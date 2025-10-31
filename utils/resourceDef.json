@@ -24,7 +24,7 @@
       "id": ["user id", "uid", "identifier"],
       "name": ["user name", "full name", "personal name", "username"],
       "email": ["email address", "mail", "user email"],
-      "age": ["user age", "years", "dob"], 
+      "age": ["user age", "years", "dob"],
       "status": ["account status", "user status"],
       "teamName": ["team", "team name", "group name"],
       "teamDescription": ["team info", "group description"]
@@ -52,6 +52,127 @@
     "aliases": {
       "id": ["team id", "tid"],
       "name": ["team name", "group name"]
+    }
+  },
+  "companies": {
+    "table": "companies",
+    "alias": "c",
+    "fields": {
+      "id": "c.id",
+      "name": "c.name",
+      "slug": "c.slug"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "slug": "string"
+    }
+  },
+  "apps": {
+    "table": "apps",
+    "alias": "a",
+    "fields": {
+      "id": "a.id",
+      "name": "a.name",
+      "slug": "a.slug",
+      "company_id": "a.company_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "slug": "string",
+      "company_id": "integer"
+    }
+  },
+  "roles": {
+    "table": "roles",
+    "alias": "r",
+    "fields": {
+      "id": "r.id",
+      "name": "r.name",
+      "company_id": "r.company_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "company_id": "integer"
+    }
+  },
+  "features": {
+    "table": "features",
+    "alias": "f",
+    "fields": {
+      "id": "f.id",
+      "feature_name": "f.feature_name",
+      "feature_tag": "f.feature_tag",
+      "type": "f.type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "feature_name": "string",
+      "feature_tag": "string",
+      "type": "string"
+    }
+  },
+  "features_capability": {
+    "table": "features_capability",
+    "alias": "fc",
+    "fields": {
+      "capability_id": "fc.capability_id",
+      "name": "fc.name",
+      "features_json": "fc.features_json"
+    },
+    "fieldTypes": {
+      "capability_id": "integer",
+      "name": "string"
+    }
+  },
+  "role_capability": {
+    "table": "role_capability",
+    "alias": "rc",
+    "fields": {
+      "id": "rc.id",
+      "role": "rc.role",
+      "team": "rc.team",
+      "company": "rc.company",
+      "capability_id": "rc.capability_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "role": "string",
+      "team": "string",
+      "company": "string",
+      "capability_id": "integer"
+    }
+  },
+  "audio_recordings": {
+    "table": "audio_recordings",
+    "alias": "ar",
+    "fields": {
+      "id": "ar.id",
+      "title": "ar.title",
+      "recorded_by": "ar.recorded_by",
+      "recorded_by_role": "ar.recorded_by_role",
+      "audio_url": "ar.audio_url",
+      "audio_data": "ar.audio_data",
+      "transcription": "ar.transcription",
+      "created_at": "ar.created_at",
+      "status": "ar.status",
+      "duration_seconds": "ar.duration_seconds",
+      "company_id": "ar.company_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "title": "string",
+      "recorded_by": "string",
+      "recorded_by_role": "string",
+      "audio_url": "string",
+      "audio_data": "text",
+      "transcription": "string",
+      "created_at": "datetime",
+      "status": "string",
+      "duration_seconds": "integer",
+      "company_id": "integer"
     }
   }
 }

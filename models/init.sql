@@ -1,13 +1,3 @@
-CREATE TABLE users (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(100),
-  email VARCHAR(100) UNIQUE,
-  password VARCHAR(255),
-  role VARCHAR(50),
-  team VARCHAR(50),
-  company VARCHAR(100)
-);
-
 CREATE TABLE features (
   id INT AUTO_INCREMENT PRIMARY KEY,
   feature_name VARCHAR(100),
@@ -39,7 +29,54 @@ CREATE TABLE companies (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(200) NOT NULL,
   slug VARCHAR(100) NOT NULL UNIQUE,
-  settings JSON,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+create table apps(
+  id int auto_increment primary key,
+  company_id int not null,
+  name varchar(100) not null,
+  slug varchar(100) not null unique,
+  created_at timestamp default current_timestamp,
+  settings json,
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+);
+
+create table users(
+  id int auto_increment primary key,
+  name varchar(100) not null,
+  email varchar(100) not null unique,
+  password varchar(255) not null,
+  role_id int not null,
+  team_id int not null,
+  company_id int not null,
+  FOREIGN KEY (role_id) REFERENCES roles(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+  FOREIGN KEY (team_id) REFERENCES teams(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+)
+
+create table teams(
+  id int auto_increment primary key,
+  name varchar(100) not null,
+  company_id int not null,
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+);
+
+create table roles(
+  id int auto_increment primary key,
+  name varchar(100) not null,
+  company_id int not null,
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+);

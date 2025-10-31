@@ -28,13 +28,13 @@ export const appContext = async (req, res, next) => {
       appSlug = parts.length > 1 ? parts[1] : null;
     }
 
-    // If this is a root public API path (e.g. /api/public/...), skip context
-    // detection — these endpoints are global and should not be treated as a
-    // company/app-scoped request. Exit early so mounted public routes can run.
+    // If this is a root public or query API path (e.g. /api/public/... or /api/query/...),
+    // skip context detection — these endpoints are global and should not be treated as
+    // company/app-scoped requests. Exit early so mounted routes can run.
     if (
       parts.length > 1 &&
       parts[0].toLowerCase() === "api" &&
-      parts[1].toLowerCase() === "public"
+      ["public", "query"].includes(parts[1].toLowerCase())
     ) {
       req.company = null;
       req.app = null;

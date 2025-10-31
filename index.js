@@ -2,20 +2,22 @@ import express from "express";
 import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import cors from "cors";
+import jwt from "jsonwebtoken";
 import authRoutes from "./routes/authRoute.js";
 import { loginUser, verifyUser } from "./controller/authController.js";
 import adminRoutes from "./routes/adminRoute.js";
-
-import publicApiRoutes from "./routes/publicApiRoute.js";
 import userRoutes from "./routes/userRoute.js";
 import appRoutes from "./routes/appRoute.js";
-import queryRoutes from "./routes/queryRoute.js";
+import baseResourceRoute from "./routes/baseResourceRoute.js";
 import { appContext } from "./middleware/appContext.js";
+import { pool } from "./db.js";
 
 dotenv.config();
 const app = express();
 
-app.use(express.json());
+// Increase payload size limit for audio uploads (50MB)
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Enable CORS. We reflect the incoming origin (origin: true) so the
 // Access-Control-Allow-Origin header contains the request origin. This
@@ -29,6 +31,47 @@ app.use(
 );
 
 app.use(cookieParser());
+
+// Debug endpoint (before appContext middleware) - no auth required
+app.get("/debug/data", async (req, res) => {
+  try {
+    const [companies] = await pool.query(
+      "SELECT id, name, slug FROM companies"
+    );
+    const [roles] = await pool.query("SELECT id, name, company_id FROM roles");
+    const [teams] = await pool.query("SELECT id, name, company_id FROM teams");
+    const [users] = await pool.query(
+      "SELECT id, name, email, role_id, team_id, company_id FROM users"
+    );
+
+    res.json({
+      companies,
+      roles,
+      teams,
+      users,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint to check JWT token
+app.get("/debug/jwt", (req, res) => {
+  const token = req.cookies.token;
+  if (!token) {
+    return res.json({
+      error: "No token found in cookies",
+      cookies: req.cookies,
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    res.json({ decoded, token: token.substring(0, 50) + "..." });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
 
 // Attach app/company context (reads first segment after /api)
 app.use(appContext);
@@ -44,10 +87,8 @@ app.use("/api/:company/:appSlug/admin", adminRoutes);
 // app.use("/api/:company/:appSlug/public", );
 app.use("/api/:company/:appSlug/user", userRoutes);
 app.use("/api/:company/:appSlug/app", appRoutes);
-// Public endpoints that don't require company/app context (used by SelectCompany UI)
-app.use("/api/:company/:appSlug/public", publicApiRoutes);
-// Expose a canonical query endpoint used by frontend clients: /api/query/v1/:resource
-app.use("/api/query", queryRoutes);
+// Expose a canonical base resource endpoint - all data queries go through here
+app.use("/api/query/v1", baseResourceRoute);
 
 app.listen(process.env.PORT, () => {
   console.log(`✅ Server running on port ${process.env.PORT}`);

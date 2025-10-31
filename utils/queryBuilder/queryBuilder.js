@@ -13,12 +13,12 @@ export function buildQuery(config) {
   // 2️⃣ Build SELECT + JOIN part
   const selectJoinSQL = buildSelectQuery(parsedResource);
 
-  // 3️⃣ Build WHERE clause
+  // 3️⃣ Build WHERE clause with field types for proper operator handling
   let whereSQL = "";
-  if (filters) whereSQL = buildWhere(filters);
+  if (filters) whereSQL = buildWhere(filters, parsedResource.fieldTypes || {});
 
-  // 4️⃣ Inject security filters (company, team)
-  if (jwt) whereSQL = injectSecurity(whereSQL, jwt);
+  // 4️⃣ Inject security filters (company, team) - pass resource name to check if it's global
+  if (jwt) whereSQL = injectSecurity(whereSQL, jwt, resource);
 
   // 5️⃣ Build ORDER BY
   const orderSQL = orderBy ? buildOrderBy(orderBy) : "";

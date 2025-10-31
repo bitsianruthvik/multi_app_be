@@ -5,7 +5,7 @@ import { signToken } from "../utils/jwt.js";
 // Add new user (Admin only)
 export const addUser = async (req, res) => {
   try {
-    const { name, email,company, password, role, team } = req.body;
+    const { name, email, company, password, role, team } = req.body;
 
     // Require company context
     if (!req.company || !req.company.id) {
@@ -39,8 +39,8 @@ export const addUser = async (req, res) => {
       );
       if (roleRows.length === 0) {
         const [rRes] = await pool.query(
-          "INSERT INTO roles (name, team_id, company_id) VALUES (?, ?, ?)",
-          [role, teamId || null, req.company.id]
+          "INSERT INTO roles (name, company_id) VALUES (?, ?)",
+          [role, req.company.id]
         );
         roleId = rRes.insertId;
       } else {
@@ -99,7 +99,9 @@ export const addFeatureCapability = async (req, res) => {
       "INSERT INTO features_capability (features_json) VALUES (?)",
       [JSON.stringify(features_json || [])]
     );
-    res.status(201).json({ message: "Capability added successfully", id: result.insertId });
+    res
+      .status(201)
+      .json({ message: "Capability added successfully", id: result.insertId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Error adding capability" });
@@ -200,8 +202,8 @@ export const registerAdmin = async (req, res) => {
     );
     if (roleRows.length === 0) {
       const [rRes] = await pool.query(
-        "INSERT INTO roles (name, team_id, company_id) VALUES (?, ?, ?)",
-        [adminRoleName, teamId, req.company.id]
+        "INSERT INTO roles (name, company_id) VALUES (?, ?)",
+        [adminRoleName, req.company.id]
       );
       roleId = rRes.insertId;
     } else {
@@ -234,16 +236,22 @@ export const registerAdmin = async (req, res) => {
       maxAge: 7 * 24 * 3600 * 1000,
     });
 
-    res
-      .status(200)
-      .json({
-        message: "register successful",
-        user: tokenPayload,
-        token,
-        company: { slug: req.company.slug, id: req.company.id, name: req.company.name },
-        app: req.app ? { id: req.app.id, slug: req.app.slug, name: req.app.name } : null,
-        dashboardRoute: `/${req.company.slug}/${req.app ? req.app.slug : ""}/admin/dashboard`.replace("//", "/"),
-      });
+    res.status(200).json({
+      message: "register successful",
+      user: tokenPayload,
+      token,
+      company: {
+        slug: req.company.slug,
+        id: req.company.id,
+        name: req.company.name,
+      },
+      app: req.app
+        ? { id: req.app.id, slug: req.app.slug, name: req.app.name }
+        : null,
+      dashboardRoute: `/${req.company.slug}/${
+        req.app ? req.app.slug : ""
+      }/admin/dashboard`.replace("//", "/"),
+    });
   } catch (err) {
     console.error(err);
     res
@@ -278,11 +286,11 @@ export const updateRoleCapability = async (req, res) => {
       "UPDATE role_capability SET role = ?, team = ?, company = ?, capability_id = ? WHERE role = ? AND team = ? AND company = ?",
       [role, team, company, capability_id, role, team, company]
     );
-    res.status(200).json({ message: "Role-capability mapping updated successfully" });
-  }
-  catch (err) {
+    res
+      .status(200)
+      .json({ message: "Role-capability mapping updated successfully" });
+  } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Error updating role-capability" });
   }
 };
-

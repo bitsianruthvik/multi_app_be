@@ -57,9 +57,11 @@ export function buildWhere(filters, fieldTypes = {}) {
 
     switch (operator) {
       case "=":
+      case "EQ":
         conditions.push(`${ident} = ${escapeValueSafe(value)}`);
         break;
       case "!=":
+      case "NEQ":
         conditions.push(`${ident} != ${escapeValueSafe(value)}`);
         break;
       case "LIKE":
@@ -104,7 +106,21 @@ export function buildWhere(filters, fieldTypes = {}) {
       case ">":
       case "<=":
       case ">=":
-        conditions.push(`${ident} ${operator} ${escapeValueSafe(value)}`);
+      case "LT":
+      case "GT":
+      case "LTE":
+      case "GTE":
+        const op =
+          operator.length > 2
+            ? operator === "LT"
+              ? "<"
+              : operator === "GT"
+              ? ">"
+              : operator === "LTE"
+              ? "<="
+              : ">="
+            : operator;
+        conditions.push(`${ident} ${op} ${escapeValueSafe(value)}`);
         break;
       default:
         throw new Error(`Unsupported operator: ${operator}`);
@@ -113,7 +129,7 @@ export function buildWhere(filters, fieldTypes = {}) {
 
   return conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 }
-// checking change thing's for git 
+// checking change thing's for git
 
 //another change to just test
 // more changes to test git

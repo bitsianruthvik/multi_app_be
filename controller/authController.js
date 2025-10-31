@@ -1,11 +1,14 @@
 import bcrypt from "bcryptjs";
 import { pool } from "../db.js";
 import { signToken, verifyToken } from "../utils/jwt.js";
+import { use } from "react";
 
 // LOGIN controller
 export const loginUser = async (req, res) => {
+  console.log("========== LOGIN ATTEMPT STARTED ==========");
   try {
     const { email, password } = req.body || {};
+    console.log("Login attempt for email:", email);
     // Validate required fields early to prevent DB/query errors
     if (!email || !password) {
       console.log("Missing credentials on login attempt", { email, password });
@@ -14,7 +17,8 @@ export const loginUser = async (req, res) => {
         .json({ message: "Email and password are required" });
     }
     // Determine current company/app from middleware (req.company) or params
-    const companySlug = req.company?.slug || req.params?.company ||req.companySlug|| null;
+    const companySlug =
+      req.company?.slug || req.params?.company || req.companySlug || null;
     const appSlug = req.app?.slug || req.params?.appSlug || req.appSlug || null;
 
     // First verify the company exists and get the company details
@@ -27,7 +31,7 @@ export const loginUser = async (req, res) => {
       "SELECT  id FROM companies WHERE slug = ?",
       [companySlug]
     );
-     console.log("Company ID lookup result:", companysID);
+    console.log("Company ID lookup result:", companysID);
 
     if (!companySlug || companys.length === 0) {
       console.log("[auth controller] Company not found:", companySlug);
@@ -36,6 +40,7 @@ export const loginUser = async (req, res) => {
 
     // Get the exact company slug from the database
     const correctCompanySlug = companys[0].slug;
+    const companyName = companys[0].name; // Get company name for role_capability lookup
 
     console.log("Request details:", {
       body: req.body,
@@ -60,6 +65,21 @@ export const loginUser = async (req, res) => {
       return res.status(404).json({ message: "User not found" });
 
     const user = rows[0];
+
+    // Fetch the role name and team name from their respective tables
+    const [roleRows] = await pool.query(
+      "SELECT name FROM roles WHERE id = ? LIMIT 1",
+      [user.role_id]
+    );
+    const [teamRows] = await pool.query(
+      "SELECT name FROM teams WHERE id = ? LIMIT 1",
+      [user.team_id]
+    );
+
+    const roleName = roleRows.length > 0 ? roleRows[0].name : null;
+    const teamName = teamRows.length > 0 ? teamRows[0].name : null;
+
+    console.log("User role and team:", { roleName, teamName });
     console.log("Verifying password for user:", user);
     const isMatch = await bcrypt.compare(password, user.password);
 
@@ -68,10 +88,11 @@ export const loginUser = async (req, res) => {
 
     // Determine user's company value: prefer slug stored on users table
     const userCompanyId = user.company_id || null;
-    const userCompanySlug = await pool.query(
-      "SELECT slug FROM companies WHERE id = ? LIMIT 1",
-      [user.company_id]
-    ).then(([rows]) => (rows.length > 0 ? rows[0].slug : null));
+    const userCompanySlug = await pool
+      .query("SELECT slug FROM companies WHERE id = ? LIMIT 1", [
+        user.company_id,
+      ])
+      .then(([rows]) => (rows.length > 0 ? rows[0].slug : null));
     //.then(([rows]) => (rows.length > 0 ? rows[0].slug : null)); is used to fetch slug from company id
 
     console.log("Login attempt - user company values:", {
@@ -113,51 +134,72 @@ export const loginUser = async (req, res) => {
     }
 
     // Fetch role-based capability and features (permissions)
-    let capabilityRows = [];
-    const roleName = user.role_name || user.role || null;
-    const teamName = user.team_name || user.team || null;
-    try {
-      const [capRows] = await pool.query(
-        `SELECT f.features_json, a.id as app_id 
-         FROM features_capability f 
-         JOIN role_capability r ON f.capability_id = r.capability_id 
-         LEFT JOIN apps a ON r.company = ? AND a.slug = ?
-         WHERE r.role = ? AND r.team = ? AND r.company = ?`,
-        [correctCompanySlug, appSlug, roleName, teamName, correctCompanySlug]
-      );
-      capabilityRows = capRows;
-    } catch (e) {
-      // If capability tables are not present or query fails, continue without permissions
-      console.warn(
-        "Capability lookup failed or tables missing, continuing without uiPermissions:",
-        e.message
-      );
-      capabilityRows = [];
-    }
-
     let uiPermissions = [];
-    let appAccess = [];
+    // roleName and teamName are already fetched above
+    try {
+      console.log("Querying role_capability with:", {
+        roleName,
+        teamName,
+        companyName,
+      });
 
-    if (capabilityRows.length > 0) {
-      // Parse the JSON string from DB safely
-      try {
-        const features = JSON.parse(capabilityRows[0].features_json || "[]");
+      // Step 1: Get capability_id from role_capability
+      const [capability_id] = await pool.query(
+        `SELECT capability_id FROM role_capability WHERE role = ? AND team = ? AND company = ?`,
+        [roleName, teamName, companyName]
+      );
+      console.log("Capability ID fetched:", capability_id);
+      // capability_id format is [{ capability_id: 1 },{capability_id:3}] or []
+      const all_capability_ids = [];
+      for (const capObj of capability_id) {
+        if (capObj && capObj.capability_id) {
+          all_capability_ids.push(capObj.capability_id);
+        }
+      }
+      console.log("All capability IDs collected:", all_capability_ids);
 
-        // Filter only frontend features and attach app context
-        uiPermissions = features
-          .filter((f) => f.type === "frontend")
-          .map((f) => ({
-            ...f,
-            appId: capabilityRows[0].app_id, // Attach app ID to each permission
+      if (all_capability_ids.length > 0) {
+        const allfeatureIds = [];
+        // Step 2: For each capability_id, get feature IDs from features_capability
+        for (const capIdObj of all_capability_ids) {
+          const [featureId] = await pool.query(
+            `SELECT features_json FROM features_capability WHERE capability_id = ?`,
+            [capIdObj]
+          );
+          console.log("Feature IDs rows fetched:", featureId[0].features_json[0]);
+          allfeatureIds.push(featureId[0].features_json[0]);
+
+          
+        }
+
+        console.log("All feature IDs collected:", allfeatureIds);
+
+        if (allfeatureIds.length > 0) {
+          // Step 3: Get feature details from features table
+          const placeholders = allfeatureIds.map(() => "?").join(",");
+          const [user_features] = await pool.query(
+            `SELECT id, feature_name, feature_tag, type FROM features WHERE id IN (${placeholders}) AND type = ?`,
+            [...allfeatureIds, "frontend"]
+          );
+          console.log("User features fetched:", user_features);
+
+          // Step 5: Map to uiPermissions format
+          uiPermissions = user_features.map((f) => ({
+            id: f.id,
+            feature_name: f.feature_name,
+            feature_tag: f.feature_tag,
+            type: f.type,
           }));
 
-        // Store app access information
-        if (capabilityRows[0].app_id) {
-          appAccess.push(capabilityRows[0].app_id);
+          console.log("Final uiPermissions:", uiPermissions);
         }
-      } catch (e) {
-        console.warn("Failed to parse features_json:", e.message);
+      } else {
+        console.log("⚠️ No capability found for this role/team/company");
       }
+    } catch (e) {
+      // If capability tables are not present or query fails, continue without permissions
+      console.error("❌ Capability lookup FAILED:", e.message);
+      console.error("Full error:", e);
     }
 
     // Create JWT payload with user info and permissions
@@ -165,13 +207,18 @@ export const loginUser = async (req, res) => {
       id: user.id,
       name: user.name,
       email: user.email,
-      role: user.role,
-      team: user.team,
+      role: roleName, // Use the fetched role name
+      team: teamName, // Use the fetched team name
       company: companySlug || user.company,
       companyId: companysID && companysID[0] ? companysID[0].id : undefined,
+      company_id: companysID && companysID[0] ? companysID[0].id : undefined, // Add this for consistency
       uiPermissions,
-      appAccess, // Add list of accessible app IDs
     };
+
+    console.log(
+      "JWT Payload being created:",
+      JSON.stringify(tokenPayload, null, 2)
+    );
 
     let token;
     try {
@@ -194,13 +241,10 @@ export const loginUser = async (req, res) => {
       maxAge: 7 * 24 * 3600 * 1000,
     });
 
-    // Determine the dashboard route based on user role
-    const user_role=await pool.query(
-      "SELECT name FROM roles WHERE id=? LIMIT 1",[user.role_id]).then(([rows]) => (rows.length > 0 ? rows[0].name : null));
-    console.log("Determining dashboard route for role:", user_role);
-    
-    let dashboardRoute = `/${companySlug}/${appSlug}/${user_role}/dashboard`; // default route
+    // Determine the dashboard route based on user role (already fetched above)
+    console.log("Determining dashboard route for role:", roleName);
 
+    let dashboardRoute = `/${companySlug}/${appSlug}/${roleName}/dashboard`;
 
     res.status(200).json({
       message: "Login successful",
