@@ -80,3 +80,20 @@ create table roles(
     ON DELETE CASCADE
     ON UPDATE CASCADE
 );
+
+CREATE TABLE audio_recordings ( 
+  id INT NOT NULL AUTO_INCREMENT,
+  title VARCHAR(255) NOT NULL,
+  recorded_by VARCHAR(255) NOT NULL,
+  recorded_by_role VARCHAR(50) NOT NULL,
+  audio_url TEXT,
+  audio_data LONGTEXT,
+  transcription TEXT,
+  company_id INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  processed_audio LONGTEXT,
+  idempotency_key VARCHAR(255) DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_audio_idempotency (idempotency_key)
+);

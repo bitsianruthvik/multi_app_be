@@ -1,4 +1,5 @@
 import express from "express";
+import path from "path";
 import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import cors from "cors";
@@ -9,6 +10,7 @@ import adminRoutes from "./routes/adminRoute.js";
 import userRoutes from "./routes/userRoute.js";
 import appRoutes from "./routes/appRoute.js";
 import baseResourceRoute from "./routes/baseResourceRoute.js";
+import publicApiRoute from "./routes/publicApiRoute.js";
 import { appContext } from "./middleware/appContext.js";
 import { pool } from "./db.js";
 
@@ -31,6 +33,15 @@ app.use(
 );
 
 app.use(cookieParser());
+
+// Serve uploaded files (mp3s) from /uploads
+const uploadsDir = path.join(process.cwd(), "public", "uploads");
+app.use(
+  "/uploads",
+  express.static(uploadsDir, {
+    maxAge: "1d",
+  })
+);
 
 // Debug endpoint (before appContext middleware) - no auth required
 app.get("/debug/data", async (req, res) => {
@@ -72,6 +83,10 @@ app.get("/debug/jwt", (req, res) => {
     res.json({ error: error.message });
   }
 });
+
+// Attach app/company context (reads first segment after /api)
+// Mount public API routes (no auth / no tenant slugs required)
+app.use("/api/public", publicApiRoute);
 
 // Attach app/company context (reads first segment after /api)
 app.use(appContext);

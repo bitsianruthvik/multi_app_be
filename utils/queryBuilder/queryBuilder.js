@@ -4,14 +4,14 @@ import { buildWhere } from "./whereBuilder.js";
 import { addPagination, buildOrderBy } from "./paginationBuilder.js";
 import { injectSecurity } from "./securityInjector.js";
 
-export function buildQuery(config) {
+export async function buildQuery(config) {
   const { resource, filters, orderBy, pagination, jwt } = config;
 
   // 1️⃣ Parse resource definition
   const parsedResource = parseResource(resource);
 
-  // 2️⃣ Build SELECT + JOIN part
-  const selectJoinSQL = buildSelectQuery(parsedResource);
+  // 2️⃣ Build SELECT + JOIN part (may validate columns asynchronously)
+  const selectJoinSQL = await buildSelectQuery(parsedResource);
 
   // 3️⃣ Build WHERE clause with field types for proper operator handling
   let whereSQL = "";

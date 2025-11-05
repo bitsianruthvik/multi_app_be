@@ -15,7 +15,7 @@ export async function handleVersionedQuery(req, res) {
   if (method === "GET") {
     try {
       // Build the SQL query using the query builder
-      const query = buildQuery({
+      const query = await buildQuery({
         resource, // The resource to query (e.g., 'users', 'products')
         filters: filters ? JSON.parse(filters) : null, // WHERE conditions
         orderBy: orderBy ? JSON.parse(orderBy) : null, // ORDER BY clause
@@ -48,7 +48,7 @@ export async function handleVersionedQuery(req, res) {
     const body = req.body;
     try {
       // Validate the resource exists
-      const query = buildQuery({
+      const query = await buildQuery({
         resource,
         filters: null,
         orderBy: null,

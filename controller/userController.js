@@ -22,7 +22,7 @@ export const handleDBQuery = async (req, res) => {
       team_ids: team ? [team] : [],
     };
 
-    const sql = buildQuery({
+    const sql = await buildQuery({
       resource,
       filters,
       orderBy,
@@ -31,7 +31,7 @@ export const handleDBQuery = async (req, res) => {
     });
 
     // Run the query
-    const [rows] = await pool.promise().query(sql);
+    const [rows] = await pool.query(sql);
 
     res.json({ data: rows });
   } catch (err) {
