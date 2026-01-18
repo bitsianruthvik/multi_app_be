@@ -12,6 +12,35 @@ CREATE TABLE features_capability (
   CONSTRAINT chk_valid_json CHECK (JSON_VALID(features_json))
 );
 
+CREATE TABLE IF NOT EXISTS company_documents (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+
+    uploader_id INT NOT NULL,
+    company_id INT NOT NULL,
+
+    doc_path VARCHAR(1000) NOT NULL,
+    
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (uploader_id) REFERENCES users(id),
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+); 
+
+CREATE TABLE IF NOT EXISTS team_documents (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+
+    uploader_id INT NOT NULL,
+    company_id INT NOT NULL,
+    team_id INT NOT NULL,
+
+    doc_path VARCHAR(1000) NOT NULL,
+
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (uploader_id) REFERENCES users(id),
+    FOREIGN KEY (company_id) REFERENCES companies(id),
+    FOREIGN KEY (team_id) REFERENCES teams(id)
+) ; 
 
 CREATE TABLE role_capability (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -92,7 +121,7 @@ CREATE TABLE audio_recordings (
   company_id INT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  processed_audio LONGTEXT,
+  new_tran LONGTEXT,
   idempotency_key VARCHAR(255) DEFAULT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uq_audio_idempotency (idempotency_key)

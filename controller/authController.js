@@ -162,24 +162,70 @@ export const loginUser = async (req, res) => {
         const allfeatureIds = [];
         // Step 2: For each capability_id, get feature IDs from features_capability
         for (const capIdObj of all_capability_ids) {
-          const [featureId] = await pool.query(
+          const [featureRows] = await pool.query(
             `SELECT features_json FROM features_capability WHERE capability_id = ?`,
             [capIdObj]
           );
-          console.log("Feature IDs rows fetched:", featureId[0].features_json[0]);
-          allfeatureIds.push(featureId[0].features_json[0]);
-
-          
+          if (featureRows.length === 0) {
+            console.log(
+              `No features_capability row for capability_id=${capIdObj}`
+            );
+            continue;
+          }
+          const raw = featureRows[0].features_json;
+          let parsed = [];
+          if (Array.isArray(raw)) {
+            parsed = raw;
+          } else if (typeof raw === "string") {
+            try {
+              const p = JSON.parse(raw || "[]");
+              parsed = Array.isArray(p) ? p : [];
+            } catch (e) {
+              console.warn(
+                "Failed to parse features_json for capability_id",
+                capIdObj,
+                e && e.message
+              );
+              parsed = [];
+            }
+          } else {
+            console.warn(
+              "Unexpected features_json type for capability_id",
+              capIdObj,
+              typeof raw
+            );
+          }
+          // Flatten and collect
+          for (const fid of parsed) {
+            // normalize numeric strings to numbers where possible
+            const nfid =
+              typeof fid === "string" && /^\d+$/.test(fid)
+                ? parseInt(fid, 10)
+                : fid;
+            allfeatureIds.push(nfid);
+          }
+          console.log(`Features for capability_id=${capIdObj}:`, parsed);
         }
 
-        console.log("All feature IDs collected:", allfeatureIds);
+        // Deduplicate and keep only valid IDs
+        const normalizedFeatureIds = Array.from(
+          new Set(
+            allfeatureIds.filter(
+              (x) => x !== null && x !== undefined && x !== ""
+            )
+          )
+        );
+        console.log(
+          "All feature IDs collected (normalized):",
+          normalizedFeatureIds
+        );
 
-        if (allfeatureIds.length > 0) {
+        if (normalizedFeatureIds.length > 0) {
           // Step 3: Get feature details from features table
-          const placeholders = allfeatureIds.map(() => "?").join(",");
+          const placeholders = normalizedFeatureIds.map(() => "?").join(",");
           const [user_features] = await pool.query(
             `SELECT id, feature_name, feature_tag, type FROM features WHERE id IN (${placeholders}) AND type = ?`,
-            [...allfeatureIds, "frontend"]
+            [...normalizedFeatureIds, "frontend"]
           );
           console.log("User features fetched:", user_features);
 
@@ -233,18 +279,22 @@ export const loginUser = async (req, res) => {
       });
     }
 
-    // Send token as cookie
+    // Send token as session cookie (cleared when browser closes)
     res.cookie("token", token, {
       httpOnly: true,
       sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
       secure: process.env.NODE_ENV === "production",
-      maxAge: 7 * 24 * 3600 * 1000,
     });
 
     // Determine the dashboard route based on user role (already fetched above)
     console.log("Determining dashboard route for role:", roleName);
 
-    let dashboardRoute = `/${companySlug}/${appSlug}/${roleName}/dashboard`;
+    let dashboardRoute = `/${companySlug}/${appSlug}/quick-actions`;
+
+    // Only admins go to admin dashboard; others go to quick actions first
+    if (roleName && roleName.toLowerCase() === "admin") {
+      dashboardRoute = `/${companySlug}/${appSlug}/admin/dashboard`;
+    }
 
     res.status(200).json({
       message: "Login successful",
@@ -283,6 +333,21 @@ export const verifyUser = async (req, res) => {
     return res.status(200).json({ user: decoded });
   } catch (err) {
     console.error("Verify user error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
+// Logout: clear the token cookie
+export const logoutUser = async (req, res) => {
+  try {
+    res.clearCookie("token", {
+      httpOnly: true,
+      sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+      secure: process.env.NODE_ENV === "production",
+    });
+    return res.status(200).json({ message: "Logout successful" });
+  } catch (err) {
+    console.error("Logout error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 };

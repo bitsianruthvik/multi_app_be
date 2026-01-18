@@ -155,13 +155,20 @@
       "recorded_by_role": "ar.recorded_by_role",
       "audio_url": "ar.audio_url",
       "audio_data": "ar.audio_data",
-      "processed_audio": "ar.processed_audio",
       "idempotency_key": "ar.idempotency_key",
       "transcription": "ar.transcription",
+      "analysis": "ar.analysis",
+      "score": "ar.score",
+      "keywords_of_improvement": "ar.keywords_of_improvement",
+      "processed_url": "ar.processed_url",
+      "medicine": "ar.medicine",
       "created_at": "ar.created_at",
+      "updated_at": "ar.updated_at",
       "status": "ar.status",
       "duration_seconds": "ar.duration_seconds",
-      "company_id": "ar.company_id"
+      "company_id": "ar.company_id",
+      "track": "ar.track",
+      "history_block": "ar.history_block"
     },
     "fieldTypes": {
       "id": "integer",
@@ -170,13 +177,61 @@
       "recorded_by_role": "string",
       "audio_url": "string",
       "audio_data": "text",
-      "processed_audio": "string",
       "idempotency_key": "string",
       "transcription": "string",
+      "analysis": "text",
+      "score": "integer",
+      "keywords_of_improvement": "text",
+      "medicine": "string",
       "created_at": "datetime",
+      "updated_at": "datetime",
       "status": "string",
       "duration_seconds": "integer",
-      "company_id": "integer"
+      "company_id": "integer",
+      "track": "json",
+      "history_block": "json"
+    }
+  },
+  "company_documents": {
+    "table": "company_documents",
+    "alias": "cd",
+    "fields": {
+      "id": "cd.id",
+      "uploader_id": "cd.uploader_id",
+      "company_id": "cd.company_id",
+      "doc_path": "cd.doc_path",
+      "doc_name": "cd.doc_name",
+      "uploaded_at": "cd.uploaded_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "uploader_id": "integer",
+      "company_id": "integer",
+      "doc_path": "string",
+      "doc_name": "string",
+      "uploaded_at": "datetime"
+    }
+  },
+  "team_documents": {
+    "table": "team_documents",
+    "alias": "td",
+    "fields": {
+      "id": "td.id",
+      "team_id": "td.team_id",
+      "company_id": "td.company_id",
+      "doc_path": "td.doc_path",
+      "doc_name": "td.doc_name",
+      "uploaded_at": "td.uploaded_at",
+      "medicines": "td.medicines"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "team_id": "integer",
+      "company_id": "integer",
+      "doc_path": "string",
+      "doc_name": "string",
+      "uploaded_at": "datetime",
+      "medicines": "string"
     }
   }
 }

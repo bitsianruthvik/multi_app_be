@@ -1,0 +1,207 @@
+# analysis_service.py
+import os
+import json
+import logging
+import time
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import requests
+import mysql.connector
+from mysql.connector import pooling
+
+load_dotenv()  # loads .env in project root if present
+
+# -------- Config ----------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+API_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "sqldb")
+DB_POOL_NAME = "mypool"
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+
+FACTSHEET = """FACTSHEET (Oncaryva short):
+1) Oncaryva (rovelcitib) oral once-daily 40mg; FGFR2 primary, VEGFR3 secondary.
+2) RIVERA-03: median PFS 8.4 vs 5.1 mo; ORR 37.2% vs 12.8%; DCR 71% vs 42%.
+3) RWD-2025 n=612: ORR 33%, PFS 7.9 mo, OS 13.4 mo; Grade3+ AEs 14%.
+4) Safety: hyperphosphatemia 38%, stomatitis 4%, RPED 1.1%; monitor phosphate/LFT/eyes.
+5) Compliance: do NOT promote off-label, unpublished comparisons, or patient-directed claims.
+"""
+
+# -------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("analysis-service")
+
+# -------- DB pool ----------
+try:
+    POOL = pooling.MySQLConnectionPool(
+        pool_name=DB_POOL_NAME,
+        pool_size=DB_POOL_SIZE,
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        auth_plugin="mysql_native_password"
+    )
+    logger.info("DB pool created.")
+except Exception as e:
+    logger.exception("Failed to create DB pool: %s", e)
+    POOL = None
+
+# -------- FastAPI ----------
+app = FastAPI(title="Transcript Analysis Service")
+
+class AnalyzeByIdRequest(BaseModel):
+    id: int
+    # optional: override model or factsheet
+    model: Optional[str] = None
+
+class AnalyzeInlineRequest(BaseModel):
+    transcription: str
+    model: Optional[str] = None
+
+# -------- Helpers ----------
+def get_db_conn():
+    if not POOL:
+        raise RuntimeError("DB pool not initialized")
+    return POOL.get_connection()
+
+def extract_json_from_text(text: str) -> Dict[str, Any]:
+    """Try to extract a JSON object from the model output."""
+    try:
+        return json.loads(text)
+    except Exception:
+        # heuristic
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except Exception:
+                pass
+    # if still not JSON, return as raw
+    return {"analysis_text": text}
+
+def call_openrouter(prompt: str, model: str = OPENROUTER_MODEL, timeout: int = API_TIMEOUT) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": 1200
+    }
+    r = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    # defensive access
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return json.dumps(data)
+
+def build_prompt(transcription: str, factsheet: str = FACTSHEET) -> str:
+    # Keep prompt short & deterministic, ask for JSON only.
+    return f"""
+You are an Oncology Sales Training Evaluator. Use ONLY the factsheet to verify statements.
+FACTSHEET:
+{factsheet}
+
+TRANSCRIPT:
+{transcription}
+
+TASK: Return EXACTLY ONE valid JSON object (no additional text) with keys:
+summary, doctor_profile, selling_messages_used,
+scientific_accuracy_check, compliance_violations,
+objection_handling, conversation_flow_usage,
+next_best_actions, score.
+
+If unable to fill a field use [] or "".
+When marking an incorrect statement, quote the transcript snippet.
+Return JSON only.
+"""
+
+# -------- Core logic ----------
+def analyze_transcription_text_and_update_db(row_id: int, transcription: str, model: Optional[str] = None) -> Dict[str, Any]:
+    # 1) Build prompt (truncate transcription if too long)
+    max_chars = 30000
+    if len(transcription) > max_chars:
+        # keep first and last parts
+        transcription = transcription[:15000] + "\n\n...TRUNCATED...\n\n" + transcription[-15000:]
+
+    prompt = build_prompt(transcription)
+    mm = model or OPENROUTER_MODEL
+
+    logger.info("Calling LLM for row_id=%s model=%s", row_id, mm)
+    raw = call_openrouter(prompt, model=mm)
+
+    parsed = extract_json_from_text(raw)
+
+    # Store parsed JSON (stringify) in analysis column
+    analysis_str = json.dumps(parsed, ensure_ascii=False)
+
+    # Update DB
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        # update sample statement - adjust table/column names
+        update_sql = "UPDATE audio_recordings SET analysis = %s, updated_at = NOW() WHERE id = %s"
+        cursor.execute(update_sql, (analysis_str, row_id))
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
+
+    return parsed
+
+# -------- Endpoints ----------
+@app.post("/api/analyze_by_id")
+def analyze_by_id(req: AnalyzeByIdRequest):
+    # 1) fetch transcription by id
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, transcription FROM audio_recordings WHERE id = %s", (req.id,))
+        row = cur.fetchone()
+        cur.close()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="recording not found")
+
+    transcription = row.get("transcription", "")
+    if not transcription:
+        raise HTTPException(status_code=400, detail="transcription empty")
+
+    try:
+        parsed = analyze_transcription_text_and_update_db(req.id, transcription, model=req.model)
+        return {"ok": True, "analysis": parsed}
+    except requests.HTTPError as he:
+        logger.exception("LLM HTTP error: %s", he)
+        raise HTTPException(status_code=502, detail=str(he))
+    except Exception as e:
+        logger.exception("Failed analysis: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze_inline")
+def analyze_inline(req: AnalyzeInlineRequest):
+    if not req.transcription or not req.transcription.strip():
+        raise HTTPException(status_code=400, detail="transcription required")
+    # no DB update, just return analysis
+    try:
+        parsed = analyze_transcription_text_and_update_db(-1, req.transcription)  # row_id -1 -> won't update DB
+        return {"ok": True, "analysis": parsed}
+    except Exception as e:
+        logger.exception("Inline analysis failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

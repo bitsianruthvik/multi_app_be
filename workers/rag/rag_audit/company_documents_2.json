@@ -1,0 +1,7 @@
+{
+  "table": "company_documents",
+  "doc_id": 2,
+  "vectors_prepared": 4,
+  "vectors_upserted": 4,
+  "timestamp": 1765445244
+}

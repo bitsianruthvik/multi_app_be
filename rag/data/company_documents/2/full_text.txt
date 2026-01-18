@@ -1,0 +1,319 @@
+This is the sales training manual:
+
+⸻
+
+📘 ONCARYVA™ SALES TEAM TRAINING MANUAL
+
+For Field Representatives – Oncology Division
+
+(Internal Use Only – Not for Distribution)
+
+⸻
+
+TABLE OF CONTENTS
+	1.	Introduction to Oncaryva™ & Company Mission
+	2.	Disease Background: Cholangiocarcinoma & FGFR Biology
+	3.	Product Deep Dive – Oncaryva™ (rovelcitib mesylate)
+	4.	Mechanism of Action – Scientific Narrative for Doctors
+	5.	Clinical Development Program (Phase II, Phase III)
+	6.	Real-World Evidence (RWD-2025 Summary)
+	7.	Safety, AE Management & Monitoring Guidance
+	8.	Competitor Landscape & Strategic Positioning
+	9.	Approved Indications & Compliance Boundaries
+	10.	Core Selling Messages – How to Position Oncaryva™
+	11.	Doctor Profiling Framework – Understanding Your Audience
+	12.	Conversation Flow & Talking Scripts
+	13.	Handling Objections & Difficult Questions
+	14.	20 DOs & DON’Ts for Sales Excellence
+	15.	Scientific Questions You Must Be Able to Answer
+	16.	Field Visit Etiquette & Relationship-Building
+	17.	Reporting Insights & Feedback Loop
+	18.	Prohibited Behaviors & Compliance Red Flags
+	19.	Case Scenarios / Role-Plays
+	20.	Final Checklist Before Field Deployment
+
+⸻
+
+1. INTRODUCTION TO ONCARYVA™ & COMPANY MISSION
+
+Oncaryva™ is our flagship targeted therapy for FGFR2-fusion–positive cholangiocarcinoma, an area with limited treatment options and significant patient need. Our mission is to bring precision oncology solutions to underserved cancers while maintaining the highest standards of scientific integrity.
+
+As an oncology sales representative, your role is not “selling medicine”—
+your role is enabling doctors to make the most informed, evidence-based decisions for their patients.
+
+⸻
+
+2. DISEASE BACKGROUND: CHOLANGIOCARCINOMA & FGFR BIOLOGY
+
+Cholangiocarcinoma Overview
+	•	Rare, aggressive cancer originating in the bile ducts
+	•	Incidence: increasing globally due to improved diagnosis
+	•	Median overall survival after first-line therapy: 11–14 months
+	•	FGFR2 fusions occur in 10–16% of intrahepatic cases
+
+What FGFR2 Fusions Do
+	•	Create ligand-independent activation
+	•	Trigger MAPK, PI3K–AKT, and STAT pathways
+	•	Drive uncontrolled tumor proliferation
+	•	Associated with unique biology—more indolent but more metastatic to lymphatics
+
+Understanding FGFR biology is foundational. Oncologists expect reps to know the science.
+
+⸻
+
+3. PRODUCT DEEP DIVE – ONCARYVA™ (ROVELCITIB MESYLATE)
+
+What It Is
+	•	Oral, once-daily targeted inhibitor
+	•	Dual activity: FGFR2 (primary) + VEGFR3 (secondary)
+	•	High selectivity: 18× over FGFR1 → better metabolic safety profile
+	•	Eliminates reliance on IV therapy for targeted lines
+
+Formulation
+	•	40 mg film-coated tablets
+	•	Linear PK, minimal food effect
+	•	Predictable interpatient exposure
+
+⸻
+
+4. MECHANISM OF ACTION – SCIENTIFIC NARRATIVE FOR DOCTORS
+
+Your MoA explanation must sound like this (memorize):
+
+“Oncaryva™ selectively inhibits FGFR2 at nanomolar potency, blocking fusion-driven signaling that underlies tumor growth.
+In addition, low-level VEGFR3 inhibition reduces lymphatic spread, which is particularly relevant in cholangiocarcinoma metastasis patterns.”
+
+This narrative positions the drug as science-first, not sales-first.
+
+Key PD effects (biopsy-backed):
+	•	↓ Phospho-FGFR2 by 84%
+	•	↓ ERK activation by 68%
+	•	↓ Ki-67 proliferation index
+	•	↓ ctDNA fusion allele frequency within first 2–4 weeks
+
+⸻
+
+5. CLINICAL DEVELOPMENT PROGRAM – SUMMARY
+
+RIVERA-03 Phase III Results
+
+Parameter	Oncaryva™	Physician’s Choice
+Median PFS	8.4 mo	5.1 mo
+ORR	37.2%	12.8%
+DCR	71%	42%
+DoR	7.8 mo	3.1 mo
+
+Subgroup analysis highlights better outcomes in:
+	•	FGFR2-BICC1
+	•	FGFR2-KIAA1598
+	•	High variant allele frequency (VAF)
+
+⸻
+
+6. REAL-WORLD EVIDENCE (RWD-2025)
+
+Largest independent dataset (n=612):
+	•	Real-world ORR: 33%
+	•	PFS: 7.9 months
+	•	OS (interim): 13.4 months
+	•	Grade ≥3 AEs: 14%
+	•	Discontinuation: 5.1%
+
+Doctors trust independent data more than sponsor data.
+
+⸻
+
+7. SAFETY PROFILE & AE MANAGEMENT
+
+Common AEs
+	•	Hyperphosphatemia (38%)
+	•	Dry mouth (27%)
+	•	Fatigue (22%)
+	•	Nail changes (14%)
+
+Serious AEs
+	•	Stomatitis – 4%
+	•	RPED – 1.1%
+	•	ALT/AST elevation – 3%
+
+Monitoring
+	•	Phosphate: weekly x 4 weeks
+	•	LFT: every 2 weeks x 2 months
+	•	Eye exam: every 8 weeks
+
+⸻
+
+8. COMPETITOR LANDSCAPE & POSITIONING
+
+Key competitors: pemigatinib, infigratinib, futibatinib
+
+Oncaryva™ advantage points:
+	•	Lower hyperphosphatemia (38% vs 56%)
+	•	Once-daily vs cyclical dosing
+	•	Lower discontinuation rate
+	•	Stronger real-world evidence support
+
+Positioning Line:
+
+“Oncaryva™ offers strong efficacy with predictable, manageable safety that fits real-world practice.”
+
+⸻
+
+9. COMPLIANCE BOUNDARIES
+
+You may NOT:
+	•	Promote off-label use
+	•	Compare competitors using unpublished data
+	•	Suggest superiority without referencing a source
+	•	Discuss price without the approved pathway
+	•	Share unapproved slides or WhatsApp charts
+
+You MUST:
+	•	Stick to PI-approved claims
+	•	Use balanced risk–benefit discussion
+	•	Maintain scientific tone
+
+⸻
+
+10. CORE SELLING MESSAGES
+	1.	Strong Phase III efficacy in FGFR2-fusion cholangiocarcinoma
+	2.	Predictable safety compared to other FGFR inhibitors
+	3.	Real-world validation from 21 centers
+	4.	Convenient, once-daily dosing
+	5.	Biomarker-driven precision targeting
+
+⸻
+
+11. DOCTOR PROFILING FRAMEWORK
+
+A. Scientific doctors (data-first)
+
+Use graphs, hazard ratios, subgroup analysis.
+
+B. Practical doctors (workflow-first)
+
+Focus on dosing, monitoring simplicity.
+
+C. Cautious doctors (safety-first)
+
+Lead with tolerability and AE management guide.
+
+D. Innovators (early adopters)
+
+Highlight ctDNA correlation, future pipeline studies.
+
+⸻
+
+12. CONVERSATION FLOW & SCRIPTS
+
+Opening
+
+“Doctor, do your cholangiocarcinoma patients undergo routine FGFR2 testing after progression?”
+
+Bridging
+
+“Patients with FGFR2 fusions respond differently. That is where Oncaryva™ becomes relevant.”
+
+Core Message
+
+“Oncaryva™ improved median PFS to 8.4 months versus 5.1 months with standard therapy, with a better real-world tolerability profile.”
+
+Closing
+
+“Would you like me to arrange a medical session on optimizing FGFR2-targeted sequencing?”
+
+⸻
+
+13. HANDLING OBJECTIONS
+
+“I’ve seen hyperphosphatemia issues with FGFR inhibitors.”
+
+“Yes, that’s common for the class. Oncaryva™ shows a lower incidence (38%), and in RWD-2025, most cases were Grade 1–2 and manageable.”
+
+“My patients don’t adhere to oral targeted therapies well.”
+
+“That’s a valid concern. The once-daily regimen has shown better adherence in the real-world dataset.”
+
+“I don’t routinely test for FGFR2 fusions.”
+
+“Would it be helpful if I share a list of local labs offering fast-turnaround NGS?”
+
+⸻
+
+14. DOs & DON’Ts
+
+(Already shared earlier — included in manual as Appendix.)
+
+⸻
+
+15. SCIENTIFIC QUESTIONS YOU MUST BE ABLE TO ANSWER
+	•	What is the Ki value for FGFR2 binding? (0.9 nM)
+	•	How selective is Oncaryva™ vs FGFR1? (18×)
+	•	What fusion types respond best? (BICC1, KIAA1598, TACC3)
+	•	What is the rationale for VEGFR3 inhibition?
+
+⸻
+
+16. FIELD VISIT ETIQUETTE
+	•	Arrive early, but don’t interrupt clinic workflow
+	•	Keep meetings under 4 minutes unless invited longer
+	•	Never hand materials to patients
+	•	Always thank nurses—they influence doctor access
+
+⸻
+
+17. INSIGHT REPORTING
+
+Capture:
+	•	Testing barriers
+	•	Preferred second-line sequence
+	•	Safety concerns
+	•	Competitor mentions
+	•	Patient caseload patterns
+
+Insights shape strategy.
+
+⸻
+
+18. PROHIBITED BEHAVIORS
+	•	Off-label promotion
+	•	Gift-giving
+	•	Offering samples without process
+	•	Making clinical guarantees
+	•	Discussing competitors with emotion or bias
+
+⸻
+
+19. ROLE-PLAY SCENARIOS
+
+Scenario 1: Safety-Conscious Doctor
+
+Concern: ocular toxicity
+You highlight the 1.1% RPED incidence.
+
+Scenario 2: Data-Driven Doctor
+
+Concern: subgroup evidence
+You present hazard ratios + RWD.
+
+Scenario 3: Skeptical Doctor
+
+Concern: hyperphosphatemia
+You explain the phosphate-management protocol.
+
+Scenario 4: Low-testing Hospital
+
+Concern: lack of NGS
+You help them map a testing workflow.
+
+⸻
+
+20. FINAL CHECKLIST BEFORE FIELD DEPLOYMENT
+
+✔ Memorize MoA narrative
+✔ Master trial statistics
+✔ Carry updated PI & safety card
+✔ Know local labs for FGFR2 testing
+✔ Prepare your opening question
+✔ Practice objection handling
+✔ Maintain compliance boundaries

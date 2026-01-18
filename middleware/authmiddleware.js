@@ -16,6 +16,23 @@ export const protect = (req, res, next) => {
       req.cookies ? Object.keys(req.cookies) : "No cookies"
     );
 
+    // Check for service-to-service token first (worker requests)
+    if (req.headers && req.headers.authorization) {
+      const auth = req.headers.authorization;
+      if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+        const token = auth.substring("Bearer ".length);
+        // Allow service token to bypass normal auth
+        if (
+          process.env.WORKER_SERVICE_TOKEN &&
+          token === process.env.WORKER_SERVICE_TOKEN
+        ) {
+          console.log("Service token verified - allowing worker request");
+          req.user = { is_service: true, role: "service", id: 0 };
+          return next();
+        }
+      }
+    }
+
     // Read JWT from cookies or Authorization header
     let token = req.cookies && req.cookies.token ? req.cookies.token : null;
     if (!token && req.headers && req.headers.authorization) {
@@ -26,6 +43,37 @@ export const protect = (req, res, next) => {
       }
     } else if (token) {
       console.log("Token found in cookies");
+    }
+
+    // Debug / fallback: allow token in body or query for debugging or clients
+    // that cannot send Authorization header or cookies. This is intended
+    // as a development-time aid only. It will log how the token was provided.
+    if (!token) {
+      if (req.body && req.body.token) {
+        token = req.body.token;
+        console.warn(
+          "Token was provided in request body (req.body.token). This fallback is for debugging only."
+        );
+      } else {
+        // Avoid accessing express' `req.query` getter directly since in some
+        // edge cases it may attempt to access internals that are not available
+        // (caused an exception in production). Parse the raw URL query string
+        // as a safe fallback.
+        try {
+          const qs =
+            req && req.url && req.url.includes("?")
+              ? require("querystring").parse(req.url.split("?")[1] || "")
+              : {};
+          if (qs && qs.token) {
+            token = qs.token;
+            console.warn(
+              "Token was provided in URL query string (parsed). This fallback is for debugging only."
+            );
+          }
+        } catch (e) {
+          // swallow parsing errors - we don't want the auth middleware to crash
+        }
+      }
     }
 
     if (!token) {
