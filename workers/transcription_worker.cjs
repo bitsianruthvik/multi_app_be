@@ -54,8 +54,8 @@ function runTranscriptRetrieval(recordingId, topK = 5) {
       if (code !== 0) {
         return reject(
           new Error(
-            `transcript_retrieval.py exited with code ${code}. stderr:\n${stderr}`
-          )
+            `transcript_retrieval.py exited with code ${code}. stderr:\n${stderr}`,
+          ),
         );
       }
       try {
@@ -64,8 +64,8 @@ function runTranscriptRetrieval(recordingId, topK = 5) {
       } catch (err) {
         reject(
           new Error(
-            `Failed to parse transcript_retrieval output as JSON.\nstdout:\n${stdout}\n\nstderr:\n${stderr}\n\nerror: ${err.message}`
-          )
+            `Failed to parse transcript_retrieval output as JSON.\nstdout:\n${stdout}\n\nstderr:\n${stderr}\n\nerror: ${err.message}`,
+          ),
         );
       }
     });
@@ -214,7 +214,7 @@ function uploadLocalFileToAssemblyAI(filePath, apiKey) {
               resolve(parsed && parsed.upload_url ? parsed.upload_url : parsed);
             else
               reject(
-                new Error(`Upload failed: HTTP ${res.statusCode}: ${buf}`)
+                new Error(`Upload failed: HTTP ${res.statusCode}: ${buf}`),
               );
           } catch (e) {
             reject(e);
@@ -275,7 +275,7 @@ async function main() {
       console.warn(
         "[FLOW-CHECKPOINT-2-FAIL] record not found via query-builder for id",
         audioId,
-        "- attempting fallback search by processed_url"
+        "- attempting fallback search by processed_url",
       );
       // Fallback: search by processed_url substring (some flows use filenames
       // like processed_<timestamp>_<fileid>.mp3 instead of DB id). This helps
@@ -288,7 +288,7 @@ async function main() {
           fields: ["id", "processed_url", "audio_url", "medicine"],
         };
         const fres = await postJson(endpoint, fallbackPayload).catch(
-          () => null
+          () => null,
         );
         if (
           fres &&
@@ -301,7 +301,7 @@ async function main() {
             "Fallback matched record id",
             row.id,
             "for file id",
-            audioId
+            audioId,
           );
           // map to actual DB id
           if (row && row.id) audioId = row.id;
@@ -313,7 +313,7 @@ async function main() {
     if (!row) {
       console.warn(
         "[FLOW-CHECKPOINT-2-FAIL-FINAL] record not found after fallback search",
-        audioId
+        audioId,
       );
       process.exit(0);
     }
@@ -321,7 +321,7 @@ async function main() {
     if (!processedUrl) {
       console.warn(
         "[FLOW-CHECKPOINT-2-FAIL] processed_url missing in record",
-        audioId
+        audioId,
       );
       process.exit(0);
     }
@@ -378,7 +378,7 @@ async function main() {
           process.cwd(),
           "public",
           "uploads",
-          decodeURIComponent(rel.replace(/^\/+/, ""))
+          decodeURIComponent(rel.replace(/^\/+/, "")),
         );
         if (!fs.existsSync(localPath)) {
           console.warn(`local processed file missing: ${localPath}`);
@@ -390,7 +390,7 @@ async function main() {
         }
         const uploadUrl = await uploadLocalFileToAssemblyAI(
           localPath,
-          assemblyKey
+          assemblyKey,
         ).catch(() => null);
         if (!uploadUrl) {
           console.warn("assemblyai upload failed for", localPath);
@@ -415,7 +415,7 @@ async function main() {
         process.cwd(),
         "public",
         "uploads",
-        decodeURIComponent(rel.replace(/^\/+/, ""))
+        decodeURIComponent(rel.replace(/^\/+/, "")),
       );
       if (!fs.existsSync(localPath)) {
         console.warn(`local processed file missing: ${localPath}`);
@@ -427,7 +427,7 @@ async function main() {
       }
       const uploadUrl = await uploadLocalFileToAssemblyAI(
         localPath,
-        assemblyKey
+        assemblyKey,
       ).catch(() => null);
       if (!uploadUrl) {
         console.warn("assemblyai upload failed for", localPath);
@@ -443,18 +443,22 @@ async function main() {
 
     console.log(
       "[FLOW-CHECKPOINT-4] Sending to AssemblyAI with audio_url:",
-      audioUrl
+      audioUrl,
     );
-    const transcriptReq = { audio_url: audioUrl };
+    const transcriptReq = {
+      audio_url: audioUrl,
+      speaker_labels: true,
+    };
+
     const transcriptCreate = await httpJsonRequest(
       "https://api.assemblyai.com/v2/transcript",
       "POST",
       { authorization: assemblyKey, "Content-Type": "application/json" },
-      JSON.stringify(transcriptReq)
+      JSON.stringify(transcriptReq),
     );
     console.log(
       "[FLOW-CHECKPOINT-5] AssemblyAI job created with ID:",
-      transcriptCreate && transcriptCreate.id ? transcriptCreate.id : "NONE"
+      transcriptCreate && transcriptCreate.id ? transcriptCreate.id : "NONE",
     );
     console.log(
       "[worker] transcriptCreate details:",
@@ -462,7 +466,7 @@ async function main() {
         ? Object.keys(transcriptCreate).length
           ? transcriptCreate
           : transcriptCreate
-        : transcriptCreate
+        : transcriptCreate,
     );
     const tid =
       transcriptCreate && transcriptCreate.id ? transcriptCreate.id : null;
@@ -470,7 +474,7 @@ async function main() {
       console.warn(
         "failed to create transcription job for audioId",
         audioId,
-        transcriptCreate
+        transcriptCreate,
       );
       process.exit(0);
     }
@@ -478,12 +482,12 @@ async function main() {
     const pollUrl = `https://api.assemblyai.com/v2/transcript/${tid}`;
     const start = Date.now();
     const timeout = Number(
-      process.env.ASSEMBLYAI_POLL_TIMEOUT || 10 * 60 * 1000
+      process.env.ASSEMBLYAI_POLL_TIMEOUT || 10 * 60 * 1000,
     );
     let final = null;
     while (Date.now() - start < timeout) {
       await new Promise((r) =>
-        setTimeout(r, Number(process.env.ASSEMBLYAI_POLL_INTERVAL || 3000))
+        setTimeout(r, Number(process.env.ASSEMBLYAI_POLL_INTERVAL || 3000)),
       );
       try {
         const p = await httpJsonRequest(pollUrl, "GET", {
@@ -512,15 +516,64 @@ async function main() {
       const text = final.text || null;
       console.log(
         "[FLOW-CHECKPOINT-6] Transcription completed from AssemblyAI:",
-        text ? text.substring(0, 100) + "..." : "NULL"
+        text ? text.substring(0, 100) + "..." : "NULL",
       );
+
+      // DEBUG: Log the full response structure to see what AssemblyAI returns
+      console.log("[DEBUG] Full AssemblyAI response keys:", Object.keys(final));
+      console.log("[DEBUG] Has utterances:", Array.isArray(final.utterances));
+      console.log("[DEBUG] Has words:", Array.isArray(final.words));
+      console.log("[DEBUG] Has diarization:", final.diarization);
+
+      if (final.utterances) {
+        console.log("[DEBUG] Utterances count:", final.utterances.length);
+        if (final.utterances[0]) {
+          console.log(
+            "[DEBUG] First utterance sample:",
+            JSON.stringify(final.utterances[0]).substring(0, 200),
+          );
+        }
+      }
+
+      // Extract utterances for speaker grouping
+      const utterances = Array.isArray(final.utterances)
+        ? final.utterances
+        : [];
+
+      console.log("[DEBUG] Utterances extracted:", utterances.length);
+
+      // Build simple speaker transcript from utterances (Speaker A: ..., Speaker B: ...)
+      function buildSimpleSpeakerTranscriptFromUtterances(utterances = []) {
+        if (!Array.isArray(utterances) || utterances.length === 0) return null;
+
+        const speakerMap = {};
+        for (const u of utterances) {
+          if (!u.speaker || !u.text) continue;
+          if (!speakerMap[u.speaker]) speakerMap[u.speaker] = [];
+          speakerMap[u.speaker].push(u.text);
+        }
+
+        return Object.entries(speakerMap)
+          .map(([speaker, texts]) => `Speaker ${speaker}: ${texts.join(" ")}`)
+          .join("\n");
+      }
+
+      const speakerTranscript =
+        buildSimpleSpeakerTranscriptFromUtterances(utterances);
+      const finalTranscriptToSave = speakerTranscript || text;
+
+      console.log(
+        "[DEBUG] Using speaker transcript:",
+        speakerTranscript ? "YES" : "NO (fallback to plain text)",
+      );
+
       // Production-first: attempt to persist directly to the DB using mysql2.
       // This avoids transient HTTP/auth issues between worker and server and
       // is the most reliable persistence path for background workers.
       try {
         console.log(
           "[FLOW-CHECKPOINT-7] Persisting transcription to database for id=%s",
-          audioId
+          audioId,
         );
         const pool = await mysql.createPool({
           host: process.env.DB_HOST || "localhost",
@@ -533,11 +586,11 @@ async function main() {
         try {
           const [res] = await pool.query(
             "UPDATE audio_recordings SET transcription = ? WHERE id = ?",
-            [text, audioId]
+            [finalTranscriptToSave, audioId],
           );
           console.log(
             "[FLOW-CHECKPOINT-8] Database update completed, affected rows:",
-            res && res.affectedRows ? res.affectedRows : "0"
+            res && res.affectedRows ? res.affectedRows : "0",
           );
           try {
             await pool.end();
@@ -545,7 +598,7 @@ async function main() {
           // If affectedRows > 0 we are done
           if (res && res.affectedRows && Number(res.affectedRows) > 0) {
             console.log(
-              `[FLOW-CHECKPOINT-9-SUCCESS] transcription persisted via direct DB update for id ${audioId}`
+              `[FLOW-CHECKPOINT-9-SUCCESS] transcription persisted via direct DB update for id ${audioId}`,
             );
             try {
               const analyzeEndpoint = `${trimmedAnalysisHost}/api/analyze_by_id_async`;
@@ -607,7 +660,7 @@ async function main() {
             // }
 
             console.log(
-              "[worker] RAG retrieval disabled - transcription will be sent directly to LLM"
+              "[worker] RAG retrieval disabled - transcription will be sent directly to LLM",
             );
 
             try {
@@ -618,13 +671,13 @@ async function main() {
         } catch (dbe) {
           console.error(
             "[worker] direct DB update failed:",
-            dbe && (dbe.message || dbe)
+            dbe && (dbe.message || dbe),
           );
         }
       } catch (dbeOuter) {
         console.error(
           "[worker] failed to create DB pool for direct update:",
-          dbeOuter && (dbeOuter.message || dbeOuter)
+          dbeOuter && (dbeOuter.message || dbeOuter),
         );
       }
 
@@ -634,7 +687,7 @@ async function main() {
           operation: "update",
           resource: "audio_recordings",
           id: audioId,
-          data: { transcription: text },
+          data: { transcription: finalTranscriptToSave },
         };
         const upRes = await postJson(endpoint, upPayload).catch(() => null);
         console.log("[worker] base_resource update response:", upRes);
@@ -652,11 +705,12 @@ async function main() {
           } catch (e) {
             console.warn("Failed to call analyze_by_id_async:", e);
           }
+          process.exit(0);
         }
       } catch (uerr) {
         console.error(
           "[worker] base_resource update error:",
-          uerr && (uerr.message || uerr)
+          uerr && (uerr.message || uerr),
         );
       }
 
@@ -665,7 +719,7 @@ async function main() {
         // Try server debug endpoint which updates via the server's pool (dev-only)
         const trimmed = String(host).replace(/\/+$/g, "");
         const forceEndpoint = `${trimmed}/api/query/v1/debug/force_update`;
-        const forceBody = { id: audioId, transcription: text };
+        const forceBody = { id: audioId, transcription: finalTranscriptToSave };
         const fres = await postJson(forceEndpoint, forceBody).catch(() => null);
         console.log("[worker] force_update response:", fres);
         const fresAffected = fres && fres.data && fres.data.affectedRows;
@@ -687,7 +741,7 @@ async function main() {
       } catch (e) {
         console.error(
           "[worker] force_update call failed:",
-          e && (e.message || e)
+          e && (e.message || e),
         );
       }
 
@@ -696,21 +750,21 @@ async function main() {
         const scriptPath = path.join(
           process.cwd(),
           "scripts",
-          "direct_update_pool.mjs"
+          "direct_update_pool.mjs",
         );
         const sp = spawnSync(
           "node",
-          [scriptPath, String(audioId), String(text)],
+          [scriptPath, String(audioId), String(finalTranscriptToSave)],
           {
             env: process.env,
             stdio: "inherit",
             encoding: "utf8",
-          }
+          },
         );
         if (sp.error) {
           console.error(
             "[worker] spawn direct-update script failed:",
-            sp.error
+            sp.error,
           );
         } else {
           console.log("[worker] spawn direct-update exitCode:", sp.status);
@@ -718,14 +772,14 @@ async function main() {
       } catch (dbe) {
         console.error(
           "[worker] direct DB update via script failed:",
-          dbe && (dbe.message || dbe)
+          dbe && (dbe.message || dbe),
         );
       }
       try {
         console.log(
           "[worker] final direct DB update attempt host=%s user=%s",
           process.env.DB_HOST || "localhost",
-          process.env.DB_USER || "root"
+          process.env.DB_USER || "root",
         );
         const pool = await mysql.createPool({
           host: process.env.DB_HOST || "localhost",
@@ -737,11 +791,11 @@ async function main() {
         });
         const [res] = await pool.query(
           "UPDATE audio_recordings SET transcription = ? WHERE id = ?",
-          [text, audioId]
+          [finalTranscriptToSave, audioId],
         );
         console.log(
           "[worker] final direct DB update result:",
-          res && res.affectedRows ? res.affectedRows : res
+          res && res.affectedRows ? res.affectedRows : res,
         );
         try {
           if (res && res.affectedRows && Number(res.affectedRows) > 0) {
@@ -768,7 +822,7 @@ async function main() {
       } catch (dbe) {
         console.error(
           "[worker] final direct DB update failed:",
-          dbe && (dbe.message || dbe)
+          dbe && (dbe.message || dbe),
         );
       }
 

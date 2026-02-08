@@ -54,6 +54,9 @@ def build_filter_chain(rnnoise: Path | None) -> str:
         denoise = "afftdn=nf=-20"
 
     # Compose filters (match user's requested chain)
+    # NOTE: silenceremove filter is DISABLED because it removes conversational pauses
+    # which are critical for speaker diarization turn detection. Removing natural pauses
+    # causes AssemblyAI to collapse multiple speakers into one.
     filters = [
         denoise,
         "highpass=f=120",
@@ -62,7 +65,7 @@ def build_filter_chain(rnnoise: Path | None) -> str:
         "acompressor=threshold=-25dB:ratio=2.5:attack=10:release=150",
         "loudnorm=I=-14:TP=-1.5:LRA=5",
         "alimiter=limit=0.98",
-        "silenceremove=stop_periods=-1:stop_threshold=-50dB:stop_duration=0.3",
+        # "silenceremove=stop_periods=-1:stop_threshold=-50dB:stop_duration=0.3",  # DISABLED: breaks diarization
         "agate=range=0.03:threshold=-40dB:attack=10:release=100",
     ]
 
@@ -72,6 +75,10 @@ def build_filter_chain(rnnoise: Path | None) -> str:
 def run_ffmpeg(input_path: Path, output_path: Path, rnnoise: Path | None) -> int:
     filter_chain = build_filter_chain(rnnoise)
 
+    # CRITICAL: Speaker diarization requires stereo or original channel layout.
+    # NEVER force mono (-ac 1) when diarization is enabled, as it destroys
+    # spatial and acoustic cues that distinguish speakers. Mono downmix causes
+    # AssemblyAI to identify all speakers as "Speaker A".
     cmd = [
         "ffmpeg",
         "-y",
@@ -79,8 +86,7 @@ def run_ffmpeg(input_path: Path, output_path: Path, rnnoise: Path | None) -> int
         str(input_path),
         "-af",
         filter_chain,
-        "-ac",
-        "1",
+        # "-ac", "1",  # REMOVED: mono downmix breaks speaker diarization
         "-ar",
         "16000",
         "-sample_fmt",

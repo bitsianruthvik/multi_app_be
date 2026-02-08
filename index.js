@@ -47,7 +47,7 @@ app.use(
       return callback(new Error("CORS blocked: " + origin));
     },
     credentials: true,
-  })
+  }),
 );
 
 app.use(cookieParser());
@@ -74,7 +74,7 @@ try {
             res.type("application/javascript");
         },
         maxAge: "1d",
-      })
+      }),
     );
 
     app.get(/^(?!\/api|\/uploads|\/debug).*/, (req, res) => {
@@ -95,7 +95,7 @@ try {
 app.get("/debug/data", async (req, res) => {
   try {
     const [companies] = await pool.query(
-      "SELECT id, name, slug FROM companies"
+      "SELECT id, name, slug FROM companies",
     );
     const [roles] = await pool.query("SELECT id, name, company_id FROM roles");
     const [teams] = await pool.query("SELECT id, name, company_id FROM teams");

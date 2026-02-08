@@ -9,6 +9,8 @@ This module provides:
 It uses an in-memory queue and a worker thread (no external deps).
 """
 
+print("RUNNING ANALYSIS_SERVICE — NO RETRY — VERIFIED")
+
 import os
 import json
 import logging
@@ -17,7 +19,7 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import requests
+from openai import OpenAI
 import mysql.connector
 from mysql.connector import pooling
 import threading
@@ -26,12 +28,11 @@ import uuid
 
 load_dotenv()  # loads .env in project root if present
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 API_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3500"))
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "root")
@@ -48,11 +49,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("analysis-service")
 
 # Fail fast if critical env missing
-if not GEMINI_API_KEY:
+if not OPENAI_API_KEY:
     logger.error(
-        "Missing GEMINI_API_KEY. Set it before starting. Example (PowerShell): $env:GEMINI_API_KEY='your_key_here' or setx GEMINI_API_KEY \"your_key_here\""
+        "Missing OPENAI_API_KEY. Set it before starting. Example (PowerShell): $env:OPENAI_API_KEY='your_key_here' or setx OPENAI_API_KEY \"your_key_here\""
     )
-    raise SystemExit("GEMINI_API_KEY not set")
+    raise SystemExit("OPENAI_API_KEY not set")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------- DB pool ----------
 try:
@@ -94,7 +98,18 @@ def get_db_conn():
     return POOL.get_connection()
 
 
-def get_last_5_call_notes(row_id: int):
+def fetch_previous_calls_for_llm_context(row_id: int):
+    """Fetch previous call data to provide LLM with context during call analysis.
+    
+    NOTE: This is NOT history analysis. It provides context to the LLM prompt.
+    See /api/history_analysis for actual history-level analysis.
+    
+    Args:
+        row_id: Current call ID (excluded from results)
+    
+    Returns:
+        List of previous call track data for LLM context
+    """
     conn = get_db_conn()
     try:
         cur = conn.cursor(dictionary=True)
@@ -107,16 +122,16 @@ def get_last_5_call_notes(row_id: int):
         rows = cur.fetchall()
         cur.close()
 
-        history = []
+        context_data = []
         for r in rows:
             raw = r.get("track")
             if not raw:
                 continue
             try:
-                history.append(json.loads(raw))  # <-- critical fix
+                context_data.append(json.loads(raw))
             except Exception:
-                logger.warning("Skipping corrupt history track: %s", str(raw)[:120])
-        return history
+                logger.warning("Skipping corrupt track data: %s", str(raw)[:120])
+        return context_data
     finally:
         conn.close()
 
@@ -147,49 +162,46 @@ def get_brand_guide_from_db(medicine: str) -> Optional[dict]:
         conn.close()
 
 
-def call_gemini(prompt: str, timeout: int = API_TIMEOUT) -> str:
-    headers = {"Content-Type": "application/json"}
-
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.15,
-            "maxOutputTokens": MAX_TOKENS,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    # Retry logic for rate limiting (429) and transient errors (503)
-    max_retries = 3
-    base_delay = 2  # seconds
+def call_chatgpt(prompt: str, timeout: int = API_TIMEOUT, model: Optional[str] = None) -> str:
+    """Call OpenAI GPT-5.2 with strict JSON enforcement.
     
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                headers=headers,
-                json=payload,
-                timeout=timeout
-            )
-            r.raise_for_status()
-            data = r.json()
-
-            try:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception:
-                raise RuntimeError(f"Invalid Gemini response: {json.dumps(data)[:500]}")
-                
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code in (429, 503):
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # exponential backoff: 2s, 4s, 8s
-                    logger.warning(f"Rate limit/service error (attempt {attempt+1}/{max_retries}). Retrying in {delay}s...")
-                    time.sleep(delay)
-                    continue
-            raise  # Re-raise if not retryable or max retries exceeded
+    Args:
+        prompt: User prompt for the LLM
+        timeout: Timeout in seconds
+        model: Optional model override (defaults to OPENAI_MODEL)
+    
+    Returns:
+        JSON string from LLM
+    
+    Raises:
+        RuntimeError: If rate limited or API error
+    """
+    try:
+        response = client.chat.completions.create(
+            model=model if model else OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You must return ONLY valid JSON. No markdown. No code blocks. No explanations. No text outside JSON structure. Return pure JSON only."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.15,
+            max_tokens=MAX_TOKENS,
+            response_format={"type": "json_object"},
+            timeout=timeout
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        error_str = str(e)
+        if "rate_limit" in error_str.lower() or "429" in error_str:
+            raise RuntimeError("OPENAI_RATE_LIMITED")
+        raise
 
 
 def build_prompt(transcription: str, brand_guide: str, medicine: str, usp_points: str) -> str:
@@ -488,19 +500,29 @@ def analyze_transcription_text_and_update_db(row_id: int, transcription: str, me
         logger.error(f"Brand guide extracted_text missing or too short for {medicine} - HARD FAIL")
         raise ValueError(f"Brand guide extracted_text missing or too short for {medicine}")
     
+    # Truncate brand_guide_text and usp_points to prevent prompt overflow
+    if len(brand_guide_text) > 6000:
+        brand_guide_text = brand_guide_text[:6000]
+        logger.info(f"Brand guide truncated to 6000 chars")
+    
+    usp_points_str = str(usp_points or '')
+    if len(usp_points_str) > 3000:
+        usp_points = usp_points_str[:3000]
+        logger.info(f"USP points truncated to 3000 chars")
+    
     logger.info(f"Brand guide fetched from DB: {len(brand_guide_text)} characters, USP points: {len(str(usp_points or ''))} chars")
     
-    # 4) Fetch historical call notes
-    history_notes = get_last_5_call_notes(row_id)
-    history_block = history_notes if history_notes else []
+    # 4) Fetch previous call data to provide LLM with context (limit to last 2 calls)
+    previous_calls_data = fetch_previous_calls_for_llm_context(row_id)[:2]
+    previous_calls_context_block = previous_calls_data if previous_calls_data else []
     
     # 5) Build prompt with DB-driven brand guide and USP points
     prompt = build_prompt(transcription, brand_guide_text, medicine, usp_points) + f"""
 
 ==========================
-HISTORICAL CALL NOTES (LAST 5 CALLS)
+PREVIOUS CALL CONTEXT (LAST 5 CALLS - FOR LLM CONTEXT ONLY)
 ==========================
-{json.dumps(history_block)}
+{json.dumps(previous_calls_context_block)}
 
 You must compute HISTORICAL DELTA ANALYSIS strictly from these notes.
     """
@@ -508,9 +530,9 @@ You must compute HISTORICAL DELTA ANALYSIS strictly from these notes.
 
     # Call LLM and parse JSON response
     try:
-        analysis_text = call_gemini(prompt)
-    except requests.HTTPError as he:
-        error_msg = f"LLM error: {he}. Check GEMINI_API_KEY and API access."
+        analysis_text = call_chatgpt(prompt, model=model)
+    except Exception as e:
+        error_msg = f"LLM error: {e}. Check OPENAI_API_KEY and API access."
         logger.error(error_msg)
         raise RuntimeError(error_msg)
     
@@ -590,10 +612,9 @@ You must compute HISTORICAL DELTA ANALYSIS strictly from these notes.
         track_payload["sections"][mapped_key]["critical_issues"] = critical_issues[:3]
 
     
-    if history_block is None:
-        raise RuntimeError("history_block missing – audit trail must be stored")
-    
-    # Store JSON + score in DB only (no keywords_of_improvement)
+    # Store JSON + score in DB only
+    # NOTE: previous_calls_context_block is used ONLY for LLM prompt context during call analysis.
+    # It is NOT stored in the database. History analysis uses ONLY the analysis JSON field.
     if row_id and row_id > 0:
         conn = get_db_conn()
         try:
@@ -605,14 +626,12 @@ You must compute HISTORICAL DELTA ANALYSIS strictly from these notes.
                    SET analysis = %s,
                        score = %s,
                        track = %s,
-                       history_block = %s,
                        updated_at = NOW()
                    WHERE id = %s""",
                 (
                     analysis_json,
                     overall_score,
                     json.dumps(track_payload),
-                    json.dumps(history_block),
                     row_id,
                 ),
             )
@@ -641,7 +660,7 @@ def mask_key(k: Optional[str]) -> str:
 
 
 def worker_loop():
-    logger.info("Analysis worker thread started (GEMINI=%s)", mask_key(GEMINI_API_KEY))
+    logger.info("Analysis worker thread started (OPENAI=%s)", mask_key(OPENAI_API_KEY))
     while True:
         try:
             job = JOB_QUEUE.get()
@@ -676,8 +695,20 @@ def worker_loop():
                     try:
                         result = analyze_transcription_text_and_update_db(row_id, row.get("transcription"), medicine)
                         JOB_STATUS[job_id]["status"] = "finished"
-                        JOB_STATUS[job_id]["result"] = result
+                        JOB_STATUS[job_id]["result"] = {
+                            "overall_score": result.get("overall_score"),
+                            "overall_label": result.get("overall_label")
+                        }
                         logger.info("Job finished: %s row_id=%s score=%s", job_id, row_id, result.get("overall_score"))
+                    except RuntimeError as e:
+                        if "OPENAI_RATE_LIMITED" in str(e):
+                            logger.error("Job %s failed: OpenAI rate limited (429)", job_id)
+                            JOB_STATUS[job_id]["status"] = "failed"
+                            JOB_STATUS[job_id]["error"] = "OPENAI_RATE_LIMITED"
+                        else:
+                            JOB_STATUS[job_id]["status"] = "failed"
+                            JOB_STATUS[job_id]["error"] = str(e)
+                            logger.exception("Job %s failed during analysis: %s", job_id, e)
                     except Exception as e:
                         JOB_STATUS[job_id]["status"] = "failed"
                         JOB_STATUS[job_id]["error"] = str(e)
@@ -698,6 +729,232 @@ _worker_thread.start()
 
 
 # -------- Endpoints ----------
+
+# -------- History Analysis (second-order intelligence) ----------
+
+class HistoryAnalysisRequest(BaseModel):
+    recorded_by: str
+
+
+def fetch_recent_analyses(recorded_by: str, limit: int = 5) -> list:
+    """Fetch the last N completed call analyses for a given user.
+    
+    Uses ONLY the analysis field (canonical source of truth).
+    IMPORTANT: Records are ordered NEWEST → OLDEST by created_at DESC.
+    This ordering is critical for trend calculations (see analyze_section_trends).
+    
+    Args:
+        recorded_by: User name to filter by
+        limit: Number of recent analyses to fetch (default 5)
+    
+    Returns:
+        List of records with analysis JSON, ordered newest first
+    """
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT id, analysis, created_at, title
+            FROM audio_recordings
+            WHERE recorded_by = %s AND analysis IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (recorded_by, limit))
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def parse_analysis_json(analysis_raw: Any) -> Optional[dict]:
+    """Safely parse analysis JSON.
+    
+    Args:
+        analysis_raw: Raw analysis data (string or dict)
+    
+    Returns:
+        Parsed analysis dict or None if invalid
+    """
+    if not analysis_raw:
+        return None
+    try:
+        if isinstance(analysis_raw, str):
+            return json.loads(analysis_raw)
+        return analysis_raw
+    except Exception as e:
+        logger.warning("Failed to parse analysis JSON: %s", str(e)[:100])
+        return None
+
+
+def generate_history_insights(records: list) -> dict:
+    """Generate AI-powered history insights using LLM analysis.
+    
+    Backend role: TRANSPORT LAYER ONLY
+    - Fetches data
+    - Sends prompt
+    - Validates JSON structure
+    - Adds timestamp
+    - Returns LLM response as-is
+    
+    LLM role: SOLE INTELLIGENCE
+    - All interpretation
+    - All reasoning
+    - All narrative
+    
+    Uses ONLY analysis JSON field from last 5 calls. Does not touch track or history_block.
+    Records are ordered NEWEST → OLDEST from fetch_recent_analyses.
+    
+    Args:
+        records: List of audio_recordings with analysis field, ordered newest first
+    
+    Returns:
+        Structured history insights JSON with LLM-generated trajectory and trends
+    """
+    if not records or len(records) < 2:
+        raise ValueError("At least 2 analyzed calls required for history analysis")
+    
+    # Parse all analysis JSON
+    analyses = []
+    for record in records:
+        analysis = parse_analysis_json(record.get("analysis"))
+        if analysis:
+            analyses.append(analysis)
+    
+    if len(analyses) < 2:
+        raise ValueError("Insufficient valid analysis data. At least 2 calls must have complete analysis")
+    
+    # Build prompt with only analysis JSON data
+    analyses_json = json.dumps(analyses, indent=2)
+    
+    prompt = f"""You are an expert performance coach analyzing historical performance across multiple evaluated sales calls.
+
+CRITICAL: You are analyzing FINAL EVALUATION OUTPUTS only. You are NOT analyzing raw conversations. You are NOT re-scoring calls.
+
+You have been given the final evaluation outputs of the last {len(analyses)} calls (scores, sections, reasoning).
+
+Your task is to:
+1. Detect performance trajectory over time (improving, declining, stable, or volatile)
+2. Identify consistent improvements across sections
+3. Identify regressions or weak patterns
+4. Determine the single most important coaching focus
+5. Reason SEMANTICALLY and NARRATIVELY
+
+Focus on describing:
+- Performance consistency and changes in natural language
+- Qualitative patterns and evolution
+- Coaching insights
+
+Do NOT compute or reference raw calculations unless semantically meaningful.
+
+Call Evaluation Data (newest to oldest):
+{analyses_json}
+
+You MUST return ONLY valid JSON with this EXACT structure:
+{{
+  "trajectory": "improving | declining | stable | volatile",
+  "trajectory_reasoning": "semantic, narrative explanation of overall performance evolution",
+  "section_wise_trends": {{
+    "Model Communication Compliance": {{
+      "trend": "improving | declining | stable",
+      "reasoning": "narrative explanation of this section's evolution"
+    }},
+    "Language Tonality": {{
+      "trend": "improving | declining | stable",
+      "reasoning": "narrative explanation"
+    }},
+    "Medical Scientific Accuracy": {{
+      "trend": "improving | declining | stable",
+      "reasoning": "narrative explanation"
+    }},
+    "Closing Action Orientation": {{
+      "trend": "improving | declining | stable",
+      "reasoning": "narrative explanation"
+    }}
+  }},
+  "key_improvements": ["improvement 1", "improvement 2"],
+  "key_regressions": ["regression 1"],
+  "coaching_focus": "the single most important focus area for next call",
+  "calls_analyzed": {len(analyses)}
+}}
+
+Return ONLY the JSON. No preamble. No explanation. Valid JSON only."""
+    
+    # Call LLM for history analysis
+    try:
+        llm_response = call_chatgpt(prompt, model=None)
+    except RuntimeError as e:
+        if "OPENAI_RATE_LIMITED" in str(e):
+            raise HTTPException(status_code=429, detail="LLM temporarily rate-limited. Please retry.")
+        logger.error("LLM call failed for history analysis: %s", str(e))
+        raise RuntimeError(f"Failed to generate history insights: {str(e)}")
+    
+    # Parse LLM response
+    try:
+        history_insights = json.loads(llm_response)
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse history insights JSON: %s", llm_response[:500])
+        raise RuntimeError(f"LLM returned invalid JSON: {str(e)}")
+    
+    # Validate required fields
+    required_fields = ["trajectory", "trajectory_reasoning", "section_wise_trends", 
+                      "key_improvements", "key_regressions", "coaching_focus", "calls_analyzed"]
+    for field in required_fields:
+        if field not in history_insights:
+            raise ValueError(f"Missing required field in history insights: {field}")
+    
+    # Add ONLY timestamp (backend is transport layer, LLM owns all interpretation)
+    history_insights["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    
+    # Return LLM response as-is (no backend computation of averages, deltas, or trends)
+    return history_insights
+
+
+@app.post("/api/history_analysis")
+def history_analysis(req: HistoryAnalysisRequest):
+    """Perform AI-powered history analysis on stored call analysis data.
+    
+    This endpoint:
+    - Fetches last 5 completed call analyses (where analysis IS NOT NULL)
+    - Passes only analysis JSON to LLM for second-order reasoning
+    - Returns LLM-generated history-level insights
+    - Does NOT re-run transcription analysis
+    - Does NOT call OpenAI for individual calls (only for history analysis)
+    - Does NOT modify call-level scores
+    - Does NOT read track or history_block
+    - Does NOT write to database
+    """
+    try:
+        if not req.recorded_by:
+            raise HTTPException(status_code=400, detail="recorded_by field required")
+        
+        # Fetch recent analyses (using analysis field only)
+        records = fetch_recent_analyses(req.recorded_by, limit=5)
+        
+        if not records or len(records) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient history data. Please complete at least 2 analyzed calls to generate history insights.",
+            )
+        
+        # Generate insights using LLM analysis of past evaluations
+        insights = generate_history_insights(records)
+        
+        logger.info("History analysis completed for user=%s with %d calls", req.recorded_by, len(records))
+        
+        return {
+            "ok": True,
+            "history_insights": insights,
+        }
+    
+    except ValueError as e:
+        logger.warning("History analysis validation error: %s", str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("History analysis error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/analyze_by_id")
 def analyze_by_id(req: AnalyzeByIdRequest):
     # 1) fetch transcription by id
@@ -726,8 +983,10 @@ def analyze_by_id(req: AnalyzeByIdRequest):
             "ok": True,
             "result": result
         }
-    except requests.HTTPError as he:
-        raise HTTPException(status_code=502, detail=str(he))
+    except RuntimeError as e:
+        if "OPENAI_RATE_LIMITED" in str(e):
+            raise HTTPException(status_code=429, detail="OpenAI rate limited. Please retry.")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
