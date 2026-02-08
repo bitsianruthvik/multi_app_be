@@ -9,3 +9,4 @@ pinecone-client
 google-generativeai
 openai
 qdrant-client
+mysql-connector-python
