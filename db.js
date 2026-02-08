@@ -87,12 +87,12 @@ if (!process.env.DB_USER || !process.env.DB_PASSWORD) {
 
 // Create a connection pool (better than single connection for performance)
 export const pool = mysql.createPool({
-  host: process.env.DB_HOST, // where MySQL is running (localhost)
-  port: Number(process.env.DB_PORT),
-  user: process.env.DB_USER, // MySQL username
-  password: process.env.DB_PASSWORD, // MySQL password
-  database: process.env.DB_NAME, // which DB to use
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 3306), // ✅ ADD THIS
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   waitForConnections: true,
-  connectionLimit: 10, // up to 10 simultaneous connections
+  connectionLimit: 10,
   queueLimit: 0,
 });
