@@ -34,10 +34,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 API_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3500"))
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_NAME = os.getenv("DB_NAME", "sqldb")
+DB_HOST=hopper.proxy.rlwy.net
+DB_PORT=52309
+DB_USER=root
+DB_PASSWORD=DvgxyiAmqdlqxThRnLXxBSMQwwlMppDp
+DB_NAME=railway
 DB_POOL_NAME = "mypool"
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 
