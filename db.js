@@ -57,7 +57,7 @@ if (result.error) {
     } catch (e) {
       console.warn(
         "[dotenv-fallback] failed to parse .env fallback",
-        e.message || e
+        e.message || e,
       );
     }
   }
@@ -73,12 +73,12 @@ function mask(s) {
 // Fail fast with a clear message if DB credentials are not present
 if (!process.env.DB_USER || !process.env.DB_PASSWORD) {
   console.error(
-    "Missing DB credentials: ensure DB_USER and DB_PASSWORD are set in .env or environment variables."
+    "Missing DB credentials: ensure DB_USER and DB_PASSWORD are set in .env or environment variables.",
   );
   console.error(
     `DB_USER=${mask(process.env.DB_USER)}, DB_PASSWORD=${mask(
-      process.env.DB_PASSWORD
-    )}`
+      process.env.DB_PASSWORD,
+    )}`,
   );
   // Do not exit here to allow some admin routes to run in limited local modes,
   // but log prominently so it's obvious in logs. If you want hard-fail, uncomment:
@@ -88,6 +88,7 @@ if (!process.env.DB_USER || !process.env.DB_PASSWORD) {
 // Create a connection pool (better than single connection for performance)
 export const pool = mysql.createPool({
   host: process.env.DB_HOST, // where MySQL is running (localhost)
+  port: Number(process.env.DB_PORT),
   user: process.env.DB_USER, // MySQL username
   password: process.env.DB_PASSWORD, // MySQL password
   database: process.env.DB_NAME, // which DB to use
