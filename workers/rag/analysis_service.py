@@ -34,12 +34,22 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 API_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3500"))
 
-DB_HOST=hopper.proxy.rlwy.net
-DB_PORT=52309
-DB_USER=root
-DB_PASSWORD=DvgxyiAmqdlqxThRnLXxBSMQwwlMppDp
-DB_NAME=railway
-DB_POOL_NAME = "mypool"
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "sqldb")
+POOL = pooling.MySQLConnectionPool(
+    pool_name=DB_POOL_NAME,
+    pool_size=DB_POOL_SIZE,
+    host=DB_HOST,
+    port=DB_PORT,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    database=DB_NAME,
+    auth_plugin="mysql_native_password",
+)
+DB_POOL_NAME = os.getenv("DB_POOL_NAME", "analysis_pool")
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 
 # -------- Brand Guide to provide domain context to the LLM ----------
