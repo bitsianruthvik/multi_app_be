@@ -223,7 +223,24 @@ Your job is to compute a total score out of 100 based on the predefined rubric.
 All evaluation should be semantic, not keyword-based.
 Never reduce scores in more than one section for the same underlying issue (MECE).
 
+For every subsection where the score is NOT full:
+You MUST provide structured corrective feedback.
+
+Each "negative" field MUST contain:
+1. "Observed snippet:" → exact or near-exact line(s) from the transcription
+2. "Issue:" → why this communication is suboptimal (semantic, not stylistic)
+3. "Better example:" → an improved example sentence aligned to brand guide
+4. "Next time:" → a clear coaching instruction for the MR
+
+If the subsection has full score, keep "negative" as an empty string.
+
+
 No section or sub-section can have negative scores; the minimum is always **0**.
+
+Generic feedback is not allowed.
+If feedback does not reference the transcription AND provide an improved example,
+the evaluation is considered invalid.
+
 
 Output must be a **strict JSON object** with **overall score**, **section-wise scores**, **subsection-wise scores**, **positive reasoning**, and **negative reasoning**.
 
@@ -355,22 +372,22 @@ Return ONLY a JSON object in this structure:
       "Brand_Introduction": {{
         "score": 0-8,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "USP_Coverage": {{
         "score": 0-8,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Indication_Usecase": {{
         "score": 0-8,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Sequence_Adherence": {{
         "score": 0-6,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }}
     }},
     "Language_Tonality": {{
@@ -378,22 +395,22 @@ Return ONLY a JSON object in this structure:
       "Clarity_Simplicity": {{
         "score": 0-8,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Confidence_Fluency": {{
         "score": 0-7,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Fillers_Hesitation": {{
         "score": 0-5,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Professional_Tone": {{
         "score": 0-5,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }}
     }},
     "Medical_Scientific_Accuracy": {{
@@ -401,22 +418,22 @@ Return ONLY a JSON object in this structure:
       "Feature_Accuracy": {{
         "score": 0-6,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Clinical_Claims": {{
         "score": 0-6,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Evidence_Alignment": {{
         "score": 0-6,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Compliance_Safety": {{
         "score": 0-7,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }}
     }},
     "Closing_Action_Orientation": {{
@@ -424,17 +441,17 @@ Return ONLY a JSON object in this structure:
       "Quantified_Rx_Ask": {{
         "score": 0-10,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Closing_Statement": {{
         "score": 0-6,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }},
       "Followup_Intent": {{
         "score": 0-4,
         "positive": "",
-        "negative": ""
+        "negative": "Observed snippet: ... | Issue: ... | Better example: ... | Next time: ..."
       }}
     }}
   }},
