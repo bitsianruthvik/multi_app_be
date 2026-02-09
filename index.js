@@ -27,6 +27,7 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 // CANONICAL CORS CONFIG
 // =====================
 const ALLOWED_ORIGINS = [
+  "https://multi-app-fe.vercel.app", 
   "https://jewelry-shopping-dreams-learned.trycloudflare.com",
   "http://localhost:5173",
   "http://localhost:4000",
