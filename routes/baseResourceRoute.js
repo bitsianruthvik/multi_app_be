@@ -477,7 +477,6 @@ router.post(
                 "node",
                 [script, "--audio-id", String(result.insertId)],
                 {
-                  detached: true,
                   stdio: ["ignore", "pipe", "pipe"],
                   env: { ...process.env },
                 }
@@ -1324,7 +1323,6 @@ router.post("/base_resource", async (req, res) => {
               "node",
               [script, "--audio-id", String(result.insertId)],
               {
-                detached: true,
                 stdio: ["ignore", "pipe", "pipe"],
                 env: { ...process.env },
               }
@@ -1546,7 +1544,6 @@ router.post("/transcribe", async (req, res) => {
         "transcription_worker.cjs"
       );
       const child = spawn("node", [script, "--audio-id", String(audioId)], {
-        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
       });
