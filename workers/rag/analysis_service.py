@@ -32,7 +32,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 API_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3500"))
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "3000"))
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
@@ -175,23 +175,10 @@ def get_brand_guide_from_db(medicine: str) -> Optional[dict]:
 
 
 def call_chatgpt(prompt: str, timeout: int = API_TIMEOUT, model: Optional[str] = None) -> str:
-    """Call OpenAI GPT-5.2 with strict JSON enforcement.
-    
-    Args:
-        prompt: User prompt for the LLM
-        timeout: Timeout in seconds
-        model: Optional model override (defaults to OPENAI_MODEL)
-    
-    Returns:
-        JSON string from LLM
-    
-    Raises:
-        RuntimeError: If rate limited or API error
-    """
     try:
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model=model if model else OPENAI_MODEL,
-            messages=[
+            input=[
                 {
                     "role": "system",
                     "content": "You must return ONLY valid JSON. No markdown. No code blocks. No explanations. No text outside JSON structure. Return pure JSON only."
@@ -202,18 +189,18 @@ def call_chatgpt(prompt: str, timeout: int = API_TIMEOUT, model: Optional[str] =
                 }
             ],
             temperature=0.15,
-            max_tokens=MAX_TOKENS,
-            response_format={"type": "json_object"},
+            max_output_tokens=MAX_TOKENS,
             timeout=timeout
         )
-        
-        return response.choices[0].message.content
-        
+
+        return response.output_text
+
     except Exception as e:
         error_str = str(e)
         if "rate_limit" in error_str.lower() or "429" in error_str:
             raise RuntimeError("OPENAI_RATE_LIMITED")
         raise
+
 
 
 def build_prompt(transcription: str, brand_guide: str, medicine: str, usp_points: str) -> str:
@@ -508,7 +495,7 @@ Rules:
 
 def analyze_transcription_text_and_update_db(row_id: int, transcription: str, medicine: str, model: Optional[str] = None) -> str:
     # 1) Build prompt (truncate transcription if too long)
-    max_chars = 30000
+    max_chars = 8000
     if len(transcription) > max_chars:
         # keep first and last parts
         transcription = transcription[:15000] + "\n\n...TRUNCATED...\n\n" + transcription[-15000:]

@@ -59,6 +59,7 @@ app.use(cookieParser());
 const uploadsDir = path.join(process.cwd(), "public", "uploads");
 app.use("/uploads", express.static(uploadsDir, { maxAge: "1d" }));
 
+
 // =====================
 // Serve Frontend Build
 // =====================
