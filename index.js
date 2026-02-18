@@ -144,3 +144,4 @@ app.listen(PORT, "0.0.0.0", () => {
 
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
+console.log("SERVER WORKER TOKEN:", process.env.WORKER_SERVICE_TOKEN);
