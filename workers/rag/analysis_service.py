@@ -49,16 +49,7 @@ print("USER:", DB_USER)
 print("NAME:", DB_NAME)
 
 
-POOL = pooling.MySQLConnectionPool(
-    pool_name=DB_POOL_NAME,
-    pool_size=DB_POOL_SIZE,
-    host=DB_HOST,
-    port=DB_PORT,
-    user=DB_USER,
-    password=DB_PASSWORD, 
-    database=DB_NAME,
-    auth_plugin="mysql_native_password",
-)
+
 
 
 # -------- Brand Guide to provide domain context to the LLM ----------
@@ -79,17 +70,18 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------- DB pool ----------
+# -------- DB pool ----------
 try:
     POOL = pooling.MySQLConnectionPool(
         pool_name=DB_POOL_NAME,
         pool_size=DB_POOL_SIZE,
         host=DB_HOST,
+        port=DB_PORT,   # ✅ IMPORTANT
         user=DB_USER,
         password=DB_PASSWORD,
         database=DB_NAME,
-        auth_plugin="mysql_native_password",
     )
-    logger.info("DB pool created.")
+    logger.info("DB pool created successfully.")
 except Exception as e:
     logger.exception("Failed to create DB pool: %s", e)
     POOL = None
