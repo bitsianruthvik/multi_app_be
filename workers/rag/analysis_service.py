@@ -41,6 +41,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "sqldb")
 DB_POOL_NAME = os.getenv("DB_POOL_NAME", "analysis_pool")
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+
+print("DB DEBUG VALUES:")
+print("HOST:", DB_HOST)
+print("PORT:", DB_PORT)
+print("USER:", DB_USER)
+print("NAME:", DB_NAME)
+
+
 POOL = pooling.MySQLConnectionPool(
     pool_name=DB_POOL_NAME,
     pool_size=DB_POOL_SIZE,
