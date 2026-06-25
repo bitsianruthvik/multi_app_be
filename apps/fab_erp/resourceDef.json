@@ -1,0 +1,1673 @@
+{
+  "fabErpPlant": {
+    "table": "fab_plants",
+    "alias": "fpl",
+    "writeFields": ["name", "code"],
+    "fields": {
+      "id":        "fpl.id",
+      "companyId": "fpl.company_id",
+      "name":      "fpl.name",
+      "code":      "fpl.code",
+      "createdAt": "fpl.created_at",
+      "updatedAt": "fpl.updated_at"
+    },
+    "fieldTypes": {
+      "id":        "integer",
+      "companyId": "integer",
+      "name":      "string",
+      "code":      "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpResourceType": {
+    "table": "fab_resource_types",
+    "alias": "frt",
+    "writeFields": ["plant_id", "name", "code", "category",
+                    "capacity_hrs_per_day", "num_units", "utilization_pct", "efficiency_pct", "overload_pct",
+                    "setup_time_hrs", "teardown_time_hrs", "queue_time_hrs", "move_time_hrs",
+                    "scheduling_basis", "cost_per_hour", "currency"],
+    "fields": {
+      "id":                  "frt.id",
+      "companyId":           "frt.company_id",
+      "plantId":             "frt.plant_id",
+      "name":                "frt.name",
+      "code":                "frt.code",
+      "category":            "frt.category",
+      "capacityHrsPerDay":   "frt.capacity_hrs_per_day",
+      "numUnits":            "frt.num_units",
+      "utilizationPct":      "frt.utilization_pct",
+      "efficiencyPct":       "frt.efficiency_pct",
+      "overloadPct":         "frt.overload_pct",
+      "setupTimeHrs":        "frt.setup_time_hrs",
+      "teardownTimeHrs":     "frt.teardown_time_hrs",
+      "queueTimeHrs":        "frt.queue_time_hrs",
+      "moveTimeHrs":         "frt.move_time_hrs",
+      "schedulingBasis":     "frt.scheduling_basis",
+      "costPerHour":         "frt.cost_per_hour",
+      "currency":            "frt.currency",
+      "createdAt":           "frt.created_at",
+      "updatedAt":           "frt.updated_at",
+      "plantName":           "fpl_rt.name",
+      "plantCode":           "fpl_rt.code"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "plantId":             "integer",
+      "name":                "string",
+      "code":                "string",
+      "category":            "string",
+      "capacityHrsPerDay":   "decimal",
+      "numUnits":            "integer",
+      "utilizationPct":      "decimal",
+      "efficiencyPct":       "decimal",
+      "overloadPct":         "decimal",
+      "setupTimeHrs":        "decimal",
+      "teardownTimeHrs":     "decimal",
+      "queueTimeHrs":        "decimal",
+      "moveTimeHrs":         "decimal",
+      "schedulingBasis":     "string",
+      "costPerHour":         "decimal",
+      "currency":            "string",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime",
+      "plantName":           "string",
+      "plantCode":           "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_rt",
+        "on":    "frt.plant_id = fpl_rt.id",
+        "fields": ["plantName", "plantCode"]
+      }
+    }
+  },
+
+  "fabErpResourceTypeMetric": {
+    "table": "fab_resource_type_metrics",
+    "alias": "frtm",
+    "writeFields": ["resource_type_id", "metric_key", "metric_label", "data_type", "unit"],
+    "fields": {
+      "id":               "frtm.id",
+      "companyId":        "frtm.company_id",
+      "resourceTypeId":   "frtm.resource_type_id",
+      "metricKey":        "frtm.metric_key",
+      "metricLabel":      "frtm.metric_label",
+      "dataType":         "frtm.data_type",
+      "unit":             "frtm.unit",
+      "createdAt":        "frtm.created_at",
+      "updatedAt":        "frtm.updated_at",
+      "resourceTypeName": "frt_rtm.name",
+      "resourceTypeCode": "frt_rtm.code"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "resourceTypeId":   "integer",
+      "metricKey":        "string",
+      "metricLabel":      "string",
+      "dataType":         "string",
+      "unit":             "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "resourceTypeName": "string",
+      "resourceTypeCode": "string"
+    },
+    "relations": {
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_rtm",
+        "on":    "frtm.resource_type_id = frt_rtm.id",
+        "fields": ["resourceTypeName", "resourceTypeCode"]
+      }
+    }
+  },
+
+  "fabErpResource": {
+    "table": "fab_resources",
+    "alias": "fr",
+    "writeFields": ["plant_id", "stock_location_id", "shift_calendar_id", "resource_type_id", "name", "code",
+                    "capacity_hrs_per_day", "num_units", "utilization_pct", "efficiency_pct", "overload_pct",
+                    "setup_time_hrs", "teardown_time_hrs", "queue_time_hrs", "move_time_hrs",
+                    "scheduling_basis", "cost_per_hour", "currency"],
+    "fields": {
+      "id":                  "fr.id",
+      "companyId":           "fr.company_id",
+      "plantId":             "fr.plant_id",
+      "stockLocationId":     "fr.stock_location_id",
+      "shiftCalendarId":     "fr.shift_calendar_id",
+      "resourceTypeId":      "fr.resource_type_id",
+      "name":                "fr.name",
+      "code":                "fr.code",
+      "capacityHrsPerDay":   "fr.capacity_hrs_per_day",
+      "numUnits":            "fr.num_units",
+      "utilizationPct":      "fr.utilization_pct",
+      "efficiencyPct":       "fr.efficiency_pct",
+      "overloadPct":         "fr.overload_pct",
+      "setupTimeHrs":        "fr.setup_time_hrs",
+      "teardownTimeHrs":     "fr.teardown_time_hrs",
+      "queueTimeHrs":        "fr.queue_time_hrs",
+      "moveTimeHrs":         "fr.move_time_hrs",
+      "schedulingBasis":     "fr.scheduling_basis",
+      "costPerHour":         "fr.cost_per_hour",
+      "currency":            "fr.currency",
+      "createdAt":           "fr.created_at",
+      "updatedAt":           "fr.updated_at",
+      "plantName":           "fpl_r.name",
+      "plantCode":           "fpl_r.code",
+      "stockLocationName":   "fsl_r.name",
+      "resourceTypeName":    "frt_r.name",
+      "resourceTypeCode":    "frt_r.code",
+      "shiftCalendarName":   "fsc_r.name",
+      "shiftCalendarCode":   "fsc_r.code"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "plantId":             "integer",
+      "stockLocationId":     "integer",
+      "shiftCalendarId":     "integer",
+      "resourceTypeId":      "integer",
+      "name":                "string",
+      "code":                "string",
+      "capacityHrsPerDay":   "decimal",
+      "numUnits":            "integer",
+      "utilizationPct":      "decimal",
+      "efficiencyPct":       "decimal",
+      "overloadPct":         "decimal",
+      "setupTimeHrs":        "decimal",
+      "teardownTimeHrs":     "decimal",
+      "queueTimeHrs":        "decimal",
+      "moveTimeHrs":         "decimal",
+      "schedulingBasis":     "string",
+      "costPerHour":         "decimal",
+      "currency":            "string",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime",
+      "plantName":           "string",
+      "plantCode":           "string",
+      "stockLocationName":   "string",
+      "resourceTypeName":    "string",
+      "resourceTypeCode":    "string",
+      "shiftCalendarName":   "string",
+      "shiftCalendarCode":   "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_r",
+        "on":    "fr.plant_id = fpl_r.id",
+        "fields": ["plantName", "plantCode"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_r",
+        "on":    "fr.stock_location_id = fsl_r.id",
+        "fields": ["stockLocationName"]
+      },
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_r",
+        "on":    "fr.resource_type_id = frt_r.id",
+        "fields": ["resourceTypeName", "resourceTypeCode"]
+      },
+      "shiftCalendar": {
+        "table": "fab_shift_calendars",
+        "alias": "fsc_r",
+        "on":    "fr.shift_calendar_id = fsc_r.id",
+        "fields": ["shiftCalendarName", "shiftCalendarCode"]
+      }
+    }
+  },
+
+  "fabErpItemMetricDef": {
+    "table": "fab_item_metric_defs",
+    "alias": "fimd",
+    "writeFields": ["metric_key", "metric_label", "data_type", "unit"],
+    "fields": {
+      "id":          "fimd.id",
+      "companyId":   "fimd.company_id",
+      "metricKey":   "fimd.metric_key",
+      "metricLabel": "fimd.metric_label",
+      "dataType":    "fimd.data_type",
+      "unit":        "fimd.unit",
+      "createdAt":   "fimd.created_at",
+      "updatedAt":   "fimd.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "metricKey":   "string",
+      "metricLabel": "string",
+      "dataType":    "string",
+      "unit":        "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpConstant": {
+    "table": "fab_constants",
+    "alias": "fc",
+    "writeFields": ["const_key", "const_value", "label"],
+    "fields": {
+      "id":         "fc.id",
+      "companyId":  "fc.company_id",
+      "constKey":   "fc.const_key",
+      "constValue": "fc.const_value",
+      "label":      "fc.label",
+      "createdAt":  "fc.created_at",
+      "updatedAt":  "fc.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "constKey":   "string",
+      "constValue": "decimal",
+      "label":      "string",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpProcessMaster": {
+    "table": "fab_process_master",
+    "alias": "fpm",
+    "writeFields": ["name", "code", "description"],
+    "fields": {
+      "id":          "fpm.id",
+      "companyId":   "fpm.company_id",
+      "name":        "fpm.name",
+      "code":        "fpm.code",
+      "description": "fpm.description",
+      "createdAt":   "fpm.created_at",
+      "updatedAt":   "fpm.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "name":        "string",
+      "code":        "string",
+      "description": "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpResourceTypeProperty": {
+    "table": "fab_resource_type_properties",
+    "alias": "frtp",
+    "writeFields": ["resource_type_id", "property_key", "property_label", "unit", "default_value"],
+    "fields": {
+      "id":               "frtp.id",
+      "resourceTypeId":   "frtp.resource_type_id",
+      "propertyKey":      "frtp.property_key",
+      "propertyLabel":    "frtp.property_label",
+      "unit":             "frtp.unit",
+      "defaultValue":     "frtp.default_value",
+      "createdAt":        "frtp.created_at",
+      "updatedAt":        "frtp.updated_at",
+      "resourceTypeName": "frt_rtp.name",
+      "resourceTypeCode": "frt_rtp.code"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "resourceTypeId":   "integer",
+      "propertyKey":      "string",
+      "propertyLabel":    "string",
+      "unit":             "string",
+      "defaultValue":     "decimal",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "resourceTypeName": "string",
+      "resourceTypeCode": "string"
+    },
+    "relations": {
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_rtp",
+        "on":    "frtp.resource_type_id = frt_rtp.id",
+        "fields": ["resourceTypeName", "resourceTypeCode"]
+      }
+    }
+  },
+
+  "fabErpProcessTemplate": {
+    "table": "fab_process_templates",
+    "alias": "fpt",
+    "writeFields": ["plant_id", "name", "code", "version_group_id", "version_no", "is_current_version", "approval_status"],
+    "fields": {
+      "id":               "fpt.id",
+      "companyId":        "fpt.company_id",
+      "plantId":          "fpt.plant_id",
+      "name":             "fpt.name",
+      "code":             "fpt.code",
+      "versionGroupId":   "fpt.version_group_id",
+      "versionNo":        "fpt.version_no",
+      "isCurrentVersion": "fpt.is_current_version",
+      "approvalStatus":   "fpt.approval_status",
+      "createdAt":        "fpt.created_at",
+      "updatedAt":        "fpt.updated_at",
+      "plantName":        "fpl_fpt.name",
+      "plantCode":        "fpl_fpt.code"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "plantId":          "integer",
+      "name":             "string",
+      "code":             "string",
+      "versionGroupId":   "integer",
+      "versionNo":        "integer",
+      "isCurrentVersion": "integer",
+      "approvalStatus":   "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "plantName":        "string",
+      "plantCode":        "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_fpt",
+        "on":    "fpt.plant_id = fpl_fpt.id",
+        "fields": ["plantName", "plantCode"]
+      }
+    }
+  },
+
+  "fabErpProcessTemplateStep": {
+    "table": "fab_process_template_steps",
+    "alias": "fpts",
+    "writeFields": ["process_template_id", "seq_no", "name", "resource_type_id", "process_master_id", "allowed_resource_type_ids", "formula", "standard_values", "sub_template_id"],
+    "fields": {
+      "id":                     "fpts.id",
+      "companyId":              "fpts.company_id",
+      "processTemplateId":      "fpts.process_template_id",
+      "seqNo":                  "fpts.seq_no",
+      "name":                   "fpts.name",
+      "resourceTypeId":         "fpts.resource_type_id",
+      "processMasterId":        "fpts.process_master_id",
+      "allowedResourceTypeIds": "fpts.allowed_resource_type_ids",
+      "formula":                "fpts.formula",
+      "standardValues":         "fpts.standard_values",
+      "subTemplateId":          "fpts.sub_template_id",
+      "createdAt":              "fpts.created_at",
+      "updatedAt":              "fpts.updated_at",
+      "processTemplateName":    "fpt_pts.name",
+      "processTemplateCode":    "fpt_pts.code",
+      "resourceTypeName":       "frt_pts.name",
+      "processMasterName":      "fpm_pts.name",
+      "processMasterCode":      "fpm_pts.code"
+    },
+    "fieldTypes": {
+      "id":                     "integer",
+      "companyId":              "integer",
+      "processTemplateId":      "integer",
+      "seqNo":                  "integer",
+      "name":                   "string",
+      "resourceTypeId":         "integer",
+      "processMasterId":        "integer",
+      "allowedResourceTypeIds": "text",
+      "formula":                "text",
+      "standardValues":         "text",
+      "subTemplateId":          "integer",
+      "createdAt":              "datetime",
+      "updatedAt":              "datetime",
+      "processTemplateName":    "string",
+      "processTemplateCode":    "string",
+      "resourceTypeName":       "string",
+      "processMasterName":      "string",
+      "processMasterCode":      "string"
+    },
+    "relations": {
+      "processTemplate": {
+        "table": "fab_process_templates",
+        "alias": "fpt_pts",
+        "on":    "fpts.process_template_id = fpt_pts.id",
+        "fields": ["processTemplateName", "processTemplateCode"]
+      },
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_pts",
+        "on":    "fpts.resource_type_id = frt_pts.id",
+        "fields": ["resourceTypeName"]
+      },
+      "processMaster": {
+        "table": "fab_process_master",
+        "alias": "fpm_pts",
+        "on":    "fpts.process_master_id = fpm_pts.id",
+        "fields": ["processMasterName", "processMasterCode"]
+      }
+    }
+  },
+
+  "fabErpItemCatalog": {
+    "table": "fab_item_catalog",
+    "alias": "fic",
+    "writeFields": ["name", "code", "unit", "description", "category_id", "group_id", "subgroup_id",
+      "gross_weight", "net_weight", "weight_unit",
+      "volume", "volume_unit",
+      "length", "width", "height", "dimension_unit",
+      "barcode", "hsn_code", "division",
+      "material_type", "purchase_cost",
+      "procurement_type", "lead_time_days", "mrp_active"],
+    "fields": {
+      "id":            "fic.id",
+      "companyId":     "fic.company_id",
+      "name":          "fic.name",
+      "code":          "fic.code",
+      "unit":          "fic.unit",
+      "description":   "fic.description",
+      "categoryId":    "fic.category_id",
+      "groupId":       "fic.group_id",
+      "subgroupId":    "fic.subgroup_id",
+      "grossWeight":   "fic.gross_weight",
+      "netWeight":     "fic.net_weight",
+      "weightUnit":    "fic.weight_unit",
+      "volume":        "fic.volume",
+      "volumeUnit":    "fic.volume_unit",
+      "length":        "fic.length",
+      "width":         "fic.width",
+      "height":        "fic.height",
+      "dimensionUnit": "fic.dimension_unit",
+      "barcode":       "fic.barcode",
+      "hsnCode":       "fic.hsn_code",
+      "division":      "fic.division",
+      "materialType":  "fic.material_type",
+      "purchaseCost":  "fic.purchase_cost",
+      "procurementType": "fic.procurement_type",
+      "leadTimeDays":    "fic.lead_time_days",
+      "mrpActive":       "fic.mrp_active",
+      "createdAt":     "fic.created_at",
+      "updatedAt":     "fic.updated_at",
+      "categoryName":  "fic_cat.name",
+      "groupName":     "fig_grp.name",
+      "subgroupName":  "fisg_sub.name"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "companyId":     "integer",
+      "name":          "string",
+      "code":          "string",
+      "unit":          "string",
+      "description":   "string",
+      "categoryId":    "integer",
+      "groupId":       "integer",
+      "subgroupId":    "integer",
+      "grossWeight":   "decimal",
+      "netWeight":     "decimal",
+      "weightUnit":    "string",
+      "volume":        "decimal",
+      "volumeUnit":    "string",
+      "length":        "decimal",
+      "width":         "decimal",
+      "height":        "decimal",
+      "dimensionUnit": "string",
+      "barcode":       "string",
+      "hsnCode":       "string",
+      "division":      "string",
+      "materialType":  "string",
+      "purchaseCost":  "decimal",
+      "procurementType": "string",
+      "leadTimeDays":    "integer",
+      "mrpActive":       "integer",
+      "createdAt":     "datetime",
+      "updatedAt":     "datetime",
+      "categoryName":  "string",
+      "groupName":     "string",
+      "subgroupName":  "string"
+    },
+    "relations": {
+      "category": {
+        "table": "fab_item_categories",
+        "alias": "fic_cat",
+        "on":    "fic.category_id = fic_cat.id",
+        "fields": ["categoryName"]
+      },
+      "group": {
+        "table": "fab_item_groups",
+        "alias": "fig_grp",
+        "on":    "fic.group_id = fig_grp.id",
+        "fields": ["groupName"]
+      },
+      "subgroup": {
+        "table": "fab_item_subgroups",
+        "alias": "fisg_sub",
+        "on":    "fic.subgroup_id = fisg_sub.id",
+        "fields": ["subgroupName"]
+      }
+    }
+  },
+
+  "fabErpItem": {
+    "table": "fab_items",
+    "alias": "fi",
+    "writeFields": ["project_id", "parent_item_id", "catalog_item_id", "name", "unit", "qty"],
+    "fields": {
+      "id":              "fi.id",
+      "companyId":       "fi.company_id",
+      "projectId":       "fi.project_id",
+      "parentItemId":    "fi.parent_item_id",
+      "catalogItemId":   "fi.catalog_item_id",
+      "name":            "fi.name",
+      "unit":            "fi.unit",
+      "qty":             "fi.qty",
+      "createdAt":       "fi.created_at",
+      "updatedAt":       "fi.updated_at",
+      "projectName":     "fproj_fi.name",
+      "projectCode":     "fproj_fi.code",
+      "catalogItemCode": "fic_item.code",
+      "catalogItemUnit": "fic_item.unit"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "projectId":       "integer",
+      "parentItemId":    "integer",
+      "catalogItemId":   "integer",
+      "name":            "string",
+      "unit":            "string",
+      "qty":             "decimal",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime",
+      "projectName":     "string",
+      "projectCode":     "string",
+      "catalogItemCode": "string",
+      "catalogItemUnit": "string"
+    },
+    "relations": {
+      "project": {
+        "table": "fab_projects",
+        "alias": "fproj_fi",
+        "on":    "fi.project_id = fproj_fi.id",
+        "fields": ["projectName", "projectCode"]
+      },
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_item",
+        "on":    "fi.catalog_item_id = fic_item.id",
+        "fields": ["catalogItemCode", "catalogItemUnit"]
+      }
+    }
+  },
+
+  "fabErpItemMetricValue": {
+    "table": "fab_item_metric_values",
+    "alias": "fimv",
+    "writeFields": ["item_id", "metric_key", "metric_value"],
+    "fields": {
+      "id":          "fimv.id",
+      "companyId":   "fimv.company_id",
+      "itemId":      "fimv.item_id",
+      "metricKey":   "fimv.metric_key",
+      "metricValue": "fimv.metric_value",
+      "createdAt":   "fimv.created_at",
+      "updatedAt":   "fimv.updated_at",
+      "itemName":    "fi_imv.name"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "itemId":      "integer",
+      "metricKey":   "string",
+      "metricValue": "decimal",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime",
+      "itemName":    "string"
+    },
+    "relations": {
+      "item": {
+        "table": "fab_items",
+        "alias": "fi_imv",
+        "on":    "fimv.item_id = fi_imv.id",
+        "fields": ["itemName"]
+      }
+    }
+  },
+
+  "fabErpShiftCalendar": {
+    "table": "fab_shift_calendars",
+    "alias": "fsc",
+    "writeFields": ["plant_id", "name", "code"],
+    "fields": {
+      "id":        "fsc.id",
+      "companyId": "fsc.company_id",
+      "plantId":   "fsc.plant_id",
+      "name":      "fsc.name",
+      "code":      "fsc.code",
+      "createdAt": "fsc.created_at",
+      "updatedAt": "fsc.updated_at",
+      "plantName": "fpl_sc.name",
+      "plantCode": "fpl_sc.code"
+    },
+    "fieldTypes": {
+      "id":        "integer",
+      "companyId": "integer",
+      "plantId":   "integer",
+      "name":      "string",
+      "code":      "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "plantName": "string",
+      "plantCode": "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_sc",
+        "on":    "fsc.plant_id = fpl_sc.id",
+        "fields": ["plantName", "plantCode"]
+      }
+    }
+  },
+
+  "fabErpShift": {
+    "table": "fab_shifts",
+    "alias": "fsft",
+    "writeFields": ["calendar_id", "name", "start_time", "end_time", "working_minutes"],
+    "fields": {
+      "id":             "fsft.id",
+      "companyId":      "fsft.company_id",
+      "calendarId":     "fsft.calendar_id",
+      "name":           "fsft.name",
+      "startTime":      "fsft.start_time",
+      "endTime":        "fsft.end_time",
+      "workingMinutes": "fsft.working_minutes",
+      "createdAt":      "fsft.created_at",
+      "updatedAt":      "fsft.updated_at",
+      "calendarName":   "fsc_sft.name",
+      "calendarCode":   "fsc_sft.code"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "companyId":      "integer",
+      "calendarId":     "integer",
+      "name":           "string",
+      "startTime":      "string",
+      "endTime":        "string",
+      "workingMinutes": "integer",
+      "createdAt":      "datetime",
+      "updatedAt":      "datetime",
+      "calendarName":   "string",
+      "calendarCode":   "string"
+    },
+    "relations": {
+      "calendar": {
+        "table": "fab_shift_calendars",
+        "alias": "fsc_sft",
+        "on":    "fsft.calendar_id = fsc_sft.id",
+        "fields": ["calendarName", "calendarCode"]
+      }
+    }
+  },
+
+  "fabErpCalendarDay": {
+    "table": "fab_calendar_days",
+    "alias": "fcd",
+    "writeFields": ["calendar_id", "day_date", "is_working"],
+    "fields": {
+      "id":           "fcd.id",
+      "companyId":    "fcd.company_id",
+      "calendarId":   "fcd.calendar_id",
+      "dayDate":      "fcd.day_date",
+      "isWorking":    "fcd.is_working",
+      "createdAt":    "fcd.created_at",
+      "updatedAt":    "fcd.updated_at",
+      "calendarName": "fsc_cd.name",
+      "calendarCode": "fsc_cd.code"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "calendarId":   "integer",
+      "dayDate":      "string",
+      "isWorking":    "integer",
+      "createdAt":    "datetime",
+      "updatedAt":    "datetime",
+      "calendarName": "string",
+      "calendarCode": "string"
+    },
+    "relations": {
+      "calendar": {
+        "table": "fab_shift_calendars",
+        "alias": "fsc_cd",
+        "on":    "fcd.calendar_id = fsc_cd.id",
+        "fields": ["calendarName", "calendarCode"]
+      }
+    }
+  },
+
+  "fabErpItemCategory": {
+    "table": "fab_item_categories",
+    "alias": "fic2",
+    "writeFields": ["name", "code", "description", "is_system"],
+    "fields": {
+      "id":          "fic2.id",
+      "companyId":   "fic2.company_id",
+      "name":        "fic2.name",
+      "code":        "fic2.code",
+      "description": "fic2.description",
+      "isSystem":    "fic2.is_system",
+      "createdAt":   "fic2.created_at",
+      "updatedAt":   "fic2.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "name":        "string",
+      "code":        "string",
+      "description": "string",
+      "isSystem":    "integer",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpItemGroup": {
+    "table": "fab_item_groups",
+    "alias": "fig",
+    "writeFields": ["category_id", "name", "code", "description", "is_system"],
+    "fields": {
+      "id":           "fig.id",
+      "companyId":    "fig.company_id",
+      "categoryId":   "fig.category_id",
+      "name":         "fig.name",
+      "code":         "fig.code",
+      "description":  "fig.description",
+      "isSystem":     "fig.is_system",
+      "createdAt":    "fig.created_at",
+      "updatedAt":    "fig.updated_at",
+      "categoryName": "fic_g.name"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "categoryId":   "integer",
+      "name":         "string",
+      "code":         "string",
+      "description":  "string",
+      "isSystem":     "integer",
+      "createdAt":    "datetime",
+      "updatedAt":    "datetime",
+      "categoryName": "string"
+    },
+    "relations": {
+      "category": {
+        "table": "fab_item_categories",
+        "alias": "fic_g",
+        "on":    "fig.category_id = fic_g.id",
+        "fields": ["categoryName"]
+      }
+    }
+  },
+
+  "fabErpItemSubgroup": {
+    "table": "fab_item_subgroups",
+    "alias": "fisg",
+    "writeFields": ["group_id", "name", "code", "description", "is_system"],
+    "fields": {
+      "id":          "fisg.id",
+      "companyId":   "fisg.company_id",
+      "groupId":     "fisg.group_id",
+      "name":        "fisg.name",
+      "code":        "fisg.code",
+      "description": "fisg.description",
+      "isSystem":    "fisg.is_system",
+      "createdAt":   "fisg.created_at",
+      "updatedAt":   "fisg.updated_at",
+      "groupName":   "fig_sg.name"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "groupId":     "integer",
+      "name":        "string",
+      "code":        "string",
+      "description": "string",
+      "isSystem":    "integer",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime",
+      "groupName":   "string"
+    },
+    "relations": {
+      "group": {
+        "table": "fab_item_groups",
+        "alias": "fig_sg",
+        "on":    "fisg.group_id = fig_sg.id",
+        "fields": ["groupName"]
+      }
+    }
+  },
+
+  "fabErpStockLocation": {
+    "table": "fab_stock_locations",
+    "alias": "fsl",
+    "writeFields": ["plant_id", "name", "code", "description"],
+    "fields": {
+      "id":          "fsl.id",
+      "companyId":   "fsl.company_id",
+      "plantId":     "fsl.plant_id",
+      "name":        "fsl.name",
+      "code":        "fsl.code",
+      "description": "fsl.description",
+      "createdAt":   "fsl.created_at",
+      "updatedAt":   "fsl.updated_at",
+      "plantName":   "fpl_sl.name",
+      "plantCode":   "fpl_sl.code"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "plantId":     "integer",
+      "name":        "string",
+      "code":        "string",
+      "description": "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime",
+      "plantName":   "string",
+      "plantCode":   "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_sl",
+        "on":    "fsl.plant_id = fpl_sl.id",
+        "fields": ["plantName", "plantCode"]
+      }
+    }
+  },
+
+  "fabErpSupplier": {
+    "table": "fab_suppliers",
+    "alias": "fsup",
+    "writeFields": ["name", "code", "contact_name", "phone", "email", "address", "notes"],
+    "fields": {
+      "id":          "fsup.id",
+      "companyId":   "fsup.company_id",
+      "name":        "fsup.name",
+      "code":        "fsup.code",
+      "contactName": "fsup.contact_name",
+      "phone":       "fsup.phone",
+      "email":       "fsup.email",
+      "address":     "fsup.address",
+      "notes":       "fsup.notes",
+      "createdAt":   "fsup.created_at",
+      "updatedAt":   "fsup.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "name":        "string",
+      "code":        "string",
+      "contactName": "string",
+      "phone":       "string",
+      "email":       "string",
+      "address":     "string",
+      "notes":       "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpStockBalance": {
+    "table": "fab_stock_balances",
+    "alias": "fsb",
+    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "qty_on_hand", "qty_ordered", "qty_earmarked"],
+    "fields": {
+      "id":               "fsb.id",
+      "companyId":        "fsb.company_id",
+      "catalogItemId":    "fsb.catalog_item_id",
+      "plantId":          "fsb.plant_id",
+      "stockLocationId":  "fsb.stock_location_id",
+      "qtyOnHand":        "fsb.qty_on_hand",
+      "qtyOrdered":       "fsb.qty_ordered",
+      "qtyEarmarked":     "fsb.qty_earmarked",
+      "createdAt":        "fsb.created_at",
+      "updatedAt":        "fsb.updated_at",
+      "catalogItemName":  "fic_sb.name",
+      "catalogItemCode":  "fic_sb.code",
+      "unit":             "fic_sb.unit",
+      "plantName":        "fpl_sb.name",
+      "stockLocationName": "fsl_sb.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "qtyOnHand":        "decimal",
+      "qtyOrdered":       "decimal",
+      "qtyEarmarked":     "decimal",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "catalogItemName":  "string",
+      "catalogItemCode":  "string",
+      "unit":             "string",
+      "plantName":        "string",
+      "stockLocationName": "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_sb",
+        "on":    "fsb.catalog_item_id = fic_sb.id",
+        "fields": ["catalogItemName", "catalogItemCode", "unit"]
+      },
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_sb",
+        "on":    "fsb.plant_id = fpl_sb.id",
+        "fields": ["plantName"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_sb",
+        "on":    "fsb.stock_location_id = fsl_sb.id",
+        "fields": ["stockLocationName"]
+      }
+    }
+  },
+
+  "fabErpStockPolicy": {
+    "table": "fab_stock_policies",
+    "alias": "fsp",
+    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "min_qty", "reorder_qty"],
+    "fields": {
+      "id":               "fsp.id",
+      "companyId":        "fsp.company_id",
+      "catalogItemId":    "fsp.catalog_item_id",
+      "plantId":          "fsp.plant_id",
+      "stockLocationId":  "fsp.stock_location_id",
+      "minQty":           "fsp.min_qty",
+      "reorderQty":       "fsp.reorder_qty",
+      "createdAt":        "fsp.created_at",
+      "updatedAt":        "fsp.updated_at",
+      "catalogItemName":  "fic_sp.name",
+      "catalogItemCode":  "fic_sp.code",
+      "unit":             "fic_sp.unit",
+      "plantName":        "fpl_sp.name",
+      "stockLocationName": "fsl_sp.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "minQty":           "decimal",
+      "reorderQty":       "decimal",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "catalogItemName":  "string",
+      "catalogItemCode":  "string",
+      "unit":             "string",
+      "plantName":        "string",
+      "stockLocationName": "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_sp",
+        "on":    "fsp.catalog_item_id = fic_sp.id",
+        "fields": ["catalogItemName", "catalogItemCode", "unit"]
+      },
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_sp",
+        "on":    "fsp.plant_id = fpl_sp.id",
+        "fields": ["plantName"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_sp",
+        "on":    "fsp.stock_location_id = fsl_sp.id",
+        "fields": ["stockLocationName"]
+      }
+    }
+  },
+
+  "fabErpItemBatch": {
+    "table": "fab_item_batches",
+    "alias": "fib",
+    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "batch_code", "qty_on_hand", "received_date", "notes"],
+    "fields": {
+      "id":               "fib.id",
+      "companyId":        "fib.company_id",
+      "catalogItemId":    "fib.catalog_item_id",
+      "plantId":          "fib.plant_id",
+      "stockLocationId":  "fib.stock_location_id",
+      "batchCode":        "fib.batch_code",
+      "qtyOnHand":        "fib.qty_on_hand",
+      "receivedDate":     "fib.received_date",
+      "notes":            "fib.notes",
+      "createdAt":        "fib.created_at",
+      "updatedAt":        "fib.updated_at",
+      "catalogItemName":  "fic_ib.name",
+      "catalogItemCode":  "fic_ib.code",
+      "unit":             "fic_ib.unit",
+      "plantName":        "fpl_ib.name",
+      "stockLocationName": "fsl_ib.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "batchCode":        "string",
+      "qtyOnHand":        "decimal",
+      "receivedDate":     "string",
+      "notes":            "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "catalogItemName":  "string",
+      "catalogItemCode":  "string",
+      "unit":             "string",
+      "plantName":        "string",
+      "stockLocationName": "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_ib",
+        "on":    "fib.catalog_item_id = fic_ib.id",
+        "fields": ["catalogItemName", "catalogItemCode", "unit"]
+      },
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_ib",
+        "on":    "fib.plant_id = fpl_ib.id",
+        "fields": ["plantName"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_ib",
+        "on":    "fib.stock_location_id = fsl_ib.id",
+        "fields": ["stockLocationName"]
+      }
+    }
+  },
+
+  "fabErpGrn": {
+    "table": "fab_grns",
+    "alias": "fgrn",
+    "writeFields": ["grn_number", "grn_date", "plant_id", "stock_location_id", "supplier_id", "supplier_ref", "notes", "status"],
+    "fields": {
+      "id":               "fgrn.id",
+      "companyId":        "fgrn.company_id",
+      "grnNumber":        "fgrn.grn_number",
+      "grnDate":          "fgrn.grn_date",
+      "plantId":          "fgrn.plant_id",
+      "stockLocationId":  "fgrn.stock_location_id",
+      "supplierId":       "fgrn.supplier_id",
+      "supplierRef":      "fgrn.supplier_ref",
+      "notes":            "fgrn.notes",
+      "status":           "fgrn.status",
+      "createdAt":        "fgrn.created_at",
+      "updatedAt":        "fgrn.updated_at",
+      "plantName":        "fpl_g.name",
+      "stockLocationName": "fsl_g.name",
+      "supplierName":     "fsup_g.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "grnNumber":        "string",
+      "grnDate":          "string",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "supplierId":       "integer",
+      "supplierRef":      "string",
+      "notes":            "string",
+      "status":           "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "plantName":        "string",
+      "stockLocationName": "string",
+      "supplierName":     "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_g",
+        "on":    "fgrn.plant_id = fpl_g.id",
+        "fields": ["plantName"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_g",
+        "on":    "fgrn.stock_location_id = fsl_g.id",
+        "fields": ["stockLocationName"]
+      },
+      "supplier": {
+        "table": "fab_suppliers",
+        "alias": "fsup_g",
+        "on":    "fgrn.supplier_id = fsup_g.id",
+        "fields": ["supplierName"]
+      }
+    }
+  },
+
+  "fabErpGrnLine": {
+    "table": "fab_grn_lines",
+    "alias": "fgl",
+    "writeFields": ["grn_id", "catalog_item_id", "batch_id", "batch_code", "qty", "unit_cost"],
+    "fields": {
+      "id":              "fgl.id",
+      "companyId":       "fgl.company_id",
+      "grnId":           "fgl.grn_id",
+      "catalogItemId":   "fgl.catalog_item_id",
+      "batchId":         "fgl.batch_id",
+      "batchCode":       "fgl.batch_code",
+      "qty":             "fgl.qty",
+      "unitCost":        "fgl.unit_cost",
+      "createdAt":       "fgl.created_at",
+      "updatedAt":       "fgl.updated_at",
+      "catalogItemName": "fic_gl.name",
+      "catalogItemCode": "fic_gl.code",
+      "unit":            "fic_gl.unit"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "grnId":           "integer",
+      "catalogItemId":   "integer",
+      "batchId":         "integer",
+      "batchCode":       "string",
+      "qty":             "decimal",
+      "unitCost":        "decimal",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime",
+      "catalogItemName": "string",
+      "catalogItemCode": "string",
+      "unit":            "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_gl",
+        "on":    "fgl.catalog_item_id = fic_gl.id",
+        "fields": ["catalogItemName", "catalogItemCode", "unit"]
+      }
+    }
+  },
+
+  "fabErpMaterialBomItem": {
+    "table": "fab_material_bom_items",
+    "alias": "fmbi",
+    "writeFields": ["catalog_item_id", "ref_catalog_item_id", "name", "qty", "unit", "bom_id", "item_category"],
+    "fields": {
+      "id":               "fmbi.id",
+      "companyId":        "fmbi.company_id",
+      "catalogItemId":    "fmbi.catalog_item_id",
+      "refCatalogItemId": "fmbi.ref_catalog_item_id",
+      "name":             "fmbi.name",
+      "qty":              "fmbi.qty",
+      "unit":             "fmbi.unit",
+      "bomId":            "fmbi.bom_id",
+      "itemCategory":     "fmbi.item_category",
+      "createdAt":        "fmbi.created_at",
+      "updatedAt":        "fmbi.updated_at",
+      "refItemName":      "fic_mbi.name",
+      "refItemCode":      "fic_mbi.code",
+      "refItemUnit":      "fic_mbi.unit"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "refCatalogItemId": "integer",
+      "name":             "string",
+      "qty":              "decimal",
+      "unit":             "string",
+      "bomId":            "integer",
+      "itemCategory":     "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "refItemName":      "string",
+      "refItemCode":      "string",
+      "refItemUnit":      "string"
+    },
+    "relations": {
+      "refCatalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_mbi",
+        "on":    "fmbi.ref_catalog_item_id = fic_mbi.id",
+        "fields": ["refItemName", "refItemCode", "refItemUnit"]
+      }
+    }
+  },
+
+  "fabErpItemConfigValue": {
+    "table": "fab_item_config_values",
+    "alias": "ficv",
+    "writeFields": ["catalog_item_id", "field_key", "field_value", "sort_order"],
+    "fields": {
+      "id":            "ficv.id",
+      "companyId":     "ficv.company_id",
+      "catalogItemId": "ficv.catalog_item_id",
+      "fieldKey":      "ficv.field_key",
+      "fieldValue":    "ficv.field_value",
+      "sortOrder":     "ficv.sort_order",
+      "createdAt":     "ficv.created_at",
+      "updatedAt":     "ficv.updated_at"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "companyId":     "integer",
+      "catalogItemId": "integer",
+      "fieldKey":      "string",
+      "fieldValue":    "string",
+      "sortOrder":     "integer",
+      "createdAt":     "datetime",
+      "updatedAt":     "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpMaterialBom": {
+    "table": "fab_material_boms",
+    "alias": "fmb",
+    "writeFields": ["catalog_item_id", "name", "description", "is_default", "base_qty", "base_unit"],
+    "fields": {
+      "id":            "fmb.id",
+      "companyId":     "fmb.company_id",
+      "catalogItemId": "fmb.catalog_item_id",
+      "name":          "fmb.name",
+      "description":   "fmb.description",
+      "isDefault":     "fmb.is_default",
+      "baseQty":       "fmb.base_qty",
+      "baseUnit":      "fmb.base_unit",
+      "createdAt":     "fmb.created_at",
+      "updatedAt":     "fmb.updated_at"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "companyId":     "integer",
+      "catalogItemId": "integer",
+      "name":          "string",
+      "description":   "string",
+      "isDefault":     "integer",
+      "baseQty":       "decimal",
+      "baseUnit":      "string",
+      "createdAt":     "datetime",
+      "updatedAt":     "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpOrder": {
+    "table": "fab_orders",
+    "alias": "fo",
+    "writeFields": ["order_number","order_type","type","status","customer_name","customer_po_ref","plant_id","catalog_item_id","qty","unit","required_date","confirmed_date","scheduled_start","scheduled_end","scheduled_ship_date","parent_order_id","source_order_id","source_order_line_id","bom_id","routing_plan_id","delivery_address","payment_terms","currency","supplier_id","supplier_ref","priority","mrp_controller","notes","created_by"],
+    "fields": {
+      "id":                  "fo.id",
+      "companyId":           "fo.company_id",
+      "orderNumber":         "fo.order_number",
+      "orderType":           "fo.order_type",
+      "type":                "fo.type",
+      "status":              "fo.status",
+      "customerName":        "fo.customer_name",
+      "customerPoRef":       "fo.customer_po_ref",
+      "plantId":             "fo.plant_id",
+      "catalogItemId":       "fo.catalog_item_id",
+      "qty":                 "fo.qty",
+      "unit":                "fo.unit",
+      "requiredDate":        "fo.required_date",
+      "confirmedDate":       "fo.confirmed_date",
+      "scheduledStart":      "fo.scheduled_start",
+      "scheduledEnd":        "fo.scheduled_end",
+      "scheduledShipDate":   "fo.scheduled_ship_date",
+      "parentOrderId":       "fo.parent_order_id",
+      "sourceOrderId":       "fo.source_order_id",
+      "sourceOrderLineId":   "fo.source_order_line_id",
+      "bomId":               "fo.bom_id",
+      "routingPlanId":       "fo.routing_plan_id",
+      "deliveryAddress":     "fo.delivery_address",
+      "paymentTerms":        "fo.payment_terms",
+      "currency":            "fo.currency",
+      "supplierId":          "fo.supplier_id",
+      "supplierRef":         "fo.supplier_ref",
+      "priority":            "fo.priority",
+      "mrpController":       "fo.mrp_controller",
+      "notes":               "fo.notes",
+      "createdBy":           "fo.created_by",
+      "createdAt":           "fo.created_at",
+      "updatedAt":           "fo.updated_at",
+      "plantName":           "fpl_o.name",
+      "plantCode":           "fpl_o.code"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "orderNumber":         "string",
+      "orderType":           "string",
+      "type":                "string",
+      "status":              "string",
+      "customerName":        "string",
+      "customerPoRef":       "string",
+      "plantId":             "integer",
+      "catalogItemId":       "integer",
+      "qty":                 "decimal",
+      "unit":                "string",
+      "requiredDate":        "string",
+      "confirmedDate":       "string",
+      "scheduledStart":      "datetime",
+      "scheduledEnd":        "datetime",
+      "scheduledShipDate":   "string",
+      "parentOrderId":       "integer",
+      "sourceOrderId":       "integer",
+      "sourceOrderLineId":   "integer",
+      "bomId":               "integer",
+      "routingPlanId":       "integer",
+      "deliveryAddress":     "string",
+      "paymentTerms":        "string",
+      "currency":            "string",
+      "supplierId":          "integer",
+      "supplierRef":         "string",
+      "priority":            "string",
+      "mrpController":       "string",
+      "notes":               "string",
+      "createdBy":           "integer",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime",
+      "plantName":           "string",
+      "plantCode":           "string"
+    },
+    "relations": {
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_o",
+        "on":    "fo.plant_id = fpl_o.id",
+        "fields": ["plantName","plantCode"]
+      }
+    }
+  },
+
+  "fabErpOrderLine": {
+    "table": "fab_order_lines",
+    "alias": "fol",
+    "writeFields": ["order_id","line_no","catalog_item_id","qty","unit","unit_price","discount","target_plant_id","requested_date","bom_id","routing_plan_id","status","qty_completed","scheduled_start","scheduled_end","notes"],
+    "fields": {
+      "id":              "fol.id",
+      "companyId":       "fol.company_id",
+      "orderId":         "fol.order_id",
+      "lineNo":          "fol.line_no",
+      "catalogItemId":   "fol.catalog_item_id",
+      "qty":             "fol.qty",
+      "unit":            "fol.unit",
+      "unitPrice":       "fol.unit_price",
+      "discount":        "fol.discount",
+      "targetPlantId":   "fol.target_plant_id",
+      "requestedDate":   "fol.requested_date",
+      "bomId":           "fol.bom_id",
+      "routingPlanId":   "fol.routing_plan_id",
+      "status":          "fol.status",
+      "qtyCompleted":    "fol.qty_completed",
+      "scheduledStart":  "fol.scheduled_start",
+      "scheduledEnd":    "fol.scheduled_end",
+      "notes":           "fol.notes",
+      "createdAt":       "fol.created_at",
+      "updatedAt":       "fol.updated_at",
+      "catalogItemName": "fic_ol.name",
+      "catalogItemCode": "fic_ol.code",
+      "catalogItemUnit": "fic_ol.unit",
+      "targetPlantName": "fpl_ol.name"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "orderId":         "integer",
+      "lineNo":          "integer",
+      "catalogItemId":   "integer",
+      "qty":             "decimal",
+      "unit":            "string",
+      "unitPrice":       "decimal",
+      "discount":        "decimal",
+      "targetPlantId":   "integer",
+      "requestedDate":   "string",
+      "bomId":           "integer",
+      "routingPlanId":   "integer",
+      "status":          "string",
+      "qtyCompleted":    "decimal",
+      "scheduledStart":  "datetime",
+      "scheduledEnd":    "datetime",
+      "notes":           "string",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime",
+      "catalogItemName": "string",
+      "catalogItemCode": "string",
+      "catalogItemUnit": "string",
+      "targetPlantName": "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_ol",
+        "on":    "fol.catalog_item_id = fic_ol.id",
+        "fields": ["catalogItemName","catalogItemCode","catalogItemUnit"]
+      },
+      "targetPlant": {
+        "table": "fab_plants",
+        "alias": "fpl_ol",
+        "on":    "fol.target_plant_id = fpl_ol.id",
+        "fields": ["targetPlantName"]
+      }
+    }
+  },
+
+  "fabErpSupplierItem": {
+    "table": "fab_supplier_items",
+    "alias": "fsuppi",
+    "writeFields": ["supplier_id","catalog_item_id","lead_time_days","unit_cost","currency","min_order_qty","is_preferred","notes"],
+    "fields": {
+      "id":              "fsuppi.id",
+      "companyId":       "fsuppi.company_id",
+      "supplierId":      "fsuppi.supplier_id",
+      "catalogItemId":   "fsuppi.catalog_item_id",
+      "leadTimeDays":    "fsuppi.lead_time_days",
+      "unitCost":        "fsuppi.unit_cost",
+      "currency":        "fsuppi.currency",
+      "minOrderQty":     "fsuppi.min_order_qty",
+      "isPreferred":     "fsuppi.is_preferred",
+      "notes":           "fsuppi.notes",
+      "createdAt":       "fsuppi.created_at",
+      "updatedAt":       "fsuppi.updated_at",
+      "supplierName":    "fsup_si.name",
+      "supplierCode":    "fsup_si.code",
+      "catalogItemName": "fic_si.name",
+      "catalogItemCode": "fic_si.code",
+      "catalogItemUnit": "fic_si.unit"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "supplierId":      "integer",
+      "catalogItemId":   "integer",
+      "leadTimeDays":    "integer",
+      "unitCost":        "decimal",
+      "currency":        "string",
+      "minOrderQty":     "decimal",
+      "isPreferred":     "integer",
+      "notes":           "string",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime",
+      "supplierName":    "string",
+      "supplierCode":    "string",
+      "catalogItemName": "string",
+      "catalogItemCode": "string",
+      "catalogItemUnit": "string"
+    },
+    "relations": {
+      "supplier": {
+        "table": "fab_suppliers",
+        "alias": "fsup_si",
+        "on":    "fsuppi.supplier_id = fsup_si.id",
+        "fields": ["supplierName","supplierCode"]
+      },
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_si",
+        "on":    "fsuppi.catalog_item_id = fic_si.id",
+        "fields": ["catalogItemName","catalogItemCode","catalogItemUnit"]
+      }
+    }
+  },
+
+  "fabErpCustomField": {
+    "table": "fab_custom_fields",
+    "alias": "fcf",
+    "writeFields": ["level", "level_id", "field_key", "field_type", "field_value", "sort_order"],
+    "fields": {
+      "id":         "fcf.id",
+      "companyId":  "fcf.company_id",
+      "level":      "fcf.level",
+      "levelId":    "fcf.level_id",
+      "fieldKey":   "fcf.field_key",
+      "fieldType":  "fcf.field_type",
+      "fieldValue": "fcf.field_value",
+      "sortOrder":  "fcf.sort_order",
+      "createdAt":  "fcf.created_at",
+      "updatedAt":  "fcf.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "level":      "string",
+      "levelId":    "integer",
+      "fieldKey":   "string",
+      "fieldType":  "string",
+      "fieldValue": "string",
+      "sortOrder":  "integer",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpStockLedger": {
+    "table": "fab_stock_ledger",
+    "alias": "fsled",
+    "writeFields": [],
+    "fields": {
+      "id":               "fsled.id",
+      "companyId":        "fsled.company_id",
+      "catalogItemId":    "fsled.catalog_item_id",
+      "plantId":          "fsled.plant_id",
+      "stockLocationId":  "fsled.stock_location_id",
+      "batchId":          "fsled.batch_id",
+      "batchCode":        "fsled.batch_code",
+      "txnType":          "fsled.txn_type",
+      "qty":              "fsled.qty",
+      "unitCost":         "fsled.unit_cost",
+      "supplierId":       "fsled.supplier_id",
+      "grnId":            "fsled.grn_id",
+      "grnLineId":        "fsled.grn_line_id",
+      "txnDate":          "fsled.txn_date",
+      "notes":            "fsled.notes",
+      "createdAt":        "fsled.created_at",
+      "updatedAt":        "fsled.updated_at",
+      "catalogItemName":  "fic_ldg.name",
+      "catalogItemCode":  "fic_ldg.code",
+      "unit":             "fic_ldg.unit",
+      "plantName":        "fpl_ldg.name",
+      "stockLocationName": "fsl_ldg.name",
+      "supplierName":     "fsup_ldg.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "batchId":          "integer",
+      "batchCode":        "string",
+      "txnType":          "string",
+      "qty":              "decimal",
+      "unitCost":         "decimal",
+      "supplierId":       "integer",
+      "grnId":            "integer",
+      "grnLineId":        "integer",
+      "txnDate":          "string",
+      "notes":            "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "catalogItemName":  "string",
+      "catalogItemCode":  "string",
+      "unit":             "string",
+      "plantName":        "string",
+      "stockLocationName": "string",
+      "supplierName":     "string"
+    },
+    "relations": {
+      "catalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_ldg",
+        "on":    "fsled.catalog_item_id = fic_ldg.id",
+        "fields": ["catalogItemName", "catalogItemCode", "unit"]
+      },
+      "plant": {
+        "table": "fab_plants",
+        "alias": "fpl_ldg",
+        "on":    "fsled.plant_id = fpl_ldg.id",
+        "fields": ["plantName"]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_ldg",
+        "on":    "fsled.stock_location_id = fsl_ldg.id",
+        "fields": ["stockLocationName"]
+      },
+      "supplier": {
+        "table": "fab_suppliers",
+        "alias": "fsup_ldg",
+        "on":    "fsled.supplier_id = fsup_ldg.id",
+        "fields": ["supplierName"]
+      }
+    }
+  },
+
+  "fabErpResourceCustomField": {
+    "table": "fab_resource_custom_fields",
+    "alias": "frcf",
+    "writeFields": ["level", "level_id", "field_key", "field_label", "field_type", "field_value", "sort_order"],
+    "fields": {
+      "id":         "frcf.id",
+      "companyId":  "frcf.company_id",
+      "level":      "frcf.level",
+      "levelId":    "frcf.level_id",
+      "fieldKey":   "frcf.field_key",
+      "fieldLabel": "frcf.field_label",
+      "fieldType":  "frcf.field_type",
+      "fieldValue": "frcf.field_value",
+      "sortOrder":  "frcf.sort_order",
+      "createdAt":  "frcf.created_at",
+      "updatedAt":  "frcf.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "level":      "string",
+      "levelId":    "integer",
+      "fieldKey":   "string",
+      "fieldLabel": "string",
+      "fieldType":  "string",
+      "fieldValue": "string",
+      "sortOrder":  "integer",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    },
+    "relations": {}
+  }
+}

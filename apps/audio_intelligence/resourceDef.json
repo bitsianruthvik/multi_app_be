@@ -1,0 +1,127 @@
+{
+  "audio_recordings": {
+    "table": "audio_recordings",
+    "alias": "ar",
+    "writeFields": ["title", "recorded_by", "recorded_by_role", "audio_url", "audio_data", "idempotency_key", "transcription", "analysis", "score", "keywords_of_improvement", "processed_url", "medicine", "action_id", "status", "duration_seconds", "company_id", "track", "history_block", "new_tran"],
+    "fields": {
+      "id": "ar.id",
+      "title": "ar.title",
+      "recorded_by": "ar.recorded_by",
+      "recorded_by_role": "ar.recorded_by_role",
+      "audio_url": "ar.audio_url",
+      "audio_data": "ar.audio_data",
+      "idempotency_key": "ar.idempotency_key",
+      "transcription": "ar.transcription",
+      "analysis": "ar.analysis",
+      "score": "ar.score",
+      "keywords_of_improvement": "ar.keywords_of_improvement",
+      "processed_url": "ar.processed_url",
+      "medicine": "ar.medicine",
+      "created_at": "ar.created_at",
+      "updated_at": "ar.updated_at",
+      "status": "ar.status",
+      "duration_seconds": "ar.duration_seconds",
+      "company_id": "ar.company_id",
+      "track": "ar.track",
+      "history_block": "ar.history_block",
+      "action_id": "ar.action_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "title": "string",
+      "recorded_by": "string",
+      "recorded_by_role": "string",
+      "audio_url": "string",
+      "audio_data": "text",
+      "idempotency_key": "string",
+      "transcription": "string",
+      "analysis": "text",
+      "score": "integer",
+      "keywords_of_improvement": "text",
+      "medicine": "string",
+      "created_at": "datetime",
+      "updated_at": "datetime",
+      "status": "string",
+      "duration_seconds": "integer",
+      "company_id": "integer",
+      "track": "json",
+      "history_block": "json",
+      "action_id": "integer"
+    }
+  },
+  "actions": {
+    "table": "actions",
+    "alias": "act",
+    "writeFields": ["name", "description", "display_order"],
+    "fields": {
+      "id": "act.id",
+      "name": "act.name",
+      "description": "act.description",
+      "company_id": "act.company_id",
+      "display_order": "act.display_order",
+      "created_at": "act.created_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "description": "text",
+      "company_id": "integer",
+      "display_order": "integer",
+      "created_at": "datetime"
+    }
+  },
+  "company_documents": {
+    "table": "company_documents",
+    "alias": "cd",
+    "writeFields": ["uploader_id", "company_id", "doc_path", "doc_name"],
+    "fields": {
+      "id": "cd.id",
+      "uploader_id": "cd.uploader_id",
+      "company_id": "cd.company_id",
+      "doc_path": "cd.doc_path",
+      "doc_name": "cd.doc_name",
+      "uploaded_at": "cd.uploaded_at",
+      "title": "cd.doc_name",
+      "file_url": "cd.doc_path"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "uploader_id": "integer",
+      "company_id": "integer",
+      "doc_path": "string",
+      "doc_name": "string",
+      "uploaded_at": "datetime",
+      "title": "string",
+      "file_url": "string"
+    }
+  },
+  "team_documents": {
+    "table": "team_documents",
+    "alias": "td",
+    "writeFields": ["team_id", "company_id", "doc_path", "doc_name", "medicines", "medicine"],
+    "fields": {
+      "id": "td.id",
+      "team_id": "td.team_id",
+      "company_id": "td.company_id",
+      "doc_path": "td.doc_path",
+      "doc_name": "td.doc_name",
+      "uploaded_at": "td.uploaded_at",
+      "medicines": "td.medicines",
+      "medicine": "td.medicines",
+      "title": "td.doc_name",
+      "file_url": "td.doc_path"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "team_id": "integer",
+      "company_id": "integer",
+      "doc_path": "string",
+      "doc_name": "string",
+      "uploaded_at": "datetime",
+      "medicines": "string",
+      "medicine": "string",
+      "title": "string",
+      "file_url": "string"
+    }
+  }
+}

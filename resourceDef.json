@@ -1,0 +1,189 @@
+{
+  "users": {
+    "table": "users",
+    "alias": "u",
+    "writeFields": ["name", "email", "age", "status", "password", "company_id", "team_id", "role_id"],
+    "fields": {
+      "id": "u.id",
+      "name": "u.name",
+      "email": "u.email",
+      "age": "u.age",
+      "status": "u.status",
+      "teamName": "t.name",
+      "teamDescription": "t.description",
+      "company_id": "u.company_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "email": "string",
+      "age": "integer",
+      "status": "string",
+      "teamName": "string",
+      "teamDescription": "string",
+      "company_id": "integer"
+    },
+    "aliases": {
+      "id": ["user id", "uid", "identifier"],
+      "name": ["user name", "full name", "personal name", "username"],
+      "email": ["email address", "mail", "user email"],
+      "age": ["user age", "years", "dob"],
+      "status": ["account status", "user status"],
+      "teamName": ["team", "team name", "group name"],
+      "teamDescription": ["team info", "group description"]
+    },
+    "relations": {
+      "team": {
+        "table": "teams",
+        "alias": "t",
+        "on": "u.team_id = t.id",
+        "fields": ["teamName", "teamDescription"]
+      }
+    }
+  },
+  "teams": {
+    "table": "teams",
+    "alias": "t",
+    "writeFields": ["name", "company_id"],
+    "fields": {
+      "id": "t.id",
+      "name": "t.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string"
+    },
+    "aliases": {
+      "id": ["team id", "tid"],
+      "name": ["team name", "group name"]
+    }
+  },
+  "companies": {
+    "table": "companies",
+    "alias": "c",
+    "writeFields": ["name", "slug"],
+    "fields": {
+      "id": "c.id",
+      "name": "c.name",
+      "slug": "c.slug"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "slug": "string"
+    }
+  },
+  "apps": {
+    "table": "apps",
+    "alias": "a",
+    "writeFields": ["name", "slug", "company_id"],
+    "fields": {
+      "id": "a.id",
+      "name": "a.name",
+      "slug": "a.slug",
+      "company_id": "a.company_id",
+      "is_public": "a.is_public"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "slug": "string",
+      "company_id": "integer",
+      "is_public": "integer"
+    }
+  },
+  "roles": {
+    "table": "roles",
+    "alias": "r",
+    "writeFields": ["name", "company_id"],
+    "fields": {
+      "id": "r.id",
+      "name": "r.name",
+      "company_id": "r.company_id",
+      "role_tag": "r.role_tag"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "company_id": "integer",
+      "role_tag": "string"
+    }
+  },
+  "features": {
+    "table": "features",
+    "alias": "f",
+    "writeFields": ["feature_name", "feature_tag", "type"],
+    "fields": {
+      "id": "f.id",
+      "name": "f.name",
+      "feature_name": "f.feature_name",
+      "feature_tag": "f.feature_tag",
+      "type": "f.type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "name": "string",
+      "feature_name": "string",
+      "feature_tag": "string",
+      "type": "string"
+    }
+  },
+  "features_capability": {
+    "table": "features_capability",
+    "alias": "fc",
+    "writeFields": ["name", "features_json"],
+    "fields": {
+      "id": "fc.id",
+      "feature_id": "fc.feature_id",
+      "capability_id": "fc.capability_id",
+      "name": "fc.name",
+      "features_json": "fc.features_json"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "feature_id": "integer",
+      "capability_id": "integer",
+      "name": "string"
+    }
+  },
+  "role_capability": {
+    "table": "role_capability",
+    "alias": "rc",
+    "writeFields": ["role_id", "team_id", "company_id", "capability_id"],
+    "fields": {
+      "id": "rc.id",
+      "role_id": "rc.role_id",
+      "team_id": "rc.team_id",
+      "company_id": "rc.company_id",
+      "capability_id": "rc.capability_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "role_id": "integer",
+      "team_id": "integer",
+      "company_id": "integer",
+      "capability_id": "integer"
+    }
+  },
+  "app_user_access": {
+    "table": "app_user_access",
+    "alias": "aua",
+    "writeFields": ["user_id", "app_id", "role_id"],
+    "fields": {
+      "id": "aua.id",
+      "user_id": "aua.user_id",
+      "app_id": "aua.app_id",
+      "role_id": "aua.role_id",
+      "company_id": "aua.company_id",
+      "created_at": "aua.created_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "user_id": "integer",
+      "app_id": "integer",
+      "role_id": "integer",
+      "company_id": "integer",
+      "created_at": "datetime"
+    }
+  }
+}

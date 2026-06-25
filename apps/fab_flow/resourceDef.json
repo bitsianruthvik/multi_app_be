@@ -1,0 +1,989 @@
+{
+  "fab_project_plans": {
+    "table": "fab_project_plans",
+    "alias": "fpp",
+    "writeFields": ["project_code","project_name","client_name","site_location","plan_name","plan_revision","status","source","notes","company_id","created_by","calendar_id","planned_start_date","target_end_date","scheduling_mode"],
+    "fields": {
+      "id":                "fpp.id",
+      "projectCode":       "fpp.project_code",
+      "projectName":       "fpp.project_name",
+      "clientName":        "fpp.client_name",
+      "siteLocation":      "fpp.site_location",
+      "planName":          "fpp.plan_name",
+      "planRevision":      "fpp.plan_revision",
+      "status":            "fpp.status",
+      "source":            "fpp.source",
+      "notes":             "fpp.notes",
+      "companyId":         "fpp.company_id",
+      "createdBy":         "fpp.created_by",
+      "approvedBy":        "fpp.approved_by",
+      "approvedAt":        "fpp.approved_at",
+      "calendarId":        "fpp.calendar_id",
+      "plannedStartDate":  "fpp.planned_start_date",
+      "targetEndDate":     "fpp.target_end_date",
+      "schedulingMode":    "fpp.scheduling_mode",
+      "createdAt":         "fpp.created_at",
+      "updatedAt":         "fpp.updated_at",
+      "createdByName":     "ucb.name",
+      "approvedByName":    "uab.name"
+    },
+    "fieldTypes": {
+      "id":                "integer",
+      "projectCode":       "string",
+      "projectName":       "string",
+      "clientName":        "string",
+      "siteLocation":      "string",
+      "planName":          "string",
+      "planRevision":      "string",
+      "status":            "string",
+      "source":            "string",
+      "notes":             "text",
+      "companyId":         "integer",
+      "createdBy":         "integer",
+      "approvedBy":        "integer",
+      "approvedAt":        "datetime",
+      "calendarId":        "integer",
+      "plannedStartDate":  "string",
+      "targetEndDate":     "string",
+      "schedulingMode":    "string",
+      "createdAt":         "datetime",
+      "updatedAt":         "datetime",
+      "createdByName":     "string",
+      "approvedByName":    "string"
+    },
+    "aliases": {
+      "projectCode":       ["project code","project id","project ref","job code"],
+      "projectName":       ["project name","project title","job name"],
+      "clientName":        ["client","client name","customer"],
+      "planName":          ["plan name","plan title","fabrication plan"],
+      "planRevision":      ["revision","plan revision","rev","version"],
+      "status":            ["status","plan status","state"],
+      "createdByName":     ["created by","author","plan owner","raised by"],
+      "approvedByName":    ["approved by","approver","sign off"]
+    },
+    "relations": {
+      "createdByUser": {
+        "table": "users",
+        "alias": "ucb",
+        "on":    "fpp.created_by = ucb.id",
+        "fields": ["createdByName"]
+      },
+      "approvedByUser": {
+        "table": "users",
+        "alias": "uab",
+        "on":    "fpp.approved_by = uab.id",
+        "fields": ["approvedByName"]
+      }
+    }
+  },
+
+  "fab_nodes": {
+    "table": "fab_nodes",
+    "alias": "fn",
+    "writeFields": ["project_plan_id","node_code","display_name","level_name","description","quantity","unit","drawing_ref","drawing_sheet_no","drawing_revision","material_grade","profile","length_mm","width_mm","thickness_mm","weight_kg","location_ref","dispatchable","preferred_work_area_id","notes"],
+    "fields": {
+      "id":                  "fn.id",
+      "projectPlanId":       "fn.project_plan_id",
+      "nodeCode":            "fn.node_code",
+      "displayName":         "fn.display_name",
+      "levelName":           "fn.level_name",
+      "description":         "fn.description",
+      "quantity":            "fn.quantity",
+      "unit":                "fn.unit",
+      "drawingRef":          "fn.drawing_ref",
+      "drawingSheetNo":      "fn.drawing_sheet_no",
+      "drawingRevision":     "fn.drawing_revision",
+      "materialGrade":       "fn.material_grade",
+      "profile":             "fn.profile",
+      "lengthMm":            "fn.length_mm",
+      "widthMm":             "fn.width_mm",
+      "thicknessMm":         "fn.thickness_mm",
+      "weightKg":            "fn.weight_kg",
+      "locationRef":         "fn.location_ref",
+      "dispatchable":        "fn.dispatchable",
+      "preferredWorkAreaId": "fn.preferred_work_area_id",
+      "notes":               "fn.notes",
+      "createdAt":           "fn.created_at",
+      "updatedAt":           "fn.updated_at",
+      "planName":            "fpp_n.plan_name",
+      "projectCode":         "fpp_n.project_code"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "projectPlanId":       "integer",
+      "nodeCode":            "string",
+      "displayName":         "string",
+      "levelName":           "string",
+      "description":         "text",
+      "quantity":            "decimal",
+      "unit":                "string",
+      "drawingRef":          "string",
+      "drawingSheetNo":      "string",
+      "drawingRevision":     "string",
+      "materialGrade":       "string",
+      "profile":             "string",
+      "lengthMm":            "decimal",
+      "widthMm":             "decimal",
+      "thicknessMm":         "decimal",
+      "weightKg":            "decimal",
+      "locationRef":         "string",
+      "dispatchable":        "integer",
+      "preferredWorkAreaId": "integer",
+      "notes":               "text",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime",
+      "planName":            "string",
+      "projectCode":         "string"
+    },
+    "aliases": {
+      "nodeCode":      ["node code","node id","code","mark","member mark","item code"],
+      "displayName":   ["name","node name","display name","member name","description"],
+      "levelName":     ["level","level name","type","category","hierarchy"],
+      "quantity":      ["qty","quantity","count","nos"],
+      "materialGrade": ["material","grade","material grade","steel grade"],
+      "profile":       ["profile","section","cross section","size","dimension"],
+      "weightKg":      ["weight","weight kg","mass","kg"],
+      "drawingRef":    ["drawing","drawing reference","drg ref","drawing number"]
+    },
+    "relations": {
+      "plan": {
+        "table": "fab_project_plans",
+        "alias": "fpp_n",
+        "on":    "fn.project_plan_id = fpp_n.id",
+        "fields": ["planName","projectCode"]
+      }
+    }
+  },
+
+  "fab_node_relationships": {
+    "table": "fab_node_relationships",
+    "alias": "fnr",
+    "writeFields": ["project_plan_id","parent_node_id","child_node_id","quantity_required","relationship_type","is_primary","notes"],
+    "fields": {
+      "id":               "fnr.id",
+      "projectPlanId":    "fnr.project_plan_id",
+      "parentNodeId":     "fnr.parent_node_id",
+      "childNodeId":      "fnr.child_node_id",
+      "quantityRequired": "fnr.quantity_required",
+      "relationshipType": "fnr.relationship_type",
+      "isPrimary":        "fnr.is_primary",
+      "notes":            "fnr.notes",
+      "createdAt":        "fnr.created_at"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "projectPlanId":    "integer",
+      "parentNodeId":     "integer",
+      "childNodeId":      "integer",
+      "quantityRequired": "decimal",
+      "relationshipType": "string",
+      "isPrimary":        "integer",
+      "notes":            "text",
+      "createdAt":        "datetime"
+    },
+    "aliases": {
+      "parentNodeId":     ["parent","parent node","parent id","assembly"],
+      "childNodeId":      ["child","child node","child id","component","sub item"],
+      "quantityRequired": ["qty required","quantity required","qty needed"],
+      "relationshipType": ["type","relationship type","relation","link type"],
+      "isPrimary":        ["primary","is primary","main parent","primary parent"]
+    }
+  },
+
+  "fab_process_steps": {
+    "table": "fab_process_steps",
+    "alias": "fps",
+    "writeFields": ["project_plan_id","company_id","process_step_code","process_name","process_type","sequence_no","parallel_group","machine_or_workcentre_type","estimated_time_value","estimated_time_unit","mandatory","notes","requires_work_area","preferred_work_area_id","requires_machine","estimated_machine_time_value","estimated_machine_time_unit","resource_notes","time_calc_mode","time_metric_key","time_rate_value","time_rate_unit"],
+    "fields": {
+      "id":                          "fps.id",
+      "projectPlanId":               "fps.project_plan_id",
+      "companyId":                   "fps.company_id",
+      "processStepCode":             "fps.process_step_code",
+      "processName":                 "fps.process_name",
+      "processType":                 "fps.process_type",
+      "sequenceNo":                  "fps.sequence_no",
+      "parallelGroup":               "fps.parallel_group",
+      "machineOrWorkcentreType":     "fps.machine_or_workcentre_type",
+      "estimatedTimeValue":          "fps.estimated_time_value",
+      "estimatedTimeUnit":           "fps.estimated_time_unit",
+      "mandatory":                   "fps.mandatory",
+      "notes":                       "fps.notes",
+      "requiresWorkArea":            "fps.requires_work_area",
+      "preferredWorkAreaId":         "fps.preferred_work_area_id",
+      "requiresMachine":             "fps.requires_machine",
+      "estimatedMachineTimeValue":   "fps.estimated_machine_time_value",
+      "estimatedMachineTimeUnit":    "fps.estimated_machine_time_unit",
+      "resourceNotes":               "fps.resource_notes",
+      "timeCalcMode":                "fps.time_calc_mode",
+      "timeMetricKey":               "fps.time_metric_key",
+      "timeRateValue":               "fps.time_rate_value",
+      "timeRateUnit":                "fps.time_rate_unit",
+      "createdAt":                   "fps.created_at",
+      "updatedAt":                   "fps.updated_at"
+    },
+    "fieldTypes": {
+      "id":                          "integer",
+      "projectPlanId":               "integer",
+      "companyId":                   "integer",
+      "processStepCode":             "string",
+      "processName":                 "string",
+      "processType":                 "string",
+      "sequenceNo":                  "integer",
+      "parallelGroup":               "string",
+      "machineOrWorkcentreType":     "string",
+      "estimatedTimeValue":          "decimal",
+      "estimatedTimeUnit":           "string",
+      "mandatory":                   "integer",
+      "notes":                       "text",
+      "requiresWorkArea":            "integer",
+      "preferredWorkAreaId":         "integer",
+      "requiresMachine":             "integer",
+      "estimatedMachineTimeValue":   "decimal",
+      "estimatedMachineTimeUnit":    "string",
+      "resourceNotes":               "text",
+      "timeCalcMode":                "string",
+      "timeMetricKey":               "string",
+      "timeRateValue":               "decimal",
+      "timeRateUnit":                "string",
+      "createdAt":                   "datetime",
+      "updatedAt":                   "datetime"
+    },
+    "aliases": {
+      "processName":             ["process","operation","step","step name","activity"],
+      "processType":             ["type","process type","operation type","category"],
+      "sequenceNo":              ["seq","sequence","order","step number","position"],
+      "parallelGroup":           ["parallel group","parallel","group","concurrent"],
+      "machineOrWorkcentreType": ["machine","workcentre","work centre","equipment","station"],
+      "estimatedTimeValue":      ["time","estimated time","duration","cycle time"],
+      "estimatedTimeUnit":       ["time unit","unit","min or hr"],
+      "mandatory":               ["mandatory","required","must do","obligatory"]
+    }
+  },
+
+  "fab_process_step_node_map": {
+    "table": "fab_process_step_node_map",
+    "alias": "fpsnm",
+    "writeFields": ["process_step_id","node_id","company_id","node_role","quantity","notes"],
+    "fields": {
+      "id":              "fpsnm.id",
+      "processStepId":   "fpsnm.process_step_id",
+      "nodeId":          "fpsnm.node_id",
+      "companyId":       "fpsnm.company_id",
+      "nodeRole":        "fpsnm.node_role",
+      "quantity":        "fpsnm.quantity",
+      "notes":           "fpsnm.notes",
+      "createdAt":       "fpsnm.created_at",
+      "nodeCode":        "fn_nm.node_code",
+      "nodeDisplayName": "fn_nm.display_name",
+      "processName":     "fps_nm.process_name",
+      "processStepCode": "fps_nm.process_step_code"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "processStepId":   "integer",
+      "nodeId":          "integer",
+      "companyId":       "integer",
+      "nodeRole":        "string",
+      "quantity":        "decimal",
+      "notes":           "text",
+      "createdAt":       "datetime",
+      "nodeCode":        "string",
+      "nodeDisplayName": "string",
+      "processName":     "string",
+      "processStepCode": "string"
+    },
+    "aliases": {
+      "nodeRole":        ["role","node role","participation role"],
+      "nodeCode":        ["node","node code","member","item"],
+      "nodeDisplayName": ["node name","member name","item name"],
+      "processName":     ["process","step","process name"],
+      "processStepCode": ["step code","process code"]
+    },
+    "relations": {
+      "node": {
+        "table": "fab_nodes",
+        "alias": "fn_nm",
+        "on":    "fpsnm.node_id = fn_nm.id",
+        "fields": ["nodeCode","nodeDisplayName"]
+      },
+      "step": {
+        "table": "fab_process_steps",
+        "alias": "fps_nm",
+        "on":    "fpsnm.process_step_id = fps_nm.id",
+        "fields": ["processName","processStepCode"]
+      }
+    }
+  },
+
+  "fab_process_preconditions": {
+    "table": "fab_process_preconditions",
+    "alias": "fppc",
+    "writeFields": ["process_step_id","company_id","required_node_id","required_process_step_id","required_condition","notes"],
+    "fields": {
+      "id":                     "fppc.id",
+      "processStepId":          "fppc.process_step_id",
+      "companyId":              "fppc.company_id",
+      "requiredNodeId":         "fppc.required_node_id",
+      "requiredProcessStepId":  "fppc.required_process_step_id",
+      "requiredCondition":      "fppc.required_condition",
+      "notes":                  "fppc.notes",
+      "createdAt":              "fppc.created_at",
+      "requiredNodeCode":       "fn_pc.node_code",
+      "requiredStepName":       "fps_pc.process_name",
+      "requiredStepCode":       "fps_pc.process_step_code"
+    },
+    "fieldTypes": {
+      "id":                     "integer",
+      "processStepId":          "integer",
+      "companyId":              "integer",
+      "requiredNodeId":         "integer",
+      "requiredProcessStepId":  "integer",
+      "requiredCondition":      "string",
+      "notes":                  "text",
+      "createdAt":              "datetime",
+      "requiredNodeCode":       "string",
+      "requiredStepName":       "string",
+      "requiredStepCode":       "string"
+    },
+    "aliases": {
+      "requiredCondition":    ["condition","required condition","status required"],
+      "requiredNodeCode":     ["required node","prerequisite node","depends on node"],
+      "requiredStepName":     ["required step","prerequisite step","depends on step"],
+      "requiredStepCode":     ["required step code","prerequisite code"]
+    },
+    "relations": {
+      "requiredNode": {
+        "table": "fab_nodes",
+        "alias": "fn_pc",
+        "on":    "fppc.required_node_id = fn_pc.id",
+        "fields": ["requiredNodeCode"]
+      },
+      "requiredStep": {
+        "table": "fab_process_steps",
+        "alias": "fps_pc",
+        "on":    "fppc.required_process_step_id = fps_pc.id",
+        "fields": ["requiredStepName","requiredStepCode"]
+      }
+    }
+  },
+
+  "fab_excel_import_batches": {
+    "table": "fab_excel_import_batches",
+    "alias": "feib",
+    "writeFields": ["project_plan_id","file_name","uploaded_by","status","error_count","warning_count","parsed_data"],
+    "fields": {
+      "id":             "feib.id",
+      "projectPlanId":  "feib.project_plan_id",
+      "fileName":       "feib.file_name",
+      "uploadedBy":     "feib.uploaded_by",
+      "status":         "feib.status",
+      "errorCount":     "feib.error_count",
+      "warningCount":   "feib.warning_count",
+      "uploadedAt":     "feib.uploaded_at",
+      "uploaderName":   "uup.name"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "projectPlanId":  "integer",
+      "fileName":       "string",
+      "uploadedBy":     "integer",
+      "status":         "string",
+      "errorCount":     "integer",
+      "warningCount":   "integer",
+      "uploadedAt":     "datetime",
+      "uploaderName":   "string"
+    },
+    "aliases": {
+      "fileName":     ["file","file name","excel file","upload name"],
+      "status":       ["status","import status","state","result"],
+      "errorCount":   ["errors","error count","number of errors"],
+      "warningCount": ["warnings","warning count","number of warnings"],
+      "uploaderName": ["uploaded by","uploader","user","raised by"]
+    },
+    "relations": {
+      "uploader": {
+        "table": "users",
+        "alias": "uup",
+        "on":    "feib.uploaded_by = uup.id",
+        "fields": ["uploaderName"]
+      }
+    }
+  },
+
+  "fab_excel_import_issues": {
+    "table": "fab_excel_import_issues",
+    "alias": "feii",
+    "writeFields": ["import_batch_id","sheet_name","row_number","severity","field_name","message"],
+    "fields": {
+      "id":             "feii.id",
+      "importBatchId":  "feii.import_batch_id",
+      "sheetName":      "feii.sheet_name",
+      "rowNumber":      "feii.`row_number`",
+      "severity":       "feii.severity",
+      "fieldName":      "feii.field_name",
+      "message":        "feii.message",
+      "createdAt":      "feii.created_at"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "importBatchId":  "integer",
+      "sheetName":      "string",
+      "rowNumber":      "integer",
+      "severity":       "string",
+      "fieldName":      "string",
+      "message":        "text",
+      "createdAt":      "datetime"
+    },
+    "aliases": {
+      "importBatchId": ["batch","batch id","import batch","upload"],
+      "sheetName":     ["sheet","sheet name","tab","worksheet"],
+      "rowNumber":     ["row","row number","line","line number"],
+      "severity":      ["severity","level","error level","type"],
+      "fieldName":     ["field","column","field name","attribute"],
+      "message":       ["message","error message","issue","problem","description"]
+    }
+  },
+
+  "fab_work_calendars": {
+    "table": "fab_work_calendars",
+    "alias": "fwcal",
+    "writeFields": ["company_id","calendar_code","calendar_name","description","active"],
+    "fields": {
+      "id":           "fwcal.id",
+      "companyId":    "fwcal.company_id",
+      "calendarCode": "fwcal.calendar_code",
+      "calendarName": "fwcal.calendar_name",
+      "description":  "fwcal.description",
+      "active":       "fwcal.active",
+      "createdAt":    "fwcal.created_at",
+      "updatedAt":    "fwcal.updated_at"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "calendarCode": "string",
+      "calendarName": "string",
+      "description":  "text",
+      "active":       "integer",
+      "createdAt":    "datetime",
+      "updatedAt":    "datetime"
+    },
+    "aliases": {
+      "calendarCode": ["code","calendar code","calendar id"],
+      "calendarName": ["name","calendar name","calendar"],
+      "active":       ["active","enabled","status"]
+    }
+  },
+
+  "fab_work_calendar_days": {
+    "table": "fab_work_calendar_days",
+    "alias": "fwcd",
+    "writeFields": ["calendar_id","company_id","day_of_week","is_working_day","start_time","end_time","working_hours"],
+    "fields": {
+      "id":            "fwcd.id",
+      "calendarId":    "fwcd.calendar_id",
+      "companyId":     "fwcd.company_id",
+      "dayOfWeek":     "fwcd.day_of_week",
+      "isWorkingDay":  "fwcd.is_working_day",
+      "startTime":     "fwcd.start_time",
+      "endTime":       "fwcd.end_time",
+      "workingHours":  "fwcd.working_hours",
+      "calendarCode":  "fwcal_d.calendar_code",
+      "calendarName":  "fwcal_d.calendar_name"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "calendarId":    "integer",
+      "companyId":     "integer",
+      "dayOfWeek":     "string",
+      "isWorkingDay":  "integer",
+      "startTime":     "string",
+      "endTime":       "string",
+      "workingHours":  "decimal",
+      "calendarCode":  "string",
+      "calendarName":  "string"
+    },
+    "aliases": {
+      "dayOfWeek":    ["day","day of week","weekday"],
+      "isWorkingDay": ["working","is working","working day"],
+      "workingHours": ["hours","working hours","hrs per day"]
+    },
+    "relations": {
+      "calendar": {
+        "table": "fab_work_calendars",
+        "alias": "fwcal_d",
+        "on":    "fwcd.calendar_id = fwcal_d.id",
+        "fields": ["calendarCode","calendarName"]
+      }
+    }
+  },
+
+  "fab_work_calendar_exceptions": {
+    "table": "fab_work_calendar_exceptions",
+    "alias": "fwce",
+    "writeFields": ["calendar_id","company_id","exception_date","exception_name","is_working_day","start_time","end_time","working_hours","notes"],
+    "fields": {
+      "id":             "fwce.id",
+      "calendarId":     "fwce.calendar_id",
+      "companyId":      "fwce.company_id",
+      "exceptionDate":  "fwce.exception_date",
+      "exceptionName":  "fwce.exception_name",
+      "isWorkingDay":   "fwce.is_working_day",
+      "startTime":      "fwce.start_time",
+      "endTime":        "fwce.end_time",
+      "workingHours":   "fwce.working_hours",
+      "notes":          "fwce.notes",
+      "calendarCode":   "fwcal_e.calendar_code"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "calendarId":     "integer",
+      "companyId":      "integer",
+      "exceptionDate":  "string",
+      "exceptionName":  "string",
+      "isWorkingDay":   "integer",
+      "startTime":      "string",
+      "endTime":        "string",
+      "workingHours":   "decimal",
+      "notes":          "text",
+      "calendarCode":   "string"
+    },
+    "aliases": {
+      "exceptionDate": ["date","exception date","holiday date"],
+      "exceptionName": ["name","exception name","holiday name"],
+      "isWorkingDay":  ["working","is working","special working"]
+    },
+    "relations": {
+      "calendar": {
+        "table": "fab_work_calendars",
+        "alias": "fwcal_e",
+        "on":    "fwce.calendar_id = fwcal_e.id",
+        "fields": ["calendarCode"]
+      }
+    }
+  },
+
+  "fab_work_areas": {
+    "table": "fab_work_areas",
+    "alias": "fwa",
+    "writeFields": ["company_id","work_area_code","work_area_name","area_type","max_parallel_jobs","calendar_id","active","notes"],
+    "fields": {
+      "id":               "fwa.id",
+      "companyId":        "fwa.company_id",
+      "workAreaCode":     "fwa.work_area_code",
+      "workAreaName":     "fwa.work_area_name",
+      "areaType":         "fwa.area_type",
+      "maxParallelJobs":  "fwa.max_parallel_jobs",
+      "calendarId":       "fwa.calendar_id",
+      "active":           "fwa.active",
+      "notes":            "fwa.notes",
+      "createdAt":        "fwa.created_at",
+      "updatedAt":        "fwa.updated_at",
+      "calendarCode":     "fwcal_wa.calendar_code",
+      "calendarName":     "fwcal_wa.calendar_name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "workAreaCode":     "string",
+      "workAreaName":     "string",
+      "areaType":         "string",
+      "maxParallelJobs":  "integer",
+      "calendarId":       "integer",
+      "active":           "integer",
+      "notes":            "text",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "calendarCode":     "string",
+      "calendarName":     "string"
+    },
+    "aliases": {
+      "workAreaCode": ["code","area code","work area code","bay code"],
+      "workAreaName": ["name","area name","work area name","bay name"],
+      "areaType":     ["type","area type","bay type"],
+      "active":       ["active","enabled","status"]
+    },
+    "relations": {
+      "calendar": {
+        "table": "fab_work_calendars",
+        "alias": "fwcal_wa",
+        "on":    "fwa.calendar_id = fwcal_wa.id",
+        "fields": ["calendarCode","calendarName"]
+      }
+    }
+  },
+
+  "fab_work_area_capabilities": {
+    "table": "fab_work_area_capabilities",
+    "alias": "fwac",
+    "writeFields": ["work_area_id","company_id","process_type","allowed","priority","notes"],
+    "fields": {
+      "id":           "fwac.id",
+      "workAreaId":   "fwac.work_area_id",
+      "companyId":    "fwac.company_id",
+      "processType":  "fwac.process_type",
+      "allowed":      "fwac.allowed",
+      "priority":     "fwac.priority",
+      "notes":        "fwac.notes",
+      "workAreaCode": "fwa_cap.work_area_code",
+      "workAreaName": "fwa_cap.work_area_name"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "workAreaId":   "integer",
+      "companyId":    "integer",
+      "processType":  "string",
+      "allowed":      "integer",
+      "priority":     "integer",
+      "notes":        "text",
+      "workAreaCode": "string",
+      "workAreaName": "string"
+    },
+    "aliases": {
+      "processType":  ["type","process type","capability","process"],
+      "workAreaCode": ["area code","work area","bay code"]
+    },
+    "relations": {
+      "workArea": {
+        "table": "fab_work_areas",
+        "alias": "fwa_cap",
+        "on":    "fwac.work_area_id = fwa_cap.id",
+        "fields": ["workAreaCode","workAreaName"]
+      }
+    }
+  },
+
+  "fab_machines": {
+    "table": "fab_machines",
+    "alias": "fm",
+    "writeFields": ["company_id","machine_code","machine_name","machine_type","work_area_id","calendar_id","active","notes"],
+    "fields": {
+      "id":           "fm.id",
+      "companyId":    "fm.company_id",
+      "machineCode":  "fm.machine_code",
+      "machineName":  "fm.machine_name",
+      "machineType":  "fm.machine_type",
+      "workAreaId":   "fm.work_area_id",
+      "calendarId":   "fm.calendar_id",
+      "active":       "fm.active",
+      "notes":        "fm.notes",
+      "createdAt":    "fm.created_at",
+      "updatedAt":    "fm.updated_at",
+      "workAreaCode": "fwa_m.work_area_code",
+      "workAreaName": "fwa_m.work_area_name",
+      "calendarCode": "fwcal_m.calendar_code"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "machineCode":  "string",
+      "machineName":  "string",
+      "machineType":  "string",
+      "workAreaId":   "integer",
+      "calendarId":   "integer",
+      "active":       "integer",
+      "notes":        "text",
+      "createdAt":    "datetime",
+      "updatedAt":    "datetime",
+      "workAreaCode": "string",
+      "workAreaName": "string",
+      "calendarCode": "string"
+    },
+    "aliases": {
+      "machineCode":  ["code","machine code","equipment code"],
+      "machineName":  ["name","machine name","equipment name"],
+      "machineType":  ["type","machine type","equipment type"],
+      "workAreaCode": ["area","work area","bay"],
+      "active":       ["active","enabled","status"]
+    },
+    "relations": {
+      "workArea": {
+        "table": "fab_work_areas",
+        "alias": "fwa_m",
+        "on":    "fm.work_area_id = fwa_m.id",
+        "fields": ["workAreaCode","workAreaName"]
+      },
+      "calendar": {
+        "table": "fab_work_calendars",
+        "alias": "fwcal_m",
+        "on":    "fm.calendar_id = fwcal_m.id",
+        "fields": ["calendarCode"]
+      }
+    }
+  },
+
+  "fab_machine_capabilities": {
+    "table": "fab_machine_capabilities",
+    "alias": "fmc",
+    "writeFields": ["machine_id","company_id","process_type","capacity_hours_per_day","priority","notes"],
+    "fields": {
+      "id":                   "fmc.id",
+      "machineId":            "fmc.machine_id",
+      "companyId":            "fmc.company_id",
+      "processType":          "fmc.process_type",
+      "capacityHoursPerDay":  "fmc.capacity_hours_per_day",
+      "priority":             "fmc.priority",
+      "notes":                "fmc.notes",
+      "machineCode":          "fm_mc.machine_code",
+      "machineName":          "fm_mc.machine_name"
+    },
+    "fieldTypes": {
+      "id":                   "integer",
+      "machineId":            "integer",
+      "companyId":            "integer",
+      "processType":          "string",
+      "capacityHoursPerDay":  "decimal",
+      "priority":             "integer",
+      "notes":                "text",
+      "machineCode":          "string",
+      "machineName":          "string"
+    },
+    "aliases": {
+      "processType":         ["type","process type","capability","process"],
+      "capacityHoursPerDay": ["capacity","hours","hrs per day","daily hours"],
+      "machineCode":         ["machine","machine code","equipment"]
+    },
+    "relations": {
+      "machine": {
+        "table": "fab_machines",
+        "alias": "fm_mc",
+        "on":    "fmc.machine_id = fm_mc.id",
+        "fields": ["machineCode","machineName"]
+      }
+    }
+  },
+
+  "fab_process_work_area_options": {
+    "table": "fab_process_work_area_options",
+    "alias": "fpwao",
+    "writeFields": ["process_step_id","work_area_id","company_id","priority","notes"],
+    "fields": {
+      "id":             "fpwao.id",
+      "processStepId":  "fpwao.process_step_id",
+      "workAreaId":     "fpwao.work_area_id",
+      "companyId":      "fpwao.company_id",
+      "priority":       "fpwao.priority",
+      "notes":          "fpwao.notes",
+      "workAreaCode":   "fwa_pwo.work_area_code",
+      "workAreaName":   "fwa_pwo.work_area_name",
+      "processName":    "fps_pwo.process_name",
+      "processStepCode":"fps_pwo.process_step_code"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "processStepId":  "integer",
+      "workAreaId":     "integer",
+      "companyId":      "integer",
+      "priority":       "integer",
+      "notes":          "text",
+      "workAreaCode":   "string",
+      "workAreaName":   "string",
+      "processName":    "string",
+      "processStepCode":"string"
+    },
+    "aliases": {
+      "workAreaCode":   ["area","area code","work area code"],
+      "processStepCode":["step code","process code"]
+    },
+    "relations": {
+      "workArea": {
+        "table": "fab_work_areas",
+        "alias": "fwa_pwo",
+        "on":    "fpwao.work_area_id = fwa_pwo.id",
+        "fields": ["workAreaCode","workAreaName"]
+      },
+      "step": {
+        "table": "fab_process_steps",
+        "alias": "fps_pwo",
+        "on":    "fpwao.process_step_id = fps_pwo.id",
+        "fields": ["processName","processStepCode"]
+      }
+    }
+  },
+
+  "fab_process_type_registry": {
+    "table": "fab_process_type_registry",
+    "alias": "fptr",
+    "writeFields": ["company_id","process_type_name","description","metric_key","rate_value","rate_unit","active"],
+    "fields": {
+      "id":              "fptr.id",
+      "companyId":       "fptr.company_id",
+      "processTypeName": "fptr.process_type_name",
+      "description":     "fptr.description",
+      "metricKey":       "fptr.metric_key",
+      "rateValue":       "fptr.rate_value",
+      "rateUnit":        "fptr.rate_unit",
+      "active":          "fptr.active",
+      "createdAt":       "fptr.created_at",
+      "updatedAt":       "fptr.updated_at"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "processTypeName": "string",
+      "description":     "text",
+      "metricKey":       "string",
+      "rateValue":       "decimal",
+      "rateUnit":        "string",
+      "active":          "integer",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime"
+    },
+    "aliases": {
+      "processTypeName": ["process type","type name","process"],
+      "metricKey":       ["metric","metric key","measurement"],
+      "rateValue":       ["rate","rate value","hours per unit"],
+      "active":          ["active","enabled","status"]
+    }
+  },
+
+  "fab_node_metrics": {
+    "table": "fab_node_metrics",
+    "alias": "fnm",
+    "writeFields": ["node_id","company_id","metric_key","metric_value","metric_unit"],
+    "fields": {
+      "id":          "fnm.id",
+      "nodeId":      "fnm.node_id",
+      "companyId":   "fnm.company_id",
+      "metricKey":   "fnm.metric_key",
+      "metricValue": "fnm.metric_value",
+      "metricUnit":  "fnm.metric_unit",
+      "nodeCode":    "fn_m.node_code",
+      "displayName": "fn_m.display_name",
+      "createdAt":   "fnm.created_at",
+      "updatedAt":   "fnm.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "nodeId":      "integer",
+      "companyId":   "integer",
+      "metricKey":   "string",
+      "metricValue": "decimal",
+      "metricUnit":  "string",
+      "nodeCode":    "string",
+      "displayName": "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "aliases": {
+      "metricKey":   ["metric","key","metric key","measurement type"],
+      "metricValue": ["value","metric value","amount"],
+      "nodeCode":    ["node","node code","member"]
+    },
+    "relations": {
+      "node": {
+        "table": "fab_nodes",
+        "alias": "fn_m",
+        "on":    "fnm.node_id = fn_m.id",
+        "fields": ["nodeCode","displayName"]
+      }
+    }
+  },
+
+  "fab_node_process_progress": {
+    "table": "fab_node_process_progress",
+    "alias": "fnpp",
+    "writeFields": ["plan_id","node_id","process_step_id","company_id","snapshot_date","batch_qty","completion_pct","reported_by","notes"],
+    "fields": {
+      "id":             "fnpp.id",
+      "planId":         "fnpp.plan_id",
+      "nodeId":         "fnpp.node_id",
+      "processStepId":  "fnpp.process_step_id",
+      "companyId":      "fnpp.company_id",
+      "snapshotDate":   "fnpp.snapshot_date",
+      "batchQty":       "fnpp.batch_qty",
+      "completionPct":  "fnpp.completion_pct",
+      "reportedBy":     "fnpp.reported_by",
+      "notes":          "fnpp.notes",
+      "createdAt":      "fnpp.created_at",
+      "nodeCode":       "fn_pp.node_code",
+      "nodeDisplayName":"fn_pp.display_name",
+      "stepName":       "fps_pp.process_name",
+      "reporterName":   "u_pp.name"
+    },
+    "fieldTypes": {
+      "id":             "integer",
+      "planId":         "integer",
+      "nodeId":         "integer",
+      "processStepId":  "integer",
+      "companyId":      "integer",
+      "snapshotDate":   "string",
+      "batchQty":       "decimal",
+      "completionPct":  "decimal",
+      "reportedBy":     "integer",
+      "notes":          "text",
+      "createdAt":      "datetime",
+      "nodeCode":       "string",
+      "nodeDisplayName":"string",
+      "stepName":       "string",
+      "reporterName":   "string"
+    },
+    "aliases": {
+      "snapshotDate":  ["date","report date","progress date"],
+      "batchQty":      ["qty","batch qty","quantity","pieces"],
+      "completionPct": ["pct","completion","progress","percent done"],
+      "nodeCode":      ["node","node code"],
+      "stepName":      ["step","process","step name"]
+    },
+    "relations": {
+      "node": {
+        "table": "fab_nodes",
+        "alias": "fn_pp",
+        "on":    "fnpp.node_id = fn_pp.id",
+        "fields": ["nodeCode","nodeDisplayName"]
+      },
+      "step": {
+        "table": "fab_process_steps",
+        "alias": "fps_pp",
+        "on":    "fnpp.process_step_id = fps_pp.id",
+        "fields": ["stepName"]
+      },
+      "reporter": {
+        "table": "users",
+        "alias": "u_pp",
+        "on":    "fnpp.reported_by = u_pp.id",
+        "fields": ["reporterName"]
+      }
+    }
+  },
+
+  "fab_capacity_import_batches": {
+    "table": "fab_capacity_import_batches",
+    "alias": "fcib",
+    "writeFields": ["company_id","file_name","uploaded_by","status","error_count","warning_count"],
+    "fields": {
+      "id":           "fcib.id",
+      "companyId":    "fcib.company_id",
+      "fileName":     "fcib.file_name",
+      "uploadedBy":   "fcib.uploaded_by",
+      "status":       "fcib.status",
+      "errorCount":   "fcib.error_count",
+      "warningCount": "fcib.warning_count",
+      "uploadedAt":   "fcib.uploaded_at",
+      "uploaderName": "ucib.name"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "fileName":     "string",
+      "uploadedBy":   "integer",
+      "status":       "string",
+      "errorCount":   "integer",
+      "warningCount": "integer",
+      "uploadedAt":   "datetime",
+      "uploaderName": "string"
+    },
+    "aliases": {
+      "fileName":     ["file","file name","upload name"],
+      "uploaderName": ["uploaded by","uploader","user"]
+    },
+    "relations": {
+      "uploader": {
+        "table": "users",
+        "alias": "ucib",
+        "on":    "fcib.uploaded_by = ucib.id",
+        "fields": ["uploaderName"]
+      }
+    }
+  }
+}
