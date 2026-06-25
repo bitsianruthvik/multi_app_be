@@ -72,12 +72,14 @@ export const loginUser = async (req, res) => {
     try {
       let featureRows = [];
       try {
+        // JSON_CONTAINS instead of JSON_TABLE — JSON_TABLE isn't supported on
+        // TiDB (MySQL-compatible but not MySQL 8's JSON_TABLE), and this form
+        // works identically on both.
         [featureRows] = await pool.query(
           `SELECT DISTINCT f.id, f.feature_name, f.feature_tag, f.type
            FROM role_capability rc
            JOIN features_capability fc ON rc.capability_id = fc.capability_id
-           JOIN JSON_TABLE(fc.features_json, '$[*]' COLUMNS (fid INT PATH '$')) jt ON TRUE
-           JOIN features f ON f.id = jt.fid
+           JOIN features f ON JSON_CONTAINS(fc.features_json, CAST(f.id AS JSON))
            WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?
              AND f.type = 'frontend'`,
           [user.role_id, user.team_id, user.company_id]

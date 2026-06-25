@@ -17,19 +17,22 @@ const fetchUiPermissions = async (roleId, teamId, companyId) => {
   try {
     let featureRows = [];
     try {
+      // JSON_CONTAINS instead of JSON_TABLE — JSON_TABLE isn't supported on
+      // TiDB (MySQL-compatible but not MySQL 8's JSON_TABLE), and this form
+      // works identically on both. team_id uses <=> since many roles have a
+      // NULL team_id, which `=` never matches.
       [featureRows] = await pool.query(
         `SELECT DISTINCT f.feature_tag FROM role_capability rc
          JOIN features_capability fc ON rc.capability_id = fc.capability_id
-         JOIN JSON_TABLE(fc.features_json, '$[*]' COLUMNS (fid INT PATH '$')) jt ON TRUE
-         JOIN features f ON f.id = jt.fid
-         WHERE rc.role_id = ? AND rc.team_id = ? AND rc.company_id = ? AND f.type = 'frontend'`,
+         JOIN features f ON JSON_CONTAINS(fc.features_json, CAST(f.id AS JSON))
+         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ? AND f.type = 'frontend'`,
         [roleId, teamId, companyId]
       );
     } catch {
       const [capRows] = await pool.query(
         `SELECT fc.features_json FROM role_capability rc
          JOIN features_capability fc ON rc.capability_id = fc.capability_id
-         WHERE rc.role_id = ? AND rc.team_id = ? AND rc.company_id = ?`,
+         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?`,
         [roleId, teamId, companyId]
       );
       const ids = [];

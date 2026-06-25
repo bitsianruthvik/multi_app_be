@@ -95,13 +95,16 @@ export const protect = async (req, res, next) => {
         // Load feature_tags for this user's role in this app
         try {
           const roleId = rows[0].role_id;
+          // JSON_CONTAINS instead of JSON_TABLE — JSON_TABLE isn't supported
+          // on TiDB (MySQL-compatible but not MySQL 8's JSON_TABLE), and this
+          // form works identically on both.
           const [permRows] = await pool.query(
             `SELECT DISTINCT f.feature_tag
                FROM role_capability rc
                JOIN features_capability fca ON fca.capability_id = rc.capability_id
                  AND fca.deleted_at IS NULL
-               JOIN JSON_TABLE(fca.features_json, '$[*]' COLUMNS (fid INT PATH '$')) jt ON TRUE
-               JOIN features f ON f.id = jt.fid AND f.deleted_at IS NULL
+               JOIN features f ON JSON_CONTAINS(fca.features_json, CAST(f.id AS JSON))
+                 AND f.deleted_at IS NULL
               WHERE rc.role_id = ?
                 AND (rc.app_id = ? OR rc.app_id IS NULL)
                 AND rc.deleted_at IS NULL`,
