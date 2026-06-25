@@ -23,16 +23,18 @@ const fetchUiPermissions = async (roleId, teamId, companyId) => {
       // NULL team_id, which `=` never matches.
       [featureRows] = await pool.query(
         `SELECT DISTINCT f.feature_tag FROM role_capability rc
-         JOIN features_capability fc ON rc.capability_id = fc.capability_id
+         JOIN features_capability fc ON rc.capability_id = fc.capability_id AND fc.deleted_at IS NULL
          JOIN features f ON JSON_CONTAINS(fc.features_json, CAST(f.id AS JSON))
-         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ? AND f.type = 'frontend'`,
+         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?
+           AND rc.deleted_at IS NULL AND f.type = 'frontend'`,
         [roleId, teamId, companyId]
       );
     } catch {
       const [capRows] = await pool.query(
         `SELECT fc.features_json FROM role_capability rc
-         JOIN features_capability fc ON rc.capability_id = fc.capability_id
-         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?`,
+         JOIN features_capability fc ON rc.capability_id = fc.capability_id AND fc.deleted_at IS NULL
+         WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?
+           AND rc.deleted_at IS NULL`,
         [roleId, teamId, companyId]
       );
       const ids = [];

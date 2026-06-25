@@ -78,10 +78,10 @@ export const loginUser = async (req, res) => {
         [featureRows] = await pool.query(
           `SELECT DISTINCT f.id, f.feature_name, f.feature_tag, f.type
            FROM role_capability rc
-           JOIN features_capability fc ON rc.capability_id = fc.capability_id
+           JOIN features_capability fc ON rc.capability_id = fc.capability_id AND fc.deleted_at IS NULL
            JOIN features f ON JSON_CONTAINS(fc.features_json, CAST(f.id AS JSON))
            WHERE rc.role_id = ? AND rc.team_id <=> ? AND rc.company_id = ?
-             AND f.type = 'frontend'`,
+             AND rc.deleted_at IS NULL AND f.type = 'frontend'`,
           [user.role_id, user.team_id, user.company_id]
         );
       } catch (_jsonTableErr) {
@@ -89,8 +89,9 @@ export const loginUser = async (req, res) => {
         const [capabilityRows] = await pool.query(
           `SELECT fc.features_json
            FROM role_capability rc
-           JOIN features_capability fc ON rc.capability_id = fc.capability_id
-           WHERE rc.role_id = ? AND rc.team_id = ? AND rc.company_id = ?`,
+           JOIN features_capability fc ON rc.capability_id = fc.capability_id AND fc.deleted_at IS NULL
+           WHERE rc.role_id = ? AND rc.team_id = ? AND rc.company_id = ?
+             AND rc.deleted_at IS NULL`,
           [user.role_id, user.team_id, user.company_id]
         );
         const allIds = [];
