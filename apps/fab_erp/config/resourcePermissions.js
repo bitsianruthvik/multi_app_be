@@ -31,9 +31,9 @@ const resourcePermissions = {
   fabErpMfgMethodTemplate:    'fab_erp_templates_manage',
   fabErpMfgMethodLine:        'fab_erp_templates_manage',
 
-  // Sales Orders
-  fabErpSalesOrder:    'fab_erp_projects_manage',
-  fabErpSoItem:        'fab_erp_projects_manage',
+  // Orders (sales, manufacturing, purchase, planned, subcontract, transfer)
+  fabErpOrder:     'fab_erp_projects_manage',
+  fabErpOrderLine: 'fab_erp_projects_manage',
 
   // Supplier × Item
   fabErpSupplierItem:  'fab_erp_grn_manage',
