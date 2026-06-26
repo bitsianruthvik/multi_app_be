@@ -277,6 +277,24 @@ export async function mutate(req, res) {
       return res.json({ ok: true, id, deleted: true });
     }
   } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY' || err.errno === 1062) {
+      // sqlMessage looks like: Duplicate entry 'x-y' for key 'table.uq_some_name_active'
+      // Match on the *_active suffix to tell name vs code collisions apart.
+      const indexName = String(err.sqlMessage ?? '').match(/for key '[^']*\.([^']+)'/)?.[1] ?? '';
+      let message = 'A record with this name or code already exists.';
+      if (/code_active|_code\b/i.test(indexName)) {
+        message = 'A record with this code already exists.';
+      } else if (/name_active/i.test(indexName)) {
+        message = 'A record with this name already exists.';
+      }
+
+      logger.warn(
+        { resource, op, userId: user?.id, indexName },
+        'fab_erp mutate: duplicate key',
+      );
+      return res.status(409).json({ message });
+    }
+
     logger.error({ err, resource, op, userId: user?.id }, 'fab_erp mutate: DB error');
     return res.status(500).json({ message: 'Database write failed. Please try again.' });
   }

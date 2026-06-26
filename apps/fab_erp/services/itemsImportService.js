@@ -17,6 +17,7 @@ import { pool } from '../../../db.js';
 
 const MATERIAL_TYPES    = ['raw_material', 'component', 'semi_finished', 'finished_good'];
 const PROCUREMENT_TYPES = ['buy', 'make'];
+const CF_PREFIX = 'CF: ';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -91,15 +92,38 @@ export async function exportItemsTemplate(companyId) {
     { header: 'HSN Code',         width: 14 },
     { header: 'Division',         width: 14 },
     { header: 'Lead Time (Days)', width: 14 },
+    { header: 'Gross Weight',     width: 14 },
+    { header: 'Net Weight',       width: 14 },
+    { header: 'Weight Unit',      width: 12 },
+    { header: 'Volume',           width: 14 },
+    { header: 'Volume Unit',      width: 12 },
+    { header: 'Length',           width: 12 },
+    { header: 'Width',            width: 12 },
+    { header: 'Height',           width: 12 },
+    { header: 'Dimension Unit',   width: 14 },
+    { header: 'Barcode/EAN',      width: 18 },
+    { header: 'Purchase Cost',    width: 14 },
+    { header: 'Decimal Places',   width: 14 },
   ];
+
+  const [cfKeys] = await pool.query(
+    `SELECT DISTINCT field_key, field_type FROM fab_custom_fields
+      WHERE company_id = ? AND level = 'item' AND deleted_at IS NULL ORDER BY field_key`,
+    [companyId],
+  );
+  for (const cf of cfKeys) cols.push({ header: `${CF_PREFIX}${cf.field_key}`, width: 18 });
+
   styledHeader(ws, cols);
 
-  ws.addRow([
+  const exampleRow = [
     'Structural Steel Bar 50x50', 'STRUCT-STEEL-50', 'kg',
     'Raw Material', 'Structural Steel', '',
     'raw_material', 'buy',
     'Example row — delete before importing', '', '', 5,
-  ]);
+    '', '', '', '', '', '', '', '', '', '', '', '',
+  ];
+  for (let i = 0; i < cfKeys.length; i++) exampleRow.push('');
+  ws.addRow(exampleRow);
   ws.getRow(2).font = { italic: true, color: { argb: 'FF999999' } };
 
   dropdown(ws, 7, MATERIAL_TYPES, 2, 1000);
@@ -153,6 +177,13 @@ export async function exportItemsTemplate(companyId) {
     '7. See the "Existing Taxonomy" sheet for Category / Group / Sub-group names already in use —',
     '   reuse them exactly to avoid creating near-duplicate entries.',
     '8. If an Item Code already exists, that row is skipped (existing items are never overwritten by import).',
+    '9. Gross Weight, Net Weight, Volume, Length, Width, Height are numeric. Weight Unit, Volume Unit,',
+    '   Dimension Unit are free-text unit labels (e.g. kg, m3, mm) — left blank, the item default is used.',
+    '10. Barcode/EAN and Purchase Cost are optional.',
+    '11. Decimal Places sets how many decimals this item\'s dimension/weight/volume fields display and',
+    '    round to (default 3 if left blank or not a valid number).',
+    '12. Columns titled "CF: <name>" are existing item-level custom fields for this company — fill in a',
+    '    value per row to set that custom field on the imported item. Leave blank to skip it for that row.',
   ];
   lines.forEach((l) => wsHelp.addRow([l]));
   wsHelp.getRow(1).font = { bold: true, size: 13 };
@@ -169,6 +200,17 @@ export async function importItemsExcel(file, companyId) {
 
   const ws = wb.getWorksheet('Items');
   if (!ws) throw new Error('Sheet "Items" not found in the uploaded file. Use the exported template.');
+
+  // CF: <key> columns can appear anywhere past the standard columns — find them by header text.
+  const headerRow = ws.getRow(1);
+  const cfColumns = []; // { col, fieldKey }
+  headerRow.eachCell((cell, colNumber) => {
+    const text = cell.value && (cell.value.text || cell.value.result || cell.value);
+    const header = text === null || text === undefined ? '' : String(text).trim();
+    if (header.startsWith(CF_PREFIX)) {
+      cfColumns.push({ col: colNumber, fieldKey: header.slice(CF_PREFIX.length).trim() });
+    }
+  });
 
   // Collect rows synchronously first (ExcelJS eachRow callback is sync).
   const rows = [];
@@ -190,6 +232,19 @@ export async function importItemsExcel(file, companyId) {
       hsnCode:           cellVal(row, 10),
       division:          cellVal(row, 11),
       leadTimeDays:      numVal(row, 12),
+      grossWeight:       numVal(row, 13),
+      netWeight:         numVal(row, 14),
+      weightUnit:        cellVal(row, 15),
+      volume:            numVal(row, 16),
+      volumeUnit:        cellVal(row, 17),
+      length:            numVal(row, 18),
+      width:             numVal(row, 19),
+      height:            numVal(row, 20),
+      dimensionUnit:     cellVal(row, 21),
+      barcode:           cellVal(row, 22),
+      purchaseCost:      numVal(row, 23),
+      dimensionDecimalsRaw: cellVal(row, 24),
+      customFields: cfColumns.map((cf) => ({ fieldKey: cf.fieldKey, value: cellVal(row, cf.col) })),
     });
   });
 
@@ -202,6 +257,14 @@ export async function importItemsExcel(file, companyId) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    // ── preload existing item-level custom-field keys/types ────────────────
+    const [existingCf] = await conn.query(
+      `SELECT DISTINCT field_key, field_type FROM fab_custom_fields
+        WHERE company_id = ? AND level = 'item' AND deleted_at IS NULL`,
+      [companyId],
+    );
+    const cfTypeByKey = new Map(existingCf.map((cf) => [cf.field_key, cf.field_type]));
 
     // ── preload existing taxonomy + codes ──────────────────────────────────
     const [existingCats] = await conn.query(
@@ -281,6 +344,28 @@ export async function importItemsExcel(file, companyId) {
       return res.insertId;
     }
 
+    async function resolveDefaultGroup(categoryId) {
+      const key = `${categoryId}::default`;
+      if (groupCache.has(key)) return groupCache.get(key);
+      const [rows] = await conn.query(
+        'SELECT id FROM fab_item_groups WHERE company_id = ? AND category_id = ? AND name = ? AND deleted_at IS NULL LIMIT 1',
+        [companyId, categoryId, 'Default'],
+      );
+      if (rows.length) { groupCache.set(key, rows[0].id); return rows[0].id; }
+      return resolveGroup(categoryId, 'Default');
+    }
+
+    async function resolveDefaultSubgroup(groupId) {
+      const key = `${groupId}::default`;
+      if (subgroupCache.has(key)) return subgroupCache.get(key);
+      const [rows] = await conn.query(
+        'SELECT id FROM fab_item_subgroups WHERE company_id = ? AND group_id = ? AND name = ? AND deleted_at IS NULL LIMIT 1',
+        [companyId, groupId, 'Default'],
+      );
+      if (rows.length) { subgroupCache.set(key, rows[0].id); return rows[0].id; }
+      return resolveSubgroup(groupId, 'Default');
+    }
+
     // ── process rows ─────────────────────────────────────────────────────────
     for (const r of rows) {
       let code = r.code ? r.code.trim().toUpperCase() : null;
@@ -292,24 +377,15 @@ export async function importItemsExcel(file, companyId) {
       if (!code) code = uniqueCode(itemCodeSet, r.name);
       else itemCodeSet.add(code);
 
-      let categoryId = null, groupId = null, subgroupId = null;
-      if (r.categoryName) categoryId = await resolveCategory(r.categoryName);
-
-      if (r.groupName) {
-        if (!categoryId) {
-          result.warnings.push({ row: r.rowNumber, message: `Group '${r.groupName}' needs a Category in the same row — group not assigned.` });
-        } else {
-          groupId = await resolveGroup(categoryId, r.groupName);
-        }
+      if (!r.categoryName) {
+        result.warnings.push({ row: r.rowNumber, message: `Category is required — row skipped.` });
+        result.itemsSkipped++;
+        continue;
       }
 
-      if (r.subgroupName) {
-        if (!groupId) {
-          result.warnings.push({ row: r.rowNumber, message: `Sub-group '${r.subgroupName}' needs a Group in the same row — sub-group not assigned.` });
-        } else {
-          subgroupId = await resolveSubgroup(groupId, r.subgroupName);
-        }
-      }
+      const categoryId = await resolveCategory(r.categoryName);
+      let groupId = r.groupName ? await resolveGroup(categoryId, r.groupName) : await resolveDefaultGroup(categoryId);
+      const subgroupId = r.subgroupName ? await resolveSubgroup(groupId, r.subgroupName) : await resolveDefaultSubgroup(groupId);
 
       let materialType = 'component';
       if (r.materialTypeRaw) {
@@ -322,15 +398,42 @@ export async function importItemsExcel(file, companyId) {
         else result.warnings.push({ row: r.rowNumber, message: `Unrecognised Procurement Type — defaulted to 'buy'.` });
       }
 
-      await conn.query(
+      let dimensionDecimals = parseInt(r.dimensionDecimalsRaw, 10);
+      if (!Number.isInteger(dimensionDecimals) || dimensionDecimals < 0) {
+        if (r.dimensionDecimalsRaw) {
+          result.warnings.push({ row: r.rowNumber, message: `Invalid Decimal Places — defaulted to 3.` });
+        }
+        dimensionDecimals = 3;
+      }
+
+      const [insertRes] = await conn.query(
         `INSERT INTO fab_item_catalog
            (company_id, name, code, unit, description, category_id, group_id, subgroup_id,
-            material_type, procurement_type, hsn_code, division, lead_time_days)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            material_type, procurement_type, hsn_code, division, lead_time_days,
+            gross_weight, net_weight, weight_unit, volume, volume_unit,
+            length, width, height, dimension_unit, barcode, purchase_cost, dimension_decimals)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [companyId, r.name.trim(), code, r.unit, r.description || null, categoryId, groupId, subgroupId,
-         materialType, procurementType, r.hsnCode || null, r.division || null, r.leadTimeDays],
+         materialType, procurementType, r.hsnCode || null, r.division || null, r.leadTimeDays,
+         r.grossWeight, r.netWeight, r.weightUnit || 'kg', r.volume, r.volumeUnit || 'm3',
+         r.length, r.width, r.height, r.dimensionUnit || 'mm', r.barcode || null, r.purchaseCost, dimensionDecimals],
       );
       result.itemsCreated++;
+
+      const itemId = insertRes.insertId;
+      let cfSortOrder = 0;
+      for (const cf of r.customFields) {
+        if (cf.value === null || cf.value === undefined || cf.value === '') continue;
+        const fieldType = cfTypeByKey.get(cf.fieldKey) || 'text';
+        await conn.query(
+          `INSERT INTO fab_custom_fields
+             (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+           VALUES (?,?,?,?,?,?,?)`,
+          [companyId, 'item', itemId, cf.fieldKey, fieldType, cf.value, cfSortOrder],
+        );
+        if (!cfTypeByKey.has(cf.fieldKey)) cfTypeByKey.set(cf.fieldKey, fieldType);
+        cfSortOrder++;
+      }
     }
 
     await conn.commit();
