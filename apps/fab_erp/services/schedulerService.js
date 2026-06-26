@@ -24,7 +24,7 @@
  *     → fab_work_calendar_exceptions
  *
  * Exported:
- *   runScheduler(companyId, options?)  → { runId, scheduled, lateOrders, entriesCreated }
+ *   runScheduler(companyId, options?)  → { runId, ordersScheduled, lateOrders, entriesCreated }
  *   getScheduleEntries(companyId, filters) → rows
  *   lockEntry(entryId, companyId, locked) → void
  *   getSchedulerRuns(companyId, limit)  → rows
@@ -78,7 +78,7 @@ export async function runScheduler(
         [runId],
       );
       conn.release();
-      return { runId, scheduled: 0, lateOrders: 0, entriesCreated: 0 };
+      return { runId, ordersScheduled: 0, lateOrders: 0, entriesCreated: 0 };
     }
 
     // ── B. Load resource working-hours map ───────────────────────────────────
@@ -368,8 +368,8 @@ export async function runScheduler(
       [scheduled, entriesCreated, lateOrders, runId],
     );
 
-    logger.info({ companyId, runId, scheduled, entriesCreated, lateOrders }, '[scheduler] run complete');
-    return { runId, scheduled, lateOrders, entriesCreated };
+    logger.info({ companyId, runId, ordersScheduled: scheduled, entriesCreated, lateOrders }, '[scheduler] run complete');
+    return { runId, ordersScheduled: scheduled, lateOrders, entriesCreated };
 
   } catch (err) {
     await conn.rollback().catch(() => {});
@@ -388,15 +388,17 @@ export async function runScheduler(
 
 export async function getScheduleEntries(companyId, { fromDate, toDate, resourceId, orderId } = {}) {
   let sql = `
-    SELECT fse.id, fse.order_id, fse.order_line_id, fse.step_id, fse.resource_id,
-           fse.start_datetime, fse.end_datetime, fse.duration_hrs,
-           fse.actual_start, fse.actual_end, fse.actual_hrs,
-           fse.status, fse.locked, fse.is_late,
-           fo.order_number, fo.qty AS order_qty,
-           fic.name AS item_name, fic.code AS item_code,
-           ops.name AS op_name, ops.seq_no,
-           r.name AS resource_name, r.code AS resource_code,
-           rt.name AS resource_type_name
+    SELECT fse.id, fse.order_id AS orderId, fse.order_line_id AS orderLineId,
+           fse.step_id AS stepId, fse.resource_id AS resourceId,
+           fse.start_datetime AS startDatetime, fse.end_datetime AS endDatetime,
+           fse.duration_hrs AS durationHrs,
+           fse.actual_start AS actualStart, fse.actual_end AS actualEnd, fse.actual_hrs AS actualHrs,
+           fse.status, fse.locked, fse.is_late AS isLate,
+           fo.order_number AS orderNumber, fo.qty AS orderQty,
+           fic.name AS itemName, fic.code AS itemCode,
+           ops.name AS opName, ops.seq_no AS seqNo,
+           r.name AS resourceName, r.code AS resourceCode,
+           rt.name AS resourceTypeName
     FROM fab_schedule_entries fse
     JOIN fab_orders            fo  ON fo.id  = fse.order_id
     JOIN fab_item_catalog      fic ON fic.id = fo.catalog_item_id
@@ -426,8 +428,10 @@ export async function lockEntry(entryId, companyId, locked) {
 
 export async function getSchedulerRuns(companyId, limit = 20) {
   const [rows] = await pool.query(
-    `SELECT id, triggered_by, triggered_by_user_id, started_at, finished_at,
-            status, orders_scheduled, entries_created, late_orders, error_message
+    `SELECT id, triggered_by AS triggeredBy, triggered_by_user_id AS triggeredByUserId,
+            started_at AS startedAt, finished_at AS finishedAt,
+            status, orders_scheduled AS ordersScheduled, entries_created AS entriesCreated,
+            late_orders AS lateOrders, error_message AS errorMessage
      FROM fab_scheduler_runs
      WHERE company_id = ? ORDER BY started_at DESC LIMIT ?`,
     [companyId, limit],

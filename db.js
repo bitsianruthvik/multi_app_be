@@ -102,6 +102,11 @@ export const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: DB_POOL_SIZE,
   queueLimit: 0,
+  // DATE columns: return plain 'YYYY-MM-DD' strings instead of JS Date objects.
+  // Date objects serialize via toJSON() in UTC, which shifts a wall-clock date
+  // back a day for timezones east of UTC. DATETIME/TIMESTAMP are unaffected —
+  // they represent real instants and serialize correctly as Date objects.
+  dateStrings: ["DATE"],
   ...(useSsl ? { ssl: { minVersion: "TLSv1.2", rejectUnauthorized: true } } : {}),
 });
 

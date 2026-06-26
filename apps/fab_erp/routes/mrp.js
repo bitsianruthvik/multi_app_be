@@ -27,7 +27,7 @@ const requirePerm = (tag) => (req, res, next) => {
 };
 
 // ── POST /mrp/run ─────────────────────────────────────────────────────────────
-router.post('/mrp/run', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+router.post('/mrp/run', protect, requirePerm('fab_erp_planning_manage'), async (req, res) => {
   const user = req.user;
   const companyId = user.companyId;
   if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId.' });
@@ -73,7 +73,7 @@ router.put('/mrp/settings', protect, async (req, res) => {
   const user = req.user;
   const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
   if (!isAdmin) {
-    const tag = 'fab_erp_projects_manage';
+    const tag = 'fab_erp_planning_manage';
     if (!Array.isArray(user?.uiPermissions) || !user.uiPermissions.includes(tag)) {
       return res.status(403).json({ message: `Permission denied. Required: "${tag}".` });
     }
