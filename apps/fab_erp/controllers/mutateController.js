@@ -121,6 +121,39 @@ async function runConsumptionGate(resource, filteredPayload, companyId) {
 
 const VALID_OPS = new Set(['insert', 'update', 'delete']);
 
+/**
+ * Resolves the set of fields required for this write, from the resource's
+ * declared `requiredFields` config in resourceDef.json:
+ *   { always: [...], byOrderType: { <typeValue>: [...] }, orderTypeField: 'order_type' }
+ * `byOrderType` is a generic discriminator rule — keyed off whatever field
+ * `orderTypeField` names — not specific to orders.
+ *
+ * On insert, every required field must be present and non-empty in the
+ * filtered payload. On update, only fields explicitly included in the
+ * payload are checked (we don't fetch the existing row), so a partial
+ * update that doesn't touch a required field is not blocked retroactively.
+ */
+function getMissingRequiredFields(def, filteredPayload, op) {
+  const rf = def.requiredFields;
+  if (!rf) return [];
+
+  const required = new Set(rf.always ?? []);
+  if (rf.byOrderType && rf.orderTypeField) {
+    const discriminator = filteredPayload[rf.orderTypeField];
+    for (const f of rf.byOrderType[discriminator] ?? []) required.add(f);
+  }
+
+  const missing = [];
+  for (const field of required) {
+    const present = Object.prototype.hasOwnProperty.call(filteredPayload, field);
+    if (op === 'insert' && !present) { missing.push(field); continue; }
+    if (!present) continue; // update: untouched field — not our concern
+    const v = filteredPayload[field];
+    if (v === undefined || v === null || v === '') missing.push(field);
+  }
+  return missing;
+}
+
 export async function mutate(req, res) {
   const { resource, op, payload = {} } = req.body ?? {};
 
@@ -186,6 +219,17 @@ export async function mutate(req, res) {
 
   const tableName = def.table;
   const tableAlias = def.alias;
+
+  // ── 5b. Required-field enforcement (insert / update only) ─────────────────
+  if (op === 'insert' || op === 'update') {
+    const missing = getMissingRequiredFields(def, filteredPayload, op);
+    if (missing.length) {
+      return res.status(422).json({
+        message: `Missing required field${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}.`,
+        missingFields: missing,
+      });
+    }
+  }
 
   // ── 6. EU-B3: Consumption gate (insert / update only) ─────────────────────
   //   Runs AFTER permission check and payload filtering, BEFORE any DB write.

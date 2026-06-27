@@ -921,6 +921,66 @@
     "relations": {}
   },
 
+  "fabErpCustomer": {
+    "table": "fab_customers",
+    "alias": "fcus",
+    "writeFields": ["name", "code", "contact_name", "phone", "email", "address", "notes"],
+    "fields": {
+      "id":          "fcus.id",
+      "companyId":   "fcus.company_id",
+      "name":        "fcus.name",
+      "code":        "fcus.code",
+      "contactName": "fcus.contact_name",
+      "phone":       "fcus.phone",
+      "email":       "fcus.email",
+      "address":     "fcus.address",
+      "notes":       "fcus.notes",
+      "createdAt":   "fcus.created_at",
+      "updatedAt":   "fcus.updated_at"
+    },
+    "fieldTypes": {
+      "id":          "integer",
+      "companyId":   "integer",
+      "name":        "string",
+      "code":        "string",
+      "contactName": "string",
+      "phone":       "string",
+      "email":       "string",
+      "address":     "string",
+      "notes":       "string",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCodegenRule": {
+    "table": "fab_codegen_rules",
+    "alias": "fcgr",
+    "writeFields": ["entity_type", "segments_json"],
+    "fields": {
+      "id":            "fcgr.id",
+      "companyId":     "fcgr.company_id",
+      "entityType":    "fcgr.entity_type",
+      "segmentsJson":  "fcgr.segments_json",
+      "nextSeq":       "fcgr.next_seq",
+      "seqPeriodKey":  "fcgr.seq_period_key",
+      "createdAt":     "fcgr.created_at",
+      "updatedAt":     "fcgr.updated_at"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "companyId":     "integer",
+      "entityType":    "string",
+      "segmentsJson":  "string",
+      "nextSeq":       "integer",
+      "seqPeriodKey":  "string",
+      "createdAt":     "datetime",
+      "updatedAt":     "datetime"
+    },
+    "relations": {}
+  },
+
   "fabErpStockBalance": {
     "table": "fab_stock_balances",
     "alias": "fsb",
@@ -1312,7 +1372,7 @@
   "fabErpOrder": {
     "table": "fab_orders",
     "alias": "fo",
-    "writeFields": ["order_number","order_type","type","status","customer_name","customer_po_ref","plant_id","catalog_item_id","qty","unit","required_date","confirmed_date","scheduled_start","scheduled_end","scheduled_ship_date","parent_order_id","source_order_id","source_order_line_id","bom_id","routing_plan_id","delivery_address","payment_terms","currency","supplier_id","supplier_ref","priority","mrp_controller","notes","created_by"],
+    "writeFields": ["order_number","order_type","type","status","customer_id","customer_name","customer_po_ref","plant_id","catalog_item_id","qty","unit","required_date","confirmed_date","scheduled_start","scheduled_end","scheduled_ship_date","parent_order_id","source_order_id","source_order_line_id","bom_id","routing_plan_id","delivery_address","payment_terms","currency","supplier_id","supplier_ref","priority","mrp_controller","notes","created_by"],
     "fields": {
       "id":                  "fo.id",
       "companyId":           "fo.company_id",
@@ -1320,6 +1380,7 @@
       "orderType":           "fo.order_type",
       "type":                "fo.type",
       "status":              "fo.status",
+      "customerId":          "fo.customer_id",
       "customerName":        "fo.customer_name",
       "customerPoRef":       "fo.customer_po_ref",
       "plantId":             "fo.plant_id",
@@ -1348,7 +1409,10 @@
       "createdAt":           "fo.created_at",
       "updatedAt":           "fo.updated_at",
       "plantName":           "fpl_o.name",
-      "plantCode":           "fpl_o.code"
+      "plantCode":           "fpl_o.code",
+      "customerCode":        "fcus_o.code",
+      "supplierName":        "fsup_o.name",
+      "supplierCode":        "fsup_o.code"
     },
     "fieldTypes": {
       "id":                  "integer",
@@ -1357,6 +1421,7 @@
       "orderType":           "string",
       "type":                "string",
       "status":              "string",
+      "customerId":          "integer",
       "customerName":        "string",
       "customerPoRef":       "string",
       "plantId":             "integer",
@@ -1385,7 +1450,10 @@
       "createdAt":           "datetime",
       "updatedAt":           "datetime",
       "plantName":           "string",
-      "plantCode":           "string"
+      "plantCode":           "string",
+      "customerCode":        "string",
+      "supplierName":        "string",
+      "supplierCode":        "string"
     },
     "relations": {
       "plant": {
@@ -1393,7 +1461,28 @@
         "alias": "fpl_o",
         "on":    "fo.plant_id = fpl_o.id",
         "fields": ["plantName","plantCode"]
+      },
+      "customer": {
+        "table": "fab_customers",
+        "alias": "fcus_o",
+        "on":    "fo.customer_id = fcus_o.id",
+        "fields": ["customerCode"]
+      },
+      "supplier": {
+        "table": "fab_suppliers",
+        "alias": "fsup_o",
+        "on":    "fo.supplier_id = fsup_o.id",
+        "fields": ["supplierName","supplierCode"]
       }
+    },
+    "requiredFields": {
+      "always": ["order_number", "order_type"],
+      "byOrderType": {
+        "sales":      ["customer_id"],
+        "purchase":   ["supplier_id"],
+        "subcontract": ["supplier_id"]
+      },
+      "orderTypeField": "order_type"
     }
   },
 

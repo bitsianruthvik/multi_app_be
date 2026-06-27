@@ -14,6 +14,7 @@
 import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
+import { generateCode } from './codegenService.js';
 
 const MATERIAL_TYPES    = ['raw_material', 'component', 'semi_finished', 'finished_good'];
 const PROCUREMENT_TYPES = ['buy', 'make'];
@@ -374,8 +375,7 @@ export async function importItemsExcel(file, companyId) {
         result.itemsSkipped++;
         continue;
       }
-      if (!code) code = uniqueCode(itemCodeSet, r.name);
-      else itemCodeSet.add(code);
+      if (code) itemCodeSet.add(code);
 
       if (!r.categoryName) {
         result.warnings.push({ row: r.rowNumber, message: `Category is required — row skipped.` });
@@ -386,6 +386,16 @@ export async function importItemsExcel(file, companyId) {
       const categoryId = await resolveCategory(r.categoryName);
       let groupId = r.groupName ? await resolveGroup(categoryId, r.groupName) : await resolveDefaultGroup(categoryId);
       const subgroupId = r.subgroupName ? await resolveSubgroup(groupId, r.subgroupName) : await resolveDefaultSubgroup(groupId);
+
+      if (!code) {
+        // No code in the spreadsheet — use the company's configured item code rule
+        // (falls back to a sensible default when none is configured), retrying on
+        // the rare collision against codes already used elsewhere in this import.
+        do {
+          code = (await generateCode(companyId, 'item', { categoryId })).toUpperCase();
+        } while (itemCodeSet.has(code));
+        itemCodeSet.add(code);
+      }
 
       let materialType = 'component';
       if (r.materialTypeRaw) {

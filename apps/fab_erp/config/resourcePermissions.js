@@ -63,6 +63,8 @@ const resourcePermissions = {
   fabErpItemSubgroup:  'fab_erp_taxonomy_manage',
   fabErpStockLocation: 'fab_erp_stock_location_manage',
   fabErpSupplier:      'fab_erp_grn_manage',
+  fabErpCustomer:      'fab_erp_projects_manage',
+  fabErpCodegenRule:   'fab_erp_items_meta_manage',
   fabErpStockBalance:  'fab_erp_inventory_manage',
   fabErpStockPolicy:   'fab_erp_inventory_manage',
   fabErpItemBatch:     'fab_erp_inventory_manage',

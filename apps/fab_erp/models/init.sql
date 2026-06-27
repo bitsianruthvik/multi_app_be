@@ -109,6 +109,18 @@ CREATE TABLE IF NOT EXISTS fab_constants (
   KEY idx_fc_company (company_id)
 );
 
+CREATE TABLE IF NOT EXISTS fab_codegen_rules (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  entity_type    VARCHAR(50)   NOT NULL,
+  segments_json  JSON          NOT NULL,
+  next_seq       INT           NOT NULL DEFAULT 1,
+  seq_period_key VARCHAR(20)   NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_fab_codegen_rules (company_id, entity_type)
+);
+
 -- ===== TEMPLATES =====
 
 CREATE TABLE IF NOT EXISTS fab_process_templates (
@@ -412,6 +424,23 @@ CREATE TABLE IF NOT EXISTS fab_suppliers (
   deleted_at   TIMESTAMP     NULL,
   UNIQUE KEY uq_fab_suppliers (company_id, code),
   KEY idx_fab_suppliers_company (company_id)
+);
+
+CREATE TABLE IF NOT EXISTS fab_customers (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  name         VARCHAR(150)  NOT NULL,
+  code         VARCHAR(40)   NOT NULL,
+  contact_name VARCHAR(120)  NULL,
+  phone        VARCHAR(40)   NULL,
+  email        VARCHAR(150)  NULL,
+  address      TEXT          NULL,
+  notes        TEXT          NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at   TIMESTAMP     NULL,
+  UNIQUE KEY uq_fab_customers (company_id, code),
+  KEY idx_fab_customers_company (company_id)
 );
 
 CREATE TABLE IF NOT EXISTS fab_item_batches (

@@ -10,6 +10,7 @@ import ordersRouter    from './orders.js';
 import schedulerRouter from './scheduler.js';
 import plannerRouter   from './planner.js';
 import itemsRouter     from './items.js';
+import codegenRouter   from './codegen.js';
 
 const router = Router();
 
@@ -26,5 +27,6 @@ router.use(ordersRouter);
 router.use(schedulerRouter);
 router.use(plannerRouter);
 router.use(itemsRouter);
+router.use(codegenRouter);
 
 export default router;
