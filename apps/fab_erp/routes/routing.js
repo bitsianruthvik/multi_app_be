@@ -144,13 +144,20 @@ router.get('/routing/boms', protect, async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT fmb.id, fmb.name AS bom_name, fmb.is_default, fmb.base_qty, fmb.base_unit,
-              fic.id AS catalog_item_id, fic.name AS catalog_item_name, fic.code AS catalog_item_code
+              fic.id AS catalog_item_id, fic.name AS catalog_item_name, fic.code AS catalog_item_code,
+              cat.name AS category_name, grp.name AS group_name,
+              (SELECT COUNT(*) FROM fab_material_bom_items
+                 WHERE bom_id = fmb.id AND deleted_at IS NULL) AS item_count
          FROM fab_material_boms fmb
          JOIN fab_item_catalog fic ON fic.id = fmb.catalog_item_id
+         LEFT JOIN fab_item_categories cat ON cat.id = fic.category_id
+         LEFT JOIN fab_item_groups     grp ON grp.id = fic.group_id
         WHERE fmb.company_id = ? AND fmb.deleted_at IS NULL AND fic.deleted_at IS NULL
         ORDER BY fic.name, fmb.name`,
       [req.user.companyId],
     );
+    // kept snake_case (not run through ccs()) — the frontend already consumes this
+    // endpoint's existing fields as snake_case (bom_name, catalog_item_name, ...).
     res.json({ data: rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
