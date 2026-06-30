@@ -21,39 +21,55 @@ const requirePerm = (tag) => (req, res, next) => {
 };
 
 router.get('/codegen-rules', protect, async (req, res) => {
-  const entityType = req.query.entityType;
-  if (!entityType) return res.status(400).json({ message: '"entityType" query param is required.' });
-  const companyId = req.user.companyId ?? req.user.company_id;
-  const rule = await getRule(companyId, entityType);
-  res.json(rule);
+  try {
+    const entityType = req.query.entityType;
+    if (!entityType) return res.status(400).json({ message: '"entityType" query param is required.' });
+    const companyId = req.user.companyId ?? req.user.company_id;
+    const rule = await getRule(companyId, entityType);
+    res.json(rule);
+  } catch (err) {
+    res.status(500).json({ message: err.message ?? 'Failed to load rule' });
+  }
 });
 
 router.post('/codegen-rules', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
-  const { entityType, segments } = req.body ?? {};
-  if (!entityType || !Array.isArray(segments)) {
-    return res.status(400).json({ message: '"entityType" and "segments" (array) are required.' });
+  try {
+    const { entityType, segments } = req.body ?? {};
+    if (!entityType || !Array.isArray(segments)) {
+      return res.status(400).json({ message: '"entityType" and "segments" (array) are required.' });
+    }
+    const companyId = req.user.companyId ?? req.user.company_id;
+    await saveRule(companyId, entityType, segments);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message ?? 'Failed to save rule' });
   }
-  const companyId = req.user.companyId ?? req.user.company_id;
-  await saveRule(companyId, entityType, segments);
-  res.json({ ok: true });
 });
 
 router.post('/codegen/preview', protect, async (req, res) => {
-  const { entityType, segments, context } = req.body ?? {};
-  if (!entityType || !Array.isArray(segments)) {
-    return res.status(400).json({ message: '"entityType" and "segments" (array) are required.' });
+  try {
+    const { entityType, segments, context } = req.body ?? {};
+    if (!entityType || !Array.isArray(segments)) {
+      return res.status(400).json({ message: '"entityType" and "segments" (array) are required.' });
+    }
+    const companyId = req.user.companyId ?? req.user.company_id;
+    const code = await previewCode(companyId, entityType, segments, context ?? {});
+    res.json({ code });
+  } catch (err) {
+    res.status(500).json({ message: err.message ?? 'Preview failed' });
   }
-  const companyId = req.user.companyId ?? req.user.company_id;
-  const code = await previewCode(companyId, entityType, segments, context ?? {});
-  res.json({ code });
 });
 
 router.post('/codegen/next-code', protect, async (req, res) => {
-  const { entityType, context } = req.body ?? {};
-  if (!entityType) return res.status(400).json({ message: '"entityType" is required.' });
-  const companyId = req.user.companyId ?? req.user.company_id;
-  const code = await generateCode(companyId, entityType, context ?? {});
-  res.json({ code });
+  try {
+    const { entityType, context } = req.body ?? {};
+    if (!entityType) return res.status(400).json({ message: '"entityType" is required.' });
+    const companyId = req.user.companyId ?? req.user.company_id;
+    const code = await generateCode(companyId, entityType, context ?? {});
+    res.json({ code });
+  } catch (err) {
+    res.status(500).json({ message: err.message ?? 'Failed to generate code' });
+  }
 });
 
 export default router;
