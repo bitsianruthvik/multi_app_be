@@ -11,6 +11,7 @@ import schedulerRouter from './scheduler.js';
 import plannerRouter   from './planner.js';
 import itemsRouter     from './items.js';
 import codegenRouter   from './codegen.js';
+import searchRouter    from './search.js';
 
 const router = Router();
 
@@ -28,5 +29,6 @@ router.use(schedulerRouter);
 router.use(plannerRouter);
 router.use(itemsRouter);
 router.use(codegenRouter);
+router.use(searchRouter);
 
 export default router;
