@@ -66,6 +66,42 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: 'RT-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
   ],
+  sales_order: [
+    { type: 'fixed', value: 'SO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  manufacturing_order: [
+    { type: 'fixed', value: 'MO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  purchase_order: [
+    { type: 'fixed', value: 'PO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  planned_order: [
+    { type: 'fixed', value: 'PLN-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  subcontract_order: [
+    { type: 'fixed', value: 'SCO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  transfer_order: [
+    { type: 'fixed', value: 'TO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
 };
 
 export function defaultSegmentsFor(entityType) {
