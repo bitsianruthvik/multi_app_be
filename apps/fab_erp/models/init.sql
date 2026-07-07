@@ -1678,6 +1678,6 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=D
 SET @sql = IF(@col=0,'ALTER TABLE fab_item_subgroups ADD COLUMN shortform VARCHAR(10) NULL','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
-UPDATE fab_item_categories SET shortform = code WHERE shortform IS NULL;
-UPDATE fab_item_groups SET shortform = code WHERE shortform IS NULL;
-UPDATE fab_item_subgroups SET shortform = code WHERE shortform IS NULL;
+UPDATE fab_item_categories SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
+UPDATE fab_item_groups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
+UPDATE fab_item_subgroups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
