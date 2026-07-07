@@ -767,12 +767,13 @@
   "fabErpItemCategory": {
     "table": "fab_item_categories",
     "alias": "fic2",
-    "writeFields": ["name", "code", "description", "is_system", "batch_required", "serial_required", "heat_required", "mark_required"],
+    "writeFields": ["name", "code", "shortform", "description", "is_system", "batch_required", "serial_required", "heat_required", "mark_required"],
     "fields": {
       "id":             "fic2.id",
       "companyId":      "fic2.company_id",
       "name":           "fic2.name",
       "code":           "fic2.code",
+      "shortform":      "fic2.shortform",
       "description":    "fic2.description",
       "isSystem":       "fic2.is_system",
       "batchRequired":  "fic2.batch_required",
@@ -787,6 +788,7 @@
       "companyId":      "integer",
       "name":           "string",
       "code":           "string",
+      "shortform":      "string",
       "description":    "string",
       "isSystem":       "integer",
       "batchRequired":  "integer",
@@ -802,13 +804,14 @@
   "fabErpItemGroup": {
     "table": "fab_item_groups",
     "alias": "fig",
-    "writeFields": ["category_id", "name", "code", "description", "is_system"],
+    "writeFields": ["category_id", "name", "code", "shortform", "description", "is_system"],
     "fields": {
       "id":           "fig.id",
       "companyId":    "fig.company_id",
       "categoryId":   "fig.category_id",
       "name":         "fig.name",
       "code":         "fig.code",
+      "shortform":    "fig.shortform",
       "description":  "fig.description",
       "isSystem":     "fig.is_system",
       "createdAt":    "fig.created_at",
@@ -821,6 +824,7 @@
       "categoryId":   "integer",
       "name":         "string",
       "code":         "string",
+      "shortform":    "string",
       "description":  "string",
       "isSystem":     "integer",
       "createdAt":    "datetime",
@@ -840,13 +844,14 @@
   "fabErpItemSubgroup": {
     "table": "fab_item_subgroups",
     "alias": "fisg",
-    "writeFields": ["group_id", "name", "code", "description", "is_system"],
+    "writeFields": ["group_id", "name", "code", "shortform", "description", "is_system"],
     "fields": {
       "id":          "fisg.id",
       "companyId":   "fisg.company_id",
       "groupId":     "fisg.group_id",
       "name":        "fisg.name",
       "code":        "fisg.code",
+      "shortform":   "fisg.shortform",
       "description": "fisg.description",
       "isSystem":    "fisg.is_system",
       "createdAt":   "fisg.created_at",
@@ -859,6 +864,7 @@
       "groupId":     "integer",
       "name":        "string",
       "code":        "string",
+      "shortform":   "string",
       "description": "string",
       "isSystem":    "integer",
       "createdAt":   "datetime",
@@ -916,7 +922,7 @@
   "fabErpSupplier": {
     "table": "fab_suppliers",
     "alias": "fsup",
-    "writeFields": ["name", "code", "contact_name", "phone", "email", "address", "notes"],
+    "writeFields": ["name", "contact_name", "phone", "email", "address", "notes"],
     "fields": {
       "id":          "fsup.id",
       "companyId":   "fsup.company_id",
@@ -949,7 +955,7 @@
   "fabErpCustomer": {
     "table": "fab_customers",
     "alias": "fcus",
-    "writeFields": ["name", "code", "contact_name", "phone", "email", "address", "notes"],
+    "writeFields": ["name", "contact_name", "phone", "email", "address", "notes"],
     "fields": {
       "id":          "fcus.id",
       "companyId":   "fcus.company_id",

@@ -102,6 +102,14 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: '-' },
     { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
   ],
+  customer: [
+    { type: 'fixed', value: 'CUST-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'never' },
+  ],
+  supplier: [
+    { type: 'fixed', value: 'SUPP-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'never' },
+  ],
 };
 
 export function defaultSegmentsFor(entityType) {
@@ -139,28 +147,34 @@ function periodKeyFor(resetPeriod, now) {
 async function categoryShortform(companyId, categoryId, length) {
   if (!categoryId) return '';
   const [[row]] = await pool.query(
-    `SELECT code FROM fab_item_categories WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    `SELECT shortform, name FROM fab_item_categories WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [categoryId, companyId],
   );
-  return (row?.code ?? '').toUpperCase().slice(0, length);
+  if (!row) return '';
+  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
+  return source.toUpperCase().slice(0, length);
 }
 
 async function groupShortform(companyId, groupId, length) {
   if (!groupId) return '';
   const [[row]] = await pool.query(
-    `SELECT code FROM fab_item_groups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    `SELECT shortform, name FROM fab_item_groups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [groupId, companyId],
   );
-  return (row?.code ?? '').toUpperCase().slice(0, length);
+  if (!row) return '';
+  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
+  return source.toUpperCase().slice(0, length);
 }
 
 async function subgroupShortform(companyId, subgroupId, length) {
   if (!subgroupId) return '';
   const [[row]] = await pool.query(
-    `SELECT code FROM fab_item_subgroups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    `SELECT shortform, name FROM fab_item_subgroups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [subgroupId, companyId],
   );
-  return (row?.code ?? '').toUpperCase().slice(0, length);
+  if (!row) return '';
+  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
+  return source.toUpperCase().slice(0, length);
 }
 
 /** Evaluates segments into a code string. seqValue is the number to render for the sequence segment. */
