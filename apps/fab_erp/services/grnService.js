@@ -10,8 +10,8 @@
  *   1. Insert the GRN header into fab_grns (status = 'posted').
  *   2. For each line, in order:
  *        a. Upsert fab_item_batches: increment qty_on_hand if a matching
- *           batch (company/item/plant/location/batch_code) exists, otherwise
- *           insert a new batch row with qty_on_hand = line.qty.
+ *           batch (company/item/plant/location/batch_no/serial_no/heat_no/mark_no)
+ *           exists, otherwise insert a new batch row with qty_on_hand = line.qty.
  *        b. Insert the GRN line into fab_grn_lines, linked to the batch.
  *        c. Append a 'grn_receipt' entry to fab_stock_ledger.
  *        d. If a fab_stock_balances row exists for this item/plant/location,
@@ -20,12 +20,30 @@
  *           balance row is created here.
  *   3. Commit the transaction and return { ok, grnId, lineCount }.
  *
+ * Traceability: each line optionally carries batch_no / serial_no / heat_no /
+ * mark_no. Which of these are mandatory is determined by the item's Category
+ * (with a per-item override) — see routes/grn.js for the pre-post validation
+ * that enforces this before postGrn() is ever called.
+ *
  * On any error the transaction is rolled back and the error is rethrown for
  * the route handler to translate into an HTTP response (e.g. ER_DUP_ENTRY
  * on fab_grns.uq_fab_grns_number -> 409).
  */
 
 import { pool } from '../../../db.js';
+
+// NULL-safe equality (<=>) so two lines that both omit e.g. heat_no still
+// match on that column instead of being treated as never-equal (regular `=`
+// never matches NULL against NULL).
+const BATCH_MATCH_SQL = `
+            AND batch_no    <=> ?
+            AND serial_no   <=> ?
+            AND heat_no     <=> ?
+            AND mark_no     <=> ?`;
+
+function displayBatchCode(line) {
+  return line.batch_no ?? line.serial_no ?? line.heat_no ?? line.mark_no ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // postGrn
@@ -64,6 +82,12 @@ export async function postGrn(companyId, { header, lines }) {
 
     // ── 2. Process each line ─────────────────────────────────────────────────
     for (const line of lines) {
+      const batchNo   = line.batch_no ?? null;
+      const serialNo  = line.serial_no ?? null;
+      const heatNo    = line.heat_no ?? null;
+      const markNo    = line.mark_no ?? null;
+      const batchCode = displayBatchCode(line);
+
       // a. Batch upsert
       const [batchRows] = await conn.query(
         `SELECT id, qty_on_hand
@@ -71,8 +95,7 @@ export async function postGrn(companyId, { header, lines }) {
           WHERE company_id = ?
             AND catalog_item_id = ?
             AND plant_id = ?
-            AND stock_location_id = ?
-            AND batch_code = ?
+            AND stock_location_id = ?${BATCH_MATCH_SQL}
             AND deleted_at IS NULL
           FOR UPDATE`,
         [
@@ -80,7 +103,7 @@ export async function postGrn(companyId, { header, lines }) {
           line.catalog_item_id,
           header.plant_id,
           header.stock_location_id,
-          line.batch_code,
+          batchNo, serialNo, heatNo, markNo,
         ],
       );
 
@@ -98,14 +121,14 @@ export async function postGrn(companyId, { header, lines }) {
         const [batchInsertResult] = await conn.query(
           `INSERT INTO fab_item_batches
              (company_id, catalog_item_id, plant_id, stock_location_id,
-              batch_code, qty_on_hand, received_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              batch_code, batch_no, serial_no, heat_no, mark_no, qty_on_hand, received_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             companyId,
             line.catalog_item_id,
             header.plant_id,
             header.stock_location_id,
-            line.batch_code,
+            batchCode, batchNo, serialNo, heatNo, markNo,
             line.qty,
             header.grn_date,
           ],
@@ -116,14 +139,14 @@ export async function postGrn(companyId, { header, lines }) {
       // b. Insert GRN line
       const [grnLineResult] = await conn.query(
         `INSERT INTO fab_grn_lines
-           (company_id, grn_id, catalog_item_id, batch_id, batch_code, qty, unit_cost)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (company_id, grn_id, catalog_item_id, batch_id, batch_code, batch_no, serial_no, heat_no, mark_no, qty, unit_cost)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           companyId,
           grnId,
           line.catalog_item_id,
           batchId,
-          line.batch_code,
+          batchCode, batchNo, serialNo, heatNo, markNo,
           line.qty,
           line.unit_cost ?? null,
         ],
@@ -135,15 +158,15 @@ export async function postGrn(companyId, { header, lines }) {
       await conn.query(
         `INSERT INTO fab_stock_ledger
            (company_id, catalog_item_id, plant_id, stock_location_id, batch_id,
-            batch_code, txn_type, qty, unit_cost, supplier_id, grn_id, grn_line_id, txn_date)
-         VALUES (?, ?, ?, ?, ?, ?, 'grn_receipt', ?, ?, ?, ?, ?, ?)`,
+            batch_code, batch_no, serial_no, heat_no, mark_no, txn_type, qty, unit_cost, supplier_id, grn_id, grn_line_id, txn_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'grn_receipt', ?, ?, ?, ?, ?, ?)`,
         [
           companyId,
           line.catalog_item_id,
           header.plant_id,
           header.stock_location_id,
           batchId,
-          line.batch_code,
+          batchCode, batchNo, serialNo, heatNo, markNo,
           line.qty,
           line.unit_cost ?? null,
           header.supplier_id ?? null,

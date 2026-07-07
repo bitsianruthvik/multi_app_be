@@ -1574,3 +1574,93 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='dimension_decimals');
 SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN dimension_decimals INT NOT NULL DEFAULT 3','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===== TRACEABILITY (batch / serial / heat / mark) =====
+--
+-- Traceability requirements live on the Category ("Item Type") and can be
+-- overridden per item. `@col` gates both the ALTERs and the one-time default
+-- seed below it — if the columns already exist, neither runs again, so a
+-- user's later edits to these flags are never clobbered on server restart.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='batch_required');
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_categories ADD COLUMN batch_required TINYINT(1) NOT NULL DEFAULT 0','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_categories ADD COLUMN serial_required TINYINT(1) NOT NULL DEFAULT 0','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_categories ADD COLUMN heat_required TINYINT(1) NOT NULL DEFAULT 0','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_categories ADD COLUMN mark_required TINYINT(1) NOT NULL DEFAULT 0','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- One-time default rules for the standard seeded taxonomy (only fires the
+-- first time the columns above are created).
+SET @sql = IF(@col=0,"UPDATE fab_item_categories SET batch_required=1, heat_required=1 WHERE code='rm' AND is_system=1",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,"UPDATE fab_item_categories SET batch_required=1 WHERE code='cons' AND is_system=1",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,"UPDATE fab_item_categories SET mark_required=1 WHERE code='sfg' AND is_system=1",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,"UPDATE fab_item_categories SET mark_required=1 WHERE code='fg' AND is_system=1",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Item-level overrides — NULL means "inherit from Category".
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='batch_required_override');
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN batch_required_override TINYINT(1) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN serial_required_override TINYINT(1) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN heat_required_override TINYINT(1) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN mark_required_override TINYINT(1) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Split the single free-text batch_code into four typed identifiers so stock
+-- can be broken out by tracking type. batch_code is kept (now nullable) as a
+-- legacy display fallback for rows created before this migration.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_batches' AND COLUMN_NAME='batch_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches MODIFY COLUMN batch_code VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD COLUMN batch_no VARCHAR(60) NULL AFTER batch_code','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD COLUMN serial_no VARCHAR(60) NULL AFTER batch_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD COLUMN heat_no VARCHAR(60) NULL AFTER serial_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD COLUMN mark_no VARCHAR(60) NULL AFTER heat_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'UPDATE fab_item_batches SET batch_no = batch_code WHERE batch_no IS NULL AND batch_code IS NOT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches DROP INDEX uq_fab_item_batches','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD UNIQUE KEY uq_fab_item_batches (company_id, catalog_item_id, plant_id, stock_location_id, batch_no, serial_no, heat_no, mark_no)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Same four identifiers on the GRN line (source of truth at receipt time).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_grn_lines' AND COLUMN_NAME='batch_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines MODIFY COLUMN batch_code VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN batch_no VARCHAR(60) NULL AFTER batch_code','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN serial_no VARCHAR(60) NULL AFTER batch_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN heat_no VARCHAR(60) NULL AFTER serial_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN mark_no VARCHAR(60) NULL AFTER heat_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'UPDATE fab_grn_lines SET batch_no = batch_code WHERE batch_no IS NULL AND batch_code IS NOT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Same four identifiers on the stock ledger (audit trail).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='batch_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_code VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN batch_no VARCHAR(60) NULL AFTER batch_code','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN serial_no VARCHAR(60) NULL AFTER batch_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN heat_no VARCHAR(60) NULL AFTER serial_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN mark_no VARCHAR(60) NULL AFTER heat_no','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'UPDATE fab_stock_ledger SET batch_no = batch_code WHERE batch_no IS NULL AND batch_code IS NOT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
