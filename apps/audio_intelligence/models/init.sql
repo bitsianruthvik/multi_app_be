@@ -70,19 +70,6 @@ CREATE TABLE IF NOT EXISTS actions (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-DROP PROCEDURE IF EXISTS add_action_id_if_missing;
-DELIMITER //
-CREATE PROCEDURE add_action_id_if_missing()
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE()
-      AND TABLE_NAME = 'audio_recordings'
-      AND COLUMN_NAME = 'action_id'
-  ) THEN
-    ALTER TABLE audio_recordings ADD COLUMN action_id INT DEFAULT NULL AFTER medicine;
-  END IF;
-END //
-DELIMITER ;
-CALL add_action_id_if_missing();
-DROP PROCEDURE IF EXISTS add_action_id_if_missing;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='audio_recordings' AND COLUMN_NAME='action_id');
+SET @sql = IF(@col=0,'ALTER TABLE audio_recordings ADD COLUMN action_id INT DEFAULT NULL AFTER medicine','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

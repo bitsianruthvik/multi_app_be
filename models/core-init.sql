@@ -2,7 +2,7 @@
 -- Tables: companies, apps, users, teams, roles, features, features_capability, role_capability.
 -- App-specific tables live in apps/<slug>/models/init.sql.
 
-CREATE TABLE features (
+CREATE TABLE IF NOT EXISTS features (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(255),
   feature_name VARCHAR(100),
@@ -11,7 +11,7 @@ CREATE TABLE features (
   deleted_at DATETIME NULL DEFAULT NULL
 );
 
-CREATE TABLE features_capability (
+CREATE TABLE IF NOT EXISTS features_capability (
   capability_id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(100),
   features_json JSON,
@@ -21,7 +21,7 @@ CREATE TABLE features_capability (
 
 -- Post-migration shape: role_capability uses FK columns (role_id, team_id, company_id).
 -- See migrations/core/002_role_capability_fk.sql for the data migration.
-CREATE TABLE role_capability (
+CREATE TABLE IF NOT EXISTS role_capability (
   id INT AUTO_INCREMENT PRIMARY KEY,
   role_id INT NULL,
   team_id INT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE role_capability (
 );
 
 -- Companies table used to store app/company specific settings and slug
-CREATE TABLE companies (
+CREATE TABLE IF NOT EXISTS companies (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(200) NOT NULL,
   slug VARCHAR(100) NOT NULL UNIQUE,
@@ -47,7 +47,7 @@ CREATE TABLE companies (
   deleted_at DATETIME NULL DEFAULT NULL
 );
 
-CREATE TABLE apps (
+CREATE TABLE IF NOT EXISTS apps (
   id INT AUTO_INCREMENT PRIMARY KEY,
   company_id INT NOT NULL,
   name VARCHAR(200) NOT NULL,
@@ -61,7 +61,7 @@ CREATE TABLE apps (
     ON UPDATE CASCADE
 );
 
-CREATE TABLE teams (
+CREATE TABLE IF NOT EXISTS teams (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(200) NOT NULL,
   company_id INT NOT NULL,
@@ -71,7 +71,7 @@ CREATE TABLE teams (
     ON UPDATE CASCADE
 );
 
-CREATE TABLE roles (
+CREATE TABLE IF NOT EXISTS roles (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(200) NOT NULL,
   company_id INT NOT NULL,
@@ -82,7 +82,7 @@ CREATE TABLE roles (
     ON UPDATE CASCADE
 );
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(100) NOT NULL UNIQUE,
