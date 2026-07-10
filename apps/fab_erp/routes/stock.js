@@ -14,9 +14,14 @@
  *       stockLocationId?  — optional filter, integer
  *       catalogItemId?    — optional filter, integer — scope the breakdown to one item
  *       groupBy?          — optional, one of:
- *                             batchNo | heatNo | serialNo | markNo |
- *                             stockLocationId | status | customField:<field_key>
+ *                             batchNo | heatNo | piece
  *     }
+ *
+ *     groupBy=piece returns one segment row per individual fab_stock_pieces
+ *     row (not aggregated), with every stock-piece-level custom field
+ *     (fab_custom_fields, level='stock_piece') attached as a customFields
+ *     array — this is what the Item Batches UI uses for its "Stock Piece"
+ *     segment-by option so users can see Width/Length/etc. per physical piece.
  *     Auth: JWT required (protect middleware).
  *     Authz: req.user.role === 'admin'  OR
  *            req.user.uiPermissions includes 'fab_erp_inventory_view'
@@ -46,10 +51,6 @@ const router = Router();
 const PIECE_COLUMN_GROUP_BYS = {
   batchNo: 'batch_no',
   heatNo: 'heat_no',
-  serialNo: 'serial_no',
-  markNo: 'mark_no',
-  stockLocationId: 'stock_location_id',
-  status: 'status',
 };
 
 // ── GET /stock/summary ────────────────────────────────────────────────────
@@ -111,21 +112,17 @@ router.get('/stock/summary', protect, async (req, res) => {
     params.push(n);
   }
 
-  let customFieldKey = null;
   let pieceColumn = null;
+  let byPiece = false;
 
   if (groupBy !== undefined && groupBy !== '') {
-    if (typeof groupBy === 'string' && groupBy.startsWith('customField:')) {
-      customFieldKey = groupBy.slice('customField:'.length);
-      if (!customFieldKey) {
-        return res.status(400).json({ message: 'groupBy=customField:<field_key> requires a field_key.' });
-      }
+    if (groupBy === 'piece') {
+      byPiece = true;
     } else if (Object.prototype.hasOwnProperty.call(PIECE_COLUMN_GROUP_BYS, groupBy)) {
       pieceColumn = PIECE_COLUMN_GROUP_BYS[groupBy];
     } else {
       return res.status(400).json({
-        message:
-          'groupBy must be one of batchNo, heatNo, serialNo, markNo, stockLocationId, status, or customField:<field_key>.',
+        message: 'groupBy must be one of batchNo, heatNo, or piece.',
       });
     }
   }
@@ -133,7 +130,7 @@ router.get('/stock/summary', protect, async (req, res) => {
   const whereClause = filters.join(' AND ');
 
   try {
-    if (!pieceColumn && !customFieldKey) {
+    if (!pieceColumn && !byPiece) {
       // ── Mode 1: item-level totals only ──────────────────────────────
       const [rows] = await pool.query(
         `SELECT fic.id AS catalog_item_id, fic.name, fic.code, fic.unit, SUM(fsp.qty) AS qty
@@ -156,42 +153,83 @@ router.get('/stock/summary', protect, async (req, res) => {
       return res.status(200).json({ ok: true, data: { items } });
     }
 
-    // ── Mode 2: item-level totals + per-dimension breakdown ────────────
-    let segmentRows;
-    if (customFieldKey) {
-      const [rows] = await pool.query(
-        `SELECT fic.id AS catalog_item_id, fic.name, fic.code, fic.unit,
-                cf.field_value AS segment_value, SUM(fsp.qty) AS qty
-           FROM fab_stock_pieces fsp
-           JOIN fab_item_catalog fic ON fic.id = fsp.catalog_item_id
-           LEFT JOIN fab_custom_fields cf
-                  ON cf.level = 'stock_piece'
-                 AND cf.level_id = fsp.id
-                 AND cf.field_key = ?
-                 AND cf.deleted_at IS NULL
-          WHERE ${whereClause}
-          GROUP BY fic.id, fic.name, fic.code, fic.unit, cf.field_value
-          ORDER BY fic.name, segment_value`,
-        [customFieldKey, ...params],
-      );
-      segmentRows = rows;
-    } else {
-      const [rows] = await pool.query(
-        `SELECT fic.id AS catalog_item_id, fic.name, fic.code, fic.unit,
-                fsp.${pieceColumn} AS segment_value, SUM(fsp.qty) AS qty
+    if (byPiece) {
+      // ── Mode 3: individual stock pieces, each with its custom fields ──
+      const [pieceRows] = await pool.query(
+        `SELECT fsp.id, fsp.batch_no, fsp.heat_no, fsp.serial_no, fsp.mark_no,
+                fsp.qty, fsp.uom, fsp.status, fsp.stock_location_id, fsp.received_date,
+                fic.id AS catalog_item_id, fic.name, fic.code, fic.unit
            FROM fab_stock_pieces fsp
            JOIN fab_item_catalog fic ON fic.id = fsp.catalog_item_id
           WHERE ${whereClause}
-          GROUP BY fic.id, fic.name, fic.code, fic.unit, fsp.${pieceColumn}
-          ORDER BY fic.name, segment_value`,
+          ORDER BY fic.name, fsp.id`,
         params,
       );
-      segmentRows = rows;
+
+      const pieceIds = pieceRows.map((r) => r.id);
+      const customFieldsByPieceId = new Map();
+      if (pieceIds.length) {
+        const [cfRows] = await pool.query(
+          `SELECT level_id, field_key, field_value
+             FROM fab_custom_fields
+            WHERE company_id = ? AND level = 'stock_piece' AND level_id IN (?) AND deleted_at IS NULL
+            ORDER BY sort_order`,
+          [companyId, pieceIds],
+        );
+        for (const cf of cfRows) {
+          if (!customFieldsByPieceId.has(cf.level_id)) customFieldsByPieceId.set(cf.level_id, []);
+          customFieldsByPieceId.get(cf.level_id).push({ fieldKey: cf.field_key, fieldValue: cf.field_value });
+        }
+      }
+
+      const itemsByCatalogId = new Map();
+      for (const r of pieceRows) {
+        let item = itemsByCatalogId.get(r.catalog_item_id);
+        if (!item) {
+          item = {
+            catalogItemId: r.catalog_item_id,
+            name: r.name,
+            code: r.code,
+            unit: r.unit,
+            qty: 0,
+            segments: [],
+          };
+          itemsByCatalogId.set(r.catalog_item_id, item);
+        }
+        item.qty += Number(r.qty);
+        item.segments.push({
+          value: r.batch_no ?? r.serial_no ?? r.heat_no ?? r.mark_no ?? `Piece #${r.id}`,
+          qty: r.qty,
+          pieceId: r.id,
+          batchNo: r.batch_no,
+          heatNo: r.heat_no,
+          serialNo: r.serial_no,
+          markNo: r.mark_no,
+          status: r.status,
+          stockLocationId: r.stock_location_id,
+          receivedDate: r.received_date,
+          customFields: customFieldsByPieceId.get(r.id) ?? [],
+        });
+      }
+
+      return res.status(200).json({ ok: true, data: { items: [...itemsByCatalogId.values()] } });
     }
+
+    // ── Mode 2: item-level totals + per-dimension breakdown ────────────
+    const [rows] = await pool.query(
+      `SELECT fic.id AS catalog_item_id, fic.name, fic.code, fic.unit,
+              fsp.${pieceColumn} AS segment_value, SUM(fsp.qty) AS qty
+         FROM fab_stock_pieces fsp
+         JOIN fab_item_catalog fic ON fic.id = fsp.catalog_item_id
+        WHERE ${whereClause}
+        GROUP BY fic.id, fic.name, fic.code, fic.unit, fsp.${pieceColumn}
+        ORDER BY fic.name, segment_value`,
+      params,
+    );
 
     // Fold the flat rows into { items: [{ ...totals, segments: [...] }] }
     const itemsByCatalogId = new Map();
-    for (const r of segmentRows) {
+    for (const r of rows) {
       let item = itemsByCatalogId.get(r.catalog_item_id);
       if (!item) {
         item = {
