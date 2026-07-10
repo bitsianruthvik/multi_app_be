@@ -16,7 +16,6 @@ import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { generateCode } from './codegenService.js';
 
-const MATERIAL_TYPES    = ['raw_material', 'component', 'semi_finished', 'finished_good'];
 const PROCUREMENT_TYPES = ['buy', 'make'];
 const CF_PREFIX = 'CF: ';
 
@@ -87,24 +86,10 @@ export async function exportItemsTemplate(companyId) {
     { header: 'Category',         width: 20 },
     { header: 'Group',            width: 20 },
     { header: 'Sub-group',        width: 20 },
-    { header: 'Material Type',    width: 16 },
     { header: 'Procurement Type', width: 16 },
     { header: 'Description',      width: 30 },
     { header: 'HSN Code',         width: 14 },
-    { header: 'Division',         width: 14 },
     { header: 'Lead Time (Days)', width: 14 },
-    { header: 'Gross Weight',     width: 14 },
-    { header: 'Net Weight',       width: 14 },
-    { header: 'Weight Unit',      width: 12 },
-    { header: 'Volume',           width: 14 },
-    { header: 'Volume Unit',      width: 12 },
-    { header: 'Length',           width: 12 },
-    { header: 'Width',            width: 12 },
-    { header: 'Height',           width: 12 },
-    { header: 'Dimension Unit',   width: 14 },
-    { header: 'Barcode/EAN',      width: 18 },
-    { header: 'Purchase Cost',    width: 14 },
-    { header: 'Decimal Places',   width: 14 },
   ];
 
   const [cfKeys] = await pool.query(
@@ -119,16 +104,14 @@ export async function exportItemsTemplate(companyId) {
   const exampleRow = [
     'Structural Steel Bar 50x50', 'STRUCT-STEEL-50', 'kg',
     'Raw Material', 'Structural Steel', '',
-    'raw_material', 'buy',
-    'Example row — delete before importing', '', '', 5,
-    '', '', '', '', '', '', '', '', '', '', '', '',
+    'buy',
+    'Example row — delete before importing', '', 5,
   ];
   for (let i = 0; i < cfKeys.length; i++) exampleRow.push('');
   ws.addRow(exampleRow);
   ws.getRow(2).font = { italic: true, color: { argb: 'FF999999' } };
 
-  dropdown(ws, 7, MATERIAL_TYPES, 2, 1000);
-  dropdown(ws, 8, PROCUREMENT_TYPES, 2, 1000);
+  dropdown(ws, 7, PROCUREMENT_TYPES, 2, 1000);
 
   // ── Sheet 2: Existing Taxonomy (reference) ──────────────────────────────
   const wsTax = wb.addWorksheet('Existing Taxonomy');
@@ -173,17 +156,11 @@ export async function exportItemsTemplate(companyId) {
     '   this company, it will be created automatically when you import.',
     '4. A Group must have a Category in the same row. A Sub-group must have a Group in the same row.',
     '   If the parent is missing, that level is skipped for the row (the item is still created).',
-    '5. Material Type: one of raw_material, component, semi_finished, finished_good (default: component).',
-    '6. Procurement Type: buy or make (default: buy).',
-    '7. See the "Existing Taxonomy" sheet for Category / Group / Sub-group names already in use —',
+    '5. Procurement Type: buy or make (default: buy).',
+    '6. See the "Existing Taxonomy" sheet for Category / Group / Sub-group names already in use —',
     '   reuse them exactly to avoid creating near-duplicate entries.',
-    '8. If an Item Code already exists, that row is skipped (existing items are never overwritten by import).',
-    '9. Gross Weight, Net Weight, Volume, Length, Width, Height are numeric. Weight Unit, Volume Unit,',
-    '   Dimension Unit are free-text unit labels (e.g. kg, m3, mm) — left blank, the item default is used.',
-    '10. Barcode/EAN and Purchase Cost are optional.',
-    '11. Decimal Places sets how many decimals this item\'s dimension/weight/volume fields display and',
-    '    round to (default 3 if left blank or not a valid number).',
-    '12. Columns titled "CF: <name>" are existing item-level custom fields for this company — fill in a',
+    '7. If an Item Code already exists, that row is skipped (existing items are never overwritten by import).',
+    '8. Columns titled "CF: <name>" are existing item-level custom fields for this company — fill in a',
     '    value per row to set that custom field on the imported item. Leave blank to skip it for that row.',
   ];
   lines.forEach((l) => wsHelp.addRow([l]));
@@ -227,24 +204,10 @@ export async function importItemsExcel(file, companyId) {
       categoryName:     cellVal(row, 4),
       groupName:        cellVal(row, 5),
       subgroupName:     cellVal(row, 6),
-      materialTypeRaw:  (cellVal(row, 7) || '').toLowerCase(),
-      procurementRaw:   (cellVal(row, 8) || '').toLowerCase(),
-      description:      cellVal(row, 9),
-      hsnCode:           cellVal(row, 10),
-      division:          cellVal(row, 11),
-      leadTimeDays:      numVal(row, 12),
-      grossWeight:       numVal(row, 13),
-      netWeight:         numVal(row, 14),
-      weightUnit:        cellVal(row, 15),
-      volume:            numVal(row, 16),
-      volumeUnit:        cellVal(row, 17),
-      length:            numVal(row, 18),
-      width:             numVal(row, 19),
-      height:            numVal(row, 20),
-      dimensionUnit:     cellVal(row, 21),
-      barcode:           cellVal(row, 22),
-      purchaseCost:      numVal(row, 23),
-      dimensionDecimalsRaw: cellVal(row, 24),
+      procurementRaw:   (cellVal(row, 7) || '').toLowerCase(),
+      description:      cellVal(row, 8),
+      hsnCode:           cellVal(row, 9),
+      leadTimeDays:      numVal(row, 10),
       customFields: cfColumns.map((cf) => ({ fieldKey: cf.fieldKey, value: cellVal(row, cf.col) })),
     });
   });
@@ -397,36 +360,19 @@ export async function importItemsExcel(file, companyId) {
         itemCodeSet.add(code);
       }
 
-      let materialType = 'component';
-      if (r.materialTypeRaw) {
-        if (MATERIAL_TYPES.includes(r.materialTypeRaw)) materialType = r.materialTypeRaw;
-        else result.warnings.push({ row: r.rowNumber, message: `Unrecognised Material Type — defaulted to 'component'.` });
-      }
       let procurementType = 'buy';
       if (r.procurementRaw) {
         if (PROCUREMENT_TYPES.includes(r.procurementRaw)) procurementType = r.procurementRaw;
         else result.warnings.push({ row: r.rowNumber, message: `Unrecognised Procurement Type — defaulted to 'buy'.` });
       }
 
-      let dimensionDecimals = parseInt(r.dimensionDecimalsRaw, 10);
-      if (!Number.isInteger(dimensionDecimals) || dimensionDecimals < 0) {
-        if (r.dimensionDecimalsRaw) {
-          result.warnings.push({ row: r.rowNumber, message: `Invalid Decimal Places — defaulted to 3.` });
-        }
-        dimensionDecimals = 3;
-      }
-
       const [insertRes] = await conn.query(
         `INSERT INTO fab_item_catalog
            (company_id, name, code, unit, description, category_id, group_id, subgroup_id,
-            material_type, procurement_type, hsn_code, division, lead_time_days,
-            gross_weight, net_weight, weight_unit, volume, volume_unit,
-            length, width, height, dimension_unit, barcode, purchase_cost, dimension_decimals)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            procurement_type, hsn_code, lead_time_days)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [companyId, r.name.trim(), code, r.unit, r.description || null, categoryId, groupId, subgroupId,
-         materialType, procurementType, r.hsnCode || null, r.division || null, r.leadTimeDays,
-         r.grossWeight, r.netWeight, r.weightUnit || 'kg', r.volume, r.volumeUnit || 'm3',
-         r.length, r.width, r.height, r.dimensionUnit || 'mm', r.barcode || null, r.purchaseCost, dimensionDecimals],
+         procurementType, r.hsnCode || null, r.leadTimeDays],
       );
       result.itemsCreated++;
 

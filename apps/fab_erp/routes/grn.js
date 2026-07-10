@@ -1,7 +1,7 @@
 /**
  * routes/grn.js
  * -------------
- * EU-5: Goods Receipt Note (GRN) posting routes for fab_erp.
+ * EU-3: Goods Receipt Note (GRN) posting routes for fab_erp.
  *
  * Mounted by the orchestrator under /api/:companySlug/fab_erp
  * (do NOT edit routes/index.js or app.js).
@@ -11,7 +11,11 @@
  *     Body: {
  *       header: { grn_number, grn_date, plant_id, stock_location_id,
  *                  supplier_id?, supplier_ref?, notes? },
- *       lines: [{ catalog_item_id, batch_no?, serial_no?, heat_no?, mark_no?, qty, unit_cost? }, ...]
+ *       lines: [{
+ *         catalog_item_id, unit_cost?,
+ *         pieces: [{ qty, batch_no?, heat_no?, serial_no?, mark_no?,
+ *                    custom_fields?: [{ field_key, field_type?, field_value? }, ...] }, ...]
+ *       }, ...]
  *     }
  *     Auth: JWT required (protect middleware).
  *     Authz: req.user.role === 'admin'  OR
@@ -28,57 +32,24 @@
  *   const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
  *   if (!isAdmin) check uiPermissions for the required feature tag.
  *
- * Traceability: which of batch_no/serial_no/heat_no/mark_no are mandatory
- * comes from the item's Category (batch_required/serial_required/...),
- * overridable per item (batch_required_override/...; NULL = inherit). This
- * is enforced here, before postGrn() runs, so a bad request never reaches
- * the DB transaction.
+ * Traceability: per the stock-piece redesign (PLAN.md EU-1/EU-3), batch_no /
+ * heat_no / serial_no / mark_no are free-text per-piece attributes with no
+ * mandatory/required flag anymore (fab_item_categories.*_required and
+ * fab_item_catalog.*_required_override were dropped in EU-1). There is no
+ * pre-post traceability validation here — every item is processed uniformly;
+ * only structural/shape validation (qty > 0, required ids present, and — if
+ * present — a well-formed custom_fields array per piece) happens before
+ * postGrn() runs.
  */
 
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { postGrn } from '../services/grnService.js';
-import { pool } from '../../../db.js';
 
 const router = Router();
 
-const TRACE_FIELDS = [
-  { key: 'batch_no',  overrideCol: 'batch_required_override',  categoryCol: 'batch_required',  label: 'batch number' },
-  { key: 'serial_no', overrideCol: 'serial_required_override', categoryCol: 'serial_required', label: 'serial number' },
-  { key: 'heat_no',   overrideCol: 'heat_required_override',   categoryCol: 'heat_required',   label: 'heat number' },
-  { key: 'mark_no',   overrideCol: 'mark_required_override',   categoryCol: 'mark_required',    label: 'mark number' },
-];
-
-/**
- * Fetch each item's effective traceability requirements (item override, else
- * category default) as a Map<catalogItemId, { batch_no: bool, serial_no: bool, ... }>.
- */
-async function getEffectiveTraceability(companyId, catalogItemIds) {
-  if (catalogItemIds.length === 0) return new Map();
-
-  const [rows] = await pool.query(
-    `SELECT fic.id,
-            fic.batch_required_override, fic.serial_required_override,
-            fic.heat_required_override, fic.mark_required_override,
-            cat.batch_required, cat.serial_required, cat.heat_required, cat.mark_required
-       FROM fab_item_catalog fic
-       LEFT JOIN fab_item_categories cat ON cat.id = fic.category_id
-      WHERE fic.company_id = ? AND fic.id IN (?) AND fic.deleted_at IS NULL`,
-    [companyId, catalogItemIds],
-  );
-
-  const map = new Map();
-  for (const row of rows) {
-    map.set(row.id, {
-      batch_no:  (row.batch_required_override  ?? row.batch_required  ?? 0) === 1,
-      serial_no: (row.serial_required_override ?? row.serial_required ?? 0) === 1,
-      heat_no:   (row.heat_required_override   ?? row.heat_required   ?? 0) === 1,
-      mark_no:   (row.mark_required_override   ?? row.mark_required   ?? 0) === 1,
-    });
-  }
-  return map;
-}
+const PIECE_ATTR_FIELDS = ['batch_no', 'heat_no', 'serial_no', 'mark_no'];
 
 // ── POST /grn/post ─────────────────────────────────────────────────────────
 
@@ -142,14 +113,82 @@ router.post('/grn/post', protect, async (req, res) => {
       return res.status(400).json({ message: `lines[${i}].catalog_item_id is required.` });
     }
 
-    for (const f of TRACE_FIELDS) {
-      if (line[f.key] !== undefined && line[f.key] !== null && typeof line[f.key] !== 'string') {
-        return res.status(400).json({ message: `lines[${i}].${f.key} must be a string.` });
-      }
+    if (
+      line.unit_cost !== undefined &&
+      line.unit_cost !== null &&
+      typeof line.unit_cost !== 'number'
+    ) {
+      return res.status(400).json({ message: `lines[${i}].unit_cost must be a number.` });
     }
 
-    if (typeof line.qty !== 'number' || !(line.qty > 0)) {
-      return res.status(400).json({ message: `lines[${i}].qty is required and must be a number greater than 0.` });
+    if (!Array.isArray(line.pieces) || line.pieces.length === 0) {
+      return res.status(400).json({ message: `lines[${i}].pieces must be a non-empty array.` });
+    }
+
+    for (let j = 0; j < line.pieces.length; j++) {
+      const piece = line.pieces[j];
+
+      if (!piece || typeof piece !== 'object') {
+        return res.status(400).json({ message: `lines[${i}].pieces[${j}] is invalid.` });
+      }
+
+      if (typeof piece.qty !== 'number' || !(piece.qty > 0)) {
+        return res.status(400).json({
+          message: `lines[${i}].pieces[${j}].qty is required and must be a number greater than 0.`,
+        });
+      }
+
+      for (const f of PIECE_ATTR_FIELDS) {
+        if (piece[f] !== undefined && piece[f] !== null && typeof piece[f] !== 'string') {
+          return res.status(400).json({ message: `lines[${i}].pieces[${j}].${f} must be a string.` });
+        }
+      }
+
+      if (piece.custom_fields !== undefined && piece.custom_fields !== null) {
+        if (!Array.isArray(piece.custom_fields)) {
+          return res.status(400).json({
+            message: `lines[${i}].pieces[${j}].custom_fields must be an array.`,
+          });
+        }
+
+        for (let k = 0; k < piece.custom_fields.length; k++) {
+          const cf = piece.custom_fields[k];
+
+          if (!cf || typeof cf !== 'object') {
+            return res.status(400).json({
+              message: `lines[${i}].pieces[${j}].custom_fields[${k}] is invalid.`,
+            });
+          }
+
+          if (typeof cf.field_key !== 'string' || cf.field_key.trim() === '') {
+            return res.status(400).json({
+              message: `lines[${i}].pieces[${j}].custom_fields[${k}].field_key is required and must be a non-empty string.`,
+            });
+          }
+
+          if (
+            cf.field_type !== undefined &&
+            cf.field_type !== null &&
+            typeof cf.field_type !== 'string'
+          ) {
+            return res.status(400).json({
+              message: `lines[${i}].pieces[${j}].custom_fields[${k}].field_type must be a string.`,
+            });
+          }
+
+          if (
+            cf.field_value !== undefined &&
+            cf.field_value !== null &&
+            typeof cf.field_value !== 'string' &&
+            typeof cf.field_value !== 'number' &&
+            typeof cf.field_value !== 'boolean'
+          ) {
+            return res.status(400).json({
+              message: `lines[${i}].pieces[${j}].custom_fields[${k}].field_value must be a string, number, or boolean.`,
+            });
+          }
+        }
+      }
     }
   }
 
@@ -157,28 +196,6 @@ router.post('/grn/post', protect, async (req, res) => {
 
   if (!companyId) {
     return res.status(400).json({ message: 'Unable to determine companyId from token.' });
-  }
-
-  // ── Traceability validation — only the fields each item requires ──────────
-  try {
-    const itemIds = [...new Set(lines.map((l) => l.catalog_item_id))];
-    const effective = await getEffectiveTraceability(companyId, itemIds);
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const reqs = effective.get(line.catalog_item_id);
-      if (!reqs) {
-        return res.status(400).json({ message: `lines[${i}].catalog_item_id does not exist.` });
-      }
-      for (const f of TRACE_FIELDS) {
-        if (reqs[f.key] && !(line[f.key] && String(line[f.key]).trim())) {
-          return res.status(400).json({ message: `lines[${i}]: this item requires a ${f.label}.` });
-        }
-      }
-    }
-  } catch (err) {
-    logger.error({ err, companyId }, 'fab_erp grn/post: traceability validation error');
-    return res.status(500).json({ message: 'Internal server error during traceability validation.' });
   }
 
   // ── Call service ───────────────────────────────────────────────────────────

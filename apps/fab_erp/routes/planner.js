@@ -44,8 +44,8 @@ router.get(
            fic.lead_time_days,
 
            -- Stock on hand (aggregated across locations)
-           COALESCE(sb.on_hand,     0) AS stock_on_hand,
-           COALESCE(sb.on_order,    0) AS stock_on_order,
+           COALESCE(sb.on_hand,  0) AS stock_on_hand,
+           COALESCE(oo.on_order, 0) AS stock_on_order,
 
            -- Source sales order (may be NULL for safety-stock demand)
            so.id           AS so_id,
@@ -62,13 +62,24 @@ router.get(
          JOIN fab_item_catalog fic ON fic.id = po.catalog_item_id AND fic.deleted_at IS NULL
 
          LEFT JOIN (
-           SELECT catalog_item_id,
-                  SUM(qty_on_hand) AS on_hand,
-                  SUM(qty_ordered) AS on_order
-           FROM fab_stock_balances
+           SELECT catalog_item_id, SUM(qty) AS on_hand
+           FROM fab_stock_pieces
            WHERE company_id = ? AND deleted_at IS NULL
            GROUP BY catalog_item_id
          ) sb ON sb.catalog_item_id = po.catalog_item_id
+
+         LEFT JOIN (
+           SELECT fol.catalog_item_id,
+                  SUM(fol.qty - COALESCE(fol.qty_completed, 0)) AS on_order
+           FROM fab_order_lines fol
+           JOIN fab_orders fo ON fo.id = fol.order_id
+           WHERE fo.company_id = ?
+             AND fo.order_type = 'purchase'
+             AND fo.status NOT IN ('closed', 'cancelled')
+             AND fo.deleted_at IS NULL
+             AND fol.deleted_at IS NULL
+           GROUP BY fol.catalog_item_id
+         ) oo ON oo.catalog_item_id = po.catalog_item_id
 
          LEFT JOIN fab_orders so
            ON so.id = po.source_order_id AND so.deleted_at IS NULL
@@ -79,7 +90,7 @@ router.get(
            AND po.deleted_at  IS NULL
 
          ORDER BY po.source_order_id, po.parent_planned_order_id, po.id`,
-        [companyId, companyId],
+        [companyId, companyId, companyId],
       );
 
       // Build tree grouped by source demand

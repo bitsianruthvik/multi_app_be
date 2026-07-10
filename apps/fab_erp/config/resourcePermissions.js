@@ -45,7 +45,6 @@ const resourcePermissions = {
   // Material BOMs (catalog-level templates)
   fabErpMaterialBom:     'fab_erp_items_meta_manage',
   fabErpMaterialBomItem: 'fab_erp_items_meta_manage',
-  fabErpItemConfigValue: 'fab_erp_items_meta_manage',
 
   // Calendars & shifts
   fabErpShiftCalendar: 'fab_erp_calendars_manage',
@@ -65,9 +64,8 @@ const resourcePermissions = {
   fabErpSupplier:      'fab_erp_grn_manage',
   fabErpCustomer:      'fab_erp_projects_manage',
   fabErpCodegenRule:   'fab_erp_items_meta_manage',
-  fabErpStockBalance:  'fab_erp_inventory_manage',
   fabErpStockPolicy:   'fab_erp_inventory_manage',
-  fabErpItemBatch:     'fab_erp_inventory_manage',
+  fabErpStockPiece:    'fab_erp_inventory_manage',
   fabErpGrn:           'fab_erp_grn_manage',
   fabErpGrnLine:       'fab_erp_grn_manage',
   fabErpStockLedger:   'fab_erp_inventory_manage',

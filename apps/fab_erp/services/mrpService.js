@@ -6,7 +6,8 @@
  * Algorithm (single company, one run):
  *   1. Delete previous MRP-generated draft planned orders (type = 'mrp_make' | 'mrp_buy').
  *   2. Collect gross demand from open sales order lines.
- *   3. Add reorder-point demand from stock policies (where on_hand < min_qty).
+ *   3. Add reorder-point demand from stock policies (where on_hand < min_qty
+ *      AND the item's mrp_policy = 'reorder_point').
  *   4. BFS BOM explosion — for each demand item:
  *        a. Subtract available stock (on_hand + on_order) → net requirement.
  *        b. Look up procurement_type and lead_time_days.
@@ -67,6 +68,23 @@ export async function runMrp(companyId, { triggeredBy = 'manual', userId = null 
     );
     deleted = delRes.affectedRows;
 
+    // ── 2a. Item catalog snapshot (procurement_type, lead_time_days, mrp_policy) ──
+    // Fetched early so gross-demand filtering below can consult mrp_policy.
+    const [itemRows] = await conn.query(
+      `SELECT id, procurement_type, lead_time_days, mrp_policy
+       FROM fab_item_catalog
+       WHERE company_id = ? AND deleted_at IS NULL`,
+      [companyId],
+    );
+    const itemMap = new Map();
+    for (const r of itemRows) {
+      itemMap.set(r.id, {
+        procurementType: r.procurement_type || 'buy',
+        leadTimeDays: Number(r.lead_time_days) || 1,
+        mrpPolicy: r.mrp_policy,
+      });
+    }
+
     // ── 2. Gross demand from open sales order lines ───────────────────────────
     const [demandRows] = await conn.query(
       `SELECT fol.catalog_item_id,
@@ -91,9 +109,14 @@ export async function runMrp(companyId, { triggeredBy = 'manual', userId = null 
       `SELECT fsp.catalog_item_id,
               GREATEST(0, fsp.reorder_qty) AS reorder_qty
        FROM fab_stock_policies fsp
+       JOIN fab_item_catalog fic
+         ON fic.id = fsp.catalog_item_id
+        AND fic.company_id = fsp.company_id
+        AND fic.deleted_at IS NULL
+        AND fic.mrp_policy = 'reorder_point'
        LEFT JOIN (
-         SELECT catalog_item_id, SUM(qty_on_hand) AS on_hand
-           FROM fab_stock_balances
+         SELECT catalog_item_id, SUM(qty) AS on_hand
+           FROM fab_stock_pieces
           WHERE company_id = ? AND deleted_at IS NULL
           GROUP BY catalog_item_id
        ) sb ON sb.catalog_item_id = fsp.catalog_item_id
@@ -105,6 +128,9 @@ export async function runMrp(companyId, { triggeredBy = 'manual', userId = null 
     // Merge into demand map
     const demandMap = new Map(); // catalogItemId → { qty, requiredDate, sourceOrderId, sourceOrderLineId }
     for (const r of demandRows) {
+      // Sales-order-driven demand only applies to lot_for_lot (default) items.
+      // reorder_point items derive demand solely from stock-policy shortfall (policyRows below).
+      if (itemMap.get(r.catalog_item_id)?.mrpPolicy === 'reorder_point') continue;
       const qty = Number(r.gross_qty);
       if (qty > 0) {
         demandMap.set(r.catalog_item_id, {
@@ -145,37 +171,43 @@ export async function runMrp(companyId, { triggeredBy = 'manual', userId = null 
     }
 
     // ── 4. Stock snapshot ─────────────────────────────────────────────────────
-    const [stockRows] = await conn.query(
-      `SELECT catalog_item_id,
-              SUM(qty_on_hand) AS on_hand,
-              SUM(qty_ordered) AS on_order
-       FROM fab_stock_balances
+    const [onHandRows] = await conn.query(
+      `SELECT catalog_item_id, SUM(qty) AS on_hand
+       FROM fab_stock_pieces
        WHERE company_id = ? AND deleted_at IS NULL
        GROUP BY catalog_item_id`,
       [companyId],
     );
-    const stockMap = new Map();
-    for (const r of stockRows) {
-      stockMap.set(r.catalog_item_id, {
-        onHand: Number(r.on_hand),
-        onOrder: Number(r.on_order),
-      });
-    }
-
-    // ── 5. Item catalog snapshot (procurement_type, lead_time_days) ───────────
-    const [itemRows] = await conn.query(
-      `SELECT id, procurement_type, lead_time_days, mrp_active
-       FROM fab_item_catalog
-       WHERE company_id = ? AND deleted_at IS NULL`,
+    const [onOrderRows] = await conn.query(
+      `SELECT fol.catalog_item_id,
+              SUM(fol.qty - COALESCE(fol.qty_completed, 0)) AS on_order
+       FROM fab_order_lines fol
+       JOIN fab_orders fo ON fo.id = fol.order_id
+       WHERE fo.company_id = ?
+         AND fo.order_type = 'purchase'
+         AND fo.status NOT IN ('closed', 'cancelled')
+         AND fo.deleted_at IS NULL
+         AND fol.deleted_at IS NULL
+       GROUP BY fol.catalog_item_id`,
       [companyId],
     );
-    const itemMap = new Map();
-    for (const r of itemRows) {
-      itemMap.set(r.id, {
-        procurementType: r.procurement_type || 'buy',
-        leadTimeDays: Number(r.lead_time_days) || 1,
-        mrpActive: r.mrp_active === 1,
+    const stockMap = new Map();
+    for (const r of onHandRows) {
+      stockMap.set(r.catalog_item_id, {
+        onHand: Number(r.on_hand),
+        onOrder: 0,
       });
+    }
+    for (const r of onOrderRows) {
+      const existing = stockMap.get(r.catalog_item_id);
+      if (existing) {
+        existing.onOrder = Number(r.on_order);
+      } else {
+        stockMap.set(r.catalog_item_id, {
+          onHand: 0,
+          onOrder: Number(r.on_order),
+        });
+      }
     }
 
     // ── 6. Default BOM snapshot ───────────────────────────────────────────────
@@ -236,7 +268,8 @@ export async function runMrp(companyId, { triggeredBy = 'manual', userId = null 
       if (depth > MAX_BOM_DEPTH) continue;
 
       const item = itemMap.get(catalogItemId);
-      if (!item || !item.mrpActive) continue;
+      if (!item) continue;
+      if (item.mrpPolicy === 'manual') continue;
 
       // Net requirement after subtracting available stock
       const stock = stockMap.get(catalogItemId) ?? { onHand: 0, onOrder: 0 };

@@ -1681,3 +1681,215 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 UPDATE fab_item_categories SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
 UPDATE fab_item_groups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
 UPDATE fab_item_subgroups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
+
+-- ===== STOCK PIECE REDESIGN (2026-07-10) =====
+--
+-- Replaces the batch-level `fab_item_batches` / `fab_stock_balances` model
+-- with a piece-level `fab_stock_pieces` table (one row per receivable unit
+-- of stock, carrying its own batch/heat/serial/mark identifiers). The stock
+-- ledger gains a `piece_id` pointer for new code to write against; old
+-- batch_id/batch_code columns are left in place (unused going forward) so a
+-- parallel in-progress unit (EU-3) can still reference them if needed.
+
+-- 1. New table: fab_stock_pieces
+CREATE TABLE IF NOT EXISTS fab_stock_pieces (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  catalog_item_id   INT            NOT NULL,
+  plant_id          INT            NOT NULL,
+  stock_location_id INT            NOT NULL,
+  batch_no          VARCHAR(60)    NULL,
+  heat_no           VARCHAR(60)    NULL,
+  serial_no         VARCHAR(60)    NULL,
+  mark_no           VARCHAR(60)    NULL,
+  qty               DECIMAL(14,4)  NOT NULL DEFAULT 0,
+  uom               VARCHAR(20)    NULL,
+  unit_cost         DECIMAL(14,4)  NULL,
+  status            VARCHAR(20)    NOT NULL DEFAULT 'in_stock',
+  grn_id            INT            NULL,
+  grn_line_id       INT            NULL,
+  received_date     DATE           NULL,
+  notes             TEXT           NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at        TIMESTAMP      NULL,
+  KEY idx_fsp_company (company_id),
+  KEY idx_fsp_item    (catalog_item_id),
+  KEY idx_fsp_grn     (grn_id)
+);
+
+-- 2. Drop obsolete tables (superseded by fab_stock_pieces / confirmed dead)
+DROP TABLE IF EXISTS fab_item_batches;
+DROP TABLE IF EXISTS fab_stock_balances;
+DROP TABLE IF EXISTS fab_item_config_values;
+
+-- 3. Drop traceability flag columns from the item taxonomy tables.
+-- NOTE: as of this migration, batch_required/serial_required/heat_required/
+-- mark_required only actually exist on fab_item_categories (see the
+-- "TRACEABILITY" block above) — fab_item_groups and fab_item_subgroups never
+-- had them added. The guards below are no-ops for those two tables but are
+-- included for completeness/safety in case a future migration adds them.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='batch_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_categories DROP COLUMN batch_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='serial_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_categories DROP COLUMN serial_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='heat_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_categories DROP COLUMN heat_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='mark_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_categories DROP COLUMN mark_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_groups' AND COLUMN_NAME='batch_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_groups DROP COLUMN batch_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_groups' AND COLUMN_NAME='serial_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_groups DROP COLUMN serial_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_groups' AND COLUMN_NAME='heat_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_groups DROP COLUMN heat_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_groups' AND COLUMN_NAME='mark_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_groups DROP COLUMN mark_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_subgroups' AND COLUMN_NAME='batch_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_subgroups DROP COLUMN batch_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_subgroups' AND COLUMN_NAME='serial_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_subgroups DROP COLUMN serial_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_subgroups' AND COLUMN_NAME='heat_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_subgroups DROP COLUMN heat_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_subgroups' AND COLUMN_NAME='mark_required');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_subgroups DROP COLUMN mark_required','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='batch_required_override');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN batch_required_override','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='serial_required_override');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN serial_required_override','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='heat_required_override');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN heat_required_override','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='mark_required_override');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN mark_required_override','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 4. Strip descriptive/dimensional columns from fab_item_catalog (moved out
+-- of scope for this app's item master; not referenced by stock pieces).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='gross_weight');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN gross_weight','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='net_weight');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN net_weight','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='weight_unit');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN weight_unit','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='volume');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN volume','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='volume_unit');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN volume_unit','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='length');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN `length`','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='width');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN width','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='height');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN height','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='dimension_unit');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN dimension_unit','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='dimension_decimals');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN dimension_decimals','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='barcode');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN barcode','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='division');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN division','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='material_type');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN material_type','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='purchase_cost');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN purchase_cost','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 5. Replace mrp_active (boolean) with mrp_policy (enum). Order matters:
+-- ADD mrp_policy -> backfill from mrp_active -> DROP mrp_active, so the
+-- backfill only ever runs once, while mrp_active still exists.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='mrp_policy');
+SET @sql = IF(@col=0,"ALTER TABLE fab_item_catalog ADD COLUMN mrp_policy ENUM('manual','reorder_point','lot_for_lot') NOT NULL DEFAULT 'lot_for_lot'",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='mrp_active');
+SET @sql = IF(@col>0,"UPDATE fab_item_catalog SET mrp_policy = IF(mrp_active = 1, 'lot_for_lot', 'manual')",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='mrp_active');
+SET @sql = IF(@col>0,'ALTER TABLE fab_item_catalog DROP COLUMN mrp_active','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 6. fab_stock_ledger: add piece_id for new code to write against, near
+-- batch_id (the column it supersedes). batch_id/batch_code and the
+-- batch_no/heat_no/serial_no/mark_no snapshot columns (added earlier, see
+-- ~line 1653-1666) are left in place as denormalized audit-trail fields.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='piece_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN piece_id INT NULL AFTER batch_id','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND INDEX_NAME='idx_fab_stock_ledger_piece');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_stock_ledger ADD KEY idx_fab_stock_ledger_piece (piece_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Confirm batch_no/heat_no/serial_no/mark_no snapshot columns exist on
+-- fab_stock_ledger (they should already be present from the migration at
+-- ~line 1653-1666; guarded here defensively so this section is self-contained).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='batch_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN batch_no VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='heat_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN heat_no VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='serial_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN serial_no VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='mark_no');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_ledger ADD COLUMN mark_no VARCHAR(60) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 7. Relax remaining legacy NOT NULL columns left over from the dropped
+-- fab_item_batches model, so grnService.js's piece-level writes no longer
+-- need placeholder values to satisfy them.
+--
+-- Verified against the current schema (live DESCRIBE, not just this file's
+-- implied history) before writing this block:
+--   - fab_grn_lines.batch_code   -> already NULLable (nulled by the
+--     "Same four identifiers on the GRN line" guarded block above, ~line 1640,
+--     which runs the first time batch_no is added to this table).
+--   - fab_stock_ledger.batch_code -> already NULLable, same reasoning, via
+--     the "Same four identifiers on the stock ledger" block above (~line 1655).
+--   - fab_stock_ledger.batch_id  -> STILL `INT NOT NULL` (base CREATE TABLE,
+--     ~line 539). No prior block ever MODIFY'd this column, so it's the only
+--     one of the three actually requiring a change here.
+--
+-- MODIFY COLUMN to relax NOT NULL -> NULL is naturally idempotent (safe to
+-- re-run), so no information_schema guard is needed for it specifically, but
+-- the columns are still only touched where confirmed necessary above. The
+-- batch_code MODIFYs are included defensively (harmless no-ops on this DB,
+-- but keep this block self-contained for any environment where the earlier
+-- guarded blocks were skipped for some reason, e.g. a partially-migrated DB).
+ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_id INT NULL;
+ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_code VARCHAR(60) NULL;
+ALTER TABLE fab_grn_lines MODIFY COLUMN batch_code VARCHAR(60) NULL;

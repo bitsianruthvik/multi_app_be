@@ -453,13 +453,7 @@
     "table": "fab_item_catalog",
     "alias": "fic",
     "writeFields": ["name", "code", "unit", "description", "category_id", "group_id", "subgroup_id",
-      "gross_weight", "net_weight", "weight_unit",
-      "volume", "volume_unit",
-      "length", "width", "height", "dimension_unit",
-      "barcode", "hsn_code", "division",
-      "material_type", "purchase_cost",
-      "procurement_type", "lead_time_days", "mrp_active", "dimension_decimals",
-      "batch_required_override", "serial_required_override", "heat_required_override", "mark_required_override"],
+      "hsn_code", "procurement_type", "lead_time_days", "mrp_policy"],
     "fields": {
       "id":            "fic.id",
       "companyId":     "fic.company_id",
@@ -470,28 +464,10 @@
       "categoryId":    "fic.category_id",
       "groupId":       "fic.group_id",
       "subgroupId":    "fic.subgroup_id",
-      "grossWeight":   "fic.gross_weight",
-      "netWeight":     "fic.net_weight",
-      "weightUnit":    "fic.weight_unit",
-      "volume":        "fic.volume",
-      "volumeUnit":    "fic.volume_unit",
-      "length":        "fic.length",
-      "width":         "fic.width",
-      "height":        "fic.height",
-      "dimensionUnit": "fic.dimension_unit",
-      "barcode":       "fic.barcode",
       "hsnCode":       "fic.hsn_code",
-      "division":      "fic.division",
-      "materialType":  "fic.material_type",
-      "purchaseCost":  "fic.purchase_cost",
       "procurementType": "fic.procurement_type",
       "leadTimeDays":    "fic.lead_time_days",
-      "mrpActive":       "fic.mrp_active",
-      "dimensionDecimals": "fic.dimension_decimals",
-      "batchRequiredOverride":  "fic.batch_required_override",
-      "serialRequiredOverride": "fic.serial_required_override",
-      "heatRequiredOverride":   "fic.heat_required_override",
-      "markRequiredOverride":   "fic.mark_required_override",
+      "mrpPolicy":       "fic.mrp_policy",
       "createdAt":     "fic.created_at",
       "updatedAt":     "fic.updated_at",
       "categoryName":  "fic_cat.name",
@@ -512,28 +488,10 @@
       "categoryId":    "integer",
       "groupId":       "integer",
       "subgroupId":    "integer",
-      "grossWeight":   "decimal",
-      "netWeight":     "decimal",
-      "weightUnit":    "string",
-      "volume":        "decimal",
-      "volumeUnit":    "string",
-      "length":        "decimal",
-      "width":         "decimal",
-      "height":        "decimal",
-      "dimensionUnit": "string",
-      "barcode":       "string",
       "hsnCode":       "string",
-      "division":      "string",
-      "materialType":  "string",
-      "purchaseCost":  "decimal",
       "procurementType": "string",
       "leadTimeDays":    "integer",
-      "mrpActive":       "integer",
-      "dimensionDecimals": "int",
-      "batchRequiredOverride":  "integer",
-      "serialRequiredOverride": "integer",
-      "heatRequiredOverride":   "integer",
-      "markRequiredOverride":   "integer",
+      "mrpPolicy":       "string",
       "createdAt":     "datetime",
       "updatedAt":     "datetime",
       "categoryName":  "string",
@@ -1012,66 +970,6 @@
     "relations": {}
   },
 
-  "fabErpStockBalance": {
-    "table": "fab_stock_balances",
-    "alias": "fsb",
-    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "qty_on_hand", "qty_ordered", "qty_earmarked"],
-    "fields": {
-      "id":               "fsb.id",
-      "companyId":        "fsb.company_id",
-      "catalogItemId":    "fsb.catalog_item_id",
-      "plantId":          "fsb.plant_id",
-      "stockLocationId":  "fsb.stock_location_id",
-      "qtyOnHand":        "fsb.qty_on_hand",
-      "qtyOrdered":       "fsb.qty_ordered",
-      "qtyEarmarked":     "fsb.qty_earmarked",
-      "createdAt":        "fsb.created_at",
-      "updatedAt":        "fsb.updated_at",
-      "catalogItemName":  "fic_sb.name",
-      "catalogItemCode":  "fic_sb.code",
-      "unit":             "fic_sb.unit",
-      "plantName":        "fpl_sb.name",
-      "stockLocationName": "fsl_sb.name"
-    },
-    "fieldTypes": {
-      "id":               "integer",
-      "companyId":        "integer",
-      "catalogItemId":    "integer",
-      "plantId":          "integer",
-      "stockLocationId":  "integer",
-      "qtyOnHand":        "decimal",
-      "qtyOrdered":       "decimal",
-      "qtyEarmarked":     "decimal",
-      "createdAt":        "datetime",
-      "updatedAt":        "datetime",
-      "catalogItemName":  "string",
-      "catalogItemCode":  "string",
-      "unit":             "string",
-      "plantName":        "string",
-      "stockLocationName": "string"
-    },
-    "relations": {
-      "catalogItem": {
-        "table": "fab_item_catalog",
-        "alias": "fic_sb",
-        "on":    "fsb.catalog_item_id = fic_sb.id",
-        "fields": ["catalogItemName", "catalogItemCode", "unit"]
-      },
-      "plant": {
-        "table": "fab_plants",
-        "alias": "fpl_sb",
-        "on":    "fsb.plant_id = fpl_sb.id",
-        "fields": ["plantName"]
-      },
-      "stockLocation": {
-        "table": "fab_stock_locations",
-        "alias": "fsl_sb",
-        "on":    "fsb.stock_location_id = fsl_sb.id",
-        "fields": ["stockLocationName"]
-      }
-    }
-  },
-
   "fabErpStockPolicy": {
     "table": "fab_stock_policies",
     "alias": "fsp",
@@ -1125,76 +1023,6 @@
         "table": "fab_stock_locations",
         "alias": "fsl_sp",
         "on":    "fsp.stock_location_id = fsl_sp.id",
-        "fields": ["stockLocationName"]
-      }
-    }
-  },
-
-  "fabErpItemBatch": {
-    "table": "fab_item_batches",
-    "alias": "fib",
-    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "batch_code", "batch_no", "serial_no", "heat_no", "mark_no", "qty_on_hand", "received_date", "notes"],
-    "fields": {
-      "id":               "fib.id",
-      "companyId":        "fib.company_id",
-      "catalogItemId":    "fib.catalog_item_id",
-      "plantId":          "fib.plant_id",
-      "stockLocationId":  "fib.stock_location_id",
-      "batchCode":        "fib.batch_code",
-      "batchNo":          "fib.batch_no",
-      "serialNo":         "fib.serial_no",
-      "heatNo":           "fib.heat_no",
-      "markNo":           "fib.mark_no",
-      "qtyOnHand":        "fib.qty_on_hand",
-      "receivedDate":     "fib.received_date",
-      "notes":            "fib.notes",
-      "createdAt":        "fib.created_at",
-      "updatedAt":        "fib.updated_at",
-      "catalogItemName":  "fic_ib.name",
-      "catalogItemCode":  "fic_ib.code",
-      "unit":             "fic_ib.unit",
-      "plantName":        "fpl_ib.name",
-      "stockLocationName": "fsl_ib.name"
-    },
-    "fieldTypes": {
-      "id":               "integer",
-      "companyId":        "integer",
-      "catalogItemId":    "integer",
-      "plantId":          "integer",
-      "stockLocationId":  "integer",
-      "batchCode":        "string",
-      "batchNo":          "string",
-      "serialNo":         "string",
-      "heatNo":           "string",
-      "markNo":           "string",
-      "qtyOnHand":        "decimal",
-      "receivedDate":     "string",
-      "notes":            "string",
-      "createdAt":        "datetime",
-      "updatedAt":        "datetime",
-      "catalogItemName":  "string",
-      "catalogItemCode":  "string",
-      "unit":             "string",
-      "plantName":        "string",
-      "stockLocationName": "string"
-    },
-    "relations": {
-      "catalogItem": {
-        "table": "fab_item_catalog",
-        "alias": "fic_ib",
-        "on":    "fib.catalog_item_id = fic_ib.id",
-        "fields": ["catalogItemName", "catalogItemCode", "unit"]
-      },
-      "plant": {
-        "table": "fab_plants",
-        "alias": "fpl_ib",
-        "on":    "fib.plant_id = fpl_ib.id",
-        "fields": ["plantName"]
-      },
-      "stockLocation": {
-        "table": "fab_stock_locations",
-        "alias": "fsl_ib",
-        "on":    "fib.stock_location_id = fsl_ib.id",
         "fields": ["stockLocationName"]
       }
     }
@@ -1312,6 +1140,55 @@
     }
   },
 
+  "fabErpStockPiece": {
+    "table": "fab_stock_pieces",
+    "alias": "fsp",
+    "writeFields": ["catalog_item_id", "plant_id", "stock_location_id", "batch_no", "heat_no", "serial_no", "mark_no", "qty", "uom", "unit_cost", "status", "grn_id", "grn_line_id", "received_date", "notes"],
+    "fields": {
+      "id":               "fsp.id",
+      "companyId":        "fsp.company_id",
+      "catalogItemId":    "fsp.catalog_item_id",
+      "plantId":          "fsp.plant_id",
+      "stockLocationId":  "fsp.stock_location_id",
+      "batchNo":          "fsp.batch_no",
+      "heatNo":           "fsp.heat_no",
+      "serialNo":         "fsp.serial_no",
+      "markNo":           "fsp.mark_no",
+      "qty":              "fsp.qty",
+      "uom":              "fsp.uom",
+      "unitCost":         "fsp.unit_cost",
+      "status":           "fsp.status",
+      "grnId":            "fsp.grn_id",
+      "grnLineId":        "fsp.grn_line_id",
+      "receivedDate":     "fsp.received_date",
+      "notes":            "fsp.notes",
+      "createdAt":        "fsp.created_at",
+      "updatedAt":        "fsp.updated_at"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "catalogItemId":    "integer",
+      "plantId":          "integer",
+      "stockLocationId":  "integer",
+      "batchNo":          "string",
+      "heatNo":           "string",
+      "serialNo":         "string",
+      "markNo":           "string",
+      "qty":              "decimal",
+      "uom":              "string",
+      "unitCost":         "decimal",
+      "status":           "string",
+      "grnId":            "integer",
+      "grnLineId":        "integer",
+      "receivedDate":     "date",
+      "notes":            "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime"
+    },
+    "relations": {}
+  },
+
   "fabErpMaterialBomItem": {
     "table": "fab_material_bom_items",
     "alias": "fmbi",
@@ -1356,33 +1233,6 @@
         "fields": ["refItemName", "refItemCode", "refItemUnit"]
       }
     }
-  },
-
-  "fabErpItemConfigValue": {
-    "table": "fab_item_config_values",
-    "alias": "ficv",
-    "writeFields": ["catalog_item_id", "field_key", "field_value", "sort_order"],
-    "fields": {
-      "id":            "ficv.id",
-      "companyId":     "ficv.company_id",
-      "catalogItemId": "ficv.catalog_item_id",
-      "fieldKey":      "ficv.field_key",
-      "fieldValue":    "ficv.field_value",
-      "sortOrder":     "ficv.sort_order",
-      "createdAt":     "ficv.created_at",
-      "updatedAt":     "ficv.updated_at"
-    },
-    "fieldTypes": {
-      "id":            "integer",
-      "companyId":     "integer",
-      "catalogItemId": "integer",
-      "fieldKey":      "string",
-      "fieldValue":    "string",
-      "sortOrder":     "integer",
-      "createdAt":     "datetime",
-      "updatedAt":     "datetime"
-    },
-    "relations": {}
   },
 
   "fabErpMaterialBom": {
