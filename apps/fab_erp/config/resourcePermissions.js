@@ -51,10 +51,6 @@ const resourcePermissions = {
   fabErpShift:         'fab_erp_calendars_manage',
   fabErpCalendarDay:   'fab_erp_calendars_manage',
 
-  // Planning
-  fabErpPlannedOperation:  'fab_erp_planning_manage',
-  fabErpResourceAssignment: 'fab_erp_planning_manage',
-
   // Operations
   fabErpOperation:             'fab_erp_operations_manage',
   fabErpOperationVariable:     'fab_erp_operations_manage',

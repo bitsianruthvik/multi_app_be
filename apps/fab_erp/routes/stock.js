@@ -25,7 +25,7 @@
  *     Auth: JWT required (protect middleware).
  *     Authz: req.user.role === 'admin'  OR
  *            req.user.uiPermissions includes 'fab_erp_inventory_view'
- *            (admin-bypass pattern mirrors routes/mrp.js / routes/version.js —
+ *            (admin-bypass pattern mirrors routes/version.js —
  *            routes/items.js's uiPermissions-only check is a known bug and is
  *            NOT replicated here).
  *     Returns:

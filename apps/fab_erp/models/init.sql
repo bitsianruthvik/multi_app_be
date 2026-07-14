@@ -13,6 +13,21 @@ DROP TABLE IF EXISTS fab_routing_templates;
 DROP TABLE IF EXISTS fab_formulas;
 DROP TABLE IF EXISTS fab_formula_sets;
 
+-- ===== DROP: MRP/Scheduler + legacy visual routing-graph (EU-15, 2026-07-14) =====
+-- Superseded by the DAG task engine (fab_project_tasks/fab_bom_flow_bindings) —
+-- routes/mrp.js, routes/scheduler.js, routes/planner.js, routes/orders.js,
+-- routes/routing.js, services/plannedOpService.js, services/schedulerService.js
+-- were all deleted in the same change. Full clean removal (pre-live, user-approved) —
+-- not a deprecate-in-place.
+DROP TABLE IF EXISTS fab_resource_assignments;
+DROP TABLE IF EXISTS fab_planned_operations;
+DROP TABLE IF EXISTS fab_routing_op_deps;
+DROP TABLE IF EXISTS fab_routing_op_inputs;
+DROP TABLE IF EXISTS fab_routing_op_outputs;
+DROP TABLE IF EXISTS fab_routing_op_formulas;
+DROP TABLE IF EXISTS fab_routing_op_steps;
+DROP TABLE IF EXISTS fab_routing_plans;
+
 SET foreign_key_checks = 1;
 
 -- ===== MASTER DATA =====
@@ -248,52 +263,8 @@ CREATE TABLE IF NOT EXISTS fab_item_metric_values (
   KEY idx_fimv_metric_key (item_id, metric_key)
 );
 
-CREATE TABLE IF NOT EXISTS fab_planned_operations (
-  id                     INT AUTO_INCREMENT PRIMARY KEY,
-  company_id             INT             NOT NULL,
-  project_id             INT             NOT NULL,
-  item_id                INT             NOT NULL,
-  resource_type_id       INT             NULL,
-  seq_no                 INT             NOT NULL,
-  name                   VARCHAR(255)    NULL,
-  planned_hours          DECIMAL(18,4)   NULL,
-  planned_start          DATETIME        NULL,
-  planned_end            DATETIME        NULL,
-  status                 VARCHAR(100)    NOT NULL DEFAULT 'planned',
-  source_routing_step_id INT             NULL,
-  deleted_at             DATETIME        DEFAULT NULL,
-  created_at             TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-  updated_at             TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id)       REFERENCES companies(id),
-  FOREIGN KEY (project_id)       REFERENCES fab_projects(id),
-  FOREIGN KEY (item_id)          REFERENCES fab_items(id),
-  FOREIGN KEY (resource_type_id) REFERENCES fab_resource_types(id),
-  KEY idx_fpo_company       (company_id),
-  KEY idx_fpo_project       (project_id),
-  KEY idx_fpo_item          (item_id),
-  KEY idx_fpo_resource_type (resource_type_id),
-  KEY idx_fpo_status        (company_id, status),
-  KEY idx_fpo_seq           (item_id, seq_no)
-);
-
-CREATE TABLE IF NOT EXISTS fab_resource_assignments (
-  id                    INT AUTO_INCREMENT PRIMARY KEY,
-  company_id            INT           NOT NULL,
-  planned_operation_id  INT           NOT NULL,
-  resource_id           INT           NULL,
-  assigned_shift_id     INT           NULL,
-  assigned_date         DATE          NULL,
-  deleted_at            DATETIME      DEFAULT NULL,
-  created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id)           REFERENCES companies(id),
-  FOREIGN KEY (planned_operation_id) REFERENCES fab_planned_operations(id),
-  FOREIGN KEY (resource_id)          REFERENCES fab_resources(id),
-  KEY idx_fra_company           (company_id),
-  KEY idx_fra_planned_operation (planned_operation_id),
-  KEY idx_fra_resource          (resource_id),
-  KEY idx_fra_assigned_date     (company_id, assigned_date)
-);
+-- fab_planned_operations / fab_resource_assignments removed 2026-07-14 (EU-15) —
+-- superseded by fab_project_tasks (DAG task engine). See top-of-file DROP section.
 
 -- ===== SHIFT / CALENDAR =====
 
@@ -697,35 +668,7 @@ SET @sql = IF(@col = 0,
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
--- Add standard_values to fab_planned_operations
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME   = 'fab_planned_operations'
-              AND COLUMN_NAME  = 'standard_values');
-SET @sql = IF(@col = 0,
-  'ALTER TABLE fab_planned_operations ADD COLUMN standard_values JSON DEFAULT NULL',
-  'SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-
--- Add computed_hours to fab_planned_operations
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME   = 'fab_planned_operations'
-              AND COLUMN_NAME  = 'computed_hours');
-SET @sql = IF(@col = 0,
-  'ALTER TABLE fab_planned_operations ADD COLUMN computed_hours DECIMAL(10,4) DEFAULT NULL',
-  'SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-
--- Add assigned_resource_type_id to fab_planned_operations
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME   = 'fab_planned_operations'
-              AND COLUMN_NAME  = 'assigned_resource_type_id');
-SET @sql = IF(@col = 0,
-  'ALTER TABLE fab_planned_operations ADD COLUMN assigned_resource_type_id INT DEFAULT NULL',
-  'SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- fab_planned_operations column-guard ALTERs removed 2026-07-14 (EU-15) — table dropped.
 
 -- Add FK for process_master_id (guard: only if constraint doesn't exist)
 SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
@@ -1238,116 +1181,10 @@ CREATE TABLE IF NOT EXISTS fab_resource_custom_fields (
 );
 
 -- ===== ROUTING PLANS =====
-
-CREATE TABLE IF NOT EXISTS fab_routing_plans (
-  id               INT AUTO_INCREMENT PRIMARY KEY,
-  company_id       INT            NOT NULL,
-  bom_id           INT            NOT NULL,
-  name             VARCHAR(255)   NOT NULL,
-  version_no       INT            NOT NULL DEFAULT 1,
-  version_group_id INT            NULL,
-  is_current       TINYINT(1)     NOT NULL DEFAULT 1,
-  status           ENUM('draft','released','superseded','archived') NOT NULL DEFAULT 'draft',
-  released_by      INT            NULL,
-  released_at      DATETIME       NULL,
-  notes            TEXT           NULL,
-  deleted_at       DATETIME       NULL,
-  created_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_frp_company (company_id),
-  KEY idx_frp_bom     (bom_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_routing_op_steps (
-  id               INT AUTO_INCREMENT PRIMARY KEY,
-  company_id       INT            NOT NULL,
-  routing_plan_id  INT            NOT NULL,
-  name             VARCHAR(255)   NOT NULL,
-  description      TEXT           NULL,
-  resource_type_id INT            NULL,
-  seq_no           INT            NOT NULL DEFAULT 0,
-  x_pos            DECIMAL(10,2)  NOT NULL DEFAULT 100,
-  y_pos            DECIMAL(10,2)  NOT NULL DEFAULT 100,
-  is_optional      TINYINT(1)     NOT NULL DEFAULT 0,
-  notes            TEXT           NULL,
-  deleted_at       DATETIME       NULL,
-  created_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id)      REFERENCES companies(id),
-  FOREIGN KEY (routing_plan_id) REFERENCES fab_routing_plans(id),
-  KEY idx_fros_plan (routing_plan_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_routing_op_deps (
-  id              INT AUTO_INCREMENT PRIMARY KEY,
-  company_id      INT            NOT NULL,
-  routing_plan_id INT            NOT NULL,
-  from_step_id    INT            NOT NULL,
-  to_step_id      INT            NOT NULL,
-  lag_minutes     DECIMAL(10,2)  NULL DEFAULT 0,
-  notes           TEXT           NULL,
-  deleted_at      DATETIME       NULL,
-  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id)      REFERENCES companies(id),
-  FOREIGN KEY (routing_plan_id) REFERENCES fab_routing_plans(id),
-  KEY idx_frod_plan (routing_plan_id),
-  KEY idx_frod_from (from_step_id),
-  KEY idx_frod_to   (to_step_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_routing_op_inputs (
-  id             INT AUTO_INCREMENT PRIMARY KEY,
-  company_id     INT            NOT NULL,
-  step_id        INT            NOT NULL,
-  source_type    ENUM('bom_item','op_output') NOT NULL DEFAULT 'bom_item',
-  bom_item_id    INT            NULL,
-  source_step_id INT            NULL,
-  label          VARCHAR(255)   NULL,
-  qty            DECIMAL(14,4)  NULL,
-  uom            VARCHAR(20)    NULL,
-  notes          TEXT           NULL,
-  deleted_at     DATETIME       NULL,
-  created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_froi_step    (step_id),
-  KEY idx_froi_company (company_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_routing_op_outputs (
-  id          INT AUTO_INCREMENT PRIMARY KEY,
-  company_id  INT            NOT NULL,
-  step_id     INT            NOT NULL,
-  name        VARCHAR(255)   NOT NULL,
-  output_type ENUM('wip','final','scrap') NOT NULL DEFAULT 'wip',
-  qty_formula TEXT           NULL,
-  uom         VARCHAR(20)    NULL,
-  notes       TEXT           NULL,
-  deleted_at  DATETIME       NULL,
-  created_at  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_froo_step    (step_id),
-  KEY idx_froo_company (company_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_routing_op_formulas (
-  id           INT AUTO_INCREMENT PRIMARY KEY,
-  company_id   INT            NOT NULL,
-  step_id      INT            NOT NULL,
-  formula_type ENUM('setup_time','machine_time','people_time','wait_time','move_time') NOT NULL,
-  expression   TEXT           NOT NULL,
-  output_unit  VARCHAR(20)    NULL DEFAULT 'hours',
-  is_valid     TINYINT(1)     NOT NULL DEFAULT 0,
-  deleted_at   DATETIME       NULL,
-  created_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_frof_step    (step_id),
-  KEY idx_frof_company (company_id)
-);
+-- fab_routing_plans / fab_routing_op_steps / _deps / _inputs / _outputs / _formulas
+-- removed 2026-07-14 (EU-15) — the visual routing-graph builder is superseded by
+-- Operations/Operation Flows (fab_operation_flows/_steps) + fab_bom_flow_bindings.
+-- See top-of-file DROP section.
 
 -- ===== ALTER: NAME/CODE UNIQUENESS (case-insensitive, soft-delete-aware) =====
 -- A plain UNIQUE(company_id, name) would (a) be case-sensitive unless the
