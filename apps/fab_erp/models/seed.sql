@@ -86,7 +86,15 @@ INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
   ('Manage Item Taxonomy',      'fab_erp_taxonomy_manage',          'frontend'),
   -- GRN (Goods Receipt Note)
   ('View GRNs',                 'fab_erp_grn_view',                 'frontend'),
-  ('Manage GRNs',                'fab_erp_grn_manage',              'frontend');
+  ('Manage GRNs',                'fab_erp_grn_manage',              'frontend'),
+  -- BOM Templates (EU-12)
+  ('View BOM Templates',        'fab_erp_bomtemplate_view',        'frontend'),
+  ('Manage BOM Templates',      'fab_erp_bomtemplate_manage',      'backend'),
+  -- Task Queue (EU-4)
+  ('View Task Queue',           'fab_erp_taskqueue_view',          'frontend'),
+  ('Manage Task Queue',         'fab_erp_taskqueue_manage',        'backend'),
+  -- Project DAG (EU-4)
+  ('View Project DAG',          'fab_erp_projectdag_view',         'frontend');
 
 -- =============================================================================
 -- 3. FEATURES_CAPABILITY  (global — no company_id column)
@@ -219,6 +227,39 @@ WHERE feature_tag IN ('fab_erp_grn_view', 'fab_erp_grn_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_grn'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Capability 12: BOM Templates (view + manage) (EU-12)
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_bomtemplate', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_bomtemplate_view', 'fab_erp_bomtemplate_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_bomtemplate'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Capability 13: Task Queue (view + manage) (EU-4)
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_taskqueue', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_taskqueue_view', 'fab_erp_taskqueue_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_taskqueue'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Capability 14: Project DAG (view only) (EU-4)
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_projectdag', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_projectdag_view')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_projectdag'
 )
 HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
@@ -358,6 +399,36 @@ VALUES (
   @companyId,
   @erp_app_id,
   (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_grn' LIMIT 1)
+);
+
+-- Capability 13: fab_erp_bomtemplate → Admin (EU-12)
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+VALUES (
+  @admin_role_id,
+  NULL,
+  @companyId,
+  @erp_app_id,
+  (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_bomtemplate' LIMIT 1)
+);
+
+-- Capability 14: fab_erp_taskqueue → Admin (EU-4)
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+VALUES (
+  @admin_role_id,
+  NULL,
+  @companyId,
+  @erp_app_id,
+  (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_taskqueue' LIMIT 1)
+);
+
+-- Capability 15: fab_erp_projectdag → Admin (EU-4)
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+VALUES (
+  @admin_role_id,
+  NULL,
+  @companyId,
+  @erp_app_id,
+  (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_projectdag' LIMIT 1)
 );
 
 -- =============================================================================

@@ -13,6 +13,7 @@ import plannerRouter   from './planner.js';
 import itemsRouter     from './items.js';
 import codegenRouter   from './codegen.js';
 import searchRouter    from './search.js';
+import tasksRouter     from './tasks.js';
 
 const router = Router();
 
@@ -32,5 +33,6 @@ router.use(plannerRouter);
 router.use(itemsRouter);
 router.use(codegenRouter);
 router.use(searchRouter);
+router.use(tasksRouter);
 
 export default router;

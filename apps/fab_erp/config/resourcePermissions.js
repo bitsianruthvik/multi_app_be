@@ -64,6 +64,17 @@ const resourcePermissions = {
   fabErpOperationFlow:      'fab_erp_flows_manage',
   fabErpOperationFlowStep:  'fab_erp_flows_manage',
 
+  // Project Task Queue
+  fabErpProjectTask: 'fab_erp_taskqueue_manage',
+
+  // BOM ↔ Flow attach
+  fabErpBomFlowBinding: 'fab_erp_flows_manage',
+
+  // BOM Templates
+  fabErpBomTemplate:     'fab_erp_bomtemplate_manage',
+  fabErpBomTemplateNode: 'fab_erp_bomtemplate_manage',
+  fabErpBomTemplateSlot: 'fab_erp_bomtemplate_manage',
+
   // Inventory / GRN (item categorization, stock, batches, GRN)
   fabErpCustomField:   'fab_erp_taxonomy_manage',
   fabErpItemCategory:  'fab_erp_taxonomy_manage',

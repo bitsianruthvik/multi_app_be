@@ -1454,6 +1454,42 @@
     "relations": {}
   },
 
+  "fabErpBomFlowBinding": {
+    "table": "fab_bom_flow_bindings",
+    "alias": "fbfb",
+    "writeFields": ["bom_id", "flow_id", "active"],
+    "fields": {
+      "id":        "fbfb.id",
+      "companyId": "fbfb.company_id",
+      "bomId":     "fbfb.bom_id",
+      "flowId":    "fbfb.flow_id",
+      "active":    "fbfb.active",
+      "createdAt": "fbfb.created_at",
+      "updatedAt": "fbfb.updated_at",
+      "flowName":  "fofl_bfb.name",
+      "flowCode":  "fofl_bfb.code"
+    },
+    "fieldTypes": {
+      "id":        "integer",
+      "companyId": "integer",
+      "bomId":     "integer",
+      "flowId":    "integer",
+      "active":    "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "flowName":  "string",
+      "flowCode":  "string"
+    },
+    "relations": {
+      "flow": {
+        "table": "fab_operation_flows",
+        "alias": "fofl_bfb",
+        "on":    "fbfb.flow_id = fofl_bfb.id",
+        "fields": ["flowName", "flowCode"]
+      }
+    }
+  },
+
   "fabErpOrder": {
     "table": "fab_orders",
     "alias": "fo",
@@ -1855,5 +1891,244 @@
       "updatedAt":  "datetime"
     },
     "relations": {}
+  },
+
+  "fabErpBomTemplate": {
+    "table": "fab_bom_templates",
+    "alias": "fbt",
+    "writeFields": ["name", "code", "base_qty", "base_unit", "active"],
+    "fields": {
+      "id":        "fbt.id",
+      "companyId": "fbt.company_id",
+      "name":      "fbt.name",
+      "code":      "fbt.code",
+      "baseQty":   "fbt.base_qty",
+      "baseUnit":  "fbt.base_unit",
+      "active":    "fbt.active",
+      "createdAt": "fbt.created_at",
+      "updatedAt": "fbt.updated_at"
+    },
+    "fieldTypes": {
+      "id":        "integer",
+      "companyId": "integer",
+      "name":      "string",
+      "code":      "string",
+      "baseQty":   "decimal",
+      "baseUnit":  "string",
+      "active":    "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpBomTemplateNode": {
+    "table": "fab_bom_template_nodes",
+    "alias": "fbtn",
+    "writeFields": ["template_id", "parent_node_id", "node_role", "ref_catalog_item_id", "qty", "unit", "sort_order"],
+    "fields": {
+      "id":                "fbtn.id",
+      "companyId":         "fbtn.company_id",
+      "templateId":        "fbtn.template_id",
+      "parentNodeId":      "fbtn.parent_node_id",
+      "nodeRole":          "fbtn.node_role",
+      "refCatalogItemId":  "fbtn.ref_catalog_item_id",
+      "qty":               "fbtn.qty",
+      "unit":              "fbtn.unit",
+      "sortOrder":         "fbtn.sort_order",
+      "createdAt":         "fbtn.created_at",
+      "updatedAt":         "fbtn.updated_at",
+      "refCatalogItemName": "fic_fbtn.name",
+      "refCatalogItemCode": "fic_fbtn.code"
+    },
+    "fieldTypes": {
+      "id":                "integer",
+      "companyId":         "integer",
+      "templateId":        "integer",
+      "parentNodeId":      "integer",
+      "nodeRole":          "string",
+      "refCatalogItemId":  "integer",
+      "qty":               "decimal",
+      "unit":              "string",
+      "sortOrder":         "integer",
+      "createdAt":         "datetime",
+      "updatedAt":         "datetime",
+      "refCatalogItemName": "string",
+      "refCatalogItemCode": "string"
+    },
+    "relations": {
+      "refCatalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_fbtn",
+        "on":    "fbtn.ref_catalog_item_id = fic_fbtn.id",
+        "fields": ["refCatalogItemName", "refCatalogItemCode"]
+      }
+    }
+  },
+
+  "fabErpBomTemplateSlot": {
+    "table": "fab_bom_template_slots",
+    "alias": "fbts",
+    "writeFields": ["template_id", "node_id", "slot_key", "param_label", "catalog_category", "catalog_group", "dimension_params", "selection_strategy", "default_catalog_item_id"],
+    "fields": {
+      "id":                     "fbts.id",
+      "companyId":              "fbts.company_id",
+      "templateId":             "fbts.template_id",
+      "nodeId":                 "fbts.node_id",
+      "slotKey":                "fbts.slot_key",
+      "paramLabel":             "fbts.param_label",
+      "catalogCategory":        "fbts.catalog_category",
+      "catalogGroup":           "fbts.catalog_group",
+      "dimensionParams":        "fbts.dimension_params",
+      "selectionStrategy":      "fbts.selection_strategy",
+      "defaultCatalogItemId":   "fbts.default_catalog_item_id",
+      "createdAt":              "fbts.created_at",
+      "updatedAt":              "fbts.updated_at",
+      "defaultCatalogItemName": "fic_fbts.name",
+      "defaultCatalogItemCode": "fic_fbts.code"
+    },
+    "fieldTypes": {
+      "id":                     "integer",
+      "companyId":              "integer",
+      "templateId":             "integer",
+      "nodeId":                 "integer",
+      "slotKey":                "string",
+      "paramLabel":             "string",
+      "catalogCategory":        "string",
+      "catalogGroup":           "string",
+      "dimensionParams":        "text",
+      "selectionStrategy":      "string",
+      "defaultCatalogItemId":   "integer",
+      "createdAt":              "datetime",
+      "updatedAt":              "datetime",
+      "defaultCatalogItemName": "string",
+      "defaultCatalogItemCode": "string"
+    },
+    "relations": {
+      "defaultCatalogItem": {
+        "table": "fab_item_catalog",
+        "alias": "fic_fbts",
+        "on":    "fbts.default_catalog_item_id = fic_fbts.id",
+        "fields": ["defaultCatalogItemName", "defaultCatalogItemCode"]
+      }
+    }
+  },
+
+  "fabErpProjectTask": {
+    "table": "fab_project_tasks",
+    "alias": "fpjt",
+    "writeFields": ["resource_type_id", "assigned_resource_id", "sort_order"],
+    "fields": {
+      "id":                          "fpjt.id",
+      "companyId":                   "fpjt.company_id",
+      "projectId":                   "fpjt.project_id",
+      "itemId":                      "fpjt.item_id",
+      "flowId":                      "fpjt.flow_id",
+      "flowStepId":                  "fpjt.flow_step_id",
+      "operationId":                 "fpjt.operation_id",
+      "seqNo":                       "fpjt.seq_no",
+      "dependsOn":                   "fpjt.depends_on",
+      "resourceTypeId":              "fpjt.resource_type_id",
+      "assignedResourceId":          "fpjt.assigned_resource_id",
+      "status":                      "fpjt.status",
+      "depsClearedAt":               "fpjt.deps_cleared_at",
+      "queuedAt":                    "fpjt.queued_at",
+      "startedAt":                   "fpjt.started_at",
+      "pausedAt":                    "fpjt.paused_at",
+      "completedAt":                 "fpjt.completed_at",
+      "waitWorkingMinutes":          "fpjt.wait_working_minutes",
+      "blockedByOtherTasksMinutes":  "fpjt.blocked_by_other_tasks_minutes",
+      "idleWaitMinutes":             "fpjt.idle_wait_minutes",
+      "delayReason":                 "fpjt.delay_reason",
+      "computedHours":               "fpjt.computed_hours",
+      "sortOrder":                   "fpjt.sort_order",
+      "createdAt":                   "fpjt.created_at",
+      "updatedAt":                   "fpjt.updated_at",
+      "projectName":                 "fproj_pt.name",
+      "projectCode":                 "fproj_pt.code",
+      "itemName":                    "fi_pt.name",
+      "flowName":                    "fofl_pt.name",
+      "flowCode":                    "fofl_pt.code",
+      "operationName":               "fop_pt.name",
+      "operationCode":               "fop_pt.code",
+      "resourceTypeName":            "frt_pt.name",
+      "assignedResourceName":        "far_pt.name",
+      "assignedResourceCode":        "far_pt.code"
+    },
+    "fieldTypes": {
+      "id":                          "integer",
+      "companyId":                   "integer",
+      "projectId":                   "integer",
+      "itemId":                      "integer",
+      "flowId":                      "integer",
+      "flowStepId":                  "integer",
+      "operationId":                 "integer",
+      "seqNo":                       "integer",
+      "dependsOn":                   "string",
+      "resourceTypeId":              "integer",
+      "assignedResourceId":          "integer",
+      "status":                      "string",
+      "depsClearedAt":               "datetime",
+      "queuedAt":                    "datetime",
+      "startedAt":                   "datetime",
+      "pausedAt":                    "datetime",
+      "completedAt":                 "datetime",
+      "waitWorkingMinutes":          "integer",
+      "blockedByOtherTasksMinutes":  "integer",
+      "idleWaitMinutes":             "integer",
+      "delayReason":                 "string",
+      "computedHours":               "decimal",
+      "sortOrder":                   "integer",
+      "createdAt":                   "datetime",
+      "updatedAt":                   "datetime",
+      "projectName":                 "string",
+      "projectCode":                 "string",
+      "itemName":                    "string",
+      "flowName":                    "string",
+      "flowCode":                    "string",
+      "operationName":               "string",
+      "operationCode":               "string",
+      "resourceTypeName":            "string",
+      "assignedResourceName":        "string",
+      "assignedResourceCode":        "string"
+    },
+    "relations": {
+      "project": {
+        "table": "fab_projects",
+        "alias": "fproj_pt",
+        "on":    "fpjt.project_id = fproj_pt.id",
+        "fields": ["projectName", "projectCode"]
+      },
+      "item": {
+        "table": "fab_items",
+        "alias": "fi_pt",
+        "on":    "fpjt.item_id = fi_pt.id",
+        "fields": ["itemName"]
+      },
+      "flow": {
+        "table": "fab_operation_flows",
+        "alias": "fofl_pt",
+        "on":    "fpjt.flow_id = fofl_pt.id",
+        "fields": ["flowName", "flowCode"]
+      },
+      "operation": {
+        "table": "fab_operations",
+        "alias": "fop_pt",
+        "on":    "fpjt.operation_id = fop_pt.id",
+        "fields": ["operationName", "operationCode"]
+      },
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_pt",
+        "on":    "fpjt.resource_type_id = frt_pt.id",
+        "fields": ["resourceTypeName"]
+      },
+      "assignedResource": {
+        "table": "fab_resources",
+        "alias": "far_pt",
+        "on":    "fpjt.assigned_resource_id = far_pt.id",
+        "fields": ["assignedResourceName", "assignedResourceCode"]
+      }
+    }
   }
 }

@@ -1979,3 +1979,147 @@ CREATE TABLE IF NOT EXISTS fab_operation_flow_steps (
   FOREIGN KEY (company_id) REFERENCES companies(id),
   KEY idx_fofs_flow (flow_id)
 );
+
+-- BOM ↔ Operation Flow attach: links a manufacturing flow to a BOM header
+CREATE TABLE IF NOT EXISTS fab_bom_flow_bindings (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  company_id INT           NOT NULL,
+  bom_id     INT           NOT NULL,
+  flow_id    INT           NOT NULL,
+  active     TINYINT(1)    NOT NULL DEFAULT 1,
+  deleted_at DATETIME      DEFAULT NULL,
+  created_at TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fbfb_company (company_id),
+  KEY idx_fbfb_bom     (bom_id),
+  KEY idx_fbfb_flow    (flow_id)
+);
+
+-- ===== Project Task Queue (EU-4) =====
+-- Materialized, per-item tasks generated from an operation flow's steps.
+-- All cross-refs below (project_id, item_id, flow_id, flow_step_id, operation_id,
+-- resource_type_id, assigned_resource_id) follow the established fab_erp
+-- convention: plain INT + KEY index, no FK, so soft-deleted parent rows never
+-- block inserts/updates here (see fab_operation_flow_steps above for the same
+-- pattern). Only company_id gets a real FK. Lifecycle transitions (status,
+-- started_at, etc.) are written exclusively via dedicated routes in a later
+-- unit, not through the generic /mutate writeFields list.
+CREATE TABLE IF NOT EXISTS fab_project_tasks (
+  id                              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id                      INT           NOT NULL,
+  project_id                      INT           NOT NULL,
+  item_id                         INT           NOT NULL,
+  flow_id                         INT           NOT NULL,
+  flow_step_id                    INT           NOT NULL,
+  operation_id                    INT           NOT NULL,
+  seq_no                          INT           NOT NULL,
+  depends_on                      VARCHAR(255)  NULL,
+  resource_type_id                INT           NULL,
+  assigned_resource_id            INT           NULL,
+  status                          ENUM('blocked','eligible','in_progress','paused','done','cancelled') NOT NULL DEFAULT 'blocked',
+  deps_cleared_at                 DATETIME      NULL,
+  queued_at                       DATETIME      NULL,
+  started_at                      DATETIME      NULL,
+  paused_at                       DATETIME      NULL,
+  completed_at                    DATETIME      NULL,
+  wait_working_minutes            INT           NOT NULL DEFAULT 0,
+  blocked_by_other_tasks_minutes  INT           NOT NULL DEFAULT 0,
+  idle_wait_minutes               INT           NOT NULL DEFAULT 0,
+  delay_reason                    ENUM('lack_of_manpower','machine_down','lack_of_consumable','planning_issue','minor_operational_delay') NULL,
+  computed_hours                  DECIMAL(10,2) NULL,
+  sort_order                      INT           NOT NULL DEFAULT 0,
+  deleted_at                      DATETIME      DEFAULT NULL,
+  created_at                      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at                      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fpjt_company        (company_id),
+  KEY idx_fpjt_project        (project_id),
+  KEY idx_fpjt_item           (item_id),
+  KEY idx_fpjt_flow           (flow_id),
+  KEY idx_fpjt_flow_step      (flow_step_id),
+  KEY idx_fpjt_operation      (operation_id),
+  KEY idx_fpjt_resource_type  (resource_type_id),
+  KEY idx_fpjt_assigned_res   (assigned_resource_id),
+  KEY idx_fpjt_status         (company_id, status),
+  KEY idx_fpjt_seq            (item_id, seq_no)
+);
+
+-- ===== BOM Templates (EU-12) =====
+-- Reusable, parameterized BOM patterns. A template has a tree of nodes
+-- (assembly/intermediate/raw_material, self-referencing via parent_node_id,
+-- mirroring fab_material_bom_items.parent_bom_item_id) and raw_material nodes
+-- may carry one or more parameterized material "slots" instead of a fixed
+-- catalog item.
+
+-- Header: one row per reusable BOM pattern. name/code uniqueness follows the
+-- established case-insensitive, soft-delete-aware VIRTUAL column pattern used
+-- by fab_operations / fab_operation_flows / fab_resource_types etc.
+CREATE TABLE IF NOT EXISTS fab_bom_templates (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  name         VARCHAR(255)  NOT NULL,
+  code         VARCHAR(100)  NOT NULL,
+  base_qty     DECIMAL(18,4) NOT NULL DEFAULT 1,
+  base_unit    VARCHAR(50)   NULL,
+  active       TINYINT(1)    NOT NULL DEFAULT 1,
+  deleted_at   DATETIME      DEFAULT NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  name_active  VARCHAR(255)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+  code_active  VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fbt_name (company_id, name_active),
+  UNIQUE KEY uq_fbt_code (company_id, code_active),
+  KEY idx_fbt_company (company_id)
+);
+
+-- Tree structure: self-referencing via parent_node_id (mirrors
+-- fab_material_bom_items.parent_bom_item_id). ref_catalog_item_id is set for
+-- fixed parts and left NULL for parameterized slots (see fab_bom_template_slots).
+-- Cross-refs follow the established fab_erp convention: plain INT + KEY index,
+-- no FK, except on company_id.
+CREATE TABLE IF NOT EXISTS fab_bom_template_nodes (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  template_id         INT           NOT NULL,
+  parent_node_id      INT           NULL,
+  node_role           ENUM('assembly','intermediate','raw_material') NOT NULL,
+  ref_catalog_item_id INT           NULL,
+  qty                 DECIMAL(18,4) NOT NULL DEFAULT 1,
+  unit                VARCHAR(50)   NULL,
+  sort_order          INT           NOT NULL DEFAULT 0,
+  deleted_at          DATETIME      DEFAULT NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fbtn_company     (company_id),
+  KEY idx_fbtn_template    (template_id),
+  KEY idx_fbtn_parent      (parent_node_id),
+  KEY idx_fbtn_ref_catalog (ref_catalog_item_id)
+);
+
+-- Parameterized material choice: one row per raw_material node slot. Stores
+-- the target dimension/attribute criteria (dimension_params JSON) and the
+-- strategy used to resolve a concrete catalog item at BOM-instantiation time.
+CREATE TABLE IF NOT EXISTS fab_bom_template_slots (
+  id                      INT AUTO_INCREMENT PRIMARY KEY,
+  company_id              INT           NOT NULL,
+  template_id             INT           NOT NULL,
+  node_id                 INT           NOT NULL,
+  slot_key                VARCHAR(100)  NOT NULL,
+  param_label             VARCHAR(255)  NULL,
+  catalog_category        VARCHAR(100)  NULL,
+  catalog_group           VARCHAR(100)  NULL,
+  dimension_params        JSON          NULL,
+  selection_strategy      ENUM('available_now','soonest_available','manual') NOT NULL DEFAULT 'available_now',
+  default_catalog_item_id INT           NULL,
+  deleted_at              DATETIME      DEFAULT NULL,
+  created_at              TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at              TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fbts_company         (company_id),
+  KEY idx_fbts_template        (template_id),
+  KEY idx_fbts_node            (node_id),
+  KEY idx_fbts_default_catalog (default_catalog_item_id)
+);
