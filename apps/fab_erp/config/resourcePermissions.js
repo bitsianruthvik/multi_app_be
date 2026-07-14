@@ -55,6 +55,15 @@ const resourcePermissions = {
   fabErpPlannedOperation:  'fab_erp_planning_manage',
   fabErpResourceAssignment: 'fab_erp_planning_manage',
 
+  // Operations
+  fabErpOperation:             'fab_erp_operations_manage',
+  fabErpOperationVariable:     'fab_erp_operations_manage',
+  fabErpOperationResourceType: 'fab_erp_operations_manage',
+
+  // Flows
+  fabErpOperationFlow:      'fab_erp_flows_manage',
+  fabErpOperationFlowStep:  'fab_erp_flows_manage',
+
   // Inventory / GRN (item categorization, stock, batches, GRN)
   fabErpCustomField:   'fab_erp_taxonomy_manage',
   fabErpItemCategory:  'fab_erp_taxonomy_manage',

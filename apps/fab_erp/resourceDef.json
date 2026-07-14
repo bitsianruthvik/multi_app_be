@@ -339,6 +339,194 @@
     }
   },
 
+  "fabErpOperation": {
+    "table": "fab_operations",
+    "alias": "fop",
+    "writeFields": ["name", "code", "default_resource_type_id", "time_formula", "time_unit", "active"],
+    "fields": {
+      "id":                     "fop.id",
+      "companyId":              "fop.company_id",
+      "name":                   "fop.name",
+      "code":                   "fop.code",
+      "defaultResourceTypeId":  "fop.default_resource_type_id",
+      "timeFormula":            "fop.time_formula",
+      "timeUnit":               "fop.time_unit",
+      "active":                 "fop.active",
+      "createdAt":              "fop.created_at",
+      "updatedAt":              "fop.updated_at",
+      "defaultResourceTypeName": "frt_op.name"
+    },
+    "fieldTypes": {
+      "id":                     "integer",
+      "companyId":              "integer",
+      "name":                   "string",
+      "code":                   "string",
+      "defaultResourceTypeId":  "integer",
+      "timeFormula":            "text",
+      "timeUnit":               "string",
+      "active":                 "integer",
+      "createdAt":              "datetime",
+      "updatedAt":              "datetime",
+      "defaultResourceTypeName": "string"
+    },
+    "relations": {
+      "defaultResourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_op",
+        "on":    "fop.default_resource_type_id = frt_op.id",
+        "fields": ["defaultResourceTypeName"]
+      }
+    }
+  },
+
+  "fabErpOperationVariable": {
+    "table": "fab_operation_variables",
+    "alias": "fov",
+    "writeFields": ["operation_id", "var_key", "label", "unit", "default_value", "sort_order"],
+    "fields": {
+      "id":           "fov.id",
+      "companyId":    "fov.company_id",
+      "operationId":  "fov.operation_id",
+      "varKey":       "fov.var_key",
+      "label":        "fov.label",
+      "unit":         "fov.unit",
+      "defaultValue": "fov.default_value",
+      "sortOrder":    "fov.sort_order",
+      "createdAt":    "fov.created_at",
+      "updatedAt":    "fov.updated_at"
+    },
+    "fieldTypes": {
+      "id":           "integer",
+      "companyId":    "integer",
+      "operationId":  "integer",
+      "varKey":       "string",
+      "label":        "string",
+      "unit":         "string",
+      "defaultValue": "decimal",
+      "sortOrder":    "integer",
+      "createdAt":    "datetime",
+      "updatedAt":    "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpOperationResourceType": {
+    "table": "fab_operation_resource_types",
+    "alias": "forc",
+    "writeFields": ["operation_id", "resource_type_id"],
+    "fields": {
+      "id":               "forc.id",
+      "companyId":        "forc.company_id",
+      "operationId":      "forc.operation_id",
+      "resourceTypeId":   "forc.resource_type_id",
+      "createdAt":        "forc.created_at",
+      "updatedAt":        "forc.updated_at",
+      "resourceTypeName": "frt_orc.name",
+      "resourceTypeCode": "frt_orc.code",
+      "operationName":    "fop_orc.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "operationId":      "integer",
+      "resourceTypeId":   "integer",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "resourceTypeName": "string",
+      "resourceTypeCode": "string",
+      "operationName":    "string"
+    },
+    "relations": {
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_orc",
+        "on":    "forc.resource_type_id = frt_orc.id",
+        "fields": ["resourceTypeName", "resourceTypeCode"]
+      },
+      "operation": {
+        "table": "fab_operations",
+        "alias": "fop_orc",
+        "on":    "forc.operation_id = fop_orc.id",
+        "fields": ["operationName"]
+      }
+    }
+  },
+
+  "fabErpOperationFlow": {
+    "table": "fab_operation_flows",
+    "alias": "fofl",
+    "writeFields": ["name", "code", "active"],
+    "fields": {
+      "id":        "fofl.id",
+      "companyId": "fofl.company_id",
+      "name":      "fofl.name",
+      "code":      "fofl.code",
+      "active":    "fofl.active",
+      "createdAt": "fofl.created_at",
+      "updatedAt": "fofl.updated_at"
+    },
+    "fieldTypes": {
+      "id":        "integer",
+      "companyId": "integer",
+      "name":      "string",
+      "code":      "string",
+      "active":    "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpOperationFlowStep": {
+    "table": "fab_operation_flow_steps",
+    "alias": "fofs",
+    "writeFields": ["flow_id", "operation_id", "seq_no", "depends_on", "resource_type_id", "notes"],
+    "fields": {
+      "id":               "fofs.id",
+      "companyId":        "fofs.company_id",
+      "flowId":           "fofs.flow_id",
+      "operationId":      "fofs.operation_id",
+      "seqNo":            "fofs.seq_no",
+      "dependsOn":        "fofs.depends_on",
+      "resourceTypeId":   "fofs.resource_type_id",
+      "notes":            "fofs.notes",
+      "createdAt":        "fofs.created_at",
+      "updatedAt":        "fofs.updated_at",
+      "operationName":    "fop_ofs.name",
+      "operationCode":    "fop_ofs.code",
+      "resourceTypeName": "frt_ofs.name"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "flowId":           "integer",
+      "operationId":      "integer",
+      "seqNo":            "integer",
+      "dependsOn":        "string",
+      "resourceTypeId":   "integer",
+      "notes":            "string",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime",
+      "operationName":    "string",
+      "operationCode":    "string",
+      "resourceTypeName": "string"
+    },
+    "relations": {
+      "operation": {
+        "table": "fab_operations",
+        "alias": "fop_ofs",
+        "on":    "fofs.operation_id = fop_ofs.id",
+        "fields": ["operationName", "operationCode"]
+      },
+      "resourceType": {
+        "table": "fab_resource_types",
+        "alias": "frt_ofs",
+        "on":    "fofs.resource_type_id = frt_ofs.id",
+        "fields": ["resourceTypeName"]
+      }
+    }
+  },
+
   "fabErpProcessTemplate": {
     "table": "fab_process_templates",
     "alias": "fpt",

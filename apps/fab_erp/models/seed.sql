@@ -43,7 +43,7 @@ VALUES (@companyId, 'Fab ERP', 'fab_erp', 1, NULL);
 -- =============================================================================
 -- 2. FEATURES  (global — no company_id column)
 -- =============================================================================
--- 14 rows: one frontend (view) + one backend (manage) per permission group.
+-- 18 rows: one frontend (view) + one backend (manage) per permission group.
 -- `name` column exists in the DDL (VARCHAR 255) but is not required; we mirror
 -- the fab_flow seed which omits it.  feature_tag values are verbatim from the
 -- EU-A5 spec and must not be changed — other units depend on them exactly.
@@ -73,6 +73,12 @@ INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
   -- Planning & Capacity
   ('View Planning',             'fab_erp_planning_view',       'frontend'),
   ('Manage Planning',           'fab_erp_planning_manage',     'backend'),
+  -- Operations
+  ('View Operations',           'fab_erp_operations_view',     'frontend'),
+  ('Manage Operations',         'fab_erp_operations_manage',   'backend'),
+  -- Operation Flows
+  ('View Operation Flows',      'fab_erp_flows_view',          'frontend'),
+  ('Manage Operation Flows',    'fab_erp_flows_manage',        'backend'),
   -- Inventory & Stock
   ('View Inventory',            'fab_erp_inventory_view',          'frontend'),
   ('Manage Inventory',          'fab_erp_inventory_manage',        'frontend'),
@@ -85,10 +91,13 @@ INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
 -- =============================================================================
 -- 3. FEATURES_CAPABILITY  (global — no company_id column)
 -- =============================================================================
--- 7 capabilities, one per permission group.
+-- 11 capabilities, one per permission group.
 -- features_json is built via JSON_ARRAYAGG(id) from a subquery — IDs are
 -- resolved dynamically at import time so this script does not hardcode any IDs.
--- Each INSERT is guarded by NOT EXISTS so it is safe to re-run.
+-- Each INSERT is guarded by NOT EXISTS *and* a HAVING JSON_ARRAYAGG(id) IS NOT NULL
+-- clause so it is safe to re-run: without the HAVING, an ungrouped aggregate still
+-- returns one (NULL) row when NOT EXISTS filters everything out, inserting a junk
+-- duplicate capability with features_json = NULL on every re-run.
 --
 -- `features_capability` columns: capability_id (PK AI), name, features_json, deleted_at
 
@@ -100,7 +109,8 @@ WHERE feature_tag IN ('fab_erp_resources_view', 'fab_erp_resources_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_resources'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 2: Item Metrics & Constants (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -110,7 +120,8 @@ WHERE feature_tag IN ('fab_erp_items_meta_view', 'fab_erp_items_meta_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_items_meta'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 3: Formulas (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -120,7 +131,8 @@ WHERE feature_tag IN ('fab_erp_formulas_view', 'fab_erp_formulas_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_formulas'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 4: Templates — process / routing / mfg-method (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -130,7 +142,8 @@ WHERE feature_tag IN ('fab_erp_templates_view', 'fab_erp_templates_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_templates'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 5: Projects & Items (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -140,7 +153,8 @@ WHERE feature_tag IN ('fab_erp_projects_view', 'fab_erp_projects_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_projects'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 6: Calendars (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -150,7 +164,8 @@ WHERE feature_tag IN ('fab_erp_calendars_view', 'fab_erp_calendars_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_calendars'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- Capability 7: Planning & Capacity (view + manage)
 INSERT INTO features_capability (name, features_json)
@@ -160,9 +175,32 @@ WHERE feature_tag IN ('fab_erp_planning_view', 'fab_erp_planning_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_planning'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
--- Capability 8: Inventory & Stock Setup (view + manage + locations + taxonomy)
+-- Capability 8: Operations (view + manage)
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_operations', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_operations_view', 'fab_erp_operations_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_operations'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Capability 9: Operation Flows (view + manage)
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_flows', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_flows_view', 'fab_erp_flows_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_flows'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Capability 10: Inventory & Stock Setup (view + manage + locations + taxonomy)
 INSERT INTO features_capability (name, features_json)
 SELECT 'fab_erp_inventory_setup', JSON_ARRAYAGG(id)
 FROM features
@@ -170,9 +208,10 @@ WHERE feature_tag IN ('fab_erp_inventory_view', 'fab_erp_inventory_manage', 'fab
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_inventory_setup'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
--- Capability 9: GRN (view + manage)
+-- Capability 11: GRN (view + manage)
 INSERT INTO features_capability (name, features_json)
 SELECT 'fab_erp_grn', JSON_ARRAYAGG(id)
 FROM features
@@ -180,20 +219,21 @@ WHERE feature_tag IN ('fab_erp_grn_view', 'fab_erp_grn_manage')
   AND deleted_at IS NULL
 AND NOT EXISTS (
   SELECT 1 FROM features_capability WHERE name = 'fab_erp_grn'
-);
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
 
 -- ===== EU-A6 appends below: role_capability + app_user_access =====
 
 -- =============================================================================
 -- 4. ROLE_CAPABILITY  (tenant-scoped)
 -- =============================================================================
--- Grant all 7 fab_erp capabilities to the Admin role for @companyId.
+-- Grant all 11 fab_erp capabilities to the Admin role for @companyId.
 -- Columns confirmed from core-init.sql:
 --   role_id, team_id (NULL = company-wide), company_id, app_id, capability_id
 -- INSERT IGNORE is safe because there is no unique constraint on the column
 -- combination, but re-running will simply skip existing rows with the same PK.
 -- We use SET variables to resolve role_id and app_id exactly once, then
--- reference them in all 7 inserts — matching the pattern in demo_seed.sql.
+-- reference them in all 11 inserts — matching the pattern in demo_seed.sql.
 --
 -- NOTE: The Admin role name is 'Admin' (capital A) as created by registerAdmin.
 --       If your company uses a different admin role name, update the WHERE clause.
@@ -280,7 +320,27 @@ VALUES (
   (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_planning' LIMIT 1)
 );
 
--- Capability 8: fab_erp_inventory_setup → Admin
+-- Capability 8: fab_erp_operations → Admin
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+VALUES (
+  @admin_role_id,
+  NULL,
+  @companyId,
+  @erp_app_id,
+  (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_operations' LIMIT 1)
+);
+
+-- Capability 9: fab_erp_flows → Admin
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+VALUES (
+  @admin_role_id,
+  NULL,
+  @companyId,
+  @erp_app_id,
+  (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_flows' LIMIT 1)
+);
+
+-- Capability 11: fab_erp_inventory_setup → Admin
 INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
 VALUES (
   @admin_role_id,
@@ -290,7 +350,7 @@ VALUES (
   (SELECT capability_id FROM features_capability WHERE name = 'fab_erp_inventory_setup' LIMIT 1)
 );
 
--- Capability 9: fab_erp_grn → Admin
+-- Capability 12: fab_erp_grn → Admin
 INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
 VALUES (
   @admin_role_id,

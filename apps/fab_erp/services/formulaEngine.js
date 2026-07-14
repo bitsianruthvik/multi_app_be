@@ -5,11 +5,13 @@
  *   machine.<key>  → resolved from fab_resource_type_properties for the given resource type
  *   item.<key>     → passed in as itemValues map
  *   step.<key>     → passed in as stepValues map (standard_values overrides from planned op)
+ *   op.<key>       → passed in as opValues map (an operation's own named variables)
  *
  * expr-eval does not support dots in identifiers, so dots are rewritten to underscores:
  *   machine.speed → machine_speed
  *   item.length   → item_length
  *   step.holes    → step_holes
+ *   op.cycle_time → op_cycle_time
  *
  * IF(cond, a, b) is pre-processed to (cond ? a : b) before parsing.
  */
@@ -38,7 +40,7 @@ function normalise(formula) {
     (_, cond, tVal, fVal) => `(${cond.trim()} ? ${tVal.trim()} : ${fVal.trim()})`,
   );
   // Step 2: rewrite namespace.key → namespace_key
-  result = result.replace(/\b(machine|item|step)\.(\w+)\b/g, '$1_$2');
+  result = result.replace(/\b(machine|item|step|op)\.(\w+)\b/g, '$1_$2');
   return result;
 }
 
@@ -49,6 +51,7 @@ function normalise(formula) {
  * @param {Record<string,number>} itemValues   - item metric values keyed by metric_key
  * @param {Record<string,number>} stepValues   - step parameter values (standard_values overrides)
  * @param {number|null} resourceTypeId  - resource type whose properties supply machine.* vars
+ * @param {Record<string,number>} opValues     - operation's own variable values keyed by var_key
  * @returns {Promise<number|null>}      - evaluated result or null on error/missing formula
  */
 export async function evaluateFormula(
@@ -56,6 +59,7 @@ export async function evaluateFormula(
   itemValues  = {},
   stepValues  = {},
   resourceTypeId = null,
+  opValues = {},
 ) {
   if (!formula || typeof formula !== 'string') return null;
 
@@ -82,6 +86,9 @@ export async function evaluateFormula(
     }
     for (const prop of machineProps) {
       scope[`machine_${prop.property_key}`] = Number(prop.default_value ?? 0);
+    }
+    for (const [k, v] of Object.entries(opValues)) {
+      scope[`op_${k}`] = Number(v ?? 0);
     }
 
     const normalised = normalise(formula);
@@ -127,7 +134,7 @@ export function parseFormula(formula) {
     const rawVars = expr.variables();
     // Convert back to dot-notation for display
     const variables = rawVars.map((v) =>
-      v.replace(/^(machine|item|step)_(\w+)$/, '$1.$2'),
+      v.replace(/^(machine|item|step|op)_(\w+)$/, '$1.$2'),
     );
     return { valid: true, variables };
   } catch (e) {

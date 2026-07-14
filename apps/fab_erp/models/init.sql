@@ -1893,3 +1893,89 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_id INT NULL;
 ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_code VARCHAR(60) NULL;
 ALTER TABLE fab_grn_lines MODIFY COLUMN batch_code VARCHAR(60) NULL;
+
+-- ===== Operations / Operation Flows (flat routing model) =====
+
+CREATE TABLE IF NOT EXISTS fab_operations (
+  id                       INT AUTO_INCREMENT PRIMARY KEY,
+  company_id               INT           NOT NULL,
+  name                     VARCHAR(255)  NOT NULL,
+  code                     VARCHAR(100)  NOT NULL,
+  default_resource_type_id INT           NULL,
+  time_formula             TEXT          NULL,
+  time_unit                ENUM('min','hr','sec') NOT NULL DEFAULT 'min',
+  active                   TINYINT(1)    NOT NULL DEFAULT 1,
+  deleted_at               DATETIME      DEFAULT NULL,
+  created_at               TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at               TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  name_active              VARCHAR(255)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+  code_active              VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fop_name (company_id, name_active),
+  UNIQUE KEY uq_fop_code (company_id, code_active),
+  KEY idx_fop_company (company_id)
+);
+
+CREATE TABLE IF NOT EXISTS fab_operation_variables (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  operation_id  INT           NOT NULL,
+  var_key       VARCHAR(64)   NOT NULL,
+  label         VARCHAR(255)  NOT NULL,
+  unit          VARCHAR(32)   NULL,
+  default_value DECIMAL(18,4) NULL,
+  sort_order    INT           NOT NULL DEFAULT 0,
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fopv (operation_id, var_key),
+  KEY idx_fopv_op (operation_id)
+);
+
+CREATE TABLE IF NOT EXISTS fab_operation_resource_types (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT NOT NULL,
+  operation_id     INT NOT NULL,
+  resource_type_id INT NOT NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fort (operation_id, resource_type_id),
+  KEY idx_fort_op (operation_id),
+  KEY idx_fort_rt (resource_type_id)
+);
+
+CREATE TABLE IF NOT EXISTS fab_operation_flows (
+  id        INT AUTO_INCREMENT PRIMARY KEY,
+  company_id INT           NOT NULL,
+  name      VARCHAR(255)  NOT NULL,
+  code      VARCHAR(100)  NOT NULL,
+  active    TINYINT(1)    NOT NULL DEFAULT 1,
+  deleted_at DATETIME      DEFAULT NULL,
+  created_at TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  name_active VARCHAR(255) GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+  code_active VARCHAR(100) GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fofl_name (company_id, name_active),
+  UNIQUE KEY uq_fofl_code (company_id, code_active),
+  KEY idx_fofl_company (company_id)
+);
+
+CREATE TABLE IF NOT EXISTS fab_operation_flow_steps (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  flow_id          INT           NOT NULL,
+  operation_id     INT           NOT NULL,
+  seq_no           INT           NOT NULL,
+  depends_on       VARCHAR(255)  NULL,
+  resource_type_id INT           NULL,
+  notes            TEXT          NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fofs_flow (flow_id)
+);
