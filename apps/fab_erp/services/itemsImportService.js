@@ -72,10 +72,40 @@ function dropdown(ws, col, list, fromRow, toRow) {
   }
 }
 
+/** Same as dropdown(), but the list comes from a cell range (e.g. another sheet) rather than an inline literal. */
+function dropdownFromRange(ws, col, rangeRef, fromRow, toRow) {
+  for (let r = fromRow; r <= toRow; r++) {
+    ws.getCell(r, col).dataValidation = {
+      type: 'list', allowBlank: true, showErrorMessage: false, formulae: [rangeRef],
+    };
+  }
+}
+
 // ── export ────────────────────────────────────────────────────────────────────
 
 export async function exportItemsTemplate(companyId) {
   const wb = new ExcelJS.Workbook();
+
+  // ── Taxonomy, fetched up front so both the Items sheet's dropdowns and the
+  //    Existing Taxonomy reference sheet can use it ─────────────────────────
+  const [categories] = await pool.query(
+    'SELECT id, name FROM fab_item_categories WHERE company_id = ? AND deleted_at IS NULL ORDER BY name',
+    [companyId],
+  );
+  const [groups] = await pool.query(
+    `SELECT g.id, g.name, c.name AS category_name
+       FROM fab_item_groups g JOIN fab_item_categories c ON c.id = g.category_id
+      WHERE g.company_id = ? AND g.deleted_at IS NULL ORDER BY c.name, g.name`,
+    [companyId],
+  );
+  const [subgroups] = await pool.query(
+    `SELECT s.name, g.name AS group_name, c.name AS category_name
+       FROM fab_item_subgroups s
+       JOIN fab_item_groups g     ON g.id = s.group_id
+       JOIN fab_item_categories c ON c.id = g.category_id
+      WHERE s.company_id = ? AND s.deleted_at IS NULL ORDER BY c.name, g.name, s.name`,
+    [companyId],
+  );
 
   // ── Sheet 1: Items (fill-in template) ────────────────────────────────────
   const ws = wb.addWorksheet('Items');
@@ -113,6 +143,31 @@ export async function exportItemsTemplate(companyId) {
 
   dropdown(ws, 7, PROCUREMENT_TYPES, 2, 1000);
 
+  // ── Hidden "Lists" sheet backing the Category / Group / Sub-group dropdowns
+  //    on the Items sheet — a plain (non-cascading) list of every name that
+  //    currently exists for this company, kept off to the side so it doesn't
+  //    clutter the fill-in sheet. Data validation still lets the user type a
+  //    brand-new name — new taxonomy is created automatically on import.
+  const wsLists = wb.addWorksheet('Lists', { state: 'veryHidden' });
+  wsLists.getCell(1, 1).value = 'Category';
+  wsLists.getCell(1, 2).value = 'Group';
+  wsLists.getCell(1, 3).value = 'Sub-group';
+  categories.forEach((c, i) => { wsLists.getCell(i + 2, 1).value = c.name; });
+  const uniqueGroupNames    = [...new Set(groups.map((g) => g.name))];
+  const uniqueSubgroupNames = [...new Set(subgroups.map((s) => s.name))];
+  uniqueGroupNames.forEach((n, i)    => { wsLists.getCell(i + 2, 2).value = n; });
+  uniqueSubgroupNames.forEach((n, i) => { wsLists.getCell(i + 2, 3).value = n; });
+
+  if (categories.length > 0) {
+    dropdownFromRange(ws, 4, `Lists!$A$2:$A$${categories.length + 1}`, 2, 1000);
+  }
+  if (uniqueGroupNames.length > 0) {
+    dropdownFromRange(ws, 5, `Lists!$B$2:$B$${uniqueGroupNames.length + 1}`, 2, 1000);
+  }
+  if (uniqueSubgroupNames.length > 0) {
+    dropdownFromRange(ws, 6, `Lists!$C$2:$C$${uniqueSubgroupNames.length + 1}`, 2, 1000);
+  }
+
   // ── Sheet 2: Existing Taxonomy (reference) ──────────────────────────────
   const wsTax = wb.addWorksheet('Existing Taxonomy');
   styledHeader(wsTax, [
@@ -122,24 +177,6 @@ export async function exportItemsTemplate(companyId) {
     { header: 'Parent Group',    width: 24 },
   ]);
 
-  const [categories] = await pool.query(
-    'SELECT id, name FROM fab_item_categories WHERE company_id = ? AND deleted_at IS NULL ORDER BY name',
-    [companyId],
-  );
-  const [groups] = await pool.query(
-    `SELECT g.id, g.name, c.name AS category_name
-       FROM fab_item_groups g JOIN fab_item_categories c ON c.id = g.category_id
-      WHERE g.company_id = ? AND g.deleted_at IS NULL ORDER BY c.name, g.name`,
-    [companyId],
-  );
-  const [subgroups] = await pool.query(
-    `SELECT s.name, g.name AS group_name, c.name AS category_name
-       FROM fab_item_subgroups s
-       JOIN fab_item_groups g     ON g.id = s.group_id
-       JOIN fab_item_categories c ON c.id = g.category_id
-      WHERE s.company_id = ? AND s.deleted_at IS NULL ORDER BY c.name, g.name, s.name`,
-    [companyId],
-  );
   for (const c of categories) wsTax.addRow(['Category',  c.name, '', '']);
   for (const g of groups)     wsTax.addRow(['Group',     g.name, g.category_name, '']);
   for (const s of subgroups)  wsTax.addRow(['Sub-group', s.name, s.category_name, s.group_name]);
@@ -166,6 +203,33 @@ export async function exportItemsTemplate(companyId) {
   lines.forEach((l) => wsHelp.addRow([l]));
   wsHelp.getRow(1).font = { bold: true, size: 13 };
 
+  return wb.xlsx.writeBuffer();
+}
+
+// ── import report ────────────────────────────────────────────────────────────
+
+/** Builds a per-row status log as an .xlsx buffer — what got imported, what was skipped, and why. */
+async function buildImportReport(rowLog) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Import Log');
+  styledHeader(ws, [
+    { header: 'Row',        width: 8 },
+    { header: 'Item Name',  width: 28 },
+    { header: 'Code',       width: 18 },
+    { header: 'Category',   width: 20 },
+    { header: 'Group',      width: 20 },
+    { header: 'Sub-group',  width: 20 },
+    { header: 'Status',     width: 12 },
+    { header: 'Reason',     width: 40 },
+  ]);
+  for (const r of rowLog) {
+    ws.addRow([r.row, r.name, r.code, r.categoryName, r.groupName, r.subgroupName, r.status, r.reason]);
+    const excelRow = ws.lastRow;
+    const fill = r.status === 'Created'
+      ? { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE6F4EA' } }
+      : { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE8E6' } };
+    excelRow.eachCell((cell) => { cell.fill = fill; });
+  }
   return wb.xlsx.writeBuffer();
 }
 
@@ -216,6 +280,7 @@ export async function importItemsExcel(file, companyId) {
     itemsCreated: 0, itemsSkipped: 0,
     categoriesCreated: 0, groupsCreated: 0, subgroupsCreated: 0,
     warnings: [],
+    rowLog: [], // one entry per data row — backs the downloadable import report
   };
 
   const conn = await pool.getConnection();
@@ -332,17 +397,26 @@ export async function importItemsExcel(file, companyId) {
 
     // ── process rows ─────────────────────────────────────────────────────────
     for (const r of rows) {
+      const rowBase = {
+        row: r.rowNumber, name: r.name, code: r.code || '',
+        categoryName: r.categoryName || '', groupName: r.groupName || '', subgroupName: r.subgroupName || '',
+      };
+
       let code = r.code ? r.code.trim().toUpperCase() : null;
       if (code && itemCodeSet.has(code)) {
-        result.warnings.push({ row: r.rowNumber, message: `Item code '${code}' already exists — row skipped.` });
+        const message = `Item code '${code}' already exists — row skipped.`;
+        result.warnings.push({ row: r.rowNumber, message });
         result.itemsSkipped++;
+        result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
         continue;
       }
       if (code) itemCodeSet.add(code);
 
       if (!r.categoryName) {
-        result.warnings.push({ row: r.rowNumber, message: `Category is required — row skipped.` });
+        const message = `Category is required — row skipped.`;
+        result.warnings.push({ row: r.rowNumber, message });
         result.itemsSkipped++;
+        result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
         continue;
       }
 
@@ -361,9 +435,14 @@ export async function importItemsExcel(file, companyId) {
       }
 
       let procurementType = 'buy';
+      const rowNotes = [];
       if (r.procurementRaw) {
         if (PROCUREMENT_TYPES.includes(r.procurementRaw)) procurementType = r.procurementRaw;
-        else result.warnings.push({ row: r.rowNumber, message: `Unrecognised Procurement Type — defaulted to 'buy'.` });
+        else {
+          const message = `Unrecognised Procurement Type — defaulted to 'buy'.`;
+          result.warnings.push({ row: r.rowNumber, message });
+          rowNotes.push(message);
+        }
       }
 
       const [insertRes] = await conn.query(
@@ -390,9 +469,16 @@ export async function importItemsExcel(file, companyId) {
         if (!cfTypeByKey.has(cf.fieldKey)) cfTypeByKey.set(cf.fieldKey, fieldType);
         cfSortOrder++;
       }
+
+      result.rowLog.push({
+        ...rowBase, code, status: 'Created',
+        reason: rowNotes.join(' ') || '',
+      });
     }
 
     await conn.commit();
+    result.reportBase64 = (await buildImportReport(result.rowLog)).toString('base64');
+    delete result.rowLog;
     return result;
   } catch (err) {
     await conn.rollback();

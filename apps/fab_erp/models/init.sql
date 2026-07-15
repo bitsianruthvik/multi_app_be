@@ -1960,3 +1960,8 @@ CREATE TABLE IF NOT EXISTS fab_bom_template_slots (
   KEY idx_fbts_node            (node_id),
   KEY idx_fbts_default_catalog (default_catalog_item_id)
 );
+
+-- ── fab_operation_flows: description (free-text, shown in the flow list) ──────
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_operation_flows' AND COLUMN_NAME='description');
+SET @sql = IF(@col=0,'ALTER TABLE fab_operation_flows ADD COLUMN description TEXT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

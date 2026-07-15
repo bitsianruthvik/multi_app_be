@@ -455,24 +455,26 @@
   "fabErpOperationFlow": {
     "table": "fab_operation_flows",
     "alias": "fofl",
-    "writeFields": ["name", "code", "active"],
+    "writeFields": ["name", "code", "description", "active"],
     "fields": {
-      "id":        "fofl.id",
-      "companyId": "fofl.company_id",
-      "name":      "fofl.name",
-      "code":      "fofl.code",
-      "active":    "fofl.active",
-      "createdAt": "fofl.created_at",
-      "updatedAt": "fofl.updated_at"
+      "id":          "fofl.id",
+      "companyId":   "fofl.company_id",
+      "name":        "fofl.name",
+      "code":        "fofl.code",
+      "description": "fofl.description",
+      "active":      "fofl.active",
+      "createdAt":   "fofl.created_at",
+      "updatedAt":   "fofl.updated_at"
     },
     "fieldTypes": {
-      "id":        "integer",
-      "companyId": "integer",
-      "name":      "string",
-      "code":      "string",
-      "active":    "integer",
-      "createdAt": "datetime",
-      "updatedAt": "datetime"
+      "id":          "integer",
+      "companyId":   "integer",
+      "name":        "string",
+      "code":        "string",
+      "description": "text",
+      "active":      "integer",
+      "createdAt":   "datetime",
+      "updatedAt":   "datetime"
     },
     "relations": {}
   },
