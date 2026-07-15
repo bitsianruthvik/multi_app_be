@@ -4,15 +4,20 @@
  * EU-5: Task instantiation service for fab_erp.
  *
  * Exported function:
- *   materializeTasks(companyId, projectId)
+ *   materializeTasks(companyId, orderId)
  *
- * For every fab_items instance belonging to the project whose catalog item
- * has a BOM with an active flow binding, insert one fab_project_tasks row
- * per (fab_items instance x flow step) — no dedup/batching across identical
- * sibling instances; each instance gets its own independent set of task rows.
+ * For every fab_items instance belonging to the order that resolves to a
+ * flow (either directly via item.flow_id, or via the legacy catalog-BOM
+ * fallback), insert one fab_project_tasks row per (fab_items instance x flow
+ * step) — no dedup/batching across identical sibling instances; each
+ * instance gets its own independent set of task rows.
  *
- * BOM linkage (read from actual schema/code, see mrpService.js §6 "Default
- * BOM snapshot" for the established precedent in this codebase):
+ * Flow resolution (EU-3): each fab_items row is checked for its own
+ * flow_id FIRST — hand-typed/free-text items (no catalog_item_id) can carry
+ * a flow_id directly and must be eligible for materialization. Only when
+ * item.flow_id IS NULL do we fall back to the legacy catalog_item_id path
+ * (read from actual schema/code, see mrpService.js §6 "Default BOM snapshot"
+ * for the established precedent in this codebase):
  *   fab_items has NO bom_id column — it only carries catalog_item_id. There
  *   is no per-item mechanism recording which specific fab_material_boms row
  *   produced/applies to a given fab_items instance. mrpService.js resolves
@@ -21,11 +26,11 @@
  *   resolve its BOM as the row in fab_material_boms with
  *   catalog_item_id = fab_items.catalog_item_id AND is_default = 1, then look
  *   up an active fab_bom_flow_bindings row for that bom_id to get the flow_id.
- *   If a catalog_item_id has no default BOM, or the default BOM has no active
- *   binding, that fab_items instance is skipped (no tasks materialized for it).
+ *   If neither item.flow_id nor the catalog-BOM fallback resolves a flow,
+ *   that fab_items instance is skipped (no tasks materialized for it).
  *
  * Idempotency: before inserting, existing (item_id, flow_id) task combinations
- * for the project are loaded and skipped — materializeTasks can be re-run
+ * for the order are loaded and skipped — materializeTasks can be re-run
  * safely without creating duplicate task rows.
  *
  * computed_hours: derived via formulaEngine.evaluateFormula(operation.time_formula,
@@ -45,22 +50,21 @@ import { evaluateFormula } from './formulaEngine.js';
 
 /**
  * @param {number} companyId
- * @param {number} projectId
+ * @param {number} orderId
  * @returns {Promise<{ ok: boolean, itemsProcessed: number, itemsSkipped: number, tasksInserted: number }>}
  */
-export async function materializeTasks(companyId, projectId) {
+export async function materializeTasks(companyId, orderId) {
   const conn = await pool.getConnection();
 
   try {
     await conn.beginTransaction();
 
-    // ── 1. fab_items instances for this project ─────────────────────────────
+    // ── 1. fab_items instances for this order ────────────────────────────────
     const [items] = await conn.query(
-      `SELECT id, catalog_item_id
+      `SELECT id, catalog_item_id, flow_id
          FROM fab_items
-        WHERE company_id = ? AND project_id = ? AND deleted_at IS NULL
-          AND catalog_item_id IS NOT NULL`,
-      [companyId, projectId],
+        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+      [companyId, orderId],
     );
 
     if (items.length === 0) {
@@ -68,18 +72,25 @@ export async function materializeTasks(companyId, projectId) {
       return { ok: true, itemsProcessed: 0, itemsSkipped: 0, tasksInserted: 0 };
     }
 
-    const catalogItemIds = [...new Set(items.map((i) => i.catalog_item_id))];
+    const catalogItemIds = [
+      ...new Set(items.filter((i) => i.catalog_item_id != null).map((i) => i.catalog_item_id)),
+    ];
 
-    // ── 2. Default BOM per catalog_item_id ───────────────────────────────────
-    const [bomRows] = await conn.query(
-      `SELECT id AS bom_id, catalog_item_id
-         FROM fab_material_boms
-        WHERE company_id = ? AND is_default = 1 AND deleted_at IS NULL
-          AND catalog_item_id IN (?)`,
-      [companyId, catalogItemIds],
-    );
-    const bomIdByCatalogItemId = new Map(bomRows.map((r) => [r.catalog_item_id, r.bom_id]));
-    const bomIds = [...new Set(bomRows.map((r) => r.bom_id))];
+    // ── 2. Default BOM per catalog_item_id (legacy fallback, only for items
+    //      without their own flow_id) ────────────────────────────────────────
+    let bomIdByCatalogItemId = new Map();
+    let bomIds = [];
+    if (catalogItemIds.length > 0) {
+      const [bomRows] = await conn.query(
+        `SELECT id AS bom_id, catalog_item_id
+           FROM fab_material_boms
+          WHERE company_id = ? AND is_default = 1 AND deleted_at IS NULL
+            AND catalog_item_id IN (?)`,
+        [companyId, catalogItemIds],
+      );
+      bomIdByCatalogItemId = new Map(bomRows.map((r) => [r.catalog_item_id, r.bom_id]));
+      bomIds = [...new Set(bomRows.map((r) => r.bom_id))];
+    }
 
     // ── 3. Active flow binding per bom_id ────────────────────────────────────
     let flowIdByBomId = new Map();
@@ -94,8 +105,9 @@ export async function materializeTasks(companyId, projectId) {
       flowIdByBomId = new Map(bindingRows.map((r) => [r.bom_id, r.flow_id]));
     }
 
-    // ── 4. Flow steps per flow_id ─────────────────────────────────────────────
-    const flowIds = [...new Set([...flowIdByBomId.values()])];
+    // ── 4. Flow steps per flow_id (item.flow_id direct + legacy BOM fallback) ─
+    const itemFlowIds = items.filter((i) => i.flow_id != null).map((i) => i.flow_id);
+    const flowIds = [...new Set([...flowIdByBomId.values(), ...itemFlowIds])];
     const stepsByFlowId = new Map();
     if (flowIds.length > 0) {
       const [stepRows] = await conn.query(
@@ -142,8 +154,8 @@ export async function materializeTasks(companyId, projectId) {
     const [existingRows] = await conn.query(
       `SELECT DISTINCT item_id, flow_id
          FROM fab_project_tasks
-        WHERE company_id = ? AND project_id = ? AND deleted_at IS NULL`,
-      [companyId, projectId],
+        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+      [companyId, orderId],
     );
     const existingCombos = new Set(existingRows.map((r) => `${r.item_id}:${r.flow_id}`));
 
@@ -153,8 +165,11 @@ export async function materializeTasks(companyId, projectId) {
     let tasksInserted = 0;
 
     for (const item of items) {
-      const bomId = bomIdByCatalogItemId.get(item.catalog_item_id);
-      const flowId = bomId != null ? flowIdByBomId.get(bomId) : undefined;
+      let flowId = item.flow_id;
+      if (flowId == null) {
+        const bomId = bomIdByCatalogItemId.get(item.catalog_item_id);
+        flowId = bomId != null ? flowIdByBomId.get(bomId) : undefined;
+      }
       const steps = flowId != null ? stepsByFlowId.get(flowId) : undefined;
 
       if (!flowId || !steps || steps.length === 0) {
@@ -186,12 +201,12 @@ export async function materializeTasks(companyId, projectId) {
 
         await conn.query(
           `INSERT INTO fab_project_tasks
-             (company_id, project_id, item_id, flow_id, flow_step_id, operation_id,
+             (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
               seq_no, depends_on, resource_type_id, status, deps_cleared_at, computed_hours)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             companyId,
-            projectId,
+            orderId,
             item.id,
             flowId,
             step.id,

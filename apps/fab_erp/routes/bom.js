@@ -86,7 +86,7 @@ router.post('/bom/copy-template', protect, async (req, res) => {
 
     async function insertNode(node, parentItemId) {
       const [result] = await pool.query(
-        `INSERT INTO fab_items (company_id, project_id, parent_item_id, catalog_item_id, name, unit, qty)
+        `INSERT INTO fab_items (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [companyId, projectId, parentItemId, node.ref_catalog_item_id, node.name, node.unit, node.qty],
       );

@@ -291,17 +291,18 @@ export async function resolveTemplate(templateId, projectId, projectItemId, plan
   try {
     await conn.beginTransaction();
 
-    // ── 0. Resolve companyId from the project (all fab_erp tables are
+    // ── 0. Resolve companyId from the order (all fab_erp tables are
     //    company-scoped; the caller doesn't pass companyId explicitly per
-    //    the task's function signature, so we derive it here). ────────────
-    const [[project]] = await conn.query(
-      `SELECT company_id FROM fab_projects WHERE id = ? AND deleted_at IS NULL`,
+    //    the task's function signature, so we derive it here). fab_projects
+    //    was dropped and fab_items now scopes to fab_orders directly. ─────
+    const [[order]] = await conn.query(
+      `SELECT company_id FROM fab_orders WHERE id = ? AND deleted_at IS NULL`,
       [projectId],
     );
-    if (!project) {
-      throw new Error(`fab_projects ${projectId} not found`);
+    if (!order) {
+      throw new Error(`fab_orders ${projectId} not found`);
     }
-    companyId = project.company_id;
+    companyId = order.company_id;
 
     const [[template]] = await conn.query(
       `SELECT id FROM fab_bom_templates
@@ -405,7 +406,7 @@ export async function resolveTemplate(templateId, projectId, projectItemId, plan
         (node.node_role === 'raw_material' ? 'Raw Material (unresolved)' : node.node_role);
 
       const [result] = await conn.query(
-        `INSERT INTO fab_items (company_id, project_id, parent_item_id, catalog_item_id, name, unit, qty)
+        `INSERT INTO fab_items (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [companyId, projectId, parentItemId, catalogItemId, name, node.unit, node.qty],
       );

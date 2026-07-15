@@ -717,11 +717,12 @@
   "fabErpItem": {
     "table": "fab_items",
     "alias": "fi",
-    "writeFields": ["project_id", "parent_item_id", "catalog_item_id", "name", "unit", "qty"],
+    "writeFields": ["order_id", "flow_id", "parent_item_id", "catalog_item_id", "name", "unit", "qty"],
     "fields": {
       "id":              "fi.id",
       "companyId":       "fi.company_id",
-      "projectId":       "fi.project_id",
+      "orderId":         "fi.order_id",
+      "flowId":          "fi.flow_id",
       "parentItemId":    "fi.parent_item_id",
       "catalogItemId":   "fi.catalog_item_id",
       "name":            "fi.name",
@@ -729,15 +730,15 @@
       "qty":             "fi.qty",
       "createdAt":       "fi.created_at",
       "updatedAt":       "fi.updated_at",
-      "projectName":     "fproj_fi.name",
-      "projectCode":     "fproj_fi.code",
+      "orderNumber":     "ford_fi.order_number",
       "catalogItemCode": "fic_item.code",
       "catalogItemUnit": "fic_item.unit"
     },
     "fieldTypes": {
       "id":              "integer",
       "companyId":       "integer",
-      "projectId":       "integer",
+      "orderId":         "integer",
+      "flowId":          "integer",
       "parentItemId":    "integer",
       "catalogItemId":   "integer",
       "name":            "string",
@@ -745,17 +746,16 @@
       "qty":             "decimal",
       "createdAt":       "datetime",
       "updatedAt":       "datetime",
-      "projectName":     "string",
-      "projectCode":     "string",
+      "orderNumber":     "string",
       "catalogItemCode": "string",
       "catalogItemUnit": "string"
     },
     "relations": {
-      "project": {
-        "table": "fab_projects",
-        "alias": "fproj_fi",
-        "on":    "fi.project_id = fproj_fi.id",
-        "fields": ["projectName", "projectCode"]
+      "order": {
+        "table": "fab_orders",
+        "alias": "ford_fi",
+        "on":    "fi.order_id = ford_fi.id",
+        "fields": ["orderNumber"]
       },
       "catalogItem": {
         "table": "fab_item_catalog",
@@ -2023,7 +2023,7 @@
     "fields": {
       "id":                          "fpjt.id",
       "companyId":                   "fpjt.company_id",
-      "projectId":                   "fpjt.project_id",
+      "orderId":                     "fpjt.order_id",
       "itemId":                      "fpjt.item_id",
       "flowId":                      "fpjt.flow_id",
       "flowStepId":                  "fpjt.flow_step_id",
@@ -2046,8 +2046,7 @@
       "sortOrder":                   "fpjt.sort_order",
       "createdAt":                   "fpjt.created_at",
       "updatedAt":                   "fpjt.updated_at",
-      "projectName":                 "fproj_pt.name",
-      "projectCode":                 "fproj_pt.code",
+      "orderNumber":                 "ford_pt.order_number",
       "itemName":                    "fi_pt.name",
       "flowName":                    "fofl_pt.name",
       "flowCode":                    "fofl_pt.code",
@@ -2060,7 +2059,7 @@
     "fieldTypes": {
       "id":                          "integer",
       "companyId":                   "integer",
-      "projectId":                   "integer",
+      "orderId":                     "integer",
       "itemId":                      "integer",
       "flowId":                      "integer",
       "flowStepId":                  "integer",
@@ -2083,8 +2082,7 @@
       "sortOrder":                   "integer",
       "createdAt":                   "datetime",
       "updatedAt":                   "datetime",
-      "projectName":                 "string",
-      "projectCode":                 "string",
+      "orderNumber":                 "string",
       "itemName":                    "string",
       "flowName":                    "string",
       "flowCode":                    "string",
@@ -2095,11 +2093,11 @@
       "assignedResourceCode":        "string"
     },
     "relations": {
-      "project": {
-        "table": "fab_projects",
-        "alias": "fproj_pt",
-        "on":    "fpjt.project_id = fproj_pt.id",
-        "fields": ["projectName", "projectCode"]
+      "order": {
+        "table": "fab_orders",
+        "alias": "ford_pt",
+        "on":    "fpjt.order_id = ford_pt.id",
+        "fields": ["orderNumber"]
       },
       "item": {
         "table": "fab_items",

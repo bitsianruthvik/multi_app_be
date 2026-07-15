@@ -13,11 +13,11 @@
  *     for one fab_resources row, including unassigned tasks of matching type.
  *
  *   POST /tasks/materialize
- *     Body: { projectId }
+ *     Body: { orderId }
  *     Auth: JWT required (protect middleware).
  *     Authz: req.user.role === 'admin'  OR
  *            req.user.uiPermissions includes 'fab_erp_taskqueue_manage'
- *     Calls: materializeTasks(companyId, projectId)
+ *     Calls: materializeTasks(companyId, orderId)
  *     Returns:
  *       200  { ok: true, itemsProcessed, itemsSkipped, tasksInserted }
  *       400  { message: '...' }   — validation error
@@ -107,8 +107,8 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.id,
         t.operation_id AS operationId,
         op.name AS operationName,
-        t.project_id AS projectId,
-        p.name AS projectName,
+        t.order_id AS orderId,
+        fo.order_number AS orderNumber,
         t.item_id AS itemId,
         t.seq_no AS seqNo,
         t.status,
@@ -127,7 +127,7 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.updated_at AS updatedAt
       FROM fab_project_tasks t
       LEFT JOIN fab_operations op ON t.operation_id = op.id
-      LEFT JOIN fab_projects p ON t.project_id = p.id
+      LEFT JOIN fab_orders fo ON t.order_id = fo.id
       WHERE t.company_id = ?
         AND t.status IN ('eligible', 'in_progress', 'paused')
         AND t.deleted_at IS NULL
@@ -183,10 +183,10 @@ router.post('/tasks/materialize', protect, async (req, res) => {
   }
 
   // ── Input validation ───────────────────────────────────────────────────────
-  const { projectId } = req.body ?? {};
+  const { orderId } = req.body ?? {};
 
-  if (projectId === undefined || projectId === null || isNaN(Number(projectId))) {
-    return res.status(400).json({ message: 'projectId is required and must be a number.' });
+  if (orderId === undefined || orderId === null || isNaN(Number(orderId))) {
+    return res.status(400).json({ message: 'orderId is required and must be a number.' });
   }
 
   const companyId = user.companyId;
@@ -197,18 +197,18 @@ router.post('/tasks/materialize', protect, async (req, res) => {
 
   // ── Call service ───────────────────────────────────────────────────────────
   try {
-    const result = await materializeTasks(companyId, Number(projectId));
+    const result = await materializeTasks(companyId, Number(orderId));
 
     return res.status(200).json(result);
   } catch (err) {
-    logger.error({ err, companyId, projectId }, 'fab_erp tasks/materialize: unexpected error');
+    logger.error({ err, companyId, orderId }, 'fab_erp tasks/materialize: unexpected error');
     return res.status(500).json({ message: 'Internal server error during task materialization.' });
   }
 });
 
 // ── GET /tasks/graph ────────────────────────────────────────────────────────
-// EU-11: project-wide task DAG (all fab_items instances of a project in one
-// response — one DAG per project, not per item, per design).
+// EU-11: order-wide task DAG (all fab_items instances of an order in one
+// response — one DAG per order, not per item, per design).
 //
 // depends_on/edge-derivation logic below is a direct copy of
 // taskEngineService.js's parseDependsOn() + previousSeqNo() (see that file's
@@ -252,11 +252,11 @@ router.get('/tasks/graph', protect, async (req, res) => {
   }
 
   // ── Input validation ───────────────────────────────────────────────────────
-  const { projectId } = req.query;
-  const pid = Number(projectId);
+  const { orderId } = req.query;
+  const oid = Number(orderId);
 
-  if (!projectId || isNaN(pid) || pid <= 0) {
-    return res.status(400).json({ message: 'projectId query param is required and must be a positive integer.' });
+  if (!orderId || isNaN(oid) || oid <= 0) {
+    return res.status(400).json({ message: 'orderId query param is required and must be a positive integer.' });
   }
 
   const companyId = user.companyId;
@@ -287,9 +287,9 @@ router.get('/tasks/graph', protect, async (req, res) => {
        FROM fab_project_tasks t
        LEFT JOIN fab_operations op ON t.operation_id = op.id
        LEFT JOIN fab_items it ON t.item_id = it.id
-       WHERE t.company_id = ? AND t.project_id = ? AND t.deleted_at IS NULL
+       WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
        ORDER BY t.item_id ASC, t.flow_id ASC, t.seq_no ASC, t.id ASC`,
-      [companyId, pid],
+      [companyId, oid],
     );
 
     if (taskRows.length === 0) {
@@ -354,7 +354,7 @@ router.get('/tasks/graph', protect, async (req, res) => {
 
     return res.status(200).json({ ok: true, nodes, edges });
   } catch (err) {
-    logger.error({ err, companyId, projectId }, 'fab_erp tasks/graph: unexpected error');
+    logger.error({ err, companyId, orderId }, 'fab_erp tasks/graph: unexpected error');
     return res.status(500).json({ message: 'Internal server error fetching project task graph.' });
   }
 });

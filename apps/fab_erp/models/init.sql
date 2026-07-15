@@ -1965,3 +1965,68 @@ CREATE TABLE IF NOT EXISTS fab_bom_template_slots (
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_operation_flows' AND COLUMN_NAME='description');
 SET @sql = IF(@col=0,'ALTER TABLE fab_operation_flows ADD COLUMN description TEXT NULL','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===== Collapse fab_projects -> fab_orders (EU-1, 2026-07-15) =====
+-- A sales order IS the project now — fab_items.project_id and
+-- fab_project_tasks.project_id are repointed to fab_orders.id, and the
+-- standalone fab_projects / fab_project_items tables are dropped outright.
+-- Full clean removal (pre-live, user-approved), matching the MRP/Scheduler
+-- removal precedent at the top of this file. Idempotent — safe to re-run.
+
+-- fab_items' FK into fab_projects has an auto-generated constraint name
+-- that can differ across environments (local MySQL vs TiDB), so it must be
+-- looked up dynamically rather than hardcoded.
+SET @fk_name = (SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND REFERENCED_TABLE_NAME='fab_projects' LIMIT 1);
+SET @sql = IF(@fk_name IS NOT NULL, CONCAT('ALTER TABLE fab_items DROP FOREIGN KEY ', @fk_name), 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='project_id');
+SET @sql = IF(@col=1,'ALTER TABLE fab_items CHANGE COLUMN project_id order_id INT NOT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx_old = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_project');
+SET @idx_new = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_order');
+SET @sql = IF(@idx_old>0 AND @idx_new=0,'ALTER TABLE fab_items RENAME INDEX idx_fi_project TO idx_fi_order','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='flow_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN flow_id INT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_flow');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD KEY idx_fi_flow (flow_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Sanity check: every fab_items.order_id must map to a real fab_orders.id
+-- before the new FK can be safely added. If orphans exist, skip the FK add
+-- (no-op) rather than fail the whole script — do not force the FK against
+-- orphaned data.
+SET @fk_exists = (SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND CONSTRAINT_NAME='fab_items_order_fk');
+SET @orphan_count = (SELECT COUNT(*) FROM fab_items WHERE order_id NOT IN (SELECT id FROM fab_orders));
+SET @sql = IF(@fk_exists=0 AND @orphan_count=0,'ALTER TABLE fab_items ADD CONSTRAINT fab_items_order_fk FOREIGN KEY (order_id) REFERENCES fab_orders(id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- fab_project_tasks has no FK into fab_projects (only company_id is FK'd,
+-- confirmed via information_schema.KEY_COLUMN_USAGE) — this rename is
+-- metadata-only.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='project_id');
+SET @sql = IF(@col=1,'ALTER TABLE fab_project_tasks CHANGE COLUMN project_id order_id INT NOT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx_old = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND INDEX_NAME='idx_fpjt_project');
+SET @idx_new = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND INDEX_NAME='idx_fpjt_order');
+SET @sql = IF(@idx_old>0 AND @idx_new=0,'ALTER TABLE fab_project_tasks RENAME INDEX idx_fpjt_project TO idx_fpjt_order','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- fab_project_items has real FKs to fab_projects/fab_item_catalog/fab_plants;
+-- dropping the table drops those FKs with it. DROP TABLE IF EXISTS is valid
+-- MySQL syntax and needs no guard.
+DROP TABLE IF EXISTS fab_project_items;
+
+-- fab_projects can only be dropped once nothing still holds a live FK into
+-- it (fab_items' FK dropped above; fab_project_items dropped above). Recheck
+-- dynamically rather than assume — if an unexpected referencing table is
+-- found, skip the drop (no-op) instead of guessing.
+SET @other_fk = (SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME='fab_projects');
+SET @sql = IF(@other_fk=0,'DROP TABLE IF EXISTS fab_projects','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
