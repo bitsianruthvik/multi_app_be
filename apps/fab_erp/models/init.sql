@@ -2030,3 +2030,19 @@ DROP TABLE IF EXISTS fab_project_items;
 SET @other_fk = (SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME='fab_projects');
 SET @sql = IF(@other_fk=0,'DROP TABLE IF EXISTS fab_projects','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===== fab_orders.customer_id (EU-1 gap fix, 2026-07-16) =====
+-- resourceDef.json's fabErpOrder "customer" relation always joined
+-- fo.customer_id = fcus_o.id, but the EU-1 collapse of fab_projects into
+-- fab_orders never actually added that column — every fabErpOrder query
+-- failed with "Unknown column 'fo.customer_id' in 'on clause'", which the
+-- frontend swallows and renders as an empty Orders list. Plain INT + KEY
+-- index, no FK, matching the established cross-ref convention elsewhere in
+-- this file (see fab_operation_flow_steps).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='customer_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_orders ADD COLUMN customer_id INT NULL AFTER customer_name','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='idx_fo_customer');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_orders ADD KEY idx_fo_customer (customer_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
