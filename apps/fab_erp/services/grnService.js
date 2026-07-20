@@ -50,6 +50,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { reevaluateStockGatedTasks } from './taskGatingService.js';
 
 // Human-readable display string for fab_grn_lines.batch_code /
 // fab_stock_ledger.batch_code — denormalized, non-FK, still useful even
@@ -201,7 +202,17 @@ export async function postGrn(companyId, { header, lines }) {
 
     await conn.commit();
 
-    return { ok: true, grnId, lineCount: lines.length };
+    // Post-commit: unblock any tasks that were waiting on this stock to arrive.
+    // Best-effort — a hook failure must never fail an already-committed GRN.
+    let tasksCleared = [];
+    try {
+      const catalogItemIds = lines.map((l) => Number(l.catalog_item_id)).filter(Boolean);
+      tasksCleared = await reevaluateStockGatedTasks(conn, companyId, catalogItemIds);
+    } catch (hookErr) {
+      // swallow — GRN is committed; gating will still re-check on next event
+    }
+
+    return { ok: true, grnId, lineCount: lines.length, tasksCleared };
   } catch (err) {
     await conn.rollback();
     throw err;

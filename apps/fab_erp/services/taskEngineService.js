@@ -1,45 +1,29 @@
 /**
  * taskEngineService.js
  * ---------------------
- * EU-6: Dependency-clearing engine for fab_erp (event-driven).
+ * Dependency-clearing engine for fab_erp (event-driven).
  *
- * Exported function:
  *   onTaskComplete(companyId, taskId)
  *
- * Called (by a later unit, EU-8's task lifecycle "stop"/complete route — not
- * built here) right after a fab_project_tasks row has been set to
- * status = 'done'. Finds sibling tasks that were waiting on it and, for each
- * one whose full predecessor set is now done, flips it to 'eligible'.
+ * Called by POST /tasks/:id/stop right after a fab_project_tasks row is set to
+ * status = 'done'. It clears every task that was waiting on the just-completed
+ * one and is now fully ready. As of the 2026-07-20 remodel "ready" means BOTH
+ * process predecessors done AND gated inputs satisfied — the check lives in
+ * taskGatingService.tryClearTask, shared with materialization.
  *
- * Scoping rationale (non-obvious, load-bearing): depends_on stores seq_no
- * values, not row ids, and seq_no is only unique WITHIN one flow's step
- * sequence — it is not globally unique. materializeTasks() gives every
- * fab_items instance its own full copy of a flow's steps as separate
- * fab_project_tasks rows, so two different item_id instances running the
- * same flow_id both have a row with seq_no = 2. Every query in this file is
- * therefore scoped to (company_id, item_id, flow_id) of the just-completed
- * task, never to seq_no/flow_id alone, so completing task seq_no=2 for one
- * item instance can never clear a step on a sibling instance.
- *
- * "Runs after previous step" semantics (mirrors materializeTasks()): a task
- * whose depends_on is NULL/empty depends on the task in the same item_id +
- * flow_id scope with the largest seq_no strictly less than its own seq_no
- * (i.e. the step immediately before it in the flow). The very first step in
- * a flow has no such predecessor and is handled by materializeTasks() at
- * creation time, not here.
+ * Two kinds of successor are re-evaluated:
+ *   1. Intra-item — blocked tasks in the SAME (item_id, flow_id) instance.
+ *      (seq_no in depends_on is only unique within one flow's step sequence, so
+ *       this stays scoped to the completed task's item_id + flow_id.)
+ *   2. Cross-item (material) — when the completed task is its item's TERMINAL
+ *      step, the whole item is produced; any other item's task that lists this
+ *      item as a gated component input (fab_task_inputs.producing_item_id) is
+ *      re-evaluated. This is how a girder segment's crane-load step unblocks
+ *      once all its child parts are finished.
  */
 
 import { pool } from '../../../db.js';
-
-function parseDependsOn(csv) {
-  if (csv === null || csv === undefined) return [];
-  const str = String(csv).trim();
-  if (str === '') return [];
-  return str
-    .split(',')
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isInteger(n));
-}
+import { tryClearTask } from './taskGatingService.js';
 
 /**
  * @param {number} companyId
@@ -48,89 +32,51 @@ function parseDependsOn(csv) {
  */
 export async function onTaskComplete(companyId, taskId) {
   const conn = await pool.getConnection();
-
   try {
     await conn.beginTransaction();
 
-    // ── 1. The just-completed task, scoped to this company ──────────────────
     const [completedRows] = await conn.query(
-      `SELECT id, company_id, item_id, flow_id, seq_no, status
-         FROM fab_project_tasks
-        WHERE company_id = ? AND id = ? AND deleted_at IS NULL
-        LIMIT 1`,
+      `SELECT id, item_id, flow_id, seq_no FROM fab_project_tasks
+        WHERE company_id = ? AND id = ? AND deleted_at IS NULL LIMIT 1`,
       [companyId, taskId],
     );
-
     if (completedRows.length === 0) {
       await conn.commit();
       return { ok: false, completedTaskId: taskId, successorsCleared: [] };
     }
-
-    const completedTask = completedRows[0];
-    const { item_id: itemId, flow_id: flowId, seq_no: completedSeqNo } = completedTask;
-
-    // ── 2. All sibling tasks for this exact item_id + flow_id instance ──────
-    // (same company_id + item_id + flow_id — see file header for why this
-    // triple, not flow_id alone, is required)
-    const [siblingRows] = await conn.query(
-      `SELECT id, seq_no, depends_on, status
-         FROM fab_project_tasks
-        WHERE company_id = ? AND item_id = ? AND flow_id = ? AND deleted_at IS NULL`,
-      [companyId, itemId, flowId],
-    );
-
-    const statusBySeqNo = new Map(siblingRows.map((r) => [r.seq_no, r.status]));
-    const seqNos = siblingRows.map((r) => r.seq_no).sort((a, b) => a - b);
-
-    // previous seq_no in this flow instance, for NULL/empty depends_on tasks
-    function previousSeqNo(seqNo) {
-      let prev = null;
-      for (const s of seqNos) {
-        if (s < seqNo && (prev === null || s > prev)) prev = s;
-      }
-      return prev;
-    }
-
-    // ── 3. Successors of the completed task ──────────────────────────────────
-    const successors = [];
-    for (const row of siblingRows) {
-      if (row.status !== 'blocked') continue;
-
-      const deps = parseDependsOn(row.depends_on);
-      let predecessorSeqNos;
-
-      if (deps.length > 0) {
-        if (!deps.includes(completedSeqNo)) continue;
-        predecessorSeqNos = deps;
-      } else {
-        const prev = previousSeqNo(row.seq_no);
-        if (prev === null || prev !== completedSeqNo) continue;
-        predecessorSeqNos = [prev];
-      }
-
-      const allPredecessorsDone = predecessorSeqNos.every(
-        (sn) => statusBySeqNo.get(sn) === 'done',
-      );
-
-      if (allPredecessorsDone) successors.push(row.id);
-    }
-
-    // ── 4. Clear eligible successors ─────────────────────────────────────────
+    const ct = completedRows[0];
     const successorsCleared = [];
-    for (const successorId of successors) {
-      const [result] = await conn.query(
-        `UPDATE fab_project_tasks
-            SET status = 'eligible', deps_cleared_at = NOW(), queued_at = NOW()
-          WHERE company_id = ? AND item_id = ? AND flow_id = ? AND id = ?
-            AND status = 'blocked' AND deleted_at IS NULL`,
-        [companyId, itemId, flowId, successorId],
-      );
 
-      if (result.affectedRows > 0) successorsCleared.push(successorId);
+    // ── 1. Intra-item successors ────────────────────────────────────────────
+    const [siblings] = await conn.query(
+      `SELECT id FROM fab_project_tasks
+        WHERE company_id = ? AND item_id = ? AND flow_id = ?
+          AND status = 'blocked' AND deleted_at IS NULL`,
+      [companyId, ct.item_id, ct.flow_id],
+    );
+    for (const s of siblings) {
+      if (await tryClearTask(conn, companyId, s.id)) successorsCleared.push(s.id);
+    }
+
+    // ── 2. Cross-item (material) successors, only if this was the item's last step ─
+    const [terminal] = await conn.query(
+      `SELECT id FROM fab_project_tasks
+        WHERE company_id = ? AND item_id = ? AND deleted_at IS NULL
+        ORDER BY seq_no DESC LIMIT 1`,
+      [companyId, ct.item_id],
+    );
+    if (terminal.length && terminal[0].id === taskId) {
+      const [dependents] = await conn.query(
+        `SELECT DISTINCT task_id FROM fab_task_inputs
+          WHERE company_id = ? AND producing_item_id = ? AND gate = 1 AND deleted_at IS NULL`,
+        [companyId, ct.item_id],
+      );
+      for (const d of dependents) {
+        if (await tryClearTask(conn, companyId, d.task_id)) successorsCleared.push(d.task_id);
+      }
     }
 
     await conn.commit();
-
     return { ok: true, completedTaskId: taskId, successorsCleared };
   } catch (err) {
     await conn.rollback();

@@ -1833,6 +1833,72 @@ CREATE TABLE IF NOT EXISTS fab_bom_flow_bindings (
   KEY idx_fbfb_flow    (flow_id)
 );
 
+-- Per-flow-step material/component/consumable inputs. Declares what an
+-- operation consumes; ref_bom_role ('raw_material'|'child_parts') is resolved
+-- against the item's BOM at materialize time, ref_catalog_item_id is a fixed
+-- consumable. gate=1 means the step's eligibility waits on this input being
+-- available (stock present for materials/consumables, producing task done for
+-- components). See taskGatingService.js.
+CREATE TABLE IF NOT EXISTS fab_operation_flow_step_inputs (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  flow_step_id        INT           NOT NULL,
+  input_role          VARCHAR(30)   NOT NULL,
+  ref_catalog_item_id INT           NULL,
+  ref_bom_role        VARCHAR(50)   NULL,
+  qty                 DECIMAL(18,4)  NULL,
+  unit                VARCHAR(20)   NULL,
+  gate                TINYINT(1)    NOT NULL DEFAULT 0,
+  notes               VARCHAR(255)  NULL,
+  deleted_at          DATETIME      DEFAULT NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_ofsi_company (company_id),
+  KEY idx_ofsi_step    (flow_step_id)
+);
+
+-- What a flow step produces (for make→make chaining / traceability).
+CREATE TABLE IF NOT EXISTS fab_operation_flow_step_outputs (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  flow_step_id  INT           NOT NULL,
+  produces_role VARCHAR(50)   NOT NULL,
+  qty           DECIMAL(18,4)  NULL,
+  unit          VARCHAR(20)   NULL,
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_ofso_company (company_id),
+  KEY idx_ofso_step    (flow_step_id)
+);
+
+-- Materialized per-task copy of the flow step's gated inputs. Written by
+-- materializeTasks; satisfied_at is stamped when the input becomes available.
+-- A blocked task clears to 'eligible' only when process predecessors are done
+-- AND every gate=1 row here is satisfied.
+CREATE TABLE IF NOT EXISTS fab_task_inputs (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  task_id             INT           NOT NULL,
+  order_id            INT           NULL,
+  input_role          VARCHAR(30)   NOT NULL,
+  ref_catalog_item_id INT           NULL,
+  producing_item_id   INT           NULL,
+  qty                 DECIMAL(18,4)  NULL,
+  unit                VARCHAR(20)   NULL,
+  gate                TINYINT(1)    NOT NULL DEFAULT 0,
+  satisfied_at        DATETIME      NULL,
+  deleted_at          DATETIME      DEFAULT NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fti_company (company_id),
+  KEY idx_fti_task    (task_id),
+  KEY idx_fti_producing (producing_item_id)
+);
+
 -- ===== Project Task Queue (EU-4) =====
 -- Materialized, per-item tasks generated from an operation flow's steps.
 -- All cross-refs below (project_id, item_id, flow_id, flow_step_id, operation_id,
