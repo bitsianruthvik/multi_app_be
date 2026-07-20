@@ -267,19 +267,62 @@ router.get('/tasks/graph', protect, async (req, res) => {
 
   // ── Query logic ────────────────────────────────────────────────────────────
   try {
-    const [taskRows] = await pool.query(
-      `SELECT
+    // EU-1: optional itemId/scope narrowing. If itemId is absent or invalid,
+    // itemScopeIds stays null and the whole-order behavior is unchanged.
+    let itemScopeIds = null;
+    const itemIdRaw = req.query.itemId;
+
+    if (itemIdRaw !== undefined) {
+      const iid = Number(itemIdRaw);
+
+      if (Number.isInteger(iid) && iid > 0) {
+        const scope = req.query.scope === 'self' ? 'self' : 'subtree';
+
+        if (scope === 'self') {
+          itemScopeIds = [iid];
+        } else {
+          const [treeRows] = await pool.query(
+            `WITH RECURSIVE item_tree AS (
+               SELECT id, parent_item_id, 0 AS depth
+                 FROM fab_items
+                WHERE id = ? AND company_id = ? AND order_id = ? AND deleted_at IS NULL
+               UNION ALL
+               SELECT fi.id, fi.parent_item_id, item_tree.depth + 1
+                 FROM fab_items fi
+                 JOIN item_tree ON fi.parent_item_id = item_tree.id
+                WHERE item_tree.depth < 12 AND fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+             )
+             SELECT id FROM item_tree`,
+            [iid, companyId, oid, companyId, oid],
+          );
+          itemScopeIds = treeRows.map((r) => r.id);
+        }
+      }
+    }
+
+    if (itemScopeIds !== null && itemScopeIds.length === 0) {
+      return res.status(200).json({ ok: true, nodes: [], edges: [] });
+    }
+
+    let taskSql = `SELECT
          t.id,
          t.operation_id AS operationId,
          op.name AS operationName,
          t.item_id AS itemId,
          it.name AS itemName,
+         it.parent_item_id AS parentItemId,
          t.flow_id AS flowId,
          t.seq_no AS seqNo,
          t.depends_on AS dependsOn,
          t.status,
          t.resource_type_id AS resourceTypeId,
+         rt.name AS resourceTypeName,
          t.assigned_resource_id AS assignedResourceId,
+         t.deps_cleared_at AS depsClearedAt,
+         t.wait_working_minutes AS waitWorkingMinutes,
+         t.blocked_by_other_tasks_minutes AS blockedByOtherTasksMinutes,
+         t.idle_wait_minutes AS idleWaitMinutes,
+         t.delay_reason AS delayReason,
          t.started_at AS startedAt,
          t.paused_at AS pausedAt,
          t.completed_at AS completedAt,
@@ -287,10 +330,18 @@ router.get('/tasks/graph', protect, async (req, res) => {
        FROM fab_project_tasks t
        LEFT JOIN fab_operations op ON t.operation_id = op.id
        LEFT JOIN fab_items it ON t.item_id = it.id
-       WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
-       ORDER BY t.item_id ASC, t.flow_id ASC, t.seq_no ASC, t.id ASC`,
-      [companyId, oid],
-    );
+       LEFT JOIN fab_resource_types rt ON t.resource_type_id = rt.id
+       WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL AND t.status <> 'cancelled'`;
+    const taskParams = [companyId, oid];
+
+    if (itemScopeIds !== null) {
+      taskSql += ` AND t.item_id IN (?)`;
+      taskParams.push(itemScopeIds);
+    }
+
+    taskSql += ` ORDER BY t.item_id ASC, t.flow_id ASC, t.seq_no ASC, t.id ASC`;
+
+    const [taskRows] = await pool.query(taskSql, taskParams);
 
     if (taskRows.length === 0) {
       return res.status(200).json({ ok: true, nodes: [], edges: [] });
@@ -329,9 +380,44 @@ router.get('/tasks/graph', protect, async (req, res) => {
 
         for (const sn of predecessorSeqNos) {
           const fromId = taskIdBySeqNo.get(sn);
-          if (fromId != null) edges.push({ from: fromId, to: row.id });
+          if (fromId != null) edges.push({ from: fromId, to: row.id, kind: 'flow' });
         }
       }
+    }
+
+    // EU-1: cross-item (cross-BOM) component edges, derived from
+    // fab_task_inputs gated component links. An edge is drawn from the
+    // producing item's terminal task (max seq_no across ALL of that item's
+    // tasks, tie-break by max id — mirrors taskGatingService.terminalTaskDone)
+    // to the consuming task, regardless of the terminal task's status.
+    const taskIdSet = new Set(taskRows.map((r) => r.id));
+    const terminalTaskByItem = new Map();
+    for (const row of taskRows) {
+      const current = terminalTaskByItem.get(row.itemId);
+      if (!current || row.seqNo > current.seqNo || (row.seqNo === current.seqNo && row.id > current.id)) {
+        terminalTaskByItem.set(row.itemId, { id: row.id, seqNo: row.seqNo });
+      }
+    }
+
+    const [inputRows] = await pool.query(
+      `SELECT task_id AS taskId, producing_item_id AS producingItemId
+         FROM fab_task_inputs
+        WHERE company_id = ? AND order_id = ? AND input_role = 'component'
+          AND gate = 1 AND producing_item_id IS NOT NULL AND deleted_at IS NULL`,
+      [companyId, oid],
+    );
+
+    const seenComponentEdges = new Set();
+    for (const row of inputRows) {
+      if (!taskIdSet.has(row.taskId)) continue;
+      const terminal = terminalTaskByItem.get(row.producingItemId);
+      if (!terminal) continue;
+
+      const edgeKey = `${terminal.id}:${row.taskId}:component`;
+      if (seenComponentEdges.has(edgeKey)) continue;
+      seenComponentEdges.add(edgeKey);
+
+      edges.push({ from: terminal.id, to: row.taskId, kind: 'component' });
     }
 
     const nodes = taskRows.map((r) => ({
@@ -340,12 +426,19 @@ router.get('/tasks/graph', protect, async (req, res) => {
       operationName: r.operationName,
       itemId: r.itemId,
       itemName: r.itemName,
+      parentItemId: r.parentItemId,
       flowId: r.flowId,
       seqNo: r.seqNo,
       status: r.status,
       dependsOn: r.dependsOn,
       resourceTypeId: r.resourceTypeId,
+      resourceTypeName: r.resourceTypeName,
       assignedResourceId: r.assignedResourceId,
+      depsClearedAt: r.depsClearedAt,
+      waitWorkingMinutes: r.waitWorkingMinutes,
+      blockedByOtherTasksMinutes: r.blockedByOtherTasksMinutes,
+      idleWaitMinutes: r.idleWaitMinutes,
+      delayReason: r.delayReason,
       startedAt: r.startedAt,
       pausedAt: r.pausedAt,
       completedAt: r.completedAt,
@@ -356,6 +449,77 @@ router.get('/tasks/graph', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, orderId }, 'fab_erp tasks/graph: unexpected error');
     return res.status(500).json({ message: 'Internal server error fetching project task graph.' });
+  }
+});
+
+// ── GET /tasks/overview ─────────────────────────────────────────────────────
+// EU-2: per-order task-status rollup across the company. Only "active"
+// orders are returned — i.e. orders whose tasks aren't all done yet — sorted
+// by remaining (not-done) task count descending.
+
+router.get('/tasks/overview', protect, async (req, res) => {
+  const user = req.user;
+
+  // ── Authorization ──────────────────────────────────────────────────────────
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_taskengine_view';
+    const granted =
+      Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG);
+
+    if (!granted) {
+      logger.warn(
+        { userId: user?.id, requiredTag: REQUIRED_TAG },
+        'fab_erp tasks/overview: permission denied',
+      );
+      return res.status(403).json({
+        message: `Permission denied. Required: "${REQUIRED_TAG}".`,
+      });
+    }
+  }
+
+  const companyId = user.companyId;
+
+  if (!companyId) {
+    return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  }
+
+  // ── Query logic ────────────────────────────────────────────────────────────
+  try {
+    const [rows] = await pool.query(
+      `SELECT t.order_id AS orderId, fo.order_number AS orderNumber,
+              COUNT(*) AS total,
+              SUM(t.status = 'done') AS done,
+              SUM(t.status = 'in_progress') AS in_progress,
+              SUM(t.status IN ('blocked', 'eligible')) AS not_started,
+              SUM(t.status = 'paused') AS paused
+         FROM fab_project_tasks t
+         JOIN fab_orders fo ON fo.id = t.order_id AND fo.company_id = t.company_id
+        WHERE t.company_id = ? AND t.deleted_at IS NULL AND t.status <> 'cancelled'
+        GROUP BY t.order_id, fo.order_number`,
+      [companyId],
+    );
+
+    const orders = rows
+      .map((r) => ({
+        orderId: r.orderId,
+        orderNumber: r.orderNumber,
+        counts: {
+          total: Number(r.total),
+          done: Number(r.done),
+          in_progress: Number(r.in_progress),
+          not_started: Number(r.not_started),
+          paused: Number(r.paused),
+        },
+      }))
+      .filter((o) => o.counts.done < o.counts.total)
+      .sort((a, b) => (b.counts.total - b.counts.done) - (a.counts.total - a.counts.done));
+
+    return res.status(200).json({ ok: true, orders });
+  } catch (err) {
+    logger.error({ err, companyId }, 'fab_erp tasks/overview: unexpected error');
+    return res.status(500).json({ message: 'Internal server error fetching task overview.' });
   }
 });
 
