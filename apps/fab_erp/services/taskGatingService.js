@@ -20,6 +20,7 @@
  */
 
 import { evaluateFormula } from './formulaEngine.js';
+import { recordEvent, recordEvents } from './taskEventService.js';
 
 export function parseDependsOn(csv) {
   if (csv === null || csv === undefined) return [];
@@ -90,6 +91,10 @@ export async function taskInputsSatisfied(conn, companyId, taskId) {
     if (!(await inputSatisfiedLive(conn, companyId, inp))) return false;
     await conn.query('UPDATE fab_task_inputs SET satisfied_at = NOW() WHERE id = ?', [inp.id]);
   }
+  // Every gate=1 input is now satisfied — fire once per task, not per input row.
+  if (inputs.length > 0) {
+    await recordEvent({ companyId, taskId, type: 'materials_ready', source: 'system' });
+  }
   return true;
 }
 
@@ -111,7 +116,14 @@ export async function tryClearTask(conn, companyId, taskId) {
       WHERE id = ? AND status = 'blocked' AND deleted_at IS NULL`,
     [taskId],
   );
-  return u.affectedRows > 0;
+  const cleared = u.affectedRows > 0;
+  if (cleared) {
+    await recordEvents([
+      { companyId, taskId, type: 'deps_cleared', source: 'system' },
+      { companyId, taskId, type: 'queued', source: 'system' },
+    ]);
+  }
+  return cleared;
 }
 
 /**

@@ -2130,5 +2130,156 @@
         "fields": ["assignedResourceName", "assignedResourceCode"]
       }
     }
+  },
+
+  "fabErpTaskEvent": {
+    "table": "fab_task_events",
+    "alias": "fte",
+    "writeFields": [],
+    "fields": {
+      "id":                   "fte.id",
+      "companyId":            "fte.company_id",
+      "taskId":               "fte.task_id",
+      "eventType":            "fte.event_type",
+      "at":                   "fte.at",
+      "source":               "fte.source",
+      "enteredBy":            "fte.entered_by",
+      "note":                 "fte.note",
+      "supersededByEventId":  "fte.superseded_by_event_id",
+      "createdAt":            "fte.created_at",
+      "updatedAt":            "fte.updated_at"
+    },
+    "fieldTypes": {
+      "id":                   "integer",
+      "companyId":            "integer",
+      "taskId":               "integer",
+      "eventType":            "string",
+      "at":                   "datetime",
+      "source":               "string",
+      "enteredBy":            "integer",
+      "note":                 "string",
+      "supersededByEventId":  "integer",
+      "createdAt":            "datetime",
+      "updatedAt":            "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpResourceEvent": {
+    "table": "fab_resource_events",
+    "alias": "fre",
+    "writeFields": [],
+    "fields": {
+      "id":                   "fre.id",
+      "companyId":            "fre.company_id",
+      "resourceId":           "fre.resource_id",
+      "state":                "fre.state",
+      "reasonCode":           "fre.reason_code",
+      "at":                   "fre.at",
+      "source":               "fre.source",
+      "enteredBy":            "fre.entered_by",
+      "note":                 "fre.note",
+      "supersededByEventId":  "fre.superseded_by_event_id",
+      "createdAt":            "fre.created_at",
+      "updatedAt":            "fre.updated_at"
+    },
+    "fieldTypes": {
+      "id":                   "integer",
+      "companyId":            "integer",
+      "resourceId":           "integer",
+      "state":                "string",
+      "reasonCode":           "string",
+      "at":                   "datetime",
+      "source":               "string",
+      "enteredBy":            "integer",
+      "note":                 "string",
+      "supersededByEventId":  "integer",
+      "createdAt":            "datetime",
+      "updatedAt":            "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpResourceDowntimeReason": {
+    "table": "fab_resource_downtime_reasons",
+    "alias": "frdr",
+    "writeFields": [],
+    "fields": {
+      "id":         "frdr.id",
+      "companyId":  "frdr.company_id",
+      "code":       "frdr.code",
+      "label":      "frdr.label",
+      "active":     "frdr.active",
+      "createdAt":  "frdr.created_at",
+      "updatedAt":  "frdr.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "code":       "string",
+      "label":      "string",
+      "active":     "boolean",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpResourceOperator": {
+    "table": "fab_resource_operators",
+    "alias": "fro",
+    "writeFields": [],
+    "fields": {
+      "id":         "fro.id",
+      "companyId":  "fro.company_id",
+      "resourceId": "fro.resource_id",
+      "userId":     "fro.user_id",
+      "isPrimary":  "fro.is_primary",
+      "absentOn":   "fro.absent_on",
+      "createdAt":  "fro.created_at",
+      "updatedAt":  "fro.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "resourceId": "integer",
+      "userId":     "integer",
+      "isPrimary":  "boolean",
+      "absentOn":   "date",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpTaskWaitSegment": {
+    "table": "fab_task_wait_segments",
+    "alias": "ftws",
+    "writeFields": [],
+    "fields": {
+      "id":              "ftws.id",
+      "companyId":       "ftws.company_id",
+      "taskId":          "ftws.task_id",
+      "reason":          "ftws.reason",
+      "segStart":        "ftws.seg_start",
+      "segEnd":          "ftws.seg_end",
+      "workingMinutes":  "ftws.working_minutes",
+      "computedAt":      "ftws.computed_at",
+      "createdAt":       "ftws.created_at",
+      "updatedAt":       "ftws.updated_at"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "taskId":          "integer",
+      "reason":          "string",
+      "segStart":        "datetime",
+      "segEnd":          "datetime",
+      "workingMinutes":  "integer",
+      "computedAt":      "datetime",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime"
+    },
+    "relations": {}
   }
 }

@@ -5,6 +5,8 @@ import indexRoutes            from './routes/index.js';
 import { runMrp, markAutoRun } from './services/mrpService.js';
 import { pool }                from '../../db.js';
 import { logger }              from '../../core/utils/logger.js';
+import { getQueue }            from '../../core/jobs/queue.js';
+import attributionJobHandlers  from './workers/jobHandlers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -53,13 +55,33 @@ async function checkAndRunMrp() {
 export default {
   slug: 'fab_erp',
   resourceDefs,
-  jobHandlers: {},
+  jobHandlers: attributionJobHandlers,
 
   register(server) {
     server.use('/api/:companySlug/fab_erp', indexRoutes);
     // Tick every 60 s — checks each company's configured run time
     setInterval(checkAndRunMrp, 60 * 1000);
     logger.info('[mrp] per-company nightly scheduler started');
+
+    // EU-3: wait-attribution sweep every 15 min. When Redis is available we
+    // enqueue onto the 'fab_erp' Bull queue (processor wired by jobHandlers);
+    // when it isn't (getQueue → null, this repo's default) we run the sweep
+    // handler inline instead. Fully fire-and-forget — never throws into the tick.
+    setInterval(() => {
+      try {
+        const queue = getQueue('fab_erp');
+        if (queue) {
+          queue.add('fab_erp:attribution-sweep', {}).catch(() => {});
+        } else {
+          attributionJobHandlers['fab_erp:attribution-sweep']({}).catch((err) =>
+            logger.error({ err }, '[attribution] inline sweep failed'),
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, '[attribution] sweep tick failed');
+      }
+    }, 15 * 60 * 1000);
+    logger.info('[attribution] wait-attribution sweep scheduler started');
   },
 
   migrations: path.join(__dirname, 'models', 'init.sql'),

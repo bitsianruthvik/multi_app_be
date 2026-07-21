@@ -38,9 +38,11 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
+import { recordEvent } from '../services/taskEventService.js';
 import { materializeTasks } from '../services/taskInstanceService.js';
 import { computeTaskWaitMetrics } from '../services/taskWaitService.js';
 import { onTaskComplete } from '../services/taskEngineService.js';
+import { recomputeTaskAttribution } from '../services/taskAttributionService.js';
 
 const router = Router();
 
@@ -526,24 +528,15 @@ router.get('/tasks/overview', protect, async (req, res) => {
 // ── POST /tasks/:id/start ───────────────────────────────────────────────────
 // EU-8: Task lifecycle — start.
 //
-// Requires a `delay_reason` in the body, one of the fixed
-// fab_project_tasks.delay_reason ENUM values. Legal from status 'eligible'
-// (first start) or 'paused' (resume) — both require a fresh delay_reason,
-// since resuming after a pause is itself a delay event that needs its own
-// reason recorded, exactly like the initial start.
+// Legal from status 'eligible' (first start) or 'paused' (resume).
 //
 // Calls taskWaitService's computeTaskWaitMetrics(task, now) to compute
 // wait_working_minutes / blocked_by_other_tasks_minutes / idle_wait_minutes
-// as of now, then persists those three fields alongside delay_reason,
-// started_at = NOW(), and status = 'in_progress'.
-
-const DELAY_REASONS = [
-  'lack_of_manpower',
-  'machine_down',
-  'lack_of_consumable',
-  'planning_issue',
-  'minor_operational_delay',
-];
+// as of now, then persists those three fields alongside started_at = NOW()
+// and status = 'in_progress'.
+//
+// EU-2: also dual-writes a fab_task_events row — 'started' from 'eligible',
+// 'resumed' from 'paused'.
 
 router.post('/tasks/:id/start', protect, async (req, res) => {
   const user = req.user;
@@ -574,14 +567,7 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
     return res.status(400).json({ message: 'Task id must be a positive integer.' });
   }
 
-  const { delay_reason } = req.body ?? {};
-
-  if (!delay_reason || !DELAY_REASONS.includes(delay_reason)) {
-    return res.status(400).json({
-      message: `delay_reason is required and must be one of: ${DELAY_REASONS.join(', ')}.`,
-    });
-  }
-
+  // EU-2: delay_reason is no longer required/validated/persisted — accepted-and-ignored if present.
   const companyId = user.companyId;
 
   if (!companyId) {
@@ -611,6 +597,7 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       });
     }
 
+    const priorStatus = task.status;
     const now = new Date();
     const metrics = await computeTaskWaitMetrics(task, now);
 
@@ -619,7 +606,6 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
           SET wait_working_minutes = ?,
               blocked_by_other_tasks_minutes = ?,
               idle_wait_minutes = ?,
-              delay_reason = ?,
               started_at = NOW(),
               status = 'in_progress'
         WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
@@ -627,7 +613,6 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
         metrics.wait_working_minutes,
         metrics.blocked_by_other_tasks_minutes,
         metrics.idle_wait_minutes,
-        delay_reason,
         taskId,
         companyId,
       ],
@@ -637,11 +622,22 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       return res.status(404).json({ message: `Task with id ${taskId} not found.` });
     }
 
+    await recordEvent({
+      companyId,
+      taskId,
+      type: priorStatus === 'paused' ? 'resumed' : 'started',
+      enteredBy: user.id,
+    });
+
+    // EU-3: refresh wait attribution (fire-and-forget — never fails the response).
+    recomputeTaskAttribution(companyId, taskId).catch((err) =>
+      logger.error({ err, taskId }, 'attribution recompute failed'),
+    );
+
     return res.status(200).json({
       ok: true,
       taskId,
       status: 'in_progress',
-      delayReason: delay_reason,
       waitWorkingMinutes: metrics.wait_working_minutes,
       blockedByOtherTasksMinutes: metrics.blocked_by_other_tasks_minutes,
       idleWaitMinutes: metrics.idle_wait_minutes,
@@ -726,6 +722,8 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
       return res.status(404).json({ message: `Task with id ${taskId} not found.` });
     }
 
+    await recordEvent({ companyId, taskId, type: 'paused', enteredBy: user.id });
+
     return res.status(200).json({ ok: true, taskId, status: 'paused' });
   } catch (err) {
     logger.error({ err, companyId, taskId }, 'fab_erp tasks/pause: unexpected error');
@@ -808,6 +806,13 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       return res.status(404).json({ message: `Task with id ${taskId} not found.` });
     }
 
+    await recordEvent({ companyId, taskId, type: 'completed', enteredBy: user.id });
+
+    // EU-3: refresh wait attribution (fire-and-forget — never fails the response).
+    recomputeTaskAttribution(companyId, taskId).catch((err) =>
+      logger.error({ err, taskId }, 'attribution recompute failed'),
+    );
+
     const engineResult = await onTaskComplete(companyId, taskId);
 
     return res.status(200).json({
@@ -819,6 +824,96 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, taskId }, 'fab_erp tasks/stop: unexpected error');
     return res.status(500).json({ message: 'Internal server error stopping task.' });
+  }
+});
+
+// ── GET /tasks/:id/wait-breakdown ───────────────────────────────────────────
+// EU-3: cause-classified wait segments + totals for one task. Auth mirrors the
+// sibling task routes (admin bypass, else 'fab_erp_taskqueue_manage'). If the
+// task has no segments yet but exists and is past created_at, we compute on the
+// fly, then re-read. It's a GET, so it never shadows the POST /tasks/:id/... routes.
+
+router.get('/tasks/:id/wait-breakdown', protect, async (req, res) => {
+  const user = req.user;
+
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_taskqueue_manage';
+    const granted =
+      Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG);
+    if (!granted) {
+      logger.warn(
+        { userId: user?.id, requiredTag: REQUIRED_TAG },
+        'fab_erp tasks/wait-breakdown: permission denied',
+      );
+      return res.status(403).json({ message: `Permission denied. Required: "${REQUIRED_TAG}".` });
+    }
+  }
+
+  const taskId = Number(req.params.id);
+  if (!req.params.id || isNaN(taskId) || taskId <= 0) {
+    return res.status(400).json({ message: 'Task id must be a positive integer.' });
+  }
+
+  const companyId = user.companyId;
+  if (!companyId) {
+    return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  }
+
+  try {
+    const loadSegments = async () => {
+      const [rows] = await pool.query(
+        `SELECT reason, seg_start, seg_end, working_minutes
+           FROM fab_task_wait_segments
+          WHERE company_id = ? AND task_id = ? AND deleted_at IS NULL
+          ORDER BY seg_start ASC`,
+        [companyId, taskId],
+      );
+      return rows;
+    };
+
+    let rows = await loadSegments();
+
+    if (rows.length === 0) {
+      const [taskRows] = await pool.query(
+        `SELECT id, created_at FROM fab_project_tasks
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+          LIMIT 1`,
+        [taskId, companyId],
+      );
+      if (taskRows.length === 0) {
+        return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      }
+      const createdAt = taskRows[0].created_at ? new Date(taskRows[0].created_at) : null;
+      if (createdAt && createdAt < new Date()) {
+        await recomputeTaskAttribution(companyId, taskId);
+        rows = await loadSegments();
+      }
+    }
+
+    const totals = {};
+    let totalWaitMinutes = 0;
+    for (const r of rows) {
+      const wm = Number(r.working_minutes) || 0;
+      totals[r.reason] = (totals[r.reason] || 0) + wm;
+      totalWaitMinutes += wm;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      taskId,
+      totals,
+      totalWaitMinutes,
+      segments: rows.map((r) => ({
+        reason: r.reason,
+        segStart: r.seg_start,
+        segEnd: r.seg_end,
+        workingMinutes: Number(r.working_minutes) || 0,
+      })),
+    });
+  } catch (err) {
+    logger.error({ err, companyId, taskId }, 'fab_erp tasks/wait-breakdown: unexpected error');
+    return res.status(500).json({ message: 'Internal server error fetching wait breakdown.' });
   }
 });
 

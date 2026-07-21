@@ -13,6 +13,7 @@ import flowStepsRouter  from './flowSteps.js';
 import codegenRouter   from './codegen.js';
 import searchRouter    from './search.js';
 import tasksRouter     from './tasks.js';
+import machineStateRouter from './machineState.js';
 
 const router = Router();
 
@@ -32,5 +33,6 @@ router.use(flowStepsRouter);
 router.use(codegenRouter);
 router.use(searchRouter);
 router.use(tasksRouter);
+router.use(machineStateRouter);
 
 export default router;

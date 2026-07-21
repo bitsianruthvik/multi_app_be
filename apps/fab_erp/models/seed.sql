@@ -488,3 +488,33 @@ SELECT
 FROM features_capability fc
 WHERE fc.name = 'fab_erp_inventory_view_only'
   AND @pm_role_id IS NOT NULL;
+
+-- =============================================================================
+-- 7. MACHINE BOARD / MACHINE STATE  (EU-4, Shop-Floor Time Intelligence)
+-- =============================================================================
+-- Single permission tag for the whole Machine Board feature (GET board
+-- included — one tag per the EU-4 plan). Mirrors the fab_erp_taskengine_view
+-- block in seed_fab_erp_taskengine.sql (TM root): set-based, no @companyId
+-- to set — role_capability is granted to every fab_erp tenant's Admin role
+-- by joining companies -> apps -> roles, so this is safe to re-run in any
+-- environment (local MySQL + TiDB) without editing.
+
+INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
+  ('Manage Machine State',      'fab_erp_machine_state_manage', 'backend');
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_machine_state', JSON_ARRAYAGG(id)
+FROM features
+WHERE feature_tag IN ('fab_erp_machine_state_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (
+  SELECT 1 FROM features_capability WHERE name = 'fab_erp_machine_state'
+)
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, c.id, a.id, fc.capability_id
+FROM companies c
+JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
+JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
+JOIN features_capability fc ON fc.name = 'fab_erp_machine_state';

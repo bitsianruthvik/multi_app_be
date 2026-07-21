@@ -60,11 +60,11 @@ function toTimeString(t) {
 }
 
 /**
- * Overlap (in minutes) between a shift's wall-clock interval on `dateStr` and the
- * arbitrary [windowStart, windowEnd] Date window. Handles shifts that cross
- * midnight (end_time <= start_time).
+ * Overlap interval between a shift's wall-clock interval on `dateStr` and the
+ * arbitrary [windowStart, windowEnd] Date window, or null when they don't
+ * overlap. Handles shifts that cross midnight (end_time <= start_time).
  */
-function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd) {
+function shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEnd) {
   const shiftStart = new Date(`${dateStr}T${toTimeString(startTime)}Z`);
   let shiftEnd = new Date(`${dateStr}T${toTimeString(endTime)}Z`);
   if (shiftEnd <= shiftStart) {
@@ -72,8 +72,17 @@ function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd
   }
   const overlapStart = shiftStart > windowStart ? shiftStart : windowStart;
   const overlapEnd = shiftEnd < windowEnd ? shiftEnd : windowEnd;
-  const ms = overlapEnd.getTime() - overlapStart.getTime();
-  return ms > 0 ? ms / 60000 : 0;
+  return overlapEnd > overlapStart ? { start: overlapStart, end: overlapEnd } : null;
+}
+
+/**
+ * Overlap (in minutes) between a shift's wall-clock interval on `dateStr` and the
+ * arbitrary [windowStart, windowEnd] Date window. Handles shifts that cross
+ * midnight (end_time <= start_time).
+ */
+function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd) {
+  const iv = shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEnd);
+  return iv ? (iv.end.getTime() - iv.start.getTime()) / 60000 : 0;
 }
 
 // ─── resource/calendar resolution ──────────────────────────────────────────────
@@ -82,7 +91,7 @@ function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd
  * Resolve the plant a task's resource operates under: prefer the specifically
  * assigned resource's plant, fall back to the resource type's plant.
  */
-async function resolveTaskPlantId(companyId, task) {
+export async function resolveTaskPlantId(companyId, task) {
   if (task.assigned_resource_id) {
     const [[row]] = await pool.query(
       `SELECT plant_id FROM fab_resources
@@ -107,7 +116,7 @@ async function resolveTaskPlantId(companyId, task) {
  * plant-wide model with a broad company-wide fallback when the plant can't pin
  * down a calendar.
  */
-async function resolveCalendarIds(companyId, plantId) {
+export async function resolveCalendarIds(companyId, plantId) {
   if (plantId) {
     const [rows] = await pool.query(
       `SELECT id FROM fab_shift_calendars
@@ -173,20 +182,23 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
 }
 
 /**
- * Working minutes across `calendarIds` that fall inside [windowStart, windowEnd].
- * Walks every date the window touches (like capacityService's date-walk), applies
- * the working-day fallback described at the top of this file, then sums per-shift
- * wall-clock overlap with the window.
+ * Shared day-walk: collect the raw per-shift wall-clock overlap intervals that
+ * fall inside [windowStart, windowEnd]. Walks every date the window touches (like
+ * capacityService's date-walk) and applies the working-day fallback described at
+ * the top of this file. Intervals are returned un-merged (one per shift/day
+ * overlap) — callers either sum their durations (working-minutes) or merge them
+ * into a union of in-shift time (working-intervals). Factored out so both public
+ * consumers below share exactly one copy of the calendar logic.
  */
-async function workingMinutesInWindow(companyId, calendarIds, windowStart, windowEnd) {
-  if (!(windowEnd > windowStart) || calendarIds.length === 0) return 0;
+async function collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd) {
+  if (!(windowEnd > windowStart) || calendarIds.length === 0) return [];
 
   const dateFrom = toYMD(windowStart);
   const dateTo = toYMD(windowEnd);
   const { shiftsByCalendar, calendarDayMap, calendarsWithRows } =
     await loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo);
 
-  let totalMinutes = 0;
+  const intervals = [];
   for (const date of allDatesInRange(dateFrom, dateTo)) {
     for (const calId of calendarIds) {
       const shifts = shiftsByCalendar[calId];
@@ -203,13 +215,40 @@ async function workingMinutesInWindow(companyId, calendarIds, windowStart, windo
       if (!isWorking) continue;
 
       for (const shift of shifts) {
-        totalMinutes += shiftOverlapMinutes(
+        const iv = shiftOverlapInterval(
           date, shift.start_time, shift.end_time, windowStart, windowEnd,
         );
+        if (iv) intervals.push(iv);
       }
     }
   }
+  return intervals;
+}
+
+/**
+ * Working minutes across `calendarIds` that fall inside [windowStart, windowEnd].
+ * Sums per-shift wall-clock overlap with the window (behaviorally identical to the
+ * pre-refactor implementation — overlapping calendars/shifts are summed, not
+ * de-duplicated, so callers relying on the historical number are unaffected).
+ */
+async function workingMinutesInWindow(companyId, calendarIds, windowStart, windowEnd) {
+  const intervals = await collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd);
+  let totalMinutes = 0;
+  for (const iv of intervals) {
+    totalMinutes += (iv.end.getTime() - iv.start.getTime()) / 60000;
+  }
   return totalMinutes;
+}
+
+/**
+ * Merged union of in-shift [start, end] Date intervals inside [windowStart,
+ * windowEnd] — the same per-day shift-overlap logic as workingMinutesInWindow,
+ * but overlapping shifts/calendars are merged into non-overlapping wall-clock
+ * coverage (so slicing a window by cause never double-counts a minute).
+ */
+export async function workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd) {
+  const intervals = await collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd);
+  return mergeIntervals(intervals);
 }
 
 // ─── other-tasks overlap (blocked_by_other_tasks_minutes) ─────────────────────
@@ -219,7 +258,7 @@ async function workingMinutesInWindow(companyId, calendarIds, windowStart, windo
  * when no specific resource is assigned yet) whose [started_at, completed_at||now]
  * span overlaps [windowStart, windowEnd].
  */
-async function fetchOverlappingOtherTasks(companyId, task, windowStart, windowEnd, now) {
+export async function fetchOverlappingOtherTasks(companyId, task, windowStart, windowEnd, now) {
   const params = [companyId, task.id];
   let matchSql;
   if (task.assigned_resource_id) {
@@ -254,7 +293,7 @@ async function fetchOverlappingOtherTasks(companyId, task, windowStart, windowEn
 }
 
 /** Merge overlapping/adjacent [start, end] intervals to avoid double-counting. */
-function mergeIntervals(intervals) {
+export function mergeIntervals(intervals) {
   const sorted = intervals.slice().sort((a, b) => a.start - b.start);
   const merged = [];
   for (const iv of sorted) {
