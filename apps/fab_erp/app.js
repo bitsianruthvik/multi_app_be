@@ -82,6 +82,26 @@ export default {
       }
     }, 15 * 60 * 1000);
     logger.info('[attribution] wait-attribution sweep scheduler started');
+
+    // EU-14: operation-stats (learned durations) recompute, once per day.
+    // Mirrors the attribution-sweep tick exactly: same null-guard-inline-
+    // fallback, just a 24h period instead of 15 min (freshness doesn't matter
+    // much for a rolling median/p80/ewma over historical completions).
+    setInterval(() => {
+      try {
+        const queue = getQueue('fab_erp');
+        if (queue) {
+          queue.add('fab_erp:operation-stats', {}).catch(() => {});
+        } else {
+          attributionJobHandlers['fab_erp:operation-stats']({}).catch((err) =>
+            logger.error({ err }, '[operation-stats] inline recompute failed'),
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, '[operation-stats] recompute tick failed');
+      }
+    }, 24 * 60 * 60 * 1000);
+    logger.info('[operation-stats] nightly learned-duration scheduler started');
   },
 
   migrations: path.join(__dirname, 'models', 'init.sql'),

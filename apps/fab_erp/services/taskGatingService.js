@@ -19,8 +19,82 @@
  * before (predecessor-only gating), so other tenants/flows are unaffected.
  */
 
+import { pool } from '../../../db.js';
 import { evaluateFormula } from './formulaEngine.js';
 import { recordEvent, recordEvents } from './taskEventService.js';
+import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
+import { getUsableStat } from './operationStatsService.js';
+
+/** Best-effort machine name for a resource id (falls back to "#<id>"). */
+async function resourceName(exec, companyId, resourceId) {
+  if (!resourceId) return null;
+  try {
+    const [[r]] = await exec.query(
+      `SELECT name FROM fab_resources WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [resourceId, companyId],
+    );
+    return r?.name || `#${resourceId}`;
+  } catch {
+    return `#${resourceId}`;
+  }
+}
+
+/**
+ * Output-blocked check (EU-8, Locked Decision 4). A task is output-blocked ONLY
+ * when BOTH sides are simultaneously full:
+ *   (a) the successor machine's INPUT buffer is at/over its block_pct, AND
+ *   (b) this task's OWN machine's OUTPUT buffer is at/over its block_pct.
+ * If either buffer is absent (not configured), the machine is NEVER blocking —
+ * buffers are opt-in, so the common no-buffer case always returns blocked:false.
+ *
+ * @param {number} companyId
+ * @param {object} task  needs at least `id` (+ assigned_resource_id if known;
+ *                       resolveNextInputBuffer re-reads item/flow/seq as needed).
+ * @param {import('mysql2/promise').Connection} [conn]
+ * @returns {Promise<{blocked:boolean, reason?:string}>}
+ */
+export async function isOutputBlocked(companyId, task, conn) {
+  const exec = conn ?? pool;
+
+  // (a) successor machine's input buffer — no next input buffer ⇒ never blocking.
+  const nextBuf = await resolveNextInputBuffer(companyId, task, conn);
+  if (!nextBuf) return { blocked: false };
+  const nextLoad = await loadOf(companyId, nextBuf.id, conn);
+  if (statusFor(nextLoad.pct, nextLoad.warnPct, nextLoad.blockPct) !== 'block') {
+    return { blocked: false };
+  }
+
+  // (b) this task's OWN output buffer — no output buffer ⇒ never blocking.
+  let assignedResourceId = task.assigned_resource_id;
+  if (assignedResourceId === undefined) {
+    const [[t]] = await exec.query(
+      `SELECT assigned_resource_id FROM fab_project_tasks
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [task.id, companyId],
+    );
+    assignedResourceId = t?.assigned_resource_id ?? null;
+  }
+  if (!assignedResourceId) return { blocked: false };
+  const [[ownBuf]] = await exec.query(
+    `SELECT id FROM fab_buffers
+      WHERE company_id = ? AND resource_id = ? AND kind = 'output'
+        AND active = 1 AND deleted_at IS NULL LIMIT 1`,
+    [companyId, assignedResourceId],
+  );
+  if (!ownBuf) return { blocked: false };
+  const ownLoad = await loadOf(companyId, ownBuf.id, conn);
+  if (statusFor(ownLoad.pct, ownLoad.warnPct, ownLoad.blockPct) !== 'block') {
+    return { blocked: false };
+  }
+
+  // Both sides full — genuinely blocked. Build a best-effort human reason.
+  const nextName = await resourceName(exec, companyId, nextBuf.resource_id);
+  const thisName = await resourceName(exec, companyId, assignedResourceId);
+  return {
+    blocked: true,
+    reason: `blocked because ${nextName} input buffer is full and ${thisName} output staging is full`,
+  };
+}
 
 export function parseDependsOn(csv) {
   if (csv === null || csv === undefined) return [];
@@ -279,18 +353,28 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       const op = opById.get(step.operation_id);
       const resourceTypeId = step.resource_type_id ?? op?.default_resource_type_id ?? null;
       const opValues = opVarsByOpId.get(step.operation_id) ?? {};
-      const computedHours = op
+      const formulaHours = op
         ? await evaluateFormula(op.time_formula, {}, {}, resourceTypeId, opValues)
         : null;
+
+      // EU-15: prefer the learned p80 touch-time (converted to hours) as the
+      // planning estimate when enough real samples exist; keep the formula's
+      // value in formula_hours for comparison. No usable stat → computed_hours
+      // stays the formula value and formula_hours is left NULL (no distinct
+      // learned value to preserve).
+      const stat = await getUsableStat(companyId, step.operation_id, resourceTypeId);
+      const learnedHours = stat && stat.p80_minutes != null ? Number(stat.p80_minutes) / 60 : null;
+      const computedHours = learnedHours != null ? learnedHours : formulaHours;
+      const preservedFormulaHours = learnedHours != null ? formulaHours : null;
 
       // insert task as 'blocked' first; clear at the end once inputs exist
       const [ins] = await conn.query(
         `INSERT INTO fab_project_tasks
            (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
-            seq_no, depends_on, resource_type_id, status, computed_hours)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?)`,
+            seq_no, depends_on, resource_type_id, status, computed_hours, formula_hours)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?)`,
         [companyId, orderId, item.id, flowId, step.id, step.operation_id,
-         step.seq_no, step.depends_on, resourceTypeId, computedHours],
+         step.seq_no, step.depends_on, resourceTypeId, computedHours, preservedFormulaHours],
       );
       const taskId = ins.insertId;
       tasksInserted++;

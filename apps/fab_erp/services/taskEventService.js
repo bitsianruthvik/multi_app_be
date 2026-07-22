@@ -75,3 +75,61 @@ export async function recordEvents(events) {
     return { ok: false };
   }
 }
+
+/**
+ * EU-10: supersede a fab_task_events row by inserting a corrected copy (same
+ * task_id + event_type, corrected `at`, source 'backfill') and stamping the old
+ * row's superseded_by_event_id with the new id — in ONE transaction. The old
+ * row's `at` is never mutated; corrections are append-only for auditability.
+ *
+ * Unlike recordEvent/recordEvents (which swallow errors so lifecycle writes are
+ * never broken by event logging), this is user-initiated correction: a genuine
+ * DB failure MUST surface, so this rethrows after rolling back.
+ *
+ * @param {object} params
+ * @param {number} params.companyId
+ * @param {number} params.oldEventId
+ * @param {Date|string|null} params.newAt   corrected timestamp (COALESCE→NOW() if null)
+ * @param {number|null} [params.enteredBy]
+ * @param {string|null} [params.note]
+ * @returns {Promise<{oldEventId:number, newEventId:number}>}
+ * @throws if the event is missing/already-superseded or on any DB error
+ */
+export async function supersedeEvent({ companyId, oldEventId, newAt, enteredBy = null, note = null }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT task_id, event_type FROM fab_task_events
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND superseded_by_event_id IS NULL
+        LIMIT 1`,
+      [oldEventId, companyId],
+    );
+    if (rows.length === 0) {
+      throw new Error(`supersedeEvent: event ${oldEventId} not found or already superseded`);
+    }
+    const { task_id, event_type } = rows[0];
+
+    const [ins] = await conn.query(
+      `INSERT INTO fab_task_events (company_id, task_id, event_type, at, source, entered_by, note)
+       VALUES (?, ?, ?, COALESCE(?, NOW()), 'backfill', ?, ?)`,
+      [companyId, task_id, event_type, newAt, enteredBy, note],
+    );
+    const newEventId = ins.insertId;
+
+    await conn.query(
+      `UPDATE fab_task_events SET superseded_by_event_id = ?
+        WHERE id = ? AND company_id = ?`,
+      [newEventId, oldEventId, companyId],
+    );
+
+    await conn.commit();
+    return { oldEventId, newEventId };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}

@@ -14,6 +14,9 @@ import codegenRouter   from './codegen.js';
 import searchRouter    from './search.js';
 import tasksRouter     from './tasks.js';
 import machineStateRouter from './machineState.js';
+import buffersRouter   from './buffers.js';
+import reconciliationRouter from './reconciliation.js';
+import analyticsRouter   from './analytics.js';
 
 const router = Router();
 
@@ -34,5 +37,8 @@ router.use(codegenRouter);
 router.use(searchRouter);
 router.use(tasksRouter);
 router.use(machineStateRouter);
+router.use(buffersRouter);
+router.use(reconciliationRouter);
+router.use(analyticsRouter);
 
 export default router;

@@ -38,13 +38,46 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
-import { recordEvent } from '../services/taskEventService.js';
+import { recordEvent, recordEvents, supersedeEvent } from '../services/taskEventService.js';
 import { materializeTasks } from '../services/taskInstanceService.js';
-import { computeTaskWaitMetrics } from '../services/taskWaitService.js';
+import {
+  computeTaskWaitMetrics,
+  resolveTaskPlantId,
+  resolveCalendarIds,
+  workingIntervalsInWindow,
+  fetchOverlappingOtherTasks,
+} from '../services/taskWaitService.js';
 import { onTaskComplete } from '../services/taskEngineService.js';
-import { recomputeTaskAttribution } from '../services/taskAttributionService.js';
+import { recomputeTaskAttribution, recomputeForResource } from '../services/taskAttributionService.js';
+import * as bufferService from '../services/bufferService.js';
+import { isOutputBlocked } from '../services/taskGatingService.js';
 
 const router = Router();
+
+// ── EU-10 helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Format a JS Date as a MySQL DATETIME literal in UTC wall-clock
+ * ('YYYY-MM-DD HH:MM:SS'). The wait/calendar math in taskWaitService works in
+ * UTC, so storing the same UTC instant keeps backfilled rows consistent with the
+ * shift-membership warnings computed against them.
+ */
+function toSqlUtc(d) {
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * True when `tsDate` does NOT fall inside any working shift interval of the given
+ * calendars. Probes a ±1 min window around the instant and tests membership.
+ * Callers must guard on calendarIds.length > 0 (no calendars = cannot judge).
+ */
+async function timestampOutsideShift(companyId, calendarIds, tsDate) {
+  const windowStart = new Date(tsDate.getTime() - 60000);
+  const windowEnd = new Date(tsDate.getTime() + 60000);
+  const intervals = await workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd);
+  const t = tsDate.getTime();
+  return !intervals.some((iv) => iv.start.getTime() <= t && t <= iv.end.getTime());
+}
 
 // ── GET /tasks/queue-summary ────────────────────────────────────────────────
 
@@ -597,6 +630,20 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       });
     }
 
+    // ── EU-8 Start guard: refuse to start an output-blocked task ───────────────
+    // Both the successor's input buffer and this machine's output staging must be
+    // full (see isOutputBlocked). Admins may force past it with body {force:true},
+    // which is audited via a state_note event; non-admins are blocked regardless.
+    const forced = req.body?.force === true;
+    const outBlock = await isOutputBlocked(companyId, task);
+    if (outBlock.blocked && !(forced && isAdmin)) {
+      return res.status(409).json({
+        ok: false,
+        code: 'OUTPUT_BLOCKED',
+        message: outBlock.reason,
+      });
+    }
+
     const priorStatus = task.status;
     const now = new Date();
     const metrics = await computeTaskWaitMetrics(task, now);
@@ -628,6 +675,18 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       type: priorStatus === 'paused' ? 'resumed' : 'started',
       enteredBy: user.id,
     });
+
+    // EU-8: audit an admin override of the output-blocked guard.
+    if (outBlock.blocked && forced && isAdmin) {
+      await recordEvent({
+        companyId,
+        taskId,
+        type: 'state_note',
+        source: 'live',
+        enteredBy: user.id,
+        note: `force-started while output_blocked: ${outBlock.reason}`,
+      });
+    }
 
     // EU-3: refresh wait attribution (fire-and-forget — never fails the response).
     recomputeTaskAttribution(companyId, taskId).catch((err) =>
@@ -813,6 +872,12 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       logger.error({ err, taskId }, 'attribution recompute failed'),
     );
 
+    // EU-7: place the produced item into the machine's output buffer, if one is
+    // configured (opt-in). Best-effort — must never fail the stop response.
+    bufferService.placeOutput(companyId, { id: taskId }).catch((err) =>
+      logger.error({ err, taskId }, 'buffer placeOutput failed'),
+    );
+
     const engineResult = await onTaskComplete(companyId, taskId);
 
     return res.status(200).json({
@@ -914,6 +979,330 @@ router.get('/tasks/:id/wait-breakdown', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, taskId }, 'fab_erp tasks/wait-breakdown: unexpected error');
     return res.status(500).json({ message: 'Internal server error fetching wait breakdown.' });
+  }
+});
+
+// ── POST /tasks/:id/events/backfill ─────────────────────────────────────────
+// EU-10: enter a full past lifecycle (started → pauses → completed) in one call.
+// Distinct suffix from the /tasks/:id/start|pause|stop POSTs, so no route clash.
+//
+// Validation philosophy: shop-floor times go MISSING when a form rejects messy
+// input, so we WARN-AND-FLAG (warnings[]) rather than reject for calendar/overlap
+// anomalies. We HARD-reject (400) only for logically-impossible orderings:
+// completed_at <= started_at; a pause outside [started_at, completed_at];
+// resumed_at <= its paused_at.
+
+router.post('/tasks/:id/events/backfill', protect, async (req, res) => {
+  const user = req.user;
+
+  // ── Authorization ──────────────────────────────────────────────────────────
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_time_backfill';
+    const granted =
+      Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG);
+
+    if (!granted) {
+      logger.warn(
+        { userId: user?.id, requiredTag: REQUIRED_TAG },
+        'fab_erp tasks/events/backfill: permission denied',
+      );
+      return res.status(403).json({
+        message: `Permission denied. Required: "${REQUIRED_TAG}".`,
+      });
+    }
+  }
+
+  // ── Input validation ───────────────────────────────────────────────────────
+  const taskId = Number(req.params.id);
+
+  if (!req.params.id || isNaN(taskId) || taskId <= 0) {
+    return res.status(400).json({ message: 'Task id must be a positive integer.' });
+  }
+
+  const companyId = user.companyId;
+
+  if (!companyId) {
+    return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  }
+
+  const { started_at, completed_at, pauses, note } = req.body ?? {};
+
+  const startedDate = started_at ? new Date(started_at) : null;
+  if (!startedDate || isNaN(startedDate.getTime())) {
+    return res.status(400).json({ message: 'started_at is required and must be a valid datetime.' });
+  }
+
+  let completedDate = null;
+  if (completed_at !== undefined && completed_at !== null && completed_at !== '') {
+    completedDate = new Date(completed_at);
+    if (isNaN(completedDate.getTime())) {
+      return res.status(400).json({ message: 'completed_at must be a valid datetime.' });
+    }
+    // HARD reject: a completed task must finish strictly after it started.
+    if (completedDate.getTime() <= startedDate.getTime()) {
+      return res.status(400).json({ message: 'completed_at must be after started_at.' });
+    }
+  }
+
+  const pauseList = Array.isArray(pauses) ? pauses : [];
+  const parsedPauses = [];
+  for (const p of pauseList) {
+    const pausedDate = p?.paused_at ? new Date(p.paused_at) : null;
+    if (!pausedDate || isNaN(pausedDate.getTime())) {
+      return res.status(400).json({ message: 'Each pause requires a valid paused_at.' });
+    }
+    let resumedDate = null;
+    if (p?.resumed_at !== undefined && p?.resumed_at !== null && p?.resumed_at !== '') {
+      resumedDate = new Date(p.resumed_at);
+      if (isNaN(resumedDate.getTime())) {
+        return res.status(400).json({ message: 'resumed_at must be a valid datetime.' });
+      }
+      // HARD reject: a resume must come strictly after its pause.
+      if (resumedDate.getTime() <= pausedDate.getTime()) {
+        return res.status(400).json({ message: 'resumed_at must be after paused_at.' });
+      }
+    }
+    // HARD reject: a pause must fall within [started_at, completed_at].
+    if (pausedDate.getTime() < startedDate.getTime()) {
+      return res.status(400).json({ message: 'A pause falls before started_at.' });
+    }
+    if (completedDate &&
+        (pausedDate.getTime() > completedDate.getTime() ||
+         (resumedDate && resumedDate.getTime() > completedDate.getTime()))) {
+      return res.status(400).json({ message: 'A pause falls after completed_at.' });
+    }
+    parsedPauses.push({ pausedDate, resumedDate });
+  }
+
+  // ── Query logic ────────────────────────────────────────────────────────────
+  try {
+    const [taskRows] = await pool.query(
+      `SELECT id, company_id, resource_type_id, assigned_resource_id, status
+         FROM fab_project_tasks
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+      [taskId, companyId],
+    );
+
+    if (taskRows.length === 0) {
+      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+    }
+
+    const task = taskRows[0];
+
+    // ── Soft validation → warnings[] (never rejects) ─────────────────────────
+    const warnings = [];
+    const now = new Date();
+
+    const plantId = await resolveTaskPlantId(companyId, task);
+    const calendarIds = await resolveCalendarIds(companyId, plantId);
+
+    if (calendarIds.length > 0) {
+      const checks = [['started_at', startedDate]];
+      for (const pp of parsedPauses) {
+        checks.push(['paused_at', pp.pausedDate]);
+        if (pp.resumedDate) checks.push(['resumed_at', pp.resumedDate]);
+      }
+      if (completedDate) checks.push(['completed_at', completedDate]);
+
+      for (const [label, d] of checks) {
+        if (await timestampOutsideShift(companyId, calendarIds, d)) {
+          warnings.push(`${label} (${d.toISOString()}) falls outside the task's shift calendar.`);
+        }
+      }
+    }
+
+    const overlapEnd = completedDate || now;
+    const overlaps = await fetchOverlappingOtherTasks(companyId, task, startedDate, overlapEnd, now);
+    if (overlaps.length > 0) {
+      warnings.push(`[started_at, completed_at] overlaps ${overlaps.length} other task(s) on the same machine.`);
+    }
+
+    // ── Write events (source 'backfill', entered_by = req.user.id) ───────────
+    const events = [];
+    events.push({ companyId, taskId, type: 'started', at: toSqlUtc(startedDate), source: 'backfill', enteredBy: user.id, note: note ?? null });
+    for (const pp of parsedPauses) {
+      events.push({ companyId, taskId, type: 'paused', at: toSqlUtc(pp.pausedDate), source: 'backfill', enteredBy: user.id, note: note ?? null });
+      if (pp.resumedDate) {
+        events.push({ companyId, taskId, type: 'resumed', at: toSqlUtc(pp.resumedDate), source: 'backfill', enteredBy: user.id, note: note ?? null });
+      }
+    }
+    if (completedDate) {
+      events.push({ companyId, taskId, type: 'completed', at: toSqlUtc(completedDate), source: 'backfill', enteredBy: user.id, note: note ?? null });
+    }
+    await recordEvents(events);
+
+    // ── Mirror timestamp columns + status onto fab_project_tasks ─────────────
+    // (keeps the row consistent with its events, like the live start/stop routes)
+    const lastPausedAt = parsedPauses.length > 0
+      ? toSqlUtc(parsedPauses[parsedPauses.length - 1].pausedDate)
+      : null;
+    const newStatus = completedDate ? 'done' : 'in_progress';
+
+    await pool.query(
+      `UPDATE fab_project_tasks
+          SET started_at = ?,
+              paused_at = ?,
+              completed_at = ?,
+              status = ?
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [
+        toSqlUtc(startedDate),
+        lastPausedAt,
+        completedDate ? toSqlUtc(completedDate) : null,
+        newStatus,
+        taskId,
+        companyId,
+      ],
+    );
+
+    // ── Refresh attribution (fire-and-forget); also fix neighbors' busy math ─
+    recomputeTaskAttribution(companyId, taskId).catch((err) =>
+      logger.error({ err, taskId }, 'attribution recompute failed'),
+    );
+    if (task.assigned_resource_id) {
+      recomputeForResource(companyId, task.assigned_resource_id, new Date()).catch((err) =>
+        logger.error({ err, resourceId: task.assigned_resource_id }, 'resource attribution recompute failed'),
+      );
+    }
+
+    return res.status(200).json({ ok: true, warnings });
+  } catch (err) {
+    logger.error({ err, companyId, taskId }, 'fab_erp tasks/events/backfill: unexpected error');
+    return res.status(500).json({ message: 'Internal server error during task backfill.' });
+  }
+});
+
+// ── POST /task-events/:eventId/correct ──────────────────────────────────────
+// EU-10: correct one event's timestamp WITHOUT in-place edit — insert a new
+// event and mark the old row superseded (append-only audit). Mounted as a
+// sibling of /tasks/*; the '/task-events/' prefix guarantees no path clash.
+
+router.post('/task-events/:eventId/correct', protect, async (req, res) => {
+  const user = req.user;
+
+  // ── Authorization ──────────────────────────────────────────────────────────
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_time_backfill';
+    const granted =
+      Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG);
+
+    if (!granted) {
+      logger.warn(
+        { userId: user?.id, requiredTag: REQUIRED_TAG },
+        'fab_erp task-events/correct: permission denied',
+      );
+      return res.status(403).json({
+        message: `Permission denied. Required: "${REQUIRED_TAG}".`,
+      });
+    }
+  }
+
+  // ── Input validation ───────────────────────────────────────────────────────
+  const eventId = Number(req.params.eventId);
+
+  if (!req.params.eventId || isNaN(eventId) || eventId <= 0) {
+    return res.status(400).json({ message: 'Event id must be a positive integer.' });
+  }
+
+  const companyId = user.companyId;
+
+  if (!companyId) {
+    return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  }
+
+  const { at, note } = req.body ?? {};
+  const atDate = at ? new Date(at) : null;
+  if (!atDate || isNaN(atDate.getTime())) {
+    return res.status(400).json({ message: 'at is required and must be a valid datetime.' });
+  }
+
+  // ── Query logic ────────────────────────────────────────────────────────────
+  try {
+    const [eventRows] = await pool.query(
+      `SELECT id, task_id, event_type
+         FROM fab_task_events
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND superseded_by_event_id IS NULL
+        LIMIT 1`,
+      [eventId, companyId],
+    );
+
+    if (eventRows.length === 0) {
+      return res.status(404).json({ message: `Event with id ${eventId} not found or already superseded.` });
+    }
+
+    const evt = eventRows[0];
+    const taskId = evt.task_id;
+    const newAtSql = toSqlUtc(atDate);
+
+    // Insert-new + set-superseded in one transaction (throws on genuine DB error).
+    const { oldEventId, newEventId } = await supersedeEvent({
+      companyId,
+      oldEventId: eventId,
+      newAt: newAtSql,
+      enteredBy: user.id,
+      note: note ?? null,
+    });
+
+    // Mirror the corrected value onto the task's matching timestamp column.
+    const COLUMN_BY_EVENT = {
+      started: 'started_at',
+      paused: 'paused_at',
+      resumed: 'started_at',
+      completed: 'completed_at',
+      deps_cleared: 'deps_cleared_at',
+      queued: 'queued_at',
+    };
+    const col = COLUMN_BY_EVENT[evt.event_type];
+    if (col) {
+      await pool.query(
+        `UPDATE fab_project_tasks SET ${col} = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+        [newAtSql, taskId, companyId],
+      );
+    }
+
+    // ── Warnings for the corrected time (shift + overlap on same machine) ────
+    const warnings = [];
+    const now = new Date();
+    const [taskRows] = await pool.query(
+      `SELECT id, company_id, resource_type_id, assigned_resource_id
+         FROM fab_project_tasks
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+      [taskId, companyId],
+    );
+    const task = taskRows[0];
+    if (task) {
+      const plantId = await resolveTaskPlantId(companyId, task);
+      const calendarIds = await resolveCalendarIds(companyId, plantId);
+      if (calendarIds.length > 0 && (await timestampOutsideShift(companyId, calendarIds, atDate))) {
+        warnings.push(`Corrected time (${atDate.toISOString()}) falls outside the task's shift calendar.`);
+      }
+      const overlaps = await fetchOverlappingOtherTasks(
+        companyId, task, atDate, new Date(atDate.getTime() + 60000), now,
+      );
+      if (overlaps.length > 0) {
+        warnings.push(`Corrected time overlaps ${overlaps.length} other task(s) on the same machine.`);
+      }
+    }
+
+    recomputeTaskAttribution(companyId, taskId).catch((err) =>
+      logger.error({ err, taskId }, 'attribution recompute failed'),
+    );
+    if (task?.assigned_resource_id) {
+      recomputeForResource(companyId, task.assigned_resource_id, new Date()).catch((err) =>
+        logger.error({ err, resourceId: task.assigned_resource_id }, 'resource attribution recompute failed'),
+      );
+    }
+
+    return res.status(200).json({ ok: true, oldEventId, newEventId, warnings });
+  } catch (err) {
+    logger.error({ err, companyId, eventId }, 'fab_erp task-events/correct: unexpected error');
+    return res.status(500).json({ message: 'Internal server error correcting event.' });
   }
 });
 

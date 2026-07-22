@@ -50,7 +50,7 @@ import {
   fetchOverlappingOtherTasks,
   mergeIntervals,
 } from './taskWaitService.js';
-import { processPredecessorsDone } from './taskGatingService.js';
+import { processPredecessorsDone, isOutputBlocked } from './taskGatingService.js';
 
 // ─── pure interval helpers (over [{start:Date,end:Date}] lists) ───────────────
 
@@ -286,6 +286,15 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
       await fetchOverlappingOtherTasks(companyId, task, spanStart, spanEnd, now),
     );
 
+    // EU-8 output_blocked. Buffer levels are not historically reconstructable
+    // (fab_buffer_contents holds only current open rows, not a per-minute
+    // timeline), so we cannot know WHEN in the past a task was output-blocked.
+    // SIMPLIFICATION: we classify only the task's still-open idle tail (in-shift
+    // remainder running up to `now`) as output_blocked, and only when the task
+    // is output-blocked RIGHT NOW. All historical/closed idle stays
+    // unexplained_idle. Defensible: the live block explains the current stall.
+    const blockedNow = (await isOutputBlocked(companyId, task)).blocked;
+
     for (const w of activeWindows) {
       const win = [{ start: w.start, end: w.end }];
       const inShift = await workingIntervalsInWindow(companyId, calendarIds, w.start, w.end);
@@ -308,9 +317,14 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
       const busyHit = intersectIntervals(remaining, machineBusy);
       for (const iv of busyHit) segments.push(inShiftSeg('machine_busy', iv));
       remaining = subtractIntervals(remaining, busyHit);
-      // 5. TODO(Phase 2 / EU-8): output_blocked — carve blocked-output time here.
+      // 5. output_blocked — only the still-open tail (interval ending at `now`)
+      //    when the task is output-blocked right now (see SIMPLIFICATION above).
+      //    Everything else remains unexplained_idle.
       // 6. unexplained_idle — whatever in-shift time is left.
-      for (const iv of remaining) segments.push(inShiftSeg('unexplained_idle', iv));
+      for (const iv of remaining) {
+        const openTail = blockedNow && iv.end.getTime() === now.getTime();
+        segments.push(inShiftSeg(openTail ? 'output_blocked' : 'unexplained_idle', iv));
+      }
     }
   }
 

@@ -518,3 +518,39 @@ FROM companies c
 JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
 JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
 JOIN features_capability fc ON fc.name = 'fab_erp_machine_state';
+
+-- =============================================================================
+-- Section 8: Shop-Floor Time Intelligence Phases 2-4 permission tags
+-- (mirror of TM/seed_fab_erp_shopfloor_p234.sql — set-based, idempotent)
+--   fab_erp_buffer_config, fab_erp_time_backfill, fab_erp_shopfloor_analytics_view
+-- =============================================================================
+INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
+  ('Configure Machine Buffers',       'fab_erp_buffer_config',            'backend'),
+  ('Back-enter / Correct Task Times', 'fab_erp_time_backfill',            'backend'),
+  ('View Shop-Floor Analytics',       'fab_erp_shopfloor_analytics_view', 'backend');
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_buffer_config', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_buffer_config') AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_buffer_config')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_time_backfill', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_time_backfill') AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_time_backfill')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_shopfloor_analytics_view', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_shopfloor_analytics_view') AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_shopfloor_analytics_view')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, c.id, a.id, fc.capability_id
+FROM companies c
+JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
+JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
+JOIN features_capability fc
+  ON fc.name IN ('fab_erp_buffer_config', 'fab_erp_time_backfill', 'fab_erp_shopfloor_analytics_view');

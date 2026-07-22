@@ -2043,6 +2043,7 @@
       "idleWaitMinutes":             "fpjt.idle_wait_minutes",
       "delayReason":                 "fpjt.delay_reason",
       "computedHours":               "fpjt.computed_hours",
+      "formulaHours":                "fpjt.formula_hours",
       "sortOrder":                   "fpjt.sort_order",
       "createdAt":                   "fpjt.created_at",
       "updatedAt":                   "fpjt.updated_at",
@@ -2079,6 +2080,7 @@
       "idleWaitMinutes":             "integer",
       "delayReason":                 "string",
       "computedHours":               "decimal",
+      "formulaHours":                "decimal",
       "sortOrder":                   "integer",
       "createdAt":                   "datetime",
       "updatedAt":                   "datetime",
@@ -2277,6 +2279,138 @@
       "segEnd":          "datetime",
       "workingMinutes":  "integer",
       "computedAt":      "datetime",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpBuffer": {
+    "table": "fab_buffers",
+    "alias": "fb",
+    "writeFields": [],
+    "fields": {
+      "id":               "fb.id",
+      "companyId":        "fb.company_id",
+      "resourceId":       "fb.resource_id",
+      "kind":             "fb.kind",
+      "stockLocationId":  "fb.stock_location_id",
+      "capacityValue":    "fb.capacity_value",
+      "capacityUom":      "fb.capacity_uom",
+      "weightMetricKey":  "fb.weight_metric_key",
+      "warnPct":          "fb.warn_pct",
+      "blockPct":         "fb.block_pct",
+      "active":           "fb.active",
+      "createdAt":        "fb.created_at",
+      "updatedAt":        "fb.updated_at"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "resourceId":       "integer",
+      "kind":             "string",
+      "stockLocationId":  "integer",
+      "capacityValue":    "decimal",
+      "capacityUom":      "string",
+      "weightMetricKey":  "string",
+      "warnPct":          "integer",
+      "blockPct":         "integer",
+      "active":           "boolean",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpBufferContent": {
+    "table": "fab_buffer_contents",
+    "alias": "fbc",
+    "writeFields": [],
+    "fields": {
+      "id":              "fbc.id",
+      "companyId":       "fbc.company_id",
+      "bufferId":        "fbc.buffer_id",
+      "taskId":          "fbc.task_id",
+      "itemId":          "fbc.item_id",
+      "qty":             "fbc.qty",
+      "unit":            "fbc.unit",
+      "computedWeight":  "fbc.computed_weight",
+      "placedAt":        "fbc.placed_at",
+      "movedOutAt":      "fbc.moved_out_at",
+      "createdAt":       "fbc.created_at",
+      "updatedAt":       "fbc.updated_at"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "bufferId":        "integer",
+      "taskId":          "integer",
+      "itemId":          "integer",
+      "qty":             "decimal",
+      "unit":            "string",
+      "computedWeight":  "decimal",
+      "placedAt":        "datetime",
+      "movedOutAt":      "datetime",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpBufferLevelSnapshot": {
+    "table": "fab_buffer_level_snapshots",
+    "alias": "fbls",
+    "writeFields": [],
+    "fields": {
+      "id":              "fbls.id",
+      "companyId":       "fbls.company_id",
+      "bufferId":        "fbls.buffer_id",
+      "at":              "fbls.at",
+      "loadValue":       "fbls.load_value",
+      "capacityValue":   "fbls.capacity_value",
+      "pct":             "fbls.pct",
+      "createdAt":       "fbls.created_at",
+      "updatedAt":       "fbls.updated_at"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "bufferId":        "integer",
+      "at":              "datetime",
+      "loadValue":       "decimal",
+      "capacityValue":   "decimal",
+      "pct":             "decimal",
+      "createdAt":       "datetime",
+      "updatedAt":       "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpOperationStat": {
+    "table": "fab_operation_stats",
+    "alias": "fos",
+    "writeFields": [],
+    "fields": {
+      "id":              "fos.id",
+      "companyId":       "fos.company_id",
+      "operationId":     "fos.operation_id",
+      "resourceTypeId":  "fos.resource_type_id",
+      "sampleCount":     "fos.sample_count",
+      "medianMinutes":   "fos.median_minutes",
+      "p80Minutes":      "fos.p80_minutes",
+      "ewmaMinutes":     "fos.ewma_minutes",
+      "createdAt":       "fos.created_at",
+      "updatedAt":       "fos.updated_at"
+    },
+    "fieldTypes": {
+      "id":              "integer",
+      "companyId":       "integer",
+      "operationId":     "integer",
+      "resourceTypeId":  "integer",
+      "sampleCount":     "integer",
+      "medianMinutes":   "decimal",
+      "p80Minutes":      "decimal",
+      "ewmaMinutes":     "decimal",
       "createdAt":       "datetime",
       "updatedAt":       "datetime"
     },
