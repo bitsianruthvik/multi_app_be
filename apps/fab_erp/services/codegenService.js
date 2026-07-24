@@ -66,6 +66,10 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: 'RT-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
   ],
+  operation: [
+    { type: 'fixed', value: 'OP-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'never' },
+  ],
   sales_order: [
     { type: 'fixed', value: 'SO-' },
     { type: 'date', format: 'YYYYMMDD' },

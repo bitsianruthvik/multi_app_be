@@ -525,6 +525,27 @@ CREATE TABLE IF NOT EXISTS fab_stock_ledger (
   KEY idx_fab_stock_ledger_grn   (grn_id)
 );
 
+-- FEAT-02: material reservations. A task's gated material is earmarked when its
+-- gate first clears (status 'active'), so a later task can't clear against the
+-- same stock: gating availability = SUM(in_stock pieces) − SUM(active reservations).
+-- The reservation is flipped to 'consumed' when the task starts and physically
+-- deducts the stock, or 'released' if the task is cancelled / re-materialized.
+CREATE TABLE IF NOT EXISTS fab_stock_reservations (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  catalog_item_id   INT            NOT NULL,
+  task_id           INT            NOT NULL,
+  order_id          INT            NULL,
+  qty               DECIMAL(18,4)  NOT NULL DEFAULT 0,
+  status            ENUM('active','consumed','released') NOT NULL DEFAULT 'active',
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  released_at       DATETIME       NULL,
+  deleted_at        DATETIME       DEFAULT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fsr_avail  (company_id, catalog_item_id, status),
+  KEY idx_fsr_task   (company_id, task_id, status)
+);
+
 -- ===== STANDARD ITEM TAXONOMY SEED (system rows, all companies) =====
 
 -- 1. Categories: one row per company per taxonomy entry
@@ -1547,13 +1568,26 @@ CREATE TABLE IF NOT EXISTS fab_stock_pieces (
   grn_line_id       INT            NULL,
   received_date     DATE           NULL,
   notes             TEXT           NULL,
+  -- WIP model: ties a work-in-process / produced piece to the fab_items node
+  -- (order BOM instance) it belongs to, so the single WIP piece can be located
+  -- as it moves machine→machine and finalized at the terminal step.
+  wip_item_id       INT            NULL,
   created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
   updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   deleted_at        TIMESTAMP      NULL,
   KEY idx_fsp_company (company_id),
   KEY idx_fsp_item    (catalog_item_id),
-  KEY idx_fsp_grn     (grn_id)
+  KEY idx_fsp_grn     (grn_id),
+  KEY idx_fsp_wip     (company_id, wip_item_id)
 );
+
+-- Idempotent add of wip_item_id for DBs created before the WIP-inventory feature.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND COLUMN_NAME='wip_item_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_stock_pieces ADD COLUMN wip_item_id INT NULL AFTER notes','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND INDEX_NAME='idx_fsp_wip');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_stock_pieces ADD KEY idx_fsp_wip (company_id, wip_item_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- 2. Drop obsolete tables (superseded by fab_stock_pieces / confirmed dead)
 DROP TABLE IF EXISTS fab_item_batches;
@@ -1931,6 +1965,12 @@ CREATE TABLE IF NOT EXISTS fab_project_tasks (
   idle_wait_minutes               INT           NOT NULL DEFAULT 0,
   delay_reason                    ENUM('lack_of_manpower','machine_down','lack_of_consumable','planning_issue','minor_operational_delay') NULL,
   computed_hours                  DECIMAL(10,2) NULL,
+  -- FEAT-05: production output captured at completion (/tasks/:id/stop).
+  produced_qty                    DECIMAL(18,4) NULL,          -- good units produced (NULL until stopped)
+  scrap_qty                       DECIMAL(18,4) NOT NULL DEFAULT 0,
+  qc_result                       ENUM('pass','fail') NULL,    -- NULL until stopped; 'fail' spawns a rework task
+  is_rework                       TINYINT(1)    NOT NULL DEFAULT 0,
+  rework_of_task_id               INT           NULL,          -- the QC-failed task this reworks
   sort_order                      INT           NOT NULL DEFAULT 0,
   deleted_at                      DATETIME      DEFAULT NULL,
   created_at                      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
@@ -2111,6 +2151,12 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='idx_fo_customer');
 SET @sql = IF(@idx=0,'ALTER TABLE fab_orders ADD KEY idx_fo_customer (customer_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- FEAT-03 (2026-07-23): persisted task-count completion % (0-100) for the Orders
+-- board, maintained by taskEngineService.rollUpOrderStatus on every task event.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='progress_pct');
+SET @sql = IF(@col=0,'ALTER TABLE fab_orders ADD COLUMN progress_pct TINYINT UNSIGNED NOT NULL DEFAULT 0','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- ===== Shop-Floor Time Intelligence (Phase 1) =====
@@ -2363,4 +2409,30 @@ CREATE TABLE IF NOT EXISTS fab_operation_stats (
 -- CREATE TABLE above either, matching that same precedent.
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='formula_hours');
 SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN formula_hours DECIMAL(10,2) NULL AFTER computed_hours','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- FEAT-05 (2026-07-23): production output + rework. Idempotent adds for DBs
+-- created before this feature. Mirrors the CREATE TABLE columns above.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='produced_qty');
+SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN produced_qty DECIMAL(18,4) NULL AFTER formula_hours','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='scrap_qty');
+SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN scrap_qty DECIMAL(18,4) NOT NULL DEFAULT 0 AFTER produced_qty','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='qc_result');
+SET @sql = IF(@col=0,"ALTER TABLE fab_project_tasks ADD COLUMN qc_result ENUM('pass','fail') NULL AFTER scrap_qty",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='is_rework');
+SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN is_rework TINYINT(1) NOT NULL DEFAULT 0 AFTER qc_result','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='rework_of_task_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN rework_of_task_id INT NULL AFTER is_rework','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND INDEX_NAME='idx_fpjt_rework_of');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_project_tasks ADD KEY idx_fpjt_rework_of (company_id, rework_of_task_id)','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

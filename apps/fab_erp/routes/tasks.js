@@ -40,6 +40,7 @@ import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
 import { recordEvent, recordEvents, supersedeEvent } from '../services/taskEventService.js';
 import { materializeTasks } from '../services/taskInstanceService.js';
+import { previewRematerialize, applyRematerialize } from '../services/rematerializeService.js';
 import {
   computeTaskWaitMetrics,
   resolveTaskPlantId,
@@ -47,7 +48,8 @@ import {
   workingIntervalsInWindow,
   fetchOverlappingOtherTasks,
 } from '../services/taskWaitService.js';
-import { onTaskComplete } from '../services/taskEngineService.js';
+import { onTaskComplete, rollUpOrderStatus, spawnReworkTask } from '../services/taskEngineService.js';
+import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
 import { recomputeTaskAttribution, recomputeForResource } from '../services/taskAttributionService.js';
 import * as bufferService from '../services/bufferService.js';
 import { isOutputBlocked } from '../services/taskGatingService.js';
@@ -238,6 +240,62 @@ router.post('/tasks/materialize', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, orderId }, 'fab_erp tasks/materialize: unexpected error');
     return res.status(500).json({ message: 'Internal server error during task materialization.' });
+  }
+});
+
+// ── POST /tasks/rematerialize/preview ───────────────────────────────────────
+// FEAT-07: read-only diff of what re-generating the order's DAG from the current
+// flow definitions would change (added / removed / changed / retained-started).
+router.post('/tasks/rematerialize/preview', protect, async (req, res) => {
+  const user = req.user;
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_taskqueue_manage';
+    if (!(Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG))) {
+      return res.status(403).json({ message: `Permission denied. Required: "${REQUIRED_TAG}".` });
+    }
+  }
+  const { orderId } = req.body ?? {};
+  if (orderId === undefined || orderId === null || isNaN(Number(orderId))) {
+    return res.status(400).json({ message: 'orderId is required and must be a number.' });
+  }
+  const companyId = user.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const result = await previewRematerialize(companyId, Number(orderId));
+    return res.status(200).json(result);
+  } catch (err) {
+    logger.error({ err, companyId, orderId }, 'fab_erp tasks/rematerialize/preview: unexpected error');
+    return res.status(500).json({ message: 'Internal server error computing re-materialization preview.' });
+  }
+});
+
+// ── POST /tasks/rematerialize ───────────────────────────────────────────────
+// FEAT-07: apply the re-generation — drop unstarted work, rebuild from the
+// current flows, and preserve every started/done task.
+router.post('/tasks/rematerialize', protect, async (req, res) => {
+  const user = req.user;
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_taskqueue_manage';
+    if (!(Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG))) {
+      return res.status(403).json({ message: `Permission denied. Required: "${REQUIRED_TAG}".` });
+    }
+  }
+  const { orderId } = req.body ?? {};
+  if (orderId === undefined || orderId === null || isNaN(Number(orderId))) {
+    return res.status(400).json({ message: 'orderId is required and must be a number.' });
+  }
+  const companyId = user.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const result = await applyRematerialize(companyId, Number(orderId));
+    return res.status(200).json(result);
+  } catch (err) {
+    logger.error({ err, companyId, orderId }, 'fab_erp tasks/rematerialize: unexpected error');
+    return res.status(500).json({ message: 'Internal server error during re-materialization.' });
   }
 });
 
@@ -607,66 +665,143 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
     return res.status(400).json({ message: 'Unable to determine companyId from token.' });
   }
 
+  // BUG-09: the machine to run on. Prefer the machine sent from the queue
+  // (the operator picked it); fall back to any prior assignment (resume).
+  const requestedResourceId = Number(req.body?.resourceId) > 0 ? Number(req.body.resourceId) : null;
+  // EU-8 admins may force past the output-blocked guard with body {force:true}.
+  const forced = req.body?.force === true;
+
   // ── Query logic ────────────────────────────────────────────────────────────
   try {
-    const [taskRows] = await pool.query(
-      `SELECT id, company_id, resource_type_id, assigned_resource_id,
-              deps_cleared_at, status
-         FROM fab_project_tasks
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
-        LIMIT 1`,
-      [taskId, companyId],
-    );
+    // The core invariant (status guard + no machine double-booking) is enforced
+    // in one transaction so concurrent starts can't both win (BUG-10, BUG-11).
+    const conn = await pool.getConnection();
+    let priorStatus, machineId, metrics, outBlock, orderId;
+    try {
+      await conn.beginTransaction();
 
-    if (taskRows.length === 0) {
-      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
-    }
+      const [taskRows] = await conn.query(
+        `SELECT id, company_id, order_id, item_id, flow_id, seq_no,
+                resource_type_id, assigned_resource_id, deps_cleared_at, status
+           FROM fab_project_tasks
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+          FOR UPDATE`,
+        [taskId, companyId],
+      );
 
-    const task = taskRows[0];
+      if (taskRows.length === 0) {
+        await conn.rollback();
+        return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      }
 
-    if (task.status !== 'eligible' && task.status !== 'paused') {
-      return res.status(400).json({
-        message: `Task cannot be started from status "${task.status}". Must be "eligible" or "paused".`,
-      });
-    }
+      const task = taskRows[0];
+      priorStatus = task.status;
+      orderId = task.order_id;
 
-    // ── EU-8 Start guard: refuse to start an output-blocked task ───────────────
-    // Both the successor's input buffer and this machine's output staging must be
-    // full (see isOutputBlocked). Admins may force past it with body {force:true},
-    // which is audited via a state_note event; non-admins are blocked regardless.
-    const forced = req.body?.force === true;
-    const outBlock = await isOutputBlocked(companyId, task);
-    if (outBlock.blocked && !(forced && isAdmin)) {
-      return res.status(409).json({
-        ok: false,
-        code: 'OUTPUT_BLOCKED',
-        message: outBlock.reason,
-      });
-    }
+      if (task.status !== 'eligible' && task.status !== 'paused') {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Task cannot be started from status "${task.status}". Must be "eligible" or "paused".`,
+        });
+      }
 
-    const priorStatus = task.status;
-    const now = new Date();
-    const metrics = await computeTaskWaitMetrics(task, now);
+      // ── BUG-09: resolve, validate and record the machine ─────────────────────
+      machineId = requestedResourceId ?? task.assigned_resource_id ?? null;
+      if (!machineId) {
+        await conn.rollback();
+        return res.status(400).json({ code: 'NO_MACHINE', message: 'Select a machine before starting this task.' });
+      }
+      const [machineRows] = await conn.query(
+        `SELECT id, resource_type_id, plant_id, stock_location_id, name FROM fab_resources
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+        [machineId, companyId],
+      );
+      if (machineRows.length === 0) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Selected machine was not found.' });
+      }
+      const machine = machineRows[0];
+      if (task.resource_type_id && machineRows[0].resource_type_id &&
+          machineRows[0].resource_type_id !== task.resource_type_id) {
+        await conn.rollback();
+        return res.status(409).json({
+          code: 'WRONG_MACHINE_TYPE',
+          message: 'This task requires a machine of a different resource type.',
+        });
+      }
 
-    const [updateResult] = await pool.query(
-      `UPDATE fab_project_tasks
-          SET wait_working_minutes = ?,
-              blocked_by_other_tasks_minutes = ?,
-              idle_wait_minutes = ?,
-              started_at = NOW(),
-              status = 'in_progress'
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [
-        metrics.wait_working_minutes,
-        metrics.blocked_by_other_tasks_minutes,
-        metrics.idle_wait_minutes,
-        taskId,
-        companyId,
-      ],
-    );
+      // ── BUG-10: no machine double-booking. Lock the machine's in-progress rows. ─
+      const [busyRows] = await conn.query(
+        `SELECT id FROM fab_project_tasks
+          WHERE company_id = ? AND assigned_resource_id = ? AND status = 'in_progress'
+            AND deleted_at IS NULL AND id <> ? LIMIT 1 FOR UPDATE`,
+        [companyId, machineId, taskId],
+      );
+      if (busyRows.length > 0) {
+        await conn.rollback();
+        return res.status(409).json({
+          code: 'MACHINE_BUSY',
+          message: `That machine is already running task #${busyRows[0].id}. Finish or pause it first.`,
+        });
+      }
 
-    if (updateResult.affectedRows === 0) {
-      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      // ── EU-8 output-blocked guard (unchanged behaviour, now machine-aware) ────
+      outBlock = await isOutputBlocked(companyId, { ...task, assigned_resource_id: machineId }, conn);
+      if (outBlock.blocked && !(forced && isAdmin)) {
+        await conn.rollback();
+        return res.status(409).json({ ok: false, code: 'OUTPUT_BLOCKED', message: outBlock.reason });
+      }
+
+      const now = new Date();
+      metrics = await computeTaskWaitMetrics(task, now);
+
+      // ── BUG-11: atomic transition — guard the UPDATE on the expected prior status ─
+      const [updateResult] = await conn.query(
+        `UPDATE fab_project_tasks
+            SET wait_working_minutes = ?,
+                blocked_by_other_tasks_minutes = ?,
+                idle_wait_minutes = ?,
+                assigned_resource_id = ?,
+                started_at = NOW(),
+                status = 'in_progress'
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = ?`,
+        [
+          metrics.wait_working_minutes,
+          metrics.blocked_by_other_tasks_minutes,
+          metrics.idle_wait_minutes,
+          machineId,
+          taskId,
+          companyId,
+          priorStatus,
+        ],
+      );
+
+      if (updateResult.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(409).json({
+          code: 'CONFLICT',
+          message: 'Task state changed before it could start. Refresh and try again.',
+        });
+      }
+
+      // BUG-01/02/07: consume this task's inputs (deduct, quantity-checked) and
+      // open/move the node's WIP piece into this machine's stock area. A shortage
+      // throws INSUFFICIENT_STOCK, which rolls the whole start back (below).
+      // `task` carries id, item_id, seq_no, order_id from the SELECT above.
+      await openOrMoveWipOnStart(conn, companyId, task, machine);
+
+      // BUG-03: reflect production progress on the order (best-effort, in-txn).
+      await rollUpOrderStatus(conn, companyId, orderId);
+
+      await conn.commit();
+    } catch (txErr) {
+      await conn.rollback();
+      if (txErr?.code === 'INSUFFICIENT_STOCK') {
+        return res.status(409).json({ code: 'INSUFFICIENT_STOCK', message: txErr.message });
+      }
+      throw txErr;
+    } finally {
+      conn.release();
     }
 
     await recordEvent({
@@ -697,6 +832,7 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       ok: true,
       taskId,
       status: 'in_progress',
+      assignedResourceId: machineId,
       waitWorkingMinutes: metrics.wait_working_minutes,
       blockedByOtherTasksMinutes: metrics.blocked_by_other_tasks_minutes,
       idleWaitMinutes: metrics.idle_wait_minutes,
@@ -769,16 +905,18 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
       });
     }
 
+    // BUG-11: gate the transition on the expected prior status so two concurrent
+    // pause/stop calls can't both apply (affectedRows tells us who won).
     const [updateResult] = await pool.query(
       `UPDATE fab_project_tasks
           SET paused_at = NOW(),
               status = 'paused'
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = 'in_progress'`,
       [taskId, companyId],
     );
 
     if (updateResult.affectedRows === 0) {
-      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      return res.status(409).json({ code: 'CONFLICT', message: 'Task is no longer in progress. Refresh and try again.' });
     }
 
     await recordEvent({ companyId, taskId, type: 'paused', enteredBy: user.id });
@@ -795,6 +933,15 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
 // Sets status = 'done', completed_at = NOW(), then calls taskEngineService's
 // onTaskComplete(companyId, taskId) (EU-6) to cascade-clear downstream
 // successors whose full predecessor set is now done.
+//
+// FEAT-05: optionally captures production output in the body — all fields
+// optional, defaulting to a clean full-yield pass:
+//   { producedQty?: number,   // good units; default = the item's planned qty
+//     scrapQty?:    number,   // rejected units; default 0
+//     qcResult?:    'pass'|'fail' }  // default 'pass'
+// On 'pass' the WIP piece is finalised at the GOOD qty (scrap written off); on
+// 'fail' no inventory is booked and a rework task is spawned as the node's new
+// terminal step, so downstream stays gated until the rework passes QC.
 
 router.post('/tasks/:id/stop', protect, async (req, res) => {
   const user = req.user;
@@ -831,41 +978,118 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
     return res.status(400).json({ message: 'Unable to determine companyId from token.' });
   }
 
+  // FEAT-05: optional production-output capture. Validate up front; actual
+  // defaulting of producedQty needs the item's planned qty, resolved in the txn.
+  const body = req.body || {};
+  const hasProduced = body.producedQty != null && body.producedQty !== '';
+  const hasScrap = body.scrapQty != null && body.scrapQty !== '';
+  const producedQtyIn = hasProduced ? Number(body.producedQty) : null;
+  const scrapQty = hasScrap ? Number(body.scrapQty) : 0;
+  const qcResult = body.qcResult == null || body.qcResult === '' ? 'pass' : String(body.qcResult);
+
+  if (hasProduced && (!Number.isFinite(producedQtyIn) || producedQtyIn < 0)) {
+    return res.status(400).json({ message: 'producedQty must be a number ≥ 0.' });
+  }
+  if (!Number.isFinite(scrapQty) || scrapQty < 0) {
+    return res.status(400).json({ message: 'scrapQty must be a number ≥ 0.' });
+  }
+  if (qcResult !== 'pass' && qcResult !== 'fail') {
+    return res.status(400).json({ message: "qcResult must be 'pass' or 'fail'." });
+  }
+
   // ── Query logic ────────────────────────────────────────────────────────────
   try {
-    const [taskRows] = await pool.query(
-      `SELECT id, status
-         FROM fab_project_tasks
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
-        LIMIT 1`,
-      [taskId, companyId],
-    );
+    // Atomic complete + output capture + WIP finalize (goods-receipt of the
+    // produced item) in one transaction, so completing a task always books its
+    // inventory (BUG-01) and its production record (FEAT-05) together.
+    let rework = null;      // { reworkTaskId, failedSeqNo } when QC failed
+    let producedQty = producedQtyIn;
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
 
-    if (taskRows.length === 0) {
-      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
-    }
+      const [taskRows] = await conn.query(
+        `SELECT t.id, t.item_id, t.seq_no, t.assigned_resource_id, t.status,
+                COALESCE(i.qty, 1) AS planned_qty
+           FROM fab_project_tasks t
+           LEFT JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
+          WHERE t.id = ? AND t.company_id = ? AND t.deleted_at IS NULL
+          FOR UPDATE`,
+        [taskId, companyId],
+      );
 
-    const task = taskRows[0];
+      if (taskRows.length === 0) {
+        await conn.rollback();
+        return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      }
 
-    if (task.status !== 'in_progress') {
-      return res.status(400).json({
-        message: `Task cannot be stopped from status "${task.status}". Must be "in_progress".`,
-      });
-    }
+      const task = taskRows[0];
 
-    const [updateResult] = await pool.query(
-      `UPDATE fab_project_tasks
-          SET status = 'done',
-              completed_at = NOW()
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [taskId, companyId],
-    );
+      if (task.status !== 'in_progress') {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Task cannot be stopped from status "${task.status}". Must be "in_progress".`,
+        });
+      }
 
-    if (updateResult.affectedRows === 0) {
-      return res.status(404).json({ message: `Task with id ${taskId} not found.` });
+      // Default good qty to the item's planned qty when the operator didn't report one.
+      if (producedQty == null) producedQty = Number(task.planned_qty) || 1;
+
+      // BUG-11 + FEAT-05: gate the transition on the expected prior status
+      // (atomic complete) and record the captured production output.
+      const [updateResult] = await conn.query(
+        `UPDATE fab_project_tasks
+            SET status = 'done',
+                completed_at = NOW(),
+                produced_qty = ?,
+                scrap_qty = ?,
+                qc_result = ?
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = 'in_progress'`,
+        [producedQty, scrapQty, qcResult, taskId, companyId],
+      );
+
+      if (updateResult.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(409).json({ code: 'CONFLICT', message: 'Task is no longer in progress. Refresh and try again.' });
+      }
+
+      if (qcResult === 'fail') {
+        // FEAT-05: QC fail — book NO good inventory; spawn a rework task that
+        // becomes the node's new terminal step, so the item is not "produced"
+        // (and downstream stays gated) until the rework passes QC. The WIP piece
+        // is intentionally left in 'wip' for the rework to finish.
+        rework = await spawnReworkTask(conn, companyId, taskId);
+      } else {
+        // BUG-01 + FEAT-05: at the node's terminal step, finalize the WIP piece →
+        // in_stock at the GOOD qty (transform up one BOM level); a top-level node
+        // posts to Finished Goods. Scrap is written off for traceability.
+        await finalizeWipOnComplete(conn, companyId, task, { goodQty: producedQty, scrapQty });
+      }
+
+      await conn.commit();
+    } catch (txErr) {
+      await conn.rollback();
+      throw txErr;
+    } finally {
+      conn.release();
     }
 
     await recordEvent({ companyId, taskId, type: 'completed', enteredBy: user.id });
+
+    // FEAT-05: audit the QC fail + rework spawn (recordEvent uses its own
+    // connection, so this runs post-commit — same pattern as 'completed' above).
+    if (rework) {
+      await recordEvents([
+        {
+          companyId, taskId, type: 'state_note', source: 'live', enteredBy: user.id,
+          note: `QC fail at completion — rework task ${rework.reworkTaskId} created`,
+        },
+        {
+          companyId, taskId: rework.reworkTaskId, type: 'state_note', source: 'system',
+          note: `rework of task ${taskId} (QC fail at seq ${rework.failedSeqNo})`,
+        },
+      ]);
+    }
 
     // EU-3: refresh wait attribution (fire-and-forget — never fails the response).
     recomputeTaskAttribution(companyId, taskId).catch((err) =>
@@ -873,10 +1097,13 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
     );
 
     // EU-7: place the produced item into the machine's output buffer, if one is
-    // configured (opt-in). Best-effort — must never fail the stop response.
-    bufferService.placeOutput(companyId, { id: taskId }).catch((err) =>
-      logger.error({ err, taskId }, 'buffer placeOutput failed'),
-    );
+    // configured (opt-in). Best-effort — must never fail the stop response. Only
+    // for a QC pass: a failed task produced nothing to buffer.
+    if (qcResult === 'pass') {
+      bufferService.placeOutput(companyId, { id: taskId }).catch((err) =>
+        logger.error({ err, taskId }, 'buffer placeOutput failed'),
+      );
+    }
 
     const engineResult = await onTaskComplete(companyId, taskId);
 
@@ -884,6 +1111,10 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       ok: true,
       taskId,
       status: 'done',
+      qcResult,
+      producedQty,
+      scrapQty,
+      reworkTaskId: rework?.reworkTaskId ?? null,
       successorsCleared: engineResult.successorsCleared,
     });
   } catch (err) {
