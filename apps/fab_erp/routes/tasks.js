@@ -41,6 +41,8 @@ import { pool } from '../../../db.js';
 import { recordEvent, recordEvents, supersedeEvent } from '../services/taskEventService.js';
 import { materializeTasks } from '../services/taskInstanceService.js';
 import { previewRematerialize, applyRematerialize } from '../services/rematerializeService.js';
+import { portfolioProgress, computeStageBreakdown } from '../services/progressReportService.js';
+import { computeActualHoursForTasks, computeTaskVariance } from '../services/taskVarianceService.js';
 import {
   computeTaskWaitMetrics,
   resolveTaskPlantId,
@@ -299,6 +301,43 @@ router.post('/tasks/rematerialize', protect, async (req, res) => {
   }
 });
 
+// ── GET /tasks/progress ─────────────────────────────────────────────────────
+// Project Progress view (2026-07-24). No orderId → portfolio (active orders +
+// overall % + resolved template). With orderId (+ optional itemId/scope) → the
+// per-stage breakdown for that scope. Gated fab_erp_taskengine_view.
+router.get('/tasks/progress', protect, async (req, res) => {
+  const user = req.user;
+  const isAdmin = user?.role && String(user.role).toLowerCase() === 'admin';
+  if (!isAdmin) {
+    const REQUIRED_TAG = 'fab_erp_taskengine_view';
+    if (!(Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(REQUIRED_TAG))) {
+      return res.status(403).json({ message: `Permission denied. Required: "${REQUIRED_TAG}".` });
+    }
+  }
+  const companyId = user.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const { orderId } = req.query;
+    if (orderId === undefined) {
+      const result = await portfolioProgress(companyId);
+      return res.status(200).json(result);
+    }
+    const oid = Number(orderId);
+    if (isNaN(oid) || oid <= 0) {
+      return res.status(400).json({ message: 'orderId must be a positive integer.' });
+    }
+    const result = await computeStageBreakdown(companyId, oid, {
+      itemId: req.query.itemId,
+      scope: req.query.scope === 'self' ? 'self' : 'subtree',
+    });
+    return res.status(200).json(result);
+  } catch (err) {
+    logger.error({ err, companyId }, 'fab_erp tasks/progress: unexpected error');
+    return res.status(500).json({ message: 'Internal server error computing progress.' });
+  }
+});
+
 // ── GET /tasks/graph ────────────────────────────────────────────────────────
 // EU-11: order-wide task DAG (all fab_items instances of an order in one
 // response — one DAG per order, not per item, per design).
@@ -513,6 +552,16 @@ router.get('/tasks/graph', protect, async (req, res) => {
       edges.push({ from: terminal.id, to: row.taskId, kind: 'component' });
     }
 
+    // FEAT-16: batch-compute actual touch hours for the done tasks, so each node
+    // can show plan vs actual variance (one event query for the whole order).
+    const doneIds = taskRows.filter((r) => r.status === 'done').map((r) => r.id);
+    const actualsMap = await computeActualHoursForTasks(pool, companyId, doneIds);
+    const varianceOf = (r) => {
+      const a = actualsMap.get(r.id);
+      if (r.computedHours == null || a == null) return null;
+      return Math.round((a - Number(r.computedHours)) * 100) / 100;
+    };
+
     const nodes = taskRows.map((r) => ({
       id: r.id,
       operationId: r.operationId,
@@ -536,6 +585,8 @@ router.get('/tasks/graph', protect, async (req, res) => {
       pausedAt: r.pausedAt,
       completedAt: r.completedAt,
       computedHours: r.computedHours,
+      actualHours: actualsMap.get(r.id) ?? null,
+      varianceHours: varianceOf(r),
     }));
 
     return res.status(200).json({ ok: true, nodes, edges });
@@ -844,9 +895,14 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
 });
 
 // ── POST /tasks/:id/pause ───────────────────────────────────────────────────
-// EU-8: Task lifecycle — pause. No delay reason accepted/required (delay
-// reasons are only captured on start/resume, per spec). Legal only from
-// 'in_progress'.
+// EU-8: Task lifecycle — pause. Legal only from 'in_progress'.
+// FEAT-12 (2026-07-24): optionally captures a downtime *reason* (why the task
+// was paused), persisted to fab_project_tasks.delay_reason and onto the 'paused'
+// event, so wait-time attribution can be grounded in reported causes.
+
+const PAUSE_REASONS = new Set([
+  'lack_of_manpower', 'machine_down', 'lack_of_consumable', 'planning_issue', 'minor_operational_delay',
+]);
 
 router.post('/tasks/:id/pause', protect, async (req, res) => {
   const user = req.user;
@@ -883,6 +939,13 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
     return res.status(400).json({ message: 'Unable to determine companyId from token.' });
   }
 
+  // FEAT-12: optional downtime reason. Empty/absent → null (unattributed pause).
+  const rawReason = req.body?.reason;
+  const reason = rawReason == null || rawReason === '' ? null : String(rawReason);
+  if (reason !== null && !PAUSE_REASONS.has(reason)) {
+    return res.status(400).json({ message: `reason must be one of: ${[...PAUSE_REASONS].join(', ')}.` });
+  }
+
   // ── Query logic ────────────────────────────────────────────────────────────
   try {
     const [taskRows] = await pool.query(
@@ -907,21 +970,23 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
 
     // BUG-11: gate the transition on the expected prior status so two concurrent
     // pause/stop calls can't both apply (affectedRows tells us who won).
+    // FEAT-12: record the reported downtime reason on the task.
     const [updateResult] = await pool.query(
       `UPDATE fab_project_tasks
           SET paused_at = NOW(),
-              status = 'paused'
+              status = 'paused',
+              delay_reason = ?
         WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = 'in_progress'`,
-      [taskId, companyId],
+      [reason, taskId, companyId],
     );
 
     if (updateResult.affectedRows === 0) {
       return res.status(409).json({ code: 'CONFLICT', message: 'Task is no longer in progress. Refresh and try again.' });
     }
 
-    await recordEvent({ companyId, taskId, type: 'paused', enteredBy: user.id });
+    await recordEvent({ companyId, taskId, type: 'paused', enteredBy: user.id, note: reason });
 
-    return res.status(200).json({ ok: true, taskId, status: 'paused' });
+    return res.status(200).json({ ok: true, taskId, status: 'paused', reason });
   } catch (err) {
     logger.error({ err, companyId, taskId }, 'fab_erp tasks/pause: unexpected error');
     return res.status(500).json({ message: 'Internal server error pausing task.' });
@@ -1004,12 +1069,13 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
     // inventory (BUG-01) and its production record (FEAT-05) together.
     let rework = null;      // { reworkTaskId, failedSeqNo } when QC failed
     let producedQty = producedQtyIn;
+    let planHours = null;   // FEAT-16: this task's planned hours, for the variance readout
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
       const [taskRows] = await conn.query(
-        `SELECT t.id, t.item_id, t.seq_no, t.assigned_resource_id, t.status,
+        `SELECT t.id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
                 COALESCE(i.qty, 1) AS planned_qty
            FROM fab_project_tasks t
            LEFT JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
@@ -1034,6 +1100,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
 
       // Default good qty to the item's planned qty when the operator didn't report one.
       if (producedQty == null) producedQty = Number(task.planned_qty) || 1;
+      planHours = task.computed_hours; // FEAT-16
 
       // BUG-11 + FEAT-05: gate the transition on the expected prior status
       // (atomic complete) and record the captured production output.
@@ -1107,6 +1174,15 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
 
     const engineResult = await onTaskComplete(companyId, taskId);
 
+    // FEAT-16: plan-vs-actual variance for the just-completed task (the 'completed'
+    // event is already recorded above, so touch time is computable). Best-effort.
+    let variance = null;
+    try {
+      variance = await computeTaskVariance(pool, companyId, taskId, planHours);
+    } catch (e) {
+      logger.error({ err: e, taskId }, 'variance compute failed');
+    }
+
     return res.status(200).json({
       ok: true,
       taskId,
@@ -1116,6 +1192,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       scrapQty,
       reworkTaskId: rework?.reworkTaskId ?? null,
       successorsCleared: engineResult.successorsCleared,
+      variance,
     });
   } catch (err) {
     logger.error({ err, companyId, taskId }, 'fab_erp tasks/stop: unexpected error');

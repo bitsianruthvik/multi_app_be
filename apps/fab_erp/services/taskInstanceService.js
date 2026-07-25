@@ -19,6 +19,7 @@
 
 import { pool } from '../../../db.js';
 import { materializeOrderTasks } from './taskGatingService.js';
+import { rollUpOrderStatus } from './taskEngineService.js';
 
 /**
  * @param {number} companyId
@@ -30,6 +31,8 @@ export async function materializeTasks(companyId, orderId) {
   try {
     await conn.beginTransaction();
     const result = await materializeOrderTasks(conn, companyId, orderId);
+    // Building the DAG advances a sales order to 'scheduled' (2026-07-24 lifecycle).
+    await rollUpOrderStatus(conn, companyId, orderId);
     await conn.commit();
     return result;
   } catch (err) {

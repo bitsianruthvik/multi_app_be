@@ -28,6 +28,7 @@ import {
   materializeOrderTasks,
   releaseTaskReservations,
 } from './taskGatingService.js';
+import { rollUpOrderStatus } from './taskEngineService.js';
 import { evaluateFormula } from './formulaEngine.js';
 import { getUsableStat } from './operationStatsService.js';
 
@@ -213,6 +214,8 @@ export async function applyRematerialize(companyId, orderId) {
     // just dropped + any brand-new steps/items), skipping steps still pinned by a
     // retained started/done task.
     const rebuilt = await materializeOrderTasks(conn, companyId, orderId);
+    // Keep the sales lifecycle in sync after a rebuild (2026-07-24).
+    await rollUpOrderStatus(conn, companyId, orderId);
 
     await conn.commit();
     return { ok: true, orderId, deletedUnstarted: deleted, rebuilt };

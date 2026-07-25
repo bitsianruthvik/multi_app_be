@@ -52,7 +52,7 @@ function round2(n) {
  * happen for a 'done' task, but data can be messy) contributes 0 to the
  * subtracted pause time rather than corrupting the result.
  */
-function buildSample(events) {
+export function buildSample(events) {
   let startedAt = null;
   let startedSource = null;
   let completedAt = null;

@@ -31,6 +31,11 @@ const resourcePermissions = {
   fabErpMfgMethodTemplate:    'fab_erp_templates_manage',
   fabErpMfgMethodLine:        'fab_erp_templates_manage',
 
+  // Progress report templates (Project Progress view config)
+  fabErpProgressTemplate:  'fab_erp_taskengine_view',
+  fabErpProgressStage:     'fab_erp_taskengine_view',
+  fabErpProgressStageOp:   'fab_erp_taskengine_view',
+
   // Orders (sales, manufacturing, purchase, planned, subcontract, transfer)
   fabErpOrder:     'fab_erp_projects_manage',
   fabErpOrderLine: 'fab_erp_projects_manage',

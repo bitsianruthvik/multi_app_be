@@ -529,6 +529,98 @@
     }
   },
 
+  "fabErpProgressTemplate": {
+    "table": "fab_progress_templates",
+    "alias": "fptpl",
+    "writeFields": ["name", "code", "match_item_category_id", "active"],
+    "fields": {
+      "id":                  "fptpl.id",
+      "companyId":           "fptpl.company_id",
+      "name":                "fptpl.name",
+      "code":                "fptpl.code",
+      "matchItemCategoryId": "fptpl.match_item_category_id",
+      "active":              "fptpl.active",
+      "createdAt":           "fptpl.created_at",
+      "updatedAt":           "fptpl.updated_at",
+      "matchCategoryName":   "fic_ptpl.name"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "name":                "string",
+      "code":                "string",
+      "matchItemCategoryId": "integer",
+      "active":              "integer",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime",
+      "matchCategoryName":   "string"
+    },
+    "relations": {
+      "matchCategory": {
+        "table": "fab_item_categories",
+        "alias": "fic_ptpl",
+        "on":    "fptpl.match_item_category_id = fic_ptpl.id",
+        "fields": ["matchCategoryName"]
+      }
+    }
+  },
+
+  "fabErpProgressStage": {
+    "table": "fab_progress_stages",
+    "alias": "fpstg",
+    "writeFields": ["template_id", "name", "seq_no"],
+    "fields": {
+      "id":         "fpstg.id",
+      "companyId":  "fpstg.company_id",
+      "templateId": "fpstg.template_id",
+      "name":       "fpstg.name",
+      "seqNo":      "fpstg.seq_no",
+      "createdAt":  "fpstg.created_at",
+      "updatedAt":  "fpstg.updated_at"
+    },
+    "fieldTypes": {
+      "id":         "integer",
+      "companyId":  "integer",
+      "templateId": "integer",
+      "name":       "string",
+      "seqNo":      "integer",
+      "createdAt":  "datetime",
+      "updatedAt":  "datetime"
+    }
+  },
+
+  "fabErpProgressStageOp": {
+    "table": "fab_progress_stage_ops",
+    "alias": "fpsop",
+    "writeFields": ["stage_id", "operation_id"],
+    "fields": {
+      "id":            "fpsop.id",
+      "companyId":     "fpsop.company_id",
+      "stageId":       "fpsop.stage_id",
+      "operationId":   "fpsop.operation_id",
+      "createdAt":     "fpsop.created_at",
+      "operationName": "fop_psop.name",
+      "operationCode": "fop_psop.code"
+    },
+    "fieldTypes": {
+      "id":            "integer",
+      "companyId":     "integer",
+      "stageId":       "integer",
+      "operationId":   "integer",
+      "createdAt":     "datetime",
+      "operationName": "string",
+      "operationCode": "string"
+    },
+    "relations": {
+      "operation": {
+        "table": "fab_operations",
+        "alias": "fop_psop",
+        "on":    "fpsop.operation_id = fop_psop.id",
+        "fields": ["operationName", "operationCode"]
+      }
+    }
+  },
+
   "fabErpProcessTemplate": {
     "table": "fab_process_templates",
     "alias": "fpt",
@@ -1495,7 +1587,7 @@
   "fabErpOrder": {
     "table": "fab_orders",
     "alias": "fo",
-    "writeFields": ["order_number","order_type","type","status","customer_id","customer_name","customer_po_ref","plant_id","catalog_item_id","qty","unit","required_date","confirmed_date","scheduled_start","scheduled_end","scheduled_ship_date","parent_order_id","source_order_id","source_order_line_id","bom_id","routing_plan_id","delivery_address","payment_terms","currency","supplier_id","supplier_ref","priority","mrp_controller","notes","created_by"],
+    "writeFields": ["order_number","order_type","type","status","customer_id","customer_name","customer_po_ref","plant_id","catalog_item_id","qty","unit","required_date","confirmed_date","scheduled_start","scheduled_end","scheduled_ship_date","parent_order_id","source_order_id","source_order_line_id","bom_id","routing_plan_id","delivery_address","payment_terms","currency","supplier_id","supplier_ref","priority","mrp_controller","notes","created_by","progress_template_id"],
     "fields": {
       "id":                  "fo.id",
       "companyId":           "fo.company_id",
