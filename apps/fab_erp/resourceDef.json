@@ -2509,5 +2509,215 @@
       "updatedAt":       "datetime"
     },
     "relations": {}
+  },
+
+  "fabErpCcPlan": {
+    "table": "fab_cc_plans",
+    "alias": "fccp",
+    "writeFields": [],
+    "fields": {
+      "id":                    "fccp.id",
+      "companyId":             "fccp.company_id",
+      "orderId":               "fccp.order_id",
+      "status":                "fccp.status",
+      "dueDate":               "fccp.due_date",
+      "chainLengthMinutes":    "fccp.chain_length_minutes",
+      "projectBufferMinutes":  "fccp.project_buffer_minutes",
+      "aggressiveFinish":      "fccp.aggressive_finish",
+      "committedFinish":       "fccp.committed_finish",
+      "feverZone":             "fccp.fever_zone",
+      "bufferConsumedPct":     "fccp.buffer_consumed_pct",
+      "chainCompletePct":      "fccp.chain_complete_pct",
+      "drumPlannedStart":      "fccp.drum_planned_start",
+      "baselinedAt":           "fccp.baselined_at",
+      "supersededByPlanId":    "fccp.superseded_by_plan_id",
+      "createdAt":             "fccp.created_at",
+      "updatedAt":             "fccp.updated_at"
+    },
+    "fieldTypes": {
+      "id":                    "integer",
+      "companyId":             "integer",
+      "orderId":               "integer",
+      "status":                "string",
+      "dueDate":               "datetime",
+      "chainLengthMinutes":    "integer",
+      "projectBufferMinutes":  "integer",
+      "aggressiveFinish":      "datetime",
+      "committedFinish":       "datetime",
+      "feverZone":             "string",
+      "bufferConsumedPct":     "integer",
+      "chainCompletePct":      "integer",
+      "drumPlannedStart":      "datetime",
+      "baselinedAt":           "datetime",
+      "supersededByPlanId":    "integer",
+      "createdAt":             "datetime",
+      "updatedAt":             "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCcChainTask": {
+    "table": "fab_cc_chain_tasks",
+    "alias": "fcct",
+    "writeFields": [],
+    "fields": {
+      "id":                  "fcct.id",
+      "companyId":           "fcct.company_id",
+      "planId":              "fcct.plan_id",
+      "taskId":              "fcct.task_id",
+      "seq":                 "fcct.seq",
+      "chainRole":           "fcct.chain_role",
+      "feedingGroupId":      "fcct.feeding_group_id",
+      "aggressiveMinutes":   "fcct.aggressive_minutes",
+      "plannedStart":        "fcct.planned_start",
+      "plannedEnd":          "fcct.planned_end",
+      "createdAt":           "fcct.created_at",
+      "updatedAt":           "fcct.updated_at"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "planId":              "integer",
+      "taskId":              "integer",
+      "seq":                 "integer",
+      "chainRole":           "string",
+      "feedingGroupId":      "integer",
+      "aggressiveMinutes":   "integer",
+      "plannedStart":        "datetime",
+      "plannedEnd":          "datetime",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCcBuffer": {
+    "table": "fab_cc_buffers",
+    "alias": "fccb",
+    "writeFields": [],
+    "fields": {
+      "id":                "fccb.id",
+      "companyId":         "fccb.company_id",
+      "planId":            "fccb.plan_id",
+      "kind":              "fccb.kind",
+      "sizeMinutes":       "fccb.size_minutes",
+      "consumedMinutes":   "fccb.consumed_minutes",
+      "feedsTaskId":       "fccb.feeds_task_id",
+      "afterTaskId":       "fccb.after_task_id",
+      "warnPct":           "fccb.warn_pct",
+      "actPct":            "fccb.act_pct",
+      "createdAt":         "fccb.created_at",
+      "updatedAt":         "fccb.updated_at"
+    },
+    "fieldTypes": {
+      "id":                "integer",
+      "companyId":         "integer",
+      "planId":            "integer",
+      "kind":              "string",
+      "sizeMinutes":       "integer",
+      "consumedMinutes":   "integer",
+      "feedsTaskId":       "integer",
+      "afterTaskId":       "integer",
+      "warnPct":           "integer",
+      "actPct":            "integer",
+      "createdAt":         "datetime",
+      "updatedAt":         "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCcBufferSnapshot": {
+    "table": "fab_cc_buffer_snapshots",
+    "alias": "fccbs",
+    "writeFields": [],
+    "fields": {
+      "id":                  "fccbs.id",
+      "companyId":           "fccbs.company_id",
+      "planId":              "fccbs.plan_id",
+      "bufferId":            "fccbs.buffer_id",
+      "at":                  "fccbs.at",
+      "chainCompletePct":    "fccbs.chain_complete_pct",
+      "bufferConsumedPct":   "fccbs.buffer_consumed_pct",
+      "zone":                "fccbs.zone",
+      "createdAt":           "fccbs.created_at",
+      "updatedAt":           "fccbs.updated_at"
+    },
+    "fieldTypes": {
+      "id":                  "integer",
+      "companyId":           "integer",
+      "planId":              "integer",
+      "bufferId":            "integer",
+      "at":                  "datetime",
+      "chainCompletePct":    "integer",
+      "bufferConsumedPct":   "integer",
+      "zone":                "string",
+      "createdAt":           "datetime",
+      "updatedAt":           "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCcDrum": {
+    "table": "fab_cc_drum",
+    "alias": "fccd",
+    "writeFields": [],
+    "fields": {
+      "id":               "fccd.id",
+      "companyId":        "fccd.company_id",
+      "resourceTypeId":   "fccd.resource_type_id",
+      "resourceId":       "fccd.resource_id",
+      "loadMinutes":      "fccd.load_minutes",
+      "method":           "fccd.method",
+      "computedAt":       "fccd.computed_at",
+      "createdAt":        "fccd.created_at",
+      "updatedAt":        "fccd.updated_at"
+    },
+    "fieldTypes": {
+      "id":               "integer",
+      "companyId":        "integer",
+      "resourceTypeId":   "integer",
+      "resourceId":       "integer",
+      "loadMinutes":      "integer",
+      "method":           "string",
+      "computedAt":       "datetime",
+      "createdAt":        "datetime",
+      "updatedAt":        "datetime"
+    },
+    "relations": {}
+  },
+
+  "fabErpCcDrumSlot": {
+    "table": "fab_cc_drum_slots",
+    "alias": "fccds",
+    "writeFields": [],
+    "fields": {
+      "id":                       "fccds.id",
+      "companyId":                "fccds.company_id",
+      "drumId":                   "fccds.drum_id",
+      "orderId":                  "fccds.order_id",
+      "planId":                   "fccds.plan_id",
+      "seq":                      "fccds.seq",
+      "plannedStart":             "fccds.planned_start",
+      "plannedEnd":               "fccds.planned_end",
+      "capacityBufferMinutes":    "fccds.capacity_buffer_minutes",
+      "isCommitted":              "fccds.is_committed",
+      "createdAt":                "fccds.created_at",
+      "updatedAt":                "fccds.updated_at"
+    },
+    "fieldTypes": {
+      "id":                       "integer",
+      "companyId":                "integer",
+      "drumId":                   "integer",
+      "orderId":                  "integer",
+      "planId":                   "integer",
+      "seq":                      "integer",
+      "plannedStart":             "datetime",
+      "plannedEnd":               "datetime",
+      "capacityBufferMinutes":    "integer",
+      "isCommitted":              "boolean",
+      "createdAt":                "datetime",
+      "updatedAt":                "datetime"
+    },
+    "relations": {}
   }
 }

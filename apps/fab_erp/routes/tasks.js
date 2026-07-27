@@ -55,6 +55,7 @@ import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInve
 import { recomputeTaskAttribution, recomputeForResource } from '../services/taskAttributionService.js';
 import * as bufferService from '../services/bufferService.js';
 import { isOutputBlocked } from '../services/taskGatingService.js';
+import { recomputeForOrder as ccRecomputeForOrder } from '../services/ccBufferService.js';
 
 const router = Router();
 
@@ -879,6 +880,14 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       logger.error({ err, taskId }, 'attribution recompute failed'),
     );
 
+    // EU-5: refresh CC buffer consumption for this order (fire-and-forget — a CC
+    // recompute failure must never break the task lifecycle).
+    if (orderId != null) {
+      ccRecomputeForOrder(companyId, orderId).catch((err) =>
+        logger.error({ err, taskId, orderId }, 'cc buffer recompute failed'),
+      );
+    }
+
     return res.status(200).json({
       ok: true,
       taskId,
@@ -1070,12 +1079,13 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
     let rework = null;      // { reworkTaskId, failedSeqNo } when QC failed
     let producedQty = producedQtyIn;
     let planHours = null;   // FEAT-16: this task's planned hours, for the variance readout
+    let orderId = null;     // EU-5: captured for the post-commit CC buffer recompute
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
       const [taskRows] = await conn.query(
-        `SELECT t.id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
+        `SELECT t.id, t.order_id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
                 COALESCE(i.qty, 1) AS planned_qty
            FROM fab_project_tasks t
            LEFT JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
@@ -1101,6 +1111,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       // Default good qty to the item's planned qty when the operator didn't report one.
       if (producedQty == null) producedQty = Number(task.planned_qty) || 1;
       planHours = task.computed_hours; // FEAT-16
+      orderId = task.order_id;         // EU-5
 
       // BUG-11 + FEAT-05: gate the transition on the expected prior status
       // (atomic complete) and record the captured production output.
@@ -1162,6 +1173,14 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
     recomputeTaskAttribution(companyId, taskId).catch((err) =>
       logger.error({ err, taskId }, 'attribution recompute failed'),
     );
+
+    // EU-5: refresh CC buffer consumption for this order now that a chain task
+    // completed (fire-and-forget — never breaks the task lifecycle).
+    if (orderId != null) {
+      ccRecomputeForOrder(companyId, orderId).catch((err) =>
+        logger.error({ err, taskId, orderId }, 'cc buffer recompute failed'),
+      );
+    }
 
     // EU-7: place the produced item into the machine's output buffer, if one is
     // configured (opt-in). Best-effort — must never fail the stop response. Only

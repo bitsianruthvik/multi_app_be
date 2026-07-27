@@ -18,8 +18,32 @@
  */
 
 import { pool } from '../../../db.js';
+import { logger } from '../../../core/utils/logger.js';
 import { materializeOrderTasks } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
+import { buildBaseline } from './criticalChainService.js';
+
+/**
+ * EU-10 placeholder: if a portfolio drum-sequencing module has been added
+ * (not built as of EU-4), ask it to resequence after a baseline changes.
+ * Guarded so materializeTasks never depends on drumService existing — the
+ * dynamic import simply no-ops until EU-10 drops the module in.
+ */
+async function triggerDrumReplanIfAvailable(companyId) {
+  try {
+    const mod = await import('./drumService.js');
+    const replan = mod?.replan ?? mod?.default?.replan;
+    if (typeof replan === 'function') {
+      await replan(companyId);
+    }
+  } catch (err) {
+    // Module not present yet (EU-10) or it threw — either way, never let this
+    // affect task materialization.
+    if (err?.code !== 'ERR_MODULE_NOT_FOUND') {
+      logger.warn({ err, companyId }, '[cc] drumService replan trigger failed');
+    }
+  }
+}
 
 /**
  * @param {number} companyId
@@ -28,17 +52,36 @@ import { rollUpOrderStatus } from './taskEngineService.js';
  */
 export async function materializeTasks(companyId, orderId) {
   const conn = await pool.getConnection();
+  let result;
   try {
     await conn.beginTransaction();
-    const result = await materializeOrderTasks(conn, companyId, orderId);
+    result = await materializeOrderTasks(conn, companyId, orderId);
     // Building the DAG advances a sales order to 'scheduled' (2026-07-24 lifecycle).
     await rollUpOrderStatus(conn, companyId, orderId);
     await conn.commit();
-    return result;
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
   }
+
+  // EU-4: auto-baseline sales orders once their tasks are materialized.
+  // Never lets a CC failure break materialization — the tasks are already
+  // committed above by this point.
+  try {
+    const [[order]] = await pool.query(
+      `SELECT order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [orderId, companyId],
+    );
+    if (order?.order_type === 'sales') {
+      await buildBaseline({ companyId, orderId });
+      // EU-10 placeholder — no-ops until drumService.js exists.
+      await triggerDrumReplanIfAvailable(companyId);
+    }
+  } catch (err) {
+    logger.warn({ err, companyId, orderId }, '[cc] auto-baseline after materialize failed');
+  }
+
+  return result;
 }

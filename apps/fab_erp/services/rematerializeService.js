@@ -31,6 +31,9 @@ import {
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { evaluateFormula } from './formulaEngine.js';
 import { getUsableStat } from './operationStatsService.js';
+import { buildBaseline } from './criticalChainService.js';
+import { replan as drumReplan } from './drumService.js';
+import { logger } from '../../../core/utils/logger.js';
 
 const STARTED_STATUSES = new Set(['in_progress', 'paused', 'done']);
 const HOURS_EPS = 0.01;
@@ -183,6 +186,7 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
  */
 export async function applyRematerialize(companyId, orderId) {
   const conn = await pool.getConnection();
+  let result;
   try {
     await conn.beginTransaction();
 
@@ -218,11 +222,29 @@ export async function applyRematerialize(companyId, orderId) {
     await rollUpOrderStatus(conn, companyId, orderId);
 
     await conn.commit();
-    return { ok: true, orderId, deletedUnstarted: deleted, rebuilt };
+    result = { ok: true, orderId, deletedUnstarted: deleted, rebuilt };
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
   }
+
+  // After the rebuild is committed: refresh this order's CCPM baseline (its DAG
+  // changed) and replan the drum. Sales orders only; fully guarded so a Critical
+  // Chain failure never breaks re-materialization.
+  try {
+    const [[order]] = await pool.query(
+      `SELECT order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [orderId, companyId],
+    );
+    if (order?.order_type === 'sales') {
+      await buildBaseline({ companyId, orderId });
+      await drumReplan(companyId);
+    }
+  } catch (err) {
+    logger.warn({ err, companyId, orderId }, '[cc] rematerialize baseline/replan refresh failed (non-fatal)');
+  }
+
+  return result;
 }

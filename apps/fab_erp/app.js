@@ -2,6 +2,7 @@ import fs   from 'fs';
 import path  from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes            from './routes/index.js';
+import criticalChainRoutes    from './routes/criticalChain.js';
 import { runMrp, markAutoRun } from './services/mrpService.js';
 import { pool }                from '../../db.js';
 import { logger }              from '../../core/utils/logger.js';
@@ -59,6 +60,9 @@ export default {
 
   register(server) {
     server.use('/api/:companySlug/fab_erp', indexRoutes);
+    // EU-4: critical-chain baseline route, mounted separately (same prefix)
+    // rather than folded into routes/index.js — see routes/criticalChain.js.
+    server.use('/api/:companySlug/fab_erp', criticalChainRoutes);
     // Tick every 60 s — checks each company's configured run time
     setInterval(checkAndRunMrp, 60 * 1000);
     logger.info('[mrp] per-company nightly scheduler started');

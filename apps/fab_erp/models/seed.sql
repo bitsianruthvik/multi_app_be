@@ -554,3 +554,32 @@ JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
 JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
 JOIN features_capability fc
   ON fc.name IN ('fab_erp_buffer_config', 'fab_erp_time_backfill', 'fab_erp_shopfloor_analytics_view');
+
+-- =============================================================================
+-- Section 9: Critical Chain view/manage permission tags (EU-1)
+-- (mirror of TM/seed_fab_erp_criticalchain.sql — set-based, idempotent)
+--   fab_erp_cc_view, fab_erp_cc_manage
+-- =============================================================================
+INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
+  ('View Critical Chain',    'fab_erp_cc_view',    'frontend'),
+  ('Manage Critical Chain',  'fab_erp_cc_manage',  'backend');
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_cc_view', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_cc_view') AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_cc_view')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_cc_manage', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_cc_manage') AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_cc_manage')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, c.id, a.id, fc.capability_id
+FROM companies c
+JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
+JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
+JOIN features_capability fc
+  ON fc.name IN ('fab_erp_cc_view', 'fab_erp_cc_manage');
