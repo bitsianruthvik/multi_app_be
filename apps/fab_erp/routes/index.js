@@ -17,6 +17,7 @@ import machineStateRouter from './machineState.js';
 import buffersRouter   from './buffers.js';
 import reconciliationRouter from './reconciliation.js';
 import analyticsRouter   from './analytics.js';
+import navCountsRouter   from './navCounts.js';
 
 const router = Router();
 
@@ -40,5 +41,6 @@ router.use(machineStateRouter);
 router.use(buffersRouter);
 router.use(reconciliationRouter);
 router.use(analyticsRouter);
+router.use(navCountsRouter);
 
 export default router;
