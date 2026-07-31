@@ -48,9 +48,16 @@ import { pool } from '../../../db.js';
 const router = Router();
 
 // groupBy values that map directly onto a fab_stock_pieces column.
+//
+// `stockLocationId` was missing here while Plants.tsx's Stock Levels tab had
+// always requested it (its own comment claimed the value was supported), so
+// that tab 400'd on every load and permanently showed "No stock data for the
+// selected filters". Adding it is purely additive — the column exists on
+// fab_stock_pieces and the grouping logic is column-agnostic.
 const PIECE_COLUMN_GROUP_BYS = {
   batchNo: 'batch_no',
   heatNo: 'heat_no',
+  stockLocationId: 'stock_location_id',
 };
 
 // ── GET /stock/summary ────────────────────────────────────────────────────
@@ -121,8 +128,11 @@ router.get('/stock/summary', protect, async (req, res) => {
     } else if (Object.prototype.hasOwnProperty.call(PIECE_COLUMN_GROUP_BYS, groupBy)) {
       pieceColumn = PIECE_COLUMN_GROUP_BYS[groupBy];
     } else {
+      // Build the list from the map so this message can't drift out of sync
+      // with what is actually accepted — which is how the missing
+      // stockLocationId value went unnoticed.
       return res.status(400).json({
-        message: 'groupBy must be one of batchNo, heatNo, or piece.',
+        message: `groupBy must be one of ${Object.keys(PIECE_COLUMN_GROUP_BYS).join(', ')}, or piece.`,
       });
     }
   }
