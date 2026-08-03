@@ -150,6 +150,10 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.order_id AS orderId,
         fo.order_number AS orderNumber,
         t.item_id AS itemId,
+        it.name AS itemName,
+        it.qty AS itemQty,
+        it.unit AS itemUnit,
+        ic.code AS itemCode,
         t.seq_no AS seqNo,
         t.status,
         t.deps_cleared_at AS depsClearedAt,
@@ -168,6 +172,8 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
       FROM fab_project_tasks t
       LEFT JOIN fab_operations op ON t.operation_id = op.id
       LEFT JOIN fab_orders fo ON t.order_id = fo.id
+      LEFT JOIN fab_items it ON it.id = t.item_id AND it.deleted_at IS NULL
+      LEFT JOIN fab_item_catalog ic ON ic.id = it.catalog_item_id AND ic.deleted_at IS NULL
       WHERE t.company_id = ?
         AND t.status IN ('eligible', 'in_progress', 'paused')
         AND t.deleted_at IS NULL
@@ -179,6 +185,51 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
     `;
 
     const [taskRows] = await pool.query(tasksQuery, [companyId, rid, resourceTypeId]);
+
+    // ── Where does this work sit in the project? ────────────────────────────
+    //
+    // The queue previously returned item_id and nothing else, so an operator saw
+    // "Cut Plate (CNC) · SO-0001" and had no way to know *which part* to pick up
+    // — the single most important fact on the screen was missing.
+    //
+    // Resolve each distinct item to its ancestor chain in one recursive pass
+    // rather than per row: a queue is dozens of tasks over a handful of items,
+    // so per-row walking would be mostly duplicate work.
+    const itemIds = [...new Set(taskRows.map((t) => t.itemId).filter(Boolean))];
+    const pathByItem = new Map();
+
+    if (itemIds.length > 0) {
+      const placeholders = itemIds.map(() => '?').join(',');
+      const [pathRows] = await pool.query(
+        `WITH RECURSIVE chain AS (
+           SELECT id AS leaf_id, id, parent_item_id, name, 0 AS depth
+           FROM fab_items
+           WHERE id IN (${placeholders}) AND company_id = ? AND deleted_at IS NULL
+           UNION ALL
+           SELECT c.leaf_id, p.id, p.parent_item_id, p.name, c.depth + 1
+           FROM chain c
+           JOIN fab_items p ON p.id = c.parent_item_id AND p.deleted_at IS NULL
+           WHERE c.depth < 20            -- cycle guard; BOM trees are shallow
+         )
+         SELECT leaf_id, id, name, depth FROM chain ORDER BY leaf_id, depth DESC`,
+        [...itemIds, companyId],
+      );
+
+      for (const r of pathRows) {
+        if (!pathByItem.has(r.leaf_id)) pathByItem.set(r.leaf_id, []);
+        // depth DESC => root first, leaf last: "Bridge Span 1 › Girder A › Web Plate"
+        pathByItem.get(r.leaf_id).push(r.name);
+      }
+    }
+
+    for (const t of taskRows) {
+      const path = pathByItem.get(t.itemId) ?? [];
+      // itemName is the leaf; itemPath is the ancestors above it, so the UI can
+      // lead with the part and show its context underneath. Falls back to the
+      // row's own joined name when the recursive walk found nothing.
+      t.itemName = path.length ? path[path.length - 1] : (t.itemName ?? null);
+      t.itemPath = path.slice(0, -1);
+    }
 
     // Count tasks by status
     const counts = {
