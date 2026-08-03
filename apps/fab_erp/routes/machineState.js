@@ -113,7 +113,8 @@ router.get('/machines/board', protect, async (req, res) => {
 
     const [inProgressTasks] = await pool.query(
       `SELECT t.id, t.assigned_resource_id AS assignedResourceId, op.name AS operationName,
-              it.name AS itemName, t.started_at AS startedAt
+              it.name AS itemName, it.mark AS itemMark, t.started_at AS startedAt,
+              t.batch_id AS batchId
          FROM fab_project_tasks t
          LEFT JOIN fab_operations op ON t.operation_id = op.id
          LEFT JOIN fab_items it ON t.item_id = it.id
@@ -139,14 +140,31 @@ router.get('/machines/board', protect, async (req, res) => {
 
     const eventByResource = new Map(latestEvents.map((e) => [e.resourceId, e]));
 
-    // If a data conflict ever produces >1 in_progress task on one resource,
-    // keep the most recently started one.
-    const taskByResource = new Map();
+    // A machine can legitimately have several in_progress tasks now: a batch
+    // (Issue 4) is exactly that. This used to keep only the most recently
+    // started one and call the rest a data conflict, so a plasma table cutting
+    // four nested plates showed one part's name and silently hid three.
+    //
+    // Keep the earliest-started task as the card's headline (it's the one whose
+    // clock the run is measured on) and carry the sibling count alongside, so
+    // the card can say "4 parts running together" instead of naming one.
+    const tasksByResource = new Map();
     for (const t of inProgressTasks) {
-      const existing = taskByResource.get(t.assignedResourceId);
-      if (!existing || new Date(t.startedAt) > new Date(existing.startedAt)) {
-        taskByResource.set(t.assignedResourceId, t);
-      }
+      if (!tasksByResource.has(t.assignedResourceId)) tasksByResource.set(t.assignedResourceId, []);
+      tasksByResource.get(t.assignedResourceId).push(t);
+    }
+
+    const taskByResource = new Map();
+    for (const [resourceId, list] of tasksByResource) {
+      list.sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+      const head = list[0];
+      taskByResource.set(resourceId, {
+        ...head,
+        taskCount: list.length,
+        // Only a real batch groups tasks. Several unbatched in_progress rows on
+        // one machine still means something is wrong, and the card says so.
+        batched: head.batchId != null && list.every((t) => t.batchId === head.batchId),
+      });
     }
 
     const absentSet = new Set(absentRows.map((r) => `${r.resourceId}:${r.userId}`));
@@ -189,7 +207,16 @@ router.get('/machines/board', protect, async (req, res) => {
         reasonCode,
         stateSince,
         currentTask: task
-          ? { id: task.id, operationName: task.operationName, itemName: task.itemName, startedAt: task.startedAt }
+          ? {
+            id: task.id,
+            operationName: task.operationName,
+            itemName: task.itemName,
+            itemMark: task.itemMark,
+            startedAt: task.startedAt,
+            batchId: task.batchId,
+            taskCount: task.taskCount,
+            batched: task.batched,
+          }
           : null,
         operators: operatorsByResource.get(r.id) ?? [],
       };

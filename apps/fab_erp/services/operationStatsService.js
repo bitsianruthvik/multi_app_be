@@ -127,7 +127,7 @@ function ewma(valuesInTimeOrder, alpha) {
  */
 export async function recomputeStatsForCompany(companyId) {
   const [tasks] = await pool.query(
-    `SELECT id, operation_id, resource_type_id
+    `SELECT id, operation_id, resource_type_id, attributed_minutes
        FROM fab_project_tasks
       WHERE company_id = ? AND deleted_at IS NULL AND status = 'done'`,
     [companyId],
@@ -158,6 +158,16 @@ export async function recomputeStatsForCompany(companyId) {
     if (!taskEvents) continue;
     const sample = buildSample(taskEvents);
     if (!sample) continue;
+
+    // Issue 4 (batching): eight parts cut in one 40-minute nest all carry
+    // started 09:00 / completed 09:40 — true, but not eight independent
+    // 40-minute samples. Without this override the model would learn that the
+    // operation takes 40 minutes a part, and every future estimate for it would
+    // be inflated by however many pieces happen to fit on a sheet. The share
+    // batchService attributed to this task is the sample.
+    if (task.attributed_minutes != null) {
+      sample.touchMinutes = Number(task.attributed_minutes);
+    }
 
     const key = `${task.operation_id}::${task.resource_type_id == null ? 'null' : task.resource_type_id}`;
     if (!groups.has(key)) {

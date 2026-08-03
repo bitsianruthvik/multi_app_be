@@ -164,6 +164,7 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.delay_reason AS delayReason,
         t.computed_hours AS computedHours,
         t.assigned_resource_id AS assignedResourceId,
+        t.batch_id AS batchId,
         t.queued_at AS queuedAt,
         t.started_at AS startedAt,
         t.paused_at AS pausedAt,

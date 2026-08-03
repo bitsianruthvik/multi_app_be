@@ -20,11 +20,23 @@ const round2 = (n) => (n == null ? null : Math.round(n * 100) / 100);
  * Actual touch-HOURS for a set of tasks, from their (non-superseded) event logs.
  * One query for all task ids. Returns Map<taskId, actualHours|null> (null when a
  * task has no usable started/completed pair yet).
+ *
+ * Issue 4 (batching): a batched task's events are truthful but not divisible —
+ * eight parts cut in one 40-minute nest each show started 09:00 / completed
+ * 09:40, so the event derivation would report 40 minutes eight times. When
+ * batchService has attributed a share of the run to a task, that share wins.
  */
 export async function computeActualHoursForTasks(exec, companyId, taskIds) {
   const ids = [...new Set((taskIds || []).map(Number).filter(Number.isInteger))];
   const out = new Map();
   if (!ids.length) return out;
+
+  const [attrRows] = await exec.query(
+    `SELECT id, attributed_minutes FROM fab_project_tasks
+      WHERE company_id = ? AND id IN (?) AND attributed_minutes IS NOT NULL`,
+    [companyId, ids],
+  );
+  const attributed = new Map(attrRows.map((r) => [r.id, Number(r.attributed_minutes)]));
 
   const [rows] = await exec.query(
     `SELECT task_id, event_type, at, source
@@ -40,6 +52,10 @@ export async function computeActualHoursForTasks(exec, companyId, taskIds) {
     byTask.get(r.task_id).push(r);
   }
   for (const id of ids) {
+    if (attributed.has(id)) {
+      out.set(id, round2(attributed.get(id) / 60));
+      continue;
+    }
     const evts = byTask.get(id);
     const sample = evts ? buildSample(evts) : null;
     out.set(id, sample ? round2(sample.touchMinutes / 60) : null);
