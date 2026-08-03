@@ -18,6 +18,7 @@ import buffersRouter   from './buffers.js';
 import reconciliationRouter from './reconciliation.js';
 import analyticsRouter   from './analytics.js';
 import navCountsRouter   from './navCounts.js';
+import pulseRouter       from './pulse.js';
 
 const router = Router();
 
@@ -42,5 +43,6 @@ router.use(buffersRouter);
 router.use(reconciliationRouter);
 router.use(analyticsRouter);
 router.use(navCountsRouter);
+router.use(pulseRouter);
 
 export default router;

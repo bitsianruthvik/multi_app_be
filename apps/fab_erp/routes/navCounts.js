@@ -73,11 +73,16 @@ router.get('/nav-counts', protect, async (req, res) => {
          AND assigned_resource_id IS NOT NULL`,
       [companyId]],
 
-    // Buffers past their action threshold — the CCPM "red zone".
+    // Buffers past their action threshold — the CCPM "red zone". Scoped to
+    // live plans: a superseded or archived plan's buffers are history, and
+    // counting them made the badge permanently red once a project replanned.
+    // act_pct is NOT NULL DEFAULT 67, so the old COALESCE was dead.
     ['redBuffers',
-      `SELECT COUNT(*) AS n FROM fab_cc_buffers
-       WHERE company_id=? AND deleted_at IS NULL AND size_minutes > 0
-         AND (consumed_minutes / size_minutes) * 100 >= COALESCE(act_pct, 66)`,
+      `SELECT COUNT(*) AS n FROM fab_cc_buffers b
+       JOIN fab_cc_plans p ON p.id = b.plan_id AND p.deleted_at IS NULL
+         AND p.status IN ('draft','baselined')
+       WHERE b.company_id=? AND b.deleted_at IS NULL AND b.size_minutes > 0
+         AND (b.consumed_minutes / b.size_minutes) * 100 >= b.act_pct`,
       [companyId]],
 
     ['items',
