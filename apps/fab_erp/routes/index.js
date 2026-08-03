@@ -21,6 +21,7 @@ import navCountsRouter   from './navCounts.js';
 import pulseRouter       from './pulse.js';
 import marksRouter       from './marks.js';
 import batchesRouter     from './batches.js';
+import shiftLogRouter    from './shiftLog.js';
 
 const router = Router();
 
@@ -48,5 +49,6 @@ router.use(navCountsRouter);
 router.use(pulseRouter);
 router.use(marksRouter);
 router.use(batchesRouter);
+router.use(shiftLogRouter);
 
 export default router;
