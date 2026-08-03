@@ -19,6 +19,7 @@ import reconciliationRouter from './reconciliation.js';
 import analyticsRouter   from './analytics.js';
 import navCountsRouter   from './navCounts.js';
 import pulseRouter       from './pulse.js';
+import marksRouter       from './marks.js';
 
 const router = Router();
 
@@ -44,5 +45,6 @@ router.use(reconciliationRouter);
 router.use(analyticsRouter);
 router.use(navCountsRouter);
 router.use(pulseRouter);
+router.use(marksRouter);
 
 export default router;
