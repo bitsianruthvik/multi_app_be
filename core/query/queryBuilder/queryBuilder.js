@@ -78,5 +78,27 @@ export async function buildQuery(config) {
       .map((part) => part.trim())
       .join(" ") + ";";
 
-  return { sql, params: whereParams };
+  // 9. Matching COUNT, for callers that need a true total rather than the size
+  //    of the page they just fetched.
+  //
+  //    Built by swapping the SELECT list for COUNT(*) while keeping the exact
+  //    FROM/JOIN and the *already-secured* WHERE — so the count is subject to
+  //    the same company/team scoping and soft-delete filter as the rows. Any
+  //    other construction risks a count that leaks across tenants.
+  //
+  //    Returned but never executed here; the caller decides whether the extra
+  //    round trip is worth it (see baseResourceRoute's `includeTotal`).
+  //    Aggregate queries are excluded: COUNT(*) over a GROUP BY counts groups,
+  //    not rows, which is a different question than the caller is asking.
+  const countSql = aggregate
+    ? null
+    : [
+        selectJoinSQL.replace(/^SELECT[\s\S]*?\sFROM\s/i, 'SELECT COUNT(*) AS total FROM '),
+        whereSql,
+      ]
+        .filter(Boolean)
+        .map((part) => part.trim())
+        .join(' ') + ';';
+
+  return { sql, params: whereParams, countSql };
 }

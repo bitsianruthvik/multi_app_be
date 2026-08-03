@@ -99,14 +99,14 @@ router.post("/base_resource", async (req, res) => {
       url: req.url,
     });
 
-    const { operation, resource, fields, filters, orderBy, pagination, data, include_deleted } =
+    const { operation, resource, fields, filters, orderBy, pagination, data, include_deleted, includeTotal } =
       req.body || {};
 
     // For read operations (query)
     if (operation === "query") {
       try {
         logger.info("Building query for resource:", resource);
-        const { sql, params } = await buildQuery({
+        const { sql, params, countSql } = await buildQuery({
           resource,
           fields,
           filters,
@@ -117,6 +117,25 @@ router.post("/base_resource", async (req, res) => {
         });
         logger.info("Generated SQL:", sql, params);
         const [rows] = await pool.query(sql, params);
+
+        // `total` is opt-in. It is a genuine COUNT over the same secured WHERE,
+        // NOT rows.length — with pagination those differ, and callers that
+        // measured the returned array were silently reporting the page size as
+        // the total (the fab_erp cockpit read "1 part defined" against 8 items).
+        //
+        // Opt-in because it costs a second round trip, and the overwhelming
+        // majority of reads here don't need a count. Never infer a total from
+        // `data.length` on the client.
+        if (includeTotal) {
+          if (!countSql) {
+            // Aggregate queries have no meaningful row count — say so rather
+            // than returning a number that answers a different question.
+            return res.json({ success: true, data: rows, total: null });
+          }
+          const [countRows] = await pool.query(countSql, params);
+          return res.json({ success: true, data: rows, total: Number(countRows[0]?.total ?? 0) });
+        }
+
         return res.json({ success: true, data: rows });
       } catch (qErr) {
         logger.error("Query failed in base_resource:", qErr);

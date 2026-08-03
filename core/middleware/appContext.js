@@ -67,13 +67,21 @@ export const appContext = async (req, res, next) => {
       return next();
     }
 
-    // Skip company-level routes: /api/:company/auth/... and /api/:company/apps
-    // These use the company slug only (no app slug). We detect them by checking
-    // whether the 3rd path segment is a known company-level route keyword.
+    // Skip company-level routes: /api/:company/auth/…, /api/:company/apps and
+    // /api/:company/schema/…. These use the company slug only (no app slug), so
+    // without this list appContext reads the 3rd segment as an app slug, fails
+    // to find an app by that name, and 404s the whole route.
+    //
+    // `schema` was missing until 2026-07-31: GET /api/:company/schema/resources
+    // returned `App not found: schema for company <slug>` on every call.
+    // Verified 404 before the fix, 200 after.
+    //
+    // Adding a company-level route? Add its keyword here in the same commit —
+    // the failure is a confusing 404 that looks like bad data, not a bug.
     if (
       parts.length > 2 &&
       parts[0].toLowerCase() === "api" &&
-      ["auth", "apps"].includes(parts[2].toLowerCase())
+      ["auth", "apps", "schema"].includes(parts[2].toLowerCase())
     ) {
       req.company = null;
       req.appCtx = null;
