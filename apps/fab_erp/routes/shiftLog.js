@@ -42,6 +42,7 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import { recordEvents } from '../services/taskEventService.js';
 import { resolveCalendarIds, workingIntervalsInWindow } from '../services/taskWaitService.js';
+import { crewForWindow } from '../services/workerService.js';
 import { recomputeForResource } from '../services/taskAttributionService.js';
 
 const router = Router();
@@ -157,18 +158,19 @@ router.get('/shift-log', protect, async (req, res) => {
       [companyId, resourceId, toSqlUtc(start), toSqlUtc(end)],
     );
 
-    const [operators] = await pool.query(
-      `SELECT o.user_id AS userId, u.name, o.is_primary AS isPrimary,
-              EXISTS (
-                SELECT 1 FROM fab_resource_operators a
-                 WHERE a.company_id = o.company_id AND a.resource_id = o.resource_id
-                   AND a.user_id = o.user_id AND a.absent_on = ? AND a.deleted_at IS NULL
-              ) AS absent
-         FROM fab_resource_operators o
-         JOIN users u ON u.id = o.user_id
-        WHERE o.company_id = ? AND o.resource_id = ? AND o.absent_on IS NULL AND o.deleted_at IS NULL`,
-      [date, companyId, resourceId],
-    );
+    // The crew that machine had on THAT day, with any time away — intervals, so
+    // "left at 4" survives as a fact instead of collapsing into "absent".
+    const crew = await crewForWindow(pool, companyId, resourceId, start, end);
+    const operators = crew.map((c) => ({
+      workerId: c.workerId,
+      userId: c.userId,
+      name: c.name,
+      workerType: c.workerType,
+      vendorName: c.vendorName,
+      away: c.away.map((a) => ({ id: a.id, from: a.fromTs, to: a.toTs, reason: a.reason })),
+      // True only for a full-day absence; a part-day is described by `away`.
+      absent: c.away.some((a) => new Date(a.fromTs) <= start && (a.toTs == null || new Date(a.toTs) >= end)),
+    }));
 
     const [reasons] = await pool.query(
       `SELECT code, label FROM fab_resource_downtime_reasons
@@ -373,21 +375,32 @@ router.post('/shift-log', protect, async (req, res) => {
       }
     }
 
+    // Absence writes an interval. `from`/`to` are optional: without them it's a
+    // whole day (midnight to midnight), with them it's "left at 4" — the same
+    // record at a different scale, which is the point of the interval model.
     for (const a of absences) {
-      const userId = Number(a?.userId);
-      if (!(userId > 0)) continue;
+      const workerId = Number(a?.workerId);
+      if (!(workerId > 0)) continue;
       if (a?.absent) {
+        const from = a.from ? new Date(a.from) : start;
+        const to = a.to ? new Date(a.to) : end;
+        if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || to <= from) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'Time away must end after it starts.' });
+        }
         await conn.query(
-          `INSERT INTO fab_resource_operators (company_id, resource_id, user_id, absent_on)
-           VALUES (?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE deleted_at = NULL`,
-          [companyId, resourceId, userId, date],
+          `INSERT INTO fab_worker_assignments
+             (company_id, worker_id, resource_id, kind, from_ts, to_ts, reason, note, entered_by)
+           VALUES (?, ?, NULL, 'away', ?, ?, ?, ?, ?)`,
+          [companyId, workerId, toSqlUtc(from), toSqlUtc(to), a.reason ?? 'leave', a.note ?? null, user.id],
         );
       } else {
+        // Un-ticking someone withdraws the away intervals that overlap this day.
         await conn.query(
-          `UPDATE fab_resource_operators SET deleted_at = NOW()
-            WHERE company_id = ? AND resource_id = ? AND user_id = ? AND absent_on = ? AND deleted_at IS NULL`,
-          [companyId, resourceId, userId, date],
+          `UPDATE fab_worker_assignments SET deleted_at = NOW()
+            WHERE company_id = ? AND worker_id = ? AND kind = 'away' AND deleted_at IS NULL
+              AND from_ts < ? AND (to_ts IS NULL OR to_ts > ?)`,
+          [companyId, workerId, toSqlUtc(end), toSqlUtc(start)],
         );
       }
     }

@@ -22,6 +22,7 @@ import pulseRouter       from './pulse.js';
 import marksRouter       from './marks.js';
 import batchesRouter     from './batches.js';
 import shiftLogRouter    from './shiftLog.js';
+import workersRouter     from './workers.js';
 
 const router = Router();
 
@@ -50,5 +51,6 @@ router.use(pulseRouter);
 router.use(marksRouter);
 router.use(batchesRouter);
 router.use(shiftLogRouter);
+router.use(workersRouter);
 
 export default router;

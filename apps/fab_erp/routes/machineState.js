@@ -123,18 +123,26 @@ router.get('/machines/board', protect, async (req, res) => {
       [companyId],
     );
 
+    // Crew now comes from fab_worker_assignments — intervals, not flags — so a
+    // person who left at 4pm or moved machines after lunch is reflected on the
+    // board immediately, rather than only being expressible as a whole-day
+    // absence. `absentToday` is retained as a name but now means "away right
+    // now", which is what the board was always trying to say.
     const [operatorRows] = await pool.query(
-      `SELECT o.resource_id AS resourceId, o.user_id AS userId, o.is_primary AS isPrimary, u.name AS name
-         FROM fab_resource_operators o
-         JOIN users u ON u.id = o.user_id
-        WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.absent_on IS NULL`,
+      `SELECT a.resource_id AS resourceId, w.id AS workerId, w.user_id AS userId,
+              w.name AS name, w.worker_type AS workerType, w.vendor_name AS vendorName
+         FROM fab_worker_assignments a
+         JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
+        WHERE a.company_id = ? AND a.kind = 'assigned' AND a.deleted_at IS NULL
+          AND a.from_ts <= NOW() AND (a.to_ts IS NULL OR a.to_ts > NOW())`,
       [companyId],
     );
 
     const [absentRows] = await pool.query(
-      `SELECT resource_id AS resourceId, user_id AS userId
-         FROM fab_resource_operators
-        WHERE company_id = ? AND deleted_at IS NULL AND absent_on = CURDATE()`,
+      `SELECT worker_id AS workerId, reason
+         FROM fab_worker_assignments
+        WHERE company_id = ? AND kind = 'away' AND deleted_at IS NULL
+          AND from_ts <= NOW() AND (to_ts IS NULL OR to_ts > NOW())`,
       [companyId],
     );
 
@@ -167,16 +175,22 @@ router.get('/machines/board', protect, async (req, res) => {
       });
     }
 
-    const absentSet = new Set(absentRows.map((r) => `${r.resourceId}:${r.userId}`));
+    // Away is per-PERSON, not per-machine — someone who went home is away from
+    // every machine they're on, so this is keyed by worker rather than by pair.
+    const awayByWorker = new Map(absentRows.map((r) => [r.workerId, r.reason]));
 
     const operatorsByResource = new Map();
     for (const o of operatorRows) {
       if (!operatorsByResource.has(o.resourceId)) operatorsByResource.set(o.resourceId, []);
       operatorsByResource.get(o.resourceId).push({
+        workerId: o.workerId,
         userId: o.userId,
         name: o.name,
-        isPrimary: !!o.isPrimary,
-        absentToday: absentSet.has(`${o.resourceId}:${o.userId}`),
+        workerType: o.workerType,
+        vendorName: o.vendorName,
+        isPrimary: false,
+        absentToday: awayByWorker.has(o.workerId),
+        awayReason: awayByWorker.get(o.workerId) ?? null,
       });
     }
 

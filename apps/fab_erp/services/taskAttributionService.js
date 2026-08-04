@@ -29,7 +29,9 @@
  *     1. no_shift        (window minus working intervals; working_minutes = 0)
  *     -- everything below is classified WITHIN the in-shift intervals only --
  *     2. machine_down    (assigned machine down/off from fab_resource_events)
- *     3. no_operator     (full dates where every standing operator is absent)
+ *     3. no_operator     (time no assigned worker was present — real intervals
+ *                         as of 2026-08-03; was whole dates only, because
+ *                         absence used to be a DATE column)
  *     4. machine_busy    (other tasks on the same resource/type)
  *     5. output_blocked  (reserved — produces nothing yet; see TODO below)
  *     6. unexplained_idle (the remainder)
@@ -51,6 +53,7 @@ import {
   mergeIntervals,
 } from './taskWaitService.js';
 import { processPredecessorsDone, isOutputBlocked } from './taskGatingService.js';
+import { crewForWindow, coveredIntervals } from './workerService.js';
 
 // ─── pure interval helpers (over [{start:Date,end:Date}] lists) ───────────────
 
@@ -134,43 +137,30 @@ async function loadMachineDownIntervals(companyId, resourceId, now) {
 }
 
 /**
- * Full-day intervals on which the machine had ≥1 standing operator AND every
- * standing operator was marked absent. Returns [] when the machine has zero
- * standing operators (per spec — an unmanned-by-design machine never counts as
- * "no operator"). Day boundaries are UTC midnights to live in the same instant
- * space as workingIntervalsInWindow's shift intervals.
+ * Periods in [windowStart, windowEnd) when this machine had nobody on it.
+ *
+ * This used to read `fab_resource_operators` and could only produce WHOLE DATES
+ * — "every standing operator has an absent_on row for this day" — because
+ * absence was a DATE column. An afternoon with nobody on the machine was
+ * therefore invisible to attribution, and a half-day of idle time got
+ * classified as `unexplained_idle` instead of the real cause.
+ *
+ * It now derives from `fab_worker_assignments` intervals (workerService
+ * .coveredIntervals): no_operator is simply the window minus the time at least
+ * one assigned worker was present and not away.
+ *
+ * IMPORTANT SAFETY PROPERTY, PRESERVED FROM THE OLD RULE: a machine with no
+ * crew assigned at all yields NO no_operator intervals. Absence of a roster
+ * means we don't know who was there, not that nobody was — and claiming
+ * otherwise would reclassify the entire history of every machine that hasn't
+ * been rostered yet, which is most of them.
  */
-async function loadNoOperatorIntervals(companyId, resourceId) {
-  const [ops] = await pool.query(
-    `SELECT user_id, absent_on FROM fab_resource_operators
-      WHERE company_id = ? AND resource_id = ? AND deleted_at IS NULL`,
-    [companyId, resourceId],
-  );
-  const standing = new Set();
-  const absentByDate = new Map(); // 'YYYY-MM-DD' -> Set(user_id)
-  for (const r of ops) {
-    if (r.absent_on == null) {
-      standing.add(r.user_id);
-    } else {
-      const ymd = String(r.absent_on).slice(0, 10);
-      if (!absentByDate.has(ymd)) absentByDate.set(ymd, new Set());
-      absentByDate.get(ymd).add(r.user_id);
-    }
-  }
-  if (standing.size === 0) return [];
+async function loadNoOperatorIntervals(companyId, resourceId, windowStart, windowEnd) {
+  const crew = await crewForWindow(pool, companyId, resourceId, windowStart, windowEnd);
+  if (crew.length === 0) return [];
 
-  const out = [];
-  for (const [ymd, absentSet] of absentByDate) {
-    let allAbsent = true;
-    for (const u of standing) {
-      if (!absentSet.has(u)) { allAbsent = false; break; }
-    }
-    if (!allAbsent) continue;
-    const dayStart = new Date(`${ymd}T00:00:00Z`);
-    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
-    out.push({ start: dayStart, end: dayEnd });
-  }
-  return mergeIntervals(out);
+  const covered = await coveredIntervals(pool, companyId, resourceId, windowStart, windowEnd);
+  return mergeIntervals(subtractIntervals([{ start: windowStart, end: windowEnd }], covered));
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -280,7 +270,7 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
     let noOperator = [];
     if (task.assigned_resource_id) {
       machineDown = await loadMachineDownIntervals(companyId, task.assigned_resource_id, now);
-      noOperator = await loadNoOperatorIntervals(companyId, task.assigned_resource_id);
+      noOperator = await loadNoOperatorIntervals(companyId, task.assigned_resource_id, spanStart, spanEnd);
     }
     const machineBusy = mergeIntervals(
       await fetchOverlappingOtherTasks(companyId, task, spanStart, spanEnd, now),
