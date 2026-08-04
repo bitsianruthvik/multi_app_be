@@ -4,6 +4,22 @@
  * EU-2: Dual-write lifecycle events into fab_task_events alongside the
  * existing fab_project_tasks timestamp columns. Event logging must never
  * break the caller's main write — all failures are caught and logged.
+ *
+ * RUNNING INSIDE A CALLER'S TRANSACTION (`exec`)
+ * ---------------------------------------------
+ * Both writers take an optional `exec` — a transaction connection — and fall
+ * back to the pool when it is absent.
+ *
+ * That parameter is not a convenience. Until 2026-08-04 these always used the
+ * pool, so a caller holding a transaction (applyRematerialize → materializeOrderTasks
+ * → tryClearTask) wrote its task rows on one connection and its events on a
+ * SECOND one. The second connection then waited for locks the first would only
+ * release on commit — and the first could not commit, because it was waiting on
+ * the second. A textbook self-deadlock, which surfaced as "Lock wait timeout
+ * exceeded" roughly a minute into any re-materialize big enough to matter.
+ * Preview never hit it (read-only, no transaction), so it looked fine.
+ *
+ * If you call these from inside a transaction, PASS THE CONNECTION.
  */
 
 import { pool } from '../../../db.js';
@@ -28,9 +44,9 @@ export async function recordEvent({
   source = 'live',
   enteredBy = null,
   note = null,
-}) {
+}, exec = pool) {
   try {
-    await pool.query(
+    await exec.query(
       `INSERT INTO fab_task_events (company_id, task_id, event_type, at, source, entered_by, note)
        VALUES (?, ?, ?, COALESCE(?, NOW()), ?, ?, ?)`,
       [companyId, taskId, type, at, source, enteredBy, note],
@@ -47,7 +63,7 @@ export async function recordEvent({
  * @param {Array<{companyId:number, taskId:number, type:string, at?:Date|string|null, source?:string, enteredBy?:number|null, note?:string|null}>} events
  * @returns {Promise<{ok: boolean}>}
  */
-export async function recordEvents(events) {
+export async function recordEvents(events, exec = pool) {
   if (!Array.isArray(events) || events.length === 0) return { ok: true };
   try {
     const placeholders = [];
@@ -64,7 +80,7 @@ export async function recordEvents(events) {
         e.note ?? null,
       );
     }
-    await pool.query(
+    await exec.query(
       `INSERT INTO fab_task_events (company_id, task_id, event_type, at, source, entered_by, note)
        VALUES ${placeholders.join(', ')}`,
       params,

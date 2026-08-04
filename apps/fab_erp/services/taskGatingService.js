@@ -268,7 +268,9 @@ export async function taskInputsSatisfied(conn, companyId, taskId) {
     // FEAT-02: earmark this task's material now, before another task's gate can
     // clear against the same stock.
     await reserveTaskInputs(conn, companyId, taskId, inputs);
-    await recordEvent({ companyId, taskId, type: 'materials_ready', source: 'system' });
+    // `conn` — this runs inside the caller's transaction. Writing the event on
+    // a pooled connection instead would wait on locks this transaction holds.
+    await recordEvent({ companyId, taskId, type: 'materials_ready', source: 'system' }, conn);
   }
   return true;
 }
@@ -296,7 +298,7 @@ export async function tryClearTask(conn, companyId, taskId) {
     await recordEvents([
       { companyId, taskId, type: 'deps_cleared', source: 'system' },
       { companyId, taskId, type: 'queued', source: 'system' },
-    ]);
+    ], conn);
   }
   return cleared;
 }
