@@ -44,6 +44,7 @@ import { recordEvents } from '../services/taskEventService.js';
 import { resolveCalendarIds, workingIntervalsInWindow } from '../services/taskWaitService.js';
 import { crewForWindow } from '../services/workerService.js';
 import { recomputeForResource } from '../services/taskAttributionService.js';
+import { onTaskComplete } from '../services/taskEngineService.js';
 
 const router = Router();
 
@@ -429,12 +430,29 @@ router.post('/shift-log', protect, async (req, res) => {
     }
   }
 
+  // Advance the DAG for every job written up, exactly as /tasks/:id/stop does.
+  // Without this the Shift Log recorded work as done and left every successor
+  // sitting blocked — so a shift entered from paper looked complete on the task
+  // itself while the rest of the order never moved. Sequential, not parallel:
+  // onTaskComplete clears successors, and two jobs in one shift can feed the
+  // same downstream task.
+  let successorsCleared = 0;
+  for (const w of parsedWork.filter((x) => x.completedAt)) {
+    try {
+      const r = await onTaskComplete(companyId, w.taskId);
+      successorsCleared += r?.successorsCleared ?? 0;
+    } catch (err) {
+      logger.error({ err, taskId: w.taskId }, 'shift-log: onTaskComplete failed');
+    }
+  }
+
   recomputeForResource(companyId, resourceId, new Date()).catch((err) =>
     logger.error({ err, resourceId }, 'shift-log: attribution recompute failed'));
 
   return res.json({
     ok: true,
     workLogged: parsedWork.length,
+    successorsCleared,
     downtimeLogged: parsedDowntime.length,
     absencesSet: absences.length,
     warnings,
