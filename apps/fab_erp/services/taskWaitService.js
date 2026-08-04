@@ -30,9 +30,17 @@
 //
 // GRANULARITY: unlike capacityService (which buckets whole-day/whole-shift minutes),
 // this service needs partial-day precision (e.g. "Friday 4pm" or "Monday 10am"), so
-// for each working day we intersect each shift's [start_time, end_time) wall-clock
-// interval with the requested window and sum the overlap in minutes, rather than
-// crediting the shift's full working_minutes for boundary days.
+// for each working day we intersect each shift's wall-clock interval with the
+// requested window and sum the overlap in minutes, rather than crediting the
+// shift's full working_minutes for boundary days.
+//
+//   BREAKS (fixed 2026-08-04): the shift's wall-clock interval is its span MINUS
+//   its unpaid break — `working_minutes` short of `end_time - start_time` carves
+//   that difference out of the middle (see workedIntervalsForShift). Before this,
+//   `working_minutes` was read by nothing in this file: intervals came from the
+//   raw span and the minute sums came from those same intervals, so a lunch break
+//   configured in the UI had no effect on anything, and idle time over lunch was
+//   attributed as `unexplained_idle` instead of falling outside the working day.
 
 import { pool } from '../../../db.js';
 
@@ -83,6 +91,57 @@ function shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEn
 function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd) {
   const iv = shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEnd);
   return iv ? (iv.end.getTime() - iv.start.getTime()) / 60000 : 0;
+}
+
+/**
+ * One shift on one date, as the wall-clock interval(s) that are actually WORKED —
+ * i.e. the shift's span with its unpaid break carved out.
+ *
+ * `fab_shifts.working_minutes` was, until 2026-08-04, read by nothing: this
+ * service built intervals from raw `[start_time, end_time)` and summed those for
+ * its minutes too, so a shift configured as 08:00–17:00 with 510 working minutes
+ * contributed the full 540. The field was editable in the UI, displayed in the
+ * shifts table, and decorative everywhere it mattered — which meant a factory's
+ * lunch break had no effect on the coverage meter, and idle time over lunch was
+ * classified as `unexplained_idle` rather than as time outside the working day.
+ *
+ * WHERE THE BREAK SITS: the schema records how long it is, not when. Carving it
+ * from the CENTRE is the assumption that costs least when wrong — lunch is
+ * mid-shift in practice, and a centred carve keeps both shift boundaries honest
+ * (a 16:45 event still falls inside a shift that really runs to 17:00, which
+ * shrinking the end time would have broken). If a site ever needs the exact
+ * break window, that wants explicit columns rather than a cleverer guess here.
+ */
+function workedIntervalsForShift(dateStr, shift) {
+  const full = shiftOverlapInterval(
+    dateStr, shift.start_time, shift.end_time,
+    new Date(-8640000000000000), new Date(8640000000000000),
+  );
+  if (!full) return [];
+
+  const spanMinutes = (full.end.getTime() - full.start.getTime()) / 60000;
+  const worked = Number(shift.working_minutes);
+  // Not configured, or configured to at least the whole span: nothing to carve.
+  if (!Number.isFinite(worked) || worked >= spanMinutes) return [full];
+  // A zero-minute shift is a holiday/placeholder — it contributes nothing, which
+  // is the behaviour the file header already promised.
+  if (worked <= 0) return [];
+
+  const breakMs = (spanMinutes - worked) * 60000;
+  const midpoint = full.start.getTime() + (full.end.getTime() - full.start.getTime()) / 2;
+  const breakStart = midpoint - breakMs / 2;
+  const breakEnd = breakStart + breakMs;
+  return [
+    { start: full.start, end: new Date(breakStart) },
+    { start: new Date(breakEnd), end: full.end },
+  ].filter((iv) => iv.end > iv.start);
+}
+
+/** Clip an interval to [windowStart, windowEnd], or null when it falls outside. */
+function clipToWindow(iv, windowStart, windowEnd) {
+  const start = iv.start > windowStart ? iv.start : windowStart;
+  const end = iv.end < windowEnd ? iv.end : windowEnd;
+  return end > start ? { start, end } : null;
 }
 
 // ─── resource/calendar resolution ──────────────────────────────────────────────
@@ -215,10 +274,13 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
       if (!isWorking) continue;
 
       for (const shift of shifts) {
-        const iv = shiftOverlapInterval(
-          date, shift.start_time, shift.end_time, windowStart, windowEnd,
-        );
-        if (iv) intervals.push(iv);
+        // Worked intervals, not the raw span — the shift's unpaid break is
+        // carved out here so every caller (coverage meter, no_shift attribution,
+        // working-minute sums) sees the same working day.
+        for (const worked of workedIntervalsForShift(date, shift)) {
+          const iv = clipToWindow(worked, windowStart, windowEnd);
+          if (iv) intervals.push(iv);
+        }
       }
     }
   }
