@@ -420,6 +420,23 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     }
   }
 
+  // Per-item metrics, so a formula can size the job off the actual part. Without
+  // these every item_* variable evaluated to 0 and each formula collapsed onto its
+  // operation-level default — one flat time for every part, so a 250 mm stiffener
+  // cost the same to cut as a full web plate.
+  const itemMetricsById = new Map();
+  if (items.length) {
+    const [metricRows] = await conn.query(
+      `SELECT item_id, metric_key, metric_value FROM fab_item_metric_values
+        WHERE company_id = ? AND deleted_at IS NULL AND item_id IN (?)`,
+      [companyId, items.map((i) => i.id)],
+    );
+    for (const m of metricRows) {
+      if (!itemMetricsById.has(m.item_id)) itemMetricsById.set(m.item_id, {});
+      itemMetricsById.get(m.item_id)[m.metric_key] = m.metric_value;
+    }
+  }
+
   // child parts (flow-bound children) per parent item — for 'child_parts' inputs
   const childPartsByParent = new Map();
   for (const it of items) {
@@ -468,7 +485,13 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       // as 500 hours — which is exactly what used to happen.
       const formulaHours = op
         ? formulaResultToHours(
-            await evaluateFormula(op.time_formula, {}, {}, resourceTypeId, opValues),
+            await evaluateFormula(
+              op.time_formula,
+              itemMetricsById.get(item.id) ?? {},
+              {},
+              resourceTypeId,
+              opValues,
+            ),
             op.time_unit,
           )
         : null;
