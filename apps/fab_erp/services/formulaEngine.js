@@ -92,6 +92,13 @@ export async function evaluateFormula(
     }
 
     const normalised = normalise(formula);
+    // Any namespaced variable the formula mentions but the item/step/machine/op
+    // has no value for reads as 0. Without this mathjs throws on the undefined
+    // symbol and the whole formula returns null — so a single unmeasured metric
+    // wiped the estimate instead of letting an IF(...) fall back to its default.
+    for (const [, sym] of normalised.matchAll(/\b((?:machine|item|step|op)_\w+)\b/g)) {
+      if (!(sym in scope)) scope[sym] = 0;
+    }
     const result = parser.evaluate(normalised, scope);
     return typeof result === 'number' && isFinite(result) ? result : null;
   } catch {
