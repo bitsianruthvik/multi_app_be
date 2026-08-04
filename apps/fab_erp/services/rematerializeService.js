@@ -29,7 +29,7 @@ import {
   releaseTaskReservations,
 } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
-import { evaluateFormula } from './formulaEngine.js';
+import { evaluateFormula, formulaResultToHours } from './formulaEngine.js';
 import { getUsableStat } from './operationStatsService.js';
 import { buildBaseline } from './criticalChainService.js';
 import { replan as drumReplan } from './drumService.js';
@@ -59,7 +59,7 @@ async function resolveItemFlowId(conn, companyId, item) {
 /** Desired planning hours for a step — mirrors materializeOrderTasks (learned p80 ?? formula). */
 async function desiredHours(conn, companyId, operationId, resourceTypeId) {
   const [[op]] = await conn.query(
-    `SELECT time_formula, default_resource_type_id FROM fab_operations
+    `SELECT time_formula, time_unit, default_resource_type_id FROM fab_operations
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [operationId, companyId],
   );
@@ -71,7 +71,11 @@ async function desiredHours(conn, companyId, operationId, resourceTypeId) {
   );
   const opValues = Object.fromEntries(vars.map((v) => [v.var_key, v.default_value]));
   const rt = resourceTypeId ?? op.default_resource_type_id ?? null;
-  const formulaHours = await evaluateFormula(op.time_formula, {}, {}, rt, opValues);
+  // Same unit conversion as the materialize path — these two must agree,
+  // or every re-materialize would report a spurious duration change.
+  const formulaHours = formulaResultToHours(
+    await evaluateFormula(op.time_formula, {}, {}, rt, opValues), op.time_unit,
+  );
   const stat = await getUsableStat(companyId, operationId, rt);
   const learned = stat && stat.p80_minutes != null ? Number(stat.p80_minutes) / 60 : null;
   return learned != null ? learned : formulaHours;

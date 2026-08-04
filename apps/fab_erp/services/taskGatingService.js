@@ -20,7 +20,7 @@
  */
 
 import { pool } from '../../../db.js';
-import { evaluateFormula } from './formulaEngine.js';
+import { evaluateFormula , formulaResultToHours } from './formulaEngine.js';
 import { recordEvent, recordEvents } from './taskEventService.js';
 import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
 import { getUsableStat } from './operationStatsService.js';
@@ -402,7 +402,7 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   const opVarsByOpId = new Map();
   if (operationIds.length) {
     const [opRows] = await conn.query(
-      `SELECT id, default_resource_type_id, time_formula FROM fab_operations
+      `SELECT id, default_resource_type_id, time_formula, time_unit FROM fab_operations
         WHERE company_id = ? AND deleted_at IS NULL AND id IN (?)`,
       [companyId, operationIds],
     );
@@ -461,8 +461,14 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       const op = opById.get(step.operation_id);
       const resourceTypeId = step.resource_type_id ?? op?.default_resource_type_id ?? null;
       const opValues = opVarsByOpId.get(step.operation_id) ?? {};
+      // The formula returns the operation's OWN unit (min for nearly all of
+      // them); computed_hours is hours. Convert, or a 500-minute cut is stored
+      // as 500 hours — which is exactly what used to happen.
       const formulaHours = op
-        ? await evaluateFormula(op.time_formula, {}, {}, resourceTypeId, opValues)
+        ? formulaResultToHours(
+            await evaluateFormula(op.time_formula, {}, {}, resourceTypeId, opValues),
+            op.time_unit,
+          )
         : null;
 
       // EU-15: prefer the learned p80 touch-time (converted to hours) as the

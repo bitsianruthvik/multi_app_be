@@ -141,3 +141,36 @@ export function parseFormula(formula) {
     return { valid: false, error: e.message };
   }
 }
+
+/**
+ * Convert a time-formula result into HOURS using the operation's `time_unit`.
+ *
+ * `fab_operations.time_formula` returns a number in whatever unit the operation
+ * declares — `min` for almost every real operation, since that is how a
+ * fabricator writes a standard time ("cut_length / 2" minutes). But
+ * `fab_project_tasks.computed_hours` is, by its name and by every consumer,
+ * HOURS.
+ *
+ * Nothing converted between the two until 2026-08-04, so a 500-minute plate cut
+ * was stored as 500 HOURS — a 60x overstatement on every task in the system.
+ * The learned-duration branch beside it always divided p80_minutes by 60, so
+ * the intent was never in doubt; the formula branch simply never did the same.
+ * Everything downstream inherited it: capacity, the critical-chain baseline,
+ * ETAs, the variance readout, and the "running Nx typical" nudge.
+ */
+export function formulaResultToHours(value, timeUnit) {
+  if (value == null || !Number.isFinite(Number(value))) return null;
+  const v = Number(value);
+  switch (String(timeUnit || 'min').toLowerCase()) {
+    case 'hr':
+    case 'hour':
+    case 'hours': return v;
+    case 'sec':
+    case 'second':
+    case 'seconds': return v / 3600;
+    case 'min':
+    case 'minute':
+    case 'minutes':
+    default: return v / 60;
+  }
+}
