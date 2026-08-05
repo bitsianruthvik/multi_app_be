@@ -44,6 +44,7 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
+import { receiveStock } from '../services/stockInService.js';
 
 const router = Router();
 
@@ -260,6 +261,69 @@ router.get('/stock/summary', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId }, 'fab_erp stock/summary: unexpected error');
     return res.status(500).json({ message: 'Internal server error during stock summary query.' });
+  }
+});
+
+// ── POST /stock/receive ─────────────────────────────────────────────────────
+// Add raw material directly into a stock area. Replaces the goods-receipt flow;
+// there is no purchase order, supplier or delivery document.
+//
+// Body: { catalogItemId, plantId, stockLocationId, receivedDate,
+//         uom?, unitCost?, notes?, pieces: [{ qty, batchNo?, heatNo?,
+//         serialNo?, markNo? }] }
+
+router.post('/stock/receive', protect, async (req, res) => {
+  const user = req.user;
+  const companyId = user?.companyId ?? user?.company_id;
+  const isAdmin = String(user?.role ?? '').toLowerCase() === 'admin';
+  const permitted = isAdmin
+    || (Array.isArray(user?.uiPermissions) && user.uiPermissions.includes('fab_erp_inventory_manage'));
+  if (!permitted) {
+    return res.status(403).json({ message: 'Permission denied. Required: "fab_erp_inventory_manage".' });
+  }
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const b = req.body ?? {};
+  const catalogItemId = Number(b.catalogItemId);
+  const plantId = Number(b.plantId);
+  const stockLocationId = Number(b.stockLocationId);
+  const receivedDate = b.receivedDate;
+  const pieces = Array.isArray(b.pieces) ? b.pieces : [];
+
+  if (!Number.isInteger(catalogItemId)) return res.status(400).json({ message: '"catalogItemId" is required.' });
+  if (!Number.isInteger(plantId)) return res.status(400).json({ message: '"plantId" is required.' });
+  if (!Number.isInteger(stockLocationId)) return res.status(400).json({ message: '"stockLocationId" is required.' });
+  // Not merely a format check: received_date orders FIFO consumption, and NULL
+  // sorts last, so an undated piece would be consumed after everything else.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(receivedDate ?? ''))) {
+    return res.status(400).json({ message: '"receivedDate" (YYYY-MM-DD) is required.' });
+  }
+  if (pieces.length === 0) return res.status(400).json({ message: 'At least one piece is required.' });
+  for (const p of pieces) {
+    if (!(Number(p?.qty) > 0)) return res.status(400).json({ message: 'Every piece needs a quantity greater than zero.' });
+  }
+
+  try {
+    const result = await receiveStock(companyId, {
+      catalog_item_id: catalogItemId,
+      plant_id: plantId,
+      stock_location_id: stockLocationId,
+      received_date: receivedDate,
+      uom: b.uom ?? null,
+      unit_cost: b.unitCost ?? null,
+      notes: b.notes ?? null,
+      pieces: pieces.map((p) => ({
+        qty: Number(p.qty),
+        batch_no: p.batchNo ?? null,
+        heat_no: p.heatNo ?? null,
+        serial_no: p.serialNo ?? null,
+        mark_no: p.markNo ?? null,
+      })),
+    });
+    return res.status(200).json(result);
+  } catch (err) {
+    logger.error({ err, companyId, catalogItemId }, 'fab_erp stock/receive: failed');
+    return res.status(500).json({ message: err.message ?? 'Failed to record stock.' });
   }
 });
 
