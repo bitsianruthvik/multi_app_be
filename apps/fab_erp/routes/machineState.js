@@ -147,14 +147,14 @@ router.get('/machines/board', protect, async (req, res) => {
 
     const eventByResource = new Map(latestEvents.map((e) => [e.resourceId, e]));
 
-    // A machine can legitimately have several in_progress tasks now: a batch
-    // (Issue 4) is exactly that. This used to keep only the most recently
-    // started one and call the rest a data conflict, so a plasma table cutting
-    // four nested plates showed one part's name and silently hid three.
+    // Several in_progress tasks on one machine is a double-booking. Batching
+    // (Issue 4) used to make it legitimate; that feature was removed 2026-08-05,
+    // so any count above one means something is wrong again.
     //
-    // Keep the earliest-started task as the card's headline (it's the one whose
-    // clock the run is measured on) and carry the sibling count alongside, so
-    // the card can say "4 parts running together" instead of naming one.
+    // Still keep the earliest-started task as the card's headline — it is the
+    // one whose clock the run is measured on — and carry the count alongside so
+    // the card can say how many are double-booked rather than silently naming
+    // one and hiding the rest.
     const tasksByResource = new Map();
     for (const t of inProgressTasks) {
       if (!tasksByResource.has(t.assignedResourceId)) tasksByResource.set(t.assignedResourceId, []);
@@ -168,9 +168,6 @@ router.get('/machines/board', protect, async (req, res) => {
       taskByResource.set(resourceId, {
         ...head,
         taskCount: list.length,
-        // Only a real batch groups tasks. Several unbatched in_progress rows on
-        // one machine still means something is wrong, and the card says so.
-        batched: head.batchId != null && list.every((t) => t.batchId === head.batchId),
       });
     }
 
@@ -226,9 +223,7 @@ router.get('/machines/board', protect, async (req, res) => {
             itemName: task.itemName,
             itemMark: task.itemMark,
             startedAt: task.startedAt,
-            batchId: task.batchId,
             taskCount: task.taskCount,
-            batched: task.batched,
           }
           : null,
         operators: operatorsByResource.get(r.id) ?? [],
