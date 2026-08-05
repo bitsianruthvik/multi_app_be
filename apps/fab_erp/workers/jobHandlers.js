@@ -7,10 +7,6 @@
  *   - data.companyId present → sweepCompany(companyId)
  *   - otherwise             → sweepAllCompanies()
  *
- * The 'fab_erp:operation-stats' handler recomputes learned-duration stats:
- *   - data.companyId present → recomputeStatsForCompany(companyId)
- *   - otherwise             → recomputeAllCompanies()
- *
  * The 'fab_erp:cc-sweep' handler (EU-5) recomputes Critical Chain buffer
  * consumption for every status='baselined' plan (batch-limited). Unlike the two
  * sweeps above — whose 15-min/24h ticks live in app.js — this module self-starts
@@ -28,11 +24,9 @@
 import { logger } from '../../../core/utils/logger.js';
 import { getQueue } from '../../../core/jobs/queue.js';
 import { sweepCompany, sweepAllCompanies } from '../services/taskAttributionService.js';
-import { recomputeStatsForCompany, recomputeAllCompanies } from '../services/operationStatsService.js';
 import { recomputeAllBaselined } from '../services/ccBufferService.js';
 
 const SWEEP_JOB = 'fab_erp:attribution-sweep';
-const OPERATION_STATS_JOB = 'fab_erp:operation-stats';
 const CC_SWEEP_JOB = 'fab_erp:cc-sweep';
 const CC_SWEEP_PERIOD_MS = 15 * 60 * 1000;
 
@@ -43,13 +37,6 @@ const jobHandlers = {
       return sweepCompany(data.companyId, { limit });
     }
     return sweepAllCompanies({ limit });
-  },
-
-  [OPERATION_STATS_JOB]: async (data = {}) => {
-    if (data && data.companyId) {
-      return recomputeStatsForCompany(data.companyId);
-    }
-    return recomputeAllCompanies();
   },
 
   // EU-5: recompute CC buffer consumption for all baselined plans, batch-limited.
@@ -66,7 +53,6 @@ const jobHandlers = {
       return;
     }
     queue.process(SWEEP_JOB, async (job) => jobHandlers[SWEEP_JOB](job.data || {}));
-    queue.process(OPERATION_STATS_JOB, async (job) => jobHandlers[OPERATION_STATS_JOB](job.data || {}));
     queue.process(CC_SWEEP_JOB, async (job) => jobHandlers[CC_SWEEP_JOB](job.data || {}));
     logger.info('[jobs] fab_erp attribution-sweep + operation-stats + cc-sweep processors registered.');
   },

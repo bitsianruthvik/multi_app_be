@@ -23,7 +23,6 @@ import { pool } from '../../../db.js';
 import { evaluateFormula , formulaResultToHours } from './formulaEngine.js';
 import { recordEvent, recordEvents } from './taskEventService.js';
 import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
-import { getUsableStat } from './operationStatsService.js';
 
 /** Best-effort machine name for a resource id (falls back to "#<id>"). */
 async function resourceName(exec, companyId, resourceId) {
@@ -138,10 +137,11 @@ export async function terminalTaskDone(conn, companyId, itemId) {
 }
 
 /**
- * FEAT-02: FREE (unreserved) on-hand quantity of a catalog item —
- *   SUM(in_stock pieces) − SUM(active reservations).
- * Reservations earmark stock for tasks whose gate has already cleared, so a
- * later task can't clear against material another task is holding.
+ * On-hand quantity of a catalog item: SUM of in_stock pieces.
+ *
+ * Until 2026-08-05 this subtracted active reservations to give a FREE quantity.
+ * Reservations are gone (see the note below inputSatisfiedLive); the table held
+ * zero rows, so the subtraction was always of zero and this is the same number.
  */
 async function availableQty(conn, companyId, catalogItemId) {
   const [r] = await conn.query(
@@ -149,12 +149,7 @@ async function availableQty(conn, companyId, catalogItemId) {
       WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock' AND deleted_at IS NULL`,
     [companyId, catalogItemId],
   );
-  const [rv] = await conn.query(
-    `SELECT COALESCE(SUM(qty), 0) AS q FROM fab_stock_reservations
-      WHERE company_id = ? AND catalog_item_id = ? AND status = 'active' AND deleted_at IS NULL`,
-    [companyId, catalogItemId],
-  );
-  return (Number(r[0].q) || 0) - (Number(rv[0].q) || 0);
+  return Number(r[0].q) || 0;
 }
 
 /**
@@ -188,68 +183,20 @@ async function inputSatisfiedLive(conn, companyId, input) {
   return true;
 }
 
-/**
- * Resolve the catalog item a gated input draws from: the ref item for a
- * raw-material/consumable, or the producing child node's catalog item for a
- * component. Returns null when there is nothing quantifiable to reserve.
+/*
+ * Stock reservations (FEAT-02) were removed 2026-08-05 along with the rest of the
+ * out-of-spec features. inputCatalogItemId / reserveTaskInputs /
+ * releaseTaskReservations lived here and earmarked a task's gated material once
+ * its gate cleared, so a second task could not clear against the same stock.
+ *
+ * The table held zero rows in production, so availableQty was always subtracting
+ * zero and removal is behaviourally identical. Worth knowing what was given up:
+ * two tasks needing the same plate can now both clear their material gate, and
+ * whichever starts second finds the stock already consumed. That is acceptable
+ * while material is issued at start and the shop runs a handful of projects; it
+ * would not be if the queue ever ran deep enough for gate-to-start latency to
+ * matter.
  */
-async function inputCatalogItemId(conn, companyId, input) {
-  if (input.ref_catalog_item_id) return input.ref_catalog_item_id;
-  if (input.input_role === 'component' && input.producing_item_id) {
-    const [[child]] = await conn.query(
-      `SELECT catalog_item_id FROM fab_items WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-      [input.producing_item_id, companyId],
-    );
-    return child?.catalog_item_id ?? null;
-  }
-  return null;
-}
-
-/**
- * FEAT-02: earmark a task's gated material once its gate has cleared. Idempotent
- * — a no-op if the task already holds active reservations. Only inputs with a
- * declared qty are reserved (presence-only inputs have nothing quantifiable to
- * hold); those reservations then reduce availableQty for every other task.
- */
-export async function reserveTaskInputs(conn, companyId, taskId, inputs) {
-  const [[ex]] = await conn.query(
-    `SELECT COUNT(*) AS n FROM fab_stock_reservations
-      WHERE company_id = ? AND task_id = ? AND status = 'active' AND deleted_at IS NULL`,
-    [companyId, taskId],
-  );
-  if (Number(ex?.n) > 0) return; // already reserved for this task
-
-  const [[t]] = await conn.query(
-    `SELECT order_id FROM fab_project_tasks WHERE company_id = ? AND id = ? AND deleted_at IS NULL LIMIT 1`,
-    [companyId, taskId],
-  );
-  const orderId = t?.order_id ?? null;
-
-  for (const inp of inputs || []) {
-    const required = Number(inp.qty) > 0 ? Number(inp.qty) : 0;
-    if (!(required > 0)) continue;
-    const catId = await inputCatalogItemId(conn, companyId, inp);
-    if (!catId) continue;
-    await conn.query(
-      `INSERT INTO fab_stock_reservations (company_id, catalog_item_id, task_id, order_id, qty, status)
-       VALUES (?, ?, ?, ?, ?, 'active')`,
-      [companyId, catId, taskId, orderId, required],
-    );
-  }
-}
-
-/**
- * FEAT-02: release a task's active reservations (cancel / re-materialize). Marks
- * them 'released' so they stop counting against availability. Consumption at
- * start uses 'consumed' instead (see wipInventoryService.openOrMoveWipOnStart).
- */
-export async function releaseTaskReservations(conn, companyId, taskId) {
-  await conn.query(
-    `UPDATE fab_stock_reservations SET status = 'released', released_at = NOW()
-      WHERE company_id = ? AND task_id = ? AND status = 'active' AND deleted_at IS NULL`,
-    [companyId, taskId],
-  );
-}
 
 /** True when all gate=1 inputs for the task are satisfied; stamps satisfied_at as it goes. */
 export async function taskInputsSatisfied(conn, companyId, taskId) {
@@ -265,9 +212,6 @@ export async function taskInputsSatisfied(conn, companyId, taskId) {
   }
   // Every gate=1 input is now satisfied — fire once per task, not per input row.
   if (inputs.length > 0) {
-    // FEAT-02: earmark this task's material now, before another task's gate can
-    // clear against the same stock.
-    await reserveTaskInputs(conn, companyId, taskId, inputs);
     // `conn` — this runs inside the caller's transaction. Writing the event on
     // a pooled connection instead would wait on locks this transaction holds.
     await recordEvent({ companyId, taskId, type: 'materials_ready', source: 'system' }, conn);
@@ -496,24 +440,20 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
           )
         : null;
 
-      // EU-15: prefer the learned p80 touch-time (converted to hours) as the
-      // planning estimate when enough real samples exist; keep the formula's
-      // value in formula_hours for comparison. No usable stat → computed_hours
-      // stays the formula value and formula_hours is left NULL (no distinct
-      // learned value to preserve).
-      const stat = await getUsableStat(companyId, step.operation_id, resourceTypeId);
-      const learnedHours = stat && stat.p80_minutes != null ? Number(stat.p80_minutes) / 60 : null;
-      const computedHours = learnedHours != null ? learnedHours : formulaHours;
-      const preservedFormulaHours = learnedHours != null ? formulaHours : null;
+      // The formula IS the estimate. Learned p80 touch-times used to override it
+      // here, with the formula's own value preserved in formula_hours for
+      // comparison; that subsystem was removed 2026-08-05 (buffer sizing is a
+      // fixed 50%, so nothing consumed the learning). One source of truth now.
+      const computedHours = formulaHours;
 
       // insert task as 'blocked' first; clear at the end once inputs exist
       const [ins] = await conn.query(
         `INSERT INTO fab_project_tasks
            (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
-            seq_no, depends_on, resource_type_id, status, computed_hours, formula_hours)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?)`,
+            seq_no, depends_on, resource_type_id, status, computed_hours)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?)`,
         [companyId, orderId, item.id, flowId, step.id, step.operation_id,
-         step.seq_no, step.depends_on, resourceTypeId, computedHours, preservedFormulaHours],
+         step.seq_no, step.depends_on, resourceTypeId, computedHours],
       );
       const taskId = ins.insertId;
       tasksInserted++;

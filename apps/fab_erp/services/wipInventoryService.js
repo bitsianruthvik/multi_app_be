@@ -201,11 +201,6 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
     // FEAT-02: the earmark is now physically consumed. Flip this task's active
     // reservations to 'consumed' so on-hand and reserved drop together (net
     // availability for other tasks is unchanged by the start).
-    await conn.query(
-      `UPDATE fab_stock_reservations SET status = 'consumed', released_at = NOW()
-        WHERE company_id = ? AND task_id = ? AND status = 'active' AND deleted_at IS NULL`,
-      [companyId, task.id],
-    );
 
     // Open the single WIP piece for this node (idempotent).
     if (node.catalog_item_id && wipLoc) {

@@ -246,7 +246,7 @@ export async function onTaskComplete(companyId, taskId) {
 export async function spawnReworkTask(exec, companyId, failedTaskId) {
   const [[ft]] = await exec.query(
     `SELECT id, order_id, item_id, flow_id, flow_step_id, operation_id, seq_no,
-            resource_type_id, computed_hours, formula_hours, sort_order
+            resource_type_id, computed_hours, sort_order
        FROM fab_project_tasks
       WHERE company_id = ? AND id = ? AND deleted_at IS NULL LIMIT 1`,
     [companyId, failedTaskId],
@@ -263,11 +263,11 @@ export async function spawnReworkTask(exec, companyId, failedTaskId) {
   const [ins] = await exec.query(
     `INSERT INTO fab_project_tasks
        (company_id, order_id, item_id, flow_id, flow_step_id, operation_id, seq_no,
-        depends_on, resource_type_id, status, computed_hours, formula_hours,
+        depends_on, resource_type_id, status, computed_hours,
         deps_cleared_at, queued_at, is_rework, rework_of_task_id, sort_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, ?, NOW(), NOW(), 1, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, NOW(), NOW(), 1, ?, ?)`,
     [companyId, ft.order_id, ft.item_id, ft.flow_id, ft.flow_step_id, ft.operation_id, newSeq,
-     String(ft.seq_no), ft.resource_type_id, ft.computed_hours, ft.formula_hours,
+     String(ft.seq_no), ft.resource_type_id, ft.computed_hours,
      failedTaskId, (Number(ft.sort_order) || 0) + 1],
   );
 

@@ -21,7 +21,6 @@ import analyticsRouter   from './analytics.js';
 import navCountsRouter   from './navCounts.js';
 import pulseRouter       from './pulse.js';
 import marksRouter       from './marks.js';
-import batchesRouter     from './batches.js';
 import shiftLogRouter    from './shiftLog.js';
 import workersRouter     from './workers.js';
 
@@ -51,7 +50,6 @@ router.use(analyticsRouter);
 router.use(navCountsRouter);
 router.use(pulseRouter);
 router.use(marksRouter);
-router.use(batchesRouter);
 router.use(shiftLogRouter);
 router.use(workersRouter);
 

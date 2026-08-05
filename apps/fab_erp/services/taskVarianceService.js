@@ -6,13 +6,49 @@
  *
  *   plan   = fab_project_tasks.computed_hours (learned-p80 or formula estimate)
  *   actual = touch time from the event log (started→completed minus pause gaps),
- *            same definition operationStatsService uses for learning — so the two
- *            reconcile.
+ *            derived here and nowhere else.
  *   variance = actual − plan  (positive = over-ran the estimate)
  */
 
 import { pool } from '../../../db.js';
-import { buildSample } from './operationStatsService.js';
+/**
+ * Touch time for one task from its event log: first 'started' to last
+ * 'completed', minus closed pause pairs. Only the first start and last
+ * completion are used, defensively against duplicate or corrected rows that
+ * slipped through without being marked superseded; a pause left open at
+ * completion contributes 0 rather than corrupting the result.
+ *
+ * Lived in operationStatsService until 2026-08-05. That module existed to learn
+ * durations from history, which is gone (buffer sizing is a fixed 50%), but this
+ * one function also feeds ccBufferService's buffer-CONSUMPTION maths, which
+ * stays. Moved here rather than keeping a file alive for a single helper.
+ */
+function buildSample(events) {
+  let startedAt = null, startedSource = null;
+  let completedAt = null, completedSource = null;
+  let pauseStart = null, pauseMinutes = 0;
+
+  for (const ev of events) {
+    const at = new Date(ev.at);
+    if (ev.event_type === 'started') {
+      if (!startedAt) { startedAt = at; startedSource = ev.source; }
+    } else if (ev.event_type === 'completed') {
+      completedAt = at; completedSource = ev.source;
+    } else if (ev.event_type === 'paused') {
+      if (!pauseStart) pauseStart = at;
+    } else if (ev.event_type === 'resumed') {
+      if (pauseStart) { pauseMinutes += (at - pauseStart) / 60000; pauseStart = null; }
+    }
+  }
+
+  if (!startedAt || !completedAt || completedAt <= startedAt) return null;
+  const totalMinutes = (completedAt - startedAt) / 60000;
+  return {
+    touchMinutes: Math.max(0, totalMinutes - pauseMinutes),
+    completedAt,
+    isBackfill: startedSource === 'backfill' || completedSource === 'backfill',
+  };
+}
 
 const round2 = (n) => (n == null ? null : Math.round(n * 100) / 100);
 
@@ -21,22 +57,11 @@ const round2 = (n) => (n == null ? null : Math.round(n * 100) / 100);
  * One query for all task ids. Returns Map<taskId, actualHours|null> (null when a
  * task has no usable started/completed pair yet).
  *
- * Issue 4 (batching): a batched task's events are truthful but not divisible —
- * eight parts cut in one 40-minute nest each show started 09:00 / completed
- * 09:40, so the event derivation would report 40 minutes eight times. When
- * batchService has attributed a share of the run to a task, that share wins.
  */
 export async function computeActualHoursForTasks(exec, companyId, taskIds) {
   const ids = [...new Set((taskIds || []).map(Number).filter(Number.isInteger))];
   const out = new Map();
   if (!ids.length) return out;
-
-  const [attrRows] = await exec.query(
-    `SELECT id, attributed_minutes FROM fab_project_tasks
-      WHERE company_id = ? AND id IN (?) AND attributed_minutes IS NOT NULL`,
-    [companyId, ids],
-  );
-  const attributed = new Map(attrRows.map((r) => [r.id, Number(r.attributed_minutes)]));
 
   const [rows] = await exec.query(
     `SELECT task_id, event_type, at, source
@@ -52,10 +77,6 @@ export async function computeActualHoursForTasks(exec, companyId, taskIds) {
     byTask.get(r.task_id).push(r);
   }
   for (const id of ids) {
-    if (attributed.has(id)) {
-      out.set(id, round2(attributed.get(id) / 60));
-      continue;
-    }
     const evts = byTask.get(id);
     const sample = evts ? buildSample(evts) : null;
     out.set(id, sample ? round2(sample.touchMinutes / 60) : null);

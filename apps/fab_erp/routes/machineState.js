@@ -113,8 +113,7 @@ router.get('/machines/board', protect, async (req, res) => {
 
     const [inProgressTasks] = await pool.query(
       `SELECT t.id, t.assigned_resource_id AS assignedResourceId, op.name AS operationName,
-              it.name AS itemName, it.mark AS itemMark, t.started_at AS startedAt,
-              t.batch_id AS batchId
+              it.name AS itemName, it.mark AS itemMark, t.started_at AS startedAt
          FROM fab_project_tasks t
          LEFT JOIN fab_operations op ON t.operation_id = op.id
          LEFT JOIN fab_items it ON t.item_id = it.id
