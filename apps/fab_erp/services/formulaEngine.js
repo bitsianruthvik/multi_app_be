@@ -34,14 +34,55 @@ const parser = new Parser({
  * @returns {string} normalised expression
  */
 function normalise(formula) {
-  // Step 1: rewrite IF(...) — simple non-nested version
-  let result = formula.replace(
-    /\bIF\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)/gi,
-    (_, cond, tVal, fVal) => `(${cond.trim()} ? ${tVal.trim()} : ${fVal.trim()})`,
-  );
+  // Step 1: rewrite IF(...) → ternary, innermost first.
+  //
+  // This used to be one regex with `[^,]+?` arguments, which could not span a
+  // nested IF — its own comment admitted it handled "nested commas naively".
+  // A formula like  IF(a > 0, x / IF(b > 0, b, 1), y)  came out mangled and
+  // evaluated to garbage or null with no error, which is the worst way for a
+  // duration to be wrong. Nested IF is not exotic: guarding a divisor against
+  // zero (`/ IF(machine.speed > 0, machine.speed, 500)`) needs it, and that is
+  // exactly what a formula referencing machine speed should do.
+  //
+  // Scanned rather than regexed: find each IF, match its parentheses by depth,
+  // split on TOP-LEVEL commas only, and recurse into each argument.
+  let result = rewriteIf(formula);
   // Step 2: rewrite namespace.key → namespace_key
   result = result.replace(/\b(machine|item|step|op)\.(\w+)\b/g, '$1_$2');
   return result;
+}
+
+/** Rewrite every IF(cond, then, else) in `src` to (cond ? then : else). */
+function rewriteIf(src) {
+  const m = /\bIF\s*\(/i.exec(src);
+  if (!m) return src;
+
+  const open = m.index + m[0].length - 1; // index of the '('
+  let depth = 0;
+  let close = -1;
+  const commas = [];
+  for (let i = open; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) { close = i; break; }
+    } else if (ch === ',' && depth === 1) commas.push(i);
+  }
+
+  // Unbalanced parens or not exactly three arguments: leave it alone and let
+  // expr-eval produce a real parse error rather than silently inventing one.
+  if (close === -1 || commas.length !== 2) return src;
+
+  const cond = src.slice(open + 1, commas[0]);
+  const tVal = src.slice(commas[0] + 1, commas[1]);
+  const fVal = src.slice(commas[1] + 1, close);
+
+  const rewritten =
+    `(${rewriteIf(cond).trim()} ? ${rewriteIf(tVal).trim()} : ${rewriteIf(fVal).trim()})`;
+
+  // Recurse across the remainder so several IFs in one formula all convert.
+  return src.slice(0, m.index) + rewritten + rewriteIf(src.slice(close + 1));
 }
 
 /**
