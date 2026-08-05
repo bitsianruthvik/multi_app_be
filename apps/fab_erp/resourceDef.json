@@ -1537,21 +1537,7 @@
   "fabErpStockPiece": {
     "table": "fab_stock_pieces",
     "alias": "fsp",
-    "writeFields": [
-      "catalog_item_id",
-      "plant_id",
-      "stock_location_id",
-      "batch_no",
-      "heat_no",
-      "serial_no",
-      "mark_no",
-      "qty",
-      "uom",
-      "unit_cost",
-      "status",
-      "received_date",
-      "notes"
-    ],
+    "writeFields": [],
     "fields": {
       "id": "fsp.id",
       "companyId": "fsp.company_id",

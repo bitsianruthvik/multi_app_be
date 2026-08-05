@@ -389,8 +389,18 @@ router.post('/shift-log', protect, async (req, res) => {
       // not reject a supervisor's whole shift sheet, which is a record of what
       // already happened and cannot be "declined". The live path is stricter
       // because there the work has not started yet and can still be stopped.
+      //
+      // SAVEPOINT per row, because "best-effort" without one is not best-effort
+      // at all. consumeStock walks pieces FIFO and decrements them one at a
+      // time; if it runs out partway it throws INSUFFICIENT_STOCK having already
+      // deducted several. Catching that and carrying on used to commit those
+      // deductions with no WIP piece to show for them — steel gone from stock
+      // and present nowhere. Rolling back to the savepoint undoes the partial
+      // consumption while leaving every earlier row of the sheet intact.
       const task = taskById.get(w.taskId);
       if (task && machine) {
+        const sp = `wip_${w.taskId}`;
+        await conn.query(`SAVEPOINT ${sp}`);
         try {
           await openOrMoveWipOnStart(conn, companyId, task, machine);
           if (w.completedAt && w.qcResult !== 'fail') {
@@ -399,10 +409,21 @@ router.post('/shift-log', protect, async (req, res) => {
               scrapQty: w.scrapQty ?? null,
             });
           }
+          await conn.query(`RELEASE SAVEPOINT ${sp}`);
         } catch (wipErr) {
+          await conn.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          // The times and events for this job are written outside this block and
+          // survive — the supervisor's record of what happened stands, and only
+          // the material movement is undone. Reported back so the sheet does not
+          // look like it landed cleanly.
+          warnings.push(
+            wipErr?.code === 'INSUFFICIENT_STOCK'
+              ? `Task #${w.taskId}: times recorded, but no material was issued — ${wipErr.message || 'not enough stock on hand'}.`
+              : `Task #${w.taskId}: times recorded, but the material movement failed and was rolled back.`,
+          );
           logger.warn(
             { err: wipErr, taskId: w.taskId, resourceId },
-            'shift-log: WIP movement failed for a back-entered job; times and events still recorded',
+            'shift-log: WIP movement rolled back for a back-entered job; times and events still recorded',
           );
         }
       }

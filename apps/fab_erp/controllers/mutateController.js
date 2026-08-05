@@ -38,6 +38,25 @@ const AUTOGEN_CODE_RESOURCES = {
   fabErpStockLocation: { entityType: 'stock_location', mode: 'ifBlank' },
 };
 
+/**
+ * Resources this endpoint must never write, no matter what resourceDef says.
+ *
+ * Physical stock is the case that matters. Creating a piece has three
+ * obligations beyond the row itself: issue its code, append a fab_stock_ledger
+ * entry, and re-evaluate every task gated on that material. stockInService does
+ * all three inside one transaction. This controller does none of them — so a
+ * piece inserted here is uncoded, invisible to the ledger, and leaves blocked
+ * work blocked forever with no signal.
+ *
+ * `writeFields: []` in resourceDef already makes these read-only, but that is a
+ * data file someone will one day "fix" by adding the fields back. This is the
+ * check that survives that, and it names the route to use instead.
+ */
+const WRITE_FORBIDDEN = {
+  fabErpStockPiece: 'POST /stock/receive (stockInService) — it also writes the ledger, issues the piece code, and re-checks material-gated tasks',
+  fabErpStockLedger: 'the ledger is append-only and written by the service that moves the stock',
+};
+
 // ---------------------------------------------------------------------------
 // EU-B3: Consumption-gate helpers
 // ---------------------------------------------------------------------------
@@ -145,6 +164,13 @@ export async function mutate(req, res) {
   if (!(resource in resourcePermissions)) {
     return res.status(400).json({
       message: `Unknown fab_erp resource: "${resource}". Not listed in resourcePermissions.`,
+    });
+  }
+
+  if (WRITE_FORBIDDEN[resource]) {
+    return res.status(400).json({
+      message: `"${resource}" cannot be written through the generic endpoint. Use ${WRITE_FORBIDDEN[resource]}.`,
+      code: 'WRITE_FORBIDDEN',
     });
   }
 

@@ -146,20 +146,46 @@ export async function receiveStock(companyId, input) {
 
     await conn.commit();
 
-    // Post-commit, best-effort. A hook failure must not fail stock that is
-    // already recorded — but without this call the material is on hand and every
-    // task gated on it stays blocked, silently and indefinitely.
+    // Post-commit, best-effort, but retried — because this call is the ONLY
+    // thing in the system that moves a task off 'blocked' for material. There is
+    // no sweeper and no queue behind it: if it fails silently the stock is on
+    // hand, the work stays blocked, and nobody finds out until someone asks why
+    // a machine is idle. A transient deadlock or timeout is exactly the failure
+    // mode worth retrying, so it gets three quick attempts before we give up.
     let tasksCleared = [];
-    try {
-      tasksCleared = await reevaluateStockGatedTasks(conn, companyId, [Number(catalogItemId)]);
-    } catch (hookErr) {
+    let gateError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        tasksCleared = await reevaluateStockGatedTasks(conn, companyId, [Number(catalogItemId)]);
+        gateError = null;
+        break;
+      } catch (hookErr) {
+        gateError = hookErr;
+        logger.warn(
+          { err: hookErr, companyId, catalogItemId, attempt },
+          '[stock-in] gate re-evaluation attempt failed',
+        );
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 150 * attempt));
+      }
+    }
+
+    if (gateError) {
       logger.error(
-        { err: hookErr, companyId, catalogItemId },
-        '[stock-in] gate re-evaluation failed; stock is committed but blocked tasks were not re-checked',
+        { err: gateError, companyId, catalogItemId },
+        '[stock-in] gate re-evaluation failed after 3 attempts; stock is committed but blocked tasks were not re-checked',
       );
     }
 
-    return { ok: true, pieceIds, qtyTotal, tasksCleared };
+    // Reported, not swallowed. The receipt succeeded and must not be undone, but
+    // the caller needs to know the second half did not happen — otherwise the
+    // screen says "stock added, 4 tasks unblocked" when nothing was unblocked.
+    return {
+      ok: true,
+      pieceIds,
+      qtyTotal,
+      tasksCleared,
+      gateCheckFailed: !!gateError,
+    };
   } catch (err) {
     await conn.rollback();
     throw err;

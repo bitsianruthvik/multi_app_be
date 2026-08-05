@@ -183,14 +183,25 @@ export async function computeOrderSlack(companyId, now = new Date()) {
 export async function computeDispatch(companyId, { limitPerMachine = 5, now = new Date() } = {}) {
   const { slackByOrder, criticalTaskIds } = await computeOrderSlack(companyId, now);
 
+  // Machine state joined in, not ignored. fab_resource_events was previously
+  // read only by analytics and after-the-fact wait attribution, so dispatch
+  // would rank a full shift of work onto a machine somebody had marked DOWN and
+  // Start would accept it. A machine that cannot run is not a candidate.
   const [machines] = await pool.query(
-    `SELECT id, name, resource_type_id AS resourceTypeId, plant_id AS plantId, stock_location_id
-       FROM fab_resources
-      WHERE company_id = ? AND deleted_at IS NULL
-      ORDER BY name ASC`,
-    [companyId],
+    `SELECT r.id, r.name, r.resource_type_id AS resourceTypeId, r.plant_id AS plantId,
+            r.stock_location_id, ev.state AS machineState, ev.reason_code AS machineReason
+       FROM fab_resources r
+       LEFT JOIN (
+         SELECT resource_id, state, reason_code,
+                ROW_NUMBER() OVER (PARTITION BY resource_id ORDER BY at DESC, id DESC) AS rn
+           FROM fab_resource_events
+          WHERE company_id = ? AND deleted_at IS NULL AND superseded_by_event_id IS NULL
+       ) ev ON ev.resource_id = r.id AND ev.rn = 1
+      WHERE r.company_id = ? AND r.deleted_at IS NULL
+      ORDER BY r.name ASC`,
+    [companyId, companyId],
   );
-  if (machines.length === 0) return { machines: [], skipped: { blocked: 0, claimed: 0 } };
+  if (machines.length === 0) return { machines: [], skipped: { blocked: 0, claimed: 0, machinesDown: 0 } };
 
   const [tasks] = await pool.query(
     `SELECT t.id, t.order_id AS orderId, t.item_id, t.flow_id, t.seq_no AS seqNo,
@@ -272,7 +283,18 @@ export async function computeDispatch(companyId, { limitPerMachine = 5, now = ne
   let claimedCount = 0;
   const out = [];
 
+  const machinesDown = [];
   for (const m of machines) {
+    // A machine somebody marked down cannot run anything, so recommending work
+    // for it is worse than saying nothing: the list looks full while the shop
+    // stands still. Reported separately rather than dropped silently — "CNC 2
+    // is down" is the actual news on that row.
+    if (m.machineState === 'down') {
+      machinesDown.push({ resourceId: m.id, resourceName: m.name, reason: m.machineReason ?? null });
+      out.push({ resourceId: m.id, resourceName: m.name, tasks: [], machineState: 'down', machineReason: m.machineReason ?? null });
+      continue;
+    }
+
     const candidates = tasks
       .filter((t) => t.assignedResourceId === m.id
         || (t.assignedResourceId == null && t.resourceTypeId === m.resourceTypeId))
@@ -311,10 +333,17 @@ export async function computeDispatch(companyId, { limitPerMachine = 5, now = ne
       });
     }
 
-    out.push({ resourceId: m.id, resourceName: m.name, tasks: picked });
+    out.push({
+      resourceId: m.id, resourceName: m.name, tasks: picked,
+      machineState: m.machineState ?? null, machineReason: m.machineReason ?? null,
+    });
   }
 
-  return { machines: out, skipped: { blocked: blockedCount, claimed: claimedCount } };
+  return {
+    machines: out,
+    skipped: { blocked: blockedCount, claimed: claimedCount, machinesDown: machinesDown.length },
+    machinesDown,
+  };
 }
 
 /**

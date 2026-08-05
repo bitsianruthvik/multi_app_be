@@ -67,7 +67,20 @@ export async function availableQty(conn, companyId, catalogItemId) {
 }
 
 async function writeLedger(conn, companyId, { catalogItemId, plantId, stockLocationId, txnType, qty, batchCode = 'WIP', notes = null }) {
-  if (!catalogItemId || !plantId || !stockLocationId) return; // ledger requires a real location
+  // Throw, do not return. This used to skip quietly when a piece carried no
+  // plant or location — but the caller has ALREADY decremented that piece by the
+  // time it gets here, so skipping turned a data-quality problem into stock that
+  // left the system with no record of leaving. Failing loudly rolls the whole
+  // movement back instead, which is the only outcome that keeps stock and ledger
+  // telling the same story.
+  if (!catalogItemId || !plantId || !stockLocationId) {
+    const err = new Error(
+      `Cannot write a stock-ledger row for catalog item ${catalogItemId ?? 'null'}: ` +
+      `missing ${!plantId ? 'plant' : 'stock location'}. Refusing to move stock untracked.`,
+    );
+    err.code = 'LEDGER_INCOMPLETE';
+    throw err;
+  }
   await conn.query(
     `INSERT INTO fab_stock_ledger
        (company_id, catalog_item_id, plant_id, stock_location_id, batch_id, batch_code, txn_type, qty, txn_date, notes)
@@ -317,10 +330,27 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
         });
       } else {
         // Nothing good produced — write the piece off entirely (no receipt).
+        //
+        // The write-off is itself ledgered. Only the separately reported
+        // scrapQty used to be, so an operator recording "0 good, 0 scrap" made
+        // the whole piece vanish from stock with no row anywhere saying where it
+        // went — the one case where the ledger and the shelf could disagree
+        // without anybody being able to find out why.
+        const writtenOff = Number(piece.qty) || 0;
         await conn.query(
           `UPDATE fab_stock_pieces SET qty = 0, status = 'scrapped' WHERE id = ?`,
           [piece.id],
         );
+        if (writtenOff > EPS) {
+          await writeLedger(conn, companyId, {
+            catalogItemId: node.catalog_item_id,
+            plantId: piece.plant_id ?? plantId,
+            stockLocationId: piece.stock_location_id ?? targetLoc,
+            txnType: 'scrap',
+            qty: -writtenOff,
+            notes: `written off: nothing good produced`,
+          });
+        }
       }
       await bookScrap(piece.stock_location_id ?? targetLoc);
     }

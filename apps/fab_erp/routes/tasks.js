@@ -53,7 +53,7 @@ import { onTaskComplete, rollUpOrderStatus, spawnReworkTask } from '../services/
 import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
 import { recomputeTaskAttribution, recomputeForResource } from '../services/taskAttributionService.js';
 import * as bufferService from '../services/bufferService.js';
-import { isOutputBlocked } from '../services/taskGatingService.js';
+import { isOutputBlocked, startBlockersForQueue } from '../services/taskGatingService.js';
 import { recomputeForOrder as ccRecomputeForOrder } from '../services/ccBufferService.js';
 
 const router = Router();
@@ -231,11 +231,35 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
       t.itemPath = path.slice(0, -1);
     }
 
+    // ── What would refuse to start? ─────────────────────────────────────────
+    //
+    // Until now this endpoint filtered on status alone, so it listed work that
+    // 409s the moment an operator presses Start — the buffer and material gates
+    // were only evaluated inside POST /tasks/:id/start. Answering it here costs
+    // a couple of queries and turns a red toast into something visible in
+    // advance. Best-effort: if the check itself fails the queue still renders,
+    // because a queue that shows work optimistically is far better than none.
+    let blockers = new Map();
+    try {
+      blockers = await startBlockersForQueue(companyId, rid, taskRows);
+    } catch (blockErr) {
+      logger.warn({ err: blockErr, companyId, resourceId: rid }, 'queue-summary: start-blocker check failed');
+    }
+    for (const t of taskRows) {
+      const b = blockers.get(t.id);
+      t.startBlocked = !!b;
+      t.blockKind = b ? (b.outputBlocked ? 'output_blocked' : 'material_short') : null;
+      t.blockReason = b?.reason ?? null;
+    }
+
     // Count tasks by status
     const counts = {
       eligible: taskRows.filter(t => t.status === 'eligible').length,
       in_progress: taskRows.filter(t => t.status === 'in_progress').length,
       paused: taskRows.filter(t => t.status === 'paused').length,
+      // Eligible on paper but would refuse right now — the number that explains
+      // why the queue looks longer than the work an operator can actually pick up.
+      blocked: taskRows.filter(t => (t.status === 'eligible' || t.status === 'paused') && t.startBlocked).length,
     };
 
     return res.status(200).json({
@@ -825,6 +849,28 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
         return res.status(400).json({ message: 'Selected machine was not found.' });
       }
       const machine = machineRows[0];
+
+      // A machine marked DOWN cannot run work. Until now machine state was read
+      // only by analytics and after-the-fact wait attribution, so Start would
+      // cheerfully begin a job on a machine the shop had just flagged as broken,
+      // and those minutes were then attributed as downtime on a task that was
+      // supposedly running. `force` is honoured for the same reason it is on the
+      // buffer check: an admin reconciling the record with reality.
+      const [[machineNow]] = await conn.query(
+        `SELECT state, reason_code AS reasonCode FROM fab_resource_events
+          WHERE company_id = ? AND resource_id = ? AND deleted_at IS NULL
+            AND superseded_by_event_id IS NULL
+          ORDER BY at DESC, id DESC LIMIT 1`,
+        [companyId, machineId],
+      );
+      if (machineNow?.state === 'down' && !(forced && isAdmin)) {
+        await conn.rollback();
+        return res.status(409).json({
+          code: 'MACHINE_DOWN',
+          message: `${machine.name} is marked down${machineNow.reasonCode ? ` (${machineNow.reasonCode})` : ''}. Mark it back up before starting work on it.`,
+        });
+      }
+
       if (task.resource_type_id && machineRows[0].resource_type_id &&
           machineRows[0].resource_type_id !== task.resource_type_id) {
         await conn.rollback();

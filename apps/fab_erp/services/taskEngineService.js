@@ -102,6 +102,23 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
         `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
         [salesTarget, orderId, companyId],
       );
+
+      // A finished project has to let go of the constraint. Nothing used to move
+      // fab_cc_plans off 'baselined', and both the CC portfolio and
+      // drumService.sequenceProjects select on exactly that — so a delivered
+      // order kept its drum slot and its row on the fever chart indefinitely,
+      // crowding out live work until somebody happened to press Replan.
+      //
+      // Archived, not deleted: the plan is the record of what was committed to
+      // and what it actually cost, and that is the only thing that makes the
+      // next estimate better than a guess.
+      if (salesTarget === 'ready_to_ship') {
+        await exec.query(
+          `UPDATE fab_cc_plans SET status = 'archived'
+            WHERE company_id = ? AND order_id = ? AND status = 'baselined' AND deleted_at IS NULL`,
+          [companyId, orderId],
+        );
+      }
     }
   } catch (err) {
     // Never let a status rollup break the task lifecycle.

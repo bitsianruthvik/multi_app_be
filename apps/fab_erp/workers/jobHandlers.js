@@ -25,9 +25,12 @@ import { logger } from '../../../core/utils/logger.js';
 import { getQueue } from '../../../core/jobs/queue.js';
 import { sweepCompany, sweepAllCompanies } from '../services/taskAttributionService.js';
 import { recomputeAllBaselined } from '../services/ccBufferService.js';
+import { sweepBlockedTasksAllCompanies } from '../services/taskGatingService.js';
 
 const SWEEP_JOB = 'fab_erp:attribution-sweep';
 const CC_SWEEP_JOB = 'fab_erp:cc-sweep';
+const GATE_SWEEP_JOB = 'fab_erp:gate-sweep';
+let _gateSweepRunning = false;
 const CC_SWEEP_PERIOD_MS = 15 * 60 * 1000;
 
 const jobHandlers = {
@@ -37,6 +40,28 @@ const jobHandlers = {
       return sweepCompany(data.companyId, { limit });
     }
     return sweepAllCompanies({ limit });
+  },
+
+  // Re-check tasks still blocked on material. The receipt-time hook is the
+  // primary path and is retried; this is the net under it, because that hook is
+  // the ONLY thing that unblocks material-gated work and a process restart
+  // mid-receipt would otherwise strand it indefinitely.
+  // Re-entrancy guarded and batch-capped: a full pass over 275 blocked tasks
+  // measured ~36s against TiDB, which is comfortably inside the 15-minute tick
+  // but not so far inside that two passes could never overlap on a bigger shop.
+  // Overlapping passes would double the load to reach the same answer.
+  [GATE_SWEEP_JOB]: async (data = {}) => {
+    if (_gateSweepRunning) {
+      logger.warn('[gate-sweep] previous pass still running; skipping this tick');
+      return { skipped: true };
+    }
+    _gateSweepRunning = true;
+    try {
+      const limit = data && data.limit != null ? Number(data.limit) : 200;
+      return await sweepBlockedTasksAllCompanies({ limit });
+    } finally {
+      _gateSweepRunning = false;
+    }
   },
 
   // EU-5: recompute CC buffer consumption for all baselined plans, batch-limited.
@@ -54,7 +79,11 @@ const jobHandlers = {
     }
     queue.process(SWEEP_JOB, async (job) => jobHandlers[SWEEP_JOB](job.data || {}));
     queue.process(CC_SWEEP_JOB, async (job) => jobHandlers[CC_SWEEP_JOB](job.data || {}));
-    logger.info('[jobs] fab_erp attribution-sweep + operation-stats + cc-sweep processors registered.');
+    // Must be registered, not just enqueued: the scheduler above adds a
+    // GATE_SWEEP_JOB on every tick when Redis is up, and without a processor
+    // those would accumulate unread while the safety net silently never ran.
+    queue.process(GATE_SWEEP_JOB, async (job) => jobHandlers[GATE_SWEEP_JOB](job.data || {}));
+    logger.info('[jobs] fab_erp attribution-sweep + cc-sweep + gate-sweep processors registered.');
   },
 };
 
@@ -72,16 +101,27 @@ export function startCcSweepScheduler() {
       const queue = getQueue('fab_erp');
       if (queue) {
         queue.add(CC_SWEEP_JOB, {}).catch(() => {});
+        queue.add(GATE_SWEEP_JOB, {}).catch(() => {});
       } else {
         jobHandlers[CC_SWEEP_JOB]({}).catch((err) =>
           logger.error({ err }, '[cc-sweep] inline sweep failed'),
         );
+        // Rides the same tick rather than adding a second timer: both answer
+        // "has something changed underneath a stored decision?", and neither
+        // needs to be more punctual than the other.
+        jobHandlers[GATE_SWEEP_JOB]({})
+          .then((r) => {
+            if (r?.cleared?.length) {
+              logger.info({ cleared: r.cleared.length }, '[gate-sweep] unblocked tasks the receipt hook had missed');
+            }
+          })
+          .catch((err) => logger.error({ err }, '[gate-sweep] inline sweep failed'));
       }
     } catch (err) {
       logger.error({ err }, '[cc-sweep] sweep tick failed');
     }
   }, CC_SWEEP_PERIOD_MS);
-  logger.info('[cc-sweep] critical-chain buffer-consumption sweep scheduler started');
+  logger.info('[cc-sweep] critical-chain and material-gate sweep scheduler started');
 }
 
 // Start on module load. jobHandlers.js is imported once, at server boot (app.js →

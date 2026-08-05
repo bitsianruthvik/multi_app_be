@@ -20,6 +20,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { logger } from '../../../core/utils/logger.js';
 import { evaluateFormula , formulaResultToHours } from './formulaEngine.js';
 import { recordEvent, recordEvents } from './taskEventService.js';
 import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
@@ -511,4 +512,209 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   }
 
   return { ok: true, itemsProcessed, itemsSkipped, tasksInserted, cleared };
+}
+
+/**
+ * What would stop each of these tasks from starting, right now.
+ *
+ * The operator's queue used to filter on status alone, so it listed work that
+ * 409s on contact — the two gates that actually decide a start (a full output
+ * buffer, and material a sibling task consumed first) were only evaluated
+ * inside POST /tasks/:id/start. Dispatch pre-filtered; the person pressing the
+ * button did not, and got a red toast with no way to see it coming.
+ *
+ * Batched deliberately. The queue polls every 30 seconds, and calling
+ * isOutputBlocked per task would be four round trips each. Two properties make
+ * that unnecessary:
+ *
+ *   - The queue is ONE machine's, and output-blocking requires this machine's
+ *     own output buffer to be full. That is one check for the whole list, and
+ *     when it comes back clear — the overwhelmingly common case — no task in
+ *     the queue can be output-blocked and we stop.
+ *   - Material availability is a sum per catalog item, so every task's inputs
+ *     resolve from a single grouped query.
+ *
+ * Returns Map<taskId, { outputBlocked, materialShort, reason }>. A task absent
+ * from the map has nothing standing in its way.
+ */
+export async function startBlockersForQueue(companyId, resourceId, tasks) {
+  const out = new Map();
+  const eligible = (tasks || []).filter((t) => t.status === 'eligible');
+  if (eligible.length === 0) return out;
+
+  // ── (1) output buffer, once for the whole machine ────────────────────────
+  let ownBufferFull = false;
+  if (resourceId) {
+    const [[ownBuf]] = await pool.query(
+      `SELECT id FROM fab_buffers
+        WHERE company_id = ? AND resource_id = ? AND kind = 'output'
+          AND active = 1 AND deleted_at IS NULL LIMIT 1`,
+      [companyId, resourceId],
+    );
+    if (ownBuf) {
+      const load = await loadOf(companyId, ownBuf.id);
+      ownBufferFull = statusFor(load.pct, load.warnPct, load.blockPct) === 'block';
+    }
+  }
+
+  if (ownBufferFull) {
+    // Only now is the successor side worth resolving, and only per task,
+    // because each task's next step can sit on a different machine.
+    for (const t of eligible) {
+      try {
+        const r = await isOutputBlocked(companyId, { ...t, assigned_resource_id: resourceId });
+        if (r.blocked) {
+          out.set(t.id, { outputBlocked: true, materialShort: false, reason: r.reason ?? 'output buffer full' });
+        }
+      } catch { /* a gating hiccup must not empty the queue; treat as startable */ }
+    }
+  }
+
+  // ── (2) material, for the tasks that will actually consume ───────────────
+  //
+  // Only a first step consumes (wipInventoryService opens the WIP piece there);
+  // later steps move a piece that already exists. A task is eligible because its
+  // gate was satisfied at some point in the past — satisfied_at is a one-way
+  // stamp — so stock a sibling has since taken is exactly the case this catches.
+  const taskIds = eligible.map((t) => t.id);
+  const [gateRows] = await pool.query(
+    `SELECT ti.task_id, ti.ref_catalog_item_id AS catalogItemId, ti.qty,
+            ic.name AS itemName
+       FROM fab_task_inputs ti
+       LEFT JOIN fab_item_catalog ic ON ic.id = ti.ref_catalog_item_id
+      WHERE ti.company_id = ? AND ti.task_id IN (?) AND ti.gate = 1
+        AND ti.ref_catalog_item_id IS NOT NULL AND ti.deleted_at IS NULL`,
+    [companyId, taskIds],
+  );
+  if (gateRows.length === 0) return out;
+
+  const catalogIds = [...new Set(gateRows.map((r) => r.catalogItemId))];
+  const [stockRows] = await pool.query(
+    `SELECT catalog_item_id AS catalogItemId, COALESCE(SUM(qty), 0) AS available
+       FROM fab_stock_pieces
+      WHERE company_id = ? AND catalog_item_id IN (?)
+        AND status = 'in_stock' AND deleted_at IS NULL
+      GROUP BY catalog_item_id`,
+    [companyId, catalogIds],
+  );
+  const availableBy = new Map(stockRows.map((r) => [r.catalogItemId, Number(r.available) || 0]));
+
+  // Mirror inputSatisfiedLive exactly, including its weakness. That function
+  // does `required > 0 ? avail >= required : avail > 0`, and in practice the
+  // second branch is the only one that ever runs: fab_task_inputs.qty is NULL on
+  // every row in production (2328 of 2328), because the flow-step inputs it is
+  // copied from carry no quantity either. So the material gate is presence-only
+  // — it asks "is there any of this?", not "is there enough?".
+  //
+  // Predicting something stricter than the gate would be worse than predicting
+  // nothing: the queue would grey out work that starts perfectly well. When a
+  // quantity does exist, demand is summed across the whole queue, because two
+  // tasks each needing the last plate are both fine in isolation and cannot
+  // both be right.
+  const demandBy = new Map();
+  let anyQuantities = false;
+  for (const g of gateRows) {
+    const need = Number(g.qty) || 0;
+    if (need > 0) anyQuantities = true;
+    demandBy.set(g.catalogItemId, (demandBy.get(g.catalogItemId) ?? 0) + need);
+  }
+
+  const shortItems = new Set();
+  for (const catId of demandBy.keys()) {
+    const have = availableBy.get(catId) ?? 0;
+    const demand = demandBy.get(catId) ?? 0;
+    const short = demand > 0 ? demand > have + 1e-9 : have <= 0;
+    if (short) shortItems.add(catId);
+  }
+  if (shortItems.size === 0) return out;
+
+  for (const g of gateRows) {
+    if (!shortItems.has(g.catalogItemId)) continue;
+    const have = availableBy.get(g.catalogItemId) ?? 0;
+    const demand = demandBy.get(g.catalogItemId) ?? 0;
+    const prev = out.get(g.task_id) ?? { outputBlocked: false, materialShort: false, reason: null };
+    const label = g.itemName ?? `item #${g.catalogItemId}`;
+    out.set(g.task_id, {
+      ...prev,
+      materialShort: true,
+      reason: prev.outputBlocked
+        ? prev.reason
+        : (demand > 0
+          ? `${label}: ${round2(have)} in stock, this queue needs ${round2(demand)}`
+          : `${label}: none in stock`),
+    });
+  }
+
+  return out;
+}
+
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+/**
+ * Re-check every task still sitting on 'blocked' for material.
+ *
+ * The safety net under reevaluateStockGatedTasks. That hook runs once, at the
+ * moment stock is received, and it is the only thing that moves a task off
+ * 'blocked' — so if it fails (deadlock, timeout, a bad row) the material is on
+ * hand and the work stays blocked with nobody watching. It is now retried three
+ * times at the call site, but a retry loop still cannot survive a process
+ * restart mid-receipt.
+ *
+ * This sweep closes that hole from the other side: it asks the same question
+ * periodically, for every blocked task, regardless of what happened at receipt
+ * time. Idempotent by construction — tryClearTask only acts on tasks that are
+ * still 'blocked' and whose inputs genuinely check out, so a task that is fine
+ * costs one evaluation and nothing else.
+ *
+ * @returns {Promise<{checked:number, cleared:number[]}>}
+ */
+export async function sweepBlockedTasks(companyId, { limit = 500 } = {}) {
+  const [rows] = await pool.query(
+    `SELECT DISTINCT t.id
+       FROM fab_project_tasks t
+       JOIN fab_task_inputs ti ON ti.task_id = t.id AND ti.gate = 1
+                              AND ti.satisfied_at IS NULL AND ti.deleted_at IS NULL
+      WHERE t.company_id = ? AND t.status = 'blocked' AND t.deleted_at IS NULL
+      ORDER BY t.id ASC
+      LIMIT ?`,
+    [companyId, limit],
+  );
+  if (rows.length === 0) return { checked: 0, cleared: [] };
+
+  const conn = await pool.getConnection();
+  const cleared = [];
+  try {
+    for (const r of rows) {
+      try {
+        if (await tryClearTask(conn, companyId, r.id)) cleared.push(r.id);
+      } catch (err) {
+        // One bad task must not stop the sweep for the rest of the shop.
+        logger.warn({ err, companyId, taskId: r.id }, '[gate-sweep] task re-check failed');
+      }
+    }
+  } finally {
+    conn.release();
+  }
+  return { checked: rows.length, cleared };
+}
+
+/** Every company with at least one blocked, material-gated task. */
+export async function sweepBlockedTasksAllCompanies({ limit = 500 } = {}) {
+  const [companies] = await pool.query(
+    `SELECT DISTINCT t.company_id AS companyId
+       FROM fab_project_tasks t
+       JOIN fab_task_inputs ti ON ti.task_id = t.id AND ti.gate = 1
+                              AND ti.satisfied_at IS NULL AND ti.deleted_at IS NULL
+      WHERE t.status = 'blocked' AND t.deleted_at IS NULL`,
+  );
+  let totalChecked = 0;
+  const totalCleared = [];
+  for (const c of companies) {
+    const r = await sweepBlockedTasks(c.companyId, { limit });
+    totalChecked += r.checked;
+    totalCleared.push(...r.cleared);
+  }
+  return { companies: companies.length, checked: totalChecked, cleared: totalCleared };
 }
