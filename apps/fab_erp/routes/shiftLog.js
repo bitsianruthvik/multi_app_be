@@ -45,6 +45,7 @@ import { resolveCalendarIds, workingIntervalsInWindow } from '../services/taskWa
 import { crewForWindow } from '../services/workerService.js';
 import { recomputeForResource } from '../services/taskAttributionService.js';
 import { onTaskComplete } from '../services/taskEngineService.js';
+import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
 
 const router = Router();
 
@@ -327,10 +328,14 @@ router.post('/shift-log', protect, async (req, res) => {
 
     // Every task must belong to this company; assign it to this machine while
     // we're here, since the whole premise is "this machine ran this work".
+    //
+    // item_id / seq_no / order_id come back too because the WIP hooks below need
+    // them — they take the same task shape the live start/stop route passes.
     const taskIds = parsedWork.map((w) => w.taskId);
+    const taskById = new Map();
     if (taskIds.length) {
       const [rows] = await conn.query(
-        `SELECT id FROM fab_project_tasks
+        `SELECT id, item_id, seq_no, order_id FROM fab_project_tasks
           WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL FOR UPDATE`,
         [companyId, taskIds],
       );
@@ -338,7 +343,15 @@ router.post('/shift-log', protect, async (req, res) => {
         await conn.rollback();
         return res.status(404).json({ message: 'One or more tasks no longer exist.' });
       }
+      for (const r of rows) taskById.set(r.id, r);
     }
+
+    // The machine, in the shape ensureMachineWipLocation expects.
+    const [[machine]] = await conn.query(
+      `SELECT id, name, plant_id, stock_location_id FROM fab_resources
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [resourceId, companyId],
+    );
 
     for (const w of parsedWork) {
       await conn.query(
@@ -361,6 +374,38 @@ router.post('/shift-log', protect, async (req, res) => {
           w.taskId, companyId,
         ],
       );
+
+      // Move the material, exactly as POST /tasks/:id/start and /stop do.
+      //
+      // Until 2026-08-05 this route wrote task times and events and stopped
+      // there. Back-entry is not a lesser path — 572 of the 578 start/stop
+      // events in production came through it — so a whole girder could be
+      // fabricated without a kilogram of steel being consumed: every stock
+      // piece stayed 'in_stock', no WIP was ever opened, no machine ever got
+      // its stock area, and finished goods never appeared. A material gate
+      // could keep passing on steel that was notionally used weeks earlier.
+      //
+      // Best-effort per row: a material problem on one back-entered job must
+      // not reject a supervisor's whole shift sheet, which is a record of what
+      // already happened and cannot be "declined". The live path is stricter
+      // because there the work has not started yet and can still be stopped.
+      const task = taskById.get(w.taskId);
+      if (task && machine) {
+        try {
+          await openOrMoveWipOnStart(conn, companyId, task, machine);
+          if (w.completedAt && w.qcResult !== 'fail') {
+            await finalizeWipOnComplete(conn, companyId, task, {
+              goodQty: w.producedQty ?? null,
+              scrapQty: w.scrapQty ?? null,
+            });
+          }
+        } catch (wipErr) {
+          logger.warn(
+            { err: wipErr, taskId: w.taskId, resourceId },
+            'shift-log: WIP movement failed for a back-entered job; times and events still recorded',
+          );
+        }
+      }
     }
 
     for (const d of parsedDowntime) {
