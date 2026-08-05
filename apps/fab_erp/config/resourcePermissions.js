@@ -17,7 +17,6 @@ const resourcePermissions = {
 
   // Item meta
   fabErpItemMetricDef: 'fab_erp_items_meta_manage',
-  fabErpConstant:      'fab_erp_items_meta_manage',
 
   // Formulas
   fabErpFormulaSet: 'fab_erp_formulas_manage',

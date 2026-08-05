@@ -307,34 +307,6 @@
     },
     "relations": {}
   },
-  "fabErpConstant": {
-    "table": "fab_constants",
-    "alias": "fc",
-    "writeFields": [
-      "const_key",
-      "const_value",
-      "label"
-    ],
-    "fields": {
-      "id": "fc.id",
-      "companyId": "fc.company_id",
-      "constKey": "fc.const_key",
-      "constValue": "fc.const_value",
-      "label": "fc.label",
-      "createdAt": "fc.created_at",
-      "updatedAt": "fc.updated_at"
-    },
-    "fieldTypes": {
-      "id": "integer",
-      "companyId": "integer",
-      "constKey": "string",
-      "constValue": "decimal",
-      "label": "string",
-      "createdAt": "datetime",
-      "updatedAt": "datetime"
-    },
-    "relations": {}
-  },
   "fabErpProcessMaster": {
     "table": "fab_process_master",
     "alias": "fpm",
