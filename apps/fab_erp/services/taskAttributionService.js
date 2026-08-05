@@ -274,9 +274,11 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
       await fetchOverlappingOtherTasks(companyId, task, spanStart, spanEnd, now),
     );
 
-    // EU-8 output_blocked. Buffer levels are not historically reconstructable
-    // (fab_buffer_contents holds only current open rows, not a per-minute
-    // timeline), so we cannot know WHEN in the past a task was output-blocked.
+    // EU-8 output_blocked. Buffer levels are not historically reconstructable —
+    // a buffer's load is derived from the WIP pieces standing at a machine's
+    // stock area right now, and a piece records where it IS, not where it was
+    // at 14:20 last Tuesday — so we cannot know WHEN in the past a task was
+    // output-blocked.
     // SIMPLIFICATION: we classify only the task's still-open idle tail (in-shift
     // remainder running up to `now`) as output_blocked, and only when the task
     // is output-blocked RIGHT NOW. All historical/closed idle stays

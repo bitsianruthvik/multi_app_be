@@ -2133,47 +2133,10 @@ CREATE TABLE IF NOT EXISTS fab_buffers (
   KEY idx_fb_company_resource (company_id, resource_id)
 );
 
--- Live (and historical) contents of a buffer: one row per item placed into
--- it. A row is "currently in the buffer" while moved_out_at IS NULL; once set,
--- the row becomes history rather than being deleted, so occupancy can be
--- reconstructed for any point in time.
-CREATE TABLE IF NOT EXISTS fab_buffer_contents (
-  id               INT AUTO_INCREMENT PRIMARY KEY,
-  company_id       INT           NOT NULL,
-  buffer_id        INT           NOT NULL,
-  task_id          INT           NULL,
-  item_id          INT           NOT NULL,
-  qty              DECIMAL(18,4) NULL,
-  unit             VARCHAR(20)   NULL,
-  computed_weight  DECIMAL(18,4) NULL,
-  placed_at        DATETIME      NOT NULL,
-  moved_out_at     DATETIME      NULL,
-  deleted_at       DATETIME      DEFAULT NULL,
-  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_fbc_company_buffer   (company_id, buffer_id),
-  KEY idx_fbc_buffer_moved_out (buffer_id, moved_out_at),
-  KEY idx_fbc_task             (task_id)
-);
 
 -- Periodic point-in-time snapshots of a buffer's load vs. capacity, written
 -- by a backend job (not by users directly) to power buffer-level
 -- capacity/overflow monitoring and history charts.
-CREATE TABLE IF NOT EXISTS fab_buffer_level_snapshots (
-  id              INT AUTO_INCREMENT PRIMARY KEY,
-  company_id      INT           NOT NULL,
-  buffer_id       INT           NOT NULL,
-  at              DATETIME      NOT NULL,
-  load_value      DECIMAL(18,4) NULL,
-  capacity_value  DECIMAL(18,4) NULL,
-  pct             DECIMAL(6,2)  NULL,
-  deleted_at      DATETIME      DEFAULT NULL,
-  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_fbls_company_buffer_at (company_id, buffer_id, at)
-);
 
 -- ===== Shop-Floor Time Intelligence (Phase 4 — Learned Durations) =====
 -- EU-14: rolling per-(operation, resource_type) duration stats, computed

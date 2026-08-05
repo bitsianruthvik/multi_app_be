@@ -68,9 +68,12 @@ DELETE FROM fab_task_inputs WHERE task_id IN (
   SELECT id FROM fab_project_tasks WHERE order_id IN (
     SELECT id FROM fab_orders WHERE FIND_IN_SET(order_type, @doomed)));
 
-DELETE FROM fab_buffer_contents WHERE task_id IN (
-  SELECT id FROM fab_project_tasks WHERE order_id IN (
-    SELECT id FROM fab_orders WHERE FIND_IN_SET(order_type, @doomed)));
+-- fab_buffer_contents rows for these tasks were deleted here when this
+-- migration first ran. The statement is retired rather than kept, because
+-- 2026-08-drop-buffer-contents.sql sorts BEFORE this file by filename and drops
+-- the table outright — so on a clean in-order replay this DELETE would hit a
+-- table that no longer exists and abort the migration midway.
+--   was: DELETE FROM fab_buffer_contents WHERE task_id IN (...doomed tasks...);
 
 -- ── item children (hard FK) ─────────────────────────────────────────────────
 DELETE FROM fab_item_metric_values WHERE item_id IN (

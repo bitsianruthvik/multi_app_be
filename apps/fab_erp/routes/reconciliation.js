@@ -110,32 +110,47 @@ async function findLongRunning(companyId) {
   });
 }
 
+/**
+ * WIP that has sat at one machine's stock area too long.
+ *
+ * Read from fab_stock_pieces since 2026-08-05. It used to read
+ * fab_buffer_contents, looking for a row whose moved_out_at was still NULL —
+ * but the only thing that ever set moved_out_at was an operator tapping "Move",
+ * so this detector largely reported people forgetting to tap rather than
+ * material actually sitting. Asking the stock model instead makes it mean what
+ * it says: this piece has not moved to another machine since `days` ago.
+ *
+ * No contentId and no one-tap Move any more — moving a piece is starting its
+ * next operation, not a separate gesture. The anomaly names where the metal is
+ * and leaves the fix to the queue.
+ */
 async function findStuckBuffers(companyId, days) {
   const [rows] = await pool.query(
-    `SELECT c.id AS contentId, c.buffer_id AS bufferId, c.placed_at AS placedAt,
-            b.resource_id AS resourceId, b.kind AS bufferKind,
-            r.name AS resourceName, it.name AS itemName
-       FROM fab_buffer_contents c
-       JOIN fab_buffers b ON b.id = c.buffer_id AND b.deleted_at IS NULL
-       LEFT JOIN fab_resources r ON r.id = b.resource_id AND r.deleted_at IS NULL
-       LEFT JOIN fab_items it ON it.id = c.item_id
-      WHERE c.company_id = ? AND c.moved_out_at IS NULL AND c.deleted_at IS NULL
-        AND c.placed_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+    `SELECT p.id AS pieceId, p.updated_at AS sinceAt, p.qty,
+            sl.id AS locationId, sl.code AS locationCode,
+            r.id AS resourceId, r.name AS resourceName,
+            it.name AS itemName
+       FROM fab_stock_pieces p
+       JOIN fab_stock_locations sl ON sl.id = p.stock_location_id AND sl.deleted_at IS NULL
+       LEFT JOIN fab_resources r ON r.stock_location_id = sl.id AND r.deleted_at IS NULL
+       LEFT JOIN fab_items it ON it.id = p.wip_item_id
+      WHERE p.company_id = ? AND p.status = 'wip' AND p.deleted_at IS NULL
+        AND p.updated_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
     [companyId, days],
   );
 
   return rows.map((r) => {
-    const ageDays = Math.floor((Date.now() - new Date(r.placedAt).getTime()) / 86400000);
-    const where = r.resourceName ? `${r.resourceName} (${r.bufferKind})` : `buffer #${r.bufferId}`;
-    const materialLabel = r.itemName ?? 'Material';
+    const ageDays = Math.floor((Date.now() - new Date(r.sinceAt).getTime()) / 86400000);
+    // The resource join can miss when a machine's stock_location_id copy is
+    // stale; the location code carries the machine id either way.
+    const where = r.resourceName ?? r.locationCode ?? 'a stock area';
     return {
       type: 'stuckBuffer',
-      contentId: r.contentId,
-      bufferId: r.bufferId,
+      pieceId: r.pieceId,
       resourceId: r.resourceId,
-      label: `${materialLabel} stuck in ${where} for ${ageDays}d`,
-      detail: `Placed ${r.placedAt}`,
-      placedAt: r.placedAt,
+      label: `${r.itemName ?? 'Material'} sitting at ${where} for ${ageDays}d`,
+      detail: `Last moved ${r.sinceAt}`,
+      placedAt: r.sinceAt,
       ageDays,
     };
   });

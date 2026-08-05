@@ -145,27 +145,49 @@ async function fetchStateMinutes(companyId, fromSql, effectiveToSql) {
 }
 
 /**
- * Latest input-buffer fullness pct per machine, as of `asOfSql`. One row per
- * active input buffer, taking its most recent snapshot at/before the window
- * end. Returns Map<resourceId, pct(number)>.
+ * Input-buffer fullness pct per machine. Returns Map<resourceId, pct(number)>.
+ *
+ * Derived live from the WIP pieces standing at each machine's stock area — the
+ * same aggregate /buffers/board renders, so the two screens can never disagree.
+ *
+ * This used to read the newest fab_buffer_level_snapshots row at/before the
+ * window end. That table had a single writer (placeOutput, removed 2026-08-05
+ * with fab_buffer_contents) and zero rows in every environment, so the column
+ * has been blank since it shipped.
+ *
+ * Consequence of deriving: the pct is how full the machine is NOW, not as of a
+ * past window end. Buffer fullness is a right-now question — the other columns
+ * on this row are genuinely windowed, this one is not. Everything else on the
+ * page respects the range.
  */
-async function fetchInputBufferPct(companyId, asOfSql) {
+async function fetchInputBufferPct(companyId) {
   const [rows] = await pool.query(
-    `SELECT b.resource_id AS resourceId, s.pct AS pct
+    `SELECT b.resource_id                    AS resourceId,
+            b.capacity_value                 AS capacity,
+            SUM(p.qty * v.metric_value)      AS weightSum
        FROM fab_buffers b
-       JOIN (
-         SELECT buffer_id, pct,
-                ROW_NUMBER() OVER (PARTITION BY buffer_id ORDER BY at DESC, id DESC) AS rn
-           FROM fab_buffer_level_snapshots
-          WHERE company_id = ? AND deleted_at IS NULL AND at <= ?
-       ) s ON s.buffer_id = b.id AND s.rn = 1
-      WHERE b.company_id = ? AND b.kind = 'input' AND b.active = 1 AND b.deleted_at IS NULL`,
-    [companyId, asOfSql, companyId],
+       LEFT JOIN fab_stock_locations l
+         ON l.company_id = b.company_id AND l.deleted_at IS NULL
+        AND (l.id = b.stock_location_id
+             OR (b.stock_location_id IS NULL
+                 AND l.code = CONCAT('WIP-M', b.resource_id)))
+       LEFT JOIN fab_stock_pieces p
+              ON p.company_id = b.company_id AND p.stock_location_id = l.id
+             AND p.status = 'wip' AND p.deleted_at IS NULL
+       LEFT JOIN fab_item_metric_values v
+              ON v.item_id = p.wip_item_id AND v.company_id = p.company_id
+             AND v.metric_key = COALESCE(b.weight_metric_key, 'unit_weight_kg')
+             AND v.deleted_at IS NULL
+      WHERE b.company_id = ? AND b.kind = 'input' AND b.active = 1
+        AND b.deleted_at IS NULL AND b.capacity_value > 0
+      GROUP BY b.id, b.resource_id, b.capacity_value`,
+    [companyId],
   );
 
   const byResource = new Map();
   for (const r of rows) {
-    if (r.pct != null) byResource.set(r.resourceId, Number(r.pct));
+    const load = Number(r.weightSum ?? 0);
+    byResource.set(r.resourceId, round((load / Number(r.capacity)) * 100, 2));
   }
   return byResource;
 }
@@ -186,7 +208,7 @@ async function buildMachineRows(companyId, range) {
 
   const [stateByResource, bufferByResource] = await Promise.all([
     fetchStateMinutes(companyId, range.fromSql, range.effectiveToSql),
-    fetchInputBufferPct(companyId, range.effectiveToSql),
+    fetchInputBufferPct(companyId),
   ]);
 
   return resources.map((r) => {

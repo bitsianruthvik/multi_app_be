@@ -1,14 +1,13 @@
 /**
  * routes/buffers.js
  * -----------------
- * EU-7: Buffer board (per-machine load) + one-tap material move.
+ * EU-7: Buffer board (per-machine load).
  * EU-9: Buffer configuration endpoints (create/update/soft-delete a machine's
  * input/output buffer).
  *
  * Mounted under /api/:companySlug/fab_erp (via routes/index.js).
  *
- * The board/move routes are gated behind 'fab_erp_taskqueue_manage' (operators
- * moving material); the config routes are gated behind 'fab_erp_buffer_config'
+ * The board route is gated behind 'fab_erp_taskqueue_manage'; the config routes are gated behind 'fab_erp_buffer_config'
  * (planners/admins shaping the buffer model). Both apply the usual admin bypass.
  *
  * Routes:
@@ -19,13 +18,6 @@
  *         output: { load, capacity, pct, status } | null }
  *     status ∈ ok|warn|block by pct vs the buffer's warn_pct / block_pct.
  *     Set-based (no N+1).
- *
- *   POST /buffers/move
- *     Body: { contentId?, taskId?, toBufferId? }
- *       - toBufferId omitted → resolved via resolveNextInputBuffer(task).
- *       - contentId omitted but taskId given → that task's open output-buffer content.
- *     Returns 200 { ok, movedContentId, fromBufferId, toBufferId }
- *          or 400 { message } when no source/destination resolves.
  *
  *   GET  /buffers/config?resourceId=
  *     Both buffer rows (input/output, active or not) for one machine.
@@ -50,10 +42,8 @@ import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
 import {
   deriveLoad,
-  moveContent,
   resolveNextInputBuffer,
   statusFor,
-  BufferMoveError,
 } from '../services/bufferService.js';
 
 const router = Router();
@@ -89,29 +79,76 @@ router.get('/buffers/board', protect, async (req, res) => {
   try {
     // 1. all active buffers for the company
     const [buffers] = await pool.query(
-      `SELECT id, resource_id, kind, capacity_value, capacity_uom, warn_pct, block_pct
+      `SELECT id, resource_id, kind, stock_location_id, weight_metric_key,
+              capacity_value, capacity_uom, warn_pct, block_pct
          FROM fab_buffers
         WHERE company_id = ? AND active = 1 AND deleted_at IS NULL`,
       [companyId],
     );
     if (buffers.length === 0) return res.status(200).json({ ok: true, machines: [] });
 
-    const bufferIds = buffers.map((b) => b.id);
     const resourceIds = [...new Set(buffers.map((b) => b.resource_id))];
 
-    // 2. one grouped aggregate over open contents for ALL buffers (no N+1)
-    const [aggRows] = await pool.query(
-      `SELECT buffer_id,
-              SUM(computed_weight)   AS weightSum,
-              SUM(qty)               AS qtySum,
-              COUNT(*)               AS cnt,
-              COUNT(computed_weight) AS weightCnt
-         FROM fab_buffer_contents
-        WHERE company_id = ? AND buffer_id IN (?) AND moved_out_at IS NULL AND deleted_at IS NULL
-        GROUP BY buffer_id`,
-      [companyId, bufferIds],
+    // 2. one grouped aggregate over the WIP standing at each machine's stock
+    //    area, for ALL buffers at once (no N+1).
+    //
+    //    Grouped by RESOURCE, not by buffer: a machine has one WIP location, so
+    //    its input and output buffers both measure the same pile. That is the
+    //    honest limitation of deriving load from stock rather than from a
+    //    separate placement ledger — the stock model records where a piece is,
+    //    not which side of a machine it is waiting on. Splitting the two needs
+    //    "pieces whose next eligible task is assigned here", which is a
+    //    different query and a later job.
+    //
+    //    Location resolution mirrors bufferService.bufferLocationId EXACTLY —
+    //    the buffer's own stock_location_id when set, else the machine's
+    //    WIP-M<id> area by code. The code fallback matters because
+    //    stock_location_id is a copy taken at config time and is NULL for any
+    //    buffer configured before its machine first ran. Resolving differently
+    //    here would let this board and the gating check disagree about how full
+    //    the same machine is.
+    const [locRows] = await pool.query(
+      `SELECT id, code FROM fab_stock_locations
+        WHERE company_id = ? AND code IN (?) AND deleted_at IS NULL`,
+      [companyId, resourceIds.map((rid) => `WIP-M${rid}`.slice(0, 20))],
     );
-    const aggByBuffer = new Map(aggRows.map((r) => [r.buffer_id, r]));
+    const locIdByCode = new Map(locRows.map((l) => [l.code, l.id]));
+    const locIdOf = (b) =>
+      b.stock_location_id ?? locIdByCode.get(`WIP-M${b.resource_id}`.slice(0, 20)) ?? null;
+
+    //    Weights are summed per metric key, because each buffer may measure its
+    //    capacity with a different one. In practice they all use unit_weight_kg,
+    //    so this is one extra query in the degenerate case and correct in the
+    //    general one.
+    const locIds = [...new Set(buffers.map(locIdOf).filter((v) => v != null))];
+    const metricKeys = [...new Set(buffers.map((b) => b.weight_metric_key || 'unit_weight_kg'))];
+    const aggByLocationAndKey = new Map(); // `${locId}|${key}` -> agg row
+    if (locIds.length) {
+      for (const key of metricKeys) {
+        const [aggRows] = await pool.query(
+          `SELECT p.stock_location_id           AS locId,
+                  SUM(p.qty * v.metric_value)   AS weightSum,
+                  SUM(p.qty)                    AS qtySum,
+                  COUNT(*)                      AS cnt,
+                  COUNT(v.metric_value)         AS weightCnt
+             FROM fab_stock_pieces p
+             LEFT JOIN fab_item_metric_values v
+                    ON v.item_id = p.wip_item_id AND v.company_id = p.company_id
+                   AND v.metric_key = ? AND v.deleted_at IS NULL
+            WHERE p.company_id = ? AND p.stock_location_id IN (?)
+              AND p.status = 'wip' AND p.deleted_at IS NULL
+            GROUP BY p.stock_location_id`,
+          [key, companyId, locIds],
+        );
+        for (const r of aggRows) aggByLocationAndKey.set(`${r.locId}|${key}`, r);
+      }
+    }
+    const aggByBuffer = new Map(
+      buffers.map((b) => [
+        b.id,
+        aggByLocationAndKey.get(`${locIdOf(b)}|${b.weight_metric_key || 'unit_weight_kg'}`) ?? {},
+      ]),
+    );
 
     // 3. resource names in one query
     const [resRows] = await pool.query(
@@ -146,91 +183,11 @@ router.get('/buffers/board', protect, async (req, res) => {
     return res.status(500).json({ message: 'Internal server error building buffer board.' });
   }
 });
+// POST /buffers/move was here. It was the only thing that ever closed a
+// fab_buffer_contents row, and that table is gone: what a machine holds is
+// read from fab_stock_pieces, which wipInventoryService moves on task start.
+// A buffer no longer needs an operator to tell it something left.
 
-// ── POST /buffers/move ──────────────────────────────────────────────────────
-
-router.post('/buffers/move', protect, async (req, res) => {
-  if (!authorize(req, res, 'buffers/move')) return;
-
-  const companyId = req.user.companyId;
-  if (!companyId) {
-    return res.status(400).json({ message: 'Unable to determine companyId from token.' });
-  }
-
-  const body = req.body || {};
-  const contentId = body.contentId != null ? Number(body.contentId) : null;
-  const taskId = body.taskId != null ? Number(body.taskId) : null;
-  let toBufferId = body.toBufferId != null ? Number(body.toBufferId) : null;
-
-  if (contentId == null && taskId == null) {
-    return res.status(400).json({ message: 'Provide contentId or taskId.' });
-  }
-
-  try {
-    // 1. resolve the source open content row
-    let resolvedContentId = contentId;
-    let sourceTask = null;
-
-    if (resolvedContentId == null) {
-      // taskId given → find its open OUTPUT-buffer content
-      const [[content]] = await pool.query(
-        `SELECT c.id FROM fab_buffer_contents c
-           JOIN fab_buffers b ON b.id = c.buffer_id AND b.kind = 'output' AND b.deleted_at IS NULL
-          WHERE c.company_id = ? AND c.task_id = ? AND c.moved_out_at IS NULL AND c.deleted_at IS NULL
-          ORDER BY c.placed_at DESC LIMIT 1`,
-        [companyId, taskId],
-      );
-      if (!content) {
-        return res.status(400).json({ message: `No open output-buffer content found for task ${taskId}.` });
-      }
-      resolvedContentId = content.id;
-    }
-
-    // 2. resolve the destination buffer if not supplied
-    if (toBufferId == null) {
-      // need the task to resolve the next machine's input buffer
-      let taskForResolve = taskId;
-      if (taskForResolve == null) {
-        const [[c]] = await pool.query(
-          `SELECT task_id FROM fab_buffer_contents
-            WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-          [resolvedContentId, companyId],
-        );
-        taskForResolve = c ? c.task_id : null;
-      }
-      if (taskForResolve == null) {
-        return res.status(400).json({
-          message: 'No toBufferId given and the content has no task to resolve a destination from.',
-        });
-      }
-      const destBuffer = await resolveNextInputBuffer(companyId, { id: taskForResolve });
-      if (!destBuffer) {
-        return res.status(400).json({
-          message: 'Could not resolve a next input buffer (no downstream machine with an input buffer).',
-        });
-      }
-      toBufferId = destBuffer.id;
-      sourceTask = taskForResolve;
-    }
-
-    // 3. perform the move
-    const result = await moveContent(companyId, { contentId: resolvedContentId, toBufferId });
-    return res.status(200).json({
-      ok: true,
-      movedContentId: result.movedContentId,
-      newContentId: result.newContentId,
-      fromBufferId: result.fromBufferId,
-      toBufferId: result.toBufferId,
-      ...(sourceTask != null ? { taskId: sourceTask } : {}),
-    });
-  } catch (err) {
-    if (err instanceof BufferMoveError) {
-      return res.status(400).json({ message: err.message });
-    }
-    logger.error({ err, companyId }, 'fab_erp buffers/move: unexpected error');
-    return res.status(500).json({ message: 'Internal server error moving buffer content.' });
-  }
-});
 
 // ── GET /buffers/config?resourceId= ─────────────────────────────────────────
 

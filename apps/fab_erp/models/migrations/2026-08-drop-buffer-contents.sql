@@ -1,0 +1,35 @@
+-- 2026-08-drop-buffer-contents.sql  (plan Phase 4a)
+--
+-- Drop fab_buffer_contents. A buffer's load is now read from the WIP pieces
+-- standing at the machine's stock area.
+--
+-- WHY, since the table was not merely unused: it recorded the same physical
+-- fact twice. wipInventoryService already moves a WIP piece from machine to
+-- machine on task start, inside the task's own transaction, writing a
+-- fab_stock_ledger row for every move. fab_buffer_contents was an append-only
+-- placement log beside it — placeOutput() added a row on every task stop, and
+-- the ONLY thing that ever set moved_out_at was an operator tapping "Move".
+--
+-- So the two drifted by construction, and only ever in one direction: a buffer
+-- filled on every stop and emptied only when someone remembered. Worse,
+-- placeOutput fired at every step, not just the terminal one, so a single
+-- physical piece was counted once per operation, cumulatively. A machine's
+-- buffer would eventually read full of steel that had long since moved on, and
+-- gating would refuse to start work against it.
+--
+-- fab_buffers survives as configuration (capacity, uom, warn/block thresholds).
+--
+-- fab_buffer_level_snapshots goes too. It was a point-in-time load/capacity/pct
+-- history, and placeOutput was its only writer — so with that gone it could
+-- never gain another row. It held zero rows in local AND in production, which
+-- means its one reader (the input-buffer column on machine analytics) had been
+-- rendering blank since it shipped. That column now derives the same figure
+-- live from fab_stock_pieces, so the history is not merely unwritten, it is
+-- unnecessary: a buffer's load is a count of what is standing at a location,
+-- correct whenever it is asked for, not a fact that must be logged on change.
+--
+-- Idempotent: DROP TABLE IF EXISTS, safe to re-run.
+-- No FK constraints reference either table (indexes only).
+
+DROP TABLE IF EXISTS fab_buffer_contents;
+DROP TABLE IF EXISTS fab_buffer_level_snapshots;

@@ -1234,19 +1234,9 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       );
     }
 
-    // EU-7: place the produced item into the machine's output buffer, if one is
-    // configured (opt-in). Only for a QC pass: a failed task produced nothing.
-    //
-    // AWAITED, not fire-and-forget. onTaskComplete on the next line advances the
-    // DAG, and the gating it runs reads buffer load (isOutputBlocked). Letting
-    // the placement race that gate means a successor can be cleared to start
-    // against a buffer that still looks emptier than it is. Trailing .catch()
-    // keeps it best-effort — a buffer failure must never fail the stop response.
-    if (qcResult === 'pass') {
-      await bufferService.placeOutput(companyId, { id: taskId }).catch((err) =>
-        logger.error({ err, taskId }, 'buffer placeOutput failed'),
-      );
-    }
+    // A placeOutput() call sat here, appending to fab_buffer_contents on every
+    // stop. That table is gone: finalizeWipOnComplete above already moved the
+    // piece, and the buffer reads its load from where the piece now is.
 
     const engineResult = await onTaskComplete(companyId, taskId);
 

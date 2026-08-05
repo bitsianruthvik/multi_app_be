@@ -3,34 +3,31 @@
  * -------------------------
  * EU-7: Buffer movement flow + load computation for fab_erp.
  *
- * Builds on the EU-6 buffer schema:
- *   fab_buffers            — one input and/or output buffer per machine (resource).
- *   fab_buffer_contents    — one row per item placed in a buffer; "open" while
- *                            moved_out_at IS NULL.
- *   fab_buffer_level_snapshots — point-in-time load/capacity/pct history rows.
+ * SCHEMA
+ *   fab_buffers — one input and/or output buffer per machine. Configuration
+ *                 only: capacity, uom, thresholds. It is the ONLY table this
+ *                 service owns; load is read from stock, never stored.
  *
- * Load model
- * ──────────
- * A buffer's capacity is expressed either as a weight (capacity_uom = 'kg', the
- * default) or as a piece count (any non-weight uom, e.g. 'pcs'). We compute load
- * to match:
- *   - Weight uom + at least one open row carries a computed_weight → Σ computed_weight.
- *   - Weight uom but NO open row has a weight metric (all NULL) → fall back to
- *     counting pieces (Σ qty, or the open row COUNT when qty is also NULL). This is
- *     the "items have no weight metric available" fallback — it never blocks on a
- *     null weight and never returns NaN.
- *   - Non-weight uom → always a piece count (Σ qty, or open row COUNT).
+ * WHERE THE LOAD COMES FROM
+ * ─────────────────────────
+ * fab_stock_pieces at the machine's WIP stock location — the same rows
+ * wipInventoryService moves on task start. There is no separate buffer-contents
+ * ledger; there was one until 2026-08-05 and it recorded the same physical fact
+ * a second time, with no automatic drain, so the two diverged permanently.
  *
- * All state-changing helpers accept an optional mysql connection so they can run
- * inside a caller's transaction (e.g. moveContent) or standalone on the pool (e.g.
- * placeOutput fired from the task-stop route).
+ * Capacity is a weight (capacity_uom 'kg', the default) or a piece count:
+ *   - Weight uom, at least one piece carries the weight metric → Σ qty × metric.
+ *   - Weight uom, no piece has it → count pieces instead, flagged via `fallback`.
+ *   - Non-weight uom → always a piece count.
+ * A partially-weighed buffer sums only the weighed pieces, so it reads LIGHTER
+ * than it is. That is a real hazard while metric coverage is incomplete.
  */
 
 import { pool } from '../../../db.js';
 import { parseDependsOn } from './taskGatingService.js';
 
-// Units we treat as weights (→ use computed_weight for load). Everything else is
-// interpreted as a piece count against capacity.
+// Units we treat as weights (→ weigh the pieces). Everything else is interpreted
+// as a piece count against capacity.
 const WEIGHT_UOMS = new Set([
   'kg', 'kgs', 'kilogram', 'kilograms',
   'g', 'gram', 'grams',
@@ -45,15 +42,6 @@ function isWeightUom(uom) {
 
 function round2(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-}
-
-/** Error the /buffers/move route maps to a 400 (bad request) rather than a 500. */
-export class BufferMoveError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'BufferMoveError';
-    this.userError = true;
-  }
 }
 
 /**
@@ -87,16 +75,80 @@ export function deriveLoad(buffer, agg) {
   }
 
   const capacity = buffer.capacity_value == null ? null : Number(buffer.capacity_value);
-  const pct = capacity && capacity > 0 ? round2((load / capacity) * 100) : 0; // guard /0
+  // NULL, not 0, when there is no capacity to measure against. "Unconfigured"
+  // and "empty" are different facts, and reporting the first as 0% made a buffer
+  // nobody had set up look like a buffer with room to spare — which would have
+  // let dispatch rank on a number that means nothing.
+  const pct = capacity && capacity > 0 ? round2((load / capacity) * 100) : null;
   return { load: round2(load), capacity, pct, fallback };
 }
 
-/** ok / warn / block for a load pct against a buffer's warn/block thresholds. */
+/**
+ * ok / warn / block for a load pct against a buffer's warn/block thresholds.
+ * A null pct (no capacity configured) is 'ok': an unmeasured buffer must never
+ * block work, and the caller can tell the two apart by checking pct itself.
+ */
 export function statusFor(pct, warnPct, blockPct) {
+  if (pct == null) return 'ok';
   const p = Number(pct) || 0;
   if (blockPct != null && p >= Number(blockPct)) return 'block';
   if (warnPct != null && p >= Number(warnPct)) return 'warn';
   return 'ok';
+}
+
+/**
+ * The stock location a buffer measures.
+ *
+ * fab_buffers.stock_location_id is a COPY, taken from fab_resources at config
+ * time — and a machine's WIP area is auto-provisioned on its first task start,
+ * so a buffer configured before the machine ever ran holds NULL forever. That is
+ * not hypothetical: every buffer in the fixture was configured that way and all
+ * six stored NULL while the machine went on to get a real location.
+ *
+ * So resolve live, by the code wipInventoryService assigns, and treat the stored
+ * column as a hint rather than the answer.
+ */
+async function bufferLocationId(exec, companyId, buffer) {
+  if (buffer.stock_location_id) return buffer.stock_location_id;
+  if (!buffer.resource_id) return null;
+  const [[loc]] = await exec.query(
+    `SELECT id FROM fab_stock_locations
+      WHERE company_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1`,
+    [companyId, `WIP-M${buffer.resource_id}`.slice(0, 20)],
+  );
+  return loc?.id ?? null;
+}
+
+/**
+ * Aggregate the WIP standing at a stock location, in the shape deriveLoad wants.
+ *
+ * This replaced a sum over fab_buffer_contents on 2026-08-05. That table was a
+ * second, parallel record of the same physical fact: wipInventoryService already
+ * moves a WIP piece from machine to machine on task start, inside the task's own
+ * transaction and with a fab_stock_ledger row for every move, while
+ * fab_buffer_contents was an append-only placement log with no drain except a
+ * manual operator tap. Keeping both meant two truths that diverged the moment
+ * someone forgot to tap Move — and the divergence only ever grew, because
+ * placeOutput fired on every task stop and nothing ever closed a row.
+ */
+async function loadAtLocation(exec, companyId, locationId, weightMetricKey) {
+  if (!locationId) return { weightSum: 0, qtySum: 0, cnt: 0, weightCnt: 0 };
+  const [[agg]] = await exec.query(
+    `SELECT SUM(p.qty * v.metric_value) AS weightSum,
+            SUM(p.qty)                  AS qtySum,
+            COUNT(*)                    AS cnt,
+            COUNT(v.metric_value)       AS weightCnt
+       FROM fab_stock_pieces p
+       LEFT JOIN fab_item_metric_values v
+              ON v.item_id = p.wip_item_id
+             AND v.company_id = p.company_id
+             AND v.metric_key = ?
+             AND v.deleted_at IS NULL
+      WHERE p.company_id = ? AND p.stock_location_id = ?
+        AND p.status = 'wip' AND p.deleted_at IS NULL`,
+    [weightMetricKey || 'unit_weight_kg', companyId, locationId],
+  );
+  return agg;
 }
 
 /**
@@ -108,21 +160,15 @@ export function statusFor(pct, warnPct, blockPct) {
 export async function loadOf(companyId, bufferId, conn) {
   const exec = conn ?? pool;
   const [[buffer]] = await exec.query(
-    `SELECT id, capacity_value, capacity_uom, weight_metric_key, warn_pct, block_pct
+    `SELECT id, resource_id, stock_location_id, capacity_value, capacity_uom,
+            weight_metric_key, warn_pct, block_pct
        FROM fab_buffers WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [bufferId, companyId],
   );
   if (!buffer) throw new Error(`Buffer ${bufferId} not found for company ${companyId}`);
 
-  const [[agg]] = await exec.query(
-    `SELECT SUM(computed_weight) AS weightSum,
-            SUM(qty)             AS qtySum,
-            COUNT(*)             AS cnt,
-            COUNT(computed_weight) AS weightCnt
-       FROM fab_buffer_contents
-      WHERE company_id = ? AND buffer_id = ? AND moved_out_at IS NULL AND deleted_at IS NULL`,
-    [companyId, bufferId],
-  );
+  const locId = await bufferLocationId(exec, companyId, buffer);
+  const agg = await loadAtLocation(exec, companyId, locId, buffer.weight_metric_key);
 
   const d = deriveLoad(buffer, agg);
   return {
@@ -136,165 +182,31 @@ export async function loadOf(companyId, bufferId, conn) {
   };
 }
 
-/**
- * qty × the item's weight_metric_key metric value (fab_item_metric_values).
- * Returns null when the item has no such metric (piece-fallback: the caller stores
- * NULL computed_weight, which loadOf then treats as a piece count).
- */
-export async function computeContentWeight(companyId, buffer, itemId, qty, conn) {
-  const exec = conn ?? pool;
-  const key = buffer.weight_metric_key || 'unit_weight_kg';
-  const [[row]] = await exec.query(
-    `SELECT metric_value FROM fab_item_metric_values
-      WHERE company_id = ? AND item_id = ? AND metric_key = ?
-        AND metric_value IS NOT NULL AND deleted_at IS NULL
-      ORDER BY id DESC LIMIT 1`,
-    [companyId, itemId, key],
-  );
-  if (!row || row.metric_value == null) return null; // no weight metric → piece-fallback
-  const q = Number(qty ?? 0);
-  return round2(q * Number(row.metric_value));
-}
 
-/** Write a fab_buffer_level_snapshots row from loadOf (AFTER any pending insert). */
-export async function snapshot(companyId, bufferId, conn) {
-  const exec = conn ?? pool;
-  const { load, capacity, pct } = await loadOf(companyId, bufferId, conn);
-  await exec.query(
-    `INSERT INTO fab_buffer_level_snapshots (company_id, buffer_id, at, load_value, capacity_value, pct)
-     VALUES (?, ?, NOW(), ?, ?, ?)`,
-    [companyId, bufferId, load, capacity, pct],
-  );
-  return { load, capacity, pct };
-}
-
-/**
- * If the just-completed task's machine has an active output buffer, place the
- * produced item into it and snapshot the buffer. No-op (returns {placed:false})
- * when the machine has no output buffer — buffers are opt-in.
+/*
+ * snapshot() wrote a fab_buffer_level_snapshots row. Removed 2026-08-05 along
+ * with the table: its only writer was placeOutput (gone with
+ * fab_buffer_contents) and its only reader was analytics' input-buffer column,
+ * which now derives the same figure live from fab_stock_pieces. The table held
+ * zero rows in every environment, so that column had never displayed anything.
  *
- * `task` needs at least `id`; assigned_resource_id / item_id are re-read from the
- * row when not supplied (the stop route passes a minimal {id, status}). Produced
- * qty is the item's own qty (fab_items.qty) — there is no per-task produced qty
- * column. Safe to call inside a caller transaction via `conn`.
+ * A load is no longer a fact that has to be recorded when it changes — it is
+ * a count of what is standing at a location, correct whenever it is asked for.
  */
-export async function placeOutput(companyId, task, conn) {
-  const exec = conn ?? pool;
 
-  let assignedResourceId = task.assigned_resource_id;
-  let itemId = task.item_id;
-  if (assignedResourceId === undefined || itemId === undefined) {
-    const [[t]] = await exec.query(
-      `SELECT assigned_resource_id, item_id FROM fab_project_tasks
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-      [task.id, companyId],
-    );
-    if (!t) return { placed: false, reason: 'task_not_found' };
-    assignedResourceId = t.assigned_resource_id;
-    itemId = t.item_id;
-  }
-  if (!assignedResourceId) return { placed: false, reason: 'no_assigned_resource' };
-
-  const [[buffer]] = await exec.query(
-    `SELECT id, capacity_uom, weight_metric_key FROM fab_buffers
-      WHERE company_id = ? AND resource_id = ? AND kind = 'output'
-        AND active = 1 AND deleted_at IS NULL LIMIT 1`,
-    [companyId, assignedResourceId],
-  );
-  if (!buffer) return { placed: false, reason: 'no_output_buffer' };
-
-  const [[item]] = await exec.query(
-    `SELECT qty FROM fab_items WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-    [itemId, companyId],
-  );
-  const qty = item ? Number(item.qty) : null;
-  const computedWeight = await computeContentWeight(companyId, buffer, itemId, qty, conn);
-
-  const [ins] = await exec.query(
-    `INSERT INTO fab_buffer_contents
-       (company_id, buffer_id, task_id, item_id, qty, unit, computed_weight, placed_at, moved_out_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NULL)`,
-    [companyId, buffer.id, task.id, itemId, qty, null, computedWeight],
-  );
-  const contentId = ins.insertId;
-
-  const snap = await snapshot(companyId, buffer.id, conn);
-  return {
-    placed: true,
-    bufferId: buffer.id,
-    contentId,
-    load: snap.load,
-    capacity: snap.capacity,
-    pct: snap.pct,
-  };
-}
-
-/**
- * Move an open content row from its current buffer to `toBufferId`: close the
- * source row (moved_out_at = NOW), open a fresh row in the destination with the
- * weight recomputed for the destination buffer's weight_metric_key, and snapshot
- * BOTH buffers. Single transaction.
+/*
+ * placeOutput() and moveContent() lived here until 2026-08-05, together with
+ * computeContentWeight(). They maintained fab_buffer_contents: placeOutput
+ * appended a row on every task stop, moveContent was the only thing that ever
+ * set moved_out_at, and it was reachable only from a manual "Move" tap.
  *
- * @returns {Promise<{ok:true, movedContentId:number, newContentId:number,
- *                     fromBufferId:number, toBufferId:number}>}
- * @throws {BufferMoveError} when the source content or destination buffer is invalid.
+ * The table has gone. What a machine is holding is now read from
+ * fab_stock_pieces at that machine's WIP location, which wipInventoryService
+ * already maintains transactionally on every task start with a ledger row per
+ * move. One record of where the steel is, not two that drift apart.
  */
-export async function moveContent(companyId, { contentId, toBufferId }) {
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
 
-    const [[src]] = await conn.query(
-      `SELECT id, buffer_id, task_id, item_id, qty, unit FROM fab_buffer_contents
-        WHERE id = ? AND company_id = ? AND moved_out_at IS NULL AND deleted_at IS NULL LIMIT 1`,
-      [contentId, companyId],
-    );
-    if (!src) throw new BufferMoveError(`Content ${contentId} not found or already moved out.`);
 
-    const [[dest]] = await conn.query(
-      `SELECT id, capacity_uom, weight_metric_key FROM fab_buffers
-        WHERE id = ? AND company_id = ? AND active = 1 AND deleted_at IS NULL LIMIT 1`,
-      [toBufferId, companyId],
-    );
-    if (!dest) throw new BufferMoveError(`Destination buffer ${toBufferId} not found or inactive.`);
-
-    if (src.buffer_id === dest.id) {
-      throw new BufferMoveError('Source and destination buffers are the same.');
-    }
-
-    const computedWeight = await computeContentWeight(companyId, dest, src.item_id, src.qty, conn);
-
-    await conn.query(
-      `UPDATE fab_buffer_contents SET moved_out_at = NOW() WHERE id = ? AND company_id = ?`,
-      [contentId, companyId],
-    );
-
-    const [ins] = await conn.query(
-      `INSERT INTO fab_buffer_contents
-         (company_id, buffer_id, task_id, item_id, qty, unit, computed_weight, placed_at, moved_out_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NULL)`,
-      [companyId, toBufferId, src.task_id, src.item_id, src.qty, src.unit, computedWeight],
-    );
-    const newContentId = ins.insertId;
-
-    await snapshot(companyId, src.buffer_id, conn);
-    await snapshot(companyId, toBufferId, conn);
-
-    await conn.commit();
-    return {
-      ok: true,
-      movedContentId: contentId,
-      newContentId,
-      fromBufferId: src.buffer_id,
-      toBufferId,
-    };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
 
 /**
  * Resolve the input buffer of the FIRST downstream machine for a task, for the
