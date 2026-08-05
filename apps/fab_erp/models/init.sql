@@ -2395,3 +2395,101 @@ CREATE TABLE IF NOT EXISTS fab_cc_drum_slots (
   FOREIGN KEY (company_id) REFERENCES companies(id),
   KEY idx_fccds_company_drum_seq (company_id, drum_id, seq)
 );
+
+-- ===========================================================================
+-- PIECE MARKS AND PEOPLE
+-- ===========================================================================
+-- These three tables and the fab_items mark columns shipped as hand-applied
+-- migrations (2026-08-piece-marks.sql, the people model) and were never folded
+-- back in. Production has them; init.sql did not — so anything built from this
+-- file alone came up with no marks and no workers, silently. Reconciled from
+-- the live schema 2026-08-05.
+
+-- A mark is the identifier stamped on the steel: top-level items get PREFIX+seq
+-- (B1, B2) and their children hang off the parent (B1-a, B1-a-i), so the
+-- hierarchy is readable on the shop floor.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_items' AND COLUMN_NAME = 'mark');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN mark VARCHAR(40) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN mark_prefix VARCHAR(10) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN mark_seq INT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Two marks alike on one order would be two pieces of steel that cannot be
+-- told apart. NULLs are permitted and repeatable, so unmarked items coexist.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_items'
+               AND INDEX_NAME = 'uq_fab_items_order_mark');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD UNIQUE KEY uq_fab_items_order_mark (order_id, mark)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_items'
+               AND INDEX_NAME = 'idx_fab_items_company_mark');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD KEY idx_fab_items_company_mark (company_id, mark)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Which prefix a category's items get. The row with item_category_id = NULL is
+-- the fallback for every item whose category has no row of its own; without any
+-- row at all markService falls back to the hardcoded 'P'.
+-- Uniqueness is on the generated item_category_id_active, not on
+-- item_category_id: rows are soft-deleted, and a tombstone must not stop the
+-- same category being given a prefix again. It cannot enforce "one fallback
+-- row" — that row is the one with a NULL category, and repeated NULLs are
+-- legal — so the editor enforces that rule instead.
+CREATE TABLE IF NOT EXISTS fab_mark_schemes (
+  id                      INT AUTO_INCREMENT PRIMARY KEY,
+  company_id              INT          NOT NULL,
+  item_category_id        INT          NULL,
+  prefix                  VARCHAR(10)  NOT NULL,
+  sort_order              INT          NOT NULL DEFAULT 0,
+  deleted_at              DATETIME     NULL,
+  created_at              TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at              TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  item_category_id_active INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, item_category_id, NULL)) VIRTUAL,
+  KEY idx_fab_mark_schemes_company (company_id),
+  UNIQUE KEY uq_fms_company_cat_active (company_id, item_category_id_active)
+);
+
+-- Who does the work. A worker may be an employee, a contractor, or a vendor's
+-- crew; user_id links the ones who also log in.
+CREATE TABLE IF NOT EXISTS fab_workers (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  name         VARCHAR(255) NOT NULL,
+  code         VARCHAR(64)  NULL,
+  worker_type  ENUM('employee','contractor','vendor') NOT NULL DEFAULT 'employee',
+  user_id      INT          NULL,
+  vendor_name  VARCHAR(255) NULL,
+  phone        VARCHAR(50)  NULL,
+  active       TINYINT(1)   NOT NULL DEFAULT 1,
+  deleted_at   DATETIME     NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fab_workers_company (company_id, active),
+  KEY idx_fab_workers_user (user_id)
+);
+
+-- Intervals, not a single current machine: 'assigned' puts a worker on a
+-- resource from from_ts until to_ts (NULL = still there), 'away' records leave.
+-- Open-ended rows are why to_ts is nullable.
+CREATE TABLE IF NOT EXISTS fab_worker_assignments (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  worker_id    INT          NOT NULL,
+  resource_id  INT          NULL,
+  kind         ENUM('assigned','away') NOT NULL DEFAULT 'assigned',
+  from_ts      DATETIME     NOT NULL,
+  to_ts        DATETIME     NULL,
+  reason       VARCHAR(64)  NULL,
+  note         VARCHAR(400) NULL,
+  entered_by   INT          NULL,
+  deleted_at   DATETIME     NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fwa_company (company_id),
+  KEY idx_fwa_worker (worker_id, from_ts),
+  KEY idx_fwa_resource (resource_id, kind, from_ts)
+);

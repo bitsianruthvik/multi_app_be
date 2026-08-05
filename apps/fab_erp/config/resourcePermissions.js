@@ -74,6 +74,7 @@ const resourcePermissions = {
   // Inventory / GRN (item categorization, stock, batches, GRN)
   fabErpCustomField:   'fab_erp_taxonomy_manage',
   fabErpItemCategory:  'fab_erp_taxonomy_manage',
+  fabErpMarkScheme:    'fab_erp_taxonomy_manage',
   fabErpItemGroup:     'fab_erp_taxonomy_manage',
   fabErpItemSubgroup:  'fab_erp_taxonomy_manage',
   fabErpStockLocation: 'fab_erp_stock_location_manage',

@@ -33,6 +33,7 @@
 
 import { pool } from '../../../db.js';
 import { reevaluateStockGatedTasks } from './taskGatingService.js';
+import { generateCode } from './codegenService.js';
 import { logger } from '../../../core/utils/logger.js';
 
 /**
@@ -41,7 +42,11 @@ import { logger } from '../../../core/utils/logger.js';
  * piece it was; 'N/A' only when the piece carries no identity at all.
  */
 function displayBatchCode(piece) {
-  return piece.batch_no || piece.serial_no || piece.heat_no || piece.mark_no || 'N/A';
+  // The piece's own code leads now that every piece gets one: it names exactly
+  // this piece, where a batch or heat number names the lot it came from. The
+  // supplier-supplied fields stay ahead of nothing and behind the code, and
+  // 'N/A' survives only for rows written before codes existed.
+  return piece.code || piece.batch_no || piece.serial_no || piece.heat_no || piece.mark_no || 'N/A';
 }
 
 /**
@@ -98,14 +103,20 @@ export async function receiveStock(companyId, input) {
       const serialNo = piece.serial_no ?? null;
       const markNo = piece.mark_no ?? null;
 
+      // Issued on THIS connection so the number and the row it names are one
+      // atomic act: a rolled-back receipt must not leave a hole in the
+      // sequence, and the piece must never exist uncoded.
+      const code = await generateCode(companyId, 'stock_piece', {}, conn);
+
       const [pieceResult] = await conn.query(
         `INSERT INTO fab_stock_pieces
-           (company_id, catalog_item_id, plant_id, stock_location_id,
+           (company_id, code, catalog_item_id, plant_id, stock_location_id,
             batch_no, heat_no, serial_no, mark_no, qty, uom, unit_cost,
             status, received_date, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
         [
-          companyId, catalogItemId, plantId, stockLocationId,
+          companyId, code,
+          catalogItemId, plantId, stockLocationId,
           batchNo, heatNo, serialNo, markNo, qty, resolvedUom, unitCost,
           // received_date drives FIFO in wipInventoryService.consumeStock, where
           // NULL sorts last — a piece received with no date would be consumed
@@ -126,7 +137,7 @@ export async function receiveStock(companyId, input) {
          VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'stock_in', ?, ?, ?)`,
         [
           companyId, catalogItemId, plantId, stockLocationId,
-          displayBatchCode(piece), pieceId,
+          displayBatchCode({ ...piece, code }), pieceId,
           batchNo, serialNo, heatNo, markNo,
           qty, unitCost, receivedDate,
         ],

@@ -66,6 +66,54 @@ async function loadScheme(companyId) {
 }
 
 /**
+ * Parents before children, at every depth.
+ *
+ * SQL can only order this set by id, and id order is not BOM order. The old
+ * `ORDER BY parent_item_id IS NOT NULL, id` was two buckets — roots, then every
+ * non-root interleaved by id — so it guaranteed "roots first" and nothing more.
+ * At depth 3+ a grandchild could be reached before its parent had a mark, and
+ * the marking loop reads that as "no parent mark" and sends it down the
+ * top-level branch: it gets `B2` instead of `B1-a-i`, burns a sequence number,
+ * and rule 2 then freezes the mistake forever.
+ *
+ * Two things break the "a parent always has a lower id" assumption it rested
+ * on: `parent_item_id` is a declared write field, so an item can be re-parented
+ * under an assembly created later; and production is TiDB, whose auto-increment
+ * ids are unique but NOT monotonic across nodes.
+ *
+ * Depth-first from the roots, preserving sibling order by id so existing depth-2
+ * suffixes (a, b, c) come out exactly as they do today. A row whose parent isn't
+ * in this set (soft-deleted, or on another order) is a root for this pass — the
+ * same assumption the old query made. A cycle from a bad re-parent must not hang
+ * or silently drop rows, so anything left unvisited is appended and treated as
+ * an orphan.
+ */
+function orderParentsFirst(items) {
+  const present = new Set(items.map((it) => it.id));
+  const childrenByParent = new Map();
+  for (const it of items) {
+    const key = it.parent_item_id && present.has(it.parent_item_id) ? it.parent_item_id : null;
+    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+    childrenByParent.get(key).push(it);
+  }
+
+  const out = [];
+  const seen = new Set();
+  const stack = [...(childrenByParent.get(null) ?? [])].reverse();
+  while (stack.length > 0) {
+    const it = stack.pop();
+    if (seen.has(it.id)) continue;
+    seen.add(it.id);
+    out.push(it);
+    const kids = childrenByParent.get(it.id) ?? [];
+    for (let i = kids.length - 1; i >= 0; i -= 1) stack.push(kids[i]);
+  }
+
+  for (const it of items) if (!seen.has(it.id)) out.push(it);
+  return out;
+}
+
+/**
  * Assign marks to every unmarked item in an order.
  *
  * Returns { assigned, skipped, total }. `skipped` counts rows that already had
@@ -81,21 +129,28 @@ export async function generateMarksForOrder(companyId, orderId) {
 
     // Lock the order's items so two concurrent generate calls can't both claim
     // the same next sequence number and collide on the unique index.
-    const [items] = await conn.query(
+    //
+    // Ordered by id only, then re-ordered in JS. A recursive CTE would express
+    // the hierarchy in SQL, but neither MySQL nor TiDB allows FOR UPDATE on one,
+    // and this lock is the only thing stopping two concurrent generate calls
+    // from claiming the same sequence number.
+    const [rawItems] = await conn.query(
       `SELECT i.id, i.parent_item_id, i.mark, i.mark_prefix, i.mark_seq,
               ic.category_id AS categoryId
          FROM fab_items i
          LEFT JOIN fab_item_catalog ic ON ic.id = i.catalog_item_id AND ic.deleted_at IS NULL
         WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
-        ORDER BY i.parent_item_id IS NOT NULL, i.id
+        ORDER BY i.id
         FOR UPDATE`,
       [companyId, orderId],
     );
 
-    if (items.length === 0) {
+    if (rawItems.length === 0) {
       await conn.commit();
       return { assigned: 0, skipped: 0, total: 0 };
     }
+
+    const items = orderParentsFirst(rawItems);
 
     const { byCategoryId, fallback } = await loadScheme(companyId);
 
@@ -111,8 +166,8 @@ export async function generateMarksForOrder(companyId, orderId) {
     }
 
     // Children need their parent's mark, and a parent may be marked in this
-    // same pass — so resolve top-level first (the ORDER BY above guarantees it)
-    // and keep a live map as we go.
+    // same pass — so resolve parents first (orderParentsFirst above guarantees
+    // it at every depth) and keep a live map as we go.
     const markById = new Map();
     const childCountByParent = new Map();
     for (const it of items) {
@@ -230,16 +285,27 @@ export async function setItemMark(companyId, itemId, mark, { cascadeChildren = f
   let childrenOnOldStem = 0;
 
   if (oldMark && oldMark !== trimmed) {
+    // The WHOLE subtree, not just direct children. Marks ARE the hierarchy, so
+    // everything on the 'B1-' stem is by definition below B1 — matching on
+    // parent_item_id instead only reached one level, so renaming B1 to B7 moved
+    // B1-a to B7-a and left B1-a-i pointing at a stem that no longer existed
+    // anywhere on the order. That is worse than not cascading at all, and
+    // childrenOnOldStem was zeroed below, so the caller was told it was clean.
+    //
+    // Matched with LEFT(...) rather than LIKE because a mark prefix is
+    // user-configurable and '_' is a LIKE wildcard.
+    const stem = `${oldMark}-`;
     const [kids] = await pool.query(
       `SELECT id, mark FROM fab_items
-        WHERE parent_item_id = ? AND deleted_at IS NULL AND mark LIKE ?`,
-      [itemId, `${oldMark}-%`],
+        WHERE order_id = ? AND deleted_at IS NULL AND id <> ?
+          AND LEFT(mark, ?) = ?`,
+      [rows[0].order_id, itemId, stem.length, stem],
     );
     childrenOnOldStem = kids.length;
 
     if (cascadeChildren) {
       for (const kid of kids) {
-        // Swap only the stem, keep the suffix: 'P1-a' → 'B12-a'.
+        // Swap only the stem, keep the rest of the path: 'P1-a-i' → 'B12-a-i'.
         const next = `${trimmed}${kid.mark.slice(oldMark.length)}`;
         await pool.query(
           `UPDATE fab_items SET mark = ?, mark_prefix = NULL, mark_seq = NULL WHERE id = ?`,

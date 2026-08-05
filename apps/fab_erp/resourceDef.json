@@ -1,4 +1,32 @@
 {
+  "fabErpMarkScheme": {
+    "table": "fab_mark_schemes",
+    "alias": "fms",
+    "writeFields": [
+      "item_category_id",
+      "prefix",
+      "sort_order"
+    ],
+    "fields": {
+      "id": "fms.id",
+      "companyId": "fms.company_id",
+      "itemCategoryId": "fms.item_category_id",
+      "prefix": "fms.prefix",
+      "sortOrder": "fms.sort_order",
+      "createdAt": "fms.created_at",
+      "updatedAt": "fms.updated_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "itemCategoryId": "integer",
+      "prefix": "string",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
+  },
   "fabErpPlant": {
     "table": "fab_plants",
     "alias": "fpl",
@@ -1536,6 +1564,7 @@
     "fields": {
       "id": "fsp.id",
       "companyId": "fsp.company_id",
+      "code": "fsp.code",
       "catalogItemId": "fsp.catalog_item_id",
       "plantId": "fsp.plant_id",
       "stockLocationId": "fsp.stock_location_id",
@@ -1555,6 +1584,7 @@
     "fieldTypes": {
       "id": "integer",
       "companyId": "integer",
+      "code": "string",
       "catalogItemId": "integer",
       "plantId": "integer",
       "stockLocationId": "integer",

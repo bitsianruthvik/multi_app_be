@@ -24,6 +24,8 @@
  * take an explicit connection so they run inside the task-lifecycle transaction.
  */
 
+import { generateCode } from './codegenService.js';
+
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
 
@@ -213,9 +215,12 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
         const qty = Number(node.qty) || 1;
         await conn.query(
           `INSERT INTO fab_stock_pieces
-             (company_id, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
-           VALUES (?, ?, ?, ?, ?, ?, 'wip', ?, ?)`,
-          [companyId, node.catalog_item_id, machine.plant_id, wipLoc, qty, node.unit || null, node.id,
+             (company_id, code, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'wip', ?, ?)`,
+          // On the caller's connection: the code is part of the task-start
+          // transaction, so a start that fails leaves neither a piece nor a gap.
+          [companyId, await generateCode(companyId, 'stock_piece', {}, conn),
+           node.catalog_item_id, machine.plant_id, wipLoc, qty, node.unit || null, node.id,
            `WIP order ${node.order_id} item ${node.id}`],
         );
         await writeLedger(conn, companyId, {
@@ -333,9 +338,10 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
   if (goodQty > EPS) {
     await conn.query(
       `INSERT INTO fab_stock_pieces
-         (company_id, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
-       VALUES (?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
-      [companyId, node.catalog_item_id, plantId, loc, goodQty, node.unit || null, node.id,
+         (company_id, code, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
+      [companyId, await generateCode(companyId, 'stock_piece', {}, conn),
+       node.catalog_item_id, plantId, loc, goodQty, node.unit || null, node.id,
        `produced order ${node.order_id} item ${node.id}`],
     );
     await writeLedger(conn, companyId, {

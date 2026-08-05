@@ -58,6 +58,13 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: 'LOC-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
   ],
+  // Every physical piece of steel — received, opened as WIP, or produced. Six
+  // digits because this is the highest-volume thing in the system by far: one
+  // row per piece per receipt, and one more each time a piece is made.
+  stock_piece: [
+    { type: 'fixed', value: 'SP-' },
+    { type: 'sequence', digits: 6, resetPeriod: 'never' },
+  ],
   bom: [
     { type: 'fixed', value: 'BOM-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
@@ -259,32 +266,44 @@ export async function previewCode(companyId, entityType, segments, context = {})
 /**
  * Generates and consumes the next code for a company × entity type.
  * Resets the running sequence when the resetPeriod's period key has rolled over.
+ *
+ * Pass `existingConn` to issue the code inside a caller's open transaction. Do
+ * that whenever the code is about to be written to a row: a number consumed on
+ * its own connection commits immediately, so if the insert that was going to
+ * use it then fails, the number is burnt and the sequence has a permanent hole.
+ * Sharing the caller's transaction makes issue-and-insert atomic — and avoids
+ * taking a second pool connection while the caller holds one, which under load
+ * is a self-inflicted deadlock (the pool has no queue limit).
  */
-export async function generateCode(companyId, entityType, context = {}) {
+export async function generateCode(companyId, entityType, context = {}, existingConn = null) {
   await ensureTable();
-  const conn = await pool.getConnection();
+  const conn = existingConn ?? (await pool.getConnection());
+  const ownTransaction = !existingConn;
   try {
-    await conn.beginTransaction();
+    if (ownTransaction) await conn.beginTransaction();
 
-    let [[row]] = await conn.query(
+    // Make the row exist BEFORE locking it. A SELECT ... FOR UPDATE that matches
+    // nothing takes a gap lock, and gap locks are mutually compatible — so two
+    // first-callers for the same (company, entityType) both sail past, both
+    // INSERT, and their insert-intention locks collide: one gets ER_DUP_ENTRY,
+    // or more often ER_LOCK_DEADLOCK, and the caller sees a 500 the first time
+    // anyone ever generates a code of that type. Upserting first means the
+    // lock below always has a real row to take.
+    await conn.query(
+      `INSERT INTO fab_codegen_rules (company_id, entity_type, segments_json, next_seq)
+       VALUES (?, ?, ?, 1)
+       ON DUPLICATE KEY UPDATE id = id`,
+      [companyId, entityType, JSON.stringify(defaultSegmentsFor(entityType))],
+    );
+
+    const [[row]] = await conn.query(
       `SELECT * FROM fab_codegen_rules WHERE company_id = ? AND entity_type = ? LIMIT 1 FOR UPDATE`,
       [companyId, entityType],
     );
 
-    let segments;
-    if (row) {
-      segments = typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json;
-    } else {
-      segments = defaultSegmentsFor(entityType);
-      await conn.query(
-        `INSERT INTO fab_codegen_rules (company_id, entity_type, segments_json, next_seq) VALUES (?, ?, ?, 1)`,
-        [companyId, entityType, JSON.stringify(segments)],
-      );
-      [[row]] = await conn.query(
-        `SELECT * FROM fab_codegen_rules WHERE company_id = ? AND entity_type = ? LIMIT 1 FOR UPDATE`,
-        [companyId, entityType],
-      );
-    }
+    const segments = typeof row.segments_json === 'string'
+      ? JSON.parse(row.segments_json)
+      : row.segments_json;
 
     const now = new Date();
     const seqSeg = findSequenceSegment(segments);
@@ -308,12 +327,15 @@ export async function generateCode(companyId, entityType, context = {}) {
       [nextSeqToStore, periodKeyToStore, row.id],
     );
 
-    await conn.commit();
+    if (ownTransaction) await conn.commit();
     return code;
   } catch (err) {
-    await conn.rollback();
+    // Only unwind what we started. Rolling back a caller's transaction here
+    // would silently discard work this function knows nothing about; let the
+    // error propagate and leave that decision to whoever opened it.
+    if (ownTransaction) await conn.rollback();
     throw err;
   } finally {
-    conn.release();
+    if (ownTransaction) conn.release();
   }
 }
