@@ -45,8 +45,7 @@ import { portfolioProgress, computeStageBreakdown } from '../services/progressRe
 import { computeActualHoursForTasks, computeTaskVariance } from '../services/taskVarianceService.js';
 import {
   computeTaskWaitMetrics,
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
   fetchOverlappingOtherTasks,
 } from '../services/taskWaitService.js';
@@ -1477,8 +1476,7 @@ router.post('/tasks/:id/events/backfill', protect, async (req, res) => {
     const warnings = [];
     const now = new Date();
 
-    const plantId = await resolveTaskPlantId(companyId, task);
-    const calendarIds = await resolveCalendarIds(companyId, plantId);
+    const calendarIds = await resolveTaskCalendarIds(companyId, task);
 
     if (calendarIds.length > 0) {
       const checks = [['started_at', startedDate]];
@@ -1658,8 +1656,7 @@ router.post('/task-events/:eventId/correct', protect, async (req, res) => {
     );
     const task = taskRows[0];
     if (task) {
-      const plantId = await resolveTaskPlantId(companyId, task);
-      const calendarIds = await resolveCalendarIds(companyId, plantId);
+      const calendarIds = await resolveTaskCalendarIds(companyId, task);
       if (calendarIds.length > 0 && (await timestampOutsideShift(companyId, calendarIds, atDate))) {
         warnings.push(`Corrected time (${atDate.toISOString()}) falls outside the task's shift calendar.`);
       }

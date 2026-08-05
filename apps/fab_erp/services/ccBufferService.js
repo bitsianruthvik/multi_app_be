@@ -18,7 +18,7 @@
 // (e.g. still in_progress, no 'completed' event) yields null actual → 0 overrun until
 // it completes and the recompute fires again.
 //
-// Calendar-forward projection reuses taskWaitService (resolveTaskPlantId /
+// Calendar-forward projection reuses taskWaitService (resolveTaskCalendarIds /
 // resolveCalendarIds / workingIntervalsInWindow) the same chunked way EU-2/EU-3 do;
 // there is no exported "advance by N working-minutes" helper, so that small loop is
 // replicated here (identical to criticalChainService.advanceWorkingMinutes).
@@ -27,8 +27,7 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import { computeActualHoursForTasks } from './taskVarianceService.js';
 import {
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
 } from './taskWaitService.js';
 
@@ -243,8 +242,7 @@ export async function recomputeConsumption(companyId, planId) {
     if (representative) {
       const live = liveById.get(representative.task_id);
       if (live) {
-        const plantId = await resolveTaskPlantId(companyId, live);
-        calendarIds = await resolveCalendarIds(companyId, plantId);
+        calendarIds = await resolveTaskCalendarIds(companyId, live);
       }
     }
     calendarFallback = calendarIds.length === 0;

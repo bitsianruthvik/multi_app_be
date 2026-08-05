@@ -17,8 +17,7 @@
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
 } from './taskWaitService.js';
 
@@ -380,8 +379,7 @@ export async function sequenceProjects(companyId, drum) {
   let seq = 0;
   for (const p of ordered) {
     const calTask = calTaskByOrder.get(p.orderId) ?? { assigned_resource_id: null, resource_type_id: drumTypeId };
-    const plantId = await resolveTaskPlantId(companyId, calTask);
-    const calendarIds = await resolveCalendarIds(companyId, plantId);
+    const calendarIds = await resolveTaskCalendarIds(companyId, calTask);
 
     const drumStart = new Date(cursor.getTime());
     const load = drumLoadByOrder.get(p.orderId) || 0;

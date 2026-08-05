@@ -22,8 +22,7 @@ import {
   loadResourceCapacity,
 } from './resourceLevelingService.js';
 import {
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
 } from './taskWaitService.js';
 
@@ -330,8 +329,7 @@ export async function buildBaseline({ companyId, orderId, anchor } = {}) {
   let calendarFallback = false;
   if (aggressiveFinish) {
     const tailTask = taskById.get(tailCriticalId);
-    const plantId = await resolveTaskPlantId(companyId, tailTask);
-    const calendarIds = await resolveCalendarIds(companyId, plantId);
+    const calendarIds = await resolveTaskCalendarIds(companyId, tailTask);
     calendarFallback = calendarIds.length === 0;
     committedFinish = await advanceWorkingMinutes(companyId, calendarIds, aggressiveFinish, projectBufferMinutes);
   }

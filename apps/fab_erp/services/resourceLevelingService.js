@@ -10,13 +10,12 @@
 // no sort/scheduling decision depends on the current time.
 //
 // Calendar math is NOT reimplemented — it reuses taskWaitService's already-public
-// calendar helpers (resolveTaskPlantId / resolveCalendarIds / workingIntervals-
+// calendar helpers (resolveTaskCalendarIds / workingIntervals-
 // InWindow). Edge-building mirrors GET /tasks/graph exactly (see buildEdges).
 
 import { pool } from '../../../db.js';
 import {
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
 } from './taskWaitService.js';
 import { parseDependsOn } from './taskGatingService.js';
@@ -338,19 +337,18 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
     );
   }
 
-  // ── per-task calendar resolution (cached by resource identity / plant) ───────
-  const plantCache = new Map();  // resourceKey -> plantId
-  const calCache = new Map();    // plantId key -> calendarIds
+  // ── per-task calendar resolution (cached by resource identity) ──────────────
+  // Keyed by resource, NOT by plant: a machine can carry its own
+  // shift_calendar_id, so two machines in the same plant may resolve to
+  // different calendars. A plant-keyed cache would hand the first machine's
+  // calendar to the second.
+  const calCache = new Map();    // resourceKey -> calendarIds
   async function calendarIdsFor(task) {
     if (Array.isArray(calendar)) return calendar;
     const rKey = `${task.assigned_resource_id ?? ''}|${task.resource_type_id ?? ''}`;
-    let plantId;
-    if (plantCache.has(rKey)) plantId = plantCache.get(rKey);
-    else { plantId = await resolveTaskPlantId(companyId, task); plantCache.set(rKey, plantId); }
-    const pKey = plantId == null ? 'null' : String(plantId);
-    if (calCache.has(pKey)) return calCache.get(pKey);
-    const ids = await resolveCalendarIds(companyId, plantId);
-    calCache.set(pKey, ids);
+    if (calCache.has(rKey)) return calCache.get(rKey);
+    const ids = await resolveTaskCalendarIds(companyId, task);
+    calCache.set(rKey, ids);
     return ids;
   }
 

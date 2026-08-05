@@ -90,7 +90,8 @@ router.get('/shift-log', protect, async (req, res) => {
 
   try {
     const [[resource]] = await pool.query(
-      `SELECT id, name, code, plant_id AS plantId, resource_type_id AS resourceTypeId
+      `SELECT id, name, code, plant_id AS plantId, resource_type_id AS resourceTypeId,
+              shift_calendar_id AS shiftCalendarId
          FROM fab_resources WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
       [resourceId, companyId],
     );
@@ -99,7 +100,11 @@ router.get('/shift-log', protect, async (req, res) => {
     // The shift itself — what "a full day" means for this machine, so the UI can
     // show how much of the day is accounted for and default the first row's
     // start to when the shift actually began.
-    const calendarIds = await resolveCalendarIds(companyId, resource.plantId);
+    // The machine's own calendar wins over its plant's, matching how the backend
+    // now attributes its time and what MachineTimeline already shows.
+    const calendarIds = await resolveCalendarIds(
+      companyId, resource.plantId, resource.shiftCalendarId,
+    );
     const intervals = calendarIds.length
       ? await workingIntervalsInWindow(companyId, calendarIds, start, end)
       : [];

@@ -46,8 +46,7 @@
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  resolveTaskPlantId,
-  resolveCalendarIds,
+  resolveTaskCalendarIds,
   workingIntervalsInWindow,
   fetchOverlappingOtherTasks,
   mergeIntervals,
@@ -205,8 +204,7 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
   const completedAt = task.completed_at ? new Date(task.completed_at) : null;
   const isDone = task.status === 'done' || task.status === 'cancelled';
 
-  const plantId = await resolveTaskPlantId(companyId, task);
-  const calendarIds = await resolveCalendarIds(companyId, plantId);
+  const calendarIds = await resolveTaskCalendarIds(companyId, task);
 
   const segments = []; // { reason, start, end, wm, group:'pre'|'active' }
 

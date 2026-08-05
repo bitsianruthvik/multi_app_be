@@ -7,18 +7,20 @@
 // this file as authoritative for attribution; the durable fix is to have
 // capacityService call collectWorkingIntervals() rather than keep a second copy.
 //
-//   RESOURCE ↔ CALENDAR RESOLUTION (mirrors capacityService's documented model)
+//   RESOURCE ↔ CALENDAR RESOLUTION (see resolveTaskCalendarIds)
 //   ───────────────────────────────────────────────────────────────────────────
-//   The schema has no direct fab_resource → fab_shift_calendar link. capacityService
-//   resolves this via the "plant-wide calendar" model: a fab_shift_calendar has a
-//   plant_id, fab_resources/fab_resource_types have a plant_id, and resources are
-//   treated as operating under every shift of the calendar(s) sharing their plant.
-//   We mirror that here: resolve the task's plant via fab_resources.plant_id (if
-//   assigned_resource_id is set) else fab_resource_types.plant_id (if only
-//   resource_type_id is known). Calendars are then matched on that plant_id. If no
-//   plant can be resolved, or no calendar matches that plant, we broaden to ALL of
-//   the company's shift calendars — the same broad fallback capacityService uses
-//   when no plantId/calendarId filter is supplied.
+//   1. fab_resources.shift_calendar_id — the machine's OWN calendar, when set.
+//   2. else every calendar sharing the task's plant, resolved via
+//      fab_resources.plant_id (if assigned_resource_id is set) else
+//      fab_resource_types.plant_id.
+//   3. else every calendar in the company.
+//
+//   Step 1 was added 2026-08-05. shift_calendar_id is writable from
+//   ResourceTypes.tsx and the resource import and MachineTimeline.tsx already read
+//   it, but this service resolved by plant alone — so a machine explicitly put on
+//   its own calendar was still attributed against every calendar its plant had,
+//   and the frontend and backend disagreed. capacityService.js still resolves by
+//   plant only and has NOT been updated; see the drift note above.
 //
 //   fab_calendar_days IS AN EXCEPTION LIST (changed 2026-08-05)
 //   ───────────────────────────────────────────────────────────────────────────
@@ -163,7 +165,7 @@ function clipToWindow(iv, windowStart, windowEnd) {
  * Resolve the plant a task's resource operates under: prefer the specifically
  * assigned resource's plant, fall back to the resource type's plant.
  */
-export async function resolveTaskPlantId(companyId, task) {
+async function resolveTaskPlantId(companyId, task) {
   if (task.assigned_resource_id) {
     const [[row]] = await pool.query(
       `SELECT plant_id FROM fab_resources
@@ -184,11 +186,63 @@ export async function resolveTaskPlantId(companyId, task) {
 }
 
 /**
- * Resolve the in-scope shift calendars for a task, mirroring capacityService's
- * plant-wide model with a broad company-wide fallback when the plant can't pin
- * down a calendar.
+ * Resolve the shift calendars in scope for a task.
+ *
+ * Order of preference:
+ *   1. the assigned machine's own fab_resources.shift_calendar_id
+ *   2. every calendar sharing the task's plant
+ *   3. every calendar in the company
+ *
+ * Step 1 is the reason this exists. shift_calendar_id is writable from
+ * ResourceTypes.tsx and the resource import, and MachineTimeline.tsx already
+ * reads it — but the backend resolved calendars by plant alone, so a machine
+ * explicitly put on its own calendar was still attributed against every calendar
+ * its plant had. Frontend and backend disagreed.
+ *
+ * One query for both fields; falls through to the plant path when the machine
+ * has no explicit calendar, which is the common case.
  */
-export async function resolveCalendarIds(companyId, plantId) {
+export async function resolveTaskCalendarIds(companyId, task) {
+  let explicitCalendarId = null;
+  let plantId = null;
+
+  if (task?.assigned_resource_id) {
+    const [[row]] = await pool.query(
+      `SELECT plant_id, shift_calendar_id FROM fab_resources
+       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [task.assigned_resource_id, companyId],
+    );
+    if (row) {
+      plantId = row.plant_id;
+      explicitCalendarId = row.shift_calendar_id;
+    }
+  }
+  if (plantId == null && task?.resource_type_id) {
+    const [[row]] = await pool.query(
+      `SELECT plant_id FROM fab_resource_types
+       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [task.resource_type_id, companyId],
+    );
+    if (row) plantId = row.plant_id;
+  }
+  return resolveCalendarIds(companyId, plantId, explicitCalendarId);
+}
+
+/**
+ * Resolve the in-scope shift calendars, mirroring capacityService's plant-wide
+ * model with a broad company-wide fallback when the plant can't pin down a
+ * calendar. `explicitCalendarId` — a machine's own calendar — wins when supplied
+ * and still live; callers holding a task should prefer resolveTaskCalendarIds().
+ */
+export async function resolveCalendarIds(companyId, plantId, explicitCalendarId = null) {
+  if (explicitCalendarId) {
+    const [rows] = await pool.query(
+      `SELECT id FROM fab_shift_calendars
+       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [explicitCalendarId, companyId],
+    );
+    if (rows.length > 0) return [rows[0].id];
+  }
   if (plantId) {
     const [rows] = await pool.query(
       `SELECT id FROM fab_shift_calendars
@@ -401,8 +455,7 @@ export async function computeWaitWorkingMinutes(task, now = new Date()) {
   const depsClearedAt = new Date(task.deps_cleared_at);
   if (isNaN(depsClearedAt.getTime()) || depsClearedAt >= now) return 0;
 
-  const plantId = await resolveTaskPlantId(task.company_id, task);
-  const calendarIds = await resolveCalendarIds(task.company_id, plantId);
+  const calendarIds = await resolveTaskCalendarIds(task.company_id, task);
 
   const minutes = await workingMinutesInWindow(task.company_id, calendarIds, depsClearedAt, now);
   return Math.round(minutes);
@@ -426,8 +479,7 @@ export async function computeTaskWaitMetrics(task, now = new Date()) {
     return { wait_working_minutes: 0, blocked_by_other_tasks_minutes: 0, idle_wait_minutes: 0 };
   }
 
-  const plantId = await resolveTaskPlantId(task.company_id, task);
-  const calendarIds = await resolveCalendarIds(task.company_id, plantId);
+  const calendarIds = await resolveTaskCalendarIds(task.company_id, task);
 
   const waitMinutesRaw = await workingMinutesInWindow(task.company_id, calendarIds, depsClearedAt, now);
   const waitWorkingMinutes = Math.round(waitMinutesRaw);
