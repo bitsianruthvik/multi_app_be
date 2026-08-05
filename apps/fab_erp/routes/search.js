@@ -19,10 +19,8 @@ const TYPE_LABEL = {
   item:           'Item',
   order:          'Order',
   plant:          'Plant',
-  supplier:       'Supplier',
   customer:       'Customer',
   bom:            'BOM',
-  grn:            'GRN',
   resource_type:  'Resource type',
   stock_location: 'Stock location',
 };
@@ -35,7 +33,7 @@ router.get('/search', protect, async (req, res) => {
     const companyId = req.user.companyId ?? req.user.company_id;
     const like = `%${q}%`;
 
-    const [items, orders, plants, suppliers, customers, boms, grns, resourceTypes, stockLocs] =
+    const [items, orders, plants, customers, boms, resourceTypes, stockLocs] =
       await Promise.allSettled([
         pool.query(
           `SELECT id, name, code, unit AS detail
@@ -60,13 +58,6 @@ router.get('/search', protect, async (req, res) => {
         ),
         pool.query(
           `SELECT id, name, code, contact_name AS detail
-           FROM fab_suppliers
-           WHERE company_id=? AND deleted_at IS NULL AND (name LIKE ? OR code LIKE ?)
-           LIMIT ?`,
-          [companyId, like, like, PER_TYPE],
-        ),
-        pool.query(
-          `SELECT id, name, code, contact_name AS detail
            FROM fab_customers
            WHERE company_id=? AND deleted_at IS NULL AND (name LIKE ? OR code LIKE ?)
            LIMIT ?`,
@@ -76,13 +67,6 @@ router.get('/search', protect, async (req, res) => {
           `SELECT id, name, '' AS code, description AS detail
            FROM fab_material_boms
            WHERE company_id=? AND deleted_at IS NULL AND name LIKE ?
-           LIMIT ?`,
-          [companyId, like, PER_TYPE],
-        ),
-        pool.query(
-          `SELECT id, grn_number AS name, status AS code, supplier_ref AS detail
-           FROM fab_grns
-           WHERE company_id=? AND deleted_at IS NULL AND grn_number LIKE ?
            LIMIT ?`,
           [companyId, like, PER_TYPE],
         ),
@@ -115,10 +99,8 @@ router.get('/search', protect, async (req, res) => {
       ...extract(items,         'item'),
       ...extract(orders,        'order'),
       ...extract(plants,        'plant'),
-      ...extract(suppliers,     'supplier'),
       ...extract(customers,     'customer'),
       ...extract(boms,          'bom'),
-      ...extract(grns,          'grn'),
       ...extract(resourceTypes, 'resource_type'),
       ...extract(stockLocs,     'stock_location'),
     ];

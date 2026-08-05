@@ -82,12 +82,6 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: '-' },
     { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
   ],
-  purchase_order: [
-    { type: 'fixed', value: 'PO-' },
-    { type: 'date', format: 'YYYYMMDD' },
-    { type: 'fixed', value: '-' },
-    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
-  ],
   planned_order: [
     { type: 'fixed', value: 'PLN-' },
     { type: 'date', format: 'YYYYMMDD' },
@@ -108,10 +102,6 @@ const DEFAULT_SEGMENTS = {
   ],
   customer: [
     { type: 'fixed', value: 'CUST-' },
-    { type: 'sequence', digits: 4, resetPeriod: 'never' },
-  ],
-  supplier: [
-    { type: 'fixed', value: 'SUPP-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
   ],
 };

@@ -380,22 +380,6 @@ CREATE TABLE IF NOT EXISTS fab_stock_locations (
   KEY idx_fab_stock_locations_plant   (plant_id)
 );
 
-CREATE TABLE IF NOT EXISTS fab_suppliers (
-  id           INT AUTO_INCREMENT PRIMARY KEY,
-  company_id   INT           NOT NULL,
-  name         VARCHAR(150)  NOT NULL,
-  code         VARCHAR(40)   NOT NULL,
-  contact_name VARCHAR(120)  NULL,
-  phone        VARCHAR(40)   NULL,
-  email        VARCHAR(150)  NULL,
-  address      TEXT          NULL,
-  notes        TEXT          NULL,
-  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  deleted_at   TIMESTAMP     NULL,
-  UNIQUE KEY uq_fab_suppliers (company_id, code),
-  KEY idx_fab_suppliers_company (company_id)
-);
 
 CREATE TABLE IF NOT EXISTS fab_customers (
   id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -464,42 +448,7 @@ CREATE TABLE IF NOT EXISTS fab_stock_policies (
   KEY idx_fab_stock_policies_item    (catalog_item_id)
 );
 
-CREATE TABLE IF NOT EXISTS fab_grns (
-  id                INT AUTO_INCREMENT PRIMARY KEY,
-  company_id        INT           NOT NULL,
-  grn_number        VARCHAR(60)   NOT NULL,
-  grn_date          DATE          NOT NULL,
-  plant_id          INT           NOT NULL,
-  stock_location_id INT           NOT NULL,
-  supplier_id       INT           NULL,
-  supplier_ref      VARCHAR(120)  NULL,
-  notes             TEXT          NULL,
-  status            VARCHAR(20)   NOT NULL DEFAULT 'posted',
-  created_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  deleted_at        TIMESTAMP     NULL,
-  UNIQUE KEY uq_fab_grns_number (company_id, grn_number),
-  KEY idx_fab_grns_company  (company_id),
-  KEY idx_fab_grns_supplier (supplier_id)
-);
 
-CREATE TABLE IF NOT EXISTS fab_grn_lines (
-  id              INT AUTO_INCREMENT PRIMARY KEY,
-  company_id      INT            NOT NULL,
-  grn_id          INT            NOT NULL,
-  catalog_item_id INT            NOT NULL,
-  batch_id        INT            NULL,
-  batch_code      VARCHAR(60)    NOT NULL,
-  qty             DECIMAL(14,4)  NOT NULL,
-  unit_cost       DECIMAL(14,4)  NULL,
-  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  deleted_at      TIMESTAMP      NULL,
-  KEY idx_fab_grn_lines_company (company_id),
-  KEY idx_fab_grn_lines_grn     (grn_id),
-  KEY idx_fab_grn_lines_item    (catalog_item_id),
-  KEY idx_fab_grn_lines_batch   (batch_id)
-);
 
 CREATE TABLE IF NOT EXISTS fab_stock_ledger (
   id                INT AUTO_INCREMENT PRIMARY KEY,
@@ -512,17 +461,13 @@ CREATE TABLE IF NOT EXISTS fab_stock_ledger (
   txn_type          VARCHAR(30)    NOT NULL DEFAULT 'grn_receipt',
   qty               DECIMAL(14,4)  NOT NULL,
   unit_cost         DECIMAL(14,4)  NULL,
-  supplier_id       INT            NULL,
-  grn_id            INT            NULL,
-  grn_line_id       INT            NULL,
   txn_date          DATE           NOT NULL,
   notes             TEXT           NULL,
   created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
   updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   deleted_at        TIMESTAMP      NULL,
   KEY idx_fab_stock_ledger_batch (batch_id),
-  KEY idx_fab_stock_ledger_item  (company_id, catalog_item_id, plant_id, stock_location_id),
-  KEY idx_fab_stock_ledger_grn   (grn_id)
+  KEY idx_fab_stock_ledger_item  (company_id, catalog_item_id, plant_id, stock_location_id)
 );
 
 -- FEAT-02: material reservations. A task's gated material is earmarked when its
@@ -968,24 +913,6 @@ VALUES
 
 -- ── Supplier × Item records ─────────────────────────────────────────────────
 
-CREATE TABLE IF NOT EXISTS fab_supplier_items (
-  id               INT AUTO_INCREMENT PRIMARY KEY,
-  company_id       INT            NOT NULL,
-  supplier_id      INT            NOT NULL,
-  catalog_item_id  INT            NOT NULL,
-  lead_time_days   INT            NULL,
-  unit_cost        DECIMAL(14,4)  NULL,
-  currency         VARCHAR(10)    NULL DEFAULT 'INR',
-  min_order_qty    DECIMAL(14,4)  NULL,
-  is_preferred     TINYINT(1)     NOT NULL DEFAULT 0,
-  notes            TEXT           NULL,
-  deleted_at       DATETIME       NULL,
-  created_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  KEY idx_fab_supplier_items_supplier (supplier_id),
-  KEY idx_fab_supplier_items_item (catalog_item_id),
-  KEY idx_fab_supplier_items_company (company_id)
-);
 
 -- ── fab_item_catalog new columns ────────────────────────────────────────────
 
@@ -1527,8 +1454,6 @@ CREATE TABLE IF NOT EXISTS fab_stock_pieces (
   uom               VARCHAR(20)    NULL,
   unit_cost         DECIMAL(14,4)  NULL,
   status            VARCHAR(20)    NOT NULL DEFAULT 'in_stock',
-  grn_id            INT            NULL,
-  grn_line_id       INT            NULL,
   received_date     DATE           NULL,
   notes             TEXT           NULL,
   -- WIP model: ties a work-in-process / produced piece to the fab_items node
@@ -1540,7 +1465,6 @@ CREATE TABLE IF NOT EXISTS fab_stock_pieces (
   deleted_at        TIMESTAMP      NULL,
   KEY idx_fsp_company (company_id),
   KEY idx_fsp_item    (catalog_item_id),
-  KEY idx_fsp_grn     (grn_id),
   KEY idx_fsp_wip     (company_id, wip_item_id)
 );
 

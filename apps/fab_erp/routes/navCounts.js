@@ -53,11 +53,6 @@ router.get('/nav-counts', protect, async (req, res) => {
        WHERE company_id=? AND deleted_at IS NULL AND status IN (${activeList})`,
       [companyId, ...ACTIVE_ORDER_STATUSES]],
 
-    ['posInTransit',
-      `SELECT COUNT(*) AS n FROM fab_orders
-       WHERE company_id=? AND deleted_at IS NULL AND order_type='purchase' AND status='sent'`,
-      [companyId]],
-
     // "Open" work = anything not finished. Operators care about the whole
     // backlog, not just what is runnable this second.
     ['openTasks',

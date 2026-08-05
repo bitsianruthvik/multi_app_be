@@ -94,11 +94,6 @@ router.get('/pulse', protect, async (req, res) => {
        WHERE company_id=? AND deleted_at IS NULL AND order_type='sales' AND status='draft'`,
       [companyId]],
 
-    ['posInTransit',
-      `SELECT COUNT(*) AS n FROM fab_orders
-       WHERE company_id=? AND deleted_at IS NULL AND order_type='purchase' AND status='sent'`,
-      [companyId]],
-
     ['items',
       `SELECT COUNT(*) AS n FROM fab_item_catalog
        WHERE company_id=? AND deleted_at IS NULL`,
