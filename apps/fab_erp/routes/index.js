@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import mutateRouter from './mutate.js';
-import versionRouter from './version.js';
 import processTemplateStepsRouter from './processTemplateSteps.js';
 import stockRouter     from './stock.js';
 import bomRouter       from './bom.js';
@@ -28,7 +27,6 @@ const router = Router();
 router.get('/health', (req, res) => res.json({ ok: true, app: 'fab_erp' }));
 
 router.use(mutateRouter);
-router.use(versionRouter);
 router.use(processTemplateStepsRouter);
 router.use(stockRouter);
 router.use(bomRouter);

@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool }    from '../../../db.js';
-import { resolveTemplate } from '../services/bomTemplateResolveService.js';
 
 const router = Router();
 
@@ -104,39 +103,6 @@ router.post('/bom/copy-template', protect, async (req, res) => {
     res.json({ ok: true, inserted });
   } catch (err) {
     console.error('BOM copy-template error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /bom/instantiate-template
-// EU-14: hook point for creating a project's fab_items tree from a
-// fab_bom_templates row (parameterized tree with slotted raw_material
-// nodes), as opposed to `/bom/copy-template` above (fixed fab_material_bom_items
-// tree copy). Delegates entirely to bomTemplateResolveService.resolveTemplate,
-// which also resolves each slotted raw_material node against fab_stock_pieces
-// (or fab_bom_template_slots.default_catalog_item_id for 'manual' slots) and,
-// as a best-effort final step, triggers EU-5's taskInstanceService.materializeTasks.
-// Body: { templateId, projectId, projectItemId?, plantId }
-//   - projectItemId (optional): an existing fab_items.id to attach the
-//     template's root node(s) under (parent_item_id). Omit to create
-//     top-level project items, same as `/bom/copy-template`.
-router.post('/bom/instantiate-template', protect, async (req, res) => {
-  const { templateId, projectId, projectItemId, plantId } = req.body ?? {};
-
-  if (!templateId || !projectId || !plantId) {
-    return res.status(400).json({ error: 'templateId, projectId and plantId are required' });
-  }
-
-  try {
-    const result = await resolveTemplate(
-      Number(templateId),
-      Number(projectId),
-      projectItemId != null ? Number(projectItemId) : null,
-      Number(plantId),
-    );
-    res.json(result);
-  } catch (err) {
-    console.error('BOM instantiate-template error:', err);
     res.status(500).json({ error: err.message });
   }
 });

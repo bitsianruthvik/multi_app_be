@@ -85,8 +85,11 @@ router.get('/nav-counts', protect, async (req, res) => {
        WHERE company_id=? AND deleted_at IS NULL`,
       [companyId]],
 
+    // Counts the per-project BOMs that are actually built and used. This used to
+    // count fab_bom_templates, which held zero rows for the life of the feature,
+    // so the badge always read 0 next to a screen nobody had ever filled in.
     ['boms',
-      `SELECT COUNT(*) AS n FROM fab_bom_templates
+      `SELECT COUNT(*) AS n FROM fab_material_boms
        WHERE company_id=? AND deleted_at IS NULL`,
       [companyId]],
 

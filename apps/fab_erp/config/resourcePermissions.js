@@ -71,9 +71,6 @@ const resourcePermissions = {
   fabErpBomFlowBinding: 'fab_erp_flows_manage',
 
   // BOM Templates
-  fabErpBomTemplate:     'fab_erp_bomtemplate_manage',
-  fabErpBomTemplateNode: 'fab_erp_bomtemplate_manage',
-  fabErpBomTemplateSlot: 'fab_erp_bomtemplate_manage',
 
   // Inventory / GRN (item categorization, stock, batches, GRN)
   fabErpCustomField:   'fab_erp_taxonomy_manage',
