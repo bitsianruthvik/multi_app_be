@@ -2511,6 +2511,7 @@ CREATE TABLE IF NOT EXISTS fab_cc_plans (
   project_buffer_minutes   INT           NULL,
   aggressive_finish        DATETIME      NULL,
   committed_finish         DATETIME      NULL,
+  projected_finish         DATETIME      NULL,
   fever_zone               ENUM('green','yellow','red') NULL,
   buffer_consumed_pct      TINYINT       NULL,
   chain_complete_pct       TINYINT       NULL,

@@ -221,7 +221,11 @@ export async function recomputeConsumption(companyId, planId) {
   const bufferConsumedPct = clampPct(bufferConsumedPctNum);
   const zone = CC_FEVER.zoneFor(chainCompletePct, bufferConsumedPctNum);
 
-  // ── projected committed_finish ──────────────────────────────────────────────
+  // ── projected finish ────────────────────────────────────────────────────────
+  // Written to projected_finish, NOT committed_finish. This is a live projection
+  // measured from now and recomputed every 15 minutes; committed_finish is what
+  // the baseline and the drum committed to. Until 2026-08-05 this wrote the same
+  // column as both of those and the value oscillated between them.
   // now + remaining critical work + remaining (unconsumed) project buffer, walked
   // FORWARD on the order's calendar. Remaining critical work = aggressive minutes of
   // not-done critical tasks (a simple, defensible estimate — no re-leveling here).
@@ -262,7 +266,7 @@ export async function recomputeConsumption(companyId, planId) {
 
     await conn.query(
       `UPDATE fab_cc_plans
-          SET committed_finish = ?, fever_zone = ?, buffer_consumed_pct = ?, chain_complete_pct = ?
+          SET projected_finish = ?, fever_zone = ?, buffer_consumed_pct = ?, chain_complete_pct = ?
         WHERE id = ? AND company_id = ?`,
       [toDateTimeStr(committedFinish), zone, bufferConsumedPct, chainCompletePct, planId, companyId],
     );

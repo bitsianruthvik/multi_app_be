@@ -291,14 +291,21 @@ router.post('/batches/:id/complete', protect, async (req, res) => {
       }
     }
 
+    // Buffer placements are awaited (best-effort via the trailing .catch) before
+    // the critical-chain recompute below, for the same reason as the single-task
+    // stop path: anything downstream that reads buffer load must not race the
+    // placement. Attribution has no such ordering constraint, so it stays
+    // fire-and-forget.
+    const placements = [];
     for (const m of result.members) {
       recomputeTaskAttribution(companyId, m.taskId).catch((err) =>
         logger.error({ err, taskId: m.taskId }, 'attribution recompute failed'));
       if (m.qcResult === 'pass') {
-        bufferService.placeOutput(companyId, { id: m.taskId }).catch((err) =>
-          logger.error({ err, taskId: m.taskId }, 'buffer placeOutput failed'));
+        placements.push(bufferService.placeOutput(companyId, { id: m.taskId }).catch((err) =>
+          logger.error({ err, taskId: m.taskId }, 'buffer placeOutput failed')));
       }
     }
+    await Promise.all(placements);
     for (const orderId of [...new Set(result.members.map((m) => m.orderId).filter(Boolean))]) {
       ccRecomputeForOrder(companyId, orderId).catch((err) =>
         logger.error({ err, orderId }, 'cc buffer recompute failed'));
