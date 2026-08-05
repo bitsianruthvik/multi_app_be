@@ -32,6 +32,12 @@ const DEFAULT_CAP_HRS_PER_DAY = 8;
 // drum — hysteresis against flip-flop under the auto-detect choice.
 const HYSTERESIS_MARGIN = 1.15;
 
+// Capacity-buffer size, as a fraction of the drum load of the project it follows.
+// The third CCPM buffer — see sequenceProjects for why it exists and why it is
+// smaller than the project buffer's 50%. Tuning this is a one-line change, and
+// like the 50% project buffer it is a fixed ratio by decision, not learned.
+const CAPACITY_BUFFER_PCT = 0.25;
+
 // ─── helpers ───────────────────────────────────────────────────────────────────
 
 // UTC 'YYYY-MM-DD HH:MM:SS' (mirrors criticalChainService.toDateTimeStr).
@@ -396,7 +402,28 @@ export async function sequenceProjects(companyId, drum) {
     const load = drumLoadByOrder.get(p.orderId) || 0;
     const plannedEnd = await advanceWorkingMinutes(companyId, calendarIds, drumStart, load);
 
-    const capacityBuffer = 0; // tunable later; column populated so the gap is adjustable
+    // Capacity buffer: protective time on the constraint between projects.
+    //
+    // The third CCPM buffer, and the one that was missing. A project buffer
+    // protects a project's own promise date and a feeding buffer protects the
+    // point where a feeder joins the chain — but neither protects the DRUM from
+    // the project ahead of it running long. Without a gap here, projects are
+    // staggered back-to-back on the constraint and any overrun propagates
+    // straight into every project behind it, which is precisely the pile-up the
+    // drum exists to prevent.
+    //
+    // Sized from THIS project's drum load, because a project that occupies the
+    // constraint for three days can inject more variability into the next one
+    // than a project that occupies it for three hours. 25%, deliberately less
+    // than the project buffer's 50%: this absorbs one handoff, not a whole
+    // chain of dependent estimates.
+    //
+    // The last project gets none — the gap describes what follows a slot, and
+    // nothing follows the last one. Claiming a buffer there would inflate the
+    // horizon while protecting nobody.
+    const isLastOnDrum = seq === ordered.length - 1;
+    const capacityBuffer = isLastOnDrum ? 0 : Math.round(CAPACITY_BUFFER_PCT * load);
+
     // committed_finish = drum start advanced by chain length + project buffer.
     const finishMinutes = (Number(p.chainLen) > 0 ? Number(p.chainLen) : 0) + (Number(p.projBuf) > 0 ? Number(p.projBuf) : 0);
     const committedFinish = await advanceWorkingMinutes(companyId, calendarIds, drumStart, finishMinutes);

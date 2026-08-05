@@ -312,6 +312,7 @@ router.get('/cc/drum', protect, async (req, res) => {
     const [slots] = await pool.query(
       `SELECT ds.order_id AS orderId, o.order_number AS orderNumber, ds.seq AS seq,
               ds.planned_start AS plannedStart, ds.planned_end AS plannedEnd,
+              ds.capacity_buffer_minutes AS capacityBufferMinutes,
               ds.is_committed AS isCommitted
          FROM fab_cc_drum_slots ds
          JOIN fab_orders o ON o.id = ds.order_id AND o.company_id = ds.company_id
