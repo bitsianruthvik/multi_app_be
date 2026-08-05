@@ -113,14 +113,16 @@ router.get('/dispatch/latest', protect, async (req, res) => {
 
     const [items] = await pool.query(
       `SELECT i.resource_id AS resourceId, r.name AS resourceName,
-              i.task_id AS taskId, i.order_id AS orderId,
+              i.task_id AS id, i.order_id AS orderId,
               i.rank_in_machine AS rankInMachine, i.order_slack_minutes AS orderSlackMinutes,
               i.is_critical_chain AS isCriticalChain, i.seq_no AS seqNo, i.reason,
-              op.name AS operationName, o.order_number AS orderNumber
+              op.name AS operationName, o.order_number AS orderNumber,
+              it.name AS itemName, o.required_date AS requiredDate
          FROM fab_dispatch_run_items i
          LEFT JOIN fab_resources r      ON r.id = i.resource_id
          LEFT JOIN fab_project_tasks t  ON t.id = i.task_id
          LEFT JOIN fab_operations op    ON op.id = t.operation_id
+         LEFT JOIN fab_items it         ON it.id = t.item_id AND it.deleted_at IS NULL
          LEFT JOIN fab_orders o         ON o.id = i.order_id
         WHERE i.company_id = ? AND i.run_id = ? AND i.deleted_at IS NULL
         ORDER BY r.name ASC, i.rank_in_machine ASC`,
@@ -132,11 +134,15 @@ router.get('/dispatch/latest', protect, async (req, res) => {
       if (!byResource.has(it.resourceId)) {
         byResource.set(it.resourceId, { resourceId: it.resourceId, resourceName: it.resourceName, tasks: [] });
       }
+      // Normalised to /dispatch/preview's shape so one client type covers both.
       // Selected as rankInMachine because RANK is a reserved word (window
-      // function) in MySQL 8 and TiDB and an unquoted alias is a syntax error.
-      // Renamed here so this endpoint and /dispatch/preview return one shape.
-      const { rankInMachine, ...rest } = it;
-      byResource.get(it.resourceId).tasks.push({ ...rest, rank: rankInMachine });
+      // function) in MySQL 8 and TiDB and an unquoted alias is a syntax error;
+      // and is_critical_chain is TINYINT(1), so it would arrive as 0/1 here
+      // while preview sends a real boolean.
+      const { rankInMachine, isCriticalChain, ...rest } = it;
+      byResource.get(it.resourceId).tasks.push({
+        ...rest, rank: rankInMachine, isCriticalChain: !!isCriticalChain,
+      });
     }
 
     return res.status(200).json({ ok: true, run, machines: [...byResource.values()] });

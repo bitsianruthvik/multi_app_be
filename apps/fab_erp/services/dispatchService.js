@@ -79,6 +79,7 @@ export async function computeOrderSlack(companyId, now = new Date()) {
             c.chain_role         AS chainRole,
             c.aggressive_minutes AS aggressiveMinutes,
             t.status             AS status,
+            t.started_at         AS startedAt,
             t.assigned_resource_id, t.item_id, t.flow_id, t.company_id
        FROM fab_cc_chain_tasks c
        JOIN fab_project_tasks t ON t.id = c.task_id AND t.deleted_at IS NULL
@@ -93,7 +94,24 @@ export async function computeOrderSlack(companyId, now = new Date()) {
     if (c.chainRole !== 'critical') continue;
     criticalTaskIds.add(c.taskId);
     if (c.status !== 'done') {
-      remainingByPlan.set(c.planId, (remainingByPlan.get(c.planId) ?? 0) + (Number(c.aggressiveMinutes) || 0));
+      const aggressive = Number(c.aggressiveMinutes) || 0;
+
+      // A task that is ALREADY running longer than its estimate is overrun that
+      // has happened, not overrun that might. The stored buffer consumption
+      // cannot see it — that figure is driven by completed touch time, so a task
+      // running ten times over contributes nothing until the moment it finishes,
+      // and a project can sit visibly stuck while its numbers read fine.
+      //
+      // Counted at rank time and never written back: fab_cc_buffers is
+      // deliberately a record of execution variance on FINISHED work, and
+      // persisting a projection into it would corrupt that meaning.
+      let overrun = 0;
+      if (c.status === 'in_progress' && c.startedAt) {
+        const elapsed = (now.getTime() - new Date(c.startedAt).getTime()) / 60000;
+        if (Number.isFinite(elapsed) && elapsed > aggressive) overrun = elapsed - aggressive;
+      }
+
+      remainingByPlan.set(c.planId, (remainingByPlan.get(c.planId) ?? 0) + aggressive + overrun);
     }
     const rep = repByPlan.get(c.planId);
     if (!rep || Number(c.seq) > Number(rep.seq)) repByPlan.set(c.planId, c);
@@ -312,11 +330,16 @@ export async function confirmDispatch(companyId, computed, userId) {
     await conn.beginTransaction();
 
     const taskCount = computed.machines.reduce((n, m) => n + m.tasks.length, 0);
+    // Machines that were actually given work, not every machine considered.
+    // computed.machines includes idle ones so the UI can say "11 have nothing
+    // eligible"; counting those here would report a run bigger than the rows it
+    // wrote.
+    const machineCount = computed.machines.filter((m) => m.tasks.length > 0).length;
     const [runRes] = await conn.query(
       `INSERT INTO fab_dispatch_runs
          (company_id, status, computed_at, confirmed_at, confirmed_by, machine_count, task_count)
        VALUES (?, 'confirmed', NOW(), NOW(), ?, ?, ?)`,
-      [companyId, userId ?? null, computed.machines.length, taskCount],
+      [companyId, userId ?? null, machineCount, taskCount],
     );
     const runId = runRes.insertId;
 
@@ -335,7 +358,7 @@ export async function confirmDispatch(companyId, computed, userId) {
     }
 
     await conn.commit();
-    return { runId, taskCount, machineCount: computed.machines.length };
+    return { runId, taskCount, machineCount };
   } catch (err) {
     await conn.rollback();
     throw err;
