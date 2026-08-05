@@ -1,8 +1,11 @@
 // taskWaitService.js — EU-7: working-hours wait-time + blocked-vs-idle computation.
 //
-// Mirrors the calendar date-walk approach from capacityService.js::getCapacity()
-// (read that file first — this module reuses the same resolution strategy rather
-// than reinventing it):
+// NOTE: this module and capacityService.js::getCapacity() implement the calendar
+// date-walk SEPARATELY and have drifted — capacityService buckets whole-shift
+// working_minutes and does not carve the unpaid break (added here 2026-08-04), and
+// as of 2026-08-05 the two disagree on fab_calendar_days semantics (below). Treat
+// this file as authoritative for attribution; the durable fix is to have
+// capacityService call collectWorkingIntervals() rather than keep a second copy.
 //
 //   RESOURCE ↔ CALENDAR RESOLUTION (mirrors capacityService's documented model)
 //   ───────────────────────────────────────────────────────────────────────────
@@ -17,16 +20,26 @@
 //   the company's shift calendars — the same broad fallback capacityService uses
 //   when no plantId/calendarId filter is supplied.
 //
-//   WORKING-DAY FALLBACK FOR EMPTY fab_calendar_days (mirrors capacityService)
+//   fab_calendar_days IS AN EXCEPTION LIST (changed 2026-08-05)
 //   ───────────────────────────────────────────────────────────────────────────
-//   Per calendar: if that calendar has ZERO fab_calendar_days rows anywhere in the
-//   queried window, the whole window is treated as working days for it (optimistic
-//   fallback, exactly like capacityService's `workingDaysFallback`). If the calendar
-//   DOES have rows in the window, any date with no row (or a row with is_working=0)
-//   is non-working and excluded — per the EU-7 spec ("a missing day-row ... = non-
-//   working, excluded from the count"). A day that IS working but only has
-//   zero-`working_minutes` shifts naturally contributes 0 minutes, satisfying the
-//   "zero-minute/holiday shift = non-working" requirement without special-casing.
+//   A day is working unless a row explicitly says is_working = 0. Missing row =
+//   working. There is no per-calendar "has any rows" test.
+//
+//   It used to be an allow-list: if a calendar had ANY row in the queried window,
+//   a date with no row counted as non-working. That made marking one holiday
+//   catastrophic — a single "25 Dec, not working" row turned every other unlisted
+//   day non-working, resourceLevelingService.nextWorkingInstant then scanned a
+//   year in 7-day chunks and threw, and rematerializeService swallowed the throw,
+//   so the project silently lost its critical-chain baseline. The old rule was
+//   also window-dependent: the same calendar behaved as an allow-list or as a
+//   fallback depending on the date range asked for.
+//
+//   ShiftCalendars.tsx writes one day row at a time with an is_working toggle —
+//   it was always an exception editor; the read path now matches it.
+//
+//   A day that IS working but has only zero-`working_minutes` shifts naturally
+//   contributes 0 minutes, so a zero-minute shift still reads as non-working
+//   without special-casing.
 //
 // GRANULARITY: unlike capacityService (which buckets whole-day/whole-shift minutes),
 // this service needs partial-day precision (e.g. "Friday 4pm" or "Monday 10am"), so
@@ -200,7 +213,7 @@ export async function resolveCalendarIds(companyId, plantId) {
  */
 async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
   if (calendarIds.length === 0) {
-    return { shiftsByCalendar: {}, calendarDayMap: {}, calendarsWithRows: new Set() };
+    return { shiftsByCalendar: {}, calendarDayMap: {} };
   }
 
   const [shiftRows] = await pool.query(
@@ -227,17 +240,15 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
   );
 
   const calendarDayMap = {};   // calendarDayMap[calId][ymd] = boolean(is_working)
-  const calendarsWithRows = new Set();
   for (const row of dayRows) {
     const ymd = row.day_date instanceof Date
       ? toYMD(row.day_date)
       : String(row.day_date).slice(0, 10);
     if (!calendarDayMap[row.calendar_id]) calendarDayMap[row.calendar_id] = {};
     calendarDayMap[row.calendar_id][ymd] = !!row.is_working;
-    calendarsWithRows.add(row.calendar_id);
   }
 
-  return { shiftsByCalendar, calendarDayMap, calendarsWithRows };
+  return { shiftsByCalendar, calendarDayMap };
 }
 
 /**
@@ -254,7 +265,7 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
 
   const dateFrom = toYMD(windowStart);
   const dateTo = toYMD(windowEnd);
-  const { shiftsByCalendar, calendarDayMap, calendarsWithRows } =
+  const { shiftsByCalendar, calendarDayMap } =
     await loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo);
 
   const intervals = [];
@@ -263,15 +274,21 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
       const shifts = shiftsByCalendar[calId];
       if (!shifts || shifts.length === 0) continue;
 
-      let isWorking;
-      if (calendarsWithRows.has(calId)) {
-        // Calendar has explicit rows somewhere in the window: missing day = non-working.
-        isWorking = calendarDayMap[calId]?.[date] === true;
-      } else {
-        // Calendar has zero day rows in the whole window: optimistic fallback.
-        isWorking = true;
-      }
-      if (!isWorking) continue;
+      // fab_calendar_days is an EXCEPTION list: a day is working unless a row
+      // explicitly says otherwise. Only is_working = 0 blocks.
+      //
+      // This used to be an allow-list — if a calendar had any row in the queried
+      // window, a date with no row counted as non-working. That made marking a
+      // single holiday catastrophic: one "25 Dec, not working" row turned every
+      // other unlisted day non-working, resourceLevelingService.nextWorkingInstant
+      // then scanned a year in 7-day chunks and threw, and rematerializeService
+      // swallowed the throw — so the project silently lost its CC baseline.
+      // It was also window-dependent: the same calendar behaved as an allow-list
+      // or a fallback depending on the date range asked for.
+      //
+      // ShiftCalendars.tsx writes one day row at a time with an is_working
+      // toggle, i.e. it is already an exception editor. This matches it.
+      if (calendarDayMap[calId]?.[date] === false) continue;
 
       for (const shift of shifts) {
         // Worked intervals, not the raw span — the shift's unpaid break is
