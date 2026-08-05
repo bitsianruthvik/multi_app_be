@@ -959,49 +959,12 @@ VALUES
   ('Manage GRNs',               'fab_erp_grn_manage',               'frontend');
 
 -- ── Sales Orders ────────────────────────────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS fab_sales_orders (
-  id                   INT AUTO_INCREMENT PRIMARY KEY,
-  company_id           INT            NOT NULL,
-  so_number            VARCHAR(100)   NOT NULL,
-  type                 VARCHAR(50)    NOT NULL DEFAULT 'standard',
-  status               VARCHAR(50)    NOT NULL DEFAULT 'draft',
-  customer_name        VARCHAR(255)   NULL,
-  customer_po_ref      VARCHAR(255)   NULL,
-  plant_id             INT            NULL,
-  requested_date       DATE           NULL,
-  confirmed_date       DATE           NULL,
-  scheduled_ship_date  DATE           NULL,
-  delivery_address     TEXT           NULL,
-  payment_terms        VARCHAR(255)   NULL,
-  currency             VARCHAR(10)    NULL DEFAULT 'INR',
-  priority             VARCHAR(50)    NULL,
-  mrp_controller       VARCHAR(100)   NULL,
-  notes                TEXT           NULL,
-  deleted_at           DATETIME       NULL,
-  created_at           TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at           TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  KEY idx_fab_so_company (company_id)
-);
-
-CREATE TABLE IF NOT EXISTS fab_so_items (
-  id               INT AUTO_INCREMENT PRIMARY KEY,
-  company_id       INT            NOT NULL,
-  so_id            INT            NOT NULL,
-  catalog_item_id  INT            NOT NULL,
-  qty              DECIMAL(14,4)  NOT NULL DEFAULT 1,
-  unit             VARCHAR(50)    NULL,
-  unit_price       DECIMAL(14,4)  NULL,
-  discount         DECIMAL(5,2)   NULL DEFAULT 0,
-  target_plant_id  INT            NULL,
-  requested_date   DATE           NULL,
-  notes            TEXT           NULL,
-  deleted_at       DATETIME       NULL,
-  created_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  updated_at       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  KEY idx_fab_so_items_so (so_id),
-  KEY idx_fab_so_items_company (company_id)
-);
+-- fab_sales_orders / fab_so_items were dropped 2026-08-05 (plan Phase 2e).
+-- Superseded by fab_orders / fab_order_lines. No code in any app referenced
+-- them under either the table name or a fabErpX resource name. Their CREATE
+-- statements are removed here as well as dropped in the migration, because
+-- /push-to-prod pipes init.sql -- leaving the CREATE would resurrect them on
+-- the next deploy.
 
 -- ── Supplier × Item records ─────────────────────────────────────────────────
 
