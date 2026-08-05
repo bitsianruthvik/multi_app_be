@@ -111,19 +111,8 @@ CREATE TABLE IF NOT EXISTS fab_item_metric_defs (
   KEY idx_fimd_company (company_id)
 );
 
-CREATE TABLE IF NOT EXISTS fab_constants (
-  id          INT AUTO_INCREMENT PRIMARY KEY,
-  company_id  INT             NOT NULL,
-  const_key   VARCHAR(100)    NOT NULL,
-  const_value DECIMAL(18,6)   NOT NULL,
-  label       VARCHAR(255)    DEFAULT NULL,
-  deleted_at  DATETIME        DEFAULT NULL,
-  created_at  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-  updated_at  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_fc_company (company_id)
-);
-
+-- fab_constants was dropped 2026-08. Unused key/value table with no reader.
+-- Its CREATE stayed here and would rebuild it on the next run of this file.
 CREATE TABLE IF NOT EXISTS fab_codegen_rules (
   id             INT AUTO_INCREMENT PRIMARY KEY,
   company_id     INT           NOT NULL,
@@ -475,22 +464,8 @@ CREATE TABLE IF NOT EXISTS fab_stock_ledger (
 -- same stock: gating availability = SUM(in_stock pieces) − SUM(active reservations).
 -- The reservation is flipped to 'consumed' when the task starts and physically
 -- deducts the stock, or 'released' if the task is cancelled / re-materialized.
-CREATE TABLE IF NOT EXISTS fab_stock_reservations (
-  id                INT AUTO_INCREMENT PRIMARY KEY,
-  company_id        INT            NOT NULL,
-  catalog_item_id   INT            NOT NULL,
-  task_id           INT            NOT NULL,
-  order_id          INT            NULL,
-  qty               DECIMAL(18,4)  NOT NULL DEFAULT 0,
-  status            ENUM('active','consumed','released') NOT NULL DEFAULT 'active',
-  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-  released_at       DATETIME       NULL,
-  deleted_at        DATETIME       DEFAULT NULL,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_fsr_avail  (company_id, catalog_item_id, status),
-  KEY idx_fsr_task   (company_id, task_id, status)
-);
-
+-- fab_stock_reservations was dropped 2026-08. Earmarking was removed with the material-gate simplification.
+-- Its CREATE stayed here and would rebuild it on the next run of this file.
 -- ===== STANDARD ITEM TAXONOMY SEED (system rows, all companies) =====
 
 -- 1. Categories: one row per company per taxonomy entry
@@ -1383,20 +1358,11 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @sql = IF(@col=0,'ALTER TABLE fab_item_batches ADD UNIQUE KEY uq_fab_item_batches (company_id, catalog_item_id, plant_id, stock_location_id, batch_no, serial_no, heat_no, mark_no)','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
--- Same four identifiers on the GRN line (source of truth at receipt time).
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_grn_lines' AND COLUMN_NAME='batch_no');
-SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines MODIFY COLUMN batch_code VARCHAR(60) NULL','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN batch_no VARCHAR(60) NULL AFTER batch_code','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN serial_no VARCHAR(60) NULL AFTER batch_no','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN heat_no VARCHAR(60) NULL AFTER serial_no','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-SET @sql = IF(@col=0,'ALTER TABLE fab_grn_lines ADD COLUMN mark_no VARCHAR(60) NULL AFTER heat_no','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
-SET @sql = IF(@col=0,'UPDATE fab_grn_lines SET batch_no = batch_code WHERE batch_no IS NULL AND batch_code IS NOT NULL','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- The GRN line carried the same four traceability identifiers. fab_grn_lines
+-- went with the purchase side (2026-08, goods receipt replaced by direct
+-- stock-in), and its guarded block had to go with it: the guard counted
+-- columns on the table, so once the table vanished the count was 0 and every
+-- ALTER inside fired against nothing.
 
 -- Same four identifiers on the stock ledger (audit trail).
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='batch_no');
@@ -1633,9 +1599,6 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 --
 -- Verified against the current schema (live DESCRIBE, not just this file's
 -- implied history) before writing this block:
---   - fab_grn_lines.batch_code   -> already NULLable (nulled by the
---     "Same four identifiers on the GRN line" guarded block above, ~line 1640,
---     which runs the first time batch_no is added to this table).
 --   - fab_stock_ledger.batch_code -> already NULLable, same reasoning, via
 --     the "Same four identifiers on the stock ledger" block above (~line 1655).
 --   - fab_stock_ledger.batch_id  -> STILL `INT NOT NULL` (base CREATE TABLE,
@@ -1650,7 +1613,6 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- guarded blocks were skipped for some reason, e.g. a partially-migrated DB).
 ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_id INT NULL;
 ALTER TABLE fab_stock_ledger MODIFY COLUMN batch_code VARCHAR(60) NULL;
-ALTER TABLE fab_grn_lines MODIFY COLUMN batch_code VARCHAR(60) NULL;
 
 -- ===== Operations / Operation Flows (flat routing model) =====
 
@@ -2159,25 +2121,8 @@ CREATE TABLE IF NOT EXISTS fab_buffers (
 -- mechanism as name_active/kind_active elsewhere in this file. That keeps
 -- "no resource type" a single group per (company, operation) while still
 -- releasing the key on soft delete.
-CREATE TABLE IF NOT EXISTS fab_operation_stats (
-  id                 INT AUTO_INCREMENT PRIMARY KEY,
-  company_id         INT           NOT NULL,
-  operation_id       INT           NOT NULL,
-  resource_type_id   INT           NULL,
-  sample_count       INT           NOT NULL DEFAULT 0,
-  median_minutes     DECIMAL(10,2) NULL,
-  p80_minutes        DECIMAL(10,2) NULL,
-  ewma_minutes       DECIMAL(10,2) NULL,
-  deleted_at         DATETIME      DEFAULT NULL,
-  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  resource_type_key  INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, COALESCE(resource_type_id, 0), NULL)) VIRTUAL,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  UNIQUE KEY uq_fos_company_op_restype (company_id, operation_id, resource_type_key),
-  KEY idx_fos_company   (company_id),
-  KEY idx_fos_operation (operation_id)
-);
-
+-- fab_operation_stats was dropped 2026-08. Learned durations were removed; the formula is the estimate.
+-- Its CREATE stayed here and would rebuild it on the next run of this file.
 -- ===== Progress report templates (Project Progress view, 2026-07-24) =====
 -- A template is a named, ordered set of "stages"; each stage clubs one or more
 -- operations. It gives the Progress tab a fixed, comparable set of columns per
@@ -2240,14 +2185,16 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- same idiom as the fab_orders.customer_id gap fix above (information_schema
 -- existence check + PREPARE/EXECUTE), and deliberately not added to the
 -- CREATE TABLE above either, matching that same precedent.
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='formula_hours');
-SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN formula_hours DECIMAL(10,2) NULL AFTER computed_hours','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- RETIRED 2026-08-05. formula_hours held the formula's own estimate beside a
+-- learned p80 that overrode it; the learning subsystem is gone (buffer sizing
+-- is a fixed 50%, so nothing consumed it) and the column was dropped. Leaving
+-- this ALTER in would recreate it on the next run of this file — which is
+-- exactly what push-to-prod does.
 
 -- FEAT-05 (2026-07-23): production output + rework. Idempotent adds for DBs
 -- created before this feature. Mirrors the CREATE TABLE columns above.
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='produced_qty');
-SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN produced_qty DECIMAL(18,4) NULL AFTER formula_hours','SELECT 1');
+SET @sql = IF(@col=0,'ALTER TABLE fab_project_tasks ADD COLUMN produced_qty DECIMAL(18,4) NULL AFTER computed_hours','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='scrap_qty');
@@ -2294,7 +2241,9 @@ CREATE TABLE IF NOT EXISTS fab_cc_plans (
   committed_finish         DATETIME      NULL,
   projected_finish         DATETIME      NULL,
   fever_zone               ENUM('green','yellow','red') NULL,
-  buffer_consumed_pct      TINYINT       NULL,
+  -- SMALLINT, not TINYINT: buffer burn passes 100% exactly when a project is
+  -- in the trouble the fever chart exists to show, and TINYINT stops at 127.
+  buffer_consumed_pct      SMALLINT      NULL,
   chain_complete_pct       TINYINT       NULL,
   drum_planned_start       DATETIME      NULL,
   baselined_at             DATETIME      NULL,
@@ -2351,7 +2300,7 @@ CREATE TABLE IF NOT EXISTS fab_cc_buffer_snapshots (
   buffer_id             INT           NOT NULL,
   at                    DATETIME      NOT NULL,
   chain_complete_pct    TINYINT       NOT NULL,
-  buffer_consumed_pct   TINYINT       NOT NULL,
+  buffer_consumed_pct   SMALLINT      NOT NULL,
   zone                  ENUM('green','yellow','red') NOT NULL,
   deleted_at            DATETIME      DEFAULT NULL,
   created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,

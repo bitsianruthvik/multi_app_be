@@ -3,6 +3,7 @@ import path  from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes            from './routes/index.js';
 import criticalChainRoutes    from './routes/criticalChain.js';
+import dispatchRoutes         from './routes/dispatch.js';
 import { logger }              from '../../core/utils/logger.js';
 import { getQueue }            from '../../core/jobs/queue.js';
 import attributionJobHandlers  from './workers/jobHandlers.js';
@@ -24,6 +25,9 @@ export default {
     // EU-4: critical-chain baseline route, mounted separately (same prefix)
     // rather than folded into routes/index.js — see routes/criticalChain.js.
     server.use('/api/:companySlug/fab_erp', criticalChainRoutes);
+    // Dispatch: same prefix, same reason — a preview/confirm pair that is its
+    // own concern rather than another entry in the index router.
+    server.use('/api/:companySlug/fab_erp', dispatchRoutes);
     // EU-3: wait-attribution sweep every 15 min. When Redis is available we
     // enqueue onto the 'fab_erp' Bull queue (processor wired by jobHandlers);
     // when it isn't (getQueue → null, this repo's default) we run the sweep

@@ -499,19 +499,13 @@
     "alias": "forc",
     "writeFields": [
       "operation_id",
-      "resource_type_id",
-      "batch_mode",
-      "batch_capacity",
-      "batch_match_keys"
+      "resource_type_id"
     ],
     "fields": {
       "id": "forc.id",
       "companyId": "forc.company_id",
       "operationId": "forc.operation_id",
       "resourceTypeId": "forc.resource_type_id",
-      "batchMode": "forc.batch_mode",
-      "batchCapacity": "forc.batch_capacity",
-      "batchMatchKeys": "forc.batch_match_keys",
       "createdAt": "forc.created_at",
       "updatedAt": "forc.updated_at",
       "resourceTypeName": "frt_orc.name",
@@ -523,9 +517,6 @@
       "companyId": "integer",
       "operationId": "integer",
       "resourceTypeId": "integer",
-      "batchMode": "string",
-      "batchCapacity": "integer",
-      "batchMatchKeys": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime",
       "resourceTypeName": "string",
@@ -1773,7 +1764,8 @@
       "mrp_controller",
       "notes",
       "created_by",
-      "progress_template_id"
+      "progress_template_id",
+      "priority_rank"
     ],
     "fields": {
       "id": "fo.id",
@@ -1803,6 +1795,7 @@
       "paymentTerms": "fo.payment_terms",
       "currency": "fo.currency",
       "priority": "fo.priority",
+      "priorityRank": "fo.priority_rank",
       "mrpController": "fo.mrp_controller",
       "notes": "fo.notes",
       "progressPct": "fo.progress_pct",
@@ -1843,6 +1836,7 @@
       "supplierId": "integer",
       "supplierRef": "string",
       "priority": "string",
+      "priorityRank": "integer",
       "mrpController": "string",
       "notes": "string",
       "progressPct": "integer",
@@ -2195,7 +2189,6 @@
       "idleWaitMinutes": "fpjt.idle_wait_minutes",
       "delayReason": "fpjt.delay_reason",
       "computedHours": "fpjt.computed_hours",
-      "formulaHours": "fpjt.formula_hours",
       "sortOrder": "fpjt.sort_order",
       "createdAt": "fpjt.created_at",
       "updatedAt": "fpjt.updated_at",
@@ -2232,7 +2225,6 @@
       "idleWaitMinutes": "integer",
       "delayReason": "string",
       "computedHours": "decimal",
-      "formulaHours": "decimal",
       "sortOrder": "integer",
       "createdAt": "datetime",
       "updatedAt": "datetime",

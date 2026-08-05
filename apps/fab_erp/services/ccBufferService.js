@@ -55,10 +55,18 @@ function toDateTimeStr(d) {
 const CHUNK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 
-// Clamp a percentage into a signed-TINYINT-safe range. Chain completion clamps to
-// 0..100; buffer burn floors at 0 but may exceed 100 (a >100% burn = deep red) — we
-// still cap at 127 so it fits the TINYINT column without overflow.
-function clampPct(n, max = 127) {
+// Clamp a percentage to what its column can hold. Chain completion is a true
+// proportion and clamps to 0..100. Buffer burn floors at 0 but genuinely exceeds
+// 100 — a burn over 100% is a project that has eaten its whole buffer, which is
+// the case the fever chart exists to surface.
+//
+// The cap was 127, the signed-TINYINT ceiling, and four production plans burning
+// 339%, 227%, 201% and 134% all stored 127: every late project looked identically
+// late, and the worst was indistinguishable from the mildest. The column is now
+// SMALLINT and the cap is 999, which separates every realistic case while keeping
+// the number readable. Note the fever ZONE was never affected — zoneFor() is
+// passed the unclamped value.
+function clampPct(n, max = 999) {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(max, Math.round(n)));
 }

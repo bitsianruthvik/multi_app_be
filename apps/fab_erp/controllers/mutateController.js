@@ -54,52 +54,19 @@ const CONSUMPTION_RULES = {
     { field: 'routing_template_id',  entity: 'routing_templates'  },
     { field: 'process_template_id',  entity: 'process_templates'  },
   ],
-  // fabErpProcessTemplateStep and fabErpRoutingTemplateStep use formula_id → formula_set_id
-  // resolution (see checkFormulaRef below); no direct entity ref here.
 };
 
-/**
- * Resources that gate via formula_id → parent formula_set_id lookup.
- */
-const FORMULA_REF_RESOURCES = new Set([
-  'fabErpProcessTemplateStep',
-  'fabErpRoutingTemplateStep',
-]);
-
-/**
- * Resolves a formula's parent formula_set_id, then checks consumability.
- * Returns null if approved/consumable, or an error object if not.
+/*
+ * A formula_id -> formula_set_id consumption gate lived here, resolving the
+ * parent set through a fab_formulas table and checking it was approved.
  *
- * @param {number} formulaId
- * @param {number} companyId
- * @returns {Promise<null|{error:string, code:string}>}
+ * Removed 2026-08-05. There is no fab_formulas table — init.sql line 13 drops
+ * it explicitly, and no environment has one. A formula is now just a TEXT
+ * expression on the step itself (fab_process_template_steps.formula), with no
+ * separate row to version or approve. The gate could never have fired anyway:
+ * formula_id is not a writable field on either resource it guarded, so the
+ * payload it read was always empty.
  */
-async function checkFormulaRef(formulaId, companyId) {
-  const [rows] = await pool.query(
-    `SELECT formula_set_id
-       FROM fab_formulas
-      WHERE id = ? AND company_id = ? AND deleted_at IS NULL
-      LIMIT 1`,
-    [formulaId, companyId],
-  );
-
-  if (!rows.length) {
-    return {
-      error: `Referenced formula (id=${formulaId}) does not exist or is not accessible.`,
-      code: 'NOT_FOUND',
-    };
-  }
-
-  const formulaSetId = rows[0].formula_set_id;
-  const consumable = await isVersionConsumable('formula_sets', formulaSetId, companyId);
-  if (!consumable) {
-    return {
-      error: `Referenced formula_set (id=${formulaSetId}, via formula id=${formulaId}) is not approved and cannot be used.`,
-      code: 'NOT_APPROVED',
-    };
-  }
-  return null;
-}
 
 /**
  * Runs all consumption-gate checks for the given resource + filtered payload.
@@ -126,15 +93,6 @@ async function runConsumptionGate(resource, filteredPayload, companyId) {
         error: `Referenced ${label} (id=${refId}) is not approved and cannot be used.`,
         code: 'NOT_APPROVED',
       };
-    }
-  }
-
-  // ── Formula-id → formula_set resolution ─────────────────────────────────
-  if (FORMULA_REF_RESOURCES.has(resource)) {
-    const formulaId = filteredPayload.formula_id;
-    if (formulaId !== undefined && formulaId !== null) {
-      const err = await checkFormulaRef(formulaId, companyId);
-      if (err) return err;
     }
   }
 

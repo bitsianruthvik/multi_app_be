@@ -296,7 +296,7 @@ export async function sequenceProjects(companyId, drum) {
   const [plans] = await pool.query(
     `SELECT p.id AS planId, p.order_id AS orderId,
             p.chain_length_minutes AS chainLen, p.project_buffer_minutes AS projBuf,
-            o.required_date AS requiredDate
+            o.required_date AS requiredDate, o.priority_rank AS priorityRank
        FROM fab_cc_plans p
        JOIN fab_orders o ON o.id = p.order_id AND o.company_id = p.company_id AND o.deleted_at IS NULL
       WHERE p.company_id = ? AND p.status = 'baselined' AND p.deleted_at IS NULL
@@ -355,9 +355,20 @@ export async function sequenceProjects(companyId, drum) {
     if (t.status === 'in_progress' || t.status === 'done') committedByOrder.set(t.order_id, true);
   }
 
-  // Sort within a group by required_date asc (NULL last), tie-break by order id.
+  // Sort within a group by the planner's manual rank, then required_date asc
+  // (NULL last), tie-broken by order id.
+  //
+  // The manual rank feeds the drum rather than sitting beside it. A rank that
+  // only reordered a display would visibly disagree with the plan dates printed
+  // next to it, because sequenceProjects writes drum_planned_start and
+  // committed_finish from THIS order. Unranked projects fall through to the due
+  // date, so ranking a few does not scramble the rest.
   const dueMs = (rd) => (rd == null ? null : (rd instanceof Date ? rd.getTime() : new Date(rd).getTime()));
   const byDue = (a, b) => {
+    const ra = a.priorityRank ?? Number.POSITIVE_INFINITY;
+    const rb = b.priorityRank ?? Number.POSITIVE_INFINITY;
+    if (ra !== rb) return ra - rb;
+
     const da = dueMs(a.requiredDate);
     const db = dueMs(b.requiredDate);
     if (da == null && db == null) return a.orderId - b.orderId;

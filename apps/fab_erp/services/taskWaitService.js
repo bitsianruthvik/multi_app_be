@@ -1,11 +1,11 @@
 // taskWaitService.js — EU-7: working-hours wait-time + blocked-vs-idle computation.
 //
-// NOTE: this module and capacityService.js::getCapacity() implement the calendar
-// date-walk SEPARATELY and have drifted — capacityService buckets whole-shift
-// working_minutes and does not carve the unpaid break (added here 2026-08-04), and
-// as of 2026-08-05 the two disagree on fab_calendar_days semantics (below). Treat
-// this file as authoritative for attribution; the durable fix is to have
-// capacityService call collectWorkingIntervals() rather than keep a second copy.
+// This module owns the calendar date-walk. A second, drifted implementation
+// lived in capacityService.js — it bucketed whole shifts, never carved the
+// unpaid break, resolved calendars by plant alone, and read fab_calendar_days
+// with the opposite polarity. It was deleted 2026-08-05: nothing imported it,
+// and its own two queries named tables (fab_resource_assignments,
+// fab_planned_operations) that have never existed in any environment.
 //
 //   RESOURCE ↔ CALENDAR RESOLUTION (see resolveTaskCalendarIds)
 //   ───────────────────────────────────────────────────────────────────────────
@@ -19,8 +19,7 @@
 //   ResourceTypes.tsx and the resource import and MachineTimeline.tsx already read
 //   it, but this service resolved by plant alone — so a machine explicitly put on
 //   its own calendar was still attributed against every calendar its plant had,
-//   and the frontend and backend disagreed. capacityService.js still resolves by
-//   plant only and has NOT been updated; see the drift note above.
+//   and the frontend and backend disagreed.
 //
 //   fab_calendar_days IS AN EXCEPTION LIST (changed 2026-08-05)
 //   ───────────────────────────────────────────────────────────────────────────
@@ -43,7 +42,7 @@
 //   contributes 0 minutes, so a zero-minute shift still reads as non-working
 //   without special-casing.
 //
-// GRANULARITY: unlike capacityService (which buckets whole-day/whole-shift minutes),
+// GRANULARITY: rather than bucketing whole-day or whole-shift minutes,
 // this service needs partial-day precision (e.g. "Friday 4pm" or "Monday 10am"), so
 // for each working day we intersect each shift's wall-clock interval with the
 // requested window and sum the overlap in minutes, rather than crediting the
@@ -59,7 +58,7 @@
 
 import { pool } from '../../../db.js';
 
-// ─── date/time helpers (same conventions as capacityService.js) ───────────────
+// ─── date/time helpers ───────────────────────────────────────────────────────
 
 function toYMD(d) {
   return d.toISOString().slice(0, 10);
@@ -229,7 +228,7 @@ export async function resolveTaskCalendarIds(companyId, task) {
 }
 
 /**
- * Resolve the in-scope shift calendars, mirroring capacityService's plant-wide
+ * Resolve the in-scope shift calendars, widening from the machine's own to its
  * model with a broad company-wide fallback when the plant can't pin down a
  * calendar. `explicitCalendarId` — a machine's own calendar — wins when supplied
  * and still live; callers holding a task should prefer resolveTaskCalendarIds().
@@ -258,12 +257,12 @@ export async function resolveCalendarIds(companyId, plantId, explicitCalendarId 
   return rows.map(r => r.id);
 }
 
-// ─── calendar date-walk (mirrors capacityService's steps 3-4) ─────────────────
+// ─── calendar date-walk ──────────────────────────────────────────────────────
 
 /**
- * Load shifts + calendar-day rows for the given calendars/date range, in the same
- * shape capacityService builds them in (shiftRows + per-calendar working-day sets),
- * but keeping shift start/end times for the partial-day overlap math above.
+ * Load shifts + calendar-day rows for the given calendars/date range as
+ * shiftRows plus per-calendar working-day sets, keeping shift start/end times
+ * for the partial-day overlap math above.
  */
 async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
   if (calendarIds.length === 0) {
@@ -307,9 +306,8 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
 
 /**
  * Shared day-walk: collect the raw per-shift wall-clock overlap intervals that
- * fall inside [windowStart, windowEnd]. Walks every date the window touches (like
- * capacityService's date-walk) and applies the working-day fallback described at
- * the top of this file. Intervals are returned un-merged (one per shift/day
+ * fall inside [windowStart, windowEnd]. Walks every date the window touches and
+ * applies the working-day fallback described at the top of this file. Intervals are returned un-merged (one per shift/day
  * overlap) — callers either sum their durations (working-minutes) or merge them
  * into a union of in-shift time (working-intervals). Factored out so both public
  * consumers below share exactly one copy of the calendar logic.
@@ -364,7 +362,7 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
  * pre-refactor implementation — overlapping calendars/shifts are summed, not
  * de-duplicated, so callers relying on the historical number are unaffected).
  */
-async function workingMinutesInWindow(companyId, calendarIds, windowStart, windowEnd) {
+export async function workingMinutesInWindow(companyId, calendarIds, windowStart, windowEnd) {
   const intervals = await collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd);
   let totalMinutes = 0;
   for (const iv of intervals) {
