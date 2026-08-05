@@ -25,16 +25,6 @@
 import { pool } from '../../../db.js';
 import { tryClearTask } from './taskGatingService.js';
 
-// BUG-03: order statuses that are "before production" and may be advanced to
-// 'in_production' once work starts. Manual/terminal statuses (shipped, closed,
-// cancelled, completed) are never overwritten by the rollup.
-const PRE_PRODUCTION_STATUSES = new Set([
-  'draft', 'confirmed', 'approved', 'released', 'scheduled', 'scheduled_late', 'planned',
-]);
-const TERMINAL_ORDER_STATUSES = new Set([
-  'completed', 'shipped', 'closed', 'received', 'converted', 'cancelled',
-]);
-
 // Sales-order lifecycle (Project Progress feature, 2026-07-24): automation moves
 // an order forward through these ranks only. materialized(tasks exist)→scheduled,
 // any task started→in_production, all done→ready_to_ship (the automation ceiling
@@ -46,11 +36,13 @@ const SALES_STATUS_RANK = {
 };
 
 /**
- * BUG-03: roll task-status aggregates up to the order's lifecycle status.
- *   - all tasks done (≥1 task)        → 'completed'
- *   - any task started/done otherwise → 'in_production' (only from a pre-production status)
- * Never moves an order backwards and never overwrites a manual/terminal status.
- * Best-effort: swallows its own errors so it can never fail a lifecycle write.
+ * Roll task-status aggregates up to the order's lifecycle status.
+ *   - tasks exist, none started       → 'scheduled'
+ *   - any task started or done        → 'in_production'
+ *   - all tasks done (≥1 task)        → 'ready_to_ship'
+ * Forward-only by rank, so a manual shipped/closed or a cancellation is never
+ * overwritten. Best-effort: swallows its own errors so it can never fail a
+ * lifecycle write.
  *
  * @param {import('mysql2/promise').Connection|import('mysql2/promise').Pool} exec
  */
@@ -58,7 +50,7 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
   if (!orderId) return;
   try {
     const [[order]] = await exec.query(
-      `SELECT status, order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      `SELECT status FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
       [orderId, companyId],
     );
     if (!order) return;
@@ -89,40 +81,28 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
 
     if (total === 0) return;
 
-    // Sales-order lifecycle automation (2026-07-24): materialized→scheduled,
-    // started→in_production, all done→ready_to_ship. Forward-only by rank, so a
-    // manual shipped/closed (higher rank) or cancelled is never overwritten.
-    if (order.order_type === 'sales') {
-      if (order.status === 'cancelled') return;
-      let salesTarget;
-      if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
-      else if (done > 0 || active > 0) salesTarget = 'in_production';
-      else salesTarget = 'scheduled'; // tasks exist, none started yet
-      const curRank = SALES_STATUS_RANK[order.status];
-      const tgtRank = SALES_STATUS_RANK[salesTarget];
-      if (curRank == null) return; // custom/unknown status — leave it to the user
-      if (tgtRank > curRank) {
-        await exec.query(
-          `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-          [salesTarget, orderId, companyId],
-        );
-      }
-      return;
+    // Lifecycle automation: materialized→scheduled, started→in_production,
+    // all done→ready_to_ship. Forward-only by rank, so a manual shipped/closed
+    // (higher rank) or cancelled is never overwritten.
+    //
+    // A second branch used to sit below this one for non-sales orders, driven by
+    // PRE_PRODUCTION_STATUSES and TERMINAL_ORDER_STATUSES. Order types collapsed
+    // to sales only on 2026-08-05, so it became unreachable and both sets went
+    // with it.
+    if (order.status === 'cancelled') return;
+    let salesTarget;
+    if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
+    else if (done > 0 || active > 0) salesTarget = 'in_production';
+    else salesTarget = 'scheduled'; // tasks exist, none started yet
+    const curRank = SALES_STATUS_RANK[order.status];
+    const tgtRank = SALES_STATUS_RANK[salesTarget];
+    if (curRank == null) return; // custom/unknown status — leave it to the user
+    if (tgtRank > curRank) {
+      await exec.query(
+        `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+        [salesTarget, orderId, companyId],
+      );
     }
-
-    // BUG-03: non-sales advance — never overwrites a terminal/manual status, never backwards.
-    if (TERMINAL_ORDER_STATUSES.has(order.status)) return;
-    let target = null;
-    if (remaining === 0 && done > 0) target = 'completed';
-    else if (done > 0 || active > 0) target = 'in_production';
-    if (!target || target === order.status) return;
-    // Only advance to in_production from a genuine pre-production status.
-    if (target === 'in_production' && !PRE_PRODUCTION_STATUSES.has(order.status)) return;
-
-    await exec.query(
-      `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [target, orderId, companyId],
-    );
   } catch (err) {
     // Never let a status rollup break the task lifecycle.
     // eslint-disable-next-line no-console
