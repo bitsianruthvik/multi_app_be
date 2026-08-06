@@ -164,7 +164,11 @@ export async function crewIntervals(companyId, resourceId, windowStart, windowEn
     `SELECT a.worker_id AS workerId, a.from_ts AS aFrom, a.to_ts AS aTo,
             ws.shift_id AS shiftId, ws.from_ts AS sFrom, ws.to_ts AS sTo
        FROM fab_worker_assignments a
-       JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL AND w.active = 1
+       -- No active-flag filter: exit closes the assignment, so a leaver has no
+       -- open interval to contribute. Filtering on the flag as well would erase
+       -- them from HISTORICAL windows too, where they really were on the machine
+       -- — and this same query answers "what capacity did we have last Tuesday".
+       JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
        JOIN fab_worker_shifts ws
               ON ws.worker_id = a.worker_id AND ws.company_id = a.company_id
              AND ws.deleted_at IS NULL AND ws.superseded_by_id IS NULL

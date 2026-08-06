@@ -2559,3 +2559,45 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- No seed. Setting a zone changes what every existing shift MEANS, so it is a
 -- deliberate per-site decision, not something a migration should guess — and
 -- guessing wrong would silently move every historical attribution number.
+
+-- Leaving the firm (2026-08-06) ------------------------------------------
+-- exited_at is the INSTANT somebody left. active alone could not say when, and
+-- setting it did nothing to their open intervals -- so the machine kept crew
+-- that had left (phantom crew for no_operator, and for capacity under
+-- capacity_mode=crew). Exit now CLOSES the open assignment/shift at this
+-- instant, which is also why no interval query filters active=1 any more: a
+-- present-tense flag cannot answer a question about the past, and somebody who
+-- left in March really was on that machine in February.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_workers'
+              AND COLUMN_NAME  = 'exited_at');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_workers ADD COLUMN exited_at DATETIME NULL COMMENT 'When they left the firm. NULL = still here. Backdatable, because resignations are reported after the fact. Open intervals are closed at this instant.'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Any pre-existing deactivation predates the exit instant. Stamp one so the
+-- column is never NULL-while-inactive, which would read as "still here" to
+-- anything that trusts exited_at alone. updated_at is the closest thing to a
+-- deactivation time that exists on these rows.
+UPDATE fab_workers
+   SET exited_at = COALESCE(updated_at, created_at)
+ WHERE active = 0 AND exited_at IS NULL AND deleted_at IS NULL;
+
+-- Close any open interval left behind by a deactivation that happened before
+-- this migration — the phantom crew described above. Bounded to inactive
+-- workers, so an active roster is untouched.
+UPDATE fab_worker_assignments a
+  JOIN fab_workers w ON w.id = a.worker_id
+   SET a.to_ts = w.exited_at
+ WHERE w.active = 0 AND w.exited_at IS NOT NULL AND w.deleted_at IS NULL
+   AND a.kind = 'assigned' AND a.to_ts IS NULL
+   AND a.deleted_at IS NULL AND a.superseded_by_id IS NULL;
+
+UPDATE fab_worker_shifts s
+  JOIN fab_workers w ON w.id = s.worker_id
+   SET s.to_ts = w.exited_at
+ WHERE w.active = 0 AND w.exited_at IS NOT NULL AND w.deleted_at IS NULL
+   AND s.to_ts IS NULL
+   AND s.deleted_at IS NULL AND s.superseded_by_id IS NULL;

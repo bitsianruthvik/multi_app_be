@@ -268,6 +268,94 @@ export async function removeInterval(companyId, id) {
   return { removed: res.affectedRows, was: row };
 }
 
+// ─── leaving, and coming back ────────────────────────────────────────────────
+
+/**
+ * Record that somebody has left the firm, as of `at`.
+ *
+ * Leaving is NOT a long absence and must not be modelled as one: an open-ended
+ * `away` would keep them on the roster forever, still in crew pickers, with
+ * their machine assignment never closing.
+ *
+ * Closing the intervals is what makes this correct rather than the `active`
+ * flag. A present-tense flag cannot answer a question about the past —
+ * somebody who left in March WAS on that machine in February — so history stays
+ * true because the intervals record when they stopped, not because a filter
+ * hides them. That is why `active = 1` no longer appears in any interval query.
+ *
+ * Backdatable, because resignations are reported after the fact.
+ */
+export async function exitWorker(companyId, { workerId, at, note, enteredBy }) {
+  const when = toSqlUtc(at ?? new Date());
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[worker]] = await conn.query(
+      `SELECT id, name FROM fab_workers
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL FOR UPDATE`,
+      [workerId, companyId],
+    );
+    if (!worker) { await conn.rollback(); return { ok: false, reason: 'not_found' }; }
+
+    await conn.query(
+      `UPDATE fab_workers SET active = 0, exited_at = ? WHERE id = ? AND company_id = ?`,
+      [when, workerId, companyId],
+    );
+
+    // Close, don't delete. An interval that ran until they left is the truth
+    // about that period and every historical number depends on it.
+    const [asg] = await conn.query(
+      `UPDATE fab_worker_assignments SET to_ts = ?, note = COALESCE(note, ?)
+        WHERE company_id = ? AND worker_id = ? AND kind = 'assigned'
+          AND to_ts IS NULL AND deleted_at IS NULL AND superseded_by_id IS NULL`,
+      [when, note ?? 'closed on exit', companyId, workerId],
+    );
+    const [shf] = await conn.query(
+      `UPDATE fab_worker_shifts SET to_ts = ?
+        WHERE company_id = ? AND worker_id = ?
+          AND to_ts IS NULL AND deleted_at IS NULL AND superseded_by_id IS NULL`,
+      [when, companyId, workerId],
+    );
+    // An open `away` is closed too — you cannot be on leave from a job you left.
+    await conn.query(
+      `UPDATE fab_worker_assignments SET to_ts = ?
+        WHERE company_id = ? AND worker_id = ? AND kind = 'away'
+          AND to_ts IS NULL AND deleted_at IS NULL AND superseded_by_id IS NULL`,
+      [when, companyId, workerId],
+    );
+
+    await conn.commit();
+    return {
+      ok: true, name: worker.name, exitedAt: when,
+      assignmentsClosed: asg.affectedRows, shiftsClosed: shf.affectedRows,
+      enteredBy: enteredBy ?? null,
+    };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * They rejoined. Clears the exit and puts them back on the roster.
+ *
+ * Deliberately does NOT reopen the old intervals. Those record the first stint
+ * and reopening them would claim they never left; the new stint starts from a
+ * fresh assignment, which is also the only reading under which the gap between
+ * the two is honest.
+ */
+export async function reactivateWorker(companyId, workerId) {
+  const [res] = await pool.query(
+    `UPDATE fab_workers SET active = 1, exited_at = NULL
+      WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+    [workerId, companyId],
+  );
+  return { ok: res.affectedRows > 0 };
+}
+
 // ─── the busy rule ───────────────────────────────────────────────────────────
 
 /**
@@ -535,7 +623,11 @@ export async function crewCoverageGaps(companyId, { from, to, onlyWithWork = fal
       WHERE r.company_id = ? AND r.deleted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM fab_worker_assignments a
-            JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL AND w.active = 1
+            -- No active-flag filter here. Exit closes the interval, so somebody
+            -- who left has no open assignment to find; filtering on the flag as
+            -- well would additionally hide them from historical windows, where
+            -- they genuinely were on the machine.
+            JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
            WHERE a.company_id = r.company_id AND a.resource_id = r.id
              AND a.kind = 'assigned' AND a.deleted_at IS NULL AND a.superseded_by_id IS NULL
              AND a.from_ts < ? AND (a.to_ts IS NULL OR a.to_ts > ?)

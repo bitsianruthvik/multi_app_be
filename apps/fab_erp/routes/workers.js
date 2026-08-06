@@ -13,6 +13,8 @@
  *   POST   /workers/:id/assign           put them on a machine (moves them if already on another)
  *   POST   /workers/:id/unassign         take them off
  *   POST   /workers/:id/away             record time away (an hour, a day, a week)
+ *   POST   /workers/:id/exit             they left the firm — closes their open intervals
+ *   POST   /workers/:id/reactivate       they rejoined
  *   DELETE /worker-intervals/:id         withdraw an interval entered by mistake
  *
  * Permission: reads need `fab_erp_machine_state_manage` (the same tag that
@@ -31,6 +33,7 @@ import { logger } from '../../../core/utils/logger.js';
 import {
   crewForWindow, assignWorker, unassignWorker, setAway, removeInterval,
   resourcesTouchedByWorker, crewCoverageGaps, assignShift, workerDetail,
+  exitWorker, reactivateWorker,
 } from '../services/workerService.js';
 import { recomputeForResourceWindow } from '../services/taskAttributionService.js';
 import {
@@ -105,10 +108,13 @@ router.get('/workers', protect, async (req, res) => {
     // The whole roster, each with where they currently are.
     const [workers] = await pool.query(
       `SELECT w.id, w.name, w.code, w.worker_type AS workerType, w.vendor_name AS vendorName,
-              w.user_id AS userId, w.phone, w.active,
+              w.user_id AS userId, w.phone, w.active, w.exited_at AS exitedAt,
               a.resource_id AS currentResourceId, r.name AS currentResourceName,
               ws.shift_id AS currentShiftId, sh.name AS currentShiftName,
-              sh.start_time AS currentShiftStart, sh.end_time AS currentShiftEnd
+              sh.start_time AS currentShiftStart, sh.end_time AS currentShiftEnd,
+              -- The away interval covering right now, if any. Drives the row's
+              -- status without a second round trip per person.
+              aw.from_ts AS awayFrom, aw.to_ts AS awayTo, aw.reason AS awayReason
          FROM fab_workers w
          LEFT JOIN fab_worker_assignments a
                 ON a.worker_id = w.id AND a.kind = 'assigned'
@@ -118,6 +124,11 @@ router.get('/workers', protect, async (req, res) => {
                 ON ws.worker_id = w.id AND ws.deleted_at IS NULL
                AND ws.superseded_by_id IS NULL AND ws.to_ts IS NULL
          LEFT JOIN fab_shifts sh ON sh.id = ws.shift_id AND sh.deleted_at IS NULL
+         LEFT JOIN fab_worker_assignments aw
+                ON aw.worker_id = w.id AND aw.kind = 'away'
+               AND aw.deleted_at IS NULL AND aw.superseded_by_id IS NULL
+               AND aw.from_ts <= UTC_TIMESTAMP()
+               AND (aw.to_ts IS NULL OR aw.to_ts > UTC_TIMESTAMP())
         WHERE w.company_id = ? AND w.deleted_at IS NULL
         ORDER BY w.active DESC, w.name ASC`,
       [companyId],
@@ -388,6 +399,49 @@ router.post('/workers/:id/shift', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, workerId }, 'fab_erp workers: shift assign failed');
     return res.status(500).json({ message: 'Failed to set the shift.' });
+  }
+});
+
+// ── POST /workers/:id/exit  and  /reactivate ─────────────────────────────────
+// Leaving the firm, as its own act. Not an `away` interval: an open-ended
+// absence would keep somebody on the roster forever with their machine
+// assignment never closing. Reversible, because people rejoin.
+
+router.post('/workers/:id/exit', protect, async (req, res) => {
+  if (!requirePerm(req, res)) return;
+  const companyId = req.user.companyId;
+  const workerId = Number(req.params.id);
+  if (!(workerId > 0)) return res.status(400).json({ message: 'A valid worker id is required.' });
+
+  const at = req.body?.at ? new Date(req.body.at) : new Date();
+  if (Number.isNaN(at.getTime())) return res.status(400).json({ message: '"at" is not a valid time.' });
+
+  try {
+    const out = await exitWorker(companyId, { workerId, at, note: req.body?.note, enteredBy: req.user.id });
+    if (!out.ok) return res.status(404).json({ message: 'Worker not found.' });
+    // Their assignment just closed, so every machine they were on loses crew
+    // from this instant — re-derive attribution over the affected span.
+    recomputeAfterRosterChange(companyId, workerId, at);
+    return res.json({ ok: true, ...out });
+  } catch (err) {
+    logger.error({ err, companyId, workerId }, 'fab_erp workers: exit failed');
+    return res.status(500).json({ message: 'Failed to record the exit.' });
+  }
+});
+
+router.post('/workers/:id/reactivate', protect, async (req, res) => {
+  if (!requirePerm(req, res)) return;
+  const workerId = Number(req.params.id);
+  if (!(workerId > 0)) return res.status(400).json({ message: 'A valid worker id is required.' });
+  try {
+    const out = await reactivateWorker(req.user.companyId, workerId);
+    if (!out.ok) return res.status(404).json({ message: 'Worker not found.' });
+    // No recompute: reactivating opens no interval, so nothing about any past
+    // or present window has changed yet. Putting them back on a machine does.
+    return res.json({ ok: true });
+  } catch (err) {
+    logger.error({ err, workerId }, 'fab_erp workers: reactivate failed');
+    return res.status(500).json({ message: 'Failed to reactivate.' });
   }
 });
 
