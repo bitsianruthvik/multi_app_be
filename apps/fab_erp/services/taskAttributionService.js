@@ -52,6 +52,7 @@ import {
 } from './taskWaitService.js';
 import { processPredecessorsDone, isOutputBlocked } from './taskGatingService.js';
 import { resolveCapacity, capacityIntervals } from './capacityService.js';
+import { reasonCatalogue } from './gapReasons.js';
 import { crewForWindow, coveredIntervals } from './workerService.js';
 
 // ─── pure interval helpers (over [{start:Date,end:Date}] lists) ───────────────
@@ -154,6 +155,59 @@ async function loadMachineDownIntervals(companyId, resourceId, now) {
  * otherwise would reclassify the entire history of every machine that hasn't
  * been rostered yet, which is most of them.
  */
+/**
+ * Site-wide stoppages covering this machine's plant — rain, a power cut, a
+ * shutdown. One `fab_plant_events` row covers every machine at the plant, which
+ * is the whole reason the scope exists: entering rain once beats entering it
+ * nine times, and a yard that stopped for weather did not stop nine times.
+ */
+async function loadPlantEventIntervals(companyId, resourceId, windowStart, windowEnd, now) {
+  if (!resourceId) return [];
+  const [rows] = await pool.query(
+    `SELECT pe.from_ts AS fromTs, pe.to_ts AS toTs
+       FROM fab_plant_events pe
+       JOIN fab_resources r ON r.plant_id = pe.plant_id AND r.id = ?
+      WHERE pe.company_id = ? AND pe.deleted_at IS NULL AND pe.superseded_by_id IS NULL
+        AND pe.from_ts < ? AND (pe.to_ts IS NULL OR pe.to_ts > ?)`,
+    [resourceId, companyId, windowEnd, windowStart],
+  );
+  return mergeIntervals(rows.map((r) => ({
+    start: new Date(r.fromTs), end: r.toTs ? new Date(r.toTs) : now,
+  })));
+}
+
+/**
+ * Holds on THIS task — an inspection, a drawing revision, a customer stop.
+ *
+ * Returned grouped by the wait reason the hold's code maps to, because
+ * `waiting_inspection` and `drawing_hold` are separate causes with very
+ * different remedies, and flattening them would lose exactly the distinction
+ * that makes the number worth having.
+ */
+async function loadTaskHoldIntervals(companyId, taskId, windowStart, windowEnd, now, catalogue) {
+  const [rows] = await pool.query(
+    `SELECT hold_code AS code, from_ts AS fromTs, to_ts AS toTs
+       FROM fab_task_holds
+      WHERE company_id = ? AND task_id = ? AND deleted_at IS NULL
+        AND superseded_by_id IS NULL
+        AND from_ts < ? AND (to_ts IS NULL OR to_ts > ?)`,
+    [companyId, taskId, windowEnd, windowStart],
+  );
+  const byReason = new Map();
+  for (const r of rows) {
+    // An unknown code (a reason deleted after the hold was written) must not
+    // silently vanish — it still explains real time, so it lands in the
+    // explained bucket rather than falling back to unexplained_idle.
+    const reason = catalogue.get(r.code) ?? 'other_explained';
+    if (!byReason.has(reason)) byReason.set(reason, []);
+    byReason.get(reason).push({
+      start: new Date(r.fromTs), end: r.toTs ? new Date(r.toTs) : now,
+    });
+  }
+  for (const [k, v] of byReason) byReason.set(k, mergeIntervals(v));
+  return byReason;
+}
+
 async function loadNoOperatorIntervals(companyId, resourceId, windowStart, windowEnd) {
   const crew = await crewForWindow(pool, companyId, resourceId, windowStart, windowEnd);
   if (crew.length === 0) return [];
@@ -270,10 +324,21 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
 
     let machineDown = [];
     let noOperator = [];
+    let plantStopped = [];
     if (task.assigned_resource_id) {
       machineDown = await loadMachineDownIntervals(companyId, task.assigned_resource_id, now);
       noOperator = await loadNoOperatorIntervals(companyId, task.assigned_resource_id, spanStart, spanEnd);
+      plantStopped = await loadPlantEventIntervals(companyId, task.assigned_resource_id, spanStart, spanEnd, now);
     }
+
+    // Holds follow the JOB, not the machine — an inspection applies wherever the
+    // piece is sitting — so this is loaded regardless of resource assignment.
+    // The catalogue maps each site's own hold codes onto the wait reasons the
+    // engine understands.
+    const reasonMap = new Map(
+      (await reasonCatalogue(companyId)).map((r) => [r.code, r.waitReason]),
+    );
+    const holds = await loadTaskHoldIntervals(companyId, taskId, spanStart, spanEnd, now, reasonMap);
     const machineBusy = mergeIntervals(
       await fetchOverlappingOtherTasks(companyId, task, spanStart, spanEnd, now),
     );
@@ -299,22 +364,37 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
       }
 
       let remaining = inShift;
-      // 2. machine_down
-      const downHit = intersectIntervals(remaining, machineDown);
-      for (const iv of downHit) segments.push(inShiftSeg('machine_down', iv));
-      remaining = subtractIntervals(remaining, downHit);
-      // 3. no_operator
-      const opHit = intersectIntervals(remaining, noOperator);
-      for (const iv of opHit) segments.push(inShiftSeg('no_operator', iv));
-      remaining = subtractIntervals(remaining, opHit);
-      // 4. machine_busy
-      const busyHit = intersectIntervals(remaining, machineBusy);
-      for (const iv of busyHit) segments.push(inShiftSeg('machine_busy', iv));
-      remaining = subtractIntervals(remaining, busyHit);
-      // 5. output_blocked — only the still-open tail (interval ending at `now`)
+
+      // ── ASSERTED CAUSES FIRST (2-6) ────────────────────────────────────────
+      // Somebody with knowledge said this is what happened; everything below is
+      // the engine inferring from absence of evidence.
+      //
+      // This ordering is load-bearing. A girder waiting on a client inspector
+      // ALSO has no operator standing at it and its machine ALSO looks free.
+      // All three are true, but only the inspection is the binding constraint —
+      // no amount of staffing fixes it. Ranking `no_operator` above it would
+      // blame your own people for the client's delay, which is precisely the
+      // misreading this whole mechanism exists to prevent.
+      const carve = (reason, source) => {
+        const hit = intersectIntervals(remaining, source);
+        for (const iv of hit) segments.push(inShiftSeg(reason, iv));
+        remaining = subtractIntervals(remaining, hit);
+      };
+
+      carve('weather', plantStopped);              // 2. site-scope, asserted
+      carve('machine_down', machineDown);          // 3. machine-scope, asserted
+      carve('waiting_inspection', holds.get('waiting_inspection') ?? []);  // 4.
+      carve('drawing_hold', holds.get('drawing_hold') ?? []);              // 5.
+      carve('other_explained', holds.get('other_explained') ?? []);        // 6.
+
+      // ── DERIVED CAUSES (7-9) ───────────────────────────────────────────────
+      carve('no_operator', noOperator);            // 7.
+      carve('machine_busy', machineBusy);          // 8.
+      // 9. output_blocked — only the still-open tail (interval ending at `now`)
       //    when the task is output-blocked right now (see SIMPLIFICATION above).
       //    Everything else remains unexplained_idle.
-      // 6. unexplained_idle — whatever in-shift time is left.
+      // 10. unexplained_idle — whatever in-shift time is left. This is the
+      //     number the gap-capture mechanism exists to drive down.
       for (const iv of remaining) {
         const openTail = blockedNow && iv.end.getTime() === now.getTime();
         segments.push(inShiftSeg(openTail ? 'output_blocked' : 'unexplained_idle', iv));

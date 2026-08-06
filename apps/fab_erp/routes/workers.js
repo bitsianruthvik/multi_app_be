@@ -39,6 +39,14 @@ import { recomputeForResourceWindow } from '../services/taskAttributionService.j
 import {
   capacityMode, setCapacityMode, CAPACITY_CREW, CAPACITY_CALENDAR,
 } from '../services/capacityService.js';
+import { timezoneForWorker, zonedWallClockToUtc } from '../services/plantTime.js';
+
+/** Shift a 'YYYY-MM-DD' by whole days, without touching the local clock. */
+function addDays(ymd, n) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
 
 const router = Router();
 const upload = multer({ dest: path.join(process.cwd(), 'tmp') });
@@ -525,16 +533,56 @@ router.post('/workers/:id/away', protect, async (req, res) => {
   const workerId = Number(req.params.id);
   if (!(workerId > 0)) return res.status(400).json({ message: 'A valid worker id is required.' });
 
-  const from = req.body?.from ? new Date(req.body.from) : null;
-  if (!from || Number.isNaN(from.getTime())) {
-    return res.status(400).json({ message: 'A valid "from" time is required.' });
-  }
+  // Two input shapes.
+  //
+  //   { date, fromTime, toTime }  wall clock AT THE SITE — resolved through the
+  //                               worker's plant timezone. Preferred.
+  //   { from, to }                absolute instants. Kept for existing callers
+  //                               (Shift Log, CrewPanel) and for anything that
+  //                               genuinely knows the instant.
+  //
+  // The first exists because times typed on the People screen are what the board
+  // says, not what the supervisor's laptop clock says. Resolving them in the
+  // BROWSER's zone is right only while whoever is typing sits in the same
+  // country as the plant — an assumption that fails silently, by the offset.
+  let from = null;
   let to = null;
-  if (req.body?.to) {
-    to = new Date(req.body.to);
-    if (Number.isNaN(to.getTime())) return res.status(400).json({ message: '"to" is not a valid time.' });
-    if (to <= from) return res.status(400).json({ message: '"to" must be after "from".' });
+
+  if (req.body?.date && req.body?.fromTime) {
+    const tz = await timezoneForWorker(companyId, workerId);
+    const date = String(req.body.date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ message: 'date must be YYYY-MM-DD.' });
+    }
+    const norm = (t) => (/^\d{2}:\d{2}$/.test(String(t)) ? `${t}:00` : String(t));
+    from = zonedWallClockToUtc(date, norm(req.body.fromTime), tz);
+    if (!from) return res.status(400).json({ message: 'fromTime is not a valid time.' });
+
+    if (req.body?.toTime) {
+      to = zonedWallClockToUtc(date, norm(req.body.toTime), tz);
+      if (!to) return res.status(400).json({ message: 'toTime is not a valid time.' });
+      // Runs past midnight (a night shift's second half) — it ends the next day.
+      if (to <= from) to = zonedWallClockToUtc(addDays(date, 1), norm(req.body.toTime), tz);
+    } else if (req.body?.toDate) {
+      // Whole days: ends at the START of the day after the last day off, so
+      // "10th to 12th" covers all of the 12th.
+      const last = String(req.body.toDate);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(last)) {
+        return res.status(400).json({ message: 'toDate must be YYYY-MM-DD.' });
+      }
+      to = zonedWallClockToUtc(addDays(last, 1), '00:00:00', tz);
+    }
+  } else {
+    from = req.body?.from ? new Date(req.body.from) : null;
+    if (!from || Number.isNaN(from.getTime())) {
+      return res.status(400).json({ message: 'A valid "from" time is required.' });
+    }
+    if (req.body?.to) {
+      to = new Date(req.body.to);
+      if (Number.isNaN(to.getTime())) return res.status(400).json({ message: '"to" is not a valid time.' });
+    }
   }
+  if (to && to <= from) return res.status(400).json({ message: 'The end must be after the start.' });
 
   try {
     const out = await setAway(companyId, {

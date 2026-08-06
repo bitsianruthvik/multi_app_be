@@ -159,7 +159,8 @@ async function findStuckBuffers(companyId, days) {
 async function findUnexplainedIdle(companyId, minutes) {
   const [rows] = await pool.query(
     `SELECT s.id AS segmentId, s.task_id AS taskId, s.seg_start AS segStart, s.seg_end AS segEnd,
-            s.working_minutes AS workingMinutes, op.name AS operationName, it.name AS itemName
+            s.working_minutes AS workingMinutes, op.name AS operationName, it.name AS itemName,
+            t.assigned_resource_id AS resourceId
        FROM fab_task_wait_segments s
        JOIN fab_project_tasks t ON t.id = s.task_id AND t.deleted_at IS NULL
        LEFT JOIN fab_operations op ON op.id = t.operation_id
@@ -177,6 +178,11 @@ async function findUnexplainedIdle(companyId, minutes) {
       type: 'unexplainedIdle',
       taskId: r.taskId,
       segmentId: r.segmentId,
+      // The machine and the LOCAL day this idle sits in, so the feed can open the
+      // gap table on exactly the sheet that explains it rather than making the
+      // user go and find the machine and date themselves.
+      resourceId: r.resourceId,
+      segStart: r.segStart,
       minutes: r.workingMinutes,
       label: `${what} — ${r.workingMinutes}m unexplained idle`,
       detail: r.itemName

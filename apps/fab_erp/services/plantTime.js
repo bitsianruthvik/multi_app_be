@@ -176,3 +176,47 @@ export async function calendarTimezones(companyId) {
 export function tzForCalendar(tzMap, calendarId) {
   return tzMap.get(Number(calendarId)) ?? tzMap.get('__default') ?? DEFAULT_TZ;
 }
+
+/**
+ * The zone a PERSON's times should be read in.
+ *
+ * Times typed into the People screen ("away 12:30–17:00") are wall clock at the
+ * site, not at whoever is holding the laptop. Resolving them in the browser's
+ * zone is only correct while the supervisor happens to sit in the same country
+ * as the plant — which is an assumption, not a fact, and silently wrong by the
+ * offset when it breaks.
+ *
+ * Widening: the plant behind their SHIFT's calendar (the shift is the thing the
+ * times relate to), then the plant of the machine they are assigned to, then the
+ * company default, then UTC.
+ */
+export async function timezoneForWorker(companyId, workerId) {
+  const tzMap = await calendarTimezones(companyId);
+  const fallback = tzMap.get('__default') ?? DEFAULT_TZ;
+  try {
+    const [[row]] = await pool.query(
+      `SELECT sh.calendar_id AS calendarId, rp.timezone AS resourcePlantTz
+         FROM fab_workers w
+         LEFT JOIN fab_worker_shifts ws
+                ON ws.worker_id = w.id AND ws.deleted_at IS NULL
+               AND ws.superseded_by_id IS NULL AND ws.to_ts IS NULL
+         LEFT JOIN fab_shifts sh ON sh.id = ws.shift_id AND sh.deleted_at IS NULL
+         LEFT JOIN fab_worker_assignments a
+                ON a.worker_id = w.id AND a.kind = 'assigned' AND a.deleted_at IS NULL
+               AND a.superseded_by_id IS NULL AND a.to_ts IS NULL
+         LEFT JOIN fab_resources r ON r.id = a.resource_id AND r.deleted_at IS NULL
+         LEFT JOIN fab_plants rp ON rp.id = r.plant_id AND rp.deleted_at IS NULL
+        WHERE w.id = ? AND w.company_id = ? AND w.deleted_at IS NULL
+        LIMIT 1`,
+      [workerId, companyId],
+    );
+    if (row?.calendarId != null) {
+      const viaShift = tzMap.get(Number(row.calendarId));
+      if (isValidTimeZone(viaShift)) return viaShift;
+    }
+    if (isValidTimeZone(row?.resourcePlantTz)) return row.resourcePlantTz;
+  } catch (err) {
+    logger.warn({ err, companyId, workerId }, 'plantTime: worker timezone lookup failed');
+  }
+  return fallback;
+}

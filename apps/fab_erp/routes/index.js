@@ -21,6 +21,7 @@ import pulseRouter       from './pulse.js';
 import marksRouter       from './marks.js';
 import shiftLogRouter    from './shiftLog.js';
 import workersRouter     from './workers.js';
+import gapsRouter        from './gaps.js';
 
 const router = Router();
 
@@ -48,5 +49,6 @@ router.use(pulseRouter);
 router.use(marksRouter);
 router.use(shiftLogRouter);
 router.use(workersRouter);
+router.use(gapsRouter);
 
 export default router;
