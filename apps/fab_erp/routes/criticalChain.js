@@ -395,7 +395,7 @@ router.get('/cc/alerts', protect, async (req, res) => {
          JOIN fab_orders o ON o.id = ds.order_id AND o.company_id = ds.company_id
         WHERE ds.company_id = ? AND ds.deleted_at IS NULL
           AND ds.planned_start IS NOT NULL
-          AND ds.planned_start BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 24 HOUR)`,
+          AND ds.planned_start BETWEEN UTC_TIMESTAMP() AND DATE_ADD(UTC_TIMESTAMP(), INTERVAL 24 HOUR)`,
       [companyId],
     );
     for (const s of slots) {

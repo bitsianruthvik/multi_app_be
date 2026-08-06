@@ -30,7 +30,7 @@ import { logger } from '../../../core/utils/logger.js';
  * @param {number} params.companyId
  * @param {number} params.taskId
  * @param {string} params.type - fab_task_events.event_type
- * @param {Date|string|null} [params.at] - defaults to NOW() in SQL when null
+ * @param {Date|string|null} [params.at] - defaults to UTC_TIMESTAMP() in SQL when null
  * @param {'live'|'backfill'|'system'} [params.source]
  * @param {number|null} [params.enteredBy]
  * @param {string|null} [params.note]
@@ -48,7 +48,7 @@ export async function recordEvent({
   try {
     await exec.query(
       `INSERT INTO fab_task_events (company_id, task_id, event_type, at, source, entered_by, note)
-       VALUES (?, ?, ?, COALESCE(?, NOW()), ?, ?, ?)`,
+       VALUES (?, ?, ?, COALESCE(?, UTC_TIMESTAMP()), ?, ?, ?)`,
       [companyId, taskId, type, at, source, enteredBy, note],
     );
     return { ok: true };
@@ -69,7 +69,7 @@ export async function recordEvents(events, exec = pool) {
     const placeholders = [];
     const params = [];
     for (const e of events) {
-      placeholders.push('(?, ?, ?, COALESCE(?, NOW()), ?, ?, ?)');
+      placeholders.push('(?, ?, ?, COALESCE(?, UTC_TIMESTAMP()), ?, ?, ?)');
       params.push(
         e.companyId,
         e.taskId,
@@ -105,7 +105,7 @@ export async function recordEvents(events, exec = pool) {
  * @param {object} params
  * @param {number} params.companyId
  * @param {number} params.oldEventId
- * @param {Date|string|null} params.newAt   corrected timestamp (COALESCE→NOW() if null)
+ * @param {Date|string|null} params.newAt   corrected timestamp (COALESCE→UTC_TIMESTAMP() if null)
  * @param {number|null} [params.enteredBy]
  * @param {string|null} [params.note]
  * @returns {Promise<{oldEventId:number, newEventId:number}>}
@@ -129,7 +129,7 @@ export async function supersedeEvent({ companyId, oldEventId, newAt, enteredBy =
 
     const [ins] = await conn.query(
       `INSERT INTO fab_task_events (company_id, task_id, event_type, at, source, entered_by, note)
-       VALUES (?, ?, ?, COALESCE(?, NOW()), 'backfill', ?, ?)`,
+       VALUES (?, ?, ?, COALESCE(?, UTC_TIMESTAMP()), 'backfill', ?, ?)`,
       [companyId, task_id, event_type, newAt, enteredBy, note],
     );
     const newEventId = ins.insertId;

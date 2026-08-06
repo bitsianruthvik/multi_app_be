@@ -22,9 +22,8 @@ import {
   loadResourceCapacity,
 } from './resourceLevelingService.js';
 import {
-  resolveTaskCalendarIds,
-  workingIntervalsInWindow,
 } from './taskWaitService.js';
+import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -75,8 +74,10 @@ function resourceKeyFor(task, cap) {
  * minutes) it degrades to a wall-clock add — the same optimistic 24/7 fallback EU-2
  * uses when no shift calendar resolves.
  */
-async function advanceWorkingMinutes(companyId, calendarIds, from, minutes) {
-  if (calendarIds.length === 0 || !(minutes > 0)) {
+async function advanceWorkingMinutes(companyId, cap, from, minutes) {
+  // isUnbounded() only ever true on the calendar path — crew mode must not treat
+  // an unmanned machine as 24/7 (FAB_ERP_PEOPLE_PLAN.md §6).
+  if (isUnbounded(cap) || !(minutes > 0)) {
     return new Date(from.getTime() + Math.max(0, minutes) * 60000);
   }
   let remaining = minutes;
@@ -89,7 +90,7 @@ async function advanceWorkingMinutes(companyId, calendarIds, from, minutes) {
       );
     }
     const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd);
+    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
     for (const iv of ivs) {
       const lenMin = (iv.end.getTime() - iv.start.getTime()) / 60000;
       if (remaining <= lenMin + 1e-9) {
@@ -329,9 +330,12 @@ export async function buildBaseline({ companyId, orderId, anchor } = {}) {
   let calendarFallback = false;
   if (aggressiveFinish) {
     const tailTask = taskById.get(tailCriticalId);
-    const calendarIds = await resolveTaskCalendarIds(companyId, tailTask);
-    calendarFallback = calendarIds.length === 0;
-    committedFinish = await advanceWorkingMinutes(companyId, calendarIds, aggressiveFinish, projectBufferMinutes);
+    const cap = await resolveCapacity(companyId, tailTask);
+    // "We had no working-time source and fell back to wall-clock." Only ever
+    // true on the calendar path — crew mode with no crew yields zero capacity
+    // rather than a 24/7 fallback, so it is a NoCapacityError, not a fallback.
+    calendarFallback = isUnbounded(cap);
+    committedFinish = await advanceWorkingMinutes(companyId, cap, aggressiveFinish, projectBufferMinutes);
   }
 
   // Snapshot the order's due date into the plan. The live fab_orders table (the

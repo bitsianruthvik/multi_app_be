@@ -90,7 +90,7 @@ async function findLongRunning(companyId) {
        LEFT JOIN fab_items it ON it.id = t.item_id
       WHERE t.company_id = ? AND t.status = 'in_progress' AND t.deleted_at IS NULL
         AND t.started_at IS NOT NULL
-        AND t.started_at < DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+        AND t.started_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)`,
     [companyId, LONG_RUNNING_HOURS],
   );
 
@@ -135,7 +135,7 @@ async function findStuckBuffers(companyId, days) {
        LEFT JOIN fab_resources r ON r.stock_location_id = sl.id AND r.deleted_at IS NULL
        LEFT JOIN fab_items it ON it.id = p.wip_item_id
       WHERE p.company_id = ? AND p.status = 'wip' AND p.deleted_at IS NULL
-        AND p.updated_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+        AND p.updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)`,
     [companyId, days],
   );
 

@@ -107,6 +107,24 @@ export const pool = mysql.createPool({
   // back a day for timezones east of UTC. DATETIME/TIMESTAMP are unaffected —
   // they represent real instants and serialize correctly as Date objects.
   dateStrings: ["DATE"],
+  // DATETIME columns are UTC wall-clock. Without this, mysql2 defaults to
+  // timezone:'local' and interprets every DATETIME it reads in the HOST's zone —
+  // while the app writes them via toISOString() (UTC). On a UTC host those agree
+  // and nothing is visibly wrong, which is why this survived: prod (Render +
+  // TiDB, both UTC) is self-consistent.
+  //
+  // On any other host they disagree by the offset, and the error COMPOUNDS on
+  // every read-modify-write: an interval corrected twice moved 08:00 → 02:30 →
+  // 21:00 on an IST machine. See FAB_ERP_PEOPLE_PLAN.md §10.3 / §10.3a.
+  //
+  // Pinning to 'Z' makes reads and writes agree on every host, and is a no-op
+  // wherever the server is already UTC.
+  //
+  // CAVEAT: MySQL's NOW() still evaluates in the SERVER's zone. On a non-UTC
+  // server, NOW()-written values are now read back shifted. fab_erp uses
+  // UTC_TIMESTAMP() instead (see fab_erp/routes, fab_erp/services); other apps
+  // still use NOW() and are only correct on a UTC server — which is what prod is.
+  timezone: "Z",
   ...(useSsl ? { ssl: { minVersion: "TLSv1.2", rejectUnauthorized: true } } : {}),
 });
 

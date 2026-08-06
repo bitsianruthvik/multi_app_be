@@ -133,7 +133,7 @@ router.get('/machines/board', protect, async (req, res) => {
          FROM fab_worker_assignments a
          JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
         WHERE a.company_id = ? AND a.kind = 'assigned' AND a.deleted_at IS NULL
-          AND a.from_ts <= NOW() AND (a.to_ts IS NULL OR a.to_ts > NOW())`,
+          AND a.from_ts <= UTC_TIMESTAMP() AND (a.to_ts IS NULL OR a.to_ts > UTC_TIMESTAMP())`,
       [companyId],
     );
 
@@ -141,7 +141,7 @@ router.get('/machines/board', protect, async (req, res) => {
       `SELECT worker_id AS workerId, reason
          FROM fab_worker_assignments
         WHERE company_id = ? AND kind = 'away' AND deleted_at IS NULL
-          AND from_ts <= NOW() AND (to_ts IS NULL OR to_ts > NOW())`,
+          AND from_ts <= UTC_TIMESTAMP() AND (to_ts IS NULL OR to_ts > UTC_TIMESTAMP())`,
       [companyId],
     );
 
@@ -377,7 +377,7 @@ router.post('/machines/:id/operator-absent', protect, async (req, res) => {
     if (clear === true) {
       await pool.query(
         `UPDATE fab_resource_operators
-            SET deleted_at = NOW()
+            SET deleted_at = UTC_TIMESTAMP()
           WHERE company_id = ? AND resource_id = ? AND user_id = ? AND absent_on = ? AND deleted_at IS NULL`,
         [companyId, resourceId, userId, absentOn],
       );

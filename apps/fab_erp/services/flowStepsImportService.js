@@ -183,7 +183,7 @@ export async function importFlowStepsExcel(file, flowId, companyId) {
     const rtByCode = new Map(resourceTypes.map((rt) => [rt.code.toLowerCase(), rt.id]));
 
     await conn.query(
-      'UPDATE fab_operation_flow_steps SET deleted_at = NOW() WHERE company_id = ? AND flow_id = ? AND deleted_at IS NULL',
+      'UPDATE fab_operation_flow_steps SET deleted_at = UTC_TIMESTAMP() WHERE company_id = ? AND flow_id = ? AND deleted_at IS NULL',
       [companyId, flowId],
     );
 

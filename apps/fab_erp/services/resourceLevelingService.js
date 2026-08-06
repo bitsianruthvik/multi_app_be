@@ -14,11 +14,9 @@
 // InWindow). Edge-building mirrors GET /tasks/graph exactly (see buildEdges).
 
 import { pool } from '../../../db.js';
-import {
-  resolveTaskCalendarIds,
-  workingIntervalsInWindow,
-} from './taskWaitService.js';
+import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 import { parseDependsOn } from './taskGatingService.js';
+import { NoCapacityError, NO_WORKING_TIME, NO_CREW_ASSIGNED, isNoCapacity } from './schedulingErrors.js';
 
 // ─── edge building (mirrors GET /tasks/graph) ─────────────────────────────────
 
@@ -167,20 +165,28 @@ const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
  * spirit as taskWaitService's empty-calendar fallback — so the engine still runs
  * in setups without a configured shift calendar.
  */
-async function nextWorkingInstant(companyId, calendarIds, from) {
-  if (calendarIds.length === 0) return new Date(from.getTime());
+async function nextWorkingInstant(companyId, cap, from) {
+  // Only the calendar path treats "no calendars" as 24/7. Crew mode never falls
+  // back — an unmanned machine has zero capacity, and pretending otherwise would
+  // schedule work onto a machine nobody is standing at.
+  if (isUnbounded(cap)) return new Date(from.getTime());
   let windowStart = new Date(from.getTime());
   let scanned = 0;
   while (scanned <= MAX_SCAN_MS) {
     const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd);
+    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
     if (ivs.length > 0) return new Date(ivs[0].start.getTime());
     windowStart = windowEnd;
     scanned += CHUNK_MS;
   }
-  throw new Error(
-    `resourceLevelingService: no working time found within ${MAX_SCAN_MS / 86400000} days after ${from.toISOString()} for calendars [${calendarIds.join(', ')}]`,
-  );
+  throw new NoCapacityError({
+    reason: NO_WORKING_TIME,
+    from,
+    scanDays: MAX_SCAN_MS / 86400000,
+    calendarIds: cap?.calendarIds ?? [],
+    resourceId: cap?.resourceId ?? null,
+    reason: cap?.mode === 'crew' ? NO_CREW_ASSIGNED : NO_WORKING_TIME,
+  });
 }
 
 /**
@@ -189,15 +195,15 @@ async function nextWorkingInstant(companyId, calendarIds, from) {
  * list of wall-clock in-shift intervals the task actually consumes (used for
  * concurrency checks). Walks the calendar in chunks via workingIntervalsInWindow.
  */
-async function computeSpan(companyId, calendarIds, from, durationMin) {
-  if (calendarIds.length === 0) {
+async function computeSpan(companyId, cap, from, durationMin) {
+  if (isUnbounded(cap)) {
     // 24/7 fallback: working minutes == wall-clock minutes.
     const start = new Date(from.getTime());
     const end = new Date(from.getTime() + Math.max(0, durationMin) * 60000);
     return { start, end, intervals: durationMin > 0 ? [{ start, end }] : [] };
   }
   if (!(durationMin > 0)) {
-    const inst = await nextWorkingInstant(companyId, calendarIds, from);
+    const inst = await nextWorkingInstant(companyId, cap, from);
     return { start: inst, end: new Date(inst.getTime()), intervals: [] };
   }
 
@@ -208,12 +214,15 @@ async function computeSpan(companyId, calendarIds, from, durationMin) {
   let scanned = 0;
   while (remaining > 1e-9) {
     if (scanned > MAX_SCAN_MS) {
-      throw new Error(
-        `resourceLevelingService: could not fit ${durationMin} working minutes within ${MAX_SCAN_MS / 86400000} days after ${from.toISOString()} for calendars [${calendarIds.join(', ')}]`,
-      );
+      throw new NoCapacityError({
+        reason: NO_WORKING_TIME,
+        from,
+        scanDays: MAX_SCAN_MS / 86400000,
+        calendarIds,
+      });
     }
     const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd);
+    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
     for (const iv of ivs) {
       if (started === null) started = new Date(iv.start.getTime());
       const lenMin = (iv.end.getTime() - iv.start.getTime()) / 60000;
@@ -229,7 +238,7 @@ async function computeSpan(companyId, calendarIds, from, durationMin) {
     scanned += CHUNK_MS;
   }
   // remaining <= 0 with no interval consumed: zero-length at the found start.
-  const inst = started ?? (await nextWorkingInstant(companyId, calendarIds, from));
+  const inst = started ?? (await nextWorkingInstant(companyId, cap, from));
   return { start: inst, end: new Date(inst.getTime()), intervals: occupied };
 }
 
@@ -337,19 +346,21 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
     );
   }
 
-  // ── per-task calendar resolution (cached by resource identity) ──────────────
-  // Keyed by resource, NOT by plant: a machine can carry its own
-  // shift_calendar_id, so two machines in the same plant may resolve to
-  // different calendars. A plant-keyed cache would hand the first machine's
-  // calendar to the second.
-  const calCache = new Map();    // resourceKey -> calendarIds
-  async function calendarIdsFor(task) {
-    if (Array.isArray(calendar)) return calendar;
+  // ── per-task capacity resolution (cached by resource identity) ─────────────
+  // Keyed by resource, NOT by plant: under calendar mode a machine can carry its
+  // own shift_calendar_id, and under crew mode the capacity IS that machine's
+  // crew — either way two machines in the same plant can differ, and a
+  // plant-keyed cache would hand the first machine's answer to the second.
+  const capCache = new Map();    // resourceKey -> capacity source
+  async function capacityFor(task) {
+    // An explicit `calendar` argument still forces the calendar path — callers
+    // pass it to schedule against a hypothetical calendar (what-if runs).
+    if (Array.isArray(calendar)) return { mode: 'calendar', resourceId: null, calendarIds: calendar };
     const rKey = `${task.assigned_resource_id ?? ''}|${task.resource_type_id ?? ''}`;
-    if (calCache.has(rKey)) return calCache.get(rKey);
-    const ids = await resolveTaskCalendarIds(companyId, task);
-    calCache.set(rKey, ids);
-    return ids;
+    if (capCache.has(rKey)) return capCache.get(rKey);
+    const resolved = await resolveCapacity(companyId, task);
+    capCache.set(rKey, resolved);
+    return resolved;
   }
 
   // ── forward pass ─────────────────────────────────────────────────────────────
@@ -364,13 +375,29 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
       if (p && p.end > earliest) earliest = p.end;
     }
 
-    const calendarIds = await calendarIdsFor(task);
+    const capSrc = await capacityFor(task);
     const { key, capacity } = resourceContext(task, cap);
+
+    // nextWorkingInstant/computeSpan know the calendars but not whose work it
+    // is. Naming the task and machine here is what turns "nothing schedulable
+    // in 366 days" into "Press-2 has no crew, so task 4812 cannot be placed" —
+    // the difference between a log line and something the floor can act on.
+    const withContext = async (fn) => {
+      try {
+        return await fn();
+      } catch (err) {
+        if (isNoCapacity(err)) {
+          err.taskId = task.id;
+          err.resourceId = task.assigned_resource_id ?? null;
+        }
+        throw err;
+      }
+    };
 
     let span;
     if (key === null || !(capacity < Infinity) || durationMin <= 0) {
       // Unconstrained (or zero-length): schedule at precedence-earliest.
-      span = await computeSpan(companyId, calendarIds, earliest, durationMin);
+      span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin));
     } else {
       const existing = resourceState.get(key) ?? [];
       // Candidate starts: the precedence-earliest instant, plus every existing
@@ -381,13 +408,13 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
       const candidates = [...new Set(candTimes)].sort((a, b) => a - b);
       span = null;
       for (const c of candidates) {
-        const s = await computeSpan(companyId, calendarIds, new Date(c), durationMin);
+        const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin));
         if (feasible(existing, s.intervals, capacity)) { span = s; break; }
       }
       if (span === null) {
         // Defensive: place strictly after all existing work (guaranteed feasible).
         const latest = candidates[candidates.length - 1];
-        span = await computeSpan(companyId, calendarIds, new Date(latest), durationMin);
+        span = await withContext(() => computeSpan(companyId, capSrc, new Date(latest), durationMin));
       }
     }
 

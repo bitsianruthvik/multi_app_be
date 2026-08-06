@@ -262,7 +262,7 @@ export async function spawnReworkTask(exec, companyId, failedTaskId) {
        (company_id, order_id, item_id, flow_id, flow_step_id, operation_id, seq_no,
         depends_on, resource_type_id, status, computed_hours,
         deps_cleared_at, queued_at, is_rework, rework_of_task_id, sort_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, NOW(), NOW(), 1, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1, ?, ?)`,
     [companyId, ft.order_id, ft.item_id, ft.flow_id, ft.flow_step_id, ft.operation_id, newSeq,
      String(ft.seq_no), ft.resource_type_id, ft.computed_hours,
      failedTaskId, (Number(ft.sort_order) || 0) + 1],

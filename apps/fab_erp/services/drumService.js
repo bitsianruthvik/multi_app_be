@@ -17,9 +17,8 @@
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  resolveTaskCalendarIds,
-  workingIntervalsInWindow,
 } from './taskWaitService.js';
+import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 
 // ─── capacity fallbacks (documented) ───────────────────────────────────────────
 // When a resource type declares no concurrency / no daily capacity, normalize with
@@ -60,8 +59,10 @@ function taskLoadMinutes(task) {
  * calendars (or non-positive minutes) it degrades to a wall-clock add — the same
  * optimistic 24/7 fallback EU-2/EU-3 use when no shift calendar resolves.
  */
-async function advanceWorkingMinutes(companyId, calendarIds, from, minutes) {
-  if (calendarIds.length === 0 || !(minutes > 0)) {
+async function advanceWorkingMinutes(companyId, cap, from, minutes) {
+  // isUnbounded() only ever true on the calendar path — crew mode must not treat
+  // an unmanned machine as 24/7 (FAB_ERP_PEOPLE_PLAN.md §6).
+  if (isUnbounded(cap) || !(minutes > 0)) {
     return new Date(from.getTime() + Math.max(0, minutes) * 60000);
   }
   let remaining = minutes;
@@ -74,7 +75,7 @@ async function advanceWorkingMinutes(companyId, calendarIds, from, minutes) {
       );
     }
     const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd);
+    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
     for (const iv of ivs) {
       const lenMin = (iv.end.getTime() - iv.start.getTime()) / 60000;
       if (remaining <= lenMin + 1e-9) {
@@ -238,7 +239,7 @@ export async function detectDrum(companyId) {
   if (current) {
     await pool.query(
       `UPDATE fab_cc_drum
-          SET resource_type_id = ?, load_minutes = ?, method = 'auto', computed_at = NOW()
+          SET resource_type_id = ?, load_minutes = ?, method = 'auto', computed_at = UTC_TIMESTAMP()
         WHERE id = ?`,
       [chosenTypeId, loadMinutes, current.id],
     );
@@ -246,7 +247,7 @@ export async function detectDrum(companyId) {
   } else {
     const [ins] = await pool.query(
       `INSERT INTO fab_cc_drum (company_id, resource_type_id, load_minutes, method, computed_at)
-       VALUES (?, ?, ?, 'auto', NOW())`,
+       VALUES (?, ?, ?, 'auto', UTC_TIMESTAMP())`,
       [companyId, chosenTypeId, loadMinutes],
     );
     drumId = ins.insertId;
@@ -396,11 +397,11 @@ export async function sequenceProjects(companyId, drum) {
   let seq = 0;
   for (const p of ordered) {
     const calTask = calTaskByOrder.get(p.orderId) ?? { assigned_resource_id: null, resource_type_id: drumTypeId };
-    const calendarIds = await resolveTaskCalendarIds(companyId, calTask);
+    const cap = await resolveCapacity(companyId, calTask);
 
     const drumStart = new Date(cursor.getTime());
     const load = drumLoadByOrder.get(p.orderId) || 0;
-    const plannedEnd = await advanceWorkingMinutes(companyId, calendarIds, drumStart, load);
+    const plannedEnd = await advanceWorkingMinutes(companyId, cap, drumStart, load);
 
     // Capacity buffer: protective time on the constraint between projects.
     //
@@ -426,7 +427,7 @@ export async function sequenceProjects(companyId, drum) {
 
     // committed_finish = drum start advanced by chain length + project buffer.
     const finishMinutes = (Number(p.chainLen) > 0 ? Number(p.chainLen) : 0) + (Number(p.projBuf) > 0 ? Number(p.projBuf) : 0);
-    const committedFinish = await advanceWorkingMinutes(companyId, calendarIds, drumStart, finishMinutes);
+    const committedFinish = await advanceWorkingMinutes(companyId, cap, drumStart, finishMinutes);
 
     slotRows.push([
       companyId, drumId, p.orderId, p.planId, seq,
@@ -441,7 +442,7 @@ export async function sequenceProjects(companyId, drum) {
 
     // Next project starts after this one's drum slot + the capacity buffer gap.
     cursor = capacityBuffer > 0
-      ? await advanceWorkingMinutes(companyId, calendarIds, plannedEnd, capacityBuffer)
+      ? await advanceWorkingMinutes(companyId, cap, plannedEnd, capacityBuffer)
       : plannedEnd;
     seq += 1;
   }

@@ -43,7 +43,7 @@ import { logger } from '../../../core/utils/logger.js';
 import { recordEvents } from '../services/taskEventService.js';
 import { resolveCalendarIds, workingIntervalsInWindow } from '../services/taskWaitService.js';
 import { crewForWindow } from '../services/workerService.js';
-import { recomputeForResource } from '../services/taskAttributionService.js';
+import { recomputeForResourceWindow } from '../services/taskAttributionService.js';
 import { onTaskComplete } from '../services/taskEngineService.js';
 import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
 
@@ -230,6 +230,15 @@ router.post('/shift-log', protect, async (req, res) => {
   if (!work.length && !downtime.length && !absences.length) {
     return res.status(400).json({ message: 'Nothing to log.' });
   }
+
+  // The day this log covers. These were referenced in the absence block below
+  // (`a.from ?? start`, and the un-tick's overlap window) but only ever declared
+  // in the GET handler — so ticking somebody absent WITHOUT explicit times, or
+  // un-ticking them, threw ReferenceError, rolled the whole transaction back and
+  // returned a generic 500. The work and downtime rows in the same save went
+  // with it, which is why the failure looked intermittent rather than like a
+  // broken absence path.
+  const { start, end } = dayBounds(date);
 
   // ── Parse and validate up front, so a bad row never half-writes ────────────
   const parsedWork = [];
@@ -469,7 +478,7 @@ router.post('/shift-log', protect, async (req, res) => {
       } else {
         // Un-ticking someone withdraws the away intervals that overlap this day.
         await conn.query(
-          `UPDATE fab_worker_assignments SET deleted_at = NOW()
+          `UPDATE fab_worker_assignments SET deleted_at = UTC_TIMESTAMP()
             WHERE company_id = ? AND worker_id = ? AND kind = 'away' AND deleted_at IS NULL
               AND from_ts < ? AND (to_ts IS NULL OR to_ts > ?)`,
           [companyId, workerId, toSqlUtc(end), toSqlUtc(start)],
@@ -517,7 +526,13 @@ router.post('/shift-log', protect, async (req, res) => {
     }
   }
 
-  recomputeForResource(companyId, resourceId, new Date()).catch((err) =>
+  // Window-scoped, not status-scoped. This route is entirely a BACKDATED entry
+  // surface — its whole purpose is writing up yesterday's paper log — and the
+  // work it just logged is `completed`, so recomputeForResource (which only
+  // looks at eligible/blocked/paused tasks) skipped every task this handler had
+  // just finished. The shift got written up and its wait attribution kept the
+  // numbers from before the shift was known about.
+  recomputeForResourceWindow(companyId, resourceId, start, end).catch((err) =>
     logger.error({ err, resourceId }, 'shift-log: attribution recompute failed'));
 
   return res.json({

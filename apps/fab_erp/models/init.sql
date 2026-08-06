@@ -2442,3 +2442,101 @@ CREATE TABLE IF NOT EXISTS fab_worker_assignments (
   KEY idx_fwa_worker (worker_id, from_ts),
   KEY idx_fwa_resource (resource_id, kind, from_ts)
 );
+
+-- ── People own the calendar (2026-08-06) ────────────────────────────────────
+-- Which shift a person is on, as intervals. A person is assigned to a SHIFT ROW
+-- rather than a bare time range, so the midnight rollover, the unpaid break
+-- (working_minutes) and the plant's non-working days all come from fab_shifts
+-- and its calendar instead of being reimplemented per person.
+-- Rotation is close-one-open-the-next; to_ts NULL projects forward indefinitely,
+-- which is what lets the scheduler plan from today's roster.
+CREATE TABLE IF NOT EXISTS fab_worker_shifts (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT NOT NULL,
+  worker_id        INT NOT NULL,
+  shift_id         INT NOT NULL,
+  from_ts          DATETIME NOT NULL,
+  to_ts            DATETIME NULL,
+  source           ENUM('live','backfill','system') NOT NULL DEFAULT 'live',
+  entered_by       INT NULL,
+  superseded_by_id INT NULL,
+  note             VARCHAR(400) NULL,
+  deleted_at       DATETIME NULL,
+  created_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fws_worker  (worker_id, from_ts),
+  KEY idx_fws_company (company_id),
+  KEY idx_fws_shift   (shift_id)
+);
+
+-- Who actually touched a task — the traceability record (which qualified welder
+-- made which joint, AWS D1.1 / EN 1090). fab_task_events.entered_by is the LOGIN
+-- that tapped the screen, typically a supervisor, and answers a different
+-- question. Records WHO, deliberately never HOW FAST.
+CREATE TABLE IF NOT EXISTS fab_task_workers (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT NOT NULL,
+  task_id          INT NOT NULL,
+  worker_id        INT NOT NULL,
+  role             VARCHAR(64) NULL,
+  from_ts          DATETIME NOT NULL,
+  to_ts            DATETIME NULL,
+  source           ENUM('live','backfill','system') NOT NULL DEFAULT 'live',
+  entered_by       INT NULL,
+  superseded_by_id INT NULL,
+  note             VARCHAR(400) NULL,
+  deleted_at       DATETIME NULL,
+  created_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_ftw_task    (task_id, from_ts),
+  KEY idx_ftw_worker  (worker_id, from_ts),
+  KEY idx_ftw_company (company_id)
+);
+
+-- Per-company key/value settings. Currently one key: capacity_mode
+-- ('calendar' | 'crew'). A MISSING ROW MEANS 'calendar', so every existing
+-- company keeps its current behaviour until somebody switches it deliberately —
+-- crew-derived capacity gives an unmanned machine ZERO capacity, and flipping a
+-- company whose roster doesn't cover its working machines would make them
+-- unschedulable. POST /capacity-mode refuses that switch while machines with
+-- queued work still have nobody on them.
+CREATE TABLE IF NOT EXISTS fab_company_settings (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT NOT NULL,
+  setting_key   VARCHAR(64)  NOT NULL,
+  setting_value VARCHAR(255) NULL,
+  updated_by    INT NULL,
+  deleted_at    DATETIME NULL,
+  created_at    TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_fcs_company_key (company_id, setting_key)
+);
+
+-- Append-only correction on the pre-existing assignment table: a superseded row
+-- stays on disk and reads filter `superseded_by_id IS NULL`. Same idiom as
+-- fab_task_events.superseded_by_event_id. Matters here because machine and
+-- project delays are derived from these rows — a delay figure that changes with
+-- no record of why is worse than one that is simply wrong.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_worker_assignments'
+              AND COLUMN_NAME = 'superseded_by_id');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_worker_assignments ADD COLUMN superseded_by_id INT NULL COMMENT 'Append-only correction: replaced by that row. Reads filter superseded_by_id IS NULL.'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_worker_assignments'
+              AND COLUMN_NAME = 'source');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_worker_assignments ADD COLUMN source ENUM('live','backfill','system') NOT NULL DEFAULT 'live' COMMENT 'live = recorded as it happened; backfill = written up later'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fab_worker_assignments'
+              AND INDEX_NAME = 'idx_fwa_live');
+SET @sql = IF(@idx = 0,
+  "CREATE INDEX idx_fwa_live ON fab_worker_assignments (company_id, kind, superseded_by_id, from_ts)",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

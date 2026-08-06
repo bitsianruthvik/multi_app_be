@@ -244,7 +244,7 @@ export async function saveRule(companyId, entityType, segments) {
   await pool.query(
     `INSERT INTO fab_codegen_rules (company_id, entity_type, segments_json, next_seq)
      VALUES (?, ?, ?, 1)
-     ON DUPLICATE KEY UPDATE segments_json = VALUES(segments_json), updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE segments_json = VALUES(segments_json), updated_at = UTC_TIMESTAMP()`,
     [companyId, entityType, JSON.stringify(segments)],
   );
 }

@@ -46,12 +46,12 @@
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  resolveTaskCalendarIds,
   workingIntervalsInWindow,
   fetchOverlappingOtherTasks,
   mergeIntervals,
 } from './taskWaitService.js';
 import { processPredecessorsDone, isOutputBlocked } from './taskGatingService.js';
+import { resolveCapacity, capacityIntervals } from './capacityService.js';
 import { crewForWindow, coveredIntervals } from './workerService.js';
 
 // ─── pure interval helpers (over [{start:Date,end:Date}] lists) ───────────────
@@ -204,7 +204,11 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
   const completedAt = task.completed_at ? new Date(task.completed_at) : null;
   const isDone = task.status === 'done' || task.status === 'cancelled';
 
-  const calendarIds = await resolveTaskCalendarIds(companyId, task);
+  // Capacity source resolved once. Under crew mode this is the union of the
+  // machine's crew shifts; under calendar mode it is the machine/plant calendar,
+  // exactly as before. Either way no_shift is carved from it FIRST, so no_operator
+  // keeps competing only for genuine in-shift time (FAB_ERP_PEOPLE_PLAN.md §8).
+  const cap = await resolveCapacity(companyId, task);
 
   const segments = []; // { reason, start, end, wm, group:'pre'|'active' }
 
@@ -230,7 +234,7 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
         if (inp.length > 0) reason = 'waiting_materials';
       }
       if (reason) {
-        const inShiftA = await workingIntervalsInWindow(companyId, calendarIds, createdAt, aTo);
+        const inShiftA = await capacityIntervals(companyId, cap, createdAt, aTo);
         segments.push({
           reason, start: createdAt, end: aTo, wm: Math.round(sumMinutes(inShiftA)), group: 'pre',
         });
@@ -287,7 +291,7 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
 
     for (const w of activeWindows) {
       const win = [{ start: w.start, end: w.end }];
-      const inShift = await workingIntervalsInWindow(companyId, calendarIds, w.start, w.end);
+      const inShift = await capacityIntervals(companyId, cap, w.start, w.end);
 
       // 1. no_shift first — out-of-shift time (working_minutes = 0).
       for (const iv of subtractIntervals(win, inShift)) {
@@ -394,6 +398,56 @@ export async function recomputeForResource(companyId, resourceId, now = new Date
     }
   }
   return { ok: true, recomputed };
+}
+
+/**
+ * Recompute every task on a resource whose lifetime OVERLAPS a past window —
+ * including tasks that are already `done`.
+ *
+ * `recomputeForResource` above deliberately only touches still-waiting tasks,
+ * because a live machine-state flip can only change the picture for work that
+ * hasn't finished. Backdating is the opposite case: entering "Ramesh was on
+ * Press-2 last Tuesday 14:00–18:00" changes what `no_operator` should have been
+ * for tasks that ran and completed last Tuesday. Those tasks are `done`, so the
+ * status filter above skips them entirely and their segments stay stale forever
+ * — which is what made backdated roster entry worthless before this existed.
+ *
+ * `limit` is a real cap, not a formality: a wide backdated correction can touch
+ * thousands of tasks and this runs inline. When it truncates it says so rather
+ * than reporting a clean success over a partial recompute.
+ */
+export async function recomputeForResourceWindow(
+  companyId, resourceId, windowStart, windowEnd, { limit = 500, now = new Date() } = {},
+) {
+  const [rows] = await pool.query(
+    `SELECT id FROM fab_project_tasks
+      WHERE company_id = ? AND assigned_resource_id = ? AND deleted_at IS NULL
+        AND (completed_at IS NULL OR completed_at > ?)
+        AND created_at < ?
+      ORDER BY created_at ASC
+      LIMIT ?`,
+    [companyId, resourceId, windowStart, windowEnd, Number(limit) + 1],
+  );
+
+  const truncated = rows.length > limit;
+  const batch = truncated ? rows.slice(0, limit) : rows;
+  if (truncated) {
+    logger.warn(
+      { companyId, resourceId, windowStart, windowEnd, limit },
+      'recomputeForResourceWindow: more tasks overlap the window than the limit — attribution is only partially recomputed',
+    );
+  }
+
+  let recomputed = 0;
+  for (const r of batch) {
+    try {
+      await recomputeTaskAttribution(companyId, r.id, now);
+      recomputed++;
+    } catch (err) {
+      logger.error({ err, companyId, resourceId, taskId: r.id }, 'recomputeForResourceWindow: task failed');
+    }
+  }
+  return { ok: true, recomputed, truncated };
 }
 
 /**

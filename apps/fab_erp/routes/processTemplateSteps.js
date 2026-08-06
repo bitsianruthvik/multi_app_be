@@ -80,7 +80,7 @@ router.post('/process-template-steps/save', protect, async (req, res) => {
                 formula                 = ?,
                 standard_values         = ?,
                 sub_template_id         = ?,
-                updated_at              = NOW()
+                updated_at              = UTC_TIMESTAMP()
           WHERE id = ? AND deleted_at IS NULL`,
         [
           name ?? null,
@@ -103,7 +103,7 @@ router.post('/process-template-steps/save', protect, async (req, res) => {
            (company_id, process_template_id, seq_no, name, resource_type_id,
             process_master_id, allowed_resource_type_ids, formula, standard_values,
             sub_template_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`,
         [
           companyId,
           process_template_id,

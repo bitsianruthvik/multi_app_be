@@ -295,7 +295,7 @@ router.post('/buffers/config', protect, async (req, res) => {
       await pool.query(
         `UPDATE fab_buffers
             SET stock_location_id = ?, capacity_value = ?, capacity_uom = ?, weight_metric_key = ?,
-                warn_pct = ?, block_pct = ?, active = ?, updated_at = NOW()
+                warn_pct = ?, block_pct = ?, active = ?, updated_at = UTC_TIMESTAMP()
           WHERE id = ? AND company_id = ?`,
         [stockLocationId, capacityValue, capacityUom, weightMetricKey, warnPct, blockPct, active, id, companyId],
       );
@@ -334,7 +334,7 @@ router.delete('/buffers/config/:id', protect, async (req, res) => {
 
   try {
     const [result] = await pool.query(
-      `UPDATE fab_buffers SET deleted_at = NOW() WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      `UPDATE fab_buffers SET deleted_at = UTC_TIMESTAMP() WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
       [id, companyId],
     );
     if (result.affectedRows === 0) {

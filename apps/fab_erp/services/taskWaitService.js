@@ -75,6 +75,13 @@ function allDatesInRange(from, to) {
   return dates;
 }
 
+/** Shift a 'YYYY-MM-DD' string by whole days. */
+function addDaysYMD(ymd, days) {
+  const d = new Date(ymd + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 function toTimeString(t) {
   // mysql2 returns TIME columns as 'HH:MM:SS' strings by default.
   if (t == null) return '00:00:00';
@@ -317,11 +324,44 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
 
   const dateFrom = toYMD(windowStart);
   const dateTo = toYMD(windowEnd);
-  const { shiftsByCalendar, calendarDayMap } =
-    await loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo);
 
+  // Start the walk a day EARLY. A shift that crosses midnight belongs to the
+  // date it STARTS on (shiftOverlapInterval rolls its end forward 24h), so a
+  // 22:00–06:00 night shift beginning on dateFrom-1 spills its 00:00–06:00 tail
+  // into the window — and walking only dateFrom..dateTo never generated that
+  // shift at all, so the tail was invisible.
+  //
+  // That silently broke night shifts everywhere the window starts mid-shift:
+  // because taskAttributionService carves `no_shift` out FIRST with
+  // first-match-wins, the missing hours were misfiled as outside-the-working-day
+  // rather than competing for machine_down / no_operator / machine_busy. A night
+  // shift's opening hours could therefore never be blamed on anything real.
+  //
+  // Cost of the extra day is one iteration: clipToWindow discards every interval
+  // that doesn't actually reach into [windowStart, windowEnd], so a normal
+  // daytime shift on dateFrom-1 contributes nothing and falls straight out.
+  const walkFrom = addDaysYMD(dateFrom, -1);
+
+  const { shiftsByCalendar, calendarDayMap } =
+    await loadCalendarSchedule(companyId, calendarIds, walkFrom, dateTo);
+
+  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd);
+}
+
+/**
+ * The day-walk itself, over shifts already grouped by calendar.
+ *
+ * Extracted so crew-derived capacity can reuse it verbatim. Capacity computed
+ * from a PERSON's shift has to honour exactly the same rules as capacity
+ * computed from a machine's calendar — the midnight rollover, the unpaid break
+ * carved from the middle, the non-working-day exception list. Re-deriving them
+ * in a second place is how two answers to "was this a working hour?" start
+ * disagreeing, and every delay figure downstream depends on there being one.
+ */
+function walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd) {
+  const calendarIds = Object.keys(shiftsByCalendar);
   const intervals = [];
-  for (const date of allDatesInRange(dateFrom, dateTo)) {
+  for (const date of allDatesInRange(walkFrom, dateTo)) {
     for (const calId of calendarIds) {
       const shifts = shiftsByCalendar[calId];
       if (!shifts || shifts.length === 0) continue;
@@ -380,6 +420,55 @@ export async function workingMinutesInWindow(companyId, calendarIds, windowStart
 export async function workingIntervalsInWindow(companyId, calendarIds, windowStart, windowEnd) {
   const intervals = await collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd);
   return mergeIntervals(intervals);
+}
+
+/**
+ * Worked intervals for a SPECIFIC SET OF SHIFTS (by id) inside a window.
+ *
+ * The people-owned-calendar counterpart of `workingIntervalsInWindow`: a person
+ * is on a shift, so their availability is that shift's worked intervals. Goes
+ * through the same `walkShifts` as the calendar path, so a night shift's
+ * midnight rollover, its unpaid break and its plant's holidays behave
+ * identically whichever way capacity was derived.
+ *
+ * Returns un-merged intervals; the caller merges after intersecting each shift
+ * with the person's assignment and subtracting their time away.
+ */
+export async function intervalsForShifts(companyId, shiftIds, windowStart, windowEnd) {
+  if (!shiftIds?.length || !(windowEnd > windowStart)) return [];
+
+  const dateFrom = toYMD(windowStart);
+  const dateTo = toYMD(windowEnd);
+  const walkFrom = addDaysYMD(dateFrom, -1);   // see collectWorkingIntervals
+
+  const [shiftRows] = await pool.query(
+    `SELECT id, calendar_id, start_time, end_time, working_minutes
+       FROM fab_shifts
+      WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+    [companyId, shiftIds],
+  );
+  if (!shiftRows.length) return [];
+
+  const shiftsByCalendar = {};
+  for (const s of shiftRows) {
+    (shiftsByCalendar[s.calendar_id] ??= []).push(s);
+  }
+
+  const calendarIds = [...new Set(shiftRows.map((s) => s.calendar_id))];
+  const [dayRows] = await pool.query(
+    `SELECT calendar_id, day_date, is_working
+       FROM fab_calendar_days
+      WHERE company_id = ? AND calendar_id IN (?)
+        AND day_date BETWEEN ? AND ? AND deleted_at IS NULL`,
+    [companyId, calendarIds, walkFrom, dateTo],
+  );
+  const calendarDayMap = {};
+  for (const row of dayRows) {
+    const ymd = row.day_date instanceof Date ? toYMD(row.day_date) : String(row.day_date).slice(0, 10);
+    (calendarDayMap[row.calendar_id] ??= {})[ymd] = !!row.is_working;
+  }
+
+  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd);
 }
 
 // ─── other-tasks overlap (blocked_by_other_tasks_minutes) ─────────────────────

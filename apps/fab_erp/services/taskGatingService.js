@@ -209,7 +209,7 @@ export async function taskInputsSatisfied(conn, companyId, taskId) {
   for (const inp of inputs) {
     if (inp.satisfied_at) continue;
     if (!(await inputSatisfiedLive(conn, companyId, inp))) return false;
-    await conn.query('UPDATE fab_task_inputs SET satisfied_at = NOW() WHERE id = ?', [inp.id]);
+    await conn.query('UPDATE fab_task_inputs SET satisfied_at = UTC_TIMESTAMP() WHERE id = ?', [inp.id]);
   }
   // Every gate=1 input is now satisfied — fire once per task, not per input row.
   if (inputs.length > 0) {
@@ -234,7 +234,7 @@ export async function tryClearTask(conn, companyId, taskId) {
   if (!(await taskInputsSatisfied(conn, companyId, taskId))) return false;
   const [u] = await conn.query(
     `UPDATE fab_project_tasks
-        SET status = 'eligible', deps_cleared_at = NOW(), queued_at = NOW()
+        SET status = 'eligible', deps_cleared_at = UTC_TIMESTAMP(), queued_at = UTC_TIMESTAMP()
       WHERE id = ? AND status = 'blocked' AND deleted_at IS NULL`,
     [taskId],
   );

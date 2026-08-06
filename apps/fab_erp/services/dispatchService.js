@@ -34,7 +34,7 @@
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import { isOutputBlocked } from './taskGatingService.js';
-import { workingMinutesInWindow, resolveTaskCalendarIds } from './taskWaitService.js';
+import { resolveCapacity, capacityMinutes, isUnbounded } from './capacityService.js';
 
 /** Slack for an order we cannot compute one for. Sorts after every real value. */
 const NO_SLACK = Number.POSITIVE_INFINITY;
@@ -138,9 +138,9 @@ export async function computeOrderSlack(companyId, now = new Date()) {
     due.setHours(23, 59, 59, 999);
 
     const rep = repByPlan.get(plan.planId);
-    let calendarIds = [];
+    let cap = { mode: 'calendar', resourceId: null, calendarIds: [] };
     try {
-      if (rep) calendarIds = await resolveTaskCalendarIds(companyId, rep);
+      if (rep) cap = await resolveCapacity(companyId, rep);
     } catch { /* fall through to wall clock */ }
 
     // workingMinutesInWindow walks forward and returns 0 for a reversed window,
@@ -149,8 +149,8 @@ export async function computeOrderSlack(companyId, now = new Date()) {
     const overdue = due.getTime() < now.getTime();
     const [from, to] = overdue ? [due, now] : [now, due];
     let minutes;
-    if (calendarIds.length > 0) {
-      minutes = await workingMinutesInWindow(companyId, calendarIds, from, to);
+    if (!isUnbounded(cap)) {
+      minutes = await capacityMinutes(companyId, cap, from, to);
     } else {
       // No calendar resolvable (no baselined critical task with a machine).
       // Wall-clock is a worse estimate but an honest one; it never silently
@@ -367,7 +367,7 @@ export async function confirmDispatch(companyId, computed, userId) {
     const [runRes] = await conn.query(
       `INSERT INTO fab_dispatch_runs
          (company_id, status, computed_at, confirmed_at, confirmed_by, machine_count, task_count)
-       VALUES (?, 'confirmed', NOW(), NOW(), ?, ?, ?)`,
+       VALUES (?, 'confirmed', UTC_TIMESTAMP(), UTC_TIMESTAMP(), ?, ?, ?)`,
       [companyId, userId ?? null, machineCount, taskCount],
     );
     const runId = runRes.insertId;

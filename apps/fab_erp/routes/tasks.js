@@ -52,6 +52,9 @@ import {
 import { onTaskComplete, rollUpOrderStatus, spawnReworkTask } from '../services/taskEngineService.js';
 import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
 import { recomputeTaskAttribution, recomputeForResource } from '../services/taskAttributionService.js';
+import {
+  workersBlockedElsewhere, attachWorkersToTask, detachWorkersFromTask,
+} from '../services/workerService.js';
 import * as bufferService from '../services/bufferService.js';
 import { isOutputBlocked, startBlockersForQueue } from '../services/taskGatingService.js';
 import { recomputeForOrder as ccRecomputeForOrder } from '../services/ccBufferService.js';
@@ -751,7 +754,7 @@ router.get('/tasks/overview', protect, async (req, res) => {
 //
 // Calls taskWaitService's computeTaskWaitMetrics(task, now) to compute
 // wait_working_minutes / blocked_by_other_tasks_minutes / idle_wait_minutes
-// as of now, then persists those three fields alongside started_at = NOW()
+// as of now, then persists those three fields alongside started_at = UTC_TIMESTAMP()
 // and status = 'in_progress'.
 //
 // EU-2: also dual-writes a fab_task_events row — 'started' from 'eligible',
@@ -798,6 +801,17 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
   const requestedResourceId = Number(req.body?.resourceId) > 0 ? Number(req.body.resourceId) : null;
   // EU-8 admins may force past the output-blocked guard with body {force:true}.
   const forced = req.body?.force === true;
+
+  // Who is doing the work. Optional: omitting it keeps the pre-2026-08-06
+  // behaviour exactly. When supplied, these people are recorded against the task
+  // (the traceability record — which welder made which joint) and the busy rule
+  // below applies to them.
+  const workerIds = Array.isArray(req.body?.workerIds)
+    ? [...new Set(req.body.workerIds.map(Number).filter((n) => n > 0))]
+    : [];
+  // Explicit confirmation of "yes, move them off the machine they're on".
+  const moveWorkers = req.body?.moveWorkers === true;
+  const movedWorkers = [];
 
   // ── Query logic ────────────────────────────────────────────────────────────
   try {
@@ -895,6 +909,57 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
         });
       }
 
+      // ── The busy rule (FAB_ERP_PEOPLE_PLAN.md §12) ───────────────────────────
+      // A person may run any number of tasks on the machine they are assigned to,
+      // and is blocked on every other machine. Their open `assigned` interval IS
+      // their availability — there is no separate "busy" flag to keep in sync.
+      //
+      // Only fires when the caller NAMES workers. Starting without naming anyone
+      // is the existing behaviour and stays working, because a Start button that
+      // suddenly demanded a roster would simply stop being pressed.
+      if (workerIds.length > 0) {
+        const blocked = await workersBlockedElsewhere(conn, companyId, workerIds, machineId);
+        if (blocked.length > 0 && !moveWorkers) {
+          await conn.rollback();
+          return res.status(409).json({
+            code: 'WORKER_BUSY_ELSEWHERE',
+            // Everything the UI needs to offer "Move them?" rather than a dead end.
+            canMove: true,
+            workers: blocked.map((b) => ({
+              workerId: b.workerId, name: b.name,
+              currentResourceId: b.currentResourceId, currentResourceName: b.currentResourceName,
+            })),
+            message: blocked.length === 1
+              ? `${blocked[0].name} is on ${blocked[0].currentResourceName ?? 'another machine'}. Move them to ${machine.name} to start this here.`
+              : `${blocked.length} people are on other machines. Move them to ${machine.name} to start this here.`,
+          });
+        }
+        // Explicit opt-in: close their assignment on the old machine and open one
+        // here. Done on THIS connection, not via assignWorker() — that helper
+        // opens its own transaction and would commit the move independently, so
+        // a later rollback of the start (insufficient stock, say) would leave the
+        // person moved to a machine that never started anything.
+        //
+        // Closing the old interval is what stops them counting toward two
+        // machines' crews at once, which would make `no_operator` quietly wrong
+        // on the machine they actually left.
+        for (const b of blocked) {
+          await conn.query(
+            `UPDATE fab_worker_assignments SET to_ts = UTC_TIMESTAMP()
+              WHERE company_id = ? AND worker_id = ? AND kind = 'assigned'
+                AND deleted_at IS NULL AND superseded_by_id IS NULL AND to_ts IS NULL`,
+            [companyId, b.workerId],
+          );
+          await conn.query(
+            `INSERT INTO fab_worker_assignments
+               (company_id, worker_id, resource_id, kind, from_ts, entered_by, source, note)
+             VALUES (?, ?, ?, 'assigned', UTC_TIMESTAMP(), ?, 'live', 'moved on task start')`,
+            [companyId, b.workerId, machineId, user.id],
+          );
+          movedWorkers.push({ workerId: b.workerId, name: b.name, from: b.currentResourceName });
+        }
+      }
+
       // ── EU-8 output-blocked guard (unchanged behaviour, now machine-aware) ────
       outBlock = await isOutputBlocked(companyId, { ...task, assigned_resource_id: machineId }, conn);
       if (outBlock.blocked && !(forced && isAdmin)) {
@@ -912,7 +977,7 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
                 blocked_by_other_tasks_minutes = ?,
                 idle_wait_minutes = ?,
                 assigned_resource_id = ?,
-                started_at = NOW(),
+                started_at = UTC_TIMESTAMP(),
                 status = 'in_progress'
           WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = ?`,
         [
@@ -939,6 +1004,14 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       // throws INSUFFICIENT_STOCK, which rolls the whole start back (below).
       // `task` carries id, item_id, seq_no, order_id from the SELECT above.
       await openOrMoveWipOnStart(conn, companyId, task, machine);
+
+      // Record who is on this job. Anyone with no machine assignment is put on
+      // this machine at the same time — starting work on a machine IS being on
+      // it, and demanding a separate rostering step before Start worked would
+      // guarantee the roster stayed empty.
+      await attachWorkersToTask(conn, companyId, {
+        taskId, workerIds, resourceId: machineId, enteredBy: user.id,
+      });
 
       // BUG-03: reflect production progress on the order (best-effort, in-txn).
       await rollUpOrderStatus(conn, companyId, orderId);
@@ -991,6 +1064,11 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       taskId,
       status: 'in_progress',
       assignedResourceId: machineId,
+      workerIds,
+      // Non-empty only when the caller opted into moving somebody; surfaced so
+      // the UI can say "Ramesh was moved from Bay-3" rather than silently
+      // relocating a person on the board behind them.
+      movedWorkers,
       waitWorkingMinutes: metrics.wait_working_minutes,
       blockedByOtherTasksMinutes: metrics.blocked_by_other_tasks_minutes,
       idleWaitMinutes: metrics.idle_wait_minutes,
@@ -1080,7 +1158,7 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
     // FEAT-12: record the reported downtime reason on the task.
     const [updateResult] = await pool.query(
       `UPDATE fab_project_tasks
-          SET paused_at = NOW(),
+          SET paused_at = UTC_TIMESTAMP(),
               status = 'paused',
               delay_reason = ?
         WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = 'in_progress'`,
@@ -1090,6 +1168,12 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
     if (updateResult.affectedRows === 0) {
       return res.status(409).json({ code: 'CONFLICT', message: 'Task is no longer in progress. Refresh and try again.' });
     }
+
+    // Close the worker intervals — they are no longer ON this job. Their MACHINE
+    // assignment is deliberately left alone: pausing a job is not leaving the
+    // machine, and unassigning here would make the station read as unmanned and
+    // manufacture `no_operator` minutes out of an ordinary pause.
+    await detachWorkersFromTask(pool, companyId, taskId);
 
     await recordEvent({ companyId, taskId, type: 'paused', enteredBy: user.id, note: reason });
 
@@ -1102,7 +1186,7 @@ router.post('/tasks/:id/pause', protect, async (req, res) => {
 
 // ── POST /tasks/:id/stop ────────────────────────────────────────────────────
 // EU-8: Task lifecycle — stop (complete). Legal only from 'in_progress'.
-// Sets status = 'done', completed_at = NOW(), then calls taskEngineService's
+// Sets status = 'done', completed_at = UTC_TIMESTAMP(), then calls taskEngineService's
 // onTaskComplete(companyId, taskId) (EU-6) to cascade-clear downstream
 // successors whose full predecessor set is now done.
 //
@@ -1216,7 +1300,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       const [updateResult] = await conn.query(
         `UPDATE fab_project_tasks
             SET status = 'done',
-                completed_at = NOW(),
+                completed_at = UTC_TIMESTAMP(),
                 produced_qty = ?,
                 scrap_qty = ?,
                 qc_result = ?
@@ -1241,6 +1325,13 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
         // posts to Finished Goods. Scrap is written off for traceability.
         await finalizeWipOnComplete(conn, companyId, task, { goodQty: producedQty, scrapQty });
       }
+
+      // Close the worker intervals in the SAME transaction as status='done', so
+      // "the task finished" and "they stopped working on it" can never disagree.
+      // Their machine assignment is left open on purpose — finishing a job is not
+      // leaving the machine, and clearing it here would read as an unmanned
+      // station between two jobs and invent `no_operator` minutes.
+      await detachWorkersFromTask(conn, companyId, taskId);
 
       await conn.commit();
     } catch (txErr) {

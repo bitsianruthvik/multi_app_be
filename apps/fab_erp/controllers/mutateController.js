@@ -296,7 +296,7 @@ export async function mutate(req, res) {
       // Scope to user's company + non-deleted rows to prevent cross-tenant writes.
       const [result] = await pool.query(
         `UPDATE \`${tableName}\`
-         SET ?, updated_at = NOW()
+         SET ?, updated_at = UTC_TIMESTAMP()
          WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
         [filteredPayload, id, companyId],
       );
@@ -321,7 +321,7 @@ export async function mutate(req, res) {
       // Soft-delete — consistent with platform convention (deleted_at IS NULL queries).
       const [result] = await pool.query(
         `UPDATE \`${tableName}\`
-         SET deleted_at = NOW()
+         SET deleted_at = UTC_TIMESTAMP()
          WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
         [id, companyId],
       );

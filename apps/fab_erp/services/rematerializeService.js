@@ -32,6 +32,7 @@ import { evaluateFormula, formulaResultToHours } from './formulaEngine.js';
 import { buildBaseline } from './criticalChainService.js';
 import { replan as drumReplan } from './drumService.js';
 import { logger } from '../../../core/utils/logger.js';
+import { isNoCapacity } from './schedulingErrors.js';
 
 const STARTED_STATUSES = new Set(['in_progress', 'paused', 'done']);
 const HOURS_EPS = 0.01;
@@ -224,11 +225,11 @@ export async function applyRematerialize(companyId, orderId) {
       // Release any material these tasks had earmarked (FEAT-02), then soft-delete
       // the tasks and their gated inputs so materialize sees their steps as missing.
       await conn.query(
-        `UPDATE fab_project_tasks SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)`,
+        `UPDATE fab_project_tasks SET deleted_at = UTC_TIMESTAMP() WHERE company_id = ? AND id IN (?)`,
         [companyId, ids],
       );
       await conn.query(
-        `UPDATE fab_task_inputs SET deleted_at = NOW() WHERE company_id = ? AND task_id IN (?) AND deleted_at IS NULL`,
+        `UPDATE fab_task_inputs SET deleted_at = UTC_TIMESTAMP() WHERE company_id = ? AND task_id IN (?) AND deleted_at IS NULL`,
         [companyId, ids],
       );
       deleted = ids.length;
@@ -251,8 +252,17 @@ export async function applyRematerialize(companyId, orderId) {
   }
 
   // After the rebuild is committed: refresh this order's CCPM baseline (its DAG
-  // changed) and replan the drum. Sales orders only; fully guarded so a Critical
-  // Chain failure never breaks re-materialization.
+  // changed) and replan the drum. Sales orders only. Still guarded — the rebuild
+  // itself is committed and must not be undone by a downstream planning failure —
+  // but NO LONGER SILENT.
+  //
+  // This catch used to log a warn tagged "(non-fatal)" and return `{ ok: true }`.
+  // The order therefore looked re-materialized while its critical-chain baseline
+  // had quietly failed to build, which is exactly how the fab_calendar_days
+  // allow-list bug turned into an invisible outage (taskWaitService.js:29).
+  // Under the zero-capacity rule (FAB_ERP_PEOPLE_PLAN.md §9) an unmanned machine
+  // takes this path as a matter of course, so "logged somewhere" is not good
+  // enough: the warning travels back in the result and the caller renders it.
   try {
     const [[order]] = await pool.query(
       `SELECT order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
@@ -263,7 +273,14 @@ export async function applyRematerialize(companyId, orderId) {
       await drumReplan(companyId);
     }
   } catch (err) {
-    logger.warn({ err, companyId, orderId }, '[cc] rematerialize baseline/replan refresh failed (non-fatal)');
+    logger.error({ err, companyId, orderId }, '[cc] rematerialize baseline/replan refresh failed');
+    result.warnings = result.warnings ?? [];
+    result.warnings.push(
+      isNoCapacity(err)
+        ? { ...err.toJSON(), scope: 'baseline' }
+        : { error: 'baseline_failed', scope: 'baseline', message: err?.message ?? String(err) },
+    );
+    result.baselineOk = false;
   }
 
   return result;
