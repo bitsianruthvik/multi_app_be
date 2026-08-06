@@ -2540,3 +2540,22 @@ SET @sql = IF(@idx = 0,
   "CREATE INDEX idx_fwa_live ON fab_worker_assignments (company_id, kind, superseded_by_id, from_ts)",
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── Plant timezone (2026-08-06) ─────────────────────────────────────────────
+-- fab_shifts.start_time is what is written on the board at the SITE. Without a
+-- zone the calendar walk read it as UTC, so an Indian plant on a UTC server ran
+-- 5.5h late in no_shift attribution, the coverage meter, and (under
+-- capacity_mode=crew) the scheduling calendar. Resolution: plant.timezone ->
+-- fab_company_settings.timezone -> UTC. NULL keeps the pre-change behaviour.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plants'
+              AND COLUMN_NAME  = 'timezone');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_plants ADD COLUMN timezone VARCHAR(64) NULL COMMENT 'IANA zone (e.g. Asia/Kolkata) the shift times at this site are written in. NULL = company default, else UTC.'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- No seed. Setting a zone changes what every existing shift MEANS, so it is a
+-- deliberate per-site decision, not something a migration should guess — and
+-- guessing wrong would silently move every historical attribution number.

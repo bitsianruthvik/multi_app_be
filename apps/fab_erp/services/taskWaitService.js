@@ -57,6 +57,9 @@
 //   attributed as `unexplained_idle` instead of falling outside the working day.
 
 import { pool } from '../../../db.js';
+import {
+  DEFAULT_TZ, zonedWallClockToUtc, zonedYMD, calendarTimezones, tzForCalendar,
+} from './plantTime.js';
 
 // ─── date/time helpers ───────────────────────────────────────────────────────
 
@@ -93,11 +96,21 @@ function toTimeString(t) {
  * arbitrary [windowStart, windowEnd] Date window, or null when they don't
  * overlap. Handles shifts that cross midnight (end_time <= start_time).
  */
-function shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEnd) {
-  const shiftStart = new Date(`${dateStr}T${toTimeString(startTime)}Z`);
-  let shiftEnd = new Date(`${dateStr}T${toTimeString(endTime)}Z`);
+function shiftOverlapInterval(dateStr, startTime, endTime, windowStart, windowEnd, timeZone = DEFAULT_TZ) {
+  // `dateStr` is a LOCAL calendar date at the plant and start/end are what is
+  // written on the board there, so both are converted from plant-local wall
+  // clock to a real instant. This used to be `new Date(\`${d}T${t}Z\`)` — the
+  // floor's clock read as UTC — which put every Indian shift 5½ hours late on a
+  // UTC server. See plantTime.js.
+  const shiftStart = zonedWallClockToUtc(dateStr, toTimeString(startTime), timeZone);
+  let shiftEnd = zonedWallClockToUtc(dateStr, toTimeString(endTime), timeZone);
+  if (!shiftStart || !shiftEnd) return null;
   if (shiftEnd <= shiftStart) {
-    shiftEnd = new Date(shiftEnd.getTime() + 24 * 60 * 60 * 1000);
+    // Crosses midnight: the end belongs to the NEXT local day. Re-resolved
+    // through the zone rather than by adding 24h, so a shift spanning a DST
+    // change is still the length the clock on the wall says it is.
+    shiftEnd = zonedWallClockToUtc(addDaysYMD(dateStr, 1), toTimeString(endTime), timeZone);
+    if (!shiftEnd) return null;
   }
   const overlapStart = shiftStart > windowStart ? shiftStart : windowStart;
   const overlapEnd = shiftEnd < windowEnd ? shiftEnd : windowEnd;
@@ -133,10 +146,10 @@ function shiftOverlapMinutes(dateStr, startTime, endTime, windowStart, windowEnd
  * shrinking the end time would have broken). If a site ever needs the exact
  * break window, that wants explicit columns rather than a cleverer guess here.
  */
-function workedIntervalsForShift(dateStr, shift) {
+function workedIntervalsForShift(dateStr, shift, timeZone = DEFAULT_TZ) {
   const full = shiftOverlapInterval(
     dateStr, shift.start_time, shift.end_time,
-    new Date(-8640000000000000), new Date(8640000000000000),
+    new Date(-8640000000000000), new Date(8640000000000000), timeZone,
   );
   if (!full) return [];
 
@@ -322,8 +335,22 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
 async function collectWorkingIntervals(companyId, calendarIds, windowStart, windowEnd) {
   if (!(windowEnd > windowStart) || calendarIds.length === 0) return [];
 
-  const dateFrom = toYMD(windowStart);
-  const dateTo = toYMD(windowEnd);
+  const tzMap = await calendarTimezones(companyId);
+
+  // Widest local-date span across the calendars in play. Each calendar can sit
+  // in a different zone (a company can run sites in more than one), and the
+  // local date an instant falls on differs between them — so the walk covers the
+  // union and each calendar's own zone decides what actually lands in the window.
+  let dateFrom = null;
+  let dateTo = null;
+  for (const calId of calendarIds) {
+    const tz = tzForCalendar(tzMap, calId);
+    const from = zonedYMD(windowStart, tz);
+    const to = zonedYMD(windowEnd, tz);
+    if (dateFrom === null || from < dateFrom) dateFrom = from;
+    if (dateTo === null || to > dateTo) dateTo = to;
+  }
+  if (dateFrom === null) return [];
 
   // Start the walk a day EARLY. A shift that crosses midnight belongs to the
   // date it STARTS on (shiftOverlapInterval rolls its end forward 24h), so a
@@ -345,7 +372,7 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
   const { shiftsByCalendar, calendarDayMap } =
     await loadCalendarSchedule(companyId, calendarIds, walkFrom, dateTo);
 
-  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd);
+  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd, tzMap);
 }
 
 /**
@@ -358,7 +385,7 @@ async function collectWorkingIntervals(companyId, calendarIds, windowStart, wind
  * in a second place is how two answers to "was this a working hour?" start
  * disagreeing, and every delay figure downstream depends on there being one.
  */
-function walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd) {
+function walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd, tzMap) {
   const calendarIds = Object.keys(shiftsByCalendar);
   const intervals = [];
   for (const date of allDatesInRange(walkFrom, dateTo)) {
@@ -380,13 +407,19 @@ function walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowSt
       //
       // ShiftCalendars.tsx writes one day row at a time with an is_working
       // toggle, i.e. it is already an exception editor. This matches it.
+      // `date` is a LOCAL calendar date at this calendar's plant, which is the
+      // right key: a holiday is "the 26th is off at this site", not a UTC span.
       if (calendarDayMap[calId]?.[date] === false) continue;
+
+      // Each calendar resolves its own zone — a company with sites in two
+      // countries must not evaluate both against one clock.
+      const tz = tzForCalendar(tzMap, calId);
 
       for (const shift of shifts) {
         // Worked intervals, not the raw span — the shift's unpaid break is
         // carved out here so every caller (coverage meter, no_shift attribution,
         // working-minute sums) sees the same working day.
-        for (const worked of workedIntervalsForShift(date, shift)) {
+        for (const worked of workedIntervalsForShift(date, shift, tz)) {
           const iv = clipToWindow(worked, windowStart, windowEnd);
           if (iv) intervals.push(iv);
         }
@@ -437,9 +470,7 @@ export async function workingIntervalsInWindow(companyId, calendarIds, windowSta
 export async function intervalsForShifts(companyId, shiftIds, windowStart, windowEnd) {
   if (!shiftIds?.length || !(windowEnd > windowStart)) return [];
 
-  const dateFrom = toYMD(windowStart);
-  const dateTo = toYMD(windowEnd);
-  const walkFrom = addDaysYMD(dateFrom, -1);   // see collectWorkingIntervals
+  const tzMap = await calendarTimezones(companyId);
 
   const [shiftRows] = await pool.query(
     `SELECT id, calendar_id, start_time, end_time, working_minutes
@@ -455,6 +486,21 @@ export async function intervalsForShifts(companyId, shiftIds, windowStart, windo
   }
 
   const calendarIds = [...new Set(shiftRows.map((s) => s.calendar_id))];
+
+  // Local-date span, per this shift's own calendar zone — same reasoning as
+  // collectWorkingIntervals, including the day of padding for a shift that
+  // starts the previous evening and runs past midnight.
+  let dateFrom = null;
+  let dateTo = null;
+  for (const calId of calendarIds) {
+    const tz = tzForCalendar(tzMap, calId);
+    const from = zonedYMD(windowStart, tz);
+    const to = zonedYMD(windowEnd, tz);
+    if (dateFrom === null || from < dateFrom) dateFrom = from;
+    if (dateTo === null || to > dateTo) dateTo = to;
+  }
+  const walkFrom = addDaysYMD(dateFrom, -1);
+
   const [dayRows] = await pool.query(
     `SELECT calendar_id, day_date, is_working
        FROM fab_calendar_days
@@ -468,7 +514,7 @@ export async function intervalsForShifts(companyId, shiftIds, windowStart, windo
     (calendarDayMap[row.calendar_id] ??= {})[ymd] = !!row.is_working;
   }
 
-  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd);
+  return walkShifts(shiftsByCalendar, calendarDayMap, walkFrom, dateTo, windowStart, windowEnd, tzMap);
 }
 
 // ─── other-tasks overlap (blocked_by_other_tasks_minutes) ─────────────────────

@@ -32,7 +32,8 @@
     "alias": "fpl",
     "writeFields": [
       "name",
-      "code"
+      "code",
+      "timezone"
     ],
     "fields": {
       "id": "fpl.id",
@@ -40,7 +41,8 @@
       "name": "fpl.name",
       "code": "fpl.code",
       "createdAt": "fpl.created_at",
-      "updatedAt": "fpl.updated_at"
+      "updatedAt": "fpl.updated_at",
+      "timezone": "fpl.timezone"
     },
     "fieldTypes": {
       "id": "integer",
@@ -48,7 +50,8 @@
       "name": "string",
       "code": "string",
       "createdAt": "datetime",
-      "updatedAt": "datetime"
+      "updatedAt": "datetime",
+      "timezone": "string"
     },
     "relations": {}
   },
