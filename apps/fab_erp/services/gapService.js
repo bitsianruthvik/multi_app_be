@@ -111,7 +111,17 @@ export async function dayGaps(companyId, resourceId, date) {
   // The working day itself. No shift ⇒ no working time ⇒ nothing to explain;
   // an empty day is not a gap, it is a day the plant was not open.
   const cap = await resolveCapacityForResource(companyId, resourceId, bounds.plantId);
-  const working = await capacityIntervals(companyId, cap, start, end);
+  const workingFull = await capacityIntervals(companyId, cap, start, end);
+
+  // CLIP TO NOW. On today's date the rest of the shift has not happened yet, and
+  // offering it as "unaccounted" invites the supervisor to explain time that
+  // does not exist — which the shift-log save then correctly refuses with "work
+  // times cannot be in the future". A gap you are invited to fill and then
+  // blocked from filling is worse than no gap at all.
+  const now = new Date();
+  const working = workingFull
+    .map((iv) => ({ start: iv.start, end: iv.end > now ? now : iv.end }))
+    .filter((iv) => iv.end > iv.start);
 
   const catalogue = await reasonCatalogue(companyId);
   const labelFor = (code) => catalogue.find((r) => r.code === code)?.label ?? code;
@@ -121,15 +131,25 @@ export async function dayGaps(companyId, resourceId, date) {
   // 1. Work actually done on this machine — tasks that ran. Not a "gap reason",
   //    but it must be shown, or the sheet asks the supervisor to explain time
   //    the machine was busy producing.
+  // `completed_at` is returned RAW, and the still-running case is defaulted in
+  // JS below. It used to be `COALESCE(t.completed_at, ?)` with a string
+  // parameter, which silently degrades the column's type from DATETIME to
+  // VARCHAR — mysql2 then hands back a string instead of a Date, `new Date()`
+  // parses it as LOCAL time rather than UTC, and the interval came out inverted
+  // (08:00 → 06:30). An inverted interval subtracts nothing, so the work
+  // vanished from the sheet and the gap stayed full.
+  //
+  // Same rule as ARCHITECTURE.md §13: never let a DATETIME round-trip through a
+  // JS string. COALESCE with a parameter is that round trip wearing a disguise.
   const [work] = await pool.query(
     `SELECT t.id AS taskId, t.started_at AS fromTs,
-            COALESCE(t.completed_at, ?) AS toTs, o.name AS operationName
+            t.completed_at AS toTs, o.name AS operationName
        FROM fab_project_tasks t
        LEFT JOIN fab_operations o ON o.id = t.operation_id
       WHERE t.company_id = ? AND t.assigned_resource_id = ? AND t.deleted_at IS NULL
         AND t.started_at IS NOT NULL AND t.started_at < ?
         AND (t.completed_at IS NULL OR t.completed_at > ?)`,
-    [sqlUtc(end), companyId, resourceId, sqlUtc(end), sqlUtc(start)],
+    [companyId, resourceId, sqlUtc(end), sqlUtc(start)],
   );
   for (const w of work) {
     // CLAMP to the day. A task that started three weeks ago and is still open
@@ -137,7 +157,8 @@ export async function dayGaps(companyId, resourceId, date) {
     // minutes against a 480-minute shift, which swallows the sheet and leaves a
     // zero gap on a day nothing happened.
     const f = new Date(w.fromTs);
-    const t = new Date(w.toTs);
+    // Still running: it occupies the machine to the end of the day being read.
+    const t = w.toTs ? new Date(w.toTs) : end;
     explained.push({
       kind: 'work', stream: 'task', label: w.operationName ?? `Task #${w.taskId}`,
       taskId: w.taskId,
