@@ -1,0 +1,254 @@
+/**
+ * itemWeightService.js — weight roll-up for one sales order's item tree.
+ *
+ * In fabrication nobody weighs an assembly. They weigh (or calculate from the
+ * plate) the pieces it is cut from, and the assembly's weight is the sum. So
+ * weight is entered only on the rows at the bottom of the tree and every level
+ * above is derived:
+ *
+ *   effective(node) = node.unit_weight ?? computed_unit_weight(node)
+ *   computed_unit_weight(node) = Σ over children of (child.qty × effective(child))
+ *   total_weight(node) = effective(node) × node.qty
+ *
+ * `unit_weight` is only ever written by a human; `computed_unit_weight` and
+ * `total_weight` are only ever written here. Keeping them apart is the whole
+ * point — a fabricated assembly genuinely weighs more than its parts once you
+ * add welds, bolts and paint, so an entered value must win, but the difference
+ * has to stay visible rather than being silently absorbed. The UI reads both
+ * and flags the gap.
+ *
+ * A node with no children and no entered weight stays NULL, not 0. Zero would
+ * claim "this piece is weightless"; NULL correctly says "nobody has told us".
+ * That distinction propagates: an assembly whose children are all unweighed
+ * gets NULL, so a half-filled tree reports "unknown", never a false total.
+ *
+ * The effective unit weight is also mirrored into fab_item_metric_values under
+ * the company's weight metric key (default 'unit_weight_kg'), because that is
+ * what bufferService and the analytics page already join against to weigh WIP
+ * sitting in a machine buffer. Without the mirror, entering weights here would
+ * leave every buffer still falling back to counting pieces.
+ */
+
+import { pool } from '../../../db.js';
+import { logger } from '../../../core/utils/logger.js';
+
+/** The metric key buffers/analytics default to (fab_buffers.weight_metric_key). */
+const DEFAULT_WEIGHT_METRIC_KEY = 'unit_weight_kg';
+
+/** Decimal(18,6) — compare at that precision so float noise never causes a write. */
+function sameNumber(a, b) {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return Math.abs(Number(a) - Number(b)) < 1e-6;
+}
+
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Recompute computed_unit_weight + total_weight for every item in one order.
+ *
+ * @param {number} companyId
+ * @param {number} orderId
+ * @param {import('mysql2/promise').Connection} [conn] join an open transaction
+ * @returns {Promise<{updated:number, totalWeight:number|null, weighedItems:number, unweighedLeaves:number}>}
+ */
+export async function recomputeOrderWeights(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+
+  const [rows] = await exec.query(
+    `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight
+       FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+
+  if (!rows.length) {
+    return { updated: 0, totalWeight: null, weighedItems: 0, unweighedLeaves: 0 };
+  }
+
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const childrenOf = new Map();
+  const roots = [];
+  for (const r of rows) {
+    // A parent that is soft-deleted (or belongs to another order) is not in this
+    // set — treat such a row as a root so its subtree is still weighed rather
+    // than silently dropped from the order total.
+    if (r.parent_item_id != null && byId.has(r.parent_item_id)) {
+      if (!childrenOf.has(r.parent_item_id)) childrenOf.set(r.parent_item_id, []);
+      childrenOf.get(r.parent_item_id).push(r);
+    } else {
+      roots.push(r);
+    }
+  }
+
+  const effective = new Map(); // id -> number|null
+  const computed  = new Map(); // id -> number|null
+  let unweighedLeaves = 0;
+
+  // Iterative post-order. The tree is user-built and can be deep (the UI caps
+  // display at 12 levels but nothing caps the data), so recursion is avoided.
+  // `seen` also makes a cycle — which parent_item_id allows structurally —
+  // terminate instead of hanging the request.
+  const seen = new Set();
+  for (const root of roots) {
+    const stack = [{ node: root, visited: false }];
+    while (stack.length) {
+      const frame = stack.pop();
+      const { node } = frame;
+
+      if (!frame.visited) {
+        if (seen.has(node.id)) {
+          logger.warn({ companyId, orderId, itemId: node.id }, 'fab_erp: cycle in fab_items parent chain — subtree skipped in weight roll-up');
+          continue;
+        }
+        seen.add(node.id);
+        stack.push({ node, visited: true });
+        for (const child of childrenOf.get(node.id) ?? []) {
+          stack.push({ node: child, visited: false });
+        }
+        continue;
+      }
+
+      // children are resolved by now
+      const kids = childrenOf.get(node.id) ?? [];
+      let childSum = null;
+      for (const child of kids) {
+        const childEff = effective.get(child.id);
+        if (childEff === null || childEff === undefined) continue;
+        const childQty = toNum(child.qty) ?? 0;
+        childSum = (childSum ?? 0) + childEff * childQty;
+      }
+      computed.set(node.id, childSum);
+
+      const entered = toNum(node.unit_weight);
+      const eff = entered !== null ? entered : childSum;
+      effective.set(node.id, eff);
+
+      if (!kids.length && eff === null) unweighedLeaves++;
+    }
+  }
+
+  // ── persist only what actually changed ─────────────────────────────────────
+  let updated = 0;
+  let weighedItems = 0;
+  const metricPairs = [];
+
+  for (const r of rows) {
+    const newComputed = computed.has(r.id) ? computed.get(r.id) : null;
+    const eff = effective.has(r.id) ? effective.get(r.id) : null;
+    const qty = toNum(r.qty) ?? 0;
+    const newTotal = eff === null ? null : eff * qty;
+
+    if (eff !== null) {
+      weighedItems++;
+      metricPairs.push([r.id, eff]);
+    }
+
+    if (sameNumber(toNum(r.computed_unit_weight), newComputed)
+      && sameNumber(toNum(r.total_weight), newTotal)) {
+      continue;
+    }
+    await exec.query(
+      `UPDATE fab_items SET computed_unit_weight = ?, total_weight = ?
+        WHERE id = ? AND company_id = ?`,
+      [newComputed, newTotal, r.id, companyId],
+    );
+    updated++;
+  }
+
+  await syncWeightMetrics(exec, companyId, rows.map((r) => r.id), metricPairs);
+  await purgeMetricsForDeletedItems(exec, companyId, orderId);
+
+  // Order total = the roots only. Summing every row would count each piece once
+  // per level it appears under.
+  let totalWeight = null;
+  for (const root of roots) {
+    const eff = effective.get(root.id);
+    if (eff === null || eff === undefined) continue;
+    totalWeight = (totalWeight ?? 0) + eff * (toNum(root.qty) ?? 0);
+  }
+
+  return { updated, totalWeight, weighedItems, unweighedLeaves };
+}
+
+/**
+ * Mirror effective unit weights into fab_item_metric_values so machine buffers
+ * and the analytics page can weigh WIP. Rows whose weight became unknown have
+ * their metric row soft-deleted rather than set to 0 — see the module note on
+ * why NULL and 0 are not the same thing here.
+ */
+async function syncWeightMetrics(exec, companyId, allItemIds, metricPairs) {
+  if (!allItemIds.length) return;
+
+  const [existing] = await exec.query(
+    `SELECT id, item_id, metric_value FROM fab_item_metric_values
+      WHERE company_id = ? AND metric_key = ? AND deleted_at IS NULL AND item_id IN (?)`,
+    [companyId, DEFAULT_WEIGHT_METRIC_KEY, allItemIds],
+  );
+  const existingByItem = new Map(existing.map((e) => [e.item_id, e]));
+  const wanted = new Map(metricPairs);
+
+  for (const [itemId, value] of wanted) {
+    const row = existingByItem.get(itemId);
+    if (!row) {
+      await exec.query(
+        `INSERT INTO fab_item_metric_values (company_id, item_id, metric_key, metric_value)
+         VALUES (?, ?, ?, ?)`,
+        [companyId, itemId, DEFAULT_WEIGHT_METRIC_KEY, value],
+      );
+    } else if (!sameNumber(toNum(row.metric_value), value)) {
+      await exec.query(
+        'UPDATE fab_item_metric_values SET metric_value = ? WHERE id = ? AND company_id = ?',
+        [value, row.id, companyId],
+      );
+    }
+  }
+
+  const stale = existing.filter((e) => !wanted.has(e.item_id)).map((e) => e.id);
+  if (stale.length) {
+    await exec.query(
+      'UPDATE fab_item_metric_values SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)',
+      [companyId, stale],
+    );
+  }
+}
+
+/**
+ * Drop weight metrics belonging to items that have since been soft-deleted.
+ *
+ * syncWeightMetrics only ever sees the order's *live* rows, so without this a
+ * replace-mode import would leave the old tree's metric rows behind and they
+ * would accumulate on every re-upload. Written as a sweep over the order rather
+ * than a list passed in by the caller, so it self-heals regardless of how the
+ * items were deleted — the tree can also be pruned a row at a time from the UI.
+ * Scoped to this service's own metric key; nothing else here owns metrics.
+ */
+async function purgeMetricsForDeletedItems(exec, companyId, orderId) {
+  await exec.query(
+    `UPDATE fab_item_metric_values v
+       JOIN fab_items i ON i.id = v.item_id AND i.company_id = v.company_id
+        SET v.deleted_at = NOW()
+      WHERE v.company_id = ? AND v.metric_key = ? AND v.deleted_at IS NULL
+        AND i.order_id = ? AND i.deleted_at IS NOT NULL`,
+    [companyId, DEFAULT_WEIGHT_METRIC_KEY, orderId],
+  );
+}
+
+/**
+ * Order total without recomputing — a plain SUM over the roots, for list views.
+ * @returns {Promise<number|null>} null when nothing in the order has a weight yet
+ */
+export async function orderTotalWeight(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+  const [[row]] = await exec.query(
+    `SELECT SUM(total_weight) AS total, COUNT(total_weight) AS weighed
+       FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND parent_item_id IS NULL AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  return row?.weighed > 0 ? Number(row.total) : null;
+}

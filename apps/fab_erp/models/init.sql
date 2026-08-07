@@ -798,6 +798,64 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=D
 SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN unit VARCHAR(50) NULL','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- Dimensions + weight on fab_items (2026-08, see migrations/2026-08-order-bom-dims-weight.sql).
+-- Dimensions are entered on the rows that have no children — the cut pieces. Weight is entered
+-- at the bottom and rolls up: computed_unit_weight is Σ(child.qty × child effective unit weight),
+-- total_weight is (unit_weight ?? computed_unit_weight) × qty. Entered and computed are kept in
+-- separate columns so an assembly weighing more than its parts (welds, bolts, paint) reads as an
+-- override with a visible gap rather than silently clobbering one value with the other.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='length');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN `length` DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='width');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN width DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='height');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN height DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='dim_unit');
+SET @sql = IF(@col=0,"ALTER TABLE fab_items ADD COLUMN dim_unit VARCHAR(10) NOT NULL DEFAULT 'mm'",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='unit_weight');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN unit_weight DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='computed_unit_weight');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN computed_unit_weight DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='total_weight');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN total_weight DECIMAL(18,6) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='weight_unit');
+SET @sql = IF(@col=0,"ALTER TABLE fab_items ADD COLUMN weight_unit VARCHAR(10) NOT NULL DEFAULT 'kg'",'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_order_parent');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD INDEX idx_fi_order_parent (order_id, parent_item_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Generated identity code (2026-08, see migrations/2026-08-order-item-codes.sql).
+-- <CUSTOMER>-<ORDER NUMBER>-<ABBR>-<ABBR>… — the long code for drawings and paperwork,
+-- distinct from `mark`, which is the short thing painted on the steel. Server-issued and
+-- frozen once set (itemCodeService only fills blanks), so it is absent from writeFields.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='code');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN code VARCHAR(160) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='code_active');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN code_active VARCHAR(160) GENERATED ALWAYS AS (IF(deleted_at IS NULL, code, NULL)) VIRTUAL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='uq_fi_company_code_active');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD UNIQUE KEY uq_fi_company_code_active (company_id, code_active)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- Add bom_id to fab_material_bom_items
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_material_bom_items' AND COLUMN_NAME='bom_id');
 SET @sql = IF(@col=0,'ALTER TABLE fab_material_bom_items ADD COLUMN bom_id INT NULL','SELECT 1');
