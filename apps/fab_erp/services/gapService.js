@@ -14,7 +14,7 @@
  */
 
 import { pool } from '../../../db.js';
-import { resolveCapacityForResource, capacityIntervals } from './capacityService.js';
+import { resolveCapacityForResource, capacityIntervals, shiftInstancesForCapacity } from './capacityService.js';
 import { mergeIntervals } from './taskWaitService.js';
 import { zonedWallClockToUtc, calendarTimezones, tzForCalendar, DEFAULT_TZ } from './plantTime.js';
 import { reasonCatalogue, SCOPE_SITE, SCOPE_MACHINE, SCOPE_TASK } from './gapReasons.js';
@@ -97,32 +97,15 @@ export async function dayBoundsForResource(companyId, resourceId, date) {
 }
 
 /**
- * Everything the gap table needs for one machine-day.
+ * Everything already accounted for on one machine over a window: work that ran,
+ * machine-scope assertions, site-scope stoppages, and task holds.
  *
- * `explained` rows are what has already been asserted or derived, each carrying
- * the stream it came from so the UI can offer to withdraw it. `gaps` is what
- * remains of the working day.
+ * Shared by the single-day and the range reads. Pulled out of dayGaps when
+ * rangeGaps arrived, because grouping by shift instance would otherwise re-run
+ * these four queries once per instance — a week of two-shift days is fourteen
+ * times the work for identical rows.
  */
-export async function dayGaps(companyId, resourceId, date) {
-  const bounds = await dayBoundsForResource(companyId, resourceId, date);
-  if (!bounds) return null;
-  const { start, end } = bounds;
-
-  // The working day itself. No shift ⇒ no working time ⇒ nothing to explain;
-  // an empty day is not a gap, it is a day the plant was not open.
-  const cap = await resolveCapacityForResource(companyId, resourceId, bounds.plantId);
-  const workingFull = await capacityIntervals(companyId, cap, start, end);
-
-  // CLIP TO NOW. On today's date the rest of the shift has not happened yet, and
-  // offering it as "unaccounted" invites the supervisor to explain time that
-  // does not exist — which the shift-log save then correctly refuses with "work
-  // times cannot be in the future". A gap you are invited to fill and then
-  // blocked from filling is worse than no gap at all.
-  const now = new Date();
-  const working = workingFull
-    .map((iv) => ({ start: iv.start, end: iv.end > now ? now : iv.end }))
-    .filter((iv) => iv.end > iv.start);
-
+export async function explainedSpans(companyId, resourceId, plantId, start, end) {
   const catalogue = await reasonCatalogue(companyId);
   const labelFor = (code) => catalogue.find((r) => r.code === code)?.label ?? code;
 
@@ -194,7 +177,7 @@ export async function dayGaps(companyId, resourceId, date) {
        FROM fab_plant_events
       WHERE company_id = ? AND plant_id = ? AND deleted_at IS NULL
         AND superseded_by_id IS NULL AND from_ts < ? AND (to_ts IS NULL OR to_ts > ?)`,
-    [companyId, bounds.plantId, sqlUtc(end), sqlUtc(start)],
+    [companyId, plantId, sqlUtc(end), sqlUtc(start)],
   );
   for (const p of pe) {
     explained.push({
@@ -225,6 +208,38 @@ export async function dayGaps(companyId, resourceId, date) {
 
   explained.sort((a, b) => a.from - b.from);
 
+  return explained;
+}
+
+/**
+ * Everything the gap table needs for one machine-day.
+ *
+ * `explained` rows are what has already been asserted or derived, each carrying
+ * the stream it came from so the UI can offer to withdraw it. `gaps` is what
+ * remains of the working day.
+ */
+export async function dayGaps(companyId, resourceId, date) {
+  const bounds = await dayBoundsForResource(companyId, resourceId, date);
+  if (!bounds) return null;
+  const { start, end } = bounds;
+
+  // The working day itself. No shift ⇒ no working time ⇒ nothing to explain;
+  // an empty day is not a gap, it is a day the plant was not open.
+  const cap = await resolveCapacityForResource(companyId, resourceId, bounds.plantId);
+  const workingFull = await capacityIntervals(companyId, cap, start, end);
+
+  // CLIP TO NOW. On today's date the rest of the shift has not happened yet, and
+  // offering it as "unaccounted" invites the supervisor to explain time that
+  // does not exist — which the shift-log save then correctly refuses with "work
+  // times cannot be in the future". A gap you are invited to fill and then
+  // blocked from filling is worse than no gap at all.
+  const now = new Date();
+  const working = workingFull
+    .map((iv) => ({ start: iv.start, end: iv.end > now ? now : iv.end }))
+    .filter((iv) => iv.end > iv.start);
+
+  const explained = await explainedSpans(companyId, resourceId, bounds.plantId, start, end);
+
   // What is left of the working day. This IS the unexplained_idle the engine
   // computes — the table is a view of the model, not a parallel calculation.
   const gaps = subtract(working, explained.map((e) => ({ start: e.from, end: e.to })));
@@ -254,6 +269,115 @@ export async function dayGaps(companyId, resourceId, date) {
     working,
     explained,
     gaps,
+  };
+}
+
+/**
+ * A machine's time over a RANGE, grouped by shift instance.
+ *
+ * The calendar day is the wrong unit for a shop floor. A 22:00–06:00 shift is one
+ * thing a crew worked, and grouping by date splits it across two sheets — the
+ * 00:00–06:00 tail on one and the 22:00–24:00 head on the next. This groups by
+ * (shift, the local date the shift STARTED), so both halves stay together.
+ *
+ * Each instance carries its own working / explained / gap totals, so "Tuesday
+ * night is 2h short" is answerable without summing anything client-side.
+ */
+export async function rangeGaps(companyId, resourceId, fromDate, toDate) {
+  const startBounds = await dayBoundsForResource(companyId, resourceId, fromDate);
+  const endBounds = await dayBoundsForResource(companyId, resourceId, toDate);
+  if (!startBounds || !endBounds) return null;
+
+  const windowStart = startBounds.start;
+  const windowEnd = endBounds.end;
+
+  const cap = await resolveCapacityForResource(companyId, resourceId, startBounds.plantId);
+  let instances = await shiftInstancesForCapacity(companyId, cap, windowStart, windowEnd);
+
+  // Same clip-to-now rule as the single day: the rest of today has not happened,
+  // and inviting somebody to explain it only to have the save refuse them is
+  // worse than showing nothing.
+  const now = new Date();
+  instances = instances
+    .map((i) => ({ ...i, end: i.end > now ? now : i.end }))
+    .filter((i) => i.end > i.start);
+  if (!instances.length) {
+    return {
+      resourceId, resourceName: startBounds.resourceName, from: fromDate, to: toDate,
+      timezone: startBounds.tz, instances: [], workingMinutes: 0, explainedMinutes: 0, gapMinutes: 0,
+    };
+  }
+
+  // One pass over the whole range, then partitioned per instance — N instances
+  // would otherwise mean N× the queries for the same rows.
+  const explained = await explainedSpans(companyId, resourceId, startBounds.plantId, windowStart, windowEnd);
+
+  const byKey = new Map();
+  for (const i of instances) {
+    const key = `${i.shiftId}|${i.localDate}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key,
+        shiftId: i.shiftId,
+        shiftName: i.shiftName,
+        localDate: i.localDate,
+        startTime: i.startTime,
+        endTime: i.endTime,
+        crossesMidnight: i.crossesMidnight,
+        working: [],
+      });
+    }
+    byKey.get(key).working.push({ start: i.start, end: i.end });
+  }
+
+  const mins = (l, s = 'start', e = 'end') =>
+    Math.round(l.reduce((a, x) => a + (x[e] - x[s]) / 60000, 0));
+
+  const out = [];
+  for (const g of byKey.values()) {
+    const working = mergeIntervals(g.working);
+    const from = working[0].start;
+    const to = working[working.length - 1].end;
+
+    // Only the parts of each explanation that fall inside THIS instance. A
+    // breakdown spanning the gap between two shifts belongs to both, clipped.
+    const mine = [];
+    for (const e of explained) {
+      for (const w of working) {
+        const s = new Date(e.from) > w.start ? new Date(e.from) : w.start;
+        const en = new Date(e.to) < w.end ? new Date(e.to) : w.end;
+        if (en > s) mine.push({ ...e, from: s, to: en });
+      }
+    }
+    mine.sort((a, b) => a.from - b.from);
+
+    const gaps = subtract(working, mine.map((e) => ({ start: e.from, end: e.to })));
+    out.push({
+      ...g,
+      start: from,
+      end: to,
+      working,
+      explained: mine,
+      gaps,
+      workingMinutes: mins(working),
+      explainedMinutes: mins(mergeIntervals(mine.map((e) => ({ start: e.from, end: e.to })))),
+      gapMinutes: mins(gaps),
+    });
+  }
+
+  // Most recent first — a supervisor writing up the week starts with yesterday.
+  out.sort((a, b) => b.start - a.start);
+
+  return {
+    resourceId,
+    resourceName: startBounds.resourceName,
+    from: fromDate,
+    to: toDate,
+    timezone: startBounds.tz,
+    instances: out,
+    workingMinutes: out.reduce((a, i) => a + i.workingMinutes, 0),
+    explainedMinutes: out.reduce((a, i) => a + i.explainedMinutes, 0),
+    gapMinutes: out.reduce((a, i) => a + i.gapMinutes, 0),
   };
 }
 

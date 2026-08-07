@@ -21,10 +21,10 @@ import multer from 'multer';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
-import { dayGaps, dayBoundsForResource } from '../services/gapService.js';
+import { dayGaps, rangeGaps, dayBoundsForResource } from '../services/gapService.js';
 import { reasonCatalogue, findReason, SCOPE_SITE, SCOPE_MACHINE, SCOPE_TASK } from '../services/gapReasons.js';
 import { recomputeForResourceWindow } from '../services/taskAttributionService.js';
-import { zonedWallClockToUtc } from '../services/plantTime.js';
+import { zonedWallClockToUtc, zonedYMD } from '../services/plantTime.js';
 import { exportDayGaps, importDayGaps } from '../services/gapsImportService.js';
 
 const router = Router();
@@ -56,34 +56,107 @@ router.get('/gap-reasons', protect, async (req, res) => {
 
 // ── GET /gaps ────────────────────────────────────────────────────────────────
 
+// `?date=` returns ONE day, flat — kept because the Exception Feed deep-links
+// straight to the day an idle segment sits on.
+// `?from=&to=` returns the range grouped by SHIFT INSTANCE, which is what the
+// Shift Log uses: a 22:00–06:00 shift is one thing a crew worked, and the
+// calendar day splits it across two sheets.
 router.get('/gaps', protect, async (req, res) => {
   if (!requirePerm(req, res)) return;
   const resourceId = Number(req.query.resourceId);
   const date = String(req.query.date ?? '');
+  const from = String(req.query.from ?? '');
+  const to = String(req.query.to ?? '');
   if (!(resourceId > 0)) return res.status(400).json({ message: 'resourceId is required.' });
-  if (!isDate(date)) return res.status(400).json({ message: 'date must be YYYY-MM-DD.' });
 
   try {
+    if (isDate(from) && isDate(to)) {
+      if (from > to) return res.status(400).json({ message: '"from" must not be after "to".' });
+      const out = await rangeGaps(req.user.companyId, resourceId, from, to);
+      if (!out) return res.status(404).json({ message: 'Machine not found.' });
+      return res.json({ ok: true, ...out });
+    }
+    if (!isDate(date)) {
+      return res.status(400).json({ message: 'Provide date=YYYY-MM-DD, or from= and to=.' });
+    }
     const out = await dayGaps(req.user.companyId, resourceId, date);
     if (!out) return res.status(404).json({ message: 'Machine not found.' });
     return res.json({ ok: true, ...out });
   } catch (err) {
-    logger.error({ err, resourceId, date }, 'fab_erp gaps: day read failed');
-    return res.status(500).json({ message: 'Failed to load the day.' });
+    logger.error({ err, resourceId, date, from, to }, 'fab_erp gaps: read failed');
+    return res.status(500).json({ message: 'Failed to load.' });
+  }
+});
+
+// ── GET /gaps/coverage ───────────────────────────────────────────────────────
+// Totals only, every machine, one request. The Shift Log tab strip colours a dot
+// per machine; asking dayGaps per machine would be 43 round trips in prod for
+// numbers that fit in one row each.
+
+router.get('/gaps/coverage', protect, async (req, res) => {
+  if (!requirePerm(req, res)) return;
+  const companyId = req.user.companyId;
+  const from = String(req.query.from ?? '');
+  const to = String(req.query.to ?? '');
+  if (!isDate(from) || !isDate(to)) {
+    return res.status(400).json({ message: 'from and to must be YYYY-MM-DD.' });
+  }
+
+  try {
+    const [machines] = await pool.query(
+      `SELECT id, name, code FROM fab_resources
+        WHERE company_id = ? AND deleted_at IS NULL ORDER BY name`,
+      [companyId],
+    );
+
+    const out = [];
+    for (const m of machines) {
+      try {
+        const r = await rangeGaps(companyId, m.id, from, to);
+        out.push({
+          resourceId: m.id, name: m.name, code: m.code,
+          workingMinutes: r?.workingMinutes ?? 0,
+          explainedMinutes: r?.explainedMinutes ?? 0,
+          gapMinutes: r?.gapMinutes ?? 0,
+          // GREY, not red, when there is nothing to account for. A machine with
+          // no shift has no obligation, and colouring it red would train people
+          // to ignore the dot in the first week — it only works if it is
+          // believed. Amber means real unaccounted time; green means done.
+          state: (r?.workingMinutes ?? 0) === 0 ? 'none'
+            : (r.gapMinutes > 0 ? 'partial' : 'complete'),
+        });
+      } catch (err) {
+        // One bad machine must not blank the whole strip.
+        logger.warn({ err, resourceId: m.id }, 'gaps coverage: machine failed');
+        out.push({ resourceId: m.id, name: m.name, code: m.code, workingMinutes: 0, explainedMinutes: 0, gapMinutes: 0, state: 'none' });
+      }
+    }
+    return res.json({ ok: true, from, to, machines: out });
+  } catch (err) {
+    logger.error({ err, companyId }, 'fab_erp gaps: coverage failed');
+    return res.status(500).json({ message: 'Failed to load coverage.' });
   }
 });
 
 // ── POST /gaps/explain ───────────────────────────────────────────────────────
-// Body: { resourceId, date, code, fromTime, toTime, taskId?, party?, reference?, note? }
+// Body: { resourceId, date, code, fromTime, toTime, windowStart?, taskId?, ... }
 //
 // Times are WALL CLOCK at the site — the same convention as leave. Converting in
 // the browser would be right only while whoever is typing sits in the same
 // country as the plant.
+//
+// `windowStart` is the instant the shift being written up began, and it exists
+// because wall clock alone is ambiguous on a night shift. A 22:00–06:00 shift
+// whose gap runs 01:00–06:00 has BOTH times after midnight: resolved against the
+// shift's start date they land 24h early, in the PREVIOUS night's shift — which
+// is itself usually unaccounted, so the write would have succeeded silently and
+// filed the reason against the wrong night. Sending the window start lets the
+// server roll times forward onto the correct side of midnight.
 
 router.post('/gaps/explain', protect, async (req, res) => {
   if (!requirePerm(req, res)) return;
   const companyId = req.user.companyId;
-  const { resourceId, date, code, fromTime, toTime, taskId, party, reference, note } = req.body ?? {};
+  const { resourceId, date, code, fromTime, toTime, windowStart, taskId, party, reference, note } = req.body ?? {};
 
   if (!(Number(resourceId) > 0)) return res.status(400).json({ message: 'resourceId is required.' });
   if (!isDate(date)) return res.status(400).json({ message: 'date must be YYYY-MM-DD.' });
@@ -98,26 +171,46 @@ router.post('/gaps/explain', protect, async (req, res) => {
     if (!bounds) return res.status(404).json({ message: 'Machine not found.' });
 
     const norm = (t) => (/^\d{2}:\d{2}$/.test(String(t)) ? `${t}:00` : String(t));
-    const from = zonedWallClockToUtc(date, norm(fromTime), bounds.tz);
-    let to = zonedWallClockToUtc(date, norm(toTime), bounds.tz);
+    // Resolve wall clock N days after the anchor date. Re-resolving through the
+    // timezone rather than adding 24h is what keeps this right across a DST
+    // boundary, where a "day" is 23 or 25 hours.
+    const nDaysOn = (t, n) => {
+      const d = new Date(`${date}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + n);
+      return zonedWallClockToUtc(d.toISOString().slice(0, 10), norm(t), bounds.tz);
+    };
+
+    let from = nDaysOn(fromTime, 0);
+    let to = nDaysOn(toTime, 0);
     if (!from || !to) return res.status(400).json({ message: 'Times are not valid.' });
-    // Runs past midnight — a night shift's tail belongs to the next day.
-    if (to <= from) {
-      const next = new Date(`${date}T00:00:00Z`);
-      next.setUTCDate(next.getUTCDate() + 1);
-      to = zonedWallClockToUtc(next.toISOString().slice(0, 10), norm(toTime), bounds.tz);
+
+    // Both times sit after midnight on a night shift — push the pair forward.
+    const anchor = windowStart ? new Date(windowStart) : null;
+    if (anchor && !Number.isNaN(+anchor) && from < anchor) {
+      const rolled = nDaysOn(fromTime, 1);
+      if (rolled) { from = rolled; to = nDaysOn(toTime, 1) ?? to; }
     }
+    // Runs past midnight — a night shift's tail belongs to the next day.
+    if (to <= from) to = nDaysOn(toTime, from >= nDaysOn(fromTime, 1) ? 2 : 1) ?? to;
 
     // Must land inside a real gap. Explaining time that is already accounted for
     // is meaningless — the engine's segments do not overlap, so the UI must not
     // be able to express something the model cannot store.
-    const day = await dayGaps(companyId, Number(resourceId), date);
-    const insideAGap = day.gaps.some((g) => from >= g.start && to <= g.end);
+    //
+    // Checked against SHIFT gaps over the days the span actually touches, not
+    // against one calendar day's gaps. A day's gaps are clipped at midnight, so
+    // a 23:00–01:00 breakdown could never sit inside one and was rejected outright
+    // — the very entry a night shift most needs to make.
+    const spanFrom = zonedYMD(from, bounds.tz);
+    const spanTo = zonedYMD(to, bounds.tz);
+    const span = await rangeGaps(companyId, Number(resourceId), spanFrom, spanTo);
+    const candidateGaps = span.instances.flatMap((i) => i.gaps);
+    const insideAGap = candidateGaps.some((g) => from >= new Date(g.start) && to <= new Date(g.end));
     if (!insideAGap) {
       return res.status(409).json({
         code: 'NOT_IN_GAP',
         message: 'That span is outside the unaccounted time — it overlaps work or something already explained.',
-        gaps: day.gaps,
+        gaps: candidateGaps,
       });
     }
 
@@ -159,8 +252,12 @@ router.post('/gaps/explain', protect, async (req, res) => {
       return res.status(400).json({ message: `Reason "${code}" has no usable scope.` });
     }
 
-    // Re-derive over the day so the residual the user sees is the engine's.
-    recomputeForResourceWindow(companyId, Number(resourceId), bounds.start, bounds.end)
+    // Re-derive so the residual the user sees is the engine's. The window has to
+    // cover the span as written, which for a post-midnight entry reaches past the
+    // anchor day's end.
+    const reFrom = from < bounds.start ? from : bounds.start;
+    const reTo = to > bounds.end ? to : bounds.end;
+    recomputeForResourceWindow(companyId, Number(resourceId), reFrom, reTo)
       .catch((err) => logger.error({ err, resourceId }, 'gaps: recompute failed'));
 
     const after = await dayGaps(companyId, Number(resourceId), date);

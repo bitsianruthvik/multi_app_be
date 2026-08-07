@@ -40,6 +40,7 @@ import {
   workingIntervalsInWindow,
   workingMinutesInWindow,
   intervalsForShifts,
+  shiftInstancesInWindow,
   mergeIntervals,
 } from './taskWaitService.js';
 
@@ -242,6 +243,56 @@ export async function crewIntervals(companyId, resourceId, windowStart, windowEn
   }
 
   return mergeIntervals(spans);
+}
+
+/**
+ * Working time as SHIFT INSTANCES rather than anonymous spans.
+ *
+ * The Shift Log groups by "Night shift, Tuesday" because that is the unit a crew
+ * actually worked; the calendar day splits a 22:00–06:00 shift across two sheets
+ * and nobody can write that up.
+ *
+ * Calendar mode reads the machine's calendar directly. Crew mode uses the shifts
+ * its CREW are on as the frame, then clips each span to the crew's real
+ * availability — so somebody who left at 13:00 shortens that instance rather
+ * than deleting it. The frame has to come from the shift either way: crew
+ * intervals alone are a merged blob with no identity to group by.
+ */
+export async function shiftInstancesForCapacity(companyId, cap, windowStart, windowEnd) {
+  if (cap?.mode !== CAPACITY_CREW) {
+    return shiftInstancesInWindow(companyId, cap?.calendarIds ?? [], windowStart, windowEnd);
+  }
+
+  const [rows] = await pool.query(
+    `SELECT DISTINCT sh.calendar_id AS calendarId
+       FROM fab_worker_assignments a
+       JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
+       JOIN fab_worker_shifts ws
+              ON ws.worker_id = a.worker_id AND ws.deleted_at IS NULL
+             AND ws.superseded_by_id IS NULL
+             AND ws.from_ts < ? AND (ws.to_ts IS NULL OR ws.to_ts > ?)
+       JOIN fab_shifts sh ON sh.id = ws.shift_id AND sh.deleted_at IS NULL
+      WHERE a.company_id = ? AND a.resource_id = ? AND a.kind = 'assigned'
+        AND a.deleted_at IS NULL AND a.superseded_by_id IS NULL
+        AND a.from_ts < ? AND (a.to_ts IS NULL OR a.to_ts > ?)`,
+    [windowEnd, windowStart, companyId, cap.resourceId, windowEnd, windowStart],
+  );
+  const calendarIds = rows.map((r) => r.calendarId).filter(Boolean);
+  if (!calendarIds.length) return [];
+
+  const frame = await shiftInstancesInWindow(companyId, calendarIds, windowStart, windowEnd);
+  const actual = await crewIntervals(companyId, cap.resourceId, windowStart, windowEnd);
+
+  // Keep only the parts of each instance the crew were genuinely there for.
+  const out = [];
+  for (const f of frame) {
+    for (const a of actual) {
+      const s = f.start > a.start ? f.start : a.start;
+      const e = f.end < a.end ? f.end : a.end;
+      if (e > s) out.push({ ...f, start: s, end: e });
+    }
+  }
+  return out.sort((x, y) => x.start - y.start);
 }
 
 /** Merged working intervals from whichever source `cap` names. */
