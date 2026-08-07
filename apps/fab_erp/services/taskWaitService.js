@@ -290,7 +290,7 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
   }
 
   const [shiftRows] = await pool.query(
-    `SELECT id, calendar_id, start_time, end_time, working_minutes
+    `SELECT id, calendar_id, name, start_time, end_time, working_minutes
      FROM   fab_shifts
      WHERE  company_id = ? AND calendar_id IN (?) AND deleted_at IS NULL`,
     [companyId, calendarIds],
@@ -467,13 +467,83 @@ export async function workingIntervalsInWindow(companyId, calendarIds, windowSta
  * Returns un-merged intervals; the caller merges after intersecting each shift
  * with the person's assignment and subtracting their time away.
  */
+/**
+ * Working intervals TAGGED with the shift instance that produced them.
+ *
+ * `workingIntervalsInWindow` merges everything into anonymous spans, which is
+ * right for "was this a working minute?" and useless for "which shift was this?".
+ * The Shift Log needs the second question: a 22:00–06:00 night shift is ONE
+ * thing a crew worked, and grouping the day by calendar date splits it across
+ * two sheets — the 00:00–06:00 tail on one and the 22:00–24:00 head on the next.
+ * Nobody can write that up, because nobody worked it that way.
+ *
+ * The instance key is (shiftId, the LOCAL DATE THE SHIFT STARTED ON). That is
+ * what makes the night shift whole: both halves carry the starting date, so they
+ * group together even though they fall on either side of midnight.
+ *
+ * Returns one row per contiguous worked span — a shift with an unpaid break
+ * yields two rows sharing an instance key, which is correct: the break is not
+ * time anybody has to account for.
+ */
+export async function shiftInstancesInWindow(companyId, calendarIds, windowStart, windowEnd) {
+  if (!(windowEnd > windowStart) || calendarIds.length === 0) return [];
+
+  const tzMap = await calendarTimezones(companyId);
+
+  let dateFrom = null;
+  let dateTo = null;
+  for (const calId of calendarIds) {
+    const tz = tzForCalendar(tzMap, calId);
+    const from = zonedYMD(windowStart, tz);
+    const to = zonedYMD(windowEnd, tz);
+    if (dateFrom === null || from < dateFrom) dateFrom = from;
+    if (dateTo === null || to > dateTo) dateTo = to;
+  }
+  if (dateFrom === null) return [];
+  const walkFrom = addDaysYMD(dateFrom, -1);   // see collectWorkingIntervals
+
+  const { shiftsByCalendar, calendarDayMap } =
+    await loadCalendarSchedule(companyId, calendarIds, walkFrom, dateTo);
+
+  const out = [];
+  for (const date of allDatesInRange(walkFrom, dateTo)) {
+    for (const calId of Object.keys(shiftsByCalendar)) {
+      const shifts = shiftsByCalendar[calId];
+      if (!shifts?.length) continue;
+      if (calendarDayMap[calId]?.[date] === false) continue;
+      const tz = tzForCalendar(tzMap, calId);
+      for (const shift of shifts) {
+        for (const worked of workedIntervalsForShift(date, shift, tz)) {
+          const iv = clipToWindow(worked, windowStart, windowEnd);
+          if (!iv) continue;
+          out.push({
+            ...iv,
+            shiftId: shift.id,
+            shiftName: shift.name,
+            startTime: String(shift.start_time),
+            endTime: String(shift.end_time),
+            // The date the SHIFT began, not the date this span falls on.
+            localDate: date,
+            timezone: tz,
+            // True when the shift runs past midnight — the UI needs to render
+            // "Tue 22:00 → Wed 06:00" rather than pretending it is one date.
+            crossesMidnight: String(shift.end_time) <= String(shift.start_time),
+          });
+        }
+      }
+    }
+  }
+  out.sort((a, b) => a.start - b.start);
+  return out;
+}
+
 export async function intervalsForShifts(companyId, shiftIds, windowStart, windowEnd) {
   if (!shiftIds?.length || !(windowEnd > windowStart)) return [];
 
   const tzMap = await calendarTimezones(companyId);
 
   const [shiftRows] = await pool.query(
-    `SELECT id, calendar_id, start_time, end_time, working_minutes
+    `SELECT id, calendar_id, name, start_time, end_time, working_minutes
        FROM fab_shifts
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, shiftIds],
