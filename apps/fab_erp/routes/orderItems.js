@@ -22,6 +22,7 @@ import {
   recomputeOrderWeightsHandler,
   orderWeightSummaryHandler,
   generateOrderItemCodesHandler,
+  orderNestingHandler,
 } from '../controllers/orderItemsImportController.js';
 
 const router = Router();
@@ -40,5 +41,7 @@ router.post('/orders/:orderId/items/recompute-weights', protect, requirePerm('fa
 router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_erp_projects_manage'), generateOrderItemCodesHandler);
 // Read-only: gated on view, not manage — anyone who can open the order sees its tonnage.
 router.get('/orders/:orderId/items/weight-summary', protect, orderWeightSummaryHandler);
+// Read-only too — seeing what the order is waiting on is not a manage action.
+router.get('/orders/:orderId/items/nesting', protect, orderNestingHandler);
 
 export default router;

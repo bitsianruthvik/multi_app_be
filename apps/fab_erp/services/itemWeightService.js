@@ -60,7 +60,8 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
   const exec = conn ?? pool;
 
   const [rows] = await exec.query(
-    `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight
+    `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
+            catalog_item_id, flow_id
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
@@ -128,7 +129,12 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       const eff = entered !== null ? entered : childSum;
       effective.set(node.id, eff);
 
-      if (!kids.length && eff === null) unweighedLeaves++;
+      // A raw-material link (catalog item, no flow) is not something anyone
+      // types a weight on — the plate is bought by the tonne and the weight
+      // that matters is the cut part's, which sits on the row above. Counting
+      // these would report every properly-filled order as incomplete.
+      const isRmLink = node.catalog_item_id != null && node.flow_id == null;
+      if (!kids.length && eff === null && !isRmLink) unweighedLeaves++;
     }
   }
 

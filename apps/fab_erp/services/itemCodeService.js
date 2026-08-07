@@ -1,28 +1,30 @@
 /**
- * itemCodeService.js — generated identity codes for an order's item tree.
+ * itemCodeService.js — identity codes for an order's item tree.
  *
- *   <CUSTOMER>-<ORDER NUMBER>-<ABBR>-<ABBR>-…
- *   BRDG-SO-20260722-0001-GRDRA-TOPFLNG-PLT20
+ *   code = <parent's code> - <this row's abbreviation>
  *
- * The code names the row's position in the job: who it is for, which order, and
- * the chain of assemblies down to the part. It is the long code for drawings and
- * paperwork — `fab_items.mark` stays the short thing painted on the steel.
+ *   BRDG-SO-20260722-0001            (the order's prefix)
+ *   BRDG-SO-20260722-0001-GRDA       Girder A          abbr GRDA
+ *   BRDG-SO-20260722-0001-GRDA-TF1   Top Flange        abbr TF1
  *
- * TWO RULES, both from how these get used:
+ * The rule is plain concatenation, and that is deliberate. The way these sheets
+ * actually get filled is top-down: you write a row's name and abbreviation, read
+ * the code it produces, and paste that code into the next sheet as the parent of
+ * its children. That only works if the code is something you can predict by
+ * eye — so nothing here rewrites, compresses or de-duplicates the chain. What
+ * you type is what you get.
  *
- *  1. **Frozen once issued.** Generation only fills blanks. A code that exists
- *     is already on a drawing, so renaming the item must not move it. Same rule
- *     as piece marks, and for the same reason.
+ * The abbreviation is yours to choose. `abbreviate()` only fills in when the
+ * column is left blank, and the codes it produces are the ones nobody bothered
+ * to name — a convenience, not the main path.
  *
- *  2. **An abbreviation is never repeated down a chain.** "Girder A > Girder A
- *     Web" would otherwise read GRDRA-GRDRAWEB, restating its parent. Any
- *     segment whose abbreviation already appears among its ancestors is
- *     dropped, which is what keeps a six-level code readable.
+ * **Frozen once issued.** Generation only ever fills blanks. By the time a code
+ * exists it is on a drawing, so renaming or re-parenting the item must not move
+ * it. `code` is therefore absent from `fabErpItem.writeFields`.
  *
- * Two different items can still abbreviate identically (two "Top Flange" rows
- * under differently-named parents collide only if those parents were skipped by
- * rule 2). The final code is uniquified with a numeric suffix rather than
- * allowing a clash — a code that names two pieces is worse than an ugly one.
+ * The one thing that IS enforced is uniqueness: two rows that would land on the
+ * same code get a `-2`, `-3` suffix. A code naming two pieces is worse than an
+ * ugly one.
  */
 
 import { pool } from '../../../db.js';
@@ -52,7 +54,7 @@ function abbreviateToken(tok) {
   return shortenWord(tok);
 }
 
-/** "Top Flange" -> "TOPFLNG", "Plate 20 cut" -> "PLT20CUT". */
+/** "Top Flange" -> "TOPFLNG". Only used when the Abbr column is left blank. */
 export function abbreviate(name, maxLen = MAX_SEGMENT) {
   const all = String(name ?? '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
   if (!all.length) return 'X';
@@ -71,17 +73,33 @@ export function customerAbbrev(name) {
   return first ? abbreviateToken(first).slice(0, 4) : 'CUST';
 }
 
-/**
- * Fill in `code` for every row of one order that does not have one yet.
- *
- * @param {number} companyId
- * @param {number} orderId
- * @param {import('mysql2/promise').Connection} [conn] join an open transaction
- * @returns {Promise<{coded:number, skipped:number, alreadyCoded:number}>}
- */
-export async function generateOrderItemCodes(companyId, orderId, conn) {
-  const exec = conn ?? pool;
+/** Normalise a hand-typed abbreviation to the same shape the codes use. */
+export function normaliseAbbr(raw) {
+  const s = String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, MAX_SEGMENT);
+  return s || null;
+}
 
+/**
+ * The segment naming a raw material — its catalog code, kept whole.
+ *
+ * Squeezing it like a part name is actively harmful: 'MSP-E350BO-20' and
+ * 'MSP-E350BO-16' both truncate to near-identical stubs, chopping off the
+ * thickness, which is the only thing telling the two plates apart. Internal
+ * dashes are kept (they read naturally and nothing ever splits a code on them)
+ * and the allowance is generous — a 160-character code has the room.
+ */
+export function materialSegment(catalogCode, fallbackName) {
+  const s = String(catalogCode ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '').replace(/^-+|-+$/g, '');
+  return s.slice(0, 24) || abbreviate(fallbackName);
+}
+
+/**
+ * The `<CUSTOMER>-<ORDER NUMBER>` head every code in one order shares. This is
+ * what a Level 1 row hangs off, and what the sheet shows once instead of on
+ * every line.
+ */
+export async function orderCodePrefix(companyId, orderId, conn) {
+  const exec = conn ?? pool;
   const [[order]] = await exec.query(
     `SELECT o.order_number, o.customer_name, c.name AS customer_master_name
        FROM fab_orders o
@@ -90,13 +108,55 @@ export async function generateOrderItemCodes(companyId, orderId, conn) {
     [orderId, companyId],
   );
   if (!order) throw new Error('Order not found');
-
   // fab_customers.code is a serial ('CUST-0001'), which identifies nothing to a
-  // reader, so the prefix comes from the customer's NAME. The master record wins
-  // over the order's free-text copy when both exist.
-  const custPart  = customerAbbrev(order.customer_master_name || order.customer_name);
-  const orderPart = String(order.order_number ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '') || `ORD${orderId}`;
-  const prefix    = `${custPart}-${orderPart}`;
+  // reader, so the prefix comes from the customer's NAME.
+  const cust = customerAbbrev(order.customer_master_name || order.customer_name);
+  const num  = String(order.order_number ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '') || `ORD${orderId}`;
+  return `${cust}-${num}`;
+}
+
+/** `<parentCode>-<ABBR>`, trimmed to fit the column. */
+export function composeCode(parentCode, abbr) {
+  return `${parentCode}-${abbr}`.slice(0, MAX_CODE);
+}
+
+/**
+ * Make `base` unique against `used`, appending -2, -3, … The suffix is trimmed
+ * out of the base rather than added on top, so the result never overruns the
+ * column — truncating afterwards would drop the very digits that make it unique.
+ */
+export function uniquifyCode(base, used) {
+  let candidate = base.slice(0, MAX_CODE);
+  let n = 1;
+  while (used.has(candidate) && n <= 9999) {
+    n++;
+    const suffix = `-${n}`;
+    candidate = `${base.slice(0, MAX_CODE - suffix.length)}${suffix}`;
+  }
+  return candidate;
+}
+
+/** Every code already taken in this company — the unique index enforces it too. */
+export async function loadUsedCodes(companyId, conn) {
+  const exec = conn ?? pool;
+  const [taken] = await exec.query(
+    'SELECT code FROM fab_items WHERE company_id = ? AND code IS NOT NULL AND deleted_at IS NULL',
+    [companyId],
+  );
+  return new Set(taken.map((t) => t.code));
+}
+
+/**
+ * Fill in `code` for every row of one order that does not have one — used for
+ * rows added by hand in the tree, and as a backstop after an import.
+ *
+ * Walks parents before children so a child can always read its parent's code.
+ *
+ * @returns {Promise<{coded:number, skipped:number, alreadyCoded:number}>}
+ */
+export async function generateOrderItemCodes(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+  const prefix = await orderCodePrefix(companyId, orderId, conn);
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, name, code FROM fab_items
@@ -107,64 +167,50 @@ export async function generateOrderItemCodes(companyId, orderId, conn) {
   if (!rows.length) return { coded: 0, skipped: 0, alreadyCoded: 0 };
 
   const byId = new Map(rows.map((r) => [r.id, r]));
-
-  // Every code live in the company — a new one must not collide with an order
-  // that was coded months ago, and the unique index would reject it anyway.
-  const [taken] = await exec.query(
-    'SELECT code FROM fab_items WHERE company_id = ? AND code IS NOT NULL AND deleted_at IS NULL',
-    [companyId],
-  );
-  const used = new Set(taken.map((t) => t.code));
-
-  /** Root-first list of abbreviations, with repeats of an ancestor dropped. */
-  function chainFor(item) {
-    const names = [];
-    let cur = item;
-    const guard = new Set();
-    while (cur && !guard.has(cur.id)) {
-      guard.add(cur.id);
-      names.unshift(cur.name);
-      cur = cur.parent_item_id != null ? byId.get(cur.parent_item_id) : null;
+  const childrenOf = new Map();
+  const roots = [];
+  for (const r of rows) {
+    if (r.parent_item_id != null && byId.has(r.parent_item_id)) {
+      if (!childrenOf.has(r.parent_item_id)) childrenOf.set(r.parent_item_id, []);
+      childrenOf.get(r.parent_item_id).push(r);
+    } else {
+      roots.push(r);
     }
-    const out = [];
-    const seen = new Set();
-    for (const n of names) {
-      const a = abbreviate(n);
-      if (seen.has(a)) continue; // rule 2 — never restate an ancestor
-      seen.add(a);
-      out.push(a);
-    }
-    return out;
   }
 
+  const used = await loadUsedCodes(companyId, conn);
   let coded = 0;
   let alreadyCoded = 0;
   let skipped = 0;
 
-  for (const item of rows) {
-    if (item.code) { alreadyCoded++; continue; }
+  // Breadth-first from the roots: a child's code needs its parent's, so the
+  // parent must be resolved first. `seen` also makes a cycle terminate.
+  const seen = new Set();
+  const queue = roots.map((r) => ({ row: r, parentCode: prefix }));
+  while (queue.length) {
+    const { row, parentCode } = queue.shift();
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
 
-    const base = [prefix, ...chainFor(item)].join('-').slice(0, MAX_CODE);
-    let candidate = base;
-    let n = 1;
-    // Suffix until free. Trimmed from the base so the result never overruns the
-    // column — truncating after appending would drop the very digits that make
-    // it unique.
-    while (used.has(candidate)) {
-      n++;
-      const suffix = `-${n}`;
-      candidate = `${base.slice(0, MAX_CODE - suffix.length)}${suffix}`;
-      if (n > 9999) break;
+    let myCode = row.code;
+    if (myCode) {
+      alreadyCoded++;
+    } else {
+      const candidate = uniquifyCode(composeCode(parentCode, abbreviate(row.name)), used);
+      if (used.has(candidate)) { skipped++; continue; }
+      await exec.query(
+        'UPDATE fab_items SET code = ? WHERE id = ? AND company_id = ? AND code IS NULL',
+        [candidate, row.id, companyId],
+      );
+      used.add(candidate);
+      row.code = candidate;
+      myCode = candidate;
+      coded++;
     }
-    if (used.has(candidate)) { skipped++; continue; }
 
-    await exec.query(
-      'UPDATE fab_items SET code = ? WHERE id = ? AND company_id = ? AND code IS NULL',
-      [candidate, item.id, companyId],
-    );
-    used.add(candidate);
-    item.code = candidate;
-    coded++;
+    for (const child of childrenOf.get(row.id) ?? []) {
+      queue.push({ row: child, parentCode: myCode });
+    }
   }
 
   return { coded, skipped, alreadyCoded };
