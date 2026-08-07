@@ -30,6 +30,7 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
+import { machinePerformance, fleetPerformance } from '../services/machineAnalyticsService.js';
 
 const router = Router();
 
@@ -244,6 +245,72 @@ router.get('/analytics/machines', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId }, 'fab_erp analytics/machines: unexpected error');
     return res.status(500).json({ message: 'Internal server error computing machine analytics.' });
+  }
+});
+
+// ── GET /analytics/machine-performance ───────────────────────────────────────
+//
+// The unified per-machine view: where the time went, what came off it, and how
+// fast it runs when it runs.
+//
+// DELIBERATELY SEPARATE FROM /analytics/machines, which reads the machine-state
+// event stream directly. This one derives its time use from `rangeGaps` — the
+// same function the Shift Log renders — so what a supervisor writes up and what
+// this page reports can never disagree. The older endpoint answers "what state
+// was the machine in", which is a different question with a different
+// denominator, and merging them would silently change numbers people already
+// read.
+//
+// `?from=&to=` are plain dates (default: last 30 days), because a shift instance
+// belongs to the local date it STARTED and half-days would split night shifts.
+
+const isDateOnly = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+/** Dates for the performance routes — date-only, defaulting to the last 30 days. */
+function parseDateRange(query) {
+  const ymd = (d) => {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  };
+  const to = isDateOnly(query.to) ? query.to : ymd(new Date());
+  if (isDateOnly(query.from)) return { from: query.from, to };
+  const back = new Date(`${to}T00:00:00`);
+  back.setDate(back.getDate() - (DEFAULT_RANGE_DAYS - 1));
+  return { from: ymd(back), to };
+}
+
+router.get('/analytics/machine-performance', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user)) return denyPermission(res, user, 'analytics/machine-performance');
+  const companyId = user.companyId;
+  const { from, to } = parseDateRange(req.query);
+  if (from > to) return res.status(400).json({ message: '"from" is after "to".' });
+
+  try {
+    const machines = await fleetPerformance(companyId, from, to);
+    return res.json({ ok: true, from, to, machines });
+  } catch (err) {
+    logger.error({ err, companyId }, 'fab_erp analytics/machine-performance: failed');
+    return res.status(500).json({ message: 'Failed to compute machine performance.' });
+  }
+});
+
+router.get('/analytics/machine-performance/:resourceId', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user)) return denyPermission(res, user, 'analytics/machine-performance/:id');
+  const companyId = user.companyId;
+  const resourceId = Number(req.params.resourceId);
+  if (!(resourceId > 0)) return res.status(400).json({ message: 'A machine is required.' });
+  const { from, to } = parseDateRange(req.query);
+  if (from > to) return res.status(400).json({ message: '"from" is after "to".' });
+
+  try {
+    const perf = await machinePerformance(companyId, resourceId, from, to);
+    if (!perf) return res.status(404).json({ message: 'Machine not found.' });
+    return res.json({ ok: true, ...perf });
+  } catch (err) {
+    logger.error({ err, companyId, resourceId }, 'fab_erp analytics/machine-performance detail: failed');
+    return res.status(500).json({ message: 'Failed to compute machine performance.' });
   }
 });
 
