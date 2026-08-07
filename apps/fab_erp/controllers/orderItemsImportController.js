@@ -98,6 +98,7 @@ export const orderNestingHandler = async (req, res) => {
               fic.name                                   AS materialName,
               fic.unit                                   AS materialUnit,
               rm.id                                      AS linkId,
+              rm.nest_no                                 AS nestNo,
               rm.qty                                     AS qtyPerPart,
               parent.id                                  AS partId,
               parent.code                                AS partCode,
@@ -111,7 +112,7 @@ export const orderNestingHandler = async (req, res) => {
           AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM fab_items c
                            WHERE c.parent_item_id = rm.id AND c.deleted_at IS NULL)
-        ORDER BY fic.code, parent.code`,
+        ORDER BY fic.code, rm.nest_no, parent.code`,
       [cid, orderId],
     );
 
@@ -142,25 +143,44 @@ export const orderNestingHandler = async (req, res) => {
           onHand: s ? Number(s.onHand) : 0,
           pieces: s ? Number(s.pieces) : 0,
           inStock: !!s && Number(s.onHand) > 0,
+          nests: [],
           parts: [],
         };
         byId.set(r.catalogItemId, entry);
         materials.push(entry);
       }
-      byId.get(r.catalogItemId).parts.push({
+      const entry = byId.get(r.catalogItemId);
+      const part = {
         linkId: r.linkId,
         partId: r.partId,
         partCode: r.partCode,
         partName: r.partName,
         partQty: Number(r.partQty),
         qtyPerPart: r.qtyPerPart != null ? Number(r.qtyPerPart) : null,
-      });
+      };
+      entry.parts.push(part);
+
+      // Grouped by nest as well as flat, because a nest is one physical plate:
+      // "these fourteen come off N-001" is the question the shop asks, and a
+      // flat list of ninety parts against a material cannot answer it.
+      // Links with no nest_no stand alone rather than being lumped together —
+      // nobody has said they share a plate.
+      const nestKey = r.nestNo || `~solo-${r.linkId}`;
+      let nest = entry.nests.find((n) => n.key === nestKey);
+      if (!nest) {
+        nest = { key: nestKey, nestNo: r.nestNo ?? null, parts: [] };
+        entry.nests.push(nest);
+      }
+      nest.parts.push(part);
     }
 
+    const blocked = materials.filter((m) => !m.inStock);
     res.json({
       materials,
-      waitingOnStock: materials.filter((m) => !m.inStock).length,
-      partsBlocked: materials.filter((m) => !m.inStock).reduce((n, m) => n + m.parts.length, 0),
+      nests: materials.reduce((n, m) => n + m.nests.length, 0),
+      waitingOnStock: blocked.length,
+      nestsBlocked: blocked.reduce((n, m) => n + m.nests.length, 0),
+      partsBlocked: blocked.reduce((n, m) => n + m.parts.length, 0),
     });
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });

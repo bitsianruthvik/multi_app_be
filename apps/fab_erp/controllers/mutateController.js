@@ -121,6 +121,40 @@ async function runConsumptionGate(resource, filteredPayload, companyId) {
 const VALID_OPS = new Set(['insert', 'update', 'delete']);
 
 /**
+ * `fab_orders.confirmed_date` is a consequence of confirming an order, not a
+ * field anyone should type. It is stamped here — the one place every fab_erp
+ * write passes through — rather than in the two dialogs that can set a status,
+ * because a rule split across call sites is a rule that drifts.
+ *
+ *   insert : a draft has no confirmation date. Anything sent is discarded unless
+ *            the order is being created already confirmed.
+ *   update : entering 'confirmed' stamps today, but only if the order does not
+ *            already carry a date — a confirmation that happened last week must
+ *            not be rewritten to today by an unrelated edit.
+ *
+ * Moving back to draft deliberately leaves the date alone: it records that the
+ * order WAS confirmed on that day, which stays true afterwards.
+ */
+async function applyOrderConfirmationStamp(resource, op, filteredPayload, companyId, id) {
+  if (resource !== 'fabErpOrder') return;
+  const today = new Date().toISOString().slice(0, 10);
+  const status = filteredPayload.status;
+
+  if (op === 'insert') {
+    filteredPayload.confirmed_date = status === 'confirmed' ? (filteredPayload.confirmed_date || today) : null;
+    return;
+  }
+  if (op !== 'update' || status !== 'confirmed') return;
+  if (filteredPayload.confirmed_date) return; // an explicit correction wins
+
+  const [[row]] = await pool.query(
+    'SELECT confirmed_date FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
+    [id, companyId],
+  );
+  if (row && !row.confirmed_date) filteredPayload.confirmed_date = today;
+}
+
+/**
  * Resolves the set of fields required for this write, from the resource's
  * declared `requiredFields` config in resourceDef.json:
  *   { always: [...], byOrderType: { <typeValue>: [...] }, orderTypeField: 'order_type' }
@@ -256,6 +290,16 @@ export async function mutate(req, res) {
         'fab_erp mutate: consumption gate DB error',
       );
       return res.status(500).json({ message: 'Approval check failed. Please try again.' });
+    }
+  }
+
+  // ── 6b. Server-owned field stamps ─────────────────────────────────────────
+  if (op === 'insert' || op === 'update') {
+    try {
+      await applyOrderConfirmationStamp(resource, op, filteredPayload, companyId, payload?.id);
+    } catch (stampErr) {
+      logger.error({ stampErr, resource, op }, 'fab_erp mutate: confirmation stamp failed');
+      return res.status(500).json({ message: 'Could not set the confirmation date. Please try again.' });
     }
   }
 

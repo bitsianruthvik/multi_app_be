@@ -65,7 +65,11 @@ const LEVEL_COLS = [
   { header: 'Notes',            width: 26, key: 'notes' },
 ];
 
+// One row = ONE physical plate and the parts laid out on it. Nest No is what
+// makes "twenty parts off one plate" expressible at all — without it every part
+// carried its own unrelated material link.
 const NEST_COLS = [
+  { header: 'Nest No',              width: 12, key: 'nestNo' },
   { header: 'Raw Material Code *',  width: 24, key: 'rmCode' },
   { header: 'Parts Cut From It *',  width: 60, key: 'partCodes' },
   { header: 'Qty per Part',         width: 12, key: 'qty' },
@@ -148,7 +152,7 @@ export async function exportOrderItemsTemplate(companyId, orderId) {
 
   const [items] = await pool.query(
     `SELECT fi.id, fi.parent_item_id, fi.name, fi.code, fi.qty, fi.unit, fi.length, fi.width, fi.height,
-            fi.unit_weight, fi.catalog_item_id, fic.code AS catalog_code, fof.name AS flow_name
+            fi.unit_weight, fi.catalog_item_id, fi.nest_no, fic.code AS catalog_code, fof.name AS flow_name
        FROM fab_items fi
        LEFT JOIN fab_item_catalog fic ON fic.id = fi.catalog_item_id
        LEFT JOIN fab_operation_flows fof ON fof.id = fi.flow_id AND fof.deleted_at IS NULL
@@ -217,10 +221,15 @@ export async function exportOrderItemsTemplate(companyId, orderId) {
     `  share a name without any confusion. Every code on this order starts with ${prefix}-`,
     '',
     'NESTING SHEET',
-    '  This is where raw material comes in. One row per raw material:',
+    '  ONE ROW = ONE PLATE, and the parts laid out on it. Ten or twenty parts off a single plate',
+    '  is the normal case, so put all their codes on that one row.',
+    '    Nest No             names the plate, e.g. N-001, N-002. Only has to be unique within a',
+    '                        material. Leave it blank and one is numbered for you.',
     '    Raw Material Code   the Item Catalog code of the plate/section/bar being cut',
-    '    Parts Cut From It   the codes of the parts nested out of it — several per row, separated',
-    '                        by commas, or one part per row repeating the material code. Either way.',
+    '    Parts Cut From It   the codes of the parts nested out of THAT plate, comma-separated.',
+    '                        Repeating the same Nest No on another row adds parts to the same plate.',
+    '  Use a new Nest No for each physical plate: two plates of the same 20 mm stock are N-001 and',
+    '  N-002, not one row with everything on it.',
     '  This is what links material to work: when that material is received into stock, every task',
     '  waiting on it is released automatically.',
     '',
@@ -290,16 +299,24 @@ export async function exportOrderItemsTemplate(companyId, orderId) {
   // ── Nesting sheet ────────────────────────────────────────────────────────
   const wsNest = wb.addWorksheet('Nesting');
   styledHeader(wsNest, NEST_COLS);
-  // Existing links read back grouped: one row per material, listing the parts.
-  const byMaterial = new Map();
+  // One row per NEST — a nest is one physical plate, so the parts sharing it
+  // belong on the same line. Links with no nest_no (anything created before
+  // nests existed, or added by hand in the tree) each stand alone, which is the
+  // honest reading: nobody has said they share a plate.
+  const byNest = new Map();
   for (const link of rmLinks) {
     const parentCode = link.parent_item_id != null ? byId.get(link.parent_item_id)?.code : null;
     if (!parentCode || !link.catalog_code) continue;
-    if (!byMaterial.has(link.catalog_code)) byMaterial.set(link.catalog_code, { parts: [], qty: link.qty, unit: link.unit });
-    byMaterial.get(link.catalog_code).parts.push(parentCode);
+    const key = `${link.catalog_code}|${link.nest_no ?? `~solo-${link.id}`}`;
+    if (!byNest.has(key)) {
+      byNest.set(key, { nestNo: link.nest_no ?? '', rmCode: link.catalog_code, parts: [], qty: link.qty, unit: link.unit });
+    }
+    byNest.get(key).parts.push(parentCode);
   }
-  for (const [rmCode, g] of byMaterial) {
-    wsNest.addRow([rmCode, g.parts.join(', '), g.qty != null ? Number(g.qty) : 1, g.unit ?? '', '']);
+  const nestRowsOut = [...byNest.values()].sort((a, b) => (a.rmCode === b.rmCode
+    ? String(a.nestNo).localeCompare(String(b.nestNo)) : a.rmCode.localeCompare(b.rmCode)));
+  for (const g of nestRowsOut) {
+    wsNest.addRow([g.nestNo, g.rmCode, g.parts.join(', '), g.qty != null ? Number(g.qty) : 1, g.unit ?? '', '']);
   }
 
   // ── Flows reference ──────────────────────────────────────────────────────
@@ -432,6 +449,7 @@ function parseNestingSheet(ws) {
     if (!rmCode && !parts) return;
     rows.push({
       sheet: ws.name, kind: 'nesting', row: rowNumber,
+      nestNo: cellVal(row, NCOL.nestNo),
       rmCode: rmCode ?? '',
       partCodes: splitCodeList(parts),
       qty:  numVal(row, NCOL.qty),
@@ -485,7 +503,7 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
   const result = {
     mode,
     itemsCreated: 0, itemsSkipped: 0, itemsDeleted: 0,
-    nestingLinks: 0,
+    nestingLinks: 0, nests: 0,
     totalWeight: null, unweighedLeaves: 0,
     warnings: [],
   };
@@ -497,7 +515,8 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
 
   const conn = await pool.getConnection();
   const rowLog = [];
-  const byCode = new Map(); // code key -> fab_items.id
+  const byCode = new Map();   // code key -> fab_items.id
+  const nestKeys = new Set(); // material|nestNo — how many distinct plates were declared
 
   try {
     await conn.beginTransaction();
@@ -600,6 +619,16 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
     // the catalog item and no flow — exactly the shape taskGatingService reads
     // as "material to consume", which is what makes stock receipt release the
     // waiting tasks automatically.
+    // Nest numbers only have to be unique within a material, and a blank one
+    // still has to produce a groupable row — otherwise "which parts share a
+    // plate" would be unanswerable for anyone who left the column empty.
+    const nestSeq = new Map();
+    const nextNestNo = (materialCode) => {
+      const n = (nestSeq.get(materialCode) ?? 0) + 1;
+      nestSeq.set(materialCode, n);
+      return `N-${String(n).padStart(3, '0')}`;
+    };
+
     for (const r of nestRows) {
       const base = { sheet: r.sheet, row: r.row, parentCode: '', name: r.rmCode, code: null };
       const skip = (reason) => { rowLog.push({ ...base, status: 'Skipped', reason }); result.itemsSkipped++; };
@@ -609,6 +638,8 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
       if (!material) { skip(`Raw Material Code '${r.rmCode}' is not in the Item Catalog.`); continue; }
       if (!r.partCodes.length) { skip('List at least one part code under "Parts Cut From It".'); continue; }
 
+      const nestNo = String(r.nestNo ?? '').trim() || nextNestNo(codeKey(material.code));
+      if (!nestSeq.has(codeKey(material.code))) nestSeq.set(codeKey(material.code), 0);
       const rmAbbr = materialSegment(material.code, material.name);
 
       for (const partCode of r.partCodes) {
@@ -627,17 +658,20 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
         }
         const [ins] = await conn.query(
           `INSERT INTO fab_items
-             (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id, code)
-           VALUES (?,?,?,?,?,?,?,NULL,?)`,
+             (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id, code, nest_no)
+           VALUES (?,?,?,?,?,?,?,NULL,?,?)`,
           [companyId, orderId, partId, material.id, material.name,
-            r.unit || material.unit || 'pcs', r.qty ?? 1, code],
+            r.unit || material.unit || 'pcs', r.qty ?? 1, code, nestNo],
         );
         byCode.set(codeKey(code), ins.insertId);
         usedCodes.add(code);
-        rowLog.push({ ...partBase, status: 'Created', code, reason: `Nested from ${material.code}` });
+        rowLog.push({ ...partBase, status: 'Created', code, reason: `Nest ${nestNo} — ${material.code}` });
         result.nestingLinks++;
+        nestKeys.add(`${codeKey(material.code)}|${nestNo}`);
       }
     }
+
+    result.nests = nestKeys.size;
 
     const weights = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = weights.totalWeight;
