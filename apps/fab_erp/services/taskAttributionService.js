@@ -8,14 +8,22 @@
  * Two kinds of wait windows are built per task:
  *
  *   (a) PRE-ELIGIBILITY  — created_at → deps_cleared (or now if still blocked).
- *       Classified WHOLESALE as a single reason (waiting_predecessors /
- *       waiting_materials) based on the task's CURRENT gate state, because we
- *       keep no per-minute history of when each predecessor/input cleared.
- *       SIMPLIFICATION (per EU-3 spec): if predecessors aren't all done OR a
- *       depends_on is unmet → waiting_predecessors; else if a gate=1 input is
- *       still unsatisfied → waiting_materials; else the window is treated as
- *       "deps cleared instantly" and skipped. A task that has already cleared
- *       therefore contributes nothing here (current state shows all satisfied).
+ *       SLICED BY WHAT WAS OUTSTANDING as of 2026-08-06. The window is cut at
+ *       each blocker's clear time (a predecessor's completed_at, an input's
+ *       satisfied_at); within a slice the blocking set is constant, so the slice
+ *       carries the reason that was true DURING it and names the blocker when
+ *       exactly one thing was outstanding. See loadBlockers / sliceByBlocker.
+ *
+ *       It used to stamp ONE reason over the whole window from the task's state
+ *       at recompute time. Measured in production, that was 86.5% of all
+ *       attributed waiting (196,345 hours) in a bucket that could not name the
+ *       dependency responsible — and worse, a task whose gates had all cleared
+ *       matched none of the branches, so its window was skipped entirely: 533
+ *       cleared tasks, not one carrying a pre-eligibility segment.
+ *
+ *       WITH SEVERAL BLOCKERS OUTSTANDING, NO SINGLE ONE IS NAMED. Clearing any
+ *       one of them early would not have released the task, so attributing the
+ *       wait to one would invent a cause; the label says how many instead.
  *
  *   (b) ELIGIBLE  — deps_cleared → started (or now if not yet started), and
  *   (c) PAUSE GAPS — each paused→resumed pair (trailing paused → now for
@@ -50,7 +58,8 @@ import {
   fetchOverlappingOtherTasks,
   mergeIntervals,
 } from './taskWaitService.js';
-import { processPredecessorsDone, isOutputBlocked } from './taskGatingService.js';
+import { isOutputBlocked } from './taskGatingService.js';
+import { parseDependsOn } from './taskGatingService.js';
 import { resolveCapacity, capacityIntervals } from './capacityService.js';
 import { reasonCatalogue } from './gapReasons.js';
 import { crewForWindow, coveredIntervals } from './workerService.js';
@@ -137,24 +146,132 @@ async function loadMachineDownIntervals(companyId, resourceId, now) {
 }
 
 /**
- * Periods in [windowStart, windowEnd) when this machine had nobody on it.
+ * Everything that had to happen before this task could start, and when each of
+ * them actually happened.
  *
- * This used to read `fab_resource_operators` and could only produce WHOLE DATES
- * — "every standing operator has an absent_on row for this day" — because
- * absence was a DATE column. An afternoon with nobody on the machine was
- * therefore invisible to attribution, and a half-day of idle time got
- * classified as `unexplained_idle` instead of the real cause.
+ * Two kinds:
+ *   predecessor — a sibling task in the same (item_id, flow_id) at a
+ *                 predecessor seq_no. Mirrors processPredecessorsDone exactly:
+ *                 explicit `depends_on` when present, else the immediately
+ *                 previous seq_no. Clears when that task completed.
+ *   input       — a gate = 1 row in fab_task_inputs. Clears at `satisfied_at`.
  *
- * It now derives from `fab_worker_assignments` intervals (workerService
- * .coveredIntervals): no_operator is simply the window minus the time at least
- * one assigned worker was present and not away.
- *
- * IMPORTANT SAFETY PROPERTY, PRESERVED FROM THE OLD RULE: a machine with no
- * crew assigned at all yields NO no_operator intervals. Absence of a roster
- * means we don't know who was there, not that nobody was — and claiming
- * otherwise would reclassify the entire history of every machine that hasn't
- * been rostered yet, which is most of them.
+ * `clearedAt === null` means still outstanding — which, for 3,281 tasks in
+ * production, is the answer that matters.
  */
+async function loadBlockers(companyId, task) {
+  const blockers = [];
+
+  // ── process predecessors ────────────────────────────────────────────────
+  const [siblings] = await pool.query(
+    `SELECT t.id, t.seq_no AS seqNo, t.status, t.completed_at AS completedAt,
+            op.name AS operationName
+       FROM fab_project_tasks t
+       LEFT JOIN fab_operations op ON op.id = t.operation_id
+      WHERE t.company_id = ? AND t.item_id = ? AND t.flow_id = ? AND t.deleted_at IS NULL`,
+    [companyId, task.item_id, task.flow_id],
+  );
+  const deps = parseDependsOn(task.depends_on);
+  let predSeqs;
+  if (deps.length > 0) {
+    predSeqs = deps;
+  } else {
+    let prev = null;
+    for (const s of siblings.map((r) => Number(r.seqNo))) {
+      if (s < Number(task.seq_no) && (prev === null || s > prev)) prev = s;
+    }
+    predSeqs = prev === null ? [] : [prev];
+  }
+  for (const sn of predSeqs) {
+    const p = siblings.find((r) => Number(r.seqNo) === Number(sn));
+    if (!p) continue;
+    blockers.push({
+      type: 'predecessor',
+      refId: p.id,
+      label: `${p.operationName ?? `Step ${p.seqNo}`} (step ${p.seqNo})`,
+      clearedAt: p.status === 'done' && p.completedAt ? new Date(p.completedAt) : null,
+    });
+  }
+
+  // ── gating material inputs ──────────────────────────────────────────────
+  const [inputs] = await pool.query(
+    `SELECT ti.id, ti.input_role AS role, ti.satisfied_at AS satisfiedAt,
+            COALESCE(ci.name, pi.name, ti.input_role) AS label
+       FROM fab_task_inputs ti
+       LEFT JOIN fab_item_catalog ci ON ci.id = ti.ref_catalog_item_id
+       LEFT JOIN fab_items pi ON pi.id = ti.producing_item_id
+      WHERE ti.company_id = ? AND ti.task_id = ? AND ti.gate = 1 AND ti.deleted_at IS NULL`,
+    [companyId, task.id],
+  );
+  for (const i of inputs) {
+    blockers.push({
+      type: 'input',
+      refId: i.id,
+      label: i.label ?? 'material',
+      clearedAt: i.satisfiedAt ? new Date(i.satisfiedAt) : null,
+    });
+  }
+
+  return blockers;
+}
+
+/**
+ * Carve the pre-eligibility window by WHAT WAS OUTSTANDING, instead of stamping
+ * one reason over the whole thing.
+ *
+ * Cut points are the moments the blocking set changes — each blocker's clear
+ * time. Within a slice the outstanding set is constant, so:
+ *
+ *   reason  = waiting_predecessors if any predecessor is outstanding, else
+ *             waiting_materials. Predecessors rank first because a task cannot
+ *             use material it has nowhere to put yet; the upstream step is the
+ *             real constraint while it is unfinished.
+ *   blocker = named when exactly ONE thing is outstanding. With several, no
+ *             single one is responsible — removing any one changes nothing — so
+ *             the label says how many rather than picking a scapegoat.
+ *
+ * Segments still tile the window with no overlaps; that invariant is what the
+ * whole engine rests on.
+ */
+function sliceByBlocker(windowStart, windowEnd, blockers) {
+  const outstandingAt = (t) => blockers.filter((b) => b.clearedAt === null || b.clearedAt > t);
+
+  // Cut wherever something cleared inside the window.
+  const cuts = [windowStart, windowEnd];
+  for (const b of blockers) {
+    if (b.clearedAt && b.clearedAt > windowStart && b.clearedAt < windowEnd) cuts.push(b.clearedAt);
+  }
+  cuts.sort((a, b) => a - b);
+
+  const out = [];
+  for (let i = 0; i < cuts.length - 1; i++) {
+    const s = cuts[i];
+    const e = cuts[i + 1];
+    if (e <= s) continue;
+    const live = outstandingAt(s);
+    if (live.length === 0) continue;   // nothing was blocking — not a wait
+
+    const preds = live.filter((b) => b.type === 'predecessor');
+    const kind = preds.length > 0 ? 'predecessor' : 'input';
+    const pool_ = preds.length > 0 ? preds : live;
+
+    out.push({
+      start: s,
+      end: e,
+      reason: kind === 'predecessor' ? 'waiting_predecessors' : 'waiting_materials',
+      blockerType: kind,
+      // Only name a culprit when there is exactly one. Attributing a wait to one
+      // of five simultaneous blockers would invent a cause: clearing it early
+      // would not have released the task.
+      blockerRefId: pool_.length === 1 ? pool_[0].refId : null,
+      blockerLabel: pool_.length === 1
+        ? pool_[0].label
+        : `${pool_.length} ${kind === 'predecessor' ? 'upstream steps' : 'materials'}`,
+    });
+  }
+  return out;
+}
+
 /**
  * Site-wide stoppages covering this machine's plant — rain, a power cut, a
  * shutdown. One `fab_plant_events` row covers every machine at the plant, which
@@ -208,6 +325,25 @@ async function loadTaskHoldIntervals(companyId, taskId, windowStart, windowEnd, 
   return byReason;
 }
 
+/**
+ * Periods in [windowStart, windowEnd) when this machine had nobody on it.
+ *
+ * This used to read `fab_resource_operators` and could only produce WHOLE DATES
+ * — "every standing operator has an absent_on row for this day" — because
+ * absence was a DATE column. An afternoon with nobody on the machine was
+ * therefore invisible to attribution, and a half-day of idle time got
+ * classified as `unexplained_idle` instead of the real cause.
+ *
+ * It now derives from `fab_worker_assignments` intervals (workerService
+ * .coveredIntervals): no_operator is simply the window minus the time at least
+ * one assigned worker was present and not away.
+ *
+ * IMPORTANT SAFETY PROPERTY, PRESERVED FROM THE OLD RULE: a machine with no
+ * crew assigned at all yields NO no_operator intervals. Absence of a roster
+ * means we don't know who was there, not that nobody was — and claiming
+ * otherwise would reclassify the entire history of every machine that hasn't
+ * been rostered yet, which is most of them.
+ */
 async function loadNoOperatorIntervals(companyId, resourceId, windowStart, windowEnd) {
   const crew = await crewForWindow(pool, companyId, resourceId, windowStart, windowEnd);
   if (crew.length === 0) return [];
@@ -266,31 +402,38 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
 
   const segments = []; // { reason, start, end, wm, group:'pre'|'active' }
 
-  // ── window (a): pre-eligibility (wholesale classification) ──────────────────
+  // ── window (a): pre-eligibility, SLICED BY WHAT WAS OUTSTANDING ─────────────
+  //
+  // This used to stamp ONE reason over the whole window, chosen from the task's
+  // state at recompute time. Two consequences, both measured in production:
+  //
+  //   * it is 86.5% of all attributed waiting (196,345 hours) in a single
+  //     bucket that cannot name the dependency responsible, and
+  //   * a task whose gates had all cleared matched none of the branches, so the
+  //     window was skipped entirely — 533 cleared tasks, not one carrying a
+  //     pre-eligibility segment.
+  //
+  // Now the window is cut wherever the blocking set changes, each slice carries
+  // the reason that was true DURING it, and the blocker is named when exactly
+  // one thing was outstanding.
   if (createdAt) {
-    const aTo = depsClearedAt || (task.status === 'blocked' ? now : null);
+    // Ends when the task became eligible; for one still blocked, it is still
+    // running, and that open-ended slice is the actionable one — it says what is
+    // holding the task right now and for how long it has been doing so.
+    const aTo = depsClearedAt || (isDone ? null : now);
     if (aTo && aTo > createdAt) {
-      let reason = null;
-      const predsDone = await processPredecessorsDone(pool, companyId, task);
-      if (!predsDone) {
-        reason = 'waiting_predecessors';
-      } else {
-        // Read-only proxy for "a gated input is still unsatisfied": a gate=1
-        // row with no satisfied_at. (taskGatingService's live check mutates
-        // satisfied_at, so we deliberately don't call it here.)
-        const [inp] = await pool.query(
-          `SELECT 1 FROM fab_task_inputs
-            WHERE company_id = ? AND task_id = ? AND gate = 1
-              AND satisfied_at IS NULL AND deleted_at IS NULL
-            LIMIT 1`,
-          [companyId, taskId],
-        );
-        if (inp.length > 0) reason = 'waiting_materials';
-      }
-      if (reason) {
-        const inShiftA = await capacityIntervals(companyId, cap, createdAt, aTo);
+      const blockers = await loadBlockers(companyId, task);
+      for (const slice of sliceByBlocker(createdAt, aTo, blockers)) {
+        const inShift = await capacityIntervals(companyId, cap, slice.start, slice.end);
         segments.push({
-          reason, start: createdAt, end: aTo, wm: Math.round(sumMinutes(inShiftA)), group: 'pre',
+          reason: slice.reason,
+          start: slice.start,
+          end: slice.end,
+          wm: Math.round(sumMinutes(inShift)),
+          group: 'pre',
+          blockerType: slice.blockerType,
+          blockerRefId: slice.blockerRefId,
+          blockerLabel: slice.blockerLabel,
         });
       }
     }
@@ -408,7 +551,12 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
   for (const s of segments) {
     if (s.end <= s.start) continue;
     const last = merged[merged.length - 1];
-    if (last && last.reason === s.reason && last.group === s.group && s.start <= last.end) {
+    // Blocker must match too. Two adjacent slices with the same reason but
+    // different blockers are the whole point of the change; merging them would
+    // quietly rebuild the undiagnosable lump.
+    if (last && last.reason === s.reason && last.group === s.group
+        && last.blockerRefId === s.blockerRefId && last.blockerLabel === s.blockerLabel
+        && s.start <= last.end) {
       if (s.end > last.end) last.end = s.end;
       last.wm += s.wm;
     } else {
@@ -425,10 +573,14 @@ export async function recomputeTaskAttribution(companyId, taskId, now = new Date
       [companyId, taskId],
     );
     if (merged.length > 0) {
-      const rows = merged.map((s) => [companyId, taskId, s.reason, s.start, s.end, s.wm, now]);
+      const rows = merged.map((s) => [
+        companyId, taskId, s.reason, s.start, s.end, s.wm, now,
+        s.blockerType ?? null, s.blockerRefId ?? null, s.blockerLabel ?? null,
+      ]);
       await conn.query(
         `INSERT INTO fab_task_wait_segments
-           (company_id, task_id, reason, seg_start, seg_end, working_minutes, computed_at)
+           (company_id, task_id, reason, seg_start, seg_end, working_minutes, computed_at,
+            blocker_type, blocker_ref_id, blocker_label)
          VALUES ?`,
         [rows],
       );

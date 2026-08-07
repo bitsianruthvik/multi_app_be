@@ -1439,7 +1439,12 @@ router.get('/tasks/:id/wait-breakdown', protect, async (req, res) => {
   try {
     const loadSegments = async () => {
       const [rows] = await pool.query(
-        `SELECT reason, seg_start, seg_end, working_minutes
+        // blocker_* names WHAT was holding the task during each pre-eligibility
+        // slice — the difference between "waiting on predecessors" and "waiting on
+        // the weld consumable spool since Tuesday".
+        `SELECT reason, seg_start, seg_end, working_minutes,
+                blocker_type AS blockerType, blocker_ref_id AS blockerRefId,
+                blocker_label AS blockerLabel
            FROM fab_task_wait_segments
           WHERE company_id = ? AND task_id = ? AND deleted_at IS NULL
           ORDER BY seg_start ASC`,

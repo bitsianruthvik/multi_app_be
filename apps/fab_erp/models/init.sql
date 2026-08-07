@@ -2691,3 +2691,40 @@ CREATE TABLE IF NOT EXISTS fab_gap_reasons (
   UNIQUE KEY uq_fgr_company_code (company_id, code),
   KEY idx_fgr_company (company_id, active)
 );
+
+-- Blocker detail on wait segments (2026-08-06) ------------------------------
+-- The pre-eligibility window is now sliced by WHAT WAS OUTSTANDING rather than
+-- stamped with one reason. These columns name the blocker per slice. See
+-- taskAttributionService.loadBlockers / sliceByBlocker.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'fab_task_wait_segments' AND COLUMN_NAME = 'blocker_type');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_task_wait_segments ADD COLUMN blocker_type VARCHAR(20) NULL COMMENT 'predecessor | input — what kind of thing was holding the task during this segment'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'fab_task_wait_segments' AND COLUMN_NAME = 'blocker_ref_id');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_task_wait_segments ADD COLUMN blocker_ref_id INT NULL COMMENT 'the predecessor fab_project_tasks.id, or the fab_task_inputs.id — NULL when several were outstanding at once'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'fab_task_wait_segments' AND COLUMN_NAME = 'blocker_label');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE fab_task_wait_segments ADD COLUMN blocker_label VARCHAR(200) NULL COMMENT 'human name of the blocker, denormalised at write time so the read path stays one query'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Answers "what is holding the most work up right now", which is the whole point.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'fab_task_wait_segments' AND INDEX_NAME = 'idx_ftws_blocker');
+SET @sql = IF(@idx = 0,
+  "CREATE INDEX idx_ftws_blocker ON fab_task_wait_segments (company_id, blocker_type, blocker_ref_id)",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
