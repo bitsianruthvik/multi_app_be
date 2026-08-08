@@ -15,6 +15,12 @@
  *       · component (child node)    → from the child's produced (in_stock) pieces
  *     A shortage aborts the start (throws INSUFFICIENT_STOCK) — this is the real
  *     enforcement of the material gate.
+ *   - ONE PLATE PER NEST (2026-08): raw material on a link carrying a `nest_no`
+ *     is issued once for the whole nest, not once per part. The shop takes one
+ *     plate to the machine and cuts everything out of it; issuing per part drew
+ *     the same plate from stock as many times as it had parts on it. The first
+ *     part to start claims the nest (see claimNest) and draws the plate; the rest
+ *     start normally and draw nothing. Links with `nest_no` NULL are unchanged.
  *   - At the TERMINAL operation's completion the WIP piece is finalized
  *     (wip→in_stock), i.e. it "changes to the next BOM level". A top-level node's
  *     finished piece posts to a Finished-Goods location; sub-assemblies stay in
@@ -172,6 +178,53 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
 }
 
 /**
+ * Claim the raw material for this part's first operation.
+ *
+ * Returns `{ qty, nestNo, claimId }` when the caller should go ahead and draw
+ * stock, or `null` when the plate has already gone to the floor for another
+ * part on the same nest — twenty parts nested on one plate must draw that plate
+ * once, not twenty times.
+ *
+ * The claim is an INSERT against a UNIQUE key rather than a read-then-write:
+ * two operators pressing Start in the same second would both pass a check, but
+ * only one can win the index.
+ *
+ * A link with no nest_no returns the per-part quantity unchanged, which is what
+ * every order created before nesting existed depends on.
+ */
+async function claimNest(conn, companyId, task, node, inp, required) {
+  const [[link]] = await conn.query(
+    `SELECT nest_no, qty FROM fab_items
+      WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id = ?
+        AND flow_id IS NULL AND deleted_at IS NULL
+      LIMIT 1`,
+    [companyId, node.id, inp.ref_catalog_item_id],
+  );
+
+  const nestNo = link?.nest_no ?? null;
+  if (!nestNo) return { qty: required, nestNo: null, claimId: null };
+
+  // On a nested link the quantity describes the PLATE, not the part — the
+  // Nesting sheet carries one row per plate, so every link cut from it inherits
+  // that same figure. Falling back to `required` keeps a blank column working.
+  const qty = link.qty != null && Number(link.qty) > 0 ? Number(link.qty) : required;
+  const orderId = task.order_id ?? node.order_id;
+
+  try {
+    const [ins] = await conn.query(
+      `INSERT INTO fab_nest_issues
+         (company_id, order_id, catalog_item_id, nest_no, qty, unit, task_id, item_id)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [companyId, orderId, inp.ref_catalog_item_id, nestNo, qty, inp.unit ?? null, task.id, node.id],
+    );
+    return { qty, nestNo, claimId: ins.insertId };
+  } catch (err) {
+    if (err?.code === 'ER_DUP_ENTRY') return null; // already on the floor
+    throw err;
+  }
+}
+
+/**
  * On task START: for the first step, consume gated inputs and open the node's
  * WIP piece; for a later step, move the WIP piece to this machine's area.
  * Throws INSUFFICIENT_STOCK if any input can't be fully consumed.
@@ -206,10 +259,28 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
           if (!ok) throw insufficientStock(`Not enough of component item #${inp.producing_item_id} in stock to start this task.`);
         }
       } else if (inp.ref_catalog_item_id) {
-        const ok = await consumeStock(conn, companyId, inp.ref_catalog_item_id, required, {
-          txnType: 'wip_issue', notes: `issued to item ${node.id} (task ${task.id})`,
+        // A nested plate goes to the machine ONCE and everything is cut out of
+        // it. Issuing per part would draw the same plate from stock twenty
+        // times over. claimNest returns null when this nest has already gone to
+        // the floor — the part still starts, it just does not re-issue.
+        const nest = await claimNest(conn, companyId, task, node, inp, required);
+        if (nest === null) continue;
+
+        const ok = await consumeStock(conn, companyId, inp.ref_catalog_item_id, nest.qty, {
+          txnType: 'wip_issue',
+          notes: nest.nestNo
+            ? `issued nest ${nest.nestNo} to item ${node.id} (task ${task.id})`
+            : `issued to item ${node.id} (task ${task.id})`,
         });
-        if (!ok) throw insufficientStock(`Not enough raw material (catalog item #${inp.ref_catalog_item_id}) in stock to start this task.`);
+        if (!ok) {
+          // The claim and the stock movement have to stand or fall together, or
+          // a shortage would leave the nest marked as issued and every other
+          // part on it silently skipping its material.
+          if (nest.claimId) {
+            await conn.query('DELETE FROM fab_nest_issues WHERE id = ?', [nest.claimId]);
+          }
+          throw insufficientStock(`Not enough raw material (catalog item #${inp.ref_catalog_item_id}) in stock to start this task.`);
+        }
       }
     }
 

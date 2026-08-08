@@ -868,6 +868,30 @@ SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEM
 SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD INDEX idx_fi_order_nest (order_id, catalog_item_id, nest_no)','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- A nested plate is issued from stock ONCE, not once per part cut from it
+-- (2026-08, see migrations/2026-08-nest-issue-once.sql). The first task to start on a
+-- nest inserts here and consumes; later parts on the same nest find the row and consume
+-- nothing. The UNIQUE key is what makes concurrent starts safe. Links with nest_no NULL
+-- keep the per-part behaviour every pre-nest order relies on.
+CREATE TABLE IF NOT EXISTS fab_nest_issues (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_id        INT            NOT NULL,
+  catalog_item_id INT            NOT NULL,
+  nest_no         VARCHAR(40)    NOT NULL,
+  qty             DECIMAL(18,6)  NULL,
+  unit            VARCHAR(20)    NULL,
+  task_id         INT            NULL,
+  item_id         INT            NULL,
+  issued_at       DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  UNIQUE KEY uq_fni_nest (company_id, order_id, catalog_item_id, nest_no),
+  KEY idx_fni_order (order_id)
+);
+
 -- Add bom_id to fab_material_bom_items
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_material_bom_items' AND COLUMN_NAME='bom_id');
 SET @sql = IF(@col=0,'ALTER TABLE fab_material_bom_items ADD COLUMN bom_id INT NULL','SELECT 1');

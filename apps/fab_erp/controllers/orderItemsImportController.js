@@ -168,18 +168,52 @@ export const orderNestingHandler = async (req, res) => {
       const nestKey = r.nestNo || `~solo-${r.linkId}`;
       let nest = entry.nests.find((n) => n.key === nestKey);
       if (!nest) {
-        nest = { key: nestKey, nestNo: r.nestNo ?? null, parts: [] };
+        nest = {
+          key: nestKey,
+          nestNo: r.nestNo ?? null,
+          // On a nested link the quantity describes the plate, so it is the
+          // nest's requirement — counted once however many parts sit on it.
+          qty: r.qtyPerPart != null ? Number(r.qtyPerPart) : null,
+          parts: [],
+        };
         entry.nests.push(nest);
       }
       nest.parts.push(part);
     }
 
-    const blocked = materials.filter((m) => !m.inStock);
+    // Requirement = one plate per nest. Summing the per-part rows would ask for
+    // the same plate as many times as it has parts on it, which is exactly the
+    // arithmetic this replaced.
+    const [issued] = catalogIds.length
+      ? await pool.query(
+        `SELECT catalog_item_id, nest_no FROM fab_nest_issues
+          WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+        [cid, orderId],
+      )
+      : [[]];
+    const issuedSet = new Set(issued.map((i) => `${i.catalog_item_id}|${i.nest_no}`));
+
+    for (const m of materials) {
+      m.required = m.nests.reduce((sum, n) => sum + (n.qty ?? 0), 0) || null;
+      for (const n of m.nests) {
+        n.issued = n.nestNo ? issuedSet.has(`${m.catalogItemId}|${n.nestNo}`) : false;
+      }
+      m.nestsIssued = m.nests.filter((n) => n.issued).length;
+      // What still has to be on hand — a plate already cut is no longer needed.
+      m.stillRequired = m.nests
+        .filter((n) => !n.issued)
+        .reduce((sum, n) => sum + (n.qty ?? 0), 0) || null;
+      m.short = m.stillRequired != null && m.stillRequired > m.onHand;
+    }
+
+    // "Short" is the sharper signal than "not in stock": a material can have
+    // pieces on hand and still not cover the plates this order has left to cut.
+    const blocked = materials.filter((m) => m.short || !m.inStock);
     res.json({
       materials,
       nests: materials.reduce((n, m) => n + m.nests.length, 0),
       waitingOnStock: blocked.length,
-      nestsBlocked: blocked.reduce((n, m) => n + m.nests.length, 0),
+      nestsBlocked: blocked.reduce((n, m) => n + m.nests.filter((x) => !x.issued).length, 0),
       partsBlocked: blocked.reduce((n, m) => n + m.parts.length, 0),
     });
   } catch (err) {

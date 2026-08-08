@@ -72,7 +72,9 @@ const NEST_COLS = [
   { header: 'Nest No',              width: 12, key: 'nestNo' },
   { header: 'Raw Material Code *',  width: 24, key: 'rmCode' },
   { header: 'Parts Cut From It *',  width: 60, key: 'partCodes' },
-  { header: 'Qty per Part',         width: 12, key: 'qty' },
+  // Per NEST, not per part: one plate goes to the machine and everything is cut
+  // out of it, so this is how much material that plate is.
+  { header: 'Qty of Material',      width: 15, key: 'qty' },
   { header: 'Unit',                 width: 9,  key: 'unit' },
   { header: 'Notes',                width: 26, key: 'notes' },
 ];
@@ -228,8 +230,11 @@ export async function exportOrderItemsTemplate(companyId, orderId) {
     '    Raw Material Code   the Item Catalog code of the plate/section/bar being cut',
     '    Parts Cut From It   the codes of the parts nested out of THAT plate, comma-separated.',
     '                        Repeating the same Nest No on another row adds parts to the same plate.',
+    '    Qty of Material     how much this ONE plate is — 1 plate, or its weight. It is drawn from',
+    '                        stock ONCE for the whole nest, not once per part on it.',
     '  Use a new Nest No for each physical plate: two plates of the same 20 mm stock are N-001 and',
-    '  N-002, not one row with everything on it.',
+    '  N-002, not one row with everything on it. That is also how the material requirement is',
+    '  counted — the order needs one plate per nest, however many parts sit on it.',
     '  This is what links material to work: when that material is received into stock, every task',
     '  waiting on it is released automatically.',
     '',
