@@ -31,6 +31,7 @@ import { tryClearTask } from './taskGatingService.js';
 // — shipped/closed are ranked higher and only ever set by hand). Forward-only:
 // a status already at/above the computed target (incl. a manual shipped/closed)
 // is never moved back.
+//
 const SALES_STATUS_RANK = {
   draft: 0, confirmed: 1, scheduled: 2, in_production: 3, ready_to_ship: 4, shipped: 5, closed: 6,
 };
@@ -90,6 +91,14 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
     // to sales only on 2026-08-05, so it became unreachable and both sets went
     // with it.
     if (order.status === 'cancelled') return;
+
+    // A DRAFT IS AN ORDER STILL IN THE WIZARD, and building the project tree is
+    // one of the wizard's steps — it happens BEFORE anyone confirms. Without
+    // this guard the tree step would advance the order straight to 'scheduled',
+    // stepping over confirmation entirely and leaving the Confirm button with
+    // nothing left to do. Only Confirm takes an order out of draft.
+    if (order.status === 'draft') return;
+
     let salesTarget;
     if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
     else if (done > 0 || active > 0) salesTarget = 'in_production';
@@ -128,26 +137,35 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
 }
 
 /**
- * FEAT-03: per-line completion. A line maps to its top-level fab_items node(s)
- * by catalog_item_id within the order; qty_completed = line.qty × (done / total
- * tasks for those nodes). Best-effort — errors bubble to rollUpOrderStatus's catch.
+ * FEAT-03: per-line completion — qty_completed = line.qty × (done / total tasks
+ * belonging to that line). Best-effort; errors bubble to rollUpOrderStatus's catch.
+ *
+ * The link used to be catalog_item_id: a line named a catalog item, and its
+ * items were the top-level nodes carrying the same one. That could not survive
+ * lines becoming free text (2026-08-10) — the catalog holds raw materials and
+ * consumables, and no fabricator is going to add a one-off 42m span to it. So a
+ * line now owns its subtree outright through fab_items.order_line_id, which is
+ * both the honest relationship and cheaper to query.
+ *
+ * Counts EVERY task under the line, not just the top node's, because that is
+ * what completion means: a girder is not half done because its own two tasks
+ * are, while three hundred parts underneath are untouched.
  */
 async function rollUpLineProgress(exec, companyId, orderId) {
   const [lines] = await exec.query(
-    `SELECT id, catalog_item_id, qty FROM fab_order_lines
+    `SELECT id, qty FROM fab_order_lines
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
   for (const line of lines) {
-    if (!line.catalog_item_id) continue;
     const [[a]] = await exec.query(
       `SELECT COUNT(*)              AS total,
               SUM(t.status = 'done') AS done
          FROM fab_project_tasks t
          JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
         WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
-          AND i.parent_item_id IS NULL AND i.catalog_item_id = ?`,
-      [companyId, orderId, line.catalog_item_id],
+          AND i.order_line_id = ?`,
+      [companyId, orderId, line.id],
     );
     const total = Number(a?.total) || 0;
     const done = Number(a?.done) || 0;

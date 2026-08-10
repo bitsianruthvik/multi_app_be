@@ -33,6 +33,7 @@ import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights, computeUnitWeight } from './itemWeightService.js';
 import { composeCode, materialSegment } from './itemCodeService.js';
+import { propagateLineIds } from './boqSheetService.js';
 
 const SHEET = 'Nesting';
 const TEMPLATE_ROWS = 400;
@@ -399,6 +400,8 @@ export async function importNestingSheet(file, companyId, orderId, mode = 'appen
     }
 
     result.nests = seenNests.size;
+    // The material links just hung under their parts inherit those parts' line.
+    await propagateLineIds(conn, companyId, orderId);
     const w = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = w.totalWeight;
 

@@ -4,6 +4,7 @@ import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeServ
 import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
+import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -101,8 +102,14 @@ export const boqWizardHandler = async (req, res) => {
 export const importBoqHandler = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
     const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
-    res.json(await importBoqSheet(req.file, companyId(req), Number(req.params.orderId), mode));
+    const result = await importBoqSheet(req.file, cid, orderId, mode);
+    // Returned with the result so the stage strip is right the instant the
+    // upload lands — a strip that needs a refresh to catch up is a strip nobody
+    // trusts.
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
   } catch (err) {
     logger.error({ err }, 'fab_erp: importBoqSheet failed');
     res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
@@ -126,8 +133,11 @@ export const exportNestingHandler = async (req, res) => {
 export const importNestingHandler = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
     const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
-    res.json(await importNestingSheet(req.file, companyId(req), Number(req.params.orderId), mode));
+    const result = await importNestingSheet(req.file, cid, orderId, mode);
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
   } catch (err) {
     logger.error({ err }, 'fab_erp: importNestingSheet failed');
     res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
@@ -148,8 +158,11 @@ export const flowSummaryHandler = async (req, res) => {
 /** POST — apply the flow rules. `reassign` also overwrites existing choices. */
 export const applyFlowRulesHandler = async (req, res) => {
   try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
     const reassign = req.body?.reassign === true;
-    res.json(await applyFlowRules(companyId(req), Number(req.params.orderId), { reassign }));
+    const result = await applyFlowRules(cid, orderId, { reassign });
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: applyFlowRules failed');
@@ -160,11 +173,52 @@ export const applyFlowRulesHandler = async (req, res) => {
 /** POST — set one item's flow by hand. The exception path. */
 export const setItemFlowHandler = async (req, res) => {
   try {
+    const cid = companyId(req);
     const flowId = req.body?.flowId ?? null;
-    res.json(await setItemFlow(companyId(req), Number(req.params.itemId), flowId));
+    const result = await setItemFlow(cid, Number(req.params.itemId), flowId);
+    res.json({
+      ...result,
+      readiness: result.orderId ? await refreshOrderStage(cid, result.orderId) : null,
+    });
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: setItemFlow failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/**
+ * GET — the five preparation stages and what is missing from each.
+ *
+ * Read-only and gated on view, not manage: knowing how far an order has got is
+ * not an editing action, and the people who most need to see it — sales chasing
+ * a date, a supervisor deciding what to load next — are exactly the people
+ * without manage rights.
+ */
+export const orderReadinessHandler = async (req, res) => {
+  try {
+    res.json(await orderReadiness(companyId(req), Number(req.params.orderId)));
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: orderReadiness failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/**
+ * POST — confirm the order. The wizard's last act.
+ *
+ * 422 carries the readiness back so the screen can point at the unfinished step
+ * rather than just saying no.
+ */
+export const confirmOrderHandler = async (req, res) => {
+  try {
+    res.json(await confirmOrder(companyId(req), Number(req.params.orderId)));
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ message: err.message, readiness: err.readiness ?? null });
+    }
+    logger.error({ err }, 'fab_erp: confirmOrder failed');
     res.status(500).json({ message: err.message });
   }
 };

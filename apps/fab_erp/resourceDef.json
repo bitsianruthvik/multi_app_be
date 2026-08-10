@@ -981,6 +981,7 @@
     "alias": "fi",
     "writeFields": [
       "order_id",
+      "order_line_id",
       "flow_id",
       "parent_item_id",
       "catalog_item_id",
@@ -998,6 +999,7 @@
       "id": "fi.id",
       "companyId": "fi.company_id",
       "orderId": "fi.order_id",
+      "orderLineId": "fi.order_line_id",
       "flowId": "fi.flow_id",
       "parentItemId": "fi.parent_item_id",
       "catalogItemId": "fi.catalog_item_id",
@@ -1025,6 +1027,7 @@
       "id": "integer",
       "companyId": "integer",
       "orderId": "integer",
+      "orderLineId": "integer",
       "flowId": "integer",
       "parentItemId": "integer",
       "catalogItemId": "integer",
@@ -1782,7 +1785,8 @@
       "notes",
       "created_by",
       "progress_template_id",
-      "priority_rank"
+      "priority_rank",
+      "wizard_step"
     ],
     "fields": {
       "id": "fo.id",
@@ -1816,6 +1820,7 @@
       "mrpController": "fo.mrp_controller",
       "notes": "fo.notes",
       "progressPct": "fo.progress_pct",
+      "wizardStep": "fo.wizard_step",
       "createdBy": "fo.created_by",
       "createdAt": "fo.created_at",
       "updatedAt": "fo.updated_at",
@@ -1857,6 +1862,7 @@
       "mrpController": "string",
       "notes": "string",
       "progressPct": "integer",
+      "wizardStep": "string",
       "createdBy": "integer",
       "createdAt": "datetime",
       "updatedAt": "datetime",
@@ -1913,15 +1919,12 @@
     "writeFields": [
       "order_id",
       "line_no",
-      "catalog_item_id",
+      "code",
+      "description",
       "qty",
       "unit",
       "unit_price",
       "discount",
-      "target_plant_id",
-      "requested_date",
-      "bom_id",
-      "routing_plan_id",
       "status",
       "qty_completed",
       "scheduled_start",
@@ -1934,15 +1937,12 @@
       "companyId": "fol.company_id",
       "orderId": "fol.order_id",
       "lineNo": "fol.line_no",
-      "catalogItemId": "fol.catalog_item_id",
+      "code": "fol.code",
+      "description": "fol.description",
       "qty": "fol.qty",
       "unit": "fol.unit",
       "unitPrice": "fol.unit_price",
       "discount": "fol.discount",
-      "targetPlantId": "fol.target_plant_id",
-      "requestedDate": "fol.requested_date",
-      "bomId": "fol.bom_id",
-      "routingPlanId": "fol.routing_plan_id",
       "status": "fol.status",
       "qtyCompleted": "fol.qty_completed",
       "scheduledStart": "fol.scheduled_start",
@@ -1950,10 +1950,6 @@
       "notes": "fol.notes",
       "createdAt": "fol.created_at",
       "updatedAt": "fol.updated_at",
-      "catalogItemName": "fic_ol.name",
-      "catalogItemCode": "fic_ol.code",
-      "catalogItemUnit": "fic_ol.unit",
-      "targetPlantName": "fpl_ol.name",
       "lineType": "fol.line_type"
     },
     "fieldTypes": {
@@ -1961,15 +1957,12 @@
       "companyId": "integer",
       "orderId": "integer",
       "lineNo": "integer",
-      "catalogItemId": "integer",
+      "code": "string",
+      "description": "string",
       "qty": "decimal",
       "unit": "string",
       "unitPrice": "decimal",
       "discount": "decimal",
-      "targetPlantId": "integer",
-      "requestedDate": "string",
-      "bomId": "integer",
-      "routingPlanId": "integer",
       "status": "string",
       "qtyCompleted": "decimal",
       "scheduledStart": "datetime",
@@ -1977,32 +1970,9 @@
       "notes": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime",
-      "catalogItemName": "string",
-      "catalogItemCode": "string",
-      "catalogItemUnit": "string",
-      "targetPlantName": "string",
       "lineType": "string"
     },
-    "relations": {
-      "catalogItem": {
-        "table": "fab_item_catalog",
-        "alias": "fic_ol",
-        "on": "fol.catalog_item_id = fic_ol.id",
-        "fields": [
-          "catalogItemName",
-          "catalogItemCode",
-          "catalogItemUnit"
-        ]
-      },
-      "targetPlant": {
-        "table": "fab_plants",
-        "alias": "fpl_ol",
-        "on": "fol.target_plant_id = fpl_ol.id",
-        "fields": [
-          "targetPlantName"
-        ]
-      }
-    }
+    "relations": {}
   },
   "fabErpCustomField": {
     "table": "fab_custom_fields",

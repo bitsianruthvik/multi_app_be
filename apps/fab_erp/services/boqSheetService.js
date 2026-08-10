@@ -375,6 +375,18 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
 
     // No catalog or flow lookups here — this sheet no longer carries either.
 
+    // Which line each row belongs to, by its top-level (Span) code. A line is
+    // free text now, so this is a plain string match on the code the user typed
+    // in the wizard — the same code they then put in the sheet's first column.
+    // A row whose top level matches no line still imports; it simply has no
+    // line, and the BOM step will report it rather than refusing the upload.
+    const [orderLines] = await conn.query(
+      `SELECT id, code FROM fab_order_lines
+        WHERE company_id = ? AND order_id = ? AND code IS NOT NULL AND deleted_at IS NULL`,
+      [companyId, orderId],
+    );
+    const lineByCode = new Map(orderLines.map((l) => [key(l.code), l.id]));
+
     for (const r of parsed) {
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
       const base = { row: r.row, path: path.map((p) => p.label).join(' / '), name: r.name ?? '' };
@@ -390,6 +402,9 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       let parentLabel = null;
       let node = null;
       let createdHere = false;
+      // Every node on this row belongs to the line named by its top level, all
+      // the way down — that is what makes a line's progress answerable.
+      const lineId = lineByCode.get(key(path[0].label)) ?? null;
 
       for (let i = 0; i < path.length; i++) {
         // appendLevel, not plain concatenation: a segment is numbered by naming
@@ -402,11 +417,11 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
         if (!hit) {
           const [ins] = await conn.query(
             `INSERT INTO fab_items
-               (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
+               (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
                 length, width, height, code, level_kind)
-             VALUES (?,?,?,NULL,?,?,?,?,?,?,?,?,?)`,
+             VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)`,
             [
-              companyId, orderId, parentId,
+              companyId, orderId, lineId, parentId,
               // An intermediate level has no name of its own in the BOQ — the
               // code is what everyone calls it.
               isLast ? (r.name ?? path[i].label) : path[i].label,
@@ -429,9 +444,10 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
           await conn.query(
             `UPDATE fab_items SET
                name = COALESCE(?, name), qty = COALESCE(?, qty),
-               length = COALESCE(?, length), width = COALESCE(?, width), height = COALESCE(?, height)
+               length = COALESCE(?, length), width = COALESCE(?, width), height = COALESCE(?, height),
+               order_line_id = COALESCE(order_line_id, ?)
              WHERE id = ? AND company_id = ?`,
-            [r.name, r.qty, r.length, r.width, r.height, hit.id, companyId],
+            [r.name, r.qty, r.length, r.width, r.height, lineId, hit.id, companyId],
           );
           createdHere = true;
         }
@@ -451,6 +467,8 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       if (!createdHere) result.itemsSkipped++;
     }
 
+    await propagateLineIds(conn, companyId, orderId);
+
     const w = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = w.totalWeight;
     result.unweighedLeaves = w.unweighedLeaves;
@@ -465,6 +483,31 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
 
   result.reportBase64 = (await buildReport(rowLog)).toString('base64');
   return result;
+}
+
+/**
+ * Push each node's line down to its children, until nothing is left unlabelled.
+ *
+ * The row-by-row insert already stamps the line on everything it creates, but
+ * two cases slip past it: an intermediate level that existed from an earlier
+ * upload, and the raw-material links nesting hangs under a part later on. A
+ * sweep catches both, and is cheap — the tree is five levels deep, so it
+ * settles in five passes at worst.
+ *
+ * Exported because nesting needs it for exactly the same reason.
+ */
+export async function propagateLineIds(conn, companyId, orderId) {
+  for (let depth = 0; depth < 8; depth++) {
+    const [res] = await conn.query(
+      `UPDATE fab_items c
+         JOIN fab_items p ON p.id = c.parent_item_id AND p.deleted_at IS NULL
+          SET c.order_line_id = p.order_line_id
+        WHERE c.company_id = ? AND c.order_id = ? AND c.deleted_at IS NULL
+          AND c.order_line_id IS NULL AND p.order_line_id IS NOT NULL`,
+      [companyId, orderId],
+    );
+    if (!res.affectedRows) break;
+  }
 }
 
 /** The kinds of thing a sales-order line can be. */

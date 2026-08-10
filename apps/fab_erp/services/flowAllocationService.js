@@ -171,7 +171,13 @@ export async function applyFlowRules(companyId, orderId, { reassign = false } = 
   };
 }
 
-/** Set one item's flow by hand — the exception path. */
+/**
+ * Set one item's flow by hand — the exception path.
+ *
+ * Returns the item's order so the caller can refresh that order's readiness;
+ * the route is keyed on the item, and making the caller re-derive which order
+ * it belongs to would be asking it to know the item's shape.
+ */
 export async function setItemFlow(companyId, itemId, flowId) {
   const [res] = await pool.query(
     `UPDATE fab_items SET flow_id = ?, flow_source = ?
@@ -179,7 +185,10 @@ export async function setItemFlow(companyId, itemId, flowId) {
     [flowId ?? null, flowId ? 'manual' : null, itemId, companyId],
   );
   if (!res.affectedRows) { const e = new Error('Item not found'); e.status = 404; throw e; }
-  return { ok: true };
+  const [[row]] = await pool.query(
+    'SELECT order_id FROM fab_items WHERE id = ? AND company_id = ?', [itemId, companyId],
+  );
+  return { ok: true, orderId: row?.order_id ?? null };
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
