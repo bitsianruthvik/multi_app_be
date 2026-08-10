@@ -1922,7 +1922,8 @@
       "qty_completed",
       "scheduled_start",
       "scheduled_end",
-      "notes"
+      "notes",
+      "line_type"
     ],
     "fields": {
       "id": "fol.id",
@@ -1948,7 +1949,8 @@
       "catalogItemName": "fic_ol.name",
       "catalogItemCode": "fic_ol.code",
       "catalogItemUnit": "fic_ol.unit",
-      "targetPlantName": "fpl_ol.name"
+      "targetPlantName": "fpl_ol.name",
+      "lineType": "fol.line_type"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1974,7 +1976,8 @@
       "catalogItemName": "string",
       "catalogItemCode": "string",
       "catalogItemUnit": "string",
-      "targetPlantName": "string"
+      "targetPlantName": "string",
+      "lineType": "string"
     },
     "relations": {
       "catalogItem": {

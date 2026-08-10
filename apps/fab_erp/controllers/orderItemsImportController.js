@@ -1,6 +1,7 @@
 import { exportOrderItemsTemplate, importOrderItemsExcel } from '../services/orderItemsImportService.js';
 import { recomputeOrderWeights } from '../services/itemWeightService.js';
 import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeService.js';
+import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boqSheetService.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -54,6 +55,55 @@ export const recomputeOrderWeightsHandler = async (req, res) => {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: recomputeOrderWeights failed');
     res.status(500).json({ message: 'Failed to recompute weights', error: err.message });
+  }
+};
+
+/** GET — the order's BOQ as one sheet (its current tree, or a blank template). */
+export const exportBoqHandler = async (req, res) => {
+  try {
+    const buffer = await exportBoqSheet(companyId(req), Number(req.params.orderId));
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="Order_BOQ.xlsx"');
+    res.send(buffer);
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: exportBoqSheet failed');
+    res.status(err.message === 'Order not found' ? 404 : 500).json({ message: err.message });
+  }
+};
+
+/**
+ * POST — the structure wizard. Returns a SHEET, never database rows: it is
+ * scaffolding to save typing the same codes hundreds of times, and everything
+ * it guesses is meant to be edited before upload. Writing a half-thought-out
+ * structure straight into the order would be much harder to walk back than
+ * deleting a spreadsheet.
+ */
+export const boqWizardHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    await assertOrder(cid, orderId);
+    const rows = buildWizardRows(req.body ?? {});
+    const buffer = await exportBoqSheet(cid, orderId, rows);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="Order_BOQ_starter.xlsx"');
+    res.send(buffer);
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: boqWizard failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/** POST — upload a filled BOQ sheet. */
+export const importBoqHandler = async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
+    res.json(await importBoqSheet(req.file, companyId(req), Number(req.params.orderId), mode));
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: importBoqSheet failed');
+    res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
   }
 };
 

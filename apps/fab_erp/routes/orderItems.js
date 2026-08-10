@@ -23,6 +23,9 @@ import {
   orderWeightSummaryHandler,
   generateOrderItemCodesHandler,
   orderNestingHandler,
+  exportBoqHandler,
+  importBoqHandler,
+  boqWizardHandler,
 } from '../controllers/orderItemsImportController.js';
 
 const router = Router();
@@ -38,6 +41,11 @@ const requirePerm = (tag) => (req, res, next) => {
 router.get('/orders/:orderId/items/export-template', protect, requirePerm('fab_erp_projects_manage'), exportOrderItemsTemplateHandler);
 router.post('/orders/:orderId/items/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importOrderItemsHandler);
 router.post('/orders/:orderId/items/recompute-weights', protect, requirePerm('fab_erp_projects_manage'), recomputeOrderWeightsHandler);
+// ── BOQ: one sheet, four level-code columns (2026-08) ──────────────────────
+router.get('/orders/:orderId/boq/export', protect, requirePerm('fab_erp_projects_manage'), exportBoqHandler);
+router.post('/orders/:orderId/boq/wizard', protect, requirePerm('fab_erp_projects_manage'), boqWizardHandler);
+router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importBoqHandler);
+
 router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_erp_projects_manage'), generateOrderItemCodesHandler);
 // Read-only: gated on view, not manage — anyone who can open the order sees its tonnage.
 router.get('/orders/:orderId/items/weight-summary', protect, orderWeightSummaryHandler);

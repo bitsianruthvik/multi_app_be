@@ -35,6 +35,59 @@ import { logger } from '../../../core/utils/logger.js';
 /** The metric key buffers/analytics default to (fab_buffers.weight_metric_key). */
 const DEFAULT_WEIGHT_METRIC_KEY = 'unit_weight_kg';
 
+/**
+ * Weight of ONE piece: volume x density.
+ *
+ *   weight(kg) = volume(m3) x density_kg_m3
+ *
+ * and the volume comes from the dimensions, in one of two ways:
+ *
+ *   flat plate   thickness x width x length
+ *                40 x 500 x 7500 mm x 7850 = 1177.5 kg   (matches their BOQ)
+ *   profile      section_area_mm2 x length
+ *                1898.09 mm2 x 1850 mm x 7850 = 27.565 kg (matches their BOQ)
+ *
+ * WHY A PROFILE CANNOT USE THICKNESS x WIDTH. An ISA 100x100x10 is an L: two
+ * legs sharing a corner, ~1898 mm2 of steel. Treating it as a 10 x 100
+ * rectangle counts one leg and loses the other — 14.52 kg instead of 27.57 on a
+ * 1850 mm piece. The error is 47% and completely silent, because the number
+ * that comes out still looks like a plausible weight. So anything that is not
+ * flat carries its own cross-section and needs only a length.
+ *
+ * Both numbers live on the MATERIAL, never as constants here: a shop cutting
+ * aluminium, stainless or a different profile has different figures and should
+ * not need a code change to say so.
+ *
+ * Returns null rather than 0 when anything needed is missing — "nobody has told
+ * us" and "this weighs nothing" have to stay distinguishable, or a half-filled
+ * tree reports a confident zero.
+ *
+ * @returns {number|null} kg for one piece
+ */
+export function computeUnitWeight({ length, width, height }, material) {
+  const density = material?.density_kg_m3 != null ? Number(material.density_kg_m3) : null;
+  if (density === null || !Number.isFinite(density) || density <= 0) return null;
+
+  const L = Number(length);
+  if (!Number.isFinite(L) || L <= 0) return null;
+
+  const area = material.section_area_mm2 != null ? Number(material.section_area_mm2) : null;
+  let volumeMm3;
+
+  if (area !== null && Number.isFinite(area) && area > 0) {
+    volumeMm3 = area * L;
+  } else {
+    // Flat stock: needs all three. `height` carries thickness — the dimension
+    // the BOQ column calls "Thick".
+    const W = Number(width);
+    const T = Number(height);
+    if (!Number.isFinite(W) || W <= 0 || !Number.isFinite(T) || T <= 0) return null;
+    volumeMm3 = T * W * L;
+  }
+
+  return (volumeMm3 / 1e9) * density; // mm3 -> m3, then x kg/m3
+}
+
 /** Decimal(18,6) — compare at that precision so float noise never causes a write. */
 function sameNumber(a, b) {
   if (a === null && b === null) return true;
@@ -61,7 +114,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
-            catalog_item_id, flow_id
+            catalog_item_id, flow_id, length, width, height
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
@@ -83,6 +136,27 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       childrenOf.get(r.parent_item_id).push(r);
     } else {
       roots.push(r);
+    }
+  }
+
+  // A part's weight comes from its OWN dimensions and the material it is cut
+  // from — that is how the shop's BOQ has always worked it out. The material is
+  // reached through the part's raw-material child, which is the same link the
+  // task gate reads.
+  const materialOf = new Map(); // part id -> catalog row with the weight factor
+  const rmChildIds = rows.filter((r) => r.catalog_item_id != null && r.flow_id == null);
+  if (rmChildIds.length) {
+    const catIds = [...new Set(rmChildIds.map((r) => r.catalog_item_id))];
+    const [cats] = await exec.query(
+      `SELECT id, density_kg_m3, section_area_mm2 FROM fab_item_catalog
+        WHERE company_id = ? AND id IN (?)`,
+      [companyId, catIds],
+    );
+    const catById = new Map(cats.map((c) => [c.id, c]));
+    for (const rm of rmChildIds) {
+      if (rm.parent_item_id == null) continue;
+      const cat = catById.get(rm.catalog_item_id);
+      if (cat && !materialOf.has(rm.parent_item_id)) materialOf.set(rm.parent_item_id, cat);
     }
   }
 
@@ -123,10 +197,21 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
         const childQty = toNum(child.qty) ?? 0;
         childSum = (childSum ?? 0) + childEff * childQty;
       }
-      computed.set(node.id, childSum);
+
+      // Three sources, in this order:
+      //   1. a figure a human typed — always wins, it is someone's judgement
+      //   2. this row's own dimensions x its material's factor — the BOQ way
+      //   3. the sum of what is underneath — for assemblies, which have no
+      //      dimensions of their own
+      // Dimensions beat the child sum because a part's raw-material child is
+      // the stock it is cut FROM, not a component of it: a 1177 kg flange cut
+      // from a plate does not weigh the plate.
+      const fromDims = computeUnitWeight(node, materialOf.get(node.id));
+      const derived = fromDims !== null ? fromDims : childSum;
+      computed.set(node.id, derived);
 
       const entered = toNum(node.unit_weight);
-      const eff = entered !== null ? entered : childSum;
+      const eff = entered !== null ? entered : derived;
       effective.set(node.id, eff);
 
       // A raw-material link (catalog item, no flow) is not something anyone

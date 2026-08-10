@@ -868,6 +868,31 @@ SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEM
 SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD INDEX idx_fi_order_nest (order_id, catalog_item_id, nest_no)','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- Weight is volume x density (2026-08, see migrations/2026-08-rm-density-and-section-area.sql).
+--   flat plate  thickness x width x length x density_kg_m3
+--   profile     section_area_mm2 x length x density_kg_m3
+-- A profile MUST carry its cross-section: an ISA 100x100x10 is an L with two legs
+-- (~1898 mm2), so thickness x width counts one leg and is 47% light, silently.
+-- fab_item_catalog.unit_weight / weight_basis DROPPED 2026-08-07 — the per-metre
+-- model, replaced by density_kg_m3 + section_area_mm2 below.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='density_kg_m3');
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN density_kg_m3 DECIMAL(12,3) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='section_area_mm2');
+SET @sql = IF(@col=0,'ALTER TABLE fab_item_catalog ADD COLUMN section_area_mm2 DECIMAL(14,3) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Composite Girder / BowString / Tub Girder / Openweb Girder / PEB — drives the structure wizard.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='line_type');
+SET @sql = IF(@col=0,'ALTER TABLE fab_order_lines ADD COLUMN line_type VARCHAR(40) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- span / girder / segment / part — which level of the BOQ this row is.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='level_kind');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN level_kind VARCHAR(20) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- A nested plate is issued from stock ONCE, not once per part cut from it
 -- (2026-08, see migrations/2026-08-nest-issue-once.sql). The first task to start on a
 -- nest inserts here and consumes; later parts on the same nest find the row and consume
@@ -902,10 +927,8 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=D
 SET @sql = IF(@col=0,"ALTER TABLE fab_material_bom_items ADD COLUMN item_category VARCHAR(20) NOT NULL DEFAULT 'component'",'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
--- Add manufacturing_plant_id to fab_material_bom_items
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_material_bom_items' AND COLUMN_NAME='manufacturing_plant_id');
-SET @sql = IF(@col=0,'ALTER TABLE fab_material_bom_items ADD COLUMN manufacturing_plant_id INT NULL','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- fab_material_bom_items.manufacturing_plant_id DROPPED 2026-08-07 — 305 values,
+-- zero readers, left over from the removed multi-plant BOM routing.
 
 -- Add material_type to fab_item_catalog
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='material_type');
@@ -1835,21 +1858,9 @@ CREATE TABLE IF NOT EXISTS fab_operation_flow_step_inputs (
   KEY idx_ofsi_step    (flow_step_id)
 );
 
--- What a flow step produces (for make→make chaining / traceability).
-CREATE TABLE IF NOT EXISTS fab_operation_flow_step_outputs (
-  id            INT AUTO_INCREMENT PRIMARY KEY,
-  company_id    INT           NOT NULL,
-  flow_step_id  INT           NOT NULL,
-  produces_role VARCHAR(50)   NOT NULL,
-  qty           DECIMAL(18,4)  NULL,
-  unit          VARCHAR(20)   NULL,
-  deleted_at    DATETIME      DEFAULT NULL,
-  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (company_id) REFERENCES companies(id),
-  KEY idx_ofso_company (company_id),
-  KEY idx_ofso_step    (flow_step_id)
-);
+-- fab_operation_flow_step_outputs DROPPED 2026-08-07. It declared what a flow
+-- step produces, for make→make chaining, but no reader was ever written and it
+-- held 3 rows of test data. Step INPUTS above are live and drive the gate.
 
 -- Materialized per-task copy of the flow step's gated inputs. Written by
 -- materializeTasks; satisfied_at is stamped when the input becomes available.
