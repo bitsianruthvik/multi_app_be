@@ -154,9 +154,15 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
     );
     const catById = new Map(cats.map((c) => [c.id, c]));
     for (const rm of rmChildIds) {
-      if (rm.parent_item_id == null) continue;
       const cat = catById.get(rm.catalog_item_id);
-      if (cat && !materialOf.has(rm.parent_item_id)) materialOf.set(rm.parent_item_id, cat);
+      if (!cat) continue;
+      // The link row IS a piece of that material, so it weighs itself — its
+      // dimensions are the plate's, set by the nesting sheet.
+      materialOf.set(rm.id, cat);
+      // …and it also tells the part above it what that part is cut from.
+      if (rm.parent_item_id != null && !materialOf.has(rm.parent_item_id)) {
+        materialOf.set(rm.parent_item_id, cat);
+      }
     }
   }
 
@@ -192,6 +198,11 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       const kids = childrenOf.get(node.id) ?? [];
       let childSum = null;
       for (const child of kids) {
+        // A raw-material child is the STOCK this part is cut from, not a
+        // component of it — and since nesting gave those rows the plate's own
+        // dimensions, they now carry a real weight. Summing it would say a
+        // 1.2 t flange weighs the 4.7 t plate it came off.
+        if (child.catalog_item_id != null && child.flow_id == null) continue;
         const childEff = effective.get(child.id);
         if (childEff === null || childEff === undefined) continue;
         const childQty = toNum(child.qty) ?? 0;

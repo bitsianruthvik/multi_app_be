@@ -2,6 +2,7 @@ import { exportOrderItemsTemplate, importOrderItemsExcel } from '../services/ord
 import { recomputeOrderWeights } from '../services/itemWeightService.js';
 import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeService.js';
 import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boqSheetService.js';
+import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -103,6 +104,31 @@ export const importBoqHandler = async (req, res) => {
     res.json(await importBoqSheet(req.file, companyId(req), Number(req.params.orderId), mode));
   } catch (err) {
     logger.error({ err }, 'fab_erp: importBoqSheet failed');
+    res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
+  }
+};
+
+/** GET — the nesting document: plates, and the parts cut from each. */
+export const exportNestingHandler = async (req, res) => {
+  try {
+    const buffer = await exportNestingSheet(companyId(req), Number(req.params.orderId));
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="Order_Nesting.xlsx"');
+    res.send(buffer);
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: exportNestingSheet failed');
+    res.status(err.message === 'Order not found' ? 404 : 500).json({ message: err.message });
+  }
+};
+
+/** POST — upload a filled nesting sheet. Never touches the BOQ tree. */
+export const importNestingHandler = async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
+    res.json(await importNestingSheet(req.file, companyId(req), Number(req.params.orderId), mode));
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: importNestingSheet failed');
     res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
   }
 };

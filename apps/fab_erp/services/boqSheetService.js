@@ -4,8 +4,8 @@
  * Their real Bill of Quantity is a single flat list. The hierarchy is not tabs
  * or pasted parent codes — it is columns:
  *
- *   Span | Girder | Segment | Part | Part Name | Raw Material | Thick | Length | Width | Qty | Flow
- *   S1   | G1     | 1       | TF1  | Top Flange| MSP-E350BO-40|  40   | 7500   | 500   |  1  | Part Fab — Plain
+ *   Span | Girder | Segment | Part | Part Name  | Thick | Length | Width | Qty
+ *   S1   | G1     | 1       | TF1  | Top Flange |  40   | 7500   | 500   |  1
  *
  * which is exactly their existing "Shipping Mark G1 - 1 / Part List TF1", with
  * the mark split into the two levels it always meant. The codes ARE the
@@ -14,24 +14,35 @@
  *
  * The resulting item code reads the same way — `<order prefix>-S1-G1-1-TF1`.
  *
- * A row with a blank Part declares the level above it, which is how an assembly
- * gets its own Operation Flow (a girder segment is welded; it is work in its own
- * right, not just a container).
+ * A row with a blank Part declares the level above it — a girder segment is a
+ * real thing that gets welded, not just a heading.
  *
  * Blank intermediate levels collapse: a PEB with no girders or segments is just
  * Span + Part, and nothing about the format has to change to say so.
  *
- * WEIGHT IS NOT IN THIS SHEET. It is volume x density, taken from the material's
- * own `density_kg_m3` and, for anything that is not flat, its `section_area_mm2`
- * — see itemWeightService. Their BOQ has never typed a part weight and there is
- * no reason to start.
+ * THIS SHEET IS STRUCTURE AND GEOMETRY ONLY (2026-08-07). An order is built in
+ * three passes and they are deliberately three documents:
+ *
+ *   1. BOQ       what the thing is, and the size of each piece   (here)
+ *   2. Nesting   which plate each part is cut from    (nestingSheetService)
+ *   3. Flow      how each piece gets made             (flow allocation)
+ *
+ * They arrive at different times from different people — the BOQ off the
+ * drawing, nesting off the nesting software, flows from planning — so keeping
+ * them in one file meant nobody could finish their part without holding up the
+ * others, and a re-upload of one silently overwrote the rest.
+ *
+ * WEIGHT IS NOT IN THIS SHEET EITHER. It is volume x density, from the
+ * material's `density_kg_m3` and, for anything not flat, its `section_area_mm2`
+ * — see itemWeightService. The material comes from the Nesting document, so a
+ * part's weight can only be worked out once nesting is done.
  */
 
 import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
-import { orderCodePrefix, composeCode, normaliseAbbr, materialSegment } from './itemCodeService.js';
+import { orderCodePrefix, composeCode, normaliseAbbr } from './itemCodeService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -44,16 +55,17 @@ export const LEVELS = [
   { key: 'part',    header: 'Part',    width: 12 },
 ];
 
+// Structure and geometry only. Material belongs to the Nesting document and
+// the operation flow to flow allocation — one document, one question, so two
+// people can work on an order at once and neither overwrites the other.
 const COLS = [
   ...LEVELS.map((l) => ({ header: l.header, width: l.width, key: l.key })),
-  { header: 'Part Name',      width: 30, key: 'name' },
-  { header: 'Raw Material',   width: 20, key: 'rmCode' },
-  { header: 'Thick',          width: 9,  key: 'height' },
-  { header: 'Length',         width: 10, key: 'length' },
-  { header: 'Width',          width: 10, key: 'width' },
-  { header: 'Qty',            width: 8,  key: 'qty' },
-  { header: 'Operation Flow', width: 26, key: 'flowRef' },
-  { header: 'Notes',          width: 26, key: 'notes' },
+  { header: 'Part Name', width: 30, key: 'name' },
+  { header: 'Thick',     width: 9,  key: 'height' },
+  { header: 'Length',    width: 10, key: 'length' },
+  { header: 'Width',     width: 10, key: 'width' },
+  { header: 'Qty',       width: 8,  key: 'qty' },
+  { header: 'Notes',     width: 26, key: 'notes' },
 ];
 const C = Object.fromEntries(COLS.map((c, i) => [c.key, i + 1]));
 
@@ -99,7 +111,7 @@ function styledHeader(ws) {
 
 /**
  * @param {object[]} [seedRows] rows to pre-fill (the wizard's output). Each is
- *        `{ span, girder, segment, part, name, rmCode, height, length, width, qty, flowRef, notes }`.
+ *        `{ span, girder, segment, part, name, height, length, width, qty, notes }`.
  */
 export async function exportBoqSheet(companyId, orderId, seedRows = null) {
   const [orders] = await pool.query(
@@ -108,17 +120,6 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
   );
   if (!orders.length) throw new Error('Order not found');
   const prefix = await orderCodePrefix(companyId, orderId);
-
-  const [flows] = await pool.query(
-    `SELECT f.name, f.code,
-            GROUP_CONCAT(o.name ORDER BY fs.seq_no SEPARATOR ' -> ') AS operations
-       FROM fab_operation_flows f
-       LEFT JOIN fab_operation_flow_steps fs ON fs.flow_id=f.id AND fs.company_id=f.company_id AND fs.deleted_at IS NULL
-       LEFT JOIN fab_operations o ON o.id=fs.operation_id AND o.company_id=f.company_id AND o.deleted_at IS NULL
-      WHERE f.company_id=? AND f.active=1 AND f.deleted_at IS NULL
-      GROUP BY f.id, f.name, f.code ORDER BY f.name`,
-    [companyId],
-  );
 
   const [materials] = await pool.query(
     `SELECT code, name, density_kg_m3, section_area_mm2 FROM fab_item_catalog
@@ -142,29 +143,30 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     '',
     `  Every item's full code is built from them: ${prefix}-S1-G1-1-TF1`,
     '',
-    'A ROW WITH A BLANK PART declares the level above it. That is how a girder or a segment',
-    '  gets its own Operation Flow — welding a segment is work in its own right, not just a',
-    '  heading. Put the assembly flow on that row.',
+    'A ROW WITH A BLANK PART declares the level above it — a girder or a segment is a real',
+    '  thing that gets welded, not just a heading, so it needs a row of its own.',
     '',
     'LEAVE A LEVEL BLANK IF THE JOB HAS NO SUCH THING. A PEB with no girders is just Span and',
     '  Part; the levels in between collapse and nothing else changes.',
     '',
-    'WEIGHT IS NOT IN THIS SHEET. It is volume x density.',
-    '     flat plate  thickness x width x length x density',
-    '     profile     its cross-section x length x density',
-    '  An angle, channel, beam or round bar is NOT thickness x width — an ISA 100x100x10 is an L',
-    '  with two legs, so treating it as a 10 x 100 rectangle loses half the steel. Those carry',
-    '  their own cross-section and need only a Length; the "Materials" sheet says which is which.',
-    '  Fill in the dimensions and the Raw Material, and the weight follows.',
+    'THIS SHEET IS STRUCTURE AND SIZES ONLY.',
+    '  An order is built in three passes, and they are three separate documents on purpose:',
+    '     1. BOQ       what the thing is, and how big each piece is   (this one)',
+    '     2. Nesting   which plate each part is cut from',
+    '     3. Flow      how each piece gets made',
+    '  They come from different people at different times — the BOQ off the drawing, nesting off',
+    '  the nesting software, flows from planning. Keeping them apart means nobody waits, and',
+    '  re-uploading one does not wipe out the others.',
     '',
-    'RAW MATERIAL is the Item Catalog code of the stock the part is cut from. It links the part',
-    '  to inventory: when that material is received, the tasks waiting on it start by themselves.',
+    'THICK / LENGTH / WIDTH are this PART\'s size — the finished piece, not the plate it comes',
+    '  from. The plate belongs on the Nesting sheet.',
     '',
     'QTY is how many of this part go into ONE of its parent. Defaults to 1.',
     '',
-    'OPERATION FLOW must match a flow on the "Flows" sheet. An unrecognised flow rejects the',
-    '  row — an item with no flow produces no work at all, and a silent skip is worse than a',
-    '  rejected line.',
+    'WEIGHT IS NOT IN THIS SHEET. It is worked out as volume x density once nesting says which',
+    '  material the part is cut from. The "Materials" sheet lists what is available and what each',
+    '  one weighs; note that an angle, channel or beam is NOT thickness x width, so those carry a',
+    '  cross-section and need only a length.',
   ].forEach((l) => help.addRow([l]));
   help.getRow(1).font = { bold: true, size: 13 };
   help.eachRow((row, n) => {
@@ -181,20 +183,14 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
   for (const r of rows) {
     ws.addRow([
       r.span ?? '', r.girder ?? '', r.segment ?? '', r.part ?? '',
-      r.name ?? '', r.rmCode ?? '',
+      r.name ?? '',
       r.height ?? '', r.length ?? '', r.width ?? '', r.qty ?? '',
-      r.flowRef ?? '', r.notes ?? '',
+      r.notes ?? '',
     ]);
   }
-  applyFlowDropdown(ws, flows.length, rows.length);
 
   // ── Flows ────────────────────────────────────────────────────────────────
-  const wsF = wb.addWorksheet('Flows');
-  wsF.addRow(['Flow Name', 'Flow Code', 'Operations']);
-  wsF.getRow(1).font = { bold: true };
-  [34, 18, 84].forEach((w, i) => { wsF.getColumn(i + 1).width = w; });
-  for (const f of flows) wsF.addRow([f.name, f.code, f.operations || '(no steps defined)']);
-  if (!flows.length) wsF.addRow(['(no active flows — set them up under Operations › Flows first)', '', '']);
+  // No Flows sheet — flow allocation is its own pass and its own document.
 
   // ── Materials ────────────────────────────────────────────────────────────
   // Carries the weight factor, because "why is this part 12 kg" is answered here.
@@ -259,12 +255,7 @@ async function readExistingAsRows(companyId, orderId) {
     return out;
   };
 
-  // A part's raw material is its RM child; the child itself is not a row here.
-  const rmOf = new Map();
-  for (const i of items) {
-    if (!isRmLink(i) || i.parent_item_id == null) continue;
-    if (!rmOf.has(i.parent_item_id)) rmOf.set(i.parent_item_id, i.catalog_code);
-  }
+  // Raw-material links are not rows in this sheet — they belong to Nesting.
 
   const rows = [];
   for (const i of items) {
@@ -279,28 +270,14 @@ async function readExistingAsRows(companyId, orderId) {
     rows.push({
       span: levels[0], girder: levels[1], segment: levels[2], part: levels[3],
       name: isLeafish ? i.name : '',
-      rmCode: rmOf.get(i.id) ?? '',
       height: i.height != null ? Number(i.height) : '',
       length: i.length != null ? Number(i.length) : '',
       width:  i.width  != null ? Number(i.width)  : '',
       qty:    i.qty    != null ? Number(i.qty)    : '',
-      flowRef: i.flow_name ?? '',
       notes: '',
     });
   }
   return rows;
-}
-
-function applyFlowDropdown(ws, flowCount, filledRows) {
-  if (flowCount < 1) return;
-  const src = `Flows!$A$2:$A$${flowCount + 1}`;
-  for (let r = 2; r <= Math.max(TEMPLATE_ROWS, filledRows + 1); r++) {
-    ws.getCell(r, C.flowRef).dataValidation = {
-      type: 'list', allowBlank: true, formulae: [src], showErrorMessage: true,
-      errorStyle: 'warning', errorTitle: 'Unknown flow',
-      error: 'Pick a flow from the "Flows" sheet. An unrecognised flow rejects the row on upload.',
-    };
-  }
 }
 
 // ── import ───────────────────────────────────────────────────────────────────
@@ -315,12 +292,10 @@ function parseRows(ws) {
       row: n,
       levels,
       name:    cellVal(row, C.name),
-      rmCode:  cellVal(row, C.rmCode),
       height:  numVal(row, C.height),
       length:  numVal(row, C.length),
       width:   numVal(row, C.width),
       qty:     numVal(row, C.qty),
-      flowRef: cellVal(row, C.flowRef),
     });
   });
   return out;
@@ -395,22 +370,7 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       for (const e of existing) nodeByCode.set(key(e.code), { id: e.id });
     }
 
-    const [cats] = await conn.query(
-      'SELECT id, code, name, unit FROM fab_item_catalog WHERE company_id = ? AND deleted_at IS NULL',
-      [companyId],
-    );
-    const catByCode = new Map(cats.map((c) => [key(c.code), c]));
-
-    const [flows] = await conn.query(
-      `SELECT id, name, code FROM fab_operation_flows
-        WHERE company_id = ? AND active = 1 AND deleted_at IS NULL`,
-      [companyId],
-    );
-    const flowBy = new Map();
-    for (const f of flows) {
-      flowBy.set(key(f.name), f.id);
-      if (f.code) flowBy.set(key(f.code), f.id);
-    }
+    // No catalog or flow lookups here — this sheet no longer carries either.
 
     for (const r of parsed) {
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
@@ -418,21 +378,6 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       const skip = (reason) => { rowLog.push({ ...base, status: 'Skipped', reason }); result.itemsSkipped++; };
 
       if (!path.length) { skip('No level code on this row — at least a Span is needed.'); continue; }
-
-      let flowId = null;
-      if (r.flowRef) {
-        flowId = flowBy.get(key(r.flowRef)) ?? null;
-        if (!flowId) {
-          skip(`Operation Flow '${r.flowRef}' is not an active flow. Pick one from the "Flows" sheet — an item with no flow produces no tasks at all.`);
-          continue;
-        }
-      }
-
-      let material = null;
-      if (r.rmCode) {
-        material = catByCode.get(key(r.rmCode)) ?? null;
-        if (!material) { skip(`Raw Material '${r.rmCode}' is not in the Item Catalog.`); continue; }
-      }
 
       // Walk the path, creating any level that has not been seen yet. This is
       // what lets the same Span/Girder be repeated down hundreds of rows
@@ -461,7 +406,7 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
               isLast ? (r.name ?? path[i].label) : path[i].label,
               'pcs',
               isLast ? (r.qty ?? 1) : 1,
-              isLast ? flowId : null,
+              null, // flow allocation is its own pass — never set from the BOQ
               isLast ? r.length : null,
               isLast ? r.width : null,
               isLast ? r.height : null,
@@ -472,14 +417,15 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
           nodeByCode.set(key(code), hit);
           if (isLast) { result.itemsCreated++; createdHere = true; } else result.levelsCreated++;
         } else if (isLast) {
-          // The level already exists — this row is filling in its detail
-          // (typically an assembly row carrying the flow).
+          // The level already exists — this row is filling in its detail.
+          // flow_id is deliberately absent: it belongs to flow allocation, and
+          // a BOQ re-upload must not clear a flow someone has since assigned.
           await conn.query(
             `UPDATE fab_items SET
-               name = COALESCE(?, name), qty = COALESCE(?, qty), flow_id = COALESCE(?, flow_id),
+               name = COALESCE(?, name), qty = COALESCE(?, qty),
                length = COALESCE(?, length), width = COALESCE(?, width), height = COALESCE(?, height)
              WHERE id = ? AND company_id = ?`,
-            [r.name, r.qty, flowId, r.length, r.width, r.height, hit.id, companyId],
+            [r.name, r.qty, r.length, r.width, r.height, hit.id, companyId],
           );
           createdHere = true;
         }
@@ -489,20 +435,9 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
         node = hit;
       }
 
-      // Raw material hangs under the part — the same link the task gate reads.
-      if (material && node) {
-        const rmCode = composeCode(parentCode, materialSegment(material.code, material.name));
-        if (!nodeByCode.has(key(rmCode))) {
-          const [ins] = await conn.query(
-            `INSERT INTO fab_items
-               (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id, code, level_kind)
-             VALUES (?,?,?,?,?,?,1,NULL,?, 'material')`,
-            [companyId, orderId, node.id, material.id, material.name, material.unit || 'pcs', rmCode],
-          );
-          nodeByCode.set(key(rmCode), { id: ins.insertId });
-          result.rmLinks++;
-        }
-      }
+      // No raw-material link is created here — which plate a part is cut from
+      // is the Nesting document's job, and a part can be nested long after its
+      // BOQ row exists.
 
       rowLog.push({ ...base, status: createdHere ? 'Created' : 'Skipped',
         reason: createdHere ? '' : 'Nothing to create on this row.' });
@@ -547,8 +482,7 @@ export const LINE_TYPES = [
  * @param {string} [spec.spanCode]
  * @param {number} [spec.girders]
  * @param {number} [spec.segmentsPerGirder]
- * @param {{code:string,name?:string,rmCode?:string,qty?:number,flowRef?:string}[]} [spec.parts]
- * @param {string} [spec.assemblyFlow] flow put on each segment (or girder if there are no segments)
+ * @param {{code:string,name?:string,qty?:number}[]} [spec.parts]
  */
 export function buildWizardRows(spec = {}) {
   const spanCode = String(spec.spanCode ?? 'S1').trim() || 'S1';
@@ -557,17 +491,15 @@ export function buildWizardRows(spec = {}) {
   const parts   = Array.isArray(spec.parts) ? spec.parts.filter((p) => p && p.code) : [];
   const rows = [];
 
-  const partRows = (girder, segment) => parts.map((p) => ({
-    span: spanCode, girder, segment, part: p.code,
-    name: p.name ?? '', rmCode: p.rmCode ?? '',
-    height: '', length: '', width: '',
-    qty: p.qty ?? 1,
-    flowRef: p.flowRef ?? '',
-    notes: '',
-  }));
+  const level = (girder, segment, part, name, qty, notes) => ({
+    span: spanCode, girder, segment, part, name,
+    height: '', length: '', width: '', qty, notes,
+  });
+  const partRows = (girder, segment) =>
+    parts.map((p) => level(girder, segment, p.code, p.name ?? '', p.qty ?? 1, ''));
 
   // The span itself, so it exists even before anything hangs off it.
-  rows.push({ span: spanCode, girder: '', segment: '', part: '', name: '', rmCode: '', height: '', length: '', width: '', qty: 1, flowRef: '', notes: 'span' });
+  rows.push(level('', '', '', '', 1, 'span'));
 
   if (!girders) {
     // No girders: parts sit straight under the span. A PEB looks like this.
@@ -579,13 +511,13 @@ export function buildWizardRows(spec = {}) {
     const girder = `G${g}`;
     if (!segs) {
       // Girders but no segments — the girder is the assembly.
-      rows.push({ span: spanCode, girder, segment: '', part: '', name: '', rmCode: '', height: '', length: '', width: '', qty: 1, flowRef: spec.assemblyFlow ?? '', notes: 'assembly' });
+      rows.push(level(girder, '', '', '', 1, 'assembly'));
       rows.push(...partRows(girder, ''));
       continue;
     }
-    rows.push({ span: spanCode, girder, segment: '', part: '', name: '', rmCode: '', height: '', length: '', width: '', qty: 1, flowRef: '', notes: 'girder' });
+    rows.push(level(girder, '', '', '', 1, 'girder'));
     for (let s = 1; s <= segs; s++) {
-      rows.push({ span: spanCode, girder, segment: String(s), part: '', name: '', rmCode: '', height: '', length: '', width: '', qty: 1, flowRef: spec.assemblyFlow ?? '', notes: 'assembly' });
+      rows.push(level(girder, String(s), '', '', 1, 'assembly'));
       rows.push(...partRows(girder, String(s)));
     }
   }
