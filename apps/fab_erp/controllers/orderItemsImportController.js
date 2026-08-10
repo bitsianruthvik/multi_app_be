@@ -3,6 +3,7 @@ import { recomputeOrderWeights } from '../services/itemWeightService.js';
 import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeService.js';
 import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
+import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -130,6 +131,41 @@ export const importNestingHandler = async (req, res) => {
   } catch (err) {
     logger.error({ err }, 'fab_erp: importNestingSheet failed');
     res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
+  }
+};
+
+/** GET — where flow allocation stands, and what applying the rules would do. */
+export const flowSummaryHandler = async (req, res) => {
+  try {
+    res.json(await flowSummary(companyId(req), Number(req.params.orderId)));
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: flowSummary failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/** POST — apply the flow rules. `reassign` also overwrites existing choices. */
+export const applyFlowRulesHandler = async (req, res) => {
+  try {
+    const reassign = req.body?.reassign === true;
+    res.json(await applyFlowRules(companyId(req), Number(req.params.orderId), { reassign }));
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: applyFlowRules failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/** POST — set one item's flow by hand. The exception path. */
+export const setItemFlowHandler = async (req, res) => {
+  try {
+    const flowId = req.body?.flowId ?? null;
+    res.json(await setItemFlow(companyId(req), Number(req.params.itemId), flowId));
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: setItemFlow failed');
+    res.status(500).json({ message: err.message });
   }
 };
 

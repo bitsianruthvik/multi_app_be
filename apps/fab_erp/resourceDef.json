@@ -1017,7 +1017,9 @@
       "updatedAt": "fi.updated_at",
       "orderNumber": "ford_fi.order_number",
       "catalogItemCode": "fic_item.code",
-      "catalogItemUnit": "fic_item.unit"
+      "catalogItemUnit": "fic_item.unit",
+      "levelKind": "fi.level_kind",
+      "flowSource": "fi.flow_source"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1042,7 +1044,9 @@
       "updatedAt": "datetime",
       "orderNumber": "string",
       "catalogItemCode": "string",
-      "catalogItemUnit": "string"
+      "catalogItemUnit": "string",
+      "levelKind": "string",
+      "flowSource": "string"
     },
     "relations": {
       "order": {
@@ -2693,5 +2697,53 @@
       "updatedAt": "datetime"
     },
     "relations": {}
+  },
+  "fabErpFlowRule": {
+    "table": "fab_flow_rules",
+    "alias": "ffr",
+    "writeFields": [
+      "line_type",
+      "level_kind",
+      "code_suffix",
+      "flow_id",
+      "active",
+      "notes"
+    ],
+    "fields": {
+      "id": "ffr.id",
+      "companyId": "ffr.company_id",
+      "lineType": "ffr.line_type",
+      "levelKind": "ffr.level_kind",
+      "codeSuffix": "ffr.code_suffix",
+      "flowId": "ffr.flow_id",
+      "active": "ffr.active",
+      "notes": "ffr.notes",
+      "createdAt": "ffr.created_at",
+      "updatedAt": "ffr.updated_at",
+      "flowName": "ffr_flow.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "lineType": "string",
+      "levelKind": "string",
+      "codeSuffix": "string",
+      "flowId": "integer",
+      "active": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "flowName": "string"
+    },
+    "relations": {
+      "flow": {
+        "table": "fab_operation_flows",
+        "alias": "ffr_flow",
+        "on": "ffr.flow_id = ffr_flow.id",
+        "fields": [
+          "flowName"
+        ]
+      }
+    }
   }
 }

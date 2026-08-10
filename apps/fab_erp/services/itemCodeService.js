@@ -32,7 +32,9 @@ import { pool } from '../../../db.js';
 /** Company-form words that carry no identity — dropped when other words exist. */
 const STOPWORDS = new Set(['CO', 'LTD', 'LIMITED', 'PVT', 'PRIVATE', 'INC', 'LLP', 'LLC', 'THE', 'AND', 'OF', 'FOR']);
 
-const MAX_SEGMENT = 10;
+// Generous, because a truncated code is silent corruption: 'GIRDER01/01' cut to
+// ten characters becomes 'GIRDER01/0', a different segment that still looks right.
+const MAX_SEGMENT = 24;
 const MAX_CODE    = 160;
 
 /**
@@ -73,10 +75,72 @@ export function customerAbbrev(name) {
   return first ? abbreviateToken(first).slice(0, 4) : 'CUST';
 }
 
-/** Normalise a hand-typed abbreviation to the same shape the codes use. */
+/**
+ * Normalise a hand-typed abbreviation to the same shape the codes use.
+ *
+ * `/` is kept. It is how the shop marks a variant — `IS2/D` is the drilled
+ * version of `IS2` — and flow rules match on that suffix. Stripping it would
+ * both lose the marker and collapse `IS2/D` onto a genuine `IS2D`.
+ */
 export function normaliseAbbr(raw) {
-  const s = String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, MAX_SEGMENT);
+  const s = String(raw ?? '').toUpperCase().replace(/[^A-Z0-9/]+/g, '').slice(0, MAX_SEGMENT);
   return s || null;
+}
+
+/**
+ * The marker after the last `/` on a code — '/D' on `…-IS2/D`. Null when there
+ * is none. Read from the LAST dash-segment only; the chain above it belongs to
+ * other levels.
+ *
+ * `/` carries two meanings in the shop's codes and both end up here:
+ *   variant   IS2/D      the drilled version of IS2   -> flow rules match this
+ *   sequence  GDR01/01   segment 01 of girder GDR01   -> nothing matches it
+ * They do not need telling apart, because rules match the suffix EXACTLY: a
+ * rule for '/D' can never fire on '/01'. Naming a rule '/01' would be the only
+ * way to confuse the two, and that is a thing someone would have to type.
+ */
+export function codeSuffix(code) {
+  const last = String(code ?? '').split('-').pop() ?? '';
+  const i = last.lastIndexOf('/');
+  return i === -1 ? null : last.slice(i).toUpperCase();
+}
+
+/**
+ * Add one level to a code.
+ *
+ * Normally `parent-CHILD`. But the shop numbers a segment by naming its girder:
+ * girder `GDR01` holds segments `GDR01/01`, `GDR01/02`. Concatenating blindly
+ * would give `…-GDR01-GDR01/01`, saying GDR01 twice. So when a child's label
+ * already opens with its parent's, only the remainder is appended — and without
+ * a dash, since that remainder carries its own `/` separator.
+ *
+ *   GDR01     under S1      -> S1-GDR01
+ *   GDR01/01  under GDR01   -> S1-GDR01/01     (not S1-GDR01-GDR01/01)
+ *   IS2/D     under GDR01/01 -> S1-GDR01/01-IS2/D
+ */
+export function appendLevel(parentCode, parentLabel, childLabel) {
+  const child = normaliseAbbr(childLabel);
+  if (!child) return parentCode;
+
+  const parent = parentLabel ? normaliseAbbr(parentLabel) : null;
+  if (parent && child.length > parent.length && child.startsWith(parent)) {
+    return `${parentCode}${child.slice(parent.length)}`.slice(0, MAX_CODE);
+  }
+  return composeCode(parentCode, child);
+}
+
+/**
+ * The inverse of appendLevel — what was typed in this level's column, given the
+ * parent it hangs off. Used to write an existing tree back out to the sheet.
+ */
+export function levelLabel(code, parentCode, parentLabel) {
+  const c = String(code ?? '');
+  const p = String(parentCode ?? '');
+  if (!p || !c.startsWith(p)) return c.split('-').pop() ?? c;
+  const rest = c.slice(p.length);
+  if (rest.startsWith('-')) return rest.slice(1);
+  // No dash: the child absorbed its parent's label, so put it back.
+  return `${parentLabel ?? ''}${rest}`;
 }
 
 /**

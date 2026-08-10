@@ -62,6 +62,9 @@ const resourcePermissions = {
   // Flows
   fabErpOperationFlow:      'fab_erp_flows_manage',
   fabErpOperationFlowStep:  'fab_erp_flows_manage',
+  // Which flow a level/variant gets by default — same authority as editing the
+  // flows themselves, since a rule decides what actually gets made.
+  fabErpFlowRule:           'fab_erp_flows_manage',
 
   // Project Task Queue
   fabErpProjectTask: 'fab_erp_taskqueue_manage',

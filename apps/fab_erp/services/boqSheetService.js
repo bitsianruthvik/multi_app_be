@@ -42,7 +42,7 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
-import { orderCodePrefix, composeCode, normaliseAbbr } from './itemCodeService.js';
+import { orderCodePrefix, appendLevel, levelLabel } from './itemCodeService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -234,13 +234,16 @@ async function readExistingAsRows(companyId, orderId) {
   const hasChild = new Set(items.filter((i) => i.parent_item_id != null).map((i) => i.parent_item_id));
   const isRmLink = (i) => !hasChild.has(i.id) && i.catalog_item_id != null && !i.flow_name;
 
-  /** The last segment of a code is the level's own label. */
+  /**
+   * What was typed in this level's column. The inverse of appendLevel, so a
+   * segment that absorbed its girder's label (`…-GDR01/01` under `…-GDR01`)
+   * comes back out as `GDR01/01`, not `/01`.
+   */
   const labelOf = (i) => {
     if (!i.code) return i.name;
     const parent = i.parent_item_id != null ? byId.get(i.parent_item_id) : null;
-    if (parent?.code && i.code.startsWith(`${parent.code}-`)) return i.code.slice(parent.code.length + 1);
-    const bits = String(i.code).split('-');
-    return bits[bits.length - 1];
+    if (!parent?.code) return String(i.code).split('-').pop() ?? i.code;
+    return levelLabel(i.code, parent.code, labelOf(parent));
   };
 
   const chainOf = (i) => {
@@ -384,12 +387,15 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       // without creating hundreds of girders.
       let parentId = null;
       let parentCode = prefix;
+      let parentLabel = null;
       let node = null;
       let createdHere = false;
 
       for (let i = 0; i < path.length; i++) {
-        const seg = normaliseAbbr(path[i].label) ?? key(path[i].label);
-        const code = composeCode(parentCode, seg);
+        // appendLevel, not plain concatenation: a segment is numbered by naming
+        // its girder (GDR01 -> GDR01/01), and joining blindly would say GDR01
+        // twice. See itemCodeService.
+        const code = appendLevel(parentCode, parentLabel, path[i].label);
         const isLast = i === path.length - 1;
         let hit = nodeByCode.get(key(code));
 
@@ -432,6 +438,7 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
 
         parentId = hit.id;
         parentCode = code;
+        parentLabel = path[i].label;
         node = hit;
       }
 

@@ -28,6 +28,9 @@ import {
   boqWizardHandler,
   exportNestingHandler,
   importNestingHandler,
+  flowSummaryHandler,
+  applyFlowRulesHandler,
+  setItemFlowHandler,
 } from '../controllers/orderItemsImportController.js';
 
 const router = Router();
@@ -51,6 +54,11 @@ router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_project
 // ── Nesting: stage 2, its own document (2026-08) ───────────────────────────
 router.get('/orders/:orderId/nesting/export', protect, requirePerm('fab_erp_projects_manage'), exportNestingHandler);
 router.post('/orders/:orderId/nesting/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importNestingHandler);
+
+// ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
+router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
+router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), applyFlowRulesHandler);
+router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage'), setItemFlowHandler);
 
 router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_erp_projects_manage'), generateOrderItemCodesHandler);
 // Read-only: gated on view, not manage — anyone who can open the order sees its tonnage.

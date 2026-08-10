@@ -893,6 +893,32 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=D
 SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN level_kind VARCHAR(20) NULL','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- Flow allocation, stage 3 (2026-08, see migrations/2026-08-flow-rules.sql).
+-- (line_type, level_kind, code_suffix) -> flow. A DEFAULT is a rule with no suffix.
+-- No rule for a level means no flow means nothing to do — spans and girders are
+-- groupings and legitimately carry none. See §13 in ARCHITECTURE.md.
+CREATE TABLE IF NOT EXISTS fab_flow_rules (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT           NOT NULL,
+  line_type   VARCHAR(40)   NULL,
+  level_kind  VARCHAR(20)   NOT NULL,
+  code_suffix VARCHAR(20)   NULL,
+  flow_id     INT           NOT NULL,
+  active      TINYINT(1)    NOT NULL DEFAULT 1,
+  notes       VARCHAR(255)  NULL,
+  deleted_at  DATETIME      DEFAULT NULL,
+  created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_ffr_lookup (company_id, level_kind, line_type)
+);
+
+-- 'rule' or 'manual' — so Apply knows what not to overwrite, and so "why does
+-- this part have that flow" has an answer.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='flow_source');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN flow_source VARCHAR(20) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- A nested plate is issued from stock ONCE, not once per part cut from it
 -- (2026-08, see migrations/2026-08-nest-issue-once.sql). The first task to start on a
 -- nest inserts here and consumes; later parts on the same nest find the row and consume
