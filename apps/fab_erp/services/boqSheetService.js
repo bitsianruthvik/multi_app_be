@@ -539,6 +539,22 @@ export function buildWizardRows(spec = {}) {
   const girders = Math.max(0, Number(spec.girders) || 0);
   const segs    = Math.max(0, Number(spec.segmentsPerGirder) || 0);
   const parts   = Array.isArray(spec.parts) ? spec.parts.filter((p) => p && p.code) : [];
+
+  /**
+   * Segments for girder `g` (1-based).
+   *
+   * `segmentCounts` lets each girder differ, because on a real span they do —
+   * an end girder is not always cut into the same number of pieces as a middle
+   * one, and forcing one number meant deleting rows out of the sheet afterwards.
+   * Absent or short, it falls back to the single `segmentsPerGirder` figure, so
+   * the simple case stays one number.
+   */
+  const counts = Array.isArray(spec.segmentCounts) ? spec.segmentCounts : null;
+  const segsFor = (g) => {
+    const n = counts && counts[g - 1] != null ? Number(counts[g - 1]) : segs;
+    return Math.max(0, Number.isFinite(n) ? n : 0);
+  };
+
   const rows = [];
 
   const level = (girder, segment, part, name, qty, notes) => ({
@@ -559,14 +575,15 @@ export function buildWizardRows(spec = {}) {
 
   for (let g = 1; g <= girders; g++) {
     const girder = `G${g}`;
-    if (!segs) {
+    const n = segsFor(g);
+    if (!n) {
       // Girders but no segments — the girder is the assembly.
       rows.push(level(girder, '', '', '', 1, 'assembly'));
       rows.push(...partRows(girder, ''));
       continue;
     }
     rows.push(level(girder, '', '', '', 1, 'girder'));
-    for (let s = 1; s <= segs; s++) {
+    for (let s = 1; s <= n; s++) {
       rows.push(level(girder, String(s), '', '', 1, 'assembly'));
       rows.push(...partRows(girder, String(s)));
     }
