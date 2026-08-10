@@ -53,7 +53,10 @@ export async function loadRules(companyId, conn) {
        FROM fab_flow_rules r
        JOIN fab_operation_flows f ON f.id = r.flow_id AND f.deleted_at IS NULL
       WHERE r.company_id = ? AND r.active = 1 AND r.deleted_at IS NULL
-      ORDER BY r.level_kind, r.line_type, r.code_suffix`,
+      -- id last so two rules of equal specificity resolve the same way every
+      -- time (the older wins). The screen warns about such a pair rather than
+      -- leaving anyone to discover it from a wrong flow on the shop floor.
+      ORDER BY r.level_kind, r.line_type, r.code_suffix, r.id`,
     [companyId],
   );
   return rows;
