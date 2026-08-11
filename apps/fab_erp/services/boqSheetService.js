@@ -42,7 +42,9 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
-import { orderCodePrefix, appendLevel, levelLabel } from './itemCodeService.js';
+import {
+  orderCodePrefix, appendLevel, levelLabel, composeCode, materialSegment,
+} from './itemCodeService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -65,6 +67,14 @@ const COLS = [
   { header: 'Length',    width: 10, key: 'length' },
   { header: 'Width',     width: 10, key: 'width' },
   { header: 'Qty',       width: 8,  key: 'qty' },
+  // WHAT the part is cut from — not WHICH piece, which is nesting's job.
+  // Removed from this sheet in the three-document split because it was
+  // conflated with nesting; back because the two are different questions. The
+  // material is a property of the part (a web plate is 20mm plate whatever
+  // happens next); the plate it comes off is a decision made later, on the
+  // nesting board. Capturing it here is what lets that board show only the
+  // parts that could go on a given plate.
+  { header: 'Raw Material', width: 22, key: 'rmCode' },
   { header: 'Notes',     width: 26, key: 'notes' },
 ];
 const C = Object.fromEntries(COLS.map((c, i) => [c.key, i + 1]));
@@ -258,7 +268,14 @@ async function readExistingAsRows(companyId, orderId) {
     return out;
   };
 
-  // Raw-material links are not rows in this sheet — they belong to Nesting.
+  // An RM link is not a ROW of this sheet — but the material it names is a
+  // COLUMN of its parent's row, so a re-export round-trips what was entered.
+  const rmByParent = new Map();
+  for (const i of items) {
+    if (isRmLink(i) && i.parent_item_id != null && !rmByParent.has(i.parent_item_id)) {
+      rmByParent.set(i.parent_item_id, i.catalog_code ?? null);
+    }
+  }
 
   const rows = [];
   for (const i of items) {
@@ -277,6 +294,7 @@ async function readExistingAsRows(companyId, orderId) {
       length: i.length != null ? Number(i.length) : '',
       width:  i.width  != null ? Number(i.width)  : '',
       qty:    i.qty    != null ? Number(i.qty)    : '',
+      rmCode: rmByParent.get(i.id) ?? '',
       notes: '',
     });
   }
@@ -299,6 +317,7 @@ function parseRows(ws) {
       length:  numVal(row, C.length),
       width:   numVal(row, C.width),
       qty:     numVal(row, C.qty),
+      rmCode:  cellVal(row, C.rmCode),
     });
   });
   return out;
@@ -387,6 +406,15 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
     );
     const lineByCode = new Map(orderLines.map((l) => [key(l.code), l.id]));
 
+    // Raw materials, for the "Raw Material" column. Only 'buy' items — a part
+    // is cut from stock, never from another thing this shop makes.
+    const [catalog] = await conn.query(
+      `SELECT id, code, name, unit FROM fab_item_catalog
+        WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'`,
+      [companyId],
+    );
+    const materialByCode = new Map(catalog.map((m) => [key(m.code), m]));
+
     for (const r of parsed) {
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
       const base = { row: r.row, path: path.map((p) => p.label).join(' / '), name: r.name ?? '' };
@@ -458,9 +486,55 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
         node = hit;
       }
 
-      // No raw-material link is created here — which plate a part is cut from
-      // is the Nesting document's job, and a part can be nested long after its
-      // BOQ row exists.
+      /**
+       * The material this part is cut FROM — deliberately not which plate.
+       *
+       * The link is created with `nest_no` NULL, which already means "this part
+       * needs this material, on its own" everywhere downstream. Nesting later
+       * fills the nest number in, grouping several such links onto one physical
+       * plate. Capturing it here is what lets the nesting board offer only the
+       * parts that could go on a given plate, instead of the whole order.
+       *
+       * An unrecognised code is reported and the part still imports: the
+       * structure is worth having even when the material is not decided yet.
+       */
+      if (node && r.rmCode) {
+        const material = materialByCode.get(key(r.rmCode));
+        if (!material) {
+          result.warnings.push({ row: r.row, message: `Raw Material '${r.rmCode}' is not in the Item Catalog — the part was created without it.` });
+        } else {
+          const [[existing]] = await conn.query(
+            `SELECT id, catalog_item_id FROM fab_items
+              WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id IS NOT NULL
+                AND flow_id IS NULL AND deleted_at IS NULL LIMIT 1`,
+            [companyId, node.id],
+          );
+          if (!existing) {
+            await conn.query(
+              `INSERT INTO fab_items
+                 (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
+                  qty, flow_id, code, nest_no, level_kind)
+               VALUES (?,?,?,?,?,?,?,1,NULL,?,NULL,'material')`,
+              [
+                companyId, orderId, lineId, node.id, material.id, material.name,
+                material.unit || 'pcs',
+                composeCode(parentCode, materialSegment(material.code, material.name)),
+              ],
+            );
+            result.rmLinks = (result.rmLinks ?? 0) + 1;
+          } else if (existing.catalog_item_id !== material.id) {
+            // Changing the material is a legitimate correction. The nest is
+            // cleared with it — a nest is a group of parts sharing ONE plate,
+            // so a part that is now a different material cannot stay on it.
+            await conn.query(
+              `UPDATE fab_items SET catalog_item_id = ?, name = ?, unit = ?, nest_no = NULL
+                WHERE id = ? AND company_id = ?`,
+              [material.id, material.name, material.unit || 'pcs', existing.id, companyId],
+            );
+            result.rmLinks = (result.rmLinks ?? 0) + 1;
+          }
+        }
+      }
 
       rowLog.push({ ...base, status: createdHere ? 'Created' : 'Skipped',
         reason: createdHere ? '' : 'Nothing to create on this row.' });

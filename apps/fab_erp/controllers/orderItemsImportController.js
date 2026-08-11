@@ -5,6 +5,9 @@ import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boq
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
+import {
+  nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
+} from '../services/nestingBoardService.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -186,6 +189,48 @@ export const setItemFlowHandler = async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 };
+
+// ── the nesting board ───────────────────────────────────────────────────────
+// Every write returns the whole board rather than a delta: it is one screen of
+// a few hundred rows at most, and a client rebuilding its own state from patches
+// is how a board ends up disagreeing with the database.
+
+const board = (fn) => async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    const result = await fn(cid, orderId, req);
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: nesting board failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+export const nestingBoardHandler = board(async (cid, orderId) => ({
+  ...await nestingBoard(cid, orderId),
+  nextNestNo: await nextNestNo(cid, orderId),
+}));
+
+export const assignPartsHandler = board(async (cid, orderId, req) => ({
+  ...await assignParts(cid, orderId, {
+    linkIds: req.body?.linkIds,
+    nestNo: req.body?.nestNo ?? null,
+    plate: req.body?.plate ?? null,
+  }),
+  nextNestNo: await nextNestNo(cid, orderId),
+}));
+
+export const updateNestHandler = board(async (cid, orderId, req) => ({
+  ...await updateNest(cid, orderId, req.params.nestNo, req.body?.plate ?? {}),
+  nextNestNo: await nextNestNo(cid, orderId),
+}));
+
+export const clearNestHandler = board(async (cid, orderId, req) => ({
+  ...await clearNest(cid, orderId, req.params.nestNo),
+  nextNestNo: await nextNestNo(cid, orderId),
+}));
 
 /**
  * GET — the five preparation stages and what is missing from each.

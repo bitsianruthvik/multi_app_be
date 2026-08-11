@@ -33,6 +33,10 @@ import {
   setItemFlowHandler,
   orderReadinessHandler,
   confirmOrderHandler,
+  nestingBoardHandler,
+  assignPartsHandler,
+  updateNestHandler,
+  clearNestHandler,
 } from '../controllers/orderItemsImportController.js';
 
 const router = Router();
@@ -56,6 +60,13 @@ router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_project
 // ── Nesting: stage 2, its own document (2026-08) ───────────────────────────
 router.get('/orders/:orderId/nesting/export', protect, requirePerm('fab_erp_projects_manage'), exportNestingHandler);
 router.post('/orders/:orderId/nesting/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importNestingHandler);
+
+// The drag-and-drop board (2026-08-10). Reading it is a view action; arranging
+// plates is not.
+router.get('/orders/:orderId/nesting/board', protect, nestingBoardHandler);
+router.post('/orders/:orderId/nesting/assign', protect, requirePerm('fab_erp_projects_manage'), assignPartsHandler);
+router.patch('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), updateNestHandler);
+router.delete('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), clearNestHandler);
 
 // ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
