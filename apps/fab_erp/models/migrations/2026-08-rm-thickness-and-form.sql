@@ -54,7 +54,7 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 UPDATE fab_item_catalog fic
   JOIN fab_custom_fields cf
     ON cf.level = 'item' AND cf.level_id = fic.id AND cf.company_id = fic.company_id
-   AND cf.field_key = 'Thickness' AND cf.deleted_at IS NULL
+   AND cf.field_key IN ('Thickness', 'Thickness (mm)', 'Thickness mm') AND cf.deleted_at IS NULL
    SET fic.thickness_mm = CAST(TRIM(cf.field_value) AS DECIMAL(10,3))
  WHERE fic.thickness_mm IS NULL
    AND TRIM(cf.field_value) REGEXP '^[0-9]+(\\.[0-9]+)?';
@@ -71,6 +71,16 @@ UPDATE fab_item_catalog fic
      WHEN LOWER(cf.field_value) REGEXP 'isa|ismb|ismc|isnb|angle|channel|beam|section|pipe|tube|rod|bar' THEN 'section'
      ELSE NULL END
  WHERE fic.material_form IS NULL;
+
+-- Sections by their own name, BEFORE the plate fallback. Without this an
+-- unclassified ISA 100x100x10 keeps material_form NULL, and NULL is treated as
+-- plate by the picker — so it would be offered to every 10mm plate part, which
+-- is the precise mistake material_form exists to stop. Prod spells Material
+-- Type differently from local, so the name is the more reliable signal.
+UPDATE fab_item_catalog
+   SET material_form = 'section'
+ WHERE material_form IS NULL AND procurement_type = 'buy'
+   AND LOWER(name) REGEXP 'isa |isa[0-9]|ismb|ismc|isnb|angle|channel|beam|joist|pipe|tube|^isa';
 
 -- Anything still unclassified but clearly a plate by its own name.
 UPDATE fab_item_catalog

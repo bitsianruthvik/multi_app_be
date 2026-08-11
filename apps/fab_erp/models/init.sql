@@ -2905,13 +2905,24 @@ SET @sql = IF(@col=0,
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
--- Carry across whatever the existing test rows pointed at, so the 6 live lines
--- still read as something rather than turning into blank rows.
-UPDATE fab_order_lines fol
-   JOIN fab_item_catalog fic ON fic.id = fol.catalog_item_id
-    SET fol.code = COALESCE(NULLIF(fol.code, ''), fic.code),
-        fol.description = COALESCE(NULLIF(fol.description, ''), fic.name)
- WHERE fol.code IS NULL OR fol.code = '';
+-- Carry across whatever the existing rows pointed at, so they still read as
+-- something rather than turning into blank rows.
+--
+-- GUARDED, because the very next block drops catalog_item_id. Written as a bare
+-- UPDATE this was a one-shot: it succeeded on the first run and then made the
+-- whole file un-re-runnable, which breaks the contract every other statement
+-- here keeps and that the deploy flow relies on. A migration that only works
+-- once is a migration that fails the second time somebody deploys.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='catalog_item_id');
+SET @sql = IF(@col=1,
+  'UPDATE fab_order_lines fol
+      JOIN fab_item_catalog fic ON fic.id = fol.catalog_item_id
+       SET fol.code = COALESCE(NULLIF(fol.code, ''''), fic.code),
+           fol.description = COALESCE(NULLIF(fol.description, ''''), fic.name)
+    WHERE fol.code IS NULL OR fol.code = ''''',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- ── drop what a line no longer decides ──────────────────────────────────────
 
@@ -3034,7 +3045,7 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 UPDATE fab_item_catalog fic
   JOIN fab_custom_fields cf
     ON cf.level = 'item' AND cf.level_id = fic.id AND cf.company_id = fic.company_id
-   AND cf.field_key = 'Thickness' AND cf.deleted_at IS NULL
+   AND cf.field_key IN ('Thickness', 'Thickness (mm)', 'Thickness mm') AND cf.deleted_at IS NULL
    SET fic.thickness_mm = CAST(TRIM(cf.field_value) AS DECIMAL(10,3))
  WHERE fic.thickness_mm IS NULL
    AND TRIM(cf.field_value) REGEXP '^[0-9]+(\\.[0-9]+)?';
@@ -3051,6 +3062,16 @@ UPDATE fab_item_catalog fic
      WHEN LOWER(cf.field_value) REGEXP 'isa|ismb|ismc|isnb|angle|channel|beam|section|pipe|tube|rod|bar' THEN 'section'
      ELSE NULL END
  WHERE fic.material_form IS NULL;
+
+-- Sections by their own name, BEFORE the plate fallback. Without this an
+-- unclassified ISA 100x100x10 keeps material_form NULL, and NULL is treated as
+-- plate by the picker — so it would be offered to every 10mm plate part, which
+-- is the precise mistake material_form exists to stop. Prod spells Material
+-- Type differently from local, so the name is the more reliable signal.
+UPDATE fab_item_catalog
+   SET material_form = 'section'
+ WHERE material_form IS NULL AND procurement_type = 'buy'
+   AND LOWER(name) REGEXP 'isa |isa[0-9]|ismb|ismc|isnb|angle|channel|beam|joist|pipe|tube|^isa';
 
 -- Anything still unclassified but clearly a plate by its own name.
 UPDATE fab_item_catalog
