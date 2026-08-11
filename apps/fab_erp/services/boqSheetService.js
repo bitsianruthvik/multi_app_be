@@ -132,9 +132,10 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
   const prefix = await orderCodePrefix(companyId, orderId);
 
   const [materials] = await pool.query(
-    `SELECT code, name, density_kg_m3, section_area_mm2 FROM fab_item_catalog
+    `SELECT code, name, density_kg_m3, section_area_mm2, thickness_mm, material_form
+       FROM fab_item_catalog
       WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'
-      ORDER BY code`,
+      ORDER BY material_form, thickness_mm, code`,
     [companyId],
   );
 
@@ -195,6 +196,7 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
       r.span ?? '', r.girder ?? '', r.segment ?? '', r.part ?? '',
       r.name ?? '',
       r.height ?? '', r.length ?? '', r.width ?? '', r.qty ?? '',
+      r.rmCode ?? '',
       r.notes ?? '',
     ]);
   }
@@ -222,7 +224,79 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     ]);
   }
 
+  addMaterialDropdown(wb, ws, materials, Math.max(rows.length + 1, 400));
+
   return wb.xlsx.writeBuffer();
+}
+
+/**
+ * Make Raw Material a dropdown that only offers what the part could be cut from.
+ *
+ * The list is filtered PER ROW by that row's Thick value, because offering all
+ * forty stocked materials for a 20mm web plate is barely better than free text
+ * — the whole point of capturing the material is that the wrong one cannot be
+ * chosen by accident.
+ *
+ * Excel has no native "filter this list by that cell", so it is done the way
+ * spreadsheets have always done it: one contiguous named range per thickness on
+ * a hidden sheet, and a validation formula that resolves the name from the
+ * Thick cell. `INDIRECT("T" & 20)` → the T20 range.
+ *
+ * SECTIONS APPEAR IN EVERY LIST. An angle is one item — a 100×100×10 is not "a
+ * 10mm thing" — so it cannot be reached by filtering on thickness, and leaving
+ * it out would make it unpickable. Each list is therefore that thickness's
+ * plates followed by every section.
+ *
+ * A row whose Thick is blank or has no matching range simply gets no list. That
+ * is deliberate: `showErrorMessage` is off, so the cell stays typeable and the
+ * importer remains the thing that has the final say. A dropdown that blocked
+ * entry would make an unusual material impossible to record at all.
+ */
+function addMaterialDropdown(wb, ws, materials, lastRow) {
+  const plates = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm != null);
+  const sections = materials.filter((m) => m.material_form === 'section');
+  if (!plates.length && !sections.length) return;
+
+  // Excel defined names allow letters, digits and underscore — so 12.5 becomes
+  // T12_5, and the formula substitutes the same way.
+  const nameFor = (t) => `T${String(Number(t)).replace('.', '_')}`;
+
+  const byThickness = new Map();
+  for (const p of plates) {
+    const k = Number(p.thickness_mm);
+    if (!byThickness.has(k)) byThickness.set(k, []);
+    byThickness.get(k).push(p);
+  }
+
+  const lists = wb.addWorksheet('Lists');
+  lists.state = 'veryHidden'; // not a sheet anyone should be editing
+  let col = 0;
+
+  const writeColumn = (name, items) => {
+    col += 1;
+    items.forEach((m, i) => { lists.getCell(i + 1, col).value = m.code; });
+    if (!items.length) return;
+    const letter = lists.getColumn(col).letter;
+    wb.definedNames.add(`Lists!$${letter}$1:$${letter}$${items.length}`, name);
+  };
+
+  for (const [t, items] of [...byThickness.entries()].sort((a, b) => a[0] - b[0])) {
+    writeColumn(nameFor(t), [...items, ...sections]);
+  }
+  // Everything, for rows with no usable thickness.
+  writeColumn('RM_ALL', [...plates, ...sections]);
+
+  const thickCol = ws.getColumn(C.height).letter;
+  for (let r = 2; r <= lastRow; r++) {
+    ws.getCell(r, C.rmCode).dataValidation = {
+      type: 'list',
+      allowBlank: true,
+      // IFERROR so a blank or unknown thickness falls back to the full list
+      // rather than showing Excel's reference error in the dropdown.
+      formulae: [`=IFERROR(INDIRECT("T"&SUBSTITUTE(TEXT($${thickCol}$${r},"0.###"),".","_")),RM_ALL)`],
+      showErrorMessage: false,
+    };
+  }
 }
 
 /** Read the order's current tree back into sheet rows, so it round-trips. */
@@ -631,12 +705,34 @@ export function buildWizardRows(spec = {}) {
 
   const rows = [];
 
-  const level = (girder, segment, part, name, qty, notes) => ({
+  const level = (girder, segment, part, name, qty, notes, extra = {}) => ({
     span: spanCode, girder, segment, part, name,
-    height: '', length: '', width: '', qty, notes,
+    height: '', length: '', width: '', qty, notes, rmCode: '',
+    ...extra,
   });
+
+  /**
+   * Per-part material and thickness, with a per-instance override.
+   *
+   * Most parts are the same everywhere: every web plate on the span is 20mm
+   * plate, so it is set once on the common part. But the end girder's flange is
+   * routinely a different thickness from the middle ones, and until now that
+   * meant editing the sheet afterwards. `overrides` is keyed by the exact
+   * instance — "G2/1/TF" — so the wizard can expand every generated part and
+   * set the handful that differ, without turning the common case into a
+   * hundred-row form.
+   */
+  const overrides = spec.overrides && typeof spec.overrides === 'object' ? spec.overrides : {};
+  const detailFor = (girder, segment, p) => {
+    const o = overrides[`${girder}/${segment}/${p.code}`] ?? {};
+    return {
+      rmCode: o.rmCode ?? p.rmCode ?? '',
+      height: o.thick ?? p.thick ?? '',
+    };
+  };
   const partRows = (girder, segment) =>
-    parts.map((p) => level(girder, segment, p.code, p.name ?? '', p.qty ?? 1, ''));
+    parts.map((p) => level(girder, segment, p.code, p.name ?? '', p.qty ?? 1, '',
+      detailFor(girder, segment, p)));
 
   // The span itself, so it exists even before anything hangs off it.
   rows.push(level('', '', '', '', 1, 'span'));

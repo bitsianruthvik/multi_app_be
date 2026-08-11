@@ -895,7 +895,9 @@
       "hsn_code",
       "procurement_type",
       "lead_time_days",
-      "mrp_policy"
+      "mrp_policy",
+      "thickness_mm",
+      "material_form"
     ],
     "fields": {
       "id": "fic.id",
@@ -919,7 +921,9 @@
       "categoryBatchRequired": "fic_cat.batch_required",
       "categorySerialRequired": "fic_cat.serial_required",
       "categoryHeatRequired": "fic_cat.heat_required",
-      "categoryMarkRequired": "fic_cat.mark_required"
+      "categoryMarkRequired": "fic_cat.mark_required",
+      "thicknessMm": "fic.thickness_mm",
+      "materialForm": "fic.material_form"
     },
     "fieldTypes": {
       "id": "integer",
@@ -943,7 +947,9 @@
       "categoryBatchRequired": "integer",
       "categorySerialRequired": "integer",
       "categoryHeatRequired": "integer",
-      "categoryMarkRequired": "integer"
+      "categoryMarkRequired": "integer",
+      "thicknessMm": "decimal",
+      "materialForm": "string"
     },
     "relations": {
       "category": {
