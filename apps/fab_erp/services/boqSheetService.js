@@ -45,6 +45,7 @@ import { recomputeOrderWeights } from './itemWeightService.js';
 import {
   orderCodePrefix, appendLevel, levelLabel, composeCode, materialSegment,
 } from './itemCodeService.js';
+import { rawMaterialsFor, materialsForThickness } from './rawMaterialService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -131,13 +132,7 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
   if (!orders.length) throw new Error('Order not found');
   const prefix = await orderCodePrefix(companyId, orderId);
 
-  const [materials] = await pool.query(
-    `SELECT code, name, density_kg_m3, section_area_mm2, thickness_mm, material_form
-       FROM fab_item_catalog
-      WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'
-      ORDER BY material_form, thickness_mm, code`,
-    [companyId],
-  );
+  const materials = await rawMaterialsFor(companyId);
 
   const wb = new ExcelJS.Workbook();
 
@@ -253,9 +248,22 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
  * entry would make an unusual material impossible to record at all.
  */
 function addMaterialDropdown(wb, ws, materials, lastRow) {
-  const plates = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm != null);
   const sections = materials.filter((m) => m.material_form === 'section');
-  if (!plates.length && !sections.length) return;
+  const plates = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm != null);
+  /**
+   * Materials with no thickness recorded appear in EVERY list.
+   *
+   * They used to appear in none — not even the fallback — so a stocked item
+   * whose thickness nobody had filled in was silently unpickable, while the
+   * Materials sheet next door still listed it. The sheet contradicted itself
+   * and gave no hint why.
+   *
+   * The filter's job is to exclude materials we KNOW are the wrong thickness.
+   * Not knowing is not the same as knowing it is wrong, so absence of data must
+   * not mean absence from the list.
+   */
+  const unclassified = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm == null);
+  if (!materials.length) return;
 
   // Excel defined names allow letters, digits and underscore — so 12.5 becomes
   // T12_5, and the formula substitutes the same way.
@@ -281,10 +289,11 @@ function addMaterialDropdown(wb, ws, materials, lastRow) {
   };
 
   for (const [t, items] of [...byThickness.entries()].sort((a, b) => a[0] - b[0])) {
-    writeColumn(nameFor(t), [...items, ...sections]);
+    writeColumn(nameFor(t), [...items, ...unclassified, ...sections]);
   }
-  // Everything, for rows with no usable thickness.
-  writeColumn('RM_ALL', [...plates, ...sections]);
+  // The fallback for a row with no usable thickness: genuinely everything, so
+  // nothing in the catalog is unreachable from the sheet.
+  writeColumn('RM_ALL', [...plates, ...unclassified, ...sections]);
 
   const thickCol = ws.getColumn(C.height).letter;
   for (let r = 2; r <= lastRow; r++) {
@@ -482,11 +491,7 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
 
     // Raw materials, for the "Raw Material" column. Only 'buy' items — a part
     // is cut from stock, never from another thing this shop makes.
-    const [catalog] = await conn.query(
-      `SELECT id, code, name, unit FROM fab_item_catalog
-        WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'`,
-      [companyId],
-    );
+    const catalog = await rawMaterialsFor(companyId, conn);
     const materialByCode = new Map(catalog.map((m) => [key(m.code), m]));
 
     for (const r of parsed) {
@@ -657,11 +662,6 @@ export async function propagateLineIds(conn, companyId, orderId) {
     if (!res.affectedRows) break;
   }
 }
-
-/** The kinds of thing a sales-order line can be. */
-export const LINE_TYPES = [
-  'Composite Girder', 'BowString', 'Tub Girder', 'Openweb Girder', 'PEB',
-];
 
 /**
  * Turn "6 girders, 5 segments each, these parts in every segment" into the rows

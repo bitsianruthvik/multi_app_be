@@ -89,7 +89,20 @@ export const boqWizardHandler = async (req, res) => {
     const cid = companyId(req);
     const orderId = Number(req.params.orderId);
     await assertOrder(cid, orderId);
-    const rows = buildWizardRows(req.body ?? {});
+    /**
+     * One sheet, every line on the order.
+     *
+     * The wizard used to take a single line, so a two-line order meant running
+     * it twice and stitching the downloads together — or, more likely, missing
+     * the second line. `specs` is a list because an order's lines are a list;
+     * each becomes its own span, keyed by that line's code.
+     *
+     * A bare body is still accepted as one spec, so an older client keeps
+     * working rather than getting an empty sheet.
+     */
+    const body = req.body ?? {};
+    const specs = Array.isArray(body.specs) && body.specs.length ? body.specs : [body];
+    const rows = specs.flatMap((s) => buildWizardRows(s ?? {}));
     const buffer = await exportBoqSheet(cid, orderId, rows);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="Order_BOQ_starter.xlsx"');
