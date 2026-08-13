@@ -21,7 +21,29 @@
 -- a schema, which is why nothing here is enforced downstream.
 --
 -- Idempotent; re-running is a no-op.
+--
+-- NOTE: this is folded into models/init.sql, which is what push-to-prod
+-- actually runs. Keep the two in step — init.sql is the authority.
 -- ---------------------------------------------------------------------------
+
+-- `fab_bom_templates` was ALSO the name of the reusable/versioned BOM model
+-- dropped in 2026-08-drop-bom-templates.sql — a different schema with no
+-- line_type. On a database still carrying that one, CREATE TABLE IF NOT EXISTS
+-- would quietly leave it in place and the seed below would fail on an unknown
+-- column. Those legacy tables held zero rows, so dropping is safe.
+SET @legacy_exists = (
+  SELECT COUNT(*) FROM information_schema.tables
+   WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates');
+SET @has_line_type = (
+  SELECT COUNT(*) FROM information_schema.columns
+   WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates'
+     AND column_name = 'line_type');
+SET @sql = IF(@legacy_exists = 1 AND @has_line_type = 0,
+  'DROP TABLE fab_bom_templates', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+DROP TABLE IF EXISTS fab_bom_template_slots;
+DROP TABLE IF EXISTS fab_bom_template_nodes;
 
 CREATE TABLE IF NOT EXISTS fab_bom_templates (
   id                  INT AUTO_INCREMENT PRIMARY KEY,
@@ -50,8 +72,9 @@ CREATE TABLE IF NOT EXISTS fab_bom_templates (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ── seed the parts that were hardcoded ────────────────────────────────────
--- Seeded for every company already using fab_erp — judged by having an item
--- catalog, since a company with no catalog has no fab_erp data to speak of.
+-- Seeded for every company that HAS THE fab_erp APP. Keying this off the item
+-- catalog instead would miss any tenant onboarded later, whose catalog is empty
+-- on day one — and a seed only reaches whoever qualifies on the day it runs.
 -- Guarded per (company, line_type, code) so a re-run adds nothing and, more
 -- importantly, never resurrects a part somebody deliberately deleted.
 --
@@ -62,7 +85,8 @@ CREATE TABLE IF NOT EXISTS fab_bom_templates (
 
 INSERT INTO fab_bom_templates (company_id, line_type, code, name, sort_order)
 SELECT c.company_id, 'Composite Girder', s.code, s.name, s.sort_order
-  FROM (SELECT DISTINCT company_id FROM fab_item_catalog WHERE deleted_at IS NULL) c
+  FROM (SELECT DISTINCT company_id FROM apps
+         WHERE slug = 'fab_erp' AND deleted_at IS NULL) c
   JOIN (
         SELECT 'TF'   AS code, 'Top Flange'                    AS name, 1 AS sort_order
   UNION SELECT 'WP',        'Web Plate',                     2

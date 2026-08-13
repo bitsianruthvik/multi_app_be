@@ -3127,6 +3127,34 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- Idempotent; re-running is a no-op.
 -- ---------------------------------------------------------------------------
 
+-- ── the name was used before, by something else ───────────────────────────
+-- `fab_bom_templates` was ALSO the name of the reusable/versioned BOM model
+-- removed in migrations/2026-08-drop-bom-templates.sql — a completely different
+-- schema with no line_type. That drop lives in migrations/, which push-to-prod
+-- never runs, so any database restored from a dump taken before it was applied
+-- by hand still carries the old table.
+--
+-- On such a database CREATE TABLE IF NOT EXISTS silently does nothing, the
+-- table keeps the wrong shape, and the seed below then dies on `Unknown column
+-- 'line_type'` — taking the rest of init.sql with it.
+--
+-- So: if a table of that name exists and has no line_type column, it is the
+-- legacy one. All three legacy tables held zero rows for the life of that
+-- feature, so dropping is safe and loses nothing.
+SET @legacy_exists = (
+  SELECT COUNT(*) FROM information_schema.tables
+   WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates');
+SET @has_line_type = (
+  SELECT COUNT(*) FROM information_schema.columns
+   WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates'
+     AND column_name = 'line_type');
+SET @sql = IF(@legacy_exists = 1 AND @has_line_type = 0,
+  'DROP TABLE fab_bom_templates', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+DROP TABLE IF EXISTS fab_bom_template_slots;
+DROP TABLE IF EXISTS fab_bom_template_nodes;
+
 CREATE TABLE IF NOT EXISTS fab_bom_templates (
   id                  INT AUTO_INCREMENT PRIMARY KEY,
   company_id          INT NOT NULL,
@@ -3154,8 +3182,19 @@ CREATE TABLE IF NOT EXISTS fab_bom_templates (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ── seed the parts that were hardcoded ────────────────────────────────────
--- Seeded for every company already using fab_erp — judged by having an item
--- catalog, since a company with no catalog has no fab_erp data to speak of.
+-- Seeded for every company that HAS THE fab_erp APP.
+--
+-- This used to key off "has rows in fab_item_catalog", which was a proxy for
+-- the same thing and matched exactly at the time it was written. But a brand
+-- new company's catalog is empty by definition, so a tenant onboarded after
+-- this first ran would match nothing and get no templates — ever, since a seed
+-- only reaches whoever qualifies on the day it runs. Keying on the app itself
+-- is what was actually meant, and it is true from the moment fab_erp is
+-- enabled rather than from the first catalog row.
+--
+-- init.sql is re-run on every deploy (see .claude/commands/push-to-prod.md),
+-- so with the right condition this tops up new tenants by itself.
+--
 -- Guarded per (company, line_type, code) so a re-run adds nothing and, more
 -- importantly, never resurrects a part somebody deliberately deleted.
 --
@@ -3166,7 +3205,8 @@ CREATE TABLE IF NOT EXISTS fab_bom_templates (
 
 INSERT INTO fab_bom_templates (company_id, line_type, code, name, sort_order)
 SELECT c.company_id, 'Composite Girder', s.code, s.name, s.sort_order
-  FROM (SELECT DISTINCT company_id FROM fab_item_catalog WHERE deleted_at IS NULL) c
+  FROM (SELECT DISTINCT company_id FROM apps
+         WHERE slug = 'fab_erp' AND deleted_at IS NULL) c
   JOIN (
         SELECT 'TF'   AS code, 'Top Flange'                    AS name, 1 AS sort_order
   UNION SELECT 'WP',        'Web Plate',                     2

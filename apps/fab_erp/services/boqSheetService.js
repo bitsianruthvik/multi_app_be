@@ -45,7 +45,9 @@ import { recomputeOrderWeights } from './itemWeightService.js';
 import {
   orderCodePrefix, appendLevel, levelLabel, composeCode, materialSegment,
 } from './itemCodeService.js';
-import { rawMaterialsFor, materialsForThickness } from './rawMaterialService.js';
+import {
+  rawMaterialsFor, materialsForThickness, stockedThicknesses,
+} from './rawMaterialService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -248,33 +250,11 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
  * entry would make an unusual material impossible to record at all.
  */
 function addMaterialDropdown(wb, ws, materials, lastRow) {
-  const sections = materials.filter((m) => m.material_form === 'section');
-  const plates = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm != null);
-  /**
-   * Materials with no thickness recorded appear in EVERY list.
-   *
-   * They used to appear in none — not even the fallback — so a stocked item
-   * whose thickness nobody had filled in was silently unpickable, while the
-   * Materials sheet next door still listed it. The sheet contradicted itself
-   * and gave no hint why.
-   *
-   * The filter's job is to exclude materials we KNOW are the wrong thickness.
-   * Not knowing is not the same as knowing it is wrong, so absence of data must
-   * not mean absence from the list.
-   */
-  const unclassified = materials.filter((m) => m.material_form !== 'section' && m.thickness_mm == null);
   if (!materials.length) return;
 
   // Excel defined names allow letters, digits and underscore — so 12.5 becomes
   // T12_5, and the formula substitutes the same way.
   const nameFor = (t) => `T${String(Number(t)).replace('.', '_')}`;
-
-  const byThickness = new Map();
-  for (const p of plates) {
-    const k = Number(p.thickness_mm);
-    if (!byThickness.has(k)) byThickness.set(k, []);
-    byThickness.get(k).push(p);
-  }
 
   const lists = wb.addWorksheet('Lists');
   lists.state = 'veryHidden'; // not a sheet anyone should be editing
@@ -288,12 +268,19 @@ function addMaterialDropdown(wb, ws, materials, lastRow) {
     wb.definedNames.add(`Lists!$${letter}$1:$${letter}$${items.length}`, name);
   };
 
-  for (const [t, items] of [...byThickness.entries()].sort((a, b) => a[0] - b[0])) {
-    writeColumn(nameFor(t), [...items, ...unclassified, ...sections]);
+  /**
+   * Which materials belong in which list is rawMaterialService's rule, not the
+   * spreadsheet's. This used to re-derive the plate / section / no-thickness
+   * split inline, which is the same rule stated a second time — exactly the
+   * drift the service was extracted to stop. It reads it now.
+   */
+  for (const t of stockedThicknesses(materials)) {
+    writeColumn(nameFor(t), materialsForThickness(materials, t));
   }
   // The fallback for a row with no usable thickness: genuinely everything, so
-  // nothing in the catalog is unreachable from the sheet.
-  writeColumn('RM_ALL', [...plates, ...unclassified, ...sections]);
+  // nothing in the catalog is unreachable from the sheet. A null thickness is
+  // the service's own "nothing to filter on" case, which returns the lot.
+  writeColumn('RM_ALL', materialsForThickness(materials, null));
 
   const thickCol = ws.getColumn(C.height).letter;
   for (let r = 2; r <= lastRow; r++) {
