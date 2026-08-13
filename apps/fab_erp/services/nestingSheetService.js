@@ -34,7 +34,6 @@ import { pool } from '../../../db.js';
 import { recomputeOrderWeights, computeUnitWeight } from './itemWeightService.js';
 import { composeCode, materialSegment } from './itemCodeService.js';
 import { propagateLineIds } from './boqSheetService.js';
-import { rawMaterialsFor } from './rawMaterialService.js';
 
 const SHEET = 'Nesting';
 const TEMPLATE_ROWS = 400;
@@ -94,7 +93,12 @@ export async function exportNestingSheet(companyId, orderId) {
   );
   if (!orders.length) throw new Error('Order not found');
 
-  const materials = await rawMaterialsFor(companyId);
+  const [materials] = await pool.query(
+    `SELECT code, name, unit, density_kg_m3, section_area_mm2 FROM fab_item_catalog
+      WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'
+      ORDER BY code`,
+    [companyId],
+  );
 
   // Everything already nested on this order, read back grouped by plate.
   const [links] = await pool.query(
