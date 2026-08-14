@@ -103,6 +103,33 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
     if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
     else if (done > 0 || active > 0) salesTarget = 'in_production';
     else salesTarget = 'scheduled'; // tasks exist, none started yet
+
+    /**
+     * READY TO SHIP MEANS BOTH SIDES ARE DONE, not just the made one.
+     *
+     * Tasks only cover what this shop builds. An order whose every task is
+     * finished can still be waiting on a lorry — a bought-in bearing that has
+     * not arrived is just as much a reason not to ship as an unwelded seam,
+     * and this used to be invisible because purchasing had no record at all.
+     *
+     * A purchase order that is raised but not fully received holds the order at
+     * in_production. Cancelled ones do not count; an order with no purchase
+     * orders is unaffected, which is every order made before this existed.
+     *
+     * Queried inline rather than imported: procurementOrderService reaches
+     * stockInService and back into this module, and a cycle here would break
+     * task completion — the one path that must never fail.
+     */
+    if (salesTarget === 'ready_to_ship') {
+      const [[po]] = await exec.query(
+        `SELECT COUNT(*) AS outstanding
+           FROM fab_orders
+          WHERE company_id = ? AND source_order_id = ? AND order_type = 'purchase'
+            AND deleted_at IS NULL AND status NOT IN ('received', 'cancelled')`,
+        [companyId, orderId],
+      );
+      if ((Number(po?.outstanding) || 0) > 0) salesTarget = 'in_production';
+    }
     const curRank = SALES_STATUS_RANK[order.status];
     const tgtRank = SALES_STATUS_RANK[salesTarget];
     if (curRank == null) return; // custom/unknown status — leave it to the user

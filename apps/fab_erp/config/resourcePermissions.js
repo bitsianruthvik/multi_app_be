@@ -12,6 +12,10 @@ const resourcePermissions = {
   // Process master catalogue
   fabErpProcessMaster: 'fab_erp_process_master_manage',
 
+  // Suppliers — same gate as the stock they deliver into: whoever can
+  // receive material can maintain who it comes from.
+  fabErpSupplier: 'fab_erp_inventory_manage',
+
   // Parts catalog (shared across projects)
   fabErpItemCatalog: 'fab_erp_items_meta_manage',
 

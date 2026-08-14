@@ -1795,7 +1795,8 @@
       "created_by",
       "progress_template_id",
       "priority_rank",
-      "wizard_step"
+      "wizard_step",
+      "supplier_id"
     ],
     "fields": {
       "id": "fo.id",
@@ -1835,7 +1836,8 @@
       "updatedAt": "fo.updated_at",
       "plantName": "fpl_o.name",
       "plantCode": "fpl_o.code",
-      "customerCode": "fcus_o.code"
+      "customerCode": "fcus_o.code",
+      "supplierId": "fo.supplier_id"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1939,7 +1941,10 @@
       "scheduled_start",
       "scheduled_end",
       "notes",
-      "line_type"
+      "line_type",
+      "catalog_item_id",
+      "qty_received",
+      "expected_date"
     ],
     "fields": {
       "id": "fol.id",
@@ -1959,7 +1964,10 @@
       "notes": "fol.notes",
       "createdAt": "fol.created_at",
       "updatedAt": "fol.updated_at",
-      "lineType": "fol.line_type"
+      "lineType": "fol.line_type",
+      "catalogItemId": "fol.catalog_item_id",
+      "qtyReceived": "fol.qty_received",
+      "expectedDate": "fol.expected_date"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1979,7 +1987,10 @@
       "notes": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime",
-      "lineType": "string"
+      "lineType": "string",
+      "catalogItemId": "integer",
+      "qtyReceived": "decimal",
+      "expectedDate": "date"
     },
     "relations": {}
   },
@@ -2199,7 +2210,8 @@
       "operationCode": "fop_pt.code",
       "resourceTypeName": "frt_pt.name",
       "assignedResourceName": "far_pt.name",
-      "assignedResourceCode": "far_pt.code"
+      "assignedResourceCode": "far_pt.code",
+      "productionOrderId": "fpjt.production_order_id"
     },
     "fieldTypes": {
       "id": "integer",
@@ -2235,7 +2247,8 @@
       "operationCode": "string",
       "resourceTypeName": "string",
       "assignedResourceName": "string",
-      "assignedResourceCode": "string"
+      "assignedResourceCode": "string",
+      "productionOrderId": "integer"
     },
     "relations": {
       "order": {
@@ -2783,6 +2796,57 @@
           "rmName"
         ]
       }
+    }
+  },
+  "fabErpSupplier": {
+    "table": "fab_suppliers",
+    "alias": "fsup",
+    "writeFields": [
+      "code",
+      "name",
+      "contact_name",
+      "email",
+      "phone",
+      "address",
+      "payment_terms",
+      "lead_time_days",
+      "currency",
+      "active",
+      "notes"
+    ],
+    "fields": {
+      "id": "fsup.id",
+      "companyId": "fsup.company_id",
+      "code": "fsup.code",
+      "name": "fsup.name",
+      "contactName": "fsup.contact_name",
+      "email": "fsup.email",
+      "phone": "fsup.phone",
+      "address": "fsup.address",
+      "paymentTerms": "fsup.payment_terms",
+      "leadTimeDays": "fsup.lead_time_days",
+      "currency": "fsup.currency",
+      "active": "fsup.active",
+      "notes": "fsup.notes",
+      "createdAt": "fsup.created_at",
+      "updatedAt": "fsup.updated_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "contactName": "string",
+      "email": "string",
+      "phone": "string",
+      "address": "string",
+      "paymentTerms": "string",
+      "leadTimeDays": "integer",
+      "currency": "string",
+      "active": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
     }
   }
 }

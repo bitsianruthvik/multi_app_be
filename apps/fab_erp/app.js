@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import indexRoutes            from './routes/index.js';
 import criticalChainRoutes    from './routes/criticalChain.js';
 import dispatchRoutes         from './routes/dispatch.js';
+import procurementRoutes      from './routes/procurement.js';
 import { logger }              from '../../core/utils/logger.js';
 import { getQueue }            from '../../core/jobs/queue.js';
 import attributionJobHandlers  from './workers/jobHandlers.js';
@@ -28,6 +29,9 @@ export default {
     // Dispatch: same prefix, same reason — a preview/confirm pair that is its
     // own concern rather than another entry in the index router.
     server.use('/api/:companySlug/fab_erp', dispatchRoutes);
+    // Procurement + production orders: the two documents a finished BOM leads
+    // to. Same prefix, same reason as the two above.
+    server.use('/api/:companySlug/fab_erp', procurementRoutes);
     // EU-3: wait-attribution sweep every 15 min. When Redis is available we
     // enqueue onto the 'fab_erp' Bull queue (processor wired by jobHandlers);
     // when it isn't (getQueue → null, this repo's default) we run the sweep

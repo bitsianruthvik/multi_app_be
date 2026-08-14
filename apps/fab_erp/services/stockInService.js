@@ -64,7 +64,7 @@ function displayBatchCode(piece) {
  * @param {Array<{qty:number, batch_no?, heat_no?, serial_no?, mark_no?}>} input.pieces
  * @returns {Promise<{ok:true, pieceIds:number[], qtyTotal:number, tasksCleared:number[]}>}
  */
-export async function receiveStock(companyId, input) {
+export async function receiveStock(companyId, input, outerConn = null) {
   const {
     catalog_item_id: catalogItemId,
     plant_id: plantId,
@@ -76,12 +76,23 @@ export async function receiveStock(companyId, input) {
     pieces = [],
   } = input ?? {};
 
-  const conn = await pool.getConnection();
+  /**
+   * A caller may hand in its own transaction.
+   *
+   * Receiving against a purchase-order line has to book the stock AND close the
+   * line in one go: stock that arrived without its line being updated leaves
+   * the outstanding quantity permanently wrong, and nothing would ever notice.
+   * When `outerConn` is supplied this function joins that transaction and
+   * leaves begin/commit/rollback to whoever owns it. Called the old way it
+   * still owns its own, so every existing caller is unaffected.
+   */
+  const joined = !!outerConn;
+  const conn = outerConn ?? await pool.getConnection();
   const pieceIds = [];
   let qtyTotal = 0;
 
   try {
-    await conn.beginTransaction();
+    if (!joined) await conn.beginTransaction();
 
     // uom is copied from the catalog item when the caller didn't supply one.
     // postGrn never set it, so every piece in the system has a NULL unit —
@@ -144,7 +155,7 @@ export async function receiveStock(companyId, input) {
       );
     }
 
-    await conn.commit();
+    if (!joined) await conn.commit();
 
     // Post-commit, best-effort, but retried — because this call is the ONLY
     // thing in the system that moves a task off 'blocked' for material. There is
@@ -187,9 +198,9 @@ export async function receiveStock(companyId, input) {
       gateCheckFailed: !!gateError,
     };
   } catch (err) {
-    await conn.rollback();
+    if (!joined) await conn.rollback();
     throw err;
   } finally {
-    conn.release();
+    if (!joined) conn.release();
   }
 }

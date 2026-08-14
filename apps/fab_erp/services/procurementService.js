@@ -28,6 +28,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { availabilityFor } from './availabilityService.js';
 
 /** The answer for a node with no catalog link, and the fallback for an unset one. */
 export const DEFAULT_PROCUREMENT = 'make';
@@ -124,4 +125,62 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
   );
 
   return { buy, make };
+}
+
+/**
+ * What this order needs to buy, against what the shelf can actually cover.
+ *
+ * One row per catalog item on the buy side:
+ *
+ *   required   how much of it this order's BOM consumes
+ *   onHand     pieces standing in a stock area
+ *   reserved   already earmarked by SOMEBODY ELSE (this order's own holding is
+ *              excluded — it has that stock, and counting it would send the
+ *              order out to buy what it is already holding)
+ *   available  onHand − reserved
+ *   short      required − available, floored at zero. This, and only this, is
+ *              what a purchase order is raised for.
+ *
+ * A buy row with NO catalog item cannot be purchased or counted against stock —
+ * there is nothing to match on. Those are returned separately rather than
+ * folded into the totals, because silently dropping them would understate the
+ * shortfall and quietly under-order.
+ *
+ * @returns {Promise<{lines: object[], unmatched: object[], shortCount: number}>}
+ */
+export async function orderShortfall(companyId, orderId, conn) {
+  const { buy } = await orderProcurementSplit(companyId, orderId, conn);
+
+  const unmatched = buy.filter((r) => r.catalog_item_id == null);
+  const matched = buy.filter((r) => r.catalog_item_id != null);
+
+  const avail = await availabilityFor(
+    companyId, matched.map((r) => r.catalog_item_id), { forOrderId: orderId, conn },
+  );
+
+  const lines = matched.map((r) => {
+    const id = Number(r.catalog_item_id);
+    const a = avail.get(id) || { onHand: 0, reserved: 0, available: 0 };
+    const required = Number(r.qty) || 0;
+    return {
+      catalogItemId: id,
+      code: r.code,
+      name: r.name,
+      unit: r.unit,
+      linesCount: Number(r.lines_count) || 0,
+      required,
+      onHand: a.onHand,
+      reserved: a.reserved,
+      available: a.available,
+      short: Math.max(0, required - a.available),
+    };
+  }).sort((x, y) => (y.short - x.short) || String(x.code || '').localeCompare(String(y.code || '')));
+
+  return {
+    lines,
+    unmatched: unmatched.map((r) => ({
+      name: r.name, linesCount: Number(r.lines_count) || 0, required: Number(r.qty) || 0,
+    })),
+    shortCount: lines.filter((l) => l.short > 0).length,
+  };
 }

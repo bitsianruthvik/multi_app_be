@@ -3283,3 +3283,154 @@ UPDATE fab_items fi
  WHERE fi.deleted_at IS NULL
    AND fi.catalog_item_id IS NULL
    AND fi.procurement_type IS NULL;
+
+
+-- ===== procurement + production orders (2026-08-13) =====
+-- ---------------------------------------------------------------------------
+-- A sales order is a promise. Keeping it means two different kinds of work that
+-- had no record of their own: buying what we do not have, and making what
+-- nobody sells. fab_items.procurement_type says which is which per node; this
+-- is where those two answers become documents.
+--
+--   PRODUCTION ORDER   one per sales order, order_type='manufacturing'. It owns
+--                      the make side and its task DAG.
+--   PROCUREMENT ORDER  order_type='purchase', one per supplier, carrying the
+--                      shortfall lines — what stock cannot cover.
+--
+-- Both hang off the sales order by source_order_id, so the sales order's status
+-- can be read as a combination of the two.
+--
+-- NOTE ON THE DAG: fab_project_tasks.order_id still points at the SALES order
+-- and is NOT repointed. 2154 live task rows and roughly twenty modules read it
+-- (critical chain, drum, dispatch, buffers, shift log, analytics,
+-- reconciliation, readiness), all of which reach order priority and dates
+-- through it. The production order claims its DAG through a NEW nullable column
+-- instead: additive, reversible, and it leaves every one of those paths
+-- working. "The DAG lives in the production order" is a question of which
+-- column answers it, not of moving 2154 rows.
+-- ---------------------------------------------------------------------------
+
+-- ── suppliers ─────────────────────────────────────────────────────────────
+-- There was no supplier anywhere in this system: goods came in through
+-- /stock/receive with "no purchase order, no supplier, no receipt document".
+-- A purchase order has to be addressed to somebody.
+CREATE TABLE IF NOT EXISTS fab_suppliers (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  code           VARCHAR(60)   NOT NULL,
+  name           VARCHAR(255)  NOT NULL,
+  contact_name   VARCHAR(255)  NULL,
+  email          VARCHAR(255)  NULL,
+  phone          VARCHAR(60)   NULL,
+  address        TEXT          NULL,
+  payment_terms  VARCHAR(120)  NULL,
+  -- Working days from order to delivery. Feeds "will it arrive in time", which
+  -- is the only question a required date can be checked against.
+  lead_time_days INT           NULL,
+  currency       VARCHAR(10)   NULL,
+  active         TINYINT(1)    NOT NULL DEFAULT 1,
+  notes          TEXT          NULL,
+  created_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at     DATETIME      NULL,
+  KEY idx_fsup_company (company_id, active),
+  KEY idx_fsup_code    (company_id, code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Which supplier a purchase order is addressed to.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='supplier_id');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_orders ADD COLUMN supplier_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- "Everything raised for this sales order" is the query both new steps run.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='idx_fo_source_type');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_orders ADD KEY idx_fo_source_type (source_order_id, order_type)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── purchase-order lines ──────────────────────────────────────────────────
+-- fab_order_lines was built for SALES lines: free text, a price, a completed
+-- qty. A purchase line needs to name a catalog item — it is a specific plate,
+-- not a description — and to track what has physically arrived against it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='catalog_item_id');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_order_lines ADD COLUMN catalog_item_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='qty_received');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_order_lines ADD COLUMN qty_received DECIMAL(18,4) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='expected_date');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_order_lines ADD COLUMN expected_date DATE NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND INDEX_NAME='idx_fol_catalog');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_order_lines ADD KEY idx_fol_catalog (company_id, catalog_item_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── the production order owns its DAG ─────────────────────────────────────
+-- Additive on purpose — see the note at the top of this block.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='production_order_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_project_tasks ADD COLUMN production_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND INDEX_NAME='idx_fpt_prod_order');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_project_tasks ADD KEY idx_fpt_prod_order (production_order_id, status)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── stock reservations, restored ──────────────────────────────────────────
+-- Removed 2026-08-05 with the simplification pass. Back because a shortfall
+-- computed against raw on-hand is a lie the moment two orders ask at once:
+-- both are told the same plate is free, both are told to buy nothing, and one
+-- of them finds out on the shop floor.
+--
+-- One difference from the 2026-07-23 original: task_id is NULLABLE now. That
+-- version only ever earmarked at gate-clear, when a task existed. Procurement
+-- earmarks for the ORDER, long before any task does — so a reservation belongs
+-- to a task or to an order, and `kind` says which.
+CREATE TABLE IF NOT EXISTS fab_stock_reservations (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  catalog_item_id   INT            NOT NULL,
+  kind              ENUM('order','task') NOT NULL DEFAULT 'order',
+  task_id           INT            NULL,
+  order_id          INT            NULL,
+  qty               DECIMAL(18,4)  NOT NULL DEFAULT 0,
+  status            ENUM('active','consumed','released') NOT NULL DEFAULT 'active',
+  notes             TEXT           NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  released_at       DATETIME       NULL,
+  deleted_at        DATETIME       DEFAULT NULL,
+  KEY idx_fsr_avail (company_id, catalog_item_id, status),
+  KEY idx_fsr_task  (company_id, task_id, status),
+  KEY idx_fsr_order (company_id, order_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- A database that still carries the pre-removal table has task_id NOT NULL and
+-- no `kind`. Widen it rather than leaving it unusable for order reservations.
+SET @tbl = (SELECT COUNT(*) FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations');
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations' AND COLUMN_NAME='kind');
+SET @sql = IF(@tbl=1 AND @col=0,
+  "ALTER TABLE fab_stock_reservations ADD COLUMN kind ENUM('order','task') NOT NULL DEFAULT 'task'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations'
+              AND COLUMN_NAME='task_id' AND IS_NULLABLE='NO');
+SET @sql = IF(@nn=1, 'ALTER TABLE fab_stock_reservations MODIFY COLUMN task_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
