@@ -48,6 +48,7 @@ import {
 import {
   rawMaterialsFor, materialsForThickness, stockedThicknesses,
 } from './rawMaterialService.js';
+import { syncOrderProcurement } from './procurementService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -608,6 +609,10 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
     }
 
     await propagateLineIds(conn, companyId, orderId);
+    // Classify what was just created before the transaction closes: a row that
+    // reaches the tree with no answer to make-or-buy is a row the purchasing
+    // and production steps will silently skip.
+    await syncOrderProcurement(conn, companyId, orderId);
 
     const w = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = w.totalWeight;

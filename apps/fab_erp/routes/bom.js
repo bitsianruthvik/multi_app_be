@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool }    from '../../../db.js';
+import { syncOrderProcurement } from '../services/procurementService.js';
 
 const router = Router();
 
@@ -99,6 +100,10 @@ router.post('/bom/copy-template', protect, async (req, res) => {
     for (const root of byParent.get(null) ?? []) {
       await insertNode(root, null);
     }
+
+    // Same sweep every other item-creation path ends with — copied nodes are
+    // BOM nodes like any other and need an answer to make-or-buy.
+    await syncOrderProcurement(null, companyId, projectId);
 
     res.json({ ok: true, inserted });
   } catch (err) {

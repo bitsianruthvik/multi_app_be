@@ -35,6 +35,7 @@ import { recomputeOrderWeights, computeUnitWeight } from './itemWeightService.js
 import { composeCode, materialSegment } from './itemCodeService.js';
 import { propagateLineIds } from './boqSheetService.js';
 import { rawMaterialsFor } from './rawMaterialService.js';
+import { syncOrderProcurement } from './procurementService.js';
 
 const SHEET = 'Nesting';
 const TEMPLATE_ROWS = 400;
@@ -398,6 +399,8 @@ export async function importNestingSheet(file, companyId, orderId, mode = 'appen
     result.nests = seenNests.size;
     // The material links just hung under their parts inherit those parts' line.
     await propagateLineIds(conn, companyId, orderId);
+    // Those links are catalog stock draws, so this is what makes them 'buy'.
+    await syncOrderProcurement(conn, companyId, orderId);
     const w = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = w.totalWeight;
 

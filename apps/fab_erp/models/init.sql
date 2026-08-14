@@ -3221,3 +3221,65 @@ SELECT c.company_id, 'Composite Girder', s.code, s.name, s.sort_order
     WHERE t.company_id = c.company_id
       AND t.line_type = 'Composite Girder'
       AND t.code = s.code);
+
+
+-- ===== make vs buy on every BOM node (2026-08-13) =====
+-- ---------------------------------------------------------------------------
+-- Whether a BOM node is something the shop MAKES or something it BUYS was,
+-- until now, only ever recorded on the catalog — so the structural levels of an
+-- order's BOM (span, girder, segment, part) had no answer at all. They carry no
+-- catalog link: in production today all 230 of them are unclassified, while the
+-- 297 catalog-linked leaves under them are almost all 'buy' stock draws.
+--
+-- That gap is what blocks the next step. "Raise a PO for what we buy, a
+-- production order for what we make" cannot be asked of data where most rows
+-- answer neither.
+--
+-- The rule, stated once here and once in services/procurementService.js:
+--
+--   linked to a catalog item  →  whatever the CATALOG says (it is the authority;
+--                                this is what "explicitly selected from the item
+--                                catalog" means, and it is how raw materials end
+--                                up 'buy' without naming them specially)
+--   no catalog link           →  'make' — a girder is not a thing anybody sells
+--
+-- NULLABLE ON PURPOSE, with no default. NULL means "never classified", which is
+-- what makes the backfill below safe to re-run on every deploy: it fills blanks
+-- and cannot flatten a deliberate override into 'make'. A DEFAULT would erase
+-- that distinction on the first insert.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items'
+               AND COLUMN_NAME='procurement_type');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_items ADD COLUMN procurement_type VARCHAR(20) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The next step reads this per order ("everything in this order we have to buy"),
+-- which is exactly this index.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items'
+               AND INDEX_NAME='idx_fi_order_procurement');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_items ADD KEY idx_fi_order_procurement (order_id, procurement_type)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── backfill ──────────────────────────────────────────────────────────────
+-- Catalog-linked rows MIRROR the catalog every time, because the catalog is the
+-- authority for those and re-pointing an item at a different catalog entry must
+-- carry its procurement with it.
+UPDATE fab_items fi
+  JOIN fab_item_catalog fic
+    ON fic.id = fi.catalog_item_id AND fic.deleted_at IS NULL
+   SET fi.procurement_type = fic.procurement_type
+ WHERE fi.deleted_at IS NULL
+   AND (fi.procurement_type IS NULL OR fi.procurement_type <> fic.procurement_type);
+
+-- Everything else defaults to 'make', but ONLY where nothing has been recorded
+-- yet — an override that says 'buy' on an uncatalogued node survives re-runs.
+UPDATE fab_items fi
+   SET fi.procurement_type = 'make'
+ WHERE fi.deleted_at IS NULL
+   AND fi.catalog_item_id IS NULL
+   AND fi.procurement_type IS NULL;

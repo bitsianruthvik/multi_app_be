@@ -38,6 +38,7 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
+import { syncOrderProcurement } from './procurementService.js';
 import {
   orderCodePrefix, composeCode, abbreviate, normaliseAbbr, materialSegment, loadUsedCodes,
 } from './itemCodeService.js';
@@ -677,6 +678,8 @@ export async function importOrderItemsExcel(file, companyId, orderId, mode = 'ap
     }
 
     result.nests = nestKeys.size;
+
+    await syncOrderProcurement(conn, companyId, orderId);
 
     const weights = await recomputeOrderWeights(companyId, orderId, conn);
     result.totalWeight = weights.totalWeight;

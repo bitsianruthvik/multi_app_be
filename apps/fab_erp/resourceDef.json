@@ -999,7 +999,8 @@
       "height",
       "dim_unit",
       "unit_weight",
-      "weight_unit"
+      "weight_unit",
+      "procurement_type"
     ],
     "fields": {
       "id": "fi.id",
@@ -1027,7 +1028,8 @@
       "catalogItemCode": "fic_item.code",
       "catalogItemUnit": "fic_item.unit",
       "levelKind": "fi.level_kind",
-      "flowSource": "fi.flow_source"
+      "flowSource": "fi.flow_source",
+      "procurementType": "fi.procurement_type"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1055,7 +1057,8 @@
       "catalogItemCode": "string",
       "catalogItemUnit": "string",
       "levelKind": "string",
-      "flowSource": "string"
+      "flowSource": "string",
+      "procurementType": "string"
     },
     "relations": {
       "order": {
