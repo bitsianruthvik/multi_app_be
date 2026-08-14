@@ -923,7 +923,8 @@
       "categoryHeatRequired": "fic_cat.heat_required",
       "categoryMarkRequired": "fic_cat.mark_required",
       "thicknessMm": "fic.thickness_mm",
-      "materialForm": "fic.material_form"
+      "materialForm": "fic.material_form",
+      "categoryCode": "fic_cat.code"
     },
     "fieldTypes": {
       "id": "integer",
@@ -949,7 +950,8 @@
       "categoryHeatRequired": "integer",
       "categoryMarkRequired": "integer",
       "thicknessMm": "decimal",
-      "materialForm": "string"
+      "materialForm": "string",
+      "categoryCode": "string"
     },
     "relations": {
       "category": {
@@ -961,7 +963,8 @@
           "categoryBatchRequired",
           "categorySerialRequired",
           "categoryHeatRequired",
-          "categoryMarkRequired"
+          "categoryMarkRequired",
+          "categoryCode"
         ]
       },
       "group": {

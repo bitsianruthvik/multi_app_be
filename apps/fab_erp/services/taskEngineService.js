@@ -32,8 +32,28 @@ import { tryClearTask } from './taskGatingService.js';
 // a status already at/above the computed target (incl. a manual shipped/closed)
 // is never moved back.
 //
+/**
+ * `waiting_material` replaced `scheduled` at rank 2 on 2026-08-13.
+ *
+ * "Scheduled" described the DAG existing, which is now true the moment a
+ * production order is raised and says nothing about whether the job can start.
+ * What a planner needs at that rank is whether the shop is held up, and it is
+ * held up when the production order is `waiting` — approved with every task
+ * still blocked for want of steel.
+ *
+ * `scheduled` is KEPT in the map, at the same rank, so any order still carrying
+ * it compares sanely and the forward-only rule keeps working. Nothing targets
+ * it any more.
+ */
 const SALES_STATUS_RANK = {
-  draft: 0, confirmed: 1, scheduled: 2, in_production: 3, ready_to_ship: 4, shipped: 5, closed: 6,
+  draft: 0,
+  confirmed: 1,
+  scheduled: 2,
+  waiting_material: 2,
+  in_production: 3,
+  ready_to_ship: 4,
+  shipped: 5,
+  closed: 6,
 };
 
 /**
@@ -99,10 +119,37 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
     // nothing left to do. Only Confirm takes an order out of draft.
     if (order.status === 'draft') return;
 
+    /**
+     * The sales order now MIRRORS ITS PRODUCTION ORDER.
+     *
+     * The two used to be computed from the same task counts by two different
+     * rules, which is two chances to disagree about one job. The production
+     * order already answers "is this waiting for steel or actually running",
+     * and it is the thing that knows, so the sales order reads it rather than
+     * working it out again.
+     *
+     * An order with no production order yet falls back to the task counts, so
+     * anything raised before this existed still behaves.
+     */
+    const [[mo]] = await exec.query(
+      `SELECT status FROM fab_orders
+        WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+          AND deleted_at IS NULL
+        ORDER BY id LIMIT 1`,
+      [companyId, orderId],
+    );
+
     let salesTarget;
-    if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
+    if (mo) {
+      if (mo.status === 'completed') salesTarget = 'ready_to_ship';
+      else if (mo.status === 'in_production') salesTarget = 'in_production';
+      else if (mo.status === 'waiting') salesTarget = 'waiting_material';
+      // A draft production order is one nobody has approved. The sales order
+      // has nothing to advance to yet.
+      else return;
+    } else if (remaining === 0 && done > 0) salesTarget = 'ready_to_ship';
     else if (done > 0 || active > 0) salesTarget = 'in_production';
-    else salesTarget = 'scheduled'; // tasks exist, none started yet
+    else salesTarget = 'waiting_material'; // tasks exist, none startable yet
 
     /**
      * READY TO SHIP MEANS BOTH SIDES ARE DONE, not just the made one.

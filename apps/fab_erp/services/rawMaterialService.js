@@ -20,6 +20,25 @@
 import { pool } from '../../../db.js';
 
 /**
+ * Categories that are bought but are NOT stock a part is cut from.
+ *
+ * `procurement_type = 'buy'` is the right rule for "did we buy this", and it is
+ * still the rule below. It is the wrong rule on its own for "what is this part
+ * cut from", because a real catalog also contains welding flux, zinc primer,
+ * CO2 cylinders and M24 bolts — all genuinely bought, none of them something a
+ * flange is cut from. Production had 48 bought items of which 14 were these,
+ * so every material picker in the app offered paint alongside plate.
+ *
+ * This is two named SYSTEM categories excluded, not a category-based
+ * definition. The original rule rejected "is it in the Raw Materials category"
+ * as an INCLUSION test, and rightly — that category is a filing decision and a
+ * part is never cut from a finished good whatever anybody filed it under.
+ * Consumables and fasteners are different: they are seeded system rows whose
+ * meaning is fixed, and nothing in either is ever cut into anything.
+ */
+const NOT_CUT_FROM = ['cons', 'fast'];
+
+/**
  * Every raw material a company can cut from, richest form.
  *
  * @param {object} [conn] run inside a caller's transaction
@@ -27,12 +46,16 @@ import { pool } from '../../../db.js';
 export async function rawMaterialsFor(companyId, conn) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
-    `SELECT id, code, name, unit, density_kg_m3, section_area_mm2,
-            thickness_mm, material_form
-       FROM fab_item_catalog
-      WHERE company_id = ? AND deleted_at IS NULL AND procurement_type = 'buy'
-      ORDER BY material_form, thickness_mm, code`,
-    [companyId],
+    `SELECT fic.id, fic.code, fic.name, fic.unit, fic.density_kg_m3, fic.section_area_mm2,
+            fic.thickness_mm, fic.material_form
+       FROM fab_item_catalog fic
+       LEFT JOIN fab_item_categories cat
+         ON cat.id = fic.category_id AND cat.deleted_at IS NULL
+      WHERE fic.company_id = ? AND fic.deleted_at IS NULL
+        AND fic.procurement_type = 'buy'
+        AND COALESCE(cat.code, '') NOT IN (${NOT_CUT_FROM.map(() => '?').join(',')})
+      ORDER BY fic.material_form, fic.thickness_mm, fic.code`,
+    [companyId, ...NOT_CUT_FROM],
   );
   return rows;
 }

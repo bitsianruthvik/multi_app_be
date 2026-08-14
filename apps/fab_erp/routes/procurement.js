@@ -20,7 +20,7 @@ import {
   raiseProcurement, receiveAgainstLine, procurementForOrder,
 } from '../services/procurementOrderService.js';
 import {
-  ensureProductionOrder, productionForOrder, rollUpProductionOrder,
+  ensureProductionOrder, productionForOrder, rollUpProductionOrder, approveProductionOrder,
 } from '../services/productionOrderService.js';
 import { releaseOrderReservations } from '../services/availabilityService.js';
 import { pool } from '../../../db.js';
@@ -167,6 +167,25 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
     res.json({ ...mo, production });
   } catch (err) {
     logger.error({ err, orderId }, 'raising production order failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * POST /production-orders/:moId/approve — the one transition a person makes.
+ *
+ * Everything after it follows from the shop floor: waiting until material
+ * turns up, in production once a task can actually be started.
+ */
+router.post('/production-orders/:moId/approve', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_projects_manage');
+  if (!c) return;
+  const moId = Number(req.params.moId);
+  try {
+    const state = await approveProductionOrder(c.companyId, moId);
+    res.json({ ok: true, ...state });
+  } catch (err) {
+    logger.error({ err, moId }, 'approving production order failed');
     res.status(500).json({ message: err.message });
   }
 });

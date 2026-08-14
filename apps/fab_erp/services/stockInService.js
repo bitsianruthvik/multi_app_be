@@ -33,6 +33,7 @@
 
 import { pool } from '../../../db.js';
 import { reevaluateStockGatedTasks } from './taskGatingService.js';
+import { rollUpForTasks } from './productionOrderService.js';
 import { generateCode } from './codegenService.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -185,6 +186,25 @@ export async function receiveStock(companyId, input, outerConn = null) {
         { err: gateError, companyId, catalogItemId },
         '[stock-in] gate re-evaluation failed after 3 attempts; stock is committed but blocked tasks were not re-checked',
       );
+    }
+
+    /**
+     * A task clearing its material gate is exactly the moment a production
+     * order stops waiting and starts producing — "the first raw material it
+     * needs turns up". Nothing else observes it, so it is observed here.
+     *
+     * Best-effort like the gate check above: the stock is real and committed,
+     * and a status that lags is a smaller problem than a receipt that fails.
+     */
+    if (tasksCleared.length) {
+      try {
+        await rollUpForTasks(conn, companyId, tasksCleared);
+      } catch (moErr) {
+        logger.warn(
+          { err: moErr, companyId, cleared: tasksCleared.length },
+          '[stock-in] production orders not re-checked after gate clear',
+        );
+      }
     }
 
     // Reported, not swallowed. The receipt succeeded and must not be undone, but

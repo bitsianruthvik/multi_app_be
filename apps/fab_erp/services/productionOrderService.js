@@ -27,10 +27,33 @@
 
 import { pool } from '../../../db.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
+import { materializeOrderTasks } from './taskGatingService.js';
+import { rollUpOrderStatus } from './taskEngineService.js';
+import { logger } from '../../../core/utils/logger.js';
 
+/**
+ * A production order's life, and what moves it.
+ *
+ *   draft          raised, with its DAG already built. Nobody has committed to
+ *                  it yet, so nothing advances it automatically — approval is a
+ *                  person's decision and the system must not make it by
+ *                  materialising some tasks.
+ *   waiting        approved, and every task is still blocked. The shop cannot
+ *                  start: there is nothing to put on a machine.
+ *   in_production  at least one task is ELIGIBLE — its material is on hand and
+ *                  its predecessors are done. That is what "the first raw
+ *                  material it needs turns up" means in this schema, and it is
+ *                  why receiving stock has to re-check this order.
+ *   completed      every task done.
+ *
+ * `eligible` is the load-bearing status. A task sits `blocked` until
+ * taskGatingService clears it, which happens when stock arrives — so the
+ * waiting → in_production move is a consequence of the gate opening rather than
+ * a separate thing to remember to do.
+ */
 export const MO_STATUS = {
   DRAFT: 'draft',
-  RELEASED: 'released',
+  WAITING: 'waiting',
   IN_PROGRESS: 'in_production',
   DONE: 'completed',
   CANCELLED: 'cancelled',
@@ -100,6 +123,20 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
       created = true;
     }
 
+    /**
+     * The DAG is built HERE, as part of raising the order.
+     *
+     * It used to be a separate step somebody had to remember, which meant a
+     * production order could exist describing work that had never been broken
+     * down — a document about nothing. Raising the order and having the work to
+     * do are the same act, so they happen together.
+     *
+     * Idempotent by materializeOrderTasks' own per-(item, flow step) key, so
+     * raising an order whose tree is already built adds nothing and re-raising
+     * after the BOM grew adds only what is new.
+     */
+    const materialized = await materializeOrderTasks(conn, companyId, orderId);
+
     // Claim every make task on this sales order. A task whose item is bought in
     // is not production work and is left alone.
     const [claim] = await conn.query(
@@ -119,6 +156,8 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
       status: mo.status,
       created,
       tasksClaimed: claim?.affectedRows ?? 0,
+      tasksMaterialized: materialized?.tasksInserted ?? 0,
+      itemsSkipped: materialized?.itemsSkipped ?? 0,
     };
   } catch (err) {
     if (owned) await conn.rollback();
@@ -129,13 +168,46 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
 }
 
 /**
+ * Approve a production order: draft → waiting, and then wherever the work is.
+ *
+ * Approval is the one transition a person makes. Everything after it is a
+ * consequence of the shop floor, so this hands straight over to the roll-up —
+ * an order whose material is ALREADY in stock has nothing to wait for and goes
+ * to in_production immediately rather than sitting in a waiting state that was
+ * never true.
+ */
+export async function approveProductionOrder(companyId, productionOrderId) {
+  const [[mo]] = await pool.query(
+    `SELECT id, status FROM fab_orders
+      WHERE id = ? AND company_id = ? AND order_type = 'manufacturing' AND deleted_at IS NULL
+      LIMIT 1`,
+    [productionOrderId, companyId],
+  );
+  if (!mo) throw new Error('Production order not found');
+  if (mo.status === MO_STATUS.CANCELLED) throw new Error('That production order is cancelled');
+  if (mo.status !== MO_STATUS.DRAFT) {
+    // Already approved. Not an error — re-reading where it stands is useful.
+    return rollUpProductionOrder(pool, companyId, productionOrderId);
+  }
+
+  await pool.query(
+    `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ?`,
+    [MO_STATUS.WAITING, productionOrderId, companyId],
+  );
+  return rollUpProductionOrder(pool, companyId, productionOrderId);
+}
+
+/**
  * Move a production order's status to match the tasks it owns.
  *
- * Deliberately NOT forward-only, unlike the sales order's own lifecycle: a
- * production order is a description of work in progress, and re-materializing
- * the DAG can legitimately add unstarted work to a job that had been finished.
- * Saying `completed` there would be a lie the sales order would then inherit.
- * A cancelled order is still left alone.
+ * A DRAFT IS NEVER ADVANCED. Approval is a commitment somebody makes, and
+ * materialising tasks or receiving steel must not make it on their behalf —
+ * the same reason task automation is forbidden from advancing a draft sales
+ * order. Progress is still recorded, so a draft shows what it would be.
+ *
+ * Past draft it is deliberately NOT forward-only: re-materialising the DAG can
+ * legitimately add unstarted work to a job that had been finished, and saying
+ * `completed` there would be a lie the sales order then inherits.
  */
 export async function rollUpProductionOrder(exec, companyId, productionOrderId) {
   if (!productionOrderId) return null;
@@ -150,6 +222,7 @@ export async function rollUpProductionOrder(exec, companyId, productionOrderId) 
     `SELECT COUNT(*) AS total,
             SUM(status = 'done')                     AS done,
             SUM(status IN ('in_progress', 'paused')) AS active,
+            SUM(status = 'eligible')                 AS eligible,
             SUM(status NOT IN ('done', 'cancelled')) AS remaining
        FROM fab_project_tasks
       WHERE company_id = ? AND production_order_id = ? AND deleted_at IS NULL`,
@@ -158,22 +231,81 @@ export async function rollUpProductionOrder(exec, companyId, productionOrderId) 
   const total = Number(agg?.total) || 0;
   const done = Number(agg?.done) || 0;
   const active = Number(agg?.active) || 0;
+  const eligible = Number(agg?.eligible) || 0;
   const remaining = Number(agg?.remaining) || 0;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
-  let target = MO_STATUS.DRAFT;
-  if (total > 0) {
-    if (remaining === 0 && done > 0) target = MO_STATUS.DONE;
-    else if (done > 0 || active > 0) target = MO_STATUS.IN_PROGRESS;
-    else target = MO_STATUS.RELEASED;
+  // Progress is recorded either way; only the status is withheld from a draft.
+  if (mo.status === MO_STATUS.DRAFT) {
+    await exec.query(
+      `UPDATE fab_orders SET progress_pct = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [pct, productionOrderId, companyId],
+    );
+    return { status: MO_STATUS.DRAFT, progressPct: pct, total, done, active, eligible };
   }
 
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  let target;
+  if (total === 0) target = MO_STATUS.WAITING;
+  else if (remaining === 0 && done > 0) target = MO_STATUS.DONE;
+  // Anything started, finished, or STARTABLE means the shop has its first
+  // input — an eligible task is one whose material is on hand.
+  else if (done > 0 || active > 0 || eligible > 0) target = MO_STATUS.IN_PROGRESS;
+  else target = MO_STATUS.WAITING;
+
   await exec.query(
     `UPDATE fab_orders SET status = ?, progress_pct = ?
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
     [target, pct, productionOrderId, companyId],
   );
-  return { status: target, progressPct: pct, total, done, active };
+
+  /**
+   * The sales order mirrors this one, so it has to be told.
+   *
+   * Without this the two only agreed by coincidence — the sales order was
+   * updated when a TASK changed, and this order when its status was
+   * recalculated, which are not the same moments. Approving a production order
+   * moved nothing at all on the sales side.
+   *
+   * Best-effort: a status that lags is not worth failing the write that got
+   * here.
+   */
+  const [[link]] = await exec.query(
+    `SELECT source_order_id AS soId FROM fab_orders
+      WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    [productionOrderId, companyId],
+  );
+  if (link?.soId) {
+    try {
+      await rollUpOrderStatus(exec, companyId, link.soId);
+    } catch (err) {
+      logger.warn({ err, productionOrderId }, '[production] sales order not re-read');
+    }
+  }
+
+  return { status: target, progressPct: pct, total, done, active, eligible };
+}
+
+/**
+ * Re-check every production order touched by a set of tasks.
+ *
+ * Called after stock arrives and the gate clears tasks: that is precisely the
+ * moment a waiting order becomes a producing one, and nothing else was going to
+ * notice.
+ */
+export async function rollUpForTasks(exec, companyId, taskIds) {
+  const ids = (taskIds || []).map(Number).filter(Number.isFinite);
+  if (!ids.length) return [];
+  const [rows] = await exec.query(
+    `SELECT DISTINCT production_order_id AS id
+       FROM fab_project_tasks
+      WHERE company_id = ? AND id IN (?) AND production_order_id IS NOT NULL`,
+    [companyId, ids],
+  );
+  const out = [];
+  for (const r of rows) {
+    out.push({ id: r.id, ...(await rollUpProductionOrder(exec, companyId, r.id)) });
+  }
+  return out;
 }
 
 /** The production order for a sales order, with the shape of its DAG. */
