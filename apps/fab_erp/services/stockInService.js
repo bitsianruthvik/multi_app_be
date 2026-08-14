@@ -33,7 +33,7 @@
 
 import { pool } from '../../../db.js';
 import { reevaluateStockGatedTasks } from './taskGatingService.js';
-import { rollUpForTasks } from './productionOrderService.js';
+import { rollUpOrderStatus } from './taskEngineService.js';
 import { generateCode } from './codegenService.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -198,11 +198,22 @@ export async function receiveStock(companyId, input, outerConn = null) {
      */
     if (tasksCleared.length) {
       try {
-        await rollUpForTasks(conn, companyId, tasksCleared);
+        // A task carries its SALES order id, and rollUpOrderStatus refreshes the
+        // production order before mirroring it — so one call per affected order
+        // moves both documents. Going via the production order directly would
+        // leave the sales order reading a value nobody had recomputed.
+        const [orders] = await conn.query(
+          `SELECT DISTINCT order_id FROM fab_project_tasks
+            WHERE company_id = ? AND id IN (?) AND order_id IS NOT NULL`,
+          [companyId, tasksCleared],
+        );
+        for (const o of orders) {
+          await rollUpOrderStatus(conn, companyId, o.order_id);
+        }
       } catch (moErr) {
         logger.warn(
           { err: moErr, companyId, cleared: tasksCleared.length },
-          '[stock-in] production orders not re-checked after gate clear',
+          '[stock-in] order statuses not re-checked after gate clear',
         );
       }
     }

@@ -24,6 +24,7 @@
 
 import { pool } from '../../../db.js';
 import { tryClearTask } from './taskGatingService.js';
+import { rollUpProductionOrder } from './productionOrderService.js';
 
 // Sales-order lifecycle (Project Progress feature, 2026-07-24): automation moves
 // an order forward through these ranks only. materialized(tasks exist)→scheduled,
@@ -131,13 +132,39 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
      * An order with no production order yet falls back to the task counts, so
      * anything raised before this existed still behaves.
      */
-    const [[mo]] = await exec.query(
-      `SELECT status FROM fab_orders
+    const [[moRow]] = await exec.query(
+      `SELECT id FROM fab_orders
         WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
           AND deleted_at IS NULL
         ORDER BY id LIMIT 1`,
       [companyId, orderId],
     );
+
+    /**
+     * REFRESH THE PRODUCTION ORDER BEFORE READING IT.
+     *
+     * Mirroring a status nobody recomputed is mirroring a stale one. This is
+     * called on every task start and completion, and the production order was
+     * only recalculated when it was raised, approved, or when stock arrived —
+     * so finishing every task on a job left BOTH documents saying "waiting for
+     * material" about work that was already done.
+     *
+     * Doing it here, rather than having the production order push to the sales
+     * order, is what keeps the dependency in one direction: this module already
+     * owns the sales lifecycle, so it recomputes its input and then maps it.
+     */
+    let mo = null;
+    if (moRow?.id) {
+      try {
+        mo = await rollUpProductionOrder(exec, companyId, moRow.id);
+      } catch (err) {
+        // Fall back to the stored value rather than losing the roll-up entirely.
+        const [[stored]] = await exec.query(
+          'SELECT status FROM fab_orders WHERE id = ? LIMIT 1', [moRow.id],
+        );
+        mo = stored ?? null;
+      }
+    }
 
     let salesTarget;
     if (mo) {

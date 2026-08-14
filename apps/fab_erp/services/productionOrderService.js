@@ -28,8 +28,6 @@
 import { pool } from '../../../db.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
 import { materializeOrderTasks } from './taskGatingService.js';
-import { rollUpOrderStatus } from './taskEngineService.js';
-import { logger } from '../../../core/utils/logger.js';
 
 /**
  * A production order's life, and what moves it.
@@ -208,6 +206,13 @@ export async function approveProductionOrder(companyId, productionOrderId) {
  * Past draft it is deliberately NOT forward-only: re-materialising the DAG can
  * legitimately add unstarted work to a job that had been finished, and saying
  * `completed` there would be a lie the sales order then inherits.
+ *
+ * THIS FUNCTION DOES NOT TOUCH THE SALES ORDER. It used to, and that made the
+ * dependency circular the moment the sales order started mirroring this one.
+ * `taskEngineService.rollUpOrderStatus` is now the single entry point that
+ * refreshes both — it calls this first and then mirrors the result — so every
+ * existing caller of it (task start, task complete, materialise, re-materialise)
+ * keeps both documents current without knowing this exists.
  */
 export async function rollUpProductionOrder(exec, companyId, productionOrderId) {
   if (!productionOrderId) return null;
@@ -258,54 +263,7 @@ export async function rollUpProductionOrder(exec, companyId, productionOrderId) 
     [target, pct, productionOrderId, companyId],
   );
 
-  /**
-   * The sales order mirrors this one, so it has to be told.
-   *
-   * Without this the two only agreed by coincidence — the sales order was
-   * updated when a TASK changed, and this order when its status was
-   * recalculated, which are not the same moments. Approving a production order
-   * moved nothing at all on the sales side.
-   *
-   * Best-effort: a status that lags is not worth failing the write that got
-   * here.
-   */
-  const [[link]] = await exec.query(
-    `SELECT source_order_id AS soId FROM fab_orders
-      WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-    [productionOrderId, companyId],
-  );
-  if (link?.soId) {
-    try {
-      await rollUpOrderStatus(exec, companyId, link.soId);
-    } catch (err) {
-      logger.warn({ err, productionOrderId }, '[production] sales order not re-read');
-    }
-  }
-
   return { status: target, progressPct: pct, total, done, active, eligible };
-}
-
-/**
- * Re-check every production order touched by a set of tasks.
- *
- * Called after stock arrives and the gate clears tasks: that is precisely the
- * moment a waiting order becomes a producing one, and nothing else was going to
- * notice.
- */
-export async function rollUpForTasks(exec, companyId, taskIds) {
-  const ids = (taskIds || []).map(Number).filter(Number.isFinite);
-  if (!ids.length) return [];
-  const [rows] = await exec.query(
-    `SELECT DISTINCT production_order_id AS id
-       FROM fab_project_tasks
-      WHERE company_id = ? AND id IN (?) AND production_order_id IS NOT NULL`,
-    [companyId, ids],
-  );
-  const out = [];
-  for (const r of rows) {
-    out.push({ id: r.id, ...(await rollUpProductionOrder(exec, companyId, r.id)) });
-  }
-  return out;
 }
 
 /** The production order for a sales order, with the shape of its DAG. */

@@ -20,8 +20,9 @@ import {
   raiseProcurement, receiveAgainstLine, procurementForOrder,
 } from '../services/procurementOrderService.js';
 import {
-  ensureProductionOrder, productionForOrder, rollUpProductionOrder, approveProductionOrder,
+  ensureProductionOrder, productionForOrder, approveProductionOrder,
 } from '../services/productionOrderService.js';
+import { rollUpOrderStatus } from '../services/taskEngineService.js';
 import { releaseOrderReservations } from '../services/availabilityService.js';
 import { pool } from '../../../db.js';
 
@@ -162,7 +163,9 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
   const orderId = Number(req.params.orderId);
   try {
     const mo = await ensureProductionOrder(c.companyId, orderId, { createdBy: c.user?.id ?? null });
-    await rollUpProductionOrder(pool, c.companyId, mo.id);
+    // rollUpOrderStatus refreshes the production order and then mirrors it onto
+    // the sales order — one call keeps both right.
+    await rollUpOrderStatus(pool, c.companyId, orderId);
     const production = await productionForOrder(c.companyId, orderId);
     res.json({ ...mo, production });
   } catch (err) {
@@ -183,6 +186,12 @@ router.post('/production-orders/:moId/approve', protect, async (req, res) => {
   const moId = Number(req.params.moId);
   try {
     const state = await approveProductionOrder(c.companyId, moId);
+    // Approval changes the production order, and the sales order mirrors it.
+    const [[link]] = await pool.query(
+      `SELECT source_order_id AS soId FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
+      [moId, c.companyId],
+    );
+    if (link?.soId) await rollUpOrderStatus(pool, c.companyId, link.soId);
     res.json({ ok: true, ...state });
   } catch (err) {
     logger.error({ err, moId }, 'approving production order failed');
