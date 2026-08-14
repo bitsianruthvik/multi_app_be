@@ -378,6 +378,7 @@
     ],
     "fields": {
       "id": "frtp.id",
+      "companyId": "frtp.company_id",
       "resourceTypeId": "frtp.resource_type_id",
       "propertyKey": "frtp.property_key",
       "propertyLabel": "frtp.property_label",
@@ -390,6 +391,7 @@
     },
     "fieldTypes": {
       "id": "integer",
+      "companyId": "integer",
       "resourceTypeId": "integer",
       "propertyKey": "string",
       "propertyLabel": "string",

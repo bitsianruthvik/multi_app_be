@@ -3601,6 +3601,41 @@ CREATE TABLE IF NOT EXISTS fab_plan_entry_tasks (
   KEY idx_fplet_task  (company_id, task_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ── fab_resource_type_properties.company_id — CROSS-TENANT LEAK FIX ──────────
+-- Found 2026-08-14 by a tenant-isolation test: a brand-new company could read
+-- every other company's machine properties through the generic query API.
+--
+-- `core/query/queryBuilder/securityInjector.js` skips company scoping entirely
+-- when the resourceDef exposes no `<alias>.company_id`, on the assumption that
+-- such tables are child rows only ever reached by joining a scoped parent. This
+-- table broke that assumption: it is registered as a TOP-LEVEL queryable
+-- resource (`fabErpResourceTypeProperty`) while being scoped only through
+-- resource_type_id, so nothing constrained it and every tenant saw all 10 rows.
+--
+-- Writes were already failing on it — mutateController's insert stamps
+-- company_id and its update/delete filter on it, so all three threw "Unknown
+-- column". Adding the column fixes the leak and the writes together.
+--
+-- Nullable on purpose: a row that cannot be attributed stays invisible, because
+-- `company_id = ?` excludes NULL. It fails closed.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resource_type_properties'
+               AND COLUMN_NAME='company_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_resource_type_properties ADD COLUMN company_id INT NULL AFTER id','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Backfill from the parent resource type, which has always carried the tenant.
+UPDATE fab_resource_type_properties p
+  JOIN fab_resource_types rt ON rt.id = p.resource_type_id
+   SET p.company_id = rt.company_id
+ WHERE p.company_id IS NULL;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resource_type_properties'
+               AND INDEX_NAME='idx_frtp_company');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_resource_type_properties ADD KEY idx_frtp_company (company_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ── fab_orders.must_finish_by ─────────────────────────────────────────────────
 -- The must-match execution date: a planning instruction the engine may not
 -- schedule past. Distinct from required_date (the CUSTOMER date, which a planner
