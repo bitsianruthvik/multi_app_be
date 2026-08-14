@@ -195,6 +195,101 @@ export async function raiseProcurement(companyId, orderId, opts = {}) {
 }
 
 /**
+ * Book one line's delivery, INSIDE a transaction the caller owns.
+ *
+ * Split out from receiveAgainstLine so that receiving several lines of one
+ * delivery note is a single transaction rather than N independent ones. A
+ * delivery that booked three of its five lines and then failed would leave a
+ * purchase order nobody can reason about — and, worse, stock on the shelf with
+ * no record of which lines it closed.
+ *
+ * Over-receipt is allowed and NOT clamped: suppliers really do send 10.2 tonnes
+ * against a 10 tonne order, and a system that refuses the extra plate makes
+ * somebody lie to it. The line closes once qty_received ≥ qty.
+ */
+async function receiveLineWithin(conn, companyId, poLineId, payload) {
+  // FOR UPDATE because the new quantity is computed in JS from what is read
+  // here. Two people receiving the same line at once would otherwise both read
+  // the old figure and the second write would erase the first delivery.
+  const [[line]] = await conn.query(
+    `SELECT ol.id, ol.order_id, ol.catalog_item_id, ol.qty, ol.qty_received, o.status AS po_status
+       FROM fab_order_lines ol
+       JOIN fab_orders o ON o.id = ol.order_id AND o.deleted_at IS NULL
+      WHERE ol.id = ? AND ol.company_id = ? AND ol.deleted_at IS NULL
+        AND o.order_type = 'purchase'
+      LIMIT 1
+      FOR UPDATE`,
+    [poLineId, companyId],
+  );
+  if (!line) throw new Error('Purchase order line not found');
+  if (line.po_status === PO_STATUS.CANCELLED) throw new Error('That purchase order is cancelled');
+  if (line.catalog_item_id == null) {
+    // Without a catalog item there is nothing to put on the shelf. Refused
+    // rather than guessed: booking it against some other item would put the
+    // wrong steel in stock and close the wrong line.
+    throw new Error('That purchase order line names no catalog item, so it cannot be received');
+  }
+
+  const pieces = Array.isArray(payload.pieces) ? payload.pieces : [];
+  const qtyIn = pieces.reduce((a, p) => a + (Number(p.qty) || 0), 0);
+  if (!(qtyIn > 0)) throw new Error('Nothing to receive — every piece has zero quantity');
+
+  // receiveStock joins this transaction rather than opening its own, so the
+  // pieces, the ledger and the line's outstanding quantity all land together
+  // or not at all.
+  const stockResult = await receiveStock(companyId, {
+    ...payload,
+    catalog_item_id: line.catalog_item_id,
+  }, conn);
+
+  /**
+   * Both new values computed here rather than in SQL.
+   *
+   * This was one statement, `SET qty_received = qty_received + ?, status =
+   * IF(qty_received + ? >= qty, 'received', 'partial')`, and it was wrong:
+   * MySQL evaluates SET assignments left to right and later expressions see the
+   * NEW value of earlier-assigned columns, so the `+ ?` landed TWICE in the
+   * status test. Receiving 6 against a line of 10 stored qty_received = 6 and
+   * then closed the line, because it compared 6 + 6 with 10. The 4 still owed
+   * silently disappeared from every outstanding figure in the app.
+   */
+  const newReceived = Number(line.qty_received ?? 0) + qtyIn;
+  const closed = newReceived >= Number(line.qty ?? 0);
+  await conn.query(
+    `UPDATE fab_order_lines SET qty_received = ?, status = ? WHERE id = ? AND company_id = ?`,
+    [newReceived, closed ? 'received' : 'partial', poLineId, companyId],
+  );
+
+  return { orderId: line.order_id, lineId: poLineId, qtyReceived: qtyIn, stock: stockResult };
+}
+
+/**
+ * The order's own status follows its lines: all closed → received, some
+ * movement → partially_received.
+ */
+async function syncPoStatus(conn, companyId, poId) {
+  const [[agg]] = await conn.query(
+    `SELECT COUNT(*) AS total,
+            SUM(qty_received >= qty) AS closed,
+            SUM(qty_received > 0)    AS started
+       FROM fab_order_lines
+      WHERE order_id = ? AND company_id = ? AND deleted_at IS NULL`,
+    [poId, companyId],
+  );
+  const total = Number(agg?.total) || 0;
+  const closed = Number(agg?.closed) || 0;
+  const started = Number(agg?.started) || 0;
+  const poStatus = total > 0 && closed === total
+    ? PO_STATUS.RECEIVED
+    : (started > 0 ? PO_STATUS.PARTIAL : PO_STATUS.ORDERED);
+  await conn.query(
+    `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+    [poStatus, poId, companyId],
+  );
+  return poStatus;
+}
+
+/**
  * Receive against a purchase-order line.
  *
  * This is the linkage the old goods-receipt path lost: stock arriving is booked
@@ -202,76 +297,153 @@ export async function raiseProcurement(companyId, orderId, opts = {}) {
  * rather than a memory. It delegates the physical side — pieces, ledger, piece
  * codes, re-checking material-gated tasks — to the existing stock-in path
  * rather than writing a second one.
- *
- * Over-receipt is allowed and NOT clamped: suppliers really do send 10.2 tonnes
- * against a 10 tonne order, and a system that refuses the extra plate makes
- * somebody lie to it. The line closes once qty_received ≥ qty.
  */
 export async function receiveAgainstLine(companyId, poLineId, payload) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
-    const [[line]] = await conn.query(
-      `SELECT ol.id, ol.order_id, ol.catalog_item_id, ol.qty, ol.qty_received, o.status AS po_status
-         FROM fab_order_lines ol
-         JOIN fab_orders o ON o.id = ol.order_id AND o.deleted_at IS NULL
-        WHERE ol.id = ? AND ol.company_id = ? AND ol.deleted_at IS NULL
-          AND o.order_type = 'purchase'
-        LIMIT 1`,
-      [poLineId, companyId],
-    );
-    if (!line) throw new Error('Purchase order line not found');
-    if (line.po_status === PO_STATUS.CANCELLED) throw new Error('That purchase order is cancelled');
-
-    const pieces = Array.isArray(payload.pieces) ? payload.pieces : [];
-    const qtyIn = pieces.reduce((a, p) => a + (Number(p.qty) || 0), 0);
-    if (!(qtyIn > 0)) throw new Error('Nothing to receive — every piece has zero quantity');
-
-    // Joins this transaction rather than opening its own, so the pieces, the
-    // ledger and the line's outstanding quantity all land together or not at all.
-    const stockResult = await receiveStock(companyId, {
-      ...payload,
-      catalog_item_id: line.catalog_item_id,
-    }, conn);
-
-    await conn.query(
-      `UPDATE fab_order_lines
-          SET qty_received = qty_received + ?,
-              status = IF(qty_received + ? >= qty, 'received', 'partial')
-        WHERE id = ? AND company_id = ?`,
-      [qtyIn, qtyIn, poLineId, companyId],
-    );
-
-    // The order's own status follows its lines: all closed → received, some
-    // movement → partially_received.
-    const [[agg]] = await conn.query(
-      `SELECT COUNT(*) AS total,
-              SUM(qty_received >= qty) AS closed,
-              SUM(qty_received > 0)    AS started
-         FROM fab_order_lines
-        WHERE order_id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [line.order_id, companyId],
-    );
-    const total = Number(agg?.total) || 0;
-    const closed = Number(agg?.closed) || 0;
-    const started = Number(agg?.started) || 0;
-    const poStatus = total > 0 && closed === total
-      ? PO_STATUS.RECEIVED
-      : (started > 0 ? PO_STATUS.PARTIAL : PO_STATUS.ORDERED);
-    await conn.query(
-      `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [poStatus, line.order_id, companyId],
-    );
-
+    const res = await receiveLineWithin(conn, companyId, poLineId, payload);
+    const poStatus = await syncPoStatus(conn, companyId, res.orderId);
     await conn.commit();
-    return { poId: line.order_id, poStatus, lineId: poLineId, qtyReceived: qtyIn, stock: stockResult };
+    return { poId: res.orderId, poStatus, lineId: poLineId, qtyReceived: res.qtyReceived, stock: res.stock };
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
   }
+}
+
+/**
+ * Receive a whole delivery against ONE purchase order, several lines at a time.
+ *
+ * This is what a goods-receipt note actually is: a lorry turns up against a
+ * purchase order carrying some of several lines, and somebody writes down how
+ * much of each arrived. Doing that as N separate calls to receiveAgainstLine
+ * made the delivery N documents that can each half-fail, and made the person
+ * entering it pick the same plant, stock area and date N times.
+ *
+ * Lines with no quantity are simply not received — a delivery note routinely
+ * covers only part of an order, and leaving those rows blank is how somebody
+ * says so. If NOTHING has a quantity that is an error, not a silent no-op.
+ *
+ * @param {number} companyId
+ * @param {number} poId
+ * @param {object} payload
+ * @param {number} payload.plant_id
+ * @param {number} payload.stock_location_id
+ * @param {string} payload.received_date  YYYY-MM-DD
+ * @param {string} [payload.notes]
+ * @param {Array<{line_id:number, qty:number, heat_no?:string, batch_no?:string}>} payload.lines
+ */
+export async function receiveAgainstOrder(companyId, poId, payload = {}) {
+  const rows = (Array.isArray(payload.lines) ? payload.lines : [])
+    .map((l) => ({ ...l, line_id: Number(l.line_id), qty: Number(l.qty) }))
+    .filter((l) => Number.isFinite(l.line_id) && l.qty > 0);
+  if (!rows.length) throw new Error('Enter a quantity against at least one line');
+
+  const [[po]] = await pool.query(
+    `SELECT id, order_number, status FROM fab_orders
+      WHERE id = ? AND company_id = ? AND order_type = 'purchase' AND deleted_at IS NULL
+      LIMIT 1`,
+    [poId, companyId],
+  );
+  if (!po) throw new Error('Purchase order not found');
+  if (po.status === PO_STATUS.CANCELLED) throw new Error('That purchase order is cancelled');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const received = [];
+    // Accumulated across lines because each receiveStock call reports the tasks
+    // IT unblocked; the person receiving cares how many the DELIVERY unblocked.
+    const tasksCleared = new Set();
+
+    for (const l of rows) {
+      const res = await receiveLineWithin(conn, companyId, l.line_id, {
+        plant_id: payload.plant_id,
+        stock_location_id: payload.stock_location_id,
+        received_date: payload.received_date,
+        notes: payload.notes ?? null,
+        pieces: Array.isArray(l.pieces) && l.pieces.length
+          ? l.pieces
+          : [{ qty: l.qty, heat_no: l.heat_no ?? null, batch_no: l.batch_no ?? null }],
+      });
+      // Every line must belong to the order named in the URL — otherwise a
+      // hand-made request could close a line on somebody else's order and
+      // report success under this one's number.
+      if (Number(res.orderId) !== Number(poId)) {
+        throw new Error(`Line ${l.line_id} does not belong to ${po.order_number}`);
+      }
+      (res.stock?.tasksCleared ?? []).forEach((t) => tasksCleared.add(t));
+      received.push({ lineId: l.line_id, qty: res.qtyReceived });
+    }
+
+    const poStatus = await syncPoStatus(conn, companyId, poId);
+    await conn.commit();
+    return {
+      poId, poStatus, orderNumber: po.order_number,
+      lines: received,
+      qtyTotal: received.reduce((a, r) => a + r.qty, 0),
+      tasksCleared: [...tasksCleared],
+    };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * Purchase orders that can still be received against, newest first.
+ *
+ * Not scoped to a sales order, unlike procurementForOrder: the person at the
+ * gate receiving a delivery knows the PO number on the note and nothing about
+ * which sales order caused it.
+ */
+export async function openPurchaseOrders(companyId, { includeClosed = false } = {}) {
+  const [rows] = await pool.query(
+    `SELECT o.id, o.order_number, o.status, o.supplier_id, s.name AS supplier_name,
+            o.required_date, o.created_at, o.source_order_id, so.order_number AS source_order_number,
+            COUNT(ol.id)                      AS line_count,
+            COALESCE(SUM(ol.qty), 0)          AS qty_ordered,
+            COALESCE(SUM(ol.qty_received), 0) AS qty_received
+       FROM fab_orders o
+       LEFT JOIN fab_suppliers s  ON s.id = o.supplier_id
+       LEFT JOIN fab_orders so    ON so.id = o.source_order_id AND so.deleted_at IS NULL
+       LEFT JOIN fab_order_lines ol ON ol.order_id = o.id AND ol.deleted_at IS NULL
+      WHERE o.company_id = ? AND o.order_type = 'purchase' AND o.deleted_at IS NULL
+        ${includeClosed ? '' : `AND o.status NOT IN ('received', 'cancelled')`}
+      GROUP BY o.id, o.order_number, o.status, o.supplier_id, s.name,
+               o.required_date, o.created_at, o.source_order_id, so.order_number
+      ORDER BY o.id DESC`,
+    [companyId],
+  );
+  return rows;
+}
+
+/** One purchase order's lines, with what is still outstanding on each. */
+export async function purchaseOrderLines(companyId, poId) {
+  const [rows] = await pool.query(
+    `SELECT ol.id, ol.line_no, ol.code, ol.description, ol.catalog_item_id,
+            ol.qty, ol.qty_received, ol.unit, ol.status, ol.expected_date,
+            fic.code AS catalog_code, fic.name AS catalog_name, fic.unit AS catalog_unit
+       FROM fab_order_lines ol
+       JOIN fab_orders o ON o.id = ol.order_id AND o.deleted_at IS NULL
+                        AND o.order_type = 'purchase' AND o.company_id = ol.company_id
+       LEFT JOIN fab_item_catalog fic ON fic.id = ol.catalog_item_id AND fic.deleted_at IS NULL
+      WHERE ol.order_id = ? AND ol.company_id = ? AND ol.deleted_at IS NULL
+      ORDER BY ol.line_no, ol.id`,
+    [poId, companyId],
+  );
+  return rows.map((r) => ({
+    ...r,
+    // Floored at zero: an over-received line has nothing outstanding, and a
+    // negative "still to come" reads as the supplier owing us steel back.
+    outstanding: Math.max(0, Number(r.qty ?? 0) - Number(r.qty_received ?? 0)),
+  }));
 }
 
 /** Every purchase order raised for a sales order, with its receipt progress. */

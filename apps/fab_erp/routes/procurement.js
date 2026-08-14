@@ -17,7 +17,8 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { orderShortfall, orderProcurementSplit } from '../services/procurementService.js';
 import {
-  raiseProcurement, receiveAgainstLine, procurementForOrder,
+  raiseProcurement, receiveAgainstLine, receiveAgainstOrder, procurementForOrder,
+  openPurchaseOrders, purchaseOrderLines,
 } from '../services/procurementOrderService.js';
 import {
   ensureProductionOrder, productionForOrder, approveProductionOrder,
@@ -128,6 +129,62 @@ router.post('/purchase-lines/:lineId/receive', protect, async (req, res) => {
     res.json(result);
   } catch (err) {
     logger.error({ err, lineId }, 'receiving against purchase line failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * GET /purchase-orders — what can still be received against.
+ *
+ * The goods-receipt screen's entry point. Deliberately NOT scoped to a sales
+ * order, unlike /orders/:id/procurement: whoever is receiving a delivery has a
+ * PO number on a note and no idea which sales order caused it.
+ *
+ * `?all=1` includes fully received and cancelled orders, for looking one up
+ * after the fact.
+ */
+router.get('/purchase-orders', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_inventory_view');
+  if (!c) return;
+  try {
+    const orders = await openPurchaseOrders(c.companyId, {
+      includeClosed: req.query.all === '1' || req.query.all === 'true',
+    });
+    res.json({ orders });
+  } catch (err) {
+    logger.error({ err }, 'listing purchase orders failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/** GET one purchase order's lines, each with what is still outstanding. */
+router.get('/purchase-orders/:poId/lines', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_inventory_view');
+  if (!c) return;
+  const poId = Number(req.params.poId);
+  try {
+    res.json({ poId, lines: await purchaseOrderLines(c.companyId, poId) });
+  } catch (err) {
+    logger.error({ err, poId }, 'reading purchase order lines failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * POST /purchase-orders/:poId/receive — book a whole delivery in one go.
+ *
+ * Body `{plant_id, stock_location_id, received_date, notes?, lines:[{line_id,
+ * qty, heat_no?, batch_no?}]}`. One transaction across every line, because a
+ * delivery note is one document: half of it landing is worse than none of it.
+ */
+router.post('/purchase-orders/:poId/receive', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_inventory_manage');
+  if (!c) return;
+  const poId = Number(req.params.poId);
+  try {
+    res.json(await receiveAgainstOrder(c.companyId, poId, req.body ?? {}));
+  } catch (err) {
+    logger.error({ err, poId }, 'receiving against purchase order failed');
     res.status(500).json({ message: err.message });
   }
 });

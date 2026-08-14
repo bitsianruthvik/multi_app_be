@@ -70,14 +70,24 @@ export async function rawMaterialsFor(companyId, conn) {
  *                              is not "a 10mm thing", so it can never be reached
  *                              by a thickness filter; omitting it would make it
  *                              unpickable rather than merely unmatched
- *   no thickness recorded      ALSO always. The filter exists to exclude what we
- *                              KNOW is the wrong thickness, and not knowing is
- *                              not the same as knowing it is wrong. Excluding
- *                              these made stocked items silently unpickable
- *                              while the reference sheet still listed them.
+ *   no thickness recorded      ONLY when nothing matches exactly. "Not knowing a
+ *                              thickness is not the same as knowing it is wrong"
+ *                              is true, and it justifies offering these when
+ *                              there is nothing better — not when there is. With
+ *                              an exact match on the shelf, a plate whose
+ *                              thickness nobody filled in is the worse answer,
+ *                              and including it unconditionally put the same
+ *                              handful of untyped rows in every part's list at
+ *                              every thickness, which is how a thickness filter
+ *                              stops meaning anything. They stay reachable: with
+ *                              no exact match this falls back to them exactly as
+ *                              before.
  *
  * A blank or unusable thickness returns everything: with nothing to filter on,
  * offering the lot beats offering none.
+ *
+ * Mirrored in the frontend's api/rawMaterials.ts — separate repos, so the rule
+ * is stated once on each side and must be changed on both.
  *
  * @param {Array} materials from rawMaterialsFor
  * @param {number|string|null} thickness
@@ -92,7 +102,7 @@ export function materialsForThickness(materials, thickness) {
   const plates = materials.filter(
     (m) => m.material_form !== 'section' && m.thickness_mm != null && Number(m.thickness_mm) === t,
   );
-  const unclassified = materials.filter(
+  const unclassified = plates.length > 0 ? [] : materials.filter(
     (m) => m.material_form !== 'section' && m.thickness_mm == null,
   );
   return [...plates, ...unclassified, ...sections];
