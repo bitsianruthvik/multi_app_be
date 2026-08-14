@@ -31,6 +31,8 @@ import { pool } from '../../../db.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder } from './procurementOrderService.js';
 import { flowSummary } from './flowAllocationService.js';
+import { rollUpOrderStatus } from './taskEngineService.js';
+import { logger } from '../../../core/utils/logger.js';
 
 /**
  * The wizard's steps, in the order they happen.
@@ -291,7 +293,32 @@ export async function confirmOrder(companyId, orderId) {
     const e = new Error('This order was confirmed by someone else a moment ago.');
     e.status = 409; throw e;
   }
-  return { ok: true, status: 'confirmed', confirmedDate: today };
+
+  /**
+   * Catch up with where the work actually is.
+   *
+   * Everything that happens in the wizard happens to a DRAFT, and the status
+   * automation refuses to advance a draft — deliberately, so the tree step
+   * cannot walk an order past the confirmation nobody made. The cost of that
+   * guard is that a production order raised and approved during the wizard
+   * moved nothing, and confirming used to leave the order sitting at
+   * `confirmed` while its production order was already in production, with
+   * nothing scheduled to correct it.
+   *
+   * Confirming is the moment the guard stops applying, so it is the moment to
+   * re-read. Best-effort: the order IS confirmed either way, and failing the
+   * confirmation over a status refresh would be worse than a stale status.
+   */
+  try {
+    await rollUpOrderStatus(pool, companyId, orderId);
+  } catch (err) {
+    logger.warn({ err, orderId }, '[readiness] status not re-read after confirm');
+  }
+
+  const [[fresh]] = await pool.query(
+    'SELECT status FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1', [orderId, companyId],
+  );
+  return { ok: true, status: fresh?.status ?? 'confirmed', confirmedDate: today };
 }
 
 /**

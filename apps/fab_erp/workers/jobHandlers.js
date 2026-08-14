@@ -26,6 +26,8 @@ import { getQueue } from '../../../core/jobs/queue.js';
 import { sweepCompany, sweepAllCompanies } from '../services/taskAttributionService.js';
 import { recomputeAllBaselined } from '../services/ccBufferService.js';
 import { sweepBlockedTasksAllCompanies } from '../services/taskGatingService.js';
+import { rollUpOrderStatus } from '../services/taskEngineService.js';
+import { pool } from '../../../db.js';
 
 const SWEEP_JOB = 'fab_erp:attribution-sweep';
 const CC_SWEEP_JOB = 'fab_erp:cc-sweep';
@@ -58,7 +60,41 @@ const jobHandlers = {
     _gateSweepRunning = true;
     try {
       const limit = data && data.limit != null ? Number(data.limit) : 200;
-      return await sweepBlockedTasksAllCompanies({ limit });
+      const result = await sweepBlockedTasksAllCompanies({ limit });
+
+      /**
+       * A task clearing its gate here is a status change nobody was watching.
+       *
+       * The sweep is the ONLY path that moves a task from blocked to eligible
+       * without a person doing something — stock arriving goes through
+       * stockInService, a predecessor finishing goes through onTaskComplete,
+       * and both of those roll orders up. This one just flipped the tasks and
+       * returned, so a production order could sit at `waiting` while three of
+       * its tasks were eligible, and the sales order behind it stayed wherever
+       * it was.
+       *
+       * Done here rather than inside the sweep because taskGatingService cannot
+       * import taskEngineService — that pair is already a cycle in the other
+       * direction (tryClearTask).
+       */
+      const cleared = result?.cleared ?? [];
+      if (cleared.length) {
+        try {
+          const [orders] = await pool.query(
+            `SELECT DISTINCT company_id, order_id FROM fab_project_tasks
+              WHERE id IN (?) AND order_id IS NOT NULL`,
+            [cleared],
+          );
+          for (const o of orders) {
+            await rollUpOrderStatus(pool, o.company_id, o.order_id);
+          }
+          return { ...result, ordersRolledUp: orders.length };
+        } catch (err) {
+          logger.warn({ err, cleared: cleared.length },
+            '[gate-sweep] tasks cleared but order statuses not re-read');
+        }
+      }
+      return result;
     } finally {
       _gateSweepRunning = false;
     }
