@@ -2908,11 +2908,16 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- Carry across whatever the existing rows pointed at, so they still read as
 -- something rather than turning into blank rows.
 --
--- GUARDED, because the very next block drops catalog_item_id. Written as a bare
--- UPDATE this was a one-shot: it succeeded on the first run and then made the
--- whole file un-re-runnable, which breaks the contract every other statement
--- here keeps and that the deploy flow relies on. A migration that only works
--- once is a migration that fails the second time somebody deploys.
+-- GUARDED so the file stays re-runnable. Written as a bare UPDATE this was a
+-- one-shot: it succeeded once and then made the whole file un-re-runnable,
+-- which breaks the contract every other statement here keeps and that the
+-- deploy flow relies on. A migration that only works once is a migration that
+-- fails the second time somebody deploys.
+--
+-- Since 2026-08-13 the only rows it can touch are PURCHASE lines — sales lines
+-- carry a NULL catalog_item_id, so the join excludes them — and those already
+-- get their code and description from the catalog when raised. It is kept as
+-- the backstop for a purchase line created without them.
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='catalog_item_id');
 SET @sql = IF(@col=1,
@@ -2926,10 +2931,22 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- ── drop what a line no longer decides ──────────────────────────────────────
 
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
-             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='catalog_item_id');
-SET @sql = IF(@col=1, 'ALTER TABLE fab_order_lines DROP COLUMN catalog_item_id', 'SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- REMOVED 2026-08-13: the drop of fab_order_lines.catalog_item_id.
+--
+-- It did its job — a SALES line is free text and stopped naming a catalog item
+-- long ago. But the column came back on 2026-08-13 with a different meaning:
+-- a PURCHASE line orders a specific plate, and that is the whole point of
+-- ordering against a document. Both statements then lived in this file, one
+-- adding the column near the end and this one dropping it in the middle.
+--
+-- The first run worked (nothing to drop yet, then it was added). Every run
+-- after that failed here with "can't drop column catalog_item_id with
+-- composite index covered", because idx_fol_catalog covers it — so the file
+-- stopped being re-runnable and everything below this line was skipped on
+-- every deploy. Exactly the failure the comment above this block warns about.
+--
+-- Deleted rather than guarded: the column is wanted now, and a drop that must
+-- never fire is not a drop.
 
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='target_plant_id');
