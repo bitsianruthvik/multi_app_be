@@ -583,3 +583,26 @@ JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
 JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
 JOIN features_capability fc
   ON fc.name IN ('fab_erp_cc_view', 'fab_erp_cc_manage');
+
+-- =============================================================================
+-- Section 10 — Production Planner (Phase A, 2026-08-14)
+--   fab_erp_planner_view, fab_erp_planner_manage
+-- Mirrored in TM/seed_fab_erp_planner.sql — keep the two in step.
+-- =============================================================================
+INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
+  ('View Production Planner',   'fab_erp_planner_view',   'frontend'),
+  ('Manage Production Planner', 'fab_erp_planner_manage', 'frontend');
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_planner', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_planner_view', 'fab_erp_planner_manage')
+  AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_planner')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+INSERT IGNORE INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, c.id, a.id, fc.capability_id
+FROM companies c
+JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
+JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
+JOIN features_capability fc ON fc.name = 'fab_erp_planner';

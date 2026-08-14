@@ -107,6 +107,19 @@ router.get('/nav-counts', protect, async (req, res) => {
       `SELECT COUNT(*) AS n FROM fab_resources
        WHERE company_id=? AND deleted_at IS NULL`,
       [companyId]],
+
+    // Both feed the Setup readiness hub's "Who you deal with" cards. A zero here
+    // is the point: a shop with no customers and no suppliers is not set up, and
+    // until 2026-08-14 the hub had no way to say so.
+    ['customers',
+      `SELECT COUNT(*) AS n FROM fab_customers
+       WHERE company_id=? AND deleted_at IS NULL`,
+      [companyId]],
+
+    ['suppliers',
+      `SELECT COUNT(*) AS n FROM fab_suppliers
+       WHERE company_id=? AND deleted_at IS NULL`,
+      [companyId]],
   ];
 
   const settled = await Promise.allSettled(

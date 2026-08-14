@@ -34,6 +34,10 @@ import { generateCode } from '../services/codegenService.js';
 // number every time the insert that followed it failed.
 const AUTOGEN_CODE_RESOURCES = {
   fabErpCustomer:      { entityType: 'customer',       mode: 'always'  },
+  // 'ifBlank' rather than 'always' because a supplier code is often the vendor's
+  // own account number, written on their invoices — if somebody typed one, it is
+  // the number the paperwork already uses and we do not get to renumber it.
+  fabErpSupplier:      { entityType: 'supplier',       mode: 'ifBlank' },
   fabErpResource:      { entityType: 'resource',       mode: 'ifBlank' },
   fabErpStockLocation: { entityType: 'stock_location', mode: 'ifBlank' },
 };

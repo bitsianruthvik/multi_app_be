@@ -3451,3 +3451,162 @@ SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS
               AND COLUMN_NAME='task_id' AND IS_NULLABLE='NO');
 SET @sql = IF(@nn=1, 'ALTER TABLE fab_stock_reservations MODIFY COLUMN task_id INT NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- =============================================================================
+-- PRODUCTION PLANNER (Phase A, 2026-08-14) — FAB_ERP_PLANNER_PLAN.md
+--
+-- Four tables in two pairs:
+--
+--   fab_plan_runs / _run_items    the frozen IDEAL. Every Suggest run is
+--                                 persisted whether or not it is accepted. If
+--                                 the ideal were recomputed later from current
+--                                 data it would always look perfect in
+--                                 hindsight and the retrospective comparison
+--                                 would be unfalsifiable.
+--
+--   fab_plan_entries / _entry_tasks   the ACTUAL plan — hand-editable, pinnable,
+--                                 and never rewritten in place by a re-suggest.
+--
+-- Deliberately NOT reusing fab_cc_chain_tasks.planned_start/end: that is a
+-- rebuildable cache, deleted and reinserted on every re-baseline (which fires
+-- on materialize AND re-materialize), so a hand-placed bar would vanish.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS fab_plan_runs (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  status              ENUM('suggested','accepted','superseded') NOT NULL DEFAULT 'suggested',
+  window_from         DATETIME      NOT NULL,
+  window_to           DATETIME      NOT NULL,
+  -- CSV of resource_type_ids the run was scoped to; NULL = whole shop. The
+  -- planner works one resource type at a time most days, so a run is usually
+  -- narrow and must not be read later as a shop-wide recommendation.
+  resource_type_ids   VARCHAR(255)  NULL,
+  -- The levelSchedule anchor, frozen. Without it a replay of this run cannot
+  -- reproduce its own output — see resourceLevelingService's determinism note.
+  anchor_at           DATETIME      NOT NULL,
+  computed_at         DATETIME      NOT NULL,
+  computed_by         INT           NULL,
+  accepted_at         DATETIME      NULL,
+  accepted_by         INT           NULL,
+  entry_count         INT           NOT NULL DEFAULT 0,
+  task_count          INT           NOT NULL DEFAULT 0,
+  planned_minutes     INT           NOT NULL DEFAULT 0,
+  -- Tasks the engine could not place at all (no capacity, no crew, no calendar).
+  -- Counted rather than dropped: a suggestion that silently omits half the work
+  -- reads as a light week.
+  unschedulable_count INT           NOT NULL DEFAULT 0,
+  notes               TEXT          NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at          DATETIME      DEFAULT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fplr_company (company_id, status),
+  KEY idx_fplr_window  (company_id, window_from, window_to)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS fab_plan_run_items (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  run_id              INT           NOT NULL,
+  resource_type_id    INT           NOT NULL,
+  resource_id         INT           NULL,
+  bundle_key          VARCHAR(190)  NULL,
+  ancestor_item_id    INT           NULL,
+  order_id            INT           NULL,
+  operation_id        INT           NULL,
+  planned_start       DATETIME      NOT NULL,
+  planned_end         DATETIME      NOT NULL,
+  planned_minutes     INT           NOT NULL DEFAULT 0,
+  task_count          INT           NOT NULL DEFAULT 1,
+  -- JSON array of task ids, frozen as a COPY. Tasks get re-materialized,
+  -- re-sequenced and cancelled; joining to them later would silently reshape a
+  -- historical snapshot.
+  task_ids            TEXT          NULL,
+  -- Ranking components, likewise copied not joined — the whole point is that
+  -- why this was suggested first stays answerable weeks later.
+  priority_rank       INT           NULL,
+  order_slack_minutes INT           NULL,
+  is_critical_chain   TINYINT(1)    NOT NULL DEFAULT 0,
+  seq_no              INT           NULL,
+  reason              VARCHAR(255)  NULL,
+  label               VARCHAR(255)  NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at          DATETIME      DEFAULT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fplri_run   (company_id, run_id),
+  KEY idx_fplri_start (company_id, planned_start)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS fab_plan_entries (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  -- The local plan day this bar belongs to, resolved through the plant timezone
+  -- at write time. Week view groups by it; never derive it from planned_start
+  -- in SQL or a night shift lands on the wrong day.
+  plan_date           DATE          NOT NULL,
+  resource_type_id    INT           NOT NULL,
+  -- Set only when the bar is pinned to one machine. Lanes are resource TYPES.
+  resource_id         INT           NULL,
+  planned_start       DATETIME      NOT NULL,
+  planned_end         DATETIME      NOT NULL,
+  planned_minutes     INT           NOT NULL DEFAULT 0,
+  kind                ENUM('bundle','task') NOT NULL DEFAULT 'task',
+  -- (order_id, operation_id, resource_type_id, ancestor_item_id) for a bundle.
+  bundle_key          VARCHAR(190)  NULL,
+  ancestor_item_id    INT           NULL,
+  order_id            INT           NULL,
+  operation_id        INT           NULL,
+  source              ENUM('suggested','manual') NOT NULL DEFAULT 'suggested',
+  accepted_from_run_id INT          NULL,
+  run_item_id         INT           NULL,
+  -- A pinned bar survives re-suggestion untouched and is fed into the next level
+  -- pass as pre-occupied capacity. Manual bars are pinned on creation: somebody
+  -- placed it by hand, so an algorithm does not get to move it.
+  is_pinned           TINYINT(1)    NOT NULL DEFAULT 0,
+  status              ENUM('planned','superseded','cancelled') NOT NULL DEFAULT 'planned',
+  label               VARCHAR(255)  NULL,
+  notes               TEXT          NULL,
+  created_by          INT           NULL,
+  updated_by          INT           NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at          DATETIME      DEFAULT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_fple_grid   (company_id, plan_date, resource_type_id),
+  KEY idx_fple_status (company_id, status),
+  KEY idx_fple_span   (company_id, planned_start, planned_end),
+  KEY idx_fple_order  (company_id, order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS fab_plan_entry_tasks (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  plan_entry_id       INT           NOT NULL,
+  task_id             INT           NOT NULL,
+  planned_minutes     INT           NOT NULL DEFAULT 0,
+  sort_order          INT           NOT NULL DEFAULT 0,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at          DATETIME      DEFAULT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  -- One row per task even for kind='task' (a bundle of one), so every read has
+  -- exactly one shape.
+  UNIQUE KEY uq_fplet (company_id, plan_entry_id, task_id),
+  -- Is this task already planned? is asked on every manual add and every
+  -- suggest run. MySQL has no partial unique index, so the
+  -- one-active-entry-per-task rule is enforced in planService, not here.
+  KEY idx_fplet_task  (company_id, task_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── fab_orders.must_finish_by ─────────────────────────────────────────────────
+-- The must-match execution date: a planning instruction the engine may not
+-- schedule past. Distinct from required_date (the CUSTOMER date, which a planner
+-- may knowingly miss) and from confirmed_date (when the order was confirmed, an
+-- event date written by orderReadinessService).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='must_finish_by');
+SET @sql = IF(@col=0,'ALTER TABLE fab_orders ADD COLUMN must_finish_by DATE NULL AFTER required_date','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

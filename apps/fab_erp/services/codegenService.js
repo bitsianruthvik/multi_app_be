@@ -111,6 +111,15 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: 'CUST-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
   ],
+  // Suppliers had a live rule in production (next_seq had reached 5) but no
+  // default here, no entry in the settings UI and no autogen hook — so the codes
+  // were coming from somewhere ad hoc while the Suppliers form still demanded
+  // one by hand. Four digits to match customers; a mill list is the same order
+  // of magnitude as a client list.
+  supplier: [
+    { type: 'fixed', value: 'SUP-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'never' },
+  ],
 };
 
 export function defaultSegmentsFor(entityType) {

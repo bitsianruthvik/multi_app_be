@@ -3,7 +3,7 @@ import path  from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes            from './routes/index.js';
 import criticalChainRoutes    from './routes/criticalChain.js';
-import dispatchRoutes         from './routes/dispatch.js';
+import plannerRoutes          from './routes/planner.js';
 import procurementRoutes      from './routes/procurement.js';
 import { logger }              from '../../core/utils/logger.js';
 import { getQueue }            from '../../core/jobs/queue.js';
@@ -26,9 +26,14 @@ export default {
     // EU-4: critical-chain baseline route, mounted separately (same prefix)
     // rather than folded into routes/index.js — see routes/criticalChain.js.
     server.use('/api/:companySlug/fab_erp', criticalChainRoutes);
-    // Dispatch: same prefix, same reason — a preview/confirm pair that is its
-    // own concern rather than another entry in the index router.
-    server.use('/api/:companySlug/fab_erp', dispatchRoutes);
+    // Production Planner: the time-phased day/week plan. Same prefix, same
+    // reason as the two above. It REPLACED routes/dispatch.js (deleted
+    // 2026-08-14) — dispatch answered the same question with no time axis, and
+    // two endpoints disagreeing about what to work on next is worse than one.
+    // `services/dispatchService.js` deliberately survives: computeOrderSlack is
+    // the planner's priority input and its file header is the reasoning behind
+    // the whole ranking. The fab_dispatch_* tables stay as history.
+    server.use('/api/:companySlug/fab_erp', plannerRoutes);
     // Procurement + production orders: the two documents a finished BOM leads
     // to. Same prefix, same reason as the two above.
     server.use('/api/:companySlug/fab_erp', procurementRoutes);

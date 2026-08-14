@@ -293,9 +293,22 @@ function feasible(existing, newIntervals, capacity) {
  * @param {Date}     [args.anchor]          earliest allowed start (default now).
  *                   Only the anchor may influence output; scheduling is otherwise
  *                   independent of the wall clock.
+ * @param {Map<number,number>} [args.priority]  taskId → rank, LOWER runs first
+ *                   when several tasks are ready at once and contend for the same
+ *                   resource. Omit (the default) and ties break on seq_no then id
+ *                   exactly as before — CC baselines must not move because the
+ *                   planner started passing this.
+ * @param {{resource_type_id?:number, assigned_resource_id?:number,
+ *          start:Date, end:Date}[]} [args.preOccupied]  capacity that is already
+ *                   spoken for before this pass begins — in-progress work and
+ *                   entries already on the plan. Without it a "suggestion" plans
+ *                   straight over committed work, which is worse than no
+ *                   suggestion at all.
  * @returns {Promise<Map<number,{start:Date,end:Date}>>}
  */
-export async function levelSchedule({ companyId, tasks, edges, resourceCapacity, calendar, anchor } = {}) {
+export async function levelSchedule({
+  companyId, tasks, edges, resourceCapacity, calendar, anchor, priority, preOccupied,
+} = {}) {
   const schedule = new Map();
   if (!Array.isArray(tasks) || tasks.length === 0) return schedule;
 
@@ -322,9 +335,22 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
     predsOf.get(e.to).push(e.from);
   }
 
+  // Priority only breaks ties among tasks that are ALREADY ready — it can never
+  // reorder past a precedence edge, because Kahn only offers indegree-0 tasks.
+  // So a high-priority order jumps the queue for a contended machine without any
+  // risk of a task overtaking its own predecessor.
   const cmp = (a, b) => {
     const ta = taskById.get(a);
     const tb = taskById.get(b);
+    if (priority) {
+      const pa = priority.get(a);
+      const pb = priority.get(b);
+      // A task with no rank sorts after every ranked one rather than at zero,
+      // which would put unranked work at the front of the shop.
+      const ra = Number.isFinite(pa) ? pa : Number.POSITIVE_INFINITY;
+      const rb = Number.isFinite(pb) ? pb : Number.POSITIVE_INFINITY;
+      if (ra !== rb) return ra - rb;
+    }
     return (Number(ta.seq_no) || 0) - (Number(tb.seq_no) || 0) || a - b;
   };
 
@@ -365,6 +391,23 @@ export async function levelSchedule({ companyId, tasks, edges, resourceCapacity,
 
   // ── forward pass ─────────────────────────────────────────────────────────────
   const resourceState = new Map(); // key -> occupied intervals [{start,end}]
+
+  // Seed with capacity that is already committed. resourceContext is reused
+  // verbatim so a pre-occupied span lands on exactly the key the tasks contend
+  // on — computing the key here by hand is how these two drift apart.
+  for (const p of preOccupied ?? []) {
+    const start = p.start instanceof Date ? p.start : new Date(p.start);
+    const end = p.end instanceof Date ? p.end : new Date(p.end);
+    if (!(end > start)) continue;
+    const { key } = resourceContext(
+      { assigned_resource_id: p.assigned_resource_id ?? null, resource_type_id: p.resource_type_id ?? null },
+      cap,
+    );
+    if (key === null) continue;
+    if (!resourceState.has(key)) resourceState.set(key, []);
+    resourceState.get(key).push({ start, end });
+  }
+
   for (const id of order) {
     const task = taskById.get(id);
     const durationMin = Number(task.computed_hours) > 0 ? Number(task.computed_hours) * 60 : 0;

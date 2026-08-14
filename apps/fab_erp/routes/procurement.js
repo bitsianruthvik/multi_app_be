@@ -2,7 +2,7 @@
  * routes/procurement.js — the two steps that follow a finished BOM.
  *
  * Mounted separately at app.js alongside routes/criticalChain.js and
- * routes/dispatch.js, matching that precedent: this is its own concern rather
+ * routes/planner.js, matching that precedent: this is its own concern rather
  * than another entry in the index router.
  *
  * The shape is deliberately the same as dispatch's — a preview that computes
