@@ -28,13 +28,99 @@
  */
 
 import { pool } from '../../../db.js';
+import { orderShortfall } from './procurementService.js';
+import { procurementForOrder } from './procurementOrderService.js';
 import { flowSummary } from './flowAllocationService.js';
 
-/** The wizard's steps, in the order they happen. */
-export const STAGE_KEYS = ['lines', 'boq', 'nesting', 'flows', 'tasks'];
+/**
+ * The wizard's steps, in the order they happen.
+ *
+ * `procurement` and `production` were added 2026-08-13: once the tree is built,
+ * the BOM has said what to buy and what to make, and each becomes a document.
+ * They sit last because neither can be answered before the tree exists.
+ */
+export const STAGE_KEYS = ['lines', 'boq', 'nesting', 'flows', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
-const PREPARATION_STAGES = ['lines', 'boq', 'nesting', 'flows', 'tasks'];
+const PREPARATION_STAGES = STAGE_KEYS;
+
+/**
+ * Procurement readiness: is everything this order has to buy either on the
+ * shelf or on order?
+ *
+ * DONE when nothing is short. That covers two cases which look different and
+ * are not: an order with nothing to buy at all, and an order whose every
+ * shortage has a purchase order against it. In both, there is no outstanding
+ * decision — and treating "nothing to do" as unfinished would gate Confirm on
+ * an action that cannot be taken.
+ *
+ * PARTIAL rather than todo once some purchase orders exist, so a half-finished
+ * step reads as half-finished.
+ */
+async function summariseProcurement(companyId, orderId) {
+  const [short, pos] = await Promise.all([
+    orderShortfall(companyId, orderId),
+    procurementForOrder(companyId, orderId),
+  ]);
+
+  const needed = short.lines.length;
+  const stillShort = short.lines.filter((l) => l.short > 0).length;
+  const covered = needed - stillShort;
+
+  let state = 'done';
+  let detail = needed === 0
+    ? 'Nothing to buy — this order is made entirely in-house'
+    : `All ${needed} bought-in item(s) covered by stock or on order`;
+
+  if (stillShort > 0) {
+    state = pos.length > 0 ? 'partial' : 'todo';
+    detail = `${stillShort} item(s) short — ${pos.length > 0
+      ? `${pos.length} purchase order(s) raised so far`
+      : 'nothing ordered yet'}`;
+  }
+  if (short.unmatched.length > 0) {
+    // A bought-in row with no catalog item cannot be checked against stock or
+    // purchased. Saying so is the only useful thing to do about it.
+    detail += `; ${short.unmatched.length} bought-in row(s) have no catalog item`;
+    if (state === 'done') state = 'partial';
+  }
+  return { state, covered, needed, detail };
+}
+
+/** Production readiness: does a production order exist, and does it own the make tasks? */
+async function summariseProduction(companyId, orderId) {
+  const [[agg]] = await pool.query(
+    `SELECT COUNT(*) AS make_tasks,
+            SUM(t.production_order_id IS NOT NULL) AS claimed
+       FROM fab_project_tasks t
+       JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
+      WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
+        AND COALESCE(i.procurement_type, 'make') = 'make'`,
+    [companyId, orderId],
+  );
+  const makeTasks = Number(agg?.make_tasks) || 0;
+  const claimed = Number(agg?.claimed) || 0;
+
+  if (makeTasks === 0) {
+    return {
+      state: 'done', claimed: 0, makeTasks: 0,
+      detail: 'Nothing to make — this order is entirely bought in',
+    };
+  }
+  if (claimed === 0) {
+    return { state: 'todo', claimed, makeTasks, detail: 'No production order raised yet' };
+  }
+  if (claimed < makeTasks) {
+    return {
+      state: 'partial', claimed, makeTasks,
+      detail: `${makeTasks - claimed} make task(s) built since the production order was raised`,
+    };
+  }
+  return {
+    state: 'done', claimed, makeTasks,
+    detail: `All ${makeTasks} make task(s) on the production order`,
+  };
+}
 
 /**
  * Full readiness for one order.
@@ -64,6 +150,10 @@ export async function orderReadiness(companyId, orderId) {
   ]);
 
   const flowState = summariseFlows(flows);
+  const [proc, production] = await Promise.all([
+    summariseProcurement(companyId, orderId),
+    summariseProduction(companyId, orderId),
+  ]);
   const stages = [
     {
       key: 'lines',
@@ -118,6 +208,31 @@ export async function orderReadiness(companyId, orderId) {
       count: tasks,
       total: tasks,
       detail: tasks > 0 ? `${tasks} task(s) built` : 'Not built yet',
+    },
+    /**
+     * The two steps that follow a finished tree: buy what we do not have, and
+     * commit to making the rest.
+     *
+     * Both can legitimately be DONE with nothing raised. An order whose BOM is
+     * entirely made in-house has nothing to purchase, and saying "todo" about a
+     * step with no possible work would block Confirm on an action that does not
+     * exist. Emptiness and completeness are the same state here.
+     */
+    {
+      key: 'procurement',
+      label: 'Procurement',
+      state: proc.state,
+      count: proc.covered,
+      total: proc.needed,
+      detail: proc.detail,
+    },
+    {
+      key: 'production',
+      label: 'Production',
+      state: production.state,
+      count: production.claimed,
+      total: production.makeTasks,
+      detail: production.detail,
     },
   ];
 
