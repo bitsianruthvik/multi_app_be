@@ -338,7 +338,13 @@ export async function reevaluateStockGatedTasks(conn, companyId, catalogItemIds)
  */
 export async function materializeOrderTasks(conn, companyId, orderId) {
   const [items] = await conn.query(
-    `SELECT id, parent_item_id, catalog_item_id, flow_id
+    // `qty` is load-bearing and was missing until 2026-08-15: without it
+    // `item.qty ?? 1` below always took the 1, so EVERY task materialized was
+    // planned as a single piece and the per-piece × quantity model was inert
+    // for new work. The same omission made `rm.qty` undefined, so every
+    // fab_task_inputs row was written with a NULL quantity and the
+    // quantity-aware material gate silently degraded to a presence check.
+    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
