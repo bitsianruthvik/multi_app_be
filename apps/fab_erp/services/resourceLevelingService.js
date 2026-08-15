@@ -17,6 +17,7 @@ import { pool } from '../../../db.js';
 import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 import { parseDependsOn } from './taskGatingService.js';
 import { NoCapacityError, NO_WORKING_TIME, NO_CREW_ASSIGNED, isNoCapacity } from './schedulingErrors.js';
+import { taskMinutes } from './taskDuration.js';
 
 // ─── edge building (mirrors GET /tasks/graph) ─────────────────────────────────
 
@@ -410,7 +411,9 @@ export async function levelSchedule({
 
   for (const id of order) {
     const task = taskById.get(id);
-    const durationMin = Number(task.computed_hours) > 0 ? Number(task.computed_hours) * 60 : 0;
+    // Per-piece × pieces. See taskDuration — the formula is a cycle time, so a
+    // task covering 20 flanges used to be scheduled as though it were one.
+    const durationMin = taskMinutes(task);
 
     let earliest = anchorDate;
     for (const pid of predsOf.get(id)) {

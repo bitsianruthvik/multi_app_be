@@ -11,6 +11,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { taskHours } from './taskDuration.js';
 /**
  * Touch time for one task from its event log: first 'started' to last
  * 'completed', minus closed pause pairs. Only the first start and last
@@ -101,7 +102,7 @@ export async function computeTaskVariance(exec, companyId, taskId, planHours) {
  */
 export async function orderVarianceSummary(exec, companyId, orderId) {
   const [tasks] = await exec.query(
-    `SELECT id, computed_hours FROM fab_project_tasks
+    `SELECT id, computed_hours, task_qty FROM fab_project_tasks
       WHERE company_id = ? AND order_id = ? AND status = 'done' AND deleted_at IS NULL`,
     [companyId, orderId],
   );
@@ -112,7 +113,10 @@ export async function orderVarianceSummary(exec, companyId, orderId) {
   for (const t of tasks) {
     const a = actuals.get(t.id);
     if (t.computed_hours != null && a != null) {
-      planSum += Number(t.computed_hours);
+      // The whole task's plan, not one piece of it — the actual it is compared
+      // against is the time the machine really spent on all of them, so a
+      // per-piece plan would report every multi-piece task as wildly over.
+      planSum += taskHours(t);
       actualSum += a;
       counted += 1;
     }

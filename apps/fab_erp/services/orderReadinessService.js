@@ -1,9 +1,13 @@
 /**
  * orderReadinessService.js — where has this order's wizard got to?
  *
- * A sales order is built in five steps, in this order:
+ * A sales order is built in these steps, in this order (resequenced 2026-08-15):
  *
- *   lines → BOM → nesting → flows → project tree
+ *   lines → structure → flows → parameters → nesting → project tree
+ *
+ * The old order was `lines → BOM → nesting → flows`, which committed material to
+ * a part before anything said what would be made of it, and asked for every
+ * dimension before anything knew which dimensions mattered. See STAGE_KEYS.
  *
  * …and then somebody confirms it. Everything up to that point happens while the
  * order is a DRAFT: a draft is simply an order still in the wizard. Confirm is
@@ -28,6 +32,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { missingFieldsForOrder } from './itemFieldService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder } from './procurementOrderService.js';
 import { flowSummary } from './flowAllocationService.js';
@@ -41,7 +46,26 @@ import { logger } from '../../../core/utils/logger.js';
  * the BOM has said what to buy and what to make, and each becomes a document.
  * They sit last because neither can be answered before the tree exists.
  */
-export const STAGE_KEYS = ['lines', 'boq', 'nesting', 'flows', 'tasks', 'procurement', 'production'];
+/**
+ * The order the work is actually done in — RESEQUENCED 2026-08-15.
+ *
+ * It was `lines, boq, nesting, flows, tasks`, which asked two things in the
+ * wrong order:
+ *
+ *   Nesting came BEFORE flows, so material was committed to a part before
+ *   anybody had said what would be made of it.
+ *
+ *   The BOQ asked for every dimension before anything knew which dimensions
+ *   mattered. Which fields a part needs is derived from its flow's formulas
+ *   (`itemFieldService.requiredFieldsForFlow`) — so the flow has to be known
+ *   first, or the sheet is guessing at columns.
+ *
+ * Now: structure → flows → parameters → nesting. Flows need only the codes, and
+ * `fab_flow_rules` maps (structure type, level, code suffix) → flow, so that
+ * step is normally a button press. Parameters then asks for exactly the fields
+ * those flows demand. Nesting last, because it needs the dimensions.
+ */
+export const STAGE_KEYS = ['lines', 'boq', 'flows', 'params', 'nesting', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -152,9 +176,14 @@ export async function orderReadiness(companyId, orderId) {
   ]);
 
   const flowState = summariseFlows(flows);
-  const [proc, production] = await Promise.all([
+  const [proc, production, fields] = await Promise.all([
     summariseProcurement(companyId, orderId),
     summariseProduction(companyId, orderId),
+    // Never let a field-analysis failure take the whole strip down: the other
+    // stages are still true and the order still has to be workable.
+    missingFieldsForOrder(companyId, orderId).catch(() => ({
+      itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], noFormula: [],
+    })),
   ]);
   const stages = [
     {
@@ -171,7 +200,10 @@ export async function orderReadiness(companyId, orderId) {
     },
     {
       key: 'boq',
-      label: 'BOM',
+      // "Structure", not "BOM": this step is the codes and quantities, and the
+      // codes ARE the structure. Dimensions moved to `params`, which cannot be
+      // asked until the flows are known.
+      label: 'Structure',
       // Spans and girders with no parts under them is a half-entered BOQ, not
       // an empty one — the difference matters to someone deciding what to do next.
       state: tree.parts > 0 ? 'done' : tree.total > 0 ? 'partial' : 'todo',
@@ -180,6 +212,37 @@ export async function orderReadiness(companyId, orderId) {
       detail: tree.total === 0
         ? 'No structure entered'
         : `${tree.spans} span · ${tree.girders} girder · ${tree.segments} segment · ${tree.parts} part`,
+    },
+    {
+      key: 'flows',
+      label: 'Flows',
+      state: flowState.state,
+      count: flowState.withFlow,
+      total: flowState.flowable,
+      detail: flowState.detail,
+    },
+    {
+      /**
+       * The values the flows' formulas actually need.
+       *
+       * `todo` while any part is short, because a missing value does not error —
+       * the engine reads it as 0, so the part is estimated as free to make and
+       * every date computed from it is fiction. This is the stage that makes
+       * that visible before the production order freezes it.
+       */
+      key: 'params',
+      label: 'Parameters',
+      state: fields.itemsChecked === 0 ? 'todo'
+        : (fields.itemsShort > 0 || fields.unknownFields.length > 0) ? 'partial' : 'done',
+      count: fields.itemsChecked - fields.itemsShort,
+      total: fields.itemsChecked,
+      detail: fields.itemsChecked === 0
+        ? 'Assign flows first — they decide which values are needed'
+        : fields.unknownFields.length > 0
+          ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
+          : fields.itemsShort > 0
+            ? `${fields.itemsShort} of ${fields.itemsChecked} part(s) missing values`
+            : `All ${fields.itemsChecked} part(s) have what their operations need`,
     },
     {
       key: 'nesting',
@@ -194,14 +257,6 @@ export async function orderReadiness(companyId, orderId) {
         : nest.nested >= nest.parts
           ? `All ${nest.parts} part(s) have material`
           : `${nest.parts - nest.nested} of ${nest.parts} part(s) have no material`,
-    },
-    {
-      key: 'flows',
-      label: 'Flows',
-      state: flowState.state,
-      count: flowState.withFlow,
-      total: flowState.flowable,
-      detail: flowState.detail,
     },
     {
       key: 'tasks',

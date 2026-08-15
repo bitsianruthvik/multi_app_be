@@ -14,6 +14,7 @@
 
 import { pool } from '../../../db.js';
 import { CC_FEVER } from './ccBufferService.js';
+import { taskMinutes } from './taskDuration.js';
 
 // Working minutes per day used to translate a delay into whole "slip days" for
 // the warning. One shift; deliberately coarse — this is a preview, not a plan.
@@ -52,7 +53,7 @@ function toDateTimeStr(d) {
  */
 export async function whatIf({ companyId, taskId, resourceId } = {}) {
   const [[task]] = await pool.query(
-    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, status, operation_id
+    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, task_qty, status, operation_id
        FROM fab_project_tasks
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
     [taskId, companyId],
@@ -81,7 +82,9 @@ export async function whatIf({ companyId, taskId, resourceId } = {}) {
   const pinnedType = resourceId != null ? resType.get(Number(resourceId)) : null;
   const taskEffType = pinnedType != null ? pinnedType : effTypeOf(task.resource_type_id, task.assigned_resource_id);
 
-  const delayMinutes = durationMinutes(task.computed_hours);
+  // The whole task, not one piece of it — starting a 20-piece job detours the
+  // machine for all 20.
+  const delayMinutes = taskMinutes(task);
 
   // Is the chosen task itself on a critical chain?
   const [[selfCrit]] = await pool.query(
@@ -97,7 +100,7 @@ export async function whatIf({ companyId, taskId, resourceId } = {}) {
   // Not-started critical tasks (of baselined sales plans) competing for a resource.
   const [critRows] = await pool.query(
     `SELECT ct.task_id, pt.order_id, pt.resource_type_id, pt.assigned_resource_id,
-            pt.computed_hours, pt.operation_id, pt.status,
+            pt.computed_hours, pt.task_qty, pt.operation_id, pt.status,
             p.buffer_consumed_pct AS bufConsumedPct, p.chain_complete_pct AS chainPct,
             p.project_buffer_minutes AS projBufMin, p.committed_finish AS committedFinish,
             p.fever_zone AS feverZone,

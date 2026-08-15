@@ -47,9 +47,54 @@ function normalise(formula) {
   // Scanned rather than regexed: find each IF, match its parentheses by depth,
   // split on TOP-LEVEL commas only, and recurse into each argument.
   let result = rewriteIf(formula);
-  // Step 2: rewrite namespace.key → namespace_key
+
+  /**
+   * Step 2a: the INPUT namespaces, before the generic rule below.
+   *
+   *   inputs.sum(weight_kg)  → inputs_sum_weight_kg
+   *   inputs.count           → inputs_count
+   *   input.raw_material.thickness_mm → input_raw_material_thickness_mm
+   *
+   * BY ROLE, NEVER BY POSITION. `input[0]` would mean a formula's meaning
+   * changes when somebody reorders a BOM — silently, and nobody would ever
+   * connect the two. A role is a statement about what the input IS.
+   *
+   * Aggregates are rewritten to plain identifiers rather than left as function
+   * calls: the value is computed once when the scope is built, so the parser
+   * never has to know these functions exist and an aggregate over a field
+   * nothing carries degrades to 0 like every other unknown symbol.
+   */
+  result = result.replace(/\binputs\.(sum|max|min|avg)\s*\(\s*([A-Za-z_]\w*)\s*\)/gi,
+    (_m, fn, field) => `inputs_${String(fn).toLowerCase()}_${field}`);
+  result = result.replace(/\binputs\.count\b/gi, 'inputs_count');
+  result = result.replace(/\binput\.(\w+)\.(\w+)\b/g, 'input_$1_$2');
+
+  // Step 2b: rewrite namespace.key → namespace_key
   result = result.replace(/\b(machine|item|step|op)\.(\w+)\b/g, '$1_$2');
   return result;
+}
+
+/**
+ * Aggregate helpers over the inputs' resolved field values.
+ *
+ * Absent values are SKIPPED, not counted as zero: an average over three parts
+ * where one has no weight is the average of the two that do, and treating the
+ * third as 0 kg would quietly halve it. `count` is the number of inputs, not
+ * the number that happen to carry the field.
+ */
+function aggregate(fn, field, inputs) {
+  const vals = (inputs || [])
+    .map((i) => Number(i?.[field]))
+    .filter((n) => Number.isFinite(n));
+  if (fn === 'count') return (inputs || []).length;
+  if (!vals.length) return 0;
+  switch (fn) {
+    case 'sum': return vals.reduce((a, b) => a + b, 0);
+    case 'max': return Math.max(...vals);
+    case 'min': return Math.min(...vals);
+    case 'avg': return vals.reduce((a, b) => a + b, 0) / vals.length;
+    default: return 0;
+  }
 }
 
 /** Rewrite every IF(cond, then, else) in `src` to (cond ? then : else). */
@@ -93,6 +138,12 @@ function rewriteIf(src) {
  * @param {Record<string,number>} stepValues   - step parameter values (standard_values overrides)
  * @param {number|null} resourceTypeId  - resource type whose properties supply machine.* vars
  * @param {Record<string,number>} opValues     - operation's own variable values keyed by var_key
+ * @param {{byRole?:Record<string,Record<string,number>>, all?:Array<Record<string,number>>}} [inputCtx]
+ *        what this task CONSUMES — see resolveTaskInputs. `byRole` supplies
+ *        `input.<role>.<field>`, `all` backs the `inputs.*` aggregates. A sixth
+ *        positional argument rather than an options object because four call
+ *        sites already pass five, and churning them all to add one was the
+ *        larger change.
  * @returns {Promise<number|null>}      - evaluated result or null on error/missing formula
  */
 export async function evaluateFormula(
@@ -101,6 +152,7 @@ export async function evaluateFormula(
   stepValues  = {},
   resourceTypeId = null,
   opValues = {},
+  inputCtx = null,
 ) {
   if (!formula || typeof formula !== 'string') return null;
 
@@ -131,13 +183,36 @@ export async function evaluateFormula(
     for (const [k, v] of Object.entries(opValues)) {
       scope[`op_${k}`] = Number(v ?? 0);
     }
+    // input.<role>.<field> — what this task consumes, addressed by role.
+    for (const [role, fields] of Object.entries(inputCtx?.byRole ?? {})) {
+      for (const [k, v] of Object.entries(fields ?? {})) {
+        const n = Number(v);
+        if (Number.isFinite(n)) scope[`input_${role}_${k}`] = n;
+      }
+    }
 
     const normalised = normalise(formula);
+
+    /**
+     * The aggregates the formula actually asks for, computed once each.
+     *
+     * Driven off the normalised text rather than pre-computing every possible
+     * (function × field) pair, which is unbounded — a formula can name any
+     * field, and most name none.
+     */
+    const allInputs = inputCtx?.all ?? [];
+    for (const [, fn, field] of normalised.matchAll(/\binputs_(sum|max|min|avg)_(\w+)\b/g)) {
+      scope[`inputs_${fn}_${field}`] = aggregate(fn, field, allInputs);
+    }
+    if (/\binputs_count\b/.test(normalised)) scope.inputs_count = allInputs.length;
+
     // Any namespaced variable the formula mentions but the item/step/machine/op
     // has no value for reads as 0. Without this mathjs throws on the undefined
     // symbol and the whole formula returns null — so a single unmeasured metric
     // wiped the estimate instead of letting an IF(...) fall back to its default.
-    for (const [, sym] of normalised.matchAll(/\b((?:machine|item|step|op)_\w+)\b/g)) {
+    // `input_` is included so a role that is absent on this task (a first step
+    // consumes material, a later one consumes a part) degrades the same way.
+    for (const [, sym] of normalised.matchAll(/\b((?:machine|item|step|op|input|inputs)_\w+)\b/g)) {
       if (!(sym in scope)) scope[sym] = 0;
     }
     const result = parser.evaluate(normalised, scope);
@@ -172,6 +247,35 @@ export async function resolveFirstResourceType(allowedIds = []) {
  * @param {string} formula
  * @returns {{ valid: boolean, variables?: string[], error?: string }}
  */
+/**
+ * A flow step's own parameters, as the `step.*` scope.
+ *
+ * Lives here because this module owns what the namespaces mean, and because two
+ * callers need it — materialization and the re-materialize diff. If those two
+ * ever disagreed about how a step's params are read, every re-materialize would
+ * report a spurious duration change on every step that had any.
+ *
+ * Tolerates both shapes the driver can hand back for a JSON column: a parsed
+ * object, or the raw string. Non-numeric values are dropped rather than passed
+ * through — the engine coerces with Number(), so a stray string would become
+ * NaN and null the whole formula, planning the task as instant.
+ */
+export function parseStepParams(step) {
+  const raw = step?.params_json ?? step?.paramsJson ?? null;
+  if (!raw) return {};
+  let obj = raw;
+  if (typeof raw === 'string') {
+    try { obj = JSON.parse(raw); } catch { return {}; }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  return out;
+}
+
 export function parseFormula(formula) {
   if (!formula || typeof formula !== 'string') {
     return { valid: false, error: 'Formula is empty' };

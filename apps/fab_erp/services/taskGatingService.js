@@ -21,9 +21,10 @@
 
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
-import { evaluateFormula , formulaResultToHours } from './formulaEngine.js';
+import { evaluateFormula, formulaResultToHours, parseStepParams } from './formulaEngine.js';
 import { recordEvent, recordEvents } from './taskEventService.js';
 import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
+import { resolveItemFields, buildInputContext } from './itemFieldService.js';
 
 /** Best-effort machine name for a resource id (falls back to "#<id>"). */
 async function resourceName(exec, companyId, resourceId) {
@@ -379,7 +380,7 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   let allStepIds = [];
   if (flowIds.length) {
     const [stepRows] = await conn.query(
-      `SELECT id, flow_id, operation_id, seq_no, depends_on, resource_type_id
+      `SELECT id, flow_id, operation_id, seq_no, depends_on, resource_type_id, params_json
          FROM fab_operation_flow_steps
         WHERE company_id = ? AND deleted_at IS NULL AND flow_id IN (?) ORDER BY flow_id, seq_no`,
       [companyId, flowIds],
@@ -432,18 +433,22 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   // these every item_* variable evaluated to 0 and each formula collapsed onto its
   // operation-level default — one flat time for every part, so a 250 mm stiffener
   // cost the same to cut as a full web plate.
-  const itemMetricsById = new Map();
-  if (items.length) {
-    const [metricRows] = await conn.query(
-      `SELECT item_id, metric_key, metric_value FROM fab_item_metric_values
-        WHERE company_id = ? AND deleted_at IS NULL AND item_id IN (?)`,
-      [companyId, items.map((i) => i.id)],
-    );
-    for (const m of metricRows) {
-      if (!itemMetricsById.has(m.item_id)) itemMetricsById.set(m.item_id, {});
-      itemMetricsById.get(m.item_id)[m.metric_key] = m.metric_value;
-    }
-  }
+  /**
+   * Field values, resolved down the whole chain rather than read from one table.
+   *
+   * This used to be a flat `SELECT ... FROM fab_item_metric_values`, which is
+   * why formulas silently estimated from zero: the BOQ sheet and the BOM tree
+   * write `fab_items.length/width/height`, and nothing mirrored those into
+   * metric values. `resolveItemFields` consults order item → catalog item →
+   * subgroup → group → category → default, so a value entered anywhere a person
+   * would reasonably enter it now reaches the formula.
+   *
+   * No piece map: nothing is issued at materialization, so piece-varying fields
+   * correctly fall back to the item's own value here.
+   */
+  const itemMetricsById = items.length
+    ? await resolveItemFields(companyId, items.map((i) => i.id), { conn })
+    : new Map();
 
   // child parts (flow-bound children) per parent item — for 'child_parts' inputs
   const childPartsByParent = new Map();
@@ -496,9 +501,22 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
             await evaluateFormula(
               op.time_formula,
               itemMetricsById.get(item.id) ?? {},
-              {},
+              // step.* — this step's own parameters. Passed as `{}` since the
+              // engine was written, so `step.anything` silently evaluated to 0
+              // and the namespace was documented but dead. This is what lets one
+              // "Cut Plate" operation roll along the length on one flow and
+              // across the width on another without cloning the operation.
+              parseStepParams(step),
               resourceTypeId,
               opValues,
+              // input.* / inputs.* — what this task consumes. Built from the
+              // item's children and the field values already resolved above,
+              // so it costs no extra query per step.
+              buildInputContext({
+                rmChildren: rmChildrenByParent.get(item.id) ?? [],
+                partChildren: childPartsByParent.get(item.id) ?? [],
+                valuesByItemId: itemMetricsById,
+              }),
             ),
             op.time_unit,
           )
@@ -514,10 +532,14 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       const [ins] = await conn.query(
         `INSERT INTO fab_project_tasks
            (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
-            seq_no, depends_on, resource_type_id, status, computed_hours)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?)`,
+            seq_no, depends_on, resource_type_id, status, computed_hours, task_qty)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?)`,
         [companyId, orderId, item.id, flowId, step.id, step.operation_id,
-         step.seq_no, step.depends_on, resourceTypeId, computedHours],
+         step.seq_no, step.depends_on, resourceTypeId, computedHours,
+         // Snapshotted, not joined at read time: a BOM quantity edited later
+         // must not silently move the estimate under a plan already committed.
+         // Re-materialization is the deliberate way to pick up a change.
+         item.qty ?? 1],
       );
       const taskId = ins.insertId;
       tasksInserted++;

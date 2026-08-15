@@ -37,6 +37,7 @@ import { zonedYMD } from './plantTime.js';
 import { plannerTimezone } from './planService.js';
 import { outstandingGatesFor, isMaterialBlocked } from './taskGatingService.js';
 import { compareOrders } from './orderPriority.js';
+import { taskMinutes, hasNoEstimate } from './taskDuration.js';
 
 /** Statuses worth planning. `done`/`cancelled` are history; `in_progress` is already happening. */
 const PLANNABLE = new Set(['blocked', 'eligible']);
@@ -63,7 +64,7 @@ async function loadPlanningTasks(companyId) {
   const [rows] = await pool.query(
     `SELECT t.id, t.order_id, t.item_id, t.flow_id, t.seq_no, t.depends_on,
             t.resource_type_id, t.assigned_resource_id, t.status,
-            t.computed_hours, t.started_at, t.operation_id,
+            t.computed_hours, t.task_qty, t.started_at, t.operation_id,
             i.parent_item_id, i.name AS item_name,
             op.name AS operation_name,
             o.order_number, o.priority_rank, o.priority, o.required_date, o.must_finish_by
@@ -89,13 +90,13 @@ async function loadPreOccupied(companyId, now) {
   const out = [];
 
   const [running] = await pool.query(
-    `SELECT id, resource_type_id, assigned_resource_id, computed_hours, started_at
+    `SELECT id, resource_type_id, assigned_resource_id, computed_hours, task_qty, started_at
        FROM fab_project_tasks
       WHERE company_id = ? AND status = 'in_progress' AND deleted_at IS NULL`,
     [companyId],
   );
   for (const t of running) {
-    const totalMin = (Number(t.computed_hours) || 0) * 60;
+    const totalMin = taskMinutes(t);
     const elapsedMin = t.started_at
       ? Math.max(0, (now.getTime() - new Date(t.started_at).getTime()) / 60000)
       : 0;
@@ -366,7 +367,7 @@ export async function suggestPlan(companyId, {
     return span.start.getTime() < to.getTime();
   });
 
-  const missingDuration = candidates.filter((t) => !(Number(t.computed_hours) > 0)).length;
+  const missingDuration = candidates.filter(hasNoEstimate).length;
 
   const edges = await buildEdges({ companyId, tasks: levelled });
   const edgeSet = new Set(edges.map((e) => `${e.from}->${e.to}`));
@@ -433,7 +434,7 @@ async function persistRun(companyId, {
     const taskCount = bars.reduce((n, b) => n + b.members.length, 0);
     const plannedMinutes = Math.round(
       bars.reduce((n, b) => n + b.members.reduce(
-        (m, x) => m + (Number(x.task.computed_hours) || 0) * 60, 0,
+        (m, x) => m + taskMinutes(x.task), 0,
       ), 0),
     );
 
@@ -452,7 +453,7 @@ async function persistRun(companyId, {
     for (const bar of bars) {
       const first = bar.members[0].task;
       const minutes = Math.round(bar.members.reduce(
-        (m, x) => m + (Number(x.task.computed_hours) || 0) * 60, 0,
+        (m, x) => m + taskMinutes(x.task), 0,
       ));
       const slack = slackByOrder?.get(first.order_id)?.slack;
       await conn.query(
@@ -504,7 +505,7 @@ async function persistRun(companyId, {
           plannedEnd: bar.end,
           planDate: zonedYMD(bar.start, tz),
           plannedMinutes: Math.round(bar.members.reduce(
-            (m, x) => m + (Number(x.task.computed_hours) || 0) * 60, 0,
+            (m, x) => m + taskMinutes(x.task), 0,
           )),
           taskCount: bar.members.length,
           taskIds: bar.members.map((m) => m.task.id),

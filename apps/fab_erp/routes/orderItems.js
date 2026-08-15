@@ -16,6 +16,8 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { logger } from '../../../core/utils/logger.js';
+import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import {
   exportOrderItemsTemplateHandler,
   importOrderItemsHandler,
@@ -83,5 +85,30 @@ router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_e
 router.get('/orders/:orderId/items/weight-summary', protect, orderWeightSummaryHandler);
 // Read-only too — seeing what the order is waiting on is not a manage action.
 router.get('/orders/:orderId/items/nesting', protect, orderNestingHandler);
+
+/**
+ * GET /orders/:orderId/field-readiness — can this order be estimated honestly?
+ *
+ * The answer nobody could get before. A missing field value does not error: the
+ * formula engine defaults unknown symbols to 0 so `IF()` fallbacks can work, so
+ * a part with no thickness is not rejected — it is estimated as free to cut, and
+ * every date computed from it downstream is fiction.
+ *
+ * Read-only and ungated beyond `protect`: knowing an order cannot be estimated
+ * is not a manage action, and the people who most need to see it are often the
+ * ones who cannot raise the production order.
+ */
+router.get('/orders/:orderId/field-readiness', protect, async (req, res) => {
+  const companyId = req.user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  const orderId = Number(req.params.orderId);
+  if (!(orderId > 0)) return res.status(400).json({ message: 'orderId is required.' });
+  try {
+    return res.json({ ok: true, orderId, ...(await missingFieldsForOrder(companyId, orderId)) });
+  } catch (err) {
+    logger.error({ err, companyId, orderId }, 'fab_erp field-readiness failed');
+    return res.status(500).json({ message: 'Could not check the order’s field values.' });
+  }
+});
 
 export default router;

@@ -24,6 +24,7 @@ import {
 import {
 } from './taskWaitService.js';
 import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
+import { taskMinutes } from './taskDuration.js';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -38,12 +39,16 @@ const CHUNK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 
 /**
- * Aggressive (50%) minutes snapshot for a task: computed_hours × 60, rounded.
- * Tasks with no/zero computed_hours contribute 0.
+ * Aggressive (50%) minutes snapshot for a task.
+ *
+ * Delegates to taskDuration so the baseline measures the same span the resource
+ * leveller places. These were two independent multiplications of the same
+ * number; the moment quantity entered the picture, one of them applying it and
+ * the other not would have put the buffer permanently out of step with the plan
+ * it is meant to protect.
  */
 function aggressiveMinutes(task) {
-  const h = Number(task.computed_hours);
-  return h > 0 ? Math.round(h * 60) : 0;
+  return taskMinutes(task);
 }
 
 /**
@@ -221,7 +226,7 @@ export async function buildBaseline({ companyId, orderId, anchor } = {}) {
   //    → fab_orders collapse); the /tasks/graph route filters on order_id too.
   const [tasks] = await pool.query(
     `SELECT id, order_id, item_id, flow_id, seq_no, depends_on,
-            resource_type_id, assigned_resource_id, computed_hours, status
+            resource_type_id, assigned_resource_id, computed_hours, task_qty, status
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id = ? AND status <> 'cancelled' AND deleted_at IS NULL`,
     [companyId, orderId],

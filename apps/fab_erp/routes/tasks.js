@@ -58,6 +58,7 @@ import {
 import * as bufferService from '../services/bufferService.js';
 import { isOutputBlocked, startBlockersForQueue } from '../services/taskGatingService.js';
 import { recomputeForOrder as ccRecomputeForOrder } from '../services/ccBufferService.js';
+import { taskHours } from '../services/taskDuration.js';
 
 const router = Router();
 
@@ -164,7 +165,7 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.blocked_by_other_tasks_minutes AS blockedByOtherTasksMinutes,
         t.idle_wait_minutes AS idleWaitMinutes,
         t.delay_reason AS delayReason,
-        t.computed_hours AS computedHours,
+        t.computed_hours AS computedHours, t.task_qty AS taskQty,
         t.assigned_resource_id AS assignedResourceId,
         t.queued_at AS queuedAt,
         t.started_at AS startedAt,
@@ -1268,6 +1269,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
 
       const [taskRows] = await conn.query(
         `SELECT t.id, t.order_id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
+                t.task_qty,
                 COALESCE(i.qty, 1) AS planned_qty
            FROM fab_project_tasks t
            LEFT JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
@@ -1292,7 +1294,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
 
       // Default good qty to the item's planned qty when the operator didn't report one.
       if (producedQty == null) producedQty = Number(task.planned_qty) || 1;
-      planHours = task.computed_hours; // FEAT-16
+      planHours = taskHours(task); // FEAT-16 — the whole task, matching the actual it is compared against
       orderId = task.order_id;         // EU-5
 
       // BUG-11 + FEAT-05: gate the transition on the expected prior status

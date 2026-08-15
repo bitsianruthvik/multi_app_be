@@ -24,6 +24,7 @@ import { Router } from 'express';
 import { pool } from '../../../db.js';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { parseFormula, evaluateFormula, formulaResultToHours } from '../services/formulaEngine.js';
+import { resolveItemFields, inputContextForItem } from '../services/itemFieldService.js';
 
 const router = Router();
 
@@ -75,11 +76,16 @@ router.get('/formula/variables', protect, requirePerm('fab_erp_operations_view')
       [companyId],
     );
 
+    // The field registry, not the old metric defs — and only the fields that can
+    // legitimately appear in a formula. A text field offered here would be
+    // accepted by the editor and then coerce to NaN at evaluation, nulling the
+    // whole duration and planning the task as instant.
     const [itemRows] = await pool.query(
-      `SELECT metric_key, metric_label, unit
-         FROM fab_item_metric_defs
-        WHERE company_id = ? AND deleted_at IS NULL
-        ORDER BY metric_key`,
+      `SELECT field_key AS metric_key, label AS metric_label, unit
+         FROM fab_field_defs
+        WHERE company_id = ? AND deleted_at IS NULL AND active = 1
+          AND formula_usable = 1
+        ORDER BY sort_order, field_key`,
       [companyId],
     );
 
@@ -139,7 +145,8 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
       resourceTypeId ? [companyId, resourceTypeId] : [companyId],
     );
     const [itemRows] = await pool.query(
-      `SELECT metric_key FROM fab_item_metric_defs WHERE company_id = ? AND deleted_at IS NULL`,
+      `SELECT field_key AS metric_key FROM fab_field_defs
+        WHERE company_id = ? AND deleted_at IS NULL AND active = 1 AND formula_usable = 1`,
       [companyId],
     );
     const [opRows] = operationId
@@ -162,18 +169,32 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
       const [ns, key] = v.split('.');
       if (!ns || !key) continue;                 // bare identifier, not namespaced
       if (ns === 'step') continue;               // out of scope, see above
+      /**
+       * `input.<role>.<field>` and the `inputs.*` aggregates are out of scope for
+       * the same reason as `step.*`, and a stricter one: which roles a task has
+       * depends on the BOM under the item it runs on, which this endpoint is not
+       * given. Validating them here would red-underline a correct formula on
+       * every item that happens not to carry that role — a first step consumes
+       * material, a later one consumes a part, and both are right.
+       *
+       * `parseFormula` returns these already rewritten to underscore form (the
+       * dot-notation round-trip only covers the four two-part namespaces), so
+       * they arrive as bare identifiers and are skipped by the `!key` guard
+       * above. Named explicitly so the next person does not "fix" that.
+       */
+      if (ns === 'input' || ns === 'inputs') continue;
       if (!known[ns] || !known[ns].has(key)) unresolved.push(v);
     }
 
     // Optional: what would this actually produce for a real item?
     let sample = null;
     if (sampleItemId) {
-      const [metricRows] = await pool.query(
-        `SELECT metric_key, metric_value FROM fab_item_metric_values
-          WHERE company_id = ? AND item_id = ? AND deleted_at IS NULL`,
-        [companyId, sampleItemId],
-      );
-      const itemValues = Object.fromEntries(metricRows.map((m) => [m.metric_key, m.metric_value]));
+      // The field registry resolver, not the retired fab_item_metric_values table.
+      // Phase 1 migrated those rows out; reading the old table here made the
+      // preview evaluate every item.* as 0 — so a formula that will size the job
+      // correctly in production previewed as a flat constant, which is exactly
+      // the failure this preview exists to catch.
+      const itemValues = (await resolveItemFields(companyId, [Number(sampleItemId)])).get(Number(sampleItemId)) ?? {};
       const opValues = Object.fromEntries(
         (operationId
           ? (await pool.query(
@@ -184,7 +205,9 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
           : []
         ).map((v) => [v.var_key, v.default_value]),
       );
-      const raw = await evaluateFormula(formula, itemValues, {}, resourceTypeId ?? null, opValues);
+      // Inputs come from the item's own BOM children, same as materialization.
+      const inputCtx = await inputContextForItem(companyId, Number(sampleItemId));
+      const raw = await evaluateFormula(formula, itemValues, {}, resourceTypeId ?? null, opValues, inputCtx);
       let timeUnit = 'min';
       if (operationId) {
         const [[op]] = await pool.query(

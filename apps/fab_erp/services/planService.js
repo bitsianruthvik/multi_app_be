@@ -31,6 +31,7 @@ import { pool } from '../../../db.js';
 import { buildEdges } from './resourceLevelingService.js';
 import { outstandingGatesFor, isMaterialBlocked } from './taskGatingService.js';
 import { compareOrders, rankReason, PRIORITY_LEVELS } from './orderPriority.js';
+import { taskMinutes } from './taskDuration.js';
 import {
   resolveCapacityForResource, capacityIntervals, capacityMinutes, isUnbounded,
 } from './capacityService.js';
@@ -366,7 +367,7 @@ export async function assertDagAllows(companyId, taskIds, start, { excludeEntryI
   // predecessor outside the selection is precisely what has to be found.
   const [siblings] = await pool.query(
     `SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
-            started_at, computed_hours
+            started_at, computed_hours, task_qty
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
         AND status <> 'cancelled'`,
@@ -412,7 +413,7 @@ export async function assertDagAllows(companyId, taskIds, start, { excludeEntryI
 
       const end = plannedEnd.get(Number(predId))
         ?? (pred.status === 'in_progress' && pred.started_at
-          ? new Date(new Date(pred.started_at).getTime() + (Number(pred.computed_hours) || 0) * 3600000)
+          ? new Date(new Date(pred.started_at).getTime() + taskMinutes(pred) * 60000)
           : null);
 
       if (!end) {
@@ -493,11 +494,11 @@ async function insertEntry(conn, companyId, entry, planDate) {
   const entryId = res.insertId;
 
   const [minutes] = await conn.query(
-    `SELECT id, computed_hours AS computedHours FROM fab_project_tasks
+    `SELECT id, computed_hours AS computedHours, task_qty AS taskQty FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, entry.taskIds],
   );
-  const minuteOf = new Map(minutes.map((m) => [m.id, Math.round((Number(m.computedHours) || 0) * 60)]));
+  const minuteOf = new Map(minutes.map((m) => [m.id, taskMinutes(m)]));
 
   const rows = entry.taskIds.map((taskId, i) => [
     companyId, entryId, taskId, minuteOf.get(taskId) ?? 0, i,
@@ -523,7 +524,7 @@ export async function createEntry(companyId, input, userId = null) {
   const [tasks] = await pool.query(
     `SELECT t.id, t.order_id AS orderId, t.operation_id AS operationId,
             t.resource_type_id AS resourceTypeId, t.assigned_resource_id AS resourceId,
-            t.computed_hours AS computedHours, t.seq_no AS seqNo,
+            t.computed_hours AS computedHours, t.task_qty AS taskQty, t.seq_no AS seqNo,
             i.parent_item_id AS parentItemId, i.name AS itemName,
             op.name AS operationName
        FROM fab_project_tasks t
@@ -542,7 +543,7 @@ export async function createEntry(companyId, input, userId = null) {
   await assertMaterialAvailable(companyId, taskIds);
   await assertDagAllows(companyId, taskIds, start);
 
-  const totalMinutes = tasks.reduce((n, t) => n + (Number(t.computedHours) || 0) * 60, 0);
+  const totalMinutes = tasks.reduce((n, t) => n + taskMinutes(t), 0);
   const end = input.plannedEnd
     ? new Date(input.plannedEnd)
     : new Date(start.getTime() + totalMinutes * 60000);
@@ -850,7 +851,7 @@ export async function getBacklog(companyId, { resourceTypeIds = [], limit = 200 
   const [rows] = await pool.query(
     `SELECT t.id, t.order_id AS orderId, t.item_id AS itemId, t.seq_no AS seqNo,
             t.status, t.resource_type_id AS resourceTypeId,
-            t.assigned_resource_id AS resourceId, t.computed_hours AS computedHours,
+            t.assigned_resource_id AS resourceId, t.computed_hours AS computedHours, t.task_qty AS taskQty,
             i.name AS itemName, i.parent_item_id AS parentItemId,
             op.name AS operationName, op.id AS operationId,
             o.order_number AS orderNumber, o.priority_rank AS priorityRank,
@@ -902,7 +903,7 @@ export async function getPlanOrders(companyId, { from, to, resourceTypeIds = [] 
             o.priority, o.priority_rank AS priorityRank,
             o.must_finish_by AS mustFinishBy, o.required_date AS requiredDate,
             COUNT(t.id) AS taskCount,
-            COALESCE(SUM(t.computed_hours), 0) AS totalHours
+            COALESCE(SUM(t.computed_hours * COALESCE(t.task_qty, 1)), 0) AS totalHours
        FROM fab_project_tasks t
        JOIN fab_orders o ON o.id = t.order_id AND o.deleted_at IS NULL
       WHERE t.company_id = ? AND t.deleted_at IS NULL

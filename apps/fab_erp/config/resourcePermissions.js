@@ -21,6 +21,9 @@ const resourcePermissions = {
 
   // Item meta
   fabErpItemMetricDef: 'fab_erp_items_meta_manage',
+  // The field registry that replaces it — same gate, so nobody who could edit
+  // metrics loses the ability and nobody new gains it.
+  fabErpFieldDef:      'fab_erp_items_meta_manage',
 
   // Formulas
   fabErpFormulaSet: 'fab_erp_formulas_manage',

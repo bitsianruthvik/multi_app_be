@@ -588,7 +588,8 @@
       "seq_no",
       "depends_on",
       "resource_type_id",
-      "notes"
+      "notes",
+      "params_json"
     ],
     "fields": {
       "id": "fofs.id",
@@ -603,7 +604,8 @@
       "updatedAt": "fofs.updated_at",
       "operationName": "fop_ofs.name",
       "operationCode": "fop_ofs.code",
-      "resourceTypeName": "frt_ofs.name"
+      "resourceTypeName": "frt_ofs.name",
+      "paramsJson": "fofs.params_json"
     },
     "fieldTypes": {
       "id": "integer",
@@ -618,7 +620,8 @@
       "updatedAt": "datetime",
       "operationName": "string",
       "operationCode": "string",
-      "resourceTypeName": "string"
+      "resourceTypeName": "string",
+      "paramsJson": "string"
     },
     "relations": {
       "operation": {
@@ -2853,5 +2856,63 @@
       "createdAt": "datetime",
       "updatedAt": "datetime"
     }
+  },
+  "fabErpFieldDef": {
+    "table": "fab_field_defs",
+    "alias": "ffd",
+    "writeFields": [
+      "field_key",
+      "label",
+      "data_type",
+      "unit",
+      "formula_usable",
+      "piece_varying",
+      "default_value",
+      "category_id",
+      "group_id",
+      "subgroup_id",
+      "sort_order",
+      "active",
+      "notes"
+    ],
+    "fields": {
+      "id": "ffd.id",
+      "companyId": "ffd.company_id",
+      "fieldKey": "ffd.field_key",
+      "label": "ffd.label",
+      "dataType": "ffd.data_type",
+      "unit": "ffd.unit",
+      "formulaUsable": "ffd.formula_usable",
+      "pieceVarying": "ffd.piece_varying",
+      "defaultValue": "ffd.default_value",
+      "categoryId": "ffd.category_id",
+      "groupId": "ffd.group_id",
+      "subgroupId": "ffd.subgroup_id",
+      "sortOrder": "ffd.sort_order",
+      "active": "ffd.active",
+      "notes": "ffd.notes",
+      "createdAt": "ffd.created_at",
+      "updatedAt": "ffd.updated_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "fieldKey": "string",
+      "label": "string",
+      "dataType": "string",
+      "unit": "string",
+      "formulaUsable": "integer",
+      "pieceVarying": "integer",
+      "defaultValue": "decimal",
+      "categoryId": "integer",
+      "groupId": "integer",
+      "subgroupId": "integer",
+      "sortOrder": "integer",
+      "active": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
   }
 }

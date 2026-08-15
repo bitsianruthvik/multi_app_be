@@ -28,7 +28,8 @@ import {
   materializeOrderTasks,
 } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
-import { evaluateFormula, formulaResultToHours } from './formulaEngine.js';
+import { evaluateFormula, formulaResultToHours, parseStepParams } from './formulaEngine.js';
+import { resolveItemFields, inputContextForItem } from './itemFieldService.js';
 import { buildBaseline } from './criticalChainService.js';
 import { replan as drumReplan } from './drumService.js';
 import { logger } from '../../../core/utils/logger.js';
@@ -67,7 +68,7 @@ async function resolveItemFlowId(conn, companyId, item) {
  * now. Applying such a diff would have overwritten every dimension-aware
  * duration with one flat number per operation.
  */
-async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId) {
+async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId, step) {
   const [[op]] = await conn.query(
     `SELECT time_formula, time_unit, default_resource_type_id FROM fab_operations
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
@@ -82,20 +83,22 @@ async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId
   const opValues = Object.fromEntries(vars.map((v) => [v.var_key, v.default_value]));
   const rt = resourceTypeId ?? op.default_resource_type_id ?? null;
 
+  // The SAME resolver the materialize path uses. These two must agree exactly
+  // or every re-materialize preview would report a spurious duration change on
+  // every task — which is how a diff nobody trusts gets ignored.
   let itemValues = {};
   if (itemId != null) {
-    const [metricRows] = await conn.query(
-      `SELECT metric_key, metric_value FROM fab_item_metric_values
-        WHERE company_id = ? AND item_id = ? AND deleted_at IS NULL`,
-      [companyId, itemId],
-    );
-    itemValues = Object.fromEntries(metricRows.map((m) => [m.metric_key, m.metric_value]));
+    itemValues = (await resolveItemFields(companyId, [itemId], { conn })).get(itemId) ?? {};
   }
 
   // Same unit conversion as the materialize path — these two must agree,
   // or every re-materialize would report a spurious duration change.
   return formulaResultToHours(
-    await evaluateFormula(op.time_formula, itemValues, {}, rt, opValues), op.time_unit,
+    await evaluateFormula(
+      op.time_formula, itemValues, parseStepParams(step), rt, opValues,
+      // Same input resolution the materialize path uses — see inputContextForItem.
+      itemId != null ? await inputContextForItem(companyId, itemId, conn) : null,
+    ), op.time_unit,
   );
 }
 
@@ -125,7 +128,8 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
       [flowId, companyId],
     );
     const [steps] = await exec.query(
-      `SELECT s.id, s.seq_no, s.operation_id, s.depends_on, s.resource_type_id, o.name AS operation_name
+      `SELECT s.id, s.seq_no, s.operation_id, s.depends_on, s.resource_type_id,
+              s.params_json, o.name AS operation_name
          FROM fab_operation_flow_steps s
          LEFT JOIN fab_operations o ON o.id = s.operation_id AND o.company_id = s.company_id
         WHERE s.company_id = ? AND s.flow_id = ? AND s.deleted_at IS NULL
@@ -173,7 +177,7 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
       if (Number(s.seq_no) !== Number(t.seq_no)) changes.push(`seq ${t.seq_no}→${s.seq_no}`);
       if (normDeps(s.depends_on) !== normDeps(t.depends_on)) changes.push('dependencies');
       if ((s.resource_type_id ?? null) !== (t.resource_type_id ?? null)) changes.push('resource type');
-      const want = await desiredHours(exec, companyId, s.operation_id, s.resource_type_id, item.id);
+      const want = await desiredHours(exec, companyId, s.operation_id, s.resource_type_id, item.id, s);
       const have = t.computed_hours == null ? null : Number(t.computed_hours);
       if (want != null && (have == null || Math.abs(want - have) > HOURS_EPS)) {
         changes.push(`duration ${have == null ? '—' : have}→${Number(want.toFixed(2))}`);

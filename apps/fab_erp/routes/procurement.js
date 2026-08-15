@@ -25,6 +25,7 @@ import {
 } from '../services/productionOrderService.js';
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
 import { releaseOrderReservations } from '../services/availabilityService.js';
+import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { pool } from '../../../db.js';
 
 const router = Router();
@@ -219,6 +220,32 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
   if (!c) return;
   const orderId = Number(req.params.orderId);
   try {
+    /**
+     * The gate. Raising the order MATERIALIZES the DAG, and materialization is
+     * where every formula is evaluated and frozen onto its task — so a part
+     * missing a value its flow needs does not fail here, it gets a duration
+     * computed from zero. Everything after inherits it: capacity, the critical
+     * chain, the buffer, the promised date. Catching it now costs a dialog;
+     * catching it later means re-materializing an order that has started.
+     *
+     * Refused, not blocked. `{force:true}` proceeds and is the honest escape for
+     * a shop that knows its estimate is rough and wants the tasks anyway — the
+     * same shape as the unresolved-formula save and the output-blocked start.
+     */
+    if (!req.body?.force) {
+      const readiness = await missingFieldsForOrder(c.companyId, orderId);
+      if (readiness.itemsShort > 0 || readiness.unknownFields.length > 0) {
+        return res.status(409).json({
+          code: 'FIELDS_MISSING',
+          message: readiness.itemsShort > 0
+            ? `${readiness.itemsShort} of ${readiness.itemsChecked} part(s) are missing values their operations need. `
+              + 'Their tasks would be estimated as taking no time.'
+            : 'Some operations reference fields that do not exist, so they estimate as zero.',
+          detail: readiness,
+        });
+      }
+    }
+
     const mo = await ensureProductionOrder(c.companyId, orderId, { createdBy: c.user?.id ?? null });
     // rollUpOrderStatus refreshes the production order and then mirrors it onto
     // the sales order — one call keeps both right.

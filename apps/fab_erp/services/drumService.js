@@ -19,6 +19,7 @@ import { logger } from '../../../core/utils/logger.js';
 import {
 } from './taskWaitService.js';
 import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
+import { taskMinutes } from './taskDuration.js';
 
 // ─── capacity fallbacks (documented) ───────────────────────────────────────────
 // When a resource type declares no concurrency / no daily capacity, normalize with
@@ -47,10 +48,11 @@ function toDateTimeStr(d) {
 const CHUNK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 
-// Load minutes of a task: computed_hours × 60, rounded; 0 for null/≤0.
+// Load minutes of a task — per-piece × pieces, via taskDuration. The drum is
+// detected by comparing load against capacity, so undercounting a 20-piece task
+// as one piece could point the constraint at the wrong resource type entirely.
 function taskLoadMinutes(task) {
-  const h = Number(task.computed_hours);
-  return h > 0 ? Math.round(h * 60) : 0;
+  return taskMinutes(task);
 }
 
 /**
@@ -183,7 +185,7 @@ export async function detectDrum(companyId) {
   if (orders.length > 0) {
     const orderIds = orders.map((o) => o.orderId);
     const [tasks] = await pool.query(
-      `SELECT resource_type_id, assigned_resource_id, computed_hours
+      `SELECT resource_type_id, assigned_resource_id, computed_hours, task_qty
          FROM fab_project_tasks
         WHERE company_id = ? AND order_id IN (?)
           AND status NOT IN ('done','cancelled') AND deleted_at IS NULL`,
@@ -338,7 +340,7 @@ export async function sequenceProjects(companyId, drum) {
   // a representative task for calendar resolution.
   const orderIds = projects.map((p) => p.orderId);
   const [drumTasks] = await pool.query(
-    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, status
+    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, task_qty, status
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?)
         AND status <> 'cancelled' AND deleted_at IS NULL

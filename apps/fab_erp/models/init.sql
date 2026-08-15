@@ -3645,3 +3645,209 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='must_finish_by');
 SET @sql = IF(@col=0,'ALTER TABLE fab_orders ADD COLUMN must_finish_by DATE NULL AFTER required_date','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- ITEM FIELD REGISTRY (2026-08-15) — see TM/FAB_ERP_FIELDS_AND_SEQUENCE_PLAN.md
+--
+-- ONE definition table and ONE value store, replacing three overlapping ones.
+--
+-- WHY. `evaluateFormula` read item.* only from fab_item_metric_values, while the
+-- BOQ sheet and the BOM tree wrote fab_items.length/width/height — real columns
+-- nothing mirrored. So on any order built the normal way every item.* resolved
+-- to 0 and a formula collapsed to its constant term: "Cut Plate" fell from 38.8
+-- minutes to 10 on every part regardless of size, silently, because the engine
+-- deliberately defaults unknown symbols to 0 so IF() fallbacks can work.
+--
+-- fab_field_defs is fab_item_metric_defs generalised — that table was already
+-- the only thing in the system carrying BOTH data_type and unit, i.e. it was
+-- the field registry all along, just named "metric" and wired to nothing.
+-- Values move to fab_custom_fields, which already holds per-catalog-item,
+-- per-category and per-stock-piece values.
+--
+-- Additive and idempotent: nothing is dropped here. fab_item_metric_defs /
+-- _values and fab_items.length/width/height stay until Phase 4, so this file
+-- can be re-run and the change abandoned by ignoring the new table.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS fab_field_defs (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  field_key      VARCHAR(100)  NOT NULL,
+  label          VARCHAR(255)  NOT NULL,
+  -- number | integer | text. A text field can never be formula_usable: the
+  -- engine coerces with Number(), so text yields NaN, the try/catch returns
+  -- null, and the task gets a zero-length bar with no error anywhere.
+  data_type      VARCHAR(20)   NOT NULL DEFAULT 'number',
+  unit           VARCHAR(50)   NULL,
+  formula_usable TINYINT(1)    NOT NULL DEFAULT 1,
+  -- Whether the value may differ per physical piece. OFF by default and
+  -- nominated per field: a silent piece-level override would change a task's
+  -- estimate the moment stock was issued, which is either exactly right or
+  -- very surprising depending on the field.
+  piece_varying  TINYINT(1)    NOT NULL DEFAULT 0,
+  default_value  DECIMAL(18,6) NULL,
+  -- Optional taxonomy attachment: which items USUALLY carry this field. A
+  -- convenience for the editor, never a constraint — the authoritative
+  -- required set is derived from the flow's formulas (see itemFieldService).
+  category_id    INT           NULL,
+  group_id       INT           NULL,
+  subgroup_id    INT           NULL,
+  sort_order     INT           NOT NULL DEFAULT 0,
+  active         TINYINT(1)    NOT NULL DEFAULT 1,
+  notes          TEXT          NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_ffd_company (company_id),
+  KEY idx_ffd_key     (company_id, field_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Definitions from the old metric registry. KEYS ARE PRESERVED EXACTLY: every
+-- live formula references item.length_mm / item.weld_length_m / item.thickness_mm
+-- by name, so a renamed key breaks every formula in the company at once.
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, unit, formula_usable, sort_order)
+SELECT d.company_id, d.metric_key, d.metric_label,
+       CASE WHEN d.data_type IN ('text','string') THEN 'text' ELSE 'number' END,
+       d.unit,
+       CASE WHEN d.data_type IN ('text','string') THEN 0 ELSE 1 END,
+       0
+  FROM fab_item_metric_defs d
+ WHERE d.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_field_defs f
+                    WHERE f.company_id = d.company_id AND f.field_key = d.metric_key
+                      AND f.deleted_at IS NULL);
+
+-- The three dimension keys must exist as definitions before their values move,
+-- or migrated values would have no type and no unit.
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, unit, formula_usable, sort_order)
+SELECT co.id, k.field_key, k.label, 'number', 'mm', 1, k.so
+  FROM companies co
+  JOIN (SELECT 'length_mm' AS field_key, 'Length' AS label, 1 AS so
+        UNION ALL SELECT 'width_mm', 'Width', 2
+        UNION ALL SELECT 'thickness_mm', 'Thickness', 3) k
+ WHERE EXISTS (SELECT 1 FROM fab_items i WHERE i.company_id = co.id AND i.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM fab_field_defs f
+                    WHERE f.company_id = co.id AND f.field_key = k.field_key
+                      AND f.deleted_at IS NULL);
+
+-- Definitions for custom-field keys already in use that the registry has never
+-- heard of (23 item-level + 90 stock_piece-level rows in production). Without
+-- this they stay untyped and unitless, which is the state this change exists to
+-- end. Defaulted to text/non-formula: promoting a field to numeric is a
+-- deliberate act, and guessing it would put unvalidated values into estimates.
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, unit, formula_usable, sort_order)
+SELECT c.company_id, c.field_key, c.field_key, 'text', NULL, 0, 100
+  FROM (SELECT DISTINCT company_id, field_key FROM fab_custom_fields WHERE deleted_at IS NULL) c
+ WHERE NOT EXISTS (SELECT 1 FROM fab_field_defs f
+                    WHERE f.company_id = c.company_id AND f.field_key = c.field_key
+                      AND f.deleted_at IS NULL);
+
+-- Values: fab_item_metric_values → fab_custom_fields at level 'order_item'.
+--
+-- 'order_item', NOT 'item'. `level='item'` already means a CATALOG item
+-- (level_id = fab_item_catalog.id) — see the fab_item_config_values migration
+-- earlier in this file. Reusing it for fab_items rows would collide two id
+-- spaces in one column and mix a catalog item's fields with an order item's.
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT v.company_id, 'order_item', v.item_id, v.metric_key, 'number',
+       CAST(v.metric_value AS CHAR), 0
+  FROM fab_item_metric_values v
+ WHERE v.deleted_at IS NULL AND v.metric_value IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields c
+                    WHERE c.company_id = v.company_id AND c.level = 'order_item'
+                      AND c.level_id = v.item_id AND c.field_key = v.metric_key
+                      AND c.deleted_at IS NULL);
+
+-- Values: fab_items.length → length_mm
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT i.company_id, 'order_item', i.id, 'length_mm', 'number', CAST(i.length AS CHAR), 0
+  FROM fab_items i
+ WHERE i.deleted_at IS NULL AND i.length IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields c
+                    WHERE c.company_id = i.company_id AND c.level = 'order_item'
+                      AND c.level_id = i.id AND c.field_key = 'length_mm'
+                      AND c.deleted_at IS NULL);
+
+-- Values: fab_items.width → width_mm
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT i.company_id, 'order_item', i.id, 'width_mm', 'number', CAST(i.width AS CHAR), 0
+  FROM fab_items i
+ WHERE i.deleted_at IS NULL AND i.width IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields c
+                    WHERE c.company_id = i.company_id AND c.level = 'order_item'
+                      AND c.level_id = i.id AND c.field_key = 'width_mm'
+                      AND c.deleted_at IS NULL);
+
+-- Values: fab_items.height → THICKNESS_MM.
+--
+-- NOT height_mm. The BOQ sheet's "Thick" column is declared with key 'height'
+-- (boqSheetService COLS), so fab_items.height holds THICKNESS. Mapping it to a
+-- height_mm field would silently destroy every thickness value in the system
+-- and leave formulas reading 0 for the dimension that decides cutting time.
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT i.company_id, 'order_item', i.id, 'thickness_mm', 'number', CAST(i.height AS CHAR), 0
+  FROM fab_items i
+ WHERE i.deleted_at IS NULL AND i.height IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields c
+                    WHERE c.company_id = i.company_id AND c.level = 'order_item'
+                      AND c.level_id = i.id AND c.field_key = 'thickness_mm'
+                      AND c.deleted_at IS NULL);
+
+-- fab_project_tasks.task_qty (2026-08-15) — how many pieces this task covers.
+--
+-- A time formula is PER PIECE (a shop's cycle time), but nothing multiplied it
+-- by the quantity, so a task covering 20 flanges was estimated as one. And
+-- `item.qty` was not even reachable from a formula: item.* resolves from field
+-- values, so a formula naming it read 0.
+--
+-- SNAPSHOTTED at materialization rather than joined to fab_items.qty at read
+-- time, for the same reason computed_hours is: a BOM quantity edited after the
+-- fact must not silently move the estimate under a plan that has already been
+-- committed and possibly started. Re-materialization is the deliberate path for
+-- picking up a changed quantity.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='task_qty');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_project_tasks ADD COLUMN task_qty DECIMAL(18,4) NULL AFTER computed_hours',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Backfill from the item each task belongs to. NULL is treated as 1 by
+-- taskDuration, so an un-backfilled row keeps exactly its old behaviour.
+UPDATE fab_project_tasks t
+   JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
+    SET t.task_qty = i.qty
+ WHERE t.task_qty IS NULL AND t.deleted_at IS NULL AND i.qty IS NOT NULL;
+
+-- fab_operation_flow_steps.params_json (2026-08-15) — the step.* namespace.
+--
+-- `formulaEngine` has documented a `step.*` namespace since it was written, and
+-- `evaluateFormula` takes a stepValues argument — but every caller passed `{}`
+-- and no table had anywhere to put them, so `step.anything` silently evaluated
+-- to 0. This is the storage.
+--
+-- WHY IT MATTERS. The same operation legitimately behaves differently in
+-- different flows: one flow rolls a plate along its length, another across its
+-- width; one drills a pilot hole, another the full bore. Without a per-step
+-- parameter the only way to express that is to clone the operation, which
+-- multiplies the master data and leaves two "Cut Plate" rows whose formulas
+-- drift apart. A step parameter says it once, on the step that means it.
+--
+-- JSON rather than a child table: these are a handful of scalars read as a unit
+-- every time a task materializes, never queried across steps, and never joined.
+-- A child table would be three more queries per materialize for no gain.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_operation_flow_steps'
+               AND COLUMN_NAME='params_json');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_operation_flow_steps ADD COLUMN params_json JSON NULL AFTER resource_type_id',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
