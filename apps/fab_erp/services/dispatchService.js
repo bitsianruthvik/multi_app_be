@@ -16,7 +16,13 @@
  *     estimate contributes zero until it finishes, and an idle shop reads 0%
  *     while the due date goes past.
  *
- *   fab_orders.priority — free text, user-visible, read by no backend code.
+ *   fab_orders.priority — WAS free text, user-visible and read by no backend
+ *     code, which is documented here because it was a trap: a planner marking an
+ *     order Critical changed nothing anywhere. As of 2026-08-15 it IS read, via
+ *     `orderPriority.compareOrders`, and it is settable from the Planner's
+ *     pre-suggest step. The paragraph below still holds — slack remains the
+ *     signal when nobody has expressed an opinion — but a stated priority now
+ *     outranks it, which is the point of stating one.
  *
  * What is used instead is order-level slack, the one formulation whose inputs
  * survive both re-baselining and re-materialization:
@@ -35,6 +41,7 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import { isOutputBlocked } from './taskGatingService.js';
 import { resolveCapacity, capacityMinutes, isUnbounded } from './capacityService.js';
+import { compareOrders } from './orderPriority.js';
 
 /** Slack for an order we cannot compute one for. Sorts after every real value. */
 const NO_SLACK = Number.POSITIVE_INFINITY;
@@ -208,7 +215,8 @@ export async function computeDispatch(companyId, { limitPerMachine = 5, now = ne
             t.status, t.queued_at AS queuedAt, t.resource_type_id AS resourceTypeId,
             t.assigned_resource_id AS assignedResourceId,
             op.name AS operationName, o.order_number AS orderNumber,
-            o.priority_rank AS priorityRank, o.required_date AS requiredDate,
+            o.priority_rank AS priorityRank, o.priority AS priority,
+            o.must_finish_by AS mustFinishBy, o.required_date AS requiredDate,
             it.name AS itemName
        FROM fab_project_tasks t
        LEFT JOIN fab_operations op ON op.id = t.operation_id
@@ -221,20 +229,18 @@ export async function computeDispatch(companyId, { limitPerMachine = 5, now = ne
   const slackOf = (orderId) => slackByOrder.get(orderId)?.slack ?? NO_SLACK;
 
   /**
-   * Manual rank first, then how much trouble the order is in.
+   * The order's standing first, then the task's own.
    *
-   * priority_rank is a planner's explicit instruction and outranks the
-   * computed signal — that is the point of having it. Orders without one fall
-   * through to slack, so a partially-ranked shop still behaves sensibly.
+   * The order half — manual sequence, then Critical/High/Medium/Low, then the
+   * committed date, then slack — is `orderPriority.compareOrders`, shared with
+   * the Planner's suggestion engine. It used to be a second implementation
+   * living here that ranked on `priority_rank` and slack ALONE, so the two
+   * screens could and did put the same two orders in different sequences, and
+   * neither read the `priority` field a user can actually set.
    */
   const compare = (a, b) => {
-    const ra = a.priorityRank ?? Number.POSITIVE_INFINITY;
-    const rb = b.priorityRank ?? Number.POSITIVE_INFINITY;
-    if (ra !== rb) return ra - rb;
-
-    const sa = slackOf(a.orderId);
-    const sb = slackOf(b.orderId);
-    if (sa !== sb) return sa - sb;                       // least slack first
+    const byOrder = compareOrders(a, b, slackOf);
+    if (byOrder !== 0 && a.orderId !== b.orderId) return byOrder;
 
     const ca = criticalTaskIds.has(a.id) ? 0 : 1;
     const cb = criticalTaskIds.has(b.id) ? 0 : 1;

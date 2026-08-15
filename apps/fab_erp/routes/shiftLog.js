@@ -46,6 +46,7 @@ import { crewForWindow } from '../services/workerService.js';
 import { recomputeForResourceWindow } from '../services/taskAttributionService.js';
 import { onTaskComplete } from '../services/taskEngineService.js';
 import { openOrMoveWipOnStart, finalizeWipOnComplete } from '../services/wipInventoryService.js';
+import { outstandingGatesFor, blockerLabelFor } from '../services/taskGatingService.js';
 
 const router = Router();
 
@@ -111,9 +112,57 @@ router.get('/shift-log', protect, async (req, res) => {
       : [];
     const shiftMinutes = intervals.reduce((a, iv) => a + (iv.end - iv.start) / 60000, 0);
 
-    // Candidate work: anything this machine could plausibly have run that day.
-    // Deliberately wide — the whole point is that the planner's idea of what
-    // should have happened is not what the clipboard says did.
+    /**
+     * What the Production Planner said this machine would do on this date.
+     *
+     * Fetched FIRST and separately so it can drive the ordering of the candidate
+     * list below: the supervisor's most likely answer to "what ran?" is "what we
+     * planned", and it should not be somewhere in the middle of two hundred rows.
+     * A superseded or cancelled bar is not a plan — only `status='planned'`.
+     *
+     * Lanes are resource TYPES and `resource_id` is set only on a pinned bar, so
+     * an unpinned bar counts for every machine of the type. That is the same rule
+     * the planner grid itself renders by.
+     */
+    let plannedIds = [];
+    try {
+      const [rows] = await pool.query(
+        `SELECT DISTINCT pet.task_id AS taskId
+           FROM fab_plan_entry_tasks pet
+           JOIN fab_plan_entries pe ON pe.id = pet.plan_entry_id
+                AND pe.deleted_at IS NULL AND pe.status = 'planned'
+          WHERE pet.company_id = ? AND pet.deleted_at IS NULL
+            AND pe.plan_date = ?
+            AND (pe.resource_id = ? OR (pe.resource_id IS NULL AND pe.resource_type_id = ?))`,
+        [companyId, date, resourceId, resource.resourceTypeId],
+      );
+      plannedIds = rows.map((r) => r.taskId);
+    } catch (err) {
+      // No plan is a normal state, and so is a company that never opened the
+      // Planner. Never let it empty the candidate list.
+      logger.warn({ err, resourceId, date }, 'shift-log: planned-task lookup failed');
+    }
+
+    /**
+     * Candidate work: anything this machine could plausibly have run that day.
+     *
+     * **`blocked` is included.** The engine's idea of what was startable is not
+     * what the clipboard says happened — steel gets cut before the gate clears,
+     * and a supervisor writing up Tuesday cannot be told the job they watched run
+     * does not exist. Excluding blocked was the single biggest reason the task
+     * somebody wanted was not in this list. They are returned flagged, not
+     * silently mixed in, so the screen can say the system had not released them.
+     *
+     * CAPPED, because that widening is not free: `assigned_resource_id IS NULL
+     * AND resource_type_id = ?` matches every unassigned task of the type across
+     * every live order, and a fabrication order alone runs to a thousand items.
+     * The order below is what makes a cap safe — planned first, then this
+     * machine's own work, then the rest — so the rows that get dropped are the
+     * ones nobody was going to pick. `tasksTruncated` says so rather than the
+     * list quietly ending.
+     */
+    const CANDIDATE_LIMIT = 300;
+    const plannedList = plannedIds.length ? plannedIds : [0]; // IN () is a syntax error
     const [tasks] = await pool.query(
       `SELECT t.id, t.status, t.operation_id AS operationId, op.name AS operationName,
               t.item_id AS itemId, it.name AS itemName, it.mark AS itemMark,
@@ -133,12 +182,37 @@ router.get('/shift-log', protect, async (req, res) => {
             OR (t.assigned_resource_id IS NULL AND t.resource_type_id = ?)
           )
           AND (
-            t.status IN ('eligible','in_progress','paused')
+            t.status IN ('blocked','eligible','in_progress','paused')
             OR (t.status = 'done' AND t.completed_at >= ? AND t.completed_at < ?)
           )
-        ORDER BY t.seq_no ASC, t.id ASC`,
-      [companyId, resourceId, resource.resourceTypeId, toSqlUtc(start), toSqlUtc(end)],
+        ORDER BY (t.id IN (?)) DESC,
+                 (t.assigned_resource_id = ?) DESC,
+                 FIELD(t.status, 'in_progress','paused','eligible','done','blocked'),
+                 t.seq_no ASC, t.id ASC
+        LIMIT ?`,
+      [companyId, resourceId, resource.resourceTypeId, toSqlUtc(start), toSqlUtc(end),
+        plannedList, resourceId, CANDIDATE_LIMIT + 1],
     );
+    const tasksTruncated = tasks.length > CANDIDATE_LIMIT;
+    if (tasksTruncated) tasks.length = CANDIDATE_LIMIT;
+
+    /**
+     * For the blocked ones, WHAT is holding them — so "not yet released" is a
+     * fact the supervisor can judge rather than a shrug. Two outstanding-gate
+     * shapes, one grouped query; the process-predecessor case is left to the
+     * generic wording, since resolving it needs the depends_on walk and this is
+     * a label on a dropdown, not an analysis.
+     */
+    const blockedIds = tasks.filter((t) => t.status === 'blocked').map((t) => t.id);
+    const blockerBy = new Map();
+    if (blockedIds.length) {
+      try {
+        const gates = await outstandingGatesFor(companyId, blockedIds);
+        for (const [taskId, gate] of gates) blockerBy.set(taskId, blockerLabelFor(gate));
+      } catch (err) {
+        logger.warn({ err }, 'shift-log: blocker lookup failed');
+      }
+    }
 
     // Which of those already have events on this date — so the screen can say
     // "already logged" instead of quietly inviting a duplicate entry.
@@ -193,7 +267,28 @@ router.get('/shift-log', protect, async (req, res) => {
         minutes: Math.round(shiftMinutes),
         intervals: intervals.map((iv) => ({ start: iv.start, end: iv.end })),
       },
-      tasks: tasks.map((t) => ({ ...t, alreadyLogged: loggedIds.has(t.id) })),
+      /**
+       * `group` is the ONE thing the picker sorts on, decided here rather than
+       * in React so the rule lives next to the queries that produced it.
+       *
+       * `logged` wins over everything — a task already written up for this date
+       * must not also sit at the top under "planned", inviting the duplicate the
+       * whole alreadyLogged flag exists to prevent.
+       */
+      tasks: tasks.map((t) => {
+        const alreadyLogged = loggedIds.has(t.id);
+        const group = alreadyLogged ? 'logged'
+          : plannedIds.includes(t.id) ? 'planned'
+            : t.status === 'blocked' ? 'blocked' : 'open';
+        return {
+          ...t,
+          alreadyLogged,
+          group,
+          planned: plannedIds.includes(t.id),
+          blockedNote: t.status === 'blocked' ? (blockerBy.get(t.id) ?? 'not released yet') : null,
+        };
+      }),
+      tasksTruncated,
       downtime,
       operators: operators.map((o) => ({ ...o, absent: !!Number(o.absent) })),
       // Same 5 built-in defaults the machine board falls back to when a company

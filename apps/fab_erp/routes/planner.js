@@ -23,7 +23,7 @@ import { logger } from '../../../core/utils/logger.js';
 import { suggestPlan } from '../services/planSuggestionService.js';
 import {
   getPlan, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
-  acceptRun, PlanError,
+  acceptRun, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
 
 const router = Router();
@@ -109,6 +109,49 @@ router.get('/plan/backlog', protect, async (req, res) => {
 });
 
 // ─── suggesting ───────────────────────────────────────────────────────────────
+
+/**
+ * GET /plan/orders — the ground rules, before a suggestion is computed.
+ *
+ * The orders a run over this window would be sequencing, in the sequence it
+ * would use, with the two things a planner is allowed to state up front:
+ * how much the order matters, and which date is not up for negotiation.
+ */
+router.get('/plan/orders', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  try {
+    const orders = await getPlanOrders(companyId, {
+      resourceTypeIds: parseIdList(req.query.resourceTypeIds),
+    });
+    return res.json({ ok: true, orders });
+  } catch (err) {
+    logger.error({ err, companyId }, 'plan orders failed');
+    return res.status(500).json({ message: 'Failed to load the orders for planning.' });
+  }
+});
+
+/**
+ * POST /plan/orders — save them. Body `{orders:[{orderId, priority, mustFinishBy}]}`
+ * IN THE SEQUENCE they should run; `priority_rank` is written from that order.
+ */
+router.post('/plan/orders', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+  try {
+    return res.json({ ok: true, ...(await savePlanOrderRules(companyId, req.body?.orders)) });
+  } catch (err) {
+    if (err instanceof PlanError) {
+      return res.status(409).json({ code: err.code, message: err.message, detail: err.detail });
+    }
+    logger.error({ err, companyId }, 'saving plan order rules failed');
+    return res.status(500).json({ message: 'Failed to save the planning rules.' });
+  }
+});
 
 router.get('/plan/suggest', protect, async (req, res) => {
   const user = req.user;

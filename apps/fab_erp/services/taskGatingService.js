@@ -199,6 +199,69 @@ async function inputSatisfiedLive(conn, companyId, input) {
  * matter.
  */
 
+/**
+ * WHAT is holding a set of blocked tasks up, in one grouped query.
+ *
+ * The distinction matters because the two kinds of blocker behave completely
+ * differently when planning:
+ *
+ *   component  an unsatisfied gate naming a PRODUCING ITEM. This is another
+ *              task's output, so `buildEdges` already models it as a DAG edge
+ *              and the planner's own gate reasons about it — plan the producer
+ *              first and this becomes placeable after it.
+ *   material   an unsatisfied gate naming a CATALOG ITEM. Steel off the shelf.
+ *              There is no task to plan first, so nothing about placing work
+ *              can make it available, and the DAG gate cannot see it at all.
+ *
+ * One definition, because three callers ask this question — the planner's
+ * backlog, the planner's placement gate, and the shift log's task picker — and
+ * three copies of "what does blocked mean" is three chances to disagree about
+ * whether a job can be scheduled.
+ *
+ * Reads `satisfied_at IS NULL` rather than re-checking live stock: that stamp is
+ * what the gate sweep maintains and what `tryClearTask` acts on, so anything
+ * else here would answer a different question from the one the engine answers.
+ *
+ * @param {number[]} taskIds
+ * @returns {Promise<Map<number, {material: number, component: number}>>}
+ *          Tasks absent from the map have no outstanding gate.
+ */
+export async function outstandingGatesFor(companyId, taskIds, conn) {
+  const out = new Map();
+  const ids = [...new Set((taskIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return out;
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT ti.task_id AS taskId,
+            SUM(ti.ref_catalog_item_id IS NOT NULL) AS material,
+            SUM(ti.producing_item_id   IS NOT NULL) AS component
+       FROM fab_task_inputs ti
+      WHERE ti.company_id = ? AND ti.task_id IN (?)
+        AND ti.gate = 1 AND ti.satisfied_at IS NULL AND ti.deleted_at IS NULL
+      GROUP BY ti.task_id`,
+    [companyId, ids],
+  );
+  for (const r of rows) {
+    out.set(Number(r.taskId), {
+      material: Number(r.material) || 0,
+      component: Number(r.component) || 0,
+    });
+  }
+  return out;
+}
+
+/** How an outstanding-gate entry reads to a person. Null when nothing is outstanding. */
+export function blockerLabelFor(gate) {
+  if (!gate) return null;
+  if (gate.material && gate.component) return 'waiting on material and an earlier part';
+  if (gate.material) return 'waiting on material';
+  if (gate.component) return 'waiting on an earlier part';
+  return null;
+}
+
+/** True when the task cannot proceed for want of STOCK — the one blocker planning cannot fix. */
+export const isMaterialBlocked = (gate) => !!gate && gate.material > 0;
+
 /** True when all gate=1 inputs for the task are satisfied; stamps satisfied_at as it goes. */
 export async function taskInputsSatisfied(conn, companyId, taskId) {
   const [inputs] = await conn.query(

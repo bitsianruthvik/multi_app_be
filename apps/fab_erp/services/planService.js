@@ -29,6 +29,8 @@
 
 import { pool } from '../../../db.js';
 import { buildEdges } from './resourceLevelingService.js';
+import { outstandingGatesFor, isMaterialBlocked } from './taskGatingService.js';
+import { compareOrders, rankReason, PRIORITY_LEVELS } from './orderPriority.js';
 import {
   resolveCapacityForResource, capacityIntervals, capacityMinutes, isUnbounded,
 } from './capacityService.js';
@@ -298,6 +300,49 @@ export async function getPlan(companyId, { from, to, resourceTypeIds = [] } = {}
 // ─── the DAG gate ─────────────────────────────────────────────────────────────
 
 /**
+ * Refuse work that is waiting on STOCK, however it is placed.
+ *
+ * The distinction this draws is the whole reason `blocked` is plannable at all:
+ *
+ *   blocked on another TASK    plannable. Plan the predecessor, and this goes
+ *                              after it — that is what assertDagAllows checks,
+ *                              and it is the normal way a chain gets laid out.
+ *   blocked on MATERIAL        NOT plannable. There is no activity to schedule
+ *                              it after; the steel is either on the shelf or it
+ *                              is not, and no arrangement of the plan changes
+ *                              that. Committing a date to it would be inventing
+ *                              a promise out of a shortage.
+ *
+ * Deliberately checked SEPARATELY from the DAG gate rather than folded into it:
+ * a material gate is not an edge, `buildEdges` cannot see it, and a task waiting
+ * only on steel has no predecessor at all — so it sails straight through the DAG
+ * gate and would otherwise be freely plannable, which is precisely the hole this
+ * closes.
+ *
+ * The escape hatch is real work, not a flag: receive the material. Stock-in
+ * clears the gate and the task becomes plannable on its own.
+ */
+export async function assertMaterialAvailable(companyId, taskIds) {
+  const [rows] = await pool.query(
+    `SELECT id, status FROM fab_project_tasks
+      WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL AND status = 'blocked'`,
+    [companyId, taskIds],
+  );
+  if (!rows.length) return;
+
+  const gates = await outstandingGatesFor(companyId, rows.map((r) => r.id));
+  for (const [taskId, gate] of gates) {
+    if (!isMaterialBlocked(gate)) continue;
+    throw new PlanError(
+      'AWAITING_MATERIAL',
+      'This task is waiting for raw material, so it cannot be given a date yet. '
+      + 'Receive the material and it becomes plannable.',
+      { taskId: Number(taskId) },
+    );
+  }
+}
+
+/**
  * Refuse a placement that cannot physically happen.
  *
  * For every task going onto the bar, each unfinished predecessor must be either
@@ -492,6 +537,9 @@ export async function createEntry(companyId, input, userId = null) {
     throw new PlanError('TASK_NOT_FOUND', 'One or more tasks are missing, done or cancelled.');
   }
 
+  // Material first: "you cannot schedule this at all" is a more useful answer
+  // than "not before 14:00 Tuesday" on a task that has no steel behind it.
+  await assertMaterialAvailable(companyId, taskIds);
   await assertDagAllows(companyId, taskIds, start);
 
   const totalMinutes = tasks.reduce((n, t) => n + (Number(t.computedHours) || 0) * 60, 0);
@@ -649,6 +697,11 @@ export async function updateEntry(companyId, entryId, patch, userId = null) {
     : new Date(start.getTime() + duration);
 
   if (patch.plannedStart || patch.plannedEnd) {
+    // No assertMaterialAvailable here, deliberately. That gate stops work being
+    // GIVEN a date it cannot hold; a bar that already has one and has since gone
+    // short needs to be moved LATER, and refusing the move would leave the only
+    // sensible response to a shortage unavailable — the planner would have to
+    // delete the bar and lose its history to say "this slipped".
     await assertDagAllows(companyId, taskIds, start, { excludeEntryId: entryId });
   }
 
@@ -822,5 +875,223 @@ export async function getBacklog(companyId, { resourceTypeIds = [], limit = 200 
       LIMIT ?`,
     params,
   );
-  return rows;
+
+  return decorateBlocked(companyId, rows);
+}
+
+/**
+ * The orders a suggestion over this window would actually be sequencing.
+ *
+ * The ground rules a planner sets before pressing Suggest — which order matters,
+ * and which dates are not up for negotiation — are per-ORDER, so the step needs
+ * a list of orders rather than of tasks. Scoped to orders with unplanned,
+ * non-material-blocked work in the window: everything on the list is something
+ * this run could place, and an order with nothing to schedule is noise on a
+ * screen whose job is to be read in ten seconds.
+ *
+ * Returns the current values plus how much work is at stake, so the sequence can
+ * be judged against the size of what it is sequencing.
+ */
+export async function getPlanOrders(companyId, { from, to, resourceTypeIds = [] } = {}) {
+  const params = [companyId];
+  let typeFilter = '';
+  if (resourceTypeIds.length > 0) { typeFilter = ' AND t.resource_type_id IN (?)'; params.push(resourceTypeIds); }
+
+  const [rows] = await pool.query(
+    `SELECT o.id AS orderId, o.order_number AS orderNumber, o.customer_name AS customerName,
+            o.priority, o.priority_rank AS priorityRank,
+            o.must_finish_by AS mustFinishBy, o.required_date AS requiredDate,
+            COUNT(t.id) AS taskCount,
+            COALESCE(SUM(t.computed_hours), 0) AS totalHours
+       FROM fab_project_tasks t
+       JOIN fab_orders o ON o.id = t.order_id AND o.deleted_at IS NULL
+      WHERE t.company_id = ? AND t.deleted_at IS NULL
+        AND t.status IN ('blocked','eligible')
+        AND NOT EXISTS (
+          SELECT 1 FROM fab_plan_entry_tasks et
+           JOIN fab_plan_entries e ON e.id = et.plan_entry_id
+                                 AND e.company_id = et.company_id
+                                 AND e.status = 'planned' AND e.deleted_at IS NULL
+           WHERE et.company_id = t.company_id AND et.task_id = t.id AND et.deleted_at IS NULL
+        )${typeFilter}
+      GROUP BY o.id, o.order_number, o.customer_name, o.priority, o.priority_rank,
+               o.must_finish_by, o.required_date`,
+    params,
+  );
+
+  // Material-blocked work is not schedulable (see assertMaterialAvailable), so
+  // an order whose only remaining work is waiting on steel has nothing at stake
+  // in this run and does not belong on the list.
+  const slackOf = () => Number.POSITIVE_INFINITY;
+  const ordered = rows
+    .map((r) => ({ ...r, taskCount: Number(r.taskCount), totalHours: Number(r.totalHours) }))
+    .sort((a, b) => compareOrders(a, b, slackOf));
+
+  return ordered.map((o) => ({ ...o, rankReason: rankReason(o) }));
+}
+
+/**
+ * Save the ground rules, as one act.
+ *
+ * `must_finish_by` is written here rather than through the generic /mutate path
+ * on purpose: it is a commitment ("this date does not move"), and the generic
+ * writer would let it be set as casually as a note. `priority_rank` is rewritten
+ * from the submitted ORDER of the list, so the sequence a planner arranged is
+ * what gets stored — asking somebody to type rank numbers is asking them to
+ * maintain a sorted list by hand.
+ *
+ * @param {Array<{orderId:number, priority?:string|null, mustFinishBy?:string|null}>} orders
+ *        in the sequence they should run.
+ */
+export async function savePlanOrderRules(companyId, orders) {
+  const rows = (Array.isArray(orders) ? orders : [])
+    .map((o) => ({ ...o, orderId: Number(o.orderId) }))
+    .filter((o) => Number.isFinite(o.orderId));
+  if (!rows.length) return { updated: 0 };
+
+  for (const o of rows) {
+    if (o.priority != null && o.priority !== ''
+        && !PRIORITY_LEVELS.includes(String(o.priority).toLowerCase())) {
+      throw new PlanError('BAD_PRIORITY', `"${o.priority}" is not a priority level.`, { orderId: o.orderId });
+    }
+    if (o.mustFinishBy != null && o.mustFinishBy !== ''
+        && !/^\d{4}-\d{2}-\d{2}$/.test(String(o.mustFinishBy))) {
+      throw new PlanError('BAD_DATE', 'A finish-by date must be YYYY-MM-DD.', { orderId: o.orderId });
+    }
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    let updated = 0;
+    for (const [i, o] of rows.entries()) {
+      const [res] = await conn.query(
+        `UPDATE fab_orders
+            SET priority = ?, priority_rank = ?, must_finish_by = ?
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+        [
+          o.priority ? String(o.priority).toLowerCase() : null,
+          // 1-based: "#1" reads as first. Every order in the list gets one, so a
+          // partially-ranked shop cannot arise from this screen.
+          i + 1,
+          o.mustFinishBy || null,
+          o.orderId, companyId,
+        ],
+      );
+      updated += res.affectedRows > 0 ? 1 : 0;
+    }
+    await conn.commit();
+    return { updated };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * Say WHY each blocked row is blocked, and where it could go.
+ *
+ * The rail used to render the bare word "blocked", which is true and useless:
+ * it does not distinguish the task that becomes plannable the moment you place
+ * its predecessor from the one that cannot be planned at all until steel turns
+ * up, and those need opposite actions. Worse, it read as "you cannot plan this",
+ * so the case the planner is FOR — laying a chain out in order — looked
+ * forbidden.
+ *
+ * Each blocked row comes back with:
+ *   blockedBy      'material' | 'predecessor' | 'both' | null
+ *   plannable      false only for material, which no arrangement of the plan fixes
+ *   waitingFor[]   the predecessors, each with whether it is planned and when it ends
+ *   earliestStart  the latest predecessor end — the first instant this may be
+ *                  placed, so the UI can offer it instead of making somebody
+ *                  discover it by being refused
+ */
+async function decorateBlocked(companyId, rows) {
+  const blocked = rows.filter((r) => r.status === 'blocked');
+  if (!blocked.length) return rows.map((r) => ({ ...r, blockedBy: null, plannable: true }));
+
+  const gates = await outstandingGatesFor(companyId, blocked.map((r) => r.id));
+
+  // Predecessors, resolved per order so an edge to a task outside the backlog is
+  // still found — the blocking task is usually NOT itself in this list.
+  const orderIds = [...new Set(blocked.map((r) => r.orderId).filter((x) => x != null))];
+  const predsByTask = new Map();
+  const byId = new Map();
+  if (orderIds.length) {
+    const [siblings] = await pool.query(
+      `SELECT t.id, t.order_id, t.item_id, t.flow_id, t.seq_no, t.depends_on, t.status,
+              op.name AS operationName, i.name AS itemName
+         FROM fab_project_tasks t
+         LEFT JOIN fab_operations op ON op.id = t.operation_id
+         LEFT JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
+        WHERE t.company_id = ? AND t.order_id IN (?) AND t.deleted_at IS NULL
+          AND t.status <> 'cancelled'`,
+      [companyId, orderIds],
+    );
+    for (const s of siblings) byId.set(s.id, s);
+    const edges = await buildEdges({ companyId, tasks: siblings });
+    for (const e of edges) {
+      if (!predsByTask.has(e.to)) predsByTask.set(e.to, []);
+      predsByTask.get(e.to).push(e.from);
+    }
+  }
+
+  // Where those predecessors currently sit on the plan.
+  const predIds = [...new Set([...predsByTask.values()].flat())];
+  const plannedEnd = new Map();
+  if (predIds.length) {
+    const [pe] = await pool.query(
+      `SELECT et.task_id AS taskId, MAX(e.planned_end) AS plannedEnd
+         FROM fab_plan_entry_tasks et
+         JOIN fab_plan_entries e ON e.id = et.plan_entry_id
+                               AND e.company_id = et.company_id
+                               AND e.status = 'planned' AND e.deleted_at IS NULL
+        WHERE et.company_id = ? AND et.task_id IN (?) AND et.deleted_at IS NULL
+        GROUP BY et.task_id`,
+      [companyId, predIds],
+    );
+    for (const r of pe) plannedEnd.set(Number(r.taskId), new Date(r.plannedEnd));
+  }
+
+  return rows.map((r) => {
+    if (r.status !== 'blocked') return { ...r, blockedBy: null, plannable: true, waitingFor: [] };
+
+    const gate = gates.get(r.id);
+    const material = isMaterialBlocked(gate);
+
+    const waitingFor = (predsByTask.get(r.id) ?? [])
+      .map((pid) => byId.get(pid))
+      .filter((p) => p && p.status !== 'done')
+      .map((p) => {
+        const end = plannedEnd.get(Number(p.id)) ?? null;
+        return {
+          taskId: p.id,
+          seqNo: p.seq_no,
+          operationName: p.operationName ?? null,
+          itemName: p.itemName ?? null,
+          planned: !!end,
+          plannedEnd: end ? end.toISOString() : null,
+        };
+      });
+
+    const unplanned = waitingFor.filter((w) => !w.planned);
+    const ends = waitingFor.map((w) => w.plannedEnd).filter(Boolean);
+
+    return {
+      ...r,
+      blockedBy: material && waitingFor.length ? 'both' : material ? 'material'
+        : waitingFor.length ? 'predecessor' : null,
+      // Only material makes a task unplannable. A predecessor is a thing you
+      // schedule, which is the point.
+      plannable: !material,
+      waitingFor,
+      // Null while any predecessor is still unplanned — there is no earliest
+      // legal instant yet, and inventing one would be a guess.
+      earliestStart: material || unplanned.length || !ends.length
+        ? null
+        : new Date(Math.max(...ends.map((e) => +new Date(e)))).toISOString(),
+    };
+  });
 }

@@ -35,6 +35,8 @@ import { computeOrderSlack } from './dispatchService.js';
 import { isNoCapacity } from './schedulingErrors.js';
 import { zonedYMD } from './plantTime.js';
 import { plannerTimezone } from './planService.js';
+import { outstandingGatesFor, isMaterialBlocked } from './taskGatingService.js';
+import { compareOrders } from './orderPriority.js';
 
 /** Statuses worth planning. `done`/`cancelled` are history; `in_progress` is already happening. */
 const PLANNABLE = new Set(['blocked', 'eligible']);
@@ -64,7 +66,7 @@ async function loadPlanningTasks(companyId) {
             t.computed_hours, t.started_at, t.operation_id,
             i.parent_item_id, i.name AS item_name,
             op.name AS operation_name,
-            o.order_number, o.priority_rank, o.required_date, o.must_finish_by
+            o.order_number, o.priority_rank, o.priority, o.required_date, o.must_finish_by
        FROM fab_project_tasks t
        LEFT JOIN fab_items i     ON i.id = t.item_id AND i.deleted_at IS NULL
        LEFT JOIN fab_operations op ON op.id = t.operation_id
@@ -164,26 +166,18 @@ function buildPriorityMap(tasks, slackByOrder, criticalTaskIds) {
     orders.set(t.order_id, {
       orderId: t.order_id,
       priorityRank: t.priority_rank,
+      priority: t.priority,
       mustFinishBy: t.must_finish_by,
     });
   }
 
   const INF = Number.POSITIVE_INFINITY;
-  const ranked = [...orders.values()].sort((a, b) => {
-    const pa = a.mustFinishBy ? new Date(a.mustFinishBy).getTime() : INF;
-    const pb = b.mustFinishBy ? new Date(b.mustFinishBy).getTime() : INF;
-    if (pa !== pb) return pa - pb;
-
-    const ra = a.priorityRank ?? INF;
-    const rb = b.priorityRank ?? INF;
-    if (ra !== rb) return ra - rb;
-
-    const sa = slackByOrder.get(a.orderId)?.slack ?? INF;
-    const sb = slackByOrder.get(b.orderId)?.slack ?? INF;
-    if (sa !== sb) return sa - sb;
-
-    return a.orderId - b.orderId;
-  });
+  const slackOf = (orderId) => slackByOrder.get(orderId)?.slack ?? INF;
+  // The ordering itself lives in orderPriority.js, shared with dispatchService —
+  // these two used to hold separate compare functions that already disagreed,
+  // and both ignored `fab_orders.priority` entirely. See that file for why the
+  // signals rank the way they do.
+  const ranked = [...orders.values()].sort((a, b) => compareOrders(a, b, slackOf));
 
   const orderRank = new Map(ranked.map((o, i) => [o.orderId, i]));
   const priority = new Map();
@@ -345,9 +339,24 @@ export async function suggestPlan(companyId, {
 
   // Only now narrow to what may actually be SUGGESTED. Everything above had to
   // see the whole graph; only this step is about what the planner is offered.
+  //
+  // Material-blocked work is excluded here for the same reason the manual gate
+  // refuses it (see planService.assertMaterialAvailable): there is no activity
+  // to schedule it after, so a suggested date for it is a promise made out of a
+  // shortage. It must be filtered at the SAME point as the other candidate
+  // rules, not earlier — `levelled` still has to contain it, or a successor
+  // would look like a chain head and get anchored at the start of the window
+  // instead of after the work it depends on.
+  const blockedIds = levelled.filter((t) => t.status === 'blocked').map((t) => t.id);
+  const gates = await outstandingGatesFor(companyId, blockedIds);
+  const materialBlocked = new Set(
+    [...gates.entries()].filter(([, g]) => isMaterialBlocked(g)).map(([id]) => Number(id)),
+  );
+
   const typeFilter = new Set((resourceTypeIds ?? []).map(Number));
   const candidates = levelled.filter((t) => {
     if (!PLANNABLE.has(t.status)) return false;
+    if (materialBlocked.has(Number(t.id))) return false;
     if (plannedIds.has(Number(t.id))) return false;
     if (typeFilter.size > 0 && !typeFilter.has(Number(t.resource_type_id))) return false;
     const span = schedule.get(t.id);
