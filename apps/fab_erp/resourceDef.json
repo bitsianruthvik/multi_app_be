@@ -205,7 +205,18 @@
       "move_time_hrs",
       "scheduling_basis",
       "cost_per_hour",
-      "currency"
+      "currency",
+      "purchase_date",
+      "commissioned_date",
+      "supplier_id",
+      "serial_no",
+      "asset_tag",
+      "warranty_until",
+      "asset_cost",
+      "salvage_value",
+      "useful_life_years",
+      "depreciation_method",
+      "depreciation_rate_pct"
     ],
     "fields": {
       "id": "fr.id",
@@ -236,7 +247,18 @@
       "resourceTypeName": "frt_r.name",
       "resourceTypeCode": "frt_r.code",
       "shiftCalendarName": "fsc_r.name",
-      "shiftCalendarCode": "fsc_r.code"
+      "shiftCalendarCode": "fsc_r.code",
+      "purchaseDate": "fr.purchase_date",
+      "commissionedDate": "fr.commissioned_date",
+      "supplierId": "fr.supplier_id",
+      "serialNo": "fr.serial_no",
+      "assetTag": "fr.asset_tag",
+      "warrantyUntil": "fr.warranty_until",
+      "assetCost": "fr.asset_cost",
+      "salvageValue": "fr.salvage_value",
+      "usefulLifeYears": "fr.useful_life_years",
+      "depreciationMethod": "fr.depreciation_method",
+      "depreciationRatePct": "fr.depreciation_rate_pct"
     },
     "fieldTypes": {
       "id": "integer",
@@ -267,7 +289,18 @@
       "resourceTypeName": "string",
       "resourceTypeCode": "string",
       "shiftCalendarName": "string",
-      "shiftCalendarCode": "string"
+      "shiftCalendarCode": "string",
+      "purchaseDate": "date",
+      "commissionedDate": "date",
+      "supplierId": "integer",
+      "serialNo": "string",
+      "assetTag": "string",
+      "warrantyUntil": "date",
+      "assetCost": "decimal",
+      "salvageValue": "decimal",
+      "usefulLifeYears": "decimal",
+      "depreciationMethod": "string",
+      "depreciationRatePct": "decimal"
     },
     "relations": {
       "plant": {

@@ -102,6 +102,35 @@ router.get('/pulse', protect, async (req, res) => {
 
   // ── Exception feed — each row must be actionable and link somewhere ──────
   const exceptionQueries = [
+    /**
+     * Maintenance that is due or overdue.
+     *
+     * The whole point of recording a service interval is being told before the
+     * date, not after, so the window is `next_due_at <= today + lead_days` —
+     * `lead_days` is per plan because a filter change and a gearbox rebuild
+     * need different notice.
+     *
+     * Machines already in maintenance are excluded: somebody is standing at
+     * that machine with a spanner, and an alert telling them to start a job
+     * they are doing is noise. `fab_maintenance_logs` with no `completed_at`
+     * is what "in maintenance right now" means.
+     */
+    ['maintenanceDue',
+      `SELECT p.id AS planId, p.resource_id AS resourceId, r.name AS resourceName,
+              p.name AS planName, p.next_due_at AS nextDueAt,
+              DATEDIFF(CURDATE(), p.next_due_at) AS daysLate
+       FROM fab_maintenance_plans p
+       JOIN fab_resources r ON r.id = p.resource_id AND r.deleted_at IS NULL
+       WHERE p.company_id=? AND p.deleted_at IS NULL AND p.active=1
+         AND p.next_due_at IS NOT NULL
+         AND p.next_due_at <= DATE_ADD(CURDATE(), INTERVAL COALESCE(p.lead_days,0) DAY)
+         AND NOT EXISTS (
+           SELECT 1 FROM fab_maintenance_logs l
+            WHERE l.company_id = p.company_id AND l.resource_id = p.resource_id
+              AND l.completed_at IS NULL AND l.deleted_at IS NULL)
+       ORDER BY p.next_due_at ASC LIMIT ${EXCEPTION_LIMIT}`,
+      [companyId]],
+
     ['overdueOrders',
       `SELECT id, order_number AS orderNumber, status, required_date AS requiredDate,
               DATEDIFF(CURDATE(), required_date) AS daysLate

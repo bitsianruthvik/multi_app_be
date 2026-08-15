@@ -3886,3 +3886,141 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- constant inside time_formula; writing a setup_minutes now would charge it
 -- twice. Moving a constant out of a formula is a per-operation judgement (which
 -- part of "10 + x" is setup?), so it is left to whoever edits the operation.
+
+-- ── Machine asset register + planned maintenance (2026-08-16) ───────────────
+--
+-- A resource was a capacity figure and nothing else: what it can do per day,
+-- what it costs per hour. It is also a thing somebody bought on a date for an
+-- amount, that wears out, and that has to be stopped periodically to be looked
+-- after. None of that was recordable, so "when was this last serviced" and
+-- "what is it worth" lived in somebody's head or a spreadsheet.
+--
+-- WHY THE ASSET FIELDS ARE ON THE RESOURCE, NOT THE TYPE. A resource TYPE is a
+-- class ("CNC Plate Cutting") — it has no purchase date, because three tables
+-- of the same type were bought in different years for different money. Every
+-- one of these is a fact about one physical machine.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resources' AND COLUMN_NAME='purchase_date');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_resources
+     ADD COLUMN purchase_date        DATE          NULL,
+     ADD COLUMN commissioned_date    DATE          NULL,
+     ADD COLUMN supplier_id          INT           NULL,
+     ADD COLUMN serial_no            VARCHAR(120)  NULL,
+     ADD COLUMN asset_tag            VARCHAR(60)   NULL,
+     ADD COLUMN warranty_until       DATE          NULL,
+     ADD COLUMN asset_cost           DECIMAL(18,2) NULL,
+     ADD COLUMN salvage_value        DECIMAL(18,2) NULL,
+     ADD COLUMN useful_life_years    DECIMAL(6,2)  NULL,
+     ADD COLUMN depreciation_method  VARCHAR(20)   NULL,
+     ADD COLUMN depreciation_rate_pct DECIMAL(6,3) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- `currency` already exists on fab_resources (it carried cost_per_hour) and is
+-- reused for asset_cost rather than adding a second one — two currency columns
+-- on one row is an invitation to set them differently.
+--
+-- ACCUMULATED DEPRECIATION IS DELIBERATELY NOT A COLUMN. It is a pure function
+-- of cost, method, life, salvage and elapsed time, so storing it means storing
+-- something that is wrong every day after it is written and that can disagree
+-- with the inputs sitting beside it. It is computed on read — see
+-- services/assetService.js.
+
+-- ── Maintenance plans: what has to be done, how often ───────────────────────
+--
+-- Calendar-based on purpose. Runtime-based ("every 500 running hours") is the
+-- other real model and the event data to support it exists, but a shop that
+-- cannot yet say when a machine was last greased is not helped by a second
+-- trigger type it also cannot populate. `frequency_days` is the whole rule.
+--
+-- ON THE RESOURCE, NOT THE TYPE. The interval is often a type-level convention
+-- ("grease every plasma table monthly") but the DUE DATE is per machine, and
+-- the due date is the only thing anybody acts on.
+CREATE TABLE IF NOT EXISTS fab_maintenance_plans (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT NOT NULL,
+  resource_id     INT NOT NULL,
+  name            VARCHAR(160) NOT NULL,
+  -- The interval. NOT NULL because a plan with no interval is a note, not a plan.
+  frequency_days  INT NOT NULL,
+  -- How many days before it is due to start warning. Zero = warn on the day.
+  lead_days       INT NOT NULL DEFAULT 7,
+  last_done_at    DATE NULL,
+  -- Derived (last_done_at + frequency_days) but STORED, because it is what
+  -- every due-list query filters and sorts on, and recomputing it per row per
+  -- query to answer "what is due this week" across a shop is a scan.
+  -- maintenanceService is the only writer.
+  next_due_at     DATE NULL,
+  active          TINYINT(1) NOT NULL DEFAULT 1,
+  notes           TEXT NULL,
+  deleted_at      DATETIME NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_mp_company_resource (company_id, resource_id),
+  INDEX idx_mp_due (company_id, next_due_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── Maintenance logs: what was actually done, and when ──────────────────────
+--
+-- One row per occurrence. `plan_id` is nullable because a breakdown repair is
+-- maintenance too and does not belong to a cycle — refusing to record it would
+-- push exactly the events worth knowing about back into somebody's head.
+--
+-- An open row (completed_at IS NULL) is what "this machine is in maintenance"
+-- means. The machine's `down` state is written to fab_resource_events at the
+-- same moment, so the planner and the machine board see it without knowing this
+-- table exists — but this table is the record of WHY.
+CREATE TABLE IF NOT EXISTS fab_maintenance_logs (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT NOT NULL,
+  resource_id     INT NOT NULL,
+  plan_id         INT NULL,
+  -- What it was due on when it was started, copied not joined: a plan's
+  -- next_due_at moves the moment this completes, and the history has to keep
+  -- saying whether this one was late.
+  due_at          DATE NULL,
+  started_at      DATETIME NOT NULL,
+  completed_at    DATETIME NULL,
+  started_by      INT NULL,
+  completed_by    INT NULL,
+  -- Filled on completion from started_at..completed_at. Stored because the
+  -- machine may be deleted or its events pruned, and "how long were we down
+  -- for maintenance last year" has to survive that.
+  downtime_minutes INT NULL,
+  notes           TEXT NULL,
+  deleted_at      DATETIME NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_ml_company_resource (company_id, resource_id),
+  INDEX idx_ml_open (company_id, resource_id, completed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── Purchase orders raised FOR a machine or a machine type (2026-08-16) ─────
+--
+-- Two new reasons to buy something, neither of which is a sales order:
+--   spare parts for a specific machine   -> for_resource_id
+--   a new machine of a given type        -> for_resource_type_id
+--
+-- On the PO header rather than a join table because a purchase order is raised
+-- for exactly one of these, and the question people ask is "what have we spent
+-- on this machine" — which is a filter on the header, not a graph walk.
+--
+-- `source_order_id` already links a PO to the SALES order that caused it; these
+-- are the same idea for the other two causes, kept as separate columns so a
+-- query never has to guess which kind of id it is looking at.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='for_resource_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_orders
+     ADD COLUMN for_resource_id      INT NULL,
+     ADD COLUMN for_resource_type_id INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='idx_fo_for_resource');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_orders ADD KEY idx_fo_for_resource (company_id, for_resource_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
