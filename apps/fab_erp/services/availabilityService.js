@@ -138,3 +138,74 @@ export async function releaseOrderReservations(conn, companyId, orderId) {
   );
   return r?.affectedRows ?? 0;
 }
+
+/**
+ * The same question, asked about a SPECIFIC PLATE SIZE.
+ *
+ * `availabilityFor` matches on catalog item alone, which is the bug this exists
+ * to fix: a 2000x1000 offcut of 20mm plate fully "covered" a nest that needs a
+ * 12000x2500 sheet of 20mm plate, because both are catalog item #N and `qty`
+ * counts pieces. The order then went into production against material that
+ * cannot produce it.
+ *
+ * Thickness is not compared here because it is not a property of the piece —
+ * a "MS Plate 20mm" catalog row IS 20mm, so matching the catalog item has
+ * already matched the thickness. Length and width are per piece, and those are
+ * what `fab_stock_pieces.length_mm` / `width_mm` hold.
+ *
+ * UNSIZED STOCK IS COUNTED SEPARATELY, NEVER AS A MATCH. Those columns have
+ * existed for a while and nothing ever populated them, so most pieces have NULL
+ * on both. A NULL is not evidence that the plate is the right size, so it
+ * cannot be allowed to satisfy a sized requirement — but silently ignoring it
+ * would tell somebody to buy plate that may well be sitting in the yard. It is
+ * returned as `unsized` so the screen can say exactly that.
+ *
+ * @param {{catalogItemId:number, length:number|null, width:number|null}[]} specs
+ * @returns {Promise<Map<string, {onHand:number, unsized:number}>>} keyed by sizeKey()
+ */
+export const sizeKey = (catalogItemId, length, width) =>
+  `${Number(catalogItemId)}|${length == null ? '' : Number(length)}|${width == null ? '' : Number(width)}`;
+
+export async function availabilityBySize(companyId, specs, opts = {}) {
+  const { conn = null } = opts;
+  const exec = conn ?? pool;
+  const out = new Map();
+  const list = (specs || []).filter((s) => Number.isFinite(Number(s?.catalogItemId)));
+  if (!list.length) return out;
+
+  const ids = [...new Set(list.map((s) => Number(s.catalogItemId)))];
+  const placeholders = ids.map(() => '?').join(',');
+
+  // Every in-stock piece of these items, with whatever size it carries.
+  const [pieces] = await exec.query(
+    `SELECT catalog_item_id, length_mm, width_mm, COALESCE(SUM(qty), 0) AS on_hand
+       FROM fab_stock_pieces
+      WHERE company_id = ? AND deleted_at IS NULL AND status = 'in_stock'
+        AND catalog_item_id IN (${placeholders})
+      GROUP BY catalog_item_id, length_mm, width_mm`,
+    [companyId, ...ids],
+  );
+
+  const exactBy = new Map();     // sizeKey -> qty
+  const unsizedBy = new Map();   // catalogItemId -> qty of pieces with no size recorded
+  for (const p of pieces) {
+    const id = Number(p.catalog_item_id);
+    const qty = Number(p.on_hand) || 0;
+    if (p.length_mm == null && p.width_mm == null) {
+      unsizedBy.set(id, (unsizedBy.get(id) || 0) + qty);
+      continue;
+    }
+    const k = sizeKey(id, p.length_mm, p.width_mm);
+    exactBy.set(k, (exactBy.get(k) || 0) + qty);
+  }
+
+  for (const s of list) {
+    const id = Number(s.catalogItemId);
+    const k = sizeKey(id, s.length, s.width);
+    out.set(k, {
+      onHand: exactBy.get(k) || 0,
+      unsized: unsizedBy.get(id) || 0,
+    });
+  }
+  return out;
+}

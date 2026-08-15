@@ -28,6 +28,7 @@ import {
   exportBoqHandler,
   importBoqHandler,
   boqWizardHandler,
+  applyBoqWizardHandler,
   exportNestingHandler,
   importNestingHandler,
   flowSummaryHandler,
@@ -57,6 +58,10 @@ router.post('/orders/:orderId/items/recompute-weights', protect, requirePerm('fa
 // ── BOQ: one sheet, four level-code columns (2026-08) ──────────────────────
 router.get('/orders/:orderId/boq/export', protect, requirePerm('fab_erp_projects_manage'), exportBoqHandler);
 router.post('/orders/:orderId/boq/wizard', protect, requirePerm('fab_erp_projects_manage'), boqWizardHandler);
+// Same body as /boq/wizard, but SAVES the generated structure instead of
+// returning a spreadsheet — so a structure that needs no editing does not have
+// to round-trip through Excel just to exist on the order.
+router.post('/orders/:orderId/boq/wizard/apply', protect, requirePerm('fab_erp_projects_manage'), applyBoqWizardHandler);
 router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importBoqHandler);
 
 // ── Nesting: stage 2, its own document (2026-08) ───────────────────────────

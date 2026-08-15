@@ -1,7 +1,9 @@
 import { exportOrderItemsTemplate, importOrderItemsExcel } from '../services/orderItemsImportService.js';
 import { recomputeOrderWeights } from '../services/itemWeightService.js';
 import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeService.js';
-import { exportBoqSheet, importBoqSheet, buildWizardRows } from '../services/boqSheetService.js';
+import {
+  exportBoqSheet, importBoqSheet, buildWizardRows, applyWizardRows,
+} from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
@@ -110,6 +112,34 @@ export const boqWizardHandler = async (req, res) => {
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: boqWizard failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/**
+ * POST — accept the wizard's structure straight onto the order.
+ *
+ * Same body as `/boq/wizard` (`{ specs: [...] }`), plus an optional `mode`.
+ * That endpoint returns a spreadsheet and saves nothing; this one saves, so a
+ * generated structure that needs no editing does not have to make a round trip
+ * through Excel and back just to exist.
+ *
+ * Returns the import result plus fresh readiness, exactly like the upload path,
+ * so the step rail is correct the instant it lands.
+ */
+export const applyBoqWizardHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    await assertOrder(cid, orderId);
+    const body = req.body ?? {};
+    const specs = Array.isArray(body.specs) && body.specs.length ? body.specs : [body];
+    const mode = body.mode === 'replace' ? 'replace' : 'append';
+    const result = await applyWizardRows(cid, orderId, specs, mode);
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: applyBoqWizard failed');
     res.status(500).json({ message: err.message });
   }
 };

@@ -100,6 +100,7 @@ export async function exportNestingSheet(companyId, orderId) {
   // Everything already nested on this order, read back grouped by plate.
   const [links] = await pool.query(
     `SELECT rm.nest_no, rm.qty, rm.length, rm.width, rm.height,
+            fic.thickness_mm AS rm_thickness,
             fic.code AS rm_code, parent.code AS part_code
        FROM fab_items rm
        JOIN fab_items parent ON parent.id = rm.parent_item_id AND parent.deleted_at IS NULL
@@ -117,7 +118,11 @@ export async function exportNestingSheet(companyId, orderId) {
     if (!byNest.has(k)) {
       byNest.set(k, {
         nestNo: l.nest_no ?? '', rmCode: l.rm_code,
-        height: l.height, length: l.length, width: l.width,
+        // Thickness defaults to the catalog item's own — a "20mm plate" row is
+        // its thickness, so exporting a blank Thick column asked the user to
+        // retype something the catalog already knew (and to get it right).
+        height: l.height ?? l.rm_thickness,
+        length: l.length, width: l.width,
         plates: l.qty, parts: [],
       });
     }

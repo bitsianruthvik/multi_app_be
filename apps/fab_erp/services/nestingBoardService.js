@@ -51,6 +51,9 @@ export async function nestingBoard(companyId, orderId) {
             fic.code         AS materialCode,
             fic.name         AS materialName,
             fic.unit         AS materialUnit,
+            -- The catalog's own thickness, so a nest can default to it rather
+            -- than making somebody retype a number the catalog already knows.
+            fic.thickness_mm AS materialThickness,
             p.id             AS partId,
             p.code           AS partCode,
             p.name           AS partName,
@@ -121,7 +124,15 @@ export async function nestingBoard(companyId, orderId) {
         materialCode: l.materialCode,
         materialName: l.materialName,
         // The PLATE's size, carried on every link cut from it.
-        length: num(l.length), width: num(l.width), thick: num(l.height),
+        //
+        // Thickness falls back to the catalog item's own `thickness_mm`. A
+        // "20mm plate" catalog row IS its thickness, so a nest drawn from it
+        // can only be 20mm — asking somebody to retype that on every nest was
+        // busywork that also invited a typo the rest of the system would then
+        // trust. An explicit value on the link still wins, so a nest that was
+        // deliberately set to something else is never overwritten.
+        length: num(l.length), width: num(l.width),
+        thick: num(l.height) ?? num(l.materialThickness),
         plates: l.plates != null ? Number(l.plates) : 1,
         issued: issuedKeys.has(k),
         parts: [],

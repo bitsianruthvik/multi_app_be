@@ -114,6 +114,16 @@ export async function receiveStock(companyId, input, outerConn = null) {
       const heatNo = piece.heat_no ?? null;
       const serialNo = piece.serial_no ?? null;
       const markNo = piece.mark_no ?? null;
+      // Accepts either casing: the GRN dialog posts camelCase, the bulk
+      // stock-in sheet snake_case, and a size silently dropped because of the
+      // wrong key would be indistinguishable from one nobody entered.
+      const numOrNull = (v) => {
+        if (v === '' || v == null) return null;
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      };
+      const lengthMm = numOrNull(piece.length_mm ?? piece.lengthMm);
+      const widthMm = numOrNull(piece.width_mm ?? piece.widthMm);
 
       // Issued on THIS connection so the number and the row it names are one
       // atomic act: a rolled-back receipt must not leave a hole in the
@@ -124,12 +134,20 @@ export async function receiveStock(companyId, input, outerConn = null) {
         `INSERT INTO fab_stock_pieces
            (company_id, code, catalog_item_id, plant_id, stock_location_id,
             batch_no, heat_no, serial_no, mark_no, qty, uom, unit_cost,
+            length_mm, width_mm,
             status, received_date, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
         [
           companyId, code,
           catalogItemId, plantId, stockLocationId,
           batchNo, heatNo, serialNo, markNo, qty, resolvedUom, unitCost,
+          // The PIECE's size. These columns have existed since the stock-piece
+          // redesign and nothing ever wrote them, so every row was NULL — which
+          // is why procurement could only ever match on catalog item and a
+          // 2000x1000 offcut "covered" a 12000x2500 nest. Thickness is not here
+          // on purpose: a "20mm plate" catalog item IS its thickness, so the
+          // catalog link already carries it.
+          lengthMm, widthMm,
           // received_date drives FIFO in wipInventoryService.consumeStock, where
           // NULL sorts last — a piece received with no date would be consumed
           // after everything else regardless of when it actually arrived.

@@ -28,7 +28,7 @@
  */
 
 import { pool } from '../../../db.js';
-import { availabilityFor } from './availabilityService.js';
+import { availabilityFor, availabilityBySize, sizeKey } from './availabilityService.js';
 
 /** The answer for a node with no catalog link, and the fallback for an unset one. */
 export const DEFAULT_PROCUREMENT = 'make';
@@ -114,6 +114,25 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
     [companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
+  // The same buy side broken down by the PLATE SIZE each row asks for.
+  //
+  // The grouping above collapses every nest of an item into one number, so ten
+  // nests of ten different sizes read as "10 of catalog item N" and any ten
+  // pieces of it look like enough. The sizes are what nesting decided
+  // (fab_items.length/width and `height` = thickness on the material link), and
+  // they are the thing that has to be matched against the yard.
+  const [buySizes] = await exec.query(
+    `SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
+            COUNT(*) AS lines_count, SUM(fi.qty) AS qty
+       FROM fab_items fi
+      WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+        AND COALESCE(fi.procurement_type, ?) = 'buy'
+        AND fi.catalog_item_id IS NOT NULL
+      GROUP BY fi.catalog_item_id, fi.length, fi.width, fi.height
+      ORDER BY fi.catalog_item_id, fi.length, fi.width`,
+    [companyId, orderId, DEFAULT_PROCUREMENT],
+  );
+
   const [make] = await exec.query(
     `SELECT fi.id, fi.parent_item_id, fi.code, fi.name, fi.level_kind, fi.qty,
             fi.unit, fi.flow_id, fi.total_weight
@@ -124,7 +143,7 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
     [companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
-  return { buy, make };
+  return { buy, buySizes, make };
 }
 
 /**
@@ -149,7 +168,7 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
  * @returns {Promise<{lines: object[], unmatched: object[], shortCount: number}>}
  */
 export async function orderShortfall(companyId, orderId, conn) {
-  const { buy } = await orderProcurementSplit(companyId, orderId, conn);
+  const { buy, buySizes } = await orderProcurementSplit(companyId, orderId, conn);
 
   const unmatched = buy.filter((r) => r.catalog_item_id == null);
   const matched = buy.filter((r) => r.catalog_item_id != null);
@@ -158,10 +177,65 @@ export async function orderShortfall(companyId, orderId, conn) {
     companyId, matched.map((r) => r.catalog_item_id), { forOrderId: orderId, conn },
   );
 
+  // Size-aware availability for every distinct plate size the order asks for.
+  const sizeAvail = await availabilityBySize(
+    companyId,
+    (buySizes || []).map((r) => ({
+      catalogItemId: r.catalog_item_id, length: r.length, width: r.width,
+    })),
+    { conn },
+  );
+
+  const sizesByItem = new Map();
+  for (const r of buySizes || []) {
+    const id = Number(r.catalog_item_id);
+    const a = sizeAvail.get(sizeKey(id, r.length, r.width)) || { onHand: 0, unsized: 0 };
+    const required = Number(r.qty) || 0;
+    // A row with no size recorded cannot be size-matched — there is nothing to
+    // compare — so it falls back to the catalog-level answer further down.
+    const sized = r.length != null || r.width != null;
+    const row = {
+      thick: r.height == null ? null : Number(r.height),
+      length: r.length == null ? null : Number(r.length),
+      width: r.width == null ? null : Number(r.width),
+      required,
+      onHand: a.onHand,
+      unsized: a.unsized,
+      sized,
+      short: sized ? Math.max(0, required - a.onHand) : null,
+    };
+    if (!sizesByItem.has(id)) sizesByItem.set(id, []);
+    sizesByItem.get(id).push(row);
+  }
+
   const lines = matched.map((r) => {
     const id = Number(r.catalog_item_id);
     const a = avail.get(id) || { onHand: 0, reserved: 0, available: 0 };
     const required = Number(r.qty) || 0;
+    const sizes = sizesByItem.get(id) ?? [];
+
+    /**
+     * Shortfall, size by size where a size is known.
+     *
+     * Rows whose plate size was never filled in still fall back to the
+     * catalog-level comparison, so an order that has not been nested yet
+     * behaves exactly as it did before rather than suddenly reading as
+     * entirely short.
+     *
+     * Reservations stay a catalog-level figure and are NOT netted off a
+     * specific size: a reservation records "this order has claimed N of item X"
+     * and cannot say which physical plate, so attributing it to one size would
+     * be inventing information. It is reported on the line for context.
+     */
+    const sizedRows = sizes.filter((s) => s.sized);
+    const unsizedRequired = sizes.filter((s) => !s.sized)
+      .reduce((n, s) => n + s.required, 0);
+    const sizedShort = sizedRows.reduce((n, s) => n + (s.short || 0), 0);
+    const unsizedShort = Math.max(0, unsizedRequired - a.available);
+    const short = sizedRows.length
+      ? sizedShort + unsizedShort
+      : Math.max(0, required - a.available);
+
     return {
       catalogItemId: id,
       code: r.code,
@@ -172,7 +246,10 @@ export async function orderShortfall(companyId, orderId, conn) {
       onHand: a.onHand,
       reserved: a.reserved,
       available: a.available,
-      short: Math.max(0, required - a.available),
+      short,
+      sizes,
+      /** Pieces of this item in stock whose size nobody recorded. */
+      unsizedOnHand: sizes.reduce((n, s) => Math.max(n, s.unsized), 0),
     };
   }).sort((x, y) => (y.short - x.short) || String(x.code || '').localeCompare(String(y.code || '')));
 

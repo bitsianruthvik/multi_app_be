@@ -39,6 +39,8 @@
  */
 
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
@@ -768,4 +770,56 @@ async function buildReport(rowLog) {
     ws.lastRow.eachCell((c) => { c.fill = fill; });
   }
   return wb.xlsx.writeBuffer();
+}
+
+/**
+ * Accept a wizard-generated structure straight onto the order.
+ *
+ * The Structure wizard used to be download-only: it built the rows, handed back
+ * a spreadsheet, and its own dialog said "nothing is saved to the order". The
+ * only way to actually get that structure onto the order was to save the file
+ * and upload it again — so a round-trip through Excel was mandatory even when
+ * the generated structure was exactly what was wanted and nothing needed
+ * editing.
+ *
+ * WHY THIS GOES THROUGH THE SHEET RATHER THAN STRAIGHT TO SQL. The obvious
+ * implementation is to persist `buildWizardRows` output directly. That would
+ * mean a SECOND path into fab_items with its own idea of code composition,
+ * parent resolution, level_kind, material links, weight roll-up and the
+ * replace-safety check — and the moment the two disagreed, "accept" and
+ * "download then upload" would produce different trees from identical input.
+ * That is the bug this feature would be most likely to cause, so instead the
+ * rows are rendered with the same exporter and read back with the same
+ * importer. Accept IS download-and-upload, with the human round-trip removed,
+ * and it cannot drift from it because it is the same code.
+ *
+ * The temporary file is what `importBoqSheet` takes (it is fed by multer
+ * normally) and it unlinks the file itself; the finally block only covers the
+ * case where parsing threw before it got that far.
+ */
+let wizardTmpSeq = 0;
+
+export async function applyWizardRows(companyId, orderId, specs, mode = 'append') {
+  const list = Array.isArray(specs) && specs.length ? specs : [{}];
+  const rows = list.flatMap((s) => buildWizardRows(s ?? {}));
+  if (!rows.length) {
+    return {
+      mode, itemsCreated: 0, levelsCreated: 0, itemsSkipped: 0, itemsDeleted: 0,
+      rmLinks: 0, totalWeight: null, unweighedLeaves: 0,
+      warnings: [{ message: 'The wizard produced no rows — nothing was saved.' }],
+    };
+  }
+
+  const buffer = await exportBoqSheet(companyId, orderId, rows);
+  wizardTmpSeq += 1;
+  const tmp = path.join(
+    os.tmpdir(),
+    `fab-boq-wizard-${companyId}-${orderId}-${process.pid}-${wizardTmpSeq}.xlsx`,
+  );
+  await fs.promises.writeFile(tmp, Buffer.from(buffer));
+  try {
+    return await importBoqSheet({ path: tmp }, companyId, orderId, mode);
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* already gone */ }
+  }
 }

@@ -427,16 +427,54 @@ async function countLines(companyId, orderId) {
   return { total: Number(row?.total) || 0, withoutType: Number(row?.withoutType) || 0 };
 }
 
+/**
+ * What the order's structure contains.
+ *
+ * `level_kind` is only stamped by the Excel importer. A structure built by hand
+ * in the tree left it NULL on every row, and this used to filter on
+ * `level_kind IS NOT NULL` — so the stage reported "No structure entered" no
+ * matter how much had been typed, the step never went green, and because
+ * `preparationComplete` requires every stage done, Confirm stayed disabled too.
+ * The only way through was to download the sheet and upload it back, which is
+ * why the Excel round-trip felt mandatory rather than optional.
+ *
+ * So rows with no `level_kind` are now classified by SHAPE instead: a row with
+ * no children is a part (it is the thing that gets made), a row with children
+ * is structure above it. That is the same distinction the importer's labels
+ * encode, derived from the tree rather than from who created the row, so it is
+ * right for hand-built, imported, and half-and-half orders alike — including
+ * the ones already sitting in the database with NULL on every row.
+ *
+ * Raw-material links are excluded throughout. They are children of a part, not
+ * a level of the structure, and counting them would report every part twice.
+ */
 async function countTree(companyId, orderId) {
   const [rows] = await pool.query(
-    `SELECT level_kind, COUNT(*) AS n
-       FROM fab_items
-      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL AND level_kind IS NOT NULL
-      GROUP BY level_kind`,
+    `SELECT fi.id, fi.level_kind,
+            EXISTS (SELECT 1 FROM fab_items c
+                     WHERE c.parent_item_id = fi.id AND c.deleted_at IS NULL
+                       AND c.catalog_item_id IS NULL) AS has_children
+       FROM fab_items fi
+      WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+        -- not a raw-material link: those hang under a part
+        AND NOT (fi.catalog_item_id IS NOT NULL AND fi.flow_id IS NULL)`,
     [companyId, orderId],
   );
-  const by = Object.fromEntries(rows.map((r) => [r.level_kind, Number(r.n) || 0]));
-  const spans = by.span ?? 0, girders = by.girder ?? 0, segments = by.segment ?? 0, parts = by.part ?? 0;
+
+  let spans = 0, girders = 0, segments = 0, parts = 0;
+  for (const r of rows) {
+    if (r.level_kind === 'material') continue;
+    if (r.level_kind) {
+      if (r.level_kind === 'span') spans++;
+      else if (r.level_kind === 'girder') girders++;
+      else if (r.level_kind === 'segment') segments++;
+      else if (r.level_kind === 'part') parts++;
+      continue;
+    }
+    // Unlabelled: a leaf is the thing that gets made.
+    if (Number(r.has_children) === 0) parts++;
+    else segments++;
+  }
   return { spans, girders, segments, parts, total: spans + girders + segments + parts };
 }
 
