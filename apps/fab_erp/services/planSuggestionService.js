@@ -64,7 +64,7 @@ async function loadPlanningTasks(companyId) {
   const [rows] = await pool.query(
     `SELECT t.id, t.order_id, t.item_id, t.flow_id, t.seq_no, t.depends_on,
             t.resource_type_id, t.assigned_resource_id, t.status,
-            t.computed_hours, t.task_qty, t.started_at, t.operation_id,
+            t.computed_hours, t.setup_hours, t.task_qty, t.started_at, t.operation_id,
             i.parent_item_id, i.name AS item_name,
             op.name AS operation_name,
             o.order_number, o.priority_rank, o.priority, o.required_date, o.must_finish_by
@@ -90,7 +90,7 @@ async function loadPreOccupied(companyId, now) {
   const out = [];
 
   const [running] = await pool.query(
-    `SELECT id, resource_type_id, assigned_resource_id, computed_hours, task_qty, started_at
+    `SELECT id, resource_type_id, assigned_resource_id, computed_hours, setup_hours, task_qty, started_at
        FROM fab_project_tasks
       WHERE company_id = ? AND status = 'in_progress' AND deleted_at IS NULL`,
     [companyId],

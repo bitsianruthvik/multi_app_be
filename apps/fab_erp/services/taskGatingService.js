@@ -413,7 +413,7 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   const opVarsByOpId = new Map();
   if (operationIds.length) {
     const [opRows] = await conn.query(
-      `SELECT id, default_resource_type_id, time_formula, time_unit FROM fab_operations
+      `SELECT id, default_resource_type_id, time_formula, time_unit, setup_minutes FROM fab_operations
         WHERE company_id = ? AND deleted_at IS NULL AND id IN (?)`,
       [companyId, operationIds],
     );
@@ -528,14 +528,22 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       // fixed 50%, so nothing consumed the learning). One source of truth now.
       const computedHours = formulaHours;
 
+      // Setup is frozen here exactly as the formula result is, and for the same
+      // reason: re-deriving it at read time would re-time committed work every
+      // time somebody edited the operation. It is charged ONCE per task and
+      // never multiplied by quantity — see taskDuration.taskHours().
+      const setupHours = op?.setup_minutes != null && Number(op.setup_minutes) > 0
+        ? Number(op.setup_minutes) / 60
+        : null;
+
       // insert task as 'blocked' first; clear at the end once inputs exist
       const [ins] = await conn.query(
         `INSERT INTO fab_project_tasks
            (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
-            seq_no, depends_on, resource_type_id, status, computed_hours, task_qty)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?)`,
+            seq_no, depends_on, resource_type_id, status, computed_hours, setup_hours, task_qty)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?, ?)`,
         [companyId, orderId, item.id, flowId, step.id, step.operation_id,
-         step.seq_no, step.depends_on, resourceTypeId, computedHours,
+         step.seq_no, step.depends_on, resourceTypeId, computedHours, setupHours,
          // Snapshotted, not joined at read time: a BOM quantity edited later
          // must not silently move the estimate under a plan already committed.
          // Re-materialization is the deliberate way to pick up a change.

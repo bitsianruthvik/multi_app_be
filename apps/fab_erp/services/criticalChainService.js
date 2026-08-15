@@ -226,7 +226,7 @@ export async function buildBaseline({ companyId, orderId, anchor } = {}) {
   //    → fab_orders collapse); the /tasks/graph route filters on order_id too.
   const [tasks] = await pool.query(
     `SELECT id, order_id, item_id, flow_id, seq_no, depends_on,
-            resource_type_id, assigned_resource_id, computed_hours, task_qty, status
+            resource_type_id, assigned_resource_id, computed_hours, setup_hours, task_qty, status
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id = ? AND status <> 'cancelled' AND deleted_at IS NULL`,
     [companyId, orderId],

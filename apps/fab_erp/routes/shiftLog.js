@@ -168,7 +168,7 @@ router.get('/shift-log', protect, async (req, res) => {
               t.item_id AS itemId, it.name AS itemName, it.mark AS itemMark,
               COALESCE(it.qty, 1) AS plannedQty,
               t.order_id AS orderId, fo.order_number AS orderNumber,
-              t.seq_no AS seqNo, t.computed_hours AS computedHours, t.task_qty AS taskQty,
+              t.seq_no AS seqNo, t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty,
               t.assigned_resource_id AS assignedResourceId,
               t.started_at AS startedAt, t.completed_at AS completedAt,
               t.produced_qty AS producedQty, t.scrap_qty AS scrapQty

@@ -362,7 +362,7 @@ export async function onTaskComplete(companyId, taskId) {
 export async function spawnReworkTask(exec, companyId, failedTaskId) {
   const [[ft]] = await exec.query(
     `SELECT id, order_id, item_id, flow_id, flow_step_id, operation_id, seq_no,
-            resource_type_id, computed_hours, sort_order
+            resource_type_id, computed_hours, setup_hours, sort_order
        FROM fab_project_tasks
       WHERE company_id = ? AND id = ? AND deleted_at IS NULL LIMIT 1`,
     [companyId, failedTaskId],
@@ -379,11 +379,19 @@ export async function spawnReworkTask(exec, companyId, failedTaskId) {
   const [ins] = await exec.query(
     `INSERT INTO fab_project_tasks
        (company_id, order_id, item_id, flow_id, flow_step_id, operation_id, seq_no,
-        depends_on, resource_type_id, status, computed_hours,
+        depends_on, resource_type_id, status, computed_hours, setup_hours,
         deps_cleared_at, queued_at, is_rework, rework_of_task_id, sort_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'eligible', ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1, ?, ?)`,
+    // Setup is carried across: reworking a part means setting the machine up
+    // again, and that cost does not depend on how many pieces come back.
+    //
+    // `task_qty` is deliberately NOT carried, leaving the rework at the default
+    // of 1 piece. How many of a 20-off batch actually failed is not something
+    // the system knows — `scrap_qty` is captured at /stop but is not necessarily
+    // the rework count — and copying 20 would plan a full second batch every
+    // time one plate failed QC. Left as it was before setup existed.
     [companyId, ft.order_id, ft.item_id, ft.flow_id, ft.flow_step_id, ft.operation_id, newSeq,
-     String(ft.seq_no), ft.resource_type_id, ft.computed_hours,
+     String(ft.seq_no), ft.resource_type_id, ft.computed_hours, ft.setup_hours,
      failedTaskId, (Number(ft.sort_order) || 0) + 1],
   );
 

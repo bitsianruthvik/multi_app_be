@@ -53,7 +53,7 @@ function toDateTimeStr(d) {
  */
 export async function whatIf({ companyId, taskId, resourceId } = {}) {
   const [[task]] = await pool.query(
-    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, task_qty, status, operation_id
+    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, setup_hours, task_qty, status, operation_id
        FROM fab_project_tasks
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
     [taskId, companyId],
@@ -100,7 +100,7 @@ export async function whatIf({ companyId, taskId, resourceId } = {}) {
   // Not-started critical tasks (of baselined sales plans) competing for a resource.
   const [critRows] = await pool.query(
     `SELECT ct.task_id, pt.order_id, pt.resource_type_id, pt.assigned_resource_id,
-            pt.computed_hours, pt.task_qty, pt.operation_id, pt.status,
+            pt.computed_hours, pt.setup_hours, pt.task_qty, pt.operation_id, pt.status,
             p.buffer_consumed_pct AS bufConsumedPct, p.chain_complete_pct AS chainPct,
             p.project_buffer_minutes AS projBufMin, p.committed_finish AS committedFinish,
             p.fever_zone AS feverZone,

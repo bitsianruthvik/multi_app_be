@@ -70,11 +70,13 @@ async function resolveItemFlowId(conn, companyId, item) {
  */
 async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId, step) {
   const [[op]] = await conn.query(
-    `SELECT time_formula, time_unit, default_resource_type_id FROM fab_operations
+    `SELECT time_formula, time_unit, setup_minutes, default_resource_type_id FROM fab_operations
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [operationId, companyId],
   );
-  if (!op) return null;
+  // Shape-stable: callers destructure the result, so a missing operation must
+  // still hand back both keys rather than a bare null.
+  if (!op) return { runHours: null, setupHours: null };
   const [vars] = await conn.query(
     `SELECT var_key, default_value FROM fab_operation_variables
       WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL`,
@@ -93,13 +95,20 @@ async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId
 
   // Same unit conversion as the materialize path — these two must agree,
   // or every re-materialize would report a spurious duration change.
-  return formulaResultToHours(
+  const runHours = formulaResultToHours(
     await evaluateFormula(
       op.time_formula, itemValues, parseStepParams(step), rt, opValues,
       // Same input resolution the materialize path uses — see inputContextForItem.
       itemId != null ? await inputContextForItem(companyId, itemId, conn) : null,
     ), op.time_unit,
   );
+  // Setup is reported separately, not folded in: it is stored on its own column
+  // and is the one component that does NOT scale with quantity, so a diff that
+  // merged the two would say "duration changed" without saying which half.
+  const setup = op.setup_minutes != null && Number(op.setup_minutes) > 0
+    ? Number(op.setup_minutes) / 60
+    : null;
+  return { runHours, setupHours: setup };
 }
 
 const normDeps = (d) => (d == null ? '' : String(d).trim());
@@ -138,7 +147,7 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
     );
     const [tasks] = await exec.query(
       `SELECT t.id, t.flow_step_id, t.flow_id, t.seq_no, t.operation_id, t.depends_on,
-              t.resource_type_id, t.computed_hours, t.status, o.name AS operation_name
+              t.resource_type_id, t.computed_hours, t.setup_hours, t.status, o.name AS operation_name
          FROM fab_project_tasks t
          LEFT JOIN fab_operations o ON o.id = t.operation_id AND o.company_id = t.company_id
         WHERE t.company_id = ? AND t.order_id = ? AND t.item_id = ? AND t.deleted_at IS NULL`,
@@ -179,8 +188,17 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
       if ((s.resource_type_id ?? null) !== (t.resource_type_id ?? null)) changes.push('resource type');
       const want = await desiredHours(exec, companyId, s.operation_id, s.resource_type_id, item.id, s);
       const have = t.computed_hours == null ? null : Number(t.computed_hours);
-      if (want != null && (have == null || Math.abs(want - have) > HOURS_EPS)) {
-        changes.push(`duration ${have == null ? '—' : have}→${Number(want.toFixed(2))}`);
+      if (want.runHours != null && (have == null || Math.abs(want.runHours - have) > HOURS_EPS)) {
+        changes.push(`duration ${have == null ? '—' : have}→${Number(want.runHours.toFixed(2))}`);
+      }
+      // Setup reported on its own line. It is charged once per task rather than
+      // per piece, so "setup 0.17→0.33" and "duration 0.17→0.33" mean very
+      // different things to a planner looking at a 40-off task.
+      const haveSetup = t.setup_hours == null ? null : Number(t.setup_hours);
+      const wantSetup = want.setupHours;
+      if ((wantSetup ?? 0) !== (haveSetup ?? 0)
+          && Math.abs((wantSetup ?? 0) - (haveSetup ?? 0)) > HOURS_EPS) {
+        changes.push(`setup ${haveSetup == null ? '—' : haveSetup}→${wantSetup == null ? '—' : Number(wantSetup.toFixed(2))}`);
       }
       if (changes.length) {
         const started = STARTED_STATUSES.has(t.status);

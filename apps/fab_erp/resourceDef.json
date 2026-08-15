@@ -423,6 +423,7 @@
       "default_resource_type_id",
       "time_formula",
       "time_unit",
+      "setup_minutes",
       "active"
     ],
     "fields": {
@@ -433,6 +434,7 @@
       "defaultResourceTypeId": "fop.default_resource_type_id",
       "timeFormula": "fop.time_formula",
       "timeUnit": "fop.time_unit",
+      "setupMinutes": "fop.setup_minutes",
       "active": "fop.active",
       "createdAt": "fop.created_at",
       "updatedAt": "fop.updated_at",
@@ -446,6 +448,7 @@
       "defaultResourceTypeId": "integer",
       "timeFormula": "text",
       "timeUnit": "string",
+      "setupMinutes": "decimal",
       "active": "integer",
       "createdAt": "datetime",
       "updatedAt": "datetime",

@@ -185,7 +185,7 @@ export async function detectDrum(companyId) {
   if (orders.length > 0) {
     const orderIds = orders.map((o) => o.orderId);
     const [tasks] = await pool.query(
-      `SELECT resource_type_id, assigned_resource_id, computed_hours, task_qty
+      `SELECT resource_type_id, assigned_resource_id, computed_hours, setup_hours, task_qty
          FROM fab_project_tasks
         WHERE company_id = ? AND order_id IN (?)
           AND status NOT IN ('done','cancelled') AND deleted_at IS NULL`,
@@ -340,7 +340,7 @@ export async function sequenceProjects(companyId, drum) {
   // a representative task for calendar resolution.
   const orderIds = projects.map((p) => p.orderId);
   const [drumTasks] = await pool.query(
-    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, task_qty, status
+    `SELECT id, order_id, resource_type_id, assigned_resource_id, computed_hours, setup_hours, task_qty, status
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?)
         AND status <> 'cancelled' AND deleted_at IS NULL

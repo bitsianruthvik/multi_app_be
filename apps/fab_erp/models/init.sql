@@ -3851,3 +3851,38 @@ SET @sql = IF(@col=0,
   'ALTER TABLE fab_operation_flow_steps ADD COLUMN params_json JSON NULL AFTER resource_type_id',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- fab_operations.setup_minutes + fab_project_tasks.setup_hours (2026-08-15)
+--
+-- A time formula is PER PIECE and planning multiplies it by task_qty. That is
+-- right for run time and wrong for setup: setting up a machine happens ONCE
+-- for the run, not once per piece. Every seeded formula carried its setup as a
+-- constant term ("10 + cut length / speed"), so a 20-off task was billing 200
+-- minutes of setup for one setup — the estimate grew with quantity in a way the
+-- shop floor does not.
+--
+-- WHY TWO COLUMNS. `setup_minutes` on the operation is the master datum a
+-- planner edits. `setup_hours` on the task is that value FROZEN at
+-- materialization, exactly as `computed_hours` freezes the formula result. The
+-- task table is read by twelve scheduling paths that do not join operations;
+-- making them join would be twelve chances to forget, and re-deriving setup at
+-- read time would silently re-time committed work every time somebody edited an
+-- operation. Both columns NULL ⇒ 0 ⇒ precisely the old behaviour.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_operations' AND COLUMN_NAME='setup_minutes');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_operations ADD COLUMN setup_minutes DECIMAL(10,2) NULL AFTER time_unit',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='setup_hours');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_project_tasks ADD COLUMN setup_hours DECIMAL(10,4) NULL AFTER computed_hours',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Deliberately NOT backfilled. Existing formulas still carry their setup as a
+-- constant inside time_formula; writing a setup_minutes now would charge it
+-- twice. Moving a constant out of a formula is a per-operation judgement (which
+-- part of "10 + x" is setup?), so it is left to whoever edits the operation.

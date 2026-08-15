@@ -45,9 +45,31 @@ export function unitHours(task) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** What the task actually occupies: per-piece × pieces. */
+/**
+ * Setup hours for the whole task — charged ONCE, never multiplied by quantity.
+ *
+ * Frozen onto the task at materialization from `fab_operations.setup_minutes`,
+ * the same way `computed_hours` freezes the formula result. Null/negative ⇒ 0,
+ * so a task predating the column, or an operation with no setup configured,
+ * behaves exactly as before.
+ */
+export function setupHours(task) {
+  if (!task) return 0;
+  const raw = task.setup_hours ?? task.setupHours;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * What the task actually occupies: setup once, plus per-piece × pieces.
+ *
+ * Setup sits OUTSIDE the multiplication on purpose. You set a machine up once
+ * for the run, and the previous shape — setup as a constant term inside a
+ * per-piece formula — made a 20-off task bill twenty setups, so the estimate
+ * grew with quantity in a way the shop floor does not.
+ */
 export function taskHours(task) {
-  return unitHours(task) * taskQty(task);
+  return setupHours(task) + unitHours(task) * taskQty(task);
 }
 
 /** The same in minutes, rounded — what every scheduler and load figure wants. */

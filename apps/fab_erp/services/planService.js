@@ -367,7 +367,7 @@ export async function assertDagAllows(companyId, taskIds, start, { excludeEntryI
   // predecessor outside the selection is precisely what has to be found.
   const [siblings] = await pool.query(
     `SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
-            started_at, computed_hours, task_qty
+            started_at, computed_hours, setup_hours, task_qty
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
         AND status <> 'cancelled'`,
@@ -494,7 +494,7 @@ async function insertEntry(conn, companyId, entry, planDate) {
   const entryId = res.insertId;
 
   const [minutes] = await conn.query(
-    `SELECT id, computed_hours AS computedHours, task_qty AS taskQty FROM fab_project_tasks
+    `SELECT id, computed_hours AS computedHours, setup_hours AS setupHours, task_qty AS taskQty FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, entry.taskIds],
   );
@@ -524,7 +524,7 @@ export async function createEntry(companyId, input, userId = null) {
   const [tasks] = await pool.query(
     `SELECT t.id, t.order_id AS orderId, t.operation_id AS operationId,
             t.resource_type_id AS resourceTypeId, t.assigned_resource_id AS resourceId,
-            t.computed_hours AS computedHours, t.task_qty AS taskQty, t.seq_no AS seqNo,
+            t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty, t.seq_no AS seqNo,
             i.parent_item_id AS parentItemId, i.name AS itemName,
             op.name AS operationName
        FROM fab_project_tasks t
@@ -851,7 +851,7 @@ export async function getBacklog(companyId, { resourceTypeIds = [], limit = 200 
   const [rows] = await pool.query(
     `SELECT t.id, t.order_id AS orderId, t.item_id AS itemId, t.seq_no AS seqNo,
             t.status, t.resource_type_id AS resourceTypeId,
-            t.assigned_resource_id AS resourceId, t.computed_hours AS computedHours, t.task_qty AS taskQty,
+            t.assigned_resource_id AS resourceId, t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty,
             i.name AS itemName, i.parent_item_id AS parentItemId,
             op.name AS operationName, op.id AS operationId,
             o.order_number AS orderNumber, o.priority_rank AS priorityRank,
@@ -903,7 +903,12 @@ export async function getPlanOrders(companyId, { from, to, resourceTypeIds = [] 
             o.priority, o.priority_rank AS priorityRank,
             o.must_finish_by AS mustFinishBy, o.required_date AS requiredDate,
             COUNT(t.id) AS taskCount,
-            COALESCE(SUM(t.computed_hours * COALESCE(t.task_qty, 1)), 0) AS totalHours
+            -- Mirrors taskDuration.taskHours() exactly: setup once, run per piece.
+            -- Kept as SQL because this is a GROUP BY rollup over every backlog
+            -- task; pulling the rows into JS to add them up would be the one
+            -- place the two definitions could drift.
+            COALESCE(SUM(COALESCE(t.setup_hours, 0)
+                       + COALESCE(t.computed_hours, 0) * COALESCE(t.task_qty, 1)), 0) AS totalHours
        FROM fab_project_tasks t
        JOIN fab_orders o ON o.id = t.order_id AND o.deleted_at IS NULL
       WHERE t.company_id = ? AND t.deleted_at IS NULL

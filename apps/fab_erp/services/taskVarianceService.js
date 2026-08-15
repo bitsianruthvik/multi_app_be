@@ -102,7 +102,7 @@ export async function computeTaskVariance(exec, companyId, taskId, planHours) {
  */
 export async function orderVarianceSummary(exec, companyId, orderId) {
   const [tasks] = await exec.query(
-    `SELECT id, computed_hours, task_qty FROM fab_project_tasks
+    `SELECT id, computed_hours, setup_hours, task_qty FROM fab_project_tasks
       WHERE company_id = ? AND order_id = ? AND status = 'done' AND deleted_at IS NULL`,
     [companyId, orderId],
   );

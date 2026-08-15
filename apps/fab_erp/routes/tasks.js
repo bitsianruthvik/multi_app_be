@@ -165,7 +165,7 @@ router.get('/tasks/queue-summary', protect, async (req, res) => {
         t.blocked_by_other_tasks_minutes AS blockedByOtherTasksMinutes,
         t.idle_wait_minutes AS idleWaitMinutes,
         t.delay_reason AS delayReason,
-        t.computed_hours AS computedHours, t.task_qty AS taskQty,
+        t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty,
         t.assigned_resource_id AS assignedResourceId,
         t.queued_at AS queuedAt,
         t.started_at AS startedAt,
@@ -1269,6 +1269,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
 
       const [taskRows] = await conn.query(
         `SELECT t.id, t.order_id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
+                t.setup_hours,
                 t.task_qty,
                 COALESCE(i.qty, 1) AS planned_qty
            FROM fab_project_tasks t
