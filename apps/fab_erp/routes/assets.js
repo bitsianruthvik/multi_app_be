@@ -122,8 +122,9 @@ router.post('/assets/resources/:id/maintenance/stop', protect, canManage, async 
 router.get('/assets/resources/:id/valuation', protect, canView, async (req, res) => {
   try {
     const [[r]] = await pool.query(
-      `SELECT id, name, code, currency, purchase_date, commissioned_date, asset_cost,
-              salvage_value, useful_life_years, depreciation_method, depreciation_rate_pct
+`SELECT id, name, code, currency, purchase_date, commissioned_date, asset_cost,
+              salvage_value, useful_life_years, depreciation_method, depreciation_rate_pct,
+              useful_life_units, units_used, units_uom
          FROM fab_resources
         WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
       [Number(req.params.id), companyOf(req)],

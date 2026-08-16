@@ -216,7 +216,10 @@
       "salvage_value",
       "useful_life_years",
       "depreciation_method",
-      "depreciation_rate_pct"
+      "depreciation_rate_pct",
+      "useful_life_units",
+      "units_used",
+      "units_uom"
     ],
     "fields": {
       "id": "fr.id",
@@ -258,7 +261,10 @@
       "salvageValue": "fr.salvage_value",
       "usefulLifeYears": "fr.useful_life_years",
       "depreciationMethod": "fr.depreciation_method",
-      "depreciationRatePct": "fr.depreciation_rate_pct"
+      "depreciationRatePct": "fr.depreciation_rate_pct",
+      "usefulLifeUnits": "fr.useful_life_units",
+      "unitsUsed": "fr.units_used",
+      "unitsUom": "fr.units_uom"
     },
     "fieldTypes": {
       "id": "integer",
@@ -300,7 +306,10 @@
       "salvageValue": "decimal",
       "usefulLifeYears": "decimal",
       "depreciationMethod": "string",
-      "depreciationRatePct": "decimal"
+      "depreciationRatePct": "decimal",
+      "usefulLifeUnits": "decimal",
+      "unitsUsed": "decimal",
+      "unitsUom": "string"
     },
     "relations": {
       "plant": {

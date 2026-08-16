@@ -4584,3 +4584,27 @@ UPDATE fab_stock_locations
 UPDATE fab_stock_locations
    SET name = 'Machines - off site'
  WHERE code = 'MACH-OFF' AND deleted_at IS NULL AND name <> 'Machines - off site';
+
+-- ── Units-of-production depreciation inputs (2026-08-17, Phase 9) ──────────
+--
+-- The method that depreciates by USE rather than by time: a press worked twice
+-- as hard wears out twice as fast, and for equipment whose life really is
+-- measured in cycles or hours that is the truthful answer.
+--
+-- BOTH ARE RECORDED, NOT DERIVED, even though this system tracks actual machine
+-- running time. `machineAnalyticsService` computes `touchMinutes` per run, but
+-- it carries a `touchBasis` that falls back to 'elapsed' whenever shift or event
+-- data is missing — so a book value derived from it would move as the event log
+-- filled in, and the same report run twice would give two answers. Depreciation
+-- has to be reproducible. Somebody enters the reading, as they would off an
+-- hour meter.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resources'
+               AND COLUMN_NAME='useful_life_units');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_resources
+     ADD COLUMN useful_life_units DECIMAL(18,4) NULL,
+     ADD COLUMN units_used        DECIMAL(18,4) NULL,
+     ADD COLUMN units_uom         VARCHAR(20)   NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
