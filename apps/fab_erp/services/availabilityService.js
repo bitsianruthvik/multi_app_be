@@ -209,3 +209,124 @@ export async function availabilityBySize(companyId, specs, opts = {}) {
   }
   return out;
 }
+
+/**
+ * Pieces of an item that are spoken for by SOMEBODY ELSE.
+ *
+ * A piece-level reservation names a plate. Once one exists, that plate is not
+ * available to any other order, however much the catalog-level arithmetic says
+ * is on hand — "3 of MS Plate 20mm" is not an answer when only one of them is
+ * the 3000x1500 the nest needs.
+ *
+ * `forOrderId` is excluded, on the same reasoning as `availabilityFor`: an
+ * order re-running its own reservation must not see its own holding as a
+ * competitor and reserve nothing.
+ */
+export async function piecesHeldByOthers(companyId, catalogItemId, { forOrderId = null, conn = null } = {}) {
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT DISTINCT stock_piece_id AS pieceId
+       FROM fab_stock_reservations
+      WHERE company_id = ? AND catalog_item_id = ? AND status = 'active'
+        AND deleted_at IS NULL AND stock_piece_id IS NOT NULL
+        AND NOT (? IS NOT NULL AND order_id <=> ?)`,
+    [companyId, catalogItemId, forOrderId, forOrderId],
+  );
+  return new Set(rows.map((r) => Number(r.pieceId)));
+}
+
+/** The specific plates an order is holding for one item. */
+export async function piecesReservedFor(companyId, orderId, catalogItemId, conn = null) {
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT stock_piece_id AS pieceId FROM fab_stock_reservations
+      WHERE company_id = ? AND order_id = ? AND catalog_item_id = ?
+        AND status = 'active' AND deleted_at IS NULL AND stock_piece_id IS NOT NULL`,
+    [companyId, orderId, catalogItemId],
+  );
+  return rows.map((r) => Number(r.pieceId));
+}
+
+/**
+ * Earmark SPECIFIC plates for an order, where the requirement names a size.
+ *
+ * This is the half of reservation that catalog-level quantities cannot express.
+ * `reserveForOrder` answers "how much of item X is this order holding"; this
+ * answers "which plates", which is the only question that means anything once
+ * consumption matches on size.
+ *
+ * SAME ENGAGEMENT RULE AS CONSUMPTION, deliberately. Nothing is earmarked
+ * unless the requirement carries a size AND at least one in-stock piece of that
+ * item has a recorded size. Otherwise there is nothing to distinguish one plate
+ * from another, naming one would be arbitrary, and an arbitrary earmark is
+ * worse than none — it would block another order from a plate for no reason.
+ * The two rules have to agree, or an order could reserve a plate consumption
+ * then refuses to take.
+ *
+ * @param {Array<{catalogItemId:number, lengthMm:number|null, widthMm:number|null, plates:number}>} wants
+ * @returns {Promise<Array<{catalogItemId:number, pieceIds:number[], short:number}>>}
+ */
+export async function reservePiecesForOrder(conn, companyId, orderId, wants) {
+  const exec = conn ?? pool;
+  const out = [];
+
+  for (const w of wants) {
+    const id = Number(w.catalogItemId);
+    const need = Math.max(1, Number(w.plates) || 1);
+    if (!Number.isFinite(id)) continue;
+    if (w.lengthMm == null && w.widthMm == null) continue;
+
+    const [[m]] = await exec.query(
+      `SELECT COUNT(*) AS measured FROM fab_stock_pieces
+        WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
+          AND deleted_at IS NULL AND qty > 0
+          AND (length_mm IS NOT NULL OR width_mm IS NOT NULL)`,
+      [companyId, id],
+    );
+    if (!(Number(m?.measured) > 0)) continue; // dormant, exactly as consumption is
+
+    const heldByOthers = await piecesHeldByOthers(companyId, id, { forOrderId: orderId, conn: exec });
+
+    // Candidate plates of exactly the declared size, oldest first — the same
+    // ordering consumption uses, so the plate reserved is the plate taken.
+    const [candidates] = await exec.query(
+      `SELECT id FROM fab_stock_pieces
+        WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
+          AND deleted_at IS NULL AND qty > 0
+          AND length_mm <=> ? AND width_mm <=> ?
+        ORDER BY (received_date IS NULL), received_date ASC, id ASC
+        FOR UPDATE`,
+      [companyId, id, w.lengthMm ?? null, w.widthMm ?? null],
+    );
+
+    const picked = candidates
+      .map((c) => Number(c.id))
+      .filter((pid) => !heldByOthers.has(pid))
+      .slice(0, need);
+
+    // Replace this order's own piece-level holding for the item rather than
+    // stacking a second one — pressing the button twice must not hold twice the
+    // steel, which is the same rule reserveForOrder follows.
+    await exec.query(
+      `UPDATE fab_stock_reservations
+          SET status = 'released', released_at = UTC_TIMESTAMP()
+        WHERE company_id = ? AND order_id = ? AND catalog_item_id = ?
+          AND kind = 'order' AND status = 'active' AND deleted_at IS NULL
+          AND stock_piece_id IS NOT NULL`,
+      [companyId, orderId, id],
+    );
+
+    for (const pid of picked) {
+      await exec.query(
+        `INSERT INTO fab_stock_reservations
+           (company_id, catalog_item_id, stock_piece_id, kind, order_id, qty, status, notes)
+         VALUES (?, ?, ?, 'order', ?, 1, 'active', ?)`,
+        [companyId, id, pid, orderId,
+         `plate ${w.lengthMm ?? '?'}x${w.widthMm ?? '?'} earmarked for this order`],
+      );
+    }
+
+    out.push({ catalogItemId: id, pieceIds: picked, short: Math.max(0, need - picked.length) });
+  }
+  return out;
+}

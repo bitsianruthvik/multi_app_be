@@ -20,7 +20,7 @@
 
 import { pool } from '../../../db.js';
 import { orderShortfall } from './procurementService.js';
-import { reserveForOrder } from './availabilityService.js';
+import { reserveForOrder, reservePiecesForOrder } from './availabilityService.js';
 import { receiveStock } from './stockInService.js';
 
 /** Statuses a purchase order moves through, in order. */
@@ -98,6 +98,31 @@ export async function raiseProcurement(companyId, orderId, opts = {}) {
     const reserved = await reserveForOrder(
       conn, companyId, orderId,
       shortfall.lines.map((l) => ({ catalogItemId: l.catalogItemId, qty: l.required })),
+    );
+
+    /**
+     * …and name the actual PLATES, where nesting said which size.
+     *
+     * The quantity reservation above says "this order holds 3 of MS Plate
+     * 20mm". That was the whole story until consumption started matching on
+     * size, and now it is not enough: two orders can both hold three while only
+     * one is the 3000x1500 either of them can use, and the second finds out at
+     * a machine. Naming the plate is the only way to hold the right one.
+     *
+     * Both are kept. The quantity reservation is still what the shortfall
+     * arithmetic reads, and it still covers every item that has no declared
+     * size or no measured stock — the piece-level earmark is an extra claim on
+     * top, not a replacement, and it engages under exactly the condition
+     * consumption does.
+     */
+    const piecesReserved = await reservePiecesForOrder(
+      conn, companyId, orderId,
+      shortfall.lines.flatMap((l) => (l.sizes ?? [])
+        .filter((s) => s.sized)
+        .map((s) => ({
+          catalogItemId: l.catalogItemId,
+          lengthMm: s.length, widthMm: s.width, plates: s.required,
+        }))),
     );
 
     // Recompute after reserving: what is still short is what gets purchased.
@@ -185,7 +210,7 @@ export async function raiseProcurement(companyId, orderId, opts = {}) {
     }
 
     await conn.commit();
-    return { orders, reserved, skipped };
+    return { orders, reserved, piecesReserved, skipped };
   } catch (err) {
     await conn.rollback();
     throw err;

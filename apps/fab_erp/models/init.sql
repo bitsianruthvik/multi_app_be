@@ -4406,3 +4406,45 @@ SELECT c.company_id, 'category', c.id, 'cost_treatment', 'text', 'expense', 0
 -- Phase 2 made with Grade.
 UPDATE fab_field_defs SET category_id = NULL
  WHERE deleted_at IS NULL AND field_key = 'cost_treatment' AND category_id IS NOT NULL;
+
+-- ── Piece-level reservations (2026-08-16, catalog unification Phase 6b) ─────
+--
+-- A reservation could only ever say "this order has claimed 3 of item X". Once
+-- consumption matches on the plate size a nest declared, that is no longer
+-- enough: two orders can both hold "3 of MS Plate 20mm" while only one
+-- 3000x1500 piece exists, and both believe they have it. The first to start
+-- takes it and the second discovers the problem at a machine.
+--
+-- `stock_piece_id` NULL keeps the old meaning — a quantity of an item, not a
+-- named plate — so every existing reservation and every unmeasured yard behaves
+-- exactly as before. It is only set when the requirement carries a size AND
+-- measured stock exists to match it against, which is the same condition that
+-- makes consumption size-aware in the first place.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations'
+               AND COLUMN_NAME='stock_piece_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_stock_reservations ADD COLUMN stock_piece_id INT NULL AFTER catalog_item_id',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- `notes` is in this table's CREATE but missing from any database created before
+-- it was added — `CREATE TABLE IF NOT EXISTS` asserts a name exists, never that
+-- it has the right shape, so the column never arrived. Local had no `notes`
+-- while production did, which is drift between two environments running the
+-- same file. Guarded ALTER converges them.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations'
+               AND COLUMN_NAME='notes');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_stock_reservations ADD COLUMN notes TEXT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_reservations'
+               AND INDEX_NAME='idx_fsr_piece');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_stock_reservations ADD KEY idx_fsr_piece (company_id, stock_piece_id, status)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

@@ -32,6 +32,7 @@
 
 import { generateCode } from './codegenService.js';
 import { isConsumable } from './itemFieldService.js';
+import { piecesHeldByOthers, piecesReservedFor } from './availabilityService.js';
 
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
@@ -178,7 +179,7 @@ async function resolveTaskPlant(conn, companyId, assignedResourceId) {
  * to issue material is a hard block on shop-floor work, and an unclassified
  * category must not stop a job that runs fine today.
  */
-async function consumeStock(conn, companyId, catalogItemId, required, { txnType, notes, want = null }) {
+async function consumeStock(conn, companyId, catalogItemId, required, { txnType, notes, want = null, orderId = null }) {
   if (!(required > 0)) return true;
 
   if (!(await isConsumable(companyId, catalogItemId, conn))) {
@@ -220,6 +221,23 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
     sized = Number(m?.measured) > 0;
   }
 
+  /**
+   * Plates another order has already named, and plates THIS order has named.
+   *
+   * A piece-level reservation is the only thing that can stop two orders both
+   * believing they hold the one 3000x1500 plate in the yard — catalog-level
+   * quantities cannot express it, so before this both would pass their checks
+   * and the second would find out at a machine.
+   *
+   * `orderId` may be absent (a component consume, or an older call site); with
+   * no order there is nothing to prefer and nothing of one's own to exclude, so
+   * the query simply avoids everybody else's named plates.
+   */
+  const held = await piecesHeldByOthers(companyId, catalogItemId, { forOrderId: orderId ?? null, conn });
+  const mine = orderId
+    ? await piecesReservedFor(companyId, orderId, catalogItemId, conn)
+    : [];
+
   const params = [companyId, catalogItemId];
   let sizeWhere = '';
   if (sized) {
@@ -230,14 +248,35 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
     params.push(want.lengthMm ?? null, want.widthMm ?? null);
   }
 
+  // Everybody else's named plates are excluded outright. This is the one thing
+  // that stops two orders taking the same physical plate.
+  let heldWhere = '';
+  if (held.size) {
+    heldWhere = ` AND id NOT IN (${[...held].map(() => '?').join(',')})`;
+    params.push(...held);
+  }
+
   const [pieces] = await conn.query(
     `SELECT id, qty, plant_id, stock_location_id, batch_no FROM fab_stock_pieces
       WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
-        AND deleted_at IS NULL AND qty > 0${sizeWhere}
+        AND deleted_at IS NULL AND qty > 0${sizeWhere}${heldWhere}
       ORDER BY (received_date IS NULL), received_date ASC, id ASC
       FOR UPDATE`,
     params,
   );
+
+  /**
+   * Take what this order RESERVED first, then anything else eligible.
+   *
+   * Without this the FIFO order could hand an order a different plate from the
+   * one it earmarked — which still cuts, but leaves its own reservation held
+   * against a plate it no longer needs, and quietly denies that plate to
+   * whoever else could have used it. Reserving a thing and then taking a
+   * different thing is how a reservation system stops meaning anything.
+   */
+  const minePriority = new Set(mine);
+  pieces.sort((a, b) => (minePriority.has(Number(b.id)) ? 1 : 0) - (minePriority.has(Number(a.id)) ? 1 : 0));
+
   let remaining = Number(required);
   for (const p of pieces) {
     if (remaining <= EPS) break;
@@ -251,6 +290,25 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
       catalogItemId, plantId: p.plant_id, stockLocationId: p.stock_location_id,
       txnType, qty: -take, batchCode: p.batch_no || 'WIP', notes,
     });
+
+    /**
+     * A plate that has been taken stops being reserved.
+     *
+     * Left active, the earmark would go on excluding that piece from every
+     * other order for ever — and since the piece is now consumed, that is a
+     * reservation against something that no longer exists. Marked `consumed`
+     * rather than `released` so the history still says what happened to it: it
+     * was used, not given back.
+     */
+    if (newQty <= EPS) {
+      await conn.query(
+        `UPDATE fab_stock_reservations
+            SET status = 'consumed', released_at = UTC_TIMESTAMP()
+          WHERE company_id = ? AND stock_piece_id = ? AND status = 'active'
+            AND deleted_at IS NULL`,
+        [companyId, p.id],
+      );
+    }
     remaining -= take;
   }
   return remaining <= EPS;
@@ -343,7 +401,8 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
         const child = await getItemNode(conn, companyId, inp.producing_item_id);
         if (child?.catalog_item_id) {
           const ok = await consumeStock(conn, companyId, child.catalog_item_id, required, {
-            txnType: 'wip_consume', notes: `consumed by item ${node.id} (task ${task.id})`,
+            txnType: 'wip_consume', orderId: task.order_id ?? node.order_id ?? null,
+            notes: `consumed by item ${node.id} (task ${task.id})`,
           });
           if (!ok) throw insufficientStock(`Not enough of component item #${inp.producing_item_id} in stock to start this task.`);
         }
@@ -360,6 +419,8 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
           // The size nesting declared for this plate. Only a piece of exactly
           // that size will do — see consumeStock.
           want: nest.want,
+          // So the plate this order EARMARKED is the plate it takes.
+          orderId: task.order_id ?? node.order_id ?? null,
           notes: nest.nestNo
             ? `issued nest ${nest.nestNo} to item ${node.id} (task ${task.id})`
             : `issued to item ${node.id} (task ${task.id})`,
