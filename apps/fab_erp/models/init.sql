@@ -4024,3 +4024,105 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_orders ADD KEY idx_fo_for_resource (company_id, for_resource_id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ CATALOG UNIFICATION, PHASE 1 (2026-08-16) ══════════════════════════════
+-- Makes the field registry capable of describing every physical thing. Purely
+-- additive: nothing reads these until Phase 2, so this cannot change behaviour.
+-- See FAB_ERP_CATALOG_UNIFICATION_PLAN.md.
+
+-- ── fab_field_defs.level — where a field is AUTHORED ────────────────────────
+--
+-- Replaces the `piece_varying` boolean, which could say "may differ per piece"
+-- but could not say "meaningless at item level". `length_mm` on the catalog row
+-- "MS Plate 20mm" IS meaningless — that item covers every length ever bought —
+-- so the boolean allowed a value to be entered somewhere it can only mislead.
+--
+--   item   authored on the catalog item; every piece inherits it (thickness)
+--   piece  authored on the stock piece ONLY (length, heat number)
+--   both   authored on the item, overridable per piece
+--
+-- It also tells the UI which screen to ask on, which the boolean could not.
+--
+-- `piece_varying` is KEPT and backfilled from, per the plan's rule 1 (additive
+-- first, destructive last). Phase 11 drops it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_field_defs' AND COLUMN_NAME='level');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_field_defs ADD COLUMN level VARCHAR(10) NOT NULL DEFAULT ''item'' AFTER piece_varying',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Existing defs: piece_varying = 1 meant "can differ per piece", which is
+-- exactly `both`. Everything else is item-level. Guarded so a later re-run
+-- never overwrites a level somebody has since set deliberately.
+UPDATE fab_field_defs
+   SET level = IF(piece_varying = 1, 'both', 'item')
+ WHERE deleted_at IS NULL AND (level IS NULL OR level = '' OR level = 'item')
+   AND piece_varying = 1;
+
+-- ── fab_field_defs.allowed_values — a field that is a PICKER ───────────────
+--
+-- A JSON array of permitted values. Present ⇒ the editor renders a dropdown and
+-- rejects anything else; absent ⇒ free entry as before.
+--
+-- WHY IT MATTERS BEYOND TIDINESS. `cost_treatment` decides whether a spare is
+-- expensed or capitalised, and as free text it can hold "expense", "Expense"
+-- and "expensed" — three values, one meaning, and an accounting split that
+-- silently drops rows it does not recognise. The same already happened once in
+-- this registry: `Thickness (mm)` exists as free text alongside the numeric
+-- `thickness_mm`.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_field_defs' AND COLUMN_NAME='allowed_values');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_field_defs ADD COLUMN allowed_values JSON NULL AFTER unit',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── Housekeeping: fab_order_lines has never had a CREATE TABLE ─────────────
+--
+-- init.sql only ever ALTERs it; the table is assumed to pre-exist from the
+-- legacy schema. Both live databases have it, so nothing is broken today — but
+-- a database built from init.sql alone would fail on every ALTER below.
+--
+-- The shape here is copied from the LIVE table, deliberately. A
+-- `CREATE TABLE IF NOT EXISTS` whose columns disagree with an existing table
+-- silently does nothing and leaves the wrong shape in place — that is the
+-- fab_bom_templates trap recorded in §13. Copying the live shape means this is
+-- a no-op everywhere it already exists, and correct where it does not.
+CREATE TABLE IF NOT EXISTS fab_order_lines (
+  id              INT NOT NULL AUTO_INCREMENT,
+  company_id      INT NOT NULL,
+  order_id        INT NOT NULL,
+  line_no         INT NOT NULL DEFAULT 1,
+  code            VARCHAR(60)   DEFAULT NULL,
+  description     VARCHAR(255)  DEFAULT NULL,
+  qty             DECIMAL(14,4) NOT NULL DEFAULT 0.0000,
+  unit            VARCHAR(20)   DEFAULT NULL,
+  unit_price      DECIMAL(14,4) DEFAULT NULL,
+  discount        DECIMAL(8,4)  DEFAULT NULL,
+  status          VARCHAR(30)   DEFAULT NULL,
+  qty_completed   DECIMAL(14,4) DEFAULT 0.0000,
+  scheduled_start DATETIME      DEFAULT NULL,
+  scheduled_end   DATETIME      DEFAULT NULL,
+  notes           TEXT          DEFAULT NULL,
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at      DATETIME      DEFAULT NULL,
+  line_type       VARCHAR(40)   DEFAULT NULL,
+  catalog_item_id INT           DEFAULT NULL,
+  qty_received    DECIMAL(18,4) NOT NULL DEFAULT 0,
+  expected_date   DATE          DEFAULT NULL,
+  PRIMARY KEY (id),
+  KEY idx_fab_order_lines_order (order_id),
+  KEY fk_fab_order_lines_company (company_id),
+  KEY idx_fol_catalog (company_id, catalog_item_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Same gap: `shift_calendar_id` exists only in a hand-applied migration, yet
+-- resourceDef.json and four services depend on it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resources' AND COLUMN_NAME='shift_calendar_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_resources ADD COLUMN shift_calendar_id INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

@@ -39,6 +39,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { authoredOnPiece } from './fieldVocabulary.js';
 import { parseFormula } from './formulaEngine.js';
 
 /** Levels, in the order the chain consults them. Later entries lose to earlier. */
@@ -50,8 +51,12 @@ const PIECE_LEVEL = 'stock_piece';
 export async function fieldRegistry(companyId, conn) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
-    `SELECT field_key, label, data_type, unit, formula_usable, piece_varying,
-            default_value, category_id, group_id, subgroup_id
+    // `level` and `allowed_values` are Phase 1 additions. `piece_varying` is
+    // still selected because `authoredOnPiece` falls back to it for definitions
+    // that predate the column — dropping it here would silently demote every
+    // piece-varying field to item-level.
+    `SELECT field_key, label, data_type, unit, allowed_values, formula_usable,
+            piece_varying, level, default_value, category_id, group_id, subgroup_id
        FROM fab_field_defs
       WHERE company_id = ? AND deleted_at IS NULL AND active = 1`,
     [companyId],
@@ -185,13 +190,23 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
         if (v != null) values[key] = v;
       }
     }
-    // Step 1, last and narrowest: only fields the user nominated as varying by
-    // physical piece, and only when a piece is actually known.
+    // Step 1, last and narrowest: fields authored on the physical piece, and
+    // only when a piece is actually known.
+    //
+    // Gated on the definition's LEVEL rather than the old `piece_varying`
+    // boolean, via `authoredOnPiece` — which still falls back to the boolean
+    // for definitions that predate the column, so this is not a behaviour
+    // change until a level is set deliberately (Phase 2).
+    //
+    // The gate matters: without it, a stray piece-level row for an item-level
+    // field (`thickness_mm` on one plate) would override the item's own value
+    // for that piece alone, and the two would disagree with nothing to say
+    // which was right.
     const pieceVals = at(PIECE_LEVEL, pieceId);
     if (pieceVals) {
       for (const [key, raw] of Object.entries(pieceVals)) {
         const def = registry.get(key);
-        if (!def || !def.piece_varying) continue;
+        if (!def || !authoredOnPiece(def)) continue;
         const v = coerce(raw, def);
         if (v != null) values[key] = v;
       }

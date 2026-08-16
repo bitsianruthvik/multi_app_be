@@ -2909,7 +2909,9 @@
       "subgroup_id",
       "sort_order",
       "active",
-      "notes"
+      "notes",
+      "level",
+      "allowed_values"
     ],
     "fields": {
       "id": "ffd.id",
@@ -2928,7 +2930,9 @@
       "active": "ffd.active",
       "notes": "ffd.notes",
       "createdAt": "ffd.created_at",
-      "updatedAt": "ffd.updated_at"
+      "updatedAt": "ffd.updated_at",
+      "level": "ffd.level",
+      "allowedValues": "ffd.allowed_values"
     },
     "fieldTypes": {
       "id": "integer",
@@ -2947,7 +2951,9 @@
       "active": "integer",
       "notes": "string",
       "createdAt": "datetime",
-      "updatedAt": "datetime"
+      "updatedAt": "datetime",
+      "level": "string",
+      "allowedValues": "json"
     },
     "relations": {}
   }
