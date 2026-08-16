@@ -9,6 +9,20 @@ const resourcePermissions = {
   fabErpResourceTypeProperty:  'fab_erp_resource_type_properties_manage',
   fabErpResource:              'fab_erp_resources_manage',
 
+  // Custom fields on a resource TYPE or an individual resource. Absent until
+  // 2026-08-17, which made every save and delete in the Custom Fields tab fail
+  // with 400 "Unknown fab_erp resource" — for admins too, since mutateController
+  // rejects an unlisted resource BEFORE it checks the admin bypass. Reads were
+  // unaffected (fabQuery does not consult this map), so the tab listed existing
+  // fields correctly and only failed on write, which is why it looked wired up.
+  //
+  // The tag matches `usePermission('fab_erp_resources_manage')` in
+  // ResourceTypes.tsx. It must stay matched: gate the write more narrowly than
+  // the button and the UI offers an action it cannot complete. Not the narrower
+  // resource_type_properties tag, because this one editor serves both the
+  // resource_type and the resource level.
+  fabErpResourceCustomField:   'fab_erp_resources_manage',
+
   // Process master catalogue
   fabErpProcessMaster: 'fab_erp_process_master_manage',
 
@@ -19,11 +33,10 @@ const resourcePermissions = {
   // Parts catalog (shared across projects)
   fabErpItemCatalog: 'fab_erp_items_meta_manage',
 
-  // Item meta
-  fabErpItemMetricDef: 'fab_erp_items_meta_manage',
-  // The field registry that replaces it — same gate, so nobody who could edit
-  // metrics loses the ability and nobody new gains it.
-  fabErpFieldDef:      'fab_erp_items_meta_manage',
+  // Item meta — the field registry. It inherited the gate of the
+  // `fabErpItemMetricDef` resource it replaced (dropped 2026-08-17), so nobody
+  // who could edit metrics lost the ability and nobody new gained it.
+  fabErpFieldDef: 'fab_erp_items_meta_manage',
 
   // Formulas
   fabErpFormulaSet: 'fab_erp_formulas_manage',
