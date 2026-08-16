@@ -101,9 +101,13 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
   // The items, with the taxonomy reached through their catalog item (when
   // bound). A made part has none of this and falls through to its own values.
   const [items] = await exec.query(
+    // The catalog's own columns come back with the taxonomy — see `catalogCols`
+    // below for why they are read rather than migrated.
     `SELECT i.id, i.catalog_item_id AS catalogItemId,
             i.length AS legacyLength, i.width AS legacyWidth, i.height AS legacyHeight,
-            c.category_id AS categoryId, c.group_id AS groupId, c.subgroup_id AS subgroupId
+            c.category_id AS categoryId, c.group_id AS groupId, c.subgroup_id AS subgroupId,
+            c.thickness_mm AS catThickness, c.density_kg_m3 AS catDensity,
+            c.section_area_mm2 AS catSectionArea
        FROM fab_items i
        LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id AND c.deleted_at IS NULL
       WHERE i.company_id = ? AND i.id IN (?) AND i.deleted_at IS NULL`,
@@ -141,6 +145,29 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
 
   const at = (level, id) => (id == null ? undefined : byLevel.get(level)?.get(id));
 
+  /**
+   * The dimension columns of whichever pieces were named, in one query.
+   *
+   * Only fetched when a caller actually supplied `pieceByItem` — before stock is
+   * issued there is no piece, and an unconditional query here would run on every
+   * materialization of every order for nothing.
+   */
+  const pieceDimsById = new Map();
+  const pieceIds = [...new Set([...(opts.pieceByItem?.values() ?? [])].filter(Boolean))];
+  if (pieceIds.length) {
+    const [pieces] = await exec.query(
+      `SELECT id, length_mm, width_mm FROM fab_stock_pieces
+        WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+      [companyId, pieceIds],
+    );
+    for (const p of pieces) {
+      const d = {};
+      if (p.length_mm != null) d.length_mm = p.length_mm;
+      if (p.width_mm != null) d.width_mm = p.width_mm;
+      if (Object.keys(d).length) pieceDimsById.set(p.id, d);
+    }
+  }
+
   for (const item of items) {
     const pieceId = opts.pieceByItem?.get(item.id) ?? null;
     /**
@@ -164,13 +191,42 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
     if (item.legacyWidth != null) legacyDims.width_mm = item.legacyWidth;
     if (item.legacyHeight != null) legacyDims.thickness_mm = item.legacyHeight;
 
+    /**
+     * The catalog item's own COLUMNS, read as a source (Phase 3).
+     *
+     * Until now the chain consulted the catalog item's custom FIELDS but never
+     * its columns, so a raw material whose catalog row says 20 mm and
+     * 7850 kg/m3 handed the formula engine nothing at all: `density_kg_m3`
+     * resolved to MISSING on every raw-material child in production, and
+     * `thickness_mm` only survived by accident, because the BOQ import happens
+     * to copy it into `fab_items.height`. An item created any other way lost it.
+     * That is the same defect this whole registry was built to fix, one level up.
+     *
+     * They are READ here rather than migrated into `fab_custom_fields`, which is
+     * a deliberate departure from the plan's Phase 3 and worth stating:
+     * `rawMaterialService` filters the material picker on `thickness_mm` in SQL,
+     * `itemWeightService` computes weight from `density_kg_m3` and
+     * `section_area_mm2`, and Phase 6 will match stock on dimensions in SQL.
+     * Turning those into key-value rows makes each of them a pivot. The registry
+     * is the single DEFINITION of what a field is; it does not have to be the
+     * single storage of every value. What matters is that exactly one place
+     * knows where each field lives — this map — instead of four services each
+     * assuming.
+     */
+    const catalogCols = {};
+    if (item.catThickness != null) catalogCols.thickness_mm = item.catThickness;
+    if (item.catDensity != null) catalogCols.density_kg_m3 = item.catDensity;
+    if (item.catSectionArea != null) catalogCols.section_area_mm2 = item.catSectionArea;
+
     // Lowest precedence first, so each later assignment overwrites. An explicit
-    // field value beats the legacy column: if somebody has stated it as a field,
-    // that is the more deliberate act.
+    // field value beats a column: if somebody has stated it as a field, that is
+    // the more deliberate act. The catalog's columns sit just under its own
+    // custom fields for the same reason.
     const sources = [
       at('category', item.categoryId),
       at('group', item.groupId),
       at('subgroup', item.subgroupId),
+      catalogCols,
       at(CATALOG_LEVEL, item.catalogItemId),
       legacyDims,
       at(ORDER_ITEM_LEVEL, item.id),
@@ -202,8 +258,16 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
     // field (`thickness_mm` on one plate) would override the item's own value
     // for that piece alone, and the two would disagree with nothing to say
     // which was right.
-    const pieceVals = at(PIECE_LEVEL, pieceId);
-    if (pieceVals) {
+    //
+    // The piece's own dimension COLUMNS are folded in first, under any explicit
+    // piece-level field, on the same reasoning as the catalog columns above:
+    // `fab_stock_pieces.length_mm`/`width_mm` are matched in SQL by procurement
+    // and, from Phase 6, by consumption, so they stay columns and are read here
+    // rather than moved. Before this they were invisible to every formula — a
+    // 6000 mm coil issued against a 12000 mm nominal simply never reached one.
+    const pieceCols = pieceId != null ? (pieceDimsById.get(pieceId) ?? {}) : {};
+    const pieceVals = { ...pieceCols, ...(at(PIECE_LEVEL, pieceId) ?? {}) };
+    if (pieceId != null) {
       for (const [key, raw] of Object.entries(pieceVals)) {
         const def = registry.get(key);
         if (!def || !authoredOnPiece(def)) continue;
