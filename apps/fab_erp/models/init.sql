@@ -4608,3 +4608,203 @@ SET @sql = IF(@col=0,
      ADD COLUMN units_uom         VARCHAR(20)   NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ CATALOG UNIFICATION, PHASE 10 (2026-08-17) ═════════════════════════════
+-- The machine<->stock-area coupling, driven by the standard structure instead
+-- of a hardcoded two-sided model.
+--
+-- WHAT WAS WRONG WITH IT. `fab_buffers` keys on (resource_id, kind) where kind
+-- is 'input' or 'output', and resolves a buffer to a location by falling back
+-- to the naming convention `WIP-M<resource id>` — the SAME location for both
+-- sides. So a machine's input buffer and its output buffer measure one pile,
+-- and `isOutputBlocked`'s test that both sides are simultaneously full compares
+-- a number with itself. The two-sided model was never real in the data.
+--
+-- It also cannot express two things a shop actually has: a staging bay shared
+-- by three machines, and a machine with more than two areas.
+--
+-- NOT TOUCHED: `fab_cc_buffers`. Those are the critical chain's TIME buffers —
+-- a completely different concept that happens to share the word. 270 of them
+-- exist in production and none of this goes near them.
+
+-- ── Capacity belongs to the AREA ──────────────────────────────────────────
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_locations'
+               AND COLUMN_NAME='capacity_value');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_stock_locations
+     ADD COLUMN capacity_value    DECIMAL(18,4) NULL,
+     ADD COLUMN capacity_uom      VARCHAR(20)   NULL,
+     ADD COLUMN warn_pct          INT           NULL,
+     ADD COLUMN block_pct         INT           NULL,
+     ADD COLUMN weight_metric_key VARCHAR(100)  NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── A machine's areas, with roles ─────────────────────────────────────────
+--
+-- Many-to-many on purpose: one machine may have several areas, and one area may
+-- serve several machines. Neither is expressible today, and both are ordinary.
+CREATE TABLE IF NOT EXISTS fab_resource_stock_areas (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT NOT NULL,
+  resource_id       INT NOT NULL,
+  stock_location_id INT NOT NULL,
+  -- 'input' | 'output' | 'wip'. Free text rather than an enum so a shop can add
+  -- a role without a migration, which is the whole point of moving off the
+  -- hardcoded two-sided model.
+  role              VARCHAR(20) NOT NULL DEFAULT 'wip',
+  active            TINYINT(1)  NOT NULL DEFAULT 1,
+  notes             TEXT NULL,
+  deleted_at        DATETIME NULL,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_frsa_resource (company_id, resource_id, role),
+  KEY idx_frsa_location (company_id, stock_location_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── Migrate the existing buffers ──────────────────────────────────────────
+--
+-- Each buffer's capacity moves onto the location it ALREADY resolves to, and a
+-- role link is created. Behaviour is preserved exactly, including the quirk
+-- that both sides currently point at one area: making them distinct areas is an
+-- operational decision about the shop floor, not something a migration should
+-- decide on somebody's behalf.
+UPDATE fab_stock_locations l
+  JOIN (
+    SELECT COALESCE(b.stock_location_id,
+                    (SELECT x.id FROM fab_stock_locations x
+                      WHERE x.company_id = b.company_id
+                        AND x.code = CONCAT('WIP-M', b.resource_id)
+                        AND x.deleted_at IS NULL LIMIT 1)) AS loc_id,
+           MAX(b.capacity_value) AS capacity_value,
+           MAX(b.capacity_uom)   AS capacity_uom,
+           MAX(b.warn_pct)       AS warn_pct,
+           MAX(b.block_pct)      AS block_pct,
+           MAX(b.weight_metric_key) AS weight_metric_key
+      FROM fab_buffers b
+     WHERE b.deleted_at IS NULL AND b.active = 1
+     GROUP BY loc_id
+  ) src ON src.loc_id = l.id
+   SET l.capacity_value = COALESCE(l.capacity_value, src.capacity_value),
+       l.capacity_uom = COALESCE(l.capacity_uom, src.capacity_uom),
+       l.warn_pct = COALESCE(l.warn_pct, src.warn_pct),
+       l.block_pct = COALESCE(l.block_pct, src.block_pct),
+       l.weight_metric_key = COALESCE(l.weight_metric_key, src.weight_metric_key)
+ WHERE l.deleted_at IS NULL;
+
+INSERT INTO fab_resource_stock_areas
+  (company_id, resource_id, stock_location_id, role, active, notes)
+SELECT b.company_id, b.resource_id,
+       COALESCE(b.stock_location_id,
+                (SELECT x.id FROM fab_stock_locations x
+                  WHERE x.company_id = b.company_id
+                    AND x.code = CONCAT('WIP-M', b.resource_id)
+                    AND x.deleted_at IS NULL LIMIT 1)),
+       b.kind, b.active,
+       'Migrated from fab_buffers 2026-08-17'
+  FROM fab_buffers b
+ WHERE b.deleted_at IS NULL AND b.active = 1
+   AND COALESCE(b.stock_location_id,
+                (SELECT x.id FROM fab_stock_locations x
+                  WHERE x.company_id = b.company_id
+                    AND x.code = CONCAT('WIP-M', b.resource_id)
+                    AND x.deleted_at IS NULL LIMIT 1)) IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_resource_stock_areas a
+                    WHERE a.company_id = b.company_id AND a.resource_id = b.resource_id
+                      AND a.role = b.kind AND a.deleted_at IS NULL);
+
+-- Every machine that has a WIP area but no buffer gets a plain 'wip' link, so
+-- the new structure describes the whole shop rather than only the three
+-- machines somebody happened to configure buffers for.
+INSERT INTO fab_resource_stock_areas
+  (company_id, resource_id, stock_location_id, role, active, notes)
+SELECT r.company_id, r.id, r.stock_location_id, 'wip', 1,
+       'Backfilled from fab_resources.stock_location_id 2026-08-17'
+  FROM fab_resources r
+ WHERE r.deleted_at IS NULL AND r.stock_location_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_resource_stock_areas a
+                    WHERE a.company_id = r.company_id AND a.resource_id = r.id
+                      AND a.stock_location_id = r.stock_location_id
+                      AND a.deleted_at IS NULL);
+
+-- ── Provision the areas that active buffers point at but never had ─────────
+--
+-- Found by verify-buffer-migration.mjs on production: of six active buffers,
+-- four resolved to NO location at all. `bufferLocationId` falls back to a
+-- location named `WIP-M<resource id>`, and that location had only ever been
+-- created for machines that had actually run work through them
+-- (`ensureMachineWipLocation` provisions on first use). So somebody configured
+-- a 5000 kg limit on three machines and it has been inert on two of them ever
+-- since — measured against nothing, never able to warn or block.
+--
+-- Migrating only the buffers that happen to resolve would carry that silence
+-- into the new structure and make it permanent. Provisioning the area instead
+-- makes the configuration mean what it says.
+--
+-- THIS IS A BEHAVIOUR CHANGE, and a deliberate one: those buffers become live.
+-- Safe to do now specifically because there are zero WIP pieces anywhere, so
+-- every newly-live area starts empty at 0% and nothing can begin blocked.
+INSERT INTO fab_stock_locations (company_id, plant_id, name, code, description)
+SELECT DISTINCT r.company_id, r.plant_id,
+       CONCAT(COALESCE(r.name, CONCAT('Machine #', r.id)), ' WIP'),
+       CONCAT('WIP-M', r.id),
+       'Auto-provisioned for a buffer that had no area (catalog unification Phase 10)'
+  FROM fab_buffers b
+  JOIN fab_resources r ON r.id = b.resource_id AND r.deleted_at IS NULL
+ WHERE b.deleted_at IS NULL AND b.active = 1 AND b.stock_location_id IS NULL
+   AND r.plant_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_stock_locations x
+                    WHERE x.company_id = r.company_id
+                      AND x.code = CONCAT('WIP-M', r.id) AND x.deleted_at IS NULL);
+-- rerun the capacity + link migration now those areas exist
+--
+-- Repeated deliberately. init.sql runs top to bottom, and the provisioning
+-- above happens AFTER the migration below ran and skipped those machines — so
+-- on a single pass their links would still be missing, and would only appear
+-- the next time anybody happened to run the file. Both statements are
+-- NOT EXISTS / COALESCE guarded, so running them a second time is a no-op for
+-- everything already migrated.
+UPDATE fab_stock_locations l
+  JOIN (
+    SELECT COALESCE(b.stock_location_id,
+                    (SELECT x.id FROM fab_stock_locations x
+                      WHERE x.company_id = b.company_id
+                        AND x.code = CONCAT('WIP-M', b.resource_id)
+                        AND x.deleted_at IS NULL LIMIT 1)) AS loc_id,
+           MAX(b.capacity_value) AS capacity_value,
+           MAX(b.capacity_uom)   AS capacity_uom,
+           MAX(b.warn_pct)       AS warn_pct,
+           MAX(b.block_pct)      AS block_pct,
+           MAX(b.weight_metric_key) AS weight_metric_key
+      FROM fab_buffers b
+     WHERE b.deleted_at IS NULL AND b.active = 1
+     GROUP BY loc_id
+  ) src ON src.loc_id = l.id
+   SET l.capacity_value = COALESCE(l.capacity_value, src.capacity_value),
+       l.capacity_uom = COALESCE(l.capacity_uom, src.capacity_uom),
+       l.warn_pct = COALESCE(l.warn_pct, src.warn_pct),
+       l.block_pct = COALESCE(l.block_pct, src.block_pct),
+       l.weight_metric_key = COALESCE(l.weight_metric_key, src.weight_metric_key)
+ WHERE l.deleted_at IS NULL;
+
+INSERT INTO fab_resource_stock_areas
+  (company_id, resource_id, stock_location_id, role, active, notes)
+SELECT b.company_id, b.resource_id,
+       COALESCE(b.stock_location_id,
+                (SELECT x.id FROM fab_stock_locations x
+                  WHERE x.company_id = b.company_id
+                    AND x.code = CONCAT('WIP-M', b.resource_id)
+                    AND x.deleted_at IS NULL LIMIT 1)),
+       b.kind, b.active,
+       'Migrated from fab_buffers 2026-08-17'
+  FROM fab_buffers b
+ WHERE b.deleted_at IS NULL AND b.active = 1
+   AND COALESCE(b.stock_location_id,
+                (SELECT x.id FROM fab_stock_locations x
+                  WHERE x.company_id = b.company_id
+                    AND x.code = CONCAT('WIP-M', b.resource_id)
+                    AND x.deleted_at IS NULL LIMIT 1)) IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_resource_stock_areas a
+                    WHERE a.company_id = b.company_id AND a.resource_id = b.resource_id
+                      AND a.role = b.kind AND a.deleted_at IS NULL);

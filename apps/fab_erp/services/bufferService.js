@@ -296,3 +296,81 @@ export async function resolveNextInputBuffer(companyId, task, conn) {
   }
   return null;
 }
+
+/**
+ * A machine's stock areas, by role, from the STANDARD STRUCTURE.
+ *
+ * `fab_resource_stock_areas` replaces the hardcoded (resource_id, kind) shape
+ * of `fab_buffers`. Two things it can express that the old model could not:
+ * an area shared by several machines, and a machine with more than two areas.
+ *
+ * FALLS BACK TO `fab_buffers`, per the plan's dual-read rule. Nothing is deleted
+ * until a period of clean divergence reports, so a company whose links have not
+ * been migrated behaves exactly as before rather than losing its buffers the
+ * day this ships.
+ */
+export async function resourceAreas(companyId, resourceId, { role = null, conn = null } = {}) {
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT a.id, a.stock_location_id AS locationId, a.role,
+            l.code AS locationCode, l.name AS locationName,
+            l.capacity_value AS capacityValue, l.capacity_uom AS capacityUom,
+            l.warn_pct AS warnPct, l.block_pct AS blockPct,
+            l.weight_metric_key AS weightMetricKey
+       FROM fab_resource_stock_areas a
+       JOIN fab_stock_locations l ON l.id = a.stock_location_id AND l.deleted_at IS NULL
+      WHERE a.company_id = ? AND a.resource_id = ? AND a.active = 1 AND a.deleted_at IS NULL
+        ${role ? 'AND a.role = ?' : ''}
+      ORDER BY a.role`,
+    role ? [companyId, resourceId, role] : [companyId, resourceId],
+  );
+  if (rows.length) return rows;
+
+  // Fallback: the old table, read in the new shape so callers see one thing.
+  const [legacy] = await exec.query(
+    `SELECT b.id, b.stock_location_id AS locationId, b.kind AS role,
+            NULL AS locationCode, NULL AS locationName,
+            b.capacity_value AS capacityValue, b.capacity_uom AS capacityUom,
+            b.warn_pct AS warnPct, b.block_pct AS blockPct,
+            b.weight_metric_key AS weightMetricKey
+       FROM fab_buffers b
+      WHERE b.company_id = ? AND b.resource_id = ? AND b.active = 1 AND b.deleted_at IS NULL
+        ${role ? 'AND b.kind = ?' : ''}`,
+    role ? [companyId, resourceId, role] : [companyId, resourceId],
+  );
+  return legacy;
+}
+
+/**
+ * How full one AREA is, and whether that is a problem.
+ *
+ * The area-based equivalent of `loadOf`, which takes a buffer id. An area with
+ * no capacity recorded returns `status: null` rather than 'ok' — "nobody has
+ * said how much fits here" and "there is plenty of room" are different facts,
+ * and rendering the first as the second is how a lane looks healthy while the
+ * shop stands still.
+ */
+export async function loadOfArea(companyId, area, conn = null) {
+  const exec = conn ?? pool;
+  if (!area?.locationId) return { pct: null, status: null, reason: 'no stock area' };
+
+  const agg = await loadAtLocation(exec, companyId, area.locationId, area.weightMetricKey);
+  const capacity = area.capacityValue == null ? null : Number(area.capacityValue);
+  if (capacity == null || !(capacity > 0)) {
+    return {
+      locationId: area.locationId, pct: null, status: null,
+      weightSum: agg.weightSum, qtySum: agg.qtySum, pieces: agg.cnt,
+      reason: 'no capacity recorded for this area',
+    };
+  }
+
+  const load = deriveLoad(
+    { capacity_value: capacity, capacity_uom: area.capacityUom, warn_pct: area.warnPct, block_pct: area.blockPct },
+    agg,
+  );
+  return {
+    locationId: area.locationId,
+    ...load,
+    warnPct: area.warnPct, blockPct: area.blockPct,
+  };
+}
