@@ -4808,3 +4808,119 @@ SELECT b.company_id, b.resource_id,
    AND NOT EXISTS (SELECT 1 FROM fab_resource_stock_areas a
                     WHERE a.company_id = b.company_id AND a.resource_id = b.resource_id
                       AND a.role = b.kind AND a.deleted_at IS NULL);
+
+-- ══ CATALOG UNIFICATION, PHASE 7 (2026-08-17) ══════════════════════════════
+-- Named pick lists, defined by rules over the taxonomy.
+--
+-- The material picker's rule was a SUBTRACTION: everything bought, minus
+-- consumables and fasteners. Subtraction means every category added later is
+-- included by default until somebody remembers to exclude it — which is how
+-- paint and welding flux ended up offered as things to cut a flange from.
+--
+-- A scope is an INCLUSION. An item qualifies if it matches any include rule and
+-- no exclude rule; within one rule the fields are ANDed. That gives
+-- "raw materials", "raw materials AND group metals", "raw materials OR
+-- semi-finished" and "everything bought except consumables" in one shape.
+CREATE TABLE IF NOT EXISTS fab_item_scopes (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT NOT NULL,
+  scope_key   VARCHAR(60)  NOT NULL,
+  label       VARCHAR(160) NOT NULL,
+  notes       TEXT NULL,
+  active      TINYINT(1) NOT NULL DEFAULT 1,
+  deleted_at  DATETIME NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fis_company_key (company_id, scope_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS fab_item_scope_rules (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT NOT NULL,
+  scope_id         INT NOT NULL,
+  -- 'include' | 'exclude'. Excludes always win.
+  rule_type        VARCHAR(10) NOT NULL DEFAULT 'include',
+  -- Every field NULL means "any". Non-null fields are ANDed within the rule.
+  category_id      INT NULL,
+  group_id         INT NULL,
+  subgroup_id      INT NULL,
+  procurement_type VARCHAR(10) NULL,
+  material_form    VARCHAR(20) NULL,
+  notes            TEXT NULL,
+  deleted_at       DATETIME NULL,
+  created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fisr_scope (company_id, scope_id, rule_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── Where a scope applies ─────────────────────────────────────────────────
+--
+-- The two-tier resolution asked for on 2026-08-16: the ORDER LINE's type wins,
+-- the STRUCTURE LEVEL is the fallback, and a binding with neither is the global
+-- default for that purpose.
+--
+-- The chain MUST NOT be able to resolve to nothing. An empty picker looks
+-- exactly like "we have no stock" and gets filed as a data problem, so a
+-- missing binding falls through to the global default rather than to silence.
+CREATE TABLE IF NOT EXISTS fab_item_scope_bindings (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT NOT NULL,
+  scope_id    INT NOT NULL,
+  -- What is being picked: 'bom_material' | 'spares' | 'machines'.
+  purpose     VARCHAR(40) NOT NULL,
+  -- NULL = applies to any. Both NULL = the global default for this purpose.
+  line_type   VARCHAR(40) NULL,
+  level_kind  VARCHAR(20) NULL,
+  active      TINYINT(1) NOT NULL DEFAULT 1,
+  deleted_at  DATETIME NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_fisb (company_id, purpose, line_type, level_kind)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ── Seed the three standard scopes ────────────────────────────────────────
+INSERT INTO fab_item_scopes (company_id, scope_key, label, notes)
+SELECT co.id, s.k, s.l, s.n
+  FROM companies co
+  JOIN (SELECT 'bom_material' AS k, 'What a part is cut from' AS l,
+               'Raw materials. Narrow it to a group (Metals) or a subgroup (Plate) by adding fields to the include rule.' AS n
+        UNION ALL SELECT 'spares', 'Spare parts', 'MRO and spares, for machine purchase orders.'
+        UNION ALL SELECT 'machines', 'Machines', 'Machine types, for buying new plant.') s
+ WHERE NOT EXISTS (SELECT 1 FROM fab_item_scopes x
+                    WHERE x.company_id = co.id AND x.scope_key = s.k AND x.deleted_at IS NULL);
+
+-- bom_material: INCLUDE raw materials. This is the change from the old
+-- subtraction rule, and it is what was asked for on 2026-08-16 — "filter for
+-- category raw materials instead of all buy".
+INSERT INTO fab_item_scope_rules (company_id, scope_id, rule_type, category_id, notes)
+SELECT sc.company_id, sc.id, 'include', cat.id, 'Raw materials'
+  FROM fab_item_scopes sc
+  JOIN fab_item_categories cat ON cat.company_id = sc.company_id AND cat.code = 'rm' AND cat.deleted_at IS NULL
+ WHERE sc.scope_key = 'bom_material' AND sc.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_item_scope_rules r
+                    WHERE r.scope_id = sc.id AND r.deleted_at IS NULL);
+
+INSERT INTO fab_item_scope_rules (company_id, scope_id, rule_type, category_id, notes)
+SELECT sc.company_id, sc.id, 'include', cat.id, 'MRO and spares'
+  FROM fab_item_scopes sc
+  JOIN fab_item_categories cat ON cat.company_id = sc.company_id AND cat.code = 'mro' AND cat.deleted_at IS NULL
+ WHERE sc.scope_key = 'spares' AND sc.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_item_scope_rules r
+                    WHERE r.scope_id = sc.id AND r.deleted_at IS NULL);
+
+INSERT INTO fab_item_scope_rules (company_id, scope_id, rule_type, category_id, notes)
+SELECT sc.company_id, sc.id, 'include', cat.id, 'Machine types'
+  FROM fab_item_scopes sc
+  JOIN fab_item_categories cat ON cat.company_id = sc.company_id AND cat.code = 'mach' AND cat.deleted_at IS NULL
+ WHERE sc.scope_key = 'machines' AND sc.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_item_scope_rules r
+                    WHERE r.scope_id = sc.id AND r.deleted_at IS NULL);
+
+-- Global default bindings: no line_type, no level_kind.
+INSERT INTO fab_item_scope_bindings (company_id, scope_id, purpose, line_type, level_kind)
+SELECT sc.company_id, sc.id, sc.scope_key, NULL, NULL
+  FROM fab_item_scopes sc
+ WHERE sc.deleted_at IS NULL AND sc.scope_key IN ('bom_material', 'spares', 'machines')
+   AND NOT EXISTS (SELECT 1 FROM fab_item_scope_bindings b
+                    WHERE b.company_id = sc.company_id AND b.purpose = sc.scope_key
+                      AND b.line_type IS NULL AND b.level_kind IS NULL AND b.deleted_at IS NULL);
