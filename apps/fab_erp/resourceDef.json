@@ -349,37 +349,6 @@
       }
     }
   },
-  "fabErpItemMetricDef": {
-    "table": "fab_item_metric_defs",
-    "alias": "fimd",
-    "writeFields": [
-      "metric_key",
-      "metric_label",
-      "data_type",
-      "unit"
-    ],
-    "fields": {
-      "id": "fimd.id",
-      "companyId": "fimd.company_id",
-      "metricKey": "fimd.metric_key",
-      "metricLabel": "fimd.metric_label",
-      "dataType": "fimd.data_type",
-      "unit": "fimd.unit",
-      "createdAt": "fimd.created_at",
-      "updatedAt": "fimd.updated_at"
-    },
-    "fieldTypes": {
-      "id": "integer",
-      "companyId": "integer",
-      "metricKey": "string",
-      "metricLabel": "string",
-      "dataType": "string",
-      "unit": "string",
-      "createdAt": "datetime",
-      "updatedAt": "datetime"
-    },
-    "relations": {}
-  },
   "fabErpProcessMaster": {
     "table": "fab_process_master",
     "alias": "fpm",

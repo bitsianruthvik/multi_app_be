@@ -4924,3 +4924,33 @@ SELECT sc.company_id, sc.id, sc.scope_key, NULL, NULL
    AND NOT EXISTS (SELECT 1 FROM fab_item_scope_bindings b
                     WHERE b.company_id = sc.company_id AND b.purpose = sc.scope_key
                       AND b.line_type IS NULL AND b.level_kind IS NULL AND b.deleted_at IS NULL);
+
+-- ══ CATALOG UNIFICATION, PHASE 11 (2026-08-17) ═════════════════════════════
+-- The destructive phase, run only against what the gate says is safe.
+--
+-- `scripts/verify-legacy-divergence.mjs` reports, per legacy source, whether it
+-- still agrees with its replacement AND whether any code still reads it. On
+-- production it marks exactly ONE source droppable:
+--
+--   fab_items.length/width/height  BLOCKED — 5 rows already disagree with the
+--                                  registry, and five services still read them
+--   fab_item_metric_values         BLOCKED — itemWeightService still WRITES it
+--   fab_buffers                    BLOCKED — bufferService falls back to it
+--   fab_field_defs.piece_varying   BLOCKED — authoredOnPiece falls back to it
+--   fab_item_metric_defs           DROPPABLE — no readers, no divergence
+--
+-- So only the last one goes. Everything else keeps its dual-read until its
+-- precondition is done; the report says what each one needs.
+--
+-- Verified before dropping: all eight metric keys (thickness_mm, length_mm,
+-- width_mm, unit_weight_kg, num_holes, edge_length_m, weld_length_m,
+-- surface_area_m2) exist in fab_field_defs, so nothing here is the only copy.
+-- Its resourceDef entry was removed first, so the generic API can no longer
+-- reach it.
+--
+-- NOT dropped: fab_item_metric_VALUES. Same era, similar name, entirely
+-- different situation — it is still written on every weight roll-up.
+SET @tbl = (SELECT COUNT(*) FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_metric_defs');
+SET @sql = IF(@tbl=1, 'DROP TABLE fab_item_metric_defs', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
