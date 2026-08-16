@@ -1023,6 +1023,17 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       if (txErr?.code === 'INSUFFICIENT_STOCK') {
         return res.status(409).json({ code: 'INSUFFICIENT_STOCK', message: txErr.message });
       }
+      /**
+       * Kept SEPARATE from a shortage, deliberately.
+       *
+       * "Not enough stock" invites somebody to go and buy more. This is not a
+       * shortage — it is an item classified as something that never gets issued
+       * as material (a machine, tooling, a spare), and the fix is to correct the
+       * BOM or the classification, not the yard.
+       */
+      if (txErr?.code === 'NOT_CONSUMABLE') {
+        return res.status(409).json({ code: 'NOT_CONSUMABLE', message: txErr.message });
+      }
       throw txErr;
     } finally {
       conn.release();

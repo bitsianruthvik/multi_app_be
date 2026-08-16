@@ -31,6 +31,7 @@
  */
 
 import { generateCode } from './codegenService.js';
+import { isConsumable } from './itemFieldService.js';
 
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
@@ -149,15 +150,93 @@ async function resolveTaskPlant(conn, companyId, assignedResourceId) {
 }
 
 /** FIFO-consume `required` units of a catalog item from in-stock pieces. */
-async function consumeStock(conn, companyId, catalogItemId, required, { txnType, notes }) {
+/**
+ * Draw `required` of a catalog item from stock.
+ *
+ * @param {{lengthMm?:number|null, widthMm?:number|null}} [want]
+ *        The size NESTING declared for the plate. When present, only pieces of
+ *        exactly that size are eligible.
+ *
+ * TWO RULES, BOTH ADDED 2026-08-16, BOTH ABOUT TAKING THE WRONG THING.
+ *
+ * SIZE. This used to FIFO-pick any in-stock piece of the catalog item with no
+ * size check at all, so a job needing a 2000x1000 offcut would happily consume
+ * the 12000x2500 sheet that happened to arrive first. Nesting is done outside,
+ * deliberately, and a declared plate size is a decision — every plate in the
+ * yard is already earmarked for a specific nest, so taking a larger one does
+ * not merely create an offcut, it steals the plate another nest needs. The
+ * match is therefore EXACT, never "at least as large".
+ *
+ * A requirement with NO declared size falls back to catalog-only matching, so
+ * orders created before nesting existed keep working exactly as they did.
+ *
+ * CONSUMABILITY. A category marked `consumable = no` — machines, tooling,
+ * spares — is refused outright. That is what will stop a machine being issued
+ * into a girder once machines become catalog items in Phase 8, and it is
+ * enforced here rather than as a machine special-case so it holds for anything
+ * anybody classifies that way later. It fails OPEN on an unset value: refusing
+ * to issue material is a hard block on shop-floor work, and an unclassified
+ * category must not stop a job that runs fine today.
+ */
+async function consumeStock(conn, companyId, catalogItemId, required, { txnType, notes, want = null }) {
   if (!(required > 0)) return true;
+
+  if (!(await isConsumable(companyId, catalogItemId, conn))) {
+    // Not a shortage — a category error. Saying "not enough stock" about a
+    // machine would send somebody to buy another one.
+    const e = new Error(
+      `Catalog item #${catalogItemId} is marked as not consumable, so it cannot be issued as material.`,
+    );
+    e.code = 'NOT_CONSUMABLE';
+    throw e;
+  }
+
+  /**
+   * The size filter engages PER ITEM, only once that item has measured stock.
+   *
+   * `fab_stock_pieces.length_mm`/`width_mm` were dead columns until 2026-08-16 —
+   * nothing ever wrote them — so every piece in an existing yard has no recorded
+   * size. Applying an exact-size filter against that would match nothing and
+   * refuse every material issue: replaying production before this guard existed
+   * showed all six live material links failing, which would have stopped both
+   * open orders at the first Start button.
+   *
+   * So: if no in-stock piece of this item carries a size, the filter has no
+   * information to act on and is skipped — behaviour is exactly as before. The
+   * moment a measured piece of that item is received (the GRN screen now asks),
+   * matching engages for that item and stays engaged. The rule arrives with the
+   * data rather than ahead of it, per item, with no flag to remember to flip.
+   */
+  const wantsSize = want && (want.lengthMm != null || want.widthMm != null);
+  let sized = false;
+  if (wantsSize) {
+    const [[m]] = await conn.query(
+      `SELECT COUNT(*) AS measured FROM fab_stock_pieces
+        WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
+          AND deleted_at IS NULL AND qty > 0
+          AND (length_mm IS NOT NULL OR width_mm IS NOT NULL)`,
+      [companyId, catalogItemId],
+    );
+    sized = Number(m?.measured) > 0;
+  }
+
+  const params = [companyId, catalogItemId];
+  let sizeWhere = '';
+  if (sized) {
+    // NULL-safe equality: a piece with no recorded size does not match a sized
+    // requirement, which is the point — an unmeasured plate is not evidence of
+    // the right plate.
+    sizeWhere = ' AND length_mm <=> ? AND width_mm <=> ?';
+    params.push(want.lengthMm ?? null, want.widthMm ?? null);
+  }
+
   const [pieces] = await conn.query(
     `SELECT id, qty, plant_id, stock_location_id, batch_no FROM fab_stock_pieces
       WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
-        AND deleted_at IS NULL AND qty > 0
+        AND deleted_at IS NULL AND qty > 0${sizeWhere}
       ORDER BY (received_date IS NULL), received_date ASC, id ASC
       FOR UPDATE`,
-    [companyId, catalogItemId],
+    params,
   );
   let remaining = Number(required);
   for (const p of pieces) {
@@ -194,7 +273,10 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
  */
 async function claimNest(conn, companyId, task, node, inp, required) {
   const [[link]] = await conn.query(
-    `SELECT nest_no, qty FROM fab_items
+    // length/width are the PLATE's, as declared in nesting — never the part's.
+    // Comparing a part's own size against stock would match the thing being
+    // made with the thing it is made from.
+    `SELECT nest_no, qty, length, width FROM fab_items
       WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id = ?
         AND flow_id IS NULL AND deleted_at IS NULL
       LIMIT 1`,
@@ -202,7 +284,14 @@ async function claimNest(conn, companyId, task, node, inp, required) {
   );
 
   const nestNo = link?.nest_no ?? null;
-  if (!nestNo) return { qty: required, nestNo: null, claimId: null };
+  const want = {
+    lengthMm: link?.length != null ? Number(link.length) : null,
+    widthMm: link?.width != null ? Number(link.width) : null,
+  };
+  // An un-nested link still carries a declared plate size when the BOQ gave it
+  // one, and it should still be honoured — nesting is what names the plate, not
+  // what makes the size real.
+  if (!nestNo) return { qty: required, nestNo: null, claimId: null, want };
 
   // On a nested link the quantity describes the PLATE, not the part — the
   // Nesting sheet carries one row per plate, so every link cut from it inherits
@@ -217,7 +306,7 @@ async function claimNest(conn, companyId, task, node, inp, required) {
        VALUES (?,?,?,?,?,?,?,?)`,
       [companyId, orderId, inp.ref_catalog_item_id, nestNo, qty, inp.unit ?? null, task.id, node.id],
     );
-    return { qty, nestNo, claimId: ins.insertId };
+    return { qty, nestNo, claimId: ins.insertId, want };
   } catch (err) {
     if (err?.code === 'ER_DUP_ENTRY') return null; // already on the floor
     throw err;
@@ -268,6 +357,9 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
 
         const ok = await consumeStock(conn, companyId, inp.ref_catalog_item_id, nest.qty, {
           txnType: 'wip_issue',
+          // The size nesting declared for this plate. Only a piece of exactly
+          // that size will do — see consumeStock.
+          want: nest.want,
           notes: nest.nestNo
             ? `issued nest ${nest.nestNo} to item ${node.id} (task ${task.id})`
             : `issued to item ${node.id} (task ${task.id})`,
@@ -279,7 +371,21 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
           if (nest.claimId) {
             await conn.query('DELETE FROM fab_nest_issues WHERE id = ?', [nest.claimId]);
           }
-          throw insufficientStock(`Not enough raw material (catalog item #${inp.ref_catalog_item_id}) in stock to start this task.`);
+          /**
+           * Name the SIZE when one was asked for.
+           *
+           * "Not enough raw material in stock" sends somebody to look at a
+           * shelf that may be full of the same item in the wrong size, and
+           * conclude the system is wrong. "No 3000×1500 plate of MSP-16 in
+           * stock" is the actual situation and says what to order.
+           */
+          const size = nest.want && (nest.want.lengthMm != null || nest.want.widthMm != null)
+            ? ` at ${nest.want.lengthMm ?? '?'}×${nest.want.widthMm ?? '?'} mm`
+            : '';
+          throw insufficientStock(
+            `Not enough raw material (catalog item #${inp.ref_catalog_item_id})${size} in stock to start this task.`
+            + (size ? ' Stock of the same item in other sizes does not count — the nest names this plate.' : ''),
+          );
         }
       }
     }
