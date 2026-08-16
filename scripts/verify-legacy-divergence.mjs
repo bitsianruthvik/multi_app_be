@@ -29,6 +29,42 @@ import { resolveItemFields } from '../apps/fab_erp/services/itemFieldService.js'
 const only = Number(process.argv[2]) || null;
 let blocked = 0;
 let diverged = 0;
+let done = 0;
+
+/**
+ * A CHECK MUST SURVIVE ITS OWN SUCCESS.
+ *
+ * Learned immediately: the first drop this script authorised was
+ * `fab_item_metric_defs`, and the next run died on `ER_NO_SUCH_TABLE` querying
+ * it — before printing a single verdict. A gate that works exactly once, and
+ * then hides the status of every source after it, is worse than no gate,
+ * because the failure looks like a broken script rather than a missing report.
+ *
+ * So every check asks whether its source still exists before measuring it, and
+ * reports a dropped source as DONE. The point is to re-run this as each
+ * precondition lands and watch the list shorten.
+ */
+const tableExists = async (t) => {
+  const [[r]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.TABLES
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, [t],
+  );
+  return Number(r.n) > 0;
+};
+
+const columnExists = async (t, c) => {
+  const [[r]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`, [t, c],
+  );
+  return Number(r.n) > 0;
+};
+
+const reportDone = (name) => {
+  done++;
+  console.log(`\nDONE       ${name}`);
+  console.log('   already dropped — nothing left to check');
+};
 
 const report = (name, { divergence, readers, precondition }) => {
   const ok = divergence === 0 && readers.length === 0;
@@ -56,7 +92,8 @@ console.log(`Checking ${companies.length} company(ies)…`);
 // moment a field value is set that disagrees with the column, which is fine
 // while both are read and fatal the day one is dropped.
 let dimDiverge = 0;
-for (const co of companies) {
+const dimsLive = await columnExists('fab_items', 'length');
+for (const co of dimsLive ? companies : []) {
   const [items] = await pool.query(
     `SELECT id, length, width, height FROM fab_items
       WHERE company_id = ? AND deleted_at IS NULL
@@ -76,7 +113,8 @@ for (const co of companies) {
     }
   }
 }
-report('fab_items.length / width / height', {
+if (!dimsLive) reportDone('fab_items.length / width / height');
+else report('fab_items.length / width / height', {
   divergence: dimDiverge,
   readers: ['nestingBoardService', 'nestingSheetService', 'boqSheetService',
     'nestingIntegrityService', 'itemsImportService'],
@@ -85,7 +123,8 @@ report('fab_items.length / width / height', {
 
 // ── 2. fab_item_metric_values vs fab_custom_fields ────────────────────────
 let metricDiverge = 0;
-for (const co of companies) {
+const metricValsLive = await tableExists('fab_item_metric_values');
+for (const co of metricValsLive ? companies : []) {
   const [[d]] = await pool.query(
     `SELECT COUNT(*) AS n FROM fab_item_metric_values v
       WHERE v.company_id = ? AND v.deleted_at IS NULL
@@ -97,7 +136,8 @@ for (const co of companies) {
   );
   metricDiverge += Number(d.n) || 0;
 }
-report('fab_item_metric_values', {
+if (!metricValsLive) reportDone('fab_item_metric_values');
+else report('fab_item_metric_values', {
   divergence: metricDiverge,
   readers: ['itemWeightService (WRITES it)', 'bufferService', 'machineAnalyticsService',
     'taskGatingService', 'routes/analytics', 'routes/buffers'],
@@ -107,7 +147,8 @@ report('fab_item_metric_values', {
 
 // ── 3. fab_buffers vs fab_resource_stock_areas ────────────────────────────
 let bufDiverge = 0;
-for (const co of companies) {
+const buffersLive = await tableExists('fab_buffers');
+for (const co of buffersLive ? companies : []) {
   const [[d]] = await pool.query(
     `SELECT COUNT(*) AS n FROM fab_buffers b
       WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.active = 1
@@ -118,7 +159,8 @@ for (const co of companies) {
   );
   bufDiverge += Number(d.n) || 0;
 }
-report('fab_buffers', {
+if (!buffersLive) reportDone('fab_buffers');
+else report('fab_buffers', {
   divergence: bufDiverge,
   readers: ['bufferService (falls back to it)', 'taskGatingService', 'routes/buffers'],
   precondition: 'remove the fallback in bufferService.resourceAreas once every company has '
@@ -127,7 +169,8 @@ report('fab_buffers', {
 
 // ── 4. fab_field_defs.piece_varying vs level ──────────────────────────────
 let pvDiverge = 0;
-for (const co of companies) {
+const pvLive = await columnExists('fab_field_defs', 'piece_varying');
+for (const co of pvLive ? companies : []) {
   const [[d]] = await pool.query(
     `SELECT COUNT(*) AS n FROM fab_field_defs
       WHERE company_id = ? AND deleted_at IS NULL
@@ -136,7 +179,8 @@ for (const co of companies) {
   );
   pvDiverge += Number(d.n) || 0;
 }
-report('fab_field_defs.piece_varying', {
+if (!pvLive) reportDone('fab_field_defs.piece_varying');
+else report('fab_field_defs.piece_varying', {
   divergence: pvDiverge,
   readers: ['itemFieldService (authoredOnPiece falls back to it)', 'resourceDef.fabErpFieldDef'],
   precondition: 'remove the fallback in fieldVocabulary.authoredOnPiece / authoredOnItem, '
@@ -144,24 +188,30 @@ report('fab_field_defs.piece_varying', {
 });
 
 // ── 5. fab_item_metric_defs — the one with no readers at all ──────────────
-let defRows = 0;
-for (const co of companies) {
-  const [[d]] = await pool.query(
-    'SELECT COUNT(*) AS n FROM fab_item_metric_defs WHERE company_id = ? AND deleted_at IS NULL',
-    [co.id],
-  );
-  defRows += Number(d.n) || 0;
+//
+// DROPPED 2026-08-17, on this script's own verdict. Kept in the list rather
+// than deleted, because the retirement sequence is easier to trust when you can
+// see what has already gone: five sources, one done, four to go.
+const metricDefsLive = await tableExists('fab_item_metric_defs');
+if (!metricDefsLive) {
+  reportDone('fab_item_metric_defs');
+} else {
+  let defRows = 0;
+  for (const co of companies) {
+    const [[d]] = await pool.query(
+      'SELECT COUNT(*) AS n FROM fab_item_metric_defs WHERE company_id = ? AND deleted_at IS NULL',
+      [co.id],
+    );
+    defRows += Number(d.n) || 0;
+  }
+  report('fab_item_metric_defs', { divergence: 0, readers: [], precondition: '—' });
+  console.log(`   (${defRows} row(s); every key was migrated into fab_field_defs in Phase 1)`);
 }
-report('fab_item_metric_defs', {
-  divergence: 0,
-  readers: [],
-  precondition: '—',
-});
-console.log(`   (${defRows} row(s); every key was migrated into fab_field_defs in Phase 1)`);
 
 console.log(
   `\n${diverged === 0 ? 'No divergence anywhere.' : `${diverged} source(s) DISAGREE with their replacement.`}`
-  + ` ${blocked} source(s) still have live readers.`,
+  + ` ${blocked} source(s) still have live readers.`
+  + ` ${done} already dropped.`,
 );
 console.log(blocked === 0 && diverged === 0
   ? 'Everything above is safe to drop.'
