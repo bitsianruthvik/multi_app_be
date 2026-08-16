@@ -36,6 +36,7 @@ import { missingFieldsForOrder } from './itemFieldService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder } from './procurementOrderService.js';
 import { flowSummary } from './flowAllocationService.js';
+import { checkOrderNesting, blockingIssues } from './nestingIntegrityService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { logger } from '../../../core/utils/logger.js';
 
@@ -165,7 +166,7 @@ export async function orderReadiness(companyId, orderId) {
   );
   if (!order) { const e = new Error('Order not found'); e.status = 404; throw e; }
 
-  const [lines, tree, nest, tasks, flows] = await Promise.all([
+  const [lines, tree, nest, tasks, flows, nestIntegrity] = await Promise.all([
     countLines(companyId, orderId),
     countTree(companyId, orderId),
     countNesting(companyId, orderId),
@@ -173,7 +174,12 @@ export async function orderReadiness(companyId, orderId) {
     // Reusing flowSummary rather than re-deriving it: the Flows tab and the
     // strip must never disagree about how many items still need a flow.
     flowSummary(companyId, orderId),
+    // Phase 5: a nesting that is physically impossible must not read as done.
+    // Counting links was never enough — every part could have material and the
+    // order still be uncuttable.
+    checkOrderNesting(companyId, orderId).catch(() => ({ ok: true, issues: [] })),
   ]);
+  const nestBlocking = blockingIssues(nestIntegrity);
 
   const flowState = summariseFlows(flows);
   const [proc, production, fields] = await Promise.all([
@@ -247,16 +253,31 @@ export async function orderReadiness(companyId, orderId) {
     {
       key: 'nesting',
       label: 'Nesting',
+      /**
+       * Every part having material was never enough to call this done.
+       * `nested >= parts` only counts links; it says nothing about whether the
+       * nesting is physically possible. An order where a 3000 mm part is
+       * declared as cut from a 2000 mm plate, or where a 16 mm part hangs off
+       * 40 mm plate, would read "All 12 part(s) have material" and go green —
+       * and the first person to find out was a cutter.
+       */
       state: nest.parts === 0 ? 'todo'
         : nest.nested === 0 ? 'todo'
-          : nest.nested < nest.parts ? 'partial' : 'done',
+          : nest.nested < nest.parts ? 'partial'
+            : nestBlocking.length > 0 ? 'partial' : 'done',
       count: nest.nested,
       total: nest.parts,
       detail: nest.parts === 0
         ? 'No parts to nest yet'
-        : nest.nested >= nest.parts
-          ? `All ${nest.parts} part(s) have material`
-          : `${nest.parts - nest.nested} of ${nest.parts} part(s) have no material`,
+        : nest.nested < nest.parts
+          ? `${nest.parts - nest.nested} of ${nest.parts} part(s) have no material`
+          : nestBlocking.length > 0
+            ? `All ${nest.parts} part(s) have material, but ${nestBlocking.length} `
+              + `${nestBlocking.length === 1 ? 'problem' : 'problems'} would make it uncuttable — `
+              + nestBlocking[0].message
+            : `All ${nest.parts} part(s) have material`,
+      /** The full list, so the screen can show every one rather than the first. */
+      issues: nestBlocking,
     },
     {
       key: 'tasks',

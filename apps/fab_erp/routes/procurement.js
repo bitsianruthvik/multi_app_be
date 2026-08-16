@@ -25,6 +25,7 @@ import {
 } from '../services/productionOrderService.js';
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
 import { releaseOrderReservations } from '../services/availabilityService.js';
+import { checkOrderNesting, blockingIssues } from '../services/nestingIntegrityService.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { pool } from '../../../db.js';
 
@@ -76,6 +77,25 @@ router.get('/orders/:orderId/procurement', protect, async (req, res) => {
 });
 
 /**
+ * GET /orders/:orderId/nesting/integrity — what is wrong with this nesting.
+ *
+ * Read-only, and the same answer the raise gate uses, so the screen can never
+ * show a clean nesting that procurement then refuses.
+ */
+router.get('/orders/:orderId/nesting/integrity', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_inventory_view');
+  if (!c) return;
+  const orderId = Number(req.params.orderId);
+  try {
+    const result = await checkOrderNesting(c.companyId, orderId);
+    res.json({ ...result, blocking: blockingIssues(result) });
+  } catch (err) {
+    logger.error({ err, orderId }, 'nesting integrity check failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
  * POST /orders/:orderId/procurement/raise — reserve what we have, buy the rest.
  *
  * Body `{ lines?: [{catalogItemId, qty, supplierId, expectedDate?, unitPrice?}] }`.
@@ -89,6 +109,36 @@ router.post('/orders/:orderId/procurement/raise', protect, async (req, res) => {
   if (!c) return;
   const orderId = Number(req.params.orderId);
   try {
+    /**
+     * Refuse to buy plate for a nesting that cannot work.
+     *
+     * A purchase order is where a nesting mistake stops being free. Up to this
+     * point a wrong thickness or a part bigger than its plate is a row somebody
+     * can correct; past it, steel has been ordered against it — and the sizes
+     * being bought ARE the declared plate sizes, so an impossible nest buys
+     * impossible material.
+     *
+     * The two kinds refused read differently and both matter: a MISSING
+     * dimension means nobody has finished the job, and an IMPOSSIBLE one means
+     * somebody finished it wrong. Buying a plate for a part of unknown size is
+     * exactly as useless as buying one that cannot hold it.
+     *
+     * `{force:true}` proceeds, the same escape as the production-order gate —
+     * a buyer who knows the sheet is behind reality should not be stuck.
+     */
+    if (!req.body?.force) {
+      const nesting = await checkOrderNesting(c.companyId, orderId);
+      const blocking = blockingIssues(nesting);
+      if (blocking.length > 0) {
+        return res.status(409).json({
+          code: 'NESTING_INVALID',
+          message: `${blocking.length} problem(s) would make this order's nesting impossible to cut. `
+                 + 'Buying against it would order the wrong material.',
+          detail: { issues: blocking, summary: nesting.summary, checked: nesting.checked },
+        });
+      }
+    }
+
     const result = await raiseProcurement(c.companyId, orderId, {
       lines: req.body?.lines,
       createdBy: c.user?.id ?? null,
