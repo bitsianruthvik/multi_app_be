@@ -57,10 +57,10 @@ export const UNITS = [
   { group: 'Area',      values: ['mm2', 'cm2', 'm2', 'sqft'] },
   { group: 'Volume',    values: ['mm3', 'cm3', 'm3', 'litre'] },
   { group: 'Mass',      values: ['g', 'kg', 'tonne', 'lb'] },
-  { group: 'Time',      values: ['sec', 'min', 'hrs', 'days'] },
+  { group: 'Time',      values: ['sec', 'min', 'hrs', 'days', 'years'] },
   { group: 'Count',     values: ['nos', 'pcs', 'sets', 'pairs'] },
   { group: 'Ratio',     values: ['%', 'ratio'] },
-  { group: 'Rate',      values: ['mm/min', 'm/min', 'kg/min', 'kg/m3', 'nos/min'] },
+  { group: 'Rate',      values: ['mm/min', 'm/min', 'kg/min', 'kg/m3', 'nos/min', 'INR/kg'] },
   { group: 'Money',     values: ['INR', 'USD', 'EUR'] },
   { group: 'Electrical', values: ['kW', 'kVA', 'A', 'V'] },
 ];

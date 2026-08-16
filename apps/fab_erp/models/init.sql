@@ -4126,3 +4126,187 @@ SET @sql = IF(@col=0,
   'ALTER TABLE fab_resources ADD COLUMN shift_calendar_id INT NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ CATALOG UNIFICATION, PHASE 2 (2026-08-16) ══════════════════════════════
+-- Defines what fields each KIND of thing has, scoped by category and placed at
+-- the level where the value actually varies. Definitions and a de-duplication
+-- only — no storage moves; those are Phase 3.
+--
+-- Seeded per company and resolved by category CODE, never id: the taxonomy is
+-- seeded separately per company so the ids differ, and a hardcoded id would
+-- attach a raw-material field to whatever category happened to hold that id in
+-- the next tenant.
+
+-- ── A Machines category, so machine fields have somewhere to hang ──────────
+-- Phase 8 turns resource types into catalog items in this category. Creating it
+-- now costs nothing and lets Phase 2 keep its promise: "what fields does X
+-- have" answered for every kind of thing, in one place, once.
+INSERT INTO fab_item_categories (company_id, code, name)
+SELECT co.id, 'mach', 'Machines & Equipment'
+  FROM companies co
+ WHERE NOT EXISTS (SELECT 1 FROM fab_item_categories c
+                    WHERE c.company_id = co.id AND c.code = 'mach' AND c.deleted_at IS NULL);
+
+-- ── 1. Place the EXISTING canonical fields ────────────────────────────────
+--
+-- These already exist unscoped and at the default level. Only rows still in the
+-- untouched default state are moved, so a level somebody has since set by hand
+-- is never overwritten by a re-run.
+
+-- Dimensions are `both`: a part carries its own on the order, and a stock piece
+-- carries the plate's. Same key, different subjects, different steps of the
+-- resolution chain.
+UPDATE fab_field_defs SET level = 'both', piece_varying = 1
+ WHERE deleted_at IS NULL AND level = 'item' AND piece_varying = 0
+   AND field_key IN ('length_mm', 'width_mm');
+
+-- Thickness is the item's identity — "MS Plate 20mm" IS 20mm — so it is never
+-- authored per piece.
+UPDATE fab_field_defs SET level = 'item'
+ WHERE deleted_at IS NULL AND field_key = 'thickness_mm';
+
+-- ── 2. Retire the duplicates ──────────────────────────────────────────────
+--
+-- Deactivated, NOT deleted, per the plan's rule 1 (additive first, destructive
+-- last). Phase 11 removes them once the dual-read window has been clean.
+--
+--   `Thickness (mm)`  a THIRD copy — verified value-by-value against
+--                     fab_item_catalog.thickness_mm on 2026-08-16, all seven
+--                     agree, so there is nothing to migrate. Phase 3 moves the
+--                     column itself into the registry.
+--   `Length (mm)` / `Width (mm)`  category-level rows holding NULL. Empty
+--                     definitions, nothing to carry across.
+--   `length`          a single value of "0" — junk from an early import.
+UPDATE fab_field_defs
+   SET active = 0,
+       notes = CONCAT(COALESCE(notes, ''),
+                      '\nRetired 2026-08-16 (catalog unification Phase 2): duplicates a canonical numeric field.')
+ WHERE deleted_at IS NULL AND active = 1
+   AND field_key IN ('Thickness (mm)', 'Length (mm)', 'Width (mm)', 'length');
+
+UPDATE fab_custom_fields SET deleted_at = NOW()
+ WHERE deleted_at IS NULL
+   AND field_key IN ('Thickness (mm)', 'Length (mm)', 'Width (mm)', 'length');
+
+-- ── 2b. `Grade` is UPGRADED IN PLACE, not replaced ────────────────────────
+--
+-- It already holds the real data (seven catalog items say "E350 B0"), and its
+-- CATEGORY-level row held "E250 B0, E250 BR, E350 B0, E350 BR" — a list of
+-- permitted values stuffed into a value field, because until Phase 1 there was
+-- nowhere else to put it. So the list becomes `allowed_values` and the key
+-- stays exactly as it is.
+--
+-- IT MUST NOT BECOME A NEW `grade` KEY, for a reason worth remembering:
+-- `fab_custom_fields.field_key` collates utf8mb4_0900_ai_ci and therefore
+-- compares CASE-INSENSITIVELY, while `fab_field_defs.field_key` compares
+-- case-sensitively. Seeding a lowercase `grade` alongside the existing `Grade`
+-- created a second definition, while every value-migration INSERT was silently
+-- blocked by its own NOT EXISTS guard matching the old rows. The result was two
+-- definitions, no values moved, and nothing to show for it — caught only by
+-- verify-field-consolidation.mjs. Plan rule 7 already said it: never rename a
+-- key in place.
+UPDATE fab_field_defs
+   SET allowed_values = '["E250 B0","E250 BR","E350 B0","E350 BR"]',
+       data_type = 'text', formula_usable = 0, level = 'item',
+       category_id = (SELECT c.id FROM fab_item_categories c
+                       WHERE c.company_id = fab_field_defs.company_id
+                         AND c.code = 'rm' AND c.deleted_at IS NULL LIMIT 1)
+ WHERE deleted_at IS NULL AND field_key = 'Grade' AND allowed_values IS NULL;
+
+-- Remove the stray lowercase definition an earlier run of this block created.
+UPDATE fab_field_defs SET deleted_at = NOW()
+ WHERE deleted_at IS NULL AND BINARY field_key = 'grade';
+
+-- The category row was never a value — it was the list, which is now on the
+-- definition. Leaving it would show every raw-material category a "Grade" of
+-- "E250 B0, E250 BR, E350 B0, E350 BR", which its own picker rejects.
+UPDATE fab_custom_fields SET deleted_at = NOW()
+ WHERE deleted_at IS NULL AND field_key = 'Grade' AND level = 'category';
+
+-- ── 3. Free-text fields that are really typed values ──────────────────────
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, unit, allowed_values,
+   formula_usable, piece_varying, level, category_id, sort_order, active)
+SELECT co.id, f.field_key, f.label, f.data_type, f.unit, f.allowed_values,
+       f.formula_usable, IF(f.level = 'item', 0, 1), f.level, cat.id, f.sort_order, 1
+  FROM companies co
+  JOIN (
+    -- key                  label                    type      unit     allowed_values                                                   fu lvl     cat     sort
+    SELECT 'material_form'       AS field_key, 'Material form'        AS label, 'text'   AS data_type, NULL     AS unit, '["plate","section","bar","tube","sheet"]' AS allowed_values, 0 AS formula_usable, 'item'  AS level, 'rm'   AS cat_code, 11 AS sort_order
+    UNION ALL SELECT 'density_kg_m3',        'Density',              'number',  'kg/m3', NULL,                                                      1, 'item',  'rm',   12
+    UNION ALL SELECT 'section_area_mm2',     'Section area',         'number',  'mm2',   NULL,                                                      1, 'item',  'rm',   13
+    UNION ALL SELECT 'rate_per_kg',          'Rate',                 'number',  'INR/kg', NULL,                                                      0, 'item',  'rm',   14
+    UNION ALL SELECT 'heat_no',              'Heat / batch no',      'text',    NULL,    NULL,                                                      0, 'piece', 'rm',   15
+    UNION ALL SELECT 'mill_cert_ref',        'Mill certificate',     'text',    NULL,    NULL,                                                      0, 'piece', 'rm',   16
+    -- Spares
+    UNION ALL SELECT 'manufacturer',         'Manufacturer',         'text',    NULL,    NULL,                                                      0, 'item',  'mro',  20
+    UNION ALL SELECT 'part_number',          'Manufacturer part no', 'text',    NULL,    NULL,                                                      0, 'item',  'mro',  21
+    UNION ALL SELECT 'cost_treatment',       'Cost treatment',       'text',    NULL,    '["expense","capitalise"]',                                0, 'item',  'mro',  22
+    UNION ALL SELECT 'lead_time_days',       'Lead time',            'number',  'days',  NULL,                                                      0, 'item',  'mro',  23
+    UNION ALL SELECT 'reorder_level',        'Reorder level',        'number',  'nos',   NULL,                                                      0, 'item',  'mro',  24
+    UNION ALL SELECT 'condition',            'Condition',            'text',    NULL,    '["new","refurbished","used"]',                            0, 'piece', 'mro',  25
+    -- Consumables
+    UNION ALL SELECT 'pack_size',            'Pack size',            'number',  'nos',   NULL,                                                      0, 'item',  'cons', 30
+    UNION ALL SELECT 'shelf_life_days',      'Shelf life',           'number',  'days',  NULL,                                                      0, 'item',  'cons', 31
+    UNION ALL SELECT 'batch_no',             'Batch no',             'text',    NULL,    NULL,                                                      0, 'piece', 'cons', 32
+    UNION ALL SELECT 'expiry_date',          'Expiry date',          'date',    NULL,    NULL,                                                      0, 'piece', 'cons', 33
+    -- Machines: the TYPE is the catalog item, the MACHINE is the stock piece.
+    UNION ALL SELECT 'model',                'Model',                'text',    NULL,    NULL,                                                      0, 'item',  'mach', 40
+    UNION ALL SELECT 'power_kw',             'Power',                'number',  'kW',    NULL,                                                      1, 'item',  'mach', 41
+    UNION ALL SELECT 'max_thickness_mm',     'Max thickness',        'number',  'mm',    NULL,                                                      1, 'item',  'mach', 42
+    UNION ALL SELECT 'serial_no',            'Serial no',            'text',    NULL,    NULL,                                                      0, 'piece', 'mach', 43
+    UNION ALL SELECT 'asset_tag',            'Asset tag',            'text',    NULL,    NULL,                                                      0, 'piece', 'mach', 44
+    UNION ALL SELECT 'purchase_date',        'Purchased on',         'date',    NULL,    NULL,                                                      0, 'piece', 'mach', 45
+    UNION ALL SELECT 'commissioned_date',    'Commissioned on',      'date',    NULL,    NULL,                                                      0, 'piece', 'mach', 46
+    UNION ALL SELECT 'warranty_until',       'Warranty until',       'date',    NULL,    NULL,                                                      0, 'piece', 'mach', 47
+    UNION ALL SELECT 'asset_cost',           'Asset cost',           'number',  'INR',   NULL,                                                      0, 'piece', 'mach', 48
+    UNION ALL SELECT 'salvage_value',        'Salvage value',        'number',  'INR',   NULL,                                                      0, 'piece', 'mach', 49
+    UNION ALL SELECT 'useful_life_years',    'Useful life',          'number',  'years', NULL,                                                      0, 'piece', 'mach', 50
+    UNION ALL SELECT 'depreciation_method',  'Depreciation method',  'text',    NULL,    '["straight_line","wdv","none"]', 0, 'piece', 'mach', 51
+  ) f
+  JOIN fab_item_categories cat
+    ON cat.company_id = co.id AND cat.code = f.cat_code AND cat.deleted_at IS NULL
+ WHERE NOT EXISTS (SELECT 1 FROM fab_field_defs d
+                    WHERE d.company_id = co.id AND d.field_key = f.field_key
+                      AND d.deleted_at IS NULL);
+
+-- ── 4. Carry the free-text values onto their typed definitions ────────────
+--
+-- Only where the value survives being read as what the new definition says it
+-- is. A row that does not convert is LEFT WHERE IT IS rather than dropped, and
+-- the retirement above deliberately does not cover these keys, so nothing is
+-- lost silently — `scripts/verify-field-consolidation.mjs` lists them.
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT c.company_id, c.level, c.level_id, m.new_key, 'number', c.field_value, 0
+  FROM fab_custom_fields c
+  JOIN (SELECT 'Rate (INR/kg)' AS old_key, 'rate_per_kg' AS new_key
+        UNION ALL SELECT 'Sell Rate (INR/kg)', 'sell_rate_per_kg'
+        UNION ALL SELECT 'Estimated Value (INR)', 'estimated_value'
+        UNION ALL SELECT 'Total Steel Weight (kg)', 'total_steel_weight_kg') m
+    ON m.old_key = c.field_key
+ WHERE c.deleted_at IS NULL
+   AND c.field_value REGEXP '^-?[0-9]+(\\.[0-9]+)?$'
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields x
+                    WHERE x.company_id = c.company_id AND x.level = c.level
+                      AND x.level_id = c.level_id AND x.field_key = m.new_key
+                      AND x.deleted_at IS NULL);
+
+-- Grade needs no value migration — it was upgraded in place in step 2b, so its
+-- seven item-level values are already under the right definition.
+
+-- The remaining free-text definitions get a typed replacement seeded above and
+-- are retired only once their values have moved — which the verifier confirms
+-- before Phase 11 drops anything.
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, unit, formula_usable, piece_varying, level, sort_order, active)
+SELECT co.id, f.field_key, f.label, f.data_type, f.unit, 0, 0, 'item', f.sort_order, 1
+  FROM companies co
+  JOIN (SELECT 'sell_rate_per_kg' AS field_key, 'Sell rate' AS label, 'number' AS data_type, 'INR' AS unit, 60 AS sort_order
+        UNION ALL SELECT 'estimated_value',       'Estimated value',      'number', 'INR', 61
+        UNION ALL SELECT 'total_steel_weight_kg', 'Total steel weight',   'number', 'kg',  62
+        UNION ALL SELECT 'drawing_ref',           'Drawing reference',    'text',   NULL,  63
+        UNION ALL SELECT 'span_ref',              'Span reference',       'text',   NULL,  64) f
+ WHERE NOT EXISTS (SELECT 1 FROM fab_field_defs d
+                    WHERE d.company_id = co.id AND d.field_key = f.field_key
+                      AND d.deleted_at IS NULL);
