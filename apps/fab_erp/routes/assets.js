@@ -27,7 +27,12 @@ import {
   maintenanceHistory,
 } from '../services/maintenanceService.js';
 import { depreciationFor } from '../services/assetService.js';
-import { raiseAssetPurchase, assetPurchases } from '../services/assetPurchaseService.js';
+import {
+  raiseAssetPurchase, assetPurchases, spareParts, spareSpend,
+} from '../services/assetPurchaseService.js';
+import {
+  machineLocations, machineLocation, moveMachine,
+} from '../services/machineLocationService.js';
 
 const router = Router();
 
@@ -145,6 +150,49 @@ router.get('/assets/purchases', protect, canView, async (req, res) => {
       }),
     });
   } catch (err) { fail(res, err, 'asset purchases'); }
+});
+
+// ── Where a machine is, and moving it ──────────────────────────────────────
+
+router.get('/assets/machine-locations', protect, canView, async (req, res) => {
+  try {
+    res.json({ locations: await machineLocations(companyOf(req), req.query.plantId ? Number(req.query.plantId) : null) });
+  } catch (err) { fail(res, err, 'machine locations'); }
+});
+
+router.get('/assets/resources/:id/location', protect, canView, async (req, res) => {
+  try {
+    res.json(await machineLocation(companyOf(req), Number(req.params.id)));
+  } catch (err) { fail(res, err, 'machine location'); }
+});
+
+/**
+ * Move a machine to another stock area.
+ *
+ * It stays SCHEDULABLE wherever it goes — off-site work is real work, and this
+ * records where a machine is, not whether it may be used. What stops a machine
+ * being scheduled is its state (down), which is a separate mechanism.
+ */
+router.post('/assets/resources/:id/move', protect, canManage, async (req, res) => {
+  try {
+    const out = await moveMachine(companyOf(req), Number(req.params.id),
+      Number(req.body?.stockLocationId), { note: req.body?.note ?? null, userId: req.user.id });
+    res.json({ ok: true, ...out });
+  } catch (err) { fail(res, err, 'move machine'); }
+});
+
+// ── Spares from the catalog, and what has been spent ──────────────────────
+
+router.get('/assets/spare-parts', protect, canView, async (req, res) => {
+  try {
+    res.json({ items: await spareParts(companyOf(req), { search: req.query.q ?? null }) });
+  } catch (err) { fail(res, err, 'spare parts'); }
+});
+
+router.get('/assets/resources/:id/spend', protect, canView, async (req, res) => {
+  try {
+    res.json(await spareSpend(companyOf(req), Number(req.params.id)));
+  } catch (err) { fail(res, err, 'spare spend'); }
 });
 
 export default router;

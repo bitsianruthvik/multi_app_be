@@ -32,6 +32,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { resolveCatalogFields } from './itemFieldService.js';
 
 const PO_DRAFT = 'draft';
 
@@ -206,4 +207,98 @@ export async function assetPurchases(companyId, { resourceId = null, resourceTyp
     [companyId, resourceId ?? resourceTypeId],
   );
   return rows;
+}
+
+/**
+ * Spares a machine can be bought, drawn from the CATALOG.
+ *
+ * Free-text lines were the first cut, and they had a real cost stated in this
+ * file's header: a described spare can be purchased but never received into
+ * stock, because there is nothing to receive it AGAINST. Picking from the
+ * catalog fixes that, and it is also what carries `cost_treatment` — the field
+ * that decides whether the spend is expensed or capitalised lives on the item,
+ * inherited from its group, and a line with no item inherits nothing.
+ *
+ * Scoped by CATEGORY rather than by a hardcoded list, so adding a spares group
+ * is a taxonomy change rather than a code change.
+ */
+export async function spareParts(companyId, { search = null, limit = 200 } = {}) {
+  const [rows] = await pool.query(
+    `SELECT i.id, i.code, i.name, i.unit,
+            cat.code AS categoryCode, grp.name AS groupName
+       FROM fab_item_catalog i
+       JOIN fab_item_categories cat ON cat.id = i.category_id AND cat.deleted_at IS NULL
+       LEFT JOIN fab_item_groups grp ON grp.id = i.group_id
+      WHERE i.company_id = ? AND i.deleted_at IS NULL
+        AND cat.code = 'mro'
+        ${search ? 'AND (i.code LIKE ? OR i.name LIKE ?)' : ''}
+      ORDER BY grp.name, i.code
+      LIMIT ?`,
+    search
+      ? [companyId, `%${search}%`, `%${search}%`, Number(limit) || 200]
+      : [companyId, Number(limit) || 200],
+  );
+  return rows;
+}
+
+/**
+ * What has been spent on a machine, split by how it is treated.
+ *
+ * EXPENSED vs CAPITALISED comes from `cost_treatment`, resolved per line's
+ * catalog item through the normal inheritance chain — set once on the spares
+ * group, not ticked per purchase by whoever happens to be raising it.
+ *
+ * Free-text lines have no item and therefore no treatment. They are reported
+ * separately as `unclassified` rather than defaulted into either bucket:
+ * quietly calling them expenses would understate the asset's carrying value,
+ * and quietly capitalising them would overstate it. Both are wrong in a way
+ * nobody would notice, which is the reason for the third number.
+ *
+ * CAPITALISED SPEND IS NOT ADDED TO `asset_cost` AUTOMATICALLY. That column is
+ * what somebody entered as the purchase price, and silently growing it would
+ * mean the depreciation base changed without anybody deciding it had. The
+ * figure is reported so the decision can be made; `valuationWithSpares` below
+ * shows what it would look like.
+ */
+export async function spareSpend(companyId, resourceId) {
+  const [lines] = await pool.query(
+    `SELECT l.id, l.catalog_item_id AS catalogItemId, l.description, l.qty,
+            l.unit_price AS unitPrice, o.order_number AS orderNumber,
+            o.status, o.currency
+       FROM fab_order_lines l
+       JOIN fab_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
+      WHERE o.company_id = ? AND o.for_resource_id = ? AND o.order_type = 'purchase'
+        AND l.deleted_at IS NULL AND o.status <> 'cancelled'`,
+    [companyId, resourceId],
+  );
+
+  const itemIds = [...new Set(lines.map((l) => l.catalogItemId).filter(Boolean))];
+  const treatments = itemIds.length
+    ? await resolveCatalogFields(companyId, itemIds)
+    : new Map();
+
+  let expensed = 0, capitalised = 0, unclassified = 0;
+  const rows = lines.map((l) => {
+    const value = (Number(l.qty) || 0) * (Number(l.unitPrice) || 0);
+    const t = l.catalogItemId
+      ? String(treatments.get(Number(l.catalogItemId))?.cost_treatment ?? '').trim().toLowerCase()
+      : '';
+    if (t === 'capitalise') capitalised += value;
+    else if (t === 'expense') expensed += value;
+    else unclassified += value;
+    return { ...l, value, treatment: t || null };
+  });
+
+  const round2 = (n) => Math.round(n * 100) / 100;
+  return {
+    resourceId: Number(resourceId),
+    currency: lines.find((l) => l.currency)?.currency ?? null,
+    lineCount: rows.length,
+    expensed: round2(expensed),
+    capitalised: round2(capitalised),
+    /** No catalog item, so no treatment to inherit. Never silently bucketed. */
+    unclassified: round2(unclassified),
+    total: round2(expensed + capitalised + unclassified),
+    lines: rows,
+  };
 }

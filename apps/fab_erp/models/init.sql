@@ -4448,3 +4448,139 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_stock_reservations ADD KEY idx_fsr_piece (company_id, stock_piece_id, status)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ CATALOG UNIFICATION, PHASE 8 (2026-08-17) ══════════════════════════════
+-- A machine type becomes a catalog item; a machine becomes a stock piece.
+--
+-- That is what makes "where is this machine" an ordinary stock question with an
+-- ordinary answer, and moving one out of the factory an ordinary stock transfer
+-- with a history — rather than a fact nobody records anywhere.
+--
+-- SAFE ONLY BECAUSE PHASE 6 LANDED FIRST. Once a machine is a stock piece, the
+-- FIFO consumption that used to pick any in-stock piece of a catalog item could
+-- have picked a CNC table and consumed it into a girder. Phase 4 marked the
+-- Machines category `consumable = no` and Phase 6 enforces it before any size
+-- check runs, so that path is closed before this opens it.
+
+-- ── Where machines live ───────────────────────────────────────────────────
+--
+-- A stock piece must have a location, and a machine's WIP area is the wrong one
+-- — that holds material flowing THROUGH the machine, not the machine.
+--
+-- Two per plant, because "off site" has to be somewhere: a stock location is
+-- scoped to a plant, so off-site means "away from this plant" rather than a
+-- nowhere that no row can express. Machines in it STAY SCHEDULABLE, per the
+-- decision on 2026-08-16 — off-site work is real work, and this records where a
+-- machine is, not whether it may be used.
+INSERT INTO fab_stock_locations (company_id, plant_id, name, code, description)
+SELECT p.company_id, p.id, 'Machines - on site', 'MACH-ON',
+       'Where machines physically stand at this plant. Auto-provisioned.'
+  FROM fab_plants p
+ WHERE p.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_stock_locations l
+                    WHERE l.company_id = p.company_id AND l.plant_id = p.id
+                      AND l.code = 'MACH-ON' AND l.deleted_at IS NULL);
+
+INSERT INTO fab_stock_locations (company_id, plant_id, name, code, description)
+SELECT p.company_id, p.id, 'Machines - off site', 'MACH-OFF',
+       'Machines away from this plant: hired out, at a job site, or away for repair.'
+  FROM fab_plants p
+ WHERE p.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_stock_locations l
+                    WHERE l.company_id = p.company_id AND l.plant_id = p.id
+                      AND l.code = 'MACH-OFF' AND l.deleted_at IS NULL);
+
+-- ── The two links ─────────────────────────────────────────────────────────
+--
+-- A resource TYPE points at the catalog item that describes that model; a
+-- RESOURCE points at the stock piece that is that physical machine.
+--
+-- Nullable, and the system works without them. A resource remains what the
+-- scheduler reads — its capacity columns are untouched (decision D8) — and this
+-- adds an identity beside that, rather than moving it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resource_types'
+               AND COLUMN_NAME='catalog_item_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_resource_types ADD COLUMN catalog_item_id INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resources'
+               AND COLUMN_NAME='stock_piece_id');
+SET @sql = IF(@col=0,
+  'ALTER TABLE fab_resources ADD COLUMN stock_piece_id INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── Backfill: a catalog item per machine type ─────────────────────────────
+--
+-- Code prefixed `MACH-` so a machine type can never collide with a material
+-- code, and so it reads as what it is in any list it appears in.
+INSERT INTO fab_item_catalog (company_id, code, name, category_id, procurement_type, unit)
+SELECT rt.company_id, CONCAT('MACH-', rt.code), rt.name, cat.id, 'buy', 'nos'
+  FROM fab_resource_types rt
+  JOIN fab_item_categories cat
+    ON cat.company_id = rt.company_id AND cat.code = 'mach' AND cat.deleted_at IS NULL
+ WHERE rt.deleted_at IS NULL AND rt.catalog_item_id IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_item_catalog i
+                    WHERE i.company_id = rt.company_id
+                      AND i.code = CONCAT('MACH-', rt.code) AND i.deleted_at IS NULL);
+
+UPDATE fab_resource_types rt
+  JOIN fab_item_catalog i
+    ON i.company_id = rt.company_id AND i.code = CONCAT('MACH-', rt.code)
+   AND i.deleted_at IS NULL
+   SET rt.catalog_item_id = i.id
+ WHERE rt.deleted_at IS NULL AND rt.catalog_item_id IS NULL;
+
+-- ── Backfill: a stock piece per machine ───────────────────────────────────
+--
+-- ALWAYS QUANTITY 1. A machine is a serialised thing, not a quantity: "3 of CNC
+-- table" would be three machines the leveller cannot tell apart and cannot
+-- schedule separately, and a partial consume would leave two-thirds of a table.
+--
+-- Placed in the plant's on-site machine area. A machine whose resource carries
+-- no plant is SKIPPED rather than guessed at — a stock piece must have a
+-- location, and inventing one would put the machine somewhere it is not.
+INSERT INTO fab_stock_pieces
+  (company_id, catalog_item_id, plant_id, stock_location_id, qty, uom, status,
+   serial_no, received_date, notes)
+SELECT r.company_id, rt.catalog_item_id, r.plant_id, loc.id, 1, 'nos', 'in_stock',
+       r.code, COALESCE(r.purchase_date, DATE(r.created_at)),
+       CONCAT('Machine ', r.name, ' (resource #', r.id, ')')
+  FROM fab_resources r
+  JOIN fab_resource_types rt
+    ON rt.id = r.resource_type_id AND rt.deleted_at IS NULL AND rt.catalog_item_id IS NOT NULL
+  JOIN fab_stock_locations loc
+    ON loc.company_id = r.company_id AND loc.plant_id = r.plant_id
+   AND loc.code = 'MACH-ON' AND loc.deleted_at IS NULL
+ WHERE r.deleted_at IS NULL AND r.stock_piece_id IS NULL AND r.plant_id IS NOT NULL;
+
+UPDATE fab_resources r
+  JOIN fab_stock_pieces p
+    ON p.company_id = r.company_id AND p.serial_no = r.code
+   AND p.deleted_at IS NULL AND p.status IN ('in_stock', 'wip')
+  JOIN fab_resource_types rt
+    ON rt.id = r.resource_type_id AND rt.catalog_item_id = p.catalog_item_id
+   SET r.stock_piece_id = p.id
+ WHERE r.deleted_at IS NULL AND r.stock_piece_id IS NULL;
+
+-- Repair any machine-area name already stored as mojibake.
+--
+-- The first version of the seed above used an em-dash. The mysql client reading
+-- this file does not always negotiate utf8mb4 — the documented push-to-prod
+-- command does not pass --default-character-set — so those bytes were read as
+-- latin1 and re-encoded, storing "Machines ÔÇö on site" instead of the dash.
+--
+-- The lesson is the rule now followed throughout this file: SEEDED DATA IS
+-- ASCII ONLY. Comments can say what they like, because comments are not stored;
+-- a value is at the mercy of whatever charset the client happened to use.
+UPDATE fab_stock_locations
+   SET name = 'Machines - on site'
+ WHERE code = 'MACH-ON' AND deleted_at IS NULL AND name <> 'Machines - on site';
+
+UPDATE fab_stock_locations
+   SET name = 'Machines - off site'
+ WHERE code = 'MACH-OFF' AND deleted_at IS NULL AND name <> 'Machines - off site';
