@@ -486,3 +486,107 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
     noFormula,
   };
 }
+
+/**
+ * Field values for CATALOG items, with no order item in sight.
+ *
+ * `resolveItemFields` answers "what does this order item have", walking from an
+ * order item up through its catalog binding. Consumption asks the opposite and
+ * simpler question — "is catalog item 240074 consumable?" — and there may be no
+ * order item involved at all, so it had nowhere to ask.
+ *
+ * The chain here is the catalog half of the same one, first hit wins:
+ *
+ *   1. the catalog item's own custom fields
+ *   2. its columns (thickness, density, section area)
+ *   3. sub-group -> group -> category
+ *   4. the field's default_value
+ *
+ * TEXT VALUES COME BACK AS TEXT. `resolveItemFields` coerces everything to a
+ * number because it feeds the formula engine, which is right there and wrong
+ * here: `consumable` is "yes"/"no" and `cost_treatment` is "expense"/
+ * "capitalise", and coercing them would return null and read as "not set" —
+ * which, for a rule that decides whether a machine can be issued as material,
+ * fails in the more dangerous direction.
+ *
+ * @returns {Promise<Map<number, Record<string, string|number>>>}
+ */
+export async function resolveCatalogFields(companyId, catalogItemIds, opts = {}) {
+  const out = new Map();
+  const ids = [...new Set((catalogItemIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return out;
+  const exec = opts.conn ?? pool;
+  const registry = opts.registry ?? await fieldRegistry(companyId, exec);
+
+  const [items] = await exec.query(
+    `SELECT id, category_id AS categoryId, group_id AS groupId, subgroup_id AS subgroupId,
+            thickness_mm AS catThickness, density_kg_m3 AS catDensity,
+            section_area_mm2 AS catSectionArea, material_form AS catMaterialForm
+       FROM fab_item_catalog
+      WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+    [companyId, ids],
+  );
+  if (!items.length) return out;
+
+  const levelIds = {
+    item: items.map((i) => i.id),
+    category: items.map((i) => i.categoryId).filter(Boolean),
+    group: items.map((i) => i.groupId).filter(Boolean),
+    subgroup: items.map((i) => i.subgroupId).filter(Boolean),
+  };
+  const byLevel = new Map();
+  for (const [level, lids] of Object.entries(levelIds).filter(([, v]) => v.length)) {
+    const [rows] = await exec.query(
+      `SELECT level_id AS levelId, field_key AS fieldKey, field_value AS fieldValue
+         FROM fab_custom_fields
+        WHERE company_id = ? AND level = ? AND level_id IN (?) AND deleted_at IS NULL`,
+      [companyId, level, [...new Set(lids)]],
+    );
+    const m = new Map();
+    for (const r of rows) {
+      if (!m.has(r.levelId)) m.set(r.levelId, {});
+      m.get(r.levelId)[r.fieldKey] = r.fieldValue;
+    }
+    byLevel.set(level, m);
+  }
+  const at = (lvl, id) => (id == null ? undefined : byLevel.get(lvl)?.get(id));
+
+  for (const it of items) {
+    const cols = {};
+    if (it.catThickness != null) cols.thickness_mm = it.catThickness;
+    if (it.catDensity != null) cols.density_kg_m3 = it.catDensity;
+    if (it.catSectionArea != null) cols.section_area_mm2 = it.catSectionArea;
+    if (it.catMaterialForm != null) cols.material_form = it.catMaterialForm;
+
+    const values = {};
+    for (const [key, def] of registry) {
+      if (def.default_value != null) values[key] = def.default_value;
+    }
+    // Lowest precedence first.
+    for (const src of [at('category', it.categoryId), at('group', it.groupId),
+      at('subgroup', it.subgroupId), cols, at('item', it.id)]) {
+      if (!src) continue;
+      for (const [key, raw] of Object.entries(src)) {
+        if (raw !== null && raw !== undefined && raw !== '') values[key] = raw;
+      }
+    }
+    out.set(it.id, values);
+  }
+  return out;
+}
+
+/**
+ * May stock of this catalog item be consumed into a product?
+ *
+ * FAILS OPEN. Only an explicit "no" refuses; a blank is treated as allowed.
+ * Refusing to issue material is a hard block on shop-floor work, and a category
+ * nobody has classified yet must not stop a job that runs fine today. The
+ * PICKER makes the opposite choice for the opposite reason — see the Phase 4
+ * note in init.sql.
+ */
+export async function isConsumable(companyId, catalogItemId, conn = null) {
+  if (!catalogItemId) return true;
+  const vals = (await resolveCatalogFields(companyId, [catalogItemId], { conn })).get(Number(catalogItemId)) ?? {};
+  const v = String(vals.consumable ?? '').trim().toLowerCase();
+  return !(v === 'no' || v === 'false' || v === '0');
+}

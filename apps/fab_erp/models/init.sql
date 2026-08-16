@@ -4310,3 +4310,99 @@ SELECT co.id, f.field_key, f.label, f.data_type, f.unit, 0, 0, 'item', f.sort_or
  WHERE NOT EXISTS (SELECT 1 FROM fab_field_defs d
                     WHERE d.company_id = co.id AND d.field_key = f.field_key
                       AND d.deleted_at IS NULL);
+
+-- ══ CATALOG UNIFICATION, PHASE 4 (2026-08-16) ══════════════════════════════
+-- `consumable` and `cost_treatment` as inherited fields.
+--
+-- CORRECTION TO THE PLAN. Phase 4 was written as "the material rule flips to
+-- include where consumable = yes, deleting the hardcoded exclusion list". That
+-- is wrong, and building it would have made the material picker worse than it
+-- is today. Two different questions were conflated:
+--
+--   "can this be issued INTO a product?"   a bolt yes, paint yes, plate yes,
+--                                          a machine never.  -> `consumable`
+--   "can a part be CUT FROM this?"         plate yes, section yes, a bolt no,
+--                                          paint no.          -> a SCOPE
+--
+-- `consumable = yes` is true of bolts and paint, so using it for the picker
+-- would pull both back in — the exact opposite of the `NOT_CUT_FROM` exclusion
+-- it was meant to replace. The picker rule is an inclusion over TAXONOMY
+-- (category = Raw Materials), which is Phase 7's scopes, and the hardcoded list
+-- stays until then rather than being replaced by something worse.
+
+-- ── `consumable` — may stock of this item be consumed into a product? ──────
+--
+-- Unscoped: it applies to every category, unlike the raw-material or spare
+-- fields which only make sense for their own kind of thing.
+INSERT INTO fab_field_defs
+  (company_id, field_key, label, data_type, allowed_values,
+   formula_usable, piece_varying, level, sort_order, active, notes)
+SELECT co.id, 'consumable', 'Can be consumed into a product', 'bool', '["yes","no"]',
+       0, 0, 'item', 5, 1,
+       'Set on the CATEGORY and inherited. Machines and tooling are "no"; that is what stops a machine being issued as material.'
+  FROM companies co
+ WHERE NOT EXISTS (SELECT 1 FROM fab_field_defs d
+                    WHERE d.company_id = co.id AND d.field_key = 'consumable'
+                      AND d.deleted_at IS NULL);
+
+-- Values on the categories, inherited by every item beneath them.
+--
+-- FAIL-OPEN ON UNSET, DELIBERATELY. Phase 6 will refuse consumption only for an
+-- explicit `no`, never for a blank. Refusing to issue material is a hard block
+-- on shop-floor work, and a category somebody has not classified yet must not
+-- stop a job that runs fine today. That is the opposite of the choice made for
+-- the PICKER, where an unclassified category is excluded until somebody says
+-- otherwise — because excluding something from a dropdown costs nothing and
+-- including the wrong thing is how paint ended up offered as plate.
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT c.company_id, 'category', c.id, 'consumable', 'text', v.val, 0
+  FROM fab_item_categories c
+  JOIN (SELECT 'rm'   AS code, 'yes' AS val
+        UNION ALL SELECT 'cons', 'yes'
+        UNION ALL SELECT 'fast', 'yes'
+        UNION ALL SELECT 'pack', 'yes'
+        UNION ALL SELECT 'sfg',  'yes'
+        -- The three that must never be issued as material.
+        UNION ALL SELECT 'mach', 'no'
+        UNION ALL SELECT 'tool', 'no'
+        UNION ALL SELECT 'mro',  'no') v
+    ON v.code = c.code
+ WHERE c.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields x
+                    WHERE x.company_id = c.company_id AND x.level = 'category'
+                      AND x.level_id = c.id AND x.field_key = 'consumable'
+                      AND x.deleted_at IS NULL);
+
+-- ── `cost_treatment` — expense or capitalise ──────────────────────────────
+--
+-- Defaulted on the MRO category so every spare inherits "expense", which is the
+-- treatment the overwhelming majority get: filters, belts, lubricants and
+-- consumable tooling are charged to the period they are used in and do not
+-- change what the machine is worth.
+--
+-- A group or an individual item overrides it. That is where the other two real
+-- treatments live: a major spare that extends the machine's life or capability
+-- (a control system, a spindle rebuild) is capitalised, and so is an insurance
+-- spare bought for one machine and held against failure — under IAS 16 those
+-- are fixed assets rather than inventory, depreciated over the life of the
+-- machine they serve even while sitting on the shelf.
+--
+-- Set on the category rather than per purchase, because policy belongs in one
+-- place a finance person can see, not on a checkbox somebody ticks on a Friday.
+INSERT INTO fab_custom_fields
+  (company_id, level, level_id, field_key, field_type, field_value, sort_order)
+SELECT c.company_id, 'category', c.id, 'cost_treatment', 'text', 'expense', 0
+  FROM fab_item_categories c
+ WHERE c.code = 'mro' AND c.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM fab_custom_fields x
+                    WHERE x.company_id = c.company_id AND x.level = 'category'
+                      AND x.level_id = c.id AND x.field_key = 'cost_treatment'
+                      AND x.deleted_at IS NULL);
+
+-- `cost_treatment` was seeded in Phase 2 scoped to MRO only. Machines need it
+-- too — a machine IS the capitalised asset — so widen it to unscoped rather
+-- than create a second definition under a different name, which is the mistake
+-- Phase 2 made with Grade.
+UPDATE fab_field_defs SET category_id = NULL
+ WHERE deleted_at IS NULL AND field_key = 'cost_treatment' AND category_id IS NOT NULL;
