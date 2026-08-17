@@ -4954,3 +4954,71 @@ SET @tbl = (SELECT COUNT(*) FROM information_schema.TABLES
              WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_metric_defs');
 SET @sql = IF(@tbl=1, 'DROP TABLE fab_item_metric_defs', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ STOCK LEDGER: CODED MOVEMENTS (2026-08-17) ═════════════════════════════
+--
+-- Asked for: "let's maintain ledger entry whenever something moves — from one
+-- stock area to another, either through an operation like a crane operation or
+-- just a machine being carried from one place to another."
+--
+-- What was actually there:
+--   grn_receipt 113 · wip_issue 5 · wip_open 4      and NOTHING else
+--
+-- So nothing recorded a MOVE. `machineLocationService` did write a transfer
+-- pair, but it wrote `batch_code = 'MACHINE'` and no piece reference, so the
+-- ledger said a machine TYPE moved, not which machine — and no transfer row had
+-- ever been written in production anyway.
+--
+-- Three gaps, fixed here and in stockMovementService.js:
+--
+--   1. no piece identity on a ledger row  -> piece_id + piece_code
+--   2. no way to pair the two halves of a move -> move_ref
+--   3. non-catalog stock could not BE a piece -> catalog_item_id nullable
+--
+-- WHY A PAIR AND NOT from/to COLUMNS. `fab_stock_ledger` has one
+-- `stock_location_id`, and every existing row means "this much, in this place".
+-- A move is therefore two rows: -qty leaving and +qty arriving, which keeps a
+-- balance-per-location query a plain SUM with no special case for transfers.
+-- `move_ref` is what makes the two halves recoverable as one event; without it
+-- you can see stock left and stock arrived but cannot prove they were the same
+-- movement.
+--
+-- WHY piece_code IS DENORMALISED. It is a snapshot, deliberately. A ledger is
+-- an audit trail, and it has to keep reading correctly after a piece is
+-- consumed, renumbered or deleted. Joining to fab_stock_pieces for the code
+-- would make history change when the present does.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND COLUMN_NAME='piece_code');
+SET @s = IF(@c=0, 'ALTER TABLE fab_stock_ledger
+     ADD COLUMN piece_code VARCHAR(40) NULL,
+     ADD COLUMN move_ref   VARCHAR(48) NULL,
+     ADD COLUMN from_location_id INT NULL,
+     ADD COLUMN to_location_id   INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @i = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND INDEX_NAME='idx_fsl_move');
+SET @s = IF(@i=0, 'CREATE INDEX idx_fsl_move ON fab_stock_ledger (company_id, move_ref)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @i = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_ledger' AND INDEX_NAME='idx_fsl_piece');
+SET @s = IF(@i=0, 'CREATE INDEX idx_fsl_piece ON fab_stock_ledger (company_id, piece_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A stock piece may now exist WITHOUT a catalog item.
+--
+-- This is a widening (NOT NULL -> NULL), so no existing row is affected and no
+-- read breaks. It is required because a made part carries `catalog_item_id =
+-- NULL` on fab_items — a catalogue-rooted identity cannot describe something
+-- this shop invented for one order — and until now that made it impossible for
+-- work in progress to be a stock piece at all. Which is why production held 173
+-- pieces, every one of them catalog-backed, while WIP existed only as ledger
+-- rows with no piece behind them.
+--
+-- `wip_item_id` is the identity in that case, and the piece still gets a code,
+-- so a ledger row about a made part reads the same as one about a plate.
+SET @n = (SELECT IS_NULLABLE FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND COLUMN_NAME='catalog_item_id');
+SET @s = IF(@n='NO', 'ALTER TABLE fab_stock_pieces MODIFY COLUMN catalog_item_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

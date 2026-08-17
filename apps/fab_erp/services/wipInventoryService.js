@@ -33,6 +33,7 @@
 import { generateCode } from './codegenService.js';
 import { isConsumable } from './itemFieldService.js';
 import { piecesHeldByOthers, piecesReservedFor } from './availabilityService.js';
+import { movePiece } from './stockMovementService.js';
 
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
@@ -491,13 +492,22 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
     [companyId, node.id],
   );
   if (piece && piece.stock_location_id !== wipLoc) {
-    await conn.query(
-      `UPDATE fab_stock_pieces SET stock_location_id = ?, plant_id = ? WHERE id = ?`,
-      [wipLoc, machine.plant_id, piece.id],
-    );
-    await writeLedger(conn, companyId, {
-      catalogItemId: piece.catalog_item_id, plantId: machine.plant_id, stockLocationId: wipLoc,
-      txnType: 'wip_move', qty: Number(piece.qty),
+    /**
+     * Through the shared mover (2026-08-17), same as a machine relocation.
+     *
+     * This wrote a SINGLE ledger row for the arrival and nothing for the
+     * departure, so a per-area balance drifted upward every time a part
+     * advanced a step: the receiving area gained the piece and the sending area
+     * never lost it. `movePiece` writes both halves under one `move_ref` and
+     * stamps the piece's code on each, so a part moving between machines reads
+     * exactly like a machine moving between plants.
+     */
+    await movePiece(conn, companyId, {
+      pieceId: piece.id,
+      toLocationId: wipLoc,
+      reason: 'wip_advance',
+      taskId: task?.id ?? null,
+      notes: `WIP ${node.display_name ?? `item ${node.id}`} advanced to ${machine.name ?? `machine ${machine.id}`}`,
     });
   }
 }

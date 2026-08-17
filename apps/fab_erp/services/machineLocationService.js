@@ -17,6 +17,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { movePiece } from './stockMovementService.js';
 
 /** Stock areas a machine can be moved between, for one plant. */
 export async function machineLocations(companyId, plantId = null) {
@@ -129,23 +130,23 @@ export async function moveMachine(companyId, resourceId, toLocationId, { note = 
       [r.fromId, companyId],
     );
 
-    await conn.query(
-      `UPDATE fab_stock_pieces SET stock_location_id = ?, plant_id = ? WHERE id = ? AND company_id = ?`,
-      [to.id, to.plantId ?? r.plantId, r.pieceId, companyId],
-    );
-
-    const label = `moved ${r.name} (resource #${resourceId}) `
-      + `from ${from?.name ?? 'unknown'} to ${to.name}${note ? ` — ${note}` : ''}`;
-    for (const [locId, qty] of [[r.fromId, -1], [to.id, 1]]) {
-      if (!locId) continue;
-      await conn.query(
-        `INSERT INTO fab_stock_ledger
-           (company_id, catalog_item_id, plant_id, stock_location_id, batch_id, batch_code,
-            txn_type, qty, txn_date, notes)
-         VALUES (?, ?, ?, ?, 0, 'MACHINE', 'transfer', ?, CURDATE(), ?)`,
-        [companyId, r.catalogItemId, to.plantId ?? r.plantId, locId, qty, label],
-      );
-    }
+    /**
+     * The move itself goes through stockMovementService (2026-08-17).
+     *
+     * This used to update the piece and hand-write the ledger pair here, with
+     * `batch_code = 'MACHINE'` and no piece reference — so the ledger recorded
+     * that a machine TYPE had moved without recording WHICH machine, which is
+     * most of the value of having recorded it. Going through the shared mover
+     * gets the piece's code, a `move_ref` tying the two halves together, and
+     * from/to on both rows, identical to every other kind of movement.
+     */
+    const move = await movePiece(conn, companyId, {
+      pieceId: r.pieceId,
+      toLocationId: to.id,
+      reason: 'machine',
+      notes: `moved ${r.name} (resource #${resourceId}) `
+        + `from ${from?.name ?? 'unknown'} to ${to.name}${note ? ` — ${note}` : ''}`,
+    });
 
     await conn.commit();
     return {
@@ -155,6 +156,8 @@ export async function moveMachine(companyId, resourceId, toLocationId, { note = 
       offSite: to.code === 'MACH-OFF',
       /** Stated back, because it is the thing people expect to change and it does not. */
       stillSchedulable: true,
+      moveRef: move.moveRef,
+      machineCode: move.pieceCode,
       userId,
     };
   } catch (err) {
