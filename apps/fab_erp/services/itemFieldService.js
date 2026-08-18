@@ -39,6 +39,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { resolveFields } from './fieldService.js';
 import { authoredOnPiece } from './fieldVocabulary.js';
 import { parseFormula } from './formulaEngine.js';
 
@@ -91,7 +92,7 @@ function coerce(raw, def) {
  * @param {object} [opts.conn]
  * @returns {Promise<Map<number, Record<string, number>>>} itemId → { field_key: value }
  */
-export async function resolveItemFields(companyId, itemIds, opts = {}) {
+async function resolveItemFieldsLegacy(companyId, itemIds, opts = {}) {
   const out = new Map();
   const ids = [...new Set((itemIds || []).map(Number).filter(Boolean))];
   if (!ids.length) return out;
@@ -279,6 +280,61 @@ export async function resolveItemFields(companyId, itemIds, opts = {}) {
   }
   return out;
 }
+
+/**
+ * The formula engine's view of an item's values.
+ *
+ * STEP 2 OF THE FIELD REDESIGN (2026-08-18). This now reads the NEW tables and
+ * falls back to the old path for anything they do not answer. Both halves run;
+ * the new value wins.
+ *
+ * WHY DUAL-READ RATHER THAN A CLEAN SWITCH. The BOQ upload still writes
+ * fab_items.length/width/height as COLUMNS, and the parameters grid still writes
+ * fab_custom_fields. Until those writers move (steps 3 and 4), a straight cutover
+ * would silently lose every value authored after the one-time import — and it
+ * would lose it in the worst possible way, because formulaEngine evaluates a
+ * missing item_* symbol as 0 rather than erroring. The task would simply plan as
+ * free and every date computed from it would be fiction.
+ *
+ * So the legacy reader stays underneath as a safety net, and step 4 deletes it
+ * once nothing writes a column any more.
+ *
+ * IT RETURNS NUMBERS ONLY, deliberately, exactly as before. Its callers are
+ * numeric — formulaEngine does Number(v ?? 0), so handing back HT-42 would
+ * produce NaN. Text is now readable, but through resolveFields(), which is the
+ * right split: this function is the FORMULA view, not the whole record.
+ *
+ * Verified at parity across 457 live items before being switched on -- see
+ * scripts/verify-field-parity.mjs.
+ */
+export async function resolveItemFields(companyId, itemIds, opts = {}) {
+  const ids = [...new Set((itemIds || []).map(Number).filter(Boolean))];
+  const out = await resolveItemFieldsLegacy(companyId, itemIds, opts);
+  if (!ids.length) return out;
+
+  const fresh = await resolveFields(
+    companyId,
+    ids.map((id) => ({ scope: 'order_item', scopeId: id })),
+    { conn: opts.conn },
+  );
+
+  for (const id of ids) {
+    const resolved = fresh.get(`order_item:${id}`);
+    if (!resolved) continue;
+    const merged = { ...(out.get(id) ?? {}) };
+    for (const [key, entry] of Object.entries(resolved)) {
+      const v = entry?.value;
+      if (v == null) continue;
+      // Numeric only, per the contract above. A text field simply does not
+      // appear here; that is not a loss, it is the boundary.
+      const n = typeof v === 'number' ? v : Number(v);
+      if (Number.isFinite(n)) merged[key] = n;
+    }
+    out.set(id, merged);
+  }
+  return out;
+}
+
 
 /**
  * What a task CONSUMES, shaped for the formula engine's `input.*` / `inputs.*`.

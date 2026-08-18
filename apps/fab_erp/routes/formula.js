@@ -80,9 +80,15 @@ router.get('/formula/variables', protect, requirePerm('fab_erp_operations_view')
     // legitimately appear in a formula. A text field offered here would be
     // accepted by the editor and then coerce to NaN at evaluation, nulling the
     // whole duration and planning the task as instant.
+    //
+    // Definitions now come from fab_fields; fab_field_defs is the retired one.
+    // Only the definition moved — values still resolve through their own path —
+    // which is why this endpoint could cross over on its own. `unit` is
+    // `default_unit` there, aliased back so the JSON the editor already parses
+    // does not change shape underneath it.
     const [itemRows] = await pool.query(
-      `SELECT field_key AS metric_key, label AS metric_label, unit
-         FROM fab_field_defs
+      `SELECT field_key AS metric_key, label AS metric_label, default_unit AS unit
+         FROM fab_fields
         WHERE company_id = ? AND deleted_at IS NULL AND active = 1
           AND formula_usable = 1
         ORDER BY sort_order, field_key`,
@@ -144,8 +150,16 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
           ${resourceTypeId ? 'AND p.resource_type_id = ?' : ''}`,
       resourceTypeId ? [companyId, resourceTypeId] : [companyId],
     );
+    // Same registry as /formula/variables, and it has to stay the same one: a
+    // key offered by autocomplete that the validator then called unknown would
+    // make the editor argue with itself. `formula_usable = 1` is the whole
+    // point of the filter here — a registered but non-usable key must come back
+    // as unresolved rather than silently evaluating to 0.
+    //
+    // Definitions moved to fab_fields (fab_field_defs is retired); no unit is
+    // read on this path, so only the table name changes.
     const [itemRows] = await pool.query(
-      `SELECT field_key AS metric_key FROM fab_field_defs
+      `SELECT field_key AS metric_key FROM fab_fields
         WHERE company_id = ? AND deleted_at IS NULL AND active = 1 AND formula_usable = 1`,
       [companyId],
     );

@@ -5426,10 +5426,15 @@ CREATE TABLE IF NOT EXISTS fab_field_values (
 -- and custom fields share one table and one screen.
 --
 -- The level mapping, and why:
---   item  -> catalog_item   does not vary per instance; settable item-and-broader
---   both  -> stock_piece    "set on the item, overridden per piece" IS
---                           settable-all-the-way-down under one rule
---   piece -> stock_piece    varies per physical piece
+--   item  -> order_item    does not vary per PIECE. Not catalog_item: the old
+--                          gate (authoredOnPiece) only ever gated the PIECE
+--                          step, and the old chain read order_item as its
+--                          second-narrowest source for EVERY field. Mapping
+--                          this to catalog_item would refuse 457 of the 915
+--                          live values -- every per-order thickness and weight.
+--   both  -> stock_piece   "set on the item, overridden per piece" IS
+--                          settable-all-the-way-down under one rule
+--   piece -> stock_piece   varies per physical piece
 INSERT INTO fab_fields
   (company_id, field_key, label, data_type, dimension, default_unit, allowed_values,
    applies_at, formula_usable, default_num, is_standard,
@@ -5437,7 +5442,7 @@ INSERT INTO fab_fields
 SELECT d.company_id, d.field_key, d.label,
        CASE WHEN d.data_type IN ('number','text','date','bool','enum') THEN d.data_type ELSE 'number' END,
        u.dimension, d.unit, d.allowed_values,
-       CASE d.level WHEN 'item' THEN 'catalog_item' ELSE 'stock_piece' END,
+       CASE d.level WHEN 'item' THEN 'order_item' ELSE 'stock_piece' END,
        d.formula_usable, d.default_value, 1,
        d.category_id, d.group_id, d.subgroup_id, d.sort_order, d.active
   FROM fab_field_defs d
