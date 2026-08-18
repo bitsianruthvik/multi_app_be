@@ -35,6 +35,12 @@ import {
   applyFlowRulesHandler,
   setItemFlowHandler,
   setItemMaterialHandler,
+  parameterGridHandler,
+  exportParametersHandler,
+  importParametersHandler,
+  setParametersHandler,
+  similarGroupsHandler,
+  markSimilarHandler,
   orderReadinessHandler,
   confirmOrderHandler,
   nestingBoardHandler,
@@ -83,6 +89,21 @@ router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage
 // The screen equivalent of the BOQ sheet Raw Material column, so setting what a
 // part is cut from no longer needs an Excel round trip.
 router.post('/items/:itemId/material', protect, requirePerm('fab_erp_projects_manage'), setItemMaterialHandler);
+
+// ── parameters: grid, spreadsheet, and marking copies ──────────────────────
+//
+// The grid asks each part only for what ITS flow needs. The sheet exists
+// because a column of three hundred numbers is typed far faster than three
+// hundred fields, and people already have the values in a spreadsheet.
+router.get('/orders/:orderId/parameters', protect, parameterGridHandler);
+router.get('/orders/:orderId/parameters/export', protect, requirePerm('fab_erp_projects_manage'), exportParametersHandler);
+router.post('/orders/:orderId/parameters/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importParametersHandler);
+router.post('/orders/:orderId/parameters', protect, requirePerm('fab_erp_projects_manage'), setParametersHandler);
+
+// Marking girders or segments as copies of each other. One decision typed
+// once instead of thirty times.
+router.get('/orders/:orderId/similar', protect, similarGroupsHandler);
+router.post('/orders/:orderId/similar', protect, requirePerm('fab_erp_projects_manage'), markSimilarHandler);
 
 // ── The wizard: where the order stands, and the act that ends it (2026-08) ──
 // Readiness is read-only, so it is gated on view, not manage.

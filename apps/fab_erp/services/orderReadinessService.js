@@ -128,10 +128,40 @@ async function summariseProduction(companyId, orderId) {
   const makeTasks = Number(agg?.make_tasks) || 0;
   const claimed = Number(agg?.claimed) || 0;
 
+  /**
+   * "Nothing to make" and "tasks are not built yet" are different answers.
+   *
+   * The aggregate above counts TASKS, and tasks do not exist until the
+   * production order is raised — that is what builds them. So `makeTasks === 0`
+   * was true of every order that had not reached this step yet, and the step
+   * reported itself DONE and green with "this order is entirely bought in" on
+   * an order carrying hundreds of make items. Green on unfinished work is the
+   * worst direction for this to be wrong in: it says there is nothing to do.
+   *
+   * The order's ITEMS are what say whether there is anything to make, and they
+   * exist from the structure step onwards. Only when there are none of those is
+   * the order genuinely bought in.
+   */
+  const [[items]] = await pool.query(
+    `SELECT COUNT(*) AS make_items
+       FROM fab_items i
+      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+        AND i.flow_id IS NOT NULL
+        AND COALESCE(i.procurement_type, 'make') = 'make'`,
+    [companyId, orderId],
+  );
+  const makeItems = Number(items?.make_items) || 0;
+
+  if (makeItems === 0 && makeTasks === 0) {
+    return {
+      state: 'done', claimed: 0, makeTasks: 0, makeItems: 0,
+      detail: 'Nothing to make — this order is entirely bought in',
+    };
+  }
   if (makeTasks === 0) {
     return {
-      state: 'done', claimed: 0, makeTasks: 0,
-      detail: 'Nothing to make — this order is entirely bought in',
+      state: 'todo', claimed: 0, makeTasks: 0, makeItems,
+      detail: `No production order raised yet — ${makeItems} item(s) are waiting to become tasks`,
     };
   }
   if (claimed === 0) {

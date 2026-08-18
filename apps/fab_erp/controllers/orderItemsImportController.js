@@ -7,6 +7,11 @@ import {
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
 import { setItemMaterial } from '../services/itemMaterialService.js';
+import {
+  parameterGrid, setParameters, exportParameters, importParameters,
+} from '../services/orderParametersService.js';
+import { markSimilar, groupsForOrder, groupableItems } from '../services/similarityService.js';
+import fs from 'fs';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
 import {
   nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
@@ -563,5 +568,92 @@ export const orderWeightSummaryHandler = async (req, res) => {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: orderWeightSummary failed');
     res.status(500).json({ message: 'Failed to read weight summary', error: err.message });
+  }
+};
+
+// ── parameters and similarity (2026-08-18) ──────────────────────────────────
+
+/** GET — the grid: which parts, which columns, what is in them. */
+export const parameterGridHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    res.json(await parameterGrid(cid, Number(req.params.orderId)));
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: parameterGrid failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/** POST — write cells. Each edit fans out to the part's peers. */
+export const setParametersHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    const result = await setParameters(cid, orderId, req.body?.edits ?? []);
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: setParameters failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+export const exportParametersHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const { buffer, fileName } = await exportParameters(cid, Number(req.params.orderId));
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(buffer);
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: exportParameters failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+export const importParametersHandler = async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    const result = await importParameters(cid, orderId, req.file.path);
+    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: importParameters failed');
+    res.status(500).json({ message: err.message });
+  } finally {
+    // multer wrote it to disk; it is read once and has no business surviving.
+    if (req.file?.path) fs.unlink(req.file.path, () => {});
+  }
+};
+
+export const similarGroupsHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    const [groups, candidates] = await Promise.all([
+      groupsForOrder(cid, orderId), groupableItems(cid, orderId),
+    ]);
+    res.json({ groups, candidates });
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: similarGroups failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/** POST — mark a set of girders or segments as copies of each other. */
+export const markSimilarHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    const { itemIds, groupKey } = req.body ?? {};
+    const result = await markSimilar(cid, orderId, itemIds, groupKey ?? null);
+    res.json({ ...result, groups: await groupsForOrder(cid, orderId) });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: markSimilar failed');
+    res.status(500).json({ message: err.message });
   }
 };

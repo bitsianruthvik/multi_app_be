@@ -5022,3 +5022,41 @@ SET @n = (SELECT IS_NULLABLE FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND COLUMN_NAME='catalog_item_id');
 SET @s = IF(@n='NO', 'ALTER TABLE fab_stock_pieces MODIFY COLUMN catalog_item_id INT NULL', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ SIMILAR GIRDERS AND SEGMENTS (2026-08-18) ══════════════════════════════
+--
+-- Asked for: "we should give a very simple UI to mark girders or segments
+-- similar. That way entering values throughout would reduce by a lot,
+-- especially during flow and value entry phase" — and, on scope, "we can mark
+-- either G1 same as G2 or G11 same as G12, basically girders or segments".
+--
+-- A six-girder span produced 210 parts, and typing a Top Flange's thickness
+-- thirty times is not thirty decisions — it is one decision typed thirty times.
+--
+-- HOW A GROUP IS EXPRESSED. `similar_group` is stamped on the GIRDER or SEGMENT
+-- rows that are copies of each other, never on the parts. The parts follow,
+-- because a part's correspondence to its opposite number is already carried by
+-- its code: strip the group root's code from `VSHW-…-SPANA-G1-1-TF` and `-1-TF`
+-- is what makes it the same part as G2's. That is the same "codes ARE the
+-- structure" rule the BOQ sheet is built on, so no second notion of identity is
+-- introduced and nothing has to be kept in sync.
+--
+-- It is a free-text key rather than a foreign key to a groups table because a
+-- group has no properties of its own — it is only ever "these rows are the
+-- same as each other". A table would add a join and an orphan-cleanup problem
+-- to store nothing.
+--
+-- NOT A CONSTRAINT. Marking two girders similar does not stop them diverging:
+-- it means a value entered against one is written to all of them. If someone
+-- later gives one girder a different plate thickness, that is a real answer to
+-- a real question and the data says so. The grouping saves typing; it does not
+-- claim the parts are interchangeable forever.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='similar_group');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD COLUMN similar_group VARCHAR(40) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @i = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_similar');
+SET @s = IF(@i=0, 'CREATE INDEX idx_fi_similar ON fab_items (company_id, order_id, similar_group)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

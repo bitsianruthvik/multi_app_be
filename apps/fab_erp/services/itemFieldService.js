@@ -482,6 +482,22 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
     itemsChecked: items.length,
     itemsShort: missingValues.length,
     missingValues,
+    /**
+     * WHICH FIELDS EACH FLOW ACTUALLY ASKS FOR.
+     *
+     * Computed above either way — this just stops throwing it away. Without it
+     * a caller can only see what is MISSING, and "missing" disappears the
+     * moment a value is entered, so the parameters grid had no way to tell a
+     * field a part genuinely needs from one it has merely been given. It showed
+     * every field any flow on the order wanted, against every part, and let
+     * someone type a weld length onto a plate that is only ever cut.
+     *
+     * Keyed by flow because that is the granularity the requirement has: two
+     * parts on the same flow need exactly the same fields.
+     */
+    requiredByFlow: [...requiredByFlow.entries()]
+      .map(([flowId, keys]) => ({ flowId, required: [...keys] }))
+      .filter((r) => r.required.length),
     unknownFields: [...unknownByOp.values()].map((u) => ({ ...u, keys: [...u.keys] })),
     noFormula,
   };
