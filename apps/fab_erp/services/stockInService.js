@@ -35,6 +35,7 @@ import { pool } from '../../../db.js';
 import { reevaluateStockGatedTasks } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { generateCode } from './codegenService.js';
+import { setFields } from './fieldService.js';
 import { logger } from '../../../core/utils/logger.js';
 
 /**
@@ -63,7 +64,8 @@ function displayBatchCode(piece) {
  * @param {number|null} [input.unit_cost]
  * @param {string|null} [input.notes]
  * @param {Array<{qty:number, batch_no?, heat_no?, serial_no?, mark_no?}>} input.pieces
- * @returns {Promise<{ok:true, pieceIds:number[], qtyTotal:number, tasksCleared:number[]}>}
+ * @returns {Promise<{ok:true, pieceIds:number[], qtyTotal:number, tasksCleared:number[],
+ *   gateCheckFailed:boolean, dimensionRejections:Array<{pieceId,code,rejected}>}>}
  */
 export async function receiveStock(companyId, input, outerConn = null) {
   const {
@@ -90,6 +92,7 @@ export async function receiveStock(companyId, input, outerConn = null) {
   const joined = !!outerConn;
   const conn = outerConn ?? await pool.getConnection();
   const pieceIds = [];
+  const dimensionRejections = [];
   let qtyTotal = 0;
 
   try {
@@ -130,24 +133,21 @@ export async function receiveStock(companyId, input, outerConn = null) {
       // sequence, and the piece must never exist uncoded.
       const code = await generateCode(companyId, 'stock_piece', {}, conn);
 
+      // length_mm/width_mm are deliberately absent: they are now a projection of
+      // field values, and setFields fills them from the value below. Writing the
+      // column here would set the copy without the thing it is copied from, so
+      // the field system would never see the piece's real size — and it is
+      // piece-size matching that stops the wrong plate being cut.
       const [pieceResult] = await conn.query(
         `INSERT INTO fab_stock_pieces
            (company_id, code, catalog_item_id, plant_id, stock_location_id,
             batch_no, heat_no, serial_no, mark_no, qty, uom, unit_cost,
-            length_mm, width_mm,
             status, received_date, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
         [
           companyId, code,
           catalogItemId, plantId, stockLocationId,
           batchNo, heatNo, serialNo, markNo, qty, resolvedUom, unitCost,
-          // The PIECE's size. These columns have existed since the stock-piece
-          // redesign and nothing ever wrote them, so every row was NULL — which
-          // is why procurement could only ever match on catalog item and a
-          // 2000x1000 offcut "covered" a 12000x2500 nest. Thickness is not here
-          // on purpose: a "20mm plate" catalog item IS its thickness, so the
-          // catalog link already carries it.
-          lengthMm, widthMm,
           // received_date drives FIFO in wipInventoryService.consumeStock, where
           // NULL sorts last — a piece received with no date would be consumed
           // after everything else regardless of when it actually arrived.
@@ -158,6 +158,42 @@ export async function receiveStock(companyId, input, outerConn = null) {
       const pieceId = pieceResult.insertId;
       pieceIds.push(pieceId);
       qtyTotal += qty;
+
+      /**
+       * The PIECE's size, authored where sizes are now authored.
+       *
+       * Nothing wrote these at all before, so every row was NULL — which is why
+       * procurement could only ever match on catalog item and a 2000x1000
+       * offcut "covered" a 12000x2500 nest. Thickness is not here on purpose: a
+       * "20mm plate" catalog item IS its thickness, so the catalog link already
+       * carries it.
+       *
+       * Only when a size was actually measured. A receipt with no size is
+       * normal, and an empty call would clear the piece's values and cost a
+       * round trip to do it.
+       */
+      if (lengthMm != null || widthMm != null) {
+        const dims = {};
+        if (lengthMm != null) dims.length_mm = lengthMm;
+        if (widthMm != null) dims.width_mm = widthMm;
+
+        // On THIS connection, so a size cannot survive a receipt that rolled
+        // back — a piece that never existed must not leave values behind.
+        const { rejected } = await setFields(companyId, 'stock_piece', pieceId, dims, conn);
+
+        // setFields does not throw on a bad value, so an unreported rejection
+        // would leave the piece silently sizeless and matching would go back to
+        // covering a nest with an offcut. Reported the same way the gate failure
+        // below is: logged, and named in the result, because the receipt itself
+        // is sound and must not be undone over it.
+        if (rejected?.length) {
+          dimensionRejections.push({ pieceId, code, rejected });
+          logger.warn(
+            { companyId, pieceId, code, rejected },
+            '[stock-in] piece dimensions rejected; the piece has no recorded size',
+          );
+        }
+      }
 
       await conn.query(
         `INSERT INTO fab_stock_ledger
@@ -245,6 +281,7 @@ export async function receiveStock(companyId, input, outerConn = null) {
       qtyTotal,
       tasksCleared,
       gateCheckFailed: !!gateError,
+      dimensionRejections,
     };
   } catch (err) {
     if (!joined) await conn.rollback();

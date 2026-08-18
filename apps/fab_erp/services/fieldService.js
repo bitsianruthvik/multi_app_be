@@ -29,6 +29,7 @@
 
 import { pool } from '../../../db.js';
 import { chainsFor, mayHoldValue, rungOf, RUNGS } from './fieldLadder.js';
+import { projectToColumns, hasProjection } from './fieldProjection.js';
 
 /** Every active definition for a company, by key AND by id. */
 export async function fieldRegistry(companyId, conn = null) {
@@ -223,6 +224,14 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
     let written = 0;
     let cleared = 0;
     const rejected = [];
+    /**
+     * What to copy into the legacy columns afterwards (step 4).
+     *
+     * Collected as we go and written once at the end, on this same connection,
+     * so a value and its projection land together. See fieldProjection.js for
+     * why the columns still exist at all.
+     */
+    const toProject = {};
 
     for (const [fieldKey, input] of Object.entries(values ?? {})) {
       const f = registry.byKey.get(fieldKey);
@@ -249,6 +258,9 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
           [companyId, f.id, scope, scopeId],
         );
         cleared += r.affectedRows ? 1 : 0;
+        // Clearing a value clears its column too, or the column would keep
+        // answering for a value that no longer exists.
+        if (hasProjection(scope, fieldKey)) toProject[fieldKey] = null;
         continue;
       }
 
@@ -291,10 +303,28 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
         [companyId, f.id, scope, scopeId, num, text, date, unit ?? null],
       );
       written++;
+
+      /**
+       * The projected value is the one AFTER unit conversion, not the one that
+       * was typed. A length authored as 6 m must land in the column as 6000,
+       * because every matcher reading that column assumes the field's declared
+       * unit — putting 6 there would be the silent-1000x bug wearing a different
+       * hat.
+       */
+      if (hasProjection(scope, fieldKey)) {
+        let projected = num ?? text ?? date;
+        if (f.dataType === 'number' && unit && f.defaultUnit && unit !== f.defaultUnit) {
+          const c = convert(num, unit, f.defaultUnit, await unitTable(conn));
+          if (c) projected = c.value;
+        }
+        toProject[fieldKey] = projected;
+      }
     }
 
+    const projectedCount = await projectToColumns(conn, companyId, scope, scopeId, toProject);
+
     if (owned) await conn.commit();
-    return { written, cleared, rejected };
+    return { written, cleared, rejected, projected: projectedCount };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

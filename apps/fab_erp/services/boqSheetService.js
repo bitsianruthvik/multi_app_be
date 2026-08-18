@@ -52,6 +52,7 @@ import {
 } from './rawMaterialService.js';
 import { syncOrderProcurement } from './procurementService.js';
 import { setItemMaterial } from './itemMaterialService.js';
+import { setFields } from './fieldService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -489,8 +490,33 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
       const base = { row: r.row, path: path.map((p) => p.label).join(' / '), name: r.name ?? '' };
       const skip = (reason) => { rowLog.push({ ...base, status: 'Skipped', reason }); result.itemsSkipped++; };
+      const rowNotes = [];
 
       if (!path.length) { skip('No level code on this row — at least a Span is needed.'); continue; }
+
+      /**
+       * The three geometry cells, keyed the way the field registry names them.
+       *
+       * `fab_items.length/width/height` are no longer somewhere to write: they
+       * are a projection of these values, written by setFields (see
+       * fieldProjection.js). Setting the column directly would set the copy
+       * without the thing it is copied from — the same drift the projection
+       * exists to remove, only pointing the other way, and the field system
+       * would not see the dimension at all.
+       *
+       * Thick -> thickness_mm. The sheet declares that column with key
+       * `height` and it projects back to `fab_items.height`; that column has
+       * always held thickness, not any height.
+       *
+       * Only cells that were actually filled in are listed. A blank cell means
+       * "not stated on this row", which is why the old UPDATE used COALESCE —
+       * and setFields reads a null as "clear this value", so a blank listed
+       * here would delete a dimension somebody set elsewhere.
+       */
+      const dims = {};
+      if (r.length != null) dims.length_mm = r.length;
+      if (r.width  != null) dims.width_mm = r.width;
+      if (r.height != null) dims.thickness_mm = r.height;
 
       // Walk the path, creating any level that has not been seen yet. This is
       // what lets the same Span/Girder be repeated down hundreds of rows
@@ -514,10 +540,14 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
 
         if (!hit) {
           const [ins] = await conn.query(
+            // No dimension columns: the row has to exist before setFields can
+            // be given its id, so the item is inserted without them and the
+            // projection fills them in from the values a moment later. All
+            // three are NULLable, so nothing is owed at insert time.
             `INSERT INTO fab_items
                (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
-                length, width, height, code, level_kind)
-             VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?)`,
+                code, level_kind)
+             VALUES (?,?,?,?,NULL,?,?,?,?,?,?)`,
             [
               companyId, orderId, lineId, parentId,
               // An intermediate level has no name of its own in the BOQ — the
@@ -526,9 +556,6 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
               'pcs',
               isLast ? (r.qty ?? 1) : 1,
               null, // flow allocation is its own pass — never set from the BOQ
-              isLast ? r.length : null,
-              isLast ? r.width : null,
-              isLast ? r.height : null,
               code, path[i].kind,
             ],
           );
@@ -539,13 +566,15 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
           // The level already exists — this row is filling in its detail.
           // flow_id is deliberately absent: it belongs to flow allocation, and
           // a BOQ re-upload must not clear a flow someone has since assigned.
+          // The dimensions are absent for the same reason they are absent from
+          // the INSERT: those columns are a projection now, and `dims` below is
+          // where the value is written.
           await conn.query(
             `UPDATE fab_items SET
                name = COALESCE(?, name), qty = COALESCE(?, qty),
-               length = COALESCE(?, length), width = COALESCE(?, width), height = COALESCE(?, height),
                order_line_id = COALESCE(order_line_id, ?)
              WHERE id = ? AND company_id = ?`,
-            [r.name, r.qty, r.length, r.width, r.height, lineId, hit.id, companyId],
+            [r.name, r.qty, lineId, hit.id, companyId],
           );
           createdHere = true;
         }
@@ -554,6 +583,31 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
         parentCode = code;
         parentLabel = path[i].label;
         node = hit;
+      }
+
+      /**
+       * The geometry, onto the leaf the row describes.
+       *
+       * One call per row rather than three writes, and none at all for a row
+       * with no dimensions — which is most of them, since span, girder and
+       * segment rows declare a level and carry no size. setFields is a round
+       * trip whether or not it has anything to do.
+       *
+       * `conn` is the import's transaction, so a value that lands here rolls
+       * back with the item it belongs to; without it the values would survive a
+       * failed import and describe rows that no longer exist.
+       */
+      if (node && Object.keys(dims).length) {
+        // setFields reports a bad value instead of throwing, so a rejection has
+        // to be surfaced or the dimension is dropped in silence — reported like
+        // any other per-row problem here: a warning plus a note on the row's log
+        // entry, with the item itself still created.
+        const { rejected } = await setFields(companyId, 'order_item', node.id, dims, conn);
+        for (const rej of rejected) {
+          const message = `Dimension '${rej.fieldKey}' not set — ${rej.why}.`;
+          result.warnings.push({ row: r.row, message });
+          rowNotes.push(message);
+        }
       }
 
       /**
@@ -594,7 +648,7 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       }
 
       rowLog.push({ ...base, status: createdHere ? 'Created' : 'Skipped',
-        reason: createdHere ? '' : 'Nothing to create on this row.' });
+        reason: createdHere ? rowNotes.join(' ') : 'Nothing to create on this row.' });
       if (!createdHere) result.itemsSkipped++;
     }
 

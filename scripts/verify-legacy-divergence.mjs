@@ -182,9 +182,14 @@ for (const co of pvLive ? companies : []) {
 if (!pvLive) reportDone('fab_field_defs.piece_varying');
 else report('fab_field_defs.piece_varying', {
   divergence: pvDiverge,
-  readers: ['itemFieldService (authoredOnPiece falls back to it)', 'resourceDef.fabErpFieldDef'],
-  precondition: 'remove the fallback in fieldVocabulary.authoredOnPiece / authoredOnItem, '
-    + 'and drop piece_varying from resourceDef',
+  // Reader list corrected 2026-08-18. It named `resourceDef.fabErpFieldDef` as
+  // a live reader, which stopped being true when the registry page moved to
+  // fabErpField/fab_fields — so this gate would have reported a blocker that no
+  // longer exists. A stale reader list on the script that decides what is safe
+  // to DROP is worse than no list, because it is trusted.
+  readers: ['itemFieldService.resolveItemFieldsLegacy (via fieldRegistry)'],
+  precondition: 'remove the legacy fallback in itemFieldService once nothing '
+    + 'writes a duplicated column (step 4), which retires the old registry read with it',
 });
 
 // ── 5. fab_item_metric_defs — the one with no readers at all ──────────────
