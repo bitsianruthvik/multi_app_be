@@ -5060,3 +5060,52 @@ SET @i = (SELECT COUNT(*) FROM information_schema.STATISTICS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_similar');
 SET @s = IF(@i=0, 'CREATE INDEX idx_fi_similar ON fab_items (company_id, order_id, similar_group)', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ RESOURCES: NO MACHINE SHIFTS, ALWAYS A LOCATION (2026-08-18) ═══════════
+--
+-- Asked for: "remove shifts for resources, we will give shifts for people and
+-- track the resource availability based on that. Machine can technically run 24
+-- hours so we shouldn't give shifts for it" — and "stock location of a resource
+-- should never be null".
+--
+-- 1. CLEAR EVERY MACHINE'S OWN CALENDAR.
+--
+-- The field is gone from the UI, but all 18 production machines already had one
+-- set, so removing the control alone would have frozen them on machine-specific
+-- calendars forever with no way to change them — the worst of both.
+--
+-- Nothing breaks, because the resolution chain already widens: taskWaitService,
+-- gapService and resourceLevelingService all read the machine's own calendar
+-- FIRST and fall back to any calendar on its plant, then the company's. Clearing
+-- the column moves every machine onto its plant's calendar, which is exactly
+-- "the machine has no shift of its own". The column stays — the chain still
+-- reads it, and a company that genuinely does run one machine on a different
+-- pattern can still set it as data.
+UPDATE fab_resources SET shift_calendar_id = NULL
+ WHERE deleted_at IS NULL AND shift_calendar_id IS NOT NULL;
+
+-- 2. GIVE EVERY MACHINE A STOCK LOCATION, FROM THE PIECE THAT IS THAT MACHINE.
+--
+-- 16 of 18 resources had no `stock_location_id` while their stock piece did:
+-- the Phase 8 backfill created each machine's piece in the plant's on-site
+-- machine area but never wrote the location back to the resource row. So the
+-- machine knew where it was and the resource did not.
+--
+-- Derived rather than typed, because the piece is already the authority on where
+-- a physical thing is — that is the whole point of a machine being a stock
+-- piece. Making the field required in the UI without this would have meant 16
+-- machines that could not be saved without someone re-entering a location the
+-- system already knew.
+UPDATE fab_resources r
+  JOIN fab_stock_pieces p
+    ON p.id = r.stock_piece_id AND p.deleted_at IS NULL AND p.stock_location_id IS NOT NULL
+   SET r.stock_location_id = p.stock_location_id,
+       r.plant_id = COALESCE(r.plant_id, p.plant_id)
+ WHERE r.deleted_at IS NULL AND r.stock_location_id IS NULL;
+
+-- 3. ASSET TAG RETIRED.
+--
+-- A second internal identifier for a thing `code` already names, with no rule
+-- about which wins. Production had zero of them. The column is left in place
+-- rather than dropped: it is out of the UI, and dropping a column is the kind
+-- of thing verify-legacy-divergence.mjs exists to gate.
