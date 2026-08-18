@@ -5109,3 +5109,52 @@ UPDATE fab_resources r
 -- about which wins. Production had zero of them. The column is left in place
 -- rather than dropped: it is out of the UI, and dropping a column is the kind
 -- of thing verify-legacy-divergence.mjs exists to gate.
+
+-- ══ DRAWINGS (2026-08-18) ══════════════════════════════════════════════════
+--
+-- Asked for: upload drawing PDFs in the structure wizard, "which can be
+-- referenced by the org later while working on a task", and "a way to access
+-- current item and all of its above steps' diagrams on every operation".
+--
+-- THE SECOND HALF IS THE POINT. A drawing is attached to ONE item, but the
+-- person cutting a web plate needs the plate's drawing AND the segment's AND
+-- the girder's — the assembly context is what tells them which way round it
+-- goes. So a task shows its item's own drawings plus every ancestor's, and
+-- nobody has to attach the same general arrangement to two hundred parts.
+--
+-- BYTES IN THE DATABASE, FOR NOW. The backend runs on Render's free plan with
+-- no persistent disk (render.yaml has no disk section), so anything written to
+-- local storage is lost on every deploy and every spin-down — drawings that
+-- silently vanish are worse than no drawings, because people come to rely on
+-- them. Decided 2026-08-18: compress and store in TiDB until S3 is connected.
+--
+-- `content` is therefore a LONGBLOB holding the DEFLATE-compressed PDF, and
+-- `storage` records which it is. When S3 arrives, new rows carry
+-- storage='s3' + `uri` and leave `content` null; nothing has to migrate, and
+-- both kinds read through the same endpoint.
+--
+-- TiDB's txn-entry-size-limit caps a single row at about 6 MB, so the service
+-- enforces a ceiling well under that and rejects a too-large file with a clear
+-- message rather than failing on commit with an opaque one.
+CREATE TABLE IF NOT EXISTS fab_item_drawings (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT NOT NULL,
+  item_id         INT NOT NULL,
+  file_name       VARCHAR(255) NOT NULL,
+  mime_type       VARCHAR(100) NOT NULL DEFAULT 'application/pdf',
+  -- Bytes as uploaded, before compression — what the user recognises.
+  size_bytes      INT NOT NULL,
+  -- 'db' = deflate-compressed bytes in `content`; 's3' = fetch from `uri`.
+  storage         VARCHAR(16) NOT NULL DEFAULT 'db',
+  compression     VARCHAR(16) NULL DEFAULT 'deflate',
+  content         LONGBLOB NULL,
+  uri             VARCHAR(1024) NULL,
+  revision        VARCHAR(40) NULL,
+  notes           VARCHAR(500) NULL,
+  uploaded_by     INT NULL,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at      TIMESTAMP NULL,
+  KEY idx_fid_item (company_id, item_id, deleted_at),
+  CONSTRAINT fk_fid_item FOREIGN KEY (item_id) REFERENCES fab_items(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

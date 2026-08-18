@@ -1704,6 +1704,32 @@ router.post('/tasks/:id/events/backfill', protect, async (req, res) => {
   }
 });
 
+// ── GET /tasks/:taskId/logged-times ─────────────────────────────────────────
+// The current (non-superseded) start/finish events for a task, so a caller can
+// correct one without first fetching every event and mapping type→id.
+//
+// That dance is the only reason MachineTimeline needed the raw event list.
+// With Timeline removed (2026-08-18) its one irreplaceable ability — fixing a
+// wrongly logged time — moves to the Shift Log, which is where somebody is
+// already accounting for that hour.
+router.get('/tasks/:taskId/logged-times', protect, async (req, res) => {
+  const companyId = req.user?.companyId ?? req.user?.company_id;
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, event_type AS eventType, at_ts AS at
+         FROM fab_task_events
+        WHERE task_id = ? AND company_id = ? AND deleted_at IS NULL
+          AND superseded_by_event_id IS NULL
+          AND event_type IN ('started', 'completed')
+        ORDER BY at_ts`,
+      [Number(req.params.taskId), companyId],
+    );
+    res.json({ ok: true, events: rows });
+  } catch (err) {
+    logger.error({ err }, 'fab_erp logged-times failed');
+    res.status(500).json({ message: err.message });
+  }
+});
 // ── POST /task-events/:eventId/correct ──────────────────────────────────────
 // EU-10: correct one event's timestamp WITHOUT in-place edit — insert a new
 // event and mark the old row superseded (append-only audit). Mounted as a

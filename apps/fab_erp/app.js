@@ -2,7 +2,6 @@ import fs   from 'fs';
 import path  from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes            from './routes/index.js';
-import criticalChainRoutes    from './routes/criticalChain.js';
 import plannerRoutes          from './routes/planner.js';
 import procurementRoutes      from './routes/procurement.js';
 import { logger }              from '../../core/utils/logger.js';
@@ -24,8 +23,6 @@ export default {
   register(server) {
     server.use('/api/:companySlug/fab_erp', indexRoutes);
     // EU-4: critical-chain baseline route, mounted separately (same prefix)
-    // rather than folded into routes/index.js — see routes/criticalChain.js.
-    server.use('/api/:companySlug/fab_erp', criticalChainRoutes);
     // Production Planner: the time-phased day/week plan. Same prefix, same
     // reason as the two above. It REPLACED routes/dispatch.js (deleted
     // 2026-08-14) — dispatch answered the same question with no time axis, and
