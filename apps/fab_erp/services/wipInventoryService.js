@@ -32,6 +32,7 @@
 
 import { generateCode } from './codegenService.js';
 import { isConsumable } from './itemFieldService.js';
+import { fieldMatchSql } from './fieldService.js';
 import { piecesHeldByOthers, piecesReservedFor } from './availabilityService.js';
 import { movePiece } from './stockMovementService.js';
 
@@ -239,29 +240,47 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
     ? await piecesReservedFor(companyId, orderId, catalogItemId, conn)
     : [];
 
-  const params = [companyId, catalogItemId];
-  let sizeWhere = '';
-  if (sized) {
-    // NULL-safe equality: a piece with no recorded size does not match a sized
-    // requirement, which is the point — an unmeasured plate is not evidence of
-    // the right plate.
-    sizeWhere = ' AND length_mm <=> ? AND width_mm <=> ?';
-    params.push(want.lengthMm ?? null, want.widthMm ?? null);
-  }
+  /**
+   * The size filter now matches FIELD VALUES, not the projected columns.
+   *
+   * Same NULL-safe semantics as the `length_mm <=> ?` it replaces: the LEFT JOIN
+   * yields NULL where a piece has no value, and an unmeasured plate therefore
+   * does not match a sized requirement. That is deliberate and the exact-fit
+   * rule depends on it — an unmeasured plate is not evidence of the right plate.
+   *
+   * Moved because these are the queries that decide which physical plate gets
+   * cut, and matching on a value should not be a privilege of the thirteen keys
+   * that happen to have a column behind them.
+   */
+  const match = sized
+    ? await fieldMatchSql(companyId, 'stock_piece', 'p',
+      { length_mm: want.lengthMm ?? null, width_mm: want.widthMm ?? null }, conn)
+    : { join: '', where: '', joinParams: [], whereParams: [] };
 
   // Everybody else's named plates are excluded outright. This is the one thing
   // that stops two orders taking the same physical plate.
   let heldWhere = '';
+  const heldParams = [];
   if (held.size) {
-    heldWhere = ` AND id NOT IN (${[...held].map(() => '?').join(',')})`;
-    params.push(...held);
+    heldWhere = ` AND p.id NOT IN (${[...held].map(() => '?').join(',')})`;
+    heldParams.push(...held);
   }
 
+  // Ordering matters: JOIN params bind before anything in the WHERE.
+  const params = [
+    ...match.joinParams,
+    companyId, catalogItemId,
+    ...match.whereParams,
+    ...heldParams,
+  ];
+
   const [pieces] = await conn.query(
-    `SELECT id, qty, plant_id, stock_location_id, batch_no FROM fab_stock_pieces
-      WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
-        AND deleted_at IS NULL AND qty > 0${sizeWhere}${heldWhere}
-      ORDER BY (received_date IS NULL), received_date ASC, id ASC
+    `SELECT p.id, p.qty, p.plant_id, p.stock_location_id, p.batch_no
+       FROM fab_stock_pieces p
+       ${match.join}
+      WHERE p.company_id = ? AND p.catalog_item_id = ? AND p.status = 'in_stock'
+        AND p.deleted_at IS NULL AND p.qty > 0${match.where}${heldWhere}
+      ORDER BY (p.received_date IS NULL), p.received_date ASC, p.id ASC
       FOR UPDATE`,
     params,
   );

@@ -338,3 +338,75 @@ export async function resolveOne(companyId, scope, scopeId, opts = {}) {
   const m = await resolveFields(companyId, [{ scope, scopeId }], opts);
   return m.get(`${scope}:${scopeId}`) ?? {};
 }
+
+/**
+ * SQL to match rows on FIELD VALUES, the way a column filter used to.
+ *
+ * Step 4's second half. Two queries genuinely FILTER on a projected column —
+ * consumption (`wipInventoryService`) and availability — and they are the two
+ * that decide which physical plate gets cut. Everything else merely SELECTs the
+ * column for display, and a derived projection answers that correctly.
+ *
+ * Moving these two is what makes the capability universal: matching on a value
+ * stops being a privilege of the thirteen keys that happen to have a column, and
+ * becomes something any field can do. That is the asymmetry worth removing —
+ * not the storage.
+ *
+ * NULL-SAFE, EXACTLY AS BEFORE. A LEFT JOIN yields NULL where a piece has no
+ * value, and `<=>` against NULL behaves precisely as it did against an empty
+ * column: an unmeasured plate does not match a sized requirement. That is the
+ * point rather than an accident — an unmeasured plate is not evidence of the
+ * right plate, and the exact-fit rule depends on it.
+ *
+ * @param {string} alias   the table alias the caller uses, e.g. 'p' or bare ''
+ * @param {Record<string, number|null>} criteria fieldKey -> required value
+ * @returns {Promise<{join:string, where:string, params:Array}>} splice into the query
+ */
+export async function fieldMatchSql(companyId, scope, alias, criteria, conn = null) {
+  const exec = conn ?? pool;
+  const entries = Object.entries(criteria ?? {});
+  if (!entries.length) return { join: '', where: '', params: [] };
+
+  const registry = await fieldRegistry(companyId, exec);
+  const joins = [];
+  const wheres = [];
+  const joinParams = [];
+  const whereParams = [];
+  const idPrefix = alias ? `${alias}.id` : 'id';
+
+  entries.forEach(([fieldKey, wanted], i) => {
+    const f = registry.byKey.get(fieldKey);
+    // A criterion naming a field that does not exist must match NOTHING, not
+    // everything. Silently dropping it would widen the search to every piece —
+    // the opposite of what an exact-fit filter is for.
+    if (!f) { wheres.push('1 = 0'); return; }
+    const v = `fv${i}`;
+    joins.push(
+      `LEFT JOIN fab_field_values ${v}`
+      + ` ON ${v}.company_id = ? AND ${v}.field_id = ? AND ${v}.scope = ?`
+      + ` AND ${v}.scope_id = ${idPrefix} AND ${v}.deleted_at IS NULL`,
+    );
+    joinParams.push(companyId, f.id, scope);
+    wheres.push(`${v}.value_num <=> ?`);
+    whereParams.push(wanted ?? null);
+  });
+
+  /**
+   * joinParams and whereParams are returned SEPARATELY, not merged.
+   *
+   * mysql2 binds positionally, and the JOIN clause appears before the caller's
+   * own WHERE conditions — so the caller has to interleave:
+   *
+   *     [...joinParams, ...itsOwnWhereParams, ...whereParams]
+   *
+   * Handing back one array would invite `[...base, ...params]`, which binds the
+   * company id into a value comparison and silently returns the wrong pieces.
+   * Two names make the ordering something you have to think about once.
+   */
+  return {
+    join: joins.join('\n'),
+    where: wheres.length ? ` AND ${wheres.join(' AND ')}` : '',
+    joinParams,
+    whereParams,
+  };
+}

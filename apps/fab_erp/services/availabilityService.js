@@ -21,6 +21,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { fieldMatchSql } from './fieldService.js';
 
 /**
  * On hand / reserved / available for a set of catalog items.
@@ -287,16 +288,29 @@ export async function reservePiecesForOrder(conn, companyId, orderId, wants) {
 
     const heldByOthers = await piecesHeldByOthers(companyId, id, { forOrderId: orderId, conn: exec });
 
-    // Candidate plates of exactly the declared size, oldest first — the same
-    // ordering consumption uses, so the plate reserved is the plate taken.
+    /**
+     * Candidate plates of exactly the declared size, oldest first — the same
+     * ordering consumption uses, so the plate reserved is the plate taken.
+     *
+     * Matched on FIELD VALUES rather than the projected columns, and it has to
+     * stay identical to `wipInventoryService.consumeStock` down to the NULL
+     * handling: if reservation and consumption disagree about which plates
+     * qualify, an order earmarks one plate and is handed another, which is the
+     * exact failure piece-level reservation exists to prevent. Both now build
+     * the filter from the same `fieldMatchSql`, so they cannot drift apart by
+     * one of them being edited.
+     */
+    const match = await fieldMatchSql(companyId, 'stock_piece', 'p',
+      { length_mm: w.lengthMm ?? null, width_mm: w.widthMm ?? null }, exec);
+
     const [candidates] = await exec.query(
-      `SELECT id FROM fab_stock_pieces
-        WHERE company_id = ? AND catalog_item_id = ? AND status = 'in_stock'
-          AND deleted_at IS NULL AND qty > 0
-          AND length_mm <=> ? AND width_mm <=> ?
-        ORDER BY (received_date IS NULL), received_date ASC, id ASC
+      `SELECT p.id FROM fab_stock_pieces p
+       ${match.join}
+        WHERE p.company_id = ? AND p.catalog_item_id = ? AND p.status = 'in_stock'
+          AND p.deleted_at IS NULL AND p.qty > 0${match.where}
+        ORDER BY (p.received_date IS NULL), p.received_date ASC, p.id ASC
         FOR UPDATE`,
-      [companyId, id, w.lengthMm ?? null, w.widthMm ?? null],
+      [...match.joinParams, companyId, id, ...match.whereParams],
     );
 
     const picked = candidates
