@@ -34,6 +34,7 @@ import {
   flowSummaryHandler,
   applyFlowRulesHandler,
   setItemFlowHandler,
+  setItemMaterialHandler,
   orderReadinessHandler,
   confirmOrderHandler,
   nestingBoardHandler,
@@ -79,6 +80,9 @@ router.delete('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_pr
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
 router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), applyFlowRulesHandler);
 router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage'), setItemFlowHandler);
+// The screen equivalent of the BOQ sheet Raw Material column, so setting what a
+// part is cut from no longer needs an Excel round trip.
+router.post('/items/:itemId/material', protect, requirePerm('fab_erp_projects_manage'), setItemMaterialHandler);
 
 // ── The wizard: where the order stands, and the act that ends it (2026-08) ──
 // Readiness is read-only, so it is gated on view, not manage.

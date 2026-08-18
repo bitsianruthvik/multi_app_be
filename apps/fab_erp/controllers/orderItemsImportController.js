@@ -6,6 +6,7 @@ import {
 } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
+import { setItemMaterial } from '../services/itemMaterialService.js';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
 import {
   nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
@@ -229,6 +230,31 @@ export const setItemFlowHandler = async (req, res) => {
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });
     logger.error({ err }, 'fab_erp: setItemFlow failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/**
+ * POST — set (or clear) what one part is cut from.
+ *
+ * The screen equivalent of the BOQ sheet's Raw Material column. Until this
+ * existed the nesting step's own message told people to "set the Raw Material
+ * column and re-upload", i.e. round-trip a spreadsheet to change one dropdown.
+ *
+ * `materialId: null` clears the link — "we do not know yet" is a real answer.
+ */
+export const setItemMaterialHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const materialId = req.body?.materialId ?? null;
+    const result = await setItemMaterial(cid, Number(req.params.itemId), materialId);
+    res.json({
+      ...result,
+      readiness: result.orderId ? await refreshOrderStage(cid, result.orderId) : null,
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: setItemMaterial failed');
     res.status(500).json({ message: err.message });
   }
 };

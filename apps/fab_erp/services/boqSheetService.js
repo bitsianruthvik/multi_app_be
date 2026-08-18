@@ -51,6 +51,7 @@ import {
   rawMaterialsFor, materialsForThickness, stockedThicknesses,
 } from './rawMaterialService.js';
 import { syncOrderProcurement } from './procurementService.js';
+import { setItemMaterial } from './itemMaterialService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -572,36 +573,23 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
         if (!material) {
           result.warnings.push({ row: r.row, message: `Raw Material '${r.rmCode}' is not in the Item Catalog — the part was created without it.` });
         } else {
-          const [[existing]] = await conn.query(
-            `SELECT id, catalog_item_id FROM fab_items
-              WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id IS NOT NULL
-                AND flow_id IS NULL AND deleted_at IS NULL LIMIT 1`,
-            [companyId, node.id],
-          );
-          if (!existing) {
-            await conn.query(
-              `INSERT INTO fab_items
-                 (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
-                  qty, flow_id, code, nest_no, level_kind)
-               VALUES (?,?,?,?,?,?,?,1,NULL,?,NULL,'material')`,
-              [
-                companyId, orderId, lineId, node.id, material.id, material.name,
-                material.unit || 'pcs',
-                composeCode(parentCode, materialSegment(material.code, material.name)),
-              ],
-            );
-            result.rmLinks = (result.rmLinks ?? 0) + 1;
-          } else if (existing.catalog_item_id !== material.id) {
-            // Changing the material is a legitimate correction. The nest is
-            // cleared with it — a nest is a group of parts sharing ONE plate,
-            // so a part that is now a different material cannot stay on it.
-            await conn.query(
-              `UPDATE fab_items SET catalog_item_id = ?, name = ?, unit = ?, nest_no = NULL
-                WHERE id = ? AND company_id = ?`,
-              [material.id, material.name, material.unit || 'pcs', existing.id, companyId],
-            );
-            result.rmLinks = (result.rmLinks ?? 0) + 1;
-          }
+          /**
+           * Through itemMaterialService (2026-08-17), which now owns the shape
+           * of a material link for both callers.
+           *
+           * The create/change/clear logic used to live here only, which is why
+           * the ITEM TREE had no way to set a material at all and the nesting
+           * step told people to "set the Raw Material column and re-upload" —
+           * a spreadsheet round trip to change one dropdown. Re-implementing it
+           * behind the screen's picker would have given two definitions of what
+           * a material link is, and the one that drifts is always the one you
+           * are not looking at.
+           *
+           * Unchanged behaviour: creating counts as a link, changing counts and
+           * clears the nest, and setting the same material again is a no-op.
+           */
+          const linked = await setItemMaterial(companyId, node.id, material.id, conn);
+          if (!linked.unchanged) result.rmLinks = (result.rmLinks ?? 0) + 1;
         }
       }
 
