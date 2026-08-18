@@ -38,6 +38,13 @@ const resourcePermissions = {
   // who could edit metrics lost the ability and nobody new gained it.
   fabErpFieldDef: 'fab_erp_items_meta_manage',
 
+  // The same registry after the fab_field_defs -> fab_fields move. Same gate:
+  // the table changed, not who is allowed to author a field. Listed here
+  // because mutateController 400s on any resource missing from this map
+  // BEFORE it reaches the admin bypass — omitting it fails every save, for
+  // admins too, which is how the last such rename looked like a broken page.
+  fabErpField: 'fab_erp_items_meta_manage',
+
   // Formulas
   fabErpFormulaSet: 'fab_erp_formulas_manage',
   fabErpFormula:    'fab_erp_formulas_manage',

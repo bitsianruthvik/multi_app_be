@@ -15,6 +15,8 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { generateCode } from './codegenService.js';
+import { fieldRegistry, setFields } from './fieldService.js';
+import { mayHoldValue } from './fieldLadder.js';
 
 const PROCUREMENT_TYPES = ['buy', 'make'];
 const CF_PREFIX = 'CF: ';
@@ -122,12 +124,16 @@ export async function exportItemsTemplate(companyId) {
     { header: 'Lead Time (Days)', width: 14 },
   ];
 
-  const [cfKeys] = await pool.query(
-    `SELECT DISTINCT field_key, field_type FROM fab_custom_fields
-      WHERE company_id = ? AND level = 'item' AND deleted_at IS NULL ORDER BY field_key`,
-    [companyId],
-  );
-  for (const cf of cfKeys) cols.push({ header: `${CF_PREFIX}${cf.field_key}`, width: 18 });
+  // The CF columns come from the field REGISTRY (fab_fields), not from values
+  // that happen to exist. Reading them out of the value store meant a field
+  // nobody had filled in yet had no column, so the template could never be the
+  // way to populate it for the first time — the schema was being derived from
+  // the data. `applies_at` decides which fields a catalog item may carry at
+  // all; offering one it cannot hold would only earn a rejection on import,
+  // since writes now validate.
+  const { rows: fieldDefs } = await fieldRegistry(companyId);
+  const cfKeys = fieldDefs.filter((f) => mayHoldValue(f, 'catalog_item'));
+  for (const cf of cfKeys) cols.push({ header: `${CF_PREFIX}${cf.fieldKey}`, width: 18 });
 
   styledHeader(ws, cols);
 
@@ -287,13 +293,13 @@ export async function importItemsExcel(file, companyId) {
   try {
     await conn.beginTransaction();
 
-    // ── preload existing item-level custom-field keys/types ────────────────
-    const [existingCf] = await conn.query(
-      `SELECT DISTINCT field_key, field_type FROM fab_custom_fields
-        WHERE company_id = ? AND level = 'item' AND deleted_at IS NULL`,
-      [companyId],
-    );
-    const cfTypeByKey = new Map(existingCf.map((cf) => [cf.field_key, cf.field_type]));
+    // ── preload the field registry ─────────────────────────────────────────
+    // Definitions, not values: a key is known because it is declared in
+    // fab_fields, not because some other item already carries it. The type is
+    // only for the message a rejected column gets below — setFields does the
+    // actual typing and validation on write.
+    const { rows: fieldDefs } = await fieldRegistry(companyId, conn);
+    const cfTypeByKey = new Map(fieldDefs.map((f) => [f.fieldKey, f.dataType]));
 
     // ── preload existing taxonomy + codes ──────────────────────────────────
     const [existingCats] = await conn.query(
@@ -456,18 +462,30 @@ export async function importItemsExcel(file, companyId) {
       result.itemsCreated++;
 
       const itemId = insertRes.insertId;
-      let cfSortOrder = 0;
-      for (const cf of r.customFields) {
-        if (cf.value === null || cf.value === undefined || cf.value === '') continue;
-        const fieldType = cfTypeByKey.get(cf.fieldKey) || 'text';
-        await conn.query(
-          `INSERT INTO fab_custom_fields
-             (company_id, level, level_id, field_key, field_type, field_value, sort_order)
-           VALUES (?,?,?,?,?,?,?)`,
-          [companyId, 'item', itemId, cf.fieldKey, fieldType, cf.value, cfSortOrder],
-        );
-        if (!cfTypeByKey.has(cf.fieldKey)) cfTypeByKey.set(cf.fieldKey, fieldType);
-        cfSortOrder++;
+
+      // The value store moved to fab_field_values, written through setFields
+      // rather than by INSERT: it validates (unknown key, wrong scope, non-
+      // number into a number field), canonicalises enum spelling and upserts,
+      // so re-importing a row updates its values instead of duplicating them.
+      // It takes the transaction connection, so values roll back with the item.
+      // Sort order is no longer written per value — it belongs to the field.
+      const cfValues = Object.fromEntries(
+        r.customFields
+          .filter((cf) => cf.value !== null && cf.value !== undefined && cf.value !== '')
+          .map((cf) => [cf.fieldKey, cf.value]),
+      );
+      if (Object.keys(cfValues).length) {
+        const { rejected } = await setFields(companyId, 'catalog_item', itemId, cfValues, conn);
+        // setFields returns rejections instead of throwing, so they have to be
+        // surfaced here or the value is dropped in silence — reported like any
+        // other per-row problem: a warning plus a note on the row's log entry,
+        // with the item itself still created.
+        for (const rej of rejected) {
+          const declared = cfTypeByKey.get(rej.fieldKey);
+          const message = `Custom field '${rej.fieldKey}'${declared ? ` (${declared})` : ''} not set — ${rej.why}.`;
+          result.warnings.push({ row: r.rowNumber, message });
+          rowNotes.push(message);
+        }
       }
 
       result.rowLog.push({

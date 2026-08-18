@@ -15,7 +15,22 @@
  * deliberately defaults unknown symbols to 0 so `IF()` fallbacks can work, a
  * part with no thickness did not error. It became free to cut.
  *
- * THE RESOLUTION CHAIN, first hit wins:
+ * THIS FILE IS MID-MIGRATION (steps 2-3, 2026-08-18). Read
+ * FAB_ERP_FIELDS_REDESIGN.md before changing anything here.
+ *
+ *   resolveItemFields        reads the NEW tables (fab_fields/fab_field_values)
+ *                            and falls back to resolveItemFieldsLegacy below
+ *   resolveItemFieldsLegacy  the old chain, still load-bearing
+ *   missingFieldsForOrder    derives the required set from the NEW registry
+ *
+ * WHY THE OLD CHAIN IS STILL HERE. The BOQ upload writes
+ * fab_items.length/width/height as COLUMNS and nothing has moved it yet. Drop
+ * the fallback before those writers move and every value authored after the
+ * one-time import disappears — silently, because formulaEngine evaluates a
+ * missing `item_*` as 0 rather than erroring, so the task plans as free and
+ * every date derived from it is fiction. Step 4 removes it.
+ *
+ * THE OLD CHAIN, for as long as it survives (first hit wins):
  *
  *   1. the stock piece issued   ONLY for fields marked `piece_varying`
  *   2. the order item           fab_custom_fields level='order_item'
@@ -23,23 +38,15 @@
  *   4. sub-group → group → category
  *   5. the field's default_value
  *
- * Step 1 is opt-in per field, not blanket. A silent piece-level override would
- * change a task's estimate the moment stock was issued — right for "this coil
- * came in at 6000 not 12000", alarming for anything else.
- *
- * Step 3 is why the chain exists at all: the items formulas run against are
- * NOT in the catalog. `boqSheetService` inserts every structure level with
- * `catalog_item_id = NULL`; only raw-material children are catalog-bound. So a
- * "Top Flange" has no catalog row and never will — every job is one-off. The
- * catalog can only ever supply defaults for the bought leaves.
- *
- * `level='order_item'` and not `'item'`: `'item'` already means a CATALOG item
- * (level_id = fab_item_catalog.id). Two id spaces in one column would mix an
- * order item's fields with a catalog item's.
+ * Step 3 is why it exists at all: the items formulas run against are NOT in the
+ * catalog. `boqSheetService` inserts every structure level with
+ * `catalog_item_id = NULL`, so a "Top Flange" has no catalog row today. Note
+ * that constraint C2 of the redesign makes this stop being true — nothing new
+ * may assume it.
  */
 
 import { pool } from '../../../db.js';
-import { resolveFields } from './fieldService.js';
+import { resolveFields, fieldRegistry as fieldRegistryV2 } from './fieldService.js';
 import { authoredOnPiece } from './fieldVocabulary.js';
 import { parseFormula } from './formulaEngine.js';
 
@@ -476,7 +483,23 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
   );
   if (!items.length) return empty;
 
-  const registry = await fieldRegistry(companyId, exec);
+  /**
+   * The REQUIRED set is derived from the new registry, not the old one.
+   *
+   * Fields are authored into `fab_fields` now (the Item fields page moved there
+   * in step 3). Deriving "which `item.*` names are legal" from `fab_field_defs`
+   * would mean a newly created field is reported as an UNKNOWN FIELD — an
+   * authoring error against a formula that is perfectly correct — and would
+   * never be reported as missing when it has no value. Both failures point the
+   * reader at the wrong thing.
+   *
+   * Shaped back to what the loop below expects: it reads `.formula_usable`, and
+   * the new registry spells that `formulaUsable`.
+   */
+  const v2 = await fieldRegistryV2(companyId, exec);
+  const registry = new Map(
+    v2.rows.map((f) => [f.fieldKey, { ...f, formula_usable: f.formulaUsable }]),
+  );
   const flowIds = [...new Set(items.map((i) => i.flowId))];
 
   // Every operation reachable from this order's flows, once. The per-flow

@@ -23,6 +23,7 @@ import path from 'path';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
+import { fieldRegistry, resolveFields, setFields } from './fieldService.js';
 import { peerSets } from './similarityService.js';
 
 const SHEET = 'Parameters';
@@ -48,21 +49,44 @@ export async function parameterGrid(companyId, orderId, conn = null) {
     [companyId, orderId],
   );
 
-  const [defs] = await exec.query(
-    `SELECT field_key AS fieldKey, label, unit, data_type AS dataType, sort_order AS sortOrder
-       FROM fab_field_defs
-      WHERE company_id = ? AND deleted_at IS NULL AND formula_usable = 1`,
-    [companyId],
+  // Definitions from the registry (step 3 of the field redesign). `unit` is
+  // now `default_unit`; aliased so the grid and the spreadsheet header keep
+  // reading `unit`.
+  const registry = await fieldRegistry(companyId, exec);
+  const defByKey = new Map(
+    registry.rows
+      .filter((f) => Number(f.formulaUsable))
+      .map((f) => [f.fieldKey, {
+        fieldKey: f.fieldKey, label: f.label, unit: f.defaultUnit,
+        dataType: f.dataType, sortOrder: f.sortOrder,
+      }]),
   );
-  const defByKey = new Map(defs.map((d) => [d.fieldKey, d]));
 
-  const [vals] = await exec.query(
-    `SELECT level_id AS itemId, field_key AS fieldKey, field_value AS fieldValue
-       FROM fab_custom_fields
-      WHERE company_id = ? AND level = 'order_item' AND deleted_at IS NULL`,
-    [companyId],
+  /**
+   * RESOLVED values, not just the ones typed on the item.
+   *
+   * Two changes here, both deliberate.
+   *
+   * It was reading every `level='order_item'` row IN THE COMPANY with no
+   * `order_id` filter, correct only because item ids happen to be globally
+   * unique. Resolving by item id removes that coincidence.
+   *
+   * And it now shows what the formula will ACTUALLY use, including anything
+   * inherited from the catalog item or the taxonomy above it, with `from`
+   * saying which rung it came from. Showing only the item's own values meant a
+   * cell could look empty while the formula had a perfectly good inherited
+   * number — which reads as missing data and invites someone to retype it one
+   * rung lower for no reason.
+   *
+   * Safe because the grid saves only edited cells: an inherited value that
+   * nobody touches is never written down, so inheritance is not silently
+   * flattened by opening the screen.
+   */
+  const resolved = await resolveFields(
+    companyId,
+    items.map((i) => ({ scope: 'order_item', scopeId: i.id })),
+    { conn: exec, registry },
   );
-  const valueOf = new Map(vals.map((v) => [`${v.itemId}:${v.fieldKey}`, v.fieldValue]));
 
   const { peerOf, leaders } = await peerSets(companyId, orderId, exec);
 
@@ -96,7 +120,17 @@ export async function parameterGrid(companyId, orderId, conn = null) {
       represents: peers ? peers.length : 1,
       required: [...required],
       values: Object.fromEntries(
-        [...required].map((k) => [k, valueOf.get(`${it.id}:${k}`) ?? null]),
+        [...required].map((k) => [k, resolved.get(`order_item:${it.id}`)?.[k]?.value ?? null]),
+      ),
+      /**
+       * Where each value came from. `order_item` means it was typed on this
+       * part; anything else means it is inherited and the client should say so
+       * rather than presenting it as this row's own.
+       */
+      from: Object.fromEntries(
+        [...required]
+          .map((k) => [k, resolved.get(`order_item:${it.id}`)?.[k]?.from?.scope ?? null])
+          .filter(([, v]) => v),
       ),
     });
   }
@@ -117,48 +151,40 @@ export async function setParameters(companyId, orderId, edits, existingConn = nu
     if (owned) await conn.beginTransaction();
     const { peerOf } = await peerSets(companyId, orderId, conn);
 
-    const touched = new Set();
-    let written = 0;
+    /**
+     * Grouped per item, because `setFields` takes a whole row's worth of values
+     * and validates them together. The hand-rolled SELECT-then-branch upsert
+     * this replaces existed for one reason: the old table had no unique key, so
+     * ON DUPLICATE KEY would not fire and would silently insert a second row
+     * that later reads chose between at random. `uq_ffv_target` makes it a real
+     * upsert, so the branch is gone.
+     */
+    const byItem = new Map();
     for (const e of edits ?? []) {
       const base = Number(e.itemId);
       if (!base || !e.fieldKey) continue;
-      const targets = peerOf.get(base) ?? [base];
-      for (const itemId of targets) {
-        const value = e.value == null || e.value === '' ? null : String(e.value);
-        if (value === null) {
-          await conn.query(
-            `UPDATE fab_custom_fields SET deleted_at = NOW()
-              WHERE company_id = ? AND level = 'order_item' AND level_id = ?
-                AND field_key = ? AND deleted_at IS NULL`,
-            [companyId, itemId, e.fieldKey],
-          );
-        } else {
-          // Upsert by hand: the table has no unique key on
-          // (company, level, level_id, field_key), so ON DUPLICATE KEY would
-          // not fire and would silently insert a second row that later reads
-          // pick between at random.
-          const [[existing]] = await conn.query(
-            `SELECT id FROM fab_custom_fields
-              WHERE company_id = ? AND level = 'order_item' AND level_id = ?
-                AND field_key = ? AND deleted_at IS NULL LIMIT 1`,
-            [companyId, itemId, e.fieldKey],
-          );
-          if (existing) {
-            await conn.query('UPDATE fab_custom_fields SET field_value = ? WHERE id = ?', [value, existing.id]);
-          } else {
-            await conn.query(
-              `INSERT INTO fab_custom_fields (company_id, level, level_id, field_key, field_value)
-               VALUES (?, 'order_item', ?, ?, ?)`,
-              [companyId, itemId, e.fieldKey, value],
-            );
-          }
-        }
-        touched.add(itemId);
-        written++;
+      // The fan-out that makes similarity groups worth marking: one edit is
+      // written to every copy.
+      for (const itemId of peerOf.get(base) ?? [base]) {
+        if (!byItem.has(itemId)) byItem.set(itemId, {});
+        byItem.get(itemId)[e.fieldKey] = e.value == null || e.value === '' ? null : e.value;
       }
     }
+
+    const touched = new Set();
+    let written = 0;
+    const rejected = [];
+    for (const [itemId, values] of byItem) {
+      const res = await setFields(companyId, 'order_item', itemId, values, conn);
+      written += res.written + res.cleared;
+      // Surfaced rather than swallowed. A value the registry refuses is a real
+      // answer — it means the field does not apply here, or is the wrong type —
+      // and silently dropping it is how a grid appears to save and does not.
+      for (const r of res.rejected) rejected.push({ itemId, ...r });
+      touched.add(itemId);
+    }
     if (owned) await conn.commit();
-    return { written, itemsTouched: touched.size };
+    return { written, itemsTouched: touched.size, rejected };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;
