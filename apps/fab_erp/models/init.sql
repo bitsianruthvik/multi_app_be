@@ -5158,3 +5158,295 @@ CREATE TABLE IF NOT EXISTS fab_item_drawings (
   KEY idx_fid_item (company_id, item_id, deleted_at),
   CONSTRAINT fk_fid_item FOREIGN KEY (item_id) REFERENCES fab_items(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ══ FIELDS v2: ONE DEFINITION, ONE VALUE, ONE LADDER (2026-08-18) ══════════
+--
+-- See FAB_ERP_FIELDS_REDESIGN.md. These three tables replace fab_field_defs and
+-- fab_custom_fields. Both old tables stay for now and are retired in step 8,
+-- behind verify-legacy-divergence.mjs.
+--
+-- WHAT WAS WRONG, IN ONE PARAGRAPH. Two columns called `level` meant different
+-- things. Values joined definitions BY STRING across two different collations,
+-- which silently produced a duplicate `Grade` and blocked a migration. There
+-- was no unique key, so a write could not be an upsert. Every value was TEXT,
+-- so reads had to coerce, and to protect the formula engine the resolver simply
+-- DROPPED every text field -- which is why heat_no and serial_no could never be
+-- read through it. And the unit lived on the definition, so a value could never
+-- say what it was measured in.
+
+-- A unit is only useful if you can convert it. `factor_to_base` is what turns
+-- "mm" from a label into arithmetic: today a formula reading `length_mm` is
+-- trusting the NAME of the field, and nothing stops a value of 6 meaning metres.
+CREATE TABLE IF NOT EXISTS fab_units (
+  code            VARCHAR(20)    NOT NULL,
+  dimension       VARCHAR(20)    NOT NULL,
+  base_code       VARCHAR(20)    NOT NULL,
+  factor_to_base  DECIMAL(24,12) NOT NULL DEFAULT 1,
+  label           VARCHAR(60)    NOT NULL,
+  PRIMARY KEY (code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- fab_units seed data (2026-08-18)
+-- Run: source this file with the mysql CLI after the fab_units DDL exists.
+-- Safe to re-run: every row is an upsert on the code primary key.
+--
+-- WHY A FACTOR AT ALL. services/fieldVocabulary.js declares units but converts
+-- nothing, so a length authored in metres against a formula that assumes
+-- millimetres is wrong by 1000x and still looks plausible. One number per unit
+-- closes that hole without a conversion library:
+--     value_in_base = value * factor_to_base
+-- and two values are only comparable when their rows share a base_code. A
+-- caller that sees two different base_code values must refuse, not guess.
+--
+-- WHY SOME UNITS ARE THEIR OWN BASE. Money, the rate group and the electrical
+-- group have no factor that is true at all times:
+--   money       INR to USD needs an exchange rate that moves daily. Freezing
+--               one into seed data would silently backdate every costing that
+--               ever reads it, so no rate is stored here at all.
+--   rates       mm/min and kg/min measure different things, and INR/kg carries
+--               money inside it. Each is comparable only against itself.
+--   electrical  kW to kVA needs the power factor of the real load, and A / V
+--               are not power in the first place.
+-- These still get a row, with factor_to_base = 1 and base_code = code, so that
+-- "this unit does not convert" is an explicit answer from the table rather than
+-- a missing row a caller has to interpret.
+--
+-- ASCII ONLY. The deploy pipes this file through the mysql client without
+-- --default-character-set, so a non-ASCII byte lands in production as mojibake.
+-- That is why area reads m2 and volume reads m3 rather than the squared and
+-- cubed glyphs, here and in the comments.
+
+-- ===== LENGTH (base: m) =====
+-- Metre and not millimetre as the base: mm would turn every imperial factor
+-- into a large number, and the shop floor quotes both systems.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('mm',   'length', 'm', 0.001000000000, 'Millimetre'),
+  ('cm',   'length', 'm', 0.010000000000, 'Centimetre'),
+  ('m',    'length', 'm', 1.000000000000, 'Metre'),
+  ('inch', 'length', 'm', 0.025400000000, 'Inch'),
+  ('ft',   'length', 'm', 0.304800000000, 'Foot')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== AREA (base: m2) =====
+-- sqft is the square of the exact 0.3048 m foot, so 0.09290304 is exact rather
+-- than a rounded figure.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('mm2',  'area', 'm2', 0.000001000000, 'Square millimetre'),
+  ('cm2',  'area', 'm2', 0.000100000000, 'Square centimetre'),
+  ('m2',   'area', 'm2', 1.000000000000, 'Square metre'),
+  ('sqft', 'area', 'm2', 0.092903040000, 'Square foot')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== VOLUME (base: m3) =====
+-- litre is volume and not a dimension of its own: 1 litre is exactly 1 dm3.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('mm3',   'volume', 'm3', 0.000000001000, 'Cubic millimetre'),
+  ('cm3',   'volume', 'm3', 0.000001000000, 'Cubic centimetre'),
+  ('m3',    'volume', 'm3', 1.000000000000, 'Cubic metre'),
+  ('litre', 'volume', 'm3', 0.001000000000, 'Litre')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== MASS (base: kg) =====
+-- tonne is the metric tonne of 1000 kg, the only tonne steel is quoted in here;
+-- a short or long ton would be a different code. lb is the international
+-- avoirdupois pound, which is exact by definition and not a measured value.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('g',     'mass', 'kg', 0.001000000000, 'Gram'),
+  ('kg',    'mass', 'kg', 1.000000000000, 'Kilogram'),
+  ('tonne', 'mass', 'kg', 1000.000000000000, 'Tonne (metric, 1000 kg)'),
+  ('lb',    'mass', 'kg', 0.453592370000, 'Pound')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== TIME (base: sec) =====
+-- Second and not hour, so every factor is a whole number and a cycle time in
+-- seconds converts without a repeating decimal.
+-- years is a NOMINAL 365 days. A Julian 365.25-day year would surprise anyone
+-- reading a warranty or depreciation field, and leap-day exactness is not what
+-- those fields are measuring.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('sec',   'time', 'sec', 1.000000000000, 'Second'),
+  ('min',   'time', 'sec', 60.000000000000, 'Minute'),
+  ('hrs',   'time', 'sec', 3600.000000000000, 'Hour'),
+  ('days',  'time', 'sec', 86400.000000000000, 'Day'),
+  ('years', 'time', 'sec', 31536000.000000000000, 'Year (nominal, 365 days)')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== COUNT (base: nos) =====
+-- Dimensionless, so every factor is 1 and the base is only nominal.
+-- Deliberately NOT pairs = 2 nos and NOT sets = n nos: a pair of bearings is one
+-- issued line, and a set has no fixed member count, so multiplying either out
+-- would inflate stock the moment somebody converted it.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('nos',   'count', 'nos', 1.000000000000, 'Numbers'),
+  ('pcs',   'count', 'nos', 1.000000000000, 'Pieces'),
+  ('sets',  'count', 'nos', 1.000000000000, 'Sets'),
+  ('pairs', 'count', 'nos', 1.000000000000, 'Pairs')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== RATIO (base: ratio) =====
+-- The one self-based group that DOES convert: percent is exactly 1/100 of a
+-- bare ratio. Storing 0.01 here is what stops a 5 percent scrap allowance being
+-- read as 5x by a formula that expects a fraction.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('%',     'ratio', 'ratio', 0.010000000000, 'Percent'),
+  ('ratio', 'ratio', 'ratio', 1.000000000000, 'Ratio (fraction)')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== RATE (self-based, see header) =====
+-- Each rate is its own base. Converting mm/min to m/min is arithmetically easy
+-- but is NOT modelled here, because this table carries one factor per row and a
+-- compound unit needs a factor per component. Until that exists, a rate is
+-- comparable only against a rate with the same code.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('mm/min',  'rate', 'mm/min',  1.000000000000, 'Millimetres per minute'),
+  ('m/min',   'rate', 'm/min',   1.000000000000, 'Metres per minute'),
+  ('kg/min',  'rate', 'kg/min',  1.000000000000, 'Kilograms per minute'),
+  ('kg/m3',   'rate', 'kg/m3',   1.000000000000, 'Kilograms per cubic metre'),
+  ('nos/min', 'rate', 'nos/min', 1.000000000000, 'Numbers per minute'),
+  ('INR/kg',  'rate', 'INR/kg',  1.000000000000, 'Rupees per kilogram')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== MONEY (self-based, see header) =====
+-- No currency converts without an exchange rate, and an exchange rate is a
+-- dated fact rather than seed data. Each currency is therefore its own base, so
+-- a cross-currency comparison fails loudly instead of quietly applying a rate
+-- that was true on the day this file was written.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('INR', 'money', 'INR', 1.000000000000, 'Indian Rupee'),
+  ('USD', 'money', 'USD', 1.000000000000, 'US Dollar'),
+  ('EUR', 'money', 'EUR', 1.000000000000, 'Euro')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- ===== ELECTRICAL (self-based, see header) =====
+-- Four different physical quantities that the picker groups together for the
+-- user, not one dimension. kW is real power, kVA is apparent power, and the
+-- ratio between them is the power factor of the load being measured rather than
+-- a constant. A is current and V is voltage. Nothing here converts to anything
+-- else here, which is why the group name is the dimension and the base is the
+-- unit itself.
+INSERT INTO fab_units (code, dimension, base_code, factor_to_base, label) VALUES
+  ('kW',  'electrical', 'kW',  1.000000000000, 'Kilowatt (real power)'),
+  ('kVA', 'electrical', 'kVA', 1.000000000000, 'Kilovolt-ampere (apparent power)'),
+  ('A',   'electrical', 'A',   1.000000000000, 'Ampere'),
+  ('V',   'electrical', 'V',   1.000000000000, 'Volt')
+ON DUPLICATE KEY UPDATE dimension=VALUES(dimension), base_code=VALUES(base_code), factor_to_base=VALUES(factor_to_base), label=VALUES(label);
+
+-- THE DEFINITION. One table owns `field_key`, under one collation, so the
+-- duplicate-`Grade` failure cannot recur.
+--
+-- `applies_at` replaces the old `level` (item|piece|both) AND its gate. It names
+-- the NARROWEST rung a value may be set on, and it may also be set at any
+-- BROADER rung above that. So applies_at=catalog_item means the field does not
+-- vary per instance: settable at category, group, subgroup or the item, and
+-- rejected on an order_item or a stock_piece. applies_at=stock_piece means it
+-- varies per physical piece and may be set all the way down -- including
+-- broadly, because a broad value is a DEFAULT and a default is meaningful at
+-- any width ("our plate is normally 6000 long").
+--
+-- That single rule replaces the old level enum AND the runtime gate that had to
+-- stop a stray piece-level value overriding an item-level field. Here the
+-- stray cannot be written in the first place.
+--
+-- `is_standard` marks a field the code ships against. Its KEY is immutable and
+-- it cannot be deleted -- a feature written against `thickness_mm` must not have
+-- it renamed out from under it -- while its label, unit, allowed values and
+-- scoping stay editable. That is what lets standard and custom fields share one
+-- table, one resolver and one screen.
+CREATE TABLE IF NOT EXISTS fab_fields (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT NOT NULL,
+  field_key       VARCHAR(100) NOT NULL,
+  label           VARCHAR(255) NOT NULL,
+  data_type       VARCHAR(20)  NOT NULL DEFAULT 'number',
+  -- Constrains which units are valid for a value. NULL = unitless.
+  dimension       VARCHAR(20)  NULL,
+  default_unit    VARCHAR(20)  NULL,
+  allowed_values  JSON         NULL,
+  applies_at      VARCHAR(20)  NOT NULL DEFAULT 'catalog_item',
+  formula_usable  TINYINT(1)   NOT NULL DEFAULT 1,
+  default_num     DECIMAL(18,6) NULL,
+  default_text    VARCHAR(500)  NULL,
+  is_standard     TINYINT(1)   NOT NULL DEFAULT 0,
+  -- Where the field is OFFERED. NULL at every level = offered everywhere.
+  category_id     INT NULL,
+  group_id        INT NULL,
+  subgroup_id     INT NULL,
+  sort_order      INT NOT NULL DEFAULT 0,
+  active          TINYINT(1) NOT NULL DEFAULT 1,
+  notes           TEXT NULL,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at      DATETIME NULL,
+  UNIQUE KEY uq_ff_company_key (company_id, field_key),
+  KEY idx_ff_scope (company_id, category_id, group_id, subgroup_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- THE VALUE. Four fixes are structural rather than behavioural:
+--
+--   field_id            an integer FK, so the string-collation bug class dies
+--   UNIQUE(...)         so a write is a real upsert, not SELECT-then-branch
+--   value_num/text/date so a number is a number and text stops being dropped
+--   unit_code           so a value states what it was measured in
+--
+-- `scope` is ONE ladder with one meaning, unlike the two `level` columns it
+-- replaces: category, group, subgroup, catalog_item, order_item, stock_piece.
+--
+-- The second index is for the matchers. Procurement and consumption currently
+-- filter on fab_stock_pieces.length_mm/width_mm as columns; when those move to
+-- fields (step 4) the equivalent query is a join on this index rather than a
+-- table scan.
+CREATE TABLE IF NOT EXISTS fab_field_values (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT NOT NULL,
+  field_id    INT NOT NULL,
+  scope       VARCHAR(20) NOT NULL,
+  scope_id    INT NOT NULL,
+  value_num   DECIMAL(18,6) NULL,
+  value_text  VARCHAR(500)  NULL,
+  value_date  DATE          NULL,
+  unit_code   VARCHAR(20)   NULL,
+  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at  DATETIME NULL,
+  UNIQUE KEY uq_ffv_target (company_id, field_id, scope, scope_id),
+  KEY idx_ffv_match (company_id, field_id, value_num, scope, scope_id),
+  KEY idx_ffv_scope (company_id, scope, scope_id),
+  CONSTRAINT fk_ffv_field FOREIGN KEY (field_id) REFERENCES fab_fields(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- SEED fab_fields FROM THE OLD REGISTRY.
+--
+-- Definitions carry over; VALUES do not. Production data is dummy, so the 915
+-- value rows are rebuilt rather than migrated -- cheaper than a migration and
+-- it leaves no half-converted state to reason about later.
+--
+-- Every seeded field is `is_standard = 1`: these are the ones features are
+-- written against, so their KEY is immutable and they cannot be deleted. Label,
+-- unit, allowed values and scoping stay editable, which is what lets standard
+-- and custom fields share one table and one screen.
+--
+-- The level mapping, and why:
+--   item  -> catalog_item   does not vary per instance; settable item-and-broader
+--   both  -> stock_piece    "set on the item, overridden per piece" IS
+--                           settable-all-the-way-down under one rule
+--   piece -> stock_piece    varies per physical piece
+INSERT INTO fab_fields
+  (company_id, field_key, label, data_type, dimension, default_unit, allowed_values,
+   applies_at, formula_usable, default_num, is_standard,
+   category_id, group_id, subgroup_id, sort_order, active)
+SELECT d.company_id, d.field_key, d.label,
+       CASE WHEN d.data_type IN ('number','text','date','bool','enum') THEN d.data_type ELSE 'number' END,
+       u.dimension, d.unit, d.allowed_values,
+       CASE d.level WHEN 'item' THEN 'catalog_item' ELSE 'stock_piece' END,
+       d.formula_usable, d.default_value, 1,
+       d.category_id, d.group_id, d.subgroup_id, d.sort_order, d.active
+  FROM fab_field_defs d
+  LEFT JOIN fab_units u ON u.code = d.unit
+ WHERE d.deleted_at IS NULL
+ON DUPLICATE KEY UPDATE
+  label = VALUES(label), data_type = VALUES(data_type), dimension = VALUES(dimension),
+  default_unit = VALUES(default_unit), allowed_values = VALUES(allowed_values),
+  applies_at = VALUES(applies_at), formula_usable = VALUES(formula_usable),
+  default_num = VALUES(default_num), is_standard = VALUES(is_standard),
+  category_id = VALUES(category_id), group_id = VALUES(group_id),
+  subgroup_id = VALUES(subgroup_id), sort_order = VALUES(sort_order), active = VALUES(active);
