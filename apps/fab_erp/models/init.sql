@@ -5549,3 +5549,47 @@ SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='level_kind');
 SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN level_kind VARCHAR(20) NULL', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ FLOW BELONGS TO THE ITEM (2026-08-18) ══════════════════════════════════
+--
+-- Step 6. `fab_flow_rules` decides which flow an item gets by matching
+-- line_type + level_kind + a CODE SUFFIX -- so '/D' meaning "drilled" is a
+-- naming convention that code has to parse, and the rule table is keyed on the
+-- same free-text 'Composite Girder' string as two other tables with nothing
+-- keeping them spelled alike.
+--
+-- Under the BOM model a drilled stiffener IS a different catalog item with its
+-- own BOM line. So the flow is a property of the TYPE, and the suffix stops
+-- carrying meaning that has to be decoded. `fab_flow_rules` stays for now --
+-- orders built the old way still resolve through it -- but nothing new needs it.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='flow_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN flow_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Seed it from the rules that exist, so the two agree before anything switches.
+--
+-- Matched on level_kind and the suffix convention ONE LAST TIME: this is the
+-- migration that makes parsing unnecessary, so it is the one place still
+-- allowed to do it. A rule with a line_type is skipped -- that string has no
+-- meaning here, and the catalog item's CATEGORY is what carries the variant now.
+UPDATE fab_item_catalog c
+  JOIN fab_flow_rules r
+    ON r.company_id = c.company_id AND r.deleted_at IS NULL AND r.active = 1
+   AND r.line_type IS NULL
+   AND r.level_kind = c.level_kind
+   AND (r.code_suffix IS NULL OR c.code LIKE CONCAT('%', REPLACE(r.code_suffix, '/', '-')))
+   SET c.flow_id = r.flow_id
+ WHERE c.deleted_at IS NULL AND c.level_kind IS NOT NULL AND c.flow_id IS NULL;
+
+-- The suffixed rules run second so a '/D' item ends on the drilled flow rather
+-- than whichever row the join happened to reach first.
+UPDATE fab_item_catalog c
+  JOIN fab_flow_rules r
+    ON r.company_id = c.company_id AND r.deleted_at IS NULL AND r.active = 1
+   AND r.line_type IS NULL
+   AND r.level_kind = c.level_kind
+   AND r.code_suffix IS NOT NULL
+   AND c.code LIKE CONCAT('%', REPLACE(r.code_suffix, '/', '-'))
+   SET c.flow_id = r.flow_id
+ WHERE c.deleted_at IS NULL AND c.level_kind IS NOT NULL;

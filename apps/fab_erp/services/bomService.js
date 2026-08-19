@@ -334,7 +334,7 @@ export async function instantiate(companyId, spec, existingConn = null) {
 
     // level_kind per catalog item, so an instance can say what it IS.
     const [kinds] = await conn.query(
-      `SELECT id, level_kind AS levelKind, unit FROM fab_item_catalog
+      `SELECT id, level_kind AS levelKind, unit, flow_id AS flowId FROM fab_item_catalog
         WHERE company_id = ? AND deleted_at IS NULL`,
       [companyId],
     );
@@ -361,13 +361,19 @@ export async function instantiate(companyId, spec, existingConn = null) {
       const code = prefix ? (rel ? `${prefix}-${rel}` : prefix) : node.code;
 
       const [r] = await conn.query(
+        // The FLOW comes from the TYPE (step 6). It used to be decided by
+        // matching level_kind against a code SUFFIX — so '/D' meaning "drilled"
+        // was a naming convention code had to parse, and it was keyed on the
+        // same free-text variant string as two other tables. A drilled
+        // stiffener is its own catalog item now, so the flow is simply a
+        // property of what the thing is.
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
-            name, unit, qty, code, level_kind, procurement_type)
-         VALUES (?,?,?,?,?,?,?,1,?,?,'make')`,
+            name, unit, qty, code, level_kind, procurement_type, flow_id)
+         VALUES (?,?,?,?,?,?,?,1,?,?,'make',?)`,
         [
           companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
-          node.name, meta.unit ?? 'nos', code, levelKind,
+          node.name, meta.unit ?? 'nos', code, levelKind, meta.flowId ?? null,
         ],
       );
       created++;
