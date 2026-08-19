@@ -73,7 +73,7 @@ for (const c of CASES) {
     c.counts ? { perInstance: { segmentsPerGirder: c.counts } } : {},
   );
   const newLevels = { span: 0, girder: 0, segment: 0, part: 0 };
-  for (const [name, n] of Object.entries(tree.byLevel)) {
+  for (const [name, n] of Object.entries(tree.byName)) {
     if (name === 'Span') newLevels.span += n;
     else if (name === 'Girder') newLevels.girder += n;
     else if (name === 'Segment') newLevels.segment += n;

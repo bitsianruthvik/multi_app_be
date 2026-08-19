@@ -113,7 +113,7 @@ router.post('/templates/:itemId/preview', protect, async (req, res) => {
     };
     take(tree.root, 0);
 
-    res.json({ nodes: tree.nodes, byLevel: tree.byLevel, sample });
+    res.json({ nodes: tree.nodes, byName: tree.byName, sample });
   } catch (err) { fail(res, err, 'template preview'); }
 });
 
