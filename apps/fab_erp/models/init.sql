@@ -5455,3 +5455,79 @@ ON DUPLICATE KEY UPDATE
   default_num = VALUES(default_num), is_standard = VALUES(is_standard),
   category_id = VALUES(category_id), group_id = VALUES(group_id),
   subgroup_id = VALUES(subgroup_id), sort_order = VALUES(sort_order), active = VALUES(active);
+
+-- ══ ITEM BOM: WHAT A THING IS MADE OF (2026-08-18) ═════════════════════════
+--
+-- Step 5 of FAB_ERP_FIELDS_REDESIGN.md. One table replacing three partial
+-- representations of "what is made of what":
+--
+--   fab_items tree        the per-order structure, rebuilt from the BOQ sheet
+--   fab_bom_templates     a FLAT parts-per-line_type list keyed on free text
+--   fab_material_boms     catalog recipes, 7 of whose 8 rows are auto-generated
+--                         "Cut-parts (where-used)" reverse indexes
+--
+-- THE MODEL. Category/group/subgroup carry the VARIANT (Composite Girder,
+-- Bowstring); catalog items are concrete nouns (Span, Girder, Segment, Top
+-- Flange). A BOM line says a parent item contains N of a child item. Nesting
+-- those lines gives the structure, at whatever depth the job actually has --
+-- which is what removes the hardcoded four-level loop in buildWizardRows.
+--
+-- ONE BOM CONCEPT, NOT TWO. There is no "fixed BOM" and "template BOM": the
+-- distinction is only whether a quantity is a constant or a parameter, and a
+-- BOM with no parameters IS a fixed BOM. Two named concepts would mean two code
+-- paths and a decision at every BOM anyone creates, to express something the
+-- data already says.
+--
+-- TYPES ARE CATALOGUED; INSTANCES ARE NOT. "Top Flange" is one catalog item.
+-- The thirty top flanges on a span stay fab_items rows pointing at it. Taken
+-- literally, "everything is a catalog item" would mint 210 rows per order and
+-- the catalog becomes a junk drawer within a month.
+CREATE TABLE IF NOT EXISTS fab_item_bom (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT NOT NULL,
+  parent_item_id  INT NOT NULL,
+  child_item_id   INT NOT NULL,
+  -- EXACTLY ONE of these two. A constant quantity, or the name of a parameter
+  -- the wizard asks for ("how many girders?"). Enforced in bomService rather
+  -- than by a CHECK, because the error wants to name the line.
+  qty_num         DECIMAL(18,6) NULL,
+  qty_param       VARCHAR(60)   NULL,
+  -- Seeds the input when qty_param is set. The wizard's hardcoded 6 and 5.
+  default_qty     DECIMAL(18,6) NULL,
+  -- "each girder may differ" -- the per-girder segment-count grid, generalised
+  -- to any level instead of being a special argument to a four-level loop.
+  per_instance_qty TINYINT(1) NOT NULL DEFAULT 0,
+  -- How this level reads in a composed code: 'G' gives G1, G2; blank gives a
+  -- bare number, which is how segments already read. itemCodeService.appendLevel
+  -- does the composing and never needed to know what a girder was.
+  code_segment    VARCHAR(20) NULL,
+  -- The hand-written domain advice that would otherwise be lost when the wizard
+  -- stops being hand-written -- e.g. "0 if this job has no girders".
+  help_text       VARCHAR(500) NULL,
+  sort_order      INT NOT NULL DEFAULT 0,
+  active          TINYINT(1) NOT NULL DEFAULT 1,
+  notes           TEXT NULL,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at      DATETIME NULL,
+  KEY idx_fib_parent (company_id, parent_item_id, deleted_at),
+  KEY idx_fib_child  (company_id, child_item_id),
+  CONSTRAINT fk_fib_parent FOREIGN KEY (parent_item_id) REFERENCES fab_item_catalog(id),
+  CONSTRAINT fk_fib_child  FOREIGN KEY (child_item_id)  REFERENCES fab_item_catalog(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Which catalog item an order LINE is built from, and the parameters it was
+-- expanded with.
+--
+-- Stored on the line rather than recomputed because the answer must not change
+-- when the template does. A confirmed order promised a customer a particular
+-- shape; a later template edit must not silently redefine it. Draft orders
+-- inherit improvements, confirmation takes a copy -- which is the same rule the
+-- wizard already follows for everything else it does.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='template_item_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_lines
+     ADD COLUMN template_item_id INT NULL,
+     ADD COLUMN template_params JSON NULL,
+     ADD COLUMN template_snapshot_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
