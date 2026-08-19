@@ -344,7 +344,10 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     // for new work. The same omission made `rm.qty` undefined, so every
     // fab_task_inputs row was written with a NULL quantity and the
     // quantity-aware material gate silently degraded to a presence check.
-    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty
+    // `level_kind` is what says whether a child is MATERIAL or a part. Without
+    // it the classification below falls back to guessing from null columns,
+    // which stops working the moment a made item carries a catalog id.
+    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, level_kind
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
@@ -456,20 +459,37 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     ? await resolveItemFields(companyId, items.map((i) => i.id), { conn })
     : new Map();
 
-  // child parts (flow-bound children) per parent item — for 'child_parts' inputs
+  /**
+   * A child's ROLE comes from `level_kind`, which states it, not from which
+   * column happens to be null.
+   *
+   * The two lists were previously "has a flow" and "has a catalog id", and they
+   * were mutually exclusive only by accident — made items carried no catalog
+   * id. Instantiating from a BOM template gives them one, and then a Girder
+   * under a Span would be counted as MATERIAL for the span's formula and gated
+   * on as stock that must arrive. With a flow as well it would land in BOTH
+   * lists and reach two different `input.<role>` namespaces at once.
+   *
+   * `level_kind = 'material'` is written by whoever creates the link, and is
+   * the claim itself rather than a side effect of it.
+   */
+  const isMaterial = (it) => it.level_kind === 'material';
+
+  // child parts per parent item — for 'child_parts' inputs
   const childPartsByParent = new Map();
   for (const it of items) {
     if (it.parent_item_id == null) continue;
+    if (isMaterial(it)) continue;
     if (it.flow_id == null) continue; // only flow-bearing children count as parts
     if (!childPartsByParent.has(it.parent_item_id)) childPartsByParent.set(it.parent_item_id, []);
     childPartsByParent.get(it.parent_item_id).push(it);
   }
-  // raw-material children (catalog-bearing children) per parent item — for
-  // 'raw_material' inputs. BUG-07: keep ALL such children, not just the first, so
-  // a multi-material assembly gates on every material it needs.
+  // raw-material children per parent item — for 'raw_material' inputs. BUG-07:
+  // keep ALL such children, not just the first, so a multi-material assembly
+  // gates on every material it needs.
   const rmChildrenByParent = new Map();
   for (const it of items) {
-    if (it.parent_item_id == null || it.catalog_item_id == null) continue;
+    if (it.parent_item_id == null || !isMaterial(it)) continue;
     if (!rmChildrenByParent.has(it.parent_item_id)) rmChildrenByParent.set(it.parent_item_id, []);
     rmChildrenByParent.get(it.parent_item_id).push(it);
   }

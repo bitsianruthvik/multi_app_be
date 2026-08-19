@@ -5531,3 +5531,21 @@ SET @s = IF(@c=0, 'ALTER TABLE fab_order_lines
      ADD COLUMN template_params JSON NULL,
      ADD COLUMN template_snapshot_at DATETIME NULL', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- What LEVEL a catalog item represents, for rows instantiated from a BOM.
+--
+-- `fab_items.level_kind` is load-bearing: it is what says a child is MATERIAL
+-- rather than a part, which decides whether a formula sees it as
+-- `input.raw_material` or `input.child_parts` and whether the task gates on it
+-- as stock that must arrive. Instantiating from a template has to set it, and
+-- "what level is this" is a property of the TYPE (a Segment is always a
+-- segment), not of the instance -- so it belongs on the catalog item.
+--
+-- Never 'material'. A material link is created by itemMaterialService as a
+-- child of a part; a structural level instantiated from a BOM is not one, and a
+-- template that produced 'material' rows would have every girder gated on as
+-- steel waiting to arrive.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='level_kind');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN level_kind VARCHAR(20) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

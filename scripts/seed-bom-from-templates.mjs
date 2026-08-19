@@ -38,9 +38,9 @@ const dry = process.argv.includes('--dry');
  * typed into React. They belong on the BOM line.
  */
 const LEVELS = [
-  { code: 'SPAN', name: 'Span' },
-  { code: 'GDR', name: 'Girder' },
-  { code: 'SEG', name: 'Segment' },
+  { code: 'SPAN', name: 'Span', levelKind: 'span' },
+  { code: 'GDR', name: 'Girder', levelKind: 'girder' },
+  { code: 'SEG', name: 'Segment', levelKind: 'segment' },
 ];
 
 const [[co]] = await pool.query('SELECT id, name FROM companies WHERE id = ?', [only]);
@@ -91,7 +91,7 @@ for (const [variant, parts] of byVariant) {
 
   // ── the items ───────────────────────────────────────────────────────────
   const itemId = {};
-  const upsertItem = async (code, name) => {
+  const upsertItem = async (code, name, levelKind) => {
     const full = `${vCode}-${code}`;
     const [[found]] = await pool.query(
       'SELECT id FROM fab_item_catalog WHERE company_id = ? AND code = ? LIMIT 1',
@@ -99,26 +99,29 @@ for (const [variant, parts] of byVariant) {
     );
     if (found) {
       await pool.query(
-        'UPDATE fab_item_catalog SET name = ?, category_id = ?, procurement_type = ? WHERE id = ?',
-        [name, categoryId, 'make', found.id],
+        'UPDATE fab_item_catalog SET name = ?, category_id = ?, procurement_type = ?, level_kind = ? WHERE id = ?',
+        [name, categoryId, 'make', levelKind, found.id],
       );
       return found.id;
     }
     const [r] = await pool.query(
-      `INSERT INTO fab_item_catalog (company_id, code, name, category_id, unit, procurement_type)
-       VALUES (?,?,?,?,'nos','make')`,
-      [co.id, full, name, categoryId],
+      `INSERT INTO fab_item_catalog (company_id, code, name, category_id, unit, procurement_type, level_kind)
+       VALUES (?,?,?,?,'nos','make',?)`,
+      [co.id, full, name, categoryId, levelKind],
     );
     return r.insertId;
   };
 
-  for (const lv of LEVELS) itemId[lv.code] = await upsertItem(lv.code, lv.name);
+  for (const lv of LEVELS) itemId[lv.code] = await upsertItem(lv.code, lv.name, lv.levelKind);
   for (const p of parts) {
     // A '/' in a part code ('BS/D') is the variant convention. It stays in the
     // code because the existing BOQ and every generated item code use it; what
     // changes is that it no longer has to be PARSED to decide a flow, because
     // the drilled variant is now its own item with its own BOM line.
-    itemId[p.code] = await upsertItem(p.code.replace(/\//g, '-'), p.name);
+    // A leaf of the structure is a 'part'. NEVER 'material' — that is the link
+    // itemMaterialService creates UNDER a part, and a girder marked material
+    // would be gated on as steel waiting to arrive rather than something made.
+    itemId[p.code] = await upsertItem(p.code.replace(/\//g, '-'), p.name, 'part');
   }
   console.log(`     ${LEVELS.length + parts.length} catalog item(s)`);
 

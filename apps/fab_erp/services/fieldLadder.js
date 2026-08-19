@@ -85,11 +85,19 @@ async function parentOf(exec, companyId, scope, scopeId) {
         [scopeId, companyId],
       );
       if (!i) return null;
-      // An order item's own catalog binding outranks its parent item: a Top
-      // Flange that IS a catalogued Top Flange should inherit from that type
-      // before it inherits from the segment it happens to sit in.
-      if (i.catalogItemId) return { scope: 'catalog_item', scopeId: Number(i.catalogItemId) };
+      /**
+       * PURE INSTANCE WALK. The catalog item is NOT reached from here.
+       *
+       * An instantiated part has two parents — the segment it sits in, and the
+       * Top Flange type it is an instance of — and a single walk can only
+       * follow one. Following the type short-circuits the climb (the part never
+       * sees its span); following the parent loses the type's defaults.
+       *
+       * So the two are composed in `chainFor` instead, and this function
+       * answers only "what contains this". See the precedence argument there.
+       */
       if (i.parentItemId) return { scope: 'order_item', scopeId: Number(i.parentItemId) };
+      if (i.catalogItemId) return { scope: 'catalog_item', scopeId: Number(i.catalogItemId) };
       return null;
     }
     case 'catalog_item': {
@@ -153,7 +161,55 @@ export async function chainFor(companyId, scope, scopeId, conn = null) {
     cursor = next;
   }
 
-  return chain.reverse();
+  return withOwnType(exec, companyId, scope, scopeId, chain.reverse(), seen);
+}
+
+/**
+ * Splice an order item's OWN type in above the job it belongs to.
+ *
+ * The chain from an instantiated part has two segments and they are not one
+ * walk. Broadest to narrowest, the answer should be:
+ *
+ *   category / group / subgroup      of the Top Flange TYPE
+ *   the Top Flange type              "all top flanges are E350"
+ *   span -> girder -> segment        what THIS job says
+ *   the part itself
+ *
+ * A job-specific value beats a type default, so the instance ancestors sit
+ * below the type and win. Without this the part would reach its span and the
+ * span's taxonomy, and its own type's defaults would never apply — which is
+ * most of the point of catalogueing the type at all.
+ *
+ * Only inserted when the item is not already reaching its catalog item through
+ * the walk (that happens at the top of the tree, where there is no parent).
+ */
+async function withOwnType(exec, companyId, scope, scopeId, chain, seen) {
+  if (scope !== 'order_item') return chain;
+  const [[i]] = await exec.query(
+    'SELECT catalog_item_id AS catalogItemId FROM fab_items WHERE id = ? AND company_id = ? LIMIT 1',
+    [scopeId, companyId],
+  );
+  if (!i?.catalogItemId) return chain;
+  if (seen.has(`catalog_item:${i.catalogItemId}`)) return chain;
+
+  // The type and everything above it, broadest first.
+  const typeChain = [{ scope: 'catalog_item', scopeId: Number(i.catalogItemId) }];
+  let cursor = typeChain[0];
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    const next = await parentOf(exec, companyId, cursor.scope, cursor.scopeId);
+    if (!next || seen.has(`${next.scope}:${next.scopeId}`)) break;
+    seen.add(`${next.scope}:${next.scopeId}`);
+    typeChain.push(next);
+    cursor = next;
+  }
+  typeChain.reverse();
+
+  // Everything the instance walk found that is BROADER than an order item
+  // (the root's own catalog item and taxonomy) stays outermost; the type chain
+  // goes immediately before the job's own rungs.
+  const jobRungs = chain.filter((c) => c.scope === 'order_item');
+  const outer = chain.filter((c) => c.scope !== 'order_item');
+  return [...outer, ...typeChain, ...jobRungs];
 }
 
 /**
@@ -185,7 +241,7 @@ export async function chainsFor(companyId, targets, conn = null) {
       chain.push(next);
       cursor = next;
     }
-    out.set(startKey, chain.reverse());
+    out.set(startKey, await withOwnType(exec, companyId, t.scope, t.scopeId, chain.reverse(), seen));
   }
   return out;
 }

@@ -295,3 +295,108 @@ export async function removeBomLine(companyId, id) {
   if (!r.affectedRows) { const e = new Error('That BOM line does not exist.'); e.status = 404; throw e; }
   return { id: Number(id) };
 }
+
+/**
+ * Create the order's items from a template. COPY ON FORMATION.
+ *
+ * The instance is a copy, not a live reference. A template edit next month must
+ * not silently redefine a span somebody already promised a customer — and the
+ * wizard lets you deviate from the template anyway, so a live reference could
+ * never have described what was actually being built.
+ *
+ * INSTANCES ARE NOT CATALOGUED. Each row points AT its catalog item via
+ * `catalog_item_id`; it does not become one. Thirty top flanges are thirty
+ * fab_items rows and one catalog row.
+ *
+ * `catalog_item_id` on a made item is constraint C2 coming true. Two things had
+ * to be right first, and both now are:
+ *
+ *   - a child's ROLE comes from `level_kind`, not from "has a catalog id", or
+ *     every girder here would be classified as raw material for its span and
+ *     gated on as steel waiting to arrive (H1)
+ *   - `procurement_type` is written explicitly as 'make', because
+ *     procurementService treats a null one as make-by-absence and would
+ *     otherwise mirror the catalog row and could flip these to BUY (H2)
+ *
+ * @returns {Promise<{created:number, rootItemId:number, byLevel:Record<string,number>}>}
+ */
+export async function instantiate(companyId, spec, existingConn = null) {
+  const conn = existingConn ?? await pool.getConnection();
+  const owned = !existingConn;
+  try {
+    if (owned) await conn.beginTransaction();
+    const {
+      orderId, orderLineId = null, rootItemId,
+      params = {}, perInstance = {}, codePrefix = null,
+    } = spec;
+
+    const tree = await expand(companyId, rootItemId, params, { perInstance, conn });
+
+    // level_kind per catalog item, so an instance can say what it IS.
+    const [kinds] = await conn.query(
+      `SELECT id, level_kind AS levelKind, unit FROM fab_item_catalog
+        WHERE company_id = ? AND deleted_at IS NULL`,
+      [companyId],
+    );
+    const kindOf = new Map(kinds.map((k) => [Number(k.id), k]));
+
+    const byLevel = {};
+    let created = 0;
+
+    /** Depth-first, parents before children, because a child needs its id. */
+    const write = async (node, parentItemId, prefix) => {
+      const meta = kindOf.get(Number(node.catalogItemId)) ?? {};
+      // Never 'material'. A structural level is not the material link.
+      const levelKind = meta.levelKind && meta.levelKind !== 'material' ? meta.levelKind : 'part';
+      /**
+       * The template's code is relative to its ROOT; the order's prefix makes
+       * it absolute.
+       *
+       * Strip the whole root code, not its first segment. The root's own code
+       * is `COMPOS-SPAN` — two segments — so slicing one left `SPAN` embedded
+       * in every descendant and produced `TST-SPAN-G1-1-TF` where the real
+       * order says `…-G1-1-TF`.
+       */
+      const rel = node.code.slice(tree.root.code.length).replace(/^-/, '');
+      const code = prefix ? (rel ? `${prefix}-${rel}` : prefix) : node.code;
+
+      const [r] = await conn.query(
+        `INSERT INTO fab_items
+           (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+            name, unit, qty, code, level_kind, procurement_type)
+         VALUES (?,?,?,?,?,?,?,1,?,?,'make')`,
+        [
+          companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+          node.name, meta.unit ?? 'nos', code, levelKind,
+        ],
+      );
+      created++;
+      byLevel[levelKind] = (byLevel[levelKind] ?? 0) + 1;
+
+      for (const child of node.children) await write(child, r.insertId, prefix);
+      return r.insertId;
+    };
+
+    const rootId = await write(tree.root, null, codePrefix);
+
+    // Remember what it was built from, and when the copy was taken. Recomputing
+    // this later would give the template's CURRENT shape, which is exactly the
+    // thing that must not move under a confirmed order.
+    if (orderLineId) {
+      await conn.query(
+        `UPDATE fab_order_lines
+            SET template_item_id = ?, template_params = ?, template_snapshot_at = NOW()
+          WHERE id = ? AND company_id = ?`,
+        [rootItemId, JSON.stringify({ params, perInstance }), orderLineId, companyId],
+      );
+    }
+
+    if (owned) await conn.commit();
+    return { created, rootItemId: rootId, byLevel };
+  } catch (err) {
+    if (owned) await conn.rollback();
+    throw err;
+  } finally {
+    if (owned) conn.release();
+  }
+}

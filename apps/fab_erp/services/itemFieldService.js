@@ -393,7 +393,8 @@ export async function inputContextForItem(companyId, itemId, conn) {
   const exec = conn ?? pool;
   if (!itemId) return { byRole: {}, all: [] };
   const [children] = await exec.query(
-    `SELECT id, catalog_item_id AS catalogItemId, flow_id AS flowId
+    `SELECT id, catalog_item_id AS catalogItemId, flow_id AS flowId,
+            level_kind AS levelKind
        FROM fab_items
       WHERE company_id = ? AND parent_item_id = ? AND deleted_at IS NULL
       ORDER BY id`,
@@ -402,10 +403,22 @@ export async function inputContextForItem(companyId, itemId, conn) {
   if (!children.length) return { byRole: {}, all: [] };
   const values = await resolveItemFields(companyId, children.map((c) => c.id), { conn: exec });
   return buildInputContext({
-    // Same classification materialization uses: catalog-bearing children are the
-    // material, flow-bearing children are the parts.
-    rmChildren: children.filter((c) => c.catalogItemId != null),
-    partChildren: children.filter((c) => c.flowId != null),
+    /**
+     * Classified by `level_kind`, which SAYS what the row is, rather than by
+     * which column happens to be null.
+     *
+     * It used to be "has a catalog id => raw material" and "has a flow => a
+     * part". Those were mutually exclusive only by accident: made items carried
+     * no catalog id. Instantiating from a BOM template gives them one, and the
+     * accident ends — a Girder under a Span would be classified as MATERIAL for
+     * the span's formula, and once it also has a flow it lands in BOTH lists and
+     * is handed to two different `input.<role>` namespaces at once.
+     *
+     * `level_kind = 'material'` is set by whoever creates the link
+     * (itemMaterialService, boqSheetService) and is the actual claim being made.
+     */
+    rmChildren: children.filter((c) => c.levelKind === 'material'),
+    partChildren: children.filter((c) => c.levelKind !== 'material' && c.flowId != null),
     valuesByItemId: values,
   });
 }
