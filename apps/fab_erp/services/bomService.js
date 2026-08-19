@@ -165,11 +165,14 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
    * `perInstance` indexes and what the code segment numbers. G1's segments and
    * G2's segments differ by nothing else.
    */
-  const build = (itemId, name, code, depth, ancestry) => {
-    nodes++;
-    byLevel[name] = (byLevel[name] ?? 0) + 1;
-    const node = { catalogItemId: itemId, name, code, children: [] };
-    if (depth >= MAX_DEPTH) return node;
+  /**
+   * Add whatever `itemId` contains to `target`.
+   *
+   * Separate from node creation so a COLLAPSED level can call it with the same
+   * target — see below.
+   */
+  const addChildren = (target, itemId, code, depth, ancestry) => {
+    if (depth >= MAX_DEPTH) return;
 
     for (const line of byParent.get(Number(itemId)) ?? []) {
       let qty = line.qtyNum != null ? Number(line.qtyNum) : Number(params[line.qtyParam] ?? line.defaultQty ?? 0);
@@ -181,7 +184,32 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
         if (mine != null && Number.isFinite(Number(mine))) qty = Number(mine);
       }
 
-      if (!Number.isFinite(qty) || qty <= 0) continue; // a zero collapses the level
+      /**
+       * A QUANTITY OF ZERO COLLAPSES THE LEVEL AND HOISTS WHAT IT CONTAINED.
+       *
+       * Not "skips it". A PEB has no girders, but it still has parts — they
+       * hang off the span instead of off a segment. Three girders cut in one
+       * piece have no segments, but each girder still has its seven parts.
+       *
+       * This is the BOQ format's own rule, stated in boqSheetService's header:
+       * "Blank intermediate levels collapse: a PEB with no girders or segments
+       * is just Span + Part". The old wizard implemented it as two branches —
+       * `if (!girders)` and "girders but no segments, the girder is the
+       * assembly" — and I wrongly took those for special cases that would
+       * disappear. They are not special cases; they are this rule, written out
+       * twice for the only two depths a four-level loop could reach.
+       *
+       * Recursing with the SAME `target` and the SAME `code` is what hoists:
+       * the skipped level contributes no node and no code segment, so a PEB's
+       * part is SPANA-TF exactly as it was before.
+       *
+       * Caught by scripts/compare-wizard.mjs, which is the entire reason that
+       * script exists — the normal cases matched and these two did not.
+       */
+      if (!Number.isFinite(qty) || qty <= 0) {
+        addChildren(target, line.childItemId, code, depth + 1, ancestry);
+        continue;
+      }
 
       for (let i = 1; i <= qty; i++) {
         /**
@@ -199,15 +227,23 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
         const seg = line.codeSegment != null
           ? (qty === 1 ? line.codeSegment : `${line.codeSegment}${i}`)
           : String(i);
-        node.children.push(
-          build(line.childItemId, line.childName, `${code}-${seg}`, depth + 1, { ordinal: i }),
-        );
+        const childCode = `${code}-${seg}`;
+
+        nodes++;
+        byLevel[line.childName] = (byLevel[line.childName] ?? 0) + 1;
+        const child = {
+          catalogItemId: line.childItemId, name: line.childName, code: childCode, children: [],
+        };
+        target.children.push(child);
+        addChildren(child, line.childItemId, childCode, depth + 1, { ordinal: i });
       }
     }
-    return node;
   };
 
-  const tree = build(Number(root.id), root.name, root.code, 0, { ordinal: 1 });
+  nodes++;
+  byLevel[root.name] = (byLevel[root.name] ?? 0) + 1;
+  const tree = { catalogItemId: Number(root.id), name: root.name, code: root.code, children: [] };
+  addChildren(tree, Number(root.id), root.code, 0, { ordinal: 1 });
   return { root: tree, nodes, byLevel };
 }
 
