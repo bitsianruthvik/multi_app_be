@@ -76,11 +76,31 @@ const report = (name, { divergence, readers, precondition }) => {
   if (!ok) console.log(`   before dropping: ${precondition}`);
 };
 
+/**
+ * EVERY company that has legacy rows — not every company that has fab_items.
+ *
+ * The original list joined `fab_items`, on the assumption that a company with no
+ * items has nothing to check. It does not hold: locally only company 6 has
+ * items, while companies 1-5 hold 46 fab_custom_fields rows and 35
+ * fab_bom_templates rows between them. The gate looked at one company out of
+ * six and would have reported the other five CLEAN by never asking.
+ *
+ * A gate that decides what to DROP must be scoped to where the data is, not to
+ * where the traffic is.
+ */
+const legacySources = ['fab_items', 'fab_custom_fields', 'fab_bom_templates',
+  'fab_field_defs', 'fab_item_metric_values', 'fab_buffers'];
+const present = [];
+for (const t of legacySources) if (await tableExists(t)) present.push(t);
+const unionSql = present
+  .map((t) => `SELECT DISTINCT company_id FROM ${t} WHERE deleted_at IS NULL`)
+  .join(' UNION ');
+
 const [companies] = await pool.query(
   only
     ? 'SELECT id, name FROM companies WHERE id = ?'
-    : `SELECT DISTINCT c.id, c.name FROM companies c
-         JOIN fab_items i ON i.company_id = c.id AND i.deleted_at IS NULL`,
+    : `SELECT c.id, c.name FROM companies c
+        WHERE c.id IN (${unionSql || 'SELECT NULL'}) ORDER BY c.id`,
   only ? [only] : [],
 );
 
@@ -212,6 +232,115 @@ if (!metricDefsLive) {
   report('fab_item_metric_defs', { divergence: 0, readers: [], precondition: '—' });
   console.log(`   (${defRows} row(s); every key was migrated into fab_field_defs in Phase 1)`);
 }
+
+// ── 6. fab_field_defs vs fab_fields ───────────────────────────────────────
+//
+// The registry itself. A definition that exists in the old table and has no
+// counterpart in the new one is a field the resolver would stop knowing about.
+let defDiverge = 0;
+const fieldDefsLive = await tableExists('fab_field_defs');
+for (const co of fieldDefsLive ? companies : []) {
+  const [[d]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM fab_field_defs o
+      WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.active = 1
+        AND NOT EXISTS (SELECT 1 FROM fab_fields f
+                         WHERE f.company_id = o.company_id AND f.field_key = o.field_key
+                           AND f.deleted_at IS NULL)`,
+    [co.id],
+  );
+  defDiverge += Number(d.n) || 0;
+}
+if (!fieldDefsLive) reportDone('fab_field_defs');
+else report('fab_field_defs', {
+  divergence: defDiverge,
+  readers: ['itemFieldService.resolveItemFieldsLegacy', 'resourceDef.fabErpFieldDef',
+    'resourcePermissions.fabErpFieldDef'],
+  precondition: 'remove the legacy fallback in itemFieldService — which cannot go until '
+    + 'nothing writes a duplicated column (check 1) — then drop the resourceDef entry',
+});
+
+// ── 7. fab_custom_fields vs fab_field_values ──────────────────────────────
+//
+// The values. `level` here is the OLD vocabulary, so it is mapped onto the
+// ladder rather than compared as a string; an unmapped level is itself a
+// divergence, because a row nothing can be compared to is a row nothing carried.
+let cfDiverge = 0;
+const cfUnmapped = [];
+const customFieldsLive = await tableExists('fab_custom_fields');
+for (const co of customFieldsLive ? companies : []) {
+  const [[d]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM fab_custom_fields c
+      WHERE c.company_id = ? AND c.deleted_at IS NULL
+        AND NOT EXISTS (
+              SELECT 1 FROM fab_field_values v
+                JOIN fab_fields f ON f.id = v.field_id AND f.deleted_at IS NULL
+               WHERE v.company_id = c.company_id AND v.deleted_at IS NULL
+                 AND f.field_key = c.field_key AND v.scope_id = c.level_id
+                 AND v.scope = CASE c.level
+                                 WHEN 'item' THEN 'catalog_item'
+                                 WHEN 'piece' THEN 'stock_piece'
+                                 ELSE c.level END)`,
+    [co.id],
+  );
+  cfDiverge += Number(d.n) || 0;
+  const [levels] = await pool.query(
+    `SELECT DISTINCT level FROM fab_custom_fields
+      WHERE company_id = ? AND deleted_at IS NULL
+        AND level NOT IN ('item','piece','order_item','stock_piece','catalog_item',
+                          'category','group','subgroup')`,
+    [co.id],
+  );
+  cfUnmapped.push(...levels.map((l) => l.level));
+}
+if (!customFieldsLive) reportDone('fab_custom_fields');
+else {
+  report('fab_custom_fields', {
+    divergence: cfDiverge,
+    readers: ['routes/stock', 'itemFieldService.resolveItemFieldsLegacy',
+      'resourceDef.fabErpCustomField', 'FE ItemCatalog.tsx (WRITES it)',
+      'FE ItemCatalogDetail.tsx (WRITES it)'],
+    precondition: 'repoint the two catalog pages at /fields/values — while they still WRITE here, '
+      + 'every new value lands only in the old table and the divergence above keeps growing',
+  });
+  if (cfUnmapped.length) {
+    console.log(`   unmapped level(s): ${[...new Set(cfUnmapped)].join(', ')} — not carried by the importer`);
+  }
+}
+
+// ── 8. fab_bom_templates vs fab_item_bom ──────────────────────────────────
+//
+// The flat parts list the old wizard read. Its successor is a real BOM, so the
+// comparison is not row-for-row: a template row is carried when a catalog item
+// exists for its code AND something has a BOM line pointing at it.
+let bomDiverge = 0;
+const bomTemplatesLive = await tableExists('fab_bom_templates');
+for (const co of bomTemplatesLive ? companies : []) {
+  const [[d]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM fab_bom_templates t
+      WHERE t.company_id = ? AND t.deleted_at IS NULL AND t.active = 1
+        AND NOT EXISTS (
+              SELECT 1 FROM fab_item_bom b
+                JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
+               WHERE b.company_id = t.company_id AND b.deleted_at IS NULL AND b.active = 1
+                 AND c.code LIKE CONCAT('%-', REPLACE(t.code, '/', '-')))`,
+    [co.id],
+  );
+  bomDiverge += Number(d.n) || 0;
+}
+if (!bomTemplatesLive) reportDone('fab_bom_templates');
+else report('fab_bom_templates', {
+  divergence: bomDiverge,
+  readers: ['routes/navCounts', 'resourceDef.fabErpBomTemplate',
+    'scripts/seed-bom-from-templates (READS it to build the successor)',
+    'scripts/compare-wizard (READS it as the old wizard input)'],
+  precondition: 'cut over BoqWizardDialog to /templates/:itemId/preview, then re-point navCounts; '
+    + 'the two scripts must go last — they are what proves the successor matches',
+});
+
+// fab_flow_rules is NOT a candidate here. It came up in the reader sweep, but
+// this migration gave it no successor — flowAllocationService and
+// orderReadinessService still read it as the only copy. Listing it as a
+// candidate would invite a drop that has nowhere to fall back to.
 
 console.log(
   `\n${diverged === 0 ? 'No divergence anywhere.' : `${diverged} source(s) DISAGREE with their replacement.`}`

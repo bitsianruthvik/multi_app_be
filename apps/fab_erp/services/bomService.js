@@ -157,7 +157,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   );
   if (!root) { const e = new Error('That template item does not exist.'); e.status = 404; throw e; }
 
-  const byLevel = {};
+  const byName = {};
   let nodes = 0;
 
   /**
@@ -230,7 +230,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
         const childCode = `${code}-${seg}`;
 
         nodes++;
-        byLevel[line.childName] = (byLevel[line.childName] ?? 0) + 1;
+        byName[line.childName] = (byName[line.childName] ?? 0) + 1;
         const child = {
           catalogItemId: line.childItemId, name: line.childName, code: childCode, children: [],
         };
@@ -241,10 +241,10 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   };
 
   nodes++;
-  byLevel[root.name] = (byLevel[root.name] ?? 0) + 1;
+  byName[root.name] = (byName[root.name] ?? 0) + 1;
   const tree = { catalogItemId: Number(root.id), name: root.name, code: root.code, children: [] };
   addChildren(tree, Number(root.id), root.code, 0, { ordinal: 1 });
-  return { root: tree, nodes, byLevel };
+  return { root: tree, nodes, byName };
 }
 
 /** Flatten an expanded tree into rows, parents before children. */
