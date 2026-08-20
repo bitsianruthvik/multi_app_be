@@ -262,6 +262,45 @@ const FLOWS = [
       { seq: 17, op: 'FQC',   dependsOn: '16',  notes: 'Final QC & dispatch clearance' },
     ],
   },
+  {
+    code: 'PEBW',
+    name: 'PEB Built-up Member — Weld & Prime',
+    description: 'SEG without the metalizing pass: fit-up → weld (both sides) → stiffeners → weld QC → blast → paint → final QC.',
+    /**
+     * SEG MINUS METALIZING, AND THAT IS THE WHOLE POINT.
+     *
+     * The welding half of SEG is exactly right for a built-up tapered I-section
+     * — fit web to two flanges, tack, SAW one side, turn, SAW the other. A PEB
+     * rafter is made on the same H-beam line as a girder segment.
+     *
+     * The FINISH is not. Zinc thermal spray is a bridge corrosion system for
+     * steel that stands in the weather for twenty years. A PEB is an enclosed
+     * shed and its standard finish is blast then primer/paint. Routing every
+     * PEB member through METAL books zinc wire and a metalizing-booth pass no
+     * PEB customer is paying for, and with three metalizing machines in the
+     * fleet it would distort capacity for everything else in the shop.
+     *
+     * So this drops step 14 and the crane move that feeds it, and paints
+     * straight off the blast.
+     */
+    steps: [
+      { seq: 1,  op: 'CRNMV', dependsOn: null,  notes: 'Crane: load finished plates onto assembly bay' },
+      { seq: 2,  op: 'ASSY',  dependsOn: '1',   notes: 'Fit-up of web + two flanges into a tapered I-section' },
+      { seq: 3,  op: 'TACK',  dependsOn: '2',   notes: 'Tack weld the section' },
+      { seq: 4,  op: 'CRNMV', dependsOn: '2,3', notes: 'Crane move: assembly bay → SAW station' },
+      { seq: 5,  op: 'SAW',   dependsOn: '4',   notes: 'SAW weld — side 1' },
+      { seq: 6,  op: 'CRNTN', dependsOn: '5',   notes: 'Crane: turn to weld the other side' },
+      { seq: 7,  op: 'SAW',   dependsOn: '6',   notes: 'SAW weld — side 2' },
+      { seq: 8,  op: 'CRNMV', dependsOn: '7',   notes: 'Crane move: SAW → assembly bay' },
+      { seq: 9,  op: 'ASSY',  dependsOn: '8',   notes: 'Fit & weld end plates, base plate and knee stiffeners' },
+      { seq: 10, op: 'WQC',   dependsOn: '9',   notes: 'Weld inspection' },
+      { seq: 11, op: 'CRNMV', dependsOn: '10',  notes: 'Crane move: assembly → shot blast' },
+      { seq: 12, op: 'BLAST', dependsOn: '11',  notes: 'Shot blasting (SA 2.5)' },
+      { seq: 13, op: 'CRNMV', dependsOn: '12',  notes: 'Crane move: blast → paint' },
+      { seq: 14, op: 'PAINT', dependsOn: '13',  notes: 'Primer + finish coat' },
+      { seq: 15, op: 'FQC',   dependsOn: '14',  notes: 'Final QC & dispatch clearance' },
+    ],
+  },
 ];
 
 /* ───────────────────────────── 5. flow rules ───────────────────────────── */
@@ -286,6 +325,22 @@ const FLOW_RULES = [
   { levelKind: 'part',    lineType: null, codeSuffix: null, flow: 'PARTPL', notes: 'default for parts' },
   { levelKind: 'part',    lineType: null, codeSuffix: '/D', flow: 'PARTDR', notes: 'parts whose code ends /D are drilled' },
   { levelKind: 'segment', lineType: null, codeSuffix: null, flow: 'SEG',    notes: 'default for girder segments' },
+  /**
+   * THE FIRST RULE ANYWHERE THAT NAMES A STRUCTURE TYPE.
+   *
+   * `line_type` has existed on this table since it was written and nothing has
+   * ever used it — every rule until now applied to every type. A PEB member is
+   * welded like a girder segment but finished like a building, so this is the
+   * case the column was for.
+   *
+   * `pickRule` scores a rule naming a type as 2 and a NULL-type rule as 0, so a
+   * PEB order prefers this and every other structure still falls through to
+   * SEG. 'PEB' is the exact LINE_TYPES spelling in the frontend's types.ts —
+   * the same string travels from the order line to this column, so a variation
+   * in spelling would silently stop matching.
+   */
+  { levelKind: 'segment', lineType: 'PEB', codeSuffix: null, flow: 'PEBW',
+    notes: 'PEB members are welded like a segment but primed, not metalized' },
 ];
 
 /* ─────────────────────────────── the seed ──────────────────────────────── */

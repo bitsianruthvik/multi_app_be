@@ -25,16 +25,24 @@
  *
  * ── THREE RULES THAT ARE NOT OBVIOUS FROM THE SCHEMA ───────────────────────
  *
- * 1. EVERY `/D` LINE HAS qty_num = 1. This is forced, not stylistic.
- *    `expand()` numbers siblings by appending the ordinal to `code_segment`
- *    whenever qty > 1, so a `GUSS/D` line with qty 2 yields codes ending
- *    `GUSS/D1` and `GUSS/D2`. `itemCodeService.codeSuffix()` reads everything
- *    after the LAST `/`, so those become `/D1` and `/D2`, and
- *    `flowAllocationService.pickRule()` matches a suffix EXACTLY — the `/D`
- *    rule cannot fire and the drilled part is quietly routed to the plain flow.
- *    Where a real member is plural (a truss panel has two diagonals, a PEB bay
- *    six purlins) the line is still 1 here and the count is raised in the
- *    wizard, which addresses instances individually anyway.
+ * 1. A `/D` LINE MAY NOW CARRY ITS REAL QUANTITY. It could not before, and the
+ *    reason is worth keeping because it is the kind of bug that reports
+ *    success. `expand()` numbers siblings by editing `code_segment` whenever
+ *    qty > 1. It used to APPEND the ordinal, so a `GUSS/D` line at qty 2 gave
+ *    codes ending `GUSS/D1` and `GUSS/D2`; `itemCodeService.codeSuffix()` reads
+ *    everything after the LAST `/`, so the suffix read `/D1`, and
+ *    `flowAllocationService.pickRule()` matches a suffix EXACTLY — no rule
+ *    names `/D1`, so a part that must be drilled was quietly given the PLAIN
+ *    flow and shipped with no holes. Every `/D` line here was therefore pinned
+ *    to 1, with the real count raised in the wizard.
+ *
+ *    `bomService.expand()` now inserts the ordinal BEFORE the slash (`GUSS1/D`,
+ *    `GUSS2/D`), so the suffix survives and the constraint is gone. PEB below
+ *    uses real counts because of it. The four bridge variants are deliberately
+ *    NOT re-quantified in the same pass: Composite Girder is a reproduction of
+ *    placebo_old and must stay identical to it, and the other three were
+ *    authored against it. Raising their counts is a separate, reviewable
+ *    change — not a side effect of a bug fix.
  *
  * 2. LEVEL ITEMS ARE HAND-CODED, deliberately. `itemCodeService` mints codes
  *    for an ORDER's items (`CUST-SO-…-G1-1-TF`), not for catalog rows, and the
@@ -81,12 +89,22 @@ const HELP_SEGMENTS = 'The default for every girder. An end girder is routinely 
  * The five variants.
  *
  * `girder.defaultQty` is the answer the wizard pre-fills; 0 means the level
- * COLLAPSES and its contents hoist to the span, which is the whole of the PEB
- * case. `segment` may be null, in which case the parts hang off the girder.
+ * COLLAPSES and its contents hoist to the span. `segment` may be null, in which
+ * case `parts` hang off the girder.
+ *
+ * `assemblies` (PEB only) is the second shape a girder level can have: instead
+ * of ONE segment level whose children are all the parts, a girder may hold
+ * SEVERAL named weldments side by side, each with its own parts, plus loose
+ * parts of its own. Each entry is a `level_kind = 'segment'` item — which is
+ * the point, because `fab_flow_rules` gives every `segment` the SEG assembly
+ * flow, so an assembly declared this way needs no new rule.
  *
  * `seg` is `code_segment`: what this level contributes to a generated code.
  * 'G' for girders and the part's own abbreviation for parts, per the old data;
- * null on the segment line, which is why segments read as `-1-`, `-2-`.
+ * null on the single `segment` line, which is why a bridge segment reads as
+ * `-1-`, `-2-`. An `assemblies` entry MUST carry a real `seg`: two different
+ * weldments under one parent would otherwise both number from 1 and collide
+ * (rafter `-1`, column `-1`).
  */
 const VARIANTS = [
   // ───────────────────────────────────────────────────────────────────────
@@ -258,26 +276,49 @@ const VARIANTS = [
   },
 
   // ───────────────────────────────────────────────────────────────────────
-  // 5. PEB — the reason the zero-quantity collapse exists.
+  // 5. PEB — the one variant whose girder level is not a single segment run.
   //
-  // A pre-engineered building has no girders and no segments. It has FRAMES,
-  // and a frame is not a shipping segment of anything — it is the building's
-  // repeating unit. Modelled as a girder-level line with default_qty = 0, so
-  // out of the box the level collapses and the eight parts hang straight off
-  // the span (bomService.expand, "A QUANTITY OF ZERO COLLAPSES THE LEVEL AND
-  // HOISTS WHAT IT CONTAINED"). Answer the question with 3 and you get three
-  // frames instead — which is the useful behaviour, not a degenerate one.
+  // A pre-engineered building has no girders and no shipping segments. It has
+  // FRAMES: a frame is the building's repeating portal, and how many there are
+  // IS the building's length. So the girder level is the frame and its quantity
+  // is the parameter — that part of the old model was right.
   //
-  // The parts split cleanly along how a PEB is joined, and that split is the
-  // whole fabrication story:
-  //   WELDED   rafter and column are built-up tapered I-sections — web plus two
-  //            flanges, cut on the plasma table and run through the H-beam
-  //            welding line. Tapered, so the web is a trapezoid, not a rectangle.
-  //   BOLTED   everything else. The base plate takes anchor bolts into the
-  //            foundation; the rafter-to-column and rafter-to-rafter joints are
-  //            moment END PLATES; purlins bolt to the rafter; bracing flats bolt
-  //            at both ends. Four drilled parts out of eight — a PEB is a kit
-  //            that is welded in the shop and bolted on site.
+  // WHAT WAS WRONG. The rafter and the column are not parts. They are welded
+  // built-up TAPERED I-sections: a trapezoidal web plate plus two flange
+  // plates, cut on the plasma table and run through the H-beam welding line,
+  // exactly as a girder segment is. Hanging those plates directly off the frame
+  // with level_kind='part' gave each plate a part flow (cut → move → edge prep
+  // → QC) and left NOTHING that welded them together — the building's two
+  // principal members were never fabricated, only their ingredients. A PEB is
+  // the one structure here where a frame holds SEVERAL weldments rather than a
+  // run of identical segments, and `assemblies` is that shape.
+  //
+  // WHY TWO OF EACH.
+  //   Rafter ×2  — a clear-span portal ships as two rafter halves spliced at
+  //                the ridge; each half bolts to a column at the eave. That is
+  //                also why the rafter carries TWO end plates, one per joint.
+  //   Column ×2  — one each side of the frame.
+  //
+  // WHAT IS WELDED AND WHAT IS BOLTED, which is the whole fabrication story:
+  //   WELDED   web + 2 flanges into the tapered I, then the end plate (rafter)
+  //            or the base plate and cap plate (column) welded onto the ends.
+  //            All of this happens in the shop, on the assembly.
+  //   BOLTED   the joints those plates make: base plate to foundation on anchor
+  //            bolts, rafter end plate to column cap at the eave, rafter to
+  //            rafter at the ridge, purlins to rafters, bracing flats at both
+  //            ends. Bolted means DRILLED, hence `/D`.
+  //
+  // So the base plate and the end plate are drilled AND welded-on: they belong
+  // under the weldment that carries them, not loose under the frame. They were
+  // loose in the first draft, which meant four holes-in-plate with no assembly
+  // consuming them — the same gap as the rafter, one level down. Purlins and
+  // bracing flats ARE loose: they span BETWEEN frames and are bolted on site,
+  // so they stay direct children of the frame with no shop assembly at all.
+  //
+  // `EP/D` is deliberately ONE catalog item used under BOTH assemblies. A PEB
+  // moment end plate is the same detail at the eave and at the ridge; two items
+  // would be two names for one plate. `fab_item_bom` is (parent, child) pairs,
+  // so one child under two parents is a normal line, not a trick.
   // ───────────────────────────────────────────────────────────────────────
   {
     name: 'PEB',
@@ -286,26 +327,64 @@ const VARIANTS = [
     girder: {
       code: 'FRM',
       name: 'PEB Frame',
-      defaultQty: 0,
+      // WHY 5 AND NOT 0. The old default was 0 to demonstrate the collapse
+      // rule, and with no assembly level to lose that was harmless. It is not
+      // harmless now: 0 collapses the frame, and the rafter and column
+      // assemblies hoist to the span — so the default PEB becomes a building
+      // with ONE rafter and TWO columns and no repeating unit at all. A frame
+      // count is not a level a PEB can do without; it is the building's length.
+      // 5 frames is 4 bays at 6 m centres — a 24 m shed, the smallest thing a
+      // customer actually orders. The collapse rule loses nothing by not being
+      // the default: it is exercised by ANSWERING 0, which the help text says
+      // and which is a keystroke away in the wizard.
+      defaultQty: 5,
       seg: 'G',
-      help: 'Portal frames. Leave at 0 and the level collapses so the parts sit directly under the span, which is the normal PEB case.',
+      help: 'Portal frames — this is the building\'s length (5 frames = 4 bays at 6 m = 24 m). Answer 0 and the level collapses so one frame\'s worth of members sits directly under the span.',
     },
     segment: null,
+    assemblies: [
+      {
+        code: 'RAFT',
+        name: 'PEB Rafter',
+        qty: 2,
+        seg: 'RAFT',
+        parts: [
+          { seg: 'RFW', name: 'PEB Rafter Web Plate', qty: 1 },
+          { seg: 'RFF', name: 'PEB Rafter Flange Plate', qty: 2 },
+          // Eave and ridge. This is the line that could not exist before the
+          // expand() index-before-slash fix: at qty 2 its codes are EP1/D and
+          // EP2/D, and the old numbering made them EP/D1 and EP/D2, which no
+          // flow rule names.
+          { seg: 'EP/D', name: 'PEB End Plate', qty: 2 },
+        ],
+      },
+      {
+        code: 'COL',
+        name: 'PEB Column',
+        qty: 2,
+        seg: 'COL',
+        parts: [
+          { seg: 'COLW', name: 'PEB Column Web Plate', qty: 1 },
+          { seg: 'COLF', name: 'PEB Column Flange Plate', qty: 2 },
+          { seg: 'BP/D', name: 'PEB Base Plate', qty: 1 },
+          { seg: 'EP/D', name: 'PEB End Plate', qty: 1 },
+        ],
+      },
+    ],
+    // Loose, site-bolted, no shop assembly. Counts are per BAY, carried on the
+    // frame because a bay and a frame are one-for-one along the building.
     parts: [
-      { seg: 'RFW', name: 'PEB Rafter Web Plate', qty: 1 },
-      { seg: 'RFF', name: 'PEB Rafter Flange Plate', qty: 2 },
-      { seg: 'COLW', name: 'PEB Column Web Plate', qty: 1 },
-      { seg: 'COLF', name: 'PEB Column Flange Plate', qty: 2 },
-      { seg: 'BP/D', name: 'PEB Base Plate', qty: 1 },
-      { seg: 'EP/D', name: 'PEB End Plate', qty: 1 },
-      { seg: 'PRL/D', name: 'PEB Purlin', qty: 1 },
-      { seg: 'BRC/D', name: 'PEB Bracing Flat', qty: 1 },
+      { seg: 'PRL/D', name: 'PEB Purlin', qty: 12 },
+      { seg: 'BRC/D', name: 'PEB Bracing Flat', qty: 4 },
     ],
   },
 ];
 
 /** `BS/D` -> `BS-D`. A slash is legal in a code_segment but not wanted in a code. */
 const itemCode = (variantCode, seg) => `${variantCode}-${String(seg).replace(/\//g, '-')}`;
+
+/** First occurrence of each `code` wins; a repeated child is one catalog item. */
+const dedupeByCode = (rows) => [...new Map(rows.map((r) => [r.code, r])).values()];
 
 /** The flow a level should carry, by code. Null means "a grouping, no work". */
 function flowCodeFor(levelKind, seg) {
@@ -361,12 +440,17 @@ export async function seed(ctx) {
     }
 
     // ── the level items ─────────────────────────────────────────────────
-    const levels = [
+    // Deduped by code: `EP/D` is one catalog item that appears under two
+    // assemblies, and creating it twice would collide on its unique name.
+    const asms = v.assemblies ?? [];
+    const levels = dedupeByCode([
       { ...v.span, levelKind: 'span', seg: null },
       { ...v.girder, levelKind: 'girder' },
       ...(v.segment ? [{ ...v.segment, levelKind: 'segment', seg: null }] : []),
+      ...asms.map((a) => ({ code: a.code, name: a.name, levelKind: 'segment', seg: a.seg })),
+      ...asms.flatMap((a) => a.parts).map((p) => ({ code: p.seg, name: p.name, levelKind: 'part', seg: p.seg })),
       ...v.parts.map((p) => ({ code: p.seg, name: p.name, levelKind: 'part', seg: p.seg })),
-    ];
+    ]);
 
     /** code -> id, for the BOM lines below. Null in a dry run. */
     const idByCode = new Map();
@@ -444,12 +528,32 @@ export async function seed(ctx) {
         helpText: v.segment.help,
         sortOrder: 0,
       }] : []),
+      // Named weldments under the girder level, and their own parts. Fixed
+      // quantities, not parameters: two rafter halves and two columns is what a
+      // portal frame IS, not a question to ask. Sorted before the loose parts,
+      // which is why those start after them — with no assemblies the offset is
+      // zero and the four bridge variants keep the sort orders they had.
+      ...asms.map((a, i) => ({
+        parentCode: v.girder.code,
+        childCode: a.code,
+        qtyNum: a.qty,
+        codeSegment: a.seg,
+        helpText: a.help ?? null,
+        sortOrder: i + 1,
+      })),
+      ...asms.flatMap((a) => a.parts.map((p, i) => ({
+        parentCode: a.code,
+        childCode: p.seg,
+        qtyNum: p.qty,
+        codeSegment: p.seg,
+        sortOrder: i + 1,
+      }))),
       ...v.parts.map((p, i) => ({
         parentCode: partParent,
         childCode: p.seg,
         qtyNum: p.qty,
         codeSegment: p.seg,
-        sortOrder: i + 1,
+        sortOrder: i + 1 + asms.length,
       })),
     ];
     counts.bomLines += spec.length;

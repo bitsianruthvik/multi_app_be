@@ -37,6 +37,7 @@ const MODULES = [
   ['04', './04-shopfloor.mjs'],
   ['05', './05-stock.mjs'],
   ['06', './06-scopes.mjs'],
+  ['07', './07-machine-identity.mjs'],
 ];
 
 const [[company]] = await pool.query('SELECT id, name FROM companies WHERE id = ?', [companyId]);
