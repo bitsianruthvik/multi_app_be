@@ -31,6 +31,55 @@
 
 import { pool } from '../../../db.js';
 import { composeCode, materialSegment } from './itemCodeService.js';
+import { syncOrderProcurement } from './procurementService.js';
+
+/**
+ * The PLATE SIZE to stamp on a material link, for a chosen catalog material.
+ *
+ * Two dimensions come from two different places on purpose, because only one of
+ * them is a property of the material itself:
+ *
+ *   height (THICKNESS)  ← fab_item_catalog.thickness_mm
+ *       Thickness IS the material. "MS Plate E350 BO 16 mm" is 16 mm on every
+ *       shelf in every plant; there is nothing to look up and nothing that can
+ *       disagree. The catalog is definitive.
+ *
+ *   length / width      ← fab_stock_pieces for that same catalog item
+ *       The catalog has no length/width columns at all, and could not: the same
+ *       16 mm plate is bought 12000x2000 and 6000x1500 and whatever else the
+ *       mill sent. A plate's footprint is a property of the PIECE on the floor,
+ *       not of the material. So the size we assume is the size the yard most
+ *       often actually holds — most pieces wins, and a tie goes to the LARGER
+ *       area, because guessing big means a part is more likely to fit and the
+ *       nesting check catches an over-large guess anyway.
+ *
+ * With no sized stock we return nulls rather than inventing a size. A made-up
+ * plate would let nesting "pass" against a plate nobody owns; the honest
+ * MISSING_PLATE_DIMS error is the better outcome.
+ *
+ * @returns {Promise<{length:number|null, width:number|null, height:number|null}>}
+ */
+async function plateDimsForMaterial(exec, companyId, material) {
+  const height = material?.thicknessMm == null ? null : Number(material.thicknessMm);
+
+  const [[size]] = await exec.query(
+    `SELECT sp.length_mm AS length, sp.width_mm AS width, SUM(sp.qty) AS pieces
+       FROM fab_stock_pieces sp
+      WHERE sp.company_id = ? AND sp.catalog_item_id = ? AND sp.deleted_at IS NULL
+        AND sp.status = 'in_stock' AND sp.qty > 0
+        AND sp.length_mm IS NOT NULL AND sp.width_mm IS NOT NULL
+      GROUP BY sp.length_mm, sp.width_mm
+      ORDER BY pieces DESC, (sp.length_mm * sp.width_mm) DESC
+      LIMIT 1`,
+    [companyId, material.id],
+  );
+
+  return {
+    length: size?.length == null ? null : Number(size.length),
+    width: size?.width == null ? null : Number(size.width),
+    height: Number.isFinite(height) ? height : null,
+  };
+}
 
 /** The part, with enough context to build its material row's code. */
 async function loadPart(exec, companyId, itemId) {
@@ -82,13 +131,17 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
           'UPDATE fab_items SET deleted_at = NOW() WHERE id = ? AND company_id = ?',
           [link.id, companyId],
         );
+        // Removing a link removes a BOUGHT row, so the order's buy/make picture
+        // changed here too. Same connection, before the commit: the link write
+        // and the classification it implies land together or not at all.
+        if (part.orderId) await syncOrderProcurement(conn, companyId, part.orderId);
       }
       if (owned) await conn.commit();
       return { itemId: part.id, orderId: part.orderId, cleared: !!link, materialId: null };
     }
 
     const [[material]] = await conn.query(
-      `SELECT id, code, name, unit FROM fab_item_catalog
+      `SELECT id, code, name, unit, thickness_mm AS thicknessMm FROM fab_item_catalog
         WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
       [catalogItemId, companyId],
     );
@@ -100,6 +153,12 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
 
     // ── unchanged ─────────────────────────────────────────────────────────
     if (link && Number(link.catalogItemId) === Number(material.id)) {
+      // Nothing about the link changed, but re-sync anyway: it is idempotent and
+      // it heals a row left unclassified by an older write. Dimensions are NOT
+      // refreshed here — the nesting board writes a nest's real plate size onto
+      // these same columns, and re-picking the material you already had must not
+      // throw that away.
+      if (part.orderId) await syncOrderProcurement(conn, companyId, part.orderId);
       if (owned) await conn.commit();
       return {
         itemId: part.id, orderId: part.orderId, materialId: material.id,
@@ -109,11 +168,20 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
 
     // ── changing ──────────────────────────────────────────────────────────
     if (link) {
+      // The dimensions on this row describe the OLD plate. They are refreshed
+      // rather than kept, because a 16 mm size left on a row that now says 25 mm
+      // is worse than no size at all: nesting would check the part against a
+      // plate that is not the one being bought, and pass.
+      const dims = await plateDimsForMaterial(conn, companyId, material);
       await conn.query(
-        `UPDATE fab_items SET catalog_item_id = ?, name = ?, unit = ?, nest_no = NULL
+        `UPDATE fab_items
+            SET catalog_item_id = ?, name = ?, unit = ?, nest_no = NULL,
+                length = ?, width = ?, height = ?
           WHERE id = ? AND company_id = ?`,
-        [material.id, material.name, material.unit || 'pcs', link.id, companyId],
+        [material.id, material.name, material.unit || 'pcs',
+          dims.length, dims.width, dims.height, link.id, companyId],
       );
+      if (part.orderId) await syncOrderProcurement(conn, companyId, part.orderId);
       if (owned) await conn.commit();
       return {
         itemId: part.id, orderId: part.orderId, materialId: material.id,
@@ -122,17 +190,26 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
     }
 
     // ── creating ──────────────────────────────────────────────────────────
+    // A link with no size is a link nesting cannot check and procurement cannot
+    // price, which is what the sheet importer always filled in from its own
+    // columns. The screen has no size fields, so it derives them instead.
+    const dims = await plateDimsForMaterial(conn, companyId, material);
     await conn.query(
       `INSERT INTO fab_items
          (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
-          qty, flow_id, code, nest_no, level_kind)
-       VALUES (?,?,?,?,?,?,?,1,NULL,?,NULL,'material')`,
+          qty, flow_id, length, width, height, code, nest_no, level_kind)
+       VALUES (?,?,?,?,?,?,?,1,NULL,?,?,?,?,NULL,'material')`,
       [
         companyId, part.orderId, part.lineId, part.id, material.id, material.name,
         material.unit || 'pcs',
+        dims.length, dims.width, dims.height,
         composeCode(part.code, materialSegment(material.code, material.name)),
       ],
     );
+    // The link is a catalog stock draw, so this is what makes it 'buy'. Without
+    // it the row stays procurement_type NULL, reads as 'make' by default, and
+    // the order can never raise a purchase order for a plate it plainly buys.
+    if (part.orderId) await syncOrderProcurement(conn, companyId, part.orderId);
     if (owned) await conn.commit();
     return {
       itemId: part.id, orderId: part.orderId, materialId: material.id,

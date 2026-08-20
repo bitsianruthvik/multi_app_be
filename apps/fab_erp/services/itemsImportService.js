@@ -379,27 +379,7 @@ export async function importItemsExcel(file, companyId) {
       return res.insertId;
     }
 
-    async function resolveDefaultGroup(categoryId) {
-      const key = `${categoryId}::default`;
-      if (groupCache.has(key)) return groupCache.get(key);
-      const [rows] = await conn.query(
-        'SELECT id FROM fab_item_groups WHERE company_id = ? AND category_id = ? AND name = ? AND deleted_at IS NULL LIMIT 1',
-        [companyId, categoryId, 'Default'],
-      );
-      if (rows.length) { groupCache.set(key, rows[0].id); return rows[0].id; }
-      return resolveGroup(categoryId, 'Default');
-    }
 
-    async function resolveDefaultSubgroup(groupId) {
-      const key = `${groupId}::default`;
-      if (subgroupCache.has(key)) return subgroupCache.get(key);
-      const [rows] = await conn.query(
-        'SELECT id FROM fab_item_subgroups WHERE company_id = ? AND group_id = ? AND name = ? AND deleted_at IS NULL LIMIT 1',
-        [companyId, groupId, 'Default'],
-      );
-      if (rows.length) { subgroupCache.set(key, rows[0].id); return rows[0].id; }
-      return resolveSubgroup(groupId, 'Default');
-    }
 
     // ── process rows ─────────────────────────────────────────────────────────
     for (const r of rows) {
@@ -427,8 +407,37 @@ export async function importItemsExcel(file, companyId) {
       }
 
       const categoryId = await resolveCategory(r.categoryName);
-      let groupId = r.groupName ? await resolveGroup(categoryId, r.groupName) : await resolveDefaultGroup(categoryId);
-      const subgroupId = r.subgroupName ? await resolveSubgroup(groupId, r.subgroupName) : await resolveDefaultSubgroup(groupId);
+
+      /**
+       * A BLANK GROUP MEANS NO GROUP — it does not mean "invent one".
+       *
+       * This used to mint a group literally named "Default" (and a sub-group
+       * under it) whenever the sheet left the column blank, which at import
+       * scale produced one per category in a single upload. Nobody asked for
+       * them, and because the taxonomy is what scopes field definitions, an item
+       * parked under "Default" silently inherits anything later attached there.
+       *
+       * NULL is the supported state: the columns are nullable with no FK, the
+       * field ladder's `parentOf('catalog_item')` already falls through a null
+       * group straight to the category, and every join against these columns is
+       * a LEFT join. It is also what rule 7 of this importer's own instructions
+       * has always promised — a missing parent skips that level and still
+       * creates the item.
+       *
+       * A sub-group cannot outlive its group (`group_id` is NOT NULL), so a
+       * sheet naming one without a group gets the sub-group skipped and a
+       * warning, rather than a fabricated parent to hang it from.
+       */
+      const groupId = r.groupName ? await resolveGroup(categoryId, r.groupName) : null;
+      let subgroupId = null;
+      if (r.subgroupName) {
+        if (groupId) {
+          subgroupId = await resolveSubgroup(groupId, r.subgroupName);
+        } else {
+          const message = `Sub-group '${r.subgroupName}' needs a Group — sub-group left unset for this row.`;
+          result.warnings.push({ row: r.rowNumber, message });
+        }
+      }
 
       if (!code) {
         // No code in the spreadsheet — use the company's configured item code rule
