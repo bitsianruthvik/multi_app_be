@@ -13,6 +13,7 @@ import {
 import { markSimilar, groupsForOrder, groupableItems } from '../services/similarityService.js';
 import fs from 'fs';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
+import { suggestNesting, acceptSuggestion } from '../services/nestingSuggestService.js';
 import {
   nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
 } from '../services/nestingBoardService.js';
@@ -281,6 +282,35 @@ const board = (fn) => async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 };
+
+/**
+ * The nesting SUGGESTOR — a third way to fill the board, not a replacement.
+ *
+ * GET proposes and writes nothing; POST saves the nests a person accepted. The
+ * two are separate verbs because they are separate decisions: looking at a
+ * suggestion must never be able to change an order, and a suggestion that were
+ * re-derived at save time could save something nobody saw.
+ */
+export const suggestNestingHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    res.json(await suggestNesting(cid, orderId, {
+      includeNested: req.query.includeNested === 'true',
+      grade: req.query.grade || null,
+    }));
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: nesting suggestion failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+export const acceptNestingHandler = board(async (cid, orderId, req) => ({
+  ...await acceptSuggestion(cid, orderId, req.body?.nests ?? []),
+  ...await nestingBoard(cid, orderId),
+  nextNestNo: await nextNestNo(cid, orderId),
+}));
 
 export const nestingBoardHandler = board(async (cid, orderId) => ({
   ...await nestingBoard(cid, orderId),

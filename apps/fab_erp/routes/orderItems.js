@@ -44,6 +44,8 @@ import {
   orderReadinessHandler,
   confirmOrderHandler,
   nestingBoardHandler,
+  suggestNestingHandler,
+  acceptNestingHandler,
   assignPartsHandler,
   updateNestHandler,
   clearNestHandler,
@@ -81,6 +83,13 @@ router.get('/orders/:orderId/nesting/board', protect, nestingBoardHandler);
 router.post('/orders/:orderId/nesting/assign', protect, requirePerm('fab_erp_projects_manage'), assignPartsHandler);
 router.patch('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), updateNestHandler);
 router.delete('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), clearNestHandler);
+
+// The suggestor (2026-08-21) — a third way to fill the board alongside the
+// Excel import and dragging plates by hand, not a replacement for either.
+// Proposing writes nothing, so it needs only the permission to look; accepting
+// repoints material and is an arranging action like the rest.
+router.get('/orders/:orderId/nesting/suggest', protect, suggestNestingHandler);
+router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab_erp_projects_manage'), acceptNestingHandler);
 
 // ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
