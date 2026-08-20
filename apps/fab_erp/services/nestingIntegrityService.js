@@ -38,6 +38,18 @@ import { resolveItemFields } from './itemFieldService.js';
 export const ISSUE = {
   MISSING_PART_DIMS: 'missing_part_dimensions',
   MISSING_PLATE_DIMS: 'missing_plate_dimensions',
+  /**
+   * The part has material but has not been laid onto a plate yet.
+   *
+   * Split out of MISSING_PLATE_DIMS, which was reporting two different
+   * situations under one name and one severity. "Nobody has nested this yet"
+   * is the NORMAL state of a fresh order — every part is in it the moment the
+   * material is picked — and it is not a reason to refuse a purchase order,
+   * because buying to a cutting list and nesting afterwards is how the shop
+   * actually works. MISSING_PLATE_DIMS now means only what its name says:
+   * a plate somebody HAS committed a part to, whose size is unknown.
+   */
+  NOT_NESTED_YET: 'not_nested_yet',
   THICKNESS_MISMATCH: 'thickness_mismatch',
   PART_TOO_BIG: 'part_too_big',
   PLATE_OVERFILLED: 'plate_overfilled',
@@ -174,28 +186,49 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
 
     if (plateL == null || plateW == null) {
       /**
-       * SAY WHICH OF THE TWO STATES THIS IS.
+       * TWO DIFFERENT STATES, TWO DIFFERENT TYPES, TWO DIFFERENT SEVERITIES.
        *
-       * This fires for every link without dimensions, nested or not, and the
-       * old sentence described both as "the plate has no size". For a part
-       * that simply has not been laid onto a plate yet, that reads as a data
-       * fault when the honest answer is "not nested yet" — and since a fresh
-       * order has every part in that state, it produced one alarming line per
-       * part on an order where nothing was actually wrong.
+       * A link with no plate size is one of two things, and until now both were
+       * reported as MISSING_PLATE_DIMS and both blocked:
        *
-       * Both remain BLOCKING: you cannot cost or cut a plate of unknown size
-       * either way. Only the explanation changes, and with it whether the
-       * reader knows what to do next.
+       *   nest_no set    — somebody HAS committed this part to a specific plate
+       *                    and that plate's size is unknown. Nobody can cut it,
+       *                    cost it, or check the part fits on it. A real fault
+       *                    on work already done. BLOCKING.
+       *
+       *   nest_no null   — the part simply has not been laid onto a plate yet,
+       *                    and no sized stock of the material existed for
+       *                    itemMaterialService.plateDimsForMaterial() to assume
+       *                    a size from. This is the ordinary state of a fresh
+       *                    order: every part is in it from the moment material
+       *                    is picked until somebody nests. WARNING.
+       *
+       * Blocking the second one had a concrete cost in production: on a fresh
+       * 28-part order Procurement refused to raise a PO and needed an explicit
+       * "Order anyway", and Production refused too — for an order that was
+       * simply at the stage it was supposed to be at. Shops buy plate to a
+       * cutting list and nest afterwards; the gate was refusing normal practice.
+       *
+       * The split is a distinct TYPE rather than a flag on MISSING_PLATE_DIMS
+       * so callers can branch on `i.type` and never have to read the sentence
+       * to work out how serious it is. Nothing is suppressed: the issue is
+       * still reported, still counted in `summary`, still makes `ok` false —
+       * it changes severity, it does not vanish.
        */
-      add(ISSUE.MISSING_PLATE_DIMS, {
-        ...where,
-        message: l.nestNo
-          ? `The plate for ${l.partName} (${l.materialCode}, nest ${l.nestNo}) has no size, `
-            + 'so nothing can check the part fits or buy the right plate.'
-          : `${l.partName} is not on a nest yet, and no sized stock of ${l.materialCode} `
-            + 'is on hand to assume a plate size from — so nothing can check it fits '
-            + 'or buy the right plate.',
-      });
+      if (l.nestNo) {
+        add(ISSUE.MISSING_PLATE_DIMS, {
+          ...where, nested: true,
+          message: `The plate for ${l.partName} (${l.materialCode}, nest ${l.nestNo}) has no size, `
+                 + 'so nothing can check the part fits or buy the right plate.',
+        });
+      } else {
+        add(ISSUE.NOT_NESTED_YET, {
+          ...where, nested: false,
+          message: `${l.partName} is not on a nest yet, and no sized stock of ${l.materialCode} `
+                 + 'is on hand to assume a plate size from — so nothing can check it fits. '
+                 + 'Ordinary before nesting: the cutting list can still be bought to.',
+        });
+      }
     } else if (partL != null && partW != null && !fitsWithin(partL, partW, plateL, plateW, tol)) {
       add(ISSUE.PART_TOO_BIG, {
         ...where, partSize: `${partL}×${partW}`, plateSize: `${plateL}×${plateW}`,
@@ -249,8 +282,21 @@ function summarise(issues) {
  *
  * A missing dimension and an impossible one are different: the first means
  * nobody has finished the job yet, the second means somebody finished it wrong.
- * Both block procurement — buying a plate for a part of unknown size is exactly
- * as useless as buying one that cannot hold it.
+ * Both still block — buying a plate for a part of unknown size is exactly as
+ * useless as buying one that cannot hold it.
+ *
+ * NOT_NESTED_YET is the one exception, and it is deliberately outside this set.
+ * It is not an unfinished job in the sense the paragraph above means; it is the
+ * job at the stage it is meant to be at. Every part on a fresh order is "not
+ * nested yet" the instant its material is picked, and refusing to buy at that
+ * point refuses the normal sequence of work — you order to a cutting list, then
+ * nest. It is still reported, so no screen goes quiet about it; it just does
+ * not stop a purchase order.
+ *
+ * Nothing here is loosened for the impossibilities. THICKNESS_MISMATCH and
+ * PART_TOO_BIG describe parts that cannot come off the material at all, and
+ * they must keep refusing: an order that is genuinely uncuttable is exactly
+ * what these gates exist for.
  */
 export const BLOCKING = new Set([
   ISSUE.MISSING_PART_DIMS,
@@ -261,5 +307,19 @@ export const BLOCKING = new Set([
   ISSUE.NO_MATERIAL,
 ]);
 
+/**
+ * Reported, not refused. Kept as its own named set rather than "everything not
+ * in BLOCKING" so a caller that wants to show these — the readiness strip has
+ * to, or an order with nothing nested reads as green — can ask for them by
+ * name and cannot accidentally scoop up a future blocking type.
+ */
+export const ADVISORY = new Set([
+  ISSUE.NOT_NESTED_YET,
+]);
+
 export const blockingIssues = (result) =>
   (result?.issues ?? []).filter((i) => BLOCKING.has(i.type));
+
+/** The issues worth saying out loud that are not grounds for a refusal. */
+export const advisoryIssues = (result) =>
+  (result?.issues ?? []).filter((i) => ADVISORY.has(i.type));

@@ -114,25 +114,44 @@ async function writeLedger(conn, companyId, { catalogItemId, plantId, stockLocat
   );
 }
 
-/** Machine's WIP stock area, provisioning one if the machine has none. */
-async function ensureMachineWipLocation(conn, companyId, machine) {
-  if (machine.stock_location_id) return machine.stock_location_id;
-  if (!machine.plant_id) return null; // a location must be scoped to a plant
+/**
+ * Find-or-create the machine's OWN `WIP-M<id>` area, without caring what area
+ * the machine is currently pointed at and without repointing it.
+ *
+ * Split out of `ensureMachineWipLocation` (2026-08-20) for the one case that
+ * function cannot serve: a machine that already sits in a POOLED area and is
+ * being given a dedicated one on purpose. `ensureMachineWipLocation` returns
+ * early the moment `stock_location_id` is set, which is right for task start —
+ * a running job must not silently move areas — and wrong for a deliberate
+ * "give this machine its own area" instruction. Same code, same name, same
+ * description; only the early return and the repoint are the caller's business
+ * now. Behaviour of `ensureMachineWipLocation` is unchanged.
+ *
+ * @returns {Promise<number|null>} location id, or null when the machine has no
+ *   plant (an area must be scoped to one).
+ */
+export async function provisionMachineWipLocation(conn, companyId, machine) {
+  if (!machine?.plant_id) return null; // a location must be scoped to a plant
   const code = `WIP-M${machine.id}`.slice(0, 20);
   const [[existing]] = await conn.query(
     `SELECT id FROM fab_stock_locations
       WHERE company_id = ? AND plant_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1`,
     [companyId, machine.plant_id, code],
   );
-  let locId = existing?.id;
-  if (!locId) {
-    const [ins] = await conn.query(
-      `INSERT INTO fab_stock_locations (company_id, plant_id, name, code, description)
-       VALUES (?, ?, ?, ?, 'Auto-provisioned per-machine work-in-process area')`,
-      [companyId, machine.plant_id, `${machine.name || `Machine #${machine.id}`} WIP`, code],
-    );
-    locId = ins.insertId;
-  }
+  if (existing?.id) return existing.id;
+  const [ins] = await conn.query(
+    `INSERT INTO fab_stock_locations (company_id, plant_id, name, code, description)
+     VALUES (?, ?, ?, ?, 'Auto-provisioned per-machine work-in-process area')`,
+    [companyId, machine.plant_id, `${machine.name || `Machine #${machine.id}`} WIP`, code],
+  );
+  return ins.insertId;
+}
+
+/** Machine's WIP stock area, provisioning one if the machine has none. */
+async function ensureMachineWipLocation(conn, companyId, machine) {
+  if (machine.stock_location_id) return machine.stock_location_id;
+  const locId = await provisionMachineWipLocation(conn, companyId, machine);
+  if (!locId) return null;
   await conn.query(
     `UPDATE fab_resources SET stock_location_id = ? WHERE id = ? AND company_id = ?`,
     [locId, machine.id, companyId],

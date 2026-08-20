@@ -25,7 +25,7 @@ import {
 } from '../services/productionOrderService.js';
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
 import { releaseOrderReservations } from '../services/availabilityService.js';
-import { checkOrderNesting, blockingIssues } from '../services/nestingIntegrityService.js';
+import { checkOrderNesting, blockingIssues, advisoryIssues } from '../services/nestingIntegrityService.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { pool } from '../../../db.js';
 
@@ -88,7 +88,12 @@ router.get('/orders/:orderId/nesting/integrity', protect, async (req, res) => {
   const orderId = Number(req.params.orderId);
   try {
     const result = await checkOrderNesting(c.companyId, orderId);
-    res.json({ ...result, blocking: blockingIssues(result) });
+    // Both buckets, named. An advisory is a real finding that simply does not
+    // stop the order — "this part is not on a nest yet" is the normal state of
+    // a fresh job, and blocking a purchase order on it stopped legitimate
+    // buying. Returning it separately means a caller can show the count
+    // without re-deriving the split by filtering issues client-side.
+    res.json({ ...result, blocking: blockingIssues(result), advisory: advisoryIssues(result) });
   } catch (err) {
     logger.error({ err, orderId }, 'nesting integrity check failed');
     res.status(500).json({ message: err.message });

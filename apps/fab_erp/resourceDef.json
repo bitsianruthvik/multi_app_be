@@ -349,6 +349,67 @@
       }
     }
   },
+  "fabErpResourceStockArea": {
+    "table": "fab_resource_stock_areas",
+    "alias": "frsa",
+    "writeFields": [
+      "resource_id",
+      "stock_location_id",
+      "role",
+      "active",
+      "notes"
+    ],
+    "fields": {
+      "id": "frsa.id",
+      "companyId": "frsa.company_id",
+      "resourceId": "frsa.resource_id",
+      "stockLocationId": "frsa.stock_location_id",
+      "role": "frsa.role",
+      "active": "frsa.active",
+      "notes": "frsa.notes",
+      "createdAt": "frsa.created_at",
+      "updatedAt": "frsa.updated_at",
+      "resourceName": "fr_rsa.name",
+      "resourceCode": "fr_rsa.code",
+      "stockLocationName": "fsl_rsa.name",
+      "stockLocationCode": "fsl_rsa.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "resourceId": "integer",
+      "stockLocationId": "integer",
+      "role": "string",
+      "active": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "resourceName": "string",
+      "resourceCode": "string",
+      "stockLocationName": "string",
+      "stockLocationCode": "string"
+    },
+    "relations": {
+      "resource": {
+        "table": "fab_resources",
+        "alias": "fr_rsa",
+        "on": "frsa.resource_id = fr_rsa.id",
+        "fields": [
+          "resourceName",
+          "resourceCode"
+        ]
+      },
+      "stockLocation": {
+        "table": "fab_stock_locations",
+        "alias": "fsl_rsa",
+        "on": "frsa.stock_location_id = fsl_rsa.id",
+        "fields": [
+          "stockLocationName",
+          "stockLocationCode"
+        ]
+      }
+    }
+  },
   "fabErpProcessMaster": {
     "table": "fab_process_master",
     "alias": "fpm",
