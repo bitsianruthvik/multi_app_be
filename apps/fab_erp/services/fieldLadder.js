@@ -221,27 +221,218 @@ async function withOwnType(exec, companyId, scope, scopeId, chain, seen) {
  */
 export async function chainsFor(companyId, targets, conn = null) {
   const exec = conn ?? pool;
-  const memo = new Map(); // "scope:id" -> parent or null
+  const list = (targets ?? []).map((t) => ({ scope: t.scope, scopeId: Number(t.scopeId) }));
   const out = new Map();
+  if (!list.length) return out;
 
-  for (const t of targets ?? []) {
-    const startKey = `${t.scope}:${t.scopeId}`;
-    const chain = [{ scope: t.scope, scopeId: Number(t.scopeId) }];
-    const seen = new Set([startKey]);
-    let cursor = chain[0];
-
-    for (let depth = 0; depth < MAX_DEPTH; depth++) {
-      const key = `${cursor.scope}:${cursor.scopeId}`;
-      if (!memo.has(key)) memo.set(key, await parentOf(exec, companyId, cursor.scope, cursor.scopeId));
-      const next = memo.get(key);
-      if (!next) break;
-      const nk = `${next.scope}:${next.scopeId}`;
-      if (seen.has(nk)) break;
-      seen.add(nk);
-      chain.push(next);
-      cursor = next;
+  /**
+   * ONE QUERY PER RUNG, NOT ONE PER TARGET.
+   *
+   * The memo here used to be keyed on the node, which shares the ANCESTORS
+   * between targets but never the targets themselves — so a thousand parts cost
+   * a thousand round trips before the walk even reached the girder they have in
+   * common. On a real bridge order that is over two thousand sequential round
+   * trips inside a single call, and this is on the hot path for the nesting
+   * check, the readiness check and materialization. In practice it did not
+   * merely run slowly: against a managed database it outlived its own
+   * connection, and the caller then waited on a dead socket forever.
+   *
+   * The walk is breadth-first instead. Every node at one level is resolved
+   * together, grouped by scope, one query each — and since the tree is at most
+   * a handful of rungs deep, the whole thing is a dozen queries regardless of
+   * how many parts were asked for.
+   */
+  const parent = new Map(); // "scope:id" -> {scope,scopeId} | null
+  let frontier = list;
+  for (let depth = 0; depth < MAX_DEPTH && frontier.length; depth++) {
+    const byScope = new Map();
+    for (const n of frontier) {
+      const k = `${n.scope}:${n.scopeId}`;
+      if (parent.has(k)) continue;
+      if (!byScope.has(n.scope)) byScope.set(n.scope, new Set());
+      byScope.get(n.scope).add(n.scopeId);
     }
-    out.set(startKey, await withOwnType(exec, companyId, t.scope, t.scopeId, chain.reverse(), seen));
+    if (!byScope.size) break;
+
+    const next = [];
+    for (const [scope, ids] of byScope) {
+      const found = await parentsOfMany(exec, companyId, scope, [...ids]);
+      for (const id of ids) {
+        const p = found.get(id) ?? null;
+        parent.set(`${scope}:${id}`, p);
+        if (p) next.push(p);
+      }
+    }
+    frontier = next;
+  }
+
+  /** Walk one target using only what is already in `parent`. */
+  const climb = (start) => {
+    const chain = [start];
+    const seen = new Set([`${start.scope}:${start.scopeId}`]);
+    let cursor = start;
+    for (let depth = 0; depth < MAX_DEPTH; depth++) {
+      const nxt = parent.get(`${cursor.scope}:${cursor.scopeId}`);
+      if (!nxt) break;
+      const k = `${nxt.scope}:${nxt.scopeId}`;
+      // A cycle is a data error, not something to recurse on.
+      if (seen.has(k)) break;
+      seen.add(k);
+      chain.push(nxt);
+      cursor = nxt;
+    }
+    return { chain: chain.reverse(), seen };
+  };
+
+  // The own-type splice needs each order item's catalog item; that is one query
+  // for all of them rather than one apiece, for the same reason as above.
+  const orderItemIds = [...new Set(list.filter((t) => t.scope === 'order_item').map((t) => t.scopeId))];
+  const ownType = new Map();
+  if (orderItemIds.length) {
+    const [rows] = await exec.query(
+      'SELECT id, catalog_item_id AS catalogItemId FROM fab_items WHERE company_id = ? AND id IN (?)',
+      [companyId, orderItemIds],
+    );
+    for (const r of rows) if (r.catalogItemId) ownType.set(Number(r.id), Number(r.catalogItemId));
+  }
+  // Everything above each of those types, resolved the same breadth-first way.
+  let typeFrontier = [...new Set(ownType.values())].map((id) => ({ scope: 'catalog_item', scopeId: id }));
+  for (let depth = 0; depth < MAX_DEPTH && typeFrontier.length; depth++) {
+    const byScope = new Map();
+    for (const n of typeFrontier) {
+      const k = `${n.scope}:${n.scopeId}`;
+      if (parent.has(k)) continue;
+      if (!byScope.has(n.scope)) byScope.set(n.scope, new Set());
+      byScope.get(n.scope).add(n.scopeId);
+    }
+    if (!byScope.size) break;
+    const next = [];
+    for (const [scope, ids] of byScope) {
+      const found = await parentsOfMany(exec, companyId, scope, [...ids]);
+      for (const id of ids) {
+        const p = found.get(id) ?? null;
+        parent.set(`${scope}:${id}`, p);
+        if (p) next.push(p);
+      }
+    }
+    typeFrontier = next;
+  }
+
+  for (const t of list) {
+    const { chain, seen } = climb(t);
+    out.set(`${t.scope}:${t.scopeId}`, spliceOwnType(t, chain, seen, ownType, parent));
+  }
+  return out;
+}
+
+/**
+ * `withOwnType`, but reading the maps this function already built instead of
+ * querying. Identical rules — see withOwnType for why the type sits where it
+ * does.
+ */
+function spliceOwnType(target, chain, seen, ownType, parent) {
+  if (target.scope !== 'order_item') return chain;
+  const catalogItemId = ownType.get(target.scopeId);
+  if (!catalogItemId) return chain;
+  if (seen.has(`catalog_item:${catalogItemId}`)) return chain;
+
+  const typeChain = [{ scope: 'catalog_item', scopeId: catalogItemId }];
+  let cursor = typeChain[0];
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    const next = parent.get(`${cursor.scope}:${cursor.scopeId}`);
+    if (!next || seen.has(`${next.scope}:${next.scopeId}`)) break;
+    seen.add(`${next.scope}:${next.scopeId}`);
+    typeChain.push(next);
+    cursor = next;
+  }
+  typeChain.reverse();
+
+  const jobRungs = chain.filter((c) => c.scope === 'order_item');
+  const outer = chain.filter((c) => c.scope !== 'order_item');
+  return [...outer, ...typeChain, ...jobRungs];
+}
+
+/**
+ * The parents of many nodes of ONE scope, in one query.
+ *
+ * Mirrors `parentOf` case for case — the precedence inside each rung (a catalog
+ * item prefers its subgroup, then its group, then its category; an order item
+ * prefers its parent item and only falls through to its type at the top of the
+ * tree) is the same, because a batched walk that disagreed with the single walk
+ * would be a second definition of the ladder.
+ */
+async function parentsOfMany(exec, companyId, scope, ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+
+  switch (scope) {
+    case 'stock_piece': {
+      const [rows] = await exec.query(
+        `SELECT id, wip_item_id AS wipItemId, catalog_item_id AS catalogItemId
+           FROM fab_stock_pieces WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id),
+          r.wipItemId ? { scope: 'order_item', scopeId: Number(r.wipItemId) }
+            : r.catalogItemId ? { scope: 'catalog_item', scopeId: Number(r.catalogItemId) }
+              : null);
+      }
+      break;
+    }
+    case 'order_item': {
+      const [rows] = await exec.query(
+        `SELECT id, parent_item_id AS parentItemId, catalog_item_id AS catalogItemId
+           FROM fab_items WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id),
+          r.parentItemId ? { scope: 'order_item', scopeId: Number(r.parentItemId) }
+            : r.catalogItemId ? { scope: 'catalog_item', scopeId: Number(r.catalogItemId) }
+              : null);
+      }
+      break;
+    }
+    case 'catalog_item': {
+      const [rows] = await exec.query(
+        `SELECT id, category_id AS categoryId, group_id AS groupId, subgroup_id AS subgroupId
+           FROM fab_item_catalog WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id),
+          r.subgroupId ? { scope: 'subgroup', scopeId: Number(r.subgroupId) }
+            : r.groupId ? { scope: 'group', scopeId: Number(r.groupId) }
+              : r.categoryId ? { scope: 'category', scopeId: Number(r.categoryId) }
+                : null);
+      }
+      break;
+    }
+    case 'subgroup': {
+      const [rows] = await exec.query(
+        `SELECT id, group_id AS groupId FROM fab_item_subgroups
+          WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id), r.groupId ? { scope: 'group', scopeId: Number(r.groupId) } : null);
+      }
+      break;
+    }
+    case 'group': {
+      const [rows] = await exec.query(
+        `SELECT id, category_id AS categoryId FROM fab_item_groups
+          WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id), r.categoryId ? { scope: 'category', scopeId: Number(r.categoryId) } : null);
+      }
+      break;
+    }
+    default:
+      break;
   }
   return out;
 }

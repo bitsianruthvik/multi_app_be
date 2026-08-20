@@ -125,6 +125,14 @@ export const pool = mysql.createPool({
   // UTC_TIMESTAMP() instead (see fab_erp/routes, fab_erp/services); other apps
   // still use NOW() and are only correct on a UTC server — which is what prod is.
   timezone: "Z",
+  // Managed databases reap connections that look idle, and a long transaction
+  // looks idle between statements. When the far end goes away mid-work the
+  // driver has nothing to notice it by and simply waits — a rebuild of one
+  // large order's task graph sat on a dead socket for forty minutes and then
+  // rolled back with nothing written. TCP keepalive is what makes the socket
+  // fail loudly instead of silently.
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
   ...(useSsl ? { ssl: { minVersion: "TLSv1.2", rejectUnauthorized: true } } : {}),
 });
 

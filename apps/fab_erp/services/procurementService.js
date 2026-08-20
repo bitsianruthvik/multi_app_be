@@ -102,14 +102,39 @@ export async function syncOrderProcurement(conn, companyId, orderId) {
 export async function orderProcurementSplit(companyId, orderId, conn) {
   const exec = conn ?? pool;
 
+  /**
+   * A NEST IS PLATES, NOT PLATES-PER-PART.
+   *
+   * Every link row in one nest carries that nest's PLATE COUNT — the sheet
+   * importer writes `r.plates` onto each of them, and the integrity check reads
+   * the count off whichever link it sees first. So summing qty across the links
+   * multiplies the plates by the number of parts sharing them: a 20-plate nest
+   * of 12 mm with five hundred stiffeners on it asked to buy five hundred
+   * plates. That was invisible while nests held one or two parts each and is
+   * ruinous the moment a real nesting shares a plate properly.
+   *
+   * The demand for a nest is the nest's own plate count, so the rows are
+   * collapsed per nest FIRST and only then summed per item. Rows with no nest
+   * are each their own draw and still sum, which is the un-nested behaviour
+   * exactly as it was.
+   */
   const [buy] = await exec.query(
-    `SELECT fi.catalog_item_id, fic.code, fic.name, fic.unit,
-            COUNT(*) AS lines_count, SUM(fi.qty) AS qty, SUM(fi.total_weight) AS total_weight
-       FROM fab_items fi
-       LEFT JOIN fab_item_catalog fic ON fic.id = fi.catalog_item_id
-      WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
-        AND COALESCE(fi.procurement_type, ?) = 'buy'
-      GROUP BY fi.catalog_item_id, fic.code, fic.name, fic.unit
+    `SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
+            SUM(t.lines_count) AS lines_count, SUM(t.qty) AS qty,
+            SUM(t.total_weight) AS total_weight
+       FROM (
+         SELECT fi.catalog_item_id,
+                COUNT(*) AS lines_count,
+                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty) ELSE MAX(fi.qty) END AS qty,
+                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.total_weight)
+                     ELSE MAX(fi.total_weight) END AS total_weight
+           FROM fab_items fi
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND COALESCE(fi.procurement_type, ?) = 'buy'
+          GROUP BY fi.catalog_item_id, fi.nest_no
+       ) t
+       LEFT JOIN fab_item_catalog fic ON fic.id = t.catalog_item_id
+      GROUP BY t.catalog_item_id, fic.code, fic.name, fic.unit
       ORDER BY fic.code`,
     [companyId, orderId, DEFAULT_PROCUREMENT],
   );
@@ -122,14 +147,20 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
   // (fab_items.length/width and `height` = thickness on the material link), and
   // they are the thing that has to be matched against the yard.
   const [buySizes] = await exec.query(
-    `SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
-            COUNT(*) AS lines_count, SUM(fi.qty) AS qty
-       FROM fab_items fi
-      WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
-        AND COALESCE(fi.procurement_type, ?) = 'buy'
-        AND fi.catalog_item_id IS NOT NULL
-      GROUP BY fi.catalog_item_id, fi.length, fi.width, fi.height
-      ORDER BY fi.catalog_item_id, fi.length, fi.width`,
+    `SELECT t.catalog_item_id, t.length, t.width, t.height,
+            SUM(t.lines_count) AS lines_count, SUM(t.qty) AS qty
+       FROM (
+         SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
+                COUNT(*) AS lines_count,
+                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty) ELSE MAX(fi.qty) END AS qty
+           FROM fab_items fi
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND COALESCE(fi.procurement_type, ?) = 'buy'
+            AND fi.catalog_item_id IS NOT NULL
+          GROUP BY fi.catalog_item_id, fi.length, fi.width, fi.height, fi.nest_no
+       ) t
+      GROUP BY t.catalog_item_id, t.length, t.width, t.height
+      ORDER BY t.catalog_item_id, t.length, t.width`,
     [companyId, orderId, DEFAULT_PROCUREMENT],
   );
 

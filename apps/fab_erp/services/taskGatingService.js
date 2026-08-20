@@ -336,6 +336,13 @@ export async function reevaluateStockGatedTasks(conn, companyId, catalogItemIds)
  * default-BOM→binding), then additionally writes fab_task_inputs from each
  * step's fab_operation_flow_step_inputs and gates first-step eligibility.
  */
+/** Split rows into batches small enough for one multi-row INSERT. */
+const chunkRows = (rows, n) => {
+  const out = [];
+  for (let i = 0; i < rows.length; i += n) out.push(rows.slice(i, i + n));
+  return out;
+};
+
 export async function materializeOrderTasks(conn, companyId, orderId) {
   const [items] = await conn.query(
     // `qty` is load-bearing and was missing until 2026-08-15: without it
@@ -399,6 +406,18 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       stepsByFlowId.get(s.flow_id).push(s);
       allStepIds.push(s.id);
     }
+  }
+
+  /**
+   * The lowest seq_no in each flow — i.e. which step has nothing before it.
+   *
+   * Read from the flow rather than assumed to be 1: a flow whose first step was
+   * deleted starts at 2, and treating "seq_no === 1" as "first" would then
+   * leave every task in it blocked forever with no first step to open.
+   */
+  const minSeqByFlowId = new Map();
+  for (const [fid, steps] of stepsByFlowId) {
+    minSeqByFlowId.set(fid, Math.min(...steps.map((s) => s.seq_no)));
   }
 
   // step inputs, keyed by flow_step_id
@@ -507,7 +526,29 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   const existingStepKeys = new Set(existingRows.map((r) => `${r.item_id}:${r.flow_step_id}`));
 
   let itemsProcessed = 0, itemsSkipped = 0, tasksInserted = 0;
-  const insertedTaskIds = [];
+
+  /**
+   * COLLECTED FIRST, WRITTEN IN BATCHES.
+   *
+   * This loop used to INSERT each task and each of its inputs as it went. One
+   * round trip per row is invisible on the twenty-task orders it was written
+   * against and fatal on a real one: a two-span bridge is 1,258 items and about
+   * twelve thousand tasks, so raising its production order was some sixty
+   * thousand sequential round trips to a cloud database — over an hour, and in
+   * practice the connection was closed under it before it finished, which
+   * rolled back the whole thing with nothing to show.
+   *
+   * So the rows are built in memory and written in chunks. Task ids cannot come
+   * from insertId — TiDB hands out auto-increment in per-node batches, so a
+   * bulk insert's rows are not reliably contiguous — and are read back on the
+   * (item_id, flow_step_id) pair that already identifies a task uniquely and
+   * that this function's own idempotency is keyed on.
+   */
+  /** Lives exactly as long as this materialization. See evaluateFormula. */
+  const machinePropsCache = new Map();
+  const taskRows = [];      // [companyId, orderId, itemId, flowId, stepId, opId, seq, deps, rtId, hours, setup, qty]
+  const inputPlans = [];    // {itemId, stepId, cols, values}  — task_id filled after read-back
+  const firstSteps = [];    // {itemId, stepId} — the only tasks that can clear on a fresh order
 
   for (const item of items) {
     const flowId = flowOf(item);
@@ -543,6 +584,8 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
                 partChildren: childPartsByParent.get(item.id) ?? [],
                 valuesByItemId: itemMetricsById,
               }),
+              // One query per resource TYPE for this run, not one per task.
+              machinePropsCache,
             ),
             op.time_unit,
           )
@@ -562,22 +605,23 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
         ? Number(op.setup_minutes) / 60
         : null;
 
-      // insert task as 'blocked' first; clear at the end once inputs exist
-      const [ins] = await conn.query(
-        `INSERT INTO fab_project_tasks
-           (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
-            seq_no, depends_on, resource_type_id, status, computed_hours, setup_hours, task_qty)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?, ?)`,
-        [companyId, orderId, item.id, flowId, step.id, step.operation_id,
-         step.seq_no, step.depends_on, resourceTypeId, computedHours, setupHours,
-         // Snapshotted, not joined at read time: a BOM quantity edited later
-         // must not silently move the estimate under a plan already committed.
-         // Re-materialization is the deliberate way to pick up a change.
-         item.qty ?? 1],
-      );
-      const taskId = ins.insertId;
+      // Queued as 'blocked'; the clear pass at the end opens what it can.
+      taskRows.push([companyId, orderId, item.id, flowId, step.id, step.operation_id,
+        step.seq_no, step.depends_on, resourceTypeId, computedHours, setupHours,
+        // Snapshotted, not joined at read time: a BOM quantity edited later
+        // must not silently move the estimate under a plan already committed.
+        // Re-materialization is the deliberate way to pick up a change.
+        item.qty ?? 1]);
       tasksInserted++;
-      insertedTaskIds.push({ taskId, seq_no: step.seq_no, hasDeps: !!(step.depends_on && String(step.depends_on).trim()) });
+
+      // A task can only become eligible if nothing precedes it, and on a fresh
+      // materialization every task is 'blocked' — so a step with an earlier
+      // sibling can never clear here and asking costs three queries to be told
+      // no. Only genuine first steps are offered to the clear pass.
+      if (!(step.depends_on && String(step.depends_on).trim())
+          && step.seq_no === (minSeqByFlowId.get(flowId) ?? step.seq_no)) {
+        firstSteps.push({ itemId: item.id, stepId: step.id });
+      }
 
       // materialize inputs for this step
       const stepInputs = inputsByStepId.get(step.id) ?? [];
@@ -590,44 +634,82 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
           if (rms.length) {
             for (const rm of rms) {
               if (rm.catalog_item_id == null) continue;
-              await conn.query(
-                `INSERT INTO fab_task_inputs (company_id, task_id, order_id, input_role, ref_catalog_item_id, qty, unit, gate)
-                 VALUES (?, ?, ?, 'raw_material', ?, ?, ?, ?)`,
-                [companyId, taskId, orderId, rm.catalog_item_id, rm.qty ?? null, si.unit ?? null, si.gate],
-              );
+              inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+                values: ['raw_material', rm.catalog_item_id, rm.qty ?? null, si.unit ?? null, si.gate] });
             }
           } else if (item.catalog_item_id != null) {
-            await conn.query(
-              `INSERT INTO fab_task_inputs (company_id, task_id, order_id, input_role, ref_catalog_item_id, qty, unit, gate)
-               VALUES (?, ?, ?, 'raw_material', ?, ?, ?, ?)`,
-              [companyId, taskId, orderId, item.catalog_item_id, null, si.unit ?? null, si.gate],
-            );
+            inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+              values: ['raw_material', item.catalog_item_id, null, si.unit ?? null, si.gate] });
           }
         } else if (si.ref_bom_role === 'child_parts') {
           const kids = childPartsByParent.get(item.id) ?? [];
           for (const kid of kids) {
-            await conn.query(
-              `INSERT INTO fab_task_inputs (company_id, task_id, order_id, input_role, producing_item_id, gate)
-               VALUES (?, ?, ?, 'component', ?, ?)`,
-              [companyId, taskId, orderId, kid.id, si.gate],
-            );
+            inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'component',
+              values: [kid.id, si.gate] });
           }
         } else if (si.ref_catalog_item_id != null) {
-          await conn.query(
-            `INSERT INTO fab_task_inputs (company_id, task_id, order_id, input_role, ref_catalog_item_id, qty, unit, gate)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [companyId, taskId, orderId, si.input_role, si.ref_catalog_item_id, si.qty ?? null, si.unit ?? null, si.gate],
-          );
+          inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+            values: [si.input_role, si.ref_catalog_item_id, si.qty ?? null, si.unit ?? null, si.gate] });
         }
       }
     }
     itemsProcessed++;
   }
 
+  // ── write the tasks, then find out what ids they got ─────────────────────
+  const taskIdByKey = new Map();
+  for (const group of chunkRows(taskRows, 500)) {
+    await conn.query(
+      `INSERT INTO fab_project_tasks
+         (company_id, order_id, item_id, flow_id, flow_step_id, operation_id,
+          seq_no, depends_on, resource_type_id, computed_hours, setup_hours, task_qty)
+       VALUES ?`,
+      [group],
+    );
+  }
+  if (taskRows.length) {
+    const [back] = await conn.query(
+      `SELECT id, item_id, flow_step_id FROM fab_project_tasks
+        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+      [companyId, orderId],
+    );
+    for (const r of back) taskIdByKey.set(`${r.item_id}:${r.flow_step_id}`, r.id);
+  }
+
+  // ── then the inputs, now that every task has an id ────────────────────────
+  const catalogInputs = [];
+  const componentInputs = [];
+  for (const p of inputPlans) {
+    const taskId = taskIdByKey.get(`${p.itemId}:${p.stepId}`);
+    if (!taskId) continue; // the task was already materialized on an earlier run
+    if (p.kind === 'catalog') {
+      const [role, refId, qty, unit, gate] = p.values;
+      catalogInputs.push([companyId, taskId, orderId, role, refId, qty, unit, gate]);
+    } else {
+      const [producingItemId, gate] = p.values;
+      componentInputs.push([companyId, taskId, orderId, 'component', producingItemId, gate]);
+    }
+  }
+  for (const group of chunkRows(catalogInputs, 500)) {
+    await conn.query(
+      `INSERT INTO fab_task_inputs
+         (company_id, task_id, order_id, input_role, ref_catalog_item_id, qty, unit, gate) VALUES ?`,
+      [group],
+    );
+  }
+  for (const group of chunkRows(componentInputs, 500)) {
+    await conn.query(
+      `INSERT INTO fab_task_inputs
+         (company_id, task_id, order_id, input_role, producing_item_id, gate) VALUES ?`,
+      [group],
+    );
+  }
+
   // clear first steps whose inputs are already available
   let cleared = 0;
-  for (const { taskId } of insertedTaskIds) {
-    if (await tryClearTask(conn, companyId, taskId)) cleared++;
+  for (const fs of firstSteps) {
+    const taskId = taskIdByKey.get(`${fs.itemId}:${fs.stepId}`);
+    if (taskId && await tryClearTask(conn, companyId, taskId)) cleared++;
   }
 
   return { ok: true, itemsProcessed, itemsSkipped, tasksInserted, cleared };

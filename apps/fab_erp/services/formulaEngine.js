@@ -153,6 +153,22 @@ export async function evaluateFormula(
   resourceTypeId = null,
   opValues = {},
   inputCtx = null,
+  /**
+   * Optional Map<resourceTypeId, rows> the CALLER owns, for when this is being
+   * evaluated in a loop.
+   *
+   * One evaluation costs one query for the machine properties, which is
+   * nothing on its own and is why it was written this way. Materializing an
+   * order calls this once per task, and on a real bridge order that is twelve
+   * thousand queries for the fourteen distinct answers the shop has — enough
+   * that raising a production order outlived its own database connection.
+   *
+   * Deliberately caller-owned and NOT a module-level cache: a cache that
+   * outlives the call would keep serving a machine property somebody has since
+   * edited, forever, in a long-running server. This one lives exactly as long
+   * as the loop that made it. Omit it and the behaviour is unchanged.
+   */
+  machinePropsCache = null,
 ) {
   if (!formula || typeof formula !== 'string') return null;
 
@@ -160,13 +176,18 @@ export async function evaluateFormula(
     // Load machine.* properties for the given resource type
     let machineProps = [];
     if (resourceTypeId) {
-      const [rows] = await pool.query(
-        `SELECT property_key, default_value
-           FROM fab_resource_type_properties
-          WHERE resource_type_id = ? AND deleted_at IS NULL`,
-        [resourceTypeId],
-      );
-      machineProps = rows;
+      if (machinePropsCache?.has(resourceTypeId)) {
+        machineProps = machinePropsCache.get(resourceTypeId);
+      } else {
+        const [rows] = await pool.query(
+          `SELECT property_key, default_value
+             FROM fab_resource_type_properties
+            WHERE resource_type_id = ? AND deleted_at IS NULL`,
+          [resourceTypeId],
+        );
+        machineProps = rows;
+        machinePropsCache?.set(resourceTypeId, rows);
+      }
     }
 
     // Build evaluation scope with underscore-prefixed keys

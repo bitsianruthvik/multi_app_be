@@ -124,7 +124,9 @@ const plate = (mm) => ({
  * prep and welding formulas want.
  */
 const RAW_MATERIALS = [
-  plate(16), plate(20), plate(28), plate(32), plate(40), plate(45),
+  // 12 and 25 come from the KEPL ROB BOQ — its stiffeners are 12 mm and its
+  // top flanges and splice plates 25 mm, neither of which the old tenant stocked.
+  plate(12), plate(16), plate(20), plate(25), plate(28), plate(32), plate(40), plate(45),
   {
     name: 'ISA 100x100x10 E350 B0',
     cat: 'rm', group: 'met', unit: 'pcs', proc: 'buy', mrp: 'lot_for_lot',
