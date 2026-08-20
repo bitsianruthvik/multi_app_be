@@ -223,9 +223,28 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
          * `...-1-TF1`. Appending an index to a thing there is only one of reads
          * as though a second is expected, and it would not match any code
          * already in the system.
+         *
+         * THE INDEX GOES BEFORE THE SLASH, NOT AFTER IT.
+         *
+         * A '/' suffix is what routes an item to a different flow: '/D' means
+         * drilled, and `flowAllocationService.pickRule` matches suffixes
+         * EXACTLY. Appending the index blindly turned 'BS/D' at qty 2 into
+         * 'BS/D1', whose suffix reads '/D1', which no rule names — so the
+         * drilled part was silently given the PLAIN flow and never drilled.
+         * Numbering the part rather than the variant ('BS1/D', 'BS2/D') keeps
+         * the suffix intact and still tells the two apart.
+         *
+         * This never bit the old data only because every drilled line there
+         * happened to be qty 1.
          */
+        const numbered = (segment) => {
+          const slash = segment.indexOf('/');
+          return slash === -1
+            ? `${segment}${i}`
+            : `${segment.slice(0, slash)}${i}${segment.slice(slash)}`;
+        };
         const seg = line.codeSegment != null
-          ? (qty === 1 ? line.codeSegment : `${line.codeSegment}${i}`)
+          ? (qty === 1 ? line.codeSegment : numbered(line.codeSegment))
           : String(i);
         const childCode = `${code}-${seg}`;
 
