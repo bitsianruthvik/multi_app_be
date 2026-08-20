@@ -173,10 +173,28 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
     }
 
     if (plateL == null || plateW == null) {
+      /**
+       * SAY WHICH OF THE TWO STATES THIS IS.
+       *
+       * This fires for every link without dimensions, nested or not, and the
+       * old sentence described both as "the plate has no size". For a part
+       * that simply has not been laid onto a plate yet, that reads as a data
+       * fault when the honest answer is "not nested yet" — and since a fresh
+       * order has every part in that state, it produced one alarming line per
+       * part on an order where nothing was actually wrong.
+       *
+       * Both remain BLOCKING: you cannot cost or cut a plate of unknown size
+       * either way. Only the explanation changes, and with it whether the
+       * reader knows what to do next.
+       */
       add(ISSUE.MISSING_PLATE_DIMS, {
         ...where,
-        message: `The plate for ${l.partName} (${l.materialCode}${l.nestNo ? `, nest ${l.nestNo}` : ''}) `
-               + 'has no size, so nothing can check the part fits or buy the right plate.',
+        message: l.nestNo
+          ? `The plate for ${l.partName} (${l.materialCode}, nest ${l.nestNo}) has no size, `
+            + 'so nothing can check the part fits or buy the right plate.'
+          : `${l.partName} is not on a nest yet, and no sized stock of ${l.materialCode} `
+            + 'is on hand to assume a plate size from — so nothing can check it fits '
+            + 'or buy the right plate.',
       });
     } else if (partL != null && partW != null && !fitsWithin(partL, partW, plateL, plateW, tol)) {
       add(ISSUE.PART_TOO_BIG, {

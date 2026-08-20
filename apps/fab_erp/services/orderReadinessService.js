@@ -84,10 +84,29 @@ const PREPARATION_STAGES = STAGE_KEYS;
  * PARTIAL rather than todo once some purchase orders exist, so a half-finished
  * step reads as half-finished.
  */
+/**
+ * How many BOM rows this order has at all.
+ *
+ * The distinction both summarisers below need: an order with NO rows has had
+ * no decision made about it, while an order whose every row is make (or every
+ * row is buy) has. Collapsing the two is what let the two step rails assert
+ * opposite things — "made entirely in-house" and "entirely bought in" — about
+ * the same empty order at the same time.
+ */
+async function bomRowCount(companyId, orderId) {
+  const [[r]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  return Number(r?.n) || 0;
+}
+
 async function summariseProcurement(companyId, orderId) {
-  const [short, pos] = await Promise.all([
+  const [short, pos, bomRows] = await Promise.all([
     orderShortfall(companyId, orderId),
     procurementForOrder(companyId, orderId),
+    bomRowCount(companyId, orderId),
   ]);
 
   const needed = short.lines.length;
@@ -95,9 +114,19 @@ async function summariseProcurement(companyId, orderId) {
   const covered = needed - stillShort;
 
   let state = 'done';
-  let detail = needed === 0
-    ? 'Nothing to buy — this order is made entirely in-house'
-    : `All ${needed} bought-in item(s) covered by stock or on order`;
+  // An empty order and an all-make order both yield needed === 0, and they are
+  // not the same thing. Saying 'made entirely in-house' about an order with no
+  // BOM at all states something nobody has decided yet, and it used to sit
+  // directly opposite the production rail claiming the order was entirely
+  // bought in — two contradictory sentences about the same empty order.
+  let detail;
+  if (needed === 0) {
+    detail = bomRows === 0
+      ? 'Nothing in this order yet'
+      : 'Nothing to buy — every row is made here';
+  } else {
+    detail = `All ${needed} bought-in item(s) covered by stock or on order`;
+  }
 
   if (stillShort > 0) {
     state = pos.length > 0 ? 'partial' : 'todo';
@@ -151,11 +180,14 @@ async function summariseProduction(companyId, orderId) {
     [companyId, orderId],
   );
   const makeItems = Number(items?.make_items) || 0;
+  const bomRows = await bomRowCount(companyId, orderId);
 
   if (makeItems === 0 && makeTasks === 0) {
     return {
       state: 'done', claimed: 0, makeTasks: 0, makeItems: 0,
-      detail: 'Nothing to make — this order is entirely bought in',
+      detail: bomRows === 0
+        ? 'Nothing in this order yet'
+        : 'Nothing to make — every row is bought in',
     };
   }
   if (makeTasks === 0) {
@@ -315,7 +347,7 @@ export async function orderReadiness(companyId, orderId) {
       state: tasks > 0 ? 'done' : 'todo',
       count: tasks,
       total: tasks,
-      detail: tasks > 0 ? `${tasks} task(s) built` : 'Not built yet',
+      detail: tasks > 0 ? `${tasks} task(s) built` : 'Built when the production order is raised',
     },
     /**
      * The two steps that follow a finished tree: buy what we do not have, and

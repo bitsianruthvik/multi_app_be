@@ -296,6 +296,34 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
       }
     }
 
+    /**
+     * The SECOND gate, and the one Procurement has always had: parts that
+     * cannot physically be cut.
+     *
+     * Procurement refused to buy against broken nesting while Production
+     * happily built tasks against the identical errors — same facts, opposite
+     * answers, and the production side is the one that puts work on a shop
+     * floor. Enforced HERE rather than only in the client because the Production
+     * tab needs `fab_erp_projects_view` while the integrity read needs
+     * `fab_erp_inventory_view`, so a projects-only user fell straight through a
+     * client-side check, as does any other caller of this endpoint.
+     *
+     * Same `{force:true}` escape as the gate above, so a shop that knows better
+     * is never trapped.
+     */
+    if (!req.body?.force && !req.body?.ignoreNesting) {
+      const nesting = await checkOrderNesting(c.companyId, orderId);
+      const blocking = blockingIssues(nesting);
+      if (blocking.length > 0) {
+        return res.status(409).json({
+          code: 'NESTING_INVALID',
+          message: `${blocking.length} problem(s) would make this order impossible to cut. `
+            + 'Building tasks against it would put work on the floor for parts nobody can make.',
+          detail: { blocking },
+        });
+      }
+    }
+
     const mo = await ensureProductionOrder(c.companyId, orderId, { createdBy: c.user?.id ?? null });
     // rollUpOrderStatus refreshes the production order and then mirrors it onto
     // the sales order — one call keeps both right.

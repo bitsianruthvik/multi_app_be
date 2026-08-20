@@ -312,12 +312,21 @@ router.post('/stock/receive', protect, async (req, res) => {
       uom: b.uom ?? null,
       unit_cost: b.unitCost ?? null,
       notes: b.notes ?? null,
+      // length_mm/width_mm ride along with the receipt itself rather than being
+      // written afterwards through /fields/values. The service has always
+      // accepted them; this map used to drop them, which forced the frontend to
+      // record a plate's size in a second call — one that needs
+      // `fab_erp_items_meta_manage`, a tag the `stores` role does not hold. So
+      // the one person actually doing goods-in could not record the one fact
+      // that decides whether the plate can ever be matched to a nest.
       pieces: pieces.map((p) => ({
         qty: Number(p.qty),
         batch_no: p.batchNo ?? null,
         heat_no: p.heatNo ?? null,
         serial_no: p.serialNo ?? null,
         mark_no: p.markNo ?? null,
+        length_mm: p.lengthMm ?? p.length_mm ?? null,
+        width_mm: p.widthMm ?? p.width_mm ?? null,
       })),
     });
     return res.status(200).json(result);

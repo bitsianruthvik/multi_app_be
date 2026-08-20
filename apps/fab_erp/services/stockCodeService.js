@@ -64,9 +64,15 @@ export async function ensurePieceCode(conn, companyId, pieceId) {
  * backfill runs over every piece a company owns and doing that a round trip at
  * a time is the difference between a second and a minute.
  *
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeDeleted] also code SOFT-DELETED pieces. Off by
+ *   default because the live paths never want them, but a backfill does: a
+ *   deleted piece is still named by the ledger rows that recorded its life, and
+ *   `code_active` (`if(deleted_at is null, code, null)`) means giving it one
+ *   cannot collide with anything live.
  * @returns {Promise<{ codes: Map<number,string>, minted: number }>}
  */
-export async function ensurePieceCodes(conn, companyId, pieceIds) {
+export async function ensurePieceCodes(conn, companyId, pieceIds, { includeDeleted = false } = {}) {
   const ids = [...new Set((pieceIds ?? []).map(Number).filter(Boolean))];
   const codes = new Map();
   if (!ids.length) return { codes, minted: 0 };
@@ -74,7 +80,8 @@ export async function ensurePieceCodes(conn, companyId, pieceIds) {
 
   const [rows] = await exec.query(
     `SELECT id, code FROM fab_stock_pieces
-      WHERE company_id = ? AND deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
+      WHERE company_id = ?${includeDeleted ? '' : ' AND deleted_at IS NULL'}
+        AND id IN (${ids.map(() => '?').join(',')})`,
     [companyId, ...ids],
   );
 
@@ -94,12 +101,19 @@ export async function ensurePieceCodes(conn, companyId, pieceIds) {
   return { codes, minted };
 }
 
-/** Every live piece of this company that still has no code. */
-export async function uncodedPieces(companyId, conn = null) {
+/**
+ * Every live piece of this company that still has no code.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeDeleted] include soft-deleted pieces too — see
+ *   ensurePieceCodes. Only a backfill asks for this.
+ */
+export async function uncodedPieces(companyId, conn = null, { includeDeleted = false } = {}) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
     `SELECT id FROM fab_stock_pieces
-      WHERE company_id = ? AND deleted_at IS NULL AND (code IS NULL OR code = '')
+      WHERE company_id = ?${includeDeleted ? '' : ' AND deleted_at IS NULL'}
+        AND (code IS NULL OR code = '')
       ORDER BY id`,
     [companyId],
   );

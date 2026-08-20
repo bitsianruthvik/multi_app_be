@@ -39,16 +39,30 @@ import { setFields } from './fieldService.js';
 import { logger } from '../../../core/utils/logger.js';
 
 /**
- * The ledger's batch_code is a display string, not a key. Fall back through the
- * traceability fields so a row always says something useful about which physical
- * piece it was; 'N/A' only when the piece carries no identity at all.
+ * A BATCH and a PIECE are not the same thing, and the ledger has a column for
+ * each (BUG-19, 2026-08-20).
+ *
+ *   batch_code  the LOT this quantity came off — one mill batch becomes many
+ *               plates, so many pieces share one batch_code.
+ *   piece_code  the ONE physical thing this row is about — `SP-000010`.
+ *               Denormalised on purpose: a ledger is history and must keep
+ *               reading correctly after the piece is consumed or deleted.
+ *
+ * This used to fall through `code || batch_no || serial_no || heat_no ||
+ * mark_no || 'N/A'` into `batch_code`, which meant a receipt wrote the PIECE's
+ * code (`SP-000010`) into the BATCH column while `piece_code` stayed NULL —
+ * so a row claimed a batch that never existed, every piece looked like its own
+ * batch, and nothing could group a receipt by the lot it arrived on.
+ *
+ * So: the batch column carries the batch and nothing else. NULL when the
+ * receipt named no batch — which is the truth, and better than a stand-in the
+ * next reader would have to know to distrust. `serial_no`, `heat_no` and
+ * `mark_no` each already have their own column on the row; they were never
+ * batches and do not belong here.
  */
-function displayBatchCode(piece) {
-  // The piece's own code leads now that every piece gets one: it names exactly
-  // this piece, where a batch or heat number names the lot it came from. The
-  // supplier-supplied fields stay ahead of nothing and behind the code, and
-  // 'N/A' survives only for rows written before codes existed.
-  return piece.code || piece.batch_no || piece.serial_no || piece.heat_no || piece.mark_no || 'N/A';
+function batchIdentity(piece) {
+  const b = piece?.batch_no;
+  return b === '' || b == null ? null : b;
 }
 
 /**
@@ -198,12 +212,12 @@ export async function receiveStock(companyId, input, outerConn = null) {
       await conn.query(
         `INSERT INTO fab_stock_ledger
            (company_id, catalog_item_id, plant_id, stock_location_id, batch_id,
-            batch_code, piece_id, batch_no, serial_no, heat_no, mark_no,
+            batch_code, piece_id, piece_code, batch_no, serial_no, heat_no, mark_no,
             txn_type, qty, unit_cost, txn_date)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'stock_in', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'stock_in', ?, ?, ?)`,
         [
           companyId, catalogItemId, plantId, stockLocationId,
-          displayBatchCode({ ...piece, code }), pieceId,
+          batchIdentity(piece), pieceId, code,
           batchNo, serialNo, heatNo, markNo,
           qty, unitCost, receivedDate,
         ],

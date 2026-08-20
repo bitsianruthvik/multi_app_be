@@ -283,7 +283,30 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
           break;
         }
         case 'date': date = String(raw).slice(0, 10); break;
-        case 'bool': num = (raw === true || raw === 1 || String(raw).toLowerCase() === 'true') ? 1 : 0; break;
+        /**
+         * ACCEPT EXACTLY WHAT THE VALIDATOR ACCEPTS.
+         *
+         * `fieldVocabulary.validateFieldValue` takes yes/true/1/y and
+         * canonicalises to the string 'yes'. This branch used to take only
+         * true/1/'true', so a value the validator had just PASSED was written
+         * as its opposite — silently, with nothing rejected to look at.
+         *
+         * That is not hypothetical: every seeded `consumable` value is the
+         * string 'yes', and one importer run flipped five whole categories to
+         * consumable = false. Nothing noticed because the live reader still
+         * used the legacy table; the day it moves over, issuing material for
+         * those categories would have hard-blocked.
+         *
+         * An unrecognised value is refused rather than quietly falsed — the
+         * old expression treated 'no', 'banana' and a typo identically.
+         */
+        case 'bool': {
+          const t = String(raw).trim().toLowerCase();
+          if (raw === true || raw === 1 || ['yes', 'true', '1', 'y'].includes(t)) { num = 1; break; }
+          if (raw === false || raw === 0 || ['no', 'false', '0', 'n'].includes(t)) { num = 0; break; }
+          rejected.push({ fieldKey, why: `"${raw}" must be yes or no` });
+          continue;
+        }
         default: {
           const n = Number(raw);
           if (!Number.isFinite(n)) { rejected.push({ fieldKey, why: `"${raw}" is not a number` }); continue; }

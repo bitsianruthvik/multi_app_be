@@ -35,6 +35,7 @@ import { isConsumable } from './itemFieldService.js';
 import { fieldMatchSql } from './fieldService.js';
 import { piecesHeldByOthers, piecesReservedFor } from './availabilityService.js';
 import { movePiece } from './stockMovementService.js';
+import { ensurePieceCode } from './stockCodeService.js';
 
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
@@ -76,7 +77,19 @@ export async function availableQty(conn, companyId, catalogItemId) {
   return Number(r?.q) || 0;
 }
 
-async function writeLedger(conn, companyId, { catalogItemId, plantId, stockLocationId, txnType, qty, batchCode = 'WIP', notes = null }) {
+/**
+ * One audit row.
+ *
+ * `pieceId` / `pieceCode` say WHICH physical thing this movement was about;
+ * `batchCode` says which mill LOT the quantity came off. They are different
+ * questions and they get different columns (BUG-19, 2026-08-20). This used to
+ * default `batchCode` to the literal string `'WIP'` — which is not a batch, is
+ * not a piece, and grouped every work-in-process movement in the system under
+ * one imaginary lot. A row that cannot name its batch now leaves the column
+ * NULL and names its PIECE instead, which is the thing the reader actually
+ * wanted.
+ */
+async function writeLedger(conn, companyId, { catalogItemId, plantId, stockLocationId, txnType, qty, batchCode = null, pieceId = null, pieceCode = null, notes = null }) {
   // Throw, do not return. This used to skip quietly when a piece carried no
   // plant or location — but the caller has ALREADY decremented that piece by the
   // time it gets here, so skipping turned a data-quality problem into stock that
@@ -93,9 +106,11 @@ async function writeLedger(conn, companyId, { catalogItemId, plantId, stockLocat
   }
   await conn.query(
     `INSERT INTO fab_stock_ledger
-       (company_id, catalog_item_id, plant_id, stock_location_id, batch_id, batch_code, txn_type, qty, txn_date, notes)
-     VALUES (?, ?, ?, ?, 0, ?, ?, ?, CURDATE(), ?)`,
-    [companyId, catalogItemId, plantId, stockLocationId, batchCode, txnType, qty, notes],
+       (company_id, catalog_item_id, plant_id, stock_location_id, batch_id, batch_code,
+        piece_id, piece_code, txn_type, qty, txn_date, notes)
+     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, CURDATE(), ?)`,
+    [companyId, catalogItemId, plantId, stockLocationId, batchCode || null,
+      pieceId ?? null, pieceCode ?? null, txnType, qty, notes],
   );
 }
 
@@ -275,7 +290,7 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
   ];
 
   const [pieces] = await conn.query(
-    `SELECT p.id, p.qty, p.plant_id, p.stock_location_id, p.batch_no
+    `SELECT p.id, p.code, p.qty, p.plant_id, p.stock_location_id, p.batch_no
        FROM fab_stock_pieces p
        ${match.join}
       WHERE p.company_id = ? AND p.catalog_item_id = ? AND p.status = 'in_stock'
@@ -306,9 +321,17 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
       `UPDATE fab_stock_pieces SET qty = ?, status = ? WHERE id = ?`,
       [newQty, newQty <= EPS ? 'consumed' : 'in_stock', p.id],
     );
+    // The consumption knows exactly which plate it took, so the row says so.
+    // It used to record only `batch_code` — the plate's batch when it had one
+    // and the literal 'WIP' when it did not — leaving `piece_id` NULL, so a
+    // ledger of 26 issues could not name a single piece it had issued.
+    // `ensurePieceCode` covers a piece that predates codes: a movement is
+    // exactly the moment something needs naming.
     await writeLedger(conn, companyId, {
       catalogItemId, plantId: p.plant_id, stockLocationId: p.stock_location_id,
-      txnType, qty: -take, batchCode: p.batch_no || 'WIP', notes,
+      txnType, qty: -take, batchCode: p.batch_no || null,
+      pieceId: p.id, pieceCode: p.code || await ensurePieceCode(conn, companyId, p.id),
+      notes,
     });
 
     /**
@@ -484,19 +507,23 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
       );
       if (!existing) {
         const qty = Number(node.qty) || 1;
-        await conn.query(
+        // On the caller's connection: the code is part of the task-start
+        // transaction, so a start that fails leaves neither a piece nor a gap.
+        const wipCode = await generateCode(companyId, 'stock_piece', {}, conn);
+        const [opened] = await conn.query(
           `INSERT INTO fab_stock_pieces
              (company_id, code, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'wip', ?, ?)`,
-          // On the caller's connection: the code is part of the task-start
-          // transaction, so a start that fails leaves neither a piece nor a gap.
-          [companyId, await generateCode(companyId, 'stock_piece', {}, conn),
+          [companyId, wipCode,
            node.catalog_item_id, machine.plant_id, wipLoc, qty, node.unit || null, node.id,
            `WIP order ${node.order_id} item ${node.id}`],
         );
         await writeLedger(conn, companyId, {
           catalogItemId: node.catalog_item_id, plantId: machine.plant_id, stockLocationId: wipLoc,
           txnType: 'wip_open', qty,
+          // The piece is one statement old and already coded — there is no
+          // excuse for the row that opens it not to say which one it opened.
+          pieceId: opened.insertId, pieceCode: wipCode,
         });
       }
     }
@@ -554,10 +581,15 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
   const plannedQty = Number(node.qty) || 1;
 
   const [[piece]] = await conn.query(
-    `SELECT id, catalog_item_id, qty, plant_id, stock_location_id, status FROM fab_stock_pieces
+    `SELECT id, code, catalog_item_id, qty, plant_id, stock_location_id, status FROM fab_stock_pieces
       WHERE company_id = ? AND wip_item_id = ? AND deleted_at IS NULL LIMIT 1`,
     [companyId, node.id],
   );
+  // Every ledger row below is about THIS piece, so resolve its code once.
+  // `ensurePieceCode` covers a WIP piece opened before codes existed.
+  const pieceCode = piece
+    ? (piece.code || await ensurePieceCode(conn, companyId, piece.id))
+    : null;
 
   // Good units to receive; default = the whole piece/planned qty (back-compat).
   const goodQty = opts.goodQty != null ? Math.max(0, Number(opts.goodQty))
@@ -578,7 +610,11 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
     if (scrapQty > EPS && plantId && scrapLoc) {
       await writeLedger(conn, companyId, {
         catalogItemId: node.catalog_item_id, plantId, stockLocationId: scrapLoc,
-        txnType: 'scrap', qty: -scrapQty, notes: `scrap at item ${node.id} (task ${task.id})`,
+        txnType: 'scrap', qty: -scrapQty,
+        // The piece the scrap came off, when there was one. In the
+        // no-WIP-piece branch below there genuinely is none, and NULL says so.
+        pieceId: piece?.id ?? null, pieceCode,
+        notes: `scrap at item ${node.id} (task ${task.id})`,
       });
     }
   };
@@ -594,6 +630,7 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
           catalogItemId: piece.catalog_item_id, plantId: plantId ?? piece.plant_id,
           stockLocationId: targetLoc ?? piece.stock_location_id,
           txnType: isTopLevel ? 'fg_receipt' : 'wip_finalize', qty: goodQty,
+          pieceId: piece.id, pieceCode,
         });
       } else {
         // Nothing good produced — write the piece off entirely (no receipt).
@@ -615,6 +652,7 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
             stockLocationId: piece.stock_location_id ?? targetLoc,
             txnType: 'scrap',
             qty: -writtenOff,
+            pieceId: piece.id, pieceCode,
             notes: `written off: nothing good produced`,
           });
         }
@@ -633,17 +671,19 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
       }) : null);
   if (!loc || !plantId) return;
   if (goodQty > EPS) {
-    await conn.query(
+    const producedCode = await generateCode(companyId, 'stock_piece', {}, conn);
+    const [produced] = await conn.query(
       `INSERT INTO fab_stock_pieces
          (company_id, code, catalog_item_id, plant_id, stock_location_id, qty, uom, status, wip_item_id, notes)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
-      [companyId, await generateCode(companyId, 'stock_piece', {}, conn),
+      [companyId, producedCode,
        node.catalog_item_id, plantId, loc, goodQty, node.unit || null, node.id,
        `produced order ${node.order_id} item ${node.id}`],
     );
     await writeLedger(conn, companyId, {
       catalogItemId: node.catalog_item_id, plantId, stockLocationId: loc,
       txnType: isTopLevel ? 'fg_receipt' : 'wip_finalize', qty: goodQty,
+      pieceId: produced.insertId, pieceCode: producedCode,
     });
   }
   await bookScrap(loc);
