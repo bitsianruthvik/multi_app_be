@@ -153,7 +153,11 @@ function fillOne(spec, rows) {
  * Nest `rows` onto plates chosen from `specs`.
  *
  * @param {Array<{key,length,width,qty}>} rows   part rows, dimensions in mm
- * @param {Array<{id,code,length,width}>} specs  candidate plate sizes
+ * @param {Array<{id,code,length,width,available?,preferred?}>} specs  candidate plates.
+ *   `available` limits how many of that size exist — omit for a catalogue size,
+ *   which can be bought again; set 1 for an OFFCUT, which is one physical piece.
+ *   `preferred` marks material already paid for, which is chosen ahead of
+ *   anything that would have to be bought.
  * @param {{maxPlates?:number}} [opts]
  * @returns {{plates:Array, unplaced:Array}}
  */
@@ -161,6 +165,15 @@ export function nest(rows, specs, opts = {}) {
   const maxPlates = opts.maxPlates ?? 5000;
   const plates = [];
   const unplaced = [];
+  /**
+   * How many of each spec are left to open.
+   *
+   * A catalogue size is unlimited — you can buy another. An offcut is ONE
+   * piece of steel, and a packer that did not know the difference would
+   * cheerfully lay six nests onto the same drop and report a beautiful
+   * utilisation for material that exists once.
+   */
+  const stockOf = new Map(specs.map((s) => [s.id, s.available ?? Infinity]));
 
   // A row that fits on no candidate size can never be placed, and saying so up
   // front is more useful than letting the loop discover it once per pass. This
@@ -191,18 +204,38 @@ export function nest(rows, specs, opts = {}) {
   }
 
   while (remaining.length && plates.length < maxPlates) {
+    /**
+     * MATERIAL ALREADY PAID FOR IS TRIED FIRST, AND IN ITS OWN CONTEST.
+     *
+     * The objective is not the tidiest plate, it is the least steel BOUGHT — and
+     * an offcut has already been bought. Judging a drop against a fresh plate on
+     * utilisation alone loses that: a 12 m sheet cut cleverly will out-score a
+     * drop almost every time, and the drop rusts in the yard while the shop buys
+     * its area again.
+     *
+     * So preferred specs run as a separate round. Within that round the tightest
+     * fit still wins, which is what stops a big drop being burnt on one small
+     * part while a smaller drop would have done.
+     */
+    const rounds = [specs.filter((s) => s.preferred), specs.filter((s) => !s.preferred)];
     let best = null;
-    for (const spec of specs) {
-      const { plate, taken } = fillOne(spec, remaining);
-      if (!taken.size) continue;
-      const util = utilisation(plate);
-      // Utilisation decides, but two plates within a hair of each other are not
-      // meaningfully different and the tie should go to the one that absorbs
-      // more work — that is one fewer plate overall.
-      const key = [Math.round(util * 1000), Math.round(usedArea(plate))];
-      if (!best || key[0] > best.key[0] || (key[0] === best.key[0] && key[1] > best.key[1])) {
-        best = { plate, taken, key };
+    for (const round of rounds) {
+      for (const spec of round) {
+        if ((stockOf.get(spec.id) ?? 0) <= 0) continue;
+        const { plate, taken } = fillOne(spec, remaining);
+        if (!taken.size) continue;
+        const util = utilisation(plate);
+        // Utilisation decides, but two plates within a hair of each other are not
+        // meaningfully different and the tie should go to the one that absorbs
+        // more work — that is one fewer plate overall.
+        const key = [Math.round(util * 1000), Math.round(usedArea(plate))];
+        if (!best || key[0] > best.key[0] || (key[0] === best.key[0] && key[1] > best.key[1])) {
+          best = { plate, taken, key };
+        }
       }
+      // A preferred plate that took anything ends the contest — nothing a fresh
+      // plate could score is worth buying steel to achieve.
+      if (best) break;
     }
     // Every remaining row fits SOME spec (checked above), so a pass that places
     // nothing means the packer is not making progress — stop rather than spin.
@@ -215,6 +248,7 @@ export function nest(rows, specs, opts = {}) {
       break;
     }
     plates.push(best.plate);
+    stockOf.set(best.plate.spec.id, (stockOf.get(best.plate.spec.id) ?? Infinity) - 1);
     remaining = remaining.filter((r) => !best.taken.has(r.key));
   }
 

@@ -90,6 +90,58 @@ async function plateCatalog(companyId, conn = null) {
 }
 
 /**
+ * Offcuts on the shelf, as candidate plates.
+ *
+ * WHY THESE ARE DIFFERENT FROM CATALOGUE SIZES, in two ways that both matter:
+ *
+ *   available: 1   a catalogue size can be bought again; a drop is ONE piece of
+ *                  steel and can be nested onto once.
+ *   preferred      it is already paid for. The objective is the least steel
+ *                  BOUGHT, not the tidiest plate, so a drop that fits is worth
+ *                  more than a fresh sheet that fits better.
+ *
+ * Only drops of the materials this order actually uses are fetched — the yard
+ * may hold hundreds and there is no sense packing against 16 mm offcuts for an
+ * order made entirely of 12 mm.
+ */
+async function offcutSpecs(companyId, catalogItemIds, conn = null) {
+  const exec = conn ?? pool;
+  if (!catalogItemIds.length) return [];
+  const [rows] = await exec.query(
+    `SELECT p.id, p.code, p.catalog_item_id AS catalogItemId, p.length_mm AS length,
+            p.width_mm AS width, p.dims_estimated AS estimated, ic.name AS materialName,
+            ic.thickness_mm AS thickness
+       FROM fab_stock_pieces p
+       JOIN fab_item_catalog ic ON ic.id = p.catalog_item_id AND ic.deleted_at IS NULL
+       LEFT JOIN fab_stock_reservations r
+              ON r.stock_piece_id = p.id AND r.status = 'active' AND r.deleted_at IS NULL
+      WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status = 'in_stock'
+        AND p.origin_piece_id IS NOT NULL AND p.qty > 0
+        AND p.length_mm IS NOT NULL AND p.width_mm IS NOT NULL
+        AND p.catalog_item_id IN (?)
+        -- A drop somebody else has claimed is not available to offer twice.
+        AND r.id IS NULL
+      ORDER BY p.length_mm * p.width_mm ASC`,
+    [companyId, catalogItemIds],
+  );
+  return rows.map((r) => ({
+    // Negative so it can never collide with a catalog item id in the same list.
+    id: -Number(r.id),
+    pieceId: Number(r.id),
+    catalogItemId: Number(r.catalogItemId),
+    code: r.code,
+    name: `${r.materialName} — offcut ${r.code}`,
+    length: Number(r.length),
+    width: Number(r.width),
+    thickness: r.thickness == null ? null : Number(r.thickness),
+    grade: null, // filled from the material below
+    estimated: Number(r.estimated) === 1,
+    available: 1,
+    preferred: true,
+  }));
+}
+
+/**
  * The parts this order could nest, with their size and what they are cut from.
  *
  * A part here is the same thing the board calls one: a childless link row
@@ -189,6 +241,8 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
     nestableParts(companyId, orderId, { includeNested }),
     plateCatalog(companyId),
   ]);
+  // Only the materials this order actually draws on.
+  const offcuts = await offcutSpecs(companyId, [...new Set(rows.map((r) => r.currentMaterialId))]);
 
   if (!plates.length) {
     return {
@@ -227,8 +281,18 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
     // and not one a packer should make.
     const specs = plates.filter((p) => Math.abs(p.thickness - g.thickness) < 0.001
       && (g.grade == null || p.grade === g.grade));
+    /**
+     * Offcuts of the SAME material join the candidates.
+     *
+     * Matched on catalog item rather than on thickness and grade, because a
+     * drop IS a piece of that exact item — it inherited the id from the plate
+     * it was cut off. That is stricter than the thickness/grade test above and
+     * deliberately so: there is no inference to make about what a drop is.
+     */
+    const drops = offcuts.filter((o) => g.rows.some((r) => r.currentMaterialId === o.catalogItemId));
+    const candidates = [...drops, ...specs];
 
-    if (!specs.length) {
+    if (!candidates.length) {
       for (const r of g.rows) {
         unplaced.push({
           linkId: r.linkId, partCode: r.partCode, partName: r.partName,
@@ -241,7 +305,7 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       continue;
     }
 
-    const res = nest(g.rows, specs);
+    const res = nest(g.rows, candidates);
     for (const u of res.unplaced) {
       unplaced.push({
         linkId: u.row.linkId, partCode: u.row.partCode, partName: u.row.partName, reason: u.reason,
@@ -256,8 +320,22 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       out.push({
         thickness: g.thickness,
         grade: g.grade,
-        plate: { id: p.spec.id, code: p.spec.code, name: p.spec.name,
-          length: p.spec.length, width: p.spec.width },
+        plate: {
+          /**
+           * `id` is always the CATALOG item to link the part to — for an offcut
+           * that is the item it was cut from, which it inherited. The spec's own
+           * id is negative for a drop precisely so it can never be mistaken for
+           * one, and `pieceId` names the single physical piece.
+           */
+          id: p.spec.catalogItemId ?? p.spec.id,
+          pieceId: p.spec.pieceId ?? null,
+          isOffcut: !!p.spec.pieceId,
+          estimatedSize: !!p.spec.estimated,
+          code: p.spec.code,
+          name: p.spec.name,
+          length: p.spec.length,
+          width: p.spec.width,
+        },
         parts: p.rows.map((r) => ({
           linkId: r.linkId, partId: r.partId, partCode: r.partCode,
           partName: r.partName, qty: r.qty, length: r.length, width: r.width,
@@ -339,6 +417,7 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
   const conn = await pool.getConnection();
   let applied = 0;
   let linksMoved = 0;
+  let offcutsClaimed = 0;
   try {
     await conn.beginTransaction();
 
@@ -393,6 +472,45 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
       );
       applied++;
       linksMoved += res.affectedRows;
+
+      /**
+       * AN OFFCUT IS ONE PIECE, SO ACCEPTING ONE HAS TO CLAIM IT.
+       *
+       * A catalogue size can be bought again, so planning against it commits
+       * nothing. A drop cannot: two orders that both accept a suggestion using
+       * the same offcut have both planned around steel only one of them will
+       * get, and the second finds out at the torch. The earmark is what makes
+       * the suggestion honest, and it is also what keeps the NEXT suggestion
+       * from offering the same drop (see offcutSpecs).
+       *
+       * Conditional on the piece still being free, so two accepts racing cannot
+       * both claim it — the loser gets no reservation and is told.
+       */
+      if (n.plate?.pieceId) {
+        const [claim] = await conn.query(
+          // kind='order', not the column's default of 'task': this is the ORDER
+          // laying claim to a piece at planning time, long before any task
+          // exists to hold it.
+          `INSERT INTO fab_stock_reservations
+             (company_id, order_id, catalog_item_id, stock_piece_id, qty, status, kind, notes, created_at)
+           SELECT ?, ?, ?, p.id, p.qty, 'active', 'order',
+                  CONCAT('nested onto offcut ', COALESCE(p.code, p.id)), UTC_TIMESTAMP()
+             FROM fab_stock_pieces p
+            WHERE p.id = ? AND p.company_id = ? AND p.status = 'in_stock' AND p.deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM fab_stock_reservations r
+                               WHERE r.stock_piece_id = p.id AND r.status = 'active'
+                                 AND r.deleted_at IS NULL)`,
+          [companyId, orderId, plate.id, n.plate.pieceId, companyId],
+        );
+        if (!claim.affectedRows) {
+          const e = new Error(
+            `Offcut ${n.plate.code} has just been claimed by another order, so this plate `
+            + 'is no longer free. Re-run the suggestion.',
+          );
+          e.status = 409; throw e;
+        }
+        offcutsClaimed++;
+      }
     }
 
     // Repointing a link changes WHICH item the order buys, so the buy/make
@@ -408,5 +526,5 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
 
   const { recomputeOrderWeights } = await import('./itemWeightService.js');
   await recomputeOrderWeights(companyId, orderId);
-  return { nestsCreated: applied, partsNested: linksMoved };
+  return { nestsCreated: applied, partsNested: linksMoved, offcutsClaimed };
 }

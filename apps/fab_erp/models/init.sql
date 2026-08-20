@@ -5593,3 +5593,66 @@ UPDATE fab_item_catalog c
    AND c.code LIKE CONCAT('%', REPLACE(r.code_suffix, '/', '-'))
    SET c.flow_id = r.flow_id
  WHERE c.deleted_at IS NULL AND c.level_kind IS NOT NULL;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- OFFCUTS / REMNANTS (2026-08-21)
+--
+-- A drop is not a new kind of thing — it is a stock piece with a smaller size,
+-- so it needs no table of its own and it slots straight into the size matching
+-- that consumption and procurement already do. What it needs is PROVENANCE:
+-- which plate it came off, and which nest produced it. That is also what marks
+-- it as a drop at all (`origin_piece_id IS NOT NULL`), which matters because a
+-- drop must never be counted as a plate somebody could buy.
+--
+-- `dims_estimated` says the size was COMPUTED from the nesting layout rather
+-- than measured on the floor. Both are useful and they are not the same claim,
+-- and a system that cannot tell them apart eventually believes the arithmetic
+-- over the tape measure.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_stock_pieces'
+              AND COLUMN_NAME  = 'origin_piece_id');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_stock_pieces ADD COLUMN origin_piece_id INT DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_stock_pieces'
+              AND COLUMN_NAME  = 'origin_nest_no');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_stock_pieces ADD COLUMN origin_nest_no VARCHAR(40) DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_stock_pieces'
+              AND COLUMN_NAME  = 'dims_estimated');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_stock_pieces ADD COLUMN dims_estimated TINYINT(1) NOT NULL DEFAULT 0',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Finding the drops of a material, and finding a plate's own drops, are the two
+-- questions asked of this; both are cheap with an index and a scan without one.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_stock_pieces'
+              AND INDEX_NAME   = 'idx_fsp_origin');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE fab_stock_pieces ADD INDEX idx_fsp_origin (origin_piece_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_stock_pieces'
+              AND INDEX_NAME   = 'idx_fsp_company_origin_item');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE fab_stock_pieces ADD INDEX idx_fsp_company_origin_item (company_id, catalog_item_id, origin_piece_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

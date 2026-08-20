@@ -43,9 +43,28 @@ export async function availabilityFor(companyId, catalogItemIds, opts = {}) {
   const placeholders = ids.map(() => '?').join(',');
 
   const [stock] = await exec.query(
+    /**
+     * OFFCUTS ARE NOT PLATES, so they do not count here.
+     *
+     * A drop carries the same catalog_item_id as the plate it came off — that
+     * is what makes it findable as the same material — but it is a 0.8 m²
+     * remnant, not a 24 m² sheet. Counting it as one unit of the item would
+     * tell procurement the shelf holds a plate it does not hold, and the order
+     * would be one plate short at the torch.
+     *
+     * The size-aware count (`availabilityBySize`) is already safe: a drop's odd
+     * dimensions match no full-plate requirement. This catalog-level count is
+     * the one that had no way to tell them apart, and it is the fallback used
+     * whenever a line has no declared size — which is exactly the case where
+     * getting it wrong is invisible.
+     *
+     * Drops are still real stock and still consumable; they are simply counted
+     * by the code that knows what size they are.
+     */
     `SELECT catalog_item_id, COALESCE(SUM(qty), 0) AS on_hand
        FROM fab_stock_pieces
       WHERE company_id = ? AND deleted_at IS NULL AND status = 'in_stock'
+        AND origin_piece_id IS NULL
         AND catalog_item_id IN (${placeholders})
       GROUP BY catalog_item_id`,
     [companyId, ...ids],

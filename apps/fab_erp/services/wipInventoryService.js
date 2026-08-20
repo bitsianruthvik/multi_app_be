@@ -36,6 +36,8 @@ import { fieldMatchSql } from './fieldService.js';
 import { piecesHeldByOthers, piecesReservedFor } from './availabilityService.js';
 import { movePiece } from './stockMovementService.js';
 import { ensurePieceCode } from './stockCodeService.js';
+import { recordNestDrops } from './remnantService.js';
+import { logger } from '../../../core/utils/logger.js';
 
 const FG_LOCATION_CODE = 'FG-AUTO'; // per-plant finished-goods sink (auto-provisioned)
 const EPS = 1e-9;
@@ -309,7 +311,11 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
   ];
 
   const [pieces] = await conn.query(
-    `SELECT p.id, p.code, p.qty, p.plant_id, p.stock_location_id, p.batch_no
+    // heat_no and uom are read for the OFFCUT: a drop is the same heat as the
+    // plate it came off, and losing that makes it untraceable for anything
+    // certified.
+    `SELECT p.id, p.code, p.qty, p.plant_id, p.stock_location_id, p.batch_no,
+            p.heat_no, p.uom
        FROM fab_stock_pieces p
        ${match.join}
       WHERE p.company_id = ? AND p.catalog_item_id = ? AND p.status = 'in_stock'
@@ -332,9 +338,15 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
   pieces.sort((a, b) => (minePriority.has(Number(b.id)) ? 1 : 0) - (minePriority.has(Number(a.id)) ? 1 : 0));
 
   let remaining = Number(required);
+  // Which physical pieces this draw actually took. Returned so the caller can
+  // record the OFFCUT against the plate it came off — a drop with no parent
+  // piece is a piece of steel with no history, which for a certified job is the
+  // same as no steel at all.
+  const taken = [];
   for (const p of pieces) {
     if (remaining <= EPS) break;
     const take = Math.min(Number(p.qty), remaining);
+    taken.push(p);
     const newQty = Number(p.qty) - take;
     await conn.query(
       `UPDATE fab_stock_pieces SET qty = ?, status = ? WHERE id = ?`,
@@ -373,7 +385,7 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
     }
     remaining -= take;
   }
-  return remaining <= EPS;
+  return { ok: remaining <= EPS, taken };
 }
 
 /**
@@ -462,7 +474,7 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
       if (inp.input_role === 'component' && inp.producing_item_id) {
         const child = await getItemNode(conn, companyId, inp.producing_item_id);
         if (child?.catalog_item_id) {
-          const ok = await consumeStock(conn, companyId, child.catalog_item_id, required, {
+          const { ok } = await consumeStock(conn, companyId, child.catalog_item_id, required, {
             txnType: 'wip_consume', orderId: task.order_id ?? node.order_id ?? null,
             notes: `consumed by item ${node.id} (task ${task.id})`,
           });
@@ -476,7 +488,7 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
         const nest = await claimNest(conn, companyId, task, node, inp, required);
         if (nest === null) continue;
 
-        const ok = await consumeStock(conn, companyId, inp.ref_catalog_item_id, nest.qty, {
+        const { ok, taken } = await consumeStock(conn, companyId, inp.ref_catalog_item_id, nest.qty, {
           txnType: 'wip_issue',
           // The size nesting declared for this plate. Only a piece of exactly
           // that size will do — see consumeStock.
@@ -509,6 +521,42 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
             `Not enough raw material (catalog item #${inp.ref_catalog_item_id})${size} in stock to start this task.`
             + (size ? ' Stock of the same item in other sizes does not count — the nest names this plate.' : ''),
           );
+        }
+
+        /**
+         * THE PLATE IS NOW CUT, SO WHAT IS LEFT OF IT BECOMES STOCK.
+         *
+         * Here and nowhere else, because `claimNest` won a unique index a few
+         * lines up: this runs once per physical plate however many parts come
+         * off it. Booking drops per part would record the same offcut twenty
+         * times and invent nineteen plates' worth of steel.
+         *
+         * Best-effort on purpose. A drop that cannot be computed is material
+         * quietly lost, which is bad; a task that will not START because a drop
+         * could not be computed is a stopped shop, which is worse. The reason
+         * is logged and the operator's job begins.
+         */
+        if (nest.nestNo && taken?.length) {
+          try {
+            const drops = await recordNestDrops(conn, companyId, {
+              orderId: task.order_id ?? node.order_id ?? null,
+              catalogItemId: inp.ref_catalog_item_id,
+              nestNo: nest.nestNo,
+              sourcePiece: taken[0],
+              plantId: taken[0].plant_id,
+              stockLocationId: taken[0].stock_location_id,
+            });
+            if (drops.created) {
+              logger.info({ companyId, nestNo: nest.nestNo, created: drops.created },
+                '[remnant] offcuts booked into stock');
+            } else if (drops.skipped) {
+              logger.info({ companyId, nestNo: nest.nestNo, reason: drops.skipped },
+                '[remnant] no offcut recorded');
+            }
+          } catch (err) {
+            logger.warn({ err, companyId, nestNo: nest.nestNo },
+              '[remnant] could not record the offcut; the plate was still issued');
+          }
         }
       }
     }
