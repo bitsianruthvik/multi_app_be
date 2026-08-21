@@ -222,30 +222,3 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
     if (owned) conn.release();
   }
 }
-
-/**
- * What each of these parts is currently cut from.
- *
- * Batched because the item tree renders a few hundred rows and asking per row
- * would be a few hundred round trips.
- *
- * @returns {Promise<Map<number, {materialId, code, name, thicknessMm}>>}
- */
-export async function materialsForItems(companyId, itemIds, conn = null) {
-  const exec = conn ?? pool;
-  const ids = [...new Set((itemIds ?? []).map(Number).filter(Boolean))];
-  const out = new Map();
-  if (!ids.length) return out;
-
-  const [rows] = await exec.query(
-    `SELECT i.parent_item_id AS partId, i.catalog_item_id AS materialId,
-            c.code, c.name, c.thickness_mm AS thicknessMm, c.material_form AS materialForm
-       FROM fab_items i
-       JOIN fab_item_catalog c ON c.id = i.catalog_item_id
-      WHERE i.company_id = ? AND i.flow_id IS NULL AND i.deleted_at IS NULL
-        AND i.parent_item_id IN (${ids.map(() => '?').join(',')})`,
-    [companyId, ...ids],
-  );
-  for (const r of rows) out.set(Number(r.partId), r);
-  return out;
-}
