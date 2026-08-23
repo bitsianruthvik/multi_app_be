@@ -22,8 +22,20 @@ import { pool } from '../../../db.js';
 /**
  * Broadest first. The index is the rung number, and that ordering is the whole
  * precedence rule: later in this list wins.
+ *
+ * `order_line` sits between the catalogue and the job (added 2026-08-21).
+ *
+ * It is where an order states what it is MADE OF — "this span is E350 BO mild
+ * steel, 12 mm unless a part says otherwise". That belongs to the line and not
+ * to the top item, because a line of qty 2 produces two spans: put the default
+ * on the span and you have said it twice and can contradict yourself; put it on
+ * the line and it is said once, which is how the drawing says it.
+ *
+ * Broader than every job rung, so a girder, a segment or a single part can all
+ * override it. Narrower than the catalogue, because what the merchant stocks
+ * cannot outrank what this order asked for.
  */
-export const RUNGS = ['category', 'group', 'subgroup', 'catalog_item', 'order_item', 'stock_piece'];
+export const RUNGS = ['category', 'group', 'subgroup', 'catalog_item', 'order_line', 'order_item', 'stock_piece'];
 
 export const rungOf = (scope) => RUNGS.indexOf(scope);
 
@@ -78,9 +90,20 @@ async function parentOf(exec, companyId, scope, scopeId) {
       if (p.catalogItemId) return { scope: 'catalog_item', scopeId: Number(p.catalogItemId) };
       return null;
     }
+    case 'order_line': {
+      const [[l]] = await exec.query(
+        `SELECT catalog_item_id AS catalogItemId FROM fab_order_lines
+          WHERE id = ? AND company_id = ? LIMIT 1`,
+        [scopeId, companyId],
+      );
+      // A line usually names no catalogue item — it is free text describing what
+      // was sold. When it does, the type's defaults sit above the line's.
+      return l?.catalogItemId ? { scope: 'catalog_item', scopeId: Number(l.catalogItemId) } : null;
+    }
     case 'order_item': {
       const [[i]] = await exec.query(
-        `SELECT parent_item_id AS parentItemId, catalog_item_id AS catalogItemId
+        `SELECT parent_item_id AS parentItemId, order_line_id AS orderLineId,
+                catalog_item_id AS catalogItemId
            FROM fab_items WHERE id = ? AND company_id = ? LIMIT 1`,
         [scopeId, companyId],
       );
@@ -97,6 +120,10 @@ async function parentOf(exec, companyId, scope, scopeId) {
        * answers only "what contains this". See the precedence argument there.
        */
       if (i.parentItemId) return { scope: 'order_item', scopeId: Number(i.parentItemId) };
+      // At the TOP of the tree the walk leaves the job and reaches the line that
+      // ordered it — which is where this order's material, grade and thickness
+      // defaults live. Only then does it fall through to the catalogue.
+      if (i.orderLineId) return { scope: 'order_line', scopeId: Number(i.orderLineId) };
       if (i.catalogItemId) return { scope: 'catalog_item', scopeId: Number(i.catalogItemId) };
       return null;
     }
@@ -207,8 +234,17 @@ async function withOwnType(exec, companyId, scope, scopeId, chain, seen) {
   // Everything the instance walk found that is BROADER than an order item
   // (the root's own catalog item and taxonomy) stays outermost; the type chain
   // goes immediately before the job's own rungs.
-  const jobRungs = chain.filter((c) => c.scope === 'order_item');
-  const outer = chain.filter((c) => c.scope !== 'order_item');
+  /**
+   * The line counts as a JOB rung, not an outer one.
+   *
+   * It arrives in the chain from the walk, but filtering it into  would
+   * place it above the part's own catalogue type — saying the merchant's default
+   * beats what this order asked for, which is backwards. The line is the
+   * broadest thing the JOB said, so it leads the job rungs.
+   */
+  const isJob = (c) => c.scope === 'order_item' || c.scope === 'order_line';
+  const jobRungs = chain.filter(isJob);
+  const outer = chain.filter((c) => !isJob(c));
   return [...outer, ...typeChain, ...jobRungs];
 }
 
@@ -347,8 +383,17 @@ function spliceOwnType(target, chain, seen, ownType, parent) {
   }
   typeChain.reverse();
 
-  const jobRungs = chain.filter((c) => c.scope === 'order_item');
-  const outer = chain.filter((c) => c.scope !== 'order_item');
+  /**
+   * The line counts as a JOB rung, not an outer one.
+   *
+   * It arrives in the chain from the walk, but filtering it into  would
+   * place it above the part's own catalogue type — saying the merchant's default
+   * beats what this order asked for, which is backwards. The line is the
+   * broadest thing the JOB said, so it leads the job rungs.
+   */
+  const isJob = (c) => c.scope === 'order_item' || c.scope === 'order_line';
+  const jobRungs = chain.filter(isJob);
+  const outer = chain.filter((c) => !isJob(c));
   return [...outer, ...typeChain, ...jobRungs];
 }
 
@@ -380,17 +425,31 @@ async function parentsOfMany(exec, companyId, scope, ids) {
       }
       break;
     }
+    case 'order_line': {
+      const [rows] = await exec.query(
+        `SELECT id, catalog_item_id AS catalogItemId FROM fab_order_lines
+          WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
+      );
+      for (const r of rows) {
+        out.set(Number(r.id),
+          r.catalogItemId ? { scope: 'catalog_item', scopeId: Number(r.catalogItemId) } : null);
+      }
+      break;
+    }
     case 'order_item': {
       const [rows] = await exec.query(
-        `SELECT id, parent_item_id AS parentItemId, catalog_item_id AS catalogItemId
+        `SELECT id, parent_item_id AS parentItemId, order_line_id AS orderLineId,
+                catalog_item_id AS catalogItemId
            FROM fab_items WHERE company_id = ? AND id IN (?)`,
         [companyId, ids],
       );
       for (const r of rows) {
         out.set(Number(r.id),
           r.parentItemId ? { scope: 'order_item', scopeId: Number(r.parentItemId) }
-            : r.catalogItemId ? { scope: 'catalog_item', scopeId: Number(r.catalogItemId) }
-              : null);
+            : r.orderLineId ? { scope: 'order_line', scopeId: Number(r.orderLineId) }
+              : r.catalogItemId ? { scope: 'catalog_item', scopeId: Number(r.catalogItemId) }
+                : null);
       }
       break;
     }
