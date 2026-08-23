@@ -5656,3 +5656,49 @@ SET @sql = IF(@idx = 0,
   'ALTER TABLE fab_stock_pieces ADD INDEX idx_fsp_company_origin_item (company_id, catalog_item_id, origin_piece_id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- STAGE APPLICABILITY PER LINE TYPE (2026-08-21)
+--
+-- The eight preparation stages are a fixed catalogue of KINDS, because each one
+-- is code — `nesting` is six services and three screens, and no configuration
+-- can conjure a stage nobody wrote. What varies between customers, and between
+-- a Composite Girder and a PEB inside one customer, is which of those stages
+-- APPLY.
+--
+-- So this table says applicability, not existence, and deliberately NOT order.
+-- Stage order encodes real dependencies — nesting must precede procurement,
+-- because since raw material became per-dimension the size IS the item and you
+-- cannot buy one you have not chosen. A screen that let somebody reorder that
+-- would be a footgun with no upside.
+--
+-- `line_type` NULL means "any type", and an exact match beats it — the same
+-- specificity rule fab_flow_rules already uses, so there is one way to think
+-- about matching in this app rather than two.
+--
+-- NO ROW MEANS REQUIRED. Every existing tenant therefore behaves exactly as it
+-- did before anyone configures anything, which is the only safe default for a
+-- table that can switch a gate off.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS fab_line_type_stages (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  -- NULL = applies to every line type in this company.
+  line_type     VARCHAR(40)   NULL,
+  -- One of orderReadinessService.STAGE_KEYS. Not a foreign key: the catalogue
+  -- of stage kinds lives in code, and a row naming a stage that no longer
+  -- exists must be ignorable rather than un-deletable.
+  stage_key     VARCHAR(30)   NOT NULL,
+  applicability ENUM('required','optional','not_applicable') NOT NULL DEFAULT 'required',
+  -- Why this line type skips it. Shown to whoever wonders why a stage reads
+  -- "not relevant" — a rule with no reason gets reverted by the next person.
+  notes         TEXT          NULL,
+  active        TINYINT(1)    NOT NULL DEFAULT 1,
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (company_id) REFERENCES companies(id),
+  KEY idx_flts_company (company_id),
+  KEY idx_flts_lookup  (company_id, line_type, stage_key)
+);

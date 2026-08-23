@@ -35,6 +35,7 @@ import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder } from './procurementOrderService.js';
+import { orderStageApplicability } from './stageApplicabilityService.js';
 import { flowSummary } from './flowAllocationService.js';
 import { checkOrderNesting, blockingIssues } from './nestingIntegrityService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
@@ -376,9 +377,47 @@ export async function orderReadiness(companyId, orderId) {
     },
   ];
 
+  /**
+   * TYPE-SCOPED APPLICABILITY, applied last.
+   *
+   * Every stage above computes its real state from the real data, and only then
+   * is it asked whether it applies to this order's line types at all. That
+   * order matters: a stage that does not apply still knows what it WOULD have
+   * said, so the strip can show "not relevant" without having quietly skipped
+   * the work of finding out.
+   *
+   * `not_applicable` is reported, never hidden. A stage that vanishes leaves
+   * somebody wondering whether they forgot it; one that says "not relevant for
+   * a PEB line" answers the question before it is asked.
+   */
+  const applicability = await orderStageApplicability(companyId, orderId, STAGE_KEYS);
+  for (const s of stages) {
+    const a = applicability.get(s.key);
+    if (!a) continue;
+    s.applicability = a.applicability;
+    s.applicabilityNotes = a.notes;
+    s.appliesToSomeLines = a.mixed === true;
+    if (a.applicability === 'not_applicable') {
+      s.state = 'not_applicable';
+      s.detail = a.notes
+        ? `Not relevant for ${(a.lineTypes ?? []).filter(Boolean).join(', ') || 'this order'} — ${a.notes}`
+        : `Not relevant for ${(a.lineTypes ?? []).filter(Boolean).join(', ') || 'this order'}`;
+    }
+  }
+
   const byKey = Object.fromEntries(stages.map((s) => [s.key, s]));
-  const preparationComplete = PREPARATION_STAGES.every((k) => byKey[k].state === 'done');
-  const nextStage = stages.find((s) => s.state !== 'done')?.key ?? null;
+  /**
+   * A stage that does not apply cannot hold the order up, and an OPTIONAL one
+   * must not either — that is the whole of what "optional" buys. Both still
+   * report their true state; they simply stop being gates.
+   */
+  const satisfied = (k) => {
+    const s = byKey[k];
+    return s.state === 'done' || s.state === 'not_applicable'
+      || s.applicability === 'optional';
+  };
+  const preparationComplete = PREPARATION_STAGES.every(satisfied);
+  const nextStage = stages.find((s) => !satisfied(s.key))?.key ?? null;
 
   return {
     orderId,
