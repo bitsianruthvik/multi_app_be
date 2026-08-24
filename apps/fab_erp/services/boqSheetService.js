@@ -68,6 +68,28 @@ export const LEVELS = [
 const COLS = [
   ...LEVELS.map((l) => ({ header: l.header, width: l.width, key: l.key })),
   { header: 'Part Name', width: 30, key: 'name' },
+  /**
+   * WHAT THIS ROW IS, as a catalogue item code.
+   *
+   * Every row in the system names its type — that is the rule the whole item
+   * catalogue rests on — and until now a BOQ upload was the one way to build
+   * an order that did not. Rows came out with `catalog_item_id` NULL, which
+   * is not an error anywhere; it just quietly loses everything the type would
+   * have carried. A part inherits its category's and group's field defaults
+   * through its type, and an untyped row inherits none of them — reported
+   * later as a MISSING VALUE, never as the missing TYPE that caused it.
+   *
+   * It also decides buy-or-make. A shear stud is bought whole; typed as the
+   * fastener it is, `syncOrderProcurement` marks it `buy` and nesting passes
+   * over it. Untyped, it defaults to `make`, and nesting blocks the order
+   * looking for a plate to cut a stud from.
+   *
+   * DECLARED, NEVER GUESSED. An unrecognised code is reported and the row
+   * still imports — the structure is worth having while the catalogue catches
+   * up — but nothing here infers a type from a part's name or code. Guessing
+   * would silently give two parts different defaults for looking alike.
+   */
+  { header: 'Type', width: 18, key: 'type' },
   { header: 'Thick',     width: 9,  key: 'height' },
   { header: 'Length',    width: 10, key: 'length' },
   { header: 'Width',     width: 10, key: 'width' },
@@ -186,6 +208,11 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     '',
     'QTY is how many of this part go into ONE of its parent. Defaults to 1.',
     '',
+    'TYPE is what the row IS, as an item catalogue code — a girder, a web plate, a shear stud.',
+    '  It is how a part inherits the defaults set on its category and group, and how the system',
+    '  knows a stud is BOUGHT rather than cut from a plate. A code that is not in the catalogue',
+    '  is reported and the row still imports, so the structure is never held up by it.',
+    '',
     'MATERIAL / GRADE say WHAT THE STEEL IS, not which plate it comes off. Leave them BLANK',
     '  unless this row is different: material and grade are set once on the order line and every',
     '  part inherits them. Fill a cell only for the part that needs something else — a stainless',
@@ -217,6 +244,7 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     ws.addRow([
       r.span ?? '', r.girder ?? '', r.segment ?? '', r.part ?? '',
       r.name ?? '',
+      r.type ?? '',
       r.height ?? '', r.length ?? '', r.width ?? '', r.qty ?? '',
       r.material ?? '', r.grade ?? '',
       r.notes ?? '',
@@ -407,6 +435,7 @@ async function readExistingAsRows(companyId, orderId) {
       height: i.height != null ? Number(i.height) : '',
       length: i.length != null ? Number(i.length) : '',
       width:  i.width  != null ? Number(i.width)  : '',
+      type:   i.catalog_code ?? '',
       qty:    i.qty    != null ? Number(i.qty)    : '',
       material: ownSpec.get(i.id)?.material ?? '',
       grade:    ownSpec.get(i.id)?.grade ?? '',
@@ -460,6 +489,7 @@ function parseRows(ws) {
       row: n,
       levels,
       name:     cellVal(row, C.name),
+      type:     cellVal(row, C.type),
       height:   numVal(row, C.height),
       length:   numVal(row, C.length),
       width:    numVal(row, C.width),
@@ -554,6 +584,21 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
     );
     const lineByCode = new Map(orderLines.map((l) => [key(l.code), l.id]));
 
+    /**
+     * Every catalogue item, by code, so a row can name its type.
+     *
+     * The WHOLE catalogue, not just what a part could be cut from: a BOM row's
+     * type is what the row IS — a girder, a web plate, a shear stud — and those
+     * live in different categories. The raw-material pick list is the answer to
+     * a different question and would exclude every structure type there is.
+     */
+    const [typeRows] = await conn.query(
+      `SELECT id, code FROM fab_item_catalog
+        WHERE company_id = ? AND deleted_at IS NULL AND code IS NOT NULL`,
+      [companyId],
+    );
+    const typeByCode = new Map(typeRows.map((t) => [key(t.code), t]));
+
 
     for (const r of parsed) {
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
@@ -595,6 +640,24 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       let parentLabel = null;
       let node = null;
       let createdHere = false;
+
+      /**
+       * The catalogue type this row names, resolved once for the row.
+       *
+       * It applies to the row's LEAF — the thing the row describes. A row with a
+       * blank Part declares the segment above it, and that segment is then the
+       * leaf, so the same column types assemblies without needing its own.
+       */
+      let rowTypeId = null;
+      if (r.type) {
+        const t = typeByCode.get(key(r.type));
+        if (t) rowTypeId = t.id;
+        else {
+          const message = `Type '${r.type}' is not in the Item Catalog — the row was created without it.`;
+          result.warnings.push({ row: r.row, message });
+          rowNotes.push(message);
+        }
+      }
       // Every node on this row belongs to the line named by its top level, all
       // the way down — that is what makes a line's progress answerable.
       const lineId = lineByCode.get(key(path[0].label)) ?? null;
@@ -616,9 +679,12 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
             `INSERT INTO fab_items
                (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
                 code, level_kind)
-             VALUES (?,?,?,?,NULL,?,?,?,?,?,?)`,
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
             [
               companyId, orderId, lineId, parentId,
+              // Only the leaf is what this row describes; an intermediate level
+              // gets its own type from the row that declares it.
+              isLast ? rowTypeId : null,
               // An intermediate level has no name of its own in the BOQ — the
               // code is what everyone calls it.
               isLast ? (r.name ?? path[i].label) : path[i].label,
@@ -641,9 +707,15 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
           await conn.query(
             `UPDATE fab_items SET
                name = COALESCE(?, name), qty = COALESCE(?, qty),
-               order_line_id = COALESCE(order_line_id, ?)
+               order_line_id = COALESCE(order_line_id, ?),
+               -- COALESCE on the ARGUMENT, so a blank Type column leaves an
+               -- existing type alone: re-uploading a sheet written before the
+               -- column existed must not untype an order. It also means a
+               -- re-upload is how an already-built order gets typed, without
+               -- recreating rows and discarding the nesting hung off them.
+               catalog_item_id = COALESCE(?, catalog_item_id)
              WHERE id = ? AND company_id = ?`,
-            [r.name, r.qty, lineId, hit.id, companyId],
+            [r.name, r.qty, lineId, rowTypeId, hit.id, companyId],
           );
           createdHere = true;
         }
@@ -807,7 +879,7 @@ export function buildWizardRows(spec = {}) {
 
   const level = (girder, segment, part, name, qty, notes, extra = {}) => ({
     span: spanCode, girder, segment, part, name,
-    height: '', length: '', width: '', qty, notes, material: '', grade: '',
+    height: '', length: '', width: '', qty, notes, type: '', material: '', grade: '',
     ...extra,
   });
 
