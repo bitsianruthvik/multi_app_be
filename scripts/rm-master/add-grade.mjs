@@ -26,6 +26,7 @@
 
 import ExcelJS from 'exceljs';
 import { pool } from '../../db.js';
+import { upsertFieldValues } from './field-values.mjs';
 
 const args = process.argv.slice(2);
 const companyId = Number(args.find((a) => /^\d+$/.test(a)));
@@ -103,27 +104,20 @@ try {
     process.exit(0);
   }
 
-  // Idempotent: retire this field's previous answer for these items rather than
-  // stacking a second live value beside it, which resolveFields would then have
-  // to choose between.
-  const ids = items.map((i) => i.id);
-  for (const group of chunk(ids, 500)) {
-    await conn.query(
-      `UPDATE fab_field_values SET deleted_at = NOW()
-        WHERE company_id = ? AND field_id = ? AND scope = 'catalog_item'
-          AND scope_id IN (?) AND deleted_at IS NULL`,
-      [companyId, fieldId, group],
-    );
-  }
-
-  const rows = items.map((i) => [companyId, fieldId, 'catalog_item', i.id, gradeByCode.get(i.code)]);
-  for (const group of chunk(rows, 900)) {
-    await conn.query(
-      'INSERT INTO fab_field_values (company_id, field_id, scope, scope_id, value_text) VALUES ?',
-      [group],
-    );
-  }
-  log(`  grade values: ${rows.length}`);
+  /**
+   * UPSERT, not soft-delete-then-insert.
+   *
+   * `uq_ffv_target` is UNIQUE on (company_id, field_id, scope, scope_id) and
+   * does NOT include `deleted_at`, so there is only ever one row per target for
+   * all time. Retiring the old answer and inserting a new one therefore dies on
+   * a duplicate key — and it dies only on the SECOND run, which is why the first
+   * one looked fine. See field-values.mjs.
+   */
+  const written = await upsertFieldValues(conn, {
+    companyId, fieldId, scope: 'catalog_item', kind: 'text',
+    entries: items.map((i) => ({ scopeId: i.id, value: gradeByCode.get(i.code) })),
+  });
+  log(`  grade values: ${written}`);
 
   await conn.commit();
   log('  committed\n');

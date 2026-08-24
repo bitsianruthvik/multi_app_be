@@ -42,6 +42,20 @@ export const PROJECTIONS = {
       thickness_mm: 'thickness_mm',
       density_kg_m3: 'density_kg_m3',
       section_area_mm2: 'section_area_mm2',
+      /**
+       * `material_form` joins the projection (2026-08-21) because it was the
+       * clearest case of the problem this file exists to solve: a field
+       * definition holding ZERO values beside a column holding 1,420, with every
+       * reader on the column. A defined field that nothing writes is worse than
+       * no field — the next person sets it, nothing happens, and the reason is
+       * invisible.
+       *
+       * It stays a column as well as a field for the same reason the others do:
+       * `rawMaterialService` and its frontend mirror filter on it in SQL to
+       * split plate from section, and that filter should stay indexed rather
+       * than become a join.
+       */
+      material_form: 'material_form',
     },
   },
   order_item: {

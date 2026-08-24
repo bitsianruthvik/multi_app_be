@@ -11,6 +11,7 @@
 
 import ExcelJS from 'exceljs';
 import { pool } from '../../db.js';
+import { upsertFieldValues } from './field-values.mjs';
 
 const args = process.argv.slice(2);
 const companyId = Number(args.find((a) => /^\d+$/.test(a)));
@@ -170,20 +171,12 @@ try {
   }
   did.push(`depth_mm backfilled on ${depthRows.length} profile(s) from the sheet's Depth column`);
   if (apply && depthRows.length) {
-    for (const g of chunk(profItems.map((p) => p.id), 500)) {
-      await conn.query(
-        `UPDATE fab_field_values SET deleted_at = NOW()
-          WHERE company_id = ? AND field_id = ? AND scope = 'catalog_item' AND scope_id IN (?)
-            AND deleted_at IS NULL`,
-        [companyId, depthId, g],
-      );
-    }
-    for (const g of chunk(depthRows, 900)) {
-      await conn.query(
-        'INSERT INTO fab_field_values (company_id, field_id, scope, scope_id, value_num, unit_code) VALUES ?',
-        [g],
-      );
-    }
+    // UPSERT — uq_ffv_target ignores deleted_at, so there is only ever one row
+    // per target and delete-then-insert dies on the second run.
+    await upsertFieldValues(conn, {
+      companyId, fieldId: depthId, scope: 'catalog_item', kind: 'num', unit: 'mm',
+      entries: depthRows.map((r) => ({ scopeId: r[3], value: r[4] })),
+    });
   }
 
   /**
@@ -216,11 +209,10 @@ try {
   }
   did.push(`grade value added to ${gradeRows.length} legacy item(s); ${renames.length} name(s) B0 -> BO`);
   if (apply) {
-    for (const g of chunk(gradeRows, 900)) {
-      await conn.query(
-        'INSERT INTO fab_field_values (company_id, field_id, scope, scope_id, value_text) VALUES ?', [g],
-      );
-    }
+    await upsertFieldValues(conn, {
+      companyId, fieldId: gradeField.id, scope: 'catalog_item', kind: 'text',
+      entries: gradeRows.map((r) => ({ scopeId: r[3], value: r[4] })),
+    });
     for (const [id, name] of renames) {
       await conn.query('UPDATE fab_item_catalog SET name = ? WHERE id = ?', [name, id]);
     }

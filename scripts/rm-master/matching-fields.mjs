@@ -37,6 +37,7 @@
  */
 
 import { pool } from '../../db.js';
+import { upsertFieldValues } from './field-values.mjs';
 
 const args = process.argv.slice(2);
 const companyId = Number(args.find((a) => /^\d+$/.test(a)));
@@ -124,23 +125,12 @@ try {
         'SELECT id FROM fab_fields WHERE company_id = ? AND field_key = ? LIMIT 1', [companyId, 'material'],
       );
       const ids = targets.map((t) => t.id);
-      // Idempotent: retire this field's previous answer for these items rather
-      // than stacking a second live value the resolver would have to choose between.
-      for (const g of chunk(ids, 500)) {
-        await conn.query(
-          `UPDATE fab_field_values SET deleted_at = NOW()
-            WHERE company_id = ? AND field_id = ? AND scope = 'catalog_item'
-              AND scope_id IN (?) AND deleted_at IS NULL`,
-          [companyId, field.id, g],
-        );
-      }
-      for (const g of chunk(ids.map((id) => [companyId, field.id, 'catalog_item', id, 'MS']), 900)) {
-        await conn.query(
-          'INSERT INTO fab_field_values (company_id, field_id, scope, scope_id, value_text) VALUES ?',
-          [g],
-        );
-      }
-      backfilled = ids.length;
+      // UPSERT — uq_ffv_target is unique on (company, field, scope, scope_id)
+      // and ignores deleted_at, so delete-then-insert dies on the second run.
+      backfilled = await upsertFieldValues(conn, {
+        companyId, fieldId: field.id, scope: 'catalog_item', kind: 'text',
+        entries: ids.map((id) => ({ scopeId: id, value: 'MS' })),
+      });
     }
   }
 
