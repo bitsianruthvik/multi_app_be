@@ -35,6 +35,7 @@ import {
   applyFlowRulesHandler,
   setItemFlowHandler,
   setItemSpecHandler,
+  getItemSpecHandler,
   parameterGridHandler,
   exportParametersHandler,
   importParametersHandler,
@@ -112,6 +113,8 @@ router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage
  * Two routes rather than one `:scope(lines|items)` — Express 5 uses
  * path-to-regexp v8, which dropped inline patterns and throws at mount time.
  */
+router.get('/spec/lines/:id', protect, getItemSpecHandler('lines'));
+router.get('/spec/items/:id', protect, getItemSpecHandler('items'));
 router.post('/spec/lines/:id', protect, requirePerm('fab_erp_projects_manage'), setItemSpecHandler('lines'));
 router.post('/spec/items/:id', protect, requirePerm('fab_erp_projects_manage'), setItemSpecHandler('items'));
 

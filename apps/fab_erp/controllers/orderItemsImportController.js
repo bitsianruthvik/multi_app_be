@@ -302,6 +302,46 @@ export const setItemSpecHandler = (which) => async (req, res) => {
   }
 };
 
+/**
+ * GET — what a line or part SAYS its steel is.
+ *
+ * Its OWN stated values, not the resolved ones, and the difference matters: this
+ * feeds a form that writes back what it shows. Show a part the material it
+ * inherits from its line and the next save stamps it on as an override, after
+ * which the line means nothing. A blank here means "whatever the line says",
+ * which is the answer for nearly every part.
+ */
+export const getItemSpecHandler = (which) => async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const scope = which === 'lines' ? 'order_line' : 'order_item';
+    const scopeId = Number(req.params.id);
+    if (!Number.isFinite(scopeId)) {
+      return res.status(400).json({ message: 'Which line or part?' });
+    }
+    const owner = await specOwner(cid, scope, scopeId);
+    if (!owner) return res.status(404).json({ message: 'That line or part does not exist.' });
+
+    const [rows] = await pool.query(
+      `SELECT d.field_key AS k, v.value_text AS t, v.value_num AS n
+         FROM fab_field_values v
+         JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+        WHERE v.company_id = ? AND v.scope = ? AND v.scope_id = ? AND v.deleted_at IS NULL
+          AND d.field_key IN ('material','grade','thickness_mm')`,
+      [cid, scope, scopeId],
+    );
+    const out = { scope, scopeId, orderId: owner.orderId, material: null, grade: null, thickness_mm: null };
+    for (const r of rows) {
+      out[r.k] = r.k === 'thickness_mm' ? (r.n == null ? null : Number(r.n)) : (r.t ?? null);
+    }
+    res.json(out);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: getItemSpec failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
 /** The order a line or item belongs to, and proof it is this company's. */
 async function specOwner(cid, scope, scopeId) {
   const [[row]] = await pool.query(
