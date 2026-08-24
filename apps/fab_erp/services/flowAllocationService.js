@@ -86,6 +86,17 @@ export async function flowSummary(companyId, orderId) {
   for (const it of items) {
     const lv = it.level_kind;
     if (!byLevel.has(lv)) continue;
+    /*
+     * A BOUGHT part is not counted at all, not counted as unassigned.
+     *
+     * `applyFlowRules` skips it — a stud is not fabricated — so counting it here
+     * reports work that will never be done and can never be cleared: the stage
+     * says "2 items match a rule, press Apply", Apply correctly does nothing,
+     * and the order is stuck one step short of confirmable forever.
+     *
+     * The rule and the count that reports on it have to agree.
+     */
+    if ((it.procurement_type || 'make') !== 'make') continue;
     const bucket = byLevel.get(lv);
     bucket.items++;
     if (it.flow_id) {
