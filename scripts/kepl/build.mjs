@@ -27,6 +27,7 @@ import {
   RAW_MATERIAL, BOQ_STATED, spanPartRows, rowWeight,
 } from './model.mjs';
 import { nestAll, utilisation, verify } from './nest.mjs';
+import { structureType } from '../rm-master/composite-girder-types.mjs';
 import { syncOrderProcurement } from '../../apps/fab_erp/services/procurementService.js';
 import { applyFlowRules } from '../../apps/fab_erp/services/flowAllocationService.js';
 import { recomputeOrderWeights } from '../../apps/fab_erp/services/itemWeightService.js';
@@ -188,6 +189,45 @@ try {
    * parent even when siblings differ (…-TF is 5, …-IS1/D is 6, both under a
    * segment at 4).
    */
+  /**
+   * EVERY ROW NAMES ITS TYPE, resolved before anything is written.
+   *
+   * A fab_items row is an INSTANCE; the catalogue holds the type. The field
+   * ladder reaches the catalogue rungs THROUGH that type, so a row built
+   * untyped inherits nothing from "all top flanges are E350" nor from its
+   * category — and the loss shows up as a missing value, never as an error.
+   * The first build of this order left 1,266 rows untyped for exactly that
+   * reason: nothing complained.
+   *
+   * A missing type is FATAL rather than a NULL. It means the catalogue for this
+   * structure family is incomplete, which is a setup problem — and writing NULL
+   * is how the same silent bug comes back.
+   */
+  const [catRows] = await conn.query(
+    `SELECT id, code FROM fab_item_catalog
+      WHERE company_id = ? AND deleted_at IS NULL AND code LIKE 'COMPOS-%'`,
+    [companyId],
+  );
+  const typeIdByCode = new Map(catRows.map((c) => [c.code, c.id]));
+  const missingTypes = new Set();
+  for (const p of pending) {
+    const wanted = structureType(p.levelKind, String(p.code).split('-').pop());
+    // A stud is bought, not made: its identity is the fastener it links to, so
+    // it legitimately has no structural type.
+    if (!wanted) { p.typeId = null; continue; }
+    if (!typeIdByCode.has(wanted)) { missingTypes.add(wanted); continue; }
+    p.typeId = typeIdByCode.get(wanted);
+  }
+  if (missingTypes.size) {
+    throw new Error(
+      `The catalogue is missing ${missingTypes.size} type(s) this structure needs: `
+      + `${[...missingTypes].sort().join(', ')}. Seed them (see `
+      + 'scripts/rm-master/composite-girder-types.mjs) before building — a row with no '
+      + 'type loses its inheritance silently.',
+    );
+  }
+  log(`  types resolved: ${pending.filter((p) => p.typeId).length} of ${pending.length} rows`);
+
   const depth = (c) => (c.match(/[/-]/g) ?? []).length;
   const byDepth = new Map();
   for (const p of pending) {
@@ -203,11 +243,13 @@ try {
     for (const p of group) {
       const parentId = p.parentCode ? idByCode.get(p.parentCode) : null;
       if (p.parentCode && !parentId) throw new Error(`parent ${p.parentCode} not inserted before ${p.code}`);
-      vals.push([companyId, orderId, lineIds[p.lineNo], parentId, p.name, 'nos', p.qty,
+      vals.push([companyId, orderId, lineIds[p.lineNo], parentId, p.typeId ?? null,
+        p.name, 'nos', p.qty,
         p.levelKind, p.code, p.l ?? null, p.w ?? null, p.t ?? null, 'mm', 'kg']);
     }
     await conn.query(
-      `INSERT INTO fab_items (company_id, order_id, order_line_id, parent_item_id, name, unit, qty,
+      `INSERT INTO fab_items (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+         name, unit, qty,
          level_kind, code, length, width, height, dim_unit, weight_unit) VALUES ?`,
       [vals],
     );
