@@ -325,7 +325,7 @@ export const getItemSpecHandler = (which) => async (req, res) => {
     const [rows] = await pool.query(
       `SELECT d.field_key AS k, v.value_text AS t, v.value_num AS n
          FROM fab_field_values v
-         JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+         JOIN fab_fields d ON d.id = v.field_id AND d.deleted_at IS NULL
         WHERE v.company_id = ? AND v.scope = ? AND v.scope_id = ? AND v.deleted_at IS NULL
           AND d.field_key IN ('material','grade','thickness_mm')`,
       [cid, scope, scopeId],

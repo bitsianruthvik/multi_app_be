@@ -271,14 +271,14 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
  */
 async function specVocabulary(companyId) {
   const [defs] = await pool.query(
-    `SELECT field_key AS k, allowed_values AS allowed FROM fab_field_defs
+    `SELECT field_key AS k, allowed_values AS allowed FROM fab_fields
       WHERE company_id = ? AND deleted_at IS NULL AND field_key IN ('material','grade')`,
     [companyId],
   );
   const [used] = await pool.query(
     `SELECT DISTINCT d.field_key AS k, v.value_text AS v
        FROM fab_field_values v
-       JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+       JOIN fab_fields d ON d.id = v.field_id AND d.deleted_at IS NULL
       WHERE v.company_id = ? AND v.deleted_at IS NULL
         AND d.field_key IN ('material','grade')
         AND v.value_text IS NOT NULL AND v.value_text <> ''`,
@@ -435,7 +435,7 @@ async function ownFieldValues(companyId, itemIds) {
   const [rows] = await pool.query(
     `SELECT v.scope_id AS itemId, d.field_key AS k, v.value_text AS v
        FROM fab_field_values v
-       JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+       JOIN fab_fields d ON d.id = v.field_id AND d.deleted_at IS NULL
       WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
         AND v.deleted_at IS NULL AND d.field_key IN ('material','grade')`,
     [companyId, ids],
