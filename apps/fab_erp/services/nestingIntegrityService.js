@@ -34,6 +34,10 @@
 import { pool } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
 
+import {
+  axisConflicts, conflictMessage, partAxes, plateAxes,
+} from './materialMatchService.js';
+
 /** Issue kinds, so callers can group and the UI can phrase them. */
 export const ISSUE = {
   MISSING_PART_DIMS: 'missing_part_dimensions',
@@ -51,9 +55,28 @@ export const ISSUE = {
    */
   NOT_NESTED_YET: 'not_nested_yet',
   THICKNESS_MISMATCH: 'thickness_mismatch',
+  /**
+   * The part and the plate disagree on WHAT THE STEEL IS.
+   *
+   * Separate kinds from THICKNESS_MISMATCH because the remedies differ: a
+   * thickness mismatch is usually a nesting slip, while a grade or material
+   * mismatch is a specification error and the part may be unbuildable from
+   * anything the yard holds. A stainless part on mild steel plate cuts, welds,
+   * and then fails inspection or corrodes in service — which is why this is
+   * blocking rather than advisory.
+   */
+  GRADE_MISMATCH: 'grade_mismatch',
+  MATERIAL_MISMATCH: 'material_mismatch',
   PART_TOO_BIG: 'part_too_big',
   PLATE_OVERFILLED: 'plate_overfilled',
   NO_MATERIAL: 'no_material',
+};
+
+/** Which issue kind each axis of a mismatch is reported as. */
+const AXIS_ISSUE = {
+  thickness: ISSUE.THICKNESS_MISMATCH,
+  grade: ISSUE.GRADE_MISMATCH,
+  material: ISSUE.MATERIAL_MISMATCH,
 };
 
 const num = (v) => {
@@ -98,27 +121,49 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
        JOIN fab_items p ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
        JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+        -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
+        -- a stud, a bolt, a bearing — is not cut from anything, so asking which
+        -- plate it comes off is the wrong question; procurement matches it to
+        -- stock or raises an order for it instead.
+        AND COALESCE(p.procurement_type, 'make') = 'make'
       ORDER BY fic.code, rm.nest_no, p.code`,
     [companyId, orderId],
   );
 
   /**
-   * LEAF parts that get made but are cut from nothing.
+   * LEAF parts that get MADE but say nothing about what they are made of.
    *
-   * "Has a flow and no material" is NOT the test, and using it produced a false
-   * positive on the first production run: a girder segment carries the assembly
-   * flow and legitimately has no raw material, because it is welded from the
-   * three parts beneath it rather than cut from plate. Requiring material of an
-   * assembly would have blocked two live orders for doing nothing wrong.
+   * WHAT THIS NOW ASKS, and it is a different question from before. It used to
+   * be "has this part got a material LINK", which was answerable at BOM time
+   * because the sheet named a catalogue item on every row. It is not answerable
+   * any more and must not be asked: the link is created at NESTING, so between
+   * import and nesting every part in the order would be reported as cut from
+   * nothing. That is the normal state of a fresh order, not a fault.
    *
-   * The real test is childlessness. A part with no children of its own has to
-   * come from somewhere physical; an item with children comes from them.
+   * The question that survives is whether the part states a SPECIFICATION —
+   * thickness, and a material — because that is what somebody has to supply and
+   * what nesting needs in order to choose anything at all. A part with a spec
+   * and no plate yet is simply not nested; a part with no spec cannot be nested,
+   * bought, or weighed, and that is worth reporting.
+   *
+   * TWO EXCLUSIONS, both learned from false positives:
+   *
+   *   children     an item with children comes from them. A girder segment
+   *                carries the assembly flow and legitimately has no raw
+   *                material — it is welded from the three parts beneath it.
+   *                Requiring material of an assembly blocked two live orders.
+   *
+   *   'buy' parts  a shear stud is not cut from anything. It is bought whole,
+   *                matched to stock or ordered at the procurement step, and
+   *                nesting has no business with it. Asking a stud for a grade of
+   *                plate is asking the wrong question of the wrong thing.
    */
   const [orphans] = await exec.query(
     `SELECT p.id, p.code, p.name FROM fab_items p
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.flow_id IS NOT NULL
+        AND COALESCE(p.procurement_type, 'make') = 'make'
         AND NOT EXISTS (SELECT 1 FROM fab_items k
                          WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL)`,
     [companyId, orderId],
@@ -127,11 +172,21 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
   const issues = [];
   const add = (type, o) => issues.push({ type, ...o });
 
-  for (const o of orphans) {
-    add(ISSUE.NO_MATERIAL, {
-      partId: o.id, partCode: o.code, partName: o.name,
-      message: `${o.name} has no material — it cannot be cut from anything, bought, or costed.`,
-    });
+  if (orphans.length) {
+    const spec = await partAxes(companyId, orphans.map((o) => o.id), { conn: exec });
+    for (const o of orphans) {
+      const s = spec.get(o.id) ?? {};
+      const missing = [
+        s.thickness == null ? 'thickness' : null,
+        !s.material ? 'material' : null,
+      ].filter(Boolean);
+      if (!missing.length) continue;
+      add(ISSUE.NO_MATERIAL, {
+        partId: o.id, partCode: o.code, partName: o.name, missing,
+        message: `${o.name} has no ${missing.join(' or ')} — nesting cannot choose a plate for it, `
+               + 'and it cannot be bought or costed.',
+      });
+    }
   }
 
   if (!links.length) {
@@ -148,6 +203,18 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
   const partIds = [...new Set(links.map((l) => l.partId))];
   const partFields = await resolveItemFields(companyId, partIds, { conn: exec });
 
+  /**
+   * Grade and material for both sides, read through the shared matcher so this
+   * audit compares exactly what the suggestor and the board compare.
+   *
+   * Sequential and NOT Promise.all: `exec` may be a single caller-supplied
+   * connection, and mysql2 cannot multiplex two queries on one — it waits on the
+   * socket forever rather than erroring, which is a hang and not a failure.
+   */
+  const materialIds = [...new Set(links.map((l) => l.materialId).filter(Boolean))];
+  const partSpec = await partAxes(companyId, partIds, { conn: exec });
+  const plateSpec = await plateAxes(companyId, materialIds, { conn: exec });
+
   // Area consumed per (material, nest), to catch a plate asked to yield more
   // than it physically contains.
   const nests = new Map();
@@ -157,6 +224,10 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
     const partL = num(f.length_mm);
     const partW = num(f.width_mm);
     const partT = num(f.thickness_mm);
+    const partGrade = partSpec.get(l.partId)?.grade ?? null;
+    const partMaterial = partSpec.get(l.partId)?.material ?? null;
+    const plateGrade = plateSpec.get(Number(l.materialId))?.grade ?? null;
+    const plateMaterial = plateSpec.get(Number(l.materialId))?.material ?? null;
     const plateL = num(l.plateLength);
     const plateW = num(l.plateWidth);
     const plateT = num(l.plateThick) ?? num(l.materialThickness);
@@ -173,14 +244,34 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
       });
     }
 
-    // Thickness: the part must be the same thickness as the stuff it is cut
-    // from. Compared against the CATALOG item, because that is what the
-    // material IS — a "MS Plate 20mm" is 20 mm whatever a nest row says.
-    if (partT != null && matT != null && Math.abs(partT - matT) > 0.001) {
-      add(ISSUE.THICKNESS_MISMATCH, {
-        ...where, partThickness: partT, materialThickness: matT,
-        message: `${l.partName} is ${partT} mm but ${l.materialCode} is ${matT} mm. `
-               + 'A part cannot be cut from material of a different thickness.',
+    /**
+     * ALL THREE AXES, from the one comparison the suggestor and the board also
+     * use. Thickness is compared against the CATALOG item, because that is what
+     * the material IS — a "MS Plate 20mm" is 20 mm whatever a nest row says —
+     * and grade and material come from the plate's own resolved fields rather
+     * than being inferred from its name.
+     *
+     * The part's side is resolved up the ladder: its order line states the
+     * material and grade, and the part overrides only where it differs.
+     *
+     * An unknown on either side is not a conflict here. This runs over orders
+     * built long before material was expressible, and reporting every one of
+     * them as uncuttable would bury the real contradictions.
+     */
+    for (const c of axisConflicts(
+      { thickness: partT, grade: partGrade, material: partMaterial },
+      { thickness: matT, grade: plateGrade, material: plateMaterial },
+    )) {
+      add(AXIS_ISSUE[c.axis], {
+        ...where,
+        axis: c.axis,
+        partValue: c.partValue,
+        plateValue: c.plateValue,
+        // Kept for callers written against the older shape, which named the
+        // thickness pair specifically.
+        ...(c.axis === 'thickness'
+          ? { partThickness: c.partValue, materialThickness: c.plateValue } : {}),
+        message: conflictMessage(c, { partName: l.partName, plateName: l.materialCode }),
       });
     }
 
@@ -302,6 +393,8 @@ export const BLOCKING = new Set([
   ISSUE.MISSING_PART_DIMS,
   ISSUE.MISSING_PLATE_DIMS,
   ISSUE.THICKNESS_MISMATCH,
+  ISSUE.GRADE_MISMATCH,
+  ISSUE.MATERIAL_MISMATCH,
   ISSUE.PART_TOO_BIG,
   ISSUE.PLATE_OVERFILLED,
   ISSUE.NO_MATERIAL,

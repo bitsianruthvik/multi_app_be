@@ -33,6 +33,7 @@
 import { pool } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { resolveFields } from './fieldService.js';
+import { plateFits } from './materialMatchService.js';
 import { nest, verify, utilisation } from './nestingPacker.js';
 import { syncOrderProcurement } from './procurementService.js';
 
@@ -81,10 +82,11 @@ async function plateCatalog(companyId, conn = null) {
     const width = num(f.width_mm?.value);
     const thickness = num(f.thickness_mm?.value) ?? num(i.thicknessMm);
     const grade = f.grade?.value ?? null;
+    const material = f.material?.value ?? null;
     // A plate with no size cannot be nested onto and is silently useless here;
     // it is left out rather than offered as a candidate that fits everything.
     if (length == null || width == null || thickness == null) continue;
-    out.push({ id: i.id, code: i.code, name: i.name, length, width, thickness, grade });
+    out.push({ id: i.id, code: i.code, name: i.name, length, width, thickness, grade, material });
   }
   return out;
 }
@@ -142,11 +144,23 @@ async function offcutSpecs(companyId, catalogItemIds, conn = null) {
 }
 
 /**
- * The parts this order could nest, with their size and what they are cut from.
+ * The parts this order could nest, with their size and what steel they need.
  *
- * A part here is the same thing the board calls one: a childless link row
- * carrying a catalog item and no flow, whose PARENT is the part proper. The
- * part's dimensions come from the field resolver; the link's are the plate's.
+ * DRIVEN OFF THE PARTS, not off their material links — and that inversion is the
+ * whole change. It used to select the LINK rows and join up to the part above
+ * each one, which worked only because the BOM importer created a link for every
+ * part at import time. Now the link is what NESTING produces, so before nesting
+ * there are none and this query returned nothing at all: the suggestor could
+ * only propose plates for orders that had already been given plates.
+ *
+ * So the link is a LEFT JOIN. A part that has never been nested still appears,
+ * with nulls where its material would be; a part that has been keeps its link so
+ * re-running the suggestor stays idempotent.
+ *
+ * A PART is a childless made leaf — childless because an item with children is
+ * assembled from them rather than cut, and made because a bought-whole stud is
+ * procurement's business, not nesting's. Material links do not count as children
+ * for that test, or a part would stop being a leaf the moment it was nested.
  */
 async function nestableParts(companyId, orderId, { includeNested }) {
   const [links] = await pool.query(
@@ -154,11 +168,35 @@ async function nestableParts(companyId, orderId, { includeNested }) {
             fic.code AS materialCode, fic.name AS materialName,
             fic.thickness_mm AS materialThickness,
             p.id AS partId, p.code AS partCode, p.name AS partName, p.qty AS partQty
-       FROM fab_items rm
-       JOIN fab_items p ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
-       JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
-      WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+       FROM fab_items p
+       LEFT JOIN fab_items rm
+              ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
+             AND (rm.level_kind = 'material'
+                  OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+       LEFT JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
+      WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
+        /*
+         * A MATERIAL ROW IS NOT A PART, and it has to be said explicitly now.
+         * While this query selected the links and joined UP to the part, that
+         * was implicit. Driving off the parts instead, a material row qualifies
+         * on its own terms — it is childless, and it is 'make' until
+         * procurement classifies it — so every nested part was offered twice,
+         * once as itself and once as the plate it sits on.
+         */
+        AND NOT (p.level_kind = 'material'
+                 OR (p.level_kind IS NULL AND p.catalog_item_id IS NOT NULL AND p.flow_id IS NULL))
+        -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
+        -- a stud, a bolt, a bearing — is not cut from anything, so asking which
+        -- plate it comes off is the wrong question; procurement matches it to
+        -- stock or raises an order for it instead.
+        AND COALESCE(p.procurement_type, 'make') = 'make'
+        -- Childless, ignoring its own material rows: an assembly is welded from
+        -- the parts beneath it, not cut from a sheet.
+        AND NOT EXISTS (
+          SELECT 1 FROM fab_items k
+           WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL
+             AND NOT (k.level_kind = 'material'
+                      OR (k.level_kind IS NULL AND k.catalog_item_id IS NOT NULL AND k.flow_id IS NULL)))
         ${includeNested ? '' : 'AND rm.nest_no IS NULL'}
       ORDER BY p.code`,
     [companyId, orderId],
@@ -170,7 +208,18 @@ async function nestableParts(companyId, orderId, { includeNested }) {
   // the material somebody already chose rather than quietly changing it.
   const matGrades = await resolveFields(
     companyId,
-    [...new Set(links.map((l) => l.materialId))].map((id) => ({ scope: 'catalog_item', scopeId: id })),
+    [...new Set(links.map((l) => l.materialId).filter(Boolean))]
+      .map((id) => ({ scope: 'catalog_item', scopeId: id })),
+    {},
+  );
+  /**
+   * The parts' TEXT fields — grade and material — which `resolveItemFields`
+   * cannot carry because it is numbers-only by contract. One batched call for
+   * every part, resolving the whole ladder including the order line.
+   */
+  const partText = await resolveFields(
+    companyId,
+    [...new Set(links.map((l) => l.partId))].map((id) => ({ scope: 'order_item', scopeId: id })),
     {},
   );
 
@@ -187,8 +236,12 @@ async function nestableParts(companyId, orderId, { includeNested }) {
      * a bought fastener does not. A part whose material is not plate is simply
      * not plate-nesting's business, and saying so is more useful than failing
      * to pack it.
+     *
+     * Only applies to a part that HAS a link. Having none is now the ordinary
+     * state before nesting, not a sign the part is bought some other way — the
+     * `procurement_type` filter in the query is what answers that question.
      */
-    if (num(l.materialThickness) == null) {
+    if (l.materialId != null && num(l.materialThickness) == null) {
       skipped.push({
         linkId: l.linkId, partCode: l.partCode, partName: l.partName,
         reason: `${l.materialCode} is not plate stock — it has no thickness — so this part is `
@@ -200,6 +253,26 @@ async function nestableParts(companyId, orderId, { includeNested }) {
     const length = num(f.length_mm);
     const width = num(f.width_mm);
     const thickness = num(f.thickness_mm);
+    /**
+     * THE PART'S OWN grade and material, resolved up the ladder.
+     *
+     * This used to read the grade off whatever material the part was already
+     * linked to, which put the answer in the wrong place: the DRAWING says what
+     * grade the bridge is, and the merchant's catalogue only says what he
+     * stocks. Since `order_line` became a rung and both fields widened to
+     * `order_item`, the part inherits them from its line and can override on
+     * itself — so the part now states what it needs and the catalogue is
+     * searched for something that satisfies it, rather than the other way round.
+     *
+     * The linked material is still the fallback, which is what keeps every order
+     * built before this working unchanged.
+     *
+     * Read from `partText`, NOT from `f`. `resolveItemFields` returns NUMBERS
+     * only — a documented boundary, since it feeds the formula engine — so a
+     * text field simply is not in it and `f.grade` would silently be undefined.
+     */
+    const partGrade = partText.get(`order_item:${l.partId}`)?.grade?.value ?? null;
+    const partMaterial = partText.get(`order_item:${l.partId}`)?.material?.value ?? null;
     if (length == null || width == null || thickness == null) {
       skipped.push({
         linkId: l.linkId, partCode: l.partCode, partName: l.partName,
@@ -209,8 +282,10 @@ async function nestableParts(companyId, orderId, { includeNested }) {
       continue;
     }
     rows.push({
-      key: String(l.linkId),
-      linkId: l.linkId,
+      // Keyed by PART, not by link — a part that has never been nested has no
+      // link id, and `undefined` as a key would collide across all of them.
+      key: `part:${l.partId}`,
+      linkId: l.linkId ?? null,
       partId: l.partId,
       partCode: l.partCode,
       partName: l.partName,
@@ -219,7 +294,10 @@ async function nestableParts(companyId, orderId, { includeNested }) {
       currentNestNo: l.nestNo,
       currentMaterialId: l.materialId,
       currentMaterialCode: l.materialCode,
-      grade: matGrades.get(`catalog_item:${l.materialId}`)?.grade?.value ?? null,
+      // The part's own answer wins; the linked material is the fallback that
+      // keeps orders built before the order_line rung existed working.
+      grade: partGrade ?? (l.materialId ? matGrades.get(`catalog_item:${l.materialId}`)?.grade?.value : null) ?? null,
+      material: partMaterial ?? (l.materialId ? matGrades.get(`catalog_item:${l.materialId}`)?.material?.value : null) ?? null,
     });
   }
   return { rows, skipped };
@@ -230,7 +308,8 @@ async function nestableParts(companyId, orderId, { includeNested }) {
  *
  * @param {object} opts
  *   includeNested  re-nest parts already on a plate (default false)
- *   grade          force a grade for parts whose material does not state one
+ *   grade          force a grade for parts that do not state one
+ *   material       force a material for parts that do not state one
  * @returns {Promise<object>} the proposal
  */
 export async function suggestNesting(companyId, orderId, opts = {}) {
@@ -260,27 +339,45 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
   }
 
   /**
-   * Grouped by thickness AND grade, because those are the two properties that
-   * decide what a part may be cut from. Grouping on thickness alone would
-   * cheerfully nest an E350 part onto E250 plate and be more efficient for it.
+   * Grouped by THICKNESS, GRADE and MATERIAL — the three properties that decide
+   * what a part may legally be cut from. Everything else about a plate decides
+   * whether the part FITS or what it COSTS.
+   *
+   * Thickness alone would nest an E350 part onto E250 plate and score better for
+   * it. Thickness and grade alone would put a stainless part on mild steel of
+   * the same grade designation, which is worse: it cuts, it welds, and it fails
+   * inspection or corrodes in service. Material was not expressible at all until
+   * 2026-08-21, so nothing could have stopped that.
    */
   const groups = new Map();
   for (const r of rows) {
     const grade = opts.grade ?? r.grade ?? null;
-    const key = `${r.thickness}|${grade ?? '?'}`;
-    if (!groups.has(key)) groups.set(key, { thickness: r.thickness, grade, rows: [] });
+    const material = opts.material ?? r.material ?? null;
+    const key = `${r.thickness}|${grade ?? '?'}|${material ?? '?'}`;
+    if (!groups.has(key)) groups.set(key, { thickness: r.thickness, grade, material, rows: [] });
     groups.get(key).rows.push(r);
   }
 
   const out = [];
   const unplaced = [];
   for (const [, g] of groups) {
-    // Candidates: the right thickness, and the right grade when one is known.
-    // An unknown grade is NOT treated as "any grade" — it narrows to nothing and
-    // is reported, because quietly picking a grade is a metallurgical decision
-    // and not one a packer should make.
-    const specs = plates.filter((p) => Math.abs(p.thickness - g.thickness) < 0.001
-      && (g.grade == null || p.grade === g.grade));
+    /**
+     * A candidate must agree on all three axes — the SAME test the board
+     * enforces on a drop and the integrity check audits afterwards, imported
+     * from `materialMatchService` so those three can never drift apart.
+     *
+     * THICKNESS must be known and equal; a plate of unrecorded thickness is not
+     * a candidate for anything.
+     *
+     * AN UNKNOWN GRADE OR MATERIAL does not disqualify either side, and it is
+     * worth being honest that this is a compromise rather than the rule you
+     * would want. Refusing every plate whose catalogue row has not recorded a
+     * material yet would empty the candidate list for most of the yard, and the
+     * suggestion is a PROPOSAL that a person accepts — nothing reaches steel
+     * without that. What stops a genuinely wrong pairing is the conflict check,
+     * which runs on the accepted nest and blocks procurement.
+     */
+    const specs = plates.filter((p) => plateFits(g, p));
     /**
      * Offcuts of the SAME material join the candidates.
      *
@@ -296,10 +393,18 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       for (const r of g.rows) {
         unplaced.push({
           linkId: r.linkId, partCode: r.partCode, partName: r.partName,
-          reason: g.grade == null
-            ? `${r.thickness} mm plate exists, but this part's material does not state a grade, `
-              + 'so no size can be chosen. Set a grade on the material, or choose one for this run.'
-            : `no ${g.thickness} mm plate in grade ${g.grade} is in the catalog`,
+          /**
+           * Name the axis that is actually missing.
+           *
+           * "No plate found" sends somebody to look at a full rack. "This part
+           * does not state a grade" says what to type, and where.
+           */
+          reason: g.grade == null || g.material == null
+            ? `${r.thickness} mm plate exists, but this part does not state a `
+              + `${[g.material == null ? 'material' : null, g.grade == null ? 'grade' : null]
+                .filter(Boolean).join(' or ')}, so no plate can be chosen. Set it on the `
+              + 'order line and every part inherits it, or on this part alone if it differs.'
+            : `no ${g.thickness} mm plate of ${g.material} in grade ${g.grade} is in the catalog`,
         });
       }
       continue;
@@ -320,6 +425,7 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       out.push({
         thickness: g.thickness,
         grade: g.grade,
+        material: g.material,
         plate: {
           /**
            * `id` is always the CATALOG item to link the part to — for an offcut
@@ -376,7 +482,7 @@ function summarise(groups, unplaced, skipped) {
   const waste = groups.reduce((s, g) => s + g.wasteAreaMm2, 0);
   const byT = new Map();
   for (const g of groups) {
-    const k = `${g.thickness}|${g.grade ?? '?'}`;
+    const k = `${g.thickness}|${g.grade ?? '?'}|${g.material ?? '?'}`;
     if (!byT.has(k)) byT.set(k, { thickness: g.thickness, grade: g.grade, plates: 0, used: 0, waste: 0 });
     const b = byT.get(k);
     b.plates++; b.used += g.usedAreaMm2; b.waste += g.wasteAreaMm2;
@@ -393,7 +499,7 @@ function summarise(groups, unplaced, skipped) {
     unplaced: unplaced.length,
     skipped: skipped.length,
     byThickness: [...byT.values()].map((b) => ({
-      thickness: b.thickness, grade: b.grade, plates: b.plates,
+      thickness: b.thickness, grade: b.grade, material: b.material, plates: b.plates,
       wastePct: Math.round((b.waste / (b.used + b.waste)) * 1000) / 10,
     })),
   };
@@ -433,12 +539,31 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
     let next = Number(maxNo) || 0;
 
     for (const n of nests) {
-      const linkIds = (n.parts ?? []).map((p) => Number(p.linkId)).filter(Number.isFinite);
+      /**
+       * `p.linkId != null` and NOT `Number.isFinite(Number(p.linkId))`, because
+       * `Number(null)` is 0 and 0 is finite — so a part with no link would be
+       * read as link id 0, land in `linkIds`, match nothing on update, and be
+       * silently left un-nested. Which is exactly what it did.
+       */
+      const hasLink = (p) => p.linkId != null;
+      const linkIds = (n.parts ?? []).filter(hasLink)
+        .map((p) => Number(p.linkId)).filter(Number.isFinite);
+      /**
+       * Parts in this nest that have NO material row yet.
+       *
+       * The ordinary case now: a link is what nesting PRODUCES, so a part being
+       * nested for the first time has none and there is nothing to update. One
+       * is created below, and from then on it behaves exactly like a link the
+       * BOM importer used to make.
+       */
+      const bare = (n.parts ?? [])
+        .filter((p) => !hasLink(p) && Number.isFinite(Number(p.partId)))
+        .map((p) => Number(p.partId));
       const plateId = Number(n.plate?.id);
-      if (!linkIds.length || !Number.isFinite(plateId)) continue;
+      if ((!linkIds.length && !bare.length) || !Number.isFinite(plateId)) continue;
 
       const [[plate]] = await conn.query(
-        `SELECT ic.id, ic.name, ic.unit, ic.thickness_mm AS thicknessMm
+        `SELECT ic.id, ic.code, ic.name, ic.unit, ic.thickness_mm AS thicknessMm
            FROM fab_item_catalog ic WHERE ic.id = ? AND ic.company_id = ? AND ic.deleted_at IS NULL`,
         [plateId, companyId],
       );
@@ -446,32 +571,65 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
 
       // A nest already issued to the floor is not ours to rearrange. Checked on
       // the links being MOVED, since those are what would change underneath it.
-      const [issued] = await conn.query(
-        `SELECT DISTINCT i.nest_no FROM fab_items i
-           JOIN fab_nest_issues ni ON ni.company_id = i.company_id AND ni.order_id = i.order_id
-            AND ni.catalog_item_id = i.catalog_item_id AND ni.nest_no = i.nest_no
-          WHERE i.company_id = ? AND i.order_id = ? AND i.id IN (?) AND i.deleted_at IS NULL`,
-        [companyId, orderId, linkIds],
-      );
-      if (issued.length) {
-        const e = new Error(`${issued.map((r) => r.nest_no).join(', ')} has already gone to the floor `
-          + 'and cannot be re-arranged.');
-        e.status = 409; throw e;
+      // A part with no link has never been on a nest, so nothing to check.
+      if (linkIds.length) {
+        const [issued] = await conn.query(
+          `SELECT DISTINCT i.nest_no FROM fab_items i
+             JOIN fab_nest_issues ni ON ni.company_id = i.company_id AND ni.order_id = i.order_id
+              AND ni.catalog_item_id = i.catalog_item_id AND ni.nest_no = i.nest_no
+            WHERE i.company_id = ? AND i.order_id = ? AND i.id IN (?) AND i.deleted_at IS NULL`,
+          [companyId, orderId, linkIds],
+        );
+        if (issued.length) {
+          const e = new Error(`${issued.map((r) => r.nest_no).join(', ')} has already gone to the floor `
+            + 'and cannot be re-arranged.');
+          e.status = 409; throw e;
+        }
       }
 
       const nestNo = `N-${String(++next).padStart(3, '0')}`;
-      const [res] = await conn.query(
-        `UPDATE fab_items
-            SET nest_no = ?, catalog_item_id = ?, name = ?, unit = ?,
-                length = ?, width = ?, height = ?, qty = 1
-          WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
-            AND catalog_item_id IS NOT NULL AND flow_id IS NULL`,
-        [nestNo, plate.id, plate.name, plate.unit || 'nos',
-          n.plate.length, n.plate.width, plate.thicknessMm,
-          companyId, orderId, linkIds],
-      );
+      if (linkIds.length) {
+        const [res] = await conn.query(
+          `UPDATE fab_items
+              SET nest_no = ?, catalog_item_id = ?, name = ?, unit = ?,
+                  length = ?, width = ?, height = ?, qty = 1
+            WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
+              AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+          [nestNo, plate.id, plate.name, plate.unit || 'nos',
+            n.plate.length, n.plate.width, plate.thicknessMm,
+            companyId, orderId, linkIds],
+        );
+        linksMoved += res.affectedRows;
+      }
+
+      /**
+       * FIRST-TIME LINKS, written here rather than through `setItemMaterial`.
+       *
+       * That function derives a plate size from whatever the yard most often
+       * holds, which is the right guess when somebody picks a material out of a
+       * list and nothing else is known. Here the size is not a guess: the packer
+       * chose this exact sheet and laid these exact parts on it, so writing the
+       * yard's most common size over it would discard the decision being
+       * accepted. Same shape of row, deliberately different dimensions.
+       */
+      if (bare.length) {
+        const [made] = await conn.query(
+          `INSERT INTO fab_items
+             (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
+              qty, flow_id, length, width, height, code, nest_no, level_kind, dim_unit, weight_unit)
+           SELECT p.company_id, p.order_id, p.order_line_id, p.id, ?, ?, ?,
+                  1, NULL, ?, ?, ?,
+                  CONCAT(COALESCE(p.code, p.id), '-', ?), ?, 'material', 'mm', 'kg'
+             FROM fab_items p
+            WHERE p.company_id = ? AND p.order_id = ? AND p.id IN (?) AND p.deleted_at IS NULL`,
+          [plate.id, plate.name, plate.unit || 'nos',
+            n.plate.length, n.plate.width, plate.thicknessMm,
+            plate.code ?? plate.id, nestNo,
+            companyId, orderId, bare],
+        );
+        linksMoved += made.affectedRows;
+      }
       applied++;
-      linksMoved += res.affectedRows;
 
       /**
        * AN OFFCUT IS ONE PIECE, SO ACCEPTING ONE HAS TO CLAIM IT.

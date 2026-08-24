@@ -17,10 +17,29 @@
  *     qty              1
  *     nest_no          NULL until nesting groups it onto a plate
  *
- * That `catalog_item_id IS NOT NULL AND flow_id IS NULL` pair is the same test
- * taskGatingService and the formula engine use to tell a `raw_material` input
- * from a `child_parts` one, so a link made here behaves identically to an
- * imported one everywhere downstream.
+ * HOW A MATERIAL LINK IS RECOGNISED — and this changed, because the old test
+ * silently stopped working.
+ *
+ * It used to be a catalog item with no flow, on the
+ * reasoning that only a material row carried a catalog item without a flow. That
+ * became false on 2026-08-21, when every order row was given a TYPE from the item
+ * catalog: a span row now carries `catalog_item_id` (COMPOS-SPAN) and no flow, and
+ * so does a girder. Ten rows in production began answering "yes, I am a piece of
+ * raw material".
+ *
+ * The consequence was not cosmetic. `itemWeightService` SKIPS material links when
+ * it sums a parent's children — correctly, since a part's plate is not another
+ * part of it — so every span quietly stopped counting its four girders. KEPL's
+ * spans compute to 65.8 t against a true 328.9 t, a 5× understatement, latent
+ * only because the stored figures were written before the typing and nothing had
+ * recomputed them since. Any BOQ re-import would have written it in.
+ *
+ * `level_kind = 'material'` is the test now: the row says what it IS rather than
+ * being inferred from which columns happen to be filled. Verified against
+ * production — 1,084 material rows, all labelled, and the 10 false positives are
+ * exactly the typed assemblies. Use `MATERIAL_LINK_SQL` / `isMaterialLink` rather
+ * than writing either test again, because this is the second time an inferred
+ * shape has drifted out from under the code that depended on it.
  *
  * CHANGING THE MATERIAL CLEARS THE NEST. A nest is a group of parts sharing ONE
  * physical plate; a part that is now a different material cannot stay on it.
@@ -32,6 +51,22 @@
 import { pool } from '../../../db.js';
 import { composeCode, materialSegment } from './itemCodeService.js';
 import { syncOrderProcurement } from './procurementService.js';
+
+/**
+ * "This row is a piece of raw material", as a SQL predicate.
+ *
+ * The second clause is for rows written before `level_kind` existed: they have no
+ * label, so the old inferred test is still the only thing that can identify them.
+ * It is safe to keep because a TYPED assembly always has a level_kind — that is
+ * what makes it typed — so the fallback can never readmit the rows this fix is
+ * about. Unqualified column names; alias the table as needed by prefixing.
+ */
+export const MATERIAL_LINK_SQL =
+  "(level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))";
+
+/** The same test against a row already in hand. Needs `level_kind` selected. */
+export const isMaterialLink = (r) => r?.level_kind === 'material'
+  || (r?.level_kind == null && r?.catalog_item_id != null && r?.flow_id == null);
 
 /**
  * The PLATE SIZE to stamp on a material link, for a chosen catalog material.
@@ -97,8 +132,7 @@ async function loadPart(exec, companyId, itemId) {
 async function existingLink(exec, companyId, partId) {
   const [[row]] = await exec.query(
     `SELECT id, catalog_item_id AS catalogItemId, nest_no AS nestNo FROM fab_items
-      WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id IS NOT NULL
-        AND flow_id IS NULL AND deleted_at IS NULL LIMIT 1`,
+      WHERE company_id = ? AND parent_item_id = ? AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL)) AND deleted_at IS NULL LIMIT 1`,
     [companyId, partId],
   );
   return row ?? null;

@@ -16,13 +16,23 @@
  * There is nowhere to store it. The board creates one client-side and it becomes
  * real on the first drop, which is why `createNest` is not an endpoint.
  *
- * WHAT A PART CAN GO ON is decided by its material, which the BOM captured. A
- * part whose link says 20mm plate can only be dropped on a 20mm plate nest;
- * anything else would be a nest whose members are not all from one piece, which
- * is what a nest means.
+ * WHAT A PART CAN GO ON is decided by its SPECIFICATION — thickness, grade and
+ * material — checked here against the plate on every drop. A part whose link
+ * says 20mm plate can only be dropped on a 20mm plate nest; anything else would
+ * be a nest whose members are not all from one piece, which is what a nest
+ * means. The three-axis test is imported rather than written here, because a
+ * board that accepts what the suggestor refuses is the worst of the two.
+ *
+ * THE BOARD CAN NOW CHOOSE THE PLATE ITSELF. It used to require that somebody
+ * had already said what each part was cut from, back when a material meant only
+ * a thickness. Now that the catalogue holds every SIZE, "which plate" is not
+ * answerable until you know what else is going on it — so the choice belongs
+ * here, and passing `materialId` with `partIds` makes the link at the moment of
+ * nesting rather than long before it.
  */
 
 import { pool } from '../../../db.js';
+import { partAxes, plateAxes, axisConflicts, conflictMessage } from './materialMatchService.js';
 
 /** 404s unless the order is in the caller's company. */
 async function assertOrder(companyId, orderId) {
@@ -65,7 +75,12 @@ export async function nestingBoard(companyId, orderId) {
        JOIN fab_items p        ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
        JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+        -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
+        -- a stud, a bolt, a bearing — is not cut from anything, so asking which
+        -- plate it comes off is the wrong question; procurement matches it to
+        -- stock or raises an order for it instead.
+        AND COALESCE(p.procurement_type, 'make') = 'make'
       ORDER BY p.code`,
     [companyId, orderId],
   );
@@ -78,9 +93,11 @@ export async function nestingBoard(companyId, orderId) {
        FROM fab_items p
        LEFT JOIN fab_items rm
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+             AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.level_kind = 'part'
+        -- Made parts only: a bought-whole stud belongs to procurement, not here.
+        AND COALESCE(p.procurement_type, 'make') = 'make'
       GROUP BY p.id, p.code, p.name, p.qty, p.length, p.width, p.height
      HAVING COUNT(rm.id) = 0
       ORDER BY p.code`,
@@ -157,6 +174,54 @@ export async function nestingBoard(companyId, orderId) {
 const num = (v) => (v == null ? null : Number(v));
 
 /**
+ * Throw 422 unless every one of these parts may be cut from this plate.
+ *
+ * WHY IT THROWS while `nestingIntegrityService` only reports the same
+ * contradictions: that service audits an order that already exists and a hard
+ * refusal there would block the very edit that fixes it. This is somebody
+ * making a NEW pairing right now, and there is nothing to preserve — the drop
+ * simply should not happen.
+ *
+ * Every offending part is named, not just the first. Someone dragging eleven
+ * parts onto a plate wants to know which of them do not belong there, not to
+ * discover them one save at a time.
+ */
+async function assertAxesAgree(conn, companyId, partIdList, materialId) {
+  const parts = [...new Set((partIdList ?? []).map(Number).filter(Number.isFinite))];
+  if (!parts.length || !Number.isFinite(materialId)) return;
+
+  // Sequential: `conn` is one connection and mysql2 cannot multiplex it.
+  const spec = await partAxes(companyId, parts, { conn });
+  const plates = await plateAxes(companyId, [materialId], { conn });
+  const plateSpec = plates.get(materialId);
+  if (!plateSpec) {
+    const e = new Error('That material is not in the item catalog.'); e.status = 404; throw e;
+  }
+
+  const [named] = await conn.query(
+    'SELECT id, name FROM fab_items WHERE company_id = ? AND id IN (?)',
+    [companyId, parts],
+  );
+  const nameOf = new Map(named.map((r) => [Number(r.id), r.name]));
+
+  const problems = [];
+  for (const partId of parts) {
+    for (const c of axisConflicts(spec.get(partId), plateSpec)) {
+      problems.push(conflictMessage(c, {
+        partName: nameOf.get(partId) ?? `Part ${partId}`,
+        plateName: plateSpec.code,
+      }));
+    }
+  }
+  if (problems.length) {
+    const e = new Error(problems.join(' '));
+    e.status = 422;
+    e.details = problems;
+    throw e;
+  }
+}
+
+/**
  * Put parts on a nest, or take them off it (`nestNo: null`).
  *
  * Every part must already need the nest's material. That is checked here rather
@@ -166,19 +231,58 @@ const num = (v) => (v == null ? null : Number(v));
  * Plate dimensions are written to every link on the nest, since they describe
  * the plate rather than the part — the same shape the sheet importer produces.
  */
-export async function assignParts(companyId, orderId, { linkIds, nestNo, plate }) {
+export async function assignParts(companyId, orderId, {
+  linkIds, partIds, materialId: chosenMaterialId, nestNo, plate,
+}) {
   await assertOrder(companyId, orderId);
   const ids = (Array.isArray(linkIds) ? linkIds : []).map(Number).filter(Number.isFinite);
-  if (!ids.length) { const e = new Error('No parts given.'); e.status = 400; throw e; }
+  const bareParts = (Array.isArray(partIds) ? partIds : []).map(Number).filter(Number.isFinite);
+  if (!ids.length && !bareParts.length) {
+    const e = new Error('No parts given.'); e.status = 400; throw e;
+  }
+  if (bareParts.length && !chosenMaterialId) {
+    const e = new Error('Choose the material those parts are to be cut from.');
+    e.status = 400; throw e;
+  }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
+    /**
+     * PARTS WITH NO LINK YET get one now, from the chosen plate.
+     *
+     * `setItemMaterial` is reused rather than re-implemented: it owns the shape
+     * of a material link, and — the part that is easy to miss — it calls
+     * `syncOrderProcurement`, which is what makes the row read as BUY. A link
+     * written directly here would leave the order unable to raise a purchase
+     * order for a plate it plainly buys.
+     *
+     * The three axes are checked BEFORE any of this, below, so a refusal costs
+     * nothing.
+     */
+    if (bareParts.length) {
+      await assertAxesAgree(conn, companyId, bareParts, Number(chosenMaterialId));
+      const { setItemMaterial } = await import('./itemMaterialService.js');
+      for (const partId of bareParts) {
+        const r = await setItemMaterial(companyId, partId, Number(chosenMaterialId), conn);
+        if (r?.itemId == null) {
+          const e = new Error('That part is no longer on this order.'); e.status = 409; throw e;
+        }
+      }
+      const [made] = await conn.query(
+        `SELECT id FROM fab_items
+          WHERE company_id = ? AND order_id = ? AND parent_item_id IN (?) AND deleted_at IS NULL
+            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+        [companyId, orderId, bareParts],
+      );
+      for (const m of made) if (!ids.includes(Number(m.id))) ids.push(Number(m.id));
+    }
+
     const [rows] = await conn.query(
-      `SELECT id, catalog_item_id, nest_no FROM fab_items
+      `SELECT id, parent_item_id, catalog_item_id, nest_no FROM fab_items
         WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
-          AND catalog_item_id IS NOT NULL AND flow_id IS NULL`,
+          AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
       [companyId, orderId, ids],
     );
     if (rows.length !== ids.length) {
@@ -193,6 +297,18 @@ export async function assignParts(companyId, orderId, { linkIds, nestNo, plate }
         e.status = 422; throw e;
       }
       const materialId = [...materials][0];
+
+      /**
+       * THE THREE AXES, for parts that already had a link.
+       *
+       * Checked on every drop rather than only when the link is made, because
+       * the drop is where the part meets THIS plate. A part carried onto a nest
+       * of the wrong grade by a drag is exactly the mistake the suggestor
+       * refuses, and refusing it in one place only would be no rule at all.
+       */
+      await assertAxesAgree(
+        conn, companyId, rows.map((r) => r.parent_item_id), Number(materialId),
+      );
 
       // Refuse to touch a nest already drawn from stock.
       const [[gone]] = await conn.query(
@@ -209,7 +325,7 @@ export async function assignParts(companyId, orderId, { linkIds, nestNo, plate }
       const [[other]] = await conn.query(
         `SELECT catalog_item_id FROM fab_items
           WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-            AND catalog_item_id IS NOT NULL AND flow_id IS NULL LIMIT 1`,
+            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL)) LIMIT 1`,
         [companyId, orderId, nestNo],
       );
       if (other && other.catalog_item_id !== materialId) {
@@ -229,7 +345,7 @@ export async function assignParts(companyId, orderId, { linkIds, nestNo, plate }
             SET length = COALESCE(?, length), width = COALESCE(?, width),
                 height = COALESCE(?, height), qty = COALESCE(?, qty)
           WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-            AND catalog_item_id IS NOT NULL AND flow_id IS NULL`,
+            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
         [plate.length ?? null, plate.width ?? null, plate.thick ?? null, plate.plates ?? null,
           companyId, orderId, nestNo],
       );
@@ -258,7 +374,7 @@ export async function updateNest(companyId, orderId, nestNo, plate = {}) {
         SET length = COALESCE(?, length), width = COALESCE(?, width),
             height = COALESCE(?, height), qty = COALESCE(?, qty)
       WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-        AND catalog_item_id IS NOT NULL AND flow_id IS NULL`,
+        AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
     [plate.length ?? null, plate.width ?? null, plate.thick ?? null, plate.plates ?? null,
       companyId, orderId, nestNo],
   );
@@ -285,7 +401,7 @@ export async function clearNest(companyId, orderId, nestNo) {
   await pool.query(
     `UPDATE fab_items SET nest_no = NULL
       WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-        AND catalog_item_id IS NOT NULL AND flow_id IS NULL`,
+        AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
     [companyId, orderId, nestNo],
   );
   return nestingBoard(companyId, orderId);

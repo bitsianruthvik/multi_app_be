@@ -6,7 +6,7 @@ import {
 } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
-import { setItemMaterial } from '../services/itemMaterialService.js';
+import { setFields } from '../services/fieldService.js';
 import {
   parameterGrid, setParameters, exportParameters, importParameters,
 } from '../services/orderParametersService.js';
@@ -241,29 +241,79 @@ export const setItemFlowHandler = async (req, res) => {
 };
 
 /**
- * POST — set (or clear) what one part is cut from.
+ * POST — set WHAT THE STEEL IS, on an order line or on one part.
  *
- * The screen equivalent of the BOQ sheet's Raw Material column. Until this
- * existed the nesting step's own message told people to "set the Raw Material
- * column and re-upload", i.e. round-trip a spreadsheet to change one dropdown.
+ * REPLACED `POST /items/:itemId/material`, which set a part's raw-material link
+ * directly. That endpoint was the screen half of the pre-nesting material
+ * assignment and had to go for the same reason the sheet column did: naming a
+ * catalogue item now also picks a plate SIZE, and which size to buy is not
+ * knowable until you know what else is cut from the same sheet. The link is made
+ * at nesting instead, by the suggestor or by a drop on the board.
  *
- * `materialId: null` clears the link — "we do not know yet" is a real answer.
+ * WHY IT TAKES A SCOPE. The values belong at whichever level is actually true.
+ * An order is usually one steel throughout, so it is stated once on the LINE and
+ * every part inherits it; a part that differs overrides it and nothing else
+ * moves. Writing the same answer onto six hundred rows would work exactly once —
+ * after that the line would mean nothing, because every row overrides it.
+ *
+ * A null or empty value CLEARS the override, which is how a part goes back to
+ * following its line.
  */
-export const setItemMaterialHandler = async (req, res) => {
+export const setItemSpecHandler = (which) => async (req, res) => {
   try {
     const cid = companyId(req);
-    const materialId = req.body?.materialId ?? null;
-    const result = await setItemMaterial(cid, Number(req.params.itemId), materialId);
+    const scope = which === 'lines' ? 'order_line' : 'order_item';
+    const scopeId = Number(req.params.id);
+    if (!Number.isFinite(scopeId)) {
+      return res.status(400).json({ message: 'Which line or part?' });
+    }
+
+    // Only the three axes are settable here. Anything else in the body is
+    // ignored rather than written — this is not a general field endpoint, and
+    // letting it become one would put an unaudited write path next to a
+    // permission check written for something narrower.
+    const body = req.body ?? {};
+    const spec = {};
+    for (const k of ['material', 'grade', 'thickness_mm']) {
+      if (Object.prototype.hasOwnProperty.call(body, k)) {
+        spec[k] = body[k] === '' ? null : body[k];
+      }
+    }
+    if (!Object.keys(spec).length) {
+      return res.status(400).json({ message: 'Nothing to set — send material, grade or thickness_mm.' });
+    }
+
+    const owner = await specOwner(cid, scope, scopeId);
+    if (!owner) return res.status(404).json({ message: 'That line or part does not exist.' });
+
+    const { rejected } = await setFields(cid, scope, scopeId, spec);
     res.json({
-      ...result,
-      readiness: result.orderId ? await refreshOrderStage(cid, result.orderId) : null,
+      scope,
+      scopeId,
+      orderId: owner.orderId,
+      set: Object.keys(spec).filter((k) => !rejected.some((r) => r.fieldKey === k)),
+      rejected,
+      readiness: owner.orderId ? await refreshOrderStage(cid, owner.orderId) : null,
     });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: setItemMaterial failed');
+    logger.error({ err }, 'fab_erp: setItemSpec failed');
     res.status(500).json({ message: err.message });
   }
 };
+
+/** The order a line or item belongs to, and proof it is this company's. */
+async function specOwner(cid, scope, scopeId) {
+  const [[row]] = await pool.query(
+    scope === 'order_line'
+      ? `SELECT order_id AS orderId FROM fab_order_lines
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`
+      : `SELECT order_id AS orderId FROM fab_items
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    [scopeId, cid],
+  );
+  return row ?? null;
+}
 
 // ── the nesting board ───────────────────────────────────────────────────────
 // Every write returns the whole board rather than a delta: it is one screen of
@@ -320,6 +370,10 @@ export const nestingBoardHandler = board(async (cid, orderId) => ({
 export const assignPartsHandler = board(async (cid, orderId, req) => ({
   ...await assignParts(cid, orderId, {
     linkIds: req.body?.linkIds,
+    // Parts with no material yet, plus the plate chosen for them. The board is
+    // where that choice is made now, so it arrives on the same drop as the nest.
+    partIds: req.body?.partIds,
+    materialId: req.body?.materialId ?? null,
     nestNo: req.body?.nestNo ?? null,
     plate: req.body?.plate ?? null,
   }),
@@ -424,7 +478,7 @@ export const orderNestingHandler = async (req, res) => {
            ON parent.id = rm.parent_item_id AND parent.deleted_at IS NULL
          JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id
         WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-          AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+          AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
           AND NOT EXISTS (SELECT 1 FROM fab_items c
                            WHERE c.parent_item_id = rm.id AND c.deleted_at IS NULL)
         ORDER BY fic.code, rm.nest_no, parent.code`,

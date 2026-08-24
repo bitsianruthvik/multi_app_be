@@ -120,7 +120,10 @@ async function partsOnNest(conn, companyId, orderId, catalogItemId, nestNo) {
        FROM fab_items rm
        JOIN fab_items p ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.catalog_item_id = ?
-        AND rm.nest_no = ? AND rm.deleted_at IS NULL AND rm.flow_id IS NULL`,
+        AND rm.nest_no = ? AND rm.deleted_at IS NULL
+        -- The labelled test, not 'catalog item and no flow': a TYPED girder row
+        -- also has both, and only its null nest_no keeps it out of here.
+        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.flow_id IS NULL))`,
     [companyId, orderId, catalogItemId, nestNo],
   );
   const partRows = [];

@@ -34,7 +34,7 @@ import {
   flowSummaryHandler,
   applyFlowRulesHandler,
   setItemFlowHandler,
-  setItemMaterialHandler,
+  setItemSpecHandler,
   parameterGridHandler,
   exportParametersHandler,
   importParametersHandler,
@@ -95,9 +95,26 @@ router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
 router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), applyFlowRulesHandler);
 router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage'), setItemFlowHandler);
-// The screen equivalent of the BOQ sheet Raw Material column, so setting what a
-// part is cut from no longer needs an Excel round trip.
-router.post('/items/:itemId/material', protect, requirePerm('fab_erp_projects_manage'), setItemMaterialHandler);
+
+/**
+ * WHAT THE STEEL IS — material, grade, thickness — on a line or on one part.
+ *
+ * This replaced `POST /items/:itemId/material`, which pointed a part at a
+ * specific catalogue item before nesting. That is no longer a question the BOM
+ * stage can answer: a catalogue item is now a SIZE as well as a material, and
+ * which size to buy depends on what else is cut from the same sheet. Nesting
+ * makes the link, and refuses any plate that disagrees with these three values.
+ *
+ * `lines` is the one people will use. An order is normally one steel throughout,
+ * so it is stated once there and every part inherits it; `items` is for the part
+ * that genuinely differs.
+ *
+ * Two routes rather than one `:scope(lines|items)` — Express 5 uses
+ * path-to-regexp v8, which dropped inline patterns and throws at mount time.
+ */
+router.post('/spec/lines/:id', protect, requirePerm('fab_erp_projects_manage'), setItemSpecHandler('lines'));
+router.post('/spec/items/:id', protect, requirePerm('fab_erp_projects_manage'), setItemSpecHandler('items'));
+
 
 // ── parameters: grid, spreadsheet, and marking copies ──────────────────────
 //

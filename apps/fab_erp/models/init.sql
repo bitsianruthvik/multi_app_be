@@ -3198,6 +3198,34 @@ CREATE TABLE IF NOT EXISTS fab_bom_templates (
   KEY idx_fbt_material (rm_catalog_item_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ── a template states the SPEC, not a catalogue item (2026-08-24) ──────────
+--
+-- `rm_catalog_item_id` named one specific plate, which was the pre-nesting
+-- material assignment in template form. It stopped being answerable once the
+-- catalogue held every SIZE: naming an item also picks a 2000-wide sheet over a
+-- 2500-wide one, and which to buy depends on what else is cut from it — the
+-- nesting decision, made much later.
+--
+-- So a template now says what the STEEL is, and nesting resolves it to a plate.
+-- The old column is LEFT IN PLACE and simply unread: dropping it is destructive,
+-- gains nothing, and the id in it is the only record of what somebody once
+-- chose. It can go once nobody misses it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates'
+    AND column_name = 'material');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_bom_templates ADD COLUMN material VARCHAR(40) NULL AFTER thickness_mm',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE table_schema = DATABASE() AND table_name = 'fab_bom_templates'
+    AND column_name = 'grade');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_bom_templates ADD COLUMN grade VARCHAR(40) NULL AFTER material',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ── seed the parts that were hardcoded ────────────────────────────────────
 -- Seeded for every company that HAS THE fab_erp APP.
 --

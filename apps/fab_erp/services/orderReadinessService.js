@@ -579,7 +579,7 @@ async function countTree(companyId, orderId) {
        FROM fab_items fi
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
         -- not a raw-material link: those hang under a part
-        AND NOT (fi.catalog_item_id IS NOT NULL AND fi.flow_id IS NULL)`,
+        AND NOT ((fi.level_kind = 'material' OR (fi.level_kind IS NULL AND fi.catalog_item_id IS NOT NULL AND fi.flow_id IS NULL)))`,
     [companyId, orderId],
   );
 
@@ -612,7 +612,7 @@ async function countNesting(companyId, orderId) {
        FROM fab_items p
        LEFT JOIN fab_items rm
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL
+             AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.level_kind = 'part'`,
     [companyId, orderId],

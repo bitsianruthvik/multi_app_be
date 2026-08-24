@@ -47,11 +47,8 @@ import { recomputeOrderWeights } from './itemWeightService.js';
 import {
   orderCodePrefix, appendLevel, levelLabel, composeCode, materialSegment,
 } from './itemCodeService.js';
-import {
-  rawMaterialsFor, materialsForThickness, stockedThicknesses,
-} from './rawMaterialService.js';
+import { rawMaterialsFor } from './rawMaterialService.js';
 import { syncOrderProcurement } from './procurementService.js';
-import { setItemMaterial } from './itemMaterialService.js';
 import { setFields } from './fieldService.js';
 
 const SHEET = 'BOQ';
@@ -75,14 +72,27 @@ const COLS = [
   { header: 'Length',    width: 10, key: 'length' },
   { header: 'Width',     width: 10, key: 'width' },
   { header: 'Qty',       width: 8,  key: 'qty' },
-  // WHAT the part is cut from — not WHICH piece, which is nesting's job.
-  // Removed from this sheet in the three-document split because it was
-  // conflated with nesting; back because the two are different questions. The
-  // material is a property of the part (a web plate is 20mm plate whatever
-  // happens next); the plate it comes off is a decision made later, on the
-  // nesting board. Capturing it here is what lets that board show only the
-  // parts that could go on a given plate.
-  { header: 'Raw Material', width: 22, key: 'rmCode' },
+  /**
+   * WHAT THE STEEL IS — not which piece of it, which is nesting's job.
+   *
+   * This replaced a `Raw Material` column that named a specific catalogue item,
+   * and the reason is that the column stopped being answerable. It was written
+   * when a raw material meant a THICKNESS ("MS Plate 20mm"), so naming one on a
+   * BOM row was a statement about the part. Since the catalogue took on every
+   * SIZE, naming an item also picks a 2000-wide plate over a 2500-wide one —
+   * and which size to buy cannot be known until you know what else is being cut
+   * from the same sheet. That is the nesting decision, made later.
+   *
+   * So the sheet now states the SPECIFICATION and nesting resolves it to a
+   * plate. These two plus `Thick` are the three axes a part is matched on.
+   *
+   * BOTH ARE OPTIONAL HERE. The usual case is that a whole order is one steel,
+   * so material and grade are set once on the ORDER LINE and inherited by every
+   * part; a value in these columns is an OVERRIDE for the row that needs
+   * different steel. Leaving them blank is the normal, expected thing.
+   */
+  { header: 'Material', width: 14, key: 'material' },
+  { header: 'Grade',    width: 14, key: 'grade' },
   { header: 'Notes',     width: 26, key: 'notes' },
 ];
 const C = Object.fromEntries(COLS.map((c, i) => [c.key, i + 1]));
@@ -176,8 +186,18 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     '',
     'QTY is how many of this part go into ONE of its parent. Defaults to 1.',
     '',
-    'WEIGHT IS NOT IN THIS SHEET. It is worked out as volume x density once nesting says which',
-    '  material the part is cut from. The "Materials" sheet lists what is available and what each',
+    'MATERIAL / GRADE say WHAT THE STEEL IS, not which plate it comes off. Leave them BLANK',
+    '  unless this row is different: material and grade are set once on the order line and every',
+    '  part inherits them. Fill a cell only for the part that needs something else — a stainless',
+    '  insert in a mild-steel span, or one plate in a lower grade.',
+    '',
+    '  Together with Thick these are the three things a part is matched on. WHICH PLATE it is',
+    '  actually cut from is decided later, at nesting, because that depends on what else is being',
+    '  cut from the same sheet — and the nesting step will refuse any plate that disagrees with',
+    '  these values.',
+    '',
+    'WEIGHT IS NOT IN THIS SHEET. It is worked out as volume x density, and the density comes',
+    '  from the material named above. The "Materials" sheet lists what is available and what each',
     '  one weighs; note that an angle, channel or beam is NOT thickness x width, so those carry a',
     '  cross-section and need only a length.',
   ].forEach((l) => help.addRow([l]));
@@ -198,7 +218,7 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
       r.span ?? '', r.girder ?? '', r.segment ?? '', r.part ?? '',
       r.name ?? '',
       r.height ?? '', r.length ?? '', r.width ?? '', r.qty ?? '',
-      r.rmCode ?? '',
+      r.material ?? '', r.grade ?? '',
       r.notes ?? '',
     ]);
   }
@@ -226,77 +246,94 @@ export async function exportBoqSheet(companyId, orderId, seedRows = null) {
     ]);
   }
 
-  addMaterialDropdown(wb, ws, materials, Math.max(rows.length + 1, 400));
+  addSpecDropdowns(wb, ws, await specVocabulary(companyId), Math.max(rows.length + 1, 400));
 
   return wb.xlsx.writeBuffer();
 }
 
 /**
- * Make Raw Material a dropdown that only offers what the part could be cut from.
+ * The material and grade values this company actually uses, for the dropdowns.
  *
- * The list is filtered PER ROW by that row's Thick value, because offering all
- * forty stocked materials for a 20mm web plate is barely better than free text
- * — the whole point of capturing the material is that the wrong one cannot be
- * chosen by accident.
+ * Read from the catalogue rather than hard-coded, because "MS / SS304 / E350 BO"
+ * is this shop's vocabulary and the next one has a different one. A field def
+ * with `allowed_values` wins where somebody has set it — that is a deliberate
+ * statement about what is permitted — and otherwise the list is whatever the
+ * catalogue is actually labelled with.
  *
- * Excel has no native "filter this list by that cell", so it is done the way
- * spreadsheets have always done it: one contiguous named range per thickness on
- * a hidden sheet, and a validation formula that resolves the name from the
- * Thick cell. `INDIRECT("T" & 20)` → the T20 range.
+ * WHAT REPLACED WHAT. There used to be a thickness-filtered dropdown here: one
+ * hidden named range per stocked thickness, and an `INDIRECT` formula resolving
+ * the range from the row's Thick cell, so a 20 mm part offered only 20 mm
+ * materials. All of that existed to stop somebody picking the wrong CATALOGUE
+ * ITEM, and the column no longer names one — thickness is its own column and
+ * nesting does the matching. Two plain lists are the whole job now.
  *
- * SECTIONS APPEAR IN EVERY LIST. An angle is one item — a 100×100×10 is not "a
- * 10mm thing" — so it cannot be reached by filtering on thickness, and leaving
- * it out would make it unpickable. Each list is therefore that thickness's
- * plates followed by every section.
- *
- * A row whose Thick is blank or has no matching range simply gets no list. That
- * is deliberate: `showErrorMessage` is off, so the cell stays typeable and the
- * importer remains the thing that has the final say. A dropdown that blocked
- * entry would make an unusual material impossible to record at all.
+ * @returns {Promise<{materials:string[], grades:string[]}>}
  */
-function addMaterialDropdown(wb, ws, materials, lastRow) {
-  if (!materials.length) return;
+async function specVocabulary(companyId) {
+  const [defs] = await pool.query(
+    `SELECT field_key AS k, allowed_values AS allowed FROM fab_field_defs
+      WHERE company_id = ? AND deleted_at IS NULL AND field_key IN ('material','grade')`,
+    [companyId],
+  );
+  const [used] = await pool.query(
+    `SELECT DISTINCT d.field_key AS k, v.value_text AS v
+       FROM fab_field_values v
+       JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+      WHERE v.company_id = ? AND v.deleted_at IS NULL
+        AND d.field_key IN ('material','grade')
+        AND v.value_text IS NOT NULL AND v.value_text <> ''`,
+    [companyId],
+  );
 
-  // Excel defined names allow letters, digits and underscore — so 12.5 becomes
-  // T12_5, and the formula substitutes the same way.
-  const nameFor = (t) => `T${String(Number(t)).replace('.', '_')}`;
+  const pick = (k) => {
+    const def = defs.find((d) => d.k === k);
+    let allowed = null;
+    try {
+      const parsed = def?.allowed ? JSON.parse(def.allowed) : null;
+      if (Array.isArray(parsed) && parsed.length) allowed = parsed.map(String);
+    } catch { /* a malformed list is not a reason to have no dropdown */ }
+    return (allowed ?? used.filter((u) => u.k === k).map((u) => u.v))
+      .filter(Boolean).sort((a, b) => a.localeCompare(b));
+  };
+  return { materials: pick('material'), grades: pick('grade') };
+}
 
+/**
+ * Offer those values as dropdowns, without forbidding anything else.
+ *
+ * `showErrorMessage` stays off, as it was on the column this replaced: the cell
+ * remains typeable and the importer has the final say. A shop that has just
+ * taken its first stainless job must be able to write SS304 before anybody has
+ * added it to the catalogue, or the sheet becomes the thing blocking the work.
+ */
+function addSpecDropdowns(wb, ws, vocab, lastRow) {
   const lists = wb.addWorksheet('Lists');
   lists.state = 'veryHidden'; // not a sheet anyone should be editing
   let col = 0;
 
-  const writeColumn = (name, items) => {
+  const writeColumn = (name, values) => {
     col += 1;
-    items.forEach((m, i) => { lists.getCell(i + 1, col).value = m.code; });
-    if (!items.length) return;
+    values.forEach((v, i) => { lists.getCell(i + 1, col).value = v; });
+    if (!values.length) return null;
     const letter = lists.getColumn(col).letter;
-    wb.definedNames.add(`Lists!$${letter}$1:$${letter}$${items.length}`, name);
+    wb.definedNames.add(`Lists!$${letter}$1:$${letter}$${values.length}`, name);
+    return name;
   };
 
-  /**
-   * Which materials belong in which list is rawMaterialService's rule, not the
-   * spreadsheet's. This used to re-derive the plate / section / no-thickness
-   * split inline, which is the same rule stated a second time — exactly the
-   * drift the service was extracted to stop. It reads it now.
-   */
-  for (const t of stockedThicknesses(materials)) {
-    writeColumn(nameFor(t), materialsForThickness(materials, t));
-  }
-  // The fallback for a row with no usable thickness: genuinely everything, so
-  // nothing in the catalog is unreachable from the sheet. A null thickness is
-  // the service's own "nothing to filter on" case, which returns the lot.
-  writeColumn('RM_ALL', materialsForThickness(materials, null));
+  const matName = writeColumn('SPEC_MATERIAL', vocab.materials);
+  const gradeName = writeColumn('SPEC_GRADE', vocab.grades);
 
-  const thickCol = ws.getColumn(C.height).letter;
   for (let r = 2; r <= lastRow; r++) {
-    ws.getCell(r, C.rmCode).dataValidation = {
-      type: 'list',
-      allowBlank: true,
-      // IFERROR so a blank or unknown thickness falls back to the full list
-      // rather than showing Excel's reference error in the dropdown.
-      formulae: [`=IFERROR(INDIRECT("T"&SUBSTITUTE(TEXT($${thickCol}$${r},"0.###"),".","_")),RM_ALL)`],
-      showErrorMessage: false,
-    };
+    if (matName) {
+      ws.getCell(r, C.material).dataValidation = {
+        type: 'list', allowBlank: true, formulae: [`=${matName}`], showErrorMessage: false,
+      };
+    }
+    if (gradeName) {
+      ws.getCell(r, C.grade).dataValidation = {
+        type: 'list', allowBlank: true, formulae: [`=${gradeName}`], showErrorMessage: false,
+      };
+    }
   }
 }
 
@@ -343,14 +380,16 @@ async function readExistingAsRows(companyId, orderId) {
     return out;
   };
 
-  // An RM link is not a ROW of this sheet — but the material it names is a
-  // COLUMN of its parent's row, so a re-export round-trips what was entered.
-  const rmByParent = new Map();
-  for (const i of items) {
-    if (isRmLink(i) && i.parent_item_id != null && !rmByParent.has(i.parent_item_id)) {
-      rmByParent.set(i.parent_item_id, i.catalog_code ?? null);
-    }
-  }
+  /**
+   * The material and grade each row STATES ITSELF, for the round trip.
+   *
+   * Deliberately the row's own value and not the resolved one. Almost every part
+   * inherits from the order line, and writing the inherited answer into every
+   * row would turn one statement into six hundred copies — after which changing
+   * the line would change nothing, because each row now overrides it. The blank
+   * cell is the meaningful thing: it means "whatever the line says".
+   */
+  const ownSpec = await ownFieldValues(companyId, items.map((i) => i.id));
 
   const rows = [];
   for (const i of items) {
@@ -369,11 +408,44 @@ async function readExistingAsRows(companyId, orderId) {
       length: i.length != null ? Number(i.length) : '',
       width:  i.width  != null ? Number(i.width)  : '',
       qty:    i.qty    != null ? Number(i.qty)    : '',
-      rmCode: rmByParent.get(i.id) ?? '',
+      material: ownSpec.get(i.id)?.material ?? '',
+      grade:    ownSpec.get(i.id)?.grade ?? '',
       notes: '',
     });
   }
   return rows;
+}
+
+/**
+ * `material` and `grade` as STORED ON THESE ROWS — no ladder walk.
+ *
+ * `resolveFields` would answer what each part effectively is, which is the right
+ * question nearly everywhere else and the wrong one here. A sheet is round
+ * tripped: whatever it shows comes back on the next upload and is written. Show
+ * the inherited value and the next upload stamps it onto every row as an
+ * explicit override, and the order line quietly stops meaning anything.
+ *
+ * @returns {Promise<Map<number, {material?:string, grade?:string}>>}
+ */
+async function ownFieldValues(companyId, itemIds) {
+  const out = new Map();
+  const ids = [...new Set((itemIds ?? []).map(Number).filter(Number.isFinite))];
+  if (!ids.length) return out;
+
+  const [rows] = await pool.query(
+    `SELECT v.scope_id AS itemId, d.field_key AS k, v.value_text AS v
+       FROM fab_field_values v
+       JOIN fab_field_defs d ON d.id = v.field_id AND d.deleted_at IS NULL
+      WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
+        AND v.deleted_at IS NULL AND d.field_key IN ('material','grade')`,
+    [companyId, ids],
+  );
+  for (const r of rows) {
+    if (r.v == null || r.v === '') continue;
+    if (!out.has(Number(r.itemId))) out.set(Number(r.itemId), {});
+    out.get(Number(r.itemId))[r.k] = r.v;
+  }
+  return out;
 }
 
 // ── import ───────────────────────────────────────────────────────────────────
@@ -387,12 +459,13 @@ function parseRows(ws) {
     out.push({
       row: n,
       levels,
-      name:    cellVal(row, C.name),
-      height:  numVal(row, C.height),
-      length:  numVal(row, C.length),
-      width:   numVal(row, C.width),
-      qty:     numVal(row, C.qty),
-      rmCode:  cellVal(row, C.rmCode),
+      name:     cellVal(row, C.name),
+      height:   numVal(row, C.height),
+      length:   numVal(row, C.length),
+      width:    numVal(row, C.width),
+      qty:      numVal(row, C.qty),
+      material: cellVal(row, C.material),
+      grade:    cellVal(row, C.grade),
     });
   });
   return out;
@@ -481,10 +554,6 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
     );
     const lineByCode = new Map(orderLines.map((l) => [key(l.code), l.id]));
 
-    // Raw materials, for the "Raw Material" column. Only 'buy' items — a part
-    // is cut from stock, never from another thing this shop makes.
-    const catalog = await rawMaterialsFor(companyId, conn);
-    const materialByCode = new Map(catalog.map((m) => [key(m.code), m]));
 
     for (const r of parsed) {
       const path = r.levels.map((v, i) => ({ label: v, kind: LEVELS[i].key })).filter((p) => p.label);
@@ -611,40 +680,35 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
       }
 
       /**
-       * The material this part is cut FROM — deliberately not which plate.
+       * WHAT THE STEEL IS — written as an override on this row, nothing more.
        *
-       * The link is created with `nest_no` NULL, which already means "this part
-       * needs this material, on its own" everywhere downstream. Nesting later
-       * fills the nest number in, grouping several such links onto one physical
-       * plate. Capturing it here is what lets the nesting board offer only the
-       * parts that could go on a given plate, instead of the whole order.
+       * This used to create a MATERIAL LINK to a named catalogue item, and that
+       * was the pre-nesting material assignment: by the time the BOM finished
+       * importing, every part had already been committed to a specific plate.
+       * It worked while a material meant only a thickness. It stopped being
+       * answerable once the catalogue held every size, because choosing between
+       * a 2000 and a 2500 wide sheet depends on what else is cut from it — a
+       * question this sheet cannot answer and nesting exists to.
        *
-       * An unrecognised code is reported and the part still imports: the
-       * structure is worth having even when the material is not decided yet.
+       * So the sheet states the spec and the link is made at NESTING, by the
+       * suggestor or by a drop on the board, both of which refuse a plate that
+       * disagrees with these values.
+       *
+       * ONLY WHAT THE ROW ACTUALLY SAYS is written. A blank cell writes nothing
+       * rather than clearing, so a part keeps inheriting from its order line —
+       * which is how nearly every part gets its answer.
        */
-      if (node && r.rmCode) {
-        const material = materialByCode.get(key(r.rmCode));
-        if (!material) {
-          result.warnings.push({ row: r.row, message: `Raw Material '${r.rmCode}' is not in the Item Catalog — the part was created without it.` });
-        } else {
-          /**
-           * Through itemMaterialService (2026-08-17), which now owns the shape
-           * of a material link for both callers.
-           *
-           * The create/change/clear logic used to live here only, which is why
-           * the ITEM TREE had no way to set a material at all and the nesting
-           * step told people to "set the Raw Material column and re-upload" —
-           * a spreadsheet round trip to change one dropdown. Re-implementing it
-           * behind the screen's picker would have given two definitions of what
-           * a material link is, and the one that drifts is always the one you
-           * are not looking at.
-           *
-           * Unchanged behaviour: creating counts as a link, changing counts and
-           * clears the nest, and setting the same material again is a no-op.
-           */
-          const linked = await setItemMaterial(companyId, node.id, material.id, conn);
-          if (!linked.unchanged) result.rmLinks = (result.rmLinks ?? 0) + 1;
+      const spec = {};
+      if (node && r.material) spec.material = r.material;
+      if (node && r.grade) spec.grade = r.grade;
+      if (Object.keys(spec).length) {
+        const { rejected } = await setFields(companyId, 'order_item', node.id, spec, conn);
+        for (const rej of rejected) {
+          const message = `'${rej.fieldKey}' not set — ${rej.why}.`;
+          result.warnings.push({ row: r.row, message });
+          rowNotes.push(message);
         }
+        if (!rejected.length) result.specSet = (result.specSet ?? 0) + 1;
       }
 
       rowLog.push({ ...base, status: createdHere ? 'Created' : 'Skipped',
@@ -743,7 +807,7 @@ export function buildWizardRows(spec = {}) {
 
   const level = (girder, segment, part, name, qty, notes, extra = {}) => ({
     span: spanCode, girder, segment, part, name,
-    height: '', length: '', width: '', qty, notes, rmCode: '',
+    height: '', length: '', width: '', qty, notes, material: '', grade: '',
     ...extra,
   });
 
@@ -762,7 +826,8 @@ export function buildWizardRows(spec = {}) {
   const detailFor = (girder, segment, p) => {
     const o = overrides[`${girder}/${segment}/${p.code}`] ?? {};
     return {
-      rmCode: o.rmCode ?? p.rmCode ?? '',
+      material: o.material ?? p.material ?? '',
+      grade: o.grade ?? p.grade ?? '',
       height: o.thick ?? p.thick ?? '',
     };
   };

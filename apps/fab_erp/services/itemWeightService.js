@@ -31,6 +31,8 @@
 
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
+import { weightFactorsForParts } from './materialMatchService.js';
+import { isMaterialLink } from './itemMaterialService.js';
 
 /** The metric key buffers/analytics default to (fab_buffers.weight_metric_key). */
 const DEFAULT_WEIGHT_METRIC_KEY = 'unit_weight_kg';
@@ -114,7 +116,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
-            catalog_item_id, flow_id, length, width, height
+            catalog_item_id, flow_id, level_kind, length, width, height
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
@@ -144,7 +146,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
   // reached through the part's raw-material child, which is the same link the
   // task gate reads.
   const materialOf = new Map(); // part id -> catalog row with the weight factor
-  const rmChildIds = rows.filter((r) => r.catalog_item_id != null && r.flow_id == null);
+  const rmChildIds = rows.filter(isMaterialLink);
   if (rmChildIds.length) {
     const catIds = [...new Set(rmChildIds.map((r) => r.catalog_item_id))];
     const [cats] = await exec.query(
@@ -163,6 +165,46 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       if (rm.parent_item_id != null && !materialOf.has(rm.parent_item_id)) {
         materialOf.set(rm.parent_item_id, cat);
       }
+    }
+  }
+
+  /**
+   * PARTS NOT YET NESTED get their density from their SPECIFICATION.
+   *
+   * The link above only exists once somebody has chosen a plate, and choosing a
+   * plate is nesting's job — so between BOM import and nesting there is no link
+   * to read a density from. Without this, every part in that window weighs
+   * nothing: a 668 MT order reports as zero until it is nested, and procurement
+   * quantities and progress percentages are computed off that number.
+   *
+   * The lookup is not a second source of truth. Density is a property of the
+   * MATERIAL — every MS plate is 7850 kg/m³ whatever size it is cut to — so this
+   * reads the same catalogue nesting will pick from, keyed on the three axes the
+   * part states. Where a link DOES exist it wins, because then the material is
+   * settled rather than inferred.
+   *
+   * ONLY CHILDLESS ROWS, and that restriction is load-bearing rather than
+   * tidiness. Below, a row's own dimensions BEAT the sum of its children — the
+   * BOQ way of working out a part. Hand an assembly a density and a girder with
+   * an overall length would be weighed as a solid block of steel instead of as
+   * the sum of the plates it is welded from, which is both wrong and plausible
+   * enough to go unnoticed. A leaf is the only row whose dimensions describe
+   * steel rather than an envelope. (A part that HAS been nested already has a
+   * child — the material link — so this targets exactly the un-nested ones.)
+   *
+   * NOT `catalog_item_id == null` — a part row carries a catalog item too, now
+   * that every order row names its type. Testing for the absence of one would
+   * exclude every real part and this fallback would never fire at all.
+   */
+  const unlinked = rows.filter((r) => !isMaterialLink(r) && !materialOf.has(r.id)
+    && !childrenOf.has(r.id)
+    && (r.length != null || r.width != null || r.height != null));
+  if (unlinked.length) {
+    const factors = await weightFactorsForParts(companyId, unlinked.map((r) => r.id), { conn: exec });
+    for (const r of unlinked) {
+      const f = factors.get(r.id);
+      if (!f || f.density == null) continue;
+      materialOf.set(r.id, { density_kg_m3: f.density, section_area_mm2: f.sectionArea });
     }
   }
 
@@ -202,7 +244,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
         // component of it — and since nesting gave those rows the plate's own
         // dimensions, they now carry a real weight. Summing it would say a
         // 1.2 t flange weighs the 4.7 t plate it came off.
-        if (child.catalog_item_id != null && child.flow_id == null) continue;
+        if (isMaterialLink(child)) continue;
         const childEff = effective.get(child.id);
         if (childEff === null || childEff === undefined) continue;
         const childQty = toNum(child.qty) ?? 0;
@@ -229,7 +271,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       // types a weight on — the plate is bought by the tonne and the weight
       // that matters is the cut part's, which sits on the row above. Counting
       // these would report every properly-filled order as incomplete.
-      const isRmLink = node.catalog_item_id != null && node.flow_id == null;
+      const isRmLink = isMaterialLink(node);
       if (!kids.length && eff === null && !isRmLink) unweighedLeaves++;
     }
   }
