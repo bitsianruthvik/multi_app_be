@@ -5702,3 +5702,38 @@ CREATE TABLE IF NOT EXISTS fab_line_type_stages (
   KEY idx_flts_company (company_id),
   KEY idx_flts_lookup  (company_id, line_type, stage_key)
 );
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- A RESOURCE TYPE NAMES ITS CATALOGUE ITEM (2026-08-21)
+--
+-- `fab_resource_types` and the MACH-* catalogue items are the same concept held
+-- twice: ten types, ten items, matching one-to-one BY NAME. A join on a name is
+-- not a relationship — rename either side and the machine silently loses its
+-- speed, its taxonomy and every field hung off it, with no error anywhere.
+--
+-- The catalogue item is the TYPE under the standing rule, so the resource type
+-- points at it and attributes move to the field registry. `fab_resource_type_
+-- properties` stays as the fallback for a type that has not been linked yet;
+-- see formulaEngine, which reads fields first and that table second.
+--
+-- Nullable on purpose: a tenant with resource types and no catalogue entries for
+-- them still works exactly as before.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_resource_types'
+              AND COLUMN_NAME  = 'catalog_item_id');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_resource_types ADD COLUMN catalog_item_id INT DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_resource_types'
+              AND INDEX_NAME   = 'idx_frt_catalog_item');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE fab_resource_types ADD INDEX idx_frt_catalog_item (catalog_item_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

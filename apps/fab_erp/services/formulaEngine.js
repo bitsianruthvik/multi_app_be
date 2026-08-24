@@ -179,14 +179,48 @@ export async function evaluateFormula(
       if (machinePropsCache?.has(resourceTypeId)) {
         machineProps = machinePropsCache.get(resourceTypeId);
       } else {
+        /**
+         * FIELDS FIRST, the old table as fallback.
+         *
+         * A resource type and its MACH-* catalogue item are the same concept
+         * held twice, and `fab_resource_type_properties` was a parallel
+         * attribute mechanism hanging off the type. Under the standing rule the
+         * catalogue item is the type and its attributes are field values, so
+         * `machine.*` resolves from the field registry via the type's
+         * `catalog_item_id`.
+         *
+         * The old table is still read and still wins nothing: a key present in
+         * both takes the FIELD. Keeping the fallback is what makes this change
+         * safe to deploy before every tenant has been linked — a type with no
+         * `catalog_item_id` behaves exactly as it did, and a formula that
+         * evaluated to 0.5 yesterday evaluates to 0.5 today.
+         */
         const [rows] = await pool.query(
           `SELECT property_key, default_value
              FROM fab_resource_type_properties
             WHERE resource_type_id = ? AND deleted_at IS NULL`,
           [resourceTypeId],
         );
-        machineProps = rows;
-        machinePropsCache?.set(resourceTypeId, rows);
+        const merged = new Map(rows.map((r) => [r.property_key, r.default_value]));
+
+        const [[link]] = await pool.query(
+          `SELECT company_id, catalog_item_id FROM fab_resource_types
+            WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+          [resourceTypeId],
+        );
+        if (link?.catalog_item_id) {
+          const [vals] = await pool.query(
+            `SELECT f.field_key, v.value_num
+               FROM fab_field_values v
+               JOIN fab_fields f ON f.id = v.field_id AND f.deleted_at IS NULL
+              WHERE v.company_id = ? AND v.scope = 'catalog_item' AND v.scope_id = ?
+                AND v.deleted_at IS NULL AND v.value_num IS NOT NULL`,
+            [link.company_id, link.catalog_item_id],
+          );
+          for (const v of vals) merged.set(v.field_key, v.value_num);
+        }
+        machineProps = [...merged].map(([property_key, default_value]) => ({ property_key, default_value }));
+        machinePropsCache?.set(resourceTypeId, machineProps);
       }
     }
 
