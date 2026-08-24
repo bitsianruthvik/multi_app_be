@@ -73,8 +73,25 @@ for (const spanCode of spanCodes) {
    * Written FIRST so the level exists before the parts hang off it — though the
    * importer creates missing levels either way, so this is only tidiness.
    */
-  const declare = (girder, segment, type) =>
-    push(girder, segment, '', '', '', '', '', 1, type);
+  /**
+   * A declaring row, carrying the level's ENVELOPE as its length and width.
+   *
+   * An assembly has no dimensions of its own in the BOQ — only the parts inside
+   * it do — and that is fine until something asks how long a weld run is or how
+   * much surface there is to paint. Those are per-assembly questions, and with
+   * no length or width on the row there is nothing to answer them with.
+   *
+   * The envelope is DERIVED, not asserted: the longest and the widest member.
+   * A girder segment comes out 11650 or 12000 by 2995, which is its length and
+   * the girder's structural depth — the web is the widest thing in it. Writing
+   * those numbers by hand would be the same values with nothing keeping them
+   * true if a part changed.
+   */
+  const declare = (girder, segment, type, parts = []) => {
+    const L = parts.length ? Math.max(...parts.map((p) => p.l)) : '';
+    const W = parts.length ? Math.max(...parts.map((p) => p.w)) : '';
+    push(girder, segment, '', '', '', L, W, 1, type);
+  };
 
   declare('', '', 'COMPOS-SPAN');
 
@@ -84,7 +101,7 @@ for (const spanCode of spanCodes) {
     declare(girder, '', 'COMPOS-GDR');
     SEG_KINDS.forEach((kind, i) => {
       const segment = String(i + 1);
-      declare(girder, segment, 'COMPOS-SEG');
+      declare(girder, segment, 'COMPOS-SEG', segmentParts(kind));
       for (const p of segmentParts(kind)) {
         push(girder, segment, p.code, p.name, p.t, p.l, p.w, p.qty, PART_TYPE[p.code] ?? '');
       }
@@ -102,7 +119,7 @@ for (const spanCode of spanCodes) {
   for (const a of ASSEMBLIES) {
     for (let n = 1; n <= a.count; n++) {
       const segment = `${a.kind}${String(n).padStart(2, '0')}`;
-      declare('', segment, ASSEMBLY_TYPE[a.kind] ?? '');
+      declare('', segment, ASSEMBLY_TYPE[a.kind] ?? '', a.parts);
       for (const p of a.parts) {
         push('', segment, p.code, p.name, p.t, p.l, p.w, p.qty, PART_TYPE[p.code] ?? '');
       }

@@ -141,6 +141,15 @@ export async function applyFlowRules(companyId, orderId, { reassign = false } = 
     await conn.beginTransaction();
     for (const it of items) {
       if (!FLOW_LEVELS.includes(it.level_kind)) continue;
+      /*
+       * A BOUGHT part is not fabricated, so no fabrication flow belongs on it.
+       * The rules match on level and code suffix, which a shear stud satisfies
+       * as readily as a web plate — and it came out routed through Part
+       * Fabrication, then asked for the plate thickness and weld length of a
+       * thing that arrives in a box. Procurement is where a bought part is
+       * answered for.
+       */
+      if ((it.procurement_type || 'make') !== 'make') { noRule++; continue; }
       if (it.flow_id && !reassign) { unchanged++; continue; }
 
       const rule = pickRule(rules, {
@@ -209,7 +218,7 @@ async function orderLineType(companyId, orderId) {
 
 async function loadItems(companyId, orderId) {
   const [rows] = await pool.query(
-    `SELECT fi.id, fi.code, fi.level_kind, fi.flow_id, f.name AS flow_name
+    `SELECT fi.id, fi.code, fi.level_kind, fi.flow_id, fi.procurement_type, f.name AS flow_name
        FROM fab_items fi
        LEFT JOIN fab_operation_flows f ON f.id = fi.flow_id AND f.deleted_at IS NULL
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
