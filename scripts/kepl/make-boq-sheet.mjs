@@ -81,16 +81,30 @@ for (const spanCode of spanCodes) {
    * much surface there is to paint. Those are per-assembly questions, and with
    * no length or width on the row there is nothing to answer them with.
    *
-   * The envelope is DERIVED, not asserted: the longest and the widest member.
-   * A girder segment comes out 11650 or 12000 by 2995, which is its length and
-   * the girder's structural depth — the web is the widest thing in it. Writing
-   * those numbers by hand would be the same values with nothing keeping them
-   * true if a part changed.
+   * THE ENVELOPE IS DECLARED, NOT DERIVED, and the first attempt here got that
+   * wrong. It took the longest and the widest member, which happens to be right
+   * for an end diaphragm — its web is listed 3048 x 1700 and lies that way — and
+   * is wrong for an intermediate diaphragm, whose web is listed 1700 x 460 and
+   * STANDS UP. So the depth is that member's LENGTH, and the derivation returned
+   * 460 against a real 1700: a quarter of the surface area, in a number that
+   * feeds paint and weld estimates and looks perfectly reasonable.
+   *
+   * Orientation is not in the dimensions. No rule over l and w can recover it,
+   * so the envelope is stated in the model beside the parts it describes — the
+   * same reason the type map is declared and never guessed.
+   *
+   * A GIRDER SEGMENT is the exception that genuinely derives, and it is named
+   * rather than maximised: the segment is as long as its web and as deep as its
+   * web is wide, because the web IS the girder's depth. That stays true if the
+   * girder is redesigned.
    */
-  const declare = (girder, segment, type, parts = []) => {
-    const L = parts.length ? Math.max(...parts.map((p) => p.l)) : '';
-    const W = parts.length ? Math.max(...parts.map((p) => p.w)) : '';
-    push(girder, segment, '', '', '', L, W, 1, type);
+  const declare = (girder, segment, type, envelope = null) => {
+    push(girder, segment, '', '', '', envelope?.l ?? '', envelope?.w ?? '', 1, type);
+  };
+  /** The web is the girder's depth, so the segment's envelope follows it. */
+  const segmentEnvelope = (kind) => {
+    const web = segmentParts(kind).find((p) => p.code === 'W');
+    return web ? { l: web.l, w: web.w } : null;
   };
 
   declare('', '', 'COMPOS-SPAN');
@@ -101,7 +115,7 @@ for (const spanCode of spanCodes) {
     declare(girder, '', 'COMPOS-GDR');
     SEG_KINDS.forEach((kind, i) => {
       const segment = String(i + 1);
-      declare(girder, segment, 'COMPOS-SEG', segmentParts(kind));
+      declare(girder, segment, 'COMPOS-SEG', segmentEnvelope(kind));
       for (const p of segmentParts(kind)) {
         push(girder, segment, p.code, p.name, p.t, p.l, p.w, p.qty, PART_TYPE[p.code] ?? '');
       }
@@ -119,7 +133,7 @@ for (const spanCode of spanCodes) {
   for (const a of ASSEMBLIES) {
     for (let n = 1; n <= a.count; n++) {
       const segment = `${a.kind}${String(n).padStart(2, '0')}`;
-      declare('', segment, ASSEMBLY_TYPE[a.kind] ?? '', a.parts);
+      declare('', segment, ASSEMBLY_TYPE[a.kind] ?? '', a.envelope ?? null);
       for (const p of a.parts) {
         push('', segment, p.code, p.name, p.t, p.l, p.w, p.qty, PART_TYPE[p.code] ?? '');
       }

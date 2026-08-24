@@ -40,8 +40,18 @@ import { parameterGrid } from '../../apps/fab_erp/services/orderParametersServic
 const companyId = Number(process.argv[2]);
 const orderId = Number(process.argv[3]);
 const out = process.argv[4];
+/**
+ * Field keys to RECOMPUTE even where a value is already stored.
+ *
+ * Existing values are kept by default, because someone may have corrected one
+ * off a drawing and a regeneration must not quietly undo that. But when the
+ * geometry a value was derived FROM has changed, keeping it is the wrong kind
+ * of careful: the intermediate diaphragm's envelope went from 3052 x 460 to
+ * 3052 x 1700, and its surface area is stale until it is worked out again.
+ */
+const recompute = new Set((process.argv[5] || '').split(',').map((s) => s.trim()).filter(Boolean));
 if (!companyId || !orderId || !out) {
-  console.error('Usage: node scripts/kepl/make-parameters-sheet.mjs <companyId> <orderId> <out.xlsx>');
+  console.error('Usage: node scripts/kepl/make-parameters-sheet.mjs <companyId> <orderId> <out.xlsx> [fieldKeysToRecompute]');
   process.exit(1);
 }
 
@@ -102,7 +112,8 @@ try {
       // question nobody asked.
       if (!r.required.includes(c.fieldKey)) return '—';
       const existing = r.values[c.fieldKey];
-      if (existing !== undefined && existing !== null && existing !== '') return existing;
+      if (!recompute.has(c.fieldKey)
+        && existing !== undefined && existing !== null && existing !== '') return existing;
       const v = value(r, c.fieldKey);
       if (v === null) { short += 1; return ''; }
       return Math.round(v * 1e6) / 1e6;

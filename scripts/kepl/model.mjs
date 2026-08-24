@@ -57,6 +57,8 @@ export function segmentParts(kind) {
 export const ASSEMBLIES = [
   {
     kind: 'ED', name: 'End Diaphragm', count: 6,
+    // Across the bay by the diaphragm depth — the web, standing up.
+    envelope: { l: 3048, w: 1700 },
     parts: [
       { code: 'EDTF', name: 'End Diaphragm Top Flange',    t: 16, l: 3048, w: 200,  qty: 1 },
       { code: 'EDW',  name: 'End Diaphragm Web',           t: 16, l: 3048, w: 1700, qty: 1 },
@@ -67,6 +69,10 @@ export const ASSEMBLIES = [
   },
   {
     kind: 'ID', name: 'Intermediate Diaphragm', count: 45,
+    // 1700 deep, like the end diaphragm. Its web is listed 1700 x 460, and the
+    // 1700 is the LENGTH of a plate that stands vertically — which is why the
+    // depth cannot be read off the dimensions without knowing that.
+    envelope: { l: 3052, w: 1700 },
     parts: [
       { code: 'IDTF', name: 'Interm Diaphragm Top Flange',    t: 16, l: 3052, w: 200, qty: 1 },
       { code: 'IDW',  name: 'Interm Diaphragm Web',           t: 16, l: 1700, w: 460, qty: 2 },
@@ -79,6 +85,8 @@ export const ASSEMBLIES = [
   },
   {
     kind: 'SPL', name: 'Splice', count: 16,
+    // The web cover plate is the whole of it.
+    envelope: { l: 2700, w: 850 },
     parts: [
       { code: 'WCP/D',   name: 'Web Cover Plate',                 t: 25, l: 2700, w: 850, qty: 2 },
       { code: 'TFICP/D', name: 'Top Flange Inner Cover Plate',    t: 25, l: 1260, w: 225, qty: 2 },
