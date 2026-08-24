@@ -614,7 +614,12 @@ async function countNesting(companyId, orderId) {
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
              AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
-        AND p.level_kind = 'part'`,
+        AND p.level_kind = 'part'
+        -- Made parts only, the same rule nesting itself applies. A shear stud is
+        -- BOUGHT WHOLE: it is never cut from a plate, so counting it as
+        -- un-nested holds the stage at partial over work nobody can ever do.
+        -- Procurement is where a bought part is answered for.
+        AND COALESCE(p.procurement_type, 'make') = 'make'`,
     [companyId, orderId],
   );
   return { parts: Number(row?.parts) || 0, nested: Number(row?.nested) || 0 };
