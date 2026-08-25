@@ -1101,3 +1101,173 @@ async function decorateBlocked(companyId, rows) {
     };
   });
 }
+
+// ─── the board ────────────────────────────────────────────────────────────────
+
+/**
+ * Every ancestor of `itemIds`, walked up parent_item_id one generation at a time.
+ *
+ * The BOM is a tree of unbounded depth, so a fixed join count cannot express
+ * this, and a recursive CTE is not portable to every MySQL/TiDB version this
+ * runs on. The walk is bounded by MAX_BOM_DEPTH rather than by trust: a cycle in
+ * parent_item_id would otherwise loop forever, and a cycle is exactly the kind
+ * of thing a bad import produces.
+ */
+const MAX_BOM_DEPTH = 24;
+async function itemAncestry(companyId, itemIds) {
+  const known = new Map();
+  let frontier = [...new Set(itemIds.filter((x) => x != null))];
+  for (let depth = 0; depth < MAX_BOM_DEPTH && frontier.length > 0; depth += 1) {
+    const [rows] = await pool.query(
+      `SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
+              order_line_id AS orderLineId, level_kind AS levelKind,
+              name, code, mark
+         FROM fab_items
+        WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+      [companyId, frontier],
+    );
+    const next = [];
+    for (const r of rows) {
+      if (known.has(r.id)) continue;
+      known.set(r.id, r);
+      if (r.parentItemId != null && !known.has(r.parentItemId)) next.push(r.parentItemId);
+    }
+    frontier = [...new Set(next)];
+  }
+  return [...known.values()];
+}
+
+/**
+ * The board: the same plan the grid draws, in the shape a canvas can paint.
+ *
+ * WHY THIS IS NOT `getPlan`
+ * -------------------------
+ * The grid draws one absolutely-positioned element per BAR over one to seven
+ * days. The board draws one block per OPERATION over as much as five weeks, and
+ * a real bridge order is several thousand operations — enough that the DOM is
+ * the wrong tool and the per-bar JSON (order number, operation name, resource
+ * name, notes, repeated on every row) is most of the payload.
+ *
+ * So this returns the geometry as flat number tuples and the words ONCE, in
+ * lookup tables the client joins against. Two consequences worth knowing:
+ *
+ *   - Times are milliseconds RELATIVE to `from`. Absolute epoch ms would be
+ *     ~13 digits on every one of ~40,000 numbers; relative ones are 5–8.
+ *   - A bundle is expanded into its member tasks, laid end to end inside the
+ *     bundle's span in proportion to each task's minutes. The bundle is one bar
+ *     on the grid and one machine setup in reality, but the planner is looking
+ *     for GAPS here, and a bundle drawn as a single solid block hides how much
+ *     of it is actually work.
+ *
+ * No per-day capacity roll-up: that costs a calendar query per resource per day,
+ * which is affordable across seven days and not across thirty-five. The client
+ * derives load from the blocks it already has; the coverage segments below are
+ * what it needs from the calendar, and they cost one sweep per lane.
+ */
+export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] } = {}) {
+  const lanes = await loadLanes(companyId, resourceTypeIds);
+  const entries = await loadEntries(companyId, from, to, resourceTypeIds);
+  const tz = await plannerTimezone(companyId);
+  const t0 = from.getTime();
+  const rel = (d) => Math.round((d instanceof Date ? d : new Date(d)).getTime() - t0);
+
+  const entriesByLane = new Map();
+  for (const e of entries) {
+    if (!entriesByLane.has(e.resourceTypeId)) entriesByLane.set(e.resourceTypeId, []);
+    entriesByLane.get(e.resourceTypeId).push(e);
+  }
+
+  const itemIds = [];
+  const outLanes = [];
+  for (const lane of lanes) {
+    const coverage = await laneCoverage(companyId, lane, from, to);
+    const laneEntries = entriesByLane.get(lane.id) ?? [];
+
+    const blocks = [];
+    for (const e of laneEntries) {
+      const s = new Date(e.plannedStart).getTime();
+      const en = new Date(e.plannedEnd).getTime();
+      const span = Math.max(0, en - s);
+      const tasks = e.tasks ?? [];
+      if (tasks.length === 0) {
+        blocks.push(Math.round(s - t0), Math.round(span), 0, 0, e.id);
+        continue;
+      }
+      const total = tasks.reduce((n, t) => n + (Number(t.plannedMinutes) || 0), 0);
+      let cursor = s;
+      for (const t of tasks) {
+        // An equal share when nothing declares minutes, so a bundle of tasks
+        // with no time formula still draws as a bundle rather than collapsing
+        // onto its own start instant.
+        const share = total > 0 ? (Number(t.plannedMinutes) || 0) / total : 1 / tasks.length;
+        const dur = Math.round(span * share);
+        blocks.push(Math.round(cursor - t0), dur, t.itemId ?? 0, t.taskId, e.id);
+        cursor += dur;
+        if (t.itemId != null) itemIds.push(t.itemId);
+      }
+    }
+
+    outLanes.push({
+      resourceTypeId: lane.id,
+      name: lane.name,
+      code: lane.code,
+      totalUnits: coverage.totalUnits,
+      unbounded: coverage.unbounded,
+      resourceCount: lane.resources.length,
+      // [startRel, endRel, coveredUnits] per segment.
+      coverage: coverage.segments.flatMap((c) => [rel(c.start), rel(c.end), c.coveredUnits]),
+      // [startRel, durationMs, itemId, taskId, entryId] per block.
+      blocks,
+      blockCount: blocks.length / 5,
+    });
+  }
+
+  const items = await itemAncestry(companyId, itemIds);
+  const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
+  const lineIds = [...new Set(items.map((i) => i.orderLineId).filter((x) => x != null))];
+
+  const [orders] = orderIds.length === 0 ? [[]] : await pool.query(
+    `SELECT id, order_number AS orderNumber, customer_name AS customerName,
+            priority, priority_rank AS priorityRank, required_date AS requiredDate,
+            must_finish_by AS mustFinishBy
+       FROM fab_orders WHERE company_id = ? AND id IN (?)`,
+    [companyId, orderIds],
+  );
+  const [lines] = lineIds.length === 0 ? [[]] : await pool.query(
+    `SELECT id, order_id AS orderId, line_no AS lineNo, code, description
+       FROM fab_order_lines WHERE company_id = ? AND id IN (?)`,
+    [companyId, lineIds],
+  );
+
+  return {
+    from,
+    to,
+    timezone: tz,
+    lanes: outLanes,
+    items,
+    orders,
+    lines,
+    // The words, once. Every block names an entry; most entries carry many, and
+    // an order of any size has thousands of entries but a dozen operation names
+    // between them. Repeating the name on every row was most of the payload, so
+    // the names live in their own tables and the entry carries the id.
+    //
+    // `label` survives only where there is no operation to name the bar — it is
+    // otherwise "<operation> · <item>", both of which the client already has.
+    operations: [...new Map(entries
+      .filter((e) => e.operationId != null)
+      .map((e) => [e.operationId, { id: e.operationId, name: e.operationName }])).values()],
+    resources: [...new Map(entries
+      .filter((e) => e.resourceId != null)
+      .map((e) => [e.resourceId, { id: e.resourceId, name: e.resourceName }])).values()],
+    entries: entries.map((e) => ({
+      id: e.id,
+      orderId: e.orderId,
+      operationId: e.operationId,
+      resourceId: e.resourceId,
+      isPinned: !!e.isPinned,
+      source: e.source,
+      ...(e.operationId == null && e.label ? { label: e.label } : {}),
+    })),
+  };
+}

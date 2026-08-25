@@ -22,7 +22,7 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { suggestPlan } from '../services/planSuggestionService.js';
 import {
-  getPlan, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
+  getPlan, getPlanBoard, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
   acceptRun, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
 
@@ -85,6 +85,32 @@ router.get('/plan', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId }, 'plan read failed');
     return res.status(500).json({ message: 'Failed to load the plan.' });
+  }
+});
+
+/**
+ * GET /plan/board — the same plan, in the shape a canvas can paint.
+ *
+ * Separate from GET /plan because the question is different. The grid asks
+ * "what is on this machine today"; the board asks "where are the gaps across the
+ * next five weeks", and answering the second one bar-by-bar in the DOM does not
+ * work at the size a real order reaches. See getPlanBoard for the payload shape.
+ */
+router.get('/plan/board', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const win = parseWindow(req.query);
+  if (!win) return res.status(400).json({ message: 'from/to are required ISO dates, to > from, at most 92 days apart.' });
+
+  try {
+    const board = await getPlanBoard(companyId, { ...win, resourceTypeIds: parseIdList(req.query.resourceTypeIds) });
+    return res.status(200).json({ ok: true, ...board });
+  } catch (err) {
+    logger.error({ err, companyId }, 'plan board read failed');
+    return res.status(500).json({ message: 'Failed to load the plan board.' });
   }
 });
 
