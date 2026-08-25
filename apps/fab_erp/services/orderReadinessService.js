@@ -34,7 +34,7 @@
 import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
 import { orderShortfall } from './procurementService.js';
-import { procurementForOrder } from './procurementOrderService.js';
+import { procurementForOrder, onOrderByItem } from './procurementOrderService.js';
 import { orderStageApplicability } from './stageApplicabilityService.js';
 import { flowSummary } from './flowAllocationService.js';
 import { checkOrderNesting, blockingIssues } from './nestingIntegrityService.js';
@@ -104,14 +104,27 @@ async function bomRowCount(companyId, orderId) {
 }
 
 async function summariseProcurement(companyId, orderId) {
-  const [short, pos, bomRows] = await Promise.all([
+  const [short, pos, onOrder, bomRows] = await Promise.all([
     orderShortfall(companyId, orderId),
     procurementForOrder(companyId, orderId),
+    onOrderByItem(companyId, orderId),
     bomRowCount(companyId, orderId),
   ]);
 
   const needed = short.lines.length;
-  const stillShort = short.lines.filter((l) => l.short > 0).length;
+  /**
+   * SHORT MEANS "not covered by stock"; this stage asks "still to be dealt
+   * with", and those stop being the same question the moment a purchase order
+   * exists. The detail below has always said "covered by stock OR ON ORDER" —
+   * the arithmetic simply never looked at the second half, so an order whose
+   * every shortage had a PO against it stayed partial and could not be
+   * confirmed until the steel physically arrived.
+   *
+   * That is backwards. Confirming is what tells the shop the job is real;
+   * "waiting for material" is a stage that comes AFTER it, and the board has a
+   * column for exactly that.
+   */
+  const stillShort = short.lines.filter((l) => l.short > (onOrder.get(l.catalogItemId) ?? 0)).length;
   const covered = needed - stillShort;
 
   let state = 'done';

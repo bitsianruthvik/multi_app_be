@@ -472,6 +472,41 @@ export async function purchaseOrderLines(companyId, poId) {
 }
 
 /** Every purchase order raised for a sales order, with its receipt progress. */
+/**
+ * How much of each item this order has ON ORDER but not yet received.
+ *
+ * Needed because "short" and "still to buy" are different questions, and the
+ * readiness strip was answering the first while claiming to answer the second:
+ * its own text reads "covered by stock or on order", and the arithmetic only
+ * ever looked at stock. So an order whose every shortage had a purchase order
+ * against it stayed PARTIAL, and could not be confirmed until the steel
+ * physically arrived — which is the wrong way round. Confirming is what tells
+ * the shop the job is real; waiting for material is a stage that comes after it.
+ *
+ * RECEIVED QUANTITIES ARE SUBTRACTED, because those already became stock and are
+ * counted there. Adding them again would cover a shortage twice.
+ *
+ * CANCELLED ORDERS ARE EXCLUDED. A cancelled purchase order covers nothing, and
+ * one has already been cancelled on this data once.
+ *
+ * @returns {Promise<Map<number, number>>} catalog item id -> quantity outstanding
+ */
+export async function onOrderByItem(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT ol.catalog_item_id AS id,
+            COALESCE(SUM(GREATEST(ol.qty - COALESCE(ol.qty_received, 0), 0)), 0) AS outstanding
+       FROM fab_orders o
+       JOIN fab_order_lines ol ON ol.order_id = o.id AND ol.deleted_at IS NULL
+      WHERE o.company_id = ? AND o.source_order_id = ?
+        AND o.order_type = 'purchase' AND o.deleted_at IS NULL
+        AND o.status <> ? AND ol.catalog_item_id IS NOT NULL
+      GROUP BY ol.catalog_item_id`,
+    [companyId, orderId, PO_STATUS.CANCELLED],
+  );
+  return new Map(rows.map((r) => [Number(r.id), Number(r.outstanding) || 0]));
+}
+
 export async function procurementForOrder(companyId, orderId, conn) {
   const exec = conn ?? pool;
   const [orders] = await exec.query(
