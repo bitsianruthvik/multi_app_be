@@ -7,6 +7,7 @@ import {
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
 import { setFields } from '../services/fieldService.js';
+import { deleteSalesOrder } from '../services/orderDeleteService.js';
 import {
   parameterGrid, setParameters, exportParameters, importParameters,
 } from '../services/orderParametersService.js';
@@ -778,6 +779,30 @@ export const markSimilarHandler = async (req, res) => {
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
     logger.error({ err }, 'fab_erp: markSimilar failed');
+    res.status(500).json({ message: err.message });
+  }
+};
+
+/**
+ * DELETE — a sales order and the tree that exists only because of it.
+ *
+ * Not the generic row delete. That set `deleted_at` on the order and left its
+ * items, tasks, manufacturing order and stock reservations live — work that went
+ * on holding steel and occupying machines for a job that had vanished from every
+ * screen, with no error anywhere to say so.
+ *
+ * Returns what it removed, what it released, and any purchase order it kept, so
+ * the caller can report that rather than a bare success.
+ */
+export const deleteOrderHandler = async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const orderId = Number(req.params.orderId);
+    if (!Number.isFinite(orderId)) return res.status(400).json({ message: 'Which order?' });
+    res.json(await deleteSalesOrder(cid, orderId));
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err }, 'fab_erp: deleteSalesOrder failed');
     res.status(500).json({ message: err.message });
   }
 };

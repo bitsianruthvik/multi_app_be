@@ -36,6 +36,7 @@ import {
   setItemFlowHandler,
   setItemSpecHandler,
   getItemSpecHandler,
+  deleteOrderHandler,
   parameterGridHandler,
   exportParametersHandler,
   importParametersHandler,
@@ -138,6 +139,16 @@ router.post('/orders/:orderId/similar', protect, requirePerm('fab_erp_projects_m
 // Readiness is read-only, so it is gated on view, not manage.
 router.get('/orders/:orderId/readiness', protect, orderReadinessHandler);
 router.post('/orders/:orderId/confirm', protect, requirePerm('fab_erp_projects_manage'), confirmOrderHandler);
+
+/**
+ * Deleting a sales order removes the whole tree beneath it.
+ *
+ * The generic row delete is not adequate here and was doing real damage: it left
+ * the order's tasks and reservations live, so a deleted job went on holding steel
+ * and loading machines. See orderDeleteService for what is deleted, what is
+ * released, and what is deliberately kept.
+ */
+router.delete('/orders/:orderId', protect, requirePerm('fab_erp_projects_manage'), deleteOrderHandler);
 
 router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_erp_projects_manage'), generateOrderItemCodesHandler);
 // Read-only: gated on view, not manage — anyone who can open the order sees its tonnage.
