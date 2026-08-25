@@ -36,6 +36,7 @@ import {
   resolveCapacityForResource, capacityIntervals, capacityMinutes, isUnbounded,
 } from './capacityService.js';
 import { calendarTimezones, zonedYMD, zonedWallClockToUtc, DEFAULT_TZ } from './plantTime.js';
+import { apportionEntry, taskPlannedSpans } from './planTaskSpan.js';
 
 /**
  * The zone the planner's grid, hour labels and plan_date are expressed in.
@@ -382,25 +383,20 @@ export async function assertDagAllows(companyId, taskIds, start, { excludeEntryI
     preds.get(e.to).push(e.from);
   }
 
-  // Where each predecessor is currently planned to finish.
+  /**
+   * Where each predecessor is currently planned to finish — the TASK's own
+   * finish, not its bar's.
+   *
+   * This used to be MAX(e.planned_end) over the predecessor's entry, which is
+   * the bundle's end. A task second of seven in a batch therefore looked as
+   * though it finished when the seventh did, and every successor of a bundled
+   * task read as illegally early. Since accepting a suggestion with bundling on
+   * produces exactly that shape, moving almost any bar was refused for a
+   * violation the plan did not have. See planTaskSpan.
+   */
   const predIds = [...new Set(taskIds.flatMap((id) => preds.get(id) ?? []))];
-  const plannedEnd = new Map();
-  if (predIds.length > 0) {
-    const params = [companyId, predIds];
-    let excl = '';
-    if (excludeEntryId != null) { excl = ' AND e.id <> ?'; params.push(excludeEntryId); }
-    const [rows] = await pool.query(
-      `SELECT et.task_id AS taskId, MAX(e.planned_end) AS plannedEnd
-         FROM fab_plan_entry_tasks et
-         JOIN fab_plan_entries e ON e.id = et.plan_entry_id
-                               AND e.company_id = et.company_id
-                               AND e.status = 'planned' AND e.deleted_at IS NULL
-        WHERE et.company_id = ? AND et.task_id IN (?) AND et.deleted_at IS NULL${excl}
-        GROUP BY et.task_id`,
-      params,
-    );
-    for (const r of rows) plannedEnd.set(Number(r.taskId), new Date(r.plannedEnd));
-  }
+  const predSpans = await taskPlannedSpans(companyId, predIds, { excludeEntryId });
+  const plannedEnd = new Map([...predSpans].map(([taskId, span]) => [taskId, span.end]));
 
   const selected = new Set(taskIds.map(Number));
   for (const taskId of taskIds) {
@@ -1186,23 +1182,23 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] }
     const blocks = [];
     for (const e of laneEntries) {
       const s = new Date(e.plannedStart).getTime();
-      const en = new Date(e.plannedEnd).getTime();
-      const span = Math.max(0, en - s);
+      const span = Math.max(0, new Date(e.plannedEnd).getTime() - s);
       const tasks = e.tasks ?? [];
       if (tasks.length === 0) {
         blocks.push(Math.round(s - t0), Math.round(span), 0, 0, e.id);
         continue;
       }
-      const total = tasks.reduce((n, t) => n + (Number(t.plannedMinutes) || 0), 0);
-      let cursor = s;
+      // The same apportionment the DAG gate uses, so what the board draws and
+      // what the planner is allowed to do agree about when a task finishes.
+      const spans = apportionEntry(e.plannedStart, e.plannedEnd, tasks);
       for (const t of tasks) {
-        // An equal share when nothing declares minutes, so a bundle of tasks
-        // with no time formula still draws as a bundle rather than collapsing
-        // onto its own start instant.
-        const share = total > 0 ? (Number(t.plannedMinutes) || 0) / total : 1 / tasks.length;
-        const dur = Math.round(span * share);
-        blocks.push(Math.round(cursor - t0), dur, t.itemId ?? 0, t.taskId, e.id);
-        cursor += dur;
+        const at = spans.get(Number(t.taskId));
+        if (!at) continue;
+        blocks.push(
+          Math.round(at.start.getTime() - t0),
+          Math.max(0, at.end.getTime() - at.start.getTime()),
+          t.itemId ?? 0, t.taskId, e.id,
+        );
         if (t.itemId != null) itemIds.push(t.itemId);
       }
     }
