@@ -161,23 +161,78 @@ const CHUNK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 
 /**
+ * Working intervals for one capacity source over one ALIGNED window.
+ *
+ * ── WHY ALIGNED, AND WHY THIS EXISTS ──────────────────────────────────────
+ * The scan used to begin at `from` — an arbitrary instant — and step by
+ * CHUNK_MS from there. Every call therefore asked about a window no other call
+ * had ever asked about, so nothing could be reused and every one went to the
+ * database.
+ *
+ * That would be merely wasteful if the calls were few. They are not: the
+ * placement loop tries one candidate start per interval already booked on the
+ * resource, so call count grows with the square of the tasks on it, and each
+ * call is several round trips to a remote database. Measured on one real order:
+ * 100 tasks took 39 seconds, 250 took 222, and 8,848 — an ordinary bridge —
+ * did not finish in eight minutes. The suggestion pass runs the whole leveller
+ * up to 26 times.
+ *
+ * Snapping the window to a fixed epoch grid changes nothing about the answer —
+ * a shift exists whether or not the question was asked on a week boundary — but
+ * it makes every call for the same resource and week identical, so the second
+ * one is free. Callers clip to `from` themselves, which they must do anyway
+ * because an aligned window can open before the instant being asked about.
+ *
+ * The cache lives for one levelling pass. Capacity cannot change inside a pass,
+ * and a longer-lived cache would quietly serve yesterday's shift pattern.
+ */
+const alignWindow = (ms) => Math.floor(ms / CHUNK_MS) * CHUNK_MS;
+
+function capacityKey(cap) {
+  if (!cap) return 'none';
+  return `${cap.mode ?? ''}|${cap.resourceId ?? ''}|${(cap.calendarIds ?? []).join(',')}`;
+}
+
+async function windowIntervals(companyId, cap, alignedStart, cache) {
+  const key = `${capacityKey(cap)}@${alignedStart}`;
+  const hit = cache?.get(key);
+  if (hit) return hit;
+  const ivs = await capacityIntervals(
+    companyId, cap, new Date(alignedStart), new Date(alignedStart + CHUNK_MS),
+  );
+  cache?.set(key, ivs);
+  return ivs;
+}
+
+/** The part of an interval at or after `fromMs`, or null if none of it is. */
+function clipFrom(iv, fromMs) {
+  const s = Math.max(iv.start.getTime(), fromMs);
+  const e = iv.end.getTime();
+  return e > s ? { start: new Date(s), end: new Date(e) } : null;
+}
+
+/**
  * First working instant at or after `from` on the given calendars. With no
  * calendars resolved, time is treated as continuous (24/7) — the same optimistic
  * spirit as taskWaitService's empty-calendar fallback — so the engine still runs
  * in setups without a configured shift calendar.
  */
-async function nextWorkingInstant(companyId, cap, from) {
+async function nextWorkingInstant(companyId, cap, from, cache) {
   // Only the calendar path treats "no calendars" as 24/7. Crew mode never falls
   // back — an unmanned machine has zero capacity, and pretending otherwise would
   // schedule work onto a machine nobody is standing at.
   if (isUnbounded(cap)) return new Date(from.getTime());
-  let windowStart = new Date(from.getTime());
+  const fromMs = from.getTime();
+  let windowStart = alignWindow(fromMs);
   let scanned = 0;
   while (scanned <= MAX_SCAN_MS) {
-    const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
-    if (ivs.length > 0) return new Date(ivs[0].start.getTime());
-    windowStart = windowEnd;
+    const ivs = await windowIntervals(companyId, cap, windowStart, cache);
+    for (const raw of ivs) {
+      // Clipped, because an aligned window can open before `from`.
+      const iv = clipFrom(raw, fromMs);
+      if (iv) return new Date(iv.start.getTime());
+    }
+    windowStart += CHUNK_MS;
     scanned += CHUNK_MS;
   }
   throw new NoCapacityError({
@@ -196,7 +251,7 @@ async function nextWorkingInstant(companyId, cap, from) {
  * list of wall-clock in-shift intervals the task actually consumes (used for
  * concurrency checks). Walks the calendar in chunks via workingIntervalsInWindow.
  */
-async function computeSpan(companyId, cap, from, durationMin) {
+async function computeSpan(companyId, cap, from, durationMin, cache) {
   if (isUnbounded(cap)) {
     // 24/7 fallback: working minutes == wall-clock minutes.
     const start = new Date(from.getTime());
@@ -204,12 +259,13 @@ async function computeSpan(companyId, cap, from, durationMin) {
     return { start, end, intervals: durationMin > 0 ? [{ start, end }] : [] };
   }
   if (!(durationMin > 0)) {
-    const inst = await nextWorkingInstant(companyId, cap, from);
+    const inst = await nextWorkingInstant(companyId, cap, from, cache);
     return { start: inst, end: new Date(inst.getTime()), intervals: [] };
   }
 
+  const fromMs = from.getTime();
   let remaining = durationMin;
-  let windowStart = new Date(from.getTime());
+  let windowStart = alignWindow(fromMs);
   let started = null;
   const occupied = [];
   let scanned = 0;
@@ -219,12 +275,15 @@ async function computeSpan(companyId, cap, from, durationMin) {
         reason: NO_WORKING_TIME,
         from,
         scanDays: MAX_SCAN_MS / 86400000,
-        calendarIds,
+        calendarIds: cap?.calendarIds ?? [],
       });
     }
-    const windowEnd = new Date(windowStart.getTime() + CHUNK_MS);
-    const ivs = await capacityIntervals(companyId, cap, windowStart, windowEnd);
-    for (const iv of ivs) {
+    const raws = await windowIntervals(companyId, cap, windowStart, cache);
+    for (const raw of raws) {
+      // Clipped to `from`: an aligned window can open before the instant asked
+      // about, and a shift that started an hour ago offers only its remainder.
+      const iv = clipFrom(raw, fromMs);
+      if (!iv) continue;
       if (started === null) started = new Date(iv.start.getTime());
       const lenMin = (iv.end.getTime() - iv.start.getTime()) / 60000;
       if (remaining <= lenMin + 1e-9) {
@@ -235,11 +294,11 @@ async function computeSpan(companyId, cap, from, durationMin) {
       occupied.push({ start: new Date(iv.start.getTime()), end: new Date(iv.end.getTime()) });
       remaining -= lenMin;
     }
-    windowStart = windowEnd;
+    windowStart += CHUNK_MS;
     scanned += CHUNK_MS;
   }
   // remaining <= 0 with no interval consumed: zero-length at the found start.
-  const inst = started ?? (await nextWorkingInstant(companyId, cap, from));
+  const inst = started ?? (await nextWorkingInstant(companyId, cap, from, cache));
   return { start: inst, end: new Date(inst.getTime()), intervals: occupied };
 }
 
@@ -379,6 +438,12 @@ export async function levelSchedule({
   // crew — either way two machines in the same plant can differ, and a
   // plant-keyed cache would hand the first machine's answer to the second.
   const capCache = new Map();    // resourceKey -> capacity source
+  /**
+   * Working intervals, per capacity source per aligned week, for THIS pass only.
+   * See windowIntervals — this is what turns a quadratic pile of database round
+   * trips into one call per resource per week.
+   */
+  const ivCache = new Map();
   async function capacityFor(task) {
     // An explicit `calendar` argument still forces the calendar path — callers
     // pass it to schedule against a hypothetical calendar (what-if runs).
@@ -443,7 +508,7 @@ export async function levelSchedule({
     let span;
     if (key === null || !(capacity < Infinity) || durationMin <= 0) {
       // Unconstrained (or zero-length): schedule at precedence-earliest.
-      span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin));
+      span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin, ivCache));
     } else {
       const existing = resourceState.get(key) ?? [];
       // Candidate starts: the precedence-earliest instant, plus every existing
@@ -454,13 +519,13 @@ export async function levelSchedule({
       const candidates = [...new Set(candTimes)].sort((a, b) => a - b);
       span = null;
       for (const c of candidates) {
-        const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin));
+        const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache));
         if (feasible(existing, s.intervals, capacity)) { span = s; break; }
       }
       if (span === null) {
         // Defensive: place strictly after all existing work (guaranteed feasible).
         const latest = candidates[candidates.length - 1];
-        span = await withContext(() => computeSpan(companyId, capSrc, new Date(latest), durationMin));
+        span = await withContext(() => computeSpan(companyId, capSrc, new Date(latest), durationMin, ivCache));
       }
     }
 
