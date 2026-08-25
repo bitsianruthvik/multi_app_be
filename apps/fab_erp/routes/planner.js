@@ -25,6 +25,7 @@ import {
   getPlan, getPlanBoard, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
   acceptRun, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
+import { transformGroup } from '../services/planGroupService.js';
 
 const router = Router();
 
@@ -43,7 +44,14 @@ function denyPermission(res, tag) {
 
 /** A PlanError is a refusal the planner can act on, not a server fault. */
 function sendPlanError(res, err) {
-  return res.status(409).json({ message: err.message, code: err.code, detail: err.detail });
+  return res.status(409).json({
+    message: err.message,
+    code: err.code,
+    detail: err.detail,
+    // A group move can be refused for several bars at once. The first one is
+    // repeated above so every existing client keeps working unchanged.
+    ...(Array.isArray(err.refusals) ? { refusals: err.refusals } : {}),
+  });
 }
 
 function parseIdList(raw) {
@@ -228,6 +236,33 @@ router.post('/plan/accept', protect, async (req, res) => {
 });
 
 // ─── editing ──────────────────────────────────────────────────────────────────
+
+/**
+ * POST /plan/group — move, stretch, push left, or restore a whole unit.
+ *
+ * Not PATCH /plan/entries/:id in a loop. Every intermediate state of a group
+ * move is illegal, so bar-at-a-time is refused on the first call for a
+ * violation the finished move would not have had. This validates the FINAL
+ * state and writes it in one transaction: all of it lands, or none does.
+ *
+ * `dryRun` returns the same answer without writing, which is what the board
+ * calls while a handle is still being dragged.
+ */
+router.post('/plan/group', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const out = await transformGroup(companyId, req.body ?? {}, user?.id ?? null);
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'plan group transform failed');
+    return res.status(500).json({ message: 'Could not move that unit.' });
+  }
+});
 
 router.post('/plan/entries', protect, async (req, res) => {
   const user = req.user;

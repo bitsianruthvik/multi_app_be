@@ -395,6 +395,9 @@ function feasible(existing, newIntervals, capacity) {
  * Produce a deterministic, resource-feasible schedule.
  *
  * @param {object}   args
+ * @param {Map<number,Date>} [args.earliestByTask] Per-task floor, merged with the
+ *                   precedence-earliest instant. For levelling a SUBSET of a
+ *                   plan, where predecessors outside the subset have no edge.
  * @param {number}   args.companyId
  * @param {object[]} args.tasks             fab_project_tasks rows (non-cancelled),
  *                   each with at least id, computed_hours, resource_type_id,
@@ -426,6 +429,7 @@ function feasible(existing, newIntervals, capacity) {
  */
 export async function levelSchedule({
   companyId, tasks, edges, resourceCapacity, calendar, anchor, priority, preOccupied,
+  earliestByTask,
 } = {}) {
   const schedule = new Map();
   if (!Array.isArray(tasks) || tasks.length === 0) return schedule;
@@ -546,6 +550,14 @@ export async function levelSchedule({
       const p = schedule.get(pid);
       if (p && p.end > earliest) earliest = p.end;
     }
+    // A floor supplied by the caller, for predecessors that are NOT in this run.
+    // Levelling a SUBSET of a plan — one girder, against everything else held
+    // fixed — has most of its precedence outside the task set, so there is no
+    // edge to carry it. Without this the subset would happily start before work
+    // it depends on, and the only alternative would be re-levelling the whole
+    // shop in order to move one unit.
+    const floor = earliestByTask?.get(id);
+    if (floor instanceof Date && floor > earliest) earliest = floor;
 
     const capSrc = await capacityFor(task);
     const { key, capacity } = resourceContext(task, cap);
