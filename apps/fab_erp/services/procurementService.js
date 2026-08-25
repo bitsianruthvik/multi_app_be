@@ -261,8 +261,38 @@ export async function orderShortfall(companyId, orderId, conn) {
     const sizedRows = sizes.filter((s) => s.sized);
     const unsizedRequired = sizes.filter((s) => !s.sized)
       .reduce((n, s) => n + s.required, 0);
-    const sizedShort = sizedRows.reduce((n, s) => n + (s.short || 0), 0);
-    const unsizedShort = Math.max(0, unsizedRequired - a.available);
+
+    /**
+     * STOCK NOBODY MEASURED STILL COUNTS, and leaving it out ordered a yard
+     * full of steel a second time.
+     *
+     * Size matching compares a requirement against pieces carrying the same
+     * length and width. A piece whose size was never recorded matches nothing,
+     * so an item whose stock is all unmeasured read as ENTIRELY short: 14,424
+     * shear studs required, 14,424 on hand, and a purchase order for 14,424
+     * more. The unsized figure was already being computed and reported on the
+     * line — it just never reduced anything.
+     *
+     * It is safe to draw on because a catalogue item now NAMES its size — "MS
+     * Plate 28 x 3100 x 12050" — so a full piece of that item IS that size
+     * whether or not somebody typed the dimensions onto the piece. That was not
+     * true when an item meant only a thickness, which is where the caution came
+     * from.
+     *
+     * OFFCUTS ARE NOT IN THIS POOL and must never be: a drop is smaller than
+     * the item it came off, and it is created with its dimensions, so it is
+     * always sized and always matched exactly. That is what stops this from
+     * quietly under-ordering.
+     *
+     * Drawn down ONCE across the item's sizes, then what remains is what the
+     * unsized requirements can still draw on — otherwise the same pieces would
+     * be spent twice.
+     */
+    const unsizedPool = sizes.reduce((n, s) => Math.max(n, s.unsized), 0);
+    const rawSizedShort = sizedRows.reduce((n, s) => n + (s.short || 0), 0);
+    const drawnFromUnsized = Math.min(rawSizedShort, unsizedPool);
+    const sizedShort = rawSizedShort - drawnFromUnsized;
+    const unsizedShort = Math.max(0, unsizedRequired - Math.max(0, a.available - drawnFromUnsized));
     const short = sizedRows.length
       ? sizedShort + unsizedShort
       : Math.max(0, required - a.available);
