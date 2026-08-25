@@ -212,6 +212,64 @@ function clipFrom(iv, fromMs) {
 }
 
 /**
+ * What a resource is already booked with, kept so that overlap questions do not
+ * have to read all of it.
+ *
+ * ── WHY THIS IS NOT JUST AN ARRAY ─────────────────────────────────────────
+ * `feasible` compares a proposed placement against everything already on the
+ * resource. It was handed the whole list, so the comparison grew with the work
+ * already scheduled — and it is asked once per candidate start, of which there
+ * is one per interval already booked. Two nested walks of the same growing list,
+ * per task. A CPU profile of one real order put 38% of all time inside
+ * `feasible` alone.
+ *
+ * Almost every one of those comparisons is against an interval nowhere near the
+ * placement being tested. Sorting by start makes the relevant slice findable,
+ * and remembering the longest interval on the resource bounds how far back the
+ * slice can begin — an interval starting before `lo - maxLen` has certainly
+ * ended by `lo`.
+ *
+ * This changes nothing about the answer. A pair that does not overlap
+ * contributes no clip, so excluding it early and excluding it late give the same
+ * result — which the equivalence check relies on.
+ */
+function newResourceState() {
+  return { ivs: [], maxLen: 0 };
+}
+
+/** First index whose start is >= `ms`, in a list sorted by start. */
+function lowerBound(ivs, ms) {
+  let lo = 0;
+  let hi = ivs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ivs[mid].start.getTime() < ms) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function addInterval(state, iv) {
+  const at = lowerBound(state.ivs, iv.start.getTime());
+  state.ivs.splice(at, 0, iv);
+  const len = iv.end.getTime() - iv.start.getTime();
+  if (len > state.maxLen) state.maxLen = len;
+}
+
+/** The booked intervals that could possibly overlap [lo, hi). */
+function overlapping(state, lo, hi) {
+  const { ivs, maxLen } = state;
+  if (ivs.length === 0) return ivs;
+  const out = [];
+  for (let i = lowerBound(ivs, lo - maxLen); i < ivs.length; i += 1) {
+    const iv = ivs[i];
+    if (iv.start.getTime() >= hi) break;
+    if (iv.end.getTime() > lo) out.push(iv);
+  }
+  return out;
+}
+
+/**
  * First working instant at or after `from` on the given calendars. With no
  * calendars resolved, time is treated as continuous (24/7) — the same optimistic
  * spirit as taskWaitService's empty-calendar fallback — so the engine still runs
@@ -456,7 +514,10 @@ export async function levelSchedule({
   }
 
   // ── forward pass ─────────────────────────────────────────────────────────────
-  const resourceState = new Map(); // key -> occupied intervals [{start,end}]
+  // key -> a start-sorted interval index (see newResourceState). A plain array
+  // was fine until an order arrived with thousands of tasks on one machine:
+  // feasibility was rescanning every booking already made, once per candidate.
+  const resourceState = new Map();
 
   // Seed with capacity that is already committed. resourceContext is reused
   // verbatim so a pre-occupied span lands on exactly the key the tasks contend
@@ -470,8 +531,8 @@ export async function levelSchedule({
       cap,
     );
     if (key === null) continue;
-    if (!resourceState.has(key)) resourceState.set(key, []);
-    resourceState.get(key).push({ start, end });
+    if (!resourceState.has(key)) resourceState.set(key, newResourceState());
+    addInterval(resourceState.get(key), { start, end });
   }
 
   for (const id of order) {
@@ -510,17 +571,31 @@ export async function levelSchedule({
       // Unconstrained (or zero-length): schedule at precedence-earliest.
       span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin, ivCache));
     } else {
-      const existing = resourceState.get(key) ?? [];
+      const state = resourceState.get(key) ?? newResourceState();
+      const existing = state.ivs;
       // Candidate starts: the precedence-earliest instant, plus every existing
       // interval end at/after it. The latest candidate lies after all existing
       // work, so a feasible placement is always found (loop terminates).
-      const candTimes = [earliest.getTime()];
-      for (const iv of existing) if (iv.end.getTime() >= earliest.getTime()) candTimes.push(iv.end.getTime());
+      const earliestMs = earliest.getTime();
+      const candTimes = [earliestMs];
+      // No interval is longer than maxLen, so one starting before
+      // earliestMs - maxLen cannot end at/after earliestMs. Skipping those is
+      // exactly the filter below, done by binary search instead of a full scan.
+      for (let i = lowerBound(existing, earliestMs - state.maxLen); i < existing.length; i += 1) {
+        const end = existing[i].end.getTime();
+        if (end >= earliestMs) candTimes.push(end);
+      }
       const candidates = [...new Set(candTimes)].sort((a, b) => a - b);
       span = null;
       for (const c of candidates) {
         const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache));
-        if (feasible(existing, s.intervals, capacity)) { span = s; break; }
+        // Only the intervals that could touch this placement — see overlapping().
+        const near = s.intervals.length === 0 ? [] : overlapping(
+          state,
+          s.intervals[0].start.getTime(),
+          s.intervals[s.intervals.length - 1].end.getTime(),
+        );
+        if (feasible(near, s.intervals, capacity)) { span = s; break; }
       }
       if (span === null) {
         // Defensive: place strictly after all existing work (guaranteed feasible).
@@ -531,9 +606,9 @@ export async function levelSchedule({
 
     schedule.set(id, { start: span.start, end: span.end });
     if (key !== null && capacity < Infinity && span.intervals.length > 0) {
-      if (!resourceState.has(key)) resourceState.set(key, []);
-      const arr = resourceState.get(key);
-      for (const iv of span.intervals) arr.push(iv);
+      if (!resourceState.has(key)) resourceState.set(key, newResourceState());
+      const st = resourceState.get(key);
+      for (const iv of span.intervals) addInterval(st, iv);
     }
   }
 
