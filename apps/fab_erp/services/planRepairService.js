@@ -28,11 +28,27 @@
  * topological order, into the earliest slot that respects both the shift
  * calendar and the lane's concurrency.
  *
- * Does NOT (yet): make independent work yield to make room. Where the repaired
- * plan exceeds a lane's capacity that is still reported as a warning, exactly as
- * before. Bumping unrelated bars is a resource-constrained repair that can
- * cascade and oscillate, and it needs its own priority rule and hop cap; it is
- * the next piece, deliberately not smuggled in with this one.
+ * Also does (with `yieldFree`): make independent work step aside where the move
+ * put the machine over capacity. Three rules keep that bounded:
+ *
+ *   ONLY CONGESTION THE MOVE CAUSED. A target has to be an instant where the
+ *   lane is over capacity AND a bar the planner moved is sitting in it. The
+ *   KEPL plan runs at 170–290% of crewed time everywhere, so a yield that
+ *   chased over-capacity in general would try to re-level the whole shop on
+ *   every nudge, for congestion nobody just created.
+ *
+ *   FORWARD ONLY. A displaced bar is re-placed at or after where it already
+ *   was, never earlier. That makes the process monotone — every bump strictly
+ *   increases a start — so it cannot oscillate, and it never quietly pulls
+ *   untouched work earlier.
+ *
+ *   THE LEAST IMPORTANT ONE YIELDS. Ordered by the order's priority_rank
+ *   (unranked last), then its due date, then the later start. Without that,
+ *   "something moves" is a coin flip and a rush job gives way to routine work.
+ *
+ * It cannot invent capacity. On a lane that is already saturated a bump only
+ * moves the congestion along, so the loop stops after MAX_YIELD_HOPS and says
+ * what it could not clear rather than churning.
  *
  * Also does NOT pull dependents EARLIER when a unit moves left. Moving left
  * cannot create room downstream, and quietly compacting work the planner did not
@@ -54,6 +70,16 @@ import { apportionEntry } from './planTaskSpan.js';
  * with the count, rather than half-applied.
  */
 export const MAX_CASCADE = 4000;
+
+/**
+ * How many bars may be shoved aside for one move.
+ *
+ * Not a fairness policy — a termination bound. Each bump moves a bar strictly
+ * later, so the loop always makes progress, but on a saturated lane "progress"
+ * can mean pushing the same congestion down the week for ever. Past this, what
+ * is left unresolved is reported instead.
+ */
+export const MAX_YIELD_HOPS = 200;
 
 /** Bars whose work has started, or that a human pinned, do not move. Ever. */
 function isImmovable(bar) {
@@ -238,6 +264,54 @@ function kahn(ids, into, byId) {
 
 // ─── the repair ───────────────────────────────────────────────────────────────
 
+/**
+ * Which bar gives way.
+ *
+ * Lower is yielded first. `priority_rank` is a sequence somebody arranged, so a
+ * missing one means nobody said this order matters — it goes first. Due date
+ * breaks ties among the unranked, and a later start breaks the rest, because
+ * moving something that is already late is less disruptive than moving the work
+ * about to start.
+ */
+function yieldOrder(bar, orderMeta) {
+  const meta = orderMeta.get(bar.orderId) ?? {};
+  const rank = Number.isFinite(meta.priorityRank) ? meta.priorityRank : Number.POSITIVE_INFINITY;
+  const due = meta.due ? new Date(meta.due).getTime() : Number.POSITIVE_INFINITY;
+  return [-rank, -due, bar.start.getTime(), bar.id];
+}
+
+function worseThan(a, b) {
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return false;
+}
+
+/**
+ * The first instant on this lane where the plan is over capacity AND one of the
+ * bars the planner moved is in it.
+ *
+ * The second half is what stops a yield from becoming a re-level: congestion
+ * that was already there and that the move did not touch is somebody else's
+ * problem, and not one a drag should silently rearrange the shop to solve.
+ */
+function firstCausedOverload(entriesOnLane, capacity, ours) {
+  const events = [];
+  for (const b of entriesOnLane) {
+    events.push([b.start, 1, b], [b.end, -1, b]);
+  }
+  events.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  const live = new Set();
+  for (const [at, delta, bar] of events) {
+    if (delta === 1) live.add(bar); else live.delete(bar);
+    if (live.size <= capacity) continue;
+    let mine = false;
+    for (const b of live) if (ours.has(b.id)) { mine = true; break; }
+    if (mine) return { at, live: [...live] };
+  }
+  return null;
+}
+
 /** Where each of a bar's tasks runs, given where the bar is. */
 function taskSpansOf(bar, start, end) {
   const os = bar.start.getTime();
@@ -262,10 +336,13 @@ function taskSpansOf(bar, start, end) {
  *        the planner said so.
  * @param {Map<number,number[]>} args.preds task id → predecessor task ids
  * @param {number[]} args.orderIds orders the move touches
+ * @param {boolean} [args.yieldFree] also step independent work aside where the
+ *        move put a machine over capacity. See the file header for the three
+ *        rules that keep it bounded.
  * @returns {Promise<{placements:Map<number,{start:Date,end:Date}>, cascaded:number,
- *                    examined:number, capped:boolean}>}
+ *                    yielded:number, unresolved:number, examined:number, capped:boolean}>}
  */
-export async function cascadeRepair(companyId, { proposed, preds, orderIds }) {
+export async function cascadeRepair(companyId, { proposed, preds, orderIds, yieldFree = false }) {
   const movedIds = [...proposed.keys()];
   const orderBars = await loadOrderBars(companyId, orderIds);
   const byId = new Map(orderBars.map((b) => [b.id, b]));
@@ -276,12 +353,15 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds }) {
     return b && !isImmovable(b);
   });
 
-  if (affected.length === 0) {
-    return { placements: new Map(), cascaded: 0, examined: 0, capped: false };
+  // No early exit when nothing is downstream: a move can congest a machine
+  // without having a single dependant, and that is exactly what yielding is for.
+  if (affected.length === 0 && !yieldFree) {
+    return { placements: new Map(), cascaded: 0, yielded: 0, unresolved: 0, examined: 0, capped: false };
   }
   if (affected.length > MAX_CASCADE) {
     return {
-      placements: new Map(), cascaded: 0, examined: affected.length, capped: true,
+      placements: new Map(), cascaded: 0, yielded: 0, unresolved: 0,
+      examined: affected.length, capped: true,
     };
   }
 
@@ -329,7 +409,6 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds }) {
     bookedAt.delete(barId);
   };
 
-  const affectedSet = new Set(affected);
   for (const b of foreign) book(b, b.start, b.end);
   for (const b of orderBars) {
     const place = proposed.get(b.id);
@@ -347,39 +426,143 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds }) {
     recordTaskEnds(b, place ? place.start : b.start, place ? place.end : b.end);
   }
 
-  // ── walk downstream, moving only what is actually violated ─────────────────
+  // ── where everything currently sits, as this run has it ────────────────────
   const placements = new Map();
-  let cascaded = 0;
-  for (const id of kahn(affected, into, byId)) {
-    const bar = byId.get(id);
-    if (!bar) continue;
+  const posOf = (bar) => placements.get(bar.id) ?? proposed.get(bar.id) ?? { start: bar.start, end: bar.end };
 
-    let floor = null;
-    for (const t of bar.taskIds) {
-      for (const p of preds.get(t) ?? []) {
-        if (bar.taskIds.includes(p)) continue;
-        const end = taskEnd.get(p);
-        if (end && (floor === null || end > floor)) floor = end;
-      }
-    }
-    if (!floor || bar.start >= floor) {
-      // Still legal where it is. Leaving it is the whole point.
-      recordTaskEnds(bar, bar.start, bar.end);
-      continue;
-    }
-
-    unbook(id);
+  /** Re-place one bar at or after `notBefore`, keeping the books straight. */
+  const replaceBar = async (bar, notBefore) => {
+    unbook(bar.id);
     const capSrc = await capFor(bar);
     const { key, capacity: units } = placer.contextFor({
       assigned_resource_id: bar.resourceId ?? null,
       resource_type_id: bar.resourceTypeId ?? null,
     });
-    const span = await placer.place(capSrc, key, units, floor, Number(bar.plannedMinutes) || 0);
+    const span = await placer.place(capSrc, key, units, notBefore, Number(bar.plannedMinutes) || 0);
     book(bar, span.start, span.end);
-    placements.set(id, { start: span.start, end: span.end });
+    placements.set(bar.id, { start: span.start, end: span.end });
     recordTaskEnds(bar, span.start, span.end);
-    cascaded += 1;
+    return span;
+  };
+
+  /**
+   * Push a set of bars back behind their predecessors, in topological order.
+   *
+   * Returns the ones that actually had to move. Reusable because a yield can
+   * break precedence too: the bar that stepped aside may now finish after
+   * something that was waiting on it.
+   */
+  const repairPrecedence = async (ids) => {
+    const movedNow = [];
+    for (const id of kahn(ids, into, byId)) {
+      const bar = byId.get(id);
+      if (!bar || isImmovable(bar)) continue;
+
+      let floor = null;
+      for (const t of bar.taskIds) {
+        for (const pred of preds.get(t) ?? []) {
+          if (bar.taskIds.includes(pred)) continue;
+          const end = taskEnd.get(pred);
+          if (end && (floor === null || end > floor)) floor = end;
+        }
+      }
+      const at = posOf(bar);
+      if (!floor || at.start >= floor) {
+        // Still legal where it is. Leaving it is the whole point.
+        recordTaskEnds(bar, at.start, at.end);
+        continue;
+      }
+      await replaceBar(bar, floor);
+      movedNow.push(id);
+    }
+    return movedNow;
+  };
+
+  let cascaded = (await repairPrecedence(affected)).length;
+
+  // ── make room, where the move is what filled it ────────────────────────────
+  let yielded = 0;
+  let unresolved = 0;
+  if (yieldFree) {
+    const orderMeta = await loadOrderMeta(companyId, orderIds);
+    const ours = new Set([...proposed.keys(), ...placements.keys()]);
+    const movable = new Map(orderBars.filter((b) => !isImmovable(b)).map((b) => [b.id, b]));
+    const bumped = new Set();
+
+    for (let hop = 0; hop < MAX_YIELD_HOPS; hop += 1) {
+      // Group what is booked, by lane, at its current position.
+      const lanes = new Map();
+      for (const [barId, at] of bookedAt) {
+        if (!lanes.has(at.key)) lanes.set(at.key, []);
+        lanes.get(at.key).push({ id: barId, start: at.iv.start, end: at.iv.end });
+      }
+
+      let acted = false;
+      for (const [key, onLane] of lanes) {
+        const sample = movable.get(onLane[0].id) ?? byId.get(onLane[0].id)
+          ?? foreign.find((f) => f.id === onLane[0].id);
+        if (!sample) continue;
+        const { capacity: units } = placer.contextFor({
+          assigned_resource_id: sample.resourceId ?? null,
+          resource_type_id: sample.resourceTypeId ?? null,
+        });
+        if (!(units < Infinity)) continue;
+
+        const hit = firstCausedOverload(onLane, units, ours);
+        if (!hit) continue;
+
+        // The least important bar in the jam that is not the planner's own, has
+        // not already stepped aside once, and is allowed to move at all.
+        let victim = null;
+        let victimKey = null;
+        for (const entry of hit.live) {
+          if (ours.has(entry.id) || bumped.has(entry.id)) continue;
+          const bar = movable.get(entry.id);
+          if (!bar) continue;
+          const k = yieldOrder({ ...bar, start: entry.start }, orderMeta);
+          if (victim === null || worseThan(k, victimKey)) { victim = bar; victimKey = k; }
+        }
+        if (!victim) { unresolved += 1; continue; }
+
+        // Forward only: at or after where it already was, never earlier.
+        await replaceBar(victim, new Date(Math.max(hit.at.getTime(), posOf(victim).start.getTime())));
+        bumped.add(victim.id);
+        yielded += 1;
+        acted = true;
+
+        // Stepping aside can strand what was waiting on it.
+        const after = downstreamOf([victim.id], out).filter((id) => {
+          const b = byId.get(id);
+          return b && !isImmovable(b);
+        });
+        if (after.length > 0) cascaded += (await repairPrecedence(after)).length;
+        void key;
+        break;
+      }
+      if (!acted) break;
+    }
   }
 
-  return { placements, cascaded, examined: affected.length, capped: false };
+  return {
+    placements, cascaded, yielded, unresolved, examined: affected.length, capped: false,
+  };
+}
+
+/** priority_rank and due date per order — who yields to whom. */
+async function loadOrderMeta(companyId, orderIds) {
+  const out = new Map();
+  if (orderIds.length === 0) return out;
+  const [rows] = await pool.query(
+    `SELECT id, priority_rank AS priorityRank,
+            COALESCE(must_finish_by, required_date) AS due
+       FROM fab_orders WHERE company_id = ? AND id IN (?)`,
+    [companyId, orderIds],
+  );
+  for (const r of rows) {
+    out.set(r.id, {
+      priorityRank: r.priorityRank == null ? null : Number(r.priorityRank),
+      due: r.due,
+    });
+  }
+  return out;
 }

@@ -659,6 +659,9 @@ async function checkCalendar(companyId, entries, proposed) {
  * @param {boolean} [input.cascade]     also shift everything downstream that the
  *        move would otherwise leave illegal. Off by default so no existing
  *        caller changes behaviour; the board sends it on every gesture.
+ * @param {boolean} [input.yieldFree]   with `cascade`, also step independent work
+ *        aside where this move put a machine over capacity. Only congestion the
+ *        move caused, forward only, least important first — see planRepairService.
  * @param {boolean} [input.dryRun]      validate and return, write nothing
  * @returns {Promise<{applied:boolean, placements:object[], previous:object[], warnings:object[]}>}
  */
@@ -724,6 +727,7 @@ export async function transformGroup(companyId, input, userId = null) {
         movedCount: 0,
         unitSize,
         cascadedCount: 0,
+        yieldedCount: 0,
         placements: entries.map((e) => ({
           entryId: e.id,
           plannedStart: e.start.toISOString(),
@@ -769,9 +773,15 @@ export async function transformGroup(companyId, input, userId = null) {
    * decision rather than the reversal of an old one.
    */
   let cascaded = [];
+  let yielded = 0;
+  let unresolved = 0;
   if (input.cascade && input.op !== 'restore') {
     const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
-    const repair = await cascadeRepair(companyId, { proposed, preds: dag.preds, orderIds });
+    const repair = await cascadeRepair(companyId, {
+      proposed, preds: dag.preds, orderIds, yieldFree: !!input.yieldFree,
+    });
+    yielded = repair.yielded ?? 0;
+    unresolved = repair.unresolved ?? 0;
     if (repair.capped) {
       throw new PlanError(
         'CASCADE_TOO_LARGE',
@@ -822,6 +832,20 @@ export async function transformGroup(companyId, input, userId = null) {
         detail: { entryIds: cascaded.slice(0, 50), count: cascaded.length },
       }]
       : []),
+    ...(yielded > 0
+      ? [{
+        code: 'YIELDED',
+        message: `${yielded} unrelated bar${yielded === 1 ? '' : 's'} stepped aside to make room.`,
+        detail: { count: yielded },
+      }]
+      : []),
+    ...(unresolved > 0
+      ? [{
+        code: 'NO_ROOM_TO_YIELD',
+        message: 'Some of the machine time this move needs could not be freed — everything in the way is pinned, already started, or the unit\u2019s own.',
+        detail: { spots: unresolved },
+      }]
+      : []),
     ...await checkSuccessors(companyId, entries, proposed, dag),
     ...await checkCapacity(companyId, entries, proposed),
     ...await checkCalendar(companyId, entries, proposed),
@@ -843,10 +867,10 @@ export async function transformGroup(companyId, input, userId = null) {
   });
 
   if (input.dryRun) {
-    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
+    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
   }
   if (moved.length === 0) {
-    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
+    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
   }
 
   const tz = await plannerTimezone(companyId);
@@ -872,5 +896,5 @@ export async function transformGroup(companyId, input, userId = null) {
     conn.release();
   }
 
-  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
+  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
 }
