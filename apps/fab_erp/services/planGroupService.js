@@ -71,6 +71,23 @@ function toDateTimeStr(d) {
  */
 const CALENDAR_CHECK_DAYS = 120;
 
+/**
+ * How much overlap between a predecessor and its successor is not an overlap.
+ *
+ * Planned times are stored as DATETIME — whole seconds. Task spans, on the other
+ * hand, are COMPUTED: apportioned inside a bundle, and carried across a move by
+ * an affine map, both in floating point. Move a bar and put it back and the
+ * arithmetic lands a few hundred milliseconds from where it started, which is
+ * inside the rounding the database applies anyway.
+ *
+ * With a strict comparison that was enough to refuse an undo: restoring twelve
+ * bars to exactly where they had been was rejected because one predecessor came
+ * back 577 ms later than the successor's start. A violation smaller than the
+ * data's own resolution is not a violation, and refusing on one makes undo
+ * unreliable in precisely the situation somebody most wants it.
+ */
+const DAG_TOLERANCE_MS = 1000;
+
 // ─── loading ──────────────────────────────────────────────────────────────────
 
 async function loadEntries(companyId, entryIds) {
@@ -411,7 +428,7 @@ async function checkDag(companyId, entries, proposed, dag) {
           ));
           continue;
         }
-        if (end.getTime() > at.start.getTime()) {
+        if (end.getTime() > at.start.getTime() + DAG_TOLERANCE_MS) {
           refusals.push(refusal(
             'PREDECESSOR_LATER',
             `Task ${p} (seq ${pred.seq_no}) is not planned to finish until ${end.toISOString()}.`,
@@ -486,7 +503,7 @@ async function checkSuccessors(companyId, entries, proposed, dag) {
       for (const sc of dag.succs.get(t) ?? []) {
         if (entryOfTask.has(sc)) continue;
         const span = spans.get(Number(sc));
-        if (span && span.start.getTime() < at.end.getTime()) stranded.add(span.entryId);
+        if (span && span.start.getTime() + DAG_TOLERANCE_MS < at.end.getTime()) stranded.add(span.entryId);
       }
     }
   }

@@ -81,6 +81,13 @@ export const MAX_CASCADE = 4000;
  */
 export const MAX_YIELD_HOPS = 200;
 
+/**
+ * Overlap below this is rounding, not a precedence problem — see the matching
+ * note in planGroupService. Repairing on it would shove bars around to fix
+ * something the database cannot represent.
+ */
+const DAG_TOLERANCE_MS = 1000;
+
 /** Bars whose work has started, or that a human pinned, do not move. Ever. */
 function isImmovable(bar) {
   return bar.isPinned || bar.started;
@@ -467,7 +474,7 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         }
       }
       const at = posOf(bar);
-      if (!floor || at.start >= floor) {
+      if (!floor || at.start.getTime() + DAG_TOLERANCE_MS >= floor.getTime()) {
         // Still legal where it is. Leaving it is the whole point.
         recordTaskEnds(bar, at.start, at.end);
         continue;
