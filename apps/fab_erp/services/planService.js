@@ -599,6 +599,44 @@ export async function createEntry(companyId, input, userId = null) {
 }
 
 /** Accept a whole suggestion run, or named items from it, into the real plan. */
+/**
+ * Rows per statement when accepting a run.
+ *
+ * Accepting used to be about seven sequential round trips per bar, which on a
+ * 1,551-bar plan against a managed database was 130 seconds — past most proxy
+ * timeouts, and it only ever completed because Render does not impose one. The
+ * work is now batched; these are the chunk sizes, kept well inside max_allowed_packet
+ * rather than at it, since a bar's label and bundle key are free text.
+ */
+const ACCEPT_ENTRY_CHUNK = 200;
+const ACCEPT_MEMBER_CHUNK = 500;
+
+function chunked(rows, size) {
+  const out = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Move a run's bars onto the plan.
+ *
+ * WHY THIS IS BATCHED AND `insertEntry` IS NOT
+ * -------------------------------------------
+ * Everything a bar needs to be checked against — is the task still live, is it
+ * already on another bar, how many minutes is it — is the same question asked of
+ * a few thousand task ids, so it is asked ONCE for all of them and answered from
+ * memory. `planDateFor` was the worst of it: two queries per bar for the plant's
+ * timezone, which does not change between bars.
+ *
+ * The entry ids come back by SELECTing on `run_item_id` rather than by trusting
+ * a multi-row INSERT's first insertId and counting up. MySQL only makes ids
+ * contiguous under some autoinc lock modes and TiDB does not promise it at all,
+ * so counting up would silently attach members to the wrong bars.
+ *
+ * ONE BEHAVIOUR TO PRESERVE: the sequential version caught a task claimed twice
+ * WITHIN one run, because each insert was visible to the next item's check. With
+ * the inserts deferred to the end, that is what `claimed` is for.
+ */
 export async function acceptRun(companyId, runId, { runItemIds = null, pin = false } = {}, userId = null) {
   const [[run]] = await pool.query(
     `SELECT id, status FROM fab_plan_runs
@@ -618,72 +656,144 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
   );
   if (items.length === 0) return { accepted: 0, skipped: [] };
 
-  const conn = await pool.getConnection();
+  // ── parse every item once ──────────────────────────────────────────────────
+  const parsed = [];
   const skipped = [];
-  let accepted = 0;
+  const allTaskIds = new Set();
+  for (const item of items) {
+    let taskIds = [];
+    try { taskIds = JSON.parse(item.task_ids ?? '[]'); } catch { taskIds = []; }
+    taskIds = taskIds.map(Number).filter(Boolean);
+    if (taskIds.length === 0) { skipped.push({ runItemId: item.id, reason: 'no tasks' }); continue; }
+
+    // The levelled per-task spans the run froze, positionally parallel to
+    // task_ids. Runs written before that column exists simply have none.
+    const taskTimes = new Map();
+    try {
+      const raw = JSON.parse(item.task_times ?? 'null');
+      if (Array.isArray(raw)) {
+        raw.forEach((pair, i) => {
+          const id = taskIds[i];
+          if (id && Array.isArray(pair) && pair.length === 2) {
+            taskTimes.set(id, { start: new Date(pair[0]), end: new Date(pair[1]) });
+          }
+        });
+      }
+    } catch { /* a malformed run item falls back to apportioning */ }
+
+    parsed.push({ item, taskIds, taskTimes });
+    for (const id of taskIds) allTaskIds.add(id);
+  }
+  if (parsed.length === 0) return { accepted: 0, skipped };
+
+  // ── three questions, asked once for every task instead of once per bar ─────
+  const ids = [...allTaskIds];
+  const [liveRows] = await pool.query(
+    `SELECT id, computed_hours AS computedHours, setup_hours AS setupHours, task_qty AS taskQty
+       FROM fab_project_tasks
+      WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL
+        AND status NOT IN ('cancelled','done')`,
+    [companyId, ids],
+  );
+  const live = new Map(liveRows.map((r) => [Number(r.id), taskMinutes(r)]));
+
+  const [plannedRows] = await pool.query(
+    `SELECT et.task_id AS taskId, e.id AS entryId
+       FROM fab_plan_entry_tasks et
+       JOIN fab_plan_entries e ON e.id = et.plan_entry_id
+                             AND e.company_id = et.company_id
+                             AND e.status = 'planned' AND e.deleted_at IS NULL
+      WHERE et.company_id = ? AND et.task_id IN (?) AND et.deleted_at IS NULL`,
+    [companyId, ids],
+  );
+  const alreadyOn = new Map(plannedRows.map((r) => [Number(r.taskId), r.entryId]));
+
+  const tz = await plannerTimezone(companyId);
+
+  // ── decide every bar in memory ─────────────────────────────────────────────
+  const entryRows = [];
+  const membersByRunItem = new Map();
+  const claimed = new Map();
+  for (const { item, taskIds, taskTimes } of parsed) {
+    // The world moved between suggesting and accepting: tasks get started,
+    // finished, cancelled and re-materialized. Skipping the item with a reason
+    // beats writing a plan entry for work that no longer exists.
+    const liveIds = taskIds.filter((id) => live.has(id));
+    if (liveIds.length === 0) { skipped.push({ runItemId: item.id, reason: 'tasks no longer plannable' }); continue; }
+
+    const clash = liveIds.find((id) => alreadyOn.has(id) || claimed.has(id));
+    if (clash != null) {
+      const reason = alreadyOn.has(clash)
+        ? `Task ${clash} is already on plan entry ${alreadyOn.get(clash)}.`
+        : `Task ${clash} is already on another bar in this run (item ${claimed.get(clash)}).`;
+      skipped.push({ runItemId: item.id, reason });
+      continue;
+    }
+    for (const id of liveIds) claimed.set(id, item.id);
+
+    const start = new Date(item.planned_start);
+    const end = new Date(item.planned_end);
+    entryRows.push([
+      companyId, zonedYMD(start, tz), item.resource_type_id, item.resource_id ?? null,
+      toDateTimeStr(start), toDateTimeStr(end), Math.round(item.planned_minutes || 0),
+      liveIds.length > 1 ? 'bundle' : 'task',
+      item.bundle_key ? String(item.bundle_key).slice(0, 190) : null,
+      item.ancestor_item_id ?? null, item.order_id ?? null, item.operation_id ?? null,
+      'suggested', runId, item.id, pin ? 1 : 0, 'planned',
+      item.label ? String(item.label).slice(0, 255) : null, null, userId, userId,
+    ]);
+    membersByRunItem.set(item.id, liveIds.map((taskId, i) => {
+      const span = taskTimes.get(taskId);
+      return [taskId, live.get(taskId) ?? 0, i,
+        span ? toDateTimeStr(span.start) : null,
+        span ? toDateTimeStr(span.end) : null];
+    }));
+  }
+  if (entryRows.length === 0) return { accepted: 0, skipped };
+
+  const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    for (const item of items) {
-      let taskIds = [];
-      try { taskIds = JSON.parse(item.task_ids ?? '[]'); } catch { taskIds = []; }
-      taskIds = taskIds.map(Number).filter(Boolean);
-      if (taskIds.length === 0) { skipped.push({ runItemId: item.id, reason: 'no tasks' }); continue; }
 
-      // The levelled per-task spans the run froze, positionally parallel to
-      // task_ids. Runs written before that column exists simply have none.
-      const taskTimes = new Map();
-      try {
-        const raw = JSON.parse(item.task_times ?? 'null');
-        if (Array.isArray(raw)) {
-          raw.forEach((pair, i) => {
-            const id = taskIds[i];
-            if (id && Array.isArray(pair) && pair.length === 2) {
-              taskTimes.set(id, { start: new Date(pair[0]), end: new Date(pair[1]) });
-            }
-          });
-        }
-      } catch { /* a malformed run item falls back to apportioning */ }
-
-      // The world moved between suggesting and accepting: tasks get started,
-      // finished, cancelled and re-materialized. Skipping the item with a reason
-      // beats writing a plan entry for work that no longer exists.
-      const [live] = await conn.query(
-        `SELECT id FROM fab_project_tasks
-          WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL
-            AND status NOT IN ('cancelled','done')`,
-        [companyId, taskIds],
+    for (const batch of chunked(entryRows, ACCEPT_ENTRY_CHUNK)) {
+      await conn.query(
+        `INSERT INTO fab_plan_entries
+           (company_id, plan_date, resource_type_id, resource_id, planned_start,
+            planned_end, planned_minutes, kind, bundle_key, ancestor_item_id,
+            order_id, operation_id, source, accepted_from_run_id, run_item_id,
+            is_pinned, status, label, notes, created_by, updated_by)
+         VALUES ?`,
+        [batch],
       );
-      const liveIds = live.map((r) => r.id);
-      if (liveIds.length === 0) { skipped.push({ runItemId: item.id, reason: 'tasks no longer plannable' }); continue; }
+    }
 
-      try {
-        await assertNotAlreadyPlanned(conn, companyId, liveIds);
-      } catch (err) {
-        skipped.push({ runItemId: item.id, reason: err.message });
-        continue;
+    // By run_item_id, never by counting up from the first insertId — see above.
+    const [made] = await conn.query(
+      `SELECT id, run_item_id AS runItemId FROM fab_plan_entries
+        WHERE company_id = ? AND accepted_from_run_id = ? AND run_item_id IN (?)
+          AND deleted_at IS NULL`,
+      [companyId, runId, [...membersByRunItem.keys()]],
+    );
+    const entryIdOf = new Map(made.map((r) => [r.runItemId, r.id]));
+
+    const memberRows = [];
+    for (const [runItemId, members] of membersByRunItem) {
+      const entryId = entryIdOf.get(runItemId);
+      if (entryId == null) {
+        throw new PlanError('ACCEPT_FAILED', `Bar for run item ${runItemId} did not come back after insert.`);
       }
-
-      const planDate = await planDateFor(companyId, new Date(item.planned_start));
-      await insertEntry(conn, companyId, {
-        resourceTypeId: item.resource_type_id,
-        resourceId: item.resource_id,
-        plannedStart: new Date(item.planned_start),
-        plannedEnd: new Date(item.planned_end),
-        plannedMinutes: item.planned_minutes,
-        taskIds: liveIds,
-        taskTimes,
-        bundleKey: item.bundle_key,
-        ancestorItemId: item.ancestor_item_id,
-        orderId: item.order_id,
-        operationId: item.operation_id,
-        source: 'suggested',
-        acceptedFromRunId: runId,
-        runItemId: item.id,
-        isPinned: !!pin,
-        label: item.label,
-        userId,
-      }, planDate);
-      accepted += 1;
+      for (const [taskId, minutes, sortOrder, ts, te] of members) {
+        memberRows.push([companyId, entryId, taskId, minutes, sortOrder, ts, te]);
+      }
+    }
+    for (const batch of chunked(memberRows, ACCEPT_MEMBER_CHUNK)) {
+      await conn.query(
+        `INSERT INTO fab_plan_entry_tasks
+           (company_id, plan_entry_id, task_id, planned_minutes, sort_order,
+            planned_start, planned_end)
+         VALUES ?`,
+        [batch],
+      );
     }
 
     await conn.query(
@@ -692,7 +802,7 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
       [userId, companyId, runId],
     );
     await conn.commit();
-    return { accepted, skipped };
+    return { accepted: entryRows.length, skipped };
   } catch (err) {
     await conn.rollback();
     throw err;
