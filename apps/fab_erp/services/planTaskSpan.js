@@ -99,21 +99,47 @@ export function apportionEntry(entryStart, entryEnd, members) {
   const e = new Date(entryEnd).getTime();
   const span = Math.max(0, e - s);
   const total = list.reduce((n, m) => n + (Number(m.plannedMinutes) || 0), 0);
+  const work = total * 60000;
+
+  /**
+   * When the work FITS in the bar, lay it out at its real durations.
+   *
+   * The alternative — stretching each member to its share of the whole span —
+   * is what this did, and it over-states every finish. A bar that spans a night
+   * because it straddles two shifts holds two hours of welding across fifteen
+   * hours of clock; sharing that out says the first task finishes two hours in
+   * when it finishes seventeen minutes in. That difference refused a move on the
+   * production plan for an ordering problem the plan did not have.
+   *
+   * Laid contiguously from the bar's start, a finish is never later than the
+   * truth — the work may really sit further into the bar, but it cannot take
+   * longer than its own minutes. Understating is safe here in a way overstating
+   * is not: the DAG gate compares a predecessor's END against a successor's
+   * start.
+   *
+   * The remaining span is left as gap, which is also what the board then draws —
+   * and a bundle that genuinely idles across a night SHOULD look like it does.
+   */
+  const contiguous = total > 0 && work <= span;
 
   let cursor = s;
   for (const m of list) {
     // An equal share when nothing declares minutes, rather than collapsing every
     // member onto the bar's start instant — which would make a whole bundle
     // look finishable the moment it began.
-    const share = total > 0 ? (Number(m.plannedMinutes) || 0) / total : 1 / list.length;
-    const dur = Math.round(span * share);
+    const dur = contiguous
+      ? (Number(m.plannedMinutes) || 0) * 60000
+      : Math.round(span * (total > 0 ? (Number(m.plannedMinutes) || 0) / total : 1 / list.length));
     out.set(Number(m.taskId), { start: new Date(cursor), end: new Date(cursor + dur) });
     cursor += dur;
   }
-  // Rounding must not lose the bar's own end: the last member owns it, so a
-  // successor placed exactly at the bar's end is never rejected by a stray ms.
-  const last = out.get(Number(list[list.length - 1].taskId));
-  if (last && span > 0) last.end = new Date(e);
+  if (!contiguous && span > 0) {
+    // Scaled to fill: rounding must not lose the bar's own end, so the last
+    // member owns it and a successor placed exactly there is never rejected by
+    // a stray millisecond.
+    const last = out.get(Number(list[list.length - 1].taskId));
+    if (last) last.end = new Date(e);
+  }
   return out;
 }
 
