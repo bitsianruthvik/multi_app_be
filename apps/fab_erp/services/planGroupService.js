@@ -53,6 +53,7 @@ import { resolveCapacityForResource, capacityIntervals, isUnbounded } from './ca
 import { zonedYMD } from './plantTime.js';
 import { PlanError, plannerTimezone } from './planService.js';
 import { apportionEntry, taskPlannedSpans } from './planTaskSpan.js';
+import { resolveUnitEntries, assertContains } from './planUnitService.js';
 
 export const GROUP_OPS = ['move', 'stretch', 'pushLeft', 'restore'];
 
@@ -622,7 +623,13 @@ async function checkCalendar(companyId, entries, proposed) {
  *
  * @param {number} companyId
  * @param {object} input
- * @param {number[]} input.entryIds     the unit
+ * @param {{level:string,key:string}} [input.unit] WHICH UNIT — a level of the BOM
+ *        ladder and the node the board grouped onto. Preferred over entryIds:
+ *        the bars are resolved over the whole order, so a handle moves the whole
+ *        girder and not just the part of it that happened to be on screen.
+ * @param {number[]} [input.entryIds]   an explicit set. With `unit` it is a
+ *        cross-check (see planUnitService.assertContains); without one it is the
+ *        set itself, which is what `restore` needs.
  * @param {'move'|'stretch'|'pushLeft'|'restore'} input.op
  * @param {number} [input.deltaMs]      move
  * @param {number} [input.anchorMs]     stretch — the end held still
@@ -632,11 +639,27 @@ async function checkCalendar(companyId, entries, proposed) {
  * @returns {Promise<{applied:boolean, placements:object[], previous:object[], warnings:object[]}>}
  */
 export async function transformGroup(companyId, input, userId = null) {
-  const entryIds = [...new Set((input.entryIds ?? []).map(Number))].filter(Boolean);
-  if (entryIds.length === 0) throw new PlanError('NO_ENTRIES', 'No bars were named.');
   if (!GROUP_OPS.includes(input.op)) {
     throw new PlanError('BAD_OP', `Unknown operation "${input.op}".`);
   }
+  const claimed = [...new Set((input.entryIds ?? []).map(Number))].filter(Boolean);
+
+  /**
+   * `restore` always uses the explicit list, even when a unit is named.
+   *
+   * Undo puts back the bars a previous transform actually wrote, and that set is
+   * a fact about what happened — not a question to re-answer. Re-resolving the
+   * unit would silently widen an undo to bars the original move never touched.
+   */
+  let entryIds = claimed;
+  let unitSize = null;
+  if (input.unit && input.op !== 'restore') {
+    const resolved = await resolveUnitEntries(companyId, input.unit);
+    assertContains(resolved.entryIds, claimed);
+    entryIds = resolved.entryIds;
+    unitSize = entryIds.length;
+  }
+  if (entryIds.length === 0) throw new PlanError('NO_ENTRIES', 'No bars were named.');
 
   const entries = await loadEntries(companyId, entryIds);
   const allTaskIds = [...new Set(entries.flatMap((e) => e.taskIds))];
@@ -675,6 +698,7 @@ export async function transformGroup(companyId, input, userId = null) {
       return {
         applied: false,
         movedCount: 0,
+        unitSize,
         placements: entries.map((e) => ({
           entryId: e.id,
           plannedStart: e.start.toISOString(),
@@ -754,10 +778,10 @@ export async function transformGroup(companyId, input, userId = null) {
   });
 
   if (input.dryRun) {
-    return { applied: false, movedCount: moved.length, placements, previous, warnings };
+    return { applied: false, movedCount: moved.length, unitSize, placements, previous, warnings };
   }
   if (moved.length === 0) {
-    return { applied: false, movedCount: 0, placements, previous, warnings };
+    return { applied: false, movedCount: 0, unitSize, placements, previous, warnings };
   }
 
   const tz = await plannerTimezone(companyId);
@@ -781,5 +805,5 @@ export async function transformGroup(companyId, input, userId = null) {
     conn.release();
   }
 
-  return { applied: true, movedCount: moved.length, placements, previous, warnings };
+  return { applied: true, movedCount: moved.length, unitSize, placements, previous, warnings };
 }
