@@ -15,10 +15,24 @@
  *
  * The fix is to reconstruct the task's own span from what IS stored — each
  * member's `planned_minutes` and `sort_order`, laid end to end inside the bar in
- * proportion. For a bundle the suggestor built, this reproduces the leveller's
- * original task-level schedule exactly, because that is how the bar was formed.
- * For one a human split or dragged, it is the same reading the Plan Board draws,
- * so the picture and the rule agree.
+ * proportion. It is the same reading the Plan Board draws, so the picture and
+ * the rule agree, and it is far tighter than the bar's end.
+ *
+ * IT IS AN APPROXIMATION, NOT A RECONSTRUCTION. An earlier version of this note
+ * claimed it reproduced the leveller's task-level schedule exactly. It does so
+ * only when the bundled tasks happened to run back to back. They often do not:
+ * of 602 bundles in one real order, 136 span MORE wall-clock than their members'
+ * minutes (the leveller left gaps between them) and others span LESS (a lane
+ * with two machines ran them in parallel). Either way, laying them out in
+ * proportion moves a member's apportioned end away from where it was actually
+ * levelled — later in the gap case, earlier in the parallel one.
+ *
+ * The visible consequence: a successor planned at its predecessor's REAL end can
+ * read as starting before its predecessor's APPORTIONED end, and a move is then
+ * refused for an ordering problem the plan does not have. Still strictly better
+ * than the bar's end, which was later again and refused more — but the honest
+ * cure is to stop inferring: store each member's levelled start/end on
+ * `fab_plan_entry_tasks` when a run is accepted, and read those instead.
  *
  * Used by planService (the DAG gate, and the board's blocks) and by
  * planGroupService (the group DAG check). It must stay one function: two
