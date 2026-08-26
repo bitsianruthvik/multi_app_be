@@ -189,19 +189,24 @@ function proposedTaskSpans(entries, proposed) {
   for (const e of entries) {
     const place = proposed.get(e.id);
     if (!place) continue;
-    // The members' stored times describe where the bar IS. Move them by the
-    // same map the bar takes before asking where each task would then run —
-    // otherwise they fall outside the proposed bar, the containment check
-    // rejects them, and this quietly drops back to inferring what it already
-    // knows exactly.
+    // The members' stored times describe where the bar IS. Shift them by the
+    // same amount the bar moves before asking where each task would then run —
+    // otherwise they fall outside the proposed bar and this drops back to
+    // inferring what it already knows exactly.
+    //
+    // A bar that changes SPAN is a different matter: its members' layout no
+    // longer describes it (see planTaskSpan.remapMemberTimes), so they are
+    // dropped and the proposal is apportioned. Scaling them instead is what made
+    // a move un-undoable.
     const os = e.start.getTime();
-    const oe = e.end.getTime();
     const ns = place.start.getTime();
-    const scale = oe > os ? (place.end.getTime() - ns) / (oe - os) : 1;
+    const reshaped = Math.abs((place.end.getTime() - ns) - (e.end.getTime() - os)) > DAG_TOLERANCE_MS;
     const moved = e.members.map((m) => {
-      if (m.plannedStart == null || m.plannedEnd == null) return m;
-      const map = (t) => new Date(Math.round(ns + (new Date(t).getTime() - os) * scale));
-      return { ...m, plannedStart: map(m.plannedStart), plannedEnd: map(m.plannedEnd) };
+      if (reshaped || m.plannedStart == null || m.plannedEnd == null) {
+        return { ...m, plannedStart: null, plannedEnd: null };
+      }
+      const move = (v) => new Date(new Date(v).getTime() + (ns - os));
+      return { ...m, plannedStart: move(m.plannedStart), plannedEnd: move(m.plannedEnd) };
     });
     for (const [taskId, span] of apportionEntry(place.start, place.end, moved)) {
       out.set(taskId, { entryId: e.id, ...span });

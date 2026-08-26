@@ -187,12 +187,34 @@ export async function taskPlannedSpans(companyId, taskIds, { excludeEntryId = nu
 }
 
 /**
+ * A bar's span may differ from its old one by this much and still count as the
+ * same shape — rounding, not a reshaping.
+ */
+const SAME_SHAPE_MS = 1000;
+
+/**
  * Carry a bar's members with it when the bar moves.
  *
- * The map is affine: whatever took the old span to the new one takes each
- * member's span with it. A pure move is a shift; a resize scales, which keeps
- * the gaps between members proportional rather than pretending the work got
- * faster. Rows with no stored times are left alone — they had none to carry.
+ * A PURE SHIFT carries them exactly: same duration, so every member keeps its
+ * offset and the layout is preserved to the millisecond.
+ *
+ * A CHANGE OF SPAN DOES NOT. It is tempting to scale the members proportionally,
+ * and that is what this did until it produced a plan that could not be undone.
+ * A bar's wall-clock span is not a property of its work — it is where the work
+ * fell relative to the shift calendar. Re-place a bar and it may cross a night
+ * it did not cross before: the same 24 minutes of welding that spanned 24
+ * minutes inside one shift spans FIFTEEN HOURS across two. Scaling the members
+ * into that squashes a real layout into a proportional one, and scaling back out
+ * cannot recover it — the leveller's layout was never proportional. On the
+ * production plan that round trip left a predecessor five seconds past its
+ * successor and the undo was refused.
+ *
+ * So when the shape changes the stored layout is DISCARDED, and reading falls
+ * back to apportioning inside the new span. That is a real loss of precision,
+ * and it is the honest one: the information genuinely stopped applying the
+ * moment the bar changed shape. It is also self-consistent, which scaling was
+ * not — two bars that end up the same shape now describe their members the same
+ * way however they got there.
  *
  * Every path that writes `fab_plan_entries.planned_start/_end` must call this
  * in the same transaction. Missing one does not corrupt anything (the
@@ -210,9 +232,21 @@ export async function remapMemberTimes(conn, companyId, entryId, oldStart, oldEn
 
   const oldSpan = oe - os;
   const newSpan = ne - ns;
-  const scale = oldSpan > 0 ? newSpan / oldSpan : 1;
-  if (os === ns && Math.abs(scale - 1) < 1e-9) return;
+  const reshaped = Math.abs(newSpan - oldSpan) > SAME_SHAPE_MS;
+  if (os === ns && !reshaped) return;
 
+  if (reshaped) {
+    // The layout stopped describing this bar. Say so, rather than inventing a
+    // proportional one that cannot be undone.
+    await conn.query(
+      `UPDATE fab_plan_entry_tasks SET planned_start = NULL, planned_end = NULL
+        WHERE company_id = ? AND plan_entry_id = ? AND deleted_at IS NULL`,
+      [companyId, entryId],
+    );
+    return;
+  }
+
+  const shift = ns - os;
   const [rows] = await conn.query(
     `SELECT id, planned_start AS s, planned_end AS e
        FROM fab_plan_entry_tasks
@@ -221,11 +255,11 @@ export async function remapMemberTimes(conn, companyId, entryId, oldStart, oldEn
     [companyId, entryId],
   );
   for (const r of rows) {
-    const map = (t) => new Date(Math.round(ns + (new Date(t).getTime() - os) * scale));
+    const move = (t) => new Date(new Date(t).getTime() + shift);
     await conn.query(
       `UPDATE fab_plan_entry_tasks SET planned_start = ?, planned_end = ?
         WHERE company_id = ? AND id = ?`,
-      [toDateTime(map(r.s)), toDateTime(map(r.e)), companyId, r.id],
+      [toDateTime(move(r.s)), toDateTime(move(r.e)), companyId, r.id],
     );
   }
 }
