@@ -257,6 +257,25 @@ function addInterval(state, iv) {
 }
 
 /** The booked intervals that could possibly overlap [lo, hi). */
+/**
+ * Take an interval back out.
+ *
+ * `maxLen` is deliberately NOT recomputed. It exists only to bound how far back
+ * a search must start, so a value left too high stays correct — it widens the
+ * scan slightly and finds the same answer. Recomputing it would mean a pass over
+ * the whole list on every removal, to make a search marginally tighter.
+ */
+function removeInterval(state, iv) {
+  const s = iv.start.getTime();
+  const e = iv.end.getTime();
+  for (let i = lowerBound(state.ivs, s); i < state.ivs.length; i += 1) {
+    const cur = state.ivs[i];
+    if (cur.start.getTime() !== s) break;
+    if (cur.end.getTime() === e) { state.ivs.splice(i, 1); return true; }
+  }
+  return false;
+}
+
 function overlapping(state, lo, hi) {
   const { ivs, maxLen } = state;
   if (ivs.length === 0) return ivs;
@@ -625,4 +644,88 @@ export async function levelSchedule({
   }
 
   return schedule;
+}
+
+/**
+ * A bookable view of the shop, for callers that place work one bar at a time.
+ *
+ * levelSchedule builds this state internally and throws it away. Schedule repair
+ * needs the same thing but incrementally — lift one bar out, ask where it fits
+ * now, put it back — and the one thing this codebase keeps being bitten by is a
+ * second implementation of a rule that already exists (the calendar walk, the
+ * bundle apportionment). So the machinery is shared rather than copied, and
+ * levelSchedule is left exactly as it was.
+ *
+ * The two questions it answers are the leveller's own:
+ *   - where does `durationMin` of WORKING time starting at or after `notBefore`
+ *     actually land, walking the shift calendar (computeSpan)
+ *   - does putting it there keep the resource within its concurrency (feasible)
+ *
+ * @param {number} companyId
+ * @param {{typeUnits:Map, resourceUnits:Map}} resourceCapacity from loadResourceCapacity
+ */
+export function createPlacer(companyId, resourceCapacity) {
+  const ivCache = new Map();
+  const state = new Map();
+
+  const stateFor = (key) => {
+    if (!state.has(key)) state.set(key, newResourceState());
+    return state.get(key);
+  };
+
+  return {
+    /** {key, capacity} for a bar, by the same rule tasks are grouped by. */
+    contextFor: (bar) => resourceContext(bar, resourceCapacity),
+
+    book(key, intervals) {
+      if (key == null) return;
+      const st = stateFor(key);
+      for (const iv of intervals) addInterval(st, iv);
+    },
+
+    unbook(key, intervals) {
+      if (key == null) return;
+      const st = stateFor(key);
+      for (const iv of intervals) removeInterval(st, iv);
+    },
+
+    /**
+     * The working intervals a bar of `durationMin` occupies if it starts at or
+     * after `notBefore` — ignoring concurrency. What a bar ALREADY on the plan
+     * occupies, so it can be booked or lifted out.
+     */
+    async span(capSrc, notBefore, durationMin) {
+      return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+    },
+
+    /**
+     * The earliest placement at or after `notBefore` that also keeps the
+     * resource within capacity. Candidate starts are `notBefore` plus the end of
+     * every booking at or after it — the leveller's own search, which terminates
+     * because the last candidate lies beyond all existing work.
+     */
+    async place(capSrc, key, capacity, notBefore, durationMin) {
+      if (key === null || !(capacity < Infinity) || durationMin <= 0) {
+        return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+      }
+      const st = stateFor(key);
+      const from = notBefore.getTime();
+      const cand = [from];
+      for (let i = lowerBound(st.ivs, from - st.maxLen); i < st.ivs.length; i += 1) {
+        const end = st.ivs[i].end.getTime();
+        if (end >= from) cand.push(end);
+      }
+      let fallback = null;
+      for (const c of [...new Set(cand)].sort((a, b) => a - b)) {
+        const s = await computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache);
+        fallback = s;
+        const near = s.intervals.length === 0 ? [] : overlapping(
+          st, s.intervals[0].start.getTime(), s.intervals[s.intervals.length - 1].end.getTime(),
+        );
+        if (feasible(near, s.intervals, capacity)) return s;
+      }
+      // Unreachable in practice: the last candidate is past everything booked.
+      return fallback ?? computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+    },
+  };
 }

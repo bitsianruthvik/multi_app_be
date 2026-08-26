@@ -54,6 +54,7 @@ import { zonedYMD } from './plantTime.js';
 import { PlanError, plannerTimezone } from './planService.js';
 import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
 import { resolveUnitEntries, assertContains } from './planUnitService.js';
+import { cascadeRepair, MAX_CASCADE } from './planRepairService.js';
 
 export const GROUP_OPS = ['move', 'stretch', 'pushLeft', 'restore'];
 
@@ -655,6 +656,9 @@ async function checkCalendar(companyId, entries, proposed) {
  * @param {number} [input.anchorMs]     stretch — the end held still
  * @param {number} [input.scale]        stretch — > 0
  * @param {Array}  [input.placements]   restore — [{entryId, plannedStart, plannedEnd}]
+ * @param {boolean} [input.cascade]     also shift everything downstream that the
+ *        move would otherwise leave illegal. Off by default so no existing
+ *        caller changes behaviour; the board sends it on every gesture.
  * @param {boolean} [input.dryRun]      validate and return, write nothing
  * @returns {Promise<{applied:boolean, placements:object[], previous:object[], warnings:object[]}>}
  */
@@ -719,6 +723,7 @@ export async function transformGroup(companyId, input, userId = null) {
         applied: false,
         movedCount: 0,
         unitSize,
+        cascadedCount: 0,
         placements: entries.map((e) => ({
           entryId: e.id,
           plannedStart: e.start.toISOString(),
@@ -752,6 +757,39 @@ export async function transformGroup(companyId, input, userId = null) {
     }
   }
 
+  /**
+   * Shift what the move breaks — before validating, not after.
+   *
+   * The DAG gate checks the FINISHED state, so the cascade has to be part of
+   * what it is shown. Running it afterwards would mean refusing a move for
+   * violations the repair was about to fix.
+   *
+   * Not for `restore`: undo puts back exactly what a previous transform wrote,
+   * and dragging a second set of bars along with it would make undo a new
+   * decision rather than the reversal of an old one.
+   */
+  let cascaded = [];
+  if (input.cascade && input.op !== 'restore') {
+    const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
+    const repair = await cascadeRepair(companyId, { proposed, preds: dag.preds, orderIds });
+    if (repair.capped) {
+      throw new PlanError(
+        'CASCADE_TOO_LARGE',
+        `That move would shift ${repair.examined} bars downstream, past the ${MAX_CASCADE} this can move at once.`,
+        { examined: repair.examined, limit: MAX_CASCADE },
+      );
+    }
+    if (repair.placements.size > 0) {
+      const extra = await loadEntries(companyId, [...repair.placements.keys()]);
+      for (const e of extra) {
+        if (proposed.has(e.id)) continue;
+        entries.push(e);
+        proposed.set(e.id, repair.placements.get(e.id));
+        cascaded.push(e.id);
+      }
+    }
+  }
+
   const moved = entries.filter((e) => {
     const p = proposed.get(e.id);
     return p && !p.held
@@ -777,6 +815,13 @@ export async function transformGroup(companyId, input, userId = null) {
   }
 
   const warnings = [
+    ...(cascaded.length > 0
+      ? [{
+        code: 'CASCADED',
+        message: `${cascaded.length} bar${cascaded.length === 1 ? '' : 's'} downstream moved to stay behind this unit.`,
+        detail: { entryIds: cascaded.slice(0, 50), count: cascaded.length },
+      }]
+      : []),
     ...await checkSuccessors(companyId, entries, proposed, dag),
     ...await checkCapacity(companyId, entries, proposed),
     ...await checkCalendar(companyId, entries, proposed),
@@ -798,10 +843,10 @@ export async function transformGroup(companyId, input, userId = null) {
   });
 
   if (input.dryRun) {
-    return { applied: false, movedCount: moved.length, unitSize, placements, previous, warnings };
+    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
   }
   if (moved.length === 0) {
-    return { applied: false, movedCount: 0, unitSize, placements, previous, warnings };
+    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
   }
 
   const tz = await plannerTimezone(companyId);
@@ -827,5 +872,5 @@ export async function transformGroup(companyId, input, userId = null) {
     conn.release();
   }
 
-  return { applied: true, movedCount: moved.length, unitSize, placements, previous, warnings };
+  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, placements, previous, warnings };
 }
