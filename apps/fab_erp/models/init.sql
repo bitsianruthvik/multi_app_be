@@ -5765,3 +5765,51 @@ SET @sql = IF(@idx = 0,
   'ALTER TABLE fab_resource_types ADD INDEX idx_frt_catalog_item (catalog_item_id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Per-task planned times on a plan bar (2026-08-26)
+--
+-- A bar can be a BUNDLE, and until now the only record of when each member ran
+-- was its share of the bar's minutes. Everything downstream had to infer the
+-- rest by laying the members out end to end in proportion — which is exact only
+-- when the leveller happened to place them back to back. Of 602 bundles in one
+-- real order, 136 span more wall-clock than their members' minutes (gaps) and
+-- others span less (a two-machine lane ran them in parallel), so a member's
+-- inferred end drifted off its real one. A successor planned at the true end
+-- then read as starting early, and every whole-unit move on that plan was
+-- refused for an ordering problem the plan did not have.
+--
+-- So the leveller's own answer is now kept. NULLABLE on purpose: rows written
+-- before this, and bars a human created or split by hand, have no per-task
+-- levelling, and planTaskSpan falls back to apportioning for exactly those.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plan_entry_tasks'
+              AND COLUMN_NAME  = 'planned_start');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_plan_entry_tasks ADD COLUMN planned_start DATETIME DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plan_entry_tasks'
+              AND COLUMN_NAME  = 'planned_end');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_plan_entry_tasks ADD COLUMN planned_end DATETIME DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The same times on the frozen suggestion, so accepting a run can copy them
+-- rather than re-deriving what the levelling pass already knew. Parallel to
+-- task_ids: [[startISO, endISO], ...] in the same order.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plan_run_items'
+              AND COLUMN_NAME  = 'task_times');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_plan_run_items ADD COLUMN task_times TEXT DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

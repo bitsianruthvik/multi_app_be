@@ -13,26 +13,22 @@
  * plan did not actually have. Accepting a suggestion with bundling on was enough
  * to produce it, which is to say: almost every plan.
  *
- * The fix is to reconstruct the task's own span from what IS stored — each
- * member's `planned_minutes` and `sort_order`, laid end to end inside the bar in
- * proportion. It is the same reading the Plan Board draws, so the picture and
- * the rule agree, and it is far tighter than the bar's end.
+ * SO THE LEVELLER'S ANSWER IS NOW KEPT, and inference is only the fallback.
+ * `fab_plan_entry_tasks.planned_start/_end` hold each member's own span, copied
+ * from the frozen run when a suggestion is accepted and carried through every
+ * move, stretch and split. When they are there, they are used.
  *
- * IT IS AN APPROXIMATION, NOT A RECONSTRUCTION. An earlier version of this note
- * claimed it reproduced the leveller's task-level schedule exactly. It does so
- * only when the bundled tasks happened to run back to back. They often do not:
- * of 602 bundles in one real order, 136 span MORE wall-clock than their members'
- * minutes (the leveller left gaps between them) and others span LESS (a lane
- * with two machines ran them in parallel). Either way, laying them out in
- * proportion moves a member's apportioned end away from where it was actually
- * levelled — later in the gap case, earlier in the parallel one.
- *
- * The visible consequence: a successor planned at its predecessor's REAL end can
- * read as starting before its predecessor's APPORTIONED end, and a move is then
- * refused for an ordering problem the plan does not have. Still strictly better
- * than the bar's end, which was later again and refused more — but the honest
- * cure is to stop inferring: store each member's levelled start/end on
- * `fab_plan_entry_tasks` when a run is accepted, and read those instead.
+ * The fallback — laying the members end to end inside the bar in proportion to
+ * their minutes — still runs for bars written before those columns existed and
+ * for bars a human built by hand, which never had a per-task levelling to keep.
+ * It is an APPROXIMATION and this is why it had to stop being the primary path:
+ * it is exact only when the bundled tasks happened to run back to back, and of
+ * 602 bundles in one real order 136 span MORE wall-clock than their members'
+ * minutes (the leveller left gaps) while others span LESS (a two-machine lane
+ * ran them in parallel). Either way a member's inferred end drifts off its real
+ * one, a successor planned at the true end reads as starting early, and a move
+ * is refused for an ordering problem the plan does not have — which is exactly
+ * what happened to every girder in the production plan.
  *
  * Used by planService (the DAG gate, and the board's blocks) and by
  * planGroupService (the group DAG check). It must stay one function: two
@@ -42,12 +38,51 @@
 import { pool } from '../../../db.js';
 
 /**
- * Lay a bar's member tasks end to end inside its span, in proportion to their
- * minutes.
+ * Tolerance when checking stored times against their bar, in ms.
+ *
+ * A stored span should sit inside the bar it belongs to. A second of slack
+ * absorbs the DATETIME second-rounding on the way in and out; anything past
+ * that means the bar moved without its members and the stored times are stale.
+ */
+const CONTAINMENT_TOLERANCE_MS = 1000;
+
+/**
+ * Do these members carry their own levelled times, and do those times still
+ * describe this bar?
+ *
+ * The second half is a safety net, not paranoia: every path that moves a bar is
+ * supposed to remap its members, and if one is ever missed the stored times
+ * would quietly describe where the bar USED to be. Falling back to inference
+ * then degrades to the old approximation instead of asserting a lie.
+ */
+function storedSpans(entryStart, entryEnd, list) {
+  const lo = new Date(entryStart).getTime() - CONTAINMENT_TOLERANCE_MS;
+  const hi = new Date(entryEnd).getTime() + CONTAINMENT_TOLERANCE_MS;
+  const out = new Map();
+  for (const m of list) {
+    const ms = m.plannedStart ?? m.planned_start;
+    const me = m.plannedEnd ?? m.planned_end;
+    if (ms == null || me == null) return null;
+    const a = new Date(ms).getTime();
+    const b = new Date(me).getTime();
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return null;
+    if (a < lo || b > hi) return null;
+    out.set(Number(m.taskId), { start: new Date(a), end: new Date(b) });
+  }
+  return out;
+}
+
+/**
+ * Where each of a bar's member tasks runs.
+ *
+ * Their own levelled times when the bar has them; otherwise laid end to end
+ * inside the bar in proportion to their minutes. See the file header for why
+ * the second is a fallback and not the rule.
  *
  * @param {Date|string|number} entryStart
  * @param {Date|string|number} entryEnd
- * @param {Array<{taskId:number, plannedMinutes:number|string}>} members
+ * @param {Array<{taskId:number, plannedMinutes:number|string,
+ *                plannedStart?:any, plannedEnd?:any}>} members
  *        Already in the order they run — `sort_order`, which is how they were
  *        inserted. Order is NOT re-derived here; the caller owns it.
  * @returns {Map<number, {start:Date, end:Date}>}
@@ -56,6 +91,9 @@ export function apportionEntry(entryStart, entryEnd, members) {
   const out = new Map();
   const list = members ?? [];
   if (list.length === 0) return out;
+
+  const stored = storedSpans(entryStart, entryEnd, list);
+  if (stored) return stored;
 
   const s = new Date(entryStart).getTime();
   const e = new Date(entryEnd).getTime();
@@ -106,6 +144,7 @@ export async function taskPlannedSpans(companyId, taskIds, { excludeEntryId = nu
   const [rows] = await pool.query(
     `SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
+            et.planned_start AS taskStart, et.planned_end AS taskEnd,
             e.planned_start AS plannedStart, e.planned_end AS plannedEnd
        FROM fab_plan_entry_tasks et
        JOIN fab_plan_entries e ON e.id = et.plan_entry_id AND e.company_id = et.company_id
@@ -124,7 +163,12 @@ export async function taskPlannedSpans(companyId, taskIds, { excludeEntryId = nu
     if (!byEntry.has(r.entryId)) {
       byEntry.set(r.entryId, { start: r.plannedStart, end: r.plannedEnd, members: [] });
     }
-    byEntry.get(r.entryId).members.push({ taskId: r.taskId, plannedMinutes: r.plannedMinutes });
+    byEntry.get(r.entryId).members.push({
+      taskId: r.taskId,
+      plannedMinutes: r.plannedMinutes,
+      plannedStart: r.taskStart,
+      plannedEnd: r.taskEnd,
+    });
   }
 
   const wanted = new Set(ids);
@@ -140,4 +184,53 @@ export async function taskPlannedSpans(companyId, taskIds, { excludeEntryId = nu
     }
   }
   return out;
+}
+
+/**
+ * Carry a bar's members with it when the bar moves.
+ *
+ * The map is affine: whatever took the old span to the new one takes each
+ * member's span with it. A pure move is a shift; a resize scales, which keeps
+ * the gaps between members proportional rather than pretending the work got
+ * faster. Rows with no stored times are left alone — they had none to carry.
+ *
+ * Every path that writes `fab_plan_entries.planned_start/_end` must call this
+ * in the same transaction. Missing one does not corrupt anything (the
+ * containment check in storedSpans catches stale times and falls back), but it
+ * does silently lose the precision this whole change exists to keep.
+ *
+ * @param {object} conn  the transaction's connection, not the pool
+ */
+export async function remapMemberTimes(conn, companyId, entryId, oldStart, oldEnd, newStart, newEnd) {
+  const os = new Date(oldStart).getTime();
+  const oe = new Date(oldEnd).getTime();
+  const ns = new Date(newStart).getTime();
+  const ne = new Date(newEnd).getTime();
+  if (![os, oe, ns, ne].every(Number.isFinite)) return;
+
+  const oldSpan = oe - os;
+  const newSpan = ne - ns;
+  const scale = oldSpan > 0 ? newSpan / oldSpan : 1;
+  if (os === ns && Math.abs(scale - 1) < 1e-9) return;
+
+  const [rows] = await conn.query(
+    `SELECT id, planned_start AS s, planned_end AS e
+       FROM fab_plan_entry_tasks
+      WHERE company_id = ? AND plan_entry_id = ? AND deleted_at IS NULL
+        AND planned_start IS NOT NULL AND planned_end IS NOT NULL`,
+    [companyId, entryId],
+  );
+  for (const r of rows) {
+    const map = (t) => new Date(Math.round(ns + (new Date(t).getTime() - os) * scale));
+    await conn.query(
+      `UPDATE fab_plan_entry_tasks SET planned_start = ?, planned_end = ?
+        WHERE company_id = ? AND id = ?`,
+      [toDateTime(map(r.s)), toDateTime(map(r.e)), companyId, r.id],
+    );
+  }
+}
+
+/** MySQL DATETIME, UTC. */
+function toDateTime(d) {
+  return new Date(d).toISOString().slice(0, 19).replace('T', ' ');
 }

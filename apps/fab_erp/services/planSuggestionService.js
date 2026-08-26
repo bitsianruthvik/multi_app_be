@@ -460,14 +460,21 @@ async function persistRun(companyId, {
         `INSERT INTO fab_plan_run_items
            (company_id, run_id, resource_type_id, resource_id, bundle_key,
             ancestor_item_id, order_id, operation_id, planned_start, planned_end,
-            planned_minutes, task_count, task_ids, priority_rank,
+            planned_minutes, task_count, task_ids, task_times, priority_rank,
             order_slack_minutes, is_critical_chain, seq_no, reason, label)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [companyId, runId, first.resource_type_id, first.assigned_resource_id ?? null,
          bar.bundleKey.slice(0, 190), first.parent_item_id ?? null,
          first.order_id ?? null, first.operation_id ?? null,
          toDateTimeStr(bar.start), toDateTimeStr(bar.end), minutes, bar.members.length,
          JSON.stringify(bar.members.map((m) => m.task.id)),
+         // Each member's OWN levelled span, parallel to task_ids. A bundle is
+         // the union of its members and that union does not say where any one
+         // of them ran; inferring it back out is only exact when they happened
+         // to be contiguous, which is often false. See planTaskSpan.
+         JSON.stringify(bar.members.map((m) => [
+           m.span.start.toISOString(), m.span.end.toISOString(),
+         ])),
          first.priority_rank ?? null,
          Number.isFinite(slack) ? slack : null,
          bar.members.some((m) => criticalTaskIds?.has(m.task.id)) ? 1 : 0,

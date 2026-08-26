@@ -52,7 +52,7 @@ import { taskMinutes } from './taskDuration.js';
 import { resolveCapacityForResource, capacityIntervals, isUnbounded } from './capacityService.js';
 import { zonedYMD } from './plantTime.js';
 import { PlanError, plannerTimezone } from './planService.js';
-import { apportionEntry, taskPlannedSpans } from './planTaskSpan.js';
+import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
 import { resolveUnitEntries, assertContains } from './planUnitService.js';
 
 export const GROUP_OPS = ['move', 'stretch', 'pushLeft', 'restore'];
@@ -88,7 +88,8 @@ async function loadEntries(companyId, entryIds) {
 
   const [members] = await pool.query(
     `SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
-            et.planned_minutes AS plannedMinutes, t.status
+            et.planned_minutes AS plannedMinutes,
+            et.planned_start AS taskStart, et.planned_end AS taskEnd, t.status
        FROM fab_plan_entry_tasks et
        JOIN fab_project_tasks t ON t.id = et.task_id AND t.deleted_at IS NULL
       WHERE et.company_id = ? AND et.plan_entry_id IN (?) AND et.deleted_at IS NULL
@@ -112,7 +113,12 @@ async function loadEntries(companyId, entryIds) {
     const e = byId.get(m.entryId);
     if (!e) continue;
     e.taskIds.push(Number(m.taskId));
-    e.members.push({ taskId: Number(m.taskId), plannedMinutes: m.plannedMinutes });
+    e.members.push({
+      taskId: Number(m.taskId),
+      plannedMinutes: m.plannedMinutes,
+      plannedStart: m.taskStart,
+      plannedEnd: m.taskEnd,
+    });
     if (m.status === 'in_progress' || m.status === 'done') e.started = true;
   }
   return [...byId.values()].sort((a, b) => a.start - b.start || a.id - b.id);
@@ -165,7 +171,21 @@ function proposedTaskSpans(entries, proposed) {
   for (const e of entries) {
     const place = proposed.get(e.id);
     if (!place) continue;
-    for (const [taskId, span] of apportionEntry(place.start, place.end, e.members)) {
+    // The members' stored times describe where the bar IS. Move them by the
+    // same map the bar takes before asking where each task would then run —
+    // otherwise they fall outside the proposed bar, the containment check
+    // rejects them, and this quietly drops back to inferring what it already
+    // knows exactly.
+    const os = e.start.getTime();
+    const oe = e.end.getTime();
+    const ns = place.start.getTime();
+    const scale = oe > os ? (place.end.getTime() - ns) / (oe - os) : 1;
+    const moved = e.members.map((m) => {
+      if (m.plannedStart == null || m.plannedEnd == null) return m;
+      const map = (t) => new Date(Math.round(ns + (new Date(t).getTime() - os) * scale));
+      return { ...m, plannedStart: map(m.plannedStart), plannedEnd: map(m.plannedEnd) };
+    });
+    for (const [taskId, span] of apportionEntry(place.start, place.end, moved)) {
       out.set(taskId, { entryId: e.id, ...span });
     }
   }
@@ -796,6 +816,8 @@ export async function transformGroup(companyId, input, userId = null) {
           WHERE company_id = ? AND id = ? AND status = 'planned' AND deleted_at IS NULL`,
         [toDateTimeStr(p.start), toDateTimeStr(p.end), zonedYMD(p.start, tz), userId, companyId, e.id],
       );
+      // Same transaction as the bar it belongs to. See remapMemberTimes.
+      await remapMemberTimes(conn, companyId, e.id, e.start, e.end, p.start, p.end);
     }
     await conn.commit();
   } catch (err) {

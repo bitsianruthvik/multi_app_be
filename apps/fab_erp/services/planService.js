@@ -36,7 +36,7 @@ import {
   resolveCapacityForResource, capacityIntervals, capacityMinutes, isUnbounded,
 } from './capacityService.js';
 import { calendarTimezones, zonedYMD, zonedWallClockToUtc, DEFAULT_TZ } from './plantTime.js';
-import { apportionEntry, taskPlannedSpans } from './planTaskSpan.js';
+import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
 
 /**
  * The zone the planner's grid, hour labels and plan_date are expressed in.
@@ -207,6 +207,7 @@ async function loadEntries(companyId, from, to, resourceTypeIds = []) {
   const [members] = await pool.query(
     `SELECT et.plan_entry_id AS planEntryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
+            et.planned_start AS plannedStart, et.planned_end AS plannedEnd,
             t.status, t.seq_no AS seqNo, t.item_id AS itemId,
             i.name AS itemName
        FROM fab_plan_entry_tasks et
@@ -496,12 +497,25 @@ async function insertEntry(conn, companyId, entry, planDate) {
   );
   const minuteOf = new Map(minutes.map((m) => [m.id, taskMinutes(m)]));
 
-  const rows = entry.taskIds.map((taskId, i) => [
-    companyId, entryId, taskId, minuteOf.get(taskId) ?? 0, i,
-  ]);
+  /**
+   * `taskTimes` is each member's own levelled span, keyed by task id. Present
+   * when the bar came from a run (or from splitting one that did); absent for a
+   * bar a human placed by hand, which never had a per-task levelling. NULL then,
+   * and planTaskSpan falls back to apportioning for exactly those.
+   */
+  const at = entry.taskTimes instanceof Map ? entry.taskTimes : new Map();
+  const rows = entry.taskIds.map((taskId, i) => {
+    const span = at.get(Number(taskId));
+    return [
+      companyId, entryId, taskId, minuteOf.get(taskId) ?? 0, i,
+      span ? toDateTimeStr(span.start) : null,
+      span ? toDateTimeStr(span.end) : null,
+    ];
+  });
   await conn.query(
     `INSERT INTO fab_plan_entry_tasks
-       (company_id, plan_entry_id, task_id, planned_minutes, sort_order)
+       (company_id, plan_entry_id, task_id, planned_minutes, sort_order,
+        planned_start, planned_end)
      VALUES ?`,
     [rows],
   );
@@ -615,6 +629,21 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
       taskIds = taskIds.map(Number).filter(Boolean);
       if (taskIds.length === 0) { skipped.push({ runItemId: item.id, reason: 'no tasks' }); continue; }
 
+      // The levelled per-task spans the run froze, positionally parallel to
+      // task_ids. Runs written before that column exists simply have none.
+      const taskTimes = new Map();
+      try {
+        const raw = JSON.parse(item.task_times ?? 'null');
+        if (Array.isArray(raw)) {
+          raw.forEach((pair, i) => {
+            const id = taskIds[i];
+            if (id && Array.isArray(pair) && pair.length === 2) {
+              taskTimes.set(id, { start: new Date(pair[0]), end: new Date(pair[1]) });
+            }
+          });
+        }
+      } catch { /* a malformed run item falls back to apportioning */ }
+
       // The world moved between suggesting and accepting: tasks get started,
       // finished, cancelled and re-materialized. Skipping the item with a reason
       // beats writing a plan entry for work that no longer exists.
@@ -642,6 +671,7 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
         plannedEnd: new Date(item.planned_end),
         plannedMinutes: item.planned_minutes,
         taskIds: liveIds,
+        taskTimes,
         bundleKey: item.bundle_key,
         ancestorItemId: item.ancestor_item_id,
         orderId: item.order_id,
@@ -703,17 +733,34 @@ export async function updateEntry(companyId, entryId, patch, userId = null) {
   }
 
   const planDate = await planDateFor(companyId, start);
-  await pool.query(
-    `UPDATE fab_plan_entries
-        SET planned_start = ?, planned_end = ?, plan_date = ?,
-            resource_id = ?, is_pinned = ?, notes = ?, updated_by = ?
-      WHERE company_id = ? AND id = ?`,
-    [toDateTimeStr(start), toDateTimeStr(end), planDate,
-     patch.resourceId !== undefined ? patch.resourceId : entry.resource_id,
-     patch.isPinned !== undefined ? (patch.isPinned ? 1 : 0) : entry.is_pinned,
-     patch.notes !== undefined ? patch.notes : entry.notes,
-     userId, companyId, entryId],
-  );
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE fab_plan_entries
+          SET planned_start = ?, planned_end = ?, plan_date = ?,
+              resource_id = ?, is_pinned = ?, notes = ?, updated_by = ?
+        WHERE company_id = ? AND id = ?`,
+      [toDateTimeStr(start), toDateTimeStr(end), planDate,
+       patch.resourceId !== undefined ? patch.resourceId : entry.resource_id,
+       patch.isPinned !== undefined ? (patch.isPinned ? 1 : 0) : entry.is_pinned,
+       patch.notes !== undefined ? patch.notes : entry.notes,
+       userId, companyId, entryId],
+    );
+    // The members move with the bar, or their stored times start describing
+    // where it used to be. Same transaction, or a crash between the two leaves
+    // exactly that.
+    await remapMemberTimes(
+      conn, companyId, entryId,
+      entry.planned_start, entry.planned_end, start, end,
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
   return { entryId };
 }
 
@@ -736,6 +783,7 @@ export async function splitEntry(companyId, entryId, { taskIds = null } = {}, us
 
   const [members] = await pool.query(
     `SELECT et.task_id AS taskId, et.planned_minutes AS plannedMinutes,
+            et.planned_start AS taskStart, et.planned_end AS taskEnd,
             i.name AS itemName, op.name AS operationName
        FROM fab_plan_entry_tasks et
        JOIN fab_project_tasks t ON t.id = et.task_id
@@ -784,6 +832,12 @@ export async function splitEntry(companyId, entryId, { taskIds = null } = {}, us
         plannedEnd: new Date(entry.planned_end),
         plannedMinutes: minutes,
         taskIds: group.map((m) => Number(m.taskId)),
+        // Both halves keep the original span, so each member keeps its own
+        // levelled time inside it — splitting says "these are separate", not
+        // "reschedule these".
+        taskTimes: new Map(group
+          .filter((m) => m.taskStart != null && m.taskEnd != null)
+          .map((m) => [Number(m.taskId), { start: new Date(m.taskStart), end: new Date(m.taskEnd) }])),
         bundleKey: group.length > 1 ? entry.bundle_key : null,
         ancestorItemId: entry.ancestor_item_id,
         orderId: entry.order_id,
