@@ -828,16 +828,33 @@ export async function transformGroup(companyId, input, userId = null) {
       && (p.start.getTime() !== e.start.getTime() || p.end.getTime() !== e.end.getTime());
   });
 
-  const refusals = [
-    // Undo is exempt from the past guard, and has to be.
-    //
-    // The guard exists to stop somebody scheduling work into a day that has
-    // already happened. Restoring is not that: it puts the plan back where it
-    // already was, and that state was legal when it was written. Without the
-    // exemption, undo quietly stops working as soon as the clock passes the
-    // start of what was moved — which is minutes, on the bar you are most
-    // likely to have just dragged by mistake.
-    ...(input.op === 'restore' ? [] : checkPast(entries, proposed, now)),
+  /**
+   * UNDO IS NOT RE-VALIDATED.
+   *
+   * Both guards are skipped for `restore`, and the reasoning is the same for
+   * each: it puts the plan back into a state this system already wrote and
+   * already sanctioned. It reverses a decision rather than making a new one.
+   *
+   * For the past guard that is obvious — otherwise undo stops working as soon as
+   * the clock passes the start of what was moved, which is minutes on the bar
+   * you are most likely to have just dragged by mistake.
+   *
+   * For the DAG gate it took three wrong fixes to see. The gate compares a
+   * RECONSTRUCTED predecessor finish against a stored successor start, and a
+   * bundle's members cannot always be reconstructed: on a two-machine lane they
+   * genuinely overlap in the leveller's own answer, so no single-file layout —
+   * proportional, contiguous, or otherwise — reproduces it. Any reconstruction
+   * that differs by a minute can refuse a restore of a plan that was accepted as
+   * legal an hour earlier, which is exactly what happened on production. Undo
+   * has to be dependable; re-checking a state already approved is not worth
+   * making it a coin flip.
+   *
+   * Not a hole: `restore` needs explicit placements, is gated on
+   * planner_manage, and can only reach states the caller could also reach by
+   * ordinary moves.
+   */
+  const refusals = input.op === 'restore' ? [] : [
+    ...checkPast(entries, proposed, now),
     ...await checkDag(companyId, entries, proposed, dag),
   ];
   if (refusals.length > 0) {
