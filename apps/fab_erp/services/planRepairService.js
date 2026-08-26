@@ -319,16 +319,28 @@ function firstCausedOverload(entriesOnLane, capacity, ours) {
   return null;
 }
 
-/** Where each of a bar's tasks runs, given where the bar is. */
+/**
+ * Where each of a bar's tasks runs, given where the bar is.
+ *
+ * The same rule as planTaskSpan.remapMemberTimes and planGroupService's
+ * proposedTaskSpans, and it has to be: a pure shift carries the stored layout,
+ * a change of SPAN discards it and falls back to apportioning.
+ *
+ * These three agreeing is not optional. When this one scaled while the gate
+ * dropped, the repair computed a predecessor's finish from a squashed layout,
+ * decided nothing downstream was violated, and the gate then refused the move
+ * over the very bar the repair had declined to shift.
+ */
 function taskSpansOf(bar, start, end) {
   const os = bar.start.getTime();
-  const oe = bar.end.getTime();
   const ns = start.getTime();
-  const scale = oe > os ? (end.getTime() - ns) / (oe - os) : 1;
+  const reshaped = Math.abs((end.getTime() - ns) - (bar.end.getTime() - os)) > DAG_TOLERANCE_MS;
   const moved = bar.members.map((m) => {
-    if (m.plannedStart == null || m.plannedEnd == null) return m;
-    const map = (t) => new Date(Math.round(ns + (new Date(t).getTime() - os) * scale));
-    return { ...m, plannedStart: map(m.plannedStart), plannedEnd: map(m.plannedEnd) };
+    if (reshaped || m.plannedStart == null || m.plannedEnd == null) {
+      return { ...m, plannedStart: null, plannedEnd: null };
+    }
+    const move = (t) => new Date(new Date(t).getTime() + (ns - os));
+    return { ...m, plannedStart: move(m.plannedStart), plannedEnd: move(m.plannedEnd) };
   });
   return apportionEntry(start, end, moved);
 }
