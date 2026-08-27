@@ -50,7 +50,7 @@ import { pool } from '../../../db.js';
 import { levelSchedule, buildEdges, loadResourceCapacity } from './resourceLevelingService.js';
 import { taskMinutes } from './taskDuration.js';
 import { resolveCapacityForResource, capacityIntervals, isUnbounded } from './capacityService.js';
-import { zonedYMD } from './plantTime.js';
+import { zonedYMD, planningFloor } from './plantTime.js';
 import { PlanError, plannerTimezone } from './planService.js';
 import { apportionEntry, taskPlannedSpans, remapMemberTimesBulk } from './planTaskSpan.js';
 import { resolveUnitEntries, assertContains } from './planUnitService.js';
@@ -256,7 +256,7 @@ function proposeStretch(entries, anchorMs, scale) {
  * duration is the bar's planned minutes, and the task-level edges are collapsed
  * onto the bars that carry them.
  */
-async function proposePushLeft(companyId, entries, dag, now) {
+async function proposePushLeft(companyId, entries, dag, now, floor = now) {
   const movable = entries.filter((e) => !e.isPinned && !e.started);
   const held = entries.filter((e) => e.isPinned || e.started);
   if (movable.length === 0) {
@@ -362,7 +362,7 @@ async function proposePushLeft(companyId, entries, dag, now) {
     tasks: pseudo,
     edges,
     resourceCapacity: await loadResourceCapacity(companyId),
-    anchor: now,
+    anchor: floor,
     preOccupied: fixed,
     earliestByTask,
   });
@@ -456,27 +456,41 @@ async function checkDag(companyId, entries, proposed, dag) {
 }
 
 /**
- * Nothing may be dragged further into the past.
+ * Nothing may be dragged back past the planning floor.
+ *
+ * The floor is the start of tomorrow, or the start of today in the day view —
+ * see plantTime.planningFloor for why the two differ. A plan is a set of
+ * instructions to a shop, and instructions for the hour you are standing in are
+ * not a plan.
  *
  * A refusal rather than a warning, and the only one here that is not about the
  * DAG. Over-allocation is a preference — a shop CAN be asked to do too much and
  * the planner's rule is to warn about it. Yesterday is not a preference.
  *
- * The test is comparative, not absolute: a bar that already starts before now
- * (the plan was made last week and the shift has begun) may still be moved
- * later, and may be left alone. What is refused is making it earlier than it
- * already was, when that lands before now.
+ * The test is comparative, not absolute: a bar that already starts before the
+ * floor (the plan was made last week and the shift has begun) may still be
+ * moved later, and may be left alone. What is refused is making it EARLIER than
+ * it already was, when that lands below the floor. Without that, work the clock
+ * has overtaken would be frozen — unable to be pushed back even though pushing
+ * it back is the correct response to it not having happened.
  */
-function checkPast(entries, proposed, now) {
+function checkFloor(entries, proposed, floor, granularity) {
   const out = [];
   for (const e of entries) {
     const place = proposed.get(e.id);
     if (!place || place.held) continue;
-    if (place.start.getTime() < now.getTime() && place.start.getTime() < e.start.getTime()) {
+    if (place.start.getTime() < floor.getTime() && place.start.getTime() < e.start.getTime()) {
       out.push(refusal(
         'PAST_PLACEMENT',
-        `That would put work at ${place.start.toISOString()}, which has already happened.`,
-        { entryId: e.id, proposedStart: place.start.toISOString(), now: now.toISOString() },
+        granularity === 'day'
+          ? 'That would put work before today. The plan starts today.'
+          : 'That would put work before tomorrow. Switch to the day view to plan inside today.',
+        {
+          entryId: e.id,
+          proposedStart: place.start.toISOString(),
+          floor: floor.toISOString(),
+          granularity,
+        },
       ));
     }
   }
@@ -715,6 +729,15 @@ export async function transformGroup(companyId, input, userId = null) {
   if (allTaskIds.length === 0) throw new PlanError('NO_TASKS', 'Those bars carry no tasks.');
   const dag = await loadDag(companyId, allTaskIds);
   const now = new Date();
+  /**
+   * The earliest a planner may place work — tomorrow, or today in the day view.
+   * See plantTime.planningFloor. Push-left is anchored on it for the same
+   * reason the guard uses it: it is the one op that can pull work earlier.
+   */
+  const granularity = ['day', 'week', 'month'].includes(input.granularity)
+    ? input.granularity
+    : 'week';
+  const floor = planningFloor(now, await plannerTimezone(companyId), granularity);
 
   let proposed;
   if (input.op === 'move') {
@@ -729,7 +752,7 @@ export async function transformGroup(companyId, input, userId = null) {
     if (!Number.isFinite(anchor)) throw new PlanError('BAD_ANCHOR', 'anchorMs must be a number.');
     proposed = proposeStretch(entries, anchor, scale);
   } else if (input.op === 'pushLeft') {
-    proposed = await proposePushLeft(companyId, entries, dag, now);
+    proposed = await proposePushLeft(companyId, entries, dag, now, floor);
     /**
      * A push that does not finish the unit sooner is not applied.
      *
@@ -854,7 +877,7 @@ export async function transformGroup(companyId, input, userId = null) {
    * ordinary moves.
    */
   const refusals = input.op === 'restore' ? [] : [
-    ...checkPast(entries, proposed, now),
+    ...checkFloor(entries, proposed, floor, granularity),
     ...await checkDag(companyId, entries, proposed, dag),
   ];
   if (refusals.length > 0) {

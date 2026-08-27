@@ -220,3 +220,41 @@ export async function timezoneForWorker(companyId, workerId) {
   }
   return fallback;
 }
+
+/** A calendar date shifted by whole days, on the YYYY-MM-DD string itself. */
+export function addDaysYMD(ymd, days) {
+  const [y, m, d] = String(ymd).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+/**
+ * The earliest instant a planner may place work.
+ *
+ * NOT "now". A plan is a set of instructions to a shop, and instructions for
+ * the hour you are currently in are not a plan — the material is not kitted,
+ * the operator is mid-job, and nobody reads the board that often. The floor is
+ * therefore the start of TOMORROW: today is being worked, tomorrow is being
+ * planned.
+ *
+ * The exception is the day view, where the floor is the start of today. At that
+ * zoom a pixel is minutes and the planner can see the individual shift, so
+ * filling the rest of today's second shift is a real and precise intention. At
+ * week or month zoom a pixel is hours, "today" cannot be expressed accurately
+ * enough to mean anything, and a drop that lands there is far more likely to be
+ * a slip of the hand than a decision.
+ *
+ * Midnight is taken in the PLANT's zone, not the browser's or the server's: the
+ * shop's tomorrow is the only tomorrow that matters, and a planner working from
+ * another country must not get a different answer.
+ *
+ * @param {Date}   now
+ * @param {string} timeZone     the plant's zone
+ * @param {string} granularity  'day' | 'week' | 'month'
+ */
+export function planningFloor(now, timeZone, granularity = 'week') {
+  const today = zonedYMD(now, timeZone);
+  const ymd = granularity === 'day' ? today : addDaysYMD(today, 1);
+  return zonedWallClockToUtc(ymd, '00:00:00', timeZone);
+}
