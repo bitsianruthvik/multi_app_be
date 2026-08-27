@@ -33,6 +33,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
   resolveTaskCalendarIds,
@@ -66,8 +67,7 @@ export async function capacityMode(companyId) {
 
   let mode = CAPACITY_CALENDAR;
   try {
-    const [[row]] = await pool.query(
-      `SELECT setting_value AS v FROM fab_company_settings
+    const [[row]] = await cachedQuery(`SELECT setting_value AS v FROM fab_company_settings
         WHERE company_id = ? AND setting_key = ? AND deleted_at IS NULL`,
       [key, SETTING_KEY],
     );
@@ -161,8 +161,7 @@ export async function resolveCapacityForResource(companyId, resourceId, plantId 
 export async function crewIntervals(companyId, resourceId, windowStart, windowEnd) {
   if (!(windowEnd > windowStart)) return [];
 
-  const [rows] = await pool.query(
-    `SELECT a.worker_id AS workerId, a.from_ts AS aFrom, a.to_ts AS aTo,
+  const [rows] = await cachedQuery(`SELECT a.worker_id AS workerId, a.from_ts AS aFrom, a.to_ts AS aTo,
             ws.shift_id AS shiftId, ws.from_ts AS sFrom, ws.to_ts AS sTo
        FROM fab_worker_assignments a
        -- No active-flag filter: exit closes the assignment, so a leaver has no
@@ -192,8 +191,7 @@ export async function crewIntervals(companyId, resourceId, windowStart, windowEn
   }
 
   const workerIds = [...new Set(rows.map((r) => r.workerId))];
-  const [aways] = await pool.query(
-    `SELECT worker_id AS workerId, from_ts AS fromTs, to_ts AS toTs
+  const [aways] = await cachedQuery(`SELECT worker_id AS workerId, from_ts AS fromTs, to_ts AS toTs
        FROM fab_worker_assignments
       WHERE company_id = ? AND worker_id IN (?) AND kind = 'away'
         AND deleted_at IS NULL AND superseded_by_id IS NULL
@@ -263,8 +261,7 @@ export async function shiftInstancesForCapacity(companyId, cap, windowStart, win
     return shiftInstancesInWindow(companyId, cap?.calendarIds ?? [], windowStart, windowEnd);
   }
 
-  const [rows] = await pool.query(
-    `SELECT DISTINCT sh.calendar_id AS calendarId
+  const [rows] = await cachedQuery(`SELECT DISTINCT sh.calendar_id AS calendarId
        FROM fab_worker_assignments a
        JOIN fab_workers w ON w.id = a.worker_id AND w.deleted_at IS NULL
        JOIN fab_worker_shifts ws

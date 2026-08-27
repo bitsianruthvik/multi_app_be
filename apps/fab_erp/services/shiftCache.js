@@ -88,6 +88,18 @@ export async function shiftWorld(companyId) {
     liveIds: new Set(),       // membership test for an explicit calendar id
     shiftsByCalendar: {},     // calendarId -> [shift row]
     daysByCalendar: {},       // calendarId -> { 'YYYY-MM-DD': isWorking }
+    /**
+     * Which plant a machine or a machine model sits in.
+     *
+     * Here rather than in its own module because it is the first step of the
+     * same question — a bar's calendar is found by way of its plant — and it is
+     * the same kind of data: a handful of rows that change when somebody
+     * commissions a machine, read once per resource on every scheduling pass.
+     * Four of the ten queries a warm validity check still made were this lookup,
+     * asked one resource type at a time.
+     */
+    plantByResource: new Map(),      // resourceId -> { plantId, calendarId }
+    plantByResourceType: new Map(),  // resourceTypeId -> plantId
   };
 
   try {
@@ -132,6 +144,21 @@ export async function shiftWorld(companyId) {
         world.daysByCalendar[row.calendar_id][ymd] = !!row.is_working;
       }
     }
+    const [resources] = await pool.query(
+      `SELECT id, plant_id AS plantId, shift_calendar_id AS calendarId
+         FROM fab_resources WHERE company_id = ? AND deleted_at IS NULL`,
+      [key],
+    );
+    for (const r of resources) {
+      world.plantByResource.set(Number(r.id), { plantId: r.plantId, calendarId: r.calendarId });
+    }
+
+    const [types] = await pool.query(
+      `SELECT id, plant_id AS plantId FROM fab_resource_types
+        WHERE company_id = ? AND deleted_at IS NULL`,
+      [key],
+    );
+    for (const t of types) world.plantByResourceType.set(Number(t.id), t.plantId);
   } catch (err) {
     // A calendar that cannot be read must not take scheduling down: an empty
     // snapshot means "no shifts found", which every caller already handles.

@@ -36,6 +36,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 
 /**
  * Tolerance when checking stored times against their bar, in ms.
@@ -167,8 +168,7 @@ export async function taskPlannedSpans(companyId, taskIds, { excludeEntryId = nu
   if (excludeEntryId != null) { excl = ' AND e.id <> ?'; params.push(excludeEntryId); }
   params.push(companyId, ids);
 
-  const [rows] = await pool.query(
-    `SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
+  const [rows] = await cachedQuery(`SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS taskStart, et.planned_end AS taskEnd,
             e.planned_start AS plannedStart, e.planned_end AS plannedEnd

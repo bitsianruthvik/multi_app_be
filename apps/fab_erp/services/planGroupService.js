@@ -47,6 +47,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { levelSchedule, buildEdges, loadResourceCapacity } from './resourceLevelingService.js';
 import { taskMinutes } from './taskDuration.js';
 import { resolveCapacityForResource, capacityIntervals, isUnbounded } from './capacityService.js';
@@ -91,8 +92,7 @@ const DAG_TOLERANCE_MS = 1000;
 // ─── loading ──────────────────────────────────────────────────────────────────
 
 async function loadEntries(companyId, entryIds) {
-  const [rows] = await pool.query(
-    `SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
+  const [rows] = await cachedQuery(`SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
             e.planned_start AS plannedStart, e.planned_end AS plannedEnd,
             e.planned_minutes AS plannedMinutes, e.is_pinned AS isPinned,
             e.order_id AS orderId, e.label
@@ -104,8 +104,7 @@ async function loadEntries(companyId, entryIds) {
     throw new PlanError('ENTRY_NOT_FOUND', 'None of those bars are on the plan any more.');
   }
 
-  const [members] = await pool.query(
-    `SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
+  const [members] = await cachedQuery(`SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS taskStart, et.planned_end AS taskEnd, t.status
        FROM fab_plan_entry_tasks et
@@ -149,16 +148,14 @@ async function loadEntries(companyId, entryIds) {
  * question. Mirrors planService.assertDagAllows.
  */
 async function loadDag(companyId, taskIds) {
-  const [orderRows] = await pool.query(
-    `SELECT DISTINCT order_id AS orderId FROM fab_project_tasks
+  const [orderRows] = await cachedQuery(`SELECT DISTINCT order_id AS orderId FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, taskIds],
   );
   const orderIds = orderRows.map((r) => r.orderId).filter((x) => x != null);
   if (orderIds.length === 0) return { byId: new Map(), preds: new Map(), succs: new Map() };
 
-  const [siblings] = await pool.query(
-    `SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
+  const [siblings] = await cachedQuery(`SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
             started_at, computed_hours, setup_hours, task_qty
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
@@ -323,8 +320,7 @@ async function proposePushLeft(companyId, entries, dag, now, floor = now) {
   // placed on the same lane at the same instant are not rare, and the leveller
   // would then double-book the one it was told nothing about.
   const movingIds = new Set(movable.map((e) => e.id));
-  const [others] = await pool.query(
-    `SELECT id, resource_type_id, resource_id AS assigned_resource_id,
+  const [others] = await cachedQuery(`SELECT id, resource_type_id, resource_id AS assigned_resource_id,
             planned_start, planned_end
        FROM fab_plan_entries
       WHERE company_id = ? AND status = 'planned' AND deleted_at IS NULL
@@ -545,8 +541,7 @@ async function checkCapacity(companyId, entries, proposed) {
   const from = new Date(Math.min(...times.map((p) => p.start.getTime())));
   const to = new Date(Math.max(...times.map((p) => p.end.getTime())));
 
-  const [rows] = await pool.query(
-    `SELECT id, resource_type_id AS resourceTypeId, resource_id AS resourceId,
+  const [rows] = await cachedQuery(`SELECT id, resource_type_id AS resourceTypeId, resource_id AS resourceId,
             planned_start AS plannedStart, planned_end AS plannedEnd
        FROM fab_plan_entries
       WHERE company_id = ? AND status = 'planned' AND deleted_at IS NULL
@@ -621,8 +616,7 @@ async function checkCalendar(companyId, entries, proposed) {
 
   const typeIds = [...new Set(entries.map((e) => e.resourceTypeId).filter((x) => x != null))];
   if (typeIds.length === 0) return [];
-  const [resources] = await pool.query(
-    `SELECT id, plant_id AS plantId, resource_type_id AS resourceTypeId
+  const [resources] = await cachedQuery(`SELECT id, plant_id AS plantId, resource_type_id AS resourceTypeId
        FROM fab_resources
       WHERE company_id = ? AND resource_type_id IN (?) AND deleted_at IS NULL`,
     [companyId, typeIds],

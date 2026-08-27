@@ -57,6 +57,7 @@
 //   attributed as `unexplained_idle` instead of falling outside the working day.
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { shiftWorld } from './shiftCache.js';
 import {
   DEFAULT_TZ, zonedWallClockToUtc, zonedYMD, calendarTimezones, tzForCalendar,
@@ -187,16 +188,14 @@ function clipToWindow(iv, windowStart, windowEnd) {
  */
 async function resolveTaskPlantId(companyId, task) {
   if (task.assigned_resource_id) {
-    const [[row]] = await pool.query(
-      `SELECT plant_id FROM fab_resources
+    const [[row]] = await cachedQuery(`SELECT plant_id FROM fab_resources
        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
       [task.assigned_resource_id, companyId],
     );
     if (row) return row.plant_id;
   }
   if (task.resource_type_id) {
-    const [[row]] = await pool.query(
-      `SELECT plant_id FROM fab_resource_types
+    const [[row]] = await cachedQuery(`SELECT plant_id FROM fab_resource_types
        WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
       [task.resource_type_id, companyId],
     );
@@ -226,24 +225,21 @@ export async function resolveTaskCalendarIds(companyId, task) {
   let explicitCalendarId = null;
   let plantId = null;
 
+  // Both lookups come out of the company's snapshot — see shiftCache. Asked
+  // per resource and per resource type, they were four of the ten queries a warm
+  // validity check still cost, for two tables that change when a machine is
+  // commissioned.
+  const world = await shiftWorld(companyId);
   if (task?.assigned_resource_id) {
-    const [[row]] = await pool.query(
-      `SELECT plant_id, shift_calendar_id FROM fab_resources
-       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [task.assigned_resource_id, companyId],
-    );
+    const row = world.plantByResource.get(Number(task.assigned_resource_id));
     if (row) {
-      plantId = row.plant_id;
-      explicitCalendarId = row.shift_calendar_id;
+      plantId = row.plantId;
+      explicitCalendarId = row.calendarId;
     }
   }
   if (plantId == null && task?.resource_type_id) {
-    const [[row]] = await pool.query(
-      `SELECT plant_id FROM fab_resource_types
-       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [task.resource_type_id, companyId],
-    );
-    if (row) plantId = row.plant_id;
+    const p = world.plantByResourceType.get(Number(task.resource_type_id));
+    if (p != null) plantId = p;
   }
   return resolveCalendarIds(companyId, plantId, explicitCalendarId);
 }
@@ -532,8 +528,7 @@ export async function intervalsForShifts(companyId, shiftIds, windowStart, windo
 
   const tzMap = await calendarTimezones(companyId);
 
-  const [shiftRows] = await pool.query(
-    `SELECT id, calendar_id, name, start_time, end_time, working_minutes
+  const [shiftRows] = await cachedQuery(`SELECT id, calendar_id, name, start_time, end_time, working_minutes
        FROM fab_shifts
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, shiftIds],
@@ -561,8 +556,7 @@ export async function intervalsForShifts(companyId, shiftIds, windowStart, windo
   }
   const walkFrom = addDaysYMD(dateFrom, -1);
 
-  const [dayRows] = await pool.query(
-    `SELECT calendar_id, day_date, is_working
+  const [dayRows] = await cachedQuery(`SELECT calendar_id, day_date, is_working
        FROM fab_calendar_days
       WHERE company_id = ? AND calendar_id IN (?)
         AND day_date BETWEEN ? AND ? AND deleted_at IS NULL`,
@@ -599,8 +593,7 @@ export async function fetchOverlappingOtherTasks(companyId, task, windowStart, w
 
   params.push(windowEnd, windowStart);
 
-  const [rows] = await pool.query(
-    `SELECT ot.id, ot.started_at, ot.completed_at, ot.status
+  const [rows] = await cachedQuery(`SELECT ot.id, ot.started_at, ot.completed_at, ot.status
      FROM   fab_project_tasks ot
      WHERE  ot.company_id = ?
        AND  ot.id <> ?

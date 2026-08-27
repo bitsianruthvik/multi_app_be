@@ -72,6 +72,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { createPlacer, loadResourceCapacity } from './resourceLevelingService.js';
 import { resolveCapacity } from './capacityService.js';
 import { apportionEntry } from './planTaskSpan.js';
@@ -120,8 +121,7 @@ function isImmovable(bar) {
  */
 async function loadOrderBars(companyId, orderIds) {
   if (orderIds.length === 0) return [];
-  const [rows] = await pool.query(
-    `SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
+  const [rows] = await cachedQuery(`SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
             e.planned_start AS plannedStart, e.planned_end AS plannedEnd,
             e.planned_minutes AS plannedMinutes, e.is_pinned AS isPinned,
             e.order_id AS orderId
@@ -132,8 +132,7 @@ async function loadOrderBars(companyId, orderIds) {
   );
   if (rows.length === 0) return [];
 
-  const [members] = await pool.query(
-    `SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
+  const [members] = await cachedQuery(`SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS taskStart, et.planned_end AS taskEnd,
             t.status
@@ -168,13 +167,24 @@ async function loadOrderBars(companyId, orderIds) {
   return [...byId.values()];
 }
 
-/** Bars of every OTHER order — occupancy the repair must fit around. */
+/**
+ * Bars of every OTHER order — occupancy the repair must fit around.
+ *
+ * `from` is floored to the start of its day before it reaches the query, and
+ * that is not cosmetic. The caller passes the earliest instant the move touches,
+ * which changes by a few minutes every time the handle twitches; used raw it
+ * makes a different statement on every validity check and so can never be
+ * served from the drag's cache. Rounded down it is stable for the whole gesture,
+ * at the cost of a few extra hours of occupancy rows — which are only ever read
+ * as "this machine is busy here", so a superset is harmless.
+ */
 async function loadForeignBars(companyId, orderIds, from) {
-  const params = [companyId, from];
+  const day = new Date(from);
+  day.setUTCHours(0, 0, 0, 0);
+  const params = [companyId, day];
   let excl = '';
   if (orderIds.length > 0) { excl = ' AND (e.order_id IS NULL OR e.order_id NOT IN (?))'; params.push(orderIds); }
-  const [rows] = await pool.query(
-    `SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
+  const [rows] = await cachedQuery(`SELECT e.id, e.resource_type_id AS resourceTypeId, e.resource_id AS resourceId,
             e.planned_start AS plannedStart, e.planned_end AS plannedEnd,
             e.planned_minutes AS plannedMinutes
        FROM fab_plan_entries e
@@ -602,8 +612,7 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
 async function loadOrderMeta(companyId, orderIds) {
   const out = new Map();
   if (orderIds.length === 0) return out;
-  const [rows] = await pool.query(
-    `SELECT id, priority_rank AS priorityRank,
+  const [rows] = await cachedQuery(`SELECT id, priority_rank AS priorityRank,
             COALESCE(must_finish_by, required_date) AS due
        FROM fab_orders WHERE company_id = ? AND id IN (?)`,
     [companyId, orderIds],

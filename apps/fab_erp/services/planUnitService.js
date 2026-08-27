@@ -32,6 +32,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { PlanError } from './planService.js';
 
 /** Coarse → fine. Must match boardModel.GROUP_LEVELS exactly. */
@@ -88,15 +89,13 @@ function groupKeyFor(itemsById, itemId, level) {
 async function ordersForUnit(companyId, unit) {
   if (unit.kind === 'o') return [unit.id];
   if (unit.kind === 'l') {
-    const [rows] = await pool.query(
-      `SELECT order_id AS orderId FROM fab_order_lines
+    const [rows] = await cachedQuery(`SELECT order_id AS orderId FROM fab_order_lines
         WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
       [companyId, unit.id],
     );
     return rows.map((r) => r.orderId).filter((x) => x != null);
   }
-  const [rows] = await pool.query(
-    `SELECT order_id AS orderId FROM fab_items
+  const [rows] = await cachedQuery(`SELECT order_id AS orderId FROM fab_items
       WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
     [companyId, unit.id],
   );
@@ -124,8 +123,7 @@ export async function resolveUnitEntries(companyId, { level, key } = {}) {
 
   // The order's whole item tree — the walk needs ancestors, not just the leaves
   // that carry tasks.
-  const [items] = await pool.query(
-    `SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
+  const [items] = await cachedQuery(`SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
             order_line_id AS orderLineId, level_kind AS levelKind
        FROM fab_items
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL`,
@@ -133,8 +131,7 @@ export async function resolveUnitEntries(companyId, { level, key } = {}) {
   );
   const itemsById = new Map(items.map((i) => [i.id, i]));
 
-  const [rows] = await pool.query(
-    `SELECT DISTINCT e.id AS entryId, t.item_id AS itemId
+  const [rows] = await cachedQuery(`SELECT DISTINCT e.id AS entryId, t.item_id AS itemId
        FROM fab_plan_entries e
        JOIN fab_plan_entry_tasks et ON et.plan_entry_id = e.id AND et.company_id = e.company_id
                                    AND et.deleted_at IS NULL

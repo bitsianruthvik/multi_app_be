@@ -14,6 +14,7 @@
 // InWindow). Edge-building mirrors GET /tasks/graph exactly (see buildEdges).
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 import { parseDependsOn } from './taskGatingService.js';
 import { NoCapacityError, NO_WORKING_TIME, NO_CREW_ASSIGNED, isNoCapacity } from './schedulingErrors.js';
@@ -82,8 +83,7 @@ export async function buildEdges({ companyId, tasks }) {
 
   const taskIds = tasks.map((t) => t.id);
   if (taskIds.length > 0) {
-    const [inputRows] = await pool.query(
-      `SELECT task_id, producing_item_id
+    const [inputRows] = await cachedQuery(`SELECT task_id, producing_item_id
          FROM fab_task_inputs
         WHERE company_id = ? AND task_id IN (?) AND input_role = 'component'
           AND gate = 1 AND producing_item_id IS NOT NULL AND deleted_at IS NULL`,
@@ -115,12 +115,10 @@ export async function buildEdges({ companyId, tasks }) {
  * @param {number} companyId
  */
 export async function loadResourceCapacity(companyId) {
-  const [typeRows] = await pool.query(
-    `SELECT id, num_units FROM fab_resource_types WHERE company_id = ? AND deleted_at IS NULL`,
+  const [typeRows] = await cachedQuery(`SELECT id, num_units FROM fab_resource_types WHERE company_id = ? AND deleted_at IS NULL`,
     [companyId],
   );
-  const [resRows] = await pool.query(
-    `SELECT id, num_units FROM fab_resources WHERE company_id = ? AND deleted_at IS NULL`,
+  const [resRows] = await cachedQuery(`SELECT id, num_units FROM fab_resources WHERE company_id = ? AND deleted_at IS NULL`,
     [companyId],
   );
   const typeUnits = new Map();

@@ -28,6 +28,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { cachedQuery } from './planReadCache.js';
 import { buildEdges } from './resourceLevelingService.js';
 import { outstandingGatesFor, isMaterialBlocked } from './taskGatingService.js';
 import { compareOrders, rankReason, PRIORITY_LEVELS } from './orderPriority.js';
@@ -54,8 +55,7 @@ import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSp
 export async function plannerTimezone(companyId) {
   const tzMap = await calendarTimezones(companyId);
   const companyDefault = tzMap.get('__default') ?? DEFAULT_TZ;
-  const [rows] = await pool.query(
-    `SELECT DISTINCT p.timezone AS tz
+  const [rows] = await cachedQuery(`SELECT DISTINCT p.timezone AS tz
        FROM fab_plants p
       WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.timezone IS NOT NULL`,
     [companyId],
@@ -88,8 +88,7 @@ async function loadLanes(companyId, resourceTypeIds = []) {
   let filter = '';
   if (resourceTypeIds.length > 0) { filter = ' AND rt.id IN (?)'; params.push(resourceTypeIds); }
 
-  const [types] = await pool.query(
-    `SELECT rt.id, rt.name, rt.code, rt.num_units AS numUnits
+  const [types] = await cachedQuery(`SELECT rt.id, rt.name, rt.code, rt.num_units AS numUnits
        FROM fab_resource_types rt
       WHERE rt.company_id = ? AND rt.deleted_at IS NULL${filter}
       ORDER BY rt.name ASC`,
@@ -97,8 +96,7 @@ async function loadLanes(companyId, resourceTypeIds = []) {
   );
   if (types.length === 0) return [];
 
-  const [resources] = await pool.query(
-    `SELECT r.id, r.name, r.resource_type_id AS resourceTypeId, r.plant_id AS plantId,
+  const [resources] = await cachedQuery(`SELECT r.id, r.name, r.resource_type_id AS resourceTypeId, r.plant_id AS plantId,
             ev.state AS machineState
        FROM fab_resources r
        LEFT JOIN (
@@ -182,8 +180,7 @@ async function loadEntries(companyId, from, to, resourceTypeIds = []) {
   let filter = '';
   if (resourceTypeIds.length > 0) { filter = ' AND e.resource_type_id IN (?)'; params.push(resourceTypeIds); }
 
-  const [entries] = await pool.query(
-    `SELECT e.id, e.plan_date AS planDate, e.resource_type_id AS resourceTypeId,
+  const [entries] = await cachedQuery(`SELECT e.id, e.plan_date AS planDate, e.resource_type_id AS resourceTypeId,
             e.resource_id AS resourceId, e.planned_start AS plannedStart,
             e.planned_end AS plannedEnd, e.planned_minutes AS plannedMinutes,
             e.kind, e.bundle_key AS bundleKey, e.ancestor_item_id AS ancestorItemId,
@@ -204,8 +201,7 @@ async function loadEntries(companyId, from, to, resourceTypeIds = []) {
   );
   if (entries.length === 0) return [];
 
-  const [members] = await pool.query(
-    `SELECT et.plan_entry_id AS planEntryId, et.task_id AS taskId,
+  const [members] = await cachedQuery(`SELECT et.plan_entry_id AS planEntryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS plannedStart, et.planned_end AS plannedEnd,
             t.status, t.seq_no AS seqNo, t.item_id AS itemId,
@@ -326,8 +322,7 @@ export async function getPlan(companyId, { from, to, resourceTypeIds = [] } = {}
  * clears the gate and the task becomes plannable on its own.
  */
 export async function assertMaterialAvailable(companyId, taskIds) {
-  const [rows] = await pool.query(
-    `SELECT id, status FROM fab_project_tasks
+  const [rows] = await cachedQuery(`SELECT id, status FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL AND status = 'blocked'`,
     [companyId, taskIds],
   );
@@ -357,8 +352,7 @@ export async function assertMaterialAvailable(companyId, taskIds) {
 export async function assertDagAllows(companyId, taskIds, start, { excludeEntryId = null } = {}) {
   if (!taskIds.length) throw new PlanError('NO_TASKS', 'A plan entry needs at least one task.');
 
-  const [orderRows] = await pool.query(
-    `SELECT DISTINCT order_id AS orderId FROM fab_project_tasks
+  const [orderRows] = await cachedQuery(`SELECT DISTINCT order_id AS orderId FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
     [companyId, taskIds],
   );
@@ -367,8 +361,7 @@ export async function assertDagAllows(companyId, taskIds, start, { excludeEntryI
 
   // Edges are resolved over the whole order, not the selected tasks — a
   // predecessor outside the selection is precisely what has to be found.
-  const [siblings] = await pool.query(
-    `SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
+  const [siblings] = await cachedQuery(`SELECT id, order_id, item_id, flow_id, seq_no, depends_on, status,
             started_at, computed_hours, setup_hours, task_qty
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
@@ -531,8 +524,7 @@ export async function createEntry(companyId, input, userId = null) {
   const start = new Date(input.plannedStart);
   if (Number.isNaN(start.getTime())) throw new PlanError('BAD_START', 'plannedStart is not a valid date.');
 
-  const [tasks] = await pool.query(
-    `SELECT t.id, t.order_id AS orderId, t.operation_id AS operationId,
+  const [tasks] = await cachedQuery(`SELECT t.id, t.order_id AS orderId, t.operation_id AS operationId,
             t.resource_type_id AS resourceTypeId, t.assigned_resource_id AS resourceId,
             t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty, t.seq_no AS seqNo,
             i.parent_item_id AS parentItemId, i.name AS itemName,
@@ -638,8 +630,7 @@ function chunked(rows, size) {
  * the inserts deferred to the end, that is what `claimed` is for.
  */
 export async function acceptRun(companyId, runId, { runItemIds = null, pin = false } = {}, userId = null) {
-  const [[run]] = await pool.query(
-    `SELECT id, status FROM fab_plan_runs
+  const [[run]] = await cachedQuery(`SELECT id, status FROM fab_plan_runs
       WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
     [companyId, runId],
   );
@@ -648,8 +639,7 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
   const params = [companyId, runId];
   let filter = '';
   if (Array.isArray(runItemIds) && runItemIds.length > 0) { filter = ' AND id IN (?)'; params.push(runItemIds); }
-  const [items] = await pool.query(
-    `SELECT * FROM fab_plan_run_items
+  const [items] = await cachedQuery(`SELECT * FROM fab_plan_run_items
       WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL${filter}
       ORDER BY planned_start ASC, id ASC`,
     params,
@@ -688,8 +678,7 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
 
   // ── three questions, asked once for every task instead of once per bar ─────
   const ids = [...allTaskIds];
-  const [liveRows] = await pool.query(
-    `SELECT id, computed_hours AS computedHours, setup_hours AS setupHours, task_qty AS taskQty
+  const [liveRows] = await cachedQuery(`SELECT id, computed_hours AS computedHours, setup_hours AS setupHours, task_qty AS taskQty
        FROM fab_project_tasks
       WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL
         AND status NOT IN ('cancelled','done')`,
@@ -697,8 +686,7 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
   );
   const live = new Map(liveRows.map((r) => [Number(r.id), taskMinutes(r)]));
 
-  const [plannedRows] = await pool.query(
-    `SELECT et.task_id AS taskId, e.id AS entryId
+  const [plannedRows] = await cachedQuery(`SELECT et.task_id AS taskId, e.id AS entryId
        FROM fab_plan_entry_tasks et
        JOIN fab_plan_entries e ON e.id = et.plan_entry_id
                              AND e.company_id = et.company_id
@@ -813,15 +801,13 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
 
 /** Move, resize or pin an entry. A move re-checks the DAG gate. */
 export async function updateEntry(companyId, entryId, patch, userId = null) {
-  const [[entry]] = await pool.query(
-    `SELECT * FROM fab_plan_entries
+  const [[entry]] = await cachedQuery(`SELECT * FROM fab_plan_entries
       WHERE company_id = ? AND id = ? AND status = 'planned' AND deleted_at IS NULL`,
     [companyId, entryId],
   );
   if (!entry) throw new PlanError('ENTRY_NOT_FOUND', `Plan entry ${entryId} does not exist.`);
 
-  const [members] = await pool.query(
-    `SELECT task_id AS taskId FROM fab_plan_entry_tasks
+  const [members] = await cachedQuery(`SELECT task_id AS taskId FROM fab_plan_entry_tasks
       WHERE company_id = ? AND plan_entry_id = ? AND deleted_at IS NULL`,
     [companyId, entryId],
   );
@@ -884,15 +870,13 @@ export async function updateEntry(companyId, entryId, patch, userId = null) {
  * computer's opinion instead.
  */
 export async function splitEntry(companyId, entryId, { taskIds = null } = {}, userId = null) {
-  const [[entry]] = await pool.query(
-    `SELECT * FROM fab_plan_entries
+  const [[entry]] = await cachedQuery(`SELECT * FROM fab_plan_entries
       WHERE company_id = ? AND id = ? AND status = 'planned' AND deleted_at IS NULL`,
     [companyId, entryId],
   );
   if (!entry) throw new PlanError('ENTRY_NOT_FOUND', `Plan entry ${entryId} does not exist.`);
 
-  const [members] = await pool.query(
-    `SELECT et.task_id AS taskId, et.planned_minutes AS plannedMinutes,
+  const [members] = await cachedQuery(`SELECT et.task_id AS taskId, et.planned_minutes AS plannedMinutes,
             et.planned_start AS taskStart, et.planned_end AS taskEnd,
             i.name AS itemName, op.name AS operationName
        FROM fab_plan_entry_tasks et
@@ -1029,8 +1013,7 @@ export async function retirePlan(companyId, { orderIds = null } = {}, userId = n
   let filter = '';
   if (scoped) { filter = ' AND e.order_id IN (?)'; params.push(orderIds); }
 
-  const [rows] = await pool.query(
-    `SELECT e.id,
+  const [rows] = await cachedQuery(`SELECT e.id,
             e.is_pinned AS isPinned,
             EXISTS (
               SELECT 1 FROM fab_plan_entry_tasks et
@@ -1096,8 +1079,7 @@ export async function getBacklog(companyId, { resourceTypeIds = [], limit = 200 
   if (resourceTypeIds.length > 0) { filter = ' AND t.resource_type_id IN (?)'; params.push(resourceTypeIds); }
   params.push(limit);
 
-  const [rows] = await pool.query(
-    `SELECT t.id, t.order_id AS orderId, t.item_id AS itemId, t.seq_no AS seqNo,
+  const [rows] = await cachedQuery(`SELECT t.id, t.order_id AS orderId, t.item_id AS itemId, t.seq_no AS seqNo,
             t.status, t.resource_type_id AS resourceTypeId,
             t.assigned_resource_id AS resourceId, t.computed_hours AS computedHours, t.setup_hours AS setupHours, t.task_qty AS taskQty,
             i.name AS itemName, i.parent_item_id AS parentItemId,
@@ -1146,8 +1128,7 @@ export async function getPlanOrders(companyId, { from, to, resourceTypeIds = [] 
   let typeFilter = '';
   if (resourceTypeIds.length > 0) { typeFilter = ' AND t.resource_type_id IN (?)'; params.push(resourceTypeIds); }
 
-  const [rows] = await pool.query(
-    `SELECT o.id AS orderId, o.order_number AS orderNumber, o.customer_name AS customerName,
+  const [rows] = await cachedQuery(`SELECT o.id AS orderId, o.order_number AS orderNumber, o.customer_name AS customerName,
             o.priority, o.priority_rank AS priorityRank,
             o.must_finish_by AS mustFinishBy, o.required_date AS requiredDate,
             COUNT(t.id) AS taskCount,
@@ -1274,8 +1255,7 @@ async function decorateBlocked(companyId, rows) {
   const predsByTask = new Map();
   const byId = new Map();
   if (orderIds.length) {
-    const [siblings] = await pool.query(
-      `SELECT t.id, t.order_id, t.item_id, t.flow_id, t.seq_no, t.depends_on, t.status,
+    const [siblings] = await cachedQuery(`SELECT t.id, t.order_id, t.item_id, t.flow_id, t.seq_no, t.depends_on, t.status,
               op.name AS operationName, i.name AS itemName
          FROM fab_project_tasks t
          LEFT JOIN fab_operations op ON op.id = t.operation_id
@@ -1296,8 +1276,7 @@ async function decorateBlocked(companyId, rows) {
   const predIds = [...new Set([...predsByTask.values()].flat())];
   const plannedEnd = new Map();
   if (predIds.length) {
-    const [pe] = await pool.query(
-      `SELECT et.task_id AS taskId, MAX(e.planned_end) AS plannedEnd
+    const [pe] = await cachedQuery(`SELECT et.task_id AS taskId, MAX(e.planned_end) AS plannedEnd
          FROM fab_plan_entry_tasks et
          JOIN fab_plan_entries e ON e.id = et.plan_entry_id
                                AND e.company_id = et.company_id
@@ -1366,8 +1345,7 @@ async function itemAncestry(companyId, itemIds) {
   const known = new Map();
   let frontier = [...new Set(itemIds.filter((x) => x != null))];
   for (let depth = 0; depth < MAX_BOM_DEPTH && frontier.length > 0; depth += 1) {
-    const [rows] = await pool.query(
-      `SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
+    const [rows] = await cachedQuery(`SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
               order_line_id AS orderLineId, level_kind AS levelKind,
               name, code, mark
          FROM fab_items
@@ -1474,15 +1452,13 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] }
   const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
   const lineIds = [...new Set(items.map((i) => i.orderLineId).filter((x) => x != null))];
 
-  const [orders] = orderIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, order_number AS orderNumber, customer_name AS customerName,
+  const [orders] = orderIds.length === 0 ? [[]] : await cachedQuery(`SELECT id, order_number AS orderNumber, customer_name AS customerName,
             priority, priority_rank AS priorityRank, required_date AS requiredDate,
             must_finish_by AS mustFinishBy
        FROM fab_orders WHERE company_id = ? AND id IN (?)`,
     [companyId, orderIds],
   );
-  const [lines] = lineIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, order_id AS orderId, line_no AS lineNo, code, description
+  const [lines] = lineIds.length === 0 ? [[]] : await cachedQuery(`SELECT id, order_id AS orderId, line_no AS lineNo, code, description
        FROM fab_order_lines WHERE company_id = ? AND id IN (?)`,
     [companyId, lineIds],
   );

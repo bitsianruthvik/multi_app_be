@@ -25,6 +25,7 @@ import {
   getPlan, getPlanBoard, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
   acceptRun, retirePlan, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
+import { withDragSession, endDragSession } from '../services/planDragSession.js';
 import { transformGroup } from '../services/planGroupService.js';
 
 const router = Router();
@@ -287,11 +288,34 @@ router.post('/plan/group', protect, async (req, res) => {
   const companyId = user?.companyId;
   if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
 
+  /**
+   * All the requests of one drag share their reads.
+   *
+   * The board mints `sessionId` when the handle goes down and sends it with
+   * every validity check and the commit. While a planner holds a unit, the rest
+   * of the plan is frozen by definition, so asking the database the same three
+   * dozen questions on each of those requests only bought latency. Without a
+   * sessionId this behaves exactly as it did. See planDragSession.
+   */
+  const sessionId = typeof req.body?.sessionId === 'string' && req.body.sessionId.length > 0
+    ? req.body.sessionId
+    : null;
+
   try {
-    const out = await transformGroup(companyId, req.body ?? {}, user?.id ?? null);
+    const { result: out, reused } = await withDragSession(
+      companyId, user?.id ?? null, sessionId,
+      () => transformGroup(companyId, req.body ?? {}, user?.id ?? null),
+    );
+    // A drag that wrote has invalidated its own cache: every answer in it
+    // describes the plan as it was before this call.
+    if (out.applied) endDragSession(companyId, user?.id ?? null, sessionId);
+    if (sessionId) logger.debug({ companyId, sessionId, reused }, 'plan group drag session');
     return res.status(200).json({ ok: true, ...out });
   } catch (err) {
     if (err instanceof PlanError) return sendPlanError(res, err);
+    // Not a refusal but a fault: drop the session rather than let a gesture
+    // keep reasoning from reads that may have been half-collected.
+    endDragSession(companyId, user?.id ?? null, sessionId);
     logger.error({ err, companyId }, 'plan group transform failed');
     return res.status(500).json({ message: 'Could not move that unit.' });
   }
