@@ -189,6 +189,29 @@ const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 const TAIL_BUCKET_MIN = 240;
 
 /**
+ * The longest pause an uninterruptible operation may run straight through.
+ *
+ * "Uninterruptible" means it cannot be left half-done overnight — not that
+ * nobody may go to lunch. A galvanising bath, a paint bake and a stress-relief
+ * cycle all keep running while the floor eats; what they cannot survive is being
+ * shut down and gone home from.
+ *
+ * The two are easy to tell apart in the data, and not by guesswork. A meal break
+ * is CARVED out of the middle of a single shift's span by
+ * taskWaitService.workedIntervalsForShift — it is the difference between a
+ * shift's wall-clock length and its working_minutes, so it is always a fraction
+ * of one shift. A night is what is left of the day after the shift ends: fifteen
+ * hours for a single-shift shop, and never less than a couple even where shifts
+ * nearly meet. Two hours sits in a gap nothing real falls into.
+ *
+ * Chosen this way rather than by threading a flag down from the shift walk
+ * because those intervals are merged (workingIntervalsInWindow) before the
+ * scheduler sees them, and a merge of two calendars' shifts has no single
+ * shift's identity left to carry.
+ */
+const MAX_BRIDGED_BREAK_MIN = 120;
+
+/**
  * Working intervals for one capacity source over one ALIGNED window.
  *
  * ── WHY ALIGNED, AND WHY THIS EXISTS ──────────────────────────────────────
@@ -372,6 +395,8 @@ async function computeSpan(companyId, cap, from, durationMin, cache, contiguous 
   let remaining = durationMin;
   let windowStart = alignWindow(fromMs);
   let started = null;
+  /** End of the last working interval consumed — how a night is recognised. */
+  let prevEnd = null;
   const occupied = [];
   let scanned = 0;
   while (remaining > 1e-9) {
@@ -394,12 +419,31 @@ async function computeSpan(companyId, cap, from, durationMin, cache, contiguous 
       // about, and a shift that started an hour ago offers only its remainder.
       const iv = clipFrom(raw, fromMs);
       if (!iv) continue;
+      /**
+       * A night ends a run; a meal break does not.
+       *
+       * Reached only in contiguous mode, and only once something has been
+       * accumulated. Everything gathered so far belonged to a stretch that has
+       * now been broken, so it is discarded and the search restarts from this
+       * interval — which is what makes the operation WAIT for a stretch long
+       * enough rather than resume the next morning.
+       */
+      if (contiguous && started !== null && prevEnd !== null
+        && iv.start.getTime() - prevEnd > MAX_BRIDGED_BREAK_MIN * 60000) {
+        started = null;
+        prevEnd = null;
+        occupied.length = 0;
+        remaining = durationMin;
+      }
       if (started === null) started = new Date(iv.start.getTime());
       const lenMin = (iv.end.getTime() - iv.start.getTime()) / 60000;
       if (remaining <= lenMin + 1e-9) {
         const end = new Date(iv.start.getTime() + remaining * 60000);
         occupied.push({ start: new Date(iv.start.getTime()), end });
-        return { start: contiguous ? new Date(iv.start.getTime()) : started, end, intervals: occupied };
+        // `started` is the beginning of the RUN, which for an uninterruptible
+        // task may be before this interval: it is allowed to have run through a
+        // meal break to get here.
+        return { start: started, end, intervals: occupied };
       }
       /**
        * An operation that cannot be paused does not spill into tomorrow.
@@ -407,20 +451,17 @@ async function computeSpan(companyId, cap, from, durationMin, cache, contiguous 
        * The default is to consume working time until the duration is used up, so
        * a five-hour task with two and a half hours of the day left takes two and
        * a half hours today and the rest tomorrow. That is right for cutting and
-       * welding and wrong for anything that cannot be stopped once begun — a
-       * galvanising dip, a paint bake, a stress-relief cycle. Those wait for a
-       * stretch of working time long enough to hold the whole of them.
+       * welding and wrong for anything that cannot be stopped once begun.
        *
-       * So a too-short interval is skipped rather than partly consumed, and the
-       * search moves on to the next one.
+       * Such a task keeps accumulating across intervals exactly like any other —
+       * a meal break is not an interruption to a bath or an oven — and it is the
+       * NIGHT check above that discards a part-built run. So this branch simply
+       * carries on, and what makes the task wait is that any stretch broken by a
+       * night is thrown away and started again.
        */
-      if (contiguous) {
-        started = null;
-        occupied.length = 0;
-        continue;
-      }
       occupied.push({ start: new Date(iv.start.getTime()), end: new Date(iv.end.getTime()) });
       remaining -= lenMin;
+      prevEnd = iv.end.getTime();
     }
     windowStart += CHUNK_MS;
     scanned += CHUNK_MS;
