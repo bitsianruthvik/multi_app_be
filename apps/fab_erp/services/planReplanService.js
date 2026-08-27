@@ -141,15 +141,40 @@ export async function simulateOrder(companyId, orderId, { granularity = 'week' }
     if (s.end.getTime() > last) last = s.end.getTime();
   }
 
-  // Where the work sits, so a disappointing date has something to argue with.
+  /**
+   * Where the work sits, so a disappointing date has something to argue with.
+   *
+   * Ranked by hours PER MACHINE, not by hours. Two cranes carrying a thousand
+   * hours between them are half the problem one edge-preparation station is with
+   * six hundred, and ranking by the raw total says the opposite — it named the
+   * crane on the first production order and sent you to argue with the wrong
+   * station. What bounds a date is the busiest single machine.
+   */
+  const [machineRows] = await pool.query(
+    `SELECT resource_type_id AS typeId, COUNT(*) AS n FROM fab_resources
+      WHERE company_id = ? AND deleted_at IS NULL GROUP BY resource_type_id`,
+    [companyId],
+  );
+  const machinesOf = new Map(machineRows.map((r) => [Number(r.typeId), Number(r.n)]));
+
   const byType = new Map();
   for (const t of tasks) {
     const key = t.resource_type_name ?? `type ${t.resource_type_id}`;
-    byType.set(key, (byType.get(key) ?? 0) + (taskMinutes(t) || 0));
+    const at = byType.get(key) ?? { minutes: 0, typeId: t.resource_type_id };
+    at.minutes += taskMinutes(t) || 0;
+    byType.set(key, at);
   }
   const load = [...byType.entries()]
-    .map(([name, minutes]) => ({ name, hours: Math.round(minutes / 60) }))
-    .sort((a, b) => b.hours - a.hours);
+    .map(([name, at]) => {
+      const machines = machinesOf.get(Number(at.typeId)) || 1;
+      return {
+        name,
+        hours: Math.round(at.minutes / 60),
+        machines,
+        hoursPerMachine: Math.round(at.minutes / 60 / machines),
+      };
+    })
+    .sort((a, b) => b.hoursPerMachine - a.hoursPerMachine);
 
   return {
     orderId,
@@ -157,7 +182,7 @@ export async function simulateOrder(companyId, orderId, { granularity = 'week' }
     earliestStart: new Date(first).toISOString(),
     finishesAt: new Date(last).toISOString(),
     calendarDays: Math.ceil((last - anchor.getTime()) / 86400000),
-    workHours: Math.round(load.reduce((a, b) => a + b.hours, 0)),
+    workHours: load.reduce((a, b) => a + b.hours, 0),
     load: load.slice(0, 6),
     bottleneck: load[0] ?? null,
     againstCommitted: committed.length,
