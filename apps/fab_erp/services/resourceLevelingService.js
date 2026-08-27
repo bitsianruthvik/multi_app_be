@@ -474,10 +474,80 @@ export async function levelSchedule({
     predsOf.get(e.to).push(e.from);
   }
 
-  // Priority only breaks ties among tasks that are ALREADY ready — it can never
-  // reorder past a precedence edge, because Kahn only offers indegree-0 tasks.
-  // So a high-priority order jumps the queue for a contended machine without any
-  // risk of a task overtaking its own predecessor.
+  /**
+   * A plain topological pass, making no scheduling decision.
+   *
+   * It exists only to prove the graph is acyclic and to give the tail pass below
+   * something to walk backwards. The order that actually decides who gets a
+   * contended machine is built after the tails are known.
+   */
+  const topo = [];
+  {
+    const deg = new Map(indeg);
+    const q = tasks.filter((t) => deg.get(t.id) === 0).map((t) => t.id);
+    while (q.length > 0) {
+      const id = q.shift();
+      topo.push(id);
+      for (const nx of adj.get(id)) {
+        deg.set(nx, deg.get(nx) - 1);
+        if (deg.get(nx) === 0) q.push(nx);
+      }
+    }
+    if (topo.length !== tasks.length) {
+      const stuck = tasks.filter((t) => deg.get(t.id) > 0).map((t) => t.id);
+      throw new Error(
+        `resourceLevelingService.levelSchedule: precedence cycle detected among tasks [${stuck.join(', ')}]`,
+      );
+    }
+  }
+
+  /**
+   * How much work still has to happen after a task, in series.
+   *
+   *   tail(t) = duration(t) + max( tail(s) for every successor s )
+   *
+   * The longest chain of work from t to the end of its order, and therefore a
+   * lower bound on how much longer that order needs once t is done. One reverse
+   * pass, O(V+E) — microseconds even for the nine thousand tasks of a bridge.
+   *
+   * Measured in MINUTES OF WORK through taskMinutes, the same duration the
+   * placer uses, so one long task is not outranked by a pile of short ones. A
+   * count of successors would do exactly that.
+   */
+  const tailOf = new Map();
+  for (let i = topo.length - 1; i >= 0; i -= 1) {
+    const id = topo[i];
+    let longest = 0;
+    for (const nx of adj.get(id)) {
+      const t = tailOf.get(nx) ?? 0;
+      if (t > longest) longest = t;
+    }
+    tailOf.set(id, (taskMinutes(taskById.get(id)) || 0) + longest);
+  }
+
+  /**
+   * Which ready task gets a contended machine.
+   *
+   * Priority first. It can never reorder past a precedence edge, because Kahn
+   * only ever offers indegree-0 tasks — so a rush order jumps the queue with no
+   * risk of a task overtaking its own predecessor.
+   *
+   * THEN THE LONGEST REMAINING CHAIN, and that is the rule that decides when an
+   * order closes. Between orders `priority` already decides; WITHIN one, every
+   * task shares a rank and the winner used to fall through to `seq_no` — a
+   * number that says nothing at all about finishing sooner.
+   *
+   * An order closes when its LAST task finishes. Hand a contended machine to a
+   * short-tail task and the long-tail task waits: its whole chain shifts, and
+   * the close date moves out by exactly that delay. Hand it to the long-tail
+   * task and the short-tail one waits inside slack it already had. So feed the
+   * longest remaining chain first.
+   *
+   * It ignores resource contention deliberately — this is a priority signal, and
+   * making it resource-aware would turn it into the scheduling problem itself.
+   * It also cannot beat the constraint: a station carrying 676 h of work on one
+   * machine bounds the order however cleverly its queue is ordered.
+   */
   const cmp = (a, b) => {
     const ta = taskById.get(a);
     const tb = taskById.get(b);
@@ -490,6 +560,9 @@ export async function levelSchedule({
       const rb = Number.isFinite(pb) ? pb : Number.POSITIVE_INFINITY;
       if (ra !== rb) return ra - rb;
     }
+    const tailA = tailOf.get(a) ?? 0;
+    const tailB = tailOf.get(b) ?? 0;
+    if (tailA !== tailB) return tailB - tailA;
     return (Number(ta.seq_no) || 0) - (Number(tb.seq_no) || 0) || a - b;
   };
 
@@ -503,12 +576,6 @@ export async function levelSchedule({
       indeg.set(nx, indeg.get(nx) - 1);
       if (indeg.get(nx) === 0) ready.push(nx);
     }
-  }
-  if (order.length !== tasks.length) {
-    const stuck = tasks.filter((t) => indeg.get(t.id) > 0).map((t) => t.id);
-    throw new Error(
-      `resourceLevelingService.levelSchedule: precedence cycle detected among tasks [${stuck.join(', ')}]`,
-    );
   }
 
   // ── per-task capacity resolution (cached by resource identity) ─────────────
