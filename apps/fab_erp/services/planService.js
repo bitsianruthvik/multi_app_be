@@ -996,6 +996,94 @@ export async function deleteEntry(companyId, entryId, userId = null) {
 }
 
 /**
+ * Take a whole plan off the board.
+ *
+ * Re-planning means clearing what is there first — `acceptRun` skips any task
+ * already on a bar, so a fresh suggestion lands on nothing until the old plan is
+ * gone. Until this existed the only way to do that was `deleteEntry` in a loop:
+ * sixteen hundred transactions, several minutes, and a mass delete dressed up as
+ * ordinary traffic.
+ *
+ * WHAT IT WILL NOT REMOVE
+ * Bars whose work has started, and bars a human pinned. Started work is the
+ * record of what the shop actually did — retiring it would drop the link between
+ * the plan and the hours booked against it — and a pin is somebody saying "not
+ * this one". Both are counted and returned rather than skipped quietly, so a
+ * re-plan that does not come back empty explains itself.
+ *
+ * DECIDED IN A SELECT, NOT IN THE UPDATE
+ * The obvious form — UPDATE ... WHERE NOT EXISTS (subquery on the same table) —
+ * needs a derived table to satisfy MySQL, which materialises the whole member
+ * table. On TiDB that is how you hit the instance memory limit. Reading the ids
+ * first and writing them in chunks is both cheaper and easier to reason about.
+ *
+ * Scope to `orderIds` for one job's plan; omit it for the whole board. There is
+ * deliberately no implicit "everything" — this is destructive, and the caller
+ * should have to name the blast radius.
+ *
+ * @returns {Promise<{retired:number, keptStarted:number, keptPinned:number}>}
+ */
+export async function retirePlan(companyId, { orderIds = null } = {}, userId = null) {
+  const scoped = Array.isArray(orderIds) && orderIds.length > 0;
+  const params = [companyId];
+  let filter = '';
+  if (scoped) { filter = ' AND e.order_id IN (?)'; params.push(orderIds); }
+
+  const [rows] = await pool.query(
+    `SELECT e.id,
+            e.is_pinned AS isPinned,
+            EXISTS (
+              SELECT 1 FROM fab_plan_entry_tasks et
+               JOIN fab_project_tasks t ON t.id = et.task_id AND t.deleted_at IS NULL
+               WHERE et.company_id = e.company_id AND et.plan_entry_id = e.id
+                 AND et.deleted_at IS NULL AND t.status IN ('in_progress','done')
+            ) AS started
+       FROM fab_plan_entries e
+      WHERE e.company_id = ? AND e.status = 'planned' AND e.deleted_at IS NULL${filter}`,
+    params,
+  );
+
+  let keptStarted = 0;
+  let keptPinned = 0;
+  const doomed = [];
+  for (const r of rows) {
+    if (r.isPinned) { keptPinned += 1; continue; }
+    if (r.started) { keptStarted += 1; continue; }
+    doomed.push(r.id);
+  }
+  if (doomed.length === 0) return { retired: 0, keptStarted, keptPinned };
+
+  const CHUNK = 500;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    let retired = 0;
+    for (let i = 0; i < doomed.length; i += CHUNK) {
+      const ids = doomed.slice(i, i + CHUNK);
+      await conn.query(
+        `UPDATE fab_plan_entry_tasks SET deleted_at = UTC_TIMESTAMP()
+          WHERE company_id = ? AND plan_entry_id IN (?) AND deleted_at IS NULL`,
+        [companyId, ids],
+      );
+      const [res] = await conn.query(
+        `UPDATE fab_plan_entries
+            SET status = 'cancelled', deleted_at = UTC_TIMESTAMP(), updated_by = ?
+          WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+        [userId, companyId, ids],
+      );
+      retired += res.affectedRows ?? 0;
+    }
+    await conn.commit();
+    return { retired, keptStarted, keptPinned };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
  * Unplanned work, for the backlog rail beside the grid.
  *
  * Ordered the same way the engine ranks, so hand-planning down the list and

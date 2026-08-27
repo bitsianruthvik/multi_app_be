@@ -23,7 +23,7 @@ import { logger } from '../../../core/utils/logger.js';
 import { suggestPlan } from '../services/planSuggestionService.js';
 import {
   getPlan, getPlanBoard, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
-  acceptRun, getPlanOrders, savePlanOrderRules, PlanError,
+  acceptRun, retirePlan, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
 import { transformGroup } from '../services/planGroupService.js';
 
@@ -232,6 +232,39 @@ router.post('/plan/accept', protect, async (req, res) => {
     if (err instanceof PlanError) return sendPlanError(res, err);
     logger.error({ err, companyId, runId }, 'plan accept failed');
     return res.status(500).json({ message: 'Failed to accept the suggestion.' });
+  }
+});
+
+/**
+ * POST /plan/retire — take the plan off the board so a fresh one can be accepted.
+ *
+ * Destructive and deliberately explicit: `orderIds` retires one job's plan and
+ * `all: true` is required to clear the whole board, so nothing wipes a plan by
+ * omission. Started and pinned bars are never retired and come back in the count.
+ */
+router.post('/plan/retire', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const orderIds = parseIdList(req.body?.orderIds);
+  if (orderIds.length === 0 && req.body?.all !== true) {
+    return res.status(400).json({
+      message: 'Name the orders to retire, or pass all:true to clear the whole plan.',
+    });
+  }
+
+  try {
+    const result = await retirePlan(companyId, {
+      orderIds: orderIds.length > 0 ? orderIds : null,
+    }, user.id);
+    logger.info({ companyId, ...result }, 'plan retired');
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'plan retire failed');
+    return res.status(500).json({ message: 'Failed to retire the plan.' });
   }
 });
 
