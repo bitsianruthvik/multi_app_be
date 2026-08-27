@@ -25,6 +25,16 @@
 export const NO_CREW_ASSIGNED = 'no_crew_assigned';
 /** Crew (or calendar) exists but yields no working time in the scanned horizon. */
 export const NO_WORKING_TIME = 'no_working_time';
+/**
+ * The operation cannot be interrupted and no single stretch of working time is
+ * long enough to hold it.
+ *
+ * Distinct from NO_WORKING_TIME because the fix is different and the message
+ * should say so: there IS working time, just never enough of it in one go. A
+ * nine-hour bake will not fit an eight-hour shift, whatever next year's calendar
+ * looks like — either the shift gets longer or the operation gets split.
+ */
+export const NO_CONTIGUOUS_WINDOW = 'no_contiguous_window';
 
 export class NoCapacityError extends Error {
   /**

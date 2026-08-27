@@ -144,9 +144,10 @@ async function loadOrderBars(companyId, orderIds) {
   const [members] = await cachedQuery(`SELECT et.plan_entry_id AS entryId, et.task_id AS taskId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS taskStart, et.planned_end AS taskEnd,
-            t.status
+            t.status, op.is_interruptible AS isInterruptible
        FROM fab_plan_entry_tasks et
        JOIN fab_project_tasks t ON t.id = et.task_id AND t.deleted_at IS NULL
+       LEFT JOIN fab_operations op ON op.id = t.operation_id
       WHERE et.company_id = ? AND et.plan_entry_id IN (?) AND et.deleted_at IS NULL
       ORDER BY et.plan_entry_id ASC, et.sort_order ASC, et.id ASC`,
     [companyId, rows.map((r) => r.id)],
@@ -172,6 +173,15 @@ async function loadOrderBars(companyId, orderIds) {
       plannedEnd: m.taskEnd,
     });
     if (m.status === 'in_progress' || m.status === 'done') b.started = true;
+    /**
+     * A bar is uninterruptible if ANY of its members is.
+     *
+     * A bundle runs as one block on the machine, so if one member cannot be
+     * paused then the block cannot be — being conservative in the only
+     * direction that is safe. A missing flag (no operation row) means
+     * interruptible, which is how everything behaved before the column existed.
+     */
+    if (m.isInterruptible === 0) b.contiguous = true;
   }
   return [...byId.values()];
 }
@@ -498,7 +508,9 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
       assigned_resource_id: bar.resourceId ?? null,
       resource_type_id: bar.resourceTypeId ?? null,
     });
-    const span = await placer.place(capSrc, key, units, notBefore, Number(bar.plannedMinutes) || 0);
+    const span = await placer.place(
+      capSrc, key, units, notBefore, Number(bar.plannedMinutes) || 0, !!bar.contiguous,
+    );
     book(bar, span.start, span.end);
     placements.set(bar.id, { start: span.start, end: span.end });
     recordTaskEnds(bar, span.start, span.end);

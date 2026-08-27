@@ -17,7 +17,9 @@ import { pool } from '../../../db.js';
 import { cachedQuery } from './planReadCache.js';
 import { resolveCapacity, capacityIntervals, isUnbounded } from './capacityService.js';
 import { parseDependsOn } from './taskGatingService.js';
-import { NoCapacityError, NO_WORKING_TIME, NO_CREW_ASSIGNED, isNoCapacity } from './schedulingErrors.js';
+import {
+  NoCapacityError, NO_WORKING_TIME, NO_CONTIGUOUS_WINDOW, NO_CREW_ASSIGNED, isNoCapacity,
+} from './schedulingErrors.js';
 import { taskMinutes } from './taskDuration.js';
 
 // ─── edge building (mirrors GET /tasks/graph) ─────────────────────────────────
@@ -326,7 +328,7 @@ async function nextWorkingInstant(companyId, cap, from, cache) {
  * list of wall-clock in-shift intervals the task actually consumes (used for
  * concurrency checks). Walks the calendar in chunks via workingIntervalsInWindow.
  */
-async function computeSpan(companyId, cap, from, durationMin, cache) {
+async function computeSpan(companyId, cap, from, durationMin, cache, contiguous = false) {
   if (isUnbounded(cap)) {
     // 24/7 fallback: working minutes == wall-clock minutes.
     const start = new Date(from.getTime());
@@ -347,8 +349,13 @@ async function computeSpan(companyId, cap, from, durationMin, cache) {
   while (remaining > 1e-9) {
     if (scanned > MAX_SCAN_MS) {
       throw new NoCapacityError({
-        reason: NO_WORKING_TIME,
+        // A task that cannot be interrupted and is longer than any single
+        // stretch of working time can never be placed — a nine-hour bake will
+        // not fit an eight-hour shift, whatever the calendar does next year.
+        // Saying that is far more use than "no working time found".
+        reason: contiguous ? NO_CONTIGUOUS_WINDOW : NO_WORKING_TIME,
         from,
+        durationMin,
         scanDays: MAX_SCAN_MS / 86400000,
         calendarIds: cap?.calendarIds ?? [],
       });
@@ -364,7 +371,25 @@ async function computeSpan(companyId, cap, from, durationMin, cache) {
       if (remaining <= lenMin + 1e-9) {
         const end = new Date(iv.start.getTime() + remaining * 60000);
         occupied.push({ start: new Date(iv.start.getTime()), end });
-        return { start: started, end, intervals: occupied };
+        return { start: contiguous ? new Date(iv.start.getTime()) : started, end, intervals: occupied };
+      }
+      /**
+       * An operation that cannot be paused does not spill into tomorrow.
+       *
+       * The default is to consume working time until the duration is used up, so
+       * a five-hour task with two and a half hours of the day left takes two and
+       * a half hours today and the rest tomorrow. That is right for cutting and
+       * welding and wrong for anything that cannot be stopped once begun — a
+       * galvanising dip, a paint bake, a stress-relief cycle. Those wait for a
+       * stretch of working time long enough to hold the whole of them.
+       *
+       * So a too-short interval is skipped rather than partly consumed, and the
+       * search moves on to the next one.
+       */
+      if (contiguous) {
+        started = null;
+        occupied.length = 0;
+        continue;
       }
       occupied.push({ start: new Date(iv.start.getTime()), end: new Date(iv.end.getTime()) });
       remaining -= lenMin;
@@ -628,6 +653,13 @@ export async function levelSchedule({
     // Per-piece × pieces. See taskDuration — the formula is a cycle time, so a
     // task covering 20 flanges used to be scheduled as though it were one.
     const durationMin = taskMinutes(task);
+    /**
+     * Can this operation be paused at the end of a shift?
+     *
+     * Absent (an older caller that does not select the column) means yes, which
+     * is exactly how the scheduler has always behaved.
+     */
+    const contiguous = task.is_interruptible === 0 || task.is_interruptible === false;
 
     let earliest = anchorDate;
     for (const pid of predsOf.get(id)) {
@@ -665,7 +697,7 @@ export async function levelSchedule({
     let span;
     if (key === null || !(capacity < Infinity) || durationMin <= 0) {
       // Unconstrained (or zero-length): schedule at precedence-earliest.
-      span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin, ivCache));
+      span = await withContext(() => computeSpan(companyId, capSrc, earliest, durationMin, ivCache, contiguous));
     } else {
       const state = resourceState.get(key) ?? newResourceState();
       const existing = state.ivs;
@@ -684,7 +716,7 @@ export async function levelSchedule({
       const candidates = [...new Set(candTimes)].sort((a, b) => a - b);
       span = null;
       for (const c of candidates) {
-        const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache));
+        const s = await withContext(() => computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache, contiguous));
         // Only the intervals that could touch this placement — see overlapping().
         const near = s.intervals.length === 0 ? [] : overlapping(
           state,
@@ -696,7 +728,7 @@ export async function levelSchedule({
       if (span === null) {
         // Defensive: place strictly after all existing work (guaranteed feasible).
         const latest = candidates[candidates.length - 1];
-        span = await withContext(() => computeSpan(companyId, capSrc, new Date(latest), durationMin, ivCache));
+        span = await withContext(() => computeSpan(companyId, capSrc, new Date(latest), durationMin, ivCache, contiguous));
       }
     }
 
@@ -759,8 +791,8 @@ export function createPlacer(companyId, resourceCapacity) {
      * after `notBefore` — ignoring concurrency. What a bar ALREADY on the plan
      * occupies, so it can be booked or lifted out.
      */
-    async span(capSrc, notBefore, durationMin) {
-      return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+    async span(capSrc, notBefore, durationMin, contiguous = false) {
+      return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache, contiguous);
     },
 
     /**
@@ -769,9 +801,9 @@ export function createPlacer(companyId, resourceCapacity) {
      * every booking at or after it — the leveller's own search, which terminates
      * because the last candidate lies beyond all existing work.
      */
-    async place(capSrc, key, capacity, notBefore, durationMin) {
+    async place(capSrc, key, capacity, notBefore, durationMin, contiguous = false) {
       if (key === null || !(capacity < Infinity) || durationMin <= 0) {
-        return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+        return computeSpan(companyId, capSrc, notBefore, durationMin, ivCache, contiguous);
       }
       const st = stateFor(key);
       const from = notBefore.getTime();
@@ -782,7 +814,7 @@ export function createPlacer(companyId, resourceCapacity) {
       }
       let fallback = null;
       for (const c of [...new Set(cand)].sort((a, b) => a - b)) {
-        const s = await computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache);
+        const s = await computeSpan(companyId, capSrc, new Date(c), durationMin, ivCache, contiguous);
         fallback = s;
         const near = s.intervals.length === 0 ? [] : overlapping(
           st, s.intervals[0].start.getTime(), s.intervals[s.intervals.length - 1].end.getTime(),
@@ -790,7 +822,7 @@ export function createPlacer(companyId, resourceCapacity) {
         if (feasible(near, s.intervals, capacity)) return s;
       }
       // Unreachable in practice: the last candidate is past everything booked.
-      return fallback ?? computeSpan(companyId, capSrc, notBefore, durationMin, ivCache);
+      return fallback ?? computeSpan(companyId, capSrc, notBefore, durationMin, ivCache, contiguous);
     },
   };
 }

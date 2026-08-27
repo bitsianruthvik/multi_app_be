@@ -5813,3 +5813,20 @@ SET @sql = IF(@col = 0,
   'ALTER TABLE fab_plan_run_items ADD COLUMN task_times TEXT DEFAULT NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Add is_interruptible to fab_operations
+-- Whether this operation may be paused at the end of a shift and resumed on the
+-- next. Default 1, which is what the scheduler has always assumed: a five-hour
+-- task starting with two and a half hours of the day left took two and a half
+-- hours today and the rest tomorrow. True for cutting, drilling, welding.
+-- FALSE for anything that cannot be stopped once begun — a galvanising dip, a
+-- paint bake, a stress-relief cycle. Those must fit inside one continuous
+-- stretch of working time or wait for one that fits.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_operations'
+              AND COLUMN_NAME  = 'is_interruptible');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_operations ADD COLUMN is_interruptible TINYINT(1) NOT NULL DEFAULT 1',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

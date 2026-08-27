@@ -66,7 +66,7 @@ async function loadPlanningTasks(companyId) {
             t.resource_type_id, t.assigned_resource_id, t.status,
             t.computed_hours, t.setup_hours, t.task_qty, t.started_at, t.operation_id,
             i.parent_item_id, i.name AS item_name,
-            op.name AS operation_name,
+            op.name AS operation_name, op.is_interruptible,
             o.order_number, o.priority_rank, o.priority, o.required_date, o.must_finish_by
        FROM fab_project_tasks t
        LEFT JOIN fab_items i     ON i.id = t.item_id AND i.deleted_at IS NULL
