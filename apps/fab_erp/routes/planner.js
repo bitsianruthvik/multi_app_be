@@ -26,6 +26,7 @@ import {
   acceptRun, retirePlan, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
 import { withDragSession, endDragSession } from '../services/planDragSession.js';
+import { replanFromNow, simulateOrder } from '../services/planReplanService.js';
 import { transformGroup } from '../services/planGroupService.js';
 
 const router = Router();
@@ -266,6 +267,69 @@ router.post('/plan/retire', protect, async (req, res) => {
     if (err instanceof PlanError) return sendPlanError(res, err);
     logger.error({ err, companyId }, 'plan retire failed');
     return res.status(500).json({ message: 'Failed to retire the plan.' });
+  }
+});
+
+/**
+ * POST /plan/replan — the world moved; make the plan true again.
+ *
+ * One action for a changed shift pattern, somebody going on leave, or a morning
+ * that simply did not happen. Retires everything not started and not pinned,
+ * re-levels the rest from the planning floor, and accepts it. Started work stays
+ * exactly where it is and still occupies its machine.
+ *
+ * Destructive in the same sense as /plan/retire, and deliberately a POST with no
+ * arguments needed: there is one obvious thing to mean.
+ */
+router.post('/plan/replan', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const granularity = ['day', 'week', 'month'].includes(req.body?.granularity)
+    ? req.body.granularity
+    : 'week';
+
+  try {
+    const result = await replanFromNow(companyId, { granularity }, user.id);
+    logger.info({ companyId, ...result, skipped: result.skipped.length }, 'plan re-planned from now');
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'replan failed');
+    return res.status(500).json({ message: 'Could not re-plan.' });
+  }
+});
+
+/**
+ * GET /plan/simulate?orderId= — when would this order finish, if we took it?
+ *
+ * Writes nothing. The order's tasks are levelled against the committed plan held
+ * fixed, so the answer accounts for everything already promised rather than
+ * describing an empty shop.
+ */
+router.get('/plan/simulate', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const orderId = Number(req.query.orderId);
+  if (!Number.isFinite(orderId) || orderId <= 0) {
+    return res.status(400).json({ message: 'orderId is required and must be a positive integer.' });
+  }
+  const granularity = ['day', 'week', 'month'].includes(req.query.granularity)
+    ? req.query.granularity
+    : 'week';
+
+  try {
+    const result = await simulateOrder(companyId, orderId, { granularity });
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId, orderId }, 'order simulation failed');
+    return res.status(500).json({ message: 'Could not work out a date for that order.' });
   }
 });
 
