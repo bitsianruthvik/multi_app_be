@@ -854,6 +854,8 @@ export async function transformGroup(companyId, input, userId = null) {
   let yielded = 0;
   let settled = 0;
   let unresolved = 0;
+  /** entryId -> why it is where it is. See the placements returned below. */
+  const whyById = new Map();
   if (input.cascade && input.op !== 'restore') {
     const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
     const repair = await cascadeRepair(companyId, {
@@ -862,6 +864,7 @@ export async function transformGroup(companyId, input, userId = null) {
     yielded = repair.yielded ?? 0;
     settled = repair.settled ?? 0;
     unresolved = repair.unresolved ?? 0;
+    for (const [id, why] of repair.reasons ?? []) whyById.set(id, why);
     if (repair.capped) {
       throw new PlanError(
         'CASCADE_TOO_LARGE',
@@ -964,21 +967,48 @@ export async function transformGroup(companyId, input, userId = null) {
     plannedStart: e.start.toISOString(),
     plannedEnd: e.end.toISOString(),
   }));
+  /**
+   * Every bar this transform touches, and WHY.
+   *
+   *   unit     you dragged it
+   *   settle   it is yours, and it waited for a gap instead of landing on the drop
+   *   cascade  it depends on yours, so it had to follow
+   *   yield    it depends on nothing of yours; your move filled its machine
+   *
+   * The counts were already returned and the board showed them; what it could
+   * not show was which bars, or where they went, because that needed a reason
+   * per bar rather than four totals.
+   */
+  const unitIds = new Set(entryIds);
   const placements = entries.map((e) => {
     const p = proposed.get(e.id);
+    const why = whyById.get(e.id) ?? (unitIds.has(e.id) ? 'unit' : 'cascade');
     return {
       entryId: e.id,
       plannedStart: p.start.toISOString(),
       plannedEnd: p.end.toISOString(),
       held: !!p.held,
+      why,
     };
   });
 
+  /**
+   * The three counts come from the SAME per-bar reasons the board draws, so the
+   * sentence and the picture cannot disagree.
+   *
+   * They did. `cascadedCount` was the length of the list of bars this transform
+   * pulled in beyond the unit — which is cascaded AND yielded work together, so
+   * a drag that pushed 206 dependants and shoved 37 unrelated bars aside
+   * reported "243 downstream" and then listed 37 of them as something else.
+   */
+  const tally = { unit: 0, settle: 0, cascade: 0, yield: 0 };
+  for (const pl of placements) tally[pl.why] = (tally[pl.why] ?? 0) + 1;
+
   if (input.dryRun) {
-    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
+    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: tally.cascade, yieldedCount: tally.yield, settledCount: tally.settle, placements, previous, warnings };
   }
   if (moved.length === 0) {
-    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
+    return { applied: false, movedCount: 0, unitSize, cascadedCount: tally.cascade, yieldedCount: tally.yield, settledCount: tally.settle, placements, previous, warnings };
   }
 
   const tz = await plannerTimezone(companyId);
@@ -1030,5 +1060,5 @@ export async function transformGroup(companyId, input, userId = null) {
     conn.release();
   }
 
-  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
+  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: tally.cascade, yieldedCount: tally.yield, settledCount: tally.settle, placements, previous, warnings };
 }

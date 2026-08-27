@@ -409,11 +409,11 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
   // No early exit when nothing is downstream: a move can congest a machine
   // without having a single dependant, and that is exactly what yielding is for.
   if (affected.length === 0 && !yieldFree) {
-    return { placements: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0, examined: 0, capped: false };
+    return { placements: new Map(), reasons: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0, examined: 0, capped: false };
   }
   if (affected.length > MAX_CASCADE) {
     return {
-      placements: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0,
+      placements: new Map(), reasons: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0,
       examined: affected.length, capped: true,
     };
   }
@@ -481,6 +481,13 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
 
   // ── where everything currently sits, as this run has it ────────────────────
   const placements = new Map();
+  /**
+   * Why each bar ended up where it did — 'cascade', 'yield' or 'settle'.
+   *
+   * The counts alone told a planner that 39 bars moved and nothing about which
+   * or where. The board draws the ripple from this.
+   */
+  const reasons = new Map();
   const posOf = (bar) => placements.get(bar.id) ?? proposed.get(bar.id) ?? { start: bar.start, end: bar.end };
 
   /** Re-place one bar at or after `notBefore`, keeping the books straight. */
@@ -538,17 +545,17 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         continue;
       }
       await replaceBar(bar, floor);
+      // Our own bar pushed back behind its predecessors is the unit settling,
+      // not somebody else's work following it.
+      reasons.set(id, proposed.has(id) ? 'settle' : 'cascade');
       movedNow.push(id);
     }
     return movedNow;
   };
 
-  let cascaded = (await repairPrecedence(affected)).length;
+  await repairPrecedence(affected);
 
   // ── make room, where the move is what filled it ────────────────────────────
-  let yielded = 0;
-  /** Bars of the moved unit that slid forward into a gap rather than displacing. */
-  let settled = 0;
   let unresolved = 0;
   if (yieldFree) {
     const orderMeta = await loadOrderMeta(companyId, orderIds);
@@ -627,7 +634,7 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         // Counted apart, because they are different things to report: the unit
         // finding a gap is the planner's own drop settling, while a bar
         // stepping aside is somebody else's work being disturbed.
-        if (ours.has(victim.id)) settled += 1; else yielded += 1;
+        reasons.set(victim.id, ours.has(victim.id) ? 'settle' : 'yield');
         acted = true;
 
         // Stepping aside can strand what was waiting on it.
@@ -635,7 +642,7 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
           const b = byId.get(id);
           return b && !isImmovable(b);
         });
-        if (after.length > 0) cascaded += (await repairPrecedence(after)).length;
+        if (after.length > 0) await repairPrecedence(after);
         void key;
         break;
       }
@@ -674,13 +681,35 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
   for (let round = 0; round < MAX_SETTLE_ROUNDS; round += 1) {
     const movedNow = await repairPrecedence(settleIds);
     if (movedNow.length === 0) break;
-    for (const id of movedNow) {
-      if (ourIds.has(id)) settled += 1; else cascaded += 1;
-    }
+  }
+
+  /**
+   * Counted from the reasons, not accumulated as we go.
+   *
+   * The running counters counted MOVES, and the settle loop can move the same
+   * bar in several rounds as the floor beneath it rises — so a drag that
+   * disturbed 206 bars reported 243, and one that made 18 bars wait reported 67.
+   * Overstating what a gesture disturbed is worse than saying nothing: a planner
+   * who is told the shop moved more than it did stops trusting the number.
+   */
+  let cascadedBars = 0;
+  let yieldedBars = 0;
+  let settledBars = 0;
+  for (const why of reasons.values()) {
+    if (why === 'yield') yieldedBars += 1;
+    else if (why === 'settle') settledBars += 1;
+    else cascadedBars += 1;
   }
 
   return {
-    placements, cascaded, yielded, settled, unresolved, examined: affected.length, capped: false,
+    placements,
+    reasons,
+    cascaded: cascadedBars,
+    yielded: yieldedBars,
+    settled: settledBars,
+    unresolved,
+    examined: affected.length,
+    capped: false,
   };
 }
 
