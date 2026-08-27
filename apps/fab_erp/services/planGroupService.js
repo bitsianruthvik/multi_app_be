@@ -773,6 +773,7 @@ export async function transformGroup(companyId, input, userId = null) {
         unitSize,
         cascadedCount: 0,
         yieldedCount: 0,
+        settledCount: 0,
         placements: entries.map((e) => ({
           entryId: e.id,
           plannedStart: e.start.toISOString(),
@@ -819,6 +820,7 @@ export async function transformGroup(companyId, input, userId = null) {
    */
   let cascaded = [];
   let yielded = 0;
+  let settled = 0;
   let unresolved = 0;
   if (input.cascade && input.op !== 'restore') {
     const orderIds = [...new Set(entries.map((e) => e.orderId).filter((x) => x != null))];
@@ -826,6 +828,7 @@ export async function transformGroup(companyId, input, userId = null) {
       proposed, preds: dag.preds, orderIds, yieldFree: !!input.yieldFree,
     });
     yielded = repair.yielded ?? 0;
+    settled = repair.settled ?? 0;
     unresolved = repair.unresolved ?? 0;
     if (repair.capped) {
       throw new PlanError(
@@ -837,9 +840,20 @@ export async function transformGroup(companyId, input, userId = null) {
     if (repair.placements.size > 0) {
       const extra = await loadEntries(companyId, [...repair.placements.keys()]);
       for (const e of extra) {
-        if (proposed.has(e.id)) continue;
+        const place = repair.placements.get(e.id);
+        /**
+         * A bar of the moved unit that settled into a gap.
+         *
+         * The repair is allowed to re-place the planner's own bars now — that
+         * is what gaps-first means — so its answer has to REPLACE the raw drop
+         * rather than be skipped as a duplicate. Skipping it, which is what
+         * this did while only other people's work could be moved, would write
+         * the position the planner released at and quietly discard the one the
+         * repair found legal.
+         */
+        if (proposed.has(e.id)) { proposed.set(e.id, place); continue; }
         entries.push(e);
-        proposed.set(e.id, repair.placements.get(e.id));
+        proposed.set(e.id, place);
         cascaded.push(e.id);
       }
     }
@@ -929,10 +943,10 @@ export async function transformGroup(companyId, input, userId = null) {
   });
 
   if (input.dryRun) {
-    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
+    return { applied: false, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
   }
   if (moved.length === 0) {
-    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
+    return { applied: false, movedCount: 0, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
   }
 
   const tz = await plannerTimezone(companyId);
@@ -984,5 +998,5 @@ export async function transformGroup(companyId, input, userId = null) {
     conn.release();
   }
 
-  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, placements, previous, warnings };
+  return { applied: true, movedCount: moved.length, unitSize, cascadedCount: cascaded.length, yieldedCount: yielded, settledCount: settled, placements, previous, warnings };
 }

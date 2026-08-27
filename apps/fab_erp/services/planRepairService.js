@@ -42,9 +42,24 @@
  *   increases a start — so it cannot oscillate, and it never quietly pulls
  *   untouched work earlier.
  *
- *   THE LEAST IMPORTANT ONE YIELDS. Ordered by the order's priority_rank
- *   (unranked last), then its due date, then the later start. Without that,
- *   "something moves" is a coin flip and a rush job gives way to routine work.
+ *   THE LEAST IMPORTANT ONE YIELDS — INCLUDING THE BAR BEING DRAGGED. Ordered
+ *   by the order's priority_rank (unranked last), then its due date, then the
+ *   later start. The planner's own bar is ranked alongside everything else in
+ *   the jam rather than exempted from it, and that single fact is what makes a
+ *   drop mean "put this around here" instead of "put this exactly here and
+ *   shove whatever is in the way".
+ *
+ *   So a routine girder dropped onto a busy machine SETTLES INTO THE NEXT GAP,
+ *   leaving the shop alone; a rush job dropped on the same machine displaces
+ *   the routine work instead. Gaps first, rank breaks ties. Both outcomes come
+ *   out of the same comparison, which is why there is no separate policy to
+ *   keep in step.
+ *
+ *   Its limit is what this function can repair: bars belonging to the orders in
+ *   scope. Work from an order that is not part of the move is occupancy only —
+ *   it cannot be asked to yield, so the mover always waits for a gap around it.
+ *   Displacing it would mean pulling that order's whole graph into the drag,
+ *   which is the multi-order re-level this file exists to avoid.
  *
  * It cannot invent capacity. On a lane that is already saturated a bump only
  * moves the congestion along, so the loop stops after MAX_YIELD_HOPS and says
@@ -375,11 +390,11 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
   // No early exit when nothing is downstream: a move can congest a machine
   // without having a single dependant, and that is exactly what yielding is for.
   if (affected.length === 0 && !yieldFree) {
-    return { placements: new Map(), cascaded: 0, yielded: 0, unresolved: 0, examined: 0, capped: false };
+    return { placements: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0, examined: 0, capped: false };
   }
   if (affected.length > MAX_CASCADE) {
     return {
-      placements: new Map(), cascaded: 0, yielded: 0, unresolved: 0,
+      placements: new Map(), cascaded: 0, yielded: 0, settled: 0, unresolved: 0,
       examined: affected.length, capped: true,
     };
   }
@@ -501,6 +516,8 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
 
   // ── make room, where the move is what filled it ────────────────────────────
   let yielded = 0;
+  /** Bars of the moved unit that slid forward into a gap rather than displacing. */
+  let settled = 0;
   let unresolved = 0;
   if (yieldFree) {
     const orderMeta = await loadOrderMeta(companyId, orderIds);
@@ -530,12 +547,23 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         const hit = firstCausedOverload(onLane, units, ours);
         if (!hit) continue;
 
-        // The least important bar in the jam that is not the planner's own, has
-        // not already stepped aside once, and is allowed to move at all.
+        /**
+         * The least important bar in the jam, the planner's own included.
+         *
+         * Excluding the dragged bar here is what used to make a drop mean
+         * "exactly here, and everything else move" — the mover could never be
+         * the one that gave way, so it always won every collision regardless of
+         * whose work it landed on. Ranking it with the rest is the whole of the
+         * gaps-first rule.
+         *
+         * Still one step each: a bar that has already given way is out of the
+         * running, which together with forward-only placement is what makes the
+         * loop terminate rather than trading a slot back and forth.
+         */
         let victim = null;
         let victimKey = null;
         for (const entry of hit.live) {
-          if (ours.has(entry.id) || bumped.has(entry.id)) continue;
+          if (bumped.has(entry.id)) continue;
           const bar = movable.get(entry.id);
           if (!bar) continue;
           const k = yieldOrder({ ...bar, start: entry.start }, orderMeta);
@@ -546,7 +574,10 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         // Forward only: at or after where it already was, never earlier.
         await replaceBar(victim, new Date(Math.max(hit.at.getTime(), posOf(victim).start.getTime())));
         bumped.add(victim.id);
-        yielded += 1;
+        // Counted apart, because they are different things to report: the unit
+        // finding a gap is the planner's own drop settling, while a bar
+        // stepping aside is somebody else's work being disturbed.
+        if (ours.has(victim.id)) settled += 1; else yielded += 1;
         acted = true;
 
         // Stepping aside can strand what was waiting on it.
@@ -563,7 +594,7 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
   }
 
   return {
-    placements, cascaded, yielded, unresolved, examined: affected.length, capped: false,
+    placements, cascaded, yielded, settled, unresolved, examined: affected.length, capped: false,
   };
 }
 
