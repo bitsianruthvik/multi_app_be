@@ -292,7 +292,110 @@ function bundleSchedule(tasks, schedule, edgeSet, { bundling = true } = {}) {
     flush();
   }
 
-  return bars.sort((a, b) => a.start - b.start || a.bundleKey.localeCompare(b.bundleKey));
+  return splitCyclicBars(bars, edgeSet)
+    .sort((a, b) => a.start - b.start || a.bundleKey.localeCompare(b.bundleKey));
+}
+
+/**
+ * Find one cycle in a directed graph, or null. Iterative — a plan has thousands
+ * of bars and a recursive walk would run out of stack on the deep ones.
+ */
+function findCycle(out, size) {
+  const WHITE = 0; const GREY = 1; const BLACK = 2;
+  const colour = new Array(size).fill(WHITE);
+  const parent = new Array(size).fill(-1);
+  for (let root = 0; root < size; root += 1) {
+    if (colour[root] !== WHITE) continue;
+    const stack = [[root, 0]];
+    colour[root] = GREY;
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const node = frame[0];
+      const kids = out.get(node) ?? [];
+      if (frame[1] >= kids.length) { colour[node] = BLACK; stack.pop(); continue; }
+      const next = kids[frame[1]];
+      frame[1] += 1;
+      if (colour[next] === GREY) {
+        // Walk the grey path back from `node` to `next`: that is the cycle.
+        const cycle = [next];
+        for (let at = node; at !== -1 && at !== next; at = parent[at]) cycle.push(at);
+        return cycle;
+      }
+      if (colour[next] === WHITE) {
+        colour[next] = GREY;
+        parent[next] = node;
+        stack.push([next, 0]);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Break any bar that makes the BAR graph cyclic.
+ *
+ * The task graph is a DAG, but bundling CONTRACTS it — and contracting a DAG can
+ * produce a cycle. Put a task that feeds bar B into bar A, and a different task
+ * of B that feeds something in A, and now A must precede B and B must precede A.
+ *
+ * Nothing downstream can cope with that. The repair sorts bars topologically and
+ * Kahn silently DROPS cyclic nodes, so those bars are never re-placed at all, and
+ * the DAG gate then refuses the drag over a violation nothing was able to fix.
+ * On the production plan of 2026-08-27 this produced 24 such pairs and made
+ * segment-level dragging impossible — 0 of 16 attempts allowed, while part-level
+ * drags, which happened not to touch a knot, were 16 of 16.
+ *
+ * So stop drawing them. A bar on a cycle is split into one bar per task, which
+ * always terminates: a cycle among single-task bars would mean a cycle in the
+ * task graph itself, which is a different bug in a different place. The largest
+ * bar on the cycle is split first, being the one most likely to be tying two
+ * levels of the BOM together.
+ *
+ * The cost is small and local. Only what is actually tangled is split; the
+ * batching everywhere else is untouched.
+ */
+function splitCyclicBars(bars, edgeSet) {
+  const MAX_SPLITS = 200;
+  let working = bars;
+
+  for (let round = 0; round < MAX_SPLITS; round += 1) {
+    const barOfTask = new Map();
+    working.forEach((bar, i) => { for (const m of bar.members) barOfTask.set(m.task.id, i); });
+
+    const out = new Map();
+    for (let i = 0; i < working.length; i += 1) out.set(i, []);
+    const seen = new Set();
+    for (const key of edgeSet) {
+      const arrow = key.indexOf('->');
+      const from = barOfTask.get(Number(key.slice(0, arrow)));
+      const to = barOfTask.get(Number(key.slice(arrow + 2)));
+      if (from == null || to == null || from === to) continue;
+      const k = from + '->' + to;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.get(from).push(to);
+    }
+
+    const cycle = findCycle(out, working.length);
+    if (!cycle) return working;
+
+    let victim = cycle[0];
+    for (const i of cycle) {
+      if (working[i].members.length > working[victim].members.length) victim = i;
+    }
+    // Every bar on the cycle is a single task: see the note above.
+    if (working[victim].members.length < 2) return working;
+
+    const bar = working[victim];
+    const singles = bar.members.map((m, n) => ({
+      bundleKey: bar.bundleKey + '~' + n,
+      members: [m],
+      start: new Date(m.span.start.getTime()),
+      end: new Date(m.span.end.getTime()),
+    }));
+    working = working.slice(0, victim).concat(singles, working.slice(victim + 1));
+  }
+  return working;
 }
 
 // ─── entry point ──────────────────────────────────────────────────────────────

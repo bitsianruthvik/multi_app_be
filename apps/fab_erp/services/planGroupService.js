@@ -400,6 +400,42 @@ async function checkDag(companyId, entries, proposed, dag) {
   // Task-level, not bar-level, on both sides of every comparison.
   const inside = proposedTaskSpans(entries, proposed);
 
+  /**
+   * Do two bars depend on EACH OTHER?
+   *
+   * It sounds impossible and it is not. Bundling contracts the task graph into
+   * bars, and contracting a DAG can produce a cycle: a task that feeds bar B
+   * sits in bar A, while a different task of B feeds something else in A. The
+   * task graph is still acyclic; the BAR graph is not.
+   *
+   * No arrangement of two such bars satisfies both directions, so no move a
+   * planner makes can ever be legal across that pair. Refusing for it means
+   * refusing every drag near it, for ever. The production plan of 2026-08-27
+   * had 24 such pairs and segment-level dragging was impossible: 0 of 16.
+   *
+   * So the gate steps over these edges. It exists to refuse what the MOVE
+   * breaks, not to punish a planner for how the bundler drew the bars. The
+   * bundler no longer produces them — see planSuggestionService.splitCyclicBars
+   * — and this keeps plans built before that fix usable.
+   */
+  const taskIdsOf = new Map(entries.map((x) => [x.id, x.taskIds.map(Number)]));
+  const mutualCache = new Map();
+  const feeds = (fromBar, toBar) => {
+    const from = new Set(taskIdsOf.get(fromBar) ?? []);
+    if (from.size === 0) return false;
+    for (const t of taskIdsOf.get(toBar) ?? []) {
+      for (const pr of dag.preds.get(t) ?? []) if (from.has(Number(pr))) return true;
+    }
+    return false;
+  };
+  const mutuallyDependent = (a, b) => {
+    const k = a < b ? a + '|' + b : b + '|' + a;
+    if (mutualCache.has(k)) return mutualCache.get(k);
+    const res = feeds(a, b) && feeds(b, a);
+    mutualCache.set(k, res);
+    return res;
+  };
+
   const refusals = [];
   for (const e of entries) {
     const place = proposed.get(e.id);
@@ -429,6 +465,8 @@ async function checkDag(companyId, entries, proposed, dag) {
           ));
           continue;
         }
+        // A knot the bundler tied, not one this move made. See above.
+        if (predEntry != null && mutuallyDependent(e.id, predEntry)) continue;
         if (end.getTime() > at.start.getTime() + DAG_TOLERANCE_MS) {
           refusals.push(refusal(
             'PREDECESSOR_LATER',
