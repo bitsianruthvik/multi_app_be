@@ -52,7 +52,7 @@ import { taskMinutes } from './taskDuration.js';
 import { resolveCapacityForResource, capacityIntervals, isUnbounded } from './capacityService.js';
 import { zonedYMD } from './plantTime.js';
 import { PlanError, plannerTimezone } from './planService.js';
-import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
+import { apportionEntry, taskPlannedSpans, remapMemberTimesBulk } from './planTaskSpan.js';
 import { resolveUnitEntries, assertContains } from './planUnitService.js';
 import { cascadeRepair, MAX_CASCADE } from './planRepairService.js';
 
@@ -916,17 +916,43 @@ export async function transformGroup(companyId, input, userId = null) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    for (const e of moved) {
-      const p = proposed.get(e.id);
+    /**
+     * Written in chunks, not one bar at a time.
+     *
+     * A cascade of a few hundred bars used to be a few hundred UPDATEs plus a
+     * SELECT-and-UPDATE per member on top — twenty-five seconds on the real
+     * plan, during which the board showed nothing. A CASE per column writes a
+     * whole chunk in one statement.
+     */
+    const WRITE_CHUNK = 100;
+    for (let i = 0; i < moved.length; i += WRITE_CHUNK) {
+      const batch = moved.slice(i, i + WRITE_CHUNK);
+      const ids = batch.map((e) => e.id);
+      const starts = [];
+      const ends = [];
+      const dates = [];
+      for (const e of batch) {
+        const p = proposed.get(e.id);
+        starts.push(e.id, toDateTimeStr(p.start));
+        ends.push(e.id, toDateTimeStr(p.end));
+        dates.push(e.id, zonedYMD(p.start, tz));
+      }
+      const cases = batch.map(() => 'WHEN ? THEN ?').join(' ');
       await conn.query(
         `UPDATE fab_plan_entries
-            SET planned_start = ?, planned_end = ?, plan_date = ?, updated_by = ?
-          WHERE company_id = ? AND id = ? AND status = 'planned' AND deleted_at IS NULL`,
-        [toDateTimeStr(p.start), toDateTimeStr(p.end), zonedYMD(p.start, tz), userId, companyId, e.id],
+            SET planned_start = CASE id ${cases} END,
+                planned_end   = CASE id ${cases} END,
+                plan_date     = CASE id ${cases} END,
+                updated_by = ?
+          WHERE company_id = ? AND id IN (?) AND status = 'planned' AND deleted_at IS NULL`,
+        [...starts, ...ends, ...dates, userId, companyId, ids],
       );
-      // Same transaction as the bar it belongs to. See remapMemberTimes.
-      await remapMemberTimes(conn, companyId, e.id, e.start, e.end, p.start, p.end);
     }
+    // Members travel with their bars, in the same transaction. See planTaskSpan.
+    await remapMemberTimesBulk(conn, companyId, moved.map((e) => {
+      const p = proposed.get(e.id);
+      return { entryId: e.id, oldStart: e.start, oldEnd: e.end, newStart: p.start, newEnd: p.end };
+    }));
     await conn.commit();
   } catch (err) {
     await conn.rollback();

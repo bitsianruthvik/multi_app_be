@@ -294,3 +294,63 @@ export async function remapMemberTimes(conn, companyId, entryId, oldStart, oldEn
 function toDateTime(d) {
   return new Date(d).toISOString().slice(0, 19).replace('T', ' ');
 }
+
+/**
+ * Carry the members of MANY bars at once.
+ *
+ * The per-bar version costs a SELECT plus an UPDATE per member, and a move that
+ * cascades across a few hundred bars therefore cost a few hundred round trips on
+ * top of the entry writes — about twenty-five seconds on a real plan, with the
+ * board showing nothing at all while it ran.
+ *
+ * Same rule as remapMemberTimes, applied in bulk: reshaped bars have their
+ * layout cleared in one statement, and shifted bars are grouped by how far they
+ * moved, so the whole unit — every bar of which shifts by the same delta —
+ * collapses into a single UPDATE.
+ *
+ * @param {object} conn the transaction's connection
+ * @param {Array<{entryId:number, oldStart:any, oldEnd:any, newStart:any, newEnd:any}>} moves
+ */
+export async function remapMemberTimesBulk(conn, companyId, moves) {
+  const cleared = [];
+  const byShift = new Map();
+  for (const m of moves) {
+    const os = new Date(m.oldStart).getTime();
+    const oe = new Date(m.oldEnd).getTime();
+    const ns = new Date(m.newStart).getTime();
+    const ne = new Date(m.newEnd).getTime();
+    if (![os, oe, ns, ne].every(Number.isFinite)) continue;
+    if (Math.abs((ne - ns) - (oe - os)) > SAME_SHAPE_MS) { cleared.push(m.entryId); continue; }
+    const shift = Math.round((ns - os) / 1000);
+    if (shift === 0) continue;
+    if (!byShift.has(shift)) byShift.set(shift, []);
+    byShift.get(shift).push(m.entryId);
+  }
+
+  const CHUNK = 400;
+  const chunk = (arr) => {
+    const out = [];
+    for (let i = 0; i < arr.length; i += CHUNK) out.push(arr.slice(i, i + CHUNK));
+    return out;
+  };
+
+  for (const ids of chunk(cleared)) {
+    await conn.query(
+      `UPDATE fab_plan_entry_tasks SET planned_start = NULL, planned_end = NULL
+        WHERE company_id = ? AND plan_entry_id IN (?) AND deleted_at IS NULL`,
+      [companyId, ids],
+    );
+  }
+  for (const [shift, all] of byShift) {
+    for (const ids of chunk(all)) {
+      await conn.query(
+        `UPDATE fab_plan_entry_tasks
+            SET planned_start = DATE_ADD(planned_start, INTERVAL ? SECOND),
+                planned_end   = DATE_ADD(planned_end,   INTERVAL ? SECOND)
+          WHERE company_id = ? AND plan_entry_id IN (?) AND deleted_at IS NULL
+            AND planned_start IS NOT NULL`,
+        [shift, shift, companyId, ids],
+      );
+    }
+  }
+}
