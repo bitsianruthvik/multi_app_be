@@ -161,6 +161,34 @@ const CHUNK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SCAN_MS = 366 * 24 * 60 * 60 * 1000;
 
 /**
+ * How coarsely a task's remaining chain is compared when two are ready at once.
+ *
+ * NOT a detail. Comparing tails to the minute orders the queue by a number that
+ * differs slightly between siblings — the four girders of a span have almost, but
+ * not exactly, the same work after them. That scatters same-operation siblings
+ * through time, and the bundler batches by "members that touch in time", so the
+ * batches fall apart. Measured on the production order: comparing exactly gave
+ * 6,445 bars at 1.37 tasks each, against 3,579 at 2.47 for the seq_no rule it
+ * replaced. Thousands of extra setups bought with a day of makespan is a trade
+ * no shop would take.
+ *
+ * Rounding to four hours keeps genuinely different chains ordered while leaving
+ * siblings adjacent, and it wins on BOTH counts — 2,857 bars at 3.10 tasks each,
+ * and the order closing in 88.4 days against 93.4. Bigger batches pack better, so
+ * the schedule got shorter as well as calmer.
+ *
+ *     exact   6,445 bars   1.37/bar   92.3 days
+ *      60m    3,233        2.74       90.4
+ *     240m    2,857        3.10       88.4   <- here
+ *     480m    3,445        2.57       89.2
+ *    seq_no   3,579        2.47       93.4
+ *
+ * Worth re-measuring if the shift pattern changes shape: the best bucket relates
+ * to how long a working block is, not to anything universal.
+ */
+const TAIL_BUCKET_MIN = 240;
+
+/**
  * Working intervals for one capacity source over one ALIGNED window.
  *
  * ── WHY ALIGNED, AND WHY THIS EXISTS ──────────────────────────────────────
@@ -585,8 +613,8 @@ export async function levelSchedule({
       const rb = Number.isFinite(pb) ? pb : Number.POSITIVE_INFINITY;
       if (ra !== rb) return ra - rb;
     }
-    const tailA = tailOf.get(a) ?? 0;
-    const tailB = tailOf.get(b) ?? 0;
+    const tailA = Math.round((tailOf.get(a) ?? 0) / TAIL_BUCKET_MIN);
+    const tailB = Math.round((tailOf.get(b) ?? 0) / TAIL_BUCKET_MIN);
     if (tailA !== tailB) return tailB - tailA;
     return (Number(ta.seq_no) || 0) - (Number(tb.seq_no) || 0) || a - b;
   };
