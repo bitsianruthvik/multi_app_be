@@ -57,6 +57,7 @@
 //   attributed as `unexplained_idle` instead of falling outside the working day.
 
 import { pool } from '../../../db.js';
+import { shiftWorld } from './shiftCache.js';
 import {
   DEFAULT_TZ, zonedWallClockToUtc, zonedYMD, calendarTimezones, tzForCalendar,
 } from './plantTime.js';
@@ -254,27 +255,20 @@ export async function resolveTaskCalendarIds(companyId, task) {
  * and still live; callers holding a task should prefer resolveTaskCalendarIds().
  */
 export async function resolveCalendarIds(companyId, plantId, explicitCalendarId = null) {
-  if (explicitCalendarId) {
-    const [rows] = await pool.query(
-      `SELECT id FROM fab_shift_calendars
-       WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
-      [explicitCalendarId, companyId],
-    );
-    if (rows.length > 0) return [rows[0].id];
+  // Reads the in-memory snapshot. The widening order below is unchanged; what
+  // changed is that it costs nothing. The scheduler asks this once per resource
+  // per capacity window, which on one drag was eighteen round trips for a table
+  // holding a single row. See shiftCache.js.
+  const world = await shiftWorld(companyId);
+
+  if (explicitCalendarId && world.liveIds.has(Number(explicitCalendarId))) {
+    return [Number(explicitCalendarId)];
   }
   if (plantId) {
-    const [rows] = await pool.query(
-      `SELECT id FROM fab_shift_calendars
-       WHERE company_id = ? AND deleted_at IS NULL AND plant_id = ?`,
-      [companyId, plantId],
-    );
-    if (rows.length > 0) return rows.map(r => r.id);
+    const forPlant = world.byPlant.get(Number(plantId));
+    if (forPlant && forPlant.length > 0) return [...forPlant];
   }
-  const [rows] = await pool.query(
-    `SELECT id FROM fab_shift_calendars WHERE company_id = ? AND deleted_at IS NULL`,
-    [companyId],
-  );
-  return rows.map(r => r.id);
+  return [...world.allIds];
 }
 
 // ─── calendar date-walk ──────────────────────────────────────────────────────
@@ -289,36 +283,32 @@ async function loadCalendarSchedule(companyId, calendarIds, dateFrom, dateTo) {
     return { shiftsByCalendar: {}, calendarDayMap: {} };
   }
 
-  const [shiftRows] = await pool.query(
-    `SELECT id, calendar_id, name, start_time, end_time, working_minutes
-     FROM   fab_shifts
-     WHERE  company_id = ? AND calendar_id IN (?) AND deleted_at IS NULL`,
-    [companyId, calendarIds],
-  );
+  /**
+   * Sliced out of the in-memory snapshot rather than queried — this was two of
+   * the three hottest queries in a drag (see shiftCache.js).
+   *
+   * Fresh containers per call, sharing the row objects: the returned maps are
+   * keyed by the caller's own calendar subset, so they cannot be handed out
+   * wholesale, but every consumer only reads the rows themselves.
+   */
+  const world = await shiftWorld(companyId);
 
   const shiftsByCalendar = {};
-  for (const s of shiftRows) {
-    if (!shiftsByCalendar[s.calendar_id]) shiftsByCalendar[s.calendar_id] = [];
-    shiftsByCalendar[s.calendar_id].push(s);
-  }
+  const calendarDayMap = {};
+  for (const raw of calendarIds) {
+    const calId = Number(raw);
+    const shifts = world.shiftsByCalendar[calId];
+    if (shifts) shiftsByCalendar[calId] = shifts;
 
-  const [dayRows] = await pool.query(
-    `SELECT calendar_id, day_date, is_working
-     FROM   fab_calendar_days
-     WHERE  company_id = ?
-       AND  calendar_id IN (?)
-       AND  day_date BETWEEN ? AND ?
-       AND  deleted_at IS NULL`,
-    [companyId, calendarIds, dateFrom, dateTo],
-  );
-
-  const calendarDayMap = {};   // calendarDayMap[calId][ymd] = boolean(is_working)
-  for (const row of dayRows) {
-    const ymd = row.day_date instanceof Date
-      ? toYMD(row.day_date)
-      : String(row.day_date).slice(0, 10);
-    if (!calendarDayMap[row.calendar_id]) calendarDayMap[row.calendar_id] = {};
-    calendarDayMap[row.calendar_id][ymd] = !!row.is_working;
+    const days = world.daysByCalendar[calId];
+    if (!days) continue;
+    // Kept range-filtered so the contract is exactly what it was, even though
+    // the day-walk only ever looks up dates it actually visits.
+    const inRange = {};
+    for (const ymd of Object.keys(days)) {
+      if (ymd >= dateFrom && ymd <= dateTo) inRange[ymd] = days[ymd];
+    }
+    if (Object.keys(inRange).length > 0) calendarDayMap[calId] = inRange;
   }
 
   return { shiftsByCalendar, calendarDayMap };
