@@ -98,6 +98,15 @@ export const MAX_CASCADE = 4000;
 export const MAX_YIELD_HOPS = 200;
 
 /**
+ * How many times the final settle may sweep before giving up.
+ *
+ * Each sweep moves bars strictly forward and only when they are illegal, so the
+ * process converges; in practice the production plan needs a handful. This is a
+ * guard against a graph that surprises us, not a budget anybody should hit.
+ */
+const MAX_SETTLE_ROUNDS = 12;
+
+/**
  * Overlap below this is rounding, not a precedence problem — see the matching
  * note in planGroupService. Repairing on it would shove bars around to fix
  * something the database cannot represent.
@@ -496,20 +505,32 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
    * break precedence too: the bar that stepped aside may now finish after
    * something that was waiting on it.
    */
+  /**
+   * The earliest this bar may start, given where everything feeding it now sits.
+   *
+   * Predecessors inside the SAME bar are skipped: a bundle's members are
+   * sequenced within it, and comparing a bar against its own contents would
+   * refuse every bundle ever built.
+   */
+  const precedenceFloor = (bar) => {
+    let floor = null;
+    for (const t of bar.taskIds) {
+      for (const pred of preds.get(t) ?? []) {
+        if (bar.taskIds.includes(pred)) continue;
+        const end = taskEnd.get(pred);
+        if (end && (floor === null || end > floor)) floor = end;
+      }
+    }
+    return floor;
+  };
+
   const repairPrecedence = async (ids) => {
     const movedNow = [];
     for (const id of kahn(ids, into, byId)) {
       const bar = byId.get(id);
       if (!bar || isImmovable(bar)) continue;
 
-      let floor = null;
-      for (const t of bar.taskIds) {
-        for (const pred of preds.get(t) ?? []) {
-          if (bar.taskIds.includes(pred)) continue;
-          const end = taskEnd.get(pred);
-          if (end && (floor === null || end > floor)) floor = end;
-        }
-      }
+      const floor = precedenceFloor(bar);
       const at = posOf(bar);
       if (!floor || at.start.getTime() + DAG_TOLERANCE_MS >= floor.getTime()) {
         // Still legal where it is. Leaving it is the whole point.
@@ -581,8 +602,27 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         }
         if (!victim) { unresolved += 1; continue; }
 
-        // Forward only: at or after where it already was, never earlier.
-        await replaceBar(victim, new Date(Math.max(hit.at.getTime(), posOf(victim).start.getTime())));
+        /**
+         * Forward only, and never before what feeds it.
+         *
+         * The precedence floor belongs here and its absence was a real defect:
+         * a bar stepping aside was placed at the first free slot at or after the
+         * congestion, with no reference to its own predecessors. When those
+         * predecessors had ALSO moved in this same repair — which is ordinary,
+         * since the cascade runs first — the bar could land before them, and the
+         * DAG gate then refused the whole drag over a violation the repair had
+         * just created.
+         *
+         * On the dense KEPL plan that made most drags impossible: the repair put
+         * a unit's bar at 03:08 and its predecessor's bar at 04:24 on the same
+         * day, then the gate quite correctly said no.
+         */
+        const floor = precedenceFloor(victim);
+        await replaceBar(victim, new Date(Math.max(
+          hit.at.getTime(),
+          posOf(victim).start.getTime(),
+          floor ? floor.getTime() : 0,
+        )));
         bumped.add(victim.id);
         // Counted apart, because they are different things to report: the unit
         // finding a gap is the planner's own drop settling, while a bar
@@ -600,6 +640,42 @@ export async function cascadeRepair(companyId, { proposed, preds, orderIds, yiel
         break;
       }
       if (!acted) break;
+    }
+  }
+
+  /**
+   * Settle EVERYTHING this repair touched — the unit's own bars included — and
+   * keep going until nothing moves.
+   *
+   * Until now the unit's bars were never precedence-checked: a rigid shift
+   * preserves the order inside a unit, so there was nothing to check. Two things
+   * broke that. Gaps-first lets one bar of a unit settle forward while its
+   * siblings do not, and the cascade can push a bar that is downstream of the
+   * unit but UPSTREAM of another of its bars — a diamond, which heavy bundling
+   * across sibling segments makes ordinary rather than exotic.
+   *
+   * ONE PASS IS NOT ENOUGH, and this is the part that cost an afternoon.
+   * Re-placing a bar does not put it where you asked; it puts it in the first
+   * slot at or after that point where the machine is actually free. So moving a
+   * successor past its predecessor can land it well beyond, and moving the
+   * predecessor afterwards can overtake it again. Watching one bar on the
+   * production plan, it chased a floor that rose every time it landed:
+   * 11-11 14:47 behind 11-12 10:49, then 11-20, then 11-22, then 11-23 03:08
+   * behind 11-23 05:18 — closer each time, never there.
+   *
+   * So it runs to a fixpoint. Every move is strictly forward, and the shop is
+   * finite, so it terminates; the cap is a guard against a graph that surprises
+   * us, not an expected outcome. Ordering the earlier phases to avoid this is
+   * not on offer — the cascade must precede the yield loop, since you cannot
+   * tell what congestion a move caused until its dependants have landed.
+   */
+  const ourIds = new Set(proposed.keys());
+  const settleIds = [...new Set([...ourIds, ...affected])];
+  for (let round = 0; round < MAX_SETTLE_ROUNDS; round += 1) {
+    const movedNow = await repairPrecedence(settleIds);
+    if (movedNow.length === 0) break;
+    for (const id of movedNow) {
+      if (ourIds.has(id)) settled += 1; else cascaded += 1;
     }
   }
 
