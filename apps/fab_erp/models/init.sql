@@ -5830,3 +5830,26 @@ SET @sql = IF(@col = 0,
   'ALTER TABLE fab_operations ADD COLUMN is_interruptible TINYINT(1) NOT NULL DEFAULT 1',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Add resource_id to fab_plan_entry_tasks
+-- WHICH MACHINE this task runs on. On the task, not on the bar: bundling groups
+-- tasks that overlap in time, so one bar can be five members across three
+-- machines at once — 645 of 2,927 production bars carry more work than their own
+-- wall-clock span. A bar is not a machine-sized thing; a task is.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plan_entry_tasks'
+              AND COLUMN_NAME  = 'resource_id');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE fab_plan_entry_tasks ADD COLUMN resource_id INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'fab_plan_entry_tasks'
+              AND INDEX_NAME   = 'idx_fplet_resource');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE fab_plan_entry_tasks ADD INDEX idx_fplet_resource (company_id, resource_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

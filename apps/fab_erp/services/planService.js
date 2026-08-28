@@ -38,6 +38,7 @@ import {
 } from './capacityService.js';
 import { calendarTimezones, zonedYMD, zonedWallClockToUtc, DEFAULT_TZ } from './plantTime.js';
 import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
+import { assignMachines } from './planMachineService.js';
 
 /**
  * The zone the planner's grid, hour labels and plan_date are expressed in.
@@ -790,13 +791,32 @@ export async function acceptRun(companyId, runId, { runItemIds = null, pin = fal
       [userId, companyId, runId],
     );
     await conn.commit();
-    return { accepted: entryRows.length, skipped };
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
   }
+
+  /**
+   * Now give every task a machine.
+   *
+   * After the transaction, not inside it. The assignment is derived from what
+   * was just written and reads it back, so it cannot see the rows until they
+   * are committed — and a failure here leaves a plan that is correct but not
+   * yet split across machines, which is recoverable, where a rollback would
+   * throw away a good plan over a presentational detail.
+   *
+   * The leveller has already held concurrency at or below the machine count, so
+   * this is a colouring pass with nothing to decide. See planMachineService.
+   */
+  let machines = null;
+  try {
+    machines = await assignMachines(companyId);
+  } catch (err) {
+    logger.warn({ err, companyId, runId }, 'plan accepted but machine assignment failed');
+  }
+  return { accepted: entryRows.length, skipped, machines };
 }
 
 /** Move, resize or pin an entry. A move re-checks the DAG gate. */
