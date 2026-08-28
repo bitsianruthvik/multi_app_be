@@ -28,7 +28,9 @@ import {
 import { withDragSession, endDragSession } from '../services/planDragSession.js';
 import { replanFromNow, simulateOrder } from '../services/planReplanService.js';
 import { machineLoad } from '../services/planMachineLoadService.js';
-import { assignMachines } from '../services/planMachineService.js';
+import {
+  assignMachines, assignTasksToMachine, machineAgenda, machinesForTask,
+} from '../services/planMachineService.js';
 import { transformGroup } from '../services/planGroupService.js';
 
 const router = Router();
@@ -396,6 +398,90 @@ router.post('/plan/assign', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId }, 'machine assignment failed');
     return res.status(500).json({ message: 'Could not assign machines.' });
+  }
+});
+
+/**
+ * GET /plan/machine-agenda?machineId=&from=&days= — one machine, day by day.
+ *
+ * The panel beside the day view: what this machine is doing today and what is
+ * coming for the rest of the week, task by task.
+ */
+router.get('/plan/machine-agenda', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const machineId = Number(req.query.machineId);
+  if (!Number.isFinite(machineId) || machineId <= 0) {
+    return res.status(400).json({ message: 'machineId is required.' });
+  }
+  const from = req.query.from ? new Date(req.query.from) : new Date();
+  if (Number.isNaN(from.getTime())) return res.status(400).json({ message: 'from must be an ISO date.' });
+  const days = Math.min(31, Math.max(1, Number(req.query.days) || 7));
+
+  try {
+    const out = await machineAgenda(companyId, { machineId, from, days });
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId, machineId }, 'machine agenda failed');
+    return res.status(500).json({ message: 'Could not read that machine.' });
+  }
+});
+
+/**
+ * GET /plan/task-machines?entryId=&taskId= — where else could this run.
+ *
+ * Its type's machines, each marked free or busy at that task's own times, so the
+ * planner is choosing from what is actually possible rather than guessing.
+ */
+router.get('/plan/task-machines', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const entryId = Number(req.query.entryId);
+  const taskId = Number(req.query.taskId);
+  if (!Number.isFinite(entryId) || !Number.isFinite(taskId)) {
+    return res.status(400).json({ message: 'entryId and taskId are required.' });
+  }
+
+  try {
+    const out = await machinesForTask(companyId, { entryId, taskId });
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'task machine options failed');
+    return res.status(500).json({ message: 'Could not list machines for that task.' });
+  }
+});
+
+/**
+ * POST /plan/assign-task — put named tasks on a particular machine.
+ *
+ * Checked, not trusted: a machine runs one job at a time, so a move that would
+ * double-book it is refused with the job it would have collided with.
+ */
+router.post('/plan/assign-task', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const out = await assignTasksToMachine(companyId, {
+      pairs: Array.isArray(req.body?.pairs) ? req.body.pairs : [],
+      resourceId: req.body?.resourceId,
+    });
+    logger.info({ companyId, ...out }, 'tasks moved to a machine');
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'task machine assignment failed');
+    return res.status(500).json({ message: 'Could not move that work.' });
   }
 });
 
