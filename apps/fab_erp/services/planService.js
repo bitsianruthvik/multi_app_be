@@ -203,6 +203,7 @@ async function loadEntries(companyId, from, to, resourceTypeIds = []) {
   if (entries.length === 0) return [];
 
   const [members] = await cachedQuery(`SELECT et.plan_entry_id AS planEntryId, et.task_id AS taskId,
+            et.resource_id AS machineId,
             et.planned_minutes AS plannedMinutes,
             et.planned_start AS plannedStart, et.planned_end AS plannedEnd,
             t.status, t.seq_no AS seqNo, t.item_id AS itemId,
@@ -1410,8 +1411,27 @@ async function itemAncestry(companyId, itemIds) {
  * derives load from the blocks it already has; the coverage segments below are
  * what it needs from the calendar, and they cost one sweep per lane.
  */
-export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] } = {}) {
-  const lanes = await loadLanes(companyId, resourceTypeIds);
+export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [], lanesBy = 'type' } = {}) {
+  const typeLanes = await loadLanes(companyId, resourceTypeIds);
+  /**
+   * One lane per MACHINE rather than per type.
+   *
+   * A type lane with four welders draws four bars side by side and cannot say
+   * which welder has what — fine at month zoom, useless on the day a supervisor
+   * is standing in front of the machines. Each machine becomes its own lane of
+   * capacity one, and blocks are filtered to the tasks assigned to it (see
+   * planMachineService for how that assignment is made).
+   *
+   * A type with no machines on record still gets one lane, so its work does not
+   * silently vanish from the board.
+   */
+  const lanes = lanesBy !== 'machine' ? typeLanes : typeLanes.flatMap((t) => (
+    t.resources.length === 0
+      ? [{ ...t, machineId: null, machineName: t.name }]
+      : t.resources.map((r) => ({
+        ...t, machineId: r.id, machineName: r.name, resources: [r],
+      }))
+  ));
   const entries = await loadEntries(companyId, from, to, resourceTypeIds);
   const tz = await plannerTimezone(companyId);
   const t0 = from.getTime();
@@ -1433,7 +1453,12 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] }
     for (const e of laneEntries) {
       const s = new Date(e.plannedStart).getTime();
       const span = Math.max(0, new Date(e.plannedEnd).getTime() - s);
-      const tasks = e.tasks ?? [];
+      let tasks = e.tasks ?? [];
+      // On a machine lane, only the members that run on THIS machine. A bundle
+      // can straddle several — 645 of the production plan's bars hold more work
+      // than their own span — so a bar is drawn in pieces, one per machine.
+      if (lane.machineId != null) tasks = tasks.filter((t) => t.machineId === lane.machineId);
+      if (lane.machineId != null && tasks.length === 0) continue;
       if (tasks.length === 0) {
         blocks.push(Math.round(s - t0), Math.round(span), 0, 0, e.id);
         continue;
@@ -1455,7 +1480,10 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [] }
 
     outLanes.push({
       resourceTypeId: lane.id,
-      name: lane.name,
+      /** Set only on a machine lane. Null means this row IS the whole type. */
+      machineId: lane.machineId ?? null,
+      typeName: lane.name,
+      name: lane.machineName ?? lane.name,
       code: lane.code,
       totalUnits: coverage.totalUnits,
       unbounded: coverage.unbounded,

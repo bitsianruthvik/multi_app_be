@@ -27,6 +27,8 @@ import {
 } from '../services/planService.js';
 import { withDragSession, endDragSession } from '../services/planDragSession.js';
 import { replanFromNow, simulateOrder } from '../services/planReplanService.js';
+import { machineLoad } from '../services/planMachineLoadService.js';
+import { assignMachines } from '../services/planMachineService.js';
 import { transformGroup } from '../services/planGroupService.js';
 
 const router = Router();
@@ -116,7 +118,13 @@ router.get('/plan/board', protect, async (req, res) => {
   if (!win) return res.status(400).json({ message: 'from/to are required ISO dates, to > from, at most 92 days apart.' });
 
   try {
-    const board = await getPlanBoard(companyId, { ...win, resourceTypeIds: parseIdList(req.query.resourceTypeIds) });
+    // `lanesBy=machine` draws a row per machine instead of per resource type —
+    // what the day view wants, where "which of the four welders" is the question.
+    const board = await getPlanBoard(companyId, {
+      ...win,
+      resourceTypeIds: parseIdList(req.query.resourceTypeIds),
+      lanesBy: req.query.lanesBy === 'machine' ? 'machine' : 'type',
+    });
     return res.status(200).json({ ok: true, ...board });
   } catch (err) {
     logger.error({ err, companyId }, 'plan board read failed');
@@ -330,6 +338,64 @@ router.get('/plan/simulate', protect, async (req, res) => {
     if (err instanceof PlanError) return sendPlanError(res, err);
     logger.error({ err, companyId, orderId }, 'order simulation failed');
     return res.status(500).json({ message: 'Could not work out a date for that order.' });
+  }
+});
+
+/**
+ * GET /plan/machine-load — what each machine is due to put out, and what is
+ * queued in front of it.
+ *
+ * `?from=&to=&bucket=week|month`. Output is in TONNES, because that is what a
+ * fab shop counts and what the order is denominated in; hours come along for
+ * whether the machine is full.
+ *
+ * The same steel is counted at every station it passes, deliberately — a 13 t
+ * segment that is cut, welded and painted contributes 13 t to each of those
+ * three. Per machine that is right; the SUM across machines is meaningless.
+ */
+router.get('/plan/machine-load', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const win = parseWindow(req.query);
+  if (!win) return res.status(400).json({ message: 'from/to are required ISO dates, to > from, at most 92 days apart.' });
+
+  try {
+    const load = await machineLoad(companyId, {
+      ...win,
+      bucket: req.query.bucket === 'month' ? 'month' : 'week',
+    });
+    return res.status(200).json({ ok: true, ...load });
+  } catch (err) {
+    logger.error({ err, companyId }, 'machine load read failed');
+    return res.status(500).json({ message: 'Failed to read machine load.' });
+  }
+});
+
+/**
+ * POST /plan/assign — put a task on a particular machine, or re-balance a type.
+ *
+ * With `taskEntryIds` and `resourceId` it is the planner overriding one
+ * placement; with neither it re-runs the assignment for the named types, which
+ * is what to do after work has been dragged about.
+ */
+router.post('/plan/assign', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const result = await assignMachines(companyId, {
+      resourceTypeIds: parseIdList(req.body?.resourceTypeIds),
+      reassign: req.body?.reassign === true,
+    });
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    logger.error({ err, companyId }, 'machine assignment failed');
+    return res.status(500).json({ message: 'Could not assign machines.' });
   }
 });
 
