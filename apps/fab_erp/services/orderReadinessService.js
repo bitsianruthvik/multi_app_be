@@ -264,7 +264,7 @@ export async function orderReadiness(companyId, orderId) {
     // Never let a field-analysis failure take the whole strip down: the other
     // stages are still true and the order still has to be workable.
     missingFieldsForOrder(companyId, orderId).catch(() => ({
-      itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], noFormula: [],
+      itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], unusableFields: [], noFormula: [],
     })),
   ]);
   const stages = [
@@ -315,16 +315,20 @@ export async function orderReadiness(companyId, orderId) {
       key: 'params',
       label: 'Parameters',
       state: fields.itemsChecked === 0 ? 'todo'
-        : (fields.itemsShort > 0 || fields.unknownFields.length > 0) ? 'partial' : 'done',
+        : (fields.itemsShort > 0
+          || fields.unknownFields.length > 0
+          || (fields.unusableFields?.length ?? 0) > 0) ? 'partial' : 'done',
       count: fields.itemsChecked - fields.itemsShort,
       total: fields.itemsChecked,
       detail: fields.itemsChecked === 0
         ? 'Assign flows first — they decide which values are needed'
         : fields.unknownFields.length > 0
           ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
-          : fields.itemsShort > 0
-            ? `${fields.itemsShort} of ${fields.itemsChecked} part(s) missing values`
-            : `All ${fields.itemsChecked} part(s) have what their operations need`,
+          : (fields.unusableFields?.length ?? 0) > 0
+            ? `${fields.unusableFields.length} operation(s) use a field that is not set up for formulas`
+            : fields.itemsShort > 0
+              ? `${fields.itemsShort} of ${fields.itemsChecked} part(s) missing values`
+              : `All ${fields.itemsChecked} part(s) have what their operations need`,
     },
     {
       key: 'nesting',

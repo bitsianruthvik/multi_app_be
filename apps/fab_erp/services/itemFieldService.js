@@ -465,6 +465,14 @@ export async function requiredFieldsForFlow(companyId, flowId, conn) {
  *                  the same typo against nine hundred rows and bury the real
  *                  data problems underneath it.
  *
+ *   unusableFields a formula names a field that IS registered but is not
+ *                  formula-usable — a text field, usually, or one nobody has
+ *                  marked usable yet. The FIELD is wrong, not the formula, and
+ *                  it is fixed once on the Item fields screen rather than in
+ *                  every formula that names it. Reported apart from the above
+ *                  because sending somebody to rewrite a correct formula is
+ *                  worse than saying nothing.
+ *
  *   missingValues  a registered field this part's flow needs, with no value
  *                  anywhere down the resolution chain. A DATA problem, and the
  *                  one that is currently invisible: the engine defaults unknown
@@ -485,7 +493,7 @@ export async function requiredFieldsForFlow(companyId, flowId, conn) {
 export async function missingFieldsForOrder(companyId, orderId, conn) {
   const exec = conn ?? pool;
   const empty = {
-    itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], noFormula: [],
+    itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], unusableFields: [], noFormula: [],
   };
 
   const [items] = await exec.query(
@@ -529,6 +537,7 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
 
   const requiredByFlow = new Map(flowIds.map((f) => [f, new Set()]));
   const unknownByOp = new Map();
+  const unusableByOp = new Map();
   const noFormula = [];
   for (const op of ops) {
     if (!op.formula || !String(op.formula).trim()) {
@@ -541,13 +550,32 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
       if (!v.startsWith('item.')) continue;
       const key = v.slice(5);
       const def = registry.get(key);
-      if (!def || !Number(def.formula_usable)) {
-        // Unknown, or registered but not usable in a formula — both are the
-        // author's problem and neither can ever be fixed by filling in a part.
+      /**
+       * NOT the same failure, and conflating them cost an afternoon.
+       *
+       * These were reported together as "names a field that does not exist",
+       * which told somebody with a perfectly good formula to go and correct it.
+       * The formula was right; `unit_weight_kg` was registered as TEXT, so it
+       * was not formula-usable, so it came through this branch and the message
+       * blamed the wrong thing entirely.
+       *
+       * A missing field IS the formula's problem — nothing else can be done
+       * about a typo. A registered-but-unusable field is the FIELD's problem,
+       * fixed once on the Item fields screen, and every formula naming it is
+       * innocent.
+       */
+      if (!def) {
         if (!unknownByOp.has(op.operationId)) {
           unknownByOp.set(op.operationId, { operationId: op.operationId, operationName: op.operationName, keys: new Set() });
         }
         unknownByOp.get(op.operationId).keys.add(key);
+        continue;
+      }
+      if (!Number(def.formula_usable)) {
+        if (!unusableByOp.has(op.operationId)) {
+          unusableByOp.set(op.operationId, { operationId: op.operationId, operationName: op.operationName, keys: new Set() });
+        }
+        unusableByOp.get(op.operationId).keys.add(key);
         continue;
       }
       requiredByFlow.get(op.flowId)?.add(key);
@@ -591,6 +619,12 @@ export async function missingFieldsForOrder(companyId, orderId, conn) {
       .map(([flowId, keys]) => ({ flowId, required: [...keys] }))
       .filter((r) => r.required.length),
     unknownFields: [...unknownByOp.values()].map((u) => ({ ...u, keys: [...u.keys] })),
+    /**
+     * Registered, but not usable in a formula — a field to fix, not a formula.
+     *
+     * Kept apart from unknownFields so the message can name the right screen.
+     */
+    unusableFields: [...unusableByOp.values()].map((u) => ({ ...u, keys: [...u.keys] })),
     noFormula,
   };
 }
