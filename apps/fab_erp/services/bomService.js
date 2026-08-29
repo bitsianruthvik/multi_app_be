@@ -382,8 +382,96 @@ export async function instantiate(companyId, spec, existingConn = null) {
     if (owned) await conn.beginTransaction();
     const {
       orderId, orderLineId = null, rootItemId,
-      params = {}, perInstance = {}, codePrefix = null,
+      params = {}, perInstance = {}, codePrefix = null, replace = false,
     } = spec;
+
+    /**
+     * BUILDING TWICE MUST NOT BUILD TWICE.
+     *
+     * This appends. Nothing stopped a second run, so pressing the structure
+     * wizard again gave a line two spans, two sets of girders and two of
+     * everything below — silently, because every code is prefixed by the line
+     * and the duplicates look like ordinary rows. It never came up while the
+     * only caller was a dialog nothing mounted; it is the first thing that
+     * happens once the button is real.
+     *
+     * So: refuse when the line already has a structure, and say how much, unless
+     * the caller has explicitly asked to replace it.
+     *
+     * Scoped to the LINE, not the order. An order with three lines is three
+     * structures, and rebuilding one must not take the others with it.
+     */
+    const lineScope = orderLineId == null
+      ? { sql: 'AND order_line_id IS NULL', args: [] }
+      : { sql: 'AND order_line_id = ?', args: [orderLineId] };
+
+    const [[already]] = await conn.query(
+      `SELECT COUNT(*) AS n FROM fab_items
+        WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
+      [companyId, orderId, ...lineScope.args],
+    );
+
+    if (already.n > 0) {
+      if (!replace) {
+        const e = new Error(
+          `This line already has ${already.n} item(s). Building again would add a second copy `
+          + 'of everything — replace the existing structure, or pick a different line.',
+        );
+        e.status = 409;
+        e.code = 'ALREADY_BUILT';
+        e.existing = already.n;
+        throw e;
+      }
+
+      /**
+       * Replacing throws away the item tree, so it may not throw away history.
+       * The same rule the BOQ import already applies, at line granularity.
+       */
+      const [[worked]] = await conn.query(
+        `SELECT COUNT(*) AS n FROM fab_project_tasks t
+           JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id
+          WHERE t.company_id = ? AND t.order_id = ? ${lineScope.sql.replace('order_line_id', 'i.order_line_id')}
+            AND i.deleted_at IS NULL AND t.deleted_at IS NULL
+            AND (t.started_at IS NOT NULL OR t.status IN ('in_progress','paused','done'))`,
+        [companyId, orderId, ...lineScope.args],
+      );
+      if (worked.n > 0) {
+        const e = new Error(
+          `Replace refused: ${worked.n} task(s) on this line have already been started or finished. `
+          + 'Rebuilding the structure would throw that shop-floor history away.',
+        );
+        e.status = 409;
+        e.code = 'WORK_STARTED';
+        throw e;
+      }
+
+      const [ids] = await conn.query(
+        `SELECT id FROM fab_items
+          WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
+        [companyId, orderId, ...lineScope.args],
+      );
+      const itemIds = ids.map((r) => r.id);
+      if (itemIds.length) {
+        await conn.query(
+          `UPDATE fab_task_inputs SET deleted_at = NOW()
+            WHERE company_id = ? AND task_id IN (
+              SELECT id FROM (SELECT id FROM fab_project_tasks
+                WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL) x
+            ) AND deleted_at IS NULL`,
+          [companyId, companyId, itemIds],
+        );
+        await conn.query(
+          `UPDATE fab_project_tasks SET deleted_at = NOW()
+            WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`,
+          [companyId, itemIds],
+        );
+        await conn.query(
+          `UPDATE fab_items SET deleted_at = NOW()
+            WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+          [companyId, itemIds],
+        );
+      }
+    }
 
     const tree = await expand(companyId, rootItemId, params, { perInstance, conn });
 

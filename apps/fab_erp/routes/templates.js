@@ -147,7 +147,10 @@ router.post(
     try {
       const cid = companyId(req);
       const orderId = Number(req.params.orderId);
-      const { itemId, orderLineId = null, params = {}, perInstance = {}, lineCode = null } = req.body ?? {};
+      const {
+        itemId, orderLineId = null, params = {}, perInstance = {}, lineCode = null,
+        replace = false,
+      } = req.body ?? {};
       if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
 
       // `<order prefix>-<line code>` — the line's own code is the top level of
@@ -157,9 +160,17 @@ router.post(
 
       const result = await instantiate(cid, {
         orderId, orderLineId, rootItemId: Number(itemId), params, perInstance, codePrefix,
+        replace: replace === true,
       });
       res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
-    } catch (err) { fail(res, err, 'instantiate'); }
+    } catch (err) {
+      // ALREADY_BUILT and WORK_STARTED carry a code the dialog offers a choice on,
+      // so they travel as more than a message.
+      if (err.status === 409) {
+        return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
+      }
+      return fail(res, err, 'instantiate');
+    }
   },
 );
 
