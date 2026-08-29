@@ -5853,3 +5853,58 @@ SET @sql = IF(@idx = 0,
   'ALTER TABLE fab_plan_entry_tasks ADD INDEX idx_fplet_resource (company_id, resource_id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ unit_weight_kg IS A NUMBER, AND FORMULAS MAY USE IT (2026-08-29) ═══════
+--
+-- Creating an order and reaching the Parameters step failed with "2 operation(s)
+-- name a field that does not exist": Crane Move / Material Handling and Crane
+-- Turn / Reposition both read `item.unit_weight_kg`, and both were reported as
+-- naming something that is not there.
+--
+-- It IS there. It had 2,524 stored values and the resolver returned them
+-- correctly — 1143.15 kg for a top flange. What it did not have was a usable
+-- DEFINITION:
+--
+--     total_steel_weight_kg   label "Total steel weight"   number   mass   kg
+--     unit_weight_kg          label "unit_weight_kg"       TEXT     null   null
+--
+-- Label equal to the key, no dimension, no unit: that row was typed in against a
+-- value somebody needed to store, not authored alongside the other standard
+-- fields, and it existed for exactly one company. A text field cannot be used in
+-- a formula, so `formula_usable` was 0 — and `missingFieldsForOrder` reports
+-- "registered but not usable" through the same channel as "unknown", which is
+-- why the message said the field did not exist.
+--
+-- Fixed at the definition rather than by editing the two formulas. A crane's
+-- time genuinely depends on the weight it lifts; the formulas are right and it
+-- was the field that was wrong. Editing them instead would have left the next
+-- formula that reaches for weight broken in the same way.
+--
+-- Written to both registries and placed AFTER the seed that copies
+-- fab_field_defs into fab_fields, because that seed carries ON DUPLICATE KEY
+-- UPDATE and would otherwise put the bad definition back on the next deploy.
+--
+-- Deliberately conservative. Type, dimension, unit and usability are corrected
+-- wherever they are wrong, but the LABEL is only replaced where it is still the
+-- raw key — a company that has renamed it meant to.
+
+UPDATE fab_field_defs
+   SET data_type = 'number', unit = COALESCE(unit, 'kg'), formula_usable = 1
+ WHERE field_key = 'unit_weight_kg' AND deleted_at IS NULL
+   AND (data_type <> 'number' OR formula_usable = 0);
+
+UPDATE fab_field_defs
+   SET label = 'Unit weight'
+ WHERE field_key = 'unit_weight_kg' AND deleted_at IS NULL AND label = field_key;
+
+UPDATE fab_fields
+   SET data_type = 'number',
+       dimension = COALESCE(dimension, 'mass'),
+       default_unit = COALESCE(default_unit, 'kg'),
+       formula_usable = 1
+ WHERE field_key = 'unit_weight_kg' AND deleted_at IS NULL
+   AND (data_type <> 'number' OR formula_usable = 0);
+
+UPDATE fab_fields
+   SET label = 'Unit weight'
+ WHERE field_key = 'unit_weight_kg' AND deleted_at IS NULL AND label = field_key;
