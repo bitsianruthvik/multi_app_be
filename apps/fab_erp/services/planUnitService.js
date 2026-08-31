@@ -54,8 +54,15 @@ export function parseUnitKey(key) {
   return { kind: m[1], id: Number(m[2]) };
 }
 
-/** The group key an item belongs to at `level`. Mirrors boardModel.groupKeyFor. */
-function groupKeyFor(itemsById, itemId, level) {
+/**
+ * The group key an item belongs to at `level`. Mirrors boardModel.groupKeyFor.
+ *
+ * Exported so the Actuals Board resolves its units through THIS function rather
+ * than growing a third copy of the walk. The header above explains why the two
+ * copies that do exist (server + client) are cross-checked rather than trusted;
+ * a third would be the same bug waiting to happen.
+ */
+export function groupKeyFor(itemsById, itemId, level) {
   const wanted = GROUP_LEVELS.indexOf(level);
   const start = itemsById.get(Number(itemId)) ?? null;
   if (!start) return null;

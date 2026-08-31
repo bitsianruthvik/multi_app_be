@@ -606,3 +606,60 @@ FROM companies c
 JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
 JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
 JOIN features_capability fc ON fc.name = 'fab_erp_planner';
+
+-- =============================================================================
+-- Section 11 — Actuals Board (2026-08-31)
+--   fab_erp_actuals_view
+-- Mirrored in TM/seed_fab_erp_actuals.sql — keep the two in step.
+--
+-- Set-based and idempotent: no @companyId to edit, and every grant carries its
+-- own NOT EXISTS guard. `role_capability` has NO unique key on the grant tuple,
+-- so INSERT IGNORE alone does NOT make a re-run a no-op — it would quietly add a
+-- second identical grant every time the seed was applied. Harmless to
+-- permission checks, which are membership tests, and still wrong.
+--
+-- Admins bypass the tag anyway; the grants below are what makes the page visible
+-- to everybody else.
+-- =============================================================================
+INSERT IGNORE INTO features (feature_name, feature_tag, type) VALUES
+  ('View Actuals Board', 'fab_erp_actuals_view', 'frontend');
+
+INSERT INTO features_capability (name, features_json)
+SELECT 'fab_erp_actuals', JSON_ARRAYAGG(id)
+FROM features WHERE feature_tag IN ('fab_erp_actuals_view')
+  AND deleted_at IS NULL
+AND NOT EXISTS (SELECT 1 FROM features_capability WHERE name = 'fab_erp_actuals')
+HAVING JSON_ARRAYAGG(id) IS NOT NULL;
+
+-- Every fab_erp tenant's Admin role.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, c.id, a.id, fc.capability_id
+FROM companies c
+JOIN apps  a ON a.company_id = c.id AND a.slug = 'fab_erp'
+JOIN roles r ON r.company_id = c.id AND r.name = 'Admin'
+JOIN features_capability fc ON fc.name = 'fab_erp_actuals'
+WHERE NOT EXISTS (
+  SELECT 1 FROM role_capability x
+   WHERE x.role_id = r.id AND x.company_id = c.id AND x.app_id = a.id
+     AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL
+);
+
+-- …and anybody who can already see the PLAN. The two boards answer the same
+-- question in opposite directions, and a shop that trusted somebody with next
+-- month has no reason to hide last month from them. Matched by CAPABILITY
+-- rather than by role name, so a tenant's own role names do not have to be
+-- guessed here — prod Placebo's `tester` role is granted by this rule and by no
+-- other.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT rc.role_id, rc.team_id, rc.company_id, rc.app_id, fa.capability_id
+FROM role_capability rc
+JOIN features_capability fp ON fp.capability_id = rc.capability_id
+                           AND fp.name = 'fab_erp_planner'
+JOIN features_capability fa ON fa.name = 'fab_erp_actuals'
+WHERE rc.deleted_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM role_capability x
+     WHERE x.capability_id = fa.capability_id AND x.deleted_at IS NULL
+       AND (x.role_id <=> rc.role_id) AND (x.team_id <=> rc.team_id)
+       AND (x.company_id <=> rc.company_id) AND (x.app_id <=> rc.app_id)
+  );
