@@ -23,7 +23,7 @@ import { logger } from '../../../core/utils/logger.js';
 import { suggestPlan } from '../services/planSuggestionService.js';
 import {
   getPlan, getPlanBoard, getBacklog, createEntry, updateEntry, splitEntry, deleteEntry,
-  acceptRun, retirePlan, getPlanOrders, savePlanOrderRules, PlanError,
+  acceptRun, retirePlan, readRun, listRuns, getPlanOrders, savePlanOrderRules, PlanError,
 } from '../services/planService.js';
 import { withDragSession, endDragSession } from '../services/planDragSession.js';
 import { replanFromNow, simulateOrder } from '../services/planReplanService.js';
@@ -244,6 +244,54 @@ router.post('/plan/accept', protect, async (req, res) => {
     if (err instanceof PlanError) return sendPlanError(res, err);
     logger.error({ err, companyId, runId }, 'plan accept failed');
     return res.status(500).json({ message: 'Failed to accept the suggestion.' });
+  }
+});
+
+/**
+ * GET /plan/runs — recent suggestions, newest first.
+ *
+ * So the board can offer the one somebody was working through without the
+ * client having to remember a run id across a reload.
+ */
+router.get('/plan/runs', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    return res.status(200).json({ ok: true, runs: await listRuns(companyId, { limit: req.query.limit }) });
+  } catch (err) {
+    logger.error({ err, companyId }, 'plan run list failed');
+    return res.status(500).json({ message: 'Failed to list suggestions.' });
+  }
+});
+
+/**
+ * GET /plan/runs/:runId — one suggestion, bar by bar, and which of it is
+ * already on the plan.
+ *
+ * The half that makes picking possible. A suggestion used to exist only in the
+ * response that created it, so closing the page lost it and the only way back
+ * was to compute a new one — a minute of levelling, and a different answer.
+ */
+router.get('/plan/runs/:runId', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  const runId = Number(req.params.runId);
+  if (!Number.isFinite(runId) || runId <= 0) {
+    return res.status(400).json({ message: 'runId must be a positive integer.' });
+  }
+
+  try {
+    return res.status(200).json({ ok: true, ...await readRun(companyId, runId) });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId, runId }, 'plan run read failed');
+    return res.status(500).json({ message: 'Failed to read that suggestion.' });
   }
 });
 

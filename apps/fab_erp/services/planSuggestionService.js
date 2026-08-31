@@ -559,7 +559,19 @@ async function persistRun(companyId, {
         (m, x) => m + taskMinutes(x.task), 0,
       ));
       const slack = slackByOrder?.get(first.order_id)?.slack;
-      await conn.query(
+      /**
+       * The row's own id, kept on the bar.
+       *
+       * A caller that wants to accept SOME of a suggestion needs to name the
+       * rows it wants, and `acceptRun` has always taken `runItemIds` — but the
+       * response carried no ids, so nothing could ever name one and the only
+       * possible accept was all of it.
+       *
+       * Safe to read from insertId here because this is a SINGLE-row insert.
+       * The multi-row case is the one that cannot be trusted on TiDB, which is
+       * why acceptRun reads its entry ids back by run_item_id instead.
+       */
+      const [ins] = await conn.query(
         `INSERT INTO fab_plan_run_items
            (company_id, run_id, resource_type_id, resource_id, bundle_key,
             ancestor_item_id, order_id, operation_id, planned_start, planned_end,
@@ -585,6 +597,7 @@ async function persistRun(companyId, {
          barReason(bar, slackByOrder, criticalTaskIds),
          barLabel(bar).slice(0, 255)],
       );
+      bar.runItemId = ins.insertId;
     }
 
     await conn.commit();
@@ -604,6 +617,8 @@ async function persistRun(companyId, {
       items: bars.map((bar) => {
         const first = bar.members[0].task;
         return {
+          /** Name this to accept just this one. See acceptRun's runItemIds. */
+          runItemId: bar.runItemId ?? null,
           bundleKey: bar.bundleKey,
           resourceTypeId: first.resource_type_id,
           resourceId: first.assigned_resource_id ?? null,

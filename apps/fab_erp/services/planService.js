@@ -1000,6 +1000,113 @@ export async function deleteEntry(companyId, entryId, userId = null) {
   }
 }
 
+
+/**
+ * A suggestion, read back — including which of it is already on the plan.
+ *
+ * A suggestion used to exist only in the response that created it. Close the
+ * page and it was gone, and the only way to see it again was to compute a new
+ * one, which is a minute of levelling and a different answer. That is fine when
+ * the only choice is "accept all of it or none", and useless when somebody is
+ * working through it a few bars at a time.
+ *
+ * `accepted` comes from fab_plan_entries.run_item_id rather than a flag on the
+ * run item, because the plan is the truth: a bar that was accepted and later
+ * deleted should read as not accepted, and a flag would have to be maintained
+ * in two places to say so.
+ *
+ * @returns {Promise<{run:object, items:object[]}>}
+ */
+export async function readRun(companyId, runId) {
+  const [[run]] = await pool.query(
+    `SELECT id, status, window_from AS windowFrom, window_to AS windowTo,
+            anchor_at AS anchorAt, created_at AS createdAt,
+            accepted_at AS acceptedAt
+       FROM fab_plan_runs
+      WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
+    [companyId, runId],
+  );
+  if (!run) throw new PlanError('RUN_NOT_FOUND', `Plan run ${runId} does not exist.`);
+
+  const [items] = await pool.query(
+    `SELECT ri.id AS runItemId, ri.resource_type_id AS resourceTypeId,
+            ri.resource_id AS resourceId, ri.ancestor_item_id AS ancestorItemId,
+            ri.order_id AS orderId, ri.planned_start AS plannedStart,
+            ri.planned_end AS plannedEnd, ri.planned_minutes AS plannedMinutes,
+            ri.task_count AS taskCount, ri.task_ids AS taskIds,
+            ri.is_critical_chain AS isCriticalChain, ri.reason, ri.label,
+            rt.name AS resourceTypeName, r.name AS resourceName,
+            o.order_number AS orderNumber,
+            i.code AS ancestorCode, i.name AS ancestorName,
+            (SELECT COUNT(*) FROM fab_plan_entries e
+              WHERE e.company_id = ri.company_id AND e.run_item_id = ri.id
+                AND e.status = 'planned' AND e.deleted_at IS NULL) AS onPlan
+       FROM fab_plan_run_items ri
+       LEFT JOIN fab_resource_types rt ON rt.id = ri.resource_type_id
+       LEFT JOIN fab_resources r ON r.id = ri.resource_id
+       LEFT JOIN fab_orders o ON o.id = ri.order_id AND o.deleted_at IS NULL
+       LEFT JOIN fab_items i ON i.id = ri.ancestor_item_id AND i.deleted_at IS NULL
+      WHERE ri.company_id = ? AND ri.run_id = ? AND ri.deleted_at IS NULL
+      ORDER BY ri.planned_start ASC, ri.id ASC`,
+    [companyId, runId],
+  );
+
+  return {
+    run,
+    items: items.map((r) => {
+      let taskIds = [];
+      try { taskIds = JSON.parse(r.taskIds ?? '[]'); } catch { taskIds = []; }
+      return {
+        runItemId: r.runItemId,
+        resourceTypeId: r.resourceTypeId,
+        resourceTypeName: r.resourceTypeName,
+        resourceId: r.resourceId,
+        resourceName: r.resourceName,
+        orderId: r.orderId,
+        orderNumber: r.orderNumber,
+        ancestorItemId: r.ancestorItemId,
+        ancestorCode: r.ancestorCode,
+        ancestorName: r.ancestorName,
+        plannedStart: r.plannedStart,
+        plannedEnd: r.plannedEnd,
+        plannedMinutes: r.plannedMinutes,
+        taskCount: r.taskCount,
+        taskIds,
+        isCriticalChain: !!r.isCriticalChain,
+        reason: r.reason,
+        label: r.label,
+        /** Already on the plan — ticking it again would do nothing. */
+        accepted: Number(r.onPlan) > 0,
+      };
+    }),
+  };
+}
+
+/**
+ * The most recent suggestions, newest first.
+ *
+ * So a board can offer "the one you were working through" without the client
+ * having to remember a run id across a reload.
+ */
+export async function listRuns(companyId, { limit = 10 } = {}) {
+  const [rows] = await pool.query(
+    `SELECT r.id, r.status, r.created_at AS createdAt, r.accepted_at AS acceptedAt,
+            r.window_from AS windowFrom, r.window_to AS windowTo,
+            (SELECT COUNT(*) FROM fab_plan_run_items ri
+              WHERE ri.company_id = r.company_id AND ri.run_id = r.id AND ri.deleted_at IS NULL) AS itemCount,
+            (SELECT COUNT(*) FROM fab_plan_run_items ri
+               JOIN fab_plan_entries e ON e.company_id = ri.company_id AND e.run_item_id = ri.id
+                AND e.status = 'planned' AND e.deleted_at IS NULL
+              WHERE ri.company_id = r.company_id AND ri.run_id = r.id AND ri.deleted_at IS NULL) AS acceptedCount
+       FROM fab_plan_runs r
+      WHERE r.company_id = ? AND r.deleted_at IS NULL
+      ORDER BY r.id DESC
+      LIMIT ?`,
+    [companyId, Math.min(50, Math.max(1, Number(limit) || 10))],
+  );
+  return rows;
+}
+
 /**
  * Take a whole plan off the board.
  *
