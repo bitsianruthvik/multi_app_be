@@ -387,13 +387,37 @@ export async function getActualsBoard(companyId, {
   from, to, mode = 'machine', level = 'girder',
   orderIds = [], resourceTypeIds = [], now = new Date(),
 } = {}) {
-  const tz = await plannerTimezone(companyId);
   const t0 = from.getTime();
   const t1 = to.getTime();
   const nowMs = now.getTime();
   const rel = (ms) => Math.round(ms - t0);
 
-  const tasks = await loadTasks(companyId, from, to, { orderIds, resourceTypeIds });
+  /**
+   * THE READS RUN IN WAVES, NOT ONE AFTER ANOTHER.
+   *
+   * Measured on prod: 1.8–2.9 s for a window containing only 244 started tasks.
+   * Almost none of that was the work — it was ten queries awaited in a line,
+   * each paying a full Render→TiDB round trip. The order-wide ones (the item
+   * load, the task roll-up) are the same size whether one girder has been worked
+   * or all eight, so the latency was a constant nobody was going to grow out of.
+   *
+   * Three waves, which is the fewest the dependencies allow:
+   *
+   *   1  the timezone and the tasks           — nothing depends on anything
+   *   2  everything the TASKS identify        — items, planned ends, the three
+   *                                             id-keyed lookups, and warming
+   *                                             the calendar cache
+   *   3  everything the ITEMS identify        — the roll-up (which needs to know
+   *                                             whether wave 2 degraded) and the
+   *                                             order-line lookup
+   *
+   * Do not collapse waves 2 and 3 by dropping the `degraded` guard: on an
+   * oversized window the roll-up is exactly the query that must not run.
+   */
+  const [tz, tasks] = await Promise.all([
+    plannerTimezone(companyId),
+    loadTasks(companyId, from, to, { orderIds, resourceTypeIds }),
+  ]);
   const empty = {
     from, to, timezone: tz, mode, level, now: now.toISOString(),
     lanes: [], items: [], orders: [], lines: [], entries: [], operations: [], resources: [],
@@ -408,19 +432,11 @@ export async function getActualsBoard(companyId, {
   if (tasks.length === 0) return empty;
 
   const touchedOrderIds = [...new Set(tasks.map((t) => t.orderId).filter((x) => x != null))];
+  const doneIds = tasks.filter((t) => t.status === 'done' && t.completedAt != null).map((t) => t.id);
+  const opIds = [...new Set(tasks.map((t) => t.operationId).filter((x) => x != null))];
+  const resIds = [...new Set(tasks.map((t) => t.resourceId).filter((x) => x != null))];
 
-  // ── items: the walk data, the labels, the weights ─────────────────────────
-  const loaded = await loadOrderItems(companyId, touchedOrderIds);
-  const degraded = loaded.truncated;
-  const items = degraded
-    ? await itemAncestry(companyId, tasks.map((t) => t.itemId))
-    : loaded.rows;
-  const itemsById = new Map(items.map((i) => [Number(i.id), i]));
-
-  // ── when each task was really being worked on ─────────────────────────────
   const intervalsFor = makeCalendarCache(companyId, from, to);
-  /** Every calendar set seen, so the pack lanes can be shaded by their union. */
-  const seenCalendars = [];
 
   /**
    * Calendar resolution memoised on (machine, type).
@@ -441,9 +457,69 @@ export async function getActualsBoard(companyId, {
     return calByResource.get(k);
   };
 
+  /**
+   * One task per distinct (machine, type), resolved together.
+   *
+   * Warming the cache up front rather than letting the clip loop discover the
+   * keys one at a time: the loop awaits in sequence, so a shop with ten machine
+   * groups paid ten serial calendar walks before it clipped its first span.
+   */
+  const calendarProbes = new Map();
+  for (const t of tasks) {
+    const k = `${t.resourceId ?? 0}:${t.resourceTypeId ?? 0}`;
+    if (!calendarProbes.has(k)) calendarProbes.set(k, t);
+  }
+
+  // ── wave 2: everything the TASKS identify ─────────────────────────────────
+  // `pool.query` resolves to [rows, fields]; the nested pattern takes the rows.
+  const [loaded, plannedEnds, [operations], [resources], [orders]] = await Promise.all([
+    loadOrderItems(companyId, touchedOrderIds),
+    doneIds.length ? loadPlannedEnds(companyId, doneIds) : Promise.resolve(new Map()),
+    opIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+      `SELECT id, name FROM fab_operations WHERE company_id = ? AND id IN (?)`,
+      [companyId, opIds],
+    ),
+    resIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+      `SELECT id, name FROM fab_resources WHERE company_id = ? AND id IN (?)`,
+      [companyId, resIds],
+    ),
+    touchedOrderIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+      `SELECT id, order_number AS orderNumber, customer_name AS customerName,
+              priority, priority_rank AS priorityRank, required_date AS requiredDate,
+              must_finish_by AS mustFinishBy
+         FROM fab_orders WHERE company_id = ? AND id IN (?)`,
+      [companyId, touchedOrderIds],
+    ),
+    ...[...calendarProbes.values()].map((t) => calendarFor(t)),
+  ]);
+
+  // ── items: the walk data, the labels, the weights ─────────────────────────
+  const degraded = loaded.truncated;
+  const items = degraded
+    ? await itemAncestry(companyId, tasks.map((t) => t.itemId))
+    : loaded.rows;
+  const itemsById = new Map(items.map((i) => [Number(i.id), i]));
+  const lineIds = [...new Set(items.map((i) => i.orderLineId).filter((x) => x != null))];
+
+  // ── wave 3: everything the ITEMS identify ────────────────────────────────
+  const [rollup, [lines]] = await Promise.all([
+    degraded ? Promise.resolve(new Map()) : loadItemTaskRollup(companyId, touchedOrderIds),
+    lineIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+      `SELECT id, order_id AS orderId, line_no AS lineNo, code, description
+         FROM fab_order_lines WHERE company_id = ? AND id IN (?)`,
+      [companyId, lineIds],
+    ),
+  ]);
+
+  // ── when each task was really being worked on ─────────────────────────────
+  /** Every calendar set seen, so the pack lanes can be shaded by their union. */
+  const seenCalendars = [];
+
   const clippedByTask = new Map();
   const clockByTask = new Map();
   for (const t of tasks) {
+    // Resolved already — wave 2 warmed every distinct key, so this await is on
+    // a settled promise and the loop is pure arithmetic.
     const cal = await calendarFor(t);
     if (!seenCalendars.includes(cal)) seenCalendars.push(cal);
 
@@ -472,8 +548,7 @@ export async function getActualsBoard(companyId, {
   }
 
   // ── status per task ───────────────────────────────────────────────────────
-  const doneIds = tasks.filter((t) => t.status === 'done' && t.completedAt != null).map((t) => t.id);
-  const plannedEnds = doneIds.length ? await loadPlannedEnds(companyId, doneIds) : new Map();
+  // `plannedEnds` came back in wave 2.
   const statusOf = (t) => {
     // Rework is its own state even when finished: a bar that exists because
     // something failed inspection is the thing a monthly review looks for, and
@@ -746,7 +821,7 @@ export async function getActualsBoard(companyId, {
 
   // ── statistics ────────────────────────────────────────────────────────────
   const taskCountByItem = new Map();
-  const rollup = degraded ? new Map() : await loadItemTaskRollup(companyId, touchedOrderIds);
+  // `rollup` came back in wave 3.
   for (const [id, r] of rollup) taskCountByItem.set(id, r.total);
 
   const weightByItem = degraded ? new Map() : attributeWeights(items, taskCountByItem);
@@ -832,31 +907,8 @@ export async function getActualsBoard(companyId, {
     }
   }
 
-  // ── lookups: the words, once ──────────────────────────────────────────────
-  const opIds = [...new Set(tasks.map((t) => t.operationId).filter((x) => x != null))];
-  const resIds = [...new Set(tasks.map((t) => t.resourceId).filter((x) => x != null))];
-  const lineIds = [...new Set(items.map((i) => i.orderLineId).filter((x) => x != null))];
-
-  const [operations] = opIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, name FROM fab_operations WHERE company_id = ? AND id IN (?)`,
-    [companyId, opIds],
-  );
-  const [resources] = resIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, name FROM fab_resources WHERE company_id = ? AND id IN (?)`,
-    [companyId, resIds],
-  );
-  const [orders] = touchedOrderIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, order_number AS orderNumber, customer_name AS customerName,
-            priority, priority_rank AS priorityRank, required_date AS requiredDate,
-            must_finish_by AS mustFinishBy
-       FROM fab_orders WHERE company_id = ? AND id IN (?)`,
-    [companyId, touchedOrderIds],
-  );
-  const [lines] = lineIds.length === 0 ? [[]] : await pool.query(
-    `SELECT id, order_id AS orderId, line_no AS lineNo, code, description
-       FROM fab_order_lines WHERE company_id = ? AND id IN (?)`,
-    [companyId, lineIds],
-  );
+  // The words themselves were fetched in waves 2 and 3 — see the note at the
+  // top of this function. Nothing is read after this point.
 
   return {
     from,
