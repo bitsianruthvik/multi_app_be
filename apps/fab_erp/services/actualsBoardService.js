@@ -218,21 +218,62 @@ async function loadItemTaskRollup(companyId, orderIds) {
  * Only entries still `planned` count. A retired plan is not a promise anybody
  * broke, and marking work late against a schedule that was withdrawn would put a
  * red rule under most of a re-planned order.
+ *
+ * TWO INDEXED READS AND A JOIN IN JS, NOT ONE JOINED GROUP BY.
+ * ------------------------------------------------------------
+ * The obvious single query — join `fab_plan_entry_tasks` to `fab_plan_entries`,
+ * `GROUP BY task_id`, `COALESCE(MAX(...), MAX(...))` — measured **2,030 ms** on
+ * prod TiDB for 239 task ids, and was ninety-five percent of the whole endpoint.
+ * Split into two reads that each hit an index (`idx_fplet_task`, then the
+ * entries' primary key) it is **221 ms**, reproducibly, from two different
+ * networks. TiDB picks a poor plan for that shape; the rows involved are few
+ * enough that the merge belongs in JS anyway.
+ *
+ * The semantics are preserved exactly, which is the fiddly part:
+ *   - only rows whose ENTRY is still `planned` contribute at all;
+ *   - the task's own `planned_end` wins where any row has one;
+ *   - the entry's end is the fallback only when NO row for that task has one —
+ *     which is `COALESCE(MAX(a), MAX(b))`, not a per-row coalesce.
  */
 async function loadPlannedEnds(companyId, taskIds) {
   const out = new Map();
   for (const part of chunk(taskIds, ID_CHUNK)) {
-    const [rows] = await pool.query(
-      `SELECT et.task_id AS taskId,
-              COALESCE(MAX(et.planned_end), MAX(e.planned_end)) AS plannedEnd
-         FROM fab_plan_entry_tasks et
-         JOIN fab_plan_entries e ON e.id = et.plan_entry_id AND e.company_id = et.company_id
-                                AND e.status = 'planned' AND e.deleted_at IS NULL
-        WHERE et.company_id = ? AND et.task_id IN (?) AND et.deleted_at IS NULL
-        GROUP BY et.task_id`,
+    const [links] = await pool.query(
+      `SELECT task_id AS taskId, plan_entry_id AS entryId, planned_end AS taskEnd
+         FROM fab_plan_entry_tasks
+        WHERE company_id = ? AND task_id IN (?) AND deleted_at IS NULL`,
       [companyId, part],
     );
-    for (const r of rows) if (r.plannedEnd) out.set(Number(r.taskId), new Date(r.plannedEnd).getTime());
+    if (links.length === 0) continue;
+
+    const entryIds = [...new Set(links.map((r) => Number(r.entryId)))];
+    const [entries] = await pool.query(
+      `SELECT id, planned_end AS plannedEnd
+         FROM fab_plan_entries
+        WHERE company_id = ? AND id IN (?) AND status = 'planned' AND deleted_at IS NULL`,
+      [companyId, entryIds],
+    );
+    const entryEnd = new Map(entries.map((e) => [Number(e.id), e.plannedEnd]));
+
+    /** Per task: the greatest task-level end, and the greatest entry-level one. */
+    const best = new Map();
+    for (const r of links) {
+      // The JOIN's filter: an entry that is not `planned` is not in the map at
+      // all, so its rows contribute to neither maximum.
+      if (!entryEnd.has(Number(r.entryId))) continue;
+      const id = Number(r.taskId);
+      let b = best.get(id);
+      if (!b) { b = { task: null, entry: null }; best.set(id, b); }
+      const te = r.taskEnd ? new Date(r.taskEnd).getTime() : null;
+      const ee = entryEnd.get(Number(r.entryId));
+      const eems = ee ? new Date(ee).getTime() : null;
+      if (te != null && (b.task == null || te > b.task)) b.task = te;
+      if (eems != null && (b.entry == null || eems > b.entry)) b.entry = eems;
+    }
+    for (const [id, b] of best) {
+      const v = b.task ?? b.entry;
+      if (v != null) out.set(id, v);
+    }
   }
   return out;
 }
