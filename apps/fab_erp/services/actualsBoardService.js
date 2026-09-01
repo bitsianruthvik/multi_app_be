@@ -484,26 +484,38 @@ export async function getActualsBoard(companyId, {
   }
 
   // ── wave 2: everything the TASKS identify ─────────────────────────────────
+  /**
+   * Timed member by member.
+   *
+   * A parallel wave takes as long as its SLOWEST member, so an aggregate figure
+   * for it says nothing about which query to fix — which is how two deploys went
+   * on a diagnosis that turned out to be only half right.
+   */
+  const timed = (name, p) => {
+    const s = Date.now();
+    return Promise.resolve(p).then((v) => { marks[`w2_${name}`] = Date.now() - s; return v; });
+  };
+
   // `pool.query` resolves to [rows, fields]; the nested pattern takes the rows.
   const [loaded, plannedEnds, [operations], [resources], [orders]] = await Promise.all([
-    loadOrderItems(companyId, touchedOrderIds),
-    doneIds.length ? loadPlannedEnds(companyId, doneIds) : Promise.resolve(new Map()),
-    opIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+    timed('items', loadOrderItems(companyId, touchedOrderIds)),
+    timed('plannedEnds', doneIds.length ? loadPlannedEnds(companyId, doneIds) : Promise.resolve(new Map())),
+    opIds.length === 0 ? Promise.resolve([[]]) : timed('ops', pool.query(
       `SELECT id, name FROM fab_operations WHERE company_id = ? AND id IN (?)`,
       [companyId, opIds],
-    ),
-    resIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+    )),
+    resIds.length === 0 ? Promise.resolve([[]]) : timed('res', pool.query(
       `SELECT id, name FROM fab_resources WHERE company_id = ? AND id IN (?)`,
       [companyId, resIds],
-    ),
-    touchedOrderIds.length === 0 ? Promise.resolve([[]]) : pool.query(
+    )),
+    touchedOrderIds.length === 0 ? Promise.resolve([[]]) : timed('orders', pool.query(
       `SELECT id, order_number AS orderNumber, customer_name AS customerName,
               priority, priority_rank AS priorityRank, required_date AS requiredDate,
               must_finish_by AS mustFinishBy
          FROM fab_orders WHERE company_id = ? AND id IN (?)`,
       [companyId, touchedOrderIds],
-    ),
-    ...[...calendarProbes.values()].map((t) => calendarFor(t)),
+    )),
+    timed('calendars', Promise.all([...calendarProbes.values()].map((t) => calendarFor(t)))),
   ]);
 
   mark('wave2_reads');
