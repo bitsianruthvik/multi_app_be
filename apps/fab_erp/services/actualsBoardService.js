@@ -414,10 +414,23 @@ export async function getActualsBoard(companyId, {
    * Do not collapse waves 2 and 3 by dropping the `degraded` guard: on an
    * oversized window the roll-up is exactly the query that must not run.
    */
+  /**
+   * Stage timings, always measured.
+   *
+   * Reported on every response rather than hidden behind a debug flag, because
+   * the one time it mattered the board was already in production and guessing
+   * which of ten reads dominated cost a deploy cycle per guess. A handful of
+   * Date.now() calls is not a cost worth being clever about.
+   */
+  const marks = {};
+  let mark0 = Date.now();
+  const mark = (name) => { marks[name] = Date.now() - mark0; mark0 = Date.now(); };
+
   const [tz, tasks] = await Promise.all([
     plannerTimezone(companyId),
     loadTasks(companyId, from, to, { orderIds, resourceTypeIds }),
   ]);
+  mark('wave1_tasks');
   const empty = {
     from, to, timezone: tz, mode, level, now: now.toISOString(),
     lanes: [], items: [], orders: [], lines: [], entries: [], operations: [], resources: [],
@@ -493,6 +506,8 @@ export async function getActualsBoard(companyId, {
     ...[...calendarProbes.values()].map((t) => calendarFor(t)),
   ]);
 
+  mark('wave2_reads');
+
   // ── items: the walk data, the labels, the weights ─────────────────────────
   const degraded = loaded.truncated;
   const items = degraded
@@ -510,6 +525,8 @@ export async function getActualsBoard(companyId, {
       [companyId, lineIds],
     ),
   ]);
+
+  mark('wave3_reads');
 
   // ── when each task was really being worked on ─────────────────────────────
   /** Every calendar set seen, so the pack lanes can be shaded by their union. */
@@ -546,6 +563,8 @@ export async function getActualsBoard(companyId, {
     clippedByTask.set(t.id, spans);
     clockByTask.set(t.id, cal.clock);
   }
+
+  mark('clip');
 
   // ── status per task ───────────────────────────────────────────────────────
   // `plannedEnds` came back in wave 2.
@@ -819,6 +838,8 @@ export async function getActualsBoard(companyId, {
     }
   }
 
+  mark('assemble');
+
   // ── statistics ────────────────────────────────────────────────────────────
   const taskCountByItem = new Map();
   // `rollup` came back in wave 3.
@@ -965,5 +986,6 @@ export async function getActualsBoard(companyId, {
       unitsCarriedIn,
       degraded,
     },
+    timings: { ...marks, stats: Date.now() - mark0 },
   };
 }
