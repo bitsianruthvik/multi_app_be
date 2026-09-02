@@ -35,14 +35,58 @@ import { pool } from '../../../db.js';
 import { cachedQuery } from './planReadCache.js';
 import { PlanError } from './planService.js';
 
-/** Coarse → fine. Must match boardModel.GROUP_LEVELS exactly. */
-export const GROUP_LEVELS = ['order', 'line', 'span', 'girder', 'segment', 'part'];
+/**
+ * The two rungs ABOVE the item tree. Everything below them is a DEPTH.
+ *
+ * This used to be a fixed six-rung ladder — order, line, span, girder, segment,
+ * part — with a `KIND_RANK` table mapping each level name to its position. Four
+ * of those six were structural levels the company could not change, so a job
+ * with a fifth level had nowhere to sit and a job with three had a dead rung.
+ *
+ * A depth level is written `d0`, `d1`, `d2`… where the number is
+ * `fab_items.depth`: d0 is the line's root, d1 its children, and so on for
+ * however deep the BOM goes. Ranking is then arithmetic rather than a lookup,
+ * and nothing here has to know what a girder is.
+ *
+ * Labels come from the catalog item names found at that depth — see
+ * `depthLabels` — so a board still reads "Girder" without 'girder' appearing
+ * anywhere in this file.
+ */
+export const GROUP_LEVELS = ['order', 'line'];
 
-/** Must match boardModel.KIND_RANK exactly. */
-const KIND_RANK = { span: 2, girder: 3, segment: 4, part: 5, material: 6 };
+/** Deep enough for any real structure; guards a nonsense `d99` from a client. */
+export const MAX_GROUP_DEPTH = 12;
+
+export const isDepthLevel = (l) => /^d\d+$/.test(String(l ?? ''));
+export const depthOfLevel = (l) => Number(String(l).slice(1));
+export const isGroupLevel = (l) => GROUP_LEVELS.includes(l)
+  || (isDepthLevel(l) && depthOfLevel(l) <= MAX_GROUP_DEPTH);
 
 /** Guards a malformed parent chain; a cycle would otherwise loop forever. */
 const MAX_WALK = 24;
+
+/**
+ * What to call each depth on this order: the distinct catalog item names sitting
+ * at that depth, most common first.
+ *
+ * One query, because a board asks this once per render and the alternative is a
+ * per-depth round trip. A depth whose rows are named inconsistently gets the
+ * commonest name — the label is a signpost, not an identity.
+ */
+export async function depthLabels(companyId, orderIds) {
+  if (!orderIds?.length) return {};
+  const [rows] = await cachedQuery(
+    `SELECT depth, name, COUNT(*) n FROM fab_items
+      WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
+        AND node_kind = 'structure'
+      GROUP BY depth, name
+      ORDER BY depth, n DESC`,
+    [companyId, orderIds],
+  );
+  const out = {};
+  for (const r of rows) if (out[`d${r.depth}`] == null) out[`d${r.depth}`] = r.name;
+  return out;
+}
 
 /**
  * Parse a unit key as the board writes it: `o:<orderId>` / `l:<lineId>` /
@@ -63,11 +107,10 @@ export function parseUnitKey(key) {
  * a third would be the same bug waiting to happen.
  */
 export function groupKeyFor(itemsById, itemId, level) {
-  const wanted = GROUP_LEVELS.indexOf(level);
   const start = itemsById.get(Number(itemId)) ?? null;
   if (!start) return null;
 
-  if (wanted <= 1) {
+  if (level === 'order' || level === 'line') {
     // order / line are not BOM nodes; climb until the ids appear.
     let cur = start;
     for (let i = 0; i < MAX_WALK && cur; i += 1) {
@@ -77,11 +120,19 @@ export function groupKeyFor(itemsById, itemId, level) {
     }
     return null;
   }
+  if (!isDepthLevel(level)) return null;
 
+  /*
+   * Climb until the node is at or above the wanted depth.
+   *
+   * A material row sits one deeper than the part it belongs to, so it walks up
+   * to that part like anything else — the old `KIND_RANK` gave 'material' rank
+   * 6 to get the same effect, and had to state it as a special case.
+   */
+  const wanted = depthOfLevel(level);
   let node = start;
   for (let i = 0; i < MAX_WALK && node; i += 1) {
-    const rank = KIND_RANK[node.levelKind ?? ''] ?? 0;
-    if (rank <= wanted) return `i:${node.id}`;
+    if (Number(node.depth ?? 0) <= wanted) return `i:${node.id}`;
     node = node.parentItemId != null ? itemsById.get(node.parentItemId) ?? null : null;
   }
   return null;
@@ -117,8 +168,8 @@ async function ordersForUnit(companyId, unit) {
  * @returns {Promise<{entryIds: number[], level: string, key: string, orderIds: number[]}>}
  */
 export async function resolveUnitEntries(companyId, { level, key } = {}) {
-  if (!GROUP_LEVELS.includes(level)) {
-    throw new PlanError('BAD_UNIT', `"${level}" is not a level of the BOM ladder.`);
+  if (!isGroupLevel(level)) {
+    throw new PlanError('BAD_UNIT', `"${level}" is not a grouping level. Use 'order', 'line', or 'd<n>'.`);
   }
   const unit = parseUnitKey(key);
   if (!unit) throw new PlanError('BAD_UNIT', `"${key}" is not a unit key.`);
@@ -131,7 +182,7 @@ export async function resolveUnitEntries(companyId, { level, key } = {}) {
   // The order's whole item tree — the walk needs ancestors, not just the leaves
   // that carry tasks.
   const [items] = await cachedQuery(`SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
-            order_line_id AS orderLineId, level_kind AS levelKind
+            order_line_id AS orderLineId, depth, node_kind AS nodeKind
        FROM fab_items
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL`,
     [companyId, orderIds],

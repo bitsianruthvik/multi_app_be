@@ -410,7 +410,7 @@ async function claimNest(conn, companyId, task, node, inp, required) {
     // made with the thing it is made from.
     `SELECT nest_no, qty, length, width FROM fab_items
       WHERE company_id = ? AND parent_item_id = ? AND catalog_item_id = ?
-        AND (level_kind = 'material' OR (level_kind IS NULL AND flow_id IS NULL))
+        AND node_kind = 'material'
         AND deleted_at IS NULL
       LIMIT 1`,
     [companyId, node.id, inp.ref_catalog_item_id],

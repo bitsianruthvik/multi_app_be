@@ -13,7 +13,7 @@
  *   a CHILD fab_items row under the part
  *     catalog_item_id  the material            <- what makes it a material row
  *     flow_id          NULL                    <- and not a made child part
- *     level_kind       'material'
+ *     node_kind        'material'
  *     qty              1
  *     nest_no          NULL until nesting groups it onto a plate
  *
@@ -34,7 +34,7 @@
  * only because the stored figures were written before the typing and nothing had
  * recomputed them since. Any BOQ re-import would have written it in.
  *
- * `level_kind = 'material'` is the test now: the row says what it IS rather than
+ * `node_kind = 'material'` is the test now: the row says what it IS rather than
  * being inferred from which columns happen to be filled. Verified against
  * production — 1,084 material rows, all labelled, and the 10 false positives are
  * exactly the typed assemblies. Use `MATERIAL_LINK_SQL` / `isMaterialLink` rather
@@ -55,18 +55,17 @@ import { syncOrderProcurement } from './procurementService.js';
 /**
  * "This row is a piece of raw material", as a SQL predicate.
  *
- * The second clause is for rows written before `level_kind` existed: they have no
- * label, so the old inferred test is still the only thing that can identify them.
- * It is safe to keep because a TYPED assembly always has a level_kind — that is
- * what makes it typed — so the fallback can never readmit the rows this fix is
- * about. Unqualified column names; alias the table as needed by prefixing.
+ * One clause now, and no fallback. `node_kind` is NOT NULL with a default of
+ * 'structure' and every writer sets it, so there is no era of unlabelled rows
+ * for a fallback to rescue — which is the whole reason the old inferred test
+ * (`a catalog item with no flow`) was replaced twice. Unqualified column name;
+ * alias the table as needed by prefixing.
  */
 export const MATERIAL_LINK_SQL =
-  "(level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))";
+  "node_kind = 'material'";
 
-/** The same test against a row already in hand. Needs `level_kind` selected. */
-export const isMaterialLink = (r) => r?.level_kind === 'material'
-  || (r?.level_kind == null && r?.catalog_item_id != null && r?.flow_id == null);
+/** The same test against a row already in hand. Needs `node_kind` selected. */
+export const isMaterialLink = (r) => r?.node_kind === 'material' || r?.nodeKind === 'material';
 
 /**
  * The PLATE SIZE to stamp on a material link, for a chosen catalog material.
@@ -120,7 +119,7 @@ async function plateDimsForMaterial(exec, companyId, material) {
 async function loadPart(exec, companyId, itemId) {
   const [[part]] = await exec.query(
     `SELECT i.id, i.order_id AS orderId, i.order_line_id AS lineId, i.code, i.name,
-            i.flow_id AS flowId, i.level_kind AS levelKind
+            i.flow_id AS flowId, i.node_kind AS nodeKind, i.depth
        FROM fab_items i
       WHERE i.id = ? AND i.company_id = ? AND i.deleted_at IS NULL LIMIT 1`,
     [itemId, companyId],
@@ -132,7 +131,7 @@ async function loadPart(exec, companyId, itemId) {
 async function existingLink(exec, companyId, partId) {
   const [[row]] = await exec.query(
     `SELECT id, catalog_item_id AS catalogItemId, nest_no AS nestNo FROM fab_items
-      WHERE company_id = ? AND parent_item_id = ? AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL)) AND deleted_at IS NULL LIMIT 1`,
+      WHERE company_id = ? AND parent_item_id = ? AND node_kind = 'material' AND deleted_at IS NULL LIMIT 1`,
     [companyId, partId],
   );
   return row ?? null;
@@ -229,15 +228,19 @@ export async function setItemMaterial(companyId, itemId, catalogItemId, existing
     // columns. The screen has no size fields, so it derives them instead.
     const dims = await plateDimsForMaterial(conn, companyId, material);
     await conn.query(
+      // `is_leaf` is 0: leaf-ness describes the STRUCTURE, and a material link
+      // is not part of it. The part above stays the leaf it was — which is why
+      // adding a plate to a part must not stop nesting seeing that part.
       `INSERT INTO fab_items
          (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
-          qty, flow_id, length, width, height, code, nest_no, level_kind)
-       VALUES (?,?,?,?,?,?,?,1,NULL,?,?,?,?,NULL,'material')`,
+          qty, flow_id, length, width, height, code, nest_no, node_kind, depth, is_leaf)
+       VALUES (?,?,?,?,?,?,?,1,NULL,?,?,?,?,NULL,'material',?,0)`,
       [
         companyId, part.orderId, part.lineId, part.id, material.id, material.name,
         material.unit || 'pcs',
         dims.length, dims.width, dims.height,
         composeCode(part.code, materialSegment(material.code, material.name)),
+        Number(part.depth ?? 0) + 1,
       ],
     );
     // The link is a catalog stock draw, so this is what makes it 'buy'. Without

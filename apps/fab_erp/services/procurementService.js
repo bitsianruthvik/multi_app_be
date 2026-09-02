@@ -165,7 +165,7 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
   );
 
   const [make] = await exec.query(
-    `SELECT fi.id, fi.parent_item_id, fi.code, fi.name, fi.level_kind, fi.qty,
+    `SELECT fi.id, fi.parent_item_id, fi.code, fi.name, fi.node_kind, fi.qty,
             fi.unit, fi.flow_id, fi.total_weight
        FROM fab_items fi
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL

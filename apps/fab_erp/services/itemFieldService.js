@@ -394,7 +394,7 @@ export async function inputContextForItem(companyId, itemId, conn) {
   if (!itemId) return { byRole: {}, all: [] };
   const [children] = await exec.query(
     `SELECT id, catalog_item_id AS catalogItemId, flow_id AS flowId,
-            level_kind AS levelKind
+            depth, node_kind AS nodeKind
        FROM fab_items
       WHERE company_id = ? AND parent_item_id = ? AND deleted_at IS NULL
       ORDER BY id`,
@@ -404,7 +404,7 @@ export async function inputContextForItem(companyId, itemId, conn) {
   const values = await resolveItemFields(companyId, children.map((c) => c.id), { conn: exec });
   return buildInputContext({
     /**
-     * Classified by `level_kind`, which SAYS what the row is, rather than by
+     * Classified by `node_kind`, which SAYS what the row is, rather than by
      * which column happens to be null.
      *
      * It used to be "has a catalog id => raw material" and "has a flow => a
@@ -414,11 +414,11 @@ export async function inputContextForItem(companyId, itemId, conn) {
      * the span's formula, and once it also has a flow it lands in BOTH lists and
      * is handed to two different `input.<role>` namespaces at once.
      *
-     * `level_kind = 'material'` is set by whoever creates the link
+     * `node_kind = 'material'` is set by whoever creates the link
      * (itemMaterialService, boqSheetService) and is the actual claim being made.
      */
-    rmChildren: children.filter((c) => c.levelKind === 'material'),
-    partChildren: children.filter((c) => c.levelKind !== 'material' && c.flowId != null),
+    rmChildren: children.filter((c) => c.nodeKind === 'material'),
+    partChildren: children.filter((c) => c.nodeKind !== 'material' && c.flowId != null),
     valuesByItemId: values,
   });
 }

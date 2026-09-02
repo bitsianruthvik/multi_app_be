@@ -171,8 +171,7 @@ async function nestableParts(companyId, orderId, { includeNested }) {
        FROM fab_items p
        LEFT JOIN fab_items rm
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND (rm.level_kind = 'material'
-                  OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+             AND rm.node_kind = 'material'
        LEFT JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         /*
@@ -183,8 +182,7 @@ async function nestableParts(companyId, orderId, { includeNested }) {
          * procurement classifies it — so every nested part was offered twice,
          * once as itself and once as the plate it sits on.
          */
-        AND NOT (p.level_kind = 'material'
-                 OR (p.level_kind IS NULL AND p.catalog_item_id IS NOT NULL AND p.flow_id IS NULL))
+        AND NOT p.node_kind = 'material'
         -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
         -- a stud, a bolt, a bearing — is not cut from anything, so asking which
         -- plate it comes off is the wrong question; procurement matches it to
@@ -195,8 +193,7 @@ async function nestableParts(companyId, orderId, { includeNested }) {
         AND NOT EXISTS (
           SELECT 1 FROM fab_items k
            WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL
-             AND NOT (k.level_kind = 'material'
-                      OR (k.level_kind IS NULL AND k.catalog_item_id IS NOT NULL AND k.flow_id IS NULL)))
+             AND NOT k.node_kind = 'material')
         ${includeNested ? '' : 'AND rm.nest_no IS NULL'}
       ORDER BY p.code`,
     [companyId, orderId],
@@ -594,7 +591,7 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
               SET nest_no = ?, catalog_item_id = ?, name = ?, unit = ?,
                   length = ?, width = ?, height = ?, qty = 1
             WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
-              AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+              AND node_kind = 'material'`,
           [nestNo, plate.id, plate.name, plate.unit || 'nos',
             n.plate.length, n.plate.width, plate.thicknessMm,
             companyId, orderId, linkIds],
@@ -616,10 +613,11 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
         const [made] = await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
-              qty, flow_id, length, width, height, code, nest_no, level_kind, dim_unit, weight_unit)
+              qty, flow_id, length, width, height, code, nest_no, node_kind, depth, is_leaf,
+              dim_unit, weight_unit)
            SELECT p.company_id, p.order_id, p.order_line_id, p.id, ?, ?, ?,
                   1, NULL, ?, ?, ?,
-                  CONCAT(COALESCE(p.code, p.id), '-', ?), ?, 'material', 'mm', 'kg'
+                  CONCAT(COALESCE(p.code, p.id), '-', ?), ?, 'material', p.depth + 1, 0, 'mm', 'kg'
              FROM fab_items p
             WHERE p.company_id = ? AND p.order_id = ? AND p.id IN (?) AND p.deleted_at IS NULL`,
           [plate.id, plate.name, plate.unit || 'nos',

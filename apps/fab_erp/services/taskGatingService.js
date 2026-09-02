@@ -351,10 +351,10 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     // for new work. The same omission made `rm.qty` undefined, so every
     // fab_task_inputs row was written with a NULL quantity and the
     // quantity-aware material gate silently degraded to a presence check.
-    // `level_kind` is what says whether a child is MATERIAL or a part. Without
+    // `node_kind` is what says whether a child is MATERIAL or a part. Without
     // it the classification below falls back to guessing from null columns,
     // which stops working the moment a made item carries a catalog id.
-    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, level_kind
+    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, node_kind
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
@@ -479,7 +479,7 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     : new Map();
 
   /**
-   * A child's ROLE comes from `level_kind`, which states it, not from which
+   * A child’s ROLE comes from `node_kind`, which states it, not from which
    * column happens to be null.
    *
    * The two lists were previously "has a flow" and "has a catalog id", and they
@@ -489,10 +489,10 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
    * on as stock that must arrive. With a flow as well it would land in BOTH
    * lists and reach two different `input.<role>` namespaces at once.
    *
-   * `level_kind = 'material'` is written by whoever creates the link, and is
+   * `node_kind = 'material'` is written by whoever creates the link, and is
    * the claim itself rather than a side effect of it.
    */
-  const isMaterial = (it) => it.level_kind === 'material';
+  const isMaterial = (it) => it.node_kind === 'material';
 
   // child parts per parent item — for 'child_parts' inputs
   const childPartsByParent = new Map();

@@ -1474,7 +1474,7 @@ async function itemAncestry(companyId, itemIds) {
   let frontier = [...new Set(itemIds.filter((x) => x != null))];
   for (let depth = 0; depth < MAX_BOM_DEPTH && frontier.length > 0; depth += 1) {
     const [rows] = await cachedQuery(`SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
-              order_line_id AS orderLineId, level_kind AS levelKind,
+              order_line_id AS orderLineId, depth, node_kind AS nodeKind,
               name, code, mark
          FROM fab_items
         WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
@@ -1624,6 +1624,27 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [], 
     timezone: tz,
     lanes: outLanes,
     items,
+    /*
+     * What to call each depth, so the board's "Group by" picker reads
+     * "Span / Girder / Segment" without the word 'girder' existing anywhere in
+     * the planner. Derived from the items already loaded rather than queried
+     * again — every one of them is here, with its name and its depth.
+     */
+    depthLabels: (() => {
+      const count = new Map();
+      for (const i of items) {
+        if (i.nodeKind === 'material' || i.name == null) continue;
+        const k = `d${i.depth ?? 0}`;
+        if (!count.has(k)) count.set(k, new Map());
+        const bag = count.get(k);
+        bag.set(i.name, (bag.get(i.name) ?? 0) + 1);
+      }
+      const out = {};
+      for (const [k, bag] of count) {
+        out[k] = [...bag.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      }
+      return out;
+    })(),
     orders,
     lines,
     // The words, once. Every block names an entry; most entries carry many, and

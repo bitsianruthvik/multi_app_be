@@ -5,7 +5,7 @@ import {
   exportBoqSheet, importBoqSheet, buildWizardRows, applyWizardRows,
 } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
-import { flowSummary, applyFlowRules, setItemFlow } from '../services/flowAllocationService.js';
+import { flowSummary, syncFlowsFromBom, setItemFlow } from '../services/orderFlowService.js';
 import { setFields } from '../services/fieldService.js';
 import { deleteSalesOrder } from '../services/orderDeleteService.js';
 import {
@@ -210,16 +210,16 @@ export const flowSummaryHandler = async (req, res) => {
 };
 
 /** POST — apply the flow rules. `reassign` also overwrites existing choices. */
-export const applyFlowRulesHandler = async (req, res) => {
+export const syncFlowsFromBomHandler = async (req, res) => {
   try {
     const cid = companyId(req);
     const orderId = Number(req.params.orderId);
     const reassign = req.body?.reassign === true;
-    const result = await applyFlowRules(cid, orderId, { reassign });
+    const result = await syncFlowsFromBom(cid, orderId, { reassign });
     res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: applyFlowRules failed');
+    logger.error({ err }, 'fab_erp: syncFlowsFromBom failed');
     res.status(500).json({ message: err.message });
   }
 };
@@ -519,7 +519,7 @@ export const orderNestingHandler = async (req, res) => {
            ON parent.id = rm.parent_item_id AND parent.deleted_at IS NULL
          JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id
         WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-          AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+          AND rm.node_kind = 'material'
           AND NOT EXISTS (SELECT 1 FROM fab_items c
                            WHERE c.parent_item_id = rm.id AND c.deleted_at IS NULL)
         ORDER BY fic.code, rm.nest_no, parent.code`,

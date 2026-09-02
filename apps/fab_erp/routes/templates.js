@@ -70,7 +70,7 @@ router.get('/templates', protect, async (req, res) => {
   try {
     const cid = companyId(req);
     const [rows] = await pool.query(
-      `SELECT c.id, c.code, c.name, c.level_kind AS levelKind,
+      `SELECT c.id, c.code, c.name,
               cat.name AS categoryName, cat.id AS categoryId,
               (SELECT COUNT(*) FROM fab_item_bom b
                 WHERE b.company_id = c.company_id AND b.parent_item_id = c.id
@@ -203,7 +203,7 @@ router.get('/item-bom/:itemId', protect, async (req, res) => {
     }
 
     const [[parent]] = await pool.query(
-      `SELECT id, code, name, unit, level_kind AS levelKind FROM fab_item_catalog
+      `SELECT id, code, name, unit FROM fab_item_catalog
         WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
       [cid, parentItemId],
     );
@@ -244,6 +244,8 @@ router.post('/item-bom', protect, requirePerm('fab_erp_projects_manage'), async 
       codeSegment: b.codeSegment ?? null,
       helpText: b.helpText ?? null,
       sortOrder: b.sortOrder ?? 0,
+      // What every item expanded from this line starts life being made by.
+      defaultFlowId: b.defaultFlowId ?? null,
     });
     return res.json({ ok: true });
   } catch (err) { return fail(res, err, 'item BOM save'); }

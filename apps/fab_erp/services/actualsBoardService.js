@@ -144,7 +144,7 @@ async function loadOrderItems(companyId, orderIds) {
 
   const [rows] = await pool.query(
     `SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
-            order_line_id AS orderLineId, level_kind AS levelKind,
+            order_line_id AS orderLineId, depth, node_kind AS nodeKind,
             name, code, mark, total_weight AS totalWeight
        FROM fab_items
       WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL`,
@@ -167,7 +167,7 @@ async function itemAncestry(companyId, itemIds) {
     for (const part of chunk(frontier, ID_CHUNK)) {
       const [r] = await pool.query(
         `SELECT id, parent_item_id AS parentItemId, order_id AS orderId,
-                order_line_id AS orderLineId, level_kind AS levelKind,
+                order_line_id AS orderLineId, depth, node_kind AS nodeKind,
                 name, code, mark, total_weight AS totalWeight
            FROM fab_items
           WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
@@ -364,7 +364,7 @@ function makeCalendarCache(companyId, from, to) {
  *    one plate for several parts, the same plate would be counted once per part
  *    it fed. So material rows contribute nothing and are not children for the
  *    purpose of rule 1 either, which is what leaves a part holding its own
- *    75 kg. (`fab_items.level_kind` is what says a row is material; see the
+ *    75 kg. (`fab_items.node_kind` is what says a row is material; see the
  *    note at init.sql where it is described as load-bearing for exactly this.)
  *
  * 3. **Weight and work do not sit on the same rows.** An assembly has tasks and
@@ -377,7 +377,7 @@ function makeCalendarCache(companyId, from, to) {
  * own-weight except the parts, which is where the work is.
  */
 function attributeWeights(items, taskCountByItem) {
-  const isMaterial = (it) => String(it.levelKind ?? '') === 'material';
+  const isMaterial = (it) => it.nodeKind === 'material';
   const byId = new Map(items.map((i) => [Number(i.id), i]));
 
   const childSum = new Map();
@@ -1040,7 +1040,7 @@ export async function getActualsBoard(companyId, {
       parentItemId: i.parentItemId,
       orderId: i.orderId,
       orderLineId: i.orderLineId,
-      levelKind: i.levelKind,
+      depth: i.depth, nodeKind: i.nodeKind,
       name: i.name,
       code: i.code,
       mark: i.mark,

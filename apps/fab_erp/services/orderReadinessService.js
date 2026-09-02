@@ -36,7 +36,7 @@ import { missingFieldsForOrder } from './itemFieldService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder, onOrderByItem } from './procurementOrderService.js';
 import { orderStageApplicability } from './stageApplicabilityService.js';
-import { flowSummary } from './flowAllocationService.js';
+import { flowSummary } from './orderFlowService.js';
 import { checkOrderNesting, blockingIssues } from './nestingIntegrityService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { logger } from '../../../core/utils/logger.js';
@@ -286,14 +286,16 @@ export async function orderReadiness(companyId, orderId) {
       // codes ARE the structure. Dimensions moved to `params`, which cannot be
       // asked until the flows are known.
       label: 'Structure',
-      // Spans and girders with no parts under them is a half-entered BOQ, not
-      // an empty one — the difference matters to someone deciding what to do next.
+      // Assemblies with nothing under them is a half-entered structure, not an
+      // empty one — the difference matters to someone deciding what to do next.
       state: tree.parts > 0 ? 'done' : tree.total > 0 ? 'partial' : 'todo',
       count: tree.total,
       total: tree.total,
+      // Reads "2 Span · 8 Girder · 174 Segment · 1084 Top Flange" — every rung
+      // the order actually has, named by what is on it.
       detail: tree.total === 0
         ? 'No structure entered'
-        : `${tree.spans} span · ${tree.girders} girder · ${tree.segments} segment · ${tree.parts} part`,
+        : tree.levels.map((l) => `${l.count} ${l.label}`).join(' · '),
     },
     {
       key: 'flows',
@@ -567,54 +569,46 @@ async function countLines(companyId, orderId) {
 }
 
 /**
- * What the order's structure contains.
+ * What the order's structure contains, one entry per DEPTH.
  *
- * `level_kind` is only stamped by the Excel importer. A structure built by hand
- * in the tree left it NULL on every row, and this used to filter on
- * `level_kind IS NOT NULL` — so the stage reported "No structure entered" no
- * matter how much had been typed, the step never went green, and because
- * `preparationComplete` requires every stage done, Confirm stayed disabled too.
- * The only way through was to download the sheet and upload it back, which is
- * why the Excel round-trip felt mandatory rather than optional.
+ * This used to count four fixed buckets — spans, girders, segments, parts —
+ * which meant an order five levels deep had nowhere to report its fifth, and a
+ * flat one reported two empty rungs. It also had to guess a level for every row
+ * built by hand rather than imported, because only the Excel importer ever
+ * stamped `level_kind`.
  *
- * So rows with no `level_kind` are now classified by SHAPE instead: a row with
- * no children is a part (it is the thing that gets made), a row with children
- * is structure above it. That is the same distinction the importer's labels
- * encode, derived from the tree rather than from who created the row, so it is
- * right for hand-built, imported, and half-and-half orders alike — including
- * the ones already sitting in the database with NULL on every row.
+ * Depth is stamped by every writer, so there is nothing left to guess. The
+ * caller gets `[{depth, label, count, leaves}]` and names each rung from the
+ * items actually on it — a signpost taken from the data rather than a vocabulary
+ * this function has to hold.
  *
  * Raw-material links are excluded throughout. They are children of a part, not
- * a level of the structure, and counting them would report every part twice.
+ * a rung of the structure, and counting them would report every part twice.
  */
 async function countTree(companyId, orderId) {
   const [rows] = await pool.query(
-    `SELECT fi.id, fi.level_kind,
-            EXISTS (SELECT 1 FROM fab_items c
-                     WHERE c.parent_item_id = fi.id AND c.deleted_at IS NULL
-                       AND c.catalog_item_id IS NULL) AS has_children
+    `SELECT fi.depth,
+            COUNT(*) AS n,
+            SUM(fi.is_leaf = 1) AS leaves,
+            SUBSTRING_INDEX(GROUP_CONCAT(fi.name ORDER BY fi.id), ',', 1) AS label
        FROM fab_items fi
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
-        -- not a raw-material link: those hang under a part
-        AND NOT ((fi.level_kind = 'material' OR (fi.level_kind IS NULL AND fi.catalog_item_id IS NOT NULL AND fi.flow_id IS NULL)))`,
+        AND fi.node_kind = 'structure'
+      GROUP BY fi.depth
+      ORDER BY fi.depth`,
     [companyId, orderId],
   );
 
-  let spans = 0, girders = 0, segments = 0, parts = 0;
-  for (const r of rows) {
-    if (r.level_kind === 'material') continue;
-    if (r.level_kind) {
-      if (r.level_kind === 'span') spans++;
-      else if (r.level_kind === 'girder') girders++;
-      else if (r.level_kind === 'segment') segments++;
-      else if (r.level_kind === 'part') parts++;
-      continue;
-    }
-    // Unlabelled: a leaf is the thing that gets made.
-    if (Number(r.has_children) === 0) parts++;
-    else segments++;
-  }
-  return { spans, girders, segments, parts, total: spans + girders + segments + parts };
+  const levels = rows.map((r) => ({
+    depth: Number(r.depth),
+    label: r.label ?? `Level ${Number(r.depth) + 1}`,
+    count: Number(r.n) || 0,
+    leaves: Number(r.leaves) || 0,
+  }));
+  const total = levels.reduce((a, l) => a + l.count, 0);
+  // The things that actually get made, at whatever depth they turned out to be.
+  const parts = levels.reduce((a, l) => a + l.leaves, 0);
+  return { levels, parts, total };
 }
 
 /**
@@ -629,9 +623,9 @@ async function countNesting(companyId, orderId) {
        FROM fab_items p
        LEFT JOIN fab_items rm
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+             AND rm.node_kind = 'material'
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
-        AND p.level_kind = 'part'
+        AND p.is_leaf = 1 AND p.node_kind = 'structure'
         -- Made parts only, the same rule nesting itself applies. A shear stud is
         -- BOUGHT WHOLE: it is never cut from a plate, so counting it as
         -- un-nested holds the stage at partial over work nobody can ever do.
@@ -656,42 +650,45 @@ async function countTasks(companyId, orderId) {
 /**
  * Turn a flowSummary into a stage.
  *
- * The hard part is that a flow-less item is usually CORRECT — spans and girders
- * are groupings and carry no flow at all. So "missing" cannot mean "has no
- * flow". It means: this level has a rule, so the company has said work happens
- * here, and yet this item has none. The company's own configuration defines the
- * intent, which is the only definition that stays right as their setup changes.
+ * The hard part is that a flow-less item is usually CORRECT — an assembly that
+ * only groups its children carries no flow at all, and on a normal order that
+ * describes every rung above the leaves. So "missing" cannot mean "has no
+ * flow".
+ *
+ * It used to mean "this level has a rule, so the company has said work happens
+ * here, and yet this item has none". With the default on the BOM line there is
+ * no rule table to consult, and the equivalent question is simpler and more
+ * direct: does the BOM have an answer this item never received? That happens
+ * only when a line's default was set after the order was built, and
+ * `syncFlowsFromBom` is what clears it.
+ *
+ * Everything else — a leaf with no flow and no BOM default — is a genuine
+ * choice someone still has to make, so it is reported without pretending a
+ * button will fix it.
  */
 function summariseFlows(summary) {
-  const ruledLevels = new Set(summary.rules.map((r) => r.level));
-  let withFlow = 0, flowable = 0, missing = 0;
+  let withFlow = 0, flowable = 0;
   for (const lv of summary.levels) {
     withFlow += lv.withFlow;
-    if (!ruledLevels.has(lv.level)) continue;
     flowable += lv.items;
-    missing += lv.items - lv.withFlow;
   }
-  const wouldAssign = summary.wouldAssign;   // fixable by pressing Apply
-  const manual = Math.max(0, missing - wouldAssign); // need a choice
+  const wouldAssign = summary.wouldAssign;   // fixable by re-pulling the BOM
 
   let state, detail;
   if (wouldAssign > 0) {
     state = 'partial';
-    detail = `${wouldAssign} item(s) match a rule but have no flow — press Apply`;
-  } else if (missing > 0) {
-    state = 'partial';
-    detail = `${missing} item(s) have no flow and no rule matches`;
+    detail = `${wouldAssign} item(s) have a flow on the BOM that has not been pulled in yet`;
   } else if (withFlow > 0) {
     state = 'done';
     detail = `${withFlow} item(s) have a flow`;
-  } else if (!summary.rules.length) {
+  } else if (flowable === 0) {
     state = 'todo';
-    detail = 'No flow rules are set up yet';
+    detail = 'No structure to give a flow to yet';
   } else {
     state = 'todo';
-    detail = 'No item has a flow yet';
+    detail = 'No item has a flow yet — set a default flow on the BOM lines';
   }
-  return { state, detail, withFlow, flowable, wouldAssign, manual, missing };
+  return { state, detail, withFlow, flowable, wouldAssign, manual: 0, missing: wouldAssign };
 }
 
 // ── blockers ─────────────────────────────────────────────────────────────────

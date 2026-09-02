@@ -32,7 +32,7 @@ import {
   exportNestingHandler,
   importNestingHandler,
   flowSummaryHandler,
-  applyFlowRulesHandler,
+  syncFlowsFromBomHandler,
   setItemFlowHandler,
   setItemSpecHandler,
   getItemSpecHandler,
@@ -95,7 +95,7 @@ router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab
 
 // ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
-router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), applyFlowRulesHandler);
+router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), syncFlowsFromBomHandler);
 router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage'), setItemFlowHandler);
 
 /**

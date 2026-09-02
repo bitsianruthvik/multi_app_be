@@ -69,10 +69,13 @@ const WRITE_FORBIDDEN = {
  * Direct-ref rules: resource alias → array of { field, entity } pairs.
  * Only fields that are present AND non-null in the filtered payload are checked.
  */
+/*
+ * `fabErpItem.manufacturing_method_template_id` was gated here against a
+ * `manufacturing_method_templates` table that does not exist in any environment
+ * — the column held zero rows for its whole life and nothing in the frontend
+ * ever referenced it. Dropped with the column, 2026-09-02.
+ */
 const CONSUMPTION_RULES = {
-  fabErpItem: [
-    { field: 'manufacturing_method_template_id', entity: 'manufacturing_method_templates' },
-  ],
   fabErpMfgMethodLine: [
     { field: 'routing_template_id',  entity: 'routing_templates'  },
     { field: 'process_template_id',  entity: 'process_templates'  },

@@ -121,7 +121,7 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
        JOIN fab_items p ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
        JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+        AND rm.node_kind = 'material'
         -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
         -- a stud, a bolt, a bearing — is not cut from anything, so asking which
         -- plate it comes off is the wrong question; procurement matches it to

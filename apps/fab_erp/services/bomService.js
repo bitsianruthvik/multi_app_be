@@ -36,10 +36,12 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
+            b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
+       LEFT JOIN fab_operation_flows f ON f.id = b.default_flow_id AND f.deleted_at IS NULL
       WHERE b.company_id = ? AND b.parent_item_id = ? AND b.deleted_at IS NULL AND b.active = 1
       ORDER BY b.sort_order, c.code`,
     [companyId, parentItemId],
@@ -55,6 +57,7 @@ async function bomIndex(companyId, conn = null) {
             b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
+            b.default_flow_id AS defaultFlowId,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
@@ -144,7 +147,7 @@ export async function findCycle(companyId, parentItemId, childItemId, conn = nul
  *        counts, e.g. `{ segmentsPerGirder: [4,5,5,5,5,4] }` for the case the
  *        old wizard called `segmentCounts`. Short or absent falls back to the
  *        single figure, so the simple case stays one number.
- * @returns {Promise<{root, nodes:number, byLevel:Record<string,number>}>}
+ * @returns {Promise<{root, nodes:number, byName:Record<string,number>}>}
  */
 export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   const exec = opts.conn ?? pool;
@@ -227,7 +230,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
          * THE INDEX GOES BEFORE THE SLASH, NOT AFTER IT.
          *
          * A '/' suffix is what routes an item to a different flow: '/D' means
-         * drilled, and `flowAllocationService.pickRule` matches suffixes
+         * drilled. The flow now comes from the BOM line, but the suffix is
          * EXACTLY. Appending the index blindly turned 'BS/D' at qty 2 into
          * 'BS/D1', whose suffix reads '/D1', which no rule names — so the
          * drilled part was silently given the PLAIN flow and never drilled.
@@ -250,8 +253,20 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
 
         nodes++;
         byName[line.childName] = (byName[line.childName] ?? 0) + 1;
+        /**
+         * THE FLOW COMES FROM THE LINE, not from the child type.
+         *
+         * The line is the item IN CONTEXT of its parent, which is the whole
+         * reason this replaced `fab_flow_rules`: a Top Flange inside a Girder
+         * Segment can be made differently from a Top Flange inside a PEB
+         * member, and a rule keyed on the type alone could never say so.
+         */
         const child = {
-          catalogItemId: line.childItemId, name: line.childName, code: childCode, children: [],
+          catalogItemId: line.childItemId,
+          name: line.childName,
+          code: childCode,
+          defaultFlowId: line.defaultFlowId ?? null,
+          children: [],
         };
         target.children.push(child);
         addChildren(child, line.childItemId, childCode, depth + 1, { ordinal: i });
@@ -261,7 +276,12 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
 
   nodes++;
   byName[root.name] = (byName[root.name] ?? 0) + 1;
-  const tree = { catalogItemId: Number(root.id), name: root.name, code: root.code, children: [] };
+  // The root hangs off no BOM line, so it has no default flow. In practice it
+  // is the line's top assembly and carries no work of its own anyway.
+  const tree = {
+    catalogItemId: Number(root.id), name: root.name, code: root.code,
+    defaultFlowId: null, children: [],
+  };
   addChildren(tree, Number(root.id), root.code, 0, { ordinal: 1 });
   return { root: tree, nodes, byName };
 }
@@ -313,13 +333,15 @@ export async function setBomLine(companyId, line, existingConn = null) {
       line.codeSegment ?? null,
       line.helpText ?? null,
       line.sortOrder ?? 0,
+      // Null is a real answer, not "unset": a grouping level carries no flow.
+      line.defaultFlowId == null || line.defaultFlowId === '' ? null : Number(line.defaultFlowId),
     ];
 
     if (id) {
       await conn.query(
         `UPDATE fab_item_bom
             SET parent_item_id=?, child_item_id=?, qty_num=?, qty_param=?, default_qty=?,
-                per_instance_qty=?, code_segment=?, help_text=?, sort_order=?
+                per_instance_qty=?, code_segment=?, help_text=?, sort_order=?, default_flow_id=?
           WHERE id=? AND company_id=?`,
         [...cols.slice(1), id, companyId],
       );
@@ -327,8 +349,8 @@ export async function setBomLine(companyId, line, existingConn = null) {
       await conn.query(
         `INSERT INTO fab_item_bom
            (company_id, parent_item_id, child_item_id, qty_num, qty_param, default_qty,
-            per_instance_qty, code_segment, help_text, sort_order)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            per_instance_qty, code_segment, help_text, sort_order, default_flow_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         cols,
       );
     }
@@ -366,14 +388,14 @@ export async function removeBomLine(companyId, id) {
  * `catalog_item_id` on a made item is constraint C2 coming true. Two things had
  * to be right first, and both now are:
  *
- *   - a child's ROLE comes from `level_kind`, not from "has a catalog id", or
+ *   - a child's ROLE comes from `node_kind`, not from "has a catalog id", or
  *     every girder here would be classified as raw material for its span and
  *     gated on as steel waiting to arrive (H1)
  *   - `procurement_type` is written explicitly as 'make', because
  *     procurementService treats a null one as make-by-absence and would
  *     otherwise mirror the catalog row and could flip these to BUY (H2)
  *
- * @returns {Promise<{created:number, rootItemId:number, byLevel:Record<string,number>}>}
+ * @returns {Promise<{created:number, rootItemId:number, byDepth:Record<number,number>}>}
  */
 export async function instantiate(companyId, spec, existingConn = null) {
   const conn = existingConn ?? await pool.getConnection();
@@ -475,22 +497,29 @@ export async function instantiate(companyId, spec, existingConn = null) {
 
     const tree = await expand(companyId, rootItemId, params, { perInstance, conn });
 
-    // level_kind per catalog item, so an instance can say what it IS.
     const [kinds] = await conn.query(
-      `SELECT id, level_kind AS levelKind, unit, flow_id AS flowId FROM fab_item_catalog
+      `SELECT id, unit FROM fab_item_catalog
         WHERE company_id = ? AND deleted_at IS NULL`,
       [companyId],
     );
     const kindOf = new Map(kinds.map((k) => [Number(k.id), k]));
 
-    const byLevel = {};
+    const byDepth = {};
     let created = 0;
 
     /** Depth-first, parents before children, because a child needs its id. */
-    const write = async (node, parentItemId, prefix) => {
+    const write = async (node, parentItemId, prefix, depth) => {
       const meta = kindOf.get(Number(node.catalogItemId)) ?? {};
-      // Never 'material'. A structural level is not the material link.
-      const levelKind = meta.levelKind && meta.levelKind !== 'material' ? meta.levelKind : 'part';
+      /**
+       * EVERYTHING A TEMPLATE BUILDS IS STRUCTURE.
+       *
+       * A material link is a different thing entirely — it is created by
+       * `itemMaterialService` as a child of a part once nesting decides which
+       * plate that part is cut from, and it is what gates the task on steel
+       * arriving. A template that produced material rows would have every
+       * girder waiting on a delivery that is never coming.
+       */
+      const isLeaf = node.children.length === 0 ? 1 : 0;
       /**
        * The template's code is relative to its ROOT; the order's prefix makes
        * it absolute.
@@ -504,29 +533,26 @@ export async function instantiate(companyId, spec, existingConn = null) {
       const code = prefix ? (rel ? `${prefix}-${rel}` : prefix) : node.code;
 
       const [r] = await conn.query(
-        // The FLOW comes from the TYPE (step 6). It used to be decided by
-        // matching level_kind against a code SUFFIX — so '/D' meaning "drilled"
-        // was a naming convention code had to parse, and it was keyed on the
-        // same free-text variant string as two other tables. A drilled
-        // stiffener is its own catalog item now, so the flow is simply a
-        // property of what the thing is.
+        // The FLOW comes from the BOM LINE this node was expanded from — see
+        // `expand`. Nothing here parses a code, and nothing consults a rules
+        // table; `fab_flow_rules` is gone.
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
-            name, unit, qty, code, level_kind, procurement_type, flow_id)
-         VALUES (?,?,?,?,?,?,?,1,?,?,'make',?)`,
+            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
+         VALUES (?,?,?,?,?,?,?,1,?,'structure',?,?,'make',?)`,
         [
           companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
-          node.name, meta.unit ?? 'nos', code, levelKind, meta.flowId ?? null,
+          node.name, meta.unit ?? 'nos', code, depth, isLeaf, node.defaultFlowId ?? null,
         ],
       );
       created++;
-      byLevel[levelKind] = (byLevel[levelKind] ?? 0) + 1;
+      byDepth[depth] = (byDepth[depth] ?? 0) + 1;
 
-      for (const child of node.children) await write(child, r.insertId, prefix);
+      for (const child of node.children) await write(child, r.insertId, prefix, depth + 1);
       return r.insertId;
     };
 
-    const rootId = await write(tree.root, null, codePrefix);
+    const rootId = await write(tree.root, null, codePrefix, 0);
 
     // Remember what it was built from, and when the copy was taken. Recomputing
     // this later would give the template's CURRENT shape, which is exactly the
@@ -541,7 +567,7 @@ export async function instantiate(companyId, spec, existingConn = null) {
     }
 
     if (owned) await conn.commit();
-    return { created, rootItemId: rootId, byLevel };
+    return { created, rootItemId: rootId, byDepth };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

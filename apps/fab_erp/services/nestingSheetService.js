@@ -106,7 +106,7 @@ export async function exportNestingSheet(companyId, orderId) {
        JOIN fab_items parent ON parent.id = rm.parent_item_id AND parent.deleted_at IS NULL
        JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+        AND rm.node_kind = 'material'
       ORDER BY fic.code, rm.nest_no, parent.code`,
     [companyId, orderId],
   );
@@ -134,10 +134,10 @@ export async function exportNestingSheet(companyId, orderId) {
   const [unnested] = await pool.query(
     `SELECT p.code, p.name FROM fab_items p
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
-        AND p.level_kind = 'part' AND p.code IS NOT NULL
+        AND p.is_leaf = 1 AND p.node_kind = 'structure' AND p.code IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM fab_items c
                          WHERE c.parent_item_id = p.id AND c.deleted_at IS NULL
-                           AND (c.level_kind = 'material' OR (c.level_kind IS NULL AND c.catalog_item_id IS NOT NULL AND c.flow_id IS NULL)))
+                           AND c.node_kind = 'material')
       ORDER BY p.code`,
     [companyId, orderId],
   );
@@ -292,13 +292,13 @@ export async function importNestingSheet(file, companyId, orderId, mode = 'appen
       const [[before]] = await conn.query(
         `SELECT COUNT(*) AS cnt FROM fab_items
           WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+            AND node_kind = 'material'`,
         [companyId, orderId],
       );
       await conn.query(
         `UPDATE fab_items SET deleted_at = NOW()
           WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+            AND node_kind = 'material'`,
         [companyId, orderId],
       );
       await conn.query(
@@ -325,7 +325,7 @@ export async function importNestingSheet(file, companyId, orderId, mode = 'appen
     const [existingLinks] = await conn.query(
       `SELECT code FROM fab_items
         WHERE company_id = ? AND order_id = ? AND code IS NOT NULL AND deleted_at IS NULL
-          AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+          AND node_kind = 'material'`,
       [companyId, orderId],
     );
     const usedCodes = new Set(existingLinks.map((e) => key(e.code)));
@@ -382,12 +382,14 @@ export async function importNestingSheet(file, companyId, orderId, mode = 'appen
         await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
-              length, width, height, code, nest_no, level_kind)
-           VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,?, 'material')`,
+              length, width, height, code, nest_no, node_kind, depth, is_leaf)
+           SELECT ?,?,?,?,?,?,?,NULL,?,?,?,?,?, 'material', p.depth + 1, 0
+             FROM fab_items p WHERE p.id = ? AND p.company_id = ?`,
           [
             companyId, orderId, partId, material.id, material.name,
             material.unit || 'pcs', r.plates ?? 1,
             r.length, r.width, r.height, code, nestNo,
+            partId, companyId,
           ],
         );
         usedCodes.add(key(code));

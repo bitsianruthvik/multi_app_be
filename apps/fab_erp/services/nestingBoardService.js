@@ -75,7 +75,7 @@ export async function nestingBoard(companyId, orderId) {
        JOIN fab_items p        ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
        JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id
       WHERE rm.company_id = ? AND rm.order_id = ? AND rm.deleted_at IS NULL
-        AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+        AND rm.node_kind = 'material'
         -- Only MADE leaves are nesting's business. A part that is BOUGHT whole —
         -- a stud, a bolt, a bearing — is not cut from anything, so asking which
         -- plate it comes off is the wrong question; procurement matches it to
@@ -93,9 +93,9 @@ export async function nestingBoard(companyId, orderId) {
        FROM fab_items p
        LEFT JOIN fab_items rm
               ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND (rm.level_kind = 'material' OR (rm.level_kind IS NULL AND rm.catalog_item_id IS NOT NULL AND rm.flow_id IS NULL))
+             AND rm.node_kind = 'material'
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
-        AND p.level_kind = 'part'
+        AND p.is_leaf = 1 AND p.node_kind = 'structure'
         -- Made parts only: a bought-whole stud belongs to procurement, not here.
         AND COALESCE(p.procurement_type, 'make') = 'make'
       GROUP BY p.id, p.code, p.name, p.qty, p.length, p.width, p.height
@@ -273,7 +273,7 @@ export async function assignParts(companyId, orderId, {
       const [made] = await conn.query(
         `SELECT id FROM fab_items
           WHERE company_id = ? AND order_id = ? AND parent_item_id IN (?) AND deleted_at IS NULL
-            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+            AND node_kind = 'material'`,
         [companyId, orderId, bareParts],
       );
       for (const m of made) if (!ids.includes(Number(m.id))) ids.push(Number(m.id));
@@ -282,7 +282,7 @@ export async function assignParts(companyId, orderId, {
     const [rows] = await conn.query(
       `SELECT id, parent_item_id, catalog_item_id, nest_no FROM fab_items
         WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
-          AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+          AND node_kind = 'material'`,
       [companyId, orderId, ids],
     );
     if (rows.length !== ids.length) {
@@ -325,7 +325,7 @@ export async function assignParts(companyId, orderId, {
       const [[other]] = await conn.query(
         `SELECT catalog_item_id FROM fab_items
           WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL)) LIMIT 1`,
+            AND node_kind = 'material' LIMIT 1`,
         [companyId, orderId, nestNo],
       );
       if (other && other.catalog_item_id !== materialId) {
@@ -345,7 +345,7 @@ export async function assignParts(companyId, orderId, {
             SET length = COALESCE(?, length), width = COALESCE(?, width),
                 height = COALESCE(?, height), qty = COALESCE(?, qty)
           WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-            AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+            AND node_kind = 'material'`,
         [plate.length ?? null, plate.width ?? null, plate.thick ?? null, plate.plates ?? null,
           companyId, orderId, nestNo],
       );
@@ -374,7 +374,7 @@ export async function updateNest(companyId, orderId, nestNo, plate = {}) {
         SET length = COALESCE(?, length), width = COALESCE(?, width),
             height = COALESCE(?, height), qty = COALESCE(?, qty)
       WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-        AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+        AND node_kind = 'material'`,
     [plate.length ?? null, plate.width ?? null, plate.thick ?? null, plate.plates ?? null,
       companyId, orderId, nestNo],
   );
@@ -401,7 +401,7 @@ export async function clearNest(companyId, orderId, nestNo) {
   await pool.query(
     `UPDATE fab_items SET nest_no = NULL
       WHERE company_id = ? AND order_id = ? AND nest_no = ? AND deleted_at IS NULL
-        AND (level_kind = 'material' OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))`,
+        AND node_kind = 'material'`,
     [companyId, orderId, nestNo],
   );
   return nestingBoard(companyId, orderId);

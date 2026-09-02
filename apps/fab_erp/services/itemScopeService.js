@@ -13,12 +13,10 @@
  * until somebody says it belongs, and an absence is visible in a way a wrong
  * presence is not.
  *
- * THE TWO-TIER RESOLUTION, decided 2026-08-16:
- *
- *   1. the order LINE's type      most specific — a bridge line and a PEB line
- *                                  on one system can draw from different lists
- *   2. the STRUCTURE LEVEL         a part and a segment may differ
- *   3. the global default          purpose with no line type and no level
+ * ONE BINDING PER PURPOSE (2026-09-02). This described a three-tier resolution
+ * — order line type, then structure level, then a global default — which read
+ * well and was never once exercised: the only caller has always asked for the
+ * purpose alone. See `resolveScope`.
  *
  * IT CANNOT RESOLVE TO NOTHING. A missing binding falls through to the global
  * default, never to an empty list. An empty picker is indistinguishable from
@@ -27,25 +25,31 @@
 
 import { pool } from '../../../db.js';
 
-/** The scope that governs a purpose, for this line type and structure level. */
-export async function resolveScope(companyId, purpose, { lineType = null, levelKind = null, conn = null } = {}) {
+/**
+ * The scope that governs a purpose.
+ *
+ * The binding used to be keyed on a line type and a structure level as well,
+ * with a specificity score picking the winner. Both keys are gone — not because
+ * levels went away, but because `pickList` is the only caller `resolveScope`
+ * has ever had and it never passed either one, so every lookup in production
+ * has always resolved to the global binding. Two columns, a three-way score and
+ * a doc-comment describing a hierarchy nothing ever exercised.
+ *
+ * If per-context scoping is wanted later, the honest key is the catalog item —
+ * the same key the BOM and the flow default now use.
+ */
+export async function resolveScope(companyId, purpose, { conn = null } = {}) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
-    `SELECT b.id, b.scope_id AS scopeId, b.line_type AS lineType, b.level_kind AS levelKind,
-            s.scope_key AS scopeKey, s.label
+    `SELECT b.id, b.scope_id AS scopeId, s.scope_key AS scopeKey, s.label
        FROM fab_item_scope_bindings b
        JOIN fab_item_scopes s ON s.id = b.scope_id AND s.deleted_at IS NULL AND s.active = 1
       WHERE b.company_id = ? AND b.purpose = ? AND b.active = 1 AND b.deleted_at IS NULL
-        AND (b.line_type IS NULL OR b.line_type = ?)
-        AND (b.level_kind IS NULL OR b.level_kind = ?)`,
-    [companyId, purpose, lineType, levelKind],
+      ORDER BY b.id
+      LIMIT 1`,
+    [companyId, purpose],
   );
-  if (!rows.length) return null;
-
-  // Most specific wins: a line-type match beats a level match beats the global.
-  const score = (b) => (b.lineType ? 2 : 0) + (b.levelKind ? 1 : 0);
-  rows.sort((a, b) => score(b) - score(a));
-  return rows[0];
+  return rows[0] ?? null;
 }
 
 /** A scope's rules, split into the two lists the matcher wants. */

@@ -63,7 +63,7 @@ async function ancestorsOf(exec, companyId, itemId) {
  * of JSON. `readDrawing` fetches one when somebody opens it.
  *
  * @returns {Promise<Array<{id, fileName, sizeBytes, revision, itemId, itemName,
- *   itemCode, levelKind, inherited, depth}>>}
+ *   itemCode, nodeKind, inherited, depth}>>}
  */
 export async function drawingsForItem(companyId, itemId, conn = null) {
   const exec = conn ?? pool;
@@ -73,7 +73,7 @@ export async function drawingsForItem(companyId, itemId, conn = null) {
   const [rows] = await exec.query(
     `SELECT d.id, d.item_id AS itemId, d.file_name AS fileName, d.size_bytes AS sizeBytes,
             d.revision, d.notes, d.created_at AS createdAt, d.storage,
-            i.name AS itemName, i.code AS itemCode, i.level_kind AS levelKind
+            i.name AS itemName, i.code AS itemCode, i.depth, i.node_kind AS nodeKind
        FROM fab_item_drawings d
        JOIN fab_items i ON i.id = d.item_id
       WHERE d.company_id = ? AND d.deleted_at IS NULL

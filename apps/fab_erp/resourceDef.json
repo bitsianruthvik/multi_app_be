@@ -1110,9 +1110,11 @@
       "orderNumber": "ford_fi.order_number",
       "catalogItemCode": "fic_item.code",
       "catalogItemUnit": "fic_item.unit",
-      "levelKind": "fi.level_kind",
-      "flowSource": "fi.flow_source",
-      "procurementType": "fi.procurement_type"
+      "procurementType": "fi.procurement_type",
+      "nodeKind": "fi.node_kind",
+      "depth": "fi.depth",
+      "isLeaf": "fi.is_leaf",
+      "similarGroup": "fi.similar_group"
     },
     "fieldTypes": {
       "id": "integer",
@@ -1139,9 +1141,11 @@
       "orderNumber": "string",
       "catalogItemCode": "string",
       "catalogItemUnit": "string",
-      "levelKind": "string",
-      "flowSource": "string",
-      "procurementType": "string"
+      "procurementType": "string",
+      "nodeKind": "string",
+      "depth": "integer",
+      "isLeaf": "integer",
+      "similarGroup": "string"
     },
     "relations": {
       "order": {
@@ -2774,120 +2778,6 @@
       "updatedAt": "datetime"
     },
     "relations": {}
-  },
-  "fabErpFlowRule": {
-    "table": "fab_flow_rules",
-    "alias": "ffr",
-    "writeFields": [
-      "line_type",
-      "level_kind",
-      "code_suffix",
-      "flow_id",
-      "active",
-      "notes"
-    ],
-    "fields": {
-      "id": "ffr.id",
-      "companyId": "ffr.company_id",
-      "lineType": "ffr.line_type",
-      "levelKind": "ffr.level_kind",
-      "codeSuffix": "ffr.code_suffix",
-      "flowId": "ffr.flow_id",
-      "active": "ffr.active",
-      "notes": "ffr.notes",
-      "createdAt": "ffr.created_at",
-      "updatedAt": "ffr.updated_at",
-      "flowName": "ffr_flow.name"
-    },
-    "fieldTypes": {
-      "id": "integer",
-      "companyId": "integer",
-      "lineType": "string",
-      "levelKind": "string",
-      "codeSuffix": "string",
-      "flowId": "integer",
-      "active": "integer",
-      "notes": "string",
-      "createdAt": "datetime",
-      "updatedAt": "datetime",
-      "flowName": "string"
-    },
-    "relations": {
-      "flow": {
-        "table": "fab_operation_flows",
-        "alias": "ffr_flow",
-        "on": "ffr.flow_id = ffr_flow.id",
-        "fields": [
-          "flowName"
-        ]
-      }
-    }
-  },
-  "fabErpBomTemplate": {
-    "table": "fab_bom_templates",
-    "alias": "fbt",
-    "writeFields": [
-      "line_type",
-      "code",
-      "name",
-      "qty",
-      "thickness_mm",
-      "material",
-      "grade",
-      "rm_catalog_item_id",
-      "sort_order",
-      "active",
-      "notes"
-    ],
-    "fields": {
-      "id": "fbt.id",
-      "companyId": "fbt.company_id",
-      "lineType": "fbt.line_type",
-      "code": "fbt.code",
-      "name": "fbt.name",
-      "qty": "fbt.qty",
-      "thicknessMm": "fbt.thickness_mm",
-      "material": "fbt.material",
-      "grade": "fbt.grade",
-      "rmCatalogItemId": "fbt.rm_catalog_item_id",
-      "sortOrder": "fbt.sort_order",
-      "active": "fbt.active",
-      "notes": "fbt.notes",
-      "createdAt": "fbt.created_at",
-      "updatedAt": "fbt.updated_at",
-      "rmCode": "fbt_rm.code",
-      "rmName": "fbt_rm.name"
-    },
-    "fieldTypes": {
-      "id": "integer",
-      "companyId": "integer",
-      "lineType": "string",
-      "code": "string",
-      "name": "string",
-      "qty": "decimal",
-      "thicknessMm": "decimal",
-      "material": "string",
-      "grade": "string",
-      "rmCatalogItemId": "integer",
-      "sortOrder": "integer",
-      "active": "integer",
-      "notes": "string",
-      "createdAt": "datetime",
-      "updatedAt": "datetime",
-      "rmCode": "string",
-      "rmName": "string"
-    },
-    "relations": {
-      "rawMaterial": {
-        "table": "fab_item_catalog",
-        "alias": "fbt_rm",
-        "on": "fbt.rm_catalog_item_id = fbt_rm.id",
-        "fields": [
-          "rmCode",
-          "rmName"
-        ]
-      }
-    }
   },
   "fabErpSupplier": {
     "table": "fab_suppliers",

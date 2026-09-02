@@ -5908,3 +5908,170 @@ UPDATE fab_fields
 UPDATE fab_fields
    SET label = 'Unit weight'
  WHERE field_key = 'unit_weight_kg' AND deleted_at IS NULL AND label = field_key;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- STRUCTURE WITHOUT LEVELS (2026-09-02)
+--
+-- `fab_items.level_kind` was one column carrying THREE unrelated facts, which
+-- is why it looked load-bearing — it was, but not as a *level*:
+--
+--   "is this steel or a structure?"      level_kind = 'material'   (~30 reads)
+--   "is this the piece cut from plate?"  level_kind = 'part'       (2 reads)
+--   "how high up is it?"                 KIND_RANK / GROUP_LEVELS  (~12 reads)
+--
+-- Those are a NODE TYPE, LEAF-NESS and DEPTH. Split apart, none of them needs a
+-- vocabulary: depth is counted from parent_item_id, leaf-ness is "no structural
+-- children", and the node type is a fact whoever writes the row already knows.
+-- Nobody configures a list of levels again, and a five-deep structure needs no
+-- schema change — it is just a deeper BOM.
+--
+-- Display labels come from the catalog item's own NAME. A board says "Girder"
+-- because somebody named an item Girder, not because 'girder' is in an enum.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='node_kind');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items
+     ADD COLUMN node_kind ENUM(''structure'',''material'') NOT NULL DEFAULT ''structure'',
+     ADD COLUMN depth     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+     ADD COLUMN is_leaf   TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Nesting asks "which rows are cut from a plate" on every board load, so this
+-- stays a flat predicate rather than a NOT EXISTS over a few thousand rows.
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_shape');
+SET @s = IF(@c=0, 'CREATE INDEX idx_fi_shape ON fab_items (company_id, order_id, node_kind, is_leaf)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Backfill from level_kind, GUARDED on level_kind still existing.
+--
+-- Not decoration: this statement is dropped by the DROP further down, so on a
+-- second run of this block the plain form fails with "Unknown column
+-- 'level_kind'" and takes the whole migration with it. A patch file that only
+-- works once is the thing init.sql was fixed to stop being.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='level_kind');
+SET @s = IF(@c=1, 'UPDATE fab_items SET node_kind = ''material''
+ WHERE node_kind = ''structure''
+   AND (level_kind = ''material''
+        OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Depth is distance from the line's root. Six passes covers a six-deep tree;
+-- the model this replaces could not express more than four.
+UPDATE fab_items SET depth = 0 WHERE parent_item_id IS NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
+   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+
+-- A leaf is a STRUCTURAL node with no structural children. A material link
+-- hanging off a part does not stop that part being a leaf — that link is what
+-- the part is cut FROM, not something the part contains.
+UPDATE fab_items i
+   SET i.is_leaf = 1
+ WHERE i.node_kind = 'structure' AND i.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM (SELECT id, parent_item_id, deleted_at, node_kind
+                                    FROM fab_items) k
+                    WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
+                      AND k.node_kind = 'structure');
+
+-- ── The default flow belongs to the BOM LINE ──────────────────────────────
+--
+-- `fab_flow_rules` matched (line_type, level_kind, code_suffix) -> flow, so
+-- "for a Composite Girder, at segment level, use flow X" needed three free-text
+-- keys and a code-parsing convention ('/D' means drilled).
+--
+-- On the BOM line that is just the Girder->Segment line's default, and it is
+-- strictly MORE expressive than the rule it replaces: a Top Flange inside a
+-- Girder Segment can differ from a Top Flange inside a PEB member, because the
+-- line is the item IN CONTEXT of its parent. A rule could only see the type.
+--
+-- Resolution is two steps now — the order item's own flow_id (whatever somebody
+-- chose on the sales order), then this. Nothing parses a code.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='default_flow_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN default_flow_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Seed each line from the flow its CHILD type already carried, so no BOM loses
+-- a flow in the move. Fills blanks only.
+UPDATE fab_item_bom b
+  JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
+   SET b.default_flow_id = c.flow_id
+ WHERE b.deleted_at IS NULL AND b.default_flow_id IS NULL AND c.flow_id IS NOT NULL;
+
+-- ── Drop what nothing reads any more ──────────────────────────────────────
+--
+--   level_kind    replaced by node_kind + depth + is_leaf
+--   flow_source   1,264 rows written, ZERO readers anywhere in the codebase
+--   manufacturing_method_template_id   0 rows, and its table does not exist
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='level_kind');
+SET @s = IF(@c=1, 'ALTER TABLE fab_items DROP COLUMN level_kind', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='flow_source');
+SET @s = IF(@c=1, 'ALTER TABLE fab_items DROP COLUMN flow_source', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The column carries a foreign key, and MySQL will not drop a column an FK
+-- needs. Look the constraint up by COLUMN rather than by name: it is
+-- `fab_items_ibfk_4` on the dev database, but that numbering depends on the
+-- order the constraints were created in, so it is not the same everywhere.
+SET @fk = (SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items'
+              AND COLUMN_NAME='manufacturing_method_template_id'
+              AND REFERENCED_TABLE_NAME IS NOT NULL
+            LIMIT 1);
+SET @s = IF(@fk IS NULL, 'SELECT 1', CONCAT('ALTER TABLE fab_items DROP FOREIGN KEY `', @fk, '`'));
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- And the plain index the FK left behind, if one survives it.
+SET @ix = (SELECT INDEX_NAME FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items'
+              AND COLUMN_NAME='manufacturing_method_template_id'
+            LIMIT 1);
+SET @s = IF(@ix IS NULL, 'SELECT 1', CONCAT('ALTER TABLE fab_items DROP INDEX `', @ix, '`'));
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items'
+             AND COLUMN_NAME='manufacturing_method_template_id');
+SET @s = IF(@c=1, 'ALTER TABLE fab_items DROP COLUMN manufacturing_method_template_id', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The catalog no longer says what level a type is: the BOM says where it sits,
+-- and depth counts it.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='level_kind');
+SET @s = IF(@c=1, 'ALTER TABLE fab_item_catalog DROP COLUMN level_kind', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- `pickList` is the only caller of `resolveScope` and has never passed either
+-- key, so both have always resolved to the global binding.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND COLUMN_NAME='level_kind');
+SET @s = IF(@c=1, 'ALTER TABLE fab_item_scope_bindings DROP COLUMN level_kind', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND COLUMN_NAME='line_type');
+SET @s = IF(@c=1, 'ALTER TABLE fab_item_scope_bindings DROP COLUMN line_type', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- fab_flow_rules    -> replaced by fab_item_bom.default_flow_id, seeded above
+-- fab_bom_templates -> a flat per-line-type part list that only ever fed the
+--                      old fixed-level BOQ wizard; the item BOM says it properly
+DROP TABLE IF EXISTS fab_flow_rules;
+DROP TABLE IF EXISTS fab_bom_templates;

@@ -42,7 +42,7 @@ export async function parameterGrid(companyId, orderId, conn = null) {
   );
 
   const [items] = await exec.query(
-    `SELECT id, code, name, flow_id AS flowId, level_kind AS levelKind, similar_group AS similarGroup
+    `SELECT id, code, name, flow_id AS flowId, depth, node_kind AS nodeKind, similar_group AS similarGroup
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL AND flow_id IS NOT NULL
       ORDER BY code`,
@@ -114,7 +114,7 @@ export async function parameterGrid(companyId, orderId, conn = null) {
       itemId: it.id,
       code: it.code,
       name: it.name,
-      levelKind: it.levelKind,
+      depth: it.depth,
       flowId: it.flowId,
       /** How many real parts this row writes to. 1 unless it leads a peer set. */
       represents: peers ? peers.length : 1,

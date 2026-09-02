@@ -116,7 +116,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
-            catalog_item_id, flow_id, level_kind, length, width, height
+            catalog_item_id, flow_id, node_kind, length, width, height
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],

@@ -368,7 +368,7 @@ function addSpecDropdowns(wb, ws, vocab, lastRow) {
 /** Read the order's current tree back into sheet rows, so it round-trips. */
 async function readExistingAsRows(companyId, orderId) {
   const [items] = await pool.query(
-    `SELECT fi.id, fi.parent_item_id, fi.name, fi.code, fi.level_kind, fi.qty, fi.unit,
+    `SELECT fi.id, fi.parent_item_id, fi.name, fi.code, fi.node_kind, fi.depth, fi.qty, fi.unit,
             fi.length, fi.width, fi.height, fi.catalog_item_id, fi.flow_id,
             fic.code AS catalog_code, fof.name AS flow_name
        FROM fab_items fi
@@ -678,8 +678,8 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
             // three are NULLable, so nothing is owed at insert time.
             `INSERT INTO fab_items
                (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit, qty, flow_id,
-                code, level_kind)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+                code, node_kind, depth, is_leaf)
+             VALUES (?,?,?,?,?,?,?,?,?,?,'structure',?,?)`,
             [
               companyId, orderId, lineId, parentId,
               // Only the leaf is what this row describes; an intermediate level
@@ -690,8 +690,13 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
               isLast ? (r.name ?? path[i].label) : path[i].label,
               'pcs',
               isLast ? (r.qty ?? 1) : 1,
-              null, // flow allocation is its own pass — never set from the BOQ
-              code, path[i].kind,
+              null, // flow assignment is its own pass — never set from the BOQ
+              code,
+              // `i` walks the NON-BLANK levels of this row, so it is already the
+              // depth: a PEB that skips Girder and Segment puts its parts at
+              // depth 1, which is exactly where they sit in the tree.
+              i,
+              isLast ? 1 : 0,
             ],
           );
           hit = { id: ins.insertId };
@@ -789,6 +794,8 @@ export async function importBoqSheet(file, companyId, orderId, mode = 'append') 
     }
 
     await propagateLineIds(conn, companyId, orderId);
+    // A row inserted as a leaf can have stopped being one by the last sheet row.
+    await recomputeLeaves(conn, companyId, orderId);
     // Classify what was just created before the transaction closes: a row that
     // reaches the tree with no answer to make-or-buy is a row the purchasing
     // and production steps will silently skip.
@@ -833,6 +840,43 @@ export async function propagateLineIds(conn, companyId, orderId) {
     );
     if (!res.affectedRows) break;
   }
+}
+
+/**
+ * Recompute `is_leaf` across one order.
+ *
+ * A row is inserted as a leaf when the sheet row that created it was a leaf,
+ * which is right at the time and can stop being right later: a second sheet row
+ * naming a deeper code turns yesterday's leaf into a parent. Since `is_leaf` is
+ * what nesting matches on, a stale 1 offers a plate for an assembly and a stale
+ * 0 hides a part that needs one.
+ *
+ * So it is DERIVED here at the end of an import rather than maintained
+ * incrementally. Two statements over one order, and it cannot drift.
+ */
+export async function recomputeLeaves(conn, companyId, orderId) {
+  await conn.query(
+    `UPDATE fab_items i
+        SET i.is_leaf = 0
+      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+        AND (i.node_kind = 'material'
+             OR EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
+                                         FROM fab_items) k
+                         WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
+                           AND k.node_kind = 'structure'))`,
+    [companyId, orderId],
+  );
+  await conn.query(
+    `UPDATE fab_items i
+        SET i.is_leaf = 1
+      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+        AND i.node_kind = 'structure'
+        AND NOT EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
+                                         FROM fab_items) k
+                         WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
+                           AND k.node_kind = 'structure')`,
+    [companyId, orderId],
+  );
 }
 
 /**
