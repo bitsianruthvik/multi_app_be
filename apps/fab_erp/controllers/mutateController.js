@@ -16,6 +16,7 @@ import { hasResource, getResource } from '../../../core/query/resourceRegistry.j
 import resourcePermissions from '../config/resourcePermissions.js';
 import { isVersionConsumable } from '../services/versionService.js';
 import { generateCode } from '../services/codegenService.js';
+import { recomputeItemShape, orderIdOfItem } from '../services/itemShapeService.js';
 
 // Resources whose `code` the server fills in on insert.
 //
@@ -75,6 +76,30 @@ const WRITE_FORBIDDEN = {
  * — the column held zero rows for its whole life and nothing in the frontend
  * ever referenced it. Dropped with the column, 2026-09-02.
  */
+/**
+ * `depth` and `is_leaf` after any hand-edit of the item tree.
+ *
+ * The order tree's Add item writes through this controller, and this controller
+ * writes exactly the columns in `writeFields` — which do not include the two
+ * derived ones. So a row added here arrived with a parent and a depth of 0 (the
+ * column default) and `is_leaf = 0`, which put it at the wrong rung and made it
+ * invisible to nesting, with nothing reporting a problem. Found on the live
+ * KEPL order eight minutes after it was built.
+ *
+ * Fixed by DERIVING rather than by asking this path to remember: see
+ * itemShapeService. Failure is logged and swallowed — a stale shape is a bug to
+ * chase, not a reason to fail a save the user has already been told succeeded.
+ */
+async function restampItemShape(resource, companyId, orderIdFromRow, itemId) {
+  if (resource !== 'fabErpItem') return;
+  try {
+    const orderId = orderIdFromRow ?? await orderIdOfItem(companyId, itemId);
+    if (orderId) await recomputeItemShape(companyId, orderId);
+  } catch (err) {
+    logger.error({ err, companyId, itemId }, 'fab_erp mutate: could not restamp item shape');
+  }
+}
+
 const CONSUMPTION_RULES = {
   fabErpMfgMethodLine: [
     { field: 'routing_template_id',  entity: 'routing_templates'  },
@@ -326,6 +351,7 @@ export async function mutate(req, res) {
       }
 
       const [result] = await pool.query(`INSERT INTO \`${tableName}\` SET ?`, [row]);
+      await restampItemShape(resource, companyId, row.order_id ?? null, result.insertId);
 
       logger.info(
         { userId: user.id, companyId, resource, insertId: result.insertId },
@@ -356,6 +382,8 @@ export async function mutate(req, res) {
         return res.status(404).json({ message: 'Row not found or not owned by your company.' });
       }
 
+      await restampItemShape(resource, companyId, null, id);
+
       logger.info(
         { userId: user.id, companyId, resource, id },
         'fab_erp mutate: update ok',
@@ -380,6 +408,10 @@ export async function mutate(req, res) {
       if (result.affectedRows === 0) {
         return res.status(404).json({ message: 'Row not found or not owned by your company.' });
       }
+
+      // Deleting a row can make its PARENT a leaf, so the shape is restamped
+      // here too — the row itself is gone, but the tree around it changed.
+      await restampItemShape(resource, companyId, null, id);
 
       logger.info(
         { userId: user.id, companyId, resource, id },

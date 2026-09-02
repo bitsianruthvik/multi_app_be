@@ -50,6 +50,7 @@ import {
 import { rawMaterialsFor } from './rawMaterialService.js';
 import { syncOrderProcurement } from './procurementService.js';
 import { setFields } from './fieldService.js';
+import { recomputeItemShape } from './itemShapeService.js';
 
 const SHEET = 'BOQ';
 const TEMPLATE_ROWS = 600;
@@ -855,28 +856,10 @@ export async function propagateLineIds(conn, companyId, orderId) {
  * incrementally. Two statements over one order, and it cannot drift.
  */
 export async function recomputeLeaves(conn, companyId, orderId) {
-  await conn.query(
-    `UPDATE fab_items i
-        SET i.is_leaf = 0
-      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
-        AND (i.node_kind = 'material'
-             OR EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
-                                         FROM fab_items) k
-                         WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
-                           AND k.node_kind = 'structure'))`,
-    [companyId, orderId],
-  );
-  await conn.query(
-    `UPDATE fab_items i
-        SET i.is_leaf = 1
-      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
-        AND i.node_kind = 'structure'
-        AND NOT EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
-                                         FROM fab_items) k
-                         WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
-                           AND k.node_kind = 'structure')`,
-    [companyId, orderId],
-  );
+  // Delegated, not duplicated. The shared version also fixes `depth`, and it is
+  // what the generic mutate endpoint calls after the tree's Add item — which was
+  // inserting rows at depth 0 with no leaf flag until it did.
+  return recomputeItemShape(companyId, orderId, conn);
 }
 
 /**
