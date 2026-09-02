@@ -476,7 +476,7 @@ export async function getActualsBoard(companyId, {
   const empty = {
     from, to, timezone: tz, mode, level, now: now.toISOString(),
     lanes: [], items: [], orders: [], lines: [], entries: [], operations: [], resources: [],
-    units: [], laneCount: 0, unitTonnes: {}, plan: null,
+    units: [], laneCount: 0, unitTonnes: {}, unitProgress: {}, plan: null,
     stats: {
       hours: 0, tonnes: 0, taskCount: 0, tasksCompleted: 0, tasksStarted: 0,
       reworkHours: 0, ungroupedHours: 0, machinesActive: 0, peakParallel: 0,
@@ -967,6 +967,8 @@ export async function getActualsBoard(companyId, {
   let unitsStarted = 0;
   let unitsOpen = 0;
   let unitsCarriedIn = 0;
+  /** Per-unit progress, keyed like the grouping. The monthly report's table. */
+  const unitProgress = {};
   if (!degraded && level !== 'operation') {
     const byUnit = new Map();
     for (const [itemId, r] of rollup) {
@@ -985,13 +987,38 @@ export async function getActualsBoard(companyId, {
         u.lastEnd = u.lastEnd == null ? r.lastEnd : Math.max(u.lastEnd, r.lastEnd);
       }
     }
-    for (const u of byUnit.values()) {
+    for (const [key, u] of byUnit) {
       const complete = u.total > 0 && u.done === u.total && !Number.isNaN(u.lastEnd) && u.lastEnd != null;
       if (complete && u.lastEnd >= t0 && u.lastEnd < t1) unitsCompleted += 1;
       if (u.firstStart != null && u.firstStart >= t0 && u.firstStart < t1) unitsStarted += 1;
       if (!complete && u.firstStart != null && u.firstStart < t1) unitsOpen += 1;
       if (u.firstStart != null && u.firstStart < t0
         && !(complete && u.lastEnd <= t0)) unitsCarriedIn += 1;
+
+      /**
+       * The same roll-up, kept per unit rather than only counted.
+       *
+       * The monthly report needs a row per girder — done of total, and whether
+       * it is finished, running or untouched — and every figure for it is
+       * already in this loop. Emitting it here costs nothing; computing it
+       * anywhere else would mean a second walk that could disagree with the
+       * counters printed beside it.
+       *
+       * Sent for EVERY unit of the touched orders, not just the ones that were
+       * worked this month: a progress report has to list the girder that saw no
+       * work at all, and it is the only document on this board that does.
+       */
+      unitProgress[key] = {
+        done: u.done,
+        total: u.total,
+        state: complete ? 'complete' : (u.firstStart != null ? 'in_progress' : 'not_started'),
+        firstStart: u.firstStart != null ? new Date(u.firstStart).toISOString() : null,
+        lastEnd: (complete && u.lastEnd != null && !Number.isNaN(u.lastEnd))
+          ? new Date(u.lastEnd).toISOString() : null,
+        /** True when this unit moved at all inside the window. */
+        touchedInWindow: u.firstStart != null && u.firstStart < t1
+          && (Number.isNaN(u.lastEnd) || u.lastEnd == null || u.lastEnd > t0),
+      };
     }
   }
 
@@ -1027,6 +1054,7 @@ export async function getActualsBoard(companyId, {
     // Awaited last: it was started before the clipping and has had the whole
     // assembly to finish in, so on a warm connection it costs nothing here.
     plan: planPromise ? await planPromise : null,
+    unitProgress,
     unitTonnes: Object.fromEntries(
       Object.entries(unitTonnes).map(([k, v]) => [k, Math.round(v * 1000) / 1000]),
     ),
