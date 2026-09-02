@@ -36,6 +36,7 @@
 
 import { pool } from '../../../db.js';
 import { plannerTimezone } from './planService.js';
+import { loadPlanCompare } from './actualsCompareService.js';
 import { GROUP_LEVELS, groupKeyFor } from './planUnitService.js';
 import { resolveTaskCalendarIds, workingIntervalsInWindow } from './taskWaitService.js';
 import {
@@ -426,7 +427,7 @@ function attributeWeights(items, taskCountByItem) {
  */
 export async function getActualsBoard(companyId, {
   from, to, mode = 'machine', level = 'girder',
-  orderIds = [], resourceTypeIds = [], now = new Date(),
+  orderIds = [], resourceTypeIds = [], withPlan = false, now = new Date(),
 } = {}) {
   const t0 = from.getTime();
   const t1 = to.getTime();
@@ -475,7 +476,7 @@ export async function getActualsBoard(companyId, {
   const empty = {
     from, to, timezone: tz, mode, level, now: now.toISOString(),
     lanes: [], items: [], orders: [], lines: [], entries: [], operations: [], resources: [],
-    units: [], laneCount: 0, unitTonnes: {},
+    units: [], laneCount: 0, unitTonnes: {}, plan: null,
     stats: {
       hours: 0, tonnes: 0, taskCount: 0, tasksCompleted: 0, tasksStarted: 0,
       reworkHours: 0, ungroupedHours: 0, machinesActive: 0, peakParallel: 0,
@@ -578,6 +579,19 @@ export async function getActualsBoard(companyId, {
       [companyId, lineIds],
     ),
   ]);
+
+  /**
+   * Wave 3b: the plan, but only if asked for.
+   *
+   * Three more reads, so it is opt-in. Started here rather than awaited, so the
+   * whole comparison overlaps the clipping and assembly below instead of being
+   * charged on top of them.
+   */
+  const planPromise = withPlan
+    ? timed('plan', loadPlanCompare(companyId, {
+      from, to, timeZone: tz, taskIds: tasks.map((t) => t.id), orderIds: touchedOrderIds,
+    }))
+    : null;
 
   mark('wave3_reads');
 
@@ -1010,6 +1024,9 @@ export async function getActualsBoard(companyId, {
     operations,
     resources,
     laneCount: mode === 'unit' ? laneCount : outLanes.length,
+    // Awaited last: it was started before the clipping and has had the whole
+    // assembly to finish in, so on a warm connection it costs nothing here.
+    plan: planPromise ? await planPromise : null,
     unitTonnes: Object.fromEntries(
       Object.entries(unitTonnes).map(([k, v]) => [k, Math.round(v * 1000) / 1000]),
     ),

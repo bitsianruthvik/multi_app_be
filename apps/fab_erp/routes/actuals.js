@@ -62,6 +62,9 @@ function parseWindow(q) {
  * ?level          order…part | operation  (default girder)
  * ?orderIds       CSV, optional
  * ?resourceTypeIds CSV, optional (machine mode)
+ * ?plan=1          also return the plan comparison: ghost spans + the S-curve.
+ *                  Opt-in because it costs three more reads; the board's
+ *                  ordinary job is to show what happened.
  *
  * Returns the same payload shape as GET /plan/board — lanes of flat number
  * tuples plus the words once, in lookup tables — so the client's boardModel
@@ -88,6 +91,7 @@ router.get('/actuals/board', protect, async (req, res) => {
       ...win,
       mode,
       level,
+      withPlan: req.query.plan === '1' || req.query.plan === 'true',
       orderIds: parseIdList(req.query.orderIds),
       resourceTypeIds: parseIdList(req.query.resourceTypeIds),
     });
