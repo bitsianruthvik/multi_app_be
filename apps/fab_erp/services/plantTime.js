@@ -75,13 +75,38 @@ export function tzOffsetMs(date, timeZone) {
   return asIfUtc - date.getTime();
 }
 
+/**
+ * One formatter per zone, kept.
+ *
+ * `new Intl.DateTimeFormat(...)` costs roughly a millisecond — invisible once,
+ * ruinous in a loop. The Actuals Board's S-curve buckets every row of the plan
+ * by its local day, and at 8,800 rows that constructor alone was **six seconds**
+ * of a seven-second response, with the four queries behind it totalling 500 ms.
+ *
+ * Safe to cache: a DateTimeFormat is immutable and its output depends only on
+ * the options and the instant, so a shared instance answers identically. There
+ * are thirty callers of the functions below and all of them get this for free.
+ *
+ * Keyed by zone, and the zone list is a handful of IANA names, so the map cannot
+ * grow unboundedly the way a per-timestamp cache could.
+ */
+const ymdFormatters = new Map();
+function ymdFormatter(timeZone) {
+  let f = ymdFormatters.get(timeZone);
+  if (!f) {
+    // en-CA formats as YYYY-MM-DD, which is exactly the shape the calendar
+    // tables and the day-walk already use.
+    f = new Intl.DateTimeFormat('en-CA', {
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    ymdFormatters.set(timeZone, f);
+  }
+  return f;
+}
+
 /** The local calendar date ('YYYY-MM-DD') an instant falls on, in `timeZone`. */
 export function zonedYMD(date, timeZone) {
-  // en-CA formats as YYYY-MM-DD, which is exactly the shape the calendar tables
-  // and the day-walk already use.
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(date);
+  return ymdFormatter(timeZone).format(date);
 }
 
 /**
