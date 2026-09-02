@@ -26,6 +26,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { depthLabels, labelFor } from './depthLabelService.js';
 
 /**
  * What the order looks like right now, per DEPTH: how many structural items,
@@ -59,6 +60,10 @@ export async function flowSummary(companyId, orderId, conn = null) {
     [companyId, orderId],
   );
 
+  // Through the shared service. Naming a rung "the first row I happened to see"
+  // is why this tab and the Structure stage disagreed about the same depth.
+  const labels = await depthLabels(companyId, orderId, conn);
+
   const byDepth = new Map();
   let wouldAssign = 0;
   for (const r of rows) {
@@ -75,7 +80,7 @@ export async function flowSummary(companyId, orderId, conn = null) {
 
     const d = Number(r.depth);
     if (!byDepth.has(d)) {
-      byDepth.set(d, { depth: d, label: r.name, items: 0, withFlow: 0, wouldAssign: 0, flows: new Map() });
+      byDepth.set(d, { depth: d, label: labelFor(labels, d), items: 0, withFlow: 0, wouldAssign: 0, flows: new Map() });
     }
     const bucket = byDepth.get(d);
     bucket.items++;

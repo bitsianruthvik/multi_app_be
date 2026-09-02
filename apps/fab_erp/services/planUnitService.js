@@ -66,27 +66,15 @@ export const isGroupLevel = (l) => GROUP_LEVELS.includes(l)
 const MAX_WALK = 24;
 
 /**
- * What to call each depth on this order: the distinct catalog item names sitting
- * at that depth, most common first.
+ * What to call each depth on this order.
  *
- * One query, because a board asks this once per render and the alternative is a
- * per-depth round trip. A depth whose rows are named inconsistently gets the
- * commonest name — the label is a signpost, not an identity.
+ * Re-exported from `depthLabelService` rather than implemented here. This file
+ * had its own version, `orderReadinessService` had another and
+ * `orderFlowService` a third; all three were defensible, none agreed, and the
+ * order's Structure stage ended up naming a rung "Top Flange" while its Flows
+ * tab called the same rung "Bottom Flange".
  */
-export async function depthLabels(companyId, orderIds) {
-  if (!orderIds?.length) return {};
-  const [rows] = await cachedQuery(
-    `SELECT depth, name, COUNT(*) n FROM fab_items
-      WHERE company_id = ? AND order_id IN (?) AND deleted_at IS NULL
-        AND node_kind = 'structure'
-      GROUP BY depth, name
-      ORDER BY depth, n DESC`,
-    [companyId, orderIds],
-  );
-  const out = {};
-  for (const r of rows) if (out[`d${r.depth}`] == null) out[`d${r.depth}`] = r.name;
-  return out;
-}
+export { depthLabels, labelFor } from './depthLabelService.js';
 
 /**
  * Parse a unit key as the board writes it: `o:<orderId>` / `l:<lineId>` /

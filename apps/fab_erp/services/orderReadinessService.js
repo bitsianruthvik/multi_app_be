@@ -37,6 +37,7 @@ import { orderShortfall } from './procurementService.js';
 import { procurementForOrder, onOrderByItem } from './procurementOrderService.js';
 import { orderStageApplicability } from './stageApplicabilityService.js';
 import { flowSummary } from './orderFlowService.js';
+import { depthLabels, labelFor } from './depthLabelService.js';
 import { checkOrderNesting, blockingIssues } from './nestingIntegrityService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { logger } from '../../../core/utils/logger.js';
@@ -587,10 +588,7 @@ async function countLines(companyId, orderId) {
  */
 async function countTree(companyId, orderId) {
   const [rows] = await pool.query(
-    `SELECT fi.depth,
-            COUNT(*) AS n,
-            SUM(fi.is_leaf = 1) AS leaves,
-            SUBSTRING_INDEX(GROUP_CONCAT(fi.name ORDER BY fi.id), ',', 1) AS label
+    `SELECT fi.depth, COUNT(*) AS n, SUM(fi.is_leaf = 1) AS leaves
        FROM fab_items fi
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
         AND fi.node_kind = 'structure'
@@ -599,9 +597,13 @@ async function countTree(companyId, orderId) {
     [companyId, orderId],
   );
 
+  // Through the shared service, never a local rule — this stage and the Flows
+  // tab used to name the same rung differently on the same screen.
+  const labels = await depthLabels(companyId, orderId);
+
   const levels = rows.map((r) => ({
     depth: Number(r.depth),
-    label: r.label ?? `Level ${Number(r.depth) + 1}`,
+    label: labelFor(labels, r.depth),
     count: Number(r.n) || 0,
     leaves: Number(r.leaves) || 0,
   }));

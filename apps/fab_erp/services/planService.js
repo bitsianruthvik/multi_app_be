@@ -39,6 +39,7 @@ import {
 import { calendarTimezones, zonedYMD, zonedWallClockToUtc, DEFAULT_TZ } from './plantTime.js';
 import { apportionEntry, taskPlannedSpans, remapMemberTimes } from './planTaskSpan.js';
 import { assignMachines } from './planMachineService.js';
+import { depthLabelsFromItems } from './depthLabelService.js';
 
 /**
  * The zone the planner's grid, hour labels and plan_date are expressed in.
@@ -1630,21 +1631,7 @@ export async function getPlanBoard(companyId, { from, to, resourceTypeIds = [], 
      * the planner. Derived from the items already loaded rather than queried
      * again — every one of them is here, with its name and its depth.
      */
-    depthLabels: (() => {
-      const count = new Map();
-      for (const i of items) {
-        if (i.nodeKind === 'material' || i.name == null) continue;
-        const k = `d${i.depth ?? 0}`;
-        if (!count.has(k)) count.set(k, new Map());
-        const bag = count.get(k);
-        bag.set(i.name, (bag.get(i.name) ?? 0) + 1);
-      }
-      const out = {};
-      for (const [k, bag] of count) {
-        out[k] = [...bag.entries()].sort((a, b) => b[1] - a[1])[0][0];
-      }
-      return out;
-    })(),
+    depthLabels: depthLabelsFromItems(items),
     orders,
     lines,
     // The words, once. Every block names an entry; most entries carry many, and
