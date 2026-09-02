@@ -6060,6 +6060,17 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- `pickList` is the only caller of `resolveScope` and has never passed either
 -- key, so both have always resolved to the global binding.
+--
+-- The lookup index covers all four columns, and TiDB refuses to drop a column
+-- a composite index covers ("can't drop column ... with composite index covered
+-- or Primary Key covered now"). So the index comes down first and goes back up
+-- over what is left — which is also the shape the surviving query wants, since
+-- it now filters on company_id + purpose only.
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND INDEX_NAME='idx_fisb');
+SET @s = IF(@c>0, 'ALTER TABLE fab_item_scope_bindings DROP INDEX idx_fisb', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND COLUMN_NAME='level_kind');
 SET @s = IF(@c=1, 'ALTER TABLE fab_item_scope_bindings DROP COLUMN level_kind', 'SELECT 1');
@@ -6068,6 +6079,11 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND COLUMN_NAME='line_type');
 SET @s = IF(@c=1, 'ALTER TABLE fab_item_scope_bindings DROP COLUMN line_type', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_scope_bindings' AND INDEX_NAME='idx_fisb');
+SET @s = IF(@c=0, 'CREATE INDEX idx_fisb ON fab_item_scope_bindings (company_id, purpose)', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- fab_flow_rules    -> replaced by fab_item_bom.default_flow_id, seeded above
