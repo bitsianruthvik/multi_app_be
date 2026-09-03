@@ -6091,3 +6091,20 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 --                      old fixed-level BOQ wizard; the item BOM says it properly
 DROP TABLE IF EXISTS fab_flow_rules;
 DROP TABLE IF EXISTS fab_bom_templates;
+
+-- ── The catalogue no longer carries a flow (2026-09-02) ────────────────────
+--
+-- `fab_item_catalog.flow_id` was the halfway house between fab_flow_rules and
+-- the BOM: the rules were backfilled onto the TYPE, and `instantiate` read it
+-- from there. The default now lives on the BOM LINE, because the line is the
+-- item in context of its parent and the type is not — a Top Flange in a Girder
+-- Segment can be made differently from one in a PEB member.
+--
+-- Nothing reads this column any more: not bomService (which selects id and unit
+-- only), not resourceDef, not the frontend. It is left on precisely the girder
+-- and composite-girder rows people open most, where it reads as a live setting
+-- that in fact decides nothing.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='flow_id');
+SET @s = IF(@c=1, 'ALTER TABLE fab_item_catalog DROP COLUMN flow_id', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

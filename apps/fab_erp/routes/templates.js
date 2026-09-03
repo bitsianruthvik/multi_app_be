@@ -45,7 +45,15 @@ import { orderCodePrefix } from '../services/itemCodeService.js';
 const router = Router();
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
 
+/**
+ * Admin bypasses the tag, as it does on every other fab_erp write.
+ *
+ * `mutateController` has always let an admin through; this file did not, so the
+ * same person could rename an item and not edit its BOM. One surface, one rule.
+ */
 const requirePerm = (tag) => (req, res, next) => {
+  const isAdmin = req.user?.role && String(req.user.role).toLowerCase() === 'admin';
+  if (isAdmin) return next();
   if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
     return res.status(403).json({ message: `Permission required: ${tag}` });
   }
@@ -226,7 +234,7 @@ router.get('/item-bom/:itemId', protect, async (req, res) => {
  * a parameter, no self-containment, and no cycle. Those are properties of a
  * BOM rather than of an HTTP request, and every caller needs them.
  */
-router.post('/item-bom', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+router.post('/item-bom', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
   try {
     const cid = companyId(req);
     const b = req.body ?? {};
@@ -252,7 +260,7 @@ router.post('/item-bom', protect, requirePerm('fab_erp_projects_manage'), async 
 });
 
 /** DELETE /item-bom/:id — remove one line. The child item itself is untouched. */
-router.delete('/item-bom/:id', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+router.delete('/item-bom/:id', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
   try {
     await removeBomLine(companyId(req), Number(req.params.id));
     return res.json({ ok: true });
