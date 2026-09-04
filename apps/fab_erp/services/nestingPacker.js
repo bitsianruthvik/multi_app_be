@@ -150,6 +150,61 @@ function fillOne(spec, rows) {
 }
 
 /**
+ * Second pass: empty the worst plates into the others, and drop them.
+ *
+ * THE GREEDY TAIL, which is what this exists for. The main loop commits a plate
+ * and never reopens it, so rows left over at the end of a group cannot join a
+ * plate that is already closed — they open one of their own. On the KEPL order
+ * that produced N-019: three 2995x178 stiffeners alone on a 24 m2 sheet, 7%
+ * used, while dozens of identical stiffeners sat on earlier plates.
+ *
+ * It is NOT a plate-size problem. The smallest 12 mm plate that can hold a
+ * 2995 mm part is 2000x12000; the next size down is 2300x2500 and too short.
+ * The packer chose correctly and still wasted 22 m2, because the only real
+ * answer was to put those three on a plate that was already open.
+ *
+ * WORST FIRST, and all-or-nothing. A donor is emptied only if EVERY one of its
+ * rows finds a home, because half-emptying a plate still buys the plate. Rows
+ * keep their atomicity — a row moves whole or not at all.
+ *
+ * Targets are tried in order of most free area, which is where a row is most
+ * likely to fit. Each successful move is kept on a trial copy so a donor that
+ * turns out to be immovable leaves nothing behind.
+ */
+export function consolidate(plates) {
+  // Worst first: the emptiest plate is the one most worth eliminating.
+  const donors = [...plates].sort((a, b) => utilisation(a) - utilisation(b));
+  let live = [...plates];
+
+  for (const donor of donors) {
+    if (live.length <= 1) break;
+    if (!live.includes(donor)) continue;
+
+    const targets = live
+      .filter((p) => p !== donor)
+      .sort((a, b) => (areaOf(b) - usedArea(b)) - (areaOf(a) - usedArea(a)));
+
+    // Trial copies, so a failed redistribution changes nothing.
+    const trial = new Map(targets.map((t) => [t, t]));
+    let allMoved = true;
+    for (const row of donor.rows) {
+      let moved = false;
+      for (const t of targets) {
+        const next = placeRow(trial.get(t), row);
+        if (next) { trial.set(t, next); moved = true; break; }
+      }
+      if (!moved) { allMoved = false; break; }
+    }
+    if (!allMoved) continue;
+
+    live = live
+      .filter((p) => p !== donor)
+      .map((p) => trial.get(p) ?? p);
+  }
+  return live;
+}
+
+/**
  * Nest `rows` onto plates chosen from `specs`.
  *
  * @param {Array<{key,length,width,qty}>} rows   part rows, dimensions in mm
@@ -255,7 +310,9 @@ export function nest(rows, specs, opts = {}) {
   if (remaining.length) {
     for (const r of remaining) unplaced.push({ row: r, reason: `plate limit of ${maxPlates} reached` });
   }
-  return { plates, unplaced };
+  // The greedy loop never reopens a plate, so its leftovers each opened one.
+  // This is where those get absorbed back.
+  return { plates: consolidate(plates), unplaced };
 }
 
 /**

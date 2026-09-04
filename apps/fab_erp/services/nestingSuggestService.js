@@ -359,6 +359,40 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
   const unplaced = [];
   for (const [, g] of groups) {
     /**
+     * A PART THAT DOES NOT STATE ITS STEEL IS NOT NESTED. Refused, not guessed.
+     *
+     * `axisConflicts` only conflicts when BOTH sides state a value — `a && b &&
+     * a !== b` — which is right for auditing an existing pairing but wrong for
+     * choosing one. A part with no grade conflicts with nothing, so every grade
+     * in the catalogue stayed a candidate and the packer picked on fit alone.
+     * On a 12 mm group that means E250 and E350 sheets compete for the same
+     * part and the cheaper geometry wins.
+     *
+     * The consequence is not a costing error. Nesting an E250 plate under a
+     * bridge girder specified E350 is a structural defect that cuts, welds and
+     * passes the shop, and the quality suffix is worse still: BR is a
+     * room-temperature impact test and BO is at 0 °C. Substituting either is a
+     * metallurgical decision, and a packer must not make it silently.
+     *
+     * This was masked on the KEPL order only because grade and material were
+     * set on the order lines first — every one of the 23 chosen plates came out
+     * E350 BO. Nothing in the code required that.
+     */
+    if (g.grade == null || g.material == null) {
+      const missing = [g.material == null ? 'material' : null, g.grade == null ? 'grade' : null]
+        .filter(Boolean).join(' and ');
+      for (const r of g.rows) {
+        unplaced.push({
+          linkId: r.linkId, partCode: r.partCode, partName: r.partName,
+          reason: `this part does not state a ${missing}, so no plate can be chosen for it. `
+            + 'Set it on the order line and every part inherits it, or on this part alone if '
+            + 'it differs. Nesting will not pick a grade on your behalf.',
+        });
+      }
+      continue;
+    }
+
+    /**
      * A candidate must agree on all three axes — the SAME test the board
      * enforces on a drop and the integrity check audits afterwards, imported
      * from `materialMatchService` so those three can never drift apart.
