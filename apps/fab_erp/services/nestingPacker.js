@@ -34,20 +34,33 @@
 const TOL = 1;
 
 /**
- * CUTTING MARGIN — 50 mm for this shop, and it is not a rounding error.
+ * CUTTING GAP — 50 mm for this shop, BETWEEN PARTS ONLY.
  *
- * The torch needs clearance between two parts and away from the plate edge.
- * Modelled the standard way: shrink the usable sheet by the margin, and inflate
- * every part by it. Both together give exactly `margin` of clearance
- * everywhere — between neighbours, and from any part to the edge:
+ * The torch needs room to run a clean cut between two parts. It needs nothing
+ * at the plate's rim: a mill edge is already a finished edge, so a part may sit
+ * hard against it.
  *
- *   one part fits      l + m <= L - m   ->  l <= L - 2m   (m each side)
- *   two side by side   2(w + m) <= W - m -> 2w + 3m <= W  (m, part, m, part, m)
+ * MODELLED BY INFLATING THE PART AND THE SHEET BY THE SAME AMOUNT. Each part
+ * reserves (l + g) x (w + g), and the usable sheet is (L + g) x (W + g). The
+ * two cancel at the rim and survive in the middle, which is exactly the rule:
  *
- * It is charged to the PART, not to the plate, because that is where it is
- * physically consumed. A 2995 x 178 stiffener becomes 3045 x 228 — 28% more
- * area — which is why the true waste on small parts is far above what a
- * margin-free packer reports.
+ *   one part           l + g <= L + g     ->  l <= L              no edge margin
+ *   two side by side   2(w + g) <= W + g  ->  2w + g <= W         one gap between
+ *   n across           n(w + g) <= W + g  ->  nw + (n-1)g <= W    n-1 gaps
+ *
+ * `areaOf` still measures the REAL plate, because that is what gets bought.
+ *
+ * GETTING THIS WRONG IS EXPENSIVE, and it was wrong first time round. Charging
+ * the gap at the rim as well shrank the usable sheet by 2g, and the 28 mm Web
+ * Plate — 12000 long on a 12050 plate — stopped fitting at all. Twenty-four of
+ * the heaviest parts on the order became unmakeable by arithmetic rather than
+ * by anything the shop would recognise.
+ *
+ * It is still charged to the PART, which is why it hurts small ones hardest: a
+ * 2995 x 178 stiffener reserves 3045 x 228 wherever it has neighbours.
+ *
+ * ONE NUMBER FOR EVERY THICKNESS — the shop's own blanket rule, not a
+ * simplification made here.
  */
 const DEFAULT_MARGIN = 0;
 
@@ -56,7 +69,7 @@ export const newPlate = (spec, margin = DEFAULT_MARGIN) => ({
   margin,
   rows: [],
   pieces: [],
-  free: [{ x: 0, y: 0, l: spec.length - margin, w: spec.width - margin }],
+  free: [{ x: 0, y: 0, l: spec.length + margin, w: spec.width + margin }],
 });
 
 const clonePlate = (p) => ({
@@ -124,8 +137,9 @@ export function placeRow(plate, row) {
 
 /** Does ONE piece of this row fit on an empty plate of this size? */
 export const pieceFitsSpec = (row, spec, margin = DEFAULT_MARGIN) => {
+  // Both inflated by the gap, so it cancels for a lone part: no edge margin.
   const l = row.length + margin; const w = row.width + margin;
-  const L = spec.length - margin; const W = spec.width - margin;
+  const L = spec.length + margin; const W = spec.width + margin;
   return (l <= L + TOL && w <= W + TOL) || (l <= W + TOL && w <= L + TOL);
 };
 
