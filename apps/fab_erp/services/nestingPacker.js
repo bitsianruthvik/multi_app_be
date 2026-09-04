@@ -33,12 +33,30 @@
 /** Millimetres of slack before a part counts as not fitting. */
 const TOL = 1;
 
-/** A plate being filled, as a set of free rectangles. */
-const newPlate = (spec) => ({
+/**
+ * CUTTING MARGIN — 50 mm for this shop, and it is not a rounding error.
+ *
+ * The torch needs clearance between two parts and away from the plate edge.
+ * Modelled the standard way: shrink the usable sheet by the margin, and inflate
+ * every part by it. Both together give exactly `margin` of clearance
+ * everywhere — between neighbours, and from any part to the edge:
+ *
+ *   one part fits      l + m <= L - m   ->  l <= L - 2m   (m each side)
+ *   two side by side   2(w + m) <= W - m -> 2w + 3m <= W  (m, part, m, part, m)
+ *
+ * It is charged to the PART, not to the plate, because that is where it is
+ * physically consumed. A 2995 x 178 stiffener becomes 3045 x 228 — 28% more
+ * area — which is why the true waste on small parts is far above what a
+ * margin-free packer reports.
+ */
+const DEFAULT_MARGIN = 0;
+
+export const newPlate = (spec, margin = DEFAULT_MARGIN) => ({
   spec,
+  margin,
   rows: [],
   pieces: [],
-  free: [{ x: 0, y: 0, l: spec.length, w: spec.width }],
+  free: [{ x: 0, y: 0, l: spec.length - margin, w: spec.width - margin }],
 });
 
 const clonePlate = (p) => ({
@@ -48,8 +66,8 @@ const clonePlate = (p) => ({
   pieces: [...p.pieces],
 });
 
-const areaOf = (p) => p.spec.length * p.spec.width;
-const usedArea = (p) => p.rows.reduce((s, r) => s + r.length * r.width * r.qty, 0);
+export const areaOf = (p) => p.spec.length * p.spec.width;
+export const usedArea = (p) => p.rows.reduce((s, r) => s + r.length * r.width * r.qty, 0);
 
 /** Fraction of a plate actually taken by parts. */
 export const utilisation = (p) => usedArea(p) / areaOf(p);
@@ -93,19 +111,23 @@ function placePiece(plate, a, b) {
 }
 
 /** All `qty` pieces of a row, or none. Returns a new plate, or null. */
-function placeRow(plate, row) {
+export function placeRow(plate, row) {
   const trial = clonePlate(plate);
+  const m = plate.margin ?? 0;
   for (let i = 0; i < row.qty; i++) {
-    if (!placePiece(trial, row.length, row.width)) return null;
+    // Inflated by the margin: what is reserved is the part plus its clearance.
+    if (!placePiece(trial, row.length + m, row.width + m)) return null;
   }
   trial.rows.push(row);
   return trial;
 }
 
 /** Does ONE piece of this row fit on an empty plate of this size? */
-export const pieceFitsSpec = (row, spec) =>
-  (row.length <= spec.length + TOL && row.width <= spec.width + TOL)
-  || (row.length <= spec.width + TOL && row.width <= spec.length + TOL);
+export const pieceFitsSpec = (row, spec, margin = DEFAULT_MARGIN) => {
+  const l = row.length + margin; const w = row.width + margin;
+  const L = spec.length - margin; const W = spec.width - margin;
+  return (l <= L + TOL && w <= W + TOL) || (l <= W + TOL && w <= L + TOL);
+};
 
 /**
  * How many pieces of this row an empty plate of `spec` holds.
@@ -117,16 +139,16 @@ export const pieceFitsSpec = (row, spec) =>
  * packer spun on it making no progress until a plate limit stopped it. The
  * count is what lets the caller say something useful instead.
  */
-export function capacityOf(row, spec) {
-  let plate = newPlate(spec);
+export function capacityOf(row, spec, margin = DEFAULT_MARGIN) {
+  const plate = newPlate(spec, margin);
   let n = 0;
-  while (placePiece(plate, row.length, row.width)) n++;
+  while (placePiece(plate, row.length + margin, row.width + margin)) n++;
   return n;
 }
 
 /** Do ALL of this row's pieces fit on one empty plate of this size? */
-export const rowFitsSpec = (row, spec) =>
-  pieceFitsSpec(row, spec) && (row.qty <= 1 || capacityOf(row, spec) >= row.qty);
+export const rowFitsSpec = (row, spec, margin = DEFAULT_MARGIN) =>
+  pieceFitsSpec(row, spec, margin) && (row.qty <= 1 || capacityOf(row, spec, margin) >= row.qty);
 
 /**
  * Fill one plate of `spec` with as many of `rows` as will go.
@@ -135,8 +157,8 @@ export const rowFitsSpec = (row, spec) =>
  * pieces are placed while the plate is still open, and the small ones fill in
  * around them rather than fragmenting it first.
  */
-function fillOne(spec, rows, rng = null) {
-  let plate = newPlate(spec);
+export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN) {
+  let plate = newPlate(spec, margin);
   const taken = new Set();
   const pool = [...rows].sort((x, y) => {
     const d = Math.max(y.length, y.width) - Math.max(x.length, x.width);
@@ -166,7 +188,7 @@ function fillOne(spec, rows, rng = null) {
 }
 
 /** Seeded, so a run is reproducible and a good answer can be got back. */
-function mulberry32(a) {
+export function mulberry32(a) {
   return function next() {
     a |= 0; a = (a + 0x6D2B79F5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -247,6 +269,7 @@ export function consolidate(plates) {
  */
 function nestOnce(rows, specs, opts = {}, rng = null) {
   const maxPlates = opts.maxPlates ?? 5000;
+  const margin = opts.margin ?? DEFAULT_MARGIN;
   const plates = [];
   const unplaced = [];
   /**
@@ -267,17 +290,17 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
 
   let remaining = [];
   for (const r of rows) {
-    if (specs.some((s) => rowFitsSpec(r, s))) { remaining.push(r); continue; }
+    if (specs.some((s) => rowFitsSpec(r, s, margin))) { remaining.push(r); continue; }
     // Two different failures, and telling them apart is the difference between
     // "buy a wider plate" and "split this row".
-    if (!specs.some((s) => pieceFitsSpec(r, s))) {
+    if (!specs.some((s) => pieceFitsSpec(r, s, margin))) {
       unplaced.push({
         row: r,
         reason: `${r.length} x ${r.width} mm does not fit on any available plate `
               + `(largest is ${biggestLong} x ${biggestShort} mm)`,
       });
     } else {
-      const best = Math.max(...specs.filter((s) => pieceFitsSpec(r, s)).map((s) => capacityOf(r, s)));
+      const best = Math.max(...specs.filter((s) => pieceFitsSpec(r, s, margin)).map((s) => capacityOf(r, s, margin)));
       unplaced.push({
         row: r,
         reason: `${r.qty} pieces of ${r.length} x ${r.width} mm will not fit on one plate — `
@@ -306,7 +329,7 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
     for (const round of rounds) {
       for (const spec of round) {
         if ((stockOf.get(spec.id) ?? 0) <= 0) continue;
-        const { plate, taken } = fillOne(spec, remaining, rng);
+        const { plate, taken } = fillOne(spec, remaining, rng, margin);
         if (!taken.size) continue;
         const util = utilisation(plate);
         // Utilisation decides, but two plates within a hair of each other are not
@@ -398,7 +421,7 @@ export function verify(plates) {
   const problems = [];
   for (const p of plates) {
     for (const r of p.rows) {
-      if (!rowFitsSpec(r, p.spec)) {
+      if (!rowFitsSpec(r, p.spec, p.margin ?? 0)) {
         problems.push(`${r.key} is ${r.length}x${r.width} on a ${p.spec.length}x${p.spec.width} plate`);
       }
     }

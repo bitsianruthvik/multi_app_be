@@ -59,7 +59,7 @@ async function assertOrder(companyId, orderId) {
  * length have no column at catalog scope — only thickness does — so the columns
  * alone would give a set of plates with no size.
  */
-async function plateCatalog(companyId, conn = null) {
+export async function plateCatalog(companyId, conn = null) {
   const exec = conn ?? pool;
   const [items] = await exec.query(
     `SELECT ic.id, ic.code, ic.name, ic.thickness_mm AS thicknessMm
@@ -106,7 +106,7 @@ async function plateCatalog(companyId, conn = null) {
  * may hold hundreds and there is no sense packing against 16 mm offcuts for an
  * order made entirely of 12 mm.
  */
-async function offcutSpecs(companyId, catalogItemIds, conn = null) {
+export async function offcutSpecs(companyId, catalogItemIds, conn = null) {
   const exec = conn ?? pool;
   if (!catalogItemIds.length) return [];
   const [rows] = await exec.query(
@@ -162,7 +162,7 @@ async function offcutSpecs(companyId, catalogItemIds, conn = null) {
  * procurement's business, not nesting's. Material links do not count as children
  * for that test, or a part would stop being a leaf the moment it was nested.
  */
-async function nestableParts(companyId, orderId, { includeNested }) {
+export async function nestableParts(companyId, orderId, { includeNested }) {
   const [links] = await pool.query(
     `SELECT rm.id AS linkId, rm.nest_no AS nestNo, rm.catalog_item_id AS materialId,
             fic.code AS materialCode, fic.name AS materialName,
@@ -441,7 +441,7 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       continue;
     }
 
-    const res = nest(g.rows, candidates, { restarts: opts.restarts ?? 1, seed: opts.seed ?? 1 });
+    const res = nest(g.rows, candidates, { restarts: opts.restarts ?? 1, seed: opts.seed ?? 1, margin: opts.margin ?? 0 });
     for (const u of res.unplaced) {
       unplaced.push({
         linkId: u.row.linkId, partCode: u.row.partCode, partName: u.row.partName, reason: u.reason,
