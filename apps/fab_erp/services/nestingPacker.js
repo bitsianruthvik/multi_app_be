@@ -135,19 +135,48 @@ export const rowFitsSpec = (row, spec) =>
  * pieces are placed while the plate is still open, and the small ones fill in
  * around them rather than fragmenting it first.
  */
-function fillOne(spec, rows) {
+function fillOne(spec, rows, rng = null) {
   let plate = newPlate(spec);
   const taken = new Set();
-  const ordered = [...rows].sort((x, y) => {
+  const pool = [...rows].sort((x, y) => {
     const d = Math.max(y.length, y.width) - Math.max(x.length, x.width);
     return d !== 0 ? d : (y.length * y.width * y.qty) - (x.length * x.width * x.qty);
   });
-  for (const row of ordered) {
+
+  /**
+   * WITH `rng`, TAKE A RANDOM ONE OF THE TOP FEW instead of always the biggest.
+   *
+   * Greedy is order-sensitive, and "biggest first" is only a good guess, not a
+   * rule — sometimes the second-biggest first leaves a better remainder. This is
+   * the standard GRASP trick: keep the greedy instinct, but let the choice
+   * wobble among the near-equal candidates so repeated runs explore genuinely
+   * different arrangements rather than recomputing one answer.
+   *
+   * `rng` null reproduces the deterministic packer exactly, which is what makes
+   * restart 0 a guaranteed floor — more compute can never return a worse answer.
+   */
+  const TOP_K = 3;
+  while (pool.length) {
+    const i = rng ? Math.floor(rng() * Math.min(TOP_K, pool.length)) : 0;
+    const [row] = pool.splice(i, 1);
     const next = placeRow(plate, row);
     if (next) { plate = next; taken.add(row.key); }
   }
   return { plate, taken };
 }
+
+/** Seeded, so a run is reproducible and a good answer can be got back. */
+function mulberry32(a) {
+  return function next() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** What a nesting costs: plate area bought. Fewer plates breaks a tie. */
+const scoreOf = (res) => res.plates.reduce((a, p) => a + areaOf(p), 0);
 
 /**
  * Second pass: empty the worst plates into the others, and drop them.
@@ -216,7 +245,7 @@ export function consolidate(plates) {
  * @param {{maxPlates?:number}} [opts]
  * @returns {{plates:Array, unplaced:Array}}
  */
-export function nest(rows, specs, opts = {}) {
+function nestOnce(rows, specs, opts = {}, rng = null) {
   const maxPlates = opts.maxPlates ?? 5000;
   const plates = [];
   const unplaced = [];
@@ -277,7 +306,7 @@ export function nest(rows, specs, opts = {}) {
     for (const round of rounds) {
       for (const spec of round) {
         if ((stockOf.get(spec.id) ?? 0) <= 0) continue;
-        const { plate, taken } = fillOne(spec, remaining);
+        const { plate, taken } = fillOne(spec, remaining, rng);
         if (!taken.size) continue;
         const util = utilisation(plate);
         // Utilisation decides, but two plates within a hair of each other are not
@@ -313,6 +342,47 @@ export function nest(rows, specs, opts = {}) {
   // The greedy loop never reopens a plate, so its leftovers each opened one.
   // This is where those get absorbed back.
   return { plates: consolidate(plates), unplaced };
+}
+
+/**
+ * Nest, trying it many ways and keeping the best.
+ *
+ * ONE GREEDY RUN IS ONE GUESS. The order parts are placed in decides the
+ * answer, and "biggest first" is a good instinct rather than a rule. Running it
+ * again with the choice wobbled among the near-equal candidates explores a
+ * genuinely different arrangement, and the best of many is reliably better than
+ * the first.
+ *
+ * This is the cheapest way to convert compute into steel. There is no new
+ * theory, it cannot return a worse answer than the deterministic packer (run 0
+ * IS the deterministic packer, and only an improvement replaces it), and every
+ * restart is independent — so it parallelises across cores whenever that is
+ * worth wiring up.
+ *
+ * SCORED ON PLATE AREA BOUGHT, not on mean utilisation. Utilisation is a
+ * per-plate ratio and can be improved by using more plates; area bought is the
+ * money.
+ *
+ * `restarts` is a budget, not a target: pass what the clock allows.
+ */
+export function nest(rows, specs, opts = {}) {
+  const restarts = Math.max(1, opts.restarts ?? 1);
+  const seed = opts.seed ?? 1;
+
+  let best = nestOnce(rows, specs, opts, null);
+  let bestScore = scoreOf(best);
+
+  for (let i = 1; i < restarts; i += 1) {
+    const res = nestOnce(rows, specs, opts, mulberry32(seed + i * 0x9E3779B1));
+    // A run that strands a row is not an improvement whatever it scores.
+    if (res.unplaced.length > best.unplaced.length) continue;
+    const score = scoreOf(res);
+    if (score < bestScore
+      || (score === bestScore && res.plates.length < best.plates.length)) {
+      best = res; bestScore = score;
+    }
+  }
+  return best;
 }
 
 /**

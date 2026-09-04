@@ -441,7 +441,7 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       continue;
     }
 
-    const res = nest(g.rows, candidates);
+    const res = nest(g.rows, candidates, { restarts: opts.restarts ?? 1, seed: opts.seed ?? 1 });
     for (const u of res.unplaced) {
       unplaced.push({
         linkId: u.row.linkId, partCode: u.row.partCode, partName: u.row.partName, reason: u.reason,

@@ -386,9 +386,31 @@ export const suggestNestingHandler = async (req, res) => {
   try {
     const cid = companyId(req);
     const orderId = Number(req.params.orderId);
+    /**
+     * HOW HARD TO LOOK, measured rather than guessed.
+     *
+     * Benchmarked on the KEPL order (1,090 parts, 695 t of plate):
+     *
+     *   restarts   time    steel      saved
+     *          1    5 s   695.24 t        —
+     *          5   10 s   689.87 t   5.37 t
+     *         50   64 s   689.44 t   5.80 t
+     *        250  291 s   689.24 t   6.00 t
+     *
+     * Nine tenths of the gain is in the first ten seconds, and five minutes of
+     * compute buys 0.63 t more than ten seconds does. So the default is 8 — a
+     * few seconds, nearly all the money — and `?restarts=` is there for a deep
+     * run before a large purchase.
+     *
+     * Capped at 400: past ~150 the curve is flat, and the honest reading is
+     * that restarts are exhausted. What is left is not a search problem.
+     */
+    const asked = Number(req.query.restarts);
+    const restarts = Number.isFinite(asked) ? Math.min(Math.max(1, asked), 400) : 8;
     res.json(await suggestNesting(cid, orderId, {
       includeNested: req.query.includeNested === 'true',
       grade: req.query.grade || null,
+      restarts,
     }));
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
