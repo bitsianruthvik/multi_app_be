@@ -141,16 +141,43 @@ function placePiece(plate, a, b, rng = null) {
   return true;
 }
 
-/** All `qty` pieces of a row, or none. Returns a new plate, or null. */
-export function placeRow(plate, row, rng = null) {
+/**
+ * Put as many of this row's pieces on the plate as will go.
+ *
+ * A ROW USED TO BE ALL-OR-NOTHING, and that was never a rule of the shop. Nobody
+ * minds if ninety stiffeners come off one plate and fifty-four off another —
+ * they go on the same pile either way. It was a rule of the data model: one part
+ * row pointed at one plate, so the packer was made to honour something the
+ * database happened to require.
+ *
+ * Measured on the KEPL order, removing it is worth almost nothing on its own —
+ * 0.28 t across 690, which is inside the noise of a randomised search. It is
+ * removed because POOLING needs it. Once identical parts are one demand line,
+ * the biggest line on that order is 828 pieces, about fifteen plates' worth, and
+ * all-or-nothing makes it unplaceable.
+ *
+ * @returns {{plate, placed:number}} `placed` is 0 when none would fit.
+ */
+export function placeSome(plate, row, wanted, rng = null) {
   const trial = clonePlate(plate);
   const m = plate.margin ?? 0;
-  for (let i = 0; i < row.qty; i++) {
+  let placed = 0;
+  while (placed < wanted) {
     // Inflated by the margin: what is reserved is the part plus its clearance.
-    if (!placePiece(trial, row.length + m, row.width + m, rng)) return null;
+    if (!placePiece(trial, row.length + m, row.width + m, rng)) break;
+    placed++;
   }
-  trial.rows.push(row);
-  return trial;
+  if (!placed) return { plate, placed: 0 };
+  // The row recorded on the plate carries the count that landed HERE, so a plate
+  // still knows exactly what is cut from it.
+  trial.rows.push({ ...row, qty: placed });
+  return { plate: trial, placed };
+}
+
+/** All `qty` pieces of a row, or none. Used where a row must move whole. */
+export function placeRow(plate, row, rng = null) {
+  const { plate: next, placed } = placeSome(plate, row, row.qty, rng);
+  return placed === row.qty ? next : null;
 }
 
 /** Does ONE piece of this row fit on an empty plate of this size? */
@@ -191,7 +218,7 @@ export const rowFitsSpec = (row, spec, margin = DEFAULT_MARGIN) =>
  */
 export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterPlacement = false) {
   let plate = newPlate(spec, margin);
-  const taken = new Set();
+  const taken = new Map();
   const pool = [...rows].sort((x, y) => {
     const d = Math.max(y.length, y.width) - Math.max(x.length, x.width);
     return d !== 0 ? d : (y.length * y.width * y.qty) - (x.length * x.width * x.qty);
@@ -213,8 +240,15 @@ export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterP
   while (pool.length) {
     const i = rng ? Math.floor(rng() * Math.min(TOP_K, pool.length)) : 0;
     const [row] = pool.splice(i, 1);
-    const next = placeRow(plate, row, jitterPlacement ? rng : null);
-    if (next) { plate = next; taken.add(row.key); }
+    /**
+     * PART of a row is a real answer now, not a failure.
+     *
+     * `taken` therefore counts pieces rather than naming rows: the caller has to
+     * know that this plate absorbed 90 of the 144 wanted, so the remaining 54
+     * can go looking for another plate.
+     */
+    const { plate: next, placed } = placeSome(plate, row, row.qty, jitterPlacement ? rng : null);
+    if (placed) { plate = next; taken.set(row.key, (taken.get(row.key) ?? 0) + placed); }
   }
   return { plate, taken };
 }
@@ -320,26 +354,23 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
   const biggestLong = Math.max(...specs.map((s) => Math.max(s.length, s.width)));
   const biggestShort = Math.max(...specs.map((s) => Math.min(s.length, s.width)));
 
+  /**
+   * ONE PIECE IS THE TEST NOW, not the whole row.
+   *
+   * A row of 828 stiffeners is fifteen plates' worth and perfectly ordinary; it
+   * used to be rejected up front with "this row has to be split before it can be
+   * nested", which was the packer apologising for a schema rule. The only
+   * genuine impossibility left is a PIECE bigger than any plate sold — and that
+   * is a real answer: the drawing needs steel nobody stocks.
+   */
   let remaining = [];
   for (const r of rows) {
-    if (specs.some((s) => rowFitsSpec(r, s, margin))) { remaining.push(r); continue; }
-    // Two different failures, and telling them apart is the difference between
-    // "buy a wider plate" and "split this row".
-    if (!specs.some((s) => pieceFitsSpec(r, s, margin))) {
-      unplaced.push({
-        row: r,
-        reason: `${r.length} x ${r.width} mm does not fit on any available plate `
-              + `(largest is ${biggestLong} x ${biggestShort} mm)`,
-      });
-    } else {
-      const best = Math.max(...specs.filter((s) => pieceFitsSpec(r, s, margin)).map((s) => capacityOf(r, s, margin)));
-      unplaced.push({
-        row: r,
-        reason: `${r.qty} pieces of ${r.length} x ${r.width} mm will not fit on one plate — `
-              + `the largest available holds ${best}. A part row is cut from a single plate, `
-              + 'so this row has to be split before it can be nested.',
-      });
-    }
+    if (specs.some((s) => pieceFitsSpec(r, s, margin))) { remaining.push(r); continue; }
+    unplaced.push({
+      row: r,
+      reason: `${r.length} x ${r.width} mm does not fit on any available plate `
+            + `(largest is ${biggestLong} x ${biggestShort} mm)`,
+    });
   }
 
   while (remaining.length && plates.length < maxPlates) {
@@ -388,7 +419,18 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
     }
     plates.push(best.plate);
     stockOf.set(best.plate.spec.id, (stockOf.get(best.plate.spec.id) ?? Infinity) - 1);
-    remaining = remaining.filter((r) => !best.taken.has(r.key));
+    /**
+     * A row leaves the pool only when every piece of it has landed.
+     *
+     * The plate that was just committed may have absorbed 90 of 144; the other
+     * 54 are still work to do and go back into the contest for the next plate.
+     */
+    remaining = remaining.flatMap((r) => {
+      const done = best.taken.get(r.key) ?? 0;
+      if (!done) return [r];
+      const left = r.qty - done;
+      return left > 0 ? [{ ...r, qty: left }] : [];
+    });
   }
 
   if (remaining.length) {

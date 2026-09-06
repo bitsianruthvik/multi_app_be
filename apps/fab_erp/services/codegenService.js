@@ -65,6 +65,39 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: 'SP-' },
     { type: 'sequence', digits: 6, resetPeriod: 'never' },
   ],
+  /**
+   * A PART ON AN ORDER — named by what it is, not by where it sits.
+   *
+   *   KLPT-SO-20260906-0005-MS-E350BO-12X200X400
+   *
+   * No sequence and no tree position, and both omissions are the point. Two
+   * identical stiffeners under two different diaphragms produce the SAME code,
+   * which is what lets them be one thing to nest, to buy and to stock. A running
+   * number would make them different again, and a tree position asserts a
+   * difference that stops existing the moment they come off the plate and go on
+   * the same pile.
+   *
+   * It also keeps the property the whole BOQ workflow rests on: the code is
+   * predictable by eye. Read the material and the size off a drawing and you can
+   * write the code without looking it up.
+   *
+   * Dimensions read thickness x width x length because that is the order a
+   * fabricator says them in, and each is padded so codes of the same shape sort
+   * together.
+   */
+  order_part: [
+    { type: 'order_prefix' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'material', length: 4, fallback: 'NA' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'grade', length: 8, fallback: 'NA' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'thickness', pad: 2 },
+    { type: 'fixed', value: 'X' },
+    { type: 'attribute', field: 'width', pad: 4 },
+    { type: 'fixed', value: 'X' },
+    { type: 'attribute', field: 'length', pad: 5 },
+  ],
   bom: [
     { type: 'fixed', value: 'BOM-' },
     { type: 'sequence', digits: 4, resetPeriod: 'never' },
@@ -213,6 +246,51 @@ async function evaluateSegments(segments, { companyId, context, seqValue, now })
       case 'sequence':
         parts.push(String(seqValue).padStart(seg.digits ?? 4, '0'));
         break;
+
+      /**
+       * A PART IS NAMED BY WHAT IT IS, NOT BY WHERE IT SITS.
+       *
+       * An assembly earns a positional code because that specific object goes in
+       * that specific place: ED3 is at one end of the bridge and ED4 at the
+       * other, and if ED3 fails inspection it is ED3 that failed. A part has no
+       * such claim. A 12 mm E350 plate 200 x 400 is the same object wherever it
+       * came from in the tree, and once it is cut it goes on a pile with the
+       * others and nobody can tell them apart again.
+       *
+       * Coding it by its tree position asserted a difference that does not
+       * exist, and that assertion had a price: two identical stiffeners under
+       * two different diaphragms were two separate things to nest, to buy and to
+       * stock, so the same steel was planned three times over.
+       *
+       * `attribute` reads one named value out of the context the caller passes —
+       * material, grade, thickness, width, length. `length` truncates it and
+       * `pad` zero-fills a number, so `12` can read as `012` and sort properly.
+       */
+      case 'attribute': {
+        const raw = context.attributes?.[seg.field];
+        if (raw == null || raw === '') { parts.push(seg.fallback ?? ''); break; }
+        let text = String(raw).trim();
+        // Numbers lose their decimal tail: 12.000000 is 12 on a drawing.
+        if (/^-?\d+(\.\d+)?$/.test(text)) text = String(Number(text));
+        if (seg.strip !== false) text = text.replace(/[^A-Za-z0-9.]+/g, '');
+        if (seg.upper !== false) text = text.toUpperCase();
+        if (seg.pad) text = text.padStart(seg.pad, '0');
+        if (seg.length) text = text.slice(0, seg.length);
+        parts.push(text);
+        break;
+      }
+
+      /**
+       * The order's own prefix — `<customer abbr>-<order number>`.
+       *
+       * Resolved by the caller rather than looked up here, because
+       * `itemCodeService.orderCodePrefix` already owns that rule and a second
+       * implementation would be a second answer to the same question.
+       */
+      case 'order_prefix':
+        parts.push(context.orderPrefix ?? '');
+        break;
+
       default:
         break;
     }

@@ -662,6 +662,38 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
    * and the entire proposal is lost for a reason that has nothing to do with
    * the order. That is exactly how 129 plates were computed and thrown away.
    */
+  /**
+   * A PART ON TWO PLATES CANNOT BE SAVED YET — refused, not half-written.
+   *
+   * The packer may now split a row across plates, which is what pooling needs:
+   * eight hundred stiffeners are fifteen plates' worth and no single sheet holds
+   * them. The WRITER has not caught up. A part carries one material row, that
+   * row carries one nest_no, and the loop below updates it once per nest — so a
+   * part appearing twice would have its first plate silently overwritten by its
+   * second, and the order would claim steel it had not bought.
+   *
+   * Refusing is the only honest option until a part can carry one material row
+   * per nest. It cannot happen on today's orders, where no row is big enough to
+   * overflow a plate; it will happen the moment parts are pooled, and that is
+   * the change this guard is waiting for.
+   */
+  const seenPart = new Map();
+  for (const n of nests) {
+    for (const p of n.parts ?? []) {
+      const k = String(p.linkId ?? p.partId);
+      seenPart.set(k, (seenPart.get(k) ?? 0) + 1);
+    }
+  }
+  const split = [...seenPart.entries()].filter(([, c]) => c > 1);
+  if (split.length) {
+    const e = new Error(
+      `${split.length} part(s) were laid across more than one plate. That is a better nesting, `
+      + 'but a part can still only record one plate, so saving it would lose the others. '
+      + 'Nest these separately for now.',
+    );
+    e.status = 409; e.code = 'PART_SPLIT_ACROSS_PLATES'; throw e;
+  }
+
   const conn = await getLiveConnection();
   let applied = 0;
   let linksMoved = 0;
