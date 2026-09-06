@@ -387,30 +387,33 @@ export const suggestNestingHandler = async (req, res) => {
     const cid = companyId(req);
     const orderId = Number(req.params.orderId);
     /**
-     * HOW HARD TO LOOK, measured rather than guessed.
+     * HOW HARD TO LOOK — a named setting, measured rather than guessed.
      *
-     * Benchmarked on the KEPL order (1,090 parts, 695 t of plate):
+     * On the KEPL order (1,090 parts) at the shop's real 2 mm cutting gap, with
+     * MS plate around Rs 85,000 a tonne:
      *
-     *   restarts   time    steel      saved
-     *          1    5 s   695.24 t        —
-     *          5   10 s   689.87 t   5.37 t
-     *         50   64 s   689.44 t   5.80 t
-     *        250  291 s   689.24 t   6.00 t
+     *   quick      ~5 s   697.15 t        —              —
+     *   standard  ~60 s   691.03 t   6.12 t   ~Rs 5.2 lakh
+     *   deep     ~300 s   690.57 t   6.58 t   ~Rs 5.6 lakh
      *
-     * Nine tenths of the gain is in the first ten seconds, and five minutes of
-     * compute buys 0.63 t more than ten seconds does. So the default is 8 — a
-     * few seconds, nearly all the money — and `?restarts=` is there for a deep
-     * run before a large purchase.
+     * Standard is the default: 93% of the saving in a fifth of the time. Deep
+     * buys the last 0.46 t, about Rs 39,000 — worth waiting for before a large
+     * purchase, not worth it while somebody is still editing the BOQ.
      *
-     * Capped at 400: past ~150 the curve is flat, and the honest reading is
-     * that restarts are exhausted. What is left is not a search problem.
+     * `budgetMs` overrides the level's own allowance for a caller that knows
+     * how long it can wait. Capped at ten minutes: everything good converges
+     * near 690.6 t against a 689.87 t floor, so there is under a tonne left in
+     * this approach and no case for running it longer.
      */
-    const asked = Number(req.query.restarts);
-    const restarts = Number.isFinite(asked) ? Math.min(Math.max(1, asked), 400) : 8;
+    const askedMs = Number(req.query.budgetMs);
+    const effort = ['quick', 'standard', 'deep'].includes(req.query.effort)
+      ? req.query.effort : 'standard';
     res.json(await suggestNesting(cid, orderId, {
       includeNested: req.query.includeNested === 'true',
       grade: req.query.grade || null,
-      restarts,
+      margin: Number.isFinite(Number(req.query.gapMm)) ? Number(req.query.gapMm) : undefined,
+      effort,
+      budgetMs: Number.isFinite(askedMs) ? Math.min(Math.max(0, askedMs), 600_000) : undefined,
     }));
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });

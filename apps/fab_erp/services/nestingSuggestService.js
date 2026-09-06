@@ -34,10 +34,20 @@ import { pool } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { resolveFields } from './fieldService.js';
 import { plateFits } from './materialMatchService.js';
-import { nest, verify, utilisation } from './nestingPacker.js';
+import {
+  nestAtEffort, verify, utilisation, EFFORT_LEVELS, DEFAULT_CUT_GAP_MM,
+} from './nestingPacker.js';
 import { syncOrderProcurement } from './procurementService.js';
 
 const PLATE_GROUP = 'Plates';
+
+/**
+ * Indicative MS plate price, for turning tonnes of offcut into a number a
+ * person can weigh a decision against. A single blended rate on purpose — the
+ * real price moves with grade, thickness and the week, and a per-grade table
+ * here would be a second place to keep a fact that belongs in purchasing.
+ */
+const STEEL_RATE_INR_PER_TONNE = 85000;
 const num = (v) => {
   if (v == null || v === '') return null;
   const n = Number(v);
@@ -355,6 +365,22 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
     groups.get(key).rows.push(r);
   }
 
+  /**
+   * HOW HARD TO LOOK, and how long that is allowed to take.
+   *
+   * The budget belongs to the ORDER. Splitting it across the groups is what
+   * stops a six-thickness order taking six times as long as a one-thickness
+   * order at the same setting — the person picked "one minute", not "one minute
+   * per steel".
+   *
+   * Groups with no candidate plate are skipped below without spending any of
+   * it, so the split is over the groups that will actually be packed.
+   */
+  const effort = EFFORT_LEVELS[opts.effort] ? opts.effort : 'standard';
+  const packable = [...groups.values()].filter((g) => g.grade != null && g.material != null);
+  const totalBudgetMs = opts.budgetMs ?? EFFORT_LEVELS[effort].budgetMs;
+  const groupBudgetMs = packable.length ? totalBudgetMs / packable.length : totalBudgetMs;
+
   const out = [];
   const unplaced = [];
   for (const [, g] of groups) {
@@ -441,7 +467,18 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
       continue;
     }
 
-    const res = nest(g.rows, candidates, { restarts: opts.restarts ?? 1, seed: opts.seed ?? 1, margin: opts.margin ?? 0 });
+    /*
+     * The budget is for the ORDER, not for each thickness. Divided across the
+     * groups so "standard, one minute" means a minute in total — otherwise an
+     * order with six thicknesses quietly takes six minutes.
+     */
+    const res = nestAtEffort(
+      g.rows,
+      candidates,
+      { seed: opts.seed ?? 1, margin: opts.margin ?? DEFAULT_CUT_GAP_MM },
+      effort,
+      groupBudgetMs,
+    );
     for (const u of res.unplaced) {
       unplaced.push({
         linkId: u.row.linkId, partCode: u.row.partCode, partName: u.row.partName, reason: u.reason,
@@ -498,6 +535,8 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
     groups: out,
     unplaced,
     skipped,
+    effort,
+    cutGapMm: opts.margin ?? DEFAULT_CUT_GAP_MM,
     summary: summarise(out, unplaced, skipped),
   };
 }
@@ -518,6 +557,20 @@ function summarise(groups, unplaced, skipped) {
     const b = byT.get(k);
     b.plates++; b.used += g.usedAreaMm2; b.waste += g.wasteAreaMm2;
   }
+  /**
+   * TONNES AND RUPEES, because area is not what anybody buys.
+   *
+   * A square metre of 40 mm plate is 3.3 times the steel of a square metre of
+   * 12 mm, so an area total flatters a plan that wastes thick plate and
+   * punishes one that wastes thin. Weight is the honest cross-thickness figure
+   * and the only one that converts to money.
+   */
+  const DENSITY_T_PER_M2_MM = 7.85 / 1000;
+  const steelT = groups.reduce(
+    (s, g) => s + ((g.usedAreaMm2 + g.wasteAreaMm2) / 1e6) * g.thickness * DENSITY_T_PER_M2_MM, 0);
+  const wasteT = groups.reduce(
+    (s, g) => s + (g.wasteAreaMm2 / 1e6) * g.thickness * DENSITY_T_PER_M2_MM, 0);
+
   return {
     plates: groups.length,
     parts: groups.reduce((s, g) => s + g.parts.length, 0),
@@ -527,6 +580,11 @@ function summarise(groups, unplaced, skipped) {
     plateAreaM2: Math.round((used + waste) / 1e6 * 100) / 100,
     wasteAreaM2: Math.round(waste / 1e6 * 100) / 100,
     wastePct: Math.round((waste / (used + waste)) * 1000) / 10,
+    steelTonnes: Math.round(steelT * 100) / 100,
+    wasteTonnes: Math.round(wasteT * 100) / 100,
+    // Indicative only, at a single blended rate — the real price varies by
+    // grade, thickness and the day. Enough to size a decision, not to quote.
+    wasteValueInr: Math.round(wasteT * STEEL_RATE_INR_PER_TONNE),
     unplaced: unplaced.length,
     skipped: skipped.length,
     byThickness: [...byT.values()].map((b) => ({

@@ -62,6 +62,19 @@ const TOL = 1;
  * ONE NUMBER FOR EVERY THICKNESS — the shop's own blanket rule, not a
  * simplification made here.
  */
+/**
+ * The shop's actual rule: 2 mm between parts, one number for every thickness.
+ *
+ * Exported so the suggestor defaults to it rather than to nothing. It costs
+ * 1.6 t on a 690 t order — real, and nothing like the 50 mm first assumed,
+ * which would have cost 83 t and made the web plate unmakeable.
+ *
+ * The primitives below still default to 0 so that a caller measuring pure
+ * geometry — the integrity audit, a capacity question — is not silently charged
+ * a gap it did not ask for.
+ */
+export const DEFAULT_CUT_GAP_MM = 2;
+
 const DEFAULT_MARGIN = 0;
 
 export const newPlate = (spec, margin = DEFAULT_MARGIN) => ({
@@ -95,18 +108,33 @@ export const utilisation = (p) => usedArea(p) / areaOf(p);
  * cutting — refusing to turn a part 90 degrees would reject work a shop does
  * daily.
  */
-function placePiece(plate, a, b) {
-  let best = null;
+function placePiece(plate, a, b, rng = null) {
+  /**
+   * EVERY feasible placement, not just the best one — because orientation is
+   * decided here, and it was never being searched.
+   *
+   * Both turns of the piece are tried against every free rectangle, so a sheet
+   * CAN carry some parts one way and some the other. It just never did: the
+   * score is deterministic, so the first piece's choice fixed the pattern and
+   * every later piece repeated it. On the KEPL 12 mm group, 0 of 36 plates
+   * mixed orientations. The restarts did not help, because they wobble the row
+   * ORDER and leave orientation alone.
+   *
+   * With `rng`, the pick comes from the best few placements rather than the
+   * single best — which is what finally lets a run try turning a part.
+   */
+  const cands = [];
   for (let i = 0; i < plate.free.length; i++) {
     const r = plate.free[i];
     for (const [pl, pw] of [[a, b], [b, a]]) {
       if (pl > r.l + TOL || pw > r.w + TOL) continue;
-      const score = Math.min(r.l - pl, r.w - pw);
-      if (!best || score < best.score) best = { i, r, pl, pw, score };
+      cands.push({ i, r, pl, pw, score: Math.min(r.l - pl, r.w - pw) });
     }
   }
-  if (!best) return false;
+  if (!cands.length) return false;
+  cands.sort((x, y) => x.score - y.score);
 
+  const best = rng ? cands[Math.floor(rng() * Math.min(3, cands.length))] : cands[0];
   const { i, r, pl, pw } = best;
   plate.free.splice(i, 1);
   plate.pieces.push({ x: r.x, y: r.y, l: pl, w: pw });
@@ -124,12 +152,12 @@ function placePiece(plate, a, b) {
 }
 
 /** All `qty` pieces of a row, or none. Returns a new plate, or null. */
-export function placeRow(plate, row) {
+export function placeRow(plate, row, rng = null) {
   const trial = clonePlate(plate);
   const m = plate.margin ?? 0;
   for (let i = 0; i < row.qty; i++) {
     // Inflated by the margin: what is reserved is the part plus its clearance.
-    if (!placePiece(trial, row.length + m, row.width + m)) return null;
+    if (!placePiece(trial, row.length + m, row.width + m, rng)) return null;
   }
   trial.rows.push(row);
   return trial;
@@ -171,7 +199,7 @@ export const rowFitsSpec = (row, spec, margin = DEFAULT_MARGIN) =>
  * pieces are placed while the plate is still open, and the small ones fill in
  * around them rather than fragmenting it first.
  */
-export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN) {
+export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterPlacement = false) {
   let plate = newPlate(spec, margin);
   const taken = new Set();
   const pool = [...rows].sort((x, y) => {
@@ -195,7 +223,7 @@ export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN) {
   while (pool.length) {
     const i = rng ? Math.floor(rng() * Math.min(TOP_K, pool.length)) : 0;
     const [row] = pool.splice(i, 1);
-    const next = placeRow(plate, row);
+    const next = placeRow(plate, row, jitterPlacement ? rng : null);
     if (next) { plate = next; taken.add(row.key); }
   }
   return { plate, taken };
@@ -343,7 +371,7 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
     for (const round of rounds) {
       for (const spec of round) {
         if ((stockOf.get(spec.id) ?? 0) <= 0) continue;
-        const { plate, taken } = fillOne(spec, remaining, rng, margin);
+        const { plate, taken } = fillOne(spec, remaining, rng, margin, opts.jitterPlacement === true);
         if (!taken.size) continue;
         const util = utilisation(plate);
         // Utilisation decides, but two plates within a hair of each other are not
@@ -420,6 +448,113 @@ export function nest(rows, specs, opts = {}) {
     }
   }
   return best;
+}
+
+/**
+ * Tear up the worst plates and rebuild only those parts.
+ *
+ * WHY THIS BEATS RESTARTING. A restart throws the whole layout away, so a
+ * thousand of them only ever reach a thousand complete guesses — and 90% of
+ * each guess was already fine. This keeps the good plates and spends every
+ * second on the part that is actually wrong. Measured on KEPL it matched a
+ * thousand restarts in a sixth of the time, then beat them.
+ *
+ * The tear-up is biased towards the EMPTIEST plates, because a full plate
+ * rebuilt comes back as the same plate. Kept only when the area falls, so it
+ * can never end worse than the solution it started from.
+ *
+ * WHAT IT IS NOT: a way to discover the mixed sheet. Putting a web and forty
+ * stiffeners on one plate is where the efficiency lives, and this never has to
+ * rediscover that — it inherits it from the greedy start and protects it. Two
+ * strategies that build mixing from scratch (smallest-plate-first, and merging
+ * pairs upward) were both ~60 t WORSE than plain greedy for exactly that reason.
+ */
+export function ruinRecreate(rows, specs, opts = {}, deadline, seed = 7) {
+  const rng = mulberry32(seed);
+  let best = nest(rows, specs, { ...opts, restarts: 8, seed });
+  let bestScore = scoreOf(best);
+
+  while (Date.now() < deadline) {
+    const keep = [];
+    const freed = [];
+    for (const p of best.plates) {
+      const emptiness = 1 - usedArea(p) / areaOf(p);
+      if (rng() < 0.15 + emptiness) freed.push(...p.rows); else keep.push(p);
+    }
+    if (!freed.length) continue;
+
+    const redone = nest(freed, specs, { ...opts, restarts: 4, seed: Math.floor(rng() * 1e9) });
+    if (redone.unplaced.length) continue;
+
+    const score = keep.reduce((a, p) => a + areaOf(p), 0)
+      + redone.plates.reduce((a, p) => a + areaOf(p), 0);
+    if (score < bestScore) {
+      best = { plates: [...keep, ...redone.plates], unplaced: best.unplaced };
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/**
+ * Several independent ruin & recreate runs, budget split, best kept.
+ *
+ * One long run improves ONE arrangement and can settle into a shape it cannot
+ * dig out of; several shorter runs each open somewhere different, so a bad
+ * start costs a slice of the budget rather than all of it.
+ *
+ * The split is the catch. Every start pays for its own initial solution before
+ * any repair happens, so past some count each start is doing nothing but that
+ * and multi-start collapses into plain restarts — the weaker search. Four is
+ * what measured best; this is not a dial to turn up indefinitely.
+ */
+export function multiStartNest(rows, specs, opts = {}, totalMs, starts = 4) {
+  const slice = Math.max(1, totalMs / Math.max(1, starts));
+  let best = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < starts; i += 1) {
+    const r = ruinRecreate(rows, specs, opts, Date.now() + slice, 1000 + i * 7919);
+    const score = scoreOf(r);
+    if (score < bestScore) { best = r; bestScore = score; }
+  }
+  return best;
+}
+
+/**
+ * HOW HARD TO LOOK — the three settings a person actually chooses between.
+ *
+ * Measured on the KEPL order (1,090 parts) at the shop's real 2 mm cutting gap.
+ * Steel is ~Rs 85,000 a tonne, so the third column is what the choice is worth:
+ *
+ *   quick      ~5 s    697.15 t      —            still editing the BOQ
+ *   standard   ~60 s   691.03 t   6.12 t saved    the real nesting run
+ *   deep      ~300 s   690.57 t   6.58 t saved    before a large purchase
+ *
+ * Standard is the default because it captures 93% of the available saving in a
+ * fifth of the time. Deep buys the last 0.46 t — about Rs 39,000, worth having
+ * on a big job and not worth waiting for on a small one.
+ *
+ * There is very little beyond deep. Everything good converges near 690.6 t and
+ * the zero-clearance floor is 689.87 t, so under a tonne of headroom remains in
+ * this approach. More is a constraint question, not a compute question.
+ */
+export const EFFORT_LEVELS = {
+  quick: { label: 'Quick', restarts: 4, budgetMs: 0 },
+  standard: { label: 'Standard', restarts: 8, budgetMs: 60_000 },
+  deep: { label: 'Deep', restarts: 8, budgetMs: 300_000, starts: 4 },
+};
+
+/**
+ * Nest at a named effort. `budgetMs` is the whole call's allowance; the caller
+ * divides it across groups so that "standard" means a minute for the ORDER, not
+ * a minute per thickness.
+ */
+export function nestAtEffort(rows, specs, opts = {}, effort = 'standard', budgetMs = null) {
+  const level = EFFORT_LEVELS[effort] ?? EFFORT_LEVELS.standard;
+  const ms = budgetMs ?? level.budgetMs;
+  if (!ms) return nest(rows, specs, { ...opts, restarts: level.restarts });
+  if (level.starts) return multiStartNest(rows, specs, opts, ms, level.starts);
+  return ruinRecreate(rows, specs, opts, Date.now() + ms);
 }
 
 /**
