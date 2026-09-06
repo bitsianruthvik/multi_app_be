@@ -274,11 +274,29 @@ function multiStart(rowsIn, specs, margin, totalMs, starts, jitterPlacement = fa
   return best;
 }
 
+/**
+ * A LADDER THAT SEPARATES THE TWO VARIABLES.
+ *
+ * "More starts with orientation" mixes two changes, and if the result moves
+ * there is no way to say which did it. So the ladder walks the start count with
+ * orientation ON, and carries two orientation-OFF controls at the same counts.
+ * Every row gets the same wall-clock budget, which is the only fair comparison
+ * when the budget is what is being spent.
+ *
+ * Expect a turning point. The budget is SPLIT across starts, so each start gets
+ * less time as the count rises — and each one spends a fixed slice building its
+ * initial solution before any ruin & recreate happens. Past some count every
+ * start is doing nothing but that initial solve, and multi-start collapses into
+ * plain restarts, which we already know is the weaker search.
+ */
 const ALGOS = [
   ['A  greedy', (g) => nest(g.rows, g.candidates, { restarts: 1, margin: MARGIN })],
-  ['C2 multi-start x4', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 4)],
-  ['E  smallest-viable', (g) => smallestViable(g.rows, g.candidates, MARGIN)],
-  ['F  merge upwards x5', (g) => agglomerate(g.rows, g.candidates, MARGIN, Date.now() + perGroupBudget, 5)],
+  ['x4  no-orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 4, false)],
+  ['x4  + orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 4, true)],
+  ['x8  + orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 8, true)],
+  ['x8  no-orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 8, false)],
+  ['x16 + orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 16, true)],
+  ['x32 + orient', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 32, true)],
 ];
 
 const results = [];
