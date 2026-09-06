@@ -341,6 +341,16 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
   if (!rows.length) {
     return {
       ok: true, groups: [], skipped, unplaced: [], summary: emptySummary(),
+      /*
+       * The accepted nesting travels with this "nothing to do" answer too.
+       *
+       * It is the moment the screen is inviting a re-plan, and the caller needs
+       * to know one already exists before offering to spend five minutes
+       * replacing it. `comparable` is false — there is no proposal to compare
+       * against — but the plate count and tonnage are exactly what the warning
+       * is made of.
+       */
+      current: await acceptedForComparison(companyId, orderId, emptySummary()),
       message: includeNested ? 'This order has no parts with material to nest.'
         : 'Every part with material is already nested. Re-run including nested parts to re-plan.',
     };
