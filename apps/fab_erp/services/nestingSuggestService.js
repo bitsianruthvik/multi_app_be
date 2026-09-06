@@ -540,10 +540,25 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
           length: p.spec.length,
           width: p.spec.width,
         },
-        parts: p.rows.map((r) => ({
-          linkId: r.linkId, partId: r.partId, partCode: r.partCode,
-          partName: r.partName, qty: r.qty, length: r.length, width: r.width,
-        })),
+        /**
+         * ONE ENTRY PER PART, even when a plate carries it as several rows.
+         *
+         * `fillOne` records a row each time it places some, and ruin & recreate
+         * puts several partial rows of the same pooled part back in the pool —
+         * so one sheet can legitimately end up with two rows of the same part,
+         * 10 pieces and 46. Left as two entries they read as two things on the
+         * cutting list, and the accept tried to write two material rows with the
+         * same code and hit uq_fi_company_code_active. Summed here, because "46
+         * of this part come off this plate" is the true statement either way.
+         */
+        parts: [...p.rows.reduce((m, r) => {
+          const cur = m.get(r.key);
+          if (cur) { cur.qty += r.qty; return m; }
+          return m.set(r.key, {
+            linkId: r.linkId, partId: r.partId, partCode: r.partCode,
+            partName: r.partName, qty: r.qty, length: r.length, width: r.width,
+          });
+        }, new Map()).values()],
         pieces: p.rows.reduce((s, r) => s + r.qty, 0),
         utilisationPct: Math.round(utilisation(p) * 1000) / 10,
         usedAreaMm2: Math.round(used),
