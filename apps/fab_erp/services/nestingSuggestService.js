@@ -175,14 +175,33 @@ export async function offcutSpecs(companyId, catalogItemIds, conn = null) {
  */
 export async function nestableParts(companyId, orderId, { includeNested }) {
   const [links] = await pool.query(
+    /*
+     * ONE ROW PER PART, however many plates it is cut from.
+     *
+     * A part may now carry several material rows — 90 pieces off one plate and
+     * 54 off another — and the LEFT JOIN that used to be safe would return the
+     * part once per plate, so nesting would see it twice and lay it twice. The
+     * join is therefore to ONE representative material row (the earliest), which
+     * is all this query wants it for: the grade to fall back on, and whether the
+     * part has been nested at all.
+     */
     `SELECT rm.id AS linkId, rm.nest_no AS nestNo, rm.catalog_item_id AS materialId,
             fic.code AS materialCode, fic.name AS materialName,
             fic.thickness_mm AS materialThickness,
             p.id AS partId, p.code AS partCode, p.name AS partName, p.qty AS partQty
        FROM fab_items p
-       LEFT JOIN fab_items rm
-              ON rm.parent_item_id = p.id AND rm.deleted_at IS NULL
-             AND rm.node_kind = 'material'
+       /*
+        * A derived table rather than a subquery in the ON clause: TiDB refuses
+        * the latter outright ("ON condition doesn't support subqueries yet").
+        */
+       LEFT JOIN (
+         SELECT parent_item_id, MIN(id) AS firstId
+           FROM fab_items
+          WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+            AND node_kind = 'material'
+          GROUP BY parent_item_id
+       ) fm ON fm.parent_item_id = p.id
+       LEFT JOIN fab_items rm ON rm.id = fm.firstId AND rm.deleted_at IS NULL
        LEFT JOIN fab_item_catalog fic ON fic.id = rm.catalog_item_id AND fic.deleted_at IS NULL
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         /*
@@ -207,7 +226,7 @@ export async function nestableParts(companyId, orderId, { includeNested }) {
              AND NOT k.node_kind = 'material')
         ${includeNested ? '' : 'AND rm.nest_no IS NULL'}
       ORDER BY p.code`,
-    [companyId, orderId],
+    [companyId, orderId, companyId, orderId],
   );
   if (!links.length) return { rows: [], skipped: [] };
 
@@ -662,38 +681,6 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
    * and the entire proposal is lost for a reason that has nothing to do with
    * the order. That is exactly how 129 plates were computed and thrown away.
    */
-  /**
-   * A PART ON TWO PLATES CANNOT BE SAVED YET — refused, not half-written.
-   *
-   * The packer may now split a row across plates, which is what pooling needs:
-   * eight hundred stiffeners are fifteen plates' worth and no single sheet holds
-   * them. The WRITER has not caught up. A part carries one material row, that
-   * row carries one nest_no, and the loop below updates it once per nest — so a
-   * part appearing twice would have its first plate silently overwritten by its
-   * second, and the order would claim steel it had not bought.
-   *
-   * Refusing is the only honest option until a part can carry one material row
-   * per nest. It cannot happen on today's orders, where no row is big enough to
-   * overflow a plate; it will happen the moment parts are pooled, and that is
-   * the change this guard is waiting for.
-   */
-  const seenPart = new Map();
-  for (const n of nests) {
-    for (const p of n.parts ?? []) {
-      const k = String(p.linkId ?? p.partId);
-      seenPart.set(k, (seenPart.get(k) ?? 0) + 1);
-    }
-  }
-  const split = [...seenPart.entries()].filter(([, c]) => c > 1);
-  if (split.length) {
-    const e = new Error(
-      `${split.length} part(s) were laid across more than one plate. That is a better nesting, `
-      + 'but a part can still only record one plate, so saving it would lose the others. '
-      + 'Nest these separately for now.',
-    );
-    e.status = 409; e.code = 'PART_SPLIT_ACROSS_PLATES'; throw e;
-  }
-
   const conn = await getLiveConnection();
   let applied = 0;
   let linksMoved = 0;
@@ -712,29 +699,50 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
     );
     let next = Number(maxNo) || 0;
 
+    /**
+     * A PART'S OLD MATERIAL ROWS GO BEFORE ANY NEW ONE IS WRITTEN.
+     *
+     * It used to UPDATE the existing row in place, which worked only while a
+     * part had exactly one and belonged to exactly one plate. Now a part may be
+     * cut from several — 90 pieces off one sheet and 54 off another — and there
+     * is no single row to update. Clearing first and writing one row per plate
+     * is the only shape that describes both cases, and it makes re-accepting a
+     * suggestion idempotent rather than additive.
+     *
+     * Done ONCE, before the loop, because a part appearing on two plates would
+     * otherwise have its first row deleted by the second plate's turn.
+     */
+    const touchedParts = [...new Set(
+      nests.flatMap((n) => (n.parts ?? []).map((p) => Number(p.partId)).filter(Number.isFinite)),
+    )];
+    if (touchedParts.length) {
+      // A nest already issued to the floor is not ours to rearrange — checked
+      // across every part being touched, before anything is removed.
+      const [issued] = await conn.query(
+        `SELECT DISTINCT m.nest_no FROM fab_items m
+           JOIN fab_nest_issues ni ON ni.company_id = m.company_id AND ni.order_id = m.order_id
+            AND ni.catalog_item_id = m.catalog_item_id AND ni.nest_no = m.nest_no
+          WHERE m.company_id = ? AND m.order_id = ? AND m.parent_item_id IN (?)
+            AND m.node_kind = 'material' AND m.deleted_at IS NULL`,
+        [companyId, orderId, touchedParts],
+      );
+      if (issued.length) {
+        const e = new Error(`${issued.map((r) => r.nest_no).join(', ')} has already gone to the floor `
+          + 'and cannot be re-arranged.');
+        e.status = 409; throw e;
+      }
+      await conn.query(
+        `UPDATE fab_items SET deleted_at = UTC_TIMESTAMP()
+          WHERE company_id = ? AND order_id = ? AND parent_item_id IN (?)
+            AND node_kind = 'material' AND deleted_at IS NULL`,
+        [companyId, orderId, touchedParts],
+      );
+    }
+
     for (const n of nests) {
-      /**
-       * `p.linkId != null` and NOT `Number.isFinite(Number(p.linkId))`, because
-       * `Number(null)` is 0 and 0 is finite — so a part with no link would be
-       * read as link id 0, land in `linkIds`, match nothing on update, and be
-       * silently left un-nested. Which is exactly what it did.
-       */
-      const hasLink = (p) => p.linkId != null;
-      const linkIds = (n.parts ?? []).filter(hasLink)
-        .map((p) => Number(p.linkId)).filter(Number.isFinite);
-      /**
-       * Parts in this nest that have NO material row yet.
-       *
-       * The ordinary case now: a link is what nesting PRODUCES, so a part being
-       * nested for the first time has none and there is nothing to update. One
-       * is created below, and from then on it behaves exactly like a link the
-       * BOM importer used to make.
-       */
-      const bare = (n.parts ?? [])
-        .filter((p) => !hasLink(p) && Number.isFinite(Number(p.partId)))
-        .map((p) => Number(p.partId));
+      const onThisPlate = (n.parts ?? []).filter((p) => Number.isFinite(Number(p.partId)));
       const plateId = Number(n.plate?.id);
-      if ((!linkIds.length && !bare.length) || !Number.isFinite(plateId)) continue;
+      if (!onThisPlate.length || !Number.isFinite(plateId)) continue;
 
       const [[plate]] = await conn.query(
         `SELECT ic.id, ic.code, ic.name, ic.unit, ic.thickness_mm AS thicknessMm
@@ -743,64 +751,39 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
       );
       if (!plate) { const e = new Error('That plate is no longer in the catalog.'); e.status = 409; throw e; }
 
-      // A nest already issued to the floor is not ours to rearrange. Checked on
-      // the links being MOVED, since those are what would change underneath it.
-      // A part with no link has never been on a nest, so nothing to check.
-      if (linkIds.length) {
-        const [issued] = await conn.query(
-          `SELECT DISTINCT i.nest_no FROM fab_items i
-             JOIN fab_nest_issues ni ON ni.company_id = i.company_id AND ni.order_id = i.order_id
-              AND ni.catalog_item_id = i.catalog_item_id AND ni.nest_no = i.nest_no
-            WHERE i.company_id = ? AND i.order_id = ? AND i.id IN (?) AND i.deleted_at IS NULL`,
-          [companyId, orderId, linkIds],
-        );
-        if (issued.length) {
-          const e = new Error(`${issued.map((r) => r.nest_no).join(', ')} has already gone to the floor `
-            + 'and cannot be re-arranged.');
-          e.status = 409; throw e;
-        }
-      }
-
       const nestNo = `N-${String(++next).padStart(3, '0')}`;
-      if (linkIds.length) {
-        const [res] = await conn.query(
-          `UPDATE fab_items
-              SET nest_no = ?, catalog_item_id = ?, name = ?, unit = ?,
-                  length = ?, width = ?, height = ?, qty = 1
-            WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL
-              AND node_kind = 'material'`,
-          [nestNo, plate.id, plate.name, plate.unit || 'nos',
-            n.plate.length, n.plate.width, plate.thicknessMm,
-            companyId, orderId, linkIds],
-        );
-        linksMoved += res.affectedRows;
-      }
 
       /**
-       * FIRST-TIME LINKS, written here rather than through `setItemMaterial`.
+       * ONE MATERIAL ROW PER (PART, PLATE), and its `qty` is the number of
+       * PIECES CUT HERE — not 1, and not the part's whole quantity.
        *
-       * That function derives a plate size from whatever the yard most often
-       * holds, which is the right guess when somebody picks a material out of a
-       * list and nothing else is known. Here the size is not a guess: the packer
-       * chose this exact sheet and laid these exact parts on it, so writing the
-       * yard's most common size over it would discard the decision being
-       * accepted. Same shape of row, deliberately different dimensions.
+       * That number is the only place the split is recorded. A part wanting 144
+       * pieces, 90 from this sheet and 54 from the next, is two rows reading 90
+       * and 54; anything that sums steel has to read them, because the part's
+       * own qty is 144 and would count the same steel on both plates.
+       *
+       * The code carries the nest number as well as the plate, because a part
+       * cut from two sheets of the same size would otherwise produce two rows
+       * with identical codes — and a code naming two things is worse than an
+       * ugly one.
        */
-      if (bare.length) {
+      for (const part of onThisPlate) {
+        const pieces = Math.max(1, Number(part.qty) || 1);
         const [made] = await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, order_line_id, parent_item_id, catalog_item_id, name, unit,
               qty, flow_id, length, width, height, code, nest_no, node_kind, depth, is_leaf,
               dim_unit, weight_unit)
            SELECT p.company_id, p.order_id, p.order_line_id, p.id, ?, ?, ?,
-                  1, NULL, ?, ?, ?,
-                  CONCAT(COALESCE(p.code, p.id), '-', ?), ?, 'material', p.depth + 1, 0, 'mm', 'kg'
+                  ?, NULL, ?, ?, ?,
+                  CONCAT(COALESCE(p.code, p.id), '-', ?, '-', ?), ?, 'material', p.depth + 1, 0, 'mm', 'kg'
              FROM fab_items p
-            WHERE p.company_id = ? AND p.order_id = ? AND p.id IN (?) AND p.deleted_at IS NULL`,
+            WHERE p.company_id = ? AND p.order_id = ? AND p.id = ? AND p.deleted_at IS NULL`,
           [plate.id, plate.name, plate.unit || 'nos',
+            pieces,
             n.plate.length, n.plate.width, plate.thicknessMm,
-            plate.code ?? plate.id, nestNo,
-            companyId, orderId, bare],
+            plate.code ?? plate.id, nestNo, nestNo,
+            companyId, orderId, Number(part.partId)],
         );
         linksMoved += made.affectedRows;
       }

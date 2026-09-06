@@ -45,7 +45,18 @@ export async function nestTotals(companyId, orderId, conn = null) {
             MAX(rm.width)  AS plateWidth,
             MAX(rm.height) AS thickness,
             COUNT(*)       AS parts,
-            SUM(COALESCE(p.length, 0) * COALESCE(p.width, 0) * COALESCE(p.qty, 1)) AS partAreaMm2
+            /*
+             * THE PIECE COUNT COMES FROM THE MATERIAL ROW, not from the part.
+             *
+             * A part cut from two plates has two material rows reading, say, 90
+             * and 54. Its own qty is 144 on both, so multiplying by the part's
+             * figure would charge 144 pieces of area to each plate and report
+             * half again as much steel as the order actually cuts.
+             *
+             * rm.qty is written by the accept as the number cut on THIS plate,
+             * which is the only number that makes the sum add up.
+             */
+            SUM(COALESCE(p.length, 0) * COALESCE(p.width, 0) * COALESCE(rm.qty, 1)) AS partAreaMm2
        FROM fab_items rm
        JOIN fab_items p ON p.id = rm.parent_item_id AND p.deleted_at IS NULL
        LEFT JOIN fab_item_catalog c ON c.id = rm.catalog_item_id AND c.deleted_at IS NULL
