@@ -84,9 +84,9 @@ const tonnesOf = (plateList, thickness) =>
  * that part against fresh choices. Kept only if the total area falls, so it
  * can never end worse than what it started from.
  */
-function ruinRecreate(rowsIn, specs, margin, deadline, seed = 7) {
+function ruinRecreate(rowsIn, specs, margin, deadline, seed = 7, jitterPlacement = false) {
   const rng = mulberry32(seed);
-  let best = nest(rowsIn, specs, { restarts: 8, margin });
+  let best = nest(rowsIn, specs, { restarts: 8, margin, jitterPlacement, seed });
   let bestArea = best.plates.reduce((a, p) => a + areaOf(p), 0);
 
   while (Date.now() < deadline) {
@@ -100,7 +100,9 @@ function ruinRecreate(rowsIn, specs, margin, deadline, seed = 7) {
     }
     if (!freed.length) continue;
 
-    const redone = nest(freed, specs, { restarts: 4, margin, seed: Math.floor(rng() * 1e9) });
+    const redone = nest(freed, specs, {
+      restarts: 4, margin, jitterPlacement, seed: Math.floor(rng() * 1e9),
+    });
     if (redone.unplaced.length) continue;
     const area = keep.reduce((a, p) => a + areaOf(p), 0)
       + redone.plates.reduce((a, p) => a + areaOf(p), 0);
@@ -149,17 +151,149 @@ function patternPick(rowsIn, specs, margin, K, deadline) {
 // ── run them ───────────────────────────────────────────────────────────────
 const perGroupBudget = (BUDGET * 1000) / Math.max(1, prepared.length);
 
+/**
+ * E — SMALLEST VIABLE PLATE FIRST.
+ *
+ * Take the biggest part still unplaced, open the SMALLEST plate that can hold
+ * it, fill that plate with whatever else fits, repeat.
+ *
+ * Different from the shipped loop in one specific way: that one tries every
+ * plate size and keeps the best UTILISATION, which is a ratio. A ratio can be
+ * flattered by a big sheet that happens to pack tidily, so the packer can burn
+ * a 12 m plate on work a 3 m plate would have carried. This rule cannot do
+ * that — the size is decided by the largest part that has to fit, and nothing
+ * bigger is ever considered.
+ *
+ * The biggest part sets the floor because it is the binding constraint: any
+ * plate too small for it is useless this round, and any plate bigger than the
+ * smallest one that holds it is speculative.
+ */
+function smallestViable(rowsIn, specs, margin) {
+  const fits = (r, s) => rowFitsSpec(r, s, margin);
+  const out = [];
+  let remaining = rowsIn.filter((r) => specs.some((s) => fits(r, s)));
+  const unplaced = rowsIn.filter((r) => !specs.some((s) => fits(r, s))).map((row) => ({ row }));
+
+  while (remaining.length && out.length < 5000) {
+    const biggest = remaining.reduce((a, b) => (
+      Math.max(b.length, b.width) > Math.max(a.length, a.width) ? b : a));
+    const viable = specs
+      .filter((s) => fits(biggest, s))
+      .sort((a, b) => (a.length * a.width) - (b.length * b.width));
+    if (!viable.length) {
+      unplaced.push({ row: biggest });
+      remaining = remaining.filter((r) => r !== biggest);
+      continue;
+    }
+    const { plate, taken } = fillOne(viable[0], remaining, null, margin);
+    if (!taken.size) { unplaced.push({ row: biggest }); remaining = remaining.filter((r) => r !== biggest); continue; }
+    out.push(plate);
+    remaining = remaining.filter((r) => !taken.has(r.key));
+  }
+  return { plates: out, unplaced };
+}
+
+/**
+ * F — MERGE UPWARDS (agglomerative).
+ *
+ * Start with every part on its own smallest plate — the worst possible answer —
+ * then repeatedly pair groups up and keep the merge whenever one plate costs
+ * less than the two it replaces. Pairs become fours, fours become eights, so
+ * group size doubles per pass rather than crawling 2, 3, 4.
+ *
+ * MONOTONE: a merge is kept only if the area falls, so this can never end worse
+ * than where it started. That is its real virtue and also its problem — it
+ * begins 1,090 plates away from a good answer and has to climb the whole way,
+ * where ruin & recreate starts from a good answer and repairs it.
+ *
+ * Several random pairings, because which groups happen to meet decides what can
+ * merge; a bad shuffle strands two halves that belonged together.
+ */
+function agglomerate(rowsIn, specs, margin, deadline, seeds = 5) {
+  const fits = (r, s) => rowFitsSpec(r, s, margin);
+  const placeable = rowsIn.filter((r) => specs.some((s) => fits(r, s)));
+  const unplaced = rowsIn.filter((r) => !specs.some((s) => fits(r, s))).map((row) => ({ row }));
+  const bySize = [...specs].sort((a, b) => (a.length * a.width) - (b.length * b.width));
+
+  /** The cheapest single plate holding this whole set of rows, or null. */
+  const bestPlateFor = (rows) => {
+    for (const spec of bySize) {
+      const { plate, taken } = fillOne(spec, rows, null, margin);
+      if (taken.size === rows.length) return plate;
+    }
+    return null;
+  };
+
+  let best = null;
+  let bestArea = Infinity;
+  for (let s = 0; s < seeds && Date.now() < deadline; s += 1) {
+    const rng = mulberry32(4242 + s * 104729);
+    let groups = placeable.map((r) => ({ rows: [r], plate: bestPlateFor([r]) })).filter((g) => g.plate);
+
+    let improved = true;
+    while (improved && Date.now() < deadline) {
+      improved = false;
+      // Random pairing: shuffle, then try to merge neighbours.
+      const order = [...groups].sort(() => rng() - 0.5);
+      const next = [];
+      for (let i = 0; i < order.length; i += 2) {
+        const a = order[i];
+        const b = order[i + 1];
+        if (!b) { next.push(a); continue; }
+        const merged = bestPlateFor([...a.rows, ...b.rows]);
+        if (merged && areaOf(merged) < areaOf(a.plate) + areaOf(b.plate)) {
+          next.push({ rows: [...a.rows, ...b.rows], plate: merged });
+          improved = true;
+        } else { next.push(a, b); }
+      }
+      groups = next;
+    }
+    const area = groups.reduce((acc, g) => acc + areaOf(g.plate), 0);
+    if (area < bestArea) { bestArea = area; best = groups.map((g) => g.plate); }
+  }
+  return { plates: best ?? [], unplaced };
+}
+
+/**
+ * MULTI-START ruin & recreate: several independent runs, budget split, best kept.
+ *
+ * A single long run keeps improving ONE arrangement, and can settle into a shape
+ * it cannot dig its way out of. Several shorter runs each begin somewhere
+ * different, so a bad opening costs a slice of the budget rather than all of it.
+ * Which wins is an empirical question, not a theoretical one — hence both.
+ */
+function multiStart(rowsIn, specs, margin, totalMs, starts, jitterPlacement = false) {
+  const slice = totalMs / starts;
+  let best = null;
+  let bestArea = Infinity;
+  for (let i = 0; i < starts; i += 1) {
+    const r = ruinRecreate(rowsIn, specs, margin, Date.now() + slice, 1000 + i * 7919, jitterPlacement);
+    const area = r.plates.reduce((a, p) => a + areaOf(p), 0);
+    if (area < bestArea) { best = r; bestArea = area; }
+  }
+  return best;
+}
+
 const ALGOS = [
-  ['A greedy', (g) => nest(g.rows, g.candidates, { restarts: 1, margin: MARGIN })],
-  ['B restarts x1000', (g) => nest(g.rows, g.candidates, { restarts: 1000, margin: MARGIN })],
-  ['C ruin & recreate', (g) => ruinRecreate(g.rows, g.candidates, MARGIN, Date.now() + perGroupBudget)],
-  ['D pattern pick', (g) => patternPick(g.rows, g.candidates, MARGIN, 12, Date.now() + perGroupBudget)],
+  ['A  greedy', (g) => nest(g.rows, g.candidates, { restarts: 1, margin: MARGIN })],
+  ['C2 multi-start x4', (g) => multiStart(g.rows, g.candidates, MARGIN, perGroupBudget, 4)],
+  ['E  smallest-viable', (g) => smallestViable(g.rows, g.candidates, MARGIN)],
+  ['F  merge upwards x5', (g) => agglomerate(g.rows, g.candidates, MARGIN, Date.now() + perGroupBudget, 5)],
 ];
 
 const results = [];
 for (const [name, run] of ALGOS) {
   const t0 = Date.now();
   let area = 0; let part = 0; let tonnes = 0; let plateCount = 0; let unplaced = 0;
+  /**
+   * ROWS ACTUALLY ON A PLATE, counted from the result rather than trusted.
+   *
+   * An algorithm that quietly drops a part reports less area, less tonnage and
+   * a better score — it looks like the winner. F did exactly that on its first
+   * run, coming out ~430 m2 of part short while claiming the lowest area. The
+   * total has to equal the rows fed in, or the number means nothing.
+   */
+  let rowsIn = 0; let rowsOut = 0;
   for (const g of prepared) {
     const res = run(g);
     area += res.plates.reduce((a, p) => a + areaOf(p), 0);
@@ -167,6 +301,8 @@ for (const [name, run] of ALGOS) {
     tonnes += tonnesOf(res.plates, g.thickness);
     plateCount += res.plates.length;
     unplaced += res.unplaced.length;
+    rowsIn += g.rows.length;
+    rowsOut += res.plates.reduce((a, p) => a + p.rows.length, 0) + res.unplaced.length;
   }
   const secs = Math.round((Date.now() - t0) / 100) / 10;
   results.push({
@@ -177,11 +313,13 @@ for (const [name, run] of ALGOS) {
     wastePct: Math.round((1 - part / area) * 1000) / 10,
     steelTonnes: Math.round(tonnes * 100) / 100,
     unplaced,
+    rowsLost: rowsIn - rowsOut,
   });
   const r = results[results.length - 1];
   console.log(`${name.padEnd(20)} ${String(r.seconds).padStart(7)}s  ${String(r.plates).padStart(4)} plates  `
     + `${String(r.plateAreaM2).padStart(7)} m2  waste ${String(r.wastePct).padStart(5)}%  ${String(r.steelTonnes).padStart(7)} t`
-    + (r.unplaced ? `  UNPLACED ${r.unplaced}` : ''));
+    + (r.unplaced ? `  UNPLACED ${r.unplaced}` : '')
+    + (r.rowsLost ? `  *** LOST ${r.rowsLost} ROWS — RESULT INVALID ***` : ''));
 }
 
 console.log('\n=== comparison ===');
