@@ -15,11 +15,15 @@
  * in the right direction: the nesting software on the floor may beat it, and it
  * will never promise something the floor cannot deliver.
  *
- * ── WHY A ROW IS ATOMIC ───────────────────────────────────────────────────
- * A part row carries ONE material link and a link carries ONE nest_no, so every
- * piece of a row lands on the same plate or the row does not go. That is a
- * constraint from the schema, not from the shop, and it is enforced here rather
- * than discovered later by a save that half-succeeds.
+ * ── A ROW MAY SPAN PLATES ─────────────────────────────────────────────────
+ * It used to be atomic — every piece of a row on one plate or the row did not
+ * go — because a part carried one material link and a link carried one nest_no.
+ * That was the schema talking, not the shop: nobody minds if ninety stiffeners
+ * come off one plate and fifty-four off another. A part now carries one material
+ * row per plate it is cut from, so the geometry is free of it.
+ *
+ * The consequence to hold on to: one pooled part is MANY plate-rows sharing one
+ * key. Anything counting pieces must key on the row object, never on its name.
  *
  * ── HOW A PLATE SIZE IS CHOSEN ────────────────────────────────────────────
  * This is variable-sized bin packing: the sizes are not given, they are picked
@@ -241,14 +245,21 @@ export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterP
     const i = rng ? Math.floor(rng() * Math.min(TOP_K, pool.length)) : 0;
     const [row] = pool.splice(i, 1);
     /**
-     * PART of a row is a real answer now, not a failure.
+     * PART of a row is a real answer now, not a failure — so `taken` counts
+     * pieces rather than naming rows: the caller has to know this plate absorbed
+     * 90 of the 144 wanted, so the other 54 can look for another plate.
      *
-     * `taken` therefore counts pieces rather than naming rows: the caller has to
-     * know that this plate absorbed 90 of the 144 wanted, so the remaining 54
-     * can go looking for another plate.
+     * KEYED BY THE ROW OBJECT, NOT BY `row.key`, and that distinction cost 2,692
+     * pieces. Once a row can be split, one pooled part exists as many plate-rows
+     * all carrying the SAME key — 756 stiffeners are fourteen plate-rows of 56.
+     * Ruin & recreate frees those back into one pool, and a map keyed by name
+     * then reports one count for all fourteen: each of them subtracts 56 from
+     * its own 56, every one reaches zero, and they leave the pool as finished
+     * work that was never done. Silently, because nothing was left unplaced to
+     * complain about. An object reference is unique per entry by construction.
      */
     const { plate: next, placed } = placeSome(plate, row, row.qty, jitterPlacement ? rng : null);
-    if (placed) { plate = next; taken.set(row.key, (taken.get(row.key) ?? 0) + placed); }
+    if (placed) { plate = next; taken.set(row, (taken.get(row) ?? 0) + placed); }
   }
   return { plate, taken };
 }
@@ -426,7 +437,7 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
      * 54 are still work to do and go back into the contest for the next plate.
      */
     remaining = remaining.flatMap((r) => {
-      const done = best.taken.get(r.key) ?? 0;
+      const done = best.taken.get(r) ?? 0;
       if (!done) return [r];
       const left = r.qty - done;
       return left > 0 ? [{ ...r, qty: left }] : [];
