@@ -6129,3 +6129,40 @@ SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
 SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom
      ADD COLUMN code_join ENUM(''dash'',''absorb'') NOT NULL DEFAULT ''dash''', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── An assembly needs N of a part it no longer contains (2026-09-06) ───────
+--
+-- A part is identified by WHAT IT IS — material, grade, dimensions, and the
+-- finishing that distinguishes a drilled stiffener from a plain one of exactly
+-- the same size. Identical parts are therefore ONE row carrying a quantity,
+-- because a code names one thing (uq_fi_company_code_active) and because that is
+-- what makes them one thing to nest, to buy and to stock.
+--
+-- Merging them costs the tree edge. Twelve stiffeners under ED1 and twelve under
+-- ED2 become one row of twenty-four under the line, and `parent_item_id` no
+-- longer says that ED1 cannot be welded until its stiffeners are cut. That edge
+-- is not decoration: it is what taskGatingService reads to build 'child_parts'
+-- inputs, and losing it would let the floor weld a diaphragm whose plates had
+-- not been cut.
+--
+-- So the edge is written down instead of inferred from the tree. One row per
+-- (assembly, part) pairing with the quantity that assembly needs — which is also
+-- the honest shape, because "how many does ED1 need" was never derivable from a
+-- parent pointer once several assemblies shared one part.
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_demand');
+SET @s = IF(@c=0, 'CREATE TABLE fab_item_demand (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    company_id        BIGINT       NOT NULL,
+    order_id          BIGINT       NOT NULL,
+    assembly_item_id  BIGINT       NOT NULL,
+    part_item_id      BIGINT       NOT NULL,
+    qty               DECIMAL(18,4) NOT NULL DEFAULT 1,
+    created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at        DATETIME     NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_fid_pair (assembly_item_id, part_item_id),
+    KEY idx_fid_order (company_id, order_id),
+    KEY idx_fid_part (part_item_id)
+  )', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

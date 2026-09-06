@@ -503,6 +503,37 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
     if (!childPartsByParent.has(it.parent_item_id)) childPartsByParent.set(it.parent_item_id, []);
     childPartsByParent.get(it.parent_item_id).push(it);
   }
+
+  /**
+   * PARTS AN ASSEMBLY NEEDS BUT NO LONGER CONTAINS.
+   *
+   * Identical parts are one row now — twelve stiffeners under ED1 and twelve
+   * under ED2 are one row of twenty-four under the line — so `parent_item_id`
+   * has stopped saying that ED1 waits on its stiffeners. Without this the floor
+   * could weld a diaphragm whose plates had not been cut, and nothing on screen
+   * would look wrong.
+   *
+   * `fab_item_demand` carries that edge explicitly. Added to the tree-derived
+   * map rather than replacing it, because an order built before consolidation —
+   * or one never consolidated at all — still hangs its parts under their
+   * assembly and must keep working unchanged.
+   */
+  const byId = new Map(items.map((it) => [Number(it.id), it]));
+  const [demand] = await conn.query(
+    `SELECT assembly_item_id AS assemblyId, part_item_id AS partId
+       FROM fab_item_demand
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  for (const d of demand) {
+    const part = byId.get(Number(d.partId));
+    // Same test the tree path applies: only a flow-bearing part is work to wait
+    // for. A part with no flow makes no task and could never be an input.
+    if (!part || isMaterial(part) || part.flow_id == null) continue;
+    const list = childPartsByParent.get(Number(d.assemblyId));
+    if (!list) { childPartsByParent.set(Number(d.assemblyId), [part]); continue; }
+    if (!list.some((x) => Number(x.id) === Number(part.id))) list.push(part);
+  }
   // raw-material children per parent item — for 'raw_material' inputs. BUG-07:
   // keep ALL such children, not just the first, so a multi-material assembly
   // gates on every material it needs.
