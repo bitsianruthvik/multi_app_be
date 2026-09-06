@@ -3,6 +3,7 @@
  *
  *   GET  /templates                        what can be built
  *   GET  /templates/:itemId/parameters     the questions this one asks
+ *   POST /templates/:itemId/outline        the structure one rung at a time (writes nothing)
  *   POST /templates/:itemId/preview        the shape it would produce (writes nothing)
  *   POST /orders/:orderId/instantiate      create it
  *
@@ -37,7 +38,7 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  parametersFor, expand, instantiate, bomFor, setBomLine, removeBomLine,
+  parametersFor, expand, instantiate, bomFor, setBomLine, removeBomLine, structureOutline,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { orderCodePrefix } from '../services/itemCodeService.js';
@@ -113,6 +114,23 @@ router.get('/templates/:itemId/parameters', protect, async (req, res) => {
 });
 
 /**
+ * The structure one rung at a time — what the drill-down wizard walks.
+ *
+ * A POST because it takes the answers so far: every step is the expansion of
+ * the spec as it stands, which is what makes step 3 able to show the segments
+ * that step 2's numbers actually produced. WRITES NOTHING, same as preview.
+ */
+router.post('/templates/:itemId/outline', protect, async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const { params = {}, perInstance = {}, structure = null } = req.body ?? {};
+    res.json(await structureOutline(cid, Number(req.params.itemId), {
+      params, perInstance, spec: structure,
+    }));
+  } catch (err) { fail(res, err, 'structure outline'); }
+});
+
+/**
  * The shape it would produce. WRITES NOTHING.
  *
  * Returns counts and a shallow sample rather than the whole tree: a six-girder
@@ -123,8 +141,10 @@ router.get('/templates/:itemId/parameters', protect, async (req, res) => {
 router.post('/templates/:itemId/preview', protect, async (req, res) => {
   try {
     const cid = companyId(req);
-    const { params = {}, perInstance = {} } = req.body ?? {};
-    const tree = await expand(cid, Number(req.params.itemId), params, { perInstance });
+    const { params = {}, perInstance = {}, structure = null } = req.body ?? {};
+    const tree = await expand(cid, Number(req.params.itemId), params, {
+      perInstance, spec: structure,
+    });
 
     const sample = [];
     const take = (node, depth) => {
@@ -156,7 +176,7 @@ router.post(
       const cid = companyId(req);
       const orderId = Number(req.params.orderId);
       const {
-        itemId, orderLineId = null, params = {}, perInstance = {}, lineCode = null,
+        itemId, orderLineId = null, params = {}, perInstance = {}, structure = null, lineCode = null,
         replace = false,
       } = req.body ?? {};
       if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
@@ -167,7 +187,7 @@ router.post(
       const codePrefix = lineCode ? `${prefix}-${lineCode}` : prefix;
 
       const result = await instantiate(cid, {
-        orderId, orderLineId, rootItemId: Number(itemId), params, perInstance, codePrefix,
+        orderId, orderLineId, rootItemId: Number(itemId), params, perInstance, structure, codePrefix,
         replace: replace === true,
       });
       res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
