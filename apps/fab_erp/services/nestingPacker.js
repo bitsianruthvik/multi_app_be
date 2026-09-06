@@ -34,11 +34,12 @@
 const TOL = 1;
 
 /**
- * CUTTING GAP — 50 mm for this shop, BETWEEN PARTS ONLY.
+ * CUTTING GAP — 2 mm for this shop, BETWEEN PARTS ONLY.
  *
  * The torch needs room to run a clean cut between two parts. It needs nothing
  * at the plate's rim: a mill edge is already a finished edge, so a part may sit
- * hard against it.
+ * hard against it. One number for every thickness — the shop's own blanket
+ * rule, not a simplification made here.
  *
  * MODELLED BY INFLATING THE PART AND THE SHEET BY THE SAME AMOUNT. Each part
  * reserves (l + g) x (w + g), and the usable sheet is (L + g) x (W + g). The
@@ -50,24 +51,13 @@ const TOL = 1;
  *
  * `areaOf` still measures the REAL plate, because that is what gets bought.
  *
- * GETTING THIS WRONG IS EXPENSIVE, and it was wrong first time round. Charging
- * the gap at the rim as well shrank the usable sheet by 2g, and the 28 mm Web
- * Plate — 12000 long on a 12050 plate — stopped fitting at all. Twenty-four of
- * the heaviest parts on the order became unmakeable by arithmetic rather than
- * by anything the shop would recognise.
- *
- * It is still charged to the PART, which is why it hurts small ones hardest: a
- * 2995 x 178 stiffener reserves 3045 x 228 wherever it has neighbours.
- *
- * ONE NUMBER FOR EVERY THICKNESS — the shop's own blanket rule, not a
- * simplification made here.
- */
-/**
- * The shop's actual rule: 2 mm between parts, one number for every thickness.
- *
- * Exported so the suggestor defaults to it rather than to nothing. It costs
- * 1.6 t on a 690 t order — real, and nothing like the 50 mm first assumed,
- * which would have cost 83 t and made the web plate unmakeable.
+ * IT WAS BRIEFLY MODELLED AS 50 mm AT THE RIM AS WELL, and both halves of that
+ * were wrong. Charging it at the rim shrank the usable sheet by 2g and the
+ * 28 mm Web Plate — 12000 long on a 12050 sheet — stopped fitting at all, which
+ * made twenty-four of the heaviest parts unmakeable by arithmetic rather than by
+ * anything the shop would recognise. And 50 mm rather than 2 mm reported 19%
+ * waste against a true 4.7%, which is the difference between a system worth
+ * trusting and one worth ignoring.
  *
  * The primitives below still default to 0 so that a caller measuring pure
  * geometry — the integrity audit, a capacity question — is not silently charged
@@ -541,7 +531,28 @@ export function multiStartNest(rows, specs, opts = {}, totalMs, starts = 4) {
 export const EFFORT_LEVELS = {
   quick: { label: 'Quick', restarts: 4, budgetMs: 0 },
   standard: { label: 'Standard', restarts: 8, budgetMs: 60_000 },
-  deep: { label: 'Deep', restarts: 8, budgetMs: 300_000, starts: 4 },
+  /**
+   * SIXTEEN STARTS WITH ORIENTATION SEARCH — measured, and both halves earned it.
+   *
+   *   x4  no-orient   690.59 t      x4  + orient   690.24 t
+   *   x8  no-orient   690.59 t      x8  + orient   690.36 t
+   *                                 x16 + orient   690.00 t   <- best
+   *                                 x32 + orient   690.28 t
+   *
+   * The two orientation-off rows land on exactly the same tonnage and the same
+   * 126 plates, so more starts alone buy nothing at all; every gain past four
+   * comes from letting a part turn. Orientation looked worthless at one and
+   * four starts and only showed up once the search was wide enough to use it.
+   *
+   * Sixteen is the turning point. At thirty-two the budget is split so thin
+   * that each start does little beyond its opening solution, and multi-start
+   * degenerates into plain restarts — which measured worse.
+   *
+   * Runs long: the budget is per start, so 300s of allowance takes ~430s wall.
+   */
+  deep: {
+    label: 'Deep', restarts: 8, budgetMs: 300_000, starts: 16, jitterPlacement: true,
+  },
 };
 
 /**
@@ -553,8 +564,9 @@ export function nestAtEffort(rows, specs, opts = {}, effort = 'standard', budget
   const level = EFFORT_LEVELS[effort] ?? EFFORT_LEVELS.standard;
   const ms = budgetMs ?? level.budgetMs;
   if (!ms) return nest(rows, specs, { ...opts, restarts: level.restarts });
-  if (level.starts) return multiStartNest(rows, specs, opts, ms, level.starts);
-  return ruinRecreate(rows, specs, opts, Date.now() + ms);
+  const withJitter = { ...opts, jitterPlacement: level.jitterPlacement === true };
+  if (level.starts) return multiStartNest(rows, specs, withJitter, ms, level.starts);
+  return ruinRecreate(rows, specs, withJitter, Date.now() + ms);
 }
 
 /**
