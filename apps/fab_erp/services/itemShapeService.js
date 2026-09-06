@@ -70,6 +70,19 @@ export async function recomputeItemShape(companyId, orderId, conn = null) {
    * the part is cut FROM, not something it contains — which is why the
    * NOT EXISTS is restricted to structural children.
    */
+  /**
+   * A DEMAND EDGE IS A CHILD, and forgetting that made assemblies into parts.
+   *
+   * Consolidation moves identical parts off their assemblies, so ED1 ends up
+   * with no structural children at all — and childless is what `is_leaf` used to
+   * mean. Every diaphragm and segment on the order therefore became a "part",
+   * which nesting then tried to find a plate for and readiness reported as
+   * uncuttable: "Segment has no thickness". Two hundred and forty-seven of them.
+   *
+   * `fab_item_demand` is where that relationship went, so it counts here exactly
+   * as a child row does. An assembly that needs parts is not a leaf, wherever
+   * those parts are stored.
+   */
   await exec.query(
     `UPDATE fab_items i SET i.is_leaf = 0
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
@@ -77,7 +90,10 @@ export async function recomputeItemShape(companyId, orderId, conn = null) {
              OR EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
                                          FROM fab_items) k
                          WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
-                           AND k.node_kind = 'structure'))`,
+                           AND k.node_kind = 'structure')
+             OR EXISTS (SELECT 1 FROM (SELECT assembly_item_id, deleted_at
+                                         FROM fab_item_demand) d
+                         WHERE d.assembly_item_id = i.id AND d.deleted_at IS NULL))`,
     [companyId, orderId],
   );
   await exec.query(
@@ -87,7 +103,10 @@ export async function recomputeItemShape(companyId, orderId, conn = null) {
         AND NOT EXISTS (SELECT 1 FROM (SELECT parent_item_id, deleted_at, node_kind
                                          FROM fab_items) k
                          WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
-                           AND k.node_kind = 'structure')`,
+                           AND k.node_kind = 'structure')
+        AND NOT EXISTS (SELECT 1 FROM (SELECT assembly_item_id, deleted_at
+                                         FROM fab_item_demand) d
+                         WHERE d.assembly_item_id = i.id AND d.deleted_at IS NULL)`,
     [companyId, orderId],
   );
 

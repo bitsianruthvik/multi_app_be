@@ -159,13 +159,25 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
    *                nesting has no business with it. Asking a stud for a grade of
    *                plate is asking the wrong question of the wrong thing.
    */
+  /*
+   * `is_leaf` decides what a part is, rather than a third opinion about it.
+   *
+   * This asked "has no children at all", which was the same question while every
+   * part hung under its assembly. Once identical parts are consolidated onto the
+   * line, an assembly has no children either — so all 174 diaphragms and
+   * segments on the KEPL order were reported as parts with no thickness, 247
+   * problems that were entirely this query's own doing.
+   *
+   * `is_leaf` already answers this and now counts a demand edge as a child, so
+   * an assembly that needs parts is not a leaf wherever those parts are stored.
+   * One definition, maintained in one place.
+   */
   const [orphans] = await exec.query(
     `SELECT p.id, p.code, p.name FROM fab_items p
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.flow_id IS NOT NULL
         AND COALESCE(p.procurement_type, 'make') = 'make'
-        AND NOT EXISTS (SELECT 1 FROM fab_items k
-                         WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL)`,
+        AND p.node_kind = 'structure' AND p.is_leaf = 1`,
     [companyId, orderId],
   );
 
@@ -328,19 +340,33 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
       });
     }
 
-    // Aggregate area, per physical plate.
+    /**
+     * Aggregate area, per physical plate — and BOTH sides of that sum were
+     * wrong once a material row started carrying a piece count.
+     *
+     * The plate side multiplied by `rm.qty`, reading it as "how many plates".
+     * That number is now how many PIECES are cut here, so a nest holding 5
+     * pieces claimed five plates' worth of steel. A nest is ONE plate: that is
+     * the rule `nestTotalsService` is built on and the reason it exists.
+     *
+     * The part side multiplied by the PART's own qty, which is the total across
+     * the whole order — 756 stiffeners charged in full to every plate any of
+     * them touches. The pieces on THIS plate is what the material row says.
+     *
+     * Together they reported 73 overfilled plates on an order the packer had
+     * just verified as geometrically sound.
+     */
     if (l.nestNo && plateL != null && plateW != null && partL != null && partW != null) {
       const key = `${l.materialId}|${l.nestNo}`;
       if (!nests.has(key)) {
         nests.set(key, {
           materialCode: l.materialCode, nestNo: l.nestNo,
-          plateArea: plateL * plateW * Math.max(1, num(l.plates) ?? 1),
+          plateArea: plateL * plateW,
           usedArea: 0, parts: 0, plateSize: `${plateL}×${plateW}`,
-          plates: Math.max(1, num(l.plates) ?? 1),
         });
       }
       const n = nests.get(key);
-      n.usedArea += partL * partW * Math.max(1, num(l.partQty) ?? 1);
+      n.usedArea += partL * partW * Math.max(1, num(l.plates) ?? 1);
       n.parts += 1;
     }
 
@@ -353,7 +379,7 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
         nestNo: n.nestNo, materialCode: n.materialCode,
         usedAreaMm2: Math.round(n.usedArea), plateAreaMm2: Math.round(n.plateArea),
         message: `Nest ${n.nestNo} on ${n.materialCode} asks for ${Math.round(n.usedArea / 1e6)} m² of part `
-               + `from ${Math.round(n.plateArea / 1e6)} m² of plate (${n.plates} × ${n.plateSize}). `
+               + `from ${Math.round(n.plateArea / 1e6)} m² of plate (${n.plateSize}). `
                + 'That is more than the plate contains, before any offcut.',
       });
     }
