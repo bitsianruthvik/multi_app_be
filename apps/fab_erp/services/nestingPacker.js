@@ -419,15 +419,20 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
  * money.
  *
  * `restarts` is a budget, not a target: pass what the clock allows.
+ *
+ * `opts.deadline` stops the restarts early. The FIRST pack always runs whatever
+ * the clock says — an expired budget must still return a layout, not null.
  */
 export function nest(rows, specs, opts = {}) {
   const restarts = Math.max(1, opts.restarts ?? 1);
   const seed = opts.seed ?? 1;
+  const deadline = opts.deadline ?? Infinity;
 
   let best = nestOnce(rows, specs, opts, null);
   let bestScore = scoreOf(best);
 
   for (let i = 1; i < restarts; i += 1) {
+    if (Date.now() >= deadline) break;
     const res = nestOnce(rows, specs, opts, mulberry32(seed + i * 0x9E3779B1));
     // A run that strands a row is not an improvement whatever it scores.
     if (res.unplaced.length > best.unplaced.length) continue;
@@ -461,7 +466,17 @@ export function nest(rows, specs, opts = {}) {
  */
 export function ruinRecreate(rows, specs, opts = {}, deadline, seed = 7) {
   const rng = mulberry32(seed);
-  let best = nest(rows, specs, { ...opts, restarts: 8, seed });
+  /**
+   * THE OPENING SOLUTION IS INSIDE THE BUDGET TOO.
+   *
+   * It used to run eight restarts unconditionally before the clock was ever
+   * consulted, which is fine for one call and ruinous for sixteen: Deep spent
+   * its whole allowance on opening solutions and then overran it. Measured
+   * through the UI against the live backend, a 1,090-part Deep run took eleven
+   * to thirteen minutes against a stated five. A budget that only governs the
+   * repair loop is not a budget.
+   */
+  let best = nest(rows, specs, { ...opts, restarts: 8, seed, deadline });
   let bestScore = scoreOf(best);
 
   while (Date.now() < deadline) {
@@ -473,7 +488,9 @@ export function ruinRecreate(rows, specs, opts = {}, deadline, seed = 7) {
     }
     if (!freed.length) continue;
 
-    const redone = nest(freed, specs, { ...opts, restarts: 4, seed: Math.floor(rng() * 1e9) });
+    const redone = nest(freed, specs, {
+      ...opts, restarts: 4, seed: Math.floor(rng() * 1e9), deadline,
+    });
     if (redone.unplaced.length) continue;
 
     const score = keep.reduce((a, p) => a + areaOf(p), 0)
@@ -500,10 +517,25 @@ export function ruinRecreate(rows, specs, opts = {}, deadline, seed = 7) {
  */
 export function multiStartNest(rows, specs, opts = {}, totalMs, starts = 4) {
   const slice = Math.max(1, totalMs / Math.max(1, starts));
+  /**
+   * The whole call's deadline, not just each slice's.
+   *
+   * A start whose opening solution overruns its slice used to steal the time
+   * from nobody — every later start still got its own full slice, so sixteen
+   * starts could take several times the stated budget. Now a start that would
+   * begin after the overall deadline simply does not begin, and the last one
+   * gets what is left rather than a fresh slice.
+   *
+   * `i === 0` runs regardless: an allowance too small for even one start still
+   * has to return a nesting.
+   */
+  const overall = Date.now() + totalMs;
   let best = null;
   let bestScore = Infinity;
   for (let i = 0; i < starts; i += 1) {
-    const r = ruinRecreate(rows, specs, opts, Date.now() + slice, 1000 + i * 7919);
+    if (i > 0 && Date.now() >= overall) break;
+    const until = Math.min(Date.now() + slice, overall);
+    const r = ruinRecreate(rows, specs, opts, until, 1000 + i * 7919);
     const score = scoreOf(r);
     if (score < bestScore) { best = r; bestScore = score; }
   }
