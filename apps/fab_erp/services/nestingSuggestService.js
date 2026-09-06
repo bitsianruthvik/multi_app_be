@@ -30,7 +30,7 @@
  * accept has its own write path rather than calling it.
  */
 
-import { pool } from '../../../db.js';
+import { pool, getLiveConnection, retryOnDeadConnection } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { resolveFields } from './fieldService.js';
 import { plateFits } from './materialMatchService.js';
@@ -609,7 +609,18 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
   const nests = Array.isArray(accepted) ? accepted : [];
   if (!nests.length) { const e = new Error('No nests were accepted.'); e.status = 400; throw e; }
 
-  const conn = await pool.getConnection();
+  /**
+   * A PROVEN-ALIVE connection, because of how long the pause before this is.
+   *
+   * The suggestion that produced these nests ran for up to five minutes of pure
+   * computation, and then a person read it before pressing Accept. Every
+   * connection in the pool has been idle for that whole time, and TiDB Cloud
+   * hangs up on a session it considers idle — so an ordinary `getConnection()`
+   * hands back a closed socket, `beginTransaction()` below dies with ECONNRESET,
+   * and the entire proposal is lost for a reason that has nothing to do with
+   * the order. That is exactly how 129 plates were computed and thrown away.
+   */
+  const conn = await getLiveConnection();
   let applied = 0;
   let linksMoved = 0;
   let offcutsClaimed = 0;
@@ -766,13 +777,31 @@ export async function acceptSuggestion(companyId, orderId, accepted) {
     await syncOrderProcurement(conn, companyId, orderId);
     await conn.commit();
   } catch (err) {
-    await conn.rollback();
+    /**
+     * The rollback must not be able to replace the reason we are here.
+     *
+     * If the connection is what failed, `rollback()` fails too — and its error
+     * ("Can't add new command when connection is in closed state") is the one
+     * the caller sees, in place of the 409 that says an offcut was taken or a
+     * nest has gone to the floor. A dead socket has already discarded the
+     * transaction anyway, so there is nothing to undo.
+     */
+    try { await conn.rollback(); } catch { /* the socket is gone; nothing to undo */ }
     throw err;
   } finally {
     conn.release();
   }
 
+  /**
+   * After the commit, and therefore retried rather than allowed to fail.
+   *
+   * The nests are saved by this point. If this recompute hits another connection
+   * the same idle pause left dead, the request would return 500 and the screen
+   * would say the accept failed — while the plates are in fact on the order. A
+   * full recompute lands on the same answer however many times it runs, so
+   * retrying it is safe and reporting a false failure is not.
+   */
   const { recomputeOrderWeights } = await import('./itemWeightService.js');
-  await recomputeOrderWeights(companyId, orderId);
+  await retryOnDeadConnection(() => recomputeOrderWeights(companyId, orderId));
   return { nestsCreated: applied, partsNested: linksMoved, offcutsClaimed };
 }

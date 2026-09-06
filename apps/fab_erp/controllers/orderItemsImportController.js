@@ -18,7 +18,7 @@ import { suggestNesting, acceptSuggestion } from '../services/nestingSuggestServ
 import {
   nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
 } from '../services/nestingBoardService.js';
-import { pool } from '../../../db.js';
+import { pool, retryOnDeadConnection } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
@@ -366,7 +366,10 @@ const board = (fn) => async (req, res) => {
     const cid = companyId(req);
     const orderId = Number(req.params.orderId);
     const result = await fn(cid, orderId, req);
-    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
+    // Same reason as in acceptNestingHandler: the work is already saved, and a
+    // stale pooled connection here would report a failure that did not happen.
+    const readiness = await retryOnDeadConnection(() => refreshOrderStage(cid, orderId));
+    res.json({ ...result, readiness });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
     logger.error({ err }, 'fab_erp: nesting board failed');
@@ -422,11 +425,25 @@ export const suggestNestingHandler = async (req, res) => {
   }
 };
 
-export const acceptNestingHandler = board(async (cid, orderId, req) => ({
-  ...await acceptSuggestion(cid, orderId, req.body?.nests ?? []),
-  ...await nestingBoard(cid, orderId),
-  nextNestNo: await nextNestNo(cid, orderId),
-}));
+export const acceptNestingHandler = board(async (cid, orderId, req) => {
+  const saved = await acceptSuggestion(cid, orderId, req.body?.nests ?? []);
+  /**
+   * The nests are committed by the line above; everything after it only
+   * REDRAWS the screen, so it is retried rather than allowed to 500.
+   *
+   * Whoever pressed Accept has been sitting on this page for minutes — a deep
+   * nest is up to five of pure computation, and then somebody reads the result.
+   * Every connection in the pool has been idle that whole time, and TiDB Cloud
+   * hangs up on an idle session. Letting a dead one surface here would tell the
+   * user the accept failed while the plates are in fact on the order, which is
+   * worse than the original failure: they would re-run it and nest twice.
+   */
+  return retryOnDeadConnection(async () => ({
+    ...saved,
+    ...await nestingBoard(cid, orderId),
+    nextNestNo: await nextNestNo(cid, orderId),
+  }));
+});
 
 export const nestingBoardHandler = board(async (cid, orderId) => ({
   ...await nestingBoard(cid, orderId),

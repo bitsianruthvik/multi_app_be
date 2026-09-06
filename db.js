@@ -168,3 +168,100 @@ export function getPoolStats() {
       : null,
   };
 }
+
+/**
+ * Error codes that mean THE SOCKET IS GONE, as opposed to the query being wrong.
+ *
+ * The distinction is the whole point of the two helpers below: a dead socket is
+ * worth retrying because nothing was executed, and a rejected statement is not.
+ * `err.fatal` catches the driver's own view of the same thing for codes not
+ * listed here.
+ */
+const DEAD_SOCKET = new Set([
+  "ECONNRESET",
+  "PROTOCOL_CONNECTION_LOST",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ECONNABORTED",
+]);
+export const isDeadConnection = (err) =>
+  !!err && (DEAD_SOCKET.has(err.code) || err.fatal === true);
+
+/**
+ * A pooled connection that has been PROVEN alive, for work that begins after a
+ * long pause.
+ *
+ * TCP keepalive above keeps the socket from dying of neglect, but it cannot
+ * stop the far end from hanging up on purpose: TiDB Cloud closes a session that
+ * has been idle past its own timeout, and mysql2 hands the closed one straight
+ * back out of the free list. The first statement then fails with ECONNRESET —
+ * which is indistinguishable, to the caller, from the work being impossible.
+ *
+ * This bit on the nesting suggestor. A deep nest is minutes of pure computation
+ * with no queries in between; by the time a person looked at the proposal and
+ * pressed Accept, every connection in the pool had been idle long enough to be
+ * reaped. 129 plates were computed and thrown away, and the order still read
+ * "1090 of 1090 parts have no material".
+ *
+ * A ping costs one round trip. Use it where the pause is expected — a long
+ * computation, a queue worker waking up, a request that follows a person
+ * thinking — not on the hot path of ordinary reads.
+ *
+ * A connection that fails the ping is DESTROYED rather than released, so it
+ * leaves the pool instead of being handed to the next caller.
+ *
+ * ANY ping failure counts, not just the codes below. There is no such thing as
+ * a connection that cannot answer a ping but is otherwise fine, and the codes a
+ * broken socket reports vary with how it broke — a server hangup gives
+ * ECONNRESET, a locally torn-down stream gives ERR_STREAM_DESTROYED, and a test
+ * that killed the socket by hand found the second one leaking straight through
+ * a check written for the first. `isDeadConnection` stays for
+ * `retryOnDeadConnection`, where telling a dropped socket from a rejected
+ * statement is the entire point.
+ */
+export async function getLiveConnection(attempts = 3) {
+  let last;
+  for (let i = 1; i <= attempts; i += 1) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.ping();
+      return conn;
+    } catch (err) {
+      last = err;
+      conn.destroy();
+      logger.warn(
+        { attempt: i, code: err.code },
+        "[db] discarded a pooled connection that failed its ping",
+      );
+    }
+  }
+  throw last;
+}
+
+/**
+ * Run IDEMPOTENT pool work, retrying if the connection turned out to be dead.
+ *
+ * Idempotent, not read-only: a full recompute qualifies, because running it
+ * twice lands on the same answer. What does NOT qualify is anything that
+ * appends or increments — a retry there could re-apply a commit that actually
+ * landed before the socket dropped, and the caller would never know. Work like
+ * that belongs in a transaction on a `getLiveConnection()`, where a dead socket
+ * means nothing was committed at all.
+ *
+ * One stale connection does not imply the next one is good: the pool is a list,
+ * and a long pause can have left several in it. Each attempt draws a different
+ * connection, and mysql2 drops the fatally-errored one on the way out.
+ */
+export async function retryOnDeadConnection(fn, attempts = 3) {
+  let last;
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      last = err;
+      if (!isDeadConnection(err) || i === attempts) throw err;
+      logger.warn({ attempt: i, code: err.code }, "[db] retrying after a dead connection");
+    }
+  }
+  throw last;
+}
