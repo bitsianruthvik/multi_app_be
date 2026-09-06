@@ -38,6 +38,7 @@ import {
   nestAtEffort, verify, utilisation, EFFORT_LEVELS, DEFAULT_CUT_GAP_MM,
 } from './nestingPacker.js';
 import { syncOrderProcurement } from './procurementService.js';
+import { nestTotals } from './nestTotalsService.js';
 
 const PLATE_GROUP = 'Plates';
 
@@ -530,6 +531,7 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
   }
 
   out.sort((a, b) => a.thickness - b.thickness || b.utilisationPct - a.utilisationPct);
+  const summary = summarise(out, unplaced, skipped);
   return {
     ok: unplaced.length === 0,
     groups: out,
@@ -537,8 +539,38 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
     skipped,
     effort,
     cutGapMm: opts.margin ?? DEFAULT_CUT_GAP_MM,
-    summary: summarise(out, unplaced, skipped),
+    summary,
+    current: await acceptedForComparison(companyId, orderId, summary),
   };
+}
+
+/**
+ * What is already nested on the order, so a proposal can be judged against it.
+ *
+ * WHY THIS SHIPS WITH THE PROPOSAL rather than being fetched separately: the
+ * two have to describe the same moment. A second call could land after someone
+ * else accepted something, and the dialog would subtract two nestings that
+ * never coexisted.
+ *
+ * THE SEARCH IS RANDOM, so a re-run is not reliably better. A deep re-plan of
+ * the KEPL order came back 6 m² WORSE than the nesting already on it — fewer
+ * plates but bigger ones. Without this the screen showed a confident set of
+ * figures with nothing to measure them against, and "I asked for more compute"
+ * reads as "this must be an improvement".
+ *
+ * `comparable` is the honest part. A proposal only covering the un-nested parts
+ * describes a different set of steel from the whole order's accepted nesting,
+ * and subtracting those two produces a number that means nothing. The test is
+ * whether both cover the same part area — computed here, not left to the
+ * caller, so every reader applies the same rule.
+ */
+async function acceptedForComparison(companyId, orderId, summary) {
+  const { totals } = await nestTotals(companyId, orderId);
+  if (!totals.plates) return null;
+  // Tolerance of 0.5 m² absorbs the rounding each side does to two decimals
+  // across a thousand parts; it is far below any real difference in coverage.
+  const comparable = Math.abs(totals.partAreaM2 - summary.usedAreaM2) <= 0.5;
+  return { ...totals, comparable };
 }
 
 const emptySummary = () => ({

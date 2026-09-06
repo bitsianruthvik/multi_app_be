@@ -82,6 +82,18 @@ export async function nestTotals(companyId, orderId, conn = null) {
   const plateArea = nests.reduce((a, n) => a + n.plateAreaMm2, 0);
   const partArea = nests.reduce((a, n) => a + n.partAreaMm2, 0);
   const steelKg = nests.reduce((a, n) => a + n.plateWeightKg, 0);
+  /**
+   * Waste in TONNES as well as area, so this can be set beside a proposal.
+   *
+   * A square metre of 40 mm plate is 3.3 times the steel of a square metre of
+   * 12 mm, so comparing two nestings on area alone flatters whichever one
+   * wastes the thicker plate. The suggestor already reports weight; the
+   * accepted nesting has to report it the same way or the two cannot be
+   * subtracted.
+   */
+  const DENSITY_T_PER_M2_MM = 7.85 / 1000;
+  const wasteT = nests.reduce(
+    (a, n) => a + ((n.wasteAreaMm2 / 1e6) * n.thickness * DENSITY_T_PER_M2_MM), 0);
 
   return {
     nests,
@@ -95,6 +107,7 @@ export async function nestTotals(companyId, orderId, conn = null) {
       // What the order actually buys, counted once per plate. This is the
       // number a naive sum over material rows gets wrong.
       steelTonnes: Math.round(steelKg / 1000 * 100) / 100,
+      wasteTonnes: Math.round(wasteT * 100) / 100,
     },
   };
 }
