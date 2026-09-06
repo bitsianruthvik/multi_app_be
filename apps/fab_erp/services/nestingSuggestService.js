@@ -594,7 +594,22 @@ export async function suggestNesting(companyId, orderId, opts = {}) {
  * caller, so every reader applies the same rule.
  */
 async function acceptedForComparison(companyId, orderId, summary) {
-  const { totals } = await nestTotals(companyId, orderId);
+  /**
+   * THE ONLY QUERY `suggestNesting` MAKES AFTER THE PACKING, and that is exactly
+   * what makes it dangerous.
+   *
+   * Every other read here happens up front, so the whole multi-minute compute
+   * used to sit between the last query and the response — no connection, no
+   * problem. Adding the comparison put a query on the far side of that window
+   * and reintroduced the failure a previous commit had just removed from
+   * `acceptSuggestion`: TiDB Cloud hangs up on a session it thinks is idle, and
+   * a deep nest looks idle for five minutes. The first Deep run after the
+   * comparison shipped died with ECONNRESET and threw away the whole proposal.
+   *
+   * The retry is read-only work, so repeating it is free; what it must never do
+   * is take the proposal down with it.
+   */
+  const { totals } = await retryOnDeadConnection(() => nestTotals(companyId, orderId));
   if (!totals.plates) return null;
   // Tolerance of 0.5 m² absorbs the rounding each side does to two decimals
   // across a thousand parts; it is far below any real difference in coverage.
