@@ -37,6 +37,7 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
             b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName, b.code_join AS codeJoin,
+            b.explode AS explode,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
@@ -57,7 +58,7 @@ async function bomIndex(companyId, conn = null) {
             b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
-            b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin,
+            b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
@@ -211,6 +212,36 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
        */
       if (!Number.isFinite(qty) || qty <= 0) {
         addChildren(target, line.childItemId, code, depth + 1, ancestry);
+        continue;
+      }
+
+      /**
+       * DOES A QUANTITY MEAN MANY THINGS, OR ONE THING MANY TIMES?
+       *
+       * Both, and the BOM has to say which. Four girders are four girders: each
+       * carries its own mark, its own tasks, its own place on the drawing, so
+       * each is its own row. Twenty-one identical stiffeners are ONE part with a
+       * quantity — that is how the BOQ writes them, how the shop marks them, and
+       * how nesting wants them, because a row is cut from one plate.
+       *
+       * Exploding everything is what turned 7,212 shear studs into 7,212 items
+       * and an order into 17,648 rows. Exploding nothing would give four girders
+       * one code between them.
+       *
+       * The rule that falls out: assemblies explode, parts do not.
+       */
+      if (!line.explode) {
+        nodes++;
+        byName[line.childName] = (byName[line.childName] ?? 0) + qty;
+        const seg = line.codeSegment ?? String(1);
+        target.children.push({
+          catalogItemId: line.childItemId,
+          name: line.childName,
+          code: line.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`,
+          defaultFlowId: line.defaultFlowId ?? null,
+          qty,
+          children: [],
+        });
         continue;
       }
 
@@ -544,10 +575,10 @@ export async function instantiate(companyId, spec, existingConn = null) {
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
-         VALUES (?,?,?,?,?,?,?,1,?,'structure',?,?,'make',?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,'structure',?,?,'make',?)`,
         [
           companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
-          node.name, meta.unit ?? 'nos', code, depth, isLeaf, node.defaultFlowId ?? null,
+          node.name, meta.unit ?? 'nos', node.qty ?? 1, code, depth, isLeaf, node.defaultFlowId ?? null,
         ],
       );
       created++;
