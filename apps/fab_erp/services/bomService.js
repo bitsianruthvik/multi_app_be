@@ -36,7 +36,7 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
-            b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName,
+            b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName, b.code_join AS codeJoin,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
@@ -57,7 +57,7 @@ async function bomIndex(companyId, conn = null) {
             b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
-            b.default_flow_id AS defaultFlowId,
+            b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
@@ -249,7 +249,12 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
         const seg = line.codeSegment != null
           ? (qty === 1 ? line.codeSegment : numbered(line.codeSegment))
           : String(i);
-        const childCode = `${code}-${seg}`;
+        /*
+         * ABSORB joins without a dash, so girder L1 segment 1 reads L11 —
+         * the mark the shop paints on the steel. Anything else keeps the
+         * dash, which is what makes a code readable by eye.
+         */
+        const childCode = line.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`;
 
         nodes++;
         byName[line.childName] = (byName[line.childName] ?? 0) + 1;

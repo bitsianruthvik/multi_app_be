@@ -6108,3 +6108,24 @@ SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='flow_id');
 SET @s = IF(@c=1, 'ALTER TABLE fab_item_catalog DROP COLUMN flow_id', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── A BOM line can join its code without a separator (2026-09-06) ──────────
+--
+-- The shop marks a girder L1 and its first segment L11 — girder number then
+-- segment number, no dash. That is not a formatting preference; it is the mark
+-- that gets painted on the steel and written on the drawing, so a code the
+-- system invents differently is a code nobody on the floor can find.
+--
+-- `dash`   parent-CHILD    the normal case, S1-L1
+-- `absorb` parentCHILD     L1 + 1 -> L11
+--
+-- This is the first half of the "recursive code rules" in
+-- FAB_ERP_GENERIC_STRUCTURE_PLAN.md — each level says how it attaches to the
+-- one above. `itemCodeService.appendLevel` already does the same thing for the
+-- BOQ importer, by noticing that a child's label opens with its parent's; on a
+-- BOM line there is no label to notice, so it is declared.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='code_join');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom
+     ADD COLUMN code_join ENUM(''dash'',''absorb'') NOT NULL DEFAULT ''dash''', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
