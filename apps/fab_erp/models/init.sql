@@ -852,6 +852,27 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=D
 SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN code_active VARCHAR(160) GENERATED ALWAYS AS (IF(deleted_at IS NULL, code, NULL)) VIRTUAL','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- blank_catalog_item_id (2026-09) — the BLANK this part is cut from.
+--
+-- A blank is a catalog item defined by material + grade + thickness + width +
+-- length: "MS Blank 12 x 170 x 2995 E350 BO". Every part row of the same shape
+-- on the same order points at the same one, which is what makes them a LOT that
+-- a cutting order produces once and assemblies draw down.
+--
+-- Distinct from catalog_item_id, which says what the part is FOR ("Top Flange").
+-- The role and the shape are two different facts and were never the same column.
+--
+-- Nullable and read by nothing yet: this is slice 0 of
+-- FAB_ERP_LOTS_AND_PRODUCTION_ORDERS.md, which proves the grouping without
+-- changing any behaviour.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='blank_catalog_item_id');
+SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN blank_catalog_item_id INT NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_blank');
+SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD INDEX idx_fi_blank (company_id, blank_catalog_item_id)','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='uq_fi_company_code_active');
 SET @sql = IF(@idx=0,'ALTER TABLE fab_items ADD UNIQUE KEY uq_fi_company_code_active (company_id, code_active)','SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
