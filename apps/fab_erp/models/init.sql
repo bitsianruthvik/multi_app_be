@@ -6166,3 +6166,28 @@ SET @s = IF(@c=0, 'CREATE TABLE fab_item_demand (
     KEY idx_fid_part (part_item_id)
   )', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ── A field can apply to more than one branch (2026-09-07) ─────────────────
+--
+-- `fab_fields` scopes through category_id / group_id / subgroup_id — three
+-- SINGLE-valued columns, so a field belongs to at most one branch. Most of the
+-- useful answers are several: `grade` and `thickness_mm` are meaningful on
+-- fabricated steel AND on the raw material it is cut from; `hsn_code` on
+-- everything purchased and nothing made. Those six had to stay global, which
+-- means they offer themselves on machines and tins of paint.
+--
+-- `fab_item_scopes` already expresses exactly this — include and exclude rules
+-- over category, group, subgroup, procurement type and material form — and is
+-- already used to say what a part may be cut from. It had no link to a field.
+--
+-- The three columns stay: they are the simple case and most fields want them.
+-- A scope wins when set, so nothing that reads only the columns changes.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_fields' AND COLUMN_NAME='scope_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_fields ADD COLUMN scope_id BIGINT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_fields' AND INDEX_NAME='idx_ff_scope');
+SET @s = IF(@c=0, 'CREATE INDEX idx_ff_scope ON fab_fields (company_id, scope_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
