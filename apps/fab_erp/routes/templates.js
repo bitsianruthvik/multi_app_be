@@ -189,11 +189,10 @@ router.post(
     try {
       const cid = companyId(req);
       const orderId = Number(req.params.orderId);
-      const { tree, orderLineId = null, lineCode = null, replace = false } = req.body ?? {};
-      const prefix = await orderCodePrefix(cid, orderId);
-      const codePrefix = lineCode ? `${prefix}-${lineCode}` : prefix;
+      // No code prefix: the BOM step mints no codes at all. See buildFromTree.
+      const { tree, orderLineId = null, replace = false } = req.body ?? {};
       const result = await buildFromTree(cid, {
-        orderId, orderLineId, tree, codePrefix, replace: replace === true,
+        orderId, orderLineId, tree, replace: replace === true,
       });
       res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
     } catch (err) {

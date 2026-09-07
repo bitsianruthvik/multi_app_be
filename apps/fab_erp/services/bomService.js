@@ -981,7 +981,7 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
   const owned = !existingConn;
   try {
     if (owned) await conn.beginTransaction();
-    const { orderId, orderLineId = null, tree, codePrefix = null, replace = false } = spec;
+    const { orderId, orderLineId = null, tree, replace = false } = spec;
     if (!tree || !tree.catalogItemId) {
       const e = new Error('No structure was sent.'); e.status = 400; throw e;
     }
@@ -1040,36 +1040,44 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * its parent's id, and counting up from a bulk insert's insertId is the
      * trap ARCHITECTURE warns about.
      */
-    const write = async (node, parentItemId, code, depth) => {
+    /**
+     * NO CODE IS WRITTEN HERE, deliberately.
+     *
+     * A code names a piece somebody can point at on the floor, and at BOM time
+     * no such piece exists — the row says "six end diaphragms of this design",
+     * which is a requirement, not six things. Writing `…-SPAN1-ED-EDBF` anyway
+     * did two harmful things at once: it minted identity for something that had
+     * none, and it baked TREE POSITION into that identity, so the same plate cut
+     * to the same size under a different parent got a different name.
+     *
+     * Codes are minted later, at production-order time, where the pieces become
+     * real: assemblies get one code each, parts share a code derived from order
+     * + material + grade + dimensions. `itemCodeService` only ever fills blanks,
+     * so leaving NULL here is exactly what that pass expects to find.
+     *
+     * `codeSegment` and `codeJoin` still ride along on the tree. They are the
+     * BOM's own abbreviations and the code pass will want them — they are data
+     * being carried, not a decision being made here.
+     */
+    const write = async (node, parentItemId, depth) => {
       const kids = Array.isArray(node.children) ? node.children : [];
       const [r] = await conn.query(
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
-         VALUES (?,?,?,?,?,?,?,?,?,'structure',?,?,'make',?)`,
+         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,'make',?)`,
         [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
           node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
           Number(node.qty) > 0 ? Number(node.qty) : 1,
-          code, depth, kids.length ? 0 : 1, node.defaultFlowId ?? null]);
+          depth, kids.length ? 0 : 1, node.defaultFlowId ?? null]);
       created++;
       byDepth[depth] = (byDepth[depth] ?? 0) + 1;
 
-      for (const child of kids) {
-        /*
-         * A node with no code segment falls back to its name's initials, so a
-         * hand-added row still gets a readable code instead of an empty join
-         * that would collide with its parent's.
-         */
-        const seg = child.codeSegment
-          ?? String(child.name ?? '').split(/\s+/).map((w) => w[0]).join('').toUpperCase().slice(0, 6)
-          ?? 'X';
-        const childCode = child.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`;
-        await write(child, r.insertId, childCode, depth + 1);
-      }
+      for (const child of kids) await write(child, r.insertId, depth + 1);
       return r.insertId;
     };
 
-    const rootId = await write(tree, null, codePrefix ?? tree.name, 0);
+    const rootId = await write(tree, null, 0);
 
     if (orderLineId) {
       await conn.query(
