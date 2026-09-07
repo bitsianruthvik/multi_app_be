@@ -1,11 +1,9 @@
 /**
  * templates.js — build an order's structure from a BOM, generically.
  *
- *   GET  /templates                        what can be built
- *   GET  /templates/:itemId/parameters     the questions this one asks
- *   POST /templates/:itemId/outline        the structure one rung at a time (writes nothing)
  *   POST /templates/:itemId/preview        the shape it would produce (writes nothing)
- *   POST /orders/:orderId/instantiate      create it
+ *   GET  /templates/:itemId/draft          the BOM as an editable tree (writes nothing)
+ *   POST /orders/:orderId/build            write that tree onto the order
  *
  *   GET    /item-bom/:itemId               the lines under one catalog item
  *   POST   /item-bom                       add or edit a line
@@ -38,11 +36,10 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
-  parametersFor, expand, instantiate, bomFor, setBomLine, removeBomLine, structureOutline,
+  parametersFor, expand, bomFor, setBomLine, removeBomLine,
   draftTree, buildFromTree,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
-import { orderCodePrefix } from '../services/itemCodeService.js';
 
 const router = Router();
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
@@ -67,69 +64,6 @@ const fail = (res, err, what) => {
   logger.error({ err }, `fab_erp: ${what} failed`);
   return res.status(500).json({ message: err.message });
 };
-
-/**
- * Catalog items that are templates — anything with BOM lines under it and
- * nothing above it.
- *
- * Derived rather than flagged. A separate `is_template` column would be a
- * second place to keep a fact the structure already states, and it would go
- * wrong the first time somebody made a Girder buildable on its own.
- */
-router.get('/templates', protect, async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const [rows] = await pool.query(
-      `SELECT c.id, c.code, c.name,
-              cat.name AS categoryName, cat.id AS categoryId,
-              (SELECT COUNT(*) FROM fab_item_bom b
-                WHERE b.company_id = c.company_id AND b.parent_item_id = c.id
-                  AND b.deleted_at IS NULL AND b.active = 1) AS childLines
-         FROM fab_item_catalog c
-         LEFT JOIN fab_item_categories cat ON cat.id = c.category_id
-        WHERE c.company_id = ? AND c.deleted_at IS NULL
-          AND EXISTS (SELECT 1 FROM fab_item_bom b
-                       WHERE b.company_id = c.company_id AND b.parent_item_id = c.id
-                         AND b.deleted_at IS NULL AND b.active = 1)
-          AND NOT EXISTS (SELECT 1 FROM fab_item_bom b2
-                           WHERE b2.company_id = c.company_id AND b2.child_item_id = c.id
-                             AND b2.deleted_at IS NULL AND b2.active = 1)
-        ORDER BY cat.name, c.name`,
-      [cid],
-    );
-    res.json({ templates: rows });
-  } catch (err) { fail(res, err, 'templates'); }
-});
-
-/** The questions, and the immediate BOM, so a client can show what it is building. */
-router.get('/templates/:itemId/parameters', protect, async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const itemId = Number(req.params.itemId);
-    const [parameters, lines] = await Promise.all([
-      parametersFor(cid, itemId),
-      bomFor(cid, itemId),
-    ]);
-    res.json({ itemId, parameters, lines });
-  } catch (err) { fail(res, err, 'template parameters'); }
-});
-
-/**
- * The structure one rung at a time — what the drill-down wizard walks.
- *
- * A POST because it takes the answers so far: every step is the expansion of
- * the spec as it stands, which is what makes step 3 able to show the segments
- * that step 2's numbers actually produced. WRITES NOTHING, same as preview.
- */
-router.post('/templates/:itemId/outline', protect, async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const { params = {}, perInstance = {}, structure = null } = req.body ?? {};
-    res.json(await structureOutline(cid, Number(req.params.itemId), {
-      params, perInstance, spec: structure,
-    }));
-  } catch (err) { fail(res, err, 'structure outline'); }
-});
 
 /**
  * The shape it would produce. WRITES NOTHING.
@@ -200,49 +134,6 @@ router.post(
         return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
       }
       return fail(res, err, 'build structure');
-    }
-  },
-);
-
-/**
- * Create the structure on an order line.
- *
- * The order's code prefix is resolved here rather than asked for, because it is
- * derived from the order and the customer and nobody should be able to type a
- * different one — a code that does not match its order is a code nobody can
- * find later.
- */
-router.post(
-  '/orders/:orderId/instantiate',
-  protect,
-  requirePerm('fab_erp_projects_manage'),
-  async (req, res) => {
-    try {
-      const cid = companyId(req);
-      const orderId = Number(req.params.orderId);
-      const {
-        itemId, orderLineId = null, params = {}, perInstance = {}, structure = null, lineCode = null,
-        replace = false,
-      } = req.body ?? {};
-      if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
-
-      // `<order prefix>-<line code>` — the line's own code is the top level of
-      // the structure, exactly as the BOQ sheet's Span column always was.
-      const prefix = await orderCodePrefix(cid, orderId);
-      const codePrefix = lineCode ? `${prefix}-${lineCode}` : prefix;
-
-      const result = await instantiate(cid, {
-        orderId, orderLineId, rootItemId: Number(itemId), params, perInstance, structure, codePrefix,
-        replace: replace === true,
-      });
-      res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
-    } catch (err) {
-      // ALREADY_BUILT and WORK_STARTED carry a code the dialog offers a choice on,
-      // so they travel as more than a message.
-      if (err.status === 409) {
-        return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
-      }
-      return fail(res, err, 'instantiate');
     }
   },
 );

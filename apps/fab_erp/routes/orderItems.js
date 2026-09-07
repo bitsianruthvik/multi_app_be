@@ -26,10 +26,6 @@ import {
   orderWeightSummaryHandler,
   generateOrderItemCodesHandler,
   orderNestingHandler,
-  exportBoqHandler,
-  importBoqHandler,
-  boqWizardHandler,
-  applyBoqWizardHandler,
   exportNestingHandler,
   importNestingHandler,
   flowSummaryHandler,
@@ -67,14 +63,18 @@ const requirePerm = (tag) => (req, res, next) => {
 router.get('/orders/:orderId/items/export-template', protect, requirePerm('fab_erp_projects_manage'), exportOrderItemsTemplateHandler);
 router.post('/orders/:orderId/items/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importOrderItemsHandler);
 router.post('/orders/:orderId/items/recompute-weights', protect, requirePerm('fab_erp_projects_manage'), recomputeOrderWeightsHandler);
-// ── BOQ: one sheet, four level-code columns (2026-08) ──────────────────────
-router.get('/orders/:orderId/boq/export', protect, requirePerm('fab_erp_projects_manage'), exportBoqHandler);
-router.post('/orders/:orderId/boq/wizard', protect, requirePerm('fab_erp_projects_manage'), boqWizardHandler);
-// Same body as /boq/wizard, but SAVES the generated structure instead of
-// returning a spreadsheet — so a structure that needs no editing does not have
-// to round-trip through Excel just to exist on the order.
-router.post('/orders/:orderId/boq/wizard/apply', protect, requirePerm('fab_erp_projects_manage'), applyBoqWizardHandler);
-router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importBoqHandler);
+/*
+ * THE BOQ SHEET'S ROUTES ARE GONE — export, import, and the two wizard ones.
+ *
+ * That sheet's four code columns (span / girder / segment / part) WERE the
+ * structure: position baked into every code, one row per piece. The BOM step
+ * no longer works that way — a row is a design, the quantity lives on the row,
+ * and codes are issued at production-order time — so an importer speaking the
+ * old language would undo it on the first upload.
+ *
+ * boqSheetService is left on disk unreferenced, so the rewrite has something to
+ * read. It wants to speak blanks, lots and quantities.
+ */
 
 // ── Nesting: stage 2, its own document (2026-08) ───────────────────────────
 router.get('/orders/:orderId/nesting/export', protect, requirePerm('fab_erp_projects_manage'), exportNestingHandler);
