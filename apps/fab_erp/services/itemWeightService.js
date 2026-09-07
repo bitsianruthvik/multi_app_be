@@ -116,7 +116,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
-            catalog_item_id, flow_id, node_kind, length, width, height
+            catalog_item_id, flow_id, node_kind, is_leaf, length, width, height
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
@@ -272,7 +272,20 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       // that matters is the cut part's, which sits on the row above. Counting
       // these would report every properly-filled order as incomplete.
       const isRmLink = isMaterialLink(node);
-      if (!kids.length && eff === null && !isRmLink) unweighedLeaves++;
+      /**
+       * `is_leaf` DECIDES, not "has no tree children".
+       *
+       * The two agreed while every part hung under its assembly. Consolidation
+       * moved identical parts onto the order line, so a diaphragm has no
+       * children and was counted here as a bottom-level row with no weight —
+       * 174 of them on the KEPL order, under a banner reading "this total is
+       * incomplete" when the total was exactly right.
+       *
+       * An assembly weighs what its parts weigh, and its parts are now reached
+       * through fab_item_demand. `is_leaf` already knows that.
+       */
+      const isLeaf = Number(node.is_leaf) === 1;
+      if (isLeaf && !kids.length && eff === null && !isRmLink) unweighedLeaves++;
     }
   }
 
