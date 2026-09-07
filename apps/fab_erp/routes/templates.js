@@ -39,6 +39,7 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
   parametersFor, expand, instantiate, bomFor, setBomLine, removeBomLine, structureOutline,
+  draftTree, buildFromTree,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { orderCodePrefix } from '../services/itemCodeService.js';
@@ -158,6 +159,51 @@ router.post('/templates/:itemId/preview', protect, async (req, res) => {
     res.json({ nodes: tree.nodes, byName: tree.byName, sample });
   } catch (err) { fail(res, err, 'template preview'); }
 });
+
+/**
+ * GET /templates/:itemId/draft — the BOM as a tree to EDIT.
+ *
+ * One node per BOM line carrying its default quantity, NOT an expansion: a
+ * Girder line comes back as one node reading ×6. That is the shape somebody
+ * edits — change a 6 to a 4 in one place, not in six — and the shape the order
+ * should end up in. Writes nothing.
+ */
+router.get('/templates/:itemId/draft', protect, async (req, res) => {
+  try {
+    const cid = companyId(req);
+    res.json({ tree: await draftTree(cid, Number(req.params.itemId)) });
+  } catch (err) { fail(res, err, 'draft tree'); }
+});
+
+/**
+ * POST /orders/:orderId/build — write the tree exactly as sent.
+ *
+ * The editor has already said what it wants. Re-deriving it from a spec here
+ * would be a second chance to build something else.
+ */
+router.post(
+  '/orders/:orderId/build',
+  protect,
+  requirePerm('fab_erp_projects_manage'),
+  async (req, res) => {
+    try {
+      const cid = companyId(req);
+      const orderId = Number(req.params.orderId);
+      const { tree, orderLineId = null, lineCode = null, replace = false } = req.body ?? {};
+      const prefix = await orderCodePrefix(cid, orderId);
+      const codePrefix = lineCode ? `${prefix}-${lineCode}` : prefix;
+      const result = await buildFromTree(cid, {
+        orderId, orderLineId, tree, codePrefix, replace: replace === true,
+      });
+      res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
+    } catch (err) {
+      if (err.status === 409) {
+        return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
+      }
+      return fail(res, err, 'build structure');
+    }
+  },
+);
 
 /**
  * Create the structure on an order line.

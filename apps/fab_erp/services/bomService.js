@@ -576,6 +576,86 @@ export async function structureOutline(companyId, rootItemId, opts = {}) {
   return { steps, nodes: tree.nodes, byName: tree.byName, rootCode: tree.root.code };
 }
 
+/**
+ * The BOM as a tree to EDIT, one node per line, quantities as they default.
+ *
+ * ── WHY THIS IS NOT `expand` ──────────────────────────────────────────────
+ * `expand` produces what would be BUILT: six girders become six nodes. This
+ * produces what the BOM SAYS: one Girder node reading x6. That is the shape
+ * somebody edits — you change a 6 to a 4 in one place, not in six — and it is
+ * also the shape the order should end up in, because a row is a design and its
+ * quantity says how many exist. `markService` has said so all along: "twelve
+ * identical stiffeners are all S3 with qty 12 — a mark names a design. We never
+ * mint twelve marks."
+ *
+ * Nothing here answers questions. A parameterised quantity comes back as its
+ * default and the editor changes it like any other number, so there is no
+ * separate notion of "the questions this template asks" to keep in step with
+ * the BOM that asks them.
+ *
+ * @returns {Promise<object>} the root, children nested, ready to be edited
+ */
+export async function draftTree(companyId, rootItemId, conn = null) {
+  const exec = conn ?? pool;
+  const byParent = await bomIndex(companyId, exec);
+  const [[root]] = await exec.query(
+    `SELECT id, code, name, unit FROM fab_item_catalog
+      WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    [rootItemId, companyId],
+  );
+  if (!root) { const e = new Error('That item does not exist.'); e.status = 404; throw e; }
+
+  let seq = 0;
+  /** A local id, so the editor can address a node before it exists anywhere. */
+  const key = () => `n${++seq}`;
+
+  const build = (itemId, depth, seen) => {
+    if (depth >= MAX_DEPTH) return [];
+    return (byParent.get(Number(itemId)) ?? []).map((line) => {
+      /*
+       * A cycle is guarded by the path, not by a global visited set: the same
+       * item legitimately appears twice in one tree — a Top Flange under a
+       * Segment and another under a Diaphragm — and a global set would silently
+       * drop the second.
+       */
+      const cyclic = seen.has(Number(line.childItemId));
+      const qty = line.qtyNum != null
+        ? Number(line.qtyNum)
+        : Number(line.defaultQty ?? 0);
+      return {
+        key: key(),
+        catalogItemId: Number(line.childItemId),
+        name: line.childName,
+        unit: line.childUnit ?? 'nos',
+        qty: Number.isFinite(qty) ? qty : 0,
+        codeSegment: line.codeSegment,
+        codeJoin: line.codeJoin ?? 'dash',
+        defaultFlowId: line.defaultFlowId ?? null,
+        // Where it came from, so an untouched tree can be recognised as the
+        // BOM's own shape rather than something hand-built.
+        bomLineId: Number(line.lineId),
+        /** What the BOM called this quantity, if it asked for one. */
+        qtyParam: line.qtyParam ?? null,
+        children: cyclic ? [] : build(line.childItemId, depth + 1, new Set([...seen, Number(line.childItemId)])),
+      };
+    });
+  };
+
+  return {
+    key: 'root',
+    catalogItemId: Number(root.id),
+    name: root.name,
+    unit: root.unit ?? 'nos',
+    qty: 1,
+    codeSegment: null,
+    codeJoin: 'dash',
+    defaultFlowId: null,
+    bomLineId: null,
+    qtyParam: null,
+    children: build(Number(root.id), 0, new Set([Number(root.id)])),
+  };
+}
+
 /** Flatten an expanded tree into rows, parents before children. */
 export function flatten(node, parentPath = null, out = []) {
   out.push({ catalogItemId: node.catalogItemId, name: node.name, code: node.code, parentPath });
@@ -865,6 +945,140 @@ export async function instantiate(companyId, spec, existingConn = null) {
         // from memory.
         [rootItemId, JSON.stringify({ params, perInstance, structure }), orderLineId, companyId],
       );
+    }
+
+    if (owned) await conn.commit();
+    return { created, rootItemId: rootId, byDepth };
+  } catch (err) {
+    if (owned) await conn.rollback();
+    throw err;
+  } finally {
+    if (owned) conn.release();
+  }
+}
+
+/**
+ * Write an EXPLICIT tree onto an order line. What you send is what gets built.
+ *
+ * ── WHY THIS EXISTS BESIDE `instantiate` ──────────────────────────────────
+ * `instantiate` takes ANSWERS and expands a BOM into them. That is right when a
+ * wizard asks questions, and wrong when somebody has an editable tree in front
+ * of them: they have already said exactly what they want, and re-deriving it
+ * from a spec is a second chance to build something else. Here the client sends
+ * the tree and this writes it, unchanged.
+ *
+ * ── ONE ROW PER NODE, QUANTITY ON THE ROW ─────────────────────────────────
+ * Six diaphragms are one row reading 6, not six rows. That is what the rest of
+ * the system already assumes — weights multiply unit by qty, a task covers
+ * `task_qty` pieces, and a mark names a design — and it is why an order that
+ * described 669 t needed 1,276 rows to do it.
+ *
+ * The same refusals as `instantiate`: it will not build twice over an existing
+ * structure, and it will not replace one whose tasks have been started.
+ */
+export async function buildFromTree(companyId, spec, existingConn = null) {
+  const conn = existingConn ?? await pool.getConnection();
+  const owned = !existingConn;
+  try {
+    if (owned) await conn.beginTransaction();
+    const { orderId, orderLineId = null, tree, codePrefix = null, replace = false } = spec;
+    if (!tree || !tree.catalogItemId) {
+      const e = new Error('No structure was sent.'); e.status = 400; throw e;
+    }
+
+    const lineScope = orderLineId == null
+      ? { sql: 'AND order_line_id IS NULL', args: [] }
+      : { sql: 'AND order_line_id = ?', args: [orderLineId] };
+
+    const [[already]] = await conn.query(
+      `SELECT COUNT(*) AS n FROM fab_items
+        WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
+      [companyId, orderId, ...lineScope.args]);
+    if (already.n > 0) {
+      if (!replace) {
+        const e = new Error(
+          `This line already has ${already.n} item(s). Building again would add a second copy `
+          + 'of everything — replace what is there, or pick a different line.');
+        e.status = 409; e.code = 'ALREADY_BUILT'; e.existing = already.n; throw e;
+      }
+      const [[worked]] = await conn.query(
+        `SELECT COUNT(*) AS n FROM fab_project_tasks t
+           JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id
+          WHERE t.company_id = ? AND t.order_id = ? ${lineScope.sql.replace('order_line_id', 'i.order_line_id')}
+            AND i.deleted_at IS NULL AND t.deleted_at IS NULL
+            AND (t.started_at IS NOT NULL OR t.status IN ('in_progress','paused','done'))`,
+        [companyId, orderId, ...lineScope.args]);
+      if (worked.n > 0) {
+        const e = new Error(
+          `Replace refused: ${worked.n} task(s) on this line have been started or finished. `
+          + 'Rebuilding would throw that shop-floor history away.');
+        e.status = 409; e.code = 'WORK_STARTED'; throw e;
+      }
+      const [ids] = await conn.query(
+        `SELECT id FROM fab_items WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
+        [companyId, orderId, ...lineScope.args]);
+      const itemIds = ids.map((r) => r.id);
+      if (itemIds.length) {
+        await conn.query(
+          `UPDATE fab_project_tasks SET deleted_at = NOW()
+            WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`, [companyId, itemIds]);
+        await conn.query(
+          `UPDATE fab_items SET deleted_at = NOW()
+            WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`, [companyId, itemIds]);
+      }
+    }
+
+    const [kinds] = await conn.query(
+      'SELECT id, unit FROM fab_item_catalog WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+    const unitOf = new Map(kinds.map((k) => [Number(k.id), k.unit]));
+
+    let created = 0;
+    const byDepth = {};
+
+    /**
+     * Depth-first, parents before children, one row at a time — a child needs
+     * its parent's id, and counting up from a bulk insert's insertId is the
+     * trap ARCHITECTURE warns about.
+     */
+    const write = async (node, parentItemId, code, depth) => {
+      const kids = Array.isArray(node.children) ? node.children : [];
+      const [r] = await conn.query(
+        `INSERT INTO fab_items
+           (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
+         VALUES (?,?,?,?,?,?,?,?,?,'structure',?,?,'make',?)`,
+        [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+          node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
+          Number(node.qty) > 0 ? Number(node.qty) : 1,
+          code, depth, kids.length ? 0 : 1, node.defaultFlowId ?? null]);
+      created++;
+      byDepth[depth] = (byDepth[depth] ?? 0) + 1;
+
+      for (const child of kids) {
+        /*
+         * A node with no code segment falls back to its name's initials, so a
+         * hand-added row still gets a readable code instead of an empty join
+         * that would collide with its parent's.
+         */
+        const seg = child.codeSegment
+          ?? String(child.name ?? '').split(/\s+/).map((w) => w[0]).join('').toUpperCase().slice(0, 6)
+          ?? 'X';
+        const childCode = child.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`;
+        await write(child, r.insertId, childCode, depth + 1);
+      }
+      return r.insertId;
+    };
+
+    const rootId = await write(tree, null, codePrefix ?? tree.name, 0);
+
+    if (orderLineId) {
+      await conn.query(
+        `UPDATE fab_order_lines
+            SET template_item_id = ?, template_params = ?, template_snapshot_at = NOW()
+          WHERE id = ? AND company_id = ?`,
+        // The TREE is the record of what was built, not a set of answers that
+        // would have to be re-expanded to find out.
+        [tree.catalogItemId, JSON.stringify({ version: 3, tree }), orderLineId, companyId]);
     }
 
     if (owned) await conn.commit();
