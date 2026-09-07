@@ -2031,7 +2031,8 @@
       "line_type",
       "catalog_item_id",
       "qty_received",
-      "expected_date"
+      "expected_date",
+      "template_item_id"
     ],
     "fields": {
       "id": "fol.id",
@@ -2054,7 +2055,8 @@
       "lineType": "fol.line_type",
       "catalogItemId": "fol.catalog_item_id",
       "qtyReceived": "fol.qty_received",
-      "expectedDate": "fol.expected_date"
+      "expectedDate": "fol.expected_date",
+      "templateItemId": "fol.template_item_id"
     },
     "fieldTypes": {
       "id": "integer",
