@@ -18,6 +18,7 @@ import path from 'path';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
+import { demandFor } from '../services/partIdentityService.js';
 import {
   exportOrderItemsTemplateHandler,
   importOrderItemsHandler,
@@ -78,6 +79,24 @@ router.post('/orders/:orderId/boq/import', protect, requirePerm('fab_erp_project
 // ── Nesting: stage 2, its own document (2026-08) ───────────────────────────
 router.get('/orders/:orderId/nesting/export', protect, requirePerm('fab_erp_projects_manage'), exportNestingHandler);
 router.post('/orders/:orderId/nesting/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importNestingHandler);
+
+/**
+ * What an assembly NEEDS, for a screen that used to read its children.
+ *
+ * Identical parts are consolidated onto the line, so a diaphragm has no
+ * children at all and a tree that asks for them shows an empty assembly — which
+ * reads as nothing wrong rather than as a question asked in the wrong place.
+ */
+router.get('/orders/:orderId/items/:itemId/demand', protect, async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const itemId = Number(req.params.itemId);
+    const map = await demandFor(cid, [itemId]);
+    res.json({ itemId, parts: map.get(itemId) ?? [] });
+  } catch (err) {
+    return res.status(err.status ?? 500).json({ message: err.message });
+  }
+});
 
 // The drag-and-drop board (2026-08-10). Reading it is a view action; arranging
 // plates is not.

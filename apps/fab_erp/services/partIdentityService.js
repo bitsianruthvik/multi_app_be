@@ -249,3 +249,53 @@ export async function consolidateParts(companyId, orderId, { apply = false, conn
     if (owned) conn.release();
   }
 }
+
+/**
+ * What an assembly needs, now that it no longer contains it.
+ *
+ * The tree used to answer this by listing an item's children. Consolidation
+ * moved identical parts onto the line, so ED1 has no children at all and a
+ * screen that asks the tree gets "nothing" — which is worse than an error,
+ * because an empty diaphragm looks like a diaphragm with nothing wrong.
+ *
+ * Returns the parts and how many of each, plus what each part is cut from, so
+ * the tree can show a real answer in the place the children used to be.
+ */
+export async function demandFor(companyId, assemblyItemIds, conn = null) {
+  const exec = conn ?? pool;
+  const ids = [...new Set((assemblyItemIds ?? []).map(Number).filter(Number.isFinite))];
+  if (!ids.length) return new Map();
+  const [rows] = await exec.query(
+    `SELECT d.assembly_item_id AS assemblyId, d.qty,
+            p.id AS partId, p.code AS partCode, p.name AS partName,
+            p.qty AS partTotalQty, p.length, p.width, p.height AS thickness,
+            (SELECT COUNT(*) FROM fab_items m
+              WHERE m.parent_item_id = p.id AND m.deleted_at IS NULL
+                AND m.node_kind = 'material' AND m.nest_no IS NOT NULL) AS plateCount
+       FROM fab_item_demand d
+       JOIN fab_items p ON p.id = d.part_item_id AND p.deleted_at IS NULL
+      WHERE d.company_id = ? AND d.assembly_item_id IN (?) AND d.deleted_at IS NULL
+      ORDER BY p.code`,
+    [companyId, ids],
+  );
+  const out = new Map();
+  for (const r of rows) {
+    const k = Number(r.assemblyId);
+    if (!out.has(k)) out.set(k, []);
+    out.get(k).push({
+      partId: Number(r.partId),
+      code: r.partCode,
+      name: r.partName,
+      /** How many THIS assembly needs. */
+      qty: Number(r.qty),
+      /** How many the whole order needs — the part is shared. */
+      totalQty: r.partTotalQty == null ? null : Number(r.partTotalQty),
+      length: r.length == null ? null : Number(r.length),
+      width: r.width == null ? null : Number(r.width),
+      thickness: r.thickness == null ? null : Number(r.thickness),
+      /** How many plates it is cut from. More than one is normal now. */
+      plateCount: Number(r.plateCount) || 0,
+    });
+  }
+  return out;
+}

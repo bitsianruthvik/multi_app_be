@@ -55,7 +55,7 @@ export async function nestingBoard(companyId, orderId) {
   const [links] = await pool.query(
     `SELECT rm.id            AS linkId,
             rm.nest_no       AS nestNo,
-            rm.qty           AS plates,
+            rm.qty           AS piecesHere,
             rm.length, rm.width, rm.height,
             rm.catalog_item_id AS materialId,
             fic.code         AS materialCode,
@@ -126,7 +126,16 @@ export async function nestingBoard(companyId, orderId) {
     }
     const part = {
       linkId: l.linkId, partId: l.partId, code: l.partCode, name: l.partName,
+      /**
+       * TWO DIFFERENT QUANTITIES, and the board needs both.
+       *
+       * `qty` is what the ORDER wants — 756 stiffeners. `piecesHere` is how many
+       * of them come off THIS plate — 56. They were the same number while a part
+       * belonged to one plate, and showing the order total against a single
+       * sheet now would read as 756 pieces on one plate.
+       */
       qty: l.partQty != null ? Number(l.partQty) : null,
+      piecesHere: l.piecesHere != null ? Number(l.piecesHere) : 1,
       length: num(l.partLength), width: num(l.partWidth), thick: num(l.partThick),
       materialId: l.materialId, materialCode: l.materialCode,
     };
@@ -150,7 +159,14 @@ export async function nestingBoard(companyId, orderId) {
         // deliberately set to something else is never overwritten.
         length: num(l.length), width: num(l.width),
         thick: num(l.height) ?? num(l.materialThickness),
-        plates: l.plates != null ? Number(l.plates) : 1,
+        /**
+         * A NEST IS ONE PLATE. It always was — `nestTotalsService` exists
+         * precisely to stop anything counting it twice — but this read the
+         * quantity off the first material row and called it a plate count.
+         * That column now holds how many PIECES of that part are cut here, so a
+         * sheet carrying 56 stiffeners announced itself as 56 plates.
+         */
+        plates: 1,
         issued: issuedKeys.has(k),
         parts: [],
       });
