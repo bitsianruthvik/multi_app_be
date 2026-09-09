@@ -47,6 +47,28 @@ export async function bomFor(companyId, parentItemId, conn = null) {
       ORDER BY b.sort_order, c.code`,
     [companyId, parentItemId],
   );
+  if (!rows.length) return rows;
+
+  /*
+   * The sizes the recipe states, if it states any. One query for the whole
+   * list rather than one per line, and attached as a plain object so a client
+   * renders `line.defaults.length_mm` without knowing the field registry.
+   */
+  const [vals] = await exec.query(
+    `SELECT v.scope_id AS lineId, f.field_key AS k, v.value_num AS n
+       FROM fab_field_values v
+       JOIN fab_fields f ON f.id = v.field_id
+      WHERE v.company_id = ? AND v.scope = 'bom_line'
+        AND v.scope_id IN (?) AND v.deleted_at IS NULL`,
+    [companyId, rows.map((r) => r.id)],
+  );
+  const byLine = new Map();
+  for (const v of vals) {
+    const e = byLine.get(Number(v.lineId)) ?? {};
+    e[v.k] = v.n == null ? null : Number(v.n);
+    byLine.set(Number(v.lineId), e);
+  }
+  for (const r of rows) r.defaults = byLine.get(Number(r.id)) ?? {};
   return rows;
 }
 
@@ -707,6 +729,7 @@ export async function setBomLine(companyId, line, existingConn = null) {
       line.defaultFlowId == null || line.defaultFlowId === '' ? null : Number(line.defaultFlowId),
     ];
 
+    let lineId = id ? Number(id) : null;
     if (id) {
       await conn.query(
         `UPDATE fab_item_bom
@@ -716,16 +739,68 @@ export async function setBomLine(companyId, line, existingConn = null) {
         [...cols.slice(1), id, companyId],
       );
     } else {
-      await conn.query(
+      const [ins] = await conn.query(
         `INSERT INTO fab_item_bom
            (company_id, parent_item_id, child_item_id, qty_num, qty_param, default_qty,
             per_instance_qty, code_segment, help_text, sort_order, default_flow_id)
          VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         cols,
       );
+      lineId = ins.insertId;
     }
+
+    /**
+     * SIZES ON THE RECIPE, optional.
+     *
+     * "A Top Flange inside a Composite Girder Segment is 40 x 700 x 12000" is a
+     * fact about the design, and stating it here means nobody retypes it on
+     * every order. Leaving it blank is equally valid — plenty of parts are sized
+     * per job — which is why nothing is required.
+     *
+     * Held as field values at scope 'bom_line' rather than as columns on this
+     * table, so the next field somebody wants a default for (hole count, weld
+     * length) needs no migration.
+     *
+     * A blank CLEARS. Passing `{ length_mm: '' }` means "the recipe no longer
+     * says", which has to be expressible or a wrong default could never be
+     * withdrawn — and it is soft-deleted rather than removed because
+     * `uq_ffv_target` counts deleted rows and a later re-entry must not collide.
+     */
+    if (line.defaults && typeof line.defaults === 'object' && lineId) {
+      const keys = Object.keys(line.defaults);
+      if (keys.length) {
+        const [fields] = await conn.query(
+          `SELECT id, field_key, default_unit FROM fab_fields
+            WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
+          [companyId, keys],
+        );
+        for (const f of fields) {
+          const raw = line.defaults[f.field_key];
+          const blank = raw === '' || raw === null || raw === undefined;
+          if (blank) {
+            await conn.query(
+              `UPDATE fab_field_values SET deleted_at = NOW()
+                WHERE company_id = ? AND field_id = ? AND scope = 'bom_line' AND scope_id = ?
+                  AND deleted_at IS NULL`,
+              [companyId, f.id, lineId],
+            );
+            continue;
+          }
+          const num = Number(raw);
+          await conn.query(
+            `INSERT INTO fab_field_values
+               (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
+             VALUES (?,?,'bom_line',?,?,?,NOW())
+             ON DUPLICATE KEY UPDATE value_num = VALUES(value_num),
+                                     unit_code = VALUES(unit_code), deleted_at = NULL`,
+            [companyId, f.id, lineId, Number.isFinite(num) ? num : null, f.default_unit ?? null],
+          );
+        }
+      }
+    }
+
     if (owned) await conn.commit();
-    return { ok: true };
+    return { ok: true, id: lineId };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;
@@ -1046,7 +1121,10 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     const procurementOf = new Map(kinds.map((k) => [Number(k.id), k.procurement_type]));
 
     let created = 0;
+    let seeded = 0;
     const byDepth = {};
+    /** (bom line id, new item id) for every row that came from a recipe line. */
+    const fromBomLine = [];
 
     /**
      * Depth-first, parents before children, one row at a time — a child needs
@@ -1087,12 +1165,58 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
           node.defaultFlowId ?? null]);
       created++;
       byDepth[depth] = (byDepth[depth] ?? 0) + 1;
+      if (node.bomLineId) fromBomLine.push([Number(node.bomLineId), r.insertId]);
 
       for (const child of kids) await write(child, r.insertId, depth + 1);
       return r.insertId;
     };
 
     const rootId = await write(tree, null, 0);
+
+    /**
+     * DEFAULTS COME DOWN FROM THE BOM LINE, the same way the flow does.
+     *
+     * A recipe may state a size — "a Top Flange inside a Composite Girder
+     * Segment is 40 x 700 x 12000" — held as field values at scope 'bom_line'.
+     * They are COPIED onto the rows here rather than resolved through at read
+     * time, for two reasons: the numbers are then visible and editable on the
+     * Parameters step instead of arriving from somewhere the reader cannot see,
+     * and editing the BOM later cannot silently move an order already built.
+     * That order was built from what the recipe said then.
+     *
+     * A value already on the row wins — nothing here overwrites, because this
+     * runs once at build when there is nothing to overwrite, and a rebuild that
+     * clobbered somebody's typed dimension would be the worst kind of quiet.
+     */
+    if (fromBomLine.length) {
+      const lineIds = [...new Set(fromBomLine.map(([lineId]) => lineId))];
+      const [defaults] = await conn.query(
+        `SELECT scope_id AS lineId, field_id AS fieldId, value_num, value_text, value_date, unit_code
+           FROM fab_field_values
+          WHERE company_id = ? AND scope = 'bom_line' AND scope_id IN (?) AND deleted_at IS NULL`,
+        [companyId, lineIds],
+      );
+      if (defaults.length) {
+        const byLine = new Map();
+        for (const d of defaults) byLine.set(Number(d.lineId), [...(byLine.get(Number(d.lineId)) ?? []), d]);
+        const rows = [];
+        for (const [lineId, itemId] of fromBomLine) {
+          for (const d of byLine.get(lineId) ?? []) {
+            rows.push([companyId, d.fieldId, 'order_item', itemId,
+              d.value_num, d.value_text, d.value_date, d.unit_code, new Date()]);
+          }
+        }
+        for (let i = 0; i < rows.length; i += 500) {
+          await conn.query(
+            `INSERT INTO fab_field_values
+               (company_id, field_id, scope, scope_id, value_num, value_text, value_date, unit_code, created_at)
+             VALUES ?`,
+            [rows.slice(i, i + 500)],
+          );
+        }
+        seeded = rows.length;
+      }
+    }
 
     if (orderLineId) {
       await conn.query(
@@ -1105,7 +1229,7 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     }
 
     if (owned) await conn.commit();
-    return { created, rootItemId: rootId, byDepth };
+    return { created, seeded, rootItemId: rootId, byDepth };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

@@ -210,6 +210,8 @@ router.post('/item-bom', protect, requirePerm('fab_erp_items_meta_manage'), asyn
       sortOrder: b.sortOrder ?? 0,
       // What every item expanded from this line starts life being made by.
       defaultFlowId: b.defaultFlowId ?? null,
+      // Sizes the recipe states, if it states any. A blank clears one.
+      defaults: b.defaults ?? null,
     });
     return res.json({ ok: true });
   } catch (err) { return fail(res, err, 'item BOM save'); }

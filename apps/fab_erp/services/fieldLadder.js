@@ -35,7 +35,22 @@ import { pool } from '../../../db.js';
  * override it. Narrower than the catalogue, because what the merchant stocks
  * cannot outrank what this order asked for.
  */
-export const RUNGS = ['category', 'group', 'subgroup', 'catalog_item', 'order_line', 'order_item', 'stock_piece'];
+/**
+ * `bom_line` sits between the catalogue and the job (added 2026-09-10).
+ *
+ * It is where the RECIPE states a size: "a Top Flange inside a Composite Girder
+ * Segment is 40 x 700 x 12000". Narrower than the catalog item, which answers
+ * for a Top Flange anywhere; broader than the order line, because the job in
+ * hand outranks the recipe it was built from.
+ *
+ * NOTHING RESOLVES THROUGH IT AT READ TIME, deliberately. `buildFromTree` copies
+ * a line's defaults onto the rows it creates, exactly as it copies
+ * `default_flow_id` into `flow_id` — so the values are visible and editable on
+ * the Parameters step instead of arriving from somewhere the reader cannot see.
+ * It also means editing the BOM later cannot silently move a built order, which
+ * is the right answer: that order was built from what the recipe said then.
+ */
+export const RUNGS = ['category', 'group', 'subgroup', 'catalog_item', 'bom_line', 'order_line', 'order_item', 'stock_piece'];
 
 export const rungOf = (scope) => RUNGS.indexOf(scope);
 
@@ -126,6 +141,19 @@ async function parentOf(exec, companyId, scope, scopeId) {
       if (i.orderLineId) return { scope: 'order_line', scopeId: Number(i.orderLineId) };
       if (i.catalogItemId) return { scope: 'catalog_item', scopeId: Number(i.catalogItemId) };
       return null;
+    }
+    /*
+     * A BOM line's parent is the CHILD item it names — the thing the line is
+     * about. Reached only if something resolves a bom_line directly, which the
+     * order path does not; it is here so the rung is not a dead end.
+     */
+    case 'bom_line': {
+      const [[b]] = await exec.query(
+        `SELECT child_item_id AS childItemId FROM fab_item_bom
+          WHERE id = ? AND company_id = ? LIMIT 1`,
+        [scopeId, companyId],
+      );
+      return b?.childItemId ? { scope: 'catalog_item', scopeId: Number(b.childItemId) } : null;
     }
     case 'catalog_item': {
       const [[c]] = await exec.query(
@@ -452,6 +480,19 @@ async function parentsOfMany(exec, companyId, scope, ids) {
                 : null);
       }
       break;
+    }
+    /*
+     * A BOM line's parent is the CHILD item it names — the thing the line is
+     * about. Reached only if something resolves a bom_line directly, which the
+     * order path does not; it is here so the rung is not a dead end.
+     */
+    case 'bom_line': {
+      const [[b]] = await exec.query(
+        `SELECT child_item_id AS childItemId FROM fab_item_bom
+          WHERE id = ? AND company_id = ? LIMIT 1`,
+        [scopeId, companyId],
+      );
+      return b?.childItemId ? { scope: 'catalog_item', scopeId: Number(b.childItemId) } : null;
     }
     case 'catalog_item': {
       const [rows] = await exec.query(
