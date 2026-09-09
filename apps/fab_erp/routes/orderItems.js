@@ -19,6 +19,8 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { demandFor } from '../services/partIdentityService.js';
+import { duplicateSubtree } from '../services/bomService.js';
+import { refreshOrderStage } from '../services/orderReadinessService.js';
 import {
   exportOrderItemsTemplateHandler,
   importOrderItemsHandler,
@@ -168,6 +170,32 @@ router.post('/orders/:orderId/confirm', protect, requirePerm('fab_erp_projects_m
  * released, and what is deliberately kept.
  */
 router.delete('/orders/:orderId', protect, requirePerm('fab_erp_projects_manage'), deleteOrderHandler);
+
+/**
+ * POST /orders/:orderId/items/:itemId/duplicate — copy a row and its subtree.
+ *
+ * The copy lands beside the original, under the same parent. "Six of these and
+ * four of those" is: copy the row, change the copy — the same gesture the
+ * structure editor gives before anything is written, offered again on the tree
+ * after it has been.
+ */
+router.post(
+  '/orders/:orderId/items/:itemId/duplicate',
+  protect,
+  requirePerm('fab_erp_projects_manage'),
+  async (req, res) => {
+    try {
+      const cid = req.user?.companyId ?? req.user?.company_id;
+      const orderId = Number(req.params.orderId);
+      const result = await duplicateSubtree(cid, orderId, Number(req.params.itemId));
+      res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ message: err.message });
+      logger.error({ err }, 'fab_erp: duplicate subtree failed');
+      return res.status(500).json({ message: err.message });
+    }
+  },
+);
 
 router.post('/orders/:orderId/items/generate-codes', protect, requirePerm('fab_erp_projects_manage'), generateOrderItemCodesHandler);
 // Read-only: gated on view, not manage — anyone who can open the order sees its tonnage.

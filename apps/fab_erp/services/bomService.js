@@ -1113,3 +1113,123 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     if (owned) conn.release();
   }
 }
+
+/**
+ * duplicateSubtree — copy one structure row and everything under it.
+ *
+ * The copy lands beside the original, under the same parent, so "six of these
+ * and four of those" is: build the BOM, copy the row, change the copy. That is
+ * the same gesture the structure editor offers before anything is written; this
+ * is it after, on the tree, where somebody is looking at what they built and
+ * wants a second one that is nearly the same.
+ *
+ * WHAT IS NOT COPIED, and why each one:
+ *   `code`      — nothing at this stage has one, and identity is not duplicable
+ *                 anyway. A copy is a different thing, not the same thing twice.
+ *   `mark`      — the same, for the paint pen.
+ *   `nest_no`   — the original's pieces were assigned to a plate; the copy's
+ *                 have not been cut and must not claim that steel.
+ *   `blank_catalog_item_id` — derived from material, grade and size, so it is
+ *                 re-derived rather than carried.
+ *   weights     — server-owned roll-ups; they recompute.
+ *
+ * FIELD VALUES DO COME ALONG. Dimensions live in the field registry now, and a
+ * copy that arrives with empty sizes would have to be filled in from scratch,
+ * which is most of the reason somebody copies a row rather than adding one.
+ *
+ * MATERIAL LINKS DO NOT. A `node_kind = 'material'` row says which plate a part
+ * was cut from — that belongs to a nest, not to the design being copied.
+ */
+export async function duplicateSubtree(companyId, orderId, itemId, existingConn = null) {
+  const conn = existingConn ?? await pool.getConnection();
+  const owned = !existingConn;
+  try {
+    if (owned) await conn.beginTransaction();
+
+    const [[root]] = await conn.query(
+      `SELECT * FROM fab_items
+        WHERE company_id = ? AND order_id = ? AND id = ? AND deleted_at IS NULL`,
+      [companyId, orderId, itemId],
+    );
+    if (!root) { const e = new Error('That row is not on this order.'); e.status = 404; throw e; }
+    if (root.node_kind === 'material') {
+      const e = new Error('A material link belongs to a nest, not to the structure — it cannot be copied.');
+      e.status = 400; throw e;
+    }
+
+    /*
+     * The whole subtree in ONE query rather than a walk per level: an order can
+     * be a thousand rows and a recursive read would be a thousand round trips
+     * to TiDB. Levels are walked in memory instead.
+     */
+    const [all] = await conn.query(
+      `SELECT id, parent_item_id, order_line_id, catalog_item_id, name, unit, qty,
+              flow_id, procurement_type, node_kind, depth, is_leaf, dim_unit, weight_unit
+         FROM fab_items
+        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+          AND NOT node_kind = 'material'`,
+      [companyId, orderId],
+    );
+    const kidsOf = new Map();
+    for (const r of all) {
+      const k = r.parent_item_id == null ? 'root' : String(r.parent_item_id);
+      kidsOf.set(k, [...(kidsOf.get(k) ?? []), r]);
+    }
+
+    const idMap = new Map();       // old id -> new id
+    let created = 0;
+
+    const copy = async (row, newParentId) => {
+      const [ins] = await conn.query(
+        `INSERT INTO fab_items
+           (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+            name, unit, qty, flow_id, procurement_type, node_kind, depth, is_leaf,
+            dim_unit, weight_unit)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [companyId, orderId, row.order_line_id, newParentId, row.catalog_item_id,
+          row.name, row.unit, row.qty, row.flow_id, row.procurement_type,
+          row.node_kind, row.depth, row.is_leaf, row.dim_unit, row.weight_unit],
+      );
+      idMap.set(Number(row.id), ins.insertId);
+      created += 1;
+      for (const kid of kidsOf.get(String(row.id)) ?? []) await copy(kid, ins.insertId);
+      return ins.insertId;
+    };
+
+    const newRootId = await copy(root, root.parent_item_id);
+
+    /*
+     * Field values, in one statement per source row rather than a read and a
+     * write each. `uq_ffv_target` is unique on (company, field, scope, scope_id)
+     * and the copies have ids nothing has ever used, so there is nothing to
+     * collide with.
+     */
+    const oldIds = [...idMap.keys()];
+    if (oldIds.length) {
+      const [vals] = await conn.query(
+        `SELECT field_id, scope_id, value_num, value_text, value_date, unit_code
+           FROM fab_field_values
+          WHERE company_id = ? AND scope = 'order_item' AND scope_id IN (?)
+            AND deleted_at IS NULL`,
+        [companyId, oldIds],
+      );
+      if (vals.length) {
+        await conn.query(
+          `INSERT INTO fab_field_values
+             (company_id, field_id, scope, scope_id, value_num, value_text, value_date, unit_code, created_at)
+           VALUES ?`,
+          [vals.map((v) => [companyId, v.field_id, 'order_item', idMap.get(Number(v.scope_id)),
+            v.value_num, v.value_text, v.value_date, v.unit_code, new Date()])],
+        );
+      }
+    }
+
+    if (owned) await conn.commit();
+    return { created, newRootItemId: newRootId };
+  } catch (err) {
+    if (owned) await conn.rollback();
+    throw err;
+  } finally {
+    if (owned) conn.release();
+  }
+}
