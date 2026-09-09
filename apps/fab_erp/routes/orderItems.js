@@ -17,6 +17,7 @@ import multer from 'multer';
 import path from 'path';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
+import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { demandFor } from '../services/partIdentityService.js';
 import { duplicateSubtree } from '../services/bomService.js';
@@ -135,6 +136,56 @@ router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage
  * Two routes rather than one `:scope(lines|items)` — Express 5 uses
  * path-to-regexp v8, which dropped inline patterns and throws at mount time.
  */
+/**
+ * GET /steel-options — the material and grade values that actually exist.
+ *
+ * Both were free text on the order line, and that is a correctness problem now
+ * rather than a tidiness one: a BLANK's identity is material + grade + size, so
+ * "E350 BO", "E350BO" and "e350 bo" would mint three catalog items for one piece
+ * of steel. The list is short and real — read off the raw materials somebody
+ * can actually buy — so there is no reason to let anyone type a fourth spelling.
+ *
+ * Grades come back PER MATERIAL, not as one flat list. Today every grade pairs
+ * with MS and the distinction is invisible; the first time a second material
+ * arrives it stops being.
+ */
+router.get('/steel-options', protect, async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const [rows] = await pool.query(
+      `SELECT mat.value_text AS material, gr.value_text AS grade, COUNT(*) AS items
+         FROM fab_item_catalog ci
+         JOIN fab_item_categories k
+               ON k.id = ci.category_id AND k.name = 'Raw Materials' AND k.deleted_at IS NULL
+         JOIN fab_field_values mat
+               ON mat.company_id = ci.company_id AND mat.scope = 'catalog_item'
+              AND mat.scope_id = ci.id AND mat.deleted_at IS NULL
+         JOIN fab_fields fm ON fm.id = mat.field_id AND fm.field_key = 'material'
+         JOIN fab_field_values gr
+               ON gr.company_id = ci.company_id AND gr.scope = 'catalog_item'
+              AND gr.scope_id = ci.id AND gr.deleted_at IS NULL
+         JOIN fab_fields fg ON fg.id = gr.field_id AND fg.field_key = 'grade'
+        WHERE ci.company_id = ? AND ci.deleted_at IS NULL
+          AND mat.value_text <> '' AND gr.value_text <> ''
+        GROUP BY mat.value_text, gr.value_text
+        ORDER BY items DESC`,
+      [cid],
+    );
+    const byMaterial = {};
+    for (const r of rows) {
+      byMaterial[r.material] = [...(byMaterial[r.material] ?? []), r.grade];
+    }
+    res.json({
+      materials: Object.keys(byMaterial).sort(),
+      grades: [...new Set(rows.map((r) => r.grade))].sort(),
+      byMaterial,
+    });
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: steel options failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.get('/spec/lines/:id', protect, getItemSpecHandler('lines'));
 router.get('/spec/items/:id', protect, getItemSpecHandler('items'));
 router.post('/spec/lines/:id', protect, requirePerm('fab_erp_projects_manage'), setItemSpecHandler('lines'));
