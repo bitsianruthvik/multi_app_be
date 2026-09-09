@@ -1029,8 +1029,21 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     }
 
     const [kinds] = await conn.query(
-      'SELECT id, unit FROM fab_item_catalog WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+      `SELECT id, unit, procurement_type FROM fab_item_catalog
+        WHERE company_id = ? AND deleted_at IS NULL`, [companyId]);
     const unitOf = new Map(kinds.map((k) => [Number(k.id), k.unit]));
+    /*
+     * MAKE OR BUY COMES FROM THE CATALOG, not from a constant.
+     *
+     * This wrote 'make' for every row, which is right for 31 rows of a span and
+     * wrong for the 32nd: a headed shear stud arrives on a lorry. Marked 'make'
+     * it would be handed to the shop as 7,212 things to manufacture, and it
+     * would be offered to nesting as something to cut out of plate.
+     *
+     * The catalog answers for anything bound to it; a row bound to nothing is
+     * made here, which is the same rule the importer used.
+     */
+    const procurementOf = new Map(kinds.map((k) => [Number(k.id), k.procurement_type]));
 
     let created = 0;
     const byDepth = {};
@@ -1065,11 +1078,13 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
-         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,'make',?)`,
+         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?)`,
         [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
           node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
           Number(node.qty) > 0 ? Number(node.qty) : 1,
-          depth, kids.length ? 0 : 1, node.defaultFlowId ?? null]);
+          depth, kids.length ? 0 : 1,
+          procurementOf.get(Number(node.catalogItemId)) ?? 'make',
+          node.defaultFlowId ?? null]);
       created++;
       byDepth[depth] = (byDepth[depth] ?? 0) + 1;
 
