@@ -7,10 +7,29 @@
  * cutting order, drawn down by assemblies.
  *
  * WHAT THIS WRITES
- *   - a `Blanks` group under the `Fabricated` category
- *   - a subgroup per material+grade, mirroring `Raw Materials > Plates > MS E350 BO`
- *   - one catalog item per distinct blank, with its size as FIELDS
+ *   - a `Blanks` group under `Raw Materials`
+ *   - a subgroup named after the ORDER
+ *   - one catalog item per distinct blank on that order, with its size as FIELDS
  *   - `fab_items.blank_catalog_item_id` on every part row that has one
+ *
+ * ── WHY UNDER RAW MATERIALS, AND SCOPED TO THE ORDER ─────────────────────────
+ *
+ * The first attempt filed blanks in a shared namespace, as though a
+ * 12 x 170 x 2995 rectangle were a reusable type. It is not. This span has 25
+ * distinct shapes and only SIX distinct thicknesses: thickness and grade recur
+ * across jobs, the rectangle comes off one drawing and dies with the order.
+ * Filed that way the catalog gains ~25 permanently dead items per order and
+ * every picker in the app fills with them.
+ *
+ * Scoped to the order, the catalog grows with LIVE work rather than with
+ * history — retire the order and its subgroup goes with it.
+ *
+ * Under Raw Materials because that is where the hiding already is. Every item
+ * picker excludes that category today, so a blank is invisible to the people who
+ * should never pick one from the day it is created, with no new filtering rule
+ * for anyone to forget. It also reads true: a blank IS the raw material of the
+ * assembly that consumes it, and nesting already looks in Raw Materials for the
+ * stock it cuts from.
  *
  * NOTHING READS ANY OF IT YET. That is the point of slice 0: the grouping is
  * proved and inspectable before a single consumer depends on it, so being wrong
@@ -93,6 +112,11 @@ try {
    * part first and falling back to the line keeps a part that overrides its
    * line honest, without requiring 1,090 rows to repeat the same two words.
    */
+  const [[ord]] = await conn.query(
+    `SELECT order_number FROM fab_orders WHERE company_id=? AND id=?`, [COMPANY, ORDER]);
+  if (!ord) throw new Error(`Order ${ORDER} not found.`);
+  const orderNumber = ord.order_number;
+
   const [[lineSpec]] = await conn.query(
     `SELECT MAX(CASE WHEN f.field_key='material' THEN v.value_text END) AS material,
             MAX(CASE WHEN f.field_key='grade'    THEN v.value_text END) AS grade
@@ -148,8 +172,18 @@ try {
   }
 
   const num = (n) => (Number.isInteger(n) ? String(n) : String(n).replace(/0+$/, '').replace(/\.$/, ''));
-  const nameOf = (b) => `${b.material} Blank ${num(b.thk)} x ${num(b.wid)} x ${num(b.len)} ${b.grade}`;
-  const codeOf = (b) => `BLK-${b.material}-${b.grade.replace(/\s+/g, '')}-${num(b.thk)}x${num(b.wid)}x${num(b.len)}`
+  /*
+   * THE ORDER IS IN BOTH THE NAME AND THE CODE, and it has to be.
+   *
+   * `uq_fic2_company_name_active` is UNIQUE on the name and
+   * `uq_fic2_company_code_active` on the code, both company-wide. Two orders
+   * needing the same rectangle would collide on each without it — and they
+   * SHOULD be two items anyway, because a blank cut for one job is not the
+   * other job's steel to take.
+   */
+  const shape = (b) => `${num(b.thk)} x ${num(b.wid)} x ${num(b.len)}`;
+  const nameOf = (b) => `${b.material} Blank ${shape(b)} ${b.grade} — ${orderNumber}`;
+  const codeOf = (b) => `BLK-${orderNumber}-${b.material}-${b.grade.replace(/\s+/g, '')}-${shape(b).replace(/ /g, '')}`
     .toUpperCase();
 
   say(`Order ${ORDER} — ${parts.length} part row(s): ${parts.length - noDims.length} sized, ${noDims.length} without dimensions.`);
@@ -157,46 +191,51 @@ try {
   say();
 
   // ── the group and its subgroups ───────────────────────────────────────────
-  const [[fabCat]] = await conn.query(
-    `SELECT id FROM fab_item_categories WHERE company_id=? AND name='Fabricated' AND deleted_at IS NULL`,
+  const [[rmCat]] = await conn.query(
+    `SELECT id FROM fab_item_categories WHERE company_id=? AND name='Raw Materials' AND deleted_at IS NULL`,
     [COMPANY],
   );
-  if (!fabCat) throw new Error('No "Fabricated" category — nothing to hang blanks off.');
+  if (!rmCat) throw new Error('No "Raw Materials" category — nothing to hang blanks off.');
 
   let [[grp]] = await conn.query(
     `SELECT id FROM fab_item_groups WHERE company_id=? AND category_id=? AND name='Blanks' AND deleted_at IS NULL`,
-    [COMPANY, fabCat.id],
+    [COMPANY, rmCat.id],
   );
   if (!grp) {
-    plan('create group  Fabricated > Blanks');
+    plan('create group  Raw Materials > Blanks');
     if (APPLY) {
       const [r] = await conn.query(
         `INSERT INTO fab_item_groups (company_id, category_id, name, code, description, created_at)
          VALUES (?,?,?,?,?,NOW())`,
-        [COMPANY, fabCat.id, 'Blanks', 'blanks',
-          'Cut pieces, identified by material + grade + size. One per lot; assemblies draw from them.'],
+        [COMPANY, rmCat.id, 'Blanks', 'blanks',
+          'Cut pieces, one subgroup per order. The lot a cutting order makes and assemblies draw from.'],
       );
       grp = { id: r.insertId };
     } else grp = { id: 0 };
-  } else say(`group  Fabricated > Blanks  exists (${grp.id})`);
+  } else say(`group  Raw Materials > Blanks  exists (${grp.id})`);
 
-  const subgroupIds = new Map();
-  for (const b of blanks.values()) {
-    const sgName = `${b.material} ${b.grade}`;
-    if (subgroupIds.has(sgName)) continue;
+  /*
+   * ONE SUBGROUP PER ORDER, and it is the whole reason this is not catalog bloat.
+   * Retire the order and its subgroup goes with it, so the catalog grows with
+   * LIVE work rather than with history.
+   */
+  let subgroupId = 0;
+  {
     const [[sg]] = await conn.query(
       `SELECT id FROM fab_item_subgroups WHERE company_id=? AND group_id=? AND name=? AND deleted_at IS NULL`,
-      [COMPANY, grp.id, sgName],
+      [COMPANY, grp.id, orderNumber],
     );
-    if (sg) { subgroupIds.set(sgName, sg.id); say(`subgroup  ${sgName}  exists (${sg.id})`); continue; }
-    plan(`create subgroup  Blanks > ${sgName}`);
-    if (APPLY) {
-      const [r] = await conn.query(
-        `INSERT INTO fab_item_subgroups (company_id, group_id, name, code, created_at) VALUES (?,?,?,?,NOW())`,
-        [COMPANY, grp.id, sgName, sgName.toLowerCase().replace(/\s+/g, '-')],
-      );
-      subgroupIds.set(sgName, r.insertId);
-    } else subgroupIds.set(sgName, 0);
+    if (sg) { subgroupId = sg.id; say(`subgroup  Blanks > ${orderNumber}  exists (${sg.id})`); }
+    else {
+      plan(`create subgroup  Blanks > ${orderNumber}`);
+      if (APPLY) {
+        const [r] = await conn.query(
+          `INSERT INTO fab_item_subgroups (company_id, group_id, name, code, created_at) VALUES (?,?,?,?,NOW())`,
+          [COMPANY, grp.id, orderNumber, orderNumber.toLowerCase()],
+        );
+        subgroupId = r.insertId;
+      }
+    }
   }
   say();
 
@@ -249,7 +288,7 @@ try {
            VALUES (?,?,?,'nos',?,?,?,?, 'make', ?, 'blank', NOW())`,
           [COMPANY, name, code,
             'Cut blank. Made by a cutting order from plate; assemblies draw from the lot.',
-            fabCat.id, grp.id, subgroupIds.get(`${b.material} ${b.grade}`), b.thk],
+            rmCat.id, grp.id, subgroupId, b.thk],
         );
         item = { id: r.insertId };
       } else item = { id: 0 };
