@@ -664,7 +664,7 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     });
   };
 
-  return {
+  const tree = {
     key: 'root',
     catalogItemId: Number(root.id),
     name: root.name,
@@ -675,8 +675,44 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     defaultFlowId: null,
     bomLineId: null,
     qtyParam: null,
+    dims: {},
     children: build(Number(root.id), 0, new Set([Number(root.id)])),
   };
+
+  /*
+   * SIZES THE RECIPE STATES, attached to the nodes that came from a line.
+   *
+   * One query for the whole tree rather than one per node — a span walks 32
+   * lines and a deeper template many more. Nodes with no size get {}, which the
+   * editor renders as empty boxes to fill in rather than as nothing to fill.
+   */
+  const lineIds = [];
+  const collect = (n) => { if (n.bomLineId) lineIds.push(Number(n.bomLineId)); (n.children ?? []).forEach(collect); };
+  collect(tree);
+  if (lineIds.length) {
+    const [vals] = await exec.query(
+      `SELECT v.scope_id AS lineId, f.field_key AS k, v.value_num AS n
+         FROM fab_field_values v
+         JOIN fab_fields f ON f.id = v.field_id
+        WHERE v.company_id = ? AND v.scope = 'bom_line' AND v.scope_id IN (?)
+          AND v.deleted_at IS NULL
+          AND f.field_key IN ('thickness_mm','width_mm','length_mm')`,
+      [companyId, lineIds],
+    );
+    const byLine = new Map();
+    for (const v of vals) {
+      const e = byLine.get(Number(v.lineId)) ?? {};
+      e[v.k] = v.n == null ? null : Number(v.n);
+      byLine.set(Number(v.lineId), e);
+    }
+    const attach = (n) => {
+      n.dims = n.bomLineId ? (byLine.get(Number(n.bomLineId)) ?? {}) : {};
+      (n.children ?? []).forEach(attach);
+    };
+    attach(tree);
+  }
+
+  return tree;
 }
 
 /** Flatten an expanded tree into rows, parents before children. */
@@ -1454,7 +1490,33 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
   // One line, one top. Several roots means the order has several lines and the
   // caller did not say which — answer with the first rather than inventing a
   // parent that is not in the data.
-  return build(roots[0]);
+  const tree = build(roots[0]);
+
+  /*
+   * The sizes this order actually states, so the editor can show and change them
+   * beside the row they belong to. One query, not one per node.
+   */
+  const [vals] = await exec.query(
+    `SELECT v.scope_id AS itemId, f.field_key AS k, v.value_num AS n
+       FROM fab_field_values v
+       JOIN fab_fields f ON f.id = v.field_id
+      WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
+        AND v.deleted_at IS NULL
+        AND f.field_key IN ('thickness_mm','width_mm','length_mm')`,
+    [companyId, rows.map((r) => r.id)],
+  );
+  const byItem = new Map();
+  for (const v of vals) {
+    const e = byItem.get(Number(v.itemId)) ?? {};
+    e[v.k] = v.n == null ? null : Number(v.n);
+    byItem.set(Number(v.itemId), e);
+  }
+  const attach = (n) => {
+    n.dims = byItem.get(Number(n.itemId)) ?? {};
+    (n.children ?? []).forEach(attach);
+  };
+  attach(tree);
+  return tree;
 }
 
 /**
@@ -1505,6 +1567,8 @@ export async function applyTree(companyId, spec, existingConn = null) {
     const seen = new Set();
     let created = 0;
     let updated = 0;
+    /** (item id, field key, value|null) for every size the tree carried. */
+    const dimEdits = [];
 
     const walk = async (node, parentItemId, depth) => {
       const kids = Array.isArray(node.children) ? node.children : [];
@@ -1546,11 +1610,55 @@ export async function applyTree(companyId, spec, existingConn = null) {
         created += 1;
       }
 
+      /*
+       * Sizes come back with the tree, because the editor now shows them on the
+       * row they belong to. A key present and blank CLEARS: "this part no longer
+       * states a length" has to be sayable, or a wrong number could never be
+       * withdrawn from the row it was typed on.
+       */
+      if (node.dims && typeof node.dims === 'object') {
+        for (const [k, v] of Object.entries(node.dims)) {
+          dimEdits.push([id, k, v === '' || v == null ? null : Number(v)]);
+        }
+      }
+
       for (const kid of kids) await walk(kid, id, depth + 1);
       return id;
     };
 
     await walk(tree, null, 0);
+
+    if (dimEdits.length) {
+      const keys = [...new Set(dimEdits.map(([, k]) => k))];
+      const [fdefs] = await conn.query(
+        `SELECT id, field_key, default_unit FROM fab_fields
+          WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
+        [companyId, keys],
+      );
+      const fieldOf = new Map(fdefs.map((f) => [f.field_key, f]));
+      for (const [itemId, key, value] of dimEdits) {
+        const f = fieldOf.get(key);
+        if (!f) continue;
+        if (value == null || !Number.isFinite(value)) {
+          await conn.query(
+            `UPDATE fab_field_values SET deleted_at = NOW()
+              WHERE company_id = ? AND field_id = ? AND scope = 'order_item' AND scope_id = ?
+                AND deleted_at IS NULL`,
+            [companyId, f.id, itemId],
+          );
+          continue;
+        }
+        await conn.query(
+          `INSERT INTO fab_field_values
+             (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
+           VALUES (?,?,'order_item',?,?,?,NOW())
+           ON DUPLICATE KEY UPDATE value_num = VALUES(value_num), deleted_at = NULL`,
+          [companyId, f.id, itemId, value, f.default_unit ?? null],
+        );
+      }
+      // Weight and area are arithmetic on what just changed.
+      await recomputeDerived(companyId, [...new Set(dimEdits.map(([id]) => id))], conn);
+    }
 
     const gone = existing.map((r) => Number(r.id)).filter((id) => !seen.has(id));
     if (gone.length) {
@@ -1587,7 +1695,7 @@ export async function applyTree(companyId, spec, existingConn = null) {
     }
 
     if (owned) await conn.commit();
-    return { created, updated, removed: gone.length };
+    return { created, updated, removed: gone.length, sized: dimEdits.length };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;
