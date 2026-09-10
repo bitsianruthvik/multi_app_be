@@ -22,6 +22,7 @@ import os from 'os';
 import path from 'path';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
+import { recomputeDerived, isDerived } from './fieldDeriveService.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
 import { fieldRegistry, resolveFields, setFields } from './fieldService.js';
 import { peerSets } from './similarityService.js';
@@ -97,7 +98,19 @@ export async function parameterGrid(companyId, orderId, conn = null) {
   for (const it of items) {
     for (const k of requiredByFlow.get(Number(it.flowId)) ?? []) needed.add(k);
   }
+  /*
+   * DERIVED FIELDS GET NO COLUMN.
+   *
+   * Weight and area are arithmetic on the rectangle — checked against 1,062
+   * real parts, every one agreed with the formula — so asking for them is
+   * asking somebody to compute by hand what the row already knows, and every
+   * answer is a chance for the two to disagree. They are still WRITTEN, because
+   * an assembly rolls them up with `inputs.sum(unit_weight_kg)` and the engine's
+   * aggregate takes a field name rather than an expression. Computed, stored,
+   * never asked for.
+   */
   const columns = [...needed]
+    .filter((k) => !isDerived(k))
     .map((k) => defByKey.get(k))
     .filter(Boolean)
     .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.fieldKey.localeCompare(b.fieldKey));
@@ -183,8 +196,19 @@ export async function setParameters(companyId, orderId, edits, existingConn = nu
       for (const r of res.rejected) rejected.push({ itemId, ...r });
       touched.add(itemId);
     }
+
+    /*
+     * The derived values follow immediately, in the same transaction.
+     *
+     * Weight and area are arithmetic on the rectangle, so a dimension saved
+     * without them recomputed leaves two numbers on one row disagreeing — and
+     * the crane and blasting formulas would plan against the stale one until
+     * somebody happened to press something else.
+     */
+    const derived = await recomputeDerived(companyId, [...touched], conn);
+
     if (owned) await conn.commit();
-    return { written, itemsTouched: touched.size, rejected };
+    return { written, itemsTouched: touched.size, rejected, derived };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

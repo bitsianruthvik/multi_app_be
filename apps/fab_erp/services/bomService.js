@@ -24,6 +24,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { recomputeDerived } from './fieldDeriveService.js';
 
 /** A BOM deep enough to hit this is a cycle or a mistake, not a real structure. */
 const MAX_DEPTH = 16;
@@ -1215,6 +1216,12 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
           );
         }
         seeded = rows.length;
+        /*
+         * A recipe that stated a size has just given every row one, so the
+         * numbers computed from it are computed now rather than waiting for
+         * somebody to open Parameters and save something.
+         */
+        await recomputeDerived(companyId, [...new Set(fromBomLine.map(([, itemId]) => itemId))], conn);
       }
     }
 
