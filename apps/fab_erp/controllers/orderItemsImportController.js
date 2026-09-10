@@ -744,7 +744,8 @@ export const orderWeightSummaryHandler = async (req, res) => {
 export const parameterGridHandler = async (req, res) => {
   try {
     const cid = companyId(req);
-    res.json(await parameterGrid(cid, Number(req.params.orderId)));
+    // `only` picks the step: the rectangle before nesting, everything else after.
+    res.json(await parameterGrid(cid, Number(req.params.orderId), null, { only: req.query.only }));
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
     logger.error({ err }, 'fab_erp: parameterGrid failed');

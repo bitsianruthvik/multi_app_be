@@ -22,7 +22,7 @@ import os from 'os';
 import path from 'path';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
-import { recomputeDerived, isDerived } from './fieldDeriveService.js';
+import { recomputeDerived, isDerived, isDimension } from './fieldDeriveService.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
 import { fieldRegistry, resolveFields, setFields } from './fieldService.js';
 import { peerSets } from './similarityService.js';
@@ -34,7 +34,19 @@ const SHEET = 'Parameters';
  *
  * @returns {Promise<{columns, rows, groupedAway:number}>}
  */
-export async function parameterGrid(companyId, orderId, conn = null) {
+export async function parameterGrid(companyId, orderId, conn = null, opts = {}) {
+  /**
+   * `only` splits one grid between two steps.
+   *
+   *   'dims'  the rectangle — asked before nesting, which needs nothing else
+   *   'rest'  hole counts and weld runs — asked after
+   *
+   * Filtered here rather than in the browser so the "N of N missing" under each
+   * step counts the same set the columns show. A client-side filter would have
+   * left the Dimensions step reporting parts short because of a weld run.
+   */
+  const only = opts.only === 'dims' || opts.only === 'rest' ? opts.only : null;
+  const wanted = (k) => !only || (only === 'dims' ? isDimension(k) : !isDimension(k));
   const exec = conn ?? pool;
 
   const readiness = await missingFieldsForOrder(companyId, orderId, exec);
@@ -110,7 +122,7 @@ export async function parameterGrid(companyId, orderId, conn = null) {
    * never asked for.
    */
   const columns = [...needed]
-    .filter((k) => !isDerived(k))
+    .filter((k) => !isDerived(k) && wanted(k))
     .map((k) => defByKey.get(k))
     .filter(Boolean)
     .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.fieldKey.localeCompare(b.fieldKey));
@@ -131,7 +143,9 @@ export async function parameterGrid(companyId, orderId, conn = null) {
       flowId: it.flowId,
       /** How many real parts this row writes to. 1 unless it leads a peer set. */
       represents: peers ? peers.length : 1,
-      required: [...required],
+      // Narrowed to the step's own set too, so a cell the step does not show is
+      // not counted as one this row still owes.
+      required: [...required].filter((k) => !isDerived(k) && wanted(k)),
       values: Object.fromEntries(
         [...required].map((k) => [k, resolved.get(`order_item:${it.id}`)?.[k]?.value ?? null]),
       ),

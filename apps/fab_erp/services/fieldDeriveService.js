@@ -68,6 +68,16 @@ export const DERIVED = {
 export const isDerived = (fieldKey) => Object.prototype.hasOwnProperty.call(DERIVED, fieldKey);
 
 /**
+ * The rectangle. Asked for on its own step, BEFORE nesting.
+ *
+ * Nesting needs the size and the steel and nothing else — it never reads a
+ * flow — so making it wait behind hole counts and weld runs delayed the one
+ * step with a lead time on it. Everything else a flow asks for comes after.
+ */
+export const DIMENSIONS = ['length_mm', 'width_mm', 'thickness_mm'];
+export const isDimension = (fieldKey) => DIMENSIONS.includes(fieldKey);
+
+/**
  * Recompute the derived fields for some order items.
  *
  * ONLY WHERE THE INPUTS ARE ALL PRESENT. A part with no width has no area, and

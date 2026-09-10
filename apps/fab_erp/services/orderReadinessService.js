@@ -33,6 +33,7 @@
 
 import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
+import { isDimension } from './fieldDeriveService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder, onOrderByItem } from './procurementOrderService.js';
 import { orderStageApplicability } from './stageApplicabilityService.js';
@@ -63,12 +64,18 @@ import { logger } from '../../../core/utils/logger.js';
  *   (`itemFieldService.requiredFieldsForFlow`) — so the flow has to be known
  *   first, or the sheet is guessing at columns.
  *
- * Now: structure → flows → parameters → nesting. Flows need only the codes, and
- * `fab_flow_rules` maps (structure type, level, code suffix) → flow, so that
- * step is normally a button press. Parameters then asks for exactly the fields
- * those flows demand. Nesting last, because it needs the dimensions.
+ * Now: structure → flows → DIMENSIONS → nesting → other params.
+ *
+ * Parameters used to be one step and sat before nesting whole, which made the
+ * step with the longest lead time — you cannot order steel until it is nested —
+ * wait behind hole counts and weld runs. Nesting reads neither. It reads the
+ * rectangle and the steel, and nothing else: it never touches a flow.
+ *
+ * So the rectangle is asked for on its own, nesting follows it immediately, and
+ * everything else a flow demands comes after. Flows stay where they are: they
+ * need nothing, and the BOM has usually answered them already.
  */
-export const STAGE_KEYS = ['lines', 'boq', 'flows', 'params', 'nesting', 'tasks', 'procurement', 'production'];
+export const STAGE_KEYS = ['lines', 'boq', 'flows', 'dims', 'nesting', 'params', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -268,6 +275,21 @@ export async function orderReadiness(companyId, orderId) {
       itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], unusableFields: [], noFormula: [],
     })),
   ]);
+
+  /*
+   * ONE ANALYSIS, TWO STAGES. `missingValues` lists what each part is short of;
+   * splitting it by whether the field is a dimension is what lets the rectangle
+   * be asked for before nesting and everything else after, without running the
+   * whole field walk twice.
+   *
+   * A part short of BOTH counts against both, which is right: it is genuinely
+   * not finished on either step.
+   */
+  const shortOnDims = fields.missingValues
+    .filter((m) => m.missing.some(isDimension)).length;
+  const shortOnRest = fields.missingValues
+    .filter((m) => m.missing.some((k) => !isDimension(k))).length;
+
   const stages = [
     {
       key: 'lines',
@@ -292,11 +314,15 @@ export async function orderReadiness(companyId, orderId) {
       state: tree.parts > 0 ? 'done' : tree.total > 0 ? 'partial' : 'todo',
       count: tree.total,
       total: tree.total,
-      // Reads "2 Span · 8 Girder · 174 Segment · 1084 Top Flange" — every rung
-      // the order actually has, named by what is on it.
+      // Reads "4 levels · 32 rows". It used to name each rung and count it —
+      // "2 Span · 8 Girder · 174 Segment" — which was true when a row was a
+      // piece. One row per design broke the wording, not the number: "5 Line"
+      // now means five rows at the Line level, one of which is a Line of
+      // quantity 6, and it reads as five Lines. The count that survives the
+      // change is how deep the tree goes and how many rows are in it.
       detail: tree.total === 0
         ? 'No structure entered'
-        : tree.levels.map((l) => `${l.count} ${l.label}`).join(' · '),
+        : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
     },
     {
       key: 'flows',
@@ -315,13 +341,39 @@ export async function orderReadiness(companyId, orderId) {
        * every date computed from it is fiction. This is the stage that makes
        * that visible before the production order freezes it.
        */
-      key: 'params',
-      label: 'Parameters',
+      /**
+       * THE RECTANGLE, ON ITS OWN, BEFORE NESTING.
+       *
+       * Nesting reads the size and the steel and nothing else — it never
+       * touches a flow — so it used to wait behind hole counts and weld runs
+       * for no reason, and nesting is the step with a lead time on it: nothing
+       * can be ordered until it is done.
+       */
+      key: 'dims',
+      label: 'Dimensions',
       state: fields.itemsChecked === 0 ? 'todo'
-        : (fields.itemsShort > 0
+        : shortOnDims > 0 ? 'partial' : 'done',
+      count: fields.itemsChecked - shortOnDims,
+      total: fields.itemsChecked,
+      detail: fields.itemsChecked === 0
+        ? 'Assign flows first — they decide which parts need a size'
+        : shortOnDims > 0
+          ? `${shortOnDims} of ${fields.itemsChecked} part(s) have no size yet`
+          : `All ${fields.itemsChecked} part(s) are sized`,
+    },
+    {
+      /**
+       * Everything a flow asks for that is NOT the rectangle — hole counts,
+       * weld runs. Weight and area are absent on purpose: they are arithmetic
+       * on the rectangle and are computed, never asked for.
+       */
+      key: 'params',
+      label: 'Other params',
+      state: fields.itemsChecked === 0 ? 'todo'
+        : (shortOnRest > 0
           || fields.unknownFields.length > 0
           || (fields.unusableFields?.length ?? 0) > 0) ? 'partial' : 'done',
-      count: fields.itemsChecked - fields.itemsShort,
+      count: fields.itemsChecked - shortOnRest,
       total: fields.itemsChecked,
       detail: fields.itemsChecked === 0
         ? 'Assign flows first — they decide which values are needed'
@@ -329,8 +381,8 @@ export async function orderReadiness(companyId, orderId) {
           ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
           : (fields.unusableFields?.length ?? 0) > 0
             ? `${fields.unusableFields.length} operation(s) use a field that is not set up for formulas`
-            : fields.itemsShort > 0
-              ? `${fields.itemsShort} of ${fields.itemsChecked} part(s) missing values`
+            : shortOnRest > 0
+              ? `${shortOnRest} of ${fields.itemsChecked} part(s) missing values`
               : `All ${fields.itemsChecked} part(s) have what their operations need`,
     },
     {
