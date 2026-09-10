@@ -5,13 +5,11 @@ import {
   exportBoqSheet, importBoqSheet, buildWizardRows, applyWizardRows,
 } from '../services/boqSheetService.js';
 import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
-import { flowSummary, syncFlowsFromBom, setItemFlow } from '../services/orderFlowService.js';
 import { setFields } from '../services/fieldService.js';
 import { deleteSalesOrder } from '../services/orderDeleteService.js';
 import {
   parameterGrid, setParameters, exportParameters, importParameters,
 } from '../services/orderParametersService.js';
-import { markSimilar, groupsForOrder, groupableItems } from '../services/similarityService.js';
 import fs from 'fs';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
 import { suggestNesting, acceptSuggestion } from '../services/nestingSuggestService.js';
@@ -198,48 +196,8 @@ export const importNestingHandler = async (req, res) => {
   }
 };
 
-/** GET — where flow allocation stands, and what applying the rules would do. */
-export const flowSummaryHandler = async (req, res) => {
-  try {
-    res.json(await flowSummary(companyId(req), Number(req.params.orderId)));
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: flowSummary failed');
-    res.status(500).json({ message: err.message });
-  }
-};
 
-/** POST — apply the flow rules. `reassign` also overwrites existing choices. */
-export const syncFlowsFromBomHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const reassign = req.body?.reassign === true;
-    const result = await syncFlowsFromBom(cid, orderId, { reassign });
-    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: syncFlowsFromBom failed');
-    res.status(500).json({ message: err.message });
-  }
-};
 
-/** POST — set one item's flow by hand. The exception path. */
-export const setItemFlowHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const flowId = req.body?.flowId ?? null;
-    const result = await setItemFlow(cid, Number(req.params.itemId), flowId);
-    res.json({
-      ...result,
-      readiness: result.orderId ? await refreshOrderStage(cid, result.orderId) : null,
-    });
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: setItemFlow failed');
-    res.status(500).json({ message: err.message });
-  }
-};
 
 /**
  * POST — set WHAT THE STEEL IS, on an order line or on one part.
@@ -797,34 +755,7 @@ export const importParametersHandler = async (req, res) => {
   }
 };
 
-export const similarGroupsHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const [groups, candidates] = await Promise.all([
-      groupsForOrder(cid, orderId), groupableItems(cid, orderId),
-    ]);
-    res.json({ groups, candidates });
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: similarGroups failed');
-    res.status(500).json({ message: err.message });
-  }
-};
 
-/** POST — mark a set of girders or segments as copies of each other. */
-export const markSimilarHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const { itemIds, groupKey } = req.body ?? {};
-    const result = await markSimilar(cid, orderId, itemIds, groupKey ?? null);
-    res.json({ ...result, groups: await groupsForOrder(cid, orderId) });
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: markSimilar failed');
-    res.status(500).json({ message: err.message });
-  }
-};
 
 /**
  * DELETE — a sales order and the tree that exists only because of it.

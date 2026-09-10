@@ -34,9 +34,6 @@ import {
   orderNestingHandler,
   exportNestingHandler,
   importNestingHandler,
-  flowSummaryHandler,
-  syncFlowsFromBomHandler,
-  setItemFlowHandler,
   setItemSpecHandler,
   getItemSpecHandler,
   deleteOrderHandler,
@@ -44,8 +41,6 @@ import {
   exportParametersHandler,
   importParametersHandler,
   setParametersHandler,
-  similarGroupsHandler,
-  markSimilarHandler,
   orderReadinessHandler,
   confirmOrderHandler,
   nestingBoardHandler,
@@ -202,9 +197,6 @@ router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_proje
   });
 
 // ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
-router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);
-router.post('/orders/:orderId/flows/apply', protect, requirePerm('fab_erp_projects_manage'), syncFlowsFromBomHandler);
-router.post('/items/:itemId/flow', protect, requirePerm('fab_erp_projects_manage'), setItemFlowHandler);
 
 /**
  * WHAT THE STEEL IS — material, grade, thickness — on a line or on one part.
@@ -290,8 +282,6 @@ router.post('/orders/:orderId/parameters', protect, requirePerm('fab_erp_project
 
 // Marking girders or segments as copies of each other. One decision typed
 // once instead of thirty times.
-router.get('/orders/:orderId/similar', protect, similarGroupsHandler);
-router.post('/orders/:orderId/similar', protect, requirePerm('fab_erp_projects_manage'), markSimilarHandler);
 
 // ── The wizard: where the order stands, and the act that ends it (2026-08) ──
 // Readiness is read-only, so it is gated on view, not manage.

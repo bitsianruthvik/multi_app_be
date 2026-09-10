@@ -97,7 +97,22 @@ import { logger } from '../../../core/utils/logger.js';
  * as ANY item has a flow. Tightening that is a separate decision with its own
  * consequence: orders that confirm today would stop confirming.
  */
-export const STAGE_KEYS = ['lines', 'boq', 'nesting', 'params', 'tasks', 'procurement', 'production'];
+/*
+ * 'boq' IS GONE TOO — a line and its BOM are one screen now.
+ *
+ * They were two steps, and the second one was quietly wrong: it rendered the
+ * structure for the FIRST line and nothing else. An order with two lines showed
+ * two line items and one structure, and the second line's BOM was unreachable
+ * once built. Nobody noticed because the screen never claimed to be showing only
+ * one of them.
+ *
+ * A line and what it is made of are one thought. Asking on one screen and
+ * answering on another is what let the answer go missing.
+ *
+ * Both CHECKS survive, folded into 'lines' below: no lines, or a structure short
+ * of sizes, still holds the step open and Confirm shut.
+ */
+export const STAGE_KEYS = ['lines', 'nesting', 'params', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -315,58 +330,31 @@ export async function orderReadiness(companyId, orderId) {
   const stages = [
     {
       key: 'lines',
+      /**
+       * "Line items", and it owns the STRUCTURE as well.
+       *
+       * What the order sells, and what each of those is made of, on one screen —
+       * so the state has to answer for both. A line with no structure is not
+       * finished, and neither is a structure whose parts have no size.
+       */
       label: 'Line items',
-      state: lines.total === 0 ? 'todo' : 'done',
+      state: lines.total === 0 ? 'todo'
+        : (lines.withoutType > 0 || tree.total === 0
+           || tree.parts === 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial'
+        : 'done',
       count: lines.total,
       total: lines.total,
       detail: lines.total === 0
-        ? 'No line items yet'
+        ? 'Nothing sold yet'
         : lines.withoutType > 0
           ? `${lines.withoutType} line(s) have no structure type`
-          : `${lines.total} line(s)`,
-    },
-    {
-      key: 'boq',
-      /**
-       * "Structure", not "BOM", and it OWNS THE SIZES now.
-       *
-       * The rectangle had its own step for a while, because nesting needs it and
-       * needs nothing else. Then the sizes moved onto the structure tree itself,
-       * beside the row they belong to — at which point a separate step was a
-       * second screen asking about the screen you had just left.
-       *
-       * So the check stays and the step goes: a structure whose parts have no
-       * size is not finished, and this is where it says so and where it is
-       * fixed. Nesting still cannot start without them; it just hears about it
-       * one step earlier instead of on a step of its own.
-       */
-      label: 'Structure',
-      // Assemblies with nothing under them is a half-entered structure, not an
-      // empty one — the difference matters to someone deciding what to do next.
-      state: tree.total === 0 ? 'todo'
-        : (tree.parts === 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial' : 'done',
-      count: tree.total,
-      total: tree.total,
-      // Reads "4 levels · 32 rows". It used to name each rung and count it —
-      // "2 Span · 8 Girder · 174 Segment" — which was true when a row was a
-      // piece. One row per design broke the wording, not the number: "5 Line"
-      // now means five rows at the Line level, one of which is a Line of
-      // quantity 6, and it reads as five Lines. The count that survives the
-      // change is how deep the tree goes and how many rows are in it.
-      detail: tree.total === 0
-        ? 'No structure entered'
-        : shortOnDims > 0
-          ? `${tree.levels.length} levels · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
-          /*
-           * NOT "rows with no flow". A row is allowed to have none — plenty
-           * exist only to give the tree a level and the code a segment, and
-           * they build no tasks by design. What this counts is narrower and
-           * worth acting on: the BOM line states a flow and this order never
-           * received it, which is a dropped answer rather than an absent one.
-           */
-          : flowState.missing > 0
-            ? `${tree.levels.length} levels · ${tree.total} rows — ${flowState.missing} row(s) have not picked up the flow their BOM states`
-            : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
+          : tree.total === 0
+            ? `${lines.total} line(s) — no structure built yet`
+            : shortOnDims > 0
+              ? `${lines.total} line(s) · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
+              : flowState.missing > 0
+                ? `${lines.total} line(s) · ${tree.total} rows — ${flowState.missing} row(s) have not picked up the flow their BOM states`
+                : `${lines.total} line(s) · ${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} rows`,
     },
     {
       key: 'nesting',
@@ -784,7 +772,7 @@ function buildBlockers({ lines, tree, nest, flowState, tasks }) {
   }
   if (tree.parts === 0) {
     out.push({
-      stage: 'boq', count: 0,
+      stage: 'lines', count: 0,
       message: 'The BOQ has no parts, so there is nothing at the bottom of the tree to make.',
     });
   }
@@ -797,19 +785,19 @@ function buildBlockers({ lines, tree, nest, flowState, tasks }) {
   }
   if (flowState.wouldAssign > 0) {
     out.push({
-      stage: 'boq', count: flowState.wouldAssign,
+      stage: 'lines', count: flowState.wouldAssign,
       message: `${flowState.wouldAssign} item(s) have a flow on the BOM that this order never received. Set it on the row, on the Structure step.`,
     });
   }
   if (flowState.manual > 0) {
     out.push({
-      stage: 'boq', count: flowState.manual,
+      stage: 'lines', count: flowState.manual,
       message: `${flowState.manual} item(s) have no flow and no rule matches them. They will be skipped entirely — no tasks at all.`,
     });
   }
   if (flowState.withFlow === 0) {
     out.push({
-      stage: 'boq', count: 0,
+      stage: 'lines', count: 0,
       message: 'No row on this order has a flow, so building tasks would produce nothing. Set one on the Structure step.',
     });
   }
