@@ -188,7 +188,10 @@ router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_proje
       const cid = req.user?.companyId ?? req.user?.company_id;
       const orderId = Number(req.params.orderId);
       const read = await importPlan(cid, orderId, req.file.buffer);
-      const out = await acceptNestingPlan(cid, orderId, read.plan);
+      const out = await acceptNestingPlan(cid, orderId, {
+        ...read.plan,
+        provenance: `Uploaded from a spreadsheet — ${read.sheets} sheets, ${read.rows} rows`,
+      });
       return res.json({ ok: true, ...out, fromSheet: { rows: read.rows, sheets: read.sheets, short: read.short } });
     } catch (err) {
       logger.error({ err }, 'fab_erp: cutting plan import');

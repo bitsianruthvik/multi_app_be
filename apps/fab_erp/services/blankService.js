@@ -459,7 +459,7 @@ export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
     [mo.id, companyId, salesOrderId, mo.id],
   );
 
-  return { ...mo, created, tasksClaimed: claim?.affectedRows ?? 0 };
+  return { ...mo, sales, created, tasksClaimed: claim?.affectedRows ?? 0 };
 }
 
 /**
@@ -625,7 +625,18 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
       sheets += 1;
       const nestNo = n.nestNo ?? `N-${String(sheets).padStart(3, '0')}`;
 
+      /*
+       * MERGED HERE TOO, because a hand-made sheet can name the same blank on
+       * two rows just as easily as the packer can. One (blank, sheet) is one
+       * material row, and two of them collide on the unique code.
+       */
+      const items = new Map();
       for (const it of n.items) {
+        items.set(it.key, (items.get(it.key) ?? 0) + (Number(it.qty) || 0));
+      }
+
+      for (const [itemKey, itemQty] of items) {
+        const it = { key: itemKey, qty: itemQty };
         const parentId = blankRowId.get(it.key);
         if (!parentId) continue;
         const blank = mat.blanks.find((x) => x.key === it.key);
@@ -672,6 +683,21 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     // ── the work, and the order that owns it ───────────────────────────────
     const materialized = await materializeOrderTasks(conn, companyId, orderId);
     const po = await ensureCuttingOrder(companyId, orderId, conn);
+
+    /*
+     * RECORD HOW THIS PLAN WAS ARRIVED AT, so the screen can say so later.
+     * "Deep — 2000 restarts in 14.2s", or "Uploaded from a spreadsheet". Without
+     * it, an accepted plan is a set of sheets with no account of where it came
+     * from, and the first question anybody asks about a plan is why it looks
+     * like that.
+     */
+    if (plan?.provenance) {
+      await conn.query(
+        `UPDATE fab_orders SET notes = ? WHERE id = ? AND company_id = ?`,
+        [`Plate to blanks for ${po.sales?.orderNumber ?? orderId} \u00b7 ${plan.provenance}`,
+          po.id, companyId],
+      );
+    }
 
     if (owned) await conn.commit();
     const out = {

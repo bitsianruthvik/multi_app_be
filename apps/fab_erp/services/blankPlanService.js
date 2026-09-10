@@ -180,6 +180,16 @@ export async function blankPlan(companyId, orderId, opts = {}) {
         usedPct: usedFraction(n, blanks),
       }));
       const rows = describeBlanks(blanks, withKg, new Map());
+      /*
+       * HOW THIS PLAN WAS ARRIVED AT, kept so the screen can say so.
+       *
+       * Written onto the cutting order when the plan was accepted. It lives in
+       * that order's `notes` rather than a column of its own — it is one short
+       * human sentence, it is worth reading on the order itself, and a column
+       * per fact is how a table grows twenty of them. The trade is that it is
+       * text: fine to show, not something to compute against.
+       */
+      const provenance = await savedProvenance(companyId, orderId);
       return {
         orderNumber,
         blanks: rows,
@@ -190,6 +200,8 @@ export async function blankPlan(companyId, orderId, opts = {}) {
         seed: null,
         reproducible: true,
         fromSaved: true,
+        accepted: true,
+        provenance,
       };
     }
   }
@@ -224,6 +236,7 @@ export async function blankPlan(companyId, orderId, opts = {}) {
    * per order means two orders explore different arrangements rather than every
    * order walking the same sequence of "random" restarts.
    */
+  const startedAt = Date.now();
   const seed = Number(orderId) || 1;
   const deadline = Date.now() + SAFETY_MS;
   let timedOut = false;
@@ -303,12 +316,17 @@ export async function blankPlan(companyId, orderId, opts = {}) {
         isDrop: pl.spec.available != null,
         plateKg: specKg(pl.spec),
         usedPct: usedMm2 / (pl.spec.width * pl.spec.length),
-        items: pl.rows.map((r) => ({
-          key: r.id,
-          name: byKey.get(r.id)?.name ?? String(r.id),
-          rect: `${byKey.get(r.id)?.thickness} × ${r.width} × ${r.length}`,
-          qty: r.qty,
-        })),
+        /*
+         * ONE ENTRY PER BLANK, however many passes it took to place.
+         *
+         * The packer can lay part of a row, come back and lay more on the same
+         * sheet, and record that as two rows. True, and not what a sheet's
+         * contents are: "how many of this rectangle are on this plate" is one
+         * number. Left unmerged it also broke the write — two material rows
+         * for one (blank, sheet) collide on fab_items' unique code, so
+         * re-accepting a plan failed outright.
+         */
+        items: mergeItems(pl.rows, byKey),
       });
     }
     for (const u of res.unplaced) {
@@ -344,6 +362,12 @@ export async function blankPlan(companyId, orderId, opts = {}) {
     effort,
     seed,
     reproducible: !timedOut,
+    accepted: false,
+    /** What this run was, in the words the screen will show. */
+    provenance: `${effort[0].toUpperCase()}${effort.slice(1)} — `
+      + `${EFFORT[effort].restarts} restarts in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+    restarts: EFFORT[effort].restarts,
+    ms: Date.now() - startedAt,
   };
 }
 
@@ -435,4 +459,35 @@ function usedFraction(nest, blanks) {
     return a + (b ? b.width * b.length * it.qty : 0);
   }, 0);
   return Math.min(1, used / area);
+}
+
+/** The one-line note the cutting order carries about how its plan was made. */
+async function savedProvenance(companyId, orderId) {
+  const [[row]] = await pool.query(
+    `SELECT notes FROM fab_orders
+      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+        AND mo_purpose = 'cutting' AND deleted_at IS NULL
+      ORDER BY id LIMIT 1`,
+    [companyId, orderId],
+  );
+  const note = String(row?.notes ?? '');
+  const i = note.indexOf('· ');
+  return i >= 0 ? note.slice(i + 2).trim() : null;
+}
+
+/** Collapse a plate's rows to one entry per blank. */
+function mergeItems(rows, byKey) {
+  const by = new Map();
+  for (const r of rows) {
+    const b = byKey.get(r.id);
+    const hit = by.get(r.id) ?? {
+      key: r.id,
+      name: b?.name ?? String(r.id),
+      rect: `${b?.thickness} × ${r.width} × ${r.length}`,
+      qty: 0,
+    };
+    hit.qty += r.qty;
+    by.set(r.id, hit);
+  }
+  return [...by.values()];
 }
