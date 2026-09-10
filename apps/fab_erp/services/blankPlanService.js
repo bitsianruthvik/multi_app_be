@@ -33,7 +33,7 @@
  */
 
 import { plateCatalog, offcutSpecs } from './nestingSuggestService.js';
-import { nest, shrinkPlates, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
+import { nestAsync, shrinkPlates, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
 import { orderBlanks } from './blankService.js';
 
 const STEEL_DENSITY = 7850;
@@ -173,7 +173,15 @@ export async function blankPlan(companyId, orderId, opts = {}) {
     }
 
     if (Date.now() >= deadline) timedOut = true;
-    const res = nest(g.rows, specs, {
+    /*
+     * AWAITED, so the server stays answerable while this runs.
+     *
+     * At 500 restarts the packing is tens of seconds of solid CPU, and Node
+     * runs one thing at a time — a synchronous pack held every other request
+     * on the server behind it, including /health. Same seed, same restarts,
+     * same answer; it just hands control back between restarts.
+     */
+    const res = await nestAsync(g.rows, specs, {
       restarts: EFFORT[effort].restarts,
       margin: DEFAULT_CUT_GAP_MM,
       seed,

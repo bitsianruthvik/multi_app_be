@@ -733,3 +733,51 @@ export function shrinkPlates(plates, specs, margin = DEFAULT_CUT_GAP_MM) {
     return p;
   });
 }
+
+/**
+ * `nest`, but it lets the server breathe.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────────────────
+ *
+ * `nest` is a tight synchronous loop, and Node runs one thing at a time. At a
+ * few dozen restarts that is nobody's problem. At the levels this is now asked
+ * for — 200, 500, 2000 — a single nesting request holds the event loop for tens
+ * of seconds to minutes, and EVERY other request on the server waits behind it.
+ * Not the nesting screen: every screen, for everyone. Measured in production
+ * with /health, which touches nothing, timing out at sixty seconds.
+ *
+ * The work is unchanged and so is the answer — same seed, same restarts, same
+ * layout. All this does is hand control back between restarts so the runtime can
+ * serve whatever else has arrived before carrying on.
+ *
+ * `setImmediate` rather than a timer: it runs after pending I/O callbacks, which
+ * is exactly "let the queued requests through, then continue".
+ */
+const breathe = () => new Promise((resolve) => { setImmediate(resolve); });
+
+/** How many restarts to run between breaths. Small enough to stay responsive. */
+const BREATHE_EVERY = 4;
+
+export async function nestAsync(rows, specs, opts = {}) {
+  const restarts = Math.max(1, opts.restarts ?? 1);
+  const seed = opts.seed ?? 1;
+  const deadline = opts.deadline ?? Infinity;
+
+  let best = nestOnce(rows, specs, opts, null);
+  let bestScore = scoreOf(best);
+
+  for (let i = 1; i < restarts; i += 1) {
+    if (Date.now() >= deadline) break;
+    if (i % BREATHE_EVERY === 0) await breathe();
+
+    const res = nestOnce(rows, specs, opts, mulberry32(seed + i * 0x9E3779B1));
+    // A run that strands a row is not an improvement whatever it scores.
+    if (res.unplaced.length > best.unplaced.length) continue;
+    const score = scoreOf(res);
+    if (score < bestScore
+      || (score === bestScore && res.plates.length < best.plates.length)) {
+      best = res; bestScore = score;
+    }
+  }
+  return best;
+}
