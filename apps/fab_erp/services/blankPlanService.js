@@ -76,7 +76,7 @@ const specKg = (s) => (s.thickness * s.width * s.length * STEEL_DENSITY) / 1e9;
  * BOUGHT — the invoice — and treats plate count as a tie-break, so it will spend
  * three more sheets to save a kilogram. If setups ever cost more than that
  * kilogram, the scoring is the thing to change, not the effort level.
- *
+ */
 const EFFORT = {
   quick: { restarts: 200 },
   standard: { restarts: 500 },
