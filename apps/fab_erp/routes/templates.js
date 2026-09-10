@@ -32,6 +32,7 @@
  */
 
 import { Router } from 'express';
+import multer from 'multer';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
@@ -40,8 +41,11 @@ import {
   draftTree, buildFromTree,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
+import { exportStructure, importStructure } from '../services/structureSheetService.js';
 
 const router = Router();
+// In memory: the sheet is parsed and thrown away, never stored.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
 
 /**
@@ -108,6 +112,68 @@ router.get('/templates/:itemId/draft', protect, async (req, res) => {
     res.json({ tree: await draftTree(cid, Number(req.params.itemId)) });
   } catch (err) { fail(res, err, 'draft tree'); }
 });
+
+/**
+ * GET /orders/:orderId/structure/export — the structure as a sheet.
+ *
+ * Not the old BOQ sheet: that one's four code columns WERE the structure, and
+ * both halves of that are gone — no codes at BOM time, and a row is a design
+ * with a quantity rather than one piece. A level column carries the shape now.
+ */
+router.get(
+  '/orders/:orderId/structure/export',
+  protect,
+  requirePerm('fab_erp_projects_manage'),
+  async (req, res) => {
+    try {
+      const cid = companyId(req);
+      const { buffer, filename } = await exportStructure(cid, Number(req.params.orderId));
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(Buffer.from(buffer));
+    } catch (err) { return fail(res, err, 'structure export'); }
+  },
+);
+
+/**
+ * POST /orders/:orderId/structure/import — read one back.
+ *
+ * Parses the WHOLE sheet before writing anything. A structure half-imported
+ * because row 180 named an item that does not exist is worse than one not
+ * imported at all: the order looks built, and the missing branch is found by
+ * somebody counting.
+ */
+router.post(
+  '/orders/:orderId/structure/import',
+  protect,
+  requirePerm('fab_erp_projects_manage'),
+  upload.single('excel_file'),
+  async (req, res) => {
+    try {
+      const cid = companyId(req);
+      const orderId = Number(req.params.orderId);
+      if (!req.file?.buffer) return res.status(400).json({ message: 'No file was uploaded.' });
+
+      const { tree, rows, dimsGiven } = await importStructure(cid, orderId, req.file.buffer);
+      const result = await buildFromTree(cid, {
+        orderId,
+        orderLineId: req.body?.orderLineId ? Number(req.body.orderLineId) : null,
+        tree,
+        replace: String(req.body?.replace) === 'true',
+      });
+      res.json({
+        ok: true, rowsInSheet: rows, dimsGiven, ...result,
+        readiness: await refreshOrderStage(cid, orderId),
+      });
+    } catch (err) {
+      if (err.status === 409) {
+        return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
+      }
+      if (err.status === 400) return res.status(400).json({ message: err.message, problems: err.problems });
+      return fail(res, err, 'structure import');
+    }
+  },
+);
 
 /**
  * POST /orders/:orderId/build — write the tree exactly as sent.

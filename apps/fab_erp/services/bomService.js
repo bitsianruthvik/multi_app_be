@@ -1126,6 +1126,8 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     const byDepth = {};
     /** (bom line id, new item id) for every row that came from a recipe line. */
     const fromBomLine = [];
+    /** (item id, field key, value) for sizes stated on the tree that was sent. */
+    const nodeDims = [];
 
     /**
      * Depth-first, parents before children, one row at a time — a child needs
@@ -1167,6 +1169,16 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
       created++;
       byDepth[depth] = (byDepth[depth] ?? 0) + 1;
       if (node.bomLineId) fromBomLine.push([Number(node.bomLineId), r.insertId]);
+      /*
+       * Sizes carried on the node itself — how the spreadsheet import gets its
+       * dimensions in. They beat a BOM-line default because they are what this
+       * order was told, and the recipe is only a starting point.
+       */
+      if (node.dims && typeof node.dims === 'object') {
+        for (const [k, v] of Object.entries(node.dims)) {
+          if (Number.isFinite(Number(v))) nodeDims.push([r.insertId, k, Number(v)]);
+        }
+      }
 
       for (const child of kids) await write(child, r.insertId, depth + 1);
       return r.insertId;
@@ -1235,8 +1247,34 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
         [tree.catalogItemId, JSON.stringify({ version: 3, tree }), orderLineId, companyId]);
     }
 
+    /*
+     * Written AFTER the BOM-line defaults so they win: a size on the sheet is
+     * what this order was told, and the recipe is only where it started.
+     */
+    if (nodeDims.length) {
+      const keys = [...new Set(nodeDims.map(([, k]) => k))];
+      const [fdefs] = await conn.query(
+        `SELECT id, field_key, default_unit FROM fab_fields
+          WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
+        [companyId, keys],
+      );
+      const fieldOf = new Map(fdefs.map((f) => [f.field_key, f]));
+      for (const [itemId, key, value] of nodeDims) {
+        const f = fieldOf.get(key);
+        if (!f) continue;
+        await conn.query(
+          `INSERT INTO fab_field_values
+             (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
+           VALUES (?,?,'order_item',?,?,?,NOW())
+           ON DUPLICATE KEY UPDATE value_num = VALUES(value_num), deleted_at = NULL`,
+          [companyId, f.id, itemId, value, f.default_unit ?? null],
+        );
+      }
+      await recomputeDerived(companyId, [...new Set(nodeDims.map(([id]) => id))], conn);
+    }
+
     if (owned) await conn.commit();
-    return { created, seeded, rootItemId: rootId, byDepth };
+    return { created, seeded, sized: nodeDims.length, rootItemId: rootId, byDepth };
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;
