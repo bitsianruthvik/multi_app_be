@@ -1608,7 +1608,7 @@ export async function applyTree(companyId, spec, existingConn = null) {
 
     const [existing] = await conn.query(
       `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf,
-              sort_order AS sortOrder
+              sort_order AS sortOrder, flow_id AS flowId
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
           AND NOT node_kind = 'material' ${lineScope.sql}
@@ -1654,14 +1654,25 @@ export async function applyTree(companyId, spec, existingConn = null) {
           && Number(was.depth) === depth
           && Number(was.isLeaf) === isLeaf
           // Moving a row among its siblings is a change like any other.
-          && Number(was.sortOrder ?? -1) === position;
+          && Number(was.sortOrder ?? -1) === position
+          /*
+           * AND THE FLOW, which this branch used to ignore entirely.
+           *
+           * The insert carried `flow_id` and the update did not, so a flow set
+           * on a row that already existed was accepted by the screen and thrown
+           * away by the save — the worst shape a bug can have. It did not matter
+           * while flows were chosen on a step of their own; it matters now that
+           * they are chosen here.
+           */
+          && Number(was.flowId ?? 0) === Number(node.defaultFlowId ?? 0);
         if (!same) {
           await conn.query(
             `UPDATE fab_items
                 SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?,
-                    is_leaf = ?, sort_order = ?
+                    is_leaf = ?, sort_order = ?, flow_id = ?
               WHERE id = ? AND company_id = ?`,
-            [node.name, unit, qty, parentItemId, depth, isLeaf, position, id, companyId],
+            [node.name, unit, qty, parentItemId, depth, isLeaf, position,
+              node.defaultFlowId ?? null, id, companyId],
           );
           updated += 1;
         }

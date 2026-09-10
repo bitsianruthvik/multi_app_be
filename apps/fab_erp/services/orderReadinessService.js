@@ -76,7 +76,28 @@ import { logger } from '../../../core/utils/logger.js';
  * everything else a flow demands comes after. Flows stay where they are: they
  * need nothing, and the BOM has usually answered them already.
  */
-export const STAGE_KEYS = ['lines', 'boq', 'flows', 'nesting', 'params', 'tasks', 'procurement', 'production'];
+/*
+ * FLOWS IS NOT A STEP ANY MORE — it is a column on the structure.
+ *
+ * It was a review screen: a per-depth summary you could not edit, and an
+ * "exceptions" list of rows whose flow was missing. Both were answering "did the
+ * BOM already tell us how this is made", one screen after the screen where you
+ * could actually say so.
+ *
+ * The CHECK it performed has not gone anywhere — removing a step must not remove
+ * a gate. It is folded into 'boq' below, UNCHANGED IN STRENGTH: the structure
+ * reports partial when `flowState.missing` is non-zero, which is exactly what
+ * the flows stage reported partial on.
+ *
+ * Worth knowing what that gate is and is not, because it is weaker than its name
+ * suggests and moving it is not the moment to quietly change it: `missing` counts
+ * rows whose BOM LINE states a flow the row never received. A row with no flow
+ * and no BOM default is a decision somebody still has to make, and neither the
+ * old stage nor this one blocks on it — `summariseFlows` returns 'done' as soon
+ * as ANY item has a flow. Tightening that is a separate decision with its own
+ * consequence: orders that confirm today would stop confirming.
+ */
+export const STAGE_KEYS = ['lines', 'boq', 'nesting', 'params', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -323,7 +344,7 @@ export async function orderReadiness(companyId, orderId) {
       // Assemblies with nothing under them is a half-entered structure, not an
       // empty one — the difference matters to someone deciding what to do next.
       state: tree.total === 0 ? 'todo'
-        : (tree.parts === 0 || shortOnDims > 0) ? 'partial' : 'done',
+        : (tree.parts === 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial' : 'done',
       count: tree.total,
       total: tree.total,
       // Reads "4 levels · 32 rows". It used to name each rung and count it —
@@ -336,15 +357,9 @@ export async function orderReadiness(companyId, orderId) {
         ? 'No structure entered'
         : shortOnDims > 0
           ? `${tree.levels.length} levels · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
-          : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
-    },
-    {
-      key: 'flows',
-      label: 'Flows',
-      state: flowState.state,
-      count: flowState.withFlow,
-      total: flowState.flowable,
-      detail: flowState.detail,
+          : flowState.missing > 0
+            ? `${tree.levels.length} levels · ${tree.total} rows — ${flowState.missing} row(s) have no flow yet`
+            : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
     },
     {
       key: 'nesting',
@@ -775,20 +790,20 @@ function buildBlockers({ lines, tree, nest, flowState, tasks }) {
   }
   if (flowState.wouldAssign > 0) {
     out.push({
-      stage: 'flows', count: flowState.wouldAssign,
-      message: `${flowState.wouldAssign} item(s) match a flow rule but have no flow yet. Press Apply on the Flows tab and they will be included.`,
+      stage: 'boq', count: flowState.wouldAssign,
+      message: `${flowState.wouldAssign} item(s) have a flow on the BOM that this order never received. Set it on the row, on the Structure step.`,
     });
   }
   if (flowState.manual > 0) {
     out.push({
-      stage: 'flows', count: flowState.manual,
+      stage: 'boq', count: flowState.manual,
       message: `${flowState.manual} item(s) have no flow and no rule matches them. They will be skipped entirely — no tasks at all.`,
     });
   }
   if (flowState.withFlow === 0) {
     out.push({
-      stage: 'flows', count: 0,
-      message: 'No item on this order has a flow, so building tasks would produce nothing.',
+      stage: 'boq', count: 0,
+      message: 'No row on this order has a flow, so building tasks would produce nothing. Set one on the Structure step.',
     });
   }
   return out;
