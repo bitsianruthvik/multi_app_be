@@ -292,6 +292,32 @@ router.get('/item-bom/:itemId', protect, async (req, res) => {
 });
 
 /**
+ * GET /item-bom/:itemId/tree — the WHOLE recipe under one item, nested.
+ *
+ * The one-level endpoint above answers "what is directly inside this", which is
+ * what a breadcrumb walk needs. It is the wrong shape for an editor: to change
+ * a stiffener count somebody had to walk Span > Line > Segment, losing sight of
+ * everything else, and could never see two levels at once.
+ *
+ * This is the same tree `draftTree` builds for an order's Structure step, from
+ * the same recipe — so the BOM and the order that takes it are looking at one
+ * thing rendered one way, rather than two screens that have to be kept in step.
+ *
+ * Every node carries its `bomLineId`, which is what makes the tree editable:
+ * a row knows which line it came from, so a quantity typed on it writes back to
+ * that line and nothing else.
+ */
+router.get('/item-bom/:itemId/tree', protect, async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const itemId = Number(req.params.itemId);
+    if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
+    const tree = await draftTree(cid, itemId);
+    return res.json({ ok: true, tree });
+  } catch (err) { return fail(res, err, 'item BOM tree'); }
+});
+
+/**
  * POST /item-bom — add or edit one line.
  *
  * Validation lives in bomService, not here: exactly one of a fixed quantity or
