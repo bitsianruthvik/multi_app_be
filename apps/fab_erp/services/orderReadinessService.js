@@ -75,7 +75,7 @@ import { logger } from '../../../core/utils/logger.js';
  * everything else a flow demands comes after. Flows stay where they are: they
  * need nothing, and the BOM has usually answered them already.
  */
-export const STAGE_KEYS = ['lines', 'boq', 'flows', 'dims', 'nesting', 'params', 'tasks', 'procurement', 'production'];
+export const STAGE_KEYS = ['lines', 'boq', 'flows', 'nesting', 'params', 'tasks', 'procurement', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -305,13 +305,24 @@ export async function orderReadiness(companyId, orderId) {
     },
     {
       key: 'boq',
-      // "Structure", not "BOM": this step is the codes and quantities, and the
-      // codes ARE the structure. Dimensions moved to `params`, which cannot be
-      // asked until the flows are known.
+      /**
+       * "Structure", not "BOM", and it OWNS THE SIZES now.
+       *
+       * The rectangle had its own step for a while, because nesting needs it and
+       * needs nothing else. Then the sizes moved onto the structure tree itself,
+       * beside the row they belong to — at which point a separate step was a
+       * second screen asking about the screen you had just left.
+       *
+       * So the check stays and the step goes: a structure whose parts have no
+       * size is not finished, and this is where it says so and where it is
+       * fixed. Nesting still cannot start without them; it just hears about it
+       * one step earlier instead of on a step of its own.
+       */
       label: 'Structure',
       // Assemblies with nothing under them is a half-entered structure, not an
       // empty one — the difference matters to someone deciding what to do next.
-      state: tree.parts > 0 ? 'done' : tree.total > 0 ? 'partial' : 'todo',
+      state: tree.total === 0 ? 'todo'
+        : (tree.parts === 0 || shortOnDims > 0) ? 'partial' : 'done',
       count: tree.total,
       total: tree.total,
       // Reads "4 levels · 32 rows". It used to name each rung and count it —
@@ -322,7 +333,9 @@ export async function orderReadiness(companyId, orderId) {
       // change is how deep the tree goes and how many rows are in it.
       detail: tree.total === 0
         ? 'No structure entered'
-        : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
+        : shortOnDims > 0
+          ? `${tree.levels.length} levels · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
+          : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
     },
     {
       key: 'flows',
@@ -331,35 +344,6 @@ export async function orderReadiness(companyId, orderId) {
       count: flowState.withFlow,
       total: flowState.flowable,
       detail: flowState.detail,
-    },
-    {
-      /**
-       * The values the flows' formulas actually need.
-       *
-       * `todo` while any part is short, because a missing value does not error —
-       * the engine reads it as 0, so the part is estimated as free to make and
-       * every date computed from it is fiction. This is the stage that makes
-       * that visible before the production order freezes it.
-       */
-      /**
-       * THE RECTANGLE, ON ITS OWN, BEFORE NESTING.
-       *
-       * Nesting reads the size and the steel and nothing else — it never
-       * touches a flow — so it used to wait behind hole counts and weld runs
-       * for no reason, and nesting is the step with a lead time on it: nothing
-       * can be ordered until it is done.
-       */
-      key: 'dims',
-      label: 'Dimensions',
-      state: fields.itemsChecked === 0 ? 'todo'
-        : shortOnDims > 0 ? 'partial' : 'done',
-      count: fields.itemsChecked - shortOnDims,
-      total: fields.itemsChecked,
-      detail: fields.itemsChecked === 0
-        ? 'Assign flows first — they decide which parts need a size'
-        : shortOnDims > 0
-          ? `${shortOnDims} of ${fields.itemsChecked} part(s) have no size yet`
-          : `All ${fields.itemsChecked} part(s) are sized`,
     },
     {
       key: 'nesting',
