@@ -642,15 +642,28 @@ export async function draftTree(companyId, rootItemId, conn = null) {
        * drop the second.
        */
       const cyclic = seen.has(Number(line.childItemId));
+      /**
+       * A PARAMETERISED LINE WITH NO ANSWER IS null, NOT A NUMBER.
+       *
+       * It used to fall back to `default_qty`, and with the defaults removed it
+       * would have fallen to 0 — which both writers then turned into 1, because
+       * "0 of something" reads as a mistake. So "nobody has said how many
+       * splices" would have quietly become "one splice", and 1 looks like a
+       * decision in a way that a blank never does.
+       *
+       * null travels to the editor as an empty box, and the writers refuse it.
+       */
       const qty = line.qtyNum != null
         ? Number(line.qtyNum)
-        : Number(line.defaultQty ?? 0);
+        : (line.defaultQty == null ? null : Number(line.defaultQty));
       return {
         key: key(),
         catalogItemId: Number(line.childItemId),
         name: line.childName,
         unit: line.childUnit ?? 'nos',
-        qty: Number.isFinite(qty) ? qty : 0,
+        // null survives — see the comment above. Coercing it to 0 here was the
+        // last place a blank could quietly become a number.
+        qty: qty === null ? null : (Number.isFinite(qty) ? qty : null),
         codeSegment: line.codeSegment,
         codeJoin: line.codeJoin ?? 'dash',
         defaultFlowId: line.defaultFlowId ?? null,
@@ -713,6 +726,27 @@ export async function draftTree(companyId, rootItemId, conn = null) {
   }
 
   return tree;
+}
+
+/**
+ * How many of this row — or a refusal.
+ *
+ * There is no sensible default. Coercing a missing answer to 1 is what makes it
+ * dangerous: one splice on a bridge that needs sixteen is a number somebody
+ * will read as deliberate and never question. A blank cannot be mistaken for
+ * an answer, so it is carried as one all the way to here and refused.
+ */
+function requireQty(node) {
+  const n = Number(node?.qty);
+  if (!Number.isFinite(n) || n <= 0) {
+    const e = new Error(
+      `"${node?.name ?? 'A row'}" has no quantity. Fill it in before building — `
+      + 'there is no sensible number to assume.',
+    );
+    e.status = 400;
+    throw e;
+  }
+  return n;
 }
 
 /** Flatten an expanded tree into rows, parents before children. */
@@ -1198,7 +1232,7 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
          VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?)`,
         [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
           node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
-          Number(node.qty) > 0 ? Number(node.qty) : 1,
+          requireQty(node),
           depth, kids.length ? 0 : 1,
           procurementOf.get(Number(node.catalogItemId)) ?? 'make',
           node.defaultFlowId ?? null]);
@@ -1573,7 +1607,7 @@ export async function applyTree(companyId, spec, existingConn = null) {
     const walk = async (node, parentItemId, depth) => {
       const kids = Array.isArray(node.children) ? node.children : [];
       const isLeaf = kids.length ? 0 : 1;
-      const qty = Number(node.qty) > 0 ? Number(node.qty) : 1;
+      const qty = requireQty(node);
       const unit = node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos';
 
       let id = node.itemId && byId.has(Number(node.itemId)) ? Number(node.itemId) : null;
