@@ -37,6 +37,7 @@
 
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
 
 const SHEET = 'Structure';
 const HEADERS = ['Level', 'Item', 'Qty', 'Unit', 'Thickness (mm)', 'Width (mm)', 'Length (mm)'];

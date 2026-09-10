@@ -33,6 +33,7 @@
 import { pool, getLiveConnection, retryOnDeadConnection } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { resolveFields } from './fieldService.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
 import { plateFits } from './materialMatchService.js';
 import {
   nestAtEffort, verify, utilisation, EFFORT_LEVELS, DEFAULT_CUT_GAP_MM,

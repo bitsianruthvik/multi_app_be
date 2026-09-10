@@ -1,162 +1,168 @@
 /**
- * blankPlanService.js — which plate each blank should be cut from.
+ * blankPlanService.js — how the blanks are actually cut out of plate.
  *
  * ── WHAT THIS IS FOR ─────────────────────────────────────────────────────────
  *
  * `blankService` says WHAT has to be cut: 24 rectangles, so many of each. This
- * says WHERE FROM — for every blank, the plate sizes that could hold it, how
- * many fit on one, how many plates that needs, and how much steel it wastes.
+ * says HOW — the actual sheets, each holding a mix of blanks, with what lands
+ * where.
  *
- * It is the data behind the nesting screen: one row per blank, expandable to
- * the alternatives, with the cheapest already chosen.
+ * ── IT USES THE REAL PACKER, AND THE FIRST VERSION DID NOT ───────────────────
  *
- * ── IT REUSES THE PACKER'S GEOMETRY, DELIBERATELY ────────────────────────────
+ * The first version picked one plate SIZE per blank and gave each blank its own
+ * dedicated sheets. It was simple, it was wrong, and the cost was measurable: on
+ * the KEPL order it bought 759 t across 146 plates where `nest()` buys 708 t
+ * across 125 — 51 tonnes, about ₹4.4M at the ₹85,000/t the suggestor prices with.
  *
- * `capacityOf` from `nestingPacker` answers "how many of this rectangle fit on
- * that plate", and `plateCatalog` from `nestingSuggestService` is the list of
- * plate sizes with their grade and material resolved through the field ladder.
- * Both are used as-is.
+ * All of that difference is MIXING. Putting a web plate and forty stiffeners on
+ * one sheet is where the efficiency lives, and a per-blank allocator can never
+ * find it because it never looks at two blanks together. The packer's own notes
+ * make the same point from the other side: two strategies that tried to build
+ * mixing deliberately were ~60 t WORSE than plain greedy, because greedy gets
+ * mixing for free and they had to rediscover it.
  *
- * A grid-fit written here instead would have been ten lines and would have
- * disagreed with the suggestor about what fits — which is the exact failure the
- * codebase has hit before, where two answers to the same question let a Span
- * look like it had no BOM.
+ * So this groups blanks by steel and hands each group to `nest()` — the same
+ * shipped packer the old suggestor used, restarts and all.
  *
- * ── HOW A PLATE IS RANKED ────────────────────────────────────────────────────
+ * ── A NEST IS A PLATE ────────────────────────────────────────────────────────
  *
- * By STEEL BOUGHT, not by tidiness. A plate that fits the rectangle beautifully
- * but has to be bought in larger sheets loses to an awkward one that buys less
- * mass, because mass is the invoice. Offcuts already on the shelf are ranked
- * ahead of everything: they are paid for, so their marginal cost is zero.
+ * One sheet, one `nest_no`, several blanks on it. Which is exactly what
+ * `wipInventoryService.claimNest` already expects: raw material on a link
+ * carrying a `nest_no` is issued ONCE for the whole nest, because the shop takes
+ * one plate to the machine and cuts everything out of it.
  */
 
-import { pool } from '../../../db.js';
 import { plateCatalog, offcutSpecs } from './nestingSuggestService.js';
-import { capacityOf, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
+import { nest, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
 import { orderBlanks } from './blankService.js';
 
 const STEEL_DENSITY = 7850;
 
-/** kg of one plate of this size. */
-const plateKg = (p) => (p.thickness * p.width * p.length * STEEL_DENSITY) / 1e9;
+/** kg of one sheet of this size. */
+const specKg = (s) => (s.thickness * s.width * s.length * STEEL_DENSITY) / 1e9;
 
 /**
- * The plan for an order: every blank, its candidate plates, and what is chosen.
+ * How hard to look. The budget belongs to the ORDER, not to each steel — a
+ * six-thickness job must not take six times as long at the same setting.
+ */
+const EFFORT = {
+  quick: { restarts: 8, budgetMs: 4000 },
+  standard: { restarts: 60, budgetMs: 20000 },
+  deep: { restarts: 400, budgetMs: 90000 },
+};
+
+/**
+ * The plan for an order: the sheets, what is on each, and the demand behind it.
  *
  * @param {object} opts
- * @param {number} [opts.maxAlternatives] how many runners-up to return per blank
- * @returns {Promise<object>}
+ * @param {'quick'|'standard'|'deep'} [opts.effort]
  */
 export async function blankPlan(companyId, orderId, opts = {}) {
-  const maxAlternatives = opts.maxAlternatives ?? 6;
   const { orderNumber, blanks, skipped } = await orderBlanks(companyId, orderId);
   if (!blanks.length) {
-    return { orderNumber, blanks: [], skipped, summary: emptySummary() };
+    return { orderNumber, blanks: [], nests: [], skipped, summary: emptySummary() };
   }
 
   const plates = await plateCatalog(companyId);
-
-  /*
-   * WHAT THIS ORDER HAS ALREADY DECIDED, so the screen opens on the current
-   * plan rather than on a fresh proposal that quietly disagrees with it.
-   */
-  const [chosenRows] = await pool.query(
-    `SELECT i.catalog_item_id AS blankCatalogId, m.catalog_item_id AS plateCatalogId,
-            m.qty AS plates, m.nest_no AS nestNo, i.flow_id AS flowId
-       FROM fab_items i
-       JOIN fab_item_catalog b ON b.id = i.catalog_item_id AND b.material_form = 'blank'
-       LEFT JOIN fab_items m ON m.parent_item_id = i.id AND m.node_kind = 'material'
-                            AND m.deleted_at IS NULL
-      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
-        AND i.node_kind = 'structure'`,
-    [companyId, orderId],
-  );
-  /*
-   * KEYED BY CODE, NOT BY CATALOG ID.
-   *
-   * `orderBlanks` computes the rectangles without touching the catalogue, so
-   * its rows carry `catalogItemId: null` — only `materialiseBlanks` fills that
-   * in. Looking the saved plate up by id therefore matched nothing, and every
-   * row fell back to "the best candidate" while claiming to show the plan. The
-   * screen would have quietly disagreed with what the order actually says.
-   *
-   * The code is derived from the blank's identity and is stable, so it is the
-   * right key here and does not need a write to exist.
-   */
-  const [blankItems] = await pool.query(
-    `SELECT id, code FROM fab_item_catalog
-      WHERE company_id = ? AND material_form = 'blank' AND deleted_at IS NULL
-        AND code IN (?)`,
-    [companyId, blanks.map((b) => b.code)],
-  );
-  const catalogIdByCode = new Map(blankItems.map((r) => [String(r.code), Number(r.id)]));
-  const chosenBy = new Map(chosenRows.map((r) => [Number(r.blankCatalogId), r]));
-
-  // Offcuts of the right thicknesses only — the yard may hold hundreds, and
-  // there is no sense ranking 16 mm drops for a 12 mm rectangle.
-  const plateIds = plates.map((p) => p.id);
   let drops = [];
   try {
-    drops = await offcutSpecs(companyId, plateIds);
+    drops = await offcutSpecs(companyId, plates.map((p) => p.id));
   } catch {
-    drops = [];   // offcut tracking is optional; its absence is not an error
+    drops = [];        // offcut tracking is optional; its absence is not an error
   }
 
-  const out = [];
+  const byKey = new Map(blanks.map((b) => [b.key, b]));
+
+  /*
+   * GROUPED ON ALL THREE AXES. Thickness alone nests an E350 rectangle onto
+   * E250 and scores better for it. Substituting either is a metallurgical
+   * decision and a packer must not make it silently.
+   */
+  const groups = new Map();
   for (const b of blanks) {
-    const row = { length: b.length, width: b.width, qty: b.qty };
+    const k = `${b.thickness}|${b.grade ?? '?'}|${b.material ?? '?'}`;
+    if (!groups.has(k)) {
+      groups.set(k, { thickness: b.thickness, grade: b.grade, material: b.material, rows: [] });
+    }
+    groups.get(k).rows.push({ id: b.key, length: b.length, width: b.width, qty: b.qty });
+  }
 
-    const candidates = [];
-    for (const p of [...drops, ...plates]) {
-      if (Number(p.thickness) !== Number(b.thickness)) continue;
-      // Grade and material must match. A 12 mm E350 rectangle cut from E250 is
-      // not a cheaper option, it is the wrong steel.
-      if (p.grade && b.grade && String(p.grade) !== String(b.grade)) continue;
-      if (p.material && b.material && String(p.material) !== String(b.material)) continue;
+  const effort = EFFORT[opts.effort] ? opts.effort : 'standard';
+  const packable = [...groups.values()].filter((g) => g.grade != null && g.material != null);
+  const perGroupMs = packable.length
+    ? EFFORT[effort].budgetMs / packable.length
+    : EFFORT[effort].budgetMs;
 
-      const perPlate = capacityOf(row, p, DEFAULT_CUT_GAP_MM);
-      if (!perPlate) continue;
+  const nests = [];
+  const noSteel = [];
+  let nestNo = 0;
 
-      const isDrop = p.available != null;      // offcutSpecs marks its own
-      const available = isDrop ? Number(p.available ?? 1) : Infinity;
-      const needed = Math.ceil(b.qty / perPlate);
-      const used = Math.min(needed, available);
-      const kgEach = plateKg(p);
-
-      candidates.push({
-        plateCatalogItemId: p.id,
-        code: p.code,
-        name: p.name,
-        thickness: p.thickness,
-        width: p.width,
-        length: p.length,
-        isDrop,
-        perPlate,
-        plates: used,
-        coversAll: used * perPlate >= b.qty,
-        buyKg: isDrop ? 0 : used * kgEach,      // a drop is already paid for
-        grossKg: used * kgEach,
-        yield: kgEach > 0 ? Math.min(1, (b.qty * b.unitWeightKg) / (needed * kgEach)) : 0,
-      });
+  for (const g of groups.values()) {
+    // A rectangle that does not state its steel is refused, not guessed.
+    if (g.grade == null || g.material == null) {
+      for (const r of g.rows) noSteel.push({ key: r.id, reason: 'no grade or material stated' });
+      continue;
+    }
+    const specs = [...drops, ...plates].filter((p) => Number(p.thickness) === Number(g.thickness)
+      && (!p.grade || String(p.grade) === String(g.grade))
+      && (!p.material || String(p.material) === String(g.material)));
+    if (!specs.length) {
+      for (const r of g.rows) {
+        noSteel.push({ key: r.id, reason: `no ${g.thickness} mm ${g.material} ${g.grade} plate in the catalogue` });
+      }
+      continue;
     }
 
-    /*
-     * Cheapest steel first, with a drop always ahead of a bought sheet of the
-     * same cost. `coversAll` breaks the tie above both: a plate that cannot
-     * hold the whole quantity is a partial answer and belongs below one that can.
-     */
-    candidates.sort((x, y) => (Number(y.coversAll) - Number(x.coversAll))
-      || (x.buyKg - y.buyKg)
-      || (Number(y.isDrop) - Number(x.isDrop)));
+    const res = nest(g.rows, specs, {
+      restarts: EFFORT[effort].restarts,
+      margin: DEFAULT_CUT_GAP_MM,
+      deadline: Date.now() + perGroupMs,
+    });
 
-    const catalogItemId = b.catalogItemId ?? catalogIdByCode.get(b.code) ?? null;
-    const current = catalogItemId == null ? undefined : chosenBy.get(Number(catalogItemId));
-    const chosenId = current?.plateCatalogId == null ? null : Number(current.plateCatalogId);
-    const chosen = chosenId != null
-      ? candidates.find((c) => c.plateCatalogItemId === chosenId) ?? null
-      : null;
+    for (const pl of res.plates) {
+      nestNo += 1;
+      const usedMm2 = pl.rows.reduce((s, r) => s + r.length * r.width * r.qty, 0);
+      nests.push({
+        nestNo: `N-${String(nestNo).padStart(3, '0')}`,
+        plateCatalogItemId: pl.spec.id,
+        plateCode: pl.spec.code ?? null,
+        plateName: pl.spec.name ?? null,
+        thickness: pl.spec.thickness,
+        width: pl.spec.width,
+        length: pl.spec.length,
+        isDrop: pl.spec.available != null,
+        plateKg: specKg(pl.spec),
+        usedPct: usedMm2 / (pl.spec.width * pl.spec.length),
+        items: pl.rows.map((r) => ({
+          key: r.id,
+          name: byKey.get(r.id)?.name ?? String(r.id),
+          rect: `${byKey.get(r.id)?.thickness} × ${r.width} × ${r.length}`,
+          qty: r.qty,
+        })),
+      });
+    }
+    for (const u of res.unplaced) {
+      noSteel.push({ key: u.id ?? String(u), reason: 'would not fit any available sheet' });
+    }
+  }
 
-    out.push({
+  /*
+   * WHERE EACH RECTANGLE ENDED UP. A blank spreads over several sheets — 960
+   * stiffeners do not fit on one — and the table must say so rather than
+   * pretending every rectangle gets a plate of its own.
+   */
+  const onPlates = new Map();
+  for (const n of nests) {
+    for (const it of n.items) {
+      onPlates.set(it.key, [...(onPlates.get(it.key) ?? []), { qty: it.qty, plate: n }]);
+    }
+  }
+  const reasonFor = new Map(noSteel.map((x) => [x.key, x.reason]));
+
+  const out = blanks.map((b) => {
+    const on = onPlates.get(b.key) ?? [];
+    const placed = on.reduce((s, x) => s + x.qty, 0);
+    return {
       key: b.key,
       code: b.code,
       name: b.name,
@@ -170,45 +176,49 @@ export async function blankPlan(companyId, orderId, opts = {}) {
       totalWeightKg: b.totalWeightKg,
       partNames: b.partNames,
       partCount: b.parts.length,
-      catalogItemId,
-      nestNo: current?.nestNo ?? null,
-      flowId: current?.flowId == null ? null : Number(current.flowId),
-      /** What is currently saved, if anything; otherwise the best candidate. */
-      chosen: chosen ?? candidates[0] ?? null,
-      chosenIsSaved: !!chosen,
-      alternatives: candidates.slice(0, maxAlternatives),
-      candidateCount: candidates.length,
-    });
-  }
+      /** The sheets this rectangle is cut from, and how many land on each. */
+      nests: on.map((x) => ({
+        nestNo: x.plate.nestNo,
+        qty: x.qty,
+        plate: `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`,
+        isDrop: x.plate.isDrop,
+        sharedWith: x.plate.items.length - 1,
+      })),
+      plateSizes: [...new Set(on.map((x) => `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`))],
+      plateCount: on.length,
+      /** Sheets carrying something else too — the whole point of mixing. */
+      sharesPlates: on.filter((x) => x.plate.items.length > 1).length,
+      placed,
+      short: Math.max(0, b.qty - placed),
+      reason: placed === 0 ? (reasonFor.get(b.key) ?? null) : null,
+    };
+  });
 
-  return { orderNumber, blanks: out, skipped, summary: summarise(out) };
+  return { orderNumber, blanks: out, nests, skipped, summary: summarise(out, nests) };
 }
 
 function emptySummary() {
-  return { blanks: 0, pieces: 0, plates: 0, boughtKg: 0, usedKg: 0, dropKg: 0, yield: 0, unplaced: 0 };
+  return {
+    blanks: 0, pieces: 0, plates: 0, mixedPlates: 0,
+    boughtKg: 0, grossKg: 0, usedKg: 0, dropKg: 0, yield: 0, short: 0,
+  };
 }
 
-function summarise(rows) {
-  let pieces = 0;
-  let plates = 0;
-  let boughtKg = 0;
-  let usedKg = 0;
-  let unplaced = 0;
-  for (const r of rows) {
-    pieces += r.qty;
-    usedKg += r.totalWeightKg;
-    if (!r.chosen) { unplaced += 1; continue; }
-    plates += r.chosen.plates;
-    boughtKg += r.chosen.grossKg;
-  }
+function summarise(rows, nests) {
+  const grossKg = nests.reduce((s, n) => s + n.plateKg, 0);
+  const usedKg = rows.reduce((s, r) => s + r.totalWeightKg, 0);
   return {
     blanks: rows.length,
-    pieces,
-    plates,
-    boughtKg,
+    pieces: rows.reduce((s, r) => s + r.qty, 0),
+    plates: nests.length,
+    mixedPlates: nests.filter((n) => n.items.length > 1).length,
+    // A drop is already paid for, so it is not steel BOUGHT — but it is steel
+    // USED, which is why the yield below divides by gross and not by this.
+    boughtKg: nests.reduce((s, n) => s + (n.isDrop ? 0 : n.plateKg), 0),
+    grossKg,
     usedKg,
-    dropKg: Math.max(0, boughtKg - usedKg),
-    yield: boughtKg > 0 ? usedKg / boughtKg : 0,
-    unplaced,
+    dropKg: Math.max(0, grossKg - usedKg),
+    yield: grossKg > 0 ? usedKg / grossKg : 0,
+    short: rows.filter((r) => r.short > 0).length,
   };
 }

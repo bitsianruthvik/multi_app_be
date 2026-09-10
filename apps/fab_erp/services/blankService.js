@@ -39,14 +39,21 @@
  *
  * Per order, the group grows with live work and can be retired with it.
  *
- * ── CUTTING IS ORDINARY WORK ─────────────────────────────────────────────────
+ * ── CUTTING IS ITS OWN BATCH OF ORDINARY WORK ────────────────────────────────
  *
  * A blank row goes on the SALES ORDER beside everything else, carrying the
- * cutting flow, and the order's one production order claims its tasks like any
- * other. There was briefly a separate `order_type='cutting'` document; it was
- * wrong. Cutting is not a different kind of manufacturing, and a second order
- * per job meant two things to release, two to chase and two to close for one
- * trip through the same shop.
+ * cutting flow. Its TASKS are claimed by a SECOND production order —
+ * `mo_purpose='cutting'` — not by the fabrication one.
+ *
+ * Two orders, because they wait on different things. Cutting waits on PLATE
+ * ARRIVING; fabrication waits on shop capacity. Folded together, cutting cannot
+ * be released the day the steel lands, which is the day you want it released,
+ * and "cutting is 80% done" stops being visible at all because it is twenty
+ * tasks buried in five hundred.
+ *
+ * It is NOT a separate `order_type`. Cutting is not a different kind of
+ * manufacturing, it is a different batch of it — so the type stays
+ * 'manufacturing' and `mo_purpose` says which batch.
  *
  * The cost of putting them on the sales order is that a blank row LOOKS like a
  * made leaf — it is childless apart from the plate beneath it — so the function
@@ -59,8 +66,10 @@ import { pool } from '../../../db.js';
 import { resolveFields } from './fieldService.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { DEFAULT_DENSITY } from './fieldDeriveService.js';
+import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
+
+export { NOT_A_BLANK } from './blankPredicate.js';
 import { materializeOrderTasks } from './taskGatingService.js';
-import { ensureProductionOrder } from './productionOrderService.js';
 import { logger } from '../../../core/utils/logger.js';
 
 /** The flow a blank is cut by, unless the plan names another. */
@@ -89,24 +98,6 @@ export function blankName(orderNumber, { material, grade, thickness, width, leng
   const steel = [material, grade].filter(Boolean).join(' ');
   return `${steel || 'Blank'} ${thickness} x ${width} x ${length} — ${orderNumber}`;
 }
-
-/**
- * SQL that excludes blank rows, for any query aliasing fab_items as `i`.
- *
- * A blank sits on the order as a structure row with the plate beneath it, so
- * every "made leaf" test and every structure read would otherwise pick it up:
- * the editor would show it as a sibling of the Span, the spreadsheet would
- * export it, and `orderBlanks` would treat it as something that needs cutting
- * out of something else.
- *
- * The test is the CATALOG's `material_form`, not the row's shape. Shape-based
- * guesses ("it has exactly one material child") are the kind of rule that holds
- * until the day a real part has one too.
- */
-export const NOT_A_BLANK = (alias = 'i') => `
-  NOT EXISTS (SELECT 1 FROM fab_item_catalog bc
-               WHERE bc.id = ${alias}.catalog_item_id
-                 AND bc.material_form = 'blank')`;
 
 /** The identity of a blank, as a string, for grouping. */
 const blankKey = (b) => [b.material ?? '?', b.grade ?? '?', b.thickness, b.width, b.length].join('|');
@@ -396,6 +387,70 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
 }
 
 /**
+ * The CUTTING production order for a sales order, made if it is not there yet.
+ *
+ * `order_type='manufacturing'` like the fabrication one, told apart by
+ * `mo_purpose='cutting'`. It claims exactly the tasks sitting on blank rows;
+ * `productionOrderService` claims everything else and now explicitly declines
+ * these, so the two documents partition the work rather than overlapping.
+ */
+export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
+  const [[sales]] = await conn.query(
+    `SELECT id, order_number AS orderNumber, plant_id AS plantId, required_date AS requiredDate
+       FROM fab_orders
+      WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL LIMIT 1`,
+    [salesOrderId, companyId],
+  );
+  if (!sales) { const e = new Error('That sales order does not exist.'); e.status = 404; throw e; }
+
+  let [[mo]] = await conn.query(
+    `SELECT id, order_number AS orderNumber, status FROM fab_orders
+      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+        AND mo_purpose = 'cutting' AND deleted_at IS NULL
+      ORDER BY id LIMIT 1`,
+    [companyId, salesOrderId],
+  );
+  let created = false;
+
+  if (!mo) {
+    const [[{ ymd }]] = await conn.query("SELECT DATE_FORMAT(UTC_DATE(), '%Y%m%d') AS ymd");
+    const [[seq]] = await conn.query(
+      `SELECT COUNT(*) AS n FROM fab_orders
+        WHERE company_id = ? AND order_type = 'manufacturing' AND mo_purpose = 'cutting'`,
+      [companyId],
+    );
+    const orderNumber = `MO-CUT-${ymd}-${String(Number(seq.n) + 1).padStart(4, '0')}`;
+    const [ins] = await conn.query(
+      `INSERT INTO fab_orders
+         (company_id, order_number, order_type, mo_purpose, status, source_order_id,
+          plant_id, required_date, notes, created_at)
+       VALUES (?,?,'manufacturing','cutting','draft',?,?,?,?,NOW())`,
+      [companyId, orderNumber, salesOrderId, sales.plantId ?? null, sales.requiredDate ?? null,
+        `Plate to blanks for ${sales.orderNumber}`],
+    );
+    mo = { id: ins.insertId, orderNumber, status: 'draft' };
+    created = true;
+  }
+
+  /*
+   * Claim the cutting work. Only tasks whose item IS a blank — the mirror of the
+   * exclusion the fabrication order applies, so between them every make task is
+   * claimed exactly once.
+   */
+  const [claim] = await conn.query(
+    `UPDATE fab_project_tasks t
+       JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
+        SET t.production_order_id = ?
+      WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
+        AND ${IS_A_BLANK('i')}
+        AND (t.production_order_id IS NULL OR t.production_order_id <> ?)`,
+    [mo.id, companyId, salesOrderId, mo.id],
+  );
+
+  return { ...mo, created, tasksClaimed: claim?.affectedRows ?? 0 };
+}
+
+/**
  * acceptNestingPlan — make the blanks real, and make cutting them ordinary work.
  *
  * ── WHAT IT WRITES ───────────────────────────────────────────────────────────
@@ -404,7 +459,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
  *   2. a row per blank ON THE SALES ORDER, carrying the cutting flow
  *   3. the plate under each blank row                 the RM -> blank mapping
  *   4. every part's material link repointed from plate to blank
- *   5. tasks for the new rows, claimed by the order's own production order
+ *   5. tasks for the new rows, claimed by a CUTTING production order of their own
  *
  * ── WHY THE ROWS GO ON THE SALES ORDER ───────────────────────────────────────
  *
@@ -414,10 +469,10 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
  * somewhere the rest of the system had to be taught about.
  *
  * On the sales order they are ordinary rows: `materializeOrderTasks` builds
- * their tasks with no special case, `ensureProductionOrder` claims them because
- * they are make work, and the Plan Board shows cutting beside welding. The one
- * thing that had to be taught is `NOT_A_BLANK`, so the structure editor and the
- * blank calculation both look past them.
+ * their tasks with no special case and the Plan Board shows cutting beside
+ * welding. What had to be taught is `NOT_A_BLANK` — so the structure editor,
+ * the blank calculation and the FABRICATION order all look past them, leaving
+ * the cutting order to claim exactly the tasks the others declined.
  *
  * ── ORDER_LINE_ID IS NULL, DELIBERATELY ──────────────────────────────────────
  *
@@ -465,8 +520,9 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     const blankRowId = new Map();
 
     for (const b of mat.blanks) {
-      const chosen = plan[b.key] ?? {};
-      const flowId = Number(chosen.flowId) || cuttingFlow.id;
+      // The flow is per BLANK, not per sheet: a rectangle that also gets
+      // drilled while it is flat is a property of the rectangle.
+      const flowId = Number(plan?.flows?.[b.key]) || cuttingFlow.id;
       const was = rowByCatalog.get(Number(b.catalogItemId));
 
       if (was) {
@@ -521,7 +577,18 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
         [companyId, ids, ids]);
     }
 
-    // ── the plate under each blank ─────────────────────────────────────────
+    // ── the sheets, and what each carries ──────────────────────────────────
+    /*
+     * A NEST IS A SHEET, and a sheet holds several rectangles. So this writes
+     * one material row per (blank, sheet) pair, all the rows for one sheet
+     * SHARING a `nest_no`.
+     *
+     * That shared number is load-bearing downstream: `wipInventoryService
+     * .claimNest` issues raw material on a link carrying a nest_no ONCE for the
+     * whole nest, because the shop takes one plate to the machine and cuts
+     * everything out of it. Writing a row per blank without sharing the number
+     * would draw the same physical sheet from stock once per rectangle on it.
+     */
     const rowIds = [...blankRowId.values()];
     if (rowIds.length) {
       await conn.query(
@@ -531,31 +598,37 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
         [companyId, rowIds],
       );
     }
-    let nestNo = 0;
+
+    const nests = Array.isArray(plan?.nests) ? plan.nests : [];
     let platesLinked = 0;
-    for (const b of mat.blanks) {
-      const chosen = plan[b.key];
-      if (!chosen?.plateCatalogItemId) continue;
-      const parentId = blankRowId.get(b.key);
-      const plates = Math.max(1, Number(chosen.plates) || 1);
+    let sheets = 0;
+    for (const n of nests) {
+      if (!n?.plateCatalogItemId || !Array.isArray(n.items) || !n.items.length) continue;
       const [[pc]] = await conn.query(
         `SELECT id, code, name, thickness_mm AS thickness FROM fab_item_catalog
           WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-        [chosen.plateCatalogItemId, companyId],
+        [n.plateCatalogItemId, companyId],
       );
       if (!pc) continue;
-      nestNo += 1;
-      await conn.query(
-        `INSERT INTO fab_items
-           (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
-            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
-            flow_id, nest_no, length, width, height)
-         VALUES (?,?,NULL,?,?,?,'nos',?,?,'material',1,1,'buy',NULL,?,?,?,?)`,
-        [companyId, orderId, parentId, pc.id, pc.name, plates,
-          `${b.code}-${pc.code}`, `N-${String(nestNo).padStart(3, '0')}`,
-          chosen.plateLength ?? null, chosen.plateWidth ?? null, pc.thickness ?? null],
-      );
-      platesLinked += 1;
+      sheets += 1;
+      const nestNo = n.nestNo ?? `N-${String(sheets).padStart(3, '0')}`;
+
+      for (const it of n.items) {
+        const parentId = blankRowId.get(it.key);
+        if (!parentId) continue;
+        const blank = mat.blanks.find((x) => x.key === it.key);
+        await conn.query(
+          `INSERT INTO fab_items
+             (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
+              flow_id, nest_no, length, width, height)
+           VALUES (?,?,NULL,?,?,?,'nos',?,?,'material',1,1,'buy',NULL,?,?,?,?)`,
+          [companyId, orderId, parentId, pc.id, pc.name, Number(it.qty) || 1,
+            `${blank?.code ?? it.key}-${pc.code}-${nestNo}`, nestNo,
+            n.length ?? null, n.width ?? null, pc.thickness ?? null],
+        );
+        platesLinked += 1;
+      }
     }
 
     // ── every part now comes off its blank, not off plate ──────────────────
@@ -586,21 +659,13 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
 
     // ── the work, and the order that owns it ───────────────────────────────
     const materialized = await materializeOrderTasks(conn, companyId, orderId);
-    /*
-     * Raising the production order here rather than leaving it to somebody is
-     * the point of the change: cutting is claimed by the SAME document that
-     * claims the welding, so the job is one thing to release and close.
-     *
-     * Idempotent — it finds an existing production order and re-claims, which
-     * is what picks up the blank tasks on an order that was already raised.
-     */
-    const po = await ensureProductionOrder(companyId, orderId, { conn });
+    const po = await ensureCuttingOrder(companyId, orderId, conn);
 
     if (owned) await conn.commit();
     const out = {
-      productionOrderId: po.id,
-      productionOrderNumber: po.orderNumber,
-      productionOrderCreated: po.created,
+      cuttingOrderId: po.id,
+      cuttingOrderNumber: po.orderNumber,
+      cuttingOrderCreated: po.created,
       blanks: mat.blanks.length,
       blanksCreated: mat.created,
       blanksRetired: mat.retired ?? 0,
@@ -608,6 +673,7 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
       rowsUpdated,
       rowsRetired: stale.length,
       platesLinked,
+      sheets,
       partsRepointed,
       tasks: materialized?.tasksInserted ?? 0,
       tasksClaimed: po.tasksClaimed ?? 0,

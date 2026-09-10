@@ -24,7 +24,7 @@
  */
 
 import { pool } from '../../../db.js';
-import { NOT_A_BLANK } from './blankService.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
 import { recomputeDerived } from './fieldDeriveService.js';
 
 /** A BOM deep enough to hit this is a cycle or a mistake, not a real structure. */
@@ -41,6 +41,7 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName, b.code_join AS codeJoin,
             b.explode AS explode,
             c.code AS childCode, c.name AS childName, c.unit AS childUnit,
+            c.procurement_type AS childProcurement,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
@@ -84,7 +85,8 @@ async function bomIndex(companyId, conn = null) {
             b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
             b.help_text AS helpText, b.sort_order AS sortOrder,
             b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
-            c.code AS childCode, c.name AS childName, c.unit AS childUnit
+            c.code AS childCode, c.name AS childName, c.unit AS childUnit,
+            c.procurement_type AS childProcurement
        FROM fab_item_bom b
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
       WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.active = 1
@@ -673,6 +675,13 @@ export async function draftTree(companyId, rootItemId, conn = null) {
         bomLineId: Number(line.lineId),
         /** What the BOM called this quantity, if it asked for one. */
         qtyParam: line.qtyParam ?? null,
+        /*
+         * MADE OR BOUGHT, so the editor can stop asking a bought item its size.
+         * A shear stud's dimensions are the reason you picked that stud out of
+         * the catalogue; typing them again on the line is a second place for
+         * them to be wrong, and the catalogue's is the one that gets read.
+         */
+        procurementType: line.childProcurement ?? 'make',
         children: cyclic ? [] : build(line.childItemId, depth + 1, new Set([...seen, Number(line.childItemId)])),
       };
     });
@@ -689,6 +698,7 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     defaultFlowId: null,
     bomLineId: null,
     qtyParam: null,
+    procurementType: 'make',
     dims: {},
     children: build(Number(root.id), 0, new Set([Number(root.id)])),
   };

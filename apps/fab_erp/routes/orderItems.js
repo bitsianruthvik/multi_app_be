@@ -135,7 +135,7 @@ router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab
  */
 router.get('/orders/:orderId/blanks', protect, async (req, res) => {
   try {
-    const plan = await blankPlan((req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId));
+    const plan = await blankPlan((req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId), { effort: req.query?.effort });
     return res.json({ ok: true, ...plan });
   } catch (err) {
     logger.error({ err }, 'fab_erp: blank plan');

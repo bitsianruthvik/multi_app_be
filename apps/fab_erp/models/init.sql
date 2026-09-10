@@ -3416,6 +3416,26 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_orders ADD KEY idx_fo_source_type (source_order_id, order_type)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- TWO PRODUCTION ORDERS PER SALES ORDER, and a way to tell them apart.
+-- Cutting (plate -> blanks) is raised separately from fabrication because it
+-- waits on a different thing: plate arriving, not shop capacity. Keeping them
+-- apart is what lets cutting be released the day the steel lands instead of
+-- when the whole job is ready.
+-- NULL means fabrication, which is what every existing row is and why this is
+-- safe to add: productionOrderService filters on IS NULL and keeps finding the
+-- order it has always found. A new order_type was rejected — cutting is not a
+-- different kind of manufacturing, it is a different batch of it.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='mo_purpose');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_orders ADD COLUMN mo_purpose VARCHAR(20) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='idx_fo_source_purpose');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_orders ADD KEY idx_fo_source_purpose (source_order_id, order_type, mo_purpose)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ── purchase-order lines ──────────────────────────────────────────────────
 -- fab_order_lines was built for SALES lines: free text, a price, a completed
 -- qty. A purchase line needs to name a catalog item — it is a specific plate,

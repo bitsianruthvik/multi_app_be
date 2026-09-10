@@ -26,6 +26,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
 import { materializeOrderTasks } from './taskGatingService.js';
 
@@ -97,7 +98,7 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
 
     let [[mo]] = await conn.query(
       `SELECT id, order_number, status FROM fab_orders
-        WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+        WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing' AND mo_purpose IS NULL
           AND deleted_at IS NULL
         ORDER BY id LIMIT 1`,
       [companyId, orderId],
@@ -109,9 +110,9 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
       const orderNumber = await nextOrderNumber(conn, companyId, 'MO', ymd);
       const [ins] = await conn.query(
         `INSERT INTO fab_orders
-           (company_id, order_number, order_type, status, source_order_id, plant_id,
+           (company_id, order_number, order_type, mo_purpose, status, source_order_id, plant_id,
             required_date, scheduled_start, scheduled_end, created_by, notes)
-         VALUES (?, ?, 'manufacturing', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, 'manufacturing', NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [companyId, orderNumber, MO_STATUS.DRAFT, orderId, sales.plant_id ?? null,
           sales.required_date ?? null, sales.scheduled_start ?? null,
           sales.scheduled_end ?? null, opts.createdBy ?? null,
@@ -143,6 +144,9 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
           SET t.production_order_id = ?
         WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
           AND COALESCE(i.procurement_type, ?) = 'make'
+          -- Cutting belongs to the cutting order. Without this the fabrication
+          -- order claims the blanks too and the two documents overlap.
+          AND ${NOT_A_BLANK('i')}
           AND (t.production_order_id IS NULL OR t.production_order_id <> ?)`,
       [mo.id, companyId, orderId, DEFAULT_PROCUREMENT, mo.id],
     );
@@ -177,7 +181,7 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
 export async function approveProductionOrder(companyId, productionOrderId) {
   const [[mo]] = await pool.query(
     `SELECT id, status FROM fab_orders
-      WHERE id = ? AND company_id = ? AND order_type = 'manufacturing' AND deleted_at IS NULL
+      WHERE id = ? AND company_id = ? AND order_type = 'manufacturing' AND mo_purpose IS NULL AND deleted_at IS NULL
       LIMIT 1`,
     [productionOrderId, companyId],
   );
@@ -272,7 +276,7 @@ export async function productionForOrder(companyId, orderId, conn) {
   const [[mo]] = await exec.query(
     `SELECT id, order_number, status, progress_pct, required_date, created_at
        FROM fab_orders
-      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing' AND mo_purpose IS NULL
         AND deleted_at IS NULL
       ORDER BY id LIMIT 1`,
     [companyId, orderId],
