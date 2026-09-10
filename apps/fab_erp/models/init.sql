@@ -3416,6 +3416,21 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_orders ADD KEY idx_fo_source_type (source_order_id, order_type)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- A CUTTING ORDER is a manufacturing order of its own kind: plate in, blanks
+-- out. It gets its own order_type rather than sharing 'manufacturing' because
+-- productionOrderService looks up "the production order for this sales order"
+-- by that value and takes the first row it finds — a second manufacturing order
+-- on the same sales order would make which one it means depend on insert order.
+-- Every other reader tests order_type for a specific value too, so a new value
+-- is invisible to them, which is exactly right: they should not see cutting.
+SET @en = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='order_type');
+SET @sql = IF(@en IS NOT NULL AND LOCATE('cutting', @en) = 0,
+  CONCAT('ALTER TABLE fab_orders MODIFY COLUMN order_type ',
+         REPLACE(@en, ')', ",'cutting')"), " NOT NULL DEFAULT 'sales'"),
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ── purchase-order lines ──────────────────────────────────────────────────
 -- fab_order_lines was built for SALES lines: free text, a price, a completed
 -- qty. A purchase line needs to name a catalog item — it is a specific plate,
