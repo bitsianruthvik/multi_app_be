@@ -303,6 +303,14 @@ export async function orderReadiness(companyId, orderId) {
   const nestBlocking = blockingIssues(nestIntegrity);
 
   const flowState = summariseFlows(flows);
+  /** Acceptance, as a fact on the database rather than a state on a screen. */
+  const [[cutRow]] = await pool.query(
+    `SELECT id FROM fab_orders
+      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+        AND mo_purpose = 'cutting' AND deleted_at IS NULL LIMIT 1`,
+    [companyId, orderId],
+  );
+  const cuttingOrder = cutRow?.id ?? null;
   const [proc, production, fields] = await Promise.all([
     summariseProcurement(companyId, orderId),
     summariseProduction(companyId, orderId),
@@ -367,16 +375,26 @@ export async function orderReadiness(companyId, orderId) {
        * 40 mm plate, would read "All 12 part(s) have material" and go green —
        * and the first person to find out was a cutter.
        */
+      /*
+       * AND THE PLAN MUST BE ACCEPTED. Links alone are not acceptance: a plan
+       * can be looked at, re-nested and looked at again without anyone ever
+       * committing to one, and the step said "done" throughout because the
+       * PREVIOUS plan's links were still sitting there. Accepting is what
+       * raises the cutting order, so the cutting order is what proves it.
+       */
       state: nest.parts === 0 ? 'todo'
         : nest.nested === 0 ? 'todo'
           : nest.nested < nest.parts ? 'partial'
-            : nestBlocking.length > 0 ? 'partial' : 'done',
+            : !cuttingOrder ? 'partial'
+              : nestBlocking.length > 0 ? 'partial' : 'done',
       count: nest.nested,
       total: nest.parts,
       detail: nest.parts === 0
         ? 'No parts to nest yet'
         : nest.nested < nest.parts
           ? `${nest.parts - nest.nested} of ${nest.parts} part(s) have no material`
+          : !cuttingOrder
+            ? 'A plan has been proposed but not accepted yet'
           : nestBlocking.length > 0
             ? `All ${nest.parts} part(s) have material, but ${nestBlocking.length} `
               + `${nestBlocking.length === 1 ? 'problem' : 'problems'} would make it uncuttable — `
