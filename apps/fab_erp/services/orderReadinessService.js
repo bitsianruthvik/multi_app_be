@@ -362,30 +362,6 @@ export async function orderReadiness(companyId, orderId) {
           : `All ${fields.itemsChecked} part(s) are sized`,
     },
     {
-      /**
-       * Everything a flow asks for that is NOT the rectangle — hole counts,
-       * weld runs. Weight and area are absent on purpose: they are arithmetic
-       * on the rectangle and are computed, never asked for.
-       */
-      key: 'params',
-      label: 'Other params',
-      state: fields.itemsChecked === 0 ? 'todo'
-        : (shortOnRest > 0
-          || fields.unknownFields.length > 0
-          || (fields.unusableFields?.length ?? 0) > 0) ? 'partial' : 'done',
-      count: fields.itemsChecked - shortOnRest,
-      total: fields.itemsChecked,
-      detail: fields.itemsChecked === 0
-        ? 'Assign flows first — they decide which values are needed'
-        : fields.unknownFields.length > 0
-          ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
-          : (fields.unusableFields?.length ?? 0) > 0
-            ? `${fields.unusableFields.length} operation(s) use a field that is not set up for formulas`
-            : shortOnRest > 0
-              ? `${shortOnRest} of ${fields.itemsChecked} part(s) missing values`
-              : `All ${fields.itemsChecked} part(s) have what their operations need`,
-    },
-    {
       key: 'nesting',
       label: 'Nesting',
       /**
@@ -413,6 +389,30 @@ export async function orderReadiness(companyId, orderId) {
             : `All ${nest.parts} part(s) have material`,
       /** The full list, so the screen can show every one rather than the first. */
       issues: nestBlocking,
+    },
+    {
+      /**
+       * Everything a flow asks for that is NOT the rectangle — hole counts,
+       * weld runs. Weight and area are absent on purpose: they are arithmetic
+       * on the rectangle and are computed, never asked for.
+       */
+      key: 'params',
+      label: 'Other params',
+      state: fields.itemsChecked === 0 ? 'todo'
+        : (shortOnRest > 0
+          || fields.unknownFields.length > 0
+          || (fields.unusableFields?.length ?? 0) > 0) ? 'partial' : 'done',
+      count: fields.itemsChecked - shortOnRest,
+      total: fields.itemsChecked,
+      detail: fields.itemsChecked === 0
+        ? 'Assign flows first — they decide which values are needed'
+        : fields.unknownFields.length > 0
+          ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
+          : (fields.unusableFields?.length ?? 0) > 0
+            ? `${fields.unusableFields.length} operation(s) use a field that is not set up for formulas`
+            : shortOnRest > 0
+              ? `${shortOnRest} of ${fields.itemsChecked} part(s) missing values`
+              : `All ${fields.itemsChecked} part(s) have what their operations need`,
     },
     {
       key: 'tasks',
