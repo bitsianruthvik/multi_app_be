@@ -54,25 +54,32 @@ const specKg = (s) => (s.thickness * s.width * s.length * STEEL_DENSITY) / 1e9;
  * With a fixed seed and a fixed restart count, one order always packs the same
  * way. Verified: two runs at 60 restarts, byte-identical at 710.39 t.
  *
- * ── WHY THE NUMBERS ARE SO MUCH SMALLER NOW ──────────────────────────────────
+ * ── WHAT MORE EFFORT ACTUALLY BUYS ──────────────────────────────────────────
  *
- * Measured on the KEPL order, which is 24 rectangles over six thicknesses:
+ * Measured on the KEPL order — 24 rectangles over six thicknesses — with the
+ * candidate sizes SORTED, which matters: an earlier round of these numbers was
+ * taken against an unordered plate list and is not comparable.
  *
- *     1 restart    0.1 s    711.0 t
- *    60 restarts   3.8 s    710.4 t
- *   150 restarts   9.7 s    710.4 t
+ *     1 restart    0.1 s   129 sheets   711.0 t
+ *     8 restarts   0.6 s   128 sheets   710.5 t
+ *    60 restarts   5.3 s   127 sheets   710.4 t
+ *   150 restarts  12.5 s   127 sheets   710.3 t
  *
- * Sixty restarts buy SIX HUNDRED KILOGRAMS over one, and a hundred and fifty
- * buy nothing at all over sixty. The greedy first pass is already within 0.1%,
- * because mixing — which is where the tonnes are — comes free with longest-side
- * -first placement rather than from searching.
+ * The whole range is 0.7 t on a 710 t order — one tenth of one per cent. The
+ * greedy first pass is already there, because MIXING is where the tonnes are and
+ * mixing comes free with longest-side-first placement rather than from
+ * searching. Restarts only shuffle which near-equal arrangement you land on.
  *
- * So the old 400-restart "deep" was ninety seconds of wall clock in exchange for
- * nothing measurable. These levels are what the measurements support.
- */
+ * SHEET COUNT IS NOISIER THAN TONNAGE, and worth knowing before reading too much
+ * into it: the same order at the same restart count lands on 127 or 130 sheets
+ * depending only on the seed, for the same steel. The packer scores on area
+ * BOUGHT — the invoice — and treats plate count as a tie-break, so it will spend
+ * three more sheets to save a kilogram. If setups ever cost more than that
+ * kilogram, the scoring is the thing to change, not the effort level.
+ *
 const EFFORT = {
   quick: { restarts: 4 },
-  standard: { restarts: 24 },
+  standard: { restarts: 60 },
   deep: { restarts: 150 },
 };
 
