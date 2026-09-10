@@ -3436,6 +3436,25 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_orders ADD KEY idx_fo_source_purpose (source_order_id, order_type, mo_purpose)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- THE ORDER OF THE STRUCTURE IS A DECISION, so it needs somewhere to live.
+-- Rows were read back in `id` order, which is the order they happened to be
+-- inserted in. That is fine until somebody rearranges the tree — and it is not
+-- fine at all once the sequence means something, which it is about to: the
+-- production code for a piece is derived from where it sits among its siblings,
+-- so "second segment" has to keep being the second segment after a rebuild.
+-- NULL sorts with the id as a fallback, so every existing row keeps the order it
+-- already had and nothing has to be backfilled.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='sort_order');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_items ADD COLUMN sort_order INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_parent_sort');
+SET @sql = IF(@idx=0,
+  'ALTER TABLE fab_items ADD KEY idx_fi_parent_sort (order_id, parent_item_id, sort_order)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ── purchase-order lines ──────────────────────────────────────────────────
 -- fab_order_lines was built for SALES lines: free text, a price, a completed
 -- qty. A purchase line needs to name a catalog item — it is a specific plate,

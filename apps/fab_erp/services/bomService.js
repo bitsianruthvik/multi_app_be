@@ -1234,19 +1234,28 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * BOM's own abbreviations and the code pass will want them — they are data
      * being carried, not a decision being made here.
      */
-    const write = async (node, parentItemId, depth) => {
+    const write = async (node, parentItemId, depth, position = 0) => {
       const kids = Array.isArray(node.children) ? node.children : [];
       const [r] = await conn.query(
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
-            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
-         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?)`,
+            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
+            flow_id, sort_order)
+         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)`,
         [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
           node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
           requireQty(node),
           depth, kids.length ? 0 : 1,
           procurementOf.get(Number(node.catalogItemId)) ?? 'make',
-          node.defaultFlowId ?? null]);
+          node.defaultFlowId ?? null,
+          /*
+           * WHERE IT SITS AMONG ITS SIBLINGS, kept because the sequence is about
+           * to mean something: a production code is derived from position, so
+           * "the second segment" has to still be the second segment after a
+           * rebuild. Reading back in id order was insertion order, which is the
+           * same thing right up until somebody rearranges the tree.
+           */
+          position]);
       created++;
       byDepth[depth] = (byDepth[depth] ?? 0) + 1;
       if (node.bomLineId) fromBomLine.push([Number(node.bomLineId), r.insertId]);
@@ -1261,7 +1270,7 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
         }
       }
 
-      for (const child of kids) await write(child, r.insertId, depth + 1);
+      for (let i = 0; i < kids.length; i += 1) await write(kids[i], r.insertId, depth + 1, i);
       return r.insertId;
     };
 
@@ -1509,7 +1518,9 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
         AND NOT node_kind = 'material' ${lineScope}
         AND ${NOT_A_BLANK('fab_items')}
-      ORDER BY id`,
+      -- sort_order first, id as the tie-break, so rows written before the
+      -- column existed keep exactly the order they already had.
+      ORDER BY sort_order IS NULL, sort_order, id`,
     orderLineId == null ? [companyId, orderId] : [companyId, orderId, orderLineId],
   );
   if (!rows.length) return null;
@@ -1596,7 +1607,8 @@ export async function applyTree(companyId, spec, existingConn = null) {
       : { sql: 'AND order_line_id = ?', args: [orderLineId] };
 
     const [existing] = await conn.query(
-      `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf
+      `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf,
+              sort_order AS sortOrder
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
           AND NOT node_kind = 'material' ${lineScope.sql}
@@ -1626,7 +1638,7 @@ export async function applyTree(companyId, spec, existingConn = null) {
     /** (item id, field key, value|null) for every size the tree carried. */
     const dimEdits = [];
 
-    const walk = async (node, parentItemId, depth) => {
+    const walk = async (node, parentItemId, depth, position = 0) => {
       const kids = Array.isArray(node.children) ? node.children : [];
       const isLeaf = kids.length ? 0 : 1;
       const qty = requireQty(node);
@@ -1640,13 +1652,16 @@ export async function applyTree(companyId, spec, existingConn = null) {
           && Number(was.qty) === qty
           && Number(was.parentItemId ?? 0) === Number(parentItemId ?? 0)
           && Number(was.depth) === depth
-          && Number(was.isLeaf) === isLeaf;
+          && Number(was.isLeaf) === isLeaf
+          // Moving a row among its siblings is a change like any other.
+          && Number(was.sortOrder ?? -1) === position;
         if (!same) {
           await conn.query(
             `UPDATE fab_items
-                SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?, is_leaf = ?
+                SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?,
+                    is_leaf = ?, sort_order = ?
               WHERE id = ? AND company_id = ?`,
-            [node.name, unit, qty, parentItemId, depth, isLeaf, id, companyId],
+            [node.name, unit, qty, parentItemId, depth, isLeaf, position, id, companyId],
           );
           updated += 1;
         }
@@ -1655,12 +1670,13 @@ export async function applyTree(companyId, spec, existingConn = null) {
         const [r] = await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
-              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
-           VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?)`,
+              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
+              flow_id, sort_order)
+           VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)`,
           [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
             node.name, unit, qty, depth, isLeaf,
             procurementOf.get(Number(node.catalogItemId)) ?? 'make',
-            node.defaultFlowId ?? null],
+            node.defaultFlowId ?? null, position],
         );
         id = r.insertId;
         created += 1;
@@ -1678,7 +1694,7 @@ export async function applyTree(companyId, spec, existingConn = null) {
         }
       }
 
-      for (const kid of kids) await walk(kid, id, depth + 1);
+      for (let i = 0; i < kids.length; i += 1) await walk(kids[i], id, depth + 1, i);
       return id;
     };
 
