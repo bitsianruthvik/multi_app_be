@@ -357,8 +357,15 @@ export async function orderReadiness(companyId, orderId) {
         ? 'No structure entered'
         : shortOnDims > 0
           ? `${tree.levels.length} levels · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
+          /*
+           * NOT "rows with no flow". A row is allowed to have none — plenty
+           * exist only to give the tree a level and the code a segment, and
+           * they build no tasks by design. What this counts is narrower and
+           * worth acting on: the BOM line states a flow and this order never
+           * received it, which is a dropped answer rather than an absent one.
+           */
           : flowState.missing > 0
-            ? `${tree.levels.length} levels · ${tree.total} rows — ${flowState.missing} row(s) have no flow yet`
+            ? `${tree.levels.length} levels · ${tree.total} rows — ${flowState.missing} row(s) have not picked up the flow their BOM states`
             : `${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} row${tree.total === 1 ? '' : 's'}`,
     },
     {
