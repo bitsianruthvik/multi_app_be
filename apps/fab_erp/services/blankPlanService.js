@@ -32,6 +32,7 @@
  * one plate to the machine and cuts everything out of it.
  */
 
+import { pool } from '../../../db.js';
 import { plateCatalog, offcutSpecs } from './nestingSuggestService.js';
 import { nestAsync, shrinkPlates, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
 import { orderBlanks } from './blankService.js';
@@ -94,6 +95,62 @@ const EFFORT = {
 const SAFETY_MS = 300000;
 
 /**
+ * The sheets THIS ORDER HAS ALREADY ACCEPTED, read straight back.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────────────────
+ *
+ * Opening the nesting screen used to re-pack from scratch every time — around
+ * 36 seconds at 500 restarts, on an order whose plan was decided days ago. The
+ * screen looked stuck, and it was burning a CPU to arrive back at the answer it
+ * had already been given.
+ *
+ * A saved plan IS the plan. Re-packing is a thing somebody asks for, not the
+ * price of looking.
+ *
+ * The rows are the material links under each blank: one per (blank, sheet), all
+ * the rows for one sheet sharing a nest_no. That is enough to rebuild exactly
+ * what was accepted — nothing is re-derived, so what you see is what will be cut.
+ */
+async function savedNests(companyId, orderId, byKeyCode) {
+  const [rows] = await pool.query(
+    `SELECT m.nest_no AS nestNo, m.qty AS qty,
+            b.code AS blankCode,
+            pc.id AS plateId, pc.code AS plateCode, pc.name AS plateName,
+            pc.thickness_mm AS thickness,
+            m.width AS plateWidth, m.length AS plateLength
+       FROM fab_items m
+       JOIN fab_items bl ON bl.id = m.parent_item_id AND bl.deleted_at IS NULL
+       JOIN fab_item_catalog b ON b.id = bl.catalog_item_id AND b.material_form = 'blank'
+       JOIN fab_item_catalog pc ON pc.id = m.catalog_item_id
+      WHERE m.company_id = ? AND m.order_id = ? AND m.deleted_at IS NULL
+        AND m.node_kind = 'material' AND m.nest_no IS NOT NULL
+      ORDER BY m.nest_no, m.id`,
+    [companyId, orderId],
+  );
+  if (!rows.length) return null;
+
+  const bySheet = new Map();
+  for (const r of rows) {
+    const key = byKeyCode.get(String(r.blankCode));
+    if (!key) continue;             // a blank the structure no longer calls for
+    const hit = bySheet.get(r.nestNo) ?? {
+      nestNo: r.nestNo,
+      plateCatalogItemId: Number(r.plateId),
+      plateCode: r.plateCode ?? null,
+      plateName: r.plateName ?? null,
+      thickness: Number(r.thickness) || 0,
+      width: Number(r.plateWidth) || 0,
+      length: Number(r.plateLength) || 0,
+      isDrop: false,
+      items: [],
+    };
+    hit.items.push({ key, qty: Number(r.qty) || 0 });
+    bySheet.set(r.nestNo, hit);
+  }
+  return [...bySheet.values()];
+}
+
+/**
  * The plan for an order: the sheets, what is on each, and the demand behind it.
  *
  * @param {object} opts
@@ -103,6 +160,38 @@ export async function blankPlan(companyId, orderId, opts = {}) {
   const { orderNumber, blanks, skipped } = await orderBlanks(companyId, orderId);
   if (!blanks.length) {
     return { orderNumber, blanks: [], nests: [], skipped, summary: emptySummary() };
+  }
+
+  /*
+   * THE SAVED PLAN WINS, unless somebody asks for a fresh one.
+   *
+   * Re-packing on every visit meant a 36-second spinner to be shown the plan the
+   * order already had. Reading it back is a single query, and it is also more
+   * honest: what is on screen is then literally what will be cut, rather than a
+   * fresh proposal that may differ from what was accepted.
+   */
+  const byKeyCode = new Map(blanks.map((b) => [b.code, b.key]));
+  if (!opts.repack) {
+    const saved = await savedNests(companyId, orderId, byKeyCode);
+    if (saved?.length) {
+      const withKg = saved.map((n) => ({
+        ...n,
+        plateKg: specKg(n),
+        usedPct: usedFraction(n, blanks),
+      }));
+      const rows = describeBlanks(blanks, withKg, new Map());
+      return {
+        orderNumber,
+        blanks: rows,
+        nests: withKg,
+        skipped,
+        summary: summarise(rows, withKg),
+        effort: null,
+        seed: null,
+        reproducible: true,
+        fromSaved: true,
+      };
+    }
   }
 
   const plates = await plateCatalog(companyId);
@@ -240,40 +329,7 @@ export async function blankPlan(companyId, orderId, opts = {}) {
   }
   const reasonFor = new Map(noSteel.map((x) => [x.key, x.reason]));
 
-  const out = blanks.map((b) => {
-    const on = onPlates.get(b.key) ?? [];
-    const placed = on.reduce((s, x) => s + x.qty, 0);
-    return {
-      key: b.key,
-      code: b.code,
-      name: b.name,
-      material: b.material,
-      grade: b.grade,
-      thickness: b.thickness,
-      width: b.width,
-      length: b.length,
-      qty: b.qty,
-      unitWeightKg: b.unitWeightKg,
-      totalWeightKg: b.totalWeightKg,
-      partNames: b.partNames,
-      partCount: b.parts.length,
-      /** The sheets this rectangle is cut from, and how many land on each. */
-      nests: on.map((x) => ({
-        nestNo: x.plate.nestNo,
-        qty: x.qty,
-        plate: `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`,
-        isDrop: x.plate.isDrop,
-        sharedWith: x.plate.items.length - 1,
-      })),
-      plateSizes: [...new Set(on.map((x) => `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`))],
-      plateCount: on.length,
-      /** Sheets carrying something else too — the whole point of mixing. */
-      sharesPlates: on.filter((x) => x.plate.items.length > 1).length,
-      placed,
-      short: Math.max(0, b.qty - placed),
-      reason: placed === 0 ? (reasonFor.get(b.key) ?? null) : null,
-    };
-  });
+  const out = describeBlanks(blanks, nests, reasonFor);
 
   return {
     orderNumber,
@@ -315,4 +371,68 @@ function summarise(rows, nests) {
     yield: grossKg > 0 ? usedKg / grossKg : 0,
     short: rows.filter((r) => r.short > 0).length,
   };
+}
+
+/**
+ * The per-blank view: where each rectangle ended up and whether it is covered.
+ *
+ * Shared by both paths on purpose. The saved plan and a fresh pack must describe
+ * a blank identically — two descriptions of one thing is how a screen ends up
+ * disagreeing with itself depending on which way you arrived at it.
+ */
+function describeBlanks(blanks, nests, reasonFor) {
+  const onPlates = new Map();
+  for (const n of nests) {
+    for (const it of n.items) {
+      onPlates.set(it.key, [...(onPlates.get(it.key) ?? []), { qty: it.qty, plate: n }]);
+    }
+  }
+  return blanks.map((b) => {
+    const on = onPlates.get(b.key) ?? [];
+    const placed = on.reduce((s, x) => s + x.qty, 0);
+    return {
+      key: b.key,
+      code: b.code,
+      name: b.name,
+      material: b.material,
+      grade: b.grade,
+      thickness: b.thickness,
+      width: b.width,
+      length: b.length,
+      qty: b.qty,
+      unitWeightKg: b.unitWeightKg,
+      totalWeightKg: b.totalWeightKg,
+      partNames: b.partNames,
+      partCount: b.parts.length,
+      /** The sheets this rectangle is cut from, and how many land on each. */
+      nests: on.map((x) => ({
+        nestNo: x.plate.nestNo,
+        qty: x.qty,
+        plate: `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`,
+        isDrop: x.plate.isDrop,
+        sharedWith: x.plate.items.length - 1,
+      })),
+      plateSizes: [...new Set(on.map((x) => `${x.plate.thickness} × ${x.plate.width} × ${x.plate.length}`))],
+      plateCount: on.length,
+      /** Sheets carrying something else too — the whole point of mixing. */
+      sharesPlates: on.filter((x) => x.plate.items.length > 1).length,
+      placed,
+      short: Math.max(0, b.qty - placed),
+      reason: placed === 0 ? (reasonFor.get(b.key) ?? null) : null,
+    };
+  });
+
+
+}
+
+/** How much of a sheet its contents actually use. */
+function usedFraction(nest, blanks) {
+  const byKey = new Map(blanks.map((b) => [b.key, b]));
+  const area = (nest.width || 0) * (nest.length || 0);
+  if (!area) return 0;
+  const used = nest.items.reduce((a, it) => {
+    const b = byKey.get(it.key);
+    return a + (b ? b.width * b.length * it.qty : 0);
+  }, 0);
+  return Math.min(1, used / area);
 }
