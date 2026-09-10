@@ -1987,7 +1987,8 @@
         "alias": "fcus_o",
         "on": "fo.customer_id = fcus_o.id",
         "fields": [
-          "customerCode"
+          "customerCode",
+          "customerLinkedName"
         ]
       },
       "supplier": {
