@@ -1924,6 +1924,7 @@
       "plantName": "fpl_o.name",
       "plantCode": "fpl_o.code",
       "customerCode": "fcus_o.code",
+      "customerLinkedName": "fcus_o.name",
       "supplierId": "fo.supplier_id"
     },
     "fieldTypes": {
@@ -1967,6 +1968,7 @@
       "plantName": "string",
       "plantCode": "string",
       "customerCode": "string",
+      "customerLinkedName": "string",
       "supplierName": "string",
       "supplierCode": "string"
     },

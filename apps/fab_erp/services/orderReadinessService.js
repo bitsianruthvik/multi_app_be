@@ -32,6 +32,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
 import { missingFieldsForOrder } from './itemFieldService.js';
 import { isDimension } from './fieldDeriveService.js';
 import { orderShortfall } from './procurementService.js';
@@ -628,6 +629,16 @@ async function countTree(companyId, orderId) {
        FROM fab_items fi
       WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
         AND fi.node_kind = 'structure'
+        /*
+         * BLANKS ARE NOT PART OF THE STRUCTURE somebody drew.
+         *
+         * They sit on the order as depth-0 structure rows carrying the cutting
+         * flow, so this counted them: an 82-row structure reported 106, and the
+         * extra 24 appeared as a second thing at the top level beside the Span.
+         * The number on a stage chip is the one people check their own work
+         * against, so being quietly 29% high is worse than being absent.
+         */
+        AND ${NOT_A_BLANK('fi')}
       GROUP BY fi.depth
       ORDER BY fi.depth`,
     [companyId, orderId],
