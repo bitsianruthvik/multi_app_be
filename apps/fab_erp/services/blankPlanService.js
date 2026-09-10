@@ -33,7 +33,7 @@
  */
 
 import { plateCatalog, offcutSpecs } from './nestingSuggestService.js';
-import { nest, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
+import { nest, shrinkPlates, DEFAULT_CUT_GAP_MM } from './nestingPacker.js';
 import { orderBlanks } from './blankService.js';
 
 const STEEL_DENSITY = 7850;
@@ -119,7 +119,19 @@ export async function blankPlan(companyId, orderId, opts = {}) {
       deadline: Date.now() + perGroupMs,
     });
 
-    for (const pl of res.plates) {
+    /*
+     * SHRINK EACH SHEET to the smallest that still holds what landed on it.
+     *
+     * Measured on the KEPL order this changes NOTHING — 0 of 127 sheets could
+     * be swapped — because the greedy loop already picks a tight spec. It is
+     * kept because it provably cannot make the answer worse (a swap requires
+     * every row re-placed on a strictly smaller sheet) and because "the packer
+     * happens to choose well here" is a property of THIS catalogue rather than
+     * a guarantee. A yard with more sizes per thickness would give it work.
+     */
+    const packed = shrinkPlates(res.plates, specs, DEFAULT_CUT_GAP_MM);
+
+    for (const pl of packed) {
       nestNo += 1;
       const usedMm2 = pl.rows.reduce((s, r) => s + r.length * r.width * r.qty, 0);
       nests.push({

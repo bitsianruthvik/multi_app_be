@@ -22,6 +22,7 @@ import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { demandFor } from '../services/partIdentityService.js';
 import { duplicateSubtree } from '../services/bomService.js';
 import { blankPlan } from '../services/blankPlanService.js';
+import { exportPlan, importPlan } from '../services/blankSheetService.js';
 import { acceptNestingPlan } from '../services/blankService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import {
@@ -153,6 +154,50 @@ router.post('/orders/:orderId/blanks/accept', protect, requirePerm('fab_erp_proj
     } catch (err) {
       logger.error({ err }, 'fab_erp: accept nesting plan');
       return res.status(err.status ?? 500).json({ message: err.message });
+    }
+  });
+
+/**
+ * THE PLAN AS A SPREADSHEET — the second way in.
+ *
+ * `GET  /orders/:orderId/blanks/sheet`    download the plan to edit
+ * `POST /orders/:orderId/blanks/sheet`    upload a filled one and apply it
+ *
+ * The packer does not know that the 40 mm is stacked behind the 25 mm, or that
+ * the cutter wants the diaphragm plates in one setup. A planner who cannot say
+ * so keeps the real plan in a spreadsheet beside the software, and then the
+ * software describes a job nobody is doing.
+ *
+ * Upload APPLIES the plan, so it needs the same permission as accepting one.
+ */
+router.get('/orders/:orderId/blanks/sheet', protect, async (req, res) => {
+  try {
+    const { buffer, filename } = await exportPlan(
+      (req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId),
+      { effort: req.query?.effort },
+    );
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(Buffer.from(buffer));
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: cutting plan export');
+    return res.status(err.status ?? 500).json({ message: err.message });
+  }
+});
+
+router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_projects_manage'),
+  upload.single('excel_file'), async (req, res) => {
+    try {
+      if (!req.file?.buffer) return res.status(400).json({ message: 'No file was uploaded.' });
+      const cid = req.user?.companyId ?? req.user?.company_id;
+      const orderId = Number(req.params.orderId);
+      const read = await importPlan(cid, orderId, req.file.buffer);
+      const out = await acceptNestingPlan(cid, orderId, read.plan);
+      return res.json({ ok: true, ...out, fromSheet: { rows: read.rows, sheets: read.sheets, short: read.short } });
+    } catch (err) {
+      logger.error({ err }, 'fab_erp: cutting plan import');
+      return res.status(err.status ?? 500).json({ message: err.message, problems: err.problems });
     }
   });
 

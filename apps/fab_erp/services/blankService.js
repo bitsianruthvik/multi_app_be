@@ -315,12 +315,24 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
         updated += 1;
       } else {
         const [r] = await conn.query(
+      /*
+       * THE DESCRIPTION DOES NOT NAME THE PARTS.
+       *
+       * It used to list them, which read as if the blank belonged to those
+       * parts — and a blank does not: it is a SIZE, and this one serves eight
+       * part rows. The list also repeated itself (the same name once per row)
+       * and went stale the moment somebody edited the structure, while sitting
+       * in a catalogue record that outlives the edit.
+       *
+       * Which parts draw on a blank is a live question, answered by looking at
+       * what points at it. It is not an attribute of the blank.
+       */
           `INSERT INTO fab_item_catalog
              (company_id, name, code, unit, category_id, group_id, subgroup_id,
               procurement_type, thickness_mm, material_form, description, created_at)
            VALUES (?,?,?,'nos',?,?,?,'make',?,'blank',?,NOW())`,
           [companyId, b.name, b.code, group.categoryId, group.id, sub.id, b.thickness,
-            `Cut for ${orderNumber}. Used by: ${b.parts.map((p) => p.name).join(', ')}`],
+            `${b.material} ${b.grade} plate, ${b.thickness} x ${b.width} x ${b.length}, cut for ${orderNumber}.`],
         );
         b.catalogItemId = r.insertId;
         created += 1;

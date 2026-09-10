@@ -678,3 +678,58 @@ export function verify(plates) {
   }
   return problems;
 }
+
+/**
+ * SHRINK EACH PLATE TO THE SMALLEST SHEET THAT STILL HOLDS WHAT IS ON IT.
+ *
+ * ── THE GAP THIS FILLS ───────────────────────────────────────────────────────
+ *
+ * The greedy loop CHOOSES a sheet size and then fills it. Whatever it happens
+ * to choose first is what gets bought, and it never revisits that choice — so a
+ * sheet picked because it was the best home for a big web plate keeps its full
+ * size even after the web turns out to be all it received.
+ *
+ * `consolidate` does not catch this. It moves rows OFF near-empty plates to
+ * delete them entirely, which is a different move: it reduces the plate COUNT.
+ * This reduces the plate SIZE, on plates that are staying.
+ *
+ * ── WHY IT CANNOT MAKE THINGS WORSE ──────────────────────────────────────────
+ *
+ * A swap only happens when every row currently on the plate is re-placed on the
+ * smaller sheet, and only onto a sheet of strictly smaller area. Nothing is
+ * stranded and nothing grows, so area bought falls or stays put.
+ *
+ * ── OFFCUTS ARE NOT SHRINK TARGETS ───────────────────────────────────────────
+ *
+ * A drop is ONE physical piece of steel, and two plates shrinking onto the same
+ * drop would both believe they had it. Counting that correctly means tracking
+ * availability across the whole solution, which is worth doing and is not this
+ * function. Catalogue sizes can be bought again, so they have no such problem.
+ */
+export function shrinkPlates(plates, specs, margin = DEFAULT_CUT_GAP_MM) {
+  const buyable = specs.filter((s) => s.available == null);
+  if (!buyable.length) return plates;
+
+  return plates.map((p) => {
+    // An offcut already costs nothing; shrinking it saves nothing.
+    if (p.spec.available != null) return p;
+
+    const here = areaOf(p);
+    const smaller = buyable
+      .filter((s) => s.length * s.width < here)
+      .sort((a, b) => (a.length * a.width) - (b.length * b.width));
+
+    for (const s of smaller) {
+      let trial = newPlate(s, margin);
+      let ok = true;
+      for (const row of p.rows) {
+        const next = placeRow(trial, row);
+        if (!next) { ok = false; break; }
+        trial = next;
+      }
+      // Smallest first, so the first that fits is the best that fits.
+      if (ok) return trial;
+    }
+    return p;
+  });
+}
