@@ -21,6 +21,8 @@ import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { demandFor } from '../services/partIdentityService.js';
 import { duplicateSubtree } from '../services/bomService.js';
+import { blankPlan } from '../services/blankPlanService.js';
+import { acceptNestingPlan } from '../services/blankService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import {
   exportOrderItemsTemplateHandler,
@@ -114,6 +116,45 @@ router.delete('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_pr
 // repoints material and is an arranging action like the rest.
 router.get('/orders/:orderId/nesting/suggest', protect, suggestNestingHandler);
 router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab_erp_projects_manage'), acceptNestingHandler);
+
+/**
+ * THE BLANKS (2026-09-10) — nesting as it now works.
+ *
+ * `GET  /orders/:orderId/blanks`          what has to be cut, and from what
+ * `POST /orders/:orderId/blanks/accept`   make it real and raise the work
+ *
+ * These replace the board and the suggestor for new work. The difference is the
+ * BLANK: the old pair link a plate straight to each part, so 960 identical
+ * stiffeners are 960 claims on steel and the rectangle they share exists
+ * nowhere. Reading writes nothing, so it needs only the permission to look.
+ *
+ * NOTE the two are not yet mutually exclusive at the data level — both wipe a
+ * part's material rows before writing their own, so using the old board on an
+ * order that has been through here would undo the blanks. The old screens are
+ * on their way out; until they are gone, one order should use one of them.
+ */
+router.get('/orders/:orderId/blanks', protect, async (req, res) => {
+  try {
+    const plan = await blankPlan((req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId));
+    return res.json({ ok: true, ...plan });
+  } catch (err) {
+    logger.error({ err }, 'fab_erp: blank plan');
+    return res.status(err.status ?? 500).json({ message: err.message });
+  }
+});
+
+router.post('/orders/:orderId/blanks/accept', protect, requirePerm('fab_erp_projects_manage'),
+  async (req, res) => {
+    try {
+      const out = await acceptNestingPlan(
+        (req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId), req.body?.plan ?? {},
+      );
+      return res.json({ ok: true, ...out });
+    } catch (err) {
+      logger.error({ err }, 'fab_erp: accept nesting plan');
+      return res.status(err.status ?? 500).json({ message: err.message });
+    }
+  });
 
 // ── Flow allocation: stage 3 (2026-08) ─────────────────────────────────────
 router.get('/orders/:orderId/flows/summary', protect, flowSummaryHandler);

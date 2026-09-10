@@ -82,6 +82,7 @@ export async function exportStructure(companyId, orderId) {
        LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id AND c.deleted_at IS NULL
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND NOT i.node_kind = 'material'
+        AND ${NOT_A_BLANK('i')}
       ORDER BY i.id`,
     [companyId, orderId],
   );

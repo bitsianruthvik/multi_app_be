@@ -38,12 +38,33 @@
  * the interesting question — "what is THIS job cutting" — cannot be asked.
  *
  * Per order, the group grows with live work and can be retired with it.
+ *
+ * ── CUTTING IS ORDINARY WORK ─────────────────────────────────────────────────
+ *
+ * A blank row goes on the SALES ORDER beside everything else, carrying the
+ * cutting flow, and the order's one production order claims its tasks like any
+ * other. There was briefly a separate `order_type='cutting'` document; it was
+ * wrong. Cutting is not a different kind of manufacturing, and a second order
+ * per job meant two things to release, two to chase and two to close for one
+ * trip through the same shop.
+ *
+ * The cost of putting them on the sales order is that a blank row LOOKS like a
+ * made leaf — it is childless apart from the plate beneath it — so the function
+ * that computes blanks would happily make blanks out of blanks. That is what
+ * `NOT_A_BLANK` below is for, and it is why the exclusion is written once and
+ * shared rather than repeated at each call site.
  */
 
 import { pool } from '../../../db.js';
 import { resolveFields } from './fieldService.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { DEFAULT_DENSITY } from './fieldDeriveService.js';
+import { materializeOrderTasks } from './taskGatingService.js';
+import { ensureProductionOrder } from './productionOrderService.js';
+import { logger } from '../../../core/utils/logger.js';
+
+/** The flow a blank is cut by, unless the plan names another. */
+export const CUTTING_FLOW_CODE = 'C0001';
 
 /** Where blanks are filed. The group is expected to exist; the subgroup is per order. */
 const BLANK_CATEGORY = 'Raw Materials';
@@ -68,6 +89,24 @@ export function blankName(orderNumber, { material, grade, thickness, width, leng
   const steel = [material, grade].filter(Boolean).join(' ');
   return `${steel || 'Blank'} ${thickness} x ${width} x ${length} — ${orderNumber}`;
 }
+
+/**
+ * SQL that excludes blank rows, for any query aliasing fab_items as `i`.
+ *
+ * A blank sits on the order as a structure row with the plate beneath it, so
+ * every "made leaf" test and every structure read would otherwise pick it up:
+ * the editor would show it as a sibling of the Span, the spreadsheet would
+ * export it, and `orderBlanks` would treat it as something that needs cutting
+ * out of something else.
+ *
+ * The test is the CATALOG's `material_form`, not the row's shape. Shape-based
+ * guesses ("it has exactly one material child") are the kind of rule that holds
+ * until the day a real part has one too.
+ */
+export const NOT_A_BLANK = (alias = 'i') => `
+  NOT EXISTS (SELECT 1 FROM fab_item_catalog bc
+               WHERE bc.id = ${alias}.catalog_item_id
+                 AND bc.material_form = 'blank')`;
 
 /** The identity of a blank, as a string, for grouping. */
 const blankKey = (b) => [b.material ?? '?', b.grade ?? '?', b.thickness, b.width, b.length].join('|');
@@ -102,6 +141,9 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
           SELECT 1 FROM fab_items k
            WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL
              AND NOT k.node_kind = 'material')
+        -- A blank is childless apart from its plate, so without this it reads
+        -- as a made leaf and the order grows blanks of blanks on every re-nest.
+        AND ${NOT_A_BLANK('p')}
       ORDER BY p.id`,
     [companyId, orderId],
   );
@@ -345,6 +387,234 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
       orderNumber, created, updated, retired: stale.length,
       subgroupId: Number(sub.id), blanks, skipped,
     };
+  } catch (err) {
+    if (owned) await conn.rollback();
+    throw err;
+  } finally {
+    if (owned) conn.release();
+  }
+}
+
+/**
+ * acceptNestingPlan — make the blanks real, and make cutting them ordinary work.
+ *
+ * ── WHAT IT WRITES ───────────────────────────────────────────────────────────
+ *
+ *   1. a catalog item per blank                       (materialiseBlanks)
+ *   2. a row per blank ON THE SALES ORDER, carrying the cutting flow
+ *   3. the plate under each blank row                 the RM -> blank mapping
+ *   4. every part's material link repointed from plate to blank
+ *   5. tasks for the new rows, claimed by the order's own production order
+ *
+ * ── WHY THE ROWS GO ON THE SALES ORDER ───────────────────────────────────────
+ *
+ * Because cutting is not a different kind of manufacturing. An earlier version
+ * raised a separate `order_type='cutting'` document, which made every job two
+ * things to release, chase and close instead of one, and put the blanks
+ * somewhere the rest of the system had to be taught about.
+ *
+ * On the sales order they are ordinary rows: `materializeOrderTasks` builds
+ * their tasks with no special case, `ensureProductionOrder` claims them because
+ * they are make work, and the Plan Board shows cutting beside welding. The one
+ * thing that had to be taught is `NOT_A_BLANK`, so the structure editor and the
+ * blank calculation both look past them.
+ *
+ * ── ORDER_LINE_ID IS NULL, DELIBERATELY ──────────────────────────────────────
+ *
+ * A blank belongs to the JOB, not to one line of it. The same rectangle is
+ * usually cut for both spans, and filing it under the first line would make the
+ * second line's parts depend on the first line's steel for no reason anybody
+ * could see. It also keeps blanks out of every per-line structure read, which
+ * is most of them.
+ */
+export async function acceptNestingPlan(companyId, orderId, plan = {}, existingConn = null) {
+  const conn = existingConn ?? await pool.getConnection();
+  const owned = !existingConn;
+  try {
+    if (owned) await conn.beginTransaction();
+
+    const mat = await materialiseBlanks(companyId, orderId, conn);
+    if (!mat.blanks.length) {
+      const e = new Error('Nothing on this order can be nested yet — no part has a size on it.');
+      e.status = 400; throw e;
+    }
+
+    const [[cuttingFlow]] = await conn.query(
+      `SELECT id FROM fab_operation_flows
+        WHERE company_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1`,
+      [companyId, CUTTING_FLOW_CODE],
+    );
+    if (!cuttingFlow) {
+      const e = new Error(`No cutting flow (${CUTTING_FLOW_CODE}) to put this work on.`);
+      e.status = 500; throw e;
+    }
+
+    // ── the blank rows, one per rectangle ──────────────────────────────────
+    const [existing] = await conn.query(
+      `SELECT i.id, i.catalog_item_id AS catalogItemId, i.qty, i.flow_id AS flowId
+         FROM fab_items i
+         JOIN fab_item_catalog c ON c.id = i.catalog_item_id
+        WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+          AND i.node_kind = 'structure' AND c.material_form = 'blank'`,
+      [companyId, orderId],
+    );
+    const rowByCatalog = new Map(existing.map((r) => [Number(r.catalogItemId), r]));
+
+    let rowsCreated = 0;
+    let rowsUpdated = 0;
+    const blankRowId = new Map();
+
+    for (const b of mat.blanks) {
+      const chosen = plan[b.key] ?? {};
+      const flowId = Number(chosen.flowId) || cuttingFlow.id;
+      const was = rowByCatalog.get(Number(b.catalogItemId));
+
+      if (was) {
+        if (Number(was.qty) !== b.qty || Number(was.flowId) !== flowId) {
+          await conn.query(
+            `UPDATE fab_items SET qty = ?, flow_id = ?, name = ? WHERE id = ? AND company_id = ?`,
+            [b.qty, flowId, b.name, was.id, companyId],
+          );
+          rowsUpdated += 1;
+        }
+        blankRowId.set(b.key, Number(was.id));
+      } else {
+        const [r] = await conn.query(
+          `INSERT INTO fab_items
+             (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
+           VALUES (?,?,NULL,NULL,?,?,'nos',?,?,'structure',0,0,'make',?)`,
+          [companyId, orderId, b.catalogItemId, b.name, b.qty, b.code, flowId],
+        );
+        blankRowId.set(b.key, r.insertId);
+        rowsCreated += 1;
+      }
+    }
+
+    /*
+     * A rectangle the order no longer needs takes its row with it. Editing the
+     * structure changes which blanks exist, and a cutting line for something
+     * nobody is making would still be scheduled and still draw plate.
+     */
+    const liveCatalogIds = mat.blanks.map((b) => Number(b.catalogItemId));
+    const stale = existing.filter((r) => !liveCatalogIds.includes(Number(r.catalogItemId)));
+    if (stale.length) {
+      const ids = stale.map((r) => r.id);
+      const [[worked]] = await conn.query(
+        `SELECT COUNT(*) AS n FROM fab_project_tasks
+          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL
+            AND (started_at IS NOT NULL OR status IN ('in_progress','paused','done'))`,
+        [companyId, ids],
+      );
+      if (worked.n > 0) {
+        const e = new Error(
+          `Refused: ${worked.n} cutting task(s) for blanks this order no longer needs have `
+          + 'already been started. Re-nesting would throw that away.');
+        e.status = 409; e.code = 'WORK_STARTED'; throw e;
+      }
+      await conn.query(
+        `UPDATE fab_project_tasks SET deleted_at = NOW()
+          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`, [companyId, ids]);
+      await conn.query(
+        `UPDATE fab_items SET deleted_at = NOW()
+          WHERE company_id = ? AND (id IN (?) OR parent_item_id IN (?)) AND deleted_at IS NULL`,
+        [companyId, ids, ids]);
+    }
+
+    // ── the plate under each blank ─────────────────────────────────────────
+    const rowIds = [...blankRowId.values()];
+    if (rowIds.length) {
+      await conn.query(
+        `UPDATE fab_items SET deleted_at = NOW()
+          WHERE company_id = ? AND parent_item_id IN (?) AND node_kind = 'material'
+            AND deleted_at IS NULL`,
+        [companyId, rowIds],
+      );
+    }
+    let nestNo = 0;
+    let platesLinked = 0;
+    for (const b of mat.blanks) {
+      const chosen = plan[b.key];
+      if (!chosen?.plateCatalogItemId) continue;
+      const parentId = blankRowId.get(b.key);
+      const plates = Math.max(1, Number(chosen.plates) || 1);
+      const [[pc]] = await conn.query(
+        `SELECT id, code, name, thickness_mm AS thickness FROM fab_item_catalog
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+        [chosen.plateCatalogItemId, companyId],
+      );
+      if (!pc) continue;
+      nestNo += 1;
+      await conn.query(
+        `INSERT INTO fab_items
+           (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+            name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
+            flow_id, nest_no, length, width, height)
+         VALUES (?,?,NULL,?,?,?,'nos',?,?,'material',1,1,'buy',NULL,?,?,?,?)`,
+        [companyId, orderId, parentId, pc.id, pc.name, plates,
+          `${b.code}-${pc.code}`, `N-${String(nestNo).padStart(3, '0')}`,
+          chosen.plateLength ?? null, chosen.plateWidth ?? null, pc.thickness ?? null],
+      );
+      platesLinked += 1;
+    }
+
+    // ── every part now comes off its blank, not off plate ──────────────────
+    let partsRepointed = 0;
+    for (const b of mat.blanks) {
+      for (const part of b.parts) {
+        await conn.query(
+          `UPDATE fab_items SET deleted_at = NOW()
+            WHERE company_id = ? AND parent_item_id = ? AND node_kind = 'material'
+              AND deleted_at IS NULL`,
+          [companyId, part.itemId],
+        );
+        await conn.query(
+          `INSERT INTO fab_items
+             (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
+              flow_id, length, width, height)
+           SELECT ?, order_id, order_line_id, ?, ?, ?, 'nos', ?, ?, 'material', depth + 1, 1,
+                  'make', NULL, ?, ?, ?
+             FROM fab_items WHERE id = ? AND company_id = ?`,
+          [companyId, part.itemId, b.catalogItemId, b.name, part.qty,
+            `${b.code}-${part.itemId}`, b.length, b.width, b.thickness,
+            part.itemId, companyId],
+        );
+        partsRepointed += 1;
+      }
+    }
+
+    // ── the work, and the order that owns it ───────────────────────────────
+    const materialized = await materializeOrderTasks(conn, companyId, orderId);
+    /*
+     * Raising the production order here rather than leaving it to somebody is
+     * the point of the change: cutting is claimed by the SAME document that
+     * claims the welding, so the job is one thing to release and close.
+     *
+     * Idempotent — it finds an existing production order and re-claims, which
+     * is what picks up the blank tasks on an order that was already raised.
+     */
+    const po = await ensureProductionOrder(companyId, orderId, { conn });
+
+    if (owned) await conn.commit();
+    const out = {
+      productionOrderId: po.id,
+      productionOrderNumber: po.orderNumber,
+      productionOrderCreated: po.created,
+      blanks: mat.blanks.length,
+      blanksCreated: mat.created,
+      blanksRetired: mat.retired ?? 0,
+      rowsCreated,
+      rowsUpdated,
+      rowsRetired: stale.length,
+      platesLinked,
+      partsRepointed,
+      tasks: materialized?.tasksInserted ?? 0,
+      tasksClaimed: po.tasksClaimed ?? 0,
+      skipped: mat.skipped,
+    };
+    logger.info({ companyId, orderId, ...out }, 'fab_erp: nesting plan accepted');
+    return out;
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

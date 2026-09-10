@@ -24,6 +24,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { NOT_A_BLANK } from './blankService.js';
 import { recomputeDerived } from './fieldDeriveService.js';
 
 /** A BOM deep enough to hit this is a cycle or a mistake, not a real structure. */
@@ -1406,7 +1407,9 @@ export async function duplicateSubtree(companyId, orderId, itemId, existingConn 
               flow_id, procurement_type, node_kind, depth, is_leaf, dim_unit, weight_unit
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-          AND NOT node_kind = 'material'`,
+          AND NOT node_kind = 'material'
+          -- Blanks are the order's own cut steel, not part of what was drawn.
+          AND ${NOT_A_BLANK('fab_items')}`,
       [companyId, orderId],
     );
     const kidsOf = new Map();
@@ -1495,6 +1498,7 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
         AND NOT node_kind = 'material' ${lineScope}
+        AND ${NOT_A_BLANK('fab_items')}
       ORDER BY id`,
     orderLineId == null ? [companyId, orderId] : [companyId, orderId, orderLineId],
   );
@@ -1585,7 +1589,15 @@ export async function applyTree(companyId, spec, existingConn = null) {
       `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-          AND NOT node_kind = 'material' ${lineScope.sql}`,
+          AND NOT node_kind = 'material' ${lineScope.sql}
+          /*
+           * WITHOUT THIS, SAVING THE STRUCTURE DELETES EVERY BLANK.
+           * Anything listed here and absent from the tree that was sent is
+           * treated as removed. Blank rows are never in that tree — they are
+           * produced by nesting, not drawn by a person — so an unrelated edit
+           * to a quantity would quietly take the cutting work with it.
+           */
+          AND ${NOT_A_BLANK('fab_items')}`,
       [companyId, orderId, ...lineScope.args],
     );
     const byId = new Map(existing.map((r) => [Number(r.id), r]));

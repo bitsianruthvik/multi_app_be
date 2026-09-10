@@ -248,7 +248,8 @@ export async function nestableParts(companyId, orderId, { includeNested }) {
     `SELECT id, parent_item_id AS parentItemId, qty
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-        AND NOT node_kind = 'material'`,
+        AND NOT node_kind = 'material'
+        AND ${NOT_A_BLANK('fab_items')}`,
     [companyId, orderId],
   );
   const nodeById = new Map(allRows.map((r) => [Number(r.id), r]));
