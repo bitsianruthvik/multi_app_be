@@ -78,9 +78,9 @@ const specKg = (s) => (s.thickness * s.width * s.length * STEEL_DENSITY) / 1e9;
  * kilogram, the scoring is the thing to change, not the effort level.
  *
 const EFFORT = {
-  quick: { restarts: 4 },
-  standard: { restarts: 60 },
-  deep: { restarts: 150 },
+  quick: { restarts: 200 },
+  standard: { restarts: 500 },
+  deep: { restarts: 2000 },
 };
 
 /**
@@ -91,7 +91,7 @@ const EFFORT = {
  * reproducible, which the caller is TOLD rather than left to discover by
  * noticing the number moved.
  */
-const SAFETY_MS = 60000;
+const SAFETY_MS = 300000;
 
 /**
  * The plan for an order: the sheets, what is on each, and the demand behind it.
