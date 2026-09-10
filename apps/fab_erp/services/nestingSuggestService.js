@@ -188,7 +188,8 @@ export async function nestableParts(companyId, orderId, { includeNested }) {
     `SELECT rm.id AS linkId, rm.nest_no AS nestNo, rm.catalog_item_id AS materialId,
             fic.code AS materialCode, fic.name AS materialName,
             fic.thickness_mm AS materialThickness,
-            p.id AS partId, p.code AS partCode, p.name AS partName, p.qty AS partQty
+            p.id AS partId, p.code AS partCode, p.name AS partName, p.qty AS partQty,
+            p.parent_item_id AS parentItemId
        FROM fab_items p
        /*
         * A derived table rather than a subquery in the ON clause: TiDB refuses
@@ -229,6 +230,42 @@ export async function nestableParts(companyId, orderId, { includeNested }) {
     [companyId, orderId, companyId, orderId],
   );
   if (!links.length) return { rows: [], skipped: [] };
+
+  /**
+   * HOW MANY OF THIS PART THE ORDER ACTUALLY NEEDS — the row's quantity times
+   * every quantity above it.
+   *
+   * A row is a DESIGN now, not a piece. "Top Flange x1" sits under "Segment x5"
+   * under "Line x6", so the span needs thirty of them and the row says one.
+   * Reading the row's own number, nesting asked the shop to cut 72 pieces where
+   * the order needed 1,850 — four per cent — and every one of those would have
+   * come off a plate that fitted, so nothing downstream would have complained.
+   *
+   * One query for the whole order rather than a walk per part: the ancestors are
+   * needed for every leaf and there are only a few hundred rows.
+   */
+  const [allRows] = await pool.query(
+    `SELECT id, parent_item_id AS parentItemId, qty
+       FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+        AND NOT node_kind = 'material'`,
+    [companyId, orderId],
+  );
+  const nodeById = new Map(allRows.map((r) => [Number(r.id), r]));
+  const rolledQty = (partId) => {
+    let multiplier = 1;
+    let at = nodeById.get(Number(partId));
+    /*
+     * Guarded against a cycle rather than trusting the tree: a parent chain that
+     * loops would spin here forever, and the depth limit elsewhere is 12.
+     */
+    for (let hops = 0; at && hops < 64; hops += 1) {
+      multiplier *= Number(at.qty) || 0;
+      if (at.parentItemId == null) break;
+      at = nodeById.get(Number(at.parentItemId));
+    }
+    return Math.round(multiplier);
+  };
 
   const fields = await resolveItemFields(companyId, [...new Set(links.map((l) => l.partId))]);
   // The grade of what each part is CURRENTLY linked to, so a suggestion keeps
@@ -316,7 +353,7 @@ export async function nestableParts(companyId, orderId, { includeNested }) {
       partId: l.partId,
       partCode: l.partCode,
       partName: l.partName,
-      qty: Math.max(1, Number(l.partQty) || 1),
+      qty: Math.max(1, rolledQty(l.partId)),
       length, width, thickness,
       currentNestNo: l.nestNo,
       currentMaterialId: l.materialId,
