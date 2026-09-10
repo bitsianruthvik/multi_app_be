@@ -38,7 +38,7 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import {
   parametersFor, expand, bomFor, setBomLine, removeBomLine,
-  draftTree, buildFromTree,
+  draftTree, buildFromTree, currentTree, applyTree,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
@@ -112,6 +112,48 @@ router.get('/templates/:itemId/draft', protect, async (req, res) => {
     res.json({ tree: await draftTree(cid, Number(req.params.itemId)) });
   } catch (err) { fail(res, err, 'draft tree'); }
 });
+
+/**
+ * GET /orders/:orderId/structure/tree — what was decided, not what the
+ * catalogue says. The editor loads this to EDIT rather than to rebuild.
+ */
+router.get('/orders/:orderId/structure/tree', protect, async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const tree = await currentTree(
+      cid, Number(req.params.orderId),
+      req.query.orderLineId ? Number(req.query.orderLineId) : null,
+    );
+    res.json({ tree });
+  } catch (err) { return fail(res, err, 'structure tree'); }
+});
+
+/**
+ * POST /orders/:orderId/structure/apply — save an edited structure.
+ *
+ * A DIFF, not a replace. A row still in the tree keeps its id, and with it the
+ * dimensions somebody typed and the plate it was nested onto — replacing would
+ * make changing one quantity cost all of that.
+ */
+router.post(
+  '/orders/:orderId/structure/apply',
+  protect,
+  requirePerm('fab_erp_projects_manage'),
+  async (req, res) => {
+    try {
+      const cid = companyId(req);
+      const orderId = Number(req.params.orderId);
+      const { tree, orderLineId = null } = req.body ?? {};
+      const result = await applyTree(cid, { orderId, orderLineId, tree });
+      res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
+    } catch (err) {
+      if (err.status === 409) {
+        return res.status(409).json({ message: err.message, code: err.code });
+      }
+      return fail(res, err, 'structure apply');
+    }
+  },
+);
 
 /**
  * GET /orders/:orderId/structure/export — the structure as a sheet.

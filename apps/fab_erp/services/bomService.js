@@ -1402,3 +1402,196 @@ export async function duplicateSubtree(companyId, orderId, itemId, existingConn 
     if (owned) conn.release();
   }
 }
+
+/**
+ * currentTree — the structure as it STANDS, in the shape the editor speaks.
+ *
+ * `draftTree` answers "what does the catalogue say this is made of". This
+ * answers "what did we decide", which stops being the same thing the moment
+ * somebody changes a quantity. Editing needs the second; rebuilding needs the
+ * first, and offering only the first meant the only way to change one row was
+ * to throw away all of them and start again.
+ *
+ * Every node carries `itemId`, which is what lets a save be a DIFF rather than
+ * a replace — a row that survives keeps its id, and with it the dimensions
+ * somebody typed and the plate it was nested onto.
+ */
+export async function currentTree(companyId, orderId, orderLineId = null, conn = null) {
+  const exec = conn ?? pool;
+  const lineScope = orderLineId == null ? '' : 'AND order_line_id = ?';
+  const [rows] = await exec.query(
+    `SELECT id, parent_item_id AS parentItemId, catalog_item_id AS catalogItemId,
+            name, unit, qty, flow_id AS flowId
+       FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+        AND NOT node_kind = 'material' ${lineScope}
+      ORDER BY id`,
+    orderLineId == null ? [companyId, orderId] : [companyId, orderId, orderLineId],
+  );
+  if (!rows.length) return null;
+
+  const kids = new Map();
+  for (const r of rows) {
+    const k = r.parentItemId == null ? 'root' : String(r.parentItemId);
+    kids.set(k, [...(kids.get(k) ?? []), r]);
+  }
+  const build = (r) => ({
+    key: `i${r.id}`,
+    itemId: Number(r.id),
+    catalogItemId: r.catalogItemId == null ? null : Number(r.catalogItemId),
+    name: r.name,
+    unit: r.unit ?? 'nos',
+    qty: Number(r.qty),
+    codeSegment: null,
+    codeJoin: 'dash',
+    defaultFlowId: r.flowId == null ? null : Number(r.flowId),
+    bomLineId: null,
+    qtyParam: null,
+    children: (kids.get(String(r.id)) ?? []).map(build),
+  });
+  const roots = kids.get('root') ?? [];
+  if (!roots.length) return null;
+  // One line, one top. Several roots means the order has several lines and the
+  // caller did not say which — answer with the first rather than inventing a
+  // parent that is not in the data.
+  return build(roots[0]);
+}
+
+/**
+ * applyTree — save an EDITED structure by diffing it against what is there.
+ *
+ * WHY NOT JUST REPLACE. `buildFromTree(replace)` soft-deletes every row and
+ * writes fresh ones, which is right when the recipe is being taken again and
+ * wrong for an edit: new ids mean the dimensions somebody typed, the plate a
+ * part was nested onto and every field value hanging off the row all point at
+ * rows that no longer exist. Changing one quantity would quietly cost all of it.
+ *
+ * So a row still in the tree keeps its id, and only what actually changed is
+ * written.
+ *
+ * WHAT IT REFUSES: deleting a row whose work has started. Everything else is
+ * allowed, including deleting a row with tasks that have not begun — those are
+ * a plan, not history.
+ */
+export async function applyTree(companyId, spec, existingConn = null) {
+  const conn = existingConn ?? await pool.getConnection();
+  const owned = !existingConn;
+  try {
+    if (owned) await conn.beginTransaction();
+    const { orderId, orderLineId = null, tree } = spec;
+    if (!tree) { const e = new Error('No structure was sent.'); e.status = 400; throw e; }
+
+    const lineScope = orderLineId == null
+      ? { sql: '', args: [] }
+      : { sql: 'AND order_line_id = ?', args: [orderLineId] };
+
+    const [existing] = await conn.query(
+      `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf
+         FROM fab_items
+        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+          AND NOT node_kind = 'material' ${lineScope.sql}`,
+      [companyId, orderId, ...lineScope.args],
+    );
+    const byId = new Map(existing.map((r) => [Number(r.id), r]));
+
+    const [kinds] = await conn.query(
+      `SELECT id, unit, procurement_type FROM fab_item_catalog
+        WHERE company_id = ? AND deleted_at IS NULL`,
+      [companyId],
+    );
+    const unitOf = new Map(kinds.map((k) => [Number(k.id), k.unit]));
+    const procurementOf = new Map(kinds.map((k) => [Number(k.id), k.procurement_type]));
+
+    const seen = new Set();
+    let created = 0;
+    let updated = 0;
+
+    const walk = async (node, parentItemId, depth) => {
+      const kids = Array.isArray(node.children) ? node.children : [];
+      const isLeaf = kids.length ? 0 : 1;
+      const qty = Number(node.qty) > 0 ? Number(node.qty) : 1;
+      const unit = node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos';
+
+      let id = node.itemId && byId.has(Number(node.itemId)) ? Number(node.itemId) : null;
+      if (id) {
+        const was = byId.get(id);
+        const same = was.name === node.name
+          && (was.unit ?? '') === (unit ?? '')
+          && Number(was.qty) === qty
+          && Number(was.parentItemId ?? 0) === Number(parentItemId ?? 0)
+          && Number(was.depth) === depth
+          && Number(was.isLeaf) === isLeaf;
+        if (!same) {
+          await conn.query(
+            `UPDATE fab_items
+                SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?, is_leaf = ?
+              WHERE id = ? AND company_id = ?`,
+            [node.name, unit, qty, parentItemId, depth, isLeaf, id, companyId],
+          );
+          updated += 1;
+        }
+        seen.add(id);
+      } else {
+        const [r] = await conn.query(
+          `INSERT INTO fab_items
+             (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
+              name, unit, qty, code, node_kind, depth, is_leaf, procurement_type, flow_id)
+           VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?)`,
+          [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+            node.name, unit, qty, depth, isLeaf,
+            procurementOf.get(Number(node.catalogItemId)) ?? 'make',
+            node.defaultFlowId ?? null],
+        );
+        id = r.insertId;
+        created += 1;
+      }
+
+      for (const kid of kids) await walk(kid, id, depth + 1);
+      return id;
+    };
+
+    await walk(tree, null, 0);
+
+    const gone = existing.map((r) => Number(r.id)).filter((id) => !seen.has(id));
+    if (gone.length) {
+      const [[worked]] = await conn.query(
+        `SELECT COUNT(*) AS n FROM fab_project_tasks
+          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL
+            AND (started_at IS NOT NULL OR status IN ('in_progress','paused','done'))`,
+        [companyId, gone],
+      );
+      if (worked.n > 0) {
+        const e = new Error(
+          `Refused: ${worked.n} task(s) on the row(s) you removed have been started or finished. `
+          + 'Removing them would throw that shop-floor history away.',
+        );
+        e.status = 409; e.code = 'WORK_STARTED'; throw e;
+      }
+      await conn.query(
+        `UPDATE fab_project_tasks SET deleted_at = NOW()
+          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`,
+        [companyId, gone],
+      );
+      /*
+       * Material links go with their part. A link says "this part comes off that
+       * plate", and the part is gone — leaving it would hold steel for something
+       * nobody is making.
+       */
+      await conn.query(
+        `UPDATE fab_items SET deleted_at = NOW()
+          WHERE company_id = ?
+            AND (id IN (?) OR (parent_item_id IN (?) AND node_kind = 'material'))
+            AND deleted_at IS NULL`,
+        [companyId, gone, gone],
+      );
+    }
+
+    if (owned) await conn.commit();
+    return { created, updated, removed: gone.length };
+  } catch (err) {
+    if (owned) await conn.rollback();
+    throw err;
+  } finally {
+    if (owned) conn.release();
+  }
+}
