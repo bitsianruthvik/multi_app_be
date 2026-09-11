@@ -616,6 +616,9 @@ export async function orderRowCodes(companyId, orderId, conn) {
        LEFT JOIN fab_order_lines ol ON ol.id = i.order_line_id AND ol.deleted_at IS NULL
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND i.node_kind = 'structure'
+        -- Bought rows are not made here and get no production code: a shear
+        -- stud is known by its catalog code, not by where it sits.
+        AND COALESCE(i.procurement_type, 'make') = 'make'
         AND NOT EXISTS (SELECT 1 FROM fab_item_catalog bc
                          WHERE bc.id = i.catalog_item_id AND bc.material_form = 'blank')
       ORDER BY i.sort_order IS NULL, i.sort_order, i.id`,

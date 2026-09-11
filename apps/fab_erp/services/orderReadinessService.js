@@ -120,6 +120,9 @@ import { logger } from '../../../core/utils/logger.js';
  */
 export const STAGE_KEYS = ['lines', 'nesting', 'params', 'production'];
 
+/** "1 row", "82 rows" — no "row(s)". */
+const n = (count, word, plural = `${word}s`) => `${Number(count).toLocaleString('en-IN')} ${Number(count) === 1 ? word : plural}`;
+
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
 
@@ -190,14 +193,12 @@ async function summariseProcurement(companyId, orderId) {
       ? 'Nothing in this order yet'
       : 'Nothing to buy — every row is made here';
   } else {
-    detail = `All ${needed} bought-in item(s) covered by stock or on order`;
+    detail = `All ${n(needed, 'bought item')} covered`;
   }
 
   if (stillShort > 0) {
     state = pos.length > 0 ? 'partial' : 'todo';
-    detail = `${stillShort} item(s) short — ${pos.length > 0
-      ? `${pos.length} purchase order(s) raised so far`
-      : 'nothing ordered yet'}`;
+    detail = `Buy ${n(stillShort, 'item')}${pos.length > 0 ? ` · ${n(pos.length, 'purchase order')} so far` : ''}`;
   }
   if (short.unmatched.length > 0) {
     // A bought-in row with no catalog item cannot be checked against stock or
@@ -205,7 +206,7 @@ async function summariseProcurement(companyId, orderId) {
     detail += `; ${short.unmatched.length} bought-in row(s) have no catalog item`;
     if (state === 'done') state = 'partial';
   }
-  return { state, covered, needed, detail };
+  return { state, covered, needed, detail, stillShort };
 }
 
 /**
@@ -289,6 +290,16 @@ export async function orderReadiness(companyId, orderId) {
     [companyId, orderId],
   );
   const cuttingOrder = cutRow?.id ?? null;
+  /** What nesting produced, in the two numbers the Nesting tab leads with. */
+  const [[cut]] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM fab_items i
+               JOIN fab_item_catalog bc ON bc.id = i.catalog_item_id AND bc.material_form = 'blank'
+              WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL AND i.node_kind = 'structure') AS blanks,
+            (SELECT COUNT(DISTINCT nest_no) FROM fab_items
+              WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+                AND node_kind = 'material' AND nest_no IS NOT NULL) AS sheets`,
+    [companyId, orderId, companyId, orderId],
+  );
   const [proc, production, fields] = await Promise.all([
     summariseProcurement(companyId, orderId),
     summariseProduction(companyId, orderId),
@@ -330,17 +341,20 @@ export async function orderReadiness(companyId, orderId) {
         : 'done',
       count: lines.total,
       total: lines.total,
+      // The one number the strip shows, and it is the same one the wizard and
+      // the line cards show: rows.
+      summary: tree.total ? n(tree.total, 'row') : null,
       detail: lines.total === 0
         ? 'Nothing sold yet'
         : lines.withoutType > 0
-          ? `${lines.withoutType} line(s) have no structure type`
+          ? `${n(lines.withoutType, 'line')} without a structure type`
           : tree.total === 0
-            ? `${lines.total} line(s) — no structure built yet`
+            ? `${n(lines.total, 'line')} · nothing built yet`
             : shortOnDims > 0
-              ? `${lines.total} line(s) · ${tree.total} rows — ${shortOnDims} part(s) have no size yet`
+              ? `${n(shortOnDims, 'part')} without a size`
               : flowState.missing > 0
-                ? `${lines.total} line(s) · ${tree.total} rows — ${flowState.missing} row(s) have not picked up the flow their BOM states`
-                : `${lines.total} line(s) · ${tree.levels.length} level${tree.levels.length === 1 ? '' : 's'} · ${tree.total} rows`,
+                ? `${n(flowState.missing, 'row')} without a flow`
+                : `${n(lines.total, 'line')} · ${n(tree.total, 'row')}`,
     },
     {
       key: 'nesting',
@@ -367,17 +381,16 @@ export async function orderReadiness(companyId, orderId) {
               : nestBlocking.length > 0 ? 'partial' : 'done',
       count: nest.nested,
       total: nest.parts,
+      summary: cuttingOrder && Number(cut?.blanks) ? `${n(cut.blanks, 'blank')} · ${n(cut.sheets, 'sheet')}` : null,
       detail: nest.parts === 0
-        ? 'No parts to nest yet'
+        ? 'Nothing to nest yet'
         : nest.nested < nest.parts
-          ? `${nest.parts - nest.nested} of ${nest.parts} part(s) have no material`
+          ? `${n(nest.parts - nest.nested, 'part')} not on a sheet yet`
           : !cuttingOrder
-            ? 'A plan has been proposed but not accepted yet'
+            ? 'Plan not accepted yet'
           : nestBlocking.length > 0
-            ? `All ${nest.parts} part(s) have material, but ${nestBlocking.length} `
-              + `${nestBlocking.length === 1 ? 'problem' : 'problems'} would make it uncuttable — `
-              + nestBlocking[0].message
-            : `All ${nest.parts} part(s) have material`,
+            ? `${n(nestBlocking.length, 'problem')} to fix — ${nestBlocking[0].message}`
+            : `Plan accepted — ${n(cut?.blanks ?? 0, 'blank')} on ${n(cut?.sheets ?? 0, 'sheet')}`,
       /** The full list, so the screen can show every one rather than the first. */
       issues: nestBlocking,
     },
@@ -395,15 +408,16 @@ export async function orderReadiness(companyId, orderId) {
           || (fields.unusableFields?.length ?? 0) > 0) ? 'partial' : 'done',
       count: fields.itemsChecked - shortOnRest,
       total: fields.itemsChecked,
+      summary: fields.itemsChecked === 0 ? null : shortOnRest > 0 ? `${shortOnRest} to fill` : 'all filled',
       detail: fields.itemsChecked === 0
-        ? 'Assign flows first — they decide which values are needed'
+        ? 'Pick flows first — they decide which values are needed'
         : fields.unknownFields.length > 0
-          ? `${fields.unknownFields.length} operation(s) name a field that does not exist`
+          ? `${n(fields.unknownFields.length, 'operation')} name a field that does not exist`
           : (fields.unusableFields?.length ?? 0) > 0
-            ? `${fields.unusableFields.length} operation(s) use a field that is not set up for formulas`
+            ? `${n(fields.unusableFields.length, 'operation')} use a field not set up for formulas`
             : shortOnRest > 0
-              ? `${shortOnRest} of ${fields.itemsChecked} part(s) missing values`
-              : `All ${fields.itemsChecked} part(s) have what their operations need`,
+              ? `${n(shortOnRest, 'row')} missing values`
+              : 'All values filled',
     },
     {
       /**
@@ -417,12 +431,15 @@ export async function orderReadiness(companyId, orderId) {
         : proc.state === 'todo' && production.state === 'todo' ? 'todo' : 'partial',
       count: production.count,
       total: production.total,
+      summary: production.total ? `${production.deployed}/${production.total} deployed` : null,
       detail: [
-        proc.state === 'done' ? null : proc.detail,
+        proc.stillShort > 0 ? `Buy ${n(proc.stillShort, 'item')}` : null,
         production.missing.length
-          ? `No ${production.missing.join(' or ')} production order yet`
+          ? `no ${production.missing.join(' or ')} order yet`
           : production.total
-            ? `${production.count} production order(s) — ${production.deployed} deployed`
+            ? (production.deployed === production.total
+              ? 'all deployed'
+              : `${n(production.total - production.deployed, 'draft')} to deploy`)
             : null,
       ].filter(Boolean).join(' · ') || proc.detail,
     },
@@ -456,6 +473,9 @@ export async function orderReadiness(companyId, orderId) {
     }
   }
 
+  for (const s of stages) {
+    if (typeof s.detail === 'string' && s.detail) s.detail = s.detail[0].toUpperCase() + s.detail.slice(1);
+  }
   const byKey = Object.fromEntries(stages.map((s) => [s.key, s]));
   /**
    * A stage that does not apply cannot hold the order up, and an OPTIONAL one
