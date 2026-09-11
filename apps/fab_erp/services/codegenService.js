@@ -595,6 +595,21 @@ export async function orderCodePrefix(companyId, orderId, conn) {
 }
 
 /**
+ * A row added on the order with no BOM line behind it names itself.
+ *
+ * Several words read as the shop writes them — initials: "Intermediate
+ * Stiffener" is IS, "End Stiffener" ES. A trailing "(drilled)" becomes the
+ * /D the BOM uses for the same thing. One word keeps the ordinary abbreviation.
+ */
+function shortName(name) {
+  const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(String(name ?? ''));
+  const base = (m ? m[1] : String(name ?? '')).trim();
+  const words = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const head = words.length > 1 ? words.map((w) => w[0]).join('').toUpperCase() : abbreviate(base);
+  return m ? `${head}/${m[2].trim()[0].toUpperCase()}` : head;
+}
+
+/**
  * The code of every BOM row on an order, from the 'order_item' rule.
  *
  * Read in BOM order — `sort_order`, which is what dragging rows sets — so the
@@ -647,7 +662,17 @@ export async function orderRowCodes(companyId, orderId, conn) {
   }
 
   const prefix = await orderCodePrefix(companyId, orderId, exec);
-  const sameItem = (r) => (r.catalogId != null ? `c${r.catalogId}` : `n${String(r.name).toLowerCase()}`);
+  /*
+   * WHAT COUNTS AS "THE SAME" FOR NUMBERING. A row from a BOM line counts with
+   * the other rows of its item — three girder rows renamed G1, G2–G3 and G4 are
+   * still L1, L2, L3. A row added on the order has no BOM line and names
+   * itself, so it counts with rows of the same NAME: plain and drilled
+   * stiffeners are IS1 and IS/D1, and two End Stiffener rows of different
+   * sizes on one segment are ES1 and ES2 rather than both ES1.
+   */
+  const sameItem = (r, fromBom) => (fromBom
+    ? `c${r.catalogId}`
+    : `n|${String(r.name).toLowerCase()}`);
   const aboveCount = new Map();
   const contexts = [];
   const ids = [];
@@ -657,17 +682,16 @@ export async function orderRowCodes(companyId, orderId, conn) {
     const siblings = kids.get(parentKey) ?? [];
     const underParent = new Map();
     for (const r of siblings) {
-      const key = sameItem(r);
-      underParent.set(key, (underParent.get(key) ?? 0) + 1);
-      aboveCount.set(key, (aboveCount.get(key) ?? 0) + 1);
-
       // What the BOM calls this row. A BOM line left blank means "just a
       // number"; no BOM line at all (a top row, or a row added by hand) falls
       // back to the order line's code, then to an abbreviation of the name.
       const line = parentRow?.catalogId != null && r.catalogId != null
         ? bomCode.get(`${parentRow.catalogId}:${r.catalogId}`)
         : undefined;
-      const bom = line !== undefined ? line : (r.lineCode || abbreviate(r.name));
+      const key = sameItem(r, line !== undefined);
+      underParent.set(key, (underParent.get(key) ?? 0) + 1);
+      aboveCount.set(key, (aboveCount.get(key) ?? 0) + 1);
+      const bom = line !== undefined ? line : (r.lineCode || shortName(r.name));
 
       const context = {
         orderPrefix: prefix,

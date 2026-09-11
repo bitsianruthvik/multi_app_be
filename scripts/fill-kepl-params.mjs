@@ -60,8 +60,9 @@ const SEGMENT_WELD_M = { 12000: 227.74, 11650: 249.6 };
 
 /** Assumed — see the header. Replace with the drawing when there is one. */
 const HOLES = {
-  'Bearing Stiffener Hole': 4,
-  'Intermediate Stiffener Hole': 4,
+  // Names since 2026-09-11, when stiffeners became rows added on the order.
+  'Bearing Stiffener (drilled)': 4,
+  'Intermediate Stiffener (drilled)': 4,
 };
 
 const conn = await pool.getConnection();
