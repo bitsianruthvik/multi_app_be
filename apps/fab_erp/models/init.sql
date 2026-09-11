@@ -5040,14 +5040,17 @@ SELECT sc.company_id, sc.id, 'include', cat.id, 'Machine types'
    AND NOT EXISTS (SELECT 1 FROM fab_item_scope_rules r
                     WHERE r.scope_id = sc.id AND r.deleted_at IS NULL);
 
--- Global default bindings: no line_type, no level_kind.
-INSERT INTO fab_item_scope_bindings (company_id, scope_id, purpose, line_type, level_kind)
-SELECT sc.company_id, sc.id, sc.scope_key, NULL, NULL
+-- Global default bindings. (line_type / level_kind were dropped 2026-09-02;
+-- naming them here failed every run from then on, and the failure is what kept
+-- the one-time blocks below it from ever re-running. Fixed 2026-09-11 together
+-- with those blocks, so a clean run is now also a safe one.)
+INSERT INTO fab_item_scope_bindings (company_id, scope_id, purpose)
+SELECT sc.company_id, sc.id, sc.scope_key
   FROM fab_item_scopes sc
  WHERE sc.deleted_at IS NULL AND sc.scope_key IN ('bom_material', 'spares', 'machines')
    AND NOT EXISTS (SELECT 1 FROM fab_item_scope_bindings b
                     WHERE b.company_id = sc.company_id AND b.purpose = sc.scope_key
-                      AND b.line_type IS NULL AND b.level_kind IS NULL AND b.deleted_at IS NULL);
+                      AND b.deleted_at IS NULL);
 
 -- ══ CATALOG UNIFICATION, PHASE 11 (2026-08-17) ═════════════════════════════
 -- The destructive phase, run only against what the gate says is safe.
@@ -5205,8 +5208,9 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 -- "the machine has no shift of its own". The column stays — the chain still
 -- reads it, and a company that genuinely does run one machine on a different
 -- pattern can still set it as data.
-UPDATE fab_resources SET shift_calendar_id = NULL
- WHERE deleted_at IS NULL AND shift_calendar_id IS NOT NULL;
+-- (The one-time clear that ran here — UPDATE fab_resources SET
+-- shift_calendar_id = NULL — is REMOVED. It is done, and left in it would wipe
+-- every machine calendar somebody sets afterwards, on every deploy.)
 
 -- 2. GIVE EVERY MACHINE A STOCK LOCATION, FROM THE PIECE THAT IS THAT MACHINE.
 --
@@ -5572,13 +5576,10 @@ SELECT d.company_id, d.field_key, d.label,
   FROM fab_field_defs d
   LEFT JOIN fab_units u ON u.code = d.unit
  WHERE d.deleted_at IS NULL
-ON DUPLICATE KEY UPDATE
-  label = VALUES(label), data_type = VALUES(data_type), dimension = VALUES(dimension),
-  default_unit = VALUES(default_unit), allowed_values = VALUES(allowed_values),
-  applies_at = VALUES(applies_at), formula_usable = VALUES(formula_usable),
-  default_num = VALUES(default_num), is_standard = VALUES(is_standard),
-  category_id = VALUES(category_id), group_id = VALUES(group_id),
-  subgroup_id = VALUES(subgroup_id), sort_order = VALUES(sort_order), active = VALUES(active);
+-- FILL-ONLY (2026-09-11). fab_fields is the registry now and is edited
+-- directly; copying the retired fab_field_defs over it on every run put
+-- length_mm and width_mm back to 'stock_piece'.
+ON DUPLICATE KEY UPDATE id = id;
 
 -- ══ ITEM BOM: WHAT A THING IS MADE OF (2026-08-18) ═════════════════════════
 --
@@ -5669,10 +5670,8 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 -- child of a part; a structural level instantiated from a BOM is not one, and a
 -- template that produced 'material' rows would have every girder gated on as
 -- steel waiting to arrive.
-SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
-           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='level_kind');
-SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN level_kind VARCHAR(20) NULL', 'SELECT 1');
-PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+-- (Superseded 2026-09-02 — catalog level_kind is dropped further down; adding
+-- it here only for that to drop it again was churn. Removed 2026-09-11.)
 
 -- ══ FLOW BELONGS TO THE ITEM (2026-08-18) ══════════════════════════════════
 --
@@ -5686,37 +5685,10 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 -- own BOM line. So the flow is a property of the TYPE, and the suffix stops
 -- carrying meaning that has to be decoded. `fab_flow_rules` stays for now --
 -- orders built the old way still resolve through it -- but nothing new needs it.
-SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
-           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='flow_id');
-SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN flow_id INT NULL', 'SELECT 1');
-PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
-
--- Seed it from the rules that exist, so the two agree before anything switches.
---
--- Matched on level_kind and the suffix convention ONE LAST TIME: this is the
--- migration that makes parsing unnecessary, so it is the one place still
--- allowed to do it. A rule with a line_type is skipped -- that string has no
--- meaning here, and the catalog item's CATEGORY is what carries the variant now.
-UPDATE fab_item_catalog c
-  JOIN fab_flow_rules r
-    ON r.company_id = c.company_id AND r.deleted_at IS NULL AND r.active = 1
-   AND r.line_type IS NULL
-   AND r.level_kind = c.level_kind
-   AND (r.code_suffix IS NULL OR c.code LIKE CONCAT('%', REPLACE(r.code_suffix, '/', '-')))
-   SET c.flow_id = r.flow_id
- WHERE c.deleted_at IS NULL AND c.level_kind IS NOT NULL AND c.flow_id IS NULL;
-
--- The suffixed rules run second so a '/D' item ends on the drilled flow rather
--- than whichever row the join happened to reach first.
-UPDATE fab_item_catalog c
-  JOIN fab_flow_rules r
-    ON r.company_id = c.company_id AND r.deleted_at IS NULL AND r.active = 1
-   AND r.line_type IS NULL
-   AND r.level_kind = c.level_kind
-   AND r.code_suffix IS NOT NULL
-   AND c.code LIKE CONCAT('%', REPLACE(r.code_suffix, '/', '-'))
-   SET c.flow_id = r.flow_id
- WHERE c.deleted_at IS NULL AND c.level_kind IS NOT NULL;
+-- (Superseded 2026-09-02: the flow lives on the BOM line, fab_flow_rules and
+-- catalog flow_id are dropped further down. The column add and the one-time
+-- seed from the rules that stood here are removed — they could only error or
+-- re-create what is then dropped.)
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- OFFCUTS / REMNANTS (2026-08-21)
@@ -6054,32 +6026,37 @@ SET @s = IF(@c=1, 'UPDATE fab_items SET node_kind = ''material''
         OR (level_kind IS NULL AND catalog_item_id IS NOT NULL AND flow_id IS NULL))', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- Depth and leaf-ness below are a ONE-TIME backfill, run only while
+-- fab_items.level_kind still exists (i.e. this migration has not happened).
+-- Unguarded, they re-ran on every deploy and flipped every blank row to a leaf,
+-- which made nesting count 24 blanks as parts. Writers stamp both on insert.
+SET @pending = (SELECT COUNT(*) FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='level_kind');
 -- Depth is distance from the line's root. Six passes covers a six-deep tree;
 -- the model this replaces could not express more than four.
-UPDATE fab_items SET depth = 0 WHERE parent_item_id IS NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
-UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id
-   SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL;
+SET @s = IF(@pending=1, 'UPDATE fab_items SET depth = 0 WHERE parent_item_id IS NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@pending=1, 'UPDATE fab_items c JOIN fab_items p ON p.id = c.parent_item_id SET c.depth = p.depth + 1 WHERE c.parent_item_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- A leaf is a STRUCTURAL node with no structural children. A material link
 -- hanging off a part does not stop that part being a leaf — that link is what
 -- the part is cut FROM, not something the part contains.
-UPDATE fab_items i
-   SET i.is_leaf = 1
- WHERE i.node_kind = 'structure' AND i.deleted_at IS NULL
-   AND NOT EXISTS (SELECT 1 FROM (SELECT id, parent_item_id, deleted_at, node_kind
-                                    FROM fab_items) k
-                    WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL
-                      AND k.node_kind = 'structure');
+SET @s = IF(@pending=1, 'UPDATE fab_items i SET i.is_leaf = 1
+ WHERE i.node_kind = ''structure'' AND i.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM (SELECT id, parent_item_id, deleted_at, node_kind FROM fab_items) k
+                    WHERE k.parent_item_id = i.id AND k.deleted_at IS NULL AND k.node_kind = ''structure'')', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- ── The default flow belongs to the BOM LINE ──────────────────────────────
 --
@@ -6101,10 +6078,8 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- Seed each line from the flow its CHILD type already carried, so no BOM loses
 -- a flow in the move. Fills blanks only.
-UPDATE fab_item_bom b
-  JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
-   SET b.default_flow_id = c.flow_id
- WHERE b.deleted_at IS NULL AND b.default_flow_id IS NULL AND c.flow_id IS NOT NULL;
+-- (Done 2026-09-02; catalog flow_id is dropped below, so the one-time seed
+-- that stood here is removed.)
 
 -- ── Drop what nothing reads any more ──────────────────────────────────────
 --
