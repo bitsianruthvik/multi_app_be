@@ -2944,6 +2944,10 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
 SET @sql = IF(@col=1,
   'UPDATE fab_order_lines fol
       JOIN fab_item_catalog fic ON fic.id = fol.catalog_item_id
+      -- PURCHASE lines only. A sales line can carry a catalog item too, and a
+      -- blank sales-line code is a choice: filling it put COMPOS-SPAN into
+      -- every BOM row code on the KEPL order (2026-09-11).
+      JOIN fab_orders fo ON fo.id = fol.order_id AND fo.order_type = ''purchase''
        SET fol.code = COALESCE(NULLIF(fol.code, ''''), fic.code),
            fol.description = COALESCE(NULLIF(fol.description, ''''), fic.name)
     WHERE fol.code IS NULL OR fol.code = ''''',
