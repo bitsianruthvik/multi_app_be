@@ -117,6 +117,12 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
    * collapsed per nest FIRST and only then summed per item. Rows with no nest
    * are each their own draw and still sum, which is the un-nested behaviour
    * exactly as it was.
+   *
+   * BLANK NESTS ARE ONE SHEET. Accepting a blank plan writes one link per
+   * (blank, sheet) and its qty is how many of that BLANK the sheet carries —
+   * not a plate count. Taking MAX of it asked the KEPL order to buy 960 sheets
+   * of 12 mm where it needs 16. A nest whose links hang off blanks is therefore
+   * exactly one plate.
    */
   const [buy] = await exec.query(
     `SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
@@ -125,10 +131,14 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
        FROM (
          SELECT fi.catalog_item_id,
                 COUNT(*) AS lines_count,
-                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty) ELSE MAX(fi.qty) END AS qty,
+                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty)
+                     WHEN MAX(pc.id IS NOT NULL) = 1 THEN 1
+                     ELSE MAX(fi.qty) END AS qty,
                 CASE WHEN fi.nest_no IS NULL THEN SUM(fi.total_weight)
                      ELSE MAX(fi.total_weight) END AS total_weight
            FROM fab_items fi
+           LEFT JOIN fab_items par ON par.id = fi.parent_item_id
+           LEFT JOIN fab_item_catalog pc ON pc.id = par.catalog_item_id AND pc.material_form = 'blank'
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
             AND COALESCE(fi.procurement_type, ?) = 'buy'
           GROUP BY fi.catalog_item_id, fi.nest_no
@@ -152,8 +162,12 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
        FROM (
          SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
                 COUNT(*) AS lines_count,
-                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty) ELSE MAX(fi.qty) END AS qty
+                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty)
+                     WHEN MAX(pc.id IS NOT NULL) = 1 THEN 1
+                     ELSE MAX(fi.qty) END AS qty
            FROM fab_items fi
+           LEFT JOIN fab_items par ON par.id = fi.parent_item_id
+           LEFT JOIN fab_item_catalog pc ON pc.id = par.catalog_item_id AND pc.material_form = 'blank'
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
             AND COALESCE(fi.procurement_type, ?) = 'buy'
             AND fi.catalog_item_id IS NOT NULL
