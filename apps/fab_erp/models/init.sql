@@ -3455,6 +3455,42 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_items ADD KEY idx_fi_parent_sort (order_id, parent_item_id, sort_order)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- A PIECE'S TIME TO FOUR PLACES. computed_hours is per piece, and at two places
+-- it moved in 36-second steps: a 2.5-minute stiffener step stored as 2.4, and
+-- across 252 stiffeners that is 25 minutes nobody typed. Widened, not rounded.
+SET @typ = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='computed_hours');
+SET @sql = IF(@typ='decimal(10,2)',
+  'ALTER TABLE fab_project_tasks MODIFY COLUMN computed_hours DECIMAL(12,4) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A TASK'S CODE — the BOM row's code, the step, the operation. Written when the
+-- production order is deployed, from the code generator's 'task' rule.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='task_code');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_project_tasks ADD COLUMN task_code VARCHAR(200) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A TIME SOMEBODY TYPED OVER, per piece, for one step of one BOM row.
+-- Kept apart from the task because it has to exist BEFORE the task does — the
+-- production-order screen is where it is typed, and that is before the draft is
+-- raised — and because a formula recomputed later must not wash it away.
+-- taskGatingService.planOrderTasks reads it; nothing else decides a step's time.
+CREATE TABLE IF NOT EXISTS fab_task_time_overrides (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  order_id      INT           NOT NULL,
+  item_id       INT           NOT NULL,
+  flow_step_id  INT           NOT NULL,
+  unit_minutes  DECIMAL(12,3) NOT NULL,
+  updated_by    INT           NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at    DATETIME      NULL,
+  UNIQUE KEY uq_ftto_step (company_id, item_id, flow_step_id),
+  KEY idx_ftto_order (company_id, order_id)
+);
+
 -- ── purchase-order lines ──────────────────────────────────────────────────
 -- fab_order_lines was built for SALES lines: free text, a price, a completed
 -- qty. A purchase line needs to name a catalog item — it is a specific plate,

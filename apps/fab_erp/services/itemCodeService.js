@@ -157,27 +157,10 @@ export function materialSegment(catalogCode, fallbackName) {
   return s.slice(0, 24) || abbreviate(fallbackName);
 }
 
-/**
- * The `<CUSTOMER>-<ORDER NUMBER>` head every code in one order shares. This is
- * what a Level 1 row hangs off, and what the sheet shows once instead of on
- * every line.
+/*
+ * The order prefix lives in codegenService.orderCodePrefix — one rule for every
+ * code, in one place.
  */
-export async function orderCodePrefix(companyId, orderId, conn) {
-  const exec = conn ?? pool;
-  const [[order]] = await exec.query(
-    `SELECT o.order_number, o.customer_name, c.name AS customer_master_name
-       FROM fab_orders o
-       LEFT JOIN fab_customers c ON c.id = o.customer_id AND c.deleted_at IS NULL
-      WHERE o.id = ? AND o.company_id = ? AND o.deleted_at IS NULL`,
-    [orderId, companyId],
-  );
-  if (!order) throw new Error('Order not found');
-  // fab_customers.code is a serial ('CUST-0001'), which identifies nothing to a
-  // reader, so the prefix comes from the customer's NAME.
-  const cust = customerAbbrev(order.customer_master_name || order.customer_name);
-  const num  = String(order.order_number ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '') || `ORD${orderId}`;
-  return `${cust}-${num}`;
-}
 
 /** `<parentCode>-<ABBR>`, trimmed to fit the column. */
 export function composeCode(parentCode, abbr) {
@@ -208,74 +191,4 @@ export async function loadUsedCodes(companyId, conn) {
     [companyId],
   );
   return new Set(taken.map((t) => t.code));
-}
-
-/**
- * Fill in `code` for every row of one order that does not have one — used for
- * rows added by hand in the tree, and as a backstop after an import.
- *
- * Walks parents before children so a child can always read its parent's code.
- *
- * @returns {Promise<{coded:number, skipped:number, alreadyCoded:number}>}
- */
-export async function generateOrderItemCodes(companyId, orderId, conn) {
-  const exec = conn ?? pool;
-  const prefix = await orderCodePrefix(companyId, orderId, conn);
-
-  const [rows] = await exec.query(
-    `SELECT id, parent_item_id, name, code FROM fab_items
-      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-      ORDER BY id`,
-    [companyId, orderId],
-  );
-  if (!rows.length) return { coded: 0, skipped: 0, alreadyCoded: 0 };
-
-  const byId = new Map(rows.map((r) => [r.id, r]));
-  const childrenOf = new Map();
-  const roots = [];
-  for (const r of rows) {
-    if (r.parent_item_id != null && byId.has(r.parent_item_id)) {
-      if (!childrenOf.has(r.parent_item_id)) childrenOf.set(r.parent_item_id, []);
-      childrenOf.get(r.parent_item_id).push(r);
-    } else {
-      roots.push(r);
-    }
-  }
-
-  const used = await loadUsedCodes(companyId, conn);
-  let coded = 0;
-  let alreadyCoded = 0;
-  let skipped = 0;
-
-  // Breadth-first from the roots: a child's code needs its parent's, so the
-  // parent must be resolved first. `seen` also makes a cycle terminate.
-  const seen = new Set();
-  const queue = roots.map((r) => ({ row: r, parentCode: prefix }));
-  while (queue.length) {
-    const { row, parentCode } = queue.shift();
-    if (seen.has(row.id)) continue;
-    seen.add(row.id);
-
-    let myCode = row.code;
-    if (myCode) {
-      alreadyCoded++;
-    } else {
-      const candidate = uniquifyCode(composeCode(parentCode, abbreviate(row.name)), used);
-      if (used.has(candidate)) { skipped++; continue; }
-      await exec.query(
-        'UPDATE fab_items SET code = ? WHERE id = ? AND company_id = ? AND code IS NULL',
-        [candidate, row.id, companyId],
-      );
-      used.add(candidate);
-      row.code = candidate;
-      myCode = candidate;
-      coded++;
-    }
-
-    for (const child of childrenOf.get(row.id) ?? []) {
-      queue.push({ row: child, parentCode: myCode });
-    }
-  }
-
-  return { coded, skipped, alreadyCoded };
 }

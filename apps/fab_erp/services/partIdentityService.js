@@ -40,8 +40,7 @@
  */
 
 import { pool } from '../../../db.js';
-import { previewCode, defaultSegmentsFor } from './codegenService.js';
-import { orderCodePrefix } from './itemCodeService.js';
+import { previewCode, defaultSegmentsFor, orderCodePrefix } from './codegenService.js';
 
 /**
  * The finishing marker, e.g. `/D` for drilled.

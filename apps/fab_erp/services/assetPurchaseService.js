@@ -33,20 +33,10 @@
 
 import { pool } from '../../../db.js';
 import { resolveCatalogFields } from './itemFieldService.js';
+import { generateCode } from './codegenService.js';
 
 const PO_DRAFT = 'draft';
 
-/** `PO-YYYYMMDD-NNNN`, matching the sales path's numbering exactly. */
-async function nextPoNumber(conn, companyId) {
-  const [[t]] = await conn.query('SELECT DATE_FORMAT(NOW(), "%Y%m%d") AS ymd');
-  const stamp = t.ymd;
-  const [[row]] = await conn.query(
-    `SELECT COUNT(*) AS n FROM fab_orders
-      WHERE company_id = ? AND order_type = 'purchase' AND order_number LIKE ?`,
-    [companyId, `PO-${stamp}-%`],
-  );
-  return `PO-${stamp}-${String(Number(row.n) + 1).padStart(4, '0')}`;
-}
 
 /**
  * Raise a purchase order against a machine or a machine type.
@@ -128,7 +118,7 @@ export async function raiseAssetPurchase(companyId, p = {}, userId = null) {
       plantId = t.plant_id ?? null;
     }
 
-    const orderNumber = await nextPoNumber(conn, companyId);
+    const orderNumber = await generateCode(companyId, 'purchase_order', {}, conn);
     const [ins] = await conn.query(
       `INSERT INTO fab_orders
          (company_id, order_number, order_type, status, supplier_id,

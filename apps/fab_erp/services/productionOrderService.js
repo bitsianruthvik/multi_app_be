@@ -26,18 +26,18 @@
  */
 
 import { pool } from '../../../db.js';
-import { NOT_A_BLANK } from './blankPredicate.js';
+import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
-import { materializeOrderTasks } from './taskGatingService.js';
+import { materializeOrderTasks, syncUnstartedTasks } from './taskGatingService.js';
+import { generateCode, orderRowCodes, taskCodes } from './codegenService.js';
 
 /**
  * A production order's life, and what moves it.
  *
- *   draft          raised, with its DAG already built. Nobody has committed to
- *                  it yet, so nothing advances it automatically — approval is a
- *                  person's decision and the system must not make it by
- *                  materialising some tasks.
- *   waiting        approved, and every task is still blocked. The shop cannot
+ *   draft          raised, with its DAG already built. Times can still be typed
+ *                  over and the tasks follow. Nothing advances it automatically
+ *                  — deploying is a person's decision.
+ *   waiting        deployed: codes written, and every task is still blocked. The shop cannot
  *                  start: there is nothing to put on a machine.
  *   in_production  at least one task is ELIGIBLE — its material is on hand and
  *                  its predecessors are done. That is what "the first raw
@@ -57,21 +57,6 @@ export const MO_STATUS = {
   DONE: 'completed',
   CANCELLED: 'cancelled',
 };
-
-async function nextOrderNumber(exec, companyId, prefix, stampYmd) {
-  const [[row]] = await exec.query(
-    `SELECT order_number FROM fab_orders
-      WHERE company_id = ? AND order_number LIKE ?
-      ORDER BY id DESC LIMIT 1`,
-    [companyId, `${prefix}-%`],
-  );
-  let seq = 1;
-  if (row?.order_number) {
-    const n = parseInt(String(row.order_number).split('-').pop(), 10);
-    if (Number.isFinite(n)) seq = n + 1;
-  }
-  return `${prefix}-${stampYmd}-${String(seq).padStart(4, '0')}`;
-}
 
 /**
  * Create (or find) the production order for a sales order and claim its tasks.
@@ -106,8 +91,7 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
 
     let created = false;
     if (!mo) {
-      const [[{ ymd }]] = await conn.query("SELECT DATE_FORMAT(UTC_DATE(), '%Y%m%d') AS ymd");
-      const orderNumber = await nextOrderNumber(conn, companyId, 'MO', ymd);
+      const orderNumber = await generateCode(companyId, 'manufacturing_order', {}, conn);
       const [ins] = await conn.query(
         `INSERT INTO fab_orders
            (company_id, order_number, order_type, mo_purpose, status, source_order_id, plant_id,
@@ -135,6 +119,9 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
      * after the BOM grew adds only what is new.
      */
     const materialized = await materializeOrderTasks(conn, companyId, orderId);
+    // A draft follows the plan — a time typed over, a quantity changed. Once
+    // deployed, the tasks keep what they were deployed with.
+    if (mo.status === MO_STATUS.DRAFT) await syncUnstartedTasks(conn, companyId, orderId);
 
     // Claim every make task on this sales order. A task whose item is bought in
     // is not production work and is left alone.
@@ -169,33 +156,128 @@ export async function ensureProductionOrder(companyId, orderId, opts = {}) {
   }
 }
 
-/**
- * Approve a production order: draft → waiting, and then wherever the work is.
- *
- * Approval is the one transition a person makes. Everything after it is a
- * consequence of the shop floor, so this hands straight over to the roll-up —
- * an order whose material is ALREADY in stock has nothing to wait for and goes
- * to in_production immediately rather than sitting in a waiting state that was
- * never true.
- */
-export async function approveProductionOrder(companyId, productionOrderId) {
-  const [[mo]] = await pool.query(
-    `SELECT id, status FROM fab_orders
-      WHERE id = ? AND company_id = ? AND order_type = 'manufacturing' AND mo_purpose IS NULL AND deleted_at IS NULL
-      LIMIT 1`,
-    [productionOrderId, companyId],
-  );
-  if (!mo) throw new Error('Production order not found');
-  if (mo.status === MO_STATUS.CANCELLED) throw new Error('That production order is cancelled');
-  if (mo.status !== MO_STATUS.DRAFT) {
-    // Already approved. Not an error — re-reading where it stands is useful.
-    return rollUpProductionOrder(pool, companyId, productionOrderId);
-  }
+/** Which tasks a production order owns: blanks for cutting, everything else made for fabrication. */
+const claimFilter = (purpose) => (purpose === 'cutting' ? IS_A_BLANK('i') : NOT_A_BLANK('i'));
 
-  await pool.query(
-    `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ?`,
-    [MO_STATUS.WAITING, productionOrderId, companyId],
-  );
+/** Write many values in a few statements rather than one round trip each. */
+async function updateInChunks(conn, table, column, pairs, companyId) {
+  for (let i = 0; i < pairs.length; i += 200) {
+    const chunk = pairs.slice(i, i + 200);
+    const cases = chunk.map(() => 'WHEN ? THEN ?').join(' ');
+    await conn.query(
+      `UPDATE ${table} SET ${column} = CASE id ${cases} END WHERE company_id = ? AND id IN (?)`,
+      [...chunk.flat(), companyId, chunk.map(([id]) => id)],
+    );
+  }
+}
+
+/**
+ * DEPLOY a production order to the shop: draft → waiting, codes written.
+ *
+ * The one transition a person makes. Before it, the order is a plan — times can
+ * be typed over and the tasks follow. Deploying fixes it:
+ *
+ *   1. the tasks are brought up to date one last time and claimed;
+ *   2. every BOM row gets its code, from the code generator's 'order_item'
+ *      rule (a blank already has its code — the 'blank' rule gave it one);
+ *   3. every task gets its code, from the 'task' rule: the row's code, the
+ *      step, the operation;
+ *   4. the order moves to waiting, and from there follows the shop floor.
+ *
+ * CODES ARE WRITTEN ONCE. A row that already has a code keeps it — by the time
+ * one exists it may be on a drawing.
+ *
+ * Works for both production orders; the cutting one owns the blank rows, the
+ * fabrication one owns the rest.
+ */
+export async function deployProductionOrder(companyId, productionOrderId) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[mo]] = await conn.query(
+      `SELECT id, status, mo_purpose AS purpose, source_order_id AS salesId FROM fab_orders
+        WHERE id = ? AND company_id = ? AND order_type = 'manufacturing' AND deleted_at IS NULL
+        LIMIT 1 FOR UPDATE`,
+      [productionOrderId, companyId],
+    );
+    if (!mo) { const e = new Error('Production order not found'); e.status = 404; throw e; }
+    if (mo.status === MO_STATUS.CANCELLED) { const e = new Error('That production order is cancelled'); e.status = 409; throw e; }
+    if (mo.status !== MO_STATUS.DRAFT) {
+      // Already deployed. Not an error — re-reading where it stands is useful.
+      await conn.rollback();
+      return rollUpProductionOrder(pool, companyId, productionOrderId);
+    }
+
+    // 1. last refresh, then claim what is this order's
+    await materializeOrderTasks(conn, companyId, mo.salesId);
+    await syncUnstartedTasks(conn, companyId, mo.salesId);
+    await conn.query(
+      `UPDATE fab_project_tasks t
+         JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
+          SET t.production_order_id = ?
+        WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
+          AND COALESCE(i.procurement_type, ?) = 'make' AND ${claimFilter(mo.purpose)}`,
+      [mo.id, companyId, mo.salesId, DEFAULT_PROCUREMENT],
+    );
+
+    // 2. row codes — fabrication only; blanks were coded when they were made
+    if (mo.purpose !== 'cutting') {
+      const codes = await orderRowCodes(companyId, mo.salesId, conn);
+      const seen = new Map();
+      for (const [id, code] of codes) {
+        if (seen.has(code)) {
+          const e = new Error(`Two BOM rows would get the code ${code}. `
+            + 'Add a position to the BOM row rule in Code Generation so rows of the same item are numbered.');
+          e.status = 422; throw e;
+        }
+        seen.set(code, id);
+      }
+      const [uncoded] = codes.size
+        ? await conn.query(
+          `SELECT id FROM fab_items WHERE company_id = ? AND id IN (?) AND code IS NULL`,
+          [companyId, [...codes.keys()]],
+        )
+        : [[]];
+      try {
+        await updateInChunks(conn, 'fab_items', 'code',
+          uncoded.map((r) => [Number(r.id), codes.get(Number(r.id))]), companyId);
+      } catch (err) {
+        if (err?.code !== 'ER_DUP_ENTRY') throw err;
+        const e = new Error('A BOM row code is already used by another item. Change the BOM row rule in Code Generation and deploy again.');
+        e.status = 409; throw e;
+      }
+    }
+
+    // 3. task codes
+    const [tasks] = await conn.query(
+      `SELECT t.id, t.item_id AS itemId, t.seq_no AS seqNo, i.code AS rowCode, o.code AS operationCode
+         FROM fab_project_tasks t
+         JOIN fab_items i ON i.id = t.item_id
+         LEFT JOIN fab_operations o ON o.id = t.operation_id
+        WHERE t.company_id = ? AND t.production_order_id = ? AND t.deleted_at IS NULL`,
+      [companyId, mo.id],
+    );
+    // Step number = position down the row's flow, 1, 2, 3 — the same count the
+    // production-order screen shows.
+    const byRow = new Map();
+    for (const t of tasks) { if (!byRow.has(t.itemId)) byRow.set(t.itemId, []); byRow.get(t.itemId).push(t); }
+    for (const list of byRow.values()) list.sort((a, b) => a.seqNo - b.seqNo).forEach((t, i) => { t.stepNo = i + 1; });
+    const tcodes = await taskCodes(companyId, tasks);
+    await updateInChunks(conn, 'fab_project_tasks', 'task_code',
+      tasks.map((t, i) => [Number(t.id), tcodes[i]]), companyId);
+
+    // 4. deployed
+    await conn.query(
+      `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ?`,
+      [MO_STATUS.WAITING, mo.id, companyId],
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    throw err;
+  } finally {
+    conn.release();
+  }
   return rollUpProductionOrder(pool, companyId, productionOrderId);
 }
 
@@ -270,40 +352,3 @@ export async function rollUpProductionOrder(exec, companyId, productionOrderId) 
   return { status: target, progressPct: pct, total, done, active, eligible };
 }
 
-/** The production order for a sales order, with the shape of its DAG. */
-export async function productionForOrder(companyId, orderId, conn) {
-  const exec = conn ?? pool;
-  const [[mo]] = await exec.query(
-    `SELECT id, order_number, status, progress_pct, required_date, created_at
-       FROM fab_orders
-      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing' AND mo_purpose IS NULL
-        AND deleted_at IS NULL
-      ORDER BY id LIMIT 1`,
-    [companyId, orderId],
-  );
-  if (!mo) return null;
-
-  const [[agg]] = await exec.query(
-    `SELECT COUNT(*) AS total,
-            SUM(status = 'done')                     AS done,
-            SUM(status IN ('in_progress', 'paused')) AS active,
-            SUM(status = 'blocked')                  AS blocked
-       FROM fab_project_tasks
-      WHERE company_id = ? AND production_order_id = ? AND deleted_at IS NULL`,
-    [companyId, mo.id],
-  );
-
-  return {
-    id: mo.id,
-    orderNumber: mo.order_number,
-    status: mo.status,
-    progressPct: Number(mo.progress_pct) || 0,
-    requiredDate: mo.required_date,
-    tasks: {
-      total: Number(agg?.total) || 0,
-      done: Number(agg?.done) || 0,
-      active: Number(agg?.active) || 0,
-      blocked: Number(agg?.blocked) || 0,
-    },
-  };
-}

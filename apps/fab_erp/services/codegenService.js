@@ -15,9 +15,36 @@
  *   { type: 'date', format }                 — 'YYYY' | 'YY' | 'MM' | 'DD' | 'YYMM' | 'YYYYMM' | 'YYYYMMDD'
  *   { type: 'sequence', digits, resetPeriod } — resetPeriod: 'never' | 'yearly' | 'monthly'
  *   { type: 'free_text', value }             — fixed manual fragment, reserved for future use
+ *   { type: 'attribute', field, … }          — one named value the caller passes (material, size…)
+ *   { type: 'order_prefix' }                 — `<customer>-<order number>`
+ *
+ * Segments for things that sit in a TREE — an order's BOM rows and the tasks
+ * hanging off them:
+ *   { type: 'parent_code', separator, topLevel } — the parent's code, then `separator`.
+ *                                               A top row has no parent; `topLevel`
+ *                                               says what stands in: 'order_prefix'
+ *                                               (default) or 'none'.
+ *   { type: 'bom_code', length }             — the code the BOM gives this row
+ *                                               (fab_item_bom.code_segment). A BOM
+ *                                               line left blank means "just a number";
+ *                                               a row with no BOM line is abbreviated
+ *                                               from its name.
+ *   { type: 'position', digits, restart }    — where the row sits in the BOM, counted
+ *                                               among rows of the SAME item. restart:
+ *                                               'parent' — starts at 1 under each parent;
+ *                                               'above'  — carries on from the rows above,
+ *                                                          across the whole order.
+ *   { type: 'step_no', digits }              — a task's step number in its flow
+ *   { type: 'operation_code' }               — a task's operation code
+ *
+ * TWO KINDS OF RULE. Most rules issue a number from a counter (generateCode).
+ * Tree and blank codes are DERIVED instead (deriveCodes): the same row in the
+ * same place always reads the same, so the code can be shown before it is
+ * saved and never burns a number. A derived rule has no running sequence.
  */
 
 import { pool } from '../../../db.js';
+import { abbreviate, customerAbbrev } from './itemCodeService.js';
 
 // Ensures fab_codegen_rules exists — runs once per process on first use.
 // Handles the case where the deployed DB never ran init.sql migrations.
@@ -116,11 +143,64 @@ const DEFAULT_SEGMENTS = {
     { type: 'fixed', value: '-' },
     { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
   ],
+  /** Production orders — fabrication and cutting alike. One counter for both. */
   manufacturing_order: [
     { type: 'fixed', value: 'MO-' },
     { type: 'date', format: 'YYYYMMDD' },
     { type: 'fixed', value: '-' },
     { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  purchase_order: [
+    { type: 'fixed', value: 'PO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  /**
+   * A ROW OF AN ORDER'S BOM — its parent's code, the code its BOM line gives it,
+   * and where it sits.
+   *
+   *   KALP-SO-20260910-0066-SPAN1-L1-2      the second Segment row under Line 1
+   */
+  order_item: [
+    { type: 'parent_code', separator: '-', topLevel: 'order_prefix' },
+    { type: 'bom_code' },
+    { type: 'position', digits: 1, restart: 'parent' },
+  ],
+  /**
+   * A BLANK — one size of rectangle cut for one order. Named by what it is, so
+   * the same rectangle on the same order is always the same code.
+   *
+   *   BLK-202609100066-MS-E350BO-28X2995X12000
+   */
+  blank: [
+    { type: 'fixed', value: 'BLK-' },
+    { type: 'attribute', field: 'orderRef' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'material', fallback: 'X' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'grade', fallback: 'X' },
+    { type: 'fixed', value: '-' },
+    { type: 'attribute', field: 'thickness' },
+    { type: 'fixed', value: 'X' },
+    { type: 'attribute', field: 'width' },
+    { type: 'fixed', value: 'X' },
+    { type: 'attribute', field: 'length' },
+  ],
+  /**
+   * A TASK — the row it works on, which step of the flow, and the operation.
+   *
+   *   KALP-SO-20260910-0066-SPAN1-L1-2/05-SAW
+   *
+   * The step number is there because a flow can use one operation more than
+   * once (a crane move between every station), and the code has to tell those
+   * apart.
+   */
+  task: [
+    { type: 'parent_code', separator: '/', topLevel: 'none' },
+    { type: 'step_no', digits: 2 },
+    { type: 'fixed', value: '-' },
+    { type: 'operation_code' },
   ],
   planned_order: [
     { type: 'fixed', value: 'PLN-' },
@@ -291,6 +371,34 @@ async function evaluateSegments(segments, { companyId, context, seqValue, now })
         parts.push(context.orderPrefix ?? '');
         break;
 
+      case 'parent_code': {
+        const parent = context.parentCode
+          || ((seg.topLevel ?? 'order_prefix') === 'order_prefix' ? context.orderPrefix : '')
+          || '';
+        if (parent) parts.push(parent + (seg.separator ?? '-'));
+        break;
+      }
+
+      case 'bom_code': {
+        const text = String(context.bomCode ?? '').toUpperCase();
+        parts.push(seg.length ? text.slice(0, seg.length) : text);
+        break;
+      }
+
+      case 'position': {
+        const n = (seg.restart === 'above' ? context.position?.above : context.position?.parent) ?? 1;
+        parts.push(String(n).padStart(seg.digits ?? 1, '0'));
+        break;
+      }
+
+      case 'step_no':
+        parts.push(String(context.stepNo ?? '').padStart(seg.digits ?? 2, '0'));
+        break;
+
+      case 'operation_code':
+        parts.push(String(context.operationCode ?? '').toUpperCase());
+        break;
+
       default:
         break;
     }
@@ -347,7 +455,12 @@ export async function previewCode(companyId, entityType, segments, context = {})
     const periodKey = periodKeyFor(seqSeg.resetPeriod, now);
     seqValue = row && row.seq_period_key === periodKey ? row.next_seq : 1;
   }
-  return evaluateSegments(segments, { companyId, context, seqValue, now });
+  // A code read off the thing itself needs a thing to read. The settings page
+  // previews with no context at all, so it is shown a sample one.
+  const ctx = Object.keys(context ?? {}).some((k) => context[k] != null)
+    ? context
+    : (SAMPLE_CONTEXT[entityType] ?? context);
+  return evaluateSegments(segments, { companyId, context: ctx, seqValue, now });
 }
 
 /**
@@ -426,3 +539,183 @@ export async function generateCode(companyId, entityType, context = {}, existing
     if (ownTransaction) conn.release();
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * DERIVED CODES — read off where a thing is and what it is, never counted.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** The segments a rule uses, as saved or as shipped. */
+async function segmentsFor(companyId, entityType) {
+  await ensureTable();
+  const row = await getRuleRow(companyId, entityType);
+  if (!row) return defaultSegmentsFor(entityType);
+  return typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json;
+}
+
+/**
+ * Codes for many things of one kind at once, without touching any counter.
+ *
+ * For rules whose code is a fact about the thing — a blank's size, a BOM row's
+ * place in the tree, a task's step. Such a rule has no running sequence; if one
+ * is added anyway it renders as 1, which the settings page makes plain by
+ * offering no sequence for these kinds.
+ *
+ * @param {object[]} contexts one per code wanted
+ * @returns {Promise<string[]>} in the same order
+ */
+export async function deriveCodes(companyId, entityType, contexts) {
+  const segments = await segmentsFor(companyId, entityType);
+  const now = new Date();
+  const out = [];
+  for (const context of contexts) {
+    out.push(await evaluateSegments(segments, { companyId, context, seqValue: 1, now }));
+  }
+  return out;
+}
+
+/**
+ * The `<CUSTOMER>-<ORDER NUMBER>` head every code in one order shares.
+ *
+ * From the customer's NAME, not its code: fab_customers.code is a serial
+ * ('CUST-0001'), which identifies nothing to a reader.
+ */
+export async function orderCodePrefix(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+  const [[order]] = await exec.query(
+    `SELECT o.order_number, o.customer_name, c.name AS customer_master_name
+       FROM fab_orders o
+       LEFT JOIN fab_customers c ON c.id = o.customer_id AND c.deleted_at IS NULL
+      WHERE o.id = ? AND o.company_id = ? AND o.deleted_at IS NULL`,
+    [orderId, companyId],
+  );
+  if (!order) throw new Error('Order not found');
+  const cust = customerAbbrev(order.customer_master_name || order.customer_name);
+  const num = String(order.order_number ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '') || `ORD${orderId}`;
+  return `${cust}-${num}`;
+}
+
+/**
+ * The code of every BOM row on an order, from the 'order_item' rule.
+ *
+ * Read in BOM order — `sort_order`, which is what dragging rows sets — so the
+ * order on screen is the order the numbers run in. Blank rows are not part of
+ * the tree and keep the codes their own rule gives them.
+ *
+ * POSITION IS COUNTED AMONG ROWS OF THE SAME ITEM. Under a span holding a line,
+ * two end diaphragms and a splice, the end diaphragms are ED1 and ED2 — not
+ * ED2 and ED3 because a line happened to come first.
+ *
+ * @returns {Promise<Map<number, string>>} item id -> code
+ */
+export async function orderRowCodes(companyId, orderId, conn) {
+  const exec = conn ?? pool;
+  const [rows] = await exec.query(
+    `SELECT i.id, i.parent_item_id AS parentId, i.catalog_item_id AS catalogId, i.name,
+            ol.code AS lineCode
+       FROM fab_items i
+       LEFT JOIN fab_order_lines ol ON ol.id = i.order_line_id AND ol.deleted_at IS NULL
+      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+        AND i.node_kind = 'structure'
+        AND NOT EXISTS (SELECT 1 FROM fab_item_catalog bc
+                         WHERE bc.id = i.catalog_item_id AND bc.material_form = 'blank')
+      ORDER BY i.sort_order IS NULL, i.sort_order, i.id`,
+    [companyId, orderId],
+  );
+  if (!rows.length) return new Map();
+
+  const catalogIds = [...new Set(rows.map((r) => r.catalogId).filter((x) => x != null))];
+  const bomCode = new Map();
+  if (catalogIds.length) {
+    const [lines] = await exec.query(
+      `SELECT parent_item_id AS p, child_item_id AS c, code_segment AS seg
+         FROM fab_item_bom
+        WHERE company_id = ? AND deleted_at IS NULL AND child_item_id IN (?)`,
+      [companyId, catalogIds],
+    );
+    for (const l of lines) bomCode.set(`${l.p}:${l.c}`, l.seg ?? '');
+  }
+
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+  const kids = new Map();
+  for (const r of rows) {
+    const k = r.parentId != null && byId.has(Number(r.parentId)) ? Number(r.parentId) : 'root';
+    if (!kids.has(k)) kids.set(k, []);
+    kids.get(k).push(r);
+  }
+
+  const prefix = await orderCodePrefix(companyId, orderId, exec);
+  const sameItem = (r) => (r.catalogId != null ? `c${r.catalogId}` : `n${String(r.name).toLowerCase()}`);
+  const aboveCount = new Map();
+  const contexts = [];
+  const ids = [];
+
+  // Parents before children, so every row can read its parent's code.
+  const walk = (parentKey, parentRow, parentCode) => {
+    const siblings = kids.get(parentKey) ?? [];
+    const underParent = new Map();
+    for (const r of siblings) {
+      const key = sameItem(r);
+      underParent.set(key, (underParent.get(key) ?? 0) + 1);
+      aboveCount.set(key, (aboveCount.get(key) ?? 0) + 1);
+
+      // What the BOM calls this row. A BOM line left blank means "just a
+      // number"; no BOM line at all (a top row, or a row added by hand) falls
+      // back to the order line's code, then to an abbreviation of the name.
+      const line = parentRow?.catalogId != null && r.catalogId != null
+        ? bomCode.get(`${parentRow.catalogId}:${r.catalogId}`)
+        : undefined;
+      const bom = line !== undefined ? line : (r.lineCode || abbreviate(r.name));
+
+      const context = {
+        orderPrefix: prefix,
+        parentCode,
+        bomCode: bom,
+        position: { parent: underParent.get(key), above: aboveCount.get(key) },
+      };
+      contexts.push(context);
+      ids.push(Number(r.id));
+      r._context = context;
+    }
+    return siblings;
+  };
+
+  // Codes depend on the parent's code, so each level is rendered before the
+  // next is walked.
+  const segments = await segmentsFor(companyId, 'order_item');
+  const now = new Date();
+  const codes = new Map();
+  let level = walk('root', null, '');
+  while (level.length) {
+    const next = [];
+    for (const r of level) {
+      const code = await evaluateSegments(segments, { companyId, context: r._context, seqValue: 1, now });
+      codes.set(Number(r.id), code);
+      next.push(...walk(Number(r.id), r, code));
+    }
+    level = next;
+  }
+  return codes;
+}
+
+/**
+ * The code of each task, from the 'task' rule.
+ *
+ * @param {{rowCode:string, stepNo:number, operationCode:string}[]} tasks
+ */
+export async function taskCodes(companyId, tasks) {
+  return deriveCodes(companyId, 'task', tasks.map((t) => ({
+    parentCode: t.rowCode, stepNo: t.stepNo, operationCode: t.operationCode,
+  })));
+}
+
+/** What a preview shows for kinds whose code comes from the thing itself. */
+export const SAMPLE_CONTEXT = {
+  order_item: {
+    orderPrefix: 'KALP-SO-20260910-0066', parentCode: 'KALP-SO-20260910-0066-SPAN1-L1',
+    bomCode: 'SG', position: { parent: 2, above: 6 },
+  },
+  blank: {
+    attributes: { orderRef: '202609100066', material: 'MS', grade: 'E350BO', thickness: 28, width: 2995, length: 12000 },
+  },
+  task: { parentCode: 'KALP-SO-20260910-0066-SPAN1-L1-2', stepNo: 5, operationCode: 'SAW' },
+};

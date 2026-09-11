@@ -24,12 +24,8 @@
  */
 
 import { pool } from '../../../db.js';
-import {
-  materializeOrderTasks,
-} from './taskGatingService.js';
+import { materializeOrderTasks, planOrderTasks } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
-import { evaluateFormula, formulaResultToHours, parseStepParams } from './formulaEngine.js';
-import { resolveItemFields, inputContextForItem } from './itemFieldService.js';
 import { buildBaseline } from './criticalChainService.js';
 import { replan as drumReplan } from './drumService.js';
 import { logger } from '../../../core/utils/logger.js';
@@ -56,61 +52,6 @@ async function resolveItemFlowId(conn, companyId, item) {
   return bind?.flow_id ?? null;
 }
 
-/**
- * Desired planning hours for a step on a given item — must mirror
- * materializeOrderTasks exactly, or every re-materialize reports a spurious
- * duration change for tasks nobody touched.
- *
- * `itemId` is not optional in spirit: the formula sizes the job off the part's
- * own metrics. Passing no item silently evaluates every item_* variable as 0,
- * which collapses each formula onto its operation-level default — the same
- * defect fixed in the materialize path on 2026-08-05, still present here until
- * now. Applying such a diff would have overwritten every dimension-aware
- * duration with one flat number per operation.
- */
-async function desiredHours(conn, companyId, operationId, resourceTypeId, itemId, step) {
-  const [[op]] = await conn.query(
-    `SELECT time_formula, time_unit, setup_minutes, default_resource_type_id FROM fab_operations
-      WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-    [operationId, companyId],
-  );
-  // Shape-stable: callers destructure the result, so a missing operation must
-  // still hand back both keys rather than a bare null.
-  if (!op) return { runHours: null, setupHours: null };
-  const [vars] = await conn.query(
-    `SELECT var_key, default_value FROM fab_operation_variables
-      WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL`,
-    [companyId, operationId],
-  );
-  const opValues = Object.fromEntries(vars.map((v) => [v.var_key, v.default_value]));
-  const rt = resourceTypeId ?? op.default_resource_type_id ?? null;
-
-  // The SAME resolver the materialize path uses. These two must agree exactly
-  // or every re-materialize preview would report a spurious duration change on
-  // every task — which is how a diff nobody trusts gets ignored.
-  let itemValues = {};
-  if (itemId != null) {
-    itemValues = (await resolveItemFields(companyId, [itemId], { conn })).get(itemId) ?? {};
-  }
-
-  // Same unit conversion as the materialize path — these two must agree,
-  // or every re-materialize would report a spurious duration change.
-  const runHours = formulaResultToHours(
-    await evaluateFormula(
-      op.time_formula, itemValues, parseStepParams(step), rt, opValues,
-      // Same input resolution the materialize path uses — see inputContextForItem.
-      itemId != null ? await inputContextForItem(companyId, itemId, conn) : null,
-    ), op.time_unit,
-  );
-  // Setup is reported separately, not folded in: it is stored on its own column
-  // and is the one component that does NOT scale with quantity, so a diff that
-  // merged the two would say "duration changed" without saying which half.
-  const setup = op.setup_minutes != null && Number(op.setup_minutes) > 0
-    ? Number(op.setup_minutes) / 60
-    : null;
-  return { runHours, setupHours: setup };
-}
-
 const normDeps = (d) => (d == null ? '' : String(d).trim());
 
 /**
@@ -124,6 +65,13 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
+
+  // What each step SHOULD take, from the one place that works it out — the
+  // same call that builds the tasks, typed-over times included. A second copy
+  // of the formula here once disagreed with the builder and reported every
+  // task as changed.
+  const { planned } = await planOrderTasks(exec, companyId, orderId, { evaluateExisting: true });
+  const planOf = new Map(planned.map((t) => [`${t.itemId}:${t.stepId}`, t]));
 
   const outItems = [];
   let added = 0, removed = 0, changed = 0, retainedStarted = 0;
@@ -186,7 +134,8 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
       if (Number(s.seq_no) !== Number(t.seq_no)) changes.push(`seq ${t.seq_no}→${s.seq_no}`);
       if (normDeps(s.depends_on) !== normDeps(t.depends_on)) changes.push('dependencies');
       if ((s.resource_type_id ?? null) !== (t.resource_type_id ?? null)) changes.push('resource type');
-      const want = await desiredHours(exec, companyId, s.operation_id, s.resource_type_id, item.id, s);
+      const p = planOf.get(`${item.id}:${s.id}`);
+      const want = { runHours: p?.computedHours ?? null, setupHours: p?.setupHours ?? null };
       const have = t.computed_hours == null ? null : Number(t.computed_hours);
       if (want.runHours != null && (have == null || Math.abs(want.runHours - have) > HOURS_EPS)) {
         changes.push(`duration ${have == null ? '—' : have}→${Number(want.runHours.toFixed(2))}`);

@@ -22,9 +22,12 @@ import { pool } from '../../../db.js';
 import { orderShortfall } from './procurementService.js';
 import { reserveForOrder, reservePiecesForOrder } from './availabilityService.js';
 import { receiveStock } from './stockInService.js';
+import { generateCode } from './codegenService.js';
 
 /** Statuses a purchase order moves through, in order. */
 export const PO_STATUS = {
+  /** Asked for, to nobody yet. The buyer picks a supplier and sends it. */
+  REQUESTED: 'requested',
   DRAFT: 'draft',
   ORDERED: 'ordered',
   PARTIAL: 'partially_received',
@@ -33,190 +36,166 @@ export const PO_STATUS = {
 };
 
 /**
- * Next number for a document type, per company.
+ * TAKE FROM STOCK, AND ASK FOR THE REST — the buying half of the production step.
  *
- * `PO-YYYYMMDD-NNNN`, matching the sales orders' own `SO-YYYYMMDD-NNNN` shape.
- * The counter is per PREFIX, not per day, so numbers never restart and cannot
- * collide with yesterday's after a clock change.
+ * For each bought item the person says how much to take off the shelf for this
+ * order: all that is free, or less (another job may need it sooner). That much
+ * is reserved. Whatever is still needed after what is held and what is already
+ * on order goes on ONE purchase request for the order, in the 'requested'
+ * state, addressed to nobody — choosing the supplier is the buyer's call, made
+ * when the request is sent.
+ *
+ * RE-RUNNABLE. There is at most one open request per sales order: running this
+ * again rewrites that request's lines rather than raising a second, so pressing
+ * the button twice does not buy the steel twice. Requests already sent to a
+ * supplier are counted as on order and left alone.
+ *
+ * @param {Array<{catalogItemId:number, take:number}>} lines
  */
-async function nextOrderNumber(exec, companyId, prefix, stampYmd) {
-  const [[row]] = await exec.query(
-    `SELECT order_number FROM fab_orders
-      WHERE company_id = ? AND order_number LIKE ?
-      ORDER BY id DESC LIMIT 1`,
-    [companyId, `${prefix}-%`],
-  );
-  let seq = 1;
-  if (row?.order_number) {
-    const tail = String(row.order_number).split('-').pop();
-    const n = parseInt(tail, 10);
-    if (Number.isFinite(n)) seq = n + 1;
-  }
-  return `${prefix}-${stampYmd}-${String(seq).padStart(4, '0')}`;
-}
-
-/** YYYYMMDD in UTC — the DB and the server both run UTC in production. */
-async function todayStamp(exec) {
-  const [[r]] = await exec.query("SELECT DATE_FORMAT(UTC_DATE(), '%Y%m%d') AS ymd");
-  return r.ymd;
-}
-
-/**
- * Reserve what stock can cover, then raise purchase orders for the rest.
- *
- * The two halves are one transaction on purpose. Reserving without ordering
- * would hold stock against a shortfall nobody is filling; ordering without
- * reserving would buy steel the order does not need because another order took
- * the shelf out from under it a second later.
- *
- * @param {number} companyId
- * @param {number} orderId  the SALES order
- * @param {object} opts
- * @param {Array<{catalogItemId:number, qty:number, supplierId:number, expectedDate?:string, unitPrice?:number}>} opts.lines
- *   what to buy. Omit to take the computed shortfall as-is, which then requires
- *   every line to carry a supplier.
- * @param {number} [opts.createdBy]
- * @returns {Promise<{orders: object[], reserved: object[], skipped: object[]}>}
- */
-export async function raiseProcurement(companyId, orderId, opts = {}) {
+export async function requestProcurement(companyId, orderId, lines, { createdBy = null } = {}) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
     const [[sales]] = await conn.query(
-      `SELECT id, order_number, required_date, plant_id
-         FROM fab_orders
-        WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL
-        LIMIT 1`,
+      `SELECT id, order_number, required_date, plant_id FROM fab_orders
+        WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL LIMIT 1`,
       [orderId, companyId],
     );
-    if (!sales) throw new Error('Sales order not found');
+    if (!sales) { const e = new Error('Sales order not found'); e.status = 404; throw e; }
 
+    const takeOf = new Map((lines ?? []).map((l) => [Number(l.catalogItemId), Math.max(0, Number(l.take) || 0)]));
     const shortfall = await orderShortfall(companyId, orderId, conn);
 
-    // Hold what the shelf can cover for THIS order before anything is bought.
-    const reserved = await reserveForOrder(
-      conn, companyId, orderId,
-      shortfall.lines.map((l) => ({ catalogItemId: l.catalogItemId, qty: l.required })),
-    );
-
-    /**
-     * …and name the actual PLATES, where nesting said which size.
-     *
-     * The quantity reservation above says "this order holds 3 of MS Plate
-     * 20mm". That was the whole story until consumption started matching on
-     * size, and now it is not enough: two orders can both hold three while only
-     * one is the 3000x1500 either of them can use, and the second finds out at
-     * a machine. Naming the plate is the only way to hold the right one.
-     *
-     * Both are kept. The quantity reservation is still what the shortfall
-     * arithmetic reads, and it still covers every item that has no declared
-     * size or no measured stock — the piece-level earmark is an extra claim on
-     * top, not a replacement, and it engages under exactly the condition
-     * consumption does.
-     */
-    const piecesReserved = await reservePiecesForOrder(
-      conn, companyId, orderId,
-      shortfall.lines.flatMap((l) => (l.sizes ?? [])
-        .filter((s) => s.sized)
-        .map((s) => ({
-          catalogItemId: l.catalogItemId,
-          lengthMm: s.length, widthMm: s.width, plates: s.required,
-        }))),
-    );
-
-    // Recompute after reserving: what is still short is what gets purchased.
-    const after = await orderShortfall(companyId, orderId, conn);
-    const shortByItem = new Map(after.lines.map((l) => [l.catalogItemId, l]));
-
-    const requested = Array.isArray(opts.lines) && opts.lines.length
-      ? opts.lines
-      : after.lines.filter((l) => l.short > 0)
-        .map((l) => ({ catalogItemId: l.catalogItemId, qty: l.short, supplierId: null }));
-
-    const skipped = [];
-    const bySupplier = new Map();
-    for (const ln of requested) {
-      const id = Number(ln.catalogItemId);
-      const qty = Number(ln.qty);
-      if (!Number.isFinite(id) || !(qty > 0)) continue;
-      if (!ln.supplierId) {
-        // Refused rather than guessed. A purchase order with no supplier is not
-        // a draft to fix later, it is a document that cannot be sent.
-        skipped.push({ catalogItemId: id, qty, reason: 'No supplier chosen' });
-        continue;
-      }
-      const key = Number(ln.supplierId);
-      if (!bySupplier.has(key)) bySupplier.set(key, []);
-      bySupplier.get(key).push({ ...ln, catalogItemId: id, qty });
-    }
-
-    const stamp = await todayStamp(conn);
-    const orders = [];
-
-    for (const [supplierId, lines] of bySupplier) {
-      const [[sup]] = await conn.query(
-        `SELECT id, name, lead_time_days, payment_terms, currency
-           FROM fab_suppliers
-          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-        [supplierId, companyId],
+    // 1. what to hold — never more than is needed; reserveForOrder also never
+    //    takes more than is free.
+    const reserved = await reserveForOrder(conn, companyId, orderId, shortfall.lines
+      .filter((l) => takeOf.has(l.catalogItemId))
+      .map((l) => ({ catalogItemId: l.catalogItemId, qty: Math.min(takeOf.get(l.catalogItemId), l.required) })));
+    // A line taken down to zero has to give back what it held — reserveForOrder
+    // skips zero quantities, so it is released here.
+    const zeroed = [...takeOf].filter(([, t]) => t === 0).map(([id]) => id);
+    if (zeroed.length) {
+      await conn.query(
+        `UPDATE fab_stock_reservations SET status = 'released', released_at = UTC_TIMESTAMP()
+          WHERE company_id = ? AND order_id = ? AND kind = 'order' AND status = 'active'
+            AND deleted_at IS NULL AND catalog_item_id IN (?)`,
+        [companyId, orderId, zeroed],
       );
-      if (!sup) {
-        lines.forEach((l) => skipped.push({
-          catalogItemId: l.catalogItemId, qty: l.qty, reason: 'Supplier not found',
-        }));
-        continue;
+    }
+    /*
+     * …and name the actual PLATES where nesting said which size. Two orders can
+     * both hold three of a thickness while only one of the plates is the size
+     * either can use; naming the piece is the only way to hold the right one.
+     * What is taken is shared out across the sizes in turn, so naming pieces
+     * never holds more than was asked for.
+     */
+    const pieceWants = [];
+    for (const l of shortfall.lines) {
+      let left = Math.min(takeOf.get(l.catalogItemId) ?? 0, l.required);
+      for (const sz of (l.sizes ?? []).filter((x) => x.sized)) {
+        const plates = Math.min(left, sz.required);
+        if (plates > 0) pieceWants.push({ catalogItemId: l.catalogItemId, lengthMm: sz.length, widthMm: sz.width, plates });
+        left -= plates;
       }
+    }
+    if (pieceWants.length) await reservePiecesForOrder(conn, companyId, orderId, pieceWants);
+    const heldOf = new Map(await heldByOrder(conn, companyId, orderId));
 
-      const orderNumber = await nextOrderNumber(conn, companyId, 'PO', stamp);
+    // 2. the open request, if there is one — its own lines are about to be
+    //    rewritten, so they do not count as on order.
+    const [[open]] = await conn.query(
+      `SELECT id, order_number FROM fab_orders
+        WHERE company_id = ? AND source_order_id = ? AND order_type = 'purchase'
+          AND status = ? AND deleted_at IS NULL
+        ORDER BY id LIMIT 1 FOR UPDATE`,
+      [companyId, orderId, PO_STATUS.REQUESTED],
+    );
+    const onOrder = await onOrderByItem(companyId, orderId, conn, { excludeOrderId: open?.id ?? null });
+
+    const toBuy = shortfall.lines
+      .map((l) => ({
+        ...l,
+        qty: Math.max(0, l.required - (heldOf.get(l.catalogItemId) ?? 0) - (onOrder.get(l.catalogItemId) ?? 0)),
+      }))
+      .filter((l) => l.qty > 0);
+
+    // 3. one request, rewritten in place
+    let request = open ? { id: open.id, orderNumber: open.order_number } : null;
+    if (request) {
+      await conn.query(
+        `UPDATE fab_order_lines SET deleted_at = UTC_TIMESTAMP()
+          WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+        [companyId, request.id],
+      );
+      if (!toBuy.length) {
+        await conn.query(`UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ?`,
+          [PO_STATUS.CANCELLED, request.id, companyId]);
+        request = null;
+      }
+    } else if (toBuy.length) {
+      const orderNumber = await generateCode(companyId, 'purchase_order', {}, conn);
       const [ins] = await conn.query(
         `INSERT INTO fab_orders
            (company_id, order_number, order_type, status, supplier_id, source_order_id,
-            plant_id, required_date, payment_terms, currency, created_by, notes)
-         VALUES (?, ?, 'purchase', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [companyId, orderNumber, PO_STATUS.DRAFT, supplierId, orderId,
-          sales.plant_id ?? null, sales.required_date ?? null,
-          sup.payment_terms ?? null, sup.currency ?? null, opts.createdBy ?? null,
-          `Raised for ${sales.order_number || `sales order ${orderId}`}`],
+            plant_id, required_date, created_by, notes)
+         VALUES (?, ?, 'purchase', ?, NULL, ?, ?, ?, ?, ?)`,
+        [companyId, orderNumber, PO_STATUS.REQUESTED, orderId, sales.plant_id ?? null,
+          sales.required_date ?? null, createdBy, `Requested for ${sales.order_number}`],
       );
-      const poId = ins.insertId;
-
+      request = { id: ins.insertId, orderNumber };
+    }
+    if (request) {
       let lineNo = 1;
-      for (const l of lines) {
-        const [[cat]] = await conn.query(
-          `SELECT code, name, unit FROM fab_item_catalog
-            WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-          [l.catalogItemId, companyId],
-        );
-        await conn.query(
-          `INSERT INTO fab_order_lines
-             (company_id, order_id, line_no, code, description, catalog_item_id,
-              qty, unit, unit_price, expected_date, status, qty_received)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0)`,
-          [companyId, poId, lineNo++, cat?.code ?? null, cat?.name ?? null,
-            l.catalogItemId, l.qty, cat?.unit ?? null,
-            l.unitPrice ?? null, l.expectedDate ?? null],
-        );
-      }
-
-      orders.push({
-        id: poId,
-        orderNumber,
-        supplierId,
-        supplierName: sup.name,
-        lineCount: lines.length,
-        shortfallCovered: lines.reduce((a, l) => a + (shortByItem.get(l.catalogItemId)?.short ?? 0), 0),
-      });
+      await conn.query(
+        `INSERT INTO fab_order_lines
+           (company_id, order_id, line_no, code, description, catalog_item_id, qty, unit, status, qty_received)
+         VALUES ?`,
+        [toBuy.map((l) => [companyId, request.id, lineNo++, l.code ?? null, l.name ?? null,
+          l.catalogItemId, l.qty, l.unit ?? null, 'open', 0])],
+      );
     }
 
     await conn.commit();
-    return { orders, reserved, piecesReserved, skipped };
+    return { reserved, request, lines: toBuy.length };
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
   }
+}
+
+/**
+ * Send a purchase request to a supplier: requested → ordered.
+ *
+ * The request was raised addressed to nobody; this is where the buyer names
+ * who it goes to. After this it is an ordinary purchase order and is received
+ * against on the Stock In page like any other.
+ */
+export async function sendPurchaseRequest(companyId, poId, supplierId) {
+  const [[sup]] = await pool.query(
+    `SELECT id, payment_terms, currency FROM fab_suppliers WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+    [supplierId, companyId],
+  );
+  if (!sup) { const e = new Error('Choose a supplier first.'); e.status = 422; throw e; }
+  const [r] = await pool.query(
+    `UPDATE fab_orders SET supplier_id = ?, payment_terms = ?, currency = ?, status = ?
+      WHERE id = ? AND company_id = ? AND order_type = 'purchase' AND status = ? AND deleted_at IS NULL`,
+    [sup.id, sup.payment_terms ?? null, sup.currency ?? null, PO_STATUS.ORDERED, poId, companyId, PO_STATUS.REQUESTED],
+  );
+  if (!r.affectedRows) { const e = new Error('That request has already been sent.'); e.status = 409; throw e; }
+  return { ok: true };
+}
+
+/** What each item this order holds off the shelf, right now. */
+export async function heldByOrder(conn, companyId, orderId) {
+  const [rows] = await (conn ?? pool).query(
+    `SELECT catalog_item_id AS id, SUM(qty) AS qty FROM fab_stock_reservations
+      WHERE company_id = ? AND order_id = ? AND kind = 'order' AND status = 'active' AND deleted_at IS NULL
+      GROUP BY catalog_item_id`,
+    [companyId, orderId],
+  );
+  return rows.map((r) => [Number(r.id), Number(r.qty) || 0]);
 }
 
 /**
@@ -440,6 +419,8 @@ export async function openPurchaseOrders(companyId, { includeClosed = false } = 
        LEFT JOIN fab_orders so    ON so.id = o.source_order_id AND so.deleted_at IS NULL
        LEFT JOIN fab_order_lines ol ON ol.order_id = o.id AND ol.deleted_at IS NULL
       WHERE o.company_id = ? AND o.order_type = 'purchase' AND o.deleted_at IS NULL
+        -- A request has no supplier yet, so nothing can arrive against it.
+        AND o.status <> 'requested'
         ${includeClosed ? '' : `AND o.status NOT IN ('received', 'cancelled')`}
       GROUP BY o.id, o.order_number, o.status, o.supplier_id, s.name,
                o.required_date, o.created_at, o.source_order_id, so.order_number
@@ -491,7 +472,7 @@ export async function purchaseOrderLines(companyId, poId) {
  *
  * @returns {Promise<Map<number, number>>} catalog item id -> quantity outstanding
  */
-export async function onOrderByItem(companyId, orderId, conn) {
+export async function onOrderByItem(companyId, orderId, conn, { excludeOrderId = null } = {}) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
     `SELECT ol.catalog_item_id AS id,
@@ -501,8 +482,9 @@ export async function onOrderByItem(companyId, orderId, conn) {
       WHERE o.company_id = ? AND o.source_order_id = ?
         AND o.order_type = 'purchase' AND o.deleted_at IS NULL
         AND o.status <> ? AND ol.catalog_item_id IS NOT NULL
+        AND o.id <> ?
       GROUP BY ol.catalog_item_id`,
-    [companyId, orderId, PO_STATUS.CANCELLED],
+    [companyId, orderId, PO_STATUS.CANCELLED, excludeOrderId ?? 0],
   );
   return new Map(rows.map((r) => [Number(r.id), Number(r.outstanding) || 0]));
 }

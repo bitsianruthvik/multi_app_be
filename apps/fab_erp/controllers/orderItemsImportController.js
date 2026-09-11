@@ -1,6 +1,6 @@
 import { exportOrderItemsTemplate, importOrderItemsExcel } from '../services/orderItemsImportService.js';
 import { recomputeOrderWeights } from '../services/itemWeightService.js';
-import { generateOrderItemCodes, customerAbbrev } from '../services/itemCodeService.js';
+import { orderCodePrefix } from '../services/codegenService.js';
 import {
   exportBoqSheet, importBoqSheet, buildWizardRows, applyWizardRows,
 } from '../services/boqSheetService.js';
@@ -467,19 +467,6 @@ export const confirmOrderHandler = async (req, res) => {
   }
 };
 
-export const generateOrderItemCodesHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    await assertOrder(cid, orderId);
-    res.json(await generateOrderItemCodes(cid, orderId));
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: generateOrderItemCodes failed');
-    res.status(500).json({ message: 'Failed to generate codes', error: err.message });
-  }
-};
-
 /**
  * The nesting view: each raw material on this order, every part cut from it,
  * and whether it is actually in stock.
@@ -671,16 +658,7 @@ export const orderWeightSummaryHandler = async (req, res) => {
 
     // Every code in one order opens with the same customer + order number, so
     // the tree shows only the part that differs and this prefix is stated once.
-    const [[ord]] = await pool.query(
-      `SELECT o.order_number, o.customer_name, c.name AS customer_master_name
-         FROM fab_orders o
-         LEFT JOIN fab_customers c ON c.id = o.customer_id AND c.deleted_at IS NULL
-        WHERE o.id = ? AND o.company_id = ?`,
-      [orderId, cid],
-    );
-    const codePrefix = ord
-      ? `${customerAbbrev(ord.customer_master_name || ord.customer_name)}-${String(ord.order_number ?? '').toUpperCase().replace(/[^A-Z0-9-]+/g, '')}`
-      : null;
+    const codePrefix = await orderCodePrefix(cid, orderId).catch(() => null);
 
     res.json({
       totalWeight: totals.weighedRoots > 0 ? Number(totals.total) : null,

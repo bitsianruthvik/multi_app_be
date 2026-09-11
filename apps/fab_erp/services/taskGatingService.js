@@ -343,7 +343,30 @@ const chunkRows = (rows, n) => {
   return out;
 };
 
-export async function materializeOrderTasks(conn, companyId, orderId) {
+/**
+ * WHAT AN ORDER'S TASKS WOULD BE — every (row, flow step), its time, its
+ * quantity and its inputs — without writing anything.
+ *
+ * This is the one place a step's time is worked out. Building the tasks
+ * (materializeOrderTasks) writes what it returns; the production-order screen
+ * shows what it returns before anything exists; re-materialising compares
+ * against it. Three readers, one answer, so the screen cannot promise one
+ * number and the task get another.
+ *
+ * A TIME TYPED OVER wins over the formula (fab_task_time_overrides). It is a
+ * per-piece figure like the formula's, so it is multiplied by the quantity the
+ * same way — see taskDuration.
+ *
+ * THE QUANTITY IS THE WHOLE ORDER'S. A row's qty is per parent: three segments
+ * per line, four lines per span. The task makes all twelve, so its quantity is
+ * the product up the tree. It used to be the row's own 3, which planned a
+ * quarter of the work.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.evaluateExisting=false] also time steps that already
+ *   have a task. Building skips them; a screen showing every step wants them.
+ */
+export async function planOrderTasks(conn, companyId, orderId, { evaluateExisting = false } = {}) {
   const [items] = await conn.query(
     // `qty` is load-bearing and was missing until 2026-08-15: without it
     // `item.qty ?? 1` below always took the 1, so EVERY task materialized was
@@ -358,7 +381,28 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
-  if (items.length === 0) return { ok: true, itemsProcessed: 0, itemsSkipped: 0, tasksInserted: 0 };
+  if (items.length === 0) return { items, planned: [], itemsProcessed: 0, itemsSkipped: 0 };
+
+  /** How many pieces a row stands for across the whole order. */
+  const rowById = new Map(items.map((it) => [Number(it.id), it]));
+  const rolledQty = (it) => {
+    let q = 1;
+    let cur = it;
+    for (let hop = 0; cur && hop < 64; hop++) {
+      q *= Number(cur.qty ?? 1) || 0;
+      if (cur.parent_item_id == null) break;
+      cur = rowById.get(Number(cur.parent_item_id));
+    }
+    return q;
+  };
+
+  /** Times somebody typed over, per piece, in minutes. */
+  const [overrideRows] = await conn.query(
+    `SELECT item_id, flow_step_id, unit_minutes FROM fab_task_time_overrides
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  const overrideOf = new Map(overrideRows.map((r) => [`${r.item_id}:${r.flow_step_id}`, Number(r.unit_minutes)]));
 
   const catalogItemIds = [...new Set(items.filter((i) => i.catalog_item_id != null).map((i) => i.catalog_item_id))];
 
@@ -556,7 +600,7 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
   );
   const existingStepKeys = new Set(existingRows.map((r) => `${r.item_id}:${r.flow_step_id}`));
 
-  let itemsProcessed = 0, itemsSkipped = 0, tasksInserted = 0;
+  let itemsProcessed = 0, itemsSkipped = 0;
 
   /**
    * COLLECTED FIRST, WRITTEN IN BATCHES.
@@ -577,17 +621,16 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
    */
   /** Lives exactly as long as this materialization. See evaluateFormula. */
   const machinePropsCache = new Map();
-  const taskRows = [];      // [companyId, orderId, itemId, flowId, stepId, opId, seq, deps, rtId, hours, setup, qty]
-  const inputPlans = [];    // {itemId, stepId, cols, values}  — task_id filled after read-back
-  const firstSteps = [];    // {itemId, stepId} — the only tasks that can clear on a fresh order
+  const planned = [];
 
   for (const item of items) {
     const flowId = flowOf(item);
     const steps = flowId != null ? stepsByFlowId.get(flowId) : undefined;
     if (!flowId || !steps || !steps.length) { itemsSkipped++; continue; }
 
-    for (const step of steps) {
-      if (existingStepKeys.has(`${item.id}:${step.id}`)) continue; // step already materialized
+    for (const [stepIdx, step] of steps.entries()) {
+      const exists = existingStepKeys.has(`${item.id}:${step.id}`);
+      if (exists && !evaluateExisting) continue; // step already materialized
       const op = opById.get(step.operation_id);
       const resourceTypeId = step.resource_type_id ?? op?.default_resource_type_id ?? null;
       const opValues = opVarsByOpId.get(step.operation_id) ?? {};
@@ -626,7 +669,9 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
       // here, with the formula's own value preserved in formula_hours for
       // comparison; that subsystem was removed 2026-08-05 (buffer sizing is a
       // fixed 50%, so nothing consumed the learning). One source of truth now.
-      const computedHours = formulaHours;
+      const override = overrideOf.get(`${item.id}:${step.id}`);
+      const overrideHours = Number.isFinite(override) ? override / 60 : null;
+      const computedHours = overrideHours ?? formulaHours;
 
       // Setup is frozen here exactly as the formula result is, and for the same
       // reason: re-deriving it at read time would re-time committed work every
@@ -636,23 +681,27 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
         ? Number(op.setup_minutes) / 60
         : null;
 
-      // Queued as 'blocked'; the clear pass at the end opens what it can.
-      taskRows.push([companyId, orderId, item.id, flowId, step.id, step.operation_id,
-        step.seq_no, step.depends_on, resourceTypeId, computedHours, setupHours,
+      const task = {
+        itemId: item.id, flowId, stepId: step.id, operationId: step.operation_id,
+        seqNo: step.seq_no, dependsOn: step.depends_on, resourceTypeId,
+        // 1, 2, 3 down the flow. seq_no can skip — a step taken out leaves a
+        // gap — and a code reading /02 for the first step would say otherwise.
+        stepNo: stepIdx + 1,
+        formulaHours, overrideHours, computedHours, setupHours,
         // Snapshotted, not joined at read time: a BOM quantity edited later
         // must not silently move the estimate under a plan already committed.
         // Re-materialization is the deliberate way to pick up a change.
-        item.qty ?? 1]);
-      tasksInserted++;
-
-      // A task can only become eligible if nothing precedes it, and on a fresh
-      // materialization every task is 'blocked' — so a step with an earlier
-      // sibling can never clear here and asking costs three queries to be told
-      // no. Only genuine first steps are offered to the clear pass.
-      if (!(step.depends_on && String(step.depends_on).trim())
-          && step.seq_no === (minSeqByFlowId.get(flowId) ?? step.seq_no)) {
-        firstSteps.push({ itemId: item.id, stepId: step.id });
-      }
+        qty: rolledQty(item),
+        // A task can only become eligible if nothing precedes it, and on a
+        // fresh materialization every task is 'blocked' — so only genuine first
+        // steps are offered to the clear pass.
+        isFirst: !(step.depends_on && String(step.depends_on).trim())
+          && step.seq_no === (minSeqByFlowId.get(flowId) ?? step.seq_no),
+        exists,
+        inputs: [],
+      };
+      planned.push(task);
+      const inputPlans = task.inputs;
 
       // materialize inputs for this step
       const stepInputs = inputsByStepId.get(step.id) ?? [];
@@ -665,27 +714,88 @@ export async function materializeOrderTasks(conn, companyId, orderId) {
           if (rms.length) {
             for (const rm of rms) {
               if (rm.catalog_item_id == null) continue;
-              inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+              inputPlans.push({ kind: 'catalog',
                 values: ['raw_material', rm.catalog_item_id, rm.qty ?? null, si.unit ?? null, si.gate] });
             }
           } else if (item.catalog_item_id != null) {
-            inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+            inputPlans.push({ kind: 'catalog',
               values: ['raw_material', item.catalog_item_id, null, si.unit ?? null, si.gate] });
           }
         } else if (si.ref_bom_role === 'child_parts') {
           const kids = childPartsByParent.get(item.id) ?? [];
           for (const kid of kids) {
-            inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'component',
+            inputPlans.push({ kind: 'component',
               values: [kid.id, si.gate] });
           }
         } else if (si.ref_catalog_item_id != null) {
-          inputPlans.push({ itemId: item.id, stepId: step.id, kind: 'catalog',
+          inputPlans.push({ kind: 'catalog',
             values: [si.input_role, si.ref_catalog_item_id, si.qty ?? null, si.unit ?? null, si.gate] });
         }
       }
     }
     itemsProcessed++;
   }
+
+  return { items, planned, itemsProcessed, itemsSkipped };
+}
+
+/**
+ * Bring tasks nobody has started back in line with the plan — their time, setup
+ * and quantity.
+ *
+ * Building is idempotent per step, so a task built once kept the time it was
+ * built with even after a formula, a quantity or a typed-over time changed.
+ * That is right for work already under way and wrong for a draft nobody has
+ * deployed: the screen would show one time and the task hold another.
+ *
+ * Only 'blocked' and 'eligible' tasks move. A started task keeps what it was
+ * started with.
+ *
+ * @returns {Promise<number>} tasks changed
+ */
+export async function syncUnstartedTasks(conn, companyId, orderId) {
+  const { planned } = await planOrderTasks(conn, companyId, orderId, { evaluateExisting: true });
+  const want = new Map(planned.map((t) => [`${t.itemId}:${t.stepId}`, t]));
+  const [tasks] = await conn.query(
+    `SELECT id, item_id, flow_step_id, computed_hours, setup_hours, task_qty
+       FROM fab_project_tasks
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+        AND status IN ('blocked', 'eligible')`,
+    [companyId, orderId],
+  );
+  // Compared at the columns' own four places, or every task reads as changed.
+  const r4 = (x) => (x == null ? null : Math.round(Number(x) * 1e4) / 1e4);
+  const same = (a, b) => r4(a) === r4(b);
+  let changed = 0;
+  for (const t of tasks) {
+    const w = want.get(`${t.item_id}:${t.flow_step_id}`);
+    if (!w) continue;
+    if (same(t.computed_hours, w.computedHours) && same(t.setup_hours, w.setupHours) && same(t.task_qty, w.qty)) continue;
+    await conn.query(
+      `UPDATE fab_project_tasks SET computed_hours = ?, setup_hours = ?, task_qty = ? WHERE id = ? AND company_id = ?`,
+      [r4(w.computedHours), r4(w.setupHours), r4(w.qty), t.id, companyId],
+    );
+    changed++;
+  }
+  return changed;
+}
+
+/**
+ * Materialize all tasks + task-inputs for an order (transaction owned by caller).
+ *
+ * Writes what planOrderTasks says is missing. Idempotent per (row, flow step):
+ * a step that already has a task is left alone.
+ */
+export async function materializeOrderTasks(conn, companyId, orderId) {
+  const { planned, itemsProcessed, itemsSkipped } = await planOrderTasks(conn, companyId, orderId);
+  const fresh = planned.filter((t) => !t.exists);
+  const tasksInserted = fresh.length;
+  if (!tasksInserted) return { ok: true, itemsProcessed, itemsSkipped, tasksInserted: 0, cleared: 0 };
+
+  const taskRows = fresh.map((t) => [companyId, orderId, t.itemId, t.flowId, t.stepId, t.operationId,
+    t.seqNo, t.dependsOn, t.resourceTypeId, t.computedHours, t.setupHours, t.qty]);
+  const inputPlans = fresh.flatMap((t) => t.inputs.map((i) => ({ ...i, itemId: t.itemId, stepId: t.stepId })));
+  const firstSteps = fresh.filter((t) => t.isFirst).map((t) => ({ itemId: t.itemId, stepId: t.stepId }));
 
   // ── write the tasks, then find out what ids they got ─────────────────────
   const taskIdByKey = new Map();

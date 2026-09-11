@@ -40,8 +40,9 @@ import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
 import { syncOrderProcurement } from './procurementService.js';
 import {
-  orderCodePrefix, composeCode, abbreviate, normaliseAbbr, materialSegment, loadUsedCodes,
+  composeCode, abbreviate, normaliseAbbr, materialSegment, loadUsedCodes,
 } from './itemCodeService.js';
+import { orderCodePrefix } from './codegenService.js';
 
 // Validation dropdowns, Code formulas and blank fill-in rows run this far down
 // each sheet. Past it a user can still type; the sheet just stops assisting.

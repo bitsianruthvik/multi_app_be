@@ -67,6 +67,7 @@ import { resolveFields } from './fieldService.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { DEFAULT_DENSITY } from './fieldDeriveService.js';
 import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
+import { deriveCodes, generateCode } from './codegenService.js';
 
 export { NOT_A_BLANK } from './blankPredicate.js';
 import { materializeOrderTasks } from './taskGatingService.js';
@@ -79,19 +80,26 @@ export const CUTTING_FLOW_CODE = 'C0001';
 const BLANK_CATEGORY = 'Raw Materials';
 const BLANK_GROUP = 'Blanks';
 
-/** Codes are DERIVED, so the same rectangle on the same order is always the same code. */
 const codeBit = (s) => String(s ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
-export function blankCode(orderNumber, { material, grade, thickness, width, length }) {
-  return [
-    'BLK',
-    // "SO-20260910-0066" -> "202609100066". The prefix says "sales order" on a
-    // code that already begins BLK, so it earns nothing but length.
-    codeBit(String(orderNumber).replace(/^[A-Za-z]+-/, '')),
-    codeBit(material) || 'X',
-    codeBit(grade) || 'X',
-    `${thickness}X${width}X${length}`,
-  ].join('-');
+/** "SO-20260910-0066" -> "202609100066": the letters say "sales order" on a code that already begins BLK. */
+const orderRef = (orderNumber) => codeBit(String(orderNumber).replace(/^[A-Za-z]+-/, ''));
+
+/**
+ * Codes for blanks, from the company's 'blank' rule in the code generator.
+ *
+ * DERIVED, so the same rectangle on the same order is always the same code —
+ * which is what lets a saved plan, a downloaded sheet and the catalog all find
+ * each other by it.
+ */
+export async function blankCodes(companyId, orderNumber, shapes) {
+  return deriveCodes(companyId, 'blank', shapes.map((b) => ({
+    attributes: {
+      orderRef: orderRef(orderNumber),
+      material: codeBit(b.material), grade: codeBit(b.grade),
+      thickness: b.thickness, width: b.width, length: b.length,
+    },
+  })));
 }
 
 export function blankName(orderNumber, { material, grade, thickness, width, length }) {
@@ -220,8 +228,9 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
   // Heaviest first — the order somebody reads it in, because that is the order
   // in which a wrong plate costs money.
   const blanks = [...byKey.values()].sort((x, y) => (y.qty * y.unitWeightKg) - (x.qty * x.unitWeightKg));
+  const codes = await blankCodes(companyId, order.orderNumber, blanks);
+  blanks.forEach((b, i) => { b.code = codes[i]; });
   for (const b of blanks) {
-    b.code = blankCode(order.orderNumber, b);
     b.name = blankName(order.orderNumber, b);
     b.totalWeightKg = b.qty * b.unitWeightKg;
     /*
@@ -278,7 +287,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
       const [r] = await conn.query(
         `INSERT INTO fab_item_subgroups (company_id, group_id, name, code, description, created_at)
          VALUES (?,?,?,?,?,NOW())`,
-        [companyId, group.id, orderNumber, `BLK-${codeBit(String(orderNumber).replace(/^[A-Za-z]+-/, ''))}`,
+        [companyId, group.id, orderNumber, `BLK-${orderRef(orderNumber)}`,
           `Blanks cut for ${orderNumber}`],
       );
       sub = { id: r.insertId };
@@ -425,13 +434,10 @@ export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
   let created = false;
 
   if (!mo) {
-    const [[{ ymd }]] = await conn.query("SELECT DATE_FORMAT(UTC_DATE(), '%Y%m%d') AS ymd");
-    const [[seq]] = await conn.query(
-      `SELECT COUNT(*) AS n FROM fab_orders
-        WHERE company_id = ? AND order_type = 'manufacturing' AND mo_purpose = 'cutting'`,
-      [companyId],
-    );
-    const orderNumber = `MO-CUT-${ymd}-${String(Number(seq.n) + 1).padStart(4, '0')}`;
+    // Numbered by the code generator, from the same counter as every other
+    // production order. It used to count rows and add one, which hands two
+    // people pressing Accept at once the same number.
+    const orderNumber = await generateCode(companyId, 'manufacturing_order', {}, conn);
     const [ins] = await conn.query(
       `INSERT INTO fab_orders
          (company_id, order_number, order_type, mo_purpose, status, source_order_id,

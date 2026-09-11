@@ -1,5 +1,5 @@
 /**
- * routes/procurement.js — the two steps that follow a finished BOM.
+ * routes/procurement.js — buying, cutting and making: the production step.
  *
  * Mounted separately at app.js alongside routes/criticalChain.js and
  * routes/planner.js, matching that precedent: this is its own concern rather
@@ -15,16 +15,13 @@
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { logger } from '../../../core/utils/logger.js';
-import { orderShortfall, orderProcurementSplit } from '../services/procurementService.js';
 import {
-  raiseProcurement, receiveAgainstLine, receiveAgainstOrder, procurementForOrder,
+  requestProcurement, sendPurchaseRequest, receiveAgainstLine, receiveAgainstOrder,
   openPurchaseOrders, purchaseOrderLines,
 } from '../services/procurementOrderService.js';
-import {
-  ensureProductionOrder, productionForOrder, approveProductionOrder,
-} from '../services/productionOrderService.js';
+import { deployProductionOrder } from '../services/productionOrderService.js';
+import { productionPlan, setStepTime, raiseDraft } from '../services/productionPlanService.js';
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
-import { releaseOrderReservations } from '../services/availabilityService.js';
 import { checkOrderNesting, blockingIssues, advisoryIssues } from '../services/nestingIntegrityService.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { pool } from '../../../db.js';
@@ -50,28 +47,36 @@ function ctx(req, res, tag) {
 }
 
 /**
- * GET /orders/:orderId/procurement — what has to be bought, and what is covered.
- *
- * Read-only. Reserves nothing, raises nothing.
+ * GET /orders/:orderId/production-plan — the production step in one read: what
+ * is bought, and both production orders as their BOM with each row's steps.
  */
-router.get('/orders/:orderId/procurement', protect, async (req, res) => {
-  const c = ctx(req, res, 'fab_erp_inventory_view');
+router.get('/orders/:orderId/production-plan', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_projects_view');
   if (!c) return;
   const orderId = Number(req.params.orderId);
   try {
-    const [shortfall, orders] = await Promise.all([
-      orderShortfall(c.companyId, orderId),
-      procurementForOrder(c.companyId, orderId),
-    ]);
-    res.json({
-      orderId,
-      lines: shortfall.lines,
-      unmatched: shortfall.unmatched,
-      shortCount: shortfall.shortCount,
-      purchaseOrders: orders,
-    });
+    res.json(await productionPlan(c.companyId, orderId));
   } catch (err) {
-    logger.error({ err, orderId }, 'procurement preview failed');
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err, orderId }, 'production plan failed');
+    res.status(500).json({ message: err.message });
+  }
+});
+
+/**
+ * PUT /orders/:orderId/production-plan/time — type over one step's time.
+ * Body `{ itemId, stepId, minutes }`; minutes is per piece, null clears it.
+ */
+router.put('/orders/:orderId/production-plan/time', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_projects_manage');
+  if (!c) return;
+  const orderId = Number(req.params.orderId);
+  try {
+    const { itemId, stepId, minutes } = req.body ?? {};
+    res.json(await setStepTime(c.companyId, orderId, Number(itemId), Number(stepId), minutes, c.user?.id ?? null));
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err, orderId }, 'setting a step time failed');
     res.status(500).json({ message: err.message });
   }
 });
@@ -101,70 +106,35 @@ router.get('/orders/:orderId/nesting/integrity', protect, async (req, res) => {
 });
 
 /**
- * POST /orders/:orderId/procurement/raise — reserve what we have, buy the rest.
+ * POST /orders/:orderId/procurement/request — take from stock, ask for the rest.
  *
- * Body `{ lines?: [{catalogItemId, qty, supplierId, expectedDate?, unitPrice?}] }`.
- * Omitting `lines` reserves against the whole shortfall and then refuses every
- * purchase line for want of a supplier — which is the honest outcome, not a
- * silent no-op: the reservations are real and the skipped list says exactly
- * what still needs addressing.
+ * Body `{ lines: [{ catalogItemId, take }] }` — how much of each bought item to
+ * take off the shelf. Everything still needed goes on the order's one purchase
+ * request, rewritten in place if it is already there.
  */
-router.post('/orders/:orderId/procurement/raise', protect, async (req, res) => {
+router.post('/orders/:orderId/procurement/request', protect, async (req, res) => {
   const c = ctx(req, res, 'fab_erp_inventory_manage');
   if (!c) return;
   const orderId = Number(req.params.orderId);
   try {
-    /**
-     * Refuse to buy plate for a nesting that cannot work.
-     *
-     * A purchase order is where a nesting mistake stops being free. Up to this
-     * point a wrong thickness or a part bigger than its plate is a row somebody
-     * can correct; past it, steel has been ordered against it — and the sizes
-     * being bought ARE the declared plate sizes, so an impossible nest buys
-     * impossible material.
-     *
-     * The two kinds refused read differently and both matter: a MISSING
-     * dimension means nobody has finished the job, and an IMPOSSIBLE one means
-     * somebody finished it wrong. Buying a plate for a part of unknown size is
-     * exactly as useless as buying one that cannot hold it.
-     *
-     * `{force:true}` proceeds, the same escape as the production-order gate —
-     * a buyer who knows the sheet is behind reality should not be stuck.
-     */
-    if (!req.body?.force) {
-      const nesting = await checkOrderNesting(c.companyId, orderId);
-      const blocking = blockingIssues(nesting);
-      if (blocking.length > 0) {
-        return res.status(409).json({
-          code: 'NESTING_INVALID',
-          message: `${blocking.length} problem(s) would make this order's nesting impossible to cut. `
-                 + 'Buying against it would order the wrong material.',
-          detail: { issues: blocking, summary: nesting.summary, checked: nesting.checked },
-        });
-      }
-    }
-
-    const result = await raiseProcurement(c.companyId, orderId, {
-      lines: req.body?.lines,
-      createdBy: c.user?.id ?? null,
-    });
-    res.json(result);
+    res.json(await requestProcurement(c.companyId, orderId, req.body?.lines ?? [], { createdBy: c.user?.id ?? null }));
   } catch (err) {
-    logger.error({ err, orderId }, 'raising procurement failed');
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err, orderId }, 'requesting procurement failed');
     res.status(500).json({ message: err.message });
   }
 });
 
-/** DELETE the order's earmarks — starting the step over, or cancelling. */
-router.post('/orders/:orderId/procurement/release', protect, async (req, res) => {
+/** POST /purchase-orders/:poId/send — name the supplier and send a request. */
+router.post('/purchase-orders/:poId/send', protect, async (req, res) => {
   const c = ctx(req, res, 'fab_erp_inventory_manage');
   if (!c) return;
-  const orderId = Number(req.params.orderId);
+  const poId = Number(req.params.poId);
   try {
-    const released = await releaseOrderReservations(null, c.companyId, orderId);
-    res.json({ released });
+    res.json(await sendPurchaseRequest(c.companyId, poId, Number(req.body?.supplierId)));
   } catch (err) {
-    logger.error({ err, orderId }, 'releasing reservations failed');
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err, poId }, 'sending purchase request failed');
     res.status(500).json({ message: err.message });
   }
 });
@@ -245,35 +215,19 @@ router.post('/purchase-orders/:poId/receive', protect, async (req, res) => {
   }
 });
 
-/** GET the production order for a sales order, with its DAG's shape. */
-router.get('/orders/:orderId/production', protect, async (req, res) => {
-  const c = ctx(req, res, 'fab_erp_projects_view');
-  if (!c) return;
-  const orderId = Number(req.params.orderId);
-  try {
-    const [production, split] = await Promise.all([
-      productionForOrder(c.companyId, orderId),
-      orderProcurementSplit(c.companyId, orderId),
-    ]);
-    res.json({ orderId, production, makeItemCount: split.make.length });
-  } catch (err) {
-    logger.error({ err, orderId }, 'production lookup failed');
-    res.status(500).json({ message: err.message });
-  }
-});
-
 /**
- * POST /orders/:orderId/production/raise — create the MO and claim its tasks.
+ * POST /orders/:orderId/production/draft — raise, or bring up to date, the draft
+ * production order for cutting or for fabrication. Body `{ purpose }`.
  *
- * Idempotent: one production order per sales order, so pressing this twice
- * re-claims tasks onto the existing one. That re-claim is the point — tasks
- * materialized after the order was raised would otherwise sit outside the
- * document that is supposed to be tracking them.
+ * Idempotent: one of each per sales order, so pressing this again refreshes the
+ * draft's tasks — times typed over, quantities changed — rather than raising a
+ * second one.
  */
-router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
+router.post('/orders/:orderId/production/draft', protect, async (req, res) => {
   const c = ctx(req, res, 'fab_erp_projects_manage');
   if (!c) return;
   const orderId = Number(req.params.orderId);
+  const purpose = req.body?.purpose === 'cutting' ? 'cutting' : 'fabrication';
   try {
     /**
      * The gate. Raising the order MATERIALIZES the DAG, and materialization is
@@ -329,12 +283,11 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
       }
     }
 
-    const mo = await ensureProductionOrder(c.companyId, orderId, { createdBy: c.user?.id ?? null });
-    // rollUpOrderStatus refreshes the production order and then mirrors it onto
-    // the sales order — one call keeps both right.
+    const mo = await raiseDraft(c.companyId, orderId, purpose, c.user?.id ?? null);
+    // rollUpOrderStatus refreshes the production orders and then mirrors them
+    // onto the sales order — one call keeps both right.
     await rollUpOrderStatus(pool, c.companyId, orderId);
-    const production = await productionForOrder(c.companyId, orderId);
-    res.json({ ...mo, production });
+    res.json(mo);
   } catch (err) {
     logger.error({ err, orderId }, 'raising production order failed');
     res.status(500).json({ message: err.message });
@@ -342,18 +295,18 @@ router.post('/orders/:orderId/production/raise', protect, async (req, res) => {
 });
 
 /**
- * POST /production-orders/:moId/approve — the one transition a person makes.
- *
- * Everything after it follows from the shop floor: waiting until material
- * turns up, in production once a task can actually be started.
+ * POST /production-orders/:moId/deploy — send a draft production order to the
+ * shop. Codes are written (BOM rows and tasks, from the code generator) and from
+ * here the order follows the floor: waiting until material turns up, in
+ * production once a task can start.
  */
-router.post('/production-orders/:moId/approve', protect, async (req, res) => {
+router.post('/production-orders/:moId/deploy', protect, async (req, res) => {
   const c = ctx(req, res, 'fab_erp_projects_manage');
   if (!c) return;
   const moId = Number(req.params.moId);
   try {
-    const state = await approveProductionOrder(c.companyId, moId);
-    // Approval changes the production order, and the sales order mirrors it.
+    const state = await deployProductionOrder(c.companyId, moId);
+    // Deploying changes the production order, and the sales order mirrors it.
     const [[link]] = await pool.query(
       `SELECT source_order_id AS soId FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
       [moId, c.companyId],
@@ -361,7 +314,8 @@ router.post('/production-orders/:moId/approve', protect, async (req, res) => {
     if (link?.soId) await rollUpOrderStatus(pool, c.companyId, link.soId);
     res.json({ ok: true, ...state });
   } catch (err) {
-    logger.error({ err, moId }, 'approving production order failed');
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    logger.error({ err, moId }, 'deploying production order failed');
     res.status(500).json({ message: err.message });
   }
 });

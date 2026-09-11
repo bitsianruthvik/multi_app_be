@@ -112,7 +112,13 @@ import { logger } from '../../../core/utils/logger.js';
  * Both CHECKS survive, folded into 'lines' below: no lines, or a structure short
  * of sizes, still holds the step open and Confirm shut.
  */
-export const STAGE_KEYS = ['lines', 'nesting', 'params', 'tasks', 'procurement', 'production'];
+/*
+ * 'tasks' AND 'procurement' ARE FOLDED INTO 'production'. What to buy, what to
+ * cut and what to make are one screen: the buying half and both production
+ * orders sit together, because they are three answers to one question — how
+ * does this order get built.
+ */
+export const STAGE_KEYS = ['lines', 'nesting', 'params', 'production'];
 
 /** Everything that must be done before an order can be confirmed. */
 const PREPARATION_STAGES = STAGE_KEYS;
@@ -202,71 +208,44 @@ async function summariseProcurement(companyId, orderId) {
   return { state, covered, needed, detail };
 }
 
-/** Production readiness: does a production order exist, and does it own the make tasks? */
+/**
+ * Production readiness: is there a production order for everything that has to
+ * be made — one for cutting if anything is cut, one for fabrication if anything
+ * is fabricated?
+ *
+ * A DRAFT COUNTS. Raising the drafts is the decision this step asks for;
+ * deploying them to the shop is done on the production order itself, and can
+ * come after the sales order is confirmed.
+ */
 async function summariseProduction(companyId, orderId) {
-  const [[agg]] = await pool.query(
-    `SELECT COUNT(*) AS make_tasks,
-            SUM(t.production_order_id IS NOT NULL) AS claimed
-       FROM fab_project_tasks t
-       JOIN fab_items i ON i.id = t.item_id AND i.deleted_at IS NULL
-      WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL
-        AND COALESCE(i.procurement_type, 'make') = 'make'`,
-    [companyId, orderId],
-  );
-  const makeTasks = Number(agg?.make_tasks) || 0;
-  const claimed = Number(agg?.claimed) || 0;
-
-  /**
-   * "Nothing to make" and "tasks are not built yet" are different answers.
-   *
-   * The aggregate above counts TASKS, and tasks do not exist until the
-   * production order is raised — that is what builds them. So `makeTasks === 0`
-   * was true of every order that had not reached this step yet, and the step
-   * reported itself DONE and green with "this order is entirely bought in" on
-   * an order carrying hundreds of make items. Green on unfinished work is the
-   * worst direction for this to be wrong in: it says there is nothing to do.
-   *
-   * The order's ITEMS are what say whether there is anything to make, and they
-   * exist from the structure step onwards. Only when there are none of those is
-   * the order genuinely bought in.
-   */
-  const [[items]] = await pool.query(
-    `SELECT COUNT(*) AS make_items
+  const [[need]] = await pool.query(
+    `SELECT SUM(bc.id IS NOT NULL) AS blanks, SUM(bc.id IS NULL) AS made
        FROM fab_items i
+       LEFT JOIN fab_item_catalog bc ON bc.id = i.catalog_item_id AND bc.material_form = 'blank'
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
-        AND i.flow_id IS NOT NULL
+        AND i.flow_id IS NOT NULL AND i.node_kind = 'structure'
         AND COALESCE(i.procurement_type, 'make') = 'make'`,
     [companyId, orderId],
   );
-  const makeItems = Number(items?.make_items) || 0;
-  const bomRows = await bomRowCount(companyId, orderId);
-
-  if (makeItems === 0 && makeTasks === 0) {
-    return {
-      state: 'done', claimed: 0, makeTasks: 0, makeItems: 0,
-      detail: bomRows === 0
-        ? 'Nothing in this order yet'
-        : 'Nothing to make — every row is bought in',
-    };
-  }
-  if (makeTasks === 0) {
-    return {
-      state: 'todo', claimed: 0, makeTasks: 0, makeItems,
-      detail: `No production order raised yet — ${makeItems} item(s) are waiting to become tasks`,
-    };
-  }
-  if (claimed === 0) {
-    return { state: 'todo', claimed, makeTasks, detail: 'No production order raised yet' };
-  }
-  if (claimed < makeTasks) {
-    return {
-      state: 'partial', claimed, makeTasks,
-      detail: `${makeTasks - claimed} make task(s) built since the production order was raised`,
-    };
-  }
+  const [mos] = await pool.query(
+    `SELECT mo_purpose AS purpose, status FROM fab_orders
+      WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
+        AND deleted_at IS NULL AND status <> 'cancelled'`,
+    [companyId, orderId],
+  );
+  const cutting = mos.find((m) => m.purpose === 'cutting');
+  const fabrication = mos.find((m) => m.purpose == null);
+  const needCut = Number(need?.blanks) > 0;
+  const needFab = Number(need?.made) > 0;
+  const missing = [needCut && !cutting ? 'cutting' : null, needFab && !fabrication ? 'fabrication' : null]
+    .filter(Boolean);
+  const deployed = mos.filter((m) => m.status !== 'draft').length;
   return {
-    state: 'done', claimed, makeTasks,
-    detail: `All ${makeTasks} make task(s) on the production order`,
+    state: !needCut && !needFab ? 'done' : missing.length === 0 ? 'done' : mos.length ? 'partial' : 'todo',
+    missing,
+    count: mos.length,
+    total: Number(needCut) + Number(needFab),
+    deployed,
   };
 }
 
@@ -287,11 +266,10 @@ export async function orderReadiness(companyId, orderId) {
   );
   if (!order) { const e = new Error('Order not found'); e.status = 404; throw e; }
 
-  const [lines, tree, nest, tasks, flows, nestIntegrity] = await Promise.all([
+  const [lines, tree, nest, flows, nestIntegrity] = await Promise.all([
     countLines(companyId, orderId),
     countTree(companyId, orderId),
     countNesting(companyId, orderId),
-    countTasks(companyId, orderId),
     // Reusing flowSummary rather than re-deriving it: the Flows tab and the
     // strip must never disagree about how many items still need a flow.
     flowSummary(companyId, orderId),
@@ -428,37 +406,25 @@ export async function orderReadiness(companyId, orderId) {
               : `All ${fields.itemsChecked} part(s) have what their operations need`,
     },
     {
-      key: 'tasks',
-      label: 'Project tree',
-      state: tasks > 0 ? 'done' : 'todo',
-      count: tasks,
-      total: tasks,
-      detail: tasks > 0 ? `${tasks} task(s) built` : 'Built when the production order is raised',
-    },
-    /**
-     * The two steps that follow a finished tree: buy what we do not have, and
-     * commit to making the rest.
-     *
-     * Both can legitimately be DONE with nothing raised. An order whose BOM is
-     * entirely made in-house has nothing to purchase, and saying "todo" about a
-     * step with no possible work would block Confirm on an action that does not
-     * exist. Emptiness and completeness are the same state here.
-     */
-    {
-      key: 'procurement',
-      label: 'Procurement',
-      state: proc.state,
-      count: proc.covered,
-      total: proc.needed,
-      detail: proc.detail,
-    },
-    {
+      /**
+       * Buy, cut and make — one step. Done once everything bought is in stock
+       * or requested, and a production order is drafted for the cutting and
+       * for the fabrication.
+       */
       key: 'production',
       label: 'Production',
-      state: production.state,
-      count: production.claimed,
-      total: production.makeTasks,
-      detail: production.detail,
+      state: proc.state === 'done' && production.state === 'done' ? 'done'
+        : proc.state === 'todo' && production.state === 'todo' ? 'todo' : 'partial',
+      count: production.count,
+      total: production.total,
+      detail: [
+        proc.state === 'done' ? null : proc.detail,
+        production.missing.length
+          ? `No ${production.missing.join(' or ')} production order yet`
+          : production.total
+            ? `${production.count} production order(s) — ${production.deployed} deployed`
+            : null,
+      ].filter(Boolean).join(' · ') || proc.detail,
     },
   ];
 
@@ -515,7 +481,7 @@ export async function orderReadiness(companyId, orderId) {
     canConfirm: order.status === 'draft' && preparationComplete,
     nextStage,
     stages,
-    blockers: buildBlockers({ lines, tree, nest, flowState, tasks }),
+    blockers: buildBlockers({ lines, tree, nest, flowState, production }),
   };
 }
 
@@ -713,15 +679,6 @@ async function countNesting(companyId, orderId) {
   return { parts: Number(row?.parts) || 0, nested: Number(row?.nested) || 0 };
 }
 
-async function countTasks(companyId, orderId) {
-  const [[row]] = await pool.query(
-    `SELECT COUNT(*) AS n FROM fab_project_tasks
-      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
-    [companyId, orderId],
-  );
-  return Number(row?.n) || 0;
-}
-
 // ── flows ────────────────────────────────────────────────────────────────────
 
 /**
@@ -775,13 +732,13 @@ function summariseFlows(summary) {
  * consequence, stated with its count — "38 items have no flow" is actionable in
  * a way that "some items may be skipped" never was.
  */
-function buildBlockers({ lines, tree, nest, flowState, tasks }) {
+function buildBlockers({ lines, tree, nest, flowState, production }) {
   const out = [];
 
-  if (tasks === 0) {
+  if (production.missing.length) {
     out.push({
-      stage: 'tasks', count: 0,
-      message: 'The project tree has not been built, so this order has no schedule and no work on the floor.',
+      stage: 'production', count: 0,
+      message: `No ${production.missing.join(' or ')} production order yet, so this order has no work on the floor.`,
     });
   }
 

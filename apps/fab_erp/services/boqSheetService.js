@@ -45,8 +45,9 @@ import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { recomputeOrderWeights } from './itemWeightService.js';
 import {
-  orderCodePrefix, appendLevel, levelLabel, composeCode, materialSegment,
+  appendLevel, levelLabel, composeCode, materialSegment,
 } from './itemCodeService.js';
+import { orderCodePrefix } from './codegenService.js';
 import { rawMaterialsFor } from './rawMaterialService.js';
 import { syncOrderProcurement } from './procurementService.js';
 import { setFields } from './fieldService.js';
