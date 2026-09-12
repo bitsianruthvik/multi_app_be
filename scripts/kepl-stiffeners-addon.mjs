@@ -146,7 +146,7 @@ try {
   let itemsCreated = 0;
   for (const t of THICKNESSES) {
     for (const w of WIDTHS) {
-      const name = `Stiffener ${t} × ${w}`;
+      const name = `Stiffener Plate ${t} × ${w}`;
       const [[have]] = await conn.query(
         `SELECT id FROM fab_item_catalog WHERE company_id = ? AND name = ? AND deleted_at IS NULL`, [C, name],
       );
