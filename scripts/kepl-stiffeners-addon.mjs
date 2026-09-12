@@ -75,23 +75,23 @@ const WIDTHS = [150, 170, 200, 210, 250];
 
 /** One stiffener row on a segment. */
 const st = (name, t, w, qty, drilled = false) => ({ name, t, w, qty, drilled });
-const IS = (q) => st('Intermediate Stiffener', 12, 170, q);
-const ISD = (q) => st('Intermediate Stiffener (drilled)', 12, 170, q, true);
+const IS = (q) => st('Intermediate Stiffener Plain', 12, 170, q);
+const ISD = (q) => st('Intermediate Stiffener Hole', 12, 170, q, true);
 
 /** Per girder, per segment kind — read off the BOQ, checked against its weights. */
 const SPEC = {
   G1: {
     mid: [IS(23), ISD(3)],
-    end: [st('Bearing Stiffener', 32, 200, 1), st('Bearing Stiffener (drilled)', 32, 210, 1, true),
+    end: [st('Bearing Stiffener Plain', 32, 200, 1), st('Bearing Stiffener Hole', 32, 210, 1, true),
       st('End Stiffener', 32, 200, 4), IS(21), ISD(3)],
   },
   'G2–G3': {
     mid: [IS(20), ISD(6)],
-    end: [st('Bearing Stiffener (drilled)', 32, 210, 2, true), st('End Stiffener', 32, 210, 4), IS(18), ISD(6)],
+    end: [st('Bearing Stiffener Hole', 32, 210, 2, true), st('End Stiffener', 32, 210, 4), IS(18), ISD(6)],
   },
   G4: {
     mid: [IS(23), ISD(3)],
-    end: [st('Bearing Stiffener (drilled)', 32, 210, 1, true), st('End Stiffener', 32, 210, 1),
+    end: [st('Bearing Stiffener Hole', 32, 210, 1, true), st('End Stiffener', 32, 210, 1),
       st('End Stiffener', 32, 200, 4), IS(21), ISD(3)],
   },
 };
