@@ -40,6 +40,10 @@ const AUTOGEN_CODE_RESOURCES = {
   // the number the paperwork already uses and we do not get to renumber it.
   fabErpSupplier:      { entityType: 'supplier',       mode: 'ifBlank' },
   fabErpResource:      { entityType: 'resource',       mode: 'ifBlank' },
+  // A catalogue item can be created from the order's add-a-row picker, where
+  // there is nowhere to type a code and no reason to: the item rule builds one
+  // from the category. A typed code still wins — imports carry the shop's own.
+  fabErpItemCatalog:   { entityType: 'item',           mode: 'ifBlank' },
   fabErpStockLocation: { entityType: 'stock_location', mode: 'ifBlank' },
 };
 
@@ -344,7 +348,13 @@ export async function mutate(req, res) {
       if (autogen) {
         const supplied = typeof row.code === 'string' ? row.code.trim() : row.code;
         if (autogen.mode === 'always' || supplied === undefined || supplied === null || supplied === '') {
-          row.code = await generateCode(companyId, autogen.entityType, {});
+          // The item rule reads the category for its short form, so the row's
+          // own taxonomy is what the code is built from.
+          row.code = await generateCode(companyId, autogen.entityType, {
+            categoryId: row.category_id ?? null,
+            groupId: row.group_id ?? null,
+            subgroupId: row.subgroup_id ?? null,
+          });
         } else {
           row.code = supplied;
         }

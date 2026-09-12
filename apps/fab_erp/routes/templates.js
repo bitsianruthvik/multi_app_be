@@ -42,6 +42,7 @@ import {
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
+import { pickableItems, catalogSizes } from '../services/catalogPickerService.js';
 
 const router = Router();
 // In memory: the sheet is parsed and thrown away, never stored.
@@ -357,6 +358,29 @@ router.delete('/item-bom/:id', protect, requirePerm('fab_erp_items_meta_manage')
     await removeBomLine(companyId(req), Number(req.params.id));
     return res.json({ ok: true });
   } catch (err) { return fail(res, err, 'item BOM delete'); }
+});
+
+/**
+ * GET /catalog/pickable — everything a structure row may point at, with what it
+ * takes to choose between two similar names: size, material, make or bought,
+ * the flow its BOM usually gives it, and how used it is.
+ *
+ * `?orderId=` marks the items this order already has, so the picker can offer
+ * those first.
+ */
+router.get("/catalog/pickable", protect, async (req, res) => {
+  try {
+    const orderId = req.query.orderId ? Number(req.query.orderId) : null;
+    return res.json({ items: await pickableItems(companyId(req), orderId) });
+  } catch (err) { return fail(res, err, "catalog pickable"); }
+});
+
+/** GET /catalog/sizes — id -> {thickness_mm,width_mm,length_mm,material,grade}, for search. */
+router.get("/catalog/sizes", protect, async (req, res) => {
+  try {
+    const m = await catalogSizes(companyId(req));
+    return res.json({ sizes: Object.fromEntries(m) });
+  } catch (err) { return fail(res, err, "catalog sizes"); }
 });
 
 export default router;
