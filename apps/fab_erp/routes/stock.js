@@ -269,8 +269,11 @@ router.get('/stock/summary', protect, async (req, res) => {
 // there is no purchase order, supplier or delivery document.
 //
 // Body: { catalogItemId, plantId, stockLocationId, receivedDate,
-//         uom?, unitCost?, notes?, pieces: [{ qty, batchNo?, heatNo?,
-//         serialNo?, markNo? }] }
+//         uom?, unitCost?, notes?, source?, customerRef?,
+//         pieces: [{ qty, batchNo?, heatNo?, serialNo?, markNo? }] }
+//
+// EU-14: source: 'free_issue' + customerRef record material the CUSTOMER
+// supplied rather than an ordinary purchase receipt (source omitted).
 
 router.post('/stock/receive', protect, async (req, res) => {
   const user = req.user;
@@ -312,6 +315,9 @@ router.post('/stock/receive', protect, async (req, res) => {
       uom: b.uom ?? null,
       unit_cost: b.unitCost ?? null,
       notes: b.notes ?? null,
+      // EU-14: 'free_issue' + the customer's own reference for that receipt.
+      source: b.source ?? null,
+      customer_ref: b.customerRef ?? null,
       // length_mm/width_mm ride along with the receipt itself rather than being
       // written afterwards through /fields/values. The service has always
       // accepted them; this map used to drop them, which forced the frontend to

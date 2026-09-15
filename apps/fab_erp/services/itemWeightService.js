@@ -33,6 +33,19 @@ import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
 import { weightFactorsForParts } from './materialMatchService.js';
 import { isMaterialLink } from './itemMaterialService.js';
+import { NOT_A_BLANK } from './blankPredicate.js';
+
+/** The catalog ids among `rows` whose item is a BLANK (material_form='blank'). */
+async function blankCatalogIds(exec, companyId, rows) {
+  const ids = [...new Set(rows.map((r) => r.catalog_item_id).filter((v) => v != null).map(Number))];
+  if (!ids.length) return new Set();
+  const [cats] = await exec.query(
+    `SELECT id FROM fab_item_catalog WHERE company_id = ? AND id IN (?) AND material_form = 'blank'`,
+    [companyId, ids],
+  );
+  return new Set(cats.map((c) => Number(c.id)));
+}
+import { lineQtyMap, LINE_QTY_SQL } from './orderLineQty.js';
 
 /** The metric key buffers/analytics default to (fab_buffers.weight_metric_key). */
 const DEFAULT_WEIGHT_METRIC_KEY = 'unit_weight_kg';
@@ -116,7 +129,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
 
   const [rows] = await exec.query(
     `SELECT id, parent_item_id, qty, unit_weight, computed_unit_weight, total_weight,
-            catalog_item_id, flow_id, node_kind, is_leaf, length, width, height
+            catalog_item_id, flow_id, node_kind, is_leaf, length, width, height, order_line_id
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
@@ -125,6 +138,52 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
   if (!rows.length) {
     return { updated: 0, totalWeight: null, weighedItems: 0, unweighedLeaves: 0 };
   }
+
+  /**
+   * A part's dimensions come from the FIELD REGISTRY, with the three legacy
+   * columns as the fallback — not the other way round.
+   *
+   * Since fields v2 (2026-08-20) a part's thickness/width/length live in
+   * fab_field_values and reach `fab_items.length/width/height` only through
+   * the projection, which not every writer ran. The KEPL order is the proof:
+   * 138 rows sized entirely through the registry, all three columns NULL, and
+   * this roll-up read the columns — so 112 parts weighed nothing and the order
+   * total was NULL while the registry could resolve every one of them.
+   * Material links keep their column values: nesting writes the PLATE's size
+   * there and no field describes it.
+   */
+  const structIds = rows.filter((r) => !isMaterialLink(r)).map((r) => r.id);
+  let resolved = new Map();
+  if (structIds.length) {
+    const { resolveItemFields } = await import('./itemFieldService.js');
+    const out = await resolveItemFields(companyId, structIds, { conn: exec });
+    resolved = out instanceof Map ? out : new Map(Object.entries(out ?? {}).map(([k, v]) => [Number(k), v]));
+  }
+  // Weights DECLARED on the type (a bought part's catalog item), with their
+  // provenance — `resolveItemFields` flattens to plain values, and the
+  // provenance is what keeps this from reading back its own mirrored output.
+  const declaredWeight = new Map(); // item id -> kg per piece, from a TYPE rung only
+  if (structIds.length) {
+    const { resolveFields } = await import('./fieldService.js');
+    const rf = await resolveFields(companyId, structIds.map((id) => ({ scope: 'order_item', scopeId: id })), { conn: exec });
+    for (const id of structIds) {
+      const r = rf.get(`order_item:${id}`)?.unit_weight_kg;
+      if (!r || r.value == null) continue;
+      if (r.from?.scope === 'order_item' || r.from?.scope === 'order_line') continue;
+      const n = Number(r.value);
+      if (Number.isFinite(n) && n > 0) declaredWeight.set(id, n);
+    }
+  }
+  const fieldNum = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+  const dimsOf = (r) => {
+    const f = resolved.get(r.id) ?? {};
+    return {
+      length: fieldNum(f.length_mm) ?? r.length,
+      width: fieldNum(f.width_mm) ?? r.width,
+      height: fieldNum(f.thickness_mm) ?? r.height, // `height` carries thickness
+    };
+  };
+  const hasAnyDim = (r) => { const d = dimsOf(r); return d.length != null || d.width != null || d.height != null; };
 
   const byId = new Map(rows.map((r) => [r.id, r]));
   const childrenOf = new Map();
@@ -198,7 +257,7 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
    */
   const unlinked = rows.filter((r) => !isMaterialLink(r) && !materialOf.has(r.id)
     && !childrenOf.has(r.id)
-    && (r.length != null || r.width != null || r.height != null));
+    && hasAnyDim(r));
   if (unlinked.length) {
     const factors = await weightFactorsForParts(companyId, unlinked.map((r) => r.id), { conn: exec });
     for (const r of unlinked) {
@@ -259,8 +318,14 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
       // Dimensions beat the child sum because a part's raw-material child is
       // the stock it is cut FROM, not a component of it: a 1177 kg flange cut
       // from a plate does not weigh the plate.
-      const fromDims = computeUnitWeight(node, materialOf.get(node.id));
-      const derived = fromDims !== null ? fromDims : childSum;
+      const fromDims = computeUnitWeight(isMaterialLink(node) ? node : dimsOf(node), materialOf.get(node.id));
+      // 2b. a weight declared on the TYPE — a bought part (a shear stud) has no
+      //     dimensions to compute from and no children; its weight lives on the
+      //     catalog item. Only TYPE rungs count here: a value at order_item scope
+      //     is this roll-up's own earlier output mirrored into the registry, and
+      //     reading it back would freeze a stale figure.
+      const typeDeclared = declaredWeight.get(node.id) ?? null;
+      const derived = fromDims !== null ? fromDims : (typeDeclared !== null ? typeDeclared : childSum);
       computed.set(node.id, derived);
 
       const entered = toNum(node.unit_weight);
@@ -285,7 +350,10 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
        * through fab_item_demand. `is_leaf` already knows that.
        */
       const isLeaf = Number(node.is_leaf) === 1;
-      if (isLeaf && !kids.length && eff === null && !isRmLink) unweighedLeaves++;
+      // A part whose only children are its material links is still a leaf —
+      // the plate under it is what it is cut from, not something it is made of.
+      const hasStructureKids = kids.some((k) => !isMaterialLink(k));
+      if (isLeaf && !hasStructureKids && eff === null && !isRmLink) unweighedLeaves++;
     }
   }
 
@@ -320,13 +388,25 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
   await syncWeightMetrics(exec, companyId, rows.map((r) => r.id), metricPairs);
   await purgeMetricsForDeletedItems(exec, companyId, orderId);
 
-  // Order total = the roots only. Summing every row would count each piece once
-  // per level it appears under.
+  // Order total = the roots only, each multiplied by the qty of the LINE it
+  // hangs under (User Clarifications 3) — `root.qty` itself never carries this,
+  // it stays 1. Summing every row (rather than just roots) would count each
+  // piece once per level it appears under; this is the one place that also
+  // brings the line's own multiplier into the total.
+  //
+  // BLANK rows are roots too (a blank hangs off the order, not off a part) and
+  // since blanks carry a density they weigh themselves. They are the SAME steel
+  // as the parts cut from them, so counting them here doubled the KEPL order
+  // (1,317 t against 669 t) the moment its blanks got a density. Skip them.
+  const lineQty = await lineQtyMap(exec, companyId, orderId);
+  const blankCatIds = await blankCatalogIds(exec, companyId, rows);
   let totalWeight = null;
   for (const root of roots) {
+    if (blankCatIds.has(Number(root.catalog_item_id))) continue;
     const eff = effective.get(root.id);
     if (eff === null || eff === undefined) continue;
-    totalWeight = (totalWeight ?? 0) + eff * (toNum(root.qty) ?? 0);
+    const mult = lineQty.get(root.order_line_id == null ? null : Number(root.order_line_id)) ?? 1;
+    totalWeight = (totalWeight ?? 0) + eff * (toNum(root.qty) ?? 0) * mult;
   }
 
   return { updated, totalWeight, weighedItems, unweighedLeaves };
@@ -337,6 +417,13 @@ export async function recomputeOrderWeights(companyId, orderId, conn) {
  * and the analytics page can weigh WIP. Rows whose weight became unknown have
  * their metric row soft-deleted rather than set to 0 — see the module note on
  * why NULL and 0 are not the same thing here.
+ *
+ * NOT multiplied by line qty (EU-5). `metricPairs` carries `effective` — the
+ * weight of ONE physical piece of this design row — because a buffer holds
+ * discrete physical pieces and weighs whichever ones are actually sitting in
+ * it; the order line's qty says how many such pieces exist across the whole
+ * order, not how heavy any one of them is. Multiplying here would report every
+ * piece of a qty-3 line as three times its real weight.
  */
 async function syncWeightMetrics(exec, companyId, allItemIds, metricPairs) {
   if (!allItemIds.length) return;
@@ -397,15 +484,31 @@ async function purgeMetricsForDeletedItems(exec, companyId, orderId) {
 
 /**
  * Order total without recomputing — a plain SUM over the roots, for list views.
+ *
+ * Each root's `total_weight` is multiplied by the qty of the line it hangs
+ * under (User Clarifications 3), the same as `recomputeOrderWeights`'s own
+ * total — a list view and the detail page must never disagree about tonnage.
+ * (No caller currently reaches this export; fixed anyway so the next one does
+ * not inherit a total that is quietly missing the line multiplier.)
+ *
  * @returns {Promise<number|null>} null when nothing in the order has a weight yet
  */
 export async function orderTotalWeight(companyId, orderId, conn) {
   const exec = conn ?? pool;
-  const [[row]] = await exec.query(
-    `SELECT SUM(total_weight) AS total, COUNT(total_weight) AS weighed
-       FROM fab_items
-      WHERE company_id = ? AND order_id = ? AND parent_item_id IS NULL AND deleted_at IS NULL`,
+  const [rows] = await exec.query(
+    `SELECT fi.total_weight AS totalWeight, ${LINE_QTY_SQL} AS lineQty
+       FROM fab_items fi
+       LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
+      WHERE fi.company_id = ? AND fi.order_id = ? AND fi.parent_item_id IS NULL AND fi.deleted_at IS NULL
+        AND ${NOT_A_BLANK('fi')}`,
     [companyId, orderId],
   );
-  return row?.weighed > 0 ? Number(row.total) : null;
+  let total = null;
+  let weighed = 0;
+  for (const r of rows) {
+    if (r.totalWeight == null) continue;
+    weighed += 1;
+    total = (total ?? 0) + Number(r.totalWeight) * Number(r.lineQty);
+  }
+  return weighed > 0 ? total : null;
 }

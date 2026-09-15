@@ -46,25 +46,18 @@
 import { pool } from '../../../db.js';
 import { abbreviate, customerAbbrev } from './itemCodeService.js';
 
-// Ensures fab_codegen_rules exists — runs once per process on first use.
-// Handles the case where the deployed DB never ran init.sql migrations.
-let _tableReady = false;
-async function ensureTable() {
-  if (_tableReady) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS fab_codegen_rules (
-      id             INT AUTO_INCREMENT PRIMARY KEY,
-      company_id     INT           NOT NULL,
-      entity_type    VARCHAR(50)   NOT NULL,
-      segments_json  JSON          NOT NULL,
-      next_seq       INT           NOT NULL DEFAULT 1,
-      seq_period_key VARCHAR(20)   NULL,
-      created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
-      updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_fab_codegen_rules (company_id, entity_type)
-    )
-  `);
-  _tableReady = true;
+/**
+ * An empty segment list is the sentinel for "no customisation" — see
+ * `firstUseSegments` below. `fab_codegen_rules.segments_json` is `JSON NOT
+ * NULL` (init.sql:116), so NULL is not available as that sentinel without a
+ * schema change, and schema changes belong to EU-1.
+ */
+const NO_OVERRIDE = '[]';
+
+/** True segments — a real customisation, or the built-in default read live. */
+function liveSegments(row, entityType) {
+  const stored = typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json;
+  return Array.isArray(stored) && stored.length ? stored : defaultSegmentsFor(entityType);
 }
 
 const DEFAULT_SEGMENTS = {
@@ -139,6 +132,18 @@ const DEFAULT_SEGMENTS = {
   ],
   sales_order: [
     { type: 'fixed', value: 'SO-' },
+    { type: 'date', format: 'YYYYMMDD' },
+    { type: 'fixed', value: '-' },
+    { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
+  ],
+  // A quote is `fab_orders.order_type='quote'`, created the same way a sales
+  // order is (SalesOrders.tsx builds `${orderType}_order` as the entity type),
+  // so it needs its own rule rather than falling through to sales_order's —
+  // otherwise a quote and a sales order created the same day would collide on
+  // one counter and the QT- prefix a converted quote keeps in `notes` would be
+  // indistinguishable from an SO- number.
+  quote_order: [
+    { type: 'fixed', value: 'QT-' },
     { type: 'date', format: 'YYYYMMDD' },
     { type: 'fixed', value: '-' },
     { type: 'sequence', digits: 4, resetPeriod: 'monthly' },
@@ -267,41 +272,55 @@ function periodKeyFor(resetPeriod, now) {
   return null; // 'never' — sequence never resets
 }
 
-async function categoryShortform(companyId, categoryId, length) {
+/**
+ * A per-request/per-batch cache for the lookups below, shared across many
+ * codes issued in one call — `orderRowCodes` over 1,000 rows, or an item
+ * import over 1,000 rows, used to run 1,000 identical taxonomy queries when
+ * most rows share a handful of categories. Same shape as the formula engine's
+ * caller-owned cache: a plain Map, owned by the caller, never module-level
+ * (a company renaming a category mid-import must not read stale forever).
+ */
+async function categoryShortform(companyId, categoryId, length, ctxCache = null) {
   if (!categoryId) return '';
+  const key = `cat:${categoryId}`;
+  if (ctxCache?.has(key)) return String(ctxCache.get(key) ?? '').slice(0, length);
   const [[row]] = await pool.query(
     `SELECT shortform, name FROM fab_item_categories WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [categoryId, companyId],
   );
-  if (!row) return '';
-  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
-  return source.toUpperCase().slice(0, length);
+  const source = row ? (row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '')).toUpperCase() : '';
+  ctxCache?.set(key, source);
+  return source.slice(0, length);
 }
 
-async function groupShortform(companyId, groupId, length) {
+async function groupShortform(companyId, groupId, length, ctxCache = null) {
   if (!groupId) return '';
+  const key = `grp:${groupId}`;
+  if (ctxCache?.has(key)) return String(ctxCache.get(key) ?? '').slice(0, length);
   const [[row]] = await pool.query(
     `SELECT shortform, name FROM fab_item_groups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [groupId, companyId],
   );
-  if (!row) return '';
-  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
-  return source.toUpperCase().slice(0, length);
+  const source = row ? (row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '')).toUpperCase() : '';
+  ctxCache?.set(key, source);
+  return source.slice(0, length);
 }
 
-async function subgroupShortform(companyId, subgroupId, length) {
+async function subgroupShortform(companyId, subgroupId, length, ctxCache = null) {
   if (!subgroupId) return '';
+  const key = `sub:${subgroupId}`;
+  if (ctxCache?.has(key)) return String(ctxCache.get(key) ?? '').slice(0, length);
   const [[row]] = await pool.query(
     `SELECT shortform, name FROM fab_item_subgroups WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [subgroupId, companyId],
   );
-  if (!row) return '';
-  const source = row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '');
-  return source.toUpperCase().slice(0, length);
+  const source = row ? (row.shortform || (row.name || '').replace(/[^A-Za-z0-9]+/g, '')).toUpperCase() : '';
+  ctxCache?.set(key, source);
+  return source.slice(0, length);
 }
 
 /** Evaluates segments into a code string. seqValue is the number to render for the sequence segment. */
-async function evaluateSegments(segments, { companyId, context, seqValue, now }) {
+async function evaluateSegments(segments, { companyId, context, seqValue, now, ctxCache = null }) {
   const parts = [];
   for (const seg of segments) {
     switch (seg.type) {
@@ -315,13 +334,13 @@ async function evaluateSegments(segments, { companyId, context, seqValue, now })
         parts.push(formatDate(seg.format, now));
         break;
       case 'category_shortform':
-        parts.push(await categoryShortform(companyId, context.categoryId, seg.length ?? 3));
+        parts.push(await categoryShortform(companyId, context.categoryId, seg.length ?? 3, ctxCache));
         break;
       case 'group_shortform':
-        parts.push(await groupShortform(companyId, context.groupId, seg.length ?? 3));
+        parts.push(await groupShortform(companyId, context.groupId, seg.length ?? 3, ctxCache));
         break;
       case 'subgroup_shortform':
-        parts.push(await subgroupShortform(companyId, context.subgroupId, seg.length ?? 3));
+        parts.push(await subgroupShortform(companyId, context.subgroupId, seg.length ?? 3, ctxCache));
         break;
       case 'sequence':
         parts.push(String(seqValue).padStart(seg.digits ?? 4, '0'));
@@ -410,24 +429,42 @@ function findSequenceSegment(segments) {
   return segments.find((s) => s.type === 'sequence') ?? null;
 }
 
-async function getRuleRow(companyId, entityType) {
+/**
+ * @param {Map} [ctxCache] read-only lookups only — never used for the FOR
+ *   UPDATE row `generateCode` locks, which must always see the live counter.
+ */
+async function getRuleRow(companyId, entityType, ctxCache = null) {
+  const key = `rule:${companyId}:${entityType}`;
+  if (ctxCache?.has(key)) return ctxCache.get(key);
   const [[row]] = await pool.query(
     `SELECT * FROM fab_codegen_rules WHERE company_id = ? AND entity_type = ? LIMIT 1`,
     [companyId, entityType],
   );
-  return row ?? null;
+  const result = row ?? null;
+  ctxCache?.set(key, result);
+  return result;
 }
 
-/** Fetches the company's rule for an entity type, or the built-in default if none configured. */
+/**
+ * Fetches the company's rule for an entity type, or the built-in default if
+ * none configured.
+ *
+ * `isDefault` reads the SENTINEL (an empty segment list), not merely "does a
+ * row exist" — `generateCode` always upserts a row on first use to hold the
+ * running counter, and that row must not itself count as a customisation, or
+ * this would report `isDefault: false` forever the moment any code is ever
+ * issued (see `firstUseSegments` below).
+ */
 export async function getRule(companyId, entityType) {
-  await ensureTable();
   const row = await getRuleRow(companyId, entityType);
   if (row) {
+    const stored = typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json;
+    const customised = Array.isArray(stored) && stored.length > 0;
     return {
-      segments: typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json,
+      segments: customised ? stored : defaultSegmentsFor(entityType),
       nextSeq: row.next_seq,
       seqPeriodKey: row.seq_period_key,
-      isDefault: false,
+      isDefault: !customised,
     };
   }
   return { segments: defaultSegmentsFor(entityType), nextSeq: 1, seqPeriodKey: null, isDefault: true };
@@ -435,7 +472,6 @@ export async function getRule(companyId, entityType) {
 
 /** Saves (upserts) the segment list for a company × entity type. Leaves the running sequence untouched. */
 export async function saveRule(companyId, entityType, segments) {
-  await ensureTable();
   await pool.query(
     `INSERT INTO fab_codegen_rules (company_id, entity_type, segments_json, next_seq)
      VALUES (?, ?, ?, 1)
@@ -446,7 +482,6 @@ export async function saveRule(companyId, entityType, segments) {
 
 /** Builds a sample code without touching the persisted sequence. */
 export async function previewCode(companyId, entityType, segments, context = {}) {
-  await ensureTable();
   const seqSeg = findSequenceSegment(segments);
   const now = new Date();
   let seqValue = 1;
@@ -474,26 +509,39 @@ export async function previewCode(companyId, entityType, segments, context = {})
  * Sharing the caller's transaction makes issue-and-insert atomic — and avoids
  * taking a second pool connection while the caller holds one, which under load
  * is a self-inflicted deadlock (the pool has no queue limit).
+ *
+ * @param {Map} [ctxCache] shared across many calls in one batch (an import, a
+ *   bulk row build) so repeated taxonomy shortform lookups within it cost one
+ *   query, not one per code. Owned by the caller, never module-level.
  */
-export async function generateCode(companyId, entityType, context = {}, existingConn = null) {
-  await ensureTable();
+export async function generateCode(companyId, entityType, context = {}, existingConn = null, ctxCache = null) {
   const conn = existingConn ?? (await pool.getConnection());
   const ownTransaction = !existingConn;
   try {
     if (ownTransaction) await conn.beginTransaction();
 
-    // Make the row exist BEFORE locking it. A SELECT ... FOR UPDATE that matches
-    // nothing takes a gap lock, and gap locks are mutually compatible — so two
-    // first-callers for the same (company, entityType) both sail past, both
-    // INSERT, and their insert-intention locks collide: one gets ER_DUP_ENTRY,
-    // or more often ER_LOCK_DEADLOCK, and the caller sees a 500 the first time
-    // anyone ever generates a code of that type. Upserting first means the
-    // lock below always has a real row to take.
+    /*
+     * Make the row exist BEFORE locking it. A SELECT ... FOR UPDATE that matches
+     * nothing takes a gap lock, and gap locks are mutually compatible — so two
+     * first-callers for the same (company, entityType) both sail past, both
+     * INSERT, and their insert-intention locks collide: one gets ER_DUP_ENTRY,
+     * or more often ER_LOCK_DEADLOCK, and the caller sees a 500 the first time
+     * anyone ever generates a code of that type. Upserting first means the
+     * lock below always has a real row to take.
+     *
+     * `segments_json` is seeded with the SENTINEL, not a snapshot of today's
+     * default — `JSON.stringify(defaultSegmentsFor(entityType))` used to
+     * freeze whatever the built-in default happened to be the moment the
+     * FIRST code of that type was ever issued, so `getRule` reported
+     * `isDefault: false` (and the settings page a "customised" rule nobody
+     * asked for) from that point on. An empty list defers to the live default
+     * every time, in both `getRule` and here, until someone actually saves one.
+     */
     await conn.query(
       `INSERT INTO fab_codegen_rules (company_id, entity_type, segments_json, next_seq)
        VALUES (?, ?, ?, 1)
        ON DUPLICATE KEY UPDATE id = id`,
-      [companyId, entityType, JSON.stringify(defaultSegmentsFor(entityType))],
+      [companyId, entityType, NO_OVERRIDE],
     );
 
     const [[row]] = await conn.query(
@@ -501,9 +549,7 @@ export async function generateCode(companyId, entityType, context = {}, existing
       [companyId, entityType],
     );
 
-    const segments = typeof row.segments_json === 'string'
-      ? JSON.parse(row.segments_json)
-      : row.segments_json;
+    const segments = liveSegments(row, entityType);
 
     const now = new Date();
     const seqSeg = findSequenceSegment(segments);
@@ -520,7 +566,7 @@ export async function generateCode(companyId, entityType, context = {}, existing
       }
     }
 
-    const code = await evaluateSegments(segments, { companyId, context, seqValue, now });
+    const code = await evaluateSegments(segments, { companyId, context, seqValue, now, ctxCache });
 
     await conn.query(
       `UPDATE fab_codegen_rules SET next_seq = ?, seq_period_key = ? WHERE id = ?`,
@@ -545,11 +591,10 @@ export async function generateCode(companyId, entityType, context = {}, existing
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /** The segments a rule uses, as saved or as shipped. */
-async function segmentsFor(companyId, entityType) {
-  await ensureTable();
-  const row = await getRuleRow(companyId, entityType);
+async function segmentsFor(companyId, entityType, ctxCache = null) {
+  const row = await getRuleRow(companyId, entityType, ctxCache);
   if (!row) return defaultSegmentsFor(entityType);
-  return typeof row.segments_json === 'string' ? JSON.parse(row.segments_json) : row.segments_json;
+  return liveSegments(row, entityType);
 }
 
 /**
@@ -563,12 +608,12 @@ async function segmentsFor(companyId, entityType) {
  * @param {object[]} contexts one per code wanted
  * @returns {Promise<string[]>} in the same order
  */
-export async function deriveCodes(companyId, entityType, contexts) {
-  const segments = await segmentsFor(companyId, entityType);
+export async function deriveCodes(companyId, entityType, contexts, ctxCache = new Map()) {
+  const segments = await segmentsFor(companyId, entityType, ctxCache);
   const now = new Date();
   const out = [];
   for (const context of contexts) {
-    out.push(await evaluateSegments(segments, { companyId, context, seqValue: 1, now }));
+    out.push(await evaluateSegments(segments, { companyId, context, seqValue: 1, now, ctxCache }));
   }
   return out;
 }
@@ -707,15 +752,18 @@ export async function orderRowCodes(companyId, orderId, conn) {
   };
 
   // Codes depend on the parent's code, so each level is rendered before the
-  // next is walked.
-  const segments = await segmentsFor(companyId, 'order_item');
+  // next is walked. One ctxCache for the whole order — a real bridge order is
+  // exactly the "1,000 rows sharing a handful of categories" case this exists
+  // for.
+  const ctxCache = new Map();
+  const segments = await segmentsFor(companyId, 'order_item', ctxCache);
   const now = new Date();
   const codes = new Map();
   let level = walk('root', null, '');
   while (level.length) {
     const next = [];
     for (const r of level) {
-      const code = await evaluateSegments(segments, { companyId, context: r._context, seqValue: 1, now });
+      const code = await evaluateSegments(segments, { companyId, context: r._context, seqValue: 1, now, ctxCache });
       codes.set(Number(r.id), code);
       next.push(...walk(Number(r.id), r, code));
     }

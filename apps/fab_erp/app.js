@@ -5,6 +5,7 @@ import indexRoutes            from './routes/index.js';
 import plannerRoutes          from './routes/planner.js';
 import procurementRoutes      from './routes/procurement.js';
 import actualsRoutes          from './routes/actuals.js';
+import catalogRoutes          from './routes/catalog.js';
 import { logger }              from '../../core/utils/logger.js';
 import { getQueue }            from '../../core/jobs/queue.js';
 import attributionJobHandlers  from './workers/jobHandlers.js';
@@ -38,6 +39,11 @@ export default {
     // Actuals Board: the same window as the planner, drawn from what HAPPENED.
     // Same prefix, same reason as the three above. Read-only by construction.
     server.use('/api/:companySlug/fab_erp', actualsRoutes);
+    // EU-15: catalog list/create + taxonomy delete guard + order-lines readout.
+    // Same prefix, same reason as the four above — a NEW router rather than
+    // folding into routes/items.js or routes/index.js, both edited concurrently
+    // by other work in the same pass.
+    server.use('/api/:companySlug/fab_erp', catalogRoutes);
     // EU-3: wait-attribution sweep every 15 min. When Redis is available we
     // enqueue onto the 'fab_erp' Bull queue (processor wired by jobHandlers);
     // when it isn't (getQueue → null, this repo's default) we run the sweep

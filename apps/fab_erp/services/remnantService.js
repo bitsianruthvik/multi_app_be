@@ -28,6 +28,7 @@
 
 import { nest as packNest } from './nestingPacker.js';
 import { ensurePieceCode } from './stockCodeService.js';
+import { kerfFor } from './kerfService.js';
 
 /**
  * Defaults, overridable per company in `fab_company_settings`.
@@ -37,14 +38,15 @@ import { ensurePieceCode } from './stockCodeService.js';
  * suggestor offer them. Roughly "big enough to be a stiffener or a cover
  * plate".
  *
- * KERF_MM: a torch eats several millimetres on every cut. Drops computed from
- * ideal geometry are optimistic on every edge, and a drop recorded a few mm
- * larger than it is will be nested onto and then not fit.
+ * KERF is NOT read from `remnant_kerf_mm` any more (PLAN.md EU-11 item 7):
+ * that setting defaulted to 4 mm while the packer's own `kerfFor` (EU-10)
+ * defaults to 2 — two numbers for one physical fact, so a drop computed after
+ * a 2 mm pack was recorded 2 mm small on every edge. `recordNestDrops` below
+ * resolves the plate's own kerf via `kerfFor` and passes it in instead.
  */
 const DEFAULTS = {
   remnant_min_short_mm: 300,
   remnant_min_area_mm2: 500000, // 0.5 m²
-  remnant_kerf_mm: 4,
 };
 
 export async function remnantSettings(conn, companyId) {
@@ -69,7 +71,10 @@ export async function remnantSettings(conn, companyId) {
  * @returns {{drops:Array<{length,width}>, scrapAreaMm2:number, usedAreaMm2:number}}
  */
 export function dropsFor(plate, partRows, settings = DEFAULTS) {
-  const kerf = settings.remnant_kerf_mm;
+  // `?? 2`: same last-resort as `kerfService`'s own blanket default, for a
+  // caller (a script, a future test) that does not go through `recordNestDrops`
+  // and so never had a real kerf resolved onto `settings`.
+  const kerf = settings.remnant_kerf_mm ?? 2;
   const spec = { id: 0, code: 'plate', length: plate.length, width: plate.width };
 
   /**
@@ -115,6 +120,7 @@ export function dropsFor(plate, partRows, settings = DEFAULTS) {
 async function partsOnNest(conn, companyId, orderId, catalogItemId, nestNo) {
   const [rows] = await conn.query(
     `SELECT rm.id AS linkId, rm.length AS plateLength, rm.width AS plateWidth,
+            rm.qty AS nestQty,
             p.id AS partId, p.code AS partCode, p.qty AS partQty,
             p.length AS partLength, p.width AS partWidth
        FROM fab_items rm
@@ -134,7 +140,11 @@ async function partsOnNest(conn, companyId, orderId, catalogItemId, nestNo) {
     // computed honestly either. Reported by the caller rather than guessed at.
     if (!Number.isFinite(length) || !Number.isFinite(width) || length <= 0 || width <= 0) return null;
     partRows.push({
-      key: String(r.linkId), length, width, qty: Math.max(1, Number(r.partQty) || 1),
+      // The pieces of THIS part cut on THIS sheet — a part can be split across
+      // several nests, so the link's own qty is what belongs here, not the
+      // part's order-wide total. Falls back to partQty for a link written
+      // before this contract (blank/zero qty), same as everywhere else.
+      key: String(r.linkId), length, width, qty: Math.max(1, Number(r.nestQty ?? r.partQty) || 1),
     });
   }
   const plate = rows.length
@@ -169,7 +179,17 @@ export async function recordNestDrops(conn, companyId, {
     return { created: 0, pieces: [], skipped: 'the nest has no recorded plate or part sizes' };
   }
 
-  const { drops, scrapAreaMm2 } = dropsFor(shape.plate, shape.partRows, settings);
+  // The SAME kerf the pack itself used (`process:'cutting'`), not a second,
+  // disagreeing number — see the DEFAULTS comment above.
+  const [[plateRow]] = await conn.query(
+    `SELECT thickness_mm AS thickness FROM fab_item_catalog WHERE id = ? AND company_id = ? LIMIT 1`,
+    [catalogItemId, companyId],
+  );
+  const kerfMm = await kerfFor(companyId, plateRow?.thickness ?? null, 'cutting');
+
+  const { drops, scrapAreaMm2 } = dropsFor(
+    shape.plate, shape.partRows, { ...settings, remnant_kerf_mm: kerfMm },
+  );
   if (!drops.length) {
     return { created: 0, pieces: [], skipped: 'nothing left above the keep-threshold', scrapAreaMm2 };
   }

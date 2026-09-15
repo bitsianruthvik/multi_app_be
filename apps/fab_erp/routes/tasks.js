@@ -824,10 +824,15 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       await conn.beginTransaction();
 
       const [taskRows] = await conn.query(
-        `SELECT id, company_id, order_id, item_id, flow_id, seq_no,
-                resource_type_id, assigned_resource_id, deps_cleared_at, status
-           FROM fab_project_tasks
-          WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+        // EU-14: is_subcontract joined in so the UPDATE below can also stamp
+        // sent_out_at for a subcontract step — a fact about its OPERATION,
+        // not the task row itself.
+        `SELECT t.id, t.company_id, t.order_id, t.item_id, t.flow_id, t.seq_no,
+                t.resource_type_id, t.assigned_resource_id, t.deps_cleared_at, t.status,
+                COALESCE(op.is_subcontract, 0) AS is_subcontract
+           FROM fab_project_tasks t
+           LEFT JOIN fab_operations op ON op.id = t.operation_id AND op.company_id = t.company_id
+          WHERE t.id = ? AND t.company_id = ? AND t.deleted_at IS NULL
           FOR UPDATE`,
         [taskId, companyId],
       );
@@ -971,6 +976,12 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
       const now = new Date();
       metrics = await computeTaskWaitMetrics(task, now);
 
+      // EU-14: a subcontract step's start IS "sent out to the supplier" —
+      // restamped on every start (including a resume from paused), which is
+      // fine: the task is `in_progress` while it is out either way, and
+      // there is no separate status for "out" to invent.
+      const subcontractStartSet = task.is_subcontract ? ', sent_out_at = UTC_TIMESTAMP()' : '';
+
       // ── BUG-11: atomic transition — guard the UPDATE on the expected prior status ─
       const [updateResult] = await conn.query(
         `UPDATE fab_project_tasks
@@ -979,7 +990,7 @@ router.post('/tasks/:id/start', protect, async (req, res) => {
                 idle_wait_minutes = ?,
                 assigned_resource_id = ?,
                 started_at = UTC_TIMESTAMP(),
-                status = 'in_progress'
+                status = 'in_progress'${subcontractStartSet}
           WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = ?`,
         [
           metrics.wait_working_minutes,
@@ -1279,12 +1290,16 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       await conn.beginTransaction();
 
       const [taskRows] = await conn.query(
+        // EU-14: is_subcontract joined in so the completion UPDATE below can
+        // also stamp returned_at for a subcontract step.
         `SELECT t.id, t.order_id, t.item_id, t.seq_no, t.assigned_resource_id, t.status, t.computed_hours,
                 t.setup_hours,
                 t.task_qty,
-                COALESCE(i.qty, 1) AS planned_qty
+                COALESCE(i.qty, 1) AS planned_qty,
+                COALESCE(op.is_subcontract, 0) AS is_subcontract
            FROM fab_project_tasks t
            LEFT JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id AND i.deleted_at IS NULL
+           LEFT JOIN fab_operations op ON op.id = t.operation_id AND op.company_id = t.company_id
           WHERE t.id = ? AND t.company_id = ? AND t.deleted_at IS NULL
           FOR UPDATE`,
         [taskId, companyId],
@@ -1309,6 +1324,12 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
       planHours = taskHours(task); // FEAT-16 — the whole task, matching the actual it is compared against
       orderId = task.order_id;         // EU-5
 
+      // EU-14: the piece is back from the supplier the moment its subcontract
+      // step stops — same "no new status" rule as start: the task goes
+      // straight to 'done' like any other, returned_at is just a fact about
+      // when.
+      const subcontractStopSet = task.is_subcontract ? ', returned_at = UTC_TIMESTAMP()' : '';
+
       // BUG-11 + FEAT-05: gate the transition on the expected prior status
       // (atomic complete) and record the captured production output.
       const [updateResult] = await conn.query(
@@ -1317,7 +1338,7 @@ router.post('/tasks/:id/stop', protect, async (req, res) => {
                 completed_at = UTC_TIMESTAMP(),
                 produced_qty = ?,
                 scrap_qty = ?,
-                qc_result = ?
+                qc_result = ?${subcontractStopSet}
           WHERE id = ? AND company_id = ? AND deleted_at IS NULL AND status = 'in_progress'`,
         [producedQty, scrapQty, qcResult, taskId, companyId],
       );

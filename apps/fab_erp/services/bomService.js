@@ -25,7 +25,39 @@
 
 import { pool } from '../../../db.js';
 import { NOT_A_BLANK } from './blankPredicate.js';
-import { recomputeDerived } from './fieldDeriveService.js';
+import { setFieldsBulk } from './fieldService.js';
+import { lineScopeSql } from './sqlScope.js';
+import { assertNoStartedWork } from './itemGuards.js';
+import { afterStructureWrite } from './itemShapeService.js';
+import { recordRevision } from './orderRevisionService.js';
+
+/**
+ * Unit + make/buy for exactly the catalog items a tree references, not the
+ * company's whole catalog (`itemGuards.catalogKinds` has no id filter — a
+ * span-sized company catalog is thousands of rows for a 30-item tree).
+ * Same shape as `catalogKinds` deliberately, so the two are interchangeable
+ * at the call site.
+ */
+async function catalogKindsFor(conn, companyId, ids) {
+  const list = [...new Set((ids ?? []).map(Number).filter((n) => Number.isFinite(n)))];
+  if (!list.length) return { unitOf: new Map(), procurementOf: new Map() };
+  const [rows] = await conn.query(
+    `SELECT id, unit, procurement_type FROM fab_item_catalog
+      WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`,
+    [companyId, list],
+  );
+  return {
+    unitOf: new Map(rows.map((k) => [Number(k.id), k.unit])),
+    procurementOf: new Map(rows.map((k) => [Number(k.id), k.procurement_type])),
+  };
+}
+
+/** Every `catalogItemId` a tree touches, for a scoped catalog load. */
+function catalogIdsOf(node, out = []) {
+  if (node.catalogItemId != null) out.push(Number(node.catalogItemId));
+  for (const child of Array.isArray(node.children) ? node.children : []) catalogIdsOf(child, out);
+  return out;
+}
 
 /** A BOM deep enough to hit this is a cycle or a mistake, not a real structure. */
 const MAX_DEPTH = 16;
@@ -71,32 +103,59 @@ export async function bomFor(companyId, parentItemId, conn = null) {
     e[v.k] = v.n == null ? null : Number(v.n);
     byLine.set(Number(v.lineId), e);
   }
-  for (const r of rows) r.defaults = byLine.get(Number(r.id)) ?? {};
+  // `explode` arrives as a TINYINT (0/1) off the row; REPAIR-B wants the
+  // designer to read a real boolean off this line, same as `variesPerJob`
+  // is a boolean on `draftTree`'s nodes rather than a raw column value.
+  for (const r of rows) {
+    r.defaults = byLine.get(Number(r.id)) ?? {};
+    r.explode = !!Number(r.explode);
+  }
   return rows;
 }
 
-/** Every line in the company, indexed by parent — one query for a whole walk. */
-async function bomIndex(companyId, conn = null) {
+/**
+ * Every line reachable from `rootIds`, indexed by parent — a breadth-first
+ * walk, one query per depth, rather than a single query for the WHOLE
+ * company's BOM (S5). A template's own subtree is a handful of rungs deep
+ * regardless of how many OTHER templates the company has, so this stays a
+ * small, constant number of round trips instead of scanning every recipe on
+ * every call.
+ *
+ * @param {number|number[]} rootIds
+ */
+async function bomIndex(companyId, rootIds, conn = null) {
   const exec = conn ?? pool;
-  const [rows] = await exec.query(
-    `SELECT b.id AS lineId,
-            b.parent_item_id AS parentItemId, b.child_item_id AS childItemId,
-            b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
-            b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
-            b.help_text AS helpText, b.sort_order AS sortOrder,
-            b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
-            c.code AS childCode, c.name AS childName, c.unit AS childUnit,
-            c.procurement_type AS childProcurement
-       FROM fab_item_bom b
-       JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
-      WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.active = 1
-      ORDER BY b.sort_order, c.code`,
-    [companyId],
-  );
+  const roots = [...new Set((Array.isArray(rootIds) ? rootIds : [rootIds]).map(Number).filter(Boolean))];
   const byParent = new Map();
-  for (const r of rows) {
-    if (!byParent.has(r.parentItemId)) byParent.set(r.parentItemId, []);
-    byParent.get(r.parentItemId).push(r);
+  if (!roots.length) return byParent;
+
+  const seen = new Set(roots);
+  let frontier = roots;
+  for (let depth = 0; depth < MAX_DEPTH && frontier.length; depth++) {
+    const [rows] = await exec.query(
+      `SELECT b.id AS lineId,
+              b.parent_item_id AS parentItemId, b.child_item_id AS childItemId,
+              b.qty_num AS qtyNum, b.qty_param AS qtyParam, b.default_qty AS defaultQty,
+              b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
+              b.help_text AS helpText, b.sort_order AS sortOrder,
+              b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
+              c.code AS childCode, c.name AS childName, c.unit AS childUnit,
+              c.procurement_type AS childProcurement
+         FROM fab_item_bom b
+         JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
+        WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.active = 1
+          AND b.parent_item_id IN (?)
+        ORDER BY b.sort_order, c.code`,
+      [companyId, frontier],
+    );
+    const next = [];
+    for (const r of rows) {
+      if (!byParent.has(r.parentItemId)) byParent.set(r.parentItemId, []);
+      byParent.get(r.parentItemId).push(r);
+      const childId = Number(r.childItemId);
+      if (!seen.has(childId)) { seen.add(childId); next.push(childId); }
+    }
+    frontier = next;
   }
   return byParent;
 }
@@ -111,7 +170,7 @@ async function bomIndex(companyId, conn = null) {
  * @returns {Promise<Array<{param, defaultQty, askedBy, perInstance, helpText}>>}
  */
 export async function parametersFor(companyId, rootItemId, conn = null) {
-  const byParent = await bomIndex(companyId, conn);
+  const byParent = await bomIndex(companyId, [rootItemId], conn);
   const found = new Map();
   const seen = new Set();
 
@@ -146,7 +205,9 @@ export async function parametersFor(companyId, rootItemId, conn = null) {
  * @returns {Promise<string[]>} the path forming the cycle, empty when clean
  */
 export async function findCycle(companyId, parentItemId, childItemId, conn = null) {
-  const byParent = await bomIndex(companyId, conn);
+  // The walk below starts at childItemId looking for parentItemId, so that is
+  // the only subtree that matters here.
+  const byParent = await bomIndex(companyId, [childItemId], conn);
   const target = Number(parentItemId);
   const path = [];
 
@@ -246,7 +307,7 @@ export const canonicalPath = (nodes, path) => {
  */
 export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   const exec = opts.conn ?? pool;
-  const byParent = await bomIndex(companyId, exec);
+  const byParent = await bomIndex(companyId, [rootItemId], exec);
 
   const [[root]] = await exec.query(
     `SELECT id, code, name, unit FROM fab_item_catalog
@@ -499,7 +560,7 @@ export async function structureOutline(companyId, rootItemId, opts = {}) {
   const {
     params = {}, spec = null, perInstance = {}, maxParents = 100, conn = null,
   } = opts;
-  const byParent = await bomIndex(companyId, conn);
+  const byParent = await bomIndex(companyId, [rootItemId], conn);
   const tree = await expand(companyId, rootItemId, params, { spec, perInstance, conn });
 
   /** Every node, bucketed by its depth. */
@@ -623,7 +684,7 @@ export async function structureOutline(companyId, rootItemId, opts = {}) {
  */
 export async function draftTree(companyId, rootItemId, conn = null) {
   const exec = conn ?? pool;
-  const byParent = await bomIndex(companyId, exec);
+  const byParent = await bomIndex(companyId, [rootItemId], exec);
   const [[root]] = await exec.query(
     `SELECT id, code, name, unit FROM fab_item_catalog
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
@@ -669,12 +730,22 @@ export async function draftTree(companyId, rootItemId, conn = null) {
         qty: qty === null ? null : (Number.isFinite(qty) ? qty : null),
         codeSegment: line.codeSegment,
         codeJoin: line.codeJoin ?? 'dash',
+        // Same TINYINT-to-boolean coercion as `bomFor` (REPAIR-B) — `bomIndex`
+        // rows feeding this tree carry the raw column value otherwise.
+        explode: line.explode == null ? true : !!Number(line.explode),
         defaultFlowId: line.defaultFlowId ?? null,
         // Where it came from, so an untouched tree can be recognised as the
         // BOM's own shape rather than something hand-built.
         bomLineId: Number(line.lineId),
-        /** What the BOM called this quantity, if it asked for one. */
-        qtyParam: line.qtyParam ?? null,
+        /*
+         * Whether this line's quantity is a per-job answer rather than a fixed
+         * number. It is never itself the row's `qty` — that always comes from
+         * `qtyNum` or `defaultQty` above, which `setBomLine` now requires to be
+         * a real number for a varies-per-job line. "Ask the order" (a live
+         * question with no default) used to reach here as `qty: null`, which
+         * `requireAllQty` could only refuse — a dead end removed at the source.
+         */
+        variesPerJob: !!line.qtyParam,
         /*
          * MADE OR BOUGHT, so the editor can stop asking a bought item its size.
          * A shear stud's dimensions are the reason you picked that stud out of
@@ -695,9 +766,12 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     qty: 1,
     codeSegment: null,
     codeJoin: 'dash',
+    // The root is not a line — nothing to explode — so it gets the column
+    // default rather than a value read off any row.
+    explode: true,
     defaultFlowId: null,
     bomLineId: null,
-    qtyParam: null,
+    variesPerJob: false,
     procurementType: 'make',
     dims: {},
     children: build(Number(root.id), 0, new Set([Number(root.id)])),
@@ -739,25 +813,118 @@ export async function draftTree(companyId, rootItemId, conn = null) {
   return tree;
 }
 
+/** Does this row state a real quantity? */
+function hasQty(node) {
+  const n = Number(node?.qty);
+  return Number.isFinite(n) && n > 0;
+}
+
 /**
- * How many of this row — or a refusal.
+ * Every row with no quantity, not just the first one.
  *
  * There is no sensible default. Coercing a missing answer to 1 is what makes it
  * dangerous: one splice on a bridge that needs sixteen is a number somebody
  * will read as deliberate and never question. A blank cannot be mistaken for
- * an answer, so it is carried as one all the way to here and refused.
+ * an answer, so it is carried as one all the way to here and refused — and a
+ * person fixing a 200-row structure one blank at a time, resaving after each,
+ * is the failure the old first-blank-wins version left in place.
  */
-function requireQty(node) {
-  const n = Number(node?.qty);
-  if (!Number.isFinite(n) || n <= 0) {
+function collectUnanswered(node, depth = 0, ancestry = []) {
+  const path = [...ancestry, node.name].join(' / ');
+  const out = hasQty(node)
+    ? []
+    : [{ itemId: node.itemId ?? null, code: node.code ?? null, name: node.name, depth, path }];
+  for (const child of Array.isArray(node.children) ? node.children : []) {
+    out.push(...collectUnanswered(child, depth + 1, [...ancestry, node.name]));
+  }
+  return out;
+}
+
+/** Refuse the whole tree at once when any row has no quantity. */
+function requireAllQty(tree) {
+  const unanswered = collectUnanswered(tree);
+  if (unanswered.length) {
     const e = new Error(
-      `"${node?.name ?? 'A row'}" has no quantity. Fill it in before building — `
+      `${unanswered.length} row(s) have no quantity. Fill them in before building — `
       + 'there is no sensible number to assume.',
     );
     e.status = 400;
+    e.code = 'QTY_REQUIRED';
+    e.detail = { unanswered };
     throw e;
   }
-  return n;
+}
+
+/*
+ * NULL predates the `sort_order` column: nothing has ever stated an opinion
+ * about this row's position, so no position it is found at now counts as a
+ * move. Without this, the first save after the migration would report every
+ * row as updated for no reason a person asked for.
+ */
+function sortOrderMatches(storedSortOrder, position) {
+  return storedSortOrder == null ? true : Number(storedSortOrder) === position;
+}
+
+/** Does the tree's stated size for this row disagree with what is stored? */
+function dimsDiffer(node, priorDims) {
+  if (!node.dims || typeof node.dims !== 'object') return false;
+  for (const [k, v] of Object.entries(node.dims)) {
+    const nv = (v === '' || v == null) ? null : Number(v);
+    const pv = priorDims[k] ?? null;
+    if (nv !== pv) return true;
+  }
+  return false;
+}
+
+/** Everything `applyTree`'s diff already checked, factored out so the started-row guard agrees with it. */
+function rowUnchanged(was, node, parentItemId, depth, isLeaf, position, unit) {
+  return was.name === node.name
+    && (was.unit ?? '') === (unit ?? '')
+    && Number(was.qty) === Number(node.qty)
+    && Number(was.parentItemId ?? 0) === Number(parentItemId ?? 0)
+    && Number(was.depth) === depth
+    && Number(was.isLeaf) === isLeaf
+    // Moving a row among its siblings is a change like any other.
+    && sortOrderMatches(was.sortOrder, position)
+    /*
+     * AND THE FLOW, which this branch used to ignore entirely.
+     *
+     * The insert carried `flow_id` and the update did not, so a flow set on a
+     * row that already existed was accepted by the screen and thrown away by
+     * the save — the worst shape a bug can have. It did not matter while flows
+     * were chosen on a step of their own; it matters now that they are chosen
+     * here.
+     */
+    && Number(was.flowId ?? 0) === Number(node.defaultFlowId ?? 0);
+}
+
+/**
+ * Every existing row the tree would change AND that already carries shop-floor
+ * history — computed before any write, so the refusal below is checked before
+ * anything happens, the same discipline `assertNoStartedWork` uses for a
+ * removed row. A row's own qty/dims/position/flow changing is exactly what
+ * `rowUnchanged`/`dimsDiffer` already decide for the write itself; this walk
+ * asks the same question without writing anything, so a caller with no
+ * revision reason is refused before the transaction touches a single row.
+ */
+function collectStartedRowChanges(node, parentItemId, depth, position, ctx) {
+  const out = [];
+  const kids = Array.isArray(node.children) ? node.children : [];
+  const isLeaf = kids.length ? 0 : 1;
+  const id = node.itemId && ctx.byId.has(Number(node.itemId)) ? Number(node.itemId) : null;
+  let childParentId = null;
+  if (id) {
+    const was = ctx.byId.get(id);
+    const unit = node.unit ?? ctx.unitOf.get(Number(node.catalogItemId)) ?? 'nos';
+    const same = rowUnchanged(was, node, parentItemId, depth, isLeaf, position, unit);
+    const changed = !same || dimsDiffer(node, ctx.existingDimsByItem.get(id) ?? {});
+    if (changed && ctx.startedIds.has(id)) out.push(id);
+    childParentId = id;
+  }
+  for (let i = 0; i < kids.length; i += 1) {
+    out.push(...collectStartedRowChanges(kids[i], childParentId, depth + 1, i, ctx));
+  }
+  return out;
 }
 
 /** Flatten an expanded tree into rows, parents before children. */
@@ -786,6 +953,26 @@ export async function setBomLine(companyId, line, existingConn = null) {
       e.status = 400;
       throw e;
     }
+    /*
+     * A LINE THAT VARIES PER JOB STILL PRODUCES A NUMBER.
+     *
+     * `qty_param` used to be a live question an order-building screen never
+     * actually asked (draftTree had no way to feed an answer back in), so a
+     * varies-per-job line reached `requireAllQty` as a permanent blank — a
+     * dead end with a name that suggested otherwise. A required default makes
+     * it buildable immediately; the parameter name now only says "and this
+     * order may want a different number", which is what the qty box on the
+     * Parameters step is for.
+     */
+    const defaultQtyNum = line.defaultQty == null || line.defaultQty === '' ? null : Number(line.defaultQty);
+    if (hasParam && (defaultQtyNum == null || !Number.isFinite(defaultQtyNum) || defaultQtyNum <= 0)) {
+      const e = new Error(
+        'A line that varies per job still needs a default quantity — it is what makes an '
+        + 'unanswered line buildable.',
+      );
+      e.status = 400;
+      throw e;
+    }
     if (Number(parentItemId) === Number(childItemId)) {
       const e = new Error('An item cannot contain itself.');
       e.status = 400;
@@ -797,18 +984,49 @@ export async function setBomLine(companyId, line, existingConn = null) {
       e.status = 400;
       throw e;
     }
+    if (line.codeJoin != null && line.codeJoin !== '' && !['dash', 'absorb'].includes(line.codeJoin)) {
+      const e = new Error("codeJoin must be 'dash' or 'absorb'.");
+      e.status = 400;
+      throw e;
+    }
+
+    /*
+     * `explode`/`code_join` ride on the row `expand` already branches on
+     * (assemblies explode, parts do not; absorb joins without a dash) but that
+     * no writer ever set — every line got the column's own default. An EDIT
+     * that doesn't mention either must not silently flip it back to that
+     * default, so an existing row's current value is looked up and kept
+     * unless the payload says otherwise; a brand new row gets the same
+     * defaults the column always has (`explode`=1, `code_join`='dash').
+     */
+    const hasExplode = line.explode !== undefined && line.explode !== null;
+    const hasCodeJoin = line.codeJoin != null && line.codeJoin !== '';
+    let explodeVal = hasExplode ? (line.explode ? 1 : 0) : 1;
+    let codeJoinVal = hasCodeJoin ? line.codeJoin : 'dash';
+    if (id && (!hasExplode || !hasCodeJoin)) {
+      const [[prior]] = await conn.query(
+        'SELECT explode, code_join AS codeJoin FROM fab_item_bom WHERE id = ? AND company_id = ?',
+        [id, companyId],
+      );
+      if (prior) {
+        if (!hasExplode) explodeVal = Number(prior.explode) ? 1 : 0;
+        if (!hasCodeJoin) codeJoinVal = prior.codeJoin ?? 'dash';
+      }
+    }
 
     const cols = [
       companyId, parentItemId, childItemId,
       hasNum ? Number(line.qtyNum) : null,
       hasParam ? String(line.qtyParam).trim() : null,
-      line.defaultQty == null || line.defaultQty === '' ? null : Number(line.defaultQty),
+      defaultQtyNum,
       line.perInstanceQty ? 1 : 0,
       line.codeSegment ?? null,
       line.helpText ?? null,
       line.sortOrder ?? 0,
       // Null is a real answer, not "unset": a grouping level carries no flow.
       line.defaultFlowId == null || line.defaultFlowId === '' ? null : Number(line.defaultFlowId),
+      explodeVal,
+      codeJoinVal,
     ];
 
     let lineId = id ? Number(id) : null;
@@ -816,7 +1034,8 @@ export async function setBomLine(companyId, line, existingConn = null) {
       await conn.query(
         `UPDATE fab_item_bom
             SET parent_item_id=?, child_item_id=?, qty_num=?, qty_param=?, default_qty=?,
-                per_instance_qty=?, code_segment=?, help_text=?, sort_order=?, default_flow_id=?
+                per_instance_qty=?, code_segment=?, help_text=?, sort_order=?, default_flow_id=?,
+                explode=?, code_join=?
           WHERE id=? AND company_id=?`,
         [...cols.slice(1), id, companyId],
       );
@@ -824,8 +1043,9 @@ export async function setBomLine(companyId, line, existingConn = null) {
       const [ins] = await conn.query(
         `INSERT INTO fab_item_bom
            (company_id, parent_item_id, child_item_id, qty_num, qty_param, default_qty,
-            per_instance_qty, code_segment, help_text, sort_order, default_flow_id)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+            per_instance_qty, code_segment, help_text, sort_order, default_flow_id,
+            explode, code_join)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         cols,
       );
       lineId = ins.insertId;
@@ -849,36 +1069,11 @@ export async function setBomLine(companyId, line, existingConn = null) {
      * `uq_ffv_target` counts deleted rows and a later re-entry must not collide.
      */
     if (line.defaults && typeof line.defaults === 'object' && lineId) {
-      const keys = Object.keys(line.defaults);
-      if (keys.length) {
-        const [fields] = await conn.query(
-          `SELECT id, field_key, default_unit FROM fab_fields
-            WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
-          [companyId, keys],
-        );
-        for (const f of fields) {
-          const raw = line.defaults[f.field_key];
-          const blank = raw === '' || raw === null || raw === undefined;
-          if (blank) {
-            await conn.query(
-              `UPDATE fab_field_values SET deleted_at = NOW()
-                WHERE company_id = ? AND field_id = ? AND scope = 'bom_line' AND scope_id = ?
-                  AND deleted_at IS NULL`,
-              [companyId, f.id, lineId],
-            );
-            continue;
-          }
-          const num = Number(raw);
-          await conn.query(
-            `INSERT INTO fab_field_values
-               (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
-             VALUES (?,?,'bom_line',?,?,?,NOW())
-             ON DUPLICATE KEY UPDATE value_num = VALUES(value_num),
-                                     unit_code = VALUES(unit_code), deleted_at = NULL`,
-            [companyId, f.id, lineId, Number.isFinite(num) ? num : null, f.default_unit ?? null],
-          );
-        }
-      }
+      const rows = Object.entries(line.defaults).map(([key, raw]) => ({
+        scopeId: lineId, key,
+        value: (raw === '' || raw === null || raw === undefined) ? null : raw,
+      }));
+      if (rows.length) await setFieldsBulk(companyId, 'bom_line', rows, conn);
     }
 
     if (owned) await conn.commit();
@@ -950,14 +1145,12 @@ export async function instantiate(companyId, spec, existingConn = null) {
      * Scoped to the LINE, not the order. An order with three lines is three
      * structures, and rebuilding one must not take the others with it.
      */
-    const lineScope = orderLineId == null
-      ? { sql: 'AND order_line_id IS NULL', args: [] }
-      : { sql: 'AND order_line_id = ?', args: [orderLineId] };
+    const lineScope = lineScopeSql('', orderLineId);
 
     const [[already]] = await conn.query(
       `SELECT COUNT(*) AS n FROM fab_items
         WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
-      [companyId, orderId, ...lineScope.args],
+      [companyId, orderId, ...lineScope.params],
     );
 
     if (already.n > 0) {
@@ -976,30 +1169,13 @@ export async function instantiate(companyId, spec, existingConn = null) {
        * Replacing throws away the item tree, so it may not throw away history.
        * The same rule the BOQ import already applies, at line granularity.
        */
-      const [[worked]] = await conn.query(
-        `SELECT COUNT(*) AS n FROM fab_project_tasks t
-           JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id
-          WHERE t.company_id = ? AND t.order_id = ? ${lineScope.sql.replace('order_line_id', 'i.order_line_id')}
-            AND i.deleted_at IS NULL AND t.deleted_at IS NULL
-            AND (t.started_at IS NOT NULL OR t.status IN ('in_progress','paused','done'))`,
-        [companyId, orderId, ...lineScope.args],
-      );
-      if (worked.n > 0) {
-        const e = new Error(
-          `Replace refused: ${worked.n} task(s) on this line have already been started or finished. `
-          + 'Rebuilding the structure would throw that shop-floor history away.',
-        );
-        e.status = 409;
-        e.code = 'WORK_STARTED';
-        throw e;
-      }
-
       const [ids] = await conn.query(
         `SELECT id FROM fab_items
           WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
-        [companyId, orderId, ...lineScope.args],
+        [companyId, orderId, ...lineScope.params],
       );
       const itemIds = ids.map((r) => r.id);
+      await assertNoStartedWork(conn, companyId, itemIds);
       if (itemIds.length) {
         await conn.query(
           `UPDATE fab_task_inputs SET deleted_at = NOW()
@@ -1142,15 +1318,14 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     if (!tree || !tree.catalogItemId) {
       const e = new Error('No structure was sent.'); e.status = 400; throw e;
     }
+    requireAllQty(tree);
 
-    const lineScope = orderLineId == null
-      ? { sql: 'AND order_line_id IS NULL', args: [] }
-      : { sql: 'AND order_line_id = ?', args: [orderLineId] };
+    const lineScope = lineScopeSql('', orderLineId);
 
     const [[already]] = await conn.query(
       `SELECT COUNT(*) AS n FROM fab_items
         WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
-      [companyId, orderId, ...lineScope.args]);
+      [companyId, orderId, ...lineScope.params]);
     if (already.n > 0) {
       if (!replace) {
         const e = new Error(
@@ -1158,23 +1333,11 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
           + 'of everything — replace what is there, or pick a different line.');
         e.status = 409; e.code = 'ALREADY_BUILT'; e.existing = already.n; throw e;
       }
-      const [[worked]] = await conn.query(
-        `SELECT COUNT(*) AS n FROM fab_project_tasks t
-           JOIN fab_items i ON i.id = t.item_id AND i.company_id = t.company_id
-          WHERE t.company_id = ? AND t.order_id = ? ${lineScope.sql.replace('order_line_id', 'i.order_line_id')}
-            AND i.deleted_at IS NULL AND t.deleted_at IS NULL
-            AND (t.started_at IS NOT NULL OR t.status IN ('in_progress','paused','done'))`,
-        [companyId, orderId, ...lineScope.args]);
-      if (worked.n > 0) {
-        const e = new Error(
-          `Replace refused: ${worked.n} task(s) on this line have been started or finished. `
-          + 'Rebuilding would throw that shop-floor history away.');
-        e.status = 409; e.code = 'WORK_STARTED'; throw e;
-      }
       const [ids] = await conn.query(
         `SELECT id FROM fab_items WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND deleted_at IS NULL`,
-        [companyId, orderId, ...lineScope.args]);
+        [companyId, orderId, ...lineScope.params]);
       const itemIds = ids.map((r) => r.id);
+      await assertNoStartedWork(conn, companyId, itemIds);
       if (itemIds.length) {
         await conn.query(
           `UPDATE fab_project_tasks SET deleted_at = NOW()
@@ -1185,10 +1348,6 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
       }
     }
 
-    const [kinds] = await conn.query(
-      `SELECT id, unit, procurement_type FROM fab_item_catalog
-        WHERE company_id = ? AND deleted_at IS NULL`, [companyId]);
-    const unitOf = new Map(kinds.map((k) => [Number(k.id), k.unit]));
     /*
      * MAKE OR BUY COMES FROM THE CATALOG, not from a constant.
      *
@@ -1200,7 +1359,7 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * The catalog answers for anything bound to it; a row bound to nothing is
      * made here, which is the same rule the importer used.
      */
-    const procurementOf = new Map(kinds.map((k) => [Number(k.id), k.procurement_type]));
+    const { unitOf, procurementOf } = await catalogKindsFor(conn, companyId, catalogIdsOf(tree));
 
     let created = 0;
     let seeded = 0;
@@ -1210,11 +1369,6 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     /** (item id, field key, value) for sizes stated on the tree that was sent. */
     const nodeDims = [];
 
-    /**
-     * Depth-first, parents before children, one row at a time — a child needs
-     * its parent's id, and counting up from a bulk insert's insertId is the
-     * trap ARCHITECTURE warns about.
-     */
     /**
      * NO CODE IS WRITTEN HERE, deliberately.
      *
@@ -1233,48 +1387,89 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * `codeSegment` and `codeJoin` still ride along on the tree. They are the
      * BOM's own abbreviations and the code pass will want them — they are data
      * being carried, not a decision being made here.
+     *
+     * ONE INSERT PER DEPTH LEVEL, not one per row (§13 "Resolution and
+     * materialization are batched"). A child needs its parent's real id before
+     * it can be written, so the tree is walked breadth-first: every node at
+     * depth 0 is inserted, their real ids read back, then every node at depth 1
+     * (now knowing its real `parentItemId`), and so on. The read-back is keyed
+     * on `(parentItemId, sortOrder)` — NEVER on `insertId + offset`, because
+     * TiDB allocates a batch insert's ids in per-node caches and a multi-row
+     * INSERT is not guaranteed contiguous (§13 "Never count upward from a
+     * multi-row INSERT's insertId"). `sortOrder` is assigned as each node's
+     * index among its own siblings, so the pair is unique within one parent —
+     * asserted below before the insert runs, not discovered after.
      */
-    const write = async (node, parentItemId, depth, position = 0) => {
-      const kids = Array.isArray(node.children) ? node.children : [];
-      const [r] = await conn.query(
+    let currentLevel = [{ node: tree, parentItemId: null, position: 0 }];
+    let depth = 0;
+    let rootId = null;
+    while (currentLevel.length) {
+      const seenKeys = new Set();
+      for (const { parentItemId, position } of currentLevel) {
+        const key = `${parentItemId}:${position}`;
+        if (seenKeys.has(key)) {
+          throw new Error(`Two rows at depth ${depth} share the same (parent, position) — cannot read them back apart.`);
+        }
+        seenKeys.add(key);
+      }
+
+      const rows = currentLevel.map(({ node, parentItemId, position }) => {
+        const kids = Array.isArray(node.children) ? node.children : [];
+        return [
+          companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+          node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
+          Number(node.qty),
+          depth, kids.length ? 0 : 1,
+          procurementOf.get(Number(node.catalogItemId)) ?? 'make',
+          node.defaultFlowId ?? null,
+          position,
+        ];
+      });
+      await conn.query(
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
             flow_id, sort_order)
-         VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)`,
-        [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
-          node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
-          requireQty(node),
-          depth, kids.length ? 0 : 1,
-          procurementOf.get(Number(node.catalogItemId)) ?? 'make',
-          node.defaultFlowId ?? null,
-          /*
-           * WHERE IT SITS AMONG ITS SIBLINGS, kept because the sequence is about
-           * to mean something: a production code is derived from position, so
-           * "the second segment" has to still be the second segment after a
-           * rebuild. Reading back in id order was insertion order, which is the
-           * same thing right up until somebody rearranges the tree.
-           */
-          position]);
-      created++;
-      byDepth[depth] = (byDepth[depth] ?? 0) + 1;
-      if (node.bomLineId) fromBomLine.push([Number(node.bomLineId), r.insertId]);
-      /*
-       * Sizes carried on the node itself — how the spreadsheet import gets its
-       * dimensions in. They beat a BOM-line default because they are what this
-       * order was told, and the recipe is only a starting point.
-       */
-      if (node.dims && typeof node.dims === 'object') {
-        for (const [k, v] of Object.entries(node.dims)) {
-          if (Number.isFinite(Number(v))) nodeDims.push([r.insertId, k, Number(v)]);
+         VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)").join(',')}`,
+        rows.flat(),
+      );
+
+      const [inserted] = await conn.query(
+        `SELECT id, parent_item_id AS parentItemId, sort_order AS sortOrder
+           FROM fab_items
+          WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND depth = ?
+            AND node_kind = 'structure' AND deleted_at IS NULL`,
+        [companyId, orderId, ...lineScope.params, depth],
+      );
+      const idByKey = new Map(inserted.map((r) => [`${r.parentItemId}:${r.sortOrder}`, Number(r.id)]));
+
+      created += currentLevel.length;
+      byDepth[depth] = (byDepth[depth] ?? 0) + currentLevel.length;
+
+      const nextLevel = [];
+      for (const { node, parentItemId, position } of currentLevel) {
+        const id = idByKey.get(`${parentItemId}:${position}`);
+        if (id == null) {
+          throw new Error(`A row written at depth ${depth} did not read back — natural key (${parentItemId}, ${position}) not found.`);
         }
+        if (depth === 0) rootId = id;
+        if (node.bomLineId) fromBomLine.push([Number(node.bomLineId), id]);
+        /*
+         * Sizes carried on the node itself — how the spreadsheet import gets its
+         * dimensions in. They beat a BOM-line default because they are what this
+         * order was told, and the recipe is only a starting point.
+         */
+        if (node.dims && typeof node.dims === 'object') {
+          for (const [k, v] of Object.entries(node.dims)) {
+            if (Number.isFinite(Number(v))) nodeDims.push([id, k, Number(v)]);
+          }
+        }
+        const kids = Array.isArray(node.children) ? node.children : [];
+        kids.forEach((child, i) => nextLevel.push({ node: child, parentItemId: id, position: i }));
       }
-
-      for (let i = 0; i < kids.length; i += 1) await write(kids[i], r.insertId, depth + 1, i);
-      return r.insertId;
-    };
-
-    const rootId = await write(tree, null, 0);
+      currentLevel = nextLevel;
+      depth += 1;
+    }
 
     /**
      * DEFAULTS COME DOWN FROM THE BOM LINE, the same way the flow does.
@@ -1294,9 +1489,11 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     if (fromBomLine.length) {
       const lineIds = [...new Set(fromBomLine.map(([lineId]) => lineId))];
       const [defaults] = await conn.query(
-        `SELECT scope_id AS lineId, field_id AS fieldId, value_num, value_text, value_date, unit_code
-           FROM fab_field_values
-          WHERE company_id = ? AND scope = 'bom_line' AND scope_id IN (?) AND deleted_at IS NULL`,
+        `SELECT v.scope_id AS lineId, f.field_key AS fieldKey,
+                v.value_num, v.value_text, v.value_date, v.unit_code
+           FROM fab_field_values v
+           JOIN fab_fields f ON f.id = v.field_id
+          WHERE v.company_id = ? AND v.scope = 'bom_line' AND v.scope_id IN (?) AND v.deleted_at IS NULL`,
         [companyId, lineIds],
       );
       if (defaults.length) {
@@ -1305,25 +1502,17 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
         const rows = [];
         for (const [lineId, itemId] of fromBomLine) {
           for (const d of byLine.get(lineId) ?? []) {
-            rows.push([companyId, d.fieldId, 'order_item', itemId,
-              d.value_num, d.value_text, d.value_date, d.unit_code, new Date()]);
+            rows.push({
+              scopeId: itemId, key: d.fieldKey,
+              value: d.value_num ?? d.value_text ?? d.value_date,
+              unit: d.unit_code ?? undefined,
+            });
           }
         }
-        for (let i = 0; i < rows.length; i += 500) {
-          await conn.query(
-            `INSERT INTO fab_field_values
-               (company_id, field_id, scope, scope_id, value_num, value_text, value_date, unit_code, created_at)
-             VALUES ?`,
-            [rows.slice(i, i + 500)],
-          );
-        }
-        seeded = rows.length;
-        /*
-         * A recipe that stated a size has just given every row one, so the
-         * numbers computed from it are computed now rather than waiting for
-         * somebody to open Parameters and save something.
-         */
-        await recomputeDerived(companyId, [...new Set(fromBomLine.map(([, itemId]) => itemId))], conn);
+        const result = await setFieldsBulk(companyId, 'order_item', rows, conn);
+        seeded = result.written;
+        // Derived numbers (area, weight, ...) for every sized row are computed
+        // once below, by `afterStructureWrite` — no need to do it twice.
       }
     }
 
@@ -1342,26 +1531,13 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * what this order was told, and the recipe is only where it started.
      */
     if (nodeDims.length) {
-      const keys = [...new Set(nodeDims.map(([, k]) => k))];
-      const [fdefs] = await conn.query(
-        `SELECT id, field_key, default_unit FROM fab_fields
-          WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
-        [companyId, keys],
-      );
-      const fieldOf = new Map(fdefs.map((f) => [f.field_key, f]));
-      for (const [itemId, key, value] of nodeDims) {
-        const f = fieldOf.get(key);
-        if (!f) continue;
-        await conn.query(
-          `INSERT INTO fab_field_values
-             (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
-           VALUES (?,?,'order_item',?,?,?,NOW())
-           ON DUPLICATE KEY UPDATE value_num = VALUES(value_num), deleted_at = NULL`,
-          [companyId, f.id, itemId, value, f.default_unit ?? null],
-        );
-      }
-      await recomputeDerived(companyId, [...new Set(nodeDims.map(([id]) => id))], conn);
+      const rows = nodeDims.map(([itemId, key, value]) => ({ scopeId: itemId, key, value }));
+      await setFieldsBulk(companyId, 'order_item', rows, conn);
     }
+
+    // Shape, weight, procurement and derived fields, all for this write, all on
+    // this connection — see itemShapeService.afterStructureWrite.
+    await afterStructureWrite(conn, companyId, orderId);
 
     if (owned) await conn.commit();
     return { created, seeded, sized: nodeDims.length, rootItemId: rootId, byDepth };
@@ -1468,20 +1644,21 @@ export async function duplicateSubtree(companyId, orderId, itemId, existingConn 
     const oldIds = [...idMap.keys()];
     if (oldIds.length) {
       const [vals] = await conn.query(
-        `SELECT field_id, scope_id, value_num, value_text, value_date, unit_code
-           FROM fab_field_values
-          WHERE company_id = ? AND scope = 'order_item' AND scope_id IN (?)
-            AND deleted_at IS NULL`,
+        `SELECT f.field_key AS fieldKey, v.scope_id AS scopeId,
+                v.value_num, v.value_text, v.value_date, v.unit_code
+           FROM fab_field_values v
+           JOIN fab_fields f ON f.id = v.field_id
+          WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
+            AND v.deleted_at IS NULL`,
         [companyId, oldIds],
       );
       if (vals.length) {
-        await conn.query(
-          `INSERT INTO fab_field_values
-             (company_id, field_id, scope, scope_id, value_num, value_text, value_date, unit_code, created_at)
-           VALUES ?`,
-          [vals.map((v) => [companyId, v.field_id, 'order_item', idMap.get(Number(v.scope_id)),
-            v.value_num, v.value_text, v.value_date, v.unit_code, new Date()])],
-        );
+        const rows = vals.map((v) => ({
+          scopeId: idMap.get(Number(v.scopeId)), key: v.fieldKey,
+          value: v.value_num ?? v.value_text ?? v.value_date,
+          unit: v.unit_code ?? undefined,
+        }));
+        await setFieldsBulk(companyId, 'order_item', rows, conn);
       }
     }
 
@@ -1513,7 +1690,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
   const lineScope = orderLineId == null ? '' : 'AND order_line_id = ?';
   const [rows] = await exec.query(
     `SELECT id, parent_item_id AS parentItemId, catalog_item_id AS catalogItemId,
-            name, unit, qty, flow_id AS flowId
+            name, unit, qty, flow_id AS flowId,
+            COALESCE(procurement_type, 'make') AS procurementType
        FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
         AND NOT node_kind = 'material' ${lineScope}
@@ -1537,6 +1715,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     name: r.name,
     unit: r.unit ?? 'nos',
     qty: Number(r.qty),
+    // Made or bought, so the editor knows which rows have a rectangle to size.
+    procurementType: r.procurementType ?? 'make',
     codeSegment: null,
     codeJoin: 'dash',
     defaultFlowId: r.flowId == null ? null : Number(r.flowId),
@@ -1594,13 +1774,40 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
  * allowed, including deleting a row with tasks that have not begun — those are
  * a plan, not history.
  */
-export async function applyTree(companyId, spec, existingConn = null) {
+export async function applyTree(companyId, spec, existingConn = null, opts = {}) {
   const conn = existingConn ?? await pool.getConnection();
   const owned = !existingConn;
+  const { revisionReason = null, userId = null } = opts;
   try {
     if (owned) await conn.beginTransaction();
     const { orderId, orderLineId = null, tree } = spec;
     if (!tree) { const e = new Error('No structure was sent.'); e.status = 400; throw e; }
+    requireAllQty(tree);
+
+    /*
+     * A DRAFT'S EDITS ARE THE WIZARD, NOT REVISIONS (§13 "A draft sales order
+     * means 'still in the wizard'") — no reason, no row, no matter what
+     * changed. Locking the order row here, before any fab_items write, is
+     * what makes `recordRevision`'s `MAX(rev)+1` below safe against two
+     * revisions on the same order landing at once (User Clarifications 6:
+     * one `rev` sequence per ORDER).
+     */
+    const [[orderRow]] = await conn.query(
+      `SELECT id, status FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1 FOR UPDATE`,
+      [orderId, companyId],
+    );
+    if (!orderRow) { const e = new Error('Order not found'); e.status = 404; e.code = 'ORDER_NOT_FOUND'; throw e; }
+    const isDraft = orderRow.status === 'draft';
+    if (!isDraft && (!revisionReason || String(revisionReason).trim().length < 10)) {
+      const e = new Error('This order is confirmed. Applying a structure change needs a revision reason of at least 10 characters.');
+      e.status = 400;
+      e.code = 'REVISION_REASON_REQUIRED';
+      throw e;
+    }
+    // Pre-apply snapshot, only when it will actually be used — `currentTree` is
+    // a real query, not worth paying for on the draft path that runs on every
+    // wizard keystroke.
+    const revisionSnapshot = isDraft ? null : await currentTree(companyId, orderId, orderLineId, conn);
 
     const lineScope = orderLineId == null
       ? { sql: '', args: [] }
@@ -1623,14 +1830,62 @@ export async function applyTree(companyId, spec, existingConn = null) {
       [companyId, orderId, ...lineScope.args],
     );
     const byId = new Map(existing.map((r) => [Number(r.id), r]));
+    const existingIds = existing.map((r) => Number(r.id));
 
-    const [kinds] = await conn.query(
-      `SELECT id, unit, procurement_type FROM fab_item_catalog
-        WHERE company_id = ? AND deleted_at IS NULL`,
-      [companyId],
-    );
-    const unitOf = new Map(kinds.map((k) => [Number(k.id), k.unit]));
-    const procurementOf = new Map(kinds.map((k) => [Number(k.id), k.procurement_type]));
+    const { unitOf, procurementOf } = await catalogKindsFor(conn, companyId, catalogIdsOf(tree));
+
+    /*
+     * Sizes and shop-floor history for the rows already on this line, fetched
+     * once so the started-row guard below and the per-row diff during the
+     * write can both ask "did this actually change" without a query each.
+     */
+    let existingDimsByItem = new Map();
+    let startedIds = new Set();
+    if (existingIds.length) {
+      const [vals] = await conn.query(
+        `SELECT v.scope_id AS itemId, f.field_key AS k, v.value_num AS n
+           FROM fab_field_values v
+           JOIN fab_fields f ON f.id = v.field_id
+          WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
+            AND v.deleted_at IS NULL
+            AND f.field_key IN ('thickness_mm','width_mm','length_mm')`,
+        [companyId, existingIds],
+      );
+      for (const v of vals) {
+        const e = existingDimsByItem.get(Number(v.itemId)) ?? {};
+        e[v.k] = v.n == null ? null : Number(v.n);
+        existingDimsByItem.set(Number(v.itemId), e);
+      }
+      const [started] = await conn.query(
+        `SELECT DISTINCT item_id AS itemId FROM fab_project_tasks
+          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL
+            AND (started_at IS NOT NULL OR status IN ('in_progress','paused','done'))`,
+        [companyId, existingIds],
+      );
+      startedIds = new Set(started.map((r) => Number(r.itemId)));
+    }
+
+    /*
+     * THE STARTED-ROW GUARD, widened. `assertNoStartedWork` below still
+     * refuses unconditionally to DELETE a started row. This is the other half
+     * `applyTree` used to leave open: a qty or dimension edit on a row that
+     * already has shop-floor history was accepted silently. Checked before any
+     * write happens, same discipline as the delete guard, and only bypassed
+     * when the caller names a reason — recording that reason is EU-12's job.
+     */
+    const changedStartedIds = [...new Set(collectStartedRowChanges(tree, null, 0, 0, {
+      byId, unitOf, existingDimsByItem, startedIds,
+    }))];
+    if (changedStartedIds.length && !revisionReason) {
+      const e = new Error(
+        `Refused: ${changedStartedIds.length} row(s) with shop-floor history had their quantity, `
+        + 'size, position or flow changed. This needs a revision reason.',
+      );
+      e.status = 409;
+      e.code = 'STARTED_ROW_CHANGED';
+      e.detail = { startedItemIds: changedStartedIds };
+      throw e;
+    }
 
     const seen = new Set();
     let created = 0;
@@ -1638,126 +1893,137 @@ export async function applyTree(companyId, spec, existingConn = null) {
     /** (item id, field key, value|null) for every size the tree carried. */
     const dimEdits = [];
 
-    const walk = async (node, parentItemId, depth, position = 0) => {
-      const kids = Array.isArray(node.children) ? node.children : [];
-      const isLeaf = kids.length ? 0 : 1;
-      const qty = requireQty(node);
-      const unit = node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos';
-
-      let id = node.itemId && byId.has(Number(node.itemId)) ? Number(node.itemId) : null;
-      if (id) {
-        const was = byId.get(id);
-        const same = was.name === node.name
-          && (was.unit ?? '') === (unit ?? '')
-          && Number(was.qty) === qty
-          && Number(was.parentItemId ?? 0) === Number(parentItemId ?? 0)
-          && Number(was.depth) === depth
-          && Number(was.isLeaf) === isLeaf
-          // Moving a row among its siblings is a change like any other.
-          && Number(was.sortOrder ?? -1) === position
-          /*
-           * AND THE FLOW, which this branch used to ignore entirely.
-           *
-           * The insert carried `flow_id` and the update did not, so a flow set
-           * on a row that already existed was accepted by the screen and thrown
-           * away by the save — the worst shape a bug can have. It did not matter
-           * while flows were chosen on a step of their own; it matters now that
-           * they are chosen here.
-           */
-          && Number(was.flowId ?? 0) === Number(node.defaultFlowId ?? 0);
-        if (!same) {
-          await conn.query(
-            `UPDATE fab_items
-                SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?,
-                    is_leaf = ?, sort_order = ?, flow_id = ?
-              WHERE id = ? AND company_id = ?`,
-            [node.name, unit, qty, parentItemId, depth, isLeaf, position,
-              node.defaultFlowId ?? null, id, companyId],
-          );
-          updated += 1;
+    /*
+     * BATCHED PER DEPTH, like `buildFromTree` — see its header comment for why
+     * (§13 "Resolution and materialization are batched"; "Never count upward
+     * from a multi-row INSERT's insertId"). An EXISTING row already knows its
+     * own id from the tree it was read back with (`currentTree`), so only
+     * BRAND NEW rows need the insert-then-read-back dance; the read-back's
+     * `id NOT IN (existingIds)` filter is what keeps it from also matching a
+     * same-depth sibling that this save is about to remove (still live at this
+     * point — deletion happens after the whole tree is walked) or one that
+     * kept its old id and simply moved to the same (parent, position) another
+     * row vacated.
+     */
+    let currentLevel = [{ node: tree, parentItemId: null, position: 0 }];
+    let depth = 0;
+    while (currentLevel.length) {
+      const seenKeys = new Set();
+      for (const { parentItemId, position } of currentLevel) {
+        const key = `${parentItemId}:${position}`;
+        if (seenKeys.has(key)) {
+          throw new Error(`Two rows at depth ${depth} share the same (parent, position) — cannot tell them apart.`);
         }
-        seen.add(id);
-      } else {
-        const [r] = await conn.query(
+        seenKeys.add(key);
+      }
+
+      const toInsert = [];
+      const resolved = [];
+
+      for (const entry of currentLevel) {
+        const { node, parentItemId, position } = entry;
+        const kids = Array.isArray(node.children) ? node.children : [];
+        const isLeaf = kids.length ? 0 : 1;
+        const qty = Number(node.qty);
+        const unit = node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos';
+
+        const id = node.itemId && byId.has(Number(node.itemId)) ? Number(node.itemId) : null;
+        if (id) {
+          const was = byId.get(id);
+          if (!rowUnchanged(was, node, parentItemId, depth, isLeaf, position, unit)) {
+            await conn.query(
+              `UPDATE fab_items
+                  SET name = ?, unit = ?, qty = ?, parent_item_id = ?, depth = ?,
+                      is_leaf = ?, sort_order = ?, flow_id = ?
+                WHERE id = ? AND company_id = ?`,
+              [node.name, unit, qty, parentItemId, depth, isLeaf, position,
+                node.defaultFlowId ?? null, id, companyId],
+            );
+            updated += 1;
+          }
+          seen.add(id);
+          resolved.push({ node, id });
+        } else {
+          toInsert.push(entry);
+        }
+      }
+
+      if (toInsert.length) {
+        const rows = toInsert.map(({ node, parentItemId, position }) => {
+          const kids = Array.isArray(node.children) ? node.children : [];
+          return [
+            companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+            node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos', Number(node.qty),
+            depth, kids.length ? 0 : 1,
+            procurementOf.get(Number(node.catalogItemId)) ?? 'make',
+            node.defaultFlowId ?? null, position,
+          ];
+        });
+        await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
               name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
               flow_id, sort_order)
-           VALUES (?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)`,
-          [companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
-            node.name, unit, qty, depth, isLeaf,
-            procurementOf.get(Number(node.catalogItemId)) ?? 'make',
-            node.defaultFlowId ?? null, position],
+           VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)").join(',')}`,
+          rows.flat(),
         );
-        id = r.insertId;
-        created += 1;
-      }
 
-      /*
-       * Sizes come back with the tree, because the editor now shows them on the
-       * row they belong to. A key present and blank CLEARS: "this part no longer
-       * states a length" has to be sayable, or a wrong number could never be
-       * withdrawn from the row it was typed on.
-       */
-      if (node.dims && typeof node.dims === 'object') {
-        for (const [k, v] of Object.entries(node.dims)) {
-          dimEdits.push([id, k, v === '' || v == null ? null : Number(v)]);
+        const excludeSql = existingIds.length ? 'AND id NOT IN (?)' : '';
+        const excludeParams = existingIds.length ? [existingIds] : [];
+        const [inserted] = await conn.query(
+          `SELECT id, parent_item_id AS parentItemId, sort_order AS sortOrder
+             FROM fab_items
+            WHERE company_id = ? AND order_id = ? ${lineScope.sql} AND depth = ?
+              AND node_kind = 'structure' AND deleted_at IS NULL
+              ${excludeSql}`,
+          [companyId, orderId, ...lineScope.args, depth, ...excludeParams],
+        );
+        const idByKey = new Map(inserted.map((r) => [`${r.parentItemId}:${r.sortOrder}`, Number(r.id)]));
+
+        for (const { node, parentItemId, position } of toInsert) {
+          const id = idByKey.get(`${parentItemId}:${position}`);
+          if (id == null) {
+            throw new Error(`A row written at depth ${depth} did not read back — natural key (${parentItemId}, ${position}) not found.`);
+          }
+          created += 1;
+          seen.add(id);
+          resolved.push({ node, id });
         }
       }
 
-      for (let i = 0; i < kids.length; i += 1) await walk(kids[i], id, depth + 1, i);
-      return id;
-    };
-
-    await walk(tree, null, 0);
+      const nextLevel = [];
+      for (const { node, id } of resolved) {
+        /*
+         * Sizes come back with the tree, because the editor now shows them on
+         * the row they belong to. A key present and blank CLEARS: "this part
+         * no longer states a length" has to be sayable, or a wrong number
+         * could never be withdrawn from the row it was typed on.
+         */
+        if (node.dims && typeof node.dims === 'object') {
+          for (const [k, v] of Object.entries(node.dims)) {
+            dimEdits.push([id, k, v === '' || v == null ? null : Number(v)]);
+          }
+        }
+        const kids = Array.isArray(node.children) ? node.children : [];
+        kids.forEach((child, i) => nextLevel.push({ node: child, parentItemId: id, position: i }));
+      }
+      currentLevel = nextLevel;
+      depth += 1;
+    }
 
     if (dimEdits.length) {
-      const keys = [...new Set(dimEdits.map(([, k]) => k))];
-      const [fdefs] = await conn.query(
-        `SELECT id, field_key, default_unit FROM fab_fields
-          WHERE company_id = ? AND deleted_at IS NULL AND field_key IN (?)`,
-        [companyId, keys],
-      );
-      const fieldOf = new Map(fdefs.map((f) => [f.field_key, f]));
-      for (const [itemId, key, value] of dimEdits) {
-        const f = fieldOf.get(key);
-        if (!f) continue;
-        if (value == null || !Number.isFinite(value)) {
-          await conn.query(
-            `UPDATE fab_field_values SET deleted_at = NOW()
-              WHERE company_id = ? AND field_id = ? AND scope = 'order_item' AND scope_id = ?
-                AND deleted_at IS NULL`,
-            [companyId, f.id, itemId],
-          );
-          continue;
-        }
-        await conn.query(
-          `INSERT INTO fab_field_values
-             (company_id, field_id, scope, scope_id, value_num, unit_code, created_at)
-           VALUES (?,?,'order_item',?,?,?,NOW())
-           ON DUPLICATE KEY UPDATE value_num = VALUES(value_num), deleted_at = NULL`,
-          [companyId, f.id, itemId, value, f.default_unit ?? null],
-        );
-      }
-      // Weight and area are arithmetic on what just changed.
-      await recomputeDerived(companyId, [...new Set(dimEdits.map(([id]) => id))], conn);
+      const rows = dimEdits.map(([itemId, key, value]) => ({
+        scopeId: itemId, key,
+        value: (value == null || !Number.isFinite(value)) ? null : value,
+      }));
+      await setFieldsBulk(companyId, 'order_item', rows, conn);
+      // Weight and area for what just changed are computed once below, by
+      // `afterStructureWrite`.
     }
 
     const gone = existing.map((r) => Number(r.id)).filter((id) => !seen.has(id));
     if (gone.length) {
-      const [[worked]] = await conn.query(
-        `SELECT COUNT(*) AS n FROM fab_project_tasks
-          WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL
-            AND (started_at IS NOT NULL OR status IN ('in_progress','paused','done'))`,
-        [companyId, gone],
-      );
-      if (worked.n > 0) {
-        const e = new Error(
-          `Refused: ${worked.n} task(s) on the row(s) you removed have been started or finished. `
-          + 'Removing them would throw that shop-floor history away.',
-        );
-        e.status = 409; e.code = 'WORK_STARTED'; throw e;
-      }
+      await assertNoStartedWork(conn, companyId, gone);
       await conn.query(
         `UPDATE fab_project_tasks SET deleted_at = NOW()
           WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`,
@@ -1777,8 +2043,22 @@ export async function applyTree(companyId, spec, existingConn = null) {
       );
     }
 
+    // Shape, weight, procurement and derived fields, all for this write, all on
+    // this connection — see itemShapeService.afterStructureWrite.
+    await afterStructureWrite(conn, companyId, orderId);
+
+    const summary = { created, updated, removed: gone.length, sized: dimEdits.length };
+    // The revision row is written in the SAME transaction as the structure
+    // change it describes — atomic with it, so a rollback undoes both and a
+    // commit never leaves a change on a non-draft order with no paper trail.
+    if (!isDraft) {
+      await recordRevision(conn, companyId, orderId, {
+        orderLineId, reason: revisionReason, snapshot: revisionSnapshot, summary, userId,
+      });
+    }
+
     if (owned) await conn.commit();
-    return { created, updated, removed: gone.length, sized: dimEdits.length };
+    return summary;
   } catch (err) {
     if (owned) await conn.rollback();
     throw err;

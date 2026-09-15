@@ -41,6 +41,7 @@
 
 import { pool } from '../../../db.js';
 import { previewCode, defaultSegmentsFor, orderCodePrefix } from './codegenService.js';
+import { lineQtyMap } from './orderLineQty.js';
 
 /**
  * The finishing marker, e.g. `/D` for drilled.
@@ -259,36 +260,47 @@ export async function consolidateParts(companyId, orderId, { apply = false, conn
  *
  * Returns the parts and how many of each, plus what each part is cut from, so
  * the tree can show a real answer in the place the children used to be.
+ *
+ * EU-5 follow-up: `d.qty` and `p.qty` are both STRUCTURAL — the count before a
+ * line's own qty multiplies it (`orderLineQty.js`'s rule) — because a
+ * consolidated part's kept row lives under exactly ONE order line (the
+ * survivor's own, per `consolidateParts`). Multiplied here, once, at the
+ * outermost read, the same place every other roll-up does it.
  */
-export async function demandFor(companyId, assemblyItemIds, conn = null) {
+export async function demandFor(companyId, orderId, assemblyItemIds, conn = null) {
   const exec = conn ?? pool;
   const ids = [...new Set((assemblyItemIds ?? []).map(Number).filter(Number.isFinite))];
   if (!ids.length) return new Map();
-  const [rows] = await exec.query(
-    `SELECT d.assembly_item_id AS assemblyId, d.qty,
-            p.id AS partId, p.code AS partCode, p.name AS partName,
-            p.qty AS partTotalQty, p.length, p.width, p.height AS thickness,
-            (SELECT COUNT(*) FROM fab_items m
-              WHERE m.parent_item_id = p.id AND m.deleted_at IS NULL
-                AND m.node_kind = 'material' AND m.nest_no IS NOT NULL) AS plateCount
-       FROM fab_item_demand d
-       JOIN fab_items p ON p.id = d.part_item_id AND p.deleted_at IS NULL
-      WHERE d.company_id = ? AND d.assembly_item_id IN (?) AND d.deleted_at IS NULL
-      ORDER BY p.code`,
-    [companyId, ids],
-  );
+  const [rows, lineQty] = await Promise.all([
+    exec.query(
+      `SELECT d.assembly_item_id AS assemblyId, d.qty,
+              p.id AS partId, p.code AS partCode, p.name AS partName,
+              p.qty AS partTotalQty, p.order_line_id AS partOrderLineId,
+              p.length, p.width, p.height AS thickness,
+              (SELECT COUNT(*) FROM fab_items m
+                WHERE m.parent_item_id = p.id AND m.deleted_at IS NULL
+                  AND m.node_kind = 'material' AND m.nest_no IS NOT NULL) AS plateCount
+         FROM fab_item_demand d
+         JOIN fab_items p ON p.id = d.part_item_id AND p.deleted_at IS NULL
+        WHERE d.company_id = ? AND d.assembly_item_id IN (?) AND d.deleted_at IS NULL
+        ORDER BY p.code`,
+      [companyId, ids],
+    ).then(([r]) => r),
+    lineQtyMap(exec, companyId, orderId),
+  ]);
   const out = new Map();
   for (const r of rows) {
     const k = Number(r.assemblyId);
+    const factor = lineQty.get(r.partOrderLineId == null ? null : Number(r.partOrderLineId)) ?? 1;
     if (!out.has(k)) out.set(k, []);
     out.get(k).push({
       partId: Number(r.partId),
       code: r.partCode,
       name: r.partName,
-      /** How many THIS assembly needs. */
-      qty: Number(r.qty),
+      /** How many THIS assembly needs, across every job the line's qty asks for. */
+      qty: Number(r.qty) * factor,
       /** How many the whole order needs — the part is shared. */
-      totalQty: r.partTotalQty == null ? null : Number(r.partTotalQty),
+      totalQty: r.partTotalQty == null ? null : Number(r.partTotalQty) * factor,
       length: r.length == null ? null : Number(r.length),
       width: r.width == null ? null : Number(r.width),
       thickness: r.thickness == null ? null : Number(r.thickness),

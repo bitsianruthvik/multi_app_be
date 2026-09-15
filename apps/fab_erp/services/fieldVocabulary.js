@@ -31,26 +31,29 @@
  * with "01/02/2026" meaning two different days to two people.
  *
  * There is deliberately NO `picker` type: a picker is any type that has
- * `allowed_values` set. Making it a separate type would allow the contradiction
- * of a picker with no values, and a number-picker (sizes 6/8/10) would be
- * unexpressible.
+ * `allowed_values` set — `enum` names that shape explicitly for a definition
+ * that is ALWAYS a picker, never free text, so the editor can require the list
+ * up front instead of discovering after the fact that a "text" field is really
+ * a picker with no options. `integer` is `number` with no fractional part —
+ * a piece count or a batch size where "6.5" is a data error, not a value.
  */
 export const DATA_TYPES = [
-  { value: 'number', label: 'Number' },
-  { value: 'text',   label: 'Text' },
-  { value: 'date',   label: 'Date' },
-  { value: 'bool',   label: 'Yes / No' },
+  { value: 'number',  label: 'Number' },
+  { value: 'integer', label: 'Whole number' },
+  { value: 'text',    label: 'Text' },
+  { value: 'enum',    label: 'Picker (fixed list)' },
+  { value: 'date',    label: 'Date' },
+  { value: 'bool',    label: 'Yes / No' },
 ];
 
 /**
  * Units, grouped so a picker can show them sensibly.
  *
- * DECLARED, NOT CONVERTED. The engine does no unit conversion and this does not
- * add any: a unit is documentation on the definition and a label in the UI.
- * That limitation is real — define a length in metres against a formula that
- * assumes millimetres and the answer is plausible and wrong by 1000× — and it
- * is recorded as a known complexity rather than silently implied to be handled.
- * A conversion layer, if it ever lands, belongs here.
+ * CONVERTED. `fab_units.factor_to_base` gives every unit in a dimension a
+ * common base, and `fieldService.convert` uses it — a value authored in metres
+ * against a field declared in millimetres lands as 1000×, not verbatim. Two
+ * units convert only when they share a `baseCode`; across dimensions (or a
+ * compound rate, or money) `convert` refuses rather than guessing.
  */
 export const UNITS = [
   { group: 'Length',    values: ['mm', 'cm', 'm', 'inch', 'ft'] },
@@ -123,9 +126,10 @@ export function validateFieldValue(def, value) {
   }
 
   const type = def?.data_type ?? def?.dataType ?? 'number';
-  if (type === 'number') {
+  if (type === 'number' || type === 'integer') {
     const n = Number(raw);
     if (!Number.isFinite(n)) return { ok: false, reason: 'must be a number' };
+    if (type === 'integer' && !Number.isInteger(n)) return { ok: false, reason: 'must be a whole number' };
     return { ok: true, canonical: String(n) };
   }
   if (type === 'date') {
@@ -154,6 +158,31 @@ export function validateFieldValue(def, value) {
  * "MS Plate 20mm" is meaningless, because that item covers every length ever
  * bought.
  */
+/**
+ * The narrowest rung a value may be set on, phrased as the question people
+ * actually ask — not to be confused with `FIELD_LEVELS` below, which is the
+ * retired item|piece|both trio. Single definition, served by
+ * `GET /fields/vocabulary` as `appliesAt` so the editor stops hand-rolling its
+ * own copy of the same two options.
+ */
+/**
+ * Fields that describe ONE PIECE of the row they sit on and must never be
+ * inherited from an ancestor order item or from the order line.
+ *
+ * The ladder lets a part inherit from the segment above it, which is right for
+ * material or grade — and wrong for weight: the KEPL span carried its rolled-up
+ * 329 t as `unit_weight_kg`, and every row under it with no weight of its own
+ * (the 7,212 shear studs) resolved to 329 t apiece. Type-level rungs (catalog
+ * item and its taxonomy) still apply — a bought stud declares its weight on
+ * the catalog item, and that is exactly where a per-piece figure belongs.
+ */
+export const PER_PIECE_FIELDS = new Set(['unit_weight_kg', 'surface_area_m2']);
+
+export const APPLIES_AT = [
+  { value: 'order_item', label: 'Same for every piece', hint: 'thickness, grade, model' },
+  { value: 'stock_piece', label: 'Differs per piece', hint: 'length, heat number, serial' },
+];
+
 export const FIELD_LEVELS = [
   { value: 'item',  label: 'On the item',  hint: 'Same for every piece — thickness, grade, model' },
   { value: 'piece', label: 'On each piece', hint: 'Differs per piece — length, heat number, serial' },

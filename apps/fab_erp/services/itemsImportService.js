@@ -15,10 +15,10 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { generateCode } from './codegenService.js';
-import { fieldRegistry, setFields } from './fieldService.js';
+import { fieldRegistry, setFields, resolveFields } from './fieldService.js';
 import { mayHoldValue } from './fieldLadder.js';
+import { PROCUREMENT_TYPES, autoCode } from './itemGuards.js';
 
-const PROCUREMENT_TYPES = ['buy', 'make'];
 const CF_PREFIX = 'CF: ';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -36,14 +36,6 @@ function numVal(row, col) {
   if (v === null) return null;
   const n = Number(v);
   return isNaN(n) ? null : n;
-}
-
-function autoCode(name, maxLen = 20) {
-  const c = (name || '').trim().toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, maxLen);
-  return c || 'CODE';
 }
 
 /** Returns a code guaranteed not to be in codeSet, adding it to the set. */
@@ -79,6 +71,49 @@ function dropdownFromRange(ws, col, rangeRef, fromRow, toRow) {
   for (let r = fromRow; r <= toRow; r++) {
     ws.getCell(r, col).dataValidation = {
       type: 'list', allowBlank: true, showErrorMessage: false, formulae: [rangeRef],
+    };
+  }
+}
+
+/** 1 -> "A", 27 -> "AA". Excel column letters for a defined-name range string. */
+function colLetter(n) {
+  let s = '';
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
+/**
+ * A valid, unique Excel defined name for one taxonomy list. Only strips the
+ * characters the paired lookup formula (SUBSTITUTE of spaces, see
+ * dropdownIndirect) can remove itself — a name built from text with other
+ * punctuation won't round-trip through that formula, so its cascading
+ * dropdown falls back to the flat list instead of resolving to a name
+ * nothing points at. That is the intended degradation, not a bug: better a
+ * dropdown that shows every value than one that silently shows none.
+ */
+function definedNameFor(prefix, text, used) {
+  const base = `${prefix}${String(text).trim().replace(/[^A-Za-z0-9_]/g, '_')}`.slice(0, 200) || `${prefix}X`;
+  let name = base;
+  let n = 2;
+  while (used.has(name.toLowerCase())) { name = `${base}_${n}`; n += 1; }
+  used.add(name.toLowerCase());
+  return name;
+}
+
+/**
+ * A cascading dropdown: which values are legal depends on another cell in
+ * the SAME row (that row's own Category, for the Group column; its own
+ * Group, for the Sub-group column). `INDIRECT` resolves a defined name built
+ * from that cell's text; `IFERROR` falls back to the flat range whenever the
+ * text doesn't resolve to one — blank, mid-edit, or a name `definedNameFor`
+ * couldn't build cleanly.
+ */
+function dropdownIndirect(ws, col, refCol, prefix, fallbackRange, fromRow, toRow) {
+  const refLetter = colLetter(refCol);
+  for (let r = fromRow; r <= toRow; r++) {
+    const formula = `IFERROR(INDIRECT("${prefix}"&SUBSTITUTE($${refLetter}${r}," ","_")),${fallbackRange})`;
+    ws.getCell(r, col).dataValidation = {
+      type: 'list', allowBlank: true, showErrorMessage: false, formulae: [formula],
     };
   }
 }
@@ -137,17 +172,78 @@ export async function exportItemsTemplate(companyId) {
 
   styledHeader(ws, cols);
 
+  /*
+   * THE CURRENT CATALOG, so the export is something to review and re-import
+   * rather than a blank form every time. Re-importing it unmodified with
+   * `mode=upsert` is then a no-op; editing a cell and re-importing corrects
+   * that one item. `mode=append` (the default) still skips these rows, since
+   * their codes already exist — exporting them does not risk duplicating them.
+   * Queried before the example row below, which reuses this to name a
+   * taxonomy that actually exists.
+   */
+  const [catalogItems] = await pool.query(
+    `SELECT c.id, c.name, c.code, c.unit, c.description, c.hsn_code AS hsnCode,
+            c.lead_time_days AS leadTimeDays, COALESCE(c.procurement_type, 'buy') AS procurementType,
+            cat.name AS categoryName, g.name AS groupName, sg.name AS subgroupName
+       FROM fab_item_catalog c
+       LEFT JOIN fab_item_categories cat ON cat.id = c.category_id
+       LEFT JOIN fab_item_groups g ON g.id = c.group_id
+       LEFT JOIN fab_item_subgroups sg ON sg.id = c.subgroup_id
+      WHERE c.company_id = ? AND c.deleted_at IS NULL
+      ORDER BY c.code`,
+    [companyId],
+  );
+
+  /*
+   * The example row's taxonomy must name something that actually exists —
+   * a hand-typed guess here ("Raw Material" vs the real "Raw Materials")
+   * used to spawn a duplicate category plus a junk item the first time
+   * someone imported the template unmodified. Prefer the taxonomy of a real
+   * catalog item (so category/group/subgroup are a coherent, already-linked
+   * triple) and fall back to "Raw Materials" only when the catalog is empty.
+   * The code `EXAMPLE-ROW` is what `importItemsExcel` matches on to skip
+   * this row outright, so it is inert even if never deleted.
+   */
+  const itemWithCategory = catalogItems.find((it) => it.categoryName);
+  const exampleTaxonomy = itemWithCategory
+    ? [itemWithCategory.categoryName || '', itemWithCategory.groupName || '', itemWithCategory.subgroupName || '']
+    : [categories.some((c) => c.name === 'Raw Materials') ? 'Raw Materials' : '', '', ''];
+
   const exampleRow = [
-    'Structural Steel Bar 50x50', 'STRUCT-STEEL-50', 'kg',
-    'Raw Material', 'Structural Steel', '',
+    'Structural Steel Bar 50x50', 'EXAMPLE-ROW', 'kg',
+    ...exampleTaxonomy,
     'buy',
-    'Example row — delete before importing', '', 5,
+    'Example row — skipped automatically on import, delete or leave as-is', '', 5,
   ];
   for (let i = 0; i < cfKeys.length; i++) exampleRow.push('');
   ws.addRow(exampleRow);
   ws.getRow(2).font = { italic: true, color: { argb: 'FF999999' } };
 
-  dropdown(ws, 7, PROCUREMENT_TYPES, 2, 1000);
+  const cfValuesByItem = cfKeys.length && catalogItems.length
+    ? await resolveFields(companyId, catalogItems.map((c) => ({ scope: 'catalog_item', scopeId: c.id })))
+    : new Map();
+  for (const it of catalogItems) {
+    const row = [
+      it.name, it.code, it.unit, it.categoryName || '', it.groupName || '', it.subgroupName || '',
+      it.procurementType, it.description || '', it.hsnCode || '', it.leadTimeDays ?? '',
+    ];
+    const resolved = cfValuesByItem.get(`catalog_item:${it.id}`) ?? {};
+    for (const cf of cfKeys) {
+      const v = resolved[cf.fieldKey]?.value;
+      // `resolveFields` renders a bool field as a JS true/false — write it
+      // back as the canonical yes/no spelling the importer's own validator
+      // requires, or a re-import of this exact export rejects every boolean
+      // custom field it just wrote (a real gap this closed, not theoretical:
+      // exporting the current catalog and re-importing it unmodified is
+      // exactly the `mode=upsert` workflow this item exists for).
+      row.push(cf.dataType === 'bool' ? (v == null ? '' : (v ? 'yes' : 'no')) : (v ?? ''));
+    }
+    ws.addRow(row);
+  }
+
+  // Enough rows for every exported item plus room to add more by hand.
+  const lastDataRow = Math.max(1000, catalogItems.length + 20);
+  dropdown(ws, 7, PROCUREMENT_TYPES, 2, lastDataRow);
 
   // ── Hidden "Lists" sheet backing the Category / Group / Sub-group dropdowns
   //    on the Items sheet — a plain (non-cascading) list of every name that
@@ -165,13 +261,66 @@ export async function exportItemsTemplate(companyId) {
   uniqueSubgroupNames.forEach((n, i) => { wsLists.getCell(i + 2, 3).value = n; });
 
   if (categories.length > 0) {
-    dropdownFromRange(ws, 4, `Lists!$A$2:$A$${categories.length + 1}`, 2, 1000);
+    dropdownFromRange(ws, 4, `Lists!$A$2:$A$${categories.length + 1}`, 2, lastDataRow);
   }
+
+  /*
+   * CASCADING Group / Sub-group (item 2). The flat lists above let a person
+   * pick a sub-group that belongs to a completely different group — nothing
+   * on the sheet said no, and the import used to create a second, wrongly-
+   * parented entry with the same name rather than catch it. A named range
+   * per category (its groups) and per group (its sub-groups), addressed by
+   * INDIRECT off the row's own Category/Group cell, narrows what Excel even
+   * offers; `importItemsExcel`'s TAXONOMY_MISMATCH check is the backstop for
+   * anyone who types past the dropdown anyway.
+   *
+   * Sub-group lists are keyed by GROUP NAME, not group id: the Group column
+   * is free text, so two categories that both happen to have a group named
+   * "Fasteners" share one dropdown listing sub-groups from both — a real
+   * limitation of a name-only cascade, not something this sheet can resolve
+   * without a hidden id column a person would have to keep in sync by hand.
+   */
+  const definedNameSet = new Set();
+  const groupsByCategory = new Map();
+  for (const g of groups) {
+    if (!groupsByCategory.has(g.category_name)) groupsByCategory.set(g.category_name, []);
+    groupsByCategory.get(g.category_name).push(g.name);
+  }
+  const subgroupsByGroupName = new Map();
+  for (const s of subgroups) {
+    if (!subgroupsByGroupName.has(s.group_name)) subgroupsByGroupName.set(s.group_name, []);
+    subgroupsByGroupName.get(s.group_name).push(s.name);
+  }
+
+  let nextListCol = 3; // columns A/B/C already hold the flat lists above
+  for (const [categoryName, names] of groupsByCategory) {
+    const values = [...new Set(names)];
+    if (!values.length) continue;
+    const col = ++nextListCol;
+    wsLists.getCell(1, col).value = `Groups: ${categoryName}`;
+    values.forEach((n, i) => { wsLists.getCell(i + 2, col).value = n; });
+    wb.definedNames.add(
+      `Lists!$${colLetter(col)}$2:$${colLetter(col)}$${values.length + 1}`,
+      definedNameFor('CAT_', categoryName, definedNameSet),
+    );
+  }
+  for (const [groupName, names] of subgroupsByGroupName) {
+    const values = [...new Set(names)];
+    if (!values.length) continue;
+    const col = ++nextListCol;
+    wsLists.getCell(1, col).value = `Sub-groups: ${groupName}`;
+    values.forEach((n, i) => { wsLists.getCell(i + 2, col).value = n; });
+    wb.definedNames.add(
+      `Lists!$${colLetter(col)}$2:$${colLetter(col)}$${values.length + 1}`,
+      definedNameFor('GRP_', groupName, definedNameSet),
+    );
+  }
+
   if (uniqueGroupNames.length > 0) {
-    dropdownFromRange(ws, 5, `Lists!$B$2:$B$${uniqueGroupNames.length + 1}`, 2, 1000);
+    dropdownIndirect(ws, 5, 4, 'CAT_', `Lists!$B$2:$B$${uniqueGroupNames.length + 1}`, 2, lastDataRow);
   }
   if (uniqueSubgroupNames.length > 0) {
-    dropdownFromRange(ws, 6, `Lists!$C$2:$C$${uniqueSubgroupNames.length + 1}`, 2, 1000);
+    dropdownIndirect(ws, 6, 5, 'GRP_', `Lists!$C$2:$C$${uniqueSubgroupNames.length + 1}`, 2, lastDataRow);
   }
 
   // ── Sheet 2: Existing Taxonomy (reference) ──────────────────────────────
@@ -241,7 +390,20 @@ async function buildImportReport(rowLog) {
 
 // ── import ────────────────────────────────────────────────────────────────────
 
-export async function importItemsExcel(file, companyId) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun] parse, resolve and validate every row —
+ *   including creating any taxonomy the sheet implies, so a later apply sees
+ *   exactly what the dry run saw — then ROLL BACK instead of committing.
+ *   Returns `{ problems, wouldInsert, wouldUpdate, wouldSkip }` instead of the
+ *   normal `result` shape.
+ * @param {'append'|'upsert'} [opts.mode] `append` (default): a row whose code
+ *   already exists is skipped, as before. `upsert`: that row UPDATES the
+ *   existing item instead (fields + custom field values); it never creates a
+ *   second row for a code already in the catalog.
+ */
+export async function importItemsExcel(file, companyId, opts = {}) {
+  const { dryRun = false, mode = 'append' } = opts;
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(file.path);
   fs.unlinkSync(file.path);
@@ -283,13 +445,16 @@ export async function importItemsExcel(file, companyId) {
   });
 
   const result = {
-    itemsCreated: 0, itemsSkipped: 0,
+    itemsCreated: 0, itemsUpdated: 0, itemsSkipped: 0,
     categoriesCreated: 0, groupsCreated: 0, subgroupsCreated: 0,
     warnings: [],
     rowLog: [], // one entry per data row — backs the downloadable import report
+    problems: [], // one entry per row that will NOT insert cleanly — dry-run's real output
   };
 
   const conn = await pool.getConnection();
+  /** Shared across every row's `generateCode` call — see the call site below. */
+  const ctxCache = new Map();
   try {
     await conn.beginTransaction();
 
@@ -308,6 +473,7 @@ export async function importItemsExcel(file, companyId) {
     );
     const categoryCache = new Map(existingCats.map((c) => [c.name.toLowerCase(), c.id]));
     const categoryCodeSet = new Set(existingCats.map((c) => c.code.toUpperCase()));
+    const categoryNameById = new Map(existingCats.map((c) => [c.id, c.name]));
 
     const [existingGroups] = await conn.query(
       'SELECT id, name, code, category_id FROM fab_item_groups WHERE company_id = ? AND deleted_at IS NULL',
@@ -315,9 +481,23 @@ export async function importItemsExcel(file, companyId) {
     );
     const groupCache = new Map(existingGroups.map((g) => [`${g.category_id}::${g.name.toLowerCase()}`, g.id]));
     const groupCodeSetByCategory = new Map();
+    const groupNameById = new Map(existingGroups.map((g) => [g.id, g.name]));
+    /**
+     * Group NAME -> every category id it already lives under (item 2). A
+     * group is scoped by (categoryId, name), so the same name can legally
+     * exist under two categories — but a row naming a group that exists
+     * ONLY under some other category is not a second, coincidental group of
+     * the same name, it is someone who picked the wrong entry off a flat,
+     * unscoped dropdown. Reported as TAXONOMY_MISMATCH instead of silently
+     * creating a duplicate under the category the row happens to state.
+     */
+    const groupParentByName = new Map();
     for (const g of existingGroups) {
       if (!groupCodeSetByCategory.has(g.category_id)) groupCodeSetByCategory.set(g.category_id, new Set());
       groupCodeSetByCategory.get(g.category_id).add(g.code.toUpperCase());
+      const nameKey = g.name.toLowerCase();
+      if (!groupParentByName.has(nameKey)) groupParentByName.set(nameKey, new Set());
+      groupParentByName.get(nameKey).add(g.category_id);
     }
 
     const [existingSubgroups] = await conn.query(
@@ -326,16 +506,25 @@ export async function importItemsExcel(file, companyId) {
     );
     const subgroupCache = new Map(existingSubgroups.map((s) => [`${s.group_id}::${s.name.toLowerCase()}`, s.id]));
     const subgroupCodeSetByGroup = new Map();
+    // Sub-group NAME -> every group id it already lives under — same
+    // reasoning as groupParentByName, one level down.
+    const subgroupParentByName = new Map();
     for (const s of existingSubgroups) {
       if (!subgroupCodeSetByGroup.has(s.group_id)) subgroupCodeSetByGroup.set(s.group_id, new Set());
       subgroupCodeSetByGroup.get(s.group_id).add(s.code.toUpperCase());
+      const nameKey = s.name.toLowerCase();
+      if (!subgroupParentByName.has(nameKey)) subgroupParentByName.set(nameKey, new Set());
+      subgroupParentByName.get(nameKey).add(s.group_id);
     }
 
     const [existingItems] = await conn.query(
-      'SELECT code FROM fab_item_catalog WHERE company_id = ? AND deleted_at IS NULL',
+      'SELECT id, code FROM fab_item_catalog WHERE company_id = ? AND deleted_at IS NULL',
       [companyId],
     );
     const itemCodeSet = new Set(existingItems.map((r) => r.code.toUpperCase()));
+    // code -> id, for `mode: 'upsert'` — an existing code updates that row
+    // instead of being skipped.
+    const itemIdByCode = new Map(existingItems.map((r) => [r.code.toUpperCase(), r.id]));
 
     // ── resolvers (get-or-create) ───────────────────────────────────────────
     async function resolveCategory(name) {
@@ -347,6 +536,7 @@ export async function importItemsExcel(file, companyId) {
         [companyId, name.trim(), code],
       );
       categoryCache.set(key, res.insertId);
+      categoryNameById.set(res.insertId, name.trim());
       result.categoriesCreated++;
       return res.insertId;
     }
@@ -361,6 +551,13 @@ export async function importItemsExcel(file, companyId) {
         [companyId, categoryId, name.trim(), code],
       );
       groupCache.set(key, res.insertId);
+      groupNameById.set(res.insertId, name.trim());
+      // A row later in the SAME file naming this group under a different
+      // category must see it as taken too, not just rows against the DB
+      // state as of the start of the import.
+      const nameKey = name.trim().toLowerCase();
+      if (!groupParentByName.has(nameKey)) groupParentByName.set(nameKey, new Set());
+      groupParentByName.get(nameKey).add(categoryId);
       result.groupsCreated++;
       return res.insertId;
     }
@@ -375,6 +572,9 @@ export async function importItemsExcel(file, companyId) {
         [companyId, groupId, name.trim(), code],
       );
       subgroupCache.set(key, res.insertId);
+      const nameKey = name.trim().toLowerCase();
+      if (!subgroupParentByName.has(nameKey)) subgroupParentByName.set(nameKey, new Set());
+      subgroupParentByName.get(nameKey).add(groupId);
       result.subgroupsCreated++;
       return res.insertId;
     }
@@ -389,12 +589,41 @@ export async function importItemsExcel(file, companyId) {
       };
 
       let code = r.code ? r.code.trim().toUpperCase() : null;
-      if (code && itemCodeSet.has(code)) {
-        const message = `Item code '${code}' already exists — row skipped.`;
+      // The template's own example row (code EXAMPLE-ROW, item 3 of the
+      // static review) — never imported, whether or not the user deleted it,
+      // and regardless of mode/dry-run: leaving it in used to spawn a
+      // duplicate category (a hand-typed taxonomy guess) plus a junk item.
+      if (code === 'EXAMPLE-ROW') {
+        const message = 'Example row from the template — skipped automatically.';
         result.warnings.push({ row: r.rowNumber, message });
+        result.problems.push({ row: r.rowNumber, code: 'EXAMPLE_ROW_SKIPPED', reason: message });
         result.itemsSkipped++;
         result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
         continue;
+      }
+      let existingItemId = null;
+      if (code && itemCodeSet.has(code)) {
+        if (mode !== 'upsert') {
+          const message = `Item code '${code}' already exists — row skipped.`;
+          result.warnings.push({ row: r.rowNumber, message });
+          result.problems.push({ row: r.rowNumber, code, reason: message });
+          result.itemsSkipped++;
+          result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
+          continue;
+        }
+        // upsert: this row updates the existing row rather than being skipped.
+        existingItemId = itemIdByCode.get(code) ?? null;
+        if (!existingItemId) {
+          // The code was in the sheet twice (added to itemCodeSet by an earlier
+          // row in THIS import) rather than pre-existing — still a duplicate,
+          // still not creatable, and upsert has no earlier DB row to update.
+          const message = `Item code '${code}' is duplicated within this file — row skipped.`;
+          result.warnings.push({ row: r.rowNumber, message });
+          result.problems.push({ row: r.rowNumber, code, reason: message });
+          result.itemsSkipped++;
+          result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
+          continue;
+        }
       }
       if (code) itemCodeSet.add(code);
 
@@ -407,6 +636,23 @@ export async function importItemsExcel(file, companyId) {
       }
 
       const categoryId = await resolveCategory(r.categoryName);
+
+      // TAXONOMY_MISMATCH (item 2): a Group name that already belongs to a
+      // DIFFERENT category — the exact shape a flat, unscoped dropdown lets
+      // someone pick by mistake. Reported and skipped rather than silently
+      // minting a second, wrongly-parented group with the same name.
+      if (r.groupName) {
+        const owners = groupParentByName.get(r.groupName.trim().toLowerCase());
+        if (owners && !owners.has(categoryId)) {
+          const ownerNames = [...owners].map((id) => categoryNameById.get(id)).filter(Boolean).join(', ');
+          const message = `Group "${r.groupName}" already exists under ${ownerNames || 'a different category'}, not "${r.categoryName}".`;
+          result.warnings.push({ row: r.rowNumber, message });
+          result.problems.push({ row: r.rowNumber, code: 'TAXONOMY_MISMATCH', reason: message });
+          result.itemsSkipped++;
+          result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
+          continue;
+        }
+      }
 
       /**
        * A BLANK GROUP MEANS NO GROUP — it does not mean "invent one".
@@ -432,6 +678,18 @@ export async function importItemsExcel(file, companyId) {
       let subgroupId = null;
       if (r.subgroupName) {
         if (groupId) {
+          // Same TAXONOMY_MISMATCH check, one level down: a Sub-group name
+          // that already belongs to a different Group.
+          const subOwners = subgroupParentByName.get(r.subgroupName.trim().toLowerCase());
+          if (subOwners && !subOwners.has(groupId)) {
+            const ownerNames = [...subOwners].map((id) => groupNameById.get(id)).filter(Boolean).join(', ');
+            const message = `Sub-group "${r.subgroupName}" already exists under ${ownerNames || 'a different group'}, not "${r.groupName}".`;
+            result.warnings.push({ row: r.rowNumber, message });
+            result.problems.push({ row: r.rowNumber, code: 'TAXONOMY_MISMATCH', reason: message });
+            result.itemsSkipped++;
+            result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
+            continue;
+          }
           subgroupId = await resolveSubgroup(groupId, r.subgroupName);
         } else {
           const message = `Sub-group '${r.subgroupName}' needs a Group — sub-group left unset for this row.`;
@@ -443,8 +701,15 @@ export async function importItemsExcel(file, companyId) {
         // No code in the spreadsheet — use the company's configured item code rule
         // (falls back to a sensible default when none is configured), retrying on
         // the rare collision against codes already used elsewhere in this import.
+        //
+        // `conn` — the import's own transaction, not a second pool connection.
+        // Without it, every code issued here committed on its own connection
+        // immediately, so a later row's failure rolled back the items but not
+        // the sequence numbers already consumed for them — a permanent gap
+        // every time an import partially failed. `ctxCache` shares taxonomy
+        // shortform lookups across the whole file instead of one query per row.
         do {
-          code = (await generateCode(companyId, 'item', { categoryId })).toUpperCase();
+          code = (await generateCode(companyId, 'item', { categoryId }, conn, ctxCache)).toUpperCase();
         } while (itemCodeSet.has(code));
         itemCodeSet.add(code);
       }
@@ -460,17 +725,32 @@ export async function importItemsExcel(file, companyId) {
         }
       }
 
-      const [insertRes] = await conn.query(
-        `INSERT INTO fab_item_catalog
-           (company_id, name, code, unit, description, category_id, group_id, subgroup_id,
-            procurement_type, hsn_code, lead_time_days)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-        [companyId, r.name.trim(), code, r.unit, r.description || null, categoryId, groupId, subgroupId,
-         procurementType, r.hsnCode || null, r.leadTimeDays],
-      );
-      result.itemsCreated++;
-
-      const itemId = insertRes.insertId;
+      let itemId;
+      if (existingItemId) {
+        // upsert: the code was already the catalog's, so this row corrects
+        // that row rather than minting another with the same code.
+        await conn.query(
+          `UPDATE fab_item_catalog
+              SET name = ?, unit = ?, description = ?, category_id = ?, group_id = ?, subgroup_id = ?,
+                  procurement_type = ?, hsn_code = ?, lead_time_days = ?, updated_at = UTC_TIMESTAMP()
+            WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+          [r.name.trim(), r.unit, r.description || null, categoryId, groupId, subgroupId,
+           procurementType, r.hsnCode || null, r.leadTimeDays, existingItemId, companyId],
+        );
+        result.itemsUpdated++;
+        itemId = existingItemId;
+      } else {
+        const [insertRes] = await conn.query(
+          `INSERT INTO fab_item_catalog
+             (company_id, name, code, unit, description, category_id, group_id, subgroup_id,
+              procurement_type, hsn_code, lead_time_days)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          [companyId, r.name.trim(), code, r.unit, r.description || null, categoryId, groupId, subgroupId,
+           procurementType, r.hsnCode || null, r.leadTimeDays],
+        );
+        result.itemsCreated++;
+        itemId = insertRes.insertId;
+      }
 
       // The value store moved to fab_field_values, written through setFields
       // rather than by INSERT: it validates (unknown key, wrong scope, non-
@@ -493,14 +773,29 @@ export async function importItemsExcel(file, companyId) {
           const declared = cfTypeByKey.get(rej.fieldKey);
           const message = `Custom field '${rej.fieldKey}'${declared ? ` (${declared})` : ''} not set — ${rej.why}.`;
           result.warnings.push({ row: r.rowNumber, message });
+          result.problems.push({ row: r.rowNumber, code, reason: message });
           rowNotes.push(message);
         }
       }
 
       result.rowLog.push({
-        ...rowBase, code, status: 'Created',
+        ...rowBase, code, status: existingItemId ? 'Updated' : 'Created',
         reason: rowNotes.join(' ') || '',
       });
+    }
+
+    if (dryRun) {
+      // Everything above ran for real against this connection so the same
+      // categories/groups/subgroups the sheet implies were resolved exactly as
+      // an apply would see them — then discarded. Nothing the caller asked
+      // NOT to write gets written.
+      await conn.rollback();
+      return {
+        problems: result.problems,
+        wouldInsert: result.itemsCreated,
+        wouldUpdate: result.itemsUpdated,
+        wouldSkip: result.itemsSkipped,
+      };
     }
 
     await conn.commit();

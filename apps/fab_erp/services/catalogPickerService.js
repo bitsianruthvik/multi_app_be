@@ -53,8 +53,15 @@ const sizeText = (s) => {
  * @param {number} [orderId] marks the items this order already uses, so the
  *   picker can offer them first — on a bridge order the next row is nearly
  *   always a part the order already has.
+ * @param {object} [opts]
+ * @param {number[]} [opts.ids] restrict to these catalog item ids (a search or
+ *   a "load by id" fetch) instead of scanning every ADDABLE item the company
+ *   has (S5) — the BOM picker no longer needs to pull the whole catalog just
+ *   to resolve the handful of rows already on screen.
+ * @param {string} [opts.search] a name/code substring, for the same reason.
  */
-export async function pickableItems(companyId, orderId = null) {
+export async function pickableItems(companyId, orderId = null, opts = {}) {
+  const { ids: idFilter = null, search = null } = opts;
   const [items] = await pool.query(
     `SELECT c.id, c.name, c.code, c.unit, c.description, c.thickness_mm AS thicknessCol,
             COALESCE(c.procurement_type, 'make') AS procurement,
@@ -63,9 +70,22 @@ export async function pickableItems(companyId, orderId = null) {
        JOIN fab_item_categories cat ON cat.id = c.category_id AND cat.deleted_at IS NULL
        LEFT JOIN fab_item_groups g ON g.id = c.group_id AND g.deleted_at IS NULL
        LEFT JOIN fab_item_subgroups sg ON sg.id = c.subgroup_id AND sg.deleted_at IS NULL
-      WHERE c.company_id = ? AND c.deleted_at IS NULL AND cat.name IN (?)
+      WHERE c.company_id = ? AND c.deleted_at IS NULL
+        -- ADDABLE by category, OR on any BOM template at all. A company whose
+        -- structure types are top-level categories (no "Fabricated" parent)
+        -- still has every fabricated part on some BOM, and that is the truer test.
+        AND (cat.name IN (?)
+             OR EXISTS (SELECT 1 FROM fab_item_bom b
+                         WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
+                           AND (b.parent_item_id = c.id OR b.child_item_id = c.id)))
+        ${idFilter && idFilter.length ? 'AND c.id IN (?)' : ''}
+        ${search ? 'AND (c.name LIKE ? OR c.code LIKE ?)' : ''}
       ORDER BY c.name`,
-    [companyId, ADDABLE],
+    [
+      companyId, ADDABLE,
+      ...(idFilter && idFilter.length ? [idFilter] : []),
+      ...(search ? [`%${search}%`, `%${search}%`] : []),
+    ],
   );
   if (!items.length) return [];
   const ids = items.map((i) => Number(i.id));
@@ -130,4 +150,66 @@ export async function pickableItems(companyId, orderId = null) {
       onThisOrder: onThisOrder.has(Number(it.id)),
     };
   });
+}
+
+/**
+ * How much of the catalog would notice if this item disappeared — the
+ * question `DeleteDialog` asks and, until now, answered wrong: it said BOM
+ * entries are unaffected while `bomFor`/`bomIndex` inner-join
+ * `fab_item_catalog.deleted_at IS NULL`, so a soft-deleted child silently
+ * drops out of every recipe that named it (EU-15 item 4).
+ *
+ * @returns {Promise<{bomCount:number, orderCount:number}>}
+ */
+export async function itemUsage(companyId, catalogItemId) {
+  const id = Number(catalogItemId);
+  const [[bom], [orders]] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) AS n FROM fab_item_bom
+        WHERE company_id = ? AND deleted_at IS NULL AND child_item_id = ?`,
+      [companyId, id],
+    ),
+    pool.query(
+      `SELECT COUNT(DISTINCT i.order_id) AS n
+         FROM fab_items i
+         JOIN fab_orders o ON o.id = i.order_id AND o.deleted_at IS NULL
+        WHERE i.company_id = ? AND i.deleted_at IS NULL AND i.catalog_item_id = ?`,
+      [companyId, id],
+    ),
+  ]);
+  return { bomCount: Number(bom[0]?.n ?? 0), orderCount: Number(orders[0]?.n ?? 0) };
+}
+
+/**
+ * What an order LINE may sell — Fabricated only, unlike `pickableItems`
+ * (Fabricated + Fasteners + Consumables, for a BOM row). Moves
+ * `OrderLinesPanel`'s own `c.name === 'Fabricated'` comparison server-side
+ * (EU-15 item 8) without inventing a company-wide scope-binding dataset this
+ * EU has no authority to seed — see `itemScopeService.js` for the fuller
+ * mechanism this deliberately does not use.
+ */
+export async function sellableItems(companyId, { search = null } = {}) {
+  const [rows] = await pool.query(
+    `SELECT c.id, c.name, c.code,
+            cat.name AS categoryName, g.name AS groupName, sg.name AS subgroupName
+       FROM fab_item_catalog c
+       JOIN fab_item_categories cat ON cat.id = c.category_id AND cat.deleted_at IS NULL
+       LEFT JOIN fab_item_groups g ON g.id = c.group_id AND g.deleted_at IS NULL
+       LEFT JOIN fab_item_subgroups sg ON sg.id = c.subgroup_id AND sg.deleted_at IS NULL
+      WHERE c.company_id = ? AND c.deleted_at IS NULL
+        -- Fabricated by category, OR a BOM ROOT — the top of a template that no
+        -- other template contains. That is what a line sells, whatever the
+        -- taxonomy calls its category.
+        AND (cat.name = 'Fabricated'
+             OR (EXISTS (SELECT 1 FROM fab_item_bom b
+                          WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
+                            AND b.parent_item_id = c.id)
+                 AND NOT EXISTS (SELECT 1 FROM fab_item_bom b
+                                  WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
+                                    AND b.child_item_id = c.id)))
+        ${search ? 'AND (c.name LIKE ? OR c.code LIKE ?)' : ''}
+      ORDER BY c.name`,
+    search ? [companyId, `%${search}%`, `%${search}%`] : [companyId],
+  );
+  return rows;
 }

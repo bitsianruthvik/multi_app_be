@@ -25,6 +25,7 @@ import { evaluateFormula, formulaResultToHours, parseStepParams } from './formul
 import { recordEvent, recordEvents } from './taskEventService.js';
 import { resolveNextInputBuffer, loadOf, statusFor } from './bufferService.js';
 import { resolveItemFields, buildInputContext } from './itemFieldService.js';
+import { lineQtyMap } from './orderLineQty.js';
 
 /** Best-effort machine name for a resource id (falls back to "#<id>"). */
 async function resourceName(exec, companyId, resourceId) {
@@ -344,69 +345,55 @@ const chunkRows = (rows, n) => {
 };
 
 /**
- * WHAT AN ORDER'S TASKS WOULD BE — every (row, flow step), its time, its
- * quantity and its inputs — without writing anything.
+ * Write several columns of many rows in a few statements rather than one
+ * round trip each — the same CASE-per-id shape as
+ * `productionOrderService.updateInChunks`, generalised to more than one
+ * column so `syncUnstartedTasks` can move computed_hours/setup_hours/task_qty
+ * together instead of one UPDATE per changed task.
  *
- * This is the one place a step's time is worked out. Building the tasks
- * (materializeOrderTasks) writes what it returns; the production-order screen
- * shows what it returns before anything exists; re-materialising compares
- * against it. Three readers, one answer, so the screen cannot promise one
- * number and the task get another.
- *
- * A TIME TYPED OVER wins over the formula (fab_task_time_overrides). It is a
- * per-piece figure like the formula's, so it is multiplied by the quantity the
- * same way — see taskDuration.
- *
- * THE QUANTITY IS THE WHOLE ORDER'S. A row's qty is per parent: three segments
- * per line, four lines per span. The task makes all twelve, so its quantity is
- * the product up the tree. It used to be the row's own 3, which planned a
- * quarter of the work.
- *
- * @param {object} [opts]
- * @param {boolean} [opts.evaluateExisting=false] also time steps that already
- *   have a task. Building skips them; a screen showing every step wants them.
+ * @param {object} conn
+ * @param {string} table
+ * @param {number} companyId
+ * @param {Array<{id:number}>} rows - each row must carry a value for every key in `columns`
+ * @param {string[]} columns
  */
-export async function planOrderTasks(conn, companyId, orderId, { evaluateExisting = false } = {}) {
-  const [items] = await conn.query(
-    // `qty` is load-bearing and was missing until 2026-08-15: without it
-    // `item.qty ?? 1` below always took the 1, so EVERY task materialized was
-    // planned as a single piece and the per-piece × quantity model was inert
-    // for new work. The same omission made `rm.qty` undefined, so every
-    // fab_task_inputs row was written with a NULL quantity and the
-    // quantity-aware material gate silently degraded to a presence check.
-    // `node_kind` is what says whether a child is MATERIAL or a part. Without
-    // it the classification below falls back to guessing from null columns,
-    // which stops working the moment a made item carries a catalog id.
-    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, node_kind
-       FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
-    [companyId, orderId],
-  );
-  if (items.length === 0) return { items, planned: [], itemsProcessed: 0, itemsSkipped: 0 };
-
-  /** How many pieces a row stands for across the whole order. */
-  const rowById = new Map(items.map((it) => [Number(it.id), it]));
-  const rolledQty = (it) => {
-    let q = 1;
-    let cur = it;
-    for (let hop = 0; cur && hop < 64; hop++) {
-      q *= Number(cur.qty ?? 1) || 0;
-      if (cur.parent_item_id == null) break;
-      cur = rowById.get(Number(cur.parent_item_id));
+async function updateColumnsInChunks(conn, table, companyId, rows, columns) {
+  for (let i = 0; i < rows.length; i += 200) {
+    const chunk = rows.slice(i, i + 200);
+    const setClause = columns.map((col) => {
+      const cases = chunk.map(() => 'WHEN ? THEN ?').join(' ');
+      return `${col} = CASE id ${cases} END`;
+    }).join(', ');
+    const params = [];
+    for (const col of columns) {
+      for (const r of chunk) params.push(r.id, r[col]);
     }
-    return q;
-  };
+    params.push(companyId, chunk.map((r) => r.id));
+    await conn.query(`UPDATE ${table} SET ${setClause} WHERE company_id = ? AND id IN (?)`, params);
+  }
+}
 
-  /** Times somebody typed over, per piece, in minutes. */
-  const [overrideRows] = await conn.query(
-    `SELECT item_id, flow_step_id, unit_minutes FROM fab_task_time_overrides
-      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
-    [companyId, orderId],
-  );
-  const overrideOf = new Map(overrideRows.map((r) => [`${r.item_id}:${r.flow_step_id}`, Number(r.unit_minutes)]));
-
-  const catalogItemIds = [...new Set(items.filter((i) => i.catalog_item_id != null).map((i) => i.catalog_item_id))];
-
-  // legacy fallback: default BOM per catalog item → active flow binding
+/**
+ * One item's flow, resolved the same way everywhere: its OWN `flow_id` if
+ * somebody set one (an exception), else the legacy default-BOM → active
+ * binding lookup (`fab_material_boms` → `fab_bom_flow_bindings`) that predates
+ * `fab_item_bom.default_flow_id`. Merged out of `planOrderTasks` (ex
+ * `flowOf`) and `rematerializeService.resolveItemFlowId`, which had drifted
+ * into two copies of the same two-step rule.
+ *
+ * Bulk by construction — one query for every item's catalog id, one for every
+ * BOM's binding — because both callers used to resolve this per item, and a
+ * two-span order is thousands of items.
+ *
+ * @param {object} conn
+ * @param {number} companyId
+ * @param {Array<{id:number, catalog_item_id?:number|null, flow_id?:number|null}>} items
+ * @returns {Promise<Map<number, number|null>>} itemId -> flowId (null if unresolved)
+ */
+export async function resolveFlowIds(conn, companyId, items) {
+  const catalogItemIds = [...new Set(
+    (items ?? []).filter((i) => i.catalog_item_id != null).map((i) => i.catalog_item_id),
+  )];
   let bomIdByCatalogItemId = new Map();
   let bomIds = [];
   if (catalogItemIds.length) {
@@ -427,13 +414,101 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
     );
     flowIdByBomId = new Map(bindingRows.map((r) => [r.bom_id, r.flow_id]));
   }
+  const out = new Map();
+  for (const item of items ?? []) {
+    let flowId = item.flow_id;
+    if (flowId == null) {
+      const bomId = bomIdByCatalogItemId.get(item.catalog_item_id);
+      flowId = bomId != null ? flowIdByBomId.get(bomId) : null;
+    }
+    out.set(Number(item.id), flowId ?? null);
+  }
+  return out;
+}
 
-  // resolve each item's flow
-  const flowOf = (item) => {
-    if (item.flow_id != null) return item.flow_id;
-    const bomId = bomIdByCatalogItemId.get(item.catalog_item_id);
-    return bomId != null ? flowIdByBomId.get(bomId) : undefined;
+/**
+ * WHAT AN ORDER'S TASKS WOULD BE — every (row, flow step), its time, its
+ * quantity and its inputs — without writing anything.
+ *
+ * This is the one place a step's time is worked out. Building the tasks
+ * (materializeOrderTasks) writes what it returns; the production-order screen
+ * shows what it returns before anything exists; re-materialising compares
+ * against it. Three readers, one answer, so the screen cannot promise one
+ * number and the task get another.
+ *
+ * A TIME TYPED OVER wins over the formula (fab_task_time_overrides). It is a
+ * per-piece figure like the formula's, so it is multiplied by the quantity the
+ * same way — see taskDuration.
+ *
+ * THE QUANTITY IS THE WHOLE ORDER'S. A row's qty is per parent: three segments
+ * per line, four lines per span. The task makes all twelve, so its quantity is
+ * the product up the tree. It used to be the row's own 3, which planned a
+ * quarter of the work.
+ *
+ * EU-5, User Clarifications 3: the tree product above is STRUCTURAL qty only.
+ * The order LINE's own qty is a separate multiplier applied once at the end,
+ * the same rule `orderLineQty.js` states once for every roll-up — a line of
+ * qty 3 needs three times the task, not three times the structural product.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.evaluateExisting=false] also time steps that already
+ *   have a task. Building skips them; a screen showing every step wants them.
+ * @param {number[]} [opts.itemIds] S4: plan only these items' steps instead of
+ *   the whole order. Everything that resolves ancestor qty, flows, fields and
+ *   cross-item inputs still loads for the WHOLE order — a row's rolled qty and
+ *   its inputs can reach outside itself — only the expensive per-item,
+ *   per-step formula pass at the bottom is skipped for rows outside the set.
+ *   Omitted (the default, every pre-existing call site), this is a no-op: the
+ *   whole order is planned exactly as before.
+ */
+export async function planOrderTasks(conn, companyId, orderId, { evaluateExisting = false, itemIds } = {}) {
+  const [items] = await conn.query(
+    // `qty` is load-bearing and was missing until 2026-08-15: without it
+    // `item.qty ?? 1` below always took the 1, so EVERY task materialized was
+    // planned as a single piece and the per-piece × quantity model was inert
+    // for new work. The same omission made `rm.qty` undefined, so every
+    // fab_task_inputs row was written with a NULL quantity and the
+    // quantity-aware material gate silently degraded to a presence check.
+    // `node_kind` is what says whether a child is MATERIAL or a part. Without
+    // it the classification below falls back to guessing from null columns,
+    // which stops working the moment a made item carries a catalog id.
+    // `order_line_id` is the EU-5 addition: which line's qty multiplies this
+    // row's task_qty (see rolledQty below).
+    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, node_kind, order_line_id
+       FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  if (items.length === 0) return { items, planned: [], itemsProcessed: 0, itemsSkipped: 0 };
+
+  const lineQty = await lineQtyMap(conn, companyId, orderId);
+
+  /** How many pieces a row stands for across the whole order. */
+  const rowById = new Map(items.map((it) => [Number(it.id), it]));
+  const rolledQty = (it) => {
+    let q = 1;
+    let cur = it;
+    for (let hop = 0; cur && hop < 64; hop++) {
+      q *= Number(cur.qty ?? 1) || 0;
+      if (cur.parent_item_id == null) break;
+      cur = rowById.get(Number(cur.parent_item_id));
+    }
+    // The line multiplier belongs to the row the task is FOR, looked up once
+    // here rather than per ancestor — every row in the chain hangs under the
+    // same line, so multiplying at each hop would multiply it by itself.
+    return q * (lineQty.get(it.order_line_id == null ? null : Number(it.order_line_id)) ?? 1);
   };
+
+  /** Times somebody typed over, per piece, in minutes. */
+  const [overrideRows] = await conn.query(
+    `SELECT item_id, flow_step_id, unit_minutes FROM fab_task_time_overrides
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  const overrideOf = new Map(overrideRows.map((r) => [`${r.item_id}:${r.flow_step_id}`, Number(r.unit_minutes)]));
+
+  // One resolver, shared with rematerializeService — see resolveFlowIds.
+  const flowIdByItemId = await resolveFlowIds(conn, companyId, items);
+  const flowOf = (item) => flowIdByItemId.get(Number(item.id)) ?? undefined;
 
   const flowIds = [...new Set(items.map(flowOf).filter((f) => f != null))];
   const stepsByFlowId = new Map();
@@ -622,8 +697,14 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
   /** Lives exactly as long as this materialization. See evaluateFormula. */
   const machinePropsCache = new Map();
   const planned = [];
+  const scopeSet = itemIds && itemIds.length ? new Set(itemIds.map(Number)) : null;
 
   for (const item of items) {
+    // S4: everything above this line loaded for the WHOLE order on purpose —
+    // ancestor qty, flows, fields and cross-item inputs can all reach outside
+    // a single row. Only the formula pass below, which is the expensive part
+    // repeated per (item, step), is skipped for rows outside the scope.
+    if (scopeSet && !scopeSet.has(Number(item.id))) continue;
     const flowId = flowOf(item);
     const steps = flowId != null ? stepsByFlowId.get(flowId) : undefined;
     if (!flowId || !steps || !steps.length) { itemsSkipped++; continue; }
@@ -637,33 +718,39 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
       // The formula returns the operation's OWN unit (min for nearly all of
       // them); computed_hours is hours. Convert, or a 500-minute cut is stored
       // as 500 hours — which is exactly what used to happen.
-      const formulaHours = op
-        ? formulaResultToHours(
-            await evaluateFormula(
-              op.time_formula,
-              itemMetricsById.get(item.id) ?? {},
-              // step.* — this step's own parameters. Passed as `{}` since the
-              // engine was written, so `step.anything` silently evaluated to 0
-              // and the namespace was documented but dead. This is what lets one
-              // "Cut Plate" operation roll along the length on one flow and
-              // across the width on another without cloning the operation.
-              parseStepParams(step),
-              resourceTypeId,
-              opValues,
-              // input.* / inputs.* — what this task consumes. Built from the
-              // item's children and the field values already resolved above,
-              // so it costs no extra query per step.
-              buildInputContext({
-                rmChildren: rmChildrenByParent.get(item.id) ?? [],
-                partChildren: childPartsByParent.get(item.id) ?? [],
-                valuesByItemId: itemMetricsById,
-              }),
-              // One query per resource TYPE for this run, not one per task.
-              machinePropsCache,
-            ),
-            op.time_unit,
-          )
-        : null;
+      //
+      // evaluateFormula now returns { value, error, warnings } instead of
+      // swallowing a failure to a bare number|null (R2) — `error`/`warnings`
+      // ride along on the planned task so the production screen can show WHY
+      // a step reads "—" instead of just that it does (EU-8 item 5).
+      let formulaHours = null;
+      let formulaError = null;
+      let formulaWarnings = [];
+      if (op) {
+        const evalResult = await evaluateFormula(
+          op.time_formula,
+          itemMetricsById.get(item.id) ?? {},
+          // step.* — this step's own parameters. Always evaluates to 0
+          // regardless (User Clarifications 7) — passed anyway so a future
+          // change to that decision has real data to switch on.
+          parseStepParams(step),
+          resourceTypeId,
+          opValues,
+          // input.* / inputs.* — what this task consumes. Built from the
+          // item's children and the field values already resolved above,
+          // so it costs no extra query per step.
+          buildInputContext({
+            rmChildren: rmChildrenByParent.get(item.id) ?? [],
+            partChildren: childPartsByParent.get(item.id) ?? [],
+            valuesByItemId: itemMetricsById,
+          }),
+          // One query per resource TYPE for this run, not one per task.
+          machinePropsCache,
+        );
+        formulaHours = formulaResultToHours(evalResult.value, op.time_unit);
+        formulaError = evalResult.error;
+        formulaWarnings = evalResult.warnings;
+      }
 
       // The formula IS the estimate. Learned p80 touch-times used to override it
       // here, with the formula's own value preserved in formula_hours for
@@ -688,6 +775,7 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
         // gap — and a code reading /02 for the first step would say otherwise.
         stepNo: stepIdx + 1,
         formulaHours, overrideHours, computedHours, setupHours,
+        formulaError, warnings: formulaWarnings,
         // Snapshotted, not joined at read time: a BOM quantity edited later
         // must not silently move the estimate under a plan already committed.
         // Re-materialization is the deliberate way to pick up a change.
@@ -751,33 +839,56 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
  * Only 'blocked' and 'eligible' tasks move. A started task keeps what it was
  * started with.
  *
+ * @param {object} [opts]
+ * @param {number[]} [opts.itemIds] S4: re-sync only these items' tasks (see
+ *   planOrderTasks) — the shape `setStepTime` needs, so editing one row's time
+ *   does not re-plan every other row on the order to update none of them.
+ * @param {{planned:object[]}} [opts.precomputed] a plan already computed with
+ *   `{evaluateExisting:true}` (by `deployProductionOrder`, before its lock) —
+ *   use it instead of planning again. Skipped by every other caller.
  * @returns {Promise<number>} tasks changed
  */
-export async function syncUnstartedTasks(conn, companyId, orderId) {
-  const { planned } = await planOrderTasks(conn, companyId, orderId, { evaluateExisting: true });
+export async function syncUnstartedTasks(conn, companyId, orderId, { itemIds, precomputed } = {}) {
+  const { planned } = precomputed
+    ?? await planOrderTasks(conn, companyId, orderId, { evaluateExisting: true, itemIds });
   const want = new Map(planned.map((t) => [`${t.itemId}:${t.stepId}`, t]));
+  const scopeIds = itemIds && itemIds.length ? [...new Set(itemIds.map(Number))] : null;
   const [tasks] = await conn.query(
     `SELECT id, item_id, flow_step_id, computed_hours, setup_hours, task_qty
        FROM fab_project_tasks
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-        AND status IN ('blocked', 'eligible')`,
-    [companyId, orderId],
+        AND status IN ('blocked', 'eligible')
+        ${scopeIds ? 'AND item_id IN (?)' : ''}`,
+    scopeIds ? [companyId, orderId, scopeIds] : [companyId, orderId],
   );
   // Compared at the columns' own four places, or every task reads as changed.
   const r4 = (x) => (x == null ? null : Math.round(Number(x) * 1e4) / 1e4);
   const same = (a, b) => r4(a) === r4(b);
-  let changed = 0;
+  const updates = [];
   for (const t of tasks) {
     const w = want.get(`${t.item_id}:${t.flow_step_id}`);
     if (!w) continue;
-    if (same(t.computed_hours, w.computedHours) && same(t.setup_hours, w.setupHours) && same(t.task_qty, w.qty)) continue;
-    await conn.query(
-      `UPDATE fab_project_tasks SET computed_hours = ?, setup_hours = ?, task_qty = ? WHERE id = ? AND company_id = ?`,
-      [r4(w.computedHours), r4(w.setupHours), r4(w.qty), t.id, companyId],
-    );
-    changed++;
+    // A formula that now FAILS must not erase a computed_hours the shop is
+    // already working to — that would report the failure by silently
+    // blanking the number on a re-plan, which is the exact silent failure
+    // this EU exists to stop. `formulaError` is what tells the production
+    // screen why (via planOrderTasks/productionPlanService); this loop only
+    // has to not make the stored figure worse than it already was.
+    const keepExisting = w.formulaError && w.computedHours == null && t.computed_hours != null;
+    const nextComputedHours = keepExisting ? Number(t.computed_hours) : w.computedHours;
+    if (same(t.computed_hours, nextComputedHours) && same(t.setup_hours, w.setupHours) && same(t.task_qty, w.qty)) continue;
+    updates.push({
+      id: t.id,
+      computed_hours: r4(nextComputedHours),
+      setup_hours: r4(w.setupHours),
+      task_qty: r4(w.qty),
+    });
   }
-  return changed;
+  if (updates.length) {
+    await updateColumnsInChunks(conn, 'fab_project_tasks', companyId, updates,
+      ['computed_hours', 'setup_hours', 'task_qty']);
+  }
+  return updates.length;
 }
 
 /**
@@ -785,9 +896,16 @@ export async function syncUnstartedTasks(conn, companyId, orderId) {
  *
  * Writes what planOrderTasks says is missing. Idempotent per (row, flow step):
  * a step that already has a task is left alone.
+ *
+ * @param {object} [opts]
+ * @param {{planned:object[], itemsProcessed:number, itemsSkipped:number}} [opts.precomputed]
+ *   a plan already computed (by `deployProductionOrder`, before its lock) —
+ *   use it instead of planning again. `evaluateExisting:true` or `:false` both
+ *   work here: this function only ever writes rows whose `exists` is false,
+ *   and that flag is the same either way. Skipped by every other caller.
  */
-export async function materializeOrderTasks(conn, companyId, orderId) {
-  const { planned, itemsProcessed, itemsSkipped } = await planOrderTasks(conn, companyId, orderId);
+export async function materializeOrderTasks(conn, companyId, orderId, { precomputed } = {}) {
+  const { planned, itemsProcessed, itemsSkipped } = precomputed ?? await planOrderTasks(conn, companyId, orderId);
   const fresh = planned.filter((t) => !t.exists);
   const tasksInserted = fresh.length;
   if (!tasksInserted) return { ok: true, itemsProcessed, itemsSkipped, tasksInserted: 0, cleared: 0 };

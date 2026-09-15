@@ -95,6 +95,46 @@ export async function drawingsForItem(companyId, itemId, conn = null) {
     .sort((a, b) => a.depth - b.depth || String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
+/**
+ * `revision` (EU-12): an INTEGER sequence, PER ITEM — an item's own drawing
+ * history, "Rev 1", "Rev 2", … — stored as text in the existing VARCHAR(40)
+ * column (no schema change; that belongs to EU-1 only). Omitting it
+ * auto-assigns the next number; naming one is validated against every
+ * revision already on this item, numeric or not — legacy free-text values
+ * (pre-EU-12 uploads) don't parse and are simply never the max, so the
+ * sequence starts clean at 1 the first time this runs on an old item.
+ *
+ * @returns {Promise<string>} the revision to store
+ */
+async function nextDrawingRevision(companyId, itemId, requested) {
+  const [rows] = await pool.query(
+    `SELECT revision FROM fab_item_drawings
+      WHERE company_id = ? AND item_id = ? AND deleted_at IS NULL`,
+    [companyId, itemId],
+  );
+  const current = rows.reduce((max, r) => {
+    const n = Number.parseInt(r.revision, 10);
+    return Number.isFinite(n) && n > max ? n : max;
+  }, 0);
+
+  if (requested == null || String(requested).trim() === '') {
+    return String(current + 1);
+  }
+  const n = Number.parseInt(String(requested).trim(), 10);
+  if (!Number.isFinite(n) || n <= 0 || String(n) !== String(requested).trim()) {
+    const e = new Error('Revision must be a positive whole number.');
+    e.status = 400;
+    throw e;
+  }
+  if (n <= current) {
+    const e = new Error(`Revision ${n} does not come after this drawing's current revision (${current}).`);
+    e.status = 409;
+    e.code = 'REVISION_NOT_MONOTONIC';
+    throw e;
+  }
+  return String(n);
+}
+
 /** Attach a drawing to an item. `buffer` is the file exactly as uploaded. */
 export async function addDrawing(companyId, itemId, file, meta = {}, userId = null) {
   if (!file?.buffer?.length) {
@@ -113,6 +153,8 @@ export async function addDrawing(companyId, itemId, file, meta = {}, userId = nu
     [itemId, companyId],
   );
   if (!item) { const e = new Error('That item does not exist.'); e.status = 404; throw e; }
+
+  const revision = await nextDrawingRevision(companyId, itemId, meta.revision);
 
   const packed = await deflate(file.buffer, { level: zlib.constants.Z_BEST_COMPRESSION });
   if (packed.length > MAX_STORED_BYTES) {
@@ -136,7 +178,7 @@ export async function addDrawing(companyId, itemId, file, meta = {}, userId = nu
     [
       companyId, itemId, file.originalname?.slice(0, 255) || 'drawing.pdf',
       file.mimetype, file.buffer.length, packed,
-      meta.revision?.slice(0, 40) || null, meta.notes?.slice(0, 500) || null, userId,
+      revision, meta.notes?.slice(0, 500) || null, userId,
     ],
   );
   return {
@@ -144,6 +186,7 @@ export async function addDrawing(companyId, itemId, file, meta = {}, userId = nu
     fileName: file.originalname,
     sizeBytes: file.buffer.length,
     storedBytes: packed.length,
+    revision,
   };
 }
 

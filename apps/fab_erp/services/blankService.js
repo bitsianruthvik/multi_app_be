@@ -62,12 +62,17 @@
  * shared rather than repeated at each call site.
  */
 
-import { pool } from '../../../db.js';
-import { resolveFields } from './fieldService.js';
+import { pool, getLiveConnection } from '../../../db.js';
+import { resolveFields, setFieldsBulk } from './fieldService.js';
 import { resolveItemFields } from './itemFieldService.js';
 import { DEFAULT_DENSITY } from './fieldDeriveService.js';
-import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
+import { weightFactorsForParts, axisConflicts } from './materialMatchService.js';
+import { recomputeOrderWeights } from './itemWeightService.js';
+import { NOT_A_BLANK, IS_A_BLANK, isMadeChildlessLeaf, rolledQty as rolledQtyOf } from './blankPredicate.js';
+import { lineQtyMap } from './orderLineQty.js';
 import { deriveCodes, generateCode } from './codegenService.js';
+import { verify as verifyPacking } from './nestingPacker.js';
+import { kerfFor } from './kerfService.js';
 
 export { NOT_A_BLANK } from './blankPredicate.js';
 import { materializeOrderTasks } from './taskGatingService.js';
@@ -135,14 +140,7 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
        FROM fab_items p
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND NOT p.node_kind = 'material'
-        AND COALESCE(p.procurement_type, 'make') = 'make'
-        AND NOT EXISTS (
-          SELECT 1 FROM fab_items k
-           WHERE k.parent_item_id = p.id AND k.deleted_at IS NULL
-             AND NOT k.node_kind = 'material')
-        -- A blank is childless apart from its plate, so without this it reads
-        -- as a made leaf and the order grows blanks of blanks on every re-nest.
-        AND ${NOT_A_BLANK('p')}
+        AND ${isMadeChildlessLeaf('p')}
       ORDER BY p.id`,
     [companyId, orderId],
   );
@@ -154,22 +152,20 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
    * the row's own number understated one order by 96%.
    */
   const [allRows] = await exec.query(
-    `SELECT id, parent_item_id AS parentItemId, qty FROM fab_items
+    `SELECT id, parent_item_id AS parentItemId, qty, order_line_id AS orderLineId FROM fab_items
       WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
         AND NOT node_kind = 'material'`,
     [companyId, orderId],
   );
   const nodeById = new Map(allRows.map((r) => [Number(r.id), r]));
-  const rolledQty = (partId) => {
-    let multiplier = 1;
-    let at = nodeById.get(Number(partId));
-    for (let hops = 0; at && hops < 64; hops += 1) {   // cycle guard, not optimism
-      multiplier *= Number(at.qty) || 0;
-      if (at.parentItemId == null) break;
-      at = nodeById.get(Number(at.parentItemId));
-    }
-    return Math.round(multiplier);
-  };
+  /**
+   * A blank plan for a line of qty 3 lays out three times the pieces (User
+   * Clarifications 5) — the honest answer, and what makes the plate count
+   * right once nesting collapses these onto shared sheets. `lineQty` is
+   * looked up once per order, not once per part.
+   */
+  const lineQty = await lineQtyMap(exec, companyId, orderId);
+  const rolledQty = (partId) => rolledQtyOf(nodeById, partId, lineQty);
 
   const ids = parts.map((p) => Number(p.id));
   const nums = await resolveItemFields(companyId, ids, { conn: existingConn ?? undefined });
@@ -178,6 +174,17 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
     companyId, ids.map((id) => ({ scope: 'order_item', scopeId: id })),
     { conn: existingConn ?? undefined },
   );
+
+  /*
+   * DENSITY, resolved the way the weight roll-up resolves it for an un-nested
+   * part: from the catalogue, keyed on the part's material / grade / thickness
+   * (`weightFactorsForParts`). The blank has to CARRY this number. Once a part
+   * is nested its material link points at the blank, and `itemWeightService`
+   * reads density off the linked catalogue row and nothing else — so a blank
+   * without one turns every part cut from it to "weight unknown", on an order
+   * that weighed correctly the day before. The KEPL order lost 669 t this way.
+   */
+  const factors = await weightFactorsForParts(companyId, ids, { conn: existingConn ?? undefined });
 
   const byKey = new Map();
   const skipped = [];
@@ -207,7 +214,10 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
       continue;
     }
 
-    const density = Number.isFinite(Number(n.density_kg_m3)) ? Number(n.density_kg_m3) : DEFAULT_DENSITY;
+    const fromSpec = factors.get(Number(p.id))?.density;
+    const density = Number.isFinite(Number(fromSpec)) && Number(fromSpec) > 0 ? Number(fromSpec)
+      : (Number.isFinite(Number(n.density_kg_m3)) && Number(n.density_kg_m3) > 0 ? Number(n.density_kg_m3)
+        : DEFAULT_DENSITY);
     const shape = { material: String(material), grade: String(grade), thickness, width, length };
     const key = blankKey(shape);
     const qty = rolledQty(p.id);
@@ -216,6 +226,7 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
       ...shape,
       key,
       qty: 0,
+      density,
       unitWeightKg: thickness * width * length * density / 1e9,
       parts: [],
       catalogItemId: null,
@@ -286,7 +297,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
     if (!sub) {
       const [r] = await conn.query(
         `INSERT INTO fab_item_subgroups (company_id, group_id, name, code, description, created_at)
-         VALUES (?,?,?,?,?,NOW())`,
+         VALUES (?,?,?,?,?,UTC_TIMESTAMP())`,
         [companyId, group.id, orderNumber, `BLK-${orderRef(orderNumber)}`,
           `Blanks cut for ${orderNumber}`],
       );
@@ -295,16 +306,11 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
       await conn.query(`UPDATE fab_item_subgroups SET deleted_at = NULL WHERE id = ?`, [sub.id]);
     }
 
-    const [fields] = await conn.query(
-      `SELECT id, field_key, default_unit FROM fab_fields
-        WHERE company_id = ? AND deleted_at IS NULL
-          AND field_key IN ('thickness_mm','width_mm','length_mm','material','grade','unit_weight_kg')`,
-      [companyId],
-    );
-    const fieldOf = new Map(fields.map((f) => [f.field_key, f]));
-
     let created = 0;
     let updated = 0;
+    // Field writes are batched across every blank into one setFieldsBulk call
+    // below, instead of one raw INSERT per key per blank.
+    const fieldRows = [];
 
     for (const b of blanks) {
       const [[existing]] = await conn.query(
@@ -315,10 +321,10 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
         await conn.query(
           `UPDATE fab_item_catalog
               SET name = ?, unit = 'nos', category_id = ?, group_id = ?, subgroup_id = ?,
-                  procurement_type = 'make', thickness_mm = ?, material_form = 'blank',
-                  deleted_at = NULL
+                  procurement_type = 'make', thickness_mm = ?, density_kg_m3 = ?,
+                  material_form = 'blank', deleted_at = NULL
             WHERE id = ? AND company_id = ?`,
-          [b.name, group.categoryId, group.id, sub.id, b.thickness, existing.id, companyId],
+          [b.name, group.categoryId, group.id, sub.id, b.thickness, b.density, existing.id, companyId],
         );
         b.catalogItemId = Number(existing.id);
         updated += 1;
@@ -338,9 +344,9 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
        */
           `INSERT INTO fab_item_catalog
              (company_id, name, code, unit, category_id, group_id, subgroup_id,
-              procurement_type, thickness_mm, material_form, description, created_at)
-           VALUES (?,?,?,'nos',?,?,?,'make',?,'blank',?,NOW())`,
-          [companyId, b.name, b.code, group.categoryId, group.id, sub.id, b.thickness,
+              procurement_type, thickness_mm, density_kg_m3, material_form, description, created_at)
+           VALUES (?,?,?,'nos',?,?,?,'make',?,?,'blank',?,UTC_TIMESTAMP())`,
+          [companyId, b.name, b.code, group.categoryId, group.id, sub.id, b.thickness, b.density,
             `${b.material} ${b.grade} plate, ${b.thickness} x ${b.width} x ${b.length}, cut for ${orderNumber}.`],
         );
         b.catalogItemId = r.insertId;
@@ -354,25 +360,22 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
        *
        * ON DUPLICATE KEY UPDATE always: `uq_ffv_target` counts soft-deleted
        * rows, so delete-then-insert collides with the row just removed.
+       *
+       * `density_kg_m3` is written as a value AND as the column above, the way
+       * fieldProjection.js keeps the two: the roll-up reads the column, the
+       * material matcher reads the value. Leave either out and a nested part
+       * weighs nothing.
        */
       const vals = [
-        ['thickness_mm', b.thickness, null], ['width_mm', b.width, null], ['length_mm', b.length, null],
-        ['unit_weight_kg', b.unitWeightKg, null],
-        ['material', null, b.material], ['grade', null, b.grade],
+        ['thickness_mm', b.thickness], ['width_mm', b.width], ['length_mm', b.length],
+        ['unit_weight_kg', b.unitWeightKg], ['density_kg_m3', b.density],
+        ['material', b.material], ['grade', b.grade],
       ];
-      for (const [key, num, txt] of vals) {
-        const f = fieldOf.get(key);
-        if (!f) continue;
-        await conn.query(
-          `INSERT INTO fab_field_values
-             (company_id, field_id, scope, scope_id, value_num, value_text, unit_code, created_at)
-           VALUES (?,?,'catalog_item',?,?,?,?,NOW())
-           ON DUPLICATE KEY UPDATE
-             value_num = VALUES(value_num), value_text = VALUES(value_text), deleted_at = NULL`,
-          [companyId, f.id, b.catalogItemId, num, txt, f.default_unit ?? null],
-        );
+      for (const [key, value] of vals) {
+        fieldRows.push({ scopeId: b.catalogItemId, key, value });
       }
     }
+    if (fieldRows.length) await setFieldsBulk(companyId, 'catalog_item', fieldRows, conn);
 
     /*
      * BLANKS THAT ARE NO LONGER CALLED FOR are retired, not left lying about.
@@ -389,7 +392,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
     );
     if (stale.length) {
       await conn.query(
-        `UPDATE fab_item_catalog SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)`,
+        `UPDATE fab_item_catalog SET deleted_at = UTC_TIMESTAMP() WHERE company_id = ? AND id IN (?)`,
         [companyId, stale.map((s) => s.id)],
       );
     }
@@ -442,7 +445,7 @@ export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
       `INSERT INTO fab_orders
          (company_id, order_number, order_type, mo_purpose, status, source_order_id,
           plant_id, required_date, notes, created_at)
-       VALUES (?,?,'manufacturing','cutting','draft',?,?,?,?,NOW())`,
+       VALUES (?,?,'manufacturing','cutting','draft',?,?,?,?,UTC_TIMESTAMP())`,
       [companyId, orderNumber, salesOrderId, sales.plantId ?? null, sales.requiredDate ?? null,
         `Plate to blanks for ${sales.orderNumber}`],
     );
@@ -466,6 +469,92 @@ export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
   );
 
   return { ...mo, sales, created, tasksClaimed: claim?.affectedRows ?? 0 };
+}
+
+/**
+ * The next nest number for an order, per §13 "A nest is one plate, and
+ * `nest_no` is the only thing that says so" — sheets are numbered PER ORDER,
+ * not per blank/catalog item, so two different plates on the same order never
+ * share a label. Reads the high-water mark off whatever is still live; callers
+ * that are about to replace the whole order's nests (as `acceptNestingPlan`
+ * does) call this AFTER wiping the old rows, so it correctly restarts at 1.
+ */
+export async function nextNestNo(conn, companyId, orderId) {
+  const [[row]] = await conn.query(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(nest_no, 3) AS UNSIGNED)), 0) AS maxNo
+       FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+        AND nest_no REGEXP '^N-[0-9]+$'`,
+    [companyId, orderId],
+  );
+  return Number(row?.maxNo) || 0;
+}
+
+/**
+ * The real plate behind a nest entry from a client-supplied plan — a catalogue
+ * size (`plateCatalogItemId` > 0) or a specific offcut (< 0, the negative of
+ * its `fab_stock_pieces.id`, `plateSourceService.offcutSpecs`'s own encoding).
+ * Batched (two queries total, not one per nest) so accepting a 130-plate plan
+ * does not run 130 round trips to learn what it already named.
+ */
+async function resolvePlatesForNests(conn, companyId, nests) {
+  const rawIds = nests.map((n) => Number(n.plateCatalogItemId)).filter(Number.isFinite);
+  const catalogIds = [...new Set(rawIds.filter((id) => id > 0))];
+  const dropIds = [...new Set(rawIds.filter((id) => id < 0).map((id) => -id))];
+
+  const byId = new Map();
+  if (catalogIds.length) {
+    const [rows] = await conn.query(
+      `SELECT ic.id, ic.code, ic.name, ic.thickness_mm AS thickness
+         FROM fab_item_catalog ic WHERE ic.company_id = ? AND ic.id IN (?) AND ic.deleted_at IS NULL`,
+      [companyId, catalogIds],
+    );
+    const resolved = await resolveFields(
+      companyId, rows.map((r) => ({ scope: 'catalog_item', scopeId: r.id })), { conn },
+    );
+    for (const r of rows) {
+      const f = resolved.get(`catalog_item:${r.id}`) ?? {};
+      const length = Number(f.length_mm?.value);
+      const width = Number(f.width_mm?.value);
+      byId.set(Number(r.id), {
+        catalogItemId: Number(r.id), code: r.code, name: r.name,
+        thickness: r.thickness != null ? Number(r.thickness) : null,
+        length: Number.isFinite(length) ? length : null,
+        width: Number.isFinite(width) ? width : null,
+        grade: f.grade?.value ?? null, material: f.material?.value ?? null,
+        isDrop: false, pieceId: null,
+      });
+    }
+  }
+
+  const byPiece = new Map();
+  if (dropIds.length) {
+    const [rows] = await conn.query(
+      `SELECT p.id AS pieceId, p.catalog_item_id AS catalogItemId, p.code,
+              p.length_mm AS length, p.width_mm AS width,
+              ic.name AS name, ic.thickness_mm AS thickness
+         FROM fab_stock_pieces p JOIN fab_item_catalog ic ON ic.id = p.catalog_item_id AND ic.deleted_at IS NULL
+        WHERE p.company_id = ? AND p.id IN (?) AND p.deleted_at IS NULL`,
+      [companyId, dropIds],
+    );
+    for (const r of rows) {
+      byPiece.set(Number(r.pieceId), {
+        catalogItemId: Number(r.catalogItemId), code: r.code, name: r.name,
+        thickness: r.thickness != null ? Number(r.thickness) : null,
+        length: Number(r.length) || null, width: Number(r.width) || null,
+        // Neither is on the piece itself — an offcut carries no grade/material
+        // of its own, only its parent catalogue item's. Left unknown rather
+        // than guessed; axisConflicts treats an unknown side as no conflict.
+        grade: null, material: null, isDrop: true, pieceId: Number(r.pieceId),
+      });
+    }
+  }
+
+  return (n) => {
+    const raw = Number(n.plateCatalogItemId);
+    if (!Number.isFinite(raw)) return null;
+    return raw < 0 ? (byPiece.get(-raw) ?? null) : (byId.get(raw) ?? null);
+  };
 }
 
 /**
@@ -501,7 +590,15 @@ export async function ensureCuttingOrder(companyId, salesOrderId, conn) {
  * is most of them.
  */
 export async function acceptNestingPlan(companyId, orderId, plan = {}, existingConn = null) {
-  const conn = existingConn ?? await pool.getConnection();
+  /*
+   * A PROVEN-ALIVE connection. A background run (nestingRunService) can spend
+   * minutes packing before anyone presses Accept, and every pooled connection
+   * has been idle that whole time — TiDB Cloud hangs up on an idle session, so
+   * a plain `pool.getConnection()` can hand back a closed socket and the whole
+   * accept dies on `beginTransaction()` for a reason that has nothing to do
+   * with the plan (nestingSuggestService.acceptSuggestion hit this first).
+   */
+  const conn = existingConn ?? await getLiveConnection();
   const owned = !existingConn;
   try {
     if (owned) await conn.beginTransaction();
@@ -566,6 +663,128 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     }
 
     /*
+     * VERIFY THE GEOMETRY BEFORE TOUCHING ANYTHING. Until now `acceptNestingPlan`
+     * wrote the request's own `n.length`/`n.width` straight onto the material
+     * rows and never asked whether the pieces named actually fit the plate
+     * named, or whether the plate named even existed (a drop's negative
+     * `plateCatalogItemId` looked up nothing in `fab_item_catalog` and was
+     * silently skipped — the part it carried lost its material with no error).
+     *
+     * Everything here reads from the DB (catalogue / stock piece), never from
+     * the request, and none of it writes — so a rejected plan leaves the order
+     * exactly as it was.
+     */
+    const nests0 = Array.isArray(plan?.nests) ? plan.nests : [];
+    const resolvePlate = await resolvePlatesForNests(conn, companyId, nests0);
+
+    // What THIS BLANK already carries, read before anything is wiped — the
+    // only way to tell a genuine re-nest (new sheets, same or larger coverage)
+    // from a partial accept that quietly dropped one of several sheets a row
+    // was split across (§13 "A part row is ATOMIC to one plate").
+    const oldCovered = new Map();
+    {
+      const catalogIdToKey = new Map(mat.blanks.map((b) => [Number(b.catalogItemId), b.key]));
+      const liveIds = [...catalogIdToKey.keys()];
+      if (liveIds.length) {
+        const [rows] = await conn.query(
+          `SELECT b.catalog_item_id AS blankCatalogItemId, SUM(m.qty) AS qty
+             FROM fab_items m
+             JOIN fab_items b ON b.id = m.parent_item_id AND b.deleted_at IS NULL
+            WHERE m.company_id = ? AND m.order_id = ? AND m.node_kind = 'material'
+              AND m.deleted_at IS NULL AND b.catalog_item_id IN (?)
+            GROUP BY b.catalog_item_id`,
+          [companyId, orderId, liveIds],
+        );
+        for (const r of rows) {
+          const key = catalogIdToKey.get(Number(r.blankCatalogItemId));
+          if (key) oldCovered.set(key, Number(r.qty) || 0);
+        }
+      }
+    }
+
+    const byBlankKey = new Map(mat.blanks.map((b) => [b.key, b]));
+    const newCovered = new Map();
+    const packerPlates = [];
+    const problems = [];
+    const kerfCache = new Map();
+
+    for (const n of nests0) {
+      if (!Array.isArray(n.items) || !n.items.length) continue;
+      const label = n.nestNo ?? '(unnumbered nest)';
+      const info = resolvePlate(n);
+      if (!info) { problems.push(`${label}: names a plate that is no longer in the catalog or stock.`); continue; }
+      if (!Number.isFinite(info.thickness) || !Number.isFinite(info.length) || !Number.isFinite(info.width)) {
+        problems.push(`${label}: plate ${info.code ?? info.catalogItemId} has no recorded size.`);
+        continue;
+      }
+      const items = new Map();
+      for (const it of n.items) items.set(it.key, (items.get(it.key) ?? 0) + (Number(it.qty) || 0));
+
+      const rows = [];
+      for (const [key, qty] of items) {
+        const b = byBlankKey.get(key);
+        if (!b) { problems.push(`${label}: names a blank this order no longer needs.`); continue; }
+        for (const c of axisConflicts(
+          { thickness: b.thickness, grade: b.grade, material: b.material },
+          { thickness: info.thickness, grade: info.grade, material: info.material },
+        )) {
+          problems.push(`${label}: ${b.code} is ${c.partValue} but plate ${info.code ?? info.catalogItemId} `
+            + `is ${c.plateValue} (${c.axis}).`);
+        }
+        rows.push({ key, length: b.length, width: b.width, qty });
+        newCovered.set(key, (newCovered.get(key) ?? 0) + qty);
+      }
+      if (rows.length) {
+        const kerfMm = await kerfFor(companyId, info.thickness, 'cutting', kerfCache);
+        /*
+         * THE LAYOUT TRAVELS WITH THE PLAN. A sheet that arrives with its
+         * pieces (every packer run sends them) is verified exactly — inside
+         * the sheet, no overlaps, the right sizes and counts — instead of
+         * being re-solved from empty, which could refuse a layout the search
+         * only found by trying. A hand-made sheet has no pieces and is still
+         * re-packed to prove it.
+         */
+        const pieces = Array.isArray(n.pieces) && n.pieces.length
+          ? n.pieces.map((q) => ({
+            key: String(q.key), x: Number(q.x), y: Number(q.y), l: Number(q.l), w: Number(q.w), rotated: !!q.rotated,
+          })).filter((q) => [q.x, q.y, q.l, q.w].every(Number.isFinite))
+          : undefined;
+        packerPlates.push({
+          spec: { id: info.catalogItemId, length: info.length, width: info.width, code: info.code },
+          rows, margin: kerfMm, pieces,
+        });
+      }
+    }
+
+    // The packer's own honesty check (EU-10: repacks each plate's FULL row set
+    // from empty) — does every piece named actually fit the plate named, and
+    // does the plate hold no more area than it has.
+    for (const p of verifyPacking(packerPlates)) problems.push(p);
+
+    const EPS = 1e-6;
+    for (const b of mat.blanks) {
+      const placed = newCovered.get(b.key) ?? 0;
+      const was = oldCovered.get(b.key) ?? 0;
+      if (placed > b.qty + EPS) {
+        problems.push(`${b.code}: this plan nests ${placed} of it but only ${b.qty} are needed `
+          + '(demand already includes line quantity).');
+      } else if (was - placed > EPS && b.qty - placed > EPS) {
+        // Was covered by MORE than this plan covers, and is still short of
+        // demand either way — the signature of "un-ticked" a sheet rather than
+        // a deliberate reduction in what the order needs.
+        problems.push(`${b.code}: was cut ${was} of ${b.qty}; this plan only covers ${placed}. `
+          + 'A part row is atomic to one plate — accept every sheet it is split across, or none.');
+      }
+    }
+
+    if (problems.length) {
+      const e = new Error(`This plan could not be verified:\n${problems.slice(0, 12).join('\n')}`
+        + (problems.length > 12 ? `\n…and ${problems.length - 12} more` : ''));
+      e.status = 422; e.code = 'NEST_NOT_VERIFIED'; e.detail = { nests: problems };
+      throw e;
+    }
+
+    /*
      * A rectangle the order no longer needs takes its row with it. Editing the
      * structure changes which blanks exist, and a cutting line for something
      * nobody is making would still be scheduled and still draw plate.
@@ -587,10 +806,10 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
         e.status = 409; e.code = 'WORK_STARTED'; throw e;
       }
       await conn.query(
-        `UPDATE fab_project_tasks SET deleted_at = NOW()
+        `UPDATE fab_project_tasks SET deleted_at = UTC_TIMESTAMP()
           WHERE company_id = ? AND item_id IN (?) AND deleted_at IS NULL`, [companyId, ids]);
       await conn.query(
-        `UPDATE fab_items SET deleted_at = NOW()
+        `UPDATE fab_items SET deleted_at = UTC_TIMESTAMP()
           WHERE company_id = ? AND (id IN (?) OR parent_item_id IN (?)) AND deleted_at IS NULL`,
         [companyId, ids, ids]);
     }
@@ -610,25 +829,32 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     const rowIds = [...blankRowId.values()];
     if (rowIds.length) {
       await conn.query(
-        `UPDATE fab_items SET deleted_at = NOW()
+        `UPDATE fab_items SET deleted_at = UTC_TIMESTAMP()
           WHERE company_id = ? AND parent_item_id IN (?) AND node_kind = 'material'
             AND deleted_at IS NULL`,
         [companyId, rowIds],
       );
     }
 
-    const nests = Array.isArray(plan?.nests) ? plan.nests : [];
     let platesLinked = 0;
-    let sheets = 0;
-    for (const n of nests) {
-      if (!n?.plateCatalogItemId || !Array.isArray(n.items) || !n.items.length) continue;
-      const [[pc]] = await conn.query(
-        `SELECT id, code, name, thickness_mm AS thickness FROM fab_item_catalog
-          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-        [n.plateCatalogItemId, companyId],
-      );
-      if (!pc) continue;
+    // `sheets` (nextNestNo's high-water mark, +1 per row below) is the counter
+    // that NAMES each new sheet — that logic is unchanged. `sheetsWritten` is
+    // a separate count of sheets this accept actually wrote, which is what
+    // `out.sheets` reports: `sheets` alone is the LAST nest number on the
+    // whole order, not how many this call added, whenever the order already
+    // had other nested parts before this accept ran.
+    let sheets = await nextNestNo(conn, companyId, orderId);
+    let sheetsWritten = 0;
+    let offcutsClaimed = 0;
+    for (const n of nests0) {
+      if (!Array.isArray(n.items) || !n.items.length) continue;
+      // Already proved to resolve, above — verification and the write below
+      // must agree on what a nest names, or a plan could pass the check and
+      // write something else.
+      const info = resolvePlate(n);
+      if (!info) continue;
       sheets += 1;
+      sheetsWritten += 1;
       const nestNo = n.nestNo ?? `N-${String(sheets).padStart(3, '0')}`;
 
       /*
@@ -641,6 +867,7 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
         items.set(it.key, (items.get(it.key) ?? 0) + (Number(it.qty) || 0));
       }
 
+      let piecesOnThisSheet = 0;
       for (const [itemKey, itemQty] of items) {
         const it = { key: itemKey, qty: itemQty };
         const parentId = blankRowId.get(it.key);
@@ -652,12 +879,98 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
               name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
               flow_id, nest_no, length, width, height)
            VALUES (?,?,NULL,?,?,?,'nos',?,?,'material',1,1,'buy',NULL,?,?,?,?)`,
-          [companyId, orderId, parentId, pc.id, pc.name, Number(it.qty) || 1,
-            `${blank?.code ?? it.key}-${pc.code}-${nestNo}`, nestNo,
-            n.length ?? null, n.width ?? null, pc.thickness ?? null],
+          [companyId, orderId, parentId, info.catalogItemId, info.name ?? info.code, Number(it.qty) || 1,
+            `${blank?.code ?? it.key}-${info.code ?? info.catalogItemId}-${nestNo}`, nestNo,
+            info.length, info.width, info.thickness],
         );
         platesLinked += 1;
+        piecesOnThisSheet += Number(it.qty) || 0;
       }
+
+      /*
+       * A DROP IS ONE PHYSICAL PIECE, SO ACCEPTING A NEST ON ONE CLAIMS IT.
+       *
+       * Moved from `nestingSuggestService.acceptSuggestion` (deleted whole in
+       * EU-20) — the suggestor reserved a drop it nested onto; the blank path
+       * reserved nothing, so two orders could each plan around the same
+       * offcut and only one would find steel at the torch. Conditional on the
+       * piece still being free, so two accepts racing cannot both claim it —
+       * the loser is told rather than silently given someone else's plate.
+       */
+      if (info.isDrop && info.pieceId && piecesOnThisSheet > 0) {
+        // The INSERT…SELECT below is a NOT EXISTS read against
+        // fab_stock_reservations, which has only a non-unique index — nothing
+        // stops two accepts racing on the same offcut from both reading "free"
+        // before either writes. Locking the stock piece row itself is what
+        // actually serializes them: the second transaction blocks here until
+        // the first commits (and its reservation becomes visible) or rolls back.
+        await conn.query(
+          'SELECT id FROM fab_stock_pieces WHERE id = ? AND company_id = ? FOR UPDATE',
+          [info.pieceId, companyId],
+        );
+        const [claim] = await conn.query(
+          // kind='order', not the column's default of 'task': the ORDER is
+          // laying claim to a piece at planning time, before any task exists
+          // to hold it.
+          `INSERT INTO fab_stock_reservations
+             (company_id, order_id, catalog_item_id, stock_piece_id, qty, status, kind, notes, created_at)
+           SELECT ?, ?, ?, p.id, p.qty, 'active', 'order',
+                  CONCAT('nested onto offcut ', COALESCE(p.code, p.id)), UTC_TIMESTAMP()
+             FROM fab_stock_pieces p
+            WHERE p.id = ? AND p.company_id = ? AND p.status = 'in_stock' AND p.deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM fab_stock_reservations r
+                               WHERE r.stock_piece_id = p.id AND r.status = 'active'
+                                 AND r.deleted_at IS NULL)`,
+          [companyId, orderId, info.catalogItemId, info.pieceId, companyId],
+        );
+        if (!claim.affectedRows) {
+          const e = new Error(
+            `Offcut ${info.code ?? info.pieceId} has just been claimed by another order, so ${nestNo} `
+            + 'is no longer free. Re-run the plan.');
+          e.status = 409; e.code = 'OFFCUT_CLAIMED'; throw e;
+        }
+        offcutsClaimed += 1;
+      }
+    }
+
+    /*
+     * ── THE ACCEPTED LAYOUTS, KEPT ──────────────────────────────────────────
+     *
+     * The material rows above record WHAT is on each sheet (qty per blank per
+     * nest_no), never WHERE. So an accepted plan used to be drawn back from a
+     * fresh re-pack of each sheet — a display layout, not the one accepted,
+     * and one that could even fail to fit. The per-piece geometry that came
+     * with the plan is kept here, on a `fab_nesting_runs` row of its own kind,
+     * keyed by nest_no; `blankPlanService.savedNests` reads it back and only
+     * falls back to re-packing when a sheet has no layout on record (a hand-
+     * made sheet, or a plan accepted before layouts were kept).
+     */
+    const layouts = nests0
+      .filter((n) => Array.isArray(n.items) && n.items.length && Array.isArray(n.pieces) && n.pieces.length)
+      .map((n) => ({
+        nestNo: n.nestNo ?? null,
+        plateCatalogItemId: resolvePlate(n)?.catalogItemId ?? null,
+        length: Number(n.length) || null,
+        width: Number(n.width) || null,
+        items: n.items.map((it) => ({ key: it.key, qty: Number(it.qty) || 0 })),
+        pieces: n.pieces.map((q) => ({
+          key: String(q.key), x: Number(q.x), y: Number(q.y), l: Number(q.l), w: Number(q.w), rotated: !!q.rotated,
+        })),
+      }))
+      .filter((n) => n.nestNo);
+    await conn.query(
+      `UPDATE fab_nesting_runs SET deleted_at = UTC_TIMESTAMP()
+        WHERE company_id = ? AND order_id = ? AND kind = 'accepted' AND deleted_at IS NULL`,
+      [companyId, orderId],
+    );
+    if (layouts.length) {
+      await conn.query(
+        `INSERT INTO fab_nesting_runs
+           (company_id, order_id, kind, effort, status, progress, params_json, result_json,
+            started_at, finished_at, created_at)
+         VALUES (?,?,'accepted',NULL,'done',100,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP(),UTC_TIMESTAMP())`,
+        [companyId, orderId, JSON.stringify({ provenance: plan?.provenance ?? null }), JSON.stringify({ nests: layouts })],
+      );
     }
 
     // ── every part now comes off its blank, not off plate ──────────────────
@@ -665,7 +978,7 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     for (const b of mat.blanks) {
       for (const part of b.parts) {
         await conn.query(
-          `UPDATE fab_items SET deleted_at = NOW()
+          `UPDATE fab_items SET deleted_at = UTC_TIMESTAMP()
             WHERE company_id = ? AND parent_item_id = ? AND node_kind = 'material'
               AND deleted_at IS NULL`,
           [companyId, part.itemId],
@@ -689,6 +1002,14 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     // ── the work, and the order that owns it ───────────────────────────────
     const materialized = await materializeOrderTasks(conn, companyId, orderId);
     const po = await ensureCuttingOrder(companyId, orderId, conn);
+
+    /*
+     * WEIGH IT NOW. Every material link on the order was just rewritten, and
+     * weight is read off those links; leaving the roll-up for a later button
+     * press meant the order screen showed the pre-nesting figures until then,
+     * and any bug in the links above stayed invisible.
+     */
+    const weights = await recomputeOrderWeights(companyId, orderId, conn);
 
     /*
      * RECORD HOW THIS PLAN WAS ARRIVED AT, so the screen can say so later.
@@ -717,16 +1038,34 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
       rowsUpdated,
       rowsRetired: stale.length,
       platesLinked,
-      sheets,
+      sheets: sheetsWritten,
+      offcutsClaimed,
       partsRepointed,
       tasks: materialized?.tasksInserted ?? 0,
       tasksClaimed: po.tasksClaimed ?? 0,
+      totalWeightKg: weights.totalWeight,
+      unweighedLeaves: weights.unweighedLeaves,
       skipped: mat.skipped,
     };
     logger.info({ companyId, orderId, ...out }, 'fab_erp: nesting plan accepted');
     return out;
   } catch (err) {
-    if (owned) await conn.rollback();
+    if (owned) {
+      /*
+       * LOGGED, NEVER SWALLOWED. A dead socket makes `rollback()` itself throw
+       * ("Can't add new command when connection is in closed state"), and that
+       * secondary error used to replace the real one — a 409 for an offcut
+       * already claimed, or the 422 below, silently became a 500 about a
+       * closed connection. The transaction is gone either way once the socket
+       * is; there is nothing left to undo, but there IS something to log.
+       */
+      try {
+        await conn.rollback();
+      } catch (rollbackErr) {
+        logger.warn({ err: rollbackErr, companyId, orderId },
+          'fab_erp: rollback failed after a nesting accept error (connection likely dead)');
+      }
+    }
     throw err;
   } finally {
     if (owned) conn.release();

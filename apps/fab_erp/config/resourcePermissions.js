@@ -110,6 +110,18 @@ const resourcePermissions = {
   fabErpStockPolicy:   'fab_erp_inventory_manage',
   fabErpStockPiece:    'fab_erp_inventory_manage',
   fabErpStockLedger:   'fab_erp_inventory_manage',
+
+  // EU-1 (2026-09-13): structure-revision log and nesting-run tracker are both
+  // read-only from the client (writeFields: []) but still need an entry here —
+  // mutateController 400s on any resource missing from this map before it
+  // reaches the admin bypass, same trap as fabErpField above. Both hang off an
+  // order, so they take the same tag as the order resources they describe.
+  fabErpOrderStructureRevision: 'fab_erp_projects_manage',
+  fabErpNestingRun:             'fab_erp_projects_manage',
+
+  // Cutting-kerf bands — company-scoped resource master data, same gate as
+  // every other fab_erp_resources_manage-gated table (fabErpResource et al.).
+  fabErpCuttingKerf: 'fab_erp_resources_manage',
 };
 
 export default resourcePermissions;

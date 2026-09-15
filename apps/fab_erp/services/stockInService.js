@@ -77,6 +77,10 @@ function batchIdentity(piece) {
  * @param {string|null} [input.uom]
  * @param {number|null} [input.unit_cost]
  * @param {string|null} [input.notes]
+ * @param {string|null} [input.source] EU-14: e.g. 'free_issue' — who this
+ *   material came from, as opposed to an ordinary purchase receipt (NULL).
+ * @param {string|null} [input.customer_ref] EU-14: the customer's own
+ *   reference for a free-issue receipt (their DC/challan number, say).
  * @param {Array<{qty:number, batch_no?, heat_no?, serial_no?, mark_no?}>} input.pieces
  * @returns {Promise<{ok:true, pieceIds:number[], qtyTotal:number, tasksCleared:number[],
  *   gateCheckFailed:boolean, dimensionRejections:Array<{pieceId,code,rejected}>}>}
@@ -90,6 +94,8 @@ export async function receiveStock(companyId, input, outerConn = null) {
     uom = null,
     unit_cost: unitCost = null,
     notes = null,
+    source = null,
+    customer_ref: customerRef = null,
     pieces = [],
   } = input ?? {};
 
@@ -156,8 +162,8 @@ export async function receiveStock(companyId, input, outerConn = null) {
         `INSERT INTO fab_stock_pieces
            (company_id, code, catalog_item_id, plant_id, stock_location_id,
             batch_no, heat_no, serial_no, mark_no, qty, uom, unit_cost,
-            status, received_date, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)`,
+            status, received_date, notes, source, customer_ref)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_stock', ?, ?, ?, ?)`,
         [
           companyId, code,
           catalogItemId, plantId, stockLocationId,
@@ -166,6 +172,10 @@ export async function receiveStock(companyId, input, outerConn = null) {
           // NULL sorts last — a piece received with no date would be consumed
           // after everything else regardless of when it actually arrived.
           receivedDate, notes,
+          // EU-14: 'free_issue' + customer_ref record who this material really
+          // belongs to. NULL for an ordinary purchase receipt — every existing
+          // caller of this function, so every existing piece is unaffected.
+          source, customerRef,
         ],
       );
 
@@ -209,17 +219,24 @@ export async function receiveStock(companyId, input, outerConn = null) {
         }
       }
 
+      // EU-14 / §13 "Stock must never move without a ledger row": free-issue
+      // has no ledger column of its own, so it is recorded in `notes` — the
+      // one free-text field this row already has — rather than left invisible
+      // to anyone reading the ledger instead of the piece.
+      const ledgerNotes = source === 'free_issue'
+        ? `free_issue${customerRef ? ` (customer ref: ${customerRef})` : ''}`
+        : null;
       await conn.query(
         `INSERT INTO fab_stock_ledger
            (company_id, catalog_item_id, plant_id, stock_location_id, batch_id,
             batch_code, piece_id, piece_code, batch_no, serial_no, heat_no, mark_no,
-            txn_type, qty, unit_cost, txn_date)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'stock_in', ?, ?, ?)`,
+            txn_type, qty, unit_cost, txn_date, notes)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'stock_in', ?, ?, ?, ?)`,
         [
           companyId, catalogItemId, plantId, stockLocationId,
           batchIdentity(piece), pieceId, code,
           batchNo, serialNo, heatNo, markNo,
-          qty, unitCost, receivedDate,
+          qty, unitCost, receivedDate, ledgerNotes,
         ],
       );
     }

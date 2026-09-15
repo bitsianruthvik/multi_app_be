@@ -140,6 +140,7 @@ export async function generateMarksForOrder(companyId, orderId) {
          FROM fab_items i
          LEFT JOIN fab_item_catalog ic ON ic.id = i.catalog_item_id AND ic.deleted_at IS NULL
         WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+          AND i.node_kind = 'structure'
         ORDER BY i.id
         FOR UPDATE`,
       [companyId, orderId],

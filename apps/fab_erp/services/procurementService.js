@@ -29,12 +29,20 @@
 
 import { pool } from '../../../db.js';
 import { availabilityFor, availabilityBySize, sizeKey } from './availabilityService.js';
+import { LINE_QTY_SQL } from './orderLineQty.js';
 
 /** The answer for a node with no catalog link, and the fallback for an unset one. */
 export const DEFAULT_PROCUREMENT = 'make';
 
-/** What the shop can do with a thing. Anything else is not a procurement type. */
-export const PROCUREMENT_TYPES = ['make', 'buy'];
+/**
+ * What the shop can do with a thing. Anything else is not a procurement type.
+ *
+ * `free_issue` (EU-14) joins `make`/`buy`: material the CUSTOMER supplies. It
+ * is deliberately excluded from every "what do we need to purchase" query
+ * below — see `orderShortfall`'s `freeIssueLines` — while still being real
+ * catalog-linked stock that the material gate checks for like any other.
+ */
+export const PROCUREMENT_TYPES = ['make', 'buy', 'free_issue'];
 
 /**
  * The rule itself, for one row already in hand.
@@ -97,32 +105,50 @@ export async function syncOrderProcurement(conn, companyId, orderId) {
  * Grouped by catalog item for the buy side because ten parts cut from the same
  * plate are one purchase, not ten.
  *
- * @returns {Promise<{buy: object[], make: object[]}>}
+ * @param {{cache: Map}} [opts.ctx] EU-14 item E3: a per-REQUEST memo (shared
+ *   across `productionPlanService.buyView`, `orderReadinessService`'s
+ *   `summariseProcurement` and `procurementOrderService.requestProcurement`)
+ *   so a screen or action that needs this more than once in one call does not
+ *   join half a dozen tables twice. Keyed by orderId so one ctx handed to
+ *   several orders in sequence (not a real caller today, but cheap to allow)
+ *   never answers with someone else's order.
+ * @returns {Promise<{buy: object[], buySizes: object[], make: object[], freeIssue: object[]}>}
  */
-export async function orderProcurementSplit(companyId, orderId, conn) {
+export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = {}) {
+  const cacheKey = `split:${orderId}`;
+  if (ctx?.cache?.has(cacheKey)) return ctx.cache.get(cacheKey);
   const exec = conn ?? pool;
 
+  // Re-mirror before reading: syncOrderProcurement otherwise only runs on a
+  // structure write, so a catalog item flipped to free_issue (or buy/make)
+  // AFTER an order's parts were materialized would read stale here forever —
+  // the Buy screen and the shortfall it drives must see today's catalog, not
+  // the day the row was built.
+  await syncOrderProcurement(exec, companyId, orderId);
+
   /**
-   * A NEST IS PLATES, NOT PLATES-PER-PART.
+   * A NEST IS ONE PLATE, PERIOD (User Clarifications 1 + EU-4). `fi.qty` on a
+   * material link is PIECES of the part cut from that nest, never a plate
+   * count — so the un-nested and nested branches below answer different
+   * questions and must not be merged into one CASE.
    *
-   * Every link row in one nest carries that nest's PLATE COUNT — the sheet
-   * importer writes `r.plates` onto each of them, and the integrity check reads
-   * the count off whichever link it sees first. So summing qty across the links
-   * multiplies the plates by the number of parts sharing them: a 20-plate nest
-   * of 12 mm with five hundred stiffeners on it asked to buy five hundred
-   * plates. That was invisible while nests held one or two parts each and is
-   * ruinous the moment a real nesting shares a plate properly.
+   * UN-NESTED (`nest_no IS NULL`): each row is its own draw, one item at a
+   * time. The order needs this row's steel LINE_QTY times over — that is the
+   * ONE place in this branch the line-qty multiply happens (User
+   * Clarifications 3), and `order_line_id` has to survive into the GROUP BY
+   * so the right line's qty is the one that gets applied.
    *
-   * The demand for a nest is the nest's own plate count, so the rows are
-   * collapsed per nest FIRST and only then summed per item. Rows with no nest
-   * are each their own draw and still sum, which is the un-nested behaviour
-   * exactly as it was.
-   *
-   * BLANK NESTS ARE ONE SHEET. Accepting a blank plan writes one link per
-   * (blank, sheet) and its qty is how many of that BLANK the sheet carries —
-   * not a plate count. Taking MAX of it asked the KEPL order to buy 960 sheets
-   * of 12 mm where it needs 16. A nest whose links hang off blanks is therefore
-   * exactly one plate.
+   * NESTED (`nest_no IS NOT NULL`, User Clarifications 5 — supersedes the
+   * pre-EU-4 blank-only special case that used to sit here): the DEMAND fed
+   * into nesting was already multiplied by line qty before the packer ran
+   * (`blankService.orderBlanks`), so a qty-3 line's pieces are already laid
+   * out together on shared sheets. Plates needed is therefore simply the
+   * DISTINCT NESTS this catalog item occupies — one plate per nest, full stop
+   * — never `MAX(fi.qty)` (that reads a PIECE count, not a plate count, since
+   * EU-4) and never multiplied by line qty again (that would count every
+   * unit's steel a second time). Weight is taken once per nest the same way:
+   * `MAX(fi.total_weight)` is the PLATE's own weight, identical on every link
+   * that shares it.
    */
   const [buy] = await exec.query(
     `SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
@@ -131,22 +157,34 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
        FROM (
          SELECT fi.catalog_item_id,
                 COUNT(*) AS lines_count,
-                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty)
-                     WHEN MAX(pc.id IS NOT NULL) = 1 THEN 1
-                     ELSE MAX(fi.qty) END AS qty,
-                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.total_weight)
-                     ELSE MAX(fi.total_weight) END AS total_weight
+                -- CAST back to fab_items.qty's own scale: multiplying two
+                -- DECIMALs adds their scales (4+4=8), which changes nothing
+                -- numerically but reformats "8.0000" as "8.00000000" even at
+                -- the default line qty of 1 — a byte-for-byte snapshot diff
+                -- on every order with no multi-qty line, for no reason.
+                CAST(SUM(fi.qty) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty,
+                CAST(SUM(fi.total_weight) * ${LINE_QTY_SQL} AS DECIMAL(18,6)) AS total_weight
            FROM fab_items fi
-           LEFT JOIN fab_items par ON par.id = fi.parent_item_id
-           LEFT JOIN fab_item_catalog pc ON pc.id = par.catalog_item_id AND pc.material_form = 'blank'
+           LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
-            AND COALESCE(fi.procurement_type, ?) = 'buy'
+            AND COALESCE(fi.procurement_type, ?) = 'buy' AND fi.nest_no IS NULL
+          GROUP BY fi.catalog_item_id, fi.order_line_id
+
+          UNION ALL
+
+         SELECT fi.catalog_item_id,
+                COUNT(*) AS lines_count,
+                1 AS qty,
+                MAX(fi.total_weight) AS total_weight
+           FROM fab_items fi
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND COALESCE(fi.procurement_type, ?) = 'buy' AND fi.nest_no IS NOT NULL
           GROUP BY fi.catalog_item_id, fi.nest_no
        ) t
        LEFT JOIN fab_item_catalog fic ON fic.id = t.catalog_item_id
       GROUP BY t.catalog_item_id, fic.code, fic.name, fic.unit
       ORDER BY fic.code`,
-    [companyId, orderId, DEFAULT_PROCUREMENT],
+    [companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
   // The same buy side broken down by the PLATE SIZE each row asks for.
@@ -162,22 +200,34 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
        FROM (
          SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
                 COUNT(*) AS lines_count,
-                CASE WHEN fi.nest_no IS NULL THEN SUM(fi.qty)
-                     WHEN MAX(pc.id IS NOT NULL) = 1 THEN 1
-                     ELSE MAX(fi.qty) END AS qty
+                CAST(SUM(fi.qty) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty
            FROM fab_items fi
-           LEFT JOIN fab_items par ON par.id = fi.parent_item_id
-           LEFT JOIN fab_item_catalog pc ON pc.id = par.catalog_item_id AND pc.material_form = 'blank'
+           LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
             AND COALESCE(fi.procurement_type, ?) = 'buy'
-            AND fi.catalog_item_id IS NOT NULL
+            AND fi.catalog_item_id IS NOT NULL AND fi.nest_no IS NULL
+          GROUP BY fi.catalog_item_id, fi.length, fi.width, fi.height, fi.order_line_id
+
+          UNION ALL
+
+         SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
+                COUNT(*) AS lines_count,
+                1 AS qty
+           FROM fab_items fi
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND COALESCE(fi.procurement_type, ?) = 'buy'
+            AND fi.catalog_item_id IS NOT NULL AND fi.nest_no IS NOT NULL
           GROUP BY fi.catalog_item_id, fi.length, fi.width, fi.height, fi.nest_no
        ) t
       GROUP BY t.catalog_item_id, t.length, t.width, t.height
       ORDER BY t.catalog_item_id, t.length, t.width`,
-    [companyId, orderId, DEFAULT_PROCUREMENT],
+    [companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
+  // Untouched by EU-5: one row per made item, not an aggregate — `fi.qty` is
+  // deliberately the row's own per-piece figure (as intended for a listing),
+  // and there is no per-order sum here to multiply. `orderShortfall` — the
+  // only caller of this function — never reads `make` at all.
   const [make] = await exec.query(
     `SELECT fi.id, fi.parent_item_id, fi.code, fi.name, fi.node_kind, fi.qty,
             fi.unit, fi.flow_id, fi.total_weight
@@ -188,7 +238,52 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
     [companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
-  return { buy, buySizes, make };
+  /**
+   * Free-issue material, split out from `buy` on purpose (User Clarifications
+   * / EU-14 item 1): the customer supplies it, so it must never reach
+   * `orderShortfall`'s purchasable `lines` — a purchase request built off that
+   * array would ask a supplier for steel the customer is already sending.
+   * Same UNION shape as `buy` (a nested link is one plate, an un-nested row is
+   * LINE_QTY_SQL pieces) purely so the figures `orderShortfall` reports for a
+   * free-issue item (required, size) mean the same thing they mean for a
+   * bought one — the DIFFERENCE is what happens to the number afterward, not
+   * how it is added up.
+   */
+  const [freeIssue] = await exec.query(
+    `SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
+            SUM(t.lines_count) AS lines_count, SUM(t.qty) AS qty,
+            SUM(t.total_weight) AS total_weight
+       FROM (
+         SELECT fi.catalog_item_id,
+                COUNT(*) AS lines_count,
+                CAST(SUM(fi.qty) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty,
+                CAST(SUM(fi.total_weight) * ${LINE_QTY_SQL} AS DECIMAL(18,6)) AS total_weight
+           FROM fab_items fi
+           LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND fi.procurement_type = 'free_issue' AND fi.nest_no IS NULL
+          GROUP BY fi.catalog_item_id, fi.order_line_id
+
+          UNION ALL
+
+         SELECT fi.catalog_item_id,
+                COUNT(*) AS lines_count,
+                1 AS qty,
+                MAX(fi.total_weight) AS total_weight
+           FROM fab_items fi
+          WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
+            AND fi.procurement_type = 'free_issue' AND fi.nest_no IS NOT NULL
+          GROUP BY fi.catalog_item_id, fi.nest_no
+       ) t
+       LEFT JOIN fab_item_catalog fic ON fic.id = t.catalog_item_id
+      GROUP BY t.catalog_item_id, fic.code, fic.name, fic.unit
+      ORDER BY fic.code`,
+    [companyId, orderId, companyId, orderId],
+  );
+
+  const result = { buy, buySizes, make, freeIssue };
+  if (ctx?.cache) ctx.cache.set(cacheKey, result);
+  return result;
 }
 
 /**
@@ -210,10 +305,21 @@ export async function orderProcurementSplit(companyId, orderId, conn) {
  * folded into the totals, because silently dropping them would understate the
  * shortfall and quietly under-order.
  *
- * @returns {Promise<{lines: object[], unmatched: object[], shortCount: number}>}
+ * FREE-ISSUE (EU-14) never enters `lines`/`shortCount` at all — the customer
+ * supplies it, so nothing here may ever compute a `short` for it or feed it to
+ * `procurementOrderService.requestProcurement`'s purchase-request logic. It
+ * comes back separately, as `freeIssueLines`, purely so a screen can still
+ * SHOW what is free-issued (EU-14 item 3 / the production plan's Buy section)
+ * without it ever being purchasable.
+ *
+ * @param {{cache: Map}} [opts.ctx] EU-14 item E3 — see `orderProcurementSplit`.
+ * @returns {Promise<{lines: object[], unmatched: object[], shortCount: number,
+ *   freeIssueLines: object[]}>}
  */
-export async function orderShortfall(companyId, orderId, conn) {
-  const { buy, buySizes } = await orderProcurementSplit(companyId, orderId, conn);
+export async function orderShortfall(companyId, orderId, conn, { ctx } = {}) {
+  const cacheKey = `shortfall:${orderId}`;
+  if (ctx?.cache?.has(cacheKey)) return ctx.cache.get(cacheKey);
+  const { buy, buySizes, freeIssue } = await orderProcurementSplit(companyId, orderId, conn, { ctx });
 
   const unmatched = buy.filter((r) => r.catalog_item_id == null);
   const matched = buy.filter((r) => r.catalog_item_id != null);
@@ -316,6 +422,10 @@ export async function orderShortfall(companyId, orderId, conn) {
       code: r.code,
       name: r.name,
       unit: r.unit,
+      // EU-14 item E4: every buy-side line now says what kind of buy it is, so
+      // the production plan's Buy section can render itself without a second
+      // lookup. Always 'buy' here — `freeIssueLines` below carries the other kind.
+      procurementType: 'buy',
       linesCount: Number(r.lines_count) || 0,
       required,
       onHand: a.onHand,
@@ -328,11 +438,29 @@ export async function orderShortfall(companyId, orderId, conn) {
     };
   }).sort((x, y) => (y.short - x.short) || String(x.code || '').localeCompare(String(y.code || '')));
 
-  return {
+  // EU-14 item 1: what the customer is supplying, shaped just enough like
+  // `lines` for a screen to list it alongside — never a `short`, because a
+  // free-issue item is never something this order buys.
+  const freeIssueLines = (freeIssue || [])
+    .filter((r) => r.catalog_item_id != null)
+    .map((r) => ({
+      catalogItemId: Number(r.catalog_item_id),
+      code: r.code,
+      name: r.name,
+      unit: r.unit,
+      procurementType: 'free_issue',
+      linesCount: Number(r.lines_count) || 0,
+      required: Number(r.qty) || 0,
+    }));
+
+  const result = {
     lines,
     unmatched: unmatched.map((r) => ({
       name: r.name, linesCount: Number(r.lines_count) || 0, required: Number(r.qty) || 0,
     })),
     shortCount: lines.filter((l) => l.short > 0).length,
+    freeIssueLines,
   };
+  if (ctx?.cache) ctx.cache.set(cacheKey, result);
+  return result;
 }

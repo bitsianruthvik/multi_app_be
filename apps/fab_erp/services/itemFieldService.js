@@ -728,7 +728,12 @@ export async function resolveCatalogFields(companyId, catalogItemIds, opts = {})
  */
 export async function isConsumable(companyId, catalogItemId, conn = null) {
   if (!catalogItemId) return true;
-  const vals = (await resolveCatalogFields(companyId, [catalogItemId], { conn })).get(Number(catalogItemId)) ?? {};
-  const v = String(vals.consumable ?? '').trim().toLowerCase();
+  const resolved = await resolveFields(
+    companyId,
+    [{ scope: 'catalog_item', scopeId: Number(catalogItemId) }],
+    { conn },
+  );
+  const v = String(resolved.get(`catalog_item:${Number(catalogItemId)}`)?.consumable?.value ?? '')
+    .trim().toLowerCase();
   return !(v === 'no' || v === 'false' || v === '0');
 }

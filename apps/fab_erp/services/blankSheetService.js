@@ -37,6 +37,7 @@
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { blankPlan } from './blankPlanService.js';
+import { orderBlanks } from './blankService.js';
 
 const SHEET = 'Cutting plan';
 const HEADERS = [
@@ -139,9 +140,14 @@ export async function importPlan(companyId, orderId, buffer) {
   );
   const plateByCode = new Map(plateRows.map((r) => [String(r.code).trim().toUpperCase(), Number(r.id)]));
 
-  // The blanks as this order currently computes them — the codes are derived, so
-  // they exist whether or not anything has been written yet.
-  const plan = await blankPlan(companyId, orderId, { effort: 'quick' });
+  /*
+   * The blanks as this order currently computes them — the codes are derived,
+   * so they exist whether or not anything has been written yet. `orderBlanks`
+   * only walks the structure to name the rectangles; it does not run the
+   * packer, which `blankPlan(..., {effort:'quick'})` used to do here just to
+   * read the same codes off a full (if quick) pack (PLAN.md EU-11 item 7).
+   */
+  const plan = await orderBlanks(companyId, orderId);
   const keyByCode = new Map(plan.blanks.map((b) => [String(b.code).trim().toUpperCase(), b.key]));
 
   const problems = [];

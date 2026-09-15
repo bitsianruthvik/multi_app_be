@@ -33,6 +33,8 @@
 
 import { pool } from '../../../db.js';
 import { resolveItemFields } from './itemFieldService.js';
+import { rolledQty } from './blankPredicate.js';
+import { lineQtyMap } from './orderLineQty.js';
 
 import {
   axisConflicts, conflictMessage, partAxes, plateAxes,
@@ -70,6 +72,20 @@ export const ISSUE = {
   PART_TOO_BIG: 'part_too_big',
   PLATE_OVERFILLED: 'plate_overfilled',
   NO_MATERIAL: 'no_material',
+  /**
+   * A nested part's sheets carry FEWER pieces than the order now needs.
+   *
+   * EU-5, User Clarifications 5: nesting demand is multiplied by the order
+   * line's qty up front, so an accepted plan normally covers a part's full
+   * rolled qty × line qty in one pass. A shortfall here almost always means
+   * the LINE's qty changed AFTER this part was nested — accepting a plan never
+   * revisits pieces already placed, so a line raised from 1 to 3 leaves the
+   * old sheets covering only a third of what is now required, silently.
+   * Advisory like NOT_NESTED_YET: a plan the packer already validated is not
+   * wrong, it is simply incomplete, and the remedy is to nest more, not to
+   * refuse a purchase order for what is genuinely already on a sheet.
+   */
+  PIECES_SHORT: 'pieces_short',
 };
 
 /** Which issue kind each axis of a mismatch is reported as. */
@@ -111,7 +127,7 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
   // nestingBoardService reads: a link is a childless row carrying a catalog
   // item and no flow, and its length/width/height are the PLATE's.
   const [links] = await exec.query(
-    `SELECT rm.id AS linkId, rm.nest_no AS nestNo, rm.qty AS plates,
+    `SELECT rm.id AS linkId, rm.nest_no AS nestNo, rm.qty AS pieces,
             rm.length AS plateLength, rm.width AS plateWidth, rm.height AS plateThick,
             rm.catalog_item_id AS materialId,
             fic.code AS materialCode, fic.name AS materialName,
@@ -341,20 +357,18 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
     }
 
     /**
-     * Aggregate area, per physical plate — and BOTH sides of that sum were
-     * wrong once a material row started carrying a piece count.
+     * Aggregate area, per physical plate — one link's contribution is its
+     * part's footprint times how many PIECES of that part this nest cuts.
      *
-     * The plate side multiplied by `rm.qty`, reading it as "how many plates".
-     * That number is now how many PIECES are cut here, so a nest holding 5
-     * pieces claimed five plates' worth of steel. A nest is ONE plate: that is
-     * the rule `nestTotalsService` is built on and the reason it exists.
+     * `rm.qty` (aliased `pieces` above) is a link-row figure, not a per-part
+     * total: the same part can be split across several nests, so it is the
+     * count on THIS link, not `p.qty`, that says how much of this plate the
+     * part actually uses. Charging the part's full order-wide qty to every
+     * plate it touches is what once reported 73 overfilled plates on an order
+     * the packer had just verified as geometrically sound.
      *
-     * The part side multiplied by the PART's own qty, which is the total across
-     * the whole order — 756 stiffeners charged in full to every plate any of
-     * them touches. The pieces on THIS plate is what the material row says.
-     *
-     * Together they reported 73 overfilled plates on an order the packer had
-     * just verified as geometrically sound.
+     * A nest is still exactly ONE physical plate — that part of the model is
+     * unchanged, and is the rule `nestTotalsService` is built on.
      */
     if (l.nestNo && plateL != null && plateW != null && partL != null && partW != null) {
       const key = `${l.materialId}|${l.nestNo}`;
@@ -366,7 +380,7 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
         });
       }
       const n = nests.get(key);
-      n.usedArea += partL * partW * Math.max(1, num(l.plates) ?? 1);
+      n.usedArea += partL * partW * Math.max(1, num(l.pieces) ?? 1);
       n.parts += 1;
     }
 
@@ -382,6 +396,48 @@ export async function checkOrderNesting(companyId, orderId, opts = {}) {
                + `from ${Math.round(n.plateArea / 1e6)} m² of plate (${n.plateSize}). `
                + 'That is more than the plate contains, before any offcut.',
       });
+    }
+  }
+
+  /**
+   * PIECES_SHORT (User Clarifications 5): Σ link qty across a part's own nests
+   * must equal its full demand — rolledQty (structural, up the tree) × the
+   * order line's own qty, the identical figure `blankService.orderBlanks` fed
+   * the packer. Checked over every part that has at least one NESTED link
+   * (nest_no set); a part with none is NOT_NESTED_YET's business, not this
+   * one's — and a hand-added material link from itemMaterialService (qty 1,
+   * no nest_no) is not a sheet count at all, so counting it here always read
+   * as "short" regardless of what the packer actually put on a plate.
+   */
+  const nestedLinks = links.filter((l) => l.nestNo);
+  const partIdsWithLinks = [...new Set(nestedLinks.map((l) => l.partId))];
+  if (partIdsWithLinks.length) {
+    const [treeRows] = await exec.query(
+      `SELECT id, qty, parent_item_id AS parentItemId, order_line_id AS orderLineId
+         FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+      [companyId, orderId],
+    );
+    const nodeById = new Map(treeRows.map((r) => [Number(r.id), r]));
+    const lineQty = await lineQtyMap(exec, companyId, orderId);
+
+    const onSheetsByPart = new Map();
+    for (const l of nestedLinks) {
+      onSheetsByPart.set(l.partId, (onSheetsByPart.get(l.partId) ?? 0) + (num(l.pieces) ?? 0));
+    }
+    for (const partId of partIdsWithLinks) {
+      const required = rolledQty(nodeById, partId, lineQty);
+      const onSheets = onSheetsByPart.get(partId) ?? 0;
+      if (onSheets < required) {
+        const l = nestedLinks.find((x) => x.partId === partId);
+        const short = required - onSheets;
+        add(ISSUE.PIECES_SHORT, {
+          partId, partCode: l?.partCode, partName: l?.partName,
+          required, onSheets, short,
+          message: `${l?.partName} needs ${required} pieces but only ${onSheets} are on a sheet — `
+                 + `${short} of ${required} not on any nest. Likely the line's qty changed after `
+                 + 'this part was nested.',
+        });
+      }
     }
   }
 
@@ -434,6 +490,7 @@ export const BLOCKING = new Set([
  */
 export const ADVISORY = new Set([
   ISSUE.NOT_NESTED_YET,
+  ISSUE.PIECES_SHORT,
 ]);
 
 export const blockingIssues = (result) =>

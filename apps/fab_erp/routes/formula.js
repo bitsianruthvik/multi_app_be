@@ -23,21 +23,21 @@
 import { Router } from 'express';
 import { pool } from '../../../db.js';
 import { protect } from '../../../core/middleware/authmiddleware.js';
-import { parseFormula, evaluateFormula, formulaResultToHours } from '../services/formulaEngine.js';
+import { requirePerm } from '../../../core/middleware/requirePerm.js';
+import { parseFormula, evaluateFormula, formulaResultToHours, ALLOWED_FUNCTIONS } from '../services/formulaEngine.js';
 import { resolveItemFields, inputContextForItem } from '../services/itemFieldService.js';
 
 const router = Router();
 
-const requirePerm = (tag) => (req, res, next) => {
-  const isAdmin = String(req.user?.role ?? '').toLowerCase() === 'admin';
-  if (isAdmin) return next();
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
-
 const companyOf = (req) => req.user.companyId ?? req.user.company_id;
+
+/**
+ * The only two roles `itemFieldService.buildInputContext` ever populates
+ * (`byRole.raw_material` / `byRole.child_parts`, both hardcoded there — not
+ * driven by the unrelated `fab_operation_flow_step_inputs.input_role`
+ * column). Kept in sync manually; there is no registry table for this today.
+ */
+const KNOWN_INPUT_ROLES = ['raw_material', 'child_parts'];
 
 /**
  * Every variable a formula may reference, grouped by namespace.
@@ -138,7 +138,7 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
 
     const parsed = parseFormula(formula);
     if (!parsed.valid) {
-      return res.json({ valid: false, error: parsed.error, variables: [], unresolved: [] });
+      return res.json({ valid: false, error: parsed.error, variables: [], unresolved: [], problems: [], warnings: [] });
     }
 
     // Which names are legal, per namespace.
@@ -179,26 +179,86 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
     };
 
     const unresolved = [];
+    const problems = [];
     for (const v of parsed.variables) {
       const [ns, key] = v.split('.');
-      if (!ns || !key) continue;                 // bare identifier, not namespaced
-      if (ns === 'step') continue;               // out of scope, see above
-      /**
-       * `input.<role>.<field>` and the `inputs.*` aggregates are out of scope for
-       * the same reason as `step.*`, and a stricter one: which roles a task has
-       * depends on the BOM under the item it runs on, which this endpoint is not
-       * given. Validating them here would red-underline a correct formula on
-       * every item that happens not to carry that role — a first step consumes
-       * material, a later one consumes a part, and both are right.
-       *
-       * `parseFormula` returns these already rewritten to underscore form (the
-       * dot-notation round-trip only covers the four two-part namespaces), so
-       * they arrive as bare identifiers and are skipped by the `!key` guard
-       * above. Named explicitly so the next person does not "fix" that.
-       */
+      if (!ns) continue;
+      if (!key) {
+        /**
+         * A bare, non-namespaced identifier. `parseFormula`'s own docstring
+         * says `input.*`/`inputs.*` "stay in underscore form in `variables`
+         * (unchanged)" — i.e. a WHOLE flattened token like
+         * `input_raw_material_thickness_mm` or `inputs_sum_weight_kg`, not a
+         * bare `input`/`inputs` the way `ns === 'input'` alone checked for
+         * (that only matches a formula that names the namespace with no role
+         * or field at all, which never happens for a real reference). Fixed
+         * to match the actual flattened prefix; these are validated below
+         * instead, off `parsed.inputRefs`, which still has role and field
+         * apart.
+         *
+         * Anything else bare is either a DISABLED function called like
+         * `fac(item.x)` (expr-eval resolves an unknown callee by looking it
+         * up as a plain variable named after the function, so it shows up
+         * here exactly like a typo would) or a genuine no-namespace typo.
+         * Every legitimate variable in this system is namespaced
+         * (machine./item./step./op./input./inputs.), so both cases are
+         * always wrong — this used to be silently skipped by the old
+         * `!ns || !key` guard, which is how `fac(...)` passed validation.
+         */
+        if (ns === 'input' || ns === 'inputs' || ns.startsWith('input_') || ns.startsWith('inputs_')) continue;
+        const calledAsFunction = new RegExp(`\\b${ns.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`).test(formula);
+        if (calledAsFunction) {
+          problems.push({ code: 'VALIDATION', message: `Unknown function ${ns}` });
+        } else {
+          problems.push({ code: 'VALIDATION', message: `Unknown symbol ${ns}` });
+        }
+        continue;
+      }
+      if (ns === 'step') continue;               // out of scope, see below
       if (ns === 'input' || ns === 'inputs') continue;
       if (!known[ns] || !known[ns].has(key)) unresolved.push(v);
     }
+
+    /**
+     * `input.<role>.<field>` / `inputs.<fn>(<field>)` — a STRUCTURAL check,
+     * not a value-presence one: which roles a task has depends on the BOM
+     * under the item it runs on, which this endpoint is not given, so
+     * "unresolved" is the wrong word for a role that is legitimately absent
+     * on some items (a first step consumes material, a later one consumes a
+     * part, both are right). What CAN be checked here without an item is
+     * whether the role NAME and field NAME are even real — `raw_material`/
+     * `child_parts` are the only two roles `itemFieldService.buildInputContext`
+     * ever populates, and the field is checked against the same fab_fields
+     * registry `item.*` uses above (an input's fields ARE item fields,
+     * resolved off a different item in the chain).
+     */
+    for (const ref of parsed.inputRefs ?? []) {
+      if (ref.ns === 'input') {
+        if (!KNOWN_INPUT_ROLES.includes(ref.role)) {
+          problems.push({
+            code: 'VALIDATION',
+            message: `Unknown input role "input.${ref.role}" — expected one of: ${KNOWN_INPUT_ROLES.join(', ')}.`,
+          });
+        } else if (!known.item.has(ref.key)) {
+          problems.push({
+            code: 'VALIDATION',
+            message: `input.${ref.role}.${ref.key} — "${ref.key}" is not a known, formula-usable field.`,
+          });
+        }
+      } else if (ref.ns === 'inputs' && ref.fn !== 'count' && !known.item.has(ref.key)) {
+        problems.push({
+          code: 'VALIDATION',
+          message: `inputs.${ref.fn}(${ref.key}) — "${ref.key}" is not a known, formula-usable field.`,
+        });
+      }
+    }
+
+    // step.* always evaluates to 0 (User Clarifications 7) — worth a warning
+    // on every formula that names it, independent of whether a sample below
+    // also happens to surface the same thing.
+    const warnings = [];
+    const stepVars = parsed.variables.filter((v) => v.startsWith('step.'));
+    if (stepVars.length) warnings.push({ code: 'STEP_VARS_ZERO', symbols: stepVars });
 
     // Optional: what would this actually produce for a real item?
     let sample = null;
@@ -221,7 +281,7 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
       );
       // Inputs come from the item's own BOM children, same as materialization.
       const inputCtx = await inputContextForItem(companyId, Number(sampleItemId));
-      const raw = await evaluateFormula(formula, itemValues, {}, resourceTypeId ?? null, opValues, inputCtx);
+      const evalResult = await evaluateFormula(formula, itemValues, {}, resourceTypeId ?? null, opValues, inputCtx);
       let timeUnit = 'min';
       if (operationId) {
         const [[op]] = await pool.query(
@@ -230,13 +290,22 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
         );
         if (op?.time_unit) timeUnit = op.time_unit;
       }
-      sample = { itemId: Number(sampleItemId), raw, timeUnit, hours: formulaResultToHours(raw, timeUnit) };
+      sample = {
+        itemId: Number(sampleItemId),
+        raw: evalResult.value,
+        timeUnit,
+        hours: formulaResultToHours(evalResult.value, timeUnit),
+        error: evalResult.error,
+        warnings: evalResult.warnings,
+      };
     }
 
     res.json({
-      valid: unresolved.length === 0,
+      valid: unresolved.length === 0 && problems.length === 0,
       variables: parsed.variables,
       unresolved,
+      problems,
+      warnings,
       ...(unresolved.length > 0 && {
         error: `Unresolved variable${unresolved.length > 1 ? 's' : ''}: ${unresolved.join(', ')}. `
              + 'An unresolved variable reads as 0, which silently produces a null duration.',

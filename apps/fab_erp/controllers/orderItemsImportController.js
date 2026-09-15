@@ -1,10 +1,5 @@
-import { exportOrderItemsTemplate, importOrderItemsExcel } from '../services/orderItemsImportService.js';
 import { recomputeOrderWeights } from '../services/itemWeightService.js';
 import { orderCodePrefix } from '../services/codegenService.js';
-import {
-  exportBoqSheet, importBoqSheet, buildWizardRows, applyWizardRows,
-} from '../services/boqSheetService.js';
-import { exportNestingSheet, importNestingSheet } from '../services/nestingSheetService.js';
 import { setFields } from '../services/fieldService.js';
 import { deleteSalesOrder } from '../services/orderDeleteService.js';
 import {
@@ -12,12 +7,9 @@ import {
 } from '../services/orderParametersService.js';
 import fs from 'fs';
 import { orderReadiness, refreshOrderStage, confirmOrder } from '../services/orderReadinessService.js';
-import { suggestNesting, acceptSuggestion } from '../services/nestingSuggestService.js';
-import {
-  nestingBoard, assignParts, updateNest, clearNest, nextNestNo,
-} from '../services/nestingBoardService.js';
-import { pool, retryOnDeadConnection } from '../../../db.js';
+import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
+import { fail } from '../../../core/middleware/requirePerm.js';
 
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
 
@@ -27,37 +19,8 @@ async function assertOrder(cid, orderId) {
     'SELECT id FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
     [orderId, cid],
   );
-  if (!rows.length) { const e = new Error('Order not found'); e.status = 404; throw e; }
+  if (!rows.length) { const e = new Error('Order not found'); e.status = 404; e.code = 'ORDER_NOT_FOUND'; throw e; }
 }
-
-export const exportOrderItemsTemplateHandler = async (req, res) => {
-  try {
-    const buffer = await exportOrderItemsTemplate(companyId(req), req.params.orderId);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="Order_Items_Import_Template.xlsx"');
-    res.send(buffer);
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: exportOrderItemsTemplate failed');
-    const status = err.message === 'Order not found' ? 404 : 500;
-    res.status(status).json({ message: 'Failed to generate template', error: err.message });
-  }
-};
-
-export const importOrderItemsHandler = async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    // 'replace' clears the order's existing tree first. Anything other than the
-    // literal string is treated as 'append' — a destructive default reached by
-    // a typo is not a tradeoff worth making.
-    const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
-    const result = await importOrderItemsExcel(req.file, companyId(req), req.params.orderId, mode);
-    res.json(result);
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: importOrderItemsExcel failed');
-    const status = err.message === 'Order not found' ? 404 : 400;
-    res.status(status).json({ message: err.message });
-  }
-};
 
 export const recomputeOrderWeightsHandler = async (req, res) => {
   try {
@@ -72,133 +35,6 @@ export const recomputeOrderWeightsHandler = async (req, res) => {
   }
 };
 
-/** GET — the order's BOQ as one sheet (its current tree, or a blank template). */
-export const exportBoqHandler = async (req, res) => {
-  try {
-    const buffer = await exportBoqSheet(companyId(req), Number(req.params.orderId));
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="Order_BOQ.xlsx"');
-    res.send(buffer);
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: exportBoqSheet failed');
-    res.status(err.message === 'Order not found' ? 404 : 500).json({ message: err.message });
-  }
-};
-
-/**
- * POST — the structure wizard. Returns a SHEET, never database rows: it is
- * scaffolding to save typing the same codes hundreds of times, and everything
- * it guesses is meant to be edited before upload. Writing a half-thought-out
- * structure straight into the order would be much harder to walk back than
- * deleting a spreadsheet.
- */
-export const boqWizardHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    await assertOrder(cid, orderId);
-    /**
-     * One sheet, every line on the order.
-     *
-     * The wizard used to take a single line, so a two-line order meant running
-     * it twice and stitching the downloads together — or, more likely, missing
-     * the second line. `specs` is a list because an order's lines are a list;
-     * each becomes its own span, keyed by that line's code.
-     *
-     * A bare body is still accepted as one spec, so an older client keeps
-     * working rather than getting an empty sheet.
-     */
-    const body = req.body ?? {};
-    const specs = Array.isArray(body.specs) && body.specs.length ? body.specs : [body];
-    const rows = specs.flatMap((s) => buildWizardRows(s ?? {}));
-    const buffer = await exportBoqSheet(cid, orderId, rows);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="Order_BOQ_starter.xlsx"');
-    res.send(buffer);
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: boqWizard failed');
-    res.status(500).json({ message: err.message });
-  }
-};
-
-/**
- * POST — accept the wizard's structure straight onto the order.
- *
- * Same body as `/boq/wizard` (`{ specs: [...] }`), plus an optional `mode`.
- * That endpoint returns a spreadsheet and saves nothing; this one saves, so a
- * generated structure that needs no editing does not have to make a round trip
- * through Excel and back just to exist.
- *
- * Returns the import result plus fresh readiness, exactly like the upload path,
- * so the step rail is correct the instant it lands.
- */
-export const applyBoqWizardHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    await assertOrder(cid, orderId);
-    const body = req.body ?? {};
-    const specs = Array.isArray(body.specs) && body.specs.length ? body.specs : [body];
-    const mode = body.mode === 'replace' ? 'replace' : 'append';
-    const result = await applyWizardRows(cid, orderId, specs, mode);
-    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
-  } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: applyBoqWizard failed');
-    res.status(500).json({ message: err.message });
-  }
-};
-
-/** POST — upload a filled BOQ sheet. */
-export const importBoqHandler = async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
-    const result = await importBoqSheet(req.file, cid, orderId, mode);
-    // Returned with the result so the stage strip is right the instant the
-    // upload lands — a strip that needs a refresh to catch up is a strip nobody
-    // trusts.
-    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: importBoqSheet failed');
-    res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
-  }
-};
-
-/** GET — the nesting document: plates, and the parts cut from each. */
-export const exportNestingHandler = async (req, res) => {
-  try {
-    const buffer = await exportNestingSheet(companyId(req), Number(req.params.orderId));
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="Order_Nesting.xlsx"');
-    res.send(buffer);
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: exportNestingSheet failed');
-    res.status(err.message === 'Order not found' ? 404 : 500).json({ message: err.message });
-  }
-};
-
-/** POST — upload a filled nesting sheet. Never touches the BOQ tree. */
-export const importNestingHandler = async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const mode = req.body?.mode === 'replace' ? 'replace' : 'append';
-    const result = await importNestingSheet(req.file, cid, orderId, mode);
-    res.json({ ...result, readiness: await refreshOrderStage(cid, orderId) });
-  } catch (err) {
-    logger.error({ err }, 'fab_erp: importNestingSheet failed');
-    res.status(err.message === 'Order not found' ? 404 : 400).json({ message: err.message });
-  }
-};
-
-
-
-
 /**
  * POST — set WHAT THE STEEL IS, on an order line or on one part.
  *
@@ -207,7 +43,7 @@ export const importNestingHandler = async (req, res) => {
  * assignment and had to go for the same reason the sheet column did: naming a
  * catalogue item now also picks a plate SIZE, and which size to buy is not
  * knowable until you know what else is cut from the same sheet. The link is made
- * at nesting instead, by the suggestor or by a drop on the board.
+ * at nesting instead, by accepting a blank plan (blankService.acceptNestingPlan).
  *
  * WHY IT TAKES A SCOPE. The values belong at whichever level is actually true.
  * An order is usually one steel throughout, so it is stated once on the LINE and
@@ -314,123 +150,6 @@ async function specOwner(cid, scope, scopeId) {
   return row ?? null;
 }
 
-// ── the nesting board ───────────────────────────────────────────────────────
-// Every write returns the whole board rather than a delta: it is one screen of
-// a few hundred rows at most, and a client rebuilding its own state from patches
-// is how a board ends up disagreeing with the database.
-
-const board = (fn) => async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    const result = await fn(cid, orderId, req);
-    // Same reason as in acceptNestingHandler: the work is already saved, and a
-    // stale pooled connection here would report a failure that did not happen.
-    const readiness = await retryOnDeadConnection(() => refreshOrderStage(cid, orderId));
-    res.json({ ...result, readiness });
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: nesting board failed');
-    res.status(500).json({ message: err.message });
-  }
-};
-
-/**
- * The nesting SUGGESTOR — a third way to fill the board, not a replacement.
- *
- * GET proposes and writes nothing; POST saves the nests a person accepted. The
- * two are separate verbs because they are separate decisions: looking at a
- * suggestion must never be able to change an order, and a suggestion that were
- * re-derived at save time could save something nobody saw.
- */
-export const suggestNestingHandler = async (req, res) => {
-  try {
-    const cid = companyId(req);
-    const orderId = Number(req.params.orderId);
-    /**
-     * HOW HARD TO LOOK — a named setting, measured rather than guessed.
-     *
-     * On the KEPL order (1,090 parts) at the shop's real 2 mm cutting gap, with
-     * MS plate around Rs 85,000 a tonne:
-     *
-     *   quick      ~5 s   697.15 t        —              —
-     *   standard  ~60 s   691.03 t   6.12 t   ~Rs 5.2 lakh
-     *   deep     ~300 s   690.57 t   6.58 t   ~Rs 5.6 lakh
-     *
-     * Standard is the default: 93% of the saving in a fifth of the time. Deep
-     * buys the last 0.46 t, about Rs 39,000 — worth waiting for before a large
-     * purchase, not worth it while somebody is still editing the BOQ.
-     *
-     * `budgetMs` overrides the level's own allowance for a caller that knows
-     * how long it can wait. Capped at ten minutes: everything good converges
-     * near 690.6 t against a 689.87 t floor, so there is under a tonne left in
-     * this approach and no case for running it longer.
-     */
-    const askedMs = Number(req.query.budgetMs);
-    const effort = ['quick', 'standard', 'deep'].includes(req.query.effort)
-      ? req.query.effort : 'standard';
-    res.json(await suggestNesting(cid, orderId, {
-      includeNested: req.query.includeNested === 'true',
-      grade: req.query.grade || null,
-      margin: Number.isFinite(Number(req.query.gapMm)) ? Number(req.query.gapMm) : undefined,
-      effort,
-      budgetMs: Number.isFinite(askedMs) ? Math.min(Math.max(0, askedMs), 600_000) : undefined,
-    }));
-  } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: nesting suggestion failed');
-    res.status(500).json({ message: err.message });
-  }
-};
-
-export const acceptNestingHandler = board(async (cid, orderId, req) => {
-  const saved = await acceptSuggestion(cid, orderId, req.body?.nests ?? []);
-  /**
-   * The nests are committed by the line above; everything after it only
-   * REDRAWS the screen, so it is retried rather than allowed to 500.
-   *
-   * Whoever pressed Accept has been sitting on this page for minutes — a deep
-   * nest is up to five of pure computation, and then somebody reads the result.
-   * Every connection in the pool has been idle that whole time, and TiDB Cloud
-   * hangs up on an idle session. Letting a dead one surface here would tell the
-   * user the accept failed while the plates are in fact on the order, which is
-   * worse than the original failure: they would re-run it and nest twice.
-   */
-  return retryOnDeadConnection(async () => ({
-    ...saved,
-    ...await nestingBoard(cid, orderId),
-    nextNestNo: await nextNestNo(cid, orderId),
-  }));
-});
-
-export const nestingBoardHandler = board(async (cid, orderId) => ({
-  ...await nestingBoard(cid, orderId),
-  nextNestNo: await nextNestNo(cid, orderId),
-}));
-
-export const assignPartsHandler = board(async (cid, orderId, req) => ({
-  ...await assignParts(cid, orderId, {
-    linkIds: req.body?.linkIds,
-    // Parts with no material yet, plus the plate chosen for them. The board is
-    // where that choice is made now, so it arrives on the same drop as the nest.
-    partIds: req.body?.partIds,
-    materialId: req.body?.materialId ?? null,
-    nestNo: req.body?.nestNo ?? null,
-    plate: req.body?.plate ?? null,
-  }),
-  nextNestNo: await nextNestNo(cid, orderId),
-}));
-
-export const updateNestHandler = board(async (cid, orderId, req) => ({
-  ...await updateNest(cid, orderId, req.params.nestNo, req.body?.plate ?? {}),
-  nextNestNo: await nextNestNo(cid, orderId),
-}));
-
-export const clearNestHandler = board(async (cid, orderId, req) => ({
-  ...await clearNest(cid, orderId, req.params.nestNo),
-  nextNestNo: await nextNestNo(cid, orderId),
-}));
-
 /**
  * GET — the five preparation stages and what is missing from each.
  *
@@ -443,27 +162,22 @@ export const orderReadinessHandler = async (req, res) => {
   try {
     res.json(await orderReadiness(companyId(req), Number(req.params.orderId)));
   } catch (err) {
-    if (err.status === 404) return res.status(404).json({ message: err.message });
-    logger.error({ err }, 'fab_erp: orderReadiness failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 };
 
 /**
  * POST — confirm the order. The wizard's last act.
  *
- * 422 carries the readiness back so the screen can point at the unfinished step
- * rather than just saying no.
+ * 422 carries `{code:'NOT_READY', message, readiness}` back so the screen can
+ * point at the unfinished step rather than just saying no — `fail()` is what
+ * passes `code`/`readiness` through without a bespoke catch here.
  */
 export const confirmOrderHandler = async (req, res) => {
   try {
     res.json(await confirmOrder(companyId(req), Number(req.params.orderId)));
   } catch (err) {
-    if (err.status) {
-      return res.status(err.status).json({ message: err.message, readiness: err.readiness ?? null });
-    }
-    logger.error({ err }, 'fab_erp: confirmOrder failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 };
 
@@ -732,9 +446,6 @@ export const importParametersHandler = async (req, res) => {
     if (req.file?.path) fs.unlink(req.file.path, () => {});
   }
 };
-
-
-
 /**
  * DELETE — a sales order and the tree that exists only because of it.
  *

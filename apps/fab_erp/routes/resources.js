@@ -29,7 +29,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { protect } from '../../../core/middleware/authmiddleware.js';
-import { logger } from '../../../core/utils/logger.js';
+import { requirePerm, fail } from '../../../core/middleware/requirePerm.js';
 import { exportResourcesTemplateHandler, importResourcesHandler } from '../controllers/resourcesImportController.js';
 import { reassignResourceArea, previewResourceArea } from '../services/resourceAreaService.js';
 
@@ -38,27 +38,8 @@ const upload = multer({ dest: path.join(process.cwd(), 'tmp') });
 
 const isAdmin = (req) => String(req.user?.role ?? '').toLowerCase() === 'admin';
 
-const requirePerm = (tag) => (req, res, next) => {
-  // Admin bypass, as in assets.js / mutateController. The import routes did not
-  // have it and now do — an admin being told they lack a permission they define
-  // is the sort of thing that gets worked around with a direct DB edit.
-  if (isAdmin(req)) return next();
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
-
 const canManage = requirePerm('fab_erp_resources_manage');
 const companyOf = (req) => req.user.companyId ?? req.user.company_id;
-
-const fail = (res, err, what) => {
-  if (err?.status) {
-    return res.status(err.status).json({ message: err.message, code: err.code ?? undefined });
-  }
-  logger.error({ err }, `fab_erp resources: ${what} failed`);
-  return res.status(500).json({ message: err?.message ?? 'Something went wrong.' });
-};
 
 router.get('/resources/export-template', protect, canManage, exportResourcesTemplateHandler);
 router.post('/resources/import', protect, canManage, upload.single('excel_file'), importResourcesHandler);
@@ -75,7 +56,7 @@ router.post('/resources/import', protect, canManage, upload.single('excel_file')
 router.get('/resources/:id/area', protect, canManage, async (req, res) => {
   try {
     res.json(await previewResourceArea(companyOf(req), Number(req.params.id)));
-  } catch (err) { fail(res, err, 'area preview'); }
+  } catch (err) { fail(res, err); }
 });
 
 /**
@@ -107,7 +88,7 @@ router.post('/resources/:id/area', protect, canManage, async (req, res) => {
       userId: req.user?.id ?? null,
     });
     res.json(out);
-  } catch (err) { fail(res, err, 'area reassignment'); }
+  } catch (err) { fail(res, err); }
 });
 
 export default router;

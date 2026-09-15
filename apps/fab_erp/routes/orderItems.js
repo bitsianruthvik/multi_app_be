@@ -1,38 +1,37 @@
 /**
- * orderItems.js — Items/BOM tree bulk export/import via Excel, scoped to one sales order.
+ * orderItems.js — the sales-order wizard's routes: flows, blanks/nesting,
+ * parameters, spec, revisions and the wizard/confirm lifecycle itself.
  *
- * GET  /orders/:orderId/items/export-template  — download a fill-in .xlsx template
- *                                                  (Level 1..N sheets + Raw Material +
- *                                                   Flows reference + Instructions)
- * POST /orders/:orderId/items/import            — upload a filled template; builds the
- *                                                  order's fab_items parent/child tree
- *                                                  (form field `mode`: append | replace)
- * POST /orders/:orderId/items/recompute-weights — re-run the bottom-up weight roll-up
- *
- * All require: fab_erp_projects_manage
+ * The Excel bulk-import pair this file once documented here (BOQ sheet
+ * export/import, the nesting board and the nesting suggestor) was deleted in
+ * PLAN.md EU-20 (2026-09-13, User Clarifications decision 2) — the blank-plan
+ * screens below (`/blanks`, `/blanks/accept`, `/blanks/sheet`) are the one
+ * live nesting path now. `POST /orders/:orderId/items/recompute-weights`
+ * survives (see below) and still requires: fab_erp_projects_manage.
  */
 
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
+import fs from 'fs';
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { requirePerm, fail } from '../../../core/middleware/requirePerm.js';
 import { logger } from '../../../core/utils/logger.js';
 import { pool } from '../../../db.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
 import { demandFor } from '../services/partIdentityService.js';
 import { duplicateSubtree } from '../services/bomService.js';
+import { syncFlowsFromBom, setItemFlows, itemFlows } from '../services/orderFlowService.js';
 import { blankPlan } from '../services/blankPlanService.js';
 import { exportPlan, importPlan } from '../services/blankSheetService.js';
 import { acceptNestingPlan } from '../services/blankService.js';
-import { refreshOrderStage } from '../services/orderReadinessService.js';
+import { refreshOrderStage, setWizardStep, orderReadiness } from '../services/orderReadinessService.js';
+import { listRevisions } from '../services/orderRevisionService.js';
+import { generateCode, getRule } from '../services/codegenService.js';
 import {
-  exportOrderItemsTemplateHandler,
-  importOrderItemsHandler,
   recomputeOrderWeightsHandler,
   orderWeightSummaryHandler,
   orderNestingHandler,
-  exportNestingHandler,
-  importNestingHandler,
   setItemSpecHandler,
   getItemSpecHandler,
   deleteOrderHandler,
@@ -42,43 +41,12 @@ import {
   setParametersHandler,
   orderReadinessHandler,
   confirmOrderHandler,
-  nestingBoardHandler,
-  suggestNestingHandler,
-  acceptNestingHandler,
-  assignPartsHandler,
-  updateNestHandler,
-  clearNestHandler,
 } from '../controllers/orderItemsImportController.js';
 
 const router = Router();
 const upload = multer({ dest: path.join(process.cwd(), 'tmp') });
 
-const requirePerm = (tag) => (req, res, next) => {
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
-
-router.get('/orders/:orderId/items/export-template', protect, requirePerm('fab_erp_projects_manage'), exportOrderItemsTemplateHandler);
-router.post('/orders/:orderId/items/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importOrderItemsHandler);
 router.post('/orders/:orderId/items/recompute-weights', protect, requirePerm('fab_erp_projects_manage'), recomputeOrderWeightsHandler);
-/*
- * THE BOQ SHEET'S ROUTES ARE GONE — export, import, and the two wizard ones.
- *
- * That sheet's four code columns (span / girder / segment / part) WERE the
- * structure: position baked into every code, one row per piece. The BOM step
- * no longer works that way — a row is a design, the quantity lives on the row,
- * and codes are issued at production-order time — so an importer speaking the
- * old language would undo it on the first upload.
- *
- * boqSheetService is left on disk unreferenced, so the rewrite has something to
- * read. It wants to speak blanks, lots and quantities.
- */
-
-// ── Nesting: stage 2, its own document (2026-08) ───────────────────────────
-router.get('/orders/:orderId/nesting/export', protect, requirePerm('fab_erp_projects_manage'), exportNestingHandler);
-router.post('/orders/:orderId/nesting/import', protect, requirePerm('fab_erp_projects_manage'), upload.single('excel_file'), importNestingHandler);
 
 /**
  * What an assembly NEEDS, for a screen that used to read its children.
@@ -90,27 +58,66 @@ router.post('/orders/:orderId/nesting/import', protect, requirePerm('fab_erp_pro
 router.get('/orders/:orderId/items/:itemId/demand', protect, async (req, res) => {
   try {
     const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
     const itemId = Number(req.params.itemId);
-    const map = await demandFor(cid, [itemId]);
+    const map = await demandFor(cid, orderId, [itemId]);
     res.json({ itemId, parts: map.get(itemId) ?? [] });
   } catch (err) {
-    return res.status(err.status ?? 500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
-// The drag-and-drop board (2026-08-10). Reading it is a view action; arranging
-// plates is not.
-router.get('/orders/:orderId/nesting/board', protect, nestingBoardHandler);
-router.post('/orders/:orderId/nesting/assign', protect, requirePerm('fab_erp_projects_manage'), assignPartsHandler);
-router.patch('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), updateNestHandler);
-router.delete('/orders/:orderId/nests/:nestNo', protect, requirePerm('fab_erp_projects_manage'), clearNestHandler);
+// ── Flows: stage 3, at last with routes of its own (EU-9 item 6 / X3) ───────
+//
+// syncFlowsFromBom/setItemFlow/itemFlows have existed since the 2026-09-02
+// flow rework with nothing mounted to call them — the FE has been unable to
+// reach any of the three. Same permission as /structure/apply: assigning a
+// flow is an edit action, reading the review grid is not.
+/**
+ * POST /orders/:orderId/flows/sync — re-pull the BOM's default flow for every
+ * item that still has none. Body `{ reassign?: boolean }` — true also
+ * overwrites items that already carry a flow (an exception someone set is
+ * otherwise never undone by this).
+ */
+router.post('/orders/:orderId/flows/sync', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    const result = await syncFlowsFromBom(cid, orderId, { reassign: !!req.body?.reassign });
+    // 'lines' is where a missing/would-assign flow is reported (flowState is
+    // part of that stage's own compute) — see orderReadinessService STAGES.
+    res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId, { hint: 'lines' }) });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
 
-// The suggestor (2026-08-21) — a third way to fill the board alongside the
-// Excel import and dragging plates by hand, not a replacement for either.
-// Proposing writes nothing, so it needs only the permission to look; accepting
-// repoints material and is an arranging action like the rest.
-router.get('/orders/:orderId/nesting/suggest', protect, suggestNestingHandler);
-router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab_erp_projects_manage'), acceptNestingHandler);
+/**
+ * POST /orders/:orderId/flows/set — override one or more items' flow at once.
+ * Body `{ itemIds: number[], flowId: number|null }`; null clears it.
+ */
+router.post('/orders/:orderId/flows/set', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    const flowId = req.body?.flowId == null ? null : Number(req.body.flowId);
+    const result = await setItemFlows(cid, orderId, req.body?.itemIds, flowId);
+    res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId, { hint: 'lines' }) });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/** GET /orders/:orderId/flows — every structural item with its flow, for the Flows step. */
+router.get('/orders/:orderId/flows', protect, async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    res.json({ ok: true, items: await itemFlows(cid, orderId) });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
 
 /**
  * THE BLANKS (2026-09-10) — nesting as it now works.
@@ -118,23 +125,24 @@ router.post('/orders/:orderId/nesting/suggest/accept', protect, requirePerm('fab
  * `GET  /orders/:orderId/blanks`          what has to be cut, and from what
  * `POST /orders/:orderId/blanks/accept`   make it real and raise the work
  *
- * These replace the board and the suggestor for new work. The difference is the
- * BLANK: the old pair link a plate straight to each part, so 960 identical
- * stiffeners are 960 claims on steel and the rectangle they share exists
- * nowhere. Reading writes nothing, so it needs only the permission to look.
- *
- * NOTE the two are not yet mutually exclusive at the data level — both wipe a
- * part's material rows before writing their own, so using the old board on an
- * order that has been through here would undo the blanks. The old screens are
- * on their way out; until they are gone, one order should use one of them.
+ * These replaced the drag-and-drop nesting board and the nesting suggestor,
+ * both deleted whole in PLAN.md EU-20 (2026-09-13) — this is now the ONLY
+ * nesting path. The difference from the old pair is the BLANK: they linked a
+ * plate straight to each part, so 960 identical stiffeners were 960 claims on
+ * steel and the rectangle they share existed nowhere. Reading writes nothing,
+ * so it needs only the permission to look.
  */
 router.get('/orders/:orderId/blanks', protect, async (req, res) => {
   try {
-    const plan = await blankPlan((req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId), { effort: req.query?.effort, repack: req.query?.repack === '1' });
+    const plan = await blankPlan((req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId), {
+      effort: req.query?.effort,
+      repack: req.query?.repack === '1',
+      // `saved=1`: the accepted plan or an empty answer — never a fresh pack.
+      savedOnly: req.query?.saved === '1',
+    });
     return res.json({ ok: true, ...plan });
   } catch (err) {
-    logger.error({ err }, 'fab_erp: blank plan');
-    return res.status(err.status ?? 500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -146,8 +154,7 @@ router.post('/orders/:orderId/blanks/accept', protect, requirePerm('fab_erp_proj
       );
       return res.json({ ok: true, ...out });
     } catch (err) {
-      logger.error({ err }, 'fab_erp: accept nesting plan');
-      return res.status(err.status ?? 500).json({ message: err.message });
+      return fail(res, err);
     }
   });
 
@@ -175,26 +182,32 @@ router.get('/orders/:orderId/blanks/sheet', protect, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     return res.send(Buffer.from(buffer));
   } catch (err) {
-    logger.error({ err }, 'fab_erp: cutting plan export');
-    return res.status(err.status ?? 500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
 router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_projects_manage'),
   upload.single('excel_file'), async (req, res) => {
     try {
-      if (!req.file?.buffer) return res.status(400).json({ message: 'No file was uploaded.' });
+      // This router's shared `upload` is disk storage (`dest`), not
+      // `memoryStorage()` — `req.file.buffer` is never set here, unlike
+      // templates.js's own multer instance. Read the temp file back, the
+      // same way importParametersHandler (orderItemsImportController.js)
+      // already does for this same middleware.
+      if (!req.file?.path) return res.status(400).json({ message: 'No file was uploaded.' });
       const cid = req.user?.companyId ?? req.user?.company_id;
       const orderId = Number(req.params.orderId);
-      const read = await importPlan(cid, orderId, req.file.buffer);
+      const buffer = await fs.promises.readFile(req.file.path);
+      const read = await importPlan(cid, orderId, buffer);
       const out = await acceptNestingPlan(cid, orderId, {
         ...read.plan,
         provenance: `Uploaded from a spreadsheet — ${read.sheets} sheets, ${read.rows} rows`,
       });
       return res.json({ ok: true, ...out, fromSheet: { rows: read.rows, sheets: read.sheets, short: read.short } });
     } catch (err) {
-      logger.error({ err }, 'fab_erp: cutting plan import');
-      return res.status(err.status ?? 500).json({ message: err.message, problems: err.problems });
+      return fail(res, err);
+    } finally {
+      if (req.file?.path) fs.unlink(req.file.path, () => {});
     }
   });
 
@@ -289,6 +302,152 @@ router.post('/orders/:orderId/parameters', protect, requirePerm('fab_erp_project
 // Readiness is read-only, so it is gated on view, not manage.
 router.get('/orders/:orderId/readiness', protect, orderReadinessHandler);
 router.post('/orders/:orderId/confirm', protect, requirePerm('fab_erp_projects_manage'), confirmOrderHandler);
+
+/**
+ * POST /orders/:orderId/wizard-step — the user explicitly choosing where to be
+ * in the wizard (A5). Same permission tag as `/structure/apply`: moving the
+ * rail is an edit action, not a read. This is the ONLY route allowed to move
+ * `wizard_step` backward, or park it on a stage that still has work left — see
+ * `setWizardStep`/`refreshOrderStage` in orderReadinessService.js for why every
+ * OTHER write can only move it forward.
+ */
+router.post('/orders/:orderId/wizard-step', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    const readiness = await setWizardStep(cid, orderId, req.body?.step);
+    res.json({ ok: true, readiness });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/**
+ * POST /orders/:orderId/revise — enter revision mode on a confirmed order.
+ *
+ * Records nothing itself; it only checks the order is out of draft and hands
+ * back the current readiness so the wizard can reopen. Each structure change
+ * the reopened wizard makes carries this SAME reason through
+ * `/structure/apply`'s `revisionReason` body key — that call is what actually
+ * writes a `fab_order_structure_revisions` row (User Clarifications 4).
+ */
+router.post('/orders/:orderId/revise', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    const reason = String(req.body?.reason ?? '').trim();
+    if (reason.length < 10) {
+      const e = new Error('A revision reason of at least 10 characters is required.');
+      e.status = 400;
+      e.code = 'REVISION_REASON_REQUIRED';
+      throw e;
+    }
+    const [[order]] = await pool.query(
+      `SELECT status FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      [orderId, cid],
+    );
+    if (!order) { const e = new Error('Order not found'); e.status = 404; e.code = 'ORDER_NOT_FOUND'; throw e; }
+    if (order.status === 'draft') {
+      const e = new Error("This order is still a draft — there is nothing to revise, it's still the wizard.");
+      e.status = 409;
+      e.code = 'ALREADY_DRAFT';
+      throw e;
+    }
+    res.json({ ok: true, revisionMode: true, readiness: await refreshOrderStage(cid, orderId) });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/**
+ * GET /orders/:orderId/revisions — the paper trail for the order detail page,
+ * newest first. Read-only, so no `requirePerm` beyond being logged in — same
+ * as `/structure/tree`.
+ */
+router.get('/orders/:orderId/revisions', protect, async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    res.json({ rows: await listRevisions(cid, orderId) });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/**
+ * POST /orders/:orderId/convert — a quote becomes a sales order.
+ *
+ * One transaction, the order row locked: every line, item, nest, parameter and
+ * plan the quote already has carries over untouched — nothing is
+ * re-materialised here, because Production on a quote was never more than the
+ * read-only estimate `isEstimateOnly` gates (EU-13 item 2); once converted it
+ * behaves exactly like any other sales draft's Production step.
+ *
+ * The order number is reissued only if quotes and sales orders resolve to
+ * DIFFERENT codegen rules — a company that has not customised either away from
+ * the default (`quote_order` QT-, `sales_order` SO-) keeps the number it
+ * already quoted the customer only when the two rules happen to be identical.
+ * When it IS reissued, the quote's own number is kept in `notes` — no
+ * `source_order_ref` column exists (grepped init.sql) and EU-1's follow-up did
+ * not add one, so this is not a silent loss of the original number.
+ */
+router.post('/orders/:orderId/convert', protect, requirePerm('fab_erp_projects_manage'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderId = Number(req.params.orderId);
+    await conn.beginTransaction();
+    const [[order]] = await conn.query(
+      `SELECT id, order_number, order_type, status, notes FROM fab_orders
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1 FOR UPDATE`,
+      [orderId, cid],
+    );
+    if (!order) { const e = new Error('Order not found'); e.status = 404; e.code = 'ORDER_NOT_FOUND'; throw e; }
+    if (order.order_type !== 'quote') {
+      const e = new Error('Only a quote can be converted to a sales order.');
+      e.status = 409; e.code = 'NOT_A_QUOTE'; throw e;
+    }
+    if (order.status !== 'draft') {
+      const e = new Error('This quote is no longer a draft.');
+      e.status = 409; e.code = 'NOT_DRAFT'; throw e;
+    }
+
+    const [quoteRule, salesRule] = await Promise.all([
+      getRule(cid, 'quote_order'),
+      getRule(cid, 'sales_order'),
+    ]);
+    const sameSeries = JSON.stringify(quoteRule.segments) === JSON.stringify(salesRule.segments);
+
+    let orderNumber = order.order_number;
+    let notes = order.notes;
+    if (!sameSeries) {
+      orderNumber = await generateCode(cid, 'sales_order', {}, conn);
+      const ref = `Converted from quote ${order.order_number}.`;
+      notes = notes ? `${notes}\n${ref}` : ref;
+    }
+
+    // status/order_type re-tested in the WHERE (on top of the row lock above)
+    // so the UPDATE itself still refuses if something changed between the
+    // SELECT and here.
+    await conn.query(
+      `UPDATE fab_orders SET order_type = 'sales', order_number = ?, notes = ?
+        WHERE id = ? AND company_id = ? AND order_type = 'quote' AND status = 'draft'`,
+      [orderNumber, notes, orderId, cid],
+    );
+    await conn.commit();
+
+    const [[fresh]] = await pool.query(
+      `SELECT id, order_number AS orderNumber, order_type AS orderType, status FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
+      [orderId, cid],
+    );
+    res.json({ ok: true, order: fresh, readiness: await orderReadiness(cid, orderId) });
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* connection may already be gone */ }
+    return fail(res, err);
+  } finally {
+    conn.release();
+  }
+});
 
 /**
  * Deleting a sales order removes the whole tree beneath it.

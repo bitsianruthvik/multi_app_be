@@ -9,16 +9,10 @@
 
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { requirePerm } from '../../../core/middleware/requirePerm.js';
 import { getRule, saveRule, previewCode, generateCode } from '../services/codegenService.js';
 
 const router = Router();
-
-const requirePerm = (tag) => (req, res, next) => {
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
 
 router.get('/codegen-rules', protect, async (req, res) => {
   try {

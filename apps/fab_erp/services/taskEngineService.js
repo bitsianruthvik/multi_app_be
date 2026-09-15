@@ -72,10 +72,15 @@ export async function rollUpOrderStatus(exec, companyId, orderId) {
   if (!orderId) return;
   try {
     const [[order]] = await exec.query(
-      `SELECT status FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      `SELECT status, order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
       [orderId, companyId],
     );
     if (!order) return;
+    // A quote has no production order to mirror and must never be walked
+    // through the sales lifecycle by this — it stays 'draft' until Convert, so
+    // the draft guard below already covers it, but a quote is never supposed
+    // to advance regardless of status, so it is named here explicitly.
+    if (order.order_type === 'quote') return;
 
     const [[agg]] = await exec.query(
       `SELECT COUNT(*)                                          AS total,

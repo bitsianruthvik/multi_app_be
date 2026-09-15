@@ -487,12 +487,16 @@ async function parentsOfMany(exec, companyId, scope, ids) {
      * order path does not; it is here so the rung is not a dead end.
      */
     case 'bom_line': {
-      const [[b]] = await exec.query(
-        `SELECT child_item_id AS childItemId FROM fab_item_bom
-          WHERE id = ? AND company_id = ? LIMIT 1`,
-        [scopeId, companyId],
+      const [rows] = await exec.query(
+        `SELECT id, child_item_id AS childItemId FROM fab_item_bom
+          WHERE company_id = ? AND id IN (?)`,
+        [companyId, ids],
       );
-      return b?.childItemId ? { scope: 'catalog_item', scopeId: Number(b.childItemId) } : null;
+      for (const r of rows) {
+        out.set(Number(r.id),
+          r.childItemId ? { scope: 'catalog_item', scopeId: Number(r.childItemId) } : null);
+      }
+      break;
     }
     case 'catalog_item': {
       const [rows] = await exec.query(

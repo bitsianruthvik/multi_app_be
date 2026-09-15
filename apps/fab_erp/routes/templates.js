@@ -34,8 +34,8 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { requirePerm, fail } from '../../../core/middleware/requirePerm.js';
 import { pool } from '../../../db.js';
-import { logger } from '../../../core/utils/logger.js';
 import {
   parametersFor, expand, bomFor, setBomLine, removeBomLine,
   draftTree, buildFromTree, currentTree, applyTree,
@@ -48,27 +48,6 @@ const router = Router();
 // In memory: the sheet is parsed and thrown away, never stored.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
-
-/**
- * Admin bypasses the tag, as it does on every other fab_erp write.
- *
- * `mutateController` has always let an admin through; this file did not, so the
- * same person could rename an item and not edit its BOM. One surface, one rule.
- */
-const requirePerm = (tag) => (req, res, next) => {
-  const isAdmin = req.user?.role && String(req.user.role).toLowerCase() === 'admin';
-  if (isAdmin) return next();
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
-
-const fail = (res, err, what) => {
-  if (err.status) return res.status(err.status).json({ message: err.message });
-  logger.error({ err }, `fab_erp: ${what} failed`);
-  return res.status(500).json({ message: err.message });
-};
 
 /**
  * The shape it would produce. WRITES NOTHING.
@@ -96,7 +75,7 @@ router.post('/templates/:itemId/preview', protect, async (req, res) => {
     take(tree.root, 0);
 
     res.json({ nodes: tree.nodes, byName: tree.byName, sample });
-  } catch (err) { fail(res, err, 'template preview'); }
+  } catch (err) { fail(res, err); }
 });
 
 /**
@@ -111,7 +90,7 @@ router.get('/templates/:itemId/draft', protect, async (req, res) => {
   try {
     const cid = companyId(req);
     res.json({ tree: await draftTree(cid, Number(req.params.itemId)) });
-  } catch (err) { fail(res, err, 'draft tree'); }
+  } catch (err) { fail(res, err); }
 });
 
 /**
@@ -126,7 +105,7 @@ router.get('/orders/:orderId/structure/tree', protect, async (req, res) => {
       req.query.orderLineId ? Number(req.query.orderLineId) : null,
     );
     res.json({ tree });
-  } catch (err) { return fail(res, err, 'structure tree'); }
+  } catch (err) { return fail(res, err); }
 });
 
 /**
@@ -144,14 +123,16 @@ router.post(
     try {
       const cid = companyId(req);
       const orderId = Number(req.params.orderId);
-      const { tree, orderLineId = null } = req.body ?? {};
-      const result = await applyTree(cid, { orderId, orderLineId, tree });
+      const { tree, orderLineId = null, revisionReason = null } = req.body ?? {};
+      const result = await applyTree(cid, { orderId, orderLineId, tree }, null, {
+        revisionReason, userId: req.user?.id ?? null,
+      });
       res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
     } catch (err) {
       if (err.status === 409) {
         return res.status(409).json({ message: err.message, code: err.code });
       }
-      return fail(res, err, 'structure apply');
+      return fail(res, err);
     }
   },
 );
@@ -174,7 +155,7 @@ router.get(
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.send(Buffer.from(buffer));
-    } catch (err) { return fail(res, err, 'structure export'); }
+    } catch (err) { return fail(res, err); }
   },
 );
 
@@ -213,7 +194,7 @@ router.post(
         return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
       }
       if (err.status === 400) return res.status(400).json({ message: err.message, problems: err.problems });
-      return fail(res, err, 'structure import');
+      return fail(res, err);
     }
   },
 );
@@ -242,7 +223,7 @@ router.post(
       if (err.status === 409) {
         return res.status(409).json({ message: err.message, code: err.code, existing: err.existing });
       }
-      return fail(res, err, 'build structure');
+      return fail(res, err);
     }
   },
 );
@@ -289,7 +270,7 @@ router.get('/item-bom/:itemId', protect, async (req, res) => {
       /** The questions the whole tree under this item would ask. */
       parameters: await parametersFor(cid, parentItemId),
     });
-  } catch (err) { return fail(res, err, 'item BOM read'); }
+  } catch (err) { return fail(res, err); }
 });
 
 /**
@@ -315,7 +296,7 @@ router.get('/item-bom/:itemId/tree', protect, async (req, res) => {
     if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
     const tree = await draftTree(cid, itemId);
     return res.json({ ok: true, tree });
-  } catch (err) { return fail(res, err, 'item BOM tree'); }
+  } catch (err) { return fail(res, err); }
 });
 
 /**
@@ -347,9 +328,14 @@ router.post('/item-bom', protect, requirePerm('fab_erp_items_meta_manage'), asyn
       defaultFlowId: b.defaultFlowId ?? null,
       // Sizes the recipe states, if it states any. A blank clears one.
       defaults: b.defaults ?? null,
+      // Whether this line explodes into one row per instance, and how its
+      // code segment joins onto the parent's. Omitted on the body means
+      // "leave it as it is" — setBomLine reads the prior value back itself.
+      explode: b.explode,
+      codeJoin: b.codeJoin ?? null,
     });
     return res.json({ ok: true });
-  } catch (err) { return fail(res, err, 'item BOM save'); }
+  } catch (err) { return fail(res, err); }
 });
 
 /** DELETE /item-bom/:id — remove one line. The child item itself is untouched. */
@@ -357,7 +343,7 @@ router.delete('/item-bom/:id', protect, requirePerm('fab_erp_items_meta_manage')
   try {
     await removeBomLine(companyId(req), Number(req.params.id));
     return res.json({ ok: true });
-  } catch (err) { return fail(res, err, 'item BOM delete'); }
+  } catch (err) { return fail(res, err); }
 });
 
 /**
@@ -372,7 +358,7 @@ router.get("/catalog/pickable", protect, async (req, res) => {
   try {
     const orderId = req.query.orderId ? Number(req.query.orderId) : null;
     return res.json({ items: await pickableItems(companyId(req), orderId) });
-  } catch (err) { return fail(res, err, "catalog pickable"); }
+  } catch (err) { return fail(res, err); }
 });
 
 /** GET /catalog/sizes — id -> {thickness_mm,width_mm,length_mm,material,grade}, for search. */
@@ -380,7 +366,7 @@ router.get("/catalog/sizes", protect, async (req, res) => {
   try {
     const m = await catalogSizes(companyId(req));
     return res.json({ sizes: Object.fromEntries(m) });
-  } catch (err) { return fail(res, err, "catalog sizes"); }
+  } catch (err) { return fail(res, err); }
 });
 
 export default router;

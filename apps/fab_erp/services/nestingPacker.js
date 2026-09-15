@@ -71,6 +71,44 @@ export const DEFAULT_CUT_GAP_MM = 2;
 
 const DEFAULT_MARGIN = 0;
 
+/**
+ * @typedef {Object} PartRow — what a caller wants cut.
+ * @property {string} key      Stable identity, shared by every plate-row this pooled part ends up
+ *   as. Never the caller's own id under a different name — see "A ROW MAY SPAN PLATES" above.
+ * @property {number} length   mm, before kerf.
+ * @property {number} width    mm.
+ * @property {number} qty      Pieces wanted.
+ * @property {'along_length'|'along_width'|'any'} [grain] 'any' (default, when omitted) keeps the
+ *   free rotation this packer has always done; a stated grain forbids turning the piece 90°.
+ */
+
+/**
+ * @typedef {Object} PlateSpec — a candidate sheet.
+ * @property {number} id            Negative for an offcut (see `plateSourceService.offcutSpecs`),
+ *   so it can never collide with a catalogue item id.
+ * @property {number} length        mm.
+ * @property {number} width         mm.
+ * @property {number} [available]   Physical pieces of this exact spec — 1 for an offcut. Omit for
+ *   a catalogue size, which can be bought again.
+ * @property {boolean} [preferred]  Material already paid for; tried before anything to be bought.
+ */
+
+/**
+ * @typedef {Object} NestOptions
+ * @property {number} [kerfMm]      Cutting gap, mm (default `DEFAULT_CUT_GAP_MM`). `margin` is
+ *   accepted as a synonym for callers written before this option existed. The packer never reads
+ *   the database for this — kerf is resolved by the CALLER (`kerfService.kerfFor`) and handed in,
+ *   because a pure geometry engine must not depend on a connection.
+ * @property {number} [bedLengthMm] The cutting machine's bed, mm. A candidate plate that fits the
+ *   bed in NEITHER orientation is dropped before packing starts. Leave either dimension unset for
+ *   "no limit known" — behaves exactly as if bed size did not exist.
+ * @property {number} [bedWidthMm]
+ * @property {number} [restarts]
+ * @property {number} [seed]
+ * @property {number} [deadline]    A `Date.now()` timestamp; new restarts stop being started at or
+ *   after this, but the first pack always completes.
+ */
+
 export const newPlate = (spec, margin = DEFAULT_MARGIN) => ({
   spec,
   margin,
@@ -102,7 +140,38 @@ export const utilisation = (p) => usedArea(p) / areaOf(p);
  * cutting — refusing to turn a part 90 degrees would reject work a shop does
  * daily.
  */
-function placePiece(plate, a, b, rng = null) {
+/**
+ * PLACEMENT HEURISTICS — which free rectangle to take, and how to split what
+ * is left. One rule is a guess; a restart that only wobbles the ROW ORDER keeps
+ * re-running the same guess. Letting a restart also swap the rule is how the
+ * search reaches layouts the default rule structurally cannot produce.
+ *
+ *   score  bssf  best short-side fit (default): fewest slivers
+ *          blsf  best long-side fit: keeps the long strip open
+ *          baf   best area fit: tightest rectangle first
+ *   split  sas   shorter-axis split (default): the long strip survives whole
+ *          las   longer-axis split: the tall column survives whole
+ */
+const SCORE_RULES = {
+  bssf: (r, pl, pw) => Math.min(r.l - pl, r.w - pw),
+  blsf: (r, pl, pw) => Math.max(r.l - pl, r.w - pw),
+  baf: (r, pl, pw) => r.l * r.w - pl * pw,
+};
+const DEFAULT_HEUR = Object.freeze({ score: 'bssf', split: 'sas' });
+
+/** A random heuristic pair, biased towards the default that measured best alone. */
+export function pickHeuristic(rng) {
+  const scores = ['bssf', 'bssf', 'blsf', 'baf'];
+  const splits = ['sas', 'sas', 'las'];
+  return {
+    score: scores[Math.floor(rng() * scores.length)],
+    split: splits[Math.floor(rng() * splits.length)],
+  };
+}
+
+function placePiece(plate, a, b, rng = null, allowRotate = true, heur = null) {
+  const scoreOfFit = SCORE_RULES[heur?.score] ?? SCORE_RULES.bssf;
+  const splitLonger = heur?.split === 'las';
   /**
    * EVERY feasible placement, not just the best one — because orientation is
    * decided here, and it was never being searched.
@@ -116,33 +185,103 @@ function placePiece(plate, a, b, rng = null) {
    *
    * With `rng`, the pick comes from the best few placements rather than the
    * single best — which is what finally lets a run try turning a part.
+   *
+   * `allowRotate=false` (a stated `grain`) drops the swapped turn entirely, so
+   * a part that must not be turned is never placed sideways even when doing so
+   * would score better.
    */
+  const turns = allowRotate ? [[a, b, false], [b, a, true]] : [[a, b, false]];
   const cands = [];
   for (let i = 0; i < plate.free.length; i++) {
     const r = plate.free[i];
-    for (const [pl, pw] of [[a, b], [b, a]]) {
+    for (const [pl, pw, rotated] of turns) {
       if (pl > r.l + TOL || pw > r.w + TOL) continue;
-      cands.push({ i, r, pl, pw, score: Math.min(r.l - pl, r.w - pw) });
+      cands.push({
+        i, r, pl, pw, rotated, score: scoreOfFit(r, pl, pw),
+      });
     }
   }
   if (!cands.length) return false;
   cands.sort((x, y) => x.score - y.score);
 
   const best = rng ? cands[Math.floor(rng() * Math.min(3, cands.length))] : cands[0];
-  const { i, r, pl, pw } = best;
+  const {
+    i, r, pl, pw, rotated,
+  } = best;
   plate.free.splice(i, 1);
-  plate.pieces.push({ x: r.x, y: r.y, l: pl, w: pw });
+  plate.pieces.push({
+    x: r.x, y: r.y, l: pl, w: pw, rotated,
+  });
   // Split the remainder along whichever leftover axis is SHORTER, so the long
   // strip survives whole. Splitting the other way dices the plate into offcuts
-  // too small to be worth anything.
-  if (r.l - pl < r.w - pw) {
+  // too small to be worth anything — as the DEFAULT. Under the `las` heuristic
+  // the choice is inverted, which is exactly the layout family bssf/sas can
+  // never reach (a tall column kept whole beside a row of short parts).
+  const shorterFirst = (r.l - pl < r.w - pw);
+  if (shorterFirst !== splitLonger) {
     if (r.l - pl > 0) plate.free.push({ x: r.x + pl, y: r.y, l: r.l - pl, w: pw });
     if (r.w - pw > 0) plate.free.push({ x: r.x, y: r.y + pw, l: r.l, w: r.w - pw });
   } else {
     if (r.l - pl > 0) plate.free.push({ x: r.x + pl, y: r.y, l: r.l - pl, w: r.w });
     if (r.w - pw > 0) plate.free.push({ x: r.x, y: r.y + pw, l: pl, w: r.w - pw });
   }
+  plate.free = mergeFree(plate.free);
   return true;
+}
+
+/** 'any' (the default) is free rotation; anything else forbids the swapped turn. */
+const canRotate = (grain) => (grain ?? 'any') === 'any';
+
+/**
+ * Merge two free rectangles into one, ONLY along a shared FULL edge — the
+ * guillotine constraint. A partial-edge join would produce an L-shape and
+ * pretend it is liftable in one piece, which no torch can actually cut.
+ */
+const MERGE_TOL = 1e-6;
+const near = (a, b) => Math.abs(a - b) < MERGE_TOL;
+
+function mergedRect(a, b) {
+  if (near(a.y, b.y) && near(a.w, b.w)) {
+    if (near(a.x + a.l, b.x)) return { x: a.x, y: a.y, l: a.l + b.l, w: a.w };
+    if (near(b.x + b.l, a.x)) return { x: b.x, y: a.y, l: a.l + b.l, w: a.w };
+  }
+  if (near(a.x, b.x) && near(a.l, b.l)) {
+    if (near(a.y + a.w, b.y)) return { x: a.x, y: a.y, l: a.l, w: a.w + b.w };
+    if (near(b.y + b.w, a.y)) return { x: a.x, y: b.y, l: a.l, w: a.w + b.w };
+  }
+  return null;
+}
+
+/**
+ * Fold adjacent free rectangles into one, or the free list grows on every
+ * placement and a later, bigger part sees only slivers where a whole strip
+ * was actually available.
+ *
+ * Runs to a fixed point: one merge can expose another (three same-height
+ * strips in a row need two passes to become one). A pass-count bound looked
+ * safe here but wasn't — each merge shrinks the list AND advances the pass
+ * counter, so a chain of N rectangles collapsing to one stopped halfway.
+ * Loop on "did this pass find a merge" instead; it can only run as many
+ * times as the list has entries to lose, so it still terminates.
+ */
+function mergeFree(free) {
+  let list = free;
+  for (;;) {
+    let combined = null;
+    let ai = -1;
+    let bi = -1;
+    outer:
+    for (let i = 0; i < list.length; i += 1) {
+      for (let j = i + 1; j < list.length; j += 1) {
+        const m = mergedRect(list[i], list[j]);
+        if (m) { combined = m; ai = i; bi = j; break outer; }
+      }
+    }
+    if (!combined) break;
+    list = list.filter((_, k) => k !== ai && k !== bi);
+    list.push(combined);
+  }
+  return list;
 }
 
 /**
@@ -162,13 +301,14 @@ function placePiece(plate, a, b, rng = null) {
  *
  * @returns {{plate, placed:number}} `placed` is 0 when none would fit.
  */
-export function placeSome(plate, row, wanted, rng = null) {
+export function placeSome(plate, row, wanted, rng = null, heur = null) {
   const trial = clonePlate(plate);
   const m = plate.margin ?? 0;
+  const allowRotate = canRotate(row.grain);
   let placed = 0;
   while (placed < wanted) {
     // Inflated by the margin: what is reserved is the part plus its clearance.
-    if (!placePiece(trial, row.length + m, row.width + m, rng)) break;
+    if (!placePiece(trial, row.length + m, row.width + m, rng, allowRotate, heur)) break;
     placed++;
   }
   if (!placed) return { plate, placed: 0 };
@@ -189,6 +329,7 @@ export const pieceFitsSpec = (row, spec, margin = DEFAULT_MARGIN) => {
   // Both inflated by the gap, so it cancels for a lone part: no edge margin.
   const l = row.length + margin; const w = row.width + margin;
   const L = spec.length + margin; const W = spec.width + margin;
+  if (!canRotate(row.grain)) return l <= L + TOL && w <= W + TOL;
   return (l <= L + TOL && w <= W + TOL) || (l <= W + TOL && w <= L + TOL);
 };
 
@@ -204,8 +345,9 @@ export const pieceFitsSpec = (row, spec, margin = DEFAULT_MARGIN) => {
  */
 export function capacityOf(row, spec, margin = DEFAULT_MARGIN) {
   const plate = newPlate(spec, margin);
+  const allowRotate = canRotate(row.grain);
   let n = 0;
-  while (placePiece(plate, row.length + margin, row.width + margin)) n++;
+  while (placePiece(plate, row.length + margin, row.width + margin, null, allowRotate)) n++;
   return n;
 }
 
@@ -220,7 +362,7 @@ export const rowFitsSpec = (row, spec, margin = DEFAULT_MARGIN) =>
  * pieces are placed while the plate is still open, and the small ones fill in
  * around them rather than fragmenting it first.
  */
-export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterPlacement = false) {
+export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterPlacement = false, heur = null) {
   let plate = newPlate(spec, margin);
   const taken = new Map();
   const pool = [...rows].sort((x, y) => {
@@ -258,10 +400,251 @@ export function fillOne(spec, rows, rng = null, margin = DEFAULT_MARGIN, jitterP
      * work that was never done. Silently, because nothing was left unplaced to
      * complain about. An object reference is unique per entry by construction.
      */
-    const { plate: next, placed } = placeSome(plate, row, row.qty, jitterPlacement ? rng : null);
+    const { plate: next, placed } = placeSome(plate, row, row.qty, jitterPlacement ? rng : null, heur);
     if (placed) { plate = next; taken.set(row, (taken.get(row) ?? 0) + placed); }
   }
   return { plate, taken };
+}
+
+/**
+ * ── THE STRIP FILLER: two-stage guillotine with stacked columns ────────────
+ *
+ * The free-rectangle filler above places one piece at a time and lets the
+ * shape of the leftover decide the next. That is a good general-purpose
+ * instinct and a poor one for plate steel, where an order is a few DISTINCT
+ * rectangles in large quantities — 828 stiffeners, 64 flange plates. A shop
+ * nester lays those as STRIPS: a band across the sheet the height of one
+ * part, filled end to end, with shorter parts stacked two or three high in
+ * their own columns. Every cut is then a straight line edge to edge — first
+ * the bands, then the columns, then the stacks — which is the three-stage
+ * guillotine pattern a torch or a shear actually runs.
+ *
+ * HOW A STRIP IS FILLED: exactly, not greedily. Along the strip's length the
+ * question "which columns, how many of each" is a one-dimensional knapsack
+ * (maximise part area within L), and with a handful of part types it is cheap
+ * to solve to optimality by dynamic programming — a few million cell updates
+ * per strip. It is the mixing decision that matters most (four 2995 mm parts
+ * plus one 1260 mm part fills 12000 mm to within 20 mm) and the one a greedy
+ * "longest first" gets wrong on a tail.
+ *
+ * A STRIP THAT WORKS IS REPEATED. Once a band is solved it is laid again as
+ * many times as the quantities and the sheet allow before anything is
+ * re-solved, which is both what a nester does and what keeps this fast: a
+ * sheet of fifteen identical bands costs one knapsack, not fifteen.
+ *
+ * BOTH SHEET ORIENTATIONS are tried — bands along the length and bands along
+ * the width — and the fuller one is kept.
+ *
+ * WHAT IT RETURNS is the same plate shape as `fillOne`, including a `free`
+ * list of the leftovers (the tail of each band and the unused band above the
+ * last strip) so `consolidate`, `placeRow` and the remnant service can treat
+ * the result like any other plate.
+ */
+export function fillOneStrips(spec, rows, rng = null, margin = DEFAULT_MARGIN, cache = null) {
+  const g = margin;
+  const areaOfRow = (r) => r.length * r.width;
+
+  /*
+   * THE KNAPSACK IS SOLVED ONCE FOR THE LONGEST SHEET IN PLAY and read back
+   * for any shorter one: after every item has been considered, dp[len] is
+   * optimal for EVERY capacity up to the length it was built for, so the
+   * candidate sizes 12000, 12050 and 12100 share one table. `cache.maxL` is
+   * that length, set by the caller that knows the whole candidate list.
+   */
+  const solveStrip = (L, h, rem) => {
+    const Lint = Math.floor(L + TOL);
+    const cacheKey = cache ? `${h}|${rem.join(',')}` : null;
+    let table = cacheKey ? cache.get(cacheKey) : undefined;
+    if (table && table.Lsolve < Lint) table = undefined;
+    if (table === undefined) {
+      table = buildStripTable(Math.max(Lint, Math.floor((cache?.maxL ?? 0) + TOL)), h, rem);
+      if (cacheKey) {
+        if (cache.size > 400) cache.clear();
+        cache.set(cacheKey, table);
+      }
+    }
+    if (!table) return null;
+    return readStrip(table, Lint, h);
+  };
+
+  const buildStripTable = (Lint, h, rem) => {
+    /*
+     * Column types for this band: for each row still wanted, the orientation
+     * that fills the band's height best (most stacked height used); a row
+     * whose stated grain forbids turning gets only the one orientation.
+     */
+    const items = [];
+    rows.forEach((r, i) => {
+      if (rem[i] <= 0) return;
+      const l = r.length + g; const w = r.width + g;
+      const opts = [];
+      if (w <= h + TOL && l <= Lint + TOL) opts.push({ a: l, b: w, rot: false });
+      if (canRotate(r.grain) && l <= h + TOL && w <= Lint + TOL) opts.push({ a: w, b: l, rot: true });
+      if (!opts.length) return;
+      let best = null;
+      for (const o of opts) {
+        const k = Math.floor((h + TOL) / o.b);
+        if (k < 1) continue;
+        const fill = k * o.b;
+        if (!best || fill > best.fill + TOL || (Math.abs(fill - best.fill) <= TOL && o.a < best.a)) best = { ...o, k, fill };
+      }
+      if (!best) return;
+      const { a, b, rot, k } = best;
+      const segLen = Math.ceil(a - 1e-9);
+      const maxSegs = Math.floor(Lint / segLen);
+      if (maxSegs < 1) return;
+      const nFull = Math.min(Math.floor(rem[i] / k), maxSegs);
+      const partial = rem[i] - nFull * k;
+      // Binary splitting so a bounded count is a handful of 0/1 items.
+      let left = nFull;
+      for (let c = 1; left > 0; c *= 2) {
+        const take = Math.min(c, left);
+        items.push({ row: i, a, b, rot, segs: take, perSeg: k, len: segLen * take, value: take * k * areaOfRow(r) });
+        left -= take;
+      }
+      if (partial > 0 && nFull < maxSegs) {
+        items.push({ row: i, a, b, rot, segs: 1, perSeg: partial, len: segLen, value: partial * areaOfRow(r) });
+      }
+    });
+    if (!items.length) return null;
+
+    const dp = new Float64Array(Lint + 1);
+    const choose = new Uint8Array(items.length * (Lint + 1));
+    for (let t = 0; t < items.length; t += 1) {
+      const it = items[t];
+      const base = t * (Lint + 1);
+      for (let len = Lint; len >= it.len; len -= 1) {
+        const cand = dp[len - it.len] + it.value;
+        if (cand > dp[len] + 1e-9) { dp[len] = cand; choose[base + len] = 1; }
+      }
+    }
+    return { Lsolve: Lint, items, dp, choose };
+  };
+
+  const readStrip = (table, Lint, h) => {
+    const { Lsolve, items, dp, choose } = table;
+    // Reconstruct, grouped by row so a row's pieces sit side by side.
+    let len = Lint;
+    const picked = new Map();
+    for (let t = items.length - 1; t >= 0; t -= 1) {
+      if (!choose[t * (Lsolve + 1) + len]) continue;
+      const it = items[t];
+      const hit = picked.get(it.row) ?? { row: it.row, a: it.a, b: it.b, rot: it.rot, stacks: [] };
+      for (let s = 0; s < it.segs; s += 1) hit.stacks.push(it.perSeg);
+      picked.set(it.row, hit);
+      len -= it.len;
+    }
+    if (!picked.size) return null;
+    const used = new Array(rows.length).fill(0);
+    let usedLen = 0;
+    for (const p of picked.values()) {
+      for (const k of p.stacks) used[p.row] += k;
+      usedLen += p.stacks.length * Math.ceil(p.a - 1e-9);
+    }
+    return { h, value: dp[Lint], groups: [...picked.values()], used, usedLen };
+  };
+
+  const layOut = (L, W) => {
+    const rem = rows.map((r) => r.qty);
+    const pieces = []; const placedRows = []; const free = [];
+    let y = 0;
+    for (;;) {
+      const Wr = W - y;
+      const hs = new Set();
+      let bigRowH = null; let bigRowArea = -1;
+      rows.forEach((r, i) => {
+        if (rem[i] <= 0) return;
+        const l = r.length + g; const w = r.width + g;
+        const fits = [];
+        if (w <= Wr + TOL && l <= L + TOL) fits.push(w);
+        if (canRotate(r.grain) && l <= Wr + TOL && w <= L + TOL) fits.push(l);
+        if (!fits.length) return;
+        for (const h of fits) hs.add(h);
+        const a = areaOfRow(r) * rem[i];
+        if (a > bigRowArea) { bigRowArea = a; bigRowH = Math.min(...fits); }
+      });
+      if (!hs.size) break;
+      const tallest = [...hs].sort((a, b) => b - a);
+      const tryH = new Set(tallest.slice(0, rng ? 3 : 2));
+      if (bigRowH != null) tryH.add(bigRowH);
+
+      let strip = null;
+      const cands = [];
+      for (const h of tryH) {
+        const s = solveStrip(L, h, rem);
+        if (s) cands.push(s);
+      }
+      if (!cands.length) break;
+      // Fullest band wins; a seeded run may take the runner-up instead.
+      cands.sort((a, b) => b.value - a.value);
+      strip = rng ? cands[Math.floor(rng() * Math.min(2, cands.length))] : cands[0];
+
+      // Repeat the band while quantities and height allow.
+      let times = Math.floor((Wr + TOL) / strip.h);
+      rows.forEach((_, i) => { if (strip.used[i] > 0) times = Math.min(times, Math.floor(rem[i] / strip.used[i])); });
+      times = Math.max(1, times);
+      for (let t = 0; t < times; t += 1) {
+        let x = 0;
+        for (const grp of strip.groups) {
+          const r = rows[grp.row];
+          const segLen = Math.ceil(grp.a - 1e-9);
+          let count = 0;
+          for (const k of grp.stacks) {
+            for (let j = 0; j < k; j += 1) {
+              pieces.push({ x, y: y + j * grp.b, l: grp.a, w: grp.b, rotated: grp.rot });
+              count += 1;
+            }
+            x += segLen;
+          }
+          placedRows.push({ ...r, qty: count });
+          rem[grp.row] -= count;
+        }
+        if (L - strip.usedLen > 0) free.push({ x: strip.usedLen, y, l: L - strip.usedLen, w: strip.h });
+        y += strip.h;
+      }
+    }
+    if (W - y > 0) free.push({ x: 0, y, l: L, w: W - y });
+    return { pieces, placedRows, free, rem };
+  };
+
+  const L0 = spec.length + g; const W0 = spec.width + g;
+  const along = layOut(L0, W0);
+  const across = layOut(W0, L0);
+  const areaPlaced = (o) => o.placedRows.reduce((s, r) => s + r.qty * areaOfRow(r), 0);
+  const pick = areaPlaced(across) > areaPlaced(along) + TOL ? across : along;
+  const transposed = pick === across;
+  const swap = (q) => ({ x: q.y, y: q.x, l: q.w, w: q.l });
+
+  const plate = newPlate(spec, margin);
+  plate.pieces = transposed
+    ? pick.pieces.map((p) => ({ ...swap(p), rotated: !p.rotated }))
+    : pick.pieces;
+  plate.rows = pick.placedRows;
+  plate.free = mergeFree(transposed ? pick.free.map(swap) : pick.free);
+
+  const taken = new Map();
+  rows.forEach((r, i) => { const n = r.qty - pick.rem[i]; if (n > 0) taken.set(r, n); });
+  return { plate, taken };
+}
+
+/**
+ * Fill one plate the best way available: both fillers, keep the fuller.
+ *
+ * Neither filler dominates. Strips win on the big homogeneous groups and on
+ * the tail (an exact knapsack along the band), free rectangles win when the
+ * parts are all different sizes and a band would leave a ragged top edge.
+ * Running both costs a few milliseconds per plate and can never lose to
+ * either alone.
+ *
+ * @param {{jitterPlacement?:boolean, heur?:object, filler?:'freerect'|'strip'|'best', stripCache?:Map}} o
+ */
+export function fillPlate(spec, rows, rng = null, margin = DEFAULT_MARGIN, o = {}) {
+  const filler = o.filler ?? 'best';
+  if (filler === 'strip') return fillOneStrips(spec, rows, rng, margin, o.stripCache ?? null);
+  const a = fillOne(spec, rows, rng, margin, o.jitterPlacement === true, o.heur ?? null);
+  if (filler === 'freerect') return a;
+  const b = fillOneStrips(spec, rows, rng, margin, o.stripCache ?? null);
+  return usedArea(b.plate) > usedArea(a.plate) + TOL ? b : a;
 }
 
 /** Seeded, so a run is reproducible and a good answer can be got back. */
@@ -274,8 +657,14 @@ export function mulberry32(a) {
   };
 }
 
-/** What a nesting costs: plate area bought. Fewer plates breaks a tie. */
-const scoreOf = (res) => res.plates.reduce((a, p) => a + areaOf(p), 0);
+/**
+ * What a nesting costs: plate area BOUGHT. Fewer plates breaks a tie.
+ *
+ * A drop (`spec.available` set) is already paid for, so it scores 0 — counting
+ * its area again would bias the search away from using material that is
+ * sitting on the shelf, exactly backwards from the objective.
+ */
+const scoreOf = (res) => res.plates.reduce((a, p) => a + (p.spec.available != null ? 0 : areaOf(p)), 0);
 
 /**
  * Second pass: empty the worst plates into the others, and drop them.
@@ -335,20 +724,28 @@ export function consolidate(plates) {
 /**
  * Nest `rows` onto plates chosen from `specs`.
  *
- * @param {Array<{key,length,width,qty}>} rows   part rows, dimensions in mm
- * @param {Array<{id,code,length,width,available?,preferred?}>} specs  candidate plates.
- *   `available` limits how many of that size exist — omit for a catalogue size,
- *   which can be bought again; set 1 for an OFFCUT, which is one physical piece.
- *   `preferred` marks material already paid for, which is chosen ahead of
- *   anything that would have to be bought.
- * @param {{maxPlates?:number}} [opts]
- * @returns {{plates:Array, unplaced:Array}}
+ * @param {PartRow[]} rows
+ * @param {PlateSpec[]} specs
+ * @param {NestOptions} [opts]
+ * @returns {{plates:Array, unplaced:Array<{row:PartRow, reason:string}>}}
  */
 function nestOnce(rows, specs, opts = {}, rng = null) {
   const maxPlates = opts.maxPlates ?? 5000;
-  const margin = opts.margin ?? DEFAULT_MARGIN;
+  const margin = opts.kerfMm ?? opts.margin ?? DEFAULT_CUT_GAP_MM;
   const plates = [];
   const unplaced = [];
+
+  /*
+   * BED SIZE. A candidate too big for the cutting machine in EVERY orientation
+   * is not offered at all — same treatment as a plate size nobody stocks. Only
+   * excludes when BOTH dimensions are known; either missing means "no limit
+   * known", which behaves exactly as before a bed size was ever entered.
+   */
+  const { bedLengthMm, bedWidthMm } = opts;
+  if (bedLengthMm != null && bedWidthMm != null) {
+    specs = specs.filter((s) => (s.length <= bedLengthMm && s.width <= bedWidthMm)
+      || (s.length <= bedWidthMm && s.width <= bedLengthMm));
+  }
   /**
    * How many of each spec are left to open.
    *
@@ -400,19 +797,55 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
      */
     const rounds = [specs.filter((s) => s.preferred), specs.filter((s) => !s.preferred)];
     let best = null;
+    /*
+     * ONE HEURISTIC PAIR PER PLATE on a seeded run, so a restart explores a
+     * different placement FAMILY and not just a different row order. The
+     * deterministic run (rng null) keeps the default pair, which is what makes
+     * restart 0 the floor every other restart is measured against.
+     *
+     * The strip cache lives for this one plate: every candidate spec sees the
+     * same remaining parts, and many share a length, so a band solved for one
+     * spec is reused by the next.
+     */
+    const stripCache = new Map();
+    stripCache.maxL = Math.max(...specs.map((s) => Math.max(s.length, s.width))) + margin;
+    const filler = opts.filler ?? 'best';
+    const fillOpts = {
+      jitterPlacement: opts.jitterPlacement === true,
+      heur: rng && opts.jitterPlacement === true ? pickHeuristic(rng) : null,
+      filler: filler === 'best' ? 'freerect' : filler,
+      stripCache,
+    };
+    const keyOf = (plate) => [Math.round(utilisation(plate) * 1000), Math.round(usedArea(plate))];
+    const better = (k, b) => !b || k[0] > b.key[0] || (k[0] === b.key[0] && k[1] > b.key[1]);
     for (const round of rounds) {
+      const cands = [];
       for (const spec of round) {
         if ((stockOf.get(spec.id) ?? 0) <= 0) continue;
-        const { plate, taken } = fillOne(spec, remaining, rng, margin, opts.jitterPlacement === true);
+        const { plate, taken } = fillPlate(spec, remaining, rng, margin, fillOpts);
         if (!taken.size) continue;
-        const util = utilisation(plate);
+        cands.push({ spec, plate, taken, key: keyOf(plate) });
+      }
+      /*
+       * STRIPS ON THE SHORTLIST ONLY. The strip filler is an exact solve per
+       * band and costs several times a free-rectangle fill; run on every
+       * candidate size it dominated the whole search. Run on the four sizes
+       * the cheap filler already rates highest it finds the same improvements
+       * — a size the free-rectangle fill rates poorly is rarely the one a band
+       * layout rescues — at a fraction of the cost.
+       */
+      if (filler === 'best' && cands.length) {
+        cands.sort((a, b) => (b.key[0] - a.key[0]) || (b.key[1] - a.key[1]));
+        for (const c of cands.slice(0, 4)) {
+          const alt = fillOneStrips(c.spec, remaining, rng, margin, stripCache);
+          if (usedArea(alt.plate) > usedArea(c.plate) + TOL) { c.plate = alt.plate; c.taken = alt.taken; c.key = keyOf(alt.plate); }
+        }
+      }
+      for (const c of cands) {
         // Utilisation decides, but two plates within a hair of each other are not
         // meaningfully different and the tie should go to the one that absorbs
         // more work — that is one fewer plate overall.
-        const key = [Math.round(util * 1000), Math.round(usedArea(plate))];
-        if (!best || key[0] > best.key[0] || (key[0] === best.key[0] && key[1] > best.key[1])) {
-          best = { plate, taken, key };
-        }
+        if (better(c.key, best)) best = c;
       }
       // A preferred plate that took anything ends the contest — nothing a fresh
       // plate could score is worth buying steel to achieve.
@@ -453,6 +886,22 @@ function nestOnce(rows, specs, opts = {}, rng = null) {
 }
 
 /**
+ * THE DETERMINISTIC FLOOR, taken twice. The fuller plate is not always the
+ * better order — a strip that packs 60 stiffeners can leave a tail the
+ * free-rectangle fill would not have — so restart 0 is run with each filler
+ * and the better TOTAL is the floor every seeded restart must beat.
+ */
+function floorSolution(rows, specs, opts) {
+  const a = nestOnce(rows, specs, { ...opts, filler: 'freerect' }, null);
+  if ((opts.filler ?? 'best') === 'freerect') return a;
+  const b = nestOnce(rows, specs, opts, null);
+  if (b.unplaced.length > a.unplaced.length) return a;
+  if (a.unplaced.length > b.unplaced.length) return b;
+  const sa = scoreOf(a); const sb = scoreOf(b);
+  return sb < sa || (sb === sa && b.plates.length < a.plates.length) ? b : a;
+}
+
+/**
  * Nest, trying it many ways and keeping the best.
  *
  * ONE GREEDY RUN IS ONE GUESS. The order parts are placed in decides the
@@ -481,7 +930,7 @@ export function nest(rows, specs, opts = {}) {
   const seed = opts.seed ?? 1;
   const deadline = opts.deadline ?? Infinity;
 
-  let best = nestOnce(rows, specs, opts, null);
+  let best = floorSolution(rows, specs, opts);
   let bestScore = scoreOf(best);
 
   for (let i = 1; i < restarts; i += 1) {
@@ -541,7 +990,21 @@ export function ruinRecreate(rows, specs, opts = {}, deadline, seed = 7) {
     }
     if (!freed.length) continue;
 
-    const redone = nest(freed, specs, {
+    /*
+     * A DROP KEPT BY ANOTHER PLATE IS NOT A CANDIDATE HERE. `shrinkPlates`
+     * already refuses to touch an offcut for the same reason (§13 "An offcut
+     * is a stock piece, not a plate"): it is ONE physical piece, and offering
+     * it to the repair loop while a KEPT plate still stands on it would let
+     * two plates in the same result believe they both have it.
+     */
+    const keptOffcutIds = new Set(
+      keep.filter((p) => p.spec.available != null).map((p) => p.spec.id),
+    );
+    const availableSpecs = keptOffcutIds.size
+      ? specs.filter((s) => !(s.available != null && keptOffcutIds.has(s.id)))
+      : specs;
+
+    const redone = nest(freed, availableSpecs, {
       ...opts, restarts: 4, seed: Math.floor(rng() * 1e9), deadline,
     });
     if (redone.unplaced.length) continue;
@@ -662,13 +1125,45 @@ export function nestAtEffort(rows, specs, opts = {}, effort = 'standard', budget
  * two questions that are impossibilities rather than opinions — does every part
  * fit inside its plate in some orientation, and is any plate asked for more
  * area than it has.
+ *
+ * EACH PLATE'S FULL ROW SET IS REPACKED TOGETHER, not one row at a time. §13
+ * "A part row is ATOMIC to one plate, so 'does it fit' is not a question about
+ * one piece" — the same logic applies one level up, to everything a plate
+ * actually carries: checking row A alone against an EMPTY plate says nothing
+ * about whether row B, already sharing that sheet, leaves room for it.
  */
 export function verify(plates) {
   const problems = [];
   for (const p of plates) {
-    for (const r of p.rows) {
-      if (!rowFitsSpec(r, p.spec, p.margin ?? 0)) {
-        problems.push(`${r.key} is ${r.length}x${r.width} on a ${p.spec.length}x${p.spec.width} plate`);
+    const m = p.margin ?? 0;
+    const wanted = p.rows.reduce((s, r) => s + r.qty, 0);
+    if (Array.isArray(p.pieces) && p.pieces.length && wanted > 0) {
+      /*
+       * THE LAYOUT ITSELF, WHEN THERE IS ONE. A plate that carries its pieces
+       * is checked exactly — every piece inside the sheet, no two overlapping,
+       * and the pieces the size and number the rows say. This is the check
+       * that matters: it is deterministic, it cannot refuse a layout the
+       * search found by luck, and it cannot pass one that does not fit.
+       */
+      problems.push(...verifyLayout(p, m));
+    } else if (p.rows.length) {
+      /*
+       * NO LAYOUT ON RECORD (a hand-edited plan, an older saved nest) — re-pack
+       * the plate's full row set from empty with the same fillers the search
+       * uses. This can still refuse a layout that was found by a lucky seed,
+       * which is exactly why layouts are carried whenever they exist.
+       */
+      const one = fillPlate(p.spec, p.rows, null, m, { filler: 'best' });
+      const placed = [...one.taken.values()].reduce((s, n) => s + n, 0);
+      let ok = placed === wanted;
+      if (!ok) {
+        const trial = nest(p.rows, [p.spec], { margin: m, restarts: 8, jitterPlacement: true });
+        ok = !trial.unplaced.length && trial.plates.length === 1;
+      }
+      if (!ok) {
+        for (const r of p.rows) {
+          problems.push(`${r.key} is ${r.length}x${r.width} on a ${p.spec.length}x${p.spec.width} plate`);
+        }
       }
     }
     if (usedArea(p) > areaOf(p) + TOL) {
@@ -677,6 +1172,126 @@ export function verify(plates) {
     }
   }
   return problems;
+}
+
+/**
+ * Check a plate's recorded pieces against its sheet and its rows.
+ *
+ * Pieces are INFLATED rectangles (part + gap), as the fillers record them, on
+ * a sheet inflated by the same gap — so touching the rim is fine and two
+ * pieces may touch each other only through the gap. A piece may carry a `key`
+ * (the accept path sends them that way); otherwise pieces are matched to rows
+ * in the order they were laid, which is how every filler here emits them.
+ */
+export function verifyLayout(p, m = p.margin ?? 0) {
+  const problems = [];
+  const L = p.spec.length + m; const W = p.spec.width + m;
+  const label = `${p.spec.length}x${p.spec.width} plate`;
+  const pieces = p.pieces;
+
+  for (const q of pieces) {
+    if (q.x < -TOL || q.y < -TOL || q.x + q.l > L + TOL || q.y + q.w > W + TOL) {
+      problems.push(`a ${(q.l - m)}x${(q.w - m)} piece at ${Math.round(q.x)},${Math.round(q.y)} runs off the ${label}`);
+    }
+  }
+  for (let i = 0; i < pieces.length; i += 1) {
+    const a = pieces[i];
+    for (let j = i + 1; j < pieces.length; j += 1) {
+      const b = pieces[j];
+      if (a.x < b.x + b.l - TOL && b.x < a.x + a.l - TOL && a.y < b.y + b.w - TOL && b.y < a.y + a.w - TOL) {
+        problems.push(`two pieces overlap at ${Math.round(Math.max(a.x, b.x))},${Math.round(Math.max(a.y, b.y))} on the ${label}`);
+        if (problems.length > 12) return problems;
+      }
+    }
+  }
+
+  // The pieces must be the rows: same count and same size per row.
+  const sameSize = (q, r) => {
+    const l = r.length + m; const w = r.width + m;
+    return (Math.abs(q.l - l) <= TOL && Math.abs(q.w - w) <= TOL)
+      || (Math.abs(q.l - w) <= TOL && Math.abs(q.w - l) <= TOL);
+  };
+  const keyed = pieces.every((q) => q.key != null);
+  if (keyed) {
+    const byKey = new Map();
+    for (const q of pieces) byKey.set(String(q.key), [...(byKey.get(String(q.key)) ?? []), q]);
+    const wantByKey = new Map();
+    for (const r of p.rows) wantByKey.set(String(r.key), (wantByKey.get(String(r.key)) ?? 0) + r.qty);
+    for (const [k, n] of wantByKey) {
+      const have = byKey.get(k) ?? [];
+      if (have.length !== n) problems.push(`${k}: ${n} wanted on the ${label} but the layout shows ${have.length}`);
+      const row = p.rows.find((r) => String(r.key) === k);
+      if (row && have.some((q) => !sameSize(q, row))) problems.push(`${k}: a piece in the layout is not ${row.length}x${row.width}`);
+    }
+    for (const k of byKey.keys()) if (!wantByKey.has(k)) problems.push(`${k}: in the layout but not on the ${label}'s rows`);
+  } else {
+    let cursor = 0;
+    for (const r of p.rows) {
+      for (let i = 0; i < r.qty; i += 1) {
+        const q = pieces[cursor]; cursor += 1;
+        if (!q) { problems.push(`${r.key}: the layout is short of pieces on the ${label}`); break; }
+        if (!sameSize(q, r)) { problems.push(`${r.key}: piece ${cursor} is not ${r.length}x${r.width}`); break; }
+      }
+    }
+    if (cursor < pieces.length) problems.push(`the ${label} shows ${pieces.length - cursor} more pieces than its rows`);
+  }
+  return problems;
+}
+
+/**
+ * WHAT SHEET SIZE WOULD HAVE HELPED — the waste that is the CATALOGUE's, not
+ * the packer's.
+ *
+ * On the KEPL order the single biggest loss is 16 t of 28 mm: forty webs, each
+ * 12000 x 2995, and the only sheet wide enough is 3100. A 105 mm strip off
+ * every plate, and no arrangement can touch it. That is a purchasing answer —
+ * ask the mill for 3000 wide — and the only way anyone finds out is if the
+ * packer says so.
+ *
+ * Per plate, the bounding box of what landed (rounded up to `step`) is the
+ * sheet it actually needed. Plates that needed the same box off the same spec
+ * are grouped, and a group is reported when the difference is worth having.
+ *
+ * @returns {Array<{specId, specLength, specWidth, plates, length, width, savingMm2, savingPct}>}
+ */
+export function sizeAdvice(plates, margin = DEFAULT_CUT_GAP_MM, { step = 50, minPct = 2 } = {}) {
+  const groups = new Map();
+  for (const p of plates) {
+    if (p.spec.available != null || !p.pieces?.length) continue;
+    let maxX = 0; let maxY = 0;
+    for (const q of p.pieces) { maxX = Math.max(maxX, q.x + q.l); maxY = Math.max(maxY, q.y + q.w); }
+    // Deflate the far edge (the last piece's gap is not steel) and round up.
+    const need = (v) => Math.ceil(Math.max(0, v - margin) / step) * step;
+    const l = Math.min(p.spec.length, need(maxX));
+    const w = Math.min(p.spec.width, need(maxY));
+    const key = `${p.spec.id}|${l}|${w}`;
+    const hit = groups.get(key) ?? {
+      specId: p.spec.id, specLength: p.spec.length, specWidth: p.spec.width, plates: 0, length: l, width: w,
+    };
+    hit.plates += 1;
+    groups.set(key, hit);
+  }
+  /*
+   * ONE ANSWER PER WIDTH. A mill sells plate by width and cuts to length, so
+   * "16 sheets need 11650 x 3000 and 24 need 12000 x 3000" is one purchasing
+   * question — 3000 wide — asked twice. Sheets off the same spec that want
+   * the same width are merged, at the longer length.
+   */
+  const byWidth = new Map();
+  for (const gp of groups.values()) {
+    const key = `${gp.specId}|${gp.width}`;
+    const hit = byWidth.get(key);
+    if (!hit) byWidth.set(key, { ...gp });
+    else { hit.plates += gp.plates; hit.length = Math.max(hit.length, gp.length); }
+  }
+  const out = [];
+  for (const gp of byWidth.values()) {
+    const per = gp.specLength * gp.specWidth - gp.length * gp.width;
+    const pct = 100 * per / (gp.specLength * gp.specWidth);
+    if (pct < minPct) continue;
+    out.push({ ...gp, savingMm2: per * gp.plates, savingPct: Math.round(pct * 10) / 10 });
+  }
+  return out.sort((a, b) => b.savingMm2 - a.savingMm2);
 }
 
 /**
@@ -719,16 +1334,14 @@ export function shrinkPlates(plates, specs, margin = DEFAULT_CUT_GAP_MM) {
       .filter((s) => s.length * s.width < here)
       .sort((a, b) => (a.length * a.width) - (b.length * b.width));
 
+    const wanted = p.rows.reduce((s, r) => s + r.qty, 0);
     for (const s of smaller) {
-      let trial = newPlate(s, margin);
-      let ok = true;
-      for (const row of p.rows) {
-        const next = placeRow(trial, row);
-        if (!next) { ok = false; break; }
-        trial = next;
-      }
+      // Both fillers, from empty — a strip layout often fits a sheet the
+      // one-row-at-a-time re-placement cannot.
+      const trial = fillPlate(s, p.rows, null, margin, { filler: 'best' });
+      const placed = [...trial.taken.values()].reduce((a, n) => a + n, 0);
       // Smallest first, so the first that fits is the best that fits.
-      if (ok) return trial;
+      if (placed === wanted) return trial.plate;
     }
     return p;
   });
@@ -763,7 +1376,7 @@ export async function nestAsync(rows, specs, opts = {}) {
   const seed = opts.seed ?? 1;
   const deadline = opts.deadline ?? Infinity;
 
-  let best = nestOnce(rows, specs, opts, null);
+  let best = floorSolution(rows, specs, opts);
   let bestScore = scoreOf(best);
 
   for (let i = 1; i < restarts; i += 1) {
@@ -780,4 +1393,86 @@ export async function nestAsync(rows, specs, opts = {}) {
     }
   }
   return best;
+}
+
+/**
+ * `ruinRecreate`, breathing. Same search, same seed, same answer; control is
+ * handed back to the event loop every few repairs so the server keeps
+ * answering while a deep run spends its minutes. `onProgress(fraction)` is
+ * called on the same cadence so a run row can say how far along it is.
+ *
+ * THE REPAIR REPACKS WITH THE SAME FILLERS AS THE OPENING SOLUTION and runs
+ * `consolidate` over the joined result, so a freed row can land on a kept
+ * plate's leftover rather than only on the plates it was freed with.
+ */
+export async function ruinRecreateAsync(rows, specs, opts = {}, deadline, seed = 7, onProgress = null) {
+  const rng = mulberry32(seed);
+  const startedAt = Date.now();
+  let best = await nestAsync(rows, specs, { ...opts, restarts: 8, seed, deadline });
+  let bestScore = scoreOf(best);
+  let iter = 0;
+
+  while (Date.now() < deadline) {
+    iter += 1;
+    if (iter % BREATHE_EVERY === 0) {
+      await breathe();
+      if (onProgress) onProgress(Math.min(1, (Date.now() - startedAt) / Math.max(1, deadline - startedAt)));
+    }
+    const keep = [];
+    const freed = [];
+    for (const p of best.plates) {
+      const emptiness = 1 - usedArea(p) / areaOf(p);
+      if (rng() < 0.15 + emptiness) freed.push(...p.rows); else keep.push(p);
+    }
+    if (!freed.length) continue;
+
+    const keptOffcutIds = new Set(keep.filter((p) => p.spec.available != null).map((p) => p.spec.id));
+    const availableSpecs = keptOffcutIds.size
+      ? specs.filter((s) => !(s.available != null && keptOffcutIds.has(s.id)))
+      : specs;
+
+    const redone = nestOnce(freed, availableSpecs, opts, mulberry32(Math.floor(rng() * 1e9)));
+    if (redone.unplaced.length) continue;
+
+    const joined = consolidate([...keep, ...redone.plates]);
+    const score = joined.reduce((a, p) => a + (p.spec.available != null ? 0 : areaOf(p)), 0);
+    if (score < bestScore || (score === bestScore && joined.length < best.plates.length)) {
+      best = { plates: joined, unplaced: best.unplaced };
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/** `multiStartNest`, breathing — see that function for why four starts. */
+export async function multiStartNestAsync(rows, specs, opts = {}, totalMs, starts = 4, onProgress = null) {
+  const slice = Math.max(1, totalMs / Math.max(1, starts));
+  const overall = Date.now() + totalMs;
+  let best = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < starts; i += 1) {
+    if (i > 0 && Date.now() >= overall) break;
+    const until = Math.min(Date.now() + slice, overall);
+    const r = await ruinRecreateAsync(rows, specs, opts, until, 1000 + i * 7919,
+      onProgress ? (f) => onProgress((i + f) / starts) : null);
+    const score = scoreOf(r);
+    if (score < bestScore || (score === bestScore && r.plates.length < best.plates.length)) { best = r; bestScore = score; }
+  }
+  return best;
+}
+
+/**
+ * The async twin of `nestAtEffort`: what the blank plan actually runs.
+ *
+ * `quick` is the restart loop alone (about a second on KEPL). `standard` and
+ * `deep` spend their budget on repair — which is where the tonnes are — and
+ * both keep the server answerable while they do.
+ */
+export async function nestAtEffortAsync(rows, specs, opts = {}, effort = 'standard', budgetMs = null, onProgress = null) {
+  const level = EFFORT_LEVELS[effort] ?? EFFORT_LEVELS.standard;
+  const ms = budgetMs ?? level.budgetMs;
+  const withJitter = { ...opts, jitterPlacement: true };
+  if (!ms) return nestAsync(rows, specs, { ...withJitter, restarts: level.restarts });
+  if (level.starts) return multiStartNestAsync(rows, specs, withJitter, ms, level.starts, onProgress);
+  return ruinRecreateAsync(rows, specs, withJitter, Date.now() + ms, opts.seed ?? 7, onProgress);
 }

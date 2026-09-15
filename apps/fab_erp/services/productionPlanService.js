@@ -28,16 +28,48 @@ import { onOrderByItem, heldByOrder, procurementForOrder } from './procurementOr
 import { ensureProductionOrder } from './productionOrderService.js';
 import { ensureCuttingOrder } from './blankService.js';
 
+/**
+ * EU-9 item 4: a per-call memo so a screen that reads several procurement
+ * figures at once — `orderShortfall` alone joins half a dozen tables — does
+ * not compute the same one twice. `buyView` is this file's only caller today,
+ * so the cache never actually gets a second hit yet; it exists so a future
+ * caller that also needs the shortfall (a combined confirm+buy action, say)
+ * has somewhere to share it rather than adding a fourth copy of the query.
+ *
+ * EU-14 item E3: the memoization itself now lives in `procurementService.js`
+ * (`orderShortfall`/`orderProcurementSplit` both take `{ctx}` and cache into
+ * `ctx.cache` under their own keys) so the SAME `{cache: Map}` shape can be
+ * shared with `orderReadinessService.summariseProcurement` and
+ * `procurementOrderService.requestProcurement` when a caller further up
+ * builds one ctx and hands it to more than one of the three. This file's own
+ * `ctx` object is unchanged — it already had a `cache` Map — `shortfallFor`
+ * just stopped keeping its own copy of the answer.
+ */
+function procurementCtx(companyId, orderId, conn) {
+  return { companyId, orderId, conn, cache: new Map() };
+}
+
+async function shortfallFor(ctx) {
+  return orderShortfall(ctx.companyId, ctx.orderId, ctx.conn, { ctx });
+}
+
 const minutes = (h) => (h == null ? null : Math.round(Number(h) * 60 * 100) / 100);
 
-/** Both production orders of a sales order, by purpose. */
-async function productionOrders(companyId, orderId, exec = pool) {
+/**
+ * Both production orders of a sales order, by purpose.
+ *
+ * @param {boolean} [forUpdate=false] lock both rows — for a caller about to
+ *   decide, in the SAME transaction, whether a status still allows a write
+ *   (setStepTime's TOCTOU fix: reading status before BEGIN let a deploy race
+ *   land between the check and the write).
+ */
+async function productionOrders(companyId, orderId, exec = pool, forUpdate = false) {
   const [rows] = await exec.query(
     `SELECT id, order_number AS orderNumber, status, mo_purpose AS purpose, progress_pct AS progressPct, notes
        FROM fab_orders
       WHERE company_id = ? AND source_order_id = ? AND order_type = 'manufacturing'
         AND deleted_at IS NULL AND status <> 'cancelled'
-      ORDER BY id`,
+      ORDER BY id${forUpdate ? ' FOR UPDATE' : ''}`,
     [companyId, orderId],
   );
   return {
@@ -47,12 +79,15 @@ async function productionOrders(companyId, orderId, exec = pool) {
 }
 
 /**
- * The whole production step for one sales order.
+ * The whole production step for one sales order — or a quote's read-only
+ * estimate of the same (EU-13/PLAN.md: "the figures are real, but nothing
+ * here can be raised or bought" — `isEstimate` on the FE just disables the
+ * write actions; the figures themselves must still be computed).
  */
 export async function productionPlan(companyId, orderId) {
   const [[order]] = await pool.query(
     `SELECT id, order_number AS orderNumber FROM fab_orders
-      WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL`,
+      WHERE id = ? AND company_id = ? AND order_type IN ('sales', 'quote') AND deleted_at IS NULL`,
     [orderId, companyId],
   );
   if (!order) { const e = new Error('Order not found'); e.status = 404; throw e; }
@@ -71,7 +106,10 @@ export async function productionPlan(companyId, orderId) {
       [companyId, orderId],
     ),
     pool.query(
-      `SELECT id, item_id AS itemId, flow_step_id AS stepId, status, task_code AS taskCode
+      // sent_out_at/returned_at (EU-1/EU-14): only ever set on a task whose
+      // operation is_subcontract, read below for the Subcontract section.
+      `SELECT id, item_id AS itemId, flow_step_id AS stepId, status, task_code AS taskCode,
+              sent_out_at AS sentOutAt, returned_at AS returnedAt
          FROM fab_project_tasks
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
       [companyId, orderId],
@@ -83,7 +121,8 @@ export async function productionPlan(companyId, orderId) {
   const opIds = [...new Set(planned.map((t) => t.operationId))];
   const [ops] = opIds.length
     ? await pool.query(
-      `SELECT id, code, name FROM fab_operations WHERE company_id = ? AND id IN (?)`,
+      `SELECT id, code, name, is_subcontract AS isSubcontract, default_supplier_id AS defaultSupplierId
+         FROM fab_operations WHERE company_id = ? AND id IN (?)`,
       [companyId, opIds],
     )
     : [[]];
@@ -144,6 +183,15 @@ export async function productionPlan(companyId, orderId) {
         taskId: task?.id ?? null,
         status: task?.status ?? null,
         taskCode: task?.taskCode ?? null,
+        // EU-8: why `minutes` is null, when it is. `null` on both means the
+        // operation has no formula at all — not an error, just unconfigured.
+        formulaError: t.formulaError ?? null,
+        warnings: t.warnings ?? [],
+        // EU-9 item 5: replaces the FE's own 0.005-minute tolerance compare
+        // (OrderProductionPlan.tsx StepCar.commit) — typing the formula's own
+        // number back is the same as never having typed over it at all.
+        overrideIsFormula: minutes(t.overrideHours) != null && minutes(t.formulaHours) != null
+          && Math.abs(minutes(t.overrideHours) - minutes(t.formulaHours)) < 0.005,
       };
       allSteps.push({ step, rowCode: codeOf(r) });
       return step;
@@ -167,6 +215,95 @@ export async function productionPlan(companyId, orderId) {
   const fabrication = ordered.filter(({ r }) => !Number(r.isBlank)).map(({ r, depth }) => shape(r, depth));
   const cutting = ordered.filter(({ r }) => Number(r.isBlank)).map(({ r }) => shape(r, 0));
 
+  /**
+   * EU-14 item 2: every PLANNED step whose operation is `is_subcontract`,
+   * grouped by supplier — the Production step's Subcontract section. Read off
+   * `planned` (the same taskGatingService pass every other step comes from,
+   * so a step preview here matches the one under Fabrication/Cutting) rather
+   * than re-querying fab_project_tasks; `taskByKey` supplies the task's own
+   * id/status/sent-out/returned-at once it has actually been materialized.
+   */
+  const subcontractSteps = [];
+  for (const t of planned) {
+    const op = opById.get(Number(t.operationId));
+    if (!op?.isSubcontract) continue;
+    const item = byId.get(Number(t.itemId));
+    if (!item) continue;
+    const task = taskByKey.get(`${t.itemId}:${t.stepId}`);
+    subcontractSteps.push({
+      supplierId: op.defaultSupplierId ?? null,
+      taskId: task?.id ?? null,
+      itemId: Number(t.itemId),
+      itemCode: codeOf(item),
+      itemName: item.name,
+      operationName: op.name ?? null,
+      qty: rolled(item),
+      status: task?.status ?? null,
+      sentOutAt: task?.sentOutAt ?? null,
+      returnedAt: task?.returnedAt ?? null,
+    });
+  }
+  const subSupplierIds = [...new Set(subcontractSteps.map((s) => s.supplierId).filter(Boolean))];
+  const [[subOrders], subSupplierRows] = await Promise.all([
+    pool.query(
+      `SELECT id, order_number AS orderNumber, supplier_id AS supplierId, status
+         FROM fab_orders
+        WHERE company_id = ? AND source_order_id = ? AND order_type = 'subcontract' AND deleted_at IS NULL
+        ORDER BY id`,
+      [companyId, orderId],
+    ),
+    subSupplierIds.length
+      ? pool.query(`SELECT id, name FROM fab_suppliers WHERE company_id = ? AND id IN (?)`, [companyId, subSupplierIds])
+        .then(([r]) => r)
+      : Promise.resolve([]),
+  ]);
+  const subSupplierNameOf = new Map(subSupplierRows.map((s) => [Number(s.id), s.name]));
+
+  /**
+   * A step already raised on a subcontract order has to stop offering itself
+   * on the next "Send to supplier" — otherwise the same task ships on two
+   * orders. `sentOutAt` cannot answer this: it is only stamped when the task
+   * is physically STARTED (Task Queue), which can be days after it was
+   * requested. `fab_order_lines` carries no task id (no schema change here —
+   * EU-1 owns the column), so a request is recognised the same way
+   * `subcontractService.raiseSubcontractOrder` wrote it: by the
+   * "operation — item name" description on the subcontract order's own
+   * lines. Not the item's code too — before the fabrication MO is deployed,
+   * `fab_items.code` is still NULL and `raiseSubcontractOrder` stored that
+   * NULL verbatim, while this step's own `itemCode` is codegen's PREVIEW of
+   * that same code — the two never match pre-deploy. Good enough within one
+   * sales order, where the description pair is unique per planned step.
+   */
+  const subOrderIds = subOrders.map((o) => o.id);
+  const [requestedLines] = subOrderIds.length
+    ? await pool.query(
+      `SELECT description FROM fab_order_lines WHERE order_id IN (?) AND deleted_at IS NULL`,
+      [subOrderIds],
+    )
+    : [[]];
+  const requestedKeys = new Set(requestedLines.map((l) => l.description));
+  for (const s of subcontractSteps) {
+    const key = `${s.operationName ?? 'Subcontract'} — ${s.itemName ?? ''}`.trim();
+    s.requested = requestedKeys.has(key);
+  }
+
+  const subGroupsByKey = new Map();
+  for (const s of subcontractSteps) {
+    const key = s.supplierId ?? 'none';
+    if (!subGroupsByKey.has(key)) subGroupsByKey.set(key, []);
+    subGroupsByKey.get(key).push(s);
+  }
+  const subcontract = {
+    groups: [...subGroupsByKey.entries()].map(([key, steps]) => ({
+      supplierId: key === 'none' ? null : key,
+      supplierName: key === 'none' ? null : (subSupplierNameOf.get(key) ?? null),
+      steps,
+    })),
+    orders: subOrders.map((o) => ({
+      id: o.id, orderNumber: o.orderNumber, supplierId: o.supplierId, status: o.status,
+    })),
+  };
+
   // Task codes that have not been written yet, previewed from the 'task' rule.
   const pending = allSteps.filter((x) => !x.step.taskCode);
   const previews = await taskCodes(companyId, pending.map((x) => ({
@@ -189,13 +326,14 @@ export async function productionPlan(companyId, orderId) {
     buy: await buyView(companyId, orderId),
     cutting: section(cutting, mos.cutting),
     fabrication: section(fabrication, mos.fabrication),
+    subcontract,
   };
 }
 
 /** The buying half: each bought item against the shelf and what is on order. */
-async function buyView(companyId, orderId) {
+async function buyView(companyId, orderId, ctx = procurementCtx(companyId, orderId)) {
   const [shortfall, held, onOrder, purchases, [suppliers]] = await Promise.all([
-    orderShortfall(companyId, orderId),
+    shortfallFor(ctx),
     heldByOrder(null, companyId, orderId),
     onOrderByItem(companyId, orderId),
     procurementForOrder(companyId, orderId),
@@ -206,23 +344,46 @@ async function buyView(companyId, orderId) {
   ]);
   const heldOf = new Map(held);
   return {
-    lines: shortfall.lines.map((l) => {
-      const mine = heldOf.get(l.catalogItemId) ?? 0;
-      const ordered = onOrder.get(l.catalogItemId) ?? 0;
-      return {
+    lines: [
+      ...shortfall.lines.map((l) => {
+        const mine = heldOf.get(l.catalogItemId) ?? 0;
+        const ordered = onOrder.get(l.catalogItemId) ?? 0;
+        return {
+          catalogItemId: l.catalogItemId,
+          code: l.code,
+          name: l.name,
+          unit: l.unit,
+          procurementType: l.procurementType,
+          required: l.required,
+          // `available` counts this order's own holding as free to it — the
+          // shelf this order can draw on.
+          inStock: l.available,
+          held: mine,
+          onOrder: ordered,
+          stillNeeded: Math.max(0, l.required - mine - ordered),
+          // EU-9 item 5: replaces the FE's own BuySection.initialTake — take
+          // whatever this order already holds, else all that is free.
+          suggestedTake: mine > 0 ? mine : Math.min(l.required, l.available),
+        };
+      }),
+      // EU-14 item 3: free-issue material rendered in the same list, tagged so
+      // the FE can show "supplied by customer" and leave it out of "to buy" —
+      // `stillNeeded`/`suggestedTake` are always 0, because this order never
+      // buys it, whatever the shelf holds.
+      ...shortfall.freeIssueLines.map((l) => ({
         catalogItemId: l.catalogItemId,
         code: l.code,
         name: l.name,
         unit: l.unit,
+        procurementType: l.procurementType,
         required: l.required,
-        // `available` counts this order's own holding as free to it — the
-        // shelf this order can draw on.
-        inStock: l.available,
-        held: mine,
-        onOrder: ordered,
-        stillNeeded: Math.max(0, l.required - mine - ordered),
-      };
-    }),
+        inStock: null,
+        held: 0,
+        onOrder: 0,
+        stillNeeded: 0,
+        suggestedTake: 0,
+      })),
+    ],
     unmatched: shortfall.unmatched,
     purchases: purchases.map((p) => ({
       id: p.id,
@@ -259,12 +420,6 @@ export async function setStepTime(companyId, orderId, itemId, stepId, value, use
   );
   if (!step) { const e = new Error("That step is not in this row's flow."); e.status = 404; throw e; }
 
-  const mos = await productionOrders(companyId, orderId);
-  const mo = Number(row.isBlank) ? mos.cutting : mos.fabrication;
-  if (mo && mo.status !== 'draft') {
-    const e = new Error(`${mo.orderNumber} is deployed — its times are fixed.`); e.status = 409; throw e;
-  }
-
   const n = value == null || value === '' ? null : Number(value);
   if (n != null && !(Number.isFinite(n) && n >= 0)) {
     const e = new Error('A time is a number of minutes, zero or more.'); e.status = 422; throw e;
@@ -273,6 +428,15 @@ export async function setStepTime(companyId, orderId, itemId, stepId, value, use
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // TOCTOU fix: the MO's status used to be read before BEGIN, so a deploy
+    // could land between that read and this write and both would believe they
+    // won. Reading it locked, inside the same transaction the write commits
+    // in, makes a concurrent deploy wait for this transaction instead.
+    const mos = await productionOrders(companyId, orderId, conn, true);
+    const mo = Number(row.isBlank) ? mos.cutting : mos.fabrication;
+    if (mo && mo.status !== 'draft') {
+      const e = new Error(`${mo.orderNumber} is deployed — its times are fixed.`); e.status = 409; throw e;
+    }
     if (n == null) {
       await conn.query(
         `UPDATE fab_task_time_overrides SET deleted_at = UTC_TIMESTAMP()
@@ -288,8 +452,10 @@ export async function setStepTime(companyId, orderId, itemId, stepId, value, use
         [companyId, orderId, itemId, stepId, n, userId],
       );
     }
-    // The draft's task, if there is one, follows at once.
-    await syncUnstartedTasks(conn, companyId, orderId);
+    // The draft's task, if there is one, follows at once. S4: scoped to the
+    // one row edited — a re-plan of the whole order to move one step's time
+    // is the exact cost this scoping exists to avoid.
+    await syncUnstartedTasks(conn, companyId, orderId, { itemIds: [itemId] });
     await conn.commit();
   } catch (err) {
     await conn.rollback();

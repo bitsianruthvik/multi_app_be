@@ -496,7 +496,9 @@
       "time_formula",
       "time_unit",
       "setup_minutes",
-      "active"
+      "active",
+      "is_subcontract",
+      "default_supplier_id"
     ],
     "fields": {
       "id": "fop.id",
@@ -508,6 +510,8 @@
       "timeUnit": "fop.time_unit",
       "setupMinutes": "fop.setup_minutes",
       "active": "fop.active",
+      "isSubcontract": "fop.is_subcontract",
+      "defaultSupplierId": "fop.default_supplier_id",
       "createdAt": "fop.created_at",
       "updatedAt": "fop.updated_at",
       "defaultResourceTypeName": "frt_op.name"
@@ -522,6 +526,8 @@
       "timeUnit": "string",
       "setupMinutes": "decimal",
       "active": "integer",
+      "isSubcontract": "integer",
+      "defaultSupplierId": "integer",
       "createdAt": "datetime",
       "updatedAt": "datetime",
       "defaultResourceTypeName": "string"
@@ -998,10 +1004,6 @@
       "categoryName": "fic_cat.name",
       "groupName": "fig_grp.name",
       "subgroupName": "fisg_sub.name",
-      "categoryBatchRequired": "fic_cat.batch_required",
-      "categorySerialRequired": "fic_cat.serial_required",
-      "categoryHeatRequired": "fic_cat.heat_required",
-      "categoryMarkRequired": "fic_cat.mark_required",
       "thicknessMm": "fic.thickness_mm",
       "materialForm": "fic.material_form",
       "categoryCode": "fic_cat.code"
@@ -1025,10 +1027,6 @@
       "categoryName": "string",
       "groupName": "string",
       "subgroupName": "string",
-      "categoryBatchRequired": "integer",
-      "categorySerialRequired": "integer",
-      "categoryHeatRequired": "integer",
-      "categoryMarkRequired": "integer",
       "thicknessMm": "decimal",
       "materialForm": "string",
       "categoryCode": "string"
@@ -1040,10 +1038,6 @@
         "on": "fic.category_id = fic_cat.id",
         "fields": [
           "categoryName",
-          "categoryBatchRequired",
-          "categorySerialRequired",
-          "categoryHeatRequired",
-          "categoryMarkRequired",
           "categoryCode"
         ]
       },
@@ -1882,7 +1876,6 @@
       "created_by",
       "progress_template_id",
       "priority_rank",
-      "wizard_step",
       "supplier_id"
     ],
     "fields": {
@@ -2965,6 +2958,103 @@
       "notes": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime"
+    },
+    "relations": {}
+  },
+  "fabErpOrderStructureRevision": {
+    "table": "fab_order_structure_revisions",
+    "alias": "fosr",
+    "writeFields": [],
+    "fields": {
+      "id": "fosr.id",
+      "companyId": "fosr.company_id",
+      "orderId": "fosr.order_id",
+      "orderLineId": "fosr.order_line_id",
+      "rev": "fosr.rev",
+      "reason": "fosr.reason",
+      "snapshotJson": "fosr.snapshot_json",
+      "summaryJson": "fosr.summary_json",
+      "createdBy": "fosr.created_by",
+      "createdAt": "fosr.created_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderId": "integer",
+      "orderLineId": "integer",
+      "rev": "integer",
+      "reason": "string",
+      "snapshotJson": "json",
+      "summaryJson": "json",
+      "createdBy": "integer",
+      "createdAt": "datetime"
+    },
+    "relations": {}
+  },
+  "fabErpNestingRun": {
+    "table": "fab_nesting_runs",
+    "alias": "fnr",
+    "writeFields": [],
+    "fields": {
+      "id": "fnr.id",
+      "companyId": "fnr.company_id",
+      "orderId": "fnr.order_id",
+      "kind": "fnr.kind",
+      "effort": "fnr.effort",
+      "status": "fnr.status",
+      "progress": "fnr.progress",
+      "paramsJson": "fnr.params_json",
+      "resultJson": "fnr.result_json",
+      "errorText": "fnr.error_text",
+      "requestedBy": "fnr.requested_by",
+      "startedAt": "fnr.started_at",
+      "finishedAt": "fnr.finished_at",
+      "createdAt": "fnr.created_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderId": "integer",
+      "kind": "string",
+      "effort": "string",
+      "status": "string",
+      "progress": "integer",
+      "paramsJson": "json",
+      "resultJson": "json",
+      "errorText": "string",
+      "requestedBy": "integer",
+      "startedAt": "datetime",
+      "finishedAt": "datetime",
+      "createdAt": "datetime"
+    },
+    "relations": {}
+  },
+  "fabErpCuttingKerf": {
+    "table": "fab_cutting_kerfs",
+    "alias": "fck",
+    "writeFields": [
+      "process",
+      "thickness_min_mm",
+      "thickness_max_mm",
+      "kerf_mm"
+    ],
+    "fields": {
+      "id": "fck.id",
+      "companyId": "fck.company_id",
+      "process": "fck.process",
+      "thicknessMinMm": "fck.thickness_min_mm",
+      "thicknessMaxMm": "fck.thickness_max_mm",
+      "kerfMm": "fck.kerf_mm",
+      "createdAt": "fck.created_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "process": "string",
+      "thicknessMinMm": "decimal",
+      "thicknessMaxMm": "decimal",
+      "kerfMm": "decimal",
+      "createdAt": "datetime"
     },
     "relations": {}
   }

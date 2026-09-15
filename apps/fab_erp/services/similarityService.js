@@ -26,6 +26,7 @@
  */
 
 import { pool } from '../../../db.js';
+import { placeholders } from './sqlScope.js';
 
 /**
  * WHICH ROWS MAY BE MARKED SIMILAR — no whitelist any more.
@@ -62,7 +63,7 @@ export async function markSimilar(companyId, orderId, itemIds, groupKey, existin
               code, parent_item_id AS parentId
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-          AND id IN (${ids.map(() => '?').join(',')})`,
+          AND id IN (${placeholders(ids.length)})`,
       [companyId, orderId, ...ids],
     );
     if (rows.length !== ids.length) {
@@ -104,7 +105,7 @@ export async function markSimilar(companyId, orderId, itemIds, groupKey, existin
 
     await conn.query(
       `UPDATE fab_items SET similar_group = ?
-        WHERE company_id = ? AND order_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+        WHERE company_id = ? AND order_id = ? AND id IN (${placeholders(ids.length)})`,
       [groupKey || null, companyId, orderId, ...ids],
     );
 

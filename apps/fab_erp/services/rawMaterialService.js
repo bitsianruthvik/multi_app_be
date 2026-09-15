@@ -81,13 +81,17 @@ export async function rawMaterialsFor(companyId, conn) {
   }
 
   const [rows] = await exec.query(
+    // EU-14: free-issue material is stock the CUSTOMER bought, not the shop —
+    // still real steel a part gets cut from, so it belongs in this list next
+    // to 'buy' rather than being invisible to every material picker just
+    // because this order isn't the one purchasing it.
     `SELECT fic.id, fic.code, fic.name, fic.unit, fic.density_kg_m3, fic.section_area_mm2,
             fic.thickness_mm, fic.material_form
        FROM fab_item_catalog fic
        LEFT JOIN fab_item_categories cat
          ON cat.id = fic.category_id AND cat.deleted_at IS NULL
       WHERE fic.company_id = ? AND fic.deleted_at IS NULL
-        AND fic.procurement_type = 'buy'
+        AND fic.procurement_type IN ('buy', 'free_issue')
         AND COALESCE(cat.code, '') NOT IN (${NOT_CUT_FROM.map(() => '?').join(',')})
       ORDER BY fic.material_form, fic.thickness_mm, fic.code`,
     [companyId, ...NOT_CUT_FROM],

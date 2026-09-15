@@ -38,6 +38,7 @@
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { NOT_A_BLANK } from './blankPredicate.js';
+import { cellVal, numVal } from './excelHelpers.js';
 
 const SHEET = 'Structure';
 const HEADERS = ['Level', 'Item', 'Qty', 'Unit', 'Thickness (mm)', 'Width (mm)', 'Length (mm)'];
@@ -165,7 +166,7 @@ export async function importStructure(companyId, orderId, buffer, opts = {}) {
   let headerRow = 0;
   ws.eachRow((row, n) => {
     if (headerRow) return;
-    if (String(row.getCell(1).value ?? '').trim().toLowerCase() === 'level') headerRow = n;
+    if ((cellVal(row, 1) ?? '').toLowerCase() === 'level') headerRow = n;
   });
   if (!headerRow) {
     const e = new Error('No header row found — the first column of the header must read "Level".');
@@ -180,36 +181,65 @@ export async function importStructure(companyId, orderId, buffer, opts = {}) {
   const byName = new Map(catalog.map((c) => [String(c.name).trim().toLowerCase(), c]));
   const byCode = new Map(catalog.filter((c) => c.code).map((c) => [String(c.code).trim().toLowerCase(), c]));
 
+  // Columns are matched by header TEXT, not position: a reordered or
+  // inserted column must be caught as a problem rather than silently reading
+  // Qty into Level (mirrors orderParametersService.importParameters).
+  const norm = (s) => String(s ?? '').trim().toLowerCase();
+  const HEADER_KEYS = [
+    ['level', 'Level'], ['item', 'Item'], ['qty', 'Qty'], ['unit', 'Unit'],
+    ['thickness_mm', 'Thickness (mm)'], ['width_mm', 'Width (mm)'], ['length_mm', 'Length (mm)'],
+  ];
+  const keyByLabel = new Map(HEADER_KEYS.map(([key, label]) => [norm(label), key]));
+  const colOf = {};
   const problems = [];
+  const headerRowCells = ws.getRow(headerRow);
+  for (let i = 1; i <= headerRowCells.cellCount; i += 1) {
+    const label = cellVal(headerRowCells, i);
+    if (label == null || label === '') continue;
+    const key = keyByLabel.get(norm(label));
+    if (!key) {
+      problems.push({ row: headerRow, code: 'UNKNOWN_HEADER', message: `Column ${i} ("${label}") is not a column this sheet expects — skipped.` });
+      continue;
+    }
+    colOf[key] = i;
+  }
+  if (!colOf.level || !colOf.item) {
+    const e = new Error('The header row must have both a "Level" and an "Item" column.');
+    e.status = 400; e.code = 'STRUCTURE_SHEET_INVALID';
+    e.problems = [{ row: headerRow, code: 'MISSING_HEADER', message: e.message }];
+    throw e;
+  }
+
   const parsed = [];
   ws.eachRow((row, n) => {
     if (n <= headerRow) return;
-    const rawLevel = row.getCell(1).value;
-    const rawItem = String(row.getCell(2).value ?? '').trim();
+    const rawLevel = cellVal(row, colOf.level);
+    const rawItem = cellVal(row, colOf.item) ?? '';
     if (rawLevel == null && !rawItem) return;      // a blank spacer row
 
     const level = Number(rawLevel);
     if (!Number.isInteger(level) || level < 0) {
-      problems.push(`Row ${n}: level "${rawLevel}" is not a whole number.`); return;
+      problems.push({ row: n, code: 'BAD_LEVEL', message: `Row ${n}: level "${rawLevel}" is not a whole number.` }); return;
     }
-    if (!rawItem) { problems.push(`Row ${n}: no item name.`); return; }
+    if (!rawItem) { problems.push({ row: n, code: 'MISSING_ITEM', message: `Row ${n}: no item name.` }); return; }
 
     const hit = byName.get(rawItem.toLowerCase()) ?? byCode.get(rawItem.toLowerCase());
-    if (!hit) { problems.push(`Row ${n}: "${rawItem}" is not in the catalogue.`); return; }
+    if (!hit) { problems.push({ row: n, code: 'UNKNOWN_ITEM', message: `Row ${n}: "${rawItem}" is not in the catalogue.` }); return; }
 
-    const qty = Number(row.getCell(3).value);
+    const qty = colOf.qty ? numVal(row, colOf.qty) : NaN;
     const dims = {};
-    for (const { col, key } of DIM_COLS) {
-      const v = row.getCell(col).value;
-      const num = Number(v);
-      if (v !== null && v !== '' && v !== undefined && Number.isFinite(num)) dims[key] = num;
+    for (const [key] of HEADER_KEYS.slice(4)) {
+      const col = colOf[key];
+      if (!col) continue;
+      const num = numVal(row, col);
+      if (num !== null) dims[key] = num;
     }
     parsed.push({
       rowNo: n,
       level,
       catalogItemId: Number(hit.id),
       name: hit.name,
-      unit: String(row.getCell(4).value ?? '').trim() || hit.unit || 'nos',
+      unit: (colOf.unit ? cellVal(row, colOf.unit) : null) || hit.unit || 'nos',
       qty: Number.isFinite(qty) && qty > 0 ? qty : 1,
       dims,
     });
@@ -219,24 +249,26 @@ export async function importStructure(companyId, orderId, buffer, opts = {}) {
     const e = new Error('That sheet has no rows under the header.'); e.status = 400; throw e;
   }
   if (parsed.length && parsed[0].level !== 0) {
-    problems.push(`Row ${parsed[0].rowNo}: the first row must be level 0 — it is the thing being built.`);
+    problems.push({ row: parsed[0].rowNo, code: 'LEVEL_NOT_ZERO', message: `Row ${parsed[0].rowNo}: the first row must be level 0 — it is the thing being built.` });
   }
   for (let i = 1; i < parsed.length; i += 1) {
     const jump = parsed[i].level - parsed[i - 1].level;
     if (jump > 1) {
-      problems.push(
-        `Row ${parsed[i].rowNo}: level jumps from ${parsed[i - 1].level} to ${parsed[i].level}.`
-        + ' A row can only be one level deeper than the row above it.',
-      );
+      problems.push({
+        row: parsed[i].rowNo,
+        code: 'LEVEL_JUMP',
+        message: `Row ${parsed[i].rowNo}: level jumps from ${parsed[i - 1].level} to ${parsed[i].level}.`
+          + ' A row can only be one level deeper than the row above it.',
+      });
     }
   }
-  if (parsed.filter((p) => p.level === 0).length > 1) {
-    problems.push('More than one level 0 row — a structure has a single top.');
+  const roots = parsed.filter((p) => p.level === 0);
+  for (const r of roots.slice(1)) {
+    problems.push({ row: r.rowNo, code: 'MULTIPLE_ROOTS', message: `Row ${r.rowNo}: more than one level 0 row — a structure has a single top.` });
   }
   if (problems.length) {
-    const e = new Error(`That sheet could not be read:\n${problems.slice(0, 12).join('\n')}`
-      + (problems.length > 12 ? `\n…and ${problems.length - 12} more` : ''));
-    e.status = 400; e.problems = problems; throw e;
+    const e = new Error(`${problems.length} problem${problems.length === 1 ? '' : 's'} in the sheet`);
+    e.status = 400; e.code = 'STRUCTURE_SHEET_INVALID'; e.problems = problems; throw e;
   }
 
   // Level column -> nested tree. The stack holds the current ancestor per level.

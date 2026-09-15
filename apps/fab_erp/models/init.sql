@@ -5583,7 +5583,7 @@ SELECT d.company_id, d.field_key, d.label,
 -- FILL-ONLY (2026-09-11). fab_fields is the registry now and is edited
 -- directly; copying the retired fab_field_defs over it on every run put
 -- length_mm and width_mm back to 'stock_piece'.
-ON DUPLICATE KEY UPDATE id = id;
+ON DUPLICATE KEY UPDATE fab_fields.id = fab_fields.id;
 
 -- ══ ITEM BOM: WHAT A THING IS MADE OF (2026-08-18) ═════════════════════════
 --
@@ -6265,4 +6265,252 @@ PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_fields' AND INDEX_NAME='idx_ff_scope');
 SET @s = IF(@c=0, 'CREATE INDEX idx_ff_scope ON fab_fields (company_id, scope_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ══ EU-1: SCHEMA PREREQUISITES — REVISIONS, QUOTE ORDERS, KERF/GRAIN/BED, ══
+-- ══ FREE-ISSUE + SUBCONTRACT, fab_nesting_runs, IDEMPOTENCY, INDEXES ══════
+-- (2026-09-13)
+--
+-- One new guarded block appended at the end of the file, per "init.sql is a
+-- PATCH FILE" — every statement must be safe against a database that already
+-- has everything, must never assume a specific existing enum value set beyond
+-- what it explicitly checks, and the whole block must survive being run twice.
+
+-- 1. fab_orders.order_type gains 'quote'. Do NOT hardcode the enum's full
+-- value list: production carries a 'cutting' value this file's own CREATE
+-- TABLE never named (added by a hand migration, per the "PATCH FILE, not a
+-- schema" gotcha), so replacing the type with a literal list here would
+-- silently drop it on next deploy. Instead read whatever COLUMN_TYPE already
+-- is and splice 'quote' into it, touching the column only when it is not
+-- already present.
+SET @ct = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='order_type');
+SET @s = IF(@ct NOT LIKE '%''quote''%',
+  CONCAT('ALTER TABLE fab_orders MODIFY COLUMN order_type ',
+         REPLACE(@ct, ')', ',''quote'')'), ' NOT NULL DEFAULT ''sales'''),
+  'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 1b. …and 'cutting', for the same reason in the other direction. Production
+-- has carried it since the cutting production order shipped (hand-applied);
+-- a database built from this file alone never did, so a copy of production
+-- data could not even be loaded locally. Same splice, same guard.
+SET @ct = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='order_type');
+SET @s = IF(@ct NOT LIKE '%''cutting''%',
+  CONCAT('ALTER TABLE fab_orders MODIFY COLUMN order_type ',
+         REPLACE(@ct, ')', ',''cutting'')'), ' NOT NULL DEFAULT ''sales'''),
+  'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 2. Structure-revision log. ONE `rev` sequence per ORDER (User Clarification
+-- 6) — order_line_id is nullable and purely informational (which line an
+-- apply touched, or NULL for a whole-order apply), so the UNIQUE key is
+-- (order_id, rev), not (order_id, order_line_id, rev).
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_structure_revisions');
+SET @s = IF(@c=0, 'CREATE TABLE fab_order_structure_revisions (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    company_id     BIGINT       NOT NULL,
+    order_id       BIGINT       NOT NULL,
+    order_line_id  BIGINT       NULL,
+    rev            INT          NOT NULL,
+    reason         VARCHAR(500) NOT NULL,
+    snapshot_json  JSON         NULL,
+    summary_json   JSON         NULL,
+    created_by     BIGINT       NULL,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at     DATETIME     NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_fosr_order_rev (order_id, rev),
+    KEY idx_fosr_order (company_id, order_id)
+  )', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 3. Background nesting runs (blank-plan packer), polled by the run's own id.
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_nesting_runs');
+SET @s = IF(@c=0, 'CREATE TABLE fab_nesting_runs (
+    id           BIGINT       NOT NULL AUTO_INCREMENT,
+    company_id   BIGINT       NOT NULL,
+    order_id     BIGINT       NOT NULL,
+    kind         VARCHAR(20)  NOT NULL,
+    effort       VARCHAR(20)  NULL,
+    status       VARCHAR(20)  NOT NULL DEFAULT ''queued'',
+    progress     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    params_json  JSON         NULL,
+    result_json  JSON         NULL,
+    error_text   TEXT         NULL,
+    requested_by BIGINT       NULL,
+    started_at   DATETIME     NULL,
+    finished_at  DATETIME     NULL,
+    created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at   DATETIME     NULL,
+    PRIMARY KEY (id),
+    KEY idx_fnr_order (company_id, order_id, status)
+  )', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 4. Kerf settings. `fab_company_settings` is a KEY/VALUE table in production
+-- (id, company_id, setting_key, setting_value, updated_by, deleted_at,
+-- created_at, updated_at) — confirmed the same shape locally below, so the
+-- default kerf is a `setting_key='nest_kerf_mm'` row read by kerfFor(), not a
+-- new column. No row is seeded here: kerfFor() already falls back to a
+-- blanket 2 mm when the key is absent, so absence and "explicitly set to
+-- 2.00" behave identically and nothing needs to change for today's orders.
+-- The optional per-band override table is added unconditionally (empty by
+-- default), so kerfFor() has somewhere to look before falling back. Verified
+-- 2026-09-13 (both locally via SHOW COLUMNS and against TiDB): local sqldb
+-- has exactly (id, company_id, setting_key, setting_value, updated_by,
+-- deleted_at, created_at, updated_at) -- the same key/value shape as
+-- production, so no column ALTER and no ADD COLUMN branch is needed here.
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLES
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_cutting_kerfs');
+SET @s = IF(@c=0, 'CREATE TABLE fab_cutting_kerfs (
+    id               BIGINT        NOT NULL AUTO_INCREMENT,
+    company_id       BIGINT        NOT NULL,
+    process          VARCHAR(40)   NULL,
+    thickness_min_mm DECIMAL(10,2) NULL,
+    thickness_max_mm DECIMAL(10,2) NULL,
+    kerf_mm          DECIMAL(6,2)  NOT NULL,
+    deleted_at       DATETIME      NULL,
+    created_at       DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_fck_company (company_id, process)
+  )', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 5. Grain direction. Default 'any' preserves today's free-rotation packing
+-- exactly -- nothing changes for an order until someone sets a real grain.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='grain');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD COLUMN grain ENUM(''along_length'',''along_width'',''any'') NOT NULL DEFAULT ''any''', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 6. Machine bed size. NULL means "no bed limit known", which behaves exactly
+-- as today -- the packer only starts respecting a bed once one is entered.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_resources' AND COLUMN_NAME='bed_length_mm');
+SET @s = IF(@c=0, 'ALTER TABLE fab_resources
+     ADD COLUMN bed_length_mm DECIMAL(12,2) NULL,
+     ADD COLUMN bed_width_mm  DECIMAL(12,2) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 7. Subcontract operations -- which ones get sent out, and to whom by
+-- default. Defaulting is_subcontract to 0 keeps every existing operation
+-- in-house until someone opts it in.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_operations' AND COLUMN_NAME='is_subcontract');
+SET @s = IF(@c=0, 'ALTER TABLE fab_operations
+     ADD COLUMN is_subcontract TINYINT(1) NOT NULL DEFAULT 0,
+     ADD COLUMN default_supplier_id BIGINT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 8. Subcontract send/return timestamps on the task that was sent out.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_project_tasks' AND COLUMN_NAME='sent_out_at');
+SET @s = IF(@c=0, 'ALTER TABLE fab_project_tasks
+     ADD COLUMN sent_out_at DATETIME NULL,
+     ADD COLUMN returned_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 9. Idempotency key on the raised order — MANUFACTURING orders only.
+--
+-- First attempt (company_id, source_order_id, order_type, mo_purpose) was
+-- wrong in principle, not just locally: one sales order legitimately raises
+-- SEVERAL purchase orders (one per supplier), and EU-14 adds subcontract
+-- orders per supplier too. Production has zero duplicate groups today, so
+-- the original key would have gone in clean there and only broken the day
+-- a second purchase/subcontract order was raised off the same source. The
+-- local duplicate that surfaced this (company 6, source_order_id 215, two
+-- `purchase` rows) is exactly that legitimate shape, not bad data.
+--
+-- Superseded below: drop the index first (a column cannot be dropped while a
+-- UNIQUE KEY still covers it), then the column, both guarded so a database
+-- that never got the first version (or already dropped it) no-ops cleanly.
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='uq_fo_source_active');
+SET @s = IF(@c>0, 'ALTER TABLE fab_orders DROP INDEX uq_fo_source_active', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='source_key_active');
+SET @s = IF(@c>0, 'ALTER TABLE fab_orders DROP COLUMN source_key_active', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The real key, scoped to order_type='manufacturing' by the generated
+-- column itself (every other order_type collapses to NULL, and MySQL never
+-- enforces uniqueness among NULLs — same idiom as fab_operation_stats'
+-- sentinel-0 column, adapted here as a sentinel-NULL type filter instead of
+-- a sentinel value). Purchase and subcontract orders are deliberately
+-- excluded: a sales order raising several of each is normal, not a dup.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='mo_source_key_active');
+SET @s = IF(@c=0, 'ALTER TABLE fab_orders ADD COLUMN mo_source_key_active VARCHAR(120)
+     GENERATED ALWAYS AS (IF(deleted_at IS NULL AND order_type = ''manufacturing'',
+       CONCAT(COALESCE(source_order_id,0),''|'',COALESCE(mo_purpose,'''')), NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Guard on the duplicate check itself (not just "does the index already
+-- exist") so a database that currently has duplicate manufacturing groups
+-- never gets a hard ALTER failure -- it just skips the constraint and this
+-- block stays reportable, not fatal.
+SET @dup = (SELECT COUNT(*) FROM (
+              SELECT company_id, source_order_id, mo_purpose
+                FROM fab_orders
+               WHERE deleted_at IS NULL AND source_order_id IS NOT NULL
+                 AND order_type = 'manufacturing'
+               GROUP BY 1,2,3
+              HAVING COUNT(*) > 1) t);
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND INDEX_NAME='uq_fo_mo_source_active');
+SET @s = IF(@idx=0 AND @dup=0, 'ALTER TABLE fab_orders ADD UNIQUE KEY uq_fo_mo_source_active (company_id, mo_source_key_active)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 10. Indexes named in the review's "Indexes" bullet.
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND INDEX_NAME='idx_fib_default_flow');
+SET @s = IF(@c=0, 'CREATE INDEX idx_fib_default_flow ON fab_item_bom (company_id, default_flow_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_fields' AND INDEX_NAME='idx_ff_company_active');
+SET @s = IF(@c=0, 'CREATE INDEX idx_ff_company_active ON fab_fields (company_id, active)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- fab_items already carries idx_fab_items_catalog on (catalog_item_id) alone
+-- -- not company-scoped, so add the composite only if no index leads with
+-- (company_id, catalog_item_id) already.
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_company_catalog');
+SET @s = IF(@c=0, 'CREATE INDEX idx_fi_company_catalog ON fab_items (company_id, catalog_item_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 11. Free-issue stock provenance -- who supplied a piece and their
+-- reference, so free-issue material can be told apart from stock the company
+-- bought itself. Each column guarded independently: the stock-in path may
+-- already carry one of the two on some database.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND COLUMN_NAME='source');
+SET @s = IF(@c=0, 'ALTER TABLE fab_stock_pieces ADD COLUMN source VARCHAR(30) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_stock_pieces' AND COLUMN_NAME='customer_ref');
+SET @s = IF(@c=0, 'ALTER TABLE fab_stock_pieces ADD COLUMN customer_ref VARCHAR(120) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 12. fab_item_bom.explode -- folded in from production (2026-09-13).
+--
+-- Live in production as tinyint(1) NOT NULL DEFAULT 1 since the BOM designer
+-- shipped, but hand-applied and never folded into this file -- the same
+-- "PATCH FILE, not a schema" trap as fab_workers/fab_mark_schemes before it:
+-- a database built purely from init.sql has fab_item_bom.code_join but not
+-- its sibling column, and bomService.js reads b.explode/l.explode
+-- unconditionally ("the rule that falls out: assemblies explode, parts do
+-- not"). Default 1 matches production and keeps every existing BOM line
+-- exploding exactly as it does today.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='explode');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN explode TINYINT(1) NOT NULL DEFAULT 1', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

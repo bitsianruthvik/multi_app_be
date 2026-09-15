@@ -403,7 +403,7 @@ async function consumeStock(conn, companyId, catalogItemId, required, { txnType,
  * A link with no nest_no returns the per-part quantity unchanged, which is what
  * every order created before nesting existed depends on.
  */
-async function claimNest(conn, companyId, task, node, inp, required) {
+export async function claimNest(conn, companyId, task, node, inp, required) {
   const [[link]] = await conn.query(
     // length/width are the PLATE's, as declared in nesting — never the part's.
     // Comparing a part's own size against stock would match the thing being
@@ -426,10 +426,10 @@ async function claimNest(conn, companyId, task, node, inp, required) {
   // what makes the size real.
   if (!nestNo) return { qty: required, nestNo: null, claimId: null, want };
 
-  // On a nested link the quantity describes the PLATE, not the part — the
-  // Nesting sheet carries one row per plate, so every link cut from it inherits
-  // that same figure. Falling back to `required` keeps a blank column working.
-  const qty = link.qty != null && Number(link.qty) > 0 ? Number(link.qty) : required;
+  // A nest is ONE sheet. The link's qty says how many PIECES of this part come
+  // off it, which is not how much steel to draw — the sheet is drawn once, by
+  // whichever part starts first, and every other part on it draws nothing.
+  const qty = 1;
   const orderId = task.order_id ?? node.order_id;
 
   try {

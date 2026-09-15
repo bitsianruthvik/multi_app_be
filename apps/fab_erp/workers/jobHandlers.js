@@ -27,6 +27,7 @@ import { sweepCompany, sweepAllCompanies } from '../services/taskAttributionServ
 import { recomputeAllBaselined } from '../services/ccBufferService.js';
 import { sweepBlockedTasksAllCompanies } from '../services/taskGatingService.js';
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
+import { NESTING_RUN_JOB, runQueuedJob as runNestingJob } from '../services/nestingRunService.js';
 import { pool } from '../../../db.js';
 
 const SWEEP_JOB = 'fab_erp:attribution-sweep';
@@ -106,11 +107,16 @@ const jobHandlers = {
     return recomputeAllBaselined({ limit });
   },
 
+  // EU-11: one blank-plan pack, queued by nestingRunService.startRun. Unlike
+  // the sweeps above this is on-demand, not ticked — nothing here schedules
+  // it, `startRun` enqueues (or inline-runs) it once per request.
+  [NESTING_RUN_JOB]: async (data = {}) => runNestingJob(data),
+
   // Wired only when Redis is available (jobRegistry short-circuits otherwise).
   async register({ getQueue: getQ }) {
     const queue = getQ('fab_erp');
     if (!queue) {
-      logger.warn('[jobs] fab_erp: queue unavailable, skipping attribution-sweep/operation-stats/cc-sweep processors.');
+      logger.warn('[jobs] fab_erp: queue unavailable, skipping attribution-sweep/operation-stats/cc-sweep/nesting-run processors.');
       return;
     }
     queue.process(SWEEP_JOB, async (job) => jobHandlers[SWEEP_JOB](job.data || {}));
@@ -119,7 +125,11 @@ const jobHandlers = {
     // GATE_SWEEP_JOB on every tick when Redis is up, and without a processor
     // those would accumulate unread while the safety net silently never ran.
     queue.process(GATE_SWEEP_JOB, async (job) => jobHandlers[GATE_SWEEP_JOB](job.data || {}));
-    logger.info('[jobs] fab_erp attribution-sweep + cc-sweep + gate-sweep processors registered.');
+    // Same null-guard idiom as the three sweeps above (§12 "Graceful Job Queue
+    // Degradation") — when Redis is up this processes what `startRun` enqueued;
+    // when it isn't, `startRun` never enqueues and runs the pack inline itself.
+    queue.process(NESTING_RUN_JOB, async (job) => jobHandlers[NESTING_RUN_JOB](job.data || {}));
+    logger.info('[jobs] fab_erp attribution-sweep + cc-sweep + gate-sweep + nesting-run processors registered.');
   },
 };
 

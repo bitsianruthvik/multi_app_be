@@ -152,6 +152,29 @@ export async function setItemFlow(companyId, orderId, itemId, flowId) {
   return { itemId, flowId: flowId ?? null };
 }
 
+/**
+ * Override several items' flow in one write — the route behind the Flows
+ * step's bulk action ("set these 40 rows to the drilled flow"), rather than
+ * one `setItemFlow` round trip per row.
+ */
+export async function setItemFlows(companyId, orderId, itemIds, flowId) {
+  const ids = [...new Set((itemIds ?? []).map(Number).filter(Number.isFinite))];
+  if (!ids.length) return { updated: 0 };
+  if (flowId != null) {
+    const [[flow]] = await pool.query(
+      'SELECT id FROM fab_operation_flows WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
+      [flowId, companyId],
+    );
+    if (!flow) { const e = new Error('That flow does not exist.'); e.status = 404; throw e; }
+  }
+  const [res] = await pool.query(
+    `UPDATE fab_items SET flow_id = ?
+      WHERE company_id = ? AND order_id = ? AND id IN (?) AND deleted_at IS NULL`,
+    [flowId ?? null, companyId, orderId, ids],
+  );
+  return { updated: res.affectedRows };
+}
+
 /** Every structural item with its flow — the review grid behind the Flows step. */
 export async function itemFlows(companyId, orderId) {
   const [rows] = await pool.query(

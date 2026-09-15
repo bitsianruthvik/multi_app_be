@@ -18,6 +18,15 @@
  *
  * A NEST IS ONE PLATE. Its area, weight and cost count once no matter how many
  * parts sit on it; the parts divide it, they do not multiply it.
+ *
+ * NO LINE-QTY FACTOR HERE (EU-5, User Clarifications 5). `rm.qty` on an
+ * accepted link is already the real, physical piece count that landed on this
+ * plate — the demand fed into nesting was multiplied by the order line's qty
+ * BEFORE the packer ran (`blankService.orderBlanks`), so a qty-3 line's pieces
+ * are already laid out together on shared sheets and counted once, here, like
+ * everything else this file reads off the links. Multiplying `partAreaMm2` or
+ * `parts` a second time would double what decision 5 already put in the data,
+ * the same trap `procurementService`'s nested branch was rewritten to avoid.
  */
 
 import { pool } from '../../../db.js';
@@ -55,6 +64,10 @@ export async function nestTotals(companyId, orderId, conn = null) {
              *
              * rm.qty is written by the accept as the number cut on THIS plate,
              * which is the only number that makes the sum add up.
+             *
+             * This is the qty-is-pieces contract (User Clarification 1): a
+             * link's qty is always pieces of the part cut from its nest, never
+             * a plate count. Already correct here — do not "fix" it.
              */
             SUM(COALESCE(p.length, 0) * COALESCE(p.width, 0) * COALESCE(rm.qty, 1)) AS partAreaMm2
        FROM fab_items rm
@@ -103,6 +116,9 @@ export async function nestTotals(companyId, orderId, conn = null) {
    * subtracted.
    */
   const DENSITY_T_PER_M2_MM = 7.85 / 1000;
+  // partAreaMm2 (above) is already pieces-scaled by rm.qty, so wasteAreaMm2
+  // needs no qty factor of its own — the pieces contract is applied once,
+  // upstream, not per derived total.
   const wasteT = nests.reduce(
     (a, n) => a + ((n.wasteAreaMm2 / 1e6) * n.thickness * DENSITY_T_PER_M2_MM), 0);
 

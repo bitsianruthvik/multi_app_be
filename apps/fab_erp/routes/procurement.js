@@ -14,7 +14,7 @@
 
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
-import { logger } from '../../../core/utils/logger.js';
+import { fail, isPermitted } from '../../../core/middleware/requirePerm.js';
 import {
   requestProcurement, sendPurchaseRequest, receiveAgainstLine, receiveAgainstOrder,
   openPurchaseOrders, purchaseOrderLines,
@@ -24,13 +24,11 @@ import { productionPlan, setStepTime, raiseDraft } from '../services/productionP
 import { rollUpOrderStatus } from '../services/taskEngineService.js';
 import { checkOrderNesting, blockingIssues, advisoryIssues } from '../services/nestingIntegrityService.js';
 import { missingFieldsForOrder } from '../services/itemFieldService.js';
+import { raiseSubcontractOrder } from '../services/subcontractService.js';
+import { orderReadiness, refreshOrderStage } from '../services/orderReadinessService.js';
 import { pool } from '../../../db.js';
 
 const router = Router();
-
-function has(user, tag) {
-  return Array.isArray(user?.uiPermissions) && user.uiPermissions.includes(tag);
-}
 
 function ctx(req, res, tag) {
   const user = req.user;
@@ -39,7 +37,7 @@ function ctx(req, res, tag) {
     res.status(400).json({ message: 'Unable to determine companyId from token.' });
     return null;
   }
-  if (tag && user.role !== 'admin' && !has(user, tag)) {
+  if (tag && !isPermitted(user, tag)) {
     res.status(403).json({ message: `Requires the ${tag} permission.` });
     return null;
   }
@@ -57,9 +55,7 @@ router.get('/orders/:orderId/production-plan', protect, async (req, res) => {
   try {
     res.json(await productionPlan(c.companyId, orderId));
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err, orderId }, 'production plan failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -73,11 +69,15 @@ router.put('/orders/:orderId/production-plan/time', protect, async (req, res) =>
   const orderId = Number(req.params.orderId);
   try {
     const { itemId, stepId, minutes } = req.body ?? {};
-    res.json(await setStepTime(c.companyId, orderId, Number(itemId), Number(stepId), minutes, c.user?.id ?? null));
+    const result = await setStepTime(c.companyId, orderId, Number(itemId), Number(stepId), minutes, c.user?.id ?? null);
+    // REPAIR-E item 4: the wizard's Production step reads this response's own
+    // readiness rather than re-fetching (EU-7's shape) — `hint:'production'`
+    // is cheap here (skips the other three stages' queries) since a step-time
+    // edit can only ever move the production stage.
+    const readiness = await refreshOrderStage(c.companyId, orderId, { hint: 'production' });
+    res.json({ ...result, readiness });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err, orderId }, 'setting a step time failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -100,8 +100,7 @@ router.get('/orders/:orderId/nesting/integrity', protect, async (req, res) => {
     // without re-deriving the split by filtering issues client-side.
     res.json({ ...result, blocking: blockingIssues(result), advisory: advisoryIssues(result) });
   } catch (err) {
-    logger.error({ err, orderId }, 'nesting integrity check failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -117,11 +116,36 @@ router.post('/orders/:orderId/procurement/request', protect, async (req, res) =>
   if (!c) return;
   const orderId = Number(req.params.orderId);
   try {
-    res.json(await requestProcurement(c.companyId, orderId, req.body?.lines ?? [], { createdBy: c.user?.id ?? null }));
+    const result = await requestProcurement(c.companyId, orderId, req.body?.lines ?? [], { createdBy: c.user?.id ?? null });
+    const readiness = await refreshOrderStage(c.companyId, orderId, { hint: 'production' });
+    res.json({ ...result, readiness });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err, orderId }, 'requesting procurement failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
+  }
+});
+
+/**
+ * POST /orders/:orderId/subcontract/request — send named steps out to a
+ * supplier. Body `{ supplierId, taskIds }`.
+ *
+ * Raises a NEW `fab_orders` row every call (unlike `/procurement/request`,
+ * which rewrites one open request) — several subcontract orders against one
+ * sales order are legitimate (EU-14/EU-1), so there is nothing to rewrite.
+ * Same tag as the rest of the Production step (`fab_erp_projects_manage`):
+ * this is the Subcontract section of that screen, not an inventory action.
+ */
+router.post('/orders/:orderId/subcontract/request', protect, async (req, res) => {
+  const c = ctx(req, res, 'fab_erp_projects_manage');
+  if (!c) return;
+  const orderId = Number(req.params.orderId);
+  try {
+    const order = await raiseSubcontractOrder(
+      c.companyId, orderId, req.body?.supplierId, req.body?.taskIds ?? [],
+      { createdBy: c.user?.id ?? null },
+    );
+    res.json({ ok: true, order, readiness: await orderReadiness(c.companyId, orderId) });
+  } catch (err) {
+    return fail(res, err);
   }
 });
 
@@ -131,11 +155,17 @@ router.post('/purchase-orders/:poId/send', protect, async (req, res) => {
   if (!c) return;
   const poId = Number(req.params.poId);
   try {
-    res.json(await sendPurchaseRequest(c.companyId, poId, Number(req.body?.supplierId)));
+    const result = await sendPurchaseRequest(c.companyId, poId, Number(req.body?.supplierId));
+    // The PO row IS the readiness signal for its own sales order — resolve it
+    // by `source_order_id`, the same lookup /deploy already does below.
+    const [[link]] = await pool.query(
+      `SELECT source_order_id AS soId FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
+      [poId, c.companyId],
+    );
+    const readiness = link?.soId ? await refreshOrderStage(c.companyId, link.soId, { hint: 'production' }) : undefined;
+    res.json({ ...result, readiness });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err, poId }, 'sending purchase request failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -154,8 +184,7 @@ router.post('/purchase-lines/:lineId/receive', protect, async (req, res) => {
     const result = await receiveAgainstLine(c.companyId, lineId, req.body ?? {});
     res.json(result);
   } catch (err) {
-    logger.error({ err, lineId }, 'receiving against purchase line failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -178,8 +207,7 @@ router.get('/purchase-orders', protect, async (req, res) => {
     });
     res.json({ orders });
   } catch (err) {
-    logger.error({ err }, 'listing purchase orders failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -191,8 +219,7 @@ router.get('/purchase-orders/:poId/lines', protect, async (req, res) => {
   try {
     res.json({ poId, lines: await purchaseOrderLines(c.companyId, poId) });
   } catch (err) {
-    logger.error({ err, poId }, 'reading purchase order lines failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -210,8 +237,7 @@ router.post('/purchase-orders/:poId/receive', protect, async (req, res) => {
   try {
     res.json(await receiveAgainstOrder(c.companyId, poId, req.body ?? {}));
   } catch (err) {
-    logger.error({ err, poId }, 'receiving against purchase order failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 
@@ -287,10 +313,14 @@ router.post('/orders/:orderId/production/draft', protect, async (req, res) => {
     // rollUpOrderStatus refreshes the production orders and then mirrors them
     // onto the sales order — one call keeps both right.
     await rollUpOrderStatus(pool, c.companyId, orderId);
-    res.json(mo);
+    const readiness = await refreshOrderStage(c.companyId, orderId, { hint: 'production' });
+    res.json({ ...mo, readiness });
   } catch (err) {
-    logger.error({ err, orderId }, 'raising production order failed');
-    res.status(500).json({ message: err.message });
+    // EU-13 found this hardcoded to 500 regardless of err.status — a quote's
+    // QUOTE_CANNOT_RAISE (409) from raiseDraft showed up as a plain 500. The
+    // two explicit 409s above (FIELDS_MISSING/NESTING_INVALID) return early
+    // and never reach here, so their `force`/`detail` shape is unchanged.
+    return fail(res, err);
   }
 });
 
@@ -299,24 +329,28 @@ router.post('/orders/:orderId/production/draft', protect, async (req, res) => {
  * shop. Codes are written (BOM rows and tasks, from the code generator) and from
  * here the order follows the floor: waiting until material turns up, in
  * production once a task can start.
+ *
+ * Body `{ redeploy: true }` (EU-12): re-plan a NON-draft production order
+ * (one already on the floor, after a revision changed its BOM) without
+ * regressing its status — the ordinary path here is draft-only.
  */
 router.post('/production-orders/:moId/deploy', protect, async (req, res) => {
   const c = ctx(req, res, 'fab_erp_projects_manage');
   if (!c) return;
   const moId = Number(req.params.moId);
+  const redeploy = req.body?.redeploy === true;
   try {
-    const state = await deployProductionOrder(c.companyId, moId);
+    const state = await deployProductionOrder(c.companyId, moId, { redeploy });
     // Deploying changes the production order, and the sales order mirrors it.
     const [[link]] = await pool.query(
       `SELECT source_order_id AS soId FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
       [moId, c.companyId],
     );
     if (link?.soId) await rollUpOrderStatus(pool, c.companyId, link.soId);
-    res.json({ ok: true, ...state });
+    const readiness = link?.soId ? await refreshOrderStage(c.companyId, link.soId, { hint: 'production' }) : undefined;
+    res.json({ ok: true, ...state, readiness });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ message: err.message });
-    logger.error({ err, moId }, 'deploying production order failed');
-    res.status(500).json({ message: err.message });
+    return fail(res, err);
   }
 });
 

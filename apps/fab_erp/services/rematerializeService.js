@@ -24,33 +24,16 @@
  */
 
 import { pool } from '../../../db.js';
-import { materializeOrderTasks, planOrderTasks } from './taskGatingService.js';
+import { materializeOrderTasks, planOrderTasks, resolveFlowIds } from './taskGatingService.js';
 import { rollUpOrderStatus } from './taskEngineService.js';
 import { buildBaseline } from './criticalChainService.js';
 import { replan as drumReplan } from './drumService.js';
 import { logger } from '../../../core/utils/logger.js';
 import { isNoCapacity } from './schedulingErrors.js';
+import { claimTasksForOrder, issueTaskCodes } from './productionOrderService.js';
 
 const STARTED_STATUSES = new Set(['in_progress', 'paused', 'done']);
 const HOURS_EPS = 0.01;
-
-/** Resolve the flow an item should use now (explicit flow_id, else default BOM→binding). */
-async function resolveItemFlowId(conn, companyId, item) {
-  if (item.flow_id != null) return item.flow_id;
-  if (item.catalog_item_id == null) return null;
-  const [[bom]] = await conn.query(
-    `SELECT id FROM fab_material_boms
-      WHERE company_id = ? AND is_default = 1 AND deleted_at IS NULL AND catalog_item_id = ? LIMIT 1`,
-    [companyId, item.catalog_item_id],
-  );
-  if (!bom) return null;
-  const [[bind]] = await conn.query(
-    `SELECT flow_id FROM fab_bom_flow_bindings
-      WHERE company_id = ? AND active = 1 AND deleted_at IS NULL AND bom_id = ? LIMIT 1`,
-    [companyId, bom.id],
-  );
-  return bind?.flow_id ?? null;
-}
 
 const normDeps = (d) => (d == null ? '' : String(d).trim());
 
@@ -73,34 +56,60 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
   const { planned } = await planOrderTasks(exec, companyId, orderId, { evaluateExisting: true });
   const planOf = new Map(planned.map((t) => [`${t.itemId}:${t.stepId}`, t]));
 
+  // THREE BULK LOADS instead of four queries PER ITEM (flow, its name, its
+  // steps, its tasks) — a two-span order is thousands of items, and that was
+  // thousands of round trips to preview one re-materialization.
+  const flowIdByItemId = await resolveFlowIds(exec, companyId, items);
+  const flowIds = [...new Set([...flowIdByItemId.values()].filter((f) => f != null))];
+
+  const flowNameById = new Map();
+  const stepsByFlowId = new Map();
+  if (flowIds.length) {
+    const [flows] = await exec.query(
+      `SELECT id, name FROM fab_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND id IN (?)`,
+      [companyId, flowIds],
+    );
+    for (const f of flows) flowNameById.set(f.id, f.name);
+
+    const [steps] = await exec.query(
+      `SELECT s.id, s.flow_id, s.seq_no, s.operation_id, s.depends_on, s.resource_type_id,
+              s.params_json, o.name AS operation_name
+         FROM fab_operation_flow_steps s
+         LEFT JOIN fab_operations o ON o.id = s.operation_id AND o.company_id = s.company_id
+        WHERE s.company_id = ? AND s.flow_id IN (?) AND s.deleted_at IS NULL
+        ORDER BY s.flow_id, s.seq_no`,
+      [companyId, flowIds],
+    );
+    for (const s of steps) {
+      if (!stepsByFlowId.has(s.flow_id)) stepsByFlowId.set(s.flow_id, []);
+      stepsByFlowId.get(s.flow_id).push(s);
+    }
+  }
+
+  const tasksByItemId = new Map();
+  const [allTasks] = await exec.query(
+    `SELECT t.id, t.item_id, t.flow_step_id, t.flow_id, t.seq_no, t.operation_id, t.depends_on,
+            t.resource_type_id, t.computed_hours, t.setup_hours, t.status, o.name AS operation_name
+       FROM fab_project_tasks t
+       LEFT JOIN fab_operations o ON o.id = t.operation_id AND o.company_id = t.company_id
+      WHERE t.company_id = ? AND t.order_id = ? AND t.deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  for (const t of allTasks) {
+    if (!tasksByItemId.has(t.item_id)) tasksByItemId.set(t.item_id, []);
+    tasksByItemId.get(t.item_id).push(t);
+  }
+
   const outItems = [];
   let added = 0, removed = 0, changed = 0, retainedStarted = 0;
 
   for (const item of items) {
-    const flowId = await resolveItemFlowId(exec, companyId, item);
+    const flowId = flowIdByItemId.get(Number(item.id));
     if (!flowId) continue; // no flow resolvable → nothing to compare
 
-    const [[flow]] = await exec.query(
-      `SELECT name FROM fab_operation_flows WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-      [flowId, companyId],
-    );
-    const [steps] = await exec.query(
-      `SELECT s.id, s.seq_no, s.operation_id, s.depends_on, s.resource_type_id,
-              s.params_json, o.name AS operation_name
-         FROM fab_operation_flow_steps s
-         LEFT JOIN fab_operations o ON o.id = s.operation_id AND o.company_id = s.company_id
-        WHERE s.company_id = ? AND s.flow_id = ? AND s.deleted_at IS NULL
-        ORDER BY s.seq_no`,
-      [companyId, flowId],
-    );
-    const [tasks] = await exec.query(
-      `SELECT t.id, t.flow_step_id, t.flow_id, t.seq_no, t.operation_id, t.depends_on,
-              t.resource_type_id, t.computed_hours, t.setup_hours, t.status, o.name AS operation_name
-         FROM fab_project_tasks t
-         LEFT JOIN fab_operations o ON o.id = t.operation_id AND o.company_id = t.company_id
-        WHERE t.company_id = ? AND t.order_id = ? AND t.item_id = ? AND t.deleted_at IS NULL`,
-      [companyId, orderId, item.id],
-    );
+    const flow = flowNameById.has(flowId) ? { name: flowNameById.get(flowId) } : null;
+    const steps = stepsByFlowId.get(flowId) ?? [];
+    const tasks = tasksByItemId.get(Number(item.id)) ?? [];
 
     const stepById = new Map(steps.map((s) => [s.id, s]));
     const taskByStepId = new Map(tasks.filter((t) => t.flow_step_id != null).map((t) => [t.flow_step_id, t]));
@@ -174,6 +183,78 @@ export async function previewRematerialize(companyId, orderId, exec = pool) {
 }
 
 /**
+ * `fab_plan_entry_tasks` links a plan bar to the individual tasks it bundles,
+ * by `task_id`. `applyRematerialize` soft-deletes the unstarted tasks it is
+ * about to rebuild, which otherwise leaves any bar that had one of them
+ * pointing at a dead id.
+ *
+ * Repointed by natural key, not by id arithmetic (§13 "Never count upward
+ * from a multi-row INSERT's insertId") — `(item_id, flow_step_id)` is the same
+ * key `materializeOrderTasks` itself reads new task ids back on, so "the
+ * replacement for this old task" and "the row `materializeOrderTasks` just
+ * wrote for this step" are the same lookup. A step that did not come back
+ * (its item or flow step is gone too) drops the link instead of leaving it
+ * dangling.
+ */
+async function repointPlanEntryTasks(conn, companyId, orderId, oldTaskIds) {
+  if (!oldTaskIds.length) return { repointed: 0, dropped: 0 };
+
+  const [oldTasks] = await conn.query(
+    `SELECT id, item_id AS itemId, flow_step_id AS flowStepId FROM fab_project_tasks
+      WHERE company_id = ? AND id IN (?)`,
+    [companyId, oldTaskIds],
+  );
+  const keyByOldId = new Map(oldTasks.map((t) => [Number(t.id), `${t.itemId}:${t.flowStepId}`]));
+
+  const [links] = await conn.query(
+    `SELECT id, task_id AS taskId FROM fab_plan_entry_tasks
+      WHERE company_id = ? AND task_id IN (?) AND deleted_at IS NULL`,
+    [companyId, oldTaskIds],
+  );
+  if (!links.length) return { repointed: 0, dropped: 0 };
+
+  const [current] = await conn.query(
+    `SELECT id, item_id AS itemId, flow_step_id AS flowStepId FROM fab_project_tasks
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  const replacementByKey = new Map(current.map((t) => [`${t.itemId}:${t.flowStepId}`, Number(t.id)]));
+
+  let repointed = 0;
+  let dropped = 0;
+  for (const link of links) {
+    const key = keyByOldId.get(Number(link.taskId));
+    const replacementId = key ? replacementByKey.get(key) : null;
+    if (!replacementId) {
+      await conn.query(
+        `UPDATE fab_plan_entry_tasks SET deleted_at = UTC_TIMESTAMP() WHERE id = ? AND company_id = ?`,
+        [link.id, companyId],
+      );
+      dropped++;
+      continue;
+    }
+    try {
+      await conn.query(
+        `UPDATE fab_plan_entry_tasks SET task_id = ? WHERE id = ? AND company_id = ?`,
+        [replacementId, link.id, companyId],
+      );
+      repointed++;
+    } catch (err) {
+      if (err?.code !== 'ER_DUP_ENTRY') throw err;
+      // uq_fplet(company_id, plan_entry_id, task_id): this bar already has a
+      // link to the replacement task (another member of the old bundle
+      // resolved to the same step first) — this row would only duplicate it.
+      await conn.query(
+        `UPDATE fab_plan_entry_tasks SET deleted_at = UTC_TIMESTAMP() WHERE id = ? AND company_id = ?`,
+        [link.id, companyId],
+      );
+      dropped++;
+    }
+  }
+  return { repointed, dropped };
+}
+
+/**
  * Apply the re-materialization: drop unstarted work and rebuild from current
  * flows, preserving started/done tasks. Returns counts of what changed.
  */
@@ -210,11 +291,27 @@ export async function applyRematerialize(companyId, orderId) {
     // just dropped + any brand-new steps/items), skipping steps still pinned by a
     // retained started/done task.
     const rebuilt = await materializeOrderTasks(conn, companyId, orderId);
+
+    // EU-12: the tasks just rebuilt are brand new rows and start life
+    // unclaimed by any production order and uncoded — without this a
+    // rematerialize after a revision orphans them from the MO(s) that already
+    // exist for this order (rollUpProductionOrder would then count 0 tasks
+    // for real work) and any plan bar that held one of the dropped tasks is
+    // left pointing at a soft-deleted id.
+    const claim = await claimTasksForOrder(conn, companyId, orderId);
+    for (const moId of claim.productionOrders) {
+      await issueTaskCodes(conn, companyId, moId);
+    }
+    const planEntryRepoint = await repointPlanEntryTasks(conn, companyId, orderId, ids);
+
     // Keep the sales lifecycle in sync after a rebuild (2026-07-24).
     await rollUpOrderStatus(conn, companyId, orderId);
 
     await conn.commit();
-    result = { ok: true, orderId, deletedUnstarted: deleted, rebuilt };
+    result = {
+      ok: true, orderId, deletedUnstarted: deleted, rebuilt,
+      tasksClaimed: claim.claimed, productionOrders: claim.productionOrders, planEntryRepoint,
+    };
   } catch (err) {
     await conn.rollback();
     throw err;

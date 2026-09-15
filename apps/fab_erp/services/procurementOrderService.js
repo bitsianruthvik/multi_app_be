@@ -51,20 +51,43 @@ export const PO_STATUS = {
  * supplier are counted as on order and left alone.
  *
  * @param {Array<{catalogItemId:number, take:number}>} lines
+ * @param {{cache: Map}} [opts.ctx] EU-14 item E3 — a per-request memo shared
+ *   with `productionPlanService.buyView` / `orderReadinessService`'s
+ *   `summariseProcurement`, so a route that calls more than one of the three
+ *   in a single request computes `orderShortfall` once. Passed straight
+ *   through to `orderShortfall` alongside this function's OWN transaction
+ *   connection — a cache miss still reads inside this transaction exactly as
+ *   before, `ctx` only saves a re-read for whichever of the three runs next.
  */
-export async function requestProcurement(companyId, orderId, lines, { createdBy = null } = {}) {
+export async function requestProcurement(companyId, orderId, lines, { createdBy = null, ctx } = {}) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // FOR UPDATE: purchase orders carry no unique key against the sales order
+    // (several per supplier are legitimate — EU-14), so this lock is the ONLY
+    // guard against two concurrent requests both reading "no open request yet"
+    // and each raising one.
     const [[sales]] = await conn.query(
       `SELECT id, order_number, required_date, plant_id FROM fab_orders
-        WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL LIMIT 1`,
+        WHERE id = ? AND company_id = ? AND order_type = 'sales' AND deleted_at IS NULL LIMIT 1 FOR UPDATE`,
       [orderId, companyId],
     );
-    if (!sales) { const e = new Error('Sales order not found'); e.status = 404; throw e; }
+    if (!sales) {
+      // The 'sales' filter above also excludes a quote — tell the caller why,
+      // rather than reporting a quote pointing at Procurement as "not found".
+      const [[any]] = await conn.query(
+        `SELECT order_type FROM fab_orders WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+        [orderId, companyId],
+      );
+      if (any?.order_type === 'quote') {
+        const e = new Error('This is a quote. Convert it to a sales order before requesting procurement.');
+        e.status = 409; e.code = 'QUOTE_CANNOT_RAISE'; throw e;
+      }
+      const e = new Error('Sales order not found'); e.status = 404; throw e;
+    }
 
     const takeOf = new Map((lines ?? []).map((l) => [Number(l.catalogItemId), Math.max(0, Number(l.take) || 0)]));
-    const shortfall = await orderShortfall(companyId, orderId, conn);
+    const shortfall = await orderShortfall(companyId, orderId, conn, { ctx });
 
     // 1. what to hold — never more than is needed; reserveForOrder also never
     //    takes more than is free.

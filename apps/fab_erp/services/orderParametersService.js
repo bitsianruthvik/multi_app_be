@@ -100,6 +100,15 @@ export async function parameterGrid(companyId, orderId, conn = null, opts = {}) 
     items.map((i) => ({ scope: 'order_item', scopeId: i.id })),
     { conn: exec, registry },
   );
+  // Item 13: what each cell would show if its own override were cleared —
+  // computed up front so "revert to inherited" can display the real value
+  // before it is saved, rather than a blank the client cannot tell apart from
+  // a genuinely missing one.
+  const resolvedInherited = await resolveFields(
+    companyId,
+    items.map((i) => ({ scope: 'order_item', scopeId: i.id })),
+    { conn: exec, registry, excludeOwnScope: true },
+  );
 
   const { peerOf, leaders } = await peerSets(companyId, orderId, exec);
 
@@ -111,7 +120,7 @@ export async function parameterGrid(companyId, orderId, conn = null, opts = {}) 
     for (const k of requiredByFlow.get(Number(it.flowId)) ?? []) needed.add(k);
   }
   /*
-   * DERIVED FIELDS GET NO COLUMN.
+   * DERIVED FIELDS GET NO COLUMN — UNLESS SOMETHING IS ACTUALLY MISSING.
    *
    * Weight and area are arithmetic on the rectangle — checked against 1,062
    * real parts, every one agreed with the formula — so asking for them is
@@ -119,10 +128,26 @@ export async function parameterGrid(companyId, orderId, conn = null, opts = {}) 
    * answer is a chance for the two to disagree. They are still WRITTEN, because
    * an assembly rolls them up with `inputs.sum(unit_weight_kg)` and the engine's
    * aggregate takes a field name rather than an expression. Computed, stored,
-   * never asked for.
+   * never asked for — AS LONG AS THE ROLL-UP ACTUALLY REACHED THE ROW.
+   *
+   * `fieldDeriveService`'s assembly path (item B2) only fills
+   * `unit_weight_kg`/`surface_area_m2` on a non-leaf row when its children
+   * already have theirs — an assembly short one un-measured child gets no
+   * value at all, and until this fix there was nowhere on the whole grid to
+   * type one by hand. So a derived field gets a column whenever SOME row
+   * that requires it has no resolved value for it — the gap case — even
+   * though every OTHER row asking for the same field may already have it
+   * computed and stays silently read via `values`.
    */
+  const derivedGaps = new Set();
+  for (const it of items) {
+    for (const k of requiredByFlow.get(Number(it.flowId)) ?? []) {
+      if (!isDerived(k) || !wanted(k)) continue;
+      if (!resolved.get(`order_item:${it.id}`)?.[k]) derivedGaps.add(k);
+    }
+  }
   const columns = [...needed]
-    .filter((k) => !isDerived(k) && wanted(k))
+    .filter((k) => (!isDerived(k) || derivedGaps.has(k)) && wanted(k))
     .map((k) => defByKey.get(k))
     .filter(Boolean)
     .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.fieldKey.localeCompare(b.fieldKey));
@@ -144,8 +169,13 @@ export async function parameterGrid(companyId, orderId, conn = null, opts = {}) 
       /** How many real parts this row writes to. 1 unless it leads a peer set. */
       represents: peers ? peers.length : 1,
       // Narrowed to the step's own set too, so a cell the step does not show is
-      // not counted as one this row still owes.
-      required: [...required].filter((k) => !isDerived(k) && wanted(k)),
+      // not counted as one this row still owes. A derived field is asked of
+      // THIS row only in the gap case (B2ii) — and even then only when this
+      // particular row is the one missing a value; a peer whose derivation
+      // already succeeded is not asked to re-type what it already has.
+      required: [...required].filter((k) => (
+        wanted(k) && (!isDerived(k) || (derivedGaps.has(k) && !resolved.get(`order_item:${it.id}`)?.[k]))
+      )),
       values: Object.fromEntries(
         [...required].map((k) => [k, resolved.get(`order_item:${it.id}`)?.[k]?.value ?? null]),
       ),
@@ -158,6 +188,10 @@ export async function parameterGrid(companyId, orderId, conn = null, opts = {}) 
         [...required]
           .map((k) => [k, resolved.get(`order_item:${it.id}`)?.[k]?.from?.scope ?? null])
           .filter(([, v]) => v),
+      ),
+      /** What each field would resolve to with this row's own value cleared — see resolvedInherited above. */
+      inherited: Object.fromEntries(
+        [...required].map((k) => [k, resolvedInherited.get(`order_item:${it.id}`)?.[k]?.value ?? null]),
       ),
     });
   }
@@ -260,11 +294,14 @@ export async function exportParameters(companyId, orderId) {
     `Order ${order?.orderNumber ?? orderId} — Parameters`,
     '',
     'FILL IN THE VALUE COLUMNS AND UPLOAD THIS FILE BACK.',
-    '  Only the columns after "Represents" are read. Everything to the left identifies the row',
-    '  and is ignored on import, so widening or re-sorting the sheet is safe.',
+    '  Everything to the left of the value columns identifies the row and is ignored on import.',
+    '  Value columns are matched by their HEADER TEXT, not position, so widening, re-sorting, or',
+    '  dropping a column you do not need is safe. A header this file does not recognise is skipped',
+    '  and reported as a problem after you upload it, rather than imported as something else.',
     '',
-    'A BLANK CELL CLEARS THAT VALUE. It does not mean "leave it alone" — if you want a value',
-    '  kept, leave it in the cell.',
+    'A BLANK CELL MEANS NO CHANGE — the same rule the grid uses. Leave a cell blank to leave that',
+    '  value exactly as it is now. There is no way to CLEAR a value from this sheet; do that in the',
+    '  grid instead.',
     '',
     'A GREYED "—" MEANS THE FLOW DOES NOT ASK FOR IT. Typing there does nothing: the part has no',
     '  operation whose formula reads that field.',
@@ -304,7 +341,20 @@ export async function exportParameters(companyId, orderId) {
   return { buffer: buf, fileName: `${order?.orderNumber ?? `order-${orderId}`}-parameters.xlsx` };
 }
 
-/** Read a filled sheet back. Unknown codes and untouched "—" cells are skipped. */
+/**
+ * Read a filled sheet back. Unknown codes are skipped with a warning; an
+ * unrecognised column HEADER is skipped with a problem (item 7 — this used to
+ * read value columns by position while its own instructions promised
+ * re-sorting was safe, which it was not: a dropped or reordered column would
+ * silently read the wrong field into every row).
+ *
+ * A BLANK CELL MEANS "NO CHANGE" here, the same as an untouched cell in the
+ * grid — never a clear. Whether a cell was left blank because nobody ever
+ * filled it in, or because someone wants the value gone, looks identical on a
+ * round trip through a spreadsheet, and treating it as a clear is how a
+ * half-filled-in sheet uploaded twice would erase values the first upload
+ * already set. Clearing a value is a grid-only action.
+ */
 export async function importParameters(companyId, orderId, filePath) {
   const { columns, rows } = await parameterGrid(companyId, orderId);
   const byId = new Map(rows.map((r) => [Number(r.itemId), r]));
@@ -314,6 +364,24 @@ export async function importParameters(companyId, orderId, filePath) {
   await wb.xlsx.readFile(filePath);
   const ws = wb.getWorksheet(SHEET) ?? wb.worksheets.find((w) => w.name !== 'Instructions');
   if (!ws) throw Object.assign(new Error(`No "${SHEET}" sheet in that file.`), { status: 400 });
+
+  // Header -> column, built once from row 1 rather than assumed from position.
+  const headerRow = ws.getRow(1);
+  const expectedHeader = (c) => (c.unit ? `${c.label} (${c.unit})` : c.label);
+  const columnByHeader = new Map(columns.map((c) => [expectedHeader(c), c]));
+  const colByCellIndex = new Map();
+  const problems = [];
+  const lastCol = Math.max(headerRow.cellCount, 4 + columns.length);
+  for (let i = 5; i <= lastCol; i++) {
+    const header = String(headerRow.getCell(i).value ?? '').trim();
+    if (!header) continue;
+    const col = columnByHeader.get(header);
+    if (!col) {
+      problems.push({ column: i, header, message: `Column ${i} ("${header}") is not a field this order asks for — skipped.` });
+      continue;
+    }
+    colByCellIndex.set(i, col);
+  }
 
   const edits = [];
   const warnings = [];
@@ -329,17 +397,18 @@ export async function importParameters(companyId, orderId, filePath) {
       continue;
     }
 
-    columns.forEach((c, i) => {
-      if (!target.required.includes(c.fieldKey)) return; // "—" column, not asked for
-      const raw = row.getCell(5 + i).value;
+    for (const [cellIndex, c] of colByCellIndex) {
+      if (!target.required.includes(c.fieldKey)) continue; // "—" column, not asked for
+      const raw = row.getCell(cellIndex).value;
       const v = raw === null || raw === undefined ? '' : String(typeof raw === 'object' && raw.result !== undefined ? raw.result : raw).trim();
-      if (v === '—') return;
+      if (v === '—') continue; // the grey "not asked for" marker, never a value
+      if (v === '') continue; // blank means no change — see the doc comment above
       const before = target.values[c.fieldKey] ?? '';
-      if (String(before) === v) return; // unchanged — do not rewrite
-      edits.push({ itemId: target.itemId, fieldKey: c.fieldKey, value: v === '' ? null : v });
-    });
+      if (String(before) === v) continue; // unchanged — do not rewrite
+      edits.push({ itemId: target.itemId, fieldKey: c.fieldKey, value: v });
+    }
   }
 
   const result = await setParameters(companyId, orderId, edits);
-  return { ...result, edits: edits.length, warnings, rowsRead: ws.rowCount - 1 };
+  return { ...result, edits: edits.length, warnings, problems, rowsRead: ws.rowCount - 1 };
 }

@@ -29,7 +29,9 @@
 
 import { pool } from '../../../db.js';
 import { chainsFor, mayHoldValue, rungOf, RUNGS } from './fieldLadder.js';
+import { validateFieldValue, PER_PIECE_FIELDS } from './fieldVocabulary.js';
 import { projectToColumns, hasProjection } from './fieldProjection.js';
+import { placeholders } from './sqlScope.js';
 
 /** Every active definition for a company, by key AND by id. */
 export async function fieldRegistry(companyId, conn = null) {
@@ -143,7 +145,7 @@ export async function resolveFields(companyId, targets, opts = {}) {
       `SELECT field_id, scope, scope_id, value_num, value_text, value_date, unit_code
          FROM fab_field_values
         WHERE company_id = ? AND scope = ? AND deleted_at IS NULL
-          AND scope_id IN (${ids.map(() => '?').join(',')})`,
+          AND scope_id IN (${placeholders(ids.length)})`,
       [companyId, scope, ...ids],
     );
     for (const r of rows) {
@@ -155,7 +157,12 @@ export async function resolveFields(companyId, targets, opts = {}) {
 
   for (const t of list) {
     const key = `${t.scope}:${t.scopeId}`;
-    const chain = chains.get(key) ?? [{ scope: t.scope, scopeId: Number(t.scopeId) }];
+    const fullChain = chains.get(key) ?? [{ scope: t.scope, scopeId: Number(t.scopeId) }];
+    // `opts.excludeOwnScope` resolves as if the target's OWN rung (always last
+    // — `chainsFor` builds broadest-first) had no value, i.e. "what would this
+    // show if its own override were cleared". Used to preview a revert-to-
+    // inherited before it is saved, without a second round trip per field.
+    const chain = opts.excludeOwnScope ? fullChain.slice(0, -1) : fullChain;
     const resolved = {};
 
     // Registry defaults first — the broadest thing there is.
@@ -164,7 +171,7 @@ export async function resolveFields(companyId, targets, opts = {}) {
       const d = f.dataType === 'text' || f.dataType === 'enum' ? f.defaultText : f.defaultNum;
       if (d == null) continue;
       resolved[f.fieldKey] = {
-        value: f.dataType === 'number' ? Number(d) : d,
+        value: (f.dataType === 'number' || f.dataType === 'integer') ? Number(d) : d,
         unit: f.defaultUnit ?? null,
         from: { scope: 'default', scopeId: null },
         fieldId: Number(f.id),
@@ -173,16 +180,22 @@ export async function resolveFields(companyId, targets, opts = {}) {
 
     // Then the chain, broadest first — so the narrowest rung wins by being last.
     for (const node of chain) {
+      // An ancestor INSTANCE rung — the segment a part sits in, or the order
+      // line — must not hand down a per-piece figure (see PER_PIECE_FIELDS).
+      const ancestorInstance = t.scope === 'order_item'
+        && (node.scope === 'order_line'
+          || (node.scope === 'order_item' && Number(node.scopeId) !== Number(t.scopeId)));
       for (const row of valuesAt.get(`${node.scope}:${node.scopeId}`) ?? []) {
         const f = registry.byId.get(Number(row.field_id));
         if (!f) continue;
         if (opts.formulaOnly && !Number(f.formulaUsable)) continue;
+        if (ancestorInstance && PER_PIECE_FIELDS.has(f.fieldKey)) continue;
         const raw = readValue(row, f);
         if (raw == null) continue;
 
         let value = raw;
         let unit = row.unit_code ?? f.defaultUnit ?? null;
-        if (f.dataType === 'number' && row.unit_code && f.defaultUnit
+        if ((f.dataType === 'number' || f.dataType === 'integer') && row.unit_code && f.defaultUnit
             && row.unit_code !== f.defaultUnit) {
           const c = convert(raw, row.unit_code, f.defaultUnit, units);
           // Not convertible: keep the value in the unit it was authored in and
@@ -204,12 +217,26 @@ export const flatten = (resolved) =>
   Object.fromEntries(Object.entries(resolved ?? {}).map(([k, v]) => [k, v.value]));
 
 /**
- * Write values at one scope.
+ * Write values, possibly at many scope ids at once — one call for a whole
+ * BOM tree's dimensions rather than one `setFields` per node.
  *
- * @param {Record<string, {value, unit?}|string|number|null>} values keyed by field_key
+ * Same validation, unit conversion and `projectToColumns` as the old
+ * per-scope `setFields`, but with the registry and the unit table loaded
+ * ONCE for the whole batch (`setFields` in a loop reloaded both on every
+ * call — the registry once per node, and the unit table again inside the
+ * loop for every projected field) and the actual writes to
+ * `fab_field_values` batched into one `INSERT … VALUES ? ON DUPLICATE KEY
+ * UPDATE` per 500 rows rather than one INSERT per value.
+ *
+ * `uq_ffv_target` FORBIDS DELETE-THEN-INSERT, which is why this — like the
+ * `setFields` it replaces — always upserts and never clears a row before
+ * writing its replacement: the delete would land on the SAME unique target a
+ * concurrent write is inserting into, not an empty one.
+ *
+ * @param {Array<{scopeId:number, key:string, value:{value,unit?}|string|number|null, unit?:string}>} rows
  * @returns {Promise<{written:number, cleared:number, rejected:Array}>}
  */
-export async function setFields(companyId, scope, scopeId, values, existingConn = null) {
+export async function setFieldsBulk(companyId, scope, rows, existingConn = null) {
   const conn = existingConn ?? await pool.getConnection();
   const owned = !existingConn;
   try {
@@ -219,39 +246,51 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
       e.status = 400;
       throw e;
     }
+    // Loaded ONCE for every row in the batch, not once per row/scopeId.
     const registry = await fieldRegistry(companyId, conn);
+    const units = await unitTable(conn);
 
     let written = 0;
     let cleared = 0;
     const rejected = [];
     /**
-     * What to copy into the legacy columns afterwards (step 4).
+     * What to copy into the legacy columns afterwards (step 4), per scope id.
      *
      * Collected as we go and written once at the end, on this same connection,
      * so a value and its projection land together. See fieldProjection.js for
      * why the columns still exist at all.
      */
-    const toProject = {};
+    const toProject = new Map(); // scopeId -> { fieldKey: value|null }
+    const setProjected = (scopeId, fieldKey, value) => {
+      const p = toProject.get(scopeId) ?? {};
+      p[fieldKey] = value;
+      toProject.set(scopeId, p);
+    };
+    /** Rows ready for the batched upsert: {scopeId, fieldKey, fieldId, num, text, date, unit}. */
+    const upsertRows = [];
 
-    for (const [fieldKey, input] of Object.entries(values ?? {})) {
+    for (const row of rows ?? []) {
+      const { scopeId, key: fieldKey } = row;
+      const input = row.value;
       const f = registry.byKey.get(fieldKey);
-      if (!f) { rejected.push({ fieldKey, why: 'no such field' }); continue; }
+      if (!f) { rejected.push({ scopeId, fieldKey, why: 'no such field' }); continue; }
 
       // The gate, enforced on WRITE. The old design allowed the row and gated it
       // on every read, which meant a stray value sat in the table forever
       // looking authoritative. Here it simply cannot be stored.
       if (!mayHoldValue(f, scope)) {
         rejected.push({
-          fieldKey,
+          scopeId, fieldKey,
           why: `${f.label} is set at ${f.applies_at} or broader, not on a ${scope}`,
         });
         continue;
       }
 
       const raw = input && typeof input === 'object' && 'value' in input ? input.value : input;
-      const unit = input && typeof input === 'object' ? (input.unit ?? f.defaultUnit) : f.defaultUnit;
+      const unit = row.unit
+        ?? (input && typeof input === 'object' ? (input.unit ?? f.defaultUnit) : f.defaultUnit);
 
-      if (raw == null || raw === '') {
+      if (raw == null || String(raw).trim() === '') {
         const [r] = await conn.query(
           `UPDATE fab_field_values SET deleted_at = NOW()
             WHERE company_id = ? AND field_id = ? AND scope = ? AND scope_id = ? AND deleted_at IS NULL`,
@@ -260,7 +299,22 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
         cleared += r.affectedRows ? 1 : 0;
         // Clearing a value clears its column too, or the column would keep
         // answering for a value that no longer exists.
-        if (hasProjection(scope, fieldKey)) toProject[fieldKey] = null;
+        if (hasProjection(scope, fieldKey)) setProjected(scopeId, fieldKey, null);
+        continue;
+      }
+
+      /**
+       * ONE VALIDATOR. This used to be a hand-rolled switch that drifted from
+       * `fieldVocabulary.validateFieldValue` (and from a THIRD copy in the FE)
+       * — most dangerously on `bool`, which took only true/1/'true' here while
+       * the validator accepted yes/true/1/y, so a value the validator had just
+       * PASSED could be written as its opposite. `validateFieldValue` is now
+       * the only place that decides ok/reason/canonical; this switch only maps
+       * the canonical string onto a storage column.
+       */
+      const verdict = validateFieldValue(f, raw);
+      if (!verdict.ok) {
+        rejected.push({ scopeId, fieldKey, why: `"${raw}" ${verdict.reason}` });
         continue;
       }
 
@@ -268,83 +322,61 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
       let text = null;
       let date = null;
       switch (f.dataType) {
-        case 'text': text = String(raw).slice(0, 500); break;
-        case 'enum': {
-          const allowed = Array.isArray(f.allowedValues) ? f.allowedValues
-            : (typeof f.allowedValues === 'string' ? JSON.parse(f.allowedValues || '[]') : []);
-          const match = allowed.find((a) => String(a).toLowerCase() === String(raw).toLowerCase());
-          if (allowed.length && !match) {
-            rejected.push({ fieldKey, why: `"${raw}" is not one of ${allowed.join(', ')}` });
-            continue;
-          }
-          // Store the CANONICAL spelling, not what was typed, so two rows never
-          // differ only by case.
-          text = String(match ?? raw).slice(0, 500);
+        case 'text':
+        case 'enum':
+          // Canonical spelling for a picker (not what was typed), so two rows
+          // never differ only by case; plain text has no canonicalisation.
+          text = String(verdict.canonical ?? raw).slice(0, 500);
           break;
-        }
-        case 'date': date = String(raw).slice(0, 10); break;
-        /**
-         * ACCEPT EXACTLY WHAT THE VALIDATOR ACCEPTS.
-         *
-         * `fieldVocabulary.validateFieldValue` takes yes/true/1/y and
-         * canonicalises to the string 'yes'. This branch used to take only
-         * true/1/'true', so a value the validator had just PASSED was written
-         * as its opposite — silently, with nothing rejected to look at.
-         *
-         * That is not hypothetical: every seeded `consumable` value is the
-         * string 'yes', and one importer run flipped five whole categories to
-         * consumable = false. Nothing noticed because the live reader still
-         * used the legacy table; the day it moves over, issuing material for
-         * those categories would have hard-blocked.
-         *
-         * An unrecognised value is refused rather than quietly falsed — the
-         * old expression treated 'no', 'banana' and a typo identically.
-         */
-        case 'bool': {
-          const t = String(raw).trim().toLowerCase();
-          if (raw === true || raw === 1 || ['yes', 'true', '1', 'y'].includes(t)) { num = 1; break; }
-          if (raw === false || raw === 0 || ['no', 'false', '0', 'n'].includes(t)) { num = 0; break; }
-          rejected.push({ fieldKey, why: `"${raw}" must be yes or no` });
-          continue;
-        }
-        default: {
-          const n = Number(raw);
-          if (!Number.isFinite(n)) { rejected.push({ fieldKey, why: `"${raw}" is not a number` }); continue; }
-          num = n;
-        }
+        case 'date': date = String(verdict.canonical ?? raw).slice(0, 10); break;
+        case 'bool': num = (verdict.canonical ?? raw) === 'yes' ? 1 : 0; break;
+        default: num = Number(verdict.canonical ?? raw); // number, integer
       }
 
-      // A real upsert, which uq_ffv_target makes possible.
+      upsertRows.push({
+        scopeId, fieldKey, fieldId: f.id, dataType: f.dataType, defaultUnit: f.defaultUnit,
+        num, text, date, unit: unit ?? null,
+      });
+    }
+
+    // A real upsert, which uq_ffv_target makes possible — batched 500 rows at
+    // a time, one INSERT rather than one per value.
+    for (let i = 0; i < upsertRows.length; i += 500) {
+      const chunk = upsertRows.slice(i, i + 500);
       await conn.query(
         `INSERT INTO fab_field_values
            (company_id, field_id, scope, scope_id, value_num, value_text, value_date, unit_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES ?
          ON DUPLICATE KEY UPDATE
            value_num = VALUES(value_num), value_text = VALUES(value_text),
            value_date = VALUES(value_date), unit_code = VALUES(unit_code),
            deleted_at = NULL`,
-        [companyId, f.id, scope, scopeId, num, text, date, unit ?? null],
+        [chunk.map((r) => [companyId, r.fieldId, scope, r.scopeId, r.num, r.text, r.date, r.unit])],
       );
-      written++;
-
-      /**
-       * The projected value is the one AFTER unit conversion, not the one that
-       * was typed. A length authored as 6 m must land in the column as 6000,
-       * because every matcher reading that column assumes the field's declared
-       * unit — putting 6 there would be the silent-1000x bug wearing a different
-       * hat.
-       */
-      if (hasProjection(scope, fieldKey)) {
-        let projected = num ?? text ?? date;
-        if (f.dataType === 'number' && unit && f.defaultUnit && unit !== f.defaultUnit) {
-          const c = convert(num, unit, f.defaultUnit, await unitTable(conn));
-          if (c) projected = c.value;
-        }
-        toProject[fieldKey] = projected;
-      }
+      written += chunk.length;
     }
 
-    const projectedCount = await projectToColumns(conn, companyId, scope, scopeId, toProject);
+    /**
+     * The projected value is the one AFTER unit conversion, not the one that
+     * was typed. A length authored as 6 m must land in the column as 6000,
+     * because every matcher reading that column assumes the field's declared
+     * unit — putting 6 there would be the silent-1000x bug wearing a different
+     * hat.
+     */
+    for (const r of upsertRows) {
+      if (!hasProjection(scope, r.fieldKey)) continue;
+      let projected = r.num ?? r.text ?? r.date;
+      if (r.dataType === 'number' && r.unit && r.defaultUnit && r.unit !== r.defaultUnit) {
+        const c = convert(r.num, r.unit, r.defaultUnit, units);
+        if (c) projected = c.value;
+      }
+      setProjected(r.scopeId, r.fieldKey, projected);
+    }
+
+    let projectedCount = 0;
+    for (const [scopeId, fields] of toProject) {
+      projectedCount += await projectToColumns(conn, companyId, scope, scopeId, fields);
+    }
 
     if (owned) await conn.commit();
     return { written, cleared, rejected, projected: projectedCount };
@@ -354,6 +386,24 @@ export async function setFields(companyId, scope, scopeId, values, existingConn 
   } finally {
     if (owned) conn.release();
   }
+}
+
+/**
+ * Write values at one scope. Now a thin wrapper over `setFieldsBulk` so there
+ * is one code path for both — see it for the details.
+ *
+ * @param {Record<string, {value, unit?}|string|number|null>} values keyed by field_key
+ * @returns {Promise<{written:number, cleared:number, rejected:Array}>}
+ */
+export async function setFields(companyId, scope, scopeId, values, existingConn = null) {
+  const rows = Object.entries(values ?? {}).map(([key, value]) => ({ scopeId, key, value }));
+  const result = await setFieldsBulk(companyId, scope, rows, existingConn);
+  return {
+    written: result.written,
+    cleared: result.cleared,
+    rejected: result.rejected.map(({ scopeId: _s, ...rest }) => rest),
+    projected: result.projected,
+  };
 }
 
 /** Convenience for one target. */

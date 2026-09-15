@@ -17,21 +17,16 @@
 
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { requirePerm } from '../../../core/middleware/requirePerm.js';
 import { pool } from '../../../db.js';
 import { logger } from '../../../core/utils/logger.js';
-import { DATA_TYPES } from '../services/fieldVocabulary.js';
+import { DATA_TYPES, APPLIES_AT } from '../services/fieldVocabulary.js';
 import { RUNGS } from '../services/fieldLadder.js';
 import { resolveOne, setFields, fieldRegistry } from '../services/fieldService.js';
+import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 
 const router = Router();
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
-
-const requirePerm = (tag) => (req, res, next) => {
-  if (!Array.isArray(req.user?.uiPermissions) || !req.user.uiPermissions.includes(tag)) {
-    return res.status(403).json({ message: `Permission required: ${tag}` });
-  }
-  next();
-};
 
 /**
  * The vocabulary an editor draws on.
@@ -62,10 +57,10 @@ router.get('/fields/vocabulary', protect, async (req, res) => {
        * allowed, because a broad value is a default.
        */
       rungs: RUNGS,
-      levels: [
-        { value: 'order_item', label: 'Same for every piece', hint: 'thickness, grade, model' },
-        { value: 'stock_piece', label: 'Differs per piece', hint: 'length, heat number, serial' },
-      ],
+      // `appliesAt` is the one definition (fieldVocabulary.js); `levels` is kept
+      // as an alias, same content, for callers not yet moved onto the new name.
+      appliesAt: APPLIES_AT,
+      levels: APPLIES_AT,
       /**
        * This used to say `unitsAreNotConverted: true`, and the editor said so
        * out loud. It is no longer true — fab_units carries factor_to_base — so
@@ -143,6 +138,16 @@ router.post('/fields/values', protect, requirePerm('fab_erp_items_meta_manage'),
   if (!scope || !scopeId) return res.status(400).json({ message: 'scope and scopeId are required.' });
   try {
     const result = await setFields(cid, String(scope), Number(scopeId), values ?? {});
+    // A catalog item's own thickness/width/length/density can move here (S5's
+    // derived weight, item 7) — recomputed best-effort so a save is never
+    // failed by a derive problem the caller cannot act on.
+    if (String(scope) === 'catalog_item') {
+      try {
+        await recomputeCatalogWeight(cid, [Number(scopeId)]);
+      } catch (deriveErr) {
+        logger.error({ err: deriveErr, scopeId }, 'fab_erp fields/values: catalog weight derive failed');
+      }
+    }
     res.json({ ok: true, ...result });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message });
