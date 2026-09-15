@@ -430,6 +430,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
           catalogItemId: line.childItemId,
           name: line.childName,
           code: childCode,
+          catalogCode: line.childCode ?? null,
           path: pathOf(childCode),
           depth: depth + 1,
           bomLineId: Number(line.lineId),
@@ -497,6 +498,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
           catalogItemId: line.childItemId,
           name: line.childName,
           code: childCode,
+          catalogCode: line.childCode ?? null,
           path: childPath,
           depth: depth + 1,
           bomLineId: Number(line.lineId),
@@ -523,7 +525,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   // The root hangs off no BOM line, so it has no default flow. In practice it
   // is the line's top assembly and carries no work of its own anyway.
   const tree = {
-    catalogItemId: Number(root.id), name: root.name, code: root.code,
+    catalogItemId: Number(root.id), name: root.name, code: root.code, catalogCode: root.code ?? null,
     path: '', depth: 0, bomLineId: null, similarGroup: null,
     defaultFlowId: null, children: [],
   };
@@ -1689,16 +1691,20 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
   const exec = conn ?? pool;
   const lineScope = orderLineId == null ? '' : 'AND order_line_id = ?';
   const [rows] = await exec.query(
-    `SELECT id, parent_item_id AS parentItemId, catalog_item_id AS catalogItemId,
-            name, unit, qty, flow_id AS flowId,
-            COALESCE(procurement_type, 'make') AS procurementType
-       FROM fab_items
-      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-        AND NOT node_kind = 'material' ${lineScope}
-        AND ${NOT_A_BLANK('fab_items')}
+    `SELECT i.id, i.parent_item_id AS parentItemId, i.catalog_item_id AS catalogItemId,
+            i.name, i.unit, i.qty, i.flow_id AS flowId,
+            COALESCE(i.procurement_type, 'make') AS procurementType,
+            -- The row's own code (written at deploy, NULL before) and the code
+            -- of the catalog item it is — the screen shows whichever it has.
+            i.code, c.code AS catalogCode
+       FROM fab_items i
+       LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
+      WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
+        AND NOT i.node_kind = 'material' ${lineScope.replace('order_line_id', 'i.order_line_id')}
+        AND ${NOT_A_BLANK('i')}
       -- sort_order first, id as the tie-break, so rows written before the
       -- column existed keep exactly the order they already had.
-      ORDER BY sort_order IS NULL, sort_order, id`,
+      ORDER BY i.sort_order IS NULL, i.sort_order, i.id`,
     orderLineId == null ? [companyId, orderId] : [companyId, orderId, orderLineId],
   );
   if (!rows.length) return null;
@@ -1717,6 +1723,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     qty: Number(r.qty),
     // Made or bought, so the editor knows which rows have a rectangle to size.
     procurementType: r.procurementType ?? 'make',
+    code: r.code ?? null,
+    catalogCode: r.catalogCode ?? null,
     codeSegment: null,
     codeJoin: 'dash',
     defaultFlowId: r.flowId == null ? null : Number(r.flowId),

@@ -197,16 +197,15 @@ export async function sellableItems(companyId, { search = null } = {}) {
        LEFT JOIN fab_item_groups g ON g.id = c.group_id AND g.deleted_at IS NULL
        LEFT JOIN fab_item_subgroups sg ON sg.id = c.subgroup_id AND sg.deleted_at IS NULL
       WHERE c.company_id = ? AND c.deleted_at IS NULL
-        -- Fabricated by category, OR a BOM ROOT — the top of a template that no
-        -- other template contains. That is what a line sells, whatever the
-        -- taxonomy calls its category.
+        -- Fabricated by category, OR anything that HAS a bill of materials.
+        -- It used to insist on a BOM ROOT (a top that no other template
+        -- contains), which quietly hid every sub-assembly — and a shop does
+        -- sell a girder or a diaphragm on its own, not only the span it
+        -- usually sits in. If it can be built from parts, it can be sold.
         AND (cat.name = 'Fabricated'
-             OR (EXISTS (SELECT 1 FROM fab_item_bom b
-                          WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
-                            AND b.parent_item_id = c.id)
-                 AND NOT EXISTS (SELECT 1 FROM fab_item_bom b
-                                  WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
-                                    AND b.child_item_id = c.id)))
+             OR EXISTS (SELECT 1 FROM fab_item_bom b
+                         WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
+                           AND b.parent_item_id = c.id))
         ${search ? 'AND (c.name LIKE ? OR c.code LIKE ?)' : ''}
       ORDER BY c.name`,
     search ? [companyId, `%${search}%`, `%${search}%`] : [companyId],
