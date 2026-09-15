@@ -194,8 +194,12 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
                 -- numerically but reformats "8.0000" as "8.00000000" even at
                 -- the default line qty of 1 — a byte-for-byte snapshot diff
                 -- on every order with no multi-qty line, for no reason.
-                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty,
-                CAST(SUM(fi.total_weight * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,6)) AS total_weight
+                -- The line qty sits INSIDE the SUM: TiDB's only_full_group_by
+                -- cannot see that fol.qty is fixed by the order_line_id in the
+                -- GROUP BY once the multiplicity join is there, and refused the
+                -- statement (readiness 500 in prod, 2026-09-16). Same number.
+                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL} * ${LINE_QTY_SQL}) AS DECIMAL(18,4)) AS qty,
+                CAST(SUM(fi.total_weight * ${STRUCT_MULT_SQL} * ${LINE_QTY_SQL}) AS DECIMAL(18,6)) AS total_weight
            FROM fab_items fi
            LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
            LEFT JOIN anc a ON a.id = fi.id
@@ -234,7 +238,7 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
        FROM (
          SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
                 COUNT(*) AS lines_count,
-                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty
+                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL} * ${LINE_QTY_SQL}) AS DECIMAL(18,4)) AS qty
            FROM fab_items fi
            LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
            LEFT JOIN anc a ON a.id = fi.id
