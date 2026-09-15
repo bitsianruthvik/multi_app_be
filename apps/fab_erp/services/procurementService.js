@@ -31,6 +31,37 @@ import { pool } from '../../../db.js';
 import { availabilityFor, availabilityBySize, sizeKey } from './availabilityService.js';
 import { LINE_QTY_SQL } from './orderLineQty.js';
 
+/**
+ * ANCESTOR MULTIPLICITY, for bought parts that sit INSIDE the structure.
+ *
+ * A row's qty is per ONE parent: 120 shear studs under a segment, of which a
+ * girder has three, of which a span has two, is 720 studs on the order — the
+ * BOM screen and the fabrication draft already say "720 total". The buy side
+ * summed the row's own 120 and multiplied by line qty alone, so anything
+ * bought under a multi-qty assembly was under-ordered by the product of its
+ * ancestors' quantities (studs directly under a Span, as on KEPL, were fine).
+ *
+ * `anc.mult` is the product of the qty of every row ABOVE a row (the root is
+ * qty 1 by the rule in orderLineQty.js). It applies to STRUCTURE rows only: a
+ * material link's qty carries its own meaning (see the un-nested branch below
+ * — one draw per link), and nests are counted per plate, never multiplied.
+ *
+ * Prepend to a statement; it takes (company_id, order_id) as its first two
+ * placeholders. `LEFT JOIN anc a ON a.id = fi.id` inside, then STRUCT_MULT_SQL.
+ */
+const ANCESTOR_MULT_CTE = `
+  WITH RECURSIVE anc AS (
+    SELECT id, qty, CAST(1 AS DECIMAL(18,4)) AS mult
+      FROM fab_items
+     WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL AND parent_item_id IS NULL
+    UNION ALL
+    SELECT c.id, c.qty, CAST(anc.mult * COALESCE(anc.qty, 1) AS DECIMAL(18,4))
+      FROM fab_items c
+      JOIN anc ON c.parent_item_id = anc.id
+     WHERE c.deleted_at IS NULL
+  )`;
+const STRUCT_MULT_SQL = `(CASE WHEN fi.node_kind = 'structure' THEN COALESCE(a.mult, 1) ELSE 1 END)`;
+
 /** The answer for a node with no catalog link, and the fallback for an unset one. */
 export const DEFAULT_PROCUREMENT = 'make';
 
@@ -151,7 +182,8 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
    * that shares it.
    */
   const [buy] = await exec.query(
-    `SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
+    `${ANCESTOR_MULT_CTE}
+     SELECT t.catalog_item_id, fic.code, fic.name, fic.unit,
             SUM(t.lines_count) AS lines_count, SUM(t.qty) AS qty,
             SUM(t.total_weight) AS total_weight
        FROM (
@@ -162,10 +194,11 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
                 -- numerically but reformats "8.0000" as "8.00000000" even at
                 -- the default line qty of 1 — a byte-for-byte snapshot diff
                 -- on every order with no multi-qty line, for no reason.
-                CAST(SUM(fi.qty) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty,
-                CAST(SUM(fi.total_weight) * ${LINE_QTY_SQL} AS DECIMAL(18,6)) AS total_weight
+                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty,
+                CAST(SUM(fi.total_weight * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,6)) AS total_weight
            FROM fab_items fi
            LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
+           LEFT JOIN anc a ON a.id = fi.id
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
             AND COALESCE(fi.procurement_type, ?) = 'buy' AND fi.nest_no IS NULL
           GROUP BY fi.catalog_item_id, fi.order_line_id
@@ -184,7 +217,7 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
        LEFT JOIN fab_item_catalog fic ON fic.id = t.catalog_item_id
       GROUP BY t.catalog_item_id, fic.code, fic.name, fic.unit
       ORDER BY fic.code`,
-    [companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
+    [companyId, orderId, companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
   // The same buy side broken down by the PLATE SIZE each row asks for.
@@ -195,14 +228,16 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
   // (fab_items.length/width and `height` = thickness on the material link), and
   // they are the thing that has to be matched against the yard.
   const [buySizes] = await exec.query(
-    `SELECT t.catalog_item_id, t.length, t.width, t.height,
+    `${ANCESTOR_MULT_CTE}
+     SELECT t.catalog_item_id, t.length, t.width, t.height,
             SUM(t.lines_count) AS lines_count, SUM(t.qty) AS qty
        FROM (
          SELECT fi.catalog_item_id, fi.length, fi.width, fi.height,
                 COUNT(*) AS lines_count,
-                CAST(SUM(fi.qty) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty
+                CAST(SUM(fi.qty * ${STRUCT_MULT_SQL}) * ${LINE_QTY_SQL} AS DECIMAL(18,4)) AS qty
            FROM fab_items fi
            LEFT JOIN fab_order_lines fol ON fol.id = fi.order_line_id AND fol.deleted_at IS NULL
+           LEFT JOIN anc a ON a.id = fi.id
           WHERE fi.company_id = ? AND fi.order_id = ? AND fi.deleted_at IS NULL
             AND COALESCE(fi.procurement_type, ?) = 'buy'
             AND fi.catalog_item_id IS NOT NULL AND fi.nest_no IS NULL
@@ -221,7 +256,7 @@ export async function orderProcurementSplit(companyId, orderId, conn, { ctx } = 
        ) t
       GROUP BY t.catalog_item_id, t.length, t.width, t.height
       ORDER BY t.catalog_item_id, t.length, t.width`,
-    [companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
+    [companyId, orderId, companyId, orderId, DEFAULT_PROCUREMENT, companyId, orderId, DEFAULT_PROCUREMENT],
   );
 
   // Untouched by EU-5: one row per made item, not an aggregate — `fi.qty` is

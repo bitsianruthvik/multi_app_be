@@ -665,7 +665,12 @@ export function segmentFromShortCode(shortCode) {
 export function shortName(name) {
   const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(String(name ?? ''));
   const base = (m ? m[1] : String(name ?? '')).trim();
-  const words = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const tokens = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  // Initials come from the WORDS. "Stiffener Plate 12 × 150" is SP, not
+  // SP11 — a size in a name is a size, not a syllable, and "SP111" read as a
+  // row code told nobody which digit was the position.
+  const alpha = tokens.filter((w) => /^[A-Za-z]/.test(w));
+  const words = alpha.length ? alpha : tokens;
   const head = words.length > 1 ? words.map((w) => w[0]).join('').toUpperCase() : abbreviate(base);
   return m ? `${head}/${m[2].trim()[0].toUpperCase()}` : head;
 }
