@@ -240,7 +240,16 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
   // in which a wrong plate costs money.
   const blanks = [...byKey.values()].sort((x, y) => (y.qty * y.unitWeightKg) - (x.qty * x.unitWeightKg));
   const codes = await blankCodes(companyId, order.orderNumber, blanks);
-  blanks.forEach((b, i) => { b.code = codes[i]; });
+  // `ref` is the SHORT handle the cutting-plan sheet uses: the code with the
+  // order's own prefix taken off (BLK-202609150014-MS-E350BO-16X1800X10000 →
+  // MS-E350BO-16X1800X10000). Every blank on one order shares that prefix,
+  // so nothing is lost inside the order, and it still reads as what it is —
+  // unlike a running number, which changes when the BOM does.
+  const prefix = `BLK-${orderRef(order.orderNumber)}-`;
+  blanks.forEach((b, i) => {
+    b.code = codes[i];
+    b.ref = b.code.startsWith(prefix) ? b.code.slice(prefix.length) : b.code;
+  });
   for (const b of blanks) {
     b.name = blankName(order.orderNumber, b);
     b.totalWeightKg = b.qty * b.unitWeightKg;

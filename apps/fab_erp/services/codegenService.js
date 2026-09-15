@@ -686,13 +686,25 @@ export function shortName(name) {
  * two end diaphragms and a splice, the end diaphragms are ED1 and ED2 — not
  * ED2 and ED3 because a line happened to come first.
  *
- * @returns {Promise<Map<number, string>>} item id -> code
+ * NUMBERS ARE PHYSICAL PIECES, NOT DESIGNS (2026-09-15). A segment row with
+ * qty 4 is not "segment design 1", it is segments 1 to 4: the position
+ * counter advances by the row's quantity, so a second segment row after it
+ * starts at 5 — exactly as if the four had been given as four rows. The row's
+ * own code is its FIRST piece (SPAN1-L1-1); `last` is its last (SPAN1-L1-4).
+ * Top rows count the line's quantity the same way (SPAN1..SPAN5).
+ *
+ * WRITTEN CODES NEVER MOVE. A row that already carries a code keeps its
+ * number, and a row added later — even above it in the BOM — takes the next
+ * free numbers after everything already written under that parent.
+ *
+ * @returns {Promise<{info: Map<number, object>, kids: Map, prefix: string, evalCode: Function}>}
  */
-export async function orderRowCodes(companyId, orderId, conn) {
+async function computeOrderRowCodes(companyId, orderId, conn) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
     `SELECT i.id, i.parent_item_id AS parentId, i.catalog_item_id AS catalogId, i.name,
-            ol.code AS lineCode, c.short_code AS shortCode
+            i.qty, i.code AS written,
+            ol.code AS lineCode, ol.qty AS lineQty, c.short_code AS shortCode
        FROM fab_items i
        LEFT JOIN fab_order_lines ol ON ol.id = i.order_line_id AND ol.deleted_at IS NULL
        LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
@@ -706,7 +718,7 @@ export async function orderRowCodes(companyId, orderId, conn) {
       ORDER BY i.sort_order IS NULL, i.sort_order, i.id`,
     [companyId, orderId],
   );
-  if (!rows.length) return new Map();
+  if (!rows.length) return { info: new Map(), kids: new Map(), prefix: '', evalCode: async () => '' };
 
   const byId = new Map(rows.map((r) => [Number(r.id), r]));
   const kids = new Map();
@@ -726,74 +738,139 @@ export async function orderRowCodes(companyId, orderId, conn) {
    * short code, blank meaning the initials of its name. A row with no
    * catalog item at all (free text on the order) still names itself.
    *
-   * WHAT COUNTS AS "THE SAME" FOR NUMBERING: rows of one catalog item count
-   * together — three girder rows renamed G1, G2–G3 and G4 are still L1, L2,
-   * L3. Rows without an item count with rows of the same NAME, so two End
-   * Stiffener rows of different sizes on one segment are ES1 and ES2.
+   * WHAT COUNTS AS "THE SAME" FOR NUMBERING: rows that share a SEGMENT under
+   * one parent count together, whatever item they are — three girder rows
+   * renamed G1, G2–G3 and G4 are L1, L2, L3, and 23 plain stiffeners followed
+   * by 3 holed ones (two catalog items, both STF) are STF1…23 and STF24…26.
+   * Counting by item instead let two items with one short code both start
+   * at 1 and collide; the code, not the item, is what must be unique.
    */
-  const sameItem = (r) => (r.catalogId != null
-    ? `c${r.catalogId}`
-    : `n|${String(r.name).toLowerCase()}`);
   const segmentOf = (r) => segmentFromShortCode(r.shortCode)
     ?? ((r.catalogId == null && r.lineCode) || shortName(r.name));
-  const aboveCount = new Map();
-  const contexts = [];
-  const ids = [];
-
-  // Parents before children, so every row can read its parent's code.
-  const walk = (parentKey, parentRow, parentCode) => {
-    const siblings = kids.get(parentKey) ?? [];
-    const underParent = new Map();
-    for (const r of siblings) {
-      const key = sameItem(r);
-      underParent.set(key, (underParent.get(key) ?? 0) + 1);
-      aboveCount.set(key, (aboveCount.get(key) ?? 0) + 1);
-      const bom = segmentOf(r);
-
-      const context = {
-        orderPrefix: prefix,
-        parentCode,
-        bomCode: bom,
-        position: { parent: underParent.get(key), above: aboveCount.get(key) },
-      };
-      contexts.push(context);
-      ids.push(Number(r.id));
-      r._context = context;
-    }
-    return siblings;
+  const sameItem = (r) => segmentOf(r);
+  /** How many physical pieces this row is, under ONE instance of its parent. */
+  const countOf = (r, isRoot) => {
+    const q = Math.max(1, Math.round(Number(r.qty) || 1));
+    return isRoot ? q * Math.max(1, Math.round(Number(r.lineQty) || 1)) : q;
   };
 
-  // Codes depend on the parent's code, so each level is rendered before the
-  // next is walked. One ctxCache for the whole order — a real bridge order is
-  // exactly the "1,000 rows sharing a handful of categories" case this exists
-  // for.
+  // One ctxCache for the whole order — a real bridge order is exactly the
+  // "1,000 rows sharing a handful of categories" case this exists for.
   const ctxCache = new Map();
   const segments = await segmentsFor(companyId, 'order_item', ctxCache);
   const now = new Date();
-  const codes = new Map();
-  let level = walk('root', null, '');
-  while (level.length) {
-    const next = [];
-    for (const r of level) {
-      const code = await evaluateSegments(segments, { companyId, context: r._context, seqValue: 1, now, ctxCache });
-      codes.set(Number(r.id), code);
-      next.push(...walk(Number(r.id), r, code));
+  const evalCode = (parentCode, bomCode, n, above = n) => evaluateSegments(segments, {
+    companyId, seqValue: 1, now, ctxCache,
+    context: { orderPrefix: prefix, parentCode, bomCode, position: { parent: n, above } },
+  });
+
+  /**
+   * The number a WRITTEN code carries, read off against what the rule gives
+   * for number 1: the two agree up to the digits, so back up over any digit
+   * run at the divergence and parse what follows. Null when the written code
+   * was not made by this rule at all.
+   */
+  const firstFromWritten = (written, one) => {
+    let i = 0;
+    while (i < one.length && i < written.length && one[i] === written[i]) i++;
+    while (i > 0 && /\d/.test(written[i - 1])) i--;
+    const m = /^(\d+)/.exec(written.slice(i));
+    return m ? Number(m[1]) : null;
+  };
+
+  const aboveCount = new Map();
+  const info = new Map();
+
+  // Parents before children, so every row can read its parent's code.
+  const walk = async (parentKey, parentCode) => {
+    const siblings = kids.get(parentKey) ?? [];
+    const isRoot = parentKey === 'root';
+    const groups = new Map();
+    for (const r of siblings) {
+      const key = sameItem(r);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
     }
-    level = next;
-  }
-  return codes;
+    for (const [key, group] of groups) {
+      // Written rows reserve their numbers first; new rows come after them.
+      const parsed = new Map();
+      let reserved = 0;
+      for (const r of group) {
+        if (r.written == null) continue;
+        const first = firstFromWritten(r.written, await evalCode(parentCode, segmentOf(r), 1, 1));
+        if (first != null) {
+          parsed.set(r, first);
+          reserved = Math.max(reserved, first + countOf(r, isRoot) - 1);
+        }
+      }
+      let counter = reserved;
+      for (const r of group) {
+        const count = countOf(r, isRoot);
+        const segment = segmentOf(r);
+        let first = parsed.get(r);
+        if (first == null) { first = counter + 1; counter += count; }
+        const aboveFirst = (aboveCount.get(key) ?? 0) + 1;
+        aboveCount.set(key, aboveFirst + count - 1);
+        const code = r.written ?? await evalCode(parentCode, segment, first, aboveFirst);
+        const last = count > 1 ? await evalCode(parentCode, segment, first + count - 1, aboveFirst + count - 1) : null;
+        info.set(Number(r.id), {
+          id: Number(r.id), parentId: isRoot ? null : parentKey,
+          code, last, first, count, segment, written: r.written != null,
+        });
+      }
+    }
+    for (const r of siblings) await walk(Number(r.id), info.get(Number(r.id)).code);
+  };
+  await walk('root', '');
+  return { info, kids, prefix, evalCode };
 }
 
 /**
- * ONE IDENTITY PER PIECE. A row with quantity six is one row and one task —
- * a row is a design — but six pieces of steel leave the shop, and each gets
- * a name: the row's code with a running number, TF1-1 … TF1-6. A row of one
- * has no suffix; its code IS the piece.
+ * The code of every BOM row on an order — the row's FIRST piece.
+ * @returns {Promise<Map<number, string>>} item id -> code
  */
-export function pieceCodes(rowCode, qty) {
-  const n = Math.max(0, Math.floor(Number(qty) || 0));
-  if (n <= 1) return [];
-  return Array.from({ length: n }, (_, i) => `${rowCode}-${i + 1}`);
+export async function orderRowCodes(companyId, orderId, conn) {
+  const { info } = await computeOrderRowCodes(companyId, orderId, conn);
+  return new Map([...info].map(([id, i]) => [id, i.code]));
+}
+
+/**
+ * The same, with the row's LAST piece and how many it is under one parent —
+ * what a screen needs to show "SPAN1-L1-1 … 4" on a qty-4 row.
+ * @returns {Promise<Map<number, {code: string, last: string|null, count: number}>>}
+ */
+export async function orderRowCodeRanges(companyId, orderId, conn) {
+  const { info } = await computeOrderRowCodes(companyId, orderId, conn);
+  return new Map([...info].map(([id, i]) => [id, { code: i.code, last: i.last, count: i.count }]));
+}
+
+/**
+ * ONE IDENTITY PER PHYSICAL PIECE — the order fully expanded. A flange row of
+ * qty 2 under a segment row of qty 3 under a girder row of qty 2 is twelve
+ * flanges, and each is named by the path of the pieces it sits in:
+ * SPAN1-G2-3-TF1 is flange 1 of segment 3 of girder 2. Numbering restarts
+ * under each parent PIECE, the same rule as the rows; uniqueness comes from
+ * the path. Rows stay rows — a row is a design and one task chain.
+ *
+ * Parents come before their children in the result.
+ *
+ * @returns {Promise<Array<{itemId: number, code: string, parentCode: string|null}>>}
+ */
+export async function orderPieceCodes(companyId, orderId, conn) {
+  const { info, kids, evalCode } = await computeOrderRowCodes(companyId, orderId, conn);
+  const pieces = [];
+  const expand = async (parentKey, parentPieceCode) => {
+    for (const r of kids.get(parentKey) ?? []) {
+      const i = info.get(Number(r.id));
+      for (let n = i.first; n < i.first + i.count; n++) {
+        const code = await evalCode(parentPieceCode, i.segment, n, n);
+        pieces.push({ itemId: i.id, code, parentCode: parentPieceCode || null });
+        await expand(Number(r.id), code);
+      }
+    }
+  };
+  await expand('root', '');
+  return pieces;
 }
 
 /**

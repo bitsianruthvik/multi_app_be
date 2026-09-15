@@ -30,7 +30,10 @@ import { lineScopeSql } from './sqlScope.js';
 import { assertNoStartedWork } from './itemGuards.js';
 import { afterStructureWrite } from './itemShapeService.js';
 import { recordRevision } from './orderRevisionService.js';
-import { orderRowCodes, shortName, segmentFromShortCode } from './codegenService.js';
+import { orderRowCodeRanges, shortName, segmentFromShortCode } from './codegenService.js';
+
+/** Row-level steel, carried in `dims` beside the sizes: text fields, not numbers. */
+const STEEL_KEYS = new Set(['material', 'grade']);
 
 /**
  * Unit + make/buy for exactly the catalog items a tree references, not the
@@ -366,11 +369,16 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
    */
   const shortOf = (line) => segmentFromShortCode(line.childShort) ?? shortName(line.childName);
   const positions = new Map();
-  const nextPos = (parentNode, childItemId) => {
+  /**
+   * The FIRST number a row of `count` pieces takes under this parent. The
+   * counter advances by the count, so a qty-4 row followed by a qty-2 row
+   * reads 1…4 and 5…6 — the same rule `orderRowCodes` applies at deploy.
+   */
+  const nextPos = (parentNode, childItemId, count = 1) => {
     let counts = positions.get(parentNode);
     if (!counts) { counts = new Map(); positions.set(parentNode, counts); }
     const n = (counts.get(childItemId) ?? 0) + 1;
-    counts.set(childItemId, n);
+    counts.set(childItemId, n + Math.max(1, Math.round(count)) - 1);
     return n;
   };
   const numberedSegment = (segment, n) => {
@@ -457,11 +465,16 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
         // Preview of the ORDER row code: parent + the item's short code +
         // position among rows of the same item under this parent — the same
         // rule codegenService.orderRowCodes applies at deploy.
-        const childCode = `${code}-${numberedSegment(shortOf(line), nextPos(target, line.childItemId))}`;
+        // Numbered among rows sharing the SEGMENT under this parent (see
+        // codegenService.computeOrderRowCodes) — two items both STF continue.
+        const first = nextPos(target, shortOf(line), qty);
+        const childCode = `${code}-${numberedSegment(shortOf(line), first)}`;
         target.children.push({
           catalogItemId: line.childItemId,
           name: line.childName,
           code: childCode,
+          // The row's LAST piece under one parent, so the screen can read 1…4.
+          codeLast: qty > 1 ? `${code}-${numberedSegment(shortOf(line), first + Math.round(qty) - 1)}` : null,
           catalogCode: line.childCode ?? null,
           path: pathOf(childCode),
           depth: depth + 1,
@@ -501,7 +514,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
          */
         // Same preview rule as the non-exploded branch above: the item's short
         // code, numbered among rows of that item under this parent.
-        const childCode = `${code}-${numberedSegment(shortOf(line), nextPos(target, line.childItemId))}`;
+        const childCode = `${code}-${numberedSegment(shortOf(line), nextPos(target, shortOf(line)))}`;
 
         nodes++;
         byName[line.childName] = (byName[line.childName] ?? 0) + 1;
@@ -891,7 +904,10 @@ function sortOrderMatches(storedSortOrder, position) {
 function dimsDiffer(node, priorDims) {
   if (!node.dims || typeof node.dims !== 'object') return false;
   for (const [k, v] of Object.entries(node.dims)) {
-    const nv = (v === '' || v == null) ? null : Number(v);
+    // Steel is text: compare the strings, not Number('E350 BR') (NaN).
+    const nv = STEEL_KEYS.has(k)
+      ? (String(v ?? '').trim() || null)
+      : ((v === '' || v == null) ? null : Number(v));
     const pv = priorDims[k] ?? null;
     if (nv !== pv) return true;
   }
@@ -1483,6 +1499,9 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
          */
         if (node.dims && typeof node.dims === 'object') {
           for (const [k, v] of Object.entries(node.dims)) {
+            // Material and grade ride along with the sizes: TEXT the row
+            // states for itself, over the line's steel (2026-09-16).
+            if (STEEL_KEYS.has(k)) { const s = String(v ?? '').trim(); if (s) nodeDims.push([id, k, s]); continue; }
             if (Number.isFinite(Number(v))) nodeDims.push([id, k, Number(v)]);
           }
         }
@@ -1740,7 +1759,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
    * structure screen reads SPAN1-L1-2-TF1 from the day the row is created.
    * One pass over the order, only when some row still lacks one.
    */
-  const preview = rows.some((r) => r.code == null) ? await orderRowCodes(companyId, orderId, exec) : new Map();
+  // Always computed: a written row still needs its LAST piece for the range.
+  const ranges = await orderRowCodeRanges(companyId, orderId, exec);
   const build = (r) => ({
     key: `i${r.id}`,
     itemId: Number(r.id),
@@ -1750,7 +1770,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     qty: Number(r.qty),
     // Made or bought, so the editor knows which rows have a rectangle to size.
     procurementType: r.procurementType ?? 'make',
-    code: r.code ?? preview.get(Number(r.id)) ?? null,
+    code: r.code ?? ranges.get(Number(r.id))?.code ?? null,
+    codeLast: ranges.get(Number(r.id))?.last ?? null,
     codeWritten: r.code != null,
     catalogCode: r.catalogCode ?? null,
     codeSegment: null,
@@ -1772,18 +1793,19 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
    * beside the row they belong to. One query, not one per node.
    */
   const [vals] = await exec.query(
-    `SELECT v.scope_id AS itemId, f.field_key AS k, v.value_num AS n
+    `SELECT v.scope_id AS itemId, f.field_key AS k, v.value_num AS n, v.value_text AS t
        FROM fab_field_values v
        JOIN fab_fields f ON f.id = v.field_id
       WHERE v.company_id = ? AND v.scope = 'order_item' AND v.scope_id IN (?)
         AND v.deleted_at IS NULL
-        AND f.field_key IN ('thickness_mm','width_mm','length_mm')`,
+        AND f.field_key IN ('thickness_mm','width_mm','length_mm','material','grade')`,
     [companyId, rows.map((r) => r.id)],
   );
   const byItem = new Map();
   for (const v of vals) {
     const e = byItem.get(Number(v.itemId)) ?? {};
-    e[v.k] = v.n == null ? null : Number(v.n);
+    // The row's OWN steel, when it states one; absent means "the line's".
+    e[v.k] = STEEL_KEYS.has(v.k) ? (v.t ?? null) : (v.n == null ? null : Number(v.n));
     byItem.set(Number(v.itemId), e);
   }
   const attach = (n) => {
@@ -2037,6 +2059,9 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
          */
         if (node.dims && typeof node.dims === 'object') {
           for (const [k, v] of Object.entries(node.dims)) {
+            // Material/grade are text; blank CLEARS the row's own and it
+            // inherits the line's again.
+            if (STEEL_KEYS.has(k)) { const s = String(v ?? '').trim(); dimEdits.push([id, k, s || null]); continue; }
             dimEdits.push([id, k, v === '' || v == null ? null : Number(v)]);
           }
         }
@@ -2050,7 +2075,7 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
     if (dimEdits.length) {
       const rows = dimEdits.map(([itemId, key, value]) => ({
         scopeId: itemId, key,
-        value: (value == null || !Number.isFinite(value)) ? null : value,
+        value: typeof value === 'string' ? value : (value == null || !Number.isFinite(value)) ? null : value,
       }));
       await setFieldsBulk(companyId, 'order_item', rows, conn);
       // Weight and area for what just changed are computed once below, by

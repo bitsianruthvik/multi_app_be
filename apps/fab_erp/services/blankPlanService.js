@@ -678,6 +678,7 @@ function describeBlanks(blanks, nests, reasonFor) {
     return {
       key: b.key,
       code: b.code,
+      ref: b.ref,
       name: b.name,
       material: b.material,
       grade: b.grade,

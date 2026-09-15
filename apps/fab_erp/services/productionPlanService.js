@@ -22,7 +22,7 @@
 
 import { pool } from '../../../db.js';
 import { planOrderTasks, syncUnstartedTasks, materializeOrderTasks } from './taskGatingService.js';
-import { orderRowCodes, taskCodes } from './codegenService.js';
+import { orderRowCodeRanges, taskCodes } from './codegenService.js';
 import { orderShortfall } from './procurementService.js';
 import { onOrderByItem, heldByOrder, procurementForOrder } from './procurementOrderService.js';
 import { ensureProductionOrder } from './productionOrderService.js';
@@ -115,7 +115,7 @@ export async function productionPlan(companyId, orderId) {
       [companyId, orderId],
     ),
     productionOrders(companyId, orderId),
-    orderRowCodes(companyId, orderId),
+    orderRowCodeRanges(companyId, orderId),
   ]);
 
   const opIds = [...new Set(planned.map((t) => t.operationId))];
@@ -154,7 +154,9 @@ export async function productionPlan(companyId, orderId) {
   };
   walk('root', 0);
 
-  const codeOf = (r) => r.code ?? rowCodePreview.get(Number(r.id)) ?? null;
+  const codeOf = (r) => r.code ?? rowCodePreview.get(Number(r.id))?.code ?? null;
+  /** The row's last piece under one parent (SPAN1-L1-4 on a qty-4 row), or null. */
+  const codeLastOf = (r) => rowCodePreview.get(Number(r.id))?.last ?? null;
 
   // ── steps, grouped by row ────────────────────────────────────────────────
   const stepsByItem = new Map();
@@ -204,6 +206,7 @@ export async function productionPlan(companyId, orderId) {
       qty: Number(r.qty) || 0,
       totalQty: qty,
       code: codeOf(r),
+      codeLast: codeLastOf(r),
       codeSaved: r.code != null,
       procurement: r.procurement,
       flowName: r.flowName ?? null,

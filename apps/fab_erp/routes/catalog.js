@@ -18,7 +18,7 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { requirePerm, fail } from '../../../core/middleware/requirePerm.js';
 import { pool } from '../../../db.js';
-import { generateCode, orderRowCodes, orderCodePrefix } from '../services/codegenService.js';
+import { generateCode, orderRowCodeRanges, orderCodePrefix } from '../services/codegenService.js';
 import { setFieldsBulk, resolveFields } from '../services/fieldService.js';
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { catalogSizes, itemUsage, sellableItems } from '../services/catalogPickerService.js';
@@ -516,11 +516,14 @@ router.get('/orders/:id/lines', protect, async (req, res) => {
           AND node_kind = 'structure' AND deleted_at IS NULL`,
       [cid, orderId],
     );
-    const preview = roots.some((r) => !r.code) ? await orderRowCodes(cid, orderId) : new Map();
+    // Always computed: a line of qty 5 reads SPAN1…5 even once SPAN1 is written.
+    const ranges = roots.length ? await orderRowCodeRanges(cid, orderId) : new Map();
     const rootCodeByLine = new Map();
+    const rootCodeLastByLine = new Map();
     for (const r of roots) {
       if (r.lineId == null || rootCodeByLine.has(Number(r.lineId))) continue;
-      rootCodeByLine.set(Number(r.lineId), r.code ?? preview.get(Number(r.id)) ?? null);
+      rootCodeByLine.set(Number(r.lineId), r.code ?? ranges.get(Number(r.id))?.code ?? null);
+      rootCodeLastByLine.set(Number(r.lineId), ranges.get(Number(r.id))?.last ?? null);
     }
     const codePrefix = roots.length ? `${await orderCodePrefix(cid, orderId)}-` : null;
     const specByLine = new Map();
@@ -541,6 +544,7 @@ router.get('/orders/:id/lines', protect, async (req, res) => {
         } : null,
         builtCount: builtByLine.get(Number(l.id)) ?? 0,
         rootCode: rootCodeByLine.get(Number(l.id)) ?? null,
+        rootCodeLast: rootCodeLastByLine.get(Number(l.id)) ?? null,
         material: spec.material,
         grade: spec.grade,
         thicknessMm: spec.thickness_mm,

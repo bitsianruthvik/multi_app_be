@@ -6548,6 +6548,18 @@ CREATE TABLE IF NOT EXISTS fab_order_pieces (
   KEY idx_fop_item (item_id)
 );
 
+-- 2026-09-15: pieces are the order FULLY EXPANDED (SPAN1-G2-3-TF1 is flange 1
+-- of segment 3 of girder 2), so each piece points at the piece it sits in,
+-- and the code itself is the identity a re-deploy must never re-mint.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_pieces' AND COLUMN_NAME='parent_piece_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_pieces ADD COLUMN parent_piece_id INT NULL, ADD KEY idx_fop_parent (parent_piece_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_pieces' AND INDEX_NAME='uq_fop_code');
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_pieces ADD UNIQUE KEY uq_fop_code (company_id, code)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- One-time carry-over: the abbreviations the shop already chose on its BOM
 -- lines (code_segment: SPAN, L, S, TF ...) become the items' short codes, so
 -- every existing order code keeps its shape. Only where nothing is set yet;

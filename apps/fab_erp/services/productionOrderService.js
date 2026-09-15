@@ -29,7 +29,7 @@ import { pool } from '../../../db.js';
 import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
 import { materializeOrderTasks, syncUnstartedTasks, planOrderTasks } from './taskGatingService.js';
-import { generateCode, orderRowCodes, taskCodes, pieceCodes } from './codegenService.js';
+import { generateCode, orderRowCodes, taskCodes, orderPieceCodes } from './codegenService.js';
 
 /**
  * A production order's life, and what moves it.
@@ -420,32 +420,64 @@ async function deployRowsAndTaskCodes(conn, companyId, mo) {
     }
 
     /*
-     * 2b. PIECE IDENTITIES. Every made row with a quantity above one gets a
-     * name per piece (codegenService.pieceCodes) — the row stays one row and
-     * one task. INSERT IGNORE on (item, seq): a re-deploy after the quantity
-     * grew adds the new pieces and never renumbers the ones already painted
-     * on steel; a quantity that shrank keeps its extra names, like marks do.
+     * 2b. PIECE IDENTITIES — the order fully expanded (codegenService.
+     * orderPieceCodes): one row per physical piece, named by the path of the
+     * pieces it sits in (SPAN1-G2-3-TF1), each pointing at its parent piece.
+     * The row stays one row and one task. A piece whose code already exists
+     * is left exactly as it is: a re-deploy after a quantity grew adds the
+     * new pieces and never renumbers the ones already painted on steel; a
+     * quantity that shrank keeps its extra names, like marks do.
      */
-    if (codes.size) {
-      const [qtys] = await conn.query(
-        `SELECT id, qty, code FROM fab_items WHERE company_id = ? AND id IN (?) AND code IS NOT NULL`,
-        [companyId, [...codes.keys()]],
-      );
-      const pieces = [];
-      for (const r of qtys) {
-        pieceCodes(r.code, r.qty).forEach((code, i) => pieces.push([companyId, mo.salesId, Number(r.id), i + 1, code]));
-      }
-      for (let i = 0; i < pieces.length; i += 500) {
-        await conn.query(
-          `INSERT IGNORE INTO fab_order_pieces (company_id, order_id, item_id, seq, code) VALUES ?`,
-          [pieces.slice(i, i + 500)],
-        );
-      }
-    }
+    if (codes.size) await mintOrderPieces(conn, companyId, mo.salesId);
   }
 
   // 3. task codes
   await issueTaskCodes(conn, companyId, mo.id);
+}
+
+/**
+ * Step 2b on its own: mint every piece the order's expansion names that does
+ * not exist yet, and link each to its parent piece. Idempotent — running it
+ * again adds only what a grown quantity or a new row brought.
+ *
+ * @returns {Promise<{minted: number, total: number}>}
+ */
+export async function mintOrderPieces(conn, companyId, orderId) {
+  const expanded = await orderPieceCodes(companyId, orderId, conn);
+  const [have] = await conn.query(
+    `SELECT id, item_id AS itemId, seq, code FROM fab_order_pieces WHERE company_id = ? AND order_id = ?`,
+    [companyId, orderId],
+  );
+  const known = new Set(have.map((p) => p.code));
+  const maxSeq = new Map();
+  for (const p of have) maxSeq.set(Number(p.itemId), Math.max(maxSeq.get(Number(p.itemId)) ?? 0, Number(p.seq)));
+  const fresh = [];
+  for (const p of expanded) {
+    if (known.has(p.code)) continue;
+    known.add(p.code);
+    const seq = (maxSeq.get(p.itemId) ?? 0) + 1;
+    maxSeq.set(p.itemId, seq);
+    fresh.push([companyId, orderId, p.itemId, seq, p.code]);
+  }
+  for (let i = 0; i < fresh.length; i += 500) {
+    await conn.query(
+      `INSERT IGNORE INTO fab_order_pieces (company_id, order_id, item_id, seq, code) VALUES ?`,
+      [fresh.slice(i, i + 500)],
+    );
+  }
+  // Parent links, by code, for every piece that still lacks one.
+  const [all] = await conn.query(
+    `SELECT id, code, parent_piece_id AS parentId FROM fab_order_pieces
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
+    [companyId, orderId],
+  );
+  const idByCode = new Map(all.map((p) => [p.code, Number(p.id)]));
+  const parentByCode = new Map(expanded.map((p) => [p.code, p.parentCode]));
+  const links = all
+    .filter((p) => p.parentId == null && parentByCode.get(p.code) && idByCode.has(parentByCode.get(p.code)))
+    .map((p) => [Number(p.id), idByCode.get(parentByCode.get(p.code))]);
+  await updateInChunks(conn, 'fab_order_pieces', 'parent_piece_id', links, companyId);
+  return { minted: fresh.length, total: expanded.length };
 }
 
 /**

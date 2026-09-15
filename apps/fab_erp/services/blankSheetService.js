@@ -40,9 +40,17 @@ import { blankPlan } from './blankPlanService.js';
 import { orderBlanks } from './blankService.js';
 
 const SHEET = 'Cutting plan';
+/*
+ * THE FOUR COLUMNS THAT MATTER COME FIRST — Nest, Plate code, Blank, Qty — so a
+ * planner selects one narrow block to copy into a nesting program and back.
+ * "Blank" is the SHORT handle — the code after the order's own prefix
+ * (MS-E350BO-16X1800X10000); the full code sits at the far right for the
+ * record and is accepted on the way back in too. Columns are found by header
+ * on import, so the older layout (full code in column D) still reads.
+ */
 const HEADERS = [
-  'Nest', 'Plate code', 'Plate (T x W x L)',
-  'Blank code', 'Blank (T x W x L)', 'Qty on this sheet',
+  'Nest', 'Plate code', 'Blank', 'Qty on this sheet',
+  'Plate (T x W x L)', 'Blank (T x W x L)', 'Blank full code',
 ];
 
 export async function exportPlan(companyId, orderId, opts = {}) {
@@ -70,20 +78,22 @@ export async function exportPlan(companyId, orderId, opts = {}) {
       ws.addRow([
         n.nestNo,
         n.plateCode ?? '',
-        `${n.thickness} x ${n.width} x ${n.length}`,
-        b?.code ?? '',
-        b ? `${b.thickness} x ${b.width} x ${b.length}` : '',
+        b?.ref ?? '',
         it.qty,
+        `${n.thickness} x ${n.width} x ${n.length}`,
+        b ? `${b.thickness} x ${b.width} x ${b.length}` : '',
+        b?.code ?? '',
       ]);
     }
   }
 
-  ws.getColumn(1).width = 10;
+  ws.getColumn(1).width = 8;
   ws.getColumn(2).width = 16;
-  ws.getColumn(3).width = 24;
-  ws.getColumn(4).width = 42;
+  ws.getColumn(3).width = 28;
+  ws.getColumn(4).width = 18;
   ws.getColumn(5).width = 24;
-  ws.getColumn(6).width = 18;
+  ws.getColumn(6).width = 24;
+  ws.getColumn(7).width = 42;
 
   /*
    * A second sheet listing what has to be cut, so somebody planning by hand can
@@ -91,18 +101,19 @@ export async function exportPlan(companyId, orderId, opts = {}) {
    * complete statement of the job rather than half of one.
    */
   const ds = wb.addWorksheet('What has to be cut');
-  ds.addRow(['Blank code', 'Blank (T x W x L)', 'Material', 'Grade', 'Needed', 'Weight each (kg)', 'Serves parts'])
+  ds.addRow(['Blank', 'Blank (T x W x L)', 'Material', 'Grade', 'Needed', 'Weight each (kg)', 'Serves parts', 'Blank full code'])
     .font = { bold: true };
   for (const b of plan.blanks) {
     ds.addRow([
-      b.code, `${b.thickness} x ${b.width} x ${b.length}`,
+      b.ref ?? '', `${b.thickness} x ${b.width} x ${b.length}`,
       b.material ?? '', b.grade ?? '', b.qty,
-      Number(b.unitWeightKg.toFixed(2)), b.partCount,
+      Number(b.unitWeightKg.toFixed(2)), b.partCount, b.code,
     ]);
   }
-  ds.getColumn(1).width = 42;
+  ds.getColumn(1).width = 28;
   ds.getColumn(2).width = 24;
   for (const c of [3, 4, 5, 6, 7]) ds.getColumn(c).width = 15;
+  ds.getColumn(8).width = 42;
 
   return {
     buffer: await wb.xlsx.writeBuffer(),
@@ -131,7 +142,48 @@ export async function importPlan(companyId, orderId, buffer) {
     const e = new Error('No header row found — the first column of the header must read "Nest".');
     e.status = 400; throw e;
   }
+  /*
+   * COLUMNS BY HEADER, not by position: the layout has changed once already
+   * (the short "Blank" handle moved next to the plate, the full code to the
+   * end) and a sheet somebody downloaded last week must still read.
+   */
+  const col = {};
+  ws.getRow(headerRow).eachCell((cell, c) => {
+    const h = String(cell.value ?? '').trim().toLowerCase();
+    if (h === 'nest') col.nest = c;
+    else if (h === 'plate code') col.plate = c;
+    else if (h === 'blank' || h === 'blank code') col.blank = col.blank ?? c;
+    else if (h === 'blank full code') col.blankFull = c;
+    else if (h.startsWith('qty')) col.qty = c;
+  });
+  const missing = ['nest', 'plate', 'blank', 'qty'].filter((k) => !col[k]);
+  if (missing.length) {
+    const e = new Error('The header must have Nest, Plate code, Blank and Qty columns.');
+    e.status = 400; throw e;
+  }
+  const rows = [];
+  ws.eachRow((row, n) => {
+    if (n <= headerRow) return;
+    const cellText = (c) => (c ? String(row.getCell(c).value ?? '').trim() : '');
+    rows.push({
+      n,
+      nestNo: cellText(col.nest),
+      plateCode: cellText(col.plate),
+      // The short handle, or the full code where the handle is blank.
+      blankCode: cellText(col.blank) || cellText(col.blankFull),
+      qtyRaw: row.getCell(col.qty).value,
+    });
+  });
+  return importPlanRows(companyId, orderId, rows);
+}
 
+/**
+ * Validate and group parsed rows into nests — the one reader of a plan,
+ * whatever it was parsed from.
+ *
+ * @param {{n:number, nestNo:string, plateCode:string, blankCode:string, qtyRaw:*, malformed?:string}[]} inputRows
+ */
+export async function importPlanRows(companyId, orderId, inputRows) {
   const [plateRows] = await pool.query(
     `SELECT ci.id, ci.code FROM fab_item_catalog ci
        JOIN fab_item_groups g ON g.id = ci.group_id AND g.name = 'Plates'
@@ -148,26 +200,32 @@ export async function importPlan(companyId, orderId, buffer) {
    * read the same codes off a full (if quick) pack (PLAN.md EU-11 item 7).
    */
   const plan = await orderBlanks(companyId, orderId);
-  const keyByCode = new Map(plan.blanks.map((b) => [String(b.code).trim().toUpperCase(), b.key]));
+  // Matched by the short handle (the code after the order prefix) OR the full
+  // code — both are on the sheet.
+  const keyByCode = new Map([
+    ...plan.blanks.map((b) => [String(b.code).trim().toUpperCase(), b.key]),
+    ...plan.blanks.map((b) => [String(b.ref).trim().toUpperCase(), b.key]),
+  ]);
 
   const problems = [];
   const byNest = new Map();
   let rows = 0;
 
-  ws.eachRow((row, n) => {
-    if (n <= headerRow) return;
-    const nestNo = String(row.getCell(1).value ?? '').trim();
-    const plateCode = String(row.getCell(2).value ?? '').trim().toUpperCase();
-    const blankCode = String(row.getCell(4).value ?? '').trim().toUpperCase();
-    const qty = Number(row.getCell(6).value);
-    if (!nestNo && !plateCode && !blankCode) return;   // a blank spacer row
+  for (const r of inputRows) {
+    const n = r.n;
+    const nestNo = String(r.nestNo ?? '').trim();
+    const plateCode = String(r.plateCode ?? '').trim().toUpperCase();
+    const blankCode = String(r.blankCode ?? '').trim().toUpperCase();
+    const qty = Number(r.qtyRaw);
+    if (r.malformed) { problems.push(`Row ${n}: ${r.malformed}.`); continue; }
+    if (!nestNo && !plateCode && !blankCode) continue;   // a blank spacer row
 
-    if (!nestNo) { problems.push(`Row ${n}: no nest number.`); return; }
+    if (!nestNo) { problems.push(`Row ${n}: no nest number.`); continue; }
     const plateId = plateByCode.get(plateCode);
-    if (!plateId) { problems.push(`Row ${n}: "${plateCode || '(blank)'}" is not a plate code in the catalogue.`); return; }
+    if (!plateId) { problems.push(`Row ${n}: "${plateCode || '(blank)'}" is not a plate code in the catalogue.`); continue; }
     const key = keyByCode.get(blankCode);
-    if (!key) { problems.push(`Row ${n}: "${blankCode || '(blank)'}" is not a blank this order needs.`); return; }
-    if (!Number.isFinite(qty) || qty <= 0) { problems.push(`Row ${n}: quantity "${row.getCell(6).value}" is not a positive number.`); return; }
+    if (!key) { problems.push(`Row ${n}: "${blankCode || '(blank)'}" is not a blank this order needs (use the Blank column as the sheet gives it).`); continue; }
+    if (!Number.isFinite(qty) || qty <= 0) { problems.push(`Row ${n}: quantity "${r.qtyRaw}" is not a positive number.`); continue; }
 
     rows += 1;
     const hit = byNest.get(nestNo) ?? { nestNo, plateCatalogItemId: plateId, plateCode, items: [] };
@@ -178,11 +236,11 @@ export async function importPlan(companyId, orderId, buffer) {
      */
     if (hit.plateCatalogItemId !== plateId) {
       problems.push(`Row ${n}: nest ${nestNo} already uses plate ${hit.plateCode}; a nest is ONE sheet.`);
-      return;
+      continue;
     }
     hit.items.push({ key, qty });
     byNest.set(nestNo, hit);
-  });
+  }
 
   if (!rows && !problems.length) {
     const e = new Error('That sheet has no rows under the header.'); e.status = 400; throw e;
