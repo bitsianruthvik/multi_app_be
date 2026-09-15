@@ -30,6 +30,7 @@ import { lineScopeSql } from './sqlScope.js';
 import { assertNoStartedWork } from './itemGuards.js';
 import { afterStructureWrite } from './itemShapeService.js';
 import { recordRevision } from './orderRevisionService.js';
+import { orderRowCodes, shortName, segmentFromShortCode } from './codegenService.js';
 
 /**
  * Unit + make/buy for exactly the catalog items a tree references, not the
@@ -72,7 +73,7 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.help_text AS helpText, b.sort_order AS sortOrder,
             b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName, b.code_join AS codeJoin,
             b.explode AS explode,
-            c.code AS childCode, c.name AS childName, c.unit AS childUnit,
+            c.code AS childCode, c.short_code AS childShort, c.name AS childName, c.unit AS childUnit,
             c.procurement_type AS childProcurement,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
@@ -139,7 +140,7 @@ async function bomIndex(companyId, rootIds, conn = null) {
               b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
               b.help_text AS helpText, b.sort_order AS sortOrder,
               b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
-              c.code AS childCode, c.name AS childName, c.unit AS childUnit,
+              c.code AS childCode, c.short_code AS childShort, c.name AS childName, c.unit AS childUnit,
               c.procurement_type AS childProcurement
          FROM fab_item_bom b
          JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
@@ -310,11 +311,19 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   const byParent = await bomIndex(companyId, [rootItemId], exec);
 
   const [[root]] = await exec.query(
-    `SELECT id, code, name, unit FROM fab_item_catalog
+    `SELECT id, code, short_code AS shortCode, name, unit FROM fab_item_catalog
       WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
     [rootItemId, companyId],
   );
   if (!root) { const e = new Error('That template item does not exist.'); e.status = 404; throw e; }
+  /*
+   * The root's PREVIEW code: its short code numbered 1. On the order the
+   * deploy will number it among the order's top rows (SPAN1, SPAN2) behind
+   * the order prefix; before a row exists "the first one" is the honest
+   * guess, and every child code below hangs off it the way it will on the
+   * order.
+   */
+  const rootCode = `${segmentFromShortCode(root.shortCode) ?? shortName(root.name)}1`;
 
   const byName = {};
   let nodes = 0;
@@ -327,7 +336,7 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
    * as `instantiate` computes the stored code — one rule, so the key the wizard
    * wrote and the key the expander reads can never drift apart.
    */
-  const pathOf = (childCode) => childCode.slice(String(root.code).length).replace(/^-/, '');
+  const pathOf = (childCode) => childCode.slice(rootCode.length).replace(/^-/, '');
   /**
    * Paths that other paths point AT. A group's canonical member is in the group
    * too — otherwise "G2..G5 are the same as G1" would stamp four rows and leave
@@ -348,6 +357,27 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
    * Separate from node creation so a COLLAPSED level can call it with the same
    * target — see below.
    */
+  /**
+   * ROW CODE PREVIEW HELPERS. A row's segment is its ITEM's short code (blank
+   * = the initials of the name), numbered among rows of the same item under
+   * the same parent, exactly as `codegenService.orderRowCodes` will number
+   * them at deploy. A "(drilled)" variant keeps its "/D" after the number
+   * (BS1/D, BS2/D) so the suffix a flow rule reads stays intact.
+   */
+  const shortOf = (line) => segmentFromShortCode(line.childShort) ?? shortName(line.childName);
+  const positions = new Map();
+  const nextPos = (parentNode, childItemId) => {
+    let counts = positions.get(parentNode);
+    if (!counts) { counts = new Map(); positions.set(parentNode, counts); }
+    const n = (counts.get(childItemId) ?? 0) + 1;
+    counts.set(childItemId, n);
+    return n;
+  };
+  const numberedSegment = (segment, n) => {
+    const slash = segment.indexOf('/');
+    return slash === -1 ? `${segment}${n}` : `${segment.slice(0, slash)}${n}${segment.slice(slash)}`;
+  };
+
   const addChildren = (target, itemId, code, depth, ancestry, path) => {
     if (depth >= MAX_DEPTH) return;
 
@@ -424,8 +454,10 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
       if (!line.explode) {
         nodes++;
         byName[line.childName] = (byName[line.childName] ?? 0) + qty;
-        const seg = line.codeSegment ?? String(1);
-        const childCode = line.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`;
+        // Preview of the ORDER row code: parent + the item's short code +
+        // position among rows of the same item under this parent — the same
+        // rule codegenService.orderRowCodes applies at deploy.
+        const childCode = `${code}-${numberedSegment(shortOf(line), nextPos(target, line.childItemId))}`;
         target.children.push({
           catalogItemId: line.childItemId,
           name: line.childName,
@@ -467,21 +499,9 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
          * This never bit the old data only because every drilled line there
          * happened to be qty 1.
          */
-        const numbered = (segment) => {
-          const slash = segment.indexOf('/');
-          return slash === -1
-            ? `${segment}${i}`
-            : `${segment.slice(0, slash)}${i}${segment.slice(slash)}`;
-        };
-        const seg = line.codeSegment != null
-          ? (qty === 1 ? line.codeSegment : numbered(line.codeSegment))
-          : String(i);
-        /*
-         * ABSORB joins without a dash, so girder L1 segment 1 reads L11 —
-         * the mark the shop paints on the steel. Anything else keeps the
-         * dash, which is what makes a code readable by eye.
-         */
-        const childCode = line.codeJoin === 'absorb' ? `${code}${seg}` : `${code}-${seg}`;
+        // Same preview rule as the non-exploded branch above: the item's short
+        // code, numbered among rows of that item under this parent.
+        const childCode = `${code}-${numberedSegment(shortOf(line), nextPos(target, line.childItemId))}`;
 
         nodes++;
         byName[line.childName] = (byName[line.childName] ?? 0) + 1;
@@ -525,11 +545,11 @@ export async function expand(companyId, rootItemId, params = {}, opts = {}) {
   // The root hangs off no BOM line, so it has no default flow. In practice it
   // is the line's top assembly and carries no work of its own anyway.
   const tree = {
-    catalogItemId: Number(root.id), name: root.name, code: root.code, catalogCode: root.code ?? null,
+    catalogItemId: Number(root.id), name: root.name, code: rootCode, catalogCode: root.code ?? null,
     path: '', depth: 0, bomLineId: null, similarGroup: null,
     defaultFlowId: null, children: [],
   };
-  addChildren(tree, Number(root.id), root.code, 0, { ordinal: 1 }, '');
+  addChildren(tree, Number(root.id), rootCode, 0, { ordinal: 1 }, '');
   return { root: tree, nodes, byName };
 }
 
@@ -1714,6 +1734,13 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     const k = r.parentItemId == null ? 'root' : String(r.parentItemId);
     kids.set(k, [...(kids.get(k) ?? []), r]);
   }
+  /*
+   * EVERY ROW HAS A CODE TO SHOW. Written rows carry their own; rows not yet
+   * deployed get the code the deploy WOULD write, from the same rule — so the
+   * structure screen reads SPAN1-L1-2-TF1 from the day the row is created.
+   * One pass over the order, only when some row still lacks one.
+   */
+  const preview = rows.some((r) => r.code == null) ? await orderRowCodes(companyId, orderId, exec) : new Map();
   const build = (r) => ({
     key: `i${r.id}`,
     itemId: Number(r.id),
@@ -1723,7 +1750,8 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     qty: Number(r.qty),
     // Made or bought, so the editor knows which rows have a rectangle to size.
     procurementType: r.procurementType ?? 'make',
-    code: r.code ?? null,
+    code: r.code ?? preview.get(Number(r.id)) ?? null,
+    codeWritten: r.code != null,
     catalogCode: r.catalogCode ?? null,
     codeSegment: null,
     codeJoin: 'dash',

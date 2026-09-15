@@ -646,7 +646,23 @@ export async function orderCodePrefix(companyId, orderId, conn) {
  * Stiffener" is IS, "End Stiffener" ES. A trailing "(drilled)" becomes the
  * /D the BOM uses for the same thing. One word keeps the ordinary abbreviation.
  */
-function shortName(name) {
+/**
+ * What an item's stored short code means for its rows' segment:
+ *   'TF'   → 'TF'   the letters, then the position (TF1)
+ *   '#'    → ''     NUMBER ONLY — the position alone (L1-1, L1-2), which is how
+ *                   a shop numbers segments under a girder
+ *   blank  → null   not stated: the caller derives the initials of the name
+ * Blank cannot mean "number only": two different items under one parent with
+ * no letters would both be "1", and the deploy refuses duplicate codes.
+ */
+export const NUMBER_ONLY = '#';
+export function segmentFromShortCode(shortCode) {
+  const s = shortCode == null ? '' : String(shortCode).trim();
+  if (!s) return null;
+  return s === NUMBER_ONLY ? '' : s;
+}
+
+export function shortName(name) {
   const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(String(name ?? ''));
   const base = (m ? m[1] : String(name ?? '')).trim();
   const words = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
@@ -671,9 +687,10 @@ export async function orderRowCodes(companyId, orderId, conn) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
     `SELECT i.id, i.parent_item_id AS parentId, i.catalog_item_id AS catalogId, i.name,
-            ol.code AS lineCode
+            ol.code AS lineCode, c.short_code AS shortCode
        FROM fab_items i
        LEFT JOIN fab_order_lines ol ON ol.id = i.order_line_id AND ol.deleted_at IS NULL
+       LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND i.node_kind = 'structure'
         -- Bought rows are not made here and get no production code: a shear
@@ -686,18 +703,6 @@ export async function orderRowCodes(companyId, orderId, conn) {
   );
   if (!rows.length) return new Map();
 
-  const catalogIds = [...new Set(rows.map((r) => r.catalogId).filter((x) => x != null))];
-  const bomCode = new Map();
-  if (catalogIds.length) {
-    const [lines] = await exec.query(
-      `SELECT parent_item_id AS p, child_item_id AS c, code_segment AS seg
-         FROM fab_item_bom
-        WHERE company_id = ? AND deleted_at IS NULL AND child_item_id IN (?)`,
-      [companyId, catalogIds],
-    );
-    for (const l of lines) bomCode.set(`${l.p}:${l.c}`, l.seg ?? '');
-  }
-
   const byId = new Map(rows.map((r) => [Number(r.id), r]));
   const kids = new Map();
   for (const r of rows) {
@@ -708,16 +713,24 @@ export async function orderRowCodes(companyId, orderId, conn) {
 
   const prefix = await orderCodePrefix(companyId, orderId, exec);
   /*
-   * WHAT COUNTS AS "THE SAME" FOR NUMBERING. A row from a BOM line counts with
-   * the other rows of its item — three girder rows renamed G1, G2–G3 and G4 are
-   * still L1, L2, L3. A row added on the order has no BOM line and names
-   * itself, so it counts with rows of the same NAME: plain and drilled
-   * stiffeners are IS1 and IS/D1, and two End Stiffener rows of different
-   * sizes on one segment are ES1 and ES2 rather than both ES1.
+   * THE SEGMENT IS THE ITEM'S SHORT CODE, for every row alike (2026-09-15).
+   *
+   * It used to come from the catalog BOM line, which meant a row added by
+   * hand on the order — there is always one — had no segment and fell back
+   * to something else. Now every row reads the same way: the item's own
+   * short code, blank meaning the initials of its name. A row with no
+   * catalog item at all (free text on the order) still names itself.
+   *
+   * WHAT COUNTS AS "THE SAME" FOR NUMBERING: rows of one catalog item count
+   * together — three girder rows renamed G1, G2–G3 and G4 are still L1, L2,
+   * L3. Rows without an item count with rows of the same NAME, so two End
+   * Stiffener rows of different sizes on one segment are ES1 and ES2.
    */
-  const sameItem = (r, fromBom) => (fromBom
+  const sameItem = (r) => (r.catalogId != null
     ? `c${r.catalogId}`
     : `n|${String(r.name).toLowerCase()}`);
+  const segmentOf = (r) => segmentFromShortCode(r.shortCode)
+    ?? ((r.catalogId == null && r.lineCode) || shortName(r.name));
   const aboveCount = new Map();
   const contexts = [];
   const ids = [];
@@ -727,16 +740,10 @@ export async function orderRowCodes(companyId, orderId, conn) {
     const siblings = kids.get(parentKey) ?? [];
     const underParent = new Map();
     for (const r of siblings) {
-      // What the BOM calls this row. A BOM line left blank means "just a
-      // number"; no BOM line at all (a top row, or a row added by hand) falls
-      // back to the order line's code, then to an abbreviation of the name.
-      const line = parentRow?.catalogId != null && r.catalogId != null
-        ? bomCode.get(`${parentRow.catalogId}:${r.catalogId}`)
-        : undefined;
-      const key = sameItem(r, line !== undefined);
+      const key = sameItem(r);
       underParent.set(key, (underParent.get(key) ?? 0) + 1);
       aboveCount.set(key, (aboveCount.get(key) ?? 0) + 1);
-      const bom = line !== undefined ? line : (r.lineCode || shortName(r.name));
+      const bom = segmentOf(r);
 
       const context = {
         orderPrefix: prefix,
@@ -770,6 +777,18 @@ export async function orderRowCodes(companyId, orderId, conn) {
     level = next;
   }
   return codes;
+}
+
+/**
+ * ONE IDENTITY PER PIECE. A row with quantity six is one row and one task —
+ * a row is a design — but six pieces of steel leave the shop, and each gets
+ * a name: the row's code with a running number, TF1-1 … TF1-6. A row of one
+ * has no suffix; its code IS the piece.
+ */
+export function pieceCodes(rowCode, qty) {
+  const n = Math.max(0, Math.floor(Number(qty) || 0));
+  if (n <= 1) return [];
+  return Array.from({ length: n }, (_, i) => `${rowCode}-${i + 1}`);
 }
 
 /**

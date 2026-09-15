@@ -43,6 +43,7 @@ import {
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
 import { pickableItems, catalogSizes } from '../services/catalogPickerService.js';
+import { orderCodePrefix } from '../services/codegenService.js';
 
 const router = Router();
 // In memory: the sheet is parsed and thrown away, never stored.
@@ -100,11 +101,12 @@ router.get('/templates/:itemId/draft', protect, async (req, res) => {
 router.get('/orders/:orderId/structure/tree', protect, async (req, res) => {
   try {
     const cid = companyId(req);
-    const tree = await currentTree(
-      cid, Number(req.params.orderId),
-      req.query.orderLineId ? Number(req.query.orderLineId) : null,
-    );
-    res.json({ tree });
+    const orderId = Number(req.params.orderId);
+    const tree = await currentTree(cid, orderId, req.query.orderLineId ? Number(req.query.orderLineId) : null);
+    // The order prefix every row code starts with — sent so the screen can
+    // hide it (it is the same on every row) while the stored code keeps it.
+    const codePrefix = tree ? `${await orderCodePrefix(cid, orderId)}-` : null;
+    res.json({ tree, codePrefix });
   } catch (err) { return fail(res, err); }
 });
 

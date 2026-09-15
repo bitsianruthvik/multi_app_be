@@ -6514,3 +6514,46 @@ SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='explode');
 SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN explode TINYINT(1) NOT NULL DEFAULT 1', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 13. Short code on the catalog item + piece identities per order row (2026-09-15).
+--
+-- A row's ORDER code is parent code + the item's SHORT CODE + position, for
+-- every row alike -- one from a catalog BOM line and one added by hand on the
+-- order. The short code lives on the item (blank = initials of the name,
+-- codegenService.shortName); fab_item_bom.code_segment is no longer read.
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='short_code');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN short_code VARCHAR(12) NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Every made row with a quantity above one gets one identity per piece when
+-- the production order is deployed: TF1-1 .. TF1-6. The ROW stays one row
+-- and one task (a row is a design); these are the names the pieces carry.
+-- Minted once and never renumbered -- the same rule as marks.
+CREATE TABLE IF NOT EXISTS fab_order_pieces (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT          NOT NULL,
+  order_id    INT          NOT NULL,
+  item_id     INT          NOT NULL,
+  seq         INT          NOT NULL,
+  code        VARCHAR(160) NOT NULL,
+  created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  deleted_at  DATETIME     DEFAULT NULL,
+  UNIQUE KEY uq_fop_item_seq (company_id, item_id, seq),
+  KEY idx_fop_order (company_id, order_id),
+  KEY idx_fop_item (item_id)
+);
+
+-- One-time carry-over: the abbreviations the shop already chose on its BOM
+-- lines (code_segment: SPAN, L, S, TF ...) become the items' short codes, so
+-- every existing order code keeps its shape. Only where nothing is set yet;
+-- an item on several lines with different segments takes the shortest.
+UPDATE fab_item_catalog c
+  JOIN (SELECT child_item_id, company_id,
+               SUBSTRING_INDEX(GROUP_CONCAT(code_segment ORDER BY LENGTH(code_segment), code_segment), ',', 1) AS seg
+          FROM fab_item_bom
+         WHERE deleted_at IS NULL AND code_segment IS NOT NULL AND code_segment <> ''
+         GROUP BY child_item_id, company_id) b
+    ON b.child_item_id = c.id AND b.company_id = c.company_id
+   SET c.short_code = LEFT(UPPER(b.seg), 12)
+ WHERE c.short_code IS NULL AND c.deleted_at IS NULL;

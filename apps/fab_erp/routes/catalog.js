@@ -18,7 +18,7 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { requirePerm, fail } from '../../../core/middleware/requirePerm.js';
 import { pool } from '../../../db.js';
-import { generateCode } from '../services/codegenService.js';
+import { generateCode, orderRowCodes, orderCodePrefix } from '../services/codegenService.js';
 import { setFieldsBulk, resolveFields } from '../services/fieldService.js';
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { catalogSizes, itemUsage, sellableItems } from '../services/catalogPickerService.js';
@@ -133,7 +133,7 @@ router.get('/catalog/items', protect, async (req, res) => {
     // DDL"). Left out here rather than guessed at; the generic query engine
     // would hit the same ER_BAD_FIELD_ERROR if a caller ever asked it for them.
     const [rows] = await pool.query(
-      `SELECT fic.id, fic.name, fic.code, fic.unit, fic.description,
+      `SELECT fic.id, fic.name, fic.code, fic.short_code AS shortCode, fic.unit, fic.description,
               fic.category_id AS categoryId, fic.group_id AS groupId, fic.subgroup_id AS subgroupId,
               fic.hsn_code AS hsnCode, fic.procurement_type AS procurementType,
               fic.lead_time_days AS leadTimeDays, fic.mrp_policy AS mrpPolicy,
@@ -243,6 +243,10 @@ router.post('/catalog/items', protect, requirePerm('fab_erp_items_meta_manage'),
       company_id: cid,
       name: String(item.name).trim(),
       code,
+      // The segment an ORDER ROW of this item carries in its code (parent code
+      // + short code + position). Blank = the initials of the name, derived
+      // at code time (codegenService.shortName), so nothing is stored for it.
+      short_code: item.shortCode ? String(item.shortCode).trim().toUpperCase().slice(0, 12) || null : null,
       unit: item.unit ? String(item.unit).trim() : 'pcs',
       description: item.description ? String(item.description).trim() : null,
       category_id: item.categoryId,
@@ -500,6 +504,25 @@ router.get('/orders/:id/lines', protect, async (req, res) => {
 
     const catalogById = new Map(catalogRows.map((c) => [Number(c.id), c]));
     const builtByLine = new Map(builtRows.map((r) => [Number(r.lineId), Number(r.n)]));
+
+    /*
+     * THE LINE'S ROW CODE — the top row of its structure (SPAN1), written at
+     * deploy or previewed from the same rule before that. The screen shows
+     * this, not the catalog item's code: it names THIS span on THIS order.
+     */
+    const [roots] = await pool.query(
+      `SELECT id, order_line_id AS lineId, code FROM fab_items
+        WHERE company_id = ? AND order_id = ? AND parent_item_id IS NULL
+          AND node_kind = 'structure' AND deleted_at IS NULL`,
+      [cid, orderId],
+    );
+    const preview = roots.some((r) => !r.code) ? await orderRowCodes(cid, orderId) : new Map();
+    const rootCodeByLine = new Map();
+    for (const r of roots) {
+      if (r.lineId == null || rootCodeByLine.has(Number(r.lineId))) continue;
+      rootCodeByLine.set(Number(r.lineId), r.code ?? preview.get(Number(r.id)) ?? null);
+    }
+    const codePrefix = roots.length ? `${await orderCodePrefix(cid, orderId)}-` : null;
     const specByLine = new Map();
     for (const r of specRows) {
       const e = specByLine.get(Number(r.lineId)) ?? { material: null, grade: null, thickness_mm: null };
@@ -517,13 +540,14 @@ router.get('/orders/:id/lines', protect, async (req, res) => {
           categoryName: cat.categoryName, groupName: cat.groupName, subgroupName: cat.subgroupName,
         } : null,
         builtCount: builtByLine.get(Number(l.id)) ?? 0,
+        rootCode: rootCodeByLine.get(Number(l.id)) ?? null,
         material: spec.material,
         grade: spec.grade,
         thicknessMm: spec.thickness_mm,
       };
     });
 
-    return res.json({ rows });
+    return res.json({ rows, codePrefix });
   } catch (err) {
     return fail(res, err);
   }

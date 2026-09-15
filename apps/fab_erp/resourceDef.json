@@ -973,6 +973,7 @@
     "writeFields": [
       "name",
       "code",
+      "short_code",
       "unit",
       "description",
       "category_id",
@@ -990,6 +991,7 @@
       "companyId": "fic.company_id",
       "name": "fic.name",
       "code": "fic.code",
+      "shortCode": "fic.short_code",
       "unit": "fic.unit",
       "description": "fic.description",
       "categoryId": "fic.category_id",
@@ -1013,6 +1015,7 @@
       "companyId": "integer",
       "name": "string",
       "code": "string",
+      "shortCode": "string",
       "unit": "string",
       "description": "string",
       "categoryId": "integer",

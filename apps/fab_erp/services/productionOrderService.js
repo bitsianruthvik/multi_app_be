@@ -29,7 +29,7 @@ import { pool } from '../../../db.js';
 import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
 import { materializeOrderTasks, syncUnstartedTasks, planOrderTasks } from './taskGatingService.js';
-import { generateCode, orderRowCodes, taskCodes } from './codegenService.js';
+import { generateCode, orderRowCodes, taskCodes, pieceCodes } from './codegenService.js';
 
 /**
  * A production order's life, and what moves it.
@@ -417,6 +417,30 @@ async function deployRowsAndTaskCodes(conn, companyId, mo) {
       if (err?.code !== 'ER_DUP_ENTRY') throw err;
       const e = new Error('A BOM row code is already used by another item. Change the BOM row rule in Code Generation and deploy again.');
       e.status = 409; throw e;
+    }
+
+    /*
+     * 2b. PIECE IDENTITIES. Every made row with a quantity above one gets a
+     * name per piece (codegenService.pieceCodes) — the row stays one row and
+     * one task. INSERT IGNORE on (item, seq): a re-deploy after the quantity
+     * grew adds the new pieces and never renumbers the ones already painted
+     * on steel; a quantity that shrank keeps its extra names, like marks do.
+     */
+    if (codes.size) {
+      const [qtys] = await conn.query(
+        `SELECT id, qty, code FROM fab_items WHERE company_id = ? AND id IN (?) AND code IS NOT NULL`,
+        [companyId, [...codes.keys()]],
+      );
+      const pieces = [];
+      for (const r of qtys) {
+        pieceCodes(r.code, r.qty).forEach((code, i) => pieces.push([companyId, mo.salesId, Number(r.id), i + 1, code]));
+      }
+      for (let i = 0; i < pieces.length; i += 500) {
+        await conn.query(
+          `INSERT IGNORE INTO fab_order_pieces (company_id, order_id, item_id, seq, code) VALUES ?`,
+          [pieces.slice(i, i + 500)],
+        );
+      }
     }
   }
 
