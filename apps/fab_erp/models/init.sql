@@ -910,9 +910,13 @@ SET @sql = IF(@col=0,'ALTER TABLE fab_order_lines ADD COLUMN line_type VARCHAR(4
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- span / girder / segment / part — which level of the BOQ this row is.
-SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='level_kind');
-SET @sql = IF(@col=0,'ALTER TABLE fab_items ADD COLUMN level_kind VARCHAR(20) NULL','SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- (Removed 2026-09-15. `fab_items.level_kind` is DROPPED further down, so this
+-- guard re-added it on every replay. That un-guarded the level_kind backfill
+-- below, which then flipped every catalog-linked row with no flow — Span, Line,
+-- bought studs — to node_kind='material' on EACH push-to-prod, and the drop
+-- at the end hid the evidence. Same churn the catalog level_kind add had,
+-- removed 2026-09-11. A fresh database never needs the column: the backfill
+-- only reads it, and a fresh table has no rows to backfill.)
 
 -- Flow allocation, stage 3 (2026-08, see migrations/2026-08-flow-rules.sql).
 -- (line_type, level_kind, code_suffix) -> flow. A DEFAULT is a rule with no suffix.
