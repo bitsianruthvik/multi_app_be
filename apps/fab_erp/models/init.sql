@@ -6553,7 +6553,14 @@ CREATE TABLE IF NOT EXISTS fab_order_pieces (
 -- and the code itself is the identity a re-deploy must never re-mint.
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_pieces' AND COLUMN_NAME='parent_piece_id');
-SET @s = IF(@c=0, 'ALTER TABLE fab_order_pieces ADD COLUMN parent_piece_id INT NULL, ADD KEY idx_fop_parent (parent_piece_id)', 'SELECT 1');
+-- Two statements, not one: TiDB refuses "ADD COLUMN x, ADD KEY (x)" in a single
+-- ALTER ("column does not exist"), and that one error skipped the rest of this
+-- file on 2026-09-16.
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_pieces ADD COLUMN parent_piece_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_pieces' AND INDEX_NAME='idx_fop_parent');
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_pieces ADD KEY idx_fop_parent (parent_piece_id)', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
 SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_pieces' AND INDEX_NAME='uq_fop_code');
