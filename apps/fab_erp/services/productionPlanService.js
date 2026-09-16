@@ -28,6 +28,7 @@ import { onOrderByItem, heldByOrder, procurementForOrder } from './procurementOr
 import { ensureProductionOrder } from './productionOrderService.js';
 import { ensureCuttingOrder } from './blankService.js';
 import { staleProductionOrders } from './deploySignatureService.js';
+import { lineQtyMap } from './orderLineQty.js';
 
 /**
  * EU-9 item 4: a per-call memo so a screen that reads several procurement
@@ -98,6 +99,7 @@ export async function productionPlan(companyId, orderId) {
     pool.query(
       `SELECT i.id, i.parent_item_id AS parentId, i.name, i.qty, i.code, i.flow_id AS flowId,
               COALESCE(i.procurement_type, 'make') AS procurement,
+              i.order_line_id AS orderLineId,
               (bc.id IS NOT NULL) AS isBlank, f.name AS flowName
          FROM fab_items i
          LEFT JOIN fab_item_catalog bc ON bc.id = i.catalog_item_id AND bc.material_form = 'blank'
@@ -138,13 +140,20 @@ export async function productionPlan(companyId, orderId) {
     if (!kids.has(k)) kids.set(k, []);
     kids.get(k).push(r);
   }
+  /*
+   * A row's total across the order: its own qty up through every parent, TIMES
+   * the line's qty. The line multiplier was missing, so a cross girder sold
+   * ×4 showed its web as "×1" with no total while its tasks (correctly) carried
+   * 4 (prod UAT finding 22) — the same figure blankService/procurement use.
+   */
+  const lineQty = await lineQtyMap(pool, companyId, orderId);
   const rolled = (r) => {
     let q = 1;
     for (let cur = r, hop = 0; cur && hop < 64; hop++) {
       q *= Number(cur.qty) || 0;
       cur = cur.parentId != null ? byId.get(Number(cur.parentId)) : null;
     }
-    return q;
+    return q * (r.orderLineId != null ? (Number(lineQty.get(Number(r.orderLineId))) || 1) : 1);
   };
   const ordered = [];
   const walk = (key, depth) => {

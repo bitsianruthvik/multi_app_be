@@ -845,6 +845,66 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     attach(tree);
   }
 
+  /*
+   * SIZES THE ITEM ITSELF STATES, for any rung the recipe left blank.
+   *
+   * "Stiffener Plate 12 × 150" carries its thickness and width on the catalog
+   * item; the structure editor prefilled those when the item was picked by
+   * hand, but a BOM line naming the same item arrived with empty boxes and
+   * the order then failed nesting for "a part without a size" (prod UAT
+   * finding 9). Line-level sizes still win — a recipe that says 12 × 150 ×
+   * 1500 has said more than the item does — the item's own fill only what
+   * the line did not.
+   */
+  const catalogIds = [];
+  const collectCat = (n) => {
+    if (n.bomLineId && n.catalogItemId != null) catalogIds.push(Number(n.catalogItemId));
+    (n.children ?? []).forEach(collectCat);
+  };
+  collectCat(tree);
+  if (catalogIds.length) {
+    const [vals] = await exec.query(
+      `SELECT v.scope_id AS catalogItemId, f.field_key AS k, v.value_num AS n
+         FROM fab_field_values v
+         JOIN fab_fields f ON f.id = v.field_id
+        WHERE v.company_id = ? AND v.scope = 'catalog_item' AND v.scope_id IN (?)
+          AND v.deleted_at IS NULL AND v.value_num IS NOT NULL
+          AND f.field_key IN ('thickness_mm','width_mm','length_mm')`,
+      [companyId, [...new Set(catalogIds)]],
+    );
+    const byCat = new Map();
+    for (const v of vals) {
+      const e = byCat.get(Number(v.catalogItemId)) ?? {};
+      e[v.k] = Number(v.n);
+      byCat.set(Number(v.catalogItemId), e);
+    }
+    // The picker (catalogPickerService) also reads thickness off the catalog
+    // row's own column when no field value states it — same fallback here, so
+    // "12 × 150" in the picker and the prefilled row never disagree.
+    const [cols] = await exec.query(
+      `SELECT id, thickness_mm AS t FROM fab_item_catalog
+        WHERE company_id = ? AND id IN (?) AND thickness_mm IS NOT NULL`,
+      [companyId, [...new Set(catalogIds)]],
+    );
+    for (const c of cols) {
+      const e = byCat.get(Number(c.id)) ?? {};
+      if (e.thickness_mm == null) e.thickness_mm = Number(c.t);
+      byCat.set(Number(c.id), e);
+    }
+    const fill = (n) => {
+      // A bought item's size is the catalogue's business, never the row's.
+      if (n.bomLineId && n.catalogItemId != null && (n.procurementType ?? 'make') === 'make') {
+        const own = byCat.get(Number(n.catalogItemId));
+        if (own) {
+          n.dims = n.dims && typeof n.dims === 'object' ? n.dims : {};
+          for (const [k, v] of Object.entries(own)) if (n.dims[k] == null) n.dims[k] = v;
+        }
+      }
+      (n.children ?? []).forEach(fill);
+    };
+    fill(tree);
+  }
+
   return tree;
 }
 

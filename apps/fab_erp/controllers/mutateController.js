@@ -578,6 +578,18 @@ export async function mutate(req, res) {
       return res.status(409).json({ message });
     }
 
+    if (err.code === 'ER_DATA_TOO_LONG' || err.errno === 1406) {
+      // sqlMessage: Data too long for column 'shortform' at row 1. A value
+      // that does not fit is the caller's to shorten — a 422 that names the
+      // field, not a 500 that says the database is broken (prod UAT finding 1).
+      const column = String(err.sqlMessage ?? '').match(/for column '([^']+)'/)?.[1];
+      const message = column
+        ? `"${column.replace(/_/g, ' ')}" is too long for this record — shorten it and try again.`
+        : 'One of the values is too long for this record — shorten it and try again.';
+      logger.warn({ resource, op, userId: user?.id, column }, 'fab_erp mutate: value too long');
+      return res.status(422).json({ message, column: column ?? null });
+    }
+
     logger.error({ err, resource, op, userId: user?.id }, 'fab_erp mutate: DB error');
     return res.status(500).json({ message: 'Database write failed. Please try again.' });
   }

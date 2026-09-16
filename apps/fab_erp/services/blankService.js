@@ -737,7 +737,9 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
           { thickness: b.thickness, grade: b.grade, material: b.material },
           { thickness: info.thickness, grade: info.grade, material: info.material },
         )) {
-          problems.push(`${label}: ${b.code} is ${c.partValue} but plate ${info.code ?? info.catalogItemId} `
+          // Named by the SHORT handle the cutting-plan sheet uses (`ref`), so a
+          // planner can find the row without mapping the full code back by eye.
+          problems.push(`${label}: ${b.ref ?? b.code} is ${c.partValue} but plate ${info.code ?? info.catalogItemId} `
             + `is ${c.plateValue} (${c.axis}).`);
         }
         rows.push({ key, length: b.length, width: b.width, qty });
@@ -775,13 +777,13 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
       const placed = newCovered.get(b.key) ?? 0;
       const was = oldCovered.get(b.key) ?? 0;
       if (placed > b.qty + EPS) {
-        problems.push(`${b.code}: this plan nests ${placed} of it but only ${b.qty} are needed `
+        problems.push(`${b.ref ?? b.code}: this plan nests ${placed} of it but only ${b.qty} are needed `
           + '(demand already includes line quantity).');
       } else if (was - placed > EPS && b.qty - placed > EPS) {
         // Was covered by MORE than this plan covers, and is still short of
         // demand either way — the signature of "un-ticked" a sheet rather than
         // a deliberate reduction in what the order needs.
-        problems.push(`${b.code}: was cut ${was} of ${b.qty}; this plan only covers ${placed}. `
+        problems.push(`${b.ref ?? b.code}: was cut ${was} of ${b.qty}; this plan only covers ${placed}. `
           + 'A part row is atomic to one plate — accept every sheet it is split across, or none.');
       }
     }

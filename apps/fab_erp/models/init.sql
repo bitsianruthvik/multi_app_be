@@ -1564,6 +1564,20 @@ UPDATE fab_item_categories SET shortform = LEFT(code, 10) WHERE shortform IS NUL
 UPDATE fab_item_groups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
 UPDATE fab_item_subgroups SET shortform = LEFT(code, 10) WHERE shortform IS NULL;
 
+-- 2026-09-16 (prod UAT finding 1): 10 characters was too short for a
+-- sub-group handle like UATPG-PARTS and the only symptom was a generic
+-- "Database write failed". Widened to 20 — additive (never narrows), guarded
+-- on the current length so it runs once.
+SET @len = (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='shortform');
+SET @sql = IF(@len < 20,'ALTER TABLE fab_item_categories MODIFY COLUMN shortform VARCHAR(20) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @len = (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_groups' AND COLUMN_NAME='shortform');
+SET @sql = IF(@len < 20,'ALTER TABLE fab_item_groups MODIFY COLUMN shortform VARCHAR(20) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @len = (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_subgroups' AND COLUMN_NAME='shortform');
+SET @sql = IF(@len < 20,'ALTER TABLE fab_item_subgroups MODIFY COLUMN shortform VARCHAR(20) NULL','SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- ===== STOCK PIECE REDESIGN (2026-07-10) =====
 --
 -- Replaces the batch-level `fab_item_batches` / `fab_stock_balances` model
