@@ -54,7 +54,22 @@ const HEADERS = [
 ];
 
 export async function exportPlan(companyId, orderId, opts = {}) {
-  const plan = await blankPlan(companyId, orderId, opts);
+  /*
+   * `effort: 'template'` — THE BLANK LIST WITH NO SHEETS, for a planner who
+   * nests by hand from the start (never runs the packer): every blank the
+   * order needs, one row each, Nest and Plate code left empty to fill in.
+   * Rides on the existing `effort` query so the download route is untouched;
+   * anything else packs (or reads the saved plan) as before.
+   */
+  const plan = opts.effort === 'template'
+    ? await (async () => {
+      const { orderNumber, blanks } = await orderBlanks(companyId, orderId);
+      return { orderNumber, blanks, nests: blanks.map((b) => ({
+        nestNo: '', plateCode: '', thickness: '', width: '', length: '',
+        items: [{ key: b.key, qty: b.qty }],
+      })) };
+    })()
+    : await blankPlan(companyId, orderId, opts);
 
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet(SHEET);
@@ -80,7 +95,7 @@ export async function exportPlan(companyId, orderId, opts = {}) {
         n.plateCode ?? '',
         b?.ref ?? '',
         it.qty,
-        `${n.thickness} x ${n.width} x ${n.length}`,
+        n.thickness === '' ? '' : `${n.thickness} x ${n.width} x ${n.length}`,
         b ? `${b.thickness} x ${b.width} x ${b.length}` : '',
         b?.code ?? '',
       ]);

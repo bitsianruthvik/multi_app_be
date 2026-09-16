@@ -767,7 +767,7 @@ const STAGES = [
         summary: production.total ? `${production.deployed}/${production.total} deployed` : null,
         detail: [
           // Says what to press: "Buy 6 items" left people looking for a Buy button (UAT 24).
-          proc.stillShort > 0 ? `${n(proc.stillShort, 'item')} to buy — press "Hold stock and request the rest"` : null,
+          proc.stillShort > 0 ? `${n(proc.stillShort, 'item')} to buy — press "Hold stock and create the purchase order"` : null,
           production.stale?.length
             ? `${production.stale.join(', ')} changed since deploy — re-deploy`
             : null,

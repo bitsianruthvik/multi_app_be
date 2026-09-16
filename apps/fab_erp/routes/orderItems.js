@@ -24,6 +24,7 @@ import { duplicateSubtree } from '../services/bomService.js';
 import { syncFlowsFromBom, setItemFlows, itemFlows } from '../services/orderFlowService.js';
 import { blankPlan } from '../services/blankPlanService.js';
 import { exportPlan, importPlan } from '../services/blankSheetService.js';
+import { exportLineStructure, importLineStructure } from '../services/structureSheetService.js';
 import { acceptNestingPlan } from '../services/blankService.js';
 import { refreshOrderStage, setWizardStep, orderReadiness } from '../services/orderReadinessService.js';
 import { listRevisions } from '../services/orderRevisionService.js';
@@ -205,6 +206,65 @@ router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_proje
       });
       return res.json({ ok: true, ...out, fromSheet: { rows: read.rows, sheets: read.sheets, short: read.short } });
     } catch (err) {
+      return fail(res, err);
+    } finally {
+      if (req.file?.path) fs.unlink(req.file.path, () => {});
+    }
+  });
+
+// ── One line's structure as a sheet, and back (the wizard's Excel round trip) ──
+
+/**
+ * GET /orders/:orderId/structure/sheet?orderLineId=<id> — one line's tree
+ * as an editable sheet. Download, edit in Excel, upload to the POST below.
+ *
+ * Not templates.js's `/structure/export`: that one is the whole order with a
+ * Level column and REPLACES on import. This one carries Row ids, so what
+ * comes back is applied as a DIFF — the same `applyTree` the structure
+ * editor's Save changes uses. Rows keep their ids, and so their sizes, the
+ * plate they were nested onto and their tasks.
+ */
+router.get('/orders/:orderId/structure/sheet', protect, async (req, res) => {
+  try {
+    const cid = req.user?.companyId ?? req.user?.company_id;
+    const orderLineId = Number(req.query?.orderLineId);
+    if (!orderLineId) return res.status(400).json({ message: 'orderLineId is required.' });
+    const { buffer, filename } = await exportLineStructure(cid, Number(req.params.orderId), orderLineId);
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(Buffer.from(buffer));
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+/**
+ * POST /orders/:orderId/structure/sheet — apply an edited sheet as a diff.
+ *
+ * Multipart: `excel_file`, plus `orderLineId` (body or query) and an optional
+ * `revisionReason` (required by applyTree once the order is no longer a
+ * draft). The whole sheet is validated BEFORE anything is written: a 422
+ * carries `detail.problems` naming every bad row ("Row 9: …") and nothing
+ * has changed. Same permission as saving the structure in the editor.
+ */
+router.post('/orders/:orderId/structure/sheet', protect, requirePerm('fab_erp_projects_manage'),
+  upload.single('excel_file'), async (req, res) => {
+    try {
+      // Disk-storage multer (see `/blanks/sheet` above) — read the temp file back.
+      if (!req.file?.path) return res.status(400).json({ message: 'No file was uploaded.' });
+      const cid = req.user?.companyId ?? req.user?.company_id;
+      const orderId = Number(req.params.orderId);
+      const orderLineId = Number(req.body?.orderLineId ?? req.query?.orderLineId);
+      if (!orderLineId) return res.status(400).json({ message: 'orderLineId is required.' });
+      const revisionReason = String(req.body?.revisionReason ?? '').trim() || null;
+      const buffer = await fs.promises.readFile(req.file.path);
+      const result = await importLineStructure(cid, orderId, orderLineId, buffer, {
+        revisionReason, userId: req.user?.id ?? null,
+      });
+      return res.json({ ok: true, ...result, readiness: await refreshOrderStage(cid, orderId) });
+    } catch (err) {
+      // `fail` forwards status, code and detail — a 422's problems list rides along.
       return fail(res, err);
     } finally {
       if (req.file?.path) fs.unlink(req.file.path, () => {});
