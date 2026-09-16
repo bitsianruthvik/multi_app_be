@@ -45,8 +45,9 @@
 
 import { pool } from '../../../db.js';
 import { NOT_A_BLANK, isMadeChildlessLeaf } from './blankPredicate.js';
-import { missingFieldsForOrder } from './itemFieldService.js';
+import { missingFieldsForOrder, resolveItemFields } from './itemFieldService.js';
 import { isDimension } from './fieldDeriveService.js';
+import { staleProductionOrders } from './deploySignatureService.js';
 import { orderShortfall } from './procurementService.js';
 import { procurementForOrder, onOrderByItem } from './procurementOrderService.js';
 import { orderStageApplicability } from './stageApplicabilityService.js';
@@ -295,12 +296,17 @@ async function summariseProduction(companyId, orderId) {
   const missing = [needCut && !cutting ? 'cutting' : null, needFab && !fabrication ? 'fabrication' : null]
     .filter(Boolean);
   const deployed = mos.filter((m) => m.status !== 'draft').length;
+  // A deployed order whose BOM moved since is not "done": the shop is working
+  // to a plan that no longer matches what was sold.
+  const stale = deployed ? (await staleProductionOrders(companyId, orderId)).stale : [];
   return {
-    state: !needCut && !needFab ? 'done' : missing.length === 0 ? 'done' : mos.length ? 'partial' : 'todo',
+    state: stale.length ? 'partial'
+      : !needCut && !needFab ? 'done' : missing.length === 0 ? 'done' : mos.length ? 'partial' : 'todo',
     missing,
     count: mos.length,
     total: Number(needCut) + Number(needFab),
     deployed,
+    stale,
   };
 }
 
@@ -417,6 +423,43 @@ async function countNesting(companyId, orderId) {
   return { parts: Number(row?.parts) || 0, nested: Number(row?.nested) || 0 };
 }
 
+/**
+ * Made leaf parts with no rectangle yet — thickness, width or length missing.
+ *
+ * Such a part cannot become a blank (blankService skips it with "no size on it
+ * yet"), so it can never be nested, so the order can never be confirmed. That
+ * used to surface only on the NESTING step, as "1 part not on a sheet yet",
+ * which is true and useless: nothing on that step can fix it. It belongs to
+ * Line items, named, where the size is typed. The same resolver blankService
+ * uses, so the two never disagree about which parts have a size.
+ */
+async function countSizeless(companyId, orderId) {
+  const [parts] = await pool.query(
+    `SELECT p.id, p.name FROM fab_items p
+      WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
+        AND p.is_leaf = 1 AND p.node_kind = 'structure'
+        AND ${isMadeChildlessLeaf('p')}
+      ORDER BY p.id`,
+    [companyId, orderId],
+  );
+  if (!parts.length) return { count: 0, names: [] };
+  const nums = await resolveItemFields(companyId, parts.map((p) => Number(p.id)));
+  const names = [];
+  for (const p of parts) {
+    const f = nums.get(Number(p.id)) ?? {};
+    const ok = ['thickness_mm', 'width_mm', 'length_mm'].every((k) => Number.isFinite(Number(f[k])) && Number(f[k]) > 0);
+    if (!ok) names.push(p.name);
+  }
+  return { count: names.length, names };
+}
+
+/** "Stiffener Plate 16 × 150", "A, B and 3 more" — for a one-line detail. */
+function nameList(names, max = 2) {
+  const shown = names.slice(0, max).join(', ');
+  const rest = names.length - max;
+  return rest > 0 ? `${shown} and ${n(rest, 'more', 'more')}` : shown;
+}
+
 // ── flows ────────────────────────────────────────────────────────────────────
 
 /**
@@ -489,6 +532,7 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     nest, nestIntegrity, cuttingOrderId, cut,
     proc, production,
     fields,
+    sizeless,
   ] = await Promise.all([
     needLines ? countLines(companyId, orderId) : null,
     needLines ? countTree(companyId, orderId) : null,
@@ -524,6 +568,9 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     needFields ? missingFieldsForOrder(companyId, orderId).catch(() => ({
       itemsChecked: 0, itemsShort: 0, missingValues: [], unknownFields: [], unusableFields: [], noFormula: [],
     })) : null,
+    // Both the Line items stage (where it is fixed) and Nesting (where it
+    // shows) read it; a resolver failure must not take the strip down.
+    (needLines || needNesting) ? countSizeless(companyId, orderId).catch(() => ({ count: 0, names: [] })) : null,
   ]);
 
   const flowState = flows ? summariseFlows(flows) : null;
@@ -554,6 +601,7 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     nest, nestBlocking, piecesShort, cuttingOrder: cuttingOrderId, cut,
     proc, production,
     fields, shortOnDims, shortOnRest,
+    sizeless: sizeless ?? { count: 0, names: [] },
   };
 }
 
@@ -571,10 +619,10 @@ const STAGES = [
      */
     label: 'Line items',
     compute(ctx) {
-      const { lines, tree, flowState, shortOnDims } = ctx;
+      const { lines, tree, flowState, shortOnDims, sizeless } = ctx;
       const state = lines.total === 0 ? 'todo'
         : (lines.withoutType > 0 || tree.total === 0
-           || tree.parts === 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial'
+           || tree.parts === 0 || sizeless.count > 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial'
         : 'done';
       return {
         state,
@@ -589,6 +637,10 @@ const STAGES = [
             ? `${n(lines.withoutType, 'line')} without a structure type`
             : tree.total === 0
               ? `${n(lines.total, 'line')} · nothing built yet`
+              // Named: "1 part without a size — Stiffener Plate 16 × 150" is a
+              // row to go and find; "1 part without a size" is a search.
+              : sizeless.count > 0
+                ? `${n(sizeless.count, 'part')} without a size — ${nameList(sizeless.names)}`
               : shortOnDims > 0
                 ? `${n(shortOnDims, 'part')} without a size`
                 : flowState.missing > 0
@@ -601,7 +653,7 @@ const STAGES = [
     key: 'nesting',
     label: 'Nesting',
     compute(ctx) {
-      const { nest, cuttingOrder, nestBlocking, piecesShort, cut } = ctx;
+      const { nest, cuttingOrder, nestBlocking, piecesShort, cut, sizeless } = ctx;
       /**
        * Every part having material was never enough to call this done.
        * `nested >= parts` only counts links; it says nothing about whether the
@@ -644,6 +696,9 @@ const STAGES = [
         summary: cuttingOrder && Number(cut?.blanks) ? `${n(cut.blanks, 'blank')} · ${n(cut.sheets, 'sheet')}` : null,
         detail: nest.parts === 0
           ? 'Nothing to nest yet'
+          // A part with no rectangle cannot be nested from HERE — say where.
+          : nest.nested < nest.parts && sizeless.count > 0 && nest.parts - nest.nested <= sizeless.count
+            ? `${n(sizeless.count, 'part')} cannot be nested — no size yet (Line items)`
           : nest.nested < nest.parts
             ? `${n(nest.parts - nest.nested, 'part')} not on a sheet yet`
             : piecesShort.length > 0
@@ -705,9 +760,16 @@ const STAGES = [
         state,
         count: production.count,
         total: production.total,
+        /** How many production orders are on the floor — the structure editor warns before editing under them. */
+        deployed: production.deployed,
+        /** Deployed orders whose BOM changed since (order numbers) — the plan screen offers Re-deploy. */
+        stale: production.stale ?? [],
         summary: production.total ? `${production.deployed}/${production.total} deployed` : null,
         detail: [
           proc.stillShort > 0 ? `Buy ${n(proc.stillShort, 'item')}` : null,
+          production.stale?.length
+            ? `${production.stale.join(', ')} changed since deploy — re-deploy`
+            : null,
           production.missing.length
             ? `no ${production.missing.join(' or ')} order yet`
             : production.total
@@ -863,11 +925,22 @@ export async function orderReadiness(companyId, orderId, { only, procCtx } = {})
    * empty. So once a stage is unfinished, every later one (short of one that
    * genuinely does not apply) is `pending` — unreached, unsatisfied, and the
    * wizard refuses to open it. `optional` stages never block the ones after.
+   *
+   * ONLY A STAGE NOBODY HAS TOUCHED IS PENDING. The order's tabs let someone
+   * nest, draft and deploy without walking the wizard in order, and they do:
+   * a prod UAT (2026-09-15) had both production orders deployed while one
+   * part still had no size, and the strip read "Production 2/2 deployed" in
+   * one line and "Production — After Nesting" in the next, with the wizard
+   * refusing to open a step that plainly had work on it. A stage with real
+   * progress keeps its own state and detail; `pending` is reserved for a
+   * `todo` stage (or a `done` that is only "nothing to do" on an untouched
+   * order — count 0), which is the case the rule was written for.
    */
   let blockedBy = null;
   for (const s of stages) {
     if (typeof s.detail === 'string' && s.detail) s.detail = s.detail[0].toUpperCase() + s.detail.slice(1);
-    if (blockedBy && s.state !== 'not_applicable' && s.applicability !== 'optional') {
+    const untouched = s.state === 'todo' || (s.state === 'done' && !(Number(s.count) > 0));
+    if (blockedBy && untouched && s.state !== 'not_applicable' && s.applicability !== 'optional') {
       s.state = 'pending';
       s.detail = `After ${blockedBy.label}`;
     }

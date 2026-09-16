@@ -27,6 +27,7 @@ import { orderShortfall } from './procurementService.js';
 import { onOrderByItem, heldByOrder, procurementForOrder } from './procurementOrderService.js';
 import { ensureProductionOrder } from './productionOrderService.js';
 import { ensureCuttingOrder } from './blankService.js';
+import { staleProductionOrders } from './deploySignatureService.js';
 
 /**
  * EU-9 item 4: a per-call memo so a screen that reads several procurement
@@ -314,6 +315,16 @@ export async function productionPlan(companyId, orderId) {
   })));
   pending.forEach((x, i) => { x.step.taskCode = previews[i]; x.step.taskCodeSaved = false; });
   allSteps.filter((x) => x.step.taskCodeSaved === undefined).forEach((x) => { x.step.taskCodeSaved = true; });
+
+  /*
+   * STALE = deployed, and the BOM under it has moved since (deploySignatureService).
+   * The screen turns this into a "changed since deploy" flag and a Re-deploy
+   * button on any order status — a revision is not the only way a deployed
+   * order's BOM changes; a length typed on the Line items step is another.
+   */
+  const stale = await staleProductionOrders(companyId, orderId);
+  if (mos.cutting) mos.cutting.stale = stale.cutting;
+  if (mos.fabrication) mos.fabrication.stale = stale.fabrication;
 
   const section = (list, mo) => ({
     productionOrder: mo,

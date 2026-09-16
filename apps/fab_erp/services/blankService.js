@@ -1036,10 +1036,34 @@ export async function acceptNestingPlan(companyId, orderId, plan = {}, existingC
     }
 
     if (owned) await conn.commit();
+
+    /*
+     * A PLAN ACCEPTED ONTO A CUTTING ORDER ALREADY ON THE FLOOR is a re-deploy
+     * of that order: the new blank rows and their cutting tasks were just
+     * claimed above, but their task codes and the order's deploy signature
+     * are written by `deployProductionOrder` — without this the order would
+     * read "changed since deploy" the moment the upload landed, and the late
+     * blank's task would have no code. Runs after commit, on its own locks.
+     * Dynamic import: productionOrderService ⇄ blankService is otherwise a
+     * cycle. A failure here must not un-accept the plan; it is reported.
+     */
+    let cuttingRedeployed = false;
+    if (owned && po.status && po.status !== 'draft') {
+      try {
+        const { deployProductionOrder } = await import('./productionOrderService.js');
+        await deployProductionOrder(companyId, po.id, { redeploy: true });
+        cuttingRedeployed = true;
+      } catch (err) {
+        logger.warn({ companyId, orderId, cuttingOrderId: po.id, err: err?.message },
+          'fab_erp: plan accepted but the deployed cutting order could not be re-deployed');
+      }
+    }
+
     const out = {
       cuttingOrderId: po.id,
       cuttingOrderNumber: po.orderNumber,
       cuttingOrderCreated: po.created,
+      cuttingRedeployed,
       blanks: mat.blanks.length,
       blanksCreated: mat.created,
       blanksRetired: mat.retired ?? 0,

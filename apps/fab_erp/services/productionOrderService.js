@@ -30,6 +30,7 @@ import { NOT_A_BLANK, IS_A_BLANK } from './blankPredicate.js';
 import { DEFAULT_PROCUREMENT } from './procurementService.js';
 import { materializeOrderTasks, syncUnstartedTasks, planOrderTasks } from './taskGatingService.js';
 import { generateCode, orderRowCodes, taskCodes, orderPieceCodes } from './codegenService.js';
+import { bomSignature } from './deploySignatureService.js';
 
 /**
  * A production order's life, and what moves it.
@@ -372,12 +373,18 @@ export async function deployProductionOrder(companyId, productionOrderId, opts =
       // already-active or -done MO leaves its status alone; rollUpProductionOrder
       // below recomputes it honestly from the tasks it owns now, which may
       // still be `in_progress`/`done` even after new work was added.
-      if (mo.status === MO_STATUS.DRAFT) {
-        await conn.query(
-          `UPDATE fab_orders SET status = ? WHERE id = ? AND company_id = ?`,
-          [MO_STATUS.WAITING, mo.id, companyId],
-        );
-      }
+      //
+      // Either way the BOM signature is stamped: this is what the plan screen
+      // and readiness compare against to say "changed since deploy". Computed
+      // under the same lock, after every write above, so it describes exactly
+      // what the shop received.
+      const signature = await bomSignature(conn, companyId, mo.salesId, mo.purpose);
+      await conn.query(
+        `UPDATE fab_orders
+            SET status = ?, deployed_at = NOW(), deployed_signature = ?
+          WHERE id = ? AND company_id = ?`,
+        [mo.status === MO_STATUS.DRAFT ? MO_STATUS.WAITING : mo.status, signature, mo.id, companyId],
+      );
       await conn.commit();
       break;
     } catch (err) {

@@ -3444,6 +3444,19 @@ SET @sql = IF(@idx=0,
   'ALTER TABLE fab_orders ADD KEY idx_fo_source_purpose (source_order_id, order_type, mo_purpose)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- When a production order went to the floor, and a hash of the BOM it went
+-- with (deploySignatureService). The plan screen compares the hash with the
+-- BOM as it stands now to say "changed since deploy — re-deploy"; a timestamp
+-- could not, because weight roll-ups and marks bump fab_items.updated_at too.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='deployed_at');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_orders ADD COLUMN deployed_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_orders' AND COLUMN_NAME='deployed_signature');
+SET @sql = IF(@col=0, 'ALTER TABLE fab_orders ADD COLUMN deployed_signature VARCHAR(40) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- THE ORDER OF THE STRUCTURE IS A DECISION, so it needs somewhere to live.
 -- Rows were read back in `id` order, which is the order they happened to be
 -- inserted in. That is fine until somebody rearranges the tree — and it is not
