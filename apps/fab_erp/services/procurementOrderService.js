@@ -126,12 +126,17 @@ export async function requestProcurement(companyId, orderId, lines, { createdBy 
 
     // 2. the open request, if there is one — its own lines are about to be
     //    rewritten, so they do not count as on order.
+    // A DRAFT is what the sales-order flow raises now (2026-09-17): tender,
+    // quotations and the supplier are a procurement flow of their own, with
+    // its own roles, and none of it belongs on the order wizard. An older
+    // `requested` one is still recognised so it keeps being rewritten in
+    // place rather than doubled.
     const [[open]] = await conn.query(
       `SELECT id, order_number FROM fab_orders
         WHERE company_id = ? AND source_order_id = ? AND order_type = 'purchase'
-          AND status = ? AND deleted_at IS NULL
+          AND status IN (?, ?) AND deleted_at IS NULL
         ORDER BY id LIMIT 1 FOR UPDATE`,
-      [companyId, orderId, PO_STATUS.REQUESTED],
+      [companyId, orderId, PO_STATUS.DRAFT, PO_STATUS.REQUESTED],
     );
     const onOrder = await onOrderByItem(companyId, orderId, conn, { excludeOrderId: open?.id ?? null });
 
@@ -162,8 +167,8 @@ export async function requestProcurement(companyId, orderId, lines, { createdBy 
            (company_id, order_number, order_type, status, supplier_id, source_order_id,
             plant_id, required_date, created_by, notes)
          VALUES (?, ?, 'purchase', ?, NULL, ?, ?, ?, ?, ?)`,
-        [companyId, orderNumber, PO_STATUS.REQUESTED, orderId, sales.plant_id ?? null,
-          sales.required_date ?? null, createdBy, `Requested for ${sales.order_number}`],
+        [companyId, orderNumber, PO_STATUS.DRAFT, orderId, sales.plant_id ?? null,
+          sales.required_date ?? null, createdBy, `Draft purchase order for ${sales.order_number}`],
       );
       request = { id: ins.insertId, orderNumber };
     }
