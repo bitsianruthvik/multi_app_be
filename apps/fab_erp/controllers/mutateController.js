@@ -158,7 +158,67 @@ const DELETE_HOOKS = {
       throw e;
     }
   },
+
+  /**
+   * A flow step holds its operation by id, and the operation is where the
+   * step's time formula, setup and default machine live. Deleting an operation
+   * used to just flip its `deleted_at`: every step that used it stayed in its
+   * flow, screens that join by id kept showing the name, and materialization
+   * — which only loads live operations — turned the step into a task with no
+   * formula and so no duration. Refuse while any flow that still exists uses
+   * it, active or not: an inactive flow can still be on BOM rows, and can be
+   * switched back on.
+   */
+  fabErpOperation: async (conn, companyId, id) => {
+    const [flows] = await conn.query(
+      `SELECT DISTINCT f.code, f.name
+         FROM fab_operation_flow_steps s
+         JOIN fab_operation_flows f ON f.id = s.flow_id AND f.company_id = s.company_id AND f.deleted_at IS NULL
+        WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL
+        ORDER BY f.code`,
+      [companyId, id],
+    );
+    if (!flows.length) return;
+    const names = flows.map((f) => f.code || f.name);
+    const e = new Error(
+      `This operation is used by ${flows.length} flow${flows.length === 1 ? '' : 's'} (${names.join(', ')}). `
+      + 'Remove it from those flows first.',
+    );
+    e.status = 409;
+    e.code = 'OPERATION_IN_FLOW';
+    e.detail = { flows: names };
+    throw e;
+  },
 };
+
+/**
+ * A flow step must point at an operation that exists, in this company.
+ *
+ * The step's `operation_id` is a plain INT with no foreign key, so without
+ * this a step could be saved against a deleted operation, another company's
+ * operation, or nothing at all — and would only surface later as a task with
+ * no duration.
+ */
+async function assertStepOperation(resource, op, filteredPayload, companyId) {
+  if (resource !== 'fabErpOperationFlowStep') return;
+  const touches = Object.prototype.hasOwnProperty.call(filteredPayload, 'operation_id');
+  if (op === 'update' && !touches) return;
+  const opId = Number(filteredPayload.operation_id);
+  if (!Number.isInteger(opId) || opId <= 0) {
+    const e = new Error('A flow step needs an operation.');
+    e.status = 422; e.code = 'STEP_OPERATION_REQUIRED';
+    throw e;
+  }
+  const [[row]] = await pool.query(
+    'SELECT id FROM fab_operations WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1',
+    [opId, companyId],
+  );
+  if (!row) {
+    const e = new Error('That operation no longer exists. Pick another one.');
+    e.status = 422; e.code = 'STEP_OPERATION_MISSING';
+    throw e;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // EU-B3: Consumption-gate helpers
@@ -423,6 +483,15 @@ export async function mutate(req, res) {
         message: `Missing required field${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}.`,
         missingFields: missing,
       });
+    }
+  }
+
+  // ── 6a. Reference checks ──────────────────────────────────────────────────
+  if (op === 'insert' || op === 'update') {
+    try {
+      await assertStepOperation(resource, op, filteredPayload, companyId);
+    } catch (refErr) {
+      return fail(res, refErr);
     }
   }
 

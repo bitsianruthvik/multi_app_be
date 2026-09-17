@@ -685,6 +685,7 @@
       "updatedAt": "fofs.updated_at",
       "operationName": "fop_ofs.name",
       "operationCode": "fop_ofs.code",
+      "operationDeletedAt": "fop_ofs.deleted_at",
       "resourceTypeName": "frt_ofs.name",
       "paramsJson": "fofs.params_json"
     },
@@ -701,6 +702,7 @@
       "updatedAt": "datetime",
       "operationName": "string",
       "operationCode": "string",
+      "operationDeletedAt": "datetime",
       "resourceTypeName": "string",
       "paramsJson": "string"
     },
@@ -711,7 +713,8 @@
         "on": "fofs.operation_id = fop_ofs.id",
         "fields": [
           "operationName",
-          "operationCode"
+          "operationCode",
+          "operationDeletedAt"
         ]
       },
       "resourceType": {
