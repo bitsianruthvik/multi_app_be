@@ -522,9 +522,13 @@ CROSS JOIN (
   UNION ALL SELECT 'pack', 'Wrapping Material', 'wrap'
 ) v
 WHERE cat.code = v.cat_code AND cat.is_system = 1 AND cat.deleted_at IS NULL
+  -- A RETIRED SYSTEM GROUP STAYS RETIRED (2026-09-17): the guard used to look
+  -- only at live rows, so a group somebody deliberately removed was re-seeded
+  -- on the next push — and uq_fab_item_groups (company, category, code) does
+  -- not care about deleted_at, so the re-seed failed and stopped this file.
   AND NOT EXISTS (
     SELECT 1 FROM fab_item_groups g
-    WHERE g.company_id = cat.company_id AND g.category_id = cat.id AND g.code = v.code AND g.deleted_at IS NULL
+    WHERE g.company_id = cat.company_id AND g.category_id = cat.id AND g.code = v.code
   );
 
 -- 3. Sub-groups: join back to the groups just inserted, per company
@@ -552,9 +556,10 @@ CROSS JOIN (
   UNION ALL SELECT 'bolt', 'Machine Screws', 'msc'
 ) v
 WHERE grp.code = v.grp_code AND grp.is_system = 1 AND grp.deleted_at IS NULL
+  -- Same rule as the groups above: a retired sub-group is not re-seeded.
   AND NOT EXISTS (
     SELECT 1 FROM fab_item_subgroups sg
-    WHERE sg.company_id = grp.company_id AND sg.group_id = grp.id AND sg.code = v.code AND sg.deleted_at IS NULL
+    WHERE sg.company_id = grp.company_id AND sg.group_id = grp.id AND sg.code = v.code
   );
 
 -- ===== ALTER: ADD NEW COLUMNS (MySQL 8.0-safe guards) =====
