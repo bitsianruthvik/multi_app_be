@@ -138,7 +138,10 @@ router.post("/base_resource", async (req, res) => {
 
         return res.json({ success: true, data: rows });
       } catch (qErr) {
-        logger.error("Query failed in base_resource:", qErr);
+        // The error itself, and which resource — `logger.error("…:", qErr)`
+        // dropped both (pino treats the second argument as interpolation), so
+        // a failing catalog query left nothing but the words "Query failed".
+        logger.error({ err: qErr, resource, orderBy, pagination, sqlMessage: qErr?.sqlMessage }, 'Query failed in base_resource');
         return res.json({
           success: false,
           error: qErr.message || String(qErr),
