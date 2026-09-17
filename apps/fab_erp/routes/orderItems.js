@@ -24,6 +24,7 @@ import { duplicateSubtree } from '../services/bomService.js';
 import { syncFlowsFromBom, setItemFlows, itemFlows } from '../services/orderFlowService.js';
 import { blankPlan } from '../services/blankPlanService.js';
 import { exportPlan, importPlan } from '../services/blankSheetService.js';
+import { nestDxfFile, nestsDxfZip } from '../services/dxfService.js';
 import { exportLineStructure, importLineStructure } from '../services/structureSheetService.js';
 import { acceptNestingPlan } from '../services/blankService.js';
 import { refreshOrderStage, setWizardStep, orderReadiness } from '../services/orderReadinessService.js';
@@ -211,6 +212,42 @@ router.post('/orders/:orderId/blanks/sheet', protect, requirePerm('fab_erp_proje
       if (req.file?.path) fs.unlink(req.file.path, () => {});
     }
   });
+
+/**
+ * THE SHEET AS A DXF — what the CNC opens.
+ *
+ * `GET /orders/:orderId/nests/dxf.zip`          every accepted sheet, zipped
+ * `GET /orders/:orderId/nests/:nestNo/dxf`      one accepted sheet
+ *
+ * Accepted sheets only (dxfService reads the saved plan, never a fresh pack):
+ * a file a machine cuts from must be the arrangement somebody accepted.
+ * Reading writes nothing, so it needs only the permission to look.
+ */
+router.get('/orders/:orderId/nests/dxf.zip', protect, async (req, res) => {
+  try {
+    const { buffer, filename } = await nestsDxfZip(
+      (req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId),
+    );
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(buffer);
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+router.get('/orders/:orderId/nests/:nestNo/dxf', protect, async (req, res) => {
+  try {
+    const { dxf, filename } = await nestDxfFile(
+      (req.user?.companyId ?? req.user?.company_id), Number(req.params.orderId), String(req.params.nestNo),
+    );
+    res.setHeader('Content-Type', 'application/dxf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(dxf);
+  } catch (err) {
+    return fail(res, err);
+  }
+});
 
 // ── One line's structure as a sheet, and back (the wizard's Excel round trip) ──
 

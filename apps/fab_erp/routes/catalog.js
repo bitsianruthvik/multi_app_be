@@ -7,9 +7,12 @@
  * pattern (a fresh router mounted alongside the others in `app.js`) already
  * exists for the planner/procurement/actuals routers.
  *
- *   GET    /catalog/items              — server-side list, sizes + derived weight inline
+ *   GET    /catalog/items              — server-side list, sizes + derived weight inline; size-aware `q`
+ *   GET    /catalog/items/facets       — item counts per category/group/sub-group/form/material/grade
  *   POST   /catalog/items              — create an item AND its field values, one transaction
- *   GET    /catalog/items/:id/usage    — how many BOMs/orders reference it (for the delete dialog)
+ *   POST   /catalog/items/bulk         — one patch (taxonomy/procurement/material/grade) over many items
+ *   PATCH  /catalog/items/:id/fields   — inline thickness/width/length edit from the grid
+ *   GET    /catalog/items/:id/usage    — how many BOMs/orders reference it, and up to 10 of each by name
  *   DELETE /taxonomy/:level/:id        — refuses (409 + count) if any item still references it
  *   GET    /orders/:id/lines           — a line's row, built-count and spec, batched for every line
  */
@@ -21,7 +24,11 @@ import { pool } from '../../../db.js';
 import { generateCode, orderRowCodeRanges, orderCodePrefix } from '../services/codegenService.js';
 import { setFieldsBulk, resolveFields } from '../services/fieldService.js';
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
-import { catalogSizes, itemUsage, sellableItems } from '../services/catalogPickerService.js';
+import { catalogSizes, sellableItems } from '../services/catalogPickerService.js';
+import {
+  parseCatalogSearch, searchClauses, textFieldClause, catalogFacets, itemUsageDetail,
+  bulkUpdateCatalogItems, patchCatalogItemSizes,
+} from '../services/catalogItemsService.js';
 
 const router = Router();
 const companyId = (req) => req.user?.companyId ?? req.user?.company_id;
@@ -71,9 +78,23 @@ router.get('/catalog/items', protect, async (req, res) => {
 
     const where = ['fic.company_id = ?', 'fic.deleted_at IS NULL'];
     const params = [cid];
+    // Size-aware: "25x1500", "E350 12mm" and the like become dimension/grade
+    // matches on the field store, and only the leftover words hit name/code.
+    // Grammar in `catalogItemsService.parseCatalogSearch`.
     if (req.query.q) {
-      where.push('(fic.name LIKE ? OR fic.code LIKE ?)');
-      params.push(`%${req.query.q}%`, `%${req.query.q}%`);
+      const parsed = parseCatalogSearch(String(req.query.q));
+      const clauses = await searchClauses(cid, parsed, 'fic');
+      where.push(...clauses.where);
+      params.push(...clauses.params);
+    }
+    // Material / grade are field values, not columns — exact match on the
+    // text the facets endpoint handed out, so a dropdown pick always hits.
+    for (const key of ['material', 'grade']) {
+      if (req.query[key] !== undefined && req.query[key] !== '') {
+        const c = await textFieldClause(cid, key, String(req.query[key]), 'fic');
+        where.push(c.where);
+        params.push(...c.params);
+      }
     }
     if (req.query.procurementType) {
       where.push('fic.procurement_type = ?');
@@ -189,6 +210,34 @@ router.get('/catalog/items', protect, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// GET /catalog/items/facets — counts behind every filter option
+// ─────────────────────────────────────────────────────────────────────────
+
+router.get('/catalog/items/facets', protect, async (req, res) => {
+  try {
+    return res.json(await catalogFacets(companyId(req)));
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /catalog/items/bulk { ids, patch } — one patch over many rows
+// ─────────────────────────────────────────────────────────────────────────
+
+// Registered before any `/catalog/items/:id/...` route so "bulk" can never be
+// read as an id — Express matches in registration order.
+router.post('/catalog/items/bulk', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
+  try {
+    const { ids, patch } = req.body ?? {};
+    const result = await bulkUpdateCatalogItems(companyId(req), ids, patch);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // POST /catalog/items { item, fields } — one transaction (item 4)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -295,8 +344,21 @@ router.post('/catalog/items', protect, requirePerm('fab_erp_items_meta_manage'),
 
 router.get('/catalog/items/:id/usage', protect, async (req, res) => {
   try {
-    const usage = await itemUsage(companyId(req), Number(req.params.id));
+    const usage = await itemUsageDetail(companyId(req), Number(req.params.id));
     return res.json(usage);
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// PATCH /catalog/items/:id/fields { thickness_mm?, width_mm?, length_mm? }
+// ─────────────────────────────────────────────────────────────────────────
+
+router.patch('/catalog/items/:id/fields', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
+  try {
+    const result = await patchCatalogItemSizes(companyId(req), Number(req.params.id), req.body ?? {});
+    return res.json({ ok: true, ...result });
   } catch (err) {
     return fail(res, err);
   }

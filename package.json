@@ -24,6 +24,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
     "expr-eval": "^2.0.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.5.2",
