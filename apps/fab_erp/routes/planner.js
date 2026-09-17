@@ -32,6 +32,7 @@ import {
   assignMachines, assignTasksToMachine, machineAgenda, machinesForTask,
 } from '../services/planMachineService.js';
 import { transformGroup } from '../services/planGroupService.js';
+import { monthFit, saveMonthMarks } from '../services/monthFitService.js';
 
 const router = Router();
 
@@ -666,6 +667,50 @@ router.delete('/plan/entries/:id', protect, async (req, res) => {
   } catch (err) {
     logger.error({ err, companyId, entryId }, 'plan entry delete failed');
     return res.status(500).json({ message: 'Failed to remove the plan entry.' });
+  }
+});
+
+/**
+ * GET /plan/month-fit?month=YYYY-MM — what fits in the rest of the month.
+ *
+ * Capacity per station and open work per BOM node, per production order. It
+ * measures and decides nothing: the fit runs in the browser so that trying
+ * another machine or another shift is instant. Defaults to the current month in
+ * the plant's zone.
+ */
+router.get('/plan/month-fit', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, VIEW_TAG)) return denyPermission(res, VIEW_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const fit = await monthFit(companyId, { month: req.query.month ? String(req.query.month) : null });
+    return res.status(200).json({ ok: true, ...fit });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'month fit read failed');
+    return res.status(500).json({ message: 'Failed to read the month.' });
+  }
+});
+
+/**
+ * PUT /plan/month-fit/marks — the planner's own "this month" / "later" marks.
+ * Body: { month, marks: [{ orderId, poId, nodeKey, state: 'in'|'out'|null }] }.
+ */
+router.put('/plan/month-fit/marks', protect, async (req, res) => {
+  const user = req.user;
+  if (!isAuthorized(user, MANAGE_TAG)) return denyPermission(res, MANAGE_TAG);
+  const companyId = user?.companyId;
+  if (!companyId) return res.status(400).json({ message: 'Unable to determine companyId from token.' });
+
+  try {
+    const out = await saveMonthMarks(companyId, { month: req.body?.month, marks: req.body?.marks }, user?.id ?? null);
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err) {
+    if (err instanceof PlanError) return sendPlanError(res, err);
+    logger.error({ err, companyId }, 'month marks save failed');
+    return res.status(500).json({ message: 'Failed to save the month marks.' });
   }
 });
 

@@ -6612,3 +6612,31 @@ UPDATE fab_item_catalog c
     ON b.child_item_id = c.id AND b.company_id = c.company_id
    SET c.short_code = LEFT(UPPER(b.seg), 12)
  WHERE c.short_code IS NULL AND c.deleted_at IS NULL;
+
+-- ─── Month fit: the planner's own marks (2026-09-17) ─────────────────────────
+-- "This piece this month" / "this piece later", per production order and per
+-- BOM node, for one calendar month. Everything WITHOUT a row is the engine's to
+-- place, so this table holds only decisions a person made.
+--
+-- node_key is 'po' (the whole production order), 'l<order line id>' or
+-- 'i<fab_items id>'. production_order_id is 0 for work no production order has
+-- claimed yet — 0, not NULL, because NULLs never collide in a unique key and
+-- the same mark would insert twice.
+--
+-- The unique key deliberately has no deleted_at: a cleared mark is revived in
+-- place by the upsert in monthFitService.saveMonthMarks.
+CREATE TABLE IF NOT EXISTS fab_month_marks (
+  id INT NOT NULL AUTO_INCREMENT,
+  company_id INT NOT NULL,
+  month CHAR(7) NOT NULL,
+  order_id INT NOT NULL,
+  production_order_id INT NOT NULL DEFAULT 0,
+  node_key VARCHAR(32) NOT NULL,
+  state VARCHAR(8) NOT NULL,
+  updated_by INT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at TIMESTAMP NULL DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_fmm_mark (company_id, month, order_id, production_order_id, node_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
