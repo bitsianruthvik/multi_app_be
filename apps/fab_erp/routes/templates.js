@@ -41,6 +41,7 @@ import {
   draftTree, buildFromTree, currentTree, applyTree,
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
+import { draftForOrder, revisionStatus, listRevisions, releaseRevision } from '../services/templateRevisionService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
 import { pickableItems, catalogSizes } from '../services/catalogPickerService.js';
 import { pickCandidates } from '../services/catalogKind.js';
@@ -91,7 +92,28 @@ router.post('/templates/:itemId/preview', protect, async (req, res) => {
 router.get('/templates/:itemId/draft', protect, async (req, res) => {
   try {
     const cid = companyId(req);
-    res.json({ tree: await draftTree(cid, Number(req.params.itemId)) });
+    // The LATEST RELEASED revision (2026-09-18), never the working copy: an
+    // unreleased edit must not reach an order. `tree.revision` says which.
+    res.json({ tree: await draftForOrder(cid, Number(req.params.itemId)) });
+  } catch (err) { fail(res, err); }
+});
+
+/** GET /templates/:itemId/revisions — status (latest, unreleased changes) and history. */
+router.get('/templates/:itemId/revisions', protect, async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const itemId = Number(req.params.itemId);
+    const [status, history] = await Promise.all([revisionStatus(cid, itemId), listRevisions(cid, itemId)]);
+    res.json({ status, ...history });
+  } catch (err) { fail(res, err); }
+});
+
+/** POST /templates/:itemId/revisions { note } — release the working copy as the next revision. */
+router.post('/templates/:itemId/revisions', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
+  try {
+    const cid = companyId(req);
+    const r = await releaseRevision(cid, Number(req.params.itemId), { note: req.body?.note ?? null, userId: req.user?.id ?? null });
+    res.json({ ok: true, ...r });
   } catch (err) { fail(res, err); }
 });
 

@@ -6711,3 +6711,28 @@ SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_role');
 SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD KEY idx_fi_role (role_item_id)', 'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ─── Template revisions (2026-09-18) ─────────────────────────────────────────
+-- A template's BOM (fab_item_bom) is its WORKING COPY. "Release" freezes the
+-- whole tree as a numbered revision; new orders are built from the latest
+-- released revision and the order line records which (template_revision).
+-- Unreleased edits never reach an order. tree_json is bomService.draftTree
+-- with picks unresolved -- the recipe exactly as released.
+CREATE TABLE IF NOT EXISTS fab_template_revisions (
+  id INT NOT NULL AUTO_INCREMENT,
+  company_id INT NOT NULL,
+  template_item_id INT NOT NULL,
+  rev_no INT NOT NULL,
+  tree_json JSON NOT NULL,
+  note VARCHAR(500) NULL,
+  released_by INT NULL,
+  released_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  deleted_at TIMESTAMP NULL DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_ftr_rev (company_id, template_item_id, rev_no),
+  KEY idx_ftr_template (company_id, template_item_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_order_lines' AND COLUMN_NAME='template_revision');
+SET @s = IF(@c=0, 'ALTER TABLE fab_order_lines ADD COLUMN template_revision INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

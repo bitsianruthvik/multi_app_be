@@ -533,11 +533,19 @@ router.get('/orders/:id/lines', protect, async (req, res) => {
     if (!order) return res.status(404).json({ message: 'Order not found.' });
 
     const [lines] = await pool.query(
-      `SELECT id, line_no AS lineNo, code, description, qty, unit_price AS unitPrice,
-              catalog_item_id AS catalogItemId, template_item_id AS templateItemId, line_type AS lineType
-         FROM fab_order_lines
-        WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
-        ORDER BY line_no`,
+      // templateRevision: the released revision this line was BUILT from
+      // (NULL = not built, or built before revisions); latestRevision: the
+      // template's newest, so a screen can say "Rev 3 · latest is Rev 5".
+      `SELECT ol.id, ol.line_no AS lineNo, ol.code, ol.description, ol.qty, ol.unit_price AS unitPrice,
+              ol.catalog_item_id AS catalogItemId, ol.template_item_id AS templateItemId, ol.line_type AS lineType,
+              ol.template_revision AS templateRevision,
+              (ol.template_snapshot_at IS NOT NULL) AS built,
+              (SELECT MAX(r.rev_no) FROM fab_template_revisions r
+                WHERE r.company_id = ol.company_id AND r.deleted_at IS NULL
+                  AND r.template_item_id = COALESCE(ol.template_item_id, ol.catalog_item_id)) AS latestRevision
+         FROM fab_order_lines ol
+        WHERE ol.company_id = ? AND ol.order_id = ? AND ol.deleted_at IS NULL
+        ORDER BY ol.line_no`,
       [cid, orderId],
     );
     if (!lines.length) return res.json({ rows: [] });

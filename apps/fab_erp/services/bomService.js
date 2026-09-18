@@ -968,7 +968,7 @@ export async function draftTree(companyId, rootItemId, conn = null, { resolvePic
  * item's unit and make/buy, because the row IS that item now: a picked shear
  * stud is bought, a picked stiffener is made.
  */
-async function resolvePicks(exec, companyId, tree) {
+export async function resolvePicks(exec, companyId, tree) {
   const nodes = [];
   const walk = (n) => { if (n.pick) nodes.push(n); (n.children ?? []).forEach(walk); };
   walk(tree);
@@ -1838,7 +1838,10 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * runs once at build when there is nothing to overwrite, and a rebuild that
      * clobbered somebody's typed dimension would be the worst kind of quiet.
      */
-    if (fromBomLine.length) {
+    // A tree from a RELEASED revision already carries the recipe's sizes as of
+    // that release (on each node's dims); the live lines may have moved on
+    // since, and must not leak unreleased defaults into the order.
+    if (fromBomLine.length && tree.revision == null) {
       const lineIds = [...new Set(fromBomLine.map(([lineId]) => lineId))];
       const [defaults] = await conn.query(
         `SELECT v.scope_id AS lineId, f.field_key AS fieldKey,
@@ -1871,11 +1874,13 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     if (orderLineId) {
       await conn.query(
         `UPDATE fab_order_lines
-            SET template_item_id = ?, template_params = ?, template_snapshot_at = NOW()
+            SET template_item_id = ?, template_params = ?, template_snapshot_at = NOW(),
+                template_revision = ?
           WHERE id = ? AND company_id = ?`,
         // The TREE is the record of what was built, not a set of answers that
-        // would have to be re-expanded to find out.
-        [tree.catalogItemId, JSON.stringify({ version: 3, tree }), orderLineId, companyId]);
+        // would have to be re-expanded to find out. `tree.revision` is the
+        // released template revision it came from (templateRevisionService).
+        [tree.catalogItemId, JSON.stringify({ version: 3, tree }), tree.revision ?? null, orderLineId, companyId]);
     }
 
     /*
