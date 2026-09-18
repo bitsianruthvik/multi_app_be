@@ -95,8 +95,9 @@ router.get('/pulse', protect, async (req, res) => {
       [companyId]],
 
     ['items',
+      // Cataloged items only — what the Item Catalog page's Catalog tab lists.
       `SELECT COUNT(*) AS n FROM fab_item_catalog
-       WHERE company_id=? AND deleted_at IS NULL`,
+       WHERE company_id=? AND deleted_at IS NULL AND is_cataloged = 1`,
       [companyId]],
   ];
 

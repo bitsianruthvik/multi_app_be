@@ -36,6 +36,29 @@
 /** SQL: this catalog alias is a cataloged item. */
 export const CATALOGED = (alias = 'c') => `${alias}.is_cataloged = 1`;
 
+/**
+ * The three lists the Item Catalog page shows (Catalog tab; Non-catalog tab
+ * split into its two sections). A cut plate is told apart from a template part
+ * by `material_form`, the same test blankPredicate uses — never by this flag
+ * alone, which is 0 for both.
+ */
+export const ITEM_KINDS = ['catalog', 'template', 'cutplate'];
+
+/** SQL condition for one list, or null for "everything" (no kind asked). */
+export function kindWhere(kind, alias = 'fic') {
+  if (kind == null || kind === '') return null;
+  switch (kind) {
+    case 'catalog': return `${alias}.is_cataloged = 1`;
+    case 'template': return `(${alias}.is_cataloged = 0 AND COALESCE(${alias}.material_form, '') <> 'blank')`;
+    case 'cutplate': return `${alias}.material_form = 'blank'`;
+    default: {
+      const err = new Error(`Unknown kind "${kind}". Use one of: ${ITEM_KINDS.join(', ')}.`);
+      err.status = 400;
+      throw err;
+    }
+  }
+}
+
 function notCataloged(names, action) {
   const list = names.slice(0, 5).join(', ') + (names.length > 5 ? ` and ${names.length - 5} more` : '');
   const err = new Error(

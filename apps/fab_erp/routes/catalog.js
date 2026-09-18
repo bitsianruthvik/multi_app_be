@@ -25,7 +25,7 @@ import { generateCode, orderRowCodeRanges, orderCodePrefix } from '../services/c
 import { setFieldsBulk, resolveFields } from '../services/fieldService.js';
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { catalogSizes, sellableItems } from '../services/catalogPickerService.js';
-import { catalogedForNew, procurementFor } from '../services/catalogKind.js';
+import { catalogedForNew, procurementFor, kindWhere } from '../services/catalogKind.js';
 import {
   parseCatalogSearch, searchClauses, textFieldClause, catalogFacets, itemUsageDetail,
   bulkUpdateCatalogItems, patchCatalogItemSizes,
@@ -134,6 +134,10 @@ router.get('/catalog/items', protect, async (req, res) => {
     if (String(req.query.uncategorized) === '1') {
       where.push('fic.category_id IS NULL');
     }
+    // Catalog / template / cutplate — the page's tabs. Absent = everything,
+    // which is what the BOM and structure pickers still ask for.
+    const kindSql = kindWhere(req.query.kind);
+    if (kindSql) where.push(kindSql);
     const whereSql = where.join(' AND ');
 
     // A real COUNT(*) over the same WHERE — §13 "Getting a row count from the
@@ -158,6 +162,7 @@ router.get('/catalog/items', protect, async (req, res) => {
       `SELECT fic.id, fic.name, fic.code, fic.short_code AS shortCode, fic.unit, fic.description,
               fic.category_id AS categoryId, fic.group_id AS groupId, fic.subgroup_id AS subgroupId,
               fic.hsn_code AS hsnCode, fic.procurement_type AS procurementType,
+              fic.is_cataloged AS isCataloged,
               fic.lead_time_days AS leadTimeDays, fic.mrp_policy AS mrpPolicy,
               fic.thickness_mm AS thicknessMm, fic.material_form AS materialForm,
               fic.density_kg_m3 AS densityKgM3, fic.section_area_mm2 AS sectionAreaMm2,
@@ -216,7 +221,7 @@ router.get('/catalog/items', protect, async (req, res) => {
 
 router.get('/catalog/items/facets', protect, async (req, res) => {
   try {
-    return res.json(await catalogFacets(companyId(req)));
+    return res.json(await catalogFacets(companyId(req), { kind: req.query.kind }));
   } catch (err) {
     return fail(res, err);
   }

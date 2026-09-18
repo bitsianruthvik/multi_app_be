@@ -202,7 +202,11 @@ export async function sellableItems(companyId, { search = null } = {}) {
         -- contains), which quietly hid every sub-assembly — and a shop does
         -- sell a girder or a diaphragm on its own, not only the span it
         -- usually sits in. If it can be built from parts, it can be sold.
-        AND (cat.name = 'Fabricated'
+        -- "Fabricated" is no longer matched by NAME: a template is a
+        -- non-catalog item that is not a cut plate (catalogKind.js), so
+        -- renaming the category can no longer empty the order's picker.
+        AND COALESCE(c.material_form, '') <> 'blank'
+        AND (c.is_cataloged = 0
              OR EXISTS (SELECT 1 FROM fab_item_bom b
                          WHERE b.company_id = c.company_id AND b.deleted_at IS NULL
                            AND b.parent_item_id = c.id))

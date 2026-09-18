@@ -81,8 +81,9 @@ router.get('/nav-counts', protect, async (req, res) => {
       [companyId]],
 
     ['items',
+      // The Item Catalog page's Catalog tab — cataloged items only (catalogKind.js).
       `SELECT COUNT(*) AS n FROM fab_item_catalog
-       WHERE company_id=? AND deleted_at IS NULL`,
+       WHERE company_id=? AND deleted_at IS NULL AND is_cataloged = 1`,
       [companyId]],
 
     // Counts the per-project BOMs that are actually built and used. This used to

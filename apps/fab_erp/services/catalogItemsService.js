@@ -12,7 +12,7 @@ import { pool } from '../../../db.js';
 import { fieldRegistry, setFieldsBulk } from './fieldService.js';
 import { recomputeCatalogWeight } from './fieldDeriveService.js';
 import { itemUsage } from './catalogPickerService.js';
-import { assertCataloged } from './catalogKind.js';
+import { assertCataloged, kindWhere } from './catalogKind.js';
 
 /** The three dimensions a catalog item states, in the order a size is spoken. */
 const SIZE_KEYS = ['thickness_mm', 'width_mm', 'length_mm'];
@@ -159,8 +159,12 @@ export async function textFieldClause(companyId, key, value, alias = 'fic') {
  * whatever else is ticked. Cheap enough (six GROUP BYs on ~1.6k rows) that
  * a smarter cross-filtered version is not worth its complexity yet.
  */
-export async function catalogFacets(companyId) {
-  const live = 'company_id = ? AND deleted_at IS NULL';
+export async function catalogFacets(companyId, { kind } = {}) {
+  // Counted within the tab the page is showing, or a chip would read
+  // "blank (43)" on the Catalog tab and lead to an empty list.
+  const kindSql = kindWhere(kind, 'fab_item_catalog');
+  const live = `company_id = ? AND deleted_at IS NULL${kindSql ? ` AND ${kindSql}` : ''}`;
+  const kindSqlC = kindWhere(kind, 'c');
   const [[cats], [grps], [subs], [forms], [steel]] = await Promise.all([
     pool.query(`SELECT category_id AS id, COUNT(*) AS n FROM fab_item_catalog WHERE ${live} AND category_id IS NOT NULL GROUP BY category_id`, [companyId]),
     pool.query(`SELECT group_id AS id, COUNT(*) AS n FROM fab_item_catalog WHERE ${live} AND group_id IS NOT NULL GROUP BY group_id`, [companyId]),
@@ -171,6 +175,7 @@ export async function catalogFacets(companyId) {
          FROM fab_field_values v
          JOIN fab_fields f ON f.id = v.field_id AND f.deleted_at IS NULL
          JOIN fab_item_catalog c ON c.id = v.scope_id AND c.company_id = v.company_id AND c.deleted_at IS NULL
+                                ${kindSqlC ? `AND ${kindSqlC}` : ''}
         WHERE v.company_id = ? AND v.scope = 'catalog_item' AND v.deleted_at IS NULL
           AND f.field_key IN ('material', 'grade') AND v.value_text IS NOT NULL AND v.value_text <> ''
         GROUP BY f.field_key, v.value_text
