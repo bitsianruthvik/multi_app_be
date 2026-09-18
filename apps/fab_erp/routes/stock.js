@@ -88,10 +88,31 @@ router.get('/stock/summary', protect, async (req, res) => {
   }
 
   // ── Parse + validate query params ─────────────────────────────────────
-  const { plantId, stockLocationId, groupBy, catalogItemId } = req.query;
+  const { plantId, stockLocationId, groupBy, catalogItemId, kind } = req.query;
 
-  const filters = ['fsp.company_id = ?', 'fsp.deleted_at IS NULL'];
+  // A piece used up or written off is history, not stock: it sat in these
+  // totals at qty 0 and filled every piece list with dead rows.
+  const filters = ['fsp.company_id = ?', 'fsp.deleted_at IS NULL', "fsp.status NOT IN ('consumed', 'scrapped')"];
   const params = [companyId];
+
+  /*
+   * WHICH STOCK (2026-09-18) — the Stock page's tabs, mirroring the Item
+   * Catalog's. `catalog`: things bought and received, the numbers purchasing
+   * trusts. `cutplate`: plates cut for an order, not yet used. `inproduction`:
+   * template parts the shop is making or has made (WIP and finished, per
+   * order). Absent = all three, as before.
+   */
+  const KIND_SQL = {
+    catalog: 'fic.is_cataloged = 1',
+    cutplate: "fic.material_form = 'blank'",
+    inproduction: "(fic.is_cataloged = 0 AND COALESCE(fic.material_form, '') <> 'blank')",
+  };
+  if (kind !== undefined && kind !== '') {
+    if (!KIND_SQL[kind]) {
+      return res.status(400).json({ message: `kind must be one of ${Object.keys(KIND_SQL).join(', ')}.` });
+    }
+    filters.push(KIND_SQL[kind]);
+  }
 
   if (plantId !== undefined && plantId !== '') {
     const n = Number(plantId);
@@ -167,11 +188,16 @@ router.get('/stock/summary', protect, async (req, res) => {
     if (byPiece) {
       // ── Mode 3: individual stock pieces, each with its custom fields ──
       const [pieceRows] = await pool.query(
-        `SELECT fsp.id, fsp.batch_no, fsp.heat_no, fsp.serial_no, fsp.mark_no,
+        // A piece the shop made names the ORDER it was made for — one "Top
+        // Flange" item spans every order, so the piece is what tells them apart.
+        `SELECT fsp.id, fsp.code AS piece_code, fsp.batch_no, fsp.heat_no, fsp.serial_no, fsp.mark_no,
                 fsp.qty, fsp.uom, fsp.status, fsp.stock_location_id, fsp.received_date,
-                fic.id AS catalog_item_id, fic.name, fic.code, fic.unit
+                fic.id AS catalog_item_id, fic.name, fic.code, fic.unit,
+                wo.order_number AS order_number
            FROM fab_stock_pieces fsp
            JOIN fab_item_catalog fic ON fic.id = fsp.catalog_item_id
+           LEFT JOIN fab_items wi ON wi.id = fsp.wip_item_id
+           LEFT JOIN fab_orders wo ON wo.id = wi.order_id
           WHERE ${whereClause}
           ORDER BY fic.name, fsp.id`,
         params,
@@ -209,9 +235,12 @@ router.get('/stock/summary', protect, async (req, res) => {
         }
         item.qty += Number(r.qty);
         item.segments.push({
-          value: r.batch_no ?? r.serial_no ?? r.heat_no ?? r.mark_no ?? `Piece #${r.id}`,
+          value: r.batch_no ?? r.serial_no ?? r.heat_no ?? r.mark_no
+            ?? (r.order_number ? `${r.piece_code ?? `Piece #${r.id}`} · ${r.order_number}` : null)
+            ?? r.piece_code ?? `Piece #${r.id}`,
           qty: r.qty,
           pieceId: r.id,
+          orderNumber: r.order_number ?? null,
           batchNo: r.batch_no,
           heatNo: r.heat_no,
           serialNo: r.serial_no,
