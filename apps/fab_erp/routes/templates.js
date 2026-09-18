@@ -42,6 +42,7 @@ import {
 } from '../services/bomService.js';
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { draftForOrder, revisionStatus, listRevisions, releaseRevision } from '../services/templateRevisionService.js';
+import { copyBomLine } from '../services/templateCopyService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
 import { pickableItems, catalogSizes } from '../services/catalogPickerService.js';
 import { pickCandidates } from '../services/catalogKind.js';
@@ -381,6 +382,17 @@ router.get('/catalog/pick-candidates', protect, async (req, res) => {
     if (pick.categoryId == null) return res.status(400).json({ message: 'categoryId is required.' });
     const items = await pickCandidates(pool, companyId(req), pick, { search: req.query.q ? String(req.query.q) : null });
     return res.json({ items });
+  } catch (err) { return fail(res, err); }
+});
+
+/**
+ * POST /item-bom/:id/copy — copy a line as a NEW part right below it (a
+ * catalog child is copied as a second line of the same item). See
+ * templateCopyService.
+ */
+router.post('/item-bom/:id/copy', protect, requirePerm('fab_erp_items_meta_manage'), async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await copyBomLine(companyId(req), Number(req.params.id))) });
   } catch (err) { return fail(res, err); }
 });
 

@@ -1352,7 +1352,8 @@
       "batch_required",
       "serial_required",
       "heat_required",
-      "mark_required"
+      "mark_required",
+      "default_cataloged"
     ],
     "fields": {
       "id": "fic2.id",
