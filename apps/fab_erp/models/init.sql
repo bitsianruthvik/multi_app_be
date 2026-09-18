@@ -6640,3 +6640,37 @@ CREATE TABLE IF NOT EXISTS fab_month_marks (
   PRIMARY KEY (id),
   UNIQUE KEY uq_fmm_mark (company_id, month, order_id, production_order_id, node_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ─── Cataloged vs non-catalog items (2026-09-18) ─────────────────────────────
+-- CATALOGED = a standing definition you pick, buy, receive or stock across
+-- orders (plates, sections, studs, standard stiffeners, machines, spares).
+-- NON-CATALOG = abstract (a template part: Top Flange, Segment, Span -- sized
+-- only on an order) or disposable (a cut plate made for one order). Never
+-- bought or received by hand; its stock is only ever MADE (WIP, cut plates).
+-- Per ITEM, not per category: cut plates share Raw Materials with real plates.
+-- New items take the category's default_cataloged (services/catalogKind.js).
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_catalog' AND COLUMN_NAME='is_cataloged');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_catalog ADD COLUMN is_cataloged TINYINT(1) NOT NULL DEFAULT 1', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+-- One-time, on the pass that adds the column only: everything under
+-- Fabricated is a template part EXCEPT the Stiffeners group (sized, stocked,
+-- picked -- catalog items). Guarded so a later deliberate change is never
+-- undone by a re-run of this file.
+SET @s = IF(@c=0,
+  'UPDATE fab_item_catalog SET is_cataloged = 0
+    WHERE category_id IN (SELECT id FROM fab_item_categories WHERE code = ''fab'' OR name = ''Fabricated'')
+      AND (group_id IS NULL OR group_id NOT IN (SELECT id FROM fab_item_groups WHERE name = ''Stiffeners''))',
+  'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+-- Always true, so always safe to re-apply: a cut plate is never a catalog item.
+UPDATE fab_item_catalog SET is_cataloged = 0 WHERE material_form = 'blank' AND is_cataloged = 1;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_categories' AND COLUMN_NAME='default_cataloged');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_categories ADD COLUMN default_cataloged TINYINT(1) NOT NULL DEFAULT 1', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @s = IF(@c=0,
+  'UPDATE fab_item_categories SET default_cataloged = 0 WHERE code = ''fab'' OR name = ''Fabricated''',
+  'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

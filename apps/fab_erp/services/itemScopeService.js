@@ -105,6 +105,10 @@ export async function itemsInScope(companyId, scopeId, { search = null, conn = n
        LEFT JOIN fab_item_categories cat ON cat.id = i.category_id
        LEFT JOIN fab_item_groups grp ON grp.id = i.group_id
       WHERE i.company_id = ? AND i.deleted_at IS NULL
+        -- A scope is a pick list over the CATALOG. Without this the seeded
+        -- bom_material scope (category = Raw Materials) offered every order's
+        -- cut plates as material for any part, because they are filed there.
+        AND i.is_cataloged = 1
         ${search ? 'AND (i.code LIKE ? OR i.name LIKE ?)' : ''}
       ORDER BY i.code`,
     search ? [companyId, `%${search}%`, `%${search}%`] : [companyId],

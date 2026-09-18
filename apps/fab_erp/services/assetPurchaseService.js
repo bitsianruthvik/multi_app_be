@@ -34,6 +34,7 @@
 import { pool } from '../../../db.js';
 import { resolveCatalogFields } from './itemFieldService.js';
 import { generateCode } from './codegenService.js';
+import { assertCataloged } from './catalogKind.js';
 
 const PO_DRAFT = 'draft';
 
@@ -131,6 +132,8 @@ export async function raiseAssetPurchase(companyId, p = {}, userId = null) {
        notes ? `${forLabel}\n${notes}` : forLabel],
     );
     const poId = ins.insertId;
+
+    await assertCataloged(conn, companyId, clean.map((l) => l.catalogItemId), 'bought on a purchase order');
 
     let lineNo = 1;
     for (const l of clean) {

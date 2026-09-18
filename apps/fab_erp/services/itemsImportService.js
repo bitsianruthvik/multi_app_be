@@ -18,6 +18,7 @@ import { generateCode } from './codegenService.js';
 import { fieldRegistry, setFields, resolveFields } from './fieldService.js';
 import { mayHoldValue } from './fieldLadder.js';
 import { PROCUREMENT_TYPES, autoCode } from './itemGuards.js';
+import { catalogedForNew, procurementFor } from './catalogKind.js';
 
 const CF_PREFIX = 'CF: ';
 
@@ -727,6 +728,20 @@ export async function importItemsExcel(file, companyId, opts = {}) {
 
       let itemId;
       if (existingItemId) {
+        // The catalog sheet is for CATALOG items. A code that belongs to a
+        // template part or a cut plate is not this sheet's to overwrite —
+        // re-importing one with an empty Procurement cell used to flip it to
+        // 'buy', making a cut plate purchasable.
+        const [[kind]] = await conn.query(
+          `SELECT is_cataloged FROM fab_item_catalog WHERE id = ? AND company_id = ? LIMIT 1`,
+          [existingItemId, companyId],
+        );
+        if (kind && Number(kind.is_cataloged) === 0) {
+          const message = `Code ${code} is a template part or cut plate, not a catalog item — row skipped.`;
+          result.warnings.push({ row: r.rowNumber, message });
+          result.rowLog.push({ ...rowBase, status: 'Skipped', reason: message });
+          continue;
+        }
         // upsert: the code was already the catalog's, so this row corrects
         // that row rather than minting another with the same code.
         await conn.query(
@@ -740,13 +755,15 @@ export async function importItemsExcel(file, companyId, opts = {}) {
         result.itemsUpdated++;
         itemId = existingItemId;
       } else {
+        // Stamped from the category, like every other way an item is created.
+        const isCataloged = await catalogedForNew(conn, companyId, { categoryId });
         const [insertRes] = await conn.query(
           `INSERT INTO fab_item_catalog
              (company_id, name, code, unit, description, category_id, group_id, subgroup_id,
-              procurement_type, hsn_code, lead_time_days)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+              procurement_type, hsn_code, lead_time_days, is_cataloged)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           [companyId, r.name.trim(), code, r.unit, r.description || null, categoryId, groupId, subgroupId,
-           procurementType, r.hsnCode || null, r.leadTimeDays],
+           procurementFor(isCataloged, procurementType), r.hsnCode || null, r.leadTimeDays, isCataloged],
         );
         result.itemsCreated++;
         itemId = insertRes.insertId;

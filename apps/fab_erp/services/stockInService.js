@@ -37,6 +37,7 @@ import { rollUpOrderStatus } from './taskEngineService.js';
 import { generateCode } from './codegenService.js';
 import { setFields } from './fieldService.js';
 import { logger } from '../../../core/utils/logger.js';
+import { assertCataloged } from './catalogKind.js';
 
 /**
  * A BATCH and a PIECE are not the same thing, and the ledger has a column for
@@ -117,6 +118,12 @@ export async function receiveStock(companyId, input, outerConn = null) {
 
   try {
     if (!joined) await conn.beginTransaction();
+
+    // Only a catalog item is received. A template part or a cut plate is made
+    // by the shop on an order (wipInventoryService books those); receiving one
+    // by hand also re-ran every material gate naming it, which is how a stray
+    // Top Flange receipt would have released parts on other orders.
+    await assertCataloged(conn, companyId, [catalogItemId], 'received into stock');
 
     // uom is copied from the catalog item when the caller didn't supply one.
     // postGrn never set it, so every piece in the system has a NULL unit —

@@ -12,6 +12,7 @@ import { pool } from '../../../db.js';
 import { fieldRegistry, setFieldsBulk } from './fieldService.js';
 import { recomputeCatalogWeight } from './fieldDeriveService.js';
 import { itemUsage } from './catalogPickerService.js';
+import { assertCataloged } from './catalogKind.js';
 
 /** The three dimensions a catalog item states, in the order a size is spoken. */
 const SIZE_KEYS = ['thickness_mm', 'width_mm', 'length_mm'];
@@ -298,6 +299,12 @@ export async function bulkUpdateCatalogItems(companyId, ids, patch) {
     }
 
     if (!Object.keys(cols).length && !Object.keys(fields).length) throw badRequest('Nothing to change.');
+
+    // A non-catalog item is made, never bought — a bulk "Set procurement"
+    // must not make a template part or cut plate purchasable.
+    if (cols.procurement_type && cols.procurement_type !== 'make') {
+      await assertCataloged(conn, companyId, list, `set to "${cols.procurement_type}"`);
+    }
 
     // Only this company's rows — a forged id from another tenant simply
     // doesn't match, and the count says how many really changed.

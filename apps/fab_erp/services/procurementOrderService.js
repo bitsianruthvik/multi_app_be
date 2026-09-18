@@ -23,6 +23,7 @@ import { orderShortfall } from './procurementService.js';
 import { reserveForOrder, reservePiecesForOrder } from './availabilityService.js';
 import { receiveStock } from './stockInService.js';
 import { generateCode } from './codegenService.js';
+import { assertCataloged } from './catalogKind.js';
 
 /** Statuses a purchase order moves through, in order. */
 export const PO_STATUS = {
@@ -87,6 +88,9 @@ export async function requestProcurement(companyId, orderId, lines, { createdBy 
     }
 
     const takeOf = new Map((lines ?? []).map((l) => [Number(l.catalogItemId), Math.max(0, Number(l.take) || 0)]));
+    // Buy lines come from order rows marked `buy`. A template part or cut plate
+    // marked that way by a stray edit must surface here, not as a PO line.
+    await assertCataloged(conn, companyId, [...takeOf.keys()], 'bought on a purchase order');
     const shortfall = await orderShortfall(companyId, orderId, conn, { ctx });
 
     // 1. what to hold — never more than is needed; reserveForOrder also never

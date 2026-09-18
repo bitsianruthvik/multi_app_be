@@ -25,6 +25,7 @@ import { generateCode, orderRowCodeRanges, orderCodePrefix } from '../services/c
 import { setFieldsBulk, resolveFields } from '../services/fieldService.js';
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { catalogSizes, sellableItems } from '../services/catalogPickerService.js';
+import { catalogedForNew, procurementFor } from '../services/catalogKind.js';
 import {
   parseCatalogSearch, searchClauses, textFieldClause, catalogFacets, itemUsageDetail,
   bulkUpdateCatalogItems, patchCatalogItemSizes,
@@ -288,8 +289,15 @@ router.post('/catalog/items', protect, requirePerm('fab_erp_items_meta_manage'),
       code = (await generateCode(cid, 'item', { categoryId: item.categoryId }, conn)).toUpperCase();
     }
 
+    // Cataloged or not is stamped here, never trusted from a later edit: the
+    // category's default, an explicit choice, and a cut plate is never one.
+    const isCataloged = await catalogedForNew(conn, cid, {
+      categoryId: item.categoryId, materialForm: item.materialForm ?? null, explicit: item.isCataloged,
+    });
+
     const row = {
       company_id: cid,
+      is_cataloged: isCataloged,
       name: String(item.name).trim(),
       code,
       // The segment an ORDER ROW of this item carries in its code (parent code
@@ -302,7 +310,7 @@ router.post('/catalog/items', protect, requirePerm('fab_erp_items_meta_manage'),
       group_id: item.groupId ?? null,
       subgroup_id: item.subgroupId ?? null,
       hsn_code: item.hsnCode ? String(item.hsnCode).trim() : null,
-      procurement_type: item.procurementType || 'buy',
+      procurement_type: procurementFor(isCataloged, item.procurementType),
       mrp_policy: item.mrpPolicy || 'manual',
       lead_time_days: item.leadTimeDays ?? null,
     };

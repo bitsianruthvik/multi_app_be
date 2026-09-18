@@ -51,11 +51,62 @@ function insufficientStock(message) {
 
 async function getItemNode(conn, companyId, itemId) {
   const [[row]] = await conn.query(
-    `SELECT id, order_id, parent_item_id, catalog_item_id, qty, unit
-       FROM fab_items WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    `SELECT i.id, i.order_id, i.parent_item_id, i.catalog_item_id, i.qty, i.unit,
+            (c.material_form = 'blank') AS is_blank
+       FROM fab_items i
+       LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
+      WHERE i.id = ? AND i.company_id = ? AND i.deleted_at IS NULL LIMIT 1`,
     [itemId, companyId],
   );
   return row ?? null;
+}
+
+/**
+ * Draw a child ROW's finished output into its parent — by the row, never by type.
+ *
+ * This used to consume `child.catalog_item_id` FIFO across the whole yard. Every
+ * Top Flange on every order shares one catalog type, so a segment on order B
+ * would take whichever flange finished first — order A's, of a different size.
+ * A child row sits under exactly one parent row, so everything it produced is
+ * that parent's, and `wip_item_id` already names the row a piece was made for.
+ *
+ * Takes ALL of the row's finished pieces: a row is a design with a quantity, and
+ * its whole output goes into the one parent it sits under.
+ *
+ * A row that produced no piece at all is a bookkeeping gap, not a missing part —
+ * `finalizeWipOnComplete` makes none for a row with no catalog type or no stock
+ * area. The gate has already seen its last step done, so the start goes ahead
+ * and the gap is logged. A piece still in 'wip' is a genuinely unfinished part.
+ */
+async function consumeComponentRow(conn, companyId, childItemId, { notes }) {
+  const [pieces] = await conn.query(
+    `SELECT id, code, catalog_item_id, qty, plant_id, stock_location_id, status
+       FROM fab_stock_pieces
+      WHERE company_id = ? AND wip_item_id = ? AND deleted_at IS NULL
+        AND status IN ('in_stock', 'wip')
+      FOR UPDATE`,
+    [companyId, childItemId],
+  );
+  const finished = pieces.filter((p) => p.status === 'in_stock' && Number(p.qty) > EPS);
+  if (!finished.length) {
+    if (pieces.some((p) => p.status === 'wip')) {
+      throw insufficientStock(`Component item #${childItemId} is still in production — it has not finished its last step.`);
+    }
+    logger.warn({ companyId, childItemId }, '[wip] component row finished but produced no stock piece; nothing to draw');
+    return;
+  }
+  for (const p of finished) {
+    await conn.query(
+      `UPDATE fab_stock_pieces SET qty = 0, status = 'consumed' WHERE id = ?`,
+      [p.id],
+    );
+    await writeLedger(conn, companyId, {
+      catalogItemId: p.catalog_item_id, plantId: p.plant_id, stockLocationId: p.stock_location_id,
+      txnType: 'wip_consume', qty: -Number(p.qty),
+      pieceId: p.id, pieceCode: p.code || await ensurePieceCode(conn, companyId, p.id),
+      notes,
+    });
+  }
 }
 
 /** Min & max step seq_no for a node's tasks (a node has one flow). */
@@ -473,14 +524,9 @@ export async function openOrMoveWipOnStart(conn, companyId, task, machine) {
     for (const inp of inputs) {
       const required = Number(inp.qty) > 0 ? Number(inp.qty) : (Number(node.qty) || 1);
       if (inp.input_role === 'component' && inp.producing_item_id) {
-        const child = await getItemNode(conn, companyId, inp.producing_item_id);
-        if (child?.catalog_item_id) {
-          const { ok } = await consumeStock(conn, companyId, child.catalog_item_id, required, {
-            txnType: 'wip_consume', orderId: task.order_id ?? node.order_id ?? null,
-            notes: `consumed by item ${node.id} (task ${task.id})`,
-          });
-          if (!ok) throw insufficientStock(`Not enough of component item #${inp.producing_item_id} in stock to start this task.`);
-        }
+        await consumeComponentRow(conn, companyId, inp.producing_item_id, {
+          notes: `consumed by item ${node.id} (task ${task.id})`,
+        });
       } else if (inp.ref_catalog_item_id) {
         // A nested plate goes to the machine ONCE and everything is cut out of
         // it. Issuing per part would draw the same plate from stock twenty
@@ -645,7 +691,10 @@ export async function finalizeWipOnComplete(conn, companyId, task, opts = {}) {
 
   const { maxSeq } = await stepBounds(conn, companyId, task.item_id);
   if (maxSeq == null || Number(task.seq_no) !== Number(maxSeq)) return; // not the terminal step
-  const isTopLevel = node.parent_item_id == null;
+  // A cut plate (blank) sits on the order with no parent, but it is not a
+  // finished product — it is intermediate stock the parts are cut from. Booking
+  // it as top-level sent every cut plate to Finished Goods as an fg_receipt.
+  const isTopLevel = node.parent_item_id == null && !Number(node.is_blank);
   const plannedQty = Number(node.qty) || 1;
 
   const [[piece]] = await conn.query(

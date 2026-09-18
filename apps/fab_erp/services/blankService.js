@@ -331,7 +331,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
           `UPDATE fab_item_catalog
               SET name = ?, unit = 'nos', category_id = ?, group_id = ?, subgroup_id = ?,
                   procurement_type = 'make', thickness_mm = ?, density_kg_m3 = ?,
-                  material_form = 'blank', deleted_at = NULL
+                  material_form = 'blank', is_cataloged = 0, deleted_at = NULL
             WHERE id = ? AND company_id = ?`,
           [b.name, group.categoryId, group.id, sub.id, b.thickness, b.density, existing.id, companyId],
         );
@@ -353,8 +353,8 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
        */
           `INSERT INTO fab_item_catalog
              (company_id, name, code, unit, category_id, group_id, subgroup_id,
-              procurement_type, thickness_mm, density_kg_m3, material_form, description, created_at)
-           VALUES (?,?,?,'nos',?,?,?,'make',?,?,'blank',?,UTC_TIMESTAMP())`,
+              procurement_type, thickness_mm, density_kg_m3, material_form, is_cataloged, description, created_at)
+           VALUES (?,?,?,'nos',?,?,?,'make',?,?,'blank',0,?,UTC_TIMESTAMP())`,
           [companyId, b.name, b.code, group.categoryId, group.id, sub.id, b.thickness, b.density,
             `${b.material} ${b.grade} plate, ${b.thickness} x ${b.width} x ${b.length}, cut for ${orderNumber}.`],
         );

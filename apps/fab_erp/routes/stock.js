@@ -337,6 +337,9 @@ router.post('/stock/receive', protect, async (req, res) => {
     });
     return res.status(200).json(result);
   } catch (err) {
+    if (err?.status && err.status < 500) {
+      return res.status(err.status).json({ message: err.message, code: err.code });
+    }
     logger.error({ err, companyId, catalogItemId }, 'fab_erp stock/receive: failed');
     return res.status(500).json({ message: err.message ?? 'Failed to record stock.' });
   }

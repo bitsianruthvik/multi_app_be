@@ -169,12 +169,20 @@ async function inputSatisfiedLive(conn, companyId, input) {
     // must actually be on hand — completion no longer implies infinite supply.
     if (!(await terminalTaskDone(conn, companyId, input.producing_item_id))) return false;
     if (required > 0) {
-      const [child] = await conn.query(
-        `SELECT catalog_item_id FROM fab_items WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-        [input.producing_item_id, companyId],
+      // What THIS child row produced, never stock of its catalog type — every
+      // Top Flange on every order shares one type, so a type count would let
+      // order A's finished flange satisfy order B's gate. Mirrors
+      // wipInventoryService.consumeComponentRow. A row that never produced a
+      // piece (no type / no stock area) is not held up, as before.
+      const [[r]] = await conn.query(
+        `SELECT COUNT(*) AS pieces,
+                COALESCE(SUM(CASE WHEN status = 'in_stock' THEN qty END), 0) AS onHand
+           FROM fab_stock_pieces
+          WHERE company_id = ? AND wip_item_id = ? AND deleted_at IS NULL
+            AND status IN ('in_stock', 'wip')`,
+        [companyId, input.producing_item_id],
       );
-      const catId = child[0]?.catalog_item_id;
-      if (catId) return (await availableQty(conn, companyId, catId)) + 1e-9 >= required;
+      if (Number(r?.pieces) > 0) return Number(r.onHand) + 1e-9 >= required;
     }
     return true;
   }
@@ -474,7 +482,10 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
     // which stops working the moment a made item carries a catalog id.
     // `order_line_id` is the EU-5 addition: which line's qty multiplies this
     // row's task_qty (see rolledQty below).
-    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, node_kind, order_line_id
+    // `procurement_type` decides the raw-material fallback below: only a row
+    // that is itself bought stock may name its own type as its material.
+    `SELECT id, parent_item_id, catalog_item_id, flow_id, qty, node_kind, order_line_id,
+            procurement_type
        FROM fab_items WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [companyId, orderId],
   );
@@ -796,8 +807,16 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
       for (const si of stepInputs) {
         if (si.ref_bom_role === 'raw_material') {
           // BUG-07: one raw_material input per RM child (each gated independently).
-          // If the parent has no catalog-bearing children, fall back to the item's
-          // own catalog item (prior single-input behaviour).
+          //
+          // With no material child, fall back to the item's OWN type ONLY when
+          // the row is itself bought stock (an angle bought in and drilled: it
+          // waits for that angle). A MADE row with no material yet — a part not
+          // nested when its tasks were raised — used to fall back too, and then
+          // waited for stock of ITSELF. That never clears on its own, and clears
+          // the wrong way the moment any other order finishes the same type: the
+          // gate passes and the start draws that other order's part. 67 such
+          // inputs were live in prod (2026-09-18). A made row with no material
+          // gets no material input; readiness is what catches an un-nested part.
           const rms = rmChildrenByParent.get(item.id) ?? [];
           if (rms.length) {
             for (const rm of rms) {
@@ -805,7 +824,7 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
               inputPlans.push({ kind: 'catalog',
                 values: ['raw_material', rm.catalog_item_id, rm.qty ?? null, si.unit ?? null, si.gate] });
             }
-          } else if (item.catalog_item_id != null) {
+          } else if (item.catalog_item_id != null && item.procurement_type && item.procurement_type !== 'make') {
             inputPlans.push({ kind: 'catalog',
               values: ['raw_material', item.catalog_item_id, null, si.unit ?? null, si.gate] });
           }

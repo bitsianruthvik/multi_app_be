@@ -19,6 +19,7 @@ import { recomputeItemShape, orderIdOfItem } from '../services/itemShapeService.
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { assertNoStartedWork } from '../services/itemGuards.js';
 import { fail } from '../../../core/middleware/requirePerm.js';
+import { assertCataloged, catalogedForNew, procurementFor } from '../services/catalogKind.js';
 
 // Resources whose `code` the server fills in on insert.
 //
@@ -370,6 +371,61 @@ async function deriveOrderLineType(resource, filteredPayload, companyId) {
 }
 
 /**
+ * Cataloged vs non-catalog, for the writes that go through /mutate.
+ *
+ *   fabErpItemCatalog  insert: the flag is stamped here (it is not a
+ *                      writeField, so no payload can set it) and a non-catalog
+ *                      item is always `make`. update: a non-catalog item cannot
+ *                      be made buyable.
+ *   fabErpOrderLine    a line on a PURCHASE order must name a catalog item.
+ *                      Sales lines name templates on purpose and are untouched.
+ *   fabErpStockPolicy  a reorder rule on a template or cut plate means nothing.
+ */
+async function applyCatalogKindRules(resource, op, filteredPayload, companyId, id) {
+  if (resource === 'fabErpItemCatalog') {
+    if (op === 'insert') {
+      filteredPayload.is_cataloged = await catalogedForNew(pool, companyId, {
+        categoryId: filteredPayload.category_id ?? null,
+        materialForm: filteredPayload.material_form ?? null,
+      });
+      filteredPayload.procurement_type = procurementFor(filteredPayload.is_cataloged, filteredPayload.procurement_type);
+      return;
+    }
+    if (op === 'update' && filteredPayload.procurement_type && filteredPayload.procurement_type !== 'make') {
+      await assertCataloged(pool, companyId, [id], `set to "${filteredPayload.procurement_type}"`);
+    }
+    return;
+  }
+
+  const itemId = filteredPayload.catalog_item_id;
+  if (!itemId) return;
+
+  if (resource === 'fabErpStockPolicy') {
+    await assertCataloged(pool, companyId, [itemId], 'given a stock policy');
+    return;
+  }
+
+  if (resource === 'fabErpOrderLine') {
+    let orderId = filteredPayload.order_id ?? null;
+    if (orderId == null && id != null) {
+      const [[line]] = await pool.query(
+        `SELECT order_id FROM fab_order_lines WHERE id = ? AND company_id = ? LIMIT 1`,
+        [id, companyId],
+      );
+      orderId = line?.order_id ?? null;
+    }
+    if (orderId == null) return;
+    const [[order]] = await pool.query(
+      `SELECT order_type FROM fab_orders WHERE id = ? AND company_id = ? LIMIT 1`,
+      [orderId, companyId],
+    );
+    if (order?.order_type === 'purchase') {
+      await assertCataloged(pool, companyId, [itemId], 'bought on a purchase order');
+    }
+  }
+}
+
+/**
  * Resolves the set of fields required for this write, from the resource's
  * declared `requiredFields` config in resourceDef.json:
  *   { always: [...], byOrderType: { <typeValue>: [...] }, orderTypeField: 'order_type' }
@@ -490,6 +546,7 @@ export async function mutate(req, res) {
   if (op === 'insert' || op === 'update') {
     try {
       await assertStepOperation(resource, op, filteredPayload, companyId);
+      await applyCatalogKindRules(resource, op, filteredPayload, companyId, payload?.id ?? null);
     } catch (refErr) {
       return fail(res, refErr);
     }

@@ -91,6 +91,7 @@ export async function rawMaterialsFor(companyId, conn) {
        LEFT JOIN fab_item_categories cat
          ON cat.id = fic.category_id AND cat.deleted_at IS NULL
       WHERE fic.company_id = ? AND fic.deleted_at IS NULL
+        AND fic.is_cataloged = 1
         AND fic.procurement_type IN ('buy', 'free_issue')
         AND COALESCE(cat.code, '') NOT IN (${NOT_CUT_FROM.map(() => '?').join(',')})
       ORDER BY fic.material_form, fic.thickness_mm, fic.code`,
