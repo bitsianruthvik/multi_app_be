@@ -664,6 +664,34 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
     if (!list) { childPartsByParent.set(Number(d.assemblyId), [part]); continue; }
     if (!list.some((x) => Number(x.id) === Number(part.id))) list.push(part);
   }
+  /**
+   * STOCKED CHILDREN (D12, product owner 2026-09-18): a CATALOG item under an
+   * assembly that no task here makes — a bought shear stud, a picked
+   * ready-made stiffener — is waited for as stock. The assembly's step that
+   * waits for its parts (`child_parts`) also waits until the order's whole
+   * quantity of it is on the shelf, and draws it at start like any material.
+   *
+   * Only catalog items: a template part with no flow is a grouping or an
+   * unfinished design, not something that arrives; and a cut plate is made by
+   * its own cutting task.
+   */
+  const stockCandidates = items.filter((it) => it.parent_item_id != null && !isMaterial(it)
+    && it.flow_id == null && it.catalog_item_id != null);
+  let catalogedIds = new Set();
+  if (stockCandidates.length) {
+    const [cs] = await conn.query(
+      'SELECT id FROM fab_item_catalog WHERE company_id = ? AND id IN (?) AND is_cataloged = 1',
+      [companyId, [...new Set(stockCandidates.map((it) => Number(it.catalog_item_id)))]],
+    );
+    catalogedIds = new Set(cs.map((r) => Number(r.id)));
+  }
+  const stockChildrenByParent = new Map();
+  for (const it of stockCandidates) {
+    if (!catalogedIds.has(Number(it.catalog_item_id))) continue;
+    if (!stockChildrenByParent.has(it.parent_item_id)) stockChildrenByParent.set(it.parent_item_id, []);
+    stockChildrenByParent.get(it.parent_item_id).push(it);
+  }
+
   // raw-material children per parent item — for 'raw_material' inputs. BUG-07:
   // keep ALL such children, not just the first, so a multi-material assembly
   // gates on every material it needs.
@@ -833,6 +861,12 @@ export async function planOrderTasks(conn, companyId, orderId, { evaluateExistin
           for (const kid of kids) {
             inputPlans.push({ kind: 'component',
               values: [kid.id, si.gate] });
+          }
+          // …and the stocked catalog items under it, at the order's whole
+          // quantity (the task covers every instance of this row).
+          for (const sc of stockChildrenByParent.get(item.id) ?? []) {
+            inputPlans.push({ kind: 'catalog',
+              values: ['raw_material', sc.catalog_item_id, rolledQty(sc) ?? null, si.unit ?? null, si.gate] });
           }
         } else if (si.ref_catalog_item_id != null) {
           inputPlans.push({ kind: 'catalog',
