@@ -179,7 +179,7 @@ const DEFAULT_SEGMENTS = {
    *   BLK-202609100066-MS-E350BO-28X2995X12000
    */
   blank: [
-    { type: 'fixed', value: 'BLK-' },
+    { type: 'fixed', value: 'CP-' },
     { type: 'attribute', field: 'orderRef' },
     { type: 'fixed', value: '-' },
     { type: 'attribute', field: 'material', fallback: 'X' },

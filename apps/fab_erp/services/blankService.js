@@ -32,7 +32,8 @@
  *
  * ── SCOPED TO THE ORDER, ON PURPOSE ──────────────────────────────────────────
  *
- * The blanks live under `Raw Materials > Blanks > <order number>`. A shared
+ * The blanks live under `Cut Plates > <order number>` (until 2026-09-18,
+ * `Raw Materials > Blanks > <order number>`). A shared
  * namespace was tried and rejected: every order would drop its rectangles into
  * one pile, and a year of bridges makes a catalogue nobody can read, in which
  * the interesting question — "what is THIS job cutting" — cannot be asked.
@@ -81,14 +82,65 @@ import { logger } from '../../../core/utils/logger.js';
 /** The flow a blank is cut by, unless the plan names another. */
 export const CUTTING_FLOW_CODE = 'C0001';
 
-/** Where blanks are filed. The group is expected to exist; the subgroup is per order. */
-const BLANK_CATEGORY = 'Raw Materials';
-const BLANK_GROUP = 'Blanks';
+/**
+ * WHERE CUT PLATES ARE FILED (2026-09-18): their own category, one GROUP per
+ * order — `Cut Plates › SO-20260910-0066`. They used to be `Raw Materials ›
+ * Blanks › <order>`, which hid them from pickers by accident of sitting under
+ * Raw Materials; now they are non-catalog items (catalogKind.js) and kept out
+ * on purpose. The category is created on first use. "Blank" stays the word in
+ * code (`material_form = 'blank'` is THE test, see blankPredicate.js); people
+ * see "cut plate".
+ */
+const CUT_PLATE_CATEGORY = 'Cut Plates';
+const CUT_PLATE_CATEGORY_CODE = 'cut';
 
 const codeBit = (s) => String(s ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
-/** "SO-20260910-0066" -> "202609100066": the letters say "sales order" on a code that already begins BLK. */
+/** "SO-20260910-0066" -> "202609100066": the letters say "sales order" on a code that already begins CP. */
 const orderRef = (orderNumber) => codeBit(String(orderNumber).replace(/^[A-Za-z]+-/, ''));
+
+/**
+ * A cut plate's code before 2026-09-18 began BLK- rather than CP-; everything
+ * after the prefix is the same derivation. Anything that finds a cut plate by
+ * code must accept both until `scripts/cut-plates-migrate.mjs` has recoded the
+ * old ones — and a sheet downloaded before that still carries BLK- for ever.
+ */
+export const legacyBlankCode = (code) => String(code ?? '').replace(/^CP-/, 'BLK-');
+
+/** The order's group under Cut Plates, created (or revived) on demand. */
+export async function ensureCutPlateGroup(conn, companyId, orderNumber) {
+  let [[cat]] = await conn.query(
+    `SELECT id, deleted_at FROM fab_item_categories
+      WHERE company_id = ? AND (code = ? OR name = ?) ORDER BY deleted_at IS NULL DESC LIMIT 1`,
+    [companyId, CUT_PLATE_CATEGORY_CODE, CUT_PLATE_CATEGORY],
+  );
+  if (!cat) {
+    const [r] = await conn.query(
+      `INSERT INTO fab_item_categories (company_id, name, code, description, is_system, shortform, default_cataloged, created_at)
+       VALUES (?, ?, ?, ?, 1, 'CP', 0, UTC_TIMESTAMP())`,
+      [companyId, CUT_PLATE_CATEGORY, CUT_PLATE_CATEGORY_CODE,
+        'Rectangles cut from plate for one order. Made by nesting; never bought or received.'],
+    );
+    cat = { id: r.insertId };
+  } else if (cat.deleted_at) {
+    await conn.query('UPDATE fab_item_categories SET deleted_at = NULL WHERE id = ?', [cat.id]);
+  }
+  let [[grp]] = await conn.query(
+    `SELECT id FROM fab_item_groups WHERE company_id = ? AND category_id = ? AND name = ? LIMIT 1`,
+    [companyId, cat.id, orderNumber],
+  );
+  if (!grp) {
+    const [r] = await conn.query(
+      `INSERT INTO fab_item_groups (company_id, category_id, name, code, description, created_at)
+       VALUES (?,?,?,?,?,UTC_TIMESTAMP())`,
+      [companyId, cat.id, orderNumber, `CP-${orderRef(orderNumber)}`, `Plates cut for ${orderNumber}`],
+    );
+    grp = { id: r.insertId };
+  } else {
+    await conn.query('UPDATE fab_item_groups SET deleted_at = NULL WHERE id = ?', [grp.id]);
+  }
+  return { categoryId: Number(cat.id), groupId: Number(grp.id) };
+}
 
 /**
  * Codes for blanks, from the company's 'blank' rule in the code generator.
@@ -109,7 +161,7 @@ export async function blankCodes(companyId, orderNumber, shapes) {
 
 export function blankName(orderNumber, { material, grade, thickness, width, length }) {
   const steel = [material, grade].filter(Boolean).join(' ');
-  return `${steel || 'Blank'} ${thickness} x ${width} x ${length} — ${orderNumber}`;
+  return `${steel || 'Cut plate'} ${thickness} x ${width} x ${length} — ${orderNumber}`;
 }
 
 /** The identity of a blank, as a string, for grouping. */
@@ -245,10 +297,12 @@ export async function orderBlanks(companyId, orderId, existingConn = null) {
   // MS-E350BO-16X1800X10000). Every blank on one order shares that prefix,
   // so nothing is lost inside the order, and it still reads as what it is —
   // unlike a running number, which changes when the BOM does.
-  const prefix = `BLK-${orderRef(order.orderNumber)}-`;
+  const prefix = `-${orderRef(order.orderNumber)}-`;
   blanks.forEach((b, i) => {
     b.code = codes[i];
-    b.ref = b.code.startsWith(prefix) ? b.code.slice(prefix.length) : b.code;
+    // Strip "CP-<order>-" (or the older "BLK-<order>-") to the short handle.
+    const at = b.code.indexOf(prefix);
+    b.ref = at >= 0 && at <= 4 ? b.code.slice(at + prefix.length) : b.code;
   });
   for (const b of blanks) {
     b.name = blankName(order.orderNumber, b);
@@ -284,36 +338,10 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
       return { orderNumber, created: 0, updated: 0, blanks, skipped };
     }
 
-    const [[group]] = await conn.query(
-      `SELECT g.id, g.category_id AS categoryId FROM fab_item_groups g
-         JOIN fab_item_categories c ON c.id = g.category_id
-        WHERE g.company_id = ? AND g.deleted_at IS NULL
-          AND g.name = ? AND c.name = ? LIMIT 1`,
-      [companyId, BLANK_GROUP, BLANK_CATEGORY],
-    );
-    if (!group) {
-      const e = new Error(`No "${BLANK_CATEGORY} > ${BLANK_GROUP}" group to file blanks under.`);
-      e.status = 500; throw e;
-    }
-
-    // One subgroup per order, named by the order. Created on demand, revived if
-    // a previous run of this order retired it.
-    let [[sub]] = await conn.query(
-      `SELECT id FROM fab_item_subgroups
-        WHERE company_id = ? AND group_id = ? AND name = ? LIMIT 1`,
-      [companyId, group.id, orderNumber],
-    );
-    if (!sub) {
-      const [r] = await conn.query(
-        `INSERT INTO fab_item_subgroups (company_id, group_id, name, code, description, created_at)
-         VALUES (?,?,?,?,?,UTC_TIMESTAMP())`,
-        [companyId, group.id, orderNumber, `BLK-${orderRef(orderNumber)}`,
-          `Blanks cut for ${orderNumber}`],
-      );
-      sub = { id: r.insertId };
-    } else {
-      await conn.query(`UPDATE fab_item_subgroups SET deleted_at = NULL WHERE id = ?`, [sub.id]);
-    }
+    // Cut Plates › <order>. The old "Raw Materials > Blanks" group no longer
+    // has to exist — a missing one used to be a 500.
+    const place = await ensureCutPlateGroup(conn, companyId, orderNumber);
+    const group = { id: place.groupId, categoryId: place.categoryId };
 
     let created = 0;
     let updated = 0;
@@ -322,18 +350,22 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
     const fieldRows = [];
 
     for (const b of blanks) {
+      // Found by its code, or by the BLK- code it carried before 2026-09-18 —
+      // otherwise the first re-nest after the rename would mint a second copy
+      // of every cut plate beside the old one. The CP- one wins if both exist.
       const [[existing]] = await conn.query(
-        `SELECT id FROM fab_item_catalog WHERE company_id = ? AND code = ? LIMIT 1`,
-        [companyId, b.code],
+        `SELECT id FROM fab_item_catalog WHERE company_id = ? AND code IN (?, ?)
+          ORDER BY (code = ?) DESC LIMIT 1`,
+        [companyId, b.code, legacyBlankCode(b.code), b.code],
       );
       if (existing) {
         await conn.query(
           `UPDATE fab_item_catalog
-              SET name = ?, unit = 'nos', category_id = ?, group_id = ?, subgroup_id = ?,
+              SET name = ?, code = ?, unit = 'nos', category_id = ?, group_id = ?, subgroup_id = NULL,
                   procurement_type = 'make', thickness_mm = ?, density_kg_m3 = ?,
                   material_form = 'blank', is_cataloged = 0, deleted_at = NULL
             WHERE id = ? AND company_id = ?`,
-          [b.name, group.categoryId, group.id, sub.id, b.thickness, b.density, existing.id, companyId],
+          [b.name, b.code, group.categoryId, group.id, b.thickness, b.density, existing.id, companyId],
         );
         b.catalogItemId = Number(existing.id);
         updated += 1;
@@ -354,8 +386,8 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
           `INSERT INTO fab_item_catalog
              (company_id, name, code, unit, category_id, group_id, subgroup_id,
               procurement_type, thickness_mm, density_kg_m3, material_form, is_cataloged, description, created_at)
-           VALUES (?,?,?,'nos',?,?,?,'make',?,?,'blank',0,?,UTC_TIMESTAMP())`,
-          [companyId, b.name, b.code, group.categoryId, group.id, sub.id, b.thickness, b.density,
+           VALUES (?,?,?,'nos',?,?,NULL,'make',?,?,'blank',0,?,UTC_TIMESTAMP())`,
+          [companyId, b.name, b.code, group.categoryId, group.id, b.thickness, b.density,
             `${b.material} ${b.grade} plate, ${b.thickness} x ${b.width} x ${b.length}, cut for ${orderNumber}.`],
         );
         b.catalogItemId = r.insertId;
@@ -393,11 +425,16 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
      * bought for.
      */
     const live = blanks.map((b) => b.catalogItemId).filter(Boolean);
+    // …but never one that is physically in the yard: a cut plate with stock
+    // (cut, not yet used) is steel, and retiring its item would orphan it.
     const [stale] = await conn.query(
-      `SELECT id, code FROM fab_item_catalog
-        WHERE company_id = ? AND subgroup_id = ? AND deleted_at IS NULL
-          ${live.length ? 'AND id NOT IN (?)' : ''}`,
-      live.length ? [companyId, sub.id, live] : [companyId, sub.id],
+      `SELECT c.id, c.code FROM fab_item_catalog c
+        WHERE c.company_id = ? AND c.group_id = ? AND c.material_form = 'blank' AND c.deleted_at IS NULL
+          ${live.length ? 'AND c.id NOT IN (?)' : ''}
+          AND NOT EXISTS (SELECT 1 FROM fab_stock_pieces p
+                           WHERE p.catalog_item_id = c.id AND p.deleted_at IS NULL
+                             AND p.status IN ('in_stock', 'wip') AND p.qty > 0)`,
+      live.length ? [companyId, group.id, live] : [companyId, group.id],
     );
     if (stale.length) {
       await conn.query(
@@ -409,7 +446,7 @@ export async function materialiseBlanks(companyId, orderId, existingConn = null)
     if (owned) await conn.commit();
     return {
       orderNumber, created, updated, retired: stale.length,
-      subgroupId: Number(sub.id), blanks, skipped,
+      groupId: Number(group.id), blanks, skipped,
     };
   } catch (err) {
     if (owned) await conn.rollback();

@@ -46,7 +46,7 @@
 import ExcelJS from 'exceljs';
 import { pool } from '../../../db.js';
 import { blankPlan } from './blankPlanService.js';
-import { orderBlanks } from './blankService.js';
+import { orderBlanks, legacyBlankCode } from './blankService.js';
 import { plateCatalog } from './plateSourceService.js';
 import { plateFits } from './materialMatchService.js';
 
@@ -65,8 +65,8 @@ const ON_HAND_SHEET = 'Plates on hand';  // visible: the same plates, for readin
  * reads.
  */
 const HEADERS = [
-  'Blank', 'Blank (T x W x L)', 'Material', 'Grade', 'Needed',
-  'Nest', 'Plate code', 'Qty on this sheet', 'Blank full code',
+  'Cut plate', 'Cut plate (T x W x L)', 'Material', 'Grade', 'Needed',
+  'Nest', 'Plate code', 'Qty on this sheet', 'Cut plate full code',
 ];
 const COL = { blank: 1, size: 2, material: 3, grade: 4, needed: 5, nest: 6, plate: 7, qty: 8, full: 9 };
 
@@ -132,8 +132,8 @@ export async function exportPlan(companyId, orderId, opts = {}) {
   const ws = wb.addWorksheet(SHEET);
 
   ws.addRow([`How it gets cut — ${plan.orderNumber}`]);
-  ws.addRow(['1. Fill Nest and Plate code on each row. Plate code is a dropdown of plates that match the blank; a size like 25x2000x12000 also works.']);
-  ws.addRow(['2. Copy a row to split a blank across sheets; set Qty on this sheet on each copy.']);
+  ws.addRow(['1. Fill Nest and Plate code on each row. Plate code is a dropdown of plates that match the cut plate; a size like 25x2000x12000 also works.']);
+  ws.addRow(['2. Copy a row to split a cut plate across sheets; set Qty on this sheet on each copy.']);
   ws.addRow(['3. Rows with the same Nest are ONE plate. Leave Nest empty and the upload numbers that row\'s sheet for you.']);
   ws.addRow([]);
   ws.getRow(1).font = { bold: true, size: 13 };
@@ -225,8 +225,8 @@ export async function exportPlan(companyId, orderId, opts = {}) {
    * see the demand without going back to the screen — and so the file is a
    * complete statement of the job rather than half of one.
    */
-  const ds = wb.addWorksheet('Blanks needed');
-  ds.addRow(['Blank', 'Blank (T x W x L)', 'Material', 'Grade', 'Needed', 'Weight each (kg)', 'Serves parts', 'Blank full code'])
+  const ds = wb.addWorksheet('Cut plates needed');
+  ds.addRow(['Cut plate', 'Cut plate (T x W x L)', 'Material', 'Grade', 'Needed', 'Weight each (kg)', 'Serves parts', 'Cut plate full code'])
     .font = { bold: true };
   for (const b of plan.blanks) {
     ds.addRow([
@@ -299,13 +299,14 @@ export async function importPlan(companyId, orderId, buffer) {
     const h = headerText(cell);
     if (h === 'nest') col.nest = c;
     else if (h === 'plate code') col.plate = c;
-    else if (h === 'blank' || h === 'blank code') col.blank = col.blank ?? c;
-    else if (h === 'blank full code') col.blankFull = c;
+    // "Blank" headers are the pre-2026-09-18 sheets; both still read.
+    else if (h === 'blank' || h === 'blank code' || h === 'cut plate' || h === 'cut plate code') col.blank = col.blank ?? c;
+    else if (h === 'blank full code' || h === 'cut plate full code') col.blankFull = c;
     else if (h.startsWith('qty')) col.qty = c;
   });
   const missing = ['nest', 'plate', 'blank', 'qty'].filter((k) => !col[k]);
   if (missing.length) {
-    const e = new Error('The header must have Nest, Plate code, Blank and Qty columns.');
+    const e = new Error('The header must have Nest, Plate code, Cut plate and Qty columns.');
     e.status = 400; throw e;
   }
   const rows = [];
@@ -370,6 +371,8 @@ export async function importPlanRows(companyId, orderId, inputRows) {
   const keyByCode = new Map([
     ...plan.blanks.map((b) => [String(b.code).trim().toUpperCase(), b.key]),
     ...plan.blanks.map((b) => [String(b.ref).trim().toUpperCase(), b.key]),
+    // A sheet downloaded before the CP- rename carries BLK- full codes.
+    ...plan.blanks.map((b) => [legacyBlankCode(String(b.code).trim().toUpperCase()), b.key]),
   ]);
 
   /** A plate reference on a row → {id, code} | {ambiguous: codes[]} | null. */
@@ -408,7 +411,7 @@ export async function importPlanRows(companyId, orderId, inputRows) {
     if (!nestNo && !plateRaw) { unplanned += 1; continue; } // a blank left for later
 
     const key = keyByCode.get(blankCode);
-    if (!key) { problems.push(`Row ${n}: "${blankCode || '(blank)'}" is not a blank this order needs (use the Blank column as the sheet gives it).`); continue; }
+    if (!key) { problems.push(`Row ${n}: "${blankCode || '(blank)'}" is not a cut plate this order needs (use the Cut plate column as the sheet gives it).`); continue; }
     if (!Number.isFinite(qty) || qty <= 0) { problems.push(`Row ${n}: quantity "${r.qtyRaw}" is not a positive number.`); continue; }
 
     let plate = null;

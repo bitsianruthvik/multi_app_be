@@ -44,7 +44,8 @@ const num = (v) => {
 /** DXF TEXT has no escaping for the group's own characters — keep labels plain ASCII. */
 const safeText = (s) => String(s ?? '').replace(/[^\x20-\x7E]/g, '?').slice(0, 250);
 
-const handleOf = (blank) => blank?.ref ?? String(blank?.code ?? '').replace(/^BLK-\d+-/, '');
+// CP- since 2026-09-18; BLK- before (older sheets and plans still carry it).
+const handleOf = (blank) => blank?.ref ?? String(blank?.code ?? '').replace(/^(?:CP|BLK)-\d+-/, '');
 
 /**
  * The DXF text for one sheet — pure; nothing is read here.
