@@ -31,6 +31,7 @@ import { assertNoStartedWork } from './itemGuards.js';
 import { afterStructureWrite } from './itemShapeService.js';
 import { recordRevision } from './orderRevisionService.js';
 import { orderRowCodeRanges, shortName, segmentFromShortCode } from './codegenService.js';
+import { pickOf, assertPickFilter, assertInPick, pickCandidates } from './catalogKind.js';
 
 /** Row-level steel, carried in `dims` beside the sizes: text fields, not numbers. */
 const STEEL_KEYS = new Set(['material', 'grade']);
@@ -76,10 +77,18 @@ export async function bomFor(companyId, parentItemId, conn = null) {
             b.help_text AS helpText, b.sort_order AS sortOrder,
             b.default_flow_id AS defaultFlowId, f.name AS defaultFlowName, b.code_join AS codeJoin,
             b.explode AS explode,
+            b.pick_category_id AS pickCategoryId, b.pick_group_id AS pickGroupId,
+            b.pick_subgroup_id AS pickSubgroupId, b.pick_default_item_id AS pickDefaultItemId,
+            pd.name AS pickDefaultName, pd.code AS pickDefaultCode,
+            pcat.name AS pickCategoryName, pgrp.name AS pickGroupName, psub.name AS pickSubgroupName,
             c.code AS childCode, c.short_code AS childShort, c.name AS childName, c.unit AS childUnit,
             c.procurement_type AS childProcurement,
             c.category_id AS childCategoryId
        FROM fab_item_bom b
+       LEFT JOIN fab_item_catalog pd ON pd.id = b.pick_default_item_id
+       LEFT JOIN fab_item_categories pcat ON pcat.id = b.pick_category_id
+       LEFT JOIN fab_item_groups pgrp ON pgrp.id = b.pick_group_id
+       LEFT JOIN fab_item_subgroups psub ON psub.id = b.pick_subgroup_id
        JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
        LEFT JOIN fab_operation_flows f ON f.id = b.default_flow_id AND f.deleted_at IS NULL
       WHERE b.company_id = ? AND b.parent_item_id = ? AND b.deleted_at IS NULL AND b.active = 1
@@ -113,6 +122,17 @@ export async function bomFor(companyId, parentItemId, conn = null) {
   for (const r of rows) {
     r.defaults = byLine.get(Number(r.id)) ?? {};
     r.explode = !!Number(r.explode);
+    // One object for the filter (null on an ordinary line), with names so the
+    // designer can print "Pick: Standard Parts › Plate Stiffeners" unaided.
+    const p = pickOf(r);
+    r.pick = p && {
+      ...p,
+      categoryName: r.pickCategoryName ?? null, groupName: r.pickGroupName ?? null,
+      subgroupName: r.pickSubgroupName ?? null,
+      defaultItemName: r.pickDefaultName ?? null, defaultItemCode: r.pickDefaultCode ?? null,
+    };
+    for (const k of ['pickCategoryId', 'pickGroupId', 'pickSubgroupId', 'pickDefaultItemId', 'pickDefaultName',
+      'pickDefaultCode', 'pickCategoryName', 'pickGroupName', 'pickSubgroupName']) delete r[k];
   }
   return rows;
 }
@@ -143,10 +163,18 @@ async function bomIndex(companyId, rootIds, conn = null) {
               b.per_instance_qty AS perInstanceQty, b.code_segment AS codeSegment,
               b.help_text AS helpText, b.sort_order AS sortOrder,
               b.default_flow_id AS defaultFlowId, b.code_join AS codeJoin, b.explode AS explode,
+              b.pick_category_id AS pickCategoryId, b.pick_group_id AS pickGroupId,
+              b.pick_subgroup_id AS pickSubgroupId, b.pick_default_item_id AS pickDefaultItemId,
+              pcat.name AS pickCategoryName, pgrp.name AS pickGroupName, psub.name AS pickSubgroupName,
+              pd.name AS pickDefaultName,
               c.code AS childCode, c.short_code AS childShort, c.name AS childName, c.unit AS childUnit,
               c.procurement_type AS childProcurement
          FROM fab_item_bom b
          JOIN fab_item_catalog c ON c.id = b.child_item_id AND c.deleted_at IS NULL
+         LEFT JOIN fab_item_categories pcat ON pcat.id = b.pick_category_id
+         LEFT JOIN fab_item_groups pgrp ON pgrp.id = b.pick_group_id
+         LEFT JOIN fab_item_subgroups psub ON psub.id = b.pick_subgroup_id
+         LEFT JOIN fab_item_catalog pd ON pd.id = b.pick_default_item_id
         WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.active = 1
           AND b.parent_item_id IN (?)
         ORDER BY b.sort_order, c.code`,
@@ -717,7 +745,14 @@ export async function structureOutline(companyId, rootItemId, opts = {}) {
  *
  * @returns {Promise<object>} the root, children nested, ready to be edited
  */
-export async function draftTree(companyId, rootItemId, conn = null) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.resolvePicks=true] fill pick nodes with the item the
+ *   ORDER starts with. The template DESIGNER passes false: there a node's
+ *   `catalogItemId` must stay the line's own child (the role), or saving a flow
+ *   edit would write the default stiffener in as the line's child.
+ */
+export async function draftTree(companyId, rootItemId, conn = null, { resolvePicks: doResolve = true } = {}) {
   const exec = conn ?? pool;
   const byParent = await bomIndex(companyId, [rootItemId], exec);
   const [[root]] = await exec.query(
@@ -788,6 +823,20 @@ export async function draftTree(companyId, rootItemId, conn = null) {
          * them to be wrong, and the catalogue's is the one that gets read.
          */
         procurementType: line.childProcurement ?? 'make',
+        /*
+         * A PICK LINE: the child is the ROLE (its name, code segment and flow);
+         * `pick` is the filter the order chooses a catalog item from. The row's
+         * `catalogItemId` becomes that choice — the default, or the only item
+         * in the filter — and stays null until somebody picks (readiness then
+         * refuses Confirm). Filled in by `resolvePicks` below.
+         */
+        roleItemId: pickOf(line) ? Number(line.childItemId) : null,
+        // Names ride with the ids so a screen can say "Plate Stiffeners".
+        pick: pickOf(line) && {
+          ...pickOf(line),
+          categoryName: line.pickCategoryName ?? null, groupName: line.pickGroupName ?? null,
+          subgroupName: line.pickSubgroupName ?? null, defaultItemName: line.pickDefaultName ?? null,
+        },
         children: cyclic ? [] : build(line.childItemId, depth + 1, new Set([...seen, Number(line.childItemId)])),
       };
     });
@@ -808,9 +857,13 @@ export async function draftTree(companyId, rootItemId, conn = null) {
     bomLineId: null,
     variesPerJob: false,
     procurementType: 'make',
+    roleItemId: null,
+    pick: null,
     dims: {},
     children: build(Number(root.id), 0, new Set([Number(root.id)])),
   };
+
+  if (doResolve) await resolvePicks(exec, companyId, tree);
 
   /*
    * SIZES THE RECIPE STATES, attached to the nodes that came from a line.
@@ -908,6 +961,114 @@ export async function draftTree(companyId, rootItemId, conn = null) {
   return tree;
 }
 
+/**
+ * Fill each PICK node's `catalogItemId` with the item the order starts with:
+ * the line's default, else the only catalog item in the filter, else null
+ * (somebody must choose — readiness says so). A picked node also takes the
+ * item's unit and make/buy, because the row IS that item now: a picked shear
+ * stud is bought, a picked stiffener is made.
+ */
+async function resolvePicks(exec, companyId, tree) {
+  const nodes = [];
+  const walk = (n) => { if (n.pick) nodes.push(n); (n.children ?? []).forEach(walk); };
+  walk(tree);
+  if (!nodes.length) return;
+
+  const soleByFilter = new Map();
+  for (const n of nodes) {
+    if (n.pick.defaultItemId != null) { n.catalogItemId = n.pick.defaultItemId; continue; }
+    const k = `${n.pick.categoryId}|${n.pick.groupId ?? ''}|${n.pick.subgroupId ?? ''}`;
+    if (!soleByFilter.has(k)) {
+      const two = await pickCandidates(exec, companyId, n.pick, { limit: 2 });
+      soleByFilter.set(k, two.length === 1 ? Number(two[0].id) : null);
+    }
+    n.catalogItemId = soleByFilter.get(k);
+  }
+
+  const chosen = [...new Set(nodes.map((n) => n.catalogItemId).filter((v) => v != null))];
+  if (!chosen.length) return;
+  const [items] = await exec.query(
+    `SELECT id, name, unit, procurement_type AS procurementType FROM fab_item_catalog
+      WHERE company_id = ? AND id IN (?)`,
+    [companyId, chosen],
+  );
+  const byId = new Map(items.map((i) => [Number(i.id), i]));
+  for (const n of nodes) {
+    const it = n.catalogItemId != null ? byId.get(Number(n.catalogItemId)) : null;
+    if (!it) { n.catalogItemId = null; continue; }
+    n.pickedName = it.name;
+    n.unit = it.unit ?? n.unit;
+    n.procurementType = it.procurementType ?? n.procurementType;
+  }
+}
+
+/** `assertPicksInFilter`, but reading each filter off the stored BOM line by `bomLineId`. */
+async function assertTreePicksAgainstLines(conn, companyId, tree) {
+  const picked = [];
+  const walk = (n) => {
+    if (n.roleItemId != null && n.bomLineId != null && n.catalogItemId != null) picked.push(n);
+    (n.children ?? []).forEach(walk);
+  };
+  walk(tree);
+  if (!picked.length) return;
+  const [lines] = await conn.query(
+    `SELECT id, pick_category_id, pick_group_id, pick_subgroup_id, pick_default_item_id
+       FROM fab_item_bom WHERE company_id = ? AND id IN (?)`,
+    [companyId, [...new Set(picked.map((n) => Number(n.bomLineId)))]],
+  );
+  const filterOf = new Map(lines.map((l) => [Number(l.id), pickOf(l)]));
+  for (const n of picked) {
+    const f = filterOf.get(Number(n.bomLineId));
+    if (f) await assertInPick(conn, companyId, f, [n.catalogItemId]);
+  }
+}
+
+/** Catalog items' own thickness and width (field values, thickness column as fallback). */
+async function catalogThicknessWidth(conn, companyId, ids) {
+  const out = new Map();
+  const list = [...new Set(ids.map(Number))];
+  if (!list.length) return out;
+  const [vals] = await conn.query(
+    `SELECT v.scope_id AS id, f.field_key AS k, v.value_num AS n
+       FROM fab_field_values v JOIN fab_fields f ON f.id = v.field_id
+      WHERE v.company_id = ? AND v.scope = 'catalog_item' AND v.scope_id IN (?)
+        AND v.deleted_at IS NULL AND v.value_num IS NOT NULL
+        AND f.field_key IN ('thickness_mm', 'width_mm')`,
+    [companyId, list],
+  );
+  for (const v of vals) out.set(Number(v.id), { ...(out.get(Number(v.id)) ?? {}), [v.k]: Number(v.n) });
+  const [cols] = await conn.query(
+    'SELECT id, thickness_mm AS t FROM fab_item_catalog WHERE company_id = ? AND id IN (?) AND thickness_mm IS NOT NULL',
+    [companyId, list],
+  );
+  for (const c of cols) {
+    const e = out.get(Number(c.id)) ?? {};
+    if (e.thickness_mm == null) e.thickness_mm = Number(c.t);
+    out.set(Number(c.id), e);
+  }
+  return out;
+}
+
+/**
+ * Refuse a tree whose picks fall outside their lines' filters. The editor only
+ * offers items inside the filter; this is what holds when a sheet import, a
+ * stale tab or a hand-crafted request says otherwise.
+ */
+async function assertPicksInFilter(conn, companyId, tree) {
+  const byFilter = new Map();
+  const walk = (n) => {
+    if (n.pick && n.catalogItemId != null) {
+      const k = JSON.stringify([n.pick.categoryId, n.pick.groupId ?? null, n.pick.subgroupId ?? null]);
+      const e = byFilter.get(k) ?? { pick: n.pick, ids: [] };
+      e.ids.push(Number(n.catalogItemId));
+      byFilter.set(k, e);
+    }
+    (n.children ?? []).forEach(walk);
+  };
+  walk(tree);
+  for (const { pick, ids } of byFilter.values()) await assertInPick(conn, companyId, pick, ids);
+}
+
 /** Does this row state a real quantity? */
 function hasQty(node) {
   const n = Number(node?.qty);
@@ -993,7 +1154,14 @@ function rowUnchanged(was, node, parentItemId, depth, isLeaf, position, unit) {
      * were chosen on a step of their own; it matters now that they are chosen
      * here.
      */
-    && Number(was.flowId ?? 0) === Number(node.defaultFlowId ?? 0);
+    && Number(was.flowId ?? 0) === Number(node.defaultFlowId ?? 0)
+    /*
+     * AND, FOR A PICKED ROW, WHICH ITEM FILLS IT. Choosing the stiffener is an
+     * edit like any other — and through this same function the started-row
+     * guard refuses it once work on that row has begun. Only picked rows: any
+     * other row's catalog item is the design itself and is not edited here.
+     */
+    && (was.roleItemId == null || Number(was.catalogItemId ?? 0) === Number(node.catalogItemId ?? 0));
 }
 
 /**
@@ -1112,6 +1280,68 @@ export async function setBomLine(companyId, line, existingConn = null) {
       }
     }
 
+    /*
+     * PICK LINE — "any catalog item in this filter", chosen per order.
+     *
+     * `line.pick` undefined on an edit keeps what the line has (the designer's
+     * partial saves — a flow change, a qty edit — must not wipe the filter);
+     * `null` clears it; an object sets it. See catalogKind.js.
+     */
+    let pick;
+    if (line.pick === undefined) {
+      pick = null;
+      if (id) {
+        const [[prior]] = await conn.query(
+          `SELECT pick_category_id, pick_group_id, pick_subgroup_id, pick_default_item_id
+             FROM fab_item_bom WHERE id = ? AND company_id = ?`,
+          [id, companyId],
+        );
+        pick = pickOf(prior);
+      }
+    } else if (line.pick === null) {
+      pick = null;
+    } else {
+      pick = {
+        categoryId: line.pick.categoryId != null && line.pick.categoryId !== '' ? Number(line.pick.categoryId) : null,
+        groupId: line.pick.groupId != null && line.pick.groupId !== '' ? Number(line.pick.groupId) : null,
+        subgroupId: line.pick.subgroupId != null && line.pick.subgroupId !== '' ? Number(line.pick.subgroupId) : null,
+        defaultItemId: line.pick.defaultItemId != null && line.pick.defaultItemId !== '' ? Number(line.pick.defaultItemId) : null,
+      };
+      await assertPickFilter(conn, companyId, pick);
+    }
+    if (pick && line.defaults
+      && ['thickness_mm', 'width_mm'].some((k) => line.defaults[k] !== '' && line.defaults[k] != null)) {
+      // The picked catalog item carries its own thickness and width (a
+      // "Stiffener Plate 12 × 170"). Stated again on the recipe they would be
+      // copied onto the order row and quietly beat the item's. Length is
+      // different: it is set per design (D7, 2026-09-18), so it may default here.
+      const e = new Error('A pick line takes its thickness and width from the item picked — only a length may be set on the line.');
+      e.status = 400;
+      throw e;
+    }
+
+    /*
+     * A CATALOG item's BOM is EXACT (product owner, 2026-09-18): fixed
+     * quantities, catalog children, nothing chosen per job. Anything looser is
+     * a template, and belongs on a non-catalog parent.
+     */
+    const [kinds] = await conn.query(
+      'SELECT id, is_cataloged FROM fab_item_catalog WHERE company_id = ? AND id IN (?)',
+      [companyId, [parentItemId, childItemId]],
+    );
+    const catalogedById = new Map(kinds.map((k) => [Number(k.id), Number(k.is_cataloged)]));
+    if (catalogedById.get(Number(parentItemId)) === 1) {
+      const why = hasParam ? 'a quantity that varies per job'
+        : pick ? 'a pick line'
+          : catalogedById.get(Number(childItemId)) === 0 ? 'a template part or cut plate as a child' : null;
+      if (why) {
+        const e = new Error(`This is a catalog item, so its BOM must be exact — it cannot have ${why}. Put it on a template instead.`);
+        e.status = 400;
+        e.code = 'CATALOG_BOM_NOT_EXACT';
+        throw e;
+      }
+    }
+
     const cols = [
       companyId, parentItemId, childItemId,
       hasNum ? Number(line.qtyNum) : null,
@@ -1125,6 +1355,10 @@ export async function setBomLine(companyId, line, existingConn = null) {
       line.defaultFlowId == null || line.defaultFlowId === '' ? null : Number(line.defaultFlowId),
       explodeVal,
       codeJoinVal,
+      pick?.categoryId ?? null,
+      pick?.groupId ?? null,
+      pick?.subgroupId ?? null,
+      pick?.defaultItemId ?? null,
     ];
 
     let lineId = id ? Number(id) : null;
@@ -1133,7 +1367,8 @@ export async function setBomLine(companyId, line, existingConn = null) {
         `UPDATE fab_item_bom
             SET parent_item_id=?, child_item_id=?, qty_num=?, qty_param=?, default_qty=?,
                 per_instance_qty=?, code_segment=?, help_text=?, sort_order=?, default_flow_id=?,
-                explode=?, code_join=?
+                explode=?, code_join=?,
+                pick_category_id=?, pick_group_id=?, pick_subgroup_id=?, pick_default_item_id=?
           WHERE id=? AND company_id=?`,
         [...cols.slice(1), id, companyId],
       );
@@ -1142,8 +1377,9 @@ export async function setBomLine(companyId, line, existingConn = null) {
         `INSERT INTO fab_item_bom
            (company_id, parent_item_id, child_item_id, qty_num, qty_param, default_qty,
             per_instance_qty, code_segment, help_text, sort_order, default_flow_id,
-            explode, code_join)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            explode, code_join,
+            pick_category_id, pick_group_id, pick_subgroup_id, pick_default_item_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         cols,
       );
       lineId = ins.insertId;
@@ -1458,6 +1694,10 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
      * made here, which is the same rule the importer used.
      */
     const { unitOf, procurementOf } = await catalogKindsFor(conn, companyId, catalogIdsOf(tree));
+    // Every pick that HAS been made must be inside its line's filter. One not
+    // made yet is allowed through as catalog_item_id NULL — the order is a
+    // draft, and readiness refuses Confirm until somebody chooses.
+    await assertPicksInFilter(conn, companyId, tree);
 
     let created = 0;
     let seeded = 0;
@@ -1466,6 +1706,8 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
     const fromBomLine = [];
     /** (item id, field key, value) for sizes stated on the tree that was sent. */
     const nodeDims = [];
+    /** (item id, picked catalog item id) — their thickness/width come from the item. */
+    const pickedRows = [];
 
     /**
      * NO CODE IS WRITTEN HERE, deliberately.
@@ -1514,21 +1756,25 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
       const rows = currentLevel.map(({ node, parentItemId, position }) => {
         const kids = Array.isArray(node.children) ? node.children : [];
         return [
-          companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+          companyId, orderId, orderLineId, parentItemId, node.catalogItemId ?? null,
           node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos',
           Number(node.qty),
           depth, kids.length ? 0 : 1,
           procurementOf.get(Number(node.catalogItemId)) ?? 'make',
           node.defaultFlowId ?? null,
           position,
+          // A picked row remembers the ROLE it fills (name, code segment,
+          // flow) apart from the item that fills it (catalog_item_id).
+          node.pick ? (node.roleItemId ?? null) : null,
+          node.bomLineId ?? null,
         ];
       });
       await conn.query(
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
-            flow_id, sort_order)
-         VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)").join(',')}`,
+            flow_id, sort_order, role_item_id, bom_line_id)
+         VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?,?,?)").join(',')}`,
         rows.flat(),
       );
 
@@ -1562,9 +1808,14 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
             // Material and grade ride along with the sizes: TEXT the row
             // states for itself, over the line's steel (2026-09-16).
             if (STEEL_KEYS.has(k)) { const s = String(v ?? '').trim(); if (s) nodeDims.push([id, k, s]); continue; }
+            // A picked row's thickness and width are the PICKED ITEM's — the
+            // tree may still carry the default's if somebody changed the pick
+            // in the editor. Written from the catalog below instead.
+            if (node.pick && (k === 'thickness_mm' || k === 'width_mm')) continue;
             if (Number.isFinite(Number(v))) nodeDims.push([id, k, Number(v)]);
           }
         }
+        if (node.pick && node.catalogItemId != null) pickedRows.push([id, Number(node.catalogItemId)]);
         const kids = Array.isArray(node.children) ? node.children : [];
         kids.forEach((child, i) => nextLevel.push({ node: child, parentItemId: id, position: i }));
       }
@@ -1636,6 +1887,18 @@ export async function buildFromTree(companyId, spec, existingConn = null) {
       await setFieldsBulk(companyId, 'order_item', rows, conn);
     }
 
+    // A picked row's thickness and width, from the item picked (last, so they win).
+    if (pickedRows.length) {
+      const own = await catalogThicknessWidth(conn, companyId, pickedRows.map(([, c]) => c));
+      const rows = [];
+      for (const [itemId, catId] of pickedRows) {
+        const s = own.get(catId) ?? {};
+        if (s.thickness_mm != null) rows.push({ scopeId: itemId, key: 'thickness_mm', value: s.thickness_mm });
+        if (s.width_mm != null) rows.push({ scopeId: itemId, key: 'width_mm', value: s.width_mm });
+      }
+      if (rows.length) await setFieldsBulk(companyId, 'order_item', rows, conn);
+    }
+
     // Shape, weight, procurement and derived fields, all for this write, all on
     // this connection — see itemShapeService.afterStructureWrite.
     await afterStructureWrite(conn, companyId, orderId);
@@ -1700,7 +1963,8 @@ export async function duplicateSubtree(companyId, orderId, itemId, existingConn 
      */
     const [all] = await conn.query(
       `SELECT id, parent_item_id, order_line_id, catalog_item_id, name, unit, qty,
-              flow_id, procurement_type, node_kind, depth, is_leaf, dim_unit, weight_unit
+              flow_id, procurement_type, node_kind, depth, is_leaf, dim_unit, weight_unit,
+              role_item_id, bom_line_id
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
           AND NOT node_kind = 'material'
@@ -1719,14 +1983,17 @@ export async function duplicateSubtree(companyId, orderId, itemId, existingConn 
 
     const copy = async (row, newParentId) => {
       const [ins] = await conn.query(
+        // role_item_id / bom_line_id travel with the copy: a copied stiffener
+        // row still fills the same role and still picks from the same filter.
         `INSERT INTO fab_items
            (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
             name, unit, qty, flow_id, procurement_type, node_kind, depth, is_leaf,
-            dim_unit, weight_unit)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            dim_unit, weight_unit, role_item_id, bom_line_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [companyId, orderId, row.order_line_id, newParentId, row.catalog_item_id,
           row.name, row.unit, row.qty, row.flow_id, row.procurement_type,
-          row.node_kind, row.depth, row.is_leaf, row.dim_unit, row.weight_unit],
+          row.node_kind, row.depth, row.is_leaf, row.dim_unit, row.weight_unit,
+          row.role_item_id ?? null, row.bom_line_id ?? null],
       );
       idMap.set(Number(row.id), ins.insertId);
       created += 1;
@@ -1795,9 +2062,20 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
             COALESCE(i.procurement_type, 'make') AS procurementType,
             -- The row's own code (written at deploy, NULL before) and the code
             -- of the catalog item it is — the screen shows whichever it has.
-            i.code, c.code AS catalogCode
+            i.code, c.code AS catalogCode,
+            -- A picked row: the role it fills and its recipe line's filter, so
+            -- the editor can offer the same choice again.
+            i.role_item_id AS roleItemId, i.bom_line_id AS bomLineId,
+            b.pick_category_id AS pickCategoryId, b.pick_group_id AS pickGroupId,
+            b.pick_subgroup_id AS pickSubgroupId, b.pick_default_item_id AS pickDefaultItemId,
+            pcat.name AS pickCategoryName, pgrp.name AS pickGroupName, psub.name AS pickSubgroupName,
+            c.name AS pickedName
        FROM fab_items i
        LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
+       LEFT JOIN fab_item_bom b ON b.id = i.bom_line_id AND i.role_item_id IS NOT NULL
+       LEFT JOIN fab_item_categories pcat ON pcat.id = b.pick_category_id
+       LEFT JOIN fab_item_groups pgrp ON pgrp.id = b.pick_group_id
+       LEFT JOIN fab_item_subgroups psub ON psub.id = b.pick_subgroup_id
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND NOT i.node_kind = 'material' ${lineScope.replace('order_line_id', 'i.order_line_id')}
         AND ${NOT_A_BLANK('i')}
@@ -1837,8 +2115,14 @@ export async function currentTree(companyId, orderId, orderLineId = null, conn =
     codeSegment: null,
     codeJoin: 'dash',
     defaultFlowId: r.flowId == null ? null : Number(r.flowId),
-    bomLineId: null,
+    bomLineId: r.bomLineId == null ? null : Number(r.bomLineId),
     qtyParam: null,
+    roleItemId: r.roleItemId == null ? null : Number(r.roleItemId),
+    pick: r.roleItemId == null || !pickOf(r) ? null : {
+      ...pickOf(r),
+      categoryName: r.pickCategoryName ?? null, groupName: r.pickGroupName ?? null, subgroupName: r.pickSubgroupName ?? null,
+    },
+    pickedName: r.roleItemId == null ? null : (r.pickedName ?? null),
     children: (kids.get(String(r.id)) ?? []).map(build),
   });
   const roots = kids.get('root') ?? [];
@@ -1933,7 +2217,8 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
 
     const [existing] = await conn.query(
       `SELECT id, parent_item_id AS parentItemId, name, unit, qty, depth, is_leaf AS isLeaf,
-              sort_order AS sortOrder, flow_id AS flowId
+              sort_order AS sortOrder, flow_id AS flowId,
+              catalog_item_id AS catalogItemId, role_item_id AS roleItemId, bom_line_id AS bomLineId
          FROM fab_items
         WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
           AND NOT node_kind = 'material' ${lineScope.sql}
@@ -1951,6 +2236,9 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
     const existingIds = existing.map((r) => Number(r.id));
 
     const { unitOf, procurementOf } = await catalogKindsFor(conn, companyId, catalogIdsOf(tree));
+    // Every picked row — kept, changed or copied — is checked against the
+    // filter on its recipe line as stored, never a filter the request carried.
+    await assertTreePicksAgainstLines(conn, companyId, tree);
 
     /*
      * Sizes and shop-floor history for the rows already on this line, fetched
@@ -2010,6 +2298,8 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
     let updated = 0;
     /** (item id, field key, value|null) for every size the tree carried. */
     const dimEdits = [];
+    /** (item id, new catalog item id|null) for every picked row whose item changed. */
+    const pickChanged = [];
 
     /*
      * BATCHED PER DEPTH, like `buildFromTree` — see its header comment for why
@@ -2059,6 +2349,30 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
             );
             updated += 1;
           }
+          // A PICK CHANGED: the row is now a different catalog item. Checked
+          // against the filter stored on its recipe line (never one the
+          // request carried), and the row takes the new item's make/buy.
+          const newPick = node.catalogItemId == null ? null : Number(node.catalogItemId);
+          if (was.roleItemId != null && Number(was.catalogItemId ?? 0) !== Number(newPick ?? 0)) {
+            if (newPick != null) {
+              const [[line]] = await conn.query(
+                `SELECT pick_category_id, pick_group_id, pick_subgroup_id, pick_default_item_id
+                   FROM fab_item_bom WHERE id = ? AND company_id = ?`,
+                [was.bomLineId, companyId],
+              );
+              const filter = pickOf(line);
+              if (filter) await assertInPick(conn, companyId, filter, [newPick]);
+            }
+            const [[it]] = newPick == null ? [[null]] : await conn.query(
+              'SELECT procurement_type AS pt FROM fab_item_catalog WHERE id = ? AND company_id = ?',
+              [newPick, companyId],
+            );
+            await conn.query(
+              'UPDATE fab_items SET catalog_item_id = ?, procurement_type = ? WHERE id = ? AND company_id = ?',
+              [newPick, it?.pt ?? 'make', id, companyId],
+            );
+            pickChanged.push([id, newPick]);
+          }
           seen.add(id);
           resolved.push({ node, id });
         } else {
@@ -2070,19 +2384,21 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
         const rows = toInsert.map(({ node, parentItemId, position }) => {
           const kids = Array.isArray(node.children) ? node.children : [];
           return [
-            companyId, orderId, orderLineId, parentItemId, node.catalogItemId,
+            companyId, orderId, orderLineId, parentItemId, node.catalogItemId ?? null,
             node.name, node.unit ?? unitOf.get(Number(node.catalogItemId)) ?? 'nos', Number(node.qty),
             depth, kids.length ? 0 : 1,
             procurementOf.get(Number(node.catalogItemId)) ?? 'make',
             node.defaultFlowId ?? null, position,
+            // A copy of a picked row stays a picked row: same role, same line.
+            node.roleItemId ?? null, node.bomLineId ?? null,
           ];
         });
         await conn.query(
           `INSERT INTO fab_items
              (company_id, order_id, order_line_id, parent_item_id, catalog_item_id,
               name, unit, qty, code, node_kind, depth, is_leaf, procurement_type,
-              flow_id, sort_order)
-           VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?)").join(',')}`,
+              flow_id, sort_order, role_item_id, bom_line_id)
+           VALUES ${rows.map(() => "(?,?,?,?,?,?,?,?,NULL,'structure',?,?,?,?,?,?,?)").join(',')}`,
           rows.flat(),
         );
 
@@ -2140,6 +2456,24 @@ export async function applyTree(companyId, spec, existingConn = null, opts = {})
       await setFieldsBulk(companyId, 'order_item', rows, conn);
       // Weight and area for what just changed are computed once below, by
       // `afterStructureWrite`.
+    }
+
+    /*
+     * A NEW PICK BRINGS ITS OWN THICKNESS AND WIDTH. The row held the old
+     * stiffener's 12 × 170 as its own values; left there they would beat the
+     * new item's 32 × 200 for ever. Written AFTER the tree's own sizes, so a
+     * screen that sent the old numbers back cannot undo the change. Length is
+     * the order's and is left alone (D7).
+     */
+    if (pickChanged.length) {
+      const own = await catalogThicknessWidth(conn, companyId, pickChanged.map(([, c]) => c).filter((c) => c != null));
+      const rows = [];
+      for (const [itemId, catId] of pickChanged) {
+        const s = catId == null ? {} : (own.get(Number(catId)) ?? {});
+        rows.push({ scopeId: itemId, key: 'thickness_mm', value: s.thickness_mm ?? null });
+        rows.push({ scopeId: itemId, key: 'width_mm', value: s.width_mm ?? null });
+      }
+      await setFieldsBulk(companyId, 'order_item', rows, conn);
     }
 
     const gone = existing.map((r) => Number(r.id)).filter((id) => !seen.has(id));

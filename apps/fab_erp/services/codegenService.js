@@ -702,12 +702,18 @@ export function shortName(name) {
 async function computeOrderRowCodes(companyId, orderId, conn) {
   const exec = conn ?? pool;
   const [rows] = await exec.query(
+    // A PICKED row's segment is its ROLE's short code ("IS" for an
+    // intermediate stiffener), not the picked item's ("STF") — the role is the
+    // part of the design; the item is only what fills it.
     `SELECT i.id, i.parent_item_id AS parentId, i.catalog_item_id AS catalogId, i.name,
+            i.role_item_id AS roleId,
             i.qty, i.code AS written,
-            ol.code AS lineCode, ol.qty AS lineQty, c.short_code AS shortCode
+            ol.code AS lineCode, ol.qty AS lineQty,
+            COALESCE(rc.short_code, c.short_code) AS shortCode
        FROM fab_items i
        LEFT JOIN fab_order_lines ol ON ol.id = i.order_line_id AND ol.deleted_at IS NULL
        LEFT JOIN fab_item_catalog c ON c.id = i.catalog_item_id
+       LEFT JOIN fab_item_catalog rc ON rc.id = i.role_item_id
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND i.node_kind = 'structure'
         -- Bought rows are not made here and get no production code: a shear
@@ -745,8 +751,10 @@ async function computeOrderRowCodes(companyId, orderId, conn) {
    * Counting by item instead let two items with one short code both start
    * at 1 and collide; the code, not the item, is what must be unique.
    */
+  // `roleId == null` too: a pick not chosen yet has no catalog item but IS a
+  // row of the design, and must not take the order LINE's code as its segment.
   const segmentOf = (r) => segmentFromShortCode(r.shortCode)
-    ?? ((r.catalogId == null && r.lineCode) || shortName(r.name));
+    ?? ((r.catalogId == null && r.roleId == null && r.lineCode) || shortName(r.name));
   const sameItem = (r) => segmentOf(r);
   /** How many physical pieces this row is, under ONE instance of its parent. */
   const countOf = (r, isRoot) => {

@@ -417,7 +417,8 @@ async function countNesting(companyId, orderId) {
              AND rm.node_kind = 'material'
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.is_leaf = 1 AND p.node_kind = 'structure'
-        AND ${isMadeChildlessLeaf('p')}`,
+        AND ${isMadeChildlessLeaf('p')}
+        AND ${NOT_UNPICKED('p')}`,
     [companyId, orderId],
   );
   return { parts: Number(row?.parts) || 0, nested: Number(row?.nested) || 0 };
@@ -439,6 +440,7 @@ async function countSizeless(companyId, orderId) {
       WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL
         AND p.is_leaf = 1 AND p.node_kind = 'structure'
         AND ${isMadeChildlessLeaf('p')}
+        AND ${NOT_UNPICKED('p')}
       ORDER BY p.id`,
     [companyId, orderId],
   );
@@ -452,6 +454,26 @@ async function countSizeless(companyId, orderId) {
   }
   return { count: names.length, names };
 }
+
+/**
+ * Pick lines nobody has chosen an item for yet — "Intermediate Stiffener" rows
+ * still waiting to be told WHICH stiffener. Such a row has no catalog item, so
+ * it has no size, no make/buy and nothing to nest; it is not a part without a
+ * size, it is a question not answered. Named, like the sizeless list.
+ */
+async function countUnpicked(companyId, orderId) {
+  const [rows] = await pool.query(
+    `SELECT id, name FROM fab_items
+      WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL
+        AND role_item_id IS NOT NULL AND catalog_item_id IS NULL
+      ORDER BY id`,
+    [companyId, orderId],
+  );
+  return { count: rows.length, names: [...new Set(rows.map((r) => r.name))] };
+}
+
+/** An unchosen pick row — excluded from the part counts until it is a real item. */
+const NOT_UNPICKED = (a) => `NOT (${a}.role_item_id IS NOT NULL AND ${a}.catalog_item_id IS NULL)`;
 
 /** "Stiffener Plate 16 × 150", "A, B and 3 more" — for a one-line detail. */
 function nameList(names, max = 2) {
@@ -533,6 +555,7 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     proc, production,
     fields,
     sizeless,
+    unpicked,
   ] = await Promise.all([
     needLines ? countLines(companyId, orderId) : null,
     needLines ? countTree(companyId, orderId) : null,
@@ -571,6 +594,7 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     // Both the Line items stage (where it is fixed) and Nesting (where it
     // shows) read it; a resolver failure must not take the strip down.
     (needLines || needNesting) ? countSizeless(companyId, orderId).catch(() => ({ count: 0, names: [] })) : null,
+    needLines ? countUnpicked(companyId, orderId) : null,
   ]);
 
   const flowState = flows ? summariseFlows(flows) : null;
@@ -602,6 +626,7 @@ async function loadReadinessCtx(companyId, orderId, keys, procCtx) {
     proc, production,
     fields, shortOnDims, shortOnRest,
     sizeless: sizeless ?? { count: 0, names: [] },
+    unpicked: unpicked ?? { count: 0, names: [] },
   };
 }
 
@@ -619,9 +644,9 @@ const STAGES = [
      */
     label: 'Line items',
     compute(ctx) {
-      const { lines, tree, flowState, shortOnDims, sizeless } = ctx;
+      const { lines, tree, flowState, shortOnDims, sizeless, unpicked } = ctx;
       const state = lines.total === 0 ? 'todo'
-        : (lines.withoutType > 0 || tree.total === 0
+        : (lines.withoutType > 0 || tree.total === 0 || unpicked.count > 0
            || tree.parts === 0 || sizeless.count > 0 || shortOnDims > 0 || flowState.missing > 0) ? 'partial'
         : 'done';
       return {
@@ -637,6 +662,9 @@ const STAGES = [
             ? `${n(lines.withoutType, 'line')} without a structure type`
             : tree.total === 0
               ? `${n(lines.total, 'line')} · nothing built yet`
+              // Before sizes: until an item is chosen there is no size to ask for.
+              : unpicked.count > 0
+                ? `${n(unpicked.count, 'row')} still to choose an item for — ${nameList(unpicked.names)}`
               // Named: "1 part without a size — Stiffener Plate 16 × 150" is a
               // row to go and find; "1 part without a size" is a search.
               : sizeless.count > 0
@@ -789,8 +817,15 @@ const STAGES = [
  * consequence, stated with its count — "38 items have no flow" is actionable in
  * a way that "some items may be skipped" never was.
  */
-function buildBlockers({ lines, tree, nest, flowState, production }) {
+function buildBlockers({ lines, tree, nest, flowState, production, unpicked }) {
   const out = [];
+
+  if (unpicked?.count > 0) {
+    out.push({
+      stage: 'lines', count: unpicked.count,
+      message: `${unpicked.count} row(s) still need an item chosen — ${nameList(unpicked.names, 3)}. Choose one on the Structure step.`,
+    });
+  }
 
   if (production.missing.length) {
     out.push({

@@ -113,6 +113,110 @@ export async function catalogedForNew(exec, companyId, { categoryId = null, mate
   return cat && Number(cat.default_cataloged) === 0 ? 0 : 1;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PICK LINES — a template line that stands for ANY catalog item in a filter
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// "Intermediate stiffener: any item in Standard Parts › Plate Stiffeners." The
+// line's child stays a template PART (the role: its name, code segment and
+// flow); the filter says which catalog items may fill it, and the sales order
+// picks exactly one. Stored on fab_item_bom as pick_category_id /
+// pick_group_id / pick_subgroup_id (+ an optional pick_default_item_id).
+
+/** A line's filter off a row carrying the pick columns, or null when it is not a pick line. */
+export function pickOf(row) {
+  const cat = row?.pickCategoryId ?? row?.pick_category_id ?? null;
+  if (cat == null) return null;
+  return {
+    categoryId: Number(cat),
+    groupId: (row.pickGroupId ?? row.pick_group_id) != null ? Number(row.pickGroupId ?? row.pick_group_id) : null,
+    subgroupId: (row.pickSubgroupId ?? row.pick_subgroup_id) != null ? Number(row.pickSubgroupId ?? row.pick_subgroup_id) : null,
+    defaultItemId: (row.pickDefaultItemId ?? row.pick_default_item_id) != null
+      ? Number(row.pickDefaultItemId ?? row.pick_default_item_id) : null,
+  };
+}
+
+/** SQL + params: catalog items inside a pick filter. Always catalog items only. */
+export function pickWhere(pick, alias = 'c') {
+  const where = [`${alias}.is_cataloged = 1`, `${alias}.deleted_at IS NULL`, `${alias}.category_id = ?`];
+  const params = [pick.categoryId];
+  if (pick.groupId != null) { where.push(`${alias}.group_id = ?`); params.push(pick.groupId); }
+  if (pick.subgroupId != null) { where.push(`${alias}.subgroup_id = ?`); params.push(pick.subgroupId); }
+  return { where: where.join(' AND '), params };
+}
+
+/**
+ * Check a filter names real, consistent taxonomy of this company: the group
+ * inside the category, the sub-group inside the group. A filter that quietly
+ * matches nothing is the failure this refuses.
+ */
+export async function assertPickFilter(exec, companyId, pick) {
+  const bad = (msg) => { const e = new Error(msg); e.status = 400; e.code = 'BAD_PICK_FILTER'; return e; };
+  if (!pick || pick.categoryId == null) throw bad('A pick line needs at least a category to pick from.');
+  const [[cat]] = await exec.query(
+    'SELECT id FROM fab_item_categories WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
+    [pick.categoryId, companyId],
+  );
+  if (!cat) throw bad('That category does not exist in this company.');
+  if (pick.groupId != null) {
+    const [[g]] = await exec.query(
+      'SELECT category_id FROM fab_item_groups WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
+      [pick.groupId, companyId],
+    );
+    if (!g || Number(g.category_id) !== Number(pick.categoryId)) throw bad('That group is not inside the chosen category.');
+  }
+  if (pick.subgroupId != null) {
+    if (pick.groupId == null) throw bad('A sub-group needs its group chosen too.');
+    const [[s]] = await exec.query(
+      'SELECT group_id FROM fab_item_subgroups WHERE id = ? AND company_id = ? AND deleted_at IS NULL',
+      [pick.subgroupId, companyId],
+    );
+    if (!s || Number(s.group_id) !== Number(pick.groupId)) throw bad('That sub-group is not inside the chosen group.');
+  }
+  if (pick.defaultItemId != null) await assertInPick(exec, companyId, pick, [pick.defaultItemId], 'the default');
+}
+
+/**
+ * Refuse any item that is not a catalog item inside `pick`. What stops an
+ * import, a /mutate write or a stale screen from putting a machine — or a
+ * template part — where a stiffener was asked for.
+ */
+export async function assertInPick(exec, companyId, pick, itemIds, what = 'the chosen item') {
+  const ids = [...new Set((itemIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!ids.length) return;
+  const { where, params } = pickWhere(pick, 'c');
+  const [rows] = await exec.query(
+    `SELECT c.id FROM fab_item_catalog c WHERE c.company_id = ? AND c.id IN (?) AND ${where}`,
+    [companyId, ids, ...params],
+  );
+  const ok = new Set(rows.map((r) => Number(r.id)));
+  const missing = ids.filter((id) => !ok.has(id));
+  if (missing.length) {
+    const [named] = await exec.query('SELECT name FROM fab_item_catalog WHERE id IN (?)', [missing]);
+    const e = new Error(
+      `${named.map((n) => n.name).join(', ') || `Item #${missing[0]}`} is not one of the catalog items this line picks from, so it cannot be ${what}.`,
+    );
+    e.status = 422;
+    e.code = 'PICK_OUT_OF_FILTER';
+    throw e;
+  }
+}
+
+/** Catalog items a pick line may be filled with, for a picker. */
+export async function pickCandidates(exec, companyId, pick, { search = null, limit = 200 } = {}) {
+  const { where, params } = pickWhere(pick, 'c');
+  const [rows] = await exec.query(
+    `SELECT c.id, c.code, c.name, c.unit, c.thickness_mm AS thicknessMm, c.procurement_type AS procurementType
+       FROM fab_item_catalog c
+      WHERE c.company_id = ? AND ${where}
+        ${search ? 'AND (c.name LIKE ? OR c.code LIKE ?)' : ''}
+      ORDER BY c.thickness_mm, c.name
+      LIMIT ?`,
+    [companyId, ...params, ...(search ? [`%${search}%`, `%${search}%`] : []), limit],
+  );
+  return rows;
+}
+
 /**
  * A non-catalog item is never bought: it is made on an order. Anything else is
  * how a template quietly became buyable and lost its production code (the

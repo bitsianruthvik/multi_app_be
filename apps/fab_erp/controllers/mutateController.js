@@ -19,7 +19,7 @@ import { recomputeItemShape, orderIdOfItem } from '../services/itemShapeService.
 import { recomputeCatalogWeight } from '../services/fieldDeriveService.js';
 import { assertNoStartedWork } from '../services/itemGuards.js';
 import { fail } from '../../../core/middleware/requirePerm.js';
-import { assertCataloged, catalogedForNew, procurementFor } from '../services/catalogKind.js';
+import { assertCataloged, catalogedForNew, procurementFor, pickOf, assertInPick } from '../services/catalogKind.js';
 
 // Resources whose `code` the server fills in on insert.
 //
@@ -399,6 +399,20 @@ async function applyCatalogKindRules(resource, op, filteredPayload, companyId, i
 
   const itemId = filteredPayload.catalog_item_id;
   if (!itemId) return;
+
+  // An order row that fills a PICK line may only be repointed at a catalog
+  // item inside that line's filter — the same rule the Structure step obeys.
+  if (resource === 'fabErpItem' && op === 'update' && id != null) {
+    const [[row]] = await pool.query(
+      `SELECT i.role_item_id, b.pick_category_id, b.pick_group_id, b.pick_subgroup_id, b.pick_default_item_id
+         FROM fab_items i LEFT JOIN fab_item_bom b ON b.id = i.bom_line_id
+        WHERE i.id = ? AND i.company_id = ? LIMIT 1`,
+      [id, companyId],
+    );
+    const filter = row?.role_item_id != null ? pickOf(row) : null;
+    if (filter) await assertInPick(pool, companyId, filter, [itemId]);
+    return;
+  }
 
   if (resource === 'fabErpStockPolicy') {
     await assertCataloged(pool, companyId, [itemId], 'given a stock policy');

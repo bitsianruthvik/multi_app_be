@@ -6674,3 +6674,40 @@ SET @s = IF(@c=0,
   'UPDATE fab_item_categories SET default_cataloged = 0 WHERE code = ''fab'' OR name = ''Fabricated''',
   'SELECT 1');
 PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ─── Pick lines (2026-09-18) ─────────────────────────────────────────────────
+-- A template BOM line may stand for ANY catalog item in a filter ("Intermediate
+-- stiffener: any item in Plate Stiffeners"). child_item_id stays the ROLE (a
+-- template part: name, code segment, flow); the pick_* columns are the filter
+-- and an optional default; the sales order chooses exactly one item.
+-- On the order row, catalog_item_id is the REAL item chosen and role_item_id the
+-- role it fills; bom_line_id is the recipe line the row came from (so flows and
+-- the filter can be found again without guessing from catalog ids).
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='pick_category_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN pick_category_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='pick_group_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN pick_group_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='pick_subgroup_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN pick_subgroup_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_item_bom' AND COLUMN_NAME='pick_default_item_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_item_bom ADD COLUMN pick_default_item_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='role_item_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD COLUMN role_item_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND COLUMN_NAME='bom_line_id');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD COLUMN bom_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='fab_items' AND INDEX_NAME='idx_fi_role');
+SET @s = IF(@c=0, 'ALTER TABLE fab_items ADD KEY idx_fi_role (role_item_id)', 'SELECT 1');
+PREPARE s FROM @s; EXECUTE s; DEALLOCATE PREPARE s;

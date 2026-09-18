@@ -43,6 +43,7 @@ import {
 import { refreshOrderStage } from '../services/orderReadinessService.js';
 import { exportStructure, importStructure } from '../services/structureSheetService.js';
 import { pickableItems, catalogSizes } from '../services/catalogPickerService.js';
+import { pickCandidates } from '../services/catalogKind.js';
 import { orderCodePrefix } from '../services/codegenService.js';
 
 const router = Router();
@@ -296,7 +297,9 @@ router.get('/item-bom/:itemId/tree', protect, async (req, res) => {
     const cid = companyId(req);
     const itemId = Number(req.params.itemId);
     if (!itemId) return res.status(400).json({ message: 'itemId is required.' });
-    const tree = await draftTree(cid, itemId);
+    // The designer edits LINES, so a pick node keeps its own child (the role)
+    // here; the order's draft (/templates/:id/draft) is what fills picks in.
+    const tree = await draftTree(cid, itemId, null, { resolvePicks: false });
     return res.json({ ok: true, tree });
   } catch (err) { return fail(res, err); }
 });
@@ -335,8 +338,27 @@ router.post('/item-bom', protect, requirePerm('fab_erp_items_meta_manage'), asyn
       // "leave it as it is" — setBomLine reads the prior value back itself.
       explode: b.explode,
       codeJoin: b.codeJoin ?? null,
+      // A pick line's filter: {categoryId, groupId?, subgroupId?, defaultItemId?}.
+      // Omitted = leave as it is; null = this is an ordinary line again.
+      pick: b.pick,
     });
     return res.json({ ok: true });
+  } catch (err) { return fail(res, err); }
+});
+
+/**
+ * GET /catalog/pick-candidates?categoryId=&groupId=&subgroupId=&q= — the catalog
+ * items a pick line may be filled with. The same filter the server enforces on
+ * build and on edit (catalogKind.pickWhere), so a picker can never offer what
+ * the write would refuse.
+ */
+router.get('/catalog/pick-candidates', protect, async (req, res) => {
+  try {
+    const num = (v) => (v == null || v === '' ? null : Number(v));
+    const pick = { categoryId: num(req.query.categoryId), groupId: num(req.query.groupId), subgroupId: num(req.query.subgroupId) };
+    if (pick.categoryId == null) return res.status(400).json({ message: 'categoryId is required.' });
+    const items = await pickCandidates(pool, companyId(req), pick, { search: req.query.q ? String(req.query.q) : null });
+    return res.json({ items });
   } catch (err) { return fail(res, err); }
 });
 

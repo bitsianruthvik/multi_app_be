@@ -51,8 +51,8 @@ export async function flowSummary(companyId, orderId, conn = null) {
        LEFT JOIN fab_operation_flows f ON f.id = i.flow_id AND f.deleted_at IS NULL
        LEFT JOIN fab_items p ON p.id = i.parent_item_id AND p.deleted_at IS NULL
        LEFT JOIN fab_item_bom b ON b.company_id = i.company_id
-                               AND b.parent_item_id = p.catalog_item_id
-                               AND b.child_item_id = i.catalog_item_id
+                               AND b.parent_item_id = COALESCE(p.role_item_id, p.catalog_item_id)
+                               AND b.child_item_id = COALESCE(i.role_item_id, i.catalog_item_id)
                                AND b.deleted_at IS NULL AND b.active = 1
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
         AND i.node_kind = 'structure'
@@ -116,12 +116,14 @@ export async function flowSummary(companyId, orderId, conn = null) {
  * on the order — the same guarantee the service this replaced gave.
  */
 export async function syncFlowsFromBom(companyId, orderId, { reassign = false } = {}) {
+  // A PICKED row carries the chosen item in catalog_item_id and the role its
+  // recipe line names in role_item_id, so the line is matched on the role.
   const [res] = await pool.query(
     `UPDATE fab_items i
        JOIN fab_items p ON p.id = i.parent_item_id AND p.deleted_at IS NULL
        JOIN fab_item_bom b ON b.company_id = i.company_id
-                          AND b.parent_item_id = p.catalog_item_id
-                          AND b.child_item_id = i.catalog_item_id
+                          AND b.parent_item_id = COALESCE(p.role_item_id, p.catalog_item_id)
+                          AND b.child_item_id = COALESCE(i.role_item_id, i.catalog_item_id)
                           AND b.deleted_at IS NULL AND b.active = 1
         SET i.flow_id = b.default_flow_id
       WHERE i.company_id = ? AND i.order_id = ? AND i.deleted_at IS NULL
