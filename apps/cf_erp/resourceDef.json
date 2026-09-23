@@ -1,0 +1,1962 @@
+{
+  "cfErpClassificationNode": {
+    "table": "cf_classification_nodes",
+    "alias": "ccn",
+    "writeFields": [
+      "parent_id",
+      "depth",
+      "scope",
+      "code",
+      "name",
+      "description",
+      "sort_order",
+      "status"
+    ],
+    "fields": {
+      "id": "ccn.id",
+      "companyId": "ccn.company_id",
+      "parentId": "ccn.parent_id",
+      "depth": "ccn.depth",
+      "scope": "ccn.scope",
+      "code": "ccn.code",
+      "name": "ccn.name",
+      "description": "ccn.description",
+      "sortOrder": "ccn.sort_order",
+      "status": "ccn.status",
+      "createdAt": "ccn.created_at",
+      "updatedAt": "ccn.updated_at",
+      "createdBy": "ccn.created_by",
+      "parentCode": "ccn_p.code",
+      "parentName": "ccn_p.name",
+      "parentDepth": "ccn_p.depth"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "parentId": "integer",
+      "depth": "integer",
+      "scope": "string",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "sortOrder": "integer",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "parentCode": "string",
+      "parentName": "string",
+      "parentDepth": "integer"
+    },
+    "relations": {
+      "parent": {
+        "table": "cf_classification_nodes",
+        "alias": "ccn_p",
+        "on": "ccn.parent_id = ccn_p.id",
+        "fields": [
+          "parentCode",
+          "parentName",
+          "parentDepth"
+        ]
+      }
+    }
+  },
+  "cfErpMasterRecord": {
+    "table": "cf_master_records",
+    "alias": "cmr",
+    "writeFields": [],
+    "fields": {
+      "id": "cmr.id",
+      "companyId": "cmr.company_id",
+      "recordKind": "cmr.record_kind",
+      "code": "cmr.code",
+      "name": "cmr.name",
+      "shortName": "cmr.short_name",
+      "description": "cmr.description",
+      "classificationId": "cmr.classification_id",
+      "status": "cmr.status",
+      "revision": "cmr.revision",
+      "defaultFlowId": "cmr.default_flow_id",
+      "createdAt": "cmr.created_at",
+      "updatedAt": "cmr.updated_at",
+      "createdBy": "cmr.created_by",
+      "classificationCode": "ccn_m.code",
+      "classificationName": "ccn_m.name",
+      "classificationDepth": "ccn_m.depth",
+      "itemType": "cid_m.item_type",
+      "trackedBy": "cid_m.tracked_by",
+      "uom": "cid_m.uom",
+      "sourcing": "cid_m.sourcing",
+      "sourceDefinitionId": "cid_m.source_definition_id",
+      "ownerOrderLineId": "cid_m.owner_order_line_id",
+      "definitionType": "cdd_m.definition_type",
+      "selectionMode": "cdd_m.selection_mode",
+      "candidateClassificationId": "cdd_m.candidate_classification_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "recordKind": "string",
+      "code": "string",
+      "name": "string",
+      "shortName": "string",
+      "description": "text",
+      "classificationId": "integer",
+      "status": "string",
+      "revision": "string",
+      "defaultFlowId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "classificationCode": "string",
+      "classificationName": "string",
+      "classificationDepth": "integer",
+      "itemType": "string",
+      "trackedBy": "string",
+      "uom": "string",
+      "sourcing": "string",
+      "sourceDefinitionId": "integer",
+      "ownerOrderLineId": "integer",
+      "definitionType": "string",
+      "selectionMode": "string",
+      "candidateClassificationId": "integer"
+    },
+    "relations": {
+      "classification": {
+        "table": "cf_classification_nodes",
+        "alias": "ccn_m",
+        "on": "cmr.classification_id = ccn_m.id",
+        "fields": [
+          "classificationCode",
+          "classificationName",
+          "classificationDepth"
+        ]
+      },
+      "itemDetail": {
+        "table": "cf_item_details",
+        "alias": "cid_m",
+        "on": "cid_m.master_id = cmr.id",
+        "fields": [
+          "itemType",
+          "trackedBy",
+          "uom",
+          "sourcing",
+          "sourceDefinitionId",
+          "ownerOrderLineId"
+        ]
+      },
+      "definitionDetail": {
+        "table": "cf_definition_details",
+        "alias": "cdd_m",
+        "on": "cdd_m.master_id = cmr.id",
+        "fields": [
+          "definitionType",
+          "selectionMode",
+          "candidateClassificationId"
+        ]
+      }
+    }
+  },
+  "cfErpSpecification": {
+    "table": "cf_specifications",
+    "alias": "csp",
+    "writeFields": [
+      "code",
+      "name",
+      "data_type",
+      "measurement_type",
+      "default_uom",
+      "decimals",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "csp.id",
+      "companyId": "csp.company_id",
+      "code": "csp.code",
+      "name": "csp.name",
+      "dataType": "csp.data_type",
+      "measurementType": "csp.measurement_type",
+      "defaultUom": "csp.default_uom",
+      "decimals": "csp.decimals",
+      "description": "csp.description",
+      "status": "csp.status",
+      "createdAt": "csp.created_at",
+      "updatedAt": "csp.updated_at",
+      "createdBy": "csp.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "dataType": "string",
+      "measurementType": "string",
+      "defaultUom": "string",
+      "decimals": "integer",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpSpecOption": {
+    "table": "cf_spec_options",
+    "alias": "cso",
+    "writeFields": [
+      "specification_id",
+      "value",
+      "label",
+      "sort_order",
+      "status"
+    ],
+    "fields": {
+      "id": "cso.id",
+      "companyId": "cso.company_id",
+      "specificationId": "cso.specification_id",
+      "value": "cso.value",
+      "label": "cso.label",
+      "sortOrder": "cso.sort_order",
+      "status": "cso.status",
+      "createdAt": "cso.created_at",
+      "updatedAt": "cso.updated_at",
+      "createdBy": "cso.created_by",
+      "specCode": "csp_o.code",
+      "specName": "csp_o.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "specificationId": "integer",
+      "value": "string",
+      "label": "string",
+      "sortOrder": "integer",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "specCode": "string",
+      "specName": "string"
+    },
+    "relations": {
+      "specification": {
+        "table": "cf_specifications",
+        "alias": "csp_o",
+        "on": "cso.specification_id = csp_o.id",
+        "fields": [
+          "specCode",
+          "specName"
+        ]
+      }
+    }
+  },
+  "cfErpFormula": {
+    "table": "cf_formulas",
+    "alias": "cfm",
+    "writeFields": [
+      "code",
+      "name",
+      "expression",
+      "version",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "cfm.id",
+      "companyId": "cfm.company_id",
+      "code": "cfm.code",
+      "name": "cfm.name",
+      "expression": "cfm.expression",
+      "version": "cfm.version",
+      "description": "cfm.description",
+      "status": "cfm.status",
+      "createdAt": "cfm.created_at",
+      "updatedAt": "cfm.updated_at",
+      "createdBy": "cfm.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "expression": "text",
+      "version": "integer",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpSpecAssignment": {
+    "table": "cf_spec_assignments",
+    "alias": "csa",
+    "writeFields": [
+      "specification_id",
+      "subject_type",
+      "subject_id",
+      "capture_at",
+      "is_required",
+      "is_applicable",
+      "value_rule",
+      "formula_id",
+      "sort_order"
+    ],
+    "fields": {
+      "id": "csa.id",
+      "companyId": "csa.company_id",
+      "specificationId": "csa.specification_id",
+      "subjectType": "csa.subject_type",
+      "subjectId": "csa.subject_id",
+      "captureAt": "csa.capture_at",
+      "isRequired": "csa.is_required",
+      "isApplicable": "csa.is_applicable",
+      "valueRule": "csa.value_rule",
+      "formulaId": "csa.formula_id",
+      "sortOrder": "csa.sort_order",
+      "createdAt": "csa.created_at",
+      "updatedAt": "csa.updated_at",
+      "createdBy": "csa.created_by",
+      "specCode": "csp_a.code",
+      "specName": "csp_a.name",
+      "specDataType": "csp_a.data_type",
+      "specDefaultUom": "csp_a.default_uom",
+      "formulaCode": "cfm_a.code",
+      "formulaName": "cfm_a.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "specificationId": "integer",
+      "subjectType": "string",
+      "subjectId": "integer",
+      "captureAt": "string",
+      "isRequired": "boolean",
+      "isApplicable": "boolean",
+      "valueRule": "string",
+      "formulaId": "integer",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "specCode": "string",
+      "specName": "string",
+      "specDataType": "string",
+      "specDefaultUom": "string",
+      "formulaCode": "string",
+      "formulaName": "string"
+    },
+    "relations": {
+      "specification": {
+        "table": "cf_specifications",
+        "alias": "csp_a",
+        "on": "csa.specification_id = csp_a.id",
+        "fields": [
+          "specCode",
+          "specName",
+          "specDataType",
+          "specDefaultUom"
+        ]
+      },
+      "formula": {
+        "table": "cf_formulas",
+        "alias": "cfm_a",
+        "on": "csa.formula_id = cfm_a.id",
+        "fields": [
+          "formulaCode",
+          "formulaName"
+        ]
+      }
+    }
+  },
+  "cfErpSpecAssignmentOption": {
+    "table": "cf_spec_assignment_options",
+    "alias": "csao",
+    "writeFields": [
+      "assignment_id",
+      "option_id"
+    ],
+    "fields": {
+      "id": "csao.id",
+      "companyId": "csao.company_id",
+      "assignmentId": "csao.assignment_id",
+      "optionId": "csao.option_id",
+      "createdAt": "csao.created_at",
+      "updatedAt": "csao.updated_at",
+      "createdBy": "csao.created_by",
+      "optionValue": "cso_ao.value",
+      "optionLabel": "cso_ao.label"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "assignmentId": "integer",
+      "optionId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "optionValue": "string",
+      "optionLabel": "string"
+    },
+    "relations": {
+      "option": {
+        "table": "cf_spec_options",
+        "alias": "cso_ao",
+        "on": "csao.option_id = cso_ao.id",
+        "fields": [
+          "optionValue",
+          "optionLabel"
+        ]
+      }
+    }
+  },
+  "cfErpSpecValue": {
+    "table": "cf_spec_values",
+    "alias": "csv",
+    "writeFields": [],
+    "fields": {
+      "id": "csv.id",
+      "companyId": "csv.company_id",
+      "specificationId": "csv.specification_id",
+      "subjectType": "csv.subject_type",
+      "subjectId": "csv.subject_id",
+      "valueNumber": "csv.value_number",
+      "valueText": "csv.value_text",
+      "valueBool": "csv.value_bool",
+      "valueDate": "csv.value_date",
+      "optionId": "csv.option_id",
+      "uom": "csv.uom",
+      "source": "csv.source",
+      "createdAt": "csv.created_at",
+      "updatedAt": "csv.updated_at",
+      "createdBy": "csv.created_by",
+      "specCode": "csp_v.code",
+      "specName": "csp_v.name",
+      "specDataType": "csp_v.data_type",
+      "optionValue": "cso_v.value",
+      "optionLabel": "cso_v.label"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "specificationId": "integer",
+      "subjectType": "string",
+      "subjectId": "integer",
+      "valueNumber": "decimal",
+      "valueText": "string",
+      "valueBool": "boolean",
+      "valueDate": "date",
+      "optionId": "integer",
+      "uom": "string",
+      "source": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "specCode": "string",
+      "specName": "string",
+      "specDataType": "string",
+      "optionValue": "string",
+      "optionLabel": "string"
+    },
+    "relations": {
+      "specification": {
+        "table": "cf_specifications",
+        "alias": "csp_v",
+        "on": "csv.specification_id = csp_v.id",
+        "fields": [
+          "specCode",
+          "specName",
+          "specDataType"
+        ]
+      },
+      "option": {
+        "table": "cf_spec_options",
+        "alias": "cso_v",
+        "on": "csv.option_id = cso_v.id",
+        "fields": [
+          "optionValue",
+          "optionLabel"
+        ]
+      }
+    }
+  },
+  "cfErpSpecValueHistory": {
+    "table": "cf_spec_value_history",
+    "alias": "csvh",
+    "writeFields": [],
+    "fields": {
+      "id": "csvh.id",
+      "companyId": "csvh.company_id",
+      "valueId": "csvh.value_id",
+      "specificationId": "csvh.specification_id",
+      "subjectType": "csvh.subject_type",
+      "subjectId": "csvh.subject_id",
+      "changeType": "csvh.change_type",
+      "oldValue": "csvh.old_value",
+      "newValue": "csvh.new_value",
+      "changedBy": "csvh.changed_by",
+      "changedAt": "csvh.changed_at",
+      "specCode": "csp_h.code",
+      "specName": "csp_h.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "valueId": "integer",
+      "specificationId": "integer",
+      "subjectType": "string",
+      "subjectId": "integer",
+      "changeType": "string",
+      "oldValue": "json",
+      "newValue": "json",
+      "changedBy": "integer",
+      "changedAt": "datetime",
+      "specCode": "string",
+      "specName": "string"
+    },
+    "relations": {
+      "specification": {
+        "table": "cf_specifications",
+        "alias": "csp_h",
+        "on": "csvh.specification_id = csp_h.id",
+        "fields": [
+          "specCode",
+          "specName"
+        ]
+      }
+    }
+  },
+  "cfErpDefinitionAllowedItem": {
+    "table": "cf_definition_allowed_items",
+    "alias": "cdai",
+    "writeFields": [
+      "definition_id",
+      "item_id",
+      "is_default",
+      "sort_order"
+    ],
+    "fields": {
+      "id": "cdai.id",
+      "companyId": "cdai.company_id",
+      "definitionId": "cdai.definition_id",
+      "itemId": "cdai.item_id",
+      "isDefault": "cdai.is_default",
+      "sortOrder": "cdai.sort_order",
+      "createdAt": "cdai.created_at",
+      "updatedAt": "cdai.updated_at",
+      "createdBy": "cdai.created_by",
+      "definitionCode": "cmr_d.code",
+      "definitionName": "cmr_d.name",
+      "itemCode": "cmr_i.code",
+      "itemName": "cmr_i.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "definitionId": "integer",
+      "itemId": "integer",
+      "isDefault": "boolean",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "definitionCode": "string",
+      "definitionName": "string",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "definition": {
+        "table": "cf_master_records",
+        "alias": "cmr_d",
+        "on": "cdai.definition_id = cmr_d.id",
+        "fields": [
+          "definitionCode",
+          "definitionName"
+        ]
+      },
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_i",
+        "on": "cdai.item_id = cmr_i.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpSelectionCriterion": {
+    "table": "cf_selection_criteria",
+    "alias": "csc",
+    "writeFields": [
+      "definition_id",
+      "specification_id",
+      "operator",
+      "value_number",
+      "value_number_to",
+      "value_text",
+      "value_bool",
+      "value_date",
+      "option_id",
+      "sort_order"
+    ],
+    "fields": {
+      "id": "csc.id",
+      "companyId": "csc.company_id",
+      "definitionId": "csc.definition_id",
+      "specificationId": "csc.specification_id",
+      "operator": "csc.operator",
+      "valueNumber": "csc.value_number",
+      "valueNumberTo": "csc.value_number_to",
+      "valueText": "csc.value_text",
+      "valueBool": "csc.value_bool",
+      "valueDate": "csc.value_date",
+      "optionId": "csc.option_id",
+      "sortOrder": "csc.sort_order",
+      "createdAt": "csc.created_at",
+      "updatedAt": "csc.updated_at",
+      "createdBy": "csc.created_by",
+      "specCode": "csp_c.code",
+      "specName": "csp_c.name",
+      "optionValue": "cso_c.value"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "definitionId": "integer",
+      "specificationId": "integer",
+      "operator": "string",
+      "valueNumber": "decimal",
+      "valueNumberTo": "decimal",
+      "valueText": "string",
+      "valueBool": "boolean",
+      "valueDate": "date",
+      "optionId": "integer",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "specCode": "string",
+      "specName": "string",
+      "optionValue": "string"
+    },
+    "relations": {
+      "specification": {
+        "table": "cf_specifications",
+        "alias": "csp_c",
+        "on": "csc.specification_id = csp_c.id",
+        "fields": [
+          "specCode",
+          "specName"
+        ]
+      },
+      "option": {
+        "table": "cf_spec_options",
+        "alias": "cso_c",
+        "on": "csc.option_id = cso_c.id",
+        "fields": [
+          "optionValue"
+        ]
+      }
+    }
+  },
+  "cfErpBom": {
+    "table": "cf_boms",
+    "alias": "cbm",
+    "writeFields": [],
+    "fields": {
+      "id": "cbm.id",
+      "companyId": "cbm.company_id",
+      "parentId": "cbm.parent_id",
+      "bomType": "cbm.bom_type",
+      "revision": "cbm.revision",
+      "status": "cbm.status",
+      "sourceBomId": "cbm.source_bom_id",
+      "notes": "cbm.notes",
+      "createdAt": "cbm.created_at",
+      "updatedAt": "cbm.updated_at",
+      "createdBy": "cbm.created_by",
+      "parentCode": "cmr_b.code",
+      "parentName": "cmr_b.name",
+      "parentStatus": "cmr_b.status"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "parentId": "integer",
+      "bomType": "string",
+      "revision": "string",
+      "status": "string",
+      "sourceBomId": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "parentCode": "string",
+      "parentName": "string",
+      "parentStatus": "string"
+    },
+    "relations": {
+      "parent": {
+        "table": "cf_master_records",
+        "alias": "cmr_b",
+        "on": "cbm.parent_id = cmr_b.id",
+        "fields": [
+          "parentCode",
+          "parentName",
+          "parentStatus"
+        ]
+      }
+    }
+  },
+  "cfErpBomLine": {
+    "table": "cf_bom_lines",
+    "alias": "cbl",
+    "writeFields": [],
+    "fields": {
+      "id": "cbl.id",
+      "companyId": "cbl.company_id",
+      "bomId": "cbl.bom_id",
+      "lineNo": "cbl.line_no",
+      "childId": "cbl.child_id",
+      "designId": "cbl.design_id",
+      "position": "cbl.position",
+      "role": "cbl.role",
+      "quantity": "cbl.quantity",
+      "selectionDefinitionId": "cbl.selection_definition_id",
+      "sourceLineId": "cbl.source_line_id",
+      "operationFlowId": "cbl.operation_flow_id",
+      "notes": "cbl.notes",
+      "createdAt": "cbl.created_at",
+      "updatedAt": "cbl.updated_at",
+      "createdBy": "cbl.created_by",
+      "bomParentId": "cbm_l.parent_id",
+      "bomType": "cbm_l.bom_type",
+      "childCode": "cmr_c.code",
+      "childName": "cmr_c.name",
+      "childRecordKind": "cmr_c.record_kind",
+      "childStatus": "cmr_c.status",
+      "selectionCode": "cmr_s.code",
+      "selectionName": "cmr_s.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "bomId": "integer",
+      "lineNo": "integer",
+      "childId": "integer",
+      "designId": "integer",
+      "position": "integer",
+      "role": "string",
+      "quantity": "decimal",
+      "selectionDefinitionId": "integer",
+      "sourceLineId": "integer",
+      "operationFlowId": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "bomParentId": "integer",
+      "bomType": "string",
+      "childCode": "string",
+      "childName": "string",
+      "childRecordKind": "string",
+      "childStatus": "string",
+      "selectionCode": "string",
+      "selectionName": "string"
+    },
+    "relations": {
+      "bom": {
+        "table": "cf_boms",
+        "alias": "cbm_l",
+        "on": "cbl.bom_id = cbm_l.id",
+        "fields": [
+          "bomParentId",
+          "bomType"
+        ]
+      },
+      "child": {
+        "table": "cf_master_records",
+        "alias": "cmr_c",
+        "on": "cbl.child_id = cmr_c.id",
+        "fields": [
+          "childCode",
+          "childName",
+          "childRecordKind",
+          "childStatus"
+        ]
+      },
+      "selection": {
+        "table": "cf_master_records",
+        "alias": "cmr_s",
+        "on": "cbl.selection_definition_id = cmr_s.id",
+        "fields": [
+          "selectionCode",
+          "selectionName"
+        ]
+      }
+    }
+  },
+  "cfErpSalesOrder": {
+    "table": "cf_sales_orders",
+    "alias": "csor",
+    "writeFields": [],
+    "fields": {
+      "id": "csor.id",
+      "companyId": "csor.company_id",
+      "code": "csor.code",
+      "orderType": "csor.order_type",
+      "title": "csor.title",
+      "customerId": "csor.customer_id",
+      "customerReference": "csor.customer_reference",
+      "status": "csor.status",
+      "receivedOn": "csor.received_on",
+      "committedDate": "csor.committed_date",
+      "confirmedAt": "csor.confirmed_at",
+      "deliveryAddress": "csor.delivery_address",
+      "notes": "csor.notes",
+      "createdAt": "csor.created_at",
+      "updatedAt": "csor.updated_at",
+      "createdBy": "csor.created_by",
+      "customerCode": "cpt_o.code",
+      "customerName": "cpt_o.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "orderType": "string",
+      "title": "string",
+      "customerId": "integer",
+      "customerReference": "string",
+      "status": "string",
+      "receivedOn": "date",
+      "committedDate": "date",
+      "confirmedAt": "datetime",
+      "deliveryAddress": "text",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "customerCode": "string",
+      "customerName": "string"
+    },
+    "relations": {
+      "customer": {
+        "table": "cf_parties",
+        "alias": "cpt_o",
+        "on": "csor.customer_id = cpt_o.id",
+        "fields": [
+          "customerCode",
+          "customerName"
+        ]
+      }
+    }
+  },
+  "cfErpSalesOrderLine": {
+    "table": "cf_sales_order_lines",
+    "alias": "csol",
+    "writeFields": [],
+    "fields": {
+      "id": "csol.id",
+      "companyId": "csol.company_id",
+      "orderId": "csol.order_id",
+      "lineNo": "csol.line_no",
+      "lineType": "csol.line_type",
+      "itemId": "csol.item_id",
+      "designId": "csol.design_id",
+      "position": "csol.position",
+      "quantity": "csol.quantity",
+      "committedDate": "csol.committed_date",
+      "bomRevision": "csol.bom_revision",
+      "description": "csol.description",
+      "notes": "csol.notes",
+      "createdAt": "csol.created_at",
+      "updatedAt": "csol.updated_at",
+      "createdBy": "csol.created_by",
+      "orderCode": "csor_l.code",
+      "orderStatus": "csor_l.status",
+      "itemCode": "cmr_ol.code",
+      "itemName": "cmr_ol.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderId": "integer",
+      "lineNo": "integer",
+      "lineType": "string",
+      "itemId": "integer",
+      "designId": "integer",
+      "position": "integer",
+      "quantity": "decimal",
+      "committedDate": "date",
+      "bomRevision": "string",
+      "description": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "orderCode": "string",
+      "orderStatus": "string",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "order": {
+        "table": "cf_sales_orders",
+        "alias": "csor_l",
+        "on": "csol.order_id = csor_l.id",
+        "fields": [
+          "orderCode",
+          "orderStatus"
+        ]
+      },
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_ol",
+        "on": "csol.item_id = cmr_ol.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpMachine": {
+    "table": "cf_machines",
+    "alias": "cmc",
+    "writeFields": [],
+    "fields": {
+      "id": "cmc.id",
+      "companyId": "cmc.company_id",
+      "code": "cmc.code",
+      "name": "cmc.name",
+      "classificationId": "cmc.classification_id",
+      "catalogItemId": "cmc.catalog_item_id",
+      "serialNumber": "cmc.serial_number",
+      "status": "cmc.status",
+      "notes": "cmc.notes",
+      "createdAt": "cmc.created_at",
+      "updatedAt": "cmc.updated_at",
+      "createdBy": "cmc.created_by",
+      "machineTypeCode": "ccn_mc.code",
+      "machineTypeName": "ccn_mc.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "classificationId": "integer",
+      "catalogItemId": "integer",
+      "serialNumber": "string",
+      "status": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "machineTypeCode": "string",
+      "machineTypeName": "string"
+    },
+    "relations": {
+      "machineType": {
+        "table": "cf_classification_nodes",
+        "alias": "ccn_mc",
+        "on": "cmc.classification_id = ccn_mc.id",
+        "fields": [
+          "machineTypeCode",
+          "machineTypeName"
+        ]
+      }
+    }
+  },
+  "cfErpOperation": {
+    "table": "cf_operations",
+    "alias": "cop",
+    "writeFields": [],
+    "fields": {
+      "id": "cop.id",
+      "companyId": "cop.company_id",
+      "code": "cop.code",
+      "name": "cop.name",
+      "description": "cop.description",
+      "status": "cop.status",
+      "createdAt": "cop.created_at",
+      "updatedAt": "cop.updated_at",
+      "createdBy": "cop.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpOperationFlow": {
+    "table": "cf_operation_flows",
+    "alias": "cof",
+    "writeFields": [],
+    "fields": {
+      "id": "cof.id",
+      "companyId": "cof.company_id",
+      "code": "cof.code",
+      "name": "cof.name",
+      "description": "cof.description",
+      "revision": "cof.revision",
+      "status": "cof.status",
+      "createdAt": "cof.created_at",
+      "updatedAt": "cof.updated_at",
+      "createdBy": "cof.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "revision": "string",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpOperationFlowStep": {
+    "table": "cf_operation_flow_steps",
+    "alias": "cofs",
+    "writeFields": [],
+    "fields": {
+      "id": "cofs.id",
+      "companyId": "cofs.company_id",
+      "flowId": "cofs.flow_id",
+      "sequence": "cofs.sequence",
+      "operationId": "cofs.operation_id",
+      "stepName": "cofs.step_name",
+      "notes": "cofs.notes",
+      "createdAt": "cofs.created_at",
+      "updatedAt": "cofs.updated_at",
+      "createdBy": "cofs.created_by",
+      "operationCode": "cop_s.code",
+      "operationName": "cop_s.name",
+      "flowCode": "cof_s.code",
+      "flowStatus": "cof_s.status"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "flowId": "integer",
+      "sequence": "integer",
+      "operationId": "integer",
+      "stepName": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "operationCode": "string",
+      "operationName": "string",
+      "flowCode": "string",
+      "flowStatus": "string"
+    },
+    "relations": {
+      "operation": {
+        "table": "cf_operations",
+        "alias": "cop_s",
+        "on": "cofs.operation_id = cop_s.id",
+        "fields": [
+          "operationCode",
+          "operationName"
+        ]
+      },
+      "flow": {
+        "table": "cf_operation_flows",
+        "alias": "cof_s",
+        "on": "cofs.flow_id = cof_s.id",
+        "fields": [
+          "flowCode",
+          "flowStatus"
+        ]
+      }
+    }
+  },
+  "cfErpStepWaitRule": {
+    "table": "cf_step_wait_rules",
+    "alias": "cswr",
+    "writeFields": [],
+    "fields": {
+      "id": "cswr.id",
+      "companyId": "cswr.company_id",
+      "flowStepId": "cswr.flow_step_id",
+      "relation": "cswr.relation",
+      "targetDefinitionId": "cswr.target_definition_id",
+      "targetOperationId": "cswr.target_operation_id",
+      "requiredStatus": "cswr.required_status",
+      "notes": "cswr.notes",
+      "createdAt": "cswr.created_at",
+      "updatedAt": "cswr.updated_at",
+      "createdBy": "cswr.created_by",
+      "targetOperationCode": "cop_w.code",
+      "targetDefinitionCode": "cmr_w.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "flowStepId": "integer",
+      "relation": "string",
+      "targetDefinitionId": "integer",
+      "targetOperationId": "integer",
+      "requiredStatus": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "targetOperationCode": "string",
+      "targetDefinitionCode": "string"
+    },
+    "relations": {
+      "targetOperation": {
+        "table": "cf_operations",
+        "alias": "cop_w",
+        "on": "cswr.target_operation_id = cop_w.id",
+        "fields": [
+          "targetOperationCode"
+        ]
+      },
+      "targetDefinition": {
+        "table": "cf_master_records",
+        "alias": "cmr_w",
+        "on": "cswr.target_definition_id = cmr_w.id",
+        "fields": [
+          "targetDefinitionCode"
+        ]
+      }
+    }
+  },
+  "cfErpMachineShift": {
+    "table": "cf_machine_shifts",
+    "alias": "cms",
+    "writeFields": [],
+    "fields": {
+      "id": "cms.id",
+      "companyId": "cms.company_id",
+      "machineId": "cms.machine_id",
+      "name": "cms.name",
+      "weekdays": "cms.weekdays",
+      "startTime": "cms.start_time",
+      "endTime": "cms.end_time",
+      "breakMinutes": "cms.break_minutes",
+      "effectiveFrom": "cms.effective_from",
+      "effectiveTo": "cms.effective_to",
+      "sortOrder": "cms.sort_order",
+      "notes": "cms.notes",
+      "createdAt": "cms.created_at",
+      "updatedAt": "cms.updated_at",
+      "createdBy": "cms.created_by",
+      "machineCode": "cmc_s.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "machineId": "integer",
+      "name": "string",
+      "weekdays": "string",
+      "startTime": "string",
+      "endTime": "string",
+      "breakMinutes": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "sortOrder": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "machineCode": "string"
+    },
+    "relations": {
+      "machine": {
+        "table": "cf_machines",
+        "alias": "cmc_s",
+        "on": "cms.machine_id = cmc_s.id",
+        "fields": [
+          "machineCode"
+        ]
+      }
+    }
+  },
+  "cfErpMachineCalendarException": {
+    "table": "cf_machine_calendar_exceptions",
+    "alias": "cmce",
+    "writeFields": [],
+    "fields": {
+      "id": "cmce.id",
+      "companyId": "cmce.company_id",
+      "machineId": "cmce.machine_id",
+      "exceptionDate": "cmce.exception_date",
+      "kind": "cmce.kind",
+      "shiftId": "cmce.shift_id",
+      "startTime": "cmce.start_time",
+      "endTime": "cmce.end_time",
+      "reason": "cmce.reason",
+      "createdAt": "cmce.created_at",
+      "updatedAt": "cmce.updated_at",
+      "createdBy": "cmce.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "machineId": "integer",
+      "exceptionDate": "date",
+      "kind": "string",
+      "shiftId": "integer",
+      "startTime": "string",
+      "endTime": "string",
+      "reason": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpStockingArea": {
+    "table": "cf_stocking_areas",
+    "alias": "csar",
+    "writeFields": [],
+    "fields": {
+      "id": "csar.id",
+      "companyId": "csar.company_id",
+      "code": "csar.code",
+      "name": "csar.name",
+      "purpose": "csar.purpose",
+      "machineId": "csar.machine_id",
+      "status": "csar.status",
+      "notes": "csar.notes",
+      "createdAt": "csar.created_at",
+      "updatedAt": "csar.updated_at",
+      "createdBy": "csar.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "purpose": "string",
+      "machineId": "integer",
+      "status": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpStockBatch": {
+    "table": "cf_stock_batches",
+    "alias": "csb",
+    "writeFields": [],
+    "fields": {
+      "id": "csb.id",
+      "companyId": "csb.company_id",
+      "itemId": "csb.item_id",
+      "code": "csb.code",
+      "status": "csb.status",
+      "statusNote": "csb.status_note",
+      "receivedOn": "csb.received_on",
+      "supplierId": "csb.supplier_id",
+      "supplierRef": "csb.supplier_ref",
+      "notes": "csb.notes",
+      "createdAt": "csb.created_at",
+      "updatedAt": "csb.updated_at",
+      "createdBy": "csb.created_by",
+      "itemCode": "cmr_sb.code",
+      "itemName": "cmr_sb.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "itemId": "integer",
+      "code": "string",
+      "status": "string",
+      "statusNote": "string",
+      "receivedOn": "date",
+      "supplierId": "integer",
+      "supplierRef": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_sb",
+        "on": "csb.item_id = cmr_sb.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpStockMovement": {
+    "table": "cf_stock_movements",
+    "alias": "csm",
+    "writeFields": [],
+    "fields": {
+      "id": "csm.id",
+      "companyId": "csm.company_id",
+      "code": "csm.code",
+      "movementType": "csm.movement_type",
+      "movementDate": "csm.movement_date",
+      "partyId": "csm.party_id",
+      "orderId": "csm.order_id",
+      "reference": "csm.reference",
+      "reason": "csm.reason",
+      "reversalOfId": "csm.reversal_of_id",
+      "reversedById": "csm.reversed_by_id",
+      "notes": "csm.notes",
+      "createdAt": "csm.created_at",
+      "updatedAt": "csm.updated_at",
+      "createdBy": "csm.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "movementType": "string",
+      "movementDate": "date",
+      "partyId": "integer",
+      "orderId": "integer",
+      "reference": "string",
+      "reason": "string",
+      "reversalOfId": "integer",
+      "reversedById": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpStockLedger": {
+    "table": "cf_stock_ledger",
+    "alias": "csl",
+    "writeFields": [],
+    "fields": {
+      "id": "csl.id",
+      "companyId": "csl.company_id",
+      "movementId": "csl.movement_id",
+      "lineNo": "csl.line_no",
+      "stockingAreaId": "csl.stocking_area_id",
+      "itemId": "csl.item_id",
+      "batchId": "csl.batch_id",
+      "quantity": "csl.quantity",
+      "notes": "csl.notes",
+      "createdAt": "csl.created_at",
+      "updatedAt": "csl.updated_at",
+      "createdBy": "csl.created_by",
+      "movementCode": "csm_l.code",
+      "movementType": "csm_l.movement_type",
+      "movementDate": "csm_l.movement_date"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "movementId": "integer",
+      "lineNo": "integer",
+      "stockingAreaId": "integer",
+      "itemId": "integer",
+      "batchId": "integer",
+      "quantity": "decimal",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "movementCode": "string",
+      "movementType": "string",
+      "movementDate": "date"
+    },
+    "relations": {
+      "movement": {
+        "table": "cf_stock_movements",
+        "alias": "csm_l",
+        "on": "csl.movement_id = csm_l.id",
+        "fields": [
+          "movementCode",
+          "movementType",
+          "movementDate"
+        ]
+      }
+    }
+  },
+  "cfErpStockBalance": {
+    "table": "cf_stock_balances",
+    "alias": "csk",
+    "writeFields": [],
+    "fields": {
+      "id": "csk.id",
+      "companyId": "csk.company_id",
+      "stockingAreaId": "csk.stocking_area_id",
+      "itemId": "csk.item_id",
+      "batchId": "csk.batch_id",
+      "quantity": "csk.quantity",
+      "lastMovementId": "csk.last_movement_id",
+      "createdAt": "csk.created_at",
+      "updatedAt": "csk.updated_at",
+      "areaCode": "csar_k.code",
+      "areaPurpose": "csar_k.purpose",
+      "itemCode": "cmr_k.code",
+      "itemName": "cmr_k.name",
+      "batchCode": "csb_k.code",
+      "batchStatus": "csb_k.status"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "stockingAreaId": "integer",
+      "itemId": "integer",
+      "batchId": "integer",
+      "quantity": "decimal",
+      "lastMovementId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "areaCode": "string",
+      "areaPurpose": "string",
+      "itemCode": "string",
+      "itemName": "string",
+      "batchCode": "string",
+      "batchStatus": "string"
+    },
+    "relations": {
+      "area": {
+        "table": "cf_stocking_areas",
+        "alias": "csar_k",
+        "on": "csk.stocking_area_id = csar_k.id",
+        "fields": [
+          "areaCode",
+          "areaPurpose"
+        ]
+      },
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_k",
+        "on": "csk.item_id = cmr_k.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      },
+      "batch": {
+        "table": "cf_stock_batches",
+        "alias": "csb_k",
+        "on": "csk.batch_id = csb_k.id",
+        "fields": [
+          "batchCode",
+          "batchStatus"
+        ]
+      }
+    }
+  },
+  "cfErpOperationMachineRule": {
+    "table": "cf_operation_machine_rules",
+    "alias": "comr",
+    "writeFields": [],
+    "fields": {
+      "id": "comr.id",
+      "companyId": "comr.company_id",
+      "operationId": "comr.operation_id",
+      "subjectType": "comr.subject_type",
+      "subjectId": "comr.subject_id",
+      "eligible": "comr.eligible",
+      "setupMinutes": "comr.setup_minutes",
+      "setupFormulaId": "comr.setup_formula_id",
+      "workMinutes": "comr.work_minutes",
+      "workFormulaId": "comr.work_formula_id",
+      "effectiveFrom": "comr.effective_from",
+      "effectiveTo": "comr.effective_to",
+      "notes": "comr.notes",
+      "createdAt": "comr.created_at",
+      "updatedAt": "comr.updated_at",
+      "createdBy": "comr.created_by",
+      "operationCode": "cop_r.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "operationId": "integer",
+      "subjectType": "string",
+      "subjectId": "integer",
+      "eligible": "boolean",
+      "setupMinutes": "decimal",
+      "setupFormulaId": "integer",
+      "workMinutes": "decimal",
+      "workFormulaId": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "operationCode": "string"
+    },
+    "relations": {
+      "operation": {
+        "table": "cf_operations",
+        "alias": "cop_r",
+        "on": "comr.operation_id = cop_r.id",
+        "fields": [
+          "operationCode"
+        ]
+      }
+    }
+  },
+  "cfErpProductionRelease": {
+    "table": "cf_production_releases",
+    "alias": "cprl",
+    "writeFields": [],
+    "fields": {
+      "id": "cprl.id",
+      "companyId": "cprl.company_id",
+      "orderId": "cprl.order_id",
+      "orderLineId": "cprl.order_line_id",
+      "itemId": "cprl.item_id",
+      "itemRevision": "cprl.item_revision",
+      "quantity": "cprl.quantity",
+      "notes": "cprl.notes",
+      "createdAt": "cprl.created_at",
+      "updatedAt": "cprl.updated_at",
+      "createdBy": "cprl.created_by",
+      "orderCode": "csor_rl.code",
+      "orderStatus": "csor_rl.status"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderId": "integer",
+      "orderLineId": "integer",
+      "itemId": "integer",
+      "itemRevision": "string",
+      "quantity": "decimal",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "orderCode": "string",
+      "orderStatus": "string"
+    },
+    "relations": {
+      "order": {
+        "table": "cf_sales_orders",
+        "alias": "csor_rl",
+        "on": "cprl.order_id = csor_rl.id",
+        "fields": [
+          "orderCode",
+          "orderStatus"
+        ]
+      }
+    }
+  },
+  "cfErpProductionItem": {
+    "table": "cf_production_items",
+    "alias": "cpri",
+    "writeFields": [],
+    "fields": {
+      "id": "cpri.id",
+      "companyId": "cpri.company_id",
+      "releaseId": "cpri.release_id",
+      "parentId": "cpri.parent_id",
+      "itemId": "cpri.item_id",
+      "bomLineId": "cpri.bom_line_id",
+      "pieceNo": "cpri.piece_no",
+      "quantity": "cpri.quantity",
+      "code": "cpri.code",
+      "flowId": "cpri.flow_id",
+      "flowRevision": "cpri.flow_revision",
+      "depth": "cpri.depth",
+      "sortOrder": "cpri.sort_order",
+      "createdAt": "cpri.created_at",
+      "updatedAt": "cpri.updated_at",
+      "createdBy": "cpri.created_by",
+      "itemCode": "cmr_pi.code",
+      "itemName": "cmr_pi.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "releaseId": "integer",
+      "parentId": "integer",
+      "itemId": "integer",
+      "bomLineId": "integer",
+      "pieceNo": "integer",
+      "quantity": "decimal",
+      "code": "string",
+      "flowId": "integer",
+      "flowRevision": "string",
+      "depth": "integer",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_pi",
+        "on": "cpri.item_id = cmr_pi.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpProductionStep": {
+    "table": "cf_production_steps",
+    "alias": "cprs",
+    "writeFields": [],
+    "fields": {
+      "id": "cprs.id",
+      "companyId": "cprs.company_id",
+      "productionItemId": "cprs.production_item_id",
+      "flowStepId": "cprs.flow_step_id",
+      "operationId": "cprs.operation_id",
+      "sequence": "cprs.sequence",
+      "stepName": "cprs.step_name",
+      "quantity": "cprs.quantity",
+      "state": "cprs.state",
+      "heldFrom": "cprs.held_from",
+      "qtyGood": "cprs.qty_good",
+      "qtyScrap": "cprs.qty_scrap",
+      "machineId": "cprs.machine_id",
+      "startedAt": "cprs.started_at",
+      "finishedAt": "cprs.finished_at",
+      "createdAt": "cprs.created_at",
+      "updatedAt": "cprs.updated_at",
+      "createdBy": "cprs.created_by",
+      "operationCode": "cop_ps.code",
+      "operationName": "cop_ps.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "productionItemId": "integer",
+      "flowStepId": "integer",
+      "operationId": "integer",
+      "sequence": "integer",
+      "stepName": "string",
+      "quantity": "decimal",
+      "state": "string",
+      "heldFrom": "string",
+      "qtyGood": "decimal",
+      "qtyScrap": "decimal",
+      "machineId": "integer",
+      "startedAt": "datetime",
+      "finishedAt": "datetime",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "operationCode": "string",
+      "operationName": "string"
+    },
+    "relations": {
+      "operation": {
+        "table": "cf_operations",
+        "alias": "cop_ps",
+        "on": "cprs.operation_id = cop_ps.id",
+        "fields": [
+          "operationCode",
+          "operationName"
+        ]
+      }
+    }
+  },
+  "cfErpStepDependency": {
+    "table": "cf_step_dependencies",
+    "alias": "csdp",
+    "writeFields": [],
+    "fields": {
+      "id": "csdp.id",
+      "companyId": "csdp.company_id",
+      "stepId": "csdp.step_id",
+      "targetStepId": "csdp.target_step_id",
+      "targetItemId": "csdp.target_item_id",
+      "required": "csdp.required",
+      "origin": "csdp.origin",
+      "waitRuleId": "csdp.wait_rule_id",
+      "createdAt": "csdp.created_at",
+      "updatedAt": "csdp.updated_at",
+      "createdBy": "csdp.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "stepId": "integer",
+      "targetStepId": "integer",
+      "targetItemId": "integer",
+      "required": "string",
+      "origin": "string",
+      "waitRuleId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpMaterialRequirement": {
+    "table": "cf_material_requirements",
+    "alias": "cmrq",
+    "writeFields": [],
+    "fields": {
+      "id": "cmrq.id",
+      "companyId": "cmrq.company_id",
+      "releaseId": "cmrq.release_id",
+      "productionItemId": "cmrq.production_item_id",
+      "stepId": "cmrq.step_id",
+      "itemId": "cmrq.item_id",
+      "bomLineId": "cmrq.bom_line_id",
+      "quantity": "cmrq.quantity",
+      "issued": "cmrq.issued",
+      "createdAt": "cmrq.created_at",
+      "updatedAt": "cmrq.updated_at",
+      "createdBy": "cmrq.created_by",
+      "itemCode": "cmr_rq.code",
+      "itemName": "cmr_rq.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "releaseId": "integer",
+      "productionItemId": "integer",
+      "stepId": "integer",
+      "itemId": "integer",
+      "bomLineId": "integer",
+      "quantity": "decimal",
+      "issued": "decimal",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_rq",
+        "on": "cmrq.item_id = cmr_rq.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpStockReservation": {
+    "table": "cf_stock_reservations",
+    "alias": "csrv",
+    "writeFields": [],
+    "fields": {
+      "id": "csrv.id",
+      "companyId": "csrv.company_id",
+      "requirementId": "csrv.requirement_id",
+      "itemId": "csrv.item_id",
+      "batchId": "csrv.batch_id",
+      "quantity": "csrv.quantity",
+      "status": "csrv.status",
+      "closedAt": "csrv.closed_at",
+      "createdAt": "csrv.created_at",
+      "updatedAt": "csrv.updated_at",
+      "createdBy": "csrv.created_by",
+      "itemCode": "cmr_rv.code",
+      "batchCode": "csb_rv.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "requirementId": "integer",
+      "itemId": "integer",
+      "batchId": "integer",
+      "quantity": "decimal",
+      "status": "string",
+      "closedAt": "datetime",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "itemCode": "string",
+      "batchCode": "string"
+    },
+    "relations": {
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_rv",
+        "on": "csrv.item_id = cmr_rv.id",
+        "fields": [
+          "itemCode"
+        ]
+      },
+      "batch": {
+        "table": "cf_stock_batches",
+        "alias": "csb_rv",
+        "on": "csrv.batch_id = csb_rv.id",
+        "fields": [
+          "batchCode"
+        ]
+      }
+    }
+  },
+  "cfErpStepEvent": {
+    "table": "cf_step_events",
+    "alias": "csev",
+    "writeFields": [],
+    "fields": {
+      "id": "csev.id",
+      "companyId": "csev.company_id",
+      "stepId": "csev.step_id",
+      "event": "csev.event",
+      "qtyGood": "csev.qty_good",
+      "qtyScrap": "csev.qty_scrap",
+      "machineId": "csev.machine_id",
+      "note": "csev.note",
+      "createdAt": "csev.created_at",
+      "updatedAt": "csev.updated_at",
+      "createdBy": "csev.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "stepId": "integer",
+      "event": "string",
+      "qtyGood": "decimal",
+      "qtyScrap": "decimal",
+      "machineId": "integer",
+      "note": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpPurchaseOrder": {
+    "table": "cf_purchase_orders",
+    "alias": "cpo",
+    "writeFields": [],
+    "fields": {
+      "id": "cpo.id",
+      "companyId": "cpo.company_id",
+      "code": "cpo.code",
+      "supplierId": "cpo.supplier_id",
+      "status": "cpo.status",
+      "suggested": "cpo.suggested",
+      "expectedDate": "cpo.expected_date",
+      "orderedAt": "cpo.ordered_at",
+      "notes": "cpo.notes",
+      "createdAt": "cpo.created_at",
+      "updatedAt": "cpo.updated_at",
+      "createdBy": "cpo.created_by",
+      "supplierCode": "cpt_po.code",
+      "supplierName": "cpt_po.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "supplierId": "integer",
+      "status": "string",
+      "suggested": "integer",
+      "expectedDate": "date",
+      "orderedAt": "datetime",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "supplierCode": "string",
+      "supplierName": "string"
+    },
+    "relations": {
+      "supplier": {
+        "table": "cf_parties",
+        "alias": "cpt_po",
+        "on": "cpo.supplier_id = cpt_po.id",
+        "fields": [
+          "supplierCode",
+          "supplierName"
+        ]
+      }
+    }
+  },
+  "cfErpPurchaseOrderLine": {
+    "table": "cf_purchase_order_lines",
+    "alias": "cpol",
+    "writeFields": [],
+    "fields": {
+      "id": "cpol.id",
+      "companyId": "cpol.company_id",
+      "purchaseOrderId": "cpol.purchase_order_id",
+      "lineNo": "cpol.line_no",
+      "itemId": "cpol.item_id",
+      "quantity": "cpol.quantity",
+      "qtyReceived": "cpol.qty_received",
+      "uom": "cpol.uom",
+      "expectedDate": "cpol.expected_date",
+      "note": "cpol.note",
+      "createdAt": "cpol.created_at",
+      "updatedAt": "cpol.updated_at",
+      "createdBy": "cpol.created_by",
+      "orderCode": "cpo_l.code",
+      "orderStatus": "cpo_l.status",
+      "itemCode": "cmr_pl.code",
+      "itemName": "cmr_pl.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "purchaseOrderId": "integer",
+      "lineNo": "integer",
+      "itemId": "integer",
+      "quantity": "decimal",
+      "qtyReceived": "decimal",
+      "uom": "string",
+      "expectedDate": "date",
+      "note": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "orderCode": "string",
+      "orderStatus": "string",
+      "itemCode": "string",
+      "itemName": "string"
+    },
+    "relations": {
+      "order": {
+        "table": "cf_purchase_orders",
+        "alias": "cpo_l",
+        "on": "cpol.purchase_order_id = cpo_l.id",
+        "fields": [
+          "orderCode",
+          "orderStatus"
+        ]
+      },
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_pl",
+        "on": "cpol.item_id = cmr_pl.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,152 @@
+{
+  "cfErpCodeScheme": {
+    "table": "cf_code_schemes",
+    "alias": "ccs",
+    "writeFields": [
+      "code",
+      "name",
+      "entity_type",
+      "target_field",
+      "seq_scope",
+      "priority",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "ccs.id",
+      "companyId": "ccs.company_id",
+      "code": "ccs.code",
+      "name": "ccs.name",
+      "entityType": "ccs.entity_type",
+      "targetField": "ccs.target_field",
+      "seqScope": "ccs.seq_scope",
+      "priority": "ccs.priority",
+      "description": "ccs.description",
+      "status": "ccs.status",
+      "createdAt": "ccs.created_at",
+      "updatedAt": "ccs.updated_at",
+      "createdBy": "ccs.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "entityType": "string",
+      "targetField": "string",
+      "seqScope": "string",
+      "priority": "integer",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpCodeSchemeCondition": {
+    "table": "cf_code_scheme_conditions",
+    "alias": "ccsc",
+    "writeFields": [
+      "scheme_id",
+      "token_key",
+      "operator",
+      "value"
+    ],
+    "fields": {
+      "id": "ccsc.id",
+      "companyId": "ccsc.company_id",
+      "schemeId": "ccsc.scheme_id",
+      "tokenKey": "ccsc.token_key",
+      "operator": "ccsc.operator",
+      "value": "ccsc.value",
+      "createdAt": "ccsc.created_at",
+      "updatedAt": "ccsc.updated_at",
+      "createdBy": "ccsc.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "schemeId": "integer",
+      "tokenKey": "string",
+      "operator": "string",
+      "value": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpCodeSchemeSegment": {
+    "table": "cf_code_scheme_segments",
+    "alias": "ccss",
+    "writeFields": [
+      "scheme_id",
+      "sort_order",
+      "segment_type",
+      "literal_text",
+      "token_key",
+      "format",
+      "transform",
+      "max_length",
+      "is_required"
+    ],
+    "fields": {
+      "id": "ccss.id",
+      "companyId": "ccss.company_id",
+      "schemeId": "ccss.scheme_id",
+      "sortOrder": "ccss.sort_order",
+      "segmentType": "ccss.segment_type",
+      "literalText": "ccss.literal_text",
+      "tokenKey": "ccss.token_key",
+      "format": "ccss.format",
+      "transform": "ccss.transform",
+      "maxLength": "ccss.max_length",
+      "isRequired": "ccss.is_required",
+      "createdAt": "ccss.created_at",
+      "updatedAt": "ccss.updated_at",
+      "createdBy": "ccss.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "schemeId": "integer",
+      "sortOrder": "integer",
+      "segmentType": "string",
+      "literalText": "string",
+      "tokenKey": "string",
+      "format": "string",
+      "transform": "string",
+      "maxLength": "integer",
+      "isRequired": "boolean",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpCodeSequence": {
+    "table": "cf_code_sequences",
+    "alias": "ccq",
+    "writeFields": [],
+    "fields": {
+      "id": "ccq.id",
+      "companyId": "ccq.company_id",
+      "schemeId": "ccq.scheme_id",
+      "seqKey": "ccq.seq_key",
+      "nextValue": "ccq.next_value",
+      "createdAt": "ccq.created_at",
+      "updatedAt": "ccq.updated_at"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "schemeId": "integer",
+      "seqKey": "string",
+      "nextValue": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    },
+    "relations": {}
+  }
+}

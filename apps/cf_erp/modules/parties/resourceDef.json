@@ -1,0 +1,46 @@
+{
+  "cfErpParty": {
+    "table": "cf_parties",
+    "alias": "cpt",
+    "writeFields": [],
+    "fields": {
+      "id": "cpt.id",
+      "companyId": "cpt.company_id",
+      "code": "cpt.code",
+      "name": "cpt.name",
+      "isCustomer": "cpt.is_customer",
+      "isSupplier": "cpt.is_supplier",
+      "isSubcontractor": "cpt.is_subcontractor",
+      "taxNumber": "cpt.tax_number",
+      "contactName": "cpt.contact_name",
+      "email": "cpt.email",
+      "phone": "cpt.phone",
+      "address": "cpt.address",
+      "notes": "cpt.notes",
+      "status": "cpt.status",
+      "createdAt": "cpt.created_at",
+      "updatedAt": "cpt.updated_at",
+      "createdBy": "cpt.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "isCustomer": "boolean",
+      "isSupplier": "boolean",
+      "isSubcontractor": "boolean",
+      "taxNumber": "string",
+      "contactName": "string",
+      "email": "string",
+      "phone": "string",
+      "address": "text",
+      "notes": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  }
+}
