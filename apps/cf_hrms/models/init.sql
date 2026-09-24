@@ -1796,21 +1796,8 @@ SET @sql = IF(@fk = 0,
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 
--- ----- 6f. Widen hrms_audit_log.action to include READ ----------------------
--- For an installation created before READ was added to the enum. CREATE TABLE
--- IF NOT EXISTS cannot alter an existing table, so the change has to be applied
--- here too, guarded so the file stays safe to re-run. Widening an ENUM keeps
--- every existing value valid.
-
-SET @has_read = (SELECT COUNT(*) FROM information_schema.COLUMNS
-                  WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = 'hrms_audit_log'
-                    AND COLUMN_NAME = 'action'
-                    AND COLUMN_TYPE LIKE '%READ%');
-SET @sql = IF(@has_read = 0,
-  'ALTER TABLE hrms_audit_log MODIFY COLUMN action ENUM(''CREATE'',''UPDATE'',''DELETE'',''APPROVE'',''GENERATE'',''IMPORT'',''READ'') NOT NULL',
-  'SELECT 1');
-PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- (The hrms_audit_log READ widening used to sit here. It does not any more —
+--  see section 10 at the end of this file, and the note there about why.)
 
 
 -- ############################################################################
@@ -2425,3 +2412,33 @@ CREATE TABLE IF NOT EXISTS hrms_import_runs (
 --     Every rule that would have been one is named at its table together with
 --     the service that enforces it.
 -- ============================================================================
+
+
+-- ############################################################################
+-- ## 10. RETROFITS — guarded ALTERs, and they belong at the END              ##
+-- ############################################################################
+-- A guarded ALTER must come after the CREATE TABLE of the table it alters.
+--
+-- That sounds obvious. It was still got wrong: this statement originally sat in
+-- section 6f, next to the other guarded ALTER, ~500 lines BEFORE
+-- hrms_audit_log is created in section 9. Every local run passed, because the
+-- table already existed from an earlier run. The first FRESH database it ever
+-- met was production, where it aborted the whole file at 35 of 46 tables.
+--
+-- So: two guards, not one. The ALTER runs only when the table EXISTS and its
+-- enum lacks READ — which is true only for a database created before READ was
+-- added. A fresh install creates the column with READ already in it (§9) and
+-- skips this entirely.
+--
+-- Put any future retrofit here, not beside the table it touches.
+
+SET @needs_read = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_audit_log'
+     AND COLUMN_NAME  = 'action'
+     AND COLUMN_TYPE NOT LIKE '%READ%');
+SET @sql = IF(@needs_read = 1,
+  'ALTER TABLE hrms_audit_log MODIFY COLUMN action ENUM(''CREATE'',''UPDATE'',''DELETE'',''APPROVE'',''GENERATE'',''IMPORT'',''READ'') NOT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
