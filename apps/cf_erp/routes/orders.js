@@ -12,6 +12,8 @@
  *   PUT    /order-lines/:id            { quantity?, committedDate?, description?, lineNo?, notes? }
  *   DELETE /order-lines/:id            a custom line takes its structure with it
  *   GET    /order-lines/:id/structure  the whole structure the line sells
+ *   GET    /order-lines/:id/cut-plates the blanks its plate parts are cut from
+ *   POST   /order-lines/:id/cut-plates { flowId? } — work them out again; re-runnable
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -20,6 +22,7 @@ import {
   listOrders, getOrder, createOrder, updateOrder, setOrderStatus, deleteOrder,
   addOrderLine, updateOrderLine, removeOrderLine, lineStructure,
 } from '../services/salesOrderService.js';
+import { deriveCutPlates, getCutPlates } from '../services/cutPlateService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -36,5 +39,10 @@ router.post('/orders/:id/lines', guard(PERM.orders), handle((req) => tx(req, (db
 router.put('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrderLine(db, c, id(req), req.body ?? {}))));
 router.delete('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => removeOrderLine(db, c, id(req)))));
 router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle((req) => lineStructure(pool, ctx(req).companyId, id(req))));
+
+// Cut plates change the line's structure, so they sit behind the same grant as
+// the rest of it: seeing them is a read, working them out is managing the order.
+router.get('/order-lines/:id/cut-plates', guard(PERM.ordersView), handle((req) => getCutPlates(pool, ctx(req).companyId, id(req))));
+router.post('/order-lines/:id/cut-plates', guard(PERM.orders), handle((req) => tx(req, (db, c) => deriveCutPlates(db, c, id(req), req.body ?? {}))));
 
 export default router;

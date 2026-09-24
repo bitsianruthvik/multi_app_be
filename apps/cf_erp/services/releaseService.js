@@ -149,6 +149,50 @@ async function itemDetails(db, companyId, itemIds) {
 }
 
 /**
+ * "Made out of nothing" — the nodes this order makes that have nothing under
+ * them at all.
+ *
+ * It matters because of how material is worked out below: a requirement is
+ * recorded for a CHILD that is not made, so a made node with no children
+ * iterates nothing and asks for nothing. Release then succeeds, the tracker is
+ * built, and the buy list proposes nothing — the plate parts of a real job were
+ * `sourcing = 'make'` with no BOM, and 669 t of steel simply did not exist as
+ * far as the system was concerned. A thing cannot be made out of nothing.
+ *
+ * The exploded tree alone must not be the answer. It stops at its depth cap, so
+ * a node at the bottom of a deep structure looks childless while its BOM is
+ * full, and telling somebody to give a BOM to a thing that has one is worse
+ * than saying nothing. So the database is asked whether the item really has a
+ * live BOM line, and only an item that truly has none is named.
+ *
+ * Returns one entry per (item, place), so six identical stiffeners are one
+ * sentence rather than six.
+ */
+async function madeFromNothing(db, companyId, nodes) {
+  const suspects = nodes.filter((n) => n.made === true && !n.children.length);
+  if (!suspects.length) return [];
+  const [rows] = await db.query(
+    `SELECT b.parent_id, COUNT(l.id) AS line_count
+       FROM cf_boms b
+       LEFT JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
+      WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL
+      GROUP BY b.parent_id`,
+    [companyId, [...new Set(suspects.map((n) => n.id))]],
+  );
+  const lines = new Map(rows.map((r) => [r.parent_id, Number(r.line_count)]));
+  const seen = new Set();
+  const out = [];
+  for (const n of suspects) {
+    if (lines.get(n.id) > 0) continue;
+    const key = `${n.id}:${n.parentNode?.id ?? 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(n);
+  }
+  return out;
+}
+
+/**
  * Checks a line's structure and builds, in memory, everything release writes:
  * tracker nodes, their steps, the dependencies and the material requirements.
  * Returns every problem at once — nothing is written here.
@@ -203,6 +247,14 @@ async function buildPlan(db, companyId, line) {
     if (n.made) for (const kid of n.children) consider(kid, n, kid.quantity * count);
   };
   consider(tree.root, null, qty);
+  for (const n of await madeFromNothing(db, companyId, all)) {
+    const where = n.parentNode ? ` under ${nameOf(n.parentNode)}` : '';
+    // A temporary item is always made on its order — masterRecordService refuses
+    // to give one any other sourcing — so it is offered the one way out it has.
+    problems.push(n.kind === 'temporary'
+      ? `${nameOf(n)}${where} is made on the order, but nothing is under it — give it a BOM saying what it is made from.`
+      : `${nameOf(n)}${where} is made on the order, but nothing is under it — give it a BOM, or set it to come from stock.`);
+  }
   const root = tree.root;
   if (root.made === undefined) return { problems, tree };
 

@@ -356,31 +356,46 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
   let truncated = false;
   for (let depth = 1; frontier.length; depth++) {
     if (depth > maxDepth) { truncated = true; break; }
-    const byParent = new Map(frontier.map((n) => [n.bom.id, n]));
+    // One BOM can hang under SEVERAL parents at the same level — a blank that
+    // three parts are all cut from is exactly that — so a bom id maps to a list
+    // of nodes and each of them gets its own copy of the children. Keying one
+    // node per bom kept only the last of them, and the copies it dropped took
+    // their material with them: the tracker was built and nothing was ever
+    // bought for those pieces.
+    const byParent = new Map();
+    for (const n of frontier) {
+      if (!byParent.has(n.bom.id)) byParent.set(n.bom.id, []);
+      byParent.get(n.bom.id).push(n);
+    }
     const lines = await linesOfBoms(db, companyId, [...byParent.keys()]);
     const childBoms = await bomsOfParents(db, companyId, [...new Set(lines.map((l) => l.child_id))]);
     const next = [];
     for (const l of lines) {
-      const parentNode = byParent.get(l.bom_id);
       const cb = childBoms.get(l.child_id);
       const kind = childKindOf(l);
-      const node = {
-        key: `l${l.id}`, id: l.child_id, code: l.child_code, name: l.child_name, kind, status: l.child_status,
-        uom: l.child_uom ?? null, depth, quantity: Number(l.quantity), total: Number((parentNode.total * Number(l.quantity)).toFixed(6)),
-        lineId: l.id, lineNo: l.line_no, position: l.position, role: l.role,
-        selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
-        resolved: l.child_record_kind === 'item',
-        flow: effectiveFlowOf(l),
-        bom: cb ? { id: cb.id, bomType: cb.bom_type, status: cb.status, revision: cb.revision } : null,
-        children: [],
-      };
-      parentNode.children.push(node);
-      stats.nodes++;
-      stats.maxDepth = Math.max(stats.maxDepth, depth);
-      if (kind === 'temporary') stats.temporary++;
-      if (l.child_status === 'draft') stats.drafts++;
-      if (l.selection_definition_id && l.child_record_kind === 'definition') stats.unresolved++;
-      if (cb) next.push(node);
+      const copies = byParent.get(l.bom_id) ?? [];
+      for (const [i, parentNode] of copies.entries()) {
+        const node = {
+          // The line names the node, as it always has; only a line reached
+          // through more than one parent has to say which copy it is.
+          key: copies.length > 1 ? `l${l.id}#${i}` : `l${l.id}`,
+          id: l.child_id, code: l.child_code, name: l.child_name, kind, status: l.child_status,
+          uom: l.child_uom ?? null, depth, quantity: Number(l.quantity), total: Number((parentNode.total * Number(l.quantity)).toFixed(6)),
+          lineId: l.id, lineNo: l.line_no, position: l.position, role: l.role,
+          selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
+          resolved: l.child_record_kind === 'item',
+          flow: effectiveFlowOf(l),
+          bom: cb ? { id: cb.id, bomType: cb.bom_type, status: cb.status, revision: cb.revision } : null,
+          children: [],
+        };
+        parentNode.children.push(node);
+        stats.nodes++;
+        stats.maxDepth = Math.max(stats.maxDepth, depth);
+        if (kind === 'temporary') stats.temporary++;
+        if (l.child_status === 'draft') stats.drafts++;
+        if (l.selection_definition_id && l.child_record_kind === 'definition') stats.unresolved++;
+        if (cb) next.push(node);
+      }
     }
     frontier = next;
   }
