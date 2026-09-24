@@ -1,0 +1,3223 @@
+{
+  "cfHrmsLocation": {
+    "table": "hrms_locations",
+    "alias": "hloc",
+    "writeFields": [
+      "code",
+      "name",
+      "location_type",
+      "parent_location_id",
+      "address_json",
+      "status"
+    ],
+    "fields": {
+      "id": "hloc.id",
+      "companyId": "hloc.company_id",
+      "code": "hloc.code",
+      "name": "hloc.name",
+      "locationType": "hloc.location_type",
+      "parentLocationId": "hloc.parent_location_id",
+      "addressJson": "hloc.address_json",
+      "status": "hloc.status",
+      "createdAt": "hloc.created_at",
+      "updatedAt": "hloc.updated_at",
+      "createdBy": "hloc.created_by",
+      "parentName": "hloc_p.name",
+      "parentCode": "hloc_p.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "locationType": "string",
+      "parentLocationId": "integer",
+      "addressJson": "json",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "parentName": "string",
+      "parentCode": "string"
+    },
+    "relations": {
+      "parent": {
+        "table": "hrms_locations",
+        "alias": "hloc_p",
+        "on": "hloc.parent_location_id = hloc_p.id",
+        "fields": [
+          "parentName",
+          "parentCode"
+        ]
+      }
+    }
+  },
+  "cfHrmsDepartment": {
+    "table": "hrms_departments",
+    "alias": "hdep",
+    "writeFields": [
+      "code",
+      "name",
+      "parent_department_id",
+      "status"
+    ],
+    "fields": {
+      "id": "hdep.id",
+      "companyId": "hdep.company_id",
+      "code": "hdep.code",
+      "name": "hdep.name",
+      "parentDepartmentId": "hdep.parent_department_id",
+      "status": "hdep.status",
+      "createdAt": "hdep.created_at",
+      "updatedAt": "hdep.updated_at",
+      "createdBy": "hdep.created_by",
+      "parentName": "hdep_p.name",
+      "parentCode": "hdep_p.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "parentDepartmentId": "integer",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "parentName": "string",
+      "parentCode": "string"
+    },
+    "relations": {
+      "parent": {
+        "table": "hrms_departments",
+        "alias": "hdep_p",
+        "on": "hdep.parent_department_id = hdep_p.id",
+        "fields": [
+          "parentName",
+          "parentCode"
+        ]
+      }
+    }
+  },
+  "cfHrmsWorkContext": {
+    "table": "hrms_work_contexts",
+    "alias": "hwct",
+    "writeFields": [
+      "code",
+      "name",
+      "context_type",
+      "location_id",
+      "department_id",
+      "parent_context_id",
+      "external_ref",
+      "status",
+      "metadata_json"
+    ],
+    "fields": {
+      "id": "hwct.id",
+      "companyId": "hwct.company_id",
+      "code": "hwct.code",
+      "name": "hwct.name",
+      "contextType": "hwct.context_type",
+      "locationId": "hwct.location_id",
+      "departmentId": "hwct.department_id",
+      "parentContextId": "hwct.parent_context_id",
+      "externalRef": "hwct.external_ref",
+      "status": "hwct.status",
+      "metadataJson": "hwct.metadata_json",
+      "createdAt": "hwct.created_at",
+      "updatedAt": "hwct.updated_at",
+      "createdBy": "hwct.created_by",
+      "locationName": "hloc_c.name",
+      "locationCode": "hloc_c.code",
+      "departmentName": "hdep_c.name",
+      "departmentCode": "hdep_c.code",
+      "parentName": "hwct_p.name",
+      "parentContextType": "hwct_p.context_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "contextType": "string",
+      "locationId": "integer",
+      "departmentId": "integer",
+      "parentContextId": "integer",
+      "externalRef": "string",
+      "status": "string",
+      "metadataJson": "json",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "locationName": "string",
+      "locationCode": "string",
+      "departmentName": "string",
+      "departmentCode": "string",
+      "parentName": "string",
+      "parentContextType": "string"
+    },
+    "relations": {
+      "location": {
+        "table": "hrms_locations",
+        "alias": "hloc_c",
+        "on": "hwct.location_id = hloc_c.id",
+        "fields": [
+          "locationName",
+          "locationCode"
+        ]
+      },
+      "department": {
+        "table": "hrms_departments",
+        "alias": "hdep_c",
+        "on": "hwct.department_id = hdep_c.id",
+        "fields": [
+          "departmentName",
+          "departmentCode"
+        ]
+      },
+      "parent": {
+        "table": "hrms_work_contexts",
+        "alias": "hwct_p",
+        "on": "hwct.parent_context_id = hwct_p.id",
+        "fields": [
+          "parentName",
+          "parentContextType"
+        ]
+      }
+    }
+  },
+  "cfHrmsContractor": {
+    "table": "hrms_contractors",
+    "alias": "hcon",
+    "writeFields": [
+      "code",
+      "name",
+      "contact_json",
+      "status"
+    ],
+    "fields": {
+      "id": "hcon.id",
+      "companyId": "hcon.company_id",
+      "code": "hcon.code",
+      "name": "hcon.name",
+      "contactJson": "hcon.contact_json",
+      "status": "hcon.status",
+      "createdAt": "hcon.created_at",
+      "updatedAt": "hcon.updated_at",
+      "createdBy": "hcon.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "contactJson": "json",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsShift": {
+    "table": "hrms_shifts",
+    "alias": "hshf",
+    "writeFields": [
+      "code",
+      "name",
+      "start_time",
+      "end_time",
+      "crosses_midnight",
+      "grace_in_minutes",
+      "grace_out_minutes",
+      "status"
+    ],
+    "fields": {
+      "id": "hshf.id",
+      "companyId": "hshf.company_id",
+      "code": "hshf.code",
+      "name": "hshf.name",
+      "startTime": "hshf.start_time",
+      "endTime": "hshf.end_time",
+      "crossesMidnight": "hshf.crosses_midnight",
+      "graceInMinutes": "hshf.grace_in_minutes",
+      "graceOutMinutes": "hshf.grace_out_minutes",
+      "status": "hshf.status",
+      "createdAt": "hshf.created_at",
+      "updatedAt": "hshf.updated_at",
+      "createdBy": "hshf.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "startTime": "string",
+      "endTime": "string",
+      "crossesMidnight": "boolean",
+      "graceInMinutes": "integer",
+      "graceOutMinutes": "integer",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsHoliday": {
+    "table": "hrms_holidays",
+    "alias": "hhol",
+    "writeFields": [
+      "location_id",
+      "holiday_date",
+      "name",
+      "is_optional"
+    ],
+    "fields": {
+      "id": "hhol.id",
+      "companyId": "hhol.company_id",
+      "locationId": "hhol.location_id",
+      "holidayDate": "hhol.holiday_date",
+      "name": "hhol.name",
+      "isOptional": "hhol.is_optional",
+      "createdAt": "hhol.created_at",
+      "updatedAt": "hhol.updated_at",
+      "createdBy": "hhol.created_by",
+      "locationName": "hloc_h.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "locationId": "integer",
+      "holidayDate": "date",
+      "name": "string",
+      "isOptional": "boolean",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "locationName": "string"
+    },
+    "relations": {
+      "location": {
+        "table": "hrms_locations",
+        "alias": "hloc_h",
+        "on": "hhol.location_id = hloc_h.id",
+        "fields": [
+          "locationName"
+        ]
+      }
+    }
+  },
+  "cfHrmsReportingRelationshipType": {
+    "table": "hrms_reporting_relationship_types",
+    "alias": "hrrt",
+    "writeFields": [
+      "code",
+      "name",
+      "is_formal",
+      "allow_multiple",
+      "sort_order",
+      "status"
+    ],
+    "fields": {
+      "id": "hrrt.id",
+      "companyId": "hrrt.company_id",
+      "code": "hrrt.code",
+      "name": "hrrt.name",
+      "isFormal": "hrrt.is_formal",
+      "allowMultiple": "hrrt.allow_multiple",
+      "sortOrder": "hrrt.sort_order",
+      "status": "hrrt.status",
+      "createdAt": "hrrt.created_at",
+      "updatedAt": "hrrt.updated_at",
+      "createdBy": "hrrt.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "isFormal": "boolean",
+      "allowMultiple": "boolean",
+      "sortOrder": "integer",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsKraDefinition": {
+    "table": "hrms_kra_definitions",
+    "alias": "hkrd",
+    "writeFields": [
+      "code",
+      "name",
+      "description",
+      "category",
+      "status"
+    ],
+    "fields": {
+      "id": "hkrd.id",
+      "companyId": "hkrd.company_id",
+      "code": "hkrd.code",
+      "name": "hkrd.name",
+      "description": "hkrd.description",
+      "category": "hkrd.category",
+      "status": "hkrd.status",
+      "createdAt": "hkrd.created_at",
+      "updatedAt": "hkrd.updated_at",
+      "createdBy": "hkrd.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "category": "string",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsResponsibilityDefinition": {
+    "table": "hrms_responsibility_definitions",
+    "alias": "hrsd",
+    "writeFields": [
+      "code",
+      "name",
+      "description",
+      "responsibility_class",
+      "status"
+    ],
+    "fields": {
+      "id": "hrsd.id",
+      "companyId": "hrsd.company_id",
+      "code": "hrsd.code",
+      "name": "hrsd.name",
+      "description": "hrsd.description",
+      "responsibilityClass": "hrsd.responsibility_class",
+      "status": "hrsd.status",
+      "createdAt": "hrsd.created_at",
+      "updatedAt": "hrsd.updated_at",
+      "createdBy": "hrsd.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "responsibilityClass": "string",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsKpiDefinition": {
+    "table": "hrms_kpi_definitions",
+    "alias": "hkpd",
+    "writeFields": [
+      "code",
+      "name",
+      "description",
+      "measurement_type",
+      "unit",
+      "direction",
+      "formula_text",
+      "data_source",
+      "default_frequency",
+      "status"
+    ],
+    "fields": {
+      "id": "hkpd.id",
+      "companyId": "hkpd.company_id",
+      "code": "hkpd.code",
+      "name": "hkpd.name",
+      "description": "hkpd.description",
+      "measurementType": "hkpd.measurement_type",
+      "unit": "hkpd.unit",
+      "direction": "hkpd.direction",
+      "formulaText": "hkpd.formula_text",
+      "dataSource": "hkpd.data_source",
+      "defaultFrequency": "hkpd.default_frequency",
+      "status": "hkpd.status",
+      "createdAt": "hkpd.created_at",
+      "updatedAt": "hkpd.updated_at",
+      "createdBy": "hkpd.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "description": "text",
+      "measurementType": "string",
+      "unit": "string",
+      "direction": "string",
+      "formulaText": "text",
+      "dataSource": "string",
+      "defaultFrequency": "string",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsSkillDefinition": {
+    "table": "hrms_skill_definitions",
+    "alias": "hskd",
+    "writeFields": [
+      "name",
+      "skill_type",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "hskd.id",
+      "companyId": "hskd.company_id",
+      "name": "hskd.name",
+      "skillType": "hskd.skill_type",
+      "description": "hskd.description",
+      "status": "hskd.status",
+      "createdAt": "hskd.created_at",
+      "updatedAt": "hskd.updated_at",
+      "createdBy": "hskd.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "name": "string",
+      "skillType": "string",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsQualificationDefinition": {
+    "table": "hrms_qualification_definitions",
+    "alias": "hqld",
+    "writeFields": [
+      "name",
+      "qualification_type",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "hqld.id",
+      "companyId": "hqld.company_id",
+      "name": "hqld.name",
+      "qualificationType": "hqld.qualification_type",
+      "description": "hqld.description",
+      "status": "hqld.status",
+      "createdAt": "hqld.created_at",
+      "updatedAt": "hqld.updated_at",
+      "createdBy": "hqld.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "name": "string",
+      "qualificationType": "string",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsAuthorityDefinition": {
+    "table": "hrms_authority_definitions",
+    "alias": "hatd",
+    "writeFields": [
+      "name",
+      "authority_type",
+      "description",
+      "status"
+    ],
+    "fields": {
+      "id": "hatd.id",
+      "companyId": "hatd.company_id",
+      "name": "hatd.name",
+      "authorityType": "hatd.authority_type",
+      "description": "hatd.description",
+      "status": "hatd.status",
+      "createdAt": "hatd.created_at",
+      "updatedAt": "hatd.updated_at",
+      "createdBy": "hatd.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "name": "string",
+      "authorityType": "string",
+      "description": "text",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsRole": {
+    "table": "hrms_roles",
+    "alias": "hrol",
+    "writeFields": [
+      "role_code",
+      "title",
+      "role_purpose",
+      "role_summary",
+      "default_department_id",
+      "status",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrol.id",
+      "companyId": "hrol.company_id",
+      "roleCode": "hrol.role_code",
+      "title": "hrol.title",
+      "rolePurpose": "hrol.role_purpose",
+      "roleSummary": "hrol.role_summary",
+      "defaultDepartmentId": "hrol.default_department_id",
+      "status": "hrol.status",
+      "effectiveFrom": "hrol.effective_from",
+      "effectiveTo": "hrol.effective_to",
+      "createdAt": "hrol.created_at",
+      "updatedAt": "hrol.updated_at",
+      "createdBy": "hrol.created_by",
+      "departmentName": "hdep_r.name",
+      "departmentCode": "hdep_r.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleCode": "string",
+      "title": "string",
+      "rolePurpose": "text",
+      "roleSummary": "text",
+      "defaultDepartmentId": "integer",
+      "status": "string",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "departmentName": "string",
+      "departmentCode": "string"
+    },
+    "relations": {
+      "defaultDepartment": {
+        "table": "hrms_departments",
+        "alias": "hdep_r",
+        "on": "hrol.default_department_id = hdep_r.id",
+        "fields": [
+          "departmentName",
+          "departmentCode"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleKraAssignment": {
+    "table": "hrms_role_kra_assignments",
+    "alias": "hrka",
+    "writeFields": [
+      "role_id",
+      "kra_definition_id",
+      "weight_percent",
+      "is_mandatory",
+      "sequence",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hrka.id",
+      "companyId": "hrka.company_id",
+      "roleId": "hrka.role_id",
+      "kraDefinitionId": "hrka.kra_definition_id",
+      "weightPercent": "hrka.weight_percent",
+      "isMandatory": "hrka.is_mandatory",
+      "sequence": "hrka.sequence",
+      "effectiveFrom": "hrka.effective_from",
+      "effectiveTo": "hrka.effective_to",
+      "notes": "hrka.notes",
+      "createdAt": "hrka.created_at",
+      "updatedAt": "hrka.updated_at",
+      "createdBy": "hrka.created_by",
+      "roleTitle": "hrol_ka.title",
+      "roleCode": "hrol_ka.role_code",
+      "kraName": "hkrd_ka.name",
+      "kraCode": "hkrd_ka.code",
+      "kraCategory": "hkrd_ka.category",
+      "kraDescription": "hkrd_ka.description"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "kraDefinitionId": "integer",
+      "weightPercent": "decimal",
+      "isMandatory": "boolean",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "kraName": "string",
+      "kraCode": "string",
+      "kraCategory": "string",
+      "kraDescription": "text"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_ka",
+        "on": "hrka.role_id = hrol_ka.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "kra": {
+        "table": "hrms_kra_definitions",
+        "alias": "hkrd_ka",
+        "on": "hrka.kra_definition_id = hkrd_ka.id",
+        "fields": [
+          "kraName",
+          "kraCode",
+          "kraCategory",
+          "kraDescription"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleResponsibilityAssignment": {
+    "table": "hrms_role_responsibility_assignments",
+    "alias": "hrra",
+    "writeFields": [
+      "role_id",
+      "responsibility_definition_id",
+      "role_kra_assignment_id",
+      "responsibility_class_override",
+      "is_mandatory",
+      "sequence",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hrra.id",
+      "companyId": "hrra.company_id",
+      "roleId": "hrra.role_id",
+      "responsibilityDefinitionId": "hrra.responsibility_definition_id",
+      "roleKraAssignmentId": "hrra.role_kra_assignment_id",
+      "responsibilityClassOverride": "hrra.responsibility_class_override",
+      "isMandatory": "hrra.is_mandatory",
+      "sequence": "hrra.sequence",
+      "effectiveFrom": "hrra.effective_from",
+      "effectiveTo": "hrra.effective_to",
+      "notes": "hrra.notes",
+      "createdAt": "hrra.created_at",
+      "updatedAt": "hrra.updated_at",
+      "createdBy": "hrra.created_by",
+      "roleTitle": "hrol_ra.title",
+      "roleCode": "hrol_ra.role_code",
+      "responsibilityName": "hrsd_ra.name",
+      "responsibilityDescription": "hrsd_ra.description",
+      "responsibilityClass": "hrsd_ra.responsibility_class"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "responsibilityDefinitionId": "integer",
+      "roleKraAssignmentId": "integer",
+      "responsibilityClassOverride": "string",
+      "isMandatory": "boolean",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "responsibilityName": "string",
+      "responsibilityDescription": "text",
+      "responsibilityClass": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_ra",
+        "on": "hrra.role_id = hrol_ra.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "responsibility": {
+        "table": "hrms_responsibility_definitions",
+        "alias": "hrsd_ra",
+        "on": "hrra.responsibility_definition_id = hrsd_ra.id",
+        "fields": [
+          "responsibilityName",
+          "responsibilityDescription",
+          "responsibilityClass"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleKpiAssignment": {
+    "table": "hrms_role_kpi_assignments",
+    "alias": "hrkp",
+    "writeFields": [
+      "role_id",
+      "kpi_definition_id",
+      "role_kra_assignment_id",
+      "target_operator",
+      "target_value",
+      "weight_percent",
+      "frequency_override",
+      "is_mandatory",
+      "sequence",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hrkp.id",
+      "companyId": "hrkp.company_id",
+      "roleId": "hrkp.role_id",
+      "kpiDefinitionId": "hrkp.kpi_definition_id",
+      "roleKraAssignmentId": "hrkp.role_kra_assignment_id",
+      "targetOperator": "hrkp.target_operator",
+      "targetValue": "hrkp.target_value",
+      "weightPercent": "hrkp.weight_percent",
+      "frequencyOverride": "hrkp.frequency_override",
+      "isMandatory": "hrkp.is_mandatory",
+      "sequence": "hrkp.sequence",
+      "effectiveFrom": "hrkp.effective_from",
+      "effectiveTo": "hrkp.effective_to",
+      "notes": "hrkp.notes",
+      "createdAt": "hrkp.created_at",
+      "updatedAt": "hrkp.updated_at",
+      "createdBy": "hrkp.created_by",
+      "roleTitle": "hrol_kp.title",
+      "roleCode": "hrol_kp.role_code",
+      "kpiName": "hkpd_kp.name",
+      "kpiCode": "hkpd_kp.code",
+      "kpiMeasurementType": "hkpd_kp.measurement_type",
+      "kpiUnit": "hkpd_kp.unit",
+      "kpiDirection": "hkpd_kp.direction",
+      "kpiDefaultFrequency": "hkpd_kp.default_frequency"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "kpiDefinitionId": "integer",
+      "roleKraAssignmentId": "integer",
+      "targetOperator": "string",
+      "targetValue": "json",
+      "weightPercent": "decimal",
+      "frequencyOverride": "string",
+      "isMandatory": "boolean",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "kpiName": "string",
+      "kpiCode": "string",
+      "kpiMeasurementType": "string",
+      "kpiUnit": "string",
+      "kpiDirection": "string",
+      "kpiDefaultFrequency": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_kp",
+        "on": "hrkp.role_id = hrol_kp.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "kpi": {
+        "table": "hrms_kpi_definitions",
+        "alias": "hkpd_kp",
+        "on": "hrkp.kpi_definition_id = hkpd_kp.id",
+        "fields": [
+          "kpiName",
+          "kpiCode",
+          "kpiMeasurementType",
+          "kpiUnit",
+          "kpiDirection",
+          "kpiDefaultFrequency"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleSkillRequirement": {
+    "table": "hrms_role_skill_requirements",
+    "alias": "hrsk",
+    "writeFields": [
+      "role_id",
+      "skill_definition_id",
+      "requirement_level",
+      "proficiency_level",
+      "sequence",
+      "notes",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrsk.id",
+      "companyId": "hrsk.company_id",
+      "roleId": "hrsk.role_id",
+      "skillDefinitionId": "hrsk.skill_definition_id",
+      "requirementLevel": "hrsk.requirement_level",
+      "proficiencyLevel": "hrsk.proficiency_level",
+      "sequence": "hrsk.sequence",
+      "notes": "hrsk.notes",
+      "effectiveFrom": "hrsk.effective_from",
+      "effectiveTo": "hrsk.effective_to",
+      "createdAt": "hrsk.created_at",
+      "updatedAt": "hrsk.updated_at",
+      "createdBy": "hrsk.created_by",
+      "roleTitle": "hrol_sk.title",
+      "skillName": "hskd_sk.name",
+      "skillType": "hskd_sk.skill_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "skillDefinitionId": "integer",
+      "requirementLevel": "string",
+      "proficiencyLevel": "string",
+      "sequence": "integer",
+      "notes": "text",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "skillName": "string",
+      "skillType": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_sk",
+        "on": "hrsk.role_id = hrol_sk.id",
+        "fields": [
+          "roleTitle"
+        ]
+      },
+      "skill": {
+        "table": "hrms_skill_definitions",
+        "alias": "hskd_sk",
+        "on": "hrsk.skill_definition_id = hskd_sk.id",
+        "fields": [
+          "skillName",
+          "skillType"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleQualificationRequirement": {
+    "table": "hrms_role_qualification_requirements",
+    "alias": "hrqr",
+    "writeFields": [
+      "role_id",
+      "qualification_definition_id",
+      "requirement_level",
+      "sequence",
+      "notes",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrqr.id",
+      "companyId": "hrqr.company_id",
+      "roleId": "hrqr.role_id",
+      "qualificationDefinitionId": "hrqr.qualification_definition_id",
+      "requirementLevel": "hrqr.requirement_level",
+      "sequence": "hrqr.sequence",
+      "notes": "hrqr.notes",
+      "effectiveFrom": "hrqr.effective_from",
+      "effectiveTo": "hrqr.effective_to",
+      "createdAt": "hrqr.created_at",
+      "updatedAt": "hrqr.updated_at",
+      "createdBy": "hrqr.created_by",
+      "roleTitle": "hrol_qr.title",
+      "qualificationName": "hqld_qr.name",
+      "qualificationType": "hqld_qr.qualification_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "qualificationDefinitionId": "integer",
+      "requirementLevel": "string",
+      "sequence": "integer",
+      "notes": "text",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "qualificationName": "string",
+      "qualificationType": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_qr",
+        "on": "hrqr.role_id = hrol_qr.id",
+        "fields": [
+          "roleTitle"
+        ]
+      },
+      "qualification": {
+        "table": "hrms_qualification_definitions",
+        "alias": "hqld_qr",
+        "on": "hrqr.qualification_definition_id = hqld_qr.id",
+        "fields": [
+          "qualificationName",
+          "qualificationType"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleExperienceRequirement": {
+    "table": "hrms_role_experience_requirements",
+    "alias": "hrxr",
+    "writeFields": [
+      "role_id",
+      "min_years",
+      "preferred_years",
+      "experience_area",
+      "requirement_level",
+      "notes",
+      "sequence",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrxr.id",
+      "companyId": "hrxr.company_id",
+      "roleId": "hrxr.role_id",
+      "minYears": "hrxr.min_years",
+      "preferredYears": "hrxr.preferred_years",
+      "experienceArea": "hrxr.experience_area",
+      "requirementLevel": "hrxr.requirement_level",
+      "notes": "hrxr.notes",
+      "sequence": "hrxr.sequence",
+      "effectiveFrom": "hrxr.effective_from",
+      "effectiveTo": "hrxr.effective_to",
+      "createdAt": "hrxr.created_at",
+      "updatedAt": "hrxr.updated_at",
+      "createdBy": "hrxr.created_by",
+      "roleTitle": "hrol_xr.title"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "minYears": "decimal",
+      "preferredYears": "decimal",
+      "experienceArea": "string",
+      "requirementLevel": "string",
+      "notes": "text",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_xr",
+        "on": "hrxr.role_id = hrol_xr.id",
+        "fields": [
+          "roleTitle"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleAuthorityAssignment": {
+    "table": "hrms_role_authority_assignments",
+    "alias": "hrau",
+    "writeFields": [
+      "role_id",
+      "authority_definition_id",
+      "limit_json",
+      "sequence",
+      "notes",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrau.id",
+      "companyId": "hrau.company_id",
+      "roleId": "hrau.role_id",
+      "authorityDefinitionId": "hrau.authority_definition_id",
+      "limitJson": "hrau.limit_json",
+      "sequence": "hrau.sequence",
+      "notes": "hrau.notes",
+      "effectiveFrom": "hrau.effective_from",
+      "effectiveTo": "hrau.effective_to",
+      "createdAt": "hrau.created_at",
+      "updatedAt": "hrau.updated_at",
+      "createdBy": "hrau.created_by",
+      "roleTitle": "hrol_au.title",
+      "authorityName": "hatd_au.name",
+      "authorityType": "hatd_au.authority_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "authorityDefinitionId": "integer",
+      "limitJson": "json",
+      "sequence": "integer",
+      "notes": "text",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "authorityName": "string",
+      "authorityType": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_au",
+        "on": "hrau.role_id = hrol_au.id",
+        "fields": [
+          "roleTitle"
+        ]
+      },
+      "authority": {
+        "table": "hrms_authority_definitions",
+        "alias": "hatd_au",
+        "on": "hrau.authority_definition_id = hatd_au.id",
+        "fields": [
+          "authorityName",
+          "authorityType"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleRelationshipExpectation": {
+    "table": "hrms_role_relationship_expectations",
+    "alias": "hrre",
+    "writeFields": [
+      "role_id",
+      "relationship_scope",
+      "counterparty",
+      "purpose",
+      "sequence",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrre.id",
+      "companyId": "hrre.company_id",
+      "roleId": "hrre.role_id",
+      "relationshipScope": "hrre.relationship_scope",
+      "counterparty": "hrre.counterparty",
+      "purpose": "hrre.purpose",
+      "sequence": "hrre.sequence",
+      "effectiveFrom": "hrre.effective_from",
+      "effectiveTo": "hrre.effective_to",
+      "createdAt": "hrre.created_at",
+      "updatedAt": "hrre.updated_at",
+      "createdBy": "hrre.created_by",
+      "roleTitle": "hrol_re.title"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "relationshipScope": "string",
+      "counterparty": "string",
+      "purpose": "text",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_re",
+        "on": "hrre.role_id = hrol_re.id",
+        "fields": [
+          "roleTitle"
+        ]
+      }
+    }
+  },
+  "cfHrmsRoleWorkingCondition": {
+    "table": "hrms_role_working_conditions",
+    "alias": "hrwc",
+    "writeFields": [
+      "role_id",
+      "condition_type",
+      "description",
+      "is_mandatory",
+      "sequence",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hrwc.id",
+      "companyId": "hrwc.company_id",
+      "roleId": "hrwc.role_id",
+      "conditionType": "hrwc.condition_type",
+      "description": "hrwc.description",
+      "isMandatory": "hrwc.is_mandatory",
+      "sequence": "hrwc.sequence",
+      "effectiveFrom": "hrwc.effective_from",
+      "effectiveTo": "hrwc.effective_to",
+      "createdAt": "hrwc.created_at",
+      "updatedAt": "hrwc.updated_at",
+      "createdBy": "hrwc.created_by",
+      "roleTitle": "hrol_wc.title"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "conditionType": "string",
+      "description": "text",
+      "isMandatory": "boolean",
+      "sequence": "integer",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_wc",
+        "on": "hrwc.role_id = hrol_wc.id",
+        "fields": [
+          "roleTitle"
+        ]
+      }
+    }
+  },
+  "cfHrmsPosition": {
+    "table": "hrms_positions",
+    "alias": "hpos",
+    "writeFields": [
+      "position_code",
+      "role_id",
+      "position_title",
+      "department_id",
+      "location_id",
+      "sanctioned_headcount",
+      "default_shift_id",
+      "status",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "hpos.id",
+      "companyId": "hpos.company_id",
+      "positionCode": "hpos.position_code",
+      "roleId": "hpos.role_id",
+      "positionTitle": "hpos.position_title",
+      "departmentId": "hpos.department_id",
+      "locationId": "hpos.location_id",
+      "sanctionedHeadcount": "hpos.sanctioned_headcount",
+      "defaultShiftId": "hpos.default_shift_id",
+      "status": "hpos.status",
+      "effectiveFrom": "hpos.effective_from",
+      "effectiveTo": "hpos.effective_to",
+      "createdAt": "hpos.created_at",
+      "updatedAt": "hpos.updated_at",
+      "createdBy": "hpos.created_by",
+      "roleTitle": "hrol_po.title",
+      "roleCode": "hrol_po.role_code",
+      "rolePurpose": "hrol_po.role_purpose",
+      "departmentName": "hdep_po.name",
+      "departmentCode": "hdep_po.code",
+      "locationName": "hloc_po.name",
+      "locationCode": "hloc_po.code",
+      "shiftCode": "hshf_po.code",
+      "shiftName": "hshf_po.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "positionCode": "string",
+      "roleId": "integer",
+      "positionTitle": "string",
+      "departmentId": "integer",
+      "locationId": "integer",
+      "sanctionedHeadcount": "decimal",
+      "defaultShiftId": "integer",
+      "status": "string",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "rolePurpose": "text",
+      "departmentName": "string",
+      "departmentCode": "string",
+      "locationName": "string",
+      "locationCode": "string",
+      "shiftCode": "string",
+      "shiftName": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_po",
+        "on": "hpos.role_id = hrol_po.id",
+        "fields": [
+          "roleTitle",
+          "roleCode",
+          "rolePurpose"
+        ]
+      },
+      "department": {
+        "table": "hrms_departments",
+        "alias": "hdep_po",
+        "on": "hpos.department_id = hdep_po.id",
+        "fields": [
+          "departmentName",
+          "departmentCode"
+        ]
+      },
+      "location": {
+        "table": "hrms_locations",
+        "alias": "hloc_po",
+        "on": "hpos.location_id = hloc_po.id",
+        "fields": [
+          "locationName",
+          "locationCode"
+        ]
+      },
+      "shift": {
+        "table": "hrms_shifts",
+        "alias": "hshf_po",
+        "on": "hpos.default_shift_id = hshf_po.id",
+        "fields": [
+          "shiftCode",
+          "shiftName"
+        ]
+      }
+    }
+  },
+  "cfHrmsPositionWorkContext": {
+    "table": "hrms_position_work_contexts",
+    "alias": "hpwc",
+    "writeFields": [
+      "position_id",
+      "work_context_id",
+      "is_primary",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hpwc.id",
+      "companyId": "hpwc.company_id",
+      "positionId": "hpwc.position_id",
+      "workContextId": "hpwc.work_context_id",
+      "isPrimary": "hpwc.is_primary",
+      "effectiveFrom": "hpwc.effective_from",
+      "effectiveTo": "hpwc.effective_to",
+      "notes": "hpwc.notes",
+      "createdAt": "hpwc.created_at",
+      "updatedAt": "hpwc.updated_at",
+      "createdBy": "hpwc.created_by",
+      "positionCode": "hpos_pw.position_code",
+      "positionTitle": "hpos_pw.position_title",
+      "contextName": "hwct_pw.name",
+      "contextType": "hwct_pw.context_type",
+      "contextCode": "hwct_pw.code"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "positionId": "integer",
+      "workContextId": "integer",
+      "isPrimary": "boolean",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "positionCode": "string",
+      "positionTitle": "string",
+      "contextName": "string",
+      "contextType": "string",
+      "contextCode": "string"
+    },
+    "relations": {
+      "position": {
+        "table": "hrms_positions",
+        "alias": "hpos_pw",
+        "on": "hpwc.position_id = hpos_pw.id",
+        "fields": [
+          "positionCode",
+          "positionTitle"
+        ]
+      },
+      "workContext": {
+        "table": "hrms_work_contexts",
+        "alias": "hwct_pw",
+        "on": "hpwc.work_context_id = hwct_pw.id",
+        "fields": [
+          "contextName",
+          "contextType",
+          "contextCode"
+        ]
+      }
+    }
+  },
+  "cfHrmsPositionReportingRelationship": {
+    "table": "hrms_position_reporting_relationships",
+    "alias": "hprr",
+    "writeFields": [
+      "from_position_id",
+      "to_position_id",
+      "relationship_type_id",
+      "is_primary",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hprr.id",
+      "companyId": "hprr.company_id",
+      "fromPositionId": "hprr.from_position_id",
+      "toPositionId": "hprr.to_position_id",
+      "relationshipTypeId": "hprr.relationship_type_id",
+      "isPrimary": "hprr.is_primary",
+      "effectiveFrom": "hprr.effective_from",
+      "effectiveTo": "hprr.effective_to",
+      "notes": "hprr.notes",
+      "createdAt": "hprr.created_at",
+      "updatedAt": "hprr.updated_at",
+      "createdBy": "hprr.created_by",
+      "fromPositionCode": "hpos_pf.position_code",
+      "fromPositionTitle": "hpos_pf.position_title",
+      "fromRoleId": "hpos_pf.role_id",
+      "toPositionCode": "hpos_pt.position_code",
+      "toPositionTitle": "hpos_pt.position_title",
+      "toRoleId": "hpos_pt.role_id",
+      "relationshipTypeCode": "hrrt_pr.code",
+      "relationshipTypeName": "hrrt_pr.name",
+      "relationshipTypeIsFormal": "hrrt_pr.is_formal"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "fromPositionId": "integer",
+      "toPositionId": "integer",
+      "relationshipTypeId": "integer",
+      "isPrimary": "boolean",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "fromPositionCode": "string",
+      "fromPositionTitle": "string",
+      "fromRoleId": "integer",
+      "toPositionCode": "string",
+      "toPositionTitle": "string",
+      "toRoleId": "integer",
+      "relationshipTypeCode": "string",
+      "relationshipTypeName": "string",
+      "relationshipTypeIsFormal": "boolean"
+    },
+    "relations": {
+      "fromPosition": {
+        "table": "hrms_positions",
+        "alias": "hpos_pf",
+        "on": "hprr.from_position_id = hpos_pf.id",
+        "fields": [
+          "fromPositionCode",
+          "fromPositionTitle",
+          "fromRoleId"
+        ]
+      },
+      "toPosition": {
+        "table": "hrms_positions",
+        "alias": "hpos_pt",
+        "on": "hprr.to_position_id = hpos_pt.id",
+        "fields": [
+          "toPositionCode",
+          "toPositionTitle",
+          "toRoleId"
+        ]
+      },
+      "relationshipType": {
+        "table": "hrms_reporting_relationship_types",
+        "alias": "hrrt_pr",
+        "on": "hprr.relationship_type_id = hrrt_pr.id",
+        "fields": [
+          "relationshipTypeCode",
+          "relationshipTypeName",
+          "relationshipTypeIsFormal"
+        ]
+      }
+    }
+  },
+  "cfHrmsPositionContentOverride": {
+    "table": "hrms_position_content_overrides",
+    "alias": "hpco",
+    "writeFields": [
+      "position_id",
+      "content_type",
+      "kra_definition_id",
+      "responsibility_definition_id",
+      "kpi_definition_id",
+      "action",
+      "parent_kra_definition_id",
+      "override_json",
+      "effective_from",
+      "effective_to",
+      "reason"
+    ],
+    "fields": {
+      "id": "hpco.id",
+      "companyId": "hpco.company_id",
+      "positionId": "hpco.position_id",
+      "contentType": "hpco.content_type",
+      "kraDefinitionId": "hpco.kra_definition_id",
+      "responsibilityDefinitionId": "hpco.responsibility_definition_id",
+      "kpiDefinitionId": "hpco.kpi_definition_id",
+      "action": "hpco.action",
+      "parentKraDefinitionId": "hpco.parent_kra_definition_id",
+      "overrideJson": "hpco.override_json",
+      "effectiveFrom": "hpco.effective_from",
+      "effectiveTo": "hpco.effective_to",
+      "reason": "hpco.reason",
+      "createdAt": "hpco.created_at",
+      "updatedAt": "hpco.updated_at",
+      "createdBy": "hpco.created_by",
+      "positionCode": "hpos_pc.position_code",
+      "positionTitle": "hpos_pc.position_title",
+      "kraName": "hkrd_pc.name",
+      "responsibilityName": "hrsd_pc.name",
+      "kpiName": "hkpd_pc.name",
+      "parentKraName": "hkrd_pcp.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "positionId": "integer",
+      "contentType": "string",
+      "kraDefinitionId": "integer",
+      "responsibilityDefinitionId": "integer",
+      "kpiDefinitionId": "integer",
+      "action": "string",
+      "parentKraDefinitionId": "integer",
+      "overrideJson": "json",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "reason": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "positionCode": "string",
+      "positionTitle": "string",
+      "kraName": "string",
+      "responsibilityName": "string",
+      "kpiName": "string",
+      "parentKraName": "string"
+    },
+    "relations": {
+      "position": {
+        "table": "hrms_positions",
+        "alias": "hpos_pc",
+        "on": "hpco.position_id = hpos_pc.id",
+        "fields": [
+          "positionCode",
+          "positionTitle"
+        ]
+      },
+      "kra": {
+        "table": "hrms_kra_definitions",
+        "alias": "hkrd_pc",
+        "on": "hpco.kra_definition_id = hkrd_pc.id",
+        "fields": [
+          "kraName"
+        ]
+      },
+      "responsibility": {
+        "table": "hrms_responsibility_definitions",
+        "alias": "hrsd_pc",
+        "on": "hpco.responsibility_definition_id = hrsd_pc.id",
+        "fields": [
+          "responsibilityName"
+        ]
+      },
+      "kpi": {
+        "table": "hrms_kpi_definitions",
+        "alias": "hkpd_pc",
+        "on": "hpco.kpi_definition_id = hkpd_pc.id",
+        "fields": [
+          "kpiName"
+        ]
+      },
+      "parentKra": {
+        "table": "hrms_kra_definitions",
+        "alias": "hkrd_pcp",
+        "on": "hpco.parent_kra_definition_id = hkrd_pcp.id",
+        "fields": [
+          "parentKraName"
+        ]
+      }
+    }
+  },
+  "cfHrmsEmployee": {
+    "table": "hrms_employees",
+    "alias": "hemp",
+    "writeFields": [
+      "employee_code",
+      "full_name",
+      "date_of_birth",
+      "gender",
+      "phone",
+      "email",
+      "address_json",
+      "emergency_contact_json",
+      "photo_file_name",
+      "photo_mime_type",
+      "photo_size_bytes",
+      "photo_storage",
+      "photo_compression",
+      "photo_uri",
+      "date_of_joining",
+      "employment_type",
+      "contractor_id",
+      "employment_status",
+      "exit_date",
+      "user_id"
+    ],
+    "fields": {
+      "id": "hemp.id",
+      "companyId": "hemp.company_id",
+      "employeeCode": "hemp.employee_code",
+      "fullName": "hemp.full_name",
+      "dateOfBirth": "hemp.date_of_birth",
+      "gender": "hemp.gender",
+      "phone": "hemp.phone",
+      "email": "hemp.email",
+      "addressJson": "hemp.address_json",
+      "emergencyContactJson": "hemp.emergency_contact_json",
+      "photoFileName": "hemp.photo_file_name",
+      "photoMimeType": "hemp.photo_mime_type",
+      "photoSizeBytes": "hemp.photo_size_bytes",
+      "photoStorage": "hemp.photo_storage",
+      "photoCompression": "hemp.photo_compression",
+      "photoUri": "hemp.photo_uri",
+      "dateOfJoining": "hemp.date_of_joining",
+      "employmentType": "hemp.employment_type",
+      "contractorId": "hemp.contractor_id",
+      "employmentStatus": "hemp.employment_status",
+      "exitDate": "hemp.exit_date",
+      "userId": "hemp.user_id",
+      "createdAt": "hemp.created_at",
+      "updatedAt": "hemp.updated_at",
+      "createdBy": "hemp.created_by",
+      "contractorName": "hcon_e.name",
+      "contractorCode": "hcon_e.code",
+      "userName": "u_e.name",
+      "userEmail": "u_e.email"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeCode": "string",
+      "fullName": "string",
+      "dateOfBirth": "date",
+      "gender": "string",
+      "phone": "string",
+      "email": "string",
+      "addressJson": "json",
+      "emergencyContactJson": "json",
+      "photoFileName": "string",
+      "photoMimeType": "string",
+      "photoSizeBytes": "integer",
+      "photoStorage": "string",
+      "photoCompression": "string",
+      "photoUri": "string",
+      "dateOfJoining": "date",
+      "employmentType": "string",
+      "contractorId": "integer",
+      "employmentStatus": "string",
+      "exitDate": "date",
+      "userId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "contractorName": "string",
+      "contractorCode": "string",
+      "userName": "string",
+      "userEmail": "string"
+    },
+    "relations": {
+      "contractor": {
+        "table": "hrms_contractors",
+        "alias": "hcon_e",
+        "on": "hemp.contractor_id = hcon_e.id",
+        "fields": [
+          "contractorName",
+          "contractorCode"
+        ]
+      },
+      "user": {
+        "table": "users",
+        "alias": "u_e",
+        "on": "hemp.user_id = u_e.id",
+        "fields": [
+          "userName",
+          "userEmail"
+        ]
+      }
+    }
+  },
+  "cfHrmsEmployeeIdentifier": {
+    "table": "hrms_employee_identifiers",
+    "alias": "heid",
+    "writeFields": [
+      "employee_id",
+      "identifier_type",
+      "identifier_value",
+      "is_verified",
+      "valid_from",
+      "valid_to"
+    ],
+    "fields": {
+      "id": "heid.id",
+      "companyId": "heid.company_id",
+      "employeeId": "heid.employee_id",
+      "identifierType": "heid.identifier_type",
+      "isVerified": "heid.is_verified",
+      "validFrom": "heid.valid_from",
+      "validTo": "heid.valid_to",
+      "createdAt": "heid.created_at",
+      "updatedAt": "heid.updated_at",
+      "createdBy": "heid.created_by",
+      "employeeCode": "hemp_ei.employee_code",
+      "employeeName": "hemp_ei.full_name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "identifierType": "string",
+      "isVerified": "boolean",
+      "validFrom": "date",
+      "validTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_ei",
+        "on": "heid.employee_id = hemp_ei.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      }
+    }
+  },
+  "cfHrmsEmployeeDocument": {
+    "table": "hrms_employee_documents",
+    "alias": "hedo",
+    "writeFields": [
+      "employee_id",
+      "document_type",
+      "title",
+      "file_name",
+      "mime_type",
+      "size_bytes",
+      "storage",
+      "compression",
+      "uri",
+      "issue_date",
+      "expiry_date",
+      "verification_status",
+      "verified_by_employee_id",
+      "verified_at",
+      "notes"
+    ],
+    "fields": {
+      "id": "hedo.id",
+      "companyId": "hedo.company_id",
+      "employeeId": "hedo.employee_id",
+      "documentType": "hedo.document_type",
+      "title": "hedo.title",
+      "fileName": "hedo.file_name",
+      "mimeType": "hedo.mime_type",
+      "sizeBytes": "hedo.size_bytes",
+      "storage": "hedo.storage",
+      "compression": "hedo.compression",
+      "uri": "hedo.uri",
+      "issueDate": "hedo.issue_date",
+      "expiryDate": "hedo.expiry_date",
+      "verificationStatus": "hedo.verification_status",
+      "verifiedByEmployeeId": "hedo.verified_by_employee_id",
+      "verifiedAt": "hedo.verified_at",
+      "notes": "hedo.notes",
+      "createdAt": "hedo.created_at",
+      "updatedAt": "hedo.updated_at",
+      "createdBy": "hedo.created_by",
+      "employeeCode": "hemp_ed.employee_code",
+      "employeeName": "hemp_ed.full_name",
+      "verifiedByName": "hemp_ev.full_name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "documentType": "string",
+      "title": "string",
+      "fileName": "string",
+      "mimeType": "string",
+      "sizeBytes": "integer",
+      "storage": "string",
+      "compression": "string",
+      "uri": "string",
+      "issueDate": "date",
+      "expiryDate": "date",
+      "verificationStatus": "string",
+      "verifiedByEmployeeId": "integer",
+      "verifiedAt": "datetime",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "verifiedByName": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_ed",
+        "on": "hedo.employee_id = hemp_ed.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      },
+      "verifier": {
+        "table": "hrms_employees",
+        "alias": "hemp_ev",
+        "on": "hedo.verified_by_employee_id = hemp_ev.id",
+        "fields": [
+          "verifiedByName"
+        ]
+      }
+    }
+  },
+  "cfHrmsEmploymentEvent": {
+    "table": "hrms_employment_events",
+    "alias": "heev",
+    "writeFields": [
+      "employee_id",
+      "event_type",
+      "event_date",
+      "work_assignment_id",
+      "summary",
+      "details_json"
+    ],
+    "fields": {
+      "id": "heev.id",
+      "companyId": "heev.company_id",
+      "employeeId": "heev.employee_id",
+      "eventType": "heev.event_type",
+      "eventDate": "heev.event_date",
+      "workAssignmentId": "heev.work_assignment_id",
+      "summary": "heev.summary",
+      "detailsJson": "heev.details_json",
+      "createdAt": "heev.created_at",
+      "updatedAt": "heev.updated_at",
+      "createdBy": "heev.created_by",
+      "employeeCode": "hemp_ee.employee_code",
+      "employeeName": "hemp_ee.full_name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "eventType": "string",
+      "eventDate": "date",
+      "workAssignmentId": "integer",
+      "summary": "string",
+      "detailsJson": "json",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_ee",
+        "on": "heev.employee_id = hemp_ee.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      }
+    }
+  },
+  "cfHrmsWorkAssignment": {
+    "table": "hrms_work_assignments",
+    "alias": "hwas",
+    "writeFields": [
+      "employee_id",
+      "role_id",
+      "position_id",
+      "department_id",
+      "location_id",
+      "assignment_title",
+      "allocation_percent",
+      "is_primary",
+      "default_shift_id",
+      "status",
+      "effective_from",
+      "effective_to",
+      "reason"
+    ],
+    "fields": {
+      "id": "hwas.id",
+      "companyId": "hwas.company_id",
+      "employeeId": "hwas.employee_id",
+      "roleId": "hwas.role_id",
+      "positionId": "hwas.position_id",
+      "departmentId": "hwas.department_id",
+      "locationId": "hwas.location_id",
+      "assignmentTitle": "hwas.assignment_title",
+      "allocationPercent": "hwas.allocation_percent",
+      "isPrimary": "hwas.is_primary",
+      "defaultShiftId": "hwas.default_shift_id",
+      "status": "hwas.status",
+      "effectiveFrom": "hwas.effective_from",
+      "effectiveTo": "hwas.effective_to",
+      "reason": "hwas.reason",
+      "createdAt": "hwas.created_at",
+      "updatedAt": "hwas.updated_at",
+      "createdBy": "hwas.created_by",
+      "employeeCode": "hemp_wa.employee_code",
+      "employeeName": "hemp_wa.full_name",
+      "employmentType": "hemp_wa.employment_type",
+      "employmentStatus": "hemp_wa.employment_status",
+      "roleTitle": "hrol_wa.title",
+      "roleCode": "hrol_wa.role_code",
+      "positionCode": "hpos_wa.position_code",
+      "positionTitle": "hpos_wa.position_title",
+      "positionStatus": "hpos_wa.status",
+      "departmentName": "hdep_wa.name",
+      "departmentCode": "hdep_wa.code",
+      "locationName": "hloc_wa.name",
+      "locationCode": "hloc_wa.code",
+      "shiftCode": "hshf_wa.code",
+      "shiftName": "hshf_wa.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "roleId": "integer",
+      "positionId": "integer",
+      "departmentId": "integer",
+      "locationId": "integer",
+      "assignmentTitle": "string",
+      "allocationPercent": "decimal",
+      "isPrimary": "boolean",
+      "defaultShiftId": "integer",
+      "status": "string",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "reason": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "employmentType": "string",
+      "employmentStatus": "string",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "positionCode": "string",
+      "positionTitle": "string",
+      "positionStatus": "string",
+      "departmentName": "string",
+      "departmentCode": "string",
+      "locationName": "string",
+      "locationCode": "string",
+      "shiftCode": "string",
+      "shiftName": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_wa",
+        "on": "hwas.employee_id = hemp_wa.id",
+        "fields": [
+          "employeeCode",
+          "employeeName",
+          "employmentType",
+          "employmentStatus"
+        ]
+      },
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_wa",
+        "on": "hwas.role_id = hrol_wa.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "position": {
+        "table": "hrms_positions",
+        "alias": "hpos_wa",
+        "on": "hwas.position_id = hpos_wa.id",
+        "fields": [
+          "positionCode",
+          "positionTitle",
+          "positionStatus"
+        ]
+      },
+      "department": {
+        "table": "hrms_departments",
+        "alias": "hdep_wa",
+        "on": "hwas.department_id = hdep_wa.id",
+        "fields": [
+          "departmentName",
+          "departmentCode"
+        ]
+      },
+      "location": {
+        "table": "hrms_locations",
+        "alias": "hloc_wa",
+        "on": "hwas.location_id = hloc_wa.id",
+        "fields": [
+          "locationName",
+          "locationCode"
+        ]
+      },
+      "shift": {
+        "table": "hrms_shifts",
+        "alias": "hshf_wa",
+        "on": "hwas.default_shift_id = hshf_wa.id",
+        "fields": [
+          "shiftCode",
+          "shiftName"
+        ]
+      }
+    }
+  },
+  "cfHrmsWorkAssignmentContext": {
+    "table": "hrms_work_assignment_contexts",
+    "alias": "hwac",
+    "writeFields": [
+      "work_assignment_id",
+      "work_context_id",
+      "is_primary",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hwac.id",
+      "companyId": "hwac.company_id",
+      "workAssignmentId": "hwac.work_assignment_id",
+      "workContextId": "hwac.work_context_id",
+      "isPrimary": "hwac.is_primary",
+      "effectiveFrom": "hwac.effective_from",
+      "effectiveTo": "hwac.effective_to",
+      "notes": "hwac.notes",
+      "createdAt": "hwac.created_at",
+      "updatedAt": "hwac.updated_at",
+      "createdBy": "hwac.created_by",
+      "assignmentTitle": "hwas_wc.assignment_title",
+      "assignmentEmployeeId": "hwas_wc.employee_id",
+      "assignmentRoleId": "hwas_wc.role_id",
+      "contextName": "hwct_wc.name",
+      "contextType": "hwct_wc.context_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "workAssignmentId": "integer",
+      "workContextId": "integer",
+      "isPrimary": "boolean",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "assignmentTitle": "string",
+      "assignmentEmployeeId": "integer",
+      "assignmentRoleId": "integer",
+      "contextName": "string",
+      "contextType": "string"
+    },
+    "relations": {
+      "workAssignment": {
+        "table": "hrms_work_assignments",
+        "alias": "hwas_wc",
+        "on": "hwac.work_assignment_id = hwas_wc.id",
+        "fields": [
+          "assignmentTitle",
+          "assignmentEmployeeId",
+          "assignmentRoleId"
+        ]
+      },
+      "workContext": {
+        "table": "hrms_work_contexts",
+        "alias": "hwct_wc",
+        "on": "hwac.work_context_id = hwct_wc.id",
+        "fields": [
+          "contextName",
+          "contextType"
+        ]
+      }
+    }
+  },
+  "cfHrmsAssignmentReportingRelationship": {
+    "table": "hrms_assignment_reporting_relationships",
+    "alias": "harr",
+    "writeFields": [
+      "work_assignment_id",
+      "manager_employee_id",
+      "manager_work_assignment_id",
+      "relationship_type_id",
+      "is_primary",
+      "scope_notes",
+      "effective_from",
+      "effective_to"
+    ],
+    "fields": {
+      "id": "harr.id",
+      "companyId": "harr.company_id",
+      "workAssignmentId": "harr.work_assignment_id",
+      "managerEmployeeId": "harr.manager_employee_id",
+      "managerWorkAssignmentId": "harr.manager_work_assignment_id",
+      "relationshipTypeId": "harr.relationship_type_id",
+      "isPrimary": "harr.is_primary",
+      "scopeNotes": "harr.scope_notes",
+      "effectiveFrom": "harr.effective_from",
+      "effectiveTo": "harr.effective_to",
+      "createdAt": "harr.created_at",
+      "updatedAt": "harr.updated_at",
+      "createdBy": "harr.created_by",
+      "assignmentTitle": "hwas_ar.assignment_title",
+      "assignmentEmployeeId": "hwas_ar.employee_id",
+      "assignmentRoleId": "hwas_ar.role_id",
+      "managerName": "hemp_ar.full_name",
+      "managerCode": "hemp_ar.employee_code",
+      "relationshipTypeCode": "hrrt_ar.code",
+      "relationshipTypeName": "hrrt_ar.name",
+      "relationshipTypeIsFormal": "hrrt_ar.is_formal"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "workAssignmentId": "integer",
+      "managerEmployeeId": "integer",
+      "managerWorkAssignmentId": "integer",
+      "relationshipTypeId": "integer",
+      "isPrimary": "boolean",
+      "scopeNotes": "text",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "assignmentTitle": "string",
+      "assignmentEmployeeId": "integer",
+      "assignmentRoleId": "integer",
+      "managerName": "string",
+      "managerCode": "string",
+      "relationshipTypeCode": "string",
+      "relationshipTypeName": "string",
+      "relationshipTypeIsFormal": "boolean"
+    },
+    "relations": {
+      "workAssignment": {
+        "table": "hrms_work_assignments",
+        "alias": "hwas_ar",
+        "on": "harr.work_assignment_id = hwas_ar.id",
+        "fields": [
+          "assignmentTitle",
+          "assignmentEmployeeId",
+          "assignmentRoleId"
+        ]
+      },
+      "manager": {
+        "table": "hrms_employees",
+        "alias": "hemp_ar",
+        "on": "harr.manager_employee_id = hemp_ar.id",
+        "fields": [
+          "managerName",
+          "managerCode"
+        ]
+      },
+      "relationshipType": {
+        "table": "hrms_reporting_relationship_types",
+        "alias": "hrrt_ar",
+        "on": "harr.relationship_type_id = hrrt_ar.id",
+        "fields": [
+          "relationshipTypeCode",
+          "relationshipTypeName",
+          "relationshipTypeIsFormal"
+        ]
+      }
+    }
+  },
+  "cfHrmsWorkAssignmentContentOverride": {
+    "table": "hrms_work_assignment_content_overrides",
+    "alias": "hwco",
+    "writeFields": [
+      "work_assignment_id",
+      "content_type",
+      "kra_definition_id",
+      "responsibility_definition_id",
+      "kpi_definition_id",
+      "action",
+      "parent_kra_definition_id",
+      "override_json",
+      "effective_from",
+      "effective_to",
+      "reason"
+    ],
+    "fields": {
+      "id": "hwco.id",
+      "companyId": "hwco.company_id",
+      "workAssignmentId": "hwco.work_assignment_id",
+      "contentType": "hwco.content_type",
+      "kraDefinitionId": "hwco.kra_definition_id",
+      "responsibilityDefinitionId": "hwco.responsibility_definition_id",
+      "kpiDefinitionId": "hwco.kpi_definition_id",
+      "action": "hwco.action",
+      "parentKraDefinitionId": "hwco.parent_kra_definition_id",
+      "overrideJson": "hwco.override_json",
+      "effectiveFrom": "hwco.effective_from",
+      "effectiveTo": "hwco.effective_to",
+      "reason": "hwco.reason",
+      "createdAt": "hwco.created_at",
+      "updatedAt": "hwco.updated_at",
+      "createdBy": "hwco.created_by",
+      "assignmentTitle": "hwas_wo.assignment_title",
+      "assignmentEmployeeId": "hwas_wo.employee_id",
+      "kraName": "hkrd_wo.name",
+      "responsibilityName": "hrsd_wo.name",
+      "kpiName": "hkpd_wo.name",
+      "parentKraName": "hkrd_wop.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "workAssignmentId": "integer",
+      "contentType": "string",
+      "kraDefinitionId": "integer",
+      "responsibilityDefinitionId": "integer",
+      "kpiDefinitionId": "integer",
+      "action": "string",
+      "parentKraDefinitionId": "integer",
+      "overrideJson": "json",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "reason": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "assignmentTitle": "string",
+      "assignmentEmployeeId": "integer",
+      "kraName": "string",
+      "responsibilityName": "string",
+      "kpiName": "string",
+      "parentKraName": "string"
+    },
+    "relations": {
+      "workAssignment": {
+        "table": "hrms_work_assignments",
+        "alias": "hwas_wo",
+        "on": "hwco.work_assignment_id = hwas_wo.id",
+        "fields": [
+          "assignmentTitle",
+          "assignmentEmployeeId"
+        ]
+      },
+      "kra": {
+        "table": "hrms_kra_definitions",
+        "alias": "hkrd_wo",
+        "on": "hwco.kra_definition_id = hkrd_wo.id",
+        "fields": [
+          "kraName"
+        ]
+      },
+      "responsibility": {
+        "table": "hrms_responsibility_definitions",
+        "alias": "hrsd_wo",
+        "on": "hwco.responsibility_definition_id = hrsd_wo.id",
+        "fields": [
+          "responsibilityName"
+        ]
+      },
+      "kpi": {
+        "table": "hrms_kpi_definitions",
+        "alias": "hkpd_wo",
+        "on": "hwco.kpi_definition_id = hkpd_wo.id",
+        "fields": [
+          "kpiName"
+        ]
+      },
+      "parentKra": {
+        "table": "hrms_kra_definitions",
+        "alias": "hkrd_wop",
+        "on": "hwco.parent_kra_definition_id = hkrd_wop.id",
+        "fields": [
+          "parentKraName"
+        ]
+      }
+    }
+  },
+  "cfHrmsManpowerRequirement": {
+    "table": "hrms_manpower_requirements",
+    "alias": "hmrq",
+    "writeFields": [
+      "role_id",
+      "position_id",
+      "work_context_id",
+      "shift_id",
+      "required_count",
+      "effective_from",
+      "effective_to",
+      "notes"
+    ],
+    "fields": {
+      "id": "hmrq.id",
+      "companyId": "hmrq.company_id",
+      "roleId": "hmrq.role_id",
+      "positionId": "hmrq.position_id",
+      "workContextId": "hmrq.work_context_id",
+      "shiftId": "hmrq.shift_id",
+      "requiredCount": "hmrq.required_count",
+      "effectiveFrom": "hmrq.effective_from",
+      "effectiveTo": "hmrq.effective_to",
+      "notes": "hmrq.notes",
+      "createdAt": "hmrq.created_at",
+      "updatedAt": "hmrq.updated_at",
+      "createdBy": "hmrq.created_by",
+      "roleTitle": "hrol_mr.title",
+      "roleCode": "hrol_mr.role_code",
+      "positionCode": "hpos_mr.position_code",
+      "positionTitle": "hpos_mr.position_title",
+      "contextName": "hwct_mr.name",
+      "contextType": "hwct_mr.context_type",
+      "shiftCode": "hshf_mr.code",
+      "shiftName": "hshf_mr.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "roleId": "integer",
+      "positionId": "integer",
+      "workContextId": "integer",
+      "shiftId": "integer",
+      "requiredCount": "decimal",
+      "effectiveFrom": "date",
+      "effectiveTo": "date",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "positionCode": "string",
+      "positionTitle": "string",
+      "contextName": "string",
+      "contextType": "string",
+      "shiftCode": "string",
+      "shiftName": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_mr",
+        "on": "hmrq.role_id = hrol_mr.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "position": {
+        "table": "hrms_positions",
+        "alias": "hpos_mr",
+        "on": "hmrq.position_id = hpos_mr.id",
+        "fields": [
+          "positionCode",
+          "positionTitle"
+        ]
+      },
+      "workContext": {
+        "table": "hrms_work_contexts",
+        "alias": "hwct_mr",
+        "on": "hmrq.work_context_id = hwct_mr.id",
+        "fields": [
+          "contextName",
+          "contextType"
+        ]
+      },
+      "shift": {
+        "table": "hrms_shifts",
+        "alias": "hshf_mr",
+        "on": "hmrq.shift_id = hshf_mr.id",
+        "fields": [
+          "shiftCode",
+          "shiftName"
+        ]
+      }
+    }
+  },
+  "cfHrmsShiftRoster": {
+    "table": "hrms_shift_rosters",
+    "alias": "hros",
+    "writeFields": [
+      "work_assignment_id",
+      "roster_date",
+      "shift_id",
+      "work_context_id",
+      "source",
+      "notes"
+    ],
+    "fields": {
+      "id": "hros.id",
+      "companyId": "hros.company_id",
+      "workAssignmentId": "hros.work_assignment_id",
+      "rosterDate": "hros.roster_date",
+      "shiftId": "hros.shift_id",
+      "workContextId": "hros.work_context_id",
+      "source": "hros.source",
+      "notes": "hros.notes",
+      "createdAt": "hros.created_at",
+      "updatedAt": "hros.updated_at",
+      "createdBy": "hros.created_by",
+      "assignmentEmployeeId": "hwas_ro.employee_id",
+      "assignmentRoleId": "hwas_ro.role_id",
+      "assignmentTitle": "hwas_ro.assignment_title",
+      "shiftCode": "hshf_ro.code",
+      "shiftName": "hshf_ro.name",
+      "shiftStartTime": "hshf_ro.start_time",
+      "shiftEndTime": "hshf_ro.end_time",
+      "contextName": "hwct_ro.name",
+      "contextType": "hwct_ro.context_type"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "workAssignmentId": "integer",
+      "rosterDate": "date",
+      "shiftId": "integer",
+      "workContextId": "integer",
+      "source": "string",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "assignmentEmployeeId": "integer",
+      "assignmentRoleId": "integer",
+      "assignmentTitle": "string",
+      "shiftCode": "string",
+      "shiftName": "string",
+      "shiftStartTime": "string",
+      "shiftEndTime": "string",
+      "contextName": "string",
+      "contextType": "string"
+    },
+    "relations": {
+      "workAssignment": {
+        "table": "hrms_work_assignments",
+        "alias": "hwas_ro",
+        "on": "hros.work_assignment_id = hwas_ro.id",
+        "fields": [
+          "assignmentEmployeeId",
+          "assignmentRoleId",
+          "assignmentTitle"
+        ]
+      },
+      "shift": {
+        "table": "hrms_shifts",
+        "alias": "hshf_ro",
+        "on": "hros.shift_id = hshf_ro.id",
+        "fields": [
+          "shiftCode",
+          "shiftName",
+          "shiftStartTime",
+          "shiftEndTime"
+        ]
+      },
+      "workContext": {
+        "table": "hrms_work_contexts",
+        "alias": "hwct_ro",
+        "on": "hros.work_context_id = hwct_ro.id",
+        "fields": [
+          "contextName",
+          "contextType"
+        ]
+      }
+    }
+  },
+  "cfHrmsAttendanceRecord": {
+    "table": "hrms_attendance_records",
+    "alias": "hatr",
+    "writeFields": [
+      "employee_id",
+      "attendance_date",
+      "shift_id",
+      "status",
+      "in_time",
+      "out_time",
+      "source",
+      "work_assignment_id",
+      "notes"
+    ],
+    "fields": {
+      "id": "hatr.id",
+      "companyId": "hatr.company_id",
+      "employeeId": "hatr.employee_id",
+      "attendanceDate": "hatr.attendance_date",
+      "shiftId": "hatr.shift_id",
+      "status": "hatr.status",
+      "inTime": "hatr.in_time",
+      "outTime": "hatr.out_time",
+      "source": "hatr.source",
+      "workAssignmentId": "hatr.work_assignment_id",
+      "notes": "hatr.notes",
+      "createdAt": "hatr.created_at",
+      "updatedAt": "hatr.updated_at",
+      "createdBy": "hatr.created_by",
+      "employeeCode": "hemp_at.employee_code",
+      "employeeName": "hemp_at.full_name",
+      "employmentStatus": "hemp_at.employment_status",
+      "shiftCode": "hshf_at.code",
+      "shiftName": "hshf_at.name",
+      "assignmentTitle": "hwas_at.assignment_title",
+      "assignmentRoleId": "hwas_at.role_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "attendanceDate": "date",
+      "shiftId": "integer",
+      "status": "string",
+      "inTime": "datetime",
+      "outTime": "datetime",
+      "source": "string",
+      "workAssignmentId": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "employmentStatus": "string",
+      "shiftCode": "string",
+      "shiftName": "string",
+      "assignmentTitle": "string",
+      "assignmentRoleId": "integer"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_at",
+        "on": "hatr.employee_id = hemp_at.id",
+        "fields": [
+          "employeeCode",
+          "employeeName",
+          "employmentStatus"
+        ]
+      },
+      "shift": {
+        "table": "hrms_shifts",
+        "alias": "hshf_at",
+        "on": "hatr.shift_id = hshf_at.id",
+        "fields": [
+          "shiftCode",
+          "shiftName"
+        ]
+      },
+      "workAssignment": {
+        "table": "hrms_work_assignments",
+        "alias": "hwas_at",
+        "on": "hatr.work_assignment_id = hwas_at.id",
+        "fields": [
+          "assignmentTitle",
+          "assignmentRoleId"
+        ]
+      }
+    }
+  },
+  "cfHrmsAttendanceRegularization": {
+    "table": "hrms_attendance_regularizations",
+    "alias": "hreg",
+    "writeFields": [
+      "attendance_record_id",
+      "requested_by_employee_id",
+      "requested_status",
+      "requested_in_time",
+      "requested_out_time",
+      "reason",
+      "status",
+      "reviewed_by_employee_id",
+      "reviewed_at"
+    ],
+    "fields": {
+      "id": "hreg.id",
+      "companyId": "hreg.company_id",
+      "attendanceRecordId": "hreg.attendance_record_id",
+      "requestedByEmployeeId": "hreg.requested_by_employee_id",
+      "requestedStatus": "hreg.requested_status",
+      "requestedInTime": "hreg.requested_in_time",
+      "requestedOutTime": "hreg.requested_out_time",
+      "reason": "hreg.reason",
+      "status": "hreg.status",
+      "reviewedByEmployeeId": "hreg.reviewed_by_employee_id",
+      "reviewedAt": "hreg.reviewed_at",
+      "createdAt": "hreg.created_at",
+      "updatedAt": "hreg.updated_at",
+      "createdBy": "hreg.created_by",
+      "attendanceDate": "hatr_rg.attendance_date",
+      "attendanceStatus": "hatr_rg.status",
+      "attendanceEmployeeId": "hatr_rg.employee_id",
+      "requestedByName": "hemp_rq.full_name",
+      "reviewedByName": "hemp_rv.full_name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "attendanceRecordId": "integer",
+      "requestedByEmployeeId": "integer",
+      "requestedStatus": "string",
+      "requestedInTime": "datetime",
+      "requestedOutTime": "datetime",
+      "reason": "text",
+      "status": "string",
+      "reviewedByEmployeeId": "integer",
+      "reviewedAt": "datetime",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "attendanceDate": "date",
+      "attendanceStatus": "string",
+      "attendanceEmployeeId": "integer",
+      "requestedByName": "string",
+      "reviewedByName": "string"
+    },
+    "relations": {
+      "attendanceRecord": {
+        "table": "hrms_attendance_records",
+        "alias": "hatr_rg",
+        "on": "hreg.attendance_record_id = hatr_rg.id",
+        "fields": [
+          "attendanceDate",
+          "attendanceStatus",
+          "attendanceEmployeeId"
+        ]
+      },
+      "requester": {
+        "table": "hrms_employees",
+        "alias": "hemp_rq",
+        "on": "hreg.requested_by_employee_id = hemp_rq.id",
+        "fields": [
+          "requestedByName"
+        ]
+      },
+      "reviewer": {
+        "table": "hrms_employees",
+        "alias": "hemp_rv",
+        "on": "hreg.reviewed_by_employee_id = hemp_rv.id",
+        "fields": [
+          "reviewedByName"
+        ]
+      }
+    }
+  },
+  "cfHrmsLeaveType": {
+    "table": "hrms_leave_types",
+    "alias": "hlvt",
+    "writeFields": [
+      "code",
+      "name",
+      "unit",
+      "annual_entitlement",
+      "is_paid",
+      "status"
+    ],
+    "fields": {
+      "id": "hlvt.id",
+      "companyId": "hlvt.company_id",
+      "code": "hlvt.code",
+      "name": "hlvt.name",
+      "unit": "hlvt.unit",
+      "annualEntitlement": "hlvt.annual_entitlement",
+      "isPaid": "hlvt.is_paid",
+      "status": "hlvt.status",
+      "createdAt": "hlvt.created_at",
+      "updatedAt": "hlvt.updated_at",
+      "createdBy": "hlvt.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "name": "string",
+      "unit": "string",
+      "annualEntitlement": "decimal",
+      "isPaid": "boolean",
+      "status": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfHrmsLeaveBalance": {
+    "table": "hrms_leave_balances",
+    "alias": "hlvb",
+    "writeFields": [
+      "employee_id",
+      "leave_type_id",
+      "period_key",
+      "opening_balance",
+      "accrued",
+      "used",
+      "adjusted",
+      "closing_balance"
+    ],
+    "fields": {
+      "id": "hlvb.id",
+      "companyId": "hlvb.company_id",
+      "employeeId": "hlvb.employee_id",
+      "leaveTypeId": "hlvb.leave_type_id",
+      "periodKey": "hlvb.period_key",
+      "openingBalance": "hlvb.opening_balance",
+      "accrued": "hlvb.accrued",
+      "used": "hlvb.used",
+      "adjusted": "hlvb.adjusted",
+      "closingBalance": "hlvb.closing_balance",
+      "createdAt": "hlvb.created_at",
+      "updatedAt": "hlvb.updated_at",
+      "createdBy": "hlvb.created_by",
+      "employeeCode": "hemp_lb.employee_code",
+      "employeeName": "hemp_lb.full_name",
+      "leaveTypeCode": "hlvt_lb.code",
+      "leaveTypeName": "hlvt_lb.name",
+      "leaveTypeUnit": "hlvt_lb.unit"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "leaveTypeId": "integer",
+      "periodKey": "string",
+      "openingBalance": "decimal",
+      "accrued": "decimal",
+      "used": "decimal",
+      "adjusted": "decimal",
+      "closingBalance": "decimal",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "leaveTypeCode": "string",
+      "leaveTypeName": "string",
+      "leaveTypeUnit": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_lb",
+        "on": "hlvb.employee_id = hemp_lb.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      },
+      "leaveType": {
+        "table": "hrms_leave_types",
+        "alias": "hlvt_lb",
+        "on": "hlvb.leave_type_id = hlvt_lb.id",
+        "fields": [
+          "leaveTypeCode",
+          "leaveTypeName",
+          "leaveTypeUnit"
+        ]
+      }
+    }
+  },
+  "cfHrmsLeaveRequest": {
+    "table": "hrms_leave_requests",
+    "alias": "hlvr",
+    "writeFields": [
+      "employee_id",
+      "leave_type_id",
+      "from_date",
+      "to_date",
+      "quantity",
+      "reason",
+      "status",
+      "approver_employee_id",
+      "approved_at"
+    ],
+    "fields": {
+      "id": "hlvr.id",
+      "companyId": "hlvr.company_id",
+      "employeeId": "hlvr.employee_id",
+      "leaveTypeId": "hlvr.leave_type_id",
+      "fromDate": "hlvr.from_date",
+      "toDate": "hlvr.to_date",
+      "quantity": "hlvr.quantity",
+      "reason": "hlvr.reason",
+      "status": "hlvr.status",
+      "approverEmployeeId": "hlvr.approver_employee_id",
+      "approvedAt": "hlvr.approved_at",
+      "createdAt": "hlvr.created_at",
+      "updatedAt": "hlvr.updated_at",
+      "createdBy": "hlvr.created_by",
+      "employeeCode": "hemp_lr.employee_code",
+      "employeeName": "hemp_lr.full_name",
+      "leaveTypeCode": "hlvt_lr.code",
+      "leaveTypeName": "hlvt_lr.name",
+      "leaveTypeUnit": "hlvt_lr.unit",
+      "leaveTypeIsPaid": "hlvt_lr.is_paid",
+      "approverName": "hemp_la.full_name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "employeeId": "integer",
+      "leaveTypeId": "integer",
+      "fromDate": "date",
+      "toDate": "date",
+      "quantity": "decimal",
+      "reason": "text",
+      "status": "string",
+      "approverEmployeeId": "integer",
+      "approvedAt": "datetime",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "leaveTypeCode": "string",
+      "leaveTypeName": "string",
+      "leaveTypeUnit": "string",
+      "leaveTypeIsPaid": "boolean",
+      "approverName": "string"
+    },
+    "relations": {
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_lr",
+        "on": "hlvr.employee_id = hemp_lr.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      },
+      "leaveType": {
+        "table": "hrms_leave_types",
+        "alias": "hlvt_lr",
+        "on": "hlvr.leave_type_id = hlvt_lr.id",
+        "fields": [
+          "leaveTypeCode",
+          "leaveTypeName",
+          "leaveTypeUnit",
+          "leaveTypeIsPaid"
+        ]
+      },
+      "approver": {
+        "table": "hrms_employees",
+        "alias": "hemp_la",
+        "on": "hlvr.approver_employee_id = hemp_la.id",
+        "fields": [
+          "approverName"
+        ]
+      }
+    }
+  },
+  "cfHrmsGeneratedDocument": {
+    "table": "hrms_generated_documents",
+    "alias": "hgdo",
+    "writeFields": [
+      "document_type",
+      "role_id",
+      "position_id",
+      "employee_id",
+      "snapshot_json",
+      "template_version",
+      "docx_file_name",
+      "docx_mime_type",
+      "docx_size_bytes",
+      "docx_storage",
+      "docx_compression",
+      "docx_uri",
+      "pdf_file_name",
+      "pdf_mime_type",
+      "pdf_size_bytes",
+      "pdf_storage",
+      "pdf_compression",
+      "pdf_uri",
+      "generated_by",
+      "generated_at",
+      "is_current"
+    ],
+    "fields": {
+      "id": "hgdo.id",
+      "companyId": "hgdo.company_id",
+      "documentType": "hgdo.document_type",
+      "roleId": "hgdo.role_id",
+      "positionId": "hgdo.position_id",
+      "employeeId": "hgdo.employee_id",
+      "templateVersion": "hgdo.template_version",
+      "docxFileName": "hgdo.docx_file_name",
+      "docxMimeType": "hgdo.docx_mime_type",
+      "docxSizeBytes": "hgdo.docx_size_bytes",
+      "docxStorage": "hgdo.docx_storage",
+      "docxCompression": "hgdo.docx_compression",
+      "docxUri": "hgdo.docx_uri",
+      "pdfFileName": "hgdo.pdf_file_name",
+      "pdfMimeType": "hgdo.pdf_mime_type",
+      "pdfSizeBytes": "hgdo.pdf_size_bytes",
+      "pdfStorage": "hgdo.pdf_storage",
+      "pdfCompression": "hgdo.pdf_compression",
+      "pdfUri": "hgdo.pdf_uri",
+      "generatedBy": "hgdo.generated_by",
+      "generatedAt": "hgdo.generated_at",
+      "isCurrent": "hgdo.is_current",
+      "createdAt": "hgdo.created_at",
+      "updatedAt": "hgdo.updated_at",
+      "createdBy": "hgdo.created_by",
+      "roleTitle": "hrol_gd.title",
+      "roleCode": "hrol_gd.role_code",
+      "positionCode": "hpos_gd.position_code",
+      "positionTitle": "hpos_gd.position_title",
+      "employeeCode": "hemp_gd.employee_code",
+      "employeeName": "hemp_gd.full_name",
+      "generatedByName": "u_gd.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "documentType": "string",
+      "roleId": "integer",
+      "positionId": "integer",
+      "employeeId": "integer",
+      "templateVersion": "string",
+      "docxFileName": "string",
+      "docxMimeType": "string",
+      "docxSizeBytes": "integer",
+      "docxStorage": "string",
+      "docxCompression": "string",
+      "docxUri": "string",
+      "pdfFileName": "string",
+      "pdfMimeType": "string",
+      "pdfSizeBytes": "integer",
+      "pdfStorage": "string",
+      "pdfCompression": "string",
+      "pdfUri": "string",
+      "generatedBy": "integer",
+      "generatedAt": "datetime",
+      "isCurrent": "boolean",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "roleTitle": "string",
+      "roleCode": "string",
+      "positionCode": "string",
+      "positionTitle": "string",
+      "employeeCode": "string",
+      "employeeName": "string",
+      "generatedByName": "string"
+    },
+    "relations": {
+      "role": {
+        "table": "hrms_roles",
+        "alias": "hrol_gd",
+        "on": "hgdo.role_id = hrol_gd.id",
+        "fields": [
+          "roleTitle",
+          "roleCode"
+        ]
+      },
+      "position": {
+        "table": "hrms_positions",
+        "alias": "hpos_gd",
+        "on": "hgdo.position_id = hpos_gd.id",
+        "fields": [
+          "positionCode",
+          "positionTitle"
+        ]
+      },
+      "employee": {
+        "table": "hrms_employees",
+        "alias": "hemp_gd",
+        "on": "hgdo.employee_id = hemp_gd.id",
+        "fields": [
+          "employeeCode",
+          "employeeName"
+        ]
+      },
+      "generator": {
+        "table": "users",
+        "alias": "u_gd",
+        "on": "hgdo.generated_by = u_gd.id",
+        "fields": [
+          "generatedByName"
+        ]
+      }
+    }
+  },
+  "cfHrmsOpenPoint": {
+    "table": "hrms_open_points",
+    "alias": "hopp",
+    "writeFields": [
+      "entity_type",
+      "entity_id",
+      "description",
+      "status",
+      "resolution",
+      "resolved_by",
+      "resolved_at"
+    ],
+    "fields": {
+      "id": "hopp.id",
+      "companyId": "hopp.company_id",
+      "entityType": "hopp.entity_type",
+      "entityId": "hopp.entity_id",
+      "description": "hopp.description",
+      "status": "hopp.status",
+      "resolution": "hopp.resolution",
+      "resolvedBy": "hopp.resolved_by",
+      "resolvedAt": "hopp.resolved_at",
+      "createdAt": "hopp.created_at",
+      "updatedAt": "hopp.updated_at",
+      "createdBy": "hopp.created_by",
+      "resolvedByName": "u_op.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "entityType": "string",
+      "entityId": "integer",
+      "description": "text",
+      "status": "string",
+      "resolution": "text",
+      "resolvedBy": "integer",
+      "resolvedAt": "datetime",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "resolvedByName": "string"
+    },
+    "relations": {
+      "resolver": {
+        "table": "users",
+        "alias": "u_op",
+        "on": "hopp.resolved_by = u_op.id",
+        "fields": [
+          "resolvedByName"
+        ]
+      }
+    }
+  },
+  "cfHrmsAuditLog": {
+    "table": "hrms_audit_log",
+    "alias": "haud",
+    "writeFields": [
+      "actor_user_id",
+      "entity_type",
+      "entity_id",
+      "action",
+      "before_json",
+      "after_json",
+      "occurred_at",
+      "request_id"
+    ],
+    "fields": {
+      "id": "haud.id",
+      "companyId": "haud.company_id",
+      "actorUserId": "haud.actor_user_id",
+      "entityType": "haud.entity_type",
+      "entityId": "haud.entity_id",
+      "action": "haud.action",
+      "occurredAt": "haud.occurred_at",
+      "requestId": "haud.request_id",
+      "createdAt": "haud.created_at",
+      "updatedAt": "haud.updated_at",
+      "createdBy": "haud.created_by",
+      "actorName": "u_al.name",
+      "actorEmail": "u_al.email"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "actorUserId": "integer",
+      "entityType": "string",
+      "entityId": "integer",
+      "action": "string",
+      "occurredAt": "datetime",
+      "requestId": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "actorName": "string",
+      "actorEmail": "string"
+    },
+    "relations": {
+      "actor": {
+        "table": "users",
+        "alias": "u_al",
+        "on": "haud.actor_user_id = u_al.id",
+        "fields": [
+          "actorName",
+          "actorEmail"
+        ]
+      }
+    }
+  },
+  "cfHrmsImportRun": {
+    "table": "hrms_import_runs",
+    "alias": "himp",
+    "writeFields": [
+      "source_kind",
+      "source_file_name",
+      "source_hash",
+      "source_size_bytes",
+      "status",
+      "parsed_counts_json",
+      "findings_json",
+      "id_map_json",
+      "error_text",
+      "parsed_at",
+      "validated_at",
+      "committed_at",
+      "discarded_at",
+      "committed_by",
+      "notes"
+    ],
+    "fields": {
+      "id": "himp.id",
+      "companyId": "himp.company_id",
+      "sourceKind": "himp.source_kind",
+      "sourceFileName": "himp.source_file_name",
+      "sourceHash": "himp.source_hash",
+      "sourceSizeBytes": "himp.source_size_bytes",
+      "status": "himp.status",
+      "parsedCountsJson": "himp.parsed_counts_json",
+      "errorText": "himp.error_text",
+      "parsedAt": "himp.parsed_at",
+      "validatedAt": "himp.validated_at",
+      "committedAt": "himp.committed_at",
+      "discardedAt": "himp.discarded_at",
+      "committedBy": "himp.committed_by",
+      "notes": "himp.notes",
+      "createdAt": "himp.created_at",
+      "updatedAt": "himp.updated_at",
+      "createdBy": "himp.created_by",
+      "committedByName": "u_ir.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "sourceKind": "string",
+      "sourceFileName": "string",
+      "sourceHash": "string",
+      "sourceSizeBytes": "integer",
+      "status": "string",
+      "parsedCountsJson": "json",
+      "errorText": "text",
+      "parsedAt": "datetime",
+      "validatedAt": "datetime",
+      "committedAt": "datetime",
+      "discardedAt": "datetime",
+      "committedBy": "integer",
+      "notes": "text",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "committedByName": "string"
+    },
+    "relations": {
+      "committer": {
+        "table": "users",
+        "alias": "u_ir",
+        "on": "himp.committed_by = u_ir.id",
+        "fields": [
+          "committedByName"
+        ]
+      }
+    }
+  }
+}
