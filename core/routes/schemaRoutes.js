@@ -46,14 +46,25 @@ router.get('/:companySlug/schema/resources', protect, async (req, res) => {
       }
     }
 
-    // Transform to frontend manifest format
-    const resources = Object.entries(merged).map(([key, def]) => ({
-      name: key,
-      endpoint: `/api/query/v1/${key}`,
-      fields: Object.keys(def.fields || {}),
-      writeFields: def.writeFields || [],
-      allowedOps: { ops: ['get', 'post', 'put', 'delete'] },
-    }));
+    // Transform to frontend manifest format.
+    //
+    // `ops` used to claim post/put/delete for every resource. Most resources
+    // are read-only through the generic API — they are written by the service
+    // that owns their rules — so report what the write path will actually
+    // accept rather than letting a builder offer a write that 403s.
+    const resources = Object.entries(merged).map(([key, def]) => {
+      const writable = def.writable === true;
+      return {
+        name: key,
+        endpoint: `/api/query/v1/${key}`,
+        fields: Object.keys(def.fields || {}),
+        writable,
+        writeFields: writable ? def.writeFields || [] : [],
+        allowedOps: {
+          ops: writable ? ['get', 'post', 'put', 'delete'] : ['get'],
+        },
+      };
+    });
 
     const generatedAt = new Date().toISOString();
     const etag = crypto

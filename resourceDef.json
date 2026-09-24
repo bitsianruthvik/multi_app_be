@@ -2,6 +2,7 @@
   "users": {
     "table": "users",
     "alias": "u",
+    "writable": true,
     "writeFields": ["name", "email", "age", "status", "password", "company_id", "team_id", "role_id"],
     "fields": {
       "id": "u.id",
@@ -44,6 +45,7 @@
   "teams": {
     "table": "teams",
     "alias": "t",
+    "writable": true,
     "writeFields": ["name", "company_id"],
     "fields": {
       "id": "t.id",
@@ -61,6 +63,7 @@
   "companies": {
     "table": "companies",
     "alias": "c",
+    "writable": true,
     "writeFields": ["name", "slug"],
     "fields": {
       "id": "c.id",
@@ -76,6 +79,7 @@
   "apps": {
     "table": "apps",
     "alias": "a",
+    "writable": true,
     "writeFields": ["name", "slug", "company_id"],
     "fields": {
       "id": "a.id",
@@ -95,6 +99,7 @@
   "roles": {
     "table": "roles",
     "alias": "r",
+    "writable": true,
     "writeFields": ["name", "company_id"],
     "fields": {
       "id": "r.id",
@@ -112,6 +117,7 @@
   "features": {
     "table": "features",
     "alias": "f",
+    "writable": true,
     "writeFields": ["feature_name", "feature_tag", "type"],
     "fields": {
       "id": "f.id",
@@ -131,6 +137,7 @@
   "features_capability": {
     "table": "features_capability",
     "alias": "fc",
+    "writable": true,
     "writeFields": ["name", "features_json"],
     "fields": {
       "id": "fc.id",
@@ -149,6 +156,7 @@
   "role_capability": {
     "table": "role_capability",
     "alias": "rc",
+    "writable": true,
     "writeFields": ["role_id", "team_id", "company_id", "capability_id"],
     "fields": {
       "id": "rc.id",
@@ -168,6 +176,7 @@
   "app_user_access": {
     "table": "app_user_access",
     "alias": "aua",
+    "writable": true,
     "writeFields": ["user_id", "app_id", "role_id"],
     "fields": {
       "id": "aua.id",

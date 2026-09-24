@@ -1,5 +1,7 @@
 import { parseResource } from "./resourceParser.js";
 import { buildSelectQuery } from "./sqlBuilder.js";
+import { getTableColumns } from "./schemaCache.js";
+import { logger } from "../../utils/logger.js";
 import { buildWhere } from "./whereBuilder.js";
 import { addPagination, buildOrderBy } from "./paginationBuilder.js";
 import { injectSecurity } from "./securityInjector.js";
@@ -24,12 +26,26 @@ export async function buildQuery(config) {
   }
 
   // 4. Inject company/team security scoping and soft-delete filter
-  // Only inject company_id filter when the main table's resourceDef maps a field to
-  // `<alias>.company_id` — child tables (e.g. fab_nodes) don't have their own company_id.
+  //
+  // Whether a resource can be tenant-scoped is a question about the TABLE, not
+  // about whether its definition happens to expose the column. This used to ask
+  // the definition, so a resource that had a company_id and simply did not list
+  // it in `fields` was read across every tenant — `teams` was exactly that.
+  //
+  // If introspection fails, assume the column is there and scope anyway:
+  // scoping a table that lacks it fails loudly on the next query, while
+  // skipping it hands one company another company's rows.
   const mainAlias = parsedResource.alias;
-  const hasCompanyId = Object.values(parsedResource.fields || {}).some(
-    (expr) => String(expr) === `${mainAlias}.company_id`,
-  );
+  let hasCompanyId = true;
+  try {
+    const cols = await getTableColumns(parsedResource.table);
+    hasCompanyId = cols.has("company_id");
+  } catch (err) {
+    logger.warn(
+      { err, table: parsedResource.table, resource },
+      "[queryBuilder] could not introspect columns; applying company scoping anyway",
+    );
+  }
   const secured = injectSecurity(whereSql, whereParams, jwt || null, resource, {
     includeDeleted: !!includeDeleted,
     alias: mainAlias,

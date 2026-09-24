@@ -182,7 +182,9 @@ POST /api/query/v1/base_resource
 - **`company_id` is auto-injected** from JWT on insert/update — never send it from the frontend.
 - **Soft delete:** sets `deleted_at = NOW()`, never hard-deletes rows.
 - **Passwords** in `users` table are auto-hashed (bcrypt, 10 rounds) on insert/update.
-- **Write allowlist:** only fields declared in `writeFields` (resourceDef.json or DB schema) are accepted on insert/update.
+- **Writable resources are opt-in:** `insert`/`update`/`delete` work only on a resource whose resourceDef declares `writable: true`; anything else returns **403**. Most resources are read-only here and are written through their app's own routes.
+- **`resource` must be a registered resource name, not a table name.** Writes resolve it through the registry to find the table; an unknown name returns **400**.
+- **Write allowlist:** within a writable resource, only its `fields` columns plus `writeFields` are accepted on insert/update; anything else is dropped.
 - `include_deleted: true` lifts the `deleted_at IS NULL` filter.
 
 ### Available resources (known tables)

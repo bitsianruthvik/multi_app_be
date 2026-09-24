@@ -2,6 +2,7 @@
   "audio_recordings": {
     "table": "audio_recordings",
     "alias": "ar",
+    "writable": true,
     "writeFields": ["title", "recorded_by", "recorded_by_role", "audio_url", "audio_data", "idempotency_key", "transcription", "analysis", "score", "keywords_of_improvement", "processed_url", "medicine", "action_id", "status", "duration_seconds", "company_id", "track", "history_block", "new_tran"],
     "fields": {
       "id": "ar.id",
@@ -52,6 +53,7 @@
   "actions": {
     "table": "actions",
     "alias": "act",
+    "writable": true,
     "writeFields": ["name", "description", "display_order"],
     "fields": {
       "id": "act.id",
@@ -73,6 +75,7 @@
   "company_documents": {
     "table": "company_documents",
     "alias": "cd",
+    "writable": true,
     "writeFields": ["uploader_id", "company_id", "doc_path", "doc_name"],
     "fields": {
       "id": "cd.id",
@@ -98,6 +101,7 @@
   "team_documents": {
     "table": "team_documents",
     "alias": "td",
+    "writable": true,
     "writeFields": ["team_id", "company_id", "doc_path", "doc_name", "medicines", "medicine"],
     "fields": {
       "id": "td.id",

@@ -2,6 +2,7 @@
   "fab_project_plans": {
     "table": "fab_project_plans",
     "alias": "fpp",
+    "writable": true,
     "writeFields": ["project_code","project_name","client_name","site_location","plan_name","plan_revision","status","source","notes","company_id","created_by","calendar_id","planned_start_date","target_end_date","scheduling_mode"],
     "fields": {
       "id":                "fpp.id",
@@ -80,6 +81,7 @@
   "fab_nodes": {
     "table": "fab_nodes",
     "alias": "fn",
+    "writable": true,
     "writeFields": ["project_plan_id","node_code","display_name","level_name","description","quantity","unit","drawing_ref","drawing_sheet_no","drawing_revision","material_grade","profile","length_mm","width_mm","thickness_mm","weight_kg","location_ref","dispatchable","preferred_work_area_id","notes"],
     "fields": {
       "id":                  "fn.id",
@@ -158,6 +160,7 @@
   "fab_node_relationships": {
     "table": "fab_node_relationships",
     "alias": "fnr",
+    "writable": true,
     "writeFields": ["project_plan_id","parent_node_id","child_node_id","quantity_required","relationship_type","is_primary","notes"],
     "fields": {
       "id":               "fnr.id",
@@ -193,6 +196,7 @@
   "fab_process_steps": {
     "table": "fab_process_steps",
     "alias": "fps",
+    "writable": true,
     "writeFields": ["project_plan_id","company_id","process_step_code","process_name","process_type","sequence_no","parallel_group","machine_or_workcentre_type","estimated_time_value","estimated_time_unit","mandatory","notes","requires_work_area","preferred_work_area_id","requires_machine","estimated_machine_time_value","estimated_machine_time_unit","resource_notes","time_calc_mode","time_metric_key","time_rate_value","time_rate_unit"],
     "fields": {
       "id":                          "fps.id",
@@ -263,6 +267,7 @@
   "fab_process_step_node_map": {
     "table": "fab_process_step_node_map",
     "alias": "fpsnm",
+    "writable": true,
     "writeFields": ["process_step_id","node_id","company_id","node_role","quantity","notes"],
     "fields": {
       "id":              "fpsnm.id",
@@ -318,6 +323,7 @@
   "fab_process_preconditions": {
     "table": "fab_process_preconditions",
     "alias": "fppc",
+    "writable": true,
     "writeFields": ["process_step_id","company_id","required_node_id","required_process_step_id","required_condition","notes"],
     "fields": {
       "id":                     "fppc.id",
@@ -370,6 +376,7 @@
   "fab_excel_import_batches": {
     "table": "fab_excel_import_batches",
     "alias": "feib",
+    "writable": true,
     "writeFields": ["project_plan_id","file_name","uploaded_by","status","error_count","warning_count","parsed_data"],
     "fields": {
       "id":             "feib.id",
@@ -413,6 +420,7 @@
   "fab_excel_import_issues": {
     "table": "fab_excel_import_issues",
     "alias": "feii",
+    "writable": true,
     "writeFields": ["import_batch_id","sheet_name","row_number","severity","field_name","message"],
     "fields": {
       "id":             "feii.id",
@@ -447,6 +455,7 @@
   "fab_work_calendars": {
     "table": "fab_work_calendars",
     "alias": "fwcal",
+    "writable": true,
     "writeFields": ["company_id","calendar_code","calendar_name","description","active"],
     "fields": {
       "id":           "fwcal.id",
@@ -478,6 +487,7 @@
   "fab_work_calendar_days": {
     "table": "fab_work_calendar_days",
     "alias": "fwcd",
+    "writable": true,
     "writeFields": ["calendar_id","company_id","day_of_week","is_working_day","start_time","end_time","working_hours"],
     "fields": {
       "id":            "fwcd.id",
@@ -521,6 +531,7 @@
   "fab_work_calendar_exceptions": {
     "table": "fab_work_calendar_exceptions",
     "alias": "fwce",
+    "writable": true,
     "writeFields": ["calendar_id","company_id","exception_date","exception_name","is_working_day","start_time","end_time","working_hours","notes"],
     "fields": {
       "id":             "fwce.id",
@@ -566,6 +577,7 @@
   "fab_work_areas": {
     "table": "fab_work_areas",
     "alias": "fwa",
+    "writable": true,
     "writeFields": ["company_id","work_area_code","work_area_name","area_type","max_parallel_jobs","calendar_id","active","notes"],
     "fields": {
       "id":               "fwa.id",
@@ -616,6 +628,7 @@
   "fab_work_area_capabilities": {
     "table": "fab_work_area_capabilities",
     "alias": "fwac",
+    "writable": true,
     "writeFields": ["work_area_id","company_id","process_type","allowed","priority","notes"],
     "fields": {
       "id":           "fwac.id",
@@ -656,6 +669,7 @@
   "fab_machines": {
     "table": "fab_machines",
     "alias": "fm",
+    "writable": true,
     "writeFields": ["company_id","machine_code","machine_name","machine_type","work_area_id","calendar_id","active","notes"],
     "fields": {
       "id":           "fm.id",
@@ -715,6 +729,7 @@
   "fab_machine_capabilities": {
     "table": "fab_machine_capabilities",
     "alias": "fmc",
+    "writable": true,
     "writeFields": ["machine_id","company_id","process_type","capacity_hours_per_day","priority","notes"],
     "fields": {
       "id":                   "fmc.id",
@@ -756,6 +771,7 @@
   "fab_process_work_area_options": {
     "table": "fab_process_work_area_options",
     "alias": "fpwao",
+    "writable": true,
     "writeFields": ["process_step_id","work_area_id","company_id","priority","notes"],
     "fields": {
       "id":             "fpwao.id",
@@ -804,6 +820,7 @@
   "fab_process_type_registry": {
     "table": "fab_process_type_registry",
     "alias": "fptr",
+    "writable": true,
     "writeFields": ["company_id","process_type_name","description","metric_key","rate_value","rate_unit","active"],
     "fields": {
       "id":              "fptr.id",
@@ -840,6 +857,7 @@
   "fab_node_metrics": {
     "table": "fab_node_metrics",
     "alias": "fnm",
+    "writable": true,
     "writeFields": ["node_id","company_id","metric_key","metric_value","metric_unit"],
     "fields": {
       "id":          "fnm.id",
@@ -883,6 +901,7 @@
   "fab_node_process_progress": {
     "table": "fab_node_process_progress",
     "alias": "fnpp",
+    "writable": true,
     "writeFields": ["plan_id","node_id","process_step_id","company_id","snapshot_date","batch_qty","completion_pct","reported_by","notes"],
     "fields": {
       "id":             "fnpp.id",
@@ -950,6 +969,7 @@
   "fab_capacity_import_batches": {
     "table": "fab_capacity_import_batches",
     "alias": "fcib",
+    "writable": true,
     "writeFields": ["company_id","file_name","uploaded_by","status","error_count","warning_count"],
     "fields": {
       "id":           "fcib.id",

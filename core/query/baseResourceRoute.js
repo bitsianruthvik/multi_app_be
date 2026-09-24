@@ -2,7 +2,7 @@
 import { logger } from "../utils/logger.js";
 import { buildQuery } from "./queryBuilder/queryBuilder.js";
 import { getTableColumns } from "./queryBuilder/schemaCache.js";
-import { getResourceWriteAllowlist } from "./resourceRegistry.js";
+import { resolveWriteTarget } from "./resourceRegistry.js";
 import { pool } from "../../db.js";
 import { protect } from "../middleware/authmiddleware.js";
 import bcrypt from "bcryptjs";
@@ -151,131 +151,152 @@ router.post("/base_resource", async (req, res) => {
 
     // For write operations
     if (["insert", "update", "delete"].includes(operation)) {
+      // Resolve `resource` through the registry before touching SQL. It must be
+      // a registered slug that opts in with `writable: true`; the table name
+      // comes from the definition, never from the request. Tables owned by a
+      // service (stock, BOM lines, the production tracker, ...) declare no
+      // `writable`, so the generic path refuses them and the caller has to go
+      // through the route that enforces the rules.
+      const target = resolveWriteTarget(resource);
+      if (!target.ok) {
+        if (target.reason === "not_writable") {
+          return res.status(403).json({
+            success: false,
+            error: `Resource '${resource}' is not writable through the generic API. Use its app's own route.`,
+          });
+        }
+        if (target.reason === "no_table") {
+          return res.status(500).json({
+            success: false,
+            error: `Resource '${resource}' is marked writable but declares no table.`,
+          });
+        }
+        return res.status(400).json({
+          success: false,
+          error: `Unknown resource '${resource}'. Writes must name a registered resource, not a table.`,
+        });
+      }
+
+      // Authored in resourceDef.json, so safe to interpolate — unlike the raw
+      // `resource` string this used to splice straight into the statement.
+      const table = target.table;
+      const allowed = target.allowlist;
+
       let query;
       let params;
 
-      // Define global tables that don't have company_id
-      const globalTables = [
-        "features",
-        "features_capability",
-        "companies",
-        "apps",
-      ];
+      // Company scoping applies to whatever table actually has a company_id
+      // column. This used to be a hardcoded `globalTables` list, consulted by
+      // the insert branch alone — so update and delete appended
+      // `AND company_id = ?` to every table and hard-failed on the ones without
+      // the column. The list had also drifted from the schema in both
+      // directions: it missed `fab_nodes`, `fab_node_relationships` and the two
+      // `fab_excel_import_*` tables, and it named `apps`, which does have a
+      // company_id. Asking the schema cannot drift. `table` came from the
+      // registry, so this is not the raw-table lookup the write path refuses.
+      let tableColumns;
+      try {
+        tableColumns = await getTableColumns(table);
+      } catch (err) {
+        logger.error(
+          { err, table, resource },
+          "[base_resource] could not read columns for write",
+        );
+        return res.status(500).json({
+          success: false,
+          error: `Could not resolve the schema for '${resource}'.`,
+        });
+      }
+
+      // Service/worker callers (WORKER_SERVICE_TOKEN) carry no company and are
+      // deliberately unscoped so they can act across companies.
+      const scopeCompanyId =
+        tableColumns.has("company_id") && req.user && !req.user.is_service
+          ? req.user.company_id || req.user.companyId || null
+          : null;
 
       switch (operation) {
         case "insert":
-          // Auto-inject company_id from admin's JWT for new records (except global tables)
+          // Auto-inject company_id from the caller's JWT for new records
           const insertData = { ...data };
 
-          if (
-            req.user &&
-            (req.user.company_id || req.user.companyId) &&
-            !globalTables.includes(resource)
-          ) {
-            insertData.company_id = req.user.company_id || req.user.companyId;
+          if (scopeCompanyId) {
+            insertData.company_id = scopeCompanyId;
           }
 
           // Special handling for users table - hash password before storing
-          if (resource === "users" && insertData.password) {
+          if (table === "users" && insertData.password) {
             logger.info("Hashing password for new user");
             insertData.password = await bcrypt.hash(insertData.password, 10);
           }
 
-          // Filter insertData against the resourceDef.json write allowlist (preferred)
-          // or the schema cache (fallback for unregistered resources).
-          try {
-            const defAllowlist = getResourceWriteAllowlist(resource);
-            const allowed = defAllowlist ?? await getTableColumns(resource);
-            const filtered = Object.fromEntries(
-              Object.entries(insertData).filter(([k]) => allowed.has(k))
-            );
-            query = `INSERT INTO ${resource} SET ?`;
-            params = [filtered];
-          } catch (err) {
-            logger.warn("Failed to get schema for", resource, err);
-            query = `INSERT INTO ${resource} SET ?`;
-            params = [insertData];
+          // Filter insertData against the resourceDef.json write allowlist.
+          // There is no schema-cache fallback any more: an unresolved resource
+          // was refused above, so every write that gets here has a real allowlist.
+          const filtered = Object.fromEntries(
+            Object.entries(insertData).filter(([k]) => allowed.has(k))
+          );
+          if (Object.keys(filtered).length === 0) {
+            return res.status(400).json({
+              success: false,
+              error: "No insertable fields provided",
+            });
           }
+          query = `INSERT INTO \`${table}\` SET ?`;
+          params = [filtered];
           break;
 
         case "update":
-          // Ensure admin can only update records from their company.
-          // Service/workers (req.user.is_service) bypass this scoping so they
-          // can update records across companies when authorized via the
-          // WORKER_SERVICE_TOKEN.
-          const companyId =
-            req.user && !req.user.is_service
-              ? req.user?.company_id || req.user?.companyId
-              : null;
-
           // Special handling for users table - hash password if being updated
           const updateData = { ...data };
-          if (resource === "users" && updateData.password) {
+          if (table === "users" && updateData.password) {
             logger.info("Hashing password for user update");
             updateData.password = await bcrypt.hash(updateData.password, 10);
           }
 
-          // Filter updateData against the resourceDef.json write allowlist or schema cache.
-          try {
-            const defAllowlistUpd = getResourceWriteAllowlist(resource);
-            const allowedUpd = defAllowlistUpd ?? await getTableColumns(resource);
-            const filteredUpd = Object.fromEntries(
-              Object.entries(updateData).filter(([k]) => allowedUpd.has(k))
-            );
-            // Ensure we don't attempt to run an UPDATE with an empty SET
-            // Remove `id` from the SET payload and use it in the WHERE clause
-            const targetId =
-              req.body?.id ||
-              req.body?.data?.id ||
-              filteredUpd.id ||
-              updateData.id;
-            if (filteredUpd.hasOwnProperty("id")) delete filteredUpd.id;
-            const keysToUpdate = Object.keys(filteredUpd || {});
-            if (!targetId) {
-              throw new Error("Missing id for update");
-            }
-            if (keysToUpdate.length === 0) {
-              // Nothing to update — return an error instead of producing invalid SQL
-              return res.status(400).json({
-                success: false,
-                error: "No updatable fields provided",
-              });
-            }
-            if (companyId) {
-              query = `UPDATE ${resource} SET ? WHERE id = ? AND company_id = ?`;
-              params = [filteredUpd, targetId, companyId];
-            } else {
-              query = `UPDATE ${resource} SET ? WHERE id = ?`;
-              params = [filteredUpd, targetId];
-            }
-          } catch (err) {
-            logger.warn(
-              "Failed to introspect table columns for update",
-              resource,
-              err
-            );
-            if (companyId) {
-              query = `UPDATE ${resource} SET ? WHERE id = ? AND company_id = ?`;
-              params = [updateData, updateData.id, companyId];
-            } else {
-              query = `UPDATE ${resource} SET ? WHERE id = ?`;
-              params = [updateData, updateData.id];
-            }
+          // Filter updateData against the resourceDef.json write allowlist.
+          // The old catch-all here re-ran the UPDATE with the *unfiltered*
+          // payload whenever the allowlist lookup threw — an error path that
+          // wrote more than the success path did.
+          const filteredUpd = Object.fromEntries(
+            Object.entries(updateData).filter(([k]) => allowed.has(k))
+          );
+          // `id` addresses the row, it is not a column to set. The allowlist
+          // excludes it, so read it from the raw payload for the WHERE clause.
+          const targetId = req.body?.id || req.body?.data?.id || updateData.id;
+          if (!targetId) {
+            return res
+              .status(400)
+              .json({ success: false, error: "Missing id for update" });
+          }
+          if (Object.keys(filteredUpd).length === 0) {
+            // Nothing to update — return an error instead of producing invalid SQL
+            return res.status(400).json({
+              success: false,
+              error: "No updatable fields provided",
+            });
+          }
+          if (scopeCompanyId) {
+            query = `UPDATE \`${table}\` SET ? WHERE id = ? AND company_id = ?`;
+            params = [filteredUpd, targetId, scopeCompanyId];
+          } else {
+            query = `UPDATE \`${table}\` SET ? WHERE id = ?`;
+            params = [filteredUpd, targetId];
           }
           break;
 
         case "delete":
           // Soft delete: set deleted_at timestamp instead of removing the row.
-          // Service users bypass company scoping.
-          const deleteCompanyId =
-            req.user && !req.user.is_service
-              ? req.user?.company_id || req.user?.companyId
-              : null;
-          if (deleteCompanyId) {
-            query = `UPDATE ${resource} SET deleted_at = NOW() WHERE id = ? AND company_id = ? AND deleted_at IS NULL`;
-            params = [data.id, deleteCompanyId];
+          if (!data || data.id === undefined || data.id === null) {
+            return res
+              .status(400)
+              .json({ success: false, error: "Missing id for delete" });
+          }
+          if (scopeCompanyId) {
+            query = `UPDATE \`${table}\` SET deleted_at = NOW() WHERE id = ? AND company_id = ? AND deleted_at IS NULL`;
+            params = [data.id, scopeCompanyId];
           } else {
-            query = `UPDATE ${resource} SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL`;
+            query = `UPDATE \`${table}\` SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL`;
             params = [data.id];
           }
           break;

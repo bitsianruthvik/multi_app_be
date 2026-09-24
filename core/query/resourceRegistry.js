@@ -53,16 +53,43 @@ export function getAllResources() {
   return out;
 }
 
-// Build a write-column allowlist for a resource. Derives allowed columns from
-// (a) field expressions whose alias matches the resource's primary table alias,
-// and (b) an explicit writeFields array for server-set / write-only columns.
-// Returns null if the resource is not registered (caller falls back to schema cache).
+// Can this resource be written through the generic write path at all?
+//
+// Opt-in, and only via an explicit `writable: true` on the definition. A
+// definition that says nothing is NOT writable — most tables here are owned by
+// a service that enforces rules the generic path knows nothing about (stock
+// movements write a ledger row and a balance together, a BOM line re-works
+// roll-ups, releasing production writes the tracker whole), and the default has
+// to be the safe one.
+//
+// `writeFields` is NOT this gate. It only narrows *which columns* a resource
+// that is already writable accepts.
+export function isResourceWritable(slug) {
+  const def = _registry.get(slug);
+  return !!def && def.writable === true;
+}
+
+// Build a write-column allowlist for a resource. For a writable resource the
+// allowed columns are (a) field expressions whose alias matches the resource's
+// primary table alias, and (b) the explicit writeFields array for server-set /
+// write-only columns.
+//
+// Returns:
+//   null       — the slug is not registered
+//   empty Set  — registered, but not marked `writable: true`: write nothing
+//   Set<col>   — the writable columns
+//
+// The empty-Set case previously returned the full derived field set, so
+// `writeFields: []` read like a gate while in fact granting every readable
+// column. Callers must treat an empty Set as "refuse the write", not as
+// "nothing to filter" — resolveWriteTarget() below does that for them.
 export function getResourceWriteAllowlist(slug) {
   if (!_registry.has(slug)) return null;
   const def = _registry.get(slug);
-  const alias = def.alias;
   const cols = new Set();
+  if (def.writable !== true) return cols;
 
+  const alias = def.alias;
   for (const expr of Object.values(def.fields || {})) {
     const parts = String(expr).split(".");
     if (parts.length === 2 && parts[0] === alias) {
@@ -72,7 +99,38 @@ export function getResourceWriteAllowlist(slug) {
   for (const f of def.writeFields || []) {
     cols.add(f);
   }
+
+  // The primary key is never a writable column. `id` is derivable from `fields`
+  // on all 134 resources and explicitly requested by none, so leaving it in let
+  // a client choose its own primary key on insert. UPDATE never wanted it
+  // either — it takes the id from the payload for the WHERE clause and drops it
+  // from the SET list.
+  cols.delete("id");
+
   return cols;
+}
+
+// Resolve a client-supplied `resource` for a write operation.
+//
+// Writes must name a registered resourceDef slug, exactly as reads do. The raw
+// DB table name is not accepted: it used to resolve past the registry into the
+// schema cache, which handed back every column in the table and so skipped the
+// allowlist entirely — reads demanded a slug while writes quietly took either.
+//
+// Returns { ok: true, table, allowlist } or { ok: false, reason }.
+export function resolveWriteTarget(slug) {
+  if (typeof slug !== "string" || !_registry.has(slug)) {
+    return { ok: false, reason: "unknown_resource" };
+  }
+  const def = _registry.get(slug);
+  if (def.writable !== true) {
+    return { ok: false, reason: "not_writable" };
+  }
+  if (!def.table) {
+    // A writable definition with no table is a packaging bug, not a client error.
+    return { ok: false, reason: "no_table" };
+  }
+  return { ok: true, table: def.table, allowlist: getResourceWriteAllowlist(slug) };
 }
 
 // Bootstrap with core resources synchronously at module load.

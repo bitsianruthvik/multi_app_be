@@ -5,21 +5,27 @@
 //   options.includeDeleted  — when true and jwt.role === 'admin', omit deleted_at filter
 //   options.alias           — table alias to qualify deleted_at (e.g. "ar")
 export function injectSecurity(whereSql, whereParams, jwt, resource, options = {}) {
-  const globalTables = ["features", "features_capability", "companies", "apps", "roles", "teams", "role_capability"];
-
   const includeDeleted = options.includeDeleted === true;
   const alias = options.alias || null;
-
-  const isGlobal = resource && globalTables.includes(resource);
 
   const conditions = [];
   const extraParams = [];
 
-  // hasCompanyId is passed by queryBuilder when the main table's resourceDef confirms it
-  // has a company_id column. Child tables (e.g. fab_nodes) don't — skip injection there.
+  // hasCompanyId is passed by queryBuilder, which reads the table's real
+  // columns. Tables without a company_id (features, features_capability,
+  // companies) are skipped by that alone.
+  //
+  // There used to be a `globalTables` list here as well, and it was the bug:
+  // it named `roles`, `teams`, `role_capability` and `apps`, all four of which
+  // DO have a company_id, so every read of them spanned all tenants — a read of
+  // `roles` from one company returned seven companies' rows. The list was added
+  // (see architecture/errors.md) only because those tables once lacked a
+  // deleted_at column; they all have one now, and in this version the list did
+  // not gate the soft-delete filter anyway. One list doing two jobs, long after
+  // the second job stopped existing.
   const hasCompanyId = options.hasCompanyId !== false;
 
-  if (!isGlobal && hasCompanyId) {
+  if (hasCompanyId) {
     const companyId = jwt?.company_id || jwt?.companyId;
     if (companyId !== undefined && companyId !== null) {
       const companyCol = alias ? `${alias}.company_id` : "company_id";

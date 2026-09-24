@@ -79,7 +79,7 @@ query = `INSERT INTO ${resource} SET ?`;
 params = [filteredData];   // MySQL2 expands SET ? as key=val pairs
 ```
 
-- `company_id` is **always overwritten** from `req.user.company_id` (not client-supplied) for non-global tables.
+- `company_id` is **always overwritten** from `req.user.company_id` (never client-supplied) on any table that has a `company_id` column, and update/delete scope their WHERE clause by it. The write path asks the schema for that column rather than consulting a hardcoded list: the old `globalTables` list was read by the insert branch only — so update and delete appended `AND company_id = ?` to every table and 500'd on the ones without the column — and it had drifted from the schema in both directions (it missed `fab_nodes`, `fab_node_relationships` and the two `fab_excel_import_*` tables, and it named `apps`, which does have a `company_id`). Service callers (`WORKER_SERVICE_TOKEN`) stay unscoped by design. **This is the write path only** — `securityInjector.js` keeps its own separate list for reads.
 - `recorded_by` / `recorded_by_role` auto-filled from JWT for `audio_recordings`.
 - `password` is bcrypt-hashed before insert for `users`.
 - Column filtering: only columns that exist in the DB schema cache are allowed through; unknown keys are dropped.
@@ -124,7 +124,8 @@ Each entry defines:
 - `fields` — map of output key → `alias.column` expression (used in SELECT and ORDER BY validation)
 - `fieldTypes` — map of field name → type hint (`"string"` | `"integer"` | `"text"` | `"datetime"` | `"json"`)
 - `relations` — optional JOIN definitions
-- `writeFields` — explicit list of writable columns for INSERT/UPDATE (in addition to those derivable from `fields`)
+- `writable` — **the gate.** `true` opts the resource into the generic write path (`operation: insert | update | delete`). Anything else, including absent, means the generic API refuses to write it — the resource is owned by a service that enforces rules the generic path cannot see.
+- `writeFields` — extra writable columns for a resource that is *already* `writable`, on top of those derivable from `fields` (server-set columns such as `password`). **`writeFields` is not a gate:** an empty array on a resource without `writable: true` is redundant, and a non-empty one on such a resource grants nothing.
 
 ### Bootstrap & collisions
 1. `core/query/resourceRegistry.js` synchronously loads the core `resourceDef.json` on module init.
@@ -133,7 +134,7 @@ Each entry defines:
 
 `resourceParser.js` delegates to `resourceRegistry.getResource(slug)`; nothing reads JSON from disk per-request.
 
-**Write operations use the registry's `getResourceWriteAllowlist(slug)` as the primary column allowlist (TODO 4 complete).** For each registered resource, the allowlist is built from (a) field expressions whose alias matches the resource's own table alias and (b) the explicit `writeFields` array for server-set columns (e.g. `password`, `new_tran`). Unregistered resources still fall back to the schema cache.
+**Writes resolve `resource` through the registry exactly as reads do.** `resolveWriteTarget(slug)` returns the table name from the definition — the client never names a table. A request naming a raw table (`cf_classification_nodes`) is a 400; a registered resource that is not `writable: true` is a 403. There is no schema-cache fallback on the write path. For a writable resource the column allowlist is (a) field expressions whose alias matches the resource's own table alias plus (b) the explicit `writeFields` array.
 
 ---
 
@@ -166,6 +167,19 @@ Function names are restricted to `COUNT | SUM | AVG | MIN | MAX`. `field` is val
 
 ---
 
-## Write-Path Allowlist (TODO 4 — Complete)
+## Write-Path Allowlist
 
-Write operations use `resourceDef.json` as the authoritative column allowlist. `getResourceWriteAllowlist(resource)` derives the allowed set from the resource's `fields` expressions (primary-table alias only) plus an explicit `writeFields` array. Unregistered tables fall back to `SHOW COLUMNS` (schema cache). This prevents clients from writing to undeclared columns (e.g., internal columns added to the DB schema but not registered in `resourceDef.json`).
+`resourceDef.json` is the authoritative answer to both write questions, in this order:
+
+**1. May this resource be written generically at all?** Only if its definition says `writable: true`. Opt-in, deny by default. 33 resources are opted in — core, `audio_intelligence` and `fab_flow`, the ones with real callers. Every `fab_erp` and `cf_erp` resource is denied: those apps write through their own routes (`POST /api/:company/fab_erp/mutate`, the `cf_erp` service routes), which enforce the rules the generic path knows nothing about.
+
+**2. Which columns may it set?** For a writable resource, `getResourceWriteAllowlist(slug)` returns field expressions on the resource's own table alias plus `writeFields`. For a resource that is not writable it returns an **empty set**; for an unregistered slug, `null`.
+
+`id` is always excluded. It is derivable from `fields` on every resource and requested by none, and leaving it in let a client choose its own primary key on insert. On update the id addresses the row — it is read from the payload for the WHERE clause, never set.
+
+**Two traps this replaced, both of which made the allowlist decorative:**
+
+- *`writeFields: []` was documentation, not a gate.* The allowlist unioned `writeFields` with every column derivable from `fields` — and every readable column is in `fields` — so `writeFields: []` still yielded the resource's full column set. 48 definitions were relying on it as if it were a gate.
+- *Writes accepted a raw table name; reads did not.* `resource` was interpolated straight into `INSERT INTO ${resource}`, while the allowlist lookup was keyed on the camelCase slug. So `cfErpClassificationNode` found an allowlist but produced invalid SQL, whereas `cf_classification_nodes` found no allowlist, fell through to `SHOW COLUMNS` — every column in the table — and wrote successfully. The allowlist was skipped on the only path that worked.
+
+Adding a resource does **not** make it writable. Opt in deliberately, and only when no service owns the table's rules.
