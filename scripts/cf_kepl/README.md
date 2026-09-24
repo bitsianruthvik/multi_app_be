@@ -46,6 +46,7 @@ app's pool at TiDB.
 | `cf_rm_import.mjs` + `fab_rm_extract.tsv` | the raw materials, imported from a read-only extract of `fab_erp` production |
 | `cf_shop_import.mjs` + `fab_shop_extract.tsv` | the shop floor, from the same kind of extract: a `Machines` family, 8 subfamilies grouped by what the machine does to the steel, 16 machine types and the 19 machines on them — 11 types and 14 machines from the extract, plus 5 decided in the script (`EDGEMILL`, `METALIZE` and three QC stations) because the flows use operations StartHub had no machine for. Machine codes are minted by coding rule `CFMC-ANY`, never carried over |
 | `cf_ops_import.mjs` + `fab_ops_extract.tsv` + `fab_flows_extract.tsv` | the work itself: 14 operations and the 5 real flows, all 43 fab steps at their own sequence. A flow may run one operation several times — `LINESEG-FAB` welds, crane-turns the girder and welds again — so a step is keyed by (operation, sequence), never by operation alone. A step's resource type becomes a rule on the OPERATION in `cf_operation_machine_rules`, eligibility only; the fab time formulas need specifications CF does not have yet and are parked in each operation's description. The fab resource-type names are not the shop's machine-type names, so the mapping is decided in `MACHINE_TYPE_ALIASES` / `OPERATION_MACHINE_TYPE` and anything unmatched is reported, never guessed |
+| `cf_verify_against_boq.mjs` | the only check that compares the order to something OUTSIDE the database. Expands the span to its leaves, multiplying quantities the whole way, and compares the resulting bill — every rectangle and how many of it — against the same bill derived from `boq.json`. Also the stud count, each of the 20 segments against its own stated weight, and the span total. Read-only always: it reports a difference and never repairs one, because deciding which side is right is a reading of the customer's document |
 | `cf_reconcile_dims.mjs` | checks every part against **two independent authorities** — the blank it is cut from, and the BOQ — and repairs only where both name the same replacement. Read-only without `--fix`. It exists because a part can drift from the order it belongs to without any self-consistency check noticing: the model compared to itself still balances |
 
 ## The interrupted-run hazard
@@ -60,7 +61,10 @@ while the BOQ, the blank it is cut from, and the other three girders all said 25
 inflated the span by 720.63 kg and the order by 1,441 kg. Every existing check passed,
 because every existing check compared the model to itself.
 
-`cf_reconcile_dims.mjs` is the answer to that class of error, and the reason the weight
+`cf_verify_against_boq.mjs` is the answer to that class of error — and `cf_reconcile_dims.mjs`
+is the narrower one that can also repair. Dimensions alone are not enough: reconcile_dims only
+sees parts that HAVE a blank, and a wrong QUANTITY is invisible to it, so verify_against_boq is
+what actually proves the order, and the reason the weight
 check in `cf_recode_order.mjs` is a **hardcoded figure from the customer's document**
 rather than a before-and-after comparison. A before-and-after check would have confirmed
 the wrong number was still the wrong number.
