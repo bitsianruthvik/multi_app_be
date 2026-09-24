@@ -183,3 +183,16 @@ Function names are restricted to `COUNT | SUM | AVG | MIN | MAX`. `field` is val
 - *Writes accepted a raw table name; reads did not.* `resource` was interpolated straight into `INSERT INTO ${resource}`, while the allowlist lookup was keyed on the camelCase slug. So `cfErpClassificationNode` found an allowlist but produced invalid SQL, whereas `cf_classification_nodes` found no allowlist, fell through to `SHOW COLUMNS` — every column in the table — and wrote successfully. The allowlist was skipped on the only path that worked.
 
 Adding a resource does **not** make it writable. Opt in deliberately, and only when no service owns the table's rules.
+
+### What `writable: true` actually opens
+
+**It opens the resource to every authenticated user of the tenant, whatever their role.** `/api/query/v1` is mounted with `protect` alone (`index.js`), and `appContext` does not run for it, so `req.company` is null and the membership / `app_user_access` / `uiPermissions` checks never happen. The route itself checks no role and no capability. What stops a write is the resource-level opt-in and nothing else.
+
+Verified against a `fab_user` — a non-admin with 7 permission tags — which could insert into `role_capability`, `app_user_access`, `roles`, `users` and `features` through this endpoint. Granting yourself a capability is a supported operation for any logged-in account. The `company_id` stamp bounds the blast radius to the caller's own tenant; it does not bound their privileges inside it.
+
+So there are two questions, and only the first is answered here:
+
+- *May this resource be written generically?* — `writable: true` answers it.
+- *May **this caller** write it?* — **nobody asks.** If that matters for a resource, it needs its own route with its own guard.
+
+This is why the opt-in list is short and why app-owned resources stay off it. On TiDB the point is sharper still: CHECK constraints are not enforced there, so a service's rules are not the first line of defence, they are the only one.
