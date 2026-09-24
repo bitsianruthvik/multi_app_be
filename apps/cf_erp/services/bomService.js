@@ -107,7 +107,8 @@ async function ownerOrder(db, companyId, parent) {
   return o || null;
 }
 
-async function assertEditable(db, companyId, parent) {
+/** The one rule for "this structure can still change". Exported so the BOM sheet asks the same question. */
+export async function assertEditable(db, companyId, parent) {
   if (parent.status === 'obsolete') throw invalid('OBSOLETE', `${labelOf(parent)} is obsolete — reactivate it to change its BOM.`);
   const order = await ownerOrder(db, companyId, parent);
   if (order && LOCKED_ORDER_STATUSES.has(order.status)) throw invalid('ORDER_CLOSED', `Order ${order.code} is ${order.status} — its structure can no longer change.`);

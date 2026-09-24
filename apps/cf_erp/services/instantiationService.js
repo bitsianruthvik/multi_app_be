@@ -29,7 +29,6 @@ import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { bomOfParent, linesOfBom, childKindOf, createBom, insertLine } from './bomGraph.js';
 
 const MAX_DEPTH = 20;
-const pad2 = (n) => String(n).padStart(2, '0');
 
 /** The catalog item a selection line starts with: its default, or its only candidate. */
 export async function defaultCandidate(db, companyId, selectionId) {
@@ -85,10 +84,17 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
     throw invalid('TEMPLATE_BOM_NOT_ACTIVE', `The Template BOM of ${definition.code ?? definition.name} is ${templateBom.status} — activate it before using it on an order.`);
   }
 
+  // The name says what the thing IS — "Top flange", not "Top flange 01". The
+  // trailing number used to be here to keep names apart, which was never needed
+  // and never worked: cf_master_records is unique on the CODE, not the name, so
+  // "Top flange 01" already existed under two different segments. Three things
+  // already say which one this is — the code, the place in the BOM tree, and the
+  // line's role ("Intermediate stiffener — plain" against "— drilled"). A number
+  // on top of that is noise that reads like meaning. (User, 2026-09-24.)
   const item = await createItem(db, c, {
     itemType: 'temporary', sourceDefinitionId: definition.id, ownerOrderLineId: ownerLineId, status: 'draft',
   }, {
-    fallbackName: `${definition.name} ${pad2(place?.position ?? 1)}`,
+    fallbackName: definition.name,
     place: async (itemId) => {
       if (!place) return;
       await insertLine(db, c, {
