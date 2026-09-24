@@ -19,24 +19,6 @@ CREATE TABLE IF NOT EXISTS features_capability (
   CONSTRAINT chk_valid_json CHECK (JSON_VALID(features_json))
 );
 
--- Post-migration shape: role_capability uses FK columns (role_id, team_id, company_id).
--- See migrations/core/002_role_capability_fk.sql for the data migration.
-CREATE TABLE IF NOT EXISTS role_capability (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  role_id INT NULL,
-  team_id INT NULL,
-  company_id INT NULL,
-  app_id INT NULL,
-  capability_id INT,
-  deleted_at DATETIME NULL DEFAULT NULL,
-  FOREIGN KEY (capability_id) REFERENCES features_capability(capability_id)
-    ON DELETE CASCADE
-    ON UPDATE CASCADE,
-  CONSTRAINT fk_rc_role FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
-  CONSTRAINT fk_rc_team FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
-  CONSTRAINT fk_rc_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-  CONSTRAINT fk_rc_app FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
-);
 
 -- Companies table used to store app/company specific settings and slug
 CREATE TABLE IF NOT EXISTS companies (
@@ -80,6 +62,31 @@ CREATE TABLE IF NOT EXISTS roles (
   FOREIGN KEY (company_id) REFERENCES companies(id)
     ON DELETE CASCADE
     ON UPDATE CASCADE
+);
+
+-- role_capability comes AFTER companies/apps/teams/roles because it has a real
+-- foreign key into each of them. It used to sit near the top, which worked on
+-- every existing database (CREATE TABLE IF NOT EXISTS is a no-op once the table
+-- is there) and failed on every EMPTY one — so no new environment could be built
+-- from these files at all. Found 2026-09-24. Reordering idempotent statements
+-- changes nothing for a populated database.
+-- Post-migration shape: role_capability uses FK columns (role_id, team_id, company_id).
+-- See migrations/core/002_role_capability_fk.sql for the data migration.
+CREATE TABLE IF NOT EXISTS role_capability (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  role_id INT NULL,
+  team_id INT NULL,
+  company_id INT NULL,
+  app_id INT NULL,
+  capability_id INT,
+  deleted_at DATETIME NULL DEFAULT NULL,
+  FOREIGN KEY (capability_id) REFERENCES features_capability(capability_id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE,
+  CONSTRAINT fk_rc_role FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rc_team FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rc_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rc_app FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS users (
