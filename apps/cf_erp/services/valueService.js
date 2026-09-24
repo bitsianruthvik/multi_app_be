@@ -120,14 +120,230 @@ function snapshot(row, source, uom) {
   };
 }
 
-async function writeHistory(db, c, { valueId, specId, subjectType, subjectId, changeType, before, after }) {
-  await db.query(
-    `INSERT INTO cf_spec_value_history
-       (company_id, value_id, specification_id, subject_type, subject_id, change_type, old_value, new_value, changed_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, valueId, specId, subjectType, subjectId, changeType,
-      before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, c.userId],
-  );
+/* ---------------------------------------------------------------------------
+ * Writing values — one subject, any number of specs, a fixed number of queries.
+ *
+ * One value used to cost three round trips: read its current row, write the new
+ * one, write its history row. Creating a catalog item writes nine values, so 27
+ * of its 65 queries were this one loop. Over a link to TiDB (49 ms a hop) that
+ * is 1.3 s per item, and it was the largest block left.
+ *
+ * Every caller writes to ONE subject at a time — setValues, storeDerived,
+ * deleteAllForSubject and the batch service all fix (subject_type, subject_id)
+ * and vary the spec — so the batch is per subject. That also keeps the read
+ * simple: `subject_type = ? AND subject_id = ? AND specification_id IN (...)`
+ * is a plain index range, not a row-constructor IN list the planner has to
+ * think about. A create-only payload of any size now costs four queries:
+ *
+ *     SELECT the rows that already exist      1
+ *     INSERT the new value rows               1  multi-row
+ *     SELECT their ids back                   1
+ *     INSERT the history rows                 1  multi-row
+ *
+ * WHY THE IDS ARE READ BACK RATHER THAN COUNTED FORWARD
+ * A history row names the value row it describes. A multi-row INSERT reports
+ * only `insertId` (the first row) and `affectedRows`; working the rest out by
+ * adding one is an assumption that the engine hands out AUTO_INCREMENT
+ * contiguously. TiDB does not — each node caches a block of the sequence, so
+ * ids from one statement are ascending but not adjacent, and two nodes
+ * interleave their blocks. So the ids are read back by the natural key instead.
+ * (company_id, specification_id, subject_type, subject_id) with deleted_at NULL
+ * is the unique key uq_csv_value, so each key matches exactly the row this
+ * transaction just inserted, whatever number the engine gave it. True on MySQL,
+ * true on TiDB, and still true if the allocator ever changes.
+ *
+ * ORDER
+ * Value rows are written deletes, then updates, then inserts — they are
+ * different rows with different keys, so nothing depends on the order between
+ * them. History rows then go in one statement in the order the caller listed
+ * the writes, so history still reads back in write order (getHistory sorts by
+ * changed_at, then id, and everything in one transaction shares a second).
+ *
+ * A spec named twice in one payload is split into a second pass, because the
+ * second write must see the first — exactly what the one-at-a-time loop did.
+ * ------------------------------------------------------------------------ */
+
+// Placeholder budgets. mysql2 interpolates client-side, so the ceiling is
+// max_allowed_packet (MySQL) / txn-entry and statement limits (TiDB), not the
+// 65535 parameter cap. 200 value rows is 2400 placeholders and a few tens of
+// kilobytes of SQL — two orders of magnitude inside either limit — while still
+// being one round trip for every payload a person can realistically type.
+const INSERT_CHUNK = 200;   // rows per multi-row INSERT
+const UPDATE_CHUNK = 100;   // rows per CASE update (7 columns x 2 params a row, plus the id list)
+const READ_CHUNK = 500;     // spec ids per IN list
+
+const chunk = (xs, n) => {
+  const out = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
+};
+
+const SET_COLS = ['value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source'];
+const cellOf = (r, col) => (col === 'uom' ? r.uom : col === 'source' ? r.source : r.typed[col]);
+
+/** The live value rows for these specs on one subject, keyed by specification_id. */
+async function ownRowsFor(db, companyId, subjectType, subjectId, specIds) {
+  const out = new Map();
+  const ids = [...new Set(specIds)];
+  if (!ids.length) return out;
+  for (const part of chunk(ids, READ_CHUNK)) {
+    const [rows] = await db.query(
+      `SELECT * FROM cf_spec_values
+        WHERE company_id = ? AND subject_type = ? AND subject_id = ? AND specification_id IN (?) AND deleted_at IS NULL`,
+      [companyId, subjectType, subjectId, part],
+    );
+    for (const r of rows) out.set(r.specification_id, r);
+  }
+  return out;
+}
+
+async function clearRows(db, ids) {
+  for (const part of chunk(ids, INSERT_CHUNK)) {
+    await db.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE id IN (?)', [part]);
+  }
+}
+
+async function updateRows(db, rows) {
+  for (const part of chunk(rows, UPDATE_CHUNK)) {
+    if (part.length === 1) {
+      const r = part[0];
+      await db.query(
+        `UPDATE cf_spec_values
+            SET value_number = ?, value_text = ?, value_bool = ?, value_date = ?, option_id = ?, uom = ?, source = ?
+          WHERE id = ?`,
+        [r.typed.value_number, r.typed.value_text, r.typed.value_bool, r.typed.value_date, r.typed.option_id, r.uom, r.source, r.id],
+      );
+      continue;
+    }
+    // One statement, one CASE per column. Every id in the WHERE has a WHEN, so
+    // no row can fall through to the implicit ELSE NULL.
+    const params = [];
+    const sets = SET_COLS.map((col) => {
+      const whens = part.map((r) => { params.push(r.id, cellOf(r, col)); return 'WHEN ? THEN ?'; }).join(' ');
+      return `${col} = CASE id ${whens} END`;
+    }).join(', ');
+    params.push(part.map((r) => r.id));
+    await db.query(`UPDATE cf_spec_values SET ${sets} WHERE id IN (?)`, params);
+  }
+}
+
+async function insertRows(db, c, subjectType, subjectId, rows) {
+  for (const part of chunk(rows, INSERT_CHUNK)) {
+    const params = [];
+    for (const r of part) {
+      params.push(c.companyId, r.spec.id, subjectType, subjectId, r.typed.value_number, r.typed.value_text,
+        r.typed.value_bool, r.typed.value_date, r.typed.option_id, r.uom, r.source, c.userId);
+    }
+    await db.query(
+      `INSERT INTO cf_spec_values
+         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source, created_by)
+       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+      params,
+    );
+  }
+}
+
+async function insertHistory(db, c, subjectType, subjectId, rows) {
+  for (const part of chunk(rows, INSERT_CHUNK)) {
+    const params = [];
+    for (const h of part) {
+      params.push(c.companyId, h.valueId, h.specId, subjectType, subjectId, h.changeType,
+        h.before ? JSON.stringify(h.before) : null, h.after ? JSON.stringify(h.after) : null, c.userId);
+    }
+    await db.query(
+      `INSERT INTO cf_spec_value_history
+         (company_id, value_id, specification_id, subject_type, subject_id, change_type, old_value, new_value, changed_by)
+       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+      params,
+    );
+  }
+}
+
+/**
+ * One pass: every spec in it is distinct, so the whole pass reads and writes
+ * together. History rows are appended to `history` rather than written here —
+ * see applyWrites for why.
+ */
+async function applyPass(db, c, subjectType, subjectId, pass, out, history) {
+  const own = await ownRowsFor(db, c.companyId, subjectType, subjectId, pass.map((w) => w.spec.id));
+  const cleared = [];
+  const changed = [];
+  const created = [];
+  const mine = [];
+
+  for (const w of pass) {
+    const row = own.get(w.spec.id) ?? null;
+    if (!w.typed) {
+      if (!row) continue;
+      cleared.push(row.id);
+      mine.push({ idx: w.idx, valueId: row.id, specId: w.spec.id, changeType: 'delete', before: snapshot(row), after: null });
+      out[w.idx] = { spec: w.spec.code, change: 'cleared', source: row.source };
+      continue;
+    }
+    const uom = w.spec.default_uom ?? null; // locked to the spec's unit for now (Q11)
+    if (!row) {
+      created.push({ spec: w.spec, typed: w.typed, uom, source: w.source });
+      mine.push({ idx: w.idx, valueId: null, specId: w.spec.id, changeType: 'create', before: null, after: snapshot(w.typed, w.source, uom) });
+      out[w.idx] = { spec: w.spec.code, change: 'set', source: w.source };
+      continue;
+    }
+    if (sameValue(row, w.typed) && row.source === w.source) continue;
+    changed.push({ id: row.id, typed: w.typed, uom, source: w.source });
+    mine.push({ idx: w.idx, valueId: row.id, specId: w.spec.id, changeType: 'update', before: snapshot(row), after: snapshot(w.typed, w.source, uom) });
+    out[w.idx] = { spec: w.spec.code, change: 'changed', source: w.source };
+  }
+  if (!mine.length) return;
+
+  if (cleared.length) await clearRows(db, cleared);
+  if (changed.length) await updateRows(db, changed);
+  if (created.length) {
+    await insertRows(db, c, subjectType, subjectId, created);
+    const fresh = await ownRowsFor(db, c.companyId, subjectType, subjectId, created.map((r) => r.spec.id));
+    for (const h of mine) {
+      if (h.changeType !== 'create') continue;
+      const row = fresh.get(h.specId);
+      if (!row) throw new Error(`cf_erp: value row for specification ${h.specId} on ${subjectType} ${subjectId} vanished between insert and read-back.`);
+      h.valueId = row.id;
+    }
+  }
+  history.push(...mine);
+}
+
+/**
+ * Creates, changes or clears many values on ONE subject, with history.
+ * writes: [{ spec, typed, source }] — `typed` null clears that value.
+ * Returns the change records, in the order given, with the no-ops dropped.
+ */
+export async function upsertValues(db, c, subjectType, subjectId, writes = []) {
+  return (await applyWrites(db, c, subjectType, subjectId, writes)).filter(Boolean);
+}
+
+async function applyWrites(db, c, subjectType, subjectId, writes) {
+  const out = new Array(writes.length).fill(null);
+  const history = [];
+  let pending = writes.map((w, idx) => ({ ...w, idx }));
+  while (pending.length) {
+    const pass = [];
+    const later = [];
+    const seen = new Set();
+    for (const w of pending) {
+      if (seen.has(w.spec.id)) later.push(w);
+      else { seen.add(w.spec.id); pass.push(w); }
+    }
+    await applyPass(db, c, subjectType, subjectId, pass, out, history);
+    pending = later;
+  }
+  // Every history row for the call, in one statement, in the order the caller
+  // listed the writes. The passes above reorder the value writes when a spec is
+  // named twice (the second write has to see the first); sorting by the
+  // caller's index puts history back exactly as the one-at-a-time loop left it.
+  // Every value row is written before any history row, which is also what the
+  // foreign key on value_id needs.
+  if (history.length) {
+    history.sort((a, b) => a.idx - b.idx);
+    await insertHistory(db, c, subjectType, subjectId, history);
+  }
+  return out;
 }
 
 /**
@@ -135,42 +351,8 @@ async function writeHistory(db, c, { valueId, specId, subjectType, subjectId, ch
  * Returns a change record, or null when nothing changed.
  */
 export async function upsertValue(db, c, spec, subjectType, subjectId, typed, source) {
-  const [[own]] = await db.query(
-    `SELECT * FROM cf_spec_values
-      WHERE company_id = ? AND specification_id = ? AND subject_type = ? AND subject_id = ? AND deleted_at IS NULL`,
-    [c.companyId, spec.id, subjectType, subjectId],
-  );
-  const base = { specId: spec.id, subjectType, subjectId };
-
-  if (!typed) {
-    if (!own) return null;
-    await db.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE id = ?', [own.id]);
-    await writeHistory(db, c, { ...base, valueId: own.id, changeType: 'delete', before: snapshot(own), after: null });
-    return { spec: spec.code, change: 'cleared', source: own.source };
-  }
-
-  const uom = spec.default_uom ?? null; // locked to the spec's unit for now (Q11)
-  if (!own) {
-    const [r] = await db.query(
-      `INSERT INTO cf_spec_values
-         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, spec.id, subjectType, subjectId, typed.value_number, typed.value_text, typed.value_bool,
-        typed.value_date, typed.option_id, uom, source, c.userId],
-    );
-    await writeHistory(db, c, { ...base, valueId: r.insertId, changeType: 'create', before: null, after: snapshot(typed, source, uom) });
-    return { spec: spec.code, change: 'set', source };
-  }
-
-  if (sameValue(own, typed) && own.source === source) return null;
-  await db.query(
-    `UPDATE cf_spec_values
-        SET value_number = ?, value_text = ?, value_bool = ?, value_date = ?, option_id = ?, uom = ?, source = ?
-      WHERE id = ?`,
-    [typed.value_number, typed.value_text, typed.value_bool, typed.value_date, typed.option_id, uom, source, own.id],
-  );
-  await writeHistory(db, c, { ...base, valueId: own.id, changeType: 'update', before: snapshot(own), after: snapshot(typed, source, uom) });
-  return { spec: spec.code, change: 'changed', source };
+  const [change] = await applyWrites(db, c, subjectType, subjectId, [{ spec, typed, source }]);
+  return change ?? null;
 }
 
 /**
@@ -221,11 +403,8 @@ export async function setValues(db, c, subjectType, subjectId, entries = []) {
   }
   if (problems.length) throw invalid('INVALID_VALUES', 'Some values could not be saved.', { problems });
 
-  const changes = [];
-  for (const w of writes) {
-    const ch = await upsertValue(db, c, w.spec, subjectType, subjectId, w.typed, 'entered');
-    if (ch) changes.push(ch);
-  }
+  const changes = await upsertValues(db, c, subjectType, subjectId,
+    writes.map((w) => ({ spec: w.spec, typed: w.typed, source: 'entered' })));
 
   let materialized;
   if (machine) {
@@ -264,10 +443,11 @@ export async function materializeMachine(db, c, machineId) {
 
 async function storeDerived(db, c, subjectType, subjectId, r) {
   const { ownRows, effectiveRows } = r.internal;
-  const changes = [];
-  const touch = async (s, typed, source) => {
-    const ch = await upsertValue(db, c, { id: s.spec.id, code: s.spec.code, default_uom: s.spec.unit }, subjectType, subjectId, typed, source);
-    if (ch) changes.push(ch);
+  // Nothing in either loop reads a value back, so the writes are collected and
+  // sent as one batch at the end; the list keeps the order they were decided in.
+  const writes = [];
+  const touch = (s, typed, source) => {
+    writes.push({ spec: { id: s.spec.id, code: s.spec.code, default_uom: s.spec.unit }, typed, source });
   };
   const typedOf = (row) => (row ? {
     value_number: row.value_number == null ? null : Number(row.value_number),
@@ -284,28 +464,28 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
     const own = ownRows.get(s.spec.id) ?? null;
     switch (s.rule.valueRule) {
       case 'fixed':
-        if (s.value) await touch(s, typedOf(effectiveRows.get(s.spec.id)), 'fixed');
-        else if (own && own.source === 'fixed') await touch(s, null, 'fixed');
+        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), 'fixed');
+        else if (own && own.source === 'fixed') touch(s, null, 'fixed');
         break;
       case 'defaulted':
         if (own && own.source === 'entered') break;
-        if (s.value) await touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted');
-        else if (own) await touch(s, null, 'defaulted');
+        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted');
+        else if (own) touch(s, null, 'defaulted');
         break;
       case 'calculated':
-        if (s.status === 'calculated') await touch(s, { ...EMPTY, value_number: s.value.raw }, 'calculated');
-        else if (own) await touch(s, null, 'calculated');
+        if (s.status === 'calculated') touch(s, { ...EMPTY, value_number: s.value.raw }, 'calculated');
+        else if (own) touch(s, null, 'calculated');
         break;
       case 'rollup':
-        if (s.status === 'rollup') await touch(s, { ...EMPTY, value_number: s.value.raw }, 'rollup');
-        else if (own) await touch(s, null, 'rollup');
+        if (s.status === 'rollup') touch(s, { ...EMPTY, value_number: s.value.raw }, 'rollup');
+        else if (own) touch(s, null, 'rollup');
         break;
       case 'inherited':
-        if (s.status === 'inherited') await touch(s, typedOf(effectiveRows.get(s.spec.id)), 'inherited');
-        else if (own) await touch(s, null, 'inherited');
+        if (s.status === 'inherited') touch(s, typedOf(effectiveRows.get(s.spec.id)), 'inherited');
+        else if (own) touch(s, null, 'inherited');
         break;
       case 'entered':
-        if (own && own.source !== 'entered') await touch(s, null, own.source);
+        if (own && own.source !== 'entered') touch(s, null, own.source);
         break;
       default:
         break;
@@ -314,11 +494,10 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
   // Derived values whose rule is gone. Entered values stay — they are a person's data.
   for (const own of ownRows.values()) {
     if (!produced.has(own.specification_id) && own.source !== 'entered') {
-      const ch = await upsertValue(db, c, { id: own.specification_id, code: own.spec_code, default_uom: own.uom }, subjectType, subjectId, null, own.source);
-      if (ch) changes.push(ch);
+      writes.push({ spec: { id: own.specification_id, code: own.spec_code, default_uom: own.uom }, typed: null, source: own.source });
     }
   }
-  return changes;
+  return upsertValues(db, c, subjectType, subjectId, writes);
 }
 
 /** Item ids a setup change on a definition or a classification subtree reaches. */
@@ -443,9 +622,9 @@ export async function deleteAllForSubject(db, c, subjectType, subjectId) {
       WHERE v.company_id = ? AND v.subject_type = ? AND v.subject_id = ? AND v.deleted_at IS NULL`,
     [c.companyId, subjectType, subjectId],
   );
-  for (const row of rows) {
-    await upsertValue(db, c, { id: row.specification_id, code: row.spec_code, default_uom: row.uom }, subjectType, subjectId, null, row.source);
-  }
+  await upsertValues(db, c, subjectType, subjectId, rows.map((row) => ({
+    spec: { id: row.specification_id, code: row.spec_code, default_uom: row.uom }, typed: null, source: row.source,
+  })));
   return rows.length;
 }
 
