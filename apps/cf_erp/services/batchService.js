@@ -10,7 +10,7 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMaster } from './records.js';
 import { resolveBatch, publicResolution } from './resolutionService.js';
-import { loadSpecs, coerce, upsertValue, getHistory } from './valueService.js';
+import { loadSpecs, coerce, upsertValues, getHistory } from './valueService.js';
 import { draftValueMap } from './drafts.js';
 import { generate } from '../modules/codegen/index.js';
 
@@ -110,16 +110,17 @@ async function writeBatchValues(db, c, batchId, item, entries) {
     else writes.push({ spec, typed: out.typed });
   }
   if (problems.length) throw invalid('INVALID_VALUES', 'Some batch values could not be saved.', { problems });
-  for (const w of writes) await upsertValue(db, c, w.spec, 'batch', batchId, w.typed, 'entered');
+  await upsertValues(db, c, 'batch', batchId, writes.map((w) => ({ spec: w.spec, typed: w.typed, source: 'entered' })));
   // Calculated batch values are stored too, so reports can read them.
   const after = await resolveBatch(db, c.companyId, { item, batchId });
   const calculated = after.specs.filter((s) => s.rule.valueRule === 'calculated' && s.value);
   if (calculated.length) {
     const { byId: specs } = await loadSpecs(db, c.companyId, calculated.map((s) => ({ specificationId: s.spec.id })));
-    for (const s of calculated) {
-      await upsertValue(db, c, specs.get(s.spec.id), 'batch', batchId,
-        { value_number: s.value.raw, value_text: null, value_bool: null, value_date: null, option_id: null }, 'calculated');
-    }
+    await upsertValues(db, c, 'batch', batchId, calculated.map((s) => ({
+      spec: specs.get(s.spec.id),
+      typed: { value_number: s.value.raw, value_text: null, value_bool: null, value_date: null, option_id: null },
+      source: 'calculated',
+    })));
   }
 }
 
