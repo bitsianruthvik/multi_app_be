@@ -1,3 +1,4 @@
+import { EFFECTIVE_SEATS_SQL, effectiveSeats, vacancies as vacancyOf } from './seatCount.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -242,7 +243,11 @@ const OVERRIDE_SELECT = (table, fk) => `
  * ══════════════════════════════════════════════════════════════════════════ */
 
 function shapePosition(p) {
+  // sanctionedHeadcount stays the raw column — it means ONE SEAT and the edit
+  // form writes it back. `seats` is the effective strength for the date, which
+  // is what fill and vacancy are measured against. services/seatCount.js says why.
   const sanctioned = Number(p.sanctioned_headcount ?? 0);
+  const seats = Number(p.effective_seats ?? sanctioned);
   const filled = Number(p.filled_count ?? 0);
   return {
     id: p.id,
@@ -257,11 +262,12 @@ function shapePosition(p) {
     locationId: p.location_id,
     locationName: p.location_name ?? null,
     sanctionedHeadcount: sanctioned,
+    seats,
     filledCount: filled,
     // A fact, not an error. Never negative on the wire: an over-filled seat is
     // its own signal (filledCount > sanctionedHeadcount) and is not a vacancy.
-    vacancyCount: Math.max(0, sanctioned - filled),
-    overFilled: filled > sanctioned,
+    vacancyCount: vacancyOf(seats, filled),
+    overFilled: filled > seats,
     defaultShiftId: p.default_shift_id,
     shiftCode: p.shift_code ?? null,
     shiftName: p.shift_name ?? null,
@@ -280,6 +286,7 @@ const POSITION_SELECT = `
   SELECT p.*, r.title AS role_title, r.role_code,
          d.name AS department_name, l.name AS location_name,
          s.code AS shift_code, s.name AS shift_name,
+         ${EFFECTIVE_SEATS_SQL('p')} AS effective_seats,
          (SELECT COUNT(*) FROM hrms_work_assignments wa
            WHERE wa.company_id = p.company_id AND wa.position_id = p.id AND wa.deleted_at IS NULL
              AND wa.status = 'ACTIVE'
@@ -300,7 +307,9 @@ const POSITION_SELECT = `
 export async function listPositions(db, companyId, query = {}) {
   const on = dateText(query.on) || today();
   const where = ['p.company_id = ?', 'p.deleted_at IS NULL'];
-  const params = [on, on, companyId];
+  // EFFECTIVE_SEATS_SQL comes first in the SELECT and takes four date params
+  // (two subqueries x two date bounds); then filled_count takes two.
+  const params = [on, on, on, on, on, on, companyId];
 
   if (!blank(query.status)) {
     const statuses = String(query.status).split(',').map((s) => s.trim().toUpperCase()).filter((s) => POSITION_STATUSES.includes(s));
@@ -324,7 +333,7 @@ export async function listPositions(db, companyId, query = {}) {
     // The StatStrip's numbers, computed over the SAME filtered set the list
     // shows, so they can never disagree with the rows underneath.
     totals: {
-      sanctioned: items.reduce((n, p) => n + p.sanctionedHeadcount, 0),
+      sanctioned: items.reduce((n, p) => n + p.seats, 0),
       filled: items.reduce((n, p) => n + p.filledCount, 0),
       vacant: items.reduce((n, p) => n + p.vacancyCount, 0),
       overFilled: items.filter((p) => p.overFilled).length,
@@ -334,7 +343,7 @@ export async function listPositions(db, companyId, query = {}) {
 
 export async function getPosition(db, companyId, id, query = {}) {
   const on = dateText(query.on) || today();
-  const [[row]] = await db.query(`${POSITION_SELECT} WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`, [on, on, companyId, id]);
+  const [[row]] = await db.query(`${POSITION_SELECT} WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`, [on, on, on, on, on, on, companyId, id]);
   if (!row) throw notFound('Position');
   return { asOf: on, position: shapePosition(row) };
 }

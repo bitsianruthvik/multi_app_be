@@ -39,6 +39,7 @@
  */
 import { notFound, invalid } from '../lib/errors.js';
 import { dateText, today, LIVE_ON, requirePosition, listPositionOverrides } from './positionService.js';
+import { effectiveSeats, shiftPattern as seatShiftPattern } from './seatCount.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
 
@@ -49,8 +50,6 @@ import { getRoleContent } from './roleContentService.js';
  * off the CODE rather than the clock, because that is what the import wrote and
  * what the source chart meant by "DN".
  */
-const isDayShift = (code) => String(code ?? '').trim().toUpperCase().startsWith('D');
-const isNightShift = (code) => String(code ?? '').trim().toUpperCase().startsWith('N');
 
 const num = (v) => (v == null ? 0 : Number(v));
 
@@ -369,17 +368,13 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       workContextId: r.work_context_id ?? null,
       requiredCount: num(r.required_count),
     }));
-    const hasDay = requirements.some((r) => isDayShift(r.shiftCode));
-    const hasNight = requirements.some((r) => isNightShift(r.shiftCode));
-    // Derived, never stored. See the header.
-    const shiftPattern = hasDay && hasNight ? 'DN' : (p.shift_code || 'G');
-
+    // Both derived, never stored, and both come from services/seatCount.js —
+    // the ONE implementation. This arithmetic used to be written out here, again
+    // in positionService and a third time in routes/overview.js, and the copies
+    // drifted: the chart said 156 vacant while the Positions screen said 101.
+    const shiftPattern = seatShiftPattern(p.shift_code, requirements);
     const sanctionedHeadcount = num(p.sanctioned_headcount);
-    // A DN position's strength is the sum of its per-shift requirement rows;
-    // `sanctioned_headcount` still means ONE SEAT, per shift.
-    const effectiveSanctioned = shiftPattern === 'DN'
-      ? requirements.reduce((t, r) => t + r.requiredCount, 0)
-      : sanctionedHeadcount;
+    const effectiveSanctioned = effectiveSeats(sanctionedHeadcount, requirements);
 
     const occupants = (occupantsByPosition.get(p.id) ?? []).map((o) => {
       const attendance = attendanceByEmployee.get(o.employee_id) ?? null;
@@ -642,9 +637,8 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     shiftName: r.shift_name ?? null,
     requiredCount: num(r.required_count),
   }));
-  const hasDay = requirements.some((r) => isDayShift(r.shiftCode));
-  const hasNight = requirements.some((r) => isNightShift(r.shiftCode));
-  const shiftPattern = hasDay && hasNight ? 'DN' : (head.shift_code || 'G');
+  // seatCount.js is the one definition — see the note at the other call site.
+  const shiftPattern = seatShiftPattern(head.shift_code, requirements);
   const sanctionedHeadcount = num(head.sanctioned_headcount);
   const effectiveSanctioned = shiftPattern === 'DN'
     ? requirements.reduce((t, r) => t + r.requiredCount, 0)
