@@ -1949,5 +1949,131 @@
         ]
       }
     }
+  },
+  "cfErpDrawing": {
+    "table": "cf_drawings",
+    "alias": "cdw",
+    "writeFields": [],
+    "fields": {
+      "id": "cdw.id",
+      "companyId": "cdw.company_id",
+      "code": "cdw.code",
+      "number": "cdw.number",
+      "revision": "cdw.revision",
+      "title": "cdw.title",
+      "source": "cdw.source",
+      "url": "cdw.url",
+      "status": "cdw.status",
+      "issuedOn": "cdw.issued_on",
+      "notes": "cdw.notes",
+      "rootId": "cdw.root_id",
+      "supersedesId": "cdw.supersedes_id",
+      "createdAt": "cdw.created_at",
+      "updatedAt": "cdw.updated_at",
+      "createdBy": "cdw.created_by",
+      "rootCode": "cdw_r.code",
+      "rootRevision": "cdw_r.revision"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "code": "string",
+      "number": "string",
+      "revision": "string",
+      "title": "string",
+      "source": "string",
+      "url": "string",
+      "status": "string",
+      "issuedOn": "date",
+      "notes": "text",
+      "rootId": "integer",
+      "supersedesId": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "rootCode": "string",
+      "rootRevision": "string"
+    },
+    "relations": {
+      "root": {
+        "table": "cf_drawings",
+        "alias": "cdw_r",
+        "on": "cdw.root_id = cdw_r.id",
+        "fields": [
+          "rootCode",
+          "rootRevision"
+        ]
+      }
+    }
+  },
+  "cfErpDrawingLink": {
+    "table": "cf_drawing_links",
+    "alias": "cdl",
+    "writeFields": [],
+    "fields": {
+      "id": "cdl.id",
+      "companyId": "cdl.company_id",
+      "drawingId": "cdl.drawing_id",
+      "subjectType": "cdl.subject_type",
+      "subjectId": "cdl.subject_id",
+      "note": "cdl.note",
+      "createdAt": "cdl.created_at",
+      "updatedAt": "cdl.updated_at",
+      "createdBy": "cdl.created_by",
+      "drawingCode": "cdw_l.code",
+      "drawingNumber": "cdw_l.number",
+      "drawingRevision": "cdw_l.revision",
+      "drawingStatus": "cdw_l.status",
+      "drawingSource": "cdw_l.source",
+      "drawingTitle": "cdw_l.title",
+      "recordCode": "cmr_dl.code",
+      "recordName": "cmr_dl.name",
+      "recordStatus": "cmr_dl.status"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "drawingId": "integer",
+      "subjectType": "string",
+      "subjectId": "integer",
+      "note": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "drawingCode": "string",
+      "drawingNumber": "string",
+      "drawingRevision": "string",
+      "drawingStatus": "string",
+      "drawingSource": "string",
+      "drawingTitle": "string",
+      "recordCode": "string",
+      "recordName": "string",
+      "recordStatus": "string"
+    },
+    "relations": {
+      "drawing": {
+        "table": "cf_drawings",
+        "alias": "cdw_l",
+        "on": "cdl.drawing_id = cdw_l.id",
+        "fields": [
+          "drawingCode",
+          "drawingNumber",
+          "drawingRevision",
+          "drawingStatus",
+          "drawingSource",
+          "drawingTitle"
+        ]
+      },
+      "record": {
+        "table": "cf_master_records",
+        "alias": "cmr_dl",
+        "on": "cdl.subject_id = cmr_dl.id",
+        "fields": [
+          "recordCode",
+          "recordName",
+          "recordStatus"
+        ]
+      }
+    }
   }
 }

@@ -388,6 +388,36 @@ const core = {
       item: { table: 'cf_master_records', alias: 'cmr_pl', on: 'cpol.item_id = cmr_pl.id', fields: [['itemCode', 'code', 'string'], ['itemName', 'name', 'string']] },
     },
   }),
+
+  // Drawings are read-only through the generic path. A revision is a NEW ROW
+  // whose links are copied from the one it supersedes, so a generic UPDATE of
+  // `revision` or `status` would silently rewrite what a piece was built to —
+  // exactly the history these rows exist to hold. routes/drawings.js only.
+  cfErpDrawing: resource({
+    table: 'cf_drawings', alias: 'cdw',
+    cols: [['code', 'string'], ['number', 'string'], ['revision', 'string'], ['title', 'string'], ['source', 'string'],
+           ['url', 'string'], ['status', 'string'], ['issued_on', 'date'], ['notes', 'text'],
+           ['root_id', 'integer'], ['supersedes_id', 'integer']],
+    write: [],
+    relations: {
+      root: { table: 'cf_drawings', alias: 'cdw_r', on: 'cdw.root_id = cdw_r.id',
+        fields: [['rootCode', 'code', 'string'], ['rootRevision', 'revision', 'string']] },
+    },
+  }),
+  cfErpDrawingLink: resource({
+    table: 'cf_drawing_links', alias: 'cdl',
+    cols: [['drawing_id', 'integer'], ['subject_type', 'string'], ['subject_id', 'integer'], ['note', 'string']],
+    write: [],
+    relations: {
+      drawing: { table: 'cf_drawings', alias: 'cdw_l', on: 'cdl.drawing_id = cdw_l.id',
+        fields: [['drawingCode', 'code', 'string'], ['drawingNumber', 'number', 'string'],
+                 ['drawingRevision', 'revision', 'string'], ['drawingStatus', 'status', 'string'],
+                 ['drawingSource', 'source', 'string'], ['drawingTitle', 'title', 'string']] },
+      // Only subject_type 'master_record' exists, so the join is unambiguous today.
+      record: { table: 'cf_master_records', alias: 'cmr_dl', on: 'cdl.subject_id = cmr_dl.id',
+        fields: [['recordCode', 'code', 'string'], ['recordName', 'name', 'string'], ['recordStatus', 'status', 'string']] },
+    },
+  }),
 };
 
 // The parties module — people edit parties through its own routes (roles are

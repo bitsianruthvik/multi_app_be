@@ -1970,3 +1970,143 @@ SET @sql = IF(@idx = 0,
   'ALTER TABLE cf_operation_flow_steps ADD UNIQUE KEY uq_cofs_operation_seq (company_id, flow_id, operation_id, sequence, is_live)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ===== 20. DRAWINGS — the paper the job is built to ==========================
+-- A fabrication job has drawings at every level: a general arrangement for the
+-- span, an elevation for a girder line, a shop drawing for a segment, a part
+-- detail, a nesting layout for a cut plate. Three facts about them decide the
+-- whole shape of these two tables.
+--
+-- 1. ONE DRAWING COVERS MANY NODES. A GA covers the span and everything under
+--    it; one shop drawing often covers six identical segments. So a drawing
+--    cannot be a column on a node — it is its own record, joined to the nodes
+--    it covers by cf_drawing_links.
+--
+-- 2. A DRAWING IS NOT A MASTER RECORD. cf_master_records.record_kind is
+--    ENUM('item','definition'), and every one of the ~77 places that branch on
+--    it is written `=== 'item'` with the else treating the row as a definition.
+--    A third value would make a drawing read as a definition in every one of
+--    those else branches — silently. The code generator does not require being
+--    a master record either: machine, sales_order, stock_batch, purchase_order
+--    and stock_lot are all registered entities and none of them is one.
+--
+-- 3. THERE IS NO FILE STORAGE IN THIS STACK, and choosing one is a separate
+--    decision. So this is a REFERENCE — number, revision, and optionally a URL
+--    where the file happens to live — never a file and never an upload.
+--
+-- ONE ROW PER REVISION — deliberately the opposite of decision Q2.
+-- cf_master_records keeps ONE row and moves a `revision` label on it, because
+-- every BOM line, production item and stock piece points at that row and would
+-- otherwise have to be re-pointed the day Rev B arrives. A drawing link is the
+-- exact opposite case: it exists to say WHICH revision a node was built to. If
+-- the row carried a moving label, the answer to "which revision was this made
+-- to?" would change retroactively every time a new sheet arrived — which is
+-- the one question this whole app exists to answer. So a revision is a NEW
+-- ROW, and a link always points at a specific revision.
+--
+-- The revision history is walked two ways, neither of them recursive:
+--   root_id       every revision of one drawing shares it (the first row points
+--                 at itself), so the whole history is ONE indexed read — this
+--                 runs on TiDB, where a per-row round trip costs ~49 ms.
+--   supersedes_id the row this one replaced, so the chain's order is a fact and
+--                 not an assumption about ids. Unique while live: a revision
+--                 can be superseded once, so the chain cannot fork.
+--
+-- `number` is the number as the ISSUER writes it — the KEPL BOQ arrived as
+-- P103-VDB-WK-DD-MJB-200+003-401, which is the customer's numbering and obeys
+-- none of our rules. `code` is OUR handle for the row, from the code generator
+-- like every other code in this app (services/codegenProvider.js, entity
+-- `drawing`). Two different things, two columns; `source` says whose numbering
+-- `number` is in, and is part of its uniqueness because a customer and the shop
+-- may each hold a sheet called "401".
+
+CREATE TABLE IF NOT EXISTS cf_drawings (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  code           VARCHAR(100)  NULL,            -- ours, generated; NULL only between INSERT and the generator
+  number         VARCHAR(150)  NOT NULL,        -- the issuer's, exactly as written
+  revision       VARCHAR(20)   NOT NULL DEFAULT 'A',
+  title          VARCHAR(255)  NULL,
+  source         ENUM('customer','shop') NOT NULL DEFAULT 'shop',
+  url            VARCHAR(1000) NULL,            -- where the file happens to live; no file is stored here
+  status         ENUM('draft','issued','superseded','withdrawn') NOT NULL DEFAULT 'draft',
+  issued_on      DATE          NULL,            -- so "what was current in August" is answerable
+  notes          TEXT          NULL,
+
+  root_id        INT           NULL,            -- the first revision; self on that first row
+  supersedes_id  INT           NULL,            -- the revision this one replaced
+
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+
+  code_active    VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+  number_active  VARCHAR(150)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(number), NULL)) VIRTUAL,
+  is_live        TINYINT       GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cdw_tenant     (company_id, id),
+  UNIQUE KEY uq_cdw_code       (company_id, code_active),
+  -- One row per issuer's number AND revision: "P103-…-401 Rev 3 from the
+  -- customer" is one sheet and cannot be entered twice.
+  UNIQUE KEY uq_cdw_number     (company_id, source, number_active, revision),
+  UNIQUE KEY uq_cdw_supersedes (company_id, supersedes_id, is_live),
+  KEY idx_cdw_root   (company_id, root_id),
+  KEY idx_cdw_status (company_id, status),
+
+  CONSTRAINT fk_cdw_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cdw_root       FOREIGN KEY (company_id, root_id)       REFERENCES cf_drawings(company_id, id),
+  CONSTRAINT fk_cdw_supersedes FOREIGN KEY (company_id, supersedes_id) REFERENCES cf_drawings(company_id, id),
+  CONSTRAINT fk_cdw_creator    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+
+-- ----- 20a. Drawing links — what a drawing covers ---------------------------
+-- The join that lets one drawing cover many nodes and one node carry many
+-- drawings (a segment has a GA above it, its own shop drawing, and a nesting
+-- layout for the plate it is cut from).
+--
+-- `subject_type` is an ENUM so it can grow — a drawing will eventually hang off
+-- a sales order, an order line, a nest or a stock piece. Only 'master_record'
+-- is implemented, because every level of a custom BOM already IS a master
+-- record: the span, the girder line, the segment, the part and the cut plate
+-- are all temporary items. Adding a value later is additive; nothing branches
+-- on this column as "master_record or else".
+--
+-- Polymorphic, so no foreign key on subject_id (the same rule cf_spec_values
+-- and cf_spec_assignments live by) — the service checks the subject exists in
+-- this company before it writes.
+--
+-- A LINK IS NEVER MOVED. When a drawing is revised, its live links are COPIED
+-- onto the new revision's row and the old ones are left exactly where they are.
+-- Re-pointing them would answer "what covers this segment now?" correctly and
+-- destroy "what was it built to in August?" — and the second question is the
+-- one the traceability exists for. Leaving them and copying nothing would do
+-- the reverse. Copying forward answers both: the old links stay true of a row
+-- that is now `superseded`, and the new row carries the live coverage.
+
+CREATE TABLE IF NOT EXISTS cf_drawing_links (
+  id           INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT        NOT NULL,
+  drawing_id   INT        NOT NULL,             -- a specific REVISION, never "the drawing"
+  subject_type ENUM('master_record') NOT NULL DEFAULT 'master_record',
+  subject_id   INT        NOT NULL,
+  note         VARCHAR(255) NULL,               -- "sheet 3 of 7", "sections B-B and C-C"
+
+  deleted_at   DATETIME   DEFAULT NULL,
+  created_at   TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT        NULL,
+
+  is_live      TINYINT    GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cdl_tenant (company_id, id),
+  UNIQUE KEY uq_cdl_pair   (company_id, drawing_id, subject_type, subject_id, is_live),
+  KEY idx_cdl_subject (company_id, subject_type, subject_id),
+  KEY idx_cdl_drawing (company_id, drawing_id),
+
+  CONSTRAINT fk_cdl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cdl_drawing FOREIGN KEY (company_id, drawing_id) REFERENCES cf_drawings(company_id, id),
+  CONSTRAINT fk_cdl_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);

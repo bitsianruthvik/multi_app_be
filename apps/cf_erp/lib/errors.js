@@ -54,6 +54,10 @@ const UNIQUE_MESSAGES = {
   uq_csar_code: 'A stocking area with that code already exists.',
   uq_csb_code: 'That batch code is already used.',
   uq_csm_code: 'That document number is already used.',
+  uq_cdw_code: 'That drawing code is already in use.',
+  uq_cdw_number: 'That drawing number is already recorded at that revision.',
+  uq_cdw_supersedes: 'That revision has already been superseded — revise the latest one instead.',
+  uq_cdl_pair: 'That drawing revision is already on this record.',
 };
 
 /**

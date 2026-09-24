@@ -703,3 +703,86 @@ registerEntity('stock_lot', {
     return lotContext(db, companyId, draft ?? {});
   },
 });
+
+
+// ---- Drawings ------------------------------------------------------------------
+// A drawing is not a master record (cf_master_records.record_kind is
+// ENUM('item','definition') and ~77 places read the else branch as "definition"),
+// but it takes part in the generator exactly like machines, sales orders and
+// stock lots do — none of which is a master record either.
+//
+// The number a person reads on the sheet is the ISSUER's (`drawing.number`,
+// which for the KEPL job is P103-VDB-WK-DD-MJB-200+003-401). The code the
+// generator makes is OURS. `root.code` is the code of the drawing's first
+// revision, so a rule can tie the revisions of one drawing together —
+// {root.code}/{drawing.revision} gives SHP-0001/A, SHP-0001/B — while
+// {source.code}-{#0000} gives each row an independent number.
+const DRAWING_SOURCES = ['customer', 'shop'];
+const DRAWING_SOURCE_LABEL = { customer: 'CUS', shop: 'SHP' };
+
+const DRAWING_TOKENS = [
+  { key: 'drawing.number', label: "The issuer's drawing number, as written", available: true },
+  { key: 'drawing.revision', label: 'Revision of this sheet', available: true },
+  { key: 'drawing.title', label: 'Drawing title', available: true },
+  { key: 'source.code', label: 'Whose numbering — CUS customer, SHP shop', available: true },
+  { key: 'root.code', label: 'Code of this drawing\'s first revision (empty on that first one)', available: true },
+];
+const DRAWING_CONDITIONS = [
+  { key: 'source', label: 'Where the drawing comes from', operators: ['eq', 'in'], valueKind: 'enum', values: ['customer', 'shop'] },
+];
+
+async function drawingContext(db, companyId, { number, revision, title, source, rootId, selfId }) {
+  let rootCode = null;
+  if (rootId && rootId !== selfId) {
+    const [[r]] = await db.query('SELECT code FROM cf_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(rootId)]);
+    rootCode = r?.code ?? null;
+  }
+  const from = DRAWING_SOURCES.includes(source) ? source : 'shop';
+  return {
+    get(key) {
+      switch (key) {
+        case 'drawing.number': return number ?? null;
+        case 'drawing.revision': return revision ?? null;
+        case 'drawing.title': return title ?? null;
+        case 'source.code': return DRAWING_SOURCE_LABEL[from] ?? null;
+        case 'root.code': return rootCode;
+        default: return null;
+      }
+    },
+    test(cond) {
+      if (cond.token_key !== 'source') return { ok: false, weight: 0 };
+      const values = cond.operator === 'in' ? cond.value.split(',').map((s) => s.trim()) : [cond.value.trim()];
+      return { ok: values.includes(from), weight: 1 };
+    },
+  };
+}
+
+registerEntity('drawing', {
+  label: 'Drawings',
+  tokens: DRAWING_TOKENS,
+  tokenPatterns: [],
+  conditionTokens: DRAWING_CONDITIONS,
+  async validateToken(db, companyId, key) {
+    return DRAWING_TOKENS.some((t) => t.key === key) ? null : `"${key}" is not a value drawings can insert.`;
+  },
+  async validateCondition(db, companyId, cond) {
+    if (cond.token_key !== 'source') return 'Drawings are told apart by where they come from.';
+    const values = cond.operator === 'in' ? cond.value.split(',').map((s) => s.trim()).filter(Boolean) : [cond.value.trim()];
+    const bad = values.filter((v) => !DRAWING_SOURCES.includes(v));
+    return bad.length ? 'A drawing comes from the customer or from the shop.' : null;
+  },
+  async loadContext(db, companyId, entityId) {
+    const [[d]] = await db.query(
+      'SELECT id, number, revision, title, source, root_id FROM cf_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL',
+      [companyId, entityId],
+    );
+    if (!d) { const err = new Error('Drawing not found.'); err.status = 404; throw err; }
+    return drawingContext(db, companyId, { number: d.number, revision: d.revision, title: d.title, source: d.source, rootId: d.root_id, selfId: d.id });
+  },
+  async draftContext(db, companyId, draft) {
+    return drawingContext(db, companyId, {
+      number: draft.number ?? null, revision: draft.revision ?? 'A', title: draft.title ?? null,
+      source: draft.source ?? 'shop', rootId: draft.rootId ?? null, selfId: null,
+    });
+  },
+});

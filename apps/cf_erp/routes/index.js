@@ -13,6 +13,8 @@ import overviewRoutes from './overview.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
 import processRoutes from './process.js';
+import drawingRoutes from './drawings.js';
+import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
 import { MOVEMENT_TYPES } from '../services/stockService.js';
@@ -39,6 +41,8 @@ const router = Router();
  *   - the production tracker — release writes it whole, and steps change only
  *     through start / progress / hold / resume.
  *   - specification values — every change writes its history row;
+ *   - drawings — a revision is a new row and its links are copied, never
+ *     moved, so a generic UPDATE of `revision` would rewrite history;
  *   - code sequences — only the generator moves them.
  */
 router.get('/health', (req, res) => res.json({ ok: true, app: 'cf_erp' }));
@@ -63,6 +67,9 @@ router.get('/meta', guard(PERM.view), handle(async () => ({
   batchStatuses: BATCH_STATUSES,
   movementTypes: MOVEMENT_TYPES,
   purchaseStatuses: PO_STATUSES,
+  drawingSources: DRAWING_SOURCES,
+  drawingStatuses: DRAWING_STATUSES,
+  drawingSubjectTypes: DRAWING_SUBJECT_TYPES,
 })));
 
 router.use(setupRoutes);
@@ -75,5 +82,6 @@ router.use(overviewRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
 router.use(processRoutes);
+router.use(drawingRoutes);
 
 export default router;
