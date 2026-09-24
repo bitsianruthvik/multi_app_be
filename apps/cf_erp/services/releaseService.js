@@ -27,7 +27,17 @@ import { refreshValues } from './valueService.js';
 import { temporaryTree } from './instantiationService.js';
 
 const EPS = 1e-9;
-const MAX_NODES = 5000;
+// A guard against a runaway explosion, not a statement about how big a real job
+// is. 5,000 was too low to be that: one span of the KEPL bridge is 3,036 nodes
+// and two spans ~6,072, so an ordinary order tripped it — and a tripped cap
+// silently drops the material under everything past it, which is how the same
+// bridge once asked for 18 t less steel than it contains.
+//
+// The real ceiling is not this number. Releasing a tracker this size writes tens
+// of thousands of rows one at a time, and over TiDB at ~49 ms a round trip that
+// is the constraint that will actually hurt. Batch the release writes before
+// raising this again.
+const MAX_NODES = 10000;
 const round6 = (n) => Number(Number(n).toFixed(6));
 const fmt = (n) => String(round6(n));
 const blank = (v) => v == null || String(v).trim() === '';
