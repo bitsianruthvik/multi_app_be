@@ -31,9 +31,11 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import mysql from 'mysql2/promise';
+import { resolveTarget, announce } from './dbTarget.mjs';
+
+const TARGET = resolveTarget();
 
 const SOURCE = 'C:/Users/Digital Initiatives/Downloads/Org_Chart_V12.html';
-const DB = { host: 'localhost', user: 'root', password: '1234', database: 'sqldb', port: 3306 };
 
 const args = process.argv.slice(2);
 const arg = (n, d) => (args.find((a) => a.startsWith(`--${n}=`)) || `--${n}=${d}`).split('=')[1];
@@ -107,8 +109,12 @@ function makeDb(conn, companyId) {
 
 // ------------------------------------------------------------------ main ----
 async function main() {
+  announce(TARGET);
+  if (WIPE && TARGET.isProd) {
+    throw new Error("--wipe is refused against production. Deleting a live tenant's rows is not something a convenience flag should do; write a deliberate script if you really mean it.");
+  }
   const { seed, hash, size } = readSeed();
-  const conn = await mysql.createConnection(DB);
+  const conn = await mysql.createConnection(TARGET.cfg);
   await conn.query('SET SESSION sql_mode = ""');
 
   const [[company]] = await conn.query('SELECT id, name FROM companies WHERE slug = ? AND deleted_at IS NULL', [COMPANY_SLUG]);

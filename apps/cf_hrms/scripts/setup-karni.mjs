@@ -8,23 +8,27 @@
  * for companies that already have the app row, so the order here matters:
  * company -> app -> role -> user -> seed.
  *
- * LOCAL DEVELOPMENT ONLY. It writes a known test password.
+ * Writes a known test password, so think before pointing it at production.
+ * Local by default; --target=prod writes to TiDB.
  *
  *   node setup-karni.mjs
  */
 import path from 'path';
 import { createRequire } from 'module';
 import mysql from 'mysql2/promise';
+import { resolveTarget, announce } from './dbTarget.mjs';
+
+const TARGET = resolveTarget();
 
 const require = createRequire(import.meta.url);
 const bcrypt = require(path.join(process.cwd(), 'node_modules', 'bcryptjs'));
 
-const DB = { host: 'localhost', user: 'root', password: '1234', database: 'sqldb', port: 3306 };
 const COMPANY = { name: 'Karni Packaging Pvt. Ltd.', slug: 'karni' };
 const USER = { name: 'Karni Test', email: 'test@karni.com', password: 'Test@1234' };
 
 async function main() {
-  const conn = await mysql.createConnection(DB);
+  announce(TARGET);
+  const conn = await mysql.createConnection(TARGET.cfg);
   const one = async (sql, p = []) => (await conn.execute(sql, p))[0][0] ?? null;
 
   // 1. Company
