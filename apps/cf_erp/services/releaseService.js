@@ -309,8 +309,17 @@ async function buildPlan(db, companyId, line) {
   if (root.made) expand(root, null, 0, qty);
   else if (line.order_type === 'stock') problems.push(`${nameOf(root)} has no flow — say how it is made, because a stock order is what makes it.`);
   else reqs.push({ nodeK: null, itemId: root.id, bomLineId: null, quantity: round6(qty), design: root });
-  if (nodes.length > MAX_NODES) problems.push(`The tracker would have more than ${MAX_NODES} nodes — release a smaller line.`);
-  return { problems, tree, flows, nodes, reqs };
+  // Hitting the cap stops `expand` mid-tree, so everything past it was never
+  // walked and its material was never asked for. The counts that survive are
+  // not a smaller answer, they are a WRONG one — this bridge came out 18 t of
+  // steel short and said nothing. Release refuses either way, but releaseCheck
+  // shows these figures on screen, so they have to arrive labelled.
+  const truncated = nodes.length > MAX_NODES;
+  if (truncated) {
+    problems.push(`The tracker would have more than ${MAX_NODES} nodes — release a smaller line.`);
+    problems.push('Because of that, the piece and material figures below are incomplete — the rest of the structure was never worked out. Do not order from them.');
+  }
+  return { problems, tree, flows, nodes, reqs, truncated };
 }
 
 /** "P001-G01-1", or "P001-G01-WEB01 ×1 for P001-G01-1" for grouped parts. */
@@ -529,6 +538,7 @@ export async function releaseCheck(db, companyId, lineId) {
       waits: (plan.deps ?? []).filter((d) => d.origin !== 'flow').length,
       requirements: (plan.reqs ?? []).length,
     },
+    truncated: !!plan.truncated,
     materials: await materialSummary(db, companyId, plan.reqs ?? []),
   };
 }
