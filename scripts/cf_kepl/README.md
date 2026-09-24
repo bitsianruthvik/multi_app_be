@@ -21,11 +21,15 @@ node scripts/cf_kepl/cf_rm_import.mjs        # 1,425 raw materials, ~15,000 spec
 node scripts/cf_kepl/cf_bridge_setup.mjs     # classification, specs, formulas, rules, coding rules
 node scripts/cf_kepl/cf_bridge_catalog.mjs   # 38 catalog items and their Standard BOMs
 node scripts/cf_kepl/cf_bridge_order.mjs     # definitions, customer, sales order, resolved structure
+node scripts/cf_kepl/cf_shop_import.mjs      # the shop floor: 16 machine types, 19 machines
+node scripts/cf_kepl/cf_ops_import.mjs       # 14 operations, 5 flows of 43 steps, 14 machine rules
 ```
 
 Order matters: `cf_bridge_setup` needs the `PLATE_WEIGHT` and `SECTION_WEIGHT` formulas that
-`cf_rm_import` creates, and fails with a clear message if they are absent. Each script takes
-`--verify-only` to check without writing.
+`cf_rm_import` creates, and fails with a clear message if they are absent. `cf_ops_import`
+needs the machine types `cf_shop_import` builds — without them the operations and flows still
+land and the machine rules are listed as waiting, so it is safe to run early and run again.
+Every script except `cf_ops_import` takes `--verify-only` to check without writing.
 
 To seed production, use `TM/seed-cf-prod-data.sh`, which sets the tenant and points the
 app's pool at TiDB.
@@ -40,6 +44,8 @@ app's pool at TiDB.
 | `cf_bridge_catalog.mjs` | the catalog items and their Standard BOMs |
 | `cf_bridge_order.mjs` | the selection and template definitions, the customer, the order, and the 20 segment resolutions |
 | `cf_rm_import.mjs` + `fab_rm_extract.tsv` | the raw materials, imported from a read-only extract of `fab_erp` production |
+| `cf_shop_import.mjs` + `fab_shop_extract.tsv` | the shop floor, from the same kind of extract: a `Machines` family, 8 subfamilies grouped by what the machine does to the steel, 16 machine types and the 19 machines on them — 11 types and 14 machines from the extract, plus 5 decided in the script (`EDGEMILL`, `METALIZE` and three QC stations) because the flows use operations StartHub had no machine for. Machine codes are minted by coding rule `CFMC-ANY`, never carried over |
+| `cf_ops_import.mjs` + `fab_ops_extract.tsv` + `fab_flows_extract.tsv` | the work itself: 14 operations and the 5 real flows, all 43 fab steps at their own sequence. A flow may run one operation several times — `LINESEG-FAB` welds, crane-turns the girder and welds again — so a step is keyed by (operation, sequence), never by operation alone. A step's resource type becomes a rule on the OPERATION in `cf_operation_machine_rules`, eligibility only; the fab time formulas need specifications CF does not have yet and are parked in each operation's description. The fab resource-type names are not the shop's machine-type names, so the mapping is decided in `MACHINE_TYPE_ALIASES` / `OPERATION_MACHINE_TYPE` and anything unmatched is reported, never guessed |
 
 ## Why this dataset is worth keeping
 

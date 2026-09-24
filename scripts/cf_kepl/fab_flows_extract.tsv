@@ -1,0 +1,48 @@
+flow_name	seq_no	op_code	op_name	resource_type
+Cutting Flow	1	Cut	Marking and Cutting	CNC Plate Cutting
+Line Segment — Assembly, Welding & Finishing	1	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	2	ASSY	Fit-up & I/H-Beam Assembly	CNC I/H-Beam Welding
+Line Segment — Assembly, Welding & Finishing	3	TUG	Tug Weld	CNC I/H-Beam Welding
+Line Segment — Assembly, Welding & Finishing	4	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	5	SAW	SAW Welding	SAW Welding
+Line Segment — Assembly, Welding & Finishing	6	CRNTN	Crane Turn / Reposition	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	7	SAW	SAW Welding	SAW Welding
+Line Segment — Assembly, Welding & Finishing	8	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	9	ASSY	Fit-up & I/H-Beam Assembly	CNC I/H-Beam Welding
+Line Segment — Assembly, Welding & Finishing	10	WQC	Weld QC / NDT	Quality Control
+Line Segment — Assembly, Welding & Finishing	11	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	12	BLAST	Shot Blasting	Shot Blasting
+Line Segment — Assembly, Welding & Finishing	13	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	14	METAL	Metalizing	Metalizing
+Line Segment — Assembly, Welding & Finishing	15	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Line Segment — Assembly, Welding & Finishing	16	PAINT	Painting	Painting
+Line Segment — Assembly, Welding & Finishing	17	FQC	Final QC	Quality Control
+New Flow 1	1	Cut	Marking and Cutting	
+New Flow 1	2	ASSY	Fit-up & I/H-Beam Assembly	
+Part Fabrication — Drilled	2	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Part Fabrication — Drilled	3	DRILL	CNC Drilling	CNC Drilling
+Part Fabrication — Drilled	4	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Part Fabrication — Drilled	5	EDGEP	Edge / Bevel Preparation	Edge Preparation
+Part Fabrication — Drilled	6	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Part Fabrication — Drilled	7	PQC	Part QC (Dimensional)	Quality Control
+Part Fabrication — Plain (no holes)	2	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Part Fabrication — Plain (no holes)	3	EDGEP	Edge / Bevel Preparation	Edge Preparation
+Part Fabrication — Plain (no holes)	4	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+Part Fabrication — Plain (no holes)	5	PQC	Part QC (Dimensional)	Quality Control
+PEB Built-up Member — Weld & Prime	1	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	2	ASSY	Fit-up & I/H-Beam Assembly	CNC I/H-Beam Welding
+PEB Built-up Member — Weld & Prime	3	TUG	Tug Weld	CNC I/H-Beam Welding
+PEB Built-up Member — Weld & Prime	4	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	5	SAW	SAW Welding	SAW Welding
+PEB Built-up Member — Weld & Prime	6	CRNTN	Crane Turn / Reposition	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	7	SAW	SAW Welding	SAW Welding
+PEB Built-up Member — Weld & Prime	8	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	9	ASSY	Fit-up & I/H-Beam Assembly	CNC I/H-Beam Welding
+PEB Built-up Member — Weld & Prime	10	WQC	Weld QC / NDT	Quality Control
+PEB Built-up Member — Weld & Prime	11	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	12	BLAST	Shot Blasting	Shot Blasting
+PEB Built-up Member — Weld & Prime	13	CRNMV	Crane Move / Material Handling	Crane / EOT Crane
+PEB Built-up Member — Weld & Prime	14	PAINT	Painting	Painting
+PEB Built-up Member — Weld & Prime	15	FQC	Final QC	Quality Control
+Test Flow	1	ASSY	Fit-up & I/H-Beam Assembly	
+Test Flow	2	DRILL	CNC Drilling	

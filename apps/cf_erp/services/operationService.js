@@ -60,12 +60,17 @@ export async function getOperation(db, companyId, id) {
   const out = shapeOp(o);
   out.rules = await listTimingRules(db, companyId, id);
   const [flows] = await db.query(
-    `SELECT DISTINCT f.id, f.code, f.name, f.status, s.sequence
+    // A flow may run one operation more than once, so DISTINCT over a row
+    // carrying s.sequence would list the same flow once per pass. Group it:
+    // the sequence shown is where the operation FIRST comes up, and `times`
+    // says how many passes there are.
+    `SELECT f.id, f.code, f.name, f.status, MIN(s.sequence) AS sequence, COUNT(*) AS times
        FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL
-      WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL ORDER BY f.code`,
+      WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL
+      GROUP BY f.id, f.code, f.name, f.status ORDER BY f.code`,
     [companyId, id],
   );
-  out.flows = flows.map((f) => ({ id: f.id, code: f.code, name: f.name, status: f.status, sequence: f.sequence }));
+  out.flows = flows.map((f) => ({ id: f.id, code: f.code, name: f.name, status: f.status, sequence: f.sequence, times: Number(f.times) }));
   out.machines = await machinesForOperation(db, companyId, id);
   return out;
 }

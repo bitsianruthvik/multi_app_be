@@ -1,0 +1,19 @@
+code	name	time_unit	time_formula	is_subcontract
+Cut	Marking and Cutting	min	(2 * (item.length_mm + item.width_mm)) * IF(input.raw_material.thickness_mm > 0, input.raw_material.thickness_mm, item.thickness_mm) / IF(machine.speed > 0, machine.speed, 15000)	0
+DRILL	CNC Drilling	min	IF(item.num_holes > 0, item.num_holes, op.num_holes) / IF(machine.speed > 0, machine.speed, 2) * IF(input.raw_material.thickness_mm > 0, input.raw_material.thickness_mm / 16, 1)	0
+ASSY	Fit-up & I/H-Beam Assembly	min	IF(item.weld_length_m > 0, item.weld_length_m, op.weld_length) / IF(machine.speed > 0, machine.speed, 0.3333) + inputs.count * 4	0
+SAW	SAW Welding	min	IF(item.weld_length_m > 0, item.weld_length_m, op.weld_length) / IF(machine.speed > 0, machine.speed, 0.5) * IF(input.raw_material.thickness_mm > 12, input.raw_material.thickness_mm / 12, 1)	0
+BLAST	Shot Blasting	min	IF(item.surface_area_m2 > 0, item.surface_area_m2, IF(inputs.sum(surface_area_m2) > 0, inputs.sum(surface_area_m2), op.area_m2)) / IF(machine.speed > 0, machine.speed, 0.6667)	0
+METAL	Metalizing	min	IF(item.surface_area_m2 > 0, item.surface_area_m2, IF(inputs.sum(surface_area_m2) > 0, inputs.sum(surface_area_m2), op.area_m2)) / IF(machine.speed > 0, machine.speed, 0.5)	0
+PAINT	Painting	min	IF(item.surface_area_m2 > 0, item.surface_area_m2, IF(inputs.sum(surface_area_m2) > 0, inputs.sum(surface_area_m2), op.area_m2)) / IF(machine.speed > 0, machine.speed, 0.8333)	0
+CRNMV	Crane Move / Material Handling	min	IF(item.unit_weight_kg > 0, 6 + item.unit_weight_kg / IF(machine.speed > 0, machine.speed, 400), IF(inputs.sum(unit_weight_kg) > 0, 6 + inputs.sum(unit_weight_kg) / IF(machine.speed > 0, machine.speed, 400), op.move_time))	0
+CRNTN	Crane Turn / Reposition	min	IF(item.unit_weight_kg > 0, 10 + item.unit_weight_kg / 300, IF(inputs.sum(unit_weight_kg) > 0, 10 + inputs.sum(unit_weight_kg) / 300, op.turn_time))	0
+EDGEP	Edge / Bevel Preparation	min	IF(item.length_mm > 0, (2 * (item.length_mm + item.width_mm) / 1000), op.edge_length) / IF(machine.speed > 0, machine.speed, 0.5) * IF(input.raw_material.thickness_mm > 0, input.raw_material.thickness_mm / 16, 1)	0
+TUG	Tug Weld	min	IF(item.weld_length_m > 0, item.weld_length_m, op.weld_length) * 0.5 + inputs.count * 2	0
+PQC	Part QC (Dimensional)	min	IF(item.length_mm > 0, (2 * (item.length_mm + item.width_mm) / 1000) * 1.5, op.qc_time)	0
+WQC	Weld QC / NDT	min	IF(item.weld_length_m > 0, item.weld_length_m * 1.5, op.qc_time)	0
+FQC	Final QC	min	IF(item.surface_area_m2 > 0, item.surface_area_m2 * 0.8, op.qc_time)	0
+OP-0001	Line Assembly	min		0
+OP-0002	CNC Cutting	min		0
+OP-0004	Gas Cutting	min		0
+OP-0005	Trial Code	min		0

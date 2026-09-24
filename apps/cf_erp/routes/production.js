@@ -33,9 +33,16 @@
  *   POST   /flows/:id/revise             { revision? }
  *   DELETE /flows/:id
  *   POST   /flows/:id/steps              { operationId, sequence?, stepName?, notes? }
+ *                                        A flow MAY repeat an operation — welded, crane-turned,
+ *                                        welded again. The one bar is two steps of the same
+ *                                        operation at the SAME sequence number, which would
+ *                                        leave the passes unordered.
  *   PUT    /flow-steps/:id               { sequence?, stepName?, notes? }
  *   DELETE /flow-steps/:id
  *   POST   /flow-steps/:id/waits         { relation, targetDefinitionId?, targetOperationId?, requiredStatus?, notes? }
+ *                                        targetOperationId names an OPERATION, not a step. Where
+ *                                        the target's flow repeats it, requiredStatus picks the
+ *                                        pass: done = the last, started = the first.
  *   DELETE /flow-waits/:id
  *
  *   GET    /machines/:id/shifts             its weekly shift patterns

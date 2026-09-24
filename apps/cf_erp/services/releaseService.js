@@ -350,7 +350,17 @@ function planSteps(plan) {
     }
     node.groups = bySequence(node.stepKs.map((k) => steps[k]));
   }
-  const stepLabel = (s) => `${label(nodes[s.nodeK])} ${s.fs.op_name}`;
+  /** The other steps of this piece running the same operation, in flow order. */
+  const passesOf = (s) => nodes[s.nodeK].stepKs.map((k) => steps[k]).filter((x) => x.operationId === s.operationId);
+  // A flow may run one operation several times, so the operation's name alone
+  // no longer names a step on a piece. Say which pass, or use the step's own
+  // name where it was given one.
+  const stepLabel = (s) => {
+    const passes = passesOf(s);
+    if (passes.length < 2) return `${label(nodes[s.nodeK])} ${s.fs.op_name}`;
+    const which = s.stepName || `${s.fs.op_name} (pass ${passes.indexOf(s) + 1} of ${passes.length})`;
+    return `${label(nodes[s.nodeK])} ${which}`;
+  };
   for (const r of reqs) if (r.nodeK != null) r.stepK = nodes[r.nodeK].stepKs[0] ?? null;
 
   const deps = [];
@@ -362,7 +372,29 @@ function planSteps(plan) {
   }
   // Wait-For rules, resolved on the tree.
   const named = new Map();
-  const stepOn = (node, operationId) => node.stepKs.map((k) => steps[k]).find((x) => x.operationId === operationId) ?? null;
+  //
+  // A wait rule names an OPERATION, not a step: the target is a relative node
+  // (its parent, its children …) whose flow is not known when the rule is
+  // written, and a step id means nothing outside its own flow. Since
+  // 2026-09-24 a flow may run one operation more than once — weld, crane-turn,
+  // weld — so "at SAW Welding" has to say WHICH pass. It is read off the
+  // status the rule already carries, because that is what the words mean:
+  //
+  //   done    -> the LAST pass.  "Finished welding" is not true while another
+  //                              weld pass is still to come.
+  //   started -> the FIRST pass. "Started welding" is true as soon as the
+  //                              first pass begins.
+  //
+  // Each is the safe end of its range: the strictest instant for `done`, the
+  // earliest for `started`. waitText() in flowService.js prints the same
+  // choice in the sentence the flow screen and the tracker show.
+  const occurrenceFor = (requiredStatus) => (requiredStatus === 'started' ? 'first' : 'last');
+  const stepOn = (node, operationId, requiredStatus) => {
+    // stepKs is in flow order (sequence, then id), so passes is too.
+    const passes = node.stepKs.map((k) => steps[k]).filter((x) => x.operationId === operationId);
+    if (!passes.length) return null;
+    return occurrenceFor(requiredStatus) === 'first' ? passes[0] : passes[passes.length - 1];
+  };
   for (const s of steps) {
     const node = nodes[s.nodeK];
     for (const w of s.fs.waits) {
@@ -381,7 +413,7 @@ function planSteps(plan) {
       const hits = [];
       for (const t of targets) {
         if (w.target_operation_id) {
-          const ts = stepOn(t, w.target_operation_id);
+          const ts = stepOn(t, w.target_operation_id, w.required_status);
           if (!ts) {
             if (!plural) problems.push(`${stepLabel(s)} waits for ${label(t)} to ${w.required_status === 'started' ? 'start' : 'finish'} ${w.op_name} (${w.op_code}), but flow ${flows.get(t.flowId)?.code} has no ${w.op_code}.`);
             continue;
@@ -804,6 +836,24 @@ function evaluate(data) {
   const reqsByStep = groupBy(reqs.filter((q) => q.step_id), 'step_id');
   const depsByStep = groupBy(deps, 'step_id');
 
+  // A flow may run the same operation more than once (weld, crane-turn, weld),
+  // so on a piece that repeats one, "SAW Welding" no longer names a single
+  // step and the work queue would show the passes as two identical rows. Name
+  // the pass — or use the step's own name, where somebody gave it one. Nothing
+  // changes for the ordinary piece that does each operation once.
+  for (const it of items) {
+    const ss = own(it.id);   // already in flow order: sequence, then id
+    const total = new Map();
+    for (const s of ss) total.set(s.operation_id, (total.get(s.operation_id) ?? 0) + 1);
+    const seen = new Map();
+    for (const s of ss) {
+      const n = (seen.get(s.operation_id) ?? 0) + 1;
+      seen.set(s.operation_id, n);
+      const of = total.get(s.operation_id) ?? 1;
+      s._opLabel = of < 2 ? s.op_name : (s.step_name || `${s.op_name} (pass ${n} of ${of})`);
+    }
+  }
+
   // A step works on its whole quantity at once (E2, answered 2026-09-23: "if I
   // say x pieces are required for that step, then all x need to come before
   // the step"). What runs on its own is each PIECE: one girder's fit-up waits
@@ -819,8 +869,8 @@ function evaluate(data) {
         met = d.required === 'started' ? started(t) : t.state === 'done';
         const verb = d.required === 'started' ? 'start' : 'finish';
         text = t.production_item_id === s.production_item_id
-          ? `${t.op_name} (${t.op_code}) to ${verb} first`
-          : `${label(itemById.get(t.production_item_id))} to ${verb} ${t.op_name} (${t.op_code})`;
+          ? `${t._opLabel ?? t.op_name} (${t.op_code}) to ${verb} first`
+          : `${label(itemById.get(t.production_item_id))} to ${verb} ${t._opLabel ?? t.op_name} (${t.op_code})`;
       } else {
         const it = itemById.get(d.target_item_id);
         met = d.required === 'started' ? pieceStarted(it.id) : pieceComplete(it.id);
@@ -859,7 +909,7 @@ const shapeStep = (s, pieceLabel) => ({
   sequence: s.sequence,
   operation: { id: s.operation_id, code: s.op_code, name: s.op_name },
   stepName: s.step_name,
-  label: `${pieceLabel} · ${s.op_name}`,
+  label: `${pieceLabel} · ${s._opLabel ?? s.op_name}`,
   quantity: Number(s.quantity),
   qtyGood: Number(s.qty_good),
   qtyScrap: Number(s.qty_scrap),
@@ -886,7 +936,7 @@ function shapeRequirement(q, data, ev) {
     short: q._short,
     covered: q._covered,
     piece: piece ? { id: piece.id, label: piece._label } : null,
-    step: step ? { id: step.id, label: `${piece?._label ?? ''} · ${step.op_name}`, status: step._status } : null,
+    step: step ? { id: step.id, label: `${piece?._label ?? ''} · ${step._opLabel ?? step.op_name}`, status: step._status } : null,
     reservations: q._res.map((v) => ({ id: v.id, quantity: Number(v.quantity), batch: v.batch_id ? { id: v.batch_id, code: v.batch_code, status: v.batch_status } : null })),
     free: data.free.get(q.item_id)?.free ?? 0,
   };

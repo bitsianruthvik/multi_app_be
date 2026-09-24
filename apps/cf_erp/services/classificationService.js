@@ -368,7 +368,10 @@ export async function createMachineType(db, c, input = {}) {
 export async function updateMachineNode(db, c, id, input = {}) {
   await requireMachineNode(db, c.companyId, id);
   const patch = {};
-  for (const key of ['name', 'code', 'description', 'status']) if (input[key] !== undefined) patch[key] = input[key];
+  // sortOrder is included deliberately: without it the Machines screen can see
+  // its own tree but cannot order it, and shop-floor order (cut, form, weld,
+  // finish) is the order people read a machine list in — not alphabetical.
+  for (const key of ['name', 'code', 'description', 'status', 'sortOrder']) if (input[key] !== undefined) patch[key] = input[key];
   if (Object.keys(patch).length) await updateNode(db, c, id, patch);
   return { id };
 }

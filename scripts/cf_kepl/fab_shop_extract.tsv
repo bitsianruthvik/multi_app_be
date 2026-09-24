@@ -1,0 +1,15 @@
+type_name	type_code	machine_name	machine_code
+CNC Drilling Machine	RT-DRILL	CNC Drill #1	DRILL-1
+CNC Plasma Cutting	RT-PLASMA	CNC Plasma Cutter #1	PLASMA-1
+EOT Crane 10T	RT-CRANE1	EOT Crane 10T	CRANE-10T
+EOT Crane 20T	RT-CRANE2	EOT Crane 20T	CRANE-20T
+Girder Assembly Jig	RT-JIG	Girder Assembly Jig A	JIG-A
+Girder Assembly Jig	RT-JIG	Girder Assembly Jig B	JIG-B
+MIG Welding Station	RT-MIG	MIG Welding Station #1	MIG-1
+MIG Welding Station	RT-MIG	MIG Welding Station #2	MIG-2
+Painting Booth	RT-PAINT	Paint Booth #1	PAINT-1
+Plate Rolling Machine	RT-ROLL	Plate Rolling Machine #1	ROLL-1
+Press Brake	RT-BRAKE	Press Brake #1	BRAKE-1
+Shot Blasting Chamber	RT-BLAST	Shot Blasting Chamber #1	BLAST-1
+Submerged Arc Welding	RT-SAW	SAW Machine #1	SAW-1
+Submerged Arc Welding	RT-SAW	SAW Machine #2	SAW-2

@@ -2,15 +2,36 @@
  * flowService.js — operation flows, their steps and the Wait-For rules on them.
  *
  * A flow is the usual way to make something: an ordered list of operations.
- * Steps with the same sequence number may run in parallel; an operation
- * appears once per flow, so a Wait-For rule naming it means one step.
+ * Steps with the same sequence number may run in parallel, and since
+ * 2026-09-24 a flow MAY run the same operation more than once — welded one
+ * side, crane-turned, welded the other. A step is therefore identified inside
+ * its flow by its SEQUENCE, not by its operation. The only repeat forbidden is
+ * the same operation twice at ONE sequence number (uq_cofs_operation_seq),
+ * which would leave the passes unordered.
  *
  * Wait-For rules sit on the WAITING step and name a relative target — the
  * parent, the children, the siblings or the nearest ancestor of a given
- * template, at one of their operations or as a whole. They are resolved on the
- * production tracker tree when an order is released (decided 2026-09-22: "the
- * parent and child in that tree define it"); here they are only checked for
- * sense.
+ * template, at one of their operations or as a whole.
+ *
+ * A rule names an OPERATION, never a step. That is forced, not chosen: the
+ * target is a relative node whose flow is unknown when the rule is written —
+ * two children can be made by two different flows — and a step id means
+ * nothing outside its own flow. Where that operation repeats in the target's
+ * flow, the rule means:
+ *
+ *     done     the LAST pass.  "Finished welding" is not true while another
+ *                              weld pass is still to come.
+ *     started  the FIRST pass. "Started welding" is true the moment the first
+ *                              pass begins.
+ *
+ * which is no more than what the two words mean, and each is the safe end of
+ * its range — the strictest instant for `done`, the earliest for `started`.
+ * waitText() below says which pass out loud, so nobody has to infer it, and
+ * planSteps() in releaseService.js resolves it the same way.
+ *
+ * Rules are resolved on the production tracker tree when an order is released
+ * (decided 2026-09-22: "the parent and child in that tree define it"); here
+ * they are only checked for sense.
  *
  * Revision and status work like the masters': draft → active → obsolete, the
  * revision label moves on, the id never changes.
@@ -105,7 +126,14 @@ export function waitText(w) {
   const plural = w.relation === 'children' || w.relation === 'siblings';
   const started = w.required_status === 'started';
   if (w.target_operation_id) {
-    return `Waits until ${who} ${plural ? 'have' : 'has'} ${started ? 'started' : 'finished'} ${w.operation_name} (${w.operation_code}).`;
+    // Which pass, said out loud rather than left to be inferred: a flow may run
+    // one operation several times, and `done` means the last of them while
+    // `started` means the first. Only worth a clause where it can differ, so
+    // the sentence stays the same for a flow that does the operation once.
+    const pass = started
+      ? ' Where a flow does it more than once, that means the first pass.'
+      : ' Where a flow does it more than once, that means the last pass.';
+    return `Waits until ${who} ${plural ? 'have' : 'has'} ${started ? 'started' : 'finished'} ${w.operation_name} (${w.operation_code}).${pass}`;
   }
   return `Waits until ${who} ${plural ? 'are' : 'is'} ${started ? 'started' : 'complete'}.`;
 }
@@ -307,7 +335,10 @@ export async function removeStep(db, c, stepId) {
  *   relation parent | children | siblings | ancestor
  *   targetDefinitionId narrows children / siblings to those made from a template
  *     definition; for ancestor it is required (the nearest one of that kind)
- *   targetOperationId  the step to wait for; empty = the target as a whole
+ *   targetOperationId  the OPERATION to wait for; empty = the target as a whole.
+ *     It is an operation and not a step because the target's flow is not known
+ *     here. Where that flow repeats the operation, `done` waits for its last
+ *     pass and `started` for its first (see the header).
  */
 export async function addWaitRule(db, c, stepId, input = {}) {
   const step = await requireStep(db, c.companyId, stepId);

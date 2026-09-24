@@ -903,9 +903,20 @@ CREATE TABLE IF NOT EXISTS cf_operation_flows (
 -- depends_on list of sequence numbers was its most fragile part. Ordering
 -- BETWEEN items comes from the tree and the Wait-For rules.
 --
--- An operation appears at most once in a flow, so a Wait-For rule that names
--- an operation always means exactly one step. A repeat is a separate operation
--- ("Weld inspection", "Final inspection").
+-- A flow MAY run the same operation more than once (changed 2026-09-24). A
+-- plate girder is welded on one side, crane-turned, and welded on the other:
+-- two steps of ONE operation with a turn between them. Naming them SAW-1 and
+-- SAW-2 would put the sequence inside the operation's identity and break the
+-- day a job needs a third pass. Importing the real fab_erp flows under the old
+-- rule, 43 steps collapsed to 27.
+--
+-- So what identifies a step within a flow is its SEQUENCE, not its operation.
+-- uq_cofs_operation_seq keeps the repeats strictly ordered: an operation may
+-- appear many times, never twice at the SAME sequence number — steps sharing a
+-- number run in parallel, and welding one piece twice at once is not a thing.
+-- That ordering is what makes "the first pass" and "the last pass" well defined
+-- for a Wait-For rule below (see services/flowService.js for which one a rule
+-- means).
 CREATE TABLE IF NOT EXISTS cf_operation_flow_steps (
   id            INT           AUTO_INCREMENT PRIMARY KEY,
   company_id    INT           NOT NULL,
@@ -923,7 +934,7 @@ CREATE TABLE IF NOT EXISTS cf_operation_flow_steps (
   is_live       TINYINT       GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
 
   UNIQUE KEY uq_cofs_tenant    (company_id, id),
-  UNIQUE KEY uq_cofs_operation (company_id, flow_id, operation_id, is_live),
+  UNIQUE KEY uq_cofs_operation_seq (company_id, flow_id, operation_id, sequence, is_live),
   KEY idx_cofs_flow (company_id, flow_id, sequence),
   KEY idx_cofs_operation (company_id, operation_id),
 
@@ -1915,5 +1926,47 @@ SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND CONSTRAINT_NAME = 'fk_csor_process');
 SET @sql = IF(@fk = 0,
   'ALTER TABLE cf_sales_orders ADD CONSTRAINT fk_csor_process FOREIGN KEY (company_id, process_id) REFERENCES cf_processes(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ===== 19. A FLOW MAY REPEAT AN OPERATION ===================================
+-- Retrofit for databases built before 2026-09-24, kept down here rather than
+-- beside cf_operation_flow_steps (section 10c): an ALTER that sits above its
+-- own CREATE aborts the whole file on a genuinely empty schema.
+--
+-- cf_operation_flow_steps was created with
+--     UNIQUE KEY uq_cofs_operation (company_id, flow_id, operation_id, is_live)
+-- which allowed an operation to appear only ONCE in a flow. Real work does not
+-- obey that: a plate girder is welded on one side, crane-turned and welded on
+-- the other — two steps of one operation (SAW Welding) with a Crane Turn
+-- between them. Importing the real fab_erp flows, 43 steps collapsed to 27;
+-- the two-pass weld, the second fit-up stage and every repeated crane move
+-- were all refused. Calling them SAW-1 and SAW-2 would encode the sequence
+-- into the operation's identity and break on the first three-pass job.
+--
+-- It is replaced, not simply dropped. uq_cofs_operation_seq adds `sequence`,
+-- so an operation may repeat as often as the work needs but never twice at one
+-- sequence number — and since steps that share a number run in parallel, that
+-- is exactly the case where "the first pass" and "the last pass" would be
+-- arbitrary. A Wait-For rule naming an operation depends on that order being
+-- decided (services/flowService.js, services/releaseService.js).
+--
+-- Adding the new key cannot fail on existing data: the old key was strictly
+-- stronger, so no live flow has two steps of one operation at all.
+--
+-- `is_live` stays on the table. Its only remaining reader is the new key, and
+-- dropping a generated column that `SELECT s.*` still returns buys nothing.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flow_steps'
+               AND INDEX_NAME = 'uq_cofs_operation');
+SET @sql = IF(@idx > 0, 'ALTER TABLE cf_operation_flow_steps DROP INDEX uq_cofs_operation', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flow_steps'
+               AND INDEX_NAME = 'uq_cofs_operation_seq');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE cf_operation_flow_steps ADD UNIQUE KEY uq_cofs_operation_seq (company_id, flow_id, operation_id, sequence, is_live)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
