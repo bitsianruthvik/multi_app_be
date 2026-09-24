@@ -537,7 +537,12 @@ export async function listRecords(db, companyId, q = {}) {
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             sd.code AS source_definition_code, ol.line_no AS owner_line_no, so.id AS owner_order_id, so.code AS owner_order_code,
-            (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status
+            (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status,
+            -- The list shows how big a BOM is, not just that there is one, so a
+            -- user can see at a glance which records are built and which are bare.
+            (SELECT COUNT(*) FROM cf_bom_lines bl JOIN cf_boms b2 ON b2.id = bl.bom_id
+              WHERE b2.company_id = m.company_id AND b2.parent_id = m.id AND b2.deleted_at IS NULL
+                AND bl.deleted_at IS NULL) AS bom_line_count
        ${from}
       ORDER BY m.code IS NULL, m.code, m.id
       LIMIT ? OFFSET ?`,
@@ -552,6 +557,7 @@ export async function listRecords(db, companyId, q = {}) {
       classificationName: r.classification_name,
       sourceDefinitionCode: r.source_definition_code ?? null,
       bomStatus: r.bom_status ?? null,
+      bomLineCount: r.bom_status ? Number(r.bom_line_count ?? 0) : null,
       owner: r.owner_order_id ? { orderId: r.owner_order_id, orderCode: r.owner_order_code, lineNo: r.owner_line_no } : null,
     })),
   };

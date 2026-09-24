@@ -12,6 +12,7 @@ import inventoryRoutes from './inventory.js';
 import overviewRoutes from './overview.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
+import processRoutes from './process.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
 import { MOVEMENT_TYPES } from '../services/stockService.js';
@@ -73,5 +74,6 @@ router.use(inventoryRoutes);
 router.use(overviewRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
+router.use(processRoutes);
 
 export default router;

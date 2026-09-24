@@ -3,6 +3,9 @@
  *
  *   GET    /records?recordKind=&kind=&status=&classificationId=&search=&limit=&offset=
  *   POST   /records/preview            draft -> which specs apply, the code and name it would get
+ *   POST   /catalog/classification     { parentId, code, name, description?, scope?, sortOrder? }
+ *                                      a Family / Subfamily / Variant made mid-flow from the catalog
+ *                                      screens; the item side of the tree only.
  *   POST   /items                      { itemType, classificationId | sourceDefinitionId+ownerOrderLineId, name?, code?, uom?, trackedBy?, status?, revision?, values? }
  *   POST   /definitions                { definitionType, classificationId, name?, code?, selectionMode?, candidateClassificationId?, status?, values? }
  *   GET    /records/:id
@@ -35,6 +38,7 @@ import {
   getSelection, findCandidates, addAllowedItem, setDefaultAllowed, removeAllowedItem,
   addCriterion, updateCriterion, removeCriterion,
 } from '../services/selectionService.js';
+import { createCatalogNode } from '../services/classificationService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -54,6 +58,12 @@ router.post('/records/preview', guard(PERM.view), handle(async (req) => {
     conn.release();
   }
 }));
+
+// The catalog's own door into the classification tree: a catalog editor who
+// needs a Variant halfway through making an item should not have to go and ask
+// for the Setup grant. Setup › Classification keeps its own route and its own
+// guard; this one refuses machine scope and machine families outright.
+router.post('/catalog/classification', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createCatalogNode(db, c, req.body ?? {}))));
 
 router.post('/items', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createItem(db, c, req.body))));
 router.post('/definitions', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createDefinition(db, c, req.body))));

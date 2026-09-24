@@ -41,11 +41,15 @@ function detailFix(def, alias) {
 }
 
 const core = {
+  // Service-only writes, like machines. A node's depth has to be its parent's
+  // plus one, scope 'machine' belongs to a whole Family, and three separate
+  // doors (Setup, the catalog, the Machines screen) each narrow what they may
+  // make — none of which a generic INSERT knows about.
   cfErpClassificationNode: resource({
     table: 'cf_classification_nodes', alias: 'ccn',
     cols: [['parent_id', 'integer'], ['depth', 'integer'], ['scope', 'string'], ['code', 'string'], ['name', 'string'],
            ['description', 'text'], ['sort_order', 'integer'], ['status', 'string']],
-    write: ['parent_id', 'depth', 'scope', 'code', 'name', 'description', 'sort_order', 'status'],
+    write: [],
     relations: { parent: { table: 'cf_classification_nodes', alias: 'ccn_p', on: 'ccn.parent_id = ccn_p.id',
       fields: [['parentCode', 'code', 'string'], ['parentName', 'name', 'string'], ['parentDepth', 'depth', 'integer']] } },
   }),

@@ -1,0 +1,1490 @@
+{
+  "title": "Bill of Quantity For ROB 59.3M Span",
+  "arrangement": "Span 59.3M, 5 Girder Arrangement, 4 - Leaves (17 Deg Skew)",
+  "drgNo": "P103-VDB-WK-DD-MJB-200+003-401",
+  "client": "KEPL",
+  "date": "2026-07-08",
+  "densityGcm3": 7.85,
+  "girders": [
+    {
+      "sl": 1,
+      "mark": "G1-1",
+      "grossKg": 13441.23,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS1",
+          "name": "Bearing Stiffener Plain",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 1,
+          "kg": 150.47
+        },
+        {
+          "mark": "BS2",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 4,
+          "kg": 601.88
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 21,
+          "kg": 1007.2
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        }
+      ],
+      "calcKg": 13441.24,
+      "delta": 0.01
+    },
+    {
+      "sl": 2,
+      "mark": "G1-2",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 3,
+      "mark": "G1-3",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF3",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W3",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF3",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 4,
+      "mark": "G1-4",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 5,
+      "mark": "G1-5",
+      "grossKg": 13441.23,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS1",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "BS2",
+          "name": "Bearing Stiffener Plain",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 1,
+          "kg": 150.47
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 4,
+          "kg": 601.88
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 21,
+          "kg": 1007.2
+        }
+      ],
+      "calcKg": 13441.24,
+      "delta": 0.01
+    },
+    {
+      "sl": 6,
+      "mark": "G2-1",
+      "grossKg": 13485.61,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS2",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 2,
+          "kg": 315.98
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 4,
+          "kg": 631.97
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 18,
+          "kg": 863.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        }
+      ],
+      "calcKg": 13485.61,
+      "delta": 0
+    },
+    {
+      "sl": 7,
+      "mark": "G2-2",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 8,
+      "mark": "G2-3",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF3",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W3",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF3",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 9,
+      "mark": "G2-4",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 10,
+      "mark": "G2-5",
+      "grossKg": 13485.61,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS1",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 2,
+          "kg": 315.98
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 4,
+          "kg": 631.97
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 18,
+          "kg": 863.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        }
+      ],
+      "calcKg": 13485.61,
+      "delta": 0
+    },
+    {
+      "sl": 11,
+      "mark": "G3-1",
+      "grossKg": 13485.61,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS2",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 2,
+          "kg": 315.98
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 4,
+          "kg": 631.97
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 18,
+          "kg": 863.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        }
+      ],
+      "calcKg": 13485.61,
+      "delta": 0
+    },
+    {
+      "sl": 12,
+      "mark": "G3-2",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 13,
+      "mark": "G3-3",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF3",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W3",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF3",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 14,
+      "mark": "G3-4",
+      "grossKg": 12975.26,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 20,
+          "kg": 959.24
+        }
+      ],
+      "calcKg": 12975.26,
+      "delta": 0
+    },
+    {
+      "sl": 15,
+      "mark": "G3-5",
+      "grossKg": 13485.61,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS1",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 2,
+          "kg": 315.98
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 4,
+          "kg": 631.97
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 18,
+          "kg": 863.31
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 6,
+          "kg": 301.31
+        }
+      ],
+      "calcKg": 13485.61,
+      "delta": 0
+    },
+    {
+      "sl": 16,
+      "mark": "G4-1",
+      "grossKg": 13448.75,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS2",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "ES2",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 4,
+          "kg": 601.88
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 21,
+          "kg": 1007.2
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        }
+      ],
+      "calcKg": 13448.76,
+      "delta": 0.01
+    },
+    {
+      "sl": 17,
+      "mark": "G4-2",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 18,
+      "mark": "G4-3",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF3",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W3",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF3",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 19,
+      "mark": "G4-4",
+      "grossKg": 12968.49,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF2",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 12000,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1177.5
+        },
+        {
+          "mark": "W2",
+          "name": "Web",
+          "thk": 28,
+          "len": 12000,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7899.61
+        },
+        {
+          "mark": "BF2",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 12000,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2637.6
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 23,
+          "kg": 1103.12
+        }
+      ],
+      "calcKg": 12968.49,
+      "delta": 0
+    },
+    {
+      "sl": 20,
+      "mark": "G4-5",
+      "grossKg": 13448.75,
+      "qty": 1,
+      "parts": [
+        {
+          "mark": "TF1",
+          "name": "Top Flange",
+          "thk": 25,
+          "len": 11650,
+          "wid": 500,
+          "qty": 1,
+          "kg": 1143.16
+        },
+        {
+          "mark": "W1",
+          "name": "Web",
+          "thk": 28,
+          "len": 11650,
+          "wid": 2995,
+          "qty": 1,
+          "kg": 7669.21
+        },
+        {
+          "mark": "BF1",
+          "name": "Bottom Flange",
+          "thk": 40,
+          "len": 11650,
+          "wid": 700,
+          "qty": 1,
+          "kg": 2560.67
+        },
+        {
+          "mark": "BS1",
+          "name": "Bearing Stiffener Hole",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "ES1",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 210,
+          "qty": 1,
+          "kg": 157.99
+        },
+        {
+          "mark": "ES2",
+          "name": "End Stiffener",
+          "thk": 32,
+          "len": 2995,
+          "wid": 200,
+          "qty": 4,
+          "kg": 601.88
+        },
+        {
+          "mark": "IS1",
+          "name": "Intermediate Stiffener Hole",
+          "thk": 12,
+          "len": 2995,
+          "wid": 178,
+          "qty": 3,
+          "kg": 150.66
+        },
+        {
+          "mark": "IS2",
+          "name": "Intermediate Stiffener Plain",
+          "thk": 12,
+          "len": 2995,
+          "wid": 170,
+          "qty": 21,
+          "kg": 1007.2
+        }
+      ],
+      "calcKg": 13448.76,
+      "delta": 0.01
+    }
+  ],
+  "subAssemblies": [
+    {
+      "sl": 26,
+      "mark": "END-DIA",
+      "name": "End Diaphragm",
+      "qty": 6,
+      "parts": [
+        {
+          "mark": "EDTF",
+          "name": "End Diaphragm Top Flange",
+          "thk": 16,
+          "len": 200,
+          "wid": 3048,
+          "qty": 1,
+          "kg": 76.57
+        },
+        {
+          "mark": "EDW",
+          "name": "End Diaphragm Web",
+          "thk": 16,
+          "len": 1700,
+          "wid": 3048,
+          "qty": 1,
+          "kg": 650.81
+        },
+        {
+          "mark": "EDBF",
+          "name": "End Diaphragm Bottom Flange",
+          "thk": 16,
+          "len": 200,
+          "wid": 3048,
+          "qty": 1,
+          "kg": 76.57
+        },
+        {
+          "mark": "JS",
+          "name": "Jacking Stiffener",
+          "thk": 32,
+          "len": 90,
+          "wid": 1700,
+          "qty": 12,
+          "kg": 461.2
+        },
+        {
+          "mark": "PP",
+          "name": "Pad Plate",
+          "thk": 16,
+          "len": 100,
+          "wid": 180,
+          "qty": 2,
+          "kg": 4.52
+        }
+      ],
+      "unitKg": 1269.67
+    },
+    {
+      "sl": 27,
+      "mark": "INT-DIA",
+      "name": "Intermediate Diaphragm",
+      "qty": 45,
+      "parts": [
+        {
+          "mark": "IDTF",
+          "name": "Inter. Diaph. Top Flange",
+          "thk": 16,
+          "len": 200,
+          "wid": 3052,
+          "qty": 1,
+          "kg": 76.67
+        },
+        {
+          "mark": "IDW",
+          "name": "Inter. Diaph. Web1",
+          "thk": 16,
+          "len": 460,
+          "wid": 1700,
+          "qty": 2,
+          "kg": 196.44
+        },
+        {
+          "mark": "IDDW",
+          "name": "Inter. Diaph. Web2",
+          "thk": 16,
+          "len": 150,
+          "wid": 2132,
+          "qty": 2,
+          "kg": 80.33
+        },
+        {
+          "mark": "IDBF",
+          "name": "Inter. Diaph. Bottom Flange",
+          "thk": 16,
+          "len": 200,
+          "wid": 3052,
+          "qty": 1,
+          "kg": 76.67
+        },
+        {
+          "mark": "ISP",
+          "name": "Inner Side Plate",
+          "thk": 16,
+          "len": 80,
+          "wid": 1982,
+          "qty": 2,
+          "kg": 39.83
+        },
+        {
+          "mark": "IFP",
+          "name": "Inner Flange Plate",
+          "thk": 16,
+          "len": 80,
+          "wid": 1250,
+          "qty": 2,
+          "kg": 25.12
+        },
+        {
+          "mark": "ICP",
+          "name": "Inner Corner Plate",
+          "thk": 16,
+          "len": 80,
+          "wid": 106,
+          "qty": 4,
+          "kg": 4.26
+        }
+      ],
+      "unitKg": 499.32
+    },
+    {
+      "sl": 28,
+      "mark": "SPLICE",
+      "name": "Splice Set",
+      "qty": 16,
+      "parts": [
+        {
+          "mark": "WCP",
+          "name": "Web Cover Plate",
+          "thk": 25,
+          "len": 850,
+          "wid": 2700,
+          "qty": 2,
+          "kg": 900.79
+        },
+        {
+          "mark": "TFICP",
+          "name": "Top Flange Inner Cover Plate",
+          "thk": 25,
+          "len": 225,
+          "wid": 1260,
+          "qty": 2,
+          "kg": 111.27
+        },
+        {
+          "mark": "TFOCP",
+          "name": "Top Flange Outer Cover Plate",
+          "thk": 25,
+          "len": 500,
+          "wid": 1260,
+          "qty": 1,
+          "kg": 123.64
+        },
+        {
+          "mark": "BFOCP",
+          "name": "BottomFlange Outer Cover Plate",
+          "thk": 40,
+          "len": 700,
+          "wid": 2586,
+          "qty": 1,
+          "kg": 568.4
+        },
+        {
+          "mark": "BFICP",
+          "name": "Bottom Flange Inner Cover Plate",
+          "thk": 40,
+          "len": 325,
+          "wid": 2580,
+          "qty": 2,
+          "kg": 526.58
+        }
+      ],
+      "unitKg": 2230.68
+    }
+  ],
+  "studs": {
+    "mark": "STUD",
+    "name": "Shear Stud 25 DIA x 175",
+    "unitKg": 0.76,
+    "qtyPerLine": 1803,
+    "perLineKg": 1370.28,
+    "lines": 4,
+    "totalKg": 5481.12
+  },
+  "check": {
+    "girderKg": 263384.9,
+    "subKg": 65778.3,
+    "studKg": 5481.12,
+    "computedPerSpan": 334644.32,
+    "statedPerSpan": 334644,
+    "spans": 2,
+    "statedTotalMt": 669.29
+  }
+}

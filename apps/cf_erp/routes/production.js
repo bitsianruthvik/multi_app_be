@@ -10,6 +10,11 @@
  *   PUT    /machines/:id/values          { values: [{ specificationId | specCode, value }] }
  *   GET    /machines/:id/history
  *
+ *   GET    /machine-types                the machine side of the classification tree, with machine counts
+ *   POST   /machine-types                { family: {id}|{code,name}, subfamily: {id}|{code,name}, code, name, description? }
+ *   PUT    /machine-types/:id            { name?, code?, description?, status? }  — any level: Family, Subfamily or type
+ *   DELETE /machine-types/:id            — any level; refused while anything live sits below it
+ *
  *   GET    /operations?status=&search=
  *   POST   /operations                   { code, name, description?, status? }
  *   GET    /operations/:id               with its timing rules, flows and the machines that can do it
@@ -60,6 +65,9 @@ import {
 import {
   listShifts, createShift, updateShift, deleteShift, copyShifts, listExceptions, createException, deleteException, machineCalendar,
 } from '../services/shiftService.js';
+import {
+  listMachineTypes, createMachineType, updateMachineNode, deleteMachineNode,
+} from '../services/classificationService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -75,6 +83,19 @@ router.delete('/machines/:id', manage, handle((req) => tx(req, (db, c) => delete
 router.get('/machines/:id/specs', view, handle((req) => getMachineSpecs(pool, ctx(req).companyId, id(req))));
 router.put('/machines/:id/values', manage, handle((req) => tx(req, (db, c) => setMachineValues(db, c, id(req), req.body?.values ?? []))));
 router.get('/machines/:id/history', view, handle((req) => getMachineHistory(pool, ctx(req).companyId, id(req), Number(req.query.limit) || 200)));
+
+// Machine types are classification nodes, but they belong to the Machines
+// screen: somebody who may add a machine can add the type it needs without the
+// Setup grant. The service still goes through createNode / updateNode /
+// deleteNode, so the tree's own rules apply either way.
+//
+// POST makes a type (with its Family and Subfamily, if they are new). PUT and
+// DELETE take ANY level of a machine family — a screen that can make a Family
+// inline and then never rename or retire it is the same dead end one step up.
+router.get('/machine-types', view, handle((req) => listMachineTypes(pool, ctx(req).companyId)));
+router.post('/machine-types', manage, handle((req) => tx(req, (db, c) => createMachineType(db, c, req.body ?? {}))));
+router.put('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => updateMachineNode(db, c, id(req), req.body ?? {}))));
+router.delete('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => deleteMachineNode(db, c, id(req)))));
 
 router.get('/operations', view, handle((req) => listOperations(pool, ctx(req).companyId, req.query)));
 router.post('/operations', manage, handle((req) => tx(req, (db, c) => createOperation(db, c, req.body ?? {}))));

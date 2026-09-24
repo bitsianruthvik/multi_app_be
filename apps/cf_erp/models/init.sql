@@ -1801,3 +1801,119 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_master_records' AND COLUMN_NAME = 'short_name');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_master_records ADD COLUMN short_name VARCHAR(30) NULL AFTER name', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ===== 18. THE PROCESS — HOW AN ORDER IS WORKED ==============================
+-- Decided with the user 2026-09-23/24. A PROCESS is how an order is worked
+-- through the office: an ordered list of stages. It is deliberately not called
+-- a flow — a flow already means how a girder is MADE (cut, weld, paint), and
+-- the two would be confused daily.
+--
+-- What is code and what is data (fab_erp argued this out first): the KINDS of
+-- stage are code, because a stage is a screen somebody wrote and no amount of
+-- configuration conjures one nobody did. What varies — which stages a customer
+-- wants, in what order, and whether a stage applies to a particular line — is
+-- data, and lives here.
+--
+-- Stage ORDER is fixed per process (user, decision 1): you arrange the stages
+-- when you define the process, and an order follows what it was given. Order
+-- encodes real dependencies — you cannot buy a plate nobody has chosen yet.
+
+CREATE TABLE IF NOT EXISTS cf_processes (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  code         VARCHAR(50)   NOT NULL,
+  name         VARCHAR(200)  NOT NULL,
+  description  TEXT          NULL,
+  status       ENUM('draft','active','obsolete') NOT NULL DEFAULT 'draft',
+
+  deleted_at   DATETIME      DEFAULT NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT           NULL,
+
+  code_active  VARCHAR(50)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cpr_tenant (company_id, id),
+  UNIQUE KEY uq_cpr_code   (company_id, code_active),
+  KEY idx_cpr_status (company_id, status),
+
+  CONSTRAINT fk_cpr_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpr_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- The stages of one process, in the order they are worked.
+--
+-- `stage_key` names a kind from the catalogue in services/processService.js.
+-- It is NOT a foreign key: the catalogue of kinds lives in code, because each
+-- kind IS code.
+--
+-- `override_spec_id` is how a line says this stage does not apply to it (user:
+-- "have a specification on the line item that can be used for this"). The
+-- specification resolves most-specific-wins like every other, so an item's own
+-- answer beats the customer's default (decision 3) with no rule of its own.
+-- Left NULL, the stage is worked out from the data alone (decision 2).
+CREATE TABLE IF NOT EXISTS cf_process_stages (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  process_id       INT           NOT NULL,
+  stage_key        VARCHAR(30)   NOT NULL,
+  sequence         INT           NOT NULL,
+  label            VARCHAR(100)  NULL,          -- overrides the kind's own name
+  requirement      ENUM('required','optional') NOT NULL DEFAULT 'required',
+  override_spec_id INT           NULL,
+  settings         JSON          NULL,          -- what the stage's screen is configured with
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  seq_live         INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, sequence, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cps_tenant (company_id, id),
+  UNIQUE KEY uq_cps_seq    (process_id, seq_live),
+  KEY idx_cps_process (company_id, process_id, sequence),
+
+  CONSTRAINT fk_cps_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cps_process FOREIGN KEY (company_id, process_id)       REFERENCES cf_processes(company_id, id),
+  CONSTRAINT fk_cps_spec    FOREIGN KEY (company_id, override_spec_id) REFERENCES cf_specifications(company_id, id)
+);
+
+-- When a process applies. Most specific wins (decision 3): a rule naming both
+-- the customer and the order type beats one naming only the customer, which
+-- beats one naming only the type, which beats the house default (both NULL).
+CREATE TABLE IF NOT EXISTS cf_process_rules (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  process_id   INT           NOT NULL,
+  customer_id  INT           NULL,              -- NULL = any customer
+  order_type   ENUM('customer','stock') NULL,   -- NULL = any kind of order
+
+  deleted_at   DATETIME      DEFAULT NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  match_live   VARCHAR(40)   GENERATED ALWAYS AS
+    (IF(deleted_at IS NULL, CONCAT(IFNULL(customer_id, 'any'), ':', IFNULL(order_type, 'any')), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cprr_tenant (company_id, id),
+  UNIQUE KEY uq_cprr_match  (company_id, match_live),
+  KEY idx_cprr_process (company_id, process_id),
+
+  CONSTRAINT fk_cprr_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cprr_process  FOREIGN KEY (company_id, process_id)  REFERENCES cf_processes(company_id, id),
+  CONSTRAINT fk_cprr_customer FOREIGN KEY (company_id, customer_id) REFERENCES cf_parties(company_id, id)
+);
+
+-- The process an order is following. Stamped when the order is created, so
+-- changing a customer's process later does not move orders already running.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'process_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_orders ADD COLUMN process_id INT NULL AFTER order_type', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND CONSTRAINT_NAME = 'fk_csor_process');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_sales_orders ADD CONSTRAINT fk_csor_process FOREIGN KEY (company_id, process_id) REFERENCES cf_processes(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

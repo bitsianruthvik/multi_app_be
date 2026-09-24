@@ -22,6 +22,7 @@ import { refreshValues } from './valueService.js';
 import { instantiateTemplate, deleteTemporaryTree, checkTemplate, temporaryTree } from './instantiationService.js';
 import { explode } from './bomService.js';
 import { generate } from '../modules/codegen/index.js';
+import { resolveProcess } from './processService.js';
 
 export const ORDER_TYPES = ['customer', 'stock'];
 export const TRANSITIONS = {
@@ -252,12 +253,17 @@ export async function createOrder(db, c, input = {}) {
     code = g?.text ?? null;
     if (!code) throw invalid('CODE_REQUIRED', 'Type an order number, or add a coding rule for sales orders under Coding rules.');
   }
+  // The process is STAMPED here, not looked up later (init.sql §18): changing
+  // a customer's process must not move orders already running. No rule and no
+  // house default leaves it NULL — the order simply has no process, which the
+  // process endpoint says in words rather than inventing one.
+  const { processId } = await resolveProcess(db, c.companyId, { customerId, orderType });
   const [r] = await db.query(
     `INSERT INTO cf_sales_orders
-       (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, delivery_address, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, delivery_address, notes, process_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, code, orderType, body.title, customerId, body.customer_reference, FIRST_STATUS[orderType],
-      body.received_on, body.committed_date, body.delivery_address, body.notes, c.userId],
+      body.received_on, body.committed_date, body.delivery_address, body.notes, processId, c.userId],
   );
   return getOrder(db, c.companyId, r.insertId);
 }

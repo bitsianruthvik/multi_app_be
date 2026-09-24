@@ -2,16 +2,7 @@
   "cfErpClassificationNode": {
     "table": "cf_classification_nodes",
     "alias": "ccn",
-    "writeFields": [
-      "parent_id",
-      "depth",
-      "scope",
-      "code",
-      "name",
-      "description",
-      "sort_order",
-      "status"
-    ],
+    "writeFields": [],
     "fields": {
       "id": "ccn.id",
       "companyId": "ccn.company_id",

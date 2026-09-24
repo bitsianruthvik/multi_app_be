@@ -2,6 +2,12 @@
  * setup.js — the configuration side: classification, specifications and their
  * options, formulas, spec rules, and default values on classification nodes.
  *
+ * The tree has two other doors, both narrowed and each with its own grant, so
+ * that needing a new node mid-flow is not a reason to hand out the setup grant:
+ * POST /catalog/classification (records.js, catalog grant, item side only) and
+ * POST /machine-types (production.js, production grant, machine side only).
+ * These routes here stay as they are — the whole tree, the setup grant.
+ *
  *   GET    /classification                     the tree with counts
  *   GET    /classification/:id                 one node with its path
  *   GET    /classification/:id/resolved        rules and defaults reaching the node

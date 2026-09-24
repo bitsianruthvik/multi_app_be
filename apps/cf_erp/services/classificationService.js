@@ -142,12 +142,23 @@ async function hasAnythingBelow(db, companyId, id) {
   return Number(r.n) > 0;
 }
 
+/**
+ * What the level below this one is called, for a sentence a person reads. The
+ * Machines screen shows these refusals verbatim, and "1 node(s) below it" tells
+ * somebody looking at a list of machine types nothing about what is in the way.
+ */
+function childLevelWord(node, n) {
+  if (node.depth === 0) return n === 1 ? 'Subfamily' : 'Subfamilies';
+  if (isMachineScope(node)) return n === 1 ? 'machine type' : 'machine types';
+  return n === 1 ? 'Variant' : 'Variants';
+}
+
 export async function deleteNode(db, c, id) {
   const node = await requireNode(db, c.companyId, id);
   const reasons = [];
   const count = async (sql, params) => Number((await db.query(sql, params))[0][0].n);
   const children = await count('SELECT COUNT(*) AS n FROM cf_classification_nodes WHERE company_id = ? AND parent_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (children) reasons.push(`${children} node(s) below it`);
+  if (children) reasons.push(`${children} ${childLevelWord(node, children)} below it`);
   const records = await count('SELECT COUNT(*) AS n FROM cf_master_records WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   if (records) reasons.push(`${records} item(s) or definition(s) classified here`);
   const machines = await count('SELECT COUNT(*) AS n FROM cf_machines WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
@@ -199,4 +210,199 @@ export async function requireMachineType(db, companyId, id) {
   if (node.depth !== LEAF_DEPTH) throw invalid('NOT_A_MACHINE_TYPE', `${node.name} is a ${levelName(node.depth)} — a machine sits on the deepest level (its machine type).`);
   if (node.status !== 'active') throw invalid('INACTIVE', `${node.name} is inactive.`);
   return node;
+}
+
+// ---------------------------------------------------------------------------
+// The machine side of the same tree, through its own door.
+//
+// A machine type IS a classification node — the deepest level of a Family with
+// scope Machine, exactly what requireMachineType above insists on. Nothing here
+// invents a second tree or a second set of rules: every write goes through
+// createNode / updateNode / deleteNode, so depth, scope, uniqueness and the
+// in-use checks stay in one place.
+//
+// The door is the point. Setup › Classification is guarded by the setup grant
+// while the Machines screen is guarded by the production grant, so somebody who
+// may add a machine could not add the type it needs. These functions give the
+// Machines screen the narrow slice it needs — machine families only, never an
+// item Variant — without handing it the whole tree.
+// ---------------------------------------------------------------------------
+
+/** The machine tree, three levels deep, with how many machines sit on each type. */
+export async function listMachineTypes(db, companyId) {
+  const [nodes] = await db.query(
+    `SELECT n.id, n.parent_id, n.depth, n.code, n.name, n.status,
+            (SELECT COUNT(*) FROM cf_machines mc
+              WHERE mc.company_id = n.company_id AND mc.classification_id = n.id AND mc.deleted_at IS NULL) AS machine_count
+       FROM cf_classification_nodes n
+      WHERE n.company_id = ? AND n.deleted_at IS NULL AND n.scope = 'machine'
+      ORDER BY n.depth, n.sort_order, n.name`,
+    [companyId],
+  );
+  const families = [];
+  const byId = new Map();
+  // Ordered by depth, so a parent is always in the map before its children.
+  for (const n of nodes) {
+    const node = { id: n.id, code: n.code, name: n.name, status: n.status };
+    if (n.depth === 0) { node.subfamilies = []; families.push(node); }
+    else if (n.depth === 1) { node.types = []; byId.get(n.parent_id)?.subfamilies.push(node); }
+    else { node.machineCount = Number(n.machine_count); byId.get(n.parent_id)?.types.push(node); }
+    byId.set(n.id, node);
+  }
+  return { families };
+}
+
+/** { id } to use an existing node, or { code, name } to make one. */
+function readNodeSpec(raw, label, problems) {
+  const spec = raw && typeof raw === 'object' ? raw : {};
+  const hasId = spec.id !== undefined && spec.id !== null && String(spec.id).trim() !== '';
+  if (hasId) {
+    const n = Number(spec.id);
+    if (!Number.isInteger(n) || n <= 0) { problems.push(`${label}: pick one from the list, or give a code and a name to make a new one.`); return {}; }
+    return { id: n };
+  }
+  const code = String(spec.code ?? '').trim();
+  const name = String(spec.name ?? '').trim();
+  if (!code && !name) { problems.push(`Choose a ${label}, or give a code and a name to make a new one.`); return {}; }
+  if (!code || !CODE_RE.test(code) || code.length > 50) problems.push(`${label} code: up to 50 letters, digits, "_", "-" or ".", no spaces.`);
+  if (!name || name.length > 255) problems.push(`${label} name is required (up to 255 characters).`);
+  return { code, name };
+}
+
+/**
+ * Any level of a machine family — the Family, one of its Subfamilies, or a
+ * machine type. The Machines screen owns all three, because a screen that can
+ * make a Family inline and then never rename or retire it is the dead end this
+ * was built to remove.
+ *
+ * Inactive is fine: a retired level must still be renameable and removable.
+ * NOT_A_MACHINE_TYPE keeps its narrower meaning over in requireMachineType —
+ * "this is not something a MACHINE can sit on" — which is a different question
+ * with a different caller (machineService, placing a machine).
+ */
+async function requireMachineNode(db, companyId, id) {
+  const node = await requireNode(db, companyId, id, 'Machine family, subfamily or type');
+  if (!isMachineScope(node)) {
+    throw invalid('NOT_A_MACHINE_NODE',
+      `${node.name} is an item ${levelName(node.depth)} — the Machines screen manages machine families, their subfamilies and their types.`);
+  }
+  return node;
+}
+
+/**
+ * input: { family: { id } | { code, name }, subfamily: { id } | { code, name }, code, name, description? }
+ *
+ * The whole chain is checked before a single row is written, so a refusal never
+ * leaves a half-made Family behind — the route runs this in one transaction as
+ * well, but the order is what decides the message a person gets back.
+ */
+export async function createMachineType(db, c, input = {}) {
+  const problems = [];
+  const fields = validateFields(input, problems);
+  const famSpec = readNodeSpec(input.family, 'Family', problems);
+  const subSpec = readNodeSpec(input.subfamily, 'Subfamily', problems);
+  assertNoProblems(problems);
+
+  let family = null;
+  if (famSpec.id) {
+    const row = await requireNode(db, c.companyId, famSpec.id, 'Machine family');
+    if (row.depth !== 0 || !isMachineScope(row)) {
+      const why = row.depth !== 0 ? `a ${levelName(row.depth)}` : 'an item family';
+      throw invalid('NOT_A_MACHINE_FAMILY', `${row.name} is ${why} — a machine type sits under a Family with scope Machine.`);
+    }
+    family = { id: row.id, name: row.name };
+  }
+  let subfamily = null;
+  if (subSpec.id) {
+    const row = await requireNode(db, c.companyId, subSpec.id, 'Subfamily');
+    // No family given: take the one it already sits under.
+    if (!family && row.depth === 1 && row.parent_id) {
+      const up = await requireNode(db, c.companyId, row.parent_id, 'Machine family');
+      if (up.depth !== 0 || !isMachineScope(up)) {
+        throw invalid('NOT_A_MACHINE_FAMILY', `${up.name} is not a machine family — a machine type sits under a Family with scope Machine.`);
+      }
+      family = { id: up.id, name: up.name };
+    }
+    if (row.depth !== 1 || !family || row.parent_id !== family.id) {
+      const under = family ? family.name : 'the family given';
+      throw invalid('WRONG_PARENT', `${row.name} is not a Subfamily of ${under} — pick one under it, or give a code and a name to make one.`);
+    }
+    subfamily = { id: row.id, name: row.name };
+  }
+
+  const created = { family: false, subfamily: false };
+  if (!family) {
+    const made = await createNode(db, c, { code: famSpec.code, name: famSpec.name, scope: 'machine' });
+    family = { id: made.id, name: made.name };
+    created.family = true;
+  }
+  if (!subfamily) {
+    const made = await createNode(db, c, { parentId: family.id, code: subSpec.code, name: subSpec.name, scope: 'machine' });
+    subfamily = { id: made.id, name: made.name };
+    created.subfamily = true;
+  }
+  const type = await createNode(db, c, {
+    parentId: subfamily.id,
+    scope: 'machine',
+    code: fields.code,
+    name: fields.name,
+    description: input.description,
+    sortOrder: input.sortOrder,
+    status: input.status,
+  });
+  return { id: type.id, code: type.code, name: type.name, familyId: family.id, subfamilyId: subfamily.id, created };
+}
+
+/**
+ * input: { name?, code?, description?, status? } on any level of a machine
+ * family. The node stays where it is — moving one between parents is still a
+ * Setup job, because it rewrites what reaches everything below.
+ *
+ * Retiring a Family does not retire the levels under it: a status is the node's
+ * own, here exactly as in Setup.
+ */
+export async function updateMachineNode(db, c, id, input = {}) {
+  await requireMachineNode(db, c.companyId, id);
+  const patch = {};
+  for (const key of ['name', 'code', 'description', 'status']) if (input[key] !== undefined) patch[key] = input[key];
+  if (Object.keys(patch).length) await updateNode(db, c, id, patch);
+  return { id };
+}
+
+/**
+ * Soft delete of any level of a machine family. deleteNode does the refusing:
+ * a Family or Subfamily with anything live below it, a type machines still sit
+ * on, timing rules, coding rules — each named, with its count, in one sentence.
+ */
+export async function deleteMachineNode(db, c, id) {
+  await requireMachineNode(db, c.companyId, id);
+  await deleteNode(db, c, id);
+  return { id };
+}
+
+/**
+ * A classification node made from the catalog screens instead of Setup, so a
+ * catalog editor who needs a Variant mid-flow is not stuck behind the setup
+ * grant. Narrowed to the item side: this door never makes a machine level.
+ */
+export async function createCatalogNode(db, c, input = {}) {
+  if (input.scope === 'machine') {
+    throw invalid('NOT_ALLOWED', 'Scope Machine is not set from here — machine types are managed on the Machines screen.');
+  }
+  if (input.parentId != null) {
+    const parent = await requireNode(db, c.companyId, input.parentId, 'Parent node');
+    if (isMachineScope(parent)) {
+      const what = parent.depth === 0 ? 'is a machine family' : 'is inside a machine family';
+      throw invalid('NOT_ALLOWED', `${parent.name} ${what} — machine types are managed on the Machines screen.`);
+    }
+  }
+  const node = await createNode(db, c, {
+    parentId: input.parentId ?? null,
+    code: input.code,
+    name: input.name,
+    description: input.description,
+    scope: input.scope,
+    sortOrder: input.sortOrder,
+  });
+  return { id: node.id, code: node.code, name: node.name, depth: node.depth, scope: node.scope };
 }
