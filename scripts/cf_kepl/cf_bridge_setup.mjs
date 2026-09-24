@@ -26,6 +26,10 @@ const BE = process.cwd();
 const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
 
 const { pool } = await imp('db.js');
+// These scripts hand-roll their transactions, so they do not get withTransaction's
+// per-transaction memo for classification reads. Attaching it here cuts the same three
+// tree rows from 8 reads per item to 2 — worth ~0.3 s an item over a remote link.
+const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');          // registers the 'item' / 'definition' entities
 const cls = await imp('apps/cf_erp/services/classificationService.js');
 const specs = await imp('apps/cf_erp/services/specificationService.js');
@@ -490,6 +494,7 @@ async function probeOne(conn, c, { label, classificationId, name, shortName, val
     return;
   }
   await conn.beginTransaction();
+    attachNodeCache(conn);
   try {
     const item = await recs.createItem(conn, c, {
       classificationId, name, shortName,
@@ -500,7 +505,7 @@ async function probeOne(conn, c, { label, classificationId, name, shortName, val
     await checkItem(conn, c, m, { label, wantCode, wantWeight, tol });
     say('  passed; rolling back so nothing is left behind.');
   } finally {
-    await conn.rollback();
+    detachNodeCache(conn); await conn.rollback();
   }
 }
 
@@ -589,6 +594,7 @@ async function probeInstantiation(conn, c) {
   if (!parent || !tpl) { say('  no coded temporary item and active template to try this on — skipped.'); return; }
 
   await conn.beginTransaction();
+    attachNodeCache(conn);
   try {
     const before = new Set((await bomService.getBom(conn, c.companyId, parent.id)).lines.map((l) => l.child.id));
     await bomService.addLine(conn, c, parent.id, { childId: tpl.id, quantity: 1 });
@@ -604,7 +610,7 @@ async function probeInstantiation(conn, c) {
     say(`  could not mint one: ${e.message}`);
     throw e;
   } finally {
-    await conn.rollback();
+    detachNodeCache(conn); await conn.rollback();
   }
 }
 
@@ -736,7 +742,8 @@ try {
   if (!VERIFY_ONLY) {
     say('\n== setup ==');
     await conn.beginTransaction();
-    try { built = await setup(conn, c); await conn.commit(); } catch (e) { await conn.rollback(); throw e; }
+    attachNodeCache(conn);
+    try { built = await setup(conn, c); detachNodeCache(conn); await conn.commit(); } catch (e) { detachNodeCache(conn); await conn.rollback(); throw e; }
     say('  created:', JSON.stringify(tally.created));
     say('  reused :', JSON.stringify(tally.reused));
 
@@ -744,7 +751,8 @@ try {
     // generator can select them, and a backfill that fails must not take the
     // setup down with it.
     await conn.beginTransaction();
-    try { await backfillTemporaryCodes(conn, c); await conn.commit(); } catch (e) { await conn.rollback(); throw e; }
+    attachNodeCache(conn);
+    try { await backfillTemporaryCodes(conn, c); detachNodeCache(conn); await conn.commit(); } catch (e) { detachNodeCache(conn); await conn.rollback(); throw e; }
   }
 
   const seen = await verify(conn, c);

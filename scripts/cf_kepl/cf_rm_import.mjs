@@ -27,6 +27,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TSV = path.join(HERE, 'fab_rm_extract.tsv');
 
 const { pool } = await imp('db.js');
+// These scripts hand-roll their transactions, so they do not get withTransaction's
+// per-transaction memo for classification reads. Attaching it here cuts the same three
+// tree rows from 8 reads per item to 2 — worth ~0.3 s an item over a remote link.
+const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');          // registers the 'item' entity
 const cls = await imp('apps/cf_erp/services/classificationService.js');
 const specs = await imp('apps/cf_erp/services/specificationService.js');
@@ -351,6 +355,7 @@ async function importItems(conn, c, variant, source) {
   for (let i = 0; i < work.length; i += CHUNK) {
     const slice = work.slice(i, i + CHUNK);
     await conn.beginTransaction();
+    attachNodeCache(conn);
     try {
       for (const { src, cl } of slice) {
         let item;
@@ -378,9 +383,9 @@ async function importItems(conn, c, variant, source) {
           report.noCode.push({ src: src.code, name: src.name, why: [e.message, ...(e.problems ?? [])].join(' | ') });
         }
       }
-      await conn.commit();
+      detachNodeCache(conn); await conn.commit();
     } catch (e) {
-      await conn.rollback();
+      detachNodeCache(conn); await conn.rollback();
       throw e;
     }
     process.stdout.write(`\r  items ${Math.min(i + CHUNK, work.length)}/${work.length}   `);
@@ -495,8 +500,9 @@ try {
     const source = LIMIT ? readSource().slice(0, LIMIT) : readSource();
     say(`\n== setup ==`);
     await conn.beginTransaction();
+    attachNodeCache(conn);
     let built;
-    try { built = await setup(conn, c); await conn.commit(); } catch (e) { await conn.rollback(); throw e; }
+    try { built = await setup(conn, c); detachNodeCache(conn); await conn.commit(); } catch (e) { detachNodeCache(conn); await conn.rollback(); throw e; }
     say('  created:', JSON.stringify(tally.created), '\n  reused :', JSON.stringify(tally.reused));
 
     say(`\n== items (${source.length} source rows) ==`);

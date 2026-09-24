@@ -44,6 +44,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MARKER = path.join(HERE, '.bridge_catalog_done');
 
 const { pool } = await imp('db.js');
+// These scripts hand-roll their transactions, so they do not get withTransaction's
+// per-transaction memo for classification reads. Attaching it here cuts the same three
+// tree rows from 8 reads per item to 2 — worth ~0.3 s an item over a remote link.
+const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');   // side effect: registers the code-generator entities
 const recs = await imp('apps/cf_erp/services/masterRecordService.js');
 const selections = await imp('apps/cf_erp/services/selectionService.js');
@@ -734,7 +738,8 @@ async function verify(db, c, ctx) {
 
 async function inTx(conn, fn) {
   await conn.beginTransaction();
-  try { const out = await fn(); await conn.commit(); return out; } catch (e) { await conn.rollback(); throw e; }
+    attachNodeCache(conn);
+  try { const out = await fn(); detachNodeCache(conn); await conn.commit(); return out; } catch (e) { detachNodeCache(conn); await conn.rollback(); throw e; }
 }
 
 const conn = await pool.getConnection();

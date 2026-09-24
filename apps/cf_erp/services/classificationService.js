@@ -14,6 +14,7 @@
  *     machine type), and items and definitions never do.
  */
 import { invalid, conflict, assertNoProblems } from '../lib/errors.js';
+import { invalidateNodeCache } from '../lib/nodeCache.js';
 import { LEAF_DEPTH, LEVELS, levelName, requireNode, ancestors } from './tree.js';
 import { deleteAllForSubject as deleteValues, rematerialize } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
@@ -99,6 +100,7 @@ export async function createNode(db, c, input = {}) {
     [c.companyId, parentId, depth, fields.scope ?? 'both', fields.code, fields.name, fields.description ?? null,
       fields.sort_order ?? 0, fields.status ?? 'active', c.userId],
   );
+  invalidateNodeCache(db);
   return getNode(db, c.companyId, r.insertId);
 }
 
@@ -127,6 +129,7 @@ export async function updateNode(db, c, id, input = {}) {
   if (sets.length) {
     await db.query(`UPDATE cf_classification_nodes SET ${sets.join(', ')} WHERE company_id = ? AND id = ?`, [...params, c.companyId, id]);
   }
+  invalidateNodeCache(db);
   // A move changes which rules and defaults reach everything below.
   if (movedTo) await rematerialize(db, c, { classificationId: id });
   return getNode(db, c.companyId, id);
@@ -178,6 +181,7 @@ export async function deleteNode(db, c, id) {
   await deleteValues(db, c, 'classification', id);
   await deleteRules(db, c, 'classification', id);
   await db.query('UPDATE cf_classification_nodes SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
+  invalidateNodeCache(db);
   return { ok: true };
 }
 
