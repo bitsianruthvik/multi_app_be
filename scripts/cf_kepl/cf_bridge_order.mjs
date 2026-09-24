@@ -70,7 +70,15 @@ const RECEIVED_ON = '2026-07-08';
 const ORDER_TITLE = 'ROB 59.3 m, 2 spans';
 const LINE_DESCRIPTION = 'ROB span 59.3 m, 4 girder lines, 17 deg skew';
 const CUSTOMER_CODE = 'KEPL';
-const CUSTOMER_NAME = 'KEPL — Kalyan Engineering Projects Ltd.';
+// Given by the user. The BOQ itself says only "KEPL"; a company-registry search found no
+// exact match for this name, so it is recorded with its provenance in CUSTOMER_NOTES
+// rather than presented as verified. Confirm before invoicing.
+const CUSTOMER_NAME = 'Kalpataru Enterprise Private Limited';
+const CUSTOMER_NOTES = 'Name given by the user. The BOQ itself says only "KEPL" (drawing '
+  + 'P103-VDB-WK-DD-MJB-200+003-401). A company-registry search on 2026-09-24 found no exact '
+  + 'match: the nearest registrations are Kalpatru Enterprises Private Limited '
+  + '(U45201MP2006PTC043404, Bhopal) and Kalpatharu Enterprises Private Limited '
+  + '(U45201TN1981PTC008782, Chennai), both spelled differently. Confirm before invoicing.';
 /** Only used when the tenant has no coding rule for sales orders. */
 const FALLBACK_ORDER_CODE = 'SO-KEPL-ROB60';
 
@@ -440,6 +448,7 @@ async function ensureCustomer(db, c) {
   const p = await parties.createParty(db, c, {
     code: CUSTOMER_CODE,
     name: CUSTOMER_NAME,
+    notes: CUSTOMER_NOTES,
     roles: ['customer'],
     notes: `Customer of the ROB 59.3 m job, drawing ${DRAWING}. The BOQ names the client only as "KEPL"; the expanded name here is a placeholder.`,
     status: 'active',
