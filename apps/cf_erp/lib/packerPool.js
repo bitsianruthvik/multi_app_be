@@ -24,9 +24,50 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Worker } from 'worker_threads';
+import { rngFor } from '../services/nestingPacker.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER = path.join(HERE, '..', 'services', 'nestingWorker.js');
+
+/**
+ * N SEEDS THAT ARE ACTUALLY DIFFERENT, WORKED OUT IN ONE GO.
+ *
+ * Distinct integers are not the question. What matters is whether two seeds
+ * drive DIFFERENT SEARCHES — two seeds whose random streams start in the same
+ * place do identical work twice and one of the CPUs is wasted.
+ *
+ * So the seeds are stepped by the 32-bit golden ratio rather than by one.
+ * Consecutive integers go into the same hash a few bits apart and can come out
+ * correlated; a large odd stride spreads them across the space by construction,
+ * which is why the usual answer is "generate them all at once" rather than
+ * "draw one and hope".
+ *
+ * Then it is CHECKED rather than assumed, against the real generator the packer
+ * will use. A seed whose first draw matches one already accepted is stepped
+ * again, up to FIVE times; if it still collides it is dropped, because paying a
+ * core to repeat a search already running buys nothing. Fewer seeds that differ
+ * beats eight that do not.
+ */
+export function seedsFor(base, n) {
+  const GOLDEN = 0x9E3779B1;                 // 2^32 / phi, odd: a full-period stride
+  const MAX_TRIES = 5;
+  const out = [];
+  const streams = new Set();
+  const dropped = [];
+  for (let k = 0; k < n; k += 1) {
+    let seed = (Math.imul(k, GOLDEN) + (Number(base) | 0)) | 0;
+    let taken = false;
+    for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+      // The first draw of trial 1 IS the start of the search this seed runs.
+      const first = rngFor(seed, 1)();
+      if (!streams.has(first)) { streams.add(first); out.push(seed); taken = true; break; }
+      seed = (Math.imul(seed ^ (k + 1), GOLDEN) + 1) | 0;   // step and try again
+    }
+    if (!taken) dropped.push(k);
+  }
+  out.dropped = dropped.length;
+  return out;
+}
 
 /**
  * Roughly how long a job will take, for scheduling only. Total piece area is a

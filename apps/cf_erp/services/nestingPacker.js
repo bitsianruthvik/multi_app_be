@@ -100,8 +100,8 @@ export const ORDER_MARGIN = Object.freeze({ lengthMm: 100, widthMm: 50, stepMm: 
  */
 export const EFFORT = Object.freeze({
   quick: { label: 'Quick', restarts: 0, repairs: 0, capMs: 1_500 },
-  standard: { label: 'Standard', restarts: 32, repairs: 60, seeds: 1, capMs: 60_000 },
-  deep: { label: 'Deep', restarts: 64, repairs: 400, seeds: 4, capMs: 300_000 },
+  standard: { label: 'Standard', restarts: 64, repairs: 60, seeds: 8, capMs: 300_000 },
+  deep: { label: 'Deep', restarts: 64, repairs: 400, seeds: 8, capMs: 600_000 },
 });
 
 /**
@@ -185,7 +185,7 @@ export function mulberry32(a) {
  * on how many trials happened to run. That is what makes trial i of a deep run
  * identical to trial i of a standard run.
  */
-const rngFor = (seed, i) => mulberry32(
+export const rngFor = (seed, i) => mulberry32(
   (Math.imul(seed ^ 0x9E3779B9, 0x85EBCA6B) ^ Math.imul(i + 0x165667B1, 0xC2B2AE35)) | 0,
 );
 

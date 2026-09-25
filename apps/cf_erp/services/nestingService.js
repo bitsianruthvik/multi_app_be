@@ -80,7 +80,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import { subtreeIds } from './tree.js';
 import { explode } from './bomService.js';
-import { runAll, pickBest } from '../lib/packerPool.js';
+import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -151,8 +151,21 @@ export function publishedKerf(thicknessMm) {
  * eight seeds is 48 CPU-bound jobs on seven workers: seven waves, not one. The
  * floor is the single slowest GROUP and no number of cores gets under it.
  *
- * So one seed by default, four at Deep as insurance against an order where seed
- * 1 is not the lucky one. Settable per request for anyone wanting to spend it.
+ * SET TO 8 BY THE USER (2026-09-25), with 64 restarts, and the cost is known:
+ * 650.983 t in 245 s against 650.991 t in 35 s at one seed x 32 restarts — eight
+ * kilograms for seven times the wall clock.
+ *
+ * MOST OF THAT WORK IS A DUPLICATE, AND IT IS WORTH SEEING WHY. The seeds ARE
+ * distinct (seedsFor proves it against the real generator, and drops any that
+ * are not). What converges is the ANSWER: with 64 restarts inside every run the
+ * search explores enough that where it started stops mattering. On the real KEPL
+ * line eight seeds produced ONE layout in four groups of six, eight in the 16 mm
+ * group and three in the 32 mm one. Seven eighths of the CPU redid a layout
+ * already in hand.
+ *
+ * That is why `distinct` is reported per group: if it reads 1, the seeds bought
+ * nothing there and the number can come down. It is the honest dial to watch,
+ * not the seed count.
  */
 export const DEFAULT_SEEDS = 1;
 
@@ -696,11 +709,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     for (const pr of prepared) outByGroup.set(pr.g.key, (await pack(pr.packInput)) ?? {});
   } else {
     const jobs = [];
+    let seedsDropped = 0;
     for (const pr of prepared) {
-      const base = Number(pr.packInput.seed) || 1;
-      for (let i = 0; i < seedCount; i += 1) {
-        jobs.push({ key: pr.g.key, seed: base + i, input: { ...pr.packInput, seed: base + i } });
-      }
+      // Seeds worked out ONCE and checked against the real generator: two seeds
+      // whose streams start in the same place would do identical work twice.
+      const mine = seedsFor(Number(pr.packInput.seed) || 1, seedCount);
+      seedsDropped += mine.dropped ?? 0;
+      for (const seed of mine) jobs.push({ key: pr.g.key, seed, input: { ...pr.packInput, seed } });
     }
     const runs = await runAll(jobs);
     for (const pr of prepared) {
@@ -710,8 +725,14 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       const best = pickBest(mine);
       outByGroup.set(pr.g.key, best?.out ?? {});
       if (seedCount > 1) {
+        // How many distinct layouts the seeds actually produced. Two seeds landing
+        // on the same answer is wasted CPU and worth being able to see.
+        const distinct = new Set(mine.filter((r) => r.ok).map((r) => JSON.stringify(
+          (r.out?.nests ?? []).map((n) => [n.sheetKey, n.pieces?.length]),
+        ))).size;
         seedsTried.push({
-          thickness: pr.g.thickness, grade: pr.g.grade, tried: mine.length, won: best?.seed ?? null,
+          thickness: pr.g.thickness, grade: pr.g.grade,
+          tried: mine.length, distinct, dropped: seedsDropped, won: best?.seed ?? null,
         });
       }
     }
