@@ -207,6 +207,46 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
+    key: 'blanks',
+    label: 'Cut plates',
+    description: 'Pooling the parts into the blanks they are cut from.',
+    /*
+     * WHY THIS IS ITS OWN STAGE AND NOT PART OF NESTING.
+     *
+     * Deriving blanks WRITES: it mints a temporary item per rectangle and puts
+     * an area-fraction quantity on each one. The nesting screen's contract is
+     * that opening it changes nothing — a look is a look — so the write cannot
+     * live behind it.
+     *
+     * It is also a step somebody re-runs. Parts pool by (thickness, length,
+     * width, grade), so editing the structure changes which rectangles exist,
+     * and the shop needs to see that happen rather than have it slipped in.
+     *
+     * It applies wherever nesting does: if a material says it is cut to size,
+     * the blanks have to exist before anything can be laid out.
+     */
+    applies: (ctx) => ctx.nesting.items.length > 0,
+    state(ctx) {
+      const made = ctx.nesting.blanks ?? 0;
+      if (made > 0) {
+        return {
+          state: 'done',
+          detail: `${n(made, 'rectangle')} pooled from the line's plate parts`,
+          blockers: [],
+        };
+      }
+      const items = ctx.nesting.items;
+      return {
+        state: 'todo',
+        detail: `${n(items.length, 'material')} to cut — no blanks derived yet`,
+        blockers: [{
+          count: items.length,
+          message: `Line ${ctx.line.line_no} has parts that are cut from plate, but nothing has been pooled into blanks yet. Derive the cut plates, and nesting has something to lay out.`,
+        }],
+      };
+    },
+  },
+  {
     key: 'nesting',
     label: 'Nesting',
     description: 'Laying parts out on the plates they are cut from.',
@@ -1039,6 +1079,19 @@ async function loadOrderContext(db, companyId, order, lines) {
       GROUP BY pl.order_line_id, pl.company_id`,
     [companyId, lines.map((l) => l.id)],
   ) : [[]];
+  // 5c. How many blanks a line already has. The blanks stage is done when the
+  // rectangles exist; nesting is done when they are laid out. Two questions.
+  const [blankRows] = lines.length ? await db.query(
+    `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
+       FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+       JOIN cf_classification_nodes n ON n.id = m.classification_id AND n.code = 'CUT_PLATE'
+      WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.owner_order_line_id IN (?)
+      GROUP BY i.owner_order_line_id`,
+    [companyId, lines.map((l) => l.id)],
+  ) : [[]];
+  const blanksBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
+
   const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
     lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
   }]));
@@ -1058,7 +1111,7 @@ async function loadOrderContext(db, companyId, order, lines) {
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, lotsBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
+  return { trees, detail, free, onOrder, releases, lotsBy, blanksBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
 }
 
 /**
@@ -1167,6 +1220,7 @@ function lineContext(ctx, order, line) {
     nesting: {
       items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })),
       saved: ctx.lotsBy.get(line.id) ?? null,
+      blanks: ctx.blanksBy.get(line.id) ?? 0,
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
@@ -1230,6 +1284,7 @@ function notApplicableDetail(key, ctx) {
   switch (key) {
     case 'structure': return 'Sells a catalog item with no BOM — there is nothing under it';
     case 'values': return 'Nothing under this line has a required value to capture';
+    case 'blanks':
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.
