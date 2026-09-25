@@ -2110,3 +2110,281 @@ CREATE TABLE IF NOT EXISTS cf_drawing_links (
   CONSTRAINT fk_cdl_drawing FOREIGN KEY (company_id, drawing_id) REFERENCES cf_drawings(company_id, id),
   CONSTRAINT fk_cdl_creator FOREIGN KEY (created_by) REFERENCES users(id)
 );
+
+
+-- ===== 21. NESTING — the rectangles laid out on real plates ==================
+-- cutPlateService pools a line's plate parts into CUT PLATES: rectangles of one
+-- thickness/length/width/grade, each a temporary item of quantity N. The line
+-- from a cut plate to its raw plate carries an AREA FRACTION, and
+-- cutPlateService.AREA_FRACTION_CAVEAT says out loud what that is worth — it
+-- ignores how the blanks lie on the sheet and the offcut left over. These three
+-- tables are what replaces it with a real plate count.
+--
+-- THE MODEL IN ONE PARAGRAPH. A nest is a shared raw plate, not a document
+-- (CF_ERP_PLAN §671–692). So there is no "nest" table: there is a LOT, one
+-- physical plate drawn from stock once, and the cut plates that name the same
+-- lot ARE that nest. A PLACEMENT is one piece of one cut plate sitting at one
+-- (x, y) on one lot. Cut plates belong to a sales order line, so a lot does
+-- too, and nesting is within a line.
+--
+-- QUANTITY SEMANTICS, STATED ONCE AND REPEATED IN nestingService.js: a
+-- placement is ONE PIECE on ONE LOT. The plate count of a nest is always 1,
+-- because a nest IS one lot. Count LOTS to count plates; SUM PLACEMENTS to
+-- count pieces. Never sum placements to get plates — that is the arithmetic
+-- that buys a plate per blank.
+
+-- ----- 21a. Cut settings — kerf bands, sequence gaps, ordering margins ------
+-- KERF IS BANDED BY PLATE THICKNESS, not set per exact thickness, because that
+-- is how the shop quotes it:
+--      5–16 mm -> 2.5–3 mm     18–20 mm -> 4 mm     25–50 mm -> 5 mm
+-- so the row carries a RANGE (`thickness_min_mm` .. `thickness_max_mm`,
+-- inclusive) and one kerf. Both NULL is the company default row, used when no
+-- band covers a thickness.
+--
+-- THERE IS ONE KERF NUMBER AND TWO WAYS IT IS SPENT.
+--   EDGE kerf   an unshared boundary. Charged once per side, and it IS charged
+--               at the plate rim — the raw plate's own edge gets cut too.
+--   COMMON kerf two parts sharing a boundary, which is cut ONCE.
+-- One number, so both are `kerf_mm`. The arithmetic that follows: a row of n
+-- parts that share their boundaries spans SUM(sizes) + (n + 1) * kerf. Three
+-- 100 mm parts at 3 mm kerf span 312 mm sharing, 318 mm not sharing — the
+-- shop's own worked example, and the reason a single resolver
+-- (nestingService.resolveCutSettings) is used by the planner and by the
+-- accept-time verification alike. Two constants in two places is the bug.
+--
+-- SEQUENCES. A plate is cut Plate -> Sequence -> Row -> Part: a sequence holds
+-- a fixed number of rows and is cut as a unit, in order, so the pierce order is
+-- controlled. Consecutive sequences are separated by `seq_gap_min_mm` ..
+-- `seq_gap_max_mm` (5–8 mm).
+--
+-- ORDERING MARGIN. After kerf, sequences and shared boundaries give the exact
+-- requirement, the plate is ORDERED larger — `order_margin_width_mm` (50) and
+-- `order_margin_length_mm` (100) — because plate edges are not straight and a
+-- standard size procures faster. That difference is deliberate and is NOT
+-- waste, which is why cf_plate_lots records the required size and the ordered
+-- size as two separate numbers.
+--
+-- The uniqueness key holds the BAND. `band_key` folds the default row onto the
+-- sentinel -1 (no plate has a negative thickness) so a company can hold exactly
+-- one default, which a plain NULL column could never enforce — MySQL never
+-- compares NULLs in a unique index. It still goes NULL when the row is
+-- soft-deleted, so it keeps the whole point of the `_active` pattern. Bands are
+-- checked for overlap in the service; a unique key cannot express that.
+
+CREATE TABLE IF NOT EXISTS cf_cut_settings (
+  id                     INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id             INT            NOT NULL,
+  thickness_min_mm       DECIMAL(10,3)  NULL,           -- inclusive; both NULL = the default row
+  thickness_max_mm       DECIMAL(10,3)  NULL,           -- inclusive
+  kerf_mm                DECIMAL(10,3)  NOT NULL DEFAULT 3.000,  -- per cut side; edge AND common
+  seq_gap_min_mm         DECIMAL(10,3)  NOT NULL DEFAULT 5.000,
+  seq_gap_max_mm         DECIMAL(10,3)  NOT NULL DEFAULT 8.000,
+  order_margin_length_mm DECIMAL(10,3)  NOT NULL DEFAULT 100.000,
+  order_margin_width_mm  DECIMAL(10,3)  NOT NULL DEFAULT 50.000,
+  order_step_mm          DECIMAL(10,3)  NOT NULL DEFAULT 50.000,  -- ADD the margin, THEN round up to this
+  guillotine             TINYINT(1)     NOT NULL DEFAULT 0,      -- 1 = shear/saw, 0 = CNC profile cutting
+  notes                  VARCHAR(500)   NULL,
+
+  deleted_at             DATETIME       DEFAULT NULL,
+  created_at             TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at             TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by             INT            NULL,
+
+  is_live   TINYINT       GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+  band_key  VARCHAR(40)   GENERATED ALWAYS AS (IF(deleted_at IS NULL,
+                            CONCAT(IFNULL(thickness_min_mm, -1), ':', IFNULL(thickness_max_mm, -1)), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_ccst_tenant (company_id, id),
+  UNIQUE KEY uq_ccst_band   (company_id, band_key),
+
+  CONSTRAINT fk_ccst_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ccst_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+
+-- ----- 21b. Plate lots — one physical raw plate consumed by a line ----------
+-- `plate_item_id` is the CATALOG plate (Steel › Plates › Plate) this lot is one
+-- of; the lot is the instance. Its size is COPIED onto the row rather than
+-- joined for: a saved layout is verified against the sheet it was laid out on,
+-- and somebody correcting a catalog plate's width next month must not silently
+-- invalidate — or worse, silently validate — a plan already accepted.
+--
+-- TWO SIZES, ON PURPOSE.
+--   required_length_mm / required_width_mm  what the layout actually needs,
+--                                           kerf and sequence gaps included.
+--   length_mm / width_mm                    what is ORDERED and what the
+--                                           geometry is verified against.
+-- Procurement buys the ordered one. The difference is the ordering margin
+-- (21a), not waste, and quoting wastage against the ordered size without
+-- saying so would make every plate look worse than it is.
+--
+-- The same reasoning puts kerf, the sequence gaps and guillotine here: they are
+-- resolved from cf_cut_settings when the plan is accepted and RECORDED, so
+-- re-opening a plan checks its geometry against the numbers it was built with
+-- rather than against whatever the settings say today.
+--
+-- `source` = 'offcut' with `origin_lot_id` is how a drop re-enters the pool
+-- (CF_ERP_PLAN: "the offcut is an unclaimed cut plate"). The columns are here
+-- because the model needs them; today nestingService only ever proposes
+-- 'catalog' lots, and offcut sourcing is a separate piece of work.
+--
+-- `is_manual` marks a lot a person laid out by hand rather than one the packer
+-- produced — the screen and the Excel sheet can both write one.
+
+CREATE TABLE IF NOT EXISTS cf_plate_lots (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  order_line_id      INT            NOT NULL,
+  plate_item_id      INT            NOT NULL,        -- the catalog plate this lot is one of
+  lot_no             VARCHAR(30)    NOT NULL,        -- N-001, N-002 … unique within the line
+  source             ENUM('catalog','offcut') NOT NULL DEFAULT 'catalog',
+  origin_lot_id      INT            NULL,            -- the lot an offcut was left over from
+
+  thickness_mm       DECIMAL(10,3)  NOT NULL,
+  length_mm          DECIMAL(12,3)  NOT NULL,        -- ORDERED size; the geometry is verified against it
+  width_mm           DECIMAL(12,3)  NOT NULL,        -- ORDERED size
+  required_length_mm DECIMAL(12,3)  NULL,            -- what the layout needs, kerf and gaps included
+  required_width_mm  DECIMAL(12,3)  NULL,
+  grade              VARCHAR(100)   NULL,            -- as resolved when the plan was accepted
+  material           VARCHAR(100)   NULL,
+  density            DECIMAL(12,3)  NULL,            -- kg/m3, so wastage can be quoted in kg
+
+  kerf_mm            DECIMAL(10,3)  NOT NULL DEFAULT 0.000,
+  seq_gap_min_mm     DECIMAL(10,3)  NOT NULL DEFAULT 0.000,
+  seq_gap_max_mm     DECIMAL(10,3)  NOT NULL DEFAULT 0.000,
+  guillotine         TINYINT(1)     NOT NULL DEFAULT 0,
+  is_manual          TINYINT(1)     NOT NULL DEFAULT 0,
+  notes              VARCHAR(500)   NULL,
+
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT            NULL,
+
+  is_live       TINYINT     GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+  lot_no_active VARCHAR(30) GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(lot_no), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cpl_tenant (company_id, id),
+  UNIQUE KEY uq_cpl_lot_no (company_id, order_line_id, lot_no_active),
+  KEY idx_cpl_line  (company_id, order_line_id),
+  KEY idx_cpl_plate (company_id, plate_item_id),
+
+  CONSTRAINT fk_cpl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpl_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cpl_plate   FOREIGN KEY (company_id, plate_item_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cpl_origin  FOREIGN KEY (company_id, origin_lot_id) REFERENCES cf_plate_lots(company_id, id),
+  CONSTRAINT fk_cpl_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+
+-- ----- 21c. Nest placements — where one piece sits on one lot ---------------
+-- ONE ROW IS ONE PIECE. A cut plate of quantity 6 that fits on one lot is SIX
+-- rows on that lot, not one row with a quantity, because each piece has its own
+-- position and the screen draws it. That is also why there is no quantity
+-- column: a quantity here is the shape of the bug this table exists to avoid.
+--
+-- A PLACEMENT IS INSIDE A SEQUENCE AND A ROW, NOT FREE x/y. The layout is
+-- Plate -> Sequence -> Row -> Part, and the CUT ORDER IS THE POINT: sequence 1
+-- is cut in full, then sequence 2, then 3, so the pierce order is controlled
+-- and the plate does not distort. `idx_cnp_cut_order` exists so that
+-- "this lot's layout in cut order" is an index-ordered read and nobody has to
+-- remember to sort it.
+--   seq_no  the sequence on the plate, 1-based, cut as a unit and in order
+--   row_no  the row within that sequence, 1-based
+--   pos_no  the part's place along that row, 1-based
+-- How many rows a sequence holds is set by PART SIZE ON BOTH DIMENSIONS:
+-- under 200 mm on both is Small and the sequence holds 2 rows; anything larger
+-- is Big and it holds 3. That rule lives in nestingService (rowsPerSequence)
+-- because it is arithmetic, not storage — the table records what was decided.
+--
+-- x/y remain, and are the TRUE corner of the piece on the sheet measured from
+-- the sheet's own corner, so the screen can draw the plate without re-deriving
+-- the layout from the sequence and row numbers.
+--
+-- `length_mm`/`width_mm` are the footprint AS PLACED (already swapped when
+-- `rotated`), so verification and drawing both read the row rather than
+-- recombining it with the cut plate's size and a flag.
+--
+-- KERF IS CHARGED AT THE RIM HERE. The raw plate's own edge is cut, so an
+-- unshared boundary costs one kerf wherever it is, including against the sheet
+-- edge; two pieces that SHARE a boundary are one kerf apart, not two.
+
+CREATE TABLE IF NOT EXISTS cf_nest_placements (
+  id            INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT            NOT NULL,
+  plate_lot_id  INT            NOT NULL,
+  cut_plate_id  INT            NOT NULL,        -- the temporary item master, i.e. the rectangle
+  seq_no        INT            NOT NULL DEFAULT 1,   -- sequence on the plate, cut as a unit, in order
+  row_no        INT            NOT NULL DEFAULT 1,   -- row within the sequence
+  pos_no        INT            NOT NULL DEFAULT 1,   -- place along the row
+
+  x_mm          DECIMAL(12,3)  NOT NULL,
+  y_mm          DECIMAL(12,3)  NOT NULL,
+  length_mm     DECIMAL(12,3)  NOT NULL,        -- as placed
+  width_mm      DECIMAL(12,3)  NOT NULL,        -- as placed
+  rotated       TINYINT(1)     NOT NULL DEFAULT 0,
+
+  deleted_at    DATETIME       DEFAULT NULL,
+  created_at    TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT            NULL,
+
+  is_live       TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cnp_tenant (company_id, id),
+  UNIQUE KEY uq_cnp_place  (company_id, plate_lot_id, seq_no, row_no, pos_no, is_live),
+  KEY idx_cnp_cut_order (company_id, plate_lot_id, seq_no, row_no, pos_no),
+  KEY idx_cnp_plate     (company_id, cut_plate_id),
+
+  CONSTRAINT fk_cnp_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cnp_lot     FOREIGN KEY (company_id, plate_lot_id) REFERENCES cf_plate_lots(company_id, id),
+  CONSTRAINT fk_cnp_cut     FOREIGN KEY (company_id, cut_plate_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cnp_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- ===========================================================================
+-- 23. CUT SETTINGS — the retrofit, and the shop's published kerf bands
+-- ===========================================================================
+--
+-- ORDERING A PLATE: add the margin, THEN round up to the step. The margin is
+-- real slack (mill edges are not straight) and must survive the rounding, so
+-- rounding comes second. Note this does NOT reproduce the shop sheet's own
+-- worked example, which takes 2562 -> 2600 (+38, a bare round-up leaving no
+-- slack at all); under this rule the same case orders 2650. Decided that way
+-- deliberately on 2026-09-25 — a bare round-up gives ZERO margin whenever the
+-- requirement is already a round number, which defeats the reason it exists.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_cut_settings' AND COLUMN_NAME = 'order_step_mm');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_cut_settings ADD COLUMN order_step_mm DECIMAL(10,3) NOT NULL DEFAULT 50.000 AFTER order_margin_width_mm',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The three published kerf bands, per company, seeded once.
+--
+-- WHY THIS SEED EXISTS. Without it every company falls through to a single
+-- built-in default of 3 mm for EVERY thickness, so a 40 mm plate would be
+-- nested at 3 mm instead of 5 and every part on thick plate would come out
+-- 2 mm undersized on each side. Silent, and only visible at the torch. Kerf
+-- must have exactly one source of truth and this is it.
+--
+--   5 - 16 mm : 3 mm      (the sheet quotes 2.5-3; 3 is the safe end)
+--   18 - 20 mm: 4 mm
+--   25 - 50 mm: 5 mm
+-- plus a default row for anything outside those bands.
+
+INSERT INTO cf_cut_settings
+  (company_id, thickness_min_mm, thickness_max_mm, kerf_mm, notes)
+SELECT c.id, b.lo, b.hi, b.kerf, b.note
+  FROM companies c
+  JOIN (SELECT  5.000 AS lo, 16.000 AS hi, 3.000 AS kerf, 'PFPL published band 5-16 mm' AS note
+        UNION ALL SELECT 18.000, 20.000, 4.000, 'PFPL published band 18-20 mm'
+        UNION ALL SELECT 25.000, 50.000, 5.000, 'PFPL published band 25-50 mm'
+        UNION ALL SELECT NULL,   NULL,   3.000, 'Default for thicknesses outside the published bands') b
+ WHERE c.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_cut_settings x
+                    WHERE x.company_id = c.id
+                      AND x.deleted_at IS NULL
+                      AND ((x.thickness_min_mm IS NULL AND b.lo IS NULL)
+                           OR (x.thickness_min_mm = b.lo AND x.thickness_max_mm = b.hi)));

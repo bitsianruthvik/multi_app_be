@@ -418,6 +418,47 @@ const core = {
         fields: [['recordCode', 'code', 'string'], ['recordName', 'name', 'string'], ['recordStatus', 'status', 'string']] },
     },
   }),
+
+  // Nesting. Reads only, and emphatically so: a lot and its placements are
+  // written together after the whole layout has been verified against the
+  // database, and a generic INSERT of one placement would be a rectangle
+  // nobody checked for overlap, kerf, sequence or steel.
+  cfErpCutSetting: resource({
+    table: 'cf_cut_settings', alias: 'ccst',
+    cols: [['thickness_min_mm', 'decimal'], ['thickness_max_mm', 'decimal'], ['kerf_mm', 'decimal'],
+           ['seq_gap_min_mm', 'decimal'], ['seq_gap_max_mm', 'decimal'],
+           ['order_margin_length_mm', 'decimal'], ['order_margin_width_mm', 'decimal'],
+           ['guillotine', 'integer'], ['notes', 'string']],
+    write: [],
+  }),
+  cfErpPlateLot: resource({
+    table: 'cf_plate_lots', alias: 'cpl',
+    cols: [['order_line_id', 'integer'], ['plate_item_id', 'integer'], ['lot_no', 'string'], ['source', 'string'],
+           ['origin_lot_id', 'integer'], ['thickness_mm', 'decimal'], ['length_mm', 'decimal'], ['width_mm', 'decimal'],
+           ['required_length_mm', 'decimal'], ['required_width_mm', 'decimal'], ['grade', 'string'], ['material', 'string'],
+           ['density', 'decimal'], ['kerf_mm', 'decimal'], ['seq_gap_min_mm', 'decimal'], ['seq_gap_max_mm', 'decimal'],
+           ['guillotine', 'integer'], ['is_manual', 'integer'], ['notes', 'string']],
+    write: [],
+    relations: {
+      plate: { table: 'cf_master_records', alias: 'cmr_pl', on: 'cpl.plate_item_id = cmr_pl.id',
+        fields: [['plateCode', 'code', 'string'], ['plateName', 'name', 'string']] },
+      line: { table: 'cf_sales_order_lines', alias: 'csol_pl', on: 'cpl.order_line_id = csol_pl.id',
+        fields: [['lineNo', 'line_no', 'integer'], ['orderId', 'order_id', 'integer']] },
+    },
+  }),
+  cfErpNestPlacement: resource({
+    table: 'cf_nest_placements', alias: 'cnp',
+    cols: [['plate_lot_id', 'integer'], ['cut_plate_id', 'integer'], ['seq_no', 'integer'], ['row_no', 'integer'],
+           ['pos_no', 'integer'], ['x_mm', 'decimal'], ['y_mm', 'decimal'], ['length_mm', 'decimal'],
+           ['width_mm', 'decimal'], ['rotated', 'integer']],
+    write: [],
+    relations: {
+      lot: { table: 'cf_plate_lots', alias: 'cpl_np', on: 'cnp.plate_lot_id = cpl_np.id',
+        fields: [['lotNo', 'lot_no', 'string'], ['orderLineId', 'order_line_id', 'integer'], ['plateItemId', 'plate_item_id', 'integer']] },
+      cutPlate: { table: 'cf_master_records', alias: 'cmr_np', on: 'cnp.cut_plate_id = cmr_np.id',
+        fields: [['cutPlateCode', 'code', 'string'], ['cutPlateName', 'name', 'string']] },
+    },
+  }),
 };
 
 // The parties module — people edit parties through its own routes (roles are

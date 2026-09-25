@@ -2075,5 +2075,198 @@
         ]
       }
     }
+  },
+  "cfErpCutSetting": {
+    "table": "cf_cut_settings",
+    "alias": "ccst",
+    "writeFields": [],
+    "fields": {
+      "id": "ccst.id",
+      "companyId": "ccst.company_id",
+      "thicknessMinMm": "ccst.thickness_min_mm",
+      "thicknessMaxMm": "ccst.thickness_max_mm",
+      "kerfMm": "ccst.kerf_mm",
+      "seqGapMinMm": "ccst.seq_gap_min_mm",
+      "seqGapMaxMm": "ccst.seq_gap_max_mm",
+      "orderMarginLengthMm": "ccst.order_margin_length_mm",
+      "orderMarginWidthMm": "ccst.order_margin_width_mm",
+      "guillotine": "ccst.guillotine",
+      "notes": "ccst.notes",
+      "createdAt": "ccst.created_at",
+      "updatedAt": "ccst.updated_at",
+      "createdBy": "ccst.created_by"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "thicknessMinMm": "decimal",
+      "thicknessMaxMm": "decimal",
+      "kerfMm": "decimal",
+      "seqGapMinMm": "decimal",
+      "seqGapMaxMm": "decimal",
+      "orderMarginLengthMm": "decimal",
+      "orderMarginWidthMm": "decimal",
+      "guillotine": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer"
+    },
+    "relations": {}
+  },
+  "cfErpPlateLot": {
+    "table": "cf_plate_lots",
+    "alias": "cpl",
+    "writeFields": [],
+    "fields": {
+      "id": "cpl.id",
+      "companyId": "cpl.company_id",
+      "orderLineId": "cpl.order_line_id",
+      "plateItemId": "cpl.plate_item_id",
+      "lotNo": "cpl.lot_no",
+      "source": "cpl.source",
+      "originLotId": "cpl.origin_lot_id",
+      "thicknessMm": "cpl.thickness_mm",
+      "lengthMm": "cpl.length_mm",
+      "widthMm": "cpl.width_mm",
+      "requiredLengthMm": "cpl.required_length_mm",
+      "requiredWidthMm": "cpl.required_width_mm",
+      "grade": "cpl.grade",
+      "material": "cpl.material",
+      "density": "cpl.density",
+      "kerfMm": "cpl.kerf_mm",
+      "seqGapMinMm": "cpl.seq_gap_min_mm",
+      "seqGapMaxMm": "cpl.seq_gap_max_mm",
+      "guillotine": "cpl.guillotine",
+      "isManual": "cpl.is_manual",
+      "notes": "cpl.notes",
+      "createdAt": "cpl.created_at",
+      "updatedAt": "cpl.updated_at",
+      "createdBy": "cpl.created_by",
+      "plateCode": "cmr_pl.code",
+      "plateName": "cmr_pl.name",
+      "lineNo": "csol_pl.line_no",
+      "orderId": "csol_pl.order_id"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderLineId": "integer",
+      "plateItemId": "integer",
+      "lotNo": "string",
+      "source": "string",
+      "originLotId": "integer",
+      "thicknessMm": "decimal",
+      "lengthMm": "decimal",
+      "widthMm": "decimal",
+      "requiredLengthMm": "decimal",
+      "requiredWidthMm": "decimal",
+      "grade": "string",
+      "material": "string",
+      "density": "decimal",
+      "kerfMm": "decimal",
+      "seqGapMinMm": "decimal",
+      "seqGapMaxMm": "decimal",
+      "guillotine": "integer",
+      "isManual": "integer",
+      "notes": "string",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "plateCode": "string",
+      "plateName": "string",
+      "lineNo": "integer",
+      "orderId": "integer"
+    },
+    "relations": {
+      "plate": {
+        "table": "cf_master_records",
+        "alias": "cmr_pl",
+        "on": "cpl.plate_item_id = cmr_pl.id",
+        "fields": [
+          "plateCode",
+          "plateName"
+        ]
+      },
+      "line": {
+        "table": "cf_sales_order_lines",
+        "alias": "csol_pl",
+        "on": "cpl.order_line_id = csol_pl.id",
+        "fields": [
+          "lineNo",
+          "orderId"
+        ]
+      }
+    }
+  },
+  "cfErpNestPlacement": {
+    "table": "cf_nest_placements",
+    "alias": "cnp",
+    "writeFields": [],
+    "fields": {
+      "id": "cnp.id",
+      "companyId": "cnp.company_id",
+      "plateLotId": "cnp.plate_lot_id",
+      "cutPlateId": "cnp.cut_plate_id",
+      "seqNo": "cnp.seq_no",
+      "rowNo": "cnp.row_no",
+      "posNo": "cnp.pos_no",
+      "xMm": "cnp.x_mm",
+      "yMm": "cnp.y_mm",
+      "lengthMm": "cnp.length_mm",
+      "widthMm": "cnp.width_mm",
+      "rotated": "cnp.rotated",
+      "createdAt": "cnp.created_at",
+      "updatedAt": "cnp.updated_at",
+      "createdBy": "cnp.created_by",
+      "lotNo": "cpl_np.lot_no",
+      "orderLineId": "cpl_np.order_line_id",
+      "plateItemId": "cpl_np.plate_item_id",
+      "cutPlateCode": "cmr_np.code",
+      "cutPlateName": "cmr_np.name"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "plateLotId": "integer",
+      "cutPlateId": "integer",
+      "seqNo": "integer",
+      "rowNo": "integer",
+      "posNo": "integer",
+      "xMm": "decimal",
+      "yMm": "decimal",
+      "lengthMm": "decimal",
+      "widthMm": "decimal",
+      "rotated": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "lotNo": "string",
+      "orderLineId": "integer",
+      "plateItemId": "integer",
+      "cutPlateCode": "string",
+      "cutPlateName": "string"
+    },
+    "relations": {
+      "lot": {
+        "table": "cf_plate_lots",
+        "alias": "cpl_np",
+        "on": "cnp.plate_lot_id = cpl_np.id",
+        "fields": [
+          "lotNo",
+          "orderLineId",
+          "plateItemId"
+        ]
+      },
+      "cutPlate": {
+        "table": "cf_master_records",
+        "alias": "cmr_np",
+        "on": "cnp.cut_plate_id = cmr_np.id",
+        "fields": [
+          "cutPlateCode",
+          "cutPlateName"
+        ]
+      }
+    }
   }
 }
