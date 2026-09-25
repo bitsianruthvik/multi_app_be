@@ -38,9 +38,10 @@
  * more is deleted with everything below it.
  */
 import { invalid, notFound } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES } from './records.js';
+import { LOCKED_ORDER_STATUSES, loadMaster } from './records.js';
 import { subtreeIds } from './tree.js';
 import { setValues, refreshValues } from './valueService.js';
+import { resolve as resolveSpecs } from './resolutionService.js';
 import { bomOfParent, createBom, insertLine, linesOfBom, nextLineNo, nextPosition, descendantIds } from './bomGraph.js';
 import { temporaryTree, deleteTemporaryTree, defaultCandidate } from './instantiationService.js';
 import { requireUsableFlow } from './flowService.js';
@@ -51,6 +52,68 @@ const SPEC_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE'];
 const CUT_PLATE_CODE = 'CUT_PLATE';
 const PLATE_CODE = 'PLATE';
 const PARTS_CODE = 'FAB_PARTS';
+
+/**
+ * A BLANK INHERITS ITS STEEL FROM THE PART IT SERVES — all of it, not four of it.
+ *
+ * The four sizes are what make two parts the SAME blank, so they are written
+ * explicitly. But a blank is filed at CUT_PLATE, and that node's chain can
+ * require more: in the KEPL tenant it inherits IMPACT_CLASS from the steel
+ * family, and without it `setStatus('active')` refuses EVERY derived blank and
+ * release stops behind a value nobody typed. A one-off script patched the
+ * blanks that already existed and its own comment said "worth folding into
+ * cutPlateService"; this is that, so the next order does not hit it again.
+ *
+ * Written as "whatever my own chain requires, ask the part for it" rather than
+ * as a fifth hard-coded code — a fifth only moves the problem to a sixth the
+ * next time somebody adds a rule to the steel family.
+ *
+ * It only ever COPIES. A value the part cannot answer either is left empty and
+ * the activation error reports it: inventing steel is worse than not guessing.
+ */
+
+/**
+ * Which specs a blank filed HERE will need beyond the four sizes. Resolved from
+ * the CLASSIFICATION once per derivation, not once per blank — every blank in a
+ * run is filed at the same node, and over the production link a needless
+ * resolve per blank is 49 ms each.
+ */
+async function extrasRequiredAt(db, companyId, classificationId) {
+  const view = await resolveSpecs(db, companyId, { nodeId: classificationId });
+  return (view.specs ?? [])
+    .filter((e) => e.applicable
+      && e.rule?.isRequired
+      && e.rule?.valueRule === 'entered'
+      && !SPEC_CODES.includes(e.spec.code))
+    .map((e) => e.spec.code);
+}
+
+/** Copy those from the part, where the part can answer. */
+async function inheritRemainingSteel(db, c, blankId, partId, extras) {
+  if (!extras?.length || !partId) return;
+  // loadMaster, NOT a bare row: resolve() needs source_definition_id to include
+  // the TEMPLATE DEFINITION level in the chain, and a part's steel is very often
+  // set there rather than typed onto the instance. A bare SELECT * silently
+  // drops that level and the value is never found.
+  const part = await loadMaster(db, c.companyId, partId);
+  if (!part) return;
+  const theirs = await resolveSpecs(db, c.companyId, { master: part });
+  const byCode = new Map((theirs.specs ?? []).map((e) => [e.spec.code, e]));
+
+  const writes = [];
+  for (const code of extras) {
+    const raw = byCode.get(code)?.value?.raw;
+    if (raw == null || raw === '') continue;          // the part cannot say either
+    writes.push({ specCode: code, value: raw });
+  }
+  if (!writes.length) return;
+  try {
+    await setValues(db, c, 'master', blankId, writes);
+  } catch (err) {
+    if (err.code !== 'INVALID_VALUES') throw err;
+    throw invalid('CUT_PLATE_INHERIT', `A cut plate could not take ${writes.map((w) => w.specCode).join(', ')} from the part it is cut from — the rule where cut plates are filed does not accept the part's own answer.`, { problems: err.problems ?? [] });
+  }
+}
 
 export const AREA_FRACTION_CAVEAT = 'The plate quantity is the blank\'s area divided by the raw plate\'s — it ignores how the blanks lie on the sheet and the offcut left over, so it is a first answer, not a nesting plan. Real nesting will replace it, and it will ask for more steel than this, not less.';
 
@@ -271,7 +334,7 @@ function group(parts) {
  * refuses drafts, so the structure is activated once, at the end, the way the
  * rest of it already is.
  */
-async function createCutPlate(db, c, { size, classificationId, place, flowId }) {
+async function createCutPlate(db, c, { size, classificationId, place, flowId, extras = [] }) {
   const [r] = await db.query(
     `INSERT INTO cf_master_records (company_id, record_kind, code, name, short_name, classification_id, status, default_flow_id, created_by)
      VALUES (?, 'item', NULL, '(pending)', 'CUTPL', ?, 'draft', ?, ?)`,
@@ -300,6 +363,8 @@ async function createCutPlate(db, c, { size, classificationId, place, flowId }) 
     if (err.code !== 'INVALID_VALUES') throw err;
     throw invalid('CUT_PLATE_SPECS', 'A cut plate cannot be given its size where cut plates are filed — the four specifications have to be set there, the way they are for bought plates.', { problems: err.problems ?? [] });
   }
+
+  await inheritRemainingSteel(db, c, id, place.partId ?? null, extras);
 
   const fallbackName = `Cut plate ${fmt(size.thickness)} × ${fmt(size.width)} × ${fmt(size.length)}${size.gradeText ? ` ${size.gradeText}` : ''}`;
   const named = await generate(db, c.companyId, 'item', 'name', { entityId: id }, { consume: true }).catch(() => null);
@@ -469,6 +534,9 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
     cutPlate: await nodeByCode(db, c.companyId, CUT_PLATE_CODE),
   };
   if (!places.cutPlate) throw invalid('NO_CUT_PLATE_CLASS', `There is no ${CUT_PLATE_CODE} variant under Steel › Plates — a cut plate has nowhere to be filed.`);
+  // Once per run: every blank here is filed at the same node, so ask it what it
+  // needs beyond the four sizes a single time rather than per blank.
+  const blankExtras = await extrasRequiredAt(db, c.companyId, places.cutPlate.id);
   const selection = await plateSelection(db, c.companyId);
 
   const { parts, cutPlates, links } = await survey(db, c.companyId, line, places);
@@ -509,8 +577,14 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
         size: g.size,
         classificationId: places.cutPlate.id,
         flowId,
+        extras: blankExtras,
         place: {
           ownerLineId: line.id,
+          // Any part of the pool can say what steel this is — they are pooled
+          // BECAUSE they share thickness, length, width and grade — so the
+          // first one is the blank's source for anything else its own
+          // classification requires.
+          partId: first.id,
           // One blank per piece of that part: the part's own quantity already
           // says how many pieces there are, so this line never multiplies.
           insert: (id) => addChild(db, c, first.id, { childId: id, designId: id, quantity: 1, role: 'Cut from' }),
