@@ -650,7 +650,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
         sizeAdvice.push({
           thickness: g.thickness, grade: g.grade, material: g.material, kind: 'ordering margin',
           lotNo: n.lotNo, plateCode: n.plateCode,
-          detail: `${n.plateCode} is ${fmt(n.length)} × ${fmt(n.width)}; the layout needs ${fmt(n.requiredLength)} × ${fmt(n.requiredWidth)}, and plate is ordered +${fmt(settings.orderMarginLengthMm)} on length and +${fmt(settings.orderMarginWidthMm)} on width because plate edges are not straight. A plate of at least ${fmt(wantL)} × ${fmt(wantW)} would carry this layout with the margin the shop expects.`,
+          detail: `${n.plateCode} is ${fmt(n.length)} × ${fmt(n.width)}; the layout needs ${fmt(n.requiredLength)} × ${fmt(n.requiredWidth)}, so it is being cut closer to the edge than the shop likes — it wants +${fmt(settings.orderMarginLengthMm)} on length and +${fmt(settings.orderMarginWidthMm)} on width spare, because mill edges are not straight. No size you stock is at least ${fmt(wantL)} × ${fmt(wantW)}, which is what would carry this layout with that margin. This is advice, not a blocker.`,
         });
       }
     }

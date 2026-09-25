@@ -2212,11 +2212,16 @@ CREATE TABLE IF NOT EXISTS cf_cut_settings (
 -- TWO SIZES, ON PURPOSE.
 --   required_length_mm / required_width_mm  what the layout actually needs,
 --                                           kerf and sequence gaps included.
---   length_mm / width_mm                    what is ORDERED and what the
---                                           geometry is verified against.
--- Procurement buys the ordered one. The difference is the ordering margin
--- (21a), not waste, and quoting wastage against the ordered size without
--- saying so would make every plate look worse than it is.
+--   length_mm / width_mm                    the STOCKED PLATE this lot is,
+--                                           and what the geometry is verified
+--                                           against.
+-- The shop ALWAYS BUYS A STOCKED SIZE (decided 2026-09-25), so length_mm IS
+-- what is bought — there is no third "ordered" number and deliberately no
+-- column for one, because a number nobody buys would be read as one somebody
+-- does. The gap between the two is the spare on a stocked plate, not waste, and
+-- quoting wastage against the plate without saying so makes every one of them
+-- look worse than it is. The +50/+100 ordering margin is therefore ADVICE: the
+-- only thing it can say is "no size you stock leaves the margin you want here".
 --
 -- The same reasoning puts kerf, the sequence gaps and guillotine here: they are
 -- resolved from cf_cut_settings when the plan is accepted and RECORDED, so
