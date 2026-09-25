@@ -99,19 +99,57 @@ export const ORDER_MARGIN = Object.freeze({ lengthMm: 100, widthMm: 50, stepMm: 
  * re-deciding which plate each part lands on.
  */
 export const EFFORT = Object.freeze({
-  quick: { label: 'Quick', repairs: 0, capMs: 1_500 },
-  standard: { label: 'Standard', repairs: 60, capMs: 8_000 },
-  deep: { label: 'Deep', repairs: 400, capMs: 30_000 },
+  quick: { label: 'Quick', restarts: 0, repairs: 0, capMs: 1_500 },
+  standard: { label: 'Standard', restarts: 8, repairs: 60, capMs: 60_000 },
+  deep: { label: 'Deep', restarts: 32, repairs: 400, capMs: 180_000 },
 });
 
 /**
- * Seeded restarts, the SAME NUMBER at every effort. Only `repairs` grows, so a
- * deeper run is a strict PREFIX EXTENSION of a shallower one — identical trials
- * in identical order from an identical state. That makes "more effort is never
- * worse" true by construction rather than by hoping the RNG is kind. `quick`
- * has no repairs and therefore no restarts either, which is still a prefix.
+ * RESTARTS ARE THE HALF THAT PAYS, AND THIS LADDER IS SET FROM MEASUREMENT.
+ *
+ * Measured on the real KEPL line (2,116 pieces, 6 steel groups, 652 t), with
+ * repairs held at 60 and the search given room not to be truncated:
+ *
+ *   restarts   steel bought   plates
+ *      3        651.863 t      107     <- what this used to be
+ *      8        651.158 t      106     <- the knee: 705 kg for five more trials
+ *     16        651.158 t      106        identical, not one gram
+ *     32        651.124 t      105        a further 34 kg
+ *     64        651.266 t      105     <- WORSE, and worth understanding
+ *
+ * Restarts EXPLORE — a different starting arrangement. Repairs EXPLOIT — tear
+ * up the emptiest plates of the answer you have and rebuild them. This layout
+ * is decided mostly by where the search starts, so exploring beats exploiting:
+ * 3 restarts with deep repairs bought 338 kg, while 8 restarts with ordinary
+ * repairs bought 705 kg in less time.
+ *
+ * WHY 64 CAME OUT WORSE THAN 32, which a superset of trials should not be able
+ * to do: the DEADLINE truncated it. Restarts run before repairs, so enough of
+ * them eat the budget the repairs needed and the run stops early. "More effort
+ * is never worse" holds only while a run is NOT capped — `capped` in the result
+ * says which happened, and capMs is raised here so the ladder is not silently
+ * cut off. Turning restarts up without turning the budget up buys nothing and
+ * can cost.
+ *
+ * capMs is per STEEL GROUP and is set so the biggest real order finishes:
+ *   cap 20s -> 651.533 t, one group capped
+ *   cap 45s -> 651.158 t, one group capped
+ *   cap 60s -> 651.158 t, NONE capped   <- standard
+ * A capped run quietly throws away the restarts it was told to make, and the
+ * only sign is `deterministic: false` in the result. Budget it from the knee,
+ * do not guess it.
+ *
+ * Trial i is seeded from (seed, i) alone, so a shallower run's restarts are a
+ * PREFIX of a deeper one's and best-of-N stays monotone. That is what keeps
+ * the guarantee true by construction rather than by hoping the RNG is kind.
  */
-const RESTARTS = 3;
+const RESTARTS = 8;
+
+/** Benchmark/override hook: how many seeded restarts this run may use. */
+const restartsFor = (level, opts) => {
+  const n = Number(opts?.restarts);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : (level.restarts ?? RESTARTS);
+};
 
 /** Steps between breaths in `nestAsync`. Small enough to stay answerable. */
 const BREATHE_EVERY = 64;
@@ -967,12 +1005,13 @@ function* repair(ctx, cur, step) {
 function* search(ctx) {
   let best = yield* buildSolution(ctx, null); // trial 0: THE FLOOR. Always runs.
   let capped = false;
-  const total = ctx.level.repairs ? RESTARTS + ctx.level.repairs : 0;
+  const restarts = ctx.restarts;
+  const total = (ctx.level.repairs || restarts) ? restarts + ctx.level.repairs : 0;
 
   for (let step = 1; step <= total; step += 1) {
     if (Date.now() >= ctx.deadline) { capped = true; break; }
     if (best.strandedQty === 0 && best.score <= ctx.lowerBound + EPS) break; // provably done
-    const cand = step <= RESTARTS
+    const cand = step <= restarts
       ? yield* buildSolution(ctx, rngFor(ctx.seed, step))
       : yield* repair(ctx, best, step);
     if (cand && better(cand, best)) { best = cand; ctx.stall = 0; } else ctx.stall += 1;
@@ -1140,6 +1179,7 @@ function* solve(input) {
     rem0,
     seed: Number(seed) | 0,
     level,
+    restarts: restartsFor(level, input ?? {}),
     stall: 0,
     maxNests: Math.max(1, Math.trunc(Number(maxNests))),
     lowerBound: Math.max(0, pieceArea - ownedArea),

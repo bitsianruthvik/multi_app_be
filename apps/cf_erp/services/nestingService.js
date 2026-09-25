@@ -629,6 +629,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       guillotine,
       effort: input.effort ?? 'standard',
       seed: input.seed ?? 1,
+      restarts: input.restarts ?? undefined,
       budgetMs: input.budgetMs ?? null,
     }) ?? {};
 
