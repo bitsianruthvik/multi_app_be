@@ -1,0 +1,4 @@
+# A shell script must keep LF. A CRLF shebang fails with "bad interpreter: ...^M",
+# on Git Bash under Windows as well as on Linux, and core.autocrlf=true would
+# otherwise rewrite these on every checkout.
+*.sh text eol=lf
