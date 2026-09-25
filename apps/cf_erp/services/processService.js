@@ -207,9 +207,9 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
-    key: 'blanks',
-    label: 'Cut plates',
-    description: 'Pooling the parts into the blanks they are cut from.',
+    key: 'cut_pieces',
+    label: 'Cut pieces',
+    description: 'Pooling the parts into the cut pieces they come off a plate as.',
     /*
      * WHY THIS IS ITS OWN STAGE AND NOT PART OF NESTING.
      *
@@ -227,21 +227,21 @@ export const STAGE_CATALOGUE = [
      */
     applies: (ctx) => ctx.nesting.items.length > 0,
     state(ctx) {
-      const made = ctx.nesting.blanks ?? 0;
+      const made = ctx.nesting.cutPieces ?? 0;
       if (made > 0) {
         return {
           state: 'done',
-          detail: `${n(made, 'rectangle')} pooled from the line's plate parts`,
+          detail: `${n(made, 'cut piece')} pooled from the line's plate parts`,
           blockers: [],
         };
       }
       const items = ctx.nesting.items;
       return {
         state: 'todo',
-        detail: `${n(items.length, 'material')} to cut — no blanks derived yet`,
+        detail: `${n(items.length, 'material')} to cut — no cut pieces derived yet`,
         blockers: [{
           count: items.length,
-          message: `Line ${ctx.line.line_no} has parts that are cut from plate, but nothing has been pooled into blanks yet. Derive the cut plates, and nesting has something to lay out.`,
+          message: `Line ${ctx.line.line_no} has parts that are cut from plate, but nothing has been pooled into cut pieces yet. Derive them, and nesting has something to lay out.`,
         }],
       };
     },
@@ -1079,8 +1079,9 @@ async function loadOrderContext(db, companyId, order, lines) {
       GROUP BY pl.order_line_id, pl.company_id`,
     [companyId, lines.map((l) => l.id)],
   ) : [[]];
-  // 5c. How many blanks a line already has. The blanks stage is done when the
-  // rectangles exist; nesting is done when they are laid out. Two questions.
+  // 5c. How many cut pieces a line already has. The Cut pieces stage is done
+  // when the rectangles exist; nesting is done when they are laid out. Two
+  // questions, two counts.
   const [blankRows] = lines.length ? await db.query(
     `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
        FROM cf_master_records m
@@ -1090,7 +1091,7 @@ async function loadOrderContext(db, companyId, order, lines) {
       GROUP BY i.owner_order_line_id`,
     [companyId, lines.map((l) => l.id)],
   ) : [[]];
-  const blanksBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
+  const cutPiecesBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
 
   const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
     lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
@@ -1111,7 +1112,7 @@ async function loadOrderContext(db, companyId, order, lines) {
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, lotsBy, blanksBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
+  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
 }
 
 /**
@@ -1220,7 +1221,7 @@ function lineContext(ctx, order, line) {
     nesting: {
       items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })),
       saved: ctx.lotsBy.get(line.id) ?? null,
-      blanks: ctx.blanksBy.get(line.id) ?? 0,
+      cutPieces: ctx.cutPiecesBy.get(line.id) ?? 0,
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
@@ -1284,7 +1285,7 @@ function notApplicableDetail(key, ctx) {
   switch (key) {
     case 'structure': return 'Sells a catalog item with no BOM — there is nothing under it';
     case 'values': return 'Nothing under this line has a required value to capture';
-    case 'blanks':
+    case 'cut_pieces':
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.
