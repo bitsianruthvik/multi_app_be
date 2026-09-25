@@ -100,8 +100,8 @@ export const ORDER_MARGIN = Object.freeze({ lengthMm: 100, widthMm: 50, stepMm: 
  */
 export const EFFORT = Object.freeze({
   quick: { label: 'Quick', restarts: 0, repairs: 0, capMs: 1_500 },
-  standard: { label: 'Standard', restarts: 8, repairs: 60, capMs: 60_000 },
-  deep: { label: 'Deep', restarts: 32, repairs: 400, capMs: 180_000 },
+  standard: { label: 'Standard', restarts: 32, repairs: 60, seeds: 1, capMs: 60_000 },
+  deep: { label: 'Deep', restarts: 64, repairs: 400, seeds: 4, capMs: 300_000 },
 });
 
 /**

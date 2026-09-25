@@ -80,6 +80,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import { subtreeIds } from './tree.js';
 import { explode } from './bomService.js';
+import { runAll, pickBest } from '../lib/packerPool.js';
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -128,6 +129,32 @@ export function publishedKerf(thicknessMm) {
     ? PUBLISHED_KERF_BANDS[PUBLISHED_KERF_BANDS.length - 1].kerfMm
     : DEFAULT_CUT_SETTINGS.kerfMm;
 }
+
+/**
+ * HOW MANY SEEDS A PLAN TRIES, AND WHY MORE THAN ONE.
+ *
+ * Running several seeds and keeping the best is a real mechanism and it works:
+ * the layouts differ, and on one steel group here seed 7 genuinely beat seed 1.
+ * It is just the EXPENSIVE axis. Measured end to end on the real KEPL line:
+ *
+ *   1 seed  x  8 restarts   651.158 t    23 s
+ *   1 seed  x 32 restarts   650.991 t    35 s   <- 167 kg for 12 s
+ *   8 seeds x 32 restarts   650.964 t   138 s   <-  27 kg for 103 s
+ *   8 seeds x 64 restarts   650.923 t   259 s
+ *
+ * Per second of compute more restarts pay 14 kg, more seeds 0.26 kg. Fifty
+ * times worse — because restarts inside ONE run inherit the repairs that
+ * improved the running best, while independent seeds each spend their repair
+ * budget on their own local best and throw the rest away.
+ *
+ * Nor are seeds free in wall clock, which was the hope. Six steel groups times
+ * eight seeds is 48 CPU-bound jobs on seven workers: seven waves, not one. The
+ * floor is the single slowest GROUP and no number of cores gets under it.
+ *
+ * So one seed by default, four at Deep as insurance against an order where seed
+ * 1 is not the lucky one. Settable per request for anyone wanting to spend it.
+ */
+export const DEFAULT_SEEDS = 1;
 
 export const DEFAULT_CUT_SETTINGS = {
   kerfMm: 3,
@@ -557,6 +584,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
 
   const problems = [];
   const manual = [];
+  const seedsTried = [];
   const nestable = [];
   for (const cp of cutPlates) {
     if (!cp.pieces) continue;                       // nothing of it is needed
@@ -580,6 +608,24 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
 
   const groups = [];
   const sizeAdvice = [];
+
+  /*
+   * EVERY GROUP, EVERY SEED, ALL AT ONCE.
+   *
+   * The steel groups are strictly independent — a 28 mm layout cannot affect a
+   * 16 mm one — but they used to be packed one after another, so six groups
+   * cost six packs of wall clock on a machine with eight idle cores.
+   *
+   * So this runs in two passes. The first works out WHAT to pack (database
+   * work, this thread). Then every (group x seed) job is dispatched to the
+   * worker pool together. The second pass shapes the winners.
+   *
+   * Measured on the real KEPL line: the seed alone moves the answer ~500 kg,
+   * so the best of several seeds is worth having — but only because they cost
+   * the wall clock of one. Keeping the best is done by SCORE with the seed as
+   * the tie-break, never by which worker finished first.
+   */
+  const prepared = [];
   for (const g of [...byGroup.values()].sort((a, b) => a.thickness - b.thickness || String(a.key).localeCompare(String(b.key)))) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
@@ -616,7 +662,10 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     //
     // The sequence gap is sent at the BOTTOM of the band: it is legal, it is
     // what the verifier accepts, and it is the least steel.
-    const out = await pack({
+    // EVERY SEED FOR THIS GROUP AT ONCE, AND THE BEST ONE KEPT. The winner is
+    // chosen by steel bought with the seed as the tie-break — never by whichever
+    // worker finished first, or the same order would lay out differently twice.
+    const packInput = {
       pieces: pieces.map((p) => ({ key: p.key, length: p.length, width: p.width, qty: p.qty, grain: p.grain })),
       sheets: sheets.map((s) => ({ key: s.key, length: s.length, width: s.width, available: s.available, preferred: s.preferred, areaCost: s.areaCost })),
       kerf: settings.kerfMm,
@@ -631,7 +680,46 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       seed: input.seed ?? 1,
       restarts: input.restarts ?? undefined,
       budgetMs: input.budgetMs ?? null,
-    }) ?? {};
+    };
+
+    prepared.push({ g, sheets, pieces, settings, guillotine, packInput });
+  }
+
+  // ---- pack everything, in parallel ----------------------------------------
+  // Effort carries a seed count too: Deep buys insurance against an unlucky
+  // draw, Standard does not pay for it.
+  const effortSeeds = (await import('./nestingPacker.js')).EFFORT?.[input.effort ?? 'standard']?.seeds;
+  const seedCount = Math.max(1, Math.trunc(Number(input.seeds ?? effortSeeds ?? DEFAULT_SEEDS)) || 1);
+  const outByGroup = new Map();
+  if (input.pack) {
+    // A caller injected its own packer (the tests do). Run it here, in order.
+    for (const pr of prepared) outByGroup.set(pr.g.key, (await pack(pr.packInput)) ?? {});
+  } else {
+    const jobs = [];
+    for (const pr of prepared) {
+      const base = Number(pr.packInput.seed) || 1;
+      for (let i = 0; i < seedCount; i += 1) {
+        jobs.push({ key: pr.g.key, seed: base + i, input: { ...pr.packInput, seed: base + i } });
+      }
+    }
+    const runs = await runAll(jobs);
+    for (const pr of prepared) {
+      const mine = runs
+        .map((r, i) => ({ ...r, seed: jobs[i].seed, key: jobs[i].key }))
+        .filter((r) => r.key === pr.g.key);
+      const best = pickBest(mine);
+      outByGroup.set(pr.g.key, best?.out ?? {});
+      if (seedCount > 1) {
+        seedsTried.push({
+          thickness: pr.g.thickness, grade: pr.g.grade, tried: mine.length, won: best?.seed ?? null,
+        });
+      }
+    }
+  }
+
+  // ---- shape the winners ---------------------------------------------------
+  for (const { g, sheets, pieces, settings, guillotine } of prepared) {
+    const out = outByGroup.get(g.key) ?? {};
 
     const sheetByKey = new Map(sheets.map((s) => [s.key, s]));
     const pieceByKey = new Map(pieces.map((p) => [p.key, p]));
@@ -677,6 +765,9 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     manual,
     sizeAdvice,
     problems,
+    // Which seeds were tried and which won, so a plan can say how it was reached
+    // and a better one can be got back by asking for that seed again.
+    seeds: seedsTried,
     totals: totalsOf(groups),
   };
 }
