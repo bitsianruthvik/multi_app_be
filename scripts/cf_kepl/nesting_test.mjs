@@ -36,6 +36,7 @@ const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
 const { pool } = await imp('db.js');
 const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 const S = await imp('apps/cf_erp/services/nestingService.js');
+const SHEET = await imp('apps/cf_erp/services/nestingSheetService.js');
 
 const COMPANY = Number(process.env.CF_NEST_COMPANY ?? 2);
 const T = 7.777;                         // a thickness nothing else in the catalog has
@@ -510,11 +511,11 @@ try {
   /* ---- 12. the Excel round trip ----------------------------------------- */
   section('12. The sheet goes out and comes back, and coming back IS accepting');
   await S.acceptNesting(conn, c, fixture.lineId, plan2);            // a clean state to export
-  const sheet = await S.exportNestingSheet(conn, COMPANY, fixture.lineId);
+  const sheet = await SHEET.exportSheet(conn, COMPANY, fixture.lineId);
   eq('one row per piece', sheet.rows, 9);
   eq('it is the saved plan, not a fresh proposal', sheet.saved, true);
   ok('and it is a workbook', sheet.buffer[0] === 0x50 && sheet.buffer[1] === 0x4b);
-  const back = await S.importNestingSheet(conn, c, fixture.lineId, { fileBase64: sheet.buffer.toString('base64') });
+  const back = await SHEET.importSheet(conn, c, fixture.lineId, { fileBase64: sheet.buffer.toString('base64') });
   eq('reading it back rewrites the same two lots', back.lots, 2);
   eq('with the same nine pieces', back.pieces, 9);
   eq('and it says where it came from', back.source, 'sheet');

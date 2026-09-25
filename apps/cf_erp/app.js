@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes from './routes/index.js';
-import nestingRoutes from './routes/nesting.js';
 import codegenModule from './modules/codegen/index.js';
 import partiesModule, { registerReferenceCheck } from './modules/parties/index.js';
 import { partyReferences } from './services/salesOrderService.js';
@@ -53,10 +52,6 @@ export default {
 
   register(server) {
     server.use('/api/:companySlug/cf_erp', indexRoutes);
-    // Nesting — the cut plates laid out on real raw plates. Mounted here rather
-    // than folded into routes/index.js only because it was written alongside
-    // the packer; move it in with the rest when that settles.
-    server.use('/api/:companySlug/cf_erp', nestingRoutes);
     server.use('/api/:companySlug/cf_erp', codegenModule.createRouter({ viewPerm: PERM.view, managePerm: PERM.codegen }));
     server.use('/api/:companySlug/cf_erp', partiesModule.createRouter({ viewPerm: PERM.ordersView, managePerm: PERM.parties }));
   },

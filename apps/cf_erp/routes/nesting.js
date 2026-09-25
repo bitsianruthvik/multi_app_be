@@ -4,8 +4,8 @@
  *   GET  /orders/:orderId/lines/:lineId/nesting          the SAVED plan
  *   POST /orders/:orderId/lines/:lineId/nesting/plan     { effort?, guillotine?, seed? } — propose
  *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it
- *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the layout as a workbook
- *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { fileBase64 } — read it back
+ *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the layout as a workbook (?format=csv)
+ *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { fileBase64, dryRun? } — read it back
  *
  * A LOOK IS A LOOK. The GET reads what was accepted and does not re-pack:
  * re-solving on every open cost the other system a 36-second spinner, and a
@@ -31,9 +31,11 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import {
-  planNesting, acceptNesting, getNesting, exportNestingSheet, importNestingSheet, assertLineOnOrder,
-} from '../services/nestingService.js';
+import { planNesting, acceptNesting, getNesting, assertLineOnOrder } from '../services/nestingService.js';
+// The sheet is its own service: the workbook, its locked columns, its banner and
+// the diff a dry run reports are a different job from laying steel out, and
+// nestingService is long enough already.
+import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -67,19 +69,23 @@ router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
   handle((req) => write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}))));
 
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
-  const out = await read(req, (db, companyId, id) => exportNestingSheet(db, companyId, id));
+  const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id, { format: req.query.format }));
   res.setHeader('Content-Type', out.contentType);
   res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
   res.setHeader('Content-Length', String(out.buffer.length));
   // Says what the caller got without having to open the file: how many pieces,
-  // and whether this is the saved plan or a proposal made because none exists.
+  // how many plates, and whether this is the saved plan or a proposal made
+  // because none exists.
   res.setHeader('X-CF-Sheet-Rows', String(out.rows));
+  res.setHeader('X-CF-Sheet-Lots', String(out.lots));
   res.setHeader('X-CF-Sheet-Saved', out.saved ? '1' : '0');
   res.send(out.buffer);
 }));
 
-// Uploading the sheet IS accepting it. The workbook says so on its own face.
+// UPLOADING THE SHEET IS ACCEPTING IT. The workbook says so on its own face, in
+// a banner across its first row, because in fab it surprised people. `dryRun`
+// is the way to see what it would do first; it writes nothing.
 router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
-  handle((req) => write(req, (db, c, id) => importNestingSheet(db, c, id, req.body ?? {}))));
+  handle((req) => write(req, (db, c, id) => importSheet(db, c, id, req.body ?? {}))));
 
 export default router;
