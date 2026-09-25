@@ -214,26 +214,39 @@ export const STAGE_CATALOGUE = [
     applies: (ctx) => ctx.nesting.items.length > 0,
     state(ctx) {
       const items = ctx.nesting.items;
+      const saved = ctx.nesting.saved;
+
       /*
-       * THERE IS NOWHERE TO RECORD A NESTING PLAN YET.
+       * DONE MEANS A PLAN IS SAVED, AND NOTHING WEAKER.
        *
-       * The kind exists because a process must be able to say the step
-       * happens; the screen and its tables do not. Reporting `done` because
-       * nothing contradicts it would be the worst of the options — it is the
-       * exact lie fab_erp's nesting stage learned not to tell, where "every
-       * part has material" went green and the first person to find out
-       * otherwise was a cutter.
+       * cf_plate_lots is the record: one row per physical plate, written only
+       * by acceptNesting, which refuses a layout that does not cover every
+       * required piece. So lots existing means this line IS laid out — there is
+       * no partial accept to mistake for a whole one.
        *
-       * So it stays `todo`, and says why in words. A company that does not
-       * want the gate marks the stage OPTIONAL, or answers NESTING with no on
-       * the item — both are one click, and both are honest.
+       * This used to be hardcoded `todo` because nothing could record a plan.
+       * That was right then and is wrong now, but the reason behind it still
+       * stands and is worth keeping: do not report `done` because nothing
+       * contradicts it. That is the lie fab_erp's nesting stage told, where
+       * "every part has material" went green and the first person to find out
+       * otherwise was a cutter. Green here is read off saved rows, never off
+       * the absence of a complaint.
        */
+      if (saved?.lots > 0) {
+        const byHand = saved.manual > 0 ? `, ${saved.manual} by hand` : '';
+        return {
+          state: 'done',
+          detail: `${n(saved.lots, 'plate')} laid out, ${n(saved.pieces, 'piece')} placed${byHand}`,
+          blockers: [],
+        };
+      }
+
       return {
         state: 'todo',
-        detail: `${n(items.length, 'material')} to nest — ${nameList(items.map((i) => i.label))} · nothing records a nesting plan yet`,
+        detail: `${n(items.length, 'material')} to nest — ${nameList(items.map((i) => i.label))} · no plan saved yet`,
         blockers: [{
           count: items.length,
-          message: `Line ${ctx.line.line_no} has ${n(items.length, 'material')} whose ${NESTING_SPEC_CODE} says it must be nested, and there is no nesting screen yet. Mark the stage optional on the process, or answer ${NESTING_SPEC_CODE} with no.`,
+          message: `Line ${ctx.line.line_no} has ${n(items.length, 'material')} whose ${NESTING_SPEC_CODE} says it must be nested, and no nesting plan has been accepted. Open Nesting to lay them out, mark the stage optional on the process, or answer ${NESTING_SPEC_CODE} with no.`,
         }],
       };
     },
@@ -1008,6 +1021,28 @@ async function loadOrderContext(db, companyId, order, lines) {
   ) : [[]];
   const releases = new Map(relRows.map((r) => [r.order_line_id, { id: r.id, steps: Number(r.steps), doneSteps: Number(r.done_steps) }]));
 
+  // 5b. The nesting actually saved against each line. cf_plate_lots is one row
+  // per physical plate, so counting them is counting plates; the placements
+  // under them are pieces. acceptNesting refuses a plan that does not cover
+  // every required piece, so lots existing means the line IS laid out.
+  const [lotRows] = lines.length ? await db.query(
+    `SELECT pl.order_line_id,
+            COUNT(*) AS lots,
+            SUM(pl.is_manual) AS manual_lots,
+            (SELECT COUNT(*) FROM cf_nest_placements np
+              WHERE np.company_id = pl.company_id AND np.plate_lot_id IN (
+                SELECT p2.id FROM cf_plate_lots p2
+                 WHERE p2.company_id = pl.company_id AND p2.order_line_id = pl.order_line_id AND p2.deleted_at IS NULL)
+                AND np.deleted_at IS NULL) AS pieces
+       FROM cf_plate_lots pl
+      WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
+      GROUP BY pl.order_line_id, pl.company_id`,
+    [companyId, lines.map((l) => l.id)],
+  ) : [[]];
+  const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
+    lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
+  }]));
+
   // 6. Specification chains for every item, and the NESTING answer on each.
   const chains = await chainsFor(db, companyId, [...detail.values()].map((d) => ({
     id: d.master_id, classification_id: d.classification_id, source_definition_id: d.source_definition_id,
@@ -1023,7 +1058,7 @@ async function loadOrderContext(db, companyId, order, lines) {
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
+  return { trees, detail, free, onOrder, releases, lotsBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
 }
 
 /**
@@ -1129,7 +1164,10 @@ function lineContext(ctx, order, line) {
     material: split.material,
     unresolved: split.unresolved,
     drafts: split.drafts,
-    nesting: { items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })) },
+    nesting: {
+      items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })),
+      saved: ctx.lotsBy.get(line.id) ?? null,
+    },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
   };

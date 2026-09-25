@@ -2388,3 +2388,44 @@ SELECT c.id, b.lo, b.hi, b.kerf, b.note
                       AND x.deleted_at IS NULL
                       AND ((x.thickness_min_mm IS NULL AND b.lo IS NULL)
                            OR (x.thickness_min_mm = b.lo AND x.thickness_max_mm = b.hi)));
+
+-- ===========================================================================
+-- 24. NEST_MANUAL — holding a rectangle back from the packer
+-- ===========================================================================
+--
+-- Some pieces are laid out by hand: an awkward offcut, a leftover, anything the
+-- shop wants to place itself. NEST_MANUAL on a cut plate is how it is held back.
+--
+-- WHY IT IS SEEDED. nestingService READS it tolerantly — a company without the
+-- specification simply has nothing marked manual. But WRITING a value needs an
+-- assignment saying the specification applies and is `entered`, so without this
+-- the toggle on the nesting screen returns 422 on a tenant nobody has hand-set
+-- up. Reading and writing disagreeing about whether a thing exists is the kind
+-- of gap that only shows up in front of a user.
+--
+-- `entered` on purpose: it reads the record's own row and is never inherited,
+-- so marking one rectangle by hand cannot quietly mark its siblings.
+--
+-- The assignment is only created where a CUT_PLATE classification already
+-- exists, because that node is tenant setup rather than app schema.
+
+INSERT INTO cf_specifications (company_id, code, name, data_type, description, status)
+SELECT c.id, 'NEST_MANUAL', 'Nest by hand', 'boolean',
+       'Yes means the packer leaves this rectangle alone and somebody lays it out by hand, on the nesting screen or in the nesting sheet.',
+       'active'
+  FROM companies c
+ WHERE c.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_specifications s
+                    WHERE s.company_id = c.id AND s.code = 'NEST_MANUAL' AND s.deleted_at IS NULL);
+
+INSERT INTO cf_spec_assignments
+  (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule)
+SELECT n.company_id, s.id, 'classification', n.id, 'item', 0, 1, 'entered'
+  FROM cf_classification_nodes n
+  JOIN cf_specifications s
+    ON s.company_id = n.company_id AND s.code = 'NEST_MANUAL' AND s.deleted_at IS NULL
+ WHERE n.code = 'CUT_PLATE' AND n.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_spec_assignments a
+                    WHERE a.company_id = n.company_id AND a.specification_id = s.id
+                      AND a.subject_type = 'classification' AND a.subject_id = n.id
+                      AND a.deleted_at IS NULL);
