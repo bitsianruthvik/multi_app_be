@@ -446,7 +446,37 @@ async function chosenPlate(db, companyId, childId) {
  * fraction. Creates it, or moves the quantity when the parts or the chosen
  * plate changed. Never a second line, however often this runs.
  */
-async function reconcilePlateLine(db, c, cutPlate, size, selection) {
+/**
+ * The cut pieces of a line that an ACCEPTED NESTING has laid out.
+ *
+ * Once a line is nested, a cut piece's plate line no longer carries the area
+ * fraction: acceptNesting repoints it at the plate the layout actually uses and
+ * writes the real share of it — waste included. That number is the one
+ * procurement must buy from.
+ *
+ * This used to be invisible to the derivation, which rewrote any plate quantity
+ * that differed from the area fraction. After nesting every one differs, so
+ * "Derive again" silently put the smaller area fractions back under 120 nested
+ * plates — the nesting stage still said done while the buy list under-ordered
+ * by exactly the waste. It happened in production on 2026-09-26.
+ *
+ * So a nested cut piece's plate line belongs to NESTING. The derivation reads
+ * it, reports it, and does not write it.
+ */
+async function nestedCutPlates(db, companyId, orderLineId) {
+  const [rows] = await db.query(
+    `SELECT DISTINCT np.cut_plate_id
+       FROM cf_nest_placements np
+       JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
+      WHERE np.company_id = ? AND pl.order_line_id = ? AND np.deleted_at IS NULL`,
+    [companyId, orderLineId],
+  );
+  return new Set(rows.map((r) => Number(r.cut_plate_id)));
+}
+
+const NESTED_NOTE = 'This quantity comes from the accepted nesting — the real share of the plate it is cut from, waste included — not the area fraction. Nesting the line again is what changes it.';
+
+async function reconcilePlateLine(db, c, cutPlate, size, selection, { nested = null } = {}) {
   const bom = await bomOfParent(db, c.companyId, cutPlate.id);
   const lines = bom ? await linesOfBom(db, c.companyId, bom.id) : [];
   const own = lines.filter((l) => l.selection_definition_id === selection.id || l.design_id === selection.id);
@@ -467,6 +497,20 @@ async function reconcilePlateLine(db, c, cutPlate, size, selection) {
   }
   // Still nothing chosen: if the selection has since gained a default, the line
   // takes it, exactly as a line created now would. A plate a PERSON chose is
+  // Laid out by an accepted nesting: the plate and the quantity are the
+  // nesting's answer. Touch neither — see nestedCutPlates.
+  if (nested && nested.has(Number(cutPlate.id))) {
+    const plate = keep.child_record_kind === 'item' ? await chosenPlate(db, c.companyId, keep.child_id) : null;
+    return {
+      quantity: round6(Number(keep.quantity)),
+      basis: 'nesting',
+      note: NESTED_NOTE,
+      plate: plate ? { id: plate.id, code: plate.code, name: plate.name } : null,
+      changed: false,
+      otherLines: extra.length,
+    };
+  }
+
   // never second-guessed — this only fills a blank in.
   let chosenId = keep.child_record_kind === 'item' ? keep.child_id : null;
   let filled = false;
@@ -522,6 +566,7 @@ const describe = (cp, size, parts, plateLine) => ({
  */
 export async function deriveCutPlates(db, c, orderLineId, input = {}) {
   const line = await requireLine(db, c.companyId, orderLineId, { lock: true });
+  const nested = await nestedCutPlates(db, c.companyId, orderLineId);
   assertOpen(line);
   if (!line.item_id) throw invalid('NO_ITEM', `Line ${line.line_no} of ${line.order_code} has no item yet.`);
 
@@ -608,7 +653,7 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
       await addChild(db, c, p.id, { childId: cp.id, designId: cp.id, quantity: 1, role: 'Cut from' });
       touched.add(p.id);
     }
-    const plateLine = await reconcilePlateLine(db, c, cp, g.size, selection);
+    const plateLine = await reconcilePlateLine(db, c, cp, g.size, selection, { nested });
     if (plateLine.changed && !created.includes(cp.id)) updated.push(cp.id);
     for (const p of g.parts) touched.add(p.id);
     out.push(describe(cp, g.size, g.parts, plateLine));
@@ -647,6 +692,7 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
 /** The cut plates a line already has, exactly as they stand. Writes nothing. */
 export async function getCutPlates(db, companyId, orderLineId) {
   const line = await requireLine(db, companyId, orderLineId);
+  const nested = await nestedCutPlates(db, companyId, orderLineId);
   if (!line.item_id) throw invalid('NO_ITEM', `Line ${line.line_no} of ${line.order_code} has no item yet.`);
   const places = {
     parts: await partsNode(db, companyId),
@@ -663,9 +709,12 @@ export async function getCutPlates(db, companyId, orderLineId) {
     const own = (bom ? await linesOfBom(db, companyId, bom.id) : []).filter((l) => l.selection_definition_id === selection.id || l.design_id === selection.id);
     const keep = own[0] ?? null;
     const plate = keep && keep.child_record_kind === 'item' ? await chosenPlate(db, companyId, keep.child_id) : null;
-    const fresh = plateQuantity(cp.size, plate);
+    const isNested = nested.has(Number(cp.id));
+    // A nested quantity differs from the area fraction ON PURPOSE. Calling it
+    // stale told people to derive again, which is what destroyed the nesting.
+    const fresh = isNested ? { quantity: null, basis: 'nesting', note: NESTED_NOTE } : plateQuantity(cp.size, plate);
     const stored = keep ? round6(Number(keep.quantity)) : null;
-    const stale = stored != null && Math.abs(stored - fresh.quantity) > 1e-9;
+    const stale = !isNested && stored != null && Math.abs(stored - fresh.quantity) > 1e-9;
     out.push(describe(cp, cp.size, mine, {
       ...fresh,
       quantity: stored,
