@@ -224,14 +224,14 @@ async function ensureRules(db) {
   });
 
   // A girder is cut into segments along its length, and the girder is already
-  // in the parent code, so the segment is the number alone: ...-G1-1 .. ...-G1-5.
-  await putScheme(db, {
-    code: 'CFTMP-SEGMENT', name: 'Girder segment on an order', entityType: 'item', targetField: 'code',
-    seqScope: 'prefix', priority: -10, status: 'active',
-    description: 'The girder line code and the segment number along it: SO-20260924-0003-SPAN-01-G1-1. The number is the BOM position, which is the segment\'s DRAWING_MARK by construction.',
-    conditions: [temporary, inside, { tokenKey: 'classification', operator: 'eq', value: await nodeId(db, 'GIRDER_SEGMENT') }],
-    segments: [tok('parent.code'), lit('-'), tok('position', { format: '0' })],
-  });
+  // in the parent code, so a segment is the number alone: …-G1-1 .. …-G1-5.
+  // That used to take a rule of its own (CFTMP-SEGMENT). It takes none now:
+  // the segment template's short name is set to NONE (ensureShortNames), so
+  // CFTMP-PART prints nothing where the short name goes and the range is the
+  // segment number (user, 2026-09-26). An old CFTMP-SEGMENT is retired here.
+  const [retired] = VERIFY_ONLY ? [{ affectedRows: 0 }] : await db.query(
+    "UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND code = 'CFTMP-SEGMENT' AND status = 'active' AND deleted_at IS NULL", [COMPANY]);
+  if (retired.affectedRows) { tally.rules += 1; say('   CFTMP-SEGMENT     retired — the segment template\'s short name is none, so CFTMP-PART codes it'); }
 
   // A blank has no one parent — the same rectangle is cut for up to 20 parts —
   // so it is coded by WHERE IT BELONGS and WHAT IT IS, with no placement
@@ -261,21 +261,31 @@ async function ensureRules(db) {
  * A girder line is called G1 on every drawing of every bridge, so G is the
  * design's own short name, not a patch on this order. Its code (GLINE-002) was
  * minted once and does not move — a short name only feeds codes made from now on.
+ *
+ * A girder segment has NO short name, on purpose: its code is its girder's and
+ * its number, …-G1-1, under the one part rule (user, 2026-09-26).
  */
-const SHORT_NAMES = [{ name: 'Girder line', shortName: 'G' }];
+const SHORT_NAMES = [{ name: 'Girder line', shortName: 'G' }, { classification: 'GIRDER_SEGMENT', none: true }];
 
 async function ensureShortNames(db) {
   say('\n--- short names -------------------------------------------------------');
   for (const want of SHORT_NAMES) {
-    const [[d]] = await db.query(
+    // By name, or every template filed under a classification.
+    const [defs] = await db.query(
       `SELECT m.id, m.code, m.short_name FROM cf_master_records m
-         JOIN cf_definition_details dd ON dd.master_id = m.id AND dd.deleted_at IS NULL
-        WHERE m.company_id = ? AND m.name = ? AND m.deleted_at IS NULL`, [COMPANY, want.name]);
-    if (!d) { problems.push(`template definition "${want.name}" not found`); continue; }
-    if (d.short_name === want.shortName) { say(`   ${d.code.padEnd(17)} short name already ${want.shortName}`); continue; }
-    if (!VERIFY_ONLY) await recs.updateRecord(db, c, d.id, { shortName: want.shortName });
-    tally.shortNames += 1;
-    say(`   ${d.code.padEnd(17)} short name ${d.short_name} -> ${want.shortName}`);
+         JOIN cf_definition_details dd ON dd.master_id = m.id AND dd.deleted_at IS NULL AND dd.definition_type = 'template'
+         LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND ${want.classification ? 'n.code = ?' : 'm.name = ?'}`,
+      [COMPANY, want.classification ?? want.name]);
+    if (!defs.length) { problems.push(`template definition "${want.classification ?? want.name}" not found`); continue; }
+    const shown = (v) => (v === '' ? 'none' : v ?? 'not set');
+    const target = want.none ? '' : want.shortName;
+    for (const d of defs) {
+      if (d.short_name === target) { say(`   ${d.code.padEnd(17)} short name already ${shown(target)}`); continue; }
+      if (!VERIFY_ONLY) await recs.updateRecord(db, c, d.id, want.none ? { noShortName: true } : { shortName: want.shortName });
+      tally.shortNames += 1;
+      say(`   ${d.code.padEnd(17)} short name ${shown(d.short_name)} -> ${shown(target)}`);
+    }
   }
 }
 

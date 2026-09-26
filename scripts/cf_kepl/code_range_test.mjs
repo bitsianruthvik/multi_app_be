@@ -515,6 +515,35 @@ try {
   same('a template\'s BOM: nothing checked, nothing changed', [tmplOut.checked, tmplOut.changed.length], [0, 0]);
   eq('in one query', tmpl.tally.n, 1);
 
+  /* ---- a short name set to none ------------------------------------------ */
+  // User, 2026-09-26: the girder-segment rule "is a bit too much — rather give
+  // an option to give empty in short name which should ideally produce the same
+  // effect". Set to NONE, the segment template prints nothing where the short
+  // name goes, so the ONE part rule {parent.code}-{record.shortName}{range}
+  // codes a segment …-1, …-2 — and with the segment's own piece rule switched
+  // off, the one piece rule codes its pieces …-1-1, …-1-2.
+  section('16b. A short name set to NONE prints nothing — a segment needs no rule of its own');
+  const sgNone = await MR.updateRecord(conn, c, f.SG.id, { noShortName: true });
+  same('the definition keeps an empty short name, flagged none', [sgNone.shortName, sgNone.noShortName], ['', true]);
+  await conn.query("UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND id = ?", [COMPANY, f.rules.pieceSeg.id]);
+  const order2 = await SO.createOrder(conn, c, { orderType: 'customer', customerId: party.id, code: `${tag}-SO2`, title: `Range fixture 2 ${tag}`, committedDate: '2026-12-31' });
+  await SO.addOrderLine(conn, c, order2.id, { recordId: f.GR.id, quantity: 1 });
+  const [[line2]] = await conn.query('SELECT id, item_id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [COMPANY, order2.id]);
+  const root2Code = await codeOf(conn, line2.item_id);
+  const segs2 = await rowsOf(conn, line2.item_id);
+  same('a new girder\'s segments are its code and their number alone', segs2.map((r) => r.code), [`${root2Code}-1`, `${root2Code}-2`]);
+  const inSeg2 = await segmentOf(conn, segs2[0].childId);
+  same('and what sits inside a segment is built on that code', [inSeg2.tf.code, inSeg2.is23.code, inSeg2.is3.code], [`${root2Code}-1-TF1`, `${root2Code}-1-IS1-23`, `${root2Code}-1-IS24-26`]);
+  const byGenerator = await generate(conn, COMPANY, 'item', 'code', { entityId: segs2[1].childId }, { consume: false });
+  same('the code generator agrees, and nothing is "missing" — none is not empty', [byGenerator?.text, byGenerator?.missing ?? []], [`${root2Code}-2`, []]);
+  const pieces2 = await REL.previewReleaseCodes(conn, COMPANY, line2.id);
+  const noneSegPieces = pieces2.nodes.filter((n) => segs2.some((s) => s.childId === n.itemId)).map((n) => n.code);
+  same('released, a segment piece is its parent piece and its number — by the one piece rule', noneSegPieces, [`${root2Code}-1-1`, `${root2Code}-1-2`]);
+  ok('with no missing value and no clash', pieces2.missing.length === 0 && pieces2.duplicates.length === 0, JSON.stringify({ missing: pieces2.missing, duplicates: pieces2.duplicates }));
+  const sgBack = await MR.updateRecord(conn, c, f.SG.id, { noShortName: false, shortName: null });
+  const fallback = await generate(conn, COMPANY, 'item', 'code', { entityId: segs2[0].childId }, { consume: false });
+  same('set back to not-set, the fallback returns: the first word of the name', [sgBack.shortName, sgBack.noShortName, fallback?.text], [null, false, `${root2Code}-SEGMENT1`]);
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {

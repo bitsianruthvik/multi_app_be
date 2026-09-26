@@ -240,6 +240,18 @@ async function ensurePieceRules(db) {
       [tok('parent.code'), lit('-'), tok('piece.seq')]));
   }
 
+  // A derived piece rule outlives the item rule it was made for only by accident.
+  // CFTMP-SEGMENT was retired when the segment template's short name became
+  // NONE (user, 2026-09-26) — CFPC-PART then codes a segment piece …-1-G1-1 by
+  // itself — so a CFPC-<X> whose CFTMP-<X> is no longer an active rule that
+  // prints no short name is retired with it.
+  for (const full of await schemes(db, 'production_piece')) {
+    if (full.status !== 'active' || ['CFPC-TOP', 'CFPC-PART'].includes(full.code) || ours.has(full.code) || !/^CFPC-/.test(full.code)) continue;
+    await db.query("UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND id = ?", [COMPANY, full.id]);
+    changes.push({ code: full.code, from: patternOf(full), to: 'retired' });
+    say(`   ${full.code.padEnd(17)} retired — the item rule it was derived from is gone; CFPC-PART codes these pieces`);
+  }
+
   // Anybody else's production-piece rule that numbers pieces along the line.
   for (const full of await schemes(db, 'production_piece')) {
     if (ours.has(full.code) || !full.segments.some((s) => isToken(s, 'piece.no'))) continue;

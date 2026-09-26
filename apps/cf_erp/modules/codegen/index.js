@@ -21,7 +21,7 @@ const __dirname = path.dirname(__filename);
  *     registerEntity). Providers live with the entity that owns them.
  *   - The host supplies permission tags when it mounts the routes.
  */
-export { registerEntity, generate, listEntities } from './engine.js';
+export { registerEntity, generate, listEntities, BLANK } from './engine.js';
 export { findConditionsReferencing, findSegmentsUsingToken } from './service.js';
 export { CodegenError } from './errors.js';
 

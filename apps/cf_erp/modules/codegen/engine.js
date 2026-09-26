@@ -29,6 +29,16 @@ import { CodegenError } from './errors.js';
 const registry = new Map();
 const SEQ_MARK = '\u0000#\u0000'; // NULs cannot occur in a rendered code
 
+/**
+ * A token a provider answers with BLANK is empty ON PURPOSE: it prints nothing
+ * and is never "missing". An empty answer (null, '') means the record has no
+ * value yet, and a required segment then holds the code back. The difference
+ * matters for a short name deliberately set to none (user, 2026-09-26): a
+ * girder segment prints no short name — {parent.code}-{record.shortName}{range}
+ * reads …-G1-1 — where an item nobody has named yet must wait.
+ */
+export const BLANK = Object.freeze({ blank: true, toString: () => '' });
+
 export function registerEntity(entityType, provider) {
   if (registry.has(entityType)) throw new Error(`[codegen] entity type "${entityType}" registered twice`);
   registry.set(entityType, provider);
@@ -221,6 +231,7 @@ export async function renderSegments(db, companyId, scheme, segments, context, {
         break;
       case 'token': {
         const raw = context.get(seg.token_key);
+        if (raw === BLANK) break;   // empty on purpose: prints nothing, and is not missing
         if (raw === null || raw === undefined || raw === '') {
           if (seg.is_required) missing.push(seg.token_key);
           break;

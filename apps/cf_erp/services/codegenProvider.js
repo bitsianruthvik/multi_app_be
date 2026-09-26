@@ -6,7 +6,7 @@
  *
  * Imported once by app.js for its side effect of registering the entity types.
  */
-import { registerEntity } from '../modules/codegen/index.js';
+import { registerEntity, BLANK } from '../modules/codegen/index.js';
 import { ancestors, LEAF_DEPTH } from './tree.js';
 import { loadMaster, kindOf } from './records.js';
 import { resolve, effectiveByCode } from './resolutionService.js';
@@ -20,14 +20,22 @@ import { PLACED, shortNameOf, rangeOfPlacement, savedPieceSeq } from './codeRang
  * else the first word of its name. The rule lives in codeRangeService, because
  * rows share a running count (the `range` token) exactly when their codes
  * print the same short name — so there must be one copy of it.
+ *
+ * A short name deliberately set to NONE prints nothing: the code generator is
+ * handed BLANK, which is never "missing". That is how a girder segment reads
+ * …-G1-1 under the one part rule, {parent.code}-{record.shortName}{range},
+ * with no rule of its own (user, 2026-09-26).
  */
-const shortOf = shortNameOf;
+const shortOf = (record, def = null) => {
+  const s = shortNameOf(record, def);
+  return s === '' ? BLANK : s;
+};
 
 /** `range` as a code prints it: 24 for a single piece (a number, so a 00 format pads it), "24-26" for several. */
 const rangeValue = (r) => (r?.start == null ? null : r.count === 1 ? r.start : r.text);
 
 const COMMON_TOKENS = [
-  { key: 'record.shortName', label: 'Short name (falls back to the first word of the name)', available: true },
+  { key: 'record.shortName', label: 'Short name — its own, else its template’s, else the first word of its name; set to none, it prints nothing', available: true },
   { key: 'classification.code', label: 'Variant code', available: true },
   { key: 'classification.name', label: 'Variant name', available: true },
   { key: 'family.code', label: 'Family code', available: true },
@@ -600,7 +608,7 @@ registerEntity('purchase_order', {
 // its name. A code nobody can read is still better than no code at all.
 
 const PIECE_TOKENS = [
-  { key: 'item.shortName', label: 'Item short name (its definition’s, or its first word)', available: true },
+  { key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true },
   { key: 'item.code', label: 'Item code', available: true },
   { key: 'definition.shortName', label: 'Template definition short name', available: true },
   { key: 'order.code', label: 'Sales order number', available: true },
@@ -722,7 +730,7 @@ registerEntity('production_piece', {
 
 // A lot of stock: what production put on the shelf, or what a delivery brought in.
 const LOT_TOKENS = [
-  { key: 'item.shortName', label: 'Item short name (its definition’s, or its first word)', available: true },
+  { key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true },
   { key: 'item.code', label: 'Item code', available: true },
   { key: 'order.code', label: 'The order it was made on', available: true },
   { key: 'piece.code', label: 'The production piece it came from', available: true },

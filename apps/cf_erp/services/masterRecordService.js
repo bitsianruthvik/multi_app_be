@@ -39,6 +39,13 @@ const blank = (v) => v == null || String(v).trim() === '';
  * The few characters that stand for the thing ("WEB", "FLG") — the code
  * generator builds stock and WIP codes from it, so it is kept in one case and
  * free of anything that would not survive being pasted into a code.
+ *
+ * Three states, on purpose. A value prints. NULL is "not set yet": codes fall
+ * back to the template's short name, then to the first word of the name. An
+ * EMPTY string is "none" — set deliberately (`noShortName: true`), it prints
+ * nothing and stops the fallback: a girder segment reads …-G1-1 under the one
+ * part rule, with no rule of its own (user, 2026-09-26). A blank field on a
+ * form means "not set", never "none" — that takes the explicit flag.
  */
 function readShortName(raw, problems) {
   if (blank(raw)) return null;
@@ -52,7 +59,7 @@ function readBase(input, problems) {
   if (code && (!CODE_RE.test(code) || code.length > 100)) problems.push('Code: up to 100 letters, digits and - _ . /, no spaces.');
   const name = blank(input.name) ? null : String(input.name).trim();
   if (name && name.length > 255) problems.push('Name is up to 255 characters.');
-  const shortName = readShortName(input.shortName, problems);
+  const shortName = input.noShortName === true ? '' : readShortName(input.shortName, problems);
   const revision = blank(input.revision) ? null : String(input.revision).trim();
   if (revision && revision.length > 20) problems.push('Revision is up to 20 characters.');
   if (input.status && !['draft', 'active'].includes(input.status)) problems.push('A new record starts as draft or active.');
@@ -197,7 +204,8 @@ export async function updateRecord(db, c, id, input = {}) {
   }
   // Unlike the code, this one stays editable at any status: it feeds the codes
   // generated for stock and WIP from now on, not a code already on a document.
-  if (input.shortName !== undefined) sets.short_name = readShortName(input.shortName, problems);
+  if (input.noShortName === true) sets.short_name = '';
+  else if (input.shortName !== undefined || input.noShortName === false) sets.short_name = readShortName(input.shortName, problems);
   if (input.description !== undefined) sets.description = blank(input.description) ? null : String(input.description);
   if (input.defaultFlowId !== undefined) {
     if (m.record_kind === 'definition' && m.definition_type === 'selection') problems.push('A selection chooses a catalog item — it is not made here, so it has no flow.');
@@ -419,6 +427,8 @@ function shapeRecord(m) {
     code: m.code,
     name: m.name,
     shortName: m.short_name ?? null,
+    /** The short name was set to none: codes print nothing where it goes (shortName is ''). */
+    noShortName: m.short_name === '',
     description: m.description,
     classificationId: m.classification_id,
     status: m.status,

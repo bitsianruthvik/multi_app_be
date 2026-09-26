@@ -68,7 +68,12 @@ export const seqValue = (start, count) => (count === 1 ? start : `${start}-${sta
 
 // ---- short names ---------------------------------------------------------------
 
-const namedShort = (record) => (record?.short_name ? String(record.short_name).toUpperCase() : null);
+/**
+ * A record's own short name. NULL is "not set yet" — fall back. An EMPTY one
+ * was set to none on purpose (user, 2026-09-26) and stops the fallback: it
+ * prints nothing, and its rows share one count under their parent.
+ */
+const namedShort = (record) => (record?.short_name == null ? null : String(record.short_name).toUpperCase());
 
 /** Last resort: the first word of the name, so a rule still renders before anybody fills the field in. */
 const wordShort = (record) => {
