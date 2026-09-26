@@ -2,6 +2,9 @@
  * tracker.js — release to production and the production tracker (Phase 5).
  *
  *   GET    /order-lines/:id/release-check   what releasing the line would create, and what stops it
+ *   GET    /order-lines/:id/release-preview every piece release would make and the code it would get —
+ *                                           read-only, heavy (6,072 pieces on the KEPL line); a released
+ *                                           line says so instead
  *   POST   /order-lines/:id/release         { notes? } — releases the WHOLE line (decision E1)
  *   GET    /releases/:id                    the tracker tree, every step's status, the material
  *   DELETE /releases/:id                    takes a release back — nothing started, nothing issued
@@ -22,7 +25,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  releaseCheck, releaseLine, getRelease, unrelease, orderProduction, listTrackerSteps, listTrackerMaterials,
+  releaseCheck, releasePreview, releaseLine, getRelease, unrelease, orderProduction, listTrackerSteps, listTrackerMaterials,
   startStep, recordProgress, holdStep, resumeStep, stepHistory,
   reserveRequirement, reserveRelease, issueRequirement, releaseReservation,
 } from '../services/releaseService.js';
@@ -37,6 +40,7 @@ const manage = guard(PERM.production);
 const stock = guard(PERM.inventory);
 
 router.get('/order-lines/:id/release-check', view, handle((req) => releaseCheck(pool, company(req), id(req))));
+router.get('/order-lines/:id/release-preview', view, handle((req) => releasePreview(pool, company(req), id(req))));
 router.post('/order-lines/:id/release', manage, handle((req) => tx(req, (db, c) => releaseLine(db, c, id(req), req.body ?? {}))));
 router.get('/releases/:id', view, handle((req) => getRelease(pool, company(req), id(req))));
 router.delete('/releases/:id', manage, handle((req) => tx(req, (db, c) => unrelease(db, c, id(req)))));
