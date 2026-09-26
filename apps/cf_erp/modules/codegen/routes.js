@@ -9,6 +9,8 @@
  *   PUT    /codegen/schemes/:id     replace a rule, whole
  *   DELETE /codegen/schemes/:id
  *   POST   /codegen/preview         what a record (saved or draft) would get — never consumes a number
+ *   POST   /codegen/explain         the rules screen's guide for one record: which rule wins and why,
+ *                                   what each part of a pattern prints, what each token holds
  */
 import { Router } from 'express';
 import { protect } from '../../../../core/middleware/authmiddleware.js';
@@ -16,7 +18,7 @@ import { requirePerm, fail } from '../../../../core/middleware/requirePerm.js';
 import { pool } from '../../../../db.js';
 import { CodegenError } from './errors.js';
 import { listEntities, generate } from './engine.js';
-import { listSchemes, getScheme, createScheme, updateScheme, deleteScheme, checkScheme } from './service.js';
+import { listSchemes, getScheme, createScheme, updateScheme, deleteScheme, checkScheme, explainRecord } from './service.js';
 
 async function inTransaction(fn) {
   const conn = await pool.getConnection();
@@ -104,6 +106,26 @@ export function createCodegenRouter({ viewPerm, managePerm }) {
       }
       const out = await generate(conn, companyId, b.entityType, b.targetField ?? 'code', subject, { consume: false, inline });
       return out ?? { schemeId: null, schemeCode: null, text: null, number: null, missing: [], noRule: true };
+    } finally {
+      try { await conn.rollback(); } catch { /* nothing was written */ }
+      conn.release();
+    }
+  }));
+
+  /**
+   * body: { entityType, targetField, entityId? | draft?, scheme?, keys? }
+   * For one sample record: every active rule for the entity and field with each
+   * condition held or not, which one wins and why (decided by the same code as
+   * generate()), the unsaved `scheme` taking part in place of its saved self;
+   * what each part of that scheme's pattern prints; what each token in `keys`
+   * holds. Guarded like /preview, and like it always rolled back.
+   */
+  router.post('/codegen/explain', view, handle(async (req) => {
+    const { companyId } = who(req);
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      return await explainRecord(conn, companyId, req.body ?? {});
     } finally {
       try { await conn.rollback(); } catch { /* nothing was written */ }
       conn.release();

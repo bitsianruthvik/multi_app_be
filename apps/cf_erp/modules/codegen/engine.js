@@ -5,9 +5,10 @@
  *
  *   registerEntity('item', {
  *     label,                       // shown in the rules screen
- *     tokens,                      // [{ key, label, available, note }] renderable values
- *     tokenPatterns,               // [{ pattern: 'spec:<CODE>', label }] families of tokens
- *     conditionTokens,             // [{ key, label, operators, valueKind, values? }]
+ *     tokens,                      // [{ key, label, available, note, phrase, help, example }] renderable values
+ *     tokenPatterns,               // [{ pattern: 'spec:<CODE>', label, phrase, help, example }] families of tokens
+ *     conditionTokens,             // [{ key, label, operators, valueKind, values?, phrase, help }]
+ *                                  // phrase/help/example are the rules screen's guide, shown as written
  *     validateToken(db, companyId, key)        -> null | problem text
  *     validateCondition(db, companyId, cond)   -> null | problem text
  *     loadContext(db, companyId, entityId)     -> Context
@@ -66,13 +67,16 @@ export function listEntities() {
 // Scheme selection
 // ---------------------------------------------------------------------------
 
-/**
- * The single active scheme that applies to a context: every condition must
- * hold; the highest total weight wins (a deeper classification weighs more);
- * `priority` breaks a tie; a remaining tie is a configuration error, reported
- * rather than decided by row order.
+/*
+ * Selection is three steps, and selectScheme (which picks the rule a code is
+ * made by) and explainSelection (which tells the rules screen why) run the
+ * SAME three: candidates() loads the rules, evaluate() tests them, rank()
+ * orders the ones that apply. There is no second copy of the logic to drift —
+ * whatever the screen says wins is what generate() uses.
  */
-export async function selectScheme(db, companyId, entityType, targetField, context) {
+
+/** The active rules for one entity type and field, each with its conditions: [{ scheme, conditions }]. */
+async function candidates(db, companyId, entityType, targetField) {
   const [schemes] = await db.query(
     `SELECT id, code, name, seq_scope, priority
        FROM cf_code_schemes
@@ -80,7 +84,7 @@ export async function selectScheme(db, companyId, entityType, targetField, conte
         AND status = 'active' AND deleted_at IS NULL`,
     [companyId, entityType, targetField],
   );
-  if (!schemes.length) return null;
+  if (!schemes.length) return [];
 
   const [conditions] = await db.query(
     `SELECT scheme_id, token_key, operator, value
@@ -90,29 +94,137 @@ export async function selectScheme(db, companyId, entityType, targetField, conte
   );
   const bySchemeId = new Map(schemes.map((s) => [s.id, []]));
   for (const c of conditions) bySchemeId.get(c.scheme_id).push(c);
+  return schemes.map((scheme) => ({ scheme, conditions: bySchemeId.get(scheme.id) }));
+}
 
-  const matching = [];
-  for (const scheme of schemes) {
-    let weight = 0;
-    let holds = true;
-    for (const cond of bySchemeId.get(scheme.id)) {
+/**
+ * Tests every rule against the record. A rule applies when every condition
+ * holds; its weight is the sum of its conditions' weights (a deeper
+ * classification weighs more). EVERY condition is tested, not only those up to
+ * the first that fails — the screen shows each one held or not — which changes
+ * nothing about the choice: a test only reads.
+ */
+function evaluate(list, context) {
+  return list.map((candidate) => {
+    const checks = candidate.conditions.map((cond) => {
       const r = context.test(cond);
-      if (!r.ok) { holds = false; break; }
-      weight += r.weight;
-    }
-    if (holds) matching.push({ ...scheme, weight });
-  }
-  if (!matching.length) return null;
+      return { cond, ok: !!r.ok, weight: r.weight };
+    });
+    const applies = checks.every((c) => c.ok);
+    let weight = 0;
+    if (applies) for (const c of checks) weight += c.weight;
+    return { ...candidate, checks, applies, weight: applies ? weight : null };
+  });
+}
 
-  matching.sort((a, b) => b.weight - a.weight || b.priority - a.priority);
-  const [top, second] = matching;
-  if (second && second.weight === top.weight && second.priority === top.priority) {
-    const tied = matching.filter((s) => s.weight === top.weight && s.priority === top.priority).map((s) => s.code);
-    throw new CodegenError(409, 'SCHEME_TIE',
-      `Coding rules ${tied.join(' and ')} apply equally here. Make one more specific, or give one a higher priority.`,
-      { problems: tied });
+/**
+ * Orders the rules that apply: the highest total weight first, `priority`
+ * breaking a tie. Rules still level at the top are `tied` — a configuration
+ * error, reported rather than decided by row order.
+ */
+function rank(evaluated) {
+  const matching = evaluated.filter((e) => e.applies);
+  matching.sort((a, b) => b.weight - a.weight || b.scheme.priority - a.scheme.priority);
+  const [top = null, second = null] = matching;
+  const level = (e) => e.weight === top.weight && e.scheme.priority === top.scheme.priority;
+  const tied = second && level(second) ? matching.filter(level) : null;
+  return { matching, top, second, tied };
+}
+
+function tieError(tied) {
+  const codes = tied.map((e) => e.scheme.code);
+  return new CodegenError(409, 'SCHEME_TIE',
+    `Coding rules ${codes.join(' and ')} apply equally here. Make one more specific, or give one a higher priority.`,
+    { problems: codes });
+}
+
+/**
+ * The single active scheme that applies to a context: every condition must
+ * hold; the highest total weight wins (a deeper classification weighs more);
+ * `priority` breaks a tie; a remaining tie is a configuration error, reported
+ * rather than decided by row order.
+ */
+export async function selectScheme(db, companyId, entityType, targetField, context) {
+  const list = await candidates(db, companyId, entityType, targetField);
+  if (!list.length) return null;
+  const { top, tied } = rank(evaluate(list, context));
+  if (!top) return null;
+  if (tied) throw tieError(tied);
+  return { ...top.scheme, weight: top.weight };
+}
+
+/**
+ * Why a record gets the rule it gets — "which rule wins" on the rules screen.
+ * The same candidates(), evaluate() and rank() as selectScheme, so the answer
+ * is the one generate() acts on. Two differences, both on purpose: a tie is an
+ * answer here, not an error; and the rule being edited takes part as it WILL
+ * be once saved.
+ *
+ * draft (optional) — the unsaved rule:
+ *   { id?, code, name, seqScope, priority, status, conditions: [{ token_key, operator, value }], problems? }
+ * It stands in for the saved rule with its id, or joins the rules when new.
+ * Inactive, it takes no part (as it would not once saved) but is still tested,
+ * so the screen can say whether it would apply. With `problems` — a condition
+ * with no value yet — it is left out untested, and so is its saved self.
+ *
+ * Returns
+ *   rules      [{ id, code, name, priority, draft, conditions: [{ tokenKey, operator, value, ok, weight }],
+ *                 applies, weight, place, verdict: wins|tied|beaten|no|off|unfinished, problems? }]
+ *              — the rules that apply in the order they rank, then the rest
+ *   winner     { id, code, draft } | null
+ *   decidedBy  only | weight | priority | tie | none
+ *   runnerUp   the rule the winner beat: { id, code, draft, weight, priority } | null
+ *   tied       [code] | null — the codes SCHEME_TIE would name, in its order
+ */
+export async function explainSelection(db, companyId, entityType, targetField, context, { draft = null } = {}) {
+  let list = await candidates(db, companyId, entityType, targetField);
+  let aside = null;
+  if (draft) {
+    const own = {
+      draft: true,
+      scheme: { id: draft.id ?? null, code: draft.code, name: draft.name, seq_scope: draft.seqScope ?? 'prefix', priority: draft.priority },
+      conditions: draft.conditions ?? [],
+    };
+    if (draft.id != null) list = list.filter(({ scheme }) => scheme.id !== draft.id);
+    if (draft.problems?.length) aside = { ...own, checks: [], applies: false, weight: null, verdict: 'unfinished', problems: draft.problems };
+    else if (draft.status !== 'active') aside = { ...evaluate([own], context)[0], verdict: 'off' };
+    else list.push(own);
   }
-  return top;
+
+  const evaluated = evaluate(list, context);
+  const { matching, top, second, tied } = rank(evaluated);
+  const verdict = (e) => {
+    if (!e.applies) return 'no';
+    if (tied) return tied.includes(e) ? 'tied' : 'beaten';
+    return e === top ? 'wins' : 'beaten';
+  };
+  const byCode = (a, b) => String(a.scheme.code).localeCompare(String(b.scheme.code));
+  const ordered = [
+    ...matching.map((e, i) => ({ ...e, place: i + 1, verdict: verdict(e) })),
+    ...evaluated.filter((e) => !e.applies).sort(byCode).map((e) => ({ ...e, place: null, verdict: 'no' })),
+    ...(aside ? [{ ...aside, place: null }] : []),
+  ];
+  const ref = (e) => (e ? { id: e.scheme.id, code: e.scheme.code, draft: !!e.draft } : null);
+
+  return {
+    rules: ordered.map((e) => ({
+      id: e.scheme.id,
+      code: e.scheme.code,
+      name: e.scheme.name,
+      priority: e.scheme.priority,
+      draft: !!e.draft,
+      conditions: e.checks.map(({ cond, ok, weight }) => ({ tokenKey: cond.token_key, operator: cond.operator, value: cond.value, ok, weight })),
+      applies: e.applies,
+      weight: e.weight,
+      place: e.place,
+      verdict: e.verdict,
+      ...(e.problems ? { problems: e.problems } : {}),
+    })),
+    winner: top && !tied ? ref(top) : null,
+    decidedBy: !top ? 'none' : tied ? 'tie' : !second ? 'only' : top.weight !== second.weight ? 'weight' : 'priority',
+    runnerUp: top && second && !tied ? { ...ref(second), weight: second.weight, priority: second.scheme.priority } : null,
+    tied: tied ? tied.map((e) => e.scheme.code) : null,
+  };
 }
 
 async function loadSegments(db, companyId, schemeId) {

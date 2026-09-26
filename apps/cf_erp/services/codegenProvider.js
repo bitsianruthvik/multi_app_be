@@ -34,13 +34,61 @@ const shortOf = (record, def = null) => {
 /** `range` as a code prints it: 24 for a single piece (a number, so a 00 format pads it), "24-26" for several. */
 const rangeValue = (r) => (r?.start == null ? null : r.count === 1 ? r.start : r.text);
 
+/*
+ * THE GUIDE. Every token and condition below carries its own plain words, and
+ * the Coding rules screen shows them as they are — it holds no per-token text
+ * of its own — so a token gets its guide by being defined here:
+ *
+ *   token      phrase   how it reads in a sentence: "the parent's code"
+ *              help     what it is and when it is empty, in a sentence or two
+ *              example  a short value, shown until a real record is picked
+ *   pattern    the same three, with <name> in `phrase` standing for the
+ *              specification's name ("its <name>" reads "its thickness")
+ *   condition  phrase   how it reads before "is …": "where it sits"
+ *              help     what it tests, and how many points it scores
+ *
+ * Points are the weights test() returns, so the words quote the same numbers:
+ * a kind, a placement, a type is 1; "under" a level is 1 + its depth; one
+ * exact variant (or template definition) is 2 + LEAF_DEPTH, above any "under".
+ * `label` stays the token's name in lists and in validation messages.
+ */
+const UNDER_POINTS = ['a family', 'a subfamily', 'a variant'].slice(0, LEAF_DEPTH + 1).map((level, depth) => `${level} ${1 + depth}`).join(', ');
+const EXACT_POINTS = 2 + LEAF_DEPTH;
+const ONE_POINT = 'Scores 1 point.';
+const CLASSIFICATION_HELP = `“Is under” holds for everything below the level you choose, and scores more the deeper that level is: ${UNDER_POINTS}. “Is” names one exact variant and scores ${EXACT_POINTS} — more than any “is under”.`;
+const KIND_WORDS = {
+  catalog: 'Catalog: kept in the catalog and used again.',
+  temporary: 'Temporary: made for one order.',
+  template: 'Template: a design copied onto orders.',
+  selection: 'Selection: picks one catalog item from a list.',
+};
+
 const COMMON_TOKENS = [
-  { key: 'record.shortName', label: 'Short name — its own, else its template’s, else the first word of its name; set to none, it prints nothing', available: true },
-  { key: 'classification.code', label: 'Variant code', available: true },
-  { key: 'classification.name', label: 'Variant name', available: true },
-  { key: 'family.code', label: 'Family code', available: true },
-  { key: 'subfamily.code', label: 'Subfamily code', available: true },
-  { key: 'record.name', label: 'Name (for code rules)', available: true },
+  {
+    key: 'record.shortName', label: 'Short name — its own, else its template’s, else the first word of its name; set to none, it prints nothing', available: true,
+    phrase: 'the short name', example: 'IS',
+    help: 'Its own short name. If it has none, the short name of the template it came from, else the first word of its name. A short name set to none prints nothing.',
+  },
+  {
+    key: 'classification.code', label: 'Variant code', available: true,
+    phrase: 'the variant code', example: 'PLATE_PART', help: 'The code of its variant — the lowest level of its classification.',
+  },
+  {
+    key: 'classification.name', label: 'Variant name', available: true,
+    phrase: 'the variant name', example: 'Plate part', help: 'The name of its variant — the lowest level of its classification.',
+  },
+  {
+    key: 'family.code', label: 'Family code', available: true,
+    phrase: 'the family code', example: 'FABRICATED', help: 'The code of its family — the top level of its classification.',
+  },
+  {
+    key: 'subfamily.code', label: 'Subfamily code', available: true,
+    phrase: 'the subfamily code', example: 'FAB_PARTS', help: 'The code of its subfamily — the level under the family.',
+  },
+  {
+    key: 'record.name', label: 'Name (for code rules)', available: true,
+    phrase: 'the name', example: 'Intermediate stiffener', help: 'Its name, as typed. Good in a rule that makes names; long for a code.',
+  },
 ];
 // Temporary items only. For the item a sales line sells (no BOM parent),
 // parent.* falls back to the order and position to the line's position, so one
@@ -48,13 +96,36 @@ const COMMON_TOKENS = [
 // P100-G01, then P100-G01-WEB01, P100-G01-FL01, P100-G01-FL02 (taxonomy §7).
 const ITEM_TOKENS = [
   ...COMMON_TOKENS,
-  { key: 'definition.code', label: 'Definition code (temporary items)', available: true },
-  { key: 'definition.name', label: 'Definition name (temporary items)', available: true },
-  { key: 'order.code', label: 'Sales order number (temporary items)', available: true },
-  { key: 'line.no', label: 'Sales order line number (temporary items)', available: true },
-  { key: 'parent.code', label: 'BOM parent code — the order number for the item a line sells', available: true },
-  { key: 'parent.name', label: 'BOM parent name — the order title for the item a line sells', available: true },
-  { key: 'position', label: 'Position among its siblings of the same design (Web 01, Web 02)', available: true },
+  {
+    key: 'definition.code', label: 'Definition code (temporary items)', available: true,
+    phrase: 'the template’s code', example: 'IS-002', help: 'For an item made on an order: the code of the template it was made from. Empty for a catalog item.',
+  },
+  {
+    key: 'definition.name', label: 'Definition name (temporary items)', available: true,
+    phrase: 'the template’s name', example: 'Intermediate stiffener', help: 'For an item made on an order: the name of the template it was made from. Empty for a catalog item.',
+  },
+  {
+    key: 'order.code', label: 'Sales order number (temporary items)', available: true,
+    phrase: 'the order number', example: 'SO-20260924-0003', help: 'For an item made on an order: that sales order’s number. Empty for a catalog item.',
+  },
+  {
+    key: 'line.no', label: 'Sales order line number (temporary items)', available: true,
+    phrase: 'the order line number', example: '10', help: 'For an item made on an order: the number of its order line — 10, 20, 30.',
+  },
+  {
+    key: 'parent.code', label: 'BOM parent code — the order number for the item a line sells', available: true,
+    phrase: 'the parent’s code', example: 'SO-20260924-0003-SPAN-01-G1-1',
+    help: 'The code of the item it sits inside. For the item an order line sells, the order number. Empty for a catalog item.',
+  },
+  {
+    key: 'parent.name', label: 'BOM parent name — the order title for the item a line sells', available: true,
+    phrase: 'the parent’s name', example: 'Girder segment', help: 'The name of the item it sits inside. For the item an order line sells, the order title.',
+  },
+  {
+    key: 'position', label: 'Position among its siblings of the same design (Web 01, Web 02)', available: true,
+    phrase: 'the position', example: '1',
+    help: 'Its place among the rows of the same design under its parent: the first web is 1, the second 2. It counts rows, not pieces.',
+  },
   // User, 2026-09-26: a row of 23 plain stiffeners and its copy of 3 drilled
   // ones are IS 1-23 and IS 24-26 under their parent (codeRangeService).
   {
@@ -62,18 +133,36 @@ const ITEM_TOKENS = [
     label: 'Range of pieces the row covers under its parent — 24-26, or 24 for one. A copied row of the same short name carries on the count',
     available: true,
     note: 'Empty for the item a sales line sells, for a catalog item, and for a row whose quantity is not a whole number',
+    phrase: 'the pieces this row covers', example: '24-26',
+    help: 'The piece numbers this row covers under its parent: 1-23 for a row of 23, then 24-26 for a copied row of 3 with the same short name. One piece prints as one number.',
   },
 ];
-const TOKEN_PATTERNS = [{ pattern: 'spec:<CODE>', label: 'A specification value, e.g. spec:GRADE' }];
+const TOKEN_PATTERNS = [{
+  pattern: 'spec:<CODE>', label: 'A specification value, e.g. spec:GRADE',
+  phrase: 'its <name>', example: '12',
+  help: 'A specification value of the record — its own, or one set higher up. A number prints as it is unless you give it a number format; yes or no prints Y or N; a date prints as 20260926.',
+}];
 
 const conditionTokens = (kinds) => [
-  { key: 'kind', label: 'Kind', operators: ['eq', 'in'], valueKind: 'enum', values: kinds },
-  { key: 'classification', label: 'Classification', operators: ['under', 'eq'], valueKind: 'classification' },
+  {
+    key: 'kind', label: 'Kind', operators: ['eq', 'in'], valueKind: 'enum', values: kinds,
+    phrase: 'the kind', help: `${kinds.map((k) => KIND_WORDS[k] ?? k).join(' ')} ${ONE_POINT}`,
+  },
+  {
+    key: 'classification', label: 'Classification', operators: ['under', 'eq'], valueKind: 'classification',
+    phrase: 'the classification', help: CLASSIFICATION_HELP,
+  },
 ];
 const ITEM_CONDITIONS = [
   ...conditionTokens(['catalog', 'temporary']),
-  { key: 'definition', label: 'Created from definition', operators: ['eq', 'in'], valueKind: 'definition' },
-  { key: 'placement', label: 'Where a temporary item sits', operators: ['eq'], valueKind: 'enum', values: ['line', 'component'] },
+  {
+    key: 'definition', label: 'Created from definition', operators: ['eq', 'in'], valueKind: 'definition',
+    phrase: 'the template it was made from', help: `Holds for items made on an order from the template definitions you choose. Scores ${EXACT_POINTS}, like one exact variant.`,
+  },
+  {
+    key: 'placement', label: 'Where a temporary item sits', operators: ['eq'], valueKind: 'enum', values: ['line', 'component'],
+    phrase: 'where it sits', help: `line: the item an order line sells. component: an item inside another. Only items made on an order sit anywhere. ${ONE_POINT}`,
+  },
 ];
 const DEFINITION_CONDITIONS = conditionTokens(['template', 'selection']);
 
@@ -276,11 +365,20 @@ async function orderContext(db, companyId, { orderType, customerId }) {
 }
 
 const ORDER_TOKENS = [
-  { key: 'customer.code', label: 'Customer code (customer orders)', available: true },
-  { key: 'order.type', label: 'Order type letter — C customer, S stock', available: true },
+  {
+    key: 'customer.code', label: 'Customer code (customer orders)', available: true,
+    phrase: 'the customer’s code', example: 'KEPL', help: 'The code of the customer the order is for. Empty on a stock order.',
+  },
+  {
+    key: 'order.type', label: 'Order type letter — C customer, S stock', available: true,
+    phrase: 'the order type letter', example: 'C', help: 'C for a customer order, S for a stock order.',
+  },
 ];
 const ORDER_CONDITIONS = [
-  { key: 'type', label: 'Order type', operators: ['eq', 'in'], valueKind: 'enum', values: ['customer', 'stock'] },
+  {
+    key: 'type', label: 'Order type', operators: ['eq', 'in'], valueKind: 'enum', values: ['customer', 'stock'],
+    phrase: 'the order type', help: `customer: an order a customer placed. stock: an order to make or buy for stock. ${ONE_POINT}`,
+  },
 ];
 
 registerEntity('sales_order', {
@@ -311,13 +409,29 @@ registerEntity('sales_order', {
 // makes PLS-01, PLS-02 for plasma cutters. Specification values of the machine
 // (spec:MAX_THICKNESS) can go in as well.
 const MACHINE_TOKENS = [
-  { key: 'classification.code', label: 'Machine type code', available: true },
-  { key: 'classification.name', label: 'Machine type name', available: true },
-  { key: 'family.code', label: 'Family code', available: true },
-  { key: 'subfamily.code', label: 'Subfamily code', available: true },
+  {
+    key: 'classification.code', label: 'Machine type code', available: true,
+    phrase: 'the machine type code', example: 'PLS', help: 'The code of its machine type — the lowest level of its classification.',
+  },
+  {
+    key: 'classification.name', label: 'Machine type name', available: true,
+    phrase: 'the machine type name', example: 'CNC plasma', help: 'The name of its machine type.',
+  },
+  {
+    key: 'family.code', label: 'Family code', available: true,
+    phrase: 'the family code', example: 'MACHINES', help: 'The code of its machine family — the top level of its classification.',
+  },
+  {
+    key: 'subfamily.code', label: 'Subfamily code', available: true,
+    phrase: 'the subfamily code', example: 'MC-CUTTING', help: 'The code of the level under the family, such as cutting or welding.',
+  },
 ];
 const MACHINE_CONDITIONS = [
-  { key: 'classification', label: 'Machine type', operators: ['under', 'eq'], valueKind: 'classification' },
+  {
+    key: 'classification', label: 'Machine type', operators: ['under', 'eq'], valueKind: 'classification',
+    phrase: 'the machine type',
+    help: `“Is under” holds for every machine type below the level you choose, and scores more the deeper that level is: ${UNDER_POINTS}. “Is” names one exact machine type and scores ${EXACT_POINTS}.`,
+  },
 ];
 
 async function machineContext(db, companyId, machine, draftValues = null) {
@@ -389,14 +503,32 @@ registerEntity('machine', {
 // {item.code}-{#000} gives PL-E350-12-01-001 — or the heat it came from
 // ({spec:HEAT_NO}). spec:X reads the batch's own value first, then the item's.
 const BATCH_TOKENS = [
-  { key: 'item.code', label: 'Item code', available: true },
-  { key: 'classification.code', label: 'Item Variant code', available: true },
-  { key: 'family.code', label: 'Item Family code', available: true },
-  { key: 'subfamily.code', label: 'Item Subfamily code', available: true },
-  { key: 'supplier.code', label: 'Supplier code', available: true },
+  {
+    key: 'item.code', label: 'Item code', available: true,
+    phrase: 'the item’s code', example: 'PL-E350-12-01', help: 'The code of the item the batch is of.',
+  },
+  {
+    key: 'classification.code', label: 'Item Variant code', available: true,
+    phrase: 'the item’s variant code', example: 'PLATE', help: 'The code of the item’s variant — the lowest level of its classification.',
+  },
+  {
+    key: 'family.code', label: 'Item Family code', available: true,
+    phrase: 'the item’s family code', example: 'STEEL', help: 'The code of the item’s family — the top level of its classification.',
+  },
+  {
+    key: 'subfamily.code', label: 'Item Subfamily code', available: true,
+    phrase: 'the item’s subfamily code', example: 'PLATES', help: 'The code of the item’s subfamily — the level under the family.',
+  },
+  {
+    key: 'supplier.code', label: 'Supplier code', available: true,
+    phrase: 'the supplier’s code', example: 'STEEL-STK', help: 'The code of the supplier who delivered the batch. Empty when none is recorded.',
+  },
 ];
 const BATCH_CONDITIONS = [
-  { key: 'classification', label: 'Item classification', operators: ['under', 'eq'], valueKind: 'classification' },
+  {
+    key: 'classification', label: 'Item classification', operators: ['under', 'eq'], valueKind: 'classification',
+    phrase: 'the item’s classification', help: `The classification of the batch’s item. ${CLASSIFICATION_HELP}`,
+  },
 ];
 
 async function batchContext(db, companyId, { itemId, supplierId = null, batchValues = new Map() }) {
@@ -495,11 +627,20 @@ registerEntity('stock_batch', {
 // GRN-000123 from its id.
 const TYPE_CODE = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR' };
 const MOVEMENT_TOKENS = [
-  { key: 'type.code', label: 'Type letters — GRN, ISS, TRF, ADJ, SCR', available: true },
-  { key: 'area.code', label: 'Stocking area code (the first line’s)', available: true },
+  {
+    key: 'type.code', label: 'Type letters — GRN, ISS, TRF, ADJ, SCR', available: true,
+    phrase: 'the movement type letters', example: 'GRN', help: 'GRN for a receipt, ISS an issue, TRF a transfer, ADJ an adjustment, SCR scrap.',
+  },
+  {
+    key: 'area.code', label: 'Stocking area code (the first line’s)', available: true,
+    phrase: 'the stocking area code', example: 'RM-YARD', help: 'The code of the stocking area on the movement’s first line.',
+  },
 ];
 const MOVEMENT_CONDITIONS = [
-  { key: 'type', label: 'Movement type', operators: ['eq', 'in'], valueKind: 'enum', values: Object.keys(TYPE_CODE) },
+  {
+    key: 'type', label: 'Movement type', operators: ['eq', 'in'], valueKind: 'enum', values: Object.keys(TYPE_CODE),
+    phrase: 'the movement type', help: `receipt, issue, transfer, adjustment or scrap. ${ONE_POINT}`,
+  },
 ];
 
 async function movementContext(db, companyId, { movementType, areaId }) {
@@ -550,11 +691,21 @@ registerEntity('stock_movement', {
 // A suggested order has no supplier yet, so a rule that leans on one leaves a
 // gap — which is why `suggested` is offered as a condition.
 const PURCHASE_TOKENS = [
-  { key: 'supplier.code', label: 'Supplier code', available: true },
-  { key: 'supplier.name', label: 'Supplier name', available: true },
+  {
+    key: 'supplier.code', label: 'Supplier code', available: true,
+    phrase: 'the supplier’s code', example: 'STEEL-STK',
+    help: 'The code of the supplier the order goes to. Empty on an order the buy list suggested, until a supplier is chosen.',
+  },
+  {
+    key: 'supplier.name', label: 'Supplier name', available: true,
+    phrase: 'the supplier’s name', example: 'Steel Stockist Pvt Ltd', help: 'The supplier’s name. Long for a code.',
+  },
 ];
 const PURCHASE_CONDITIONS = [
-  { key: 'suggested', label: 'Raised by the buy list', operators: ['eq'], valueKind: 'enum', values: ['yes', 'no'] },
+  {
+    key: 'suggested', label: 'Raised by the buy list', operators: ['eq'], valueKind: 'enum', values: ['yes', 'no'],
+    phrase: 'raised by the buy list', help: `yes: the buy list suggested it. no: somebody raised it by hand. ${ONE_POINT}`,
+  },
 ];
 
 async function purchaseContext(db, companyId, { supplierId, suggested }) {
@@ -608,16 +759,44 @@ registerEntity('purchase_order', {
 // its name. A code nobody can read is still better than no code at all.
 
 const PIECE_TOKENS = [
-  { key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true },
-  { key: 'item.code', label: 'Item code', available: true },
-  { key: 'definition.shortName', label: 'Template definition short name', available: true },
-  { key: 'order.code', label: 'Sales order number', available: true },
-  { key: 'line.no', label: 'Sales order line number', available: true },
-  { key: 'parent.code', label: 'The piece this one is part of', available: true },
-  { key: 'piece.no', label: 'Piece number among its own kind (blank for a grouped node)', available: true },
+  {
+    key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true,
+    phrase: 'the item’s short name', example: 'IS',
+    help: 'The short name of the item the piece is made as: its own, else its template’s, else the first word of its name. Set to none, it prints nothing.',
+  },
+  {
+    key: 'item.code', label: 'Item code', available: true,
+    phrase: 'the item’s code', example: 'SO-20260924-0003-SPAN-01',
+    help: 'The code of the item the piece is made as. For the top of a released tree, the item the order line sells.',
+  },
+  {
+    key: 'definition.shortName', label: 'Template definition short name', available: true,
+    phrase: 'the template’s short name', example: 'IS', help: 'The short name of the template the piece’s item was made from.',
+  },
+  {
+    key: 'order.code', label: 'Sales order number', available: true,
+    phrase: 'the order number', example: 'SO-20260924-0003', help: 'The number of the sales order the piece is made for.',
+  },
+  {
+    key: 'line.no', label: 'Sales order line number', available: true,
+    phrase: 'the order line number', example: '10', help: 'The number of the order line released to production — 10, 20.',
+  },
+  {
+    key: 'parent.code', label: 'The piece this one is part of', available: true,
+    phrase: 'the parent piece’s code', example: 'SO-20260924-0003-SPAN-01-1', help: 'The code of the piece this one is part of. Empty for the top of the tree.',
+  },
+  {
+    key: 'piece.no', label: 'Piece number among its own kind (blank for a grouped node)', available: true,
+    phrase: 'the piece number of its kind', example: '4',
+    help: 'Counts the pieces of one design across the whole line: six stiffeners under two girders are 1 to 6. Blank for a grouped card.',
+  },
   // User, 2026-09-26: under each parent piece a row's pieces take that row's
   // range, so the three pieces of a drilled copy after 23 plain ones are 24, 25, 26.
-  { key: 'piece.seq', label: 'Piece number under its parent piece — carries on across copied rows of the same short name (24, 25, 26); a grouped card shows its range (1-4)', available: true },
+  {
+    key: 'piece.seq', label: 'Piece number under its parent piece — carries on across copied rows of the same short name (24, 25, 26); a grouped card shows its range (1-4)', available: true,
+    phrase: 'the piece number under its parent', example: '24',
+    help: 'Its number under its parent piece. A copied row of the same short name carries on the count: 24, 25, 26. A grouped card shows its range, such as 1-4.',
+  },
 ];
 // Where a piece sits and what its item is, so rules can tell apart the top of a
 // released tree (what the order line sells: {item.code}-{piece.seq}) from a piece
@@ -626,9 +805,18 @@ const PIECE_TOKENS = [
 // Same words and weights as the item conditions: placement 1; classification
 // "under" 1 + depth; the exact Variant beats any "under".
 const PIECE_CONDITIONS = [
-  { key: 'kind', label: 'Kind', operators: ['eq', 'in'], valueKind: 'enum', values: ['catalog', 'temporary'] },
-  { key: 'placement', label: 'Where the piece sits — line (what the order line sells) or component (inside another piece)', operators: ['eq'], valueKind: 'enum', values: ['line', 'component'] },
-  { key: 'classification', label: 'Classification of its item', operators: ['under', 'eq'], valueKind: 'classification' },
+  {
+    key: 'kind', label: 'Kind', operators: ['eq', 'in'], valueKind: 'enum', values: ['catalog', 'temporary'],
+    phrase: 'the kind of its item', help: `The kind of the item the piece is made as. ${KIND_WORDS.catalog} ${KIND_WORDS.temporary} ${ONE_POINT}`,
+  },
+  {
+    key: 'placement', label: 'Where the piece sits — line (what the order line sells) or component (inside another piece)', operators: ['eq'], valueKind: 'enum', values: ['line', 'component'],
+    phrase: 'where the piece sits', help: `line: the top of a released tree — what the order line sells. component: a piece inside another. ${ONE_POINT}`,
+  },
+  {
+    key: 'classification', label: 'Classification of its item', operators: ['under', 'eq'], valueKind: 'classification',
+    phrase: 'the classification of its item', help: `The classification of the item the piece is made as. ${CLASSIFICATION_HELP}`,
+  },
 ];
 
 /**
@@ -730,13 +918,29 @@ registerEntity('production_piece', {
 
 // A lot of stock: what production put on the shelf, or what a delivery brought in.
 const LOT_TOKENS = [
-  { key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true },
-  { key: 'item.code', label: 'Item code', available: true },
-  { key: 'order.code', label: 'The order it was made on', available: true },
-  { key: 'piece.code', label: 'The production piece it came from', available: true },
+  {
+    key: 'item.shortName', label: 'Item short name — its own, else its definition’s, else its first word; set to none, it prints nothing', available: true,
+    phrase: 'the item’s short name', example: 'GDR',
+    help: 'The short name of the lot’s item: its own, else its template’s, else the first word of its name. Set to none, it prints nothing.',
+  },
+  {
+    key: 'item.code', label: 'Item code', available: true,
+    phrase: 'the item’s code', example: 'SO-20260924-0003-SPAN-01', help: 'The code of the item in the lot.',
+  },
+  {
+    key: 'order.code', label: 'The order it was made on', available: true,
+    phrase: 'the order number', example: 'SO-20260924-0003', help: 'The sales order it was made on. Empty for a lot that was bought in.',
+  },
+  {
+    key: 'piece.code', label: 'The production piece it came from', available: true,
+    phrase: 'the piece’s code', example: 'P001-G01-1', help: 'The code of the production piece it came from. Empty for a lot that was bought in.',
+  },
 ];
 const LOT_CONDITIONS = [
-  { key: 'source', label: 'Where the lot came from', operators: ['eq'], valueKind: 'enum', values: ['production', 'purchase'] },
+  {
+    key: 'source', label: 'Where the lot came from', operators: ['eq'], valueKind: 'enum', values: ['production', 'purchase'],
+    phrase: 'where the lot came from', help: `production: made here. purchase: bought in. ${ONE_POINT}`,
+  },
 ];
 
 async function lotContext(db, companyId, draft) {
@@ -806,14 +1010,33 @@ const DRAWING_SOURCES = ['customer', 'shop'];
 const DRAWING_SOURCE_LABEL = { customer: 'CUS', shop: 'SHP' };
 
 const DRAWING_TOKENS = [
-  { key: 'drawing.number', label: "The issuer's drawing number, as written", available: true },
-  { key: 'drawing.revision', label: 'Revision of this sheet', available: true },
-  { key: 'drawing.title', label: 'Drawing title', available: true },
-  { key: 'source.code', label: 'Whose numbering — CUS customer, SHP shop', available: true },
-  { key: 'root.code', label: 'Code of this drawing\'s first revision (empty on that first one)', available: true },
+  {
+    key: 'drawing.number', label: "The issuer's drawing number, as written", available: true,
+    phrase: 'the issuer’s drawing number', example: 'P103-VDB-WK-DD-MJB-200+003-401', help: 'The number printed on the sheet by whoever issued it, exactly as written.',
+  },
+  {
+    key: 'drawing.revision', label: 'Revision of this sheet', available: true,
+    phrase: 'the revision', example: 'B', help: 'The revision of this sheet: A, B, C.',
+  },
+  {
+    key: 'drawing.title', label: 'Drawing title', available: true,
+    phrase: 'the drawing title', example: 'Girder G1 general arrangement', help: 'The title on the sheet. Long for a code.',
+  },
+  {
+    key: 'source.code', label: 'Whose numbering — CUS customer, SHP shop', available: true,
+    phrase: 'whose drawing it is', example: 'SHP', help: 'CUS for a customer’s drawing, SHP for our own shop drawing.',
+  },
+  {
+    key: 'root.code', label: 'Code of this drawing\'s first revision (empty on that first one)', available: true,
+    phrase: 'the first revision’s code', example: 'SHP-0001',
+    help: 'The code of this drawing’s first revision, so revisions read SHP-0001/A, SHP-0001/B. Empty on the first revision itself.',
+  },
 ];
 const DRAWING_CONDITIONS = [
-  { key: 'source', label: 'Where the drawing comes from', operators: ['eq', 'in'], valueKind: 'enum', values: ['customer', 'shop'] },
+  {
+    key: 'source', label: 'Where the drawing comes from', operators: ['eq', 'in'], valueKind: 'enum', values: ['customer', 'shop'],
+    phrase: 'where the drawing comes from', help: `customer: the customer issued it. shop: we drew it. ${ONE_POINT}`,
+  },
 ];
 
 async function drawingContext(db, companyId, { number, revision, title, source, rootId, selfId }) {

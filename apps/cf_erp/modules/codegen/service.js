@@ -12,7 +12,7 @@
  * classification is.
  */
 import { CodegenError } from './errors.js';
-import { getProvider } from './engine.js';
+import { getProvider, renderSegments, explainSelection, BLANK } from './engine.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const SEGMENT_TYPES = ['literal', 'token', 'sequence', 'date'];
@@ -41,6 +41,23 @@ function normalizeConditions(conditions = []) {
   }));
 }
 
+/** A rule's conditions, checked against what the entity's provider can test. Saving and explaining share it. */
+async function conditionProblems(db, companyId, provider, conditions) {
+  const problems = [];
+  for (const [i, c] of conditions.entries()) {
+    const where = `Condition ${i + 1}`;
+    const token = provider.conditionTokens.find((t) => t.key === c.token_key);
+    if (!token) { problems.push(`${where}: "${c.token_key}" cannot be tested.`); continue; }
+    if (!token.operators.includes(c.operator)) {
+      problems.push(`${where}: ${token.label} can be tested with ${token.operators.join(' / ')}, not "${c.operator}".`);
+    }
+    if (!c.value) { problems.push(`${where}: needs a value.`); continue; }
+    const p = await provider.validateCondition(db, companyId, c);
+    if (p) problems.push(`${where}: ${p}`);
+  }
+  return problems;
+}
+
 async function validate(db, companyId, input, segments, conditions) {
   const problems = [];
   if (!input.code || !CODE_RE.test(input.code) || input.code.length > 100) {
@@ -54,19 +71,7 @@ async function validate(db, companyId, input, segments, conditions) {
   if (!['prefix', 'scheme'].includes(input.seqScope)) problems.push('Running numbers restart per prefix or run for the whole rule.');
   if (!Number.isInteger(input.priority)) problems.push('Priority must be a whole number.');
 
-  if (provider) {
-    for (const [i, c] of conditions.entries()) {
-      const where = `Condition ${i + 1}`;
-      const token = provider.conditionTokens.find((t) => t.key === c.token_key);
-      if (!token) { problems.push(`${where}: "${c.token_key}" cannot be tested.`); continue; }
-      if (!token.operators.includes(c.operator)) {
-        problems.push(`${where}: ${token.label} can be tested with ${token.operators.join(' / ')}, not "${c.operator}".`);
-      }
-      if (!c.value) { problems.push(`${where}: needs a value.`); continue; }
-      const p = await provider.validateCondition(db, companyId, c);
-      if (p) problems.push(`${where}: ${p}`);
-    }
-  }
+  if (provider) problems.push(...await conditionProblems(db, companyId, provider, conditions));
 
   if (!segments.length) problems.push('The pattern needs at least one part.');
   let sequences = 0;
@@ -130,6 +135,114 @@ export async function checkScheme(db, companyId, body) {
   if (!['active', 'inactive'].includes(input.status)) problems.push('Status is active or inactive.');
   if (problems.length) throw new CodegenError(422, 'INVALID_SCHEME', 'The coding rule has problems.', { problems });
   return { input, segments, conditions };
+}
+
+// ---------------------------------------------------------------------------
+// The rules screen's guide: why a record gets the rule it gets, and what each
+// piece of a pattern prints for it
+// ---------------------------------------------------------------------------
+
+const TOKEN_KEY_RE = /^[A-Za-z][\w.:-]*$/;
+
+/**
+ * What each part of a pattern prints for one record. Every part goes through
+ * renderSegments itself, one at a time, so a part reads exactly as it will in
+ * the code: number format, letters, length limit, a short name set to none.
+ * A running number counts per the text BEFORE it, so it is rendered behind
+ * that text, and waits while a part before it has no value.
+ *
+ * Each part is { state, text }:
+ *   value       prints `text`
+ *   blank       prints nothing on purpose (a short name set to none)
+ *   empty       prints nothing: the record has no value, and the part may be empty
+ *   missing     the record has no value yet, so no code can be made
+ *   unfinished  the part is not filled in yet (no value chosen)
+ *   waiting     a running number whose text before it is not known yet
+ */
+async function partsOf(db, companyId, scheme, segments, context) {
+  const parts = [];
+  let before = '';
+  let known = true;
+  for (const seg of segments) {
+    if (!SEGMENT_TYPES.includes(seg.segment_type) || (seg.segment_type === 'token' && !seg.token_key)) {
+      parts.push({ state: 'unfinished', text: null });
+      known = false;
+      continue;
+    }
+    if (seg.segment_type === 'sequence') {
+      if (!known) { parts.push({ state: 'waiting', text: null }); continue; }
+      const out = await renderSegments(db, companyId, scheme, [{ segment_type: 'literal', literal_text: before }, seg], context);
+      parts.push({ state: 'value', text: out.text.slice(before.length) });
+      before = out.text;
+      continue;
+    }
+    if (seg.segment_type === 'token' && context.get(seg.token_key) === BLANK) {
+      parts.push({ state: 'blank', text: '' });
+      continue;
+    }
+    const out = await renderSegments(db, companyId, scheme, [seg], context);
+    if (out.text === null) { parts.push({ state: 'missing', text: null }); known = false; continue; }
+    parts.push({ state: seg.segment_type === 'token' && out.text === '' ? 'empty' : 'value', text: out.text });
+    before += out.text;
+  }
+  return parts;
+}
+
+/** What each token prints for a record with no format applied: the token list's "on this record" column. */
+async function valuesOf(db, companyId, keys, context) {
+  const values = {};
+  const scheme = { id: null, code: '(token values)', seq_scope: 'prefix' };
+  for (const key of keys.slice(0, 500)) {
+    if (typeof key !== 'string' || !TOKEN_KEY_RE.test(key) || Object.hasOwn(values, key)) continue;
+    if (context.get(key) === BLANK) { values[key] = { state: 'blank', text: '' }; continue; }
+    const out = await renderSegments(db, companyId, scheme,
+      [{ segment_type: 'token', token_key: key, format: null, transform: 'none', max_length: null, is_required: 1 }], context);
+    values[key] = out.text === null ? { state: 'missing', text: null } : { state: 'value', text: out.text };
+  }
+  return values;
+}
+
+/**
+ * The rules screen's guide for one sample record (POST /codegen/explain).
+ *
+ *   body: { entityType, targetField?, entityId? | draft?, scheme?, keys? }
+ *
+ *   selection  which active rule wins for the record and why, with the unsaved
+ *              `scheme` in place of its saved self — engine.explainSelection,
+ *              the same evaluation generate() makes
+ *   parts      what each part of the unsaved pattern prints for the record
+ *   values     what each token named in `keys` prints for it, unformatted
+ *
+ * The draft's conditions are checked exactly as saving checks them; one that is
+ * not finished keeps the draft out of the contest (and says why) rather than
+ * failing the whole answer. The record's context is loaded once for all three.
+ * Only reads — the route still runs it in a transaction it rolls back.
+ */
+export async function explainRecord(db, companyId, body) {
+  const entityType = body.entityType;
+  const targetField = body.targetField ?? 'code';
+  const provider = getProvider(entityType);
+  if (!['code', 'name'].includes(targetField)) throw new CodegenError(422, 'INVALID', 'A rule makes either a code or a name.');
+  const context = body.entityId != null
+    ? await provider.loadContext(db, companyId, Number(body.entityId))
+    : await provider.draftContext(db, companyId, body.draft ?? {});
+
+  let draft = null;
+  let parts = null;
+  if (body.scheme) {
+    const input = inputFrom({ ...body.scheme, entityType, targetField });
+    const conditions = normalizeConditions(Array.isArray(body.scheme.conditions) ? body.scheme.conditions : []);
+    const problems = await conditionProblems(db, companyId, provider, conditions);
+    if (!Number.isInteger(input.priority)) problems.push('Priority must be a whole number.');
+    if (!['active', 'inactive'].includes(input.status)) problems.push('Status is active or inactive.');
+    const id = Number.isInteger(Number(body.scheme.id)) && Number(body.scheme.id) > 0 ? Number(body.scheme.id) : null;
+    draft = { id, code: input.code || '', name: input.name || '', seqScope: input.seqScope, priority: input.priority, status: input.status, conditions, problems };
+    parts = await partsOf(db, companyId, { id, code: input.code || '(unsaved rule)', seq_scope: input.seqScope },
+      normalizeSegments(Array.isArray(body.scheme.segments) ? body.scheme.segments : []), context);
+  }
+  const selection = await explainSelection(db, companyId, entityType, targetField, context, { draft });
+  const values = Array.isArray(body.keys) ? await valuesOf(db, companyId, body.keys, context) : null;
+  return { selection, parts, values };
 }
 
 async function writeParts(db, companyId, userId, schemeId, conditions, segments) {
