@@ -11,6 +11,8 @@
  */
 import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { findSegmentsUsingToken } from '../modules/codegen/index.js';
+import { resolve } from './resolutionService.js';
+import { requireNode } from './tree.js';
 
 export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option'];
 export const MEASUREMENT_TYPES = ['LENGTH', 'AREA', 'VOLUME', 'MASS', 'DENSITY', 'COUNT', 'TIME', 'SPEED', 'FORCE', 'PRESSURE', 'TEMPERATURE', 'ANGLE', 'RATIO'];
@@ -223,4 +225,106 @@ export async function deleteOption(db, c, id) {
   await db.query('UPDATE cf_spec_assignment_options SET deleted_at = NOW() WHERE company_id = ? AND option_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE cf_spec_options SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   return getSpec(db, c.companyId, opt.specification_id);
+}
+
+// ----- the catalog's door into an option list --------------------------------
+
+const optionOf = (row) => ({ id: row.id, value: row.value, label: row.label, sortOrder: row.sort_order, status: row.status });
+
+/** "E250", "E250 and E350", "E250, E300 and E350". */
+function inWords(values) {
+  return values.length > 1 ? `${values.slice(0, -1).join(', ')} and ${values[values.length - 1]}` : values.join('');
+}
+
+/** The unique key on a spec's values (company, spec, lower(value)) turned an insert away. */
+const isValueClash = (err) => err?.errno === 1062 && /uq_cso_value/.test(err.sqlMessage || '');
+
+/**
+ * What stops a record filed at `node` from taking option `optionId` of `spec`
+ * — the values it may take instead, in a list and in words, and the rule that
+ * says so — or null when nothing does. Resolution answers it: the item-level
+ * rule that wins for the spec on the way up the tree, with that rule's narrowed
+ * list applied, is exactly the list an item there is offered. Nothing here
+ * walks the tree or merges rules itself.
+ */
+async function refusedAt(db, companyId, node, spec, optionId) {
+  const r = await resolve(db, companyId, { nodeId: node.id });
+  const entry = r.specs.find((s) => s.spec.id === spec.id && s.captureAt === 'item');
+  if (!entry || !entry.applicable || (entry.options ?? []).some((o) => o.id === optionId)) return null;
+  const allowed = (entry.options ?? []).map((o) => o.value);
+  const rule = entry.definedAt;
+  return {
+    allowed,
+    words: allowed.length
+      ? `items under ${node.name} only allow ${inWords(allowed)}`
+      : `items under ${node.name} allow no ${spec.name} value at all`,
+    at: `the ${spec.name} rule at ${rule.level.toLowerCase()} ${rule.name}`,
+  };
+}
+
+/**
+ * A new value for an option list, added from the item form instead of Setup,
+ * so a catalog editor filing a plate in a grade nobody has used yet is not
+ * stuck behind the setup grant. Narrowed the way POST /catalog/classification
+ * is: it only ADDS — a value and a label, never a sort order, a rename, a
+ * retirement or a delete — and only to an option specification.
+ *
+ * Uniqueness and validation stay in addOption: its unique key decides what a
+ * duplicate is. This only looks up which value the insert collided with, to
+ * name it and hand it back (409 DUPLICATE_OPTION, `existing`) so the form can
+ * select the one that is already there.
+ *
+ * input.classificationId (optional) is where the record being filed sits. A
+ * narrowed option list is a deliberate setup rule ("plates allow E250 / E350
+ * only"), so this door never writes into one: when the rule that decides the
+ * record's value there does not allow the new value, it is still added for
+ * the company, the answer says `narrowedOut` with the values that list allows,
+ * and Setup has to allow it there first.
+ */
+export async function addCatalogOption(db, c, specId, input = {}) {
+  const spec = await requireSpec(db, c.companyId, specId);
+  if (spec.data_type !== 'option') {
+    throw invalid('NOT_OPTION', `${spec.code} is a ${spec.data_type}, not an option list — only an option specification takes a new value here.`);
+  }
+  let node = null;
+  if (input.classificationId != null && input.classificationId !== '') {
+    const nodeId = Number(input.classificationId);
+    if (!Number.isInteger(nodeId) || nodeId <= 0) throw invalid('INVALID', 'classificationId must be a positive whole number.');
+    node = await requireNode(db, c.companyId, nodeId, 'Classification node');
+  }
+  const value = String(input.value ?? '').trim();
+  const label = input.label == null ? '' : String(input.label).trim();
+  if (label.length > 255) throw invalid('INVALID', 'A label is up to 255 characters.');
+
+  let saved;
+  try {
+    // Value and label only. A sort order or a status in the body is Setup's to set, so neither is passed on.
+    saved = await addOption(db, c, spec.id, { value, label: label || null });
+  } catch (err) {
+    if (!isValueClash(err)) throw err;
+    const [[row]] = await db.query(
+      'SELECT * FROM cf_spec_options WHERE company_id = ? AND specification_id = ? AND value_active = LOWER(?)',
+      [c.companyId, spec.id, value],
+    );
+    if (!row) throw conflict('DUPLICATE_OPTION', `${spec.name} already has ${value}, so it was not added again.`);
+    let message = `${spec.name} already has ${row.value}, so it was not added again.`;
+    if (row.status !== 'active') {
+      message = `${spec.name} already has ${row.value}, but it is retired — Setup can bring it back. Nothing was added.`;
+    } else if (node) {
+      const refused = await refusedAt(db, c.companyId, node, spec, row.id);
+      if (refused) message = `${spec.name} already has ${row.value}, but ${refused.words} — Setup must allow it in ${refused.at} first. Nothing was added.`;
+    }
+    throw conflict('DUPLICATE_OPTION', message, { existing: optionOf(row) });
+  }
+
+  const option = saved.options.find((o) => o.value === value);
+  const out = { specification: { id: spec.id, code: spec.code, name: spec.name }, option, narrowedOut: false, message: `${value} added to ${spec.name}.` };
+  const refused = node ? await refusedAt(db, c.companyId, node, spec, option.id) : null;
+  if (!refused) return out;
+  return {
+    ...out,
+    narrowedOut: true,
+    allowedHere: refused.allowed,
+    message: `${value} is now a ${spec.name} value for the whole company, but ${refused.words}. Setup must allow it in ${refused.at} first.`,
+  };
 }

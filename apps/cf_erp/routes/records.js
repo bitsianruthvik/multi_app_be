@@ -6,6 +6,11 @@
  *   POST   /catalog/classification     { parentId, code, name, description?, scope?, sortOrder? }
  *                                      a Family / Subfamily / Variant made mid-flow from the catalog
  *                                      screens; the item side of the tree only.
+ *   POST   /catalog/specifications/:id/options   { value, label?, classificationId? }
+ *                                      a new value on an option list, added from the item form; adds
+ *                                      only. A duplicate is 409 DUPLICATE_OPTION naming (and returning,
+ *                                      as `existing`) the value already there; `narrowedOut` says the
+ *                                      rule where the record sits does not allow it yet.
  *   POST   /items                      { itemType, classificationId | sourceDefinitionId+ownerOrderLineId, name?, code?, uom?, trackedBy?, status?, revision?, values? }
  *   POST   /definitions                { definitionType, classificationId, name?, code?, selectionMode?, candidateClassificationId?, status?, values? }
  *   GET    /records/:id
@@ -39,6 +44,7 @@ import {
   addCriterion, updateCriterion, removeCriterion,
 } from '../services/selectionService.js';
 import { createCatalogNode } from '../services/classificationService.js';
+import { addCatalogOption } from '../services/specificationService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -64,6 +70,13 @@ router.post('/records/preview', guard(PERM.view), handle(async (req) => {
 // for the Setup grant. Setup › Classification keeps its own route and its own
 // guard; this one refuses machine scope and machine families outright.
 router.post('/catalog/classification', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createCatalogNode(db, c, req.body ?? {}))));
+
+// The catalog's door into an option list, for the same reason: filing a plate
+// in a grade nobody has used yet should not mean asking for the Setup grant.
+// It only ADDS a value (and a label) to an option specification. Renaming,
+// reordering, retiring and deleting values stay on Setup's routes, and so does
+// allowing a value in a rule's narrowed list — the answer says narrowedOut.
+router.post('/catalog/specifications/:id/options', guard(PERM.catalog), handle((req) => tx(req, (db, c) => addCatalogOption(db, c, id(req), req.body ?? {}))));
 
 router.post('/items', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createItem(db, c, req.body))));
 router.post('/definitions', guard(PERM.catalog), handle((req) => tx(req, (db, c) => createDefinition(db, c, req.body))));
