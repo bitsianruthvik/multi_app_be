@@ -47,6 +47,7 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { explode } from './bomService.js';
+import { layoutDriftOfLines, driftSentence } from './nestingService.js';
 import { availability } from './releaseService.js';
 
 export const PROCESS_STATUSES = ['draft', 'active', 'obsolete'];
@@ -272,18 +273,20 @@ export const STAGE_CATALOGUE = [
        * otherwise was a cutter. Green here is read off saved rows, never off
        * the absence of a complaint.
        */
-      const drift = ctx.nesting.drift ?? { unplaced: 0, gone: 0 };
-      if (saved?.lots > 0 && (drift.unplaced > 0 || drift.gone > 0)) {
-        const said = [
-          drift.unplaced ? `${n(drift.unplaced, 'cut piece')} not laid out` : null,
-          drift.gone ? `${n(drift.gone, 'laid-out cut piece')} no longer in the structure` : null,
-        ].filter(Boolean).join(', ');
+      const drift = ctx.nesting.drift ?? [];
+      if (saved?.lots > 0 && drift.length) {
+        const first = drift.find((d) => d.why === 'count') ?? drift[0];
+        const which = first.code ?? 'a cut piece';
+        const example = first.why === 'gone'
+          ? `${which} is laid out but no longer in the structure`
+          : `${which}: the line needs ${first.needs}, the layout places ${first.placed}`;
+        const more = drift.length > 1 ? `, and ${n(drift.length - 1, 'more cut piece')}` : '';
         return {
           state: 'partial',
-          detail: `The nesting is out of date — ${said}`,
+          detail: `The nesting is out of date — ${driftSentence(drift)}`,
           blockers: [{
-            count: drift.unplaced + drift.gone,
-            message: `Line ${ctx.line.line_no}'s cut pieces changed after it was nested (${said}). Nest the line again so the plates it buys match what it cuts.`,
+            count: drift.length,
+            message: `Line ${ctx.line.line_no}'s structure changed after it was nested (${example}${more}). Nest the line again so the plates it buys match what it cuts.`,
           }],
         };
       }
@@ -1108,38 +1111,17 @@ async function loadOrderContext(db, companyId, order, lines) {
   ) : [[]];
   const cutPiecesBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
 
-  // 5d. What a saved nesting no longer covers. Deriving cut pieces again can add,
-  // remove or resize a rectangle; the lots were laid out for the old set. A cut
-  // piece with no placement, or a placement whose cut piece is gone, means the
-  // layout is out of date — and "done" would be a lie the buy list inherits.
-  const [driftRows] = lines.length ? await db.query(
-    `SELECT i.owner_order_line_id AS order_line_id,
-            SUM(NOT EXISTS (SELECT 1 FROM cf_nest_placements np
-                              JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
-                             WHERE np.cut_plate_id = m.id AND np.deleted_at IS NULL)) AS unplaced
-       FROM cf_master_records m
-       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
-       JOIN cf_classification_nodes n ON n.id = m.classification_id AND n.code = 'CUT_PLATE'
-      WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.owner_order_line_id IN (?)
-      GROUP BY i.owner_order_line_id`,
-    [companyId, lines.map((l) => l.id)],
-  ) : [[]];
-  const [orphanRows] = lines.length ? await db.query(
-    `SELECT pl.order_line_id, COUNT(DISTINCT np.cut_plate_id) AS gone
-       FROM cf_nest_placements np
-       JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
-       LEFT JOIN cf_master_records m ON m.id = np.cut_plate_id AND m.deleted_at IS NULL
-      WHERE np.company_id = ? AND np.deleted_at IS NULL AND pl.order_line_id IN (?) AND m.id IS NULL
-      GROUP BY pl.order_line_id`,
-    [companyId, lines.map((l) => l.id)],
-  ) : [[]];
-  const driftBy = new Map();
-  for (const r of driftRows) driftBy.set(r.order_line_id, { unplaced: Number(r.unplaced) || 0, gone: 0 });
-  for (const r of orphanRows) driftBy.set(r.order_line_id, { ...(driftBy.get(r.order_line_id) ?? { unplaced: 0 }), gone: Number(r.gone) || 0 });
-
   const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
     lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
   }]));
+
+  // 5d. What a saved layout no longer matches — nestingService.layoutDrift, the
+  //     rule the Nesting screen shows, counted off the trees exploded in step 1.
+  //     A piece count changed after nesting (a quantity, a removed part, the
+  //     line quantity) makes it out of date, the same as a cut piece added or
+  //     deleted: "done" would be a lie the buy list inherits.
+  const driftBy = await layoutDriftOfLines(db, companyId,
+    lines.filter((l) => (lotsBy.get(l.id)?.lots ?? 0) > 0).map((l) => l.id), trees);
 
   // 6. Specification chains for every item, and the NESTING answer on each.
   const chains = await chainsFor(db, companyId, [...detail.values()].map((d) => ({
@@ -1266,7 +1248,7 @@ function lineContext(ctx, order, line) {
       items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })),
       saved: ctx.lotsBy.get(line.id) ?? null,
       cutPieces: ctx.cutPiecesBy.get(line.id) ?? 0,
-      drift: ctx.driftBy.get(line.id) ?? { unplaced: 0, gone: 0 },
+      drift: ctx.driftBy.get(line.id) ?? [],
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,

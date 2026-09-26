@@ -467,6 +467,91 @@ try {
   eq('nothing has drifted from the structure', saved.drift.length, 0, JSON.stringify(saved.drift));
   eq('reading it changed nothing', diff(await counts(conn), await counts(conn)).length, 0);
 
+  /* ---- 8b. out of date — ONE rule, read by the screen and the stage ------ */
+  // User, 2026-09-26: a piece count changed after nesting makes the layout out
+  // of date, the same as a cut piece added or deleted. The stage reads
+  // layoutDriftOfLines off the trees processService explodes; the screen reads
+  // getNesting. Each case below changes one thing inside a savepoint and
+  // requires the two to say the same.
+  section('8b. A changed piece count makes the layout out of date — on the screen and the stage alike');
+  const BOMS = await imp('apps/cf_erp/services/bomService.js');
+  const PROC = await imp('apps/cf_erp/services/processService.js');
+  const shapeOf = (d) => d.map((x) => `${x.cutPlateId}:${x.why}:${x.needs}/${x.placed}`).sort().join(' ');
+  const both = async () => {
+    const [[ln]] = await conn.query('SELECT item_id, quantity FROM cf_sales_order_lines WHERE id = ?', [fixture.lineId]);
+    const tree = await BOMS.explode(conn, COMPANY, ln.item_id, { rootQuantity: Number(ln.quantity), maxDepth: 15 });
+    const stage = (await S.layoutDriftOfLines(conn, COMPANY, [fixture.lineId], new Map([[fixture.lineId, tree]]))).get(fixture.lineId) ?? [];
+    const screen = (await S.getNesting(conn, COMPANY, fixture.lineId)).drift;
+    return { stage, shape: shapeOf(stage), same: shapeOf(stage) === shapeOf(screen), screen: shapeOf(screen) };
+  };
+  const rootLineOf = async (childId) => (await conn.query(
+    'SELECT l.id FROM cf_bom_lines l JOIN cf_boms b ON b.id = l.bom_id WHERE b.parent_id = ? AND l.child_id = ? AND l.deleted_at IS NULL',
+    [fixture.root, childId],
+  ))[0][0].id;
+
+  let od = await both();
+  eq('as saved, neither sees any drift', od.shape, '');
+  await conn.query('SAVEPOINT oo');
+
+  await conn.query('UPDATE cf_bom_lines SET quantity = 3 WHERE id = ?', [await rootLineOf(fixture.A)]);
+  od = await both();
+  eq('a quantity made 2 -> 3 per unit: A needs 9 pieces against the 6 laid out', od.shape, `${fixture.A}:count:9/6`);
+  ok('and the stage reads exactly what the screen shows', od.same, `stage ${od.shape} · screen ${od.screen}`);
+  eq('in words', S.driftSentence(od.stage), '1 cut piece needs a different number of pieces');
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
+  await conn.query('UPDATE cf_sales_order_lines SET quantity = ? WHERE id = ?', [LINE_QTY + 1, fixture.lineId]);
+  od = await both();
+  eq('the line itself made x4: both laid-out rectangles need more', od.shape, [`${fixture.A}:count:8/6`, `${fixture.B}:count:4/3`].sort().join(' '));
+  ok('the same on both', od.same, `stage ${od.shape} · screen ${od.screen}`);
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
+  await conn.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE id = ?', [await rootLineOf(fixture.B)]);
+  od = await both();
+  eq('a rectangle taken out of the structure is laid out but gone', od.shape, `${fixture.B}:gone:0/3`);
+  ok('the same on both', od.same, `stage ${od.shape} · screen ${od.screen}`);
+  eq('in words', S.driftSentence(od.stage), '1 laid-out cut piece is no longer in the structure');
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
+  await conn.query('UPDATE cf_spec_values SET value_bool = 0 WHERE subject_type = \'master\' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL',
+    [fixture.M, fixture.spec.NEST_MANUAL]);
+  od = await both();
+  eq('a hand-laid rectangle handed back to the packer is not laid out', od.shape, `${fixture.M}:unplaced:3/0`);
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
+  await conn.query('UPDATE cf_bom_lines SET quantity = 3 WHERE id = ?', [await rootLineOf(fixture.A)]);
+  await setVals(conn, fixture.A, [[fixture.spec.NEST_MANUAL, { kind: 'bool', value: 1, source: 'entered' }]]);
+  od = await both();
+  eq('a rectangle marked NEST_MANUAL is laid out by hand — no count holds it (accept\'s rule)', od.shape, '');
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
+  // The stage itself, end to end. The fixture's order gets its own process with
+  // a nesting stage, and its own plate answers NESTING with yes — nothing of the
+  // company's decides whether the stage applies.
+  const fxProc = await PROC.createProcess(conn, c, { code: `${fixture.tag}-PRC`, name: 'Nesting fixture process' });
+  await PROC.replaceStages(conn, c, fxProc.id, { stages: [
+    { stageKey: 'nesting', sequence: 10, requirement: 'required' },
+    { stageKey: 'confirm', sequence: 20, requirement: 'required' },
+  ] });
+  await conn.query('UPDATE cf_sales_orders SET process_id = ? WHERE id = ?', [fxProc.id, fixture.orderId]);
+  await setVals(conn, fixture.P1, [[await specByCode(conn, PROC.NESTING_SPEC_CODE, 'boolean'), { kind: 'bool', value: 1, source: 'entered' }]]);
+  await conn.query('SAVEPOINT oo2');
+  const nestingStage = async () => (await PROC.orderProcess(conn, COMPANY, fixture.orderId)).lines[0].stages.find((st) => st.stageKey === 'nesting');
+  let ns = await nestingStage();
+  eq('the stage is done while the layout matches', ns?.state, 'done');
+  await conn.query('UPDATE cf_bom_lines SET quantity = 3 WHERE id = ?', [await rootLineOf(fixture.A)]);
+  ns = await nestingStage();
+  eq('a quantity changed after nesting: the stage is only part done', ns?.state, 'partial');
+  ok('it says the nesting is out of date, and why', /out of date — 1 cut piece needs a different number of pieces/.test(ns?.detail ?? ''), ns?.detail);
+  ok('its blocker names the rectangle and both counts', new RegExp(`${fixture.tag}-CP1: the line needs 9, the layout places 6`).test(ns?.blockers?.[0]?.message ?? ''), ns?.blockers?.[0]?.message);
+  await conn.query('ROLLBACK TO SAVEPOINT oo2');
+  ns = await nestingStage();
+  eq('put back, it is done again', ns?.state, 'done');
+  od = await both();
+  eq('and nothing drifts', od.shape, '');
+  // The sections after this one find the fixture exactly as 8b found it: no process, no NESTING answer.
+  await conn.query('ROLLBACK TO SAVEPOINT oo');
+
   /* ---- 9. a layout that does not verify is refused, all at once --------- */
   section('9. A layout whose geometry does not verify is refused with every problem at once');
   const bad = JSON.parse(JSON.stringify(plan2));

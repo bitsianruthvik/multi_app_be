@@ -459,11 +459,7 @@ async function surveyLine(db, companyId, line) {
   const where = await places(db, companyId);
 
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
-  const totals = new Map();
-  (function walk(node) {
-    if (node.id != null && node.depth > 0) totals.set(node.id, round6((totals.get(node.id) ?? 0) + Number(node.total)));
-    for (const child of node.children) walk(child);
-  }(tree.root));
+  const totals = piecesByRecord(tree);
 
   const ids = [...totals.keys()];
   const [rows] = ids.length ? await db.query(
@@ -486,6 +482,131 @@ async function surveyLine(db, companyId, line) {
     };
   });
   return { where, cutPlates, tree };
+}
+
+/**
+ * Pieces of each record for the WHOLE line, from an exploded structure.
+ * explode() carries `total` down from the line quantity, and a record under
+ * several parents — a pooled cut plate — sums across every place it hangs.
+ * surveyLine and layoutDriftOfLines both count with this, so the Nesting screen
+ * and the process stage can never disagree about how many pieces a line needs.
+ */
+function piecesByRecord(tree) {
+  const totals = new Map();
+  (function walk(node) {
+    if (node.id != null && node.depth > 0) totals.set(node.id, round6((totals.get(node.id) ?? 0) + Number(node.total)));
+    for (const child of node.children) walk(child);
+  }(tree.root));
+  return totals;
+}
+
+/* ---------------------------------------------------------------------------
+ * Out of date: what a saved layout no longer matches
+ * ------------------------------------------------------------------------ */
+
+/**
+ * WHAT A SAVED LAYOUT NO LONGER MATCHES — the one rule, for the Nesting screen
+ * and the process stage alike.
+ *
+ * It used to be two. The screen compared pieces; the stage only asked whether a
+ * cut piece had no placement, or a placement had lost its cut piece. So a count
+ * changed after nesting — a segment x2 made x3, one part of five taken off a
+ * shared rectangle, the line itself made x3 — kept the stage "done" while the
+ * buy list bought for the old count. User, 2026-09-26: "Even then it should be
+ * made out of date."
+ *
+ *   cutPlates  what the line needs NOW, surveyLine's shape: [{ id, code, pieces, manual }]
+ *   placed     what the saved layout places: Map(cutPlateId -> pieces)
+ *   codes      optional Map(cutPlateId -> code), to name a cut plate that is gone
+ *
+ * A rectangle is held to its count when the layout must place it — accept's
+ * own rule: not one marked NEST_MANUAL, which is laid out by hand or outside the
+ * layout altogether. One entry per rectangle that differs:
+ *   { cutPlateId, code, needs, placed, why }   why: 'count' | 'unplaced' | 'gone'
+ * 'gone' is a rectangle the layout places that is no longer in the structure —
+ * deleted, or re-pooled into another after its parts changed size. Pure.
+ */
+export function layoutDrift(cutPlates, placed, codes = new Map()) {
+  const drift = [];
+  const here = new Set();
+  for (const cp of cutPlates) {
+    here.add(cp.id);
+    if (cp.manual) continue;
+    const needs = cp.pieces ?? 0;
+    const got = placed.get(cp.id) ?? 0;
+    if (got !== needs) drift.push({ cutPlateId: cp.id, code: cp.code ?? null, needs, placed: got, why: got === 0 ? 'unplaced' : 'count' });
+  }
+  for (const [id, got] of placed) {
+    if (!here.has(id) && got > 0) drift.push({ cutPlateId: id, code: codes.get(id) ?? null, needs: 0, placed: got, why: 'gone' });
+  }
+  return drift;
+}
+
+/** The same drift in words — one clause per kind, for a stage's line and its blocker. */
+export function driftSentence(drift) {
+  const of = (why) => drift.filter((d) => d.why === why).length;
+  const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+  return [
+    of('count') ? `${n(of('count'), 'cut piece needs', 'cut pieces need')} a different number of pieces` : null,
+    of('unplaced') ? `${n(of('unplaced'), 'cut piece is', 'cut pieces are')} not laid out` : null,
+    of('gone') ? `${n(of('gone'), 'laid-out cut piece is', 'laid-out cut pieces are')} no longer in the structure` : null,
+  ].filter(Boolean).join(', ');
+}
+
+/**
+ * layoutDrift for several lines at once, from structures the caller has
+ * ALREADY exploded: processService explodes every line once for all its
+ * stages, and exploding again here would double the order page's round trips
+ * (~49 ms each on production). A handful of queries whatever the number of
+ * lines — the saved placements, where cut plates are filed, which of the trees'
+ * records are cut plates, and their NEST_MANUAL answers. A line with no saved
+ * layout is left out: it is not nested, which is not the same as out of date.
+ * Returns Map(lineId -> drift[]).
+ */
+export async function layoutDriftOfLines(db, companyId, lineIds, trees) {
+  const out = new Map();
+  if (!lineIds.length) return out;
+  // The code of a cut plate that has since been deleted still names what was laid out.
+  const [placedRows] = await db.query(
+    `SELECT pl.order_line_id, np.cut_plate_id, COUNT(*) AS pieces, MAX(m.code) AS code
+       FROM cf_plate_lots pl
+       JOIN cf_nest_placements np ON np.plate_lot_id = pl.id AND np.company_id = pl.company_id AND np.deleted_at IS NULL
+       LEFT JOIN cf_master_records m ON m.id = np.cut_plate_id
+      WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.order_line_id IN (?)
+      GROUP BY pl.order_line_id, np.cut_plate_id`,
+    [companyId, lineIds],
+  );
+  const placedBy = new Map();
+  const codes = new Map();
+  for (const r of placedRows) {
+    const lineId = Number(r.order_line_id);
+    if (!placedBy.has(lineId)) placedBy.set(lineId, new Map());
+    placedBy.get(lineId).set(Number(r.cut_plate_id), Number(r.pieces));
+    if (r.code) codes.set(Number(r.cut_plate_id), r.code);
+  }
+  const nested = lineIds.map(Number).filter((id) => placedBy.has(id));
+  if (!nested.length) return out;
+
+  const totalsBy = new Map(nested.map((id) => [id, trees.get(id) ? piecesByRecord(trees.get(id)) : new Map()]));
+  const recordIds = [...new Set([...totalsBy.values()].flatMap((t) => [...t.keys()]))];
+  const cutNode = await nodeByCode(db, companyId, CUT_PLATE_CODE);
+  const cutClassIds = cutNode ? await subtreeIds(db, companyId, cutNode.id) : [];
+  const [rows] = recordIds.length && cutClassIds.length ? await db.query(
+    `SELECT m.id, m.code
+       FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL
+      WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL AND m.classification_id IN (?)`,
+    [companyId, recordIds, cutClassIds],
+  ) : [[]];
+  const values = await valuesOf(db, companyId, rows.map((r) => r.id));
+  for (const lineId of nested) {
+    const totals = totalsBy.get(lineId);
+    const cutPlates = rows.filter((r) => totals.has(r.id)).map((r) => ({
+      id: r.id, code: r.code, pieces: Math.round(totals.get(r.id) ?? 0), manual: values.get(r.id)?.manual ?? false,
+    }));
+    out.set(lineId, layoutDrift(cutPlates, placedBy.get(lineId), codes));
+  }
+  return out;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1349,7 +1470,7 @@ export async function getNesting(db, companyId, orderLineId) {
   const [placeRows] = lotRows.length ? await db.query(
     `SELECT p.*, m.code AS cut_plate_code, m.name AS cut_plate_name
        FROM cf_nest_placements p
-       LEFT JOIN cf_master_records m ON m.id = p.cut_plate_id AND m.deleted_at IS NULL
+       LEFT JOIN cf_master_records m ON m.id = p.cut_plate_id
       WHERE p.company_id = ? AND p.plate_lot_id IN (?) AND p.deleted_at IS NULL
       ORDER BY p.plate_lot_id, p.seq_no, p.row_no, p.pos_no`,
     [companyId, lotRows.map((l) => l.id)],
@@ -1407,15 +1528,12 @@ export async function getNesting(db, companyId, orderLineId) {
     g.metrics = metricsOf(g.nests, g);
   }
 
-  // What the line needs now, against what the saved plan places. A structure
-  // that has moved since does not invalidate the plan; it means somebody has to
-  // look, and saying which rectangles drifted is more use than a stale flag.
-  const drift = [];
-  for (const cp of cutPlates) {
-    if (cp.manual || !cp.pieces) continue;
-    const got = placedCount.get(cp.id) ?? 0;
-    if (got !== cp.pieces) drift.push({ cutPlateId: cp.id, code: cp.code, needs: cp.pieces, placed: got });
-  }
+  // What the line needs now, against what the saved plan places — layoutDrift,
+  // the rule the process stage reads too. A structure that has moved since does
+  // not rewrite the plan; it makes it OUT OF DATE, and saying which rectangles
+  // drifted is more use than a stale flag. A line not nested yet has no drift.
+  const codes = new Map(placeRows.map((p) => [p.cut_plate_id, p.cut_plate_code ?? p.cut_plate_name]));
+  const drift = lotRows.length ? layoutDrift(cutPlates, placedCount, codes) : [];
 
   return {
     line: lineHead(line),
