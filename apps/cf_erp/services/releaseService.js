@@ -25,6 +25,7 @@ import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
 import { refreshValues } from './valueService.js';
 import { temporaryTree } from './instantiationService.js';
+import { rangesOfBoms, seqValue, readRulesOnce } from './codeRangeService.js';
 
 const EPS = 1e-9;
 // A guard against a runaway explosion, not a statement about how big a real job
@@ -286,11 +287,42 @@ async function buildPlan(db, companyId, line) {
   }
   const nodes = [];
   const reqs = [];
+  // piece.no: one counter per DESIGN across the whole line, as it always was.
   const counters = new Map();
+  // piece.seq (user, 2026-09-26): under each parent piece, a row's pieces are
+  // numbered start … end of that row's range — rows of the same short name
+  // carry one count, so a drilled copy of 3 after 23 plain stiffeners is 24,
+  // 25, 26 — and the count starts again under the next parent piece. The
+  // ranges are codeRangeService's, over the same rows explode() read. The
+  // line's own item is not on a BOM row: its pieces are 1 … n on the order line.
+  const lineRanges = await rangesOfBoms(db, companyId, [...new Set(all.filter((n) => n.made && n.bom).map((n) => n.bom.id))]);
+  const rangeOfRow = (d) => (d.lineId != null ? lineRanges.get(d.lineId) ?? null : null);
+  const seqOfPiece = (d, i) => {
+    if (d.lineId == null) return i + 1;
+    const r = rangeOfRow(d);
+    return r?.start != null ? r.start + i : null;
+  };
+  const seqOfGroup = (d, count) => {
+    if (!whole(count)) return null;
+    const start = d.lineId == null ? 1 : rangeOfRow(d)?.start;
+    return start != null ? seqValue(start, Math.round(count)) : null;
+  };
+  // Children in the order the rows are shown (line number, then line id), so
+  // the numbers are the same on every run. explode() already delivers that
+  // order; sorting here keeps piece numbers from depending on it.
+  const shown = new WeakMap();
+  const inShownOrder = (d) => {
+    let kids = shown.get(d);
+    if (!kids) {
+      kids = [...d.children].sort((a, b) => (a.lineNo ?? 0) - (b.lineNo ?? 0) || (a.lineId ?? 0) - (b.lineId ?? 0));
+      shown.set(d, kids);
+    }
+    return kids;
+  };
   const madeKids = (d) => d.children.filter((k) => k.made);
-  const addNode = (design, parentK, depth, quantity, pieceNo) => {
+  const addNode = (design, parentK, depth, quantity, pieceNo, pieceSeq) => {
     const node = {
-      k: nodes.length, parentK, design, itemId: design.id, bomLineId: design.lineId ?? null, pieceNo, quantity: round6(quantity),
+      k: nodes.length, parentK, design, itemId: design.id, bomLineId: design.lineId ?? null, pieceNo, pieceSeq, quantity: round6(quantity),
       code: pieceNo ? `${design.code}-${pieceNo}` : null, flowId: design.flow.id, depth, childKs: [], stepKs: [],
       madeFrom: sourceDef.get(design.id) ?? null,
     };
@@ -299,7 +331,7 @@ async function buildPlan(db, companyId, line) {
     return node;
   };
   const fill = (design, node) => {
-    for (const kid of design.children) {
+    for (const kid of inShownOrder(design)) {
       if (kid.made) expand(kid, node.k, node.depth + 1, kid.quantity * node.quantity);
       else if (kid.made === false) reqs.push({ nodeK: node.k, itemId: kid.id, bomLineId: kid.lineId, quantity: round6(kid.quantity * node.quantity), design: kid });
     }
@@ -312,9 +344,9 @@ async function buildPlan(db, companyId, line) {
       for (let i = 0; i < Math.round(count); i++) {
         const no = (counters.get(design.id) ?? 0) + 1;
         counters.set(design.id, no);
-        fill(design, addNode(design, parentK, depth, 1, no));
+        fill(design, addNode(design, parentK, depth, 1, no, seqOfPiece(design, i)));
       }
-    } else fill(design, addNode(design, parentK, depth, count, null));
+    } else fill(design, addNode(design, parentK, depth, count, null, seqOfGroup(design, count)));
   };
   if (root.made) expand(root, null, 0, qty);
   else if (line.order_type === 'stock') problems.push(`${nameOf(root)} has no flow — say how it is made, because a stock order is what makes it.`);
@@ -538,7 +570,7 @@ async function codeRuleProblems(db, companyId, line, nodes) {
     const g = await generate(db, companyId, 'production_piece', 'code', {
       draft: {
         itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no,
-        parentCode: n.parentK != null ? 'PARENT' : null, pieceNo: n.pieceNo,
+        parentCode: n.parentK != null ? 'PARENT' : null, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq,
       },
     }, { consume: false }).catch(() => null);
     if (g && g.text === null && (g.missing ?? []).length) {
@@ -546,6 +578,100 @@ async function codeRuleProblems(db, companyId, line, nodes) {
     }
   }
   return problems;
+}
+
+/**
+ * Every piece's code, parents first so a rule can build a child's code out of
+ * its parent's — from the code generator where a rule applies, and from the
+ * built-in shape where none does. Release calls it with `consume` (a running
+ * number is drawn for real); previewReleaseCodes without (it is only peeked),
+ * so the preview shows exactly the codes release would write. Writes nothing
+ * but the codes onto the plan's nodes.
+ *
+ * The coding rules are read once for the whole tree, and each item, template
+ * and order once (the provider's memo), not once per piece: one span of the
+ * KEPL bridge is ~3,000 pieces, and per-piece reads at ~49 ms a round trip were
+ * minutes of release.
+ *
+ * Returns { duplicates, taken, missing, byRule } — codes given to two pieces,
+ * codes another release's pieces already carry, rules with a hole (a consuming
+ * run throws on the first of those, as it always has), and how many pieces a
+ * rule coded.
+ */
+async function codeNodes(db, companyId, line, nodes, { consume }) {
+  const rules = readRulesOnce(db);
+  const memo = new Map();
+  const seen = new Set();
+  const out = { duplicates: [], taken: [], missing: [], byRule: 0 };
+  for (const n of nodes) {
+    const parentCode = n.parentK != null ? nodes[n.parentK].code : null;
+    let g = null;
+    try {
+      g = await generate(rules, companyId, 'production_piece', 'code', {
+        draft: { itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no, parentCode, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq, memo },
+      }, { consume });
+    } catch (err) {
+      // A rule that leans on something this piece has not got — say which piece,
+      // rather than leaving a code-generator message with no context.
+      if (err?.code !== 'TOKEN_MISSING') throw err;
+      throw invalid('TOKEN_MISSING', `${nameOf(n.design)} cannot be numbered: ${err.message}`, { problems: err.problems ?? [] });
+    }
+    if (g?.text) out.byRule += 1;
+    else if (g?.missing?.length) out.missing.push({ node: n, schemeCode: g.schemeCode, missing: g.missing });
+    // The fallback has to stay unique across orders, so a grouped node with no
+    // parent — a line making one lot of something — carries its line with it.
+    const own = n.design.code ?? n.design.name;
+    n.code = g?.text || (n.pieceNo ? `${own}-${n.pieceNo}`
+      : parentCode ? `${parentCode}/${own}`
+        : `${line.order_code}/${line.line_no}-${own}`);
+    // Two pieces called the same thing is not an identity — and it surfaces far
+    // later, as a duplicate lot on the day one of them is finished.
+    if (seen.has(n.code)) out.duplicates.push(n.code);
+    else seen.add(n.code);
+  }
+  // Pieces of other releases, asked a thousand codes at a time rather than one
+  // per piece. This line's own live release, if it has one, is not "another".
+  const codes = [...seen];
+  for (let i = 0; i < codes.length; i += 1000) {
+    const [rows] = await db.query(
+      `SELECT code FROM cf_production_items
+        WHERE company_id = ? AND code IN (?) AND deleted_at IS NULL
+          AND release_id NOT IN (SELECT r.id FROM cf_production_releases r WHERE r.company_id = ? AND r.order_line_id = ? AND r.deleted_at IS NULL)`,
+      [companyId, codes.slice(i, i + 1000), companyId, line.id],
+    );
+    out.taken.push(...rows.map((r) => r.code));
+  }
+  return out;
+}
+
+/**
+ * What release would write for a line's pieces: the tracker tree laid out as
+ * release lays it out, and every piece's code from the coding rules as they
+ * stand — nothing written, no running number drawn. It does not ask whether
+ * the line may be released today (a confirmed order, not released yet);
+ * releaseCheck answers that. It exists to prove a coding rule on a real order
+ * before anything is released.
+ *
+ *   { line, problems, nodes: [{ k, parentK, depth, code, pieceNo, pieceSeq, itemId, itemCode, bomLineId, quantity }],
+ *     duplicates, taken, missing, byRule }
+ */
+export async function previewReleaseCodes(db, companyId, lineId) {
+  const line = await requireLine(db, companyId, lineId);
+  const plan = await buildPlan(db, companyId, line);
+  const nodes = plan.nodes ?? [];
+  const coded = await codeNodes(db, companyId, line, nodes, { consume: false });
+  return {
+    line: { id: line.id, lineNo: line.line_no, orderCode: line.order_code, quantity: Number(line.quantity) },
+    problems: plan.problems,
+    nodes: nodes.map((n) => ({
+      k: n.k, parentK: n.parentK, depth: n.depth, code: n.code, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq,
+      itemId: n.itemId, itemCode: n.design.code, bomLineId: n.bomLineId, quantity: n.quantity,
+    })),
+    duplicates: coded.duplicates,
+    taken: coded.taken,
+    missing: coded.missing.map((m) => ({ k: m.node.k, itemCode: m.node.design.code, schemeCode: m.schemeCode, missing: m.missing })),
+    byRule: coded.byRule,
+  };
 }
 
 /**
@@ -651,41 +777,16 @@ export async function releaseLine(db, c, lineId, input = {}) {
   const releaseId = r.insertId;
   // Every piece of work in progress carries a code, at every level of the tree
   // (user, 2026-09-23) — from the code generator when a rule says how, and from
-  // the shape below when none does. Parents are laid out before their children,
-  // so a rule can build a child's code out of its parent's.
-  const minted = new Set();
+  // a built-in shape when none does (codeNodes, the same coder the preview uses).
+  const coded = await codeNodes(db, c.companyId, line, plan.nodes, { consume: true });
+  if (coded.duplicates.length) {
+    throw invalid('CODE_CLASH', `The coding rule gives more than one piece the code ${coded.duplicates[0]}. Add something that tells them apart — the piece number, or the piece it is part of.`);
+  }
+  if (coded.taken.length) {
+    throw invalid('CODE_CLASH', `${coded.taken[0]} is already the code of a piece on another release. Add something to the rule that tells orders apart — the order number, or a running number.`);
+  }
+  // Parents are laid out before their children, so each insert knows its parent's id.
   for (const n of plan.nodes) {
-    const parentCode = n.parentK != null ? plan.nodes[n.parentK].code : null;
-    let g = null;
-    try {
-      g = await generate(db, c.companyId, 'production_piece', 'code', {
-        draft: { itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no, parentCode, pieceNo: n.pieceNo },
-      }, { consume: true });
-    } catch (err) {
-      // A rule that leans on something this piece has not got — say which piece,
-      // rather than leaving a code-generator message with no context.
-      if (err?.code !== 'TOKEN_MISSING') throw err;
-      throw invalid('TOKEN_MISSING', `${nameOf(n.design)} cannot be numbered: ${err.message}`, { problems: err.problems ?? [] });
-    }
-    // The fallback has to stay unique across orders, so a grouped node with no
-    // parent — a line making one lot of something — carries its line with it.
-    const own = n.design.code ?? n.design.name;
-    n.code = g?.text || (n.pieceNo ? `${own}-${n.pieceNo}`
-      : parentCode ? `${parentCode}/${own}`
-        : `${line.order_code}/${line.line_no}-${own}`);
-    // Two pieces called the same thing is not an identity — and it surfaces far
-    // later, as a duplicate lot on the day one of them is finished.
-    if (minted.has(n.code)) {
-      throw invalid('CODE_CLASH', `The coding rule gives more than one piece the code ${n.code}. Add something that tells them apart — the piece number, or the piece it is part of.`);
-    }
-    minted.add(n.code);
-    const [[clash]] = await db.query(
-      'SELECT id FROM cf_production_items WHERE company_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1',
-      [c.companyId, n.code],
-    );
-    if (clash) {
-      throw invalid('CODE_CLASH', `${n.code} is already the code of a piece on another release. Add something to the rule that tells orders apart — the order number, or a running number.`);
-    }
     const [x] = await db.query(
       `INSERT INTO cf_production_items (company_id, release_id, parent_id, item_id, bom_line_id, piece_no, quantity, code, flow_id, flow_revision, depth, sort_order, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

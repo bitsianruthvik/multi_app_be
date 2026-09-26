@@ -131,10 +131,14 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   return { itemId: item.id, created, item };
 }
 
-/** A temporary item and every temporary item below it, children first. */
+/**
+ * A temporary item and every temporary item below it, children first, each
+ * once. `rootId` may be one id or several. An item reached twice — a cut plate
+ * several parts share — is listed once, below everything that holds it.
+ */
 export async function temporaryTree(db, companyId, rootId) {
   const order = [];
-  let frontier = [rootId];
+  let frontier = [...new Set((Array.isArray(rootId) ? rootId : [rootId]).map(Number))];
   for (let depth = 0; frontier.length && depth <= MAX_DEPTH + 5; depth++) {
     order.push(...frontier);
     const [rows] = await db.query(
@@ -144,19 +148,53 @@ export async function temporaryTree(db, companyId, rootId) {
         WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL`,
       [companyId, frontier],
     );
-    frontier = rows.map((r) => r.child_id);
+    frontier = [...new Set(rows.map((r) => Number(r.child_id)))];
   }
-  return order.reverse();
+  // Children first; a node seen at several depths keeps its deepest place.
+  const seen = new Set();
+  return order.reverse().filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
 }
 
 /**
- * Deletes a temporary item with everything below it: values (with history),
- * item-level rules, Custom BOMs and their lines, detail and master rows. The
- * line that held the top item is the caller's to remove. Code numbers are never
+ * The part of a temporary tree that nothing outside it still holds.
+ *
+ * A temporary item is not always private to one place. A cut plate is one
+ * rectangle pooled from every part cut to that size, so seven parts each hold a
+ * line to the SAME cut plate. Removing one part walked down into that cut plate
+ * and deleted it, and the six parts left were pointing at a deleted record —
+ * found on the KEPL order on 2026-09-26, through the ordinary Remove.
+ *
+ * So an item below the root that a live line OUTSIDE the tree still holds is
+ * kept, with everything below it: a kept item's own structure is what it stands
+ * on. The root always goes — removing it is what the caller asked for.
+ */
+async function privatePart(db, companyId, rootId, ids) {
+  const inTree = new Set(ids);
+  const below = ids.filter((id) => id !== rootId);
+  if (!below.length) return ids;
+  const [rows] = await db.query(
+    `SELECT DISTINCT l.child_id, b.parent_id
+       FROM cf_bom_lines l
+       JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.child_id IN (?)`,
+    [companyId, below],
+  );
+  const held = [...new Set(rows.filter((r) => !inTree.has(Number(r.parent_id))).map((r) => Number(r.child_id)))];
+  if (!held.length) return ids;
+  const keep = new Set(await temporaryTree(db, companyId, held));
+  return ids.filter((id) => !keep.has(id));
+}
+
+/**
+ * Deletes a temporary item with everything below it that nothing else holds:
+ * values (with history), item-level rules, Custom BOMs and their lines, detail
+ * and master rows. A shared item below it stays — see privatePart. The line
+ * that held the top item is the caller's to remove. Code numbers are never
  * given back — a deleted P100-G01-WEB02 is not reissued.
  */
 export async function deleteTemporaryTree(db, c, rootId) {
-  const ids = await temporaryTree(db, c.companyId, rootId);
+  const root = Number(rootId);
+  const ids = await privatePart(db, c.companyId, root, await temporaryTree(db, c.companyId, root));
   for (const id of ids) {
     await deleteValues(db, c, 'master', id);
     await deleteRules(db, c, 'master', id);

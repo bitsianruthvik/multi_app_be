@@ -11,9 +11,13 @@
  *   DELETE /bom-lines/:id                   a temporary item goes with its line
  *   GET    /bom-lines/:id/candidates        catalog items a selection line may take
  *   POST   /bom-lines/:id/resolve           { itemId | null }
+ *   POST   /bom-changes                     { scope: { recordId } | { orderLineId }, dryRun?, changes: [...] }
+ *                                           edit mode: quantity / flow / remove / paste, all or nothing
+ *                                           (services/bomChangeService.js)
  *
  * Permission follows the parent: a Custom BOM is order design (orders manage),
- * a Standard or Template BOM is catalog design (catalog manage).
+ * a Standard or Template BOM is catalog design (catalog manage). A batch asks
+ * for the grant of every kind of parent it touches.
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -24,10 +28,12 @@ import {
   getBom, explode, whereUsed, addLine, updateLine, removeLine, lineCandidates, resolveLine,
   setBomStatus, reviseBom, parentOfLine,
 } from '../services/bomService.js';
+import { applyBomChanges } from '../services/bomChangeService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
-const permFor = (parent) => (bomTypeOf(parent) === 'custom' ? PERM.orders : PERM.catalog);
+const permForType = (bomType) => (bomType === 'custom' ? PERM.orders : PERM.catalog);
+const permFor = (parent) => permForType(bomTypeOf(parent));
 
 /** Runs a write in a transaction after checking the permission its parent needs. */
 const write = (req, parentOf, fn) => withTransaction(async (db) => {
@@ -54,5 +60,11 @@ router.put('/bom-lines/:id', guard(PERM.view), handle((req) => write(req, byLine
 router.delete('/bom-lines/:id', guard(PERM.view), handle((req) => write(req, byLine(req), (db, c) => removeLine(db, c, id(req)))));
 router.get('/bom-lines/:id/candidates', guard(PERM.view), handle((req) => lineCandidates(pool, ctx(req).companyId, id(req))));
 router.post('/bom-lines/:id/resolve', guard(PERM.view), handle((req) => write(req, byLine(req), (db, c) => resolveLine(db, c, id(req), { itemId: req.body?.itemId ?? null }))));
+
+// The service names the BOM type of every parent the batch touches; the grant
+// asked for is the one each single-line route above would ask for.
+router.post('/bom-changes', guard(PERM.view), handle((req) => withTransaction((db) => applyBomChanges(db, ctx(req), req.body ?? {}, {
+  allow: (bomType) => assertPerm(req, permForType(bomType)),
+}))));
 
 export default router;

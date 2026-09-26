@@ -38,8 +38,10 @@
  *   SO-20260924-0003-SPAN-01-G1              girder line 1
  *   SO-20260924-0003-SPAN-01-G1-1            its segment 1  (drawing mark G1-1)
  *   SO-20260924-0003-SPAN-01-G1-1-TF1        that segment's top flange
- *   SO-20260924-0003-SPAN-01-G1-SPLC1        the girder's splice set
- *   SO-20260924-0003-SPAN-01-EDIA1           an end diaphragm of the span
+ *   SO-20260924-0003-SPAN-01-G1-1-IS1-21     its 21 plain intermediate stiffeners, one row
+ *   SO-20260924-0003-SPAN-01-G1-1-IS22-24    and the copied row of 3 drilled ones
+ *   SO-20260924-0003-SPAN-01-G1-SPLC1-4      the girder's four splice sets, one row
+ *   SO-20260924-0003-SPAN-01-EDIA1-6         the span's six end diaphragms, one row
  *   SO-20260924-0003-10-CUTPL-25X500X11650-E350   a blank eight parts are cut from
  *
  * Why this shape:
@@ -53,10 +55,16 @@
  *     must not break when a text field is left empty; the script checks that
  *     the two agree for all 20 segments, so the mark is the proof and the
  *     position is the source.
- *   - Everything else keeps its short name and its position — TF1, IS1, IS2 —
- *     because siblings of the same design need telling apart and the position
- *     is what does it. Only the top code is padded (SPAN-01): that is the one
- *     that goes on the order document; below it the shop shorthand is tighter.
+ *   - Everything else keeps its short name, followed by the RANGE of pieces its
+ *     row covers under its parent (user, 2026-09-26): a repeat is one row with
+ *     a quantity and a slightly different copy is a copied row, so 21 plain
+ *     stiffeners and their copy of 3 drilled ones are IS1-21 and IS22-24, and a
+ *     single top flange is TF1. Rows of one short name share the count; it
+ *     starts again under every parent (codeRangeService). It used to be the
+ *     row's position (IS1, IS2), which counted rows, not pieces. Only the top
+ *     code is padded (SPAN-01): that is the one that goes on the order
+ *     document; below it the shop shorthand is tighter. cf_range_rules.mjs,
+ *     run after this, also writes the codes released pieces take (…-G1-1-IS24).
  *   - A CUT PLATE is not coded from its parent. One blank is shared by up to 20
  *     parts (they are the same rectangle cut off the same sheet), so it has no
  *     single parent to be named after. It is coded by the ORDER LINE it belongs
@@ -88,6 +96,7 @@ const recs = await imp('apps/cf_erp/services/masterRecordService.js');
 const codegen = await imp('apps/cf_erp/modules/codegen/service.js');
 const { generate } = await imp('apps/cf_erp/modules/codegen/index.js');
 const { loadMaster } = await imp('apps/cf_erp/services/records.js');
+const { refreshRangeCodes } = await imp('apps/cf_erp/services/codeRangeService.js');
 const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 
 const DRY = process.argv.includes('--dry-run');
@@ -201,14 +210,17 @@ async function ensureRules(db) {
     segments: [tok('order.code'), lit('-'), tok('record.shortName'), lit('-'), tok('position', { format: '00' })],
   });
 
-  // Everything inside: the parent's code, the short name and the position, with
-  // no separator before the number so it reads as one shop mark — TF1, IS2.
+  // Everything inside: the parent's code, the short name and the range of pieces
+  // the row covers under that parent, with no separator before the number so it
+  // reads as one shop mark — TF1, IS1-21, IS22-24. THIS is the one definition of
+  // the rule's shape; cf_range_rules.mjs only switches rules still ending in
+  // {position}, and leaves this one alone.
   await putScheme(db, {
     code: 'CFTMP-PART', name: 'Temporary item inside another', entityType: 'item', targetField: 'code',
     seqScope: 'prefix', priority: -10, status: 'active',
-    description: 'The parent item code, the short name and the BOM position: SO-20260924-0003-SPAN-01-G1-1-TF1.',
+    description: 'The parent item code, the short name and the pieces its row covers under that parent: SO-20260924-0003-SPAN-01-G1-1-TF1, …-G1-1-IS1-21 and its copied row …-G1-1-IS22-24.',
     conditions: [temporary, inside],
-    segments: [tok('parent.code'), lit('-'), tok('record.shortName'), tok('position', { format: '0' })],
+    segments: [tok('parent.code'), lit('-'), tok('record.shortName'), tok('range', { format: '0' })],
   });
 
   // A girder is cut into segments along its length, and the girder is already
@@ -308,6 +320,40 @@ async function recodeOne(db, id) {
   if (patch.name) tally.names += 1;
   if (!VERIFY_ONLY) await recs.updateRecord(db, c, id, patch);
   say(`   ${String(m.code ?? 'NULL').padEnd(34)} -> ${String(patch.code ?? m.code).padEnd(42)} ${patch.name ? `"${m.name}" -> "${patch.name}"` : ''}`);
+}
+
+/**
+ * Range codes first, one parent at a time and all of a parent's rows at once.
+ * When rows go from counting positions to counting pieces, a later row's new
+ * code can be another row's old one — X x2, X x1, X x1 turns X2 into X3 while
+ * the third row still holds X3 — and the one-at-a-time updates in recodeOne
+ * would run into it. refreshRangeCodes writes a parent's rows together (and the
+ * codes built on them below), so they never meet. What it does not touch —
+ * names, codes made by other rules — recodeOrders still does.
+ */
+async function renumberRanges(db) {
+  say('\n--- range codes -------------------------------------------------------');
+  const [tops] = await db.query(
+    `SELECT ol.item_id FROM cf_sales_order_lines ol
+       JOIN cf_sales_orders o ON o.id = ol.order_id AND o.deleted_at IS NULL
+       JOIN cf_item_details i ON i.master_id = ol.item_id AND i.item_type = 'temporary' AND i.deleted_at IS NULL
+      WHERE ol.company_id = ? AND ol.deleted_at IS NULL ORDER BY o.code, ol.line_no`, [COMPANY]);
+  const seen = new Set();
+  let moved = 0;
+  let frontier = tops.map((t) => t.item_id);
+  for (let depth = 0; frontier.length && depth < 25; depth += 1) {
+    const fresh = frontier.filter((id) => !seen.has(id));
+    fresh.forEach((id) => seen.add(id));
+    for (const id of fresh) {
+      const out = await refreshRangeCodes(db, c, id);
+      for (const ch of out.changed) say(`   ${String(ch.from ?? 'NULL').padEnd(34)} -> ${ch.to}`);
+      for (const s of out.skipped) problems.push(`${s.code ?? s.id}: ${s.why}`);
+      moved += out.changed.length;
+    }
+    frontier = [...new Set((await childrenOf(db, fresh)).map((r) => r.child_id))];
+  }
+  tally.codes += moved;
+  say(`   ${moved} codes renumbered by the pieces their rows cover`);
 }
 
 /**
@@ -450,6 +496,7 @@ try {
 
   await ensureRules(conn);
   await ensureShortNames(conn);
+  if (!VERIFY_ONLY) await renumberRanges(conn);
   const roots = await recodeOrders(conn);
   failed = await verify(conn, roots);
 

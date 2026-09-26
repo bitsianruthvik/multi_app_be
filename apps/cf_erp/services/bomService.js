@@ -27,6 +27,7 @@ import { findCandidates } from './selectionService.js';
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
+import { refreshRangeCodes, shortNameOf } from './codeRangeService.js';
 
 export const ALLOWED_CHILDREN = {
   standard: ['catalog'],
@@ -192,6 +193,12 @@ export async function addLine(db, c, parentId, input = {}) {
   let created = [];
 
   if (bomType === 'custom' && childKind === 'template') {
+    // Range codes (codeRangeService): a row put in AMONG existing rows moves
+    // the rows after it up. Move them first, so the new item's first code
+    // cannot meet the stale code one of them still carries.
+    if (lineNoIn != null) {
+      await refreshRangeCodes(db, c, parent.id, { insert: { lineNo, quantity, shortName: shortNameOf({ name: child.name }, child) } });
+    }
     const out = await instantiateTemplate(db, c, { definition: child, ownerLineId: parent.owner_order_line_id, place: { bom, ...common } });
     created = out.created;
   } else if (bomType === 'custom' && childKind === 'selection') {
@@ -202,6 +209,7 @@ export async function addLine(db, c, parentId, input = {}) {
   }
   // New items first (children before parents), then the parent's roll-ups.
   await refreshValues(db, c, [...created.slice().reverse(), parent.id]);
+  if (bomType === 'custom') await refreshRangeCodes(db, c, parent.id);
   return getBom(db, c.companyId, parent.id);
 }
 
@@ -217,8 +225,28 @@ export async function parentOfLine(db, companyId, lineId) {
   return requireMaster(db, companyId, line.parent_id);
 }
 
-/** input: { quantity?, role?, lineNo?, notes?, operationFlowId? } — what a line IS cannot change; remove it and add another. */
-export async function updateLine(db, c, lineId, input = {}) {
+/*
+ * WRITE, THEN REFRESH — AND A BATCH REFRESHES ONCE
+ *
+ * A change to a line is two things: the row itself, and what it moves — the
+ * values rolled up through every parent above it, and the range codes of the
+ * rows after it. The second is the expensive part: one quantity deep in the
+ * KEPL order re-works the values all the way to the span, 251 round trips, about
+ * 12 s on production (~49 ms a hop).
+ *
+ * updateLine / removeLine do both, for one line. writeLineUpdate /
+ * writeLineRemoval do only the first and say what needs refreshing, so a caller
+ * that changes many lines at once (edit mode, bomChangeService) can refresh
+ * each parent ONCE — ten quantity changes under one girder are one walk up the
+ * tree, not ten.
+ */
+
+/**
+ * input: { quantity?, role?, lineNo?, notes?, operationFlowId? } — what a line IS cannot change; remove it and add another.
+ * Writes the row only. Returns what the caller must refresh: `values` when the
+ * quantity changed, `ranges` when a Custom BOM's rows moved.
+ */
+export async function writeLineUpdate(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId);
   const parent = await requireMaster(db, c.companyId, line.parent_id);
   await assertEditable(db, c.companyId, parent);
@@ -237,26 +265,47 @@ export async function updateLine(db, c, lineId, input = {}) {
     sets.operation_flow_id = await readLineFlow(db, c.companyId, input.operationFlowId, isSelection, problems);
   }
   assertNoProblems(problems);
+  const out = { parentId: parent.id, values: false, ranges: false };
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_bom_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, lineId]);
-    if (sets.quantity !== undefined && sets.quantity !== Number(line.quantity)) await refreshValues(db, c, [parent.id]);
+    out.values = sets.quantity !== undefined && sets.quantity !== Number(line.quantity);
+    // A new quantity or a new place in the list moves the ranges of the rows after it.
+    out.ranges = line.bom_type === 'custom'
+      && (out.values || (sets.line_no !== undefined && sets.line_no !== line.line_no));
   }
-  return getBom(db, c.companyId, parent.id);
+  return out;
+}
+
+/** Changes one line and refreshes what it moves. See writeLineUpdate. */
+export async function updateLine(db, c, lineId, input = {}) {
+  const w = await writeLineUpdate(db, c, lineId, input);
+  if (w.values) await refreshValues(db, c, [w.parentId]);
+  if (w.ranges) await refreshRangeCodes(db, c, w.parentId);
+  return getBom(db, c.companyId, w.parentId);
 }
 
 /**
- * Removes a line. On a Custom BOM, a temporary item goes with its line —
- * together with everything below it, since it exists only for this place.
+ * Removes a line — the row only; returns what the caller must refresh, as
+ * writeLineUpdate does. On a Custom BOM, a temporary item goes with its line,
+ * together with everything below it that nothing else holds (a cut plate other
+ * parts are still cut from stays — see deleteTemporaryTree).
  */
-export async function removeLine(db, c, lineId) {
+export async function writeLineRemoval(db, c, lineId) {
   const line = await requireLine(db, c.companyId, lineId);
   const parent = await requireMaster(db, c.companyId, line.parent_id);
   await assertEditable(db, c.companyId, parent);
   if (line.bom_type === 'custom' && childKindOf(line) === 'temporary') await deleteTemporaryTree(db, c, line.child_id);
   await db.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, lineId]);
-  await refreshValues(db, c, [parent.id]);
-  return getBom(db, c.companyId, parent.id);
+  return { parentId: parent.id, values: true, ranges: line.bom_type === 'custom' };
+}
+
+/** Removes one line and refreshes what it moves. See writeLineRemoval. */
+export async function removeLine(db, c, lineId) {
+  const w = await writeLineRemoval(db, c, lineId);
+  await refreshValues(db, c, [w.parentId]);
+  if (w.ranges) await refreshRangeCodes(db, c, w.parentId);
+  return getBom(db, c.companyId, w.parentId);
 }
 
 /** The catalog items a selection line may take, with the one it holds now. */
@@ -288,6 +337,8 @@ export async function resolveLine(db, c, lineId, { itemId } = {}) {
   if (childId !== line.child_id) {
     await db.query('UPDATE cf_bom_lines SET child_id = ? WHERE company_id = ? AND id = ?', [childId, c.companyId, lineId]);
     await refreshValues(db, c, [parent.id]);
+    // The chosen item's short name decides which count the row joins.
+    if (line.bom_type === 'custom') await refreshRangeCodes(db, c, parent.id);
   }
   return getBom(db, c.companyId, parent.id);
 }

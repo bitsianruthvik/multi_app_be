@@ -139,6 +139,12 @@ const text = (v) => (blank(v) ? null : String(v).trim());
 const near = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
 const labelOf = (n) => n.code ?? n.name ?? `#${n.id}`;
 const chunk = (xs, n) => { const out = []; for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n)); return out; };
+/**
+ * Two codes that differ only in their numbers — a number or a range of them,
+ * so IS24 against IS24-26 (one piece became three) counts as the same shape.
+ */
+const numbersAsOne = (s) => String(s).toUpperCase().replace(/\d+(?:-\d+)*/g, '#');
+const sameButNumbers = (a, b) => numbersAsOne(a) === numbersAsOne(b);
 
 /** One cell of an ExcelJS sheet as plain text: formulas, rich text and dates all flattened. */
 function cellText(v) {
@@ -776,11 +782,22 @@ async function buildPlan(db, c, model, sheet) {
     };
 
     // Code is identity, not a field. Changing it is remove-and-add.
+    //
+    // Except where codes MOVE. An order's own temporary items are numbered by
+    // where their pieces fall under their parent (codeRangeService): a quantity
+    // changed since this sheet was exported moves the code of that row, of the
+    // rows after it, and of everything built on them — WEB1-7 is WEB1-5 once the
+    // row holds 5. The Row ID already says which line this is, and a line never
+    // changes what it holds, so a temporary item's code that differs ONLY IN
+    // ITS NUMBERS is the same row with an older number — not a swap. Refusing it
+    // made every sheet go stale the moment it was used once. A different word
+    // (TF1 for BF1) is still refused: that reads like a swap.
     const codeRead = agree('Code', (e) => cell(e.row, 'code'));
     if (!codeRead.conflict) {
       const was = n.code ?? '';
       const now = codeRead.value ?? '';
-      if (was !== '' && now !== '' && was.toUpperCase() !== now.toUpperCase()) {
+      const renumbered = n.kind === 'temporary' && sameButNumbers(was, now);
+      if (was !== '' && now !== '' && was.toUpperCase() !== now.toUpperCase() && !renumbered) {
         problems.push(n.selection
           ? `Row ${rowId} chooses a catalog item for ${n.selection.code ?? n.selection.name}; the sheet does not change that choice — make it on the structure screen.`
           : `Row ${rowId}: what a line holds cannot change (${was} -> ${now}) — take this row out and add ${now} instead.`);
