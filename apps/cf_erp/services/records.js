@@ -15,10 +15,7 @@ import { notFound, invalid } from '../lib/errors.js';
 /** Order statuses in which nothing on the order changes. A lost order can be reopened, which unfreezes it. */
 export const LOCKED_ORDER_STATUSES = new Set(['closed', 'lost', 'cancelled']);
 
-export async function loadMaster(db, companyId, id) {
-  if (id == null) return null;
-  const [[row]] = await db.query(
-    `SELECT m.*,
+const MASTER_SELECT = `SELECT m.*,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
@@ -28,11 +25,24 @@ export async function loadMaster(db, companyId, id) {
        LEFT JOIN cf_definition_details d ON d.master_id = m.id AND d.deleted_at IS NULL
        LEFT JOIN cf_sales_order_lines ol ON ol.id = i.owner_order_line_id
        LEFT JOIN cf_sales_orders so      ON so.id = ol.order_id
-       LEFT JOIN cf_production_releases rel ON rel.order_line_id = ol.id AND rel.deleted_at IS NULL
-      WHERE m.company_id = ? AND m.id = ? AND m.deleted_at IS NULL`,
-    [companyId, id],
-  );
+       LEFT JOIN cf_production_releases rel ON rel.order_line_id = ol.id AND rel.deleted_at IS NULL`;
+
+export async function loadMaster(db, companyId, id) {
+  if (id == null) return null;
+  const [[row]] = await db.query(`${MASTER_SELECT} WHERE m.company_id = ? AND m.id = ? AND m.deleted_at IS NULL`, [companyId, id]);
   return row || null;
+}
+
+/**
+ * loadMaster for many ids in ONE query — the same row shape, keyed by id. For
+ * code that would otherwise load record after record: every one is ~49 ms on
+ * production. A missing or deleted id is simply absent from the map.
+ */
+export async function loadMasters(db, companyId, ids) {
+  const want = [...new Set(ids.filter((id) => id != null).map(Number))];
+  if (!want.length) return new Map();
+  const [rows] = await db.query(`${MASTER_SELECT} WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL`, [companyId, want]);
+  return new Map(rows.map((r) => [r.id, r]));
 }
 
 export async function requireMaster(db, companyId, id, what = 'Record') {

@@ -35,5 +35,20 @@ export async function withTransaction(fn) {
   }
 }
 
+/**
+ * Rows written with multi-row INSERTs, `chunk` rows a statement — a fixed number
+ * of round trips whatever the size, where one INSERT a row is ~49 ms each on
+ * production. A multi-row INSERT reports only its first id and TiDB does not
+ * hand AUTO_INCREMENT ids out contiguously, so read the new ids back by a
+ * natural key; never compute them from insertId.
+ */
+export async function insertRows(db, table, columns, rows, chunk = 200) {
+  const holes = `(${columns.map(() => '?').join(', ')})`;
+  for (let i = 0; i < rows.length; i += chunk) {
+    const part = rows.slice(i, i + chunk);
+    await db.query(`INSERT INTO ${table} (${columns.join(', ')}) VALUES ${part.map(() => holes).join(', ')}`, part.flat());
+  }
+}
+
 export { pool };
 export { attachNodeCache, detachNodeCache, invalidateNodeCache } from './nodeCache.js';

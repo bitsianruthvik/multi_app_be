@@ -615,6 +615,28 @@ try {
   console.log(`  one flow: ${oneFlow} round trips · one quantity: ${oneQty} · two quantities under one segment: ${twoQty}`);
   ok('the second quantity costs less than a refresh of its own', twoQty - oneQty < oneQty - oneFlow, `${twoQty} − ${oneQty} vs ${oneQty} − ${oneFlow}`);
 
+  // Putting a template on an order used to create one item at a time — ~49
+  // round trips an item: a 62-item span took three minutes on production, the
+  // screen gave up at 30 s and a second click made a second line (2026-09-26).
+  // It is written in bulk now: the count follows how DEEP the template goes,
+  // not how many items it holds.
+  section('10c. Putting a template on an order costs a fixed number of round trips');
+  const addLineTrips = async (recordId) => {
+    const m = meter(conn);
+    await S.addOrderLine(conn, c, f.orderId, { recordId, quantity: 1 });
+    m.stop();
+    const [[nl]] = await conn.query('SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1', [COMPANY, f.orderId]);
+    const [[{ n }]] = await conn.query('SELECT COUNT(*) AS n FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND deleted_at IS NULL', [COMPANY, nl.id]);
+    return { trips: m.m.total, items: Number(n) };
+  };
+  const girderLine = await addLineTrips(f.GIRDER);
+  const segmentLine = await addLineTrips(f.SEGMENT);
+  console.log(`  girder: ${girderLine.items} items in ${girderLine.trips} round trips · segment: ${segmentLine.items} items in ${segmentLine.trips}`);
+  ok('a whole girder is a few dozen round trips, not dozens an item', girderLine.trips <= 90, `${girderLine.trips} round trips for ${girderLine.items} items`);
+  ok('and the bigger template costs next to nothing more per item',
+    girderLine.items > segmentLine.items && (girderLine.trips - segmentLine.trips) <= 3 * (girderLine.items - segmentLine.items),
+    `${girderLine.trips - segmentLine.trips} more round trips for ${girderLine.items - segmentLine.items} more items`);
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {

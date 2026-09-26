@@ -844,6 +844,61 @@ function refreshInMemory(ctx, changedIds) {
   return changes;
 }
 
+/** What the store held when the line was loaded — the flush writes the difference from it. */
+function storeAsLoaded(ctx) {
+  const initial = new Map();
+  for (const rec of ctx.records.values()) {
+    const rows = ctx.store.get(subjectKey('master', rec.id));
+    initial.set(rec.id, rows ? new Map(rows) : new Map());
+  }
+  return initial;
+}
+
+/** Every (record, specification) pair a pass touched, in the order first touched — what flush() walks. */
+function changeLog() {
+  const order = { records: [], specsOf: new Map() };
+  const note = (changes) => {
+    for (const ch of changes) {
+      if (!order.specsOf.has(ch.recordId)) { order.specsOf.set(ch.recordId, []); order.records.push(ch.recordId); }
+      const list = order.specsOf.get(ch.recordId);
+      if (!list.includes(ch.specId)) list.push(ch.specId);
+    }
+  };
+  return { order, note };
+}
+
+/**
+ * The values of records JUST CREATED under a line: valueService.materialize for
+ * each of them, deepest first, then one walk from everything that moved — what
+ * the per-item path reaches, in this engine's fixed number of statements.
+ *
+ * The batched template copy (instantiationService) calls it instead of one
+ * materialize per new item and a refreshValues over all of them afterwards. On
+ * a 203-item bridge span that refresh alone was 1,483 round trips (~73 s on
+ * production, ~49 ms each) and changed nothing, because the per-item pass had
+ * already arrived; here the loading is 8 statements and the writing a handful.
+ * The line is open — the records were created a moment ago. Returns
+ * { records, values }: how many records changed, how many value rows were written.
+ */
+export async function materializeLineRecords(db, c, lineId, recordIds) {
+  const ctx = await loadContext(db, c.companyId, lineId);
+  const initial = storeAsLoaded(ctx);
+  const { order, note } = changeLog();
+  const depthOf = new Map([[ctx.line.itemId, 0], ...ctx.lines.map((l) => [l.childId, l.depth])]);
+  const ids = [...new Set([...recordIds].map(Number))]
+    .filter((id) => ctx.records.has(id))
+    .sort((a, b) => (depthOf.get(b) ?? 0) - (depthOf.get(a) ?? 0));
+  const moved = [];
+  for (const id of ids) {
+    const own = materializeInMemory(ctx, id);
+    note(own);
+    if (own.length) moved.push(id);
+  }
+  note(refreshInMemory(ctx, moved));
+  const flushed = order.records.length ? await flush(db, c, ctx, initial, order) : { values: 0 };
+  return { records: order.records.length, values: flushed.values };
+}
+
 /* ===========================================================================
  * The flush — the net difference, in a fixed number of statements
  * ======================================================================== */
@@ -1308,19 +1363,8 @@ export async function writeLineValues(db, c, lineId, input = {}) {
   // ---- work it out in memory ----------------------------------------------
   // `initial` is what was loaded; the store is changed from here on, and the
   // flush writes the difference between the two for every pair `order` names.
-  const initial = new Map();
-  for (const rec of ctx.records.values()) {
-    const rows = ctx.store.get(subjectKey('master', rec.id));
-    initial.set(rec.id, rows ? new Map(rows) : new Map());
-  }
-  const order = { records: [], specsOf: new Map() };
-  const note = (changes) => {
-    for (const ch of changes) {
-      if (!order.specsOf.has(ch.recordId)) { order.specsOf.set(ch.recordId, []); order.records.push(ch.recordId); }
-      const list = order.specsOf.get(ch.recordId);
-      if (!list.includes(ch.specId)) list.push(ch.specId);
-    }
-  };
+  const initial = storeAsLoaded(ctx);
+  const { order, note } = changeLog();
   // setValues, for every record at once: the typed values, then the record's
   // own derived values, then ONE walk from everything that moved. Deepest
   // first, so a parent is worked out after the children written with it.

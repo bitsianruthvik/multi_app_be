@@ -133,12 +133,12 @@ import { dateText } from './resolutionService.js';
 import { CUT_PLATE_CODE } from './nestingService.js';
 import { refreshRangeCodes, shortNameOf } from './codeRangeService.js';
 import { generate } from '../modules/codegen/index.js';
+import { insertRows } from '../lib/db.js';
 
 export const OPS = ['quantity', 'flow', 'remove', 'paste'];
 const MAX_CHANGES = 1000;
 const MAX_COPY_DEPTH = 25;
 const ID_CHUNK = 500;   // ids per IN list
-const ROW_CHUNK = 200;  // rows per multi-row INSERT (valueService's budget)
 const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED']);
 const SELECTION_FLOW = 'A selection line takes the flow of the catalog item chosen for it — it has none of its own.';
 const LINE_COLUMNS = ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity',
@@ -828,12 +828,6 @@ function valueSnapshot(v) {
 
 const markerToken = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
-async function insertRows(db, table, columns, rows) {
-  for (const part of chunk(rows, ROW_CHUNK)) {
-    const holes = `(${columns.map(() => '?').join(', ')})`;
-    await db.query(`INSERT INTO ${table} (${columns.join(', ')}) VALUES ${part.map(() => holes).join(', ')}`, part.flat());
-  }
-}
 
 /**
  * One paste into a Custom BOM. The top line goes into the target's BOM; when it

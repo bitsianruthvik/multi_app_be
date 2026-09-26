@@ -447,9 +447,9 @@ export async function addOrderLine(db, c, orderId, input = {}) {
       Number(quantity.toFixed(6)), committedDate, bomRevision, description, blank(input.notes) ? null : String(input.notes), c.userId],
   );
   if (kind === 'template') {
-    const out = await instantiateTemplate(db, c, { definition: rec, ownerLineId: r.insertId });
-    await db.query('UPDATE cf_sales_order_lines SET item_id = ? WHERE company_id = ? AND id = ?', [out.itemId, c.companyId, r.insertId]);
-    await refreshValues(db, c, out.created.slice().reverse());
+    // The copy points the line at the item it makes, and settles the values,
+    // names and codes of everything it creates — in bulk (instantiationService).
+    await instantiateTemplate(db, c, { definition: rec, ownerLineId: r.insertId });
   }
   return getOrder(db, c.companyId, orderId);
 }

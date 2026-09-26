@@ -20,13 +20,15 @@
  * Only active blueprints are copied: an order is a commitment, and a draft or
  * obsolete template, or a Template BOM still in draft, is refused with its code.
  */
-import { invalid } from '../lib/errors.js';
-import { requireMaster } from './records.js';
-import { createItem } from './masterRecordService.js';
+import { invalid, notFound } from '../lib/errors.js';
+import { insertRows } from '../lib/db.js';
+import { loadMasters } from './records.js';
 import { findCandidates } from './selectionService.js';
 import { deleteAllForSubject as deleteValues } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
-import { bomOfParent, linesOfBom, childKindOf, createBom, insertLine } from './bomGraph.js';
+import { bomOfParent, bomsOfParents, linesOfBoms, childKindOf } from './bomGraph.js';
+import { materializeLineRecords } from './orderValuesService.js';
+import { codeNewItems } from './codeRangeService.js';
 
 const MAX_DEPTH = 20;
 
@@ -64,71 +66,178 @@ function refuseInactive(def, depth) {
 }
 
 /**
- * Creates one temporary item from a template definition, places it, and copies
- * the definition's Template BOM beneath it.
+ * Creates the temporary items of a template definition — the one an order line
+ * sells, or one put on a Custom BOM (`place`) — with the definition's Template
+ * BOM copied beneath it, recursively.
  *
  *   ownerLineId  the sales order line every item of this structure belongs to
  *   place        { bom, lineNo, position, quantity, role, notes, sourceLineId, operationFlowId }
  *                where it sits in its parent's Custom BOM — omitted for the item
- *                the sales line itself sells
+ *                the sales line itself sells, whose line is pointed at it here
  *
- * Returns { itemId, created } — created lists every new temporary item, parents
- * before children, so the caller can refresh their values bottom-up.
+ * IN BULK. This used to create one item at a time through createItem — the
+ * record, its line, its values resolved three times over, its name and its code
+ * each through the code generator, the whole record read back — about 49 round
+ * trips an item, then a refreshValues over all of them that changed nothing. On
+ * production, ~49 ms a round trip, a 62-item bridge span took three minutes;
+ * the screen gave up at thirty seconds and a second click made a second line
+ * (SO-20260926-0001). Now:
+ *
+ *   read the template tree, a level at a time     3 statements a level
+ *   INSERT the items with placeholder codes,
+ *     read their ids back                         2
+ *   INSERT their details, their BOMs,
+ *     read the BOM ids back, INSERT every line    4
+ *   work out their values, once for the line      orderValuesService.materializeLineRecords
+ *   name and code them, once for the tree         codeRangeService.codeNewItems
+ *
+ * (one more statement per 200 rows, and one per selection line's default.) The
+ * same checks refuse the same things before anything is written, and the result
+ * is the per-item copy's, item for item — proved against it on real templates
+ * (a 203-item span, selections, a template put into an existing structure)
+ * before it replaced it.
+ *
+ * Returns { itemId, created, warnings } — created lists every new item in the
+ * order the per-item copy made them (depth first, a parent before its
+ * children). Their values, names and codes are settled: a caller has nothing
+ * left to refresh for them, only for what they were put under.
  */
-export async function instantiateTemplate(db, c, { definition, ownerLineId, place = null, depth = 0, path = [] }) {
-  if (depth > MAX_DEPTH) throw invalid('TOO_DEEP', `Templates nest more than ${MAX_DEPTH} levels deep here — check for a template that contains itself.`);
-  if (path.includes(definition.id)) throw invalid('TEMPLATE_LOOP', `${definition.code ?? definition.name} contains itself further down its Template BOM.`);
-  refuseInactive(definition, depth);
-  const templateBom = await bomOfParent(db, c.companyId, definition.id);
-  if (templateBom && templateBom.status !== 'active') {
-    throw invalid('TEMPLATE_BOM_NOT_ACTIVE', `The Template BOM of ${definition.code ?? definition.name} is ${templateBom.status} — activate it before using it on an order.`);
+export async function instantiateTemplate(db, c, { definition, ownerLineId, place = null }) {
+  const { companyId } = c;
+
+  // ---- 1. the whole template tree — every refusal before any write ---------
+  const root = { def: definition, depth: 0, path: [], tls: [], childByTl: new Map() };
+  const bomOf = new Map();   // definition id -> its Template BOM, or null
+  const picks = new Map();   // selection id -> its default candidate, or null
+  let frontier = [root];
+  while (frontier.length) {
+    for (const n of frontier) {
+      if (n.depth > MAX_DEPTH) throw invalid('TOO_DEEP', `Templates nest more than ${MAX_DEPTH} levels deep here — check for a template that contains itself.`);
+      if (n.path.includes(n.def.id)) throw invalid('TEMPLATE_LOOP', `${n.def.code ?? n.def.name} contains itself further down its Template BOM.`);
+      refuseInactive(n.def, n.depth);
+    }
+    const unread = [...new Set(frontier.map((n) => n.def.id))].filter((id) => !bomOf.has(id));
+    const boms = await bomsOfParents(db, companyId, unread);
+    for (const id of unread) bomOf.set(id, boms.get(id) ?? null);
+    for (const n of frontier) {
+      const b = bomOf.get(n.def.id);
+      if (b && b.status !== 'active') {
+        throw invalid('TEMPLATE_BOM_NOT_ACTIVE', `The Template BOM of ${n.def.code ?? n.def.name} is ${b.status} — activate it before using it on an order.`);
+      }
+    }
+    const bomIds = [...new Set(frontier.map((n) => bomOf.get(n.def.id)?.id).filter(Boolean))];
+    const tlsOf = new Map();
+    for (const tl of await linesOfBoms(db, companyId, bomIds)) {
+      if (!tlsOf.has(tl.bom_id)) tlsOf.set(tl.bom_id, []);
+      tlsOf.get(tl.bom_id).push(tl);
+    }
+    const all = [...tlsOf.values()].flat();
+    const defs = await loadMasters(db, companyId, all.filter((tl) => childKindOf(tl) === 'template').map((tl) => tl.child_id));
+    for (const tl of all) {
+      if (childKindOf(tl) === 'selection' && !picks.has(tl.child_id)) picks.set(tl.child_id, await defaultCandidate(db, companyId, tl.child_id));
+    }
+    const next = [];
+    for (const n of frontier) {
+      const b = bomOf.get(n.def.id);
+      if (!b) continue;
+      n.tls = tlsOf.get(b.id) ?? [];
+      for (const tl of n.tls) {
+        if (childKindOf(tl) !== 'template') continue;
+        const def = defs.get(tl.child_id);
+        if (!def) throw notFound('Template definition');
+        const child = { def, depth: n.depth + 1, path: [...n.path, n.def.id], tls: [], childByTl: new Map() };
+        n.childByTl.set(tl.id, child);
+        next.push(child);
+      }
+    }
+    frontier = next;
   }
 
-  // The name says what the thing IS — "Top flange", not "Top flange 01". The
-  // trailing number used to be here to keep names apart, which was never needed
-  // and never worked: cf_master_records is unique on the CODE, not the name, so
-  // "Top flange 01" already existed under two different segments. Three things
-  // already say which one this is — the code, the place in the BOM tree, and the
-  // line's role ("Intermediate stiffener — plain" against "— drilled"). A number
-  // on top of that is noise that reads like meaning. (User, 2026-09-24.)
-  const item = await createItem(db, c, {
-    itemType: 'temporary', sourceDefinitionId: definition.id, ownerOrderLineId: ownerLineId, status: 'draft',
-  }, {
-    fallbackName: definition.name,
-    place: async (itemId) => {
-      if (!place) return;
-      await insertLine(db, c, {
-        bomId: place.bom.id, lineNo: place.lineNo, childId: itemId, designId: definition.id, position: place.position,
-        quantity: place.quantity, role: place.role, notes: place.notes, sourceLineId: place.sourceLineId,
-        operationFlowId: place.operationFlowId,
-      });
-    },
-  });
-  const created = [item.id];
-  if (!templateBom) return { itemId: item.id, created, item };
+  // ---- 2. depth first: the order the per-item copy made them in -------------
+  const order = [];
+  (function walk(n) {
+    order.push(n);
+    for (const tl of n.tls) { const child = n.childByTl.get(tl.id); if (child) walk(child); }
+  }(root));
 
-  const custom = await createBom(db, c, { parentId: item.id, bomType: 'custom', sourceBomId: templateBom.id });
-  for (const tl of await linesOfBom(db, c.companyId, templateBom.id)) {
-    // A flow named on the template line travels with the copy.
-    const common = {
-      lineNo: tl.line_no, position: tl.position, quantity: Number(tl.quantity), role: tl.role, notes: tl.notes, sourceLineId: tl.id,
-      operationFlowId: tl.operation_flow_id,
-    };
-    const kind = childKindOf(tl);
-    if (kind === 'template') {
-      const def = await requireMaster(db, c.companyId, tl.child_id, 'Template definition');
-      const sub = await instantiateTemplate(db, c, {
-        definition: def, ownerLineId, place: { bom: custom, ...common }, depth: depth + 1, path: [...path, definition.id],
-      });
-      created.push(...sub.created);
-    } else if (kind === 'selection') {
-      const pick = await defaultCandidate(db, c.companyId, tl.child_id);
-      await insertLine(db, c, { bomId: custom.id, childId: pick?.id ?? tl.child_id, designId: tl.child_id, selectionDefinitionId: tl.child_id, ...common, operationFlowId: null });
-    } else {
-      await insertLine(db, c, { bomId: custom.id, childId: tl.child_id, designId: tl.design_id, ...common });
+  // ---- 3. the items, born with placeholder codes to read their ids back by --
+  // A new temporary item has no natural key of its own — its code is empty and
+  // its name repeats — so each is written with a code unique to this copy and
+  // found again by it. codeNewItems overwrites every placeholder, with the
+  // generated code or with nothing, before this returns.
+  const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const marker = (i) => `~tpl~${token}~${i}`;
+  await insertRows(db, 'cf_master_records',
+    ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'created_by'],
+    order.map((n, i) => [companyId, 'item', marker(i), '(pending)', null, null, n.def.classification_id, 'draft', null, c.userId]));
+  const [back] = await db.query('SELECT id, code FROM cf_master_records WHERE company_id = ? AND code LIKE ?', [companyId, `~tpl~${token}~%`]);
+  const idOf = new Map(back.map((r) => [r.code, r.id]));
+  order.forEach((n, i) => { n.id = idOf.get(marker(i)); });
+  if (order.some((n) => !n.id)) throw new Error(`cf_erp: ${order.length} temporary items written, ${back.length} read back.`);
+
+  await insertRows(db, 'cf_item_details',
+    ['master_id', 'company_id', 'item_type', 'tracked_by', 'uom', 'sourcing', 'source_definition_id', 'owner_order_line_id'],
+    order.map((n) => [n.id, companyId, 'temporary', 'individual', 'nos', 'make', n.def.id, ownerLineId]));
+
+  // ---- 4. their Custom BOMs, copied from the Template BOMs ------------------
+  const withBom = order.filter((n) => bomOf.get(n.def.id));
+  await insertRows(db, 'cf_boms', ['company_id', 'parent_id', 'bom_type', 'status', 'source_bom_id', 'created_by'],
+    withBom.map((n) => [companyId, n.id, 'custom', 'draft', bomOf.get(n.def.id).id, c.userId]));
+  const custom = await bomsOfParents(db, companyId, withBom.map((n) => n.id)); // one live BOM a parent
+  for (const n of withBom) {
+    n.customBomId = custom.get(n.id)?.id;
+    if (!n.customBomId) throw new Error(`cf_erp: the Custom BOM of temporary item ${n.id} was written and not read back.`);
+  }
+
+  // ---- 5. every line: where the top item sits, and each copied line ---------
+  // A template line becomes the new item it made; a selection keeps its
+  // definition beside the default candidate (Q12); a catalog item is copied as
+  // it is. Positions and line numbers are the template's.
+  const rows = [];
+  const line = (bomId, l) => [companyId, bomId, l.lineNo, l.childId, l.designId, l.position, l.role ?? null, l.quantity,
+    l.selectionDefinitionId ?? null, l.sourceLineId ?? null, l.operationFlowId ?? null, l.notes ?? null, c.userId];
+  if (place) {
+    rows.push(line(place.bom.id, {
+      lineNo: place.lineNo, childId: root.id, designId: definition.id, position: place.position, quantity: place.quantity,
+      role: place.role, notes: place.notes, sourceLineId: place.sourceLineId, operationFlowId: place.operationFlowId,
+    }));
+  }
+  for (const n of order) {
+    for (const tl of n.tls) {
+      const common = {
+        lineNo: tl.line_no, position: tl.position, quantity: Number(tl.quantity), role: tl.role, notes: tl.notes, sourceLineId: tl.id,
+        operationFlowId: tl.operation_flow_id,
+      };
+      const kind = childKindOf(tl);
+      if (kind === 'template') {
+        const child = n.childByTl.get(tl.id);
+        rows.push(line(n.customBomId, { ...common, childId: child.id, designId: child.def.id }));
+      } else if (kind === 'selection') {
+        const pick = picks.get(tl.child_id);
+        rows.push(line(n.customBomId, { ...common, childId: pick?.id ?? tl.child_id, designId: tl.child_id, selectionDefinitionId: tl.child_id, operationFlowId: null }));
+      } else {
+        rows.push(line(n.customBomId, { ...common, childId: tl.child_id, designId: tl.design_id }));
+      }
     }
   }
-  return { itemId: item.id, created, item };
+  await insertRows(db, 'cf_bom_lines',
+    ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity', 'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by'],
+    rows);
+
+  // The item the sales line sells: the line points at it before its values are
+  // worked out, because the line's structure is read from there.
+  if (!place) await db.query('UPDATE cf_sales_order_lines SET item_id = ? WHERE company_id = ? AND id = ?', [root.id, companyId, ownerLineId]);
+
+  // ---- 6. values, then names and codes — a code may print a value ----------
+  const created = order.map((n) => n.id);
+  await materializeLineRecords(db, c, ownerLineId, created);
+  const coded = await codeNewItems(db, c, {
+    rootId: root.id,
+    parentId: place ? place.bom.parent_id : null,
+    ids: created,
+    fallbackName: new Map(order.map((n) => [n.id, n.def.name])),
+  });
+  return { itemId: root.id, created, warnings: coded.warnings };
 }
 
 /**

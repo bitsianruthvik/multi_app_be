@@ -190,7 +190,6 @@ export async function addLine(db, c, parentId, input = {}) {
   const lineNo = lineNoIn ?? await nextLineNo(db, c.companyId, bom.id);
   const position = await nextPosition(db, c.companyId, bom.id, child.id);
   const common = { lineNo, position, quantity, role, operationFlowId, notes: blank(input.notes) ? null : String(input.notes) };
-  let created = [];
 
   if (bomType === 'custom' && childKind === 'template') {
     // Range codes (codeRangeService): a row put in AMONG existing rows moves
@@ -199,16 +198,17 @@ export async function addLine(db, c, parentId, input = {}) {
     if (lineNoIn != null) {
       await refreshRangeCodes(db, c, parent.id, { insert: { lineNo, quantity, shortName: shortNameOf({ name: child.name }, child) } });
     }
-    const out = await instantiateTemplate(db, c, { definition: child, ownerLineId: parent.owner_order_line_id, place: { bom, ...common } });
-    created = out.created;
+    await instantiateTemplate(db, c, { definition: child, ownerLineId: parent.owner_order_line_id, place: { bom, ...common } });
   } else if (bomType === 'custom' && childKind === 'selection') {
     const pick = await defaultCandidate(db, c.companyId, child.id);
     await insertLine(db, c, { bomId: bom.id, childId: pick?.id ?? child.id, designId: child.id, selectionDefinitionId: child.id, ...common });
   } else {
     await insertLine(db, c, { bomId: bom.id, childId: child.id, designId: child.id, ...common });
   }
-  // New items first (children before parents), then the parent's roll-ups.
-  await refreshValues(db, c, [...created.slice().reverse(), parent.id]);
+  // The parent's roll-ups. A template's new items arrive with their values
+  // already worked out by the copy (instantiationService), so only the parent
+  // is refreshed here — it walks up from there as far as anything moves.
+  await refreshValues(db, c, [parent.id]);
   if (bomType === 'custom') await refreshRangeCodes(db, c, parent.id);
   return getBom(db, c.companyId, parent.id);
 }

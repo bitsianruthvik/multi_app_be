@@ -475,3 +475,147 @@ export async function refreshRangeCodes(db, c, parentId, { insert = null } = {})
   }
   return out;
 }
+
+/**
+ * NAMES AND CODES FOR ITEMS JUST CREATED IN BULK — the batched template copy
+ * (instantiationService). What masterRecordService.finishCreate does for one
+ * item — a naming rule's name or the fallback, then a coding rule's code, a
+ * draft allowed to wait for a value its code needs — for a whole new tree:
+ *
+ *   - IN THE ORDER THE PER-ITEM COPY CREATED THEM: depth first, a parent before
+ *     its children, siblings in line order. A child's code is built on its
+ *     parent's, so each parent's new code is carried down in memory; and a rule
+ *     that draws a running number hands the numbers out in the same order.
+ *   - Everything is loaded ONCE for the tree — the new items with the fields
+ *     buildContext would read record by record (loadPlacedItems), the lines
+ *     that hold them, the rules (readRulesOnce) — and every name and code is
+ *     written at the end in a few statements. finishCreate cost ~13 round trips
+ *     an item in the code generator alone; on production that was minutes for a
+ *     bridge span.
+ *   - Specification values are resolved only for an item whose rule prints one:
+ *     a dry pass (consume: false) says which tokens a rule reads, and only then
+ *     is the item resolved, before the pass that draws its number.
+ *
+ *   rootId        the first new item
+ *   parentId      the record it was put under (a template added to a Custom
+ *                 BOM), or null when it is what the order line sells
+ *   ids           every new item — only these are named and coded
+ *   fallbackName  Map(id -> name) when no naming rule applies (the definition's)
+ *
+ * Every new item leaves with its generated code, or none — whatever placeholder
+ * the caller wrote is overwritten. Returns { named, coded, warnings }.
+ */
+export async function codeNewItems(db, c, { rootId, parentId = null, ids, fallbackName = new Map() }) {
+  const { companyId } = c;
+  const rules = readRulesOnce(db);
+  const newIds = new Set([...ids].map(Number));
+  const chains = new Map();
+  const chainOf = async (clsId) => {
+    if (clsId == null) return [];
+    if (!chains.has(clsId)) chains.set(clsId, await ancestors(db, companyId, clsId));
+    return chains.get(clsId);
+  };
+  const out = { named: 0, coded: 0, warnings: [] };
+
+  // Everything, once: the new items, and every line under the parent and under them.
+  const all = [...newIds];
+  const masters = new Map();
+  for (let i = 0; i < all.length; i += 500) for (const [k, v] of await loadPlacedItems(db, companyId, all.slice(i, i + 500))) masters.set(k, v);
+  const holders = [...(parentId == null ? [] : [parentId]), ...all];
+  const lines = [];
+  for (let i = 0; i < holders.length; i += 500) lines.push(...await linesOfParents(db, companyId, holders.slice(i, i + 500)));
+  const ranges = rangesOf(lines);
+  const linesUnder = new Map(); // parent id -> its lines, in the order they are shown
+  for (const l of lines) {
+    if (!linesUnder.has(l.parent_id)) linesUnder.set(l.parent_id, []);
+    linesUnder.get(l.parent_id).push(l);
+  }
+  for (const list of linesUnder.values()) list.sort((a, b) => a.line_no - b.line_no || a.id - b.id);
+  const codeOf = new Map();  // new item id -> the code just generated (its children print it)
+  const nameOf = new Map();
+  const written = [];        // [id, name, code], in creation order
+
+  // Depth first from the top item — the per-item copy's order.
+  const first = parentId == null
+    ? [{ id: Number(rootId), line: null }]
+    : (linesUnder.get(Number(parentId)) ?? []).filter((l) => Number(l.child_id) === Number(rootId)).map((l) => ({ id: Number(rootId), line: l }));
+  const stack = [...first].reverse();
+  let steps = 0;
+  while (stack.length) {
+    const x = stack.pop();
+    if ((steps += 1) > newIds.size + 1) throw new Error('cf_erp: codeNewItems walked more items than it was given — the structure loops.');
+    const m = masters.get(x.id);
+    if (m) {
+      const parentCode = x.line ? (codeOf.has(Number(x.line.parent_id)) ? codeOf.get(Number(x.line.parent_id)) : x.line.parent_code) : null;
+      const parentName = x.line ? (nameOf.has(Number(x.line.parent_id)) ? nameOf.get(Number(x.line.parent_id)) : x.line.parent_name) : null;
+      const data = {
+        master: m,
+        def: m.def_id ? { id: m.def_id, code: m.def_code, name: m.def_name, short_name: m.def_short_name } : null,
+        chain: await chainOf(m.classification_id),
+        specs: new Map(),
+        owner: m.owner_line_row_id != null && m.owner_order_id != null
+          ? { line_no: m.owner_line_no, position: m.owner_line_position, order_code: m.owner_order_code, order_title: m.owner_order_title }
+          : null,
+        place: x.line
+          ? { line_id: x.line.id, bom_id: x.line.bom_id, line_no: x.line.line_no, position: x.line.position, quantity: x.line.quantity, role: x.line.role, parent_id: x.line.parent_id, parent_code: parentCode, parent_name: parentName }
+          : null,
+        range: x.line ? ranges.get(x.line.id) ?? null : null,
+        asked: new Set(),
+      };
+      const draft = { draft: { [PLACED]: data } };
+      // A dry pass first: which tokens does the chosen rule read? Only an item
+      // whose rule prints a specification is resolved — buildContext resolves
+      // every one, which is most of what the per-item path cost.
+      const prepare = async (field) => {
+        const dry = await generate(rules, companyId, 'item', field, draft, { consume: false });
+        if (dry && [...data.asked].some((k) => k.startsWith('spec:')) && !data.specsLoaded) {
+          data.specs = effectiveByCode(await resolve(db, companyId, { master: data.master }));
+          data.specsLoaded = true;
+        }
+        data.asked = new Set();
+        return dry;
+      };
+
+      // The name, as finishCreate: a naming rule's, else the fallback. A rule
+      // that cannot be rendered stops the copy, as it stops finishCreate.
+      const nameRule = await prepare('name');
+      const g = nameRule ? await generate(rules, companyId, 'item', 'name', draft, { consume: true }) : null;
+      const name = g?.text ?? fallbackName.get(x.id) ?? null;
+      if (!name) throw invalid('NAME_REQUIRED', 'Give the item a name — no naming rule applies to it.');
+      data.master = { ...data.master, name };
+      out.named += 1;
+
+      // The code: a coding rule's, or none yet — a draft may wait for the value
+      // its code needs (TOKEN_MISSING), as finishCreate lets it.
+      let code = null;
+      const codeRule = await prepare('code');
+      if (codeRule) {
+        try {
+          const gc = await generate(rules, companyId, 'item', 'code', draft, { consume: true });
+          code = gc?.text ?? null;
+        } catch (e) {
+          if (e.code !== 'TOKEN_MISSING') throw e;
+          out.warnings.push(`${name}: ${e.message} The code will be generated on activation.`);
+        }
+      }
+      if (code) out.coded += 1;
+      codeOf.set(x.id, code);
+      nameOf.set(x.id, name);
+      written.push([x.id, name, code]);
+    }
+    // Its new children next, first line first (pushed last so it pops first).
+    const kids = (linesUnder.get(x.id) ?? []).filter((l) => newIds.has(Number(l.child_id)));
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ id: Number(kids[i].child_id), line: kids[i] });
+  }
+
+  // Every name and code at once — the placeholders overwritten, or emptied.
+  for (let i = 0; i < written.length; i += 100) {
+    const part = written.slice(i, i + 100);
+    const params = [];
+    const names = part.map(([id, name]) => { params.push(id, name); return 'WHEN ? THEN ?'; }).join(' ');
+    const codes = part.map(([id, , code]) => { params.push(id, code); return 'WHEN ? THEN ?'; }).join(' ');
+    params.push(companyId, part.map(([id]) => id));
+    await db.query(`UPDATE cf_master_records SET name = CASE id ${names} END, code = CASE id ${codes} END WHERE company_id = ? AND id IN (?)`, params);
+  }
+  return out;
+}
