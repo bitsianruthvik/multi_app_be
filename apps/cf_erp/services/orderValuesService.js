@@ -55,8 +55,8 @@
  * accepts: `entered`, and `defaulted` (to override the default). `fixed`,
  * `calculated`, `rollup` and `inherited` come back with their worked-out value
  * and the reason they are not typed. A line whose order is closed, lost or
- * cancelled, or which is released to production, is read-only (409 on write),
- * as bomChangeService treats a frozen structure.
+ * cancelled, or which is locked or released to production, is read-only (409
+ * on write), as bomChangeService treats a frozen structure.
  *
  * HISTORY
  * Every value a person typed gets its history row, exactly as setValues writes
@@ -80,7 +80,7 @@
  *           its usual per-record cost for them.
  */
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, frozenBy } from './records.js';
+import { LOCKED_ORDER_STATUSES, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
@@ -109,8 +109,26 @@ const chunk = (xs, n) => {
 };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const blank = (v) => v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
-/** How a record is named in a sentence: its code, or — a draft may have none — its name and id. */
-const labelOf = (rec) => rec.code ?? `${rec.name} (#${rec.id})`;
+/**
+ * How a record is named in a sentence: its code — or, for a row of an order,
+ * which has none until its line is locked, WHERE IT SITS: the names down from
+ * the nearest thing with a code, each with its line number as the tree shows
+ * it, "Girder › 10 Segment › 20 Web plate" (two segments both hold a web plate).
+ * Without the structure at hand, its name.
+ */
+const labelOf = (rec, ctx = null) => {
+  if (rec.code) return rec.code;
+  if (!ctx) return rec.name;
+  const parts = [];
+  let r = rec;
+  for (let hops = 0; r && hops < 30; hops++) {
+    if (r.code) { parts.unshift(r.code); break; }
+    const place = ctx.linesByChild.get(r.id)?.[0] ?? null;
+    parts.unshift(place ? `${place.lineNo} ${r.name}` : r.name);
+    r = place ? ctx.records.get(place.parentId) : null;
+  }
+  return parts.join(' › ');
+};
 const isOwn = (ctx, rec) => rec.record_kind === 'item' && rec.item_type === 'temporary' && rec.owner_order_line_id === ctx.line.id;
 
 /** The structure tree's own words for a node that is not this order's work (BomPanel.whyNotValues). */
@@ -122,8 +140,9 @@ const sharedWhy = (rec) => `${rec.code ?? rec.name} is not this order’s own wo
 
 async function loadLine(db, companyId, lineId, { lock }) {
   const [[row]] = await db.query(
-    `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity,
+    `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at,
             o.id AS order_id, o.code AS order_code, o.status AS order_status,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
             (SELECT r.id FROM cf_production_releases r
               WHERE r.company_id = ol.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
        FROM cf_sales_order_lines ol
@@ -142,7 +161,10 @@ async function loadLine(db, companyId, lineId, { lock }) {
     orderId: row.order_id,
     orderCode: row.order_code,
     orderStatus: row.order_status,
+    orderRevision: row.order_revision ?? 1,
+    orderLatestRevision: row.order_latest_revision ?? null,
     releaseId: row.release_id ?? null,
+    lockedAt: row.locked_at ?? null,
   };
 }
 
@@ -189,7 +211,7 @@ const RECORDS_SQL = `
          d.definition_type,
          sd.id AS def_id, sd.code AS def_code, sd.name AS def_name,
          so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
-         ol.line_no AS owner_line_no, rel.id AS owner_release_id,
+         ol.line_no AS owner_line_no, ol.locked_at AS owner_line_locked_at, rel.id AS owner_release_id,
          bh.id AS bom_id,
          COALESCE(pl.n, 0) AS placements
     FROM cf_master_records m
@@ -1050,10 +1072,13 @@ function ownInput(s) {
 function buildView(ctx) {
   const { line } = ctx;
   const lock = LOCKED_ORDER_STATUSES.has(line.orderStatus)
-    ? { reason: 'closed', message: `Order ${line.orderCode} is ${line.orderStatus}, so everything made for it is frozen — its values are kept as they were.` }
+    ? { reason: 'closed', message: line.orderStatus === 'revised' ? revisedOrderMessage(line.orderCode, line.orderRevision, line.orderLatestRevision)
+      : `Order ${line.orderCode} is ${line.orderStatus}, so everything made for it is frozen — its values are kept as they were.` }
     : line.releaseId
       ? { reason: 'released', message: `Line ${line.lineNo} of ${line.orderCode} was released to production, so its values are frozen. Take the release back — while nothing has started — to change them.` }
-      : null;
+      : line.lockedAt
+        ? { reason: 'locked', message: lockedLineMessage(line.lineNo, line.orderCode) }
+        : null;
 
   // First visit in tree order gives each record its depth and the parent it is shown under.
   const order = [];
@@ -1094,7 +1119,7 @@ function buildView(ctx) {
     // order is frozen with it, so repeating that on each row says nothing. A
     // row only says what is true of IT alone.
     const rowWhy = !own ? sharedWhy(rec)
-      : r.frozen && !lock ? `${labelOf(rec)} is frozen with order ${r.frozen.orderCode}.`
+      : r.frozen && !lock ? `${labelOf(rec, ctx)} is frozen with order ${r.frozen.orderCode}.`
         : null;
     const full = new Map();
     let missing = 0;
@@ -1296,17 +1321,19 @@ export async function writeLineValues(db, c, lineId, input = {}) {
   const ctx = await loadContext(db, c.companyId, lineId, { lock: true });
   const { line } = ctx;
   if (LOCKED_ORDER_STATUSES.has(line.orderStatus)) {
-    throw conflict('ORDER_CLOSED', `Order ${line.orderCode} is ${line.orderStatus} — its values can no longer change.`);
+    throw conflict('ORDER_CLOSED', line.orderStatus === 'revised' ? revisedOrderMessage(line.orderCode, line.orderRevision, line.orderLatestRevision)
+      : `Order ${line.orderCode} is ${line.orderStatus} — its values can no longer change.`);
   }
   if (line.releaseId) {
     throw conflict('RELEASED', `Line ${line.lineNo} of ${line.orderCode} was released to production — its values are frozen. Take the release back, while nothing has started, to change them.`);
   }
+  if (line.lockedAt) throw conflict('LOCKED', lockedLineMessage(line.lineNo, line.orderCode));
 
   // ---- check everything before writing anything ----------------------------
   const problems = [];
   const cells = [];
   const say = (rec, specCode, text) => {
-    const head = rec ? labelOf(rec) : null;
+    const head = rec ? labelOf(rec, ctx) : null;
     const p = specCode ? `${head ?? 'Record'} · ${specCode}: ${text}` : `${head ?? 'Record'}: ${text}`;
     problems.push(p);
     cells.push({ recordId: rec?.id ?? null, specCode: specCode ?? null, problem: p });
@@ -1329,7 +1356,12 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       continue;
     }
     const f = frozenBy(rec);
-    if (f) { say(rec, null, f.reason === 'released' ? `was released to production with line ${f.lineNo} of ${f.orderCode} — its values can no longer change.` : `belongs to order ${f.orderCode}, which is ${f.orderStatus} — its values can no longer change.`); continue; }
+    if (f) {
+      say(rec, null, f.reason === 'released' ? `was released to production with line ${f.lineNo} of ${f.orderCode} — its values can no longer change.`
+        : f.reason === 'locked' ? `belongs to a locked line. ${lockedLineMessage(f.lineNo, f.orderCode)}`
+          : `belongs to order ${f.orderCode}, which is ${f.orderStatus} — its values can no longer change.`);
+      continue;
+    }
     const key = `${w.recordId}:${w.specCode}`;
     if (seen.has(key)) { say(rec, w.specCode, 'is given twice — say it once.'); continue; }
     seen.add(key);

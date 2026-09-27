@@ -38,7 +38,10 @@ const UNIQUE_MESSAGES = {
   uq_cbl_line_no: 'That line number is already used in this BOM.',
   uq_cbl_position: 'That position is already taken in this BOM — try again.',
   uq_csor_code: 'That order number is already used.',
+  // Revisions share their order's number; a second order with it is still refused here.
+  uq_csor_code_revision: 'That order number is already used.',
   uq_cprl_line: 'This line is already released.',
+  uq_copc_code: 'That piece code is already carried by a piece of another locked line. Add something to the coding rule that tells them apart — the order number, or the line position.',
   uq_cpo_code: 'That purchase order number is already used.',
   uq_cpo_suggest: 'There is already a suggested purchase order — it is rewritten rather than raised again.',
   uq_cpol_item: 'That item is already a line on this purchase order.',

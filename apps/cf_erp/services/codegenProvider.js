@@ -781,6 +781,13 @@ const PIECE_TOKENS = [
     key: 'line.no', label: 'Sales order line number', available: true,
     phrase: 'the order line number', example: '10', help: 'The number of the order line released to production — 10, 20.',
   },
+  // Given when the line is LOCKED, counted over the lines that exist then, so
+  // a trial line deleted before the lock leaves no gap (user, 2026-09-26).
+  {
+    key: 'line.position', label: 'The line’s number among the order’s lines of the same design (01, 02), given at lock', available: true,
+    phrase: 'the line’s number among lines of the same design', example: '01',
+    help: 'Counts the order’s lines that sell the same design, in line order: two span lines are 01 and 02. It is given when the line is locked, so a line deleted before that leaves no gap.',
+  },
   {
     key: 'parent.code', label: 'The piece this one is part of', available: true,
     phrase: 'the parent piece’s code', example: 'SO-20260924-0003-SPAN-01-1', help: 'The code of the piece this one is part of. Empty for the top of the tree.',
@@ -852,6 +859,7 @@ async function pieceContext(db, companyId, draft) {
         case 'definition.shortName': return shortOf(def);
         case 'order.code': return order?.code ?? null;
         case 'line.no': return draft.lineNo ?? null;
+        case 'line.position': return draft.linePosition ?? null;
         case 'parent.code': return draft.parentCode ?? null;
         case 'piece.no': return draft.pieceNo ?? null;
         case 'piece.seq': return draft.pieceSeq ?? null;

@@ -77,7 +77,7 @@
  * of its own plans with a 422.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES } from './records.js';
+import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { subtreeIds } from './tree.js';
 import { explode } from './bomService.js';
 import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
@@ -311,6 +311,7 @@ export const sharedSpan = (sizes, kerfMm) =>
 async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(
     `SELECT l.*, o.id AS order_id, o.code AS order_code, o.status AS order_status,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
             rel.id AS release_id
        FROM cf_sales_order_lines l
        JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
@@ -325,7 +326,8 @@ async function requireLine(db, companyId, lineId, { lock = false } = {}) {
 /** The same two rules that close a structure to change: cut plates and their lots are part of it. */
 function assertOpen(line) {
   if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
-    throw invalid('ORDER_LOCKED', `Order ${line.order_code} is ${line.order_status} — its structure can no longer change, so its nesting cannot either.`);
+    throw invalid('ORDER_LOCKED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
+      : `Order ${line.order_code} is ${line.order_status} — its structure can no longer change, so its nesting cannot either.`);
   }
   if (line.release_id) {
     throw invalid('RELEASED', `Line ${line.line_no} of ${line.order_code} is released to production — its structure is fixed. Take the release back (while nothing has started) before re-nesting it.`);

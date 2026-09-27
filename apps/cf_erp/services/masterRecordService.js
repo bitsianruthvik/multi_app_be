@@ -300,6 +300,12 @@ export async function updateRecord(db, c, id, input = {}) {
 export async function setStatus(db, c, id, status) {
   const m = await requireMaster(db, c.companyId, id);
   assertNotFrozen(m, 'status');
+  // A row of an order's structure (a temporary item, cut plates included) has no
+  // life of its own: it is a design with no code until its line is LOCKED, and
+  // locking is what activates it (lockService) — user, 2026-09-26.
+  if (m.record_kind === 'item' && m.item_type === 'temporary') {
+    throw invalid('ROW_STATUS', `${m.name ?? 'This row'} is part of an order's structure — it becomes active when its line is locked.`);
+  }
   if (m.status === status) return getRecord(db, c.companyId, id);
   if (!(TRANSITIONS[m.status] ?? []).includes(status)) {
     const article = /^[aeiou]/.test(m.status) ? 'An' : 'A';
@@ -321,10 +327,6 @@ export async function setStatus(db, c, id, status) {
       const r = await resolve(db, c.companyId, { master: m });
       for (const s of r.missingRequired) problems.push(`${s.code} (${s.name}) is required.`);
       problems.push(...r.problems);
-      if (m.item_type === 'temporary') {
-        const def = await loadMaster(db, c.companyId, m.source_definition_id);
-        if (def && def.status !== 'active') problems.push(`Its definition ${def.code ?? def.name} is not active.`);
-      }
     } else if (m.definition_type === 'selection') {
       const [[counts]] = await db.query(
         `SELECT (SELECT COUNT(*) FROM cf_definition_allowed_items WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL) AS allowed,
@@ -517,6 +519,12 @@ export async function listRecords(db, companyId, q = {}) {
   // kinds=catalog,template,selection — what a BOM line or order line picker may offer
   const kinds = blank(q.kinds) ? [] : String(q.kinds).split(',').map((k) => k.trim()).filter((k) => ['catalog', 'temporary', 'template', 'selection'].includes(k));
   if (kinds.length) { where.push('(i.item_type IN (?) OR d.definition_type IN (?))'); params.push(kinds, kinds); }
+  // An order's rows (temporary items, cut plates too) live on the order: a list
+  // shows them only when asked for them by name or by order (user, 2026-09-26 —
+  // a row is a design, not a catalog item).
+  if (q.kind !== 'temporary' && !kinds.includes('temporary') && blank(q.orderId)) {
+    where.push("(i.item_type IS NULL OR i.item_type <> 'temporary')");
+  }
   if (q.status) { where.push('m.status = ?'); params.push(q.status); }
   if (q.usable === '1' || q.usable === 1 || q.usable === true) where.push("m.status <> 'obsolete'");
   if (!blank(q.orderId)) {

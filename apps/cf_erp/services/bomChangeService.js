@@ -36,7 +36,8 @@
  * bomService's mutators, one change at a time.
  *
  * The one thing bomService has no mutator for is a deep copy of an order's own
- * temporary items, so that is written here (copyInto below), batched.
+ * temporary items. That lives in treeCopyService, batched, because a revision
+ * of an order copies with the same machine; copyInto below calls it.
  *
  * PASTE
  *   into a Custom BOM (a temporary item) — a DEEP COPY. The source line's
@@ -66,18 +67,12 @@
  * what cutPlateService and nestingService say it is: a temporary item filed
  * under the CUT_PLATE classification.
  *
- * RANGE CODES (codeRangeService)
- * A row's code may print the piece numbers it covers under its parent, counted
- * across the rows of the same short name in the order they are shown. So a
- * paste AMONG existing rows moves the codes of the rows after it: before the
- * copy is written, refreshRangeCodes is asked with the row about to arrive
- * (`insert`), the rows it displaces are renumbered first, and the copy's code
- * is free when the generator makes it — what bomService.addLine does for a row
- * put in among others. The copy's own code comes first, then its subtree's,
- * which is built on it. Once the whole batch is in, every custom parent whose
- * rows changed quantity or membership is renumbered ONCE (quantity and remove
- * already renumber inside bomService, line by line; this settles what the
- * pastes and those changes did together).
+ * NO CODES ON ROWS
+ * A row of an order's BOM is a design with a quantity, not an item, so a copy
+ * gets no code (user, 2026-09-26 — "the codes can't live on the BOM as it is
+ * yet to be rolled out based on the quantity"). Its pieces get their codes when
+ * the line is LOCKED; until then each row shows a placeholder (placeholderService).
+ * So a paste among other rows moves nobody's code: there are none to move.
  *
  * A REMOVAL LEAVES A SHARED ITEM WHERE IT IS
  * A removed line takes the temporary items below it that nothing else holds.
@@ -123,26 +118,20 @@
  * minutes when each refreshed on its own. Now they are one walk.
  */
 import { invalid, notFound, conflict, CfError, translateDbError } from '../lib/errors.js';
-import { requireMaster, LOCKED_ORDER_STATUSES } from './records.js';
-import { subtreeIds } from './tree.js';
+import { requireMaster, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { BOM_TYPE_BY_KIND, descendantIds } from './bomGraph.js';
 import { explode, writeLineUpdate, writeLineRemoval, addLine, assertEditable, ALLOWED_CHILDREN } from './bomService.js';
 import { refreshValues } from './valueService.js';
 import { requireUsableFlow } from './flowService.js';
-import { dateText } from './resolutionService.js';
 import { CUT_PLATE_CODE } from './nestingService.js';
-import { refreshRangeCodes, shortNameOf } from './codeRangeService.js';
-import { generate } from '../modules/codegen/index.js';
 import { insertRows } from '../lib/db.js';
+import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
 
 export const OPS = ['quantity', 'flow', 'remove', 'paste'];
 const MAX_CHANGES = 1000;
-const MAX_COPY_DEPTH = 25;
 const ID_CHUNK = 500;   // ids per IN list
-const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED']);
+const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED', 'LOCKED']);
 const SELECTION_FLOW = 'A selection line takes the flow of the catalog item chosen for it — it has none of its own.';
-const LINE_COLUMNS = ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity',
-  'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by'];
 
 const blank = (v) => v == null || String(v).trim() === '';
 const near = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-9;
@@ -235,8 +224,9 @@ function readChanges(raw, problems) {
 
 async function requireOrderLine(db, companyId, lineId) {
   const [[row]] = await db.query(
-    `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity,
+    `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at,
             o.id AS order_id, o.code AS order_code, o.status AS order_status,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
             (SELECT r.id FROM cf_production_releases r WHERE r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
        FROM cf_sales_order_lines ol
        JOIN cf_sales_orders o ON o.id = ol.order_id AND o.deleted_at IS NULL
@@ -271,12 +261,6 @@ function subtreeKeys(node, into = new Set()) {
   into.add(node.key);
   for (const kid of node.children) subtreeKeys(kid, into);
   return into;
-}
-
-/** Classification nodes whose temporary items are cut plates: the CUT_PLATE variant and anything under it. */
-async function cutPlateNodes(db, companyId, code) {
-  const [[n]] = await db.query('SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [companyId, code]);
-  return n ? new Set(await subtreeIds(db, companyId, n.id)) : new Set();
 }
 
 /* ===========================================================================
@@ -332,7 +316,21 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     if (!bomTypeOfKind(parent.kind)) return `${p} is a selection, which holds no BOM`;
     return `${p} belongs to another structure`;
   };
-  const lineLabel = (e) => (e.node.code ?? `${e.node.name} (line ${e.node.lineNo ?? '?'} of ${labelOf(e.parent)})`);
+  // A row of an order has no code (its pieces are coded at LOCK), and two
+  // segments both hold a "Flange plate" — so a problem names a row by where it
+  // sits: the names down from the nearest thing with a code, each with its line
+  // number as the tree shows it. "Girder › 10 Girder segment › 20 Flange plate".
+  const pathLabel = (node) => {
+    const parts = [];
+    let n = node;
+    for (let hops = 0; n && hops < 30; hops++) {
+      if (n.code) { parts.unshift(n.code); break; }
+      parts.unshift(n.lineNo != null ? `${n.lineNo} ${n.name}` : n.name);
+      n = n.lineId != null ? lines.get(n.lineId)?.parent ?? null : null;
+    }
+    return parts.join(' › ');
+  };
+  const lineLabel = (e) => pathLabel(e.node);
 
   // ---- who may do this, and whether anything may change at all ------------
   const touched = new Set();
@@ -348,11 +346,13 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
 
   if (line) {
     if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
-      throw conflict('ORDER_CLOSED', `Order ${line.order_code} is ${line.order_status} — its structure can no longer change.`);
+      throw conflict('ORDER_CLOSED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
+        : `Order ${line.order_code} is ${line.order_status} — its structure can no longer change.`);
     }
     if (line.release_id) {
       throw conflict('RELEASED', `Line ${line.line_no} of ${line.order_code} was released to production — its structure is frozen. Take the release back, while nothing has started, to change it.`);
     }
+    if (line.locked_at) throw conflict('LOCKED', lockedLineMessage(line.line_no, line.order_code));
   }
   await assertOpen(db, companyId, root);
 
@@ -374,7 +374,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     ch.entry = e;
     const label = lineLabel(e);
     if (!holds(e.parent)) { problems.push(`${label} cannot change here — ${notHere(e.parent)}.`); continue; }
-    if (e.parent.status === 'obsolete') { problems.push(`${label}: ${labelOf(e.parent)} is obsolete — reactivate it to change its BOM.`); continue; }
+    if (e.parent.status === 'obsolete') { problems.push(`${label}: ${pathLabel(e.parent)} is obsolete — reactivate it to change its BOM.`); continue; }
     if (seen[ch.op].has(ch.lineId)) { problems.push(`${label} is given more than one ${ch.op === 'remove' ? 'removal' : ch.op} — say it once.`); continue; }
     seen[ch.op].add(ch.lineId);
     if (ch.op === 'quantity') {
@@ -422,11 +422,10 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       `SELECT l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
               l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes,
               ci.item_type AS child_item_type, cm.classification_id AS child_classification_id,
-              cm.short_name AS child_short_name, cm.name AS child_name, sd.short_name AS def_short_name, sd.name AS def_name
+              cm.name AS child_name
          FROM cf_bom_lines l
          JOIN cf_master_records cm ON cm.id = l.child_id
          LEFT JOIN cf_item_details ci ON ci.master_id = l.child_id AND ci.deleted_at IS NULL
-         LEFT JOIN cf_master_records sd ON sd.id = ci.source_definition_id AND sd.deleted_at IS NULL
         WHERE l.company_id = ? AND l.id IN (?) AND l.deleted_at IS NULL`,
       [companyId, part],
     );
@@ -446,7 +445,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     const what = lineLabel(src);
     if (!place) { problems.push(`${what} cannot be pasted there — record ${ch.parentId} is not part of this structure.`); continue; }
     const target = place[0].node;
-    const into = labelOf(target);
+    const into = pathLabel(target);
     if (!holds(target)) { problems.push(`${what} cannot be pasted into ${into} — ${notHere(target)}.`); continue; }
     if (target.status === 'obsolete') { problems.push(`${what} cannot be pasted into ${into}: it is obsolete — reactivate it to change its BOM.`); continue; }
     if (doomed.has(target.key)) { problems.push(`${what} is pasted into ${into}, which this save removes — paste it somewhere that stays.`); continue; }
@@ -469,7 +468,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     ch.target = target;
     if (targetType === 'custom') {
       if (kind === 'template') {
-        problems.push(`${what} is a template line — on an order it becomes a temporary item. Add the template to ${into} with Add line instead.`);
+        problems.push(`${what} is a template line — on an order it is laid out as rows. Add the template to ${into} with Add line instead.`);
         continue;
       }
       ch.mode = copies(row) ? 'copy' : 'line';
@@ -487,7 +486,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       if (!ALLOWED_CHILDREN[targetType].includes(kind)) {
         problems.push(targetType === 'standard'
           ? `${what} cannot go into ${into}: a Standard BOM holds catalog items only.`
-          : `${what} cannot go into ${into}: a Template BOM holds catalog items and definitions — temporary items belong to one order.`);
+          : `${what} cannot go into ${into}: a Template BOM holds catalog items and definitions — an order’s rows belong to that order.`);
         continue;
       }
       if (src.node.status === 'obsolete') { problems.push(`${what} is obsolete, so it cannot be pasted into ${into}.`); continue; }
@@ -534,7 +533,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     const lastPasteAfter = new Map(); // anchor line id -> the line pasted after it last, so A then B stay in order
     for (const ch of pastes) {
       const src = ch.source.entry;
-      const label = `${lineLabel(src)}, pasted into ${labelOf(ch.target)}`;
+      const label = `${lineLabel(src)}, pasted into ${pathLabel(ch.target)}`;
       const r = await attempt(label, async () => {
         const after = ch.afterLineId == null ? null : (lastPasteAfter.get(ch.afterLineId) ?? ch.afterLineId);
         const out = ch.mode === 'reference'
@@ -610,22 +609,6 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       if (alive.length) await attempt('Working the values out again', () => refreshValues(db, c, alive.map((a) => a.id)));
     }
 
-    // 5. Range codes: once per custom parent whose rows changed quantity or
-    //    membership — the paste targets, and the parents of quantity changes
-    //    and removals. A flow does not move a range. Once per parent, however
-    //    many of its rows changed: production is ~49 ms a round trip.
-    const renumber = new Map(); // parent id -> label
-    const custom = (node) => bomTypeOfKind(node?.kind) === 'custom';
-    for (const ch of pastes) if (ch.mode !== 'reference' && results[ch.index]) renumber.set(ch.target.id, labelOf(ch.target));
-    for (const ch of updates) {
-      const r = results[ch.index];
-      if (ch.op === 'quantity' && r?.changed && custom(ch.entry.parent)) renumber.set(ch.entry.parent.id, labelOf(ch.entry.parent));
-    }
-    for (const ch of removes) if (results[ch.index] && custom(ch.entry.parent)) renumber.set(ch.entry.parent.id, labelOf(ch.entry.parent));
-    for (const [parentId, name] of renumber) {
-      await attempt(`Renumbering the rows of ${name}`, () => refreshRangeCodes(db, c, parentId));
-    }
-
     if (applyProblems.length) {
       throw invalid('INVALID', `${dryRun ? 'These changes cannot be saved' : 'Nothing was saved'} — ${plural(applyProblems.length, 'problem', 'problems')} to fix first.`, { problems: applyProblems });
     }
@@ -665,7 +648,7 @@ function sentenceOf(k) {
   if (k.quantity) bits.push(plural(k.quantity, 'quantity changed', 'quantities changed'));
   if (k.flow) bits.push(plural(k.flow, 'flow changed', 'flows changed'));
   if (k.pasted) {
-    bits.push(`${plural(k.pasted, 'line pasted', 'lines pasted')}${k.copiedItems ? ` (${plural(k.copiedItems, 'new temporary item', 'new temporary items')})` : ''}`);
+    bits.push(`${plural(k.pasted, 'line pasted', 'lines pasted')}${k.copiedItems ? ` (${plural(k.copiedItems, 'new row', 'new rows')})` : ''}`);
   }
   if (k.removed) bits.push(plural(k.removed, 'line removed', 'lines removed'));
   // The number somebody has to see before they agree to a removal.
@@ -725,111 +708,6 @@ async function lineNoAfter(db, companyId, target, bomId, afterLineId) {
  * ======================================================================== */
 
 /**
- * Everything a deep copy needs about the temporary items below some items,
- * read before anything is written. Level by level: one query for the items
- * and their BOMs, one for those BOMs' lines; then one for all their values,
- * one for their own rules and one for those rules' option lists.
- * `copies(line)` says whether a line's child is made afresh (it is then read
- * too) or referenced, like a catalog item or a shared cut plate.
- */
-async function snapshotSubtrees(db, companyId, rootIds, copies) {
-  const snap = { items: new Map(), linesByBom: new Map(), values: new Map(), rules: new Map(), ruleOptions: new Map() };
-  let frontier = [...new Set(rootIds)];
-  for (let depth = 0; frontier.length; depth++) {
-    if (depth > MAX_COPY_DEPTH) throw invalid('TOO_DEEP', `The structure being copied is more than ${MAX_COPY_DEPTH} levels deep — check for a temporary item that contains itself.`);
-    const level = frontier.filter((id) => !snap.items.has(id));
-    if (!level.length) break;
-    for (const part of chunk(level, ID_CHUNK)) {
-      const [rows] = await db.query(
-        `SELECT m.id, m.code, m.name, m.short_name, m.description, m.classification_id, m.default_flow_id, m.status,
-                i.tracked_by, i.uom, i.source_definition_id,
-                b.id AS bom_id, b.status AS bom_status, b.source_bom_id, b.revision AS bom_revision, b.notes AS bom_notes
-           FROM cf_master_records m
-           JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL AND i.item_type = 'temporary'
-           LEFT JOIN cf_boms b ON b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL
-          WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL`,
-        [companyId, part],
-      );
-      for (const r of rows) snap.items.set(r.id, r);
-    }
-    const bomIds = level.map((id) => snap.items.get(id)?.bom_id).filter(Boolean);
-    const next = [];
-    for (const part of chunk(bomIds, ID_CHUNK)) {
-      const [ls] = await db.query(
-        `SELECT l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
-                l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes,
-                ci.item_type AS child_item_type, cm.classification_id AS child_classification_id,
-                cm.code AS child_code, cm.name AS child_name
-           FROM cf_bom_lines l
-           JOIN cf_master_records cm ON cm.id = l.child_id
-           LEFT JOIN cf_item_details ci ON ci.master_id = l.child_id AND ci.deleted_at IS NULL
-          WHERE l.company_id = ? AND l.bom_id IN (?) AND l.deleted_at IS NULL
-          ORDER BY l.bom_id, l.line_no, l.id`,
-        [companyId, part],
-      );
-      for (const l of ls) {
-        l.copy = copies(l);
-        if (!snap.linesByBom.has(l.bom_id)) snap.linesByBom.set(l.bom_id, []);
-        snap.linesByBom.get(l.bom_id).push(l);
-        if (l.copy) next.push(l.child_id);
-      }
-    }
-    frontier = next;
-  }
-  const ids = [...snap.items.keys()];
-  for (const part of chunk(ids, ID_CHUNK)) {
-    const [vals] = await db.query(
-      `SELECT id, specification_id, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source
-         FROM cf_spec_values
-        WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL
-        ORDER BY subject_id, id`,
-      [companyId, part],
-    );
-    for (const v of vals) {
-      if (!snap.values.has(v.subject_id)) snap.values.set(v.subject_id, []);
-      snap.values.get(v.subject_id).push(v);
-    }
-    const [rules] = await db.query(
-      `SELECT id, specification_id, subject_id, capture_at, is_required, is_applicable, value_rule, formula_id, sort_order
-         FROM cf_spec_assignments
-        WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL`,
-      [companyId, part],
-    );
-    for (const r of rules) {
-      if (!snap.rules.has(r.subject_id)) snap.rules.set(r.subject_id, []);
-      snap.rules.get(r.subject_id).push(r);
-    }
-    if (rules.length) {
-      const [opts] = await db.query(
-        'SELECT assignment_id, option_id FROM cf_spec_assignment_options WHERE company_id = ? AND assignment_id IN (?) AND deleted_at IS NULL',
-        [companyId, rules.map((r) => r.id)],
-      );
-      for (const o of opts) {
-        if (!snap.ruleOptions.has(o.assignment_id)) snap.ruleOptions.set(o.assignment_id, []);
-        snap.ruleOptions.get(o.assignment_id).push(o.option_id);
-      }
-    }
-  }
-  return snap;
-}
-
-/** The snapshot `valueService` writes to a history row (its `snapshot()`), for a copied value row. */
-function valueSnapshot(v) {
-  return {
-    number: v.value_number == null ? null : Number(v.value_number),
-    text: v.value_text ?? null,
-    bool: v.value_bool == null ? null : !!Number(v.value_bool),
-    date: dateText(v.value_date),
-    option_id: v.option_id ?? null,
-    uom: v.uom ?? null,
-    source: v.source,
-  };
-}
-
-const markerToken = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-
-
-/**
  * One paste into a Custom BOM. The top line goes into the target's BOM; when it
  * holds a temporary item, that item and every temporary item below it are
  * created afresh, in a fixed number of statements:
@@ -883,138 +761,20 @@ async function copyInto(db, c, snap, ch, afterLineId) {
   const position = (Number(topPos) || 0) + 1;
   const quantity = ch.quantity ?? Number(row.quantity);
 
-  // ---- room for it: a row put in AMONG existing rows moves the ranges of the
-  //      rows after it (codeRangeService). Move them first, counting the row
-  //      about to arrive, so the copy's first code cannot meet the stale code
-  //      one of them still carries — bomService.addLine's order. Appended at
-  //      the end, it moves nobody.
-  if (afterLineId != null) {
-    const shortName = shortNameOf({ short_name: row.child_short_name, name: row.child_name }, { short_name: row.def_short_name, name: row.def_name });
-    await refreshRangeCodes(db, c, target.id, { insert: { lineNo, quantity, shortName } });
-  }
 
-  // ---- which items, parents before children --------------------------------
-  const levels = [];
-  if (ch.mode === 'copy') {
-    const seen = new Set();
-    let frontier = [row.child_id];
-    while (frontier.length) {
-      const level = [...new Set(frontier)].filter((id) => !seen.has(id) && snap.items.has(id));
-      if (!level.length) break;
-      level.forEach((id) => seen.add(id));
-      levels.push(level);
-      frontier = level.flatMap((id) => {
-        const bomId = snap.items.get(id).bom_id;
-        return (bomId ? snap.linesByBom.get(bomId) ?? [] : []).filter((l) => l.copy).map((l) => l.child_id);
-      });
-    }
-    if (!levels.length) throw invalid('NOT_FOUND', `${labelOf(ch.source.entry.node)} could not be read to copy it.`);
-  }
-  const srcIds = levels.flat();
-  const idMap = new Map();
+  // ---- the copies: every row below the top one, written by the shared copy ---
+  // (treeCopyService.writeCopies — the same machine a revision copies with).
+  // A line to a cut plate is written pointing at the SAME cut plate: a copied
+  // part is one more part of that rectangle, never a second blank for it.
+  let idMap = new Map();
+  let levels = [];
   const sharedPlates = new Set(); // cut plates the copy points at rather than duplicates
   if (ch.mode === 'line' && row.child_item_type === 'temporary') sharedPlates.add(labelOf(ch.source.entry.node));
-
-  if (srcIds.length) {
-    // ---- the items ----------------------------------------------------------
-    const token = markerToken();
-    const marker = (srcId) => `~copy~${token}~${srcId}`;
-    await insertRows(db, 'cf_master_records',
-      ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'default_flow_id', 'created_by'],
-      srcIds.map((id) => {
-        const s = snap.items.get(id);
-        return [companyId, 'item', marker(id), s.name, s.short_name, s.description, s.classification_id, 'draft', null, s.default_flow_id, c.userId];
-      }));
-    const [born] = await db.query(
-      'SELECT id, code FROM cf_master_records WHERE company_id = ? AND code_active LIKE ? AND deleted_at IS NULL',
-      [companyId, `~copy~${token}~%`],
-    );
-    for (const b of born) idMap.set(Number(String(b.code).split('~').pop()), b.id);
-    if (idMap.size !== srcIds.length) throw new Error(`cf_erp: ${srcIds.length} copies written, ${idMap.size} read back.`);
-
-    await insertRows(db, 'cf_item_details',
-      ['master_id', 'company_id', 'item_type', 'tracked_by', 'uom', 'sourcing', 'source_definition_id', 'owner_order_line_id'],
-      srcIds.map((id) => {
-        const s = snap.items.get(id);
-        return [idMap.get(id), companyId, 'temporary', s.tracked_by, s.uom, 'make', s.source_definition_id, target.owner_order_line_id];
-      }));
-
-    // ---- their BOMs ---------------------------------------------------------
-    const withBom = srcIds.filter((id) => snap.items.get(id).bom_id);
-    const bomMap = new Map();
-    if (withBom.length) {
-      await insertRows(db, 'cf_boms',
-        ['company_id', 'parent_id', 'bom_type', 'revision', 'status', 'source_bom_id', 'notes', 'created_by'],
-        withBom.map((id) => {
-          const s = snap.items.get(id);
-          return [companyId, idMap.get(id), 'custom', s.bom_revision, s.bom_status, s.source_bom_id, s.bom_notes, c.userId];
-        }));
-      const back = new Map([...idMap].map(([src, fresh]) => [fresh, src]));
-      for (const part of chunk(withBom.map((id) => idMap.get(id)), ID_CHUNK)) {
-        const [bs] = await db.query('SELECT id, parent_id FROM cf_boms WHERE company_id = ? AND parent_id IN (?) AND deleted_at IS NULL', [companyId, part]);
-        for (const b of bs) bomMap.set(snap.items.get(back.get(b.parent_id)).bom_id, b.id);
-      }
-    }
-
-    // ---- every line below the top one ---------------------------------------
-    const inner = [];
-    for (const id of withBom) {
-      const srcBom = snap.items.get(id).bom_id;
-      for (const l of snap.linesByBom.get(srcBom) ?? []) {
-        const child = l.copy ? idMap.get(l.child_id) : l.child_id;
-        if (l.child_item_type === 'temporary' && !l.copy) sharedPlates.add(l.child_code ?? l.child_name);
-        if (child == null) {
-          throw invalid('BROKEN_LINE', `${snap.items.get(id).code ?? snap.items.get(id).name} has a line to a temporary item that no longer exists — remove that line, then copy it.`);
-        }
-        inner.push([companyId, bomMap.get(srcBom), l.line_no, child, l.design_id, l.position, l.role, l.quantity,
-          l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes, c.userId]);
-      }
-    }
-    if (inner.length) await insertRows(db, 'cf_bom_lines', LINE_COLUMNS, inner);
-
-    // ---- values, with the history every value write leaves (Q19) ------------
-    const vals = srcIds.flatMap((id) => (snap.values.get(id) ?? []).map((v) => ({ ...v, subject_id: idMap.get(id) })));
-    if (vals.length) {
-      await insertRows(db, 'cf_spec_values',
-        ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source', 'created_by'],
-        vals.map((v) => [companyId, v.specification_id, 'master', v.subject_id, v.value_number, v.value_text, v.value_bool,
-          dateText(v.value_date), v.option_id, v.uom, v.source, c.userId]));
-      // (company, spec, subject) is uq_csv_value among live rows, so each key is
-      // exactly the row just written, whatever id the engine gave it.
-      const valueId = new Map();
-      for (const part of chunk([...new Set(vals.map((v) => v.subject_id))], ID_CHUNK)) {
-        const [rows] = await db.query(
-          "SELECT id, subject_id, specification_id FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL",
-          [companyId, part],
-        );
-        for (const r of rows) valueId.set(`${r.subject_id}:${r.specification_id}`, r.id);
-      }
-      await insertRows(db, 'cf_spec_value_history',
-        ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
-        vals.map((v) => [companyId, valueId.get(`${v.subject_id}:${v.specification_id}`), v.specification_id, 'master', v.subject_id,
-          'create', null, JSON.stringify(valueSnapshot(v)), c.userId]));
-    }
-
-    // ---- rules the items carry themselves -----------------------------------
-    const rules = srcIds.flatMap((id) => (snap.rules.get(id) ?? []).map((r) => ({ ...r, subject_id: idMap.get(id) })));
-    if (rules.length) {
-      await insertRows(db, 'cf_spec_assignments',
-        ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'formula_id', 'sort_order', 'created_by'],
-        rules.map((r) => [companyId, r.specification_id, 'master', r.subject_id, r.capture_at, r.is_required, r.is_applicable, r.value_rule, r.formula_id, r.sort_order, c.userId]));
-      const withOptions = rules.filter((r) => snap.ruleOptions.has(r.id));
-      if (withOptions.length) {
-        const ruleId = new Map();
-        for (const part of chunk([...new Set(withOptions.map((r) => r.subject_id))], ID_CHUNK)) {
-          const [rows] = await db.query(
-            "SELECT id, subject_id, specification_id, capture_at FROM cf_spec_assignments WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL",
-            [companyId, part],
-          );
-          for (const r of rows) ruleId.set(`${r.subject_id}:${r.specification_id}:${r.capture_at}`, r.id);
-        }
-        await insertRows(db, 'cf_spec_assignment_options', ['company_id', 'assignment_id', 'option_id', 'created_by'],
-          withOptions.flatMap((r) => snap.ruleOptions.get(r.id).map((optionId) => [companyId, ruleId.get(`${r.subject_id}:${r.specification_id}:${r.capture_at}`), optionId, c.userId])));
-      }
-    }
+  if (ch.mode === 'copy') {
+    const out = await writeCopies(db, c, snap, [{ srcId: row.child_id, ownerLineId: target.owner_order_line_id }]);
+    if (!out.levels.length) throw invalid('NOT_FOUND', `${labelOf(ch.source.entry.node)} could not be read to copy it.`);
+    ({ idMap, levels } = out);
+    for (const label of out.shared) sharedPlates.add(label);
   }
 
   // ---- the top line, into the target's BOM ----------------------------------
@@ -1031,34 +791,15 @@ async function copyInto(db, c, snap, ch, afterLineId) {
   //      what its original holds, so the walk only goes further if the top moved.
   await refreshValues(db, c, ch.mode === 'copy' ? [topChild, target.id] : [target.id]);
 
-  // ---- codes, parents first: a child's code may be built from its parent's --
+  // ---- no codes: a row is a design, its pieces get their codes at LOCK --------
+  // (user, 2026-09-26). writeCopies already emptied the placeholder codes.
   const items = [];
   const notes = [];
   if (sharedPlates.size) {
     notes.push(`Shares ${plural(sharedPlates.size, 'cut plate', 'cut plates')} with the original (${[...sharedPlates].slice(0, 3).join(', ')}${sharedPlates.size > 3 ? ', …' : ''}) — a cut plate belongs to its rectangle on this line, not to one part.`);
   }
   for (const [depth, level] of levels.entries()) {
-    const codes = [];
-    for (const srcId of level) {
-      const id = idMap.get(srcId);
-      let code = null;
-      try {
-        const g = await generate(db, companyId, 'item', 'code', { entityId: id }, { consume: true });
-        code = g?.text ?? null;
-      } catch (e) {
-        // A draft may wait for the value its code needs — finishCreate's rule.
-        if (e.code !== 'TOKEN_MISSING') throw e;
-        notes.push(`${snap.items.get(srcId).name}: ${e.message} The code will be generated on activation.`);
-      }
-      codes.push([id, code]);
-      items.push({ id, code, name: snap.items.get(srcId).name, depth });
-    }
-    for (const part of chunk(codes, 100)) {
-      const params = [];
-      const whens = part.map(([id, code]) => { params.push(id, code); return 'WHEN ? THEN ?'; }).join(' ');
-      params.push(companyId, part.map(([id]) => id));
-      await db.query(`UPDATE cf_master_records SET code = CASE id ${whens} END WHERE company_id = ? AND id IN (?)`, params);
-    }
+    for (const srcId of level) items.push({ id: idMap.get(srcId), code: null, name: snap.items.get(srcId).name, depth });
   }
   return { lineId: top?.id ?? null, items, notes };
 }

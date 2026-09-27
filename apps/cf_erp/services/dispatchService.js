@@ -15,7 +15,7 @@
  * carries `delivered_qty` and is shipped as many times as it takes.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES } from './records.js';
+import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { postMovement } from './stockService.js';
 import { getRelease, liveReleaseOfLine } from './releaseService.js';
 
@@ -26,7 +26,8 @@ const fmt = (n) => Number(Number(n).toFixed(3));
 
 async function requireLine(db, companyId, lineId) {
   const [[l]] = await db.query(
-    `SELECT l.*, o.code AS order_code, o.status AS order_status, o.order_type, m.code AS item_code, m.name AS item_name, i.uom
+    `SELECT l.*, o.code AS order_code, o.status AS order_status, o.order_type, m.code AS item_code, m.name AS item_name, i.uom,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision
        FROM cf_sales_order_lines l
        JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
        LEFT JOIN cf_master_records m ON m.id = l.item_id
@@ -71,7 +72,10 @@ export async function shipmentView(db, companyId, lineId) {
  */
 export async function shipLine(db, c, lineId, input = {}) {
   const l = await requireLine(db, c.companyId, lineId);
-  if (LOCKED_ORDER_STATUSES.has(l.order_status)) throw invalid('LOCKED', `Order ${l.order_code} is ${l.order_status} — nothing more is shipped against it.`);
+  if (LOCKED_ORDER_STATUSES.has(l.order_status)) {
+    throw invalid('LOCKED', l.order_status === 'revised' ? revisedOrderMessage(l.order_code, l.order_revision, l.order_latest_revision)
+      : `Order ${l.order_code} is ${l.order_status} — nothing more is shipped against it.`);
+  }
   if (l.order_type === 'stock') throw invalid('STOCK_ORDER', `${l.order_code} is a stock order: what it makes goes on the shelf, it is not shipped to anybody.`);
   await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id = ? FOR UPDATE', [c.companyId, l.item_id]);
   const res = await earmarks(db, c.companyId, l.id);

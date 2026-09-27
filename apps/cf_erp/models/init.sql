@@ -2434,3 +2434,174 @@ SELECT n.company_id, s.id, 'classification', n.id, 'item', 0, 1, 'entered'
                     WHERE a.company_id = n.company_id AND a.specification_id = s.id
                       AND a.subject_type = 'classification' AND a.subject_id = n.id
                       AND a.deleted_at IS NULL);
+
+-- ===========================================================================
+-- 25. LOCK — a line's BOM is a design until it is locked
+-- ===========================================================================
+--
+-- User, 2026-09-26: "the codes can't live on the BOM as it is yet to be rolled
+-- out based on the quantity … once entered and locked I don't see a reason for
+-- it to change." Until LOCK a line's rows are a design with quantities and no
+-- codes. Locking rolls them out into pieces (cf_order_pieces, below) with their
+-- real codes and freezes the line's structure, values and cut pieces.
+--
+-- lock_position is the line's number among the order's lines that sell the
+-- same design (the `line.position` piece token, SPAN-01 / SPAN-02). It is given
+-- at lock, counted over the lines that exist THEN — `position` above is unique
+-- over deleted lines too (uq_csol_position), which is why a deleted trial line
+-- left a gap; this one does not.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'locked_at');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_sales_order_lines ADD COLUMN locked_at DATETIME NULL, ADD COLUMN locked_by INT NULL, ADD COLUMN lock_position INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 26. ORDER PIECES — what a locked line rolls out into
+-- ===========================================================================
+--
+-- A BOM row is a design with a quantity. Locking a line (services/lockService)
+-- rolls its structure out into PIECES — one node per physical piece where the
+-- piece has made parts of its own, identical parts grouped under their parent
+-- piece, exactly the tree release lays out (services/rollOutService) — and
+-- gives every node its real code, here, once. The line's structure, values and
+-- cut pieces are frozen from then on.
+--
+-- Release does not make codes for a locked line: it lays its tracker out again
+-- and takes each node's code from these rows by path_key. path_key names a node
+-- by WHERE IT SITS, not by ids handed out in order: the chain from the top of
+-- <bom line id>.<ordinal> — "L.1/3861.1/3862.1/3863.1/4071", L being the line's
+-- own item. The ordinal is the piece's place among its OWN ROW's pieces under
+-- ONE parent piece; a group has none. A frozen structure lays out the same way
+-- every time, so the keys come out the same.
+--
+--   quantity   1 for a piece, the count for a group ("6 off")
+--   piece_no   a piece's number among its design across the whole line; NULL for a group
+--   piece_seq  what the code printed for piece.seq — a group's range reads "1-4"
+--   rule_code  the coding rule that gave the code; NULL means none applied and
+--              the built-in shape did
+--
+-- A later revision of the order retires a locked line's pieces (deleted_at).
+-- code_live keeps a code unique among a company's LIVE pieces, so a retired
+-- revision gives its codes back to the one that replaces it.
+
+CREATE TABLE IF NOT EXISTS cf_order_pieces (
+  id             INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT            NOT NULL,
+  order_id       INT            NOT NULL,
+  order_line_id  INT            NOT NULL,
+  parent_id      INT            NULL,
+  item_id        INT            NOT NULL,          -- the row's temporary item, or a catalog item made on the order
+  bom_line_id    INT            NULL,              -- the row it rolled out from; NULL for the line's own item
+  piece_no       INT            NULL,
+  piece_seq      VARCHAR(40)    NULL,
+  quantity       DECIMAL(18,6)  NOT NULL,
+  code           VARCHAR(150)   NOT NULL,
+  rule_code      VARCHAR(100)   NULL,
+  path_key       VARCHAR(600)   NOT NULL,
+  depth          INT            NOT NULL,
+  sort_order     INT            NOT NULL,          -- the roll-out order: a parent before its children, rows as shown
+
+  deleted_at     DATETIME       DEFAULT NULL,      -- set only when a later revision of the order replaces the line
+  created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT            NULL,
+
+  code_live      VARCHAR(150)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, code, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_copc_tenant (company_id, id),
+  UNIQUE KEY uq_copc_code   (company_id, code_live),
+  KEY idx_copc_line   (company_id, order_line_id, depth, sort_order),
+  KEY idx_copc_order  (company_id, order_id),
+  KEY idx_copc_parent (company_id, parent_id),
+  KEY idx_copc_item   (company_id, item_id),
+  KEY idx_copc_bom    (company_id, bom_line_id),
+
+  CONSTRAINT fk_copc_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_copc_order   FOREIGN KEY (company_id, order_id)      REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_copc_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_copc_parent  FOREIGN KEY (company_id, parent_id)     REFERENCES cf_order_pieces(company_id, id),
+  CONSTRAINT fk_copc_item    FOREIGN KEY (company_id, item_id)       REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_copc_bomline FOREIGN KEY (company_id, bom_line_id)   REFERENCES cf_bom_lines(company_id, id),
+  CONSTRAINT fk_copc_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- ===========================================================================
+-- 27. REVISIONS — a change after lock is a new revision of the same order
+-- ===========================================================================
+--
+-- After LOCK a line's structure, values and cut pieces never change (§25). The
+-- user, 2026-09-27: "If it changes, the whole sales order basically changes so
+-- it should be a new one anyways" — and chose a new REVISION of the same order
+-- ("SO-…-0001 rev 2") over a new order number.
+--
+-- A revision is another cf_sales_orders row with the SAME code and revision
+-- + 1; revision_of_id names the row it revises. The row it replaced gets status
+-- 'revised' — read-only, frozen exactly like 'closed' (records.js
+-- LOCKED_ORDER_STATUSES) and left out of lists by default — with revised_at and
+-- status_before_revised, the status it gets back if the new revision is
+-- discarded. The locked revision's lines, rows and pieces stay as they were;
+-- only its pieces are retired, when the new revision's first line locks, so
+-- their codes are free for the same pieces again (services/revisionService.js).
+--
+-- The order number was unique on (company_id, code_active). It becomes unique
+-- on (company_id, code_active, revision): the revisions of one order share the
+-- number, two orders still cannot. The new key is made BEFORE the old one is
+-- dropped, so the number is never without a unique key, even for a moment.
+--
+-- revises_line_id on a line names the line of the previous revision it was
+-- copied from — how a line keeps its identity from one revision to the next.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'revision');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_sales_orders ADD COLUMN revision INT NOT NULL DEFAULT 1, ADD COLUMN revision_of_id INT NULL, ADD COLUMN revised_at DATETIME NULL, ADD COLUMN status_before_revised VARCHAR(20) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 'revised' is APPENDED to the list, never inserted: appending changes no
+-- stored value, so it is a metadata change on MySQL and on TiDB alike.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders'
+               AND COLUMN_NAME = 'status' AND COLUMN_TYPE LIKE '%revised%');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_sales_orders MODIFY COLUMN status ENUM('draft','inquiry','quoted','confirmed','closed','lost','cancelled','revised') NOT NULL",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The new key first ...
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND INDEX_NAME = 'uq_csor_code_revision');
+SET @sql = IF(@idx = 0,
+  'ALTER TABLE cf_sales_orders ADD UNIQUE KEY uq_csor_code_revision (company_id, code_active, revision)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ... then the old one, which would refuse rev 2 for carrying rev 1's number.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND INDEX_NAME = 'uq_csor_code');
+SET @sql = IF(@idx > 0, 'ALTER TABLE cf_sales_orders DROP INDEX uq_csor_code', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A revision points at the revision it replaced, in the same company.
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND CONSTRAINT_NAME = 'fk_csor_revision_of');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_sales_orders ADD CONSTRAINT fk_csor_revision_of FOREIGN KEY (company_id, revision_of_id) REFERENCES cf_sales_orders(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A line of a revision points at the line it was copied from.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'revises_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN revises_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND CONSTRAINT_NAME = 'fk_csol_revises');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_sales_order_lines ADD CONSTRAINT fk_csol_revises FOREIGN KEY (company_id, revises_line_id) REFERENCES cf_sales_order_lines(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

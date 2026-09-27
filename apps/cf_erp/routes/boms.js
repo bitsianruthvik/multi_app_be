@@ -18,6 +18,10 @@
  * Permission follows the parent: a Custom BOM is order design (orders manage),
  * a Standard or Template BOM is catalog design (catalog manage). A batch asks
  * for the grant of every kind of parent it touches.
+ *
+ * A change to an order's own structure is followed by the line's cut pieces,
+ * on the same transaction (cutPlateService.refreshCutPieces — it never fails
+ * the save); the answer carries what happened as `cutPieces`.
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -29,6 +33,7 @@ import {
   setBomStatus, reviseBom, parentOfLine,
 } from '../services/bomService.js';
 import { applyBomChanges } from '../services/bomChangeService.js';
+import { withCutPieces, ownerLineOf } from '../services/cutPlateService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -40,7 +45,9 @@ const write = (req, parentOf, fn) => withTransaction(async (db) => {
   const c = ctx(req);
   const parent = await parentOf(db, c);
   assertPerm(req, permFor(parent));
-  return fn(db, c, parent);
+  const out = await fn(db, c, parent);
+  // Only an order's own rows belong to a line whose cut pieces follow them.
+  return parent.item_type === 'temporary' ? withCutPieces(db, c, parent.owner_order_line_id, out) : out;
 });
 const byRecord = (req) => (db, c) => requireMaster(db, c.companyId, id(req));
 const byLine = (req) => (db, c) => parentOfLine(db, c.companyId, id(req));
@@ -63,8 +70,13 @@ router.post('/bom-lines/:id/resolve', guard(PERM.view), handle((req) => write(re
 
 // The service names the BOM type of every parent the batch touches; the grant
 // asked for is the one each single-line route above would ask for.
-router.post('/bom-changes', guard(PERM.view), handle((req) => withTransaction((db) => applyBomChanges(db, ctx(req), req.body ?? {}, {
-  allow: (bomType) => assertPerm(req, permForType(bomType)),
-}))));
+router.post('/bom-changes', guard(PERM.view), handle((req) => withTransaction(async (db) => {
+  const c = ctx(req);
+  const body = req.body ?? {};
+  const out = await applyBomChanges(db, c, body, { allow: (bomType) => assertPerm(req, permForType(bomType)) });
+  if (!out.applied) return out;   // a dry run changed nothing
+  const lineId = body.scope?.orderLineId != null ? Number(body.scope.orderLineId) : await ownerLineOf(db, c.companyId, Number(body.scope?.recordId));
+  return withCutPieces(db, c, lineId, out);
+})));
 
 export default router;

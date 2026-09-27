@@ -45,6 +45,7 @@ import {
 } from '../services/selectionService.js';
 import { createCatalogNode } from '../services/classificationService.js';
 import { addCatalogOption } from '../services/specificationService.js';
+import { withCutPieces, ownerLineOf } from '../services/cutPlateService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -87,7 +88,8 @@ router.get('/records/:id/history', guard(PERM.view), handle((req) => getHistory(
 router.put('/records/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => updateRecord(db, c, id(req), req.body))));
 router.put('/records/:id/values', guard(PERM.catalog), handle((req) => tx(req, async (db, c) => {
   const result = await setValues(db, c, 'master', id(req), req.body?.values);
-  return { ...result, specs: await getRecordSpecs(db, c.companyId, id(req)) };
+  // A row of an order: its line's cut pieces follow the new values.
+  return withCutPieces(db, c, await ownerLineOf(db, c.companyId, id(req)), { ...result, specs: await getRecordSpecs(db, c.companyId, id(req)) });
 })));
 router.post('/records/:id/status', guard(PERM.catalog), handle((req) => tx(req, (db, c) => setStatus(db, c, id(req), req.body?.status))));
 router.post('/records/:id/revision', guard(PERM.catalog), handle((req) => tx(req, (db, c) => reviseRecord(db, c, id(req), req.body))));

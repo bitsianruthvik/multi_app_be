@@ -11,7 +11,7 @@
  * never edited; reverseMovement posts the opposite rows.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
-import { loadMaster, LOCKED_ORDER_STATUSES } from './records.js';
+import { loadMaster, LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { requireArea, shapeArea } from './stockingAreaService.js';
 import { requireBatch, checkBatchValues, createBatch } from './batchService.js';
 import { generate } from '../modules/codegen/index.js';
@@ -328,9 +328,14 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   }
   let order = null;
   if (!blank(input.orderId)) {
-    const [[o]] = await db.query('SELECT id, code, status FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.orderId)]);
+    const [[o]] = await db.query(
+      `SELECT o.id, o.code, o.status, o.revision, ${latestRevisionSql('o')} AS latest_revision
+         FROM cf_sales_orders o WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL`,
+      [c.companyId, Number(input.orderId)],
+    );
     if (type !== 'issue') problems.push('Only an issue is made for a sales order.');
     else if (!o) problems.push('That sales order does not exist.');
+    else if (o.status === 'revised') problems.push(revisedOrderMessage(o.code, o.revision, o.latest_revision));
     else if (LOCKED_ORDER_STATUSES.has(o.status)) problems.push(`Order ${o.code} is ${o.status} — nothing more is issued to it.`);
     else order = o;
   }

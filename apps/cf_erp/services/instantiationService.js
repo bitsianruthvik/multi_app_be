@@ -28,7 +28,7 @@ import { deleteAllForSubject as deleteValues } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { bomOfParent, bomsOfParents, linesOfBoms, childKindOf } from './bomGraph.js';
 import { materializeLineRecords } from './orderValuesService.js';
-import { codeNewItems } from './codeRangeService.js';
+import { nameNewItems } from './codeRangeService.js';
 
 const MAX_DEPTH = 20;
 
@@ -89,7 +89,7 @@ function refuseInactive(def, depth) {
  *   INSERT their details, their BOMs,
  *     read the BOM ids back, INSERT every line    4
  *   work out their values, once for the line      orderValuesService.materializeLineRecords
- *   name and code them, once for the tree         codeRangeService.codeNewItems
+ *   name them, once for the tree                  codeRangeService.nameNewItems
  *
  * (one more statement per 200 rows, and one per selection line's default.) The
  * same checks refuse the same things before anything is written, and the result
@@ -163,8 +163,8 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   // ---- 3. the items, born with placeholder codes to read their ids back by --
   // A new temporary item has no natural key of its own — its code is empty and
   // its name repeats — so each is written with a code unique to this copy and
-  // found again by it. codeNewItems overwrites every placeholder, with the
-  // generated code or with nothing, before this returns.
+  // found again by it. nameNewItems clears every placeholder before this
+  // returns: a row is a design and has NO code — its pieces get theirs at LOCK.
   const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const marker = (i) => `~tpl~${token}~${i}`;
   await insertRows(db, 'cf_master_records',
@@ -231,13 +231,13 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   // ---- 6. values, then names and codes — a code may print a value ----------
   const created = order.map((n) => n.id);
   await materializeLineRecords(db, c, ownerLineId, created);
-  const coded = await codeNewItems(db, c, {
+  await nameNewItems(db, c, {
     rootId: root.id,
     parentId: place ? place.bom.parent_id : null,
     ids: created,
     fallbackName: new Map(order.map((n) => [n.id, n.def.name])),
   });
-  return { itemId: root.id, created, warnings: coded.warnings };
+  return { itemId: root.id, created, warnings: [] };
 }
 
 /**

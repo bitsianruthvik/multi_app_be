@@ -85,6 +85,13 @@
  *   node scripts/cf_kepl/cf_recode_order.mjs --dry-run      # roll back at the end
  *   node scripts/cf_kepl/cf_recode_order.mjs --verify-only  # no writes at all
  */
+
+// SUPERSEDED 2026-09-27 — an order's rows carry no codes any more: their pieces
+// are coded when the line is LOCKED (lockService; the migration is
+// cf_rows_no_codes.mjs). This script codes rows, so running it now would put
+// back what that removed. Kept for the record; it does nothing.
+console.error('cf_recode_order.mjs is superseded by cf_rows_no_codes.mjs — an order\'s rows carry no codes now. Nothing was done.');
+process.exit(1);
 import path from 'path';
 import { pathToFileURL } from 'url';
 

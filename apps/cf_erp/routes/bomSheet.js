@@ -16,6 +16,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { exportSheet, importSheet } from '../services/bomSheetService.js';
+import { withCutPieces } from '../services/cutPlateService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -30,6 +31,11 @@ router.get('/order-lines/:id/sheet', guard(PERM.ordersView), handle(async (req, 
   res.send(out.buffer);
 }));
 
-router.post('/order-lines/:id/sheet', guard(PERM.orders), handle((req) => withTransaction((db) => importSheet(db, ctx(req), id(req), req.body ?? {}))));
+// An applied sheet is followed by the line's cut pieces (cutPlateService.refreshCutPieces).
+router.post('/order-lines/:id/sheet', guard(PERM.orders), handle((req) => withTransaction(async (db) => {
+  const c = ctx(req);
+  const out = await importSheet(db, c, id(req), req.body ?? {});
+  return out.applied ? withCutPieces(db, c, id(req), out) : out;
+})));
 
 export default router;

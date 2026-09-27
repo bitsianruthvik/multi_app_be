@@ -27,7 +27,12 @@
  *       CL  x6  (line 50)  material only       no piece rule: the built-in code
  *
  * The girders are {item.shortName}-{piece.seq}: the same on both orders, so
- * once A is released, B's preview must say its codes are taken.
+ * once A is locked, B's preview must say its codes are taken.
+ *
+ * SINCE 2026-09-26 A LINE IS LOCKED BEFORE IT IS RELEASED. Lock writes every
+ * piece's code (cf_order_pieces) and release takes them from there, so the codes
+ * the preview shows are the ones LOCK writes, the refusals for a duplicate, a
+ * hole or a taken code are lock's, and release writes exactly what was locked.
  */
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -40,10 +45,10 @@ const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 const codegen = await imp('apps/cf_erp/modules/codegen/service.js');
 const B = await imp('apps/cf_erp/services/bomService.js');
 const REL = await imp('apps/cf_erp/services/releaseService.js');
+const LOCK = await imp('apps/cf_erp/services/lockService.js');
 const SO = await imp('apps/cf_erp/services/salesOrderService.js');
 const MR = await imp('apps/cf_erp/services/masterRecordService.js');
 const { createNode } = await imp('apps/cf_erp/services/classificationService.js');
-const { temporaryTree } = await imp('apps/cf_erp/services/instantiationService.js');
 const OPS = await imp('apps/cf_erp/services/operationService.js');
 const FLOWS = await imp('apps/cf_erp/services/flowService.js');
 const AREAS = await imp('apps/cf_erp/services/stockingAreaService.js');
@@ -187,13 +192,12 @@ async function buildFixture(db, c) {
   return { fam, sub, sub2, v, op, flow, mat, BLK, IS, TF, ST, CL, SG, GR, rules, exactly, inside, pieceRule };
 }
 
-/** An order of `quantity` girders, confirmed, its structure active. */
+/** An order of `quantity` girders, confirmed. Its rows stay drafts until the line is locked — lock activates them. */
 async function girderOrder(db, c, f, party, letter, quantity) {
   const order = await SO.createOrder(db, c, { orderType: 'customer', customerId: party.id, code: `${tag}-SO${letter}`, title: `Preview fixture ${letter} ${tag}`, committedDate: '2026-12-31' });
   const withLine = await SO.addOrderLine(db, c, order.id, { recordId: f.GR.id, quantity });
   const line = withLine.lines[0];
   const [[{ item_id: rootId }]] = await db.query('SELECT item_id FROM cf_sales_order_lines WHERE id = ?', [line.id]);
-  for (const id of await temporaryTree(db, COMPANY, rootId)) await MR.setStatus(db, c, id, 'active');
   await SO.setOrderStatus(db, c, order.id, 'confirmed');
   return { order, line, rootId };
 }
@@ -238,7 +242,9 @@ try {
   const Bo = await girderOrder(conn, c, f, party, 'B', 1);
   const area = await AREAS.createArea(conn, c, { code: `${tag}-DSP`, name: `Dispatch ${tag}`, purpose: 'dispatch' });
   const check = await REL.releaseCheck(conn, COMPANY, A.line.id);
-  ok('the fixture is releasable: the release check finds nothing wrong', check.problems.length === 0, check.problems.join(' | '));
+  same('before it is locked, the release check says one thing: lock the line first', check.problems, [REL.lockFirst({ line_no: A.line.lineNo, order_code: `${tag}-SOA` })]);
+  const lockCheck = await LOCK.lockPlan(conn, COMPANY, A.line.id);
+  ok('and the line can be locked: every lock check passes', lockCheck.canLock === true, lockCheck.problems.join(' | '));
 
   /* ---- the preview ------------------------------------------------------ */
   section('1. The preview of an unreleased line: every piece, its code, and what it is');
@@ -254,7 +260,7 @@ try {
   eq('226 distinct codes', pa.summary.codes, 226);
   same('222 coded by a rule, 4 by the built-in shape (the cleats), none with a hole', [pa.summary.byRule, pa.summary.builtIn, pa.summary.missing], [222, 4, 0]);
   same('no duplicates, nothing taken', [pa.summary.duplicates, pa.summary.duplicatePieces, pa.summary.taken, pa.duplicates.length, pa.taken.length], [0, 0, 0, 0, 0]);
-  same('no problem stops the release', pa.problems, []);
+  same('the one thing that stops release is the lock', pa.problems, [REL.lockFirst({ line_no: A.line.lineNo, order_code: `${tag}-SOA` })]);
   eq('not truncated', pa.truncated, false);
   const byK = new Map(pa.nodes.map((n) => [n.k, n]));
   ok('nodes come in release order: k is the place in the list, and every parent comes before its children',
@@ -274,10 +280,14 @@ try {
   same('the top flange is a group of 1: no piece number, one code', [tf?.pieceNo, tf?.quantity, tf?.code], [null, 1, `GR${tag}-1-2-TF1`]);
   const st = under.find((n) => n.code.includes('-ST'));
   same('the stud plates are ONE group of 4 sharing one code, their range in it', [st?.pieceNo, st?.quantity, st?.pieceSeq, st?.code], [null, 4, '1-4', `GR${tag}-1-2-ST1-4`]);
-  ok('a group has a label saying what it is and how many', typeof st?.label === 'string' && st.label.endsWith(' ×4') && st.label.startsWith(pa.items[st.itemId]?.code ?? '\u0000'), st?.label);
+  // A row has no code of its own any more (2026-09-26), so its label names it.
+  const itemWord = (id) => pa.items[id]?.code ?? pa.items[id]?.name ?? '\u0000';
+  ok('a group has a label saying what it is and how many', typeof st?.label === 'string' && st.label.endsWith(' ×4') && st.label.startsWith(itemWord(st.itemId)), st?.label);
   ok('a numbered piece has none', isPieces.every((n) => n.label === undefined));
-  const cl = under.find((n) => n.code.includes('/'));
-  same('the cleats have no piece rule: the built-in code, {parent code}/{item}', [cl?.rule, cl?.code, cl?.quantity], [null, `${segs[1].code}/${pa.items[cl?.itemId]?.code}`, 6]);
+  // The built-in shape is built from short names, never a row's code (a row has
+  // none): {parent code}-{short name}{piece seq} — the cleats' group of 6 is 1-6.
+  const cl = under.find((n) => n.rule === null);
+  same('the cleats have no piece rule: the built-in code, {parent code}-{short name}{piece seq}', [cl?.rule, cl?.code, cl?.quantity], [null, `${segs[1].code}-CL1-6`, 6]);
   same('every other node names the rule that coded it', [...new Set(pa.nodes.filter((n) => n.rule).map((n) => n.rule))].sort(),
     [f.rules.pieceBlank.code, f.rules.piecePart.code, f.rules.pieceSeg.code, f.rules.pieceTop.code].sort());
   const blanks = pa.nodes.filter((n) => n.rule === f.rules.pieceBlank.code);
@@ -298,7 +308,7 @@ try {
   same('releasePreview lays out exactly what previewReleaseCodes does, code for code', pa.nodes.map((n) => [n.k, n.parentK, n.code, n.pieceNo, n.itemId]), plain.nodes.map((n) => [n.k, n.parentK, n.code, n.pieceNo, n.itemId]));
 
   /* ---- a rule that gives two pieces one code ---------------------------- */
-  section('2. Duplicates: the preview names them, and release refuses them');
+  section('2. Duplicates: the preview names them, and lock refuses them');
   await conn.query('SAVEPOINT dup');
   // Weighs 1 + 4 against PPART's 1 + 2: the stiffeners lose their number.
   await f.pieceRule('PDUP', { conditions: [f.inside, f.exactly(f.v.is)], segments: [tok('parent.code'), lit('-'), tok('item.shortName')] });
@@ -306,14 +316,16 @@ try {
   same('4 codes are each given to 26 stiffeners — one per segment piece', [pd.summary.duplicates, pd.summary.duplicatePieces, pd.duplicates.length], [4, 104, 4]);
   ok('and they are the segment\'s code with -IS', pd.duplicates.includes(`GR${tag}-1-2-IS`), pd.duplicates.join(', '));
   eq('the blanks under them follow their own rule and stay apart', new Set(pd.nodes.filter((n) => n.rule === f.rules.pieceBlank.code).map((n) => n.code)).size, 104);
-  const dupErr = await refusal(() => REL.releaseLine(conn, c, A.line.id, { finishedAreaId: area.id }));
-  eq('release refuses: CODE_CLASH', dupErr?.code, 'CODE_CLASH');
-  ok('naming one of the codes the preview named', pd.duplicates.some((d) => (dupErr?.message ?? '').includes(d)), dupErr?.message);
-  says(dupErr?.message);
+  const dupErr = await refusal(() => LOCK.lockLine(conn, c, A.line.id));
+  eq('lock refuses: NOT_READY', dupErr?.code, 'NOT_READY');
+  ok('naming one of the codes the preview named', pd.duplicates.some((d) => (dupErr?.problems ?? []).join(' ').includes(d)), (dupErr?.problems ?? []).join(' | '));
+  says((dupErr?.problems ?? []).find((p) => p.includes('more than one piece')));
+  const unlockedErr = await refusal(() => REL.releaseLine(conn, c, A.line.id, { finishedAreaId: area.id }));
+  ok('and release, of a line not locked, says to lock it first', unlockedErr?.code === 'NOT_READY' && (unlockedErr?.problems ?? []).some((p) => p.includes('Lock the line first')), (unlockedErr?.problems ?? []).join(' | '));
   await conn.query('ROLLBACK TO SAVEPOINT dup');
 
   /* ---- a rule with a hole ------------------------------------------------ */
-  section('3. A rule with a hole: the preview says which pieces and what is missing; release refuses');
+  section('3. A rule with a hole: the preview says which pieces and what is missing; lock refuses');
   await conn.query('SAVEPOINT hole');
   // piece.no is blank on a group, so a group's code has a hole.
   await f.pieceRule('PHOLE', { conditions: [f.inside, f.exactly(f.v.part)], segments: [tok('parent.code'), lit('-'), tok('piece.no')] });
@@ -321,17 +333,22 @@ try {
   eq('8 groups (4 top flanges, 4 stud plates) cannot be numbered', ph.summary.missing, 8);
   same('each says which rule and which value', [...new Set(ph.missing.map((m) => `${m.schemeCode}:${m.missing.join(',')}`))], [`${tag}-PHOLE:piece.no`]);
   const holed = ph.nodes[ph.missing[0].k];
-  same('the node keeps the built-in code in the preview, and names the rule that failed', [holed.code, holed.rule], [`${ph.nodes[holed.parentK].code}/${ph.items[holed.itemId].code}`, `${tag}-PHOLE`]);
+  same('the node keeps the built-in code in the preview, and names the rule that failed', [holed.code, holed.rule], [`${ph.nodes[holed.parentK].code}-TF${holed.pieceSeq}`, `${tag}-PHOLE`]);
   eq('byRule + built-in + missing is every node', ph.summary.byRule + ph.summary.builtIn + ph.summary.missing, ph.summary.nodes);
-  const holeErr = await refusal(() => REL.releaseLine(conn, c, A.line.id, { finishedAreaId: area.id }));
-  eq('release refuses: TOKEN_MISSING', holeErr?.code, 'TOKEN_MISSING');
-  says(holeErr?.message);
+  const holeErr = await refusal(() => LOCK.lockLine(conn, c, A.line.id));
+  eq('lock refuses: NOT_READY', holeErr?.code, 'NOT_READY');
+  ok('saying which rule cannot number what, and what it needs', (holeErr?.problems ?? []).some((p) => p.includes(`${tag}-PHOLE`) && p.includes('piece.no')), (holeErr?.problems ?? []).join(' | '));
+  says((holeErr?.problems ?? []).find((p) => p.includes('PHOLE')));
   await conn.query('ROLLBACK TO SAVEPOINT hole');
 
   /* ---- release, and compare ------------------------------------------------ */
-  section('4. Release writes exactly what the preview showed, piece for piece');
+  section('4. Lock writes exactly what the preview showed, and release exactly what was locked');
   const again = await REL.releasePreview(conn, COMPANY, A.line.id);
   same('back to the fixture\'s own rules, the preview is what it was', again.nodes.map((n) => n.code), pa.nodes.map((n) => n.code));
+  await LOCK.lockLine(conn, c, A.line.id);
+  const [lockedA] = await conn.query('SELECT code FROM cf_order_pieces WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL ORDER BY sort_order', [COMPANY, A.line.id]);
+  same('lock wrote the codes the preview showed, in its order', lockedA.map((p) => p.code), pa.nodes.map((n) => n.code));
+  same('the running number was drawn by the lock: next is 105', await sequenceRows(conn, f.rules.pieceBlank.id), [{ key: '', next: 105 }]);
   await REL.releaseLine(conn, c, A.line.id, { finishedAreaId: area.id });
   const releaseId = (await REL.liveReleaseOfLine(conn, COMPANY, A.line.id))?.id;
   ok('the line is released', Number.isInteger(releaseId));
@@ -349,7 +366,7 @@ try {
   let mismatches = 0;
   for (let i = 0; i < written.length; i++) if (written[i].code !== pa.nodes[i].code) mismatches += 1;
   eq('no piece differs from its preview', mismatches, 0);
-  same('the running number was drawn for real now: next is 105', await sequenceRows(conn, f.rules.pieceBlank.id), [{ key: '', next: 105 }]);
+  same('and release drew none of its own: next is still 105', await sequenceRows(conn, f.rules.pieceBlank.id), [{ key: '', next: 105 }]);
 
   /* ---- already released ----------------------------------------------------- */
   section('5. A released line says so, and lays nothing out');
@@ -361,7 +378,7 @@ try {
   ok('and costs three round trips, not a tree', tripR.tally.n <= 3, `${tripR.tally.n}`);
 
   /* ---- taken by another release --------------------------------------------- */
-  section('6. Codes another release already holds: the preview says taken, and release refuses');
+  section('6. Codes another line already holds: the preview says taken, and lock refuses');
   const pt = await REL.releasePreview(conn, COMPANY, Bo.line.id);
   const writtenCodes = new Set(written.map((p) => p.code));
   ok('order B\'s girder code is taken — A\'s first girder carries it', pt.taken.includes(`GR${tag}-1`), pt.taken.slice(0, 5).join(', '));
@@ -369,10 +386,10 @@ try {
   eq('the count says the same', pt.summary.taken, pt.taken.length);
   ok('B\'s blanks carry B\'s own order code, so none of them is taken', pt.nodes.filter((n) => n.rule === f.rules.pieceBlank.code).every((n) => !pt.taken.includes(n.code)));
   await conn.query('SAVEPOINT taken');
-  const takenErr = await refusal(() => REL.releaseLine(conn, c, Bo.line.id, { finishedAreaId: area.id }));
-  eq('release refuses: CODE_CLASH', takenErr?.code, 'CODE_CLASH');
-  ok('naming a code the preview called taken', pt.taken.some((code) => (takenErr?.message ?? '').includes(code)), takenErr?.message);
-  says(takenErr?.message);
+  const takenErr = await refusal(() => LOCK.lockLine(conn, c, Bo.line.id));
+  eq('lock refuses: NOT_READY', takenErr?.code, 'NOT_READY');
+  ok('naming a code the preview called taken', pt.taken.some((code) => (takenErr?.problems ?? []).join(' ').includes(code)), (takenErr?.problems ?? []).join(' | '));
+  says((takenErr?.problems ?? []).find((p) => p.includes('another line')));
   await conn.query('ROLLBACK TO SAVEPOINT taken');
 
   /* ---- no item ----------------------------------------------------------------- */
@@ -402,7 +419,7 @@ const left = TABLES.filter((t) => before[t] !== after[t]).map((t) => `${t} ${bef
 const touched = ['cf_classification_nodes', 'cf_master_records', 'cf_item_details', 'cf_definition_details', 'cf_boms', 'cf_bom_lines',
   'cf_operations', 'cf_operation_flows', 'cf_operation_flow_steps', 'cf_code_schemes', 'cf_code_scheme_conditions', 'cf_code_scheme_segments',
   'cf_code_sequences', 'cf_parties', 'cf_sales_orders', 'cf_sales_order_lines', 'cf_stocking_areas', 'cf_production_releases',
-  'cf_production_items', 'cf_production_steps', 'cf_step_dependencies', 'cf_material_requirements'].filter((t) => t in before);
+  'cf_production_items', 'cf_production_steps', 'cf_step_dependencies', 'cf_material_requirements', 'cf_order_pieces'].filter((t) => t in before);
 console.log('        census of the tables the fixture writes (before -> after):');
 for (const t of touched) console.log(`          ${t.padEnd(28)} ${String(before[t]).padStart(7)} -> ${String(after[t]).padStart(7)}`);
 ok(`every cf_ table (${TABLES.length}) is back to the count it started at`, left.length === 0, left.join(', '));

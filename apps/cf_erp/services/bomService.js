@@ -17,7 +17,7 @@
  * roll-ups up the tree, inherited values down it (valueService.refreshValues).
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
-import { requireMaster, kindOf, LOCKED_ORDER_STATUSES } from './records.js';
+import { requireMaster, kindOf, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import {
   bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, loadLine, childKindOf, descendantIds,
   createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf,
@@ -27,7 +27,6 @@ import { findCandidates } from './selectionService.js';
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
-import { refreshRangeCodes, shortNameOf } from './codeRangeService.js';
 
 export const ALLOWED_CHILDREN = {
   standard: ['catalog'],
@@ -101,7 +100,8 @@ async function readLineFlow(db, companyId, value, isSelection, problems) {
 async function ownerOrder(db, companyId, parent) {
   if (!parent.owner_order_line_id) return null;
   const [[o]] = await db.query(
-    `SELECT o.id, o.code, o.status FROM cf_sales_order_lines ol JOIN cf_sales_orders o ON o.id = ol.order_id
+    `SELECT o.id, o.code, o.status, o.revision, ${latestRevisionSql('o')} AS latest_revision
+       FROM cf_sales_order_lines ol JOIN cf_sales_orders o ON o.id = ol.order_id
       WHERE ol.company_id = ? AND ol.id = ?`,
     [companyId, parent.owner_order_line_id],
   );
@@ -112,10 +112,15 @@ async function ownerOrder(db, companyId, parent) {
 export async function assertEditable(db, companyId, parent) {
   if (parent.status === 'obsolete') throw invalid('OBSOLETE', `${labelOf(parent)} is obsolete — reactivate it to change its BOM.`);
   const order = await ownerOrder(db, companyId, parent);
-  if (order && LOCKED_ORDER_STATUSES.has(order.status)) throw invalid('ORDER_CLOSED', `Order ${order.code} is ${order.status} — its structure can no longer change.`);
+  if (order && LOCKED_ORDER_STATUSES.has(order.status)) {
+    throw invalid('ORDER_CLOSED', order.status === 'revised' ? revisedOrderMessage(order.code, order.revision, order.latest_revision)
+      : `Order ${order.code} is ${order.status} — its structure can no longer change.`);
+  }
   if (parent.owner_release_id) {
     throw invalid('RELEASED', `${labelOf(parent)} was released to production with line ${parent.owner_line_no} of ${order?.code ?? 'its order'} — its structure can no longer change. (Take the release back while nothing has started, or wait for change after release.)`);
   }
+  // A locked line's structure is what it was rolled out from (lockService).
+  if (parent.owner_line_locked_at) throw invalid('LOCKED', lockedLineMessage(parent.owner_line_no, order?.code));
 }
 
 /** The BOM of any record, with its lines and what they may contain. */
@@ -171,7 +176,7 @@ export async function addLine(db, c, parentId, input = {}) {
   if (!ALLOWED_CHILDREN[bomType].includes(childKind)) {
     const why = {
       standard: 'A Standard BOM holds catalog items only — a structure that changes per order belongs on a template definition.',
-      template: 'A Template BOM holds catalog items and definitions — temporary items belong to one order.',
+      template: 'A Template BOM holds catalog items and definitions — an order’s rows belong to that order.',
       custom: 'Temporary items are created by adding their template definition here.',
     }[bomType];
     throw invalid('WRONG_CHILD', why);
@@ -192,12 +197,6 @@ export async function addLine(db, c, parentId, input = {}) {
   const common = { lineNo, position, quantity, role, operationFlowId, notes: blank(input.notes) ? null : String(input.notes) };
 
   if (bomType === 'custom' && childKind === 'template') {
-    // Range codes (codeRangeService): a row put in AMONG existing rows moves
-    // the rows after it up. Move them first, so the new item's first code
-    // cannot meet the stale code one of them still carries.
-    if (lineNoIn != null) {
-      await refreshRangeCodes(db, c, parent.id, { insert: { lineNo, quantity, shortName: shortNameOf({ name: child.name }, child) } });
-    }
     await instantiateTemplate(db, c, { definition: child, ownerLineId: parent.owner_order_line_id, place: { bom, ...common } });
   } else if (bomType === 'custom' && childKind === 'selection') {
     const pick = await defaultCandidate(db, c.companyId, child.id);
@@ -209,7 +208,6 @@ export async function addLine(db, c, parentId, input = {}) {
   // already worked out by the copy (instantiationService), so only the parent
   // is refreshed here — it walks up from there as far as anything moves.
   await refreshValues(db, c, [parent.id]);
-  if (bomType === 'custom') await refreshRangeCodes(db, c, parent.id);
   return getBom(db, c.companyId, parent.id);
 }
 
@@ -229,8 +227,8 @@ export async function parentOfLine(db, companyId, lineId) {
  * WRITE, THEN REFRESH — AND A BATCH REFRESHES ONCE
  *
  * A change to a line is two things: the row itself, and what it moves — the
- * values rolled up through every parent above it, and the range codes of the
- * rows after it. The second is the expensive part: one quantity deep in the
+ * values rolled up through every parent above it. (A row has no code to move:
+ * its pieces are coded when the line is LOCKED.) The second is the expensive part: one quantity deep in the
  * KEPL order re-works the values all the way to the span, 251 round trips, about
  * 12 s on production (~49 ms a hop).
  *
@@ -244,7 +242,7 @@ export async function parentOfLine(db, companyId, lineId) {
 /**
  * input: { quantity?, role?, lineNo?, notes?, operationFlowId? } — what a line IS cannot change; remove it and add another.
  * Writes the row only. Returns what the caller must refresh: `values` when the
- * quantity changed, `ranges` when a Custom BOM's rows moved.
+ * quantity changed.
  */
 export async function writeLineUpdate(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId);
@@ -265,14 +263,11 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
     sets.operation_flow_id = await readLineFlow(db, c.companyId, input.operationFlowId, isSelection, problems);
   }
   assertNoProblems(problems);
-  const out = { parentId: parent.id, values: false, ranges: false };
+  const out = { parentId: parent.id, values: false };
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_bom_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, lineId]);
     out.values = sets.quantity !== undefined && sets.quantity !== Number(line.quantity);
-    // A new quantity or a new place in the list moves the ranges of the rows after it.
-    out.ranges = line.bom_type === 'custom'
-      && (out.values || (sets.line_no !== undefined && sets.line_no !== line.line_no));
   }
   return out;
 }
@@ -281,7 +276,6 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
 export async function updateLine(db, c, lineId, input = {}) {
   const w = await writeLineUpdate(db, c, lineId, input);
   if (w.values) await refreshValues(db, c, [w.parentId]);
-  if (w.ranges) await refreshRangeCodes(db, c, w.parentId);
   return getBom(db, c.companyId, w.parentId);
 }
 
@@ -297,14 +291,13 @@ export async function writeLineRemoval(db, c, lineId) {
   await assertEditable(db, c.companyId, parent);
   if (line.bom_type === 'custom' && childKindOf(line) === 'temporary') await deleteTemporaryTree(db, c, line.child_id);
   await db.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, lineId]);
-  return { parentId: parent.id, values: true, ranges: line.bom_type === 'custom' };
+  return { parentId: parent.id, values: true };
 }
 
 /** Removes one line and refreshes what it moves. See writeLineRemoval. */
 export async function removeLine(db, c, lineId) {
   const w = await writeLineRemoval(db, c, lineId);
   await refreshValues(db, c, [w.parentId]);
-  if (w.ranges) await refreshRangeCodes(db, c, w.parentId);
   return getBom(db, c.companyId, w.parentId);
 }
 
@@ -338,7 +331,6 @@ export async function resolveLine(db, c, lineId, { itemId } = {}) {
     await db.query('UPDATE cf_bom_lines SET child_id = ? WHERE company_id = ? AND id = ?', [childId, c.companyId, lineId]);
     await refreshValues(db, c, [parent.id]);
     // The chosen item's short name decides which count the row joins.
-    if (line.bom_type === 'custom') await refreshRangeCodes(db, c, parent.id);
   }
   return getBom(db, c.companyId, parent.id);
 }
@@ -403,7 +395,9 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
     bom: rootBom ? { id: rootBom.id, bomType: rootBom.bom_type, status: rootBom.status, revision: rootBom.revision } : null,
     children: [],
   };
-  const stats = { nodes: 1, temporary: kindOf(root) === 'temporary' ? 1 : 0, drafts: root.status === 'draft' ? 1 : 0, unresolved: 0, maxDepth: 0 };
+  // `drafts` counts what a person activates — not an order's rows, which locking
+  // their line activates (lockService).
+  const stats = { nodes: 1, temporary: kindOf(root) === 'temporary' ? 1 : 0, drafts: root.status === 'draft' && kindOf(root) !== 'temporary' ? 1 : 0, unresolved: 0, maxDepth: 0 };
   let frontier = rootBom ? [rootNode] : [];
   let truncated = false;
   for (let depth = 1; frontier.length; depth++) {
@@ -444,7 +438,7 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
         stats.nodes++;
         stats.maxDepth = Math.max(stats.maxDepth, depth);
         if (kind === 'temporary') stats.temporary++;
-        if (l.child_status === 'draft') stats.drafts++;
+        if (l.child_status === 'draft' && kind !== 'temporary') stats.drafts++;
         if (l.selection_definition_id && l.child_record_kind === 'definition') stats.unresolved++;
         if (cb) next.push(node);
       }
@@ -469,6 +463,8 @@ export async function whereUsed(db, companyId, masterId) {
        LEFT JOIN cf_sales_order_lines ol ON ol.id = pi.owner_order_line_id
        LEFT JOIN cf_sales_orders o ON o.id = ol.order_id
       WHERE l.company_id = ? AND l.deleted_at IS NULL AND (l.child_id = ? OR l.selection_definition_id = ?)
+        -- A revised order is kept as it was: its latest revision is where the record is used.
+        AND (o.id IS NULL OR o.status <> 'revised')
       ORDER BY b.bom_type, p.code
       LIMIT 300`,
     [companyId, masterId, masterId],

@@ -75,6 +75,10 @@ import {
 } from './bomService.js';
 import { loadSpecs, coerce, setValues } from './valueService.js';
 import { resolve, dateText } from './resolutionService.js';
+import { linePlaceholders } from './placeholderService.js';
+
+/** How a structure node finds its placeholder: by its BOM line, or by item for what the line sells. */
+const placeholderKey = (lineId, itemId) => (lineId != null ? `l${lineId}` : `i${itemId}`);
 
 export const SHEET_NAME = 'BOM';
 export const NOTES_SHEET = 'How to use this';
@@ -139,12 +143,6 @@ const text = (v) => (blank(v) ? null : String(v).trim());
 const near = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
 const labelOf = (n) => n.code ?? n.name ?? `#${n.id}`;
 const chunk = (xs, n) => { const out = []; for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n)); return out; };
-/**
- * Two codes that differ only in their numbers — a number or a range of them,
- * so IS24 against IS24-26 (one piece became three) counts as the same shape.
- */
-const numbersAsOne = (s) => String(s).toUpperCase().replace(/\d+(?:-\d+)*/g, '#');
-const sameButNumbers = (a, b) => numbersAsOne(a) === numbersAsOne(b);
 
 /** One cell of an ExcelJS sheet as plain text: formulas, rich text and dates all flattened. */
 function cellText(v) {
@@ -407,7 +405,7 @@ function sheetMatrix(model) {
       '',                       // Delete? — always exported blank
       n.depth,
       indent(n.depth, labelOf(n)),
-      n.code ?? '',
+      n.code ?? model.placeholders?.get(placeholderKey(n.lineId, n.id))?.code ?? '',
       n.name ?? '',
       n.kind,
       Number(n.quantity),
@@ -458,6 +456,8 @@ const INSTRUCTIONS = (model) => [
   ['What you may NOT change', 'Every column marked "do not edit", and every specification cell marked as worked out'],
   ['', '(calculated, rollup, inherited or fixed). Those are worked out from other values — change'],
   ['', 'what they are worked out FROM and they follow. A code belongs to the code generator.'],
+  ['', 'A row made for this order has no code yet: its Code shows the code its pieces get when'],
+  ['', 'the line is locked, with # where each piece\'s own number goes. It is only shown.'],
   ['', 'A row inside a catalog item\'s own BOM is shared by every order and is read only here;'],
   ['', 'the Locked column says which rows those are.'],
   ['', 'To swap one item for another, remove its row and add the one you want — a row cannot'],
@@ -485,6 +485,14 @@ const HEAD_LOCKED = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDDD
 export async function exportSheet(db, companyId, orderLineId, { format = 'xlsx' } = {}) {
   const fmt = String(format).toLowerCase() === 'csv' ? 'csv' : 'xlsx';
   const model = await buildModel(db, companyId, orderLineId);
+  // An order's rows have no code of their own until the line is LOCKED; the
+  // sheet shows the code their pieces will get instead, # where each piece's
+  // number goes. Only shown: the import never reads it back. A sheet without
+  // them is still a sheet, so a roll-out that cannot be worked out yet
+  // (a selection unchosen) leaves the cells empty rather than failing the export.
+  model.placeholders = await linePlaceholders(db, companyId, orderLineId)
+    .then((ph) => new Map(ph.rows.map((r) => [placeholderKey(r.bomLineId, r.itemId), r])))
+    .catch(() => null);
   // Reading is always allowed — a closed order's sheet is a record worth having.
   // But the one rule that decides whether it can come back in is asked here too,
   // so the sheet says on its own face that it is read only.
@@ -783,28 +791,24 @@ async function buildPlan(db, c, model, sheet) {
 
     // Code is identity, not a field. Changing it is remove-and-add.
     //
-    // Except where codes MOVE. An order's own temporary items are numbered by
-    // where their pieces fall under their parent (codeRangeService): a quantity
-    // changed since this sheet was exported moves the code of that row, of the
-    // rows after it, and of everything built on them — WEB1-7 is WEB1-5 once the
-    // row holds 5. The Row ID already says which line this is, and a line never
-    // changes what it holds, so a temporary item's code that differs ONLY IN
-    // ITS NUMBERS is the same row with an older number — not a swap. Refusing it
-    // made every sheet go stale the moment it was used once. A different word
-    // (TF1 for BF1) is still refused: that reads like a swap.
-    const codeRead = agree('Code', (e) => cell(e.row, 'code'));
+    // Except on an order's own rows (temporary items): a row is a design with no
+    // code of its own — its pieces are coded when the line is LOCKED — so its
+    // Code cell holds the placeholder the export printed (# where each piece's
+    // number goes), or, on a sheet exported before rows lost their codes, the
+    // code it used to carry. Either way it names nothing, so it is not read.
+    // The Row ID says which line this is, and a line never changes what it holds.
+    const codeRead = n.kind === 'temporary' ? { conflict: true } : agree('Code', (e) => cell(e.row, 'code'));
     if (!codeRead.conflict) {
       const was = n.code ?? '';
       const now = codeRead.value ?? '';
-      const renumbered = n.kind === 'temporary' && sameButNumbers(was, now);
-      if (was !== '' && now !== '' && was.toUpperCase() !== now.toUpperCase() && !renumbered) {
+      if (was !== '' && now !== '' && was.toUpperCase() !== now.toUpperCase()) {
         problems.push(n.selection
           ? `Row ${rowId} chooses a catalog item for ${n.selection.code ?? n.selection.name}; the sheet does not change that choice — make it on the structure screen.`
           : `Row ${rowId}: what a line holds cannot change (${was} -> ${now}) — take this row out and add ${now} instead.`);
       } else if (was === '' && now !== '') {
-        // A temporary item has no code until a coding rule gives it one, and
-        // that generator owns it. Typing one here would otherwise look like it
-        // worked and then quietly do nothing.
+        // A catalog item still without a code gets one from the code generator,
+        // which owns it. Typing one here would otherwise look like it worked
+        // and then quietly do nothing.
         problems.push(`Row ${rowId} (${labelOf(n)}) has no code of its own, and a code is given by the code generator — this sheet does not name records. Leave Code empty on a row that came out empty.`);
       }
     }
@@ -963,7 +967,7 @@ async function buildPlan(db, c, model, sheet) {
     const child = await requireMaster(db, companyId, found.id);
     const childKind = kindOf(child);
     if (!ALLOWED_CHILDREN.custom.includes(childKind)) {
-      problems.push(`${label}: ${code} is a ${childKind} record — a temporary item belongs to one order and cannot be put on another. Add the template definition it was made from.`);
+      problems.push(`${label}: ${code} is a row of another order’s structure and cannot be put on this one. Add the template definition it was made from.`);
       continue;
     }
     if (child.status === 'obsolete') { problems.push(`${label}: ${code} is obsolete.`); continue; }

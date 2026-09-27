@@ -7,7 +7,9 @@
  *   PUT    /orders/:id                 header fields; the number only while the order has no lines
  *   POST   /orders/:id/status          { status }  — inquiry, quoted, confirmed, closed, lost, cancelled (customer)
  *                                                   draft, confirmed, closed, cancelled (stock)
- *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only
+ *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only — not a revision (discard it)
+ *   POST   /orders/:id/revise          the next revision of the order: a copy of it, unlocked (revisionService)
+ *   DELETE /orders/:id/revision        takes the latest revision away while none of its lines is locked
  *   POST   /orders/:id/lines           { recordId, quantity, committedDate?, description?, lineNo?, notes? }
  *   PUT    /order-lines/:id            { quantity?, committedDate?, description?, lineNo?, notes? }
  *   DELETE /order-lines/:id            a custom line takes its structure with it
@@ -23,6 +25,8 @@ import {
   addOrderLine, updateOrderLine, removeOrderLine, lineStructure,
 } from '../services/salesOrderService.js';
 import { deriveCutPlates, getCutPlates } from '../services/cutPlateService.js';
+import { assertLineUnlocked } from '../services/lockService.js';
+import { reviseOrder, discardRevision } from '../services/revisionService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -34,6 +38,10 @@ router.get('/orders/:id', guard(PERM.ordersView), handle((req) => getOrder(pool,
 router.put('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrder(db, c, id(req), req.body ?? {}))));
 router.post('/orders/:id/status', guard(PERM.orders), handle((req) => tx(req, (db, c) => setOrderStatus(db, c, id(req), req.body?.status))));
 router.delete('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => deleteOrder(db, c, id(req)))));
+// A change after lock is a new revision of the same order (init.sql §27). Both
+// write the whole order in one transaction, so a refusal leaves nothing behind.
+router.post('/orders/:id/revise', guard(PERM.orders), handle((req) => tx(req, (db, c) => reviseOrder(db, c, id(req)))));
+router.delete('/orders/:id/revision', guard(PERM.orders), handle((req) => tx(req, (db, c) => discardRevision(db, c, id(req)))));
 
 router.post('/orders/:id/lines', guard(PERM.orders), handle((req) => tx(req, (db, c) => addOrderLine(db, c, id(req), req.body ?? {}))));
 router.put('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrderLine(db, c, id(req), req.body ?? {}))));
@@ -43,6 +51,10 @@ router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle((req) =>
 // Cut plates change the line's structure, so they sit behind the same grant as
 // the rest of it: seeing them is a read, working them out is managing the order.
 router.get('/order-lines/:id/cut-plates', guard(PERM.ordersView), handle((req) => getCutPlates(pool, ctx(req).companyId, id(req))));
-router.post('/order-lines/:id/cut-plates', guard(PERM.orders), handle((req) => tx(req, (db, c) => deriveCutPlates(db, c, id(req), req.body ?? {}))));
+// A locked line's cut pieces are part of what it was rolled out from.
+router.post('/order-lines/:id/cut-plates', guard(PERM.orders), handle((req) => tx(req, async (db, c) => {
+  await assertLineUnlocked(db, c.companyId, id(req));
+  return deriveCutPlates(db, c, id(req), req.body ?? {});
+})));
 
 export default router;

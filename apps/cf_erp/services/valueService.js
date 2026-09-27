@@ -23,7 +23,7 @@
  */
 import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
-import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine } from './records.js';
+import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS } from './records.js';
 import { resolve, dateText } from './resolutionService.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
 
@@ -365,11 +365,17 @@ export async function setValues(db, c, subjectType, subjectId, entries = []) {
     throw invalid('NOT_HERE', subjectType === 'batch' ? 'Batch values are set on the batch (Inventory › Batches).' : 'Values on individual units arrive with production.');
   }
   const master = subjectType === 'master' ? await requireMaster(db, c.companyId, subjectId) : null;
-  if (master) assertNotFrozen(master, 'values');
   const machine = subjectType === 'machine' ? await requireMachine(db, c.companyId, subjectId) : null;
   if (subjectType === 'classification') await requireNode(db, c.companyId, subjectId);
 
   const { byId, byCode } = await loadSpecs(db, c.companyId, entries);
+  if (master) {
+    // A locked line still takes nesting's own values (records.AFTER_LOCK_SPECS):
+    // nesting comes after lock. Anything else on a frozen record is refused.
+    const codeOf = (e) => String((e.specificationId != null ? byId.get(Number(e.specificationId))?.code : e.specCode) ?? '').toUpperCase();
+    const planningOnly = frozenBy(master)?.reason === 'locked' && entries.every((e) => AFTER_LOCK_SPECS.has(codeOf(e)));
+    if (!planningOnly) assertNotFrozen(master, 'values');
+  }
   let rules = null;
   if ((master && master.record_kind === 'item') || machine) {
     const r = await resolve(db, c.companyId, machine ? { machine } : { master });

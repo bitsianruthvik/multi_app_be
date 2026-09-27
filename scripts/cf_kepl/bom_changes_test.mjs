@@ -12,8 +12,10 @@
  * none of the company's own nodes, records or rules. Four suites broke in one
  * week by borrowing tenant data, one of them because uq_ccn_sibling is unique on
  * the NAME, not the code; every name and code here carries a run tag. Its coding
- * rule is more specific than any the company has (kind + exact Variant), so the
- * codes it asserts are the fixture's own, produced by the real generator.
+ * rule is more specific than any the company has (kind + exact Variant) — and
+ * still codes nothing: an order's rows are designs with no code of their own
+ * (their pieces are coded when the line is LOCKED), so the suite finds its rows
+ * by where they sit, and a problem names a row by its path.
  *
  * ok(label, cond) — the label FIRST. A swapped call has passed unconditionally
  * twice in this codebase, so ok() here refuses anything but (string, boolean).
@@ -52,6 +54,9 @@ const eq = (name, got, want) => ok(name, same(got, want), `got ${JSON.stringify(
 const near = (name, got, want) => ok(name, got != null && Math.abs(Number(got) - want) < 1e-6, `got ${got}, wanted ${want}`);
 const section = (s) => console.log(`\n${s}`);
 const some = (xs, re) => (xs ?? []).some((p) => re.test(String(p)));
+const has = (xs, text) => (xs ?? []).some((p) => String(p).includes(text));
+/** How a problem names a row with no code: the names down the tree, each with its line number. */
+const pathOf = (...nodes) => nodes.map((n) => (n.code ? n.code : n.lineNo != null ? `${n.lineNo} ${n.name}` : n.name)).join(' › ');
 const refusal = async (fn) => { try { await fn(); return null; } catch (e) { return e; } };
 
 /* --------------------------------------------------------------------------
@@ -196,26 +201,11 @@ async function buildFixture(db, c) {
     );
   }
 
-  // A stiffener, coded the way the company now codes parts — {parent.code}-
-  // {shortName}{range} (codeRangeService) — by a rule that also names the
-  // definition, so it outweighs the rule above (1 + 4 + 4 against 1 + 4).
+  // A stiffener, for 9b: a row added the ordinary way, and a copy of it.
   const STIFF = await master('template', 'STIFF', 'Intermediate stiffener', 'IS');
-  const rangeScheme = await ins(
-    "INSERT INTO cf_code_schemes (company_id, code, name, entity_type, target_field, seq_scope, priority, status) VALUES (?, ?, 'Bom changes test — ranges', 'item', 'code', 'prefix', 0, 'active')",
-    [COMPANY, `${tag}-RNG`],
-  );
-  for (const [k, op, v] of [['kind', 'eq', 'temporary'], ['classification', 'eq', String(variant)], ['definition', 'eq', String(STIFF)]]) {
-    await db.query('INSERT INTO cf_code_scheme_conditions (company_id, scheme_id, token_key, operator, value) VALUES (?, ?, ?, ?, ?)', [COMPANY, rangeScheme, k, op, v]);
-  }
-  for (const [i, [type, token, literal, format]] of [['token', 'parent.code'], ['literal', null, '-'], ['token', 'record.shortName'], ['token', 'range', null, '0']].entries()) {
-    await db.query(
-      'INSERT INTO cf_code_scheme_segments (company_id, scheme_id, sort_order, segment_type, literal_text, token_key, format) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [COMPANY, rangeScheme, i + 1, type, literal ?? null, token ?? null, format ?? null],
-    );
-  }
 
   // An order of its own, and a custom line made the real way: the girder
-  // template becomes the order's temporary items, coded by the rule above.
+  // template is laid out as the order's rows — named, and coded by nothing.
   const orderCode = `${tag}-SO`;
   const orderId = await ins("INSERT INTO cf_sales_orders (company_id, code, order_type, title, status, created_by) VALUES (?, ?, 'customer', 'Bom changes fixture', 'inquiry', ?)", [COMPANY, orderCode, c.userId]);
   await S.addOrderLine(db, c, orderId, { recordId: GIRDER, quantity: 2 });
@@ -227,10 +217,9 @@ async function buildFixture(db, c) {
     BOLT, BOLT2, ASSY, assyBoltLine, WEB, FLANGE, SEL, SEGMENT, GIRDER, STIFF, tplWebLine,
   };
   let t = await look(db, f);
-  f.rootCode = `${orderCode}-GDR01`;
-  f.seg1 = t.byCode.get(`${f.rootCode}-SEG01`);
-  f.seg2 = t.byCode.get(`${f.rootCode}-SEG02`);
-  if (!f.seg1 || !f.seg2) throw new Error(`The fixture's structure did not come out coded as expected: ${[...t.byCode.keys()].join(', ')}`);
+  f.seg1 = kid(t.tree.root, SEGMENT, 0);
+  f.seg2 = kid(t.tree.root, SEGMENT, 1);
+  if (!f.seg1 || !f.seg2) throw new Error('The fixture\'s structure did not come out as expected: the girder should hold two segments.');
 
   // A cut plate both webs are cut from — ONE temporary item under two parts,
   // the way cutPlateService leaves one — filed under the fixture's own
@@ -252,8 +241,8 @@ async function buildFixture(db, c) {
     await line(webBom, 10, f.blank, 1, { designId: BLK });
   }
   t = await look(db, f);
-  f.seg1 = t.byCode.get(`${f.rootCode}-SEG01`);
-  f.seg2 = t.byCode.get(`${f.rootCode}-SEG02`);
+  f.seg1 = kid(t.tree.root, SEGMENT, 0);
+  f.seg2 = kid(t.tree.root, SEGMENT, 1);
 
   // Values the real way: every write through valueService, roll-ups following.
   const set = (id, entries) => V.setValues(db, c, 'master', id, entries.map(([s, value]) => ({ specCode: s.code, value })));
@@ -274,20 +263,26 @@ async function buildFixture(db, c) {
   return f;
 }
 
-/** The order line's structure, a lookup by code, and each line's design (explode does not carry it). */
+/** The order line's structure, and each line's design (explode does not carry it). */
 const designOf = new Map();
 async function look(db, f) {
   const tree = await B.explode(db, COMPANY, f.root, {});
-  const byCode = new Map();
   const lineIds = [];
-  const walk = (n) => { if (n.code) byCode.set(n.code, n); if (n.lineId) lineIds.push(n.lineId); n.children.forEach(walk); };
+  const walk = (n) => { if (n.lineId) lineIds.push(n.lineId); n.children.forEach(walk); };
   walk(tree.root);
   if (lineIds.length) {
     const [rows] = await db.query('SELECT id, design_id FROM cf_bom_lines WHERE company_id = ? AND id IN (?)', [COMPANY, lineIds]);
     for (const r of rows) designOf.set(r.id, r.design_id);
   }
-  return { tree, byCode };
+  return { tree };
 }
+/** The codes of every row (temporary item) in a tree but the shared cut plate, which keeps its own. */
+const rowCodes = (tree, blank) => {
+  const out = [];
+  const walk = (n) => { if (n.kind === 'temporary' && n.id !== blank) out.push(n.code); n.children.forEach(walk); };
+  walk(tree.root);
+  return out;
+};
 /** A node's child made from one design (the first, unless `nth` says otherwise). */
 const kid = (node, designId, nth = 0) => node.children.filter((k) => k.id === designId || designOf.get(k.lineId) === designId)[nth];
 async function value(db, subjectId, s) {
@@ -317,14 +312,17 @@ try {
   section('0. Fixture — its own classification, specs, templates, coding rule and order');
   const f = await buildFixture(conn, c);
   let t = await look(conn, f);
-  const seg1 = () => t.byCode.get(`${f.rootCode}-SEG01`);
-  const seg2 = () => t.byCode.get(`${f.rootCode}-SEG02`);
+  const seg1 = () => kid(t.tree.root, f.SEGMENT, 0);
+  const seg2 = () => kid(t.tree.root, f.SEGMENT, 1);
+  const seg3 = () => kid(t.tree.root, f.SEGMENT, 2);
   const web1 = () => kid(seg1(), f.WEB);
   const flg1 = () => kid(seg1(), f.FLANGE);
   const bolt = (seg) => seg.children.find((k) => k.id === f.BOLT);
   const selLine = (seg) => seg.children.find((k) => k.selection?.id === f.SEL);
   const assyNode = (seg) => seg.children.find((k) => k.id === f.ASSY);
-  ok('the girder template became the order\'s temporary items', t.tree.root.code === f.rootCode && !!seg1() && !!seg2());
+  ok('the girder template was laid out as the order\'s rows', !!seg1() && !!seg2() && seg1().children.length === 5);
+  const codes0 = rowCodes(t.tree, f.blank);
+  ok('and not one row has a code — even with a coding rule that applies to them', codes0.length === 7 && codes0.every((x) => x === null), JSON.stringify(codes0));
   ok('the selection line started with its only candidate', selLine(seg1())?.id === f.BOLT2);
   near('a part\'s weight is worked out from its size', await value(conn, web1().id, f.spec.WT), 500);
   // 1×500 + 2×300 + 8×0.1 + 4×0.2 + 1×2
@@ -371,9 +369,9 @@ try {
   ]));
   eq('it is refused as a whole', bad?.status, 422);
   eq('with the house code', bad?.code, 'INVALID');
-  ok('a quantity below zero is named', some(bad?.problems, /FLG01: Quantity must be more than zero/), JSON.stringify(bad?.problems));
-  ok('a flow that does not exist is named', some(bad?.problems, /WEB01: That flow does not exist/));
-  ok('an obsolete flow is named', some(bad?.problems, /FLG01: Flow .*-FX is obsolete/));
+  ok('a quantity below zero is named, the row by where it sits', has(bad?.problems, `${pathOf(t.tree.root, seg1(), flg1())}: Quantity must be more than zero`), JSON.stringify(bad?.problems));
+  ok('a flow that does not exist is named', has(bad?.problems, `${pathOf(t.tree.root, seg2(), kid(seg2(), f.WEB))}: That flow does not exist`));
+  ok('an obsolete flow is named', some(bad?.problems, /Flow .*-FX is obsolete/) && has(bad?.problems, `${pathOf(t.tree.root, seg2(), kid(seg2(), f.FLANGE))}: Flow `));
   ok('a flow on a selection line is named', some(bad?.problems, /selection line takes the flow/));
   ok('a change to a line the same save removes is named', some(bad?.problems, /changed and removed in the same save/));
   eq('all five, together', bad?.problems?.length, 5);
@@ -408,9 +406,9 @@ try {
     { op: 'remove', lineId: kid(seg2(), f.FLANGE).lineId },
   ], { dryRun: true });
   eq('it says it is a dry run', [dry.dryRun, dry.applied], [true, false]);
-  eq('it counts what would change', dry.summary.sentence, '1 quantity changed, 1 line pasted (3 new temporary items), 1 line removed');
+  eq('it counts what would change', dry.summary.sentence, '1 quantity changed, 1 line pasted (3 new rows), 1 line removed');
   const dryCodes = dry.results[1].items.map((i) => i.code);
-  eq('and names the codes the copies would get', dryCodes, [`${f.rootCode}-SEG03`, `${f.rootCode}-SEG03-WEB01`, `${f.rootCode}-SEG03-FLG01`]);
+  eq('and promises the copies no code — their pieces are coded at lock', dryCodes, [null, null, null]);
   ok('it gives no ids for rows that were never kept', dry.results[1].lineId === null && dry.results[1].items.every((i) => i.id === null));
   ok('nothing was written', diff(beforeDry, await counts(conn)).length === 0, diff(beforeDry, await counts(conn)).join(', '));
   eq('the quantity is as it was', Number((await lineRow(conn, web1().lineId)).quantity), 1);
@@ -428,37 +426,38 @@ try {
   eq('and the template line was left alone', Number((await lineRow(conn, f.tplWebLine)).quantity), 1);
 
   /* ---- 5. deep paste into a Custom BOM ---------------------------------- */
-  section('5. Paste into a Custom BOM is a deep copy — values, lines, flows, rules, codes');
+  section('5. Paste into a Custom BOM is a deep copy — values, lines, flows, rules; no codes');
   const beforePaste = await counts(conn);
   const m1 = meter(conn);
   const pasted = await run([{ op: 'paste', sourceLineId: seg1().lineId, parentId: f.root }]);
   m1.stop();
   const rtSeg = m1.m;
-  eq('it pasted one line with three new temporary items', pasted.summary.sentence, '1 line pasted (3 new temporary items)');
-  eq('the copies took the codes the dry run promised', pasted.results[0].items.map((i) => i.code), dryCodes);
+  eq('it pasted one line with three new rows', pasted.summary.sentence, '1 line pasted (3 new rows)');
+  eq('the copies have no code, as the dry run said', pasted.results[0].items.map((i) => i.code), dryCodes);
   const afterPaste = await counts(conn);
   eq('three items with their detail rows, two BOMs (segment, web), seven lines',
     ['cf_master_records', 'cf_item_details', 'cf_boms', 'cf_bom_lines'].map((k) => afterPaste[k] - beforePaste[k]), [3, 3, 2, 7]);
   t = await look(conn, f);
-  const seg3 = t.byCode.get(`${f.rootCode}-SEG03`);
-  const web3 = seg3 && kid(seg3, f.WEB);
-  const flg3 = seg3 && kid(seg3, f.FLANGE);
-  ok('the copy hangs under the girder, after the other two', !!seg3 && seg3.lineNo === 30 && seg3.position === 3);
+  const seg3now = seg3();
+  const web3 = seg3now && kid(seg3now, f.WEB);
+  const flg3 = seg3now && kid(seg3now, f.FLANGE);
+  ok('the copy hangs under the girder, after the other two', !!seg3now && seg3now.lineNo === 30 && seg3now.position === 3);
+  eq('and in the database too, no row of it has a code', (await conn.query('SELECT code FROM cf_master_records WHERE id IN (?)', [[seg3now.id, web3.id, flg3.id]]))[0].map((r) => r.code), [null, null, null]);
   const topLine = await lineRow(conn, pasted.results[0].lineId);
   eq('its line is the segment design, from the same template line', [topLine.design_id, topLine.source_line_id], [f.SEGMENT, (await lineRow(conn, seg1().lineId)).source_line_id]);
   const [copies] = await conn.query(
     `SELECT m.id, m.name, m.short_name, m.status, m.classification_id, m.default_flow_id, i.source_definition_id, i.owner_order_line_id, i.tracked_by
        FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE m.id IN (?)`,
-    [[seg3.id, web3.id, flg3.id]],
+    [[seg3now.id, web3.id, flg3.id]],
   );
   ok('every copy is a new draft temporary item of the same order line', copies.length === 3 && copies.every((x) => x.status === 'draft' && x.owner_order_line_id === f.lineId));
   ok('made from the same definitions, filed in the same place', copies.every((x) => [f.SEGMENT, f.WEB, f.FLANGE].includes(x.source_definition_id) && x.classification_id === f.variant));
   eq('the web copy keeps its own default flow', copies.find((x) => x.id === web3.id)?.default_flow_id, f.flows.FLW1);
-  ok('the copies are new records, not the originals', ![seg1().id, web1().id, flg1().id].some((id) => [seg3.id, web3.id, flg3.id].includes(id)));
-  eq('the copy has every line the original has', seg3.children.length, seg1().children.length);
-  eq('catalog items are referenced, not copied', bolt(seg3)?.id, f.BOLT);
-  ok('the selection line is referenced with its choice', selLine(seg3)?.id === f.BOLT2 && selLine(seg3)?.selection?.id === f.SEL);
-  eq('the catalog kit is referenced, its own BOM untouched', [assyNode(seg3)?.id, assyNode(seg3)?.children.length], [f.ASSY, 1]);
+  ok('the copies are new records, not the originals', ![seg1().id, web1().id, flg1().id].some((id) => [seg3now.id, web3.id, flg3.id].includes(id)));
+  eq('the copy has every line the original has', seg3now.children.length, seg1().children.length);
+  eq('catalog items are referenced, not copied', bolt(seg3now)?.id, f.BOLT);
+  ok('the selection line is referenced with its choice', selLine(seg3now)?.id === f.BOLT2 && selLine(seg3now)?.selection?.id === f.SEL);
+  eq('the catalog kit is referenced, its own BOM untouched', [assyNode(seg3now)?.id, assyNode(seg3now)?.children.length], [f.ASSY, 1]);
   eq('the web copy is cut from the SAME cut plate — shared, not copied', web3.children.map((k) => k.id), [f.blank]);
   eq('which now serves three parts', await parentsOfBlank(), 3);
   const [[inCut]] = await conn.query(
@@ -480,7 +479,7 @@ try {
   const [[hist]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_value_history WHERE company_id = ? AND subject_type = 'master' AND subject_id = ?", [COMPANY, web3.id]);
   const [[valsN]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL", [COMPANY, web3.id]);
   ok('every copied value left a history row', Number(hist.n) > 0 && Number(hist.n) === Number(valsN.n), `${hist.n} history, ${valsN.n} values`);
-  near('the copy weighs what the original weighs', await value(conn, seg3.id, f.spec.WT), 1403.6);
+  near('the copy weighs what the original weighs', await value(conn, seg3now.id, f.spec.WT), 1403.6);
   near('and the girder now rolls up three segments', await value(conn, f.root, f.spec.WT), 1403.6 * 2 + 1102.8);
 
   section('5b. The copy is independent of the original');
@@ -504,7 +503,7 @@ try {
   const moved = await run([{ op: 'paste', sourceLineId: web1().lineId, parentId: seg2().id }]);
   m2.stop();
   const rtWeb = m2.m;
-  eq('the part copy is coded under its new parent', moved.results[0].items.map((i) => i.code), [`${f.rootCode}-SEG02-WEB02`]);
+  eq('the part copy has no code either', moved.results[0].items.map((i) => i.code), [null]);
   t = await look(conn, f);
   const webInSeg2 = kid(seg2(), f.WEB, 1);
   eq('its grade is its new segment\'s', await value(conn, webInSeg2.id, f.spec.GRD), 'E250');
@@ -534,8 +533,8 @@ try {
     { op: 'paste', sourceLineId: seg2().lineId, parentId: kid(seg2(), f.WEB).id },
   ]));
   eq('refused', loop?.status, 422);
-  ok('into itself', some(loop?.problems, /SEG01 cannot be pasted into itself/), JSON.stringify(loop?.problems));
-  ok('into its own part', some(loop?.problems, /SEG02 cannot be pasted into .*WEB01, which is inside .*SEG02/));
+  ok('into itself', has(loop?.problems, `${pathOf(t.tree.root, seg1())} cannot be pasted into itself`), JSON.stringify(loop?.problems));
+  ok('into its own part', has(loop?.problems, `${pathOf(t.tree.root, seg2())} cannot be pasted into ${pathOf(t.tree.root, seg2(), kid(seg2(), f.WEB))}, which is inside ${pathOf(t.tree.root, seg2())}`));
 
   /* ---- 8. frozen -------------------------------------------------------- */
   section('8. A frozen order refuses, with a 409');
@@ -571,30 +570,29 @@ try {
   eq('paste there and remove here is a move', moveIt.summary.sentence, '1 line pasted, 1 line removed');
   t = await look(conn, f);
   eq('the selection now sits in segment 2 twice and segment 1 not at all', [seg2().children.filter((k) => k.selection?.id === f.SEL).length, seg1().children.filter((k) => k.selection?.id === f.SEL).length], [2, 0]);
-  const webs = [seg1(), seg2(), t.byCode.get(`${f.rootCode}-SEG03`)].flatMap((s) => s.children.filter((k) => k.children.some((g) => g.id === f.blank)));
+  const webs = [seg1(), seg2(), seg3()].flatMap((s) => s.children.filter((k) => k.children.some((g) => g.id === f.blank)));
   const allGo = await run(webs.map((w) => ({ op: 'remove', lineId: w.lineId })), { dryRun: true });
   eq('removing every part a cut plate serves, together, is allowed', [webs.length, allGo.summary.counts.removed], [4, 4]);
 
-  /* ---- 9b. range codes --------------------------------------------------- */
-  section('9b. Range codes — a same-size copy pasted BEFORE a row of the same short name');
-  const s1code = seg1().code;
+  /* ---- 9b. no row is ever coded ------------------------------------------ */
+  section('9b. No row is coded — added, pasted among others, or given a new quantity');
   await B.addLine(conn, c, seg1().id, { childId: f.STIFF, quantity: 23 });   // a row added the ordinary way
   t = await look(conn, f);
   const stiffsOf = () => seg1().children.filter((k) => designOf.get(k.lineId) === f.STIFF);
   const isOriginal = stiffsOf()[0];
-  eq('the stiffener row covers pieces 1-23 of its segment', isOriginal?.code, `${s1code}-IS1-23`);
+  eq('a row added the ordinary way has no code', isOriginal?.code, null);
   const before23 = { op: 'paste', sourceLineId: isOriginal.lineId, parentId: seg1().id, afterLineId: assyNode(seg1()).lineId };
-  const isDry = await run([before23], { dryRun: true });
-  eq('a dry run names the copy by the pieces it will take', isDry.results[0].items.map((i) => i.code), [`${s1code}-IS1-23`]);
   const isPasted = await refusal(() => run([before23]));
-  ok('the copy is saved — no CODE_CLASH with the code the original carried', isPasted === null, JSON.stringify(isPasted?.problems ?? isPasted?.message));
+  ok('a copy pasted BEFORE a row of the same short name is saved', isPasted === null, JSON.stringify(isPasted?.problems ?? isPasted?.message));
   t = await look(conn, f);
   const stiffs = stiffsOf();
-  eq('the copy comes first and takes 1-23, the original moves on to 24-46', stiffs.map((k) => k.code), [`${s1code}-IS1-23`, `${s1code}-IS24-46`]);
-  ok('in the order they are shown, the original keeping its own record', stiffs.length === 2 && stiffs[0].lineNo < stiffs[1].lineNo && stiffs[1].id === isOriginal.id);
+  ok('the copy comes first, the original keeping its own record', stiffs.length === 2 && stiffs[0].lineNo < stiffs[1].lineNo && stiffs[1].id === isOriginal.id);
+  eq('and neither has a code', stiffs.map((k) => k.code), [null, null]);
   await run([{ op: 'quantity', lineId: stiffs[0].lineId, quantity: 20 }]);
   t = await look(conn, f);
-  eq('a quantity on the first row moves the numbers of the one after it', stiffsOf().map((k) => k.code), [`${s1code}-IS1-20`, `${s1code}-IS21-43`]);
+  eq('a new quantity codes nothing either', stiffsOf().map((k) => k.code), [null, null]);
+  const everyRow = rowCodes(t.tree, f.blank);
+  ok('across the whole structure, after every change above, no row has a code', everyRow.length > 0 && everyRow.every((x) => x === null), JSON.stringify(everyRow.filter(Boolean)));
 
   /* ---- 10. round trips --------------------------------------------------- */
   section('10. Round trips for a deep copy (what TiDB, ~49 ms away, will feel)');

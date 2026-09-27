@@ -37,6 +37,8 @@ const { pool } = await imp('db.js');
 const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 const S = await imp('apps/cf_erp/services/nestingService.js');
 const SHEET = await imp('apps/cf_erp/services/nestingSheetService.js');
+const VALUES = await imp('apps/cf_erp/services/valueService.js');
+const RECORDS = await imp('apps/cf_erp/services/records.js');
 
 const COMPANY = Number(process.env.CF_NEST_COMPANY ?? 2);
 const T = 7.777;                         // a thickness nothing else in the catalog has
@@ -609,6 +611,40 @@ try {
   ok('the layout survived the round trip unchanged', JSON.stringify(sheetKeys) === JSON.stringify(savedKeys), `\n    before ${JSON.stringify(savedKeys)}\n    after  ${JSON.stringify(sheetKeys)}`);
   const [[sheetA]] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id = ?', [fixture.areaLine[fixture.A]]);
   near('and so did the plate count', Number(sheetA.quantity), 1.6 / 6, 1e-6);
+
+  /* ---- 12b. nesting comes AFTER lock ------------------------------------ */
+  // Decided 2026-09-26: lock sits after Values and cut pieces, before nesting
+  // and buying. A locked line's structure, values and cut pieces are frozen —
+  // but laying the cut pieces out on plates is material planning, not the
+  // design, so accepting a layout (it repoints a cut plate's raw-plate line and
+  // writes its real share) and holding a rectangle back by hand must keep
+  // working. The line is put in the locked state directly: this fixture is
+  // nesting's, and lockLine's own checks are lock_test's business. From here to
+  // the end of the run — the real packer included — the line stays locked.
+  section('12b. Nesting comes after lock: a locked line is still nested');
+  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW(), lock_position = 1 WHERE company_id = ? AND id = ?', [COMPANY, fixture.lineId]);
+  const lockedA = await RECORDS.loadMaster(conn, COMPANY, fixture.A);
+  eq('a cut plate of a locked line is frozen, and says why', RECORDS.frozenBy(lockedA)?.reason, 'locked');
+  let sizeErr = null;
+  try { await VALUES.setValues(conn, c, 'master', fixture.A, [{ specCode: 'LENGTH', value: 950 }]); } catch (e) { sizeErr = e; }
+  ok('its size no longer changes — refused in the locked words', sizeErr?.code === 'LOCKED' && /is locked — its structure, values and cut pieces no longer change\. A change means a new revision of the order\./.test(sizeErr?.message ?? ''), sizeErr?.message);
+  const manualOn = await VALUES.setValues(conn, c, 'master', fixture.B, [{ specCode: S.NEST_MANUAL_SPEC_CODE, value: true }]);
+  ok('but holding a rectangle back from the packer is nesting, and still works', manualOn.changes.length === 1, JSON.stringify(manualOn.changes));
+  const [[manualRow]] = await conn.query('SELECT value_bool FROM cf_spec_values WHERE company_id = ? AND subject_type = \'master\' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL', [COMPANY, fixture.B, fixture.spec.NEST_MANUAL]);
+  eq('the flag is on the cut plate', Number(manualRow?.value_bool), 1);
+  await VALUES.setValues(conn, c, 'master', fixture.B, [{ specCode: S.NEST_MANUAL_SPEC_CODE, value: false }]);
+  let mixedErr = null;
+  try { await VALUES.setValues(conn, c, 'master', fixture.B, [{ specCode: S.NEST_MANUAL_SPEC_CODE, value: true }, { specCode: 'WIDTH', value: 310 }]); } catch (e) { mixedErr = e; }
+  eq('a save that carries a design value along with it is refused whole', mixedErr?.code, 'LOCKED');
+  const lockedAccept = await S.acceptNesting(conn, c, fixture.lineId, plan2);
+  eq('a layout is accepted on the locked line: the same two plates', lockedAccept.lots, 2);
+  eq('with the same nine pieces', lockedAccept.pieces, 9);
+  ok('and the raw-plate lines carry the real share again', lockedAccept.quantities.every((q) => q.applied), JSON.stringify(lockedAccept.quantities.map((q) => q.applied)));
+  const [[lockedShare]] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id = ?', [fixture.areaLine[fixture.A]]);
+  near('the share written is the plate count, as before the lock', Number(lockedShare.quantity), 1.6 / 6, 1e-6);
+  const lockedSheet = await SHEET.exportSheet(conn, COMPANY, fixture.lineId);
+  const lockedBack = await SHEET.importSheet(conn, c, fixture.lineId, { fileBase64: lockedSheet.buffer.toString('base64') });
+  eq('and the nesting sheet comes back in on a locked line too', lockedBack.pieces, 9);
 
   /* ---- 13. the real packer --------------------------------------------- */
   // Everything above runs on the stub, because exact plate counts need a layout

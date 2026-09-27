@@ -22,7 +22,9 @@ export async function navCounts(db, companyId) {
   const [openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas] = await Promise.all([
     one(db, `SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status IN ${OPEN}`, c),
     one(db, 'SELECT COUNT(*) FROM cf_parties WHERE company_id = ? AND deleted_at IS NULL AND is_customer = 1', c),
-    one(db, "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND record_kind = 'item'", c),
+    // An order's rows live on the order, not in the catalog (user, 2026-09-26).
+    one(db, `SELECT COUNT(*) FROM cf_master_records m LEFT JOIN cf_item_details i ON i.master_id = m.id
+              WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item' AND (i.item_type IS NULL OR i.item_type <> 'temporary')`, c),
     one(db, "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND record_kind = 'definition'", c),
     one(db, "SELECT COUNT(*) FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
     one(db, "SELECT COUNT(*) FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
@@ -50,9 +52,11 @@ export async function search(db, companyId, q) {
     run(`SELECT m.id, m.code, m.name, m.record_kind, i.item_type, d.definition_type, n.name AS node FROM cf_master_records m
            LEFT JOIN cf_item_details i ON i.master_id = m.id LEFT JOIN cf_definition_details d ON d.master_id = m.id
            LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
-          WHERE m.company_id = ? AND m.deleted_at IS NULL AND (m.code LIKE ? OR m.name LIKE ?) ORDER BY m.code LIMIT 8`, [like, like]),
-    run(`SELECT o.id, o.code, o.title, o.status, p.name AS customer FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id
-          WHERE o.company_id = ? AND o.deleted_at IS NULL AND (o.code LIKE ? OR o.title LIKE ? OR p.name LIKE ?) ORDER BY o.id DESC LIMIT 6`, [like, like, like]),
+          WHERE m.company_id = ? AND m.deleted_at IS NULL AND (i.item_type IS NULL OR i.item_type <> 'temporary')
+            AND (m.code LIKE ? OR m.name LIKE ?) ORDER BY m.code LIMIT 8`, [like, like]),
+    // The latest revision of an order only: an earlier one is kept for the record, and opening it says where the latest is.
+    run(`SELECT o.id, o.code, o.title, o.status, o.revision, p.name AS customer FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id
+          WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.status <> 'revised' AND (o.code LIKE ? OR o.title LIKE ? OR p.name LIKE ?) ORDER BY o.id DESC LIMIT 6`, [like, like, like]),
     run('SELECT id, code, name, serial_number FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ? OR serial_number LIKE ?) ORDER BY code LIMIT 5', [like, like, like]),
     run('SELECT id, code, name FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
     run('SELECT id, code, name, status FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
@@ -64,7 +68,7 @@ export async function search(db, companyId, q) {
   ]);
   const kindOf = (r) => (r.record_kind === 'item' ? r.item_type : r.definition_type);
   const results = [
-    ...orders.map((o) => ({ type: 'order', id: o.id, code: o.code, name: o.title ?? o.customer ?? o.code, detail: `${o.status}${o.customer ? ` · ${o.customer}` : ''}`, route: `orders/${o.id}` })),
+    ...orders.map((o) => ({ type: 'order', id: o.id, code: o.code, name: o.title ?? o.customer ?? o.code, detail: `${o.status}${o.customer ? ` · ${o.customer}` : ''}`, route: `orders/${o.id}`, revision: Number(o.revision ?? 1) })),
     ...records.map((r) => ({
       type: r.record_kind, id: r.id, code: r.code, name: r.name, detail: [kindOf(r), r.node].filter(Boolean).join(' · '),
       route: `${r.record_kind === 'item' ? 'items' : 'definitions'}/${r.id}`,

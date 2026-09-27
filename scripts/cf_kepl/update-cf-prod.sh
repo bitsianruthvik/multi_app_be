@@ -20,12 +20,12 @@
 # customer's document — the only check here that does not compare the model to
 # itself.
 #
-# Step 8 leaves the codes in the RANGE state (user, 2026-09-26): a row of 21
-# plain stiffeners and its copied row of 3 drilled ones are IS1-21 and IS22-24,
-# and released pieces take their own number, SO-…-SPAN-01-1-G1-1-IS24. Step 7
-# already writes CFTMP-PART with {range}; step 8 writes the production-piece
-# rules, dry-runs a release of every custom line (nothing is released) and
-# rolls itself back if any piece code would repeat. It must stay AFTER step 7.
+# Step 7 takes the codes off an order's rows (user, 2026-09-26): a BOM row is a
+# design with a quantity, and its PIECES are coded when the line is locked —
+# SO-…-SPAN-01-1-G1-1-IS24. It points the top piece rule at the order number,
+# proves every existing top code comes out the same, retires the row rules
+# (CFTMP-LINE/PART/SEGMENT) and clears the codes of rows on unlocked lines. It
+# replaces the old re-code and range steps, which coded rows and now refuse to run.
 #
 # Run it from anywhere; it finds its own way:
 #
@@ -60,7 +60,7 @@ SQL=(apps/cf_erp/modules/parties/models/init.sql
      apps/cf_erp/models/init.sql
      apps/cf_erp/modules/codegen/models/init.sql)
 MJS=(cf_shop_import cf_ops_import cf_assembly_flows cf_wire_flows
-     cf_reconcile_dims cf_recode_order cf_range_rules cf_verify_against_boq)
+     cf_reconcile_dims cf_rows_no_codes cf_verify_against_boq)
 
 # Everything this needs must exist BEFORE anything touches production. A moved
 # or renamed file should stop the run at step 0, not half way through a write.
@@ -88,9 +88,8 @@ step "3. operations and flows, all 43 steps"             ; node $S/cf_ops_import
 step "4. the assembly flows"                             ; node $S/cf_assembly_flows.mjs
 step "5. say how each thing is made"                     ; node $S/cf_wire_flows.mjs
 step "6. reconcile part dimensions against the BOQ"      ; node $S/cf_reconcile_dims.mjs --fix
-step "7. re-code and re-name the order's items"          ; node $S/cf_recode_order.mjs
-step "8. range codes, and the codes released pieces take"; node $S/cf_range_rules.mjs
-step "9. verify the order against the customer's BOQ"    ; node $S/cf_verify_against_boq.mjs
+step "7. rows carry no codes — pieces are coded at lock" ; CF_COMPANY=30005 node $S/cf_rows_no_codes.mjs --commit
+step "8. verify the order against the customer's BOQ"    ; node $S/cf_verify_against_boq.mjs
 
 step "what is there now"
 mysql_run -t -e "
@@ -103,12 +102,15 @@ UNION ALL SELECT 'temporary items with no flow', COUNT(*) FROM cf_master_records
    JOIN cf_item_details i ON i.master_id=m.id AND i.item_type='temporary'
    LEFT JOIN cf_master_records sd ON sd.id=i.source_definition_id
   WHERE m.company_id=30005 AND m.deleted_at IS NULL AND m.default_flow_id IS NULL AND (sd.id IS NULL OR sd.default_flow_id IS NULL)
-UNION ALL SELECT 'temporary items with no code', COUNT(*) FROM cf_master_records m
+UNION ALL SELECT 'rows of unlocked lines that still have a code', COUNT(*) FROM cf_master_records m
    JOIN cf_item_details i ON i.master_id=m.id AND i.item_type='temporary'
-  WHERE m.company_id=30005 AND m.deleted_at IS NULL AND m.code IS NULL
-UNION ALL SELECT 'item code rules that print {range}', COUNT(DISTINCT s.id) FROM cf_code_schemes s
-   JOIN cf_code_scheme_segments g ON g.scheme_id=s.id AND g.deleted_at IS NULL AND g.token_key='range'
-  WHERE s.company_id=30005 AND s.entity_type='item' AND s.status='active' AND s.deleted_at IS NULL
+   JOIN cf_sales_order_lines l ON l.id=i.owner_order_line_id AND l.locked_at IS NULL AND l.deleted_at IS NULL
+   LEFT JOIN cf_classification_nodes cp ON cp.company_id=m.company_id AND cp.code='CUT_PLATE' AND cp.deleted_at IS NULL
+  WHERE m.company_id=30005 AND m.deleted_at IS NULL AND m.code IS NOT NULL
+    AND NOT (m.classification_id <=> cp.id) AND m.name NOT LIKE 'Cut plate%'
+UNION ALL SELECT 'item code rules still coding rows', COUNT(DISTINCT s.id) FROM cf_code_schemes s
+   JOIN cf_code_scheme_conditions k ON k.scheme_id=s.id AND k.deleted_at IS NULL AND k.token_key='kind' AND k.value LIKE '%temporary%'
+  WHERE s.company_id=30005 AND s.entity_type='item' AND s.status='active' AND s.deleted_at IS NULL AND s.code <> 'CFTMP-BLANK'
 UNION ALL SELECT 'production-piece coding rules', COUNT(*) FROM cf_code_schemes
   WHERE company_id=30005 AND entity_type='production_piece' AND status='active' AND deleted_at IS NULL
 UNION ALL SELECT 'names still ending in a number', COUNT(*) FROM cf_master_records m

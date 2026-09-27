@@ -238,7 +238,9 @@ async function buildFixture(db, c) {
   await line(topBom, 20, TASM, 1, 2);
 
   // The fixture's own coding rules: {parent.code}-{shortName}{position:00}, one
-  // per Variant; kind (1) + exact Variant (4) outweighs every rule the company has.
+  // per Variant; kind (1) + exact Variant (4) outweighs every rule the company
+  // has. They code nothing: an order's rows are designs with no code until the
+  // line is LOCKED — kept so the suite proves a rule that applies still does not.
   for (const variant of [vPart, vAsm]) {
     const scheme = await ins(
       "INSERT INTO cf_code_schemes (company_id, code, name, entity_type, target_field, seq_scope, priority, status) VALUES (?, ?, 'Order values test', 'item', 'code', 'prefix', 0, 'active')",
@@ -261,31 +263,37 @@ async function buildFixture(db, c) {
   }
 
   // An order of its own, and a custom line made the real way: the girder
-  // template becomes the order's temporary items, coded by the rules above.
+  // template is laid out as the order's rows — named, coded by nothing.
   const orderCode = `${tag}-SO`;
   const orderId = await ins("INSERT INTO cf_sales_orders (company_id, code, order_type, title, status, created_by) VALUES (?, ?, 'customer', 'Order values fixture', 'inquiry', ?)", [COMPANY, orderCode, c.userId]);
   await S.addOrderLine(db, c, orderId, { recordId: TTOP, quantity: 2 });
   const [[ol]] = await db.query('SELECT id, item_id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [COMPANY, orderId]);
 
-  const [recs] = await db.query('SELECT m.id, m.code FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE i.owner_order_line_id = ?', [ol.id]);
-  const byCode = new Map(recs.map((r) => [r.code, r.id]));
-  const root = `${orderCode}-TOP01`;
-  const at = (suffix) => {
-    const id = byCode.get(`${root}${suffix}`);
-    if (!id) throw new Error(`The fixture's structure did not come out coded as expected — no ${root}${suffix} among ${[...byCode.keys()].join(', ')}`);
-    return id;
+  // Rows have no codes, so the fixture finds each by where it sits: the
+  // girder's two segments by line number, and each segment's parts the same way.
+  const at = async (parentId, lineNo) => {
+    const [[k]] = await db.query(
+      `SELECT l.child_id FROM cf_bom_lines l JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
+        WHERE l.company_id = ? AND b.parent_id = ? AND l.line_no = ? AND l.deleted_at IS NULL`,
+      [COMPANY, parentId, lineNo],
+    );
+    if (!k) throw new Error(`The fixture's structure did not come out as expected — nothing at line ${lineNo} under record ${parentId}.`);
+    return k.child_id;
   };
+  const root = ol.item_id;
+  const asm1 = await at(root, 10);
+  const asm2 = await at(root, 20);
   const f = {
     tag, fam, vPart, vAsm, vBolt, orderId, orderCode, lineId: ol.id,
     spec: { LEN, WID, THK, WT, DENS, GRD, CLS, HOLED, MARK, PAINT, DUE, HEAT },
     opt: { E250, E350, E450, clsA, clsB },
     BOLT, TPA, TPB, TASM, TTOP,
-    root: at(''),
-    asm1: at('-AS01'), asm2: at('-AS02'),
-    a1pa1: at('-AS01-PA01'), a1pa2: at('-AS01-PA02'), a1pb: at('-AS01-PB01'),
-    a2pa1: at('-AS02-PA01'), a2pa2: at('-AS02-PA02'), a2pb: at('-AS02-PB01'),
+    root, asm1, asm2,
+    a1pa1: await at(asm1, 10), a1pa2: await at(asm1, 20), a1pb: await at(asm1, 30),
+    a2pa1: await at(asm2, 10), a2pa2: await at(asm2, 20), a2pb: await at(asm2, 30),
   };
-  if (ol.item_id !== f.root) throw new Error('The line does not sell the fixture\'s root.');
+  const [coded] = await db.query('SELECT code FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE i.owner_order_line_id = ? AND m.code IS NOT NULL', [ol.id]);
+  if (coded.length) throw new Error(`A row came out with a code (${coded.map((r) => r.code).join(', ')}) — rows are coded at lock, never before.`);
 
   // A starting point the real way: some filled, some not.
   const set = (id, entries) => V.setValues(db, c, 'master', id, entries.map(([s, value]) => ({ specCode: s.code, value })));
@@ -332,6 +340,28 @@ async function mirrorDiffers(db, lineId) {
     if (JSON.stringify(real) !== JSON.stringify(pub)) bad.push(id);
   }
   return { size: mirror.size, bad };
+}
+
+/**
+ * How a problem names a row with no code — every row of an order until its line
+ * is locked: the names down the tree from the nearest thing with a code, each
+ * with its line number ("Girder › 10 Segment › 20 Web plate").
+ */
+async function pathOf(db, id) {
+  const parts = [];
+  let cur = id;
+  for (let hops = 0; cur != null && hops < 30; hops++) {
+    const [[m]] = await db.query('SELECT code, name FROM cf_master_records WHERE id = ?', [cur]);
+    if (m.code) { parts.unshift(m.code); break; }
+    const [[l]] = await db.query(
+      `SELECT l.line_no, b.parent_id FROM cf_bom_lines l JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.child_id = ? AND l.deleted_at IS NULL ORDER BY l.line_no, l.id LIMIT 1`,
+      [COMPANY, cur],
+    );
+    parts.unshift(l ? `${l.line_no} ${m.name}` : m.name);
+    cur = l?.parent_id ?? null;
+  }
+  return parts.join(' › ');
 }
 
 /* --------------------------------------------------------------------------
@@ -430,7 +460,7 @@ try {
   eq('a fixed density shows the Family\'s value', cellOf(view, f.a1pa1, DENS)?.display, '7850 kg/m3');
   ok('and says where to change it', /Fixed at family level .*— change it there/.test(fieldOf(view, f.a1pa1, DENS, 'why') ?? ''), fieldOf(view, f.a1pa1, DENS, 'why'));
   eq('an inherited paint shows the parent\'s value', cellOf(view, f.a1pa1, PAINT)?.display, 'RAL5010');
-  ok('and names the parent it came from', (fieldOf(view, f.a1pa1, PAINT, 'why') ?? '').includes(`${f.orderCode}-TOP01-AS01`), fieldOf(view, f.a1pa1, PAINT, 'why'));
+  ok('and names the parent it came from — by name: a row has no code until lock', (fieldOf(view, f.a1pa1, PAINT, 'why') ?? '').includes('Segment'), fieldOf(view, f.a1pa1, PAINT, 'why'));
   eq('a defaulted class starts empty but shows its default', [cellOf(view, f.a1pa1, CLS)?.input ?? '', cellOf(view, f.a1pa1, CLS)?.defaultDisplay], ['', 'A']);
   eq('and is editable, to override it', [fieldOf(view, f.a1pa1, CLS, 'rule'), colOf(view, f.a1pa1, CLS)?.editable], ['defaulted', true]);
   eq('a roll-up waits while a part has no size', cellOf(view, f.asm1, WT)?.display ?? null, null);
@@ -443,7 +473,7 @@ try {
   const bolt = rowOf(view, f.BOLT)?.r;
   ok('the shared bolt is read-only, in the structure tree\'s own words', /is not this order’s own work, so its values belong to the record itself/.test(bolt?.readOnly ?? ''), bolt?.readOnly);
   eq('and its column is not editable here', colOf(view, f.BOLT, WT)?.editable, false);
-  eq('a row names its parent, so two parts of one name can be told apart', rowOf(view, f.a2pa1)?.r.parent?.code, `${f.orderCode}-TOP01-AS02`);
+  eq('a row names its parent (the screen shows that parent\'s placeholder), so two parts of one name can be told apart', rowOf(view, f.a2pa1)?.r.parent?.id, f.asm2);
   eq('the view is editable while the order is open', view.editable, true);
 
   section('4. Read-only rules are refused on write — and nothing is written');
@@ -462,10 +492,11 @@ try {
   eq('listing five problems at once', ro?.problems?.length, 5);
   ok('a calculated value cannot be typed in', (ro?.problems ?? []).some((p) => p.includes(`${WT.code}: is calculated`)), ro?.problems?.join(' | '));
   ok('a fixed one says where to change it', (ro?.problems ?? []).some((p) => p.includes(`${DENS.code}: is fixed at family level`)));
-  ok('a roll-up cannot be typed in', (ro?.problems ?? []).some((p) => p.startsWith(`${f.orderCode}-TOP01-AS01 · ${WT.code}: is a roll-up`)));
+  const asm1Path = await pathOf(conn, f.asm1);
+  ok('a roll-up cannot be typed in — the row named by where it sits (it has no code until lock)', (ro?.problems ?? []).some((p) => p.startsWith(`${asm1Path} · ${WT.code}: is a roll-up`)), ro?.problems?.join(' | '));
   ok('an inherited one cannot be typed in', (ro?.problems ?? []).some((p) => p.includes(`${PAINT.code}: is inherited`)));
   ok('a batch-captured one is recorded on each batch', (ro?.problems ?? []).some((p) => p.includes(`${HEAT.code}: is recorded on each batch`)));
-  ok('every problem names its row', (ro?.problems ?? []).every((p) => p.startsWith(`${f.orderCode}-TOP01-AS01`)));
+  ok('every problem names its row, down from the girder', (ro?.problems ?? []).every((p) => p.startsWith(asm1Path)));
   eq('detail.cells carries the same, by record and spec', ro?.detail?.cells?.length, 5);
   says(ro?.problems?.[0]);
   eq('nothing was written — not even the good length', diff(countsBeforeRO, await counts(conn)), []);
@@ -492,13 +523,16 @@ try {
   says(bad?.message);
   for (const p of bad?.problems ?? []) says(p);
   const has = (re) => (bad?.problems ?? []).some((p) => re.test(p));
-  ok('a word where a number goes', has(new RegExp(`-AS01-PB01 · ${WID.code}: needs a number`)));
-  ok('an option that does not exist', has(new RegExp(`-AS01-PB01 · ${GRD.code}: "E999" is not an option`)));
-  ok('an option this part may not take', has(new RegExp(`-AS02-PA01 · ${GRD.code}: E450 is not allowed`)));
-  ok('a specification that does not apply', has(/-AS02-PA01 · NO_SUCH_SPEC: is not part of this item’s setup/));
-  ok('a yes/no that is neither', has(new RegExp(`-AS02-PA01 · ${HOLED.code}: is yes or no`)));
-  ok('a date that is not a date', has(new RegExp(`-AS01 · ${DUE.code}: needs a date`)));
-  ok('the same cell given twice', has(new RegExp(`-AS02-PA02 · ${LEN.code}: is given twice`)));
+  const starts = (text) => (bad?.problems ?? []).some((p) => p.startsWith(text));
+  const [a1pbPath, a2pa1Path, a2pa2Path] = [await pathOf(conn, f.a1pb), await pathOf(conn, f.a2pa1), await pathOf(conn, f.a2pa2)];
+  ok('a word where a number goes', starts(`${a1pbPath} · ${WID.code}: needs a number`));
+  ok('an option that does not exist', starts(`${a1pbPath} · ${GRD.code}: "E999" is not an option`));
+  ok('an option this part may not take', starts(`${a2pa1Path} · ${GRD.code}: E450 is not allowed`));
+  ok('a specification that does not apply', starts(`${a2pa1Path} · NO_SUCH_SPEC: is not part of this item’s setup`));
+  ok('a yes/no that is neither', starts(`${a2pa1Path} · ${HOLED.code}: is yes or no`));
+  ok('a date that is not a date', starts(`${asm1Path} · ${DUE.code}: needs a date`));
+  ok('the same cell given twice', starts(`${a2pa2Path} · ${LEN.code}: is given twice`));
+  ok('the two segments\' parts are told apart by their segment', a1pbPath !== a2pa1Path && a2pa1Path.split(' › ')[1] !== a1pbPath.split(' › ')[1]);
   ok('a record that is not part of this structure', has(new RegExp(`Record #${f.TPA} is not part of line`)));
   eq('and nothing was written, not even the good values', diff(countsBeforeBad, await counts(conn)), []);
   eq('the stiffener still has no length', await stored(conn, f.a1pb, LEN), null);

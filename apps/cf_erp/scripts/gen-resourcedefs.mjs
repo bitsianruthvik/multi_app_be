@@ -200,7 +200,9 @@ const core = {
     table: 'cf_sales_orders', alias: 'csor',
     cols: [['code', 'string'], ['order_type', 'string'], ['title', 'string'], ['customer_id', 'integer'], ['customer_reference', 'string'],
            ['status', 'string'], ['received_on', 'date'], ['committed_date', 'date'], ['confirmed_at', 'datetime'],
-           ['delivery_address', 'text'], ['notes', 'text']],
+           ['delivery_address', 'text'], ['notes', 'text'],
+           // Revisions (init.sql §27): the same code, revision + 1, pointing at the row it replaced.
+           ['revision', 'integer'], ['revision_of_id', 'integer'], ['revised_at', 'datetime'], ['status_before_revised', 'string']],
     relations: {
       customer: { table: 'cf_parties', alias: 'cpt_o', on: 'csor.customer_id = cpt_o.id',
         fields: [['customerCode', 'code', 'string'], ['customerName', 'name', 'string']] },
@@ -210,12 +212,25 @@ const core = {
     table: 'cf_sales_order_lines', alias: 'csol',
     cols: [['order_id', 'integer'], ['line_no', 'integer'], ['line_type', 'string'], ['item_id', 'integer'], ['design_id', 'integer'],
            ['position', 'integer'], ['quantity', 'decimal'], ['committed_date', 'date'], ['bom_revision', 'string'],
-           ['description', 'string'], ['notes', 'text']],
+           ['description', 'string'], ['notes', 'text'], ['locked_at', 'datetime'], ['lock_position', 'integer'],
+           ['revises_line_id', 'integer']],
     relations: {
       order: { table: 'cf_sales_orders', alias: 'csor_l', on: 'csol.order_id = csor_l.id',
         fields: [['orderCode', 'code', 'string'], ['orderStatus', 'status', 'string']] },
       item: { table: 'cf_master_records', alias: 'cmr_ol', on: 'csol.item_id = cmr_ol.id',
         fields: [['itemCode', 'code', 'string'], ['itemName', 'name', 'string']] },
+    },
+  }),
+  // What a locked line rolled out into — written whole by lockService, never
+  // through the generic path; release reads each code back by path_key.
+  cfErpOrderPiece: resource({
+    table: 'cf_order_pieces', alias: 'copc',
+    cols: [['order_id', 'integer'], ['order_line_id', 'integer'], ['parent_id', 'integer'], ['item_id', 'integer'], ['bom_line_id', 'integer'],
+           ['piece_no', 'integer'], ['piece_seq', 'string'], ['quantity', 'decimal'], ['code', 'string'], ['rule_code', 'string'],
+           ['path_key', 'string'], ['depth', 'integer'], ['sort_order', 'integer']],
+    relations: {
+      item: { table: 'cf_master_records', alias: 'cmr_op', on: 'copc.item_id = cmr_op.id', fields: [['itemCode', 'code', 'string'], ['itemName', 'name', 'string']] },
+      line: { table: 'cf_sales_order_lines', alias: 'csol_op', on: 'copc.order_line_id = csol_op.id', fields: [['lineNo', 'line_no', 'integer']] },
     },
   }),
 

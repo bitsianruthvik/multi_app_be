@@ -40,6 +40,15 @@ const SEQ_MARK = '\u0000#\u0000'; // NULs cannot occur in a rendered code
  */
 export const BLANK = Object.freeze({ blank: true, toString: () => '' });
 
+/**
+ * A token a provider answers with HOLE is a number that does not exist yet:
+ * it prints as # and is never "missing". A BOM row is a design with a
+ * quantity, not a piece, so its code is shown with holes where the roll-out
+ * will put each piece's number — SO-0001-SPAN-01-#-G1-1-IS# (user,
+ * 2026-09-26). Never formatted: # is not a number to pad.
+ */
+export const HOLE = Object.freeze({ hole: true, toString: () => '#' });
+
 export function registerEntity(entityType, provider) {
   if (registry.has(entityType)) throw new Error(`[codegen] entity type "${entityType}" registered twice`);
   registry.set(entityType, provider);
@@ -344,6 +353,7 @@ export async function renderSegments(db, companyId, scheme, segments, context, {
       case 'token': {
         const raw = context.get(seg.token_key);
         if (raw === BLANK) break;   // empty on purpose: prints nothing, and is not missing
+        if (raw === HOLE) { text += '#'; break; }   // a number the roll-out will fill
         if (raw === null || raw === undefined || raw === '') {
           if (seg.is_required) missing.push(seg.token_key);
           break;

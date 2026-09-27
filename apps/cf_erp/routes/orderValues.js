@@ -28,6 +28,7 @@ import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { readLineValues, writeLineValues } from '../services/orderValuesService.js';
+import { withCutPieces } from '../services/cutPlateService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -42,7 +43,14 @@ const requireAny = (tags) => (req, res, next) => {
 };
 
 router.get('/order-lines/:id/values', guard(PERM.ordersView), handle((req) => readLineValues(pool, ctx(req).companyId, id(req))));
+// Saved values are followed by the line's cut pieces: made as soon as the
+// required values are complete, and made again when they change (user,
+// 2026-09-26) — cutPlateService.refreshCutPieces, which never fails the save.
 router.put('/order-lines/:id/values', protect, requireAny(VALUES_WRITE_PERMS),
-  handle((req) => withTransaction((db) => writeLineValues(db, ctx(req), id(req), req.body ?? {}))));
+  handle((req) => withTransaction(async (db) => {
+    const c = ctx(req);
+    const out = await writeLineValues(db, c, id(req), req.body ?? {});
+    return out.applied ? withCutPieces(db, c, id(req), out) : out;
+  })));
 
 export default router;

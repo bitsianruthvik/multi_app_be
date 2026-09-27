@@ -17,6 +17,8 @@ import purchaseRoutes from './purchase.js';
 import processRoutes from './process.js';
 import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
+import lockRoutes from './lock.js';
+import placeholderRoutes from './placeholders.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -89,5 +91,7 @@ router.use(purchaseRoutes);
 router.use(processRoutes);
 router.use(drawingRoutes);
 router.use(orderValuesRoutes);
+router.use(lockRoutes);
+router.use(placeholderRoutes);
 
 export default router;

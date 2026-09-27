@@ -3,8 +3,8 @@
  * got to (models/init.sql §18).
  *
  * A PROCESS is an ordered list of STAGES. A stage KIND is code — a screen
- * somebody wrote — so the seven kinds live in STAGE_CATALOGUE below and no
- * amount of configuration conjures an eighth. What varies is data: which
+ * somebody wrote — so the kinds live in STAGE_CATALOGUE below and no
+ * amount of configuration conjures another. What varies is data: which
  * stages a customer gets, in what order, whether each is required, and
  * whether a particular line needs it at all.
  *
@@ -48,7 +48,8 @@
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { explode } from './bomService.js';
 import { layoutDriftOfLines, driftSentence } from './nestingService.js';
-import { availability } from './releaseService.js';
+import { availability, madeRule } from './rollOutService.js';
+import { cutPieceGaps } from './lockService.js';
 
 export const PROCESS_STATUSES = ['draft', 'active', 'obsolete'];
 export const STAGE_REQUIREMENTS = ['required', 'optional'];
@@ -57,7 +58,7 @@ export const STAGE_STATES = ['todo', 'partial', 'done', 'not_applicable'];
 
 /**
  * The specification a material answers to say it must be nested. A code, not
- * an id: the seven kinds are code, and so is the one question a kind asks of
+ * an id: the kinds are code, and so is the one question a kind asks of
  * the catalogue. A company that has never created it simply never sees the
  * nesting stage apply.
  */
@@ -210,7 +211,7 @@ export const STAGE_CATALOGUE = [
   {
     key: 'cut_pieces',
     label: 'Cut pieces',
-    description: 'Pooling the parts into the cut pieces they come off a plate as.',
+    description: 'The rectangles the plate parts are cut as — made automatically as soon as the values are complete.',
     /*
      * WHY THIS IS ITS OWN STAGE AND NOT PART OF NESTING.
      *
@@ -219,31 +220,83 @@ export const STAGE_CATALOGUE = [
      * that opening it changes nothing — a look is a look — so the write cannot
      * live behind it.
      *
-     * It is also a step somebody re-runs. Parts pool by (thickness, length,
-     * width, grade), so editing the structure changes which rectangles exist,
-     * and the shop needs to see that happen rather than have it slipped in.
+     * Parts pool by (thickness, length, width, grade), so the rectangles follow
+     * the values: they are made as soon as the line's required values are
+     * complete, and again when those change, until the line is locked. So the
+     * stage waits on the values, and says so.
      *
-     * It applies wherever nesting does: if a material says it is cut to size,
-     * the blanks have to exist before anything can be laid out.
+     * It applies where the line has plate parts (what cutPlateService pools),
+     * or where a material says it is cut to size.
      */
-    applies: (ctx) => ctx.nesting.items.length > 0,
+    applies: (ctx) => ctx.cut.parts.length > 0 || ctx.nesting.items.length > 0,
     state(ctx) {
       const made = ctx.nesting.cutPieces ?? 0;
-      if (made > 0) {
+      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
+      if (made > 0 && !bare.length) {
+        return { state: 'done', detail: `${n(made, 'cut piece')} pooled from the line's plate parts`, blockers: [] };
+      }
+      const missing = ctx.values.missing.length;
+      if (missing) {
         return {
-          state: 'done',
-          detail: `${n(made, 'cut piece')} pooled from the line's plate parts`,
-          blockers: [],
+          state: 'todo',
+          detail: `Waiting for the values — ${n(missing, 'required value')} still empty. Cut pieces are made automatically as soon as they are complete`,
+          blockers: [{
+            count: missing,
+            message: `Line ${ctx.line.line_no}'s cut pieces wait for its values: ${n(missing, 'required value')} ${missing === 1 ? 'is' : 'are'} still empty. They are made automatically as soon as the values are complete.`,
+          }],
         };
       }
-      const items = ctx.nesting.items;
+      const which = bare.length ? bare : ctx.cut.parts;
       return {
-        state: 'todo',
-        detail: `${n(items.length, 'material')} to cut — no cut pieces derived yet`,
+        state: made > 0 ? 'partial' : 'todo',
+        detail: which.length
+          ? `${n(which.length, 'plate part')} without a cut piece — ${nameList([...new Set(which.map(nameOf))])}`
+          : `${n(ctx.nesting.items.length, 'material')} to cut — no cut pieces yet`,
         blockers: [{
-          count: items.length,
-          message: `Line ${ctx.line.line_no} has parts that are cut from plate, but nothing has been pooled into cut pieces yet. Derive them, and nesting has something to lay out.`,
+          count: which.length || ctx.nesting.items.length,
+          message: `Line ${ctx.line.line_no} has parts cut from plate with no cut piece yet. Cut pieces are made automatically once the values are complete — if they have not appeared, open this stage to see why.`,
         }],
+      };
+    },
+  },
+  {
+    key: 'lock',
+    label: 'Lock',
+    description: 'Rolls the structure out into pieces, each with its own code. From then on the structure, values and cut pieces no longer change — a change means a new revision.',
+    /** Only a line built from a template has a structure of its own to roll out. */
+    applies: (ctx) => ctx.line.line_type === 'custom',
+    state(ctx) {
+      if (ctx.lock.lockedAt) return { state: 'done', detail: `Locked — ${n(ctx.lock.pieces, 'piece')}`, blockers: [] };
+      const L = ctx.line.line_no;
+      const blockers = [];
+      const missing = ctx.values.missing;
+      if (missing.length) {
+        const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
+        blockers.push({
+          count: missing.length,
+          message: `Line ${L} cannot be locked while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
+        });
+      }
+      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
+      if (bare.length) {
+        blockers.push({
+          count: bare.length,
+          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
+        });
+      }
+      if (ctx.unresolved.length) {
+        blockers.push({
+          count: ctx.unresolved.length,
+          message: `${n(ctx.unresolved.length, 'row')} under line ${L} still need an item chosen before it can be locked — ${nameList(ctx.unresolved.map(nameOf), 3)}.`,
+        });
+      }
+      return {
+        // Waiting on something is untouched; with nothing in the way, only the act is left.
+        state: blockers.length ? 'todo' : 'partial',
+        detail: blockers.length
+          ? `Not locked — ${n(blockers.length, 'thing')} to settle first`
+          : 'Ready to lock — each piece gets its code when the line is locked',
+        blockers,
       };
     },
   },
@@ -370,7 +423,9 @@ export const STAGE_CATALOGUE = [
     always: true,
     applies: () => true,
     state(ctx) {
-      const status = ctx.order.status;
+      // A revised order (init.sql §27) is kept as it was, so it answers as it
+      // stood when a later revision replaced it.
+      const status = ctx.order.status === 'revised' ? ctx.order.status_before_revised ?? ctx.order.status : ctx.order.status;
       // Confirmation is one act on the whole order, so every line reports the
       // same answer. That is not a defect: a line cannot be half-committed.
       if (['confirmed', 'closed'].includes(status)) return { state: 'done', detail: `Order is ${status}`, blockers: [] };
@@ -563,7 +618,7 @@ export async function setProcessStatus(db, c, id, status) {
     // it is what the person is about to want to know.
     const [[{ n: running }]] = await db.query(
       `SELECT COUNT(*) AS n FROM cf_sales_orders
-        WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND status NOT IN ('closed','lost','cancelled')`,
+        WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND status NOT IN ('closed','lost','cancelled','revised')`,
       [c.companyId, id],
     );
     if (Number(running)) {
@@ -1115,6 +1170,29 @@ async function loadOrderContext(db, companyId, order, lines) {
     lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
   }]));
 
+  // 5e. What each locked line was rolled out into (cf_order_pieces): how many
+  //     pieces, and which BOM lines it made — a 'both' item follows the lock's
+  //     decision, not today's stock (rollOutService.madeRule).
+  const lockedLines = lines.filter((l) => l.locked_at).map((l) => l.id);
+  const [pieceRows] = lockedLines.length ? await db.query(
+    `SELECT order_line_id, bom_line_id, COUNT(*) AS n FROM cf_order_pieces
+      WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL
+      GROUP BY order_line_id, bom_line_id`,
+    [companyId, lockedLines],
+  ) : [[]];
+  const locksBy = new Map(lockedLines.map((id) => [id, { pieces: 0, bomLines: new Set() }]));
+  for (const r of pieceRows) {
+    const e = locksBy.get(r.order_line_id);
+    e.pieces += Number(r.n);
+    if (r.bom_line_id != null) e.bomLines.add(Number(r.bom_line_id));
+  }
+
+  // 5f. The plate parts under every line and whether each has its cut piece —
+  //     lockService's question, so the stages and the Lock screen agree.
+  const temporaryIds = [...itemIds].filter((id) => detail.get(id)?.item_type === 'temporary');
+  const cut = await cutPieceGaps(db, companyId, temporaryIds);
+  const partById = new Map(cut.parts.map((p) => [p.id, p]));
+
   // 5d. What a saved layout no longer matches — nestingService.layoutDrift, the
   //     rule the Nesting screen shows, counted off the trees exploded in step 1.
   //     A piece count changed after nesting (a quantity, a removed part, the
@@ -1138,7 +1216,7 @@ async function loadOrderContext(db, companyId, order, lines) {
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null };
+  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById };
 }
 
 /**
@@ -1160,8 +1238,15 @@ function splitLine(ctx, order, line) {
   const material = new Map();
   const unresolved = [];
   const drafts = [];
-  const seenFree = new Map();
   if (!tree) return { made, material: [], unresolved, drafts };
+  // The one made rule (rollOutService.madeRule). A locked line follows the
+  // decisions its lock took; any other line asks today's free stock.
+  const decide = madeRule({
+    orderType: order.order_type,
+    sourcingOf: (node) => (node.kind === 'catalog' ? (ctx.detail.get(node.id)?.sourcing ?? 'stock') : null),
+    free: new Map([...ctx.free].map(([id, v]) => [id, v.free])),
+    lockedBoth: ctx.locksBy.get(line.id)?.bomLines ?? null,
+  });
 
   const consider = (node, count) => {
     if (node.kind === 'selection' || node.kind === 'template') {
@@ -1169,20 +1254,11 @@ function splitLine(ctx, order, line) {
       if (node.kind === 'selection') unresolved.push(node);
       return;
     }
-    // The root counts too: a temporary item is born draft and release refuses
-    // one, so "activate it" is part of finishing the structure, not an aside.
-    if (node.status === 'draft') drafts.push(node);
-    const d = ctx.detail.get(node.id);
-    const sourcing = node.kind === 'catalog' ? (d?.sourcing ?? 'stock') : null;
-    let isMade;
-    if (node.kind === 'temporary') isMade = true;
-    else if (node === tree.root && order.order_type === 'stock') isMade = !!node.flow;
-    else if (sourcing === 'make') isMade = true;
-    else if (sourcing === 'both' && node.flow) {
-      const left = seenFree.has(node.id) ? seenFree.get(node.id) : (ctx.free.get(node.id)?.free ?? 0);
-      isMade = left + EPS < count;
-      if (!isMade) seenFree.set(node.id, round6(left - count));
-    } else isMade = false;
+    // A catalog item still in draft is unfinished setup. A row of the line (a
+    // temporary item) is not: it has no draft life of its own — locking the
+    // line is what activates it — so it is never counted here.
+    if (node.status === 'draft' && node.kind !== 'temporary') drafts.push(node);
+    const isMade = decide(node, count, node === tree.root).made;
 
     if (isMade) {
       made.push(node);
@@ -1252,6 +1328,9 @@ function lineContext(ctx, order, line) {
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
+    lock: { lockedAt: line.locked_at ?? null, pieces: ctx.locksBy.get(line.id)?.pieces ?? 0 },
+    // This line's plate parts, each once, and whether each has its cut piece.
+    cut: { parts: [...new Set(split.made.map((x) => x.id))].map((id) => ctx.partById.get(id)).filter(Boolean) },
   };
 }
 
@@ -1312,7 +1391,8 @@ function notApplicableDetail(key, ctx) {
   switch (key) {
     case 'structure': return 'Sells a catalog item with no BOM — there is nothing under it';
     case 'values': return 'Nothing under this line has a required value to capture';
-    case 'cut_pieces':
+    case 'lock': return 'Sells a catalog item as it is — only a line built from a template has a structure to lock';
+    case 'cut_pieces': return 'No part of this line is cut from plate';
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.
@@ -1433,7 +1513,9 @@ export async function orderProcess(db, companyId, orderId) {
   } else {
     // Not stamped: say what it WOULD get, so the screen can offer to fix it.
     const match = await resolveProcess(db, companyId, { customerId: order.customer_id, orderType: order.order_type });
-    reason = order.status === 'inquiry' || order.status === 'draft'
+    // A revised order answers as it stood when a later revision replaced it (init.sql §27).
+    const was = order.status === 'revised' ? order.status_before_revised ?? order.status : order.status;
+    reason = was === 'inquiry' || was === 'draft'
       ? `This order has no process. ${match.reason}`
       : `This order was created before it had a process. ${match.reason}`;
   }

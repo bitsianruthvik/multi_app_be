@@ -14,9 +14,14 @@
  * template (instantiationService). Lines and their structures may change while
  * the order is open; release to production — and change control after it —
  * arrive in later phases.
+ *
+ * REVISIONS (init.sql §27, revisionService). A change after LOCK is a new
+ * revision of the same order: another row with the same number and revision
+ * + 1. The row it replaced is 'revised' — kept as it was, frozen like a closed
+ * order — and lists show the latest revision only unless asked for all.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
-import { requireMaster, kindOf, LOCKED_ORDER_STATUSES as LOCKED } from './records.js';
+import { requireMaster, kindOf, LOCKED_ORDER_STATUSES as LOCKED, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { bomOfParent } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
 import { instantiateTemplate, deleteTemporaryTree, checkTemplate, temporaryTree } from './instantiationService.js';
@@ -80,26 +85,37 @@ async function requireCustomer(db, companyId, id, problems) {
 
 async function requireOrder(db, companyId, id, { lock = false } = {}) {
   const [[o]] = await db.query(
-    `SELECT * FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
+    `SELECT o.*, ${latestRevisionSql('o')} AS latest_revision
+       FROM cf_sales_orders o WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
     [companyId, id],
   );
   if (!o) throw notFound('Sales order');
   return o;
 }
 
+/** The sentence a revised order is refused with — naming the revision to change instead. */
+const revisedWords = (o) => revisedOrderMessage(o.code, o.revision, o.latest_revision);
+
 function assertOpen(order) {
+  if (order.status === 'revised') throw invalid('ORDER_LOCKED', revisedWords(order));
   if (LOCKED.has(order.status)) throw invalid('ORDER_LOCKED', `Order ${order.code} is ${order.status} — reopen it before changing it.`);
 }
 
 // --- orders --------------------------------------------------------------------
 
+/**
+ * The orders, newest first. Only the LATEST revision of each by default: an
+ * earlier one was replaced and is kept for the record (init.sql §27).
+ * `revisions=all` lists them too, and so does asking for status=revised.
+ */
 export async function listOrders(db, companyId, q = {}) {
   const where = ['o.company_id = ?', 'o.deleted_at IS NULL'];
   const params = [companyId];
+  if (q.revisions !== 'all' && q.status !== 'revised') where.push("o.status <> 'revised'");
   if (!blank(q.status)) { where.push('o.status = ?'); params.push(q.status); }
   if (!blank(q.orderType)) { where.push('o.order_type = ?'); params.push(q.orderType); }
   if (!blank(q.customerId)) { where.push('o.customer_id = ?'); params.push(Number(q.customerId)); }
-  if (q.open === '1' || q.open === 1 || q.open === true) where.push("o.status NOT IN ('closed','lost','cancelled')");
+  if (q.open === '1' || q.open === 1 || q.open === true) where.push("o.status NOT IN ('closed','lost','cancelled','revised')");
   if (!blank(q.search)) {
     const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
     where.push('(o.code LIKE ? OR o.title LIKE ? OR o.customer_reference LIKE ? OR p.name LIKE ?)');
@@ -134,26 +150,35 @@ function shapeOrder(o) {
     confirmedAt: o.confirmed_at,
     deliveryAddress: o.delivery_address,
     notes: o.notes,
+    // Revisions (init.sql §27): the same number across them, this one's place.
+    revision: Number(o.revision ?? 1),
+    revisionOfId: o.revision_of_id ?? null,
+    revisedAt: o.revised_at ?? null,
+    statusBeforeRevised: o.status_before_revised ?? null,
     lineCount: o.line_count == null ? undefined : Number(o.line_count),
-    overdue: !!committed && committed < today() && !['closed', 'lost', 'cancelled'].includes(o.status),
+    overdue: !!committed && committed < today() && !LOCKED.has(o.status),
     allowedTransitions: TRANSITIONS[o.order_type]?.[o.status] ?? [],
     createdAt: o.created_at,
     updatedAt: o.updated_at,
   };
 }
 
-/** Per custom line: how many temporary items, how many still draft, how many selections unchosen. */
+/**
+ * Per custom line: how many rows its structure has (its temporary items, cut
+ * plates included) and how many selections are unchosen. No draft count: a row
+ * has no draft life of its own — locking the line activates it (lockService).
+ */
 async function structureStats(db, companyId, lineIds) {
-  const out = new Map(lineIds.map((id) => [id, { temporaryItems: 0, drafts: 0, unresolvedSelections: 0 }]));
+  const out = new Map(lineIds.map((id) => [id, { temporaryItems: 0, unresolvedSelections: 0 }]));
   if (!lineIds.length) return out;
   const [items] = await db.query(
-    `SELECT i.owner_order_line_id AS line_id, COUNT(*) AS n, SUM(m.status = 'draft') AS drafts
+    `SELECT i.owner_order_line_id AS line_id, COUNT(*) AS n
        FROM cf_item_details i JOIN cf_master_records m ON m.id = i.master_id AND m.deleted_at IS NULL
       WHERE i.company_id = ? AND i.owner_order_line_id IN (?) AND i.deleted_at IS NULL
       GROUP BY i.owner_order_line_id`,
     [companyId, lineIds],
   );
-  for (const r of items) Object.assign(out.get(r.line_id), { temporaryItems: Number(r.n), drafts: Number(r.drafts) });
+  for (const r of items) out.get(r.line_id).temporaryItems = Number(r.n);
   const [sel] = await db.query(
     `SELECT pi.owner_order_line_id AS line_id, COUNT(*) AS n
        FROM cf_bom_lines l
@@ -175,6 +200,12 @@ export async function getOrder(db, companyId, id) {
     ? await db.query('SELECT code, name FROM cf_parties WHERE id = ?', [o.customer_id])
     : [[null]];
   const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
+  // Every revision of this order, oldest first — one index lookup on the number.
+  const [revs] = await db.query(
+    'SELECT id, revision, status, revised_at FROM cf_sales_orders WHERE company_id = ? AND code_active = ? ORDER BY revision',
+    [companyId, String(o.code).toLowerCase()],
+  );
+  order.revisions = revs.map((r) => ({ id: r.id, revision: Number(r.revision), status: r.status, revisedAt: r.revised_at ?? null }));
   const [lines] = await db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, m.status AS item_status, m.revision AS item_revision,
             i.item_type, i.uom, dz.code AS design_code, dz.name AS design_name,
@@ -209,6 +240,11 @@ export async function getOrder(db, companyId, id) {
     bom: l.bom_status ? { status: l.bom_status, currentRevision: l.current_bom_revision } : null,
     structure: stats.get(l.id) ?? null,
     release: l.release_id ? { id: l.release_id, releasedAt: l.released_at } : null,
+    // Locked (lockService): its pieces carry their codes, and its structure,
+    // values and cut pieces no longer change. `position` is its line.position.
+    lock: l.locked_at ? { lockedAt: l.locked_at, position: l.lock_position } : null,
+    // The line of the previous revision this one was copied from (init.sql §27).
+    revisesLineId: l.revises_line_id ?? null,
   }));
   return order;
 }
@@ -278,7 +314,8 @@ export async function updateOrder(db, c, id, input = {}) {
     const code = String(input.code ?? '').trim();
     if (code !== o.code) {
       const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ?', [c.companyId, id]);
-      if (Number(n)) problems.push('The order number is fixed once the order has lines — item codes are built from it.');
+      if (Number(o.revision) > 1) problems.push(`A revision keeps its order's number — this is rev ${o.revision} of ${o.code}.`);
+      else if (Number(n)) problems.push('The order number is fixed once the order has lines — item codes are built from it.');
       else if (!code || !CODE_RE.test(code) || code.length > 100) problems.push('Order number: up to 100 letters, digits and - _ . /, no spaces.');
       sets.code = code;
     }
@@ -311,6 +348,8 @@ export async function updateOrder(db, c, id, input = {}) {
 export async function setOrderStatus(db, c, id, status) {
   const o = await requireOrder(db, c.companyId, id, { lock: true });
   if (o.status === status) return getOrder(db, c.companyId, id);
+  // 'revised' is set by revising and cleared by discarding the revision — never by hand.
+  if (o.status === 'revised') throw invalid('ORDER_LOCKED', revisedWords(o));
   const allowed = TRANSITIONS[o.order_type]?.[o.status] ?? [];
   if (!allowed.includes(status)) throw invalid('BAD_TRANSITION', `A ${o.status} ${o.order_type} order cannot become ${status}.`);
   const wasLocked = LOCKED.has(o.status);
@@ -374,6 +413,11 @@ async function refreshOrderValues(db, c, orderId) {
 
 export async function deleteOrder(db, c, id) {
   const o = await requireOrder(db, c.companyId, id, { lock: true });
+  if (o.status === 'revised') throw conflict('ORDER_ACTIVE', revisedWords(o));
+  // Deleting a revision would leave the one it replaced frozen with nothing after it.
+  if (Number(o.revision) > 1) {
+    throw conflict('ORDER_ACTIVE', `${o.code} rev ${o.revision} is a revision — discard the revision instead, which gives rev ${Number(o.revision) - 1} back as it was.`);
+  }
   if (!DELETABLE.has(o.status)) {
     throw conflict('ORDER_ACTIVE', `A ${o.status} order cannot be deleted — cancel it instead, so its history stays.`);
   }
@@ -420,7 +464,7 @@ export async function addOrderLine(db, c, orderId, input = {}) {
   if (!['catalog', 'template'].includes(kind)) {
     throw invalid('WRONG_RECORD', kind === 'selection'
       ? 'A line sells an item: choose the catalog item itself, or a template definition.'
-      : 'A temporary item already belongs to an order line.');
+      : 'That is a row of another order line’s structure — add the template it was made from.');
   }
   if (o.order_type === 'stock' && kind !== 'catalog') throw invalid('STOCK_STANDARD_ONLY', 'A stock order makes standard products — choose a catalog item.');
   if (kind === 'template') await checkTemplate(db, c.companyId, rec);
@@ -465,6 +509,10 @@ export async function updateOrderLine(db, c, lineId, input = {}) {
   if (input.quantity !== undefined && Number(input.quantity) !== Number(line.quantity) && await releaseOfLine(db, c.companyId, lineId)) {
     throw invalid('RELEASED', `Line ${line.line_no} is released to production — its quantity is fixed. Take the release back (while nothing has started) to change it.`);
   }
+  // The quantity is what a locked line was rolled out from: its pieces exist.
+  if (input.quantity !== undefined && Number(input.quantity) !== Number(line.quantity) && line.locked_at) {
+    throw invalid('LOCKED', lockedLineMessage(line.line_no, o.code));
+  }
   const problems = [];
   const sets = {};
   if (input.quantity !== undefined) {
@@ -491,6 +539,10 @@ export async function updateOrderLine(db, c, lineId, input = {}) {
 async function removeLineRows(db, c, lineId) {
   const line = await requireOrderLine(db, c.companyId, lineId);
   if (line.line_type === 'custom' && line.item_id) await deleteTemporaryTree(db, c, line.item_id);
+  // A deleted order takes its locked pieces with it, so their codes are free again.
+  if (line.locked_at) {
+    await db.query('UPDATE cf_order_pieces SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [c.companyId, lineId]);
+  }
   await db.query('UPDATE cf_sales_order_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, lineId]);
   return line;
 }
@@ -503,6 +555,7 @@ export async function removeOrderLine(db, c, lineId) {
   if (await releaseOfLine(db, c.companyId, lineId)) {
     throw invalid('RELEASED', `Line ${line.line_no} is released to production — take the release back (while nothing has started) before removing it.`);
   }
+  if (line.locked_at) throw invalid('LOCKED', lockedLineMessage(line.line_no, o.code));
   await removeLineRows(db, c, lineId);
   return getOrder(db, c.companyId, line.order_id);
 }
@@ -515,7 +568,7 @@ export async function lineStructure(db, companyId, lineId) {
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
   return {
     line: { id: line.id, lineNo: line.line_no, lineType: line.line_type, quantity: Number(line.quantity) },
-    order: { id: o.id, code: o.code, status: o.status, editable: !LOCKED.has(o.status) && !(await releaseOfLine(db, companyId, line.id)) },
+    order: { id: o.id, code: o.code, status: o.status, editable: !LOCKED.has(o.status) && !line.locked_at && !(await releaseOfLine(db, companyId, line.id)) },
     ...tree,
   };
 }
@@ -526,5 +579,6 @@ export async function partyReferences(db, companyId, partyId) {
     'SELECT code FROM cf_sales_orders WHERE company_id = ? AND customer_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 6',
     [companyId, partyId],
   );
-  return rows.length ? [`it is the customer on sales order ${rows.map((r) => r.code).join(', ')}`] : [];
+  // The revisions of one order share its number, so it is named once.
+  return rows.length ? [`it is the customer on sales order ${[...new Set(rows.map((r) => r.code))].join(', ')}`] : [];
 }

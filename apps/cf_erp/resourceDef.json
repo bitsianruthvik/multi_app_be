@@ -810,6 +810,10 @@
       "confirmedAt": "csor.confirmed_at",
       "deliveryAddress": "csor.delivery_address",
       "notes": "csor.notes",
+      "revision": "csor.revision",
+      "revisionOfId": "csor.revision_of_id",
+      "revisedAt": "csor.revised_at",
+      "statusBeforeRevised": "csor.status_before_revised",
       "createdAt": "csor.created_at",
       "updatedAt": "csor.updated_at",
       "createdBy": "csor.created_by",
@@ -830,6 +834,10 @@
       "confirmedAt": "datetime",
       "deliveryAddress": "text",
       "notes": "text",
+      "revision": "integer",
+      "revisionOfId": "integer",
+      "revisedAt": "datetime",
+      "statusBeforeRevised": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime",
       "createdBy": "integer",
@@ -866,6 +874,9 @@
       "bomRevision": "csol.bom_revision",
       "description": "csol.description",
       "notes": "csol.notes",
+      "lockedAt": "csol.locked_at",
+      "lockPosition": "csol.lock_position",
+      "revisesLineId": "csol.revises_line_id",
       "createdAt": "csol.created_at",
       "updatedAt": "csol.updated_at",
       "createdBy": "csol.created_by",
@@ -888,6 +899,9 @@
       "bomRevision": "string",
       "description": "string",
       "notes": "text",
+      "lockedAt": "datetime",
+      "lockPosition": "integer",
+      "revisesLineId": "integer",
       "createdAt": "datetime",
       "updatedAt": "datetime",
       "createdBy": "integer",
@@ -913,6 +927,76 @@
         "fields": [
           "itemCode",
           "itemName"
+        ]
+      }
+    }
+  },
+  "cfErpOrderPiece": {
+    "table": "cf_order_pieces",
+    "alias": "copc",
+    "writeFields": [],
+    "fields": {
+      "id": "copc.id",
+      "companyId": "copc.company_id",
+      "orderId": "copc.order_id",
+      "orderLineId": "copc.order_line_id",
+      "parentId": "copc.parent_id",
+      "itemId": "copc.item_id",
+      "bomLineId": "copc.bom_line_id",
+      "pieceNo": "copc.piece_no",
+      "pieceSeq": "copc.piece_seq",
+      "quantity": "copc.quantity",
+      "code": "copc.code",
+      "ruleCode": "copc.rule_code",
+      "pathKey": "copc.path_key",
+      "depth": "copc.depth",
+      "sortOrder": "copc.sort_order",
+      "createdAt": "copc.created_at",
+      "updatedAt": "copc.updated_at",
+      "createdBy": "copc.created_by",
+      "itemCode": "cmr_op.code",
+      "itemName": "cmr_op.name",
+      "lineNo": "csol_op.line_no"
+    },
+    "fieldTypes": {
+      "id": "integer",
+      "companyId": "integer",
+      "orderId": "integer",
+      "orderLineId": "integer",
+      "parentId": "integer",
+      "itemId": "integer",
+      "bomLineId": "integer",
+      "pieceNo": "integer",
+      "pieceSeq": "string",
+      "quantity": "decimal",
+      "code": "string",
+      "ruleCode": "string",
+      "pathKey": "string",
+      "depth": "integer",
+      "sortOrder": "integer",
+      "createdAt": "datetime",
+      "updatedAt": "datetime",
+      "createdBy": "integer",
+      "itemCode": "string",
+      "itemName": "string",
+      "lineNo": "integer"
+    },
+    "relations": {
+      "item": {
+        "table": "cf_master_records",
+        "alias": "cmr_op",
+        "on": "copc.item_id = cmr_op.id",
+        "fields": [
+          "itemCode",
+          "itemName"
+        ]
+      },
+      "line": {
+        "table": "cf_sales_order_lines",
+        "alias": "csol_op",
+        "on": "copc.order_line_id = csol_op.id",
+        "fields": [
+          "lineNo"
         ]
       }
     }

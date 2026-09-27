@@ -8,48 +8,49 @@
  * has made parts of its own, identical parts grouped under their parent. Waits
  * are resolved on that tree — parent, children, siblings, ancestor.
  *
- * What is made and what is material: a temporary item, or a catalog item with a
- * flow, is MADE (a tracker node with steps); a catalog item without a flow is
- * MATERIAL (a requirement on the step that consumes it — the piece's first step
- * for now).
+ * The tree itself — what is made, what is material, how it is numbered — is
+ * rollOutService's, the one copy lock and release share. Since 2026-09-26 a
+ * line built from a template is LOCKED before it is released: lock rolls it out
+ * and writes every piece's code (cf_order_pieces), and release lays the same
+ * tree out again and takes each node's code from there by path key. It never
+ * makes a code for a locked line. What release adds is its own: the production
+ * steps, the waits between them and the material each one consumes.
+ *
+ * A standard line (a catalog item sold as it is) has no structure of its own to
+ * lock, and is coded here at release, as before.
  *
  * The tracker is the release snapshot: it copies what it needs and never
  * follows later edits. Whether a step is READY is worked out on every read from
  * its dependencies and its material — never stored.
  */
 import { invalid, notFound, conflict } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, loadMasters } from './records.js';
-import { LEAF_DEPTH } from './tree.js';
-import { explode } from './bomService.js';
+import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { resolveTiming } from './operationService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
-import { refreshValues } from './valueService.js';
-import { temporaryTree } from './instantiationService.js';
-import { rangesOfBoms, seqValue, readRulesOnce } from './codeRangeService.js';
+import {
+  availability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
+  lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf,
+} from './rollOutService.js';
+
+// availability moved to rollOutService with the made rule it serves; the
+// services that read it from here keep working.
+export { availability };
 
 const EPS = 1e-9;
-// A guard against a runaway explosion, not a statement about how big a real job
-// is. 5,000 was too low to be that: one span of the KEPL bridge is 3,036 nodes
-// and two spans ~6,072, so an ordinary order tripped it — and a tripped cap
-// silently drops the material under everything past it, which is how the same
-// bridge once asked for 18 t less steel than it contains.
-//
-// The real ceiling is not this number. Releasing a tracker this size writes tens
-// of thousands of rows one at a time, and over TiDB at ~49 ms a round trip that
-// is the constraint that will actually hurt. Batch the release writes before
-// raising this again.
-const MAX_NODES = 10000;
 const round6 = (n) => Number(Number(n).toFixed(6));
 const fmt = (n) => String(round6(n));
 const blank = (v) => v == null || String(v).trim() === '';
-const whole = (x) => Math.abs(x - Math.round(x)) < 1e-9;
 const USABLE = "('storage','wip')";
 const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : d ?? null);
 
+/** Release's words for a line built from a template that has not been locked. */
+export const lockFirst = (line) => `Line ${line.line_no} of ${line.order_code} is not locked. Lock the line first — it comes after the values and cut pieces.`;
+
 async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(
-    `SELECT l.*, o.code AS order_code, o.status AS order_status, o.order_type
+    `SELECT l.*, o.code AS order_code, o.status AS order_status, o.order_type,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision
        FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
     [companyId, lineId],
@@ -65,7 +66,8 @@ export async function liveReleaseOfLine(db, companyId, lineId) {
 
 async function requireRelease(db, companyId, id, { lock = false } = {}) {
   const [[r]] = await db.query(
-    `SELECT r.*, o.code AS order_code, o.status AS order_status, l.line_no
+    `SELECT r.*, o.code AS order_code, o.status AS order_status, l.line_no,
+            o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision
        FROM cf_production_releases r
        JOIN cf_sales_orders o ON o.id = r.order_id
        JOIN cf_sales_order_lines l ON l.id = r.order_line_id
@@ -78,7 +80,8 @@ async function requireRelease(db, companyId, id, { lock = false } = {}) {
 
 function assertOrderOpen(order) {
   if (LOCKED_ORDER_STATUSES.has(order.order_status)) {
-    throw invalid('ORDER_LOCKED', `Order ${order.order_code} is ${order.order_status} — nothing more is recorded on it.`);
+    throw invalid('ORDER_LOCKED', order.order_status === 'revised' ? revisedOrderMessage(order.order_code, order.order_revision, order.order_latest_revision)
+      : `Order ${order.order_code} is ${order.order_status} — nothing more is recorded on it.`);
   }
 }
 
@@ -107,262 +110,50 @@ async function loadFlows(db, companyId, flowIds) {
   return out;
 }
 
-/**
- * What can be used now, per item and batch: on hand in storage and WIP areas
- * (a held batch counts for nothing), what is reserved, and what is free.
- */
-export async function availability(db, companyId, itemIds) {
-  const out = new Map();
-  if (!itemIds.length) return out;
-  const [bal] = await db.query(
-    `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on
-       FROM cf_stock_balances k
-       JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose IN ${USABLE}
-       LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
-      WHERE k.company_id = ? AND k.item_id IN (?) AND k.quantity > 0
-      GROUP BY k.item_id, k.batch_id, b.code, b.status, b.received_on`,
-    [companyId, itemIds],
-  );
-  const [res] = await db.query(
-    `SELECT item_id, batch_id, SUM(quantity) AS qty FROM cf_stock_reservations
-      WHERE company_id = ? AND item_id IN (?) AND status = 'active' AND deleted_at IS NULL GROUP BY item_id, batch_id`,
-    [companyId, itemIds],
-  );
-  const reservedOf = new Map(res.map((r) => [`${r.item_id}:${r.batch_id ?? 0}`, Number(r.qty)]));
-  for (const id of itemIds) out.set(id, { available: 0, reserved: 0, free: 0, batches: [] });
-  for (const b of bal) {
-    const entry = out.get(b.item_id);
-    const usable = !b.batch_id || b.batch_status === 'available';
-    const reserved = reservedOf.get(`${b.item_id}:${b.batch_id ?? 0}`) ?? 0;
-    const qty = usable ? Number(b.qty) : 0;
-    const free = round6(Math.max(0, qty - reserved));
-    if (b.batch_id) entry.batches.push({ batchId: b.batch_id, code: b.batch_code, status: b.batch_status, receivedOn: dateOnly(b.received_on), available: qty, reserved, free });
-    entry.available = round6(entry.available + qty);
-    entry.free = round6(entry.free + free);
-  }
-  for (const r of res) { const e = out.get(r.item_id); if (e) e.reserved = round6(e.reserved + Number(r.qty)); }
-  for (const e of out.values()) e.batches.sort((a, b) => String(a.receivedOn ?? '').localeCompare(String(b.receivedOn ?? '')) || a.batchId - b.batchId);
-  return out;
-}
-
 // --- the release plan: what release would create, and what stops it --------------
 
-const nameOf = (n) => n.code ?? n.name;
-
-/** item_type, sourcing, tracked_by and the definition each temporary item came from. */
-async function itemDetails(db, companyId, itemIds) {
-  const ids = [...new Set(itemIds)];
-  if (!ids.length) return new Map();
-  const [rows] = await db.query(
-    'SELECT master_id, item_type, sourcing, tracked_by, source_definition_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?)',
-    [companyId, ids],
-  );
-  return new Map(rows.map((r) => [r.master_id, r]));
-}
-
 /**
- * "Made out of nothing" — the nodes this order makes that have nothing under
- * them at all.
+ * The roll-out (rollOutService.rollOutPlan) with release's own checks on top:
+ * how each made thing is made, and whether it may be issued. Returns every
+ * problem at once — nothing is written here.
  *
- * It matters because of how material is worked out below: a requirement is
- * recorded for a CHILD that is not made, so a made node with no children
- * iterates nothing and asks for nothing. Release then succeeds, the tracker is
- * built, and the buy list proposes nothing — the plate parts of a real job were
- * `sourcing = 'make'` with no BOM, and 669 t of steel simply did not exist as
- * far as the system was concerned. A thing cannot be made out of nothing.
- *
- * The exploded tree alone must not be the answer. It stops at its depth cap, so
- * a node at the bottom of a deep structure looks childless while its BOM is
- * full, and telling somebody to give a BOM to a thing that has one is worse
- * than saying nothing. So the database is asked whether the item really has a
- * live BOM line, and only an item that truly has none is named.
- *
- * Returns one entry per (item, place), so six identical stiffeners are one
- * sentence rather than six.
+ *   lockedBoth      a locked line's 'both' decisions, taken at lock (madeRule)
+ *   rowsMayBeDraft  a line not locked yet: its rows are drafts until lock
+ *                   activates them, so a draft row is not a problem to report
+ *                   — "lock the line first" is the one thing to say
  */
-async function madeFromNothing(db, companyId, nodes) {
-  const suspects = nodes.filter((n) => n.made === true && !n.children.length);
-  if (!suspects.length) return [];
-  const [rows] = await db.query(
-    `SELECT b.parent_id, COUNT(l.id) AS line_count
-       FROM cf_boms b
-       LEFT JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
-      WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL
-      GROUP BY b.parent_id`,
-    [companyId, [...new Set(suspects.map((n) => n.id))]],
-  );
-  const lines = new Map(rows.map((r) => [r.parent_id, Number(r.line_count)]));
-  const seen = new Set();
-  const out = [];
-  for (const n of suspects) {
-    if (lines.get(n.id) > 0) continue;
-    const key = `${n.id}:${n.parentNode?.id ?? 0}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(n);
-  }
-  return out;
-}
+async function buildPlan(db, companyId, line, { lockedBoth = null, rowsMayBeDraft = false } = {}) {
+  const plan = await rollOutPlan(db, companyId, line, { lockedBoth });
+  const { problems, all, detail, tree } = plan;
+  if (tree.root.made === undefined) return plan;
 
-/**
- * Checks a line's structure and builds, in memory, everything release writes:
- * tracker nodes, their steps, the dependencies and the material requirements.
- * Returns every problem at once — nothing is written here.
- */
-async function buildPlan(db, companyId, line) {
-  const problems = [];
-  const qty = Number(line.quantity);
-  const tree = await explode(db, companyId, line.item_id, { rootQuantity: qty, maxDepth: 15 });
-  if (tree.truncated) problems.push('The structure is more than 15 levels deep.');
-
-  // 1. Every design node: is it an item, is it ready, is it made or material?
-  //    Where a catalog item comes from is its own field (user, 2026-09-23):
-  //    stock = drawn from stock, make = made on the order that needs it, both =
-  //    from stock when free stock covers it, else made. A stock order's own line
-  //    is always made — that order is what puts the item in stock.
-  const everyNode = [];
-  const collect = (n) => { everyNode.push(n); n.children.forEach(collect); };
-  collect(tree.root);
-  const detail = await itemDetails(db, companyId, everyNode.map((n) => n.id));
-  const sourcingOf = (n) => (n.kind === 'catalog' ? detail.get(n.id)?.sourcing ?? 'stock' : null);
-  const maybe = everyNode.filter((n) => n.kind === 'catalog' && sourcingOf(n) === 'both' && n.flow);
-  const freeLeft = maybe.length ? new Map([...(await availability(db, companyId, [...new Set(maybe.map((n) => n.id))]))].map(([id, v]) => [id, v.free])) : new Map();
-
-  const all = [];
-  const consider = (n, parent, count) => {
-    n.parentNode = parent;
-    n.needCount = round6(count);
-    all.push(n);
-    const where = parent ? ` under ${nameOf(parent)}` : '';
-    if (n.kind === 'selection') { problems.push(`${nameOf(parent ?? n)} still has to choose its ${n.selection?.code ?? nameOf(n)} — pick the catalog item.`); return; }
-    if (n.kind === 'template') { problems.push(`${nameOf(n)}${where} is a definition — a blueprint is never made or issued.`); return; }
-    const sourcing = sourcingOf(n);
-    if (n.kind === 'temporary') n.made = true;
-    else if (n === tree.root && line.order_type === 'stock') n.made = !!n.flow;
-    else if (sourcing === 'make') n.made = true;
-    else if (sourcing === 'both' && n.flow) {
-      const free = freeLeft.get(n.id) ?? 0;
-      n.made = free + EPS < n.needCount;
-      if (!n.made) freeLeft.set(n.id, round6(free - n.needCount));
-      n.sourcedBy = n.made ? 'made (no free stock)' : 'stock';
-    } else n.made = false;
-    if (n.status === 'draft') problems.push(`${nameOf(n)} is still a draft — activate it before release.`);
-    else if (n.status !== 'active') problems.push(`${nameOf(n)}${where} is ${n.status} — only active items are made or issued.`);
+  for (const n of all) {
+    if (n.made === undefined) continue;   // a selection or a definition — already a problem
+    const where = n.parentNode ? ` under ${nameOf(n.parentNode)}` : '';
+    // A row is activated when its line is locked; a locked line's rows are active.
+    if (n.kind === 'temporary' && !rowsMayBeDraft) {
+      if (n.status === 'draft') problems.push(`${nameOf(n)} is still a draft — activate it before release.`);
+      else if (n.status !== 'active') problems.push(`${nameOf(n)}${where} is ${n.status} — only active items are made or issued.`);
+    }
     if (n.made && !n.flow) {
       problems.push(n.kind === 'temporary'
         ? `${nameOf(n)} has no flow — say how it is made.`
         : `${nameOf(n)}${where} is made on the order, but has no flow — give it one, or set it to come from stock.`);
     }
-    if (n.made && n.kind === 'catalog' && n.bom && n.bom.status !== 'active') problems.push(`The BOM of ${nameOf(n)} is ${n.bom.status} — activate it before release.`);
-    // Only what is made here has parts that matter: the structure under an item
-    // taken from stock is that item's business, not this order's.
-    if (n.made) for (const kid of n.children) consider(kid, n, kid.quantity * count);
-  };
-  consider(tree.root, null, qty);
-  for (const n of await madeFromNothing(db, companyId, all)) {
-    const where = n.parentNode ? ` under ${nameOf(n.parentNode)}` : '';
-    // A temporary item is always made on its order — masterRecordService refuses
-    // to give one any other sourcing — so it is offered the one way out it has.
-    problems.push(n.kind === 'temporary'
-      ? `${nameOf(n)}${where} is made on the order, but nothing is under it — give it a BOM saying what it is made from.`
-      : `${nameOf(n)}${where} is made on the order, but nothing is under it — give it a BOM, or set it to come from stock.`);
-  }
-  const root = tree.root;
-  if (root.made === undefined) return { problems, tree };
-
-  // 2. The flows of everything made: active, with steps, on active operations.
-  const flows = await loadFlows(db, companyId, [...new Set(all.filter((n) => n.made && n.flow).map((n) => n.flow.id))]);
-  for (const f of flows.values()) {
-    if (f.status !== 'active') problems.push(`Flow ${f.code} is ${f.status === 'draft' ? 'still a draft' : f.status} — activate it before release.`);
-    if (!f.steps.length) problems.push(`Flow ${f.code} has no steps.`);
-    for (const s of f.steps) if (s.op_status !== 'active') problems.push(`Flow ${f.code} step ${s.sequence} uses ${s.op_code}, which is inactive.`);
-  }
-
-  // 3. The tracker tree (T1 = (c)): a piece per node when it has made parts,
-  //    one grouped node otherwise; material becomes requirements.
-  const sourceDef = new Map([...detail].map(([id, d]) => [id, d.source_definition_id]));
-  for (const n of all) {
     if (n.made === false && detail.get(n.id)?.tracked_by === 'individual') {
       problems.push(`${nameOf(n)} is tracked unit by unit — no stock is kept of it yet, so it cannot be reserved. Give it a flow, or track it by quantity or batch.`);
     }
   }
-  const nodes = [];
-  const reqs = [];
-  // piece.no: one counter per DESIGN across the whole line, as it always was.
-  const counters = new Map();
-  // piece.seq (user, 2026-09-26): under each parent piece, a row's pieces are
-  // numbered start … end of that row's range — rows of the same short name
-  // carry one count, so a drilled copy of 3 after 23 plain stiffeners is 24,
-  // 25, 26 — and the count starts again under the next parent piece. The
-  // ranges are codeRangeService's, over the same rows explode() read. The
-  // line's own item is not on a BOM row: its pieces are 1 … n on the order line.
-  const lineRanges = await rangesOfBoms(db, companyId, [...new Set(all.filter((n) => n.made && n.bom).map((n) => n.bom.id))]);
-  const rangeOfRow = (d) => (d.lineId != null ? lineRanges.get(d.lineId) ?? null : null);
-  const seqOfPiece = (d, i) => {
-    if (d.lineId == null) return i + 1;
-    const r = rangeOfRow(d);
-    return r?.start != null ? r.start + i : null;
-  };
-  const seqOfGroup = (d, count) => {
-    if (!whole(count)) return null;
-    const start = d.lineId == null ? 1 : rangeOfRow(d)?.start;
-    return start != null ? seqValue(start, Math.round(count)) : null;
-  };
-  // Children in the order the rows are shown (line number, then line id), so
-  // the numbers are the same on every run. explode() already delivers that
-  // order; sorting here keeps piece numbers from depending on it.
-  const shown = new WeakMap();
-  const inShownOrder = (d) => {
-    let kids = shown.get(d);
-    if (!kids) {
-      kids = [...d.children].sort((a, b) => (a.lineNo ?? 0) - (b.lineNo ?? 0) || (a.lineId ?? 0) - (b.lineId ?? 0));
-      shown.set(d, kids);
-    }
-    return kids;
-  };
-  const madeKids = (d) => d.children.filter((k) => k.made);
-  const addNode = (design, parentK, depth, quantity, pieceNo, pieceSeq) => {
-    const node = {
-      k: nodes.length, parentK, design, itemId: design.id, bomLineId: design.lineId ?? null, pieceNo, pieceSeq, quantity: round6(quantity),
-      code: pieceNo ? `${design.code}-${pieceNo}` : null, flowId: design.flow.id, depth, childKs: [], stepKs: [],
-      madeFrom: sourceDef.get(design.id) ?? null,
-    };
-    nodes.push(node);
-    if (parentK != null) nodes[parentK].childKs.push(node.k);
-    return node;
-  };
-  const fill = (design, node) => {
-    for (const kid of inShownOrder(design)) {
-      if (kid.made) expand(kid, node.k, node.depth + 1, kid.quantity * node.quantity);
-      else if (kid.made === false) reqs.push({ nodeK: node.k, itemId: kid.id, bomLineId: kid.lineId, quantity: round6(kid.quantity * node.quantity), design: kid });
-    }
-  };
-  const expand = (design, parentK, depth, count) => {
-    if (nodes.length > MAX_NODES) return;
-    if (!design.flow) return; // the missing flow is already a problem; nothing to lay out
-    if (madeKids(design).length) {
-      if (!whole(count)) { problems.push(`${nameOf(design)} is made piece by piece, so it needs a whole number — ${fmt(count)} were asked for.`); return; }
-      for (let i = 0; i < Math.round(count); i++) {
-        const no = (counters.get(design.id) ?? 0) + 1;
-        counters.set(design.id, no);
-        fill(design, addNode(design, parentK, depth, 1, no, seqOfPiece(design, i)));
-      }
-    } else fill(design, addNode(design, parentK, depth, count, null, seqOfGroup(design, count)));
-  };
-  if (root.made) expand(root, null, 0, qty);
-  else if (line.order_type === 'stock') problems.push(`${nameOf(root)} has no flow — say how it is made, because a stock order is what makes it.`);
-  else reqs.push({ nodeK: null, itemId: root.id, bomLineId: null, quantity: round6(qty), design: root });
-  // Hitting the cap stops `expand` mid-tree, so everything past it was never
-  // walked and its material was never asked for. The counts that survive are
-  // not a smaller answer, they are a WRONG one — this bridge came out 18 t of
-  // steel short and said nothing. Release refuses either way, but releaseCheck
-  // shows these figures on screen, so they have to arrive labelled.
-  const truncated = nodes.length > MAX_NODES;
-  if (truncated) {
-    problems.push(`The tracker would have more than ${MAX_NODES} nodes — release a smaller line.`);
-    problems.push('Because of that, the piece and material figures below are incomplete — the rest of the structure was never worked out. Do not order from them.');
+  if (!tree.root.made && line.order_type === 'stock') problems.push(`${nameOf(tree.root)} has no flow — say how it is made, because a stock order is what makes it.`);
+
+  // The flows of everything made: active, with steps, on active operations.
+  plan.flows = await loadFlows(db, companyId, [...new Set(all.filter((n) => n.made && n.flow).map((n) => n.flow.id))]);
+  for (const f of plan.flows.values()) {
+    if (f.status !== 'active') problems.push(`Flow ${f.code} is ${f.status === 'draft' ? 'still a draft' : f.status} — activate it before release.`);
+    if (!f.steps.length) problems.push(`Flow ${f.code} has no steps.`);
+    for (const s of f.steps) if (s.op_status !== 'active') problems.push(`Flow ${f.code} step ${s.sequence} uses ${s.op_code}, which is inactive.`);
   }
-  return { problems, tree, flows, nodes, reqs, truncated };
+  return plan;
 }
 
 /** "P001-G01-1", or "P001-G01-WEB01 ×1 for P001-G01-1" for grouped parts. */
@@ -525,16 +316,26 @@ function findCycle(nodes, steps, deps) {
   return null;
 }
 
-/** The plan for a line, with the line-level checks first. */
+/**
+ * The plan for a line, with the line-level checks first. A locked line's plan
+ * carries its locked codes (by path key) and follows the lock's own
+ * made-or-stock decisions; a node the lock did not roll out is a problem.
+ */
 async function planFor(db, companyId, line) {
   const problems = [];
-  if (line.order_status !== 'confirmed') problems.push(`Order ${line.order_code} is ${line.order_status} — only a confirmed order is released to production.`);
+  if (line.order_status === 'revised') problems.push(revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision));
+  else if (line.order_status !== 'confirmed') problems.push(`Order ${line.order_code} is ${line.order_status} — only a confirmed order is released to production.`);
   if (await liveReleaseOfLine(db, companyId, line.id)) problems.push(`Line ${line.line_no} is already released.`);
   if (!line.item_id) problems.push('The line has no item yet.');
+  if (line.line_type === 'custom' && !line.locked_at) problems.push(lockFirst(line));
   if (problems.length) return { problems, nodes: [], steps: [], deps: [], reqs: [] };
-  const plan = await buildPlan(db, companyId, line);
+  const pieces = line.locked_at ? await lockedPiecesOf(db, companyId, line.id) : null;
+  const plan = await buildPlan(db, companyId, line, { lockedBoth: pieces ? lockedBothOf(pieces) : null });
+  if (pieces) {
+    for (const u of attachLockedCodes(plan.nodes ?? [], pieces)) plan.problems.push(unmatchedProblem(u, plan.nodes));
+  }
   if (plan.nodes) planSteps(plan);
-  plan.problems.unshift(...problems);
+  plan.lockedPieces = pieces;
   return plan;
 }
 
@@ -558,9 +359,10 @@ async function materialSummary(db, companyId, reqs) {
  * code, or on a piece number, has nothing to work with at the top of the tree
  * or on a grouped card — and finding that out halfway through a release is too
  * late. One dry run per SHAPE of piece (four at most) catches it here instead,
- * without numbering anything.
+ * without numbering anything. Only a line coded at release needs it: a locked
+ * line's codes were made, and checked, at lock.
  */
-async function codeRuleProblems(db, companyId, line, nodes) {
+async function codeRuleProblems(db, companyId, line, nodes, linePosition) {
   const seen = new Map();
   for (const n of nodes) {
     const shape = `${n.parentK != null ? 'child' : 'top'}:${n.pieceNo ? 'piece' : 'group'}`;
@@ -570,7 +372,7 @@ async function codeRuleProblems(db, companyId, line, nodes) {
   for (const n of seen.values()) {
     const g = await generate(db, companyId, 'production_piece', 'code', {
       draft: {
-        itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no,
+        itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no, linePosition,
         parentCode: n.parentK != null ? 'PARENT' : null, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq,
       },
     }, { consume: false }).catch(() => null);
@@ -581,206 +383,63 @@ async function codeRuleProblems(db, companyId, line, nodes) {
   return problems;
 }
 
-/**
- * Every piece's code, parents first so a rule can build a child's code out of
- * its parent's — from the code generator where a rule applies, and from the
- * built-in shape where none does. Release calls it with `consume` (a running
- * number is drawn for real); previewReleaseCodes without (it is only peeked),
- * so the preview shows exactly the codes release would write. Writes nothing
- * but the codes onto the plan's nodes.
- *
- * The coding rules are read once for the whole tree, and each item, template
- * and order once (the provider's memo), not once per piece: one span of the
- * KEPL bridge is ~3,000 pieces, and per-piece reads at ~49 ms a round trip were
- * minutes of release.
- *
- * Returns { duplicates, taken, missing, byRule } — codes given to two pieces,
- * codes another release's pieces already carry, rules with a hole (a consuming
- * run throws on the first of those, as it always has), and how many pieces a
- * rule coded. Each node also carries `rule`, the coding rule that chose it
- * (null where none applies and the built-in shape was used).
- *
- * Three things only the preview passes, none of which changes a code:
- *   memo        the code generator's memo, already filled (seedPieceMemo), so
- *               the items, definitions and chains are not read one by one
- *   takenChunk  how many codes each "already on another release?" read asks
- * and, without `consume`, running numbers handed out in turn (numbersInTurn).
- */
-async function codeNodes(db, companyId, line, nodes, { consume, memo = new Map(), takenChunk = 1000 }) {
-  const rules = consume ? readRulesOnce(db) : numbersInTurn(readRulesOnce(db));
-  const seen = new Set();
-  const out = { duplicates: [], taken: [], missing: [], byRule: 0 };
-  for (const n of nodes) {
-    const parentCode = n.parentK != null ? nodes[n.parentK].code : null;
-    let g = null;
-    try {
-      g = await generate(rules, companyId, 'production_piece', 'code', {
-        draft: { itemId: n.itemId, orderId: line.order_id, lineNo: line.line_no, parentCode, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq, memo },
-      }, { consume });
-    } catch (err) {
-      // A rule that leans on something this piece has not got — say which piece,
-      // rather than leaving a code-generator message with no context.
-      if (err?.code !== 'TOKEN_MISSING') throw err;
-      throw invalid('TOKEN_MISSING', `${nameOf(n.design)} cannot be numbered: ${err.message}`, { problems: err.problems ?? [] });
-    }
-    n.rule = g?.schemeCode ?? null;
-    if (g?.text) out.byRule += 1;
-    else if (g?.missing?.length) out.missing.push({ node: n, schemeCode: g.schemeCode, missing: g.missing });
-    // The fallback has to stay unique across orders, so a grouped node with no
-    // parent — a line making one lot of something — carries its line with it.
-    const own = n.design.code ?? n.design.name;
-    n.code = g?.text || (n.pieceNo ? `${own}-${n.pieceNo}`
-      : parentCode ? `${parentCode}/${own}`
-        : `${line.order_code}/${line.line_no}-${own}`);
-    // Two pieces called the same thing is not an identity — and it surfaces far
-    // later, as a duplicate lot on the day one of them is finished.
-    if (seen.has(n.code)) out.duplicates.push(n.code);
-    else seen.add(n.code);
-  }
-  // Pieces of other releases, asked a thousand codes at a time rather than one
-  // per piece. This line's own live release, if it has one, is not "another".
-  const codes = [...seen];
-  for (let i = 0; i < codes.length; i += takenChunk) {
-    const [rows] = await db.query(
-      `SELECT code FROM cf_production_items
-        WHERE company_id = ? AND code IN (?) AND deleted_at IS NULL
-          AND release_id NOT IN (SELECT r.id FROM cf_production_releases r WHERE r.company_id = ? AND r.order_line_id = ? AND r.deleted_at IS NULL)`,
-      [companyId, codes.slice(i, i + takenChunk), companyId, line.id],
-    );
-    out.taken.push(...rows.map((r) => r.code));
-  }
-  return out;
-}
-
 // --- the preview: what release would write, read cheaply ------------------------------
 
-const PEEK_NUMBER = /^\s*SELECT\s+next_value\s+FROM\s+cf_code_sequences\b/i;
+/** What a node with no locked piece shows in a preview — it has no code, and none is made up. */
+const NO_LOCKED_PIECE = '(no locked piece)';
 
 /**
- * A preview draws no running number; the code generator only PEEKS at the next
- * one. Left alone, every piece of a rule with a running number would show that
- * same next number — a preview full of duplicates that release would never
- * write. This hands the numbers out in turn instead, per rule and prefix,
- * starting from the one the database says is next — exactly the order release
- * draws them in, one piece after another. Nothing is written: the first peek of
- * each prefix is the only read, and every later one is counted here.
+ * The plan release would lay out, every node coded as release would code it —
+ * nothing written. A locked line shows its LOCKED codes, found by path key; a
+ * line not locked yet shows the codes lock would write now, at the position
+ * lock would give it.
  *
- * It sits OUTSIDE readRulesOnce, which would otherwise answer every peek from
- * its cache with the first number.
+ * ~30 round trips on the KEPL line (6,072 pieces).
  */
-function numbersInTurn(db) {
-  const next = new Map();
-  const query = async (sql, params) => {
-    if (!PEEK_NUMBER.test(sql) || /\bFOR\s+UPDATE\b/i.test(sql)) return db.query(sql, params);
-    const key = JSON.stringify(params ?? []);
-    if (!next.has(key)) {
-      const [[row]] = await db.query(sql, params);
-      next.set(key, row ? Number(row.next_value) : 1);
-    }
-    const n = next.get(key);
-    next.set(key, n + 1);
-    return [[{ next_value: n }], []];
-  };
-  return new Proxy(db, { get: (target, prop) => (prop === 'query' ? query : Reflect.get(target, prop)) });
-}
-
-/**
- * tree.ancestors, started from many classification nodes in ONE round trip:
- * the same recursive walk, each row remembering which chain it belongs to.
- * Returns id -> chain, root first, the rows `ancestors` returns (hop and
- * chain_of stripped), and an empty chain for an id that is not a live node —
- * as there. CHAIN_HOPS is tree.js's MAX_CHAIN - 1: the same guard against a
- * tree that loops.
- */
-const CHAIN_HOPS = LEAF_DEPTH + 2;
-const CHAINS_SQL = `
-  WITH RECURSIVE chain AS (
-    SELECT n.*, n.id AS chain_of, CAST(0 AS SIGNED) AS hop
-      FROM cf_classification_nodes n
-     WHERE n.company_id = ? AND n.id IN (?) AND n.deleted_at IS NULL
-     UNION ALL
-    SELECT p.*, c.chain_of, c.hop + 1
-      FROM chain c
-      JOIN cf_classification_nodes p
-        ON p.company_id = c.company_id AND p.id = c.parent_id AND p.deleted_at IS NULL
-     WHERE c.hop < ?
-  )
-  SELECT * FROM chain`;
-
-async function chainsOf(db, companyId, ids) {
-  const out = new Map();
-  if (!ids.length) return out;
-  const [rows] = await db.query(CHAINS_SQL, [companyId, ids, CHAIN_HOPS]);
-  for (const id of ids) out.set(id, []);
-  for (const row of rows) out.get(row.chain_of)?.push(row);
-  for (const chain of out.values()) {
-    chain.sort((a, b) => b.hop - a.hop);   // root first, whatever order the engine returned
-    for (const row of chain) { delete row.hop; delete row.chain_of; }
-  }
-  return out;
-}
-
-/**
- * The code generator's memo for a preview, filled before the first piece is
- * coded (pieceContext in codegenProvider.js: one release, one memo). Each piece
- * asks for its item, the item's template definition, the order and the item's
- * classification chain. Asked piece by piece that was 235 round trips on the
- * KEPL line — 208 items and definitions, 7 chains, the order — about 11 s at
- * production's ~49 ms a round trip. Here it is two: every item and definition
- * in one read (loadMasters: the very row loadMaster gives), every chain in
- * another; the order's code is the one requireLine already read.
- *
- * Only answers go in. Anything not read here is simply absent, and pieceContext
- * reads it itself as it always has — so the seed makes a preview cheaper, never
- * different. `madeFrom` is each node's template definition, from buildPlan.
- */
-async function seedPieceMemo(db, companyId, line, nodes) {
-  const memo = new Map();
-  if (!nodes.length) return memo;
-  const itemIds = [...new Set(nodes.map((n) => n.itemId))];
-  const wanted = [...new Set([...itemIds, ...nodes.map((n) => n.madeFrom).filter((id) => id != null)])];
-  const masters = await loadMasters(db, companyId, wanted);
-  for (const id of wanted) memo.set(`master:${id}`, masters.get(id) ?? null);
-  memo.set(`order:${line.order_id}`, { code: line.order_code });
-  const classIds = [...new Set(itemIds.map((id) => masters.get(id)?.classification_id).filter((id) => id != null))];
-  for (const [id, chain] of await chainsOf(db, companyId, classIds)) memo.set(`chain:${id}`, chain);
-  return memo;
-}
-
-/** The plan release would lay out, every node coded as release would code it — nothing written. */
 async function codedPreview(db, companyId, line) {
-  const plan = await buildPlan(db, companyId, line);
+  if (line.locked_at) {
+    const pieces = await lockedPiecesOf(db, companyId, line.id);
+    const plan = await buildPlan(db, companyId, line, { lockedBoth: lockedBothOf(pieces) });
+    const nodes = plan.nodes ?? [];
+    const unmatched = attachLockedCodes(nodes, pieces);
+    for (const u of unmatched) { plan.problems.push(unmatchedProblem(u, nodes)); u.node.code = NO_LOCKED_PIECE; }
+    const codes = [...new Set(nodes.map((n) => n.code).filter((c) => c !== NO_LOCKED_PIECE))];
+    const coded = {
+      duplicates: [], missing: [], numbered: 0, taken: await takenCodes(db, companyId, line.id, codes),
+      byRule: nodes.filter((n) => n.rule).length,
+    };
+    return { plan, nodes, coded, linePosition: line.lock_position, locked: { at: line.locked_at, pieces: pieces.length } };
+  }
+  const custom = line.line_type === 'custom';
+  const plan = await buildPlan(db, companyId, line, { rowsMayBeDraft: custom });
+  if (custom) plan.problems.unshift(lockFirst(line));
   const nodes = plan.nodes ?? [];
   const memo = await seedPieceMemo(db, companyId, line, nodes);
-  // 5,000 codes a read rather than 1,000: the KEPL line's 6,072 codes in two
-  // round trips instead of seven. Release keeps its own thousand.
-  const coded = await codeNodes(db, companyId, line, nodes, { consume: false, memo, takenChunk: 5000 });
-  return { plan, nodes, coded };
+  const linePosition = await linePositionOf(db, companyId, line.id);
+  const coded = await codeNodes(db, companyId, line, nodes, { consume: false, memo, linePosition, takenChunk: 5000 });
+  return { plan, nodes, coded, linePosition, locked: null };
 }
 
 /**
  * What release would write for a line's pieces: the tracker tree laid out as
- * release lays it out, and every piece's code from the coding rules as they
- * stand — nothing written, no running number drawn (a rule's running numbers
- * are shown as the ones release would draw next). It does not ask whether
- * the line may be released today (a confirmed order, not released yet);
- * releaseCheck answers that. It exists to prove a coding rule on a real order
- * before anything is released.
+ * release lays it out, and every piece's code — the locked one, for a locked
+ * line; for a line not locked yet, the one lock would write now (nothing
+ * written, no running number drawn). It does not ask whether the line may be
+ * released today; releaseCheck answers that.
  *
- *   { line, problems, nodes: [{ k, parentK, depth, code, pieceNo, pieceSeq, itemId, itemCode, bomLineId, quantity }],
+ *   { line, problems, linePosition, nodes: [{ k, parentK, depth, code, pieceNo, pieceSeq, itemId, itemCode, bomLineId, quantity, pathKey }],
  *     duplicates, taken, missing, byRule }
- *
- * ~30 round trips on the KEPL line (6,072 pieces), down from 266.
  */
 export async function previewReleaseCodes(db, companyId, lineId) {
   const line = await requireLine(db, companyId, lineId);
-  const { plan, nodes, coded } = await codedPreview(db, companyId, line);
+  const { plan, nodes, coded, linePosition } = await codedPreview(db, companyId, line);
   return {
-    line: { id: line.id, lineNo: line.line_no, orderCode: line.order_code, quantity: Number(line.quantity) },
+    line: { id: line.id, lineNo: line.line_no, orderCode: line.order_code, quantity: Number(line.quantity), locked: !!line.locked_at },
+    linePosition,
     problems: plan.problems,
     nodes: nodes.map((n) => ({
       k: n.k, parentK: n.parentK, depth: n.depth, code: n.code, pieceNo: n.pieceNo, pieceSeq: n.pieceSeq,
-      itemId: n.itemId, itemCode: n.design.code, bomLineId: n.bomLineId, quantity: n.quantity,
+      itemId: n.itemId, itemCode: n.design.code, bomLineId: n.bomLineId, quantity: n.quantity, pathKey: n.pathKey,
     })),
     duplicates: coded.duplicates,
     taken: coded.taken,
@@ -795,6 +454,7 @@ export async function previewReleaseCodes(db, companyId, lineId) {
  *
  *   { line: { id, lineNo, orderId, orderCode, orderStatus, quantity, item: { id, code, name } },
  *     released: null | { id, releasedAt, pieces },
+ *     locked: null | { at, pieces },
  *     problems, truncated,
  *     summary: { nodes, pieces, groups, codes, byRule, builtIn, duplicates, duplicatePieces, taken, missing },
  *     nodes: [{ k, parentK, depth, code, pieceNo, pieceSeq, quantity, itemId, rule, label? }],
@@ -803,21 +463,17 @@ export async function previewReleaseCodes(db, companyId, lineId) {
  *
  *   - A node is a numbered PIECE (pieceNo set) or a GROUP of identical parts
  *     under its parent piece (no pieceNo; quantity says how many), which shares
- *     one code. A group's `label` says what it is — "<item> ×6", the way the
- *     tracker's label for it begins (the tracker adds "for <its parent>").
+ *     one code. A group's `label` says what it is — "<item> ×6".
  *   - Nodes are in the order release writes them: a parent before its children,
  *     siblings as the rows are shown. `k` is the node's place in that list.
- *   - Item code, name and unit come once per item in `items`, not once per node:
- *     the KEPL line is 6,072 nodes of 208 items.
- *   - `rule` is the coding rule that chose the node's code. Null: no rule
- *     applies and the built-in shape was used, which release writes too. A node
- *     listed in `missing` has a rule with a hole — its code here is the
- *     built-in one, and release refuses until the rule has what it needs.
+ *   - Item code, name and unit come once per item in `items`, not once per node.
+ *   - `rule` is the coding rule that chose the node's code; null means none
+ *     applied and the built-in shape did. A node listed in `missing` has a rule
+ *     with a hole — its code here is the built-in one, and lock refuses.
  *   - duplicates: codes given to more than one node; taken: codes a piece of
- *     another release already carries. Release refuses either.
+ *     another line already carries.
  *   - `problems` are what still stops release, as releaseCheck words them (bar
- *     the order's status). While one stands, what it names may be missing from
- *     the tree — a piece with no flow is not laid out.
+ *     the order's status). A line built from a template names the lock first.
  *
  * A line already released lays nothing out and says so: its tracker holds the
  * real pieces and their codes.
@@ -830,6 +486,7 @@ export async function releasePreview(db, companyId, lineId) {
       quantity: Number(line.quantity), item: line.item_id ? { id: line.item_id, code: null, name: null } : null,
     },
     released: null,
+    locked: null,
     problems: [],
     truncated: false,
     summary: { nodes: 0, pieces: 0, groups: 0, codes: 0, byRule: 0, builtIn: 0, duplicates: 0, duplicatePieces: 0, taken: 0, missing: 0 },
@@ -849,7 +506,7 @@ export async function releasePreview(db, companyId, lineId) {
   }
   if (!line.item_id) return { ...base, problems: ['The line has no item yet.'] };
 
-  const { plan, nodes, coded } = await codedPreview(db, companyId, line);
+  const { plan, nodes, coded, locked } = await codedPreview(db, companyId, line);
   const root = plan.tree?.root;
   const dup = new Set(coded.duplicates);
   const taken = [...new Set(coded.taken)];
@@ -861,6 +518,7 @@ export async function releasePreview(db, companyId, lineId) {
   return {
     ...base,
     line: { ...base.line, item: { id: line.item_id, code: root?.code ?? null, name: root?.name ?? null } },
+    locked,
     problems: plan.problems,
     truncated: !!plan.truncated,
     summary: {
@@ -890,6 +548,7 @@ export async function releasePreview(db, companyId, lineId) {
   };
 }
 
+
 /**
  * What releasing a line would create, and what stops it — nothing is written.
  * { ok, problems, summary: { pieces, groups, steps, waits, requirements }, materials }
@@ -902,7 +561,10 @@ export async function releaseCheck(db, companyId, lineId) {
   // is offered as the default; when it is not, the screen asks rather than the
   // release failing on the day the last step is recorded.
   const finished = await finishedArea(db, companyId, line, null);
-  const codeTrouble = await codeRuleProblems(db, companyId, line, plan.nodes ?? []);
+  // A locked line's codes were made, and checked, at lock; only a line coded here needs the dry run.
+  const codeTrouble = nodes.length && !line.locked_at
+    ? await codeRuleProblems(db, companyId, line, nodes, await linePositionOf(db, companyId, line.id))
+    : [];
   const [areas] = await db.query(
     "SELECT id, code, name, purpose FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND purpose <> 'quarantine' ORDER BY purpose = ? DESC, code",
     [companyId, line.order_type === 'stock' ? 'storage' : 'dispatch'],
@@ -976,11 +638,8 @@ export async function releaseLine(db, c, lineId, input = {}) {
   await db.query('SELECT id FROM cf_sales_orders WHERE company_id = ? AND id = ? FOR UPDATE', [c.companyId, line.order_id]);
   const plan = await planFor(db, c.companyId, line);
   if (plan.problems.length) throw invalid('NOT_READY', `Line ${line.line_no} of ${line.order_code} cannot be released yet.`, { problems: plan.problems });
-  // Release freezes the line's items, so bring their values up to date first.
-  if (line.line_type === 'custom') {
-    const ids = await temporaryTree(db, c.companyId, line.item_id);
-    if (ids.length) await refreshValues(db, c, ids);
-  }
+  // A line built from a template was brought up to date and frozen when it was
+  // LOCKED (lockService), so there is nothing to refresh here.
   const [[root]] = await db.query('SELECT revision FROM cf_master_records WHERE id = ?', [line.item_id]);
   const finished = await finishedArea(db, c.companyId, line, input.finishedAreaId);
   if (finished.problem) throw invalid('NO_FINISHED_AREA', finished.problem);
@@ -992,14 +651,25 @@ export async function releaseLine(db, c, lineId, input = {}) {
   );
   const releaseId = r.insertId;
   // Every piece of work in progress carries a code, at every level of the tree
-  // (user, 2026-09-23) — from the code generator when a rule says how, and from
-  // a built-in shape when none does (codeNodes, the same coder the preview uses).
-  const coded = await codeNodes(db, c.companyId, line, plan.nodes, { consume: true });
-  if (coded.duplicates.length) {
-    throw invalid('CODE_CLASH', `The coding rule gives more than one piece the code ${coded.duplicates[0]}. Add something that tells them apart — the piece number, or the piece it is part of.`);
-  }
-  if (coded.taken.length) {
-    throw invalid('CODE_CLASH', `${coded.taken[0]} is already the code of a piece on another release. Add something to the rule that tells orders apart — the order number, or a running number.`);
+  // (user, 2026-09-23). A locked line's codes are the ones lock wrote — planFor
+  // attached them by path key, and refused a node the lock never rolled out —
+  // so here they are only checked against every OTHER line's pieces. A standard
+  // line is coded now, by the same coder lock uses.
+  if (line.locked_at) {
+    const taken = await takenCodes(db, c.companyId, line.id, [...new Set(plan.nodes.map((n) => n.code))]);
+    if (taken.length) {
+      throw invalid('CODE_CLASH', `${taken[0]} is already the code of a piece of another line — line ${line.line_no}'s pieces were locked with it. Two lines carry one code; the other line has to change.`, { problems: taken.map((t) => `${t} is taken`) });
+    }
+  } else {
+    const memo = await seedPieceMemo(db, c.companyId, line, plan.nodes);
+    const linePosition = await linePositionOf(db, c.companyId, line.id);
+    const coded = await codeNodes(db, c.companyId, line, plan.nodes, { consume: true, memo, linePosition, takenChunk: 1000 });
+    if (coded.duplicates.length) {
+      throw invalid('CODE_CLASH', `The coding rule gives more than one piece the code ${coded.duplicates[0]}. Add something that tells them apart — the piece number, or the piece it is part of.`);
+    }
+    if (coded.taken.length) {
+      throw invalid('CODE_CLASH', `${coded.taken[0]} is already the code of a piece on another release. Add something to the rule that tells orders apart — the order number, or a running number.`);
+    }
   }
   // Parents are laid out before their children, so each insert knows its parent's id.
   for (const n of plan.nodes) {
@@ -1144,7 +814,8 @@ function evaluate(data) {
   // A numbered piece is called by its code; a grouped node is still called what
   // it is ("stiffener ×6 for segment 1"). Both carry a code — the label is the
   // sentence a person reads, not the identity.
-  const label = (it) => (it.piece_no ? it.code : `${it.item_code} ×${fmt(it.quantity)}${it.parent_id ? ` for ${label(itemById.get(it.parent_id))}` : ''}`);
+  // A row has no code of its own any more (2026-09-26), so a group names its item.
+  const label = (it) => (it.piece_no ? it.code : `${it.item_code ?? it.item_name} ×${fmt(it.quantity)}${it.parent_id ? ` for ${label(itemById.get(it.parent_id))}` : ''}`);
   const started = (s) => !!s.started_at || s.state === 'in_progress' || s.state === 'done';
   const own = (id) => stepsOf.get(id) ?? [];
   const pieceStarted = (id) => own(id).some(started);
