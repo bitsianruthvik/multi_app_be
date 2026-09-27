@@ -74,7 +74,7 @@ import {
   explode, addLine, updateLine, removeLine, assertEditable, ALLOWED_CHILDREN,
 } from './bomService.js';
 import { loadSpecs, coerce, setValues } from './valueService.js';
-import { resolve, dateText } from './resolutionService.js';
+import { resolve, dateText, tableSummary, parseJsonCol } from './resolutionService.js';
 import { linePlaceholders } from './placeholderService.js';
 
 /** How a structure node finds its placeholder: by its BOM line, or by item for what the line sells. */
@@ -219,8 +219,8 @@ async function valuesOfNodes(db, companyId, ids) {
   for (const part of chunk([...new Set(ids)], ID_CHUNK)) {
     const [rows] = await db.query(
       `SELECT v.subject_id, v.specification_id, v.source, v.uom,
-              v.value_number, v.value_text, v.value_bool, v.value_date, v.option_id,
-              s.code, s.name, s.data_type, s.default_uom, o.value AS option_value
+              v.value_number, v.value_text, v.value_bool, v.value_date, v.option_id, v.value_json,
+              s.code, s.name, s.data_type, s.default_uom, s.table_config, o.value AS option_value
          FROM cf_spec_values v
          JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
          LEFT JOIN cf_spec_options o ON o.id = v.option_id
@@ -239,6 +239,8 @@ async function valuesOfNodes(db, companyId, ids) {
         case 'boolean': display = r.value_bool == null ? null : (Number(r.value_bool) ? 'yes' : 'no'); break;
         case 'date': display = dateText(r.value_date); break;
         case 'option': display = r.option_value ?? null; break;
+        // A chart is never edited from this sheet — a summary is all it shows here.
+        case 'table': display = tableSummary(parseJsonCol(r.table_config), parseJsonCol(r.value_json)); break;
         default: display = r.value_text ?? null;
       }
       if (!byNode.has(r.subject_id)) byNode.set(r.subject_id, new Map());
@@ -382,6 +384,9 @@ const indent = (depth, label) => (depth === 0 ? label : `${'  '.repeat(depth - 1
  */
 function specHeader(spec) {
   const unit = spec.uom ? ` (${spec.uom})` : '';
+  // A chart is never edited from this sheet, whatever rule set it — it belongs
+  // to a grid of its own, on the machine or classification it is set up on.
+  if (spec.dataType === 'table') return `${spec.code}${unit} [table — do not edit; open it from the machine or its type]`;
   const kinds = new Set([...spec.sources, ...(spec.rules ?? [])]);
   const typeable = [...kinds].filter((s) => TYPEABLE_SOURCES.has(s));
   const derived = [...kinds].filter((s) => !TYPEABLE_SOURCES.has(s));
@@ -534,7 +539,7 @@ export async function exportSheet(db, companyId, orderLineId, { format = 'xlsx' 
     FIXED_COLUMNS.forEach((c, i) => { if (c.locked) r.getCell(i + 1).fill = GREY; });
     model.specCols.forEach((s, i) => {
       const v = b.vals.get(s.code);
-      if (v && !TYPEABLE_SOURCES.has(v.source)) r.getCell(FIXED_COLUMNS.length + i + 1).fill = GREY;
+      if (v && (s.dataType === 'table' || !TYPEABLE_SOURCES.has(v.source))) r.getCell(FIXED_COLUMNS.length + i + 1).fill = GREY;
     });
     // A line that is not this order line's own is shown for context only — and
     // it cannot be deleted either, so its Delete? cell is shaded with the rest.
@@ -632,6 +637,14 @@ async function buildPlan(db, c, model, sheet) {
 
   const { fixed, specs: specCols } = mapHeaders(sheet[0], problems);
   assertNoProblems(problems, 'That sheet cannot be read.');
+
+  // A column's data type is needed before its cells are read — a table's is
+  // never written back, whatever the sheet's cell says (its column header
+  // already says so; specHeader marks the export the same way).
+  if (specCols.length) {
+    const { byCode: specTypeByCode } = await loadSpecs(db, companyId, specCols.map((s) => ({ specCode: s.code })));
+    for (const col of specCols) col.dataType = specTypeByCode.get(col.code)?.data_type ?? null;
+  }
 
   const cell = (row, key) => (fixed[key] === undefined ? null : text(row[fixed[key]]));
   const bodyRows = sheet.slice(1)
@@ -884,6 +897,13 @@ async function buildPlan(db, c, model, sheet) {
       const was = stored?.display == null ? null : String(stored.display);
       if ((now ?? '') === (was ?? '')) continue;
       if (was !== null && now !== null && !Number.isNaN(Number(was)) && !Number.isNaN(Number(now)) && near(was, now)) continue;
+      if (col.dataType === 'table') {
+        // The cell shows a summary ("15 rows, 6-50 mm"), never the chart
+        // itself — a changed cell is reported rather than silently dropped,
+        // the same as any other edit this sheet cannot carry out.
+        problems.push(`Row ${rowId} (${labelOf(n)}): ${col.code} is a table — its chart cannot be set from this sheet. Open it from the machine or classification it is set up on.`);
+        continue;
+      }
       if (!place.valuesEditable) {
         problems.push(`Row ${rowId} (${labelOf(n)}): ${col.code} cannot be set here — ${n.kind === 'catalog' ? 'it is a catalog item, shared by every order' : `it is ${place.lockedWhy ?? 'not part of this order line'}`}.`);
         continue;

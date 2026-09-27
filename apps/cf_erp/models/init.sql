@@ -2605,3 +2605,60 @@ SET @sql = IF(@fk = 0,
   'ALTER TABLE cf_sales_order_lines ADD CONSTRAINT fk_csol_revises FOREIGN KEY (company_id, revises_line_id) REFERENCES cf_sales_order_lines(company_id, id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 28. TABLE SPECIFICATIONS — a chart is a value too
+-- ===========================================================================
+--
+-- Decided 2026-09-27, reading the plant's own rate charts (Process_Flow_v5.xlsx,
+-- sheet Sample_Calculations — CNC cutting speed by plate thickness, drilling
+-- time by thickness x hole diameter). The user: "Rate charts are SPECIFICATIONS
+-- ON THE MACHINE, read by the formula ... this will be standard for every other
+-- ERP implementation too." So a chart is not a one-off machine feature — it is
+-- a fourth kind of specification VALUE, `table`, beside number/text/boolean/
+-- date/option, usable wherever any other specification is: a machine, a
+-- machine type, an item, a definition.
+--
+-- table_config (on the specification) is the chart's SHAPE, not its numbers:
+-- one or two numeric axes, each `{ label, unit }`, and how a value between two
+-- rows is read —
+--   step_up  the first row AT OR ABOVE the asked value (a 10 mm plate takes the
+--            12 mm speed off the chart — never a faster rate than it gives)
+--   linear   a straight line between the two rows around the asked value
+-- Outside the chart's own range, neither mode invents a number — the value
+-- reads as missing, with the reason (formulaEngine.js, valueService.js). The
+-- chart's OUTPUT unit is the specification's own default_uom, same as a number.
+--
+-- value_json (on the value) holds the chart's numbers:
+--   1-D   { "x": [6, 8, 12], "v": [3535, 2860, 1700] }
+--   2-D   { "x": [...], "y": [...], "v": [[...], ...] }, v[yIndex][xIndex]
+-- `null` in v means the machine cannot do it at that row/column — the chart's
+-- own "x" (a plain absence of a value there — never confused with "not entered
+-- yet", which is the whole value_json column being NULL).
+--
+-- Rules and history need no new machinery: `fixed`/`defaulted` on a machine
+-- TYPE and `entered` on one machine already mean "most specific wins" for any
+-- specification (cf_spec_assignments, §5), and cf_spec_value_history already
+-- stores old/new values as JSON (§6a) — a table's old/new is just more JSON.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications'
+               AND COLUMN_NAME = 'data_type' AND COLUMN_TYPE LIKE '%table%');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_specifications MODIFY COLUMN data_type ENUM('number','text','boolean','date','option','table') NOT NULL DEFAULT 'number'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications' AND COLUMN_NAME = 'table_config');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_specifications ADD COLUMN table_config JSON NULL AFTER decimals',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_values' AND COLUMN_NAME = 'value_json');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_spec_values ADD COLUMN value_json JSON NULL AFTER option_id',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

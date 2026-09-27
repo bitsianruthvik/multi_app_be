@@ -79,8 +79,8 @@ const core = {
   cfErpSpecification: resource({
     table: 'cf_specifications', alias: 'csp',
     cols: [['code', 'string'], ['name', 'string'], ['data_type', 'string'], ['measurement_type', 'string'],
-           ['default_uom', 'string'], ['decimals', 'integer'], ['description', 'text'], ['status', 'string']],
-    write: ['code', 'name', 'data_type', 'measurement_type', 'default_uom', 'decimals', 'description', 'status'],
+           ['default_uom', 'string'], ['decimals', 'integer'], ['table_config', 'json'], ['description', 'text'], ['status', 'string']],
+    write: ['code', 'name', 'data_type', 'measurement_type', 'default_uom', 'decimals', 'table_config', 'description', 'status'],
   }),
 
   cfErpSpecOption: resource({
@@ -123,7 +123,8 @@ const core = {
   cfErpSpecValue: resource({
     table: 'cf_spec_values', alias: 'csv',
     cols: [['specification_id', 'integer'], ['subject_type', 'string'], ['subject_id', 'integer'], ['value_number', 'decimal'],
-           ['value_text', 'string'], ['value_bool', 'boolean'], ['value_date', 'date'], ['option_id', 'integer'], ['uom', 'string'], ['source', 'string']],
+           ['value_text', 'string'], ['value_bool', 'boolean'], ['value_date', 'date'], ['option_id', 'integer'], ['value_json', 'json'],
+           ['uom', 'string'], ['source', 'string']],
     write: [],
     relations: {
       specification: { table: 'cf_specifications', alias: 'csp_v', on: 'csv.specification_id = csp_v.id',

@@ -57,8 +57,9 @@ async function timingUsage(db, companyId, id) {
 
 /**
  * Parses and checks names. Returns { parsed, problems }; `sample` (code -> number,
- * or item.CODE / machine.CODE -> number for a timing formula) is evaluated when
- * given, so the editor can show a result while typing.
+ * or item.CODE / machine.CODE -> number for a timing formula; a table's own code
+ * -> { x, v } / { x, y, v }, its LOOKUP target, for a sample table) is evaluated
+ * when given, so the editor can show a result while typing.
  */
 export async function checkFormula(db, companyId, expression, sample = null) {
   const problems = [];
@@ -69,27 +70,51 @@ export async function checkFormula(db, companyId, expression, sample = null) {
     if (e instanceof FormulaError) return { parsed: null, problems: [e.message], references: [], result: null };
     throw e;
   }
-  const names = [...new Set([...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs])];
+  const lookupRefs = parsed.lookupRefs ?? [];
+  const names = [...new Set([...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs, ...lookupRefs.map((r) => r.code)])];
+  let known = new Map();
   if (names.length) {
     const [rows] = await db.query(
-      'SELECT code, data_type FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN (?)',
+      'SELECT code, data_type, table_config FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN (?)',
       [companyId, names],
     );
-    const known = new Map(rows.map((r) => [r.code, r.data_type]));
-    for (const n of names) {
-      if (!known.has(n)) problems.push(`Unknown specification ${n}.`);
-      else if (known.get(n) !== 'number') problems.push(`${n} is a ${known.get(n)}, not a number.`);
+    known = new Map(rows.map((r) => [r.code, { dataType: r.data_type, tableConfig: typeof r.table_config === 'string' ? JSON.parse(r.table_config) : r.table_config }]));
+    // Ordinary references must all be numbers — a table read this way (not
+    // through LOOKUP) gets its own message, so it says what to do about it.
+    for (const n of [...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs]) {
+      const meta = known.get(n);
+      if (!meta) problems.push(`Unknown specification ${n}.`);
+      else if (meta.dataType === 'table') problems.push(`${n} is a table — read it with LOOKUP(${n}, …).`);
+      else if (meta.dataType !== 'number') problems.push(`${n} is a ${meta.dataType}, not a number.`);
+    }
+    // LOOKUP's own target: must exist, must be a table, and must be asked for
+    // the number of values its own axes take.
+    for (const ref of lookupRefs) {
+      const meta = known.get(ref.code);
+      if (!meta) { problems.push(`Unknown specification ${ref.code}.`); continue; }
+      if (meta.dataType !== 'table') {
+        problems.push(`LOOKUP's first argument must be a table specification — ${ref.code} is a ${meta.dataType}. Read it directly instead of through LOOKUP.`);
+        continue;
+      }
+      const axisCount = meta.tableConfig?.axes?.length || 1;
+      if (ref.arity - 1 !== axisCount) {
+        problems.push(`${ref.code} has ${axisCount} chart axis${axisCount === 1 ? '' : 'es'} — LOOKUP(${ref.code}${axisCount === 1 ? ', x' : ', x, y'}) takes ${axisCount} value${axisCount === 1 ? '' : 's'} to look up, not ${ref.arity - 1}.`);
+      }
     }
   }
   let result = null;
   if (sample && !problems.length && !parsed.usesRollup) {
-    const num = (k) => (sample[k] === undefined || sample[k] === '' || sample[k] === null ? null : Number(sample[k]));
-    const context = parsed.usesContext ? { item: (code) => num(`item.${code}`), machine: (code) => num(`machine.${code}`) } : null;
-    result = evaluateFormula(parsed, num, null, context);
+    const num = (k) => (sample[k] === undefined || sample[k] === '' || sample[k] === null || typeof sample[k] === 'object' ? null : Number(sample[k]));
+    const tableAt = (k) => (sample[k] && typeof sample[k] === 'object' ? sample[k] : null);
+    const context = parsed.usesContext ? {
+      item: (code) => num(`item.${code}`), machine: (code) => num(`machine.${code}`),
+      itemTable: (code) => tableAt(`item.${code}`), machineTable: (code) => tableAt(`machine.${code}`),
+    } : null;
+    result = evaluateFormula(parsed, num, null, context, (code) => tableAt(code));
   }
   return {
     parsed, problems, kind: parsed.kind, references: parsed.references, rollupTerms: parsed.rollupTerms, usesRollup: parsed.usesRollup,
-    itemRefs: parsed.itemRefs, machineRefs: parsed.machineRefs, result,
+    itemRefs: parsed.itemRefs, machineRefs: parsed.machineRefs, lookupRefs, result,
   };
 }
 
@@ -143,8 +168,9 @@ export async function updateFormula(db, c, id, input = {}) {
       if (rules.includes('rollup') && !check.usesRollup) problems.push('Roll-up rules use this formula; it must read BOM children, e.g. SUM(children.WEIGHT).');
       if (rules.length && check.kind === 'timing') problems.push('Specification rules use this formula; it cannot read item. or machine. values.');
       if (await timingUsage(db, c.companyId, id)) {
-        if (check.kind === 'rollup' || (check.kind === 'value' && check.references.length)) {
-          problems.push('Operation timing rules use this formula; it reads item.X and machine.X (or is a plain number).');
+        const bareLookup = (check.lookupRefs ?? []).some((r) => r.role === 'plain');
+        if (check.kind === 'rollup' || (check.kind === 'value' && (check.references.length || bareLookup))) {
+          problems.push('Operation timing rules use this formula; it reads item.X and machine.X (or LOOKUP(item.X, …) / LOOKUP(machine.X, …), or is a plain number).');
         }
       }
     }

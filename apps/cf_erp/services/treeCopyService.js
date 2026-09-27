@@ -28,7 +28,7 @@
 import { invalid } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { subtreeIds } from './tree.js';
-import { dateText } from './resolutionService.js';
+import { dateText, parseJsonCol } from './resolutionService.js';
 
 export const MAX_COPY_DEPTH = 25;
 const ID_CHUNK = 500;   // ids per IN list
@@ -98,7 +98,7 @@ export async function snapshotSubtrees(db, companyId, rootIds, copies) {
   const ids = [...snap.items.keys()];
   for (const part of chunk(ids, ID_CHUNK)) {
     const [vals] = await db.query(
-      `SELECT id, specification_id, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source
+      `SELECT id, specification_id, subject_id, value_number, value_text, value_bool, value_date, option_id, value_json, uom, source
          FROM cf_spec_values
         WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL
         ORDER BY subject_id, id`,
@@ -140,6 +140,7 @@ export function valueSnapshot(v) {
     bool: v.value_bool == null ? null : !!Number(v.value_bool),
     date: dateText(v.value_date),
     option_id: v.option_id ?? null,
+    json: parseJsonCol(v.value_json),
     uom: v.uom ?? null,
     source: v.source,
   };
@@ -267,9 +268,9 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
   const vals = srcIds.flatMap((id) => (snap.values.get(id) ?? []).map((v) => ({ ...v, subject_id: idMap.get(id) })));
   if (vals.length) {
     await insertRows(db, 'cf_spec_values',
-      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source', 'created_by'],
+      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'value_json', 'uom', 'source', 'created_by'],
       vals.map((v) => [companyId, v.specification_id, 'master', v.subject_id, v.value_number, v.value_text, v.value_bool,
-        dateText(v.value_date), v.option_id, v.uom, v.source, c.userId]), rows);
+        dateText(v.value_date), v.option_id, v.value_json == null ? null : JSON.stringify(parseJsonCol(v.value_json)), v.uom, v.source, c.userId]), rows);
     // (company, spec, subject) is uq_csv_value among live rows, so each key is
     // exactly the row just written, whatever id the engine gave it.
     const valueId = new Map();
@@ -336,7 +337,7 @@ export async function deleteTemporaryItems(db, c, itemIds, { chunk: rows = 500 }
   const vals = [];
   for (const part of parts) {
     const [vs] = await db.query(
-      `SELECT id, specification_id, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source
+      `SELECT id, specification_id, subject_id, value_number, value_text, value_bool, value_date, option_id, value_json, uom, source
          FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL`,
       [companyId, part],
     );

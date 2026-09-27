@@ -21,25 +21,112 @@
  * inherited value reads the parent. refreshValues follows both directions until
  * nothing changes any more.
  */
+import { isDeepStrictEqual } from 'node:util';
 import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
 import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS } from './records.js';
-import { resolve, dateText } from './resolutionService.js';
+import { resolve, dateText, tableSummary } from './resolutionService.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null };
+const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null, value_json: null };
+
+/** JSON columns come back parsed on some drivers, as text on others. */
+const parseJsonCol = (v) => (v == null ? null : typeof v === 'string' ? JSON.parse(v) : v);
 
 export async function loadSpecs(db, companyId, entries) {
   const ids = entries.map((e) => e.specificationId).filter((v) => v != null).map(Number);
   const codes = entries.map((e) => e.specCode).filter(Boolean).map((c) => String(c).toUpperCase());
   if (!ids.length && !codes.length) return { byId: new Map(), byCode: new Map() };
   const [rows] = await db.query(
-    `SELECT id, code, name, data_type, default_uom, status FROM cf_specifications
+    `SELECT id, code, name, data_type, default_uom, status, table_config FROM cf_specifications
       WHERE company_id = ? AND deleted_at IS NULL AND (id IN (?) OR code IN (?))`,
     [companyId, ids.length ? ids : [0], codes.length ? codes : ['']],
   );
   return { byId: new Map(rows.map((r) => [r.id, r])), byCode: new Map(rows.map((r) => [r.code.toUpperCase(), r])) };
+}
+
+/**
+ * Validates a table value against its spec's axes (from table_config: one axis
+ * or two) and normalises it to a fixed key order — { x, v } or { x, y, v },
+ * v[yIndex][xIndex] — so two writes of the same chart compare equal. `spec`
+ * needs `code` and `table_config` (loadSpecs already selects it).
+ *
+ * Returns { typed } (value_json-ready, `null` clears the whole chart) or
+ * { problem } in words: which row is wrong and why, never "invalid input".
+ */
+export function validateTableValue(spec, input) {
+  if (input === null || input === undefined || input === '') return { typed: null };
+  // The shared specification editor keeps draft values as strings for every
+  // data type. Decode its chart at this boundary, then apply the same checks.
+  if (typeof input === 'string') {
+    try { input = JSON.parse(input); }
+    catch { return { problem: `${spec.code} needs a valid table of values.` }; }
+  }
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { problem: `${spec.code} needs a table of values (x and v, or x, y and v) — not a plain value.` };
+  }
+  const config = parseJsonCol(spec.table_config);
+  const axisCount = config?.axes?.length || 1;
+
+  const axis = (name, arr) => {
+    if (!Array.isArray(arr) || !arr.length) return { problem: `${spec.code} needs at least one ${name} value.` };
+    const nums = [];
+    for (const raw of arr) {
+      const n = Number(raw);
+      if (!['number', 'string'].includes(typeof raw) || String(raw).trim() === '' || !Number.isFinite(n)) return { problem: `${spec.code}'s ${name} values must all be numbers.` };
+      nums.push(n);
+    }
+    for (let i = 1; i < nums.length; i++) {
+      if (!(nums[i] > nums[i - 1])) return { problem: `${spec.code}'s ${name} values must keep increasing left to right — ${nums[i - 1]} is not less than ${nums[i]}.` };
+    }
+    return { values: nums };
+  };
+  const cell = (raw, where) => {
+    if (raw === null || raw === undefined || raw === '') return { value: null };
+    const n = Number(raw);
+    if (!['number', 'string'].includes(typeof raw) || String(raw).trim() === '' || !Number.isFinite(n)) return { problem: `${spec.code}: ${where} is not a number — leave it blank if the machine cannot do it.` };
+    return { value: Number(n.toFixed(6)) };
+  };
+
+  const x = axis(config?.axes?.[0]?.label || 'x', input.x);
+  if (x.problem) return { problem: x.problem };
+
+  if (axisCount === 1) {
+    if (input.y != null) return { problem: `${spec.code} has one axis — give x and v, not y.` };
+    if (!Array.isArray(input.v)) return { problem: `${spec.code} needs a v value under every x.` };
+    if (input.v.length !== x.values.length) {
+      return { problem: `${spec.code}: ${x.values.length} x value(s) but ${input.v.length} v value(s) — every column needs exactly one row.` };
+    }
+    const v = [];
+    for (let i = 0; i < input.v.length; i++) {
+      const c = cell(input.v[i], `the value at x = ${x.values[i]}`);
+      if (c.problem) return { problem: c.problem };
+      v.push(c.value);
+    }
+    return { typed: { ...EMPTY, value_json: { x: x.values, v } } };
+  }
+
+  const y = axis(config?.axes?.[1]?.label || 'y', input.y);
+  if (y.problem) return { problem: y.problem };
+  if (!Array.isArray(input.v) || input.v.length !== y.values.length) {
+    return { problem: `${spec.code}: ${y.values.length} y value(s) but ${Array.isArray(input.v) ? input.v.length : 0} row(s) of v — every y needs one row.` };
+  }
+  const v = [];
+  for (let j = 0; j < input.v.length; j++) {
+    const row = input.v[j];
+    if (!Array.isArray(row) || row.length !== x.values.length) {
+      return { problem: `${spec.code}: the row for y = ${y.values[j]} has ${Array.isArray(row) ? row.length : 0} value(s), not ${x.values.length} — every x needs one column.` };
+    }
+    const outRow = [];
+    for (let i = 0; i < row.length; i++) {
+      const c = cell(row[i], `the value at x = ${x.values[i]}, y = ${y.values[j]}`);
+      if (c.problem) return { problem: c.problem };
+      outRow.push(c.value);
+    }
+    v.push(outRow);
+  }
+  return { typed: { ...EMPTY, value_json: { x: x.values, y: y.values, v } } };
 }
 
 async function loadSpecOptions(db, companyId, specId) {
@@ -56,6 +143,9 @@ async function loadSpecOptions(db, companyId, specId) {
  */
 export async function coerce(db, companyId, spec, input, allowedOptionIds = null) {
   if (input === null || input === undefined || input === '') return { typed: null };
+  // Every OTHER type takes a plain value — an object here is a caller mistake
+  // (e.g. a table value sent for a number spec), not a value to coerce into text.
+  if (spec.data_type !== 'table' && typeof input === 'object') return { problem: `${spec.code} needs a plain value, not a table.` };
   switch (spec.data_type) {
     case 'number': {
       const n = typeof input === 'number' ? input : Number(String(input).trim());
@@ -91,6 +181,8 @@ export async function coerce(db, companyId, spec, input, allowedOptionIds = null
       }
       return { typed: { ...EMPTY, option_id: found.id } };
     }
+    case 'table':
+      return validateTableValue(spec, input);
     default:
       return { problem: `${spec.code} has an unknown data type.` };
   }
@@ -104,7 +196,10 @@ function sameValue(row, typed) {
   return (row.value_text ?? null) === (typed.value_text ?? null)
     && (row.value_bool == null ? null : Number(row.value_bool)) === (typed.value_bool == null ? null : Number(typed.value_bool))
     && dateText(row.value_date) === (typed.value_date ?? null)
-    && (row.option_id ?? null) === (typed.option_id ?? null);
+    && (row.option_id ?? null) === (typed.option_id ?? null)
+    // MySQL reorders JSON object keys. Compare contents so an unchanged chart
+    // does not write history or keep a materialization cascade running.
+    && isDeepStrictEqual(parseJsonCol(row.value_json), typed.value_json ?? null);
 }
 
 function snapshot(row, source, uom) {
@@ -115,6 +210,7 @@ function snapshot(row, source, uom) {
     bool: row.value_bool == null ? null : !!Number(row.value_bool),
     date: dateText(row.value_date),
     option_id: row.option_id ?? null,
+    json: row.value_json === undefined ? null : parseJsonCol(row.value_json),
     uom: uom ?? row.uom ?? null,
     source: source ?? row.source,
   };
@@ -178,8 +274,11 @@ const chunk = (xs, n) => {
   return out;
 };
 
-const SET_COLS = ['value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source'];
-const cellOf = (r, col) => (col === 'uom' ? r.uom : col === 'source' ? r.source : r.typed[col]);
+const SET_COLS = ['value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'value_json', 'uom', 'source'];
+// mysql2 does not serialise a JS object into a JSON column on its own (the
+// codebase's other JSON writer, insertHistory, stringifies explicitly too).
+const cellOf = (r, col) => (col === 'uom' ? r.uom : col === 'source' ? r.source
+  : col === 'value_json' ? (r.typed.value_json == null ? null : JSON.stringify(r.typed.value_json)) : r.typed[col]);
 
 /** The live value rows for these specs on one subject, keyed by specification_id. */
 async function ownRowsFor(db, companyId, subjectType, subjectId, specIds) {
@@ -209,9 +308,10 @@ async function updateRows(db, rows) {
       const r = part[0];
       await db.query(
         `UPDATE cf_spec_values
-            SET value_number = ?, value_text = ?, value_bool = ?, value_date = ?, option_id = ?, uom = ?, source = ?
+            SET value_number = ?, value_text = ?, value_bool = ?, value_date = ?, option_id = ?, value_json = ?, uom = ?, source = ?
           WHERE id = ?`,
-        [r.typed.value_number, r.typed.value_text, r.typed.value_bool, r.typed.value_date, r.typed.option_id, r.uom, r.source, r.id],
+        [r.typed.value_number, r.typed.value_text, r.typed.value_bool, r.typed.value_date, r.typed.option_id,
+          r.typed.value_json == null ? null : JSON.stringify(r.typed.value_json), r.uom, r.source, r.id],
       );
       continue;
     }
@@ -232,12 +332,13 @@ async function insertRows(db, c, subjectType, subjectId, rows) {
     const params = [];
     for (const r of part) {
       params.push(c.companyId, r.spec.id, subjectType, subjectId, r.typed.value_number, r.typed.value_text,
-        r.typed.value_bool, r.typed.value_date, r.typed.option_id, r.uom, r.source, c.userId);
+        r.typed.value_bool, r.typed.value_date, r.typed.option_id,
+        r.typed.value_json == null ? null : JSON.stringify(r.typed.value_json), r.uom, r.source, c.userId);
     }
     await db.query(
       `INSERT INTO cf_spec_values
-         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source, created_by)
-       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, value_json, uom, source, created_by)
+       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
       params,
     );
   }
@@ -461,6 +562,7 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
     value_bool: row.value_bool == null ? null : Number(row.value_bool),
     value_date: dateText(row.value_date),
     option_id: row.option_id ?? null,
+    value_json: row.value_json === undefined ? null : parseJsonCol(row.value_json),
   } : null);
 
   const produced = new Set();
@@ -637,7 +739,7 @@ export async function deleteAllForSubject(db, c, subjectType, subjectId) {
 export async function getHistory(db, companyId, subjectType, subjectId, limit = 200) {
   const [rows] = await db.query(
     `SELECT h.id, h.change_type, h.old_value, h.new_value, h.changed_at, h.changed_by,
-            s.code AS spec_code, s.name AS spec_name, s.data_type, s.decimals, s.default_uom,
+            s.code AS spec_code, s.name AS spec_name, s.data_type, s.decimals, s.default_uom, s.table_config,
             u.email AS changed_by_email
        FROM cf_spec_value_history h
        JOIN cf_specifications s ON s.id = h.specification_id
@@ -655,6 +757,7 @@ export async function getHistory(db, companyId, subjectType, subjectId, limit = 
     if (j.number != null) return row.decimals == null ? String(j.number) : Number(j.number).toFixed(row.decimals);
     if (j.option_id != null) return optionText.get(j.option_id) ?? `#${j.option_id}`;
     if (j.bool != null) return j.bool ? 'Yes' : 'No';
+    if (j.json != null) return tableSummary(parseJsonCol(row.table_config), j.json);
     return j.date ?? j.text ?? null;
   };
   return rows.map((row) => {

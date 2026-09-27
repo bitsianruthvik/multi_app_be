@@ -26,6 +26,15 @@
  * `item.X` and `machine.X` make a TIMING formula: minutes for a machine working
  * on an item — "item.CUT_LENGTH / machine.CUTTING_SPEED". One formula then gives
  * each machine its own time from its own specs.
+ *
+ * `LOOKUP(t, x)` and `LOOKUP(t, x, y)` read a TABLE specification — a chart,
+ * e.g. cutting speed by plate thickness. `t` names the table (a plain code, or
+ * item.X / machine.X exactly like any other reference) and must be a bare name
+ * in that position; everywhere else a table specification is a check error; see
+ * "CUT_SPEED is a table" in formulaService.checkFormula. Reading outside the
+ * chart's range, or a cell the chart marks null, is not an error — the FORMULA'S
+ * result is simply missing, with the reason, same as any other unmeasured input
+ * (MissingValueError, caught in evaluateFormula).
  */
 
 export class FormulaError extends Error {
@@ -33,6 +42,11 @@ export class FormulaError extends Error {
     super(position == null ? message : `${message} (at character ${position + 1})`);
     this.position = position;
   }
+}
+
+/** A LOOKUP that fell outside the chart, or landed on a null cell — reported as `missing`, never as `error`, because it is a data gap, not a formula mistake. */
+export class MissingValueError extends FormulaError {
+  constructor(reason) { super(reason); this.isMissing = true; }
 }
 
 const FUNCTIONS = {
@@ -46,6 +60,7 @@ const FUNCTIONS = {
   IF: { min: 3, max: 3, lazy: true },
 };
 const ROLLUP_FUNCTIONS = new Set(['SUM', 'COUNT', 'AVG']);
+const LOOKUP_FN = 'LOOKUP';
 const COMPARISONS = new Set(['<', '<=', '>', '>=', '=', '==', '!=', '<>']);
 
 function tokenize(src) {
@@ -91,11 +106,14 @@ function parseTokens(tokens) {
         }
         expect(')');
         const fname = tok.v.toUpperCase();
-        if (!FUNCTIONS[fname] && !ROLLUP_FUNCTIONS.has(fname)) throw new FormulaError(`Unknown function ${tok.v}`, tok.p);
+        if (!FUNCTIONS[fname] && !ROLLUP_FUNCTIONS.has(fname) && fname !== LOOKUP_FN) throw new FormulaError(`Unknown function ${tok.v}`, tok.p);
         const spec = FUNCTIONS[fname];
         if (spec && (args.length < spec.min || args.length > spec.max)) {
           throw new FormulaError(`${fname} takes ${spec.min === spec.max ? spec.min : `${spec.min}+`} argument(s)`, tok.p);
         }
+        // LOOKUP's own shape (2 or 3 args, a table name first) is checked once
+        // the whole tree exists — checkLookupUsage, below — so it can name the
+        // table in its message.
         return { type: 'call', name: fname, args };
       }
       return { type: 'ref', name: tok.v };
@@ -145,12 +163,57 @@ function walk(ast, visit) {
 }
 
 /**
+ * Walks the tree collecting plain references (specs of the same record),
+ * item./machine. refs (timing context) and children.X (roll-up terms) — the
+ * same job walk() does for every other purpose below, except a LOOKUP's own
+ * first argument is pulled into `lookupRefs` instead of the ordinary sets: it
+ * names a TABLE, not a number, so it must never also count as "this formula
+ * reads CUT_SPEED as a number" (that read happens through LOOKUP, nowhere else).
+ * LOOKUP's other argument(s) — the value(s) to look up — are read normally, so
+ * `LOOKUP(machine.CUT_SPEED, item.THICKNESS)` still records item.THICKNESS as
+ * an ordinary timing reference.
+ */
+function collectRefs(ast, sets) {
+  if (ast.type === 'ref') {
+    const m = /^(children|item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(ast.name);
+    if (m) ({ children: sets.rollupTerms, item: sets.itemRefs, machine: sets.machineRefs }[m[1].toLowerCase()]).add(m[2].toUpperCase());
+    else if (ast.name.includes('.')) throw new FormulaError(`"${ast.name}" is not a name this formula can read`);
+    else sets.references.add(ast.name.toUpperCase());
+    return;
+  }
+  if (ast.type === 'bin') { collectRefs(ast.left, sets); collectRefs(ast.right, sets); return; }
+  if (ast.type === 'neg') { collectRefs(ast.arg, sets); return; }
+  if (ast.type === 'call') {
+    if (ast.name === LOOKUP_FN) {
+      const t = ast.args[0];
+      if (!t || t.type !== 'ref') {
+        throw new FormulaError('LOOKUP\'s first argument names a table specification, e.g. LOOKUP(machine.CUT_SPEED, item.THICKNESS)');
+      }
+      if (ast.args.length < 2 || ast.args.length > 3) {
+        throw new FormulaError('LOOKUP takes a table and one value to look up (or two, for a table with two axes)');
+      }
+      const cx = /^(item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(t.name);
+      if (cx) sets.lookupRefs.push({ role: cx[1].toLowerCase(), code: cx[2].toUpperCase(), arity: ast.args.length });
+      else if (t.name.includes('.')) throw new FormulaError(`"${t.name}" is not a name this formula can read`);
+      else sets.lookupRefs.push({ role: 'plain', code: t.name.toUpperCase(), arity: ast.args.length });
+      for (let i = 1; i < ast.args.length; i++) collectRefs(ast.args[i], sets);
+      return;
+    }
+    if (ROLLUP_FUNCTIONS.has(ast.name)) sets.usesRollupFunction = true;
+    ast.args.forEach((a) => collectRefs(a, sets));
+  }
+}
+
+/**
  * Parses an expression. Returns { ast, references, rollupTerms, usesRollup,
- * itemRefs, machineRefs, usesContext, kind }:
+ * itemRefs, machineRefs, lookupRefs, usesContext, kind }:
  *   references   — plain names (spec codes) the formula reads from the same record
  *   rollupTerms  — names read from BOM children (children.X -> X)
  *   itemRefs     — item.X: the item being worked on (timing formulas)
  *   machineRefs  — machine.X: the machine doing it (timing formulas)
+ *   lookupRefs   — [{ role: 'plain'|'item'|'machine', code, arity }], one per
+ *                  LOOKUP call's first argument — the TABLE it reads, never
+ *                  double-counted in references/itemRefs/machineRefs
  *   kind         — 'value' (plain names or none), 'rollup' or 'timing'
  * A formula is one kind or another: in one that reads item. or machine. values
  * every name needs its prefix, and none can also roll up BOM children.
@@ -158,26 +221,23 @@ function walk(ast, visit) {
 export function parseFormula(expression) {
   if (typeof expression !== 'string' || !expression.trim()) throw new FormulaError('The formula is empty');
   const ast = parseTokens(tokenize(expression));
-  const references = new Set();
-  const rollupTerms = new Set();
-  const itemRefs = new Set();
-  const machineRefs = new Set();
-  let usesRollupFunction = false;
-  walk(ast, (n) => {
-    if (n.type === 'ref') {
-      const m = /^(children|item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(n.name);
-      if (m) ({ children: rollupTerms, item: itemRefs, machine: machineRefs }[m[1].toLowerCase()]).add(m[2].toUpperCase());
-      else if (n.name.includes('.')) throw new FormulaError(`"${n.name}" is not a name this formula can read`);
-      else references.add(n.name.toUpperCase());
-    }
-    if (n.type === 'call' && ROLLUP_FUNCTIONS.has(n.name)) usesRollupFunction = true;
-  });
+  const sets = { references: new Set(), rollupTerms: new Set(), itemRefs: new Set(), machineRefs: new Set(), lookupRefs: [], usesRollupFunction: false };
+  collectRefs(ast, sets);
   checkRollupPlacement(ast, false);
+  const { references, rollupTerms, itemRefs, machineRefs, lookupRefs, usesRollupFunction } = sets;
   const usesRollup = usesRollupFunction || rollupTerms.size > 0;
-  const usesContext = itemRefs.size > 0 || machineRefs.size > 0;
+  // A LOOKUP on item.X / machine.X makes this a timing formula even when that
+  // is the ONLY item./machine. name in it (e.g. LOOKUP(machine.CUT_SPEED, 12)).
+  const usesContext = itemRefs.size > 0 || machineRefs.size > 0 || lookupRefs.some((r) => r.role === 'item' || r.role === 'machine');
   if (usesContext && usesRollup) throw new FormulaError('A timing formula (item. / machine.) cannot also roll up BOM children');
   if (usesContext && references.size) {
     throw new FormulaError(`${[...references][0]} needs a prefix — in a formula that reads item. or machine. values, say item.${[...references][0]} or machine.${[...references][0]}`);
+  }
+  if (usesContext) {
+    const bare = lookupRefs.find((r) => r.role === 'plain');
+    if (bare) {
+      throw new FormulaError(`${bare.code} needs a prefix — in a formula that reads item. or machine. values, say LOOKUP(item.${bare.code}, …) or LOOKUP(machine.${bare.code}, …)`);
+    }
   }
   return {
     ast,
@@ -186,6 +246,7 @@ export function parseFormula(expression) {
     usesRollup,
     itemRefs: [...itemRefs],
     machineRefs: [...machineRefs],
+    lookupRefs,
     usesContext,
     kind: usesRollup ? 'rollup' : usesContext ? 'timing' : 'value',
   };
@@ -241,13 +302,85 @@ const hasValue = (v) => v !== null && v !== undefined && !Number.isNaN(v);
  * "item · CODE" / "machine · CODE"), or { value: null, error } for arithmetic
  * that has no answer.
  */
-export function evaluateFormula(parsed, lookup, children = null, context = null) {
+/**
+ * `table` is a resolved table value: { mode, axes, x, v } (one axis) or
+ * { mode, axes, x, y, v } (two). Returns { value } or { missingReason } in
+ * words — never invents a rate the chart does not give (contract: outside the
+ * chart's range, or a null cell, is a missing value, not an error).
+ */
+function lookupTableValue(table, x, y) {
+  const EPS = 1e-9;
+  const xs = table.x;
+  if (!Array.isArray(xs) || !xs.length) return { missingReason: 'has no chart rows yet' };
+  const unit0 = table.axes?.[0]?.unit ? ` ${table.axes[0].unit}` : '';
+  if (x < xs[0] - EPS) return { missingReason: `${x}${unit0} is below the chart's range, which starts at ${xs[0]}${unit0}` };
+  if (x > xs[xs.length - 1] + EPS) return { missingReason: `${x}${unit0} is above the chart's range, which ends at ${xs[xs.length - 1]}${unit0}` };
+  const linear = table.mode === 'linear';
+
+  // Where x sits: an exact row (i0 === i1, t = 0), or bracketed between two
+  // (i0 below, i1 above). step_up reads row i1 regardless of t — the first row
+  // AT OR ABOVE x is exactly what an exact match or a bracket's upper end is.
+  const bracket = (arr, v) => {
+    const exact = arr.findIndex((a) => Math.abs(a - v) < EPS);
+    if (exact >= 0) return { i0: exact, i1: exact, t: 0 };
+    let i0 = 0;
+    while (i0 < arr.length - 1 && arr[i0 + 1] < v) i0++;
+    const i1 = i0 + 1;
+    return { i0, i1, t: (v - arr[i0]) / (arr[i1] - arr[i0]) };
+  };
+
+  const twoD = Array.isArray(table.y) && table.y.length > 0;
+  if (!twoD) {
+    const { i0, i1, t } = bracket(xs, x);
+    if (!linear) {
+      const v = table.v[i1];
+      return v == null ? { missingReason: `has no rate at ${xs[i1]}${unit0} — the chart marks it blank` } : { value: v };
+    }
+    const v0 = table.v[i0];
+    const v1 = table.v[i1];
+    if (v0 == null || v1 == null) return { missingReason: `has no rate at one end of the rows around ${x}${unit0} — the chart marks it blank` };
+    return { value: v0 + (v1 - v0) * t };
+  }
+
+  const ys = table.y;
+  const unit1 = table.axes?.[1]?.unit ? ` ${table.axes[1].unit}` : '';
+  if (y == null || !Number.isFinite(y)) return { missingReason: 'needs a second value to look up — it has two axes' };
+  if (y < ys[0] - EPS) return { missingReason: `${y}${unit1} is below the chart's range, which starts at ${ys[0]}${unit1}` };
+  if (y > ys[ys.length - 1] + EPS) return { missingReason: `${y}${unit1} is above the chart's range, which ends at ${ys[ys.length - 1]}${unit1}` };
+  const bx = bracket(xs, x);
+  const by = bracket(ys, y);
+  if (!linear) {
+    const v = table.v[by.i1]?.[bx.i1];
+    return v == null ? { missingReason: `has no rate at ${xs[bx.i1]}${unit0} / ${ys[by.i1]}${unit1} — the chart marks it blank` } : { value: v };
+  }
+  // Bilinear: when a bracket is exact (t or u = 0) the two "sides" of that
+  // axis are the same cell, so this reads correctly even right on a row.
+  const c00 = table.v[by.i0]?.[bx.i0];
+  const c01 = table.v[by.i0]?.[bx.i1];
+  const c10 = table.v[by.i1]?.[bx.i0];
+  const c11 = table.v[by.i1]?.[bx.i1];
+  if ([c00, c01, c10, c11].some((c) => c == null)) return { missingReason: `has a blank cell near ${x}${unit0} / ${y}${unit1} — the chart marks the machine as unable to there` };
+  const top = c00 + (c01 - c00) * bx.t;
+  const bottom = c10 + (c11 - c10) * bx.t;
+  return { value: top + (bottom - top) * by.t };
+}
+
+export function evaluateFormula(parsed, lookup, children = null, context = null, lookupTable = null) {
   if (parsed.usesRollup && !children) return { value: null, error: 'Roll-up terms are evaluated from BOM lines.' };
   if (parsed.usesContext && !context) return { value: null, error: 'item. and machine. values are read when a machine works on an item.' };
   const missing = parsed.references.filter((code) => !hasValue(lookup(code)));
   if (parsed.usesContext) {
     for (const code of parsed.itemRefs ?? []) if (!hasValue(context.item(code))) missing.push(`item · ${code}`);
     for (const code of parsed.machineRefs ?? []) if (!hasValue(context.machine(code))) missing.push(`machine · ${code}`);
+  }
+  // A table not yet fixed, defaulted or entered anywhere reachable is the same
+  // class of gap as any other unmeasured input — reported here, before the
+  // chart's own range/null-cell checks run inside ev() below.
+  const tableOf = (ref) => (ref.role === 'item' ? context?.itemTable?.(ref.code)
+    : ref.role === 'machine' ? context?.machineTable?.(ref.code)
+    : lookupTable?.(ref.code));
+  for (const ref of parsed.lookupRefs ?? []) {
+    if (!tableOf(ref)) missing.push(ref.role === 'plain' ? ref.code : `${ref.role} · ${ref.code}`);
   }
   if (parsed.usesRollup) {
     walk(parsed.ast, (n) => {
@@ -274,6 +407,25 @@ export function evaluateFormula(parsed, lookup, children = null, context = null)
     if (!pieces) throw new FormulaError('There are no child pieces to average');
     return sum / pieces;
   }
+  /** LOOKUP(t, x[, y]) — t is n.args[0], already checked (parseFormula) to be a bare/item./machine. reference. */
+  function lookupCall(n, child) {
+    const t = n.args[0];
+    const cx = CONTEXT_REF.exec(t.name);
+    const role = cx ? cx[1].toLowerCase() : 'plain';
+    const code = (cx ? cx[2] : t.name).toUpperCase();
+    const named = role === 'plain' ? code : `${role}.${code}`;
+    const table = tableOf({ role, code });
+    if (!table) throw new MissingValueError(`${named} has no chart set yet`);
+    const axisCount = Array.isArray(table.y) && table.y.length ? 2 : 1;
+    if (n.args.length - 1 !== axisCount) {
+      throw new FormulaError(`${code} has ${axisCount} chart axis${axisCount === 1 ? '' : 'es'} — LOOKUP(${code}${axisCount === 1 ? ', x' : ', x, y'}) takes ${axisCount} value${axisCount === 1 ? '' : 's'} to look up, not ${n.args.length - 1}`);
+    }
+    const x = ev(n.args[1], child);
+    const y = n.args[2] ? ev(n.args[2], child) : null;
+    const out = lookupTableValue(table, x, y);
+    if (out.missingReason) throw new MissingValueError(`${named} ${out.missingReason}`);
+    return out.value;
+  }
   function ev(n, child = null) {
     switch (n.type) {
       case 'num': return n.value;
@@ -286,6 +438,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null)
       }
       case 'neg': return -ev(n.arg, child);
       case 'call': {
+        if (n.name === LOOKUP_FN) return lookupCall(n, child);
         if (ROLLUP_FUNCTIONS.has(n.name)) return rollup(n);
         if (n.name === 'IF') return ev(n.args[0], child) ? ev(n.args[1], child) : ev(n.args[2], child);
         return FUNCTIONS[n.name].fn(...n.args.map((a) => ev(a, child)));
@@ -317,6 +470,9 @@ export function evaluateFormula(parsed, lookup, children = null, context = null)
     if (!Number.isFinite(value)) return { value: null, error: 'The result is not a finite number.' };
     return { value: Number(value.toFixed(6)) };
   } catch (e) {
+    // A LOOKUP outside its chart's range, or on a null cell, is a data gap —
+    // reported the way every other unmeasured input is, not as a formula bug.
+    if (e.isMissing) return { value: null, missing: [e.message] };
     return { value: null, error: e.message };
   }
 }

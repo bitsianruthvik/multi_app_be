@@ -332,6 +332,16 @@ const numericValues = (resolution) => {
   };
 };
 
+/** Same idea as numericValues, for a table spec — LOOKUP's own reader. */
+const tableValues = (resolution) => {
+  const map = effectiveByCode(resolution);
+  return (code) => {
+    const v = map.get(code);
+    if (!v || v.dataType !== 'table' || v.raw == null) return null;
+    return { mode: v.tableConfig?.mode ?? 'step_up', axes: v.tableConfig?.axes ?? [], ...v.raw };
+  };
+};
+
 /**
  * How long a machine takes to do an operation on an item: setup (per run) plus
  * work (per piece) × quantity, from the rule that applies, with its formulas
@@ -354,9 +364,16 @@ export async function timingPreview(db, companyId, operationId, input = {}) {
     item = await loadMaster(db, companyId, Number(input.itemId));
     if (!item || item.record_kind !== 'item') throw invalid('INVALID', 'Choose an item to time.');
   }
+  // Resolved once per subject and shared by both readers below — a formula
+  // reading item.CUT_LENGTH and LOOKUP(item.SOME_CHART, ...) must not pay for
+  // resolving the item's specs twice.
+  const itemResolution = item ? await resolve(db, companyId, { master: item }) : null;
+  const machineResolution = await resolve(db, companyId, { machine });
   const context = {
-    item: item ? numericValues(await resolve(db, companyId, { master: item })) : () => null,
-    machine: numericValues(await resolve(db, companyId, { machine })),
+    item: itemResolution ? numericValues(itemResolution) : () => null,
+    machine: numericValues(machineResolution),
+    itemTable: itemResolution ? tableValues(itemResolution) : () => null,
+    machineTable: tableValues(machineResolution),
   };
   // No setup on the rule means none; no work time means the rule is not finished.
   const evaluate = (time, what) => {

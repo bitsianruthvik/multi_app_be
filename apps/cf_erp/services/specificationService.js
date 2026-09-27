@@ -14,9 +14,13 @@ import { findSegmentsUsingToken } from '../modules/codegen/index.js';
 import { resolve } from './resolutionService.js';
 import { requireNode } from './tree.js';
 
-export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option'];
+export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option', 'table'];
 export const MEASUREMENT_TYPES = ['LENGTH', 'AREA', 'VOLUME', 'MASS', 'DENSITY', 'COUNT', 'TIME', 'SPEED', 'FORCE', 'PRESSURE', 'TEMPERATURE', 'ANGLE', 'RATIO'];
+export const TABLE_MODES = ['step_up', 'linear'];
 const CODE_RE = /^[A-Z][A-Z0-9_]*$/;
+
+/** JSON columns come back parsed on some drivers, as text on others (valueService.getHistory does the same guard). */
+const parseJson = (v) => (v == null ? null : typeof v === 'string' ? JSON.parse(v) : v);
 
 async function requireSpec(db, companyId, id) {
   const [[row]] = await db.query('SELECT * FROM cf_specifications WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
@@ -29,9 +33,35 @@ function shapeSpec(s, options = [], usage = {}) {
     id: s.id, code: s.code, name: s.name, dataType: s.data_type, measurementType: s.measurement_type,
     defaultUom: s.default_uom, decimals: s.decimals, description: s.description, status: s.status,
     options: s.data_type === 'option' ? options.map((o) => ({ id: o.id, value: o.value, label: o.label, sortOrder: o.sort_order, status: o.status })) : undefined,
+    tableConfig: s.data_type === 'table' ? parseJson(s.table_config) : undefined,
     ruleCount: Number(usage.rules ?? 0),
     valueCount: Number(usage.values ?? 0),
   };
+}
+
+/**
+ * table_config: { axes: [{ label, unit? }, { label, unit? }?], mode }. One
+ * axis is a chart with one input (thickness -> speed); two is a chart with two
+ * (thickness x hole diameter -> time) — table_spec_value validates a value
+ * against however many axes this says there are. mode defaults to step_up,
+ * the side that never invents a faster rate than the chart gives.
+ */
+function readTableConfig(input, problems) {
+  const axesIn = Array.isArray(input?.axes) ? input.axes : [];
+  if (!axesIn.length || axesIn.length > 2) {
+    problems.push('A table needs one or two axes — e.g. thickness alone, or thickness and hole diameter.');
+    return null;
+  }
+  const axes = axesIn.map((a, i) => {
+    const label = String(a?.label ?? '').trim();
+    if (!label || label.length > 100) problems.push(`Axis ${i + 1} needs a label (up to 100 characters), e.g. "Thickness".`);
+    const unit = a?.unit ? String(a.unit).trim() : null;
+    if (unit && unit.length > 20) problems.push(`Axis ${i + 1}'s unit is up to 20 characters.`);
+    return { label, unit: unit || null };
+  });
+  const mode = input?.mode ? String(input.mode).trim() : 'step_up';
+  if (!TABLE_MODES.includes(mode)) problems.push(`How to read between rows is ${TABLE_MODES.join(' or ')} — the next row up, or a straight line between rows.`);
+  return { axes, mode };
 }
 
 export async function listSpecs(db, companyId) {
@@ -104,13 +134,19 @@ export async function createSpec(db, c, input = {}) {
     else if (seen.has(v.toLowerCase())) problems.push(`Option ${v} is listed twice.`);
     seen.add(v.toLowerCase());
   }
+  let tableConfig = null;
+  if (dataType === 'table') {
+    tableConfig = readTableConfig(input.tableConfig, problems);
+  } else if (input.tableConfig != null) {
+    problems.push('Axes apply to table specifications only.');
+  }
   assertNoProblems(problems);
 
   const [r] = await db.query(
-    `INSERT INTO cf_specifications (company_id, code, name, data_type, measurement_type, default_uom, decimals, description, status, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_specifications (company_id, code, name, data_type, measurement_type, default_uom, decimals, table_config, description, status, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, code, fields.name, dataType, fields.measurement_type ?? null, fields.default_uom ?? null,
-      fields.decimals ?? null, fields.description ?? null, fields.status ?? 'active', c.userId],
+      fields.decimals ?? null, tableConfig ? JSON.stringify(tableConfig) : null, fields.description ?? null, fields.status ?? 'active', c.userId],
   );
   for (const [i, o] of options.entries()) {
     await db.query(
@@ -128,11 +164,32 @@ export async function updateSpec(db, c, id, input = {}) {
     problems.push('A specification code is permanent — formulas and coding rules refer to it.');
   }
   const fields = readCommon(input, problems);
+  let dataType = spec.data_type;
   if (input.dataType !== undefined && input.dataType !== spec.data_type) {
     if (!DATA_TYPES.includes(input.dataType)) problems.push(`Data type is one of ${DATA_TYPES.join(', ')}.`);
     const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
     if (Number(n)) problems.push(`${spec.code} already has ${n} value(s); its data type cannot change.`);
     fields.data_type = input.dataType;
+    dataType = input.dataType;
+  }
+  if (input.tableConfig !== undefined) {
+    if (dataType !== 'table') {
+      if (input.tableConfig != null) problems.push('Axes apply to table specifications only.');
+    } else {
+      // Changing the axis COUNT once values exist would leave them the wrong
+      // shape (a 1-D chart's { x, v } cannot become a 2-D { x, y, v }) — a
+      // relabel or a change of lookup mode does not touch the shape, so those
+      // stay free even with values on record.
+      const already = spec.data_type === 'table' ? parseJson(spec.table_config) : null;
+      const next = readTableConfig(input.tableConfig, problems);
+      if (already && next && already.axes.length !== next.axes.length) {
+        const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+        if (Number(n)) problems.push(`${spec.code} already has ${n} chart value(s) built for ${already.axes.length} axis${already.axes.length === 1 ? '' : 'es'} — changing to ${next.axes.length} would not match them. Retire it and make a new one instead.`);
+      }
+      if (next) fields.table_config = JSON.stringify(next);
+    }
+  } else if (dataType === 'table' && spec.data_type !== 'table') {
+    problems.push('A table specification needs its axes.');
   }
   assertNoProblems(problems);
   const keys = Object.keys(fields);

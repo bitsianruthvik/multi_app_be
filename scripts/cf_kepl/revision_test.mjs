@@ -61,6 +61,7 @@ const SO = await imp('apps/cf_erp/services/salesOrderService.js');
 const MR = await imp('apps/cf_erp/services/masterRecordService.js');
 const OV = await imp('apps/cf_erp/services/orderValuesService.js');
 const V = await imp('apps/cf_erp/services/valueService.js');
+const SPEC = await imp('apps/cf_erp/services/specificationService.js');
 const REL = await imp('apps/cf_erp/services/releaseService.js');
 const NEST = await imp('apps/cf_erp/services/nestingService.js');
 const STOCK = await imp('apps/cf_erp/services/stockService.js');
@@ -411,6 +412,13 @@ try {
   same('line 10\'s web is cut from PL2 now, the rest from the default PL1', a10After.map((p) => [p.name.includes('500') ? 'web' : 'other', p.plate]),
     a10After.map((p) => [p.name.includes('500') ? 'web' : 'other', p.name.includes('500') ? f.PL2.id : f.PL1.id]));
   ok('a cut plate code is the tenant\'s own shape: order, line, the rectangle', a10After.some((p) => p.code === `${A.code}-10-CUTPL-12X500X2000-E350`), a10After.map((p) => p.code).join(', '));
+  // A chart is a specification value too: revisions must preserve it and its audit history.
+  const chartSpec = await SPEC.createSpec(conn, c, { code: `${tag}_CHART`, name: `${tag} chart`, dataType: 'table',
+    tableConfig: { axes: [{ label: 'Thickness', unit: 'mm' }, { label: 'Diameter', unit: 'mm' }], mode: 'step_up' } });
+  await createRule(conn, c, { specificationId: chartSpec.id, subjectType: 'master', subjectId: a10.item.id,
+    captureAt: 'item', valueRule: 'entered' });
+  const chartValue = { x: [10, 20], y: [21, 25], v: [[50, 80], [null, null]] };
+  await V.setValues(conn, c, 'master', a10.item.id, [{ specificationId: chartSpec.id, value: chartValue }]);
   await LOCK.lockLine(conn, c, a10.id);
   await LOCK.lockLine(conn, c, a20.id);
   const a1Pieces = { 10: await livePieces(conn, a10.id), 20: await livePieces(conn, a20.id) };
@@ -458,6 +466,16 @@ try {
   says(A2.cutPieces[0].message);
 
   const shapes2 = { 10: await shapeOf(conn, b10.id), 20: await shapeOf(conn, b20.id), 40: await shapeOf(conn, b40.id) };
+  const jsonValue = (v) => typeof v === 'string' ? JSON.parse(v) : v;
+  const chartShape = (v) => { const t = jsonValue(v); return t == null ? null : [t.x, t.y, t.v]; };
+  const [[copiedChart]] = await conn.query(
+    "SELECT value_json FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL",
+    [COMPANY, b10.item.id, chartSpec.id]);
+  same('revision preserves both axes and blank cells of a table value', chartShape(copiedChart?.value_json), chartShape(chartValue));
+  const [[chartHistory]] = await conn.query(
+    "SELECT new_value FROM cf_spec_value_history WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND specification_id = ? AND change_type = 'create'",
+    [COMPANY, b10.item.id, chartSpec.id]);
+  same('the copied chart has its complete value in history', chartShape(jsonValue(chartHistory?.new_value)?.json), chartShape(chartValue));
   for (const n of [10, 20, 40]) {
     same(`line ${n}: the structure is identical, cut pieces included (${shapes2[n].length} nodes)`, shapes2[n].map((r) => r.sig), shapes1[n].map((r) => r.sig));
     same(`line ${n}: every row holds exactly the values it held`, await valuesOf(conn, shapes2[n]), values1[n]);

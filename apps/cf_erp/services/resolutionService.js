@@ -51,6 +51,28 @@ export function dateText(d) {
   return String(d).slice(0, 10);
 }
 
+/** JSON columns come back parsed on some drivers, as text on others. */
+export const parseJsonCol = (v) => (v == null ? null : typeof v === 'string' ? JSON.parse(v) : v);
+
+/**
+ * The short line a table shows everywhere it is not being edited — "15 rows,
+ * 6-50 mm" for a 1-D chart, "10 x 3 rows, 10-30 mm / 14-26 deg" for a 2-D one.
+ * Axis units come from table_config; a chart with nothing entered yet says so.
+ */
+export function tableSummary(tableConfig, raw) {
+  if (!raw || !Array.isArray(raw.x) || !raw.x.length) return 'No chart set yet';
+  const axes = tableConfig?.axes ?? [];
+  const fmt = (n) => (Number.isInteger(n) ? String(n) : String(Number(n.toFixed(3))));
+  const range = (arr, axis) => {
+    const unit = axis?.unit ? ` ${axis.unit}` : '';
+    return arr.length > 1 ? `${fmt(arr[0])}-${fmt(arr[arr.length - 1])}${unit}` : `${fmt(arr[0])}${unit}`;
+  };
+  if (Array.isArray(raw.y) && raw.y.length) {
+    return `${raw.x.length} x ${raw.y.length} rows, ${range(raw.x, axes[0])} / ${range(raw.y, axes[1])}`;
+  }
+  return `${raw.x.length} row${raw.x.length === 1 ? '' : 's'}, ${range(raw.x, axes[0])}`;
+}
+
 /** The subjects whose rules reach a master record, broadest first. A draft (no id) has no own level. */
 export async function chainForMaster(db, companyId, master) {
   const nodes = await ancestors(db, companyId, master.classification_id);
@@ -103,7 +125,7 @@ async function loadRules(db, companyId, chain) {
   const [rows] = await db.query(
     `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
             a.value_rule, a.formula_id, a.sort_order,
-            s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals,
+            s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals, s.table_config,
             f.code AS formula_code, f.name AS formula_name, f.expression AS formula_expression, f.version AS formula_version
        FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL
@@ -143,7 +165,7 @@ async function loadOptions(db, companyId, specIds, assignmentIds) {
   return { options, narrowed };
 }
 
-/** The raw value of a value row, as its data type. Options resolve to the option id. */
+/** The raw value of a value row, as its data type. Options resolve to the option id; a table resolves to its whole { x, v } / { x, y, v } object. */
 export function rawOf(row, dataType) {
   if (!row) return null;
   switch (dataType) {
@@ -152,6 +174,7 @@ export function rawOf(row, dataType) {
     case 'boolean': return row.value_bool == null ? null : !!row.value_bool;
     case 'date': return dateText(row.value_date);
     case 'option': return row.option_id ?? null;
+    case 'table': return row.value_json === undefined ? null : parseJsonCol(row.value_json);
     default: return null;
   }
 }
@@ -169,6 +192,7 @@ export function displayOf(raw, spec, optionById) {
       const o = optionById.get(raw);
       return o ? (o.label || o.value) : `#${raw}`;
     }
+    case 'table': return tableSummary(spec.tableConfig, raw);
     default: return String(raw);
   }
 }
@@ -238,7 +262,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   const specs = [];
   const effectiveRows = new Map();
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(narrowed.filter((n) => n.assignment_id === r.id).map((n) => n.option_id));
@@ -348,6 +372,11 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   if (mode === 'item' && !frozen) {
     const lookup = new Map();
     for (const s of specs) if (s.value && s.spec.dataType === 'number') lookup.set(s.spec.code, s.value.raw);
+    // A calculated spec may read another table specification of the SAME
+    // record through LOOKUP(TABLE_CODE, x) with no item./machine. prefix —
+    // "any spec can be a table" is the point, not only machine rate charts.
+    const tableLookup = new Map();
+    for (const s of specs) if (s.value && s.spec.dataType === 'table') tableLookup.set(s.spec.code, { mode: s.spec.tableConfig?.mode, axes: s.spec.tableConfig?.axes, ...s.value.raw });
     const calc = specs.filter((s) => s.applicable && s.captureAt === 'item' && ['calculated', 'rollup'].includes(s.rule.valueRule));
     const parsedOf = new Map();
     for (const s of calc) {
@@ -377,7 +406,8 @@ export async function resolve(db, companyId, { master = null, machine = null, no
         }
         const waiting = parsed.references.some((code) => !lookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
         if (waiting) continue;
-        const out = evaluateFormula(parsed, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null);
+        const out = evaluateFormula(parsed, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null, null,
+          (code) => tableLookup.get(code) ?? null);
         done.add(s);
         moved = true;
         if (out.value === null) {
@@ -436,7 +466,10 @@ export function effectiveByCode(r) {
   const out = new Map();
   for (const s of r.specs) {
     if (!s.value || s.captureAt !== 'item') continue;
-    out.set(s.spec.code, { raw: s.value.raw, dataType: s.spec.dataType, optionValue: s.value.optionValue ?? null, display: s.value.display });
+    out.set(s.spec.code, {
+      raw: s.value.raw, dataType: s.spec.dataType, optionValue: s.value.optionValue ?? null, display: s.value.display,
+      tableConfig: s.spec.tableConfig ?? null,
+    });
   }
   return out;
 }
@@ -477,7 +510,7 @@ export async function resolveBatch(db, companyId, { item, batchId = null, draftV
   const specs = [];
   const calc = [];
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(narrowed.filter((n) => n.assignment_id === r.id).map((n) => n.option_id));

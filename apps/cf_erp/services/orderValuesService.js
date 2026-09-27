@@ -82,7 +82,7 @@
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
-import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH } from './resolutionService.js';
+import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues } from './valueService.js';
 
@@ -98,8 +98,8 @@ const ID_CHUNK = 500;
 /** More writes than this in one request is not a person at a grid. */
 const MAX_WRITES = 5000;
 
-const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null };
-const SET_COLS = ['value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source'];
+const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null, value_json: null };
+const SET_COLS = ['value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'value_json', 'uom', 'source'];
 const READ_ONLY_RULES = ['fixed', 'calculated', 'rollup', 'inherited'];
 
 const chunk = (xs, n) => {
@@ -316,7 +316,7 @@ async function loadContext(db, companyId, lineId, { lock = false } = {}) {
     db.query(
       `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
               a.value_rule, a.formula_id, a.sort_order,
-              s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals,
+              s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals, s.table_config,
               f.code AS formula_code, f.name AS formula_name, f.expression AS formula_expression, f.version AS formula_version
          FROM cf_spec_assignments a
          JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL
@@ -523,7 +523,7 @@ function resolveRecord(ctx, rec) {
   const specs = [];
   const effectiveRows = new Map();
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(ctx.narrowedBy.get(r.id) ?? []);
@@ -710,7 +710,8 @@ function sameValue(row, typed) {
   return (row.value_text ?? null) === (typed.value_text ?? null)
     && (row.value_bool == null ? null : Number(row.value_bool)) === (typed.value_bool == null ? null : Number(typed.value_bool))
     && dateText(row.value_date) === dateText(typed.value_date)
-    && (row.option_id ?? null) === (typed.option_id ?? null);
+    && (row.option_id ?? null) === (typed.option_id ?? null)
+    && JSON.stringify(parseJsonCol(row.value_json)) === JSON.stringify(typed.value_json ?? null);
 }
 
 /** valueService.snapshot — what a history row records. */
@@ -722,6 +723,7 @@ function snapshot(row, source, uom) {
     bool: row.value_bool == null ? null : !!Number(row.value_bool),
     date: dateText(row.value_date),
     option_id: row.option_id ?? null,
+    json: row.value_json === undefined ? null : parseJsonCol(row.value_json),
     uom: uom ?? row.uom ?? null,
     source: source ?? row.source,
   };
@@ -777,6 +779,7 @@ function derivedWrites(r) {
     value_bool: row.value_bool == null ? null : Number(row.value_bool),
     value_date: dateText(row.value_date),
     option_id: row.option_id ?? null,
+    value_json: row.value_json === undefined ? null : parseJsonCol(row.value_json),
   } : null);
 
   const produced = new Set();
@@ -954,11 +957,14 @@ async function flush(db, c, ctx, initial, order) {
   for (const part of chunk(clears, INSERT_CHUNK)) {
     await db.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [c.companyId, part]);
   }
+  // mysql2 does not serialise a JS object into a JSON column on its own (this
+  // file's own history INSERT below stringifies explicitly too).
+  const cellOf = (row, col) => (col === 'value_json' ? (row.value_json == null ? null : JSON.stringify(row.value_json)) : (row[col] ?? null));
   for (const part of chunk(updates, UPDATE_CHUNK)) {
     // valueService.updateRows: one CASE per column, and every id in the WHERE has a WHEN.
     const params = [];
     const sets = SET_COLS.map((col) => {
-      const whens = part.map((u) => { params.push(u.id, u.row[col] ?? null); return 'WHEN ? THEN ?'; }).join(' ');
+      const whens = part.map((u) => { params.push(u.id, cellOf(u.row, col)); return 'WHEN ? THEN ?'; }).join(' ');
       return `${col} = CASE id ${whens} END`;
     }).join(', ');
     params.push(c.companyId, part.map((u) => u.id));
@@ -968,12 +974,12 @@ async function flush(db, c, ctx, initial, order) {
     const params = [];
     for (const { recordId, specId, row } of part) {
       params.push(c.companyId, specId, 'master', recordId, row.value_number, row.value_text, row.value_bool,
-        row.value_date, row.option_id, row.uom ?? null, row.source, c.userId);
+        row.value_date, row.option_id, cellOf(row, 'value_json'), row.uom ?? null, row.source, c.userId);
     }
     await db.query(
       `INSERT INTO cf_spec_values
-         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, uom, source, created_by)
-       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+         (company_id, specification_id, subject_type, subject_id, value_number, value_text, value_bool, value_date, option_id, value_json, uom, source, created_by)
+       VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
       params,
     );
   }
@@ -1023,6 +1029,9 @@ async function flush(db, c, ctx, initial, order) {
 
 /** Why a value that applies is not typed here — said on the cell. */
 function whyReadOnly(s) {
+  // A table is never edited from this screen, whatever its rule — it belongs
+  // to a grid of its own, on the machine or classification it is set up on.
+  if (s.spec.dataType === 'table') return 'A table — open it from the machine or classification it is set up on.';
   const vr = s.rule.valueRule;
   const waiting = s.missingInputs?.length ? ` — waiting for ${s.missingInputs.slice(0, 3).join(', ')}${s.missingInputs.length > 3 ? ` and ${s.missingInputs.length - 3} more` : ''}` : '';
   if (vr === 'fixed') {
@@ -1124,7 +1133,7 @@ function buildView(ctx) {
     const full = new Map();
     let missing = 0;
     for (const s of applicable) {
-      const typeable = ['entered', 'defaulted'].includes(s.rule.valueRule);
+      const typeable = s.spec.dataType !== 'table' && ['entered', 'defaulted'].includes(s.rule.valueRule);
       const cell = {
         rule: s.rule.valueRule,
         required: s.rule.isRequired,
@@ -1275,7 +1284,13 @@ function readWrites(input, problems) {
     if (!Number.isInteger(recordId) || recordId <= 0) { problems.push(`${where}: recordId must be a positive whole number.`); return; }
     if (blank(w.specCode) || typeof w.specCode !== 'string') { problems.push(`${where}: specCode is required.`); return; }
     const value = w.value === undefined ? null : w.value;
-    if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) { problems.push(`${where}: value must be text, a number, yes/no or null.`); return; }
+    // An object/array is only ever a table's chart shape ({x,v} / {x,y,v}) —
+    // tables are refused below, by spec code, with a message that says why,
+    // rather than here where the shape alone cannot say which spec it was for.
+    if (value !== null && !['string', 'number', 'boolean', 'object'].includes(typeof value)) {
+      problems.push(`${where}: value must be text, a number, yes/no, a table or null.`);
+      return;
+    }
     out.push({ index: i, recordId, specCode: w.specCode.trim().toUpperCase(), value });
   });
   return out;
@@ -1379,6 +1394,10 @@ export async function writeLineValues(db, c, lineId, input = {}) {
     const vr = s.rule.valueRule;
     if (vr === 'fixed') { say(rec, s.spec.code, `is fixed at ${s.definedAt.level.toLowerCase()} level — change it there.`); continue; }
     if (READ_ONLY_RULES.includes(vr)) { say(rec, s.spec.code, `is ${vr === 'rollup' ? 'a roll-up' : vr} — it cannot be typed in.`); continue; }
+    // A table (a chart) is shown here as a summary but never edited from the
+    // Values stage — its rows belong to a grid of their own, on the machine or
+    // classification it is set up on (setValues, via the Setup/machine screens).
+    if (s.spec.dataType === 'table') { say(rec, s.spec.code, 'is a table — open it from the machine or classification it is set up on, not from the Values screen.'); continue; }
     const out = await coerceFor(db, ctx, s, w.value);
     if (out.problem) {
       // coerce's sentences start with the spec code; the head already says it.

@@ -18,7 +18,8 @@
  *   GET    /classification/:id/history         value history of the node's defaults
  *
  *   GET    /specifications                     library with options and usage
- *   POST   /specifications                     { code, name, dataType, measurementType?, defaultUom?, decimals?, options? }
+ *   POST   /specifications                     { code, name, dataType, measurementType?, defaultUom?, decimals?, options?, tableConfig? }
+ *                                              tableConfig (dataType 'table'): { axes: [{ label, unit? }, { label, unit? }?], mode? }
  *   PUT    /specifications/:id                 code is permanent
  *   DELETE /specifications/:id
  *   POST   /specifications/:id/options         { value, label? }
