@@ -14,8 +14,12 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import { exportSheet, importSheet } from '../services/bomSheetService.js';
+import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
+import { requireMaster } from '../services/records.js';
+import { bomTypeOf } from '../services/bomGraph.js';
+import {
+  exportSheet, importSheet, exportRecordSheet, importRecordSheet,
+} from '../services/bomSheetService.js';
 import { withCutPieces } from '../services/cutPlateService.js';
 
 const router = Router();
@@ -36,6 +40,27 @@ router.post('/order-lines/:id/sheet', guard(PERM.orders), handle((req) => withTr
   const c = ctx(req);
   const out = await importSheet(db, c, id(req), req.body ?? {});
   return out.applied ? withCutPieces(db, c, id(req), out) : out;
+})));
+
+// The same workbook is useful on the catalogue side: an item or definition's
+// own BOM is shared by every order that uses it. Permission follows the parent,
+// as in boms.js; a temporary record also refreshes its order's cut pieces.
+router.get('/records/:id/bom/sheet', guard(PERM.view), handle(async (req, res) => {
+  const out = await exportRecordSheet(pool, ctx(req).companyId, id(req), { format: req.query.format });
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.setHeader('X-CF-Sheet-Rows', String(out.rows));
+  res.send(out.buffer);
+}));
+
+router.post('/records/:id/bom/sheet', guard(PERM.view), handle((req) => withTransaction(async (db) => {
+  const c = ctx(req);
+  const parent = await requireMaster(db, c.companyId, id(req));
+  assertPerm(req, bomTypeOf(parent) === 'custom' ? PERM.orders : PERM.catalog);
+  const out = await importRecordSheet(db, c, id(req), req.body ?? {});
+  return out.applied && parent.item_type === 'temporary'
+    ? withCutPieces(db, c, parent.owner_order_line_id, out) : out;
 })));
 
 export default router;

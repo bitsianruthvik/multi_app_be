@@ -55,7 +55,9 @@ export async function listMachines(db, companyId, q = {}) {
     where.push('(mc.code LIKE ? OR mc.name LIKE ? OR mc.serial_number LIKE ?)');
     params.push(like, like, like);
   }
-  const [rows] = await db.query(`${SELECT} WHERE ${where.join(' AND ')} ORDER BY mc.code LIMIT 500`, params);
+  const requestedOffset = Number(q.offset);
+  const offset = Number.isSafeInteger(requestedOffset) && requestedOffset > 0 ? requestedOffset : 0;
+  const [rows] = await db.query(`${SELECT} WHERE ${where.join(' AND ')} ORDER BY mc.code, mc.id LIMIT 500 OFFSET ?`, [...params, offset]);
   return rows.map(shape);
 }
 

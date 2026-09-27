@@ -716,6 +716,7 @@ try {
 
   const leafId = {};
   for (const [leafCode, ms] of byLeaf) leafId[leafCode] = await ensureLeaf(conn, c, SUB[ms[0].subKey].family, ms[0].subKey, leafCode, ms[0].leafName);
+  say(`   specifications and ${Object.keys(leafId).length} machine types ready`);
 
   // Rules on every Family, so a value on any machine anywhere is accepted —
   // there is no single shared root above the six Families to hang one rule on.
@@ -743,6 +744,7 @@ try {
     if (crew) {
       await valueSvc.setValues(conn, c, 'classification', leafId[leafCode], Object.entries(crew).map(([specCode, value]) => ({ specCode, value })));
     }
+    say(`   ${leafCode}: ${ms.length} assets checked`);
   }
 
   say('\n-- retiring the old generic tree --');
@@ -781,7 +783,7 @@ try {
       }
     }
   }
-  if (verifyProblems.length) { say(`\n   ${verifyProblems.length} problem(s):`); for (const p of verifyProblems) say(`     ${p}`); }
+  if (verifyProblems.length) throw new Error(`Import verification failed: ${verifyProblems.join('; ')}`);
   say(`\n   ${leafCount} leaf types, ${machineCount} machines, ${seenCodes.size} distinct codes`);
 
   detachNodeCache(conn);
@@ -792,7 +794,7 @@ try {
   say(`  reused : ${JSON.stringify(tally.reused)}`);
   if (verifyProblems.length) process.exitCode = 1;
 } catch (e) {
-  if (conn) await conn.rollback();
+  if (conn) { try { await conn.rollback(); } catch { /* Preserve the original connection error. */ } }
   console.error('\nFAILED:', e.code ?? '', e.message, e.problems ?? '');
   process.exitCode = 1;
 } finally {

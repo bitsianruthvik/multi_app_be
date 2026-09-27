@@ -71,9 +71,10 @@ import ExcelJS from 'exceljs';
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { requireMaster, kindOf } from './records.js';
 import {
-  explode, addLine, updateLine, removeLine, assertEditable, ALLOWED_CHILDREN,
+  explode, addLine, writeLineUpdate, writeLineRemoval, assertEditable, ALLOWED_CHILDREN,
 } from './bomService.js';
-import { loadSpecs, coerce, setValues } from './valueService.js';
+import { bomTypeOf, descendantIds } from './bomGraph.js';
+import { loadSpecs, coerce, setValues, refreshValues } from './valueService.js';
 import { resolve, dateText, tableSummary, parseJsonCol } from './resolutionService.js';
 import { linePlaceholders } from './placeholderService.js';
 
@@ -99,23 +100,23 @@ const TYPEABLE_RULES = new Set(['entered', 'defaulted']);
  * ------------------------------------------------------------------------ */
 const LOCK = ' [do not edit]';
 export const FIXED_COLUMNS = [
-  { key: 'rowId', header: 'Row ID', width: 10, locked: true },
-  { key: 'parentRowId', header: 'Parent Row ID', width: 14, locked: true },
+  { key: 'name', header: 'Name', width: 36, locked: true },
+  { key: 'quantity', header: 'Quantity', width: 12, locked: false },
+  { key: 'role', header: 'Role', width: 22, locked: false },
+  { key: 'notes', header: 'Notes', width: 32, locked: false },
   // The only way to remove anything. Left blank by the export, always.
   { key: 'del', header: 'Delete?', width: 9, locked: false },
-  { key: 'level', header: 'Level', width: 7, locked: true },
-  { key: 'path', header: 'Path', width: 42, locked: true },
   { key: 'code', header: 'Code', width: 22, locked: true },
-  { key: 'name', header: 'Name', width: 30, locked: true },
-  { key: 'kind', header: 'Kind', width: 11, locked: true },
-  { key: 'quantity', header: 'Quantity', width: 11, locked: false },
-  { key: 'totalQty', header: 'Total Qty', width: 11, locked: true },
+  { key: 'rowId', header: 'Row ID', width: 12, locked: true },
+  { key: 'parentRowId', header: 'Parent Row ID', width: 16, locked: true },
   { key: 'uom', header: 'UoM', width: 7, locked: true },
-  { key: 'role', header: 'Role', width: 20, locked: false },
-  { key: 'notes', header: 'Notes', width: 26, locked: false },
   { key: 'flow', header: 'Flow', width: 16, locked: true },
-  { key: 'shared', header: 'Shared', width: 9, locked: true },
   { key: 'locked', header: 'Locked', width: 22, locked: true },
+  { key: 'level', header: 'Level', width: 7, locked: true, hidden: true },
+  { key: 'path', header: 'Path', width: 42, locked: true, hidden: true },
+  { key: 'kind', header: 'Kind', width: 11, locked: true, hidden: true },
+  { key: 'totalQty', header: 'Total Qty', width: 11, locked: true, hidden: true },
+  { key: 'shared', header: 'Shared', width: 9, locked: true, hidden: true },
 ];
 
 /**
@@ -305,11 +306,28 @@ async function addEmptyColumns(db, companyId, rows, specs) {
  * occupies (a shared BOM appears under each of its parents). `byRowId` groups
  * them, because the database holds one line however many places it fills.
  */
-async function buildModel(db, companyId, orderLineId) {
-  const line = await requireOrderLine(db, companyId, orderLineId);
-  if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet — there is no structure to put in a sheet.');
-  const root = await requireMaster(db, companyId, line.item_id);
-  const tree = await explode(db, companyId, root.id, { rootQuantity: Number(line.quantity) });
+function normaliseScope(scope) {
+  if (typeof scope === 'object' && scope !== null) {
+    if (scope.kind === 'record') return { kind: 'record', recordId: Number(scope.recordId) };
+    if (scope.kind === 'orderLine') return { kind: 'orderLine', orderLineId: Number(scope.lineId ?? scope.orderLineId) };
+  }
+  return { kind: 'orderLine', orderLineId: Number(scope) };
+}
+
+async function buildModel(db, companyId, scopeInput) {
+  const scope = normaliseScope(scopeInput);
+  let line = null;
+  let root;
+  let rootQuantity = 1;
+  if (scope.kind === 'record') {
+    root = await requireMaster(db, companyId, scope.recordId);
+  } else {
+    line = await requireOrderLine(db, companyId, scope.orderLineId);
+    if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet — there is no structure to put in a sheet.');
+    root = await requireMaster(db, companyId, line.item_id);
+    rootQuantity = Number(line.quantity);
+  }
+  const tree = await explode(db, companyId, root.id, { rootQuantity });
 
   const rows = [];
   const walk = (node, parentRowId, parentNode, parentKey) => {
@@ -319,14 +337,16 @@ async function buildModel(db, companyId, orderLineId) {
     // Anything under a catalog item is that item's Standard BOM, shared by
     // every order that uses it.
     const parentKind = parentNode ? parentNode.kind : null;
-    const lineEditable = node.lineId != null && parentKind === 'temporary';
-    const lockedWhy = node.lineId == null ? 'the top of the order line'
-      : parentKind === 'temporary' ? null
-        : `inside ${labelOf(parentNode)}'s catalog BOM — shared by every order`;
+    const lineEditable = node.lineId != null && (scope.kind === 'record'
+      ? parentNode?.id === root.id
+      : parentKind === 'temporary');
+    const lockedWhy = node.lineId == null ? (scope.kind === 'record' ? 'the top of this structure' : 'the top of the order line')
+      : lineEditable ? null
+        : `inside ${labelOf(parentNode)}'s own BOM — open that record to change it`;
     rows.push({
       key: node.key,
       rowId,
-      parentRowId: parentRowId ?? '',
+      parentRowId: parentRowId || null,
       // A shared line has one Row ID but a different parent in each place it
       // fills, so a deletion cascade has to follow the PLACE, not the Row ID.
       parentKey: parentKey ?? null,
@@ -334,7 +354,7 @@ async function buildModel(db, companyId, orderLineId) {
       node,
       parentNode,
       lineEditable,
-      valuesEditable: node.kind === 'temporary',
+      valuesEditable: scope.kind === 'orderLine' && node.kind === 'temporary',
       lockedWhy,
     });
     for (const kid of node.children) walk(kid, rowId, node, node.key);
@@ -368,7 +388,8 @@ async function buildModel(db, companyId, orderLineId) {
   }
   const specCols = [...specs.values()].sort((a, b) => a.code.localeCompare(b.code));
 
-  return { line, root, tree, rows, byRowId, values: byNode, specCols, droppedSpecs: dropped };
+  return { scope, line, root, tree, rows, byRowId, values: byNode, specCols, droppedSpecs: dropped,
+    bomType: tree.root.bom?.bomType ?? bomTypeOf(root) };
 }
 
 /* ===========================================================================
@@ -398,31 +419,22 @@ function specHeader(spec) {
 function sheetMatrix(model) {
   const headers = [
     ...FIXED_COLUMNS.map((c) => (c.locked ? `${c.header}${LOCK}` : c.header)),
-    ...model.specCols.map(specHeader),
+    ...model.specCols.map((s) => model.scope.kind === 'record' ? `${s.code}${s.uom ? ` (${s.uom})` : ''}${LOCK}` : specHeader(s)),
   ];
   const body = model.rows.map((r) => {
     const n = r.node;
     const shared = model.byRowId.get(r.rowId).length > 1;
     const vals = model.values.get(n.id) ?? new Map();
-    const fixed = [
-      r.rowId,
-      r.parentRowId,
-      '',                       // Delete? — always exported blank
-      n.depth,
-      indent(n.depth, labelOf(n)),
-      n.code ?? model.placeholders?.get(placeholderKey(n.lineId, n.id))?.code ?? '',
-      n.name ?? '',
-      n.kind,
-      Number(n.quantity),
-      Number(n.total),
-      n.uom ?? '',
-      n.role ?? '',
-      r.notes ?? '',
-      n.flow?.code ?? n.flow?.name ?? '',
-      shared ? 'yes' : '',
-      r.lockedWhy ?? '',
-    ];
-    const specs = model.specCols.map((s) => vals.get(s.code)?.display ?? '');
+    const fields = {
+      rowId: r.rowId, parentRowId: r.parentRowId, del: null, level: n.depth,
+      path: indent(n.depth, labelOf(n)),
+      code: n.code ?? model.placeholders?.get(placeholderKey(n.lineId, n.id))?.code ?? null,
+      name: n.name ?? null, kind: n.kind, quantity: Number(n.quantity), totalQty: Number(n.total),
+      uom: n.uom ?? null, role: n.role ?? null, notes: r.notes ?? null,
+      flow: n.flow?.code ?? n.flow?.name ?? null, shared: shared ? 'yes' : null, locked: r.lockedWhy ?? null,
+    };
+    const fixed = FIXED_COLUMNS.map((c) => fields[c.key]);
+    const specs = model.specCols.map((s) => vals.get(s.code)?.display ?? null);
     return { row: [...fixed, ...specs], model: r, shared, vals };
   });
   return { headers, body };
@@ -431,49 +443,57 @@ function sheetMatrix(model) {
 const INSTRUCTIONS = (model) => [
   ['How to change this BOM'],
   [],
-  [`This sheet is the structure of line ${model.line.line_no} of order ${model.line.order_code} — ${labelOf(model.root)}.`],
-  ['Change it here, save it, and import it back on the same order line.'],
-  ...(model.frozenNote ? [[], ['READ ONLY', model.frozenNote], ['', 'This sheet is a record of what was built. It cannot be imported back.']] : []),
+  ...(model.scope.kind === 'record'
+    ? [[`This sheet is the structure of ${model.root.code ?? model.root.name}.`]]
+    : [[`This sheet is the structure of line ${model.line.line_no} of order ${model.line.order_code} — ${labelOf(model.root)}.`]]),
+  [model.scope.kind === 'record'
+    ? 'Change it here, save it, and import it back on the same item or definition.'
+    : 'Change it here, save it, and import it back on the same order line.'],
+  ...(model.frozenNote ? [[], ['READ ONLY', model.frozenNote], [undefined, 'This sheet is a record of what was built. It cannot be imported back.']] : []),
   [],
   ['The columns that matter'],
-  ['Row ID', 'How the system finds this row again. Never type in it, never reorder it away from its row.'],
+  ['White cells', 'These are the cells you can change. Grey cells are for reference. Quantity, Role and Notes come first.'],
+  ['Row ID', 'How the system finds this row again. Never type in it.'],
   ['Parent Row ID', 'The Row ID of the row this one hangs under. ROOT is the top.'],
   ['Delete?', 'The ONLY way to remove anything. Put yes (or y, true, 1, x) against a row to take it out.'],
   [],
   ['Rows you leave out', 'A row that is not in the sheet is simply not mentioned, and nothing happens to it.'],
-  ['', 'So you can filter this sheet down to the rows you care about, change those, and import'],
-  ['', 'just that part. Leaving a row out NEVER deletes it — only Delete? does.'],
+  [undefined, 'So you can filter this sheet down to the rows you care about, change those, and import'],
+  [undefined, 'just that part. Leaving a row out NEVER deletes it — only Delete? does.'],
   [],
   ['What you may change'],
   ['Quantity', 'How many of this row are needed in the row above it.'],
   ['Role', 'What this row is for in its parent, in your own words.'],
   ['Notes', 'Free text.'],
-  ['Specification columns', 'Values you normally type: sizes, grades, and so on.'],
+  ['Specification columns', model.scope.kind === 'record' ? 'For reference only. Change these on the record\'s Values tab.' : 'Values you normally type: sizes, grades, and so on.'],
   [],
   ['To ADD a row', 'Insert a row anywhere. Leave Row ID EMPTY. Put the Row ID of its parent in Parent Row ID, put the'],
-  ['', 'code of the item or template you are adding in Code, and put a Quantity. Everything else is ignored.'],
-  ['', 'Add the row first and export again before filling in its specification values.'],
+  [undefined, 'code of the item or template you are adding in Code, and put a Quantity. Role and Notes are optional.'],
+  [undefined, 'Add the row first and export again before filling in its specification values.'],
   [],
   ['To REMOVE a row', 'Put yes in its Delete? column. Everything beneath it goes with it — you do not have to mark'],
-  ['', 'those rows as well, and the dry run tells you how many go before anything happens.'],
-  ['', 'Deleting the row out of the spreadsheet does NOT remove it.'],
+  [undefined, 'those rows as well, and the dry run tells you how many go before anything happens.'],
+  [undefined, 'Deleting the row out of the spreadsheet does NOT remove it.'],
   [],
   ['What you may NOT change', 'Every column marked "do not edit", and every specification cell marked as worked out'],
-  ['', '(calculated, rollup, inherited or fixed). Those are worked out from other values — change'],
-  ['', 'what they are worked out FROM and they follow. A code belongs to the code generator.'],
-  ['', 'A row made for this order has no code yet: its Code shows the code its pieces get when'],
-  ['', 'the line is locked, with # where each piece\'s own number goes. It is only shown.'],
-  ['', 'A row inside a catalog item\'s own BOM is shared by every order and is read only here;'],
-  ['', 'the Locked column says which rows those are.'],
-  ['', 'To swap one item for another, remove its row and add the one you want — a row cannot'],
-  ['', 'change what it holds.'],
+  [undefined, '(calculated, rollup, inherited or fixed). Those are worked out from other values — change'],
+  [undefined, 'what they are worked out FROM and they follow. A code belongs to the code generator.'],
+  [undefined, 'A row made for this order has no code yet: its Code shows the code its pieces get when'],
+  [undefined, 'the line is locked, with # where each piece\'s own number goes. It is only shown.'],
+  ...(model.scope.kind === 'orderLine'
+    ? [[undefined, 'A row inside a catalog item\'s own BOM is shared by every order and is read only here;'],
+      [undefined, 'the Locked column says which rows those are.']]
+    : [[undefined, 'Rows below this item or definition belong to its own BOM. Direct rows can be changed here;'],
+      [undefined, 'rows inside a child catalog item are shared and the Locked column explains why.']]),
+  [undefined, 'To swap one item for another, remove its row and add the one you want — a row cannot'],
+  [undefined, 'change what it holds.'],
   [],
   ['Shared rows', 'A row marked Shared appears more than once because one sub-assembly hangs under several'],
-  ['', 'parents. It is ONE row in the system: give every copy the same values. Deleting it takes it'],
-  ['', 'out of every parent, so every copy has to be in the sheet and marked, or none of them.'],
+  [undefined, 'parents. It is ONE row in the system: give every copy the same values. Deleting it takes it'],
+  [undefined, 'out of every parent, so every copy has to be in the sheet and marked, or none of them.'],
   [],
   ['Nothing is applied until it all works', 'The import checks the whole sheet first and refuses the lot if anything is wrong.'],
-  ['', 'Ask for a dry run to see what it would do before it does it.'],
+  [undefined, 'Upload Excel shows a preview. Review it, then press Apply changes to save.'],
   ...(model.droppedSpecs.length
     ? [[], ['Left out of this sheet', `${model.droppedSpecs.join(', ')} — the code clashes with a column of this sheet.`]]
     : []),
@@ -487,24 +507,28 @@ const HEAD_LOCKED = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDDD
  * The sheet for one order line.
  * Returns { filename, contentType, buffer } — the route sends it as a file.
  */
-export async function exportSheet(db, companyId, orderLineId, { format = 'xlsx' } = {}) {
+export async function exportSheet(db, companyId, scopeInput, { format = 'xlsx' } = {}) {
   const fmt = String(format).toLowerCase() === 'csv' ? 'csv' : 'xlsx';
-  const model = await buildModel(db, companyId, orderLineId);
+  const model = await buildModel(db, companyId, scopeInput);
   // An order's rows have no code of their own until the line is LOCKED; the
   // sheet shows the code their pieces will get instead, # where each piece's
   // number goes. Only shown: the import never reads it back. A sheet without
   // them is still a sheet, so a roll-out that cannot be worked out yet
   // (a selection unchosen) leaves the cells empty rather than failing the export.
-  model.placeholders = await linePlaceholders(db, companyId, orderLineId)
-    .then((ph) => new Map(ph.rows.map((r) => [placeholderKey(r.bomLineId, r.itemId), r])))
-    .catch(() => null);
+  model.placeholders = model.scope.kind === 'orderLine'
+    ? await linePlaceholders(db, companyId, model.scope.orderLineId)
+      .then((ph) => new Map(ph.rows.map((r) => [placeholderKey(r.bomLineId, r.itemId), r])))
+      .catch(() => null)
+    : null;
   // Reading is always allowed — a closed order's sheet is a record worth having.
   // But the one rule that decides whether it can come back in is asked here too,
   // so the sheet says on its own face that it is read only.
   try { await assertEditable(db, companyId, model.root); model.frozenNote = null; }
   catch (e) { model.frozenNote = e.message; }
   const { headers, body } = sheetMatrix(model);
-  const stem = `BOM_${model.line.order_code}_L${model.line.line_no}`.replace(/[^\w.-]+/g, '_');
+  const stem = (model.scope.kind === 'record'
+    ? `BOM_${model.root.code ?? model.root.name}_structure`
+    : `BOM_${model.line.order_code}_L${model.line.line_no}`).replace(/[^\w.-]+/g, '_');
 
   if (fmt === 'csv') {
     return {
@@ -519,31 +543,37 @@ export async function exportSheet(db, companyId, orderLineId, { format = 'xlsx' 
   const wb = new ExcelJS.Workbook();
   wb.creator = 'CF ERP';
   wb.created = new Date();
-  const ws = wb.addWorksheet(SHEET_NAME, { views: [{ state: 'frozen', xSplit: 2, ySplit: 1 }] });
+  const ws = wb.addWorksheet(SHEET_NAME, { views: [{ state: 'frozen', xSplit: 1, ySplit: 1 }] });
   ws.columns = [
-    ...FIXED_COLUMNS.map((c) => ({ width: c.width })),
+    ...FIXED_COLUMNS.map((c) => ({ width: c.width, hidden: !!c.hidden })),
     ...model.specCols.map(() => ({ width: 14 })),
   ];
   const head = ws.addRow(headers);
   head.font = { bold: true };
   head.alignment = { vertical: 'middle', wrapText: true };
-  head.height = 30;
+  head.height = 60;
   headers.forEach((_, i) => {
     const isFixed = i < FIXED_COLUMNS.length;
-    const locked = isFixed ? FIXED_COLUMNS[i].locked : false;
+    const locked = isFixed ? FIXED_COLUMNS[i].locked : model.scope.kind === 'record';
     head.getCell(i + 1).fill = locked ? HEAD_LOCKED : HEAD;
   });
 
   for (const b of body) {
     const r = ws.addRow(b.row);
+    r.getCell(1).alignment = { indent: Math.min(b.model.depth, 10) };
+    r.getCell(2).numFmt = '0.######';
+    if (b.model.lineEditable && !model.frozenNote) {
+      r.getCell(2).dataValidation = { type: 'decimal', operator: 'greaterThan', formulae: [0], showErrorMessage: true, error: 'Enter a quantity greater than zero.' };
+      r.getCell(5).dataValidation = { type: 'list', allowBlank: true, formulae: ['"yes,no"'] };
+    }
     FIXED_COLUMNS.forEach((c, i) => { if (c.locked) r.getCell(i + 1).fill = GREY; });
     model.specCols.forEach((s, i) => {
       const v = b.vals.get(s.code);
-      if (v && (s.dataType === 'table' || !TYPEABLE_SOURCES.has(v.source))) r.getCell(FIXED_COLUMNS.length + i + 1).fill = GREY;
+      if (!b.model.valuesEditable || (v && (s.dataType === 'table' || !TYPEABLE_SOURCES.has(v.source)))) r.getCell(FIXED_COLUMNS.length + i + 1).fill = GREY;
     });
     // A line that is not this order line's own is shown for context only — and
     // it cannot be deleted either, so its Delete? cell is shaded with the rest.
-    if (!b.model.lineEditable) {
+    if (!b.model.lineEditable || model.frozenNote) {
       for (const key of ['del', 'quantity', 'role', 'notes']) r.getCell(FIXED_COLUMNS.findIndex((cc) => cc.key === key) + 1).fill = GREY;
     }
   }
@@ -604,7 +634,7 @@ function mapHeaders(headerCells, problems) {
   });
   for (const need of ['rowId', 'parentRowId', 'code', 'quantity']) {
     if (fixed[need] === undefined) {
-      problems.push(`The sheet has no "${FIXED_COLUMNS.find((c) => c.key === need).header}" column — it is not a BOM sheet from this order line.`);
+      problems.push(`The sheet has no "${FIXED_COLUMNS.find((c) => c.key === need).header}" column — it is not a BOM sheet from this structure.`);
     }
   }
   return { fixed, specs };
@@ -685,7 +715,7 @@ async function buildPlan(db, c, model, sheet) {
       summary: {
         rowsInSheet: bodyRows.length, rowsMatched: 0, quantityChanged: 0, roleChanged: 0, notesChanged: 0,
         valuesChanged: 0, rowsAdded: 0, rowsRemoved: 0, rowsRemovedBeneath: 0, unchanged: 0,
-        sentence: 'nothing — this sheet does not match this order line',
+        sentence: 'nothing — this sheet does not match this structure',
       },
     };
   }
@@ -717,7 +747,9 @@ async function buildPlan(db, c, model, sheet) {
     if (!yes.length) continue;
     const places = model.byRowId.get(rowId);
     if (rowId === ROOT_ROW_ID) {
-      problems.push(`The ${ROOT_ROW_ID} row is the item this order line sells — take the LINE off the order, not the top of its own structure.`);
+      problems.push(model.scope.kind === 'record'
+        ? `The ${ROOT_ROW_ID} row is the item or definition itself — change its record details on the item screen, not the top of its own structure.`
+        : `The ${ROOT_ROW_ID} row is the item this order line sells — take the LINE off the order, not the top of its own structure.`);
       continue;
     }
     if (!places[0].lineEditable) {
@@ -840,7 +872,7 @@ async function buildPlan(db, c, model, sheet) {
     if (rowId === ROOT_ROW_ID) {
       const q = agree('Quantity', (e) => cell(e.row, 'quantity')).value;
       if (q !== null && !near(q, Number(n.quantity))) {
-        problems.push(`The ${ROOT_ROW_ID} row's quantity is the order line's own quantity — change it on the order, not in this sheet.`);
+        problems.push(model.scope.kind === 'record' ? 'The ROOT quantity is always 1 for an item structure.' : `The ${ROOT_ROW_ID} row's quantity is the order line's own quantity — change it on the order, not in this sheet.`);
       }
     } else if (place.lineEditable) {
       const sets = {};
@@ -974,8 +1006,17 @@ async function buildPlan(db, c, model, sheet) {
       continue;
     }
     const parent = parentPlaces[0];
-    if (parent.node.kind !== 'temporary') {
-      problems.push(`${label}: rows can only be added under this order's own parts. ${labelOf(parent.node)} is a ${parent.node.kind} record, shared by every order that uses it.`);
+    if (parentPlaces.some((p) => doomedKeys.has(p.key))) {
+      problems.push(`${label}: its parent is being removed. Keep the parent or remove this new row.`);
+      continue;
+    }
+    const canAddUnder = model.scope.kind === 'record'
+      ? parent.node.id === model.root.id
+      : parent.node.kind === 'temporary';
+    if (!canAddUnder) {
+      problems.push(model.scope.kind === 'record'
+        ? `${label}: rows can only be added directly under ${labelOf(model.root)} in this sheet. ${labelOf(parent.node)} is inside a child catalog BOM, which is shared.`
+        : `${label}: rows can only be added under this order's own parts. ${labelOf(parent.node)} is a ${parent.node.kind} record, shared by every order that uses it.`);
       continue;
     }
     if (!code) { problems.push(`${label}: it has no Code, so there is nothing to add. Put the code of the item or template definition you want.`); continue; }
@@ -986,11 +1027,21 @@ async function buildPlan(db, c, model, sheet) {
     if (!found) { problems.push(`${label}: nothing in the catalog has the code ${code}.`); continue; }
     const child = await requireMaster(db, companyId, found.id);
     const childKind = kindOf(child);
-    if (!ALLOWED_CHILDREN.custom.includes(childKind)) {
-      problems.push(`${label}: ${code} is a row of another order’s structure and cannot be put on this one. Add the template definition it was made from.`);
+    const allowedKinds = model.scope.kind === 'record'
+      ? (ALLOWED_CHILDREN[model.bomType] ?? [])
+      : ALLOWED_CHILDREN.custom;
+    if (!allowedKinds.includes(childKind)) {
+      problems.push(model.scope.kind === 'record'
+        ? `${label}: ${code} is a ${childKind} record, and this ${model.bomType ?? 'item'} structure accepts ${allowedKinds.join(', ') || 'no child records'}.`
+        : `${label}: ${code} is a row of another order’s structure and cannot be put on this one. Add the template definition it was made from.`);
       continue;
     }
     if (child.status === 'obsolete') { problems.push(`${label}: ${code} is obsolete.`); continue; }
+    if (child.id === parent.node.id || (await descendantIds(db, companyId, child.id)).has(parent.node.id)) {
+      problems.push(`${label}: ${code} would make this structure contain itself.`);
+      continue;
+    }
+    if ((cell(row, 'role') ?? '').length > 100) { problems.push(`${label}: Role is up to 100 characters.`); continue; }
     const qText = cell(row, 'quantity');
     const q = Number(qText);
     if (qText === null) { problems.push(`${label}: it has no Quantity.`); continue; }
@@ -1043,7 +1094,7 @@ async function buildPlan(db, c, model, sheet) {
  * Nothing is written until the whole sheet has been read and every problem
  * collected; a sheet with two problems reports both and applies neither.
  */
-export async function importSheet(db, c, orderLineId, input = {}) {
+export async function importSheet(db, c, scopeInput, input = {}) {
   const dryRun = input.dryRun === true || input.dryRun === 'true' || input.dryRun === 1 || input.dryRun === '1';
   const raw = input.file ?? input.fileBase64 ?? input.content;
   if (raw == null || raw === '') throw invalid('NO_FILE', 'There is no sheet to import — send the file as `fileBase64`.');
@@ -1055,7 +1106,7 @@ export async function importSheet(db, c, orderLineId, input = {}) {
   }
   if (!buffer.length) throw invalid('BAD_FILE', 'That file is empty.');
 
-  const model = await buildModel(db, c.companyId, orderLineId);
+  const model = await buildModel(db, c.companyId, scopeInput);
   // One rule for "this structure can still change", asked before anything else.
   await assertEditable(db, c.companyId, model.root);
 
@@ -1063,8 +1114,12 @@ export async function importSheet(db, c, orderLineId, input = {}) {
   const plan = await buildPlan(db, c, model, sheet);
 
   const head = {
-    orderLine: { id: model.line.id, lineNo: model.line.line_no, quantity: Number(model.line.quantity) },
-    order: { id: model.line.order_id, code: model.line.order_code, status: model.line.order_status },
+    ...(model.scope.kind === 'orderLine' ? {
+      orderLine: { id: model.line.id, lineNo: model.line.line_no, quantity: Number(model.line.quantity) },
+      order: { id: model.line.order_id, code: model.line.order_code, status: model.line.order_status },
+    } : {
+      record: { id: model.root.id, code: model.root.code, name: model.root.name, kind: kindOf(model.root) },
+    }),
     root: { id: model.root.id, code: model.root.code, name: model.root.name },
     format: looksXlsx(buffer) ? 'xlsx' : 'csv',
     dryRun,
@@ -1079,31 +1134,22 @@ export async function importSheet(db, c, orderLineId, input = {}) {
 
   assertNoProblems(plan.problems, `That sheet was not applied — ${plan.problems.length} problem${plan.problems.length === 1 ? '' : 's'} to fix first.`);
 
-  /* APPLYING GOES THROUGH bomService, ONE CHANGE AT A TIME, ON PURPOSE.
-   *
-   * addLine / updateLine / removeLine carry rules this service must not have a
-   * second copy of: loop detection, a template definition becoming a whole new
-   * temporary sub-tree, a removed temporary item taking its children with it,
-   * and the freeze check. Writing the rows directly would be much faster and
-   * would drift from those rules the first time one of them changed.
-   *
-   * The price is round trips. Each mutator re-works the values it can reach
-   * (refreshValues), so a sheet of 200 changed quantities is 200 of those
-   * walks. On localhost that is free; over the link to TiDB, at ~49 ms a hop,
-   * a large sheet is minutes, not seconds. Value writes are already batched one
-   * setValues call per NODE rather than per cell, which is the cheap half. If
-   * BOQ-sized sheets (hundreds of changes) become the normal way to work, the
-   * fix is to let bomService defer its refresh and run it once at the end —
-   * not to grow a second write path here.
-   */
+  // Keep BOM validation in its shared mutators, but refresh quantities once for
+  // the whole sheet. Recalculating the same tree after every cell takes minutes
+  // over the production database connection.
+  const refreshParents = new Set();
 
   // Removals shallowest first: a parent takes its subtree with it, so a deeper
   // removal may already be gone by the time its turn comes.
   for (const r of [...plan.removalPlan].sort((a, b) => a.depth - b.depth)) {
     const [[still]] = await db.query('SELECT id FROM cf_bom_lines WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, r.lineId]);
-    if (still) await removeLine(db, c, r.lineId);
+    if (still) refreshParents.add((await writeLineRemoval(db, c, r.lineId)).parentId);
   }
-  for (const u of plan.updatePlan) await updateLine(db, c, u.lineId, u.sets);
+  for (const u of plan.updatePlan) {
+    const changed = await writeLineUpdate(db, c, u.lineId, u.sets);
+    if (changed.values) refreshParents.add(changed.parentId);
+  }
+  if (refreshParents.size) await refreshValues(db, c, [...refreshParents]);
   const byNode = new Map();
   for (const v of plan.valuePlan) {
     if (!byNode.has(v.nodeId)) byNode.set(v.nodeId, []);
@@ -1114,6 +1160,17 @@ export async function importSheet(db, c, orderLineId, input = {}) {
     await addLine(db, c, a.parentId, { childId: a.childId, quantity: a.quantity, role: a.role, notes: a.notes });
   }
 
-  const after = await explode(db, c.companyId, model.root.id, { rootQuantity: Number(model.line.quantity) });
+  const after = await explode(db, c.companyId, model.root.id, {
+    rootQuantity: model.scope.kind === 'orderLine' ? Number(model.line.quantity) : 1,
+  });
   return { ...head, applied: true, stats: after.stats };
+}
+
+/** Item / definition structure wrappers keep the order-line API readable. */
+export async function exportRecordSheet(db, companyId, recordId, opts = {}) {
+  return exportSheet(db, companyId, { kind: 'record', recordId }, opts);
+}
+
+export async function importRecordSheet(db, c, recordId, input = {}) {
+  return importSheet(db, c, { kind: 'record', recordId }, input);
 }
