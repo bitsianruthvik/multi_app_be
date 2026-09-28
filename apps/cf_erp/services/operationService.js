@@ -13,7 +13,7 @@
  * gives every cutting machine its own time from its own speed.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
-import { ancestors, levelName, loadNode } from './tree.js';
+import { ancestors, levelName, loadNode, LEAF_DEPTH } from './tree.js';
 import { loadMaster, requireMachine, loadMachine } from './records.js';
 import { resolve, effectiveByCode, dateText } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
@@ -304,10 +304,29 @@ export async function resolveTiming(db, companyId, operationId, machine, date = 
 
 /** Every active machine an operation's rules reach, eligible first. */
 export async function machinesForOperation(db, companyId, operationId, date = today()) {
+  // One read of the rules, not one per asset. The plant register can include
+  // hundreds of tools and panels that have no rule for this operation at all.
+  const [rules] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.operation_id = ? AND r.deleted_at IS NULL
+    AND (r.effective_from IS NULL OR r.effective_from <= ?) AND (r.effective_to IS NULL OR r.effective_to >= ?)`, [companyId, operationId, date, date]);
+  if (!rules.length) return [];
   const [machines] = await db.query("SELECT * FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]);
+  const [nodes] = await db.query('SELECT id,parent_id,depth FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const bySubject = new Map();
+  for (const r of rules) {
+    const key = `${r.subject_type}:${r.subject_id}`;
+    if (!bySubject.has(key)) bySubject.set(key, []);
+    bySubject.get(key).push(r);
+  }
   const out = [];
   for (const m of machines) {
-    const rule = await resolveTiming(db, companyId, operationId, m, date);
+    const rank = new Map([[`machine:${m.id}`, 99]]);
+    // Match ancestors()' chain bound, including its handling of a missing
+    // parent. This map lives only for this read and never crosses requests.
+    let node = byId.get(m.classification_id);
+    for (let hop = 0; node && hop < LEAF_DEPTH + 3; hop++, node = byId.get(node.parent_id)) rank.set(`classification:${node.id}`, node.depth);
+    const candidates = [...rank.keys()].flatMap((key) => bySubject.get(key) ?? []);
+    const rule = winningTiming(candidates, rank);
     if (rule) out.push({ machine: { id: m.id, code: m.code, name: m.name }, eligible: rule.eligible, from: rule.subject, setup: rule.setup, work: rule.work });
   }
   return out.sort((a, b) => Number(b.eligible) - Number(a.eligible));
@@ -316,12 +335,33 @@ export async function machinesForOperation(db, companyId, operationId, date = to
 /** Every active operation a machine has a rule for — what it can (and cannot) do. */
 export async function operationsForMachine(db, companyId, machine, date = today()) {
   const [ops] = await db.query("SELECT * FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]);
+  if (!ops.length) return [];
+  const nodes = await ancestors(db, companyId, machine.classification_id);
+  const rank = new Map(nodes.map((n) => [`classification:${n.id}`, n.depth]));
+  rank.set(`machine:${machine.id}`, 99);
+  const [rules] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.operation_id IN (?) AND r.deleted_at IS NULL
+    AND ((r.subject_type = 'classification' AND r.subject_id IN (?)) OR (r.subject_type = 'machine' AND r.subject_id = ?))
+    AND (r.effective_from IS NULL OR r.effective_from <= ?) AND (r.effective_to IS NULL OR r.effective_to >= ?)`,
+  [companyId, ops.map((o) => o.id), nodes.length ? nodes.map((n) => n.id) : [0], machine.id, date, date]);
+  const byOperation = new Map();
+  for (const r of rules) {
+    if (!byOperation.has(r.operation_id)) byOperation.set(r.operation_id, []);
+    byOperation.get(r.operation_id).push(r);
+  }
   const out = [];
   for (const o of ops) {
-    const rule = await resolveTiming(db, companyId, o.id, machine, date);
+    const rule = winningTiming(byOperation.get(o.id) ?? [], rank);
     if (rule) out.push({ operation: { id: o.id, code: o.code, name: o.name }, eligible: rule.eligible, from: rule.subject, setup: rule.setup, work: rule.work });
   }
   return out;
+}
+
+/** Same precedence as resolveTiming; callers already filtered validity dates. */
+function winningTiming(rows, rank) {
+  if (!rows.length) return null;
+  const sorted = [...rows].sort((a, b) => (rank.get(`${b.subject_type}:${b.subject_id}`) - rank.get(`${a.subject_type}:${a.subject_id}`))
+    || String(dateText(b.effective_from) ?? '').localeCompare(String(dateText(a.effective_from) ?? '')));
+  return shapeRule(sorted[0]);
 }
 
 const numericValues = (resolution) => {
