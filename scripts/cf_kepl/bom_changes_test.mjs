@@ -336,6 +336,100 @@ try {
   const run = (changes, extra = {}) => apply({ scope, changes, ...extra });
   const parentsOfBlank = async () => Number((await conn.query('SELECT COUNT(*) AS n FROM cf_bom_lines WHERE company_id = ? AND child_id = ? AND deleted_at IS NULL', [COMPANY, f.blank]))[0][0].n);
 
+  section('0b. Sales-order spreadsheet: duplicate, reorder, move and values together');
+  {
+  await conn.query('SAVEPOINT grid_fixture');
+  const gridS1 = seg1(), gridS2 = seg2(), gridWeb = web1();
+  const idsOf = (node) => node.children.map((n) => n.lineId);
+  const reversed = [...idsOf(gridS1)].reverse();
+  const reordered = await run([{ op: 'arrange', groups: [{ parentId: gridS1.id, lineIds: reversed }] }]);
+  eq('one sibling list rearranged', reordered.summary.counts.rearranged, 1);
+  let gridTree = (await look(conn, f)).tree;
+  eq('saved row order matches the drop order', JSON.stringify(kid(gridTree.root, f.SEGMENT).children.map((n) => n.lineId)), JSON.stringify(reversed));
+  eq('reorder keeps the child record identity', (await lineRow(conn, gridWeb.lineId)).child_id, gridWeb.id);
+  const moved = await run([{ op: 'arrange', groups: [
+    { parentId: gridS1.id, lineIds: reversed.filter((id) => id !== gridWeb.lineId) },
+    { parentId: gridS2.id, lineIds: [gridWeb.lineId, ...idsOf(gridS2)] },
+  ] }]);
+  eq('move reports one changed parent', moved.summary.counts.moved, 1);
+  const movedLine = await lineRow(conn, gridWeb.lineId);
+  eq('move preserves the record and line IDs', movedLine.id === gridWeb.lineId && movedLine.child_id === gridWeb.id, true);
+  gridTree = (await look(conn, f)).tree;
+  const movedWeb = kid(gridTree.root, f.SEGMENT, 1).children[0];
+  eq('moving the part keeps its shared cut plate', movedWeb.children[0].id, f.blank);
+  eq('moved row inherits from its new parent', await value(conn, gridWeb.id, f.spec.GRD), 'E250');
+  const sharedRefusal = await refusal(() => run([{ op: 'arrange', groups: [{ parentId: f.ASSY, lineIds: [] }] }]));
+  eq('shared catalog BOM cannot be rearranged here', sharedRefusal?.status, 422);
+  const priorLength = await value(conn, gridWeb.id, f.spec.LEN);
+  const missingRow = await refusal(() => run([
+    { op: 'values', writes: [{ recordId: gridWeb.id, specCode: f.spec.LEN.code, value: '1333' }] },
+    { op: 'arrange', groups: [{ parentId: gridS2.id, lineIds: [gridWeb.lineId] }] },
+  ]));
+  eq('incomplete sibling list is refused', missingRow?.status, 422);
+  eq('failed arrangement rolls grid values back too', await value(conn, gridWeb.id, f.spec.LEN), priorLength);
+  await conn.query('ROLLBACK TO SAVEPOINT grid_fixture');
+  const cycle = await refusal(() => run([{ op: 'arrange', groups: [
+    { parentId: f.root, lineIds: idsOf(t.tree.root).filter((id) => id !== gridS1.lineId) },
+    { parentId: gridWeb.id, lineIds: [...idsOf(gridWeb), gridS1.lineId] },
+  ] }]));
+  eq('moving a parent inside its child is refused', cycle?.status, 422);
+  const batchCopy = await run([
+    { op: 'values', writes: [{ recordId: gridWeb.id, specCode: f.spec.LEN.code, value: '1333' }] },
+    { op: 'paste', key: 'copy-grid-test', sourceLineId: gridWeb.lineId, parentId: gridS1.id },
+    { op: 'arrange', groups: [{ parentId: gridS1.id, lineIds: [gridWeb.lineId, 'copy-grid-test', ...idsOf(gridS1).filter((id) => id !== gridWeb.lineId)] }] },
+  ]);
+  const copyLine = batchCopy.results[1].lineId;
+  eq('new copy can be positioned using its temporary key', (await look(conn, f)).tree.root.children[0].children[1].lineId, copyLine);
+  eq('copy receives the values typed in the same save', await value(conn, (await lineRow(conn, copyLine)).child_id, f.spec.LEN), 1333);
+  await conn.query('ROLLBACK TO SAVEPOINT grid_fixture');
+  const manyCopies = await run(Array.from({ length: 16 }, () => ({ op: 'paste', sourceLineId: gridWeb.lineId, parentId: gridS1.id, afterLineId: gridWeb.lineId })));
+  eq('repeated copy-below never runs out of line numbers', manyCopies.results.length, 16);
+  const copyOrder = (await look(conn, f)).tree.root.children[0].children;
+  const originalAt = copyOrder.findIndex((n) => n.lineId === gridWeb.lineId);
+  eq('all repeated copies follow the source in order', JSON.stringify(copyOrder.slice(originalAt + 1, originalAt + 17).map((n) => n.lineId)), JSON.stringify(manyCopies.results.map((r) => r.lineId)));
+  await conn.query('ROLLBACK TO SAVEPOINT grid_fixture');
+  const dryGrid = await run([{ op: 'arrange', groups: [{ parentId: gridS1.id, lineIds: reversed }] }], { dryRun: true });
+  eq('checking a move reports the pending arrangement', dryGrid.summary.counts.rearranged, 1);
+  eq('checking a move leaves original sibling order', (await look(conn, f)).tree.root.children[0].children.map((n) => n.lineId), idsOf(gridS1));
+  const combinedCycle = await refusal(() => run([{ op: 'arrange', groups: [
+    { parentId: f.root, lineIds: [] },
+    { parentId: gridS1.id, lineIds: [...idsOf(gridS1), gridS2.lineId] },
+    { parentId: gridS2.id, lineIds: [...idsOf(gridS2), gridS1.lineId] },
+  ] }]));
+  eq('combined moves cannot form a disconnected cycle', combinedCycle?.status, 422);
+  const emptyDestination = kid(gridS2, f.FLANGE);
+  await run([{ op: 'arrange', groups: [
+    { parentId: gridS1.id, lineIds: idsOf(gridS1).filter((id) => id !== gridWeb.lineId) },
+    { parentId: emptyDestination.id, lineIds: [gridWeb.lineId] },
+  ] }]);
+  eq('move into a leaf creates its BOM and keeps child identity', kid((await look(conn, f)).tree.root, f.SEGMENT, 1).children.find((n) => n.id === emptyDestination.id).children[0].id, gridWeb.id);
+  await conn.query('ROLLBACK TO SAVEPOINT grid_fixture');
+  const templateTree = (await B.explode(conn, COMPANY, f.SEGMENT, {})).root;
+  const templateIds = idsOf(templateTree);
+  const recordScope = { recordId: f.SEGMENT };
+  const recordGrants = [];
+  await apply({ scope: recordScope, changes: [
+    { op: 'paste', key: 'copy-template', sourceLineId: f.tplWebLine, parentId: f.SEGMENT },
+    { op: 'arrange', groups: [{ parentId: f.SEGMENT, lineIds: [f.tplWebLine, 'copy-template', ...templateIds.filter((id) => id !== f.tplWebLine)] }] },
+    { op: 'values', writes: [{ recordId: f.SEGMENT, specCode: f.spec.GRD.code, value: 'E450' }] },
+  ] }, { allow: (type) => recordGrants.push(type) });
+  const copiedTemplate = (await B.explode(conn, COMPANY, f.SEGMENT, {})).root;
+  eq('template Copy immediately below keeps shared definition reference', copiedTemplate.children[1].id, f.WEB);
+  eq('template root values remain editable', await value(conn, f.SEGMENT, f.spec.GRD), 'E450');
+  ok('record grid values ask for catalog permission', recordGrants.includes('standard'));
+  const sharedValues = await refusal(() => apply({ scope: recordScope, changes: [{ op: 'values', writes: [{ recordId: f.WEB, specCode: f.spec.LEN.code, value: '2000' }] }] }));
+  eq('shared child specifications stay read-only on definition BOM', sharedValues?.status, 422);
+  const badRecordGrid = await refusal(() => apply({ scope: recordScope, changes: [
+    { op: 'values', writes: [{ recordId: f.SEGMENT, specCode: f.spec.GRD.code, value: 'E250' }] },
+    { op: 'arrange', groups: [{ parentId: f.SEGMENT, lineIds: [] }] },
+  ] }));
+  eq('record values and structure refuse together', badRecordGrid?.status, 422);
+  eq('record values roll back when arrangement fails', await value(conn, f.SEGMENT, f.spec.GRD), 'E450');
+  await conn.query('ROLLBACK TO SAVEPOINT grid_fixture');
+  t = await look(conn, f);
+
+  }
+
   /* ---- 1. several changes, one save ------------------------------------- */
   section('1. Several changes applied together');
   const s2bolt = bolt(seg2());

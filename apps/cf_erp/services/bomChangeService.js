@@ -121,13 +121,15 @@ import { invalid, notFound, conflict, CfError, translateDbError } from '../lib/e
 import { requireMaster, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { BOM_TYPE_BY_KIND, descendantIds } from './bomGraph.js';
 import { explode, writeLineUpdate, writeLineRemoval, addLine, assertEditable, ALLOWED_CHILDREN } from './bomService.js';
-import { refreshValues } from './valueService.js';
+import { refreshValues, setValues } from './valueService.js';
 import { requireUsableFlow } from './flowService.js';
 import { CUT_PLATE_CODE } from './nestingService.js';
 import { insertRows } from '../lib/db.js';
 import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
+import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
+import { writeLineValues } from './orderValuesService.js';
 
-export const OPS = ['quantity', 'flow', 'remove', 'paste'];
+export const OPS = ['quantity', 'flow', 'remove', 'paste', 'arrange', 'values'];
 const MAX_CHANGES = 1000;
 const ID_CHUNK = 500;   // ids per IN list
 const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED', 'LOCKED']);
@@ -201,8 +203,20 @@ function readChanges(raw, problems) {
       if (!v) problems.push(`${where}: ${key} must be a positive whole number.`);
       return v;
     };
-    if (op === 'paste') {
+    if (op === 'values') {
+      if (!Array.isArray(ch.writes)) { problems.push(`${where}: values need a list of writes.`); return; }
+      if (ch.writes.length > 20000 || ch.writes.some((w) => !posInt(w?.recordId) || typeof w.specCode !== 'string' || !w.specCode.trim())) { problems.push(`${where}: each value needs a record and specification code.`); return; }
+      c.writes = ch.writes;
+    } else if (op === 'arrange') {
+      if (!Array.isArray(ch.groups) || !ch.groups.length || ch.groups.length > MAX_CHANGES) { problems.push(`${where}: give the parent rows to arrange.`); return; }
+      c.groups = ch.groups.map((g) => ({ parentId: posInt(g?.parentId), lineIds: g?.lineIds }));
+      if (c.groups.some((g) => !g.parentId || !Array.isArray(g.lineIds) || g.lineIds.length > 20000 || g.lineIds.some((id) => !posInt(id) && !(typeof id === 'string' && /^copy-[A-Za-z0-9_-]+$/.test(id))))) {
+        problems.push(`${where}: row order needs valid line IDs or copy keys.`); return;
+      }
+    } else if (op === 'paste') {
       c.sourceLineId = needId('sourceLineId');
+      c.key = ch.key == null ? null : String(ch.key);
+      if (c.key != null && !/^copy-[A-Za-z0-9_-]+$/.test(c.key)) { problems.push(`${where}: invalid copy key.`); return; }
       c.parentId = needId('parentId');
       c.afterLineId = blank(ch.afterLineId) ? null : needId('afterLineId');
       c.quantity = blank(ch.quantity) ? null : ch.quantity;
@@ -335,6 +349,14 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   // ---- who may do this, and whether anything may change at all ------------
   const touched = new Set();
   for (const ch of changes) {
+    if (ch.op === 'values') { touched.add(scope.orderLineId ? 'custom' : 'standard'); continue; }
+    if (ch.op === 'arrange') {
+      for (const g of ch.groups) {
+        const t = byRecord.get(g.parentId)?.[0]?.node;
+        if (holds(t)) touched.add(bomTypeOfKind(t.kind));
+      }
+      continue;
+    }
     const e = ch.op === 'paste' ? null : lines.get(ch.lineId);
     if (e && holds(e.parent)) touched.add(bomTypeOfKind(e.parent.kind));
     if (ch.op === 'paste') {
@@ -363,9 +385,32 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   const pastes = [];
   const updates = [];
   const removes = [];
+  const arrangements = [];
+  const valueChanges = [];
+  const copyKeys = new Set();
 
   for (const ch of changes) {
-    if (ch.op === 'paste') { pastes.push(ch); continue; }
+    if (ch.op === 'values') {
+      if (!scope.orderLineId && ch.writes.some((w) => {
+        const id = Number(w.recordId), node = byRecord.get(id)?.[0]?.node;
+        return id !== root.id && node?.kind !== 'temporary';
+      })) problems.push('Shared child values are read-only here. Open that item or definition to change its values.');
+      if (valueChanges.length) problems.push('Give the value changes once.');
+      valueChanges.push(ch); continue;
+    }
+    if (ch.op === 'arrange') {
+      if (arrangements.length) problems.push('Give the new row arrangement once.');
+      for (const g of ch.groups) {
+        const t = byRecord.get(g.parentId)?.[0]?.node;
+        if (!holds(t)) problems.push('A destination cannot be rearranged from this screen.');
+      }
+      arrangements.push(ch); continue;
+    }
+    if (ch.op === 'paste') {
+      if (ch.key && copyKeys.has(ch.key)) problems.push('Each new copy needs its own key.');
+      if (ch.key) copyKeys.add(ch.key);
+      pastes.push(ch); continue;
+    }
     const e = lines.get(ch.lineId);
     if (!e) {
       problems.push(`Line ${ch.lineId} is not part of this structure — it may have changed since the screen was opened. Reload it and make the change again.`);
@@ -527,10 +572,24 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       }
     };
 
+    // Values first: a one-click duplicate carries the values currently typed
+    // on this screen. The enclosing savepoint also rolls these back if a move
+    // or any other part of the same save is refused.
+    for (const ch of valueChanges) {
+      const r = await attempt('Specification values', async () => {
+        if (scope.orderLineId) return writeLineValues(db, c, scope.orderLineId, { writes: ch.writes });
+        if (root.owner_order_line_id) return writeLineValues(db, c, root.owner_order_line_id, { writes: ch.writes });
+        const out = await setValues(db, c, 'master', root.id, ch.writes);
+        return { summary: { changed: out.changes.length, records: out.changes.length ? 1 : 0 } };
+      });
+      if (r.ok) results[ch.index] = { op: 'values', changed: r.out.summary.changed, records: r.out.summary.records };
+    }
+
     // 1. Pastes, from what is saved. Every copied subtree is read before any
     //    paste writes, so no paste can copy another's result.
     const snap = await snapshotSubtrees(db, companyId, pastes.filter((p) => p.mode === 'copy').map((p) => p.source.row.child_id), copies);
     const lastPasteAfter = new Map(); // anchor line id -> the line pasted after it last, so A then B stay in order
+    const newLines = new Map();
     for (const ch of pastes) {
       const src = ch.source.entry;
       const label = `${lineLabel(src)}, pasted into ${pathLabel(ch.target)}`;
@@ -543,6 +602,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
         return out;
       });
       if (r.ok) {
+        if (ch.key) newLines.set(ch.key, r.out.lineId);
         results[ch.index] = {
           op: 'paste', sourceLineId: ch.sourceLineId, parentId: ch.parentId, mode: ch.mode,
           lineId: dryRun ? null : r.out.lineId,
@@ -602,6 +662,20 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       }
     }
 
+    // Arrange after copies/removals, so a new on-screen copy can be dragged
+    // before its real line ID exists. Moving keeps the same row and subtree.
+    for (const ch of arrangements) {
+      const r = await attempt('Rearranging rows', async () => {
+        const groups = ch.groups.map((g) => ({ parentId: g.parentId, lineIds: g.lineIds.map((id) => typeof id === 'string' && id.startsWith('copy-') ? newLines.get(id) : Number(id)) }));
+        if (groups.some((g) => g.lineIds.some((id) => !id))) throw invalid('ARRANGEMENT', 'A copied row could not be found. Reload and try again.');
+        const fresh = await explode(db, companyId, root.id, { rootQuantity });
+        const out = await arrangeBomLines(db, c, groups, fresh.root);
+        out.refresh.forEach((id) => valueParents.add(id));
+        return out;
+      });
+      if (r.ok) results[ch.index] = { op: 'arrange', moved: r.out.moved, reordered: r.out.reordered };
+    }
+
     // 4. Values, once for every parent the writes above moved. A parent that
     //    went with a line removed above it is gone, and is not worked out.
     if (valueParents.size) {
@@ -633,6 +707,9 @@ function countsOf(results, removes, doomed, removedKeys) {
   return {
     quantity: done.filter((r) => r.op === 'quantity' && r.changed).length,
     flow: done.filter((r) => r.op === 'flow' && r.changed).length,
+    rearranged: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.reordered, 0),
+    moved: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.moved, 0),
+    values: done.filter((r) => r.op === 'values').reduce((n, r) => n + r.changed, 0),
     pasted: pasted.length,
     copiedItems: pasted.reduce((n, r) => n + r.created, 0),
     removed: done.filter((r) => r.op === 'remove' && !r.withParent).length,
@@ -647,6 +724,9 @@ function sentenceOf(k) {
   const bits = [];
   if (k.quantity) bits.push(plural(k.quantity, 'quantity changed', 'quantities changed'));
   if (k.flow) bits.push(plural(k.flow, 'flow changed', 'flows changed'));
+  if (k.rearranged) bits.push(plural(k.rearranged, 'BOM rearranged', 'BOMs rearranged'));
+  if (k.moved) bits.push(plural(k.moved, 'row moved to another parent', 'rows moved to another parent'));
+  if (k.values) bits.push(plural(k.values, 'value changed', 'values changed'));
   if (k.pasted) {
     bits.push(`${plural(k.pasted, 'line pasted', 'lines pasted')}${k.copiedItems ? ` (${plural(k.copiedItems, 'new row', 'new rows')})` : ''}`);
   }
@@ -687,7 +767,7 @@ async function pasteReference(db, c, ch, afterLineId) {
 /** A line number between an anchor and the line after it, or a refusal when there is no gap. */
 async function lineNoAfter(db, companyId, target, bomId, afterLineId) {
   const [ls] = await db.query(
-    `SELECT l.id, l.line_no FROM cf_bom_lines l
+    `SELECT l.id, l.bom_id, l.line_no FROM cf_bom_lines l
        JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
       WHERE l.company_id = ? AND ${bomId ? 'l.bom_id = ?' : 'b.parent_id = ?'} AND l.deleted_at IS NULL
       ORDER BY l.line_no, l.id`,
@@ -699,7 +779,7 @@ async function lineNoAfter(db, companyId, target, bomId, afterLineId) {
   if (i === ls.length - 1) return here + 10;
   const next = Number(ls[i + 1].line_no);
   const mid = Math.floor((here + next) / 2);
-  if (mid <= here) throw invalid('NO_GAP', `There is no free line number between ${here} and ${next} in ${labelOf(target)} — paste it at the end, or renumber those lines first.`);
+  if (mid <= here) return spaceAfterLine(db, companyId, ls[i].bom_id, ls, i);
   return mid;
 }
 
