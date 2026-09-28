@@ -702,7 +702,7 @@ try {
   }
 
   say('\n-- BOM-line override: the drilled intermediate stiffener --');
-  // GS-002's Standard BOM carries the SAME IS-002 definition twice, told apart
+  // The girder-segment template carries the SAME intermediate-stiffener definition twice, told apart
   // only by the BOM LINE's role text ("... - plain" / "... - drilled") — real
   // structure discovered in the catalog, not order-instance data. The line
   // whose role says "drilled" gets the holed-part flow directly on the line;
@@ -712,9 +712,10 @@ try {
        FROM cf_bom_lines bl
        JOIN cf_boms b ON b.id = bl.bom_id AND b.deleted_at IS NULL
        JOIN cf_master_records dm ON dm.id = b.parent_id
+       JOIN cf_classification_nodes pn ON pn.id = dm.classification_id AND pn.company_id = dm.company_id
        JOIN cf_definition_details dd ON dd.company_id = dm.company_id AND dd.master_id = dm.id AND dd.definition_type = 'template' AND dd.deleted_at IS NULL
        JOIN cf_master_records child ON child.company_id = bl.company_id AND child.id = bl.child_id AND child.deleted_at IS NULL
-      WHERE bl.company_id = ? AND bl.deleted_at IS NULL AND dm.code = 'GS-002' AND child.code = 'IS-002'
+      WHERE bl.company_id = ? AND bl.deleted_at IS NULL AND pn.code = 'GIRDER_SEGMENT' AND child.code LIKE 'IS-%'
         AND b.bom_type = 'template' AND LOWER(bl.role) LIKE '%drilled%'`,
     [COMPANY],
   );
@@ -768,7 +769,7 @@ try {
   if (notes.length) { say(`\n  ${notes.length} note(s):`); for (const n of notes) say(`   - ${n}`); }
   if (questions.length) { say(`\n  ${questions.length} question(s) for the user:`); for (const q of questions) say(`   ? ${q}`); }
 } catch (e) {
-  if (conn) await conn.rollback();
+  if (conn) { try { await conn.rollback(); } catch { /* Preserve the original connection error. */ } }
   console.error('\nFAILED:', e.code ?? '', e.message, e.problems ?? '');
   process.exitCode = 1;
 } finally {

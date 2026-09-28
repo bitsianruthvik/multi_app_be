@@ -121,9 +121,12 @@ const valueSvc = await imp('apps/cf_erp/services/valueService.js');
 const ruleSvc = await imp('apps/cf_erp/services/assignmentService.js');
 const codegen = await imp('apps/cf_erp/modules/codegen/service.js');
 const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
+const { insertRows } = await imp('apps/cf_erp/lib/db.js');
+const engine = await imp('apps/cf_erp/modules/codegen/engine.js');
 
 const COMPANY = Number(process.env.CF_BRIDGE_COMPANY ?? process.env.CF_PLANT_COMPANY ?? 2);
 const COMMIT = process.argv.includes('--commit');
+const SERIAL = process.argv.includes('--serial'); // reference path for golden comparisons
 const WORKBOOK = path.join(BE, '..', 'imports', 'Process_Flow_v5.xlsx');
 const where = /^(localhost|127\.0\.0\.1|::1)?$/i.test(process.env.DB_HOST ?? '') ? 'local' : 'PRODUCTION';
 const say = (...a) => console.log(...a);
@@ -500,6 +503,7 @@ for (const p of purchaseRows) {
       notes,
       from: equip ? 'matched' : 'purchase-only',
       purchaseSno: p.sno,
+      sourceKey: `purchase:${p.sno}:${i + 1}`,
     });
   }
 }
@@ -513,6 +517,7 @@ for (const { equip, index } of equipmentEntries) {
       values: { ...equipValues(equip), VENDOR: null, INVOICE_NO: null, PURCHASE_RATE: null },
       notes: [`only in the equipment register — no purchase line carries code ${equip.equipmentId}.`],
       from: 'equipment-only', equipmentSno: equip.sno,
+      sourceKey: `equipment:${index + 1}`,
     });
 }
 
@@ -638,18 +643,75 @@ async function ensureLeaf(db, c, familyKey, subKey, leafCode, leafName) {
   return made.id;
 }
 
+const marker = (unit) => `[plant-register:${unit.sourceKey}]`;
+const machineNotes = (unit) => [marker(unit), ...unit.notes].join('\n');
 async function ensureMachine(db, c, leafId, unit) {
-  const [[have]] = await db.query('SELECT id FROM cf_machines WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [c.companyId, unit.code]);
+  const [[have]] = await db.query('SELECT id, classification_id FROM cf_machines WHERE company_id = ? AND (code = ? OR notes LIKE ?) AND deleted_at IS NULL', [c.companyId, unit.code, `${marker(unit)}%`]);
   const entries = Object.entries(unit.values)
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
     .map(([specCode, value]) => ({ specCode, value }));
-  if (have) { bumpTally(tally.reused, 'machine'); return have.id; }
+  if (have) {
+    if (Number(have.classification_id) !== Number(leafId)) throw new Error(`Existing machine ${unit.code} belongs to a different type.`);
+    bumpTally(tally.reused, 'machine'); return have.id;
+  }
   const created = await mach.createMachine(db, c, {
     code: unit.code ?? undefined, name: unit.name, classificationId: leafId,
-    serialNumber: unit.serialNumber ?? undefined, values: entries,
+    serialNumber: unit.serialNumber ?? undefined, values: entries, notes: machineNotes(unit),
   });
   bumpTally(tally.created, 'machine');
   return created.id;
+}
+
+/** Identical purchased units share validation and resolved values. The first
+ * goes through the ordinary service; the rest copy that proven result in bulk.
+ * Codes still come from the real generator. IDs are read by code, never guessed.
+ * --serial keeps the original path for a full golden snapshot comparison. */
+async function ensureMachineGroup(db, c, leafId, units) {
+  if (SERIAL || units.length === 1) {
+    for (const unit of units) await ensureMachine(db, c, leafId, unit);
+    return;
+  }
+  const groups = [];
+  let previousKey = null;
+  for (const unit of units) {
+    const key = JSON.stringify([unit.name, unit.serialNumber, unit.values]);
+    if (key !== previousKey) groups.push([]);
+    groups.at(-1).push(unit);
+    previousKey = key;
+  }
+  const [existing] = await db.query('SELECT id,code,notes FROM cf_machines WHERE company_id=? AND classification_id=? AND deleted_at IS NULL', [c.companyId, leafId]);
+  const existingCodes = new Set(existing.map((m) => m.code));
+  const existingNotes = new Set(existing.map((m) => String(m.notes ?? '').split('\n')[0]));
+  for (const group of groups) {
+    const missing = group.filter((u) => !(u.code && existingCodes.has(u.code)) && !existingNotes.has(marker(u)));
+    bumpTally(tally.reused, 'machine', group.length - missing.length);
+    if (!missing.length) continue;
+    const referenceId = await ensureMachine(db, c, leafId, missing[0]);
+    const rest = missing.slice(1);
+    if (!rest.length) continue;
+    const context = await engine.getProvider('machine').draftContext(db, c.companyId, { classificationId: leafId });
+    const scheme = await engine.selectScheme(db, c.companyId, 'machine', 'code', context);
+    const [segments] = scheme ? await db.query('SELECT * FROM cf_code_scheme_segments WHERE company_id=? AND scheme_id=? AND deleted_at IS NULL ORDER BY sort_order,id', [c.companyId, scheme.id]) : [[]];
+    const codes = [];
+    for (const unit of rest) {
+      const code = unit.code ?? (scheme ? (await engine.renderSegments(db, c.companyId, scheme, segments, context, { consume: true })).text : null);
+      if (!code || code.length > 50 || !/^[A-Za-z0-9][A-Za-z0-9_\-./]*$/.test(code)) throw new Error('A machine code is missing or invalid.');
+      codes.push(code);
+    }
+    await insertRows(db, 'cf_machines', ['company_id','code','name','classification_id','serial_number','status','notes','created_by'], rest.map((u,i) => [c.companyId,codes[i],u.name,leafId,u.serialNumber,'active',machineNotes(u),c.userId]));
+    const [copies] = await db.query('SELECT id FROM cf_machines WHERE company_id=? AND code IN (?) AND deleted_at IS NULL', [c.companyId,codes]);
+    if (copies.length !== rest.length) throw new Error('Bulk machine read-back did not match the inserted assets.');
+    const ids = copies.map((m) => m.id);
+    await db.query(`INSERT INTO cf_spec_values(company_id,specification_id,subject_type,subject_id,value_number,value_text,value_bool,value_date,option_id,value_json,uom,source,created_by)
+      SELECT v.company_id,v.specification_id,'machine',m.id,v.value_number,v.value_text,v.value_bool,v.value_date,v.option_id,v.value_json,v.uom,v.source,?
+      FROM cf_spec_values v JOIN cf_machines m ON m.company_id=v.company_id AND m.id IN (?)
+      WHERE v.company_id=? AND v.subject_type='machine' AND v.subject_id=? AND v.deleted_at IS NULL`, [c.userId,ids,c.companyId,referenceId]);
+    await db.query(`INSERT INTO cf_spec_value_history(company_id,value_id,specification_id,subject_type,subject_id,change_type,old_value,new_value,changed_by)
+      SELECT h.company_id,v.id,h.specification_id,'machine',v.subject_id,h.change_type,h.old_value,h.new_value,?
+      FROM cf_spec_value_history h JOIN cf_spec_values v ON v.company_id=h.company_id AND v.specification_id=h.specification_id AND v.subject_type='machine' AND v.subject_id IN (?) AND v.deleted_at IS NULL
+      WHERE h.company_id=? AND h.subject_type='machine' AND h.subject_id=?`, [c.userId,ids,c.companyId,referenceId]);
+    bumpTally(tally.created, 'machine', rest.length);
+  }
 }
 
 /** Marks the OLD generic tree cf_shop_import.mjs built inactive — never
@@ -701,8 +763,11 @@ async function retireOldTree(db, c) {
 }
 
 let conn;
+let queryCount = 0;
 try {
   conn = await pool.getConnection();
+  const query = conn.query.bind(conn);
+  conn.query = (...args) => { queryCount++; return query(...args); };
   await conn.beginTransaction();
   attachNodeCache(conn);
   const [[user]] = await conn.query('SELECT id FROM users WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
@@ -732,19 +797,19 @@ try {
   }
 
   for (const [leafCode, ms] of byLeaf) {
-    for (const unit of ms) {
-      try {
-        await ensureMachine(conn, c, leafId[leafCode], unit);
-      } catch (e) {
-        e.message = `${leafCode} / ${unit.code ?? '(auto code)'} "${unit.name}": ${e.message}`;
-        throw e;
-      }
-    }
+    await ensureMachineGroup(conn, c, leafId[leafCode], ms);
     const crew = CREW[leafCode];
     if (crew) {
       await valueSvc.setValues(conn, c, 'classification', leafId[leafCode], Object.entries(crew).map(([specCode, value]) => ({ specCode, value })));
     }
     say(`   ${leafCode}: ${ms.length} assets checked`);
+  }
+
+  if (process.argv.includes('--verify-repeat') && where === 'local') {
+    const made = tally.created.machine;
+    for (const [leafCode, ms] of byLeaf) await ensureMachineGroup(conn, c, leafId[leafCode], ms);
+    if (tally.created.machine !== made) throw new Error('A second import created duplicate assets.');
+    say('   repeat import created no duplicate assets');
   }
 
   say('\n-- retiring the old generic tree --');
@@ -786,12 +851,30 @@ try {
   if (verifyProblems.length) throw new Error(`Import verification failed: ${verifyProblems.join('; ')}`);
   say(`\n   ${leafCount} leaf types, ${machineCount} machines, ${seenCodes.size} distinct codes`);
 
+  // Local comparison only; the snapshot contains private workbook values.
+  if (process.env.CF_PLANT_SNAPSHOT && where === 'local') {
+    const [snapshot] = await conn.query(`SELECT m.code,m.name,m.serial_number,m.status,m.notes,n.code AS machine_type,
+      s.code AS spec,v.value_number,v.value_text,v.value_bool,v.value_date,o.value AS option_value,v.value_json,v.uom,v.source
+      FROM cf_machines m JOIN cf_classification_nodes n ON n.id=m.classification_id
+      JOIN cf_classification_nodes sub ON sub.id=n.parent_id JOIN cf_classification_nodes f ON f.id=sub.parent_id
+      LEFT JOIN cf_spec_values v ON v.company_id=m.company_id AND v.subject_type='machine' AND v.subject_id=m.id AND v.deleted_at IS NULL
+      LEFT JOIN cf_specifications s ON s.id=v.specification_id LEFT JOIN cf_spec_options o ON o.id=v.option_id
+      WHERE m.company_id=? AND m.deleted_at IS NULL AND f.code LIKE 'PLANT-%' ORDER BY m.code,s.code`, [COMPANY]);
+    const [history] = await conn.query(`SELECT m.code,s.code AS spec,h.change_type,COUNT(*) AS n
+      FROM cf_spec_value_history h JOIN cf_machines m ON m.company_id=h.company_id AND m.id=h.subject_id
+      JOIN cf_specifications s ON s.id=h.specification_id
+      WHERE h.company_id=? AND h.subject_type='machine' AND m.notes LIKE '[plant-register:%'
+      GROUP BY m.code,s.code,h.change_type ORDER BY m.code,s.code,h.change_type`, [COMPANY]);
+    fs.writeFileSync(process.env.CF_PLANT_SNAPSHOT, JSON.stringify({ values: snapshot, history, queryCount }));
+  }
+
   detachNodeCache(conn);
   if (COMMIT) { await conn.commit(); say('\ncommitted.'); }
   else { await conn.rollback(); say('\ndry run — rolled back. Nothing was written.'); }
 
   say(`\n  created: ${JSON.stringify(tally.created)}`);
   say(`  reused : ${JSON.stringify(tally.reused)}`);
+  say(`  database round trips: ${queryCount}`);
   if (verifyProblems.length) process.exitCode = 1;
 } catch (e) {
   if (conn) { try { await conn.rollback(); } catch { /* Preserve the original connection error. */ } }
