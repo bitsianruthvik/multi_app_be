@@ -2951,8 +2951,14 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'work_order_id');
 SET @sql = IF(@col = 0,
-  'ALTER TABLE cf_production_steps ADD COLUMN work_order_id INT NULL, ADD KEY idx_cprs_work_order (company_id, work_order_id)',
+  'ALTER TABLE cf_production_steps ADD COLUMN work_order_id INT NULL',
   'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- TiDB cannot index a column in the same ALTER that adds it, so the key is its own guarded step.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND INDEX_NAME = 'idx_cprs_work_order');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_production_steps ADD KEY idx_cprs_work_order (company_id, work_order_id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
@@ -2965,8 +2971,14 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND COLUMN_NAME = 'order_piece_id');
 SET @sql = IF(@col = 0,
-  'ALTER TABLE cf_production_items ADD COLUMN order_piece_id INT NULL, ADD KEY idx_cpri_piece (company_id, order_piece_id)',
+  'ALTER TABLE cf_production_items ADD COLUMN order_piece_id INT NULL',
   'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- TiDB cannot index a column in the same ALTER that adds it, so the key is its own guarded step.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND INDEX_NAME = 'idx_cpri_piece');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_production_items ADD KEY idx_cpri_piece (company_id, order_piece_id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
