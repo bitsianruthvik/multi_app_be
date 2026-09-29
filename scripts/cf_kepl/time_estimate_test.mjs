@@ -170,6 +170,9 @@ try {
   const edge = opByCode.get('EDGEP');
   ok('the line runs CRNMV and EDGEP', !!crn && !!edge);
   await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = 5, setup_minutes = 2 WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, crn.id]);
+  // FQC stays without a number (local rules may carry placeholder times since 2026-09-30).
+  const fqc = opByCode.get('FQC');
+  if (fqc) await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = NULL, setup_minutes = NULL, work_formula_id = NULL WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, fqc.id]);
   // EDGEP: a formula over an item value the plate parts really carry.
   const resolutions = await resolveLineRecords(conn, COMPANY, LINE);
   const edgeRows = view.rows.filter((r) => r.cells[edge.id]);

@@ -37,7 +37,7 @@
  * delivered. `frozen` on the result names the order.
  */
 import { ancestors, levelName } from './tree.js';
-import { loadMaster, frozenBy } from './records.js';
+import { loadMaster, frozenBy, LIVE_WHEN_FROZEN } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
 
@@ -304,7 +304,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
       return v;
     };
 
-    if (frozen) {
+    if (frozen && !LIVE_WHEN_FROZEN.has(spec.code)) {
       if (own) entry.value = view(own, own.source, 'here');
       entry.status = 'frozen';
       continue;

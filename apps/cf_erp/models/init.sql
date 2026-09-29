@@ -2987,3 +2987,132 @@ SET @sql = IF(@fk = 0,
   'ALTER TABLE cf_production_items ADD CONSTRAINT fk_cpri_order_piece FOREIGN KEY (company_id, order_piece_id) REFERENCES cf_order_pieces(company_id, id)',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 31. THE PLANNER — this month and the next two, by priority and a tonnes goal
+-- ===========================================================================
+--
+-- Decided 2026-09-29 (TM/CF_ERP_PLANNER_PLAN.md). The user: plan this month and
+-- the next two automatically from the orders, by order priority and a monthly
+-- output goal; plan a whole order or break it down through the BOM; plan by
+-- SHIPPING MARKS ("if we set that at least one line should be shipped, that is
+-- what gets optimised"); never plan work before its material can be there.
+--
+-- cf_sales_orders.plan_priority   1 = plan first; NULL = after every ranked
+--   order, by committed date. Written as a whole ranking (PUT /planner/priorities).
+-- cf_sales_order_lines.plan_level 'line' (the whole line) or a depth of the
+--   locked piece tree as text ('0' = the line's own pieces, e.g. a span).
+--   NULL = the default: the shipping-group depth when the line has marks.
+--
+-- cf_plan_entries: where a plan unit ships. ONE live plan per company (no
+--   scenarios in v1). unit_key = 'p<order piece id>', 'l<order line id>' or 'g<parent piece id>.<bom line id>' (a lot of loose pieces);
+--   ship_date = the START of the period it ships in. pinned = moved by hand —
+--   auto-plan never moves it. Unplanning retires the row (deleted_at).
+-- cf_plan_targets: the monthly goal, TONNES SHIPPED (decision 2), per month
+--   (the first of the month). Clearing a goal removes its row.
+-- cf_plan_settings: one row per company; no row = the defaults below.
+--
+-- SHIP_UNIT ("Ships as one unit") is the shipping mark (decision 1): a piece
+-- whose item says yes is a mark; the parent of marks is a shipping line. It is
+-- set ONCE on a template definition (e.g. Girder segment), so the rule is
+-- `defaulted`: an item made from the definition reads the definition's value
+-- through its chain (resolutionService: Family > Subfamily > Variant >
+-- Template definition > the record) unless it says otherwise itself. Seeded
+-- per cf_erp company (a company with a live cf_erp app row), and assigned on
+-- the Families that hold template definitions. The planner reads it
+-- tolerantly, but WRITING a value needs an assignment (§24 says why).
+-- No keys are added to an existing table here, so nothing trips TiDB's
+-- "cannot index a column in the ALTER that adds it".
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'plan_priority');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_orders ADD COLUMN plan_priority INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'plan_level');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN plan_level VARCHAR(20) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_plan_entries (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  unit_key        VARCHAR(40)    NOT NULL,          -- 'p<piece id>' | 'l<line id>' | 'g<parent piece id>.<bom line id>'
+  ship_date       DATE           NOT NULL,          -- the start of the period it ships in
+  pinned          TINYINT        NOT NULL DEFAULT 0,
+  updated_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  is_live         TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cpe_tenant (company_id, id),
+  UNIQUE KEY uq_cpe_unit   (company_id, unit_key, is_live),
+  KEY idx_cpe_line (company_id, order_line_id),
+
+  CONSTRAINT fk_cpe_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpe_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cpe_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_plan_targets (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  month           DATE           NOT NULL,          -- the first of the month
+  tonnes          DECIMAL(12,3)  NOT NULL,
+  updated_by      INT            NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cplt_month (company_id, month),
+
+  CONSTRAINT fk_cplt_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cplt_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_plan_settings (
+  company_id           INT       NOT NULL PRIMARY KEY,
+  min_lines_per_month  INT       NOT NULL DEFAULT 1,
+  allow_partial_lines  TINYINT   NOT NULL DEFAULT 1,
+  updated_by           INT       NULL,
+  created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  CONSTRAINT fk_cpls_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpls_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+INSERT INTO cf_specifications (company_id, code, name, data_type, description, status)
+SELECT c.id, 'SHIP_UNIT', 'Ships as one unit', 'boolean',
+       'Yes means a piece of this kind is a shipping mark: it leaves the works as one unit, and the planner plans by it. Set it once on the template definition (for example Girder segment); everything made from it follows.',
+       'active'
+  FROM companies c
+ WHERE c.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM apps ap WHERE ap.company_id = c.id AND ap.slug = 'cf_erp' AND ap.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_specifications s
+                    WHERE s.company_id = c.id AND s.code = 'SHIP_UNIT' AND s.deleted_at IS NULL);
+
+-- The Family (depth 0) of every template definition: the definition's own node
+-- when it is filed on a Family, else its parent's or grandparent's.
+INSERT INTO cf_spec_assignments
+  (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule)
+SELECT f.company_id, s.id, 'classification', f.id, 'item', 0, 1, 'defaulted'
+  FROM cf_classification_nodes f
+  JOIN cf_specifications s
+    ON s.company_id = f.company_id AND s.code = 'SHIP_UNIT' AND s.deleted_at IS NULL
+ WHERE f.depth = 0 AND f.deleted_at IS NULL AND f.scope <> 'machine'
+   AND EXISTS (SELECT 1
+                 FROM cf_master_records m
+                 JOIN cf_definition_details d ON d.master_id = m.id AND d.definition_type = 'template' AND d.deleted_at IS NULL
+                 JOIN cf_classification_nodes n  ON n.id = m.classification_id
+                 LEFT JOIN cf_classification_nodes p1 ON p1.id = n.parent_id
+                 LEFT JOIN cf_classification_nodes p2 ON p2.id = p1.parent_id
+                WHERE m.company_id = f.company_id AND m.deleted_at IS NULL
+                  AND f.id = CASE n.depth WHEN 0 THEN n.id WHEN 1 THEN p1.id ELSE p2.id END)
+   AND NOT EXISTS (SELECT 1 FROM cf_spec_assignments a
+                    WHERE a.company_id = f.company_id AND a.specification_id = s.id
+                      AND a.subject_type = 'classification' AND a.subject_id = f.id
+                      AND a.deleted_at IS NULL);

@@ -80,7 +80,7 @@
  *           its usual per-record cost for them.
  */
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
+import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
@@ -564,7 +564,7 @@ function resolveRecord(ctx, rec) {
       return v;
     };
 
-    if (frozen) {
+    if (frozen && !LIVE_WHEN_FROZEN.has(spec.code)) {
       if (own) entry.value = view(own, own.source, 'here');
       entry.status = 'frozen';
       continue;

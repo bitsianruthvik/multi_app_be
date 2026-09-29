@@ -108,6 +108,17 @@ export const lockedLineMessage = (lineNo, orderCode) =>
 export const AFTER_LOCK_SPECS = new Set(['NEST_MANUAL']);
 
 /**
+ * Values a FROZEN record still works out from its chain, as if it were live.
+ * A frozen record normally shows only what it holds, so a later setup change
+ * cannot alter what was locked or delivered. SHIP_UNIT (init.sql §31) is
+ * planning, not design: it is set ONCE on the template definition — usually
+ * after the line is locked, because the planner plans the locked pieces — and
+ * it must reach those pieces. Both resolve() and orderValuesService's mirror
+ * read this set, so the two stay equal.
+ */
+export const LIVE_WHEN_FROZEN = new Set(['SHIP_UNIT']);
+
+/**
  * What freezes this record, or null: its order is closed, lost, cancelled or
  * revised (reason 'closed'; orderStatus says which), its line was released to
  * production ('released'), or its line was LOCKED ('locked' — the pieces and

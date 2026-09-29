@@ -288,32 +288,20 @@ const cut = (windows, cs, ce) => windows.flatMap((w) => {
 });
 
 /**
- * When a machine works, day by day: its shift windows (a shift listed on the
- * day it starts), minus day-offs and stoppages, plus extra time. A shift's
- * break comes off its minutes in proportion to what is left of it.
- * q: { from?, to? } — default the next 14 days, at most 92.
+ * The day-by-day arithmetic of a calendar, pure: a machine's live shift rows and
+ * its exception rows (dated from the evening before `fromS` to `toS`) in, the
+ * days out. machineCalendar (one machine) and machinesCalendar (every machine,
+ * for the planner) both call it, so the two can never count a day differently.
  */
-export async function machineCalendar(db, companyId, machineId, q = {}) {
-  const machine = await requireMachine(db, companyId, machineId);
-  const problems = [];
-  const fromS = readDate(q.from, 'From', problems) ?? dateText(todayDate());
-  const toS = readDate(q.to, 'To', problems) ?? dateText(addDays(parseDate(fromS), 13));
-  assertNoProblems(problems);
+function calendarDays(shiftRows, exRows, fromS, toS) {
   const from = parseDate(fromS);
   const days = Math.round((parseDate(toS) - from) / 86400000) + 1;
-  if (days < 1) throw invalid('INVALID', 'To comes before from.');
-  if (days > MAX_RANGE_DAYS) throw invalid('INVALID', `Ask for up to ${MAX_RANGE_DAYS} days at a time.`);
   // Day 0 is the evening before `from`: a stoppage on the first morning can cut its night shift.
   const day0 = addDays(from, -1);
-  const shifts = (await liveShifts(db, companyId, machineId)).map((s) => {
+  const shifts = shiftRows.map((s) => {
     const start = toMinutes(s.start_time);
     return { id: s.id, name: s.name, weekdays: weekdaysOf(s.weekdays), start, span: spanOf(start, toMinutes(s.end_time)), brk: s.break_minutes, from: dateText(s.effective_from), to: dateText(s.effective_to) };
   });
-  const [exRows] = await db.query(
-    `SELECT * FROM cf_machine_calendar_exceptions
-      WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL AND exception_date BETWEEN ? AND ?`,
-    [companyId, machineId, dateText(day0), toS],
-  );
   const exByDay = new Map();
   for (const e of exRows) { const k = dateText(e.exception_date); exByDay.set(k, [...(exByDay.get(k) ?? []), e]); }
 
@@ -364,8 +352,85 @@ export async function machineCalendar(db, companyId, machineId, q = {}) {
     const exceptions = (exByDay.get(ds) ?? []).map((e) => shapeException(e, shifts.find((s) => s.id === e.shift_id)?.name ?? null));
     out.push({ date: ds, weekday: WEEKDAYS[weekdayIndex(d)], windows: shaped, exceptions, minutes: shaped.reduce((t, w) => t + w.minutes, 0) });
   }
+  return out;
+}
+
+/** From / to of a calendar request, checked; `maxDays` caps the span. */
+function calendarRange(q, maxDays) {
+  const problems = [];
+  const fromS = readDate(q.from, 'From', problems) ?? dateText(todayDate());
+  const toS = readDate(q.to, 'To', problems) ?? dateText(addDays(parseDate(fromS), 13));
+  assertNoProblems(problems);
+  const days = Math.round((parseDate(toS) - parseDate(fromS)) / 86400000) + 1;
+  if (days < 1) throw invalid('INVALID', 'To comes before from.');
+  if (days > maxDays) throw invalid('INVALID', `Ask for up to ${maxDays} days at a time.`);
+  return { fromS, toS, day0S: dateText(addDays(parseDate(fromS), -1)) };
+}
+
+/**
+ * When a machine works, day by day: its shift windows (a shift listed on the
+ * day it starts), minus day-offs and stoppages, plus extra time. A shift's
+ * break comes off its minutes in proportion to what is left of it.
+ * q: { from?, to? } — default the next 14 days, at most 92.
+ */
+export async function machineCalendar(db, companyId, machineId, q = {}) {
+  const machine = await requireMachine(db, companyId, machineId);
+  const { fromS, toS, day0S } = calendarRange(q, MAX_RANGE_DAYS);
+  const shiftRows = await liveShifts(db, companyId, machineId);
+  const [exRows] = await db.query(
+    `SELECT * FROM cf_machine_calendar_exceptions
+      WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL AND exception_date BETWEEN ? AND ?`,
+    [companyId, machineId, day0S, toS],
+  );
+  const out = calendarDays(shiftRows, exRows, fromS, toS);
   return {
     machine: { id: machine.id, code: machine.code, name: machine.name },
     from: fromS, to: toS, days: out, minutes: out.reduce((t, d) => t + d.minutes, 0),
   };
+}
+
+/** The planner's horizon is a quarter plus a little; a year is the most anyone asks for at once. */
+const MAX_BULK_DAYS = 400;
+
+/**
+ * machineCalendar for MANY machines at once — two reads whatever their number
+ * (every live shift, every exception in range), then the same calendarDays per
+ * machine. q: { from, to, machineIds? } — machineIds omitted = every active
+ * machine (one more read). Returns Map machineId -> { hasShifts, minutes,
+ * days: [{ date, minutes }] }. The windows are left out: the planner needs
+ * minutes, and 500 machines x 92 days of windows is a lot of objects nobody reads.
+ */
+export async function machinesCalendar(db, companyId, q = {}) {
+  const { fromS, toS, day0S } = calendarRange(q, MAX_BULK_DAYS);
+  let ids = q.machineIds ? [...new Set(q.machineIds.map(Number))] : null;
+  if (!ids) {
+    const [rows] = await db.query("SELECT id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL", [companyId]);
+    ids = rows.map((r) => r.id);
+  }
+  const out = new Map();
+  if (!ids.length) return out;
+  const [[shiftRows], [exRows]] = await Promise.all([
+    db.query(
+      'SELECT * FROM cf_machine_shifts WHERE company_id = ? AND machine_id IN (?) AND deleted_at IS NULL ORDER BY machine_id, sort_order, start_time, id',
+      [companyId, ids],
+    ),
+    db.query(
+      `SELECT * FROM cf_machine_calendar_exceptions
+        WHERE company_id = ? AND machine_id IN (?) AND deleted_at IS NULL AND exception_date BETWEEN ? AND ?`,
+      [companyId, ids, day0S, toS],
+    ),
+  ]);
+  const group = (rows) => {
+    const m = new Map();
+    for (const r of rows) { if (!m.has(r.machine_id)) m.set(r.machine_id, []); m.get(r.machine_id).push(r); }
+    return m;
+  };
+  const shiftsOf = group(shiftRows);
+  const exOf = group(exRows);
+  for (const id of ids) {
+    const shifts = shiftsOf.get(id) ?? [];
+    const days = calendarDays(shifts, exOf.get(id) ?? [], fromS, toS).map((d) => ({ date: d.date, minutes: d.minutes }));
+    out.set(id, { hasShifts: shifts.length > 0, minutes: days.reduce((t, d) => t + d.minutes, 0), days });
+  }
+  return out;
 }

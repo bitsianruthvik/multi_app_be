@@ -81,13 +81,19 @@ try {
   const notSub = await party('CUST', 0);
 
   section('Not locked');
+  // The local KEPL line may already be locked (the planner's local set-up locks it):
+  // it is unlocked inside this transaction for this section and put back after.
+  const [[lockState]] = await conn.query('SELECT locked_at FROM cf_sales_order_lines WHERE company_id = ? AND id = ?', [COMPANY, LINE]);
+  const wasLocked = !!lockState?.locked_at;
+  if (wasLocked) await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, LINE]);
   let v = await getAssignment(conn, COMPANY, ORDER, LINE);
   ok('before lock: no rows, and one line of why', v.line.locked === false && v.rows.length === 0 && /Lock the line first/.test(v.line.why ?? ''), JSON.stringify(v.line));
   ok('the contractors are listed (subcontractors only)', v.contractors.some((p) => p.id === A) && !v.contractors.some((p) => p.id === notSub));
   let err = await refusal(() => assignCells(conn, c, ORDER, LINE, { cells: [{ pieceId: 1, operationId: 1 }], contractorId: A }));
   ok('assigning on an unlocked line is refused (422 NOT_LOCKED)', err?.status === 422 && err.code === 'NOT_LOCKED', err?.message);
 
-  await lockLine(conn, c, LINE);
+  if (wasLocked) await conn.query('UPDATE cf_sales_order_lines SET locked_at = ? WHERE company_id = ? AND id = ?', [lockState.locked_at, COMPANY, LINE]);
+  else await lockLine(conn, c, LINE);
   section('Locked: the grid');
   let g = await measured(() => getAssignment(db, COMPANY, ORDER, LINE));
   report.getQueries = g.queries;
@@ -242,6 +248,8 @@ try {
   await insert('cf_stocking_areas', { company_id: COMPANY, code: `${tag}-DSP`, name: `${tag} dispatch`, purpose: 'dispatch' });
   // Some time to copy onto the steps: CRNMV 5 per piece + 2 setup.
   const [[crn]] = await conn.query("SELECT id FROM cf_operations WHERE company_id = ? AND code = 'CRNMV' AND deleted_at IS NULL", [COMPANY]);
+  // Only CRNMV gets a time; every other rule is cleared inside the transaction (local rules may carry placeholder times).
+  await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = NULL, setup_minutes = NULL WHERE company_id = ? AND deleted_at IS NULL AND work_formula_id IS NULL', [COMPANY]);
   await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = 5, setup_minutes = 2 WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, crn.id]);
   // A typed time wins over the formula at release too.
   const segBomLine = (await conn.query('SELECT bom_line_id FROM cf_order_pieces WHERE id = ?', [seg.pieceId]))[0][0].bom_line_id;
