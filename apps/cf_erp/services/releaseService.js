@@ -32,7 +32,7 @@ import { cellOwnersOfLine } from './workOrderService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
 import {
-  availability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
+  availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
   lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf,
 } from './rollOutService.js';
 
@@ -1007,7 +1007,9 @@ const shapeStep = (s, pieceLabel) => ({
 });
 
 function shapeRequirement(q, data, ev) {
-  const step = q.step_id ? data.steps.find((s) => s.id === q.step_id) : null;
+  // By id through a map built once per read — a find per requirement was ~50M comparisons on the KEPL line.
+  if (!data.stepById) data.stepById = new Map(data.steps.map((s) => [s.id, s]));
+  const step = q.step_id ? data.stepById.get(q.step_id) ?? null : null;
   const piece = q.production_item_id ? ev.itemById.get(q.production_item_id) : null;
   return {
     id: q.id,
@@ -1370,16 +1372,19 @@ export async function stepHistory(db, companyId, stepId) {
 
 // --- material: reservations and issues ------------------------------------------------
 
-async function requireRequirement(db, companyId, reqId) {
-  const [[q]] = await db.query(
-    `SELECT q.*, r.order_id, o.code AS order_code, o.status AS order_status, l.line_no,
+/** A requirement with what reserving and issuing it need to know — the same columns and row locks for one requirement or a whole release. */
+const REQUIREMENT_SQL = `SELECT q.*, r.order_id, o.code AS order_code, o.status AS order_status, l.line_no,
             m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by
        FROM cf_material_requirements q
        JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
        JOIN cf_sales_orders o ON o.id = r.order_id
        JOIN cf_sales_order_lines l ON l.id = r.order_line_id
        JOIN cf_master_records m ON m.id = q.item_id
-       JOIN cf_item_details i ON i.master_id = q.item_id
+       JOIN cf_item_details i ON i.master_id = q.item_id`;
+
+async function requireRequirement(db, companyId, reqId) {
+  const [[q]] = await db.query(
+    `${REQUIREMENT_SQL}
       WHERE q.company_id = ? AND q.id = ? AND q.deleted_at IS NULL FOR UPDATE`,
     [companyId, Number(reqId)],
   );
@@ -1388,10 +1393,12 @@ async function requireRequirement(db, companyId, reqId) {
   return q;
 }
 
+const ACTIVE_RESERVATIONS_SQL = `SELECT v.*, b.code AS batch_code, b.status AS batch_status FROM cf_stock_reservations v
+       LEFT JOIN cf_stock_batches b ON b.id = v.batch_id`;
+
 async function activeReservations(db, companyId, reqId) {
   const [rows] = await db.query(
-    `SELECT v.*, b.code AS batch_code, b.status AS batch_status FROM cf_stock_reservations v
-       LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
+    `${ACTIVE_RESERVATIONS_SQL}
       WHERE v.company_id = ? AND v.requirement_id = ? AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY v.id FOR UPDATE`,
     [companyId, reqId],
   );
@@ -1403,11 +1410,15 @@ export async function lockItemStock(db, companyId, itemId) {
   await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id = ? FOR UPDATE', [companyId, itemId]);
 }
 
-/** Reserves what is free for one requirement, oldest batch first. input: { quantity?, batchId? } */
-async function reserveOne(db, c, q, input = {}) {
-  const have = sum(await activeReservations(db, c.companyId, q.id));
+/*
+ * Reserving is two pure halves, shared by reserveOne (one requirement) and
+ * reserveRelease (all of them), so both follow exactly one rule.
+ */
+
+/** How much more a requirement needs, given what it has reserved: { done } (the answer — nothing more is needed) or { want }. */
+function wanted(q, have, input = {}) {
   const remaining = round6(Number(q.quantity) - Number(q.issued) - have);
-  if (remaining <= EPS) return { reserved: 0, short: 0, message: `${q.item_code} is already covered here — ${fmt(q.issued)} issued, ${fmt(have)} reserved.` };
+  if (remaining <= EPS) return { done: { reserved: 0, short: 0, message: `${q.item_code} is already covered here — ${fmt(q.issued)} issued, ${fmt(have)} reserved.` } };
   let want = remaining;
   if (!blank(input.quantity)) {
     const n = Number(input.quantity);
@@ -1415,7 +1426,11 @@ async function reserveOne(db, c, q, input = {}) {
     if (n > remaining + EPS) throw invalid('TOO_MANY', `Only ${fmt(remaining)} ${q.uom} more ${remaining === 1 ? 'is' : 'are'} needed here.`);
     want = round6(n);
   }
-  const av = (await availability(db, c.companyId, [q.item_id])).get(q.item_id);
+  return { want };
+}
+
+/** What to claim of `want` from an item's availability() entry, oldest batch first: { rows: [{ batchId, quantity }], result }. */
+function takeFrom(q, want, av, input = {}) {
   const rows = [];
   if (q.tracked_by === 'batch') {
     let batches = av.batches.filter((b) => b.status === 'available' && b.free > EPS);
@@ -1434,15 +1449,29 @@ async function reserveOne(db, c, q, input = {}) {
     rows.push({ batchId: null, quantity: take });
     want = round6(want - take);
   }
-  for (const r of rows) {
-    await db.query('INSERT INTO cf_stock_reservations (company_id, requirement_id, item_id, batch_id, quantity, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-      [c.companyId, q.id, q.item_id, r.batchId, r.quantity, c.userId]);
-  }
   const reserved = sum(rows);
   return {
-    reserved, short: want,
-    message: reserved > EPS ? null : `No free stock of ${q.item_code} — ${fmt(av.available)} ${q.uom} usable on hand, ${fmt(av.reserved)} already reserved.`,
+    rows,
+    result: {
+      reserved, short: want,
+      message: reserved > EPS ? null : `No free stock of ${q.item_code} — ${fmt(av.available)} ${q.uom} usable on hand, ${fmt(av.reserved)} already reserved.`,
+    },
   };
+}
+
+// A material claim: requirement_id set, order_line_id left NULL (see stockFinished for the other kind).
+const RESERVATION_COLUMNS = ['company_id', 'requirement_id', 'item_id', 'batch_id', 'quantity', 'created_by'];
+const reservationRow = (c, q, r) => [c.companyId, q.id, q.item_id, r.batchId, r.quantity, c.userId];
+
+/** Reserves what is free for one requirement, oldest batch first. input: { quantity?, batchId? } */
+async function reserveOne(db, c, q, input = {}) {
+  const have = sum(await activeReservations(db, c.companyId, q.id));
+  const w = wanted(q, have, input);
+  if (w.done) return w.done;
+  const av = (await availability(db, c.companyId, [q.item_id])).get(q.item_id);
+  const { rows, result } = takeFrom(q, w.want, av, input);
+  await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, rows.map((r) => reservationRow(c, q, r)));
+  return result;
 }
 
 export async function reserveRequirement(db, c, reqId, input = {}) {
@@ -1453,19 +1482,90 @@ export async function reserveRequirement(db, c, reqId, input = {}) {
   return getRelease(db, c.companyId, q.release_id);
 }
 
-/** Reserves whatever is free for every requirement of a release; says what is still short. */
+/**
+ * availability() for many items, read once and kept current in memory as claims
+ * are made — what reading it again after every claim would return. Every entry
+ * is worked out by the same shapeAvailability, from that item's rows.
+ */
+function freeStock(bal, res) {
+  const balOf = groupBy(bal, 'item_id');
+  const resOf = groupBy(res.map((r) => ({ ...r })), 'item_id');
+  const cache = new Map();
+  return {
+    of(itemId) {
+      if (!cache.has(itemId)) cache.set(itemId, shapeAvailability([itemId], balOf.get(itemId) ?? [], resOf.get(itemId) ?? []).get(itemId));
+      return cache.get(itemId);
+    },
+    claim(itemId, batchId, quantity) {
+      if (!resOf.has(itemId)) resOf.set(itemId, []);
+      const rows = resOf.get(itemId);
+      const row = rows.find((r) => (r.batch_id ?? 0) === (batchId ?? 0));
+      // What the database's SUM would say: DECIMAL(18,6), so exact at six places.
+      if (row) row.qty = round6(Number(row.qty) + quantity);
+      else rows.push({ item_id: itemId, batch_id: batchId, qty: quantity });
+      cache.delete(itemId);
+    },
+  };
+}
+
+/**
+ * Reserves whatever is free for every requirement of a release; says what is still short.
+ *
+ * In requirement-id order with the rules of reserving one at a time — each claim
+ * changes what is free for the next requirement of the same item — but every
+ * read is made once: the requirements with their row locks, the items' stock
+ * locks (in item-id order, so two of these cannot deadlock each other), the
+ * reservations already held, and the items' free stock, which is then kept
+ * current in memory (freeStock). The new reservations go in with insertRows.
+ * ~17 round trips for the KEPL line's 2,952 requirements, getRelease included
+ * (was ~16,000). scripts/cf_kepl/reserve_batch_test.mjs holds the golden snapshot.
+ */
 export async function reserveRelease(db, c, releaseId) {
   const rel = await requireRelease(db, c.companyId, releaseId, { lock: true });
   assertOrderOpen(rel);
-  const [reqs] = await db.query('SELECT id FROM cf_material_requirements WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId, releaseId]);
+  const [ids] = await db.query('SELECT id FROM cf_material_requirements WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId, releaseId]);
   let reserved = 0;
   const short = new Map();
-  for (const { id: reqId } of reqs) {
-    const q = await requireRequirement(db, c.companyId, reqId);
-    await lockItemStock(db, c.companyId, q.item_id);
-    const out = await reserveOne(db, c, q);
-    if (out.reserved > EPS) reserved += 1;
-    if (out.short > EPS) short.set(q.item_id, { code: q.item_code, uom: q.uom, short: round6((short.get(q.item_id)?.short ?? 0) + out.short) });
+  if (ids.length) {
+    const [found] = await db.query(
+      `${REQUIREMENT_SQL}
+      WHERE q.company_id = ? AND q.id IN (?) AND q.deleted_at IS NULL ORDER BY q.id FOR UPDATE`,
+      [c.companyId, ids.map((r) => r.id)],
+    );
+    const byId = new Map(found.map((q) => [q.id, q]));
+    // One at a time, a requirement the join cannot find stopped the loop with notFound — after reserving the ones before it.
+    const missingAt = ids.findIndex((r) => !byId.has(r.id));
+    const reqs = (missingAt < 0 ? ids : ids.slice(0, missingAt)).map((r) => byId.get(r.id));
+    reqs.forEach(assertOrderOpen);
+    if (reqs.length) {
+      const itemIds = [...new Set(reqs.map((q) => q.item_id))].sort((a, b) => a - b);
+      await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?) ORDER BY master_id FOR UPDATE', [c.companyId, itemIds]);
+      const [held] = await db.query(
+        `${ACTIVE_RESERVATIONS_SQL}
+      WHERE v.company_id = ? AND v.requirement_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY v.id FOR UPDATE`,
+        [c.companyId, reqs.map((q) => q.id)],
+      );
+      const heldOf = groupBy(held, 'requirement_id');
+      const { bal, res } = await availabilityRows(db, c.companyId, itemIds);
+      const stock = freeStock(bal, res);
+      const writes = [];
+      for (const q of reqs) {
+        const w = wanted(q, sum(heldOf.get(q.id) ?? []));
+        let out = w.done;
+        if (!out) {
+          const took = takeFrom(q, w.want, stock.of(q.item_id));
+          for (const r of took.rows) {
+            stock.claim(q.item_id, r.batchId, r.quantity);
+            writes.push(reservationRow(c, q, r));
+          }
+          out = took.result;
+        }
+        if (out.reserved > EPS) reserved += 1;
+        if (out.short > EPS) short.set(q.item_id, { code: q.item_code, uom: q.uom, short: round6((short.get(q.item_id)?.short ?? 0) + out.short) });
+      }
+      await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, writes, 2000);
+    }
+    if (missingAt >= 0) throw notFound('Requirement');
   }
   return { release: await getRelease(db, c.companyId, releaseId), reserved, short: [...short.values()] };
 }

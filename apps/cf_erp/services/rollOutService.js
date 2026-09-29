@@ -69,8 +69,18 @@ export const nameOf = (n) => n.code ?? n.name;
  * (a held batch counts for nothing), what is reserved, and what is free.
  */
 export async function availability(db, companyId, itemIds) {
-  const out = new Map();
-  if (!itemIds.length) return out;
+  if (!itemIds.length) return new Map();
+  const { bal, res } = await availabilityRows(db, companyId, itemIds);
+  return shapeAvailability(itemIds, bal, res);
+}
+
+/**
+ * The two reads availability() is worked out from: usable balances per item and
+ * batch, and active reservations per item and batch. Split out so "reserve all"
+ * can read them ONCE and keep them current in memory as it claims stock
+ * (releaseService.reserveRelease), through the same shapeAvailability.
+ */
+export async function availabilityRows(db, companyId, itemIds) {
   const [bal] = await db.query(
     `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on
        FROM cf_stock_balances k
@@ -85,6 +95,12 @@ export async function availability(db, companyId, itemIds) {
       WHERE company_id = ? AND item_id IN (?) AND status = 'active' AND deleted_at IS NULL GROUP BY item_id, batch_id`,
     [companyId, itemIds],
   );
+  return { bal, res };
+}
+
+/** availability() from its rows — pure. `res` holds one row per (item, batch). */
+export function shapeAvailability(itemIds, bal, res) {
+  const out = new Map();
   const reservedOf = new Map(res.map((r) => [`${r.item_id}:${r.batch_id ?? 0}`, Number(r.qty)]));
   for (const id of itemIds) out.set(id, { available: 0, reserved: 0, free: 0, batches: [] });
   for (const b of bal) {
