@@ -22,6 +22,7 @@ import placeholderRoutes from './placeholders.js';
 import timeRoutes from './times.js';
 import workOrderRoutes from './workOrders.js';
 import plannerRoutes from './planner.js';
+import floorRoutes from './floor.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -101,5 +102,6 @@ router.use(placeholderRoutes);
 router.use(timeRoutes);
 router.use(workOrderRoutes);
 router.use(plannerRoutes);
+router.use(floorRoutes);
 
 export default router;

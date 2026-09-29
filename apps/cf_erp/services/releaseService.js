@@ -1104,7 +1104,7 @@ export async function orderProduction(db, companyId, orderId) {
   };
 }
 
-async function openReleaseIds(db, companyId, { includeClosed = false } = {}) {
+export async function openReleaseIds(db, companyId, { includeClosed = false } = {}) {
   const [rows] = await db.query(
     `SELECT r.id FROM cf_production_releases r JOIN cf_sales_orders o ON o.id = r.order_id AND o.deleted_at IS NULL
       WHERE r.company_id = ? AND r.deleted_at IS NULL${includeClosed ? '' : " AND o.status = 'confirmed'"}`,
@@ -1168,11 +1168,52 @@ export async function trackerCounts(db, companyId) {
   };
 }
 
+/**
+ * The tracker's raw rows with every step's status worked out — for a reader
+ * that needs readiness without the shaped tree (the machine log's queue,
+ * floorService). Same reads and the same evaluate() as getRelease, so a step
+ * is never "ready" in one screen and "waiting" in another. Each step row gains
+ * _status, _blockers (plain sentences), _opLabel; each item _label. null when
+ * no release matches.
+ */
+export async function evaluatedTracker(db, companyId, releaseIds) {
+  const data = await loadTracker(db, companyId, releaseIds);
+  if (!data) return null;
+  const ev = evaluate(data);
+  return { ...data, ...ev };
+}
+
 // --- the shop floor -----------------------------------------------------------------
+
+/**
+ * When a floor event happened, as epoch SECONDS, or null for "now" (the old
+ * behaviour, NOW() in SQL). Given as a Date, epoch milliseconds, or an ISO
+ * date-time that carries its zone (Z or ±hh:mm) — a bare wall-clock time is
+ * ambiguous here; the machine log converts the plant clock before calling.
+ * Not in the future (a minute of clock skew allowed), not before the release
+ * was made (release_epoch, read by requireStep with UNIX_TIMESTAMP so the
+ * comparison is the same on every host).
+ */
+export function readAt(raw, releaseEpoch) {
+  if (raw == null || raw === '') return null;
+  let ms;
+  if (raw instanceof Date) ms = raw.getTime();
+  else if (typeof raw === 'number') ms = raw;
+  else {
+    const s = String(raw).trim();
+    if (!/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) throw invalid('INVALID', 'The time needs its zone (for example 2026-09-29T10:30:00+05:30).');
+    ms = Date.parse(s);
+  }
+  if (!Number.isFinite(ms)) throw invalid('INVALID', 'That is not a date and time.');
+  const sec = Math.floor(ms / 1000);
+  if (sec > Math.floor(Date.now() / 1000) + 60) throw invalid('IN_FUTURE', 'That time is in the future.');
+  if (releaseEpoch != null && sec < Number(releaseEpoch)) throw invalid('BEFORE_RELEASE', 'That time is before the job was released to production.');
+  return sec;
+}
 
 async function requireStep(db, companyId, stepId) {
   const [[s]] = await db.query(
-    `SELECT s.*, pi.release_id, r.order_id, o.code AS order_code, o.status AS order_status, op.code AS op_code, op.name AS op_name
+    `SELECT s.*, pi.release_id, r.order_id, UNIX_TIMESTAMP(r.created_at) AS release_epoch, o.code AS order_code, o.status AS order_status, op.code AS op_code, op.name AS op_name
        FROM cf_production_steps s
        JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
        JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
@@ -1193,18 +1234,37 @@ async function evaluatedStep(db, companyId, step) {
   throw notFound('Step');
 }
 
-async function logEvent(db, c, stepId, event, { good = 0, scrap = 0, machineId = null, note = null } = {}) {
+/**
+ * One history row. `at` (epoch seconds) = when it happened, NULL = when it was
+ * written (created_at) — the tracker's own calls leave it NULL as before. The
+ * machine log also stamps who (operator), where from (source), its session,
+ * and whether the step was ready (before_ready) — init.sql §32.
+ */
+async function logEvent(db, c, stepId, event, {
+  good = 0, scrap = 0, machineId = null, note = null, at = null, operatorId = null, source = null, sessionId = null, beforeReady = false,
+} = {}) {
   await db.query(
-    'INSERT INTO cf_step_events (company_id, step_id, event, qty_good, qty_scrap, machine_id, note, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [c.companyId, stepId, event, good, scrap, machineId, note, c.userId],
+    `INSERT INTO cf_step_events (company_id, step_id, event, qty_good, qty_scrap, machine_id, note, created_by, at, operator_id, source, session_id, before_ready)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ${at == null ? 'NULL' : 'FROM_UNIXTIME(?)'}, ?, ?, ?, ?)`,
+    [c.companyId, stepId, event, good, scrap, machineId, note, c.userId, ...(at == null ? [] : [at]), operatorId, source, sessionId, beforeReady ? 1 : 0],
   );
 }
 
-/** Starts a ready step. input: { machineId? } — a machine must be one its operation's rules let do it. */
+/**
+ * Starts a ready step. input: { machineId?, note?, at?, allowNotReady? } — a
+ * machine must be one its operation's rules let do it. `at` back-dates the
+ * start (readAt: not in the future, not before the release). allowNotReady is
+ * the machine log's exception (user, 2026-09-30: readiness is not a gate for
+ * logging ACTUALS — a worker who really did the job records it): a step still
+ * waiting starts anyway and its start event is flagged before_ready. A step in
+ * progress, done or on hold is refused either way.
+ */
 export async function startStep(db, c, stepId, input = {}) {
   const step = await requireStep(db, c.companyId, stepId);
+  const at = readAt(input.at, step.release_epoch);
   const { s } = await evaluatedStep(db, c.companyId, step);
-  if (s.status !== 'ready') {
+  const beforeReady = s.status === 'not_ready' && !!input.allowNotReady;
+  if (s.status !== 'ready' && !beforeReady) {
     const why = s.status === 'not_ready' ? s.blockers.map((b) => b.text) : [`It is ${s.status.replace('_', ' ')}.`];
     throw invalid('NOT_READY', `${s.label} cannot start yet.`, { problems: why });
   }
@@ -1217,18 +1277,23 @@ export async function startStep(db, c, stepId, input = {}) {
     if (!rule || !rule.eligible) throw invalid('NOT_ELIGIBLE', `${m.code} is not set up to do ${step.op_name} (${step.op_code}).`);
     machineId = m.id;
   }
-  await db.query("UPDATE cf_production_steps SET state = 'in_progress', started_at = NOW(), machine_id = ? WHERE company_id = ? AND id = ?", [machineId, c.companyId, step.id]);
-  await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500) });
+  await db.query(
+    `UPDATE cf_production_steps SET state = 'in_progress', started_at = ${at == null ? 'NOW()' : 'FROM_UNIXTIME(?)'}, machine_id = ? WHERE company_id = ? AND id = ?`,
+    [...(at == null ? [] : [at]), machineId, c.companyId, step.id],
+  );
+  await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });
   return getRelease(db, c.companyId, step.release_id);
 }
 
 /**
  * Records work on a started step. input: { good?, scrap?, note? } — quantities
  * are added to what is recorded; the step is done when the good ones reach its
- * quantity. Scrapped pieces do not count: they are made again.
+ * quantity. Scrapped pieces do not count: they are made again. `at` (readAt)
+ * back-dates the event, and the step's finished_at when this completes it.
  */
 export async function recordProgress(db, c, stepId, input = {}) {
   const step = await requireStep(db, c.companyId, stepId);
+  const at = readAt(input.at, step.release_epoch);
   if (step.state !== 'in_progress') throw invalid('NOT_STARTED', step.state === 'done' ? 'This step is already done.' : step.state === 'on_hold' ? 'This step is on hold — resume it first.' : 'Start the step first.');
   const good = blank(input.good) ? 0 : Number(input.good);
   const scrap = blank(input.scrap) ? 0 : Number(input.scrap);
@@ -1239,10 +1304,10 @@ export async function recordProgress(db, c, stepId, input = {}) {
   const newGood = round6(Number(step.qty_good) + good);
   const done = newGood >= Number(step.quantity) - EPS;
   await db.query(
-    `UPDATE cf_production_steps SET qty_good = ?, qty_scrap = qty_scrap + ?, state = ?, finished_at = ${done ? 'NOW()' : 'NULL'} WHERE company_id = ? AND id = ?`,
-    [newGood, round6(scrap), done ? 'done' : 'in_progress', c.companyId, step.id],
+    `UPDATE cf_production_steps SET qty_good = ?, qty_scrap = qty_scrap + ?, state = ?, finished_at = ${!done ? 'NULL' : at == null ? 'NOW()' : 'FROM_UNIXTIME(?)'} WHERE company_id = ? AND id = ?`,
+    [newGood, round6(scrap), done ? 'done' : 'in_progress', ...(done && at != null ? [at] : []), c.companyId, step.id],
   );
-  await logEvent(db, c, step.id, 'progress', { good: round6(good), scrap: round6(scrap), note: blank(input.note) ? null : String(input.note).slice(0, 500) });
+  await logEvent(db, c, step.id, 'progress', { good: round6(good), scrap: round6(scrap), note: blank(input.note) ? null : String(input.note).slice(0, 500), at });
   if (done) await stockFinished(db, c, step.production_item_id);
   return getRelease(db, c.companyId, step.release_id);
 }
@@ -1260,7 +1325,7 @@ export async function recordProgress(db, c, stepId, input = {}) {
  * progress, and the tracker is where their progress lives. `stocked_qty` is the
  * guard, so the same piece is never received twice.
  */
-async function stockFinished(db, c, productionItemId) {
+export async function stockFinished(db, c, productionItemId) {
   const [[it]] = await db.query(
     `SELECT pi.*, r.order_id, r.order_line_id, r.finished_area_id, o.order_type, o.code AS order_code, l.line_no,
             m.code AS item_code, m.name AS item_name, i.tracked_by
@@ -1359,14 +1424,19 @@ export async function resumeStep(db, c, stepId, input = {}) {
 /** What was recorded on a step, oldest first. */
 export async function stepHistory(db, companyId, stepId) {
   const [rows] = await db.query(
-    `SELECT e.*, m.code AS machine_code, u.name AS user_name FROM cf_step_events e
+    `SELECT e.*, m.code AS machine_code, u.name AS user_name, op.name AS operator_name FROM cf_step_events e
        LEFT JOIN cf_machines m ON m.id = e.machine_id LEFT JOIN users u ON u.id = e.created_by
+       LEFT JOIN cf_operators op ON op.id = e.operator_id
       WHERE e.company_id = ? AND e.step_id = ? ORDER BY e.id`,
     [companyId, Number(stepId)],
   );
   return rows.map((e) => ({
     id: e.id, event: e.event, good: Number(e.qty_good), scrap: Number(e.qty_scrap),
-    machine: e.machine_id ? { id: e.machine_id, code: e.machine_code } : null, note: e.note, at: e.created_at, by: e.user_name ?? null,
+    machine: e.machine_id ? { id: e.machine_id, code: e.machine_code } : null, note: e.note,
+    // When it happened (a back-dated entry says so); recordedAt is when it was typed in.
+    at: e.at ?? e.created_at, recordedAt: e.created_at, by: e.user_name ?? null,
+    operator: e.operator_id ? { id: e.operator_id, name: e.operator_name } : null,
+    source: e.source ?? 'tracker', beforeReady: !!Number(e.before_ready ?? 0),
   }));
 }
 

@@ -19,6 +19,7 @@ export const PERM = {
   production: 'cf_erp_production_manage',   // machines, shifts, operations, timing rules, flows and their waits
   inventoryView: 'cf_erp_inventory_view',   // see stocking areas, stock, batches and movements
   inventory: 'cf_erp_inventory_manage',     // stocking areas, receipts, issues, transfers, counts, scrap, batches
+  floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
 };
 
 /** The tenant and user of a request. The company always comes from the token, never the URL. */
@@ -36,6 +37,14 @@ export function assertPerm(req, tag) {
 
 /** protect + permission, as one middleware list. */
 export const guard = (perm) => [protect, requirePerm(perm)];
+
+/**
+ * protect + ANY ONE of several permissions. The floor screens take cf_erp_floor
+ * (a shared tablet has only that) or production manage (a manager records too).
+ */
+export const guardAny = (...perms) => [protect, (req, res, next) => (perms.some((p) => isPermitted(req.user, p))
+  ? next()
+  : res.status(403).json({ error: 'FORBIDDEN', message: `Permission required: ${perms.join(' or ')}` }))];
 
 /** Wraps an async handler: its return value is the JSON body; errors go through fail(). */
 export const handle = (fn) => async (req, res) => {

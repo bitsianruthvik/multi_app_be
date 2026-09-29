@@ -3116,3 +3116,255 @@ SELECT f.company_id, s.id, 'classification', f.id, 'item', 0, 1, 'defaulted'
                     WHERE a.company_id = f.company_id AND a.specification_id = s.id
                       AND a.subject_type = 'classification' AND a.subject_id = f.id
                       AND a.deleted_at IS NULL);
+
+-- ===========================================================================
+-- 32. THE MACHINE LOG — what each machine did, and when it stood still
+-- ===========================================================================
+--
+-- Decided 2026-09-30 (TM/CF_ERP_FLOOR_LOG_PLAN.md). The user: a very easy way
+-- to enter, per machine, what work happened and the blocks of time when no work
+-- happened, with a reason from a list — noted on paper and entered at the
+-- machine at the end of the day, or live: start, pause, stop. Several jobs can
+-- run together.
+--
+-- TIMES ON THE FLOOR ARE THE PLANT CLOCK, the same frame as the shifts
+-- (cf_machine_shifts): cf_work_sessions and cf_machine_stops store full
+-- date-times in the plant's local time (never a bare time of day — a night
+-- shift crosses midnight). The plant's zone is cf_floor_settings.timezone.
+-- The step columns (started_at / finished_at) and cf_step_events.at keep the
+-- frame NOW() writes, as before; floorService converts between the two.
+--
+-- cf_operators          who works the machines (a shared tablet: tap your name).
+-- cf_operator_machines  an operator's usual machines — listed first, never a limit.
+-- cf_stop_reasons       why a machine stood still; seeded per cf_erp company with
+--                       the plan's twelve. "Other" needs a note.
+-- cf_work_sessions      one continuous span of ONE step on ONE machine.
+--                       ended_at NULL = running now; end_kind pause | done | stop.
+--                       Sessions of different steps may overlap (jobs together);
+--                       a step has at most one open session (uq_cfws_open).
+--                       qty_good / qty_scrap = what was recorded with this span
+--                       (the step keeps the totals). An edit is a soft delete +
+--                       a new row whose replaces_id names the old one.
+-- cf_machine_stops      a span the machine stood still, with a reason. ended_at
+--                       NULL = still stopped; one open stop per machine
+--                       (uq_cfms_open). A stop never overlaps a work session of
+--                       the same machine, nor another stop (floorService checks).
+-- cf_floor_settings     the plant's time zone, per company; no row = the default
+--                       in floorService (env CF_PLANT_TIMEZONE, else Asia/Kolkata).
+-- cf_step_events gains  at (when it happened; NULL = created_at), operator_id,
+--                       source (tracker | live | day_entry), session_id, and
+--                       before_ready — 1 = recorded before the step was ready
+--                       (readiness is not a gate for logging actuals: flagged,
+--                       never blocked).
+-- Feature cf_erp_floor  read + record on the floor screens; granted to every
+--                       role that already has cf_erp_production_manage.
+-- Keys on the new cf_step_events columns are their own guarded steps (TiDB
+-- cannot index a column in the ALTER that adds it).
+
+CREATE TABLE IF NOT EXISTS cf_operators (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  code            VARCHAR(50)    NOT NULL,
+  name            VARCHAR(150)   NOT NULL,
+  status          ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  notes           VARCHAR(500)   NULL,
+  created_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  code_active     VARCHAR(50)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfop_tenant (company_id, id),
+  UNIQUE KEY uq_cfop_code   (company_id, code_active),
+
+  CONSTRAINT fk_cfop_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfop_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_operator_machines (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  operator_id     INT            NOT NULL,
+  machine_id      INT            NOT NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  is_live         TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfom_tenant (company_id, id),
+  UNIQUE KEY uq_cfom_pair   (company_id, operator_id, machine_id, is_live),
+  KEY idx_cfom_machine (company_id, machine_id),
+
+  CONSTRAINT fk_cfom_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfom_operator FOREIGN KEY (company_id, operator_id) REFERENCES cf_operators(company_id, id),
+  CONSTRAINT fk_cfom_machine  FOREIGN KEY (company_id, machine_id)  REFERENCES cf_machines(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_stop_reasons (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  code            VARCHAR(40)    NOT NULL,
+  label           VARCHAR(100)   NOT NULL,
+  sort_order      INT            NOT NULL DEFAULT 0,
+  needs_note      TINYINT(1)     NOT NULL DEFAULT 0,
+  status          ENUM('active','inactive') NOT NULL DEFAULT 'active',
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  code_active     VARCHAR(40)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfsr_tenant (company_id, id),
+  UNIQUE KEY uq_cfsr_code   (company_id, code_active),
+
+  CONSTRAINT fk_cfsr_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_work_sessions (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  machine_id      INT            NOT NULL,
+  step_id         INT            NOT NULL,
+  operator_id     INT            NULL,
+  started_at      DATETIME       NOT NULL,          -- plant clock
+  ended_at        DATETIME       NULL,              -- NULL = running now
+  end_kind        ENUM('pause','done','stop') NULL,
+  source          ENUM('live','day_entry') NOT NULL,
+  qty_good        DECIMAL(18,6)  NOT NULL DEFAULT 0,
+  qty_scrap       DECIMAL(18,6)  NOT NULL DEFAULT 0,
+  before_ready    TINYINT(1)     NOT NULL DEFAULT 0,
+  replaces_id     INT            NULL,              -- the row this edit replaced
+  note            VARCHAR(500)   NULL,
+  entered_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  open_step       INT            GENERATED ALWAYS AS (IF(ended_at IS NULL AND deleted_at IS NULL, step_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfws_tenant (company_id, id),
+  UNIQUE KEY uq_cfws_open   (company_id, open_step),
+  KEY idx_cfws_machine (company_id, machine_id, started_at),
+  KEY idx_cfws_step    (company_id, step_id),
+
+  CONSTRAINT fk_cfws_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfws_machine  FOREIGN KEY (company_id, machine_id)  REFERENCES cf_machines(company_id, id),
+  CONSTRAINT fk_cfws_step     FOREIGN KEY (company_id, step_id)     REFERENCES cf_production_steps(company_id, id),
+  CONSTRAINT fk_cfws_operator FOREIGN KEY (company_id, operator_id) REFERENCES cf_operators(company_id, id),
+  CONSTRAINT fk_cfws_enterer  FOREIGN KEY (entered_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_machine_stops (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  machine_id      INT            NOT NULL,
+  started_at      DATETIME       NOT NULL,          -- plant clock
+  ended_at        DATETIME       NULL,              -- NULL = still stopped
+  reason_id       INT            NOT NULL,
+  note            VARCHAR(500)   NULL,
+  operator_id     INT            NULL,
+  source          ENUM('live','day_entry') NOT NULL,
+  replaces_id     INT            NULL,
+  entered_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  open_machine    INT            GENERATED ALWAYS AS (IF(ended_at IS NULL AND deleted_at IS NULL, machine_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfms_tenant (company_id, id),
+  UNIQUE KEY uq_cfms_open   (company_id, open_machine),
+  KEY idx_cfms_machine (company_id, machine_id, started_at),
+
+  CONSTRAINT fk_cfms_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfms_machine  FOREIGN KEY (company_id, machine_id)  REFERENCES cf_machines(company_id, id),
+  CONSTRAINT fk_cfms_reason   FOREIGN KEY (company_id, reason_id)   REFERENCES cf_stop_reasons(company_id, id),
+  CONSTRAINT fk_cfms_operator FOREIGN KEY (company_id, operator_id) REFERENCES cf_operators(company_id, id),
+  CONSTRAINT fk_cfms_enterer  FOREIGN KEY (entered_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_floor_settings (
+  company_id      INT            NOT NULL PRIMARY KEY,
+  timezone        VARCHAR(64)    NOT NULL,          -- IANA zone of the plant clock, e.g. Asia/Kolkata
+  updated_by      INT            NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  CONSTRAINT fk_cffs_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cffs_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'at');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_step_events ADD COLUMN at DATETIME NULL, ADD COLUMN operator_id INT NULL, ADD COLUMN source ENUM('tracker','live','day_entry') NULL, ADD COLUMN session_id INT NULL, ADD COLUMN before_ready TINYINT(1) NOT NULL DEFAULT 0",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- TiDB cannot index a column in the same ALTER that adds it, so the key is its own guarded step.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND INDEX_NAME = 'idx_csev_operator');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_step_events ADD KEY idx_csev_operator (company_id, operator_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND CONSTRAINT_NAME = 'fk_csev_operator');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_step_events ADD CONSTRAINT fk_csev_operator FOREIGN KEY (company_id, operator_id) REFERENCES cf_operators(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The twelve reasons, for every cf_erp company that has none yet (a company
+-- whose list was edited is never re-seeded: a deleted reason stays deleted).
+-- floorService.DEFAULT_STOP_REASONS is the same list, for companies set up later.
+INSERT INTO cf_stop_reasons (company_id, code, label, sort_order, needs_note)
+SELECT c.id, x.code, x.label, x.sort_order, x.needs_note
+  FROM companies c
+  JOIN (
+    SELECT 'NO_MATERIAL' AS code, 'No material' AS label, 10 AS sort_order, 0 AS needs_note UNION ALL
+    SELECT 'CRANE',       'Waiting for crane',        20, 0 UNION ALL
+    SELECT 'PREV_JOB',    'Waiting for previous job', 30, 0 UNION ALL
+    SELECT 'BREAKDOWN',   'Breakdown',                40, 0 UNION ALL
+    SELECT 'POWER',       'Power cut',                50, 0 UNION ALL
+    SELECT 'NO_OPERATOR', 'No operator',              60, 0 UNION ALL
+    SELECT 'SETUP',       'Setup / changeover',       70, 0 UNION ALL
+    SELECT 'BREAK',       'Meal / tea break',         80, 0 UNION ALL
+    SELECT 'QUALITY',     'Quality hold',             90, 0 UNION ALL
+    SELECT 'DRAWING',     'Waiting for drawing',     100, 0 UNION ALL
+    SELECT 'CLEANING',    'Cleaning / maintenance',  110, 0 UNION ALL
+    SELECT 'OTHER',       'Other',                   120, 1
+  ) x
+ WHERE c.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM apps ap WHERE ap.company_id = c.id AND ap.slug = 'cf_erp' AND ap.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_stop_reasons r WHERE r.company_id = c.id);
+
+-- The floor permission: a feature, its capability, and a grant to every role
+-- (team, company) that already has production manage, for the same app.
+-- models/seed.sql lists cf_erp_floor too, so a fresh database's admin gets it.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: record work on the shop floor', 'cf_erp_floor', 'frontend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_floor');
+
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_floor' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_floor' AND fc.deleted_at IS NULL);
+
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT rc.role_id, rc.team_id, rc.company_id, rc.app_id, fl.capability_id
+  FROM role_capability rc
+  JOIN features_capability pm ON pm.capability_id = rc.capability_id AND pm.name = 'cf_erp_production_manage' AND pm.deleted_at IS NULL
+  JOIN features_capability fl ON fl.name = 'cf_erp_floor' AND fl.deleted_at IS NULL
+ WHERE rc.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.capability_id = fl.capability_id AND x.deleted_at IS NULL
+        AND x.role_id <=> rc.role_id AND x.team_id <=> rc.team_id
+        AND x.company_id <=> rc.company_id AND x.app_id <=> rc.app_id);
