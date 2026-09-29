@@ -4,8 +4,10 @@
  *   GET  /orders/:orderId/lines/:lineId/nesting          the SAVED plan
  *   POST /orders/:orderId/lines/:lineId/nesting/plan     { effort?, guillotine?, seed? } — propose
  *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it
- *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the layout as a workbook (?format=csv)
- *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { fileBase64, dryRun? } — read it back
+ *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the nests as a workbook (Nests / Needed / How to use this)
+ *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { file, filename, dryRun, force } — preview, or save
+ *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
+ *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
  *
  * A LOOK IS A LOOK. The GET reads what was accepted and does not re-pack:
  * re-solving on every open cost the other system a 36-second spinner, and a
@@ -13,9 +15,9 @@
  * because it is an action a person asks for — it still writes nothing.
  *
  * SUGGEST, THEN ACCEPT. /plan proposes and /accept writes; nothing reaches the
- * database in between. Uploading the sheet is the one exception, and it is not
- * really one: the sheet says on its own face that uploading IT is accepting it,
- * and it goes through the same acceptNesting, with the same verification.
+ * database in between. The sheet works the same way: an upload is a preview
+ * (dryRun) first, every nest checked against our rules, and only a save writes
+ * — replacing every lot on the line, imported and automatic alike.
  *
  * The line is addressed through its order, so the two are checked against each
  * other first — /orders/7/lines/99 must not quietly serve line 99 of order 3.
@@ -36,6 +38,8 @@ import { planNesting, acceptNesting, getNesting, assertLineOnOrder } from '../se
 // the diff a dry run reports are a different job from laying steel out, and
 // nestingService is long enough already.
 import { exportSheet, importSheet } from '../services/nestingSheetService.js';
+// The CNC files: one DXF per nest with a layout, and the line's zip.
+import { lotDxf, lineCncZip } from '../services/cncExportService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -69,7 +73,7 @@ router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
   handle((req) => write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}))));
 
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
-  const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id, { format: req.query.format }));
+  const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id));
   res.setHeader('Content-Type', out.contentType);
   res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
   res.setHeader('Content-Length', String(out.buffer.length));
@@ -82,10 +86,31 @@ router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (r
   res.send(out.buffer);
 }));
 
-// UPLOADING THE SHEET IS ACCEPTING IT. The workbook says so on its own face, in
-// a banner across its first row, because in fab it surprised people. `dryRun`
-// is the way to see what it would do first; it writes nothing.
+// THE SHEET IS PREVIEWED, THEN SAVED. `dryRun: true` checks every nest and
+// writes nothing; saving replaces every lot on the line, and a nest that does
+// not fit our rules (or a cut plate over-covered) needs `force: true`.
 router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
   handle((req) => write(req, (db, c, id) => importSheet(db, c, id, req.body ?? {}))));
+
+/** A file out: the buffer, its type, and a download name. */
+const sendFile = (res, out, type) => {
+  res.setHeader('Content-Type', type);
+  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.send(out.buffer);
+};
+
+router.get('/orders/:orderId/lines/:lineId/nesting/cnc', view, handle(async (req, res) => {
+  const out = await read(req, (db, companyId, id) => lineCncZip(db, companyId, id));
+  sendFile(res, out, 'application/zip');
+}));
+
+// A nest without a layout of ours has no drawing: lotDxf refuses it with
+// NO_LAYOUT (422), which handle() passes through as it is.
+router.get('/orders/:orderId/lines/:lineId/nesting/cnc/:lotId', view, handle(async (req, res) => {
+  const lotId = intParam(req.params.lotId, 'lotId');
+  const out = await read(req, (db, companyId, id) => lotDxf(db, companyId, id, lotId));
+  sendFile(res, out, 'application/dxf');
+}));
 
 export default router;

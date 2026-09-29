@@ -26,6 +26,8 @@
 import { invalid, notFound, conflict } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { resolveTiming } from './operationService.js';
+import { estimatorForLine } from './timeEstimateService.js';
+import { cellOwnersOfLine } from './workOrderService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
 import {
@@ -671,21 +673,35 @@ export async function releaseLine(db, c, lineId, input = {}) {
       throw invalid('CODE_CLASH', `${coded.taken[0]} is already the code of a piece on another release. Add something to the rule that tells orders apart — the order number, or a running number.`);
     }
   }
+  // The time each step is expected to take — the Times tab's numbers (a typed
+  // override, else the formula on the machine type's chart), copied here so the
+  // tracker never follows a later change — and the contractor work order its
+  // (piece, operation) cell sits on (init.sql §30). A fixed number of reads.
+  const estimate = await estimatorForLine(db, c.companyId, line.id,
+    plan.steps.map((s) => ({ bomLineId: plan.nodes[s.nodeK].bomLineId, itemId: plan.nodes[s.nodeK].itemId, operationId: s.operationId })));
+  const owners = line.locked_at ? await cellOwnersOfLine(db, c.companyId, line.id) : new Map();
   // Parents are laid out before their children, so each insert knows its parent's id.
   for (const n of plan.nodes) {
     const [x] = await db.query(
-      `INSERT INTO cf_production_items (company_id, release_id, parent_id, item_id, bom_line_id, piece_no, quantity, code, flow_id, flow_revision, depth, sort_order, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO cf_production_items (company_id, release_id, parent_id, item_id, bom_line_id, piece_no, quantity, code, flow_id, flow_revision, depth, sort_order, order_piece_id, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [c.companyId, releaseId, n.parentK != null ? plan.nodes[n.parentK].id : null, n.itemId, n.bomLineId, n.pieceNo, n.quantity, n.code,
-        n.flowId, plan.flows.get(n.flowId)?.revision ?? null, n.depth, n.k + 1, c.userId],
+        n.flowId, plan.flows.get(n.flowId)?.revision ?? null, n.depth, n.k + 1, n.lockedPieceId ?? null, c.userId],
     );
     n.id = x.insertId;
   }
   for (const s of plan.steps) {
+    const node = plan.nodes[s.nodeK];
+    const t = estimate(node.bomLineId, node.itemId, s.operationId);
+    const work = t?.work ?? null;
+    const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
+    const total = work != null ? Number(((setup ?? 0) + work * Number(s.quantity)).toFixed(3)) : null;
+    const workOrderId = node.lockedPieceId != null ? owners.get(`${node.lockedPieceId}:${s.operationId}`) ?? null : null;
     const [x] = await db.query(
-      `INSERT INTO cf_production_steps (company_id, production_item_id, flow_step_id, operation_id, sequence, step_name, quantity, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, plan.nodes[s.nodeK].id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, c.userId],
+      `INSERT INTO cf_production_steps (company_id, production_item_id, flow_step_id, operation_id, sequence, step_name, quantity,
+                                        est_setup_minutes, est_work_minutes, est_minutes, work_order_id, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.companyId, node.id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, setup, work, total, workOrderId, c.userId],
     );
     s.id = x.insertId;
   }
@@ -770,10 +786,13 @@ async function loadTracker(db, companyId, releaseIds) {
   );
   const itemIds = items.map((x) => x.id);
   const [steps] = itemIds.length ? await db.query(
-    `SELECT s.*, o.code AS op_code, o.name AS op_name, mc.code AS machine_code, mc.name AS machine_name
+    `SELECT s.*, o.code AS op_code, o.name AS op_name, mc.code AS machine_code, mc.name AS machine_name,
+            wo.code AS wo_code, wo.status AS wo_status, wo.contractor_id AS wo_contractor_id, wp.name AS wo_contractor_name
        FROM cf_production_steps s
        JOIN cf_operations o ON o.id = s.operation_id
        LEFT JOIN cf_machines mc ON mc.id = s.machine_id
+       LEFT JOIN cf_work_orders wo ON wo.id = s.work_order_id
+       LEFT JOIN cf_parties wp ON wp.id = wo.contractor_id
       WHERE s.company_id = ? AND s.production_item_id IN (?) AND s.deleted_at IS NULL ORDER BY s.production_item_id, s.sequence, s.id`,
     [companyId, itemIds],
   ) : [[]];
@@ -914,6 +933,14 @@ const shapeStep = (s, pieceLabel) => ({
   state: s.state,
   status: s._status,
   machine: s.machine_id ? { id: s.machine_id, code: s.machine_code, name: s.machine_name } : null,
+  // A step on a contractor work order (init.sql §30): the tracker shows it in place of the machine.
+  workOrder: s.work_order_id ? { id: s.work_order_id, code: s.wo_code, status: s.wo_status, contractorId: s.wo_contractor_id, contractorName: s.wo_contractor_name } : null,
+  workOrderId: s.work_order_id ?? null,
+  workOrderCode: s.work_order_id ? s.wo_code : null,
+  contractorName: s.work_order_id ? s.wo_contractor_name : null,
+  estSetupMinutes: s.est_setup_minutes == null ? null : Number(s.est_setup_minutes),
+  estWorkMinutes: s.est_work_minutes == null ? null : Number(s.est_work_minutes),
+  estMinutes: s.est_minutes == null ? null : Number(s.est_minutes),
   startedAt: s.started_at,
   finishedAt: s.finished_at,
   waits: s._waits,
@@ -1043,9 +1070,12 @@ export async function listTrackerSteps(db, companyId, q = {}) {
   else if (status !== 'all') rows = rows.filter((s) => s.status === status);
   if (!blank(q.orderId)) rows = rows.filter((s) => s.order.id === Number(q.orderId));
   if (!blank(q.operationId)) rows = rows.filter((s) => s.operation.id === Number(q.operationId));
+  // The Tracker's one "In-house only" filter: steps on no contractor work order.
+  if (String(q.inHouse) === '1') rows = rows.filter((s) => !s.workOrder);
+  if (!blank(q.workOrderId)) rows = rows.filter((s) => s.workOrder?.id === Number(q.workOrderId));
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
-    rows = rows.filter((s) => contains(term, s.piece.label, s.order.code, s.operation.code, s.operation.name, s.machine?.code));
+    rows = rows.filter((s) => contains(term, s.piece.label, s.order.code, s.operation.code, s.operation.name, s.machine?.code, s.workOrder?.code, s.workOrder?.contractorName));
   }
   return rows;
 }

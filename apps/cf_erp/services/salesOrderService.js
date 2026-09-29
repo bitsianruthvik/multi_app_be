@@ -28,6 +28,7 @@ import { instantiateTemplate, deleteTemporaryTree, checkTemplate, temporaryTree 
 import { explode } from './bomService.js';
 import { generate } from '../modules/codegen/index.js';
 import { resolveProcess } from './processService.js';
+import { retireCellsOfRetiredPieces } from './workOrderService.js';
 
 export const ORDER_TYPES = ['customer', 'stock'];
 export const TRANSITIONS = {
@@ -542,6 +543,8 @@ async function removeLineRows(db, c, lineId) {
   // A deleted order takes its locked pieces with it, so their codes are free again.
   if (line.locked_at) {
     await db.query('UPDATE cf_order_pieces SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [c.companyId, lineId]);
+    // ...and their contractor work-order cells (init.sql §30).
+    await retireCellsOfRetiredPieces(db, c.companyId, { lineId });
   }
   await db.query('UPDATE cf_sales_order_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, lineId]);
   return line;

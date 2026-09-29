@@ -125,7 +125,7 @@ function shelfPacker({ pieces, sheets, gap, margin, seqGapMin, guillotine, effor
  * Counting, so "writes nothing" and "leaves nothing behind" are facts
  * ----------------------------------------------------------------------- */
 const COUNTED = [
-  'cf_plate_lots', 'cf_nest_placements', 'cf_cut_settings', 'cf_master_records', 'cf_item_details',
+  'cf_plate_lots', 'cf_nest_placements', 'cf_offcuts', 'cf_cut_settings', 'cf_master_records', 'cf_item_details',
   'cf_boms', 'cf_bom_lines', 'cf_spec_values', 'cf_spec_options', 'cf_specifications',
   'cf_sales_orders', 'cf_sales_order_lines',
 ];
@@ -596,21 +596,22 @@ try {
   ok('refused, saying how many are missing', (shortErr?.problems ?? []).some((p) => /the line needs \d+ pieces? and the layout places \d+/.test(p)), JSON.stringify(shortErr?.problems ?? []));
 
   /* ---- 12. the Excel round trip ----------------------------------------- */
-  section('12. The sheet goes out and comes back, and coming back IS accepting');
+  section('12. The quantity-level sheet goes out and comes back as imported nests');
   await S.acceptNesting(conn, c, fixture.lineId, plan2);            // a clean state to export
   const sheet = await SHEET.exportSheet(conn, COMPANY, fixture.lineId);
-  eq('one row per piece', sheet.rows, 9);
+  eq('one row per cut plate on each nest (2 nests x 2 cut plates)', sheet.rows, 4);
+  eq('two nests', sheet.lots, 2);
   eq('it is the saved plan, not a fresh proposal', sheet.saved, true);
   ok('and it is a workbook', sheet.buffer[0] === 0x50 && sheet.buffer[1] === 0x4b);
-  const back = await SHEET.importSheet(conn, c, fixture.lineId, { fileBase64: sheet.buffer.toString('base64') });
-  eq('reading it back rewrites the same two lots', back.lots, 2);
-  eq('with the same nine pieces', back.pieces, 9);
-  eq('and it says where it came from', back.source, 'sheet');
+  const back = await SHEET.importSheet(conn, c, fixture.lineId, { file: sheet.buffer.toString('base64'), pack: shelfPacker });
+  eq('reading it back saves it (every nest fits, nothing over)', back.applied, true);
+  eq('the same two nests', back.saved?.lots, 2);
+  eq('with the same nine pieces', back.saved?.pieces, 9);
+  ok('every nest fits', back.nests.every((n) => n.verdict === 'fits'), JSON.stringify(back.nests.map((n) => [n.verdict, n.reasons])));
   const afterSheet = await S.getNesting(conn, COMPANY, fixture.lineId);
-  const sheetKeys = afterSheet.groups[0].nests.map(key).sort();
-  ok('the layout survived the round trip unchanged', JSON.stringify(sheetKeys) === JSON.stringify(savedKeys), `\n    before ${JSON.stringify(savedKeys)}\n    after  ${JSON.stringify(sheetKeys)}`);
+  ok('the lots are now imported', afterSheet.groups[0].nests.every((n) => n.origin === 'imported'));
   const [[sheetA]] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id = ?', [fixture.areaLine[fixture.A]]);
-  near('and so did the plate count', Number(sheetA.quantity), 1.6 / 6, 1e-6);
+  near('and the plate count is unchanged', Number(sheetA.quantity), 1.6 / 6, 1e-6);
 
   /* ---- 12b. nesting comes AFTER lock ------------------------------------ */
   // Decided 2026-09-26: lock sits after Values and cut pieces, before nesting
@@ -636,15 +637,18 @@ try {
   let mixedErr = null;
   try { await VALUES.setValues(conn, c, 'master', fixture.B, [{ specCode: S.NEST_MANUAL_SPEC_CODE, value: true }, { specCode: 'WIDTH', value: 310 }]); } catch (e) { mixedErr = e; }
   eq('a save that carries a design value along with it is refused whole', mixedErr?.code, 'LOCKED');
-  const lockedAccept = await S.acceptNesting(conn, c, fixture.lineId, plan2);
+  let coveredErr = null;
+  try { await S.acceptNesting(conn, c, fixture.lineId, plan2); } catch (e) { coveredErr = e; }
+  ok('a full automatic plan is refused while imported nests already hold every piece', (coveredErr?.problems ?? []).some((p) => /already on imported nests/.test(p)), JSON.stringify(coveredErr?.problems?.slice(0, 1)));
+  const lockedAccept = await S.acceptNesting(conn, c, fixture.lineId, { ...plan2, replaceImported: true });
   eq('a layout is accepted on the locked line: the same two plates', lockedAccept.lots, 2);
   eq('with the same nine pieces', lockedAccept.pieces, 9);
   ok('and the raw-plate lines carry the real share again', lockedAccept.quantities.every((q) => q.applied), JSON.stringify(lockedAccept.quantities.map((q) => q.applied)));
   const [[lockedShare]] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id = ?', [fixture.areaLine[fixture.A]]);
   near('the share written is the plate count, as before the lock', Number(lockedShare.quantity), 1.6 / 6, 1e-6);
   const lockedSheet = await SHEET.exportSheet(conn, COMPANY, fixture.lineId);
-  const lockedBack = await SHEET.importSheet(conn, c, fixture.lineId, { fileBase64: lockedSheet.buffer.toString('base64') });
-  eq('and the nesting sheet comes back in on a locked line too', lockedBack.pieces, 9);
+  const lockedBack = await SHEET.importSheet(conn, c, fixture.lineId, { file: lockedSheet.buffer.toString('base64'), pack: shelfPacker });
+  eq('and the nesting sheet comes back in on a locked line too', lockedBack.saved?.pieces, 9);
 
   /* ---- 13. the real packer --------------------------------------------- */
   // Everything above runs on the stub, because exact plate counts need a layout
@@ -653,7 +657,7 @@ try {
   // decides — above all that the accept path VERIFIES what the packer produced.
   section('13. The real packer — its output passes the same verification');
   let real = null;
-  try { real = await S.planNesting(conn, COMPANY, fixture.lineId, { effort: 'quick', seed: 11 }); }
+  try { real = await S.planNesting(conn, COMPANY, fixture.lineId, { effort: 'quick', seed: 11, replaceImported: true }); }
   catch (e) { real = { failed: e }; }
   if (real.failed) {
     ok('the real packer could be reached', false, `${real.failed.code ?? ''} ${real.failed.message}`);
@@ -669,7 +673,7 @@ try {
       'a piece sits inside the 3 mm rim kerf');
 
     let realAccept = null;
-    try { realAccept = await S.acceptNesting(conn, c, fixture.lineId, real); }
+    try { realAccept = await S.acceptNesting(conn, c, fixture.lineId, { ...real, replaceImported: true }); }
     catch (e) { realAccept = { failed: e }; }
     ok('ITS GEOMETRY VERIFIES — accept did not refuse the packer\'s own plan',
       !realAccept.failed, realAccept.failed ? JSON.stringify(realAccept.failed.problems ?? realAccept.failed.message) : '');
@@ -695,7 +699,7 @@ try {
       eq('nothing has drifted', realSaved.drift.length, 0, JSON.stringify(realSaved.drift));
     }
 
-    const twice = await S.planNesting(conn, COMPANY, fixture.lineId, { effort: 'quick', seed: 11 });
+    const twice = await S.planNesting(conn, COMPANY, fixture.lineId, { effort: 'quick', seed: 11, replaceImported: true });
     ok('the same seed gives the same layout', JSON.stringify(twice.groups[0].nests.map(key)) === JSON.stringify(rg.nests.map(key)));
   }
 

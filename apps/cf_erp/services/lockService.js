@@ -40,6 +40,7 @@ import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { refreshCutPieces } from './cutPlateService.js';
+import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import {
   rollOutPlan, codeNodes, seedPieceMemo, siblingLines, positionAmong, lockedPiecesOf, nameOf,
 } from './rollOutService.js';
@@ -476,6 +477,10 @@ export async function lockLine(db, c, lineId) {
         WHERE p.company_id = ? AND p.deleted_at IS NULL AND e.code_active = LOWER(?) AND e.revision < ?`,
       [companyId, line.order_code, Number(line.order_revision)],
     );
+    // Their contractor work-order cells go with them (init.sql §30): a cell of a
+    // retired piece is work nobody will do, and an open work order left empty
+    // is cancelled. The new pieces start in-house. Two statements.
+    await retireCellsOfRetiredPieces(db, companyId, { orderCode: line.order_code, beforeRevision: Number(line.order_revision) });
   }
   await writePieces(db, c, line, plan.nodes);
   await db.query(

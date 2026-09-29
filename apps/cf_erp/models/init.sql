@@ -2662,3 +2662,316 @@ SET @sql = IF(@col = 0,
   'ALTER TABLE cf_spec_values ADD COLUMN value_json JSON NULL AFTER option_id',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 29. IMPORTED NESTS, A RULE CHECK THAT WARNS, WASTE BY CAUSE, OFFCUTS
+-- ===========================================================================
+--
+-- Decided 2026-09-29 (CF_ERP_NESTING_PLAN, last section). The user: people
+-- often nest in another program and get a plan of several nests, each ONE
+-- standard plate plus the cut plates on it with quantities. They bring that in
+-- by Excel; or import some and let us nest the rest; or let us nest it all.
+-- An imported nest is CHECKED against our rules and we SAY whether it will
+-- work, but they may save it anyway.
+--
+-- cf_plate_lots gains
+--   origin         'auto' = our packer laid it out; 'imported' = it came in
+--                  from the nesting sheet. "Nest the rest" clears only 'auto'.
+--   check_verdict  fits / tight / wont_fit, our check of an imported nest.
+--                  NULL on an automatic lot (it fits by construction).
+--   check_json     the reasons, as plain sentences.
+--   forced         1 = saved although the verdict was not `fits`.
+--   waste_json     the plate split by cause (nestGeometry.analyseNest):
+--                  kerf, sequence gaps, rim, offcut and what is left, wastage.
+--
+-- cf_nest_placements.x_mm / y_mm become NULLable: NULL means the piece IS on
+-- that plate but we found no layout for it (an imported nest our packer could
+-- not fit; their program may have). Widened only; nothing stored changes.
+--
+-- cf_cut_settings gains the offcut thresholds: a left-over region is a
+-- reusable offcut when its area is at least offcut_min_area_mm2 (300 x 300)
+-- AND the short side of its largest inscribed rectangle is at least
+-- offcut_min_side_mm (a long sliver between rows is not reusable). Anything
+-- smaller is wastage.
+--
+-- cf_offcuts: every reusable offcut of every saved lot, with its outline. It is
+-- NOT a catalog item (its sizes are not item-level); it points at its lot.
+-- Reuse is not built yet; these rows are the stock it will draw on.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'origin');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_plate_lots ADD COLUMN origin ENUM('auto','imported') NOT NULL DEFAULT 'auto' AFTER is_manual",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'check_verdict');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_plate_lots ADD COLUMN check_verdict ENUM('fits','tight','wont_fit') NULL AFTER origin",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'check_json');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_plate_lots ADD COLUMN check_json JSON NULL AFTER check_verdict',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'forced');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_plate_lots ADD COLUMN forced TINYINT(1) NOT NULL DEFAULT 0 AFTER check_json',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'waste_json');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_plate_lots ADD COLUMN waste_json JSON NULL AFTER forced',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Widen to NULL, only while they are still NOT NULL.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements'
+               AND COLUMN_NAME = 'x_mm' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@col > 0,
+  'ALTER TABLE cf_nest_placements MODIFY COLUMN x_mm DECIMAL(12,3) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements'
+               AND COLUMN_NAME = 'y_mm' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@col > 0,
+  'ALTER TABLE cf_nest_placements MODIFY COLUMN y_mm DECIMAL(12,3) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_cut_settings' AND COLUMN_NAME = 'offcut_min_area_mm2');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_cut_settings ADD COLUMN offcut_min_area_mm2 DECIMAL(14,3) NOT NULL DEFAULT 90000.000',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_cut_settings' AND COLUMN_NAME = 'offcut_min_side_mm');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_cut_settings ADD COLUMN offcut_min_side_mm DECIMAL(10,3) NOT NULL DEFAULT 100.000',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- One row per reusable offcut. offcut_no is `<lotNo>-A`, `-B` ... within the
+-- line. rect_* is the largest inscribed axis-aligned rectangle (what a future
+-- packer can put a part in); bbox_* the region's bounding box; outline_json the
+-- region itself: a list of polygons, each a list of [x, y] in plate
+-- coordinates, mm, origin at the plate's bottom-left corner. The x/y corners of
+-- rect and bbox are kept too, so the screen can draw them without re-deriving.
+CREATE TABLE IF NOT EXISTS cf_offcuts (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  plate_lot_id    INT            NOT NULL,
+  offcut_no       VARCHAR(40)    NOT NULL,
+  thickness_mm    DECIMAL(10,3)  NULL,
+  grade           VARCHAR(100)   NULL,
+  material        VARCHAR(100)   NULL,
+  density         DECIMAL(12,3)  NULL,
+  area_mm2        DECIMAL(16,3)  NOT NULL,
+  weight_kg       DECIMAL(14,3)  NULL,
+  bbox_x_mm       DECIMAL(12,3)  NULL,
+  bbox_y_mm       DECIMAL(12,3)  NULL,
+  bbox_length_mm  DECIMAL(12,3)  NULL,
+  bbox_width_mm   DECIMAL(12,3)  NULL,
+  rect_x_mm       DECIMAL(12,3)  NULL,
+  rect_y_mm       DECIMAL(12,3)  NULL,
+  rect_length_mm  DECIMAL(12,3)  NULL,
+  rect_width_mm   DECIMAL(12,3)  NULL,
+  outline_json    JSON           NULL,
+  status          ENUM('planned','available','used','scrapped') NOT NULL DEFAULT 'planned',
+  notes           VARCHAR(500)   NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  UNIQUE KEY uq_cofc_tenant (company_id, id),
+  KEY idx_cofc_line  (company_id, order_line_id),
+  KEY idx_cofc_lot   (company_id, plate_lot_id),
+  KEY idx_cofc_steel (company_id, thickness_mm, status),
+
+  CONSTRAINT fk_cofc_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cofc_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cofc_lot     FOREIGN KEY (company_id, plate_lot_id) REFERENCES cf_plate_lots(company_id, id),
+  CONSTRAINT fk_cofc_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- ===========================================================================
+-- 30. TIME OVERRIDES AND CONTRACTOR WORK ORDERS
+-- ===========================================================================
+--
+-- Decided 2026-09-29 (TM/CF_ERP_TIMES_WORKORDERS_PLAN.md). The user: in the
+-- order's Production step, the BOM rows down the side and the operations across
+-- the top; each box holds the time the formula worked out, and a person may type
+-- over it. Then: split the production order into WORK ORDERS done by
+-- contractors, at the piece tree x operation level ("L11 by one contractor for
+-- some operations, L12 by another").
+--
+-- cf_time_overrides: a typed time for one (row, operation) of one order line.
+--   A time is WORK MINUTES PER PIECE; setup (once per run) stays with the
+--   formula unless typed over too. NULL in either column = use the formula; a
+--   row with both NULL is retired (deleted_at) rather than kept. bom_line_id
+--   NULL = the line's own item (it sits on no BOM row). Rows are designs, so an
+--   override holds for every piece the row rolls out into. Editable until
+--   release; at release the time is copied onto the production steps (est_*).
+--
+-- cf_production_steps gains
+--   est_setup_minutes, est_work_minutes (per piece), est_minutes (= setup +
+--   work x the step's quantity): filled at release from the same computation
+--   the Times grid shows (override if any, else formula). NULL = no estimate
+--   (a rule without a time, a missing input), never an invented number.
+--   work_order_id: the contractor work order the step belongs to; NULL = in-house.
+--
+-- cf_production_items gains order_piece_id: the locked piece the node was laid
+-- out from (rollOutService.attachLockedCodes matched it by path key). Releases
+-- made before this column have NULL and are matched by code.
+--
+-- cf_work_orders: a contractor's share of one order line. Contractor = a party
+--   with is_subcontractor = 1 (the party master already has the role; no new
+--   master). code from the code generator (entity work_order), else WO-000123,
+--   stamped after the insert like a purchase order's number.
+--   status  draft -> issued -> in_progress -> done; an open one may be
+--   cancelled, which frees its cells.
+--
+-- cf_work_order_cells: which (piece, operation) cells a work order holds. ONE
+--   owner per live cell (uq_cwoc_cell); a cell on no work order is in-house. A
+--   cell may be moved until that operation starts on the floor (decision 2).
+--   When a later revision retires the pieces, their cells are retired with them
+--   (lockService -> workOrderService.retireCellsOfRetiredPieces).
+
+CREATE TABLE IF NOT EXISTS cf_time_overrides (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  bom_line_id     INT            NULL,              -- NULL = the line's own item
+  operation_id    INT            NOT NULL,
+  work_minutes    DECIMAL(12,3)  NULL,              -- per piece; NULL = the formula's
+  setup_minutes   DECIMAL(12,3)  NULL,              -- per run;   NULL = the formula's
+  note            VARCHAR(300)   NULL,
+  updated_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  bom_key         INT            GENERATED ALWAYS AS (IFNULL(bom_line_id, 0)) VIRTUAL,
+  is_live         TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_ctov_tenant (company_id, id),
+  UNIQUE KEY uq_ctov_cell   (company_id, order_line_id, bom_key, operation_id, is_live),
+  KEY idx_ctov_bom (company_id, bom_line_id),
+
+  CONSTRAINT fk_ctov_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ctov_line      FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_ctov_bomline   FOREIGN KEY (company_id, bom_line_id)   REFERENCES cf_bom_lines(company_id, id),
+  CONSTRAINT fk_ctov_operation FOREIGN KEY (company_id, operation_id)  REFERENCES cf_operations(company_id, id),
+  CONSTRAINT fk_ctov_updater   FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_work_orders (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  -- NULL only between the insert and the number being stamped (WO-000123 needs
+  -- the row's own id when no coding rule answers). Never NULL once committed.
+  code            VARCHAR(100)   NULL,
+  order_id        INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  contractor_id   INT            NOT NULL,          -- cf_parties, is_subcontractor = 1
+  status          ENUM('draft','issued','in_progress','done','cancelled') NOT NULL DEFAULT 'draft',
+  start_date      DATE           NULL,
+  due_date        DATE           NULL,
+  notes           TEXT           NULL,
+  created_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  code_active     VARCHAR(100)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cwo_tenant (company_id, id),
+  UNIQUE KEY uq_cwo_code   (company_id, code_active),
+  KEY idx_cwo_line       (company_id, order_line_id, contractor_id, status),
+  KEY idx_cwo_order      (company_id, order_id),
+  KEY idx_cwo_contractor (company_id, contractor_id, status),
+
+  CONSTRAINT fk_cwo_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwo_order      FOREIGN KEY (company_id, order_id)      REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cwo_line       FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cwo_contractor FOREIGN KEY (company_id, contractor_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cwo_creator    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_work_order_cells (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  work_order_id   INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  order_piece_id  INT            NOT NULL,
+  operation_id    INT            NOT NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  is_live         TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cwoc_tenant (company_id, id),
+  UNIQUE KEY uq_cwoc_cell   (company_id, order_piece_id, operation_id, is_live),
+  KEY idx_cwoc_order (company_id, work_order_id),
+  KEY idx_cwoc_line  (company_id, order_line_id),
+
+  CONSTRAINT fk_cwoc_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwoc_order     FOREIGN KEY (company_id, work_order_id)  REFERENCES cf_work_orders(company_id, id),
+  CONSTRAINT fk_cwoc_line      FOREIGN KEY (company_id, order_line_id)  REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cwoc_piece     FOREIGN KEY (company_id, order_piece_id) REFERENCES cf_order_pieces(company_id, id),
+  CONSTRAINT fk_cwoc_operation FOREIGN KEY (company_id, operation_id)   REFERENCES cf_operations(company_id, id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'est_setup_minutes');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_production_steps ADD COLUMN est_setup_minutes DECIMAL(12,3) NULL, ADD COLUMN est_work_minutes DECIMAL(12,3) NULL, ADD COLUMN est_minutes DECIMAL(14,3) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'work_order_id');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_production_steps ADD COLUMN work_order_id INT NULL, ADD KEY idx_cprs_work_order (company_id, work_order_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND CONSTRAINT_NAME = 'fk_cprs_work_order');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_production_steps ADD CONSTRAINT fk_cprs_work_order FOREIGN KEY (company_id, work_order_id) REFERENCES cf_work_orders(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND COLUMN_NAME = 'order_piece_id');
+SET @sql = IF(@col = 0,
+  'ALTER TABLE cf_production_items ADD COLUMN order_piece_id INT NULL, ADD KEY idx_cpri_piece (company_id, order_piece_id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND CONSTRAINT_NAME = 'fk_cpri_order_piece');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_production_items ADD CONSTRAINT fk_cpri_order_piece FOREIGN KEY (company_id, order_piece_id) REFERENCES cf_order_pieces(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

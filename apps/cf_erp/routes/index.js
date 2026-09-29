@@ -19,6 +19,8 @@ import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
 import lockRoutes from './lock.js';
 import placeholderRoutes from './placeholders.js';
+import timeRoutes from './times.js';
+import workOrderRoutes from './workOrders.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -27,6 +29,7 @@ import { PO_STATUSES } from '../services/purchaseService.js';
 import { WEEKDAYS } from '../services/shiftService.js';
 import { ORDER_TYPES, TRANSITIONS } from '../services/salesOrderService.js';
 import { RELATIONS } from '../services/flowService.js';
+import { WO_STATUSES } from '../services/workOrderService.js';
 
 const router = Router();
 
@@ -75,6 +78,7 @@ router.get('/meta', guard(PERM.view), handle(async () => ({
   drawingSources: DRAWING_SOURCES,
   drawingStatuses: DRAWING_STATUSES,
   drawingSubjectTypes: DRAWING_SUBJECT_TYPES,
+  workOrderStatuses: WO_STATUSES,
 })));
 
 router.use(setupRoutes);
@@ -93,5 +97,7 @@ router.use(drawingRoutes);
 router.use(orderValuesRoutes);
 router.use(lockRoutes);
 router.use(placeholderRoutes);
+router.use(timeRoutes);
+router.use(workOrderRoutes);
 
 export default router;

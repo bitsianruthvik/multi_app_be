@@ -748,6 +748,71 @@ registerEntity('purchase_order', {
   },
 });
 
+// ---- Contractor work orders (init.sql §30) ---------------------------------------
+// A contractor's share of an order line. With no rule the number is WO-000123
+// (workOrderService), like a purchase order's; a rule can lean on the
+// contractor and the order it is for.
+const WORK_ORDER_TOKENS = [
+  {
+    key: 'contractor.code', label: 'Contractor code', available: true,
+    phrase: 'the contractor’s code', example: 'FABCO', help: 'The code of the contractor (a party marked subcontractor) the work order goes to.',
+  },
+  {
+    key: 'contractor.name', label: 'Contractor name', available: true,
+    phrase: 'the contractor’s name', example: 'Fabco Engineering', help: 'The contractor’s name. Long for a code.',
+  },
+  {
+    key: 'order.code', label: 'Sales order number', available: true,
+    phrase: 'the order number', example: 'SO-20260924-0003', help: 'The number of the sales order the work is for.',
+  },
+  {
+    key: 'line.no', label: 'Sales order line number', available: true,
+    phrase: 'the order line number', example: '10', help: 'The number of the order line the work is on — 10, 20.',
+  },
+];
+
+async function workOrderContext(db, companyId, { contractorId, lineId }) {
+  const [[row]] = await db.query(
+    `SELECT p.code AS contractor_code, p.name AS contractor_name, o.code AS order_code, l.line_no
+       FROM (SELECT 1) x
+       LEFT JOIN cf_parties p ON p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL
+       LEFT JOIN cf_sales_order_lines l ON l.company_id = ? AND l.id = ?
+       LEFT JOIN cf_sales_orders o ON o.id = l.order_id`,
+    [companyId, Number(contractorId) || 0, companyId, Number(lineId) || 0],
+  );
+  return {
+    get(key) {
+      if (key === 'contractor.code') return row?.contractor_code ?? null;
+      if (key === 'contractor.name') return row?.contractor_name ?? null;
+      if (key === 'order.code') return row?.order_code ?? null;
+      if (key === 'line.no') return row?.line_no != null ? String(row.line_no) : null;
+      return null;
+    },
+    test() { return { ok: false, weight: 0 }; },
+  };
+}
+
+registerEntity('work_order', {
+  label: 'Work orders',
+  tokens: WORK_ORDER_TOKENS,
+  tokenPatterns: [],
+  conditionTokens: [],
+  async validateToken(db, companyId, key) {
+    return WORK_ORDER_TOKENS.some((t) => t.key === key) ? null : `"${key}" is not a value work orders can insert.`;
+  },
+  async validateCondition() {
+    return 'Work order rules take no conditions.';
+  },
+  async loadContext(db, companyId, entityId) {
+    const [[w]] = await db.query('SELECT contractor_id, order_line_id FROM cf_work_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, entityId]);
+    if (!w) { const err = new Error('Work order not found.'); err.status = 404; throw err; }
+    return workOrderContext(db, companyId, { contractorId: w.contractor_id, lineId: w.order_line_id });
+  },
+  async draftContext(db, companyId, draft) {
+    return workOrderContext(db, companyId, { contractorId: draft.contractorId ?? null, lineId: draft.lineId ?? null });
+  },
+});
+
 // ---- Production pieces and stock lots -------------------------------------------
 // "Stock and WIP should all get a code to identify at every level, driven through
 // the code generator… for now use the short name of the catalog item or template

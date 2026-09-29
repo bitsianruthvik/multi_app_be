@@ -364,23 +364,113 @@ function winningTiming(rows, rank) {
   return shapeRule(sorted[0]);
 }
 
-const numericValues = (resolution) => {
-  const map = effectiveByCode(resolution);
-  return (code) => {
-    const v = map.get(code);
-    return v && v.dataType === 'number' ? v.raw : null;
+/**
+ * The two readers a timing formula takes for one subject, from a map of
+ * spec code -> { raw, dataType, tableConfig } (effectiveByCode's shape). Shared
+ * by timingPreview (one machine, one item) and timeEstimateService (every row of
+ * an order line at once), so both read values the same way.
+ */
+export function valueReaders(map) {
+  return {
+    number: (code) => {
+      const v = map.get(code);
+      return v && v.dataType === 'number' ? v.raw : null;
+    },
+    // LOOKUP's own reader.
+    table: (code) => {
+      const v = map.get(code);
+      if (!v || v.dataType !== 'table' || v.raw == null) return null;
+      return { mode: v.tableConfig?.mode ?? 'step_up', axes: v.tableConfig?.axes ?? [], ...v.raw };
+    },
   };
-};
+}
 
-/** Same idea as numericValues, for a table spec — LOOKUP's own reader. */
-const tableValues = (resolution) => {
-  const map = effectiveByCode(resolution);
-  return (code) => {
-    const v = map.get(code);
-    if (!v || v.dataType !== 'table' || v.raw == null) return null;
-    return { mode: v.tableConfig?.mode ?? 'step_up', axes: v.tableConfig?.axes ?? [], ...v.raw };
+const parsedCache = new Map();
+/** Formulas are parsed once per expression — the Times grid evaluates one rule for hundreds of rows. */
+function parsedOf(expression) {
+  let p = parsedCache.get(expression);
+  if (!p) {
+    p = parseFormula(expression);
+    if (parsedCache.size > 2000) parsedCache.clear();
+    parsedCache.set(expression, p);
+  }
+  return p;
+}
+
+/**
+ * THE time computation: a rule's setup (per run) and work (per piece), each a
+ * constant or a formula fed the item's and the machine's values. No setup on
+ * the rule means none; no work time means the rule is not finished. Missing
+ * inputs are named, never guessed. Used by timingPreview and by the bulk
+ * estimate (timeEstimateService), so a preview and the Times grid agree.
+ *
+ *   item, machine   valueReaders(...) of each side (null = no values)
+ */
+export function evaluateRuleTimes(rule, { item = null, machine = null } = {}) {
+  const context = {
+    item: item ? item.number : () => null,
+    machine: machine ? machine.number : () => null,
+    itemTable: item ? item.table : () => null,
+    machineTable: machine ? machine.table : () => null,
   };
-};
+  const evaluate = (time, what) => {
+    if (!time) return what === 'setup' ? { minutes: 0, formula: null } : { minutes: null, formula: null, error: 'The rule sets no work time.' };
+    if (time.minutes != null) return { minutes: time.minutes, formula: null };
+    let parsed;
+    try { parsed = parsedOf(time.formula.expression); } catch (e) { return { minutes: null, formula: time.formula.code, error: e.message }; }
+    const out = evaluateFormula(parsed, () => null, null, context);
+    return { minutes: out.value, formula: time.formula.code, missing: out.missing, error: out.error };
+  };
+  return { setup: evaluate(rule.setup, 'setup'), work: evaluate(rule.work, 'work') };
+}
+
+/**
+ * Everything the bulk estimate needs to know about machines for a set of
+ * operations, in three reads whatever the number of operations or assets —
+ * machinesForOperation's reads, for many operations at once: the rules valid
+ * on the day, the active machines, the classification tree. Returns the rules
+ * by operation and subject, and the helpers that rank a machine's (or a machine
+ * TYPE's) chain the way resolveTiming does.
+ */
+export async function loadTimingSetup(db, companyId, operationIds, date = today()) {
+  const empty = { rulesByOp: new Map(), machines: [], nodesById: new Map(), rankOfMachine: () => new Map(), rankOfNode: () => new Map(), winning: () => null };
+  if (!operationIds.length) return empty;
+  const [rules] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.operation_id IN (?) AND r.deleted_at IS NULL
+    AND (r.effective_from IS NULL OR r.effective_from <= ?) AND (r.effective_to IS NULL OR r.effective_to >= ?)`, [companyId, operationIds, date, date]);
+  if (!rules.length) return empty;
+  const [[machines], [nodes]] = await Promise.all([
+    db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]),
+    db.query('SELECT id, parent_id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+  ]);
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const rulesByOp = new Map();
+  for (const r of rules) {
+    if (!rulesByOp.has(r.operation_id)) rulesByOp.set(r.operation_id, new Map());
+    const bySubject = rulesByOp.get(r.operation_id);
+    const key = `${r.subject_type}:${r.subject_id}`;
+    if (!bySubject.has(key)) bySubject.set(key, []);
+    bySubject.get(key).push(r);
+  }
+  // ancestors()' chain bound, including its handling of a missing parent.
+  const rankOfNode = (nodeId) => {
+    const rank = new Map();
+    let node = nodesById.get(nodeId);
+    for (let hop = 0; node && hop < LEAF_DEPTH + 3; hop++, node = nodesById.get(node.parent_id)) rank.set(`classification:${node.id}`, node.depth);
+    return rank;
+  };
+  const rankOfMachine = (m) => {
+    const rank = rankOfNode(m.classification_id);
+    rank.set(`machine:${m.id}`, 99);
+    return rank;
+  };
+  /** The winning rule of an operation for a chain rank, or null. */
+  const winning = (operationId, rank) => {
+    const bySubject = rulesByOp.get(operationId);
+    if (!bySubject) return null;
+    return winningTiming([...rank.keys()].flatMap((key) => bySubject.get(key) ?? []), rank);
+  };
+  return { rulesByOp, machines, nodesById, rankOfMachine, rankOfNode, winning };
+}
 
 /**
  * How long a machine takes to do an operation on an item: setup (per run) plus
@@ -409,21 +499,10 @@ export async function timingPreview(db, companyId, operationId, input = {}) {
   // resolving the item's specs twice.
   const itemResolution = item ? await resolve(db, companyId, { master: item }) : null;
   const machineResolution = await resolve(db, companyId, { machine });
-  const context = {
-    item: itemResolution ? numericValues(itemResolution) : () => null,
-    machine: numericValues(machineResolution),
-    itemTable: itemResolution ? tableValues(itemResolution) : () => null,
-    machineTable: tableValues(machineResolution),
-  };
-  // No setup on the rule means none; no work time means the rule is not finished.
-  const evaluate = (time, what) => {
-    if (!time) return what === 'setup' ? { minutes: 0, formula: null } : { minutes: null, formula: null, error: 'The rule sets no work time.' };
-    if (time.minutes != null) return { minutes: time.minutes, formula: null };
-    const out = evaluateFormula(parseFormula(time.formula.expression), () => null, null, context);
-    return { minutes: out.value, formula: time.formula.code, missing: out.missing, error: out.error };
-  };
-  const setup = evaluate(rule.setup, 'setup');
-  const work = evaluate(rule.work, 'work');
+  const { setup, work } = evaluateRuleTimes(rule, {
+    item: itemResolution ? valueReaders(effectiveByCode(itemResolution)) : null,
+    machine: valueReaders(effectiveByCode(machineResolution)),
+  });
   const total = setup.minutes != null && work.minutes != null ? Number((setup.minutes + work.minutes * quantity).toFixed(4)) : null;
   return {
     ...base,
