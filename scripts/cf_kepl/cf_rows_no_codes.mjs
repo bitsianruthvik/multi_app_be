@@ -55,7 +55,7 @@ const USER = Number(process.env.CF_BRIDGE_USER ?? 0) || null;
 const say = (...a) => console.log(...a);
 
 // ---------------------------------------------------------------------------
-// Rules, the way cf_range_rules reads and writes them: whole.
+// Rules, the way the deleted cf_range_rules read and writes them: whole.
 // ---------------------------------------------------------------------------
 const asBody = (full) => ({
   code: full.code, name: full.name, entityType: full.entityType, targetField: full.targetField,

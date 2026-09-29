@@ -45,7 +45,6 @@
  * releaseService for piece numbers.
  */
 import { invalid } from '../lib/errors.js';
-import { frozenBy } from './records.js';
 import { ancestors } from './tree.js';
 import { resolve, effectiveByCode } from './resolutionService.js';
 import { generate } from '../modules/codegen/index.js';
@@ -59,7 +58,6 @@ import { generate } from '../modules/codegen/index.js';
 export const PLACED = Symbol('cf_erp.placedItem');
 
 const EPS = 1e-9;
-const MAX_DEPTH = 25;
 const fmt = (n) => String(Number(Number(n).toFixed(6)));
 const isCount = (q) => Number.isFinite(q) && q > 1 - EPS && Math.abs(q - Math.round(q)) < EPS;
 
@@ -301,7 +299,7 @@ const RULE_READ = /^\s*SELECT\b[\s\S]*\bFROM\s+cf_code_(?:schemes|scheme_conditi
  * those reads once per batch; pass everything else straight through, including
  * a running number drawn for real (SELECT … FOR UPDATE, then UPDATE). A Proxy,
  * so whatever else rides on the connection (the transaction's classification
- * memo) is still there. Used here per refresh, and by release per tree.
+ * memo) is still there. Used by nameNewItems, and by release per tree.
  */
 export function readRulesOnce(db) {
   const seen = new Map();
@@ -312,173 +310,6 @@ export function readRulesOnce(db) {
     return seen.get(key);
   };
   return new Proxy(db, { get: (target, prop) => (prop === 'query' ? query : Reflect.get(target, prop)) });
-}
-
-/** A row about to be added, counted as if it were already there (see refreshRangeCodes). */
-function withInsert(lines, insert) {
-  if (!lines.length) return lines;               // no rows yet, so nothing after it to move
-  const phantom = {
-    id: `insert:${insert.lineNo}`, bom_id: lines[0].bom_id, parent_id: lines[0].parent_id, bom_type: lines[0].bom_type,
-    line_no: insert.lineNo, quantity: insert.quantity, shortName: insert.shortName ?? null, child_item_type: null,
-  };
-  const at = lines.findIndex((l) => l.line_no > insert.lineNo);
-  return at < 0 ? [...lines, phantom] : [...lines.slice(0, at), phantom, ...lines.slice(at)];
-}
-
-/** Clears the moving codes first, then writes the new ones — after checking every new code is free. */
-async function writeCodes(db, companyId, plans) {
-  const ids = plans.map((p) => p.id);
-  const seen = new Map();
-  for (const p of plans) {
-    const key = p.to.toLowerCase();
-    if (seen.has(key)) {
-      throw invalid('CODE_CLASH', `Renumbering would give two pieces the code ${p.to} (now ${seen.get(key).from ?? 'no code'} and ${p.from ?? 'no code'}). Give one of them a short name of its own.`);
-    }
-    seen.set(key, p);
-  }
-  const [taken] = await db.query(
-    'SELECT id, code FROM cf_master_records WHERE company_id = ? AND code_active IN (?) AND id NOT IN (?)',
-    [companyId, [...seen.keys()], ids],
-  );
-  if (taken.length) {
-    const clash = seen.get(String(taken[0].code).toLowerCase());
-    throw invalid('CODE_CLASH',
-      `Renumbering would give ${clash?.from ?? 'a piece'} the code ${taken[0].code}, which another record already has. Change that record's code, or give this row's child a short name of its own.`,
-      { problems: taken.map((t) => `${t.code} is taken`) });
-  }
-  // Two rows of one parent can trade numbers — reordering them does exactly
-  // that — and uq_cmr_code is checked row by row, not at the end of the
-  // statement. So the old codes are cleared first and the new ones written
-  // after; neither is ever seen outside this transaction.
-  await db.query('UPDATE cf_master_records SET code = NULL WHERE company_id = ? AND id IN (?)', [companyId, ids]);
-  await db.query(
-    `UPDATE cf_master_records SET code = CASE id ${plans.map(() => 'WHEN ? THEN ?').join(' ')} END
-      WHERE company_id = ? AND id IN (?)`,
-    [...plans.flatMap((p) => [p.id, p.to]), companyId, ids],
-  );
-}
-
-function whyNoCode(g, data) {
-  const missing = g?.missing ?? [];
-  if (missing.includes('range') && data.range?.reason) return `Its row has no range: ${data.range.reason} Its code is kept as it was.`;
-  return `Coding rule ${g?.schemeCode ?? '?'} needs ${missing.join(', ') || 'a value'}, which it has not got — its code is kept as it was.`;
-}
-
-/**
- * Regenerates the codes of one level: the temporary children on these rows
- * whose coding rule reads `needs`. Returns the ids whose code moved.
- */
-async function recodeLevel(db, c, lines, needs, rules, out) {
-  const { companyId } = c;
-  const ranges = rangesOf(lines);
-  const linesOf = new Map();
-  for (const l of lines) {
-    if (l.child_item_type !== 'temporary' || l.bom_type !== 'custom') continue;
-    if (!linesOf.has(l.child_id)) linesOf.set(l.child_id, []);
-    linesOf.get(l.child_id).push(l);
-  }
-  if (!linesOf.size) return [];
-  const masters = await loadPlacedItems(db, companyId, [...linesOf.keys()]);
-  const chains = new Map();
-  for (const m of masters.values()) {
-    // Memoised for the transaction (tree.js): the children of one parent
-    // nearly always share one Variant, so this is one query or none.
-    if (m.classification_id != null && !chains.has(m.classification_id)) chains.set(m.classification_id, await ancestors(db, companyId, m.classification_id));
-  }
-
-  const plans = [];
-  for (const [id, placed] of linesOf) {
-    const m = masters.get(id);
-    if (!m) continue;
-    out.checked += 1;
-    // Release freezes the structure, and that is exactly when codes start being
-    // painted on steel; a closed, lost or cancelled order is frozen too.
-    const frozen = frozenBy(m);
-    if (frozen) { out.frozen = out.frozen ?? frozen.reason; continue; }
-    const line = placed[0];
-    const placements = Math.max(placed.length, Number(m.placements) || 0);
-    const hasOwner = !!m.owner_order_line_id;
-    const data = {
-      master: m,
-      def: m.def_id ? { id: m.def_id, code: m.def_code, name: m.def_name, short_name: m.def_short_name } : null,
-      chain: m.classification_id != null ? chains.get(m.classification_id) ?? [] : [],
-      specs: new Map(),
-      owner: hasOwner && m.owner_line_row_id != null && m.owner_order_id != null
-        ? { line_no: m.owner_line_no, position: m.owner_line_position, order_code: m.owner_order_code, order_title: m.owner_order_title }
-        : null,
-      place: hasOwner
-        ? { line_id: line.id, bom_id: line.bom_id, line_no: line.line_no, position: line.position, quantity: line.quantity, role: line.role, parent_id: line.parent_id, parent_code: line.parent_code, parent_name: line.parent_name }
-        : null,
-      range: placements > 1 ? sharedBy(placements) : ranges.get(line.id) ?? null,
-      asked: new Set(),
-    };
-    const codeFor = () => generate(rules, companyId, 'item', 'code', { draft: { [PLACED]: data } }, { consume: false });
-    let g = await codeFor();
-    // No rule codes it, or its code does not read what moved: nothing to do.
-    if (!g || !data.asked.has(needs)) continue;
-    if (placements > 1) { out.skipped.push({ id, code: m.code, why: data.range.reason }); continue; }
-    if (g.number != null) {
-      out.skipped.push({ id, code: m.code, why: `Coding rule ${g.schemeCode} also draws a running number, and a number is never drawn twice — its code is kept as it was.` });
-      continue;
-    }
-    // Specification values are read only for the items that need them, and
-    // only once it is known their code depends on what moved.
-    if ([...data.asked].some((k) => k.startsWith('spec:'))) {
-      data.specs = effectiveByCode(await resolve(db, companyId, { master: m }));
-      data.asked = new Set();
-      g = await codeFor();
-    }
-    if (!g?.text) { out.skipped.push({ id, code: m.code, why: whyNoCode(g, data) }); continue; }
-    if (g.text !== m.code) plans.push({ id, from: m.code, to: g.text });
-  }
-  if (!plans.length) return [];
-  await writeCodes(db, companyId, plans);
-  out.changed.push(...plans);
-  return plans.map((p) => p.id);
-}
-
-/**
- * Brings the codes that print a range back in line after a parent's rows
- * moved — an earlier row of the same short name changed quantity, or a row was
- * added, removed or reordered.
- *
- * What it touches: the parent's TEMPORARY children whose coding rule reads
- * `range` — regenerated, and written only when the text changed — and then,
- * level by level, the temporary items under any child whose code moved and
- * whose rule builds on `parent.code`, because those carry the old code inside
- * their own. A code that cannot be regenerated (its row no longer has a range)
- * is left as it was and named in `skipped`.
- *
- * What it never touches: anything on a line released to production, or on an
- * order that is closed, lost or cancelled. Release freezes the structure, and
- * that is exactly when codes start being painted on steel. Nor catalog items,
- * nor a piece shared by several parents, nor a rule that also draws a running
- * number.
- *
- * `insert` — { lineNo, quantity, shortName } — counts a row that is about to be
- * added as if it were there already. bomService.addLine passes it when a row
- * goes in AMONG existing rows: the rows after it move first, so the new row's
- * first code cannot meet the stale code one of them still carries. Anybody
- * creating a temporary item among existing rows should do the same.
- *
- * Batched, because production is ~49 ms a round trip: per level of the tree
- * that moved, one query for the rows and one for their items; the coding rules
- * are read once per call, not once per item; then one query to check the new
- * codes are free and two to write them.
- *
- * Returns { parentId, checked, changed: [{ id, from, to }], skipped: [{ id, code, why }], frozen }.
- */
-export async function refreshRangeCodes(db, c, parentId, { insert = null } = {}) {
-  const out = { parentId, checked: 0, changed: [], skipped: [], frozen: null };
-  const rules = readRulesOnce(db);
-  let lines = await linesOfParents(db, c.companyId, [parentId]);
-  if (insert) lines = withInsert(lines, insert);
-  for (let depth = 0; lines.length && depth < MAX_DEPTH; depth++) {
-    const moved = await recodeLevel(db, c, lines, depth === 0 ? 'range' : 'parent.code', rules, out);
-    if (!moved.length) break;
-    lines = await linesOfParents(db, c.companyId, moved);
-  }
-  return out;
 }
 
 /**

@@ -120,7 +120,7 @@ try {
 
   // -------------------------------------------------------------------------
   // 3. Each of the 20 girder segments against its own stated gross weight.
-  //    Matched by DRAWING_MARK, which cf_recode_order proves is on all 20.
+  //    Matched by DRAWING_MARK, which the deleted cf_recode_order proved is on all 20.
   // -------------------------------------------------------------------------
   const [marks] = await conn.query(
     `SELECT m.id, v.value_text AS mark FROM cf_master_records m

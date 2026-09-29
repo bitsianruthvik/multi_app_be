@@ -179,8 +179,8 @@ function textOf(v) {
 /**
  * An item's (or definition's) context from data already loaded. Both ways in
  * come through here — buildContext loads the data for one record, and
- * codeRangeService loads it for a whole BOM at once when it renumbers rows
- * (refreshRangeCodes) — so the two cannot choose a rule or print a token
+ * codeRangeService loads it for a whole BOM at once (loadPlacedItems, for cut
+ * plates and naming) — so the two cannot choose a rule or print a token
  * differently.
  *
  *   data: { master, def, chain, specs, owner, place, range, asked? }

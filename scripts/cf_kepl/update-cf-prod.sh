@@ -25,7 +25,7 @@
 # SO-…-SPAN-01-1-G1-1-IS24. It points the top piece rule at the order number,
 # proves every existing top code comes out the same, retires the row rules
 # (CFTMP-LINE/PART/SEGMENT) and clears the codes of rows on unlocked lines. It
-# replaces the old re-code and range steps, which coded rows and now refuse to run.
+# replaces the old re-code and range steps (scripts since deleted), which coded rows.
 #
 # Run it from anywhere; it finds its own way:
 #
