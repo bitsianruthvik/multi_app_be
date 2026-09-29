@@ -24,6 +24,7 @@
  * its dependencies and its material — never stored.
  */
 import { invalid, notFound, conflict } from '../lib/errors.js';
+import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { resolveTiming } from './operationService.js';
 import { estimatorForLine } from './timeEstimateService.js';
@@ -634,6 +635,86 @@ export async function finishedArea(db, companyId, line, givenId) {
   };
 }
 
+// --- writing a release in bulk --------------------------------------------------------
+//
+// The KEPL line is 6,072 nodes and 16,972 steps. Written a row a statement that
+// was ~23,000 round trips — 20–30 minutes at TiDB's ~49 ms, long after the
+// browser gave up. Written a depth level at a time and a chunk of steps at a
+// time, it is a fixed handful whatever the size. TiDB does not hand out
+// AUTO_INCREMENT ids contiguously, so every new id is READ BACK by a key that is
+// unique within the release — never worked out from insertId.
+
+const ITEM_COLUMNS = ['company_id', 'release_id', 'parent_id', 'item_id', 'bom_line_id', 'piece_no', 'quantity', 'code',
+  'flow_id', 'flow_revision', 'depth', 'sort_order', 'order_piece_id', 'created_by'];
+const STEP_COLUMNS = ['company_id', 'production_item_id', 'flow_step_id', 'operation_id', 'sequence', 'step_name', 'quantity',
+  'est_setup_minutes', 'est_work_minutes', 'est_minutes', 'work_order_id', 'created_by'];
+const WRITE_CHUNK = 2000;
+
+/**
+ * The tracker tree, one depth level at a time — parents first, so a child's row
+ * carries its parent's id. Each node's id is read back by its sort_order
+ * (k + 1, unique within the release). One INSERT (per 2,000 rows) and one read
+ * per level.
+ */
+async function writeItems(db, c, releaseId, plan) {
+  const levels = new Map();
+  for (const n of plan.nodes) {
+    if (!levels.has(n.depth)) levels.set(n.depth, []);
+    levels.get(n.depth).push(n);
+  }
+  for (const depth of [...levels.keys()].sort((a, b) => a - b)) {
+    const level = levels.get(depth);
+    await insertRows(db, 'cf_production_items', ITEM_COLUMNS, level.map((n) => [
+      c.companyId, releaseId, n.parentK != null ? plan.nodes[n.parentK].id : null, n.itemId, n.bomLineId, n.pieceNo, n.quantity, n.code,
+      n.flowId, plan.flows.get(n.flowId)?.revision ?? null, n.depth, n.k + 1, n.lockedPieceId ?? null, c.userId,
+    ]), WRITE_CHUNK);
+    const [back] = await db.query(
+      'SELECT id, sort_order FROM cf_production_items WHERE company_id = ? AND release_id = ? AND depth = ? AND deleted_at IS NULL',
+      [c.companyId, releaseId, depth],
+    );
+    const idOf = new Map(back.map((r) => [Number(r.sort_order), r.id]));
+    for (const n of level) {
+      n.id = idOf.get(n.k + 1);
+      if (!n.id) throw new Error(`cf_erp: production item ${n.k + 1} of release ${releaseId} vanished between insert and read-back.`);
+    }
+  }
+}
+
+/**
+ * Every step, in plan order, 2,000 rows a statement; the ids read back in one
+ * query by (production item, flow step) — a piece runs each step of its flow
+ * once, so the pair is unique within the release. Each step carries its
+ * estimated minutes (copied, so the tracker never follows a later change) and
+ * the contractor work order its (piece, operation) cell sits on.
+ */
+async function writeSteps(db, c, releaseId, plan, estimate, owners) {
+  if (!plan.steps.length) return;
+  const keyOf = (itemId, flowStepId) => `${itemId}:${flowStepId}`;
+  const rows = plan.steps.map((s) => {
+    const node = plan.nodes[s.nodeK];
+    const t = estimate(node.bomLineId, node.itemId, s.operationId);
+    const work = t?.work ?? null;
+    const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
+    const total = work != null ? Number(((setup ?? 0) + work * Number(s.quantity)).toFixed(3)) : null;
+    const workOrderId = node.lockedPieceId != null ? owners.get(`${node.lockedPieceId}:${s.operationId}`) ?? null : null;
+    return [c.companyId, node.id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, setup, work, total, workOrderId, c.userId];
+  });
+  const keys = new Set(plan.steps.map((s) => keyOf(plan.nodes[s.nodeK].id, s.flowStepId)));
+  if (keys.size !== plan.steps.length) throw new Error(`cf_erp: release ${releaseId} would run one flow step twice on one piece — the steps cannot be told apart.`);
+  await insertRows(db, 'cf_production_steps', STEP_COLUMNS, rows, WRITE_CHUNK);
+  const [back] = await db.query(
+    `SELECT s.id, s.production_item_id, s.flow_step_id FROM cf_production_steps s
+       JOIN cf_production_items pi ON pi.id = s.production_item_id
+      WHERE pi.company_id = ? AND pi.release_id = ? AND pi.deleted_at IS NULL AND s.company_id = ? AND s.deleted_at IS NULL`,
+    [c.companyId, releaseId, c.companyId],
+  );
+  const idOf = new Map(back.map((r) => [keyOf(r.production_item_id, r.flow_step_id), r.id]));
+  for (const s of plan.steps) {
+    s.id = idOf.get(keyOf(plan.nodes[s.nodeK].id, s.flowStepId));
+    if (!s.id) throw new Error(`cf_erp: a production step of release ${releaseId} vanished between insert and read-back.`);
+  }
+}
+
 /** Releases a whole sales line (E1): writes the tracker tree, its steps, dependencies and material requirements. */
 export async function releaseLine(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId, { lock: true });
@@ -680,31 +761,8 @@ export async function releaseLine(db, c, lineId, input = {}) {
   const estimate = await estimatorForLine(db, c.companyId, line.id,
     plan.steps.map((s) => ({ bomLineId: plan.nodes[s.nodeK].bomLineId, itemId: plan.nodes[s.nodeK].itemId, operationId: s.operationId })));
   const owners = line.locked_at ? await cellOwnersOfLine(db, c.companyId, line.id) : new Map();
-  // Parents are laid out before their children, so each insert knows its parent's id.
-  for (const n of plan.nodes) {
-    const [x] = await db.query(
-      `INSERT INTO cf_production_items (company_id, release_id, parent_id, item_id, bom_line_id, piece_no, quantity, code, flow_id, flow_revision, depth, sort_order, order_piece_id, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, releaseId, n.parentK != null ? plan.nodes[n.parentK].id : null, n.itemId, n.bomLineId, n.pieceNo, n.quantity, n.code,
-        n.flowId, plan.flows.get(n.flowId)?.revision ?? null, n.depth, n.k + 1, n.lockedPieceId ?? null, c.userId],
-    );
-    n.id = x.insertId;
-  }
-  for (const s of plan.steps) {
-    const node = plan.nodes[s.nodeK];
-    const t = estimate(node.bomLineId, node.itemId, s.operationId);
-    const work = t?.work ?? null;
-    const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
-    const total = work != null ? Number(((setup ?? 0) + work * Number(s.quantity)).toFixed(3)) : null;
-    const workOrderId = node.lockedPieceId != null ? owners.get(`${node.lockedPieceId}:${s.operationId}`) ?? null : null;
-    const [x] = await db.query(
-      `INSERT INTO cf_production_steps (company_id, production_item_id, flow_step_id, operation_id, sequence, step_name, quantity,
-                                        est_setup_minutes, est_work_minutes, est_minutes, work_order_id, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, node.id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, setup, work, total, workOrderId, c.userId],
-    );
-    s.id = x.insertId;
-  }
+  await writeItems(db, c, releaseId, plan);
+  await writeSteps(db, c, releaseId, plan, estimate, owners);
   if (plan.deps.length) {
     await db.query(
       'INSERT INTO cf_step_dependencies (company_id, step_id, target_step_id, target_item_id, required, origin, wait_rule_id, created_by) VALUES ?',
