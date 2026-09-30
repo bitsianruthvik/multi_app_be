@@ -9,7 +9,7 @@
  *   node scripts/cf_kepl/reserve_batch_test.mjs --check <file>    # compare with it
  *   node scripts/cf_kepl/reserve_batch_test.mjs                   # counts only
  *
- *   CF_RESERVE_COMPANY (2), CF_RESERVE_LINE (923 — the local KEPL copy, 2,952 requirements)
+ *   CF_RESERVE_COMPANY (2), CF_RESERVE_LINE (923 — the local KEPL copy, 128 requirements since the nest rule)
  *   CF_RESERVE_MAX_TRIPS (60) — the most round trips one "reserve all" may take
  *   CF_RESERVE_TRACE=1 — print every counted query
  *
@@ -22,19 +22,25 @@
  * and the line released. Then stock is put on the shelf THROUGH THE STOCK
  * SERVICES (postMovement receipts and a transfer, setBatchStatus), never as raw
  * rows, so balances, batches and the ledger agree — checkLedger is asserted.
- * The stock is chosen so reservation is interesting:
+ * The stock is chosen so reservation is interesting.
  *
- *   PL-12X2500X12100 (828 requirements): five batches over two usable areas —
- *     one batch split across storage and WIP by a transfer, two received the
- *     same day (the batch id breaks the tie), one on hold, plus stock in
- *     quarantine that must not count. Covers the first few hundred, one
- *     requirement straddles batches, the rest go short.
- *   PL-16X2300X12100 (744): one big batch — every requirement covered.
- *   PL-16X2300X6500: two small batches — partial.
- *   PL-12X2250X12050: stock in quarantine only — nothing usable.
- *   PL-16X1600X12350: a rejected batch and a small good one.
- *   PL-16X2000X8000: two batches that add up to the demand exactly.
- *   PL-25X1750X10850: one batch covering exactly half.
+ * Since 2026-09-30 the line's raw plate comes from its NEST: one requirement
+ * of ONE whole plate per plate lot (releaseService "raw plate from the nest"),
+ * 128 requirements where there were 2,952 plate fractions. The seed below was
+ * re-cut to whole plates then, and the golden re-saved deliberately. The local
+ * DB already holds a few plates of most sizes (a received demo PO), so the
+ * seed is on top of that:
+ *
+ *   PL-12X2500X12100 (9 lots): four batches over two usable areas — one batch
+ *     split across storage and WIP by a transfer, two received the same day
+ *     (the batch id breaks the tie), one on hold, plus stock in quarantine that
+ *     must not count. One plate goes short until scenario 2's older batch.
+ *   PL-16X2300X12100 (4 lots): one big batch — every requirement covered.
+ *   PL-16X2300X6500 (3): two small batches — the last one partial.
+ *   PL-12X2250X12050 (4): extra stock in quarantine only — it never counts.
+ *   PL-16X1600X12350 (4): a rejected batch and a small good one — one short.
+ *   PL-16X2000X8000 (1): two more batches, more than the demand.
+ *   PL-25X1750X10850 (8): one batch — one plate short.
  *   STUD-001 (counted by quantity, no batches): storage + WIP, four of eight
  *     requirements covered, one partly.
  *   everything else: no stock at all.
@@ -222,19 +228,19 @@ async function batchByCode(db, code) {
 const receipt = (c, db, date, toAreaId, lines) => STOCK.postMovement(db, c, { movementType: 'receipt', movementDate: date, toAreaId, reference: 'reserve_batch_test', lines });
 
 async function seedStock(db, c, A, I) {
-  // PL-12X2500X12100: the item 828 requirements share.
-  await receipt(c, db, '2026-08-15', A.sto, [{ itemId: I.p1621, quantity: 2.5, batch: { code: 'RSV-1621-A' } }]);    // oldest
+  // PL-12X2500X12100: 9 plate lots.
+  await receipt(c, db, '2026-08-15', A.sto, [{ itemId: I.p1621, quantity: 2, batch: { code: 'RSV-1621-A' } }]);      // oldest
   await receipt(c, db, '2026-09-01', A.sto, [
-    { itemId: I.p1621, quantity: 3, batch: { code: 'RSV-1621-B' } },
-    { itemId: I.p1621, quantity: 0.9, batch: { code: 'RSV-1621-C' } },                                          // same day as B: id breaks the tie
+    { itemId: I.p1621, quantity: 1, batch: { code: 'RSV-1621-B' } },
+    { itemId: I.p1621, quantity: 1, batch: { code: 'RSV-1621-C' } },                                            // same day as B: id breaks the tie
     { itemId: I.p1621, quantity: 1, batch: { code: 'RSV-1621-H' } },                                            // to be put on hold
   ]);
   await receipt(c, db, '2026-09-10', A.qua, [{ itemId: I.p1621, quantity: 4, batch: { code: 'RSV-1621-Q' } }]);    // quarantine: never counts
   const bA = await batchByCode(db, 'RSV-1621-A');
   const bB = await batchByCode(db, 'RSV-1621-B');
   await STOCK.postMovement(db, c, { movementType: 'transfer', movementDate: '2026-09-12', fromAreaId: A.sto, toAreaId: A.wip, lines: [
-    { itemId: I.p1621, quantity: 1.25, batchId: bA },                                                            // one batch, two usable areas
-    { itemId: I.p1621, quantity: 0.4, batchId: bB },
+    { itemId: I.p1621, quantity: 1, batchId: bA },                                                               // one batch, two usable areas
+    { itemId: I.p1621, quantity: 1, batchId: bB },
   ] });
   await BATCH.setBatchStatus(db, c, await batchByCode(db, 'RSV-1621-H'), { status: 'on_hold', note: 'reserve_batch_test' });
 
@@ -249,10 +255,10 @@ async function seedStock(db, c, A, I) {
   await receipt(c, db, '2026-08-01', A.sto, [{ itemId: I.p1643, quantity: 10, batch: { code: 'RSV-1643-R' } }]);
   await receipt(c, db, '2026-09-06', A.sto, [{ itemId: I.p1643, quantity: 1, batch: { code: 'RSV-1643-A' } }]);
   await BATCH.setBatchStatus(db, c, await batchByCode(db, 'RSV-1643-R'), { status: 'rejected', note: 'reserve_batch_test' });
-  // PL-16X2000X8000: exactly the demand (1.874340), in two batches.
+  // PL-16X2000X8000: more than the one plate wanted, in two batches.
   await receipt(c, db, '2026-09-07', A.sto, [{ itemId: I.p1625, quantity: 1, batch: { code: 'RSV-1625-A' } }]);
   await receipt(c, db, '2026-09-08', A.wip, [{ itemId: I.p1625, quantity: 0.87434, batch: { code: 'RSV-1625-B' } }]);
-  // PL-25X1750X10850: exactly half of 64 × 0.125.
+  // PL-25X1750X10850: 8 plates wanted, 3 already on hand.
   await receipt(c, db, '2026-09-09', A.sto, [{ itemId: I.p3005, quantity: 4, batch: { code: 'RSV-3005-A' } }]);
   // STUD-001: counted by quantity — 8 × 1,803 wanted, 8,000 on hand over two areas.
   await receipt(c, db, '2026-09-09', A.sto, [{ itemId: I.stud, quantity: 5000 }]);
@@ -323,8 +329,8 @@ try {
   const q1621 = reqsOf(I.p1621);
   const q1641 = reqsOf(I.p1641);
   pre.push(await outcome(() => REL.reserveRequirement(conn, c, q1621[5].id, { quantity: 0.01 })));             // partly, oldest batch
-  pre.push(await outcome(async () => REL.reserveRequirement(conn, c, q1621[9].id, { batchId: await batchByCode(conn, 'RSV-1621-H') })));   // on hold: NOT_FREE
-  pre.push(await outcome(async () => REL.reserveRequirement(conn, c, q1621[12].id, { batchId: await batchByCode(conn, 'RSV-1621-B') })));
+  pre.push(await outcome(async () => REL.reserveRequirement(conn, c, q1621[7].id, { batchId: await batchByCode(conn, 'RSV-1621-H') })));   // on hold: NOT_FREE
+  pre.push(await outcome(async () => REL.reserveRequirement(conn, c, q1621[8].id, { batchId: await batchByCode(conn, 'RSV-1621-B') })));
   pre.push(await outcome(() => REL.reserveRequirement(conn, c, q1641[3].id)));                                   // wholly
   const stud = reqsOf(I.stud);
   pre.push(await outcome(() => REL.reserveRequirement(conn, c, stud[2].id, { quantity: 1000 })));                // counted item, partly
@@ -356,7 +362,7 @@ try {
   const shortOne = q1643[q1643.length - 1];                                                                        // short after scenario 1
   between.push(await outcome(() => REL.reserveRequirement(conn, c, shortOne.id, { quantity: 5 })));              // TOO_MANY
   between.push(await outcome(() => REL.reserveRequirement(conn, c, shortOne.id, { quantity: -1 })));             // INVALID
-  between.push(await outcome(() => REL.reserveRequirement(conn, c, reqsOf(I.p1722)[7].id, { quantity: 0.001 }))); // the new batch, partly
+  between.push(await outcome(() => REL.reserveRequirement(conn, c, reqsOf(I.p1722)[0].id, { quantity: 0.001 }))); // the new batch, partly
   between.push(await outcome(() => REL.reserveRequirement(conn, c, reqsOf(I.p3003)[0].id)));                     // quarantine only: NOT_FREE
   between.push(await outcome(async () => REL.reserveRequirement(conn, c, shortOne.id, { batchId: await batchByCode(conn, 'RSV-1643-R') })));           // rejected batch
   ok('the stock ledger and balances agree between the runs', (await STOCK.checkLedger(conn, COMPANY)).ok);

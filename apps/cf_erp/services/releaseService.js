@@ -269,6 +269,14 @@ function planSteps(plan) {
       }
     }
   }
+  // The nest: every other cut-plate node of a nest group waits for its gate's
+  // first step — the one holding the group's plates — to start ("raw plate
+  // from the nest"). A node's first steps, like the default below.
+  for (const w of plan.nestWaits ?? []) {
+    const gateStep = nodes[w.gateK].stepKs[0];
+    if (gateStep == null) continue;
+    for (const s of nodes[w.nodeK].groups[0] ?? []) deps.push({ stepK: s.k, targetStepK: gateStep, required: 'started', origin: 'nest' });
+  }
   // The default: a parent's first steps wait for each child none of its rules names.
   for (const node of nodes) {
     const set = named.get(node.k) ?? new Set();
@@ -319,6 +327,204 @@ function findCycle(nodes, steps, deps) {
   return null;
 }
 
+// --- raw plate from the nest ----------------------------------------------------------
+//
+// RAW PLATE COMES FROM THE NEST, NOT FROM THE CUT PLATES' PLATE LINES
+// (2026-09-30, prod KEPL line 210001: the buy list asked for 14.71 of one plate
+// where the nest uses 9, and missed a size the nest uses 6 of).
+//
+// A cut plate's BOM holds ONE raw-plate line with a fractional "plates per
+// piece". That is right for a line nobody has nested: it is the only answer
+// there is. Once a nest is saved it is wrong three ways — a cut plate nested
+// across several plate sizes books all of them on one size, the fraction never
+// adds up to whole plates, and a re-nest changes the lots while the frozen
+// plate line stays where it was. The nest itself is the truth: ONE LOT IS ONE
+// PHYSICAL PLATE drawn from stock once.
+//
+// So, for a line with live plate lots:
+//   * every CATALOG lot is one requirement — item = the lot's plate, quantity 1
+//     (a whole plate), bom_line_id NULL. An OFFCUT lot draws a drop already in
+//     the yard, which is not a catalog stock item and cannot be bought or
+//     reserved, so it asks for nothing (nesting never proposes one today).
+//   * lots that share a cut plate form a NEST GROUP (a cut plate spread over
+//     three plate sizes ties those three lots together; one cut plate over 24
+//     lots is a group of 24). Each group has ONE gate: the cut plate with the
+//     most pieces placed across the group, a tie going to the one the tracker
+//     lists first (lowest sort order); of that cut plate's nodes, the first.
+//     Every lot requirement of the group sits on the gate's first step.
+//   * every OTHER node of every cut plate in the group waits for the gate's
+//     first step to START (cf_step_dependencies, origin 'nest', init.sql §34).
+//     Every piece on a lot is cut from that one plate in one CNC program, so
+//     nothing on a lot starts cutting before its plate is reserved and the
+//     gate has started.
+//     WHY A GROUP AND NOT A GATE PER LOT (asked for per lot, 2026-09-30): the
+//     placements say which cut plate sits on a lot, not which of its NODES, so
+//     a node of a cut plate on lots A and B has to wait for both lots' gates —
+//     and when the gate of A is itself on B while the gate of B is on A, the two
+//     gates wait for each other and nothing can ever start (local KEPL line: a
+//     three-gate circle). One gate per group has the same meaning — nothing on
+//     a lot starts before its plate is there — with no gate waiting for another.
+//   * the raw-plate line of every cut plate that is on the nest makes NO
+//     requirement (it would count the steel twice). That line is the cut
+//     plate's selection line (SEL Plate, which is how cutPlateService writes
+//     it), or any line naming a plate a lot uses. A cut plate NOT on the nest
+//     (NEST_MANUAL) keeps its plate line, fraction and all.
+//   * a nest that does not lay out exactly the pieces the line makes of a cut
+//     plate is a release problem: buying from it would buy the wrong plates.
+// A line with no live lots is released exactly as before.
+//
+// A lot requirement is told apart by bom_line_id NULL with a production item
+// (every other requirement under a piece has its BOM line; a bought line's has
+// neither). The tracker names its lot by laying the same rule over the lots
+// again (lotGates): the lots cannot change while the line is released —
+// nestingService refuses a released line — so the answer is the one release
+// wrote. No column was added for it.
+
+/** The live plate lots of some lines, with how many pieces of each cut plate sit on each. Map(lineId -> Map(lotId -> lot)). One query. */
+async function lotsOfLines(db, companyId, lineIds) {
+  const out = new Map();
+  if (!lineIds.length) return out;
+  const [rows] = await db.query(
+    `SELECT pl.order_line_id, pl.id AS lot_id, pl.lot_no, pl.source, pl.plate_item_id,
+            m.code AS plate_code, m.name AS plate_name, i.uom, i.tracked_by,
+            np.cut_plate_id, COUNT(np.id) AS pieces
+       FROM cf_plate_lots pl
+       JOIN cf_master_records m ON m.id = pl.plate_item_id
+       LEFT JOIN cf_item_details i ON i.master_id = pl.plate_item_id
+       LEFT JOIN cf_nest_placements np ON np.company_id = pl.company_id AND np.plate_lot_id = pl.id AND np.deleted_at IS NULL
+      WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
+      GROUP BY pl.order_line_id, pl.id, pl.lot_no, pl.source, pl.plate_item_id, m.code, m.name, i.uom, i.tracked_by, np.cut_plate_id
+      ORDER BY pl.id, np.cut_plate_id`,
+    [companyId, lineIds],
+  );
+  for (const r of rows) {
+    if (!out.has(r.order_line_id)) out.set(r.order_line_id, new Map());
+    const lots = out.get(r.order_line_id);
+    if (!lots.has(r.lot_id)) {
+      lots.set(r.lot_id, {
+        id: r.lot_id, lotNo: r.lot_no, source: r.source, plateItemId: r.plate_item_id,
+        plate: { id: r.plate_item_id, code: r.plate_code, name: r.plate_name, uom: r.uom, trackedBy: r.tracked_by },
+        byCutPlate: new Map(),
+      });
+    }
+    if (r.cut_plate_id != null) lots.get(r.lot_id).byCutPlate.set(Number(r.cut_plate_id), Number(r.pieces));
+  }
+  return out;
+}
+
+/**
+ * The nest groups and their gates — the one rule release and the tracker share.
+ * firstOf(cutPlateId) -> { key, order } of that cut plate's first node, or null
+ * when the plan has none. Returns
+ *   gates   [{ lot, gate }] for every CATALOG lot, in lot-id order (gate null
+ *           when nothing on the lot's group is in the plan)
+ *   groups  [{ gate, cutPlates: [cutPlateId], lots: [lot] }] — every lot, offcuts too
+ */
+export function lotGates(lots, firstOf) {
+  const sorted = [...lots.values()].sort((a, b) => a.id - b.id);
+  // Union-find over lots, joined by the cut plates they share.
+  const parent = new Map(sorted.map((l) => [l.id, l.id]));
+  const root = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const lotOfCutPlate = new Map();
+  for (const lot of sorted) {
+    for (const [cp, pieces] of lot.byCutPlate) {
+      if (!(pieces > 0)) continue;
+      if (lotOfCutPlate.has(cp)) {
+        const a = root(lotOfCutPlate.get(cp)); const b = root(lot.id);
+        if (a !== b) parent.set(Math.max(a, b), Math.min(a, b));
+      } else lotOfCutPlate.set(cp, lot.id);
+    }
+  }
+  const byRoot = new Map();
+  for (const lot of sorted) {
+    const r = root(lot.id);
+    if (!byRoot.has(r)) byRoot.set(r, { lots: [], pieces: new Map() });
+    const g = byRoot.get(r);
+    g.lots.push(lot);
+    for (const [cp, n] of lot.byCutPlate) if (n > 0) g.pieces.set(cp, (g.pieces.get(cp) ?? 0) + n);
+  }
+  const groups = [];
+  const gateOfLot = new Map();
+  for (const g of byRoot.values()) {
+    let best = null;
+    for (const [cp, pieces] of g.pieces) {
+      const f = firstOf(cp);
+      if (!f) continue;
+      if (!best || pieces > best.pieces || (pieces === best.pieces && f.order < best.order)) best = { pieces, order: f.order, key: f.key };
+    }
+    const gate = best ? best.key : null;
+    groups.push({ gate, cutPlates: [...g.pieces.keys()].sort((a, b) => a - b), lots: g.lots });
+    for (const lot of g.lots) gateOfLot.set(lot.id, gate);
+  }
+  const gates = sorted.filter((l) => l.source === 'catalog').map((lot) => ({ lot, gate: gateOfLot.get(lot.id) }));
+  return { gates, groups };
+}
+
+/** Replaces a nested line's raw-plate requirements with one whole plate per catalog lot (see above). */
+async function nestMaterial(db, companyId, line, plan) {
+  const nodes = plan.nodes ?? [];
+  if (!nodes.length) return;
+  const lots = (await lotsOfLines(db, companyId, [line.id])).get(line.id);
+  if (!lots?.size) return;
+  const placed = new Map();                        // cutPlateId -> pieces on the nest
+  const lotPlates = new Set();
+  for (const lot of lots.values()) {
+    lotPlates.add(Number(lot.plateItemId));
+    for (const [cp, n] of lot.byCutPlate) placed.set(cp, (placed.get(cp) ?? 0) + n);
+  }
+  const first = new Map();                         // cutPlateId -> first node k
+  const need = new Map();                          // cutPlateId -> pieces the plan makes
+  for (const n of nodes) {
+    if (!placed.has(Number(n.itemId))) continue;
+    if (!first.has(Number(n.itemId))) first.set(Number(n.itemId), n.k);
+    need.set(Number(n.itemId), round6((need.get(Number(n.itemId)) ?? 0) + n.quantity));
+  }
+  const nameOfItem = (id) => nodes[first.get(id)]?.design?.code ?? nodes[first.get(id)]?.design?.name ?? `cut plate ${id}`;
+  for (const [cp, n] of placed) {
+    const want = need.get(cp) ?? 0;
+    if (Math.abs(want - n) > EPS) {
+      plan.problems.push(want
+        ? `${nameOfItem(cp)}: the line makes ${fmt(want)} but the saved nest lays out ${fmt(n)} — nest the line again, so the plates bought are the plates cut.`
+        : `The saved nest lays out ${fmt(n)} of cut plate ${cp}, which this line no longer makes — nest the line again, so the plates bought are the plates cut.`);
+    }
+  }
+  const { gates, groups } = lotGates(lots, (cp) => (first.has(cp) ? { key: first.get(cp), order: first.get(cp) } : null));
+  // Every other node of every cut plate in a group waits for its gate to start (planSteps writes the step waits).
+  const nodesOf = new Map();                       // cutPlateId -> [node k]
+  for (const n of nodes) if (placed.has(Number(n.itemId))) { if (!nodesOf.has(Number(n.itemId))) nodesOf.set(Number(n.itemId), []); nodesOf.get(Number(n.itemId)).push(n.k); }
+  plan.nestWaits = [];
+  for (const g of groups) {
+    if (g.gate == null) continue;
+    for (const cp of g.cutPlates) for (const k of nodesOf.get(cp) ?? []) if (k !== g.gate) plan.nestWaits.push({ nodeK: k, gateK: g.gate });
+  }
+  const byGate = new Map();                        // node k -> [lot requirement]
+  for (const { lot, gate } of gates) {
+    if (gate == null) { plan.problems.push(`Nest ${lot.lotNo} holds nothing this line makes — nest the line again.`); continue; }
+    if (lot.plate.trackedBy === 'individual') {
+      plan.problems.push(`${lot.plate.code ?? lot.plate.name} is tracked unit by unit — no stock is kept of it yet, so nest ${lot.lotNo}'s plate cannot be reserved. Track it by quantity or batch.`);
+    }
+    if (!byGate.has(gate)) byGate.set(gate, []);
+    byGate.get(gate).push({
+      nodeK: gate, itemId: Number(lot.plateItemId), bomLineId: null, quantity: 1,
+      design: { id: Number(lot.plateItemId), code: lot.plate.code, name: lot.plate.name, uom: lot.plate.uom, kind: 'catalog' },
+      lot: { id: lot.id, lotNo: lot.lotNo },
+    });
+  }
+  // A cut plate's own raw-plate line, now that the nest says which plates.
+  const isPlateLine = (r) => r.nodeK != null && placed.has(Number(nodes[r.nodeK].itemId))
+    && (r.design?.selection != null || lotPlates.has(Number(r.itemId)));
+  // Each lot's requirement takes the place of its gate's plate line, so the
+  // material list keeps the tree's order; any left over go at the end.
+  const reqs = [];
+  for (const r of plan.reqs) {
+    if (!isPlateLine(r)) { reqs.push(r); continue; }
+    const mine = byGate.get(r.nodeK);
+    if (mine) { reqs.push(...mine); byGate.delete(r.nodeK); }
+  }
+  for (const k of [...byGate.keys()].sort((a, b) => a - b)) reqs.push(...byGate.get(k));
+  plan.reqs = reqs;
+}
+
 /**
  * The plan for a line, with the line-level checks first. A locked line's plan
  * carries its locked codes (by path key) and follows the lock's own
@@ -337,6 +543,8 @@ async function planFor(db, companyId, line) {
   if (pieces) {
     for (const u of attachLockedCodes(plan.nodes ?? [], pieces)) plan.problems.push(unmatchedProblem(u, plan.nodes));
   }
+  // Before planSteps: it attaches every requirement, the nest's too, to its node's first step.
+  await nestMaterial(db, companyId, line, plan);
   if (plan.nodes) planSteps(plan);
   plan.lockedPieces = pieces;
   return plan;
@@ -872,7 +1080,45 @@ async function loadTracker(db, companyId, releaseIds) {
     [companyId, reqIds],
   ) : [[]];
   const free = await availability(db, companyId, [...new Set(reqs.map((q) => q.item_id))]);
+  await nameLots(db, companyId, releases, items, reqs);
   return { releases, items, steps, deps, reqs, reservations, free };
+}
+
+/**
+ * Which plate lot each of the nest's requirements is (q._lot = { id, lotNo }) —
+ * release's own rule (lotGates) laid over the line's lots again, then matched
+ * in lot-id order within each (gated piece, plate). Exact, because a released
+ * line's nest cannot change (see "raw plate from the nest"). One query, and
+ * only when a release has such requirements.
+ */
+async function nameLots(db, companyId, releases, items, reqs) {
+  const isLot = (q) => q.bom_line_id == null && q.production_item_id != null;
+  const lotReqs = reqs.filter(isLot);
+  if (!lotReqs.length) return;
+  const byRelease = groupBy(lotReqs, 'release_id');
+  const lotsOf = await lotsOfLines(db, companyId, releases.filter((r) => byRelease.has(r.id)).map((r) => r.order_line_id));
+  const itemsOf = groupBy(items, 'release_id');
+  for (const r of releases) {
+    const mine = byRelease.get(r.id);
+    const lots = lotsOf.get(r.order_line_id);
+    if (!mine || !lots) continue;
+    const first = new Map();                       // cut plate item -> its first production item
+    for (const it of itemsOf.get(r.id) ?? []) {
+      const f = first.get(it.item_id);
+      if (!f || it.sort_order < f.order) first.set(it.item_id, { key: it.id, order: it.sort_order });
+    }
+    const queue = new Map();                       // "piece:plate" -> lots in id order
+    for (const { lot, gate } of lotGates(lots, (cp) => first.get(cp) ?? null).gates) {
+      if (gate == null) continue;
+      const k = `${gate}:${lot.plateItemId}`;
+      if (!queue.has(k)) queue.set(k, []);
+      queue.get(k).push(lot);
+    }
+    for (const q of [...mine].sort((a, b) => a.id - b.id)) {
+      const lot = queue.get(`${q.production_item_id}:${q.item_id}`)?.shift();
+      if (lot) q._lot = { id: lot.id, lotNo: lot.lotNo };
+    }
+  }
 }
 
 const groupBy = (rows, key) => {
@@ -945,7 +1191,7 @@ function evaluate(data) {
         const verb = d.required === 'started' ? 'start' : 'finish';
         text = t.production_item_id === s.production_item_id
           ? `${t._opLabel ?? t.op_name} (${t.op_code}) to ${verb} first`
-          : `${label(itemById.get(t.production_item_id))} to ${verb} ${t._opLabel ?? t.op_name} (${t.op_code})`;
+          : `${label(itemById.get(t.production_item_id))} to ${verb} ${t._opLabel ?? t.op_name} (${t.op_code})${d.origin === 'nest' ? ', which holds the plate they are both cut from' : ''}`;
       } else {
         const it = itemById.get(d.target_item_id);
         met = d.required === 'started' ? pieceStarted(it.id) : pieceComplete(it.id);
@@ -960,7 +1206,7 @@ function evaluate(data) {
       const held = q._reserved - q._usable > EPS ? ` (${fmt(q._reserved - q._usable)} reserved on a held batch)` : '';
       const freeNow = free?.get(q.item_id)?.free ?? 0;
       const none = freeNow + EPS < q._short ? ` — ${freeNow > EPS ? `only ${fmt(freeNow)}` : 'none'} free now` : '';
-      blockers.push({ kind: 'material', text: `${q.item_code}: ${fmt(q._short)} ${q.uom} still to reserve of ${fmt(q.quantity)}${held}${none}.` });
+      blockers.push({ kind: 'material', text: `${q._lot ? `${q._lot.lotNo} · ` : ''}${q.item_code}: ${fmt(q._short)} ${q.uom} still to reserve of ${fmt(q.quantity)}${held}${none}.` });
     }
     s._waits = waits;
     s._blockers = blockers;
@@ -1014,6 +1260,8 @@ function shapeRequirement(q, data, ev) {
   return {
     id: q.id,
     item: { id: q.item_id, code: q.item_code, name: q.item_name, uom: q.uom, trackedBy: q.tracked_by },
+    // The nest's whole plate (see "raw plate from the nest"); null for any other requirement.
+    lot: q._lot ?? null,
     quantity: Number(q.quantity),
     issued: Number(q.issued),
     reserved: q._reserved,
@@ -1148,7 +1396,7 @@ export async function listTrackerMaterials(db, companyId, q = {}) {
   if (String(q.show ?? 'short') === 'short') rows = rows.filter((m) => !m.covered);
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
-    rows = rows.filter((m) => contains(term, m.item.code, m.item.name, m.order.code, m.piece?.label));
+    rows = rows.filter((m) => contains(term, m.item.code, m.item.name, m.order.code, m.piece?.label, m.lot?.lotNo));
   }
   return rows;
 }

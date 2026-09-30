@@ -1496,7 +1496,7 @@ CREATE TABLE IF NOT EXISTS cf_step_dependencies (
   target_step_id  INT        NULL,
   target_item_id  INT        NULL,
   required        ENUM('started','done','complete') NOT NULL,
-  origin          ENUM('flow','rule','default') NOT NULL,
+  origin          ENUM('flow','rule','default','nest') NOT NULL,
   wait_rule_id    INT        NULL,
 
   deleted_at      DATETIME   DEFAULT NULL,
@@ -3399,3 +3399,22 @@ CREATE TABLE IF NOT EXISTS cf_company_settings (
   CONSTRAINT fk_cfcs_cut_flow FOREIGN KEY (company_id, cut_plate_flow_id) REFERENCES cf_operation_flows(company_id, id),
   CONSTRAINT fk_cfcs_updater  FOREIGN KEY (updated_by) REFERENCES users(id)
 );
+
+-- ===========================================================================
+-- 34. NEST WAITS — every cut plate on a plate lot waits for that lot's plate
+-- ===========================================================================
+--
+-- Decided 2026-09-30: a nested line's raw plate is one requirement per plate
+-- lot, held on ONE cut plate's first step (the lot's "gate", releaseService
+-- "raw plate from the nest"). Every piece on a lot is cut from that one plate in
+-- one CNC program, so every OTHER cut-plate node on the lot waits for the gate
+-- step to START — origin 'nest'. Appending a value to the ENUM is all it takes
+-- (no key, no data rewrite). Guarded: only while 'nest' is missing.
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_dependencies'
+               AND COLUMN_NAME = 'origin' AND COLUMN_TYPE NOT LIKE '%''nest''%');
+SET @sql = IF(@col > 0,
+  "ALTER TABLE cf_step_dependencies MODIFY COLUMN origin ENUM('flow','rule','default','nest') NOT NULL",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
