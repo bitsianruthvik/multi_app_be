@@ -58,6 +58,8 @@ const SEL = await imp('apps/cf_erp/services/selectionService.js');
 const V = await imp('apps/cf_erp/services/valueService.js');
 const RES = await imp('apps/cf_erp/services/resolutionService.js');
 const { loadMaster } = await imp('apps/cf_erp/services/records.js');
+const OPS = await imp('apps/cf_erp/services/operationService.js');
+const FLOWS = await imp('apps/cf_erp/services/flowService.js');
 const SO = await imp('apps/cf_erp/services/salesOrderService.js');
 const PARTIES = await imp('apps/cf_erp/modules/parties/service.js');
 const AREAS = await imp('apps/cf_erp/services/stockingAreaService.js');
@@ -425,6 +427,19 @@ try {
   section('3. As soon as the values are complete, the cut pieces are made');
   await OV.writeLineValues(conn, c, f.lineA.id, { writes: markAll([C]) });
   invalidateNodeCache(conn);
+  // The house's cut-plate flow (init.sql §33 — user, 2026-09-30: cutting
+  // belongs to the cut plate). Set here, so a new cut plate is born with it.
+  const cutOp = await OPS.createOperation(conn, c, { code: `${tag}-CUT`, name: `Cut ${tag}` });
+  const mkFlow = async (code) => {
+    const fl = await FLOWS.createFlow(conn, c, { code: `${tag}-${code}`, name: `${code} ${tag}` });
+    await FLOWS.addStep(conn, c, fl.id, { operationId: cutOp.id });
+    await FLOWS.setFlowStatus(conn, c, fl.id, 'active');
+    return fl;
+  };
+  const cncFlow = await mkFlow('CNC');
+  const setHouse = await FLOWS.setCutPlateFlow(conn, c, { flowId: cncFlow.id });
+  eq('the house says which flow cut plates are made by', setHouse.flow?.id, cncFlow.id);
+  eq('and reads it back', (await FLOWS.getCutPlateFlow(conn, COMPANY)).flow?.code, `${tag}-CNC`);
   const first = await refresh(f.lineA.id);
   ok('the refresh made them', first.out.made === true && first.out.reason === 'made', JSON.stringify(first.out));
   says(first.out.message);
@@ -448,6 +463,9 @@ try {
     ok(`the blank inherits ${f.steelExtras.map((s) => s.code).join(', ')} from the part it is cut from`,
       f.steelExtras.every((s) => onBlank.get(s.code) != null && onBlank.get(s.code) === fromPart.get(s.code)), JSON.stringify([...onBlank]));
   }
+  const flowsOf = async (ids) => new Map((await conn.query('SELECT id, default_flow_id FROM cf_master_records WHERE id IN (?)', [ids]))[0].map((r) => [r.id, r.default_flow_id]));
+  const bornWith = await flowsOf(blanks.map((b) => b.id));
+  ok('every new cut plate is made by the house cut-plate flow — no flow was asked for', blanks.every((b) => bornWith.get(b.id) === cncFlow.id), JSON.stringify([...bornWith]));
   ok(`the first derive stays inside its budget: ${first.trips} round trips (the values check and the values settle included)`, first.trips <= 60, `${first.trips}`);
   const readMade = await CUT.getCutPlates(conn, COMPANY, f.lineA.id);
   ok('the screen now says: up to date, values complete, and when they were made',
@@ -468,6 +486,12 @@ try {
 
   /* ---- a size changes ------------------------------------------------------ */
   section('5. A size changes, and the cut pieces follow');
+  // A person gives one cut plate a flow of its own, and the house changes its
+  // default: the new cut plate takes the new default, the other keeps its own.
+  const ownFlow = await mkFlow('OWN');
+  const laserFlow = await mkFlow('LASER');
+  await MR.updateRecord(conn, c, xA, { defaultFlowId: ownFlow.id });
+  await FLOWS.setCutPlateFlow(conn, c, { flowId: laserFlow.id });
   await OV.writeLineValues(conn, c, f.lineA.id, { writes: [{ recordId: Bp, specCode: 'WIDTH', value: 600 }] });
   const behind = await CUT.getCutPlates(conn, COMPANY, f.lineA.id);
   eq('before the refresh, the screen says the cut pieces are behind the parts', behind.upToDate, false);
@@ -477,6 +501,12 @@ try {
     wider.out.made === true && wider.out.summary.created === 1 && xB2 && xB2 !== xA && (await blankOfPart(conn, f, A))[0] === xA,
     JSON.stringify({ out: wider.out.summary, xB2 }));
   ok('and the part points at exactly one blank', (await blankOfPart(conn, f, Bp)).length === 1);
+  const afterWider = await flowsOf([xA, xB2, xC]);
+  eq('the new cut plate takes the NEW house default flow', afterWider.get(xB2), laserFlow.id);
+  eq('the cut plate given its own flow keeps it — never overwritten', afterWider.get(xA), ownFlow.id);
+  eq('and the untouched one keeps the flow it was born with', afterWider.get(xC), cncFlow.id);
+  const flowRefused = await (async () => { try { await FLOWS.setCutPlateFlow(conn, c, { flowId: 999999999 }); return null; } catch (e) { return e; } })();
+  ok('a flow that does not exist is refused in words', !!flowRefused && /does not exist/.test((flowRefused.problems ?? []).join(' ') + flowRefused.message), flowRefused?.message);
   await OV.writeLineValues(conn, c, f.lineA.id, { writes: [{ recordId: Bp, specCode: 'WIDTH', value: 500 }] });
   const back = await refresh(f.lineA.id);
   const [gone] = await conn.query('SELECT deleted_at FROM cf_master_records WHERE id = ?', [xB2]);

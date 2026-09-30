@@ -569,9 +569,17 @@ export async function lineStructure(db, companyId, lineId) {
   const o = await requireOrder(db, companyId, line.order_id);
   if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet.');
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
+  const released = !!(await releaseOfLine(db, companyId, line.id));
   return {
     line: { id: line.id, lineNo: line.line_no, lineType: line.line_type, quantity: Number(line.quantity) },
-    order: { id: o.id, code: o.code, status: o.status, editable: !LOCKED.has(o.status) && !line.locked_at && !(await releaseOfLine(db, companyId, line.id)) },
+    order: {
+      id: o.id, code: o.code, status: o.status,
+      editable: !LOCKED.has(o.status) && !line.locked_at && !released,
+      locked: !!line.locked_at,
+      released,
+      // How each row is made still changes on a locked line until release (records.flowStillOpen).
+      flowsEditable: !LOCKED.has(o.status) && !released,
+    },
     ...tree,
   };
 }

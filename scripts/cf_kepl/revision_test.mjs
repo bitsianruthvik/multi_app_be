@@ -536,6 +536,12 @@ try {
   refusedRev1('a value on the Values stage, as its 409', await refusal(() => OV.writeLineValues(conn, c, a40.id, { writes: [{ recordId: a40Part, specCode: 'THICKNESS', value: 14 }] })), 409);
   refusedRev1('a value set on the record itself', await refusal(() => V.setValues(conn, c, 'master', a40Part, [{ specCode: 'THICKNESS', value: 14 }])), 422);
   refusedRev1('a row\'s own details', await refusal(() => MR.updateRecord(conn, c, a40Part, { name: 'Renamed' })), 422);
+  // A locked line's flows stay open until release (2026-09-30) — but not on a revised order.
+  const a10Seg = (await conn.query('SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE i.owner_order_line_id = ? AND m.classification_id = ? AND m.deleted_at IS NULL LIMIT 1', [a10.id, f.v.seg.id]))[0][0].id;
+  const [[a10SegLine]] = await conn.query('SELECT l.id FROM cf_bom_lines l JOIN cf_boms b ON b.id = l.bom_id WHERE b.parent_id = ? AND l.deleted_at IS NULL ORDER BY l.line_no LIMIT 1', [a10Seg]);
+  refusedRev1('a row\'s flow on its locked line', await refusal(() => MR.updateRecord(conn, c, a10Seg, { defaultFlowId: f.flow.id })), 422);
+  refusedRev1('a BOM line\'s flow on its locked line', await refusal(() => B.updateLine(conn, c, a10SegLine.id, { operationFlowId: f.flow.id })), 422);
+  refusedRev1('a flow-only batch in edit mode, as its 409', await refusal(() => BC.applyBomChanges(conn, c, { scope: { orderLineId: a10.id }, changes: [{ op: 'flow', lineId: a10SegLine.id, flowId: f.flow.id }] })), 409);
   refusedRev1('working its cut pieces out again', await refusal(() => CUT.deriveCutPlates(conn, c, a40.id, {})), 422);
   const auto = await CUT.refreshCutPieces(conn, c, a40.id);
   ok('and the automatic cut pieces say so, without failing', auto.made === false && auto.reason === 'closed' && REV1.test(auto.message), JSON.stringify(auto));

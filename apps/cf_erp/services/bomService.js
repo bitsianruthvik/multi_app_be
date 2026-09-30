@@ -108,8 +108,12 @@ async function ownerOrder(db, companyId, parent) {
   return o || null;
 }
 
-/** The one rule for "this structure can still change". Exported so the BOM sheet asks the same question. */
-export async function assertEditable(db, companyId, parent) {
+/**
+ * The one rule for "this structure can still change". Exported so the BOM sheet asks the same question.
+ * opts.flowOnly: the change is ONLY how a line is made (operation_flow_id) —
+ * that still goes through on a locked line until it is released (records.flowStillOpen).
+ */
+export async function assertEditable(db, companyId, parent, opts = {}) {
   if (parent.status === 'obsolete') throw invalid('OBSOLETE', `${labelOf(parent)} is obsolete — reactivate it to change its BOM.`);
   const order = await ownerOrder(db, companyId, parent);
   if (order && LOCKED_ORDER_STATUSES.has(order.status)) {
@@ -120,7 +124,7 @@ export async function assertEditable(db, companyId, parent) {
     throw invalid('RELEASED', `${labelOf(parent)} was released to production with line ${parent.owner_line_no} of ${order?.code ?? 'its order'} — its structure can no longer change. (Take the release back while nothing has started, or wait for change after release.)`);
   }
   // A locked line's structure is what it was rolled out from (lockService).
-  if (parent.owner_line_locked_at) throw invalid('LOCKED', lockedLineMessage(parent.owner_line_no, order?.code));
+  if (parent.owner_line_locked_at && !opts.flowOnly) throw invalid('LOCKED', lockedLineMessage(parent.owner_line_no, order?.code));
 }
 
 /** The BOM of any record, with its lines and what they may contain. */
@@ -136,7 +140,7 @@ export async function getBom(db, companyId, parentId) {
     bomType,
     canHaveBom: !!bomType,
     allowedChildKinds: ALLOWED_CHILDREN[bomType] ?? [],
-    order: order ? { id: order.id, code: order.code, status: order.status, released: !!parent.owner_release_id } : null,
+    order: order ? { id: order.id, code: order.code, status: order.status, released: !!parent.owner_release_id, locked: !!parent.owner_line_locked_at } : null,
     bom: shapeBom(bom),
     lines: lines.map((l) => shapeLine(l, childBoms.has(l.child_id))),
     unresolvedSelections: lines.filter((l) => l.child_record_kind === 'definition' && l.selection_definition_id).length,
@@ -247,7 +251,10 @@ export async function parentOfLine(db, companyId, lineId) {
 export async function writeLineUpdate(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId);
   const parent = await requireMaster(db, c.companyId, line.parent_id);
-  await assertEditable(db, c.companyId, parent);
+  // Only a new flow still goes through on a locked line (records.flowStillOpen).
+  const flowOnly = input.operationFlowId !== undefined
+    && Object.keys(input).every((k) => k === 'operationFlowId' || input[k] === undefined);
+  await assertEditable(db, c.companyId, parent, { flowOnly });
   if (input.childId !== undefined && Number(input.childId) !== line.child_id) {
     throw invalid('IDENTITY', 'What a line holds cannot change — remove it and add the other one.');
   }

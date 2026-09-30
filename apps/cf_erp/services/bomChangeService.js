@@ -158,9 +158,9 @@ const personal = (e) => Number.isInteger(e?.status) && e.status >= 400 && e.stat
 const problemsOf = (e) => (Array.isArray(e?.problems) && e.problems.length ? e.problems : [e.message]);
 
 /** assertEditable's refusals, as the 409 the contract promises for a frozen structure. */
-async function assertOpen(db, companyId, master) {
+async function assertOpen(db, companyId, master, opts = {}) {
   try {
-    await assertEditable(db, companyId, master);
+    await assertEditable(db, companyId, master, opts);
   } catch (e) {
     if (e instanceof CfError && FROZEN_CODES.has(e.code)) throw conflict(e.code, e.message);
     throw e;
@@ -366,6 +366,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   }
   for (const bomType of touched) allow(bomType);
 
+  // A batch of nothing but flow changes — the one kind a locked line still takes.
+  const flowOnly = changes.length > 0 && changes.every((ch) => ch.op === 'flow');
   if (line) {
     if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
       throw conflict('ORDER_CLOSED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
@@ -374,9 +376,10 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     if (line.release_id) {
       throw conflict('RELEASED', `Line ${line.line_no} of ${line.order_code} was released to production — its structure is frozen. Take the release back, while nothing has started, to change it.`);
     }
-    if (line.locked_at) throw conflict('LOCKED', lockedLineMessage(line.line_no, line.order_code));
+    // Only flows still change on a locked line, until it is released (records.flowStillOpen).
+    if (line.locked_at && !flowOnly) throw conflict('LOCKED', lockedLineMessage(line.line_no, line.order_code));
   }
-  await assertOpen(db, companyId, root);
+  await assertOpen(db, companyId, root, { flowOnly });
 
   // ---- everything that can be checked without writing ---------------------
   const problems = [...shapeProblems];

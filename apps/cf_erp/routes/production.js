@@ -27,6 +27,8 @@
  *
  *   GET    /flows?status=&search=
  *   POST   /flows                        { code, name, description? }
+ *   GET    /flows/cut-plates             { flow } — the flow a NEW cut plate is made by (init.sql §33)
+ *   PUT    /flows/cut-plates             { flowId | null }
  *   GET    /flows/:id                    steps, wait rules, what uses it
  *   PUT    /flows/:id
  *   POST   /flows/:id/status             { status }  draft → active → obsolete
@@ -67,7 +69,7 @@ import {
 } from '../services/operationService.js';
 import {
   listFlows, getFlow, createFlow, updateFlow, setFlowStatus, reviseFlow, deleteFlow,
-  addStep, updateStep, removeStep, addWaitRule, removeWaitRule,
+  addStep, updateStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
 } from '../services/flowService.js';
 import {
   listShifts, createShift, updateShift, deleteShift, copyShifts, listExceptions, createException, deleteException, machineCalendar,
@@ -116,6 +118,9 @@ router.post('/operations/:id/timing', view, handle((req) => timingPreview(pool, 
 
 router.get('/flows', view, handle((req) => listFlows(pool, ctx(req).companyId, req.query)));
 router.post('/flows', manage, handle((req) => tx(req, (db, c) => createFlow(db, c, req.body ?? {}))));
+// Before /flows/:id, which would take 'cut-plates' for an id.
+router.get('/flows/cut-plates', view, handle((req) => getCutPlateFlow(pool, ctx(req).companyId)));
+router.put('/flows/cut-plates', manage, handle((req) => tx(req, (db, c) => setCutPlateFlow(db, c, req.body ?? {}))));
 router.get('/flows/:id', view, handle((req) => getFlow(pool, ctx(req).companyId, id(req))));
 router.put('/flows/:id', manage, handle((req) => tx(req, (db, c) => updateFlow(db, c, id(req), req.body ?? {}))));
 router.post('/flows/:id/status', manage, handle((req) => tx(req, (db, c) => setFlowStatus(db, c, id(req), req.body?.status))));

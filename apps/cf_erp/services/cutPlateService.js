@@ -91,7 +91,7 @@ import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRe
 import { ancestors } from './tree.js';
 import { resolve as resolveSpecs, rawOf, dateText } from './resolutionService.js';
 import { temporaryTree, defaultCandidate } from './instantiationService.js';
-import { requireUsableFlow } from './flowService.js';
+import { requireUsableFlow, cutPlateFlowId } from './flowService.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { readRulesOnce, PLACED, rangesOf } from './codeRangeService.js';
 import { generate } from '../modules/codegen/index.js';
@@ -1178,11 +1178,16 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
   //    (TiDB does not hand AUTO_INCREMENT ids out contiguously); nameAndCode
   //    overwrites every placeholder.
   if (fresh.length) {
+    // How a new cut plate is made: what a revision carried for its rectangle,
+    // else the flow this derive was given, else the house's cut-plate flow
+    // (init.sql §33 — user, 2026-09-30: cutting belongs to the cut plate).
+    // Read only when one of them still needs it; nothing already set changes.
+    const house = flowId == null && fresh.some((x) => x.carriedFlowId == null) ? await cutPlateFlowId(db, companyId) : null;
     const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const marker = (i) => `~cut~${token}~${i}`;
     await insertRows(db, 'cf_master_records',
       ['company_id', 'record_kind', 'code', 'name', 'short_name', 'classification_id', 'status', 'default_flow_id', 'created_by'],
-      fresh.map((x, i) => [companyId, 'item', marker(i), '(pending)', 'CUTPL', places.cutPlate.id, 'draft', x.carriedFlowId ?? flowId ?? null, c.userId]));
+      fresh.map((x, i) => [companyId, 'item', marker(i), '(pending)', 'CUTPL', places.cutPlate.id, 'draft', x.carriedFlowId ?? flowId ?? house, c.userId]));
     const [back] = await db.query('SELECT id, code FROM cf_master_records WHERE company_id = ? AND code LIKE ?', [companyId, `~cut~${token}~%`]);
     const idOf = new Map(back.map((r) => [r.code, r.id]));
     fresh.forEach((x, i) => { x.cp = { id: idOf.get(marker(i)), code: null, name: '(pending)', status: 'draft', classification_id: places.cutPlate.id }; });

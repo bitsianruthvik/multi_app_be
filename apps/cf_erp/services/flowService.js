@@ -388,3 +388,54 @@ export async function requireUsableFlow(db, companyId, id, problems) {
   if (f.status === 'obsolete') { problems.push(`Flow ${f.code} is obsolete.`); return null; }
   return f.id;
 }
+
+/* ===========================================================================
+ * The flow cut plates are made by (init.sql §33)
+ *
+ * User, 2026-09-30: cutting moves to the cut plate — a cut plate is made by a
+ * cutting flow ("CNC Cutting"), and a part's own flow no longer cuts. Cut
+ * plates are made automatically (cutPlateService.refreshCutPieces) with nobody
+ * there to choose a flow, so the house says once which flow a NEW cut plate
+ * takes. A cut plate that already has a flow keeps it.
+ * ======================================================================== */
+
+/** { flow: { id, code, name, status } | null } — what Production › Flows shows. */
+export async function getCutPlateFlow(db, companyId) {
+  const [[row]] = await db.query(
+    `SELECT f.id, f.code, f.name, f.status
+       FROM cf_company_settings s
+       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_plate_flow_id AND f.deleted_at IS NULL
+      WHERE s.company_id = ?`,
+    [companyId],
+  );
+  return { flow: row ? { id: row.id, code: row.code, name: row.name, status: row.status } : null };
+}
+
+/** input: { flowId } — null clears it. */
+export async function setCutPlateFlow(db, c, input = {}) {
+  if (input.flowId === undefined) throw invalid('INVALID', 'Say which flow — flowId, or null for none.');
+  const problems = [];
+  const flowId = input.flowId == null || String(input.flowId).trim() === '' ? null : await requireUsableFlow(db, c.companyId, input.flowId, problems);
+  assertNoProblems(problems);
+  await db.query(
+    `INSERT INTO cf_company_settings (company_id, cut_plate_flow_id, updated_by) VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE cut_plate_flow_id = VALUES(cut_plate_flow_id), updated_by = VALUES(updated_by)`,
+    [c.companyId, flowId, c.userId ?? null],
+  );
+  return getCutPlateFlow(db, c.companyId);
+}
+
+/**
+ * The flow id a new cut plate takes, or null: set, live and not obsolete. One
+ * round trip, asked only when a derive is about to write new cut plates.
+ */
+export async function cutPlateFlowId(db, companyId) {
+  const [[row]] = await db.query(
+    `SELECT f.id FROM cf_company_settings s
+       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_plate_flow_id
+                                AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+      WHERE s.company_id = ?`,
+    [companyId],
+  );
+  return row?.id ?? null;
+}

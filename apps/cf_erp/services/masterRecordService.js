@@ -15,7 +15,7 @@
  */
 import { invalid, conflict, assertNoProblems } from '../lib/errors.js';
 import { ancestors, levelName, loadNode, subtreeIds } from './tree.js';
-import { loadMaster, requireMaster, kindOf, frozenBy, assertNotFrozen } from './records.js';
+import { loadMaster, requireMaster, kindOf, frozenBy, assertNotFrozen, flowStillOpen } from './records.js';
 import { requireLeaf } from './classificationService.js';
 import { resolve, publicResolution, TRACK_DEPTH } from './resolutionService.js';
 import { setValues, materialize, rematerialize, deleteAllForSubject as deleteValues } from './valueService.js';
@@ -192,7 +192,12 @@ export async function createDefinition(db, c, input = {}) {
 
 export async function updateRecord(db, c, id, input = {}) {
   const m = await requireMaster(db, c.companyId, id);
-  assertNotFrozen(m, 'details');
+  // A locked line still takes a new flow — and nothing else — until it is
+  // released (records.flowStillOpen). Any other field in the same save is
+  // refused in the locked line's one sentence.
+  const flowOnly = input.defaultFlowId !== undefined
+    && Object.keys(input).every((k) => k === 'defaultFlowId' || input[k] === undefined);
+  if (!(flowOnly && flowStillOpen(frozenBy(m)))) assertNotFrozen(m, flowOnly ? 'flow' : 'details');
   const problems = [];
   const sets = {};
   const detail = {};

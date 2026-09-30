@@ -3372,3 +3372,30 @@ SELECT DISTINCT rc.role_id, rc.team_id, rc.company_id, rc.app_id, fl.capability_
       WHERE x.capability_id = fl.capability_id AND x.deleted_at IS NULL
         AND x.role_id <=> rc.role_id AND x.team_id <=> rc.team_id
         AND x.company_id <=> rc.company_id AND x.app_id <=> rc.app_id);
+
+-- ===========================================================================
+-- 33. HOUSE SETTINGS — the flow cut plates are made by
+-- ===========================================================================
+--
+-- Decided 2026-09-30: CUTTING belongs to the cut plate. A cut plate is made by
+-- a cutting flow (e.g. "CNC Cutting"), and the part cut from it no longer has a
+-- cutting step. Automatic cut pieces (cutPlateService.refreshCutPieces) make
+-- new cut plates without anybody choosing a flow, so release refused every one
+-- of them ("has no flow — say how it is made"). This row says which flow a NEW
+-- cut plate takes; a flow already set on a cut plate is never overwritten.
+-- Set on Production › Flows ("Cut plates are made by").
+--
+-- One row per company; no row = no default (the old behaviour). A new table,
+-- so no key is added to an existing table in an ALTER (TiDB).
+
+CREATE TABLE IF NOT EXISTS cf_company_settings (
+  company_id         INT       NOT NULL PRIMARY KEY,
+  cut_plate_flow_id  INT       NULL,
+  updated_by         INT       NULL,
+  created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  CONSTRAINT fk_cfcs_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfcs_cut_flow FOREIGN KEY (company_id, cut_plate_flow_id) REFERENCES cf_operation_flows(company_id, id),
+  CONSTRAINT fk_cfcs_updater  FOREIGN KEY (updated_by) REFERENCES users(id)
+);

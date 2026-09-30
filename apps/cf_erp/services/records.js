@@ -100,6 +100,18 @@ export const lockedLineMessage = (lineNo, orderCode) =>
   `Line ${lineNo ?? '?'} of ${orderCode ?? 'its order'} is locked — its structure, values and cut pieces no longer change. A change means a new revision of the order.`;
 
 /**
+ * HOW A THING IS MADE stays open on a locked line until the line is released
+ * (user, 2026-09-30). Lock fixes WHAT is made — structure, codes, quantities,
+ * values, cut pieces — but flows are release's business (rollOutService does
+ * not read them; release refuses a made thing with no flow). A locked line
+ * whose cut plates had no flow could otherwise never be released at all. So a
+ * temporary item's default_flow_id and a BOM line's operation_flow_id still
+ * change while the line is locked, and ONLY those. Released, or on a closed or
+ * revised order: frozen like everything else.
+ */
+export const flowStillOpen = (frozen) => frozen?.reason === 'locked';
+
+/**
  * Values that are material planning, not design. Nesting comes AFTER lock, and
  * holding a rectangle back from the packer (NEST_MANUAL on a cut plate) is part
  * of nesting — so a locked line's items still take these, and only these. A
