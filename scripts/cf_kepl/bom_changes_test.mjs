@@ -729,6 +729,29 @@ try {
     girderLine.items > segmentLine.items && (girderLine.trips - segmentLine.trips) <= 3 * (girderLine.items - segmentLine.items),
     `${girderLine.trips - segmentLine.trips} more round trips for ${girderLine.items - segmentLine.items} more items`);
 
+  // A row's description (the text after the dot in the grid) is a change like
+  // quantity and flow: editable before LOCK, frozen with the rest after it.
+  section('10d. Descriptions: edited in place, copies say so, frozen at lock');
+  t = await look(conn, f);
+  const dLine = flg1().lineId;
+  const d1 = await run([{ op: 'role', lineId: dLine, role: '  Left end  ' }]);
+  eq('a description change says what it did', d1.summary.sentence, '1 description changed');
+  eq('it is saved, trimmed', (await lineRow(conn, dLine)).role, 'Left end');
+  const d1b = await run([{ op: 'role', lineId: dLine, role: 'Left end' }]);
+  eq('the same description again changes nothing', [d1b.summary.counts.role, d1b.summary.counts.unchanged], [0, 1]);
+  const dCopy = await run([{ op: 'paste', sourceLineId: dLine, parentId: seg1().id, quantity: 1 }]);
+  eq('a copy of a described row says it is a copy', (await lineRow(conn, dCopy.results[0].lineId)).role, 'Left end (copy)');
+  const dBad = await refusal(() => run([{ op: 'role', lineId: dLine, role: 'x'.repeat(101) }]));
+  eq('a description over 100 characters is refused', dBad?.status, 422);
+  const dClear = await run([{ op: 'role', lineId: dLine, role: null }]);
+  eq('null clears the description', [(await lineRow(conn, dLine)).role, dClear.summary.counts.role], [null, 1]);
+  const dBoth = await run([{ op: 'role', lineId: dLine, role: 'Mid' }, { op: 'quantity', lineId: dLine, quantity: 2 }]);
+  eq('a description and a quantity on one line are both saved', [(await lineRow(conn, dLine)).role, Number((await lineRow(conn, dLine)).quantity)], ['Mid', 2]);
+  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, f.lineId]);
+  const dLocked = await refusal(() => run([{ op: 'role', lineId: dLine, role: 'After lock' }]));
+  eq('after lock a description is frozen like the rest', [dLocked?.status, dLocked?.code], [409, 'LOCKED']);
+  eq('and nothing was written', (await lineRow(conn, dLine)).role, 'Mid');
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {

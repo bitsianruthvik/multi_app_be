@@ -514,6 +514,49 @@ try {
     back.out.made === true && back.out.summary.removed === 1 && gone[0].deleted_at !== null && (await blankOfPart(conn, f, Bp))[0] === xA,
     JSON.stringify(back.out.summary));
 
+  /* ---- one button: every cut plate with no flow -------------------------------- */
+  section('5b. "Give all cut plates the cutting flow": sets only the ones with none');
+  const [xCnow] = await blankOfPart(conn, f, C);
+  await conn.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE company_id = ? AND id = ?', [COMPANY, xCnow]);
+  const gaps = await CUT.cutPlateFlowGaps(conn, COMPANY, f.lineA.id);
+  ok('the release check can tell: one cut plate has no flow, and the house flow is the laser one',
+    gaps.total === 2 && gaps.missing === 1 && gaps.flow?.id === laserFlow.id, JSON.stringify(gaps));
+  const given = await CUT.setCutPlateFlows(conn, c, f.lineA.id, {});
+  ok('it sets the house flow on the one that had none and counts it', given.count === 1 && given.total === 2 && given.flowId === laserFlow.id, JSON.stringify(given));
+  const afterGive = await flowsOf([xA, xCnow]);
+  eq('the cut plate with no flow took the house flow', afterGive.get(xCnow), laserFlow.id);
+  eq('the one with its own flow kept it', afterGive.get(xA), ownFlow.id);
+  eq('a second press changes nothing: count 0', (await CUT.setCutPlateFlows(conn, c, f.lineA.id, {})).count, 0);
+  eq('and nothing is left without a flow', (await CUT.cutPlateFlowGaps(conn, COMPANY, f.lineA.id)).missing, 0);
+  // A flow named in the request wins over the house's.
+  await conn.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE company_id = ? AND id = ?', [COMPANY, xCnow]);
+  eq('a flow named in the request is used instead of the house flow', (await CUT.setCutPlateFlows(conn, c, f.lineA.id, { flowId: cncFlow.id })).flowId, cncFlow.id);
+  eq('and lands on the cut plate', (await flowsOf([xCnow])).get(xCnow), cncFlow.id);
+  // No house flow and none named: refused in words, nothing written.
+  await FLOWS.setCutPlateFlow(conn, c, { flowId: null });
+  await conn.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE company_id = ? AND id = ?', [COMPANY, xCnow]);
+  const noHouse = await refusal(() => CUT.setCutPlateFlows(conn, c, f.lineA.id, {}));
+  ok('with no cut-plate flow set it says to set one first', noHouse?.code === 'NO_CUT_PLATE_FLOW' && /Set one/.test(noHouse.message), `${noHouse?.code}: ${noHouse?.message}`);
+  eq('and wrote nothing', (await flowsOf([xCnow])).get(xCnow), null);
+  ok('the check then reports no house flow', (await CUT.cutPlateFlowGaps(conn, COMPANY, f.lineA.id)).flow === null);
+  // A locked line still takes a flow (records.flowStillOpen); a released one does not.
+  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, f.lineA.id]);
+  const onLocked = await CUT.setCutPlateFlows(conn, c, f.lineA.id, { flowId: laserFlow.id });
+  eq('on a LOCKED line the flow is still set', onLocked.count, 1);
+  await conn.query(
+    `INSERT INTO cf_production_releases (company_id, order_line_id, status, created_by) VALUES (?, ?, 'released', NULL)`,
+    [COMPANY, f.lineA.id],
+  ).catch(() => null);
+  const [[rel]] = await conn.query('SELECT id FROM cf_production_releases WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, f.lineA.id]);
+  if (rel) {
+    const onReleased = await refusal(() => CUT.setCutPlateFlows(conn, c, f.lineA.id, { flowId: cncFlow.id }));
+    ok('on a RELEASED line it is refused', onReleased?.code === 'RELEASED', `${onReleased?.code}: ${onReleased?.message}`);
+    await conn.query('DELETE FROM cf_production_releases WHERE id = ?', [rel.id]);
+  } else says('(could not fake a release row here — the released refusal is covered by lockOf, shared with derive)');
+  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, f.lineA.id]);
+  await FLOWS.setCutPlateFlow(conn, c, { flowId: laserFlow.id });
+  await conn.query('UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id = ?', [cncFlow.id, COMPANY, xCnow]);
+
   /* ---- guards ------------------------------------------------------------------ */
   section('6. A nested cut piece keeps its plate and quantity');
   const [lot] = await conn.query(

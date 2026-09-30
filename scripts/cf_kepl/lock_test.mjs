@@ -359,6 +359,18 @@ try {
   const lockStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'lock');
   same('on the order\'s process, Lock is ready: nothing in its way, not done yet', [lockStage0?.applies, lockStage0?.state, lockStage0?.blockers?.length], [true, 'partial', 0]);
   says(lockStage0?.detail);
+  // The process was stored as lines, structure, values, cut_pieces, LOCK, NESTING, BUYING, PRODUCTION, confirm; it is read in the order the
+  // dependencies demand: nesting chooses the plates lock needs, release needs a confirmed order, the buy list counts released lines.
+  same('the stages come back in the catalogue order, whatever order they were stored in', procBefore.stages.map((st) => st.stageKey),
+    ['lines', 'structure', 'values', 'cut_pieces', 'nesting', 'lock', 'confirm', 'production', 'buying']);
+  const nestStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'nesting');
+  same('Nesting applies to a line with cut plates even with no NESTING specification, and is not done until a plan is saved', [nestStage0?.applies, nestStage0?.state], [true, 'todo']);
+  says(nestStage0?.detail);
+  const prodStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'production');
+  same('Production says what it waits on: the order has to be confirmed first', [prodStage0?.waitingOn?.stageKey, typeof prodStage0?.waitingOn?.message], ['confirm', 'string']);
+  const confirmStage0 = procBefore.stages.find((st) => st.stageKey === 'confirm');
+  same('Confirm says which earlier stage holds it up', [typeof confirmStage0?.waitingOn?.stageKey, confirmStage0?.waitingOn?.stageKey === 'production'], ['string', false]);
+  ok('the order blockers leave out the stages that come after Confirm', procBefore.blockers.every((b) => !['production', 'buying'].includes(b.stageKey)));
 
   /* ---- 3. lock ------------------------------------------------------------------ */
   section('3. lockLine writes exactly what lockPlan showed, piece for piece');

@@ -129,7 +129,7 @@ import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './tr
 import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
 import { writeLineValues } from './orderValuesService.js';
 
-export const OPS = ['quantity', 'flow', 'remove', 'paste', 'arrange', 'values'];
+export const OPS = ['quantity', 'flow', 'role', 'remove', 'paste', 'arrange', 'values'];
 const MAX_CHANGES = 1000;
 const ID_CHUNK = 500;   // ids per IN list
 const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED', 'LOCKED']);
@@ -220,11 +220,18 @@ function readChanges(raw, problems) {
       c.parentId = needId('parentId');
       c.afterLineId = blank(ch.afterLineId) ? null : needId('afterLineId');
       c.quantity = blank(ch.quantity) ? null : ch.quantity;
+      // What the screen showed the copy as (a description edited but not yet saved on its source); absent = "<source's> (copy)".
+      if (ch.role !== undefined) c.role = ch.role == null ? null : String(ch.role).trim().slice(0, 100) || null;
       if (!c.sourceLineId || !c.parentId || (!blank(ch.afterLineId) && !c.afterLineId)) return;
     } else {
       c.lineId = needId('lineId');
       if (!c.lineId) return;
       if (op === 'quantity') c.quantity = ch.quantity;
+      if (op === 'role') {
+        // The row's description (the text after the dot). Empty clears it.
+        if (ch.role === undefined) { problems.push(`${where}: say the description — role, or null to clear it.`); return; }
+        c.role = ch.role;
+      }
       if (op === 'flow') {
         if (ch.flowId === undefined) { problems.push(`${where}: say which flow — flowId, or null to go back to the usual one.`); return; }
         c.flowId = blank(ch.flowId) ? null : posInt(ch.flowId);
@@ -383,7 +390,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
 
   // ---- everything that can be checked without writing ---------------------
   const problems = [...shapeProblems];
-  const seen = { quantity: new Set(), flow: new Set(), remove: new Set() };
+  const seen = { quantity: new Set(), flow: new Set(), role: new Set(), remove: new Set() };
   const flowIds = new Map(); // flow id -> [labels]
   const pastes = [];
   const updates = [];
@@ -429,6 +436,15 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       const p = quantityProblem(ch.quantity);
       if (p) { problems.push(`${label}: ${p}`); continue; }
       ch.quantity = readQuantity(ch.quantity);
+      updates.push(ch);
+    } else if (ch.op === 'role') {
+      // A description is part of what the row IS on its locked line, so it is
+      // frozen with the rest at LOCK (only flows stay open) — assertOpen above
+      // refuses it there. It never changes a code or a value.
+      const found = [];
+      const role = readRoleText(ch.role, found);
+      if (found.length) { for (const f of found) problems.push(`${label}: ${f}`); continue; }
+      ch.role = role;
       updates.push(ch);
     } else if (ch.op === 'flow') {
       if (ch.flowId != null && (e.node.selection || e.node.kind === 'selection')) { problems.push(`${label}: ${SELECTION_FLOW}`); continue; }
@@ -633,6 +649,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       for (const ch of chs) {
         if (ch.op === 'quantity' && !near(ch.quantity, e.node.quantity)) sets.quantity = ch.quantity;
         if (ch.op === 'flow' && (ch.flowId ?? null) !== savedFlow) sets.operationFlowId = ch.flowId;
+        if (ch.op === 'role' && ch.role !== (e.node.role ?? null)) sets.role = ch.role;
       }
       let ok = true;
       if (Object.keys(sets).length) {
@@ -642,9 +659,11 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       }
       if (!ok) continue;
       for (const ch of chs) {
-        results[ch.index] = ch.op === 'quantity'
-          ? { op: 'quantity', lineId, from: Number(e.node.quantity), to: ch.quantity, changed: sets.quantity !== undefined }
-          : { op: 'flow', lineId, from: savedFlow, to: ch.flowId ?? null, changed: sets.operationFlowId !== undefined };
+        results[ch.index] = ch.op === 'role'
+          ? { op: 'role', lineId, from: e.node.role ?? null, to: ch.role, changed: sets.role !== undefined }
+          : ch.op === 'quantity'
+            ? { op: 'quantity', lineId, from: Number(e.node.quantity), to: ch.quantity, changed: sets.quantity !== undefined }
+            : { op: 'flow', lineId, from: savedFlow, to: ch.flowId ?? null, changed: sets.operationFlowId !== undefined };
       }
     }
 
@@ -710,6 +729,7 @@ function countsOf(results, removes, doomed, removedKeys) {
   return {
     quantity: done.filter((r) => r.op === 'quantity' && r.changed).length,
     flow: done.filter((r) => r.op === 'flow' && r.changed).length,
+    role: done.filter((r) => r.op === 'role' && r.changed).length,
     rearranged: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.reordered, 0),
     moved: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.moved, 0),
     values: done.filter((r) => r.op === 'values').reduce((n, r) => n + r.changed, 0),
@@ -718,7 +738,7 @@ function countsOf(results, removes, doomed, removedKeys) {
     removed: done.filter((r) => r.op === 'remove' && !r.withParent).length,
     // Rows drawn below a removed line that are not removed in their own right.
     removedBeneath: [...doomed].filter((k) => !removedKeys.has(k)).length,
-    unchanged: done.filter((r) => (r.op === 'quantity' || r.op === 'flow') && !r.changed).length,
+    unchanged: done.filter((r) => (r.op === 'quantity' || r.op === 'flow' || r.op === 'role') && !r.changed).length,
     changes: results.length,
   };
 }
@@ -727,6 +747,7 @@ function sentenceOf(k) {
   const bits = [];
   if (k.quantity) bits.push(plural(k.quantity, 'quantity changed', 'quantities changed'));
   if (k.flow) bits.push(plural(k.flow, 'flow changed', 'flows changed'));
+  if (k.role) bits.push(plural(k.role, 'description changed', 'descriptions changed'));
   if (k.rearranged) bits.push(plural(k.rearranged, 'BOM rearranged', 'BOMs rearranged'));
   if (k.moved) bits.push(plural(k.moved, 'row moved to another parent', 'rows moved to another parent'));
   if (k.values) bits.push(plural(k.values, 'value changed', 'values changed'));
@@ -742,6 +763,21 @@ function sentenceOf(k) {
 /* ===========================================================================
  * Paste into a Template or Standard BOM: bomService.addLine, to the same child
  * ======================================================================== */
+
+/** The text of a description, or null when empty; problems go in `problems`. */
+function readRoleText(value, problems) {
+  if (value == null || String(value).trim() === '') return null;
+  const t = String(value).trim();
+  if (t.length > 100) problems.push('A description is up to 100 characters.');
+  return t;
+}
+
+/** A copy's description says it is one: "Girder G1" becomes "Girder G1 (copy)". Nothing to say when there is none. */
+function copyRole(role) {
+  if (role == null || String(role).trim() === '') return null;
+  const t = String(role).trim();
+  return t.endsWith('(copy)') ? t : `${t} (copy)`.slice(0, 100);
+}
 
 async function pasteReference(db, c, ch, afterLineId) {
   const row = ch.source.row;
@@ -862,7 +898,7 @@ async function copyInto(db, c, snap, ch, afterLineId) {
 
   // ---- the top line, into the target's BOM ----------------------------------
   const topChild = ch.mode === 'copy' ? idMap.get(row.child_id) : row.child_id;
-  await insertRows(db, 'cf_bom_lines', LINE_COLUMNS, [[companyId, bom.id, lineNo, topChild, row.design_id, position, row.role, quantity,
+  await insertRows(db, 'cf_bom_lines', LINE_COLUMNS, [[companyId, bom.id, lineNo, topChild, row.design_id, position, ch.role !== undefined ? ch.role : copyRole(row.role), quantity,
     row.selection_definition_id, row.source_line_id, row.operation_flow_id, row.notes, c.userId]]);
   const [[top]] = await db.query(
     'SELECT id FROM cf_bom_lines WHERE company_id = ? AND bom_id = ? AND design_id = ? AND position = ?',

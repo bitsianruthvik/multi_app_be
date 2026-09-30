@@ -26,6 +26,7 @@
 import { invalid, notFound, conflict } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
+import { cutPlateFlowGaps } from './cutPlateService.js';
 import { resolveTiming } from './operationService.js';
 import { estimatorForLine } from './timeEstimateService.js';
 import { cellOwnersOfLine } from './workOrderService.js';
@@ -768,6 +769,19 @@ export async function releaseCheck(db, companyId, lineId) {
   const line = await requireLine(db, companyId, lineId);
   const plan = await planFor(db, companyId, line);
   const nodes = plan.nodes ?? [];
+  // Cut plates with no flow are ONE problem with ONE fix, not one line each:
+  // fold them into a single sentence the dialog can put a button beside.
+  let cutPlatesNoFlow = { missing: 0, flow: null };
+  if (plan.problems.some((p) => p.endsWith(' has no flow — say how it is made.'))) {
+    const gaps = await cutPlateFlowGaps(db, companyId, lineId);
+    if (gaps.missing) {
+      const mine = new Set(gaps.names.map((x) => `${x} has no flow — say how it is made.`));
+      const k = gaps.missing;
+      plan.problems = plan.problems.filter((p) => !mine.has(p));
+      plan.problems.push(`${k} cut plate${k === 1 ? '' : 's'} ${k === 1 ? 'has' : 'have'} no flow — say how ${k === 1 ? 'it is' : 'they are'} made.`);
+      cutPlatesNoFlow = { missing: gaps.missing, flow: gaps.flow };
+    }
+  }
   // Finished work has to land somewhere nameable. When one area is obvious it
   // is offered as the default; when it is not, the screen asks rather than the
   // release failing on the day the last step is recorded.
@@ -786,6 +800,10 @@ export async function releaseCheck(db, companyId, lineId) {
     problems: [...plan.problems, ...codeTrouble],
     finishedArea: finished.area ? { id: finished.area.id, code: finished.area.code, name: finished.area.name, purpose: finished.area.purpose } : null,
     needsFinishedArea: !finished.area,
+    cutPlatesNoFlow,
+    // No active area of the fitting purpose at all: the dialog offers to create one.
+    finishedAreaPurpose: line.order_type === 'stock' ? 'storage' : 'dispatch',
+    noFittingArea: areas.every((a) => a.purpose !== (line.order_type === 'stock' ? 'storage' : 'dispatch')),
     finishedAreaProblem: finished.problem,
     areas,
     summary: {

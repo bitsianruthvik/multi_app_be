@@ -1689,3 +1689,72 @@ export async function withCutPieces(db, c, lineId, out) {
   const cutPieces = await refreshCutPieces(db, c, lineId);
   return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, cutPieces } : out;
 }
+
+// --- the flow of every cut plate of a line -----------------------------------------
+
+/**
+ * Which cut plates of a line have no flow, and the flow the house would give
+ * them. Read-only and silent: a line with nothing to say (a catalog line, no
+ * plate classes) answers zero. Used by the release check so the dialog can
+ * offer ONE button instead of listing one problem per cut plate.
+ * { total, missing, names[], flow: { id, code, name } | null }
+ */
+export async function cutPlateFlowGaps(db, companyId, lineId) {
+  const none = { total: 0, missing: 0, names: [], flow: null };
+  const line = await requireLine(db, companyId, lineId);
+  if (line.line_type !== 'custom' || !line.item_id) return none;
+  const places = await loadPlaces(db, companyId);
+  if (!places.parts || !places.cutPlate || !places.plate) return none;
+  let state;
+  try { state = await survey(db, companyId, line, places); } catch (err) { if (isRefusal(err)) return none; throw err; }
+  if (!state.cutPlates.length) return none;
+  const [rows] = await db.query(
+    'SELECT id, code, name, default_flow_id FROM cf_master_records WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL',
+    [companyId, state.cutPlates.map((cp) => cp.id)],
+  );
+  const bare = rows.filter((r) => r.default_flow_id == null);
+  const [[f]] = await db.query(
+    `SELECT f.id, f.code, f.name FROM cf_company_settings s
+       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_plate_flow_id AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+      WHERE s.company_id = ?`,
+    [companyId],
+  );
+  return {
+    total: rows.length,
+    missing: bare.length,
+    names: bare.flatMap((r) => [r.code, r.name]).filter(Boolean),
+    flow: f ? { id: f.id, code: f.code, name: f.name } : null,
+  };
+}
+
+/**
+ * Gives every cut plate of the line that has NO flow the company's cut-plate
+ * flow (or `flowId`). One set-based UPDATE; a cut plate that already has a flow
+ * keeps it. Allowed on a locked line until it is released (a flow is the one
+ * thing that still changes there — records.flowStillOpen); refused on a
+ * released line or a closed/revised order.
+ * input: { flowId? } — returns { count, total, flow }.
+ */
+export async function setCutPlateFlows(db, c, lineId, input = {}) {
+  const line = await requireLine(db, c.companyId, lineId, { lock: true });
+  const f = lockOf(line);
+  if (f && f.reason !== 'locked') throw invalid(f.code, f.message);
+  const problems = [];
+  let flowId;
+  if (blank(input.flowId)) {
+    flowId = await cutPlateFlowId(db, c.companyId);
+    if (!flowId) throw invalid('NO_CUT_PLATE_FLOW', 'There is no cut-plate flow set. Set one under Production › Flows first, or say which flow.');
+  } else {
+    flowId = await requireUsableFlow(db, c.companyId, input.flowId, problems);
+    if (problems.length) throw invalid('INVALID', 'The flow could not be used.', { problems });
+  }
+  const places = await loadPlaces(db, c.companyId);
+  requirePlaces(places);
+  const state = await survey(db, c.companyId, line, places);
+  if (!state.cutPlates.length) return { count: 0, total: 0, flowId };
+  const [r] = await db.query(
+    'UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL',
+    [flowId, c.companyId, state.cutPlates.map((cp) => cp.id)],
+  );
+  return { count: r.affectedRows, total: state.cutPlates.length, flowId };
+}

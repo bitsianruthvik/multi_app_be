@@ -151,7 +151,11 @@ export const STAGE_CATALOGUE = [
     /** The data knows: the line sells something with a BOM, or built from a template. */
     applies: (ctx) => ctx.hasBom || ctx.fromTemplate,
     state(ctx) {
-      const { tree, unresolved, drafts } = ctx;
+      const { tree, drafts } = ctx;
+      // A cut plate that has not picked its raw plate is not a structure
+      // problem — NESTING chooses the plates — so it is named on its own.
+      const unresolved = ctx.unresolved.filter((x) => !x.underCutPlate);
+      const platesOpen = ctx.unresolved.filter((x) => x.underCutPlate);
       const rows = tree ? tree.stats.nodes - 1 : 0;   // the root is the thing sold, not part of it
       const blockers = [];
       if (rows === 0) {
@@ -173,14 +177,24 @@ export const STAGE_CATALOGUE = [
           message: `${n(drafts.length, 'row')} under line ${ctx.line.line_no} are still drafts — ${nameList(drafts.map(nameOf), 3)}.`,
         });
       }
+      if (platesOpen.length) {
+        blockers.push({
+          count: platesOpen.length,
+          message: `${n(platesOpen.length, 'cut plate')} under line ${ctx.line.line_no} still ${platesOpen.length === 1 ? 'has' : 'have'} no raw plate — Nesting chooses the plates.`,
+        });
+      }
       return {
         state: blockers.length ? 'partial' : 'done',
         detail: unresolved.length
           ? `${n(unresolved.length, 'row')} still to choose an item for — ${nameList(unresolved.map(nameOf))}`
           : drafts.length
             ? `${n(drafts.length, 'row')} still a draft — ${nameList(drafts.map(nameOf))}`
-            : `${n(rows, 'row')}`,
+            : platesOpen.length
+              ? `${n(platesOpen.length, 'cut plate')} still to get a raw plate — Nesting chooses the plates`
+              : `${n(rows, 'row')}`,
         blockers,
+        waitingOn: !unresolved.length && !drafts.length && platesOpen.length
+          ? { stageKey: 'nesting', message: 'Nesting chooses the plates.' } : null,
       };
     },
   },
@@ -238,6 +252,7 @@ export const STAGE_CATALOGUE = [
       const missing = ctx.values.missing.length;
       if (missing) {
         return {
+          waitingOn: { stageKey: 'values', message: `Fill the values first — ${n(missing, 'required value')} still empty.` },
           state: 'todo',
           detail: `Waiting for the values — ${n(missing, 'required value')} still empty. Cut pieces are made automatically as soon as they are complete`,
           blockers: [{
@@ -260,52 +275,16 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
-    key: 'lock',
-    label: 'Lock',
-    description: 'Rolls the structure out into pieces, each with its own code. From then on the structure, values and cut pieces no longer change — a change means a new revision.',
-    /** Only a line built from a template has a structure of its own to roll out. */
-    applies: (ctx) => ctx.line.line_type === 'custom',
-    state(ctx) {
-      if (ctx.lock.lockedAt) return { state: 'done', detail: `Locked — ${n(ctx.lock.pieces, 'piece')}`, blockers: [] };
-      const L = ctx.line.line_no;
-      const blockers = [];
-      const missing = ctx.values.missing;
-      if (missing.length) {
-        const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
-        blockers.push({
-          count: missing.length,
-          message: `Line ${L} cannot be locked while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
-        });
-      }
-      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
-      if (bare.length) {
-        blockers.push({
-          count: bare.length,
-          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
-        });
-      }
-      if (ctx.unresolved.length) {
-        blockers.push({
-          count: ctx.unresolved.length,
-          message: `${n(ctx.unresolved.length, 'row')} under line ${L} still need an item chosen before it can be locked — ${nameList(ctx.unresolved.map(nameOf), 3)}.`,
-        });
-      }
-      return {
-        // Waiting on something is untouched; with nothing in the way, only the act is left.
-        state: blockers.length ? 'todo' : 'partial',
-        detail: blockers.length
-          ? `Not locked — ${n(blockers.length, 'thing')} to settle first`
-          : 'Ready to lock — each piece gets its code when the line is locked',
-        blockers,
-      };
-    },
-  },
-  {
     key: 'nesting',
     label: 'Nesting',
     description: 'Laying parts out on the plates they are cut from.',
-    /** A material under the line answers the NESTING specification with yes. */
-    applies: (ctx) => ctx.nesting.items.length > 0,
+    /**
+     * The line has cut plates to lay out, or a material answers the NESTING
+     * specification with yes. Lock needs every cut plate's raw plate, which
+     * nesting chooses, so a line with cut plates needs this stage whether or
+     * not anybody created a NESTING specification.
+     */
+    applies: (ctx) => ctx.nesting.items.length > 0 || (ctx.nesting.cutPieces ?? 0) > 0 || ctx.cut.parts.length > 0,
     state(ctx) {
       const items = ctx.nesting.items;
       const saved = ctx.nesting.saved;
@@ -352,6 +331,24 @@ export const STAGE_CATALOGUE = [
         };
       }
 
+      const pieces = ctx.nesting.cutPieces ?? 0;
+      if (!items.length) {
+        const missing = ctx.values.missing.length;
+        const waitingOn = pieces === 0
+          ? (missing
+            ? { stageKey: 'values', message: `Fill the values first — ${n(missing, 'required value')} still empty.` }
+            : { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' })
+          : null;
+        return {
+          state: 'todo',
+          detail: pieces ? `${n(pieces, 'cut piece')} to lay out on plates — no plan saved yet` : 'The cut pieces are not made yet — nothing to lay out',
+          blockers: [{
+            count: pieces || 1,
+            message: `Line ${ctx.line.line_no} has cut plates and no nesting plan has been accepted. Nesting chooses the raw plate of every cut plate — lock needs it.`,
+          }],
+          waitingOn,
+        };
+      }
       return {
         state: 'todo',
         detail: `${n(items.length, 'material')} to nest — ${nameList(items.map((i) => i.label))} · no plan saved yet`,
@@ -363,55 +360,57 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
-    key: 'buying',
-    label: 'Buying',
-    description: 'Getting in the material the order consumes but does not make.',
-    /** The line draws material from stock at all — whether or not any is short today. */
-    applies: (ctx) => ctx.material.length > 0,
+    key: 'lock',
+    label: 'Lock',
+    description: 'Rolls the structure out into pieces, each with its own code. From then on the structure, values and cut pieces no longer change — a change means a new revision.',
+    /** Only a line built from a template has a structure of its own to roll out. */
+    applies: (ctx) => ctx.line.line_type === 'custom',
     state(ctx) {
-      const short = ctx.material.filter((m) => m.short > EPS);
-      if (!short.length) {
-        return { state: 'done', detail: `All ${n(ctx.material.length, 'material')} in stock`, blockers: [] };
+      if (ctx.lock.lockedAt) return { state: 'done', detail: `Locked — ${n(ctx.lock.pieces, 'piece')}`, blockers: [] };
+      const L = ctx.line.line_no;
+      const blockers = [];
+      let waitingOn = null;
+      const missing = ctx.values.missing;
+      if (missing.length) {
+        waitingOn = { stageKey: 'values', message: `Fill the values first — ${n(missing.length, 'required value')} still empty.` };
+        const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
+        blockers.push({
+          count: missing.length,
+          message: `Line ${L} cannot be locked while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
+        });
       }
-      const covered = short.filter((m) => m.onOrder + EPS >= m.short);
-      const open = short.filter((m) => m.onOrder + EPS < m.short);
-      const detail = open.length
-        ? `${n(open.length, 'material')} to buy — ${nameList(open.map((m) => `${m.label} short ${round6(m.short - m.onOrder)}`))}`
-        : `${n(covered.length, 'material')} on order`;
-      return {
-        // On order is real progress: somebody has acted, the steel is coming.
-        state: open.length === 0 ? 'partial' : covered.length ? 'partial' : 'todo',
-        detail,
-        blockers: open.length ? [{
-          count: open.length,
-          message: `Line ${ctx.line.line_no} is short of ${n(open.length, 'material')} with nothing on order — ${nameList(open.map((m) => m.label), 3)}.`,
-        }] : [],
-      };
-    },
-  },
-  {
-    key: 'production',
-    label: 'Production',
-    description: 'Releasing to the shop what the order makes rather than buys.',
-    /** Something under the line is made: a temporary item, or a catalog item sourced 'make'. */
-    applies: (ctx) => ctx.made.length > 0,
-    state(ctx) {
-      const { release } = ctx;
-      if (!release) {
-        return {
-          state: 'todo',
-          detail: `${n(ctx.made.length, 'row')} to make — not released yet`,
-          blockers: [{ count: 0, message: `Line ${ctx.line.line_no} is not released to production, so nothing of it is on the floor.` }],
-        };
+      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
+      if (bare.length) {
+        waitingOn ??= { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' };
+        blockers.push({
+          count: bare.length,
+          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
+        });
       }
-      const { steps, doneSteps } = release;
-      if (steps === 0) return { state: 'partial', detail: 'Released, but it has no steps', blockers: [] };
+      const plates = ctx.unresolved.filter((x) => x.underCutPlate);
+      const others = ctx.unresolved.filter((x) => !x.underCutPlate);
+      if (plates.length) {
+        waitingOn ??= { stageKey: 'nesting', message: 'Choose the plates first — Nesting chooses them.' };
+        blockers.push({
+          count: plates.length,
+          message: `${n(plates.length, 'cut plate')} under line ${L} still ${plates.length === 1 ? 'has' : 'have'} no raw plate, so it cannot be locked — Nesting chooses the plates.`,
+        });
+      }
+      if (others.length) {
+        waitingOn ??= { stageKey: 'structure', message: 'Finish the structure first — some rows still need an item.' };
+        blockers.push({
+          count: others.length,
+          message: `${n(others.length, 'row')} under line ${L} still need an item chosen before it can be locked — ${nameList(others.map(nameOf), 3)}.`,
+        });
+      }
       return {
-        state: doneSteps >= steps ? 'done' : 'partial',
-        detail: doneSteps >= steps
-          ? `All ${n(steps, 'step')} finished`
-          : `${doneSteps} of ${n(steps, 'step')} finished`,
-        blockers: [],
+        // Waiting on something is untouched; with nothing in the way, only the act is left.
+        state: blockers.length ? 'todo' : 'partial',
+        detail: blockers.length
+          ? `Not locked — ${n(blockers.length, 'thing')} to settle first`
+          : 'Ready to lock — each piece gets its code when the line is locked',
+        blockers,
+        waitingOn,
       };
     },
   },
@@ -433,6 +432,69 @@ export const STAGE_CATALOGUE = [
         return { state: 'not_applicable', detail: `Order is ${status} — there is nothing left to confirm`, blockers: [] };
       }
       return { state: 'todo', detail: `Order is ${status} — not confirmed yet`, blockers: [] };
+    },
+  },
+  {
+    key: 'production',
+    label: 'Production',
+    description: 'Releasing to the shop what the order makes rather than buys.',
+    /** Something under the line is made: a temporary item, or a catalog item sourced 'make'. */
+    applies: (ctx) => ctx.made.length > 0,
+    state(ctx) {
+      const { release } = ctx;
+      if (!release) {
+        const status = ctx.order.status === 'revised' ? ctx.order.status_before_revised ?? ctx.order.status : ctx.order.status;
+        const confirmed = ['confirmed', 'closed'].includes(status);
+        const mustLock = ctx.line.line_type === 'custom' && !ctx.lock.lockedAt;
+        return {
+          waitingOn: !confirmed ? { stageKey: 'confirm', message: 'Confirm the order first — release needs a confirmed order.' }
+            : mustLock ? { stageKey: 'lock', message: 'Lock the line first — release takes its piece codes from the lock.' } : null,
+          state: 'todo',
+          detail: `${n(ctx.made.length, 'row')} to make — not released yet`,
+          blockers: [{ count: 0, message: `Line ${ctx.line.line_no} is not released to production, so nothing of it is on the floor.` }],
+        };
+      }
+      const { steps, doneSteps } = release;
+      if (steps === 0) return { state: 'partial', detail: 'Released, but it has no steps', blockers: [] };
+      return {
+        state: doneSteps >= steps ? 'done' : 'partial',
+        detail: doneSteps >= steps
+          ? `All ${n(steps, 'step')} finished`
+          : `${doneSteps} of ${n(steps, 'step')} finished`,
+        blockers: [],
+      };
+    },
+  },
+  {
+    key: 'buying',
+    label: 'Buying',
+    description: 'Getting in the material the order consumes but does not make.',
+    /** The line draws material from stock at all — whether or not any is short today. */
+    applies: (ctx) => ctx.material.length > 0,
+    state(ctx) {
+      const short = ctx.material.filter((m) => m.short > EPS);
+      // The buy list counts only RELEASED lines, so a line that is not released
+      // shows nothing there however short it is.
+      const unreleasedHint = short.length && !ctx.release && ctx.made.length > 0
+        ? { stageKey: 'production', message: 'Release the line first — the buy list only counts released lines.' } : null;
+      if (!short.length) {
+        return { state: 'done', detail: `All ${n(ctx.material.length, 'material')} in stock`, blockers: [] };
+      }
+      const covered = short.filter((m) => m.onOrder + EPS >= m.short);
+      const open = short.filter((m) => m.onOrder + EPS < m.short);
+      const detail = open.length
+        ? `${n(open.length, 'material')} to buy — ${nameList(open.map((m) => `${m.label} short ${round6(m.short - m.onOrder)}`))}`
+        : `${n(covered.length, 'material')} on order`;
+      return {
+        // On order is real progress: somebody has acted, the steel is coming.
+        state: open.length === 0 ? 'partial' : covered.length ? 'partial' : 'todo',
+        detail,
+        blockers: open.length ? [{
+          count: open.length,
+          message: `Line ${ctx.line.line_no} is short of ${n(open.length, 'material')} with nothing on order — ${nameList(open.map((m) => m.label), 3)}.`,
+        }] : [],
+        waitingOn: unreleasedHint,
+      };
     },
   },
 ];
@@ -527,6 +589,19 @@ export async function listProcesses(db, companyId) {
   }));
 }
 
+/**
+ * The catalogue's order, applied when a process is READ. Stage order is only a
+ * position (cf_process_stages.sequence), and the real dependencies between
+ * stages are fixed by the code (Lock needs the plates Nesting chooses; Release
+ * needs a confirmed order; the buy list counts released lines), so a process
+ * stored in an older order is shown in the right one without a data fix. A key
+ * this build has never heard of keeps its place after the known ones.
+ */
+export function inCatalogueOrder(stages, keyOf = (s) => s.stageKey) {
+  const rank = (s) => { const i = STAGE_KEYS.indexOf(keyOf(s)); return i < 0 ? STAGE_KEYS.length : i; };
+  return stages.map((s, i) => ({ s, i })).sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i).map((x) => x.s);
+}
+
 export async function getProcess(db, companyId, id) {
   const p = await requireProcess(db, companyId, id);
   const [stages] = await db.query(
@@ -544,7 +619,7 @@ export async function getProcess(db, companyId, id) {
     name: p.name,
     description: p.description,
     status: p.status,
-    stages: stages.map(shapeStage),
+    stages: inCatalogueOrder(stages.map(shapeStage)).map((s, i) => ({ ...s, sequence: i + 1 })),
     rules: rules.get(id) ?? [],
     createdAt: p.created_at,
     updatedAt: p.updated_at,
@@ -1213,10 +1288,18 @@ async function loadOrderContext(db, companyId, order, lines) {
     ? await resolveBooleanSpec(db, companyId, nestSpec.id, chains)
     : new Map();
 
+  // The classification a cut plate is filed under, so a selection hanging off
+  // one can be told from any other unfinished row.
+  const [cutClassRows] = await db.query(
+    "SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = 'CUT_PLATE' AND deleted_at IS NULL",
+    [companyId],
+  );
+  const cutClassIds = new Set(cutClassRows.map((r) => Number(r.id)));
+
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById };
+  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds };
 }
 
 /**
@@ -1248,10 +1331,14 @@ function splitLine(ctx, order, line) {
     lockedBoth: ctx.locksBy.get(line.id)?.bomLines ?? null,
   });
 
-  const consider = (node, count) => {
+  const consider = (node, count, parent = null) => {
     if (node.kind === 'selection' || node.kind === 'template') {
       // A row whose item is still a definition has nothing decided about it.
-      if (node.kind === 'selection') unresolved.push(node);
+      if (node.kind === 'selection') {
+        // Hanging off a cut plate, it is the raw plate nesting has yet to choose.
+        node.underCutPlate = !!parent && ctx.cutClassIds.has(Number(ctx.detail.get(parent.id)?.classification_id));
+        unresolved.push(node);
+      }
       return;
     }
     // A catalog item still in draft is unfinished setup. A row of the line (a
@@ -1262,7 +1349,7 @@ function splitLine(ctx, order, line) {
 
     if (isMade) {
       made.push(node);
-      for (const kid of node.children) consider(kid, round6(kid.quantity * count));
+      for (const kid of node.children) consider(kid, round6(kid.quantity * count), node);
     } else {
       const e = material.get(node.id) ?? { id: node.id, label: nameOf(node), required: 0 };
       e.required = round6(e.required + count);
@@ -1363,6 +1450,7 @@ function stageForLine(stage, kind, ctx, overrideValue) {
       applies: false,
       decidedBy,
       state: 'not_applicable',
+      waitingOn: null,
       detail: declared
         ? `Switched off for ${nameOf(ctx.line)} by ${stage.override_spec_code ?? 'a specification'}`
         : notApplicableDetail(kind.key, ctx),
@@ -1383,6 +1471,9 @@ function stageForLine(stage, kind, ctx, overrideValue) {
       ? `${out.detail} · switched on by ${stage.override_spec_code ?? 'a specification'}`
       : out.detail,
     blockers: (out.blockers ?? []).map((b) => ({ stageKey: kind.key, lineId: ctx.line.id, lineNo: ctx.line.line_no, ...b })),
+    // One line saying what this stage is waiting on, and where to go for it.
+    // Only while the stage is not done.
+    waitingOn: out.state === 'done' ? null : out.waitingOn ?? null,
   };
 }
 
@@ -1396,10 +1487,7 @@ function notApplicableDetail(key, ctx) {
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.
-      if (!ctx.nestSpec) return `No ${NESTING_SPEC_CODE} specification exists here, so nothing can ask to be nested`;
-      return ctx.material.length
-        ? `No material under this line answers ${NESTING_SPEC_CODE} with yes`
-        : 'This line consumes no material to nest';
+      return 'This line has no cut plates and no material to lay out';
     case 'buying': return 'Everything under this line is made, so there is nothing to buy';
     case 'production': return 'Everything under this line comes from stock, so nothing is made';
     default: return 'Not needed for this line';
@@ -1476,6 +1564,7 @@ function rollUp(stage, kind, perLine) {
     state,
     detail,
     blockers: live.flatMap((x) => x.s.blockers),
+    waitingOn: state === 'done' ? null : (worst.s.waitingOn ?? live.find((x) => x.s.waitingOn)?.s.waitingOn ?? null),
   };
 }
 
@@ -1525,7 +1614,6 @@ export async function orderProcess(db, companyId, orderId) {
 
   const stageRows = process.stages
     .slice()
-    .sort((a, b) => a.sequence - b.sequence)
     .map((s) => ({ stage_key: s.stageKey, label: s.label, sequence: s.sequence, requirement: s.requirement, override_spec_id: s.overrideSpec?.id ?? null, override_spec_code: s.overrideSpec?.code ?? null }));
 
   const ctx = await loadOrderContext(db, companyId, order, lines);
@@ -1569,7 +1657,15 @@ export async function orderProcess(db, companyId, orderId) {
 
   // Confirming is the commitment, so every stage before it has to be settled.
   // `confirm` itself is excluded — it is the act, not a precondition of itself.
-  const before = stages.filter((s) => s.stageKey !== 'confirm');
+  // Only what comes BEFORE confirm in the process holds it up: production and
+  // buying follow it (release needs a confirmed order), so they cannot.
+  const confirmAt = stages.findIndex((s) => s.stageKey === 'confirm');
+  const before = confirmAt < 0 ? stages : stages.slice(0, confirmAt);
+  const held = before.find((s) => !satisfied(s));
+  const confirmStage = stages[confirmAt];
+  if (confirmStage && confirmStage.state !== 'done' && held) {
+    confirmStage.waitingOn = { stageKey: held.stageKey, message: `Finish ${held.label} first — ${held.detail}.` };
+  }
   const canConfirm = lines.length > 0
     && before.every(satisfied)
     && ['inquiry', 'quoted', 'draft'].includes(order.status);
@@ -1582,7 +1678,7 @@ export async function orderProcess(db, companyId, orderId) {
     stages,
     nextStage: next?.stageKey ?? null,
     canConfirm,
-    blockers: stages.flatMap((s) => s.blockers),
+    blockers: before.flatMap((s) => s.blockers),
   };
 }
 

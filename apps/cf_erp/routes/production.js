@@ -25,7 +25,7 @@
  *   DELETE /operation-rules/:id
  *   POST   /operations/:id/timing        { machineId, itemId?, quantity?, date? } — how long, and why
  *
- *   GET    /flows?status=&search=
+ *   GET    /flows?status=&search=&operationId=
  *   POST   /flows                        { code, name, description? }
  *   GET    /flows/cut-plates             { flow } — the flow a NEW cut plate is made by (init.sql §33)
  *   PUT    /flows/cut-plates             { flowId | null }
@@ -34,6 +34,7 @@
  *   POST   /flows/:id/status             { status }  draft → active → obsolete
  *   POST   /flows/:id/revise             { revision? }
  *   DELETE /flows/:id
+ *   POST   /flow-steps/:id/move          { direction: 'up' | 'down' } — renumbers in 10s
  *   POST   /flows/:id/steps              { operationId, sequence?, stepName?, notes? }
  *                                        A flow MAY repeat an operation — welded, crane-turned,
  *                                        welded again. The one bar is two steps of the same
@@ -69,7 +70,7 @@ import {
 } from '../services/operationService.js';
 import {
   listFlows, getFlow, createFlow, updateFlow, setFlowStatus, reviseFlow, deleteFlow,
-  addStep, updateStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
+  addStep, updateStep, moveStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
 } from '../services/flowService.js';
 import {
   listShifts, createShift, updateShift, deleteShift, copyShifts, listExceptions, createException, deleteException, machineCalendar,
@@ -128,6 +129,7 @@ router.post('/flows/:id/revise', manage, handle((req) => tx(req, (db, c) => revi
 router.delete('/flows/:id', manage, handle((req) => tx(req, (db, c) => deleteFlow(db, c, id(req)))));
 router.post('/flows/:id/steps', manage, handle((req) => tx(req, (db, c) => addStep(db, c, id(req), req.body ?? {}))));
 router.put('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => updateStep(db, c, id(req), req.body ?? {}))));
+router.post('/flow-steps/:id/move', manage, handle((req) => tx(req, (db, c) => moveStep(db, c, id(req), req.body ?? {}))));
 router.delete('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => removeStep(db, c, id(req)))));
 router.post('/flow-steps/:id/waits', manage, handle((req) => tx(req, (db, c) => addWaitRule(db, c, id(req), req.body ?? {}))));
 router.delete('/flow-waits/:id', manage, handle((req) => tx(req, (db, c) => removeWaitRule(db, c, id(req)))));

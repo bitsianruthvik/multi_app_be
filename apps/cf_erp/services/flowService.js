@@ -78,6 +78,10 @@ export async function listFlows(db, companyId, q = {}) {
     where.push('(f.code LIKE ? OR f.name LIKE ?)');
     params.push(like, like);
   }
+  if (!blank(q.operationId)) {
+    where.push('EXISTS (SELECT 1 FROM cf_operation_flow_steps x WHERE x.company_id = f.company_id AND x.flow_id = f.id AND x.operation_id = ? AND x.deleted_at IS NULL)');
+    params.push(Number(q.operationId));
+  }
   const [rows] = await db.query(
     `SELECT f.*,
             (SELECT COUNT(*) FROM cf_operation_flow_steps s WHERE s.company_id = f.company_id AND s.flow_id = f.id AND s.deleted_at IS NULL) AS step_count,
@@ -86,7 +90,18 @@ export async function listFlows(db, companyId, q = {}) {
        FROM cf_operation_flows f WHERE ${where.join(' AND ')} ORDER BY f.code`,
     params,
   );
-  return rows.map(shapeFlow);
+  // The steps of every listed flow in ONE query, for the "CNC Cutting > Drilling" line.
+  const ids = rows.map((f) => f.id);
+  const [stepRows] = ids.length ? await db.query(
+    `SELECT s.flow_id, s.sequence, s.operation_id, o.code AS operation_code, o.name AS operation_name
+       FROM cf_operation_flow_steps s JOIN cf_operations o ON o.id = s.operation_id
+      WHERE s.company_id = ? AND s.flow_id IN (?) AND s.deleted_at IS NULL ORDER BY s.sequence, s.id`,
+    [companyId, ids],
+  ) : [[]];
+  return rows.map((f) => ({
+    ...shapeFlow(f),
+    steps: stepRows.filter((s) => s.flow_id === f.id).map((s) => ({ sequence: s.sequence, operation: { id: s.operation_id, code: s.operation_code, name: s.operation_name } })),
+  }));
 }
 
 async function stepsOf(db, companyId, flowId) {
@@ -300,15 +315,29 @@ export async function addStep(db, c, flowId, input = {}) {
   return getFlow(db, c.companyId, flowId);
 }
 
-/** input: { sequence?, stepName?, notes? } — the operation of a step does not change; remove it and add another. */
+/** How many live production steps were released from this flow step. */
+async function releasedUses(db, companyId, stepId) {
+  const [[r]] = await db.query('SELECT COUNT(*) AS n FROM cf_production_steps WHERE company_id = ? AND flow_step_id = ? AND deleted_at IS NULL', [companyId, stepId]);
+  return Number(r.n);
+}
+
+/**
+ * input: { operationId?, sequence?, stepName?, notes? }
+ * The operation of a step may change while no released production step was
+ * copied from it (a released tracker keeps what it was released with); after
+ * that, add a step with the other operation instead.
+ */
 export async function updateStep(db, c, stepId, input = {}) {
   const step = await requireStep(db, c.companyId, stepId);
   if (step.flow_status === 'obsolete') throw invalid('OBSOLETE', `${step.flow_code} is obsolete — reactivate it to change its steps.`);
-  if (input.operationId !== undefined && Number(input.operationId) !== step.operation_id) {
-    throw invalid('IDENTITY', 'A step keeps its operation — remove it and add a step with the other one.');
-  }
   const problems = [];
   const sets = {};
+  if (input.operationId !== undefined && Number(input.operationId) !== step.operation_id) {
+    const used = await releasedUses(db, c.companyId, stepId);
+    if (used) throw conflict('STEP_RELEASED', `This step is already in production (${used} released step${used === 1 ? '' : 's'}), so its operation cannot change. Add a new step with the other operation for future orders.`);
+    const op = await requireActiveOperation(db, c.companyId, input.operationId, problems);
+    if (op) sets.operation_id = op.id;
+  }
   if (input.sequence !== undefined) { const n = readSequence(input.sequence, problems); if (n != null) sets.sequence = n; }
   if (input.stepName !== undefined) sets.step_name = blank(input.stepName) ? null : String(input.stepName).trim().slice(0, 100);
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
@@ -318,6 +347,51 @@ export async function updateStep(db, c, stepId, input = {}) {
       [...Object.values(sets), c.companyId, stepId]);
   }
   return getFlow(db, c.companyId, step.flow_id);
+}
+
+/**
+ * Moves a step one place up or down and renumbers the flow in 10s. Steps that
+ * share a number run alongside; that is kept: a step inside a group of several
+ * first steps OUT of the group (into its own number just before/after it), and
+ * a step alone at its number swaps places with the neighbouring number. Wait
+ * rules hang on the step, so they travel with it.
+ * input: { direction: 'up' | 'down' }
+ */
+export async function moveStep(db, c, stepId, input = {}) {
+  const step = await requireStep(db, c.companyId, stepId);
+  if (step.flow_status === 'obsolete') throw invalid('OBSOLETE', `${step.flow_code} is obsolete — reactivate it to change its steps.`);
+  const dir = input.direction;
+  if (dir !== 'up' && dir !== 'down') throw invalid('INVALID', 'Move a step up or down.');
+  const [rows] = await db.query(
+    'SELECT id, sequence FROM cf_operation_flow_steps WHERE company_id = ? AND flow_id = ? AND deleted_at IS NULL ORDER BY sequence, id',
+    [c.companyId, step.flow_id],
+  );
+  const groups = [];
+  for (const r of rows) {
+    const last = groups[groups.length - 1];
+    if (last && last.seq === r.sequence) last.ids.push(r.id); else groups.push({ seq: r.sequence, ids: [r.id] });
+  }
+  const gi = groups.findIndex((g) => g.ids.includes(Number(stepId)));
+  const g = groups[gi];
+  const off = dir === 'up' ? -1 : 1;
+  if (g.ids.length > 1) {
+    g.ids = g.ids.filter((i) => i !== Number(stepId));
+    groups.splice(dir === 'up' ? gi : gi + 1, 0, { seq: 0, ids: [Number(stepId)] });
+  } else if (groups[gi + off]) {
+    [groups[gi], groups[gi + off]] = [groups[gi + off], groups[gi]];
+  }
+  await renumber(db, c.companyId, groups);
+  return getFlow(db, c.companyId, step.flow_id);
+}
+
+/** Groups in order -> sequences 10, 20, 30 …. Two passes so uq_cofs_operation_seq never sees a clash half way. */
+async function renumber(db, companyId, groups) {
+  const all = groups.flatMap((g) => g.ids);
+  if (!all.length) return;
+  await db.query('UPDATE cf_operation_flow_steps SET sequence = sequence + 100000000 WHERE company_id = ? AND id IN (?)', [companyId, all]);
+  for (let i = 0; i < groups.length; i++) {
+    await db.query('UPDATE cf_operation_flow_steps SET sequence = ? WHERE company_id = ? AND id IN (?)', [(i + 1) * 10, companyId, groups[i].ids]);
+  }
 }
 
 export async function removeStep(db, c, stepId) {

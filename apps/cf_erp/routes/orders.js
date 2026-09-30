@@ -16,6 +16,7 @@
  *   GET    /order-lines/:id/structure  the whole structure the line sells
  *   GET    /order-lines/:id/cut-plates the blanks its plate parts are cut from
  *   POST   /order-lines/:id/cut-plates { flowId? } — work them out again; re-runnable
+ *   POST   /order-lines/:id/cut-plates/flow { flowId? } — give every cut plate with no flow the house flow; { count }
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -24,7 +25,7 @@ import {
   listOrders, getOrder, createOrder, updateOrder, setOrderStatus, deleteOrder,
   addOrderLine, updateOrderLine, removeOrderLine, lineStructure,
 } from '../services/salesOrderService.js';
-import { deriveCutPlates, getCutPlates } from '../services/cutPlateService.js';
+import { deriveCutPlates, getCutPlates, setCutPlateFlows } from '../services/cutPlateService.js';
 import { assertLineUnlocked } from '../services/lockService.js';
 import { reviseOrder, discardRevision } from '../services/revisionService.js';
 
@@ -56,5 +57,10 @@ router.post('/order-lines/:id/cut-plates', guard(PERM.orders), handle((req) => t
   await assertLineUnlocked(db, c.companyId, id(req));
   return deriveCutPlates(db, c, id(req), req.body ?? {});
 })));
+
+// One button for "every cut plate of this line has no flow": sets the house's
+// cut-plate flow (or the flow named in the body) on the ones that have none. Still allowed on a
+// locked line until release, like any flow change.
+router.post('/order-lines/:id/cut-plates/flow', guard(PERM.orders), handle((req) => tx(req, (db, c) => setCutPlateFlows(db, c, id(req), req.body ?? {}))));
 
 export default router;
