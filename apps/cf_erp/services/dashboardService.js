@@ -625,10 +625,13 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     db.query(
       `SELECT r.order_id, COALESCE(NULLIF(TRIM(e.note), ''), 'No reason given') AS reason, COUNT(*) AS n
          ${STEP_BASE}
-         LEFT JOIN cf_step_events e ON e.id = (SELECT MAX(e2.id) FROM cf_step_events e2 WHERE e2.company_id = s.company_id AND e2.step_id = s.id AND e2.event = 'hold')
+         LEFT JOIN (SELECT step_id, MAX(id) AS last_id FROM cf_step_events
+                     WHERE company_id = ? AND event = 'hold' GROUP BY step_id) lh ON lh.step_id = s.id
+         LEFT JOIN cf_step_events e ON e.id = lh.last_id
         WHERE s.company_id = ? AND s.deleted_at IS NULL AND s.state = 'on_hold'
         GROUP BY r.order_id, reason`,
-      [companyId],
+      // No subquery in the ON: TiDB refuses one ("ON condition doesn't support subqueries yet").
+      [companyId, companyId],
     ),
     // Material per order and item: needed, issued, reserved on a usable batch, and short
     // for steps not done yet (the tracker's own arithmetic: quantity − issued − usable reservation).
