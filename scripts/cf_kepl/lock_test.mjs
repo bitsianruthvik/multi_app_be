@@ -360,17 +360,17 @@ try {
   same('on the order\'s process, Lock is ready: nothing in its way, not done yet', [lockStage0?.applies, lockStage0?.state, lockStage0?.blockers?.length], [true, 'partial', 0]);
   says(lockStage0?.detail);
   // The process was stored as lines, structure, values, cut_pieces, LOCK, NESTING, BUYING, PRODUCTION, confirm; it is read in the order the
-  // dependencies demand: nesting chooses the plates lock needs, release needs a confirmed order, the buy list counts released lines.
-  same('the stages come back in the catalogue order, whatever order they were stored in', procBefore.stages.map((st) => st.stageKey),
-    ['lines', 'structure', 'values', 'cut_pieces', 'nesting', 'lock', 'confirm', 'production', 'buying']);
+  // dependencies demand (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): freeze, then nesting, then buying, then production — and
+  // confirm is the order's status now, not a stage, so it is dropped.
+  same('the stages come back in the catalogue order, whatever order they were stored in, without confirm', procBefore.stages.map((st) => st.stageKey),
+    ['lines', 'structure', 'values', 'cut_pieces', 'lock', 'nesting', 'buying', 'production']);
   const nestStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'nesting');
   same('Nesting applies to a line with cut plates even with no NESTING specification, and is not done until a plan is saved', [nestStage0?.applies, nestStage0?.state], [true, 'todo']);
   says(nestStage0?.detail);
   const prodStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'production');
-  same('Production says what it waits on: the order has to be confirmed first', [prodStage0?.waitingOn?.stageKey, typeof prodStage0?.waitingOn?.message], ['confirm', 'string']);
-  const confirmStage0 = procBefore.stages.find((st) => st.stageKey === 'confirm');
-  same('Confirm says which earlier stage holds it up', [typeof confirmStage0?.waitingOn?.stageKey, confirmStage0?.waitingOn?.stageKey === 'production'], ['string', false]);
-  ok('the order blockers leave out the stages that come after Confirm', procBefore.blockers.every((b) => !['production', 'buying'].includes(b.stageKey)));
+  same('Production says what it waits on: the header Confirm (no stage key, action confirm)', [prodStage0?.waitingOn?.stageKey, prodStage0?.waitingOn?.action, typeof prodStage0?.waitingOn?.message], [null, 'confirm', 'string']);
+  ok('no stage called confirm is shown', !procBefore.stages.some((st) => st.stageKey === 'confirm'));
+  eq('the order can be confirmed before the design is frozen', procBefore.canConfirm, true);
 
   /* ---- 3. lock ------------------------------------------------------------------ */
   section('3. lockLine writes exactly what lockPlan showed, piece for piece');
@@ -409,7 +409,7 @@ try {
   ok('a second lock is refused', second?.code === 'ALREADY_LOCKED' && /already locked/.test(second?.message ?? ''), second?.message);
   const procAfter = await PROC.orderProcess(conn, COMPANY, A.order.id);
   const lockStage1 = procAfter.lines[0].stages.find((st) => st.stageKey === 'lock');
-  same('the process says it too: Lock is done, "Locked — 50 pieces"', [lockStage1?.state, lockStage1?.detail], ['done', 'Locked — 50 pieces']);
+  same('the process says it too: Lock is done, "Frozen — 50 pieces"', [lockStage1?.state, lockStage1?.detail], ['done', 'Frozen — 50 pieces']);
 
   /* ---- 4. frozen ------------------------------------------------------------------- */
   section('4. A locked line no longer changes — each refusal in the same words');
@@ -545,7 +545,7 @@ try {
   const unlockedCheck = await REL.releaseCheck(conn, COMPANY, lineD.id);
   same('a line not locked: the release check says one thing, lock first', unlockedCheck.problems, [REL.lockFirst({ line_no: lineD.lineNo, order_code: D.code })]);
   const unlockedErr = await refusal(() => REL.releaseLine(conn, c, lineD.id, { finishedAreaId: f.area.id }));
-  ok('and release refuses it', unlockedErr?.code === 'NOT_READY' && (unlockedErr.problems ?? []).some((p) => p.includes('Lock the line first — it comes after the values and cut pieces')), (unlockedErr?.problems ?? []).join(' | '));
+  ok('and release refuses it', unlockedErr?.code === 'NOT_READY' && (unlockedErr.problems ?? []).some((p) => p.includes('Freeze the design first — it comes after the values and cut pieces')), (unlockedErr?.problems ?? []).join(' | '));
 
   await SO.setOrderStatus(conn, c, A.order.id, 'confirmed');
   // A coding rule changed AFTER the lock: it would give every part a new code.

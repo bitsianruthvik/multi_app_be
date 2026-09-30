@@ -44,6 +44,7 @@ import { evaluatedTracker, openReleaseIds, stockFinished } from './releaseServic
 import { operationsForMachine } from './operationService.js';
 import { machineCalendar } from './shiftService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
+import { LEAF_DEPTH, levelName } from './tree.js';
 
 const EPS = 1e-9;
 const round6 = (n) => Number(Number(n).toFixed(6));
@@ -65,7 +66,7 @@ export const DEFAULT_STOP_REASONS = [
 
 /** Every tenant today is in India; a company elsewhere sets cf_floor_settings.timezone. */
 export const DEFAULT_TIMEZONE = process.env.CF_PLANT_TIMEZONE || 'Asia/Kolkata';
-const DAY_SLACK_MS = 12 * 3600000;     // a day entry may reach 12 h either side of its date
+const DAY_TAIL_MS = 12 * 3600000;      // an entry starting in the working day may run 12 h past its end
 const STOP_SINCE_MAX_MS = DAY_MS;      // a live stop may start up to a day back
 
 // --- the plant clock ------------------------------------------------------------
@@ -73,7 +74,7 @@ const STOP_SINCE_MAX_MS = DAY_MS;      // a live stop may start up to a day back
 const zoneCache = new Map();           // companyId -> { tz, until }
 const validZone = (tz) => { try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; } };
 
-async function plantZone(db, companyId) {
+export async function plantZone(db, companyId) {
   const hit = zoneCache.get(companyId);
   if (hit && hit.until > Date.now()) return hit.tz;
   const [[row]] = await db.query('SELECT timezone FROM cf_floor_settings WHERE company_id = ?', [companyId]);
@@ -393,10 +394,32 @@ async function reopenProblems(db, companyId, reopening, { workStepIds = new Set(
 
 // --- reads ------------------------------------------------------------------------
 
-/** GET /floor/machines — every active machine with what it is doing now. 3 reads. */
+/**
+ * The machine type's path, root first, read in the same query as the machines:
+ * one LEFT JOIN per level above the leaf (the tree is at most LEVELS deep).
+ */
+const TYPE_JOINS = Array.from({ length: LEAF_DEPTH }, (_, i) =>
+  `LEFT JOIN cf_classification_nodes a${i + 1} ON a${i + 1}.id = ${i ? `a${i}` : 'n'}.parent_id`).join(' ');
+const TYPE_COLS = ['n', ...Array.from({ length: LEAF_DEPTH }, (_, i) => `a${i + 1}`)]
+  .map((t, i) => `${t}.id AS t${i}_id, ${t}.name AS t${i}_name, ${t}.depth AS t${i}_depth`).join(', ');
+function typePathOf(m) {
+  const path = [];
+  for (let i = 0; i <= LEAF_DEPTH; i++) {
+    if (m[`t${i}_id`] == null) break;
+    path.unshift({ id: m[`t${i}_id`], name: m[`t${i}_name`], depth: Number(m[`t${i}_depth`]), level: levelName(Number(m[`t${i}_depth`])) });
+  }
+  return path;
+}
+
+/**
+ * GET /floor/machines — every active machine with what it is doing now, and its
+ * machine type's path in the classification tree (Family › Subfamily › Variant),
+ * which the picker filters by. 3 reads.
+ */
 export async function listMachines(db, companyId) {
   const [machines] = await db.query(
-    `SELECT m.id, m.code, m.name, n.name AS type_name FROM cf_machines m JOIN cf_classification_nodes n ON n.id = m.classification_id
+    `SELECT m.id, m.code, m.name, n.name AS type_name, ${TYPE_COLS} FROM cf_machines m JOIN cf_classification_nodes n ON n.id = m.classification_id
+      ${TYPE_JOINS}
       WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' ORDER BY m.code`,
     [companyId],
   );
@@ -422,7 +445,7 @@ export async function listMachines(db, companyId) {
     const a = act.get(m.id);
     const st = stopOf.get(m.id);
     return {
-      id: m.id, code: m.code, name: m.name, type: m.type_name,
+      id: m.id, code: m.code, name: m.name, type: m.type_name, typePath: typePathOf(m),
       running: Number(a?.running ?? 0),
       stopped: !!st,
       stopReason: st ? st.label : null,
@@ -709,17 +732,56 @@ function readDate(raw) {
 const addDaysText = (ds, n) => new Date(Date.parse(`${ds}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10);
 
 /**
+ * The machine's WORKING DAY (user, 2026-09-30: "many times they might work later
+ * than the shift so give them a way to put for all 24 hours"). Every date owns
+ * 24 hours, from date 00:00 + an offset that is the same for every date of the
+ * machine, so the days tile time with no gap and no overlap. The offset is 0
+ * (midnight to midnight) unless a shift runs past midnight; then the day starts
+ * where it must — after the latest shift end of the day before, at or before the
+ * earliest shift start — two hours before that start where possible (early
+ * starters), leaving the rest for overtime after the shift. A 22:00–06:00 night
+ * alone gives 20:00 → 20:00; day 08:00–17:00 + night 22:00–06:00 gives 06:00 → 06:00.
+ * Pure: shifts [{ start, end }] as minutes of the day (end ≤ start = past midnight).
+ */
+export function workingDayOffset(shifts) {
+  if (!shifts.length) return 0;
+  const hi = Math.min(...shifts.map((x) => x.start));
+  const lo = Math.max(...shifts.map((x) => x.start + (x.end > x.start ? x.end - x.start : x.end + 1440 - x.start))) - 1440;
+  if (lo <= 0) return 0;                          // nothing crosses midnight
+  if (lo <= hi) return Math.max(lo, hi - 120);
+  return hi;                                      // patterns that cannot share one day: the shifts' own start
+}
+const minuteOfTime = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + m; };
+
+/** The machine's working-day offset (minutes) for a date, from the shifts in effect on it. 1 read. */
+async function machineDayOffset(db, companyId, machineId, ds) {
+  const [rows] = await db.query(
+    `SELECT start_time, end_time FROM cf_machine_shifts WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL
+        AND (effective_from IS NULL OR effective_from <= ?) AND (effective_to IS NULL OR effective_to >= ?)`,
+    [companyId, machineId, ds, ds],
+  );
+  return workingDayOffset(rows.map((r) => ({ start: minuteOfTime(r.start_time), end: minuteOfTime(r.end_time) })));
+}
+
+/**
  * GET /floor/machines/:id/day?date= — the machine's day: its shift windows
  * (a shift belongs to the day it STARTS, so a 22:00–06:00 night is one day),
  * the sessions and stops of that day, what is not recorded (shift time covered
  * by neither, up to now), and the totals in minutes. An entry belongs to the
- * day of the shift window its start falls in (else the first window it meets,
- * else the calendar date it starts on). ~7 reads.
+ * day of the shift window its start falls in, else to the working day (24 h,
+ * see workingDayOffset) its start falls in — work outside the shift is not
+ * refused, it is OVERTIME (totals.overtimeMinutes = work time outside every
+ * shift window of the day). `window` is the working day the bar draws, widened
+ * to cover a shift that sticks out of it. Utilisation stays on shift time. ~7 reads.
  */
 export async function getDay(db, companyId, machineId, date, { tz: tzGiven = null } = {}) {
   const ds = readDate(date);
   const tz = tzGiven ?? await plantZone(db, companyId);
-  const cal = await machineCalendar(db, companyId, Number(machineId), { from: addDaysText(ds, -1), to: addDaysText(ds, 1) });
+  const [cal, offsetMin] = await Promise.all([
+    machineCalendar(db, companyId, Number(machineId), { from: addDaysText(ds, -1), to: addDaysText(ds, 1) }),
+    machineDayOffset(db, companyId, Number(machineId), ds),
+  ]);
+  const offMs = offsetMin * MIN;
   const windows = cal.days.flatMap((d) => d.windows.map((w) => ({ day: d.date, s: wms(`${w.start}:00`), e: wms(`${w.end}:00`), label: w.label, source: w.source })));
   const lo = wallOfWms(wms(`${addDaysText(ds, -1)} 00:00:00`));
   const hi = wallOfWms(wms(`${addDaysText(ds, 2)} 12:00:00`));
@@ -731,16 +793,15 @@ export async function getDay(db, companyId, machineId, date, { tz: tzGiven = nul
   ]);
   const nowW = wms(wallOf(Date.now(), tz));
   const span = (x) => [wms(wallOfDb(x.started_at)), x.ended_at == null ? Math.max(nowW, wms(wallOfDb(x.started_at))) : wms(wallOfDb(x.ended_at))];
-  const dayOf = (s, e) => {
+  const dayOf = (s) => {
     const inside = windows.find((w) => s >= w.s && s < w.e);
-    if (inside) return inside.day;
-    const meets = windows.find((w) => s < w.e && w.s < e);
-    if (meets) return meets.day;
-    return wallOfWms(s).slice(0, 10);
+    return inside ? inside.day : wallOfWms(s - offMs).slice(0, 10);
   };
-  const daySessions = sessions.filter((x) => { const [s, e] = span(x); return dayOf(s, e) === ds; });
-  const dayStops = stops.filter((x) => { const [s, e] = span(x); return dayOf(s, e) === ds; });
+  const daySessions = sessions.filter((x) => dayOf(span(x)[0]) === ds);
+  const dayStops = stops.filter((x) => dayOf(span(x)[0]) === ds);
   const shifts = windows.filter((w) => w.day === ds).sort((a, b) => a.s - b.s);
+  const winS = Math.min(wms(`${ds} 00:00:00`) + offMs, ...shifts.map((w) => w.s));
+  const winE = Math.max(wms(`${ds} 00:00:00`) + offMs + DAY_MS, ...shifts.map((w) => w.e));
 
   // Time covered by ANY entry (of this day or a neighbour's) is recorded.
   const covered = union([...sessions, ...stops].map(span));
@@ -752,11 +813,14 @@ export async function getDay(db, companyId, machineId, date, { tz: tzGiven = nul
   }
   const workU = union(daySessions.map(span));
   const stopU = union(dayStops.map(span));
+  const shiftU = union(shifts.map((w) => [w.s, w.e]));
+  const overtime = workU.reduce((t, iv) => t + total(subtract(iv, shiftU)), 0);
   return {
     machine: cal.machine,
     date: ds,
     timezone: tz,
     now: wallOfWms(nowW).replace(' ', 'T'),
+    window: { start: wallOfWms(winS).replace(' ', 'T'), end: wallOfWms(winE).replace(' ', 'T'), offsetMinutes: offsetMin },
     shifts: shifts.map((w) => ({ start: wallOfWms(w.s).replace(' ', 'T'), end: wallOfWms(w.e).replace(' ', 'T'), label: w.label, source: w.source, minutes: minutesBetween(w.s, w.e) })),
     sessions: daySessions.map((x) => {
       const [s, e] = span(x);
@@ -785,6 +849,7 @@ export async function getDay(db, companyId, machineId, date, { tz: tzGiven = nul
       stopped: minutesBetween(0, total(stopU)),
       notRecorded: notRecorded.reduce((t, g) => t + g.minutes, 0),
       shift: shifts.reduce((t, w) => t + minutesBetween(w.s, w.e), 0),
+      overtimeMinutes: minutesBetween(0, overtime),
     },
   };
 }
@@ -1115,8 +1180,11 @@ export async function putDay(db, c, machineId, input = {}) {
   const deletedIn = Array.isArray(input.deletedRows) ? input.deletedRows : Array.isArray(input.deleted) ? input.deleted : [];
   if (!rowsIn.length && !deletedIn.length) throw invalid('INVALID', 'Nothing to save.');
   const nowW = wms(wallOf(Date.now(), tz));
-  const dayLo = wms(`${ds} 00:00:00`) - DAY_SLACK_MS;
-  const dayHi = wms(`${addDaysText(ds, 1)} 00:00:00`) + DAY_SLACK_MS;
+  // The machine's working day (24 h, all of it open — outside the shift is overtime, not refused).
+  const offMs = (await machineDayOffset(db, c.companyId, machine.id, ds)) * MIN;
+  const dayLo = wms(`${ds} 00:00:00`) + offMs;
+  const dayEnd = dayLo + DAY_MS;
+  const dayHi = dayEnd + DAY_TAIL_MS;
 
   // 1. Shape every row; collect every problem before a single write.
   const problems = [];
@@ -1132,7 +1200,7 @@ export async function putDay(db, c, machineId, input = {}) {
       out.span = [wms(start), wms(end)];
       if (out.span[0] >= out.span[1]) problems.push(`${at}: From must be before To.`);
       if (out.span[1] > nowW + MIN) problems.push(`${at}: it ends in the future.`);
-      if (out.span[0] < dayLo || out.span[1] > dayHi) problems.push(`${at}: it is not on ${ds} (a day entry reaches 12 hours either side of the date).`);
+      if (out.span[0] < dayLo || out.span[0] >= dayEnd || out.span[1] > dayHi) problems.push(`${at}: it is not on ${ds} — this machine's day runs ${hhmmOf(dayLo)} to ${offMs ? `${hhmmOf(dayEnd)} the next day` : '24:00'}.`);
     }
     if (kind === 'work') {
       out.stepId = Number(r.stepId);

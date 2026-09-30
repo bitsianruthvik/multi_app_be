@@ -11,8 +11,9 @@
  *
  * What this writes, per line:
  *   part, part, part  ->  one cut plate (same thickness/length/width/grade)
- *                    ->  its own BOM: the SEL Plate selection, which resolves
- *                        to a real plate item from the catalog.
+ *                    ->  its own BOM: the SEL Plate selection, which NESTING
+ *                        resolves to a real plate item from the catalog (no
+ *                        default plate since 2026-09-30 — "chosen at nesting").
  * A part's line to its cut plate is quantity 1 — one blank per piece of that
  * part. The cut plate's line to the raw plate is the AREA FRACTION, below.
  *
@@ -90,7 +91,7 @@ import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { ancestors } from './tree.js';
 import { resolve as resolveSpecs, rawOf, dateText } from './resolutionService.js';
-import { temporaryTree, defaultCandidate } from './instantiationService.js';
+import { temporaryTree } from './instantiationService.js';
 import { requireUsableFlow, cutPlateFlowId } from './flowService.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { readRulesOnce, PLACED, rangesOf } from './codeRangeService.js';
@@ -506,7 +507,7 @@ async function platesOf(db, companyId, ids) {
 function plateQuantity(size, plate) {
   const blankArea = size.length * size.width;
   if (!plate) {
-    return { quantity: 1, basis: 'unresolved', note: 'No raw plate is chosen yet, so there is no plate area to divide by — this is a placeholder of one plate per blank, not an answer. Choose the plate on the cut plate\'s BOM line.' };
+    return { quantity: 1, basis: 'unresolved', note: 'Plate: chosen at nesting. Until the line is nested there is no plate to divide by, so this 1 is a placeholder, not an answer — nothing is bought from it. A plate can also be chosen by hand on the cut plate\'s BOM line.' };
   }
   const area = (plate.size.length ?? 0) * (plate.size.width ?? 0);
   if (!(area > 0)) {
@@ -587,21 +588,6 @@ function planGroups({ parts, cutPlates, links }) {
 /** The lines of a blank's BOM that are its plate line — the selection's. */
 const ownLines = (lines, selection) => lines.filter((l) => l.selection_definition_id === selection.id || l.design_id === selection.id);
 
-/**
- * Whether reconciling the plate lines needs the selection's default candidate:
- * a new blank takes it on its new line, a blank with no plate line takes it on
- * the line it is given, and a line still holding the selection itself fills
- * it in — unless the line is nesting's.
- */
-function needsDefault(plan, plateLines, selection) {
-  return plan.groups.some((x) => {
-    if (x.isNew) return true;
-    const own = ownLines(plateLines.lines.get(x.cp.id) ?? [], selection);
-    if (!own.length) return true;
-    return !plateLines.nested.has(Number(x.cp.id)) && own[0].child_record_kind !== 'item';
-  });
-}
-
 /** The plates the plan reads: every plate line's plate, and the default candidate. */
 function platesWanted(plan, plateLines, selection, pick) {
   const ids = pick ? [pick.id] : [];
@@ -620,9 +606,11 @@ function platesWanted(plan, plateLines, selection, pick) {
  * somebody put under a cut plate is left alone and reported: this service owns
  * the plate line, not the whole BOM.
  *
- * Still nothing chosen: if the selection has since gained a default, the line
- * takes it, exactly as a line created now would. A plate a PERSON chose is
- * never second-guessed — this only fills a blank in. Laid out by an accepted
+ * Still nothing chosen: the line keeps the selection — "chosen at nesting".
+ * `pick` (the selection's default candidate) is always null since 2026-09-30
+ * (CF_ERP_ORDER_FLOW_PLAN); the path is kept only so a revision's carried
+ * plate is written the same way. A plate a PERSON chose is never
+ * second-guessed. Laid out by an accepted
  * nesting: the plate and the quantity are the nesting's answer — touch neither.
  *
  * `carried` (a revision only — refreshCutPieces' `carry`): per group key, what
@@ -677,7 +665,12 @@ const writes = (plan) => plan.drops.size > 0 || plan.groups.some((x) => x.isNew 
 async function planFor(db, companyId, { line, state, selection, carried = null }) {
   const plateLines = await plateLinesOf(db, companyId, line.id, state.cutPlates.map((cp) => cp.id));
   const plan = planGroups(state);
-  const pick = needsDefault(plan, plateLines, selection) ? await defaultCandidate(db, companyId, selection.id) : null;
+  // NO DEFAULT PLATE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): "how are the cut pieces
+  // showing the plates that happens in the next step of nesting?" A new blank's
+  // plate line holds the SELECTION — chosen at nesting — never the selection's
+  // default candidate. A plate already on a line (chosen by a person, by an
+  // earlier default, or carried by a revision) stays: it acts as a chosen plate.
+  const pick = null;
   const plates = await platesOf(db, companyId, [...platesWanted(plan, plateLines, selection, pick), ...(carried ? [...carried.values()].map((v) => v.plateId) : [])]);
   planPlateLines(plan, plateLines, { selection, pick, plates, carried });
   return plan;
@@ -1351,6 +1344,11 @@ const describe = (cp, size, parts, plateLine) => ({
   plate: plateLine.plate,
   plateQuantity: plateLine.quantity,
   plateQuantityBasis: plateLine.basis,
+  // What the plate column says (CF_ERP_ORDER_FLOW_PLAN): 'at_nesting' — the
+  // line still holds the selection, "chosen at nesting"; 'nested' — an accepted
+  // nest laid it out (getCutPlates adds the lots); 'chosen' — a plate is on the
+  // line, chosen by hand (or by an earlier default, which reads the same).
+  plateState: plateLine.basis === 'nesting' ? 'nested' : plateLine.plate ? 'chosen' : 'at_nesting',
   note: plateLine.note,
   otherLines: plateLine.otherLines,
 });
@@ -1472,13 +1470,9 @@ export async function getCutPlates(db, companyId, orderLineId) {
   if (!lock) {
     try { plan = planGroups(state); } catch (err) { if (!(err instanceof CfError)) throw err; }
   }
-  // The default candidate matters to "up to date" only where a line still
-  // holds the selection itself and nothing else already says it is behind.
-  const behind = plan && (plan.drops.size > 0 || plan.groups.some((x) => x.isNew || x.attachTo.length > 0));
-  const pick = plan && !behind && plan.groups.some((x) => {
-    const own = ownLines(plateLines.lines.get(x.cp.id) ?? [], selection);
-    return own.length && !nested.has(Number(x.cp.id)) && own[0].child_record_kind !== 'item';
-  }) ? await defaultCandidate(db, companyId, selection.id) : null;
+  // No default candidate any more: a plate line still holding the selection is
+  // waiting for nesting, not behind (planFor).
+  const pick = null;
 
   const keepOf = new Map(cutPlates.map((cp) => [cp.id, ownLines(plateLines.lines.get(cp.id) ?? [], selection)[0] ?? null]));
   const plates = await platesOf(db, companyId, [
@@ -1486,6 +1480,25 @@ export async function getCutPlates(db, companyId, orderLineId) {
     ...(pick ? [pick.id] : []),
   ]);
   if (plan) planPlateLines(plan, plateLines, { selection, pick, plates });
+
+  // The nests each nested cut plate sits on, for the plate column ("N-012 · PL-…").
+  // One query, and only when something is nested.
+  const lotsOf = new Map();
+  if (nested.size) {
+    const [lotRows] = await db.query(
+      `SELECT DISTINCT np.cut_plate_id, pl.id, pl.lot_no, m.code AS plate_code, m.name AS plate_name
+         FROM cf_nest_placements np
+         JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
+         LEFT JOIN cf_master_records m ON m.id = pl.plate_item_id
+        WHERE np.company_id = ? AND pl.order_line_id = ? AND np.deleted_at IS NULL AND np.cut_plate_id IN (?)
+        ORDER BY pl.lot_no, pl.id`,
+      [companyId, orderLineId, [...nested]],
+    );
+    for (const r of lotRows) {
+      if (!lotsOf.has(Number(r.cut_plate_id))) lotsOf.set(Number(r.cut_plate_id), []);
+      lotsOf.get(Number(r.cut_plate_id)).push({ id: r.id, lotNo: r.lot_no, plate: { code: r.plate_code, name: r.plate_name } });
+    }
+  }
 
   const partById = new Map(parts.map((p) => [p.id, p]));
   const out = [];
@@ -1499,13 +1512,21 @@ export async function getCutPlates(db, companyId, orderLineId) {
     const fresh = isNested ? { quantity: null, basis: 'nesting', note: NESTED_NOTE } : plateQuantity(cp.size, plate);
     const stored = keep ? round6(Number(keep.quantity)) : null;
     const stale = !isNested && stored != null && Math.abs(stored - fresh.quantity) > 1e-9;
-    out.push(describe(cp, cp.size, mine, {
-      ...fresh,
-      quantity: stored,
-      note: stale ? `${fresh.note ? `${fresh.note} ` : ''}What is written here is ${fmt(stored)}; the area fraction now works out at ${fmt(fresh.quantity)} — work the cut plates out again to bring it up to date.` : fresh.note,
-      plate: brief(plate),
-      otherLines: 0,
-    }));
+    out.push({
+      ...describe(cp, cp.size, mine, {
+        ...fresh,
+        quantity: stored,
+        note: stale ? `${fresh.note ? `${fresh.note} ` : ''}What is written here is ${fmt(stored)}; the area fraction now works out at ${fmt(fresh.quantity)} — work the cut plates out again to bring it up to date.` : fresh.note,
+        plate: brief(plate),
+        otherLines: 0,
+      }),
+      nestLots: lotsOf.get(Number(cp.id)) ?? [],
+      // The first nest it sits on, as the plate column shows it ("N-012 · PL-…");
+      // `lots` says how many nests it is spread over.
+      nest: lotsOf.get(Number(cp.id))?.length
+        ? { nestNo: lotsOf.get(Number(cp.id))[0].lotNo, code: lotsOf.get(Number(cp.id))[0].plate.code ?? null, lots: lotsOf.get(Number(cp.id)).length }
+        : null,
+    });
   }
   const pooled = new Set(links.map((l) => l.part_id));
   const values = !lock && parts.length ? missingValues(await readLineValues(db, companyId, orderLineId), places) : null;

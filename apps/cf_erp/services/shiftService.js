@@ -293,7 +293,7 @@ const cut = (windows, cs, ce) => windows.flatMap((w) => {
  * days out. machineCalendar (one machine) and machinesCalendar (every machine,
  * for the planner) both call it, so the two can never count a day differently.
  */
-function calendarDays(shiftRows, exRows, fromS, toS) {
+export function calendarDays(shiftRows, exRows, fromS, toS) {
   const from = parseDate(fromS);
   const days = Math.round((parseDate(toS) - from) / 86400000) + 1;
   // Day 0 is the evening before `from`: a stoppage on the first morning can cut its night shift.

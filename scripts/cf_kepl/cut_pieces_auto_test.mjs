@@ -455,8 +455,16 @@ try {
   const [[{ n: nameRules }]] = await conn.query("SELECT COUNT(*) AS n FROM cf_code_schemes WHERE company_id = ? AND entity_type = 'item' AND target_field = 'name' AND status = 'active' AND deleted_at IS NULL", [COMPANY]);
   if (Number(nameRules) === 0) eq('and, with no naming rule, named from its size', bA?.name, 'Cut plate 10 × 500 × 3000 E350');
   else ok('and named by the company\'s naming rule', !!bA?.name, bA?.name);
-  near('its plate line holds the default plate at the area fraction: 3000 × 500 of 6000 × 2000', (await plateLine(conn, xA))?.quantity, 0.125);
-  near('and the odd one 2000 × 400 of the same sheet', (await plateLine(conn, xC))?.quantity, 0.066667);
+  // NO DEFAULT PLATE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): the selection has a
+  // default (PL1), and still a new blank's plate line holds the SELECTION —
+  // "chosen at nesting" — at the placeholder quantity 1.
+  const plA = await plateLine(conn, xA);
+  const plC = await plateLine(conn, xC);
+  ok('a new blank\'s plate line holds the plate SELECTION, not the selection\'s default plate', plA?.child_id === f.sel.id && plC?.child_id === f.sel.id, JSON.stringify({ plA, plC, sel: f.sel.id }));
+  near('at the placeholder quantity 1 — nothing is bought from it', plA?.quantity, 1);
+  const cpView = await CUT.getCutPlates(conn, COMPANY, f.lineA.id);
+  ok('the Cut pieces screen says the plate is chosen at nesting', cpView.cutPlates.every((x) => x.plate === null && x.plateState === 'at_nesting' && x.nest === null && /chosen at nesting/.test(x.note ?? '')),
+    JSON.stringify(cpView.cutPlates.map((x) => ({ plate: x.plate, state: x.plateState, note: x.note }))));
   if (f.steelExtras.length) {
     const fromPart = await held(conn, A, f.steelExtras.map((s) => s.code));
     const onBlank = await held(conn, xA, f.steelExtras.map((s) => s.code));
@@ -708,11 +716,13 @@ try {
   eq(`its first derive took the same number of round trips as line A's (${first.trips})`, firstB.trips, first.trips);
   const againB = await refresh(f.lineB.id);
   const againA = await refresh(f.lineA.id);
-  ok(`nothing to change: the same round trips for twelve parts as for three (${againA.trips})`, againB.out.reason === 'up_to_date' && againB.trips === againA.trips,
+  // Line A has a plate chosen by hand by now (one more read, of that plate); line
+  // B's plates are all still "chosen at nesting". Twelve parts must not cost more.
+  ok(`nothing to change: no more round trips for twelve parts than for three (${againA.trips})`, againB.out.reason === 'up_to_date' && againB.trips <= againA.trips,
     `A ${againA.trips}, B ${againB.trips}`);
   const readA = await measured(conn, (db) => CUT.getCutPlates(db, COMPANY, f.lineA.id));
   const readB = await measured(conn, (db) => CUT.getCutPlates(db, COMPANY, f.lineB.id));
-  ok(`the Cut pieces screen: the same round trips for twelve parts as for three (${readA.trips})`, readA.trips === readB.trips && readA.trips <= 20, `A ${readA.trips}, B ${readB.trips}`);
+  ok(`the Cut pieces screen: no more round trips for twelve parts than for three (${readA.trips})`, readB.trips <= readA.trips && readA.trips <= 20, `A ${readA.trips}, B ${readB.trips}`);
   says(`round trips — first derive ${first.trips}, nothing to change ${againA.trips}, the read ${readA.trips}, the explicit derive with nothing to change ${explicit.trips}`);
 } catch (e) {
   failed += 1;

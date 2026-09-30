@@ -42,12 +42,14 @@
  *   3. A STAGE THAT DOES NOT APPLY IS REPORTED, NEVER HIDDEN. A stage that
  *      vanishes leaves somebody wondering whether they forgot it.
  *
- * Nothing here blocks anything except confirmation. `blockers` are things
- * worth knowing before pressing a button, not permission to press it.
+ * Nothing here blocks anything — not even confirmation, since 2026-09-30
+ * (CF_ERP_ORDER_FLOW_PLAN: Confirm is the customer's yes, not a stage).
+ * `blockers` are things worth knowing, not permission to press a button.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { explode } from './bomService.js';
-import { layoutDriftOfLines, driftSentence } from './nestingService.js';
+import { layoutDriftOfLines, driftSentence, FREEZE_FIRST } from './nestingService.js';
+import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
 
@@ -103,6 +105,18 @@ const readSettings = (v) => {
  * line has values to capture / material to source at all, and `state` says
  * whether any of it is outstanding.
  */
+/**
+ * CONFIRM IS NOT A STAGE ANY MORE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30: "how is
+ * lock and confirm different?"). Confirming is the customer's yes — the order's
+ * sales status in the header (Inquiry → Quoted → Confirmed), allowed any time
+ * after lines exist. A process stored with a 'confirm' stage keeps the row
+ * (nothing is deleted); it is simply not shown, and a stage waiting on the
+ * customer's yes says so with action 'confirm' instead of a stage key.
+ */
+export const RETIRED_STAGE_KEYS = new Set(['confirm']);
+const confirmFirst = (message) => ({ stageKey: null, action: 'confirm', message });
+const orderStatusOf = (order) => (order.status === 'revised' ? order.status_before_revised ?? order.status : order.status);
+
 export const STAGE_CATALOGUE = [
   {
     key: 'lines',
@@ -153,9 +167,9 @@ export const STAGE_CATALOGUE = [
     state(ctx) {
       const { tree, drafts } = ctx;
       // A cut plate that has not picked its raw plate is not a structure
-      // problem — NESTING chooses the plates — so it is named on its own.
+      // problem — NESTING chooses the plates, after the freeze — so it is not
+      // counted here at all (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30).
       const unresolved = ctx.unresolved.filter((x) => !x.underCutPlate);
-      const platesOpen = ctx.unresolved.filter((x) => x.underCutPlate);
       const rows = tree ? tree.stats.nodes - 1 : 0;   // the root is the thing sold, not part of it
       const blockers = [];
       if (rows === 0) {
@@ -177,24 +191,14 @@ export const STAGE_CATALOGUE = [
           message: `${n(drafts.length, 'row')} under line ${ctx.line.line_no} are still drafts — ${nameList(drafts.map(nameOf), 3)}.`,
         });
       }
-      if (platesOpen.length) {
-        blockers.push({
-          count: platesOpen.length,
-          message: `${n(platesOpen.length, 'cut plate')} under line ${ctx.line.line_no} still ${platesOpen.length === 1 ? 'has' : 'have'} no raw plate — Nesting chooses the plates.`,
-        });
-      }
       return {
         state: blockers.length ? 'partial' : 'done',
         detail: unresolved.length
           ? `${n(unresolved.length, 'row')} still to choose an item for — ${nameList(unresolved.map(nameOf))}`
           : drafts.length
             ? `${n(drafts.length, 'row')} still a draft — ${nameList(drafts.map(nameOf))}`
-            : platesOpen.length
-              ? `${n(platesOpen.length, 'cut plate')} still to get a raw plate — Nesting chooses the plates`
-              : `${n(rows, 'row')}`,
+            : `${n(rows, 'row')}`,
         blockers,
-        waitingOn: !unresolved.length && !drafts.length && platesOpen.length
-          ? { stageKey: 'nesting', message: 'Nesting chooses the plates.' } : null,
       };
     },
   },
@@ -275,14 +279,65 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
+    key: 'lock',
+    label: 'Freeze design',
+    description: 'Gives out the piece codes: the structure is rolled out into pieces, each with its own code. From then on only the flows change (until release) — any other change means a new revision. It does not need the plates: nesting chooses them afterwards.',
+    /** Only a line built from a template has a structure of its own to roll out. */
+    applies: (ctx) => ctx.line.line_type === 'custom',
+    state(ctx) {
+      if (ctx.lock.lockedAt) return { state: 'done', detail: `Frozen — ${n(ctx.lock.pieces, 'piece')}`, blockers: [] };
+      const L = ctx.line.line_no;
+      const blockers = [];
+      let waitingOn = null;
+      const missing = ctx.values.missing;
+      if (missing.length) {
+        waitingOn = { stageKey: 'values', message: `Fill the values first — ${n(missing.length, 'required value')} still empty.` };
+        const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
+        blockers.push({
+          count: missing.length,
+          message: `Line ${L}'s design cannot be frozen while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
+        });
+      }
+      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
+      if (bare.length) {
+        waitingOn ??= { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' };
+        blockers.push({
+          count: bare.length,
+          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
+        });
+      }
+      // A cut plate's raw plate still to be chosen does NOT hold the freeze
+      // (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): nesting chooses it, after.
+      const others = ctx.unresolved.filter((x) => !x.underCutPlate);
+      if (others.length) {
+        waitingOn ??= { stageKey: 'structure', message: 'Finish the structure first — some rows still need an item.' };
+        blockers.push({
+          count: others.length,
+          message: `${n(others.length, 'row')} under line ${L} still need an item chosen before its design can be frozen — ${nameList(others.map(nameOf), 3)}.`,
+        });
+      }
+      return {
+        // Waiting on something is untouched; with nothing in the way, only the act is left.
+        state: blockers.length ? 'todo' : 'partial',
+        detail: blockers.length
+          ? `Not frozen — ${n(blockers.length, 'thing')} to settle first`
+          : 'Ready to freeze — each piece gets its code when the design is frozen',
+        blockers,
+        waitingOn,
+      };
+    },
+  },
+  {
     key: 'nesting',
     label: 'Nesting',
     description: 'Laying parts out on the plates they are cut from.',
     /**
      * The line has cut plates to lay out, or a material answers the NESTING
-     * specification with yes. Lock needs every cut plate's raw plate, which
-     * nesting chooses, so a line with cut plates needs this stage whether or
-     * not anybody created a NESTING specification.
+     * specification with yes. Buying and release need every cut plate's raw
+     * plate, which nesting chooses, so a line with cut plates needs this stage
+     * whether or not anybody created a NESTING specification. It comes AFTER
+     * the freeze (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): it lays out the frozen
+     * pieces, and nestingService refuses a line that is not frozen.
      */
     applies: (ctx) => ctx.nesting.items.length > 0 || (ctx.nesting.cutPieces ?? 0) > 0 || ctx.cut.parts.length > 0,
     state(ctx) {
@@ -332,6 +387,19 @@ export const STAGE_CATALOGUE = [
       }
 
       const pieces = ctx.nesting.cutPieces ?? 0;
+      // Not frozen: nothing can be laid out yet, whatever else is missing — the
+      // freeze stage says what IT waits on.
+      if (ctx.line.line_type === 'custom' && !ctx.lock.lockedAt) {
+        return {
+          state: 'todo',
+          detail: pieces ? `${n(pieces, 'cut piece')} to lay out once the design is frozen` : 'Waiting for the design to be frozen',
+          blockers: [{
+            count: pieces || 1,
+            message: `Line ${ctx.line.line_no}'s design is not frozen yet — nesting lays out the frozen pieces.`,
+          }],
+          waitingOn: { stageKey: 'lock', message: FREEZE_FIRST },
+        };
+      }
       if (!items.length) {
         const missing = ctx.values.missing.length;
         const waitingOn = pieces === 0
@@ -344,7 +412,7 @@ export const STAGE_CATALOGUE = [
           detail: pieces ? `${n(pieces, 'cut piece')} to lay out on plates — no plan saved yet` : 'The cut pieces are not made yet — nothing to lay out',
           blockers: [{
             count: pieces || 1,
-            message: `Line ${ctx.line.line_no} has cut plates and no nesting plan has been accepted. Nesting chooses the raw plate of every cut plate — lock needs it.`,
+            message: `Line ${ctx.line.line_no} has cut plates and no nesting plan has been accepted. Nesting chooses the raw plate of every cut plate — buying and release need it.`,
           }],
           waitingOn,
         };
@@ -360,95 +428,93 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
-    key: 'lock',
-    label: 'Lock',
-    description: 'Rolls the structure out into pieces, each with its own code. From then on the structure, values and cut pieces no longer change — a change means a new revision.',
-    /** Only a line built from a template has a structure of its own to roll out. */
-    applies: (ctx) => ctx.line.line_type === 'custom',
+    key: 'buying',
+    label: 'Buying',
+    description: 'Getting in the material the order consumes but does not make — before production, once the order is confirmed and the design frozen (and nested).',
+    /** The line draws material from stock at all — whether or not any is short today. */
+    applies: (ctx) => ctx.material.length > 0 || ctx.buyRows.length > 0,
     state(ctx) {
-      if (ctx.lock.lockedAt) return { state: 'done', detail: `Locked — ${n(ctx.lock.pieces, 'piece')}`, blockers: [] };
-      const L = ctx.line.line_no;
-      const blockers = [];
-      let waitingOn = null;
-      const missing = ctx.values.missing;
-      if (missing.length) {
-        waitingOn = { stageKey: 'values', message: `Fill the values first — ${n(missing.length, 'required value')} still empty.` };
-        const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
-        blockers.push({
-          count: missing.length,
-          message: `Line ${L} cannot be locked while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
-        });
+      /*
+       * BUYING COMES BEFORE PRODUCTION (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30):
+       * "Buying should happen before production na?" It waits on three things,
+       * in this order: the customer's yes (nothing is bought for an inquiry),
+       * the frozen design (the material is read off the frozen pieces) and,
+       * where a cut plate still has no plate, the nest. After that the numbers
+       * are the buy list's own: a released line's requirements, or a frozen
+       * line's planned material (releaseService.plannedMaterialOfLines).
+       */
+      if (!ctx.confirmed) {
+        return {
+          state: 'todo',
+          detail: 'Waiting for the order to be confirmed — nothing is bought for an inquiry',
+          blockers: [],
+          waitingOn: confirmFirst('Confirm the order first — nothing is bought for an inquiry.'),
+        };
       }
-      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
-      if (bare.length) {
-        waitingOn ??= { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' };
-        blockers.push({
-          count: bare.length,
-          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
-        });
+      if (ctx.line.line_type === 'custom' && !ctx.lock.lockedAt) {
+        return {
+          state: 'todo',
+          detail: 'Waiting for the design to be frozen — the material is read off the frozen pieces',
+          blockers: [],
+          waitingOn: { stageKey: 'lock', message: 'Freeze the design first — the buy list takes its material from the frozen pieces.' },
+        };
       }
-      const plates = ctx.unresolved.filter((x) => x.underCutPlate);
-      const others = ctx.unresolved.filter((x) => !x.underCutPlate);
-      if (plates.length) {
-        waitingOn ??= { stageKey: 'nesting', message: 'Choose the plates first — Nesting chooses them.' };
-        blockers.push({
-          count: plates.length,
-          message: `${n(plates.length, 'cut plate')} under line ${L} still ${plates.length === 1 ? 'has' : 'have'} no raw plate, so it cannot be locked — Nesting chooses the plates.`,
-        });
+      if (!ctx.release && ctx.planned && !ctx.planned.ready) {
+        const k = ctx.planned.openPlates;
+        return {
+          state: 'todo',
+          detail: `Waiting for nesting — ${n(k, 'cut plate')} ${k === 1 ? 'has' : 'have'} no plate yet, so there is nothing to buy for ${k === 1 ? 'it' : 'them'}`,
+          blockers: [],
+          waitingOn: { stageKey: 'nesting', message: `Nest the line first — ${n(k, 'cut plate')} ${k === 1 ? 'has' : 'have'} no plate yet.` },
+        };
       }
-      if (others.length) {
-        waitingOn ??= { stageKey: 'structure', message: 'Finish the structure first — some rows still need an item.' };
-        blockers.push({
-          count: others.length,
-          message: `${n(others.length, 'row')} under line ${L} still need an item chosen before it can be locked — ${nameList(others.map(nameOf), 3)}.`,
-        });
+      const rows = ctx.buyRows;
+      if (!rows.length) return { state: 'done', detail: 'Nothing to buy', blockers: [] };
+      // Covered = held for the line, free in stock, or on order. On order counts:
+      // the plan's "done when every material is covered (held / free / on order)".
+      const open = rows.filter((m) => m.held + m.free + m.onOrder + EPS < m.required);
+      const onOrderOnly = rows.filter((m) => m.held + m.free + EPS < m.required && m.held + m.free + m.onOrder + EPS >= m.required);
+      // A catalog line has no freeze, so the buy list counts it once it is released.
+      const unreleasedHint = open.length && ctx.buySource === 'estimate' && !ctx.release && ctx.made.length > 0
+        ? { stageKey: 'production', message: 'Release the line first — the buy list counts this line once it is released.' } : null;
+      if (!open.length) {
+        return {
+          state: 'done',
+          detail: onOrderOnly.length
+            ? `All ${n(rows.length, 'material')} covered — ${onOrderOnly.length} on order`
+            : `All ${n(rows.length, 'material')} held or in stock`,
+          blockers: [],
+        };
       }
+      const short = (m) => round6(m.required - m.held - m.free - m.onOrder);
       return {
-        // Waiting on something is untouched; with nothing in the way, only the act is left.
-        state: blockers.length ? 'todo' : 'partial',
-        detail: blockers.length
-          ? `Not locked — ${n(blockers.length, 'thing')} to settle first`
-          : 'Ready to lock — each piece gets its code when the line is locked',
-        blockers,
-        waitingOn,
+        state: open.length < rows.length ? 'partial' : 'todo',
+        detail: `${n(open.length, 'material')} to buy — ${nameList(open.map((m) => `${m.label} short ${short(m)}`))}`,
+        blockers: [{
+          count: open.length,
+          message: `Line ${ctx.line.line_no} is short of ${n(open.length, 'material')} with nothing on order — ${nameList(open.map((m) => m.label), 3)}.`,
+        }],
+        waitingOn: unreleasedHint,
       };
-    },
-  },
-  {
-    key: 'confirm',
-    label: 'Confirm',
-    description: 'The commitment: the order leaves the office and becomes a job.',
-    /** Always: every order is either confirmed or waiting to be. */
-    always: true,
-    applies: () => true,
-    state(ctx) {
-      // A revised order (init.sql §27) is kept as it was, so it answers as it
-      // stood when a later revision replaced it.
-      const status = ctx.order.status === 'revised' ? ctx.order.status_before_revised ?? ctx.order.status : ctx.order.status;
-      // Confirmation is one act on the whole order, so every line reports the
-      // same answer. That is not a defect: a line cannot be half-committed.
-      if (['confirmed', 'closed'].includes(status)) return { state: 'done', detail: `Order is ${status}`, blockers: [] };
-      if (['lost', 'cancelled'].includes(status)) {
-        return { state: 'not_applicable', detail: `Order is ${status} — there is nothing left to confirm`, blockers: [] };
-      }
-      return { state: 'todo', detail: `Order is ${status} — not confirmed yet`, blockers: [] };
     },
   },
   {
     key: 'production',
     label: 'Production',
-    description: 'Releasing to the shop what the order makes rather than buys.',
+    description: 'Releasing to the shop what the order makes rather than buys. Needs a confirmed order and a frozen design; the steps wait for their material.',
     /** Something under the line is made: a temporary item, or a catalog item sourced 'make'. */
     applies: (ctx) => ctx.made.length > 0,
     state(ctx) {
       const { release } = ctx;
       if (!release) {
-        const status = ctx.order.status === 'revised' ? ctx.order.status_before_revised ?? ctx.order.status : ctx.order.status;
-        const confirmed = ['confirmed', 'closed'].includes(status);
-        const mustLock = ctx.line.line_type === 'custom' && !ctx.lock.lockedAt;
+        const mustFreeze = ctx.line.line_type === 'custom' && !ctx.lock.lockedAt;
+        const openPlates = ctx.planned && !ctx.planned.ready ? ctx.planned.openPlates : 0;
         return {
-          waitingOn: !confirmed ? { stageKey: 'confirm', message: 'Confirm the order first — release needs a confirmed order.' }
-            : mustLock ? { stageKey: 'lock', message: 'Lock the line first — release takes its piece codes from the lock.' } : null,
+          // Not buying: release does not wait for the steel — its steps do.
+          waitingOn: !ctx.confirmed ? confirmFirst('Confirm the order first — release needs a confirmed order.')
+            : mustFreeze ? { stageKey: 'lock', message: 'Freeze the design first — release takes its piece codes from the frozen design.' }
+              : openPlates ? { stageKey: 'nesting', message: `Nest the line first — ${n(openPlates, 'cut plate')} ${openPlates === 1 ? 'has' : 'have'} no plate yet.` }
+                : null,
           state: 'todo',
           detail: `${n(ctx.made.length, 'row')} to make — not released yet`,
           blockers: [{ count: 0, message: `Line ${ctx.line.line_no} is not released to production, so nothing of it is on the floor.` }],
@@ -462,38 +528,6 @@ export const STAGE_CATALOGUE = [
           ? `All ${n(steps, 'step')} finished`
           : `${doneSteps} of ${n(steps, 'step')} finished`,
         blockers: [],
-      };
-    },
-  },
-  {
-    key: 'buying',
-    label: 'Buying',
-    description: 'Getting in the material the order consumes but does not make.',
-    /** The line draws material from stock at all — whether or not any is short today. */
-    applies: (ctx) => ctx.material.length > 0,
-    state(ctx) {
-      const short = ctx.material.filter((m) => m.short > EPS);
-      // The buy list counts only RELEASED lines, so a line that is not released
-      // shows nothing there however short it is.
-      const unreleasedHint = short.length && !ctx.release && ctx.made.length > 0
-        ? { stageKey: 'production', message: 'Release the line first — the buy list only counts released lines.' } : null;
-      if (!short.length) {
-        return { state: 'done', detail: `All ${n(ctx.material.length, 'material')} in stock`, blockers: [] };
-      }
-      const covered = short.filter((m) => m.onOrder + EPS >= m.short);
-      const open = short.filter((m) => m.onOrder + EPS < m.short);
-      const detail = open.length
-        ? `${n(open.length, 'material')} to buy — ${nameList(open.map((m) => `${m.label} short ${round6(m.short - m.onOrder)}`))}`
-        : `${n(covered.length, 'material')} on order`;
-      return {
-        // On order is real progress: somebody has acted, the steel is coming.
-        state: open.length === 0 ? 'partial' : covered.length ? 'partial' : 'todo',
-        detail,
-        blockers: open.length ? [{
-          count: open.length,
-          message: `Line ${ctx.line.line_no} is short of ${n(open.length, 'material')} with nothing on order — ${nameList(open.map((m) => m.label), 3)}.`,
-        }] : [],
-        waitingOn: unreleasedHint,
       };
     },
   },
@@ -569,7 +603,8 @@ export async function listProcesses(db, companyId) {
   const [rows] = await db.query(
     `SELECT p.*,
             (SELECT COUNT(*) FROM cf_process_stages s
-              WHERE s.company_id = p.company_id AND s.process_id = p.id AND s.deleted_at IS NULL) AS stage_count
+              WHERE s.company_id = p.company_id AND s.process_id = p.id AND s.deleted_at IS NULL
+                AND s.stage_key NOT IN ('confirm')) AS stage_count
        FROM cf_processes p
       WHERE p.company_id = ? AND p.deleted_at IS NULL
       ORDER BY p.status = 'obsolete', p.code`,
@@ -592,8 +627,9 @@ export async function listProcesses(db, companyId) {
 /**
  * The catalogue's order, applied when a process is READ. Stage order is only a
  * position (cf_process_stages.sequence), and the real dependencies between
- * stages are fixed by the code (Lock needs the plates Nesting chooses; Release
- * needs a confirmed order; the buy list counts released lines), so a process
+ * stages are fixed by the code (Nesting lays out the frozen design; Buying needs
+ * a confirmed order and a frozen, nested line; Release needs a confirmed order
+ * and a frozen design — CF_ERP_ORDER_FLOW_PLAN, 2026-09-30), so a process
  * stored in an older order is shown in the right one without a data fix. A key
  * this build has never heard of keeps its place after the known ones.
  */
@@ -619,7 +655,8 @@ export async function getProcess(db, companyId, id) {
     name: p.name,
     description: p.description,
     status: p.status,
-    stages: inCatalogueOrder(stages.map(shapeStage)).map((s, i) => ({ ...s, sequence: i + 1 })),
+    // A retired kind (confirm) is kept in the table and left out here.
+    stages: inCatalogueOrder(stages.filter((s) => !RETIRED_STAGE_KEYS.has(s.stage_key)).map(shapeStage)).map((s, i) => ({ ...s, sequence: i + 1 })),
     rules: rules.get(id) ?? [],
     createdAt: p.created_at,
     updatedAt: p.updated_at,
@@ -682,7 +719,7 @@ export async function setProcessStatus(db, c, id, status) {
     // An empty process would stamp itself on orders and then say nothing about
     // them, which looks exactly like a broken screen.
     const [[{ n: stages }]] = await db.query(
-      'SELECT COUNT(*) AS n FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL',
+      "SELECT COUNT(*) AS n FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN ('confirm')",
       [c.companyId, id],
     );
     if (!Number(stages)) throw invalid('NO_STAGES', `${p.code} has no stages — add some before activating it.`);
@@ -738,8 +775,11 @@ export async function deleteProcess(db, c, id) {
  */
 export async function replaceStages(db, c, processId, input = {}) {
   const p = await requireProcess(db, c.companyId, processId, { lock: true });
-  const list = Array.isArray(input.stages) ? input.stages : null;
-  if (!list) throw invalid('INVALID', 'Send the stages as a list, in the order they are worked.');
+  const given = Array.isArray(input.stages) ? input.stages : null;
+  if (!given) throw invalid('INVALID', 'Send the stages as a list, in the order they are worked.');
+  // 'confirm' is no longer a stage (RETIRED_STAGE_KEYS): an older screen or
+  // script that still sends it is not refused — the entry is simply dropped.
+  const list = given.filter((s) => !RETIRED_STAGE_KEYS.has(String(s?.stageKey ?? s?.stage_key ?? '').trim()));
 
   const problems = [];
   const seen = new Set();
@@ -814,7 +854,17 @@ export async function replaceStages(db, c, processId, input = {}) {
   }
   assertNoProblems(problems, `The stages of ${p.code} need attention.`);
 
-  await db.query('UPDATE cf_process_stages SET deleted_at = NOW() WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL', [c.companyId, processId]);
+  // A stored 'confirm' row is KEPT (nothing about it is deleted): it only moves
+  // out of the way of the new sequence numbers, which it could otherwise clash
+  // with on uq_cps_seq.
+  await db.query(
+    "UPDATE cf_process_stages SET deleted_at = NOW() WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN ('confirm')",
+    [c.companyId, processId],
+  );
+  await db.query(
+    "UPDATE cf_process_stages SET sequence = 100000 + id WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key IN ('confirm') AND sequence < 100000",
+    [c.companyId, processId],
+  );
   for (const r of rows) {
     await db.query(
       `INSERT INTO cf_process_stages (company_id, process_id, stage_key, sequence, label, requirement, override_spec_id, settings)
@@ -1299,7 +1349,55 @@ async function loadOrderContext(db, companyId, order, lines) {
   const labelOf = (id) => nameOf(detail.get(id));
   const values = await missingRequiredValues(db, companyId, chains);
 
-  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds };
+  // 7. What Buying counts (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30) — the buy list's
+  //    own numbers: a frozen line not released has its PLANNED material (the
+  //    requirements release will write, in bulk — 3 round trips for any number
+  //    of lines) and whether it is ready (no cut plate still without a plate);
+  //    a released line has its requirements, with what is held for them.
+  const planned = await plannedMaterialOfLines(db, companyId,
+    lines.filter((l) => l.locked_at && !releases.has(l.id) && l.item_id));
+  const releasedIds = [...releases.values()].map((r) => r.id);
+  const [reqRows] = releasedIds.length ? await db.query(
+    `SELECT r.order_line_id, q.item_id, m.code, m.name,
+            SUM(GREATEST(q.quantity - q.issued, 0)) AS wanted, SUM(COALESCE(v.held, 0)) AS held
+       FROM cf_material_requirements q
+       JOIN cf_production_releases r ON r.id = q.release_id
+       JOIN cf_master_records m ON m.id = q.item_id
+       LEFT JOIN (SELECT v.requirement_id, SUM(v.quantity) AS held
+                    FROM cf_stock_reservations v
+                    JOIN cf_material_requirements q2 ON q2.id = v.requirement_id AND q2.release_id IN (?)
+                   WHERE v.company_id = ? AND v.status = 'active' AND v.deleted_at IS NULL
+                   GROUP BY v.requirement_id) v ON v.requirement_id = q.id
+      WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL
+      GROUP BY r.order_line_id, q.item_id, m.code, m.name
+      ORDER BY r.order_line_id, m.code, q.item_id`,
+    [releasedIds, companyId, companyId, releasedIds],
+  ) : [[]];
+  const requiredBy = new Map();                      // lineId -> [{ id, label, required, held }]
+  for (const r of reqRows) {
+    if (!requiredBy.has(r.order_line_id)) requiredBy.set(r.order_line_id, []);
+    requiredBy.get(r.order_line_id).push({ id: r.item_id, label: r.code ?? r.name, required: round6(r.wanted), held: round6(r.held) });
+  }
+  // Free stock and on-order for what those name that the trees did not (a nest's plates).
+  const extra = [...new Set([
+    ...reqRows.map((r) => r.item_id),
+    ...[...planned.values()].flatMap((p) => p.reqs.map((q) => q.itemId)),
+  ])].filter((id) => !itemIds.has(id));
+  if (extra.length) {
+    for (const [id, v] of await availability(db, companyId, extra)) free.set(id, v);
+    const [ooRows] = await db.query(
+      `SELECT l.item_id, SUM(GREATEST(l.quantity - l.qty_received, 0)) AS outstanding
+         FROM cf_purchase_order_lines l
+         JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
+          AND p.status IN ('draft','ordered','partially_received')
+        GROUP BY l.item_id`,
+      [companyId, extra],
+    );
+    for (const r of ooRows) onOrder.set(r.item_id, Number(r.outstanding) || 0);
+  }
+
+  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }
 
 /**
@@ -1375,6 +1473,31 @@ function splitLine(ctx, order, line) {
   };
 }
 
+/**
+ * What Buying counts for a line, in the buy list's terms (purchaseService):
+ * a released line's requirements, a frozen line's planned material, or — a
+ * line with neither (a catalog line not released, a line not frozen) — the
+ * estimate from the tree. Rows: { id, label, required, held, free, onOrder }.
+ * Free stock and on order are per line, not shared out across lines, as
+ * splitLine has always done.
+ */
+function buyRowsOf(ctx, line, material) {
+  const withStock = (m) => ({ ...m, free: ctx.free.get(m.id)?.free ?? 0, onOrder: ctx.onOrder.get(m.id) ?? 0 });
+  const released = ctx.releases.has(line.id);
+  if (released) return { buySource: 'released', buyRows: (ctx.requiredBy.get(line.id) ?? []).map(withStock) };
+  const planned = ctx.planned.get(Number(line.id));
+  if (planned) {
+    const byItem = new Map();
+    for (const r of planned.reqs) {
+      const e = byItem.get(r.itemId) ?? { id: r.itemId, label: r.design.code ?? r.design.name, required: 0, held: 0 };
+      e.required = round6(e.required + r.quantity);
+      byItem.set(r.itemId, e);
+    }
+    return { buySource: 'planned', buyRows: [...byItem.values()].map(withStock) };
+  }
+  return { buySource: 'estimate', buyRows: material.map((m) => withStock({ id: m.id, label: m.label, required: m.required, held: 0 })) };
+}
+
 /** One line's slice of the order context — the object every stage is handed. */
 function lineContext(ctx, order, line) {
   const tree = ctx.trees.get(line.id);
@@ -1415,6 +1538,9 @@ function lineContext(ctx, order, line) {
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
+    confirmed: ['confirmed', 'closed'].includes(orderStatusOf(order)),
+    planned: ctx.planned.get(Number(line.id)) ?? null,
+    ...buyRowsOf(ctx, line, split.material),
     lock: { lockedAt: line.locked_at ?? null, pieces: ctx.locksBy.get(line.id)?.pieces ?? 0 },
     // This line's plate parts, each once, and whether each has its cut piece.
     cut: { parts: [...new Set(split.made.map((x) => x.id))].map((id) => ctx.partById.get(id)).filter(Boolean) },
@@ -1655,20 +1781,15 @@ export async function orderProcess(db, companyId, orderId) {
   const stages = stageRows.map((stage) => rollUp(stage, CATALOGUE_BY_KEY.get(stage.stage_key), perLine));
   const next = stages.find((s) => !satisfied(s)) ?? null;
 
-  // Confirming is the commitment, so every stage before it has to be settled.
-  // `confirm` itself is excluded — it is the act, not a precondition of itself.
-  // Only what comes BEFORE confirm in the process holds it up: production and
-  // buying follow it (release needs a confirmed order), so they cannot.
-  const confirmAt = stages.findIndex((s) => s.stageKey === 'confirm');
-  const before = confirmAt < 0 ? stages : stages.slice(0, confirmAt);
-  const held = before.find((s) => !satisfied(s));
-  const confirmStage = stages[confirmAt];
-  if (confirmStage && confirmStage.state !== 'done' && held) {
-    confirmStage.waitingOn = { stageKey: held.stageKey, message: `Finish ${held.label} first — ${held.detail}.` };
-  }
+  // CONFIRM IS THE CUSTOMER'S YES, NOT THE END OF THE DESIGN (2026-09-30): it
+  // can happen at any point once the order has lines — no stage holds it up.
+  // What setOrderStatus checks is checked here too, so the button never offers
+  // what the server refuses: a customer order needs its customer and a
+  // committed date (on the order, or on every line).
+  const undated = lines.filter((l) => !l.committed_date);
   const canConfirm = lines.length > 0
-    && before.every(satisfied)
-    && ['inquiry', 'quoted', 'draft'].includes(order.status);
+    && ['inquiry', 'quoted', 'draft'].includes(order.status)
+    && (order.order_type !== 'customer' || (!!order.customer_id && (!!order.committed_date || !undated.length)));
 
   return {
     order: { id: order.id, code: order.code, status: order.status, orderType: order.order_type },
@@ -1678,7 +1799,9 @@ export async function orderProcess(db, companyId, orderId) {
     stages,
     nextStage: next?.stageKey ?? null,
     canConfirm,
-    blockers: before.flatMap((s) => s.blockers),
+    // Everything still outstanding, across every stage — nothing gates the
+    // confirm any more, so this is what is left to do, not what holds it up.
+    blockers: stages.flatMap((s) => s.blockers ?? []),
   };
 }
 

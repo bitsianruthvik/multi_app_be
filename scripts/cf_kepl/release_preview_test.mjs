@@ -321,7 +321,7 @@ try {
   ok('naming one of the codes the preview named', pd.duplicates.some((d) => (dupErr?.problems ?? []).join(' ').includes(d)), (dupErr?.problems ?? []).join(' | '));
   says((dupErr?.problems ?? []).find((p) => p.includes('more than one piece')));
   const unlockedErr = await refusal(() => REL.releaseLine(conn, c, A.line.id, { finishedAreaId: area.id }));
-  ok('and release, of a line not locked, says to lock it first', unlockedErr?.code === 'NOT_READY' && (unlockedErr?.problems ?? []).some((p) => p.includes('Lock the line first')), (unlockedErr?.problems ?? []).join(' | '));
+  ok('and release, of a line not locked, says to lock it first', unlockedErr?.code === 'NOT_READY' && (unlockedErr?.problems ?? []).some((p) => p.includes('Freeze the design first')), (unlockedErr?.problems ?? []).join(' | '));
   await conn.query('ROLLBACK TO SAVEPOINT dup');
 
   /* ---- a rule with a hole ------------------------------------------------ */

@@ -151,7 +151,8 @@ async function fixture(db) {
   // A nested line per order: a root and a 900 x 400 cut plate, 4 of them, on the plate.
   const nestLine = async (orderId, lineNo) => {
     const root = await master(`ROOT${lineNo}${orderId}`, cutNode, 'temporary', 'individual');
-    const lineId = await ins("INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity) VALUES (?, ?, ?, 'custom', ?, ?, 1, 1)",
+    // Frozen (locked_at): nesting lays out a frozen design only (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30).
+    const lineId = await ins("INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, locked_at) VALUES (?, ?, ?, 'custom', ?, ?, 1, 1, NOW())",
       [COMPANY, orderId, lineNo, root, root]);
     await db.query('UPDATE cf_item_details SET owner_order_line_id = ? WHERE company_id = ? AND master_id = ?', [lineId, COMPANY, root]);
     const cp = await master(`CP${lineNo}${orderId}`, cutNode, 'temporary', 'individual', lineId);

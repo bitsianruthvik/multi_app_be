@@ -13,6 +13,12 @@
  *
  *     to buy = wanted - issued - reserved - free stock - already on order
  *
+ * PLANNED DEMAND (2026-09-30, CF_ERP_ORDER_FLOW_PLAN): "Buying should happen
+ * before production." A line on a confirmed order that is frozen and nested
+ * (or has every plate chosen) but not released adds its material too — the
+ * requirements release WILL write, worked out in bulk by release's own rule
+ * (plannedRows). Released or planned: a line is one or the other.
+ *
  * Free stock is what nobody has claimed (reservations are netted off inside
  * `availability`), so an item held for another job is not counted twice.
  *
@@ -42,7 +48,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { generate } from '../modules/codegen/index.js';
-import { availability } from './releaseService.js';
+import { availability, plannedLines, plannedMaterialOfLines } from './releaseService.js';
 import { postMovement } from './stockService.js';
 import {
   CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
@@ -115,8 +121,44 @@ async function onOrderByItem(db, companyId, { exceptOrderId = null } = {}) {
 }
 
 /**
- * What the released jobs need and do not have, item by item.
- * q: { show?: short (default) | all, search?, exceptOrderId? }
+ * PLANNED demand (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): what confirmed, frozen,
+ * not-yet-released lines will ask for, so the steel can be bought before
+ * release. Only a line whose material is KNOWN counts ("ready"): every cut
+ * plate on its nest or with a chosen plate — a plate still "chosen at nesting"
+ * has nothing to buy yet. One row per line and item, in order code, line and
+ * tree order, from releaseService.plannedMaterialOfLines (release's own rule, in
+ * bulk). Round trips: 1 with no such line, 4 with any number of them.
+ */
+async function plannedRows(db, companyId) {
+  const lines = await plannedLines(db, companyId);
+  if (!lines.length) return [];
+  const material = await plannedMaterialOfLines(db, companyId, lines);
+  const out = [];
+  for (const line of lines) {
+    const m = material.get(Number(line.id));
+    if (!m?.ready) continue;
+    const byItem = new Map();
+    for (const r of m.reqs) {
+      const e = byItem.get(r.itemId) ?? {
+        item: { id: r.itemId, code: r.design.code ?? null, name: r.design.name ?? null, uom: r.design.uom ?? null, trackedBy: r.design.trackedBy ?? null },
+        wanted: 0,
+        source: { orderId: line.order_id, orderCode: line.order_code, lineId: line.id, lineNo: line.line_no },
+      };
+      e.wanted = round6(e.wanted + r.quantity);
+      byItem.set(r.itemId, e);
+    }
+    out.push(...byItem.values());
+  }
+  return out;
+}
+
+/**
+ * What the jobs need and do not have: released requirements (as always), plus
+ * the PLANNED material of confirmed, frozen lines not released yet (plannedRows).
+ * A released row is one per item, `planned: false, source: null`; a planned row
+ * is one per line and item, `planned: true, source: { orderId, orderCode, lineId,
+ * lineNo }`. A line is released or planned, never both, so nothing is wanted twice.
+ * q: { show?: short (default) | all, search?, exceptOrderId?, planned?: only | none }
  */
 export async function buyList(db, companyId, q = {}) {
   const [rows] = await db.query(
@@ -137,32 +179,81 @@ export async function buyList(db, companyId, q = {}) {
       GROUP BY q.item_id, m.code, m.name, i.uom, i.tracked_by`,
     [companyId, companyId],
   );
+  const planned = await plannedRows(db, companyId);
+  const itemIds = [...new Set([...rows.map((r) => r.item_id), ...planned.map((p) => p.item.id)])];
   const onOrder = await onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
-  const free = await availability(db, companyId, rows.map((r) => r.item_id));
-  const estimates = await buyEstimates(db, companyId, rows.map((r) => r.item_id));
+  const free = await availability(db, companyId, itemIds);
+  const estimates = await buyEstimates(db, companyId, itemIds);
+  /*
+   * Free stock and what is on order are per ITEM, and an item can now be on a
+   * released row and on planned rows at once. Each is handed out once, in
+   * order — the released row first, exactly as it always was (so with no
+   * planned rows every number is what it was), then the planned rows in order
+   * code and line order, each seeing only what the rows before it left. The
+   * item's total to buy is therefore wanted − held − free − on order, never
+   * counted twice.
+   */
+  const left = new Map();                            // itemId -> { free, onOrder } still unclaimed
+  const leftOf = (id) => {
+    if (!left.has(id)) left.set(id, { free: free.get(id)?.free ?? 0, onOrder: onOrder.get(id)?.quantity ?? 0 });
+    return left.get(id);
+  };
+  const claim = (id, uncovered) => {
+    const l = leftOf(id);
+    const shown = { free: l.free, onOrder: l.onOrder };
+    const fromFree = Math.min(l.free, uncovered);
+    const fromOrder = Math.min(l.onOrder, Math.max(0, uncovered - fromFree));
+    l.free = round6(l.free - fromFree);
+    l.onOrder = round6(l.onOrder - fromOrder);
+    return { ...shown, toBuy: round6(Math.max(0, uncovered - shown.free - shown.onOrder)) };
+  };
   let out = rows.map((r) => {
     const wanted = round6(r.wanted);
     const reserved = round6(r.reserved);
-    const freeNow = free.get(r.item_id)?.free ?? 0;
     const oo = onOrder.get(r.item_id) ?? { quantity: 0, orders: [] };
     const uncovered = round6(Math.max(0, wanted - reserved));
+    const c = claim(r.item_id, uncovered);
     return {
       item: { id: r.item_id, code: r.item_code, name: r.item_name, uom: r.uom, trackedBy: r.tracked_by },
+      planned: false,
+      source: null,
       wanted,
       reserved,
-      free: freeNow,
-      onOrder: oo.quantity,
+      free: c.free,
+      onOrder: c.onOrder,
       purchaseOrders: oo.orders,
-      toBuy: round6(Math.max(0, uncovered - freeNow - oo.quantity)),
+      toBuy: c.toBuy,
       orders: (r.orders ?? '').split('\u001f').filter(Boolean).map((code, k) => ({ code, id: Number((r.order_ids ?? '').split('\u001f')[k]) })),
     };
-  }).map((row) => withEstimate(row, estimates.get(row.item.id)));
+  });
+  for (const p of planned) {
+    const oo = onOrder.get(p.item.id) ?? { quantity: 0, orders: [] };
+    const c = claim(p.item.id, p.wanted);
+    out.push({
+      item: p.item,
+      planned: true,
+      source: p.source,
+      wanted: p.wanted,
+      reserved: 0,
+      free: c.free,
+      onOrder: c.onOrder,
+      purchaseOrders: oo.orders,
+      toBuy: c.toBuy,
+      orders: [{ code: p.source.orderCode, id: p.source.orderId }],
+    });
+  }
+  out = out.map((row) => withEstimate(row, estimates.get(row.item.id)));
   if (String(q.show ?? 'short') !== 'all') out = out.filter((r) => r.toBuy > EPS);
+  // Released / planned only — a filter over the rows above, after the stock was
+  // handed out, so a row's numbers do not change with the filter.
+  if (q.planned === 'only') out = out.filter((r) => r.planned);
+  else if (q.planned === 'none') out = out.filter((r) => !r.planned);
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
     out = out.filter((r) => [r.item.code, r.item.name, ...r.orders.map((o) => o.code)].some((t) => t && String(t).toLowerCase().includes(term)));
   }
-  return out.sort((a, b) => b.toBuy - a.toBuy || String(a.item.code ?? '').localeCompare(String(b.item.code ?? '')));
+  return out.sort((a, b) => b.toBuy - a.toBuy || String(a.item.code ?? '').localeCompare(String(b.item.code ?? ''))
+    || Number(a.planned) - Number(b.planned));
 }
 
 /**
@@ -528,13 +619,21 @@ export async function suggestPurchase(db, c) {
     "SELECT * FROM cf_purchase_orders WHERE company_id = ? AND suggested = 1 AND status = 'draft' AND deleted_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE",
     [c.companyId],
   );
-  const rows = await buyList(db, c.companyId, { show: 'short', exceptOrderId: open?.id ?? null });
+  // Released and planned rows of the same item become ONE line: the supplier is
+  // sent an item and a quantity, not our reasons for wanting it.
+  const byItem = new Map();
+  for (const r of await buyList(db, c.companyId, { show: 'short', exceptOrderId: open?.id ?? null })) {
+    const e = byItem.get(r.item.id);
+    if (e) e.toBuy = round6(e.toBuy + r.toBuy);
+    else byItem.set(r.item.id, { ...r });
+  }
+  const rows = [...byItem.values()];
   if (!rows.length) {
     if (open) {
       await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, open.id]);
       await db.query("UPDATE cf_purchase_orders SET status = 'cancelled' WHERE company_id = ? AND id = ?", [c.companyId, open.id]);
     }
-    return { order: null, lines: 0, message: 'Nothing is short — every released job has its material held or free in stock.' };
+    return { order: null, lines: 0, message: 'Nothing is short — every released or planned job has its material held, free in stock or on order.' };
   }
   let poId = open?.id ?? null;
   if (poId) {
@@ -543,7 +642,7 @@ export async function suggestPurchase(db, c) {
     poId = await insertOrder(db, c, {
       code: await nextCode(db, c, { suggested: true }),
       supplierId: null, expectedDate: null, suggested: true,
-      notes: 'Suggested from what the released jobs are short of.',
+      notes: 'Suggested from what the released and planned jobs are short of.',
     });
   }
   let lineNo = 1;
@@ -632,7 +731,8 @@ export function receiptLineFor(l, input, problems = []) {
 
 /** For the nav badge and Home: how many items are short, and how many orders are waiting. */
 export async function purchaseCounts(db, companyId) {
-  const short = (await buyList(db, companyId, { show: 'short' })).length;
+  // Items, not rows: an item short on a released row and a planned row is one item to buy.
+  const short = new Set((await buyList(db, companyId, { show: 'short' })).map((r) => r.item.id)).size;
   const [[{ drafts }]] = await db.query("SELECT COUNT(*) AS drafts FROM cf_purchase_orders WHERE company_id = ? AND status = 'draft' AND deleted_at IS NULL", [companyId]);
   const [[{ awaiting }]] = await db.query("SELECT COUNT(*) AS awaiting FROM cf_purchase_orders WHERE company_id = ? AND status IN ('ordered','partially_received') AND deleted_at IS NULL", [companyId]);
   return { toBuy: short, draftOrders: Number(drafts), awaitingDelivery: Number(awaiting) };

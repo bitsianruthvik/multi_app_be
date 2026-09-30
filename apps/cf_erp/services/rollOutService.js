@@ -264,6 +264,30 @@ async function madeFromNothing(db, companyId, nodes) {
   return out;
 }
 
+/** The classification code a cut plate is filed at (cutPlateService's own constant). */
+export const CUT_PLATE_CODE = 'CUT_PLATE';
+
+/**
+ * Of the temporary items in a structure that have a selection under them, the
+ * ones filed as cut plates — whose selection is the raw plate nesting chooses.
+ * One query, and none at all when no such selection exists (every line whose
+ * plates are all chosen), so release on a valid line costs what it did.
+ */
+async function cutPlatesAmong(db, companyId, everyNode) {
+  const parents = new Set();
+  for (const n of everyNode) {
+    if (n.kind === 'temporary' && n.children.some((k) => k.kind === 'selection')) parents.add(Number(n.id));
+  }
+  if (!parents.size) return new Set();
+  const [rows] = await db.query(
+    `SELECT m.id FROM cf_master_records m
+       JOIN cf_classification_nodes c ON c.id = m.classification_id AND c.code = ?
+      WHERE m.company_id = ? AND m.id IN (?)`,
+    [CUT_PLATE_CODE, companyId, [...parents]],
+  );
+  return new Set(rows.map((r) => Number(r.id)));
+}
+
 // --- the tree -----------------------------------------------------------------
 
 /**
@@ -289,6 +313,9 @@ async function madeFromNothing(db, companyId, nodes) {
  *             in the order they are written: a parent before its children,
  *             siblings as the rows are shown. `design` is the explode() node.
  *   reqs      [{ nodeK, itemId, bomLineId, quantity, design }] — the material
+ *   openPlates [{ cutPlateId, node, parent }] — cut plates whose raw plate is
+ *             still the selection ("chosen at nesting"): not a problem here,
+ *             no node, no requirement; release checks them against the nest
  *   tree, all (every design node considered), detail (item details by id), truncated
  */
 export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {}) {
@@ -308,13 +335,24 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     ? new Map([...(await availability(db, companyId, [...new Set(maybe.map((n) => n.id))], { orderId: line.order_id ?? null }))].map(([id, v]) => [id, v.free]))
     : new Map();
   const decide = madeRule({ orderType: line.order_type, sourcingOf, free, lockedBoth });
+  const plateParents = await cutPlatesAmong(db, companyId, everyNode);
 
   const all = [];
+  // A cut plate's raw plate still to be chosen (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30):
+  // nesting picks it, and nesting comes AFTER the design is frozen, so it is not
+  // a problem of the structure. It makes no node — a raw plate is bought, not
+  // made — and asks for nothing yet; release refuses a cut plate that has
+  // neither a nest nor a chosen plate (releaseService.planFor).
+  const openPlates = [];
   const consider = (n, parent, count) => {
     n.parentNode = parent;
     n.needCount = round6(count);
     all.push(n);
     const where = parent ? ` under ${nameOf(parent)}` : '';
+    if (n.kind === 'selection' && parent && plateParents.has(Number(parent.id))) {
+      openPlates.push({ cutPlateId: Number(parent.id), node: n, parent });
+      return;
+    }
     if (n.kind === 'selection') { problems.push(`${nameOf(parent ?? n)} still has to choose its ${n.selection?.code ?? nameOf(n)} — pick the catalog item.`); return; }
     if (n.kind === 'template') { problems.push(`${nameOf(n)}${where} is a definition — a blueprint is never made or issued.`); return; }
     const d = decide(n, n.needCount, n === tree.root);
@@ -346,7 +384,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     fromNothing.push({ id: n.id, problem });
   }
   const root = tree.root;
-  if (root.made === undefined) return { problems, fromNothing, tree, all, detail, nodes: [], reqs: [], truncated: false };
+  if (root.made === undefined) return { problems, fromNothing, tree, all, detail, nodes: [], reqs: [], truncated: false, openPlates };
 
   // 2. The layout: a piece per node when it has made parts, one grouped node
   //    otherwise; material becomes requirements.
@@ -421,7 +459,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     problems.push(`The line would roll out into more than ${MAX_NODES} pieces — split it into smaller lines.`);
     problems.push('Because of that, the piece and material figures below are incomplete — the rest of the structure was never worked out. Do not order from them.');
   }
-  return { problems, fromNothing, tree, all, detail, nodes, reqs, truncated };
+  return { problems, fromNothing, tree, all, detail, nodes, reqs, truncated, openPlates };
 }
 
 // --- the line's position among lines of the same design ---------------------------

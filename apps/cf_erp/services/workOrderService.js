@@ -51,7 +51,7 @@ const NEXT = {
 };
 const MAX_CELLS = 100000;
 const CHUNK = 1000;
-const NOT_LOCKED_WHY = 'Lock the line first — contractors are assigned to pieces.';
+const NOT_LOCKED_WHY = 'Freeze the design first — contractors are assigned to pieces.';
 const STARTED_WHY = 'Started on the floor — it stays with whoever started it.';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const blank = (v) => v === null || v === undefined || (typeof v === 'string' && v.trim() === '');

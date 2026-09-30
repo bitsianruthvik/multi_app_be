@@ -71,6 +71,8 @@ export function readCurrency(v, problems) {
 const KG_PER = { kg: 1, kgs: 1, g: 0.001, gm: 0.001, t: 1000, tonne: 1000, tonnes: 1000, ton: 1000, mt: 1000 };
 const M_PER = { m: 1, mtr: 1, metre: 1, meter: 1, mm: 0.001, cm: 0.01, km: 1000 };
 const factor = (table, uom) => table[String(uom ?? '').trim().toLowerCase()] ?? null;
+/** Kilograms in one of `uom` (kg 1, t 1000 …), or null for a unit that is not a weight. For set-based readers that join WEIGHT themselves. */
+export const kgPerUom = (uom) => factor(KG_PER, uom);
 
 /**
  * { weightKg, lengthM } per ONE of each item, from its stored item-level WEIGHT

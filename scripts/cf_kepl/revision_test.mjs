@@ -289,7 +289,26 @@ async function fillAndCut(db, c, f, lineId) {
     for (const [specCode, value] of Object.entries(SIZES[ROLE_SIZE[p.role]])) writes.push({ recordId: p.id, specCode, value });
   }
   await OV.writeLineValues(db, c, lineId, { writes });
-  return CUT.refreshCutPieces(db, c, lineId);
+  const out = await CUT.refreshCutPieces(db, c, lineId);
+  await choosePlates(db, c, f, lineId);
+  return out;
+}
+
+/**
+ * A new cut plate's raw plate is "chosen at nesting" (CF_ERP_ORDER_FLOW_PLAN,
+ * 2026-09-30 — no default plate any more). This suite is about revisions, not
+ * nesting, so a person chooses PL1 by hand for every cut plate still holding
+ * the selection — what the selection's default used to do — and the cut plates
+ * are brought up to date (the area fraction of the chosen plate).
+ */
+async function choosePlates(db, c, f, lineId) {
+  let chose = false;
+  for (const p of await cutPlatesOf(db, f, lineId)) {
+    if (p.plate === f.PL1.id || p.plate === f.PL2.id || p.plate_line == null) continue;
+    await B.resolveLine(db, c, p.plate_line, { itemId: f.PL1.id });
+    chose = true;
+  }
+  if (chose) await CUT.refreshCutPieces(db, c, lineId);
 }
 
 /** A line's cut plates: code, name, flow, and the plate line (plate and quantity). */
@@ -636,6 +655,7 @@ try {
   }
   // "Make them now", with the flow they are cut by — release needs every made thing to have one.
   await CUT.deriveCutPlates(conn, c, cLine.id, { flowId: f.flow.id });
+  await choosePlates(conn, c, f, cLine.id);
   await LOCK.lockLine(conn, c, cLine.id);
   await SO.setOrderStatus(conn, c, Cq.order.id, 'confirmed');
   const rel = await REL.releaseLine(conn, c, cLine.id, { finishedAreaId: f.area.id });

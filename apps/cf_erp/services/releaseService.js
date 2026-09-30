@@ -34,7 +34,7 @@ import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
 import {
   availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
-  lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf,
+  lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, CUT_PLATE_CODE, MAX_DEPTH,
 } from './rollOutService.js';
 
 // availability moved to rollOutService with the made rule it serves; the
@@ -49,7 +49,7 @@ const USABLE = "('storage','wip')";
 const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : d ?? null);
 
 /** Release's words for a line built from a template that has not been locked. */
-export const lockFirst = (line) => `Line ${line.line_no} of ${line.order_code} is not locked. Lock the line first — it comes after the values and cut pieces.`;
+export const lockFirst = (line) => `Line ${line.line_no} of ${line.order_code} is not frozen. Freeze the design first — it comes after the values and cut pieces.`;
 
 async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(
@@ -461,12 +461,18 @@ export function lotGates(lots, firstOf) {
   return { gates, groups };
 }
 
-/** Replaces a nested line's raw-plate requirements with one whole plate per catalog lot (see above). */
-async function nestMaterial(db, companyId, line, plan) {
+/**
+ * Replaces a nested line's raw-plate requirements with one whole plate per
+ * catalog lot (see above). Returns Map(cutPlateId -> pieces on the nest) —
+ * empty when the line is not nested — so the caller can tell which cut plates
+ * a nest covers (openPlateProblem).
+ */
+async function nestMaterial(db, companyId, line, plan, { lots: given } = {}) {
   const nodes = plan.nodes ?? [];
-  if (!nodes.length) return;
-  const lots = (await lotsOfLines(db, companyId, [line.id])).get(line.id);
-  if (!lots?.size) return;
+  if (!nodes.length) return new Map();
+  // `given`: the line's lots already read in bulk (plannedMaterial); otherwise one query.
+  const lots = given !== undefined ? given : (await lotsOfLines(db, companyId, [line.id])).get(line.id);
+  if (!lots?.size) return new Map();
   const placed = new Map();                        // cutPlateId -> pieces on the nest
   const lotPlates = new Set();
   for (const lot of lots.values()) {
@@ -524,6 +530,22 @@ async function nestMaterial(db, companyId, line, plan) {
   }
   for (const k of [...byGate.keys()].sort((a, b) => a - b)) reqs.push(...byGate.get(k));
   plan.reqs = reqs;
+  return placed;
+}
+
+/**
+ * A cut plate is released only with a plate: laid out on the saved nest, or a
+ * plate chosen on its raw-plate line (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30 — the
+ * freeze no longer needs plates, so this is where a missing one is caught).
+ * `placed` is nestMaterial's answer. Null when every cut plate has its plate —
+ * always, on a line that was valid before the rule (its plate lines were all
+ * chosen), which keeps release on it byte-identical.
+ */
+export function openPlateProblem(plan, placed) {
+  const bare = new Set((plan.openPlates ?? []).map((o) => o.cutPlateId).filter((id) => !placed?.has(Number(id))));
+  if (!bare.size) return null;
+  const k = bare.size;
+  return `${k} cut plate${k === 1 ? '' : 's'} ${k === 1 ? 'has' : 'have'} no plate yet — nest the line (or choose a plate).`;
 }
 
 /**
@@ -545,10 +567,151 @@ async function planFor(db, companyId, line) {
     for (const u of attachLockedCodes(plan.nodes ?? [], pieces)) plan.problems.push(unmatchedProblem(u, plan.nodes));
   }
   // Before planSteps: it attaches every requirement, the nest's too, to its node's first step.
-  await nestMaterial(db, companyId, line, plan);
+  const placed = await nestMaterial(db, companyId, line, plan);
+  const open = openPlateProblem(plan, placed);
+  if (open) plan.problems.push(open);
   if (plan.nodes) planSteps(plan);
   plan.lockedPieces = pieces;
   return plan;
+}
+
+// --- planned material: what a frozen line will ask for, before it is released -------
+
+/**
+ * PLANNED MATERIAL (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): "Buying should happen
+ * before production na?" The buy list takes a confirmed, frozen line's steel
+ * BEFORE it is released, so the material can be bought first.
+ *
+ * It must be exactly what release will ask for, so it is release's material
+ * rule, read off the frozen line instead of re-exploding it — and IN BULK:
+ * production is ~49 ms a round trip, and planFor per line costs dozens. A
+ * frozen line was rolled out into cf_order_pieces by lock; those rows ARE
+ * rollOutPlan's nodes (same tree, same order — sort_order is the node's place,
+ * so a node's k is its index), and a node's material is what rollOutPlan's
+ * `fill` asks for: every BOM line of its item that is not made, at the line's
+ * quantity × the node's, walked depth-first in the order the rows are shown
+ * (line number, then line id) so every sum adds up in release's order. Made
+ * follows madeRule for a locked line (temporary, catalog 'make', catalog
+ * 'both' when the lock rolled pieces out for that BOM line). Then the nest's
+ * rule is applied by the same function release uses (nestMaterial): one whole
+ * plate per catalog lot in place of the nested cut plates' plate lines.
+ * order_flow_test proves the sum per item equals releaseCheck's on the KEPL line.
+ *
+ * lines: frozen (locked) lines, none released — [{ id, item_id, quantity, ... }]
+ * Returns Map(lineId -> { ready, openPlates, reqs, problems }):
+ *   reqs        [{ nodeK, itemId, bomLineId, quantity, design }] — release's shape
+ *   openPlates  cut plates with no plate yet: still the selection, not on the nest
+ *   ready       no such cut plate — the line's material is known and can be bought
+ * Round trips: 3 for any number of lines (pieces, BOM lines, plate lots); 0 for none.
+ */
+export async function plannedMaterialOfLines(db, companyId, lines) {
+  const out = new Map();
+  if (!lines.length) return out;
+  const lineIds = lines.map((l) => Number(l.id));
+  const [pieces] = await db.query(
+    `SELECT p.id, p.order_line_id, p.parent_id, p.item_id, p.bom_line_id, p.quantity, p.depth,
+            m.code, m.name, (c.code = ?) AS is_cut_plate
+       FROM cf_order_pieces p
+       JOIN cf_master_records m ON m.id = p.item_id
+       LEFT JOIN cf_classification_nodes c ON c.id = m.classification_id
+      WHERE p.company_id = ? AND p.order_line_id IN (?) AND p.deleted_at IS NULL
+      ORDER BY p.order_line_id, p.sort_order, p.id`,
+    [CUT_PLATE_CODE, companyId, lineIds],
+  );
+  const itemIds = [...new Set(pieces.filter((p) => Number(p.depth) < MAX_DEPTH).map((p) => Number(p.item_id)))];
+  const [bomRows] = itemIds.length ? await db.query(
+    `SELECT b.parent_id, l.id, l.line_no, l.child_id, l.quantity, l.selection_definition_id,
+            ch.code, ch.name, ch.record_kind, ci.item_type, ci.uom, ci.sourcing, ci.tracked_by, cd.definition_type
+       FROM cf_boms b
+       JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
+       JOIN cf_master_records ch ON ch.id = l.child_id
+       LEFT JOIN cf_item_details ci ON ci.master_id = l.child_id AND ci.deleted_at IS NULL
+       LEFT JOIN cf_definition_details cd ON cd.master_id = l.child_id AND cd.deleted_at IS NULL
+      WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL
+      ORDER BY b.parent_id, l.line_no, l.id`,
+    [companyId, itemIds],
+  ) : [[]];
+  const bomOf = new Map();
+  for (const r of bomRows) {
+    if (!bomOf.has(Number(r.parent_id))) bomOf.set(Number(r.parent_id), []);
+    bomOf.get(Number(r.parent_id)).push(r);
+  }
+  const lotsBy = await lotsOfLines(db, companyId, lineIds);
+
+  const piecesBy = new Map(lineIds.map((id) => [id, []]));
+  for (const p of pieces) piecesBy.get(Number(p.order_line_id))?.push(p);
+  for (const line of lines) {
+    const rows = piecesBy.get(Number(line.id)) ?? [];
+    const nodes = rows.map((p, k) => ({
+      k, itemId: Number(p.item_id), quantity: Number(p.quantity), depth: Number(p.depth), isCutPlate: !!Number(p.is_cut_plate),
+      design: { id: Number(p.item_id), code: p.code, name: p.name },
+    }));
+    const kOf = new Map(rows.map((p, k) => [Number(p.id), k]));
+    const kids = new Map();                          // parent k -> Map(bom line id -> [k])
+    const roots = [];
+    rows.forEach((p, k) => {
+      if (p.parent_id == null) { roots.push(k); return; }
+      const pk = kOf.get(Number(p.parent_id));
+      if (!kids.has(pk)) kids.set(pk, new Map());
+      const byLine = kids.get(pk);
+      const bl = Number(p.bom_line_id ?? 0);
+      if (!byLine.has(bl)) byLine.set(bl, []);
+      byLine.get(bl).push(k);
+    });
+    const lockedBoth = lockedBothOf(rows);
+    const reqs = [];
+    const openPlates = [];
+    const visit = (k) => {
+      const n = nodes[k];
+      if (n.depth >= MAX_DEPTH) return;              // explode() stops there, and so did the roll-out
+      for (const bl of bomOf.get(n.itemId) ?? []) {
+        const kind = bl.record_kind === 'item' ? bl.item_type : bl.definition_type;
+        if (kind === 'selection' || kind === 'template') {
+          if (kind === 'selection' && n.isCutPlate) openPlates.push({ cutPlateId: n.itemId });
+          continue;
+        }
+        const sourcing = kind === 'catalog' ? bl.sourcing ?? 'stock' : null;
+        const made = kind === 'temporary' || sourcing === 'make' || (sourcing === 'both' && lockedBoth.has(Number(bl.id)));
+        if (made) { for (const ck of kids.get(k)?.get(Number(bl.id)) ?? []) visit(ck); continue; }
+        reqs.push({
+          nodeK: k, itemId: Number(bl.child_id), bomLineId: Number(bl.id), quantity: round6(Number(bl.quantity) * n.quantity),
+          design: {
+            id: Number(bl.child_id), code: bl.code, name: bl.name, uom: bl.uom ?? null, trackedBy: bl.tracked_by ?? null, kind,
+            selection: bl.selection_definition_id ? { id: bl.selection_definition_id } : null,
+          },
+        });
+      }
+    };
+    for (const k of roots) visit(k);
+    const plan = { nodes, reqs, problems: [], openPlates };
+    const lots = lotsBy.get(Number(line.id)) ?? null;
+    const placed = await nestMaterial(db, companyId, line, plan, { lots });
+    // A lot's requirement is made by nestMaterial; the buy list also wants how its plate is tracked.
+    for (const r of plan.reqs) if (r.lot) r.design.trackedBy = lots?.get(r.lot.id)?.plate.trackedBy ?? null;
+    const bare = new Set(openPlates.map((o) => o.cutPlateId).filter((id) => !placed.has(id)));
+    out.set(Number(line.id), { ready: bare.size === 0, openPlates: bare.size, reqs: plan.reqs, problems: plan.problems });
+  }
+  return out;
+}
+
+/**
+ * The lines the buy list plans for: on a CONFIRMED order ("nothing is bought
+ * for an inquiry"), frozen, not released — a released line's material is its
+ * requirements, so a line is always one or the other and never counted twice.
+ * In order code, then line number. One query.
+ */
+export async function plannedLines(db, companyId) {
+  const [rows] = await db.query(
+    `SELECT l.id, l.line_no, l.order_id, l.item_id, l.quantity, o.code AS order_code, o.order_type
+       FROM cf_sales_order_lines l
+       JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL AND o.status = 'confirmed'
+      WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.locked_at IS NOT NULL AND l.item_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM cf_production_releases r
+                         WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL)
+      ORDER BY o.code, l.line_no, l.id`,
+    [companyId],
+  );
+  return rows;
 }
 
 /** Material needed, per item: how much in all, how much is free now, how much is short. */
@@ -616,6 +779,15 @@ async function codedPreview(db, companyId, line) {
     const nodes = plan.nodes ?? [];
     const unmatched = attachLockedCodes(nodes, pieces);
     for (const u of unmatched) { plan.problems.push(unmatchedProblem(u, nodes)); u.node.code = NO_LOCKED_PIECE; }
+    // A frozen line whose cut plates wait for nesting says so, as release would.
+    // The lots are read only when there is such a cut plate at all.
+    if (plan.openPlates?.length) {
+      const lots = (await lotsOfLines(db, companyId, [line.id])).get(line.id);
+      const placed = new Map();
+      for (const lot of lots?.values() ?? []) for (const [cp, n] of lot.byCutPlate) placed.set(cp, (placed.get(cp) ?? 0) + n);
+      const open = openPlateProblem(plan, placed);
+      if (open) plan.problems.push(open);
+    }
     const codes = [...new Set(nodes.map((n) => n.code).filter((c) => c !== NO_LOCKED_PIECE))];
     const coded = {
       duplicates: [], missing: [], numbered: 0, taken: await takenCodes(db, companyId, line.id, codes),
@@ -1247,7 +1419,7 @@ function evaluate(data) {
   return { label, stepsOf, itemById };
 }
 
-const shapeStep = (s, pieceLabel) => ({
+export const shapeStep = (s, pieceLabel) => ({
   id: s.id,
   sequence: s.sequence,
   operation: { id: s.operation_id, code: s.op_code, name: s.op_name },

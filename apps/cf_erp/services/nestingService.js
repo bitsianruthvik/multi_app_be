@@ -451,6 +451,25 @@ function assertOpen(line) {
 }
 
 /**
+ * NESTING COMES AFTER THE FREEZE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30). It lays
+ * out the frozen pieces and picks the plates for their blanks; before the
+ * freeze the blanks can still change under it. A line built from a template is
+ * frozen once it is locked; any other line has no design of its own to freeze.
+ */
+export const isFrozenForNesting = (line) => line.line_type !== 'custom' || !!line.locked_at;
+export const FREEZE_FIRST = 'Freeze the design first — nesting lays out the frozen pieces.';
+
+function assertFrozen(line) {
+  if (!isFrozenForNesting(line)) throw invalid('NOT_FROZEN', `Line ${line.line_no} of ${line.order_code}: ${FREEZE_FIRST}`);
+}
+
+/** Both: a line open to nesting is frozen, on an open order, and not released. */
+function assertNestable(line) {
+  assertOpen(line);
+  assertFrozen(line);
+}
+
+/**
  * The routes address a line THROUGH its order, so the two have to agree or the
  * URL is a lie: /orders/7/lines/99 must not quietly serve line 99 of order 3.
  * Checked once, up front, on the same connection as the work that follows.
@@ -918,6 +937,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const planStartedAt = Date.now();   // the effort's budget runs from here
   const budgetCut = new Map();         // group key -> the clock limited its search
   const line = await requireLine(db, companyId, orderLineId);
+  assertFrozen(line);
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
   const settingRows = await cutSettingRows(db, companyId);
@@ -1210,6 +1230,8 @@ function lotWasteFields(n, g) {
 const lineHead = (line) => ({
   id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code,
   quantity: Number(line.quantity), orderStatus: line.order_status,
+  // Nesting needs a frozen design and a line not yet released (assertNestable).
+  frozen: isFrozenForNesting(line), released: !!line.release_id,
 });
 
 const groupHead = (g, settings, guillotine) => ({
@@ -1404,7 +1426,7 @@ function numberLots(groups, taken = new Set()) {
 export async function acceptNesting(db, c, orderLineId, plan = {}) {
   const companyId = c.companyId;
   const line = await requireLine(db, companyId, orderLineId, { lock: true });
-  assertOpen(line);
+  assertNestable(line);
   const { where, cutPlates } = await surveyLine(db, companyId, line);
   const settingRows = await cutSettingRows(db, companyId);
   const plates = await candidatePlates(db, companyId, where.plateIds);
@@ -2225,7 +2247,7 @@ export async function importContext(db, companyId, orderLineId, { pack } = {}) {
 
 /** The line's order and release state, for the sheet to say "cannot be saved" before anyone tries. */
 export function importBlocker(line) {
-  try { assertOpen(line); return null; } catch (e) { return e; }
+  try { assertNestable(line); return null; } catch (e) { return e; }
 }
 
 /**
@@ -2282,7 +2304,7 @@ export async function checkImportedNests(ctx, nests) {
  */
 export async function saveImportedNests(db, c, orderLineId, ctx, checked) {
   const line = await requireLine(db, c.companyId, orderLineId, { lock: true });
-  assertOpen(line);
+  assertNestable(line);
   const replaced = await clearLots(db, c, orderLineId);
   const toWrite = checked.map((n) => {
     const { plate, settings, steel, density, check, waste } = n._save;

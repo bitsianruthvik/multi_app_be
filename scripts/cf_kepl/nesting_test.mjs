@@ -250,8 +250,10 @@ async function buildFixture(db) {
   );
   const orderId = o.insertId;
   const root = await makeMaster(db, { code: `${tag}-ROOT`, name: 'Fixture assembly', classificationId: cutNode, itemType: 'temporary' });
+  // FROZEN from the start (locked_at): nesting lays out a frozen design only
+  // (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30). Section 2 proves the refusal first.
   const [l] = await db.query(
-    'INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity) VALUES (?, ?, 1, \'custom\', ?, ?, 1, ?)',
+    'INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, locked_at, lock_position) VALUES (?, ?, 1, \'custom\', ?, ?, 1, ?, NOW(), 1)',
     [COMPANY, orderId, root, root, LINE_QTY],
   );
   const lineId = l.insertId;
@@ -344,6 +346,16 @@ try {
 
   /* ---- 2. planning writes nothing -------------------------------------- */
   section('2. planNesting proposes and writes nothing');
+  // Not frozen: nesting is refused, proposing and accepting alike.
+  await conn.query('SAVEPOINT unfrozen');
+  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, fixture.lineId]);
+  let unfrozenPlan = null;
+  try { await S.planNesting(conn, COMPANY, fixture.lineId, { pack: shelfPacker, effort: 'quick', seed: 7 }); } catch (e) { unfrozenPlan = e; }
+  ok('a line whose design is not frozen is not nested — planNesting says to freeze it first', unfrozenPlan?.code === 'NOT_FROZEN' && /Freeze the design first/.test(unfrozenPlan?.message ?? ''), unfrozenPlan?.message);
+  let unfrozenAccept = null;
+  try { await S.acceptNesting(conn, c, fixture.lineId, { groups: [] }); } catch (e) { unfrozenAccept = e; }
+  eq('…and acceptNesting refuses it the same way', unfrozenAccept?.code, 'NOT_FROZEN');
+  await conn.query('ROLLBACK TO SAVEPOINT unfrozen');
   const beforePlan = await counts(conn);
   const plan = await S.planNesting(conn, COMPANY, fixture.lineId, { pack: shelfPacker, effort: 'quick', seed: 7 });
   const afterPlan = await counts(conn);

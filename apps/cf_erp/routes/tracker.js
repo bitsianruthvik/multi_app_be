@@ -11,6 +11,11 @@
  *   GET    /orders/:id/production           an order's releases and its lines not released yet
  *   GET    /tracker/steps?status=&orderId=&operationId=&search=   the work queue
  *   GET    /tracker/materials?show=&search=                       material across open releases
+ *   GET    /tracker/tree?orderId=&lineId=&depth=&search=&onlyBlocked=&includeClosed=
+ *                                           the progress tree: order › line › piece codes, each node's
+ *                                           operations and its subtree's completion (trackerTreeService)
+ *   GET    /tracker/tree/children?nodeId=&depth=   a branch of it, filled in when opened
+ *   GET    /tracker/tree/node?nodeId=p…     one piece and its steps in full
  *   POST   /production-steps/:id/start      { machineId?, note? }
  *   POST   /production-steps/:id/progress   { good?, scrap?, note? }
  *   POST   /production-steps/:id/hold       { note }
@@ -30,6 +35,7 @@ import {
   reserveRequirement, reserveRelease, issueRequirement, releaseReservation,
 } from '../services/releaseService.js';
 import { shipLine, shipmentView } from '../services/dispatchService.js';
+import { trackerTree, trackerTreeChildren, trackerTreeNode } from '../services/trackerTreeService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -50,6 +56,9 @@ router.get('/order-lines/:id/shipment', guard(PERM.ordersView), handle((req) => 
 router.post('/order-lines/:id/ship', stock, handle((req) => tx(req, (db, c) => shipLine(db, c, id(req), req.body ?? {}))));
 router.get('/tracker/steps', view, handle((req) => listTrackerSteps(pool, company(req), req.query)));
 router.get('/tracker/materials', view, handle((req) => listTrackerMaterials(pool, company(req), req.query)));
+router.get('/tracker/tree', view, handle((req) => trackerTree(pool, company(req), req.query)));
+router.get('/tracker/tree/children', view, handle((req) => trackerTreeChildren(pool, company(req), req.query)));
+router.get('/tracker/tree/node', view, handle((req) => trackerTreeNode(pool, company(req), req.query)));
 
 router.post('/production-steps/:id/start', manage, handle((req) => tx(req, (db, c) => startStep(db, c, id(req), req.body ?? {}))));
 router.post('/production-steps/:id/progress', manage, handle((req) => tx(req, (db, c) => recordProgress(db, c, id(req), req.body ?? {}))));

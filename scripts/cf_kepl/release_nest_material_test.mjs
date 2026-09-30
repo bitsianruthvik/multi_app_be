@@ -168,7 +168,13 @@ try {
 
   // --- 3. the nested release -----------------------------------------------------
   console.log('\n3. the nested release');
-  const buyBefore = new Map((await BUY.buyList(conn, COMPANY, { show: 'all' })).map((r) => [r.item.id, r.wanted]));
+  // Released rows only: before release the line is confirmed, frozen and nested,
+  // so its material is already on the buy list as PLANNED rows (CF_ERP_ORDER_FLOW_PLAN).
+  const listBefore = await BUY.buyList(conn, COMPANY, { show: 'all' });
+  const buyBefore = new Map(listBefore.filter((r) => !r.planned).map((r) => [r.item.id, r.wanted]));
+  const plannedPlates = new Map(listBefore.filter((r) => r.planned && r.source?.lineId === LINE && lotsPerPlate.has(r.item.id)).map((r) => [r.item.id, r.wanted]));
+  ok('3: before release, the buy list already plans the nest\'s plates for the line', sameMap(lotsPerPlate, plannedPlates),
+    [...lotsPerPlate].filter(([id, n]) => plannedPlates.get(id) !== n).slice(0, 4).map(([id, n]) => `${id}: ${plannedPlates.get(id)} vs ${n}`).join(', '));
   const { check, input } = await releaseInput(conn, c);
   ok('3: the nested line can be released', check.ok, check.problems.slice(0, 3).join(' | '));
   const checkPlates = new Map(check.materials.filter((m) => lotsPerPlate.has(m.item.id)).map((m) => [m.item.id, m.required]));
@@ -279,7 +285,9 @@ try {
 
   // --- 5. the buy list is the nest ---------------------------------------------------
   console.log('\n5. the buy list');
-  const buyAfter = new Map((await BUY.buyList(conn, COMPANY, { show: 'all' })).map((r) => [r.item.id, r.wanted]));
+  const listAfter = await BUY.buyList(conn, COMPANY, { show: 'all' });
+  const buyAfter = new Map(listAfter.filter((r) => !r.planned).map((r) => [r.item.id, r.wanted]));
+  ok('5: once released, the line is no longer planned — nothing is counted twice', !listAfter.some((r) => r.planned && r.source?.lineId === LINE));
   const delta = new Map();
   for (const [id, w] of buyAfter) { const d = Number((w - (buyBefore.get(id) ?? 0)).toFixed(6)); if (Math.abs(d) > EPS) delta.set(id, d); }
   const plateDelta = new Map([...delta].filter(([id]) => lotsPerPlate.has(id)));
@@ -288,7 +296,7 @@ try {
   ok('5: whole plates only', [...plateDelta.values()].every((d) => Math.abs(d - Math.round(d)) < EPS));
   const buyRows = await BUY.buyList(conn, COMPANY, { show: 'all' });
   const big = [...lotsPerPlate].sort((a, b) => b[1] - a[1])[0];
-  const bigRow = buyRows.find((r) => r.item.id === big[0]);
+  const bigRow = buyRows.find((r) => r.item.id === big[0] && !r.planned);
   console.log(`     ${bigRow?.item.code}: wanted ${bigRow?.wanted} (nest ${big[1]}), to buy ${bigRow?.toBuy}`);
 
   // --- 6. reserve and issue on lot requirements ------------------------------------------

@@ -217,10 +217,13 @@ async function lockChecks(db, companyId, line) {
   const bareIds = new Set(bare.map((p) => Number(p.id)));
   const saidByCut = new Set((plan.fromNothing ?? []).filter((f) => bareIds.has(Number(f.id))).map((f) => f.problem));
   const structural = plan.problems.filter((p) => !saidByCut.has(p));
+  // A cut plate whose raw plate is still the selection does not stop the
+  // freeze (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): nesting chooses it afterwards.
+  const openPlates = new Set((plan.openPlates ?? []).map((o) => o.cutPlateId)).size;
   add({
     key: 'structure', ok: structural.length === 0, title: 'The structure rolls out into pieces', stageKey: 'structure',
     detail: structural.length === 0
-      ? `It rolls out into ${plural(nodes.length, 'piece')} — ${count(pieces)} numbered one by one, ${plural(nodes.length - pieces, 'group')} of identical parts.`
+      ? `It rolls out into ${plural(nodes.length, 'piece')} — ${count(pieces)} numbered one by one, ${plural(nodes.length - pieces, 'group')} of identical parts.${openPlates ? ` ${plural(openPlates, 'cut plate')} ${openPlates === 1 ? 'gets its' : 'get their'} plate at nesting.` : ''}`
       : `${plural(structural.length, 'thing stops', 'things stop')} it rolling out.`,
     todo: structural.length ? 'Settle them on the Structure stage — once the line is locked, its structure no longer changes.' : null,
     problems: structural,

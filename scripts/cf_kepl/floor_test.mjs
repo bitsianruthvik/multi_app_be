@@ -359,6 +359,31 @@ try {
   ok('Tuesday is unchanged by it', gaps(tue) === gaps(put4) && tue.totals.shift === 540, `${gaps(tue)} vs ${gaps(put4)}`);
 
   /* ------------------------------------------------------------------------ */
+  section('5b. The whole 24 hours: work outside the shift is overtime, not refused');
+  const wdo = (list) => F.workingDayOffset(list.map(([a, b]) => ({ start: a * 60, end: b * 60 })));
+  ok('working day: no shift / a day shift run midnight to midnight', wdo([]) === 0 && wdo([[8, 17]]) === 0);
+  ok('working day: a night shift alone runs 20:00 → 20:00 (overtime after it stays with it)', wdo([[22, 6]]) === 20 * 60, String(wdo([[22, 6]])));
+  ok('working day: day + night runs 06:00 → 06:00', wdo([[8, 17], [22, 6]]) === 6 * 60, String(wdo([[8, 17], [22, 6]])));
+  ok('the day says its window (this machine now has a night shift: 06:00 → 06:00)', tue.window?.start === `${D}T06:00:00` && tue.window?.end === '2026-09-30T06:00:00', JSON.stringify(tue.window));
+  const beforeOt = tue.totals;
+  const ot = await F.putDay(conn, c, M.id, { date: D, operatorId: opA.id, rows: [{ kind: 'work', stepId: T1.id, start: `${D}T18:00`, end: `${D}T19:30`, good: 0 }] });
+  ok('work after the shift (18:00–19:30) is accepted and on Tuesday', ot.sessions.some((s) => s.stepId === T1.id && s.startedAt.endsWith('18:00:00')));
+  ok('it counts as 90 min overtime; shift time and not-recorded stay as they were',
+    ot.totals.overtimeMinutes === 90 && ot.totals.work === beforeOt.work + 90 && ot.totals.shift === 540 && ot.totals.notRecorded === beforeOt.notRecorded, JSON.stringify(ot.totals));
+  const otStop = await refusal(() => F.putDay(conn, c, M.id, { date: D, rows: [{ kind: 'stop', reasonId: reason('POWER'), start: `${D}T18:30`, end: `${D}T19:00` }] }));
+  ok('a stop over overtime work is still refused', said(otStop, /stopped or working/));
+  const otTwice = await refusal(() => F.putDay(conn, c, M.id, { date: D, rows: [{ kind: 'work', stepId: T1.id, start: `${D}T19:00`, end: `${D}T20:00` }] }));
+  ok('the same job twice at once is still refused out of shift', said(otTwice, /twice/));
+  const beforeDay = await refusal(() => F.putDay(conn, c, M.id, { date: D, rows: [{ kind: 'stop', reasonId: reason('POWER'), start: `${D}T05:00`, end: `${D}T05:30` }] }));
+  ok('05:00 on Tuesday belongs to Monday\'s working day and is refused on Tuesday', said(beforeDay, /day runs 06:00 to 06:00 the next day/), beforeDay?.problems?.join(' | '));
+  const nightOt = await F.putDay(conn, c, M.id, { date: N, operatorId: opB.id, rows: [{ kind: 'work', stepId: T4.id, start: `${D}T05:00`, end: `${D}T07:00`, good: 0 }] });
+  ok('night work running past the night shift (05:00–07:00) stays on Monday, 60 min overtime',
+    nightOt.sessions.some((s) => s.stepId === T4.id && s.startedAt === `${D}T05:00:00`) && nightOt.totals.overtimeMinutes === 60, JSON.stringify(nightOt.totals));
+  ok('Monday\'s not recorded shrinks to 03:00–05:00', gaps(nightOt) === '08:00-17:00,22:00-22:30,03:00-05:00', gaps(nightOt));
+  const tue2 = await F.getDay(conn, COMPANY, M.id, D);
+  ok('Tuesday does not take Monday\'s overtime', !tue2.sessions.some((s) => s.stepId === T4.id) && tue2.totals.overtimeMinutes === 90, JSON.stringify(tue2.totals));
+
+  /* ------------------------------------------------------------------------ */
   section('6. Back-dated `at`');
   const t1 = await stepRow(T1.id);
   const t1ev = (await events(T1.id)).find((e) => e.event === 'start');
@@ -505,6 +530,9 @@ try {
   ok(`GET queue takes a fixed handful (took ${qm2.queries})`, qm2.queries <= 20);
   const mm = await measured(() => F.listMachines(db, COMPANY));
   report.machines = { queries: mm.queries };
+  const mTyped = mm.result.find((x) => x.id === M.id);
+  ok('GET machines serves each machine type path root first, in the same 3 round trips', mm.queries <= 3 && Array.isArray(mTyped?.typePath) && mTyped.typePath.length >= 1
+    && mTyped.typePath.at(-1).name === mTyped.type && mTyped.typePath.every((p, i) => i === 0 || p.depth === mTyped.typePath[i - 1].depth + 1), JSON.stringify(mTyped?.typePath));
   console.log(`  GET queue: ${report.queue.queries} round trips first call (${report.queue.ms} ms, ${report.queue.total} steps), ${qm2.queries} warm (${qm2.ms} ms)`);
   console.log(`  GET day:   ${dm.queries} round trips (${dm.ms} ms)`);
   console.log(`  GET machines: ${mm.queries} round trips`);

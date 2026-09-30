@@ -118,7 +118,8 @@ async function buildFixture(db) {
 
   const [o] = await db.query('INSERT INTO cf_sales_orders (company_id, code, order_type, title, status) VALUES (?, ?, \'customer\', \'Import fixture\', \'confirmed\')', [COMPANY, `${tag}-SO`]);
   const root = await makeMaster(db, { code: `${tag}-ROOT`, name: 'Import fixture assembly', classificationId: cutNode, itemType: 'temporary' });
-  const [l] = await db.query('INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity) VALUES (?, ?, 1, \'custom\', ?, ?, 1, 1)',
+  // Frozen (locked_at): nesting lays out a frozen design only (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30).
+  const [l] = await db.query('INSERT INTO cf_sales_order_lines (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, locked_at, lock_position) VALUES (?, ?, 1, \'custom\', ?, ?, 1, 1, NOW(), 1)',
     [COMPANY, o.insertId, root, root]);
   const lineId = l.insertId;
   await db.query('UPDATE cf_item_details SET owner_order_line_id = ? WHERE company_id = ? AND master_id = ?', [lineId, COMPANY, root]);

@@ -87,7 +87,7 @@ try {
   const wasLocked = !!lockState?.locked_at;
   if (wasLocked) await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, LINE]);
   let v = await getAssignment(conn, COMPANY, ORDER, LINE);
-  ok('before lock: no rows, and one line of why', v.line.locked === false && v.rows.length === 0 && /Lock the line first/.test(v.line.why ?? ''), JSON.stringify(v.line));
+  ok('before lock: no rows, and one line of why', v.line.locked === false && v.rows.length === 0 && /Freeze the design first/.test(v.line.why ?? ''), JSON.stringify(v.line));
   ok('the contractors are listed (subcontractors only)', v.contractors.some((p) => p.id === A) && !v.contractors.some((p) => p.id === notSub));
   let err = await refusal(() => assignCells(conn, c, ORDER, LINE, { cells: [{ pieceId: 1, operationId: 1 }], contractorId: A }));
   ok('assigning on an unlocked line is refused (422 NOT_LOCKED)', err?.status === 422 && err.code === 'NOT_LOCKED', err?.message);
