@@ -19,6 +19,15 @@
  * revision of the same order: another row with the same number and revision
  * + 1. The row it replaced is 'revised' — kept as it was, frozen like a closed
  * order — and lists show the latest revision only unless asked for all.
+ *
+ * PRICES (init.sql §36, priceService). A line sells at a RATE per a BASIS —
+ * unit, kg, tonne or metre — net of tax. A standard line's rate defaults to the
+ * catalog item's list price (and its basis); a custom line has no list price to
+ * start from. The AMOUNT is rate × quantity, or × the line's rolled-up WEIGHT
+ * (per kg / tonne) or LENGTH (per metre): the line item's stored item-level
+ * value × the line quantity. Amounts and the order total are worked out on
+ * read, never stored. A rate is commercial, not structure: it may change on a
+ * locked or released line, only not on a closed, lost, cancelled or revised order.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES as LOCKED, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
@@ -29,6 +38,52 @@ import { explode } from './bomService.js';
 import { generate } from '../modules/codegen/index.js';
 import { resolveProcess } from './processService.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
+import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
+
+/**
+ * Amount per line: Map lineId → { billed, billedUom, amount, amountNote }. One
+ * read (the lines' WEIGHT/LENGTH values), and only when some line is priced
+ * per kg, tonne or metre. lines: rows with id, item_id, quantity, rate, rate_basis, uom?.
+ */
+async function lineAmounts(db, companyId, lines) {
+  const measured = lines.filter((l) => l.item_id && (l.rate_basis ?? 'unit') !== 'unit');
+  const measures = measured.length ? await measuresOf(db, companyId, measured.map((l) => l.item_id)) : new Map();
+  const out = new Map();
+  for (const l of lines) {
+    const basis = l.rate_basis ?? 'unit';
+    const a = amountOf(num(l.rate), basis, l.quantity, measures.get(l.item_id), l.uom ?? 'nos');
+    out.set(l.id, { billed: a.billed, billedUom: a.uom, amount: a.amount, amountNote: a.note });
+  }
+  return out;
+}
+
+/** The order's total from its lines' amounts: what is priced, and which lines are not (yet). */
+function orderTotal(lines, amounts) {
+  const unpriced = [];
+  const noMeasure = [];
+  let amount = 0;
+  for (const l of lines) {
+    const a = amounts.get(l.id);
+    if (l.rate == null) unpriced.push(l.line_no);
+    else if (a?.amount == null) noMeasure.push(l.line_no);
+    else amount += a.amount;
+  }
+  return {
+    amount: round2(amount),
+    currency: CURRENCY,
+    // Complete when every line has an amount; otherwise the total covers the rest.
+    complete: !unpriced.length && !noMeasure.length,
+    unpricedLines: unpriced, // line numbers with no rate
+    unmeasuredLines: noMeasure, // line numbers priced per kg/tonne/metre whose item has no WEIGHT/LENGTH yet
+  };
+}
+
+/** Reads rate / rateBasis / currency from a line input into `sets` (column names). */
+function readLinePrice(input, problems, sets) {
+  if (input.rate !== undefined) sets.rate = readPrice(input.rate, 'Rate', problems);
+  if (input.rateBasis !== undefined) sets.rate_basis = readBasis(input.rateBasis, 'Rate basis', problems) ?? 'unit';
+  if (input.currency !== undefined) readCurrency(input.currency, problems);
+}
 
 export const ORDER_TYPES = ['customer', 'stock'];
 export const TRANSITIONS = {
@@ -133,7 +188,20 @@ export async function listOrders(db, companyId, q = {}) {
       LIMIT ?`,
     [...params, limit],
   );
-  return rows.map(shapeOrder);
+  // Each order's total (init.sql §36): its priced lines, and the weights some of them need — two reads.
+  const totals = new Map();
+  if (rows.length) {
+    const [lines] = await db.query(
+      `SELECT l.id, l.order_id, l.line_no, l.item_id, l.quantity, l.rate, l.rate_basis
+         FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL`,
+      [companyId, rows.map((o) => o.id)],
+    );
+    const amounts = await lineAmounts(db, companyId, lines);
+    const byOrder = new Map();
+    for (const l of lines) { if (!byOrder.has(l.order_id)) byOrder.set(l.order_id, []); byOrder.get(l.order_id).push(l); }
+    for (const [orderId, ls] of byOrder) totals.set(orderId, orderTotal(ls, amounts));
+  }
+  return rows.map((o) => ({ ...shapeOrder(o), total: totals.get(o.id) ?? orderTotal([], new Map()) }));
 }
 
 function shapeOrder(o) {
@@ -223,6 +291,8 @@ export async function getOrder(db, companyId, id) {
     [companyId, id],
   );
   const stats = await structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id));
+  const amounts = await lineAmounts(db, companyId, lines);
+  order.total = orderTotal(lines, amounts);
   order.lines = lines.map((l) => ({
     id: l.id,
     lineNo: l.line_no,
@@ -235,6 +305,12 @@ export async function getOrder(db, companyId, id) {
     committedDate: dateText(l.committed_date),
     description: l.description,
     notes: l.notes,
+    // Price, net of tax (init.sql §36). billed = what the rate multiplies: the
+    // quantity (per unit), or the line's rolled-up weight in kg / t, or length in m.
+    rate: num(l.rate),
+    rateBasis: l.rate_basis ?? 'unit',
+    currency: l.currency ?? CURRENCY,
+    ...amounts.get(l.id),
     item: l.item_id ? { id: l.item_id, code: l.item_code, name: l.item_name, status: l.item_status, kind: l.item_type, uom: l.uom, revision: l.item_revision } : null,
     design: { id: l.design_id, code: l.design_code, name: l.design_name },
     bomRevision: l.bom_revision,
@@ -439,7 +515,7 @@ async function requireOrderLine(db, companyId, lineId) {
 }
 
 /**
- * Adds a line. input: { recordId, quantity, committedDate?, description?, lineNo?, notes? }.
+ * Adds a line. input: { recordId, quantity, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }.
  * recordId is a catalog item (standard line) or a template definition (custom
  * line — its temporary item and Custom BOM are created now).
  */
@@ -458,6 +534,8 @@ export async function addOrderLine(db, c, orderId, input = {}) {
     if (!Number.isInteger(lineNo) || lineNo <= 0 || lineNo > 1e6) problems.push('Line number is a positive whole number.');
   }
   if (blank(input.recordId)) problems.push('Choose a catalog item or a template definition.');
+  const price = {};
+  readLinePrice(input, problems, price);
   assertNoProblems(problems);
 
   const rec = await requireMaster(db, c.companyId, Number(input.recordId), 'That record');
@@ -483,13 +561,23 @@ export async function addOrderLine(db, c, orderId, input = {}) {
   if (kind === 'catalog') {
     const bom = await bomOfParent(db, c.companyId, rec.id);
     if (bom && bom.status === 'active') bomRevision = bom.revision;
+    // No rate typed: the item's list price, on the item's basis (stamped — a
+    // later change to the list does not move an order already quoted).
+    if (price.rate === undefined) {
+      const list = (await listPricesOf(db, c.companyId, [rec.id])).get(rec.id);
+      if (list?.listPrice != null) { price.rate = list.listPrice; if (price.rate_basis === undefined) price.rate_basis = list.priceBasis; }
+    }
   }
+  // A custom line (from a template) is priced by the tonne unless said otherwise — that is how a bridge is quoted.
+  if (kind === 'template' && price.rate_basis === undefined) price.rate_basis = 'tonne';
   const [r] = await db.query(
     `INSERT INTO cf_sales_order_lines
-       (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, committed_date, bom_revision, description, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, committed_date, bom_revision, description, notes, created_by,
+        rate, rate_basis, currency)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, orderId, lineNo, kind === 'catalog' ? 'standard' : 'custom', kind === 'catalog' ? rec.id : null, rec.id, position,
-      Number(quantity.toFixed(6)), committedDate, bomRevision, description, blank(input.notes) ? null : String(input.notes), c.userId],
+      Number(quantity.toFixed(6)), committedDate, bomRevision, description, blank(input.notes) ? null : String(input.notes), c.userId,
+      price.rate ?? null, price.rate_basis ?? 'unit', CURRENCY],
   );
   if (kind === 'template') {
     // The copy points the line at the item it makes, and settles the values,
@@ -499,7 +587,7 @@ export async function addOrderLine(db, c, orderId, input = {}) {
   return getOrder(db, c.companyId, orderId);
 }
 
-/** input: { quantity?, committedDate?, description?, lineNo?, notes? } — what a line sells cannot change. */
+/** input: { quantity?, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? } — what a line sells cannot change. */
 export async function updateOrderLine(db, c, lineId, input = {}) {
   const line = await requireOrderLine(db, c.companyId, lineId);
   const o = await requireOrder(db, c.companyId, line.order_id, { lock: true });
@@ -529,6 +617,7 @@ export async function updateOrderLine(db, c, lineId, input = {}) {
     if (!Number.isInteger(n) || n <= 0 || n > 1e6) problems.push('Line number is a positive whole number.');
     else sets.line_no = n;
   }
+  readLinePrice(input, problems, sets);
   assertNoProblems(problems);
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_sales_order_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,

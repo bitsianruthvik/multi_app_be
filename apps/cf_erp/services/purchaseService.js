@@ -31,11 +31,22 @@
  * movement through stockService — same ledger, same balances, same batches —
  * and stamps the line on it, so "ordered / received / outstanding" is a
  * history of movements rather than a running total nobody can check.
+ *
+ * PRICES (init.sql §36, priceService). A line carries a UNIT PRICE per its unit,
+ * net of tax. Left out, it defaults to the last price paid for the item (the
+ * newest priced line on an order that was sent). The amount (price × quantity)
+ * and the order total are worked out on read, never stored. A receipt carries
+ * the line's price to the stock ledger as its unit cost unless the receiver
+ * types another. The buy list estimates what the shortage will cost: the last
+ * price paid, else the item's list price turned into a price per unit.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { generate } from '../modules/codegen/index.js';
 import { availability } from './releaseService.js';
 import { postMovement } from './stockService.js';
+import {
+  CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
+} from './priceService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -127,6 +138,7 @@ export async function buyList(db, companyId, q = {}) {
   );
   const onOrder = await onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
   const free = await availability(db, companyId, rows.map((r) => r.item_id));
+  const estimates = await buyEstimates(db, companyId, rows.map((r) => r.item_id));
   let out = rows.map((r) => {
     const wanted = round6(r.wanted);
     const reserved = round6(r.reserved);
@@ -143,13 +155,60 @@ export async function buyList(db, companyId, q = {}) {
       toBuy: round6(Math.max(0, uncovered - freeNow - oo.quantity)),
       orders: (r.orders ?? '').split('\u001f').filter(Boolean).map((code, k) => ({ code, id: Number((r.order_ids ?? '').split('\u001f')[k]) })),
     };
-  });
+  }).map((row) => withEstimate(row, estimates.get(row.item.id)));
   if (String(q.show ?? 'short') !== 'all') out = out.filter((r) => r.toBuy > EPS);
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
     out = out.filter((r) => [r.item.code, r.item.name, ...r.orders.map((o) => o.code)].some((t) => t && String(t).toLowerCase().includes(term)));
   }
   return out.sort((a, b) => b.toBuy - a.toBuy || String(a.item.code ?? '').localeCompare(String(b.item.code ?? '')));
+}
+
+/**
+ * What one of each item is likely to cost: the last price paid, else the list
+ * price turned into a price per unit (a per-kg list price × the item's WEIGHT).
+ * Three reads for any number of items, whatever the list's length.
+ */
+async function buyEstimates(db, companyId, itemIds) {
+  if (!itemIds.length) return new Map();
+  const [paid, list, measures] = await Promise.all([
+    lastPricesPaid(db, companyId, itemIds),
+    listPricesOf(db, companyId, itemIds),
+    measuresOf(db, companyId, itemIds),
+  ]);
+  const out = new Map();
+  for (const id of itemIds) {
+    const p = paid.get(id);
+    if (p) { out.set(id, { unitPrice: p.unitPrice, source: 'last_paid', from: { id: p.orderId, code: p.orderCode, date: p.orderedAt } }); continue; }
+    const l = list.get(id);
+    const unit = l ? perUnitPrice(l.listPrice, l.priceBasis, measures.get(id)) : null;
+    out.set(id, unit != null ? { unitPrice: unit, source: 'list', from: null } : { unitPrice: null, source: null, from: null });
+  }
+  return out;
+}
+
+/** Adds the estimate to a buy-list row: estUnitPrice × toBuy = estCost (null when nothing is known). */
+function withEstimate(row, est) {
+  const unit = est?.unitPrice ?? null;
+  return {
+    ...row,
+    estUnitPrice: unit,
+    estSource: est?.source ?? null, // 'last_paid' | 'list' | null
+    estFrom: est?.from ?? null, // the purchase order the last price came from
+    estCost: unit == null ? null : round2(unit * row.toBuy),
+    currency: CURRENCY,
+  };
+}
+
+/** The buy list's estimated total: what can be priced, and how many short items cannot. */
+export function buyListTotal(rows) {
+  const priced = rows.filter((r) => r.estCost != null);
+  return {
+    estCost: round2(priced.reduce((t, r) => t + r.estCost, 0)),
+    currency: CURRENCY,
+    items: rows.length,
+    unpricedItems: rows.filter((r) => r.estCost == null && r.toBuy > EPS).length,
+  };
 }
 
 // --- the document ----------------------------------------------------------
@@ -195,6 +254,10 @@ async function restate(db, companyId, poId) {
   return status;
 }
 
+const shapeLastPaid = (p) => (p
+  ? { unitPrice: p.unitPrice, orderId: p.orderId, orderCode: p.orderCode, date: p.orderedAt, supplierName: p.supplierName }
+  : null);
+
 export async function getPurchaseOrder(db, companyId, id) {
   const p = await requireOrder(db, companyId, id);
   const [[sup]] = p.supplier_id
@@ -219,6 +282,11 @@ export async function getPurchaseOrder(db, companyId, id) {
   );
   const ordered = round6(lines.reduce((t, l) => t + Number(l.quantity), 0));
   const received = round6(lines.reduce((t, l) => t + Number(l.qty_received), 0));
+  // The last price paid elsewhere, beside each line — the buyer's yardstick.
+  const lastPaid = lines.length ? await lastPricesPaid(db, companyId, lines.map((l) => l.item_id), { exceptOrderId: p.id }) : new Map();
+  const priced = lines.filter((l) => l.unit_price != null);
+  const amount = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.quantity), 0));
+  const amountReceived = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.qty_received), 0));
   return {
     id: p.id,
     code: p.code,
@@ -229,7 +297,11 @@ export async function getPurchaseOrder(db, companyId, id) {
     orderedAt: p.ordered_at,
     notes: p.notes,
     createdAt: p.created_at,
-    totals: { lines: lines.length, ordered, received, outstanding: round6(Math.max(0, ordered - received)) },
+    totals: {
+      lines: lines.length, ordered, received, outstanding: round6(Math.max(0, ordered - received)),
+      // Money, net of tax (init.sql §36) — priced lines only; unpricedLines counts the rest.
+      amount, amountReceived, currency: CURRENCY, unpricedLines: lines.length - priced.length,
+    },
     lines: lines.map((l) => ({
       id: l.id,
       lineNo: l.line_no,
@@ -237,6 +309,10 @@ export async function getPurchaseOrder(db, companyId, id) {
       quantity: Number(l.quantity),
       received: Number(l.qty_received),
       outstanding: outstandingOf(l),
+      unitPrice: num(l.unit_price),
+      currency: l.currency ?? CURRENCY,
+      amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)),
+      lastPaid: shapeLastPaid(lastPaid.get(l.item_id)),
       expectedDate: l.expected_date,
       note: l.note,
       receipts: receipts.filter((v) => v.purchase_line_id === l.id)
@@ -257,7 +333,9 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     `SELECT p.*, s.name AS supplier_name, s.code AS supplier_code,
             (SELECT COUNT(*) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS line_count,
             (SELECT COALESCE(SUM(l.quantity), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS ordered,
-            (SELECT COALESCE(SUM(l.qty_received), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS received
+            (SELECT COALESCE(SUM(l.qty_received), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS received,
+            (SELECT COALESCE(SUM(l.quantity * l.unit_price), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS amount,
+            (SELECT COUNT(*) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL AND l.unit_price IS NULL) AS unpriced
        FROM cf_purchase_orders p LEFT JOIN cf_parties s ON s.id = p.supplier_id
       WHERE ${where.join(' AND ')} ORDER BY p.id DESC`,
     args,
@@ -276,6 +354,7 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
       ordered: round6(p.ordered),
       received: round6(p.received),
       outstanding: round6(Math.max(0, Number(p.ordered) - Number(p.received))),
+      amount: round2(p.amount), currency: CURRENCY, unpricedLines: Number(p.unpriced),
     },
   }));
   if (!blank(q.search)) {
@@ -355,20 +434,26 @@ export async function addPurchaseLine(db, c, poId, input = {}) {
   const item = await requireItem(db, c.companyId, input.itemId, problems);
   const quantity = readQty(input.quantity, 'Quantity', problems);
   const expectedDate = readDate(input.expectedDate, 'Expected date', problems);
+  const typedPrice = readPrice(input.unitPrice, 'Unit price', problems);
+  readCurrency(input.currency, problems);
   assertNoProblems(problems);
   const [[existing]] = await db.query(
-    'SELECT id, quantity FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND item_id = ? AND deleted_at IS NULL',
+    'SELECT id, quantity, unit_price FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND item_id = ? AND deleted_at IS NULL',
     [c.companyId, p.id, item.id],
   );
   if (existing) {
-    await db.query('UPDATE cf_purchase_order_lines SET quantity = ? WHERE company_id = ? AND id = ?',
-      [round6(Number(existing.quantity) + quantity), c.companyId, existing.id]);
+    // A typed price replaces the line's; otherwise the line keeps the one it has.
+    await db.query('UPDATE cf_purchase_order_lines SET quantity = ?, unit_price = ? WHERE company_id = ? AND id = ?',
+      [round6(Number(existing.quantity) + quantity), typedPrice ?? existing.unit_price, c.companyId, existing.id]);
   } else {
+    // No price typed: the last price paid for the item, if it was ever bought.
+    const unitPrice = typedPrice
+      ?? (await lastPricesPaid(db, c.companyId, [item.id], { exceptOrderId: p.id })).get(item.id)?.unitPrice ?? null;
     const [[{ n }]] = await db.query('SELECT COALESCE(MAX(line_no), 0) AS n FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ?', [c.companyId, p.id]);
     await db.query(
-      `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom, expected_date, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, p.id, Number(n) + 1, item.id, quantity, item.uom, expectedDate, blank(input.note) ? null : String(input.note).slice(0, 500)],
+      `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom, expected_date, note, unit_price, currency)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.companyId, p.id, Number(n) + 1, item.id, quantity, item.uom, expectedDate, blank(input.note) ? null : String(input.note).slice(0, 500), unitPrice, CURRENCY],
     );
   }
   await restate(db, c.companyId, p.id);
@@ -387,6 +472,9 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
   }
   if (input.expectedDate !== undefined) sets.expected_date = readDate(input.expectedDate, 'Expected date', problems);
   if (input.note !== undefined) sets.note = blank(input.note) ? null : String(input.note).slice(0, 500);
+  // Blank clears the price. What was already received keeps the cost it came in at.
+  if (input.unitPrice !== undefined) sets.unit_price = readPrice(input.unitPrice, 'Unit price', problems);
+  if (input.currency !== undefined) readCurrency(input.currency, problems);
   assertNoProblems(problems);
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_purchase_order_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
@@ -438,9 +526,11 @@ export async function suggestPurchase(db, c) {
   }
   let lineNo = 1;
   await db.query(
-    `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom)
+    `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom, unit_price, currency)
      VALUES ?`,
-    [rows.map((r) => [c.companyId, poId, lineNo++, r.item.id, r.toBuy, r.item.uom])],
+    // Each line is priced at the last price paid (the buy list has read it). Never the
+    // list price: that is what WE sell at, not a price agreed with a supplier.
+    [rows.map((r) => [c.companyId, poId, lineNo++, r.item.id, r.toBuy, r.item.uom, r.estSource === 'last_paid' ? r.estUnitPrice : null, CURRENCY])],
   );
   return { order: await getPurchaseOrder(db, c.companyId, poId), lines: rows.length, message: null };
 }
@@ -487,6 +577,7 @@ export async function receiveLine(db, c, lineId, input = {}) {
   const quantity = readQty(input.quantity ?? left, 'Quantity', problems);
   if (quantity != null && quantity > left + EPS) problems.push(`Only ${fmt(left)} ${l.uom} of this line is still outstanding.`);
   if (blank(input.stockingAreaId)) problems.push('Say which stocking area it went into.');
+  const receipt = receiptLineFor(l, { ...input, quantity }, problems);
   assertNoProblems(problems, 'The delivery cannot be booked.');
   const movement = await postMovement(db, c, {
     movementType: 'receipt',
@@ -495,12 +586,26 @@ export async function receiveLine(db, c, lineId, input = {}) {
     movementDate: input.movementDate,
     reference: input.reference,
     notes: input.notes,
-    lines: [{ itemId: l.item_id, quantity, batchId: input.batchId, batch: input.batch, notes: input.note }],
+    lines: [receipt],
   });
   await db.query('UPDATE cf_stock_movements SET purchase_line_id = ? WHERE company_id = ? AND id = ?', [l.id, c.companyId, movement.id]);
   await db.query('UPDATE cf_purchase_order_lines SET qty_received = qty_received + ? WHERE company_id = ? AND id = ?', [quantity, c.companyId, l.id]);
   await restate(db, c.companyId, l.purchase_order_id);
   return { movement, order: await getPurchaseOrder(db, c.companyId, l.purchase_order_id) };
+}
+
+/**
+ * The receipt line a delivery posts: item, quantity, batch — and the UNIT COST,
+ * the price the receiver typed (`unitCost`) or else the line's unit price. With
+ * no price anywhere, unitCost is left out. Exported so a test can check it
+ * without posting.
+ */
+export function receiptLineFor(l, input, problems = []) {
+  const typed = readPrice(input.unitCost, 'Unit cost', problems);
+  const unitCost = typed ?? (l.unit_price == null ? null : round4(l.unit_price));
+  const line = { itemId: l.item_id, quantity: input.quantity, batchId: input.batchId, batch: input.batch, notes: input.note };
+  if (unitCost != null) line.unitCost = unitCost;
+  return line;
 }
 
 /** For the nav badge and Home: how many items are short, and how many orders are waiting. */

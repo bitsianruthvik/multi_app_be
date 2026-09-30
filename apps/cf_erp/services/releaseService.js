@@ -552,14 +552,15 @@ async function planFor(db, companyId, line) {
 }
 
 /** Material needed, per item: how much in all, how much is free now, how much is short. */
-async function materialSummary(db, companyId, reqs) {
+/** opts.orderId: the order's customer's material counts as free for it (init.sql §35). */
+async function materialSummary(db, companyId, reqs, { orderId = null } = {}) {
   const need = new Map();
   for (const r of reqs) {
     const e = need.get(r.itemId) ?? { item: { id: r.itemId, code: r.design.code, name: r.design.name, uom: r.design.uom }, required: 0 };
     e.required = round6(e.required + r.quantity);
     need.set(r.itemId, e);
   }
-  const av = await availability(db, companyId, [...need.keys()]);
+  const av = await availability(db, companyId, [...need.keys()], { orderId });
   return [...need.values()].map((e) => {
     const a = av.get(e.item.id);
     return { ...e, free: a.free, short: round6(Math.max(0, e.required - a.free)) };
@@ -814,7 +815,7 @@ export async function releaseCheck(db, companyId, lineId) {
       requirements: (plan.reqs ?? []).length,
     },
     truncated: !!plan.truncated,
-    materials: await materialSummary(db, companyId, plan.reqs ?? []),
+    materials: await materialSummary(db, companyId, plan.reqs ?? [], { orderId: line.order_id ?? null }),
   };
 }
 
@@ -1097,7 +1098,10 @@ async function loadTracker(db, companyId, releaseIds) {
       WHERE v.company_id = ? AND v.requirement_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY v.id`,
     [companyId, reqIds],
   ) : [[]];
-  const free = await availability(db, companyId, [...new Set(reqs.map((q) => q.item_id))]);
+  // One order's tracker counts that customer's material as free for it; several
+  // orders' trackers count only ours (a customer's lot is never free for another order).
+  const orderIds = [...new Set(releases.map((r) => r.order_id))];
+  const free = await availability(db, companyId, [...new Set(reqs.map((q) => q.item_id))], { orderId: orderIds.length === 1 ? orderIds[0] : null });
   await nameLots(db, companyId, releases, items, reqs);
   return { releases, items, steps, deps, reqs, reservations, free };
 }
@@ -1709,7 +1713,7 @@ export async function stepHistory(db, companyId, stepId) {
 // --- material: reservations and issues ------------------------------------------------
 
 /** A requirement with what reserving and issuing it need to know — the same columns and row locks for one requirement or a whole release. */
-const REQUIREMENT_SQL = `SELECT q.*, r.order_id, o.code AS order_code, o.status AS order_status, l.line_no,
+const REQUIREMENT_SQL = `SELECT q.*, r.order_id, r.order_line_id, o.code AS order_code, o.status AS order_status, l.line_no,
             m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by
        FROM cf_material_requirements q
        JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
@@ -1765,9 +1769,34 @@ function wanted(q, have, input = {}) {
   return { want };
 }
 
-/** What to claim of `want` from an item's availability() entry, oldest batch first: { rows: [{ batchId, quantity }], result }. */
+/**
+ * What to claim of `want` from an item's availability() entry, oldest batch
+ * first: { rows: [{ batchId, quantity }], result }. The order's customer's own
+ * material first (availability sorts their lots first, and counts only theirs
+ * and ours — init.sql §35), then ours. An item counted by quantity keeps a
+ * customer's material in lots too: those lots are claimed by batch, then our
+ * loose stock with no batch.
+ */
 function takeFrom(q, want, av, input = {}) {
   const rows = [];
+  // An item counted by quantity has lots too (the customer's, production's): one named is taken from alone.
+  if (q.tracked_by !== 'batch' && !blank(input.batchId)) {
+    const lot = av.batches.find((x) => x.batchId === Number(input.batchId) && x.status === 'available' && x.free > EPS);
+    if (!lot) throw invalid('NOT_FREE', `That batch has nothing free of ${q.item_code}.`);
+    const take = round6(Math.min(want, lot.free));
+    rows.push({ batchId: lot.batchId, quantity: take });
+    want = round6(want - take);
+    return { rows, result: { reserved: sum(rows), short: want, message: null } };
+  }
+  if (q.tracked_by !== 'batch' && av.theirsFree > EPS) {
+    for (const b of av.batches) {
+      if (want <= EPS) break;
+      if (b.owner !== 'theirs' || b.status !== 'available' || b.free <= EPS) continue;
+      const take = round6(Math.min(want, b.free));
+      rows.push({ batchId: b.batchId, quantity: take });
+      want = round6(want - take);
+    }
+  }
   if (q.tracked_by === 'batch') {
     let batches = av.batches.filter((b) => b.status === 'available' && b.free > EPS);
     if (!blank(input.batchId)) {
@@ -1780,8 +1809,8 @@ function takeFrom(q, want, av, input = {}) {
       rows.push({ batchId: b.batchId, quantity: take });
       want = round6(want - take);
     }
-  } else if (av.free > EPS) {
-    const take = round6(Math.min(want, av.free));
+  } else if (av.free - av.theirsFree > EPS && want > EPS) {
+    const take = round6(Math.min(want, av.free - av.theirsFree));
     rows.push({ batchId: null, quantity: take });
     want = round6(want - take);
   }
@@ -1804,7 +1833,7 @@ async function reserveOne(db, c, q, input = {}) {
   const have = sum(await activeReservations(db, c.companyId, q.id));
   const w = wanted(q, have, input);
   if (w.done) return w.done;
-  const av = (await availability(db, c.companyId, [q.item_id])).get(q.item_id);
+  const av = (await availability(db, c.companyId, [q.item_id], { orderId: q.order_id })).get(q.item_id);
   const { rows, result } = takeFrom(q, w.want, av, input);
   await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, rows.map((r) => reservationRow(c, q, r)));
   return result;
@@ -1882,7 +1911,7 @@ export async function reserveRelease(db, c, releaseId) {
         [c.companyId, reqs.map((q) => q.id)],
       );
       const heldOf = groupBy(held, 'requirement_id');
-      const { bal, res } = await availabilityRows(db, c.companyId, itemIds);
+      const { bal, res } = await availabilityRows(db, c.companyId, itemIds, { orderId: rel.order_id });
       const stock = freeStock(bal, res);
       const writes = [];
       for (const q of reqs) {
@@ -1964,7 +1993,7 @@ export async function issueRequirement(db, c, reqId) {
   // The reservations fell first, so the issues below do not trip over them.
   for (const [areaId, lines] of byArea) {
     await postMovement(db, c, {
-      movementType: 'issue', orderId: q.order_id, fromAreaId: areaId, lines,
+      movementType: 'issue', orderId: q.order_id, orderLineId: q.order_line_id ?? undefined, fromAreaId: areaId, lines,
       reference: `${q.order_code}/${q.line_no}`, notes: `Material for line ${q.line_no} of ${q.order_code}`,
     });
   }

@@ -47,6 +47,7 @@ export const latestRevisionSql = (alias) =>
 // loads thousands of records at a time, and only a refusal needs the number.
 const MASTER_SELECT = `SELECT m.*,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
+            i.list_price, i.price_basis, i.currency AS price_currency,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
             so.revision AS owner_order_revision,

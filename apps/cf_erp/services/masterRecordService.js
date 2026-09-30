@@ -25,6 +25,7 @@ import { draftMaster, draftValueMap } from './drafts.js';
 import { bomOfParent, deleteBomOf, placementOf } from './bomGraph.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
+import { readPrice, readBasis, readCurrency } from './priceService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const SHORT_NAME_RE = /^[A-Za-z0-9_\-./]+$/;
@@ -150,6 +151,11 @@ export async function createItem(db, c, input = {}, opts = {}) {
   if (!SOURCING.includes(sourcing)) problems.push('Comes from stock, made on the order, or either.');
   const uom = blank(input.uom) ? 'nos' : String(input.uom).trim();
   if (uom.length > 20) problems.push('Unit of measure is up to 20 characters.');
+  // A catalog item may be given its list price as it is created (init.sql §36).
+  const listPrice = readPrice(input.listPrice, 'List price', problems);
+  const priceBasis = readBasis(input.priceBasis, 'Price basis', problems) ?? 'unit';
+  readCurrency(input.currency, problems);
+  if (itemType === 'temporary' && listPrice != null) problems.push('A row of an order\'s structure has no list price — price it on its order line.');
   const base = readBase(input, problems);
   assertNoProblems(problems);
 
@@ -159,9 +165,9 @@ export async function createItem(db, c, input = {}, opts = {}) {
     [c.companyId, base.code, base.name ?? '(pending)', base.shortName, base.description, classificationId, base.revision, c.userId],
   );
   await db.query(
-    `INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing, source_definition_id, owner_order_line_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [r.insertId, c.companyId, itemType, trackedBy, uom, sourcing, sourceDefinitionId, ownerOrderLineId],
+    `INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing, source_definition_id, owner_order_line_id, list_price, price_basis)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [r.insertId, c.companyId, itemType, trackedBy, uom, sourcing, sourceDefinitionId, ownerOrderLineId, listPrice, priceBasis],
   );
   if (opts.place) await opts.place(r.insertId);
   return finishCreate(db, c, r.insertId, 'item', base, input, opts);
@@ -262,6 +268,16 @@ export async function updateRecord(db, c, id, input = {}) {
       if (!SOURCING.includes(input.sourcing)) problems.push('Comes from stock, made on the order, or either.');
       else if (m.item_type === 'temporary') problems.push('A temporary item is always made on its order.');
       else detail.sourcing = input.sourcing;
+    }
+    // The list price (init.sql §36): what a catalog item sells for, net of tax. A
+    // row of an order's structure is priced on its order line, never here.
+    if (input.listPrice !== undefined || input.priceBasis !== undefined || input.currency !== undefined) {
+      if (m.item_type === 'temporary') problems.push('A row of an order\'s structure has no list price — price it on its order line.');
+      else {
+        if (input.listPrice !== undefined) detail.list_price = readPrice(input.listPrice, 'List price', problems);
+        if (input.priceBasis !== undefined) detail.price_basis = readBasis(input.priceBasis, 'Price basis', problems) ?? 'unit';
+        readCurrency(input.currency, problems);
+      }
     }
     if (input.itemType !== undefined && input.itemType !== m.item_type) problems.push('An item stays catalog or temporary.');
     if (input.sourceDefinitionId !== undefined && Number(input.sourceDefinitionId) !== m.source_definition_id) problems.push('The source definition is set when a temporary item is created.');
@@ -444,7 +460,13 @@ function shapeRecord(m) {
     createdAt: m.created_at,
     updatedAt: m.updated_at,
     item: m.record_kind === 'item'
-      ? { itemType: m.item_type, trackedBy: m.tracked_by, uom: m.uom, sourcing: m.sourcing, sourceDefinitionId: m.source_definition_id, ownerOrderLineId: m.owner_order_line_id }
+      ? {
+        itemType: m.item_type, trackedBy: m.tracked_by, uom: m.uom, sourcing: m.sourcing, sourceDefinitionId: m.source_definition_id, ownerOrderLineId: m.owner_order_line_id,
+        // What it sells for, net of tax (init.sql §36). Per price_basis: unit, kg, tonne or metre.
+        listPrice: m.list_price == null ? null : Number(m.list_price),
+        priceBasis: m.price_basis ?? 'unit',
+        currency: m.price_currency ?? 'INR',
+      }
       : null,
     definition: m.record_kind === 'definition'
       ? { definitionType: m.definition_type, selectionMode: m.selection_mode, candidateClassificationId: m.candidate_classification_id }
@@ -558,6 +580,7 @@ export async function listRecords(db, companyId, q = {}) {
   const [rows] = await db.query(
     `SELECT m.*, c.code AS classification_code, c.name AS classification_name,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
+            i.list_price, i.price_basis, i.currency AS price_currency,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             sd.code AS source_definition_code, ol.line_no AS owner_line_no, so.id AS owner_order_id, so.code AS owner_order_code,
             (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status,

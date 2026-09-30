@@ -3,15 +3,17 @@
  *
  *   GET    /orders?status=&orderType=&customerId=&search=&open=1
  *   POST   /orders                     { orderType, customerId?, title?, customerReference?, receivedOn?, committedDate?, deliveryAddress?, notes?, code? }
- *   GET    /orders/:id                 header + lines (+ structure counts per custom line)
+ *   GET    /orders/:id                 header + lines (+ structure counts per custom line) + total; each line rate, rateBasis, billed, billedUom, amount, amountNote
  *   PUT    /orders/:id                 header fields; the number only while the order has no lines
  *   POST   /orders/:id/status          { status }  — inquiry, quoted, confirmed, closed, lost, cancelled (customer)
  *                                                   draft, confirmed, closed, cancelled (stock)
  *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only — not a revision (discard it)
  *   POST   /orders/:id/revise          the next revision of the order: a copy of it, unlocked (revisionService)
  *   DELETE /orders/:id/revision        takes the latest revision away while none of its lines is locked
- *   POST   /orders/:id/lines           { recordId, quantity, committedDate?, description?, lineNo?, notes? }
- *   PUT    /order-lines/:id            { quantity?, committedDate?, description?, lineNo?, notes? }
+ *   POST   /orders/:id/lines           { recordId, quantity, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }
+ *                                      (no rate on a catalog item = its list price and basis)
+ *   PUT    /order-lines/:id            { quantity?, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }
+ *                                      rate/rateBasis also on a locked or released line (init.sql §36)
  *   DELETE /order-lines/:id            a custom line takes its structure with it
  *   GET    /order-lines/:id/structure  the whole structure the line sells
  *   GET    /order-lines/:id/cut-plates the blanks its plate parts are cut from

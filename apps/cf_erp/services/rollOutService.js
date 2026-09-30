@@ -67,54 +67,103 @@ export const nameOf = (n) => n.code ?? n.name;
 /**
  * What can be used now, per item and batch: on hand in storage and WIP areas
  * (a held batch counts for nothing), what is reserved, and what is free.
+ *
+ * WHOSE STOCK (init.sql §35, CF_ERP_MONEY_PLAN §1). Without `opts.orderId`
+ * only OUR stock counts — a customer's material never counts as ours (the buy
+ * list, the planner). With it, that order's customer's material counts too
+ * (their lots for that order — by order number, so every revision — or their
+ * lots that name no order), and comes FIRST: batch entries are sorted theirs
+ * first, and `theirsFree` says how much of `free` is theirs. Another
+ * customer's material never counts, for anyone.
  */
-export async function availability(db, companyId, itemIds) {
+export async function availability(db, companyId, itemIds, opts = {}) {
   if (!itemIds.length) return new Map();
-  const { bal, res } = await availabilityRows(db, companyId, itemIds);
+  const { bal, res } = await availabilityRows(db, companyId, itemIds, opts);
   return shapeAvailability(itemIds, bal, res);
 }
+
+/** Only our stock for the buy list: Map itemId -> free (ours). For purchaseService. */
+export async function ownFreeStock(db, companyId, itemIds) {
+  const av = await availability(db, companyId, itemIds);
+  return new Map([...av].map(([id, v]) => [id, v.free]));
+}
+
+/*
+ * 0 = ours, 1 = the order's customer's (usable for it), 2 = someone else's.
+ * `so` is the order asked about (NULL: none), `oo` the order a lot was supplied for.
+ */
+const OWNER_SCOPE = `CASE WHEN b.owner_party_id IS NULL THEN 0
+       WHEN so.id IS NOT NULL AND ((b.owner_order_id IS NOT NULL AND oo.code_active = so.code_active)
+                               OR (b.owner_order_id IS NULL AND b.owner_party_id = so.customer_id)) THEN 1
+       ELSE 2 END`;
 
 /**
  * The two reads availability() is worked out from: usable balances per item and
  * batch, and active reservations per item and batch. Split out so "reserve all"
  * can read them ONCE and keep them current in memory as it claims stock
  * (releaseService.reserveRelease), through the same shapeAvailability.
+ * opts.orderId — see availability(). Rows of someone else's lots are left out.
  */
-export async function availabilityRows(db, companyId, itemIds) {
+export async function availabilityRows(db, companyId, itemIds, { orderId = null } = {}) {
   const [bal] = await db.query(
-    `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on
+    `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on,
+            b.owner_party_id, MAX(${OWNER_SCOPE}) AS owner_scope
        FROM cf_stock_balances k
        JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose IN ${USABLE}
        LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
+       LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
+       LEFT JOIN cf_sales_orders so ON so.company_id = k.company_id AND so.id = ?
       WHERE k.company_id = ? AND k.item_id IN (?) AND k.quantity > 0
-      GROUP BY k.item_id, k.batch_id, b.code, b.status, b.received_on`,
-    [companyId, itemIds],
+      GROUP BY k.item_id, k.batch_id, b.code, b.status, b.received_on, b.owner_party_id
+     HAVING owner_scope < 2`,
+    [orderId, companyId, itemIds],
   );
   const [res] = await db.query(
-    `SELECT item_id, batch_id, SUM(quantity) AS qty FROM cf_stock_reservations
-      WHERE company_id = ? AND item_id IN (?) AND status = 'active' AND deleted_at IS NULL GROUP BY item_id, batch_id`,
-    [companyId, itemIds],
+    `SELECT v.item_id, v.batch_id, SUM(v.quantity) AS qty, MAX(${OWNER_SCOPE}) AS owner_scope
+       FROM cf_stock_reservations v
+       LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
+       LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
+       LEFT JOIN cf_sales_orders so ON so.company_id = v.company_id AND so.id = ?
+      WHERE v.company_id = ? AND v.item_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
+      GROUP BY v.item_id, v.batch_id
+     HAVING owner_scope < 2`,
+    [orderId, companyId, itemIds],
   );
   return { bal, res };
 }
 
-/** availability() from its rows — pure. `res` holds one row per (item, batch). */
+/**
+ * availability() from its rows — pure. `res` holds one row per (item, batch).
+ * Each batch entry says whose it is (`owner`: 'ours' | 'theirs'); theirs come
+ * first, then oldest first. `theirsFree` is the part of `free` that is the
+ * customer's (always in lots).
+ */
 export function shapeAvailability(itemIds, bal, res) {
   const out = new Map();
   const reservedOf = new Map(res.map((r) => [`${r.item_id}:${r.batch_id ?? 0}`, Number(r.qty)]));
-  for (const id of itemIds) out.set(id, { available: 0, reserved: 0, free: 0, batches: [] });
+  for (const id of itemIds) out.set(id, { available: 0, reserved: 0, free: 0, theirsFree: 0, batches: [] });
   for (const b of bal) {
     const entry = out.get(b.item_id);
     const usable = !b.batch_id || b.batch_status === 'available';
     const reserved = reservedOf.get(`${b.item_id}:${b.batch_id ?? 0}`) ?? 0;
     const qty = usable ? Number(b.qty) : 0;
     const free = round6(Math.max(0, qty - reserved));
-    if (b.batch_id) entry.batches.push({ batchId: b.batch_id, code: b.batch_code, status: b.batch_status, receivedOn: dateOnly(b.received_on), available: qty, reserved, free });
+    const theirs = Number(b.owner_scope ?? 0) === 1;
+    if (b.batch_id) {
+      entry.batches.push({
+        batchId: b.batch_id, code: b.batch_code, status: b.batch_status, receivedOn: dateOnly(b.received_on), available: qty, reserved, free,
+        owner: theirs ? 'theirs' : 'ours', ownerPartyId: b.owner_party_id ?? null,
+      });
+    }
     entry.available = round6(entry.available + qty);
     entry.free = round6(entry.free + free);
+    if (theirs) entry.theirsFree = round6(entry.theirsFree + free);
   }
   for (const r of res) { const e = out.get(r.item_id); if (e) e.reserved = round6(e.reserved + Number(r.qty)); }
-  for (const e of out.values()) e.batches.sort((a, b) => String(a.receivedOn ?? '').localeCompare(String(b.receivedOn ?? '')) || a.batchId - b.batchId);
+  for (const e of out.values()) {
+    e.batches.sort((a, b) => Number(b.owner === 'theirs') - Number(a.owner === 'theirs')
+      || String(a.receivedOn ?? '').localeCompare(String(b.receivedOn ?? '')) || a.batchId - b.batchId);
+  }
   return out;
 }
 
@@ -256,7 +305,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
   const sourcingOf = (n) => (n.kind === 'catalog' ? detail.get(n.id)?.sourcing ?? 'stock' : null);
   const maybe = lockedBoth ? [] : everyNode.filter((n) => n.kind === 'catalog' && sourcingOf(n) === 'both');
   const free = maybe.length
-    ? new Map([...(await availability(db, companyId, [...new Set(maybe.map((n) => n.id))]))].map(([id, v]) => [id, v.free]))
+    ? new Map([...(await availability(db, companyId, [...new Set(maybe.map((n) => n.id))], { orderId: line.order_id ?? null }))].map(([id, v]) => [id, v.free]))
     : new Map();
   const decide = madeRule({ orderType: line.order_type, sourcingOf, free, lockedBoth });
 

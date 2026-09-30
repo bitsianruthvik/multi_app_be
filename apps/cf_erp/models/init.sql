@@ -1264,7 +1264,7 @@ CREATE TABLE IF NOT EXISTS cf_stock_movements (
   id              INT           AUTO_INCREMENT PRIMARY KEY,
   company_id      INT           NOT NULL,
   code            VARCHAR(60)   NULL,             -- NULL only inside the transaction that posts it
-  movement_type   ENUM('receipt','issue','transfer','adjustment','scrap') NOT NULL,
+  movement_type   ENUM('receipt','issue','transfer','adjustment','scrap','return') NOT NULL,
   movement_date   DATE          NOT NULL,
   party_id        INT           NULL,             -- the supplier on a receipt
   order_id        INT           NULL,             -- the sales order an issue is for
@@ -2791,7 +2791,7 @@ CREATE TABLE IF NOT EXISTS cf_offcuts (
   rect_length_mm  DECIMAL(12,3)  NULL,
   rect_width_mm   DECIMAL(12,3)  NULL,
   outline_json    JSON           NULL,
-  status          ENUM('planned','available','used','scrapped') NOT NULL DEFAULT 'planned',
+  status          ENUM('planned','available','used','scrapped','returned') NOT NULL DEFAULT 'planned',
   notes           VARCHAR(500)   NULL,
 
   deleted_at      DATETIME       DEFAULT NULL,
@@ -3416,5 +3416,273 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
                AND COLUMN_NAME = 'origin' AND COLUMN_TYPE NOT LIKE '%''nest''%');
 SET @sql = IF(@col > 0,
   "ALTER TABLE cf_step_dependencies MODIFY COLUMN origin ENUM('flow','rule','default','nest') NOT NULL",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 35. STOCK MONEY AND OWNERSHIP — cost on every lot and ledger line, and whose
+--     stock it is (CF_ERP_MONEY_PLAN §1–2)
+-- ===========================================================================
+--
+-- Decided 2026-09-30 (user): "Track whether stock is OURS or the CUSTOMER'S —
+-- customers sometimes supply raw material, and the wastage has to be tracked
+-- and given back. Keep the COST of all stock at GRN."
+--
+-- OWNERSHIP lives on the LOT. cf_stock_batches.owner_party_id NULL = ours; a
+-- customer party = theirs, with owner_order_id the sales order it was supplied
+-- for (matched by order NUMBER, so a revision keeps its customer's material).
+-- Loose stock (batch_id NULL) is always ours: customer material always arrives
+-- as a lot, even for an item counted by quantity (stockService.postMovement).
+-- Offcuts and plate lots carry the owner of the plate they are cut from.
+--
+-- COST follows the item's tracking level (cf_item_details.tracked_by):
+--   batch       the lot's unit_cost, set by its receipt
+--   individual  a unit IS a lot of one — production's lot (production_item_id);
+--               its unit_cost stays NULL until production costing exists
+--   quantity    loose stock: one weighted average per item (and owner) in
+--               cf_item_costs. costed_qty is the quantity the average covers:
+--               stock that was on the shelf before costs were kept has no cost
+--               and stays "not costed" — NULL is unknown, never 0.
+-- Every ledger row records the unit cost and the value it moved (signed like
+-- quantity). Money: DECIMAL(18,4) unit costs, DECIMAL(18,2) values, INR.
+--
+-- A 'return' movement gives customer material back; return_kg records scrap
+-- handed back by weight. An issue now fills cf_stock_movements.order_line_id
+-- (§15 added it for shipments) with the line it was issued for, so job cost is
+-- per line; idx_csm_order serves the per-order reads.
+--
+-- Every ADD is guarded on its own; every key and foreign key is its own guarded
+-- ALTER after its column (TiDB cannot index a column in the ALTER that adds
+-- it). ENUM values are only APPENDED. No backfill: existing lots are ours and
+-- not costed.
+
+-- ---- 35a. Lots: owner and cost -------------------------------------------------
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'owner_party_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN owner_party_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'owner_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN owner_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'unit_cost');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN unit_cost DECIMAL(18,4) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'currency');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_stock_batches ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND INDEX_NAME = 'idx_csb_owner');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_batches ADD KEY idx_csb_owner (company_id, owner_party_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND INDEX_NAME = 'idx_csb_owner_order');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_batches ADD KEY idx_csb_owner_order (company_id, owner_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND CONSTRAINT_NAME = 'fk_csb_owner');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_stock_batches ADD CONSTRAINT fk_csb_owner FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND CONSTRAINT_NAME = 'fk_csb_owner_order');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_stock_batches ADD CONSTRAINT fk_csb_owner_order FOREIGN KEY (company_id, owner_order_id) REFERENCES cf_sales_orders(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 35b. Ledger rows: the cost and value each row moved ------------------------
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'unit_cost');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_ledger ADD COLUMN unit_cost DECIMAL(18,4) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'value');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_ledger ADD COLUMN value DECIMAL(18,2) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'currency');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_stock_ledger ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 35c. Movements: 'return', scrap returned by weight, the line issued for ----
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements'
+               AND COLUMN_NAME = 'movement_type' AND COLUMN_TYPE NOT LIKE '%''return''%');
+SET @sql = IF(@col > 0,
+  "ALTER TABLE cf_stock_movements MODIFY COLUMN movement_type ENUM('receipt','issue','transfer','adjustment','scrap','return') NOT NULL",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'return_kg');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_movements ADD COLUMN return_kg DECIMAL(14,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND INDEX_NAME = 'idx_csm_order');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_movements ADD KEY idx_csm_order (company_id, order_id, movement_type)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 35d. The weighted average of loose stock, per item and owner ---------------
+-- One row per item that has ever had a costed movement of loose stock.
+-- owner_party_id is NULL (ours) today — customer material is always a lot — and
+-- is in the key so a customer pool can come later without a migration.
+CREATE TABLE IF NOT EXISTS cf_item_costs (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  item_id         INT            NOT NULL,
+  owner_party_id  INT            NULL,
+  avg_unit_cost   DECIMAL(18,4)  NULL,            -- NULL until the first costed receipt
+  costed_qty      DECIMAL(18,6)  NOT NULL DEFAULT 0,  -- the quantity the average covers
+  currency        CHAR(3)        NOT NULL DEFAULT 'INR',
+  last_movement_id INT           NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  owner_key       INT            GENERATED ALWAYS AS (IFNULL(owner_party_id, 0)) VIRTUAL,
+
+  UNIQUE KEY uq_cic_tenant (company_id, id),
+  UNIQUE KEY uq_cic_item   (company_id, item_id, owner_key),
+
+  CONSTRAINT fk_cic_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cic_item     FOREIGN KEY (company_id, item_id)        REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_cic_owner    FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cic_movement FOREIGN KEY (company_id, last_movement_id) REFERENCES cf_stock_movements(company_id, id)
+);
+
+-- ---- 35e. Plate lots and offcuts: whose plate, and offcuts handed back ----------
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'owner_party_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN owner_party_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND CONSTRAINT_NAME = 'fk_cpl_owner');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_plate_lots ADD CONSTRAINT fk_cpl_owner FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'owner_party_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_offcuts ADD COLUMN owner_party_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'returned_movement_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_offcuts ADD COLUMN returned_movement_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts'
+               AND COLUMN_NAME = 'status' AND COLUMN_TYPE NOT LIKE '%''returned''%');
+SET @sql = IF(@col > 0,
+  "ALTER TABLE cf_offcuts MODIFY COLUMN status ENUM('planned','available','used','scrapped','returned') NOT NULL DEFAULT 'planned'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND INDEX_NAME = 'idx_cofc_owner');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_offcuts ADD KEY idx_cofc_owner (company_id, owner_party_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND CONSTRAINT_NAME = 'fk_cofc_owner');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_offcuts ADD CONSTRAINT fk_cofc_owner FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND CONSTRAINT_NAME = 'fk_cofc_returned');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_offcuts ADD CONSTRAINT fk_cofc_returned FOREIGN KEY (company_id, returned_movement_id) REFERENCES cf_stock_movements(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 36. PRICES — list price, sales rate, purchase unit price (CF_ERP_MONEY_PLAN §3)
+-- ===========================================================================
+--
+-- Decided 2026-09-30. A catalog item has a LIST price, a sales order line a RATE
+-- (default: the item's list price), a purchase order line a UNIT PRICE (default:
+-- the last price paid for the item). A list price and a rate are quoted per a
+-- BASIS — unit, kg, tonne or metre; per kg/tonne multiplies by the item's WEIGHT
+-- (on an order root, the roll-up of its structure), per metre by its LENGTH.
+-- AMOUNTS AND TOTALS ARE WORKED OUT ON READ (services/priceService.js), never
+-- stored: they follow from price x quantity x weight, and a stored amount would
+-- go stale when a roll-up changed. Every price is NET OF TAX (GST comes later
+-- and sits on top). Currency is INR only for now; the column lets another come
+-- later without a migration. Money: DECIMAL(18,4) unit prices.
+--
+-- Plain columns, no keys, each ADD guarded on its own (TiDB: never a key in the
+-- same ALTER as its column; re-running is a no-op).
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'unit_price');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_purchase_order_lines ADD COLUMN unit_price DECIMAL(18,4) NULL COMMENT 'net of tax, per the line uom'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'currency');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_purchase_order_lines ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'rate');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_sales_order_lines ADD COLUMN rate DECIMAL(18,4) NULL COMMENT 'net of tax, per rate_basis'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'rate_basis');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_sales_order_lines ADD COLUMN rate_basis ENUM('unit','kg','tonne','metre') NOT NULL DEFAULT 'unit'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'currency');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_sales_order_lines ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'list_price');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_item_details ADD COLUMN list_price DECIMAL(18,4) NULL COMMENT 'net of tax, per price_basis'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'price_basis');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_item_details ADD COLUMN price_basis ENUM('unit','kg','tonne','metre') NOT NULL DEFAULT 'unit'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'currency');
+SET @sql = IF(@col = 0,
+  "ALTER TABLE cf_item_details ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'",
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

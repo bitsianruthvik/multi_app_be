@@ -100,6 +100,7 @@ import { subtreeIds } from './tree.js';
 import { explode } from './bomService.js';
 import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 import { analyseNest } from './nestGeometry.js';
+import { availability } from './rollOutService.js';
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -814,6 +815,33 @@ async function candidatePlates(db, companyId, plateIds) {
   return rows.map((r) => ({ ...r, steel: steelOf(values.get(r.id).size) }));
 }
 
+/**
+ * THE CUSTOMER'S OWN PLATES (init.sql §35, CF_ERP_MONEY_PLAN §1). When the
+ * order's customer supplied plate, those plates are offered to the packer FIRST
+ * for their order: a sheet that is preferred, costs nothing (it is not bought)
+ * and is limited to the WHOLE plates of theirs that are free. Only the order's
+ * customer's material is ever read — availability() never counts another
+ * customer's lot — so another customer's plate is never nested. Our own stock
+ * is not offered here (nesting still buys by catalog size). One read.
+ * Returns Map plateItemId -> { ownerPartyId, count }.
+ */
+async function customerPlates(db, companyId, orderId, plateIds) {
+  const out = new Map();
+  if (!orderId || !plateIds.length) return out;
+  const av = await availability(db, companyId, plateIds, { orderId });
+  for (const [plateId, e] of av) {
+    const owners = new Map();
+    for (const b of e.batches) {
+      if (b.owner !== 'theirs' || b.status !== 'available' || b.free <= EPS) continue;
+      owners.set(b.ownerPartyId, (owners.get(b.ownerPartyId) ?? 0) + b.free);
+    }
+    // One customer per order, so at most one owner; the biggest if a party ever changed.
+    const best = [...owners].sort((a, b) => b[1] - a[1])[0];
+    if (best && Math.floor(best[1] + 1e-6) >= 1) out.set(plateId, { ownerPartyId: Number(best[0]), count: Math.floor(best[1] + 1e-6) });
+  }
+  return out;
+}
+
 const agrees = (plateValue, groupValue) => plateValue == null || norm(plateValue) === norm(groupValue);
 
 function sheetsFor(plates, group) {
@@ -894,6 +922,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const pack = await loadPacker(input.pack);
   const settingRows = await cutSettingRows(db, companyId);
   const plates = await candidatePlates(db, companyId, where.plateIds);
+  const theirs = await customerPlates(db, companyId, line.order_id, plates.map((p) => p.id));
 
   // NEST THE REST. Pieces already on imported lots are not demand any more;
   // what is left is what the packer is asked to place. With nothing imported
@@ -957,13 +986,22 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }
 
     const pieceArea = g.cutPlates.reduce((a, cp) => a + cp.steel.length * cp.steel.width * cp.pieces, 0);
-    const sheets = sortSheets(candidates.map((p) => ({
-      id: p.id, key: `pl${p.id}`, plate: p,
-      length: p.steel.length, width: p.steel.width,
-      areaCost: p.steel.length * p.steel.width,
-      preferred: false,                                    // offcut sourcing is not built yet
-      available: Math.min(1000, Math.max(1, Math.ceil(pieceArea / (p.steel.length * p.steel.width)) + 2)),
-    })));
+    const sheets = sortSheets([
+      ...candidates.map((p) => ({
+        id: p.id, key: `pl${p.id}`, plate: p,
+        length: p.steel.length, width: p.steel.width,
+        areaCost: p.steel.length * p.steel.width,
+        preferred: false,                                  // offcut sourcing is not built yet
+        available: Math.min(1000, Math.max(1, Math.ceil(pieceArea / (p.steel.length * p.steel.width)) + 2)),
+      })),
+      // The customer's own plates of this size: first, free, and only as many as they sent.
+      ...candidates.filter((p) => theirs.has(p.id)).map((p) => ({
+        id: p.id, key: `pl${p.id}c${theirs.get(p.id).ownerPartyId}`, plate: p,
+        length: p.steel.length, width: p.steel.width,
+        areaCost: 0, preferred: true, available: theirs.get(p.id).count,
+        ownerPartyId: theirs.get(p.id).ownerPartyId,
+      })),
+    ]);
     const pieces = sortPieces(g.cutPlates.map((cp) => ({
       id: cp.id, key: `cp${cp.id}`, cutPlate: cp,
       length: cp.steel.length, width: cp.steel.width, qty: cp.pieces,
@@ -1238,7 +1276,9 @@ function shapeNest(n, sheetByKey, pieceByKey, settings, g) {
     plateItemId: sheet?.id ?? null,
     plateCode: sheet?.plate?.code ?? n.sheetKey,
     plateName: sheet?.plate?.name ?? null,
-    source: n.preferred ? 'offcut' : 'catalog',
+    // A customer's plate is a catalog plate that is theirs, not an offcut.
+    source: sheet?.ownerPartyId ? 'catalog' : (n.preferred ? 'offcut' : 'catalog'),
+    ownerPartyId: sheet?.ownerPartyId ?? null,
     thickness: g.thickness, grade: g.grade, material: g.material, density,
     length, width,
     ...requiredSize(pieces, settings.kerfMm),
@@ -1370,6 +1410,8 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   const plates = await candidatePlates(db, companyId, where.plateIds);
   const plateById = new Map(plates.map((p) => [p.id, p]));
   const cpById = new Map(cutPlates.map((cp) => [cp.id, cp]));
+  const theirs = await customerPlates(db, companyId, line.order_id, plates.map((p) => p.id));
+  const theirsUsed = new Map();
 
   // NEST THE REST: the imported lots stay, and what they hold is not asked of
   // this plan. Read from the DB, like everything else here.
@@ -1412,9 +1454,21 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       continue;
     }
     const settings = pickCutSettings(settingRows, plate.steel.thickness);
+    // A lot on the customer's own plate: only their order's customer, and no
+    // more of them than they have free (init.sql §35).
+    let ownerPartyId = null;
+    if (n.ownerPartyId != null && n.ownerPartyId !== '') {
+      const t = theirs.get(plate.id);
+      const used = (theirsUsed.get(plate.id) ?? 0) + 1;
+      theirsUsed.set(plate.id, used);
+      if (!t || Number(t.ownerPartyId) !== Number(n.ownerPartyId)) problems.push(`${label}: it is marked as the customer's plate, but this order's customer has no free ${nameOf(plate)} — a plate that is not theirs, or another customer's, is never used for this order.`);
+      else if (used > t.count) problems.push(`${label}: the customer has only ${t.count} free ${nameOf(plate)} — this is plate ${used} of theirs.`);
+      else ownerPartyId = t.ownerPartyId;
+    }
     const lot = {
       lotNo: n.lotNo ?? `N-${String(i + 1).padStart(3, '0')}`,
       plate,
+      ownerPartyId,
       source: n.source === 'offcut' ? 'offcut' : 'catalog',
       isManual: !!n.isManual,
       settings,
@@ -1462,7 +1516,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       offcutMinAreaMm2: lot.settings.offcutMinAreaMm2, offcutMinSideMm: lot.settings.offcutMinSideMm,
     }, pieces);
     return {
-      lotNo, plate: lot.plate, source: lot.source, isManual: lot.isManual, settings: lot.settings,
+      lotNo, plate: lot.plate, source: lot.source, isManual: lot.isManual, settings: lot.settings, ownerPartyId: lot.ownerPartyId,
       grade: steel.grade ?? lot.plate.steel.grade,
       material: steel.material ?? lot.plate.steel.material,
       density,
@@ -1513,13 +1567,13 @@ async function writeLots(db, c, orderLineId, lots) {
     'company_id', 'order_line_id', 'plate_item_id', 'lot_no', 'source', 'thickness_mm', 'length_mm', 'width_mm',
     'required_length_mm', 'required_width_mm', 'grade', 'material', 'density',
     'kerf_mm', 'seq_gap_min_mm', 'seq_gap_max_mm', 'guillotine', 'is_manual',
-    'origin', 'check_verdict', 'check_json', 'forced', 'waste_json', 'notes', 'created_by',
+    'origin', 'check_verdict', 'check_json', 'forced', 'waste_json', 'notes', 'owner_party_id', 'created_by',
   ], lots.map((l) => [
     companyId, orderLineId, l.plate.id, l.lotNo, l.source ?? 'catalog',
     l.plate.steel.thickness, l.plate.steel.length, l.plate.steel.width,
     l.requiredLength ?? null, l.requiredWidth ?? null, l.grade ?? null, l.material ?? null, l.density ?? null,
     l.settings.kerfMm, l.settings.seqGapMinMm, l.settings.seqGapMaxMm, l.settings.guillotine ? 1 : 0, l.isManual ? 1 : 0,
-    l.origin ?? 'auto', l.verdict ?? null, json(l.reasons), l.forced ? 1 : 0, json(l.waste?.json), l.notes ?? null, user,
+    l.origin ?? 'auto', l.verdict ?? null, json(l.reasons), l.forced ? 1 : 0, json(l.waste?.json), l.notes ?? null, l.ownerPartyId ?? null, user,
   ]), 500);
 
   const [idRows] = await db.query(
@@ -1545,7 +1599,7 @@ async function writeLots(db, c, orderLineId, lots) {
         l.density ?? null, o.area, o.weightKg,
         o.bbox?.x ?? null, o.bbox?.y ?? null, o.bbox?.length ?? null, o.bbox?.width ?? null,
         o.rect?.x ?? null, o.rect?.y ?? null, o.rect?.length ?? null, o.rect?.width ?? null,
-        JSON.stringify(o.outline ?? []), user,
+        JSON.stringify(o.outline ?? []), l.ownerPartyId ?? null, user,   // an offcut is whoever's plate it was cut from
       ]);
     }
     out.push({ id: lotId, lotNo: l.lotNo, plateItemId: l.plate.id, pieces: l.pieces.length, offcuts: l.waste?.offcuts?.length ?? 0 });
@@ -1559,7 +1613,7 @@ async function writeLots(db, c, orderLineId, lots) {
     'density', 'area_mm2', 'weight_kg',
     'bbox_x_mm', 'bbox_y_mm', 'bbox_length_mm', 'bbox_width_mm',
     'rect_x_mm', 'rect_y_mm', 'rect_length_mm', 'rect_width_mm',
-    'outline_json', 'created_by',
+    'outline_json', 'owner_party_id', 'created_by',
   ], offcuts, 200);
   return out;
 }
@@ -1945,7 +1999,7 @@ export async function getNesting(db, companyId, orderLineId) {
     }
     groups.get(key).nests.push({
       id: l.id, lotNo: l.lot_no, plateItemId: l.plate_item_id, plateCode: l.plate_code, plateName: l.plate_name,
-      source: l.source, isManual: !!l.is_manual,
+      source: l.source, isManual: !!l.is_manual, ownerPartyId: l.owner_party_id ?? null,
       thickness: round3(l.thickness_mm), grade: l.grade, material: l.material, density: l.density == null ? null : Number(l.density),
       length, width,
       requiredLength: l.required_length_mm == null ? null : Number(l.required_length_mm),

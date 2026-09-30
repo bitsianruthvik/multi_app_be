@@ -11,12 +11,15 @@
  *                                      only. A duplicate is 409 DUPLICATE_OPTION naming (and returning,
  *                                      as `existing`) the value already there; `narrowedOut` says the
  *                                      rule where the record sits does not allow it yet.
- *   POST   /items                      { itemType, classificationId | sourceDefinitionId+ownerOrderLineId, name?, code?, uom?, trackedBy?, status?, revision?, values? }
+ *   POST   /items                      { itemType, classificationId | sourceDefinitionId+ownerOrderLineId, name?, code?, uom?, trackedBy?, status?, revision?, values?, listPrice?, priceBasis? }
  *   POST   /definitions                { definitionType, classificationId, name?, code?, selectionMode?, candidateClassificationId?, status?, values? }
  *   GET    /records/:id
  *   GET    /records/:id/specs          every rule that reaches it, with values and where they came from
  *   GET    /records/:id/history        value history
- *   PUT    /records/:id                name, description, code (draft only), classification, uom, tracking, selection fields
+ *   GET    /records/:id/prices         { itemId, currency, listPrice, priceBasis, listUnitPrice, lastPurchasePrice, lastPurchaseDate,
+ *                                        lastPurchaseOrder{id,code}|null, lastPurchaseSupplier{id,name}|null } — net of tax (init.sql §36)
+ *   PUT    /records/:id                name, description, code (draft only), classification, uom, tracking, selection fields,
+ *                                      listPrice (null clears) + priceBasis unit|kg|tonne|metre — catalog items only
  *   PUT    /records/:id/values         { values: [{ specCode | specificationId, value }] }
  *   POST   /records/:id/status         { status: active | obsolete }
  *   POST   /records/:id/revision       { revision? }  (empty = next label)
@@ -46,6 +49,7 @@ import {
 import { createCatalogNode } from '../services/classificationService.js';
 import { addCatalogOption } from '../services/specificationService.js';
 import { withCutPieces, ownerLineOf } from '../services/cutPlateService.js';
+import { itemPrices } from '../services/priceService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -84,6 +88,7 @@ router.post('/definitions', guard(PERM.catalog), handle((req) => tx(req, (db, c)
 
 router.get('/records/:id', guard(PERM.view), handle((req) => getRecord(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/specs', guard(PERM.view), handle((req) => getRecordSpecs(pool, ctx(req).companyId, id(req))));
+router.get('/records/:id/prices', guard(PERM.view), handle((req) => itemPrices(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/history', guard(PERM.view), handle((req) => getHistory(pool, ctx(req).companyId, 'master', id(req), req.query.limit)));
 router.put('/records/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => updateRecord(db, c, id(req), req.body))));
 router.put('/records/:id/values', guard(PERM.catalog), handle((req) => tx(req, async (db, c) => {

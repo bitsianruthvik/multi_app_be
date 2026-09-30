@@ -13,15 +13,52 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMaster, LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { requireArea, shapeArea } from './stockingAreaService.js';
-import { requireBatch, checkBatchValues, createBatch } from './batchService.js';
+import { requireBatch, checkBatchValues, createBatch, ownerOf } from './batchService.js';
 import { generate } from '../modules/codegen/index.js';
 
-export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap'];
-const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR' };
+export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
+const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const EPS = 1e-9;
 const round6 = (n) => Number(Number(n).toFixed(6));
+const round4 = (n) => Number(Number(n).toFixed(4));
+const round2 = (n) => Number(Number(n).toFixed(2));
+const numOrNull = (v) => (v == null ? null : Number(v));
+
+/*
+ * MONEY AND OWNERSHIP (init.sql §35, CF_ERP_MONEY_PLAN §1–2, decided 2026-09-30).
+ *
+ * OWNER: a lot (cf_stock_batches) is ours (owner_party_id NULL) or a customer's.
+ * Loose stock is always ours — customer material always arrives as a lot, even
+ * for an item counted by quantity. A customer's lot is used only for THAT
+ * customer's order: the order it was supplied for (by order number, so every
+ * revision), or, when it names none, any order of that customer (usableFor).
+ *
+ * COST follows the tracking level. A lot keeps its own unit cost (batch items,
+ * and a unit is production's lot of one). Loose stock of a quantity item is
+ * valued at one weighted average per item (cf_item_costs), over `costed_qty` —
+ * stock that was on the shelf before costs were kept is NOT COSTED (NULL, shown
+ * as unknown, never 0). Costed stock is taken first: an issue is valued at the
+ * average while any costed quantity is left, and is not costed after that.
+ * A receipt sets the cost; issue, scrap, return and a count move value out at
+ * the stock's cost; a transfer keeps it (both legs at the same cost, the
+ * average untouched). Every ledger row records unit_cost and value (signed like
+ * quantity). A reversal moves the exact opposite value.
+ */
+
+/** Whether a lot may be used for an order: ours always; a customer's only for that customer's order. */
+export function usableFor(batch, order) {
+  if (!batch?.owner_party_id) return true;
+  if (!order) return false;
+  if (batch.owner_order_id) {
+    const mine = order.code_active ?? (order.code == null ? null : String(order.code).toLowerCase());
+    return batch.owner_order_code_active != null && mine != null && String(batch.owner_order_code_active) === String(mine);
+  }
+  return order.customer_id != null && Number(batch.owner_party_id) === Number(order.customer_id);
+}
+
+const ownerName = (b) => b.owner_party_name ?? b.owner_party_code ?? `party ${b.owner_party_id}`;
 const fmt = (n) => String(round6(n));
 const blank = (v) => v == null || String(v).trim() === '';
 const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : d ?? null);
@@ -192,11 +229,35 @@ function areaReader(db, companyId, problems) {
  * Reads one line into { lineNo, item, batch | newBatch, legs: [{ area, sign }], quantity | counted }.
  * Problems are collected with the line number in front.
  */
-async function planLine(db, c, type, l, n, header, getArea, problems, { fromProduction = false } = {}) {
+async function planLine(db, c, type, l, n, header, getArea, problems, { fromProduction = false, owners = null } = {}) {
   const P = (msg) => problems.push(`Line ${n}: ${msg}`);
   const item = await stockItem(db, c.companyId, l.itemId, P, { receipt: type === 'receipt', fromProduction });
   if (!item) return null;
-  const plan = { lineNo: n, item, batch: null, newBatch: null, legs: [], quantity: null, counted: null, notes: blank(l.notes) ? null : String(l.notes).slice(0, 255) };
+  const plan = {
+    lineNo: n, item, batch: null, newBatch: null, legs: [], quantity: null, counted: null, notes: blank(l.notes) ? null : String(l.notes).slice(0, 255),
+    unitCost: null, owner: null,
+  };
+
+  // The cost a receipt brings (the PO line's price, or typed). Everything else
+  // moves at the cost the stock already has, so nothing else may carry one.
+  if (!blank(l.unitCost)) {
+    const u = Number(l.unitCost);
+    if (type !== 'receipt') P('only a receipt carries a cost — everything else moves at the cost the stock already has.');
+    else if (!Number.isFinite(u) || u < 0) P('unit cost is a number, zero or more.');
+    else if (u >= 1e14) P('unit cost is too large.');
+    else plan.unitCost = round4(u);
+  }
+
+  // Whose it is. Only a receipt says: customer material comes in as a lot owned
+  // by that customer, for the order named (init.sql §35).
+  if (type === 'receipt' && owners) {
+    const partyId = blank(l.ownerPartyId) ? owners.defaultPartyId : l.ownerPartyId;
+    const orderId = blank(l.ownerOrderId) ? owners.defaultOrderId : l.ownerOrderId;
+    if (!blank(partyId) || !blank(orderId)) plan.owner = await owners.resolve(partyId, orderId, P);
+    if (plan.owner === undefined) return null;
+  } else if (!blank(l.ownerPartyId) || !blank(l.ownerOrderId)) {
+    P('only a receipt says whose stock it is — a lot keeps its owner after that.');
+  }
 
   if (type === 'adjustment' && !blank(l.countedQuantity)) {
     const q = Number(l.countedQuantity);
@@ -208,7 +269,7 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
   if (type === 'receipt') {
     const to = await getArea(pick('toAreaId'), P, 'goes into', { inbound: true });
     if (to) plan.legs.push({ area: to, sign: 1 });
-  } else if (type === 'issue' || type === 'scrap') {
+  } else if (type === 'issue' || type === 'scrap' || type === 'return') {
     const from = await getArea(pick('fromAreaId'), P, 'comes from', { inbound: false });
     if (from && type === 'issue' && from.purpose === 'quarantine') P(`${from.code} holds stock in quarantine — move it to storage before issuing it.`);
     else if (from) plan.legs.push({ area: from, sign: -1 });
@@ -225,7 +286,9 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
   // Lots. An item kept by batch always has one. Anything else has one only when
   // production made it: that lot is how a finished piece keeps its identity on
   // the shelf (user, 2026-09-23), and it is what a shipment then takes back off.
-  const keepsLots = item.tracked_by === 'batch' || (fromProduction && !!l.batch);
+  // Customer material is always a lot (loose stock is always ours), and what
+  // goes back to a customer is always one of their lots.
+  const keepsLots = item.tracked_by === 'batch' || (fromProduction && !!l.batch) || !!plan.owner || type === 'return';
   if (keepsLots) {
     if (type === 'receipt' && blank(l.batchId)) {
       const nb = l.batch ?? {};
@@ -235,7 +298,7 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
       vp.forEach((p) => P(p));
       plan.newBatch = nb;
     } else if (blank(l.batchId)) {
-      P(`${item.code} is kept by batch — say which batch.`);
+      P(type === 'return' ? `say which of the customer's lots of ${item.code} goes back.` : `${item.code} is kept by batch — say which batch.`);
     } else {
       let b = null;
       try { b = await requireBatch(db, c.companyId, l.batchId); } catch { P('that batch does not exist.'); }
@@ -250,9 +313,10 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
     // even for an item that is otherwise counted by quantity.
     let b = null;
     try { b = await requireBatch(db, c.companyId, l.batchId); } catch { P('that batch does not exist.'); }
-    // The only batches such an item has are the lots production made of it;
-    // anything else named here is simply not one of its batches.
-    if (b && (b.item_id !== item.id || !b.production_item_id)) P(`${item.code} is counted by quantity — it has no batches.`);
+    // The only batches such an item has are the lots production made of it and
+    // the lots a customer supplied (and a unit-tracked item's lots ARE its units);
+    // anything else named here is not one of its batches.
+    if (b && (b.item_id !== item.id || (!b.production_item_id && !b.owner_party_id && item.tracked_by !== 'individual'))) P(`${item.code} is counted by quantity — it has no batches.`);
     else if (b) plan.batch = b;
   } else if (l.batch) {
     P(`${item.code} is counted by quantity — it has no batches.`);
@@ -263,10 +327,27 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
     // and a made piece still leaves the yard as the piece it is.
     plan.batch = await oldestLotFor(db, c.companyId, item, plan.legs[0].area.id, plan.quantity);
   }
+
+  // Ownership, once the lot is known.
+  const b = plan.batch;
+  if (type === 'receipt' && b) {
+    const same = Number(b.owner_party_id ?? 0) === Number(plan.owner?.partyId ?? 0)
+      && Number(b.owner_order_id ?? 0) === Number(plan.owner?.orderId ?? 0);
+    if (!same) P(`batch ${b.code} is ${b.owner_party_id ? `${ownerName(b)}'s material` : 'ours'} — receive ${plan.owner ? "the customer's material" : 'our stock'} into a new batch.`);
+  }
+  if (type === 'issue' && b?.owner_party_id && !usableFor(b, owners?.order)) {
+    P(owners?.order
+      ? `batch ${b.code} is ${ownerName(b)}'s material${b.owner_order_code ? ` for ${b.owner_order_code}` : ''} — it is used only for their order, not ${owners.order.code}.`
+      : `batch ${b.code} is ${ownerName(b)}'s material — it is issued only to their order; name the order.`);
+  }
+  if (type === 'return' && b) {
+    if (!b.owner_party_id) P(`batch ${b.code} is our stock — only a customer's material goes back to them.`);
+    else if (owners?.party && Number(owners.party.id) !== Number(b.owner_party_id)) P(`batch ${b.code} is ${ownerName(b)}'s material, not ${owners.party.name}'s.`);
+  }
   return plan;
 }
 
-const OUTBOUND = new Set(['issue', 'transfer', 'scrap']);
+const OUTBOUND = new Set(['issue', 'transfer', 'scrap', 'return']);
 
 /** The oldest production lot in an area that covers what is being taken, if loose stock cannot. */
 async function oldestLotFor(db, companyId, item, areaId, quantity) {
@@ -276,7 +357,7 @@ async function oldestLotFor(db, companyId, item, areaId, quantity) {
     `SELECT b.* FROM cf_stock_balances k
        JOIN cf_stock_batches b ON b.id = k.batch_id AND b.deleted_at IS NULL
       WHERE k.company_id = ? AND k.item_id = ? AND k.stocking_area_id = ? AND k.quantity >= ?
-        AND b.production_item_id IS NOT NULL
+        AND b.production_item_id IS NOT NULL AND b.owner_party_id IS NULL
       ORDER BY b.id LIMIT 1`,
     [companyId, item.id, areaId, quantity],
   );
@@ -295,13 +376,26 @@ async function movementCode(db, c, type, input, areaId) {
 
 /**
  * Posts a movement. input: {
- *   movementType: receipt | issue | transfer | adjustment | scrap,
- *   movementDate?, code?, partyId? (receipt: the supplier), orderId? (issue: the sales order),
- *   reference?, reason? (required for adjustment and scrap), notes?,
+ *   movementType: receipt | issue | transfer | adjustment | scrap | return,
+ *   movementDate?, code?,
+ *   partyId?   receipt: the supplier — or a customer, whose material it then is;
+ *              return: the customer it goes back to (defaults to the lots' owner)
+ *   orderId?   issue / scrap: the sales order it is for; receipt: the order the
+ *              customer supplied it for; return: the order it is returned against
+ *   orderLineId?  issue / scrap: the line of that order (job cost is per line)
+ *   ownerPartyId?, ownerOrderId?  receipt: whose it is — default for every line
+ *   reference?, reason? (required for adjustment, scrap and return), notes?,
+ *   returnKg?  return: scrap handed back by weight (ownershipService)
  *   fromAreaId?, toAreaId?, areaId?  — defaults for every line,
  *   lines: [{ itemId, quantity | countedQuantity (adjustment), batchId? | batch: { code?, supplierRef?, values? } (new, receipt),
+ *             unitCost? (receipt), ownerPartyId?, ownerOrderId? (receipt),
  *             fromAreaId?, toAreaId?, areaId?, notes? }]
  * }
+ * Returns the movement (getMovement): every line with its unitCost and value
+ * (null = not costed), and the movement's value.
+ *
+ * opts.allowEmpty — a return with no stock lines (only offcuts or scrap by
+ * weight go back): the header is written alone. Only ownershipService sets it.
  */
 export async function postMovement(db, c, input = {}, opts = {}) {
   // Production putting its own finished work on the shelf — never settable from
@@ -309,7 +403,7 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   // may stock.
   const fromProduction = opts.fromProduction === true;
   const type = input.movementType;
-  if (!MOVEMENT_TYPES.includes(type)) throw invalid('INVALID', 'A movement is a receipt, issue, transfer, adjustment or scrap.');
+  if (!MOVEMENT_TYPES.includes(type)) throw invalid('INVALID', 'A movement is a receipt, issue, transfer, adjustment, scrap or return.');
   const problems = [];
   let date = todayText();
   if (!blank(input.movementDate)) {
@@ -318,40 +412,119 @@ export async function postMovement(db, c, input = {}, opts = {}) {
     else if (s > todayText()) problems.push('A movement cannot be dated in the future.');
     else date = s;
   }
+  const partyCache = new Map();
+  const loadParty = async (id) => {
+    if (!partyCache.has(Number(id))) {
+      const [[p]] = await db.query('SELECT id, code, name, is_supplier, is_customer FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(id)]);
+      partyCache.set(Number(id), p ?? null);
+    }
+    return partyCache.get(Number(id));
+  };
+  const orderCache = new Map();
+  const loadOrder = async (id) => {
+    if (!orderCache.has(Number(id))) {
+      const [[o]] = await db.query(
+        `SELECT o.id, o.code, o.code_active, o.status, o.revision, o.customer_id, ${latestRevisionSql('o')} AS latest_revision
+           FROM cf_sales_orders o WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL`,
+        [c.companyId, Number(id)],
+      );
+      orderCache.set(Number(id), o ?? null);
+    }
+    return orderCache.get(Number(id));
+  };
+
   let party = null;
   if (!blank(input.partyId)) {
-    const [[p]] = await db.query('SELECT id, code, name, is_supplier FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.partyId)]);
-    if (type !== 'receipt') problems.push('Only a receipt names a supplier.');
-    else if (!p) problems.push('That supplier does not exist.');
-    else if (!Number(p.is_supplier)) problems.push(`${p.name} is not marked as a supplier.`);
-    else party = p;
+    const p = await loadParty(input.partyId);
+    if (type === 'receipt') {
+      if (!p) problems.push('That supplier does not exist.');
+      else if (!Number(p.is_supplier) && !Number(p.is_customer)) problems.push(`${p.name} is not marked as a supplier.`);
+      else party = p;
+    } else if (type === 'return') {
+      if (!p) problems.push('That customer does not exist.');
+      else if (!Number(p.is_customer)) problems.push(`${p.name} is not marked as a customer — only a customer's material goes back.`);
+      else party = p;
+    } else problems.push('Only a receipt names a supplier.');
   }
   let order = null;
   if (!blank(input.orderId)) {
-    const [[o]] = await db.query(
-      `SELECT o.id, o.code, o.status, o.revision, ${latestRevisionSql('o')} AS latest_revision
-         FROM cf_sales_orders o WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL`,
-      [c.companyId, Number(input.orderId)],
-    );
-    if (type !== 'issue') problems.push('Only an issue is made for a sales order.');
+    const o = await loadOrder(input.orderId);
+    if (!['issue', 'scrap', 'receipt', 'return'].includes(type)) problems.push('Only an issue is made for a sales order.');
     else if (!o) problems.push('That sales order does not exist.');
-    else if (o.status === 'revised') problems.push(revisedOrderMessage(o.code, o.revision, o.latest_revision));
-    else if (LOCKED_ORDER_STATUSES.has(o.status)) problems.push(`Order ${o.code} is ${o.status} — nothing more is issued to it.`);
+    // Scrap and a return settle what an order left behind, so they are allowed on a finished order.
+    else if (['issue', 'receipt'].includes(type) && o.status === 'revised') problems.push(revisedOrderMessage(o.code, o.revision, o.latest_revision));
+    else if (['issue', 'receipt'].includes(type) && LOCKED_ORDER_STATUSES.has(o.status)) problems.push(`Order ${o.code} is ${o.status} — nothing more is ${type === 'issue' ? 'issued to' : 'received for'} it.`);
     else order = o;
+  }
+  let orderLine = null;
+  if (!blank(input.orderLineId)) {
+    if (!['issue', 'scrap'].includes(type)) problems.push('Only an issue or a scrap names an order line.');
+    else if (!order) problems.push('Name the sales order the line belongs to.');
+    else {
+      const [[ln]] = await db.query('SELECT id, line_no FROM cf_sales_order_lines WHERE company_id = ? AND id = ? AND order_id = ? AND deleted_at IS NULL', [c.companyId, Number(input.orderLineId), order.id]);
+      if (!ln) problems.push(`That line is not on order ${order.code}.`);
+      else orderLine = ln;
+    }
   }
   const reason = blank(input.reason) ? null : String(input.reason).trim().slice(0, 255);
   if (type === 'adjustment' && !reason) problems.push('Say why the stock changes — a count, damage found, a correction.');
   if (type === 'scrap' && !reason) problems.push('Say why it is scrapped.');
+  let returnKg = null;
+  if (!blank(input.returnKg)) {
+    const k = Number(input.returnKg);
+    if (type !== 'return') problems.push('Only a return hands scrap back by weight.');
+    else if (!Number.isFinite(k) || k <= 0 || k >= 1e11) problems.push('The scrap weight is a number of kilograms above zero.');
+    else returnKg = Number(k.toFixed(3));
+  }
   const lines = Array.isArray(input.lines) ? input.lines : [];
-  if (!lines.length) problems.push('Add at least one line.');
+  const headerOnly = type === 'return' && opts.allowEmpty === true && !lines.length;
+  if (!lines.length && !headerOnly) problems.push('Add at least one line.');
   if (lines.length > 200) problems.push('Up to 200 lines per movement.');
+
+  // Whose a receipt is: a customer party (not also a supplier) or an order named
+  // on the receipt makes every line that customer's material.
+  const owners = {
+    order,
+    party,
+    defaultPartyId: type === 'receipt'
+      ? (blank(input.ownerPartyId) ? (party && Number(party.is_customer) && !Number(party.is_supplier) ? party.id : null) : input.ownerPartyId)
+      : null,
+    defaultOrderId: type === 'receipt' ? (blank(input.ownerOrderId) ? (order?.id ?? null) : input.ownerOrderId) : null,
+    /** { partyId, orderId, party, order } — or undefined after saying why not. */
+    async resolve(partyId, orderId, P) {
+      let o = null;
+      if (!blank(orderId)) {
+        o = await loadOrder(orderId);
+        if (!o) { P('that sales order does not exist.'); return undefined; }
+        if (o.status === 'revised') { P(revisedOrderMessage(o.code, o.revision, o.latest_revision)); return undefined; }
+        if (LOCKED_ORDER_STATUSES.has(o.status)) { P(`order ${o.code} is ${o.status} — no more material is received for it.`); return undefined; }
+        if (!o.customer_id) { P(`order ${o.code} has no customer — only a customer supplies material for an order.`); return undefined; }
+      }
+      const pid = blank(partyId) ? o?.customer_id : Number(partyId);
+      const p = await loadParty(pid);
+      if (!p) { P('that customer does not exist.'); return undefined; }
+      if (!Number(p.is_customer)) { P(`${p.name} is not marked as a customer — only a customer's material is kept as theirs.`); return undefined; }
+      if (o && Number(o.customer_id) !== Number(p.id)) { P(`order ${o.code} is not ${p.name}'s.`); return undefined; }
+      return { partyId: p.id, orderId: o?.id ?? null, party: p, order: o };
+    },
+  };
+
   const header = { fromAreaId: input.fromAreaId, toAreaId: input.toAreaId, areaId: input.areaId };
   const getArea = areaReader(db, c.companyId, problems);
   const plans = [];
   for (const [i, l] of lines.slice(0, 200).entries()) {
-    const p = await planLine(db, c, type, l ?? {}, i + 1, header, getArea, problems, { fromProduction });
+    const p = await planLine(db, c, type, l ?? {}, i + 1, header, getArea, problems, { fromProduction, owners });
     if (p) plans.push(p);
   }
+  // The party a return goes to, and a customer receipt's party, default to the lots' one owner.
+  const ownersSeen = new Set(plans.map((p) => (type === 'return' ? p.batch?.owner_party_id : p.owner?.partyId)).filter((x) => x != null).map(Number));
+  if (type === 'return' && !party) {
+    if (ownersSeen.size > 1) problems.push('A return goes to one customer — these lots belong to more than one.');
+    else if (ownersSeen.size === 1) party = await loadParty([...ownersSeen][0]);
+    else if (headerOnly) problems.push('Say which customer it goes back to.');
+  }
+  if (type === 'receipt' && !party && ownersSeen.size === 1) party = await loadParty([...ownersSeen][0]);
+  if (type === 'return' && !reason) problems.push('Say why it goes back — offcuts, unused plate, scrap.');
   assertNoProblems(problems, 'The movement cannot be posted.');
 
   // A count becomes the change it needs; lines that already match record nothing.
@@ -361,38 +534,146 @@ export async function postMovement(db, c, input = {}, opts = {}) {
     p.quantity = round6(p.counted - have);
   }
   const moving = plans.filter((p) => Math.abs(p.quantity) > EPS);
-  if (!moving.length) throw invalid('NOTHING_CHANGES', 'The counted quantities match what is recorded — nothing to adjust.');
+  if (!moving.length && !headerOnly) throw invalid('NOTHING_CHANGES', 'The counted quantities match what is recorded — nothing to adjust.');
 
   const legs = moving.flatMap((p) => p.legs.map((leg) => ({
     area: leg.area, item: p.item, batch: p.batch, newBatch: p.newBatch, delta: round6(leg.sign * p.quantity),
   })));
   await assertEnough(db, c.companyId, legs);
   if (type !== 'adjustment') await assertReservationsKept(db, c.companyId, legs);
-  const code = await movementCode(db, c, type, input, moving[0].legs[0]?.area?.id ?? null);
+  const pools = await loadPools(db, c.companyId, moving.filter(isLoose).map((p) => p.item.id));
+  costPlans(type, moving, pools);
+
+  // A customer receipt names the order it came for, when every line says the same one.
+  const receiptOrders = new Set(moving.map((p) => p.owner?.orderId).filter((x) => x != null));
+  const movementOrder = order ?? (type === 'receipt' && receiptOrders.size === 1 ? { id: [...receiptOrders][0] } : null);
+  const code = await movementCode(db, c, type, input, moving[0]?.legs[0]?.area?.id ?? null);
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, reference, reason, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, code, type, date, party?.id ?? null, order?.id ?? null,
-      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), c.userId],
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, notes, return_kg, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, code, type, date, party?.id ?? null, movementOrder?.id ?? null, orderLine?.id ?? null,
+      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), returnKg, c.userId],
   );
   const movementId = r.insertId;
   if (!code) await db.query('UPDATE cf_stock_movements SET code = ? WHERE id = ?', [`${PREFIX[type]}-${String(movementId).padStart(6, '0')}`, movementId]);
 
   for (const p of moving) {
     if (p.newBatch) {
-      const batchId = await createBatch(db, c, p.item, { ...p.newBatch, supplierId: party?.id ?? null, receivedOn: date });
+      const batchId = await createBatch(db, c, p.item, {
+        ...p.newBatch,
+        supplierId: party && Number(party.is_supplier) && !p.owner ? party.id : null,
+        receivedOn: date,
+        ownerPartyId: p.owner?.partyId ?? null,
+        ownerOrderId: p.owner?.orderId ?? null,
+        unitCost: p.unitCost,
+      });
       p.batch = await requireBatch(db, c.companyId, batchId);
+    } else if (p.batchCost !== undefined) {
+      await db.query('UPDATE cf_stock_batches SET unit_cost = ? WHERE company_id = ? AND id = ?', [p.batchCost, c.companyId, p.batch.id]);
     }
-    for (const leg of p.legs) await writeLeg(db, c, { movementId, lineNo: p.lineNo, area: leg.area, item: p.item, batch: p.batch, delta: round6(leg.sign * p.quantity), notes: p.notes });
+    for (const leg of p.legs) {
+      await writeLeg(db, c, { movementId, lineNo: p.lineNo, area: leg.area, item: p.item, batch: p.batch, delta: round6(leg.sign * p.quantity), notes: p.notes, unitCost: leg.unitCost, value: leg.value });
+    }
   }
+  await savePools(db, c.companyId, pools, movementId);
   return getMovement(db, c.companyId, movementId);
 }
 
-async function writeLeg(db, c, { movementId, lineNo, area, item, batch, delta, notes }) {
+/* ---- cost ------------------------------------------------------------------------- */
+
+/** Loose stock (no lot) is the weighted-average pool's; a lot keeps its own cost. */
+const isLoose = (p) => !p.batch && !p.newBatch;
+
+/** The average of every item's loose stock, locked until the transaction ends. One read. */
+async function loadPools(db, companyId, itemIds) {
+  const ids = [...new Set(itemIds)];
+  const pools = new Map(ids.map((id) => [id, { id: null, avg: null, qty: 0, changed: false }]));
+  if (!ids.length) return pools;
+  const [rows] = await db.query(
+    'SELECT id, item_id, avg_unit_cost, costed_qty FROM cf_item_costs WHERE company_id = ? AND owner_key = 0 AND item_id IN (?) FOR UPDATE',
+    [companyId, ids],
+  );
+  for (const r of rows) pools.set(r.item_id, { id: r.id, avg: numOrNull(r.avg_unit_cost), qty: Number(r.costed_qty), changed: false });
+  return pools;
+}
+
+/** Costed stock in: the average takes it in by value. Not-costed stock in changes nothing. */
+function poolIn(pool, qty, value) {
+  if (value == null || qty <= EPS) return;
+  const total = pool.qty * (pool.avg ?? 0) + value;
+  pool.qty = round6(pool.qty + qty);
+  if (pool.qty > EPS) pool.avg = round4(Math.max(0, total) / pool.qty);
+  pool.changed = true;
+}
+
+/** Costed stock out (value negative): the average keeps what is left; the costed quantity falls. */
+function poolOut(pool, qty, value) {
+  if (value == null || qty <= EPS) return;
+  const total = pool.qty * (pool.avg ?? 0) + value;
+  pool.qty = round6(Math.max(0, pool.qty - qty));
+  if (pool.qty > EPS) pool.avg = round4(Math.max(0, total) / pool.qty);
+  pool.changed = true;
+}
+
+/** What loose stock leaves at: the average while any costed stock is left, else not costed. */
+const poolCost = (pool) => (pool.avg != null && pool.qty > EPS ? pool.avg : null);
+
+/**
+ * Works out every leg's unit cost and value (signed like its quantity), and
+ * what the movement does to lot costs and averages. Pure but for `pools`.
+ *   receipt   the typed cost (or, into an existing lot, the lot's); a lot's
+ *             cost becomes the weighted average of what it held and what came
+ *   transfer  both legs at the stock's cost — the average is untouched
+ *   issue, scrap, return, a count down   out at the lot's cost / the average
+ *   a count up   loose stock at the average (it joins the average's quantity)
+ */
+function costPlans(type, moving, pools) {
+  for (const p of moving) {
+    const q = p.quantity;
+    let unit;
+    if (type === 'receipt') {
+      unit = p.unitCost ?? (p.batch ? numOrNull(p.batch.unit_cost) : null);
+      if (p.batch && p.unitCost != null) {
+        const held = Math.max(0, Number(p.batch.on_hand ?? 0));
+        const was = numOrNull(p.batch.unit_cost);
+        const next = was == null || held <= EPS ? p.unitCost : round4((held * was + q * p.unitCost) / (held + q));
+        if (next !== was) p.batchCost = next;
+      }
+    } else if (isLoose(p)) {
+      const pool = pools.get(p.item.id);
+      unit = type === 'adjustment' && q > 0 ? pool.avg : poolCost(pool);
+    } else unit = numOrNull(p.batch.unit_cost);
+    for (const leg of p.legs) {
+      leg.unitCost = unit;
+      leg.value = unit == null ? null : round2(leg.sign * q * unit);
+    }
+    if (isLoose(p) && type !== 'transfer') {
+      // Which way the stock went: + into our shelves (receipt, a count up), - out.
+      const pool = pools.get(p.item.id);
+      const net = round6(p.legs.reduce((t, l) => t + l.sign, 0) * q);
+      const value = unit == null ? null : round2(net * unit);
+      if (net > 0) poolIn(pool, net, value);
+      else poolOut(pool, -net, value);
+    }
+  }
+}
+
+/** Writes the averages a movement changed. One statement. */
+async function savePools(db, companyId, pools, movementId) {
+  const rows = [...pools.entries()].filter(([, p]) => p.changed);
+  if (!rows.length) return;
   await db.query(
-    `INSERT INTO cf_stock_ledger (company_id, movement_id, line_no, stocking_area_id, item_id, batch_id, quantity, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, movementId, lineNo, area.id, item.id, batch?.id ?? null, delta, notes ?? null, c.userId],
+    `INSERT INTO cf_item_costs (company_id, item_id, owner_party_id, avg_unit_cost, costed_qty, last_movement_id) VALUES ?
+     ON DUPLICATE KEY UPDATE avg_unit_cost = VALUES(avg_unit_cost), costed_qty = VALUES(costed_qty), last_movement_id = VALUES(last_movement_id)`,
+    [rows.map(([itemId, p]) => [companyId, itemId, null, p.avg, p.qty, movementId])],
+  );
+}
+
+async function writeLeg(db, c, { movementId, lineNo, area, item, batch, delta, notes, unitCost = null, value = null }) {
+  await db.query(
+    `INSERT INTO cf_stock_ledger (company_id, movement_id, line_no, stocking_area_id, item_id, batch_id, quantity, unit_cost, value, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, movementId, lineNo, area.id, item.id, batch?.id ?? null, delta, unitCost, value, notes ?? null, c.userId],
   );
   await applyDelta(db, c, { area, item, batch, delta, movementId });
 }
@@ -403,7 +684,11 @@ async function requireMovement(db, companyId, id) {
   return m;
 }
 
-/** Undoes a movement with its exact opposite, dated today. Refused if the stock it put somewhere has since moved on. */
+/**
+ * Undoes a movement with its exact opposite, dated today — the same cost, the
+ * opposite value, and the average moved back by that value. Refused if the
+ * stock it put somewhere has since moved on.
+ */
 export async function reverseMovement(db, c, id, { reason } = {}) {
   const m = await requireMovement(db, c.companyId, id);
   if (m.reversal_of_id) throw invalid('IS_REVERSAL', `${m.code} is itself a reversal — post the movement again instead.`);
@@ -412,6 +697,8 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
     throw invalid('ALREADY_REVERSED', `${m.code} was already reversed by ${rev?.code ?? 'another movement'}.`);
   }
   if (blank(reason)) throw invalid('INVALID', 'Say why it is reversed.');
+  const [[{ back }]] = await db.query('SELECT COUNT(*) AS back FROM cf_offcuts WHERE company_id = ? AND returned_movement_id = ? AND deleted_at IS NULL', [c.companyId, m.id]);
+  if (Number(back)) throw invalid('HAS_OFFCUTS', `${m.code} handed offcuts back to the customer — a return with offcuts is not reversed.`);
   const [rows] = await db.query('SELECT * FROM cf_stock_ledger WHERE company_id = ? AND movement_id = ? AND deleted_at IS NULL ORDER BY line_no, id', [c.companyId, m.id]);
   const areas = new Map();
   const legs = [];
@@ -420,24 +707,35 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
     legs.push({
       row, area: areas.get(row.stocking_area_id), item: await loadMaster(db, c.companyId, row.item_id),
       batch: row.batch_id ? await requireBatch(db, c.companyId, row.batch_id) : null, delta: round6(-Number(row.quantity)),
+      unitCost: numOrNull(row.unit_cost), value: row.value == null ? null : round2(-Number(row.value)),
     });
   }
   // The stock it put somewhere must still be there to take back — and not be reserved.
   await assertEnough(db, c.companyId, legs);
   if (m.movement_type !== 'adjustment') await assertReservationsKept(db, c.companyId, legs);
+  const pools = await loadPools(db, c.companyId, legs.filter((l) => !l.batch).map((l) => l.item.id));
+  if (m.movement_type !== 'transfer') {
+    for (const l of legs) {
+      if (l.batch) continue;
+      if (l.delta > 0) poolIn(pools.get(l.item.id), l.delta, l.value);
+      else poolOut(pools.get(l.item.id), -l.delta, l.value);
+    }
+  }
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, reference, reason, reversal_of_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, `REV-${m.code}`.slice(0, 60), m.movement_type, todayText(), m.party_id, m.order_id, m.reference,
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, reversal_of_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, `REV-${m.code}`.slice(0, 60), m.movement_type, todayText(), m.party_id, m.order_id, m.order_line_id ?? null, m.reference,
       String(reason).trim().slice(0, 255), m.id, c.userId],
   );
   const revId = r.insertId;
   for (const l of legs) {
-    await writeLeg(db, c, { movementId: revId, lineNo: l.row.line_no, area: l.area, item: l.item, batch: l.batch, delta: l.delta, notes: l.row.notes });
+    await writeLeg(db, c, { movementId: revId, lineNo: l.row.line_no, area: l.area, item: l.item, batch: l.batch, delta: l.delta, notes: l.row.notes, unitCost: l.unitCost, value: l.value });
   }
+  await savePools(db, c.companyId, pools, revId);
   await db.query('UPDATE cf_stock_movements SET reversed_by_id = ? WHERE company_id = ? AND id = ?', [revId, c.companyId, m.id]);
   return getMovement(db, c.companyId, revId);
 }
+
 
 // --- reading ------------------------------------------------------------------------
 
@@ -447,10 +745,14 @@ const MOVEMENT_SELECT = `SELECT m.*, p.code AS party_code, p.name AS party_name,
        (SELECT GROUP_CONCAT(DISTINCT a.code ORDER BY a.code SEPARATOR ', ') FROM cf_stock_ledger l JOIN cf_stocking_areas a ON a.id = l.stocking_area_id
          WHERE l.company_id = m.company_id AND l.movement_id = m.id) AS area_codes,
        (SELECT GROUP_CONCAT(DISTINCT r.code ORDER BY r.code SEPARATOR ', ') FROM cf_stock_ledger l JOIN cf_master_records r ON r.id = l.item_id
-         WHERE l.company_id = m.company_id AND l.movement_id = m.id) AS item_codes
+         WHERE l.company_id = m.company_id AND l.movement_id = m.id) AS item_codes,
+       (SELECT SUM(ABS(l.value)) FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id) AS abs_value,
+       (SELECT SUM(l.value IS NULL) FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id) AS uncosted_rows,
+       ol.line_no AS order_line_no
   FROM cf_stock_movements m
   LEFT JOIN cf_parties p ON p.id = m.party_id
   LEFT JOIN cf_sales_orders o ON o.id = m.order_id
+  LEFT JOIN cf_sales_order_lines ol ON ol.id = m.order_line_id
   LEFT JOIN cf_stock_movements ro ON ro.id = m.reversal_of_id
   LEFT JOIN cf_stock_movements rb ON rb.id = m.reversed_by_id`;
 
@@ -462,6 +764,13 @@ function shapeMovement(m) {
     movementDate: dateOnly(m.movement_date),
     party: m.party_id ? { id: m.party_id, code: m.party_code, name: m.party_name } : null,
     order: m.order_id ? { id: m.order_id, code: m.order_code } : null,
+    orderLine: m.order_line_id ? { id: m.order_line_id, lineNo: m.order_line_no ?? null } : null,
+    // What it moved, at cost (a transfer's two legs counted once). null = nothing
+    // in it is costed; `uncostedRows` says how many ledger rows have no cost.
+    value: m.abs_value == null ? null : round2(Number(m.abs_value) / (m.movement_type === 'transfer' ? 2 : 1)),
+    uncostedRows: Number(m.uncosted_rows ?? 0),
+    currency: 'INR',
+    returnKg: m.return_kg == null ? null : Number(m.return_kg),
     reference: m.reference,
     reason: m.reason,
     notes: m.notes,
@@ -504,12 +813,15 @@ export async function getMovement(db, companyId, id) {
   const out = shapeMovement(m);
   const [rows] = await db.query(
     `SELECT l.*, r.code AS item_code, r.name AS item_name, i.uom, b.code AS batch_code, b.status AS batch_status,
+            b.owner_party_id, b.owner_order_id, op.code AS owner_party_code, op.name AS owner_party_name, oo.code AS owner_order_code,
             a.code AS area_code, a.name AS area_name, a.purpose
        FROM cf_stock_ledger l
        JOIN cf_master_records r ON r.id = l.item_id
        JOIN cf_item_details i ON i.master_id = l.item_id
        JOIN cf_stocking_areas a ON a.id = l.stocking_area_id
        LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
+       LEFT JOIN cf_parties op ON op.id = b.owner_party_id
+       LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
       WHERE l.company_id = ? AND l.movement_id = ? ORDER BY l.line_no, l.quantity, l.id`,
     [companyId, m.id],
   );
@@ -519,40 +831,90 @@ export async function getMovement(db, companyId, id) {
       lineNo: r.line_no,
       item: { id: r.item_id, code: r.item_code, name: r.item_name, uom: r.uom },
       batch: r.batch_id ? { id: r.batch_id, code: r.batch_code, status: r.batch_status } : null,
+      owner: r.batch_id ? ownerOf(r) : null,
       from: null, to: null, quantity: 0, change: 0, notes: r.notes,
+      // The cost it moved at and the value (magnitude, like quantity); null = not costed.
+      unitCost: numOrNull(r.unit_cost), value: null, valueChange: 0,
     };
     const area = { id: r.stocking_area_id, code: r.area_code, name: r.area_name, purpose: r.purpose };
     const q = Number(r.quantity);
     if (q < 0) line.from = area; else line.to = area;
     line.quantity = Math.max(line.quantity, Math.abs(q));
     line.change += q;
+    if (r.value != null) {
+      line.value = Math.max(line.value ?? 0, Math.abs(Number(r.value)));
+      line.valueChange += Number(r.value);
+    }
     lines.set(r.line_no, line);
   }
-  out.lines = [...lines.values()].map((l) => ({ ...l, change: round6(l.change) }));
+  out.lines = [...lines.values()].map((l) => ({ ...l, change: round6(l.change), valueChange: l.value == null ? null : round2(l.valueChange) }));
   return out;
 }
 
 const STOCK_SELECT = `SELECT k.*, a.code AS area_code, a.name AS area_name, a.purpose, a.status AS area_status,
-       r.code AS item_code, r.name AS item_name, i.uom, i.tracked_by, b.code AS batch_code, b.status AS batch_status
+       r.code AS item_code, r.name AS item_name, i.uom, i.tracked_by, b.code AS batch_code, b.status AS batch_status,
+       b.unit_cost AS batch_unit_cost, b.owner_party_id, b.owner_order_id,
+       op.code AS owner_party_code, op.name AS owner_party_name, oo.code AS owner_order_code
   FROM cf_stock_balances k
   JOIN cf_stocking_areas a ON a.id = k.stocking_area_id
   JOIN cf_master_records r ON r.id = k.item_id
   JOIN cf_item_details i ON i.master_id = k.item_id
-  LEFT JOIN cf_stock_batches b ON b.id = k.batch_id`;
+  LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
+  LEFT JOIN cf_parties op ON op.id = b.owner_party_id
+  LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id`;
 
 function shapeStock(k) {
   return {
     area: { id: k.stocking_area_id, code: k.area_code, name: k.area_name, purpose: k.purpose },
     item: { id: k.item_id, code: k.item_code, name: k.item_name, uom: k.uom, trackedBy: k.tracked_by },
     batch: k.batch_id ? { id: k.batch_id, code: k.batch_code, status: k.batch_status } : null,
+    owner: k.batch_id ? ownerOf(k) : null,               // null = ours
     quantity: Number(k.quantity),
     category: categoryOf(k.purpose, k.batch_status),
+    ...(k._money ?? { unitCost: null, value: null, uncostedQty: Number(k.quantity) }),
     updatedAt: k.updated_at,
   };
 }
 
-/** What sits where. q: { areaId?, itemId?, batchId?, purpose?, search?, includeZero? } */
-export async function listStock(db, companyId, q = {}) {
+/**
+ * The value of balance rows, at cost — in place on each row as `_money`
+ * ({ unitCost, value, uncostedQty }). A lot at its own cost; loose stock at
+ * the item's average, over the share of it the average covers (costed_qty
+ * divided by all loose stock of the item, every area), the rest `uncostedQty`
+ * — not costed, never 0. Customer lots are valued at the reference cost they
+ * came with (callers keep them apart). One read, only when there is loose stock.
+ * Rows need item_id, batch_id, quantity and batch_unit_cost.
+ */
+export async function valueRows(db, companyId, rows) {
+  const looseItems = [...new Set(rows.filter((k) => !k.batch_id).map((k) => k.item_id))];
+  const pools = new Map();
+  if (looseItems.length) {
+    const [p] = await db.query(
+      `SELECT c.item_id, c.avg_unit_cost, c.costed_qty,
+              (SELECT COALESCE(SUM(k.quantity), 0) FROM cf_stock_balances k
+                WHERE k.company_id = c.company_id AND k.item_id = c.item_id AND k.batch_id IS NULL) AS loose
+         FROM cf_item_costs c WHERE c.company_id = ? AND c.owner_key = 0 AND c.item_id IN (?)`,
+      [companyId, looseItems],
+    );
+    for (const r of p) pools.set(r.item_id, { avg: numOrNull(r.avg_unit_cost), costed: Number(r.costed_qty), loose: Number(r.loose) });
+  }
+  for (const k of rows) {
+    const q = Number(k.quantity);
+    if (k.batch_id) {
+      const u = numOrNull(k.batch_unit_cost);
+      k._money = { unitCost: u, value: u == null ? null : round2(q * u), uncostedQty: u == null ? round6(q) : 0 };
+      continue;
+    }
+    const pool = pools.get(k.item_id);
+    if (!pool || pool.avg == null || pool.costed <= EPS) { k._money = { unitCost: null, value: null, uncostedQty: round6(q) }; continue; }
+    const share = pool.loose > EPS ? Math.min(1, pool.costed / pool.loose) : 1;
+    k._money = { unitCost: pool.avg, value: round2(q * share * pool.avg), uncostedQty: round6(q * (1 - share)) };
+  }
+  return rows;
+}
+
+/** What sits where. q: { areaId?, itemId?, batchId?, purpose?, owner? (ours | customer | party id), search?, includeZero? } */
+export async function listStock(db, companyId, q = {}, { limit = 2000 } = {}) {
   const where = ['k.company_id = ?'];
   const params = [companyId];
   if (String(q.includeZero) !== '1') where.push('k.quantity <> 0');
@@ -560,12 +922,16 @@ export async function listStock(db, companyId, q = {}) {
   if (!blank(q.itemId)) { where.push('k.item_id = ?'); params.push(Number(q.itemId)); }
   if (!blank(q.batchId)) { where.push('k.batch_id = ?'); params.push(Number(q.batchId)); }
   if (!blank(q.purpose)) { where.push('a.purpose = ?'); params.push(q.purpose); }
+  if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
+  else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
+  else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
   if (!blank(q.search)) {
     where.push('(r.code LIKE ? OR r.name LIKE ? OR b.code LIKE ?)');
     const s = like(q.search);
     params.push(s, s, s);
   }
-  const [rows] = await db.query(`${STOCK_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.code, a.code, b.code LIMIT 2000`, params);
+  const [rows] = await db.query(`${STOCK_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.code, a.code, b.code${limit ? ` LIMIT ${Number(limit)}` : ''}`, params);
+  await valueRows(db, companyId, rows);
   return rows.map(shapeStock);
 }
 
@@ -575,14 +941,26 @@ const summarise = (rows) => {
   for (const r of rows) totals[r.category] = round6(totals[r.category] + r.quantity);
   return { onHand: round6(rows.reduce((t, r) => t + r.quantity, 0)), ...totals };
 };
+/** Value of rows: what is costed, and how much has no cost (quantity). */
+const moneyOf = (rows) => ({
+  value: round2(rows.reduce((t, r) => t + (r.value ?? 0), 0)),
+  uncostedQty: round6(rows.reduce((t, r) => t + (r.uncostedQty ?? 0), 0)),
+  currency: 'INR',
+});
 
-/** One item's stock: totals by what it counts as, every area and batch holding it, and its latest movements. */
+/**
+ * One item's stock: totals by what it counts as, every area and batch holding
+ * it, and its latest movements. The category totals count everything on our
+ * shelves; `free`, `value` and `uncostedQty` are OURS only — a customer's
+ * material never counts as ours (`customers` holds theirs, valued at the
+ * reference cost it came with).
+ */
 export async function itemStock(db, companyId, itemId) {
   const item = await loadMaster(db, companyId, Number(itemId));
   if (!item || item.record_kind !== 'item') throw notFound('Item');
   const rows = await listStock(db, companyId, { itemId: item.id });
   const [res] = await db.query(
-    `SELECT v.id, v.quantity, v.batch_id, b.code AS batch_code, b.status AS batch_status,
+    `SELECT v.id, v.quantity, v.batch_id, b.code AS batch_code, b.status AS batch_status, b.owner_party_id,
             IF(v.order_line_id IS NULL, 'material', 'finished') AS kind,
             o.id AS order_id, o.code AS order_code, COALESCE(l.line_no, dl.line_no) AS line_no
        FROM cf_stock_reservations v
@@ -595,9 +973,17 @@ export async function itemStock(db, companyId, itemId) {
       WHERE v.company_id = ? AND v.item_id = ? AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY o.code, line_no, v.id`,
     [companyId, item.id],
   );
+  const ours = rows.filter((r) => !r.owner);
+  const theirs = rows.filter((r) => r.owner);
+  const reservedOf = (list) => round6(list.reduce((t, v) => t + Number(v.quantity), 0));
   const totals = summarise(rows);
-  totals.reserved = round6(res.reduce((t, v) => t + Number(v.quantity), 0));
-  totals.free = Math.max(0, round6(totals.available + totals.in_process - totals.reserved));
+  totals.reserved = reservedOf(res);
+  const o = summarise(ours);
+  totals.free = Math.max(0, round6(o.available + o.in_process - reservedOf(res.filter((v) => !v.owner_party_id))));
+  Object.assign(totals, moneyOf(ours));
+  const t = summarise(theirs);
+  const theirsReserved = reservedOf(res.filter((v) => v.owner_party_id));
+  totals.customers = { ...t, reserved: theirsReserved, free: Math.max(0, round6(t.available + t.in_process - theirsReserved)), ...moneyOf(theirs) };
   return {
     item: { id: item.id, code: item.code, name: item.name, uom: item.uom, trackedBy: item.tracked_by, stockable: item.tracked_by !== 'individual' },
     totals,
@@ -610,11 +996,11 @@ export async function itemStock(db, companyId, itemId) {
   };
 }
 
-/** A stocking area and its inventory. */
+/** A stocking area and its inventory. `value` is ours at cost. */
 export async function areaInventory(db, companyId, areaId) {
   const area = shapeArea(await requireArea(db, companyId, areaId));
   const rows = await listStock(db, companyId, { areaId: area.id });
-  return { area, totals: summarise(rows), rows, movements: await listMovements(db, companyId, { areaId: area.id, limit: 20 }) };
+  return { area, totals: { ...summarise(rows), ...moneyOf(rows.filter((r) => !r.owner)) }, rows, movements: await listMovements(db, companyId, { areaId: area.id, limit: 20 }) };
 }
 
 /**

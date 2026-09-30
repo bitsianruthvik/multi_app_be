@@ -139,9 +139,9 @@ export async function reviseOrder(db, c, orderId) {
   await db.query(
     `INSERT INTO cf_sales_order_lines
        (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, committed_date, bom_revision,
-        description, notes, created_by, revises_line_id)
+        description, notes, created_by, revises_line_id, rate, rate_basis, currency)
      SELECT company_id, ?, line_no, line_type, IF(line_type = 'custom', NULL, item_id), design_id, position, quantity, committed_date, bom_revision,
-            description, notes, ?, id
+            description, notes, ?, id, rate, rate_basis, currency
        FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [newId, c.userId ?? null, companyId, o.id],
   );

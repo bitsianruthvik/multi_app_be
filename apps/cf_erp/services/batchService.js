@@ -19,12 +19,23 @@ const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const blank = (v) => v == null || String(v).trim() === '';
 const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : d ?? null);
 
+// owner_* (init.sql §35): NULL = ours; a customer party = theirs, for the order
+// named (matched by order NUMBER — owner_order_code_active — so a revision keeps it).
 const SELECT = `SELECT b.*, m.code AS item_code, m.name AS item_name, i.uom AS item_uom, p.code AS supplier_code, p.name AS supplier_name,
+       op.code AS owner_party_code, op.name AS owner_party_name, oo.code AS owner_order_code, oo.code_active AS owner_order_code_active,
        (SELECT COALESCE(SUM(k.quantity), 0) FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id) AS on_hand
   FROM cf_stock_batches b
   JOIN cf_master_records m ON m.id = b.item_id
   JOIN cf_item_details i ON i.master_id = b.item_id
-  LEFT JOIN cf_parties p ON p.id = b.supplier_id`;
+  LEFT JOIN cf_parties p ON p.id = b.supplier_id
+  LEFT JOIN cf_parties op ON op.id = b.owner_party_id
+  LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id`;
+
+/** Whose a lot is, as every screen shows it: null = ours. */
+export const ownerOf = (b) => (b.owner_party_id
+  ? { party: { id: b.owner_party_id, code: b.owner_party_code ?? null, name: b.owner_party_name ?? null },
+      order: b.owner_order_id ? { id: b.owner_order_id, code: b.owner_order_code ?? null } : null }
+  : null);
 
 export function shapeBatch(b) {
   return {
@@ -37,6 +48,9 @@ export function shapeBatch(b) {
     supplier: b.supplier_id ? { id: b.supplier_id, code: b.supplier_code, name: b.supplier_name } : null,
     supplierRef: b.supplier_ref,
     notes: b.notes,
+    owner: ownerOf(b),
+    unitCost: b.unit_cost == null ? null : Number(b.unit_cost),   // null = not costed, never 0
+    currency: b.currency ?? 'INR',
     onHand: b.on_hand == null ? undefined : Number(b.on_hand),
     createdAt: b.created_at,
   };
@@ -53,6 +67,10 @@ export async function listBatches(db, companyId, q = {}) {
   const params = [companyId];
   if (!blank(q.itemId)) { where.push('b.item_id = ?'); params.push(Number(q.itemId)); }
   if (!blank(q.status)) { where.push('b.status = ?'); params.push(q.status); }
+  // owner: ours | customer | a party id
+  if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
+  else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
+  else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
   if (!blank(q.search)) {
     const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
     where.push('(b.code LIKE ? OR b.supplier_ref LIKE ? OR m.code LIKE ? OR m.name LIKE ?)');
@@ -140,9 +158,12 @@ export async function createBatch(db, c, item, input = {}) {
     code = g?.text ?? null;
   }
   const [r] = await db.query(
-    `INSERT INTO cf_stock_batches (company_id, item_id, code, received_on, supplier_id, supplier_ref, production_item_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, item.id, code, input.receivedOn ?? null, input.supplierId ?? null, supplierRef, input.productionItemId ?? null, c.userId],
+    `INSERT INTO cf_stock_batches (company_id, item_id, code, received_on, supplier_id, supplier_ref, production_item_id,
+                                   owner_party_id, owner_order_id, unit_cost, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    // Owner and cost were checked by stockService.postMovement (init.sql §35).
+    [c.companyId, item.id, code, input.receivedOn ?? null, input.supplierId ?? null, supplierRef, input.productionItemId ?? null,
+      input.ownerPartyId ?? null, input.ownerOrderId ?? null, input.unitCost ?? null, c.userId],
   );
   if (!code) await db.query('UPDATE cf_stock_batches SET code = ? WHERE id = ?', [`B${String(r.insertId).padStart(6, '0')}`, r.insertId]);
   const values = (input.values ?? []).filter((v) => !blank(v.value));
