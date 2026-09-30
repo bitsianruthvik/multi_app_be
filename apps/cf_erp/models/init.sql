@@ -3360,7 +3360,11 @@ SELECT f.feature_tag, JSON_ARRAY(f.id)
 INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
 SELECT DISTINCT rc.role_id, rc.team_id, rc.company_id, rc.app_id, fl.capability_id
   FROM role_capability rc
-  JOIN features_capability pm ON pm.capability_id = rc.capability_id AND pm.name = 'cf_erp_production_manage' AND pm.deleted_at IS NULL
+  -- Any capability that CONTAINS production manage, whatever it is called
+  -- (in production it sits in a bundle with another name, so a name match missed it).
+  JOIN features_capability pm ON pm.capability_id = rc.capability_id AND pm.deleted_at IS NULL
+  JOIN features pf ON pf.feature_tag = 'cf_erp_production_manage' AND pf.deleted_at IS NULL
+                  AND JSON_CONTAINS(pm.features_json, CAST(pf.id AS JSON))
   JOIN features_capability fl ON fl.name = 'cf_erp_floor' AND fl.deleted_at IS NULL
  WHERE rc.deleted_at IS NULL
    AND NOT EXISTS (
