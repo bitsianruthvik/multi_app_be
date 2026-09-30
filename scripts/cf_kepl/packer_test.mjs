@@ -204,7 +204,8 @@ function run(input, label) {
 }
 
 const placedCount = (r) => r.nests.reduce((s, n) => s + n.pieces.length, 0);
-const canon = (r) => JSON.stringify({ ...r, elapsedMs: 0 });
+// Timings are not part of the answer: elapsedMs, and floorMs (how long trial 0 took, added 2026-09-30).
+const canon = (r) => JSON.stringify({ ...r, elapsedMs: 0, floorMs: 0 });
 
 /* ────────────────────────────────  the tests  ──────────────────────────── */
 

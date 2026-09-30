@@ -887,6 +887,8 @@ async function loadPacker(injected) {
  * throw, because there is no proposal to show at all.
  */
 export async function planNesting(db, companyId, orderLineId, input = {}) {
+  const planStartedAt = Date.now();   // the effort's budget runs from here
+  const budgetCut = new Map();         // group key -> the clock limited its search
   const line = await requireLine(db, companyId, orderLineId);
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
@@ -997,7 +999,10 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       effort: input.effort ?? 'standard',
       seed: input.seed ?? 1,
       restarts: input.restarts ?? undefined,
-      budgetMs: input.budgetMs ?? null,
+      // No per-job budget here: the pool hands each job its share of the PLAN's
+      // budget at dispatch time (see packerPool.runAll). An injected packer
+      // (the tests) gets the whole plan budget, as before.
+      budgetMs: input.pack ? (input.budgetMs ?? null) : null,
     };
 
     prepared.push({ g, sheets, pieces, settings, guillotine, packInput });
@@ -1006,9 +1011,22 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // ---- pack everything, in parallel ----------------------------------------
   // Effort carries a seed count too: Deep buys insurance against an unlucky
   // draw, Standard does not pay for it.
-  const effortSeeds = (await import('./nestingPacker.js')).EFFORT?.[input.effort ?? 'standard']?.seeds;
+  const { EFFORT } = await import('./nestingPacker.js');
+  const level = EFFORT?.[input.effort ?? 'standard'] ?? EFFORT?.standard;
+  const effortSeeds = level?.seeds;
   const seedCount = Math.max(1, Math.trunc(Number(input.seeds ?? effortSeeds ?? DEFAULT_SEEDS)) || 1);
+  /*
+   * ONE BUDGET FOR THE WHOLE PLAN. `capMs` (or `budgetMs` from the caller) is
+   * the wall clock from the moment this plan started, not a per-job allowance
+   * — see packerPool.runAll for how it is shared out. A slice is held back
+   * for the last in-flight step of each job and for shaping the answer, so the
+   * response lands inside the budget rather than just after it.
+   */
+  const planBudgetMs = Math.max(0, Number(input.budgetMs ?? level?.capMs ?? 0) || 0);
+  const reserveMs = Math.min(30_000, Math.round(planBudgetMs * 0.1));
+  const deadlineAt = planStartedAt + planBudgetMs - reserveMs;
   const outByGroup = new Map();
+  let budget = null;
   if (input.pack) {
     // A caller injected its own packer (the tests do). Run it here, in order.
     for (const pr of prepared) outByGroup.set(pr.g.key, (await pack(pr.packInput)) ?? {});
@@ -1020,15 +1038,20 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       // whose streams start in the same place would do identical work twice.
       const mine = seedsFor(Number(pr.packInput.seed) || 1, seedCount);
       seedsDropped += mine.dropped ?? 0;
-      for (const seed of mine) jobs.push({ key: pr.g.key, seed, input: { ...pr.packInput, seed } });
+      mine.forEach((seed, round) => jobs.push({ key: pr.g.key, seed, round, input: { ...pr.packInput, seed } }));
     }
-    const runs = await runAll(jobs);
+    const runs = await runAll(jobs, { workers: input.workers ?? null, deadlineAt });
+    const st = runs.stats ?? {};
     for (const pr of prepared) {
-      const mine = runs
+      const all = runs
         .map((r, i) => ({ ...r, seed: jobs[i].seed, key: jobs[i].key }))
         .filter((r) => r.key === pr.g.key);
+      const mine = all.filter((r) => !r.skipped);
       const best = pickBest(mine);
       outByGroup.set(pr.g.key, best?.out ?? {});
+      const skippedTime = all.filter((r) => r.skipped === 'time').length;
+      const cappedRuns = mine.filter((r) => r.ok && r.out?.deterministic === false).length;
+      budgetCut.set(pr.g.key, skippedTime > 0 || cappedRuns > 0);
       if (seedCount > 1) {
         // How many distinct layouts the seeds actually produced. Two seeds landing
         // on the same answer is wasted CPU and worth being able to see.
@@ -1038,9 +1061,28 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
         seedsTried.push({
           thickness: pr.g.thickness, grade: pr.g.grade,
           tried: mine.length, distinct, dropped: seedsDropped, won: best?.seed ?? null,
+          // Added: seeds not run because the plan's clock had no room for them
+          // (or the first seed already hit the lower bound), and seeds whose
+          // search the clock cut short.
+          skipped: skippedTime, skippedProven: all.filter((r) => r.skipped === 'proven').length,
+          capped: cappedRuns,
         });
       }
     }
+    budget = {
+      effort: input.effort ?? 'standard',
+      capMs: planBudgetMs,
+      workers: st.workers ?? null,
+      jobs: st.jobs ?? jobs.length,
+      jobsRun: st.run ?? null,
+      seedsSkippedForTime: st.skippedTime ?? 0,
+      seedsSkippedProven: st.skippedProven ?? 0,
+      jobsCapped: st.capped ?? 0,
+      // True when the clock, not the effort's own trial count, decided how far
+      // the search went: a seed was skipped for time or a search was cut short.
+      capped: (st.skippedTime ?? 0) > 0 || (st.capped ?? 0) > 0,
+      packMs: Date.now() - planStartedAt,
+    };
   }
 
   // ---- shape the winners ---------------------------------------------------
@@ -1078,6 +1120,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       metrics: metricsOf(nests, g),
       deterministic: out.deterministic ?? null,
       elapsedMs: out.elapsedMs ?? null,
+      budgetCut: budgetCut.get(g.key) ?? false,
     });
   }
 
@@ -1103,6 +1146,9 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     // Which seeds were tried and which won, so a plan can say how it was reached
     // and a better one can be got back by asking for that seed again.
     seeds: seedsTried,
+    // How the effort's time budget was spent across the plan; `capped` says the
+    // clock cut the search. Null when an injected packer ran the plan.
+    budget: budget ? { ...budget, elapsedMs: Date.now() - planStartedAt } : null,
     totals: totalsOf(groups),
   };
 }

@@ -131,13 +131,20 @@ export const EFFORT = Object.freeze({
  * cut off. Turning restarts up without turning the budget up buys nothing and
  * can cost.
  *
- * capMs is per STEEL GROUP and is set so the biggest real order finishes:
+ * (Those figures were measured with capMs as a per-group allowance.)
  *   cap 20s -> 651.533 t, one group capped
  *   cap 45s -> 651.158 t, one group capped
- *   cap 60s -> 651.158 t, NONE capped   <- standard
+ *   cap 60s -> 651.158 t, NONE capped
  * A capped run quietly throws away the restarts it was told to make, and the
  * only sign is `deterministic: false` in the result. Budget it from the knee,
  * do not guess it.
+ *
+ * SINCE 2026-09-30 capMs IS THE WHOLE PLAN'S WALL CLOCK when nestingService
+ * runs a line: every (group x seed) job shares one absolute deadline
+ * (`deadlineAt`) and gets a share of what is left when it starts (see
+ * lib/packerPool.js). As a per-job allowance it let 48 queued jobs on a two-core
+ * host run for half an hour. Called directly, `nest()` still reads capMs (or
+ * `budgetMs`) as its own allowance.
  *
  * Trial i is seeded from (seed, i) alone, so a shallower run's restarts are a
  * PREFIX of a deeper one's and best-of-N stays monotone. That is what keeps
@@ -1003,20 +1010,27 @@ function* repair(ctx, cur, step) {
 }
 
 function* search(ctx) {
-  let best = yield* buildSolution(ctx, null); // trial 0: THE FLOOR. Always runs.
+  // Trial 0: THE FLOOR. Always runs, whatever the clock says — it is the
+  // complete, legal answer a job returns when it is given no time at all. It
+  // uses no random stream, so it is the same layout for every seed.
+  let best = yield* buildSolution(ctx, null);
+  ctx.floorMs = Date.now() - ctx.t0;
   let capped = false;
+  let trials = 1;
   const restarts = ctx.restarts;
   const total = (ctx.level.repairs || restarts) ? restarts + ctx.level.repairs : 0;
+  const proven = () => best.strandedQty === 0 && best.score <= ctx.lowerBound + EPS;
 
   for (let step = 1; step <= total; step += 1) {
+    if (proven()) break; // provably done
     if (Date.now() >= ctx.deadline) { capped = true; break; }
-    if (best.strandedQty === 0 && best.score <= ctx.lowerBound + EPS) break; // provably done
     const cand = step <= restarts
       ? yield* buildSolution(ctx, rngFor(ctx.seed, step))
       : yield* repair(ctx, best, step);
+    trials += 1;
     if (cand && better(cand, best)) { best = cand; ctx.stall = 0; } else ctx.stall += 1;
   }
-  return { best, capped };
+  return { best, capped, trials, proven: proven() };
 }
 
 /* ─────────────────────────────── size advice ───────────────────────────── */
@@ -1095,7 +1109,7 @@ function* solve(input) {
     commonBoundary = true, smallThreshold = SMALL_THRESHOLD_MM,
     rowsPerSequence = ROWS_PER_SEQUENCE,
     effort = 'standard', seed = 1,
-    budgetMs = null, maxNests = DEFAULT_MAX_NESTS,
+    budgetMs = null, deadlineAt = null, maxNests = DEFAULT_MAX_NESTS,
   } = input ?? {};
 
   // Kerf is a NUMBER of mm and nothing else. Passing a thickness and having the
@@ -1183,10 +1197,18 @@ function* solve(input) {
     stall: 0,
     maxNests: Math.max(1, Math.trunc(Number(maxNests))),
     lowerBound: Math.max(0, pieceArea - ownedArea),
-    deadline: t0 + (budgetMs == null ? level.capMs : Math.max(0, Number(budgetMs))),
+    t0,
+    floorMs: null,
+    // `budgetMs` is this run's own allowance; `deadlineAt` is an ABSOLUTE wall
+    // clock (epoch ms) shared by every job of one plan, so a job that started
+    // late still stops when the plan must. The earlier of the two wins.
+    deadline: Math.min(
+      t0 + (budgetMs == null ? level.capMs : Math.max(0, Number(budgetMs))),
+      deadlineAt == null || !Number.isFinite(Number(deadlineAt)) ? Infinity : Number(deadlineAt),
+    ),
   };
 
-  const { best, capped } = yield* search(ctx);
+  const { best, capped, trials, proven } = yield* search(ctx);
 
   const shape = (p) => ({
     key: demand[p.idx].key,
@@ -1246,6 +1268,11 @@ function* solve(input) {
     separateCuts: out.reduce((a, n) => a + n.separateCuts, 0),
     /** False only when the clock, not the iteration count, ended the search. */
     deterministic: !capped,
+    /** Trials actually run (1 = the floor alone), and how long the floor took. */
+    trials,
+    floorMs: ctx.floorMs,
+    /** The answer hit the area lower bound: no amount of searching can beat it. */
+    proven,
     elapsedMs: Date.now() - t0,
   };
 }
@@ -1271,7 +1298,7 @@ function mergeUnplaced(list) {
  *   sequenceGap?: number, margin?: number, commonBoundary?: boolean,
  *   smallThreshold?: number, rowsPerSequence?: {small:number, big:number},
  *   effort?: 'quick'|'standard'|'deep', seed?: number,
- *   budgetMs?: number|null, maxNests?: number,
+ *   budgetMs?: number|null, deadlineAt?: number|null, maxNests?: number,
  * }} input  Kerf comes as a number, or as a `thickness` resolved by `kerfFor`.
  * @returns {{nests:Array, unplaced:Array, areaBought:number, wasteArea:number,
  *            wastePct:number, sizeAdvice:Array, kerf:number, sequenceGap:number,
