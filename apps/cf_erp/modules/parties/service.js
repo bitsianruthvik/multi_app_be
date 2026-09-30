@@ -6,10 +6,16 @@
  * check and is refused while any of them finds a use.
  */
 import { PartyError } from './errors.js';
+import { validateGstin, readStateCode, stateName, FOREIGN_STATE } from './gstin.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ROLES = { customer: 'is_customer', supplier: 'is_supplier', subcontractor: 'is_subcontractor' };
+/** How a party is registered for GST (CF_ERP_GST_PLAN §1). */
+export const GST_REGISTRATIONS = ['regular', 'composition', 'unregistered', 'sez', 'overseas'];
+/** Registrations whose tax number must be a real GSTIN. An overseas party's is its own country's number. */
+const NEEDS_GSTIN = new Set(['regular', 'composition', 'sez']);
+const PIN_RE = /^[1-9]\d{5}$/;
 
 const referenceChecks = [];
 
@@ -27,6 +33,13 @@ function shape(p) {
     name: p.name,
     roles: Object.entries(ROLES).filter(([, col]) => Number(p[col])).map(([role]) => role),
     taxNumber: p.tax_number,
+    // GST ("GST identity" in this module's init.sql): tax_number IS the GSTIN.
+    gstin: p.tax_number,
+    gstRegistration: p.gst_registration ?? 'regular',
+    stateCode: p.state_code ?? null,
+    stateName: stateName(p.state_code),
+    city: p.city ?? null,
+    pincode: p.pincode ?? null,
     contactName: p.contact_name,
     email: p.email,
     phone: p.phone,
@@ -38,7 +51,9 @@ function shape(p) {
   };
 }
 
-function readBody(input, existing = null) {
+function readBody(rawInput, existing = null) {
+  // `gstin` is another name for taxNumber (the contract's word for it).
+  const input = rawInput.gstin !== undefined && rawInput.taxNumber === undefined ? { ...rawInput, taxNumber: rawInput.gstin } : rawInput;
   const problems = [];
   const out = {};
   const text = (key, col, max, required = false) => {
@@ -57,6 +72,7 @@ function readBody(input, existing = null) {
   text('contactName', 'contact_name', 255);
   text('email', 'email', 255);
   text('phone', 'phone', 50);
+  text('city', 'city', 100);
   if (input.address !== undefined) out.address = blank(input.address) ? null : String(input.address);
   if (input.notes !== undefined) out.notes = blank(input.notes) ? null : String(input.notes);
   if (out.code && !CODE_RE.test(out.code)) problems.push('Code: letters, digits and - _ . /, no spaces.');
@@ -74,8 +90,157 @@ function readBody(input, existing = null) {
     if (!['active', 'inactive'].includes(input.status)) problems.push('Status is active or inactive.');
     out.status = input.status;
   }
+  readGst(input, existing, out, problems);
   if (problems.length) throw new PartyError(422, 'INVALID', 'Some fields need attention.', { problems });
   return out;
+}
+
+/**
+ * GSTIN, registration, state and PIN code. The GSTIN is checked (pattern, state,
+ * mod-36 check character) whenever it, the registration or the state is sent,
+ * for a registration that has one; its first two digits then SET the state.
+ * Checking only what was sent keeps an old party with an odd tax number editable.
+ */
+function readGst(input, existing, out, problems) {
+  if (input.gstRegistration !== undefined) {
+    if (!GST_REGISTRATIONS.includes(input.gstRegistration)) problems.push('GST registration is regular, composition, unregistered, SEZ or overseas.');
+    else out.gst_registration = input.gstRegistration;
+  }
+  if (input.pincode !== undefined) {
+    const pin = blank(input.pincode) ? null : String(input.pincode).replace(/\s+/g, '');
+    if (pin && !PIN_RE.test(pin)) problems.push('A PIN code is 6 digits.');
+    out.pincode = pin;
+  }
+  let typedState;
+  if (input.stateCode !== undefined) {
+    typedState = readStateCode(input.stateCode);
+    if (typedState === undefined) problems.push(`${input.stateCode} is not a GST state code.`);
+    else out.state_code = typedState;
+  }
+  const touched = input.taxNumber !== undefined || input.gstRegistration !== undefined || input.stateCode !== undefined;
+  if (!touched) return;
+  const registration = out.gst_registration ?? existing?.gst_registration ?? 'regular';
+  const taxNumber = out.tax_number !== undefined ? out.tax_number : existing?.tax_number ?? null;
+  if (taxNumber && NEEDS_GSTIN.has(registration)) {
+    const v = validateGstin(taxNumber);
+    if (!v.valid) { problems.push(`GSTIN: ${v.message}`); return; }
+    out.tax_number = v.gstin;
+    if (typedState && typedState !== v.stateCode) {
+      problems.push(`The GSTIN is registered in ${v.stateName} (${v.stateCode}), not ${stateName(typedState)} — the state comes from the GSTIN.`);
+    }
+    out.state_code = v.stateCode;
+  } else if (registration === 'overseas' && input.stateCode === undefined) {
+    out.state_code = FOREIGN_STATE;
+  }
+}
+
+// --- ship-to addresses (cf_party_addresses) -----------------------------------
+
+function shapeAddress(a) {
+  return {
+    id: a.id,
+    partyId: a.party_id,
+    label: a.label,
+    address: a.address,
+    city: a.city,
+    pincode: a.pincode,
+    stateCode: a.state_code,
+    stateName: stateName(a.state_code),
+    gstin: a.gstin,
+    isDefaultShip: !!Number(a.is_default_ship),
+  };
+}
+
+function readAddress(input, existing = null) {
+  const problems = [];
+  const out = {};
+  const text = (key, col, max) => {
+    if (input[key] === undefined) return;
+    const v = blank(input[key]) ? null : String(input[key]).trim();
+    if (v && v.length > max) problems.push(`${key} is up to ${max} characters.`);
+    out[col] = v;
+  };
+  text('label', 'label', 100);
+  text('city', 'city', 100);
+  if (input.address !== undefined) out.address = blank(input.address) ? null : String(input.address);
+  if (input.pincode !== undefined) {
+    const pin = blank(input.pincode) ? null : String(input.pincode).replace(/\s+/g, '');
+    if (pin && !PIN_RE.test(pin)) problems.push('A PIN code is 6 digits.');
+    out.pincode = pin;
+  }
+  let typedState;
+  if (input.stateCode !== undefined) {
+    typedState = readStateCode(input.stateCode);
+    if (typedState === undefined) problems.push(`${input.stateCode} is not a GST state code.`);
+    else out.state_code = typedState;
+  }
+  if (input.gstin !== undefined) {
+    const g = blank(input.gstin) ? null : String(input.gstin);
+    if (g) {
+      const v = validateGstin(g);
+      if (!v.valid) problems.push(`GSTIN: ${v.message}`);
+      else {
+        out.gstin = v.gstin;
+        if (typedState && typedState !== v.stateCode) problems.push(`The GSTIN is registered in ${v.stateName} (${v.stateCode}), not ${stateName(typedState)}.`);
+        out.state_code = v.stateCode;
+      }
+    } else out.gstin = null;
+  }
+  if (input.isDefaultShip !== undefined) out.is_default_ship = input.isDefaultShip ? 1 : 0;
+  if (!existing && !out.address && !out.city) problems.push('Give the address.');
+  if (problems.length) throw new PartyError(422, 'INVALID', 'Some fields need attention.', { problems });
+  return out;
+}
+
+export async function listAddresses(db, companyId, partyId) {
+  await requireParty(db, companyId, partyId);
+  const [rows] = await db.query(
+    'SELECT * FROM cf_party_addresses WHERE company_id = ? AND party_id = ? AND deleted_at IS NULL ORDER BY is_default_ship DESC, id',
+    [companyId, partyId],
+  );
+  return rows.map(shapeAddress);
+}
+
+/** At most one default ship-to per party: setting one clears the rest. */
+async function clearDefault(db, companyId, partyId, exceptId) {
+  await db.query('UPDATE cf_party_addresses SET is_default_ship = 0 WHERE company_id = ? AND party_id = ? AND id <> ? AND is_default_ship = 1',
+    [companyId, partyId, exceptId]);
+}
+
+export async function createAddress(db, c, partyId, input = {}) {
+  await requireParty(db, c.companyId, partyId);
+  const body = readAddress(input);
+  const cols = Object.keys(body);
+  const [r] = await db.query(
+    `INSERT INTO cf_party_addresses (company_id, party_id, ${cols.join(', ')}, created_by) VALUES (?, ?, ${cols.map(() => '?').join(', ')}, ?)`,
+    [c.companyId, partyId, ...Object.values(body), c.userId],
+  );
+  if (body.is_default_ship) await clearDefault(db, c.companyId, partyId, r.insertId);
+  return listAddresses(db, c.companyId, partyId);
+}
+
+async function requireAddress(db, companyId, partyId, addressId) {
+  const [[a]] = await db.query('SELECT * FROM cf_party_addresses WHERE company_id = ? AND party_id = ? AND id = ? AND deleted_at IS NULL', [companyId, partyId, addressId]);
+  if (!a) throw new PartyError(404, 'NOT_FOUND', 'Address not found.');
+  return a;
+}
+
+export async function updateAddress(db, c, partyId, addressId, input = {}) {
+  const a = await requireAddress(db, c.companyId, partyId, addressId);
+  const body = readAddress(input, a);
+  if (Object.keys(body).length) {
+    await db.query(`UPDATE cf_party_addresses SET ${Object.keys(body).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
+      [...Object.values(body), c.companyId, a.id]);
+  }
+  if (body.is_default_ship) await clearDefault(db, c.companyId, partyId, a.id);
+  return listAddresses(db, c.companyId, partyId);
+}
+
+/** Soft delete: an issued invoice keeps its own copy of the address (snapshot), so nothing breaks. */
+export async function deleteAddress(db, c, partyId, addressId) {
+  const a = await requireAddress(db, c.companyId, partyId, addressId);
+  await db.query('UPDATE cf_party_addresses SET deleted_at = NOW(), is_default_ship = 0 WHERE company_id = ? AND id = ?', [c.companyId, a.id]);
+  return listAddresses(db, c.companyId, partyId);
 }
 
 export async function listParties(db, companyId, q = {}) {

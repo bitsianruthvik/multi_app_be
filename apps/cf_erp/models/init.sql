@@ -3686,3 +3686,258 @@ SET @sql = IF(@col = 0,
   "ALTER TABLE cf_item_details ADD COLUMN currency CHAR(3) NOT NULL DEFAULT 'INR'",
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 37. GST — tax identity, tax on orders, one tax invoice per dispatch
+--     (TM/CF_ERP_GST_PLAN.md; services/taxService.js, services/invoiceService.js)
+-- ===========================================================================
+--
+-- Decided 2026-09-30 (user): a customer gets a TAX INVOICE WITH EACH DISPATCH,
+-- and the ERP works out the tax, prints the invoice and makes the files for the
+-- government portals (e-invoice JSON, e-way bill JSON) for upload by hand.
+-- Defaults (Claude): RATES ARE DATA — the company's list (gst_rates JSON, NULL =
+-- the seed list in taxService) and each item's rate; nothing in the logic names
+-- a rate. Every existing price stays NET of tax; tax is computed on top, on read,
+-- for orders and purchase orders. An INVOICE is numbered only when ISSUED and
+-- never changes after: its supplier / buyer / ship-to and every line are frozen
+-- into its own columns at issue (a draft is worked out live). Cancel keeps the
+-- number. Numbers are gap-free per company per financial year (Apr-Mar): taken
+-- inside the issuing transaction with SELECT ... FOR UPDATE on cf_invoice_series.
+--
+-- The party half (GSTIN = cf_parties.tax_number, registration, state, ship-to
+-- addresses) is in modules/parties/models/init.sql, which runs first.
+--
+-- Every ADD is guarded on its own; no key is added in the ALTER that adds its
+-- column (TiDB). New tables carry their keys in their CREATE.
+
+-- ---- 37a. The company's tax identity (one row per company, §33) ---------------
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'legal_name');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN legal_name VARCHAR(255) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'trade_name');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN trade_name VARCHAR(255) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'gstin');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN gstin VARCHAR(15) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'state_code');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN state_code CHAR(2) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'address_line1');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN address_line1 VARCHAR(255) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'address_line2');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN address_line2 VARCHAR(255) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'city');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN city VARCHAR(100) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'pincode');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN pincode VARCHAR(10) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'lut_number');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN lut_number VARCHAR(50) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'invoice_prefix');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN invoice_prefix VARCHAR(8) NOT NULL DEFAULT 'INV'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'einvoice_required');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN einvoice_required TINYINT(1) NOT NULL DEFAULT 1", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'gst_rates');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN gst_rates JSON NULL COMMENT 'the allowed GST rates; NULL = the seed list'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 37b. HSN / SAC and GST rate on items and on template definitions --------
+-- A custom line sells a temporary item whose template carries them (KEPL span ->
+-- 7308, 18%): the item's own value wins, then its source definition's. NULL
+-- rate = "no GST rate": a draft invoice can hold it, issue cannot.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'hsn_code');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_item_details ADD COLUMN hsn_code VARCHAR(8) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'gst_rate');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_item_details ADD COLUMN gst_rate DECIMAL(5,2) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'is_service');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_item_details ADD COLUMN is_service TINYINT(1) NOT NULL DEFAULT 0", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_definition_details' AND COLUMN_NAME = 'hsn_code');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_definition_details ADD COLUMN hsn_code VARCHAR(8) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_definition_details' AND COLUMN_NAME = 'gst_rate');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_definition_details ADD COLUMN gst_rate DECIMAL(5,2) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_definition_details' AND COLUMN_NAME = 'is_service');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_definition_details ADD COLUMN is_service TINYINT(1) NOT NULL DEFAULT 0", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 37c. Reverse charge on a purchase order ------------------------------------
+-- The tax is payable by us, not part of the supplier's total.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'reverse_charge');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_purchase_orders ADD COLUMN reverse_charge TINYINT(1) NOT NULL DEFAULT 0", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ---- 37d. The invoice number series, per company per financial year ----------
+-- Numbers are <prefix>/<yy-yy>/<0001> (16 characters at most, the portal limit).
+-- The prefix is fixed for the year at its first issue. next_no only moves inside
+-- an issuing transaction that holds this row FOR UPDATE, so it never skips.
+CREATE TABLE IF NOT EXISTS cf_invoice_series (
+  company_id   INT          NOT NULL,
+  fy           VARCHAR(7)   NOT NULL,                -- '2026-27'
+  prefix       VARCHAR(8)   NOT NULL,
+  next_no      INT          NOT NULL DEFAULT 1,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  PRIMARY KEY (company_id, fy),
+  CONSTRAINT fk_cins_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+-- ---- 37e. Invoices -------------------------------------------------------------
+-- One DRAFT per order per dispatch day collects what ships that day
+-- (dispatch_date). supplier / buyer / ship_to are JSON snapshots written at
+-- ISSUE, and the totals too. irn / ack / signed_qr are typed back from the IRP.
+CREATE TABLE IF NOT EXISTS cf_invoices (
+  id                  INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT            NOT NULL,
+  order_id            INT            NOT NULL,
+  customer_id         INT            NULL,
+  status              ENUM('draft','issued','cancelled') NOT NULL DEFAULT 'draft',
+  invoice_no          VARCHAR(16)    NULL,           -- NULL until issued
+  invoice_date        DATE           NULL,
+  dispatch_date       DATE           NULL,           -- the day this draft collects shipments for
+  fy                  VARCHAR(7)     NULL,
+  supplier            JSON           NULL,
+  buyer               JSON           NULL,
+  ship_to             JSON           NULL,           -- typed on a draft, or the snapshot at issue
+  ship_to_address_id  INT            NULL,
+  place_of_supply     CHAR(2)        NULL,
+  is_igst             TINYINT(1)     NULL,
+  supply_type         VARCHAR(10)    NULL,           -- B2B, SEZWP, SEZWOP, EXPWP, EXPWOP, B2C
+  lut_number          VARCHAR(50)    NULL,
+  reverse_charge      TINYINT(1)     NOT NULL DEFAULT 0,
+  taxable_total       DECIMAL(18,2)  NULL,
+  cgst_total          DECIMAL(18,2)  NULL,
+  sgst_total          DECIMAL(18,2)  NULL,
+  igst_total          DECIMAL(18,2)  NULL,
+  round_off           DECIMAL(8,2)   NULL,
+  grand_total         DECIMAL(18,2)  NULL,
+  currency            CHAR(3)        NOT NULL DEFAULT 'INR',
+  irn                 VARCHAR(64)    NULL,
+  ack_no              VARCHAR(20)    NULL,
+  ack_date            DATETIME       NULL,
+  signed_qr           TEXT           NULL,
+  transport           JSON           NULL,
+  notes               TEXT           NULL,
+  cancelled_reason    VARCHAR(255)   NULL,
+  cancelled_at        DATETIME       NULL,
+  cancelled_by        INT            NULL,
+  issued_at           DATETIME       NULL,
+  issued_by           INT            NULL,
+
+  deleted_at          DATETIME       DEFAULT NULL,   -- drafts only; an issued invoice is never deleted
+  created_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT            NULL,
+
+  UNIQUE KEY uq_cinv_tenant (company_id, id),
+  UNIQUE KEY uq_cinv_no     (company_id, invoice_no),
+  KEY idx_cinv_order    (company_id, order_id, status),
+  KEY idx_cinv_customer (company_id, customer_id),
+  KEY idx_cinv_status   (company_id, status, invoice_date),
+
+  CONSTRAINT fk_cinv_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cinv_order     FOREIGN KEY (company_id, order_id)    REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cinv_customer  FOREIGN KEY (company_id, customer_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cinv_ship_to   FOREIGN KEY (company_id, ship_to_address_id) REFERENCES cf_party_addresses(company_id, id),
+  CONSTRAINT fk_cinv_creator   FOREIGN KEY (created_by)   REFERENCES users(id),
+  CONSTRAINT fk_cinv_issuer    FOREIGN KEY (issued_by)    REFERENCES users(id),
+  CONSTRAINT fk_cinv_canceller FOREIGN KEY (cancelled_by) REFERENCES users(id)
+);
+
+-- ---- 37f. Invoice lines — one per shipment (movement) of an order line ----------
+-- A draft line holds only WHAT shipped (order line, movement, quantity); its
+-- money is worked out live. Issue writes every other column. claim = 1 while
+-- the line holds its shipment (a live line on a draft or issued invoice); a
+-- removed line or a cancelled invoice sets it NULL, so uq_cinl_claim lets a
+-- shipment be invoiced AT MOST ONCE and a cancel frees it.
+CREATE TABLE IF NOT EXISTS cf_invoice_lines (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  invoice_id      INT            NOT NULL,
+  line_no         INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  movement_id     INT            NOT NULL,
+  claim           TINYINT        NULL DEFAULT 1,
+  quantity        DECIMAL(18,6)  NOT NULL,          -- in the line item's unit, as shipped
+  description     VARCHAR(500)   NULL,
+  hsn_code        VARCHAR(8)     NULL,
+  is_service      TINYINT(1)     NULL,
+  uom             VARCHAR(20)    NULL,
+  billed_qty      DECIMAL(18,6)  NULL,
+  billed_uom      VARCHAR(10)    NULL,
+  rate            DECIMAL(18,4)  NULL,
+  rate_basis      ENUM('unit','kg','tonne','metre') NULL,
+  taxable         DECIMAL(18,2)  NULL,
+  gst_rate        DECIMAL(5,2)   NULL,
+  cgst            DECIMAL(18,2)  NULL,
+  sgst            DECIMAL(18,2)  NULL,
+  igst            DECIMAL(18,2)  NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cinl_tenant (company_id, id),
+  UNIQUE KEY uq_cinl_claim  (company_id, movement_id, order_line_id, claim),
+  KEY idx_cinl_invoice    (company_id, invoice_id),
+  KEY idx_cinl_order_line (company_id, order_line_id),
+
+  CONSTRAINT fk_cinl_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cinl_invoice    FOREIGN KEY (company_id, invoice_id)    REFERENCES cf_invoices(company_id, id),
+  CONSTRAINT fk_cinl_order_line FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cinl_movement   FOREIGN KEY (company_id, movement_id)   REFERENCES cf_stock_movements(company_id, id)
+);
+
+-- ---- 37g. E-way bills — a big structure can need several vehicles --------------
+CREATE TABLE IF NOT EXISTS cf_eway_bills (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  invoice_id   INT           NOT NULL,
+  eway_no      VARCHAR(12)   NOT NULL,
+  vehicle_no   VARCHAR(20)   NULL,
+  valid_until  DATETIME      NULL,
+
+  deleted_at   DATETIME      DEFAULT NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  created_by   INT           NULL,
+
+  eway_active  VARCHAR(12)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, eway_no, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cewb_tenant (company_id, id),
+  UNIQUE KEY uq_cewb_no     (company_id, eway_active),
+  KEY idx_cewb_invoice (company_id, invoice_id),
+
+  CONSTRAINT fk_cewb_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cewb_invoice FOREIGN KEY (company_id, invoice_id) REFERENCES cf_invoices(company_id, id),
+  CONSTRAINT fk_cewb_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);

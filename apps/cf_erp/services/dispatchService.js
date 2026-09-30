@@ -18,6 +18,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { postMovement } from './stockService.js';
 import { getRelease, liveReleaseOfLine } from './releaseService.js';
+import { invoiceShipments } from './invoiceService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -67,8 +68,13 @@ export async function shipmentView(db, companyId, lineId) {
 
 /**
  * Ships a line: issues its earmarked finished stock to the order.
- * input: { quantity?, reference?, movementDate?, notes? } — quantity defaults
+ * input: { quantity?, reference?, movementDate?, notes?, invoice? } — quantity defaults
  * to everything standing ready.
+ *
+ * THE TAX INVOICE (CF_ERP_GST_PLAN §3, user 2026-09-30: "a tax invoice with each
+ * dispatch"): unless invoice is false, what ships goes onto TODAY'S DRAFT invoice
+ * for the order (invoiceService.invoiceShipments), in this same transaction —
+ * several lines on one truck land on one invoice. Returns invoice { id, status, invoiceNo } | null.
  */
 export async function shipLine(db, c, lineId, input = {}) {
   const l = await requireLine(db, c.companyId, lineId);
@@ -131,6 +137,7 @@ export async function shipLine(db, c, lineId, input = {}) {
   if (shipped <= EPS) throw invalid('NOT_THERE', `What was made for line ${l.line_no} is not on the dispatch shelf any more — find it before shipping.`);
 
   let movement = null;
+  const movementIds = [];
   for (const [areaId, lines] of byArea) {
     movement = await postMovement(db, c, {
       movementType: 'issue',
@@ -142,12 +149,16 @@ export async function shipLine(db, c, lineId, input = {}) {
       notes: blank(input.notes) ? `Shipped against line ${l.line_no} of ${l.order_code}` : String(input.notes),
     }, { fromProduction: true });   // production's own stock, going back out
     await db.query('UPDATE cf_stock_movements SET order_line_id = ? WHERE company_id = ? AND id = ?', [l.id, c.companyId, movement.id]);
+    movementIds.push(movement.id);
   }
   await db.query('UPDATE cf_sales_order_lines SET delivered_qty = delivered_qty + ? WHERE company_id = ? AND id = ?', [shipped, c.companyId, l.id]);
+  const wantInvoice = !(input.invoice === false || input.invoice === 'false' || input.invoice === 0);
+  const invoice = wantInvoice ? await invoiceShipments(db, c, l.order_id, movementIds) : null;
   const release = await liveReleaseOfLine(db, c.companyId, l.id);
   return {
     movement,
     shipped,
+    invoice,
     line: await shipmentView(db, c.companyId, l.id),
     release: release ? await getRelease(db, c.companyId, release.id) : null,
   };

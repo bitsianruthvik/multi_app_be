@@ -26,6 +26,11 @@ import { bomOfParent, deleteBomOf, placementOf } from './bomGraph.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
 import { readPrice, readBasis, readCurrency } from './priceService.js';
+import { readItemTax } from './taxService.js';
+
+const TEMP_TAX_MESSAGE = 'A row of an order\'s structure takes its HSN code and GST rate from its template — set them there.';
+const SELECTION_TAX_MESSAGE = 'A selection takes its HSN code and GST rate from the catalog item it picks — set them on the item.';
+const setsTax = (tax) => Object.values(tax).some((v) => v != null && v !== 0);
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const SHORT_NAME_RE = /^[A-Za-z0-9_\-./]+$/;
@@ -156,6 +161,10 @@ export async function createItem(db, c, input = {}, opts = {}) {
   const priceBasis = readBasis(input.priceBasis, 'Price basis', problems) ?? 'unit';
   readCurrency(input.currency, problems);
   if (itemType === 'temporary' && listPrice != null) problems.push('A row of an order\'s structure has no list price — price it on its order line.');
+  // HSN / GST rate (init.sql §37). A row of an order takes them from its template.
+  const tax = {};
+  await readItemTax(db, c.companyId, input, null, tax, problems);
+  if (itemType === 'temporary' && setsTax(tax)) problems.push(TEMP_TAX_MESSAGE);
   const base = readBase(input, problems);
   assertNoProblems(problems);
 
@@ -165,9 +174,11 @@ export async function createItem(db, c, input = {}, opts = {}) {
     [c.companyId, base.code, base.name ?? '(pending)', base.shortName, base.description, classificationId, base.revision, c.userId],
   );
   await db.query(
-    `INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing, source_definition_id, owner_order_line_id, list_price, price_basis)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [r.insertId, c.companyId, itemType, trackedBy, uom, sourcing, sourceDefinitionId, ownerOrderLineId, listPrice, priceBasis],
+    `INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing, source_definition_id, owner_order_line_id, list_price, price_basis,
+                                  hsn_code, gst_rate, is_service)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [r.insertId, c.companyId, itemType, trackedBy, uom, sourcing, sourceDefinitionId, ownerOrderLineId, listPrice, priceBasis,
+      tax.hsn_code ?? null, tax.gst_rate ?? null, tax.is_service ?? 0],
   );
   if (opts.place) await opts.place(r.insertId);
   return finishCreate(db, c, r.insertId, 'item', base, input, opts);
@@ -180,6 +191,9 @@ export async function createDefinition(db, c, input = {}) {
   let classificationId = null;
   try { classificationId = (await requireLeaf(db, c.companyId, input.classificationId)).id; } catch (e) { problems.push(e.message); }
   const sel = await readSelection(db, c.companyId, definitionType, input, problems);
+  const tax = {};
+  await readItemTax(db, c.companyId, input, null, tax, problems);
+  if (definitionType === 'selection' && setsTax(tax)) problems.push(SELECTION_TAX_MESSAGE);
   const base = readBase(input, problems);
   assertNoProblems(problems);
 
@@ -189,9 +203,9 @@ export async function createDefinition(db, c, input = {}) {
     [c.companyId, base.code, base.name ?? '(pending)', base.shortName, base.description, classificationId, base.revision, c.userId],
   );
   await db.query(
-    `INSERT INTO cf_definition_details (master_id, company_id, definition_type, selection_mode, candidate_classification_id)
-     VALUES (?, ?, ?, ?, ?)`,
-    [r.insertId, c.companyId, definitionType, sel.selectionMode, sel.candidateClassificationId],
+    `INSERT INTO cf_definition_details (master_id, company_id, definition_type, selection_mode, candidate_classification_id, hsn_code, gst_rate, is_service)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [r.insertId, c.companyId, definitionType, sel.selectionMode, sel.candidateClassificationId, tax.hsn_code ?? null, tax.gst_rate ?? null, tax.is_service ?? 0],
   );
   return finishCreate(db, c, r.insertId, 'definition', base, input);
 }
@@ -291,6 +305,13 @@ export async function updateRecord(db, c, id, input = {}) {
         detail.candidate_classification_id = sel.candidateClassificationId;
       }
     }
+  }
+  // HSN / GST rate (init.sql §37): catalog items and template definitions. A row
+  // of an order takes them from its template; a selection from the item it picks.
+  if (input.hsnCode !== undefined || input.gstRate !== undefined || input.isService !== undefined) {
+    if (m.record_kind === 'item' && m.item_type === 'temporary') problems.push(TEMP_TAX_MESSAGE);
+    else if (m.record_kind === 'definition' && m.definition_type === 'selection') problems.push(SELECTION_TAX_MESSAGE);
+    else await readItemTax(db, c.companyId, input, m, detail, problems);
   }
   assertNoProblems(problems);
 
@@ -443,7 +464,15 @@ export async function deleteRecord(db, c, id) {
 }
 
 function shapeRecord(m) {
+  // GST (init.sql §37): HSN/SAC, rate and service flag — on catalog items and
+  // template definitions. Top level AND inside item / definition, same values.
+  const tax = {
+    hsnCode: m.hsn_code ?? null,
+    gstRate: m.gst_rate == null ? null : Number(m.gst_rate),
+    isService: !!Number(m.is_service ?? 0),
+  };
   return {
+    ...tax,
     id: m.id,
     recordKind: m.record_kind,
     kind: kindOf(m),
@@ -466,10 +495,11 @@ function shapeRecord(m) {
         listPrice: m.list_price == null ? null : Number(m.list_price),
         priceBasis: m.price_basis ?? 'unit',
         currency: m.price_currency ?? 'INR',
+        ...tax,
       }
       : null,
     definition: m.record_kind === 'definition'
-      ? { definitionType: m.definition_type, selectionMode: m.selection_mode, candidateClassificationId: m.candidate_classification_id }
+      ? { definitionType: m.definition_type, selectionMode: m.selection_mode, candidateClassificationId: m.candidate_classification_id, ...tax }
       : null,
   };
 }
@@ -581,6 +611,7 @@ export async function listRecords(db, companyId, q = {}) {
     `SELECT m.*, c.code AS classification_code, c.name AS classification_name,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
             i.list_price, i.price_basis, i.currency AS price_currency,
+            COALESCE(i.hsn_code, d.hsn_code) AS hsn_code, COALESCE(i.gst_rate, d.gst_rate) AS gst_rate, COALESCE(i.is_service, d.is_service, 0) AS is_service,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             sd.code AS source_definition_code, ol.line_no AS owner_line_no, so.id AS owner_order_id, so.code AS owner_order_code,
             (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status,

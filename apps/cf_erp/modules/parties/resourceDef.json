@@ -20,7 +20,11 @@
       "status": "cpt.status",
       "createdAt": "cpt.created_at",
       "updatedAt": "cpt.updated_at",
-      "createdBy": "cpt.created_by"
+      "createdBy": "cpt.created_by",
+      "gstRegistration": "cpt.gst_registration",
+      "stateCode": "cpt.state_code",
+      "city": "cpt.city",
+      "pincode": "cpt.pincode"
     },
     "fieldTypes": {
       "id": "integer",
@@ -39,7 +43,11 @@
       "status": "string",
       "createdAt": "datetime",
       "updatedAt": "datetime",
-      "createdBy": "integer"
+      "createdBy": "integer",
+      "gstRegistration": "string",
+      "stateCode": "string",
+      "city": "string",
+      "pincode": "string"
     },
     "relations": {}
   }

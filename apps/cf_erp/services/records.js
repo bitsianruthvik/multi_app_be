@@ -48,6 +48,7 @@ export const latestRevisionSql = (alias) =>
 const MASTER_SELECT = `SELECT m.*,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
             i.list_price, i.price_basis, i.currency AS price_currency,
+            COALESCE(i.hsn_code, d.hsn_code) AS hsn_code, COALESCE(i.gst_rate, d.gst_rate) AS gst_rate, COALESCE(i.is_service, d.is_service, 0) AS is_service,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
             so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
             so.revision AS owner_order_revision,

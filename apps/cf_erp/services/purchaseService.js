@@ -47,6 +47,7 @@ import { postMovement } from './stockService.js';
 import {
   CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
 } from './priceService.js';
+import { purchaseOrderTax } from './taxService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -287,6 +288,9 @@ export async function getPurchaseOrder(db, companyId, id) {
   const priced = lines.filter((l) => l.unit_price != null);
   const amount = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.quantity), 0));
   const amountReceived = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.qty_received), 0));
+  // Input GST (init.sql §37): per line and in total; reverse charge keeps it out of the supplier total.
+  const { lineTax, poTax } = await purchaseOrderTax(db, companyId, [p],
+    lines.map((l) => ({ id: l.id, purchase_order_id: p.id, item_id: l.item_id, amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)) })));
   return {
     id: p.id,
     code: p.code,
@@ -296,11 +300,13 @@ export async function getPurchaseOrder(db, companyId, id) {
     expectedDate: p.expected_date,
     orderedAt: p.ordered_at,
     notes: p.notes,
+    reverseCharge: !!Number(p.reverse_charge ?? 0),
     createdAt: p.created_at,
     totals: {
       lines: lines.length, ordered, received, outstanding: round6(Math.max(0, ordered - received)),
       // Money, net of tax (init.sql §36) — priced lines only; unpricedLines counts the rest.
       amount, amountReceived, currency: CURRENCY, unpricedLines: lines.length - priced.length,
+      ...poTax.get(p.id),
     },
     lines: lines.map((l) => ({
       id: l.id,
@@ -313,6 +319,7 @@ export async function getPurchaseOrder(db, companyId, id) {
       currency: l.currency ?? CURRENCY,
       amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)),
       lastPaid: shapeLastPaid(lastPaid.get(l.item_id)),
+      ...lineTax.get(l.id),
       expectedDate: l.expected_date,
       note: l.note,
       receipts: receipts.filter((v) => v.purchase_line_id === l.id)
@@ -340,6 +347,17 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
       WHERE ${where.join(' AND ')} ORDER BY p.id DESC`,
     args,
   );
+  // Input GST per order (init.sql §37): the lines of every listed order in one read, then three.
+  const poTaxes = new Map();
+  if (rows.length) {
+    const [pl] = await db.query(
+      `SELECT id, purchase_order_id, item_id, IF(unit_price IS NULL, NULL, ROUND(unit_price * quantity, 2)) AS amount
+         FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id IN (?) AND deleted_at IS NULL`,
+      [companyId, rows.map((p) => p.id)],
+    );
+    const { poTax } = await purchaseOrderTax(db, companyId, rows, pl.map((l) => ({ ...l, amount: l.amount == null ? null : Number(l.amount) })));
+    for (const [k, v] of poTax) poTaxes.set(k, v);
+  }
   let out = rows.map((p) => ({
     id: p.id,
     code: p.code,
@@ -355,7 +373,9 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
       received: round6(p.received),
       outstanding: round6(Math.max(0, Number(p.ordered) - Number(p.received))),
       amount: round2(p.amount), currency: CURRENCY, unpricedLines: Number(p.unpriced),
+      ...poTaxes.get(p.id),
     },
+    reverseCharge: !!Number(p.reverse_charge ?? 0),
   }));
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
@@ -418,6 +438,8 @@ export async function updatePurchaseOrder(db, c, id, input = {}) {
   }
   if (input.expectedDate !== undefined) sets.expected_date = readDate(input.expectedDate, 'Expected date', problems);
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
+  // Reverse charge (init.sql §37): the GST is payable by us, not part of the supplier total.
+  if (input.reverseCharge !== undefined) sets.reverse_charge = input.reverseCharge ? 1 : 0;
   assertNoProblems(problems);
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_purchase_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,

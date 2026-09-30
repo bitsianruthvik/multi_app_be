@@ -38,6 +38,7 @@ import { explode } from './bomService.js';
 import { generate } from '../modules/codegen/index.js';
 import { resolveProcess } from './processService.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
+import { salesOrderTax } from "./taxService.js";
 import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
 
 /**
@@ -200,6 +201,9 @@ export async function listOrders(db, companyId, q = {}) {
     const byOrder = new Map();
     for (const l of lines) { if (!byOrder.has(l.order_id)) byOrder.set(l.order_id, []); byOrder.get(l.order_id).push(l); }
     for (const [orderId, ls] of byOrder) totals.set(orderId, orderTotal(ls, amounts));
+    // Estimated GST on each order (init.sql §37) — three more reads for the whole list.
+    const { orderTax } = await salesOrderTax(db, companyId, rows, lines, amounts);
+    for (const o of rows) totals.set(o.id, { ...(totals.get(o.id) ?? orderTotal([], new Map())), ...orderTax.get(o.id) });
   }
   return rows.map((o) => ({ ...shapeOrder(o), total: totals.get(o.id) ?? orderTotal([], new Map()) }));
 }
@@ -293,6 +297,9 @@ export async function getOrder(db, companyId, id) {
   const stats = await structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id));
   const amounts = await lineAmounts(db, companyId, lines);
   order.total = orderTotal(lines, amounts);
+  // Estimated GST (init.sql §37): per line and on the total, by the ship-to state.
+  const { lineTax, orderTax } = await salesOrderTax(db, companyId, [o], lines, amounts);
+  Object.assign(order.total, orderTax.get(o.id));
   order.lines = lines.map((l) => ({
     id: l.id,
     lineNo: l.line_no,
@@ -311,6 +318,9 @@ export async function getOrder(db, companyId, id) {
     rateBasis: l.rate_basis ?? 'unit',
     currency: l.currency ?? CURRENCY,
     ...amounts.get(l.id),
+    // GST estimate (not a document): taxable, gstRate, cgst, sgst, igst, taxTotal, gross, taxNote — spread, and as `tax`.
+    ...lineTax.get(l.id),
+    tax: lineTax.get(l.id) ?? null,
     item: l.item_id ? { id: l.item_id, code: l.item_code, name: l.item_name, status: l.item_status, kind: l.item_type, uom: l.uom, revision: l.item_revision } : null,
     design: { id: l.design_id, code: l.design_code, name: l.design_name },
     bomRevision: l.bom_revision,
