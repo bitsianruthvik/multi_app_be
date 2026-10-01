@@ -60,6 +60,28 @@ function readRole(value, problems) {
   return s;
 }
 
+/** Two names are the same when only case or spacing differs. */
+const sameName = (a, b) => String(a ?? '').trim().replace(/\s+/g, ' ').toLowerCase() === String(b ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+/** Names the system puts on rows it makes itself (cut pieces) — never touched here. */
+const SYSTEM_ROLES = new Set(['raw plate', 'cut from']);
+const isSystemRole = (r) => SYSTEM_ROLES.has(String(r ?? '').trim().toLowerCase());
+
+/**
+ * A line is named by what it holds. A role ("name in this parent") is only
+ * kept when it says something else — it is stored NULL when it repeats the
+ * child's name — and is required when the SAME child is already in this BOM,
+ * so the two uses can be told apart. This counts the other uses.
+ */
+async function otherUsesOfChild(db, companyId, bomId, childId, exceptLineId = null) {
+  if (!bomId) return 0;
+  const [[r]] = await db.query(
+    `SELECT COUNT(*) AS n FROM cf_bom_lines WHERE company_id = ? AND bom_id = ? AND deleted_at IS NULL
+        AND (child_id = ? OR design_id = ?) AND id <> ?`,
+    [companyId, bomId, childId, childId, exceptLineId ?? 0],
+  );
+  return Number(r.n);
+}
+
 function shapeBom(b) {
   return b ? { id: b.id, bomType: b.bom_type, status: b.status, revision: b.revision, sourceBomId: b.source_bom_id, notes: b.notes, updatedAt: b.updated_at } : null;
 }
@@ -159,10 +181,13 @@ async function ensureBom(db, c, parent, bomType) {
  * Adds a child. input: { childId, quantity, role?, lineNo?, notes?, operationFlowId? }.
  * operationFlowId is how the child is made in THIS parent, when that differs
  * from the child's own default flow.
+ * requireUseName (the Add dialog's route): adding a child that is ALREADY in this
+ * BOM needs a name for this use. Copies, spreadsheet imports and scripts add
+ * repeats freely.
  * On a Custom BOM a template definition becomes a new temporary item here and
  * a selection line starts with its default catalog item, if it has one.
  */
-export async function addLine(db, c, parentId, input = {}) {
+export async function addLine(db, c, parentId, input = {}, { requireUseName = false } = {}) {
   const parent = await requireMaster(db, c.companyId, parentId);
   const bomType = bomTypeOf(parent);
   if (!bomType) throw invalid('NO_BOM', 'A selection definition has no BOM — it chooses a catalog item.');
@@ -171,7 +196,7 @@ export async function addLine(db, c, parentId, input = {}) {
   const problems = [];
   const quantity = readQuantity(input.quantity, problems, true);
   const lineNoIn = readLineNo(input.lineNo, problems);
-  const role = readRole(input.role, problems);
+  let role = readRole(input.role, problems);
   if (blank(input.childId)) problems.push('Choose what to add.');
   assertNoProblems(problems);
 
@@ -192,6 +217,14 @@ export async function addLine(db, c, parentId, input = {}) {
   }
   const operationFlowId = await readLineFlow(db, c.companyId, input.operationFlowId, childKind === 'selection', problems);
   assertNoProblems(problems);
+
+  // The name in this parent: none unless it says something the child's name does not.
+  const existingBom = await bomOfParent(db, c.companyId, parent.id);
+  const repeats = await otherUsesOfChild(db, c.companyId, existingBom?.id, child.id);
+  if (role && !isSystemRole(role) && sameName(role, child.name) && !repeats) role = null;
+  if (requireUseName && repeats && (!role || sameName(role, child.name))) {
+    throw invalid('USE_NAME_REQUIRED', `${child.name} is already in this BOM — give this use a name so the two can be told apart.`);
+  }
 
   if (bomType === 'custom' && childKind === 'template') await checkTemplate(db, c.companyId, child);
 
@@ -269,6 +302,8 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
     const isSelection = !!line.selection_definition_id || childKindOf(line) === 'selection';
     sets.operation_flow_id = await readLineFlow(db, c.companyId, input.operationFlowId, isSelection, problems);
   }
+  if (sets.role && !isSystemRole(sets.role) && sameName(sets.role, line.child_name)
+      && !(await otherUsesOfChild(db, c.companyId, line.bom_id, line.design_id, lineId))) sets.role = null;
   assertNoProblems(problems);
   const out = { parentId: parent.id, values: false };
   if (Object.keys(sets).length) {

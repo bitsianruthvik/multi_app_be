@@ -59,7 +59,7 @@ router.get('/records/:id/bom/tree', guard(PERM.view), handle((req) => {
 }));
 router.get('/records/:id/where-used', guard(PERM.view), handle((req) => whereUsed(pool, ctx(req).companyId, id(req))));
 
-router.post('/records/:id/bom/lines', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => addLine(db, c, id(req), req.body ?? {}))));
+router.post('/records/:id/bom/lines', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => addLine(db, c, id(req), req.body ?? {}, { requireUseName: true }))));
 router.post('/records/:id/bom/status', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => setBomStatus(db, c, id(req), req.body?.status))));
 router.post('/records/:id/bom/revision', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => reviseBom(db, c, id(req), req.body ?? {}))));
 

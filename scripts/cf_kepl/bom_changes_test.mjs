@@ -747,6 +747,28 @@ try {
   eq('null clears the description', [(await lineRow(conn, dLine)).role, dClear.summary.counts.role], [null, 1]);
   const dBoth = await run([{ op: 'role', lineId: dLine, role: 'Mid' }, { op: 'quantity', lineId: dLine, quantity: 2 }]);
   eq('a description and a quantity on one line are both saved', [(await lineRow(conn, dLine)).role, Number((await lineRow(conn, dLine)).quantity)], ['Mid', 2]);
+  // One name per line: a role is kept only when it says something the child's name does not.
+  section('10e. Names: a line is named by what it holds');
+  const roleOfLine = async (id) => (await conn.query('SELECT role FROM cf_bom_lines WHERE id = ?', [id]))[0][0].role;
+  const lastLineOf = async (parentId) => (await conn.query('SELECT l.id FROM cf_bom_lines l JOIN cf_boms b ON b.id = l.bom_id WHERE b.parent_id = ? AND l.deleted_at IS NULL ORDER BY l.id DESC LIMIT 1', [parentId]))[0][0].id;
+  await B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1 });
+  const nLine = await lastLineOf(f.ASSY);
+  eq('a line added without a role stores NULL, not the child name', await roleOfLine(nLine), null);
+  await B.updateLine(conn, c, nLine, { role: '  test BOLT, LONG ' });
+  eq('a role equal to the child name (case and spacing aside) is stored NULL on save', await roleOfLine(nLine), null);
+  await B.updateLine(conn, c, nLine, { role: 'Spare bolt' });
+  eq('a different role is kept', await roleOfLine(nLine), 'Spare bolt');
+  const rep1 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1 }, { requireUseName: true }));
+  eq('the same child again, with no name, is refused (Add dialog)', [rep1?.status, rep1?.code], [422, 'USE_NAME_REQUIRED']);
+  const rep2 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'test bolt, long' }, { requireUseName: true }));
+  eq('and so is a name that is just the item name', rep2?.code, 'USE_NAME_REQUIRED');
+  await B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'Bolt 2' }, { requireUseName: true });
+  eq('the same child again with a name is added and keeps it', await roleOfLine(await lastLineOf(f.ASSY)), 'Bolt 2');
+  const sys = await conn.query("INSERT INTO cf_bom_lines (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, created_by) SELECT company_id, id, 990, ?, ?, 99, 'Raw plate', 1, created_by FROM cf_boms WHERE parent_id = ? LIMIT 1", [f.BOLT, f.BOLT, f.ASSY]);
+  await B.updateLine(conn, c, sys[0].insertId, { quantity: 2 });
+  eq('a system role (Raw plate, Cut from) is left untouched', await roleOfLine(sys[0].insertId), 'Raw plate');
+  await conn.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE bom_id IN (SELECT id FROM cf_boms WHERE parent_id = ?) AND line_no = 990', [f.ASSY]);
+
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, f.lineId]);
   const dLocked = await refusal(() => run([{ op: 'role', lineId: dLine, role: 'After lock' }]));
   eq('after lock a description is frozen like the rest', [dLocked?.status, dLocked?.code], [409, 'LOCKED']);
