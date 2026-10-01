@@ -398,11 +398,11 @@ async function reopenProblems(db, companyId, reopening, { workStepIds = new Set(
  * The machine type's path, root first, read in the same query as the machines:
  * one LEFT JOIN per level above the leaf (the tree is at most LEVELS deep).
  */
-const TYPE_JOINS = Array.from({ length: LEAF_DEPTH }, (_, i) =>
+export const TYPE_JOINS = Array.from({ length: LEAF_DEPTH }, (_, i) =>
   `LEFT JOIN cf_classification_nodes a${i + 1} ON a${i + 1}.id = ${i ? `a${i}` : 'n'}.parent_id`).join(' ');
-const TYPE_COLS = ['n', ...Array.from({ length: LEAF_DEPTH }, (_, i) => `a${i + 1}`)]
+export const TYPE_COLS = ['n', ...Array.from({ length: LEAF_DEPTH }, (_, i) => `a${i + 1}`)]
   .map((t, i) => `${t}.id AS t${i}_id, ${t}.name AS t${i}_name, ${t}.depth AS t${i}_depth`).join(', ');
-function typePathOf(m) {
+export function typePathOf(m) {
   const path = [];
   for (let i = 0; i <= LEAF_DEPTH; i++) {
     if (m[`t${i}_id`] == null) break;

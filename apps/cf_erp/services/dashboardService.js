@@ -26,14 +26,14 @@
  * compared through UNIX_TIMESTAMP with instants worked out from the plant zone.
  *
  * ROUND TRIPS (prod: ~49 ms each). Neither read loops per machine, per order or
- * per step. machines: the plant zone (cached 60 s) then ONE parallel stage of 9
+ * per step. machines: the plant zone (cached 60 s) then ONE parallel stage of 10
  * set-based reads. orders: the zone, one parallel stage of 12 reads, then one
  * stage of 3 (free stock and open purchases of the short items, line measures).
  * `meta.queries` / `meta.stages` report it on every call.
  */
 import { invalid } from '../lib/errors.js';
 import { calendarDays } from './shiftService.js';
-import { plantZone, wallOf, epochOfWall } from './floorService.js';
+import { plantZone, wallOf, epochOfWall, TYPE_JOINS, TYPE_COLS, typePathOf } from './floorService.js';
 import { availability } from './rollOutService.js';
 import { amountOf, kgPerUom } from './priceService.js';
 
@@ -96,6 +96,155 @@ function minus(A, B) {
     if (at < e) out.push([at, e]);
   }
   return out;
+}
+
+/* =====================================================================================
+ * WHERE THE SHIFT TIME WENT — buckets that add up to exactly 100 % of the shift
+ * ================================================================================== */
+
+/**
+ * The stop reasons carry no category in the data (cf_stop_reasons has code, label,
+ * sort order, needs_note — nothing else), so planned vs unplanned is decided here
+ * from the CODE: the seeded SETUP (setup / changeover), CLEANING (cleaning /
+ * maintenance) and BREAK (meal / tea break) are planned, and so is any code a
+ * company adds that names planned work (MAINT, PM, PLANNED, CLEAN, SETUP,
+ * CHANGEOVER, TRIAL). Everything else — No material, crane, previous job,
+ * breakdown, power, no operator, quality, drawing, Other, any new code — is
+ * unplanned: a reason nobody classified is a loss until someone says otherwise.
+ */
+export const PLANNED_REASON_CODES = new Set(['SETUP', 'CLEANING', 'BREAK']);
+const PLANNED_RE = /(^|_)(MAINT\w*|PM|PLANNED|CLEAN\w*|SETUP|CHANGEOVER|TRIAL)($|_)/;
+/** Reasons that ARE the shift's break when somebody logs it (they use up the pattern's break first). */
+export const MEAL_REASON_CODES = new Set(['BREAK']);
+export function reasonKind(code) {
+  const c = String(code ?? '').trim().toUpperCase();
+  return PLANNED_REASON_CODES.has(c) || PLANNED_RE.test(c) ? 'planned' : 'unplanned';
+}
+
+/**
+ * One machine's shift time, cut into what filled it. Pure (the test drives it).
+ *
+ *   windows   [{ s, e, breakMin }]  the shift windows the period's days OWN (wall ms;
+ *             a night shift belongs to the day it starts), breakMin = the pattern's
+ *             break for the whole window (0 for an extra window)
+ *   sessions  [{ s, e }]            work, any step (jobs run together are one span)
+ *   stops     [{ id, s, e, reasonId, meal }]
+ *   nowW      the plant clock now — nothing after it is counted
+ *
+ * Rules, applied to every instant of every window up to now:
+ *   1. WORK beats a stop beats nothing: an instant with a work session is Running,
+ *      whatever else was logged; else the first stop covering it (earliest start,
+ *      then lowest id) takes it — overlapping stops never count twice;
+ *      else it is unrecorded.
+ *   2. The pattern's break has no clock time (break_minutes come off a shift in
+ *      proportion), so it is taken from the window's UNRECORDED time: Break =
+ *      min(break due − meal breaks logged as stops, unrecorded); the rest is
+ *      "Not recorded". Work through the break shows as Running, not as break.
+ *   3. Windows that overlap (should not happen — shiftService forbids it) are
+ *      counted once, the earlier window first.
+ * So run + Σ stops + break + not recorded = shift time, exactly (in ms). Work
+ * outside the windows is overtime and is NOT in the 100 % (see machinesDashboard).
+ */
+export function accountShiftTime({ windows, sessions, stops, nowW }) {
+  const sesU = union(sessions.map((x) => [x.s, Math.min(x.e, nowW)]));
+  const order = [...stops].sort((a, b) => a.s - b.s || a.id - b.id);
+  const acc = { shiftMs: 0, netMs: 0, runMs: 0, breakMs: 0, unrecordedMs: 0, reasonMs: new Map(), reasonStops: new Map() };
+  let claimed = [];
+  for (const w of [...windows].sort((a, b) => a.s - b.s || a.e - b.e)) {
+    const full = w.e - w.s;
+    if (full <= 0) continue;
+    const pieces = minus(intersect([[w.s, w.e]], [[-Infinity, nowW]]), claimed);
+    const len = total(pieces);
+    if (len <= 0) continue;
+    claimed = union([...claimed, ...pieces].map((x) => [...x]));
+    const breakDue = (Number(w.breakMin) || 0) * MIN * (len / full);
+    const runParts = intersect(sesU, pieces);
+    const run = total(runParts);
+    let taken = runParts.map((x) => [...x]);
+    let stopMs = 0;
+    let mealMs = 0;
+    for (const x of order) {
+      if (x.e <= w.s || x.s >= w.e) continue;
+      const part = minus(intersect([[x.s, Math.min(x.e, nowW)]], pieces), taken);
+      const t = total(part);
+      if (t <= 0) continue;
+      taken = union([...taken, ...part].map((p) => [...p]));
+      stopMs += t;
+      if (x.meal) mealMs += t;
+      acc.reasonMs.set(x.reasonId, (acc.reasonMs.get(x.reasonId) ?? 0) + t);
+      if (!acc.reasonStops.has(x.reasonId)) acc.reasonStops.set(x.reasonId, new Set());
+      acc.reasonStops.get(x.reasonId).add(x.id);
+    }
+    const idle = Math.max(0, len - run - stopMs);
+    const brk = Math.min(Math.max(0, breakDue - mealMs), idle);
+    acc.shiftMs += len;
+    acc.netMs += len - breakDue;
+    acc.runMs += run;
+    acc.breakMs += brk;
+    acc.unrecordedMs += idle - brk;
+  }
+  acc.windowsU = claimed;
+  return acc;
+}
+
+/**
+ * Whole minutes that add up to `totalMin` exactly: floor every part, then hand the
+ * minutes left to the largest remainders (ties: the earlier part). Parts are
+ * [{ ...anything, ms }]; each comes back with `minutes`.
+ */
+export function roundToTotal(parts, totalMin) {
+  const out = parts.map((p, i) => { const exact = p.ms / MIN; return { ...p, minutes: Math.floor(exact + EPS), frac: exact - Math.floor(exact + EPS), i }; });
+  let left = totalMin - out.reduce((t, p) => t + p.minutes, 0);
+  const byFrac = [...out].sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let k = 0; left > 0 && byFrac.length; k = (k + 1) % byFrac.length, left--) byFrac[k].minutes += 1;
+  for (let k = byFrac.length - 1; left < 0 && k >= 0; k--) { if (byFrac[k].minutes > 0) { byFrac[k].minutes -= 1; left++; } }
+  return out.map(({ frac, i, ...p }) => p);
+}
+
+/** The bucket order on every bar: run, planned stops, break, unplanned stops, not recorded. */
+const KIND_RANK = { run: 0, planned: 1, break: 2, unplanned: 3, unrecorded: 4 };
+const byBucketOrder = (a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind] || (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || String(a.label).localeCompare(String(b.label));
+
+/** A machine's account as buckets of whole minutes adding up to its shift minutes. */
+function bucketsOf(acc, reasonInfo) {
+  const parts = [{ key: 'run', label: 'Running', kind: 'run', ms: acc.runMs }];
+  for (const [id, ms] of acc.reasonMs) {
+    const r = reasonInfo.get(id) ?? { code: null, label: `Reason ${id}`, kind: 'unplanned', sortOrder: 9999 };
+    parts.push({ key: `reason:${id}`, reasonId: id, code: r.code, label: r.label, kind: r.kind, ms, stops: acc.reasonStops.get(id)?.size ?? 0, sortOrder: r.sortOrder });
+  }
+  parts.push({ key: 'break', label: 'Break (shift pattern)', kind: 'break', ms: acc.breakMs });
+  parts.push({ key: 'unrecorded', label: 'Not recorded', kind: 'unrecorded', ms: acc.unrecordedMs });
+  parts.sort(byBucketOrder);
+  const shiftMinutes = Math.round(acc.shiftMs / MIN);
+  const rounded = roundToTotal(parts, shiftMinutes).map(({ ms, ...p }) => p);
+  return { shiftMinutes, buckets: rounded.filter((b) => b.minutes > 0 || b.key === 'run') };
+}
+
+/**
+ * Σ of machine accounts (→ type → plant): whole minutes added, so they still add
+ * up. A machine with no shift time in the period is counted (noShiftMachines,
+ * noShiftRunMinutes) but kept out of the bar and the overtime.
+ */
+function rollUp(items) {
+  const byKey = new Map();
+  let shiftMinutes = 0, netMin = 0, overtime = 0, stopOutside = 0, runNoShift = 0, noShift = 0;
+  for (const t of items) {
+    if (t.noShift) { noShift += 1; runNoShift += t.overtimeMinutes; continue; }
+    shiftMinutes += t.shiftMinutes; netMin += t._netMin; overtime += t.overtimeMinutes; stopOutside += t.stopOutsideShiftMinutes;
+    for (const b of t.buckets) {
+      const cur = byKey.get(b.key) ?? { ...b, minutes: 0, stops: b.stops == null ? undefined : 0 };
+      cur.minutes += b.minutes;
+      if (b.stops != null) cur.stops += b.stops;
+      byKey.set(b.key, cur);
+    }
+  }
+  const buckets = [...byKey.values()].sort(byBucketOrder);
+  const run = byKey.get('run')?.minutes ?? 0;
+  return {
+    machines: items.length, noShiftMachines: noShift,
+    shiftMinutes, netShiftMinutes: Math.round(netMin), buckets, overtimeMinutes: overtime, stopOutsideShiftMinutes: stopOutside, noShiftRunMinutes: runNoShift,
+    utilisationPct: netMin > 0 ? r1((run / netMin) * 100) : null,
+  };
 }
 
 /** from / to as plant dates; default this week (Monday → today). */
@@ -211,10 +360,12 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
   const exB = [addDays(todayS, -2), todayS];
 
   stage();
-  const [[machines], [shiftRows], [exRows], [sessions], [stops], [activity], [openSessions], [openStops], [output]] = await Promise.all([
+  const [[machines], [shiftRows], [exRows], [sessions], [stops], [activity], [openSessions], [openStops], [output], [reasonRows]] = await Promise.all([
     db.query(
-      `SELECT m.id, m.code, m.name, m.classification_id AS type_id, n.name AS type_name
+      // The machine type's path (Family › Subfamily › Variant) comes in the same read.
+      `SELECT m.id, m.code, m.name, m.classification_id AS type_id, n.name AS type_name, ${TYPE_COLS}
          FROM cf_machines m LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
+         ${TYPE_JOINS}
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' ORDER BY m.code`,
       [companyId],
     ),
@@ -236,7 +387,7 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       [companyId, companyId, companyId, hi, lo],
     ),
     db.query(
-      `SELECT st.id, st.machine_id, st.started_at, st.ended_at, st.reason_id, r.code AS reason_code, r.label AS reason_label
+      `SELECT st.id, st.machine_id, st.started_at, st.ended_at, st.reason_id, r.code AS reason_code, r.label AS reason_label, r.sort_order AS reason_sort
          FROM cf_machine_stops st JOIN cf_stop_reasons r ON r.id = st.reason_id
         WHERE st.company_id = ? AND st.deleted_at IS NULL AND st.started_at < ? AND (st.ended_at IS NULL OR st.ended_at > ?)`,
       [companyId, hi, lo],
@@ -266,7 +417,15 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       [companyId],
     ),
     db.query(...periodOutputSql(companyId, from, to)),
+    // Every active reason, so the legend can say "none" for a reason that never happened.
+    db.query("SELECT id, code, label, sort_order FROM cf_stop_reasons WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", [companyId]),
   ]);
+
+  // What each stop reason is: planned / unplanned (from its code), its label and order.
+  const reasonInfo = new Map();
+  for (const r of [...reasonRows, ...stops.map((x) => ({ id: x.reason_id, code: x.reason_code, label: x.reason_label, sort_order: x.reason_sort }))]) {
+    if (!reasonInfo.has(r.id)) reasonInfo.set(r.id, { id: r.id, code: r.code, label: r.label, kind: reasonKind(r.code), sortOrder: Number(r.sort_order ?? 0), meal: MEAL_REASON_CODES.has(String(r.code ?? '').toUpperCase()) });
+  }
 
   const group = (rows, key = 'machine_id') => {
     const m = new Map();
@@ -316,11 +475,13 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
     const operators = new Map();
     const steps = new Set();
     const series = [];
+    const ownedPast = [];
     for (const d of periodDays) {
       const own = union((winByDay.get(d) ?? []).map((w) => [...w.span]));
       const others = union([...(winByDay.get(addDays(d, -1)) ?? []), ...(winByDay.get(addDays(d, 1)) ?? [])].map((w) => [...w.span]));
       const owned = union([...own, ...minus([[wms(`${d} 00:00:00`), wms(`${addDays(d, 1)} 00:00:00`)]], others)].map((x) => [...x]));
       const past = intersect(owned, [[-Infinity, nowW]]);
+      ownedPast.push(...past.map((x) => [...x]));
       // Shift time so far, net of the pattern's break (in proportion, as the calendar does).
       let shift = 0;
       for (const w of winByDay.get(d) ?? []) {
@@ -383,6 +544,29 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       const pd = plantDays.get(d);
       pd.shift += shift; pd.run += run / MIN; pd.runIn += runIn / MIN; pd.stop += stop / MIN; pd.overtime += overtime / MIN; pd.tonnes += dayTonnes;
     }
+    // Where the shift time went (see accountShiftTime): the period's own windows only.
+    const windows = periodDays.flatMap((d) => (winByDay.get(d) ?? []).map((w) => {
+      const [s, e] = w.span;
+      return { s, e, breakMin: Math.max(0, (e - s) / MIN - w.minutes) };
+    }));
+    const tAcc = accountShiftTime({
+      windows, nowW,
+      sessions: ses.map((x) => ({ s: x.s, e: x.e })),
+      stops: sts.map((x) => ({ id: x.id, s: x.s, e: x.e, reasonId: x.reason_id, meal: !!reasonInfo.get(x.reason_id)?.meal })),
+    });
+    const ownedU = union(ownedPast);
+    const { shiftMinutes, buckets } = bucketsOf(tAcc, reasonInfo);
+    const outsideRunMs = Math.max(0, total(intersect(sesU, ownedU)) - tAcc.runMs);
+    const time = {
+      noShift: shiftMinutes === 0,
+      shiftMinutes,
+      netShiftMinutes: Math.round(tAcc.netMs / MIN),
+      buckets,
+      overtimeMinutes: mins(outsideRunMs),
+      stopOutsideShiftMinutes: mins(total(minus(minus(intersect(stopU, ownedU), tAcc.windowsU), sesU))),
+      utilisationPct: tAcc.netMs > 0 ? r1(((buckets.find((b) => b.key === 'run')?.minutes ?? 0) / (tAcc.netMs / MIN)) * 100) : null,
+      _netMin: tAcc.netMs / MIN,
+    };
     const reasonList = [...reasons.values()].map((r) => ({ ...r, minutes: mins(r.minutes) })).sort((a, b) => b.minutes - a.minutes);
     for (const r of reasonList) {
       const p = plantReasons.get(r.id) ?? { id: r.id, code: r.code, label: r.label, minutes: 0, count: 0, machines: 0 };
@@ -396,7 +580,8 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
     const runInMin = mins(acc.runIn);
     return {
       id: m.id, code: m.code, name: m.name,
-      type: m.type_id ? { id: m.type_id, name: m.type_name } : null,
+      type: m.type_id ? { id: m.type_id, name: m.type_name, path: typePathOf(m) } : null,
+      time,
       hasShifts,
       now: {
         state, inShift: inShiftNow,
@@ -431,6 +616,33 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       days: series,
     };
   });
+
+  // Roll the time accounts up: per machine type, and the plant.
+  const typeGroups = new Map();
+  for (const m of out) {
+    const k = m.type ? m.type.id : 0;
+    if (!typeGroups.has(k)) typeGroups.set(k, { type: m.type, ms: [] });
+    typeGroups.get(k).ms.push(m);
+  }
+  const timeTypes = [...typeGroups.values()].map(({ type, ms }) => ({
+    id: type ? type.id : null, name: type ? type.name : 'No machine type', path: type ? type.path : [],
+    machineIds: ms.map((m) => m.id),
+    ...rollUp(ms.map((m) => m.time)),
+  })).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const timePlant = rollUp(out.map((m) => m.time));
+  const reasonMachines = new Map();
+  for (const m of out) if (!m.time.noShift) for (const b of m.time.buckets) if (b.reasonId != null && b.minutes > 0) reasonMachines.set(b.reasonId, (reasonMachines.get(b.reasonId) ?? 0) + 1);
+  const legend = [...reasonInfo.values()].map((r) => {
+    const b = timePlant.buckets.find((x) => x.reasonId === r.id);
+    return { key: `reason:${r.id}`, reasonId: r.id, code: r.code, label: r.label, kind: r.kind, sortOrder: r.sortOrder, minutes: b?.minutes ?? 0, stops: b?.stops ?? 0, machines: reasonMachines.get(r.id) ?? 0 };
+  }).sort(byBucketOrder);
+  for (const m of out) delete m.time._netMin;
+  const timeBlock = {
+    plant: timePlant,
+    types: timeTypes,
+    reasons: legend,
+    noShift: out.filter((m) => m.time.noShift).map((m) => ({ id: m.id, code: m.code, name: m.name, typeId: m.type?.id ?? null, runMinutes: m.time.overtimeMinutes, stopMinutes: m.time.stopOutsideShiftMinutes })),
+  };
 
   const sum = (f) => out.reduce((t, m) => t + (f(m) ?? 0), 0);
   const shiftMin = sum((m) => m.shiftMin);
@@ -478,6 +690,7 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
     },
     types: [...typeMap].map(([id, name]) => ({ id, name })).sort((a, b) => String(a.name).localeCompare(String(b.name))),
     machines: out,
+    time: timeBlock,
     meta: { ...meta, ms: Date.now() - t0 },
   };
 }

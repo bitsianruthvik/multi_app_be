@@ -13,6 +13,11 @@
  *   1. by machine: a day shift with overlapping jobs, stops with reasons,
  *      overtime and a gap nobody recorded → shift / run / overtime / stop /
  *      not recorded / utilisation / reasons, to the minute
+ *   1b. where the shift time went: buckets (run, each stop reason, break,
+ *      not recorded) add up to the shift minutes EXACTLY per machine, type and
+ *      plant; work beats stop, overlapping stops count once, meal breaks,
+ *      worked-through break, overtime and stops outside the shift apart, a
+ *      machine with no shift listed apart; the rules pure
  *   2. a night shift crossing midnight belongs to the day it starts; the
  *      previous night's tail is not in the period
  *   3. output: operations done, pieces, tonnes (piece WEIGHT × good), standard minutes
@@ -143,6 +148,38 @@ try {
     stop(M.id, 'BREAKDOWN', `${D1} 12:00:00`, `${D1} 12:30:00`),
     stop(M.id, 'POWER', `${D1} 13:00:00`, `${D1} 13:30:00`),
   ]) await conn.query('INSERT INTO cf_machine_stops SET ?', r);
+  // Where the shift time went: two machines of ONE type (M3 logged in detail, M5 not at all)
+  // and a machine with no shift (M4).
+  const [pair] = await qa(
+    `SELECT classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?)
+      GROUP BY classification_id HAVING COUNT(*) >= 2 ORDER BY classification_id LIMIT 1`, [COMPANY, M.id, M2.id]);
+  if (!pair) throw new Error('Need a machine type with two active machines.');
+  const [M3, M5] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code LIMIT 2", [COMPANY, pair.classification_id]);
+  const [M4] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?, ?, ?) ORDER BY code LIMIT 1", [COMPANY, M.id, M2.id, M3.id, M5.id]);
+  for (const m of [M3, M4, M5]) {
+    await conn.query('UPDATE cf_machine_shifts SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
+    await conn.query('UPDATE cf_machine_calendar_exceptions SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
+    await conn.query('UPDATE cf_work_sessions SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
+    await conn.query('UPDATE cf_machine_stops SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
+  }
+  await createShift(conn, c, M3.id, { name: 'Long day', weekdays: ALL, startTime: '08:00', endTime: '20:00', breakMinutes: 60 });
+  await createShift(conn, c, M5.id, { name: 'Day', weekdays: ALL, startTime: '08:00', endTime: '16:00', breakMinutes: 30 });
+  for (const r of [
+    sess(M3.id, s1, `${D1} 08:00:00`, `${D1} 10:00:00`, { end_kind: 'pause' }),
+    sess(M3.id, s2, `${D1} 09:30:00`, `${D1} 10:30:00`, { end_kind: 'pause' }),   // jobs together: one span 08:00–10:30
+    sess(M3.id, s3, `${D1} 21:00:00`, `${D1} 22:00:00`, { end_kind: 'pause' }),   // after the shift: overtime 60
+    sess(M3.id, s4, `${D2} 08:00:00`, `${D2} 19:45:00`, { end_kind: 'pause' }),   // worked through the break
+    sess(M4.id, s5, `${D1} 10:00:00`, `${D1} 11:00:00`, { end_kind: 'pause' }),   // a machine with no shift
+  ]) await conn.query('INSERT INTO cf_work_sessions SET ?', r);
+  // Raw rows on purpose: the floor screens refuse overlaps, the dashboard must still count each minute once.
+  for (const r of [
+    stop(M3.id, 'SETUP', `${D1} 10:00:00`, `${D1} 11:00:00`),        // 10:00–10:30 under work → 30
+    stop(M3.id, 'NO_MATERIAL', `${D1} 10:45:00`, `${D1} 12:00:00`),  // 10:45–11:00 under SETUP (started first) → 60
+    stop(M3.id, 'BREAK', `${D1} 13:00:00`, `${D1} 13:30:00`),        // a logged meal break → 30, uses up half the pattern's break
+    stop(M3.id, 'CRANE', `${D1} 14:00:00`, `${D1} 15:00:00`),        // 60
+    stop(M3.id, 'BREAKDOWN', `${D1} 19:30:00`, `${D1} 21:00:00`),    // 30 in shift; 20:00–21:00 is outside it
+  ]) await conn.query('INSERT INTO cf_machine_stops SET ?', r);
+
   // Now: M runs a job, M2 is stopped.
   const nowWall = wallOf(Date.now(), TZ);
   const minusMin = (n) => wallOf(Date.now() - n * 60000, TZ);
@@ -192,12 +229,78 @@ try {
     JSON.stringify([m1.now, m2.now]));
   ok('the plant strip adds the machines up', md.plant.shiftMin === md.machines.reduce((t, m) => t + m.shiftMin, 0) && md.plant.runningNow >= 1 && md.plant.stoppedNow >= 1);
   ok('plant top reasons put Breakdown first', md.plant.topReasons[0]?.code === 'BREAKDOWN', JSON.stringify(md.plant.topReasons.slice(0, 2)));
-  const other = md.machines.find((m) => m.id !== M.id && m.id !== M2.id && m.hasShifts);
+  const other = md.machines.find((m) => ![M.id, M2.id, M3.id, M4.id, M5.id].includes(m.id) && m.hasShifts);
   ok('a machine with shifts and no log reads 0 % run and its whole shift not recorded', !other || (other.runMin === 0 && other.notRecordedMin === other.shiftMin));
   const bad = await (async () => { try { await D.machinesDashboard(conn, COMPANY, { from: D2, to: D1 }); return null; } catch (e) { return e; } })();
   ok('to before from is refused', !!bad && /before/.test(bad.message));
   const long = await (async () => { try { await D.machinesDashboard(conn, COMPANY, { from: '2026-01-01', to: '2026-09-01' }); return null; } catch (e) { return e; } })();
   ok('more than 92 days is refused', !!long && /92/.test(long.message));
+
+  /* ------------------------------------------------------------------------ */
+  section('1b. Where the shift time went — buckets that make up exactly 100 % of the shift');
+  const TT = md.time;
+  const bmin = (t, key) => t.buckets.find((b) => b.key === key)?.minutes ?? 0;
+  const rmin = (t, code) => t.buckets.find((b) => b.code === code)?.minutes ?? 0;
+  const sumB = (t) => t.buckets.reduce((s, b) => s + b.minutes, 0);
+  const t1 = m1.time;
+  ok('day shift M: 960 min of shift WINDOW (the break is a bucket, not taken off)', t1.shiftMinutes === 960 && t1.netShiftMinutes === 840, `${t1.shiftMinutes} / ${t1.netShiftMinutes}`);
+  ok('M: Running 180, Breakdown 90, Power cut 30, Break 120, Not recorded 540', bmin(t1, 'run') === 180 && rmin(t1, 'BREAKDOWN') === 90 && rmin(t1, 'POWER') === 30
+    && bmin(t1, 'break') === 120 && bmin(t1, 'unrecorded') === 540, JSON.stringify(t1.buckets));
+  ok('M: overtime 120 outside the 100 %; utilisation = 180 / 840 net, same as the card', t1.overtimeMinutes === 120 && t1.utilisationPct === m1.utilisationPct, `${t1.overtimeMinutes} / ${t1.utilisationPct}`);
+  ok('M: the Breakdown bucket knows its 2 stops; kinds are unplanned', t1.buckets.find((b) => b.code === 'BREAKDOWN')?.stops === 2 && t1.buckets.filter((b) => b.reasonId).every((b) => b.kind === 'unplanned'));
+  const t2 = m2.time;
+  ok('night shift M2: 960 = Running 240 + Not recorded 720; overtime 60 (07–08); the D0 tail is not in it', t2.shiftMinutes === 960 && bmin(t2, 'run') === 240 && bmin(t2, 'unrecorded') === 720 && t2.overtimeMinutes === 60,
+    JSON.stringify(t2));
+  const m3 = md.machines.find((m) => m.id === M3.id);
+  const t3 = m3.time;
+  ok('M3: 2 × 12 h windows = 1440 min', t3.shiftMinutes === 1440, String(t3.shiftMinutes));
+  ok('M3: overlapping jobs are one span, plus the day worked through: Running 150 + 705 = 855', bmin(t3, 'run') === 855, String(bmin(t3, 'run')));
+  ok('M3: work beats a stop — Setup gets only 10:30–11:00 (30)', rmin(t3, 'SETUP') === 30, String(rmin(t3, 'SETUP')));
+  ok('M3: overlapping stops count once, the earlier stop first — No material 60', rmin(t3, 'NO_MATERIAL') === 60, String(rmin(t3, 'NO_MATERIAL')));
+  ok('M3: Crane 60; Breakdown 30 (clipped to the shift)', rmin(t3, 'CRANE') === 60 && rmin(t3, 'BREAKDOWN') === 30);
+  ok('M3: the logged meal break (30) uses up half the pattern break; worked through it on D2 leaves 15 → Break 30 + 15 = 45', rmin(t3, 'BREAK') === 30 && bmin(t3, 'break') === 45, `${rmin(t3, 'BREAK')} / ${bmin(t3, 'break')}`);
+  ok('M3: Not recorded = 720 − 150 − 210 − 30 = 330 (D2 has none)', bmin(t3, 'unrecorded') === 330, String(bmin(t3, 'unrecorded')));
+  ok('M3: Setup / changeover and Meal break are PLANNED, No material / Crane / Breakdown UNPLANNED',
+    ['SETUP', 'BREAK'].every((c) => t3.buckets.find((b) => b.code === c)?.kind === 'planned') && ['NO_MATERIAL', 'CRANE', 'BREAKDOWN'].every((c) => t3.buckets.find((b) => b.code === c)?.kind === 'unplanned'));
+  ok('M3: buckets ordered run → planned → break → unplanned → not recorded', (() => {
+    const rank = { run: 0, planned: 1, break: 2, unplanned: 3, unrecorded: 4 };
+    return t3.buckets.every((b, i) => i === 0 || rank[t3.buckets[i - 1].kind] <= rank[b.kind]);
+  })(), t3.buckets.map((b) => b.kind).join(','));
+  ok('M3: overtime 60 (21–22); stop time outside the shift 60 (20–21), neither in the 100 %', t3.overtimeMinutes === 60 && t3.stopOutsideShiftMinutes === 60, `${t3.overtimeMinutes} / ${t3.stopOutsideShiftMinutes}`);
+  ok('M3: utilisation = 855 / (1440 − 120) = 64.8 %', t3.utilisationPct === 64.8, String(t3.utilisationPct));
+  const m5 = md.machines.find((m) => m.id === M5.id);
+  ok('M5 (nothing logged): 960 = Break 60 + Not recorded 900', m5.time.shiftMinutes === 960 && bmin(m5.time, 'break') === 60 && bmin(m5.time, 'unrecorded') === 900, JSON.stringify(m5.time.buckets));
+  const m4 = md.machines.find((m) => m.id === M4.id);
+  ok('M4 has no shift: listed apart with its 60 min of work, not in any bar', m4.time.noShift && m4.time.shiftMinutes === 0 && TT.noShift.some((x) => x.id === M4.id && x.runMinutes === 60), JSON.stringify(m4.time));
+  const badMachines = md.machines.filter((m) => sumB(m.time) !== m.time.shiftMinutes);
+  ok(`EVERY machine (${md.machines.length}): its buckets add up to its shift minutes exactly`, badMachines.length === 0, badMachines.map((m) => `${m.code} ${sumB(m.time)}≠${m.time.shiftMinutes}`).join(', '));
+  const badTypes = TT.types.filter((t) => sumB(t) !== t.shiftMinutes
+    || t.shiftMinutes !== md.machines.filter((m) => t.machineIds.includes(m.id) && !m.time.noShift).reduce((s, m) => s + m.time.shiftMinutes, 0));
+  ok(`EVERY type (${TT.types.length}): buckets add up to its shift minutes = Σ of its machines`, badTypes.length === 0, badTypes.map((t) => t.name).join(', '));
+  ok('the plant: buckets add up to its shift minutes = Σ of the types', sumB(TT.plant) === TT.plant.shiftMinutes && TT.plant.shiftMinutes === TT.types.reduce((s, t) => s + t.shiftMinutes, 0));
+  const ty = TT.types.find((t) => t.id === pair.classification_id);
+  ok('the M3 + M5 type: 2 machines, 2400 min, Running 855, Break 105, Not recorded 1230', ty.machines === 2 && ty.shiftMinutes === 2400 && bmin(ty, 'run') === 855 && bmin(ty, 'break') === 105 && bmin(ty, 'unrecorded') === 1230,
+    JSON.stringify({ ...ty, buckets: ty.buckets.map((b) => `${b.key}:${b.minutes}`) }));
+  ok('the type carries its path in the type tree (for the areas)', Array.isArray(ty.path) && ty.path.length >= 1 && ty.path.at(-1).id === pair.classification_id, JSON.stringify(ty.path));
+  ok('the legend lists every active reason, with time and stops, planned first', TT.reasons.length >= 12 && TT.reasons.find((r) => r.code === 'BREAKDOWN').minutes === 120
+    && TT.reasons.find((r) => r.code === 'BREAKDOWN').stops === 3 && TT.reasons.find((r) => r.code === 'DRAWING').minutes === 0 && TT.reasons[0].kind === 'planned', JSON.stringify(TT.reasons.slice(0, 4)));
+
+  // Pure: the rules on their own, with the clock in the middle of a minute.
+  const W = (h, m = 0) => Date.UTC(2026, 0, 5, h, m);
+  const pure = D.accountShiftTime({
+    windows: [{ s: W(8), e: W(16), breakMin: 60 }, { s: W(15), e: W(17), breakMin: 0 }],  // the second overlaps: counted once
+    sessions: [{ s: W(8), e: W(9) }, { s: W(8, 30), e: W(9, 30) }],
+    stops: [{ id: 2, s: W(9), e: W(10), reasonId: 7 }, { id: 1, s: W(9, 15), e: W(10, 30), reasonId: 8 }],
+    nowW: W(12) + 30500,
+  });
+  const ms2m = (x) => x / 60000;
+  ok('pure: shift counted to the clock (4 h 0.5 min)', near(ms2m(pure.shiftMs), 240 + 30.5 / 60, 1e-9), String(ms2m(pure.shiftMs)));
+  ok('pure: run 90, reason 7 gets 9:30–10:00, reason 8 10:00–10:30', near(ms2m(pure.runMs), 90) && near(ms2m(pure.reasonMs.get(7)), 30) && near(ms2m(pure.reasonMs.get(8)), 30));
+  ok('pure: run + stops + break + not recorded = shift, to the ms', Math.abs(pure.runMs + [...pure.reasonMs.values()].reduce((a, b) => a + b, 0) + pure.breakMs + pure.unrecordedMs - pure.shiftMs) < 1e-6);
+  const rounded = D.roundToTotal([{ ms: 100.4 * 60000 }, { ms: 50.4 * 60000 }, { ms: 49.2 * 60000 }], 200);
+  ok('rounding hands the spare minutes to the largest remainders and hits the total', rounded.map((r) => r.minutes).join() === '101,50,49', rounded.map((r) => r.minutes).join());
+  ok('reason kinds: SETUP / CLEANING / BREAK / PM_PRESS planned; BREAKDOWN / OTHER / anything new unplanned',
+    ['SETUP', 'CLEANING', 'BREAK', 'PM_PRESS', 'MAINTENANCE'].every((c) => D.reasonKind(c) === 'planned') && ['BREAKDOWN', 'OTHER', 'NO_MATERIAL', 'XYZ'].every((c) => D.reasonKind(c) === 'unplanned'));
 
   /* ------------------------------------------------------------------------ */
   section('5. By order');
@@ -283,7 +386,7 @@ try {
   section('7. Round trips (whatever the number of machines, orders or steps)');
   const w1 = await D.machinesDashboard(conn, COMPANY, { from: addDays(today, -29), to: today });
   const w2 = await D.ordersDashboard(conn, COMPANY, { from: addDays(today, -29), to: today });
-  ok(`GET machines: ≤ 10 reads in ≤ 2 stages (took ${w1.meta.queries} in ${w1.meta.stages})`, w1.meta.queries <= 10 && w1.meta.stages <= 2);
+  ok(`GET machines: ≤ 11 reads in ≤ 2 stages (took ${w1.meta.queries} in ${w1.meta.stages})`, w1.meta.queries <= 11 && w1.meta.stages <= 2);
   ok(`GET orders: ≤ 15 reads in ≤ 3 stages (took ${w2.meta.queries} in ${w2.meta.stages})`, w2.meta.queries <= 15 && w2.meta.stages <= 3);
   console.log(`  machines (30 days, ${w1.machines.length} machines): ${w1.meta.queries} reads, ${w1.meta.stages} stages, ${w1.meta.ms} ms`);
   console.log(`  orders (${steps.length} steps on the line): ${w2.meta.queries} reads, ${w2.meta.stages} stages, ${w2.meta.ms} ms`);
