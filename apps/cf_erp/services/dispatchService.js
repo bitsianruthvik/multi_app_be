@@ -17,7 +17,7 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { postMovement } from './stockService.js';
-import { getRelease, liveReleaseOfLine } from './releaseService.js';
+import { releaseAfterWrite, liveReleaseOfLine } from './releaseService.js';
 import { invoiceShipments } from './invoiceService.js';
 
 const EPS = 1e-6;
@@ -160,6 +160,7 @@ export async function shipLine(db, c, lineId, input = {}) {
     shipped,
     invoice,
     line: await shipmentView(db, c.companyId, l.id),
-    release: release ? await getRelease(db, c.companyId, release.id) : null,
+    // The whole release by default; input.view = 'summary' for its figures only (releaseAfterWrite).
+    release: release ? await releaseAfterWrite(db, c.companyId, release.id, input.view) : null,
   };
 }

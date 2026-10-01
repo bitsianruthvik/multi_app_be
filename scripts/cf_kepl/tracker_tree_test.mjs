@@ -239,7 +239,113 @@ try {
   const other = await TREE.trackerTree(conn, COMPANY, { orderId: 999999999 });
   ok('an order with nothing released reads empty', other.nodes.length === 0 && other.summary.pieces === 0);
 
+  // --- 6. the order line's grid (Production › Tracker on the order) -------------------------
+  console.log('\n6. The order line\'s grid');
+  const grid = await timed('grid (line, default depth)', conn, (db) => TREE.lineGrid(db, COMPANY, { lineId: LINE }));
+  const G = grid.out;
+  ok(`a grid read takes at most ${MAX_TRIPS} round trips (took ${grid.trips})`, grid.trips <= MAX_TRIPS);
+  ok('the default grid is small (under 300 KB)', bytes(G) < 300 * 1024, kb(G));
+  ok('the grid says the line is released, and which release', G.released === true && G.releaseId === rel.id);
+  ok('the first row is the line, level 0, no parent', G.nodes[0].id === `l${LINE}` && G.nodes[0].level === 0 && G.nodes[0].parentId === null);
+  ok('the default read stops GRID_DEFAULT_DEPTH levels under the line', G.nodes.every((n) => n.level <= TREE.GRID_DEFAULT_DEPTH) && G.nodes.some((n) => n.level === TREE.GRID_DEFAULT_DEPTH && n.childCount > 0 && !n.childrenIncluded));
+  const allOpIds = new Set(after.out.nodes.flatMap((n) => n.ops.map((o) => o.operationId)));
+  ok('the columns are every operation of the line, once each', G.operations.length === allOpIds.size && G.operations.every((o) => allOpIds.has(o.id)) && new Set(G.operations.map((o) => o.id)).size === G.operations.length);
+  ok('every column is named', G.operations.every((o) => o.name && o.name === after.out.operations[o.id].name));
+  const colAt = new Map(G.operations.map((o, i) => [o.id, i]));
+  const inOrder = pieces.filter((n) => {
+    const firsts = [...new Set(n.ops.map((o) => o.operationId))].map((id) => colAt.get(id));
+    return firsts.every((x, i) => i === 0 || x > firsts[i - 1]);
+  });
+  ok('columns follow flow order: each piece\'s own operations run left to right', inOrder.length >= pieces.length * 0.99, `${inOrder.length} of ${pieces.length}`);
+  const gridFull = await TREE.lineGrid(conn, COMPANY, { lineId: LINE, depth: 50 });
+  const GF = new Map(gridFull.nodes.map((n) => [n.id, n]));
+  ok('every piece is a row of the full grid (the line\'s pieces, no order row)', gridFull.nodes.length === pieces.length + 1 && gridFull.total === gridFull.nodes.length && G.total === gridFull.total);
+  // States, from the work recorded in section 4.
+  const opOf = (n, i = 0) => String(n.ops[i].operationId);
+  const c1 = GF.get(leaf.id).cells[opOf(leaf)];
+  ok('done: the finished step\'s cell is done, all of it', c1.state === 'done' && c1.done === c1.total && c1.stepIds.includes(leafSteps[0]), JSON.stringify(c1));
+  ok('running: a started step\'s cell is running', GF.get(leaf2.id).cells[opOf(leaf2)].state === 'running');
+  const c3 = GF.get(leaf3.id).cells[opOf(leaf3)];
+  ok('blocked: a held step\'s cell is blocked with its reason', c3.state === 'blocked' && c3.reason === 'On hold: Crane under repair', JSON.stringify(c3));
+  const cg = GF.get(grp.id).cells[opOf(grp)];
+  ok('partial: the grouped row\'s cell says 2 of 6', cg.state === 'partial' && cg.done === 2 && cg.total === 6, JSON.stringify(cg));
+  const naLeaf = pieces.find((n) => n.childCount === 0 && new Set(n.ops.map((o) => o.operationId)).size < allOpIds.size);
+  const naOp = G.operations.find((o) => !naLeaf.ops.some((x) => x.operationId === o.id));
+  ok('n/a: an operation not in a leaf\'s flow has no cell', !(String(naOp.id) in GF.get(naLeaf.id).cells));
+  ok('a leaf has a cell for each of its own operations and nothing else', pieces.filter((n) => n.childCount === 0).slice(0, 500).every((n) => Object.keys(GF.get(n.id).cells).length === new Set(n.ops.map((o) => o.operationId)).size));
+  ok('passes of one operation fold into one cell (the cell names each step)', pieces.every((n) => n.ops.every((o) => GF.get(n.id).cells[String(o.operationId)].stepIds.includes(o.stepId))));
+  // Parent % per operation = what is under it.
+  const subOf = (id) => { const out = []; const walk = (x) => { for (const k of after.out.nodes.filter((y) => y.parentId === x)) { out.push(k); walk(k.id); } }; walk(id); return out; };
+  const par = GF.get(l1.parentId);
+  const under = subOf(par.id);
+  const sums = new Map();
+  for (const n of under) for (const o of n.ops) { const e = sums.get(o.operationId) ?? { done: 0, total: 0 }; e.done += o.done; e.total += o.total; sums.set(o.operationId, e); }
+  const ownOps = new Set(A.get(par.id).ops.map((o) => o.operationId));
+  const rollups = [...sums].filter(([id]) => !ownOps.has(id));
+  ok('a parent shows a rolled-up cell for each operation only below it', rollups.length > 0 && rollups.every(([id, e]) => { const c = par.cells[String(id)]; return c?.rollup === true && near(c.done, e.done) && near(c.total, e.total); }),
+    JSON.stringify(rollups.slice(0, 3).map(([id, e]) => [id, e, par.cells[String(id)]])));
+  ok('the rolled-up cell for the finished step counts it', near(par.cells[opOf(leaf)].done ?? par.cells[opOf(leaf)].below?.done ?? 0, sums.get(leaf.ops[0].operationId).done));
+  const ownBelow = [...ownOps].filter((id) => sums.has(id));
+  ok('a parent\'s own operation that also runs below says how much below is done', ownBelow.every((id) => { const c = par.cells[String(id)]; return !c.rollup && near(c.below.done, sums.get(id).done) && near(c.below.total, sums.get(id).total); }));
+  ok('a parent row carries its completion (the % column) — the tree\'s', near(par.completion, A.get(par.id).completion) && near(GF.get(`l${LINE}`).completion, lineAfter.completion));
+  ok('the column header carries the line\'s count for the operation', G.operations.every((o) => near(o.total, sums.size ? (lineAfter.byOperation.find((b) => b.operationId === o.id)?.total ?? 0) : 0)));
+  ok('the summary counts ready steps and the work done', G.summary.stepsDone === after.out.summary.stepsDone && G.summary.steps === after.out.summary.steps && G.summary.ready + G.summary.notReady <= G.summary.steps);
+  // Branches.
+  const segRow = gridFull.nodes.find((n) => n.level === 3 && n.childCount > 0);
+  const kidsG = await timed(`grid children of ${segRow.code.slice(-14)}`, conn, (db) => TREE.lineGridChildren(db, COMPANY, { nodeId: segRow.id }));
+  ok('a grid branch returns exactly the row\'s children, with their cells', kidsG.out.nodes.length === segRow.childCount && kidsG.out.nodes.every((n) => n.parentId === segRow.id && n.cells) && kidsG.out.node.id === segRow.id);
+  ok('a grid branch costs at most one read more than a grid read', kidsG.trips <= grid.trips + 1, `${kidsG.trips} vs ${grid.trips}`);
+  // open=: the rows on screen come back in one read — a row named comes with its children when the row itself comes.
+  const segParent = GF.get(segRow.parentId);
+  const onlySeg = await TREE.lineGrid(conn, COMPANY, { lineId: LINE, open: segRow.id });
+  ok('open=: a row whose parent is not open does not come, so neither do its children', segParent.level === TREE.GRID_DEFAULT_DEPTH && !onlySeg.nodes.some((n) => n.id === segRow.id || n.parentId === segRow.id));
+  const pathOpen = await TREE.lineGrid(conn, COMPANY, { lineId: LINE, open: [segRow.parentId, segRow.id].join(',') });
+  ok('open=: with its parent open too, the row and its children come in the same read', pathOpen.nodes.some((n) => n.id === segRow.id)
+    && pathOpen.nodes.filter((n) => n.parentId === segRow.id).length === segRow.childCount
+    && pathOpen.nodes.filter((n) => n.parentId === segParent.id).length === segParent.childCount);
+  ok('open=: each row says whether all its children came', pathOpen.nodes.find((n) => n.id === segRow.id).childrenIncluded === true);
+  let gridRefused = false;
+  try { await TREE.lineGridChildren(conn, COMPANY, { nodeId: 'o1' }); } catch { gridRefused = true; }
+  ok('a grid branch of an order id is refused', gridRefused);
+  const notReleased = await TREE.lineGrid(conn, COMPANY, { lineId: 999999999 });
+  ok('a line not released answers released: false', notReleased.released === false && notReleased.nodes.length === 0);
+  ok('operationOrder is pure and puts deeper pieces\' work first when flows do not say', JSON.stringify(TREE.operationOrder(
+    [{ id: 1, depth: 0 }, { id: 2, depth: 1 }],
+    new Map([[1, [{ operation_id: 30 }, { operation_id: 40 }]], [2, [{ operation_id: 10 }, { operation_id: 20 }]]]),
+  )) === JSON.stringify([10, 20, 30, 40]));
+
+  // --- 7. the order page's first load: figures, not the whole tracker ---------------------------
+  console.log('\n7. The order page\'s first load');
+  const SALES = await imp('apps/cf_erp/services/salesOrderService.js');
+  const PROC = await imp('apps/cf_erp/services/processService.js');
+  const STOCK = await imp('apps/cf_erp/services/stockService.js');
+  const fOrder = await timed('GET /orders/:id', conn, (db) => SALES.getOrder(db, COMPANY, line.order_id));
+  const fProc = await timed('GET /orders/:id/process', conn, (db) => PROC.orderProcess(db, COMPANY, line.order_id));
+  const fProd = await timed('GET /orders/:id/production (figures)', conn, (db) => REL.orderProductionSummary(db, COMPANY, line.order_id));
+  const fMoves = await timed('GET /movements?orderId', conn, (db) => STOCK.listMovements(db, COMPANY, { orderId: line.order_id }));
+  const fFull = await timed('GET /orders/:id/production?full=1 (the old first load)', conn, (db) => REL.orderProduction(db, COMPANY, line.order_id));
+  const firstTrips = fOrder.trips + fProc.trips + fProd.trips + fMoves.trips + grid.trips;
+  ok(`the production figures take at most 6 round trips (took ${fProd.trips})`, fProd.trips <= 6);
+  ok('the production figures are tiny (under 10 KB) where the full tracker is megabytes', bytes(fProd.out) < 10 * 1024 && bytes(fFull.out) > 1024 * 1024, `${kb(fProd.out)} vs ${kb(fFull.out)}`);
+  ok(`the order page's first load (order, process, figures, movements, grid) takes at most 90 round trips (took ${firstTrips})`, firstTrips <= 90);
+  ok(`the order's process read takes at most 50 round trips (took ${fProc.trips})`, fProc.trips <= 50);
+  ok(`the order read takes at most 10 round trips (took ${fOrder.trips})`, fOrder.trips <= 10);
+  const sumRel = fProd.out.releases.find((r) => r.id === rel.id);
+  const fullRel = fFull.out.releases.find((r) => r.id === rel.id);
+  const { items: _i, requirements: _q, ...fullHead } = fullRel;
+  const { summary: _s, ...sumHead } = sumRel;
+  ok('the figures agree with the full release (all but readiness)', JSON.stringify({ ...fullHead, progress: { ...fullHead.progress, ready: null, notReady: null } }) === JSON.stringify(sumHead), `${JSON.stringify(sumHead.progress)} vs ${JSON.stringify(fullHead.progress)}`);
+  ok('the figures carry no tree', !('items' in sumRel) && !('requirements' in sumRel) && sumRel.summary === true);
+  ok('unreleased lines agree too', JSON.stringify(fProd.out.unreleased) === JSON.stringify(fFull.out.unreleased));
+  const reqsOnly = await timed('GET /releases/:id/requirements', conn, (db) => REL.releaseRequirements(db, COMPANY, rel.id));
+  ok('the material, read on its own, is the full release\'s', JSON.stringify(reqsOnly.out.requirements) === JSON.stringify(fullRel.requirements) && reqsOnly.out.release.id === rel.id);
+  const resumed = await REL.resumeStep(conn, c, leaf3.ops[0].stepId, { view: 'summary' });
+  ok('a write asked ?view=summary answers with the figures only', resumed.summary === true && resumed.id === rel.id && !('items' in resumed) && resumed.progress.onHold === fullRel.progress.onHold - 1);
+  const none = await REL.holdStep(conn, c, leaf3.ops[0].stepId, { note: 'again', view: 'none' });
+  ok('a write asked ?view=none answers with the id only', JSON.stringify(none) === JSON.stringify({ id: rel.id }));
+
   console.log(`\n  PERF (local, KEPL line ${LINE}: ${pieces.length} pieces, ${nSteps} steps): tree ${def.trips} trips / ${def.ms} ms / ${kb(def.out)} default (${def.out.nodes.length} nodes), ${kb(full.out)} every level; branch ${branch.trips} trips / ${branch.ms} ms / ${kb(branch.out)}; piece ${piece.trips} trips / ${piece.ms} ms`);
+  console.log(`  PERF grid: ${grid.trips} trips / ${grid.ms} ms / ${kb(G)} default (${G.nodes.length} rows × ${G.operations.length} operations), ${kb(gridFull)} every level; first load ${firstTrips} trips (figures ${fProd.trips} trips / ${kb(fProd.out)} vs the old full read ${fFull.trips} trips / ${kb(fFull.out)})`);
 
   await conn.rollback();
   detachNodeCache(conn);
@@ -248,6 +354,38 @@ try {
   ok('every cf_ table is back to its count', moved.length === 0);
   if (moved.length) console.log(`    moved: ${moved.map((t) => `${t} ${before[t]} -> ${afterCounts[t]}`).join(', ')}`);
   ok(`line ${LINE} is not released`, !(await REL.liveReleaseOfLine(conn, COMPANY, LINE)));
+
+  // --- 8. the short memory: only on the shared pool, cleared by any committed write -------------
+  console.log('\n8. The tracker\'s short memory (shared pool, a committed release — read only)');
+  const CACHE = await imp('apps/cf_erp/lib/trackerCache.js');
+  const { withTransaction } = await imp('apps/cf_erp/lib/db.js');
+  const [[live]] = await pool.query(
+    `SELECT r.company_id, r.order_line_id FROM cf_production_releases r
+      WHERE r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM cf_production_items pi WHERE pi.release_id = r.id AND pi.deleted_at IS NULL) ORDER BY r.id LIMIT 1`,
+  );
+  if (!live) console.log('    (no committed release in this database — skipped)');
+  else {
+    CACHE.invalidateTrackerCache();
+    const h0 = CACHE.trackerCacheStats().hits;
+    const g1 = await TREE.lineGrid(pool, live.company_id, { lineId: live.order_line_id });
+    const h1 = CACHE.trackerCacheStats().hits;
+    const g2 = await TREE.lineGrid(pool, live.company_id, { lineId: live.order_line_id });
+    const h2 = CACHE.trackerCacheStats().hits;
+    ok('a second read on the pool comes from memory, unchanged', h1 === h0 && h2 > h1 && JSON.stringify(g1) === JSON.stringify(g2));
+    const both = await Promise.all([REL.evaluatedTracker(pool, live.company_id, [g1.releaseId]), REL.evaluatedTracker(pool, live.company_id, [g1.releaseId])]);
+    both[0].steps[0]._status = 'tampered';
+    ok('each reader gets its own copy of the rows', both[1].steps[0]._status !== 'tampered' && both[0].steps[0] !== both[1].steps[0]);
+    await withTransaction(async () => {});
+    const h3 = CACHE.trackerCacheStats().hits;
+    await TREE.lineGrid(pool, live.company_id, { lineId: live.order_line_id });
+    ok('any committed write clears it (the next read goes to the database)', CACHE.trackerCacheStats().hits === h3);
+    const inTx = await pool.getConnection();
+    try {
+      const h4 = CACHE.trackerCacheStats().hits;
+      await TREE.lineGrid(inTx, live.company_id, { lineId: live.order_line_id });
+      ok('a read on a connection (a transaction) never uses it', CACHE.trackerCacheStats().hits === h4);
+    } finally { inTx.release(); }
+  }
 } catch (err) {
   try { await conn.rollback(); } catch { /* the error below matters */ }
   console.error(`\nERROR: ${err.stack}${err.problems?.length ? `\n  ${err.problems.slice(0, 10).join('\n  ')}` : ''}`);

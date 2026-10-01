@@ -1,5 +1,6 @@
 import { pool } from '../../../db.js';
 import { attachNodeCache, detachNodeCache } from './nodeCache.js';
+import { invalidateTrackerCache } from './trackerCache.js';
 
 /**
  * Runs fn(conn) inside one transaction on one connection.
@@ -25,6 +26,9 @@ export async function withTransaction(fn) {
     attachNodeCache(conn);
     const result = await fn(conn);
     await conn.commit();
+    // Any committed write may move a step, a reservation or stock: the
+    // tracker's short memory starts again (lib/trackerCache.js).
+    invalidateTrackerCache();
     return result;
   } catch (err) {
     try { await conn.rollback(); } catch { /* the original error is the one that matters */ }

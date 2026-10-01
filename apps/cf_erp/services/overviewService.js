@@ -19,6 +19,10 @@ async function one(db, sql, params) {
 /** Row-2 badges. Sizes stay neutral on screen; a few name work waiting (see SectionNav). */
 export async function navCounts(db, companyId) {
   const c = [companyId];
+  // The tracker and buying counts read beside the plain counts (each is several reads of its own).
+  const tP = trackerCounts(db, companyId);
+  const bP = purchaseCounts(db, companyId);
+  tP.catch(() => {}); bP.catch(() => {});
   const [openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas] = await Promise.all([
     one(db, `SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status IN ${OPEN}`, c),
     one(db, 'SELECT COUNT(*) FROM cf_parties WHERE company_id = ? AND deleted_at IS NULL AND is_customer = 1', c),
@@ -34,8 +38,7 @@ export async function navCounts(db, companyId) {
               AND EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id AND k.quantity <> 0)`, c),
     one(db, "SELECT COUNT(*) FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
   ]);
-  const t = await trackerCounts(db, companyId);
-  const b = await purchaseCounts(db, companyId);
+  const [t, b] = await Promise.all([tP, bP]);
   return { counts: { openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas, readySteps: t.readySteps, toBuy: b.toBuy, openPurchases: b.draftOrders + b.awaitingDelivery } };
 }
 

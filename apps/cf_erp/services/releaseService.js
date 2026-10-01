@@ -24,7 +24,8 @@
  * its dependencies and its material — never stored.
  */
 import { invalid, notFound, conflict } from '../lib/errors.js';
-import { insertRows } from '../lib/db.js';
+import { insertRows, pool as sharedPool } from '../lib/db.js';
+import { cachedTracker, copyTracker, readOnce, rememberTracker, trackerCacheKey, trackerStamp } from '../lib/trackerCache.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { cutPlateFlowGaps } from './cutPlateService.js';
 import { resolveTiming } from './operationService.js';
@@ -1176,7 +1177,7 @@ export async function releaseLine(db, c, lineId, input = {}) {
         q.itemId, q.bomLineId ?? null, q.quantity, c.userId])],
     );
   }
-  return getRelease(db, c.companyId, releaseId);
+  return releaseAfterWrite(db, c.companyId, releaseId, input.view);
 }
 
 /** Takes a release back — only while nothing has started and nothing was issued. Its reservations are let go. */
@@ -1213,10 +1214,8 @@ export async function unrelease(db, c, releaseId) {
 
 // --- reading the tracker: status is worked out, never stored ------------------------
 
-async function loadTracker(db, companyId, releaseIds) {
-  if (!releaseIds.length) return null;
-  const [releases] = await db.query(
-    `SELECT r.*, o.code AS order_code, o.title AS order_title, o.status AS order_status, o.order_type, o.committed_date AS order_committed,
+/** A release with its order, line, item and finished-goods figures — the head every release read starts from. */
+const RELEASE_SQL = `SELECT r.*, o.code AS order_code, o.title AS order_title, o.status AS order_status, o.order_type, o.committed_date AS order_committed,
             l.line_no, l.committed_date AS line_committed, l.made_qty, l.delivered_qty, m.code AS item_code, m.name AS item_name, u.name AS released_by,
             fa.code AS finished_area_code, fa.name AS finished_area_name,
             (SELECT COALESCE(SUM(v.quantity), 0) FROM cf_stock_reservations v
@@ -1226,55 +1225,101 @@ async function loadTracker(db, companyId, releaseIds) {
        JOIN cf_sales_order_lines l ON l.id = r.order_line_id
        JOIN cf_master_records m ON m.id = r.item_id
        LEFT JOIN cf_stocking_areas fa ON fa.id = r.finished_area_id
-       LEFT JOIN users u ON u.id = r.created_by
-      WHERE r.company_id = ? AND r.id IN (?) AND r.deleted_at IS NULL ORDER BY o.code, l.line_no`,
-    [companyId, releaseIds],
-  );
-  const ids = releases.map((r) => r.id);
-  if (!ids.length) return null;
-  const [items] = await db.query(
-    `SELECT pi.*, m.code AS item_code, m.name AS item_name, i.uom, f.code AS flow_code, f.name AS flow_name
-       FROM cf_production_items pi
-       JOIN cf_master_records m ON m.id = pi.item_id
-       JOIN cf_item_details i ON i.master_id = pi.item_id
-       JOIN cf_operation_flows f ON f.id = pi.flow_id
-      WHERE pi.company_id = ? AND pi.release_id IN (?) AND pi.deleted_at IS NULL ORDER BY pi.release_id, pi.sort_order`,
-    [companyId, ids],
-  );
-  const itemIds = items.map((x) => x.id);
-  const [steps] = itemIds.length ? await db.query(
-    `SELECT s.*, o.code AS op_code, o.name AS op_name, mc.code AS machine_code, mc.name AS machine_name,
-            wo.code AS wo_code, wo.status AS wo_status, wo.contractor_id AS wo_contractor_id, wp.name AS wo_contractor_name
-       FROM cf_production_steps s
-       JOIN cf_operations o ON o.id = s.operation_id
-       LEFT JOIN cf_machines mc ON mc.id = s.machine_id
-       LEFT JOIN cf_work_orders wo ON wo.id = s.work_order_id
-       LEFT JOIN cf_parties wp ON wp.id = wo.contractor_id
-      WHERE s.company_id = ? AND s.production_item_id IN (?) AND s.deleted_at IS NULL ORDER BY s.production_item_id, s.sequence, s.id`,
-    [companyId, itemIds],
-  ) : [[]];
-  const stepIds = steps.map((s) => s.id);
-  const [deps] = stepIds.length ? await db.query('SELECT * FROM cf_step_dependencies WHERE company_id = ? AND step_id IN (?) AND deleted_at IS NULL ORDER BY id', [companyId, stepIds]) : [[]];
-  const [reqs] = await db.query(
-    `SELECT q.*, m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by
-       FROM cf_material_requirements q
-       JOIN cf_master_records m ON m.id = q.item_id
-       JOIN cf_item_details i ON i.master_id = q.item_id
-      WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL ORDER BY q.id`,
-    [companyId, ids],
-  );
-  const reqIds = reqs.map((q) => q.id);
-  const [reservations] = reqIds.length ? await db.query(
-    `SELECT v.*, b.code AS batch_code, b.status AS batch_status FROM cf_stock_reservations v
-       LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
-      WHERE v.company_id = ? AND v.requirement_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY v.id`,
-    [companyId, reqIds],
-  ) : [[]];
+       LEFT JOIN users u ON u.id = r.created_by`;
+
+/**
+ * The tracker's raw rows for some releases. Two stages of reads, each run
+ * side by side (2026-10-01): every big read is keyed on the RELEASE ids — the
+ * steps, waits and reservations through a join, not an IN list of the ids the
+ * previous read returned — so the items (6,072 rows on KEPL), steps (11,150)
+ * and waits (14,083) no longer wait for one another; then free stock and the
+ * plate lots, which need the requirements. ~1.4 s less on production.
+ *
+ * On the shared pool the rows are kept for a few seconds (lib/trackerCache.js):
+ * one stamp read decides whether the last answer still holds.
+ */
+async function loadTracker(db, companyId, releaseIds, { stamp: known = null } = {}) {
+  if (!releaseIds.length) return null;
+  if (db !== sharedPool) return readTracker(db, companyId, releaseIds);
+  const key = trackerCacheKey(companyId, releaseIds);
+  const stamp = known ?? await trackerStamp(db, companyId, releaseIds);
+  const hit = cachedTracker(key, stamp);
+  if (hit) return hit.releases.length ? hit : null;
+  // Readers that miss together share one read; each gets its own copy of the rows.
+  const data = await readOnce(`rows:${key}|${stamp}`, async () => {
+    const d = await readTracker(db, companyId, releaseIds);
+    if (d) rememberTracker(key, stamp, d);
+    return d;
+  });
+  return data ? copyTracker(data) : null;
+}
+
+async function readTracker(db, companyId, releaseIds) {
+  const [
+    [releases], [items], [steps], [deps], [reqs], [reservations],
+  ] = await Promise.all([
+    db.query(`${RELEASE_SQL} WHERE r.company_id = ? AND r.id IN (?) AND r.deleted_at IS NULL ORDER BY o.code, l.line_no`, [companyId, releaseIds]),
+    // The live items of a live release: what every read below joins through.
+    db.query(
+      `SELECT pi.*, m.code AS item_code, m.name AS item_name, i.uom, f.code AS flow_code, f.name AS flow_name
+         FROM cf_production_items pi
+         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+         JOIN cf_master_records m ON m.id = pi.item_id
+         JOIN cf_item_details i ON i.master_id = pi.item_id
+         JOIN cf_operation_flows f ON f.id = pi.flow_id
+        WHERE pi.company_id = ? AND pi.release_id IN (?) AND pi.deleted_at IS NULL ORDER BY pi.release_id, pi.sort_order`,
+      [companyId, releaseIds],
+    ),
+    db.query(
+      `SELECT s.*, o.code AS op_code, o.name AS op_name, mc.code AS machine_code, mc.name AS machine_name,
+              wo.code AS wo_code, wo.status AS wo_status, wo.contractor_id AS wo_contractor_id, wp.name AS wo_contractor_name
+         FROM cf_production_steps s
+         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
+         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+         JOIN cf_operations o ON o.id = s.operation_id
+         LEFT JOIN cf_machines mc ON mc.id = s.machine_id
+         LEFT JOIN cf_work_orders wo ON wo.id = s.work_order_id
+         LEFT JOIN cf_parties wp ON wp.id = wo.contractor_id
+        WHERE s.company_id = ? AND pi.company_id = ? AND pi.release_id IN (?) AND s.deleted_at IS NULL
+        ORDER BY s.production_item_id, s.sequence, s.id`,
+      [companyId, companyId, releaseIds],
+    ),
+    // Only the columns evaluate() reads: 14k waits on KEPL.
+    db.query(
+      `SELECT d.id, d.step_id, d.target_step_id, d.target_item_id, d.required, d.origin, d.wait_rule_id
+         FROM cf_step_dependencies d
+         JOIN cf_production_steps s ON s.id = d.step_id AND s.deleted_at IS NULL
+         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
+         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+        WHERE d.company_id = ? AND pi.company_id = ? AND pi.release_id IN (?) AND d.deleted_at IS NULL ORDER BY d.id`,
+      [companyId, companyId, releaseIds],
+    ),
+    db.query(
+      `SELECT q.*, m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by
+         FROM cf_material_requirements q
+         JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
+         JOIN cf_master_records m ON m.id = q.item_id
+         JOIN cf_item_details i ON i.master_id = q.item_id
+        WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL ORDER BY q.id`,
+      [companyId, releaseIds],
+    ),
+    db.query(
+      `SELECT v.*, b.code AS batch_code, b.status AS batch_status FROM cf_stock_reservations v
+         JOIN cf_material_requirements q ON q.id = v.requirement_id AND q.deleted_at IS NULL
+         JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
+         LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
+        WHERE v.company_id = ? AND q.company_id = ? AND q.release_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY v.id`,
+      [companyId, companyId, releaseIds],
+    ),
+  ]);
+  if (!releases.length) return null;
   // One order's tracker counts that customer's material as free for it; several
   // orders' trackers count only ours (a customer's lot is never free for another order).
   const orderIds = [...new Set(releases.map((r) => r.order_id))];
-  const free = await availability(db, companyId, [...new Set(reqs.map((q) => q.item_id))], { orderId: orderIds.length === 1 ? orderIds[0] : null });
-  await nameLots(db, companyId, releases, items, reqs);
+  const [free] = await Promise.all([
+    availability(db, companyId, [...new Set(reqs.map((q) => q.item_id))], { orderId: orderIds.length === 1 ? orderIds[0] : null }),
+    nameLots(db, companyId, releases, items, reqs),
+  ]);
   return { releases, items, steps, deps, reqs, reservations, free };
 }
 
@@ -1469,6 +1514,28 @@ function shapeRequirement(q, data, ev) {
   };
 }
 
+/** The fields every shape of a release shares: who, what, when, and the finished-goods figures. */
+function releaseHead(r) {
+  return {
+    id: r.id,
+    order: { id: r.order_id, code: r.order_code, title: r.order_title, status: r.order_status, type: r.order_type },
+    line: { id: r.order_line_id, lineNo: r.line_no, committedDate: dateOnly(r.line_committed ?? r.order_committed) },
+    item: { id: r.item_id, code: r.item_code, name: r.item_name, revision: r.item_revision },
+    quantity: Number(r.quantity),
+    releasedAt: r.created_at,
+    releasedBy: r.released_by ?? null,
+    finishedArea: r.finished_area_id ? { id: r.finished_area_id, code: r.finished_area_code, name: r.finished_area_name } : null,
+    // What the line owes, what has been made into stock, what has left the
+    // yard, and what is standing there with its name on it (Idea A).
+    finished: {
+      quantity: Number(r.quantity),
+      made: Number(r.made_qty ?? 0),
+      delivered: Number(r.delivered_qty ?? 0),
+      readyToShip: round6(Number(r.ready_to_ship ?? 0)),
+    },
+  };
+}
+
 function shapeReleases(data) {
   const ev = evaluate(data);
   const itemsByRelease = groupBy(data.items, 'release_id');
@@ -1480,22 +1547,7 @@ function shapeReleases(data) {
     const count = (st) => steps.filter((s) => s._status === st).length;
     const done = count('done');
     return {
-      id: r.id,
-      order: { id: r.order_id, code: r.order_code, title: r.order_title, status: r.order_status, type: r.order_type },
-      line: { id: r.order_line_id, lineNo: r.line_no, committedDate: dateOnly(r.line_committed ?? r.order_committed) },
-      item: { id: r.item_id, code: r.item_code, name: r.item_name, revision: r.item_revision },
-      quantity: Number(r.quantity),
-      releasedAt: r.created_at,
-      releasedBy: r.released_by ?? null,
-      finishedArea: r.finished_area_id ? { id: r.finished_area_id, code: r.finished_area_code, name: r.finished_area_name } : null,
-      // What the line owes, what has been made into stock, what has left the
-      // yard, and what is standing there with its name on it (Idea A).
-      finished: {
-        quantity: Number(r.quantity),
-        made: Number(r.made_qty ?? 0),
-        delivered: Number(r.delivered_qty ?? 0),
-        readyToShip: round6(Number(r.ready_to_ship ?? 0)),
-      },
+      ...releaseHead(r),
       status: steps.length && done === steps.length ? 'complete' : steps.some((s) => s.started_at || s.state !== 'pending') ? 'in_progress' : 'not_started',
       progress: {
         steps: steps.length, done, inProgress: count('in_progress'), ready: count('ready'), notReady: count('not_ready'), onHold: count('on_hold'),
@@ -1544,6 +1596,113 @@ export async function orderProduction(db, companyId, orderId) {
     releases,
     unreleased: lines.filter((l) => !released.has(l.id)).map((l) => ({ id: l.id, lineNo: l.line_no, quantity: Number(l.quantity), item: { code: l.item_code, name: l.item_name } })),
   };
+}
+
+/**
+ * A release's FIGURES without its tree (2026-10-01): what the order page's
+ * header and its Production tab need — the line, the finished counts, steps
+ * done / in progress / on hold, pieces complete, material covered, whether it
+ * can be taken back — counted in SQL, four reads side by side whatever the size
+ * (the full getRelease is 11 MB and ~2 s on the KEPL line). `items` and
+ * `requirements` are absent; `ready` / `notReady` are null — readiness needs
+ * every wait worked out, which is the grid's job (trackerTreeService.lineGrid).
+ * The other counts are the ones getRelease gives (tracker_tree_test proves it).
+ */
+export async function releaseSummaries(db, companyId, releaseIds) {
+  const ids = [...new Set(releaseIds.map(Number))];
+  if (!ids.length) return [];
+  const [[releases], [stepRows], [pieceRows], [reqRows]] = await Promise.all([
+    db.query(`${RELEASE_SQL} WHERE r.company_id = ? AND r.id IN (?) AND r.deleted_at IS NULL ORDER BY o.code, l.line_no`, [companyId, ids]),
+    db.query(
+      `SELECT pi.release_id, COUNT(*) AS steps,
+              SUM(s.state = 'done') AS done, SUM(s.state = 'in_progress') AS in_progress, SUM(s.state = 'on_hold') AS on_hold,
+              SUM(s.state <> 'pending' OR s.started_at IS NOT NULL) AS started,
+              SUM(s.state <> 'pending' OR s.started_at IS NOT NULL OR s.qty_good > 0) AS touched
+         FROM cf_production_steps s
+         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
+        WHERE s.company_id = ? AND pi.company_id = ? AND pi.release_id IN (?) AND s.deleted_at IS NULL
+        GROUP BY pi.release_id`,
+      [companyId, companyId, ids],
+    ),
+    db.query(
+      `SELECT pi.release_id, COUNT(*) AS pieces, SUM(CASE WHEN x.n > 0 AND x.n = x.d THEN 1 ELSE 0 END) AS complete
+         FROM cf_production_items pi
+         LEFT JOIN (SELECT s.production_item_id, COUNT(*) AS n, SUM(s.state = 'done') AS d
+                      FROM cf_production_steps s
+                      JOIN cf_production_items p2 ON p2.id = s.production_item_id AND p2.deleted_at IS NULL
+                     WHERE s.company_id = ? AND p2.company_id = ? AND p2.release_id IN (?) AND s.deleted_at IS NULL
+                     GROUP BY s.production_item_id) x ON x.production_item_id = pi.id
+        WHERE pi.company_id = ? AND pi.release_id IN (?) AND pi.deleted_at IS NULL
+        GROUP BY pi.release_id`,
+      [companyId, companyId, ids, companyId, ids],
+    ),
+    // Covered = nothing short once the reservations on usable stock count (evaluate()'s q._covered).
+    db.query(
+      `SELECT q.release_id, COUNT(*) AS materials, COALESCE(SUM(q.issued), 0) AS issued,
+              SUM(CASE WHEN ROUND(q.quantity - q.issued - COALESCE(u.usable, 0), 6) <= 0 THEN 1 ELSE 0 END) AS covered
+         FROM cf_material_requirements q
+         LEFT JOIN (SELECT v.requirement_id, SUM(v.quantity) AS usable
+                      FROM cf_stock_reservations v
+                      JOIN cf_material_requirements q2 ON q2.id = v.requirement_id AND q2.deleted_at IS NULL
+                      LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
+                     WHERE v.company_id = ? AND q2.company_id = ? AND q2.release_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
+                       AND (v.batch_id IS NULL OR b.status = 'available')
+                     GROUP BY v.requirement_id) u ON u.requirement_id = q.id
+        WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL
+        GROUP BY q.release_id`,
+      [companyId, companyId, ids, companyId, ids],
+    ),
+  ]);
+  const by = (rows) => new Map(rows.map((r) => [r.release_id, r]));
+  const st = by(stepRows);
+  const pc = by(pieceRows);
+  const rq = by(reqRows);
+  const n = (v) => Number(v ?? 0);
+  return releases.map((r) => {
+    const s = st.get(r.id) ?? {};
+    const p = pc.get(r.id) ?? {};
+    const q = rq.get(r.id) ?? {};
+    const steps = n(s.steps);
+    const done = n(s.done);
+    return {
+      ...releaseHead(r),
+      summary: true,
+      status: steps && done === steps ? 'complete' : n(s.started) > 0 ? 'in_progress' : 'not_started',
+      progress: {
+        steps, done, inProgress: n(s.in_progress), ready: null, notReady: null, onHold: n(s.on_hold),
+        pieces: n(p.pieces), complete: n(p.complete), materials: n(q.materials), materialsCovered: n(q.covered),
+      },
+      canUnrelease: n(s.touched) === 0 && n(q.issued) <= EPS,
+    };
+  });
+}
+
+/** Every release of an order as figures (releaseSummaries), and its lines not released yet — the order page's first read. */
+export async function orderProductionSummary(db, companyId, orderId) {
+  const [[rels], [lines]] = await Promise.all([
+    db.query('SELECT id FROM cf_production_releases WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [companyId, orderId]),
+    db.query(
+      `SELECT l.id, l.line_no, l.quantity, m.code AS item_code, m.name AS item_name FROM cf_sales_order_lines l
+         LEFT JOIN cf_master_records m ON m.id = l.item_id
+        WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL ORDER BY l.line_no`,
+      [companyId, orderId],
+    ),
+  ]);
+  const releases = await releaseSummaries(db, companyId, rels.map((r) => r.id));
+  const released = new Set(releases.map((r) => r.line.id));
+  return {
+    releases,
+    unreleased: lines.filter((l) => !released.has(l.id)).map((l) => ({ id: l.id, lineNo: l.line_no, quantity: Number(l.quantity), item: { code: l.item_code, name: l.item_name } })),
+  };
+}
+
+/** A release's material on its own (the order page's Material section, opened on request): its figures and its requirements, shaped as getRelease shapes them. */
+export async function releaseRequirements(db, companyId, releaseId) {
+  const data = await loadTracker(db, companyId, [Number(releaseId)]);
+  if (!data) throw notFound('Release');
+  const ev = evaluate(data);
+  const [summary] = await releaseSummaries(db, companyId, [Number(releaseId)]);
+  return { release: summary, requirements: data.reqs.map((q) => shapeRequirement(q, data, ev)) };
 }
 
 export async function openReleaseIds(db, companyId, { includeClosed = false } = {}) {
@@ -1618,8 +1777,8 @@ export async function trackerCounts(db, companyId) {
  * _status, _blockers (plain sentences), _opLabel; each item _label. null when
  * no release matches.
  */
-export async function evaluatedTracker(db, companyId, releaseIds) {
-  const data = await loadTracker(db, companyId, releaseIds);
+export async function evaluatedTracker(db, companyId, releaseIds, opts = {}) {
+  const data = await loadTracker(db, companyId, releaseIds, opts);
   if (!data) return null;
   const ev = evaluate(data);
   return { ...data, ...ev };
@@ -1671,9 +1830,28 @@ async function requireStep(db, companyId, stepId) {
 
 /** The step as its release sees it: status, blockers, label. */
 async function evaluatedStep(db, companyId, step) {
-  const rel = await getRelease(db, companyId, step.release_id);
-  for (const it of rel.items) for (const s of it.steps) if (s.id === step.id) return { rel, s };
-  throw notFound('Step');
+  // The raw rows and evaluate() — the same status getRelease would give — without
+  // shaping 11k steps into objects to look at one of them.
+  const data = await evaluatedTracker(db, companyId, [step.release_id]);
+  const raw = data?.steps.find((s) => s.id === step.id);
+  if (!raw) throw notFound('Step');
+  return { s: shapeStep(raw, data.itemById.get(raw.production_item_id)?._label ?? '') };
+}
+
+/**
+ * What a write on the tracker answers with. Default: the whole release, as it
+ * always has (getRelease — 11 MB on the KEPL line). view 'summary': only its
+ * figures (releaseSummaries — a few hundred bytes); 'none': just its id. The
+ * order page's grid asks for 'summary' and re-reads the cells it shows.
+ */
+export async function releaseAfterWrite(db, companyId, releaseId, view) {
+  if (view === 'summary') {
+    const [one] = await releaseSummaries(db, companyId, [Number(releaseId)]);
+    if (!one) throw notFound('Release');
+    return one;
+  }
+  if (view === 'none') return { id: Number(releaseId) };
+  return getRelease(db, companyId, releaseId);
 }
 
 /**
@@ -1724,7 +1902,7 @@ export async function startStep(db, c, stepId, input = {}) {
     [...(at == null ? [] : [at]), machineId, c.companyId, step.id],
   );
   await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });
-  return getRelease(db, c.companyId, step.release_id);
+  return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
 /**
@@ -1751,7 +1929,7 @@ export async function recordProgress(db, c, stepId, input = {}) {
   );
   await logEvent(db, c, step.id, 'progress', { good: round6(good), scrap: round6(scrap), note: blank(input.note) ? null : String(input.note).slice(0, 500), at });
   if (done) await stockFinished(db, c, step.production_item_id);
-  return getRelease(db, c.companyId, step.release_id);
+  return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
 /**
@@ -1851,7 +2029,7 @@ export async function holdStep(db, c, stepId, input = {}) {
   // whether a later assignment in one UPDATE sees an earlier one.
   await db.query("UPDATE cf_production_steps SET held_from = ?, state = 'on_hold' WHERE company_id = ? AND id = ?", [step.state, c.companyId, step.id]);
   await logEvent(db, c, step.id, 'hold', { note: String(input.note).slice(0, 500) });
-  return getRelease(db, c.companyId, step.release_id);
+  return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
 /** Takes a step off hold, back to where it was. */
@@ -1860,7 +2038,7 @@ export async function resumeStep(db, c, stepId, input = {}) {
   if (step.state !== 'on_hold') throw invalid('INVALID', 'This step is not on hold.');
   await db.query('UPDATE cf_production_steps SET state = ?, held_from = NULL WHERE company_id = ? AND id = ?', [step.held_from ?? 'pending', c.companyId, step.id]);
   await logEvent(db, c, step.id, 'resume', { note: blank(input.note) ? null : String(input.note).slice(0, 500) });
-  return getRelease(db, c.companyId, step.release_id);
+  return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
 /** What was recorded on a step, oldest first. */
@@ -2016,7 +2194,7 @@ export async function reserveRequirement(db, c, reqId, input = {}) {
   await lockItemStock(db, c.companyId, q.item_id);
   const out = await reserveOne(db, c, q, input);
   if (out.reserved <= EPS) throw invalid('NOT_FREE', out.message);
-  return getRelease(db, c.companyId, q.release_id);
+  return releaseAfterWrite(db, c.companyId, q.release_id, input.view);
 }
 
 /**
@@ -2057,7 +2235,7 @@ function freeStock(bal, res) {
  * ~17 round trips for the KEPL line's 2,952 requirements, getRelease included
  * (was ~16,000). scripts/cf_kepl/reserve_batch_test.mjs holds the golden snapshot.
  */
-export async function reserveRelease(db, c, releaseId) {
+export async function reserveRelease(db, c, releaseId, opts = {}) {
   const rel = await requireRelease(db, c.companyId, releaseId, { lock: true });
   assertOrderOpen(rel);
   const [ids] = await db.query('SELECT id FROM cf_material_requirements WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId, releaseId]);
@@ -2104,11 +2282,11 @@ export async function reserveRelease(db, c, releaseId) {
     }
     if (missingAt >= 0) throw notFound('Requirement');
   }
-  return { release: await getRelease(db, c.companyId, releaseId), reserved, short: [...short.values()] };
+  return { release: await releaseAfterWrite(db, c.companyId, releaseId, opts.view), reserved, short: [...short.values()] };
 }
 
 /** Lets a reservation go. Allowed on a closed order too, so leftover claims can be freed. */
-export async function releaseReservation(db, c, reservationId) {
+export async function releaseReservation(db, c, reservationId, opts = {}) {
   const [[v]] = await db.query(
     `SELECT v.*, q.release_id FROM cf_stock_reservations v JOIN cf_material_requirements q ON q.id = v.requirement_id
       WHERE v.company_id = ? AND v.id = ? AND v.deleted_at IS NULL FOR UPDATE`,
@@ -2117,7 +2295,7 @@ export async function releaseReservation(db, c, reservationId) {
   if (!v) throw notFound('Reservation');
   if (v.status !== 'active') throw invalid('INVALID', 'This reservation is no longer active.');
   await db.query("UPDATE cf_stock_reservations SET status = 'released', closed_at = NOW() WHERE company_id = ? AND id = ?", [c.companyId, v.id]);
-  return getRelease(db, c.companyId, v.release_id);
+  return releaseAfterWrite(db, c.companyId, v.release_id, opts.view);
 }
 
 /**
@@ -2125,7 +2303,7 @@ export async function releaseReservation(db, c, reservationId) {
  * it is taken from (WIP areas first — stock already moved beside a machine),
  * each reservation falling by what was taken.
  */
-export async function issueRequirement(db, c, reqId) {
+export async function issueRequirement(db, c, reqId, opts = {}) {
   const q = await requireRequirement(db, c.companyId, reqId);
   await lockItemStock(db, c.companyId, q.item_id);
   const res = await activeReservations(db, c.companyId, q.id);
@@ -2170,5 +2348,5 @@ export async function issueRequirement(db, c, reqId) {
     });
   }
   await db.query('UPDATE cf_material_requirements SET issued = issued + ? WHERE company_id = ? AND id = ?', [total, c.companyId, q.id]);
-  return getRelease(db, c.companyId, q.release_id);
+  return releaseAfterWrite(db, c.companyId, q.release_id, opts.view);
 }

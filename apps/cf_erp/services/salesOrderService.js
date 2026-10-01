@@ -268,18 +268,9 @@ async function structureStats(db, companyId, lineIds) {
 }
 
 export async function getOrder(db, companyId, id) {
-  const o = await requireOrder(db, companyId, id);
-  const [[cust]] = o.customer_id
-    ? await db.query('SELECT code, name FROM cf_parties WHERE id = ?', [o.customer_id])
-    : [[null]];
-  const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
-  // Every revision of this order, oldest first — one index lookup on the number.
-  const [revs] = await db.query(
-    'SELECT id, revision, status, revised_at FROM cf_sales_orders WHERE company_id = ? AND code_active = ? ORDER BY revision',
-    [companyId, String(o.code).toLowerCase()],
-  );
-  order.revisions = revs.map((r) => ({ id: r.id, revision: Number(r.revision), status: r.status, revisedAt: r.revised_at ?? null }));
-  const [lines] = await db.query(
+  // Round trips side by side (~49 ms each to production): the lines need only
+  // the id, the customer and the revisions only the order row.
+  const linesP = db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, m.status AS item_status, m.revision AS item_revision,
             i.item_type, i.uom, dz.code AS design_code, dz.name AS design_name,
             b.status AS bom_status, b.revision AS current_bom_revision,
@@ -294,8 +285,20 @@ export async function getOrder(db, companyId, id) {
       ORDER BY l.line_no, l.id`,
     [companyId, id],
   );
-  const stats = await structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id));
-  const amounts = await lineAmounts(db, companyId, lines);
+  linesP.catch(() => { /* awaited below; an order that is not there throws first */ });
+  const o = await requireOrder(db, companyId, id);
+  const [[[cust]], [revs], [lines]] = await Promise.all([
+    o.customer_id ? db.query('SELECT code, name FROM cf_parties WHERE id = ?', [o.customer_id]) : [[null]],
+    // Every revision of this order, oldest first — one index lookup on the number.
+    db.query('SELECT id, revision, status, revised_at FROM cf_sales_orders WHERE company_id = ? AND code_active = ? ORDER BY revision', [companyId, String(o.code).toLowerCase()]),
+    linesP,
+  ]);
+  const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
+  order.revisions = revs.map((r) => ({ id: r.id, revision: Number(r.revision), status: r.status, revisedAt: r.revised_at ?? null }));
+  const [stats, amounts] = await Promise.all([
+    structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id)),
+    lineAmounts(db, companyId, lines),
+  ]);
   order.total = orderTotal(lines, amounts);
   // Estimated GST (init.sql §37): per line and on the total, by the ship-to state.
   const { lineTax, orderTax } = await salesOrderTax(db, companyId, [o], lines, amounts);

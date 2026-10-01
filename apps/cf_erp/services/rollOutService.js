@@ -105,7 +105,8 @@ const OWNER_SCOPE = `CASE WHEN b.owner_party_id IS NULL THEN 0
  * opts.orderId — see availability(). Rows of someone else's lots are left out.
  */
 export async function availabilityRows(db, companyId, itemIds, { orderId = null } = {}) {
-  const [bal] = await db.query(
+  // Side by side: neither read needs the other.
+  const [[bal], [res]] = await Promise.all([db.query(
     `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on,
             b.owner_party_id, MAX(${OWNER_SCOPE}) AS owner_scope
        FROM cf_stock_balances k
@@ -117,8 +118,7 @@ export async function availabilityRows(db, companyId, itemIds, { orderId = null 
       GROUP BY k.item_id, k.batch_id, b.code, b.status, b.received_on, b.owner_party_id
      HAVING owner_scope < 2`,
     [orderId, companyId, itemIds],
-  );
-  const [res] = await db.query(
+  ), db.query(
     `SELECT v.item_id, v.batch_id, SUM(v.quantity) AS qty, MAX(${OWNER_SCOPE}) AS owner_scope
        FROM cf_stock_reservations v
        LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
@@ -128,7 +128,7 @@ export async function availabilityRows(db, companyId, itemIds, { orderId = null 
       GROUP BY v.item_id, v.batch_id
      HAVING owner_scope < 2`,
     [orderId, companyId, itemIds],
-  );
+  )]);
   return { bal, res };
 }
 

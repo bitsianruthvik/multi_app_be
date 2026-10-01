@@ -1204,12 +1204,17 @@ async function missingRequiredValues(db, companyId, chains) {
  * keeps them readable and testable.
  */
 async function loadOrderContext(db, companyId, order, lines) {
-  // 1. Each line's structure, exploded once.
-  const trees = new Map();
-  for (const line of lines) {
-    if (!line.item_id) { trees.set(line.id, null); continue; }
-    trees.set(line.id, await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), maxDepth: 15 }));
-  }
+  // Every read here is one round trip (~49 ms to production), so the reads that
+  // do not need one another's answers go side by side (2026-10-01: 49 one after
+  // another, ~3 s on the KEPL order; now in a handful of stages). On a single
+  // connection (inside a transaction) mysql2 queues them — same answers.
+  const lineIds = lines.map((l) => l.id);
+
+  // 1. Each line's structure, exploded once — the lines side by side.
+  const trees = new Map(await Promise.all(lines.map(async (line) => [
+    line.id,
+    line.item_id ? await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), maxDepth: 15 }) : null,
+  ])));
 
   // 2. Every item any tree touches, with what decides made-or-material.
   const itemIds = new Set();
@@ -1228,151 +1233,168 @@ async function loadOrderContext(db, companyId, order, lines) {
     [companyId, [...itemIds]],
   ) : [[]];
   const detail = new Map(detailRows.map((r) => [r.master_id, r]));
+  const lockedLines = lines.filter((l) => l.locked_at).map((l) => l.id);
+  const temporaryIds = [...itemIds].filter((id) => detail.get(id)?.item_type === 'temporary');
 
-  // 3. Free stock, once, for every item that could be drawn from it.
-  const free = itemIds.size ? await availability(db, companyId, [...itemIds]) : new Map();
+  const onOrderOf = async (ids) => {
+    if (!ids.length) return [];
+    const [rows] = await db.query(
+      `SELECT l.item_id, SUM(GREATEST(l.quantity - l.qty_received, 0)) AS outstanding
+         FROM cf_purchase_order_lines l
+         JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
+          AND p.status IN ('draft','ordered','partially_received')
+        GROUP BY l.item_id`,
+      [companyId, ids],
+    );
+    return rows;
+  };
 
-  // 4. What is already on order, so "short" can tell waiting from missing.
-  const [poRows] = itemIds.size ? await db.query(
-    `SELECT l.item_id, SUM(GREATEST(l.quantity - l.qty_received, 0)) AS outstanding
-       FROM cf_purchase_order_lines l
-       JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
-      WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
-        AND p.status IN ('draft','ordered','partially_received')
-      GROUP BY l.item_id`,
-    [companyId, [...itemIds]],
-  ) : [[]];
-  const onOrder = new Map(poRows.map((r) => [r.item_id, Number(r.outstanding) || 0]));
-
-  // 5. Releases and how far their steps have got.
-  const [relRows] = lines.length ? await db.query(
-    `SELECT r.id, r.order_line_id,
-            (SELECT COUNT(*) FROM cf_production_steps s
-               JOIN cf_production_items pi ON pi.id = s.production_item_id
-              WHERE pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
-            (SELECT COUNT(*) FROM cf_production_steps s
-               JOIN cf_production_items pi ON pi.id = s.production_item_id
-              WHERE pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done_steps
-       FROM cf_production_releases r
-      WHERE r.company_id = ? AND r.order_line_id IN (?) AND r.deleted_at IS NULL`,
-    [companyId, lines.map((l) => l.id)],
-  ) : [[]];
-  const releases = new Map(relRows.map((r) => [r.order_line_id, { id: r.id, steps: Number(r.steps), doneSteps: Number(r.done_steps) }]));
+  // 5. Releases and how far their steps have got — then, for the released
+  //    lines, their requirements; for the frozen ones, the planned material.
+  const releasesStage = (async () => {
+    const [relRows] = lines.length ? await db.query(
+      `SELECT r.id, r.order_line_id,
+              (SELECT COUNT(*) FROM cf_production_steps s
+                 JOIN cf_production_items pi ON pi.id = s.production_item_id
+                WHERE pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
+              (SELECT COUNT(*) FROM cf_production_steps s
+                 JOIN cf_production_items pi ON pi.id = s.production_item_id
+                WHERE pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done_steps
+         FROM cf_production_releases r
+        WHERE r.company_id = ? AND r.order_line_id IN (?) AND r.deleted_at IS NULL`,
+      [companyId, lineIds],
+    ) : [[]];
+    const releases = new Map(relRows.map((r) => [r.order_line_id, { id: r.id, steps: Number(r.steps), doneSteps: Number(r.done_steps) }]));
+    // 7. What Buying counts (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30) — the buy list's
+    //    own numbers: a frozen line not released has its PLANNED material (the
+    //    requirements release will write, in bulk — 3 round trips for any number
+    //    of lines) and whether it is ready (no cut plate still without a plate);
+    //    a released line has its requirements, with what is held for them.
+    const releasedIds = [...releases.values()].map((r) => r.id);
+    const [planned, [reqRows]] = await Promise.all([
+      plannedMaterialOfLines(db, companyId, lines.filter((l) => l.locked_at && !releases.has(l.id) && l.item_id)),
+      releasedIds.length ? db.query(
+        `SELECT r.order_line_id, q.item_id, m.code, m.name,
+                SUM(GREATEST(q.quantity - q.issued, 0)) AS wanted, SUM(COALESCE(v.held, 0)) AS held
+           FROM cf_material_requirements q
+           JOIN cf_production_releases r ON r.id = q.release_id
+           JOIN cf_master_records m ON m.id = q.item_id
+           LEFT JOIN (SELECT v.requirement_id, SUM(v.quantity) AS held
+                        FROM cf_stock_reservations v
+                        JOIN cf_material_requirements q2 ON q2.id = v.requirement_id AND q2.release_id IN (?)
+                       WHERE v.company_id = ? AND v.status = 'active' AND v.deleted_at IS NULL
+                       GROUP BY v.requirement_id) v ON v.requirement_id = q.id
+          WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL
+          GROUP BY r.order_line_id, q.item_id, m.code, m.name
+          ORDER BY r.order_line_id, m.code, q.item_id`,
+        [releasedIds, companyId, companyId, releasedIds],
+      ) : [[]],
+    ]);
+    return { releases, planned, reqRows };
+  })();
 
   // 5b. The nesting actually saved against each line. cf_plate_lots is one row
   // per physical plate, so counting them is counting plates; the placements
   // under them are pieces. acceptNesting refuses a plan that does not cover
-  // every required piece, so lots existing means the line IS laid out.
-  const [lotRows] = lines.length ? await db.query(
-    `SELECT pl.order_line_id,
-            COUNT(*) AS lots,
-            SUM(pl.is_manual) AS manual_lots,
-            (SELECT COUNT(*) FROM cf_nest_placements np
-              WHERE np.company_id = pl.company_id AND np.plate_lot_id IN (
-                SELECT p2.id FROM cf_plate_lots p2
-                 WHERE p2.company_id = pl.company_id AND p2.order_line_id = pl.order_line_id AND p2.deleted_at IS NULL)
-                AND np.deleted_at IS NULL) AS pieces
-       FROM cf_plate_lots pl
-      WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
-      GROUP BY pl.order_line_id, pl.company_id`,
-    [companyId, lines.map((l) => l.id)],
-  ) : [[]];
-  // 5c. How many cut pieces a line already has. The Cut pieces stage is done
-  // when the rectangles exist; nesting is done when they are laid out. Two
-  // questions, two counts.
-  const [blankRows] = lines.length ? await db.query(
-    `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
-       FROM cf_master_records m
-       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
-       JOIN cf_classification_nodes n ON n.id = m.classification_id AND n.code = 'CUT_PLATE'
-      WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.owner_order_line_id IN (?)
-      GROUP BY i.owner_order_line_id`,
-    [companyId, lines.map((l) => l.id)],
-  ) : [[]];
+  // every required piece, so lots existing means the line IS laid out. 5d. What
+  // a saved layout no longer matches — nestingService.layoutDrift, the rule the
+  // Nesting screen shows, counted off the trees exploded in step 1. A piece
+  // count changed after nesting (a quantity, a removed part, the line quantity)
+  // makes it out of date, the same as a cut piece added or deleted: "done"
+  // would be a lie the buy list inherits.
+  const lotsStage = (async () => {
+    const [lotRows] = lines.length ? await db.query(
+      `SELECT pl.order_line_id,
+              COUNT(*) AS lots,
+              SUM(pl.is_manual) AS manual_lots,
+              (SELECT COUNT(*) FROM cf_nest_placements np
+                WHERE np.company_id = pl.company_id AND np.plate_lot_id IN (
+                  SELECT p2.id FROM cf_plate_lots p2
+                   WHERE p2.company_id = pl.company_id AND p2.order_line_id = pl.order_line_id AND p2.deleted_at IS NULL)
+                  AND np.deleted_at IS NULL) AS pieces
+         FROM cf_plate_lots pl
+        WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
+        GROUP BY pl.order_line_id, pl.company_id`,
+      [companyId, lineIds],
+    ) : [[]];
+    const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
+      lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
+    }]));
+    const driftBy = await layoutDriftOfLines(db, companyId, lines.filter((l) => (lotsBy.get(l.id)?.lots ?? 0) > 0).map((l) => l.id), trees);
+    return { lotsBy, driftBy };
+  })();
+
+  // 6. Specification chains for every item, the NESTING answer on each, and the
+  //    required values still empty.
+  const specStage = (async () => {
+    const [chains, [[nestSpec]]] = await Promise.all([
+      chainsFor(db, companyId, [...detail.values()].map((d) => ({
+        id: d.master_id, classification_id: d.classification_id, source_definition_id: d.source_definition_id,
+      }))),
+      db.query("SELECT id, data_type FROM cf_specifications WHERE company_id = ? AND code = ? AND deleted_at IS NULL", [companyId, NESTING_SPEC_CODE]),
+    ]);
+    const [nestingBy, values] = await Promise.all([
+      nestSpec && nestSpec.data_type === 'boolean' ? resolveBooleanSpec(db, companyId, nestSpec.id, chains) : new Map(),
+      missingRequiredValues(db, companyId, chains),
+    ]);
+    return { chains, nestSpec, nestingBy, values };
+  })();
+
+  const [
+    free, poRows, rel, lots, spec, [blankRows], [pieceRows], cut, [cutClassRows],
+  ] = await Promise.all([
+    // 3. Free stock, once, for every item that could be drawn from it.
+    itemIds.size ? availability(db, companyId, [...itemIds]) : new Map(),
+    // 4. What is already on order, so "short" can tell waiting from missing.
+    onOrderOf([...itemIds]),
+    releasesStage,
+    lotsStage,
+    specStage,
+    // 5c. How many cut pieces a line already has. The Cut pieces stage is done
+    // when the rectangles exist; nesting is done when they are laid out. Two
+    // questions, two counts.
+    lines.length ? db.query(
+      `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
+         FROM cf_master_records m
+         JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+         JOIN cf_classification_nodes n ON n.id = m.classification_id AND n.code = 'CUT_PLATE'
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.owner_order_line_id IN (?)
+        GROUP BY i.owner_order_line_id`,
+      [companyId, lineIds],
+    ) : [[]],
+    // 5e. What each locked line was rolled out into (cf_order_pieces): how many
+    //     pieces, and which BOM lines it made — a 'both' item follows the lock's
+    //     decision, not today's stock (rollOutService.madeRule).
+    lockedLines.length ? db.query(
+      `SELECT order_line_id, bom_line_id, COUNT(*) AS n FROM cf_order_pieces
+        WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL
+        GROUP BY order_line_id, bom_line_id`,
+      [companyId, lockedLines],
+    ) : [[]],
+    // 5f. The plate parts under every line and whether each has its cut piece —
+    //     lockService's question, so the stages and the Lock screen agree.
+    cutPieceGaps(db, companyId, temporaryIds),
+    // The classification a cut plate is filed under, so a selection hanging off
+    // one can be told from any other unfinished row.
+    db.query("SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = 'CUT_PLATE' AND deleted_at IS NULL", [companyId]),
+  ]);
+
+  const onOrder = new Map(poRows.map((r) => [r.item_id, Number(r.outstanding) || 0]));
+  const { releases, planned, reqRows } = rel;
+  const { lotsBy, driftBy } = lots;
+  const { chains, nestSpec, nestingBy, values } = spec;
   const cutPiecesBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
-
-  const lotsBy = new Map(lotRows.map((r) => [r.order_line_id, {
-    lots: Number(r.lots), pieces: Number(r.pieces), manual: Number(r.manual_lots ?? 0),
-  }]));
-
-  // 5e. What each locked line was rolled out into (cf_order_pieces): how many
-  //     pieces, and which BOM lines it made — a 'both' item follows the lock's
-  //     decision, not today's stock (rollOutService.madeRule).
-  const lockedLines = lines.filter((l) => l.locked_at).map((l) => l.id);
-  const [pieceRows] = lockedLines.length ? await db.query(
-    `SELECT order_line_id, bom_line_id, COUNT(*) AS n FROM cf_order_pieces
-      WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL
-      GROUP BY order_line_id, bom_line_id`,
-    [companyId, lockedLines],
-  ) : [[]];
   const locksBy = new Map(lockedLines.map((id) => [id, { pieces: 0, bomLines: new Set() }]));
   for (const r of pieceRows) {
     const e = locksBy.get(r.order_line_id);
     e.pieces += Number(r.n);
     if (r.bom_line_id != null) e.bomLines.add(Number(r.bom_line_id));
   }
-
-  // 5f. The plate parts under every line and whether each has its cut piece —
-  //     lockService's question, so the stages and the Lock screen agree.
-  const temporaryIds = [...itemIds].filter((id) => detail.get(id)?.item_type === 'temporary');
-  const cut = await cutPieceGaps(db, companyId, temporaryIds);
   const partById = new Map(cut.parts.map((p) => [p.id, p]));
-
-  // 5d. What a saved layout no longer matches — nestingService.layoutDrift, the
-  //     rule the Nesting screen shows, counted off the trees exploded in step 1.
-  //     A piece count changed after nesting (a quantity, a removed part, the
-  //     line quantity) makes it out of date, the same as a cut piece added or
-  //     deleted: "done" would be a lie the buy list inherits.
-  const driftBy = await layoutDriftOfLines(db, companyId,
-    lines.filter((l) => (lotsBy.get(l.id)?.lots ?? 0) > 0).map((l) => l.id), trees);
-
-  // 6. Specification chains for every item, and the NESTING answer on each.
-  const chains = await chainsFor(db, companyId, [...detail.values()].map((d) => ({
-    id: d.master_id, classification_id: d.classification_id, source_definition_id: d.source_definition_id,
-  })));
-  const [[nestSpec]] = await db.query(
-    "SELECT id, data_type FROM cf_specifications WHERE company_id = ? AND code = ? AND deleted_at IS NULL",
-    [companyId, NESTING_SPEC_CODE],
-  );
-  const nestingBy = nestSpec && nestSpec.data_type === 'boolean'
-    ? await resolveBooleanSpec(db, companyId, nestSpec.id, chains)
-    : new Map();
-
-  // The classification a cut plate is filed under, so a selection hanging off
-  // one can be told from any other unfinished row.
-  const [cutClassRows] = await db.query(
-    "SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = 'CUT_PLATE' AND deleted_at IS NULL",
-    [companyId],
-  );
   const cutClassIds = new Set(cutClassRows.map((r) => Number(r.id)));
-
   const labelOf = (id) => nameOf(detail.get(id));
-  const values = await missingRequiredValues(db, companyId, chains);
 
-  // 7. What Buying counts (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30) — the buy list's
-  //    own numbers: a frozen line not released has its PLANNED material (the
-  //    requirements release will write, in bulk — 3 round trips for any number
-  //    of lines) and whether it is ready (no cut plate still without a plate);
-  //    a released line has its requirements, with what is held for them.
-  const planned = await plannedMaterialOfLines(db, companyId,
-    lines.filter((l) => l.locked_at && !releases.has(l.id) && l.item_id));
-  const releasedIds = [...releases.values()].map((r) => r.id);
-  const [reqRows] = releasedIds.length ? await db.query(
-    `SELECT r.order_line_id, q.item_id, m.code, m.name,
-            SUM(GREATEST(q.quantity - q.issued, 0)) AS wanted, SUM(COALESCE(v.held, 0)) AS held
-       FROM cf_material_requirements q
-       JOIN cf_production_releases r ON r.id = q.release_id
-       JOIN cf_master_records m ON m.id = q.item_id
-       LEFT JOIN (SELECT v.requirement_id, SUM(v.quantity) AS held
-                    FROM cf_stock_reservations v
-                    JOIN cf_material_requirements q2 ON q2.id = v.requirement_id AND q2.release_id IN (?)
-                   WHERE v.company_id = ? AND v.status = 'active' AND v.deleted_at IS NULL
-                   GROUP BY v.requirement_id) v ON v.requirement_id = q.id
-      WHERE q.company_id = ? AND q.release_id IN (?) AND q.deleted_at IS NULL
-      GROUP BY r.order_line_id, q.item_id, m.code, m.name
-      ORDER BY r.order_line_id, m.code, q.item_id`,
-    [releasedIds, companyId, companyId, releasedIds],
-  ) : [[]];
   const requiredBy = new Map();                      // lineId -> [{ id, label, required, held }]
   for (const r of reqRows) {
     if (!requiredBy.has(r.order_line_id)) requiredBy.set(r.order_line_id, []);
@@ -1384,16 +1406,8 @@ async function loadOrderContext(db, companyId, order, lines) {
     ...[...planned.values()].flatMap((p) => p.reqs.map((q) => q.itemId)),
   ])].filter((id) => !itemIds.has(id));
   if (extra.length) {
-    for (const [id, v] of await availability(db, companyId, extra)) free.set(id, v);
-    const [ooRows] = await db.query(
-      `SELECT l.item_id, SUM(GREATEST(l.quantity - l.qty_received, 0)) AS outstanding
-         FROM cf_purchase_order_lines l
-         JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
-        WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
-          AND p.status IN ('draft','ordered','partially_received')
-        GROUP BY l.item_id`,
-      [companyId, extra],
-    );
+    const [more, ooRows] = await Promise.all([availability(db, companyId, extra), onOrderOf(extra)]);
+    for (const [id, v] of more) free.set(id, v);
     for (const r of ooRows) onOrder.set(r.item_id, Number(r.outstanding) || 0);
   }
 
@@ -1704,25 +1718,29 @@ function rollUp(stage, kind, perLine) {
  * one nobody notices for a month.
  */
 export async function orderProcess(db, companyId, orderId) {
-  const [[order]] = await db.query(
-    'SELECT * FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL',
-    [companyId, orderId],
-  );
+  // The order and its lines side by side: neither needs the other.
+  const [[[order]], [lines]] = await Promise.all([
+    db.query('SELECT * FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, orderId]),
+    db.query(
+      `SELECT l.*, m.code AS item_code, m.name AS item_name, m.status AS item_status
+         FROM cf_sales_order_lines l
+         LEFT JOIN cf_master_records m ON m.id = l.item_id
+        WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL
+        ORDER BY l.line_no, l.id`,
+      [companyId, orderId],
+    ),
+  ]);
   if (!order) throw notFound('Sales order');
-
-  const [lines] = await db.query(
-    `SELECT l.*, m.code AS item_code, m.name AS item_name, m.status AS item_status
-       FROM cf_sales_order_lines l
-       LEFT JOIN cf_master_records m ON m.id = l.item_id
-      WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL
-      ORDER BY l.line_no, l.id`,
-    [companyId, orderId],
-  );
   for (const l of lines) { l.code = l.item_code; l.name = l.item_name; }
 
   let process = null;
   let reason = null;
+  // A stamped order nearly always has its process, so its context starts
+  // reading beside the process (it does not need it); it is waited for below.
+  let ctxP = null;
   if (order.process_id) {
+    ctxP = loadOrderContext(db, companyId, order, lines);
+    ctxP.catch(() => { /* awaited below, or dropped with a deleted process */ });
     process = await getProcess(db, companyId, order.process_id).catch(() => null);
     if (!process) reason = 'The process this order was stamped with has been deleted.';
   } else {
@@ -1742,16 +1760,20 @@ export async function orderProcess(db, companyId, orderId) {
     .slice()
     .map((s) => ({ stage_key: s.stageKey, label: s.label, sequence: s.sequence, requirement: s.requirement, override_spec_id: s.overrideSpec?.id ?? null, override_spec_code: s.overrideSpec?.code ?? null }));
 
-  const ctx = await loadOrderContext(db, companyId, order, lines);
-
   // Each override specification, resolved once for every line's item. A stage
   // asks it of the LINE'S item — the thing being sold — not of everything
-  // underneath: this is the customer saying what THIS line needs.
-  const lineItemChains = await chainsFor(db, companyId, await lineItemsFor(db, companyId, lines));
-  const overrideValues = new Map();
-  for (const specId of [...new Set(stageRows.map((s) => s.override_spec_id).filter(Boolean))]) {
-    overrideValues.set(specId, await resolveBooleanSpec(db, companyId, specId, lineItemChains));
-  }
+  // underneath: this is the customer saying what THIS line needs. Read beside
+  // the order's context, which it does not need.
+  const overrides = (async () => {
+    const specIds = [...new Set(stageRows.map((s) => s.override_spec_id).filter(Boolean))];
+    const out = new Map();
+    if (!specIds.length) return out;
+    const lineItemChains = await chainsFor(db, companyId, await lineItemsFor(db, companyId, lines));
+    const values = await Promise.all(specIds.map((specId) => resolveBooleanSpec(db, companyId, specId, lineItemChains)));
+    specIds.forEach((specId, i) => out.set(specId, values[i]));
+    return out;
+  })();
+  const [ctx, overrideValues] = await Promise.all([ctxP ?? loadOrderContext(db, companyId, order, lines), overrides]);
 
   const perLine = lines.map((line) => {
     const lctx = lineContext(ctx, order, line);

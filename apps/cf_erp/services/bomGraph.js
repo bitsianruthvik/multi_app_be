@@ -76,6 +76,24 @@ export async function linesOfBoms(db, companyId, bomIds) {
   return rows;
 }
 
+/**
+ * linesOfBoms with each child's own live BOM header beside it (cb_id …; NULL
+ * when it has none) — one query per level of an explosion instead of two. A
+ * parent has at most ONE live BOM (uq_cbm_parent), so the join never repeats a line.
+ */
+export async function linesOfBomsWithChildBom(db, companyId, bomIds) {
+  if (!bomIds.length) return [];
+  const [rows] = await db.query(
+    `SELECT ${LINE_COLUMNS}, cb.id AS cb_id, cb.bom_type AS cb_bom_type, cb.status AS cb_status, cb.revision AS cb_revision
+       FROM cf_bom_lines l ${LINE_JOINS}
+       LEFT JOIN cf_boms cb ON cb.company_id = l.company_id AND cb.parent_id = l.child_id AND cb.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.bom_id IN (?) AND l.deleted_at IS NULL
+      ORDER BY l.bom_id, l.line_no, l.id`,
+    [companyId, bomIds],
+  );
+  return rows;
+}
+
 export async function loadLine(db, companyId, lineId) {
   const [[row]] = await db.query(
     `SELECT ${LINE_COLUMNS}, b.parent_id, b.bom_type, b.status AS bom_status

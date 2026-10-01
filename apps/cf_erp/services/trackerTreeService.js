@@ -43,6 +43,8 @@
  */
 import { invalid, notFound } from '../lib/errors.js';
 import { evaluatedTracker, shapeStep } from './releaseService.js';
+import { pool as sharedPool } from '../lib/db.js';
+import { cachedDerived, readOnce, rememberDerived, trackerCacheKey, trackerStamp } from '../lib/trackerCache.js';
 
 const round6 = (n) => Number(Number(n).toFixed(6));
 const fmt = (n) => String(round6(n));
@@ -197,7 +199,22 @@ function completionOf(agg) {
  */
 export async function buildTree(db, companyId, lines) {
   const releaseIds = lines.map((r) => r.release_id);
-  const data = releaseIds.length ? await evaluatedTracker(db, companyId, releaseIds) : null;
+  // On the shared pool the built tree is kept with the rows it came from
+  // (lib/trackerCache.js): a branch opened, the grid and the drawer re-read it
+  // for one stamp read instead of ~250 ms of building. Readers map it into new
+  // objects and never change it.
+  if (db === sharedPool && releaseIds.length) {
+    const key = `tree:${trackerCacheKey(companyId, releaseIds)}:${lines.map((l) => l.order_line_id).join(",")}`;
+    const stamp = await trackerStamp(db, companyId, releaseIds);
+    return cachedDerived(key, stamp)
+      ?? readOnce(`${key}|${stamp}`, async () => rememberDerived(key, stamp, await buildTreeFresh(db, companyId, lines, { stamp })));
+  }
+  return buildTreeFresh(db, companyId, lines);
+}
+
+async function buildTreeFresh(db, companyId, lines, opts = {}) {
+  const releaseIds = lines.map((r) => r.release_id);
+  const data = releaseIds.length ? await evaluatedTracker(db, companyId, releaseIds, opts) : null;
   const nodes = [];
   const byId = new Map();
   const childrenOf = new Map();
@@ -427,6 +444,209 @@ export async function trackerTreeChildren(db, companyId, q = {}) {
     if (n.level - node.level < depth) stack.push(...[...(tree.childrenOf.get(n.id) ?? [])].reverse());
   }
   return { node: finish([node], tree.childrenOf)[0], operations: tree.operations, nodes: finish(list, tree.childrenOf) };
+}
+
+// --- the order line's grid -------------------------------------------------------------
+//
+// User, 2026-10-01: "the same BOM structure to the left but just elongated on
+// the right codes and all the operations to the right like the grids from
+// other steps". The progress tree above, turned into a sheet for ONE released
+// line: rows are its frozen piece codes (line › span › girder line › segment ›
+// parts), columns its operations in flow order, a cell per piece per operation.
+//
+// A CELL is one of three things:
+//   own    — the piece has a step (or several passes) for that operation:
+//            { state, done, total, stepIds, ready?, reason?, passes?, below? }
+//            state is the tree's (done · running · partial · blocked · todo);
+//            passes are folded into one cell (done and total added up), `below`
+//            is the same operation further down the piece, when there is any.
+//   rollup — the piece has no step of its own for it but something under it
+//            does: { rollup: true, done, total } (count of pieces' operations
+//            done, as byOperation counts them).
+//   absent — the operation is in nobody's flow on this branch: the screen
+//            draws it hatched (n/a).
+// Same reads, same evaluate(), same states as the tree and the Steps tab.
+
+/**
+ * The line's operations in flow order: each piece's flow gives an order
+ * between its own operations, and a part is made before what it goes into, so
+ * deeper pieces' operations lean left. Kahn's sort over the flows' own
+ * sequences, ties (and the odd cycle between two flows) broken by that lean.
+ */
+export function operationOrder(items, stepsOf) {
+  const lean = new Map();          // op -> { sum, n, first }
+  const next = new Map();          // op -> Set(op)
+  let seen = 0;
+  for (const it of items) {
+    const ops = [];
+    for (const s of stepsOf.get(it.id) ?? []) if (!ops.includes(s.operation_id)) ops.push(s.operation_id);
+    ops.forEach((op, i) => {
+      const e = lean.get(op) ?? { sum: 0, n: 0, first: seen++ };
+      e.sum += -Number(it.depth ?? 0) + (ops.length > 1 ? (i / (ops.length - 1)) * 0.98 : 0);
+      e.n += 1;
+      lean.set(op, e);
+      if (!next.has(op)) next.set(op, new Set());
+      if (i + 1 < ops.length && ops[i + 1] !== op) next.get(op).add(ops[i + 1]);
+    });
+  }
+  const key = (op) => { const e = lean.get(op); return [e.sum / e.n, e.first]; };
+  const before = (a, b) => { const [x, xf] = key(a); const [y, yf] = key(b); return x !== y ? x - y : xf - yf; };
+  const indeg = new Map([...lean.keys()].map((op) => [op, 0]));
+  for (const [, to] of next) for (const t of to) indeg.set(t, indeg.get(t) + 1);
+  const left = new Set(lean.keys());
+  const out = [];
+  while (left.size) {
+    let pick = null;
+    for (const op of left) if (indeg.get(op) === 0 && (pick == null || before(op, pick) < 0)) pick = op;
+    if (pick == null) for (const op of left) if (pick == null || before(op, pick) < 0) pick = op;   // a cycle: the leanest goes first
+    left.delete(pick);
+    out.push(pick);
+    for (const t of next.get(pick) ?? []) if (left.has(t)) indeg.set(t, indeg.get(t) - 1);
+  }
+  return out;
+}
+
+const STATE_RANK = { blocked: 4, running: 3, partial: 2, todo: 1, done: 0 };
+
+/** One piece's steps for one operation, folded into a cell. */
+function ownCell(ops) {
+  const done = round6(ops.reduce((t, o) => t + o.done, 0));
+  const total = round6(ops.reduce((t, o) => t + o.total, 0));
+  let state;
+  if (ops.every((o) => o.state === 'done')) state = 'done';
+  else {
+    const worst = ops.reduce((w, o) => (o.state !== 'done' && STATE_RANK[o.state] > STATE_RANK[w] ? o.state : w), 'todo');
+    state = worst === 'todo' && ops.some((o) => o.done > 0) ? 'partial' : worst;
+  }
+  const cell = { state, done, total, stepIds: ops.map((o) => o.stepId) };
+  if (state === 'todo' && ops.some((o) => o.ready)) cell.ready = true;
+  const reason = ops.find((o) => o.state === 'blocked' && o.reason)?.reason;
+  if (state === 'blocked' && reason) cell.reason = reason;
+  if (ops.length > 1) cell.passes = ops.map((o) => ({ stepId: o.stepId, name: o.name ?? null, state: o.state, done: o.done, total: o.total }));
+  return cell;
+}
+
+/** Every node's cells, keyed by operation id. byOperation is the subtree INCLUDING the node's own steps; `below` takes them out again. */
+function cellsOf(node) {
+  const cells = {};
+  const own = new Map();
+  for (const o of node.ops) { if (!own.has(o.operationId)) own.set(o.operationId, []); own.get(o.operationId).push(o); }
+  const sub = new Map((node.byOperation ?? []).map((b) => [b.operationId, b]));
+  for (const [opId, ops] of own) {
+    const cell = ownCell(ops);
+    const b = sub.get(opId);
+    if (b) {
+      const d = round6(b.done - cell.done);
+      const t = round6(b.total - cell.total);
+      if (t > 0) cell.below = { done: d, total: t };
+    }
+    cells[opId] = cell;
+  }
+  for (const [opId, b] of sub) if (!own.has(opId) && b.total > 0) cells[opId] = { rollup: true, done: b.done, total: b.total };
+  return cells;
+}
+
+/** A tree node as a grid row: levels counted from the line (0), its cells instead of ops. */
+function gridRow(n, childrenOf, included) {
+  const row = {
+    id: n.id, parentId: n.kind === 'line' ? null : n.parentId, kind: n.kind, level: n.level - 1, code: n.code, name: n.name, qty: n.qty,
+    completion: n.completion, weight: n.weight, blockedCount: n.blockedCount, blockedReason: n.blockedReason, blockedAt: n.blockedAt,
+    running: n.running, childCount: n.childCount,
+    childrenIncluded: n.childCount === 0 || (childrenOf.get(n.id) ?? []).every((k) => included.has(k)),
+    cells: cellsOf(n),
+  };
+  if (n.kind === 'piece') { row.pieceNo = n.pieceNo; row.basis = n.basis; row.itemId = n.itemId; row.ownSteps = n.ops.length; }
+  return row;
+}
+
+/** Levels returned by default, counted below the line: the top pieces and the level under them (KEPL: 2 spans, 110 girder lines and sets). */
+export const GRID_DEFAULT_DEPTH = 2;
+/** The most open branches one grid read brings back. */
+export const GRID_OPEN_CAP = 400;
+
+async function gridTree(db, companyId, lineId) {
+  if (!Number.isInteger(lineId) || lineId <= 0) throw invalid('lineId is a number.');
+  const all = await releasedLines(db, companyId);
+  const lines = all.filter((l) => l.order_line_id === lineId);
+  const tree = await buildTree(db, companyId, lines);
+  return { lines, tree };
+}
+
+function gridOperations(tree, lineNode) {
+  if (!tree.data) return [];
+  const order = operationOrder(tree.data.items, tree.data.stepsOf);
+  const byOp = new Map((lineNode?.byOperation ?? []).map((b) => [b.operationId, b]));
+  return order.map((id) => ({ id, code: tree.operations[id]?.code ?? null, name: tree.operations[id]?.name ?? `Operation ${id}`, done: byOp.get(id)?.done ?? 0, total: byOp.get(id)?.total ?? 0 }));
+}
+
+/**
+ * GET /tracker/grid?lineId=&depth=&open= — one released line as a grid (see
+ * above). depth = levels below the line returned (default GRID_DEFAULT_DEPTH,
+ * at most 50 = all); open = node ids (comma-separated, up to GRID_OPEN_CAP)
+ * whose children come too — the screen re-reads everything it has open in ONE
+ * call after work is recorded. /tracker/grid/children fills a branch in. A
+ * line not released answers released: false and nothing else.
+ */
+export async function lineGrid(db, companyId, q = {}) {
+  const lineId = Number(q.lineId);
+  const { lines, tree } = await gridTree(db, companyId, lineId);
+  const line = lines[0];
+  const lineNode = tree.byId.get(`l${lineId}`);
+  if (!line || !lineNode) return { lineId, released: false, operations: [], nodes: [], summary: null, total: 0, returned: 0, depth: 0, basisNote: BASIS_NOTE };
+  const depth = intOr(q.depth, GRID_DEFAULT_DEPTH);
+  const open = new Set(blank(q.open) ? [] : String(q.open).split(',').map((x) => x.trim()).filter(Boolean).slice(0, GRID_OPEN_CAP));
+  // Depth-first, so a parent is decided before its children: a child of an open node comes when its parent does.
+  const list = [];
+  const included = new Set();
+  for (const n of tree.nodes) {
+    if (n.kind === 'order') continue;
+    if (n.level - 1 <= depth || (open.has(n.parentId) && included.has(n.parentId))) { list.push(n); included.add(n.id); }
+  }
+  let ready = 0;
+  let notReady = 0;
+  for (const s of tree.data.steps) { if (s._status === 'ready') ready += 1; else if (s._status === 'not_ready') notReady += 1; }
+  return {
+    lineId,
+    released: true,
+    releaseId: line.release_id,
+    order: { id: line.order_id, code: line.order_code, status: line.order_status },
+    summary: { ...summaryOf(tree), ready, notReady },
+    operations: gridOperations(tree, lineNode),
+    depth,
+    total: tree.nodes.length - 1,
+    returned: list.length,
+    basisNote: BASIS_NOTE,
+    nodes: list.map((n) => gridRow(n, tree.childrenOf, included)),
+  };
+}
+
+/** GET /tracker/grid/children?nodeId=&depth= — a branch of the grid: the node itself (fresh) and its descendants `depth` levels down (default 1). */
+export async function lineGridChildren(db, companyId, q = {}) {
+  const m = /^([lp])(\d+)$/.exec(String(q.nodeId ?? ''));
+  if (!m) throw invalid('nodeId is l<line id> or p<piece id>.');
+  let lineId = Number(m[2]);
+  if (m[1] === 'p') {
+    const [[it]] = await db.query(
+      `SELECT r.order_line_id FROM cf_production_items pi JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+        WHERE pi.company_id = ? AND pi.id = ? AND pi.deleted_at IS NULL`,
+      [companyId, Number(m[2])],
+    );
+    if (!it) throw notFound('Tracker piece');
+    lineId = it.order_line_id;
+  }
+  const { tree } = await gridTree(db, companyId, lineId);
+  const node = tree.byId.get(String(q.nodeId));
+  if (!node) throw notFound('Tracker node');
+  const depth = intOr(q.depth, 1);
+  const list = [];
+  const stack = [...(tree.childrenOf.get(node.id) ?? [])].reverse();
+  while (stack.length) {
+    const n = tree.byId.get(stack.pop());
+    list.push(n);
+    if (n.level - node.level < depth) stack.push(...[...(tree.childrenOf.get(n.id) ?? [])].reverse());
+  }
+  const included = new Set([node.id, ...list.map((n) => n.id)]);
+  return { node: gridRow(node, tree.childrenOf, included), nodes: list.map((n) => gridRow(n, tree.childrenOf, included)) };
 }
 
 /** GET /tracker/tree/node?nodeId=p… — one piece: its node and every step in full, as the tracker shapes them (waits, blockers, actions). */

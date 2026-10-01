@@ -19,7 +19,7 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import {
-  bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, loadLine, childKindOf, descendantIds,
+  bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, linesOfBomsWithChildBom, loadLine, childKindOf, descendantIds,
   createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf,
 } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
@@ -416,8 +416,8 @@ export async function reviseBom(db, c, parentId, input = {}) {
  * the quantities above it, starting from rootQuantity (a sales line's).
  */
 export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15 } = {}) {
-  const root = await requireMaster(db, companyId, rootId);
-  const rootBom = await bomOfParent(db, companyId, rootId);
+  // Side by side; and below, one read per level (the children's BOMs come with their lines).
+  const [root, rootBom] = await Promise.all([requireMaster(db, companyId, rootId), bomOfParent(db, companyId, rootId)]);
   const [[rf]] = await db.query(
     `SELECT f.id AS child_flow_id, f.code AS child_flow_code, f.name AS child_flow_name,
             df.id AS def_flow_id, df.code AS def_flow_code, df.name AS def_flow_name
@@ -454,11 +454,10 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
       if (!byParent.has(n.bom.id)) byParent.set(n.bom.id, []);
       byParent.get(n.bom.id).push(n);
     }
-    const lines = await linesOfBoms(db, companyId, [...byParent.keys()]);
-    const childBoms = await bomsOfParents(db, companyId, [...new Set(lines.map((l) => l.child_id))]);
+    const lines = await linesOfBomsWithChildBom(db, companyId, [...byParent.keys()]);
     const next = [];
     for (const l of lines) {
-      const cb = childBoms.get(l.child_id);
+      const cb = l.cb_id ? { id: l.cb_id, bom_type: l.cb_bom_type, status: l.cb_status, revision: l.cb_revision } : null;
       const kind = childKindOf(l);
       const copies = byParent.get(l.bom_id) ?? [];
       for (const [i, parentNode] of copies.entries()) {
