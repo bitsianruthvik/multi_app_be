@@ -27,6 +27,8 @@
  *      money (rate × weight), period gain
  *   6. risk rules, pure
  *   7. round trips: a fixed handful whatever the size (the KEPL line: ~17k steps)
+ *   6b. work orders: contractors, cells, steps, partial completion, overdue, contractor summary,
+ *      the period's progress, full tree rows, round trips
  *   8. permission (HTTP): production view reads both; orders view gets money
  */
 import express from 'express';
@@ -386,9 +388,107 @@ try {
   ok('line progress: step count below that', D.lineProgress([{ steps: 10, withEst: 7, estTotal: 100, estDone: 25, countDone: 5 }]).pct === 50);
 
   /* ------------------------------------------------------------------------ */
+  section('6b. Work orders: contractors, cells, steps, completion');
+  const tag = `DWO${Date.now().toString(36).toUpperCase()}`;
+  // Own the fixture: no other work order is live inside this transaction.
+  await conn.query('UPDATE cf_work_order_cells SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
+  await conn.query('UPDATE cf_production_steps SET work_order_id = NULL WHERE company_id = ? AND work_order_id IS NOT NULL', [COMPANY]);
+  await conn.query('UPDATE cf_work_orders SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
+  const ins = async (table, body) => (await conn.query(`INSERT INTO ${table} SET ?`, body))[0].insertId;
+  const cA = await ins('cf_parties', { company_id: COMPANY, code: `${tag}-A`, name: `${tag} Alpha Fab`, is_subcontractor: 1 });
+  const cB = await ins('cf_parties', { company_id: COMPANY, code: `${tag}-B`, name: `${tag} Beta Welding`, is_subcontractor: 1 });
+  const mkWo = (n, contractor, status, due, start = null) => ins('cf_work_orders', { company_id: COMPANY, code: `${tag}-${n}`, order_id: line.order_id, order_line_id: LINE, contractor_id: contractor, status, due_date: due, start_date: start });
+  const wo1 = await mkWo(1, cA, 'in_progress', addDays(today, -3), addDays(today, -20));
+  const wo2 = await mkWo(2, cB, 'issued', addDays(today, 10));
+  const wo3 = await mkWo(3, cA, 'draft', null);
+  const wo4 = await mkWo(4, cB, 'done', addDays(today, -30));
+  await mkWo(5, cB, 'cancelled', null);
+  const freeAll = await qa(
+    `SELECT s.id, s.quantity, s.operation_id, pi.order_piece_id FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
+      WHERE pi.release_id = ? AND pi.order_piece_id IS NOT NULL AND s.deleted_at IS NULL AND pi.deleted_at IS NULL AND s.state = 'pending' AND s.qty_good = 0
+      ORDER BY s.id LIMIT 400`, [rel.id]);
+  // One step per (piece, operation) cell, from different pieces.
+  const seenCell = new Set();
+  const free = freeAll.filter((s) => { const k = `${s.order_piece_id}:${s.operation_id}`; if (seenCell.has(k)) return false; seenCell.add(k); return true; });
+  ok('the release has pending steps on locked pieces to hand out', free.length >= 12, String(free.length));
+  const [a, b, cc, d, e, f, g, h, k] = free;
+  const give = async (woId, rows) => {
+    for (const s of rows) {
+      await conn.query('UPDATE cf_production_steps SET work_order_id = ? WHERE id = ?', [woId, s.id]);
+      await ins('cf_work_order_cells', { company_id: COMPANY, work_order_id: woId, order_line_id: LINE, order_piece_id: s.order_piece_id, operation_id: s.operation_id });
+    }
+  };
+  // WO1: one step done, one half made, one not started -> (1 + 0.5 + 0) / 3 = 50 %.
+  await give(wo1, [a, b, cc]);
+  await conn.query("UPDATE cf_production_steps SET state = 'done', qty_good = quantity, started_at = ?, finished_at = ? WHERE id = ?", [`${today} 07:00:00`, `${today} 09:00:00`, a.id]);
+  await conn.query("UPDATE cf_production_steps SET state = 'in_progress', qty_good = quantity / 2, started_at = ? WHERE id = ?", [`${addDays(today, -2)} 08:00:00`, b.id]);
+  // WO2: two untouched steps -> 0 %.
+  await give(wo2, [d, e]);
+  // WO4 (done): one finished step.
+  await give(wo4, [f]);
+  await conn.query("UPDATE cf_production_steps SET state = 'done', qty_good = quantity, started_at = ?, finished_at = ? WHERE id = ?", [`${addDays(today, -40)} 08:00:00`, `${addDays(today, -39)} 08:00:00`, f.id]);
+  // WO3 (draft): cells only, no steps carry it -> not released.
+  for (const s of [g, h, k]) await ins('cf_work_order_cells', { company_id: COMPANY, work_order_id: wo3, order_line_id: LINE, order_piece_id: s.order_piece_id, operation_id: s.operation_id });
+  // Progress events: today (in the period) and 30 days ago.
+  const ev = (step, qty, at) => ins('cf_step_events', { company_id: COMPANY, step_id: step.id, event: 'progress', qty_good: qty, at });
+  await ev(a, Number(a.quantity), `${today} 09:00:00`);
+  await ev(b, Number(b.quantity) / 2, `${today} 10:00:00`);
+  await ev(d, Number(d.quantity) / 4, `${addDays(today, -30)} 10:00:00`);
+
+  const wd = await D.workOrdersDashboard(conn, COMPANY, { from: addDays(today, -5), to: today });
+  report.workOrders = wd.meta;
+  const byCode = (n) => wd.workOrders.find((w) => w.code === `${tag}-${n}`);
+  const W1 = byCode(1); const W2 = byCode(2); const W3 = byCode(3); const W4 = byCode(4);
+  ok('four work orders listed (the cancelled one is not)', wd.workOrders.length === 4 && !byCode(5), String(wd.workOrders.length));
+  ok('each carries its contractor, order and line', W1.contractor.id === cA && W1.contractor.name === `${tag} Alpha Fab` && W1.order.id === line.order_id && W1.line.id === LINE && W1.line.lineNo === line.line_no);
+  ok('operations: assigned cells, released steps, done', W1.operations.assigned === 3 && W1.operations.steps === 3 && W1.operations.done === 1 && W1.operations.inProgress === 1, JSON.stringify(W1.operations));
+  ok('completion counts a partial step by its share: (1 + 0.5 + 0) / 3 = 50 %', near(W1.operations.pct, 50, 0.11), String(W1.operations.pct));
+  ok('an untouched work order is 0 %, not null', W2.operations.pct === 0 && W2.operations.steps === 2 && W2.released === true);
+  ok('a work order whose steps are not on it says not released: pct null, cells counted', W3.released === false && W3.operations.pct === null && W3.operations.assigned === 3 && W3.operations.steps === 0);
+  ok('pieces = distinct pieces of its cells', W1.pieces === new Set([a, b, cc].map((s) => s.order_piece_id)).size);
+  ok('overdue: open and the due date has passed (3 days)', W1.overdue === true && W1.daysOverdue === 3 && W2.overdue === false && W3.overdue === false);
+  ok('a done work order past its date is not overdue; it is 100 %', W4.overdue === false && W4.open === false && W4.operations.pct === 100);
+  ok('first started is the earliest step start; last activity the latest', W1.firstStartedAt === `${addDays(today, -2)}T08:00:00` && String(W1.lastActivityAt).startsWith(today), `${W1.firstStartedAt} / ${W1.lastActivityAt}`);
+  ok('work done this period = progress events in the period (1 + 0.5)', near(W1.period.opsDone, 1.5, 0.002) && W1.period.stepsTouched === 2, JSON.stringify(W1.period));
+  ok('progress outside the period is not counted (30 days ago)', W2.period.opsDone === 0);
+  const wdLong = await D.workOrdersDashboard(conn, COMPANY, { from: addDays(today, -60), to: today });
+  ok('...but a longer period takes it in (a quarter of a step)', near(wdLong.workOrders.find((w) => w.code === `${tag}-2`).period.opsDone, 0.25, 0.002));
+  ok('per-operation rows add up to the work order', W1.byOperation.reduce((t, x) => t + x.assigned, 0) === W1.operations.assigned
+    && W1.byOperation.reduce((t, x) => t + x.steps, 0) === W1.operations.steps && W1.byOperation.every((x) => x.code && x.name));
+  ok('sorted: overdue first, then open by least complete, done last', wd.workOrders[0].id === wo1 && wd.workOrders.at(-1).id === wo4, wd.workOrders.map((w) => w.code.slice(-1)).join(''));
+  const cs = (id) => wd.contractors.find((x) => x.id === id);
+  ok('contractor summary: Alpha has WO1 + WO3, Beta WO2 + WO4', wd.contractors.length === 2 && cs(cA).workOrders === 2 && cs(cB).workOrders === 2 && cs(cA).open === 2 && cs(cB).open === 1);
+  ok('contractor completion pools the steps: Alpha (1.5 of 3) = 50 %; Beta (0 + 1 of 3) = 33.3 %', near(cs(cA).pct, 50, 0.11) && near(cs(cB).pct, 33.3, 0.11), `${cs(cA).pct} ${cs(cB).pct}`);
+  ok('contractor: overdue and ops done this period', cs(cA).overdue === 1 && cs(cB).overdue === 0 && near(cs(cA).periodOps, 1.5, 0.002));
+  ok('plant strip: open 3, contractors active 2 (issued / in progress), overdue 1, not released 1', wd.plant.open === 3 && wd.plant.workOrders === 4 && wd.plant.contractorsActive === 2 && wd.plant.overdue === 1 && wd.plant.notReleased === 1, JSON.stringify(wd.plant));
+  ok('plant strip: ops assigned 3+2+3+1, released 3+2+1, done 2, % pools the steps', wd.plant.operationsAssigned === 9 && wd.plant.operationsReleased === 6 && wd.plant.operationsDone === 2 && near(wd.plant.pct, ((1.5 + 0 + 1) / 6) * 100, 0.11), JSON.stringify(wd.plant));
+  ok('no value is invented: work orders carry no amount', wd.plant.value === null);
+  ok(`work orders: ≤ 8 reads in 2 stages whatever the count (took ${wd.meta.queries} in ${wd.meta.stages})`, wd.meta.queries <= 8 && wd.meta.stages <= 2);
+  let wdBad = null;
+  try { await D.workOrdersDashboard(conn, COMPANY, { from: '2026-13-01' }); } catch (err) { wdBad = err; }
+  ok('a bad date is refused (422)', wdBad?.status === 422, wdBad?.message);
+
+  const tr = await D.orderTreeRows(conn, COMPANY);
+  const [[trCount]] = await conn.query(
+    `SELECT COUNT(*) AS n FROM cf_production_items pi JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+       JOIN cf_sales_orders o ON o.id = r.order_id AND o.status = 'confirmed' AND o.deleted_at IS NULL WHERE pi.company_id = ? AND pi.deleted_at IS NULL`, [COMPANY]);
+  ok('full tree rows: every production item of the confirmed order, one row each', tr.rows.length === Number(trCount.n) && tr.rows.length > 50, `${tr.rows.length} vs ${trCount.n}`);
+  ok('tree rows: roots have no parent; a child names its parent\'s code', tr.rows.some((x) => x.parentCode === null && x.level === 0) && tr.rows.some((x) => x.parentCode && x.level > 0)
+    && tr.rows.every((x) => x.orderCode === line.order_code));
+  const stepSum = tr.rows.reduce((t, x) => t + x.steps, 0);
+  const [[stepCount]] = await conn.query(
+    'SELECT COUNT(*) AS n FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL WHERE s.company_id = ? AND pi.release_id = ? AND s.deleted_at IS NULL', [COMPANY, rel.id]);
+  ok('tree rows: steps add up to the release\'s steps', stepSum === Number(stepCount.n), `${stepSum} vs ${stepCount.n}`);
+  ok(`tree rows: 2 reads in 2 stages (took ${tr.meta.queries})`, tr.meta.queries <= 3 && tr.meta.stages <= 2);
+
+  /* ------------------------------------------------------------------------ */
   section('7. Round trips (whatever the number of machines, orders or steps)');
   const w1 = await D.machinesDashboard(conn, COMPANY, { from: addDays(today, -29), to: today });
   const w2 = await D.ordersDashboard(conn, COMPANY, { from: addDays(today, -29), to: today });
+  ok('the days carry what the download needs: ops / pieces add up to the machine, reasons by day add up to its stop reasons',
+    w1.machines.every((m) => m.days.reduce((t, x) => t + x.ops, 0) === m.output.operationsDone && Math.abs(m.days.reduce((t, x) => t + x.pieces, 0) - m.output.piecesGood) < 0.01
+      && m.days.every((x) => typeof x.stopIn === 'number' && typeof x.notRecorded === 'number' && x.reasons && typeof x.reasons === 'object'))
+    && w1.machines.some((m) => m.days.some((x) => Object.keys(x.reasons).length > 0)));
   ok(`GET machines: ≤ 11 reads in ≤ 2 stages (took ${w1.meta.queries} in ${w1.meta.stages})`, w1.meta.queries <= 11 && w1.meta.stages <= 2);
   ok(`GET orders: ≤ 15 reads in ≤ 3 stages (took ${w2.meta.queries} in ${w2.meta.stages})`, w2.meta.queries <= 15 && w2.meta.stages <= 3);
   console.log(`  machines (30 days, ${w1.machines.length} machines): ${w1.meta.queries} reads, ${w1.meta.stages} stages, ${w1.meta.ms} ms`);
@@ -417,6 +517,12 @@ try {
   ok('with orders view too, the money is there', ordersBoth.status === 200 && ordersBoth.body.withMoney === true);
   ok('a floor-only tablet sees neither', (await get('/dashboard/machines', ['cf_erp_floor'])).status === 403 && (await get('/dashboard/orders', ['cf_erp_floor'])).status === 403);
   ok('a bad date is a 422', (await get('/dashboard/machines?from=2026-13-01', pv)).status === 422);
+  const woHttp = await get(`/dashboard/work-orders?from=${addDays(today, -5)}&to=${today}`, pv);
+  ok('production view reads the work orders tab', woHttp.status === 200 && Array.isArray(woHttp.body.workOrders) && !!woHttp.body.plant && woHttp.body.meta.queries <= 8);
+  ok('orders view alone also opens it; a floor-only tablet gets 403; a bad date 422',
+    (await get('/dashboard/work-orders', ['cf_erp_orders_view'])).status === 200 && (await get('/dashboard/work-orders', ['cf_erp_floor'])).status === 403
+    && (await get('/dashboard/work-orders?to=nope', pv)).status === 422);
+  ok('the full tree download is the same gate', (await get('/dashboard/orders/tree-rows', pv)).status === 200 && (await get('/dashboard/orders/tree-rows', ['cf_erp_floor'])).status === 403);
 } catch (e) {
   console.error(e);
   exitCode = 1;

@@ -3,6 +3,8 @@
  *
  *   GET /dashboard/machines?from=YYYY-MM-DD&to=YYYY-MM-DD   by machine (default this week, ≤ 92 days)
  *   GET /dashboard/orders?from=&to=                          by confirmed order; from/to set "this period"
+ *   GET /dashboard/work-orders?from=&to=                     by contractor work order
+ *   GET /dashboard/orders/tree-rows                          every piece/part of every released line, flat (the full download)
  *
  * Permission: production view (or manage) for both — what management already
  * holds to see machines, the plan and the tracker. The orders tab also opens
@@ -13,7 +15,7 @@ import { Router } from 'express';
 import { pool } from '../lib/db.js';
 import { PERM, guardAny, handle, ctx } from '../lib/http.js';
 import { isPermitted } from '../../../core/middleware/requirePerm.js';
-import { machinesDashboard, ordersDashboard } from '../services/dashboardService.js';
+import { machinesDashboard, ordersDashboard, workOrdersDashboard, orderTreeRows } from '../services/dashboardService.js';
 
 const router = Router();
 
@@ -21,5 +23,10 @@ router.get('/dashboard/machines', guardAny(PERM.productionView, PERM.production)
   handle((req) => machinesDashboard(pool, ctx(req).companyId, req.query)));
 router.get('/dashboard/orders', guardAny(PERM.productionView, PERM.production, PERM.ordersView),
   handle((req) => ordersDashboard(pool, ctx(req).companyId, req.query, { withMoney: isPermitted(req.user, PERM.ordersView) })));
+
+router.get('/dashboard/work-orders', guardAny(PERM.productionView, PERM.production, PERM.ordersView),
+  handle((req) => workOrdersDashboard(pool, ctx(req).companyId, req.query)));
+router.get('/dashboard/orders/tree-rows', guardAny(PERM.productionView, PERM.production, PERM.ordersView),
+  handle((req) => orderTreeRows(pool, ctx(req).companyId)));
 
 export default router;

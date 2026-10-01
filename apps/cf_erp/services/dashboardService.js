@@ -507,16 +507,21 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       // Anything this day owns lies between its midnight and the one after next (a night shift).
       const dLo = wms(`${d} 00:00:00`);
       const dHi = dLo + 2 * DAY_MS;
+      const dayReasons = {};
       for (const x of sts) {
         if (x.e <= dLo || x.s >= dHi) continue;
         const part = total(intersect(union([[x.s, Math.min(x.e, nowW)]]), past));
         if (part <= 0) continue;
+        dayReasons[x.reason_id] = (dayReasons[x.reason_id] ?? 0) + part;
         const r = reasons.get(x.reason_id) ?? { id: x.reason_id, code: x.reason_code, label: x.reason_label, minutes: 0, count: 0 };
         r.minutes += part;
         r.count += 1;
         reasons.set(x.reason_id, r);
       }
       let dayTonnes = 0;
+      let dayDone = 0;
+      let dayGood = 0;
+      let dayScrap = 0;
       for (const x of ses) {
         if (x.e <= dLo || x.s >= dHi) continue;
         const part = total(intersect(union([[x.s, Math.min(x.e, nowW)]]), past));
@@ -533,7 +538,9 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
         const good = Number(x.qty_good);
         acc.good += good;
         acc.scrap += Number(x.qty_scrap);
-        if (x.end_kind === 'done') acc.done += 1;
+        dayGood += good;
+        dayScrap += Number(x.qty_scrap);
+        if (x.end_kind === 'done') { acc.done += 1; dayDone += 1; }
         if (good > EPS) {
           acc.qtySessions += 1;
           const kg = kgOf(x);
@@ -545,7 +552,12 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
         }
       }
       acc.tonnes += dayTonnes;
-      series.push({ date: d, shift: Math.round(shift), run: mins(run), runIn: mins(runIn), stop: mins(stop), overtime: mins(overtime), tonnes: r3(dayTonnes) });
+      series.push({
+        date: d, shift: Math.round(shift), run: mins(run), runIn: mins(runIn), stop: mins(stop), overtime: mins(overtime), tonnes: r3(dayTonnes),
+        // For the download: stop minutes inside the shift, shift time nobody recorded, what was made, and each reason's minutes.
+        stopIn: mins(stopIn), notRecorded: mins(notRecorded), ops: dayDone, pieces: r3(dayGood), scrap: r3(dayScrap),
+        reasons: Object.fromEntries(Object.entries(dayReasons).map(([id, ms]) => [id, mins(ms)])),
+      });
       const pd = plantDays.get(d);
       pd.shift += shift; pd.run += run / MIN; pd.runIn += runIn / MIN; pd.stop += stop / MIN; pd.overtime += overtime / MIN; pd.tonnes += dayTonnes;
     }
@@ -1167,4 +1179,246 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     orders,
     meta: { ...meta, ms: Date.now() - t0 },
   };
+}
+
+/* =====================================================================================
+ * BY WORK ORDER (2026-10-01)
+ * ================================================================================== */
+
+/** A work order still open: its contractor may be working on it. */
+const WO_OPEN = new Set(['draft', 'issued', 'in_progress']);
+/** A work order a contractor has been handed (not a draft nobody issued). */
+const WO_ACTIVE = new Set(['issued', 'in_progress']);
+const pctOf = (done, of) => (of > 0 ? r1((done / of) * 100) : null);
+
+/**
+ * GET /dashboard/work-orders?from=&to= — every live work order that is not
+ * cancelled, with how far its operations are. Cells (piece x operation) say what
+ * was ASSIGNED; the tracker's steps carrying work_order_id say what is done
+ * (done = step done, partial = qty_good / quantity, so a half-made step counts
+ * half). A work order on a line that is not released yet has cells and no steps:
+ * its completion is null ("not released"), never 0 %. Work orders carry no rate
+ * or amount in the schema, so there is no value here. "Done this period" is the
+ * progress events recorded on its steps inside the period (qty_good / step quantity).
+ *
+ * ROUND TRIPS: the plant zone, then ONE parallel stage of 7 set-based reads
+ * (work orders, cells by work order x operation, pieces by work order, steps by
+ * work order x operation, progress in the period, last activity, operations) — 8
+ * whatever the number of work orders. No subquery in any JOIN ... ON (TiDB).
+ */
+export async function workOrdersDashboard(dbIn, companyId, q = {}) {
+  const t0 = Date.now();
+  const { db, meta, stage } = counted(dbIn);
+  stage();
+  const tz = await plantZone(db, companyId);
+  const { todayS, nowText } = plantNow(tz);
+  const { from, to, days } = readPeriod(q, todayS);
+  const sec = (wall) => Math.floor(epochOfWall(wall, tz) / 1000);
+  const fromSec = sec(`${from} 00:00:00`);
+  const toSec = sec(`${addDays(to, 1)} 00:00:00`);
+
+  stage();
+  const [[wos], [cellRows], [pieceRows], [stepRows], [periodRows], [lastRows], [ops]] = await Promise.all([
+    db.query(
+      `SELECT w.id, w.code, w.status, w.start_date, w.due_date, w.notes, w.contractor_id, p.code AS contractor_code, p.name AS contractor_name,
+              w.order_id, o.code AS order_code, o.revision, o.title AS order_title, o.status AS order_status,
+              w.order_line_id, l.line_no, mr.code AS item_code, mr.name AS item_name
+         FROM cf_work_orders w
+         JOIN cf_parties p ON p.id = w.contractor_id
+         JOIN cf_sales_orders o ON o.id = w.order_id
+         JOIN cf_sales_order_lines l ON l.id = w.order_line_id
+         LEFT JOIN cf_master_records mr ON mr.id = l.item_id
+        WHERE w.company_id = ? AND w.deleted_at IS NULL AND w.status <> 'cancelled'`,
+      [companyId],
+    ),
+    db.query(
+      `SELECT c.work_order_id, c.operation_id, COUNT(*) AS cells
+         FROM cf_work_order_cells c WHERE c.company_id = ? AND c.deleted_at IS NULL GROUP BY c.work_order_id, c.operation_id`,
+      [companyId],
+    ),
+    db.query(
+      `SELECT c.work_order_id, COUNT(DISTINCT c.order_piece_id) AS pieces
+         FROM cf_work_order_cells c WHERE c.company_id = ? AND c.deleted_at IS NULL GROUP BY c.work_order_id`,
+      [companyId],
+    ),
+    db.query(
+      `SELECT s.work_order_id, s.operation_id, COUNT(*) AS steps, SUM(s.state = 'done') AS done, SUM(s.state = 'in_progress') AS in_progress,
+              SUM(s.state = 'on_hold') AS on_hold,
+              SUM(IF(s.state = 'done', 1, LEAST(1, COALESCE(s.qty_good / NULLIF(s.quantity, 0), 0)))) AS frac,
+              MIN(s.started_at) AS first_started, MAX(COALESCE(s.finished_at, s.started_at)) AS last_at
+         FROM cf_production_steps s
+         JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id AND pi.deleted_at IS NULL
+        WHERE s.company_id = ? AND s.work_order_id IS NOT NULL AND s.deleted_at IS NULL
+        GROUP BY s.work_order_id, s.operation_id`,
+      [companyId],
+    ),
+    db.query(
+      `SELECT s.work_order_id, s.operation_id, SUM(e.qty_good / NULLIF(s.quantity, 0)) AS ops, COUNT(DISTINCT e.step_id) AS steps_touched
+         FROM (SELECT step_id, qty_good, UNIX_TIMESTAMP(COALESCE(at, created_at)) AS t FROM cf_step_events
+                WHERE company_id = ? AND event = 'progress' AND COALESCE(at, created_at) >= FROM_UNIXTIME(?)) e
+         JOIN cf_production_steps s ON s.id = e.step_id AND s.work_order_id IS NOT NULL AND s.deleted_at IS NULL
+        WHERE e.t < ?
+        GROUP BY s.work_order_id, s.operation_id`,
+      [companyId, fromSec, toSec],
+    ),
+    db.query(
+      `SELECT s.work_order_id, MAX(COALESCE(e.at, e.created_at)) AS last_event
+         FROM cf_step_events e
+         JOIN cf_production_steps s ON s.id = e.step_id AND s.work_order_id IS NOT NULL AND s.deleted_at IS NULL
+        WHERE e.company_id = ? AND e.event IN ('start', 'progress')
+        GROUP BY s.work_order_id`,
+      [companyId],
+    ),
+    db.query('SELECT id, code, name FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+  ]);
+
+  const opOf = new Map(ops.map((o) => [o.id, o]));
+  const by = new Map(wos.map((w) => [w.id, { cells: new Map(), steps: new Map(), period: new Map(), pieces: 0, lastEvent: null }]));
+  for (const r of cellRows) by.get(r.work_order_id)?.cells.set(r.operation_id, Number(r.cells));
+  for (const r of pieceRows) { const b = by.get(r.work_order_id); if (b) b.pieces = Number(r.pieces); }
+  for (const r of stepRows) by.get(r.work_order_id)?.steps.set(r.operation_id, r);
+  for (const r of periodRows) by.get(r.work_order_id)?.period.set(r.operation_id, r);
+  for (const r of lastRows) { const b = by.get(r.work_order_id); if (b) b.lastEvent = dbWall(r.last_event); }
+
+  const workOrders = wos.map((w) => {
+    const b = by.get(w.id);
+    const opIds = [...new Set([...b.cells.keys(), ...b.steps.keys()])];
+    const byOperation = opIds.map((id) => {
+      const s = b.steps.get(id);
+      const p = b.period.get(id);
+      const steps = Number(s?.steps ?? 0);
+      const o = opOf.get(id);
+      return {
+        operationId: id, code: o?.code ?? null, name: o?.name ?? `#${id}`,
+        assigned: b.cells.get(id) ?? 0, steps,
+        done: Number(s?.done ?? 0), inProgress: Number(s?.in_progress ?? 0), onHold: Number(s?.on_hold ?? 0),
+        pct: steps > 0 ? pctOf(Number(s.frac), steps) : null,
+        periodOps: p ? r3(Number(p.ops ?? 0)) : 0, periodSteps: Number(p?.steps_touched ?? 0),
+      };
+    }).sort((x, y) => String(x.code ?? x.name).localeCompare(String(y.code ?? y.name)));
+    const sum = (f) => byOperation.reduce((t, x) => t + f(x), 0);
+    const fracTotal = [...b.steps.values()].reduce((t, s) => t + Number(s.frac), 0);
+    const steps = sum((x) => x.steps);
+    const starts = [...b.steps.values()].map((s) => dbWall(s.first_started)).filter(Boolean).sort();
+    const lasts = [...b.steps.values()].map((s) => dbWall(s.last_at)).filter(Boolean).concat(b.lastEvent ? [b.lastEvent] : []).sort();
+    const due = dayText(w.due_date);
+    const open = WO_OPEN.has(w.status);
+    const overdue = open && due != null && due < todayS;
+    return {
+      id: w.id, code: w.code, status: w.status, open,
+      contractor: { id: w.contractor_id, code: w.contractor_code, name: w.contractor_name },
+      order: { id: w.order_id, code: w.order_code, revision: w.revision, title: w.order_title, status: w.order_status },
+      line: { id: w.order_line_id, lineNo: w.line_no, itemCode: w.item_code, itemName: w.item_name },
+      startDate: dayText(w.start_date), dueDate: due, notes: w.notes ?? null,
+      overdue, daysOverdue: overdue ? daysBetween(due, todayS) : 0,
+      pieces: b.pieces,
+      released: steps > 0,
+      operations: {
+        assigned: sum((x) => x.assigned), steps, done: sum((x) => x.done), inProgress: sum((x) => x.inProgress), onHold: sum((x) => x.onHold),
+        pct: steps > 0 ? pctOf(fracTotal, steps) : null,
+      },
+      firstStartedAt: starts[0] ?? null,
+      lastActivityAt: lasts.length ? lasts[lasts.length - 1] : null,
+      period: { opsDone: r3(sum((x) => x.periodOps)), stepsTouched: sum((x) => x.periodSteps) },
+      byOperation,
+      frac: fracTotal,
+    };
+  }).sort((a, z) => Number(z.overdue) - Number(a.overdue) || z.daysOverdue - a.daysOverdue
+    || Number(z.open) - Number(a.open) || (a.operations.pct ?? 101) - (z.operations.pct ?? 101) || String(a.code).localeCompare(String(z.code)));
+
+  // Contractor summary: one row per contractor over the work orders listed.
+  const cmap = new Map();
+  for (const w of workOrders) {
+    let c = cmap.get(w.contractor.id);
+    if (!c) { c = { ...w.contractor, workOrders: 0, open: 0, active: 0, assigned: 0, steps: 0, done: 0, frac: 0, overdue: 0, periodOps: 0 }; cmap.set(c.id, c); }
+    c.workOrders++;
+    if (w.open) c.open++;
+    if (WO_ACTIVE.has(w.status)) c.active++;
+    c.assigned += w.operations.assigned; c.steps += w.operations.steps; c.done += w.operations.done; c.frac += w.frac;
+    if (w.overdue) c.overdue++;
+    c.periodOps += w.period.opsDone;
+  }
+  const contractors = [...cmap.values()].map(({ frac, periodOps, ...c }) => ({ ...c, pct: pctOf(frac, c.steps), periodOps: r3(periodOps) }))
+    .sort((a, z) => z.open - a.open || String(a.name).localeCompare(String(z.name)));
+  const fracAll = workOrders.reduce((t, w) => t + w.frac, 0);
+  const stepsAll = workOrders.reduce((t, w) => t + w.operations.steps, 0);
+  for (const w of workOrders) delete w.frac;
+  return {
+    period: { from, to, days, today: todayS, now: nowText, timezone: tz },
+    plant: {
+      workOrders: workOrders.length,
+      open: workOrders.filter((w) => w.open).length,
+      contractors: contractors.length,
+      contractorsActive: new Set(workOrders.filter((w) => WO_ACTIVE.has(w.status)).map((w) => w.contractor.id)).size,
+      operationsAssigned: workOrders.reduce((t, w) => t + w.operations.assigned, 0),
+      operationsReleased: stepsAll,
+      operationsDone: workOrders.reduce((t, w) => t + w.operations.done, 0),
+      pct: pctOf(fracAll, stepsAll),
+      notReleased: workOrders.filter((w) => !w.released).length,
+      overdue: workOrders.filter((w) => w.overdue).length,
+      periodOps: r3(workOrders.reduce((t, w) => t + w.period.opsDone, 0)),
+      // Work orders carry no rate or amount: there is no value to total.
+      value: null,
+    },
+    contractors,
+    workOrders,
+    meta: { ...meta, ms: Date.now() - t0 },
+  };
+}
+
+/**
+ * GET /dashboard/orders/tree-rows — "Download full (all levels)": EVERY production
+ * item (piece / part) of every released line of a confirmed order, flat, with its
+ * parent's code, depth and its steps' progress. 3 reads (zone + items + step
+ * aggregate per item), whatever the size. Reads only; no weights (items carry none).
+ */
+export async function orderTreeRows(dbIn, companyId) {
+  const t0 = Date.now();
+  const { db, meta, stage } = counted(dbIn);
+  stage();
+  const tz = await plantZone(db, companyId);
+  const { todayS, nowText } = plantNow(tz);
+  stage();
+  const [[items], [stepAgg]] = await Promise.all([
+    db.query(
+      `SELECT pi.id, pi.parent_id, pi.code, pi.quantity, pi.depth, pi.sort_order, pi.piece_no, r.order_line_id AS line_id,
+              o.id AS order_id, o.code AS order_code, l.line_no, mr.code AS item_code, mr.name AS item_name
+         FROM cf_production_releases r
+         JOIN cf_sales_orders o ON o.id = r.order_id AND o.status = 'confirmed' AND o.deleted_at IS NULL
+         JOIN cf_sales_order_lines l ON l.id = r.order_line_id
+         JOIN cf_production_items pi ON pi.company_id = r.company_id AND pi.release_id = r.id AND pi.deleted_at IS NULL
+         LEFT JOIN cf_master_records mr ON mr.id = pi.item_id
+        WHERE r.company_id = ? AND r.deleted_at IS NULL
+        ORDER BY o.code, l.line_no, pi.sort_order, pi.id`,
+      [companyId],
+    ),
+    db.query(
+      `SELECT s.production_item_id AS item_id, COUNT(*) AS steps, SUM(s.state = 'done') AS done, SUM(s.state = 'in_progress') AS in_progress,
+              SUM(s.state = 'on_hold') AS on_hold, SUM(s.work_order_id IS NOT NULL) AS contracted,
+              SUM(IF(s.state = 'done', 1, LEAST(1, COALESCE(s.qty_good / NULLIF(s.quantity, 0), 0)))) AS frac
+         FROM cf_production_releases r
+         JOIN cf_sales_orders o ON o.id = r.order_id AND o.status = 'confirmed' AND o.deleted_at IS NULL
+         JOIN cf_production_items pi ON pi.company_id = r.company_id AND pi.release_id = r.id AND pi.deleted_at IS NULL
+         JOIN cf_production_steps s ON s.company_id = pi.company_id AND s.production_item_id = pi.id AND s.deleted_at IS NULL
+        WHERE r.company_id = ? AND r.deleted_at IS NULL
+        GROUP BY s.production_item_id`,
+      [companyId],
+    ),
+  ]);
+  const agg = new Map(stepAgg.map((s) => [s.item_id, s]));
+  const codeOf = new Map(items.map((i) => [i.id, i.code]));
+  const rows = items.map((i) => {
+    const s = agg.get(i.id);
+    const steps = Number(s?.steps ?? 0);
+    const hold = Number(s?.on_hold ?? 0);
+    return {
+      orderId: i.order_id, orderCode: i.order_code, lineId: i.line_id, lineNo: i.line_no,
+      code: i.code ?? i.item_code ?? null, parentCode: i.parent_id == null ? null : (codeOf.get(i.parent_id) ?? null),
+      level: Number(i.depth), name: i.item_name ?? null, itemCode: i.item_code ?? null, quantity: Number(i.quantity), pieceNo: i.piece_no ?? null,
+      steps, stepsDone: Number(s?.done ?? 0), inProgress: Number(s?.in_progress ?? 0), onHold: hold, contracted: Number(s?.contracted ?? 0),
+      pct: steps > 0 ? pctOf(Number(s.frac), steps) : null,
+      blocked: hold > 0,
+    };
+  });
+  return { period: { today: todayS, now: nowText, timezone: tz }, rows, meta: { ...meta, ms: Date.now() - t0 } };
 }
