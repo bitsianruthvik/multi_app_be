@@ -22,6 +22,8 @@
  *      machineCalendar, supply by date, round trips (not growing with pieces)
  *   4. writes round-trip: entries, priorities, line level, targets, settings,
  *      and what each refuses
+ *   4b. (2026-10-01) machine-type paths for the machine areas, unit ranks and
+ *      PUT /planner/changes (moves + a line's unit order in one transaction)
  */
 import { pool } from '../../db.js';
 import '../../apps/cf_erp/services/codegenProvider.js';
@@ -34,7 +36,7 @@ import { createArea } from '../../apps/cf_erp/services/stockingAreaService.js';
 import { postMovement } from '../../apps/cf_erp/services/stockService.js';
 import { getAssignment, assignCells } from '../../apps/cf_erp/services/workOrderService.js';
 import {
-  getPlanner, horizonOf, putEntries, putPriorities, putLineLevel, putTargets, putSettings, CONTRACTOR,
+  getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings, CONTRACTOR,
 } from '../../apps/cf_erp/services/plannerService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -375,12 +377,68 @@ try {
   err = await refusal(() => putSettings(conn, c, { allowPartialLines: 'maybe' }));
   ok('a bad yes/no is refused', err?.status === 422);
 
+
+  /* ------------------------------------------------------------------------ */
+  section('4b. The rework (2026-10-01): machine-type paths, unit ranks, PUT /planner/changes');
+  s = await getPlanner(conn, COMPANY, {});
+  const typed = s.functions.filter((f) => !f.unlimited);
+  ok('every machine type carries its path, root first, ending at itself', typed.length > 0 && typed.every((f) => Array.isArray(f.path) && f.path.length >= 1
+    && String(f.path.at(-1).id) === f.key && f.path.every((n, i) => i === 0 || n.depth > f.path[i - 1].depth)), JSON.stringify(typed.slice(0, 2).map((f) => f.path)));
+  const subfamilies = new Set(typed.map((f) => f.path.find((n) => n.depth === 1)?.id).filter((x) => x != null));
+  console.log(`        machine areas at the Subfamily level: ${subfamilies.size} (${[...new Set(typed.map((f) => f.path.find((n) => n.depth === 1)?.name))].join(', ')})`);
+  ok('the snapshot has ranks (unit key → 1..)', !!s.ranks && typeof s.ranks === 'object' && Object.values(s.ranks).every((n) => Number.isInteger(n) && n > 0));
+  const [g1, g2, g3] = girderLines;
+  w = await measured(() => putChanges(db, c, {
+    entries: [{ unitKey: g1.key, shipDate: '2026-10-19', pinned: true }, { unitKey: g2.key, shipDate: '2026-10-26', pinned: true }],
+    ranks: [{ lineId: LINE, unitKeys: [g2.key, g1.key, g3.key] }],
+  }));
+  report.putChangesTrips = w.queries;
+  ok(`PUT changes: entries and the line's order in one call (${w.queries} round trips)`, w.result.entries[g1.key]?.shipDate === '2026-10-19' && w.result.entries[g2.key]?.shipDate === '2026-10-26'
+    && JSON.stringify(w.result.ranks[LINE]) === JSON.stringify([g2.key, g1.key, g3.key]), JSON.stringify(w.result));
+  ok('PUT changes stays small (≤ 8 round trips)', w.queries <= 8, String(w.queries));
+  s = await getPlanner(conn, COMPANY, {});
+  ok('GET shows the moves and the ranks (1 = first)', s.entries[g1.key]?.shipDate === '2026-10-19' && s.ranks[g2.key] === 1 && s.ranks[g1.key] === 2 && s.ranks[g3.key] === 3);
+  // a move = the same unit to another week; a reorder = the whole order again
+  await putChanges(conn, c, { entries: [{ unitKey: g1.key, shipDate: '2026-11-02', pinned: true }], ranks: [{ lineId: LINE, unitKeys: [g3.key, g2.key] }] });
+  s = await getPlanner(conn, COMPANY, {});
+  ok('moving updates the one live entry; a new order replaces the old (g1 no longer ranked)', s.entries[g1.key]?.shipDate === '2026-11-02' && s.ranks[g3.key] === 1 && s.ranks[g2.key] === 2 && s.ranks[g1.key] === undefined);
+  const [[{ liveG1 }]] = await conn.query('SELECT COUNT(*) AS liveG1 FROM cf_plan_entries WHERE company_id = ? AND unit_key = ? AND deleted_at IS NULL', [COMPANY, g1.key]);
+  ok('still one live entry row for the moved unit', Number(liveG1) === 1);
+  const [[{ rankRows }]] = await conn.query('SELECT COUNT(*) AS rankRows FROM cf_plan_ranks WHERE company_id = ? AND order_line_id = ?', [COMPANY, LINE]);
+  ok('the line has exactly its two rank rows', Number(rankRows) === 2);
+  await putChanges(conn, c, { ranks: [{ lineId: LINE, unitKeys: [] }] });
+  ok('an empty order clears the line', Object.keys((await getPlanner(conn, COMPANY, {})).ranks).length === 0);
+  w = await measured(() => putChanges(db, c, { entries: [], ranks: [] }));
+  ok(`nothing to save costs nothing (${w.queries} round trips)`, w.queries === 0);
+  // refusals — and all or nothing
+  const g3Before = JSON.stringify((await getPlanner(conn, COMPANY, {})).entries[g3.key] ?? null);
+  err = await refusal(() => putChanges(conn, c, { entries: [{ unitKey: g3.key, shipDate: '2026-12-07', pinned: true }], ranks: [{ lineId: LINE, unitKeys: ['nope'] }] }));
+  ok('a bad unit key in the ranks is refused (422) …', err?.status === 422);
+  ok('… and the entry beside it was not written', JSON.stringify((await getPlanner(conn, COMPANY, {})).entries[g3.key] ?? null) === g3Before);
+  err = await refusal(() => putChanges(conn, c, { ranks: [{ lineId: LINE, unitKeys: [g1.key, g1.key] }] }));
+  ok('a unit twice in an order is refused', err?.status === 422);
+  err = await refusal(() => putChanges(conn, c, { ranks: [{ lineId: LINE, unitKeys: [g1.key] }, { lineId: LINE, unitKeys: [g2.key] }] }));
+  ok('a line twice is refused', err?.status === 422);
+  err = await refusal(() => putChanges(conn, c, { ranks: [{ lineId: 999999999, unitKeys: [] }] }));
+  ok('a line that is not here is refused', err?.status === 422);
+  const otherLineUnit = s.units.find((u) => u.lineId !== LINE);
+  if (otherLineUnit) {
+    err = await refusal(() => putChanges(conn, c, { ranks: [{ lineId: LINE, unitKeys: [otherLineUnit.key] }] }));
+    ok(`a unit of another line (${otherLineUnit.key}) is refused in this line's order`, err?.status === 422);
+  }
+  if (other) {
+    err = await refusal(() => putChanges(conn, c, { ranks: [{ lineId: LINE, unitKeys: [`p${other.id}`] }] }));
+    ok('another company\'s piece is refused in a rank', err?.status === 422);
+  }
+  err = await refusal(() => putChanges(conn, c, { entries: 'x' }));
+  ok('a body that is not lists is refused', err?.status === 422);
+
   // The route is mounted.
   const indexRouter = (await import('../../apps/cf_erp/routes/index.js')).default;
   const paths = [];
   const walk = (stack) => { for (const l of stack) { if (l.route) paths.push(`${Object.keys(l.route.methods).join(',')} ${l.route.path}`); else if (l.handle?.stack) walk(l.handle.stack); } };
   walk(indexRouter.stack);
-  ok('GET /planner and the five PUTs are mounted', ['get /planner', 'put /planner/entries', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/targets', 'put /planner/settings'].every((p) => paths.includes(p)), paths.filter((p) => p.includes('planner')).join(' | '));
+  ok('GET /planner and the six PUTs are mounted', ['get /planner', 'put /planner/entries', 'put /planner/changes', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/targets', 'put /planner/settings'].every((p) => paths.includes(p)), paths.filter((p) => p.includes('planner')).join(' | '));
 
   // A trimmed example for the report.
   const ex = await getPlanner(conn, COMPANY, {});
@@ -409,7 +467,7 @@ const after = await counts();
 const changed = after.filter((a) => Number(before.find((b) => b.name === a.name)?.n) !== Number(a.n));
 ok(`every cf_ table is back where it started (${after.length} tables)`, changed.length === 0, changed.map((x) => x.name).join(', '));
 if (process.env.PLAN_EXAMPLE) console.log(JSON.stringify(report.example, null, 1));
-console.log(`\nround trips: ${JSON.stringify({ getUnlocked: report.unlockedTrips, getLocked: report.lockedTrips, getLockedMs: report.lockedMs, units: report.units, putEntries: report.putEntriesTrips })}`);
+console.log(`\nround trips: ${JSON.stringify({ getUnlocked: report.unlockedTrips, getLocked: report.lockedTrips, getLockedMs: report.lockedMs, units: report.units, putEntries: report.putEntriesTrips, putChanges: report.putChangesTrips })}`);
 console.log(`${passed} passed, ${failed} failed`);
 await pool.end();
 process.exit(failed ? 1 : 0);

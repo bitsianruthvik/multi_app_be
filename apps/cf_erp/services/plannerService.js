@@ -81,6 +81,7 @@ import { effectiveByCode, dateText } from './resolutionService.js';
 import { loadMachineSide, flowSteps, opsOfFlow } from './timeEstimateService.js';
 import { valueReaders } from './operationService.js';
 import { machinesCalendar } from './shiftService.js';
+import { LEAF_DEPTH, levelName } from './tree.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
@@ -93,6 +94,26 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 export const DEFAULT_SETTINGS = { minLinesPerMonth: 1, allowPartialLines: true };
 export const CONTRACTOR = 'contractor';
 export const UNASSIGNED = 'unassigned';
+
+/**
+ * A machine type's path in the classification tree, root first
+ * ([{ id, name, depth, level }], level = Family / Subfamily / Variant), read in
+ * the same query as the type: one LEFT JOIN per level above it (as floorService).
+ * The screen groups types into machine AREAS by one level of it.
+ */
+const NODE_PATH_JOINS = Array.from({ length: LEAF_DEPTH }, (_, i) =>
+  `LEFT JOIN cf_classification_nodes a${i + 1} ON a${i + 1}.id = ${i ? `a${i}` : 'n'}.parent_id`).join(' ');
+const NODE_PATH_COLS = Array.from({ length: LEAF_DEPTH }, (_, i) =>
+  `a${i + 1}.id AS a${i + 1}_id, a${i + 1}.name AS a${i + 1}_name, a${i + 1}.depth AS a${i + 1}_depth`).join(', ');
+function nodePathOf(n) {
+  const path = [{ id: n.id, name: n.name, depth: Number(n.depth), level: levelName(Number(n.depth)) }];
+  for (let i = 1; i <= LEAF_DEPTH; i++) {
+    if (n[`a${i}_id`] == null) break;
+    const depth = Number(n[`a${i}_depth`]);
+    path.unshift({ id: n[`a${i}_id`], name: n[`a${i}_name`], depth, level: levelName(depth) });
+  }
+  return path;
+}
 
 const r3 = (n) => Number(Number(n).toFixed(3));
 const r6 = (n) => Number(Number(n).toFixed(6));
@@ -221,7 +242,7 @@ export async function getPlanner(db, companyId, q = {}) {
   const today = todayText();
 
   // ---- orders, and what the company stored about the plan -------------------
-  const [lineRows, [[settingRow]], [targetRows], [entryRows], [machineRows], [nodeRows]] = await Promise.all([
+  const [lineRows, [[settingRow]], [targetRows], [entryRows], [machineRows], [nodeRows], [rankRows]] = await Promise.all([
     loadOrderLines(db, companyId),
     // The settings row (if any) and WEIGHT's unit, in one read.
     db.query(
@@ -234,13 +255,17 @@ export async function getPlanner(db, companyId, q = {}) {
     db.query('SELECT month, tonnes FROM cf_plan_targets WHERE company_id = ? ORDER BY month', [companyId]),
     db.query('SELECT unit_key, ship_date, pinned FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL", [companyId]),
-    // The machine types: the nodes machines are filed under.
+    // The machine types: the nodes machines are filed under, with the nodes
+    // above them (Family › Subfamily › Variant), in the same read.
     db.query(
-      `SELECT DISTINCT n.id, n.code, n.name FROM cf_classification_nodes n
+      `SELECT DISTINCT n.id, n.code, n.name, n.depth, ${NODE_PATH_COLS} FROM cf_classification_nodes n
          JOIN cf_machines m ON m.company_id = n.company_id AND m.classification_id = n.id AND m.deleted_at IS NULL
+         ${NODE_PATH_JOINS}
         WHERE n.company_id = ?`,
       [companyId],
     ),
+    // The order of a line's units, dragged by hand (§38).
+    db.query('SELECT unit_key, rank_no FROM cf_plan_ranks WHERE company_id = ? ORDER BY order_line_id, rank_no', [companyId]),
   ]);
   const weightToTonnes = String(settingRow?.weight_uom ?? 'kg').toLowerCase().startsWith('t') ? 1 : 0.001;
   const settings = settingRow?.min_lines_per_month != null
@@ -693,6 +718,7 @@ export async function getPlanner(db, companyId, q = {}) {
     for (let d = parseDate(p.start); dateText(d) <= p.end; d = addDays(d, 1)) periodOfDate.set(dateText(d), p.key);
   }
   const typeName = new Map(nodeRows.map((n) => [String(n.id), n.name]));
+  const typePath = new Map(nodeRows.map((n) => [String(n.id), nodePathOf(n)]));
   const byType = new Map();
   for (const m of machineRows) {
     const key = String(m.classification_id);
@@ -714,7 +740,10 @@ export async function getPlanner(db, companyId, q = {}) {
         if (pk) capacity[pk] += d.minutes;
       }
     }
-    functions.push({ key, name: typeName.get(key) ?? `Machine type ${key}`, machines: machines.length, capacity, noShifts: !anyShift, used: usedFunctions.has(key) });
+    functions.push({
+      key, name: typeName.get(key) ?? `Machine type ${key}`, machines: machines.length, capacity, noShifts: !anyShift, used: usedFunctions.has(key),
+      path: typePath.get(key) ?? [],
+    });
   }
   functions.sort((a, b) => Number(b.used) - Number(a.used) || a.name.localeCompare(b.name));
   functions.push({ key: CONTRACTOR, name: 'Contractors', machines: 0, capacity: {}, noShifts: false, unlimited: true, used: usedFunctions.has(CONTRACTOR) });
@@ -774,6 +803,9 @@ export async function getPlanner(db, companyId, q = {}) {
     if (!unitKeys.has(e.unit_key)) continue;
     entries[e.unit_key] = { shipDate: dateText(e.ship_date), pinned: !!Number(e.pinned) };
   }
+  // A line's units in the order dragged by hand (1 = first); units that are gone are left out.
+  const ranks = {};
+  for (const r of rankRows) if (unitKeys.has(r.unit_key)) ranks[r.unit_key] = Number(r.rank_no);
 
   return {
     horizon: { from: horizon.from, to: horizon.to, today, periods: horizon.periods },
@@ -784,6 +816,7 @@ export async function getPlanner(db, companyId, q = {}) {
     units,
     supply,
     entries,
+    ranks,
   };
 }
 
@@ -808,14 +841,24 @@ const toBool = (v, label, problems) => {
 export async function putEntries(db, c, input = {}) {
   const list = Array.isArray(input.entries) ? input.entries : null;
   if (!list) throw invalid('INVALID', 'Send the entries: { entries: [{ unitKey, shipDate, pinned }] }.');
+  const want = parseEntries(list);
+  if (!want.length) return { entries: {} };
+  await attachLines(db, c, want);
+  return writeEntries(db, c, want);
+}
+
+const KEY_WORDS = "unitKey is 'p<piece id>', 'l<line id>' or 'g<parent piece id>.<bom line id>'.";
+
+/** Validate entry rows (no reads); throws 422 with every problem. */
+function parseEntries(list) {
   if (list.length > MAX_ENTRIES) throw invalid('TOO_MANY', `At most ${MAX_ENTRIES} entries in one save.`);
   const problems = [];
   const seen = new Set();
   const want = [];
   list.forEach((e, i) => {
     const at = `Entry ${i + 1}`;
-    const m = UNIT_RE.exec(String(e?.unitKey ?? ''));
-    if (!m) { problems.push(`${at}: unitKey is 'p<piece id>', 'l<line id>' or 'g<parent piece id>.<bom line id>'.`); return; }
+    const k = parseUnitKey(e?.unitKey);
+    if (!k) { problems.push(`${at}: ${KEY_WORDS}`); return; }
     if (seen.has(e.unitKey)) { problems.push(`${at}: ${e.unitKey} is named twice.`); return; }
     seen.add(e.unitKey);
     let shipDate = null;
@@ -824,14 +867,112 @@ export async function putEntries(db, c, input = {}) {
       shipDate = String(e.shipDate);
     }
     const pinned = toBool(e.pinned ?? false, `${at}: pinned`, problems);
-    want.push(m[3]
-      ? { unitKey: e.unitKey, kind: 'g', id: Number(m[4]), bomLineId: Number(m[5]), shipDate, pinned: !!pinned }
-      : { unitKey: e.unitKey, kind: m[1], id: Number(m[2]), shipDate, pinned: !!pinned });
+    want.push({ unitKey: e.unitKey, ...k, shipDate, pinned: !!pinned });
   });
   assertNoProblems(problems, 'Some entries need attention.');
-  if (!want.length) return { entries: {} };
+  return want;
+}
 
-  // Which line each unit belongs to — and that it is this company's.
+/**
+ * Validate rank rows { lineId, unitKeys: [...] } (no reads): each is the WHOLE
+ * order of one line's units, first first; an empty list clears the line's order.
+ */
+function parseRanks(list) {
+  if (list.length > 500) throw invalid('TOO_MANY', 'At most 500 lines in one save.');
+  const problems = [];
+  const lines = [];
+  const seenLines = new Set();
+  const seenKeys = new Set();
+  let total = 0;
+  list.forEach((r, i) => {
+    const at = `Rank ${i + 1}`;
+    const lineId = Number(r?.lineId);
+    if (!Number.isInteger(lineId) || lineId <= 0) { problems.push(`${at}: lineId is an order line id.`); return; }
+    if (seenLines.has(lineId)) { problems.push(`${at}: line ${lineId} is named twice.`); return; }
+    seenLines.add(lineId);
+    if (!Array.isArray(r.unitKeys)) { problems.push(`${at}: unitKeys is the line's units in order (a list).`); return; }
+    total += r.unitKeys.length;
+    const units = [];
+    for (const key of r.unitKeys) {
+      const k = parseUnitKey(key);
+      if (!k) { problems.push(`${at}: ${KEY_WORDS}`); return; }
+      if (seenKeys.has(key)) { problems.push(`${at}: ${key} is named twice.`); return; }
+      seenKeys.add(key);
+      units.push({ unitKey: key, ...k, rankLine: lineId });
+    }
+    lines.push({ lineId, units });
+  });
+  if (total > MAX_ENTRIES) problems.push(`At most ${MAX_ENTRIES} ranked units in one save.`);
+  assertNoProblems(problems, 'Some ranks need attention.');
+  return lines;
+}
+
+/**
+ * PUT /planner/changes { entries: [...], ranks: [{ lineId, unitKeys }] } —
+ * everything the Save button sends, in ONE transaction: where units ship
+ * (as PUT /planner/entries) and the order of each named line's units (§38).
+ * Both lists are checked before anything is written. Round trips: one stage of
+ * up to four reads, one retire, the upsert (per 500), one read back, and per
+ * save of ranks one delete + one insert.
+ */
+export async function putChanges(db, c, input = {}) {
+  const entryList = input.entries == null ? [] : input.entries;
+  const rankList = input.ranks == null ? [] : input.ranks;
+  if (!Array.isArray(entryList) || !Array.isArray(rankList)) {
+    throw invalid('INVALID', 'Send { entries: [{ unitKey, shipDate, pinned }], ranks: [{ lineId, unitKeys }] }.');
+  }
+  const want = parseEntries(entryList);
+  const lines = parseRanks(rankList);
+  const ranked = lines.flatMap((l) => l.units);
+  const lineIds = lines.map((l) => l.lineId);
+  const [, liveLines] = await Promise.all([
+    want.length || ranked.length ? attachLines(db, c, [...want, ...ranked]) : null,
+    lineIds.length
+      ? db.query('SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [c.companyId, lineIds]).then(([r]) => new Set(r.map((x) => x.id)))
+      : new Set(),
+  ]);
+  const problems = [];
+  for (const l of lines) if (!liveLines.has(l.lineId)) problems.push(`Line ${l.lineId} is not an order line here.`);
+  for (const u of ranked) if (u.lineId !== u.rankLine) problems.push(`${u.unitKey} is not a unit of line ${u.rankLine}.`);
+  assertNoProblems(problems, 'Some ranks name units of another line.');
+
+  const out = want.length ? await writeEntries(db, c, want) : { entries: {} };
+  const ranks = await writeRanks(db, c, lines);
+  return { entries: out.entries, ranks };
+}
+
+/** Replace the order of each named line's units; returns { [lineId]: [unitKey…] }. */
+async function writeRanks(db, c, lines) {
+  const out = {};
+  if (!lines.length) return out;
+  await db.query('DELETE FROM cf_plan_ranks WHERE company_id = ? AND order_line_id IN (?)', [c.companyId, lines.map((l) => l.lineId)]);
+  const rows = lines.flatMap((l) => l.units.map((u, i) => [c.companyId, l.lineId, u.unitKey, i + 1, c.userId ?? null]));
+  // A unit ranked under another line before (it cannot be: a unit has one line) would trip uq_cprk_unit.
+  for (let i = 0; i < rows.length; i += 500) {
+    const part = rows.slice(i, i + 500);
+    await db.query(
+      `INSERT INTO cf_plan_ranks (company_id, order_line_id, unit_key, rank_no, updated_by) VALUES ${part.map(() => '(?, ?, ?, ?, ?)').join(', ')}`,
+      part.flat(),
+    );
+  }
+  for (const l of lines) out[l.lineId] = l.units.map((u) => u.unitKey);
+  return out;
+}
+
+/** Parse a unit key into { kind, id, bomLineId? }; null when it is not one. */
+function parseUnitKey(key) {
+  const m = UNIT_RE.exec(String(key ?? ''));
+  if (!m) return null;
+  return m[3] ? { kind: 'g', id: Number(m[4]), bomLineId: Number(m[5]) } : { kind: m[1], id: Number(m[2]) };
+}
+
+/**
+ * Which order line each unit belongs to — and that it is this company's
+ * (sets `w.lineId`; refuses the lot if any names nothing here). One stage of
+ * up to three reads, whatever the number of units.
+ */
+async function attachLines(db, c, want) {
+  const problems = [];
   const pieceIds = want.filter((w) => w.kind === 'p').map((w) => w.id);
   const lineIds = want.filter((w) => w.kind === 'l').map((w) => w.id);
   const lots = want.filter((w) => w.kind === 'g');
@@ -861,7 +1002,10 @@ export async function putEntries(db, c, input = {}) {
     if (w.lineId == null) problems.push(`${w.unitKey} is not a ${kindWord[w.kind]} of an order here.`);
   }
   assertNoProblems(problems, 'Some entries name nothing that can be planned.');
+}
 
+/** Retire / upsert entries whose lines are attached; returns what changed. */
+async function writeEntries(db, c, want) {
   const drop = want.filter((w) => w.shipDate == null).map((w) => w.unitKey);
   const keep = want.filter((w) => w.shipDate != null);
   if (drop.length) {

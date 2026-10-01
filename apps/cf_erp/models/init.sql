@@ -3941,3 +3941,35 @@ CREATE TABLE IF NOT EXISTS cf_eway_bills (
   CONSTRAINT fk_cewb_invoice FOREIGN KEY (company_id, invoice_id) REFERENCES cf_invoices(company_id, id),
   CONSTRAINT fk_cewb_creator FOREIGN KEY (created_by) REFERENCES users(id)
 );
+
+-- ===========================================================================
+-- 38. PLANNER RANKS — the order of a line's units, dragged by hand
+-- ===========================================================================
+--
+-- 2026-10-01, the planner rework (the user: "make it very easy to expand, drag
+-- and drop and shift things around"). Orders are ranked by
+-- cf_sales_orders.plan_priority (§31) and lines go in line order; INSIDE a line
+-- the planner's units (girder lines, segments, lots) used to go in structure
+-- order. Dragging a unit up or down the plan's tree now stores that order here:
+-- rank_no 1 = first. Auto-plan and material allocation take a line's ranked
+-- units first, in rank order, then the rest in structure order.
+-- Written as a whole line at a time (PUT /planner/changes { ranks: [{ lineId,
+-- unitKeys }] }): the line's rows are deleted and re-inserted, so there is no
+-- soft delete. unit_key is the planner's key ('p<piece>' | 'l<line>' |
+-- 'g<parent piece>.<bom line>'), as cf_plan_entries.
+CREATE TABLE IF NOT EXISTS cf_plan_ranks (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  unit_key        VARCHAR(40)    NOT NULL,
+  rank_no         INT            NOT NULL,
+  updated_by      INT            NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cprk_unit (company_id, unit_key),
+  KEY idx_cprk_line (company_id, order_line_id),
+
+  CONSTRAINT fk_cprk_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cprk_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cprk_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
