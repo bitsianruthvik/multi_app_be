@@ -251,7 +251,7 @@ export const LEFT_EMPTY = {
 const LENGTH_CODES = new Set(['SAW_WELD_LENGTH', 'MIG_WELD_LENGTH', 'MIG_WELD_LENGTH_AFTER_FLIP', 'ARC_WELD_LENGTH']);
 const LIVE_ORDER = (s) => !['closed', 'lost', 'cancelled', 'revised'].includes(s);
 
-async function findLine(db, companyId, lineId) {
+export async function findLine(db, companyId, lineId) {
   const [rows] = await db.query(
     `SELECT ol.id, ol.order_id, ol.line_no, ol.item_id, ol.quantity, ol.locked_at, o.code AS order_code, o.status AS order_status
        FROM cf_sales_order_lines ol
@@ -271,7 +271,7 @@ async function findLine(db, companyId, lineId) {
 }
 
 /** The release, what would stop a take-back, and its steps' estimates. */
-async function releaseState(db, companyId, lineId) {
+export async function releaseState(db, companyId, lineId) {
   const rel = await liveReleaseOfLine(db, companyId, lineId);
   if (!rel) return null;
   const [[[s]], [[i]], [[v]]] = await Promise.all([
@@ -294,9 +294,10 @@ async function releaseState(db, companyId, lineId) {
 /**
  * Everything the derivation and the projection need, in a fixed number of
  * reads: the line, explode (2 + one a level), classes + values (2), flow steps
- * + rules (2), specs (1), overrides (1), the Values mirror (~6).
+ * + rules (2), specs (1), overrides (1), the Values mirror (~6). Also used by
+ * cf_arc_blast_rates.mjs.
  */
-async function load(db, companyId, lineId) {
+export async function load(db, companyId, lineId) {
   const line = await findLine(db, companyId, lineId);
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), maxDepth: 15 });
   const nodes = [];
@@ -415,8 +416,13 @@ export async function lineTimes(db, companyId, line) {
   return { byCode, all: v.totals.all };
 }
 
-/** The Times grid's arithmetic with the planned values laid over each piece's own (buildTimesView's sum). */
-async function projectTimes(db, companyId, data, writes) {
+/**
+ * The Times grid's arithmetic with the planned values laid over each piece's own
+ * (buildTimesView's sum). `estimateFor(op, readers)` — optional — answers for an
+ * operation whose rule is about to change (cf_arc_blast_rates.mjs); null falls
+ * back to the rules in the database.
+ */
+export async function projectTimes(db, companyId, data, writes, { estimateFor = null } = {}) {
   const ops = new Map();
   for (const fo of data.flowOps.values()) for (const o of fo.values()) if (!ops.has(o.id)) ops.set(o.id, { id: o.id, code: o.code, name: o.name });
   const { estimate } = await loadMachineSide(db, companyId, ops, undefined);
@@ -439,7 +445,7 @@ async function projectTimes(db, companyId, data, writes) {
   for (const n of data.nodes) {
     for (const o of data.flowOps.get(n.flow?.id)?.values() ?? []) {
       const k = `${n.id}:${o.id}`;
-      if (!memo.has(k)) memo.set(k, estimate(o.id, readerOf(n.id)));
+      if (!memo.has(k)) memo.set(k, estimateFor?.(o, readerOf(n.id)) ?? estimate(o.id, readerOf(n.id)));
       const f = memo.get(k);
       const ov = data.overrides.get(`${n.lineId ?? 0}:${o.id}`);
       const work = ov?.work_minutes != null ? Number(ov.work_minutes) : f.work;
@@ -460,12 +466,34 @@ async function projectTimes(db, companyId, data, writes) {
   return { byCode, all, untimed };
 }
 
-async function newReleaseStats(db, companyId, releaseId) {
+export async function newReleaseStats(db, companyId, releaseId) {
   const [[s]] = await db.query(
     `SELECT COUNT(*) AS steps, SUM(s.est_minutes IS NOT NULL) AS timed, COALESCE(SUM(s.est_minutes), 0) AS minutes
        FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
       WHERE s.company_id = ? AND pi.release_id = ? AND s.deleted_at IS NULL`, [companyId, releaseId]);
   return { id: releaseId, steps: Number(s.steps), timed: Number(s.timed ?? 0), minutes: Number(s.minutes) };
+}
+
+/**
+ * Take the line's release back, run `apply`, release again with the old
+ * release's finished area and notes — all in the CALLER's transaction. No
+ * release: just `apply`. Refuses (code STARTED) before `apply` if anything
+ * started or was issued; unrelease refuses again if that changed meanwhile.
+ * Shared with cf_arc_blast_rates.mjs.
+ */
+export async function reRelease(db, c, data, apply) {
+  const rel = data.release;
+  if (rel && (rel.started || rel.issued > 1e-9)) {
+    const e = new Error(`Release ${rel.id} has started (${rel.started} step(s) begun, material issued ${rel.issued}) — it cannot be taken back. Nothing was written.`);
+    e.code = 'STARTED';
+    throw e;
+  }
+  if (rel) await unrelease(db, c, rel.id);
+  await apply();
+  if (!rel) return { tookBack: null, released: null };
+  const r = await releaseLine(db, c, data.line.id, { finishedAreaId: rel.finishedAreaId, notes: rel.notes });
+  const released = await newReleaseStats(db, c.companyId, r.id ?? r.release?.id ?? (await liveReleaseOfLine(db, c.companyId, data.line.id)).id);
+  return { tookBack: rel, released };
 }
 
 /* ===========================================================================
@@ -493,25 +521,23 @@ export async function run(db, companyId, opts = {}) {
   if (!opts.commit || !changes.length) return out;
   if (out.stopped) { const e = new Error(out.stopped); e.code = 'STARTED'; throw e; }
 
-  // 1. Take the release back (unrelease refuses again if anything started meanwhile).
-  if (rel) { await unrelease(db, c, rel.id); out.tookBack = rel; }
-  // 2. The values, with history, onto the frozen pieces.
-  const bySubject = new Map();
-  for (const w of changes) { if (!bySubject.has(w.itemId)) bySubject.set(w.itemId, []); bySubject.get(w.itemId).push(w); }
-  for (const [id, ws] of bySubject) {
-    const typed = [];
-    for (const w of ws) {
-      const { typed: t, problem } = await valueSvc.coerce(db, companyId, w.spec, w.value);
-      if (problem) throw new Error(`${w.code} on item ${id}: ${problem}`);
-      typed.push({ spec: w.spec, typed: t, source: SOURCE });
+  // 1. take back (unrelease refuses again if anything started meanwhile) ->
+  // 2. the values, with history, onto the frozen pieces -> 3. release again, as it was released.
+  const rr = await reRelease(db, c, data, async () => {
+    const bySubject = new Map();
+    for (const w of changes) { if (!bySubject.has(w.itemId)) bySubject.set(w.itemId, []); bySubject.get(w.itemId).push(w); }
+    for (const [id, ws] of bySubject) {
+      const typed = [];
+      for (const w of ws) {
+        const { typed: t, problem } = await valueSvc.coerce(db, companyId, w.spec, w.value);
+        if (problem) throw new Error(`${w.code} on item ${id}: ${problem}`);
+        typed.push({ spec: w.spec, typed: t, source: SOURCE });
+      }
+      out.written += (await valueSvc.upsertValues(db, c, 'master', id, typed)).length;
     }
-    out.written += (await valueSvc.upsertValues(db, c, 'master', id, typed)).length;
-  }
-  // 3. Release again, as it was released.
-  if (rel) {
-    const r = await releaseLine(db, c, data.line.id, { finishedAreaId: rel.finishedAreaId, notes: rel.notes });
-    out.released = await newReleaseStats(db, companyId, r.id ?? r.release?.id ?? (await liveReleaseOfLine(db, companyId, data.line.id)).id);
-  }
+  });
+  out.tookBack = rr.tookBack;
+  out.released = rr.released;
   if (wantTimes) out.after = await lineTimes(db, companyId, data.line);
   return out;
 }
