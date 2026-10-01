@@ -389,14 +389,39 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
   // 2. The layout: a piece per node when it has made parts, one grouped node
   //    otherwise; material becomes requirements.
   const sourceDef = new Map([...detail].map(([id, d]) => [id, d.source_definition_id]));
-  const nodes = [];
-  const reqs = [];
-  const counters = new Map();   // piece.no: one counter per DESIGN across the whole line
   // piece.seq (user, 2026-09-26): under each parent piece a row's pieces are
   // numbered start … end of that row's range; rows of the same short name share
   // one count, and it starts again under the next parent piece. The line's own
   // item is not on a BOM row: its pieces are 1 … n on the order line.
   const lineRanges = await rangesOfBoms(db, companyId, [...new Set(all.filter((n) => n.made && n.bom).map((n) => n.bom.id))]);
+  const laid = layOutPieces(root, { quantity: qty, lineRanges, sourceDef, rootAsMaterial: line.order_type !== 'stock' });
+  problems.push(...laid.problems);
+  return { problems, fromNothing, tree, all, detail, nodes: laid.nodes, reqs: laid.reqs, truncated: laid.truncated, openPlates };
+}
+
+/**
+ * The layout of an exploded tree whose nodes already say `made` (true / false /
+ * undefined for "not considered") — PURE, no database. One node per physical
+ * piece for a design with made parts, one grouped node for one without;
+ * material (`made === false`) becomes requirements. Shared by the roll-out of
+ * an order line (rollOutPlan) and the code preview of a catalog item's or
+ * definition's BOM (placeholderService.recordBomCodes), so the two number
+ * pieces the same way.
+ *
+ *   root          explode()'s root, with `made` set on every node to lay out
+ *   quantity      how many of the root
+ *   lineRanges    rangesOfBoms() over the BOMs of the made nodes
+ *   sourceDef     item id -> the template definition it came from (madeFrom)
+ *   rootAsMaterial  a root that is not made becomes a requirement (not on a stock order)
+ *
+ * Returns { nodes, reqs, problems, truncated } — the shapes rollOutPlan documents.
+ */
+export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef = new Map(), rootAsMaterial = true }) {
+  const problems = [];
+  const qty = Number(quantity);
+  const nodes = [];
+  const reqs = [];
+  const counters = new Map();   // piece.no: one counter per DESIGN across the whole line
   const rangeOfRow = (d) => (d.lineId != null ? lineRanges.get(d.lineId) ?? null : null);
   const seqOfPiece = (d, i) => {
     if (d.lineId == null) return i + 1;
@@ -420,13 +445,13 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     return kids;
   };
   const madeKids = (d) => d.children.filter((k) => k.made);
-  const addNode = (design, parentK, depth, quantity, pieceNo, pieceSeq, ordinal) => {
+  const addNode = (design, parentK, depth, count, pieceNo, pieceSeq, ordinal) => {
     const parent = parentK != null ? nodes[parentK] : null;
     const step = `${design.lineId ?? 'L'}${ordinal != null ? `.${ordinal}` : ''}`;
     const node = {
       k: nodes.length, parentK, design, itemId: design.id, bomLineId: design.lineId ?? null,
       pieceNo, pieceSeq, ordinal, pathKey: parent ? `${parent.pathKey}/${step}` : step,
-      quantity: round6(quantity), code: null, flowId: design.flow?.id ?? null, depth, childKs: [], stepKs: [],
+      quantity: round6(count), code: null, flowId: design.flow?.id ?? null, depth, childKs: [], stepKs: [],
       madeFrom: sourceDef.get(design.id) ?? null,
     };
     nodes.push(node);
@@ -451,7 +476,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     } else fill(design, addNode(design, parentK, depth, count, null, seqOfGroup(design, count), null));
   };
   if (root.made) expand(root, null, 0, qty);
-  else if (line.order_type !== 'stock') reqs.push({ nodeK: null, itemId: root.id, bomLineId: null, quantity: round6(qty), design: root });
+  else if (rootAsMaterial) reqs.push({ nodeK: null, itemId: root.id, bomLineId: null, quantity: round6(qty), design: root });
   // Hitting the cap stops `expand` mid-tree, so everything past it was never
   // walked and its material never asked for — not a smaller answer, a WRONG one.
   const truncated = nodes.length > MAX_NODES;
@@ -459,7 +484,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
     problems.push(`The line would roll out into more than ${MAX_NODES} pieces — split it into smaller lines.`);
     problems.push('Because of that, the piece and material figures below are incomplete — the rest of the structure was never worked out. Do not order from them.');
   }
-  return { problems, fromNothing, tree, all, detail, nodes, reqs, truncated, openPlates };
+  return { nodes, reqs, problems, truncated };
 }
 
 // --- the line's position among lines of the same design ---------------------------

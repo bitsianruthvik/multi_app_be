@@ -3,6 +3,7 @@
  *
  *   GET    /records/:id/bom                 the BOM, its lines, what it may contain
  *   GET    /records/:id/bom/tree            the whole structure below it (?quantity= for the top)
+ *   GET    /records/:id/bom/codes           each row's code, worked out by the order coding rules (preview, nothing stored)
  *   GET    /records/:id/where-used          BOMs that hold it
  *   POST   /records/:id/bom/lines           { childId, quantity, role?, lineNo?, notes?, operationFlowId? }
  *   POST   /records/:id/bom/status          { status: active | obsolete }   (standard / template)
@@ -33,6 +34,7 @@ import {
   setBomStatus, reviseBom, parentOfLine,
 } from '../services/bomService.js';
 import { applyBomChanges } from '../services/bomChangeService.js';
+import { recordBomCodes } from '../services/placeholderService.js';
 import { withCutPieces, ownerLineOf } from '../services/cutPlateService.js';
 
 const router = Router();
@@ -57,9 +59,11 @@ router.get('/records/:id/bom/tree', guard(PERM.view), handle((req) => {
   const q = Number(req.query.quantity);
   return explode(pool, ctx(req).companyId, id(req), { rootQuantity: Number.isFinite(q) && q > 0 ? q : 1 });
 }));
+// A catalog item's or definition's BOM, coded the way an order codes its rows — read only.
+router.get('/records/:id/bom/codes', guard(PERM.view), handle((req) => recordBomCodes(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/where-used', guard(PERM.view), handle((req) => whereUsed(pool, ctx(req).companyId, id(req))));
 
-router.post('/records/:id/bom/lines', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => addLine(db, c, id(req), req.body ?? {}, { requireUseName: true }))));
+router.post('/records/:id/bom/lines', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => addLine(db, c, id(req), req.body ?? {}))));
 router.post('/records/:id/bom/status', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => setBomStatus(db, c, id(req), req.body?.status))));
 router.post('/records/:id/bom/revision', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => reviseBom(db, c, id(req), req.body ?? {}))));
 

@@ -76,7 +76,7 @@ import {
 import { bomTypeOf, descendantIds } from './bomGraph.js';
 import { loadSpecs, coerce, setValues, refreshValues } from './valueService.js';
 import { resolve, dateText, tableSummary, parseJsonCol } from './resolutionService.js';
-import { linePlaceholders } from './placeholderService.js';
+import { linePlaceholders, recordBomCodes } from './placeholderService.js';
 
 /** How a structure node finds its placeholder: by its BOM line, or by item for what the line sells. */
 const placeholderKey = (lineId, itemId) => (lineId != null ? `l${lineId}` : `i${itemId}`);
@@ -107,6 +107,8 @@ export const FIXED_COLUMNS = [
   // The only way to remove anything. Left blank by the export, always.
   { key: 'del', header: 'Delete?', width: 9, locked: false },
   { key: 'code', header: 'Code', width: 22, locked: true },
+  // The code the row's position gives it (placeholderService) — only shown, never read back.
+  { key: 'posCode', header: 'Position code', width: 30, locked: true },
   { key: 'rowId', header: 'Row ID', width: 12, locked: true },
   { key: 'parentRowId', header: 'Parent Row ID', width: 16, locked: true },
   { key: 'uom', header: 'UoM', width: 7, locked: true },
@@ -429,6 +431,7 @@ function sheetMatrix(model) {
       rowId: r.rowId, parentRowId: r.parentRowId, del: null, level: n.depth,
       path: indent(n.depth, labelOf(n)),
       code: n.code ?? model.placeholders?.get(placeholderKey(n.lineId, n.id))?.code ?? null,
+      posCode: model.positionCodes?.get(r.key)?.code ?? model.placeholders?.get(placeholderKey(n.lineId, n.id))?.code ?? null,
       name: n.name ?? null, kind: n.kind, quantity: Number(n.quantity), totalQty: Number(n.total),
       uom: n.uom ?? null, role: n.role ?? null, notes: r.notes ?? null,
       flow: n.flow?.code ?? n.flow?.name ?? null, shared: shared ? 'yes' : null, locked: r.lockedWhy ?? null,
@@ -480,6 +483,8 @@ const INSTRUCTIONS = (model) => [
   [undefined, 'what they are worked out FROM and they follow. A code belongs to the code generator.'],
   [undefined, 'A row made for this order has no code yet: its Code shows the code its pieces get when'],
   [undefined, 'the line is locked, with # where each piece\'s own number goes. It is only shown.'],
+  [undefined, 'Position code is the code a row gets from where it sits — parent, short name, quantity —'],
+  [undefined, 'by the same rules an order codes its rows with. It is only shown, never read back.'],
   ...(model.scope.kind === 'orderLine'
     ? [[undefined, 'A row inside a catalog item\'s own BOM is shared by every order and is read only here;'],
       [undefined, 'the Locked column says which rows those are.']]
@@ -518,6 +523,15 @@ export async function exportSheet(db, companyId, scopeInput, { format = 'xlsx' }
   model.placeholders = model.scope.kind === 'orderLine'
     ? await linePlaceholders(db, companyId, model.scope.orderLineId)
       .then((ph) => new Map(ph.rows.map((r) => [placeholderKey(r.bomLineId, r.itemId), r])))
+      .catch(() => null)
+    : null;
+  // A catalog item's or definition's rows: the code each row's POSITION gives it,
+  // by the same rules an order codes its rows with (recordBomCodes, on the tree
+  // this sheet already exploded). Code stays the child's own code — it is what
+  // the import reads back — and Position code is only shown.
+  model.positionCodes = model.scope.kind === 'record'
+    ? await recordBomCodes(db, companyId, model.root.id, { tree: model.tree })
+      .then((pc) => new Map(pc.rows.map((r) => [r.key, r])))
       .catch(() => null)
     : null;
   // Reading is always allowed — a closed order's sheet is a record worth having.

@@ -181,13 +181,15 @@ async function ensureBom(db, c, parent, bomType) {
  * Adds a child. input: { childId, quantity, role?, lineNo?, notes?, operationFlowId? }.
  * operationFlowId is how the child is made in THIS parent, when that differs
  * from the child's own default flow.
- * requireUseName (the Add dialog's route): adding a child that is ALREADY in this
- * BOM needs a name for this use. Copies, spreadsheet imports and scripts add
- * repeats freely.
+ * The same child may go in twice (user, 2026-10-01: "even if it is same item
+ * twice it is ok, keep the same name"): two lines referencing one record, both
+ * named by it. They are told apart by the CODE each row gets from its position
+ * (placeholderService: recordBomCodes, an order's placeholders), never by a
+ * name nobody asked for. The optional role stays available on edit.
  * On a Custom BOM a template definition becomes a new temporary item here and
  * a selection line starts with its default catalog item, if it has one.
  */
-export async function addLine(db, c, parentId, input = {}, { requireUseName = false } = {}) {
+export async function addLine(db, c, parentId, input = {}) {
   const parent = await requireMaster(db, c.companyId, parentId);
   const bomType = bomTypeOf(parent);
   if (!bomType) throw invalid('NO_BOM', 'A selection definition has no BOM — it chooses a catalog item.');
@@ -222,9 +224,6 @@ export async function addLine(db, c, parentId, input = {}, { requireUseName = fa
   const existingBom = await bomOfParent(db, c.companyId, parent.id);
   const repeats = await otherUsesOfChild(db, c.companyId, existingBom?.id, child.id);
   if (role && !isSystemRole(role) && sameName(role, child.name) && !repeats) role = null;
-  if (requireUseName && repeats && (!role || sameName(role, child.name))) {
-    throw invalid('USE_NAME_REQUIRED', `${child.name} is already in this BOM — give this use a name so the two can be told apart.`);
-  }
 
   if (bomType === 'custom' && childKind === 'template') await checkTemplate(db, c.companyId, child);
 

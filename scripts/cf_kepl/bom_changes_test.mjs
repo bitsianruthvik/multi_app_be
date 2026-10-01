@@ -758,11 +758,14 @@ try {
   eq('a role equal to the child name (case and spacing aside) is stored NULL on save', await roleOfLine(nLine), null);
   await B.updateLine(conn, c, nLine, { role: 'Spare bolt' });
   eq('a different role is kept', await roleOfLine(nLine), 'Spare bolt');
-  const rep1 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1 }, { requireUseName: true }));
-  eq('the same child again, with no name, is refused (Add dialog)', [rep1?.status, rep1?.code], [422, 'USE_NAME_REQUIRED']);
-  const rep2 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'test bolt, long' }, { requireUseName: true }));
-  eq('and so is a name that is just the item name', rep2?.code, 'USE_NAME_REQUIRED');
-  await B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'Bolt 2' }, { requireUseName: true });
+  // 2026-10-01: a repeat is no longer refused — the same child twice is two
+  // lines, told apart by the code each row's position gives it (bom_codes_test).
+  const rep1 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1 }));
+  eq('the same child again, with no name, is added (Add dialog)', rep1, null);
+  eq('and keeps the child’s own name (no role)', await roleOfLine(await lastLineOf(f.ASSY)), null);
+  const rep2 = await refusal(() => B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'test bolt, long' }));
+  eq('so is a name that is just the item name', rep2, null);
+  await B.addLine(conn, c, f.ASSY, { childId: f.BOLT2, quantity: 1, role: 'Bolt 2' });
   eq('the same child again with a name is added and keeps it', await roleOfLine(await lastLineOf(f.ASSY)), 'Bolt 2');
   const sys = await conn.query("INSERT INTO cf_bom_lines (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, created_by) SELECT company_id, id, 990, ?, ?, 99, 'Raw plate', 1, created_by FROM cf_boms WHERE parent_id = ? LIMIT 1", [f.BOLT, f.BOLT, f.ASSY]);
   await B.updateLine(conn, c, sys[0].insertId, { quantity: 2 });
