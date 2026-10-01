@@ -19,6 +19,7 @@ import { LEAF_DEPTH, LEVELS, levelName, requireNode, ancestors } from './tree.js
 import { deleteAllForSubject as deleteValues, rematerialize } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { findConditionsReferencing } from '../modules/codegen/index.js';
+import { clearProductionMachines } from './operationService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const SCOPES = ['item', 'definition', 'both', 'machine'];
@@ -101,6 +102,7 @@ export async function createNode(db, c, input = {}) {
       fields.sort_order ?? 0, fields.status ?? 'active', c.userId],
   );
   invalidateNodeCache(db);
+  clearProductionMachines(c.companyId);
   return getNode(db, c.companyId, r.insertId);
 }
 
@@ -130,6 +132,7 @@ export async function updateNode(db, c, id, input = {}) {
     await db.query(`UPDATE cf_classification_nodes SET ${sets.join(', ')} WHERE company_id = ? AND id = ?`, [...params, c.companyId, id]);
   }
   invalidateNodeCache(db);
+  clearProductionMachines(c.companyId);
   // A move changes which rules and defaults reach everything below.
   if (movedTo) await rematerialize(db, c, { classificationId: id });
   return getNode(db, c.companyId, id);
@@ -182,6 +185,7 @@ export async function deleteNode(db, c, id) {
   await deleteRules(db, c, 'classification', id);
   await db.query('UPDATE cf_classification_nodes SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   invalidateNodeCache(db);
+  clearProductionMachines(c.companyId);
   return { ok: true };
 }
 

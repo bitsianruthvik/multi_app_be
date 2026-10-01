@@ -41,6 +41,7 @@ import { createShift } from '../../apps/cf_erp/services/shiftService.js';
 import { listReasons, wallOf } from '../../apps/cf_erp/services/floorService.js';
 import { measuresOf } from '../../apps/cf_erp/services/priceService.js';
 import * as D from '../../apps/cf_erp/services/dashboardService.js';
+import { productionMachineIds, clearProductionMachines } from '../../apps/cf_erp/services/operationService.js';
 import { signToken } from '../../core/utils/jwt.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -107,8 +108,10 @@ try {
   console.log(`  released ${line.order_code} line ${line.line_no}: ${steps.length} steps`);
   ok('the release has plenty of steps to work with', steps.length > 50, String(steps.length));
 
-  // Two machines with shifts of our own: a day shift and a night shift, every day.
-  const [M, M2] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code LIMIT 2", [COMPANY]);
+  // The dashboard shows production machines only, so the test machines are drawn from those.
+  clearProductionMachines();
+  const prod = [...await productionMachineIds(conn, COMPANY)];
+  const [M, M2] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id IN (?) ORDER BY code LIMIT 2", [COMPANY, prod]);
   for (const m of [M, M2]) {
     await conn.query('UPDATE cf_machine_shifts SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
     await conn.query('UPDATE cf_machine_calendar_exceptions SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
@@ -151,11 +154,11 @@ try {
   // Where the shift time went: two machines of ONE type (M3 logged in detail, M5 not at all)
   // and a machine with no shift (M4).
   const [pair] = await qa(
-    `SELECT classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?)
-      GROUP BY classification_id HAVING COUNT(*) >= 2 ORDER BY classification_id LIMIT 1`, [COMPANY, M.id, M2.id]);
+    `SELECT classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?) AND id IN (?)
+      GROUP BY classification_id HAVING COUNT(*) >= 2 ORDER BY classification_id LIMIT 1`, [COMPANY, M.id, M2.id, prod]);
   if (!pair) throw new Error('Need a machine type with two active machines.');
-  const [M3, M5] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code LIMIT 2", [COMPANY, pair.classification_id]);
-  const [M4] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?, ?, ?) ORDER BY code LIMIT 1", [COMPANY, M.id, M2.id, M3.id, M5.id]);
+  const [M3, M5] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL AND status = 'active' AND id IN (?) ORDER BY code LIMIT 2", [COMPANY, pair.classification_id, prod]);
+  const [M4] = await qa("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND id NOT IN (?, ?, ?, ?) AND id IN (?) ORDER BY code LIMIT 1", [COMPANY, M.id, M2.id, M3.id, M5.id, prod]);
   for (const m of [M3, M4, M5]) {
     await conn.query('UPDATE cf_machine_shifts SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);
     await conn.query('UPDATE cf_machine_calendar_exceptions SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [COMPANY, m.id]);

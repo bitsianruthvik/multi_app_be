@@ -35,6 +35,7 @@ import { createShift, createException, machineCalendar, machinesCalendar } from 
 import { createArea } from '../../apps/cf_erp/services/stockingAreaService.js';
 import { postMovement } from '../../apps/cf_erp/services/stockService.js';
 import { getAssignment, assignCells } from '../../apps/cf_erp/services/workOrderService.js';
+import { productionMachineIds } from '../../apps/cf_erp/services/operationService.js';
 import {
   getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings, CONTRACTOR,
 } from '../../apps/cf_erp/services/plannerService.js';
@@ -135,7 +136,9 @@ try {
   ok('the Girder segment pieces come from a template definition', !!segDef?.id);
   await setValues(conn, c, 'master', segDef.id, [{ specCode: 'SHIP_UNIT', value: true }]);
   // Shifts: two machines of types the line uses.
-  const [machines] = await conn.query("SELECT id, classification_id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY id", [COMPANY]);
+  // Plan usage counts production machines only.
+  const prodIds = [...await productionMachineIds(conn, COMPANY)];
+  const [machines] = await conn.query("SELECT id, classification_id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL AND id IN (?) ORDER BY id", [COMPANY, prodIds]);
   const mA = machines[0];
   const mB = machines.find((m) => m.classification_id === mA.classification_id && m.id !== mA.id) ?? machines[1];
   // Machines may already have shifts locally: inside the transaction, mA and mB

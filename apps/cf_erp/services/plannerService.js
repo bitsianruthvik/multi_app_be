@@ -79,7 +79,7 @@ import { rollOutPlan, lockedBothOf, attachLockedCodes, availabilityRows, shapeAv
 import { resolveLineRecords } from './orderValuesService.js';
 import { effectiveByCode, dateText } from './resolutionService.js';
 import { loadMachineSide, flowSteps, opsOfFlow } from './timeEstimateService.js';
-import { valueReaders } from './operationService.js';
+import { valueReaders, productionMachineIds } from './operationService.js';
 import { machinesCalendar } from './shiftService.js';
 import { LEAF_DEPTH, levelName } from './tree.js';
 
@@ -242,7 +242,7 @@ export async function getPlanner(db, companyId, q = {}) {
   const today = todayText();
 
   // ---- orders, and what the company stored about the plan -------------------
-  const [lineRows, [[settingRow]], [targetRows], [entryRows], [machineRows], [nodeRows], [rankRows]] = await Promise.all([
+  const [lineRows, [[settingRow]], [targetRows], [entryRows], [machineRowsAll], [nodeRows], [rankRows], production] = await Promise.all([
     loadOrderLines(db, companyId),
     // The settings row (if any) and WEIGHT's unit, in one read.
     db.query(
@@ -266,7 +266,10 @@ export async function getPlanner(db, companyId, q = {}) {
     ),
     // The order of a line's units, dragged by hand (§38).
     db.query('SELECT unit_key, rank_no FROM cf_plan_ranks WHERE company_id = ? ORDER BY order_line_id, rank_no', [companyId]),
+    // Plan usage counts the machines that do production work, not the asset register.
+    productionMachineIds(db, companyId),
   ]);
+  const machineRows = machineRowsAll.filter((m) => production.has(m.id));
   const weightToTonnes = String(settingRow?.weight_uom ?? 'kg').toLowerCase().startsWith('t') ? 1 : 0.001;
   const settings = settingRow?.min_lines_per_month != null
     ? { minLinesPerMonth: Number(settingRow.min_lines_per_month), allowPartialLines: !!Number(settingRow.allow_partial_lines) }

@@ -33,6 +33,7 @@
  */
 import { invalid } from '../lib/errors.js';
 import { calendarDays } from './shiftService.js';
+import { productionMachineIds } from './operationService.js';
 import { plantZone, wallOf, epochOfWall, TYPE_JOINS, TYPE_COLS, typePathOf } from './floorService.js';
 import { availability } from './rollOutService.js';
 import { amountOf, kgPerUom } from './priceService.js';
@@ -359,6 +360,10 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
   const exA = [addDays(from, -2), addDays(to, 1)];
   const exB = [addDays(todayS, -2), todayS];
 
+  // Only production machines: the asset register (vehicles, panels, tools) is not on this screen.
+  const prodIds = [...await productionMachineIds(db, companyId)];
+  const inProd = prodIds.length ? prodIds : [0];
+
   stage();
   const [[machines], [shiftRows], [exRows], [sessions], [stops], [activity], [openSessions], [openStops], [output], [reasonRows]] = await Promise.all([
     db.query(
@@ -366,14 +371,14 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
       `SELECT m.id, m.code, m.name, m.classification_id AS type_id, n.name AS type_name, ${TYPE_COLS}
          FROM cf_machines m LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
          ${TYPE_JOINS}
-        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' ORDER BY m.code`,
-      [companyId],
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND m.id IN (?) ORDER BY m.code`,
+      [companyId, inProd],
     ),
-    db.query('SELECT * FROM cf_machine_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY machine_id, sort_order, start_time, id', [companyId]),
+    db.query('SELECT * FROM cf_machine_shifts WHERE company_id = ? AND deleted_at IS NULL AND machine_id IN (?) ORDER BY machine_id, sort_order, start_time, id', [companyId, inProd]),
     db.query(
-      `SELECT * FROM cf_machine_calendar_exceptions WHERE company_id = ? AND deleted_at IS NULL
+      `SELECT * FROM cf_machine_calendar_exceptions WHERE company_id = ? AND deleted_at IS NULL AND machine_id IN (?)
           AND (exception_date BETWEEN ? AND ? OR exception_date BETWEEN ? AND ?)`,
-      [companyId, ...exA, ...exB],
+      [companyId, inProd, ...exA, ...exB],
     ),
     db.query(
       `SELECT ws.id, ws.machine_id, ws.step_id, ws.operator_id, opr.name AS operator_name, ws.started_at, ws.ended_at, ws.end_kind,

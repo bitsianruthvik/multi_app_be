@@ -18,12 +18,12 @@ import { resolve, publicResolution } from './resolutionService.js';
 import { materializeMachine, setValues, deleteAllForSubject as deleteValues, getHistory } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { generate } from '../modules/codegen/index.js';
-import { operationsForMachine } from './operationService.js';
+import { operationsForMachine, productionMachineIds, clearProductionMachines } from './operationService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const blank = (v) => v == null || String(v).trim() === '';
 
-function shape(m) {
+function shape(m, production = null) {
   return {
     id: m.id,
     code: m.code,
@@ -34,6 +34,7 @@ function shape(m) {
     catalogItem: m.catalog_item_id ? { id: m.catalog_item_id, code: m.catalog_code ?? null, name: m.catalog_name ?? null } : null,
     serialNumber: m.serial_number,
     status: m.status,
+    isProduction: production ? production.has(m.id) : undefined,
     notes: m.notes,
     createdAt: m.created_at,
     updatedAt: m.updated_at,
@@ -55,10 +56,13 @@ export async function listMachines(db, companyId, q = {}) {
     where.push('(mc.code LIKE ? OR mc.name LIKE ? OR mc.serial_number LIKE ?)');
     params.push(like, like, like);
   }
+  const production = await productionMachineIds(db, companyId);
+  // ?production=1 — only machines some active operation can run on (pages stay whole).
+  if (q.production === '1' || q.production === 'true') { where.push('mc.id IN (?)'); params.push(production.size ? [...production] : [0]); }
   const requestedOffset = Number(q.offset);
   const offset = Number.isSafeInteger(requestedOffset) && requestedOffset > 0 ? requestedOffset : 0;
   const [rows] = await db.query(`${SELECT} WHERE ${where.join(' AND ')} ORDER BY mc.code, mc.id LIMIT 500 OFFSET ?`, [...params, offset]);
-  return rows.map(shape);
+  return rows.map((m) => shape(m, production));
 }
 
 async function loadShaped(db, companyId, id) {
@@ -69,7 +73,7 @@ async function loadShaped(db, companyId, id) {
 
 export async function getMachine(db, companyId, id) {
   const m = await loadShaped(db, companyId, id);
-  const out = shape(m);
+  const out = shape(m, await productionMachineIds(db, companyId));
   const path = await ancestors(db, companyId, m.classification_id);
   out.classificationPath = path.map((n) => ({ id: n.id, code: n.code, name: n.name, level: levelName(n.depth) }));
   out.operations = await operationsForMachine(db, companyId, m);
@@ -117,6 +121,7 @@ export async function createMachine(db, c, input = {}) {
   // Fixed and default values from its machine type land on it straight away.
   await materializeMachine(db, c, r.insertId);
   if (Array.isArray(input.values) && input.values.length) await setValues(db, c, 'machine', r.insertId, input.values);
+  clearProductionMachines(c.companyId);
   return getMachine(db, c.companyId, r.insertId);
 }
 
@@ -148,6 +153,7 @@ export async function updateMachine(db, c, id, input = {}) {
   }
   // A new machine type brings new rules and defaults.
   if (moved) await materializeMachine(db, c, id);
+  clearProductionMachines(c.companyId);
   return getMachine(db, c.companyId, id);
 }
 
@@ -169,6 +175,7 @@ export async function deleteMachine(db, c, id) {
   await db.query('UPDATE cf_machine_shifts SET deleted_at = NOW() WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE cf_stocking_areas SET machine_id = NULL WHERE company_id = ? AND machine_id = ?', [c.companyId, id]);
   await db.query('UPDATE cf_machines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
+  clearProductionMachines(c.companyId);
   return { ok: true };
 }
 

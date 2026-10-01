@@ -41,7 +41,7 @@
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { evaluatedTracker, openReleaseIds, stockFinished } from './releaseService.js';
-import { operationsForMachine } from './operationService.js';
+import { operationsForMachine, productionMachineIds } from './operationService.js';
 import { machineCalendar } from './shiftService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import { LEAF_DEPTH, levelName } from './tree.js';
@@ -417,12 +417,15 @@ export function typePathOf(m) {
  * which the picker filters by. 3 reads.
  */
 export async function listMachines(db, companyId) {
-  const [machines] = await db.query(
+  const production = await productionMachineIds(db, companyId);
+  const [allMachines] = await db.query(
     `SELECT m.id, m.code, m.name, n.name AS type_name, ${TYPE_COLS} FROM cf_machines m JOIN cf_classification_nodes n ON n.id = m.classification_id
       ${TYPE_JOINS}
       WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' ORDER BY m.code`,
     [companyId],
   );
+  // The asset register (vehicles, panels, tools) is not on the floor: only machines an operation can run on.
+  const machines = allMachines.filter((m) => production.has(m.id));
   const [[activity], [stops]] = await Promise.all([
     db.query(
       `SELECT machine_id, SUM(running) AS running, MAX(last_at) AS last_at FROM (

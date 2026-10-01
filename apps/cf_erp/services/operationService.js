@@ -103,6 +103,7 @@ export async function createOperation(db, c, input = {}) {
     'INSERT INTO cf_operations (company_id, code, name, description, status, created_by) VALUES (?, ?, ?, ?, ?, ?)',
     [c.companyId, f.code, f.name, f.description ?? null, f.status ?? 'active', c.userId],
   );
+  clearProductionMachines(c.companyId);
   return getOperation(db, c.companyId, r.insertId);
 }
 
@@ -115,6 +116,7 @@ export async function updateOperation(db, c, id, input = {}) {
     await db.query(`UPDATE cf_operations SET ${Object.keys(f).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(f), c.companyId, id]);
   }
+  clearProductionMachines(c.companyId);
   return getOperation(db, c.companyId, id);
 }
 
@@ -130,6 +132,7 @@ export async function deleteOperation(db, c, id) {
   if (reasons.length) throw conflict('IN_USE', `${o.code} cannot be deleted: ${reasons.join('; ')}. Mark it inactive instead.`, { problems: reasons });
   await db.query('UPDATE cf_operation_machine_rules SET deleted_at = NOW() WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE cf_operations SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
+  clearProductionMachines(c.companyId);
   return { ok: true };
 }
 
@@ -248,6 +251,7 @@ export async function createTimingRule(db, c, operationId, input = {}) {
     [c.companyId, operationId, subjectType, subjectId, body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id,
       body.work_minutes, body.work_formula_id, body.effective_from, body.effective_to, body.notes, c.userId],
   );
+  clearProductionMachines(c.companyId);
   return (await listTimingRules(db, c.companyId, operationId)).find((x) => x.id === r.insertId);
 }
 
@@ -271,12 +275,14 @@ export async function updateTimingRule(db, c, id, input = {}) {
     [body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id, body.work_minutes, body.work_formula_id,
       body.effective_from, body.effective_to, body.notes, c.companyId, id],
   );
+  clearProductionMachines(c.companyId);
   return (await listTimingRules(db, c.companyId, rule.operation_id)).find((x) => x.id === id);
 }
 
 export async function deleteTimingRule(db, c, id) {
   await requireRule(db, c.companyId, id);
   await db.query('UPDATE cf_operation_machine_rules SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
+  clearProductionMachines(c.companyId);
   return { ok: true };
 }
 
@@ -330,6 +336,66 @@ export async function machinesForOperation(db, companyId, operationId, date = to
     if (rule) out.push({ machine: { id: m.id, code: m.code, name: m.name }, eligible: rule.eligible, from: rule.subject, setup: rule.setup, work: rule.work });
   }
   return out.sort((a, b) => Number(b.eligible) - Number(a.eligible));
+}
+
+// --- production machines -----------------------------------------------------------
+
+/**
+ * Which machines are PRODUCTION machines: some active operation can run on them.
+ * A machine qualifies when, for at least one active operation, the winning timing
+ * rule valid today (the machine's own, else the deepest machine type above it —
+ * the same precedence as operationsForMachine) is eligible. Contractor rules name
+ * no machine, so they never count. The plant register also holds vehicles, panels
+ * and tools that no operation reaches; production screens hide those.
+ *
+ * Set-based: 3 reads however many machines. Cached 60 s per company; every write
+ * that can change the answer (rules, operations, machines, the tree) calls
+ * clearProductionMachines.
+ */
+const PRODUCTION_TTL_MS = 60_000;
+const productionCache = new Map();
+export function clearProductionMachines(companyId) {
+  if (companyId == null) productionCache.clear(); else productionCache.delete(Number(companyId));
+}
+
+export async function productionMachineIds(db, companyId, date = today()) {
+  const hit = productionCache.get(Number(companyId));
+  if (hit && hit.date === date && Date.now() - hit.at < PRODUCTION_TTL_MS) return hit.ids;
+  const [[rules], [machines], [nodes]] = await Promise.all([
+    db.query(
+      `SELECT r.operation_id, r.subject_type, r.subject_id, r.eligible, r.effective_from
+         FROM cf_operation_machine_rules r
+         JOIN cf_operations o ON o.id = r.operation_id AND o.company_id = r.company_id AND o.deleted_at IS NULL AND o.status = 'active'
+        WHERE r.company_id = ? AND r.deleted_at IS NULL
+          AND (r.effective_from IS NULL OR r.effective_from <= ?) AND (r.effective_to IS NULL OR r.effective_to >= ?)`,
+      [companyId, date, date],
+    ),
+    db.query('SELECT id, classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+    db.query('SELECT id, parent_id, depth FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+  ]);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const bySubject = new Map();
+  for (const r of rules) {
+    const key = `${r.subject_type}:${r.subject_id}`;
+    if (!bySubject.has(key)) bySubject.set(key, []);
+    bySubject.get(key).push(r);
+  }
+  const ids = new Set();
+  for (const m of machines) {
+    const rank = new Map([[`machine:${m.id}`, 99]]);
+    let node = byId.get(m.classification_id);
+    for (let hop = 0; node && hop < LEAF_DEPTH + 3; hop++, node = byId.get(node.parent_id)) rank.set(`classification:${node.id}`, node.depth);
+    const best = new Map(); // operation id -> { r, rk } the winning rule
+    for (const [key, rk] of rank) {
+      for (const r of bySubject.get(key) ?? []) {
+        const cur = best.get(r.operation_id);
+        if (!cur || rk > cur.rk || (rk === cur.rk && String(dateText(r.effective_from) ?? '') > String(dateText(cur.r.effective_from) ?? ''))) best.set(r.operation_id, { r, rk });
+      }
+    }
+    for (const { r } of best.values()) if (r.eligible) { ids.add(m.id); break; }
+  }
+  productionCache.set(Number(companyId), { at: Date.now(), date, ids });
+  return ids;
 }
 
 /** Every active operation a machine has a rule for — what it can (and cannot) do. */
