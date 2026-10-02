@@ -49,7 +49,8 @@ router.delete('/orders/:id/revision', guard(PERM.orders), handle((req) => tx(req
 router.post('/orders/:id/lines', guard(PERM.orders), handle((req) => tx(req, (db, c) => addOrderLine(db, c, id(req), req.body ?? {}))));
 router.put('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrderLine(db, c, id(req), req.body ?? {}))));
 router.delete('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => removeOrderLine(db, c, id(req)))));
-router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle((req) => lineStructure(pool, ctx(req).companyId, id(req))));
+// A read that may write: an editable line's selection rows the system can answer (a default, or one candidate) are chosen first — so it runs in a transaction.
+router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle((req) => tx(req, (db, c) => lineStructure(db, c.companyId, id(req), { c }))));
 
 // Cut plates change the line's structure, so they sit behind the same grant as
 // the rest of it: seeing them is a read, working them out is managing the order.

@@ -60,23 +60,22 @@ export async function screenTree(db, companyId, screen, { all = false } = {}) {
         WHERE company_id = ? AND subject_type = 'classification' AND deleted_at IS NULL GROUP BY subject_id`,
       [companyId],
     ),
-    // A selection's candidate branch — the node it searches.
+    // The branches a selection picks from (init.sql §42 node entries)...
     db.query(
-      `SELECT d.candidate_classification_id AS id, COUNT(*) AS n
-         FROM cf_definition_details d
-         JOIN cf_master_records m ON m.company_id = d.company_id AND m.id = d.master_id AND m.deleted_at IS NULL
-        WHERE d.company_id = ? AND d.deleted_at IS NULL AND d.definition_type = 'selection'
-          AND d.candidate_classification_id IS NOT NULL
-        GROUP BY d.candidate_classification_id`,
+      `SELECT a.node_id AS id, COUNT(DISTINCT a.definition_id) AS n
+         FROM cf_selection_scope a
+         JOIN cf_master_records m ON m.company_id = a.company_id AND m.id = a.definition_id AND m.deleted_at IS NULL
+        WHERE a.company_id = ? AND a.node_id IS NOT NULL
+        GROUP BY a.node_id`,
       [companyId],
     ),
-    // ...and the branches of the items on its allowed list.
+    // ...and the branches of the single items it picks from.
     db.query(
       `SELECT i.classification_id AS id, COUNT(DISTINCT a.definition_id) AS n
-         FROM cf_definition_allowed_items a
+         FROM cf_selection_scope a
          JOIN cf_master_records d ON d.company_id = a.company_id AND d.id = a.definition_id AND d.deleted_at IS NULL
          JOIN cf_master_records i ON i.company_id = a.company_id AND i.id = a.item_id AND i.deleted_at IS NULL
-        WHERE a.company_id = ? AND a.deleted_at IS NULL AND i.classification_id IS NOT NULL
+        WHERE a.company_id = ? AND a.item_id IS NOT NULL AND i.classification_id IS NOT NULL
         GROUP BY i.classification_id`,
       [companyId],
     ),

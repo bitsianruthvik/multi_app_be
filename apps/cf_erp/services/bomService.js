@@ -23,7 +23,7 @@ import {
   createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf,
 } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
-import { findCandidates } from './selectionService.js';
+import { findCandidates, isCutPlateRecord, CUT_PLATE_CLASS_CODE } from './selectionService.js';
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
@@ -101,6 +101,7 @@ function shapeLine(l, hasBom) {
     },
     design: { id: l.design_id, code: l.design_code, name: l.design_name },
     selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
+    autoChosen: !!l.auto_chosen && l.child_record_kind === 'item',
     resolved: l.child_record_kind === 'item',
     sourceLineId: l.source_line_id,
     // The flow this line names, and the one that applies (line, else the child's default).
@@ -165,7 +166,9 @@ export async function getBom(db, companyId, parentId) {
     order: order ? { id: order.id, code: order.code, status: order.status, released: !!parent.owner_release_id, locked: !!parent.owner_line_locked_at } : null,
     bom: shapeBom(bom),
     lines: lines.map((l) => shapeLine(l, childBoms.has(l.child_id))),
-    unresolvedSelections: lines.filter((l) => l.child_record_kind === 'definition' && l.selection_definition_id).length,
+    // A cut plate's raw plate is chosen by nesting, not a person — not counted (processService underCutPlate).
+    unresolvedSelections: (await isCutPlateRecord(db, companyId, parent.id)) ? 0
+      : lines.filter((l) => l.child_record_kind === 'definition' && l.selection_definition_id).length,
   };
 }
 
@@ -235,8 +238,9 @@ export async function addLine(db, c, parentId, input = {}) {
   if (bomType === 'custom' && childKind === 'template') {
     await instantiateTemplate(db, c, { definition: child, ownerLineId: parent.owner_order_line_id, place: { bom, ...common } });
   } else if (bomType === 'custom' && childKind === 'selection') {
-    const pick = await defaultCandidate(db, c.companyId, child.id);
-    await insertLine(db, c, { bomId: bom.id, childId: pick?.id ?? child.id, designId: child.id, selectionDefinitionId: child.id, ...common });
+    // Its default (when a candidate) or its only candidate, marked "default · change" — never a cut plate's raw plate (nesting chooses it).
+    const pick = (await isCutPlateRecord(db, c.companyId, parent.id)) ? null : await defaultCandidate(db, c.companyId, child.id);
+    await insertLine(db, c, { bomId: bom.id, childId: pick?.id ?? child.id, designId: child.id, selectionDefinitionId: child.id, autoChosen: pick ? 1 : null, ...common });
   } else {
     await insertLine(db, c, { bomId: bom.id, childId: child.id, designId: child.id, ...common });
   }
@@ -351,6 +355,8 @@ export async function lineCandidates(db, companyId, lineId, { limit, search } = 
     lineId: line.id,
     selection: { id: line.selection_definition_id, code: line.selection_code, name: line.selection_name },
     chosenItemId: line.child_record_kind === 'item' ? line.child_id : null,
+    // The system chose it (default, or only candidate) and no person has since — "Keep this item" makes it a person's choice.
+    autoChosen: line.child_record_kind === 'item' && line.auto_chosen === 1,
     ...found,
   };
 }
@@ -368,10 +374,14 @@ export async function resolveLine(db, c, lineId, { itemId } = {}) {
     if (!pick) throw invalid('NOT_A_CANDIDATE', `That item does not satisfy ${line.selection_code ?? line.selection_name}.`);
     childId = pick.id;
   }
+  // A person's choice — or a person clearing one — is final: auto_chosen 0, so
+  // the "default · change" tag goes and the system never fills it again.
   if (childId !== line.child_id) {
-    await db.query('UPDATE cf_bom_lines SET child_id = ? WHERE company_id = ? AND id = ?', [childId, c.companyId, lineId]);
+    await db.query('UPDATE cf_bom_lines SET child_id = ?, auto_chosen = 0 WHERE company_id = ? AND id = ?', [childId, c.companyId, lineId]);
     await refreshValues(db, c, [parent.id]);
     // The chosen item's short name decides which count the row joins.
+  } else if (line.auto_chosen !== 0) {
+    await db.query('UPDATE cf_bom_lines SET auto_chosen = 0 WHERE company_id = ? AND id = ?', [c.companyId, lineId]);
   }
   return getBom(db, c.companyId, parent.id);
 }
@@ -441,6 +451,7 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
   const stats = { nodes: 1, temporary: kindOf(root) === 'temporary' ? 1 : 0, drafts: root.status === 'draft' && kindOf(root) !== 'temporary' ? 1 : 0, unresolved: 0, maxDepth: 0 };
   let frontier = rootBom ? [rootNode] : [];
   let truncated = false;
+  const unresolvedNodes = [];
   for (let depth = 1; frontier.length; depth++) {
     if (depth > maxDepth) { truncated = true; break; }
     // One BOM can hang under SEVERAL parents at the same level — a blank that
@@ -470,6 +481,8 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
           lineId: l.id, lineNo: l.line_no, position: l.position, role: l.role,
           selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
           resolved: l.child_record_kind === 'item',
+          // The system chose it (the selection's default, or its only candidate) and no person has since.
+          autoChosen: !!l.auto_chosen && l.child_record_kind === 'item',
           flow: effectiveFlowOf(l),
           bom: cb ? { id: cb.id, bomType: cb.bom_type, status: cb.status, revision: cb.revision } : null,
           children: [],
@@ -479,11 +492,26 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
         stats.maxDepth = Math.max(stats.maxDepth, depth);
         if (kind === 'temporary') stats.temporary++;
         if (l.child_status === 'draft' && kind !== 'temporary') stats.drafts++;
-        if (l.selection_definition_id && l.child_record_kind === 'definition') stats.unresolved++;
+        if (l.selection_definition_id && l.child_record_kind === 'definition') { stats.unresolved++; unresolvedNodes.push({ node, parentId: parentNode.id }); }
         if (cb) next.push(node);
       }
     }
     frontier = next;
+  }
+  // A cut plate's raw plate still to choose is NESTING's to choose, not a
+  // person's: marked, and left out of the count (processService underCutPlate).
+  if (unresolvedNodes.length) {
+    const [cut] = await db.query(
+      `SELECT pm.id FROM cf_master_records pm JOIN cf_classification_nodes pcls ON pcls.id = pm.classification_id
+        WHERE pm.company_id = ? AND pm.id IN (?) AND pcls.code = ?`,
+      [companyId, [...new Set(unresolvedNodes.map((u) => u.parentId))], CUT_PLATE_CLASS_CODE],
+    );
+    const cutIds = new Set(cut.map((r) => r.id));
+    for (const u of unresolvedNodes) {
+      if (!cutIds.has(u.parentId)) continue;
+      u.node.underCutPlate = true;
+      stats.unresolved--;
+    }
   }
   return { root: rootNode, stats, truncated };
 }

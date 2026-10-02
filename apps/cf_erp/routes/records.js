@@ -28,10 +28,13 @@
  *   POST   /records/:id/revision       { revision? }  (empty = next label)
  *   DELETE /records/:id
  *
- *   GET    /definitions/:id/selection   allowed list + criteria
- *   GET    /definitions/:id/candidates  the catalog items it resolves to now
- *   POST   /definitions/:id/allowed-items   { itemId, isDefault? }
- *   POST   /allowed-items/:id/default
+ *   GET    /definitions/:id/selection   what it picks from (entries) + criteria
+ *   GET    /definitions/:id/candidates  the catalog items it resolves to now (union of entries ∩ criteria)
+ *   POST   /definitions/:id/scope           { nodeId } | { itemId, isDefault? }  (init.sql §42)
+ *   POST   /selection-scope/:id/default     { isDefault? }  — false takes the star off
+ *   DELETE /selection-scope/:id
+ *   POST   /definitions/:id/allowed-items   { itemId, isDefault? }   (older screens: an item entry)
+ *   POST   /allowed-items/:id/default       (older screens: the id is the entry's)
  *   DELETE /allowed-items/:id
  *   POST   /definitions/:id/criteria        { specificationId, operator, value, valueTo? }
  *   PUT    /criteria/:id
@@ -47,7 +50,7 @@ import {
 import { setValues, getHistory } from '../services/valueService.js';
 import {
   getSelection, findCandidates, addAllowedItem, setDefaultAllowed, removeAllowedItem,
-  addCriterion, updateCriterion, removeCriterion,
+  addEntry, setDefaultEntry, removeEntry, addCriterion, updateCriterion, removeCriterion,
 } from '../services/selectionService.js';
 import { createCatalogNode } from '../services/classificationService.js';
 import { addCatalogOption } from '../services/specificationService.js';
@@ -103,8 +106,12 @@ router.post('/records/:id/status', guard(PERM.catalog), handle((req) => tx(req, 
 router.post('/records/:id/revision', guard(PERM.catalog), handle((req) => tx(req, (db, c) => reviseRecord(db, c, id(req), req.body))));
 router.delete('/records/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => deleteRecord(db, c, id(req)))));
 
-router.get('/definitions/:id/selection', guard(PERM.view), handle((req) => getSelection(pool, ctx(req).companyId, id(req))));
+// A selection still on its old columns has them written as entries on first read (selectionService.adoptLegacy) — so a transaction.
+router.get('/definitions/:id/selection', guard(PERM.view), handle((req) => tx(req, (db, c) => getSelection(db, c.companyId, id(req), { c }))));
 router.get('/definitions/:id/candidates', guard(PERM.view), handle((req) => findCandidates(pool, ctx(req).companyId, id(req), { limit: req.query.limit, search: req.query.search, itemId: req.query.itemId })));
+router.post('/definitions/:id/scope', guard(PERM.catalog), handle((req) => tx(req, (db, c) => addEntry(db, c, id(req), req.body ?? {}))));
+router.post('/selection-scope/:id/default', guard(PERM.catalog), handle((req) => tx(req, (db, c) => setDefaultEntry(db, c, id(req), req.body ?? {}))));
+router.delete('/selection-scope/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => removeEntry(db, c, id(req)))));
 router.post('/definitions/:id/allowed-items', guard(PERM.catalog), handle((req) => tx(req, (db, c) => addAllowedItem(db, c, id(req), req.body))));
 router.post('/allowed-items/:id/default', guard(PERM.catalog), handle((req) => tx(req, (db, c) => setDefaultAllowed(db, c, id(req)))));
 router.delete('/allowed-items/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => removeAllowedItem(db, c, id(req)))));

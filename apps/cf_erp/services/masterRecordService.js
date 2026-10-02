@@ -28,6 +28,7 @@ import { wantsPage, pageArgs, orderBy, likeOf, pageOf } from '../lib/listing.js'
 import { requireUsableFlow } from './flowService.js';
 import { readPrice, readBasis, readCurrency } from './priceService.js';
 import { readItemTax } from './taxService.js';
+import { writeEntries, addEntry, entryCount, deleteSelectionRules } from './selectionService.js';
 
 const TEMP_TAX_MESSAGE = 'A row of an order\'s structure takes its HSN code and GST rate from its template — set them there.';
 const SELECTION_TAX_MESSAGE = 'A selection takes its HSN code and GST rate from the catalog item it picks — set them on the item.';
@@ -73,11 +74,19 @@ function readBase(input, problems) {
   return { code, name, shortName, revision, description: blank(input.description) ? null : String(input.description), status: input.status ?? 'draft' };
 }
 
+/**
+ * A selection's "picks from" on create / update (init.sql §42). The entries are
+ * the rule now: `scope` = [{ nodeId } | { itemId, isDefault? }]. selectionMode is
+ * accepted from older screens and otherwise ignored — it is derived from the
+ * entries (selectionService.syncLegacy). An older screen's candidateClassificationId
+ * becomes a branch entry unless its mode said the node was not used.
+ */
 async function readSelection(db, companyId, definitionType, input, problems, existing = null) {
   if (definitionType !== 'selection') {
-    if (input.selectionMode || input.candidateClassificationId) problems.push('Only selection definitions have a selection mode and a search area.');
-    return { selectionMode: null, candidateClassificationId: null };
+    if (input.selectionMode || input.candidateClassificationId || (Array.isArray(input.scope) && input.scope.length)) problems.push('Only selection definitions pick from branches and items.');
+    return { selectionMode: null, candidateClassificationId: null, scope: [] };
   }
+  if (input.scope !== undefined && !Array.isArray(input.scope)) problems.push('What it picks from is a list of branches and items.');
   const selectionMode = input.selectionMode ?? existing?.selection_mode ?? 'allowed_list';
   if (!SELECTION_MODES.includes(selectionMode)) problems.push('Selection mode is allowed_list, spec_match or both.');
   const raw = input.candidateClassificationId !== undefined ? input.candidateClassificationId : existing?.candidate_classification_id ?? null;
@@ -87,7 +96,11 @@ async function readSelection(db, companyId, definitionType, input, problems, exi
     if (!area) problems.push('The search area does not exist.');
     else if (area.scope === 'machine') problems.push('The search area is a machine family — a selection searches catalog items.');
   }
-  return { selectionMode, candidateClassificationId };
+  const scope = Array.isArray(input.scope) ? [...input.scope] : [];
+  if (candidateClassificationId != null && selectionMode !== 'allowed_list' && !scope.some((e) => Number(e?.nodeId) === candidateClassificationId)) {
+    scope.unshift({ nodeId: candidateClassificationId });
+  }
+  return { selectionMode, candidateClassificationId, scope };
 }
 
 /**
@@ -208,6 +221,8 @@ export async function createDefinition(db, c, input = {}) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [r.insertId, c.companyId, definitionType, sel.selectionMode, sel.candidateClassificationId, tax.hsn_code ?? null, tax.gst_rate ?? null, tax.is_service ?? 0],
   );
+  // What it picks from — the old columns follow (selectionService.syncLegacy).
+  if (definitionType === 'selection') await writeEntries(db, c, r.insertId, sel.scope);
   return finishCreate(db, c, r.insertId, 'definition', base, input);
 }
 
@@ -222,6 +237,7 @@ export async function updateRecord(db, c, id, input = {}) {
   const problems = [];
   const sets = {};
   const detail = {};
+  const laterEntries = [];
 
   if (input.name !== undefined) {
     const name = String(input.name ?? '').trim();
@@ -299,11 +315,11 @@ export async function updateRecord(db, c, id, input = {}) {
     if (input.ownerOrderLineId !== undefined && Number(input.ownerOrderLineId) !== m.owner_order_line_id) problems.push('The owner order line is set when a temporary item is created.');
   } else {
     if (input.definitionType !== undefined && input.definitionType !== m.definition_type) problems.push('A definition stays a template or a selection.');
+    // The mode is derived now; an older screen's search area becomes a branch entry (after the checks below).
     if (input.selectionMode !== undefined || input.candidateClassificationId !== undefined) {
       const sel = await readSelection(db, c.companyId, m.definition_type, input, problems, m);
-      if (m.definition_type === 'selection') {
-        detail.selection_mode = sel.selectionMode;
-        detail.candidate_classification_id = sel.candidateClassificationId;
+      if (m.definition_type === 'selection' && input.candidateClassificationId != null && input.candidateClassificationId !== '') {
+        laterEntries.push(...sel.scope.filter((e) => e.nodeId != null));
       }
     }
   }
@@ -324,6 +340,9 @@ export async function updateRecord(db, c, id, input = {}) {
     const table = m.record_kind === 'item' ? 'cf_item_details' : 'cf_definition_details';
     await db.query(`UPDATE ${table} SET ${Object.keys(detail).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND master_id = ?`,
       [...Object.values(detail), c.companyId, id]);
+  }
+  for (const e of laterEntries) {
+    try { await addEntry(db, c, id, e); } catch (err) { if (err.code !== 'DUPLICATE_ENTRY') throw err; }
   }
   if (moved && m.record_kind === 'definition' && m.definition_type === 'template') {
     // Its temporary items follow it (Q20), and inherit from the new place.
@@ -371,13 +390,8 @@ export async function setStatus(db, c, id, status) {
       for (const s of r.missingRequired) problems.push(`${s.code} (${s.name}) is required.`);
       problems.push(...r.problems);
     } else if (m.definition_type === 'selection') {
-      const [[counts]] = await db.query(
-        `SELECT (SELECT COUNT(*) FROM cf_definition_allowed_items WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL) AS allowed,
-                (SELECT COUNT(*) FROM cf_selection_criteria WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL) AS criteria`,
-        [c.companyId, id, c.companyId, id],
-      );
-      if (['allowed_list', 'both'].includes(m.selection_mode) && !Number(counts.allowed)) problems.push('The allowed list is empty.');
-      if (['spec_match', 'both'].includes(m.selection_mode) && !Number(counts.criteria)) problems.push('There are no matching criteria.');
+      // At least one branch or item to pick from (init.sql §42); spec filters are optional.
+      if (!(await entryCount(db, c.companyId, id))) problems.push('It picks from nothing yet — add a branch of the classification or a catalog item.');
     }
     if (problems.length) throw invalid('INCOMPLETE', `${code ?? m.name} cannot be activated yet.`, { problems });
   }
@@ -439,12 +453,12 @@ export async function deleteRecord(db, c, id) {
     if (rules.length) reasons.push(`coding rule(s) ${rules.map((r) => r.code).join(', ')} test it`);
   } else {
     const [rows] = await db.query(
-      `SELECT DISTINCT dm.code, dm.name FROM cf_definition_allowed_items a
+      `SELECT DISTINCT dm.code, dm.name FROM cf_selection_scope a
          JOIN cf_master_records dm ON dm.id = a.definition_id AND dm.deleted_at IS NULL
-        WHERE a.company_id = ? AND a.item_id = ? AND a.deleted_at IS NULL`,
+        WHERE a.company_id = ? AND a.item_id = ?`,
       [c.companyId, id],
     );
-    if (rows.length) reasons.push(`it is on the allowed list of ${rows.map((r) => r.code ?? r.name).join(', ')}`);
+    if (rows.length) reasons.push(`${rows.map((r) => r.code ?? r.name).join(', ')} pick${rows.length === 1 ? 's' : ''} from it`);
     const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_stock_ledger WHERE company_id = ? AND item_id = ?', [c.companyId, id]);
     if (Number(n)) reasons.push('it has stock history — mark it obsolete instead');
   }
@@ -452,8 +466,7 @@ export async function deleteRecord(db, c, id) {
     throw conflict('IN_USE', `${m.code ?? m.name} cannot be deleted: ${reasons.join('; ')}.`, { problems: reasons });
   }
   if (m.record_kind === 'definition') {
-    await db.query('UPDATE cf_definition_allowed_items SET deleted_at = NOW() WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-    await db.query('UPDATE cf_selection_criteria SET deleted_at = NOW() WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+    await deleteSelectionRules(db, c, id);
   }
   await deleteBomOf(db, c, id);
   await deleteValues(db, c, 'master', id);
@@ -519,11 +532,12 @@ export async function getRecord(db, companyId, id) {
     const [[counts]] = await db.query(
       `SELECT (SELECT COUNT(*) FROM cf_item_details i JOIN cf_master_records mr ON mr.id = i.master_id AND mr.deleted_at IS NULL
                 WHERE i.company_id = ? AND i.source_definition_id = ? AND i.deleted_at IS NULL) AS temporary_items,
-              (SELECT COUNT(*) FROM cf_definition_allowed_items WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL) AS allowed_items,
+              (SELECT COUNT(*) FROM cf_selection_scope WHERE company_id = ? AND definition_id = ? AND item_id IS NOT NULL) AS allowed_items,
+              (SELECT COUNT(*) FROM cf_selection_scope WHERE company_id = ? AND definition_id = ? AND node_id IS NOT NULL) AS branches,
               (SELECT COUNT(*) FROM cf_selection_criteria WHERE company_id = ? AND definition_id = ? AND deleted_at IS NULL) AS criteria`,
-      [companyId, id, companyId, id, companyId, id],
+      [companyId, id, companyId, id, companyId, id, companyId, id],
     );
-    out.counts = { temporaryItems: Number(counts.temporary_items), allowedItems: Number(counts.allowed_items), criteria: Number(counts.criteria) };
+    out.counts = { temporaryItems: Number(counts.temporary_items), allowedItems: Number(counts.allowed_items), branches: Number(counts.branches), criteria: Number(counts.criteria) };
   }
   if (m.candidate_classification_id) {
     const n = await loadNode(db, companyId, m.candidate_classification_id);

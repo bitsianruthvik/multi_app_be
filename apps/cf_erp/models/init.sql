@@ -4324,3 +4324,104 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_classification_nodes' AND COLUMN_NAME = 'created_in');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_classification_nodes ADD COLUMN created_in VARCHAR(16) NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ===========================================================================
+-- 42. WHAT A SELECTION PICKS FROM — a list of branches and items (and the
+--     row a person has not chosen yet)
+-- ===========================================================================
+--
+-- 2026-10-02 (agreed with the user). A selection used to choose from ONE
+-- optional classification node, OR an allowed list, OR both (intersected),
+-- with a mode switch saying which. Now it picks from a LIST OF ENTRIES:
+--   node_id  a classification node at ANY level — its whole subtree
+--   item_id  one catalog item (is_default = the starred default, at most one)
+-- Candidates = the UNION of the entries, then narrowed by the spec filters
+-- (cf_selection_criteria, unchanged: same spec OR, different specs AND).
+-- Exactly one of node_id / item_id per row (service rule). Hard-deleted, like
+-- §40: a removed entry has no history worth keeping.
+--
+-- The old columns stay and are KEPT IN STEP by selectionService (syncLegacy):
+-- cf_definition_details.candidate_classification_id = the first node entry
+-- (cut plates still find "the selection that searches PLATE" by it),
+-- selection_mode derived (items only = allowed_list, nodes only = spec_match,
+-- both = both — now meaning union), cf_definition_allowed_items = the item
+-- entries. That is also what keeps the migration below idempotent: it only
+-- fills a selection that has NO entry yet, and a selection emptied through
+-- the new code has nothing left in the old columns to be filled from.
+CREATE TABLE IF NOT EXISTS cf_selection_scope (
+  id             INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT        NOT NULL,
+  definition_id  INT        NOT NULL,              -- a selection definition
+  node_id        INT        NULL,                  -- a classification node (its subtree)
+  item_id        INT        NULL,                  -- or one catalog item
+  is_default     TINYINT(1) NOT NULL DEFAULT 0,    -- item entries only
+  sort_order     INT        NOT NULL DEFAULT 0,
+  created_by     INT        NULL,
+  created_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+
+  KEY idx_cssc_def  (company_id, definition_id),
+  KEY idx_cssc_node (company_id, node_id),
+  KEY idx_cssc_item (company_id, item_id),
+
+  CONSTRAINT fk_cssc_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cssc_def     FOREIGN KEY (company_id, definition_id) REFERENCES cf_definition_details(company_id, master_id),
+  CONSTRAINT fk_cssc_node    FOREIGN KEY (company_id, node_id)       REFERENCES cf_classification_nodes(company_id, id),
+  CONSTRAINT fk_cssc_item    FOREIGN KEY (company_id, item_id)       REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_cssc_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- Migration, the narrowest faithful translation of the old rule:
+--   spec_match + node        -> the node entry (criteria unchanged)
+--   spec_match, no node      -> one entry per top-level item branch (the old
+--                               "whole catalog"), so nothing is lost
+--   allowed_list (or NULL)   -> the item entries (an old node was ignored)
+--   both, no node            -> the item entries (items ∩ criteria = old rule)
+--   both + node              -> ONLY the item entries that lie inside the node
+--                               (old = items ∩ node ∩ criteria; a node entry
+--                               would WIDEN it to the whole branch)
+-- Each statement fills only a selection that has no entry at all.
+INSERT INTO cf_selection_scope (company_id, definition_id, node_id, item_id, is_default, sort_order)
+SELECT d.company_id, d.master_id, d.candidate_classification_id, NULL, 0, 0
+  FROM cf_definition_details d
+  JOIN cf_master_records m ON m.company_id = d.company_id AND m.id = d.master_id AND m.deleted_at IS NULL
+ WHERE d.deleted_at IS NULL AND d.definition_type = 'selection' AND d.selection_mode = 'spec_match'
+   AND d.candidate_classification_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_selection_scope s WHERE s.company_id = d.company_id AND s.definition_id = d.master_id);
+
+INSERT INTO cf_selection_scope (company_id, definition_id, node_id, item_id, is_default, sort_order)
+SELECT d.company_id, d.master_id, n.id, NULL, 0, n.sort_order
+  FROM cf_definition_details d
+  JOIN cf_master_records m ON m.company_id = d.company_id AND m.id = d.master_id AND m.deleted_at IS NULL
+  JOIN cf_classification_nodes n ON n.company_id = d.company_id AND n.parent_id IS NULL AND n.deleted_at IS NULL AND n.scope <> 'machine'
+ WHERE d.deleted_at IS NULL AND d.definition_type = 'selection' AND d.selection_mode = 'spec_match'
+   AND d.candidate_classification_id IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_selection_scope s WHERE s.company_id = d.company_id AND s.definition_id = d.master_id);
+
+-- Items: allowed_list / NULL / both. For 'both' with a node the item's own
+-- branch must be the node or below it (at most four levels up — the tree has
+-- three; a self-join chain rather than a recursive CTE inside an INSERT).
+INSERT INTO cf_selection_scope (company_id, definition_id, node_id, item_id, is_default, sort_order)
+SELECT a.company_id, a.definition_id, NULL, a.item_id, a.is_default, a.sort_order
+  FROM cf_definition_allowed_items a
+  JOIN cf_definition_details d ON d.company_id = a.company_id AND d.master_id = a.definition_id AND d.deleted_at IS NULL
+  JOIN cf_master_records m ON m.company_id = d.company_id AND m.id = d.master_id AND m.deleted_at IS NULL
+  JOIN cf_master_records i ON i.company_id = a.company_id AND i.id = a.item_id AND i.deleted_at IS NULL
+  LEFT JOIN cf_classification_nodes p1 ON p1.company_id = i.company_id AND p1.id = i.classification_id
+  LEFT JOIN cf_classification_nodes p2 ON p2.company_id = p1.company_id AND p2.id = p1.parent_id
+  LEFT JOIN cf_classification_nodes p3 ON p3.company_id = p2.company_id AND p3.id = p2.parent_id
+  LEFT JOIN cf_classification_nodes p4 ON p4.company_id = p3.company_id AND p4.id = p3.parent_id
+ WHERE a.deleted_at IS NULL AND d.definition_type = 'selection'
+   AND (d.selection_mode IS NULL OR d.selection_mode IN ('allowed_list', 'both'))
+   AND (d.selection_mode IS NULL OR d.selection_mode = 'allowed_list' OR d.candidate_classification_id IS NULL
+        OR d.candidate_classification_id IN (p1.id, p2.id, p3.id, p4.id))
+   AND NOT EXISTS (SELECT 1 FROM cf_selection_scope s WHERE s.company_id = a.company_id AND s.definition_id = a.definition_id AND s.node_id IS NOT NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_selection_scope s WHERE s.company_id = a.company_id AND s.definition_id = a.definition_id AND s.item_id = a.item_id);
+
+-- A row of an order whose catalog item the SYSTEM chose for a selection (its
+-- default, or its only candidate): 1 shows "default · change" on the row until
+-- a person chooses (which writes 0). NULL/0 = chosen by a person, or never a
+-- selection. No key (TiDB: never ADD KEY in the same ALTER as its column).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_bom_lines' AND COLUMN_NAME = 'auto_chosen');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_bom_lines ADD COLUMN auto_chosen TINYINT(1) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

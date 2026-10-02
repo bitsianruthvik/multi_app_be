@@ -484,7 +484,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   for (const part of chunk(sourceIds, ID_CHUNK)) {
     const [rows] = await db.query(
       `SELECT l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
-              l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes,
+              l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes, l.auto_chosen,
               ci.item_type AS child_item_type, cm.classification_id AS child_classification_id,
               cm.name AS child_name
          FROM cf_bom_lines l
@@ -898,7 +898,7 @@ async function copyInto(db, c, snap, ch, afterLineId) {
   // ---- the top line, into the target's BOM ----------------------------------
   const topChild = ch.mode === 'copy' ? idMap.get(row.child_id) : row.child_id;
   await insertRows(db, 'cf_bom_lines', LINE_COLUMNS, [[companyId, bom.id, lineNo, topChild, row.design_id, position, ch.role !== undefined ? ch.role : copyRole(row.role), quantity,
-    row.selection_definition_id, row.source_line_id, row.operation_flow_id, row.notes, c.userId]]);
+    row.selection_definition_id, row.source_line_id, row.operation_flow_id, row.notes, c.userId, row.auto_chosen ?? null]]);
   const [[top]] = await db.query(
     'SELECT id FROM cf_bom_lines WHERE company_id = ? AND bom_id = ? AND design_id = ? AND position = ?',
     [companyId, bom.id, row.design_id, position],

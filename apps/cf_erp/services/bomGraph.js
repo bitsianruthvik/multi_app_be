@@ -32,7 +32,7 @@ export async function bomsOfParents(db, companyId, parentIds) {
 
 const LINE_COLUMNS = `
   l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
-  l.selection_definition_id, l.source_line_id, l.notes, l.operation_flow_id,
+  l.selection_definition_id, l.source_line_id, l.notes, l.operation_flow_id, l.auto_chosen,
   ch.code AS child_code, ch.name AS child_name, ch.record_kind AS child_record_kind, ch.status AS child_status,
   ci.item_type AS child_item_type, ci.uom AS child_uom, ci.tracked_by AS child_tracked_by,
   cd.definition_type AS child_definition_type,
@@ -251,10 +251,10 @@ export async function createBom(db, c, { parentId, bomType, sourceBomId = null, 
 export async function insertLine(db, c, l) {
   const [r] = await db.query(
     `INSERT INTO cf_bom_lines
-       (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, selection_definition_id, source_line_id, operation_flow_id, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, selection_definition_id, source_line_id, operation_flow_id, notes, created_by, auto_chosen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, l.bomId, l.lineNo, l.childId, l.designId, l.position, l.role ?? null, l.quantity,
-      l.selectionDefinitionId ?? null, l.sourceLineId ?? null, l.operationFlowId ?? null, l.notes ?? null, c.userId],
+      l.selectionDefinitionId ?? null, l.sourceLineId ?? null, l.operationFlowId ?? null, l.notes ?? null, c.userId, l.autoChosen ?? null],
   );
   return r.insertId;
 }

@@ -52,7 +52,29 @@ export async function listOperations(db, companyId, q = {}) {
        FROM cf_operations o WHERE ${where.join(' AND ')} ORDER BY o.code`,
     params,
   );
-  return rows.map(shapeOp);
+  const out = rows.map(shapeOp);
+  // The row's headline: ONE read of every rule of the company (the list is a few dozen
+  // operations; a call per row costs ~49 ms each on the production link), grouped here.
+  if (out.length) {
+    const [rules] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.deleted_at IS NULL ORDER BY r.operation_id, r.id`, [companyId]);
+    const byOp = new Map();
+    for (const r of rules) { if (!byOp.has(r.operation_id)) byOp.set(r.operation_id, []); byOp.get(r.operation_id).push(r); }
+    for (const o of out) o.mainRule = mainRuleOf(byOp.get(o.id) ?? []);
+  }
+  return out;
+}
+
+/**
+ * The rule a list row shows: one on a machine type before one on a single machine, a rule valid
+ * today before a dated-out one, one that lets machines in before one that keeps them out, then the
+ * higher level of the tree, then the oldest. Null when the operation has no rule.
+ */
+export function mainRuleOf(rules, date = today()) {
+  if (!rules.length) return null;
+  const validToday = (r) => (!r.effective_from || dateText(r.effective_from) <= date) && (!r.effective_to || dateText(r.effective_to) >= date);
+  const rank = (r) => [r.subject_type === 'classification' ? 0 : 1, validToday(r) ? 0 : 1, r.eligible ? 0 : 1, r.node_depth ?? 99, r.id];
+  const best = [...rules].sort((a, b) => { const x = rank(a); const y = rank(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; })[0];
+  return shapeRule(best);
 }
 
 export async function getOperation(db, companyId, id) {

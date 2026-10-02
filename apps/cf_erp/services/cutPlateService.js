@@ -96,6 +96,8 @@ import { requireUsableFlow, cutPlateFlowId } from './flowService.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { readRulesOnce, PLACED, rangesOf } from './codeRangeService.js';
 import { generate } from '../modules/codegen/index.js';
+import { refreshValues } from './valueService.js';
+import { autofillLineSelections } from './selectionService.js';
 
 /** The four facts that make two parts the same blank. */
 const SPEC_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE'];
@@ -1746,6 +1748,8 @@ export async function ownerLineOf(db, companyId, recordId) {
  */
 export async function withCutPieces(db, c, lineId, out) {
   if (lineId == null) return out;
+  // Selection rows the system can answer on its own (a default, or one candidate) — before the cut pieces are worked out.
+  await autofillLineSelections(db, c, lineId, { refresh: (ids) => refreshValues(db, c, ids) });
   const cutPieces = await refreshCutPieces(db, c, lineId);
   return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, cutPieces } : out;
 }

@@ -33,7 +33,7 @@ import { dateText, parseJsonCol } from './resolutionService.js';
 export const MAX_COPY_DEPTH = 25;
 const ID_CHUNK = 500;   // ids per IN list
 export const LINE_COLUMNS = ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity',
-  'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by'];
+  'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by', 'auto_chosen'];
 
 const chunk = (xs, n) => { const out = []; for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n)); return out; };
 
@@ -76,7 +76,7 @@ export async function snapshotSubtrees(db, companyId, rootIds, copies) {
     for (const part of chunk(bomIds, ID_CHUNK)) {
       const [ls] = await db.query(
         `SELECT l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
-                l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes,
+                l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes, l.auto_chosen,
                 ci.item_type AS child_item_type, cm.classification_id AS child_classification_id,
                 cm.code AS child_code, cm.name AS child_name
            FROM cf_bom_lines l
@@ -259,7 +259,7 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
         throw invalid('BROKEN_LINE', `${snap.items.get(id).code ?? snap.items.get(id).name} has a line to a temporary item that no longer exists — remove that line, then copy it.`);
       }
       inner.push([companyId, bomMap.get(srcBom), l.line_no, child, l.design_id, l.position, l.role, l.quantity,
-        l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes, c.userId]);
+        l.selection_definition_id, l.source_line_id, l.operation_flow_id, l.notes, c.userId, l.auto_chosen ?? null]);
     }
   }
   if (inner.length) await insertRows(db, 'cf_bom_lines', LINE_COLUMNS, inner, rows);

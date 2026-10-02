@@ -40,6 +40,7 @@ import { generate } from '../modules/codegen/index.js';
 import { resolveProcess } from './processService.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import { salesOrderTax } from "./taxService.js";
+import { autofillLineSelections, PARENT_CLASS_JOIN, NOT_UNDER_CUT_PLATE_WHERE } from './selectionService.js';
 import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
 
 /**
@@ -311,9 +312,13 @@ async function structureStats(db, companyId, lineIds) {
        FROM cf_bom_lines l
        JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
        JOIN cf_item_details pi ON pi.master_id = b.parent_id AND pi.deleted_at IS NULL
+       JOIN cf_master_records pm ON pm.id = b.parent_id
        JOIN cf_master_records ch ON ch.id = l.child_id AND ch.record_kind = 'definition'
+       ${PARENT_CLASS_JOIN}
       WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.selection_definition_id IS NOT NULL
         AND pi.owner_order_line_id IN (?)
+        -- a cut plate's raw plate is nesting's to choose, not a person's (processService underCutPlate)
+        AND ${NOT_UNDER_CUT_PLATE_WHERE}
       GROUP BY pi.owner_order_line_id`,
     [companyId, lineIds],
   );
@@ -750,11 +755,17 @@ export async function removeOrderLine(db, c, lineId) {
   return getOrder(db, c.companyId, line.order_id);
 }
 
-/** The full structure a line sells: its Custom BOM, or the catalog item's Standard BOM. */
-export async function lineStructure(db, companyId, lineId) {
+/**
+ * The full structure a line sells: its Custom BOM, or the catalog item's Standard BOM.
+ * Given `c` (a transaction), an editable line's selection rows the system can
+ * answer on its own are chosen first (selectionService.autofillLineSelections —
+ * the default, or the only candidate; never a cut plate's raw plate).
+ */
+export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
   const line = await requireOrderLine(db, companyId, lineId);
   const o = await requireOrder(db, companyId, line.order_id);
   if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet.');
+  if (c) await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) });
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
   const released = !!(await releaseOfLine(db, companyId, line.id));
   return {

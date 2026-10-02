@@ -192,8 +192,8 @@ export async function deleteNode(db, c, id) {
     [c.companyId, id],
   );
   if (timings) reasons.push(`${timings} operation timing rule(s) set on it`);
-  const searchers = await count('SELECT COUNT(*) AS n FROM cf_definition_details WHERE company_id = ? AND candidate_classification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (searchers) reasons.push(`${searchers} selection definition(s) searching it`);
+  const searchers = await count('SELECT COUNT(DISTINCT definition_id) AS n FROM cf_selection_scope WHERE company_id = ? AND node_id = ?', [c.companyId, id]);
+  if (searchers) reasons.push(`${searchers} selection definition(s) picking from it`);
   const rules = await findConditionsReferencing(db, c.companyId, 'classification', id);
   if (rules.length) reasons.push(`coding rule(s) ${rules.map((r) => r.code).join(', ')}`);
   if (reasons.length) {

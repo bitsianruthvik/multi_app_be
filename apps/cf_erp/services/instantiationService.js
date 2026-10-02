@@ -23,7 +23,7 @@
 import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { loadMasters } from './records.js';
-import { findCandidates } from './selectionService.js';
+import { automaticPick } from './selectionService.js';
 import { deleteAllForSubject as deleteValues } from './valueService.js';
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { bomOfParent, bomsOfParents, linesOfBoms, childKindOf } from './bomGraph.js';
@@ -32,13 +32,8 @@ import { nameNewItems } from './codeRangeService.js';
 
 const MAX_DEPTH = 20;
 
-/** The catalog item a selection line starts with: its default, or its only candidate. */
-export async function defaultCandidate(db, companyId, selectionId) {
-  const { candidates } = await findCandidates(db, companyId, selectionId, { limit: 2 });
-  if (!candidates.length) return null;
-  if (candidates[0].isDefault) return candidates[0];
-  return candidates.length === 1 ? candidates[0] : null;
-}
+/** The catalog item a selection line starts with: its default (when it is a candidate), or its only candidate. Marked auto_chosen. */
+export const defaultCandidate = (db, companyId, selectionId) => automaticPick(db, companyId, selectionId);
 
 /**
  * The checks on the template itself, run before anything is written, so a
@@ -195,7 +190,7 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   // it is. Positions and line numbers are the template's.
   const rows = [];
   const line = (bomId, l) => [companyId, bomId, l.lineNo, l.childId, l.designId, l.position, l.role ?? null, l.quantity,
-    l.selectionDefinitionId ?? null, l.sourceLineId ?? null, l.operationFlowId ?? null, l.notes ?? null, c.userId];
+    l.selectionDefinitionId ?? null, l.sourceLineId ?? null, l.operationFlowId ?? null, l.notes ?? null, c.userId, l.autoChosen ?? null];
   if (place) {
     rows.push(line(place.bom.id, {
       lineNo: place.lineNo, childId: root.id, designId: definition.id, position: place.position, quantity: place.quantity,
@@ -214,14 +209,14 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
         rows.push(line(n.customBomId, { ...common, childId: child.id, designId: child.def.id }));
       } else if (kind === 'selection') {
         const pick = picks.get(tl.child_id);
-        rows.push(line(n.customBomId, { ...common, childId: pick?.id ?? tl.child_id, designId: tl.child_id, selectionDefinitionId: tl.child_id, operationFlowId: null }));
+        rows.push(line(n.customBomId, { ...common, childId: pick?.id ?? tl.child_id, designId: tl.child_id, selectionDefinitionId: tl.child_id, operationFlowId: null, autoChosen: pick ? 1 : null }));
       } else {
         rows.push(line(n.customBomId, { ...common, childId: tl.child_id, designId: tl.design_id }));
       }
     }
   }
   await insertRows(db, 'cf_bom_lines',
-    ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity', 'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by'],
+    ['company_id', 'bom_id', 'line_no', 'child_id', 'design_id', 'position', 'role', 'quantity', 'selection_definition_id', 'source_line_id', 'operation_flow_id', 'notes', 'created_by', 'auto_chosen'],
     rows);
 
   // The item the sales line sells: the line points at it before its values are
