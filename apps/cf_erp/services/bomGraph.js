@@ -112,7 +112,12 @@ export async function loadLine(db, companyId, lineId) {
  * chosen, that item's default applies. Null for things with no flow.
  */
 export function effectiveFlowOf(line) {
-  if (line.operation_flow_id) return { id: line.operation_flow_id, code: line.line_flow_code, name: line.line_flow_name, from: 'line' };
+  if (line.operation_flow_id) {
+    // `usual`: what applies once this line's own choice is taken away ("reset to default"); null = none.
+    const usual = line.child_flow_id ? { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item' }
+      : line.def_flow_id ? { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name, from: 'template' } : null;
+    return { id: line.operation_flow_id, code: line.line_flow_code, name: line.line_flow_name, from: 'line', usual };
+  }
   if (line.child_flow_id) return { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item' };
   if (line.def_flow_id) return { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name, from: 'template' };
   return null;
