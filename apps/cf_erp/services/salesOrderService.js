@@ -514,7 +514,9 @@ export async function deleteOrder(db, c, id) {
   const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_stock_movements WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   if (Number(n)) throw conflict('IN_USE', `Stock was issued to ${o.code} (${n} movement${Number(n) === 1 ? '' : 's'}) — cancel it instead, so its history stays.`);
   const [lines] = await db.query('SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  for (const l of lines) await removeLineRows(db, c, l.id);
+  // The rows every line owns are retired together, in a handful of statements.
+  await retireLineOwnedRows(db, c.companyId, lines.map((l) => l.id));
+  for (const l of lines) await removeLineRows(db, c, l.id, { ownedDone: true });
   await db.query('UPDATE cf_sales_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   return { ok: true };
 }
@@ -639,8 +641,37 @@ export async function updateOrderLine(db, c, lineId, input = {}) {
   return getOrder(db, c.companyId, line.order_id);
 }
 
-async function removeLineRows(db, c, lineId) {
+/**
+ * Retires what lines own besides their structure: the nesting (lots, their
+ * placements and offcuts, the exclusions), the plan (entries, ranks), time
+ * overrides and the line's own active reservations. Soft delete where the table
+ * has deleted_at; cf_nest_exclusions and cf_plan_ranks have none, so those rows
+ * are removed. Set-based: one statement per table whatever the number of lines,
+ * and no subquery inside a JOIN ... ON (TiDB refuses it).
+ */
+async function retireLineOwnedRows(db, companyId, lineIds) {
+  if (!lineIds.length) return;
+  await db.query(
+    `UPDATE cf_nest_placements p JOIN cf_plate_lots l ON l.company_id = p.company_id AND l.id = p.plate_lot_id
+        SET p.deleted_at = NOW()
+      WHERE p.company_id = ? AND p.deleted_at IS NULL AND l.order_line_id IN (?)`,
+    [companyId, lineIds],
+  );
+  await db.query('UPDATE cf_offcuts SET deleted_at = NOW() WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
+  await db.query('UPDATE cf_plate_lots SET deleted_at = NOW() WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
+  await db.query('DELETE FROM cf_nest_exclusions WHERE company_id = ? AND order_line_id IN (?)', [companyId, lineIds]);
+  await db.query('UPDATE cf_plan_entries SET deleted_at = NOW() WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
+  await db.query('DELETE FROM cf_plan_ranks WHERE company_id = ? AND order_line_id IN (?)', [companyId, lineIds]);
+  await db.query('UPDATE cf_time_overrides SET deleted_at = NOW() WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
+  await db.query(
+    "UPDATE cf_stock_reservations SET status = 'released', closed_at = NOW(), deleted_at = NOW() WHERE company_id = ? AND order_line_id IN (?) AND status = 'active' AND deleted_at IS NULL",
+    [companyId, lineIds],
+  );
+}
+
+async function removeLineRows(db, c, lineId, { ownedDone = false } = {}) {
   const line = await requireOrderLine(db, c.companyId, lineId);
+  if (!ownedDone) await retireLineOwnedRows(db, c.companyId, [lineId]);
   if (line.line_type === 'custom' && line.item_id) await deleteTemporaryTree(db, c, line.item_id);
   // A deleted order takes its locked pieces with it, so their codes are free again.
   if (line.locked_at) {
