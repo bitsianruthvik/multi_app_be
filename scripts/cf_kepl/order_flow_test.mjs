@@ -138,6 +138,14 @@ try {
   section('2. Confirm is the customer\'s yes — allowed before the freeze; buying waits on it');
   let proc = await PROC.orderProcess(conn, COMPANY, line.order_id);
   ok('the order\'s stages carry no confirm stage', !proc.stages.some((s) => s.stageKey === 'confirm'));
+  // Values is a check on the Structure tab (2026-10-02), not a tab: the stage stays — state, blockers, its hold on the freeze.
+  if (proc.stages.some((s) => s.stageKey === 'values')) {
+    eq('values is drawn in structure (order roll-up)', proc.stages.find((s) => s.stageKey === 'values')?.shownIn, 'structure');
+    ok('…and on every line', proc.lines.every((l) => l.stages.filter((s) => s.stageKey === 'values').every((s) => s.shownIn === 'structure')));
+    ok('no other stage is folded anywhere', proc.stages.every((s) => s.stageKey === 'values' || s.shownIn === undefined));
+    ok('values still has its own state', ['todo', 'partial', 'done', 'not_applicable'].includes(stageOf(proc, 'values')?.state));
+  }
+  ok('the values kind is still in the catalogue (it still gates Freeze design)', PROC.STAGE_KEYS.includes('values'));
   const buyWait0 = stageOf(proc, 'buying')?.waitingOn;
   eq('buying waits on the header Confirm: no stage key, action confirm', [buyWait0?.stageKey, buyWait0?.action], [null, 'confirm']);
   eq('…in words', buyWait0?.message, 'Confirm the order first — nothing is bought for an inquiry.');

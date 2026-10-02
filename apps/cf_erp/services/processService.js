@@ -206,6 +206,14 @@ export const STAGE_CATALOGUE = [
     key: 'values',
     label: 'Values',
     description: 'The specification values the setup asks for — thickness, grade, length.',
+    /**
+     * Drawn as a CHECK on the Structure tab, not as a tab of its own (user,
+     * 2026-10-02: "in the structure and value, same things are there so no
+     * point having two tabs"). The stage is unchanged — its state, its
+     * blockers and its hold on Freeze design — only where it is drawn moves.
+     * A process without a Structure stage still shows it as its own tab.
+     */
+    shownIn: 'structure',
     /** Something under the line has a required, applicable, item-level rule. */
     applies: (ctx) => ctx.values.required > 0,
     state(ctx) {
@@ -1572,6 +1580,9 @@ function lineContext(ctx, order, line) {
  * skipped the work of finding out cannot tell you what changed when somebody
  * switches it back on.
  */
+/** Where a stage is drawn when it is a check on another stage's tab (Values on Structure); absent otherwise. */
+const shownInOf = (kind) => (kind?.shownIn ? { shownIn: kind.shownIn } : {});
+
 function stageForLine(stage, kind, ctx, overrideValue) {
   const label = stage.label || kind.label;
   const derived = kind.applies(ctx);
@@ -1584,6 +1595,7 @@ function stageForLine(stage, kind, ctx, overrideValue) {
   if (!applies) {
     return {
       stageKey: kind.key,
+      ...shownInOf(kind),
       label,
       sequence: stage.sequence,
       requirement: stage.requirement,
@@ -1600,6 +1612,7 @@ function stageForLine(stage, kind, ctx, overrideValue) {
   const out = kind.state(ctx);
   return {
     stageKey: kind.key,
+    ...shownInOf(kind),
     label,
     sequence: stage.sequence,
     requirement: stage.requirement,
@@ -1650,7 +1663,7 @@ function rollUp(stage, kind, perLine) {
     .map((l) => ({ line: l, s: l.stages.find((x) => x.stageKey === stage.stage_key) }))
     .filter((x) => x.s);
   const live = mine.filter((x) => x.s.applies);
-  const base = { stageKey: stage.stage_key, label, sequence: stage.sequence, requirement: stage.requirement };
+  const base = { stageKey: stage.stage_key, ...shownInOf(kind), label, sequence: stage.sequence, requirement: stage.requirement };
 
   if (!perLine.length) {
     // An order with no lines has not decided that a stage does not apply — it
