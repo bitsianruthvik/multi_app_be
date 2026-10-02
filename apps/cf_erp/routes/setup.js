@@ -27,7 +27,7 @@
  *   DELETE /spec-options/:id
  *
  *   GET    /formulas
- *   POST   /formulas/check                     { expression, sample? } -> parse result, names, sample result
+ *   POST   /formulas/check                     { expression, sample?, itemId?, machineId? } -> parse result, names, sample result (on a real piece / machine when given, + inputs)
  *   POST   /formulas                           { code, name, expression, description? }
  *   PUT    /formulas/:id
  *   DELETE /formulas/:id
@@ -45,6 +45,7 @@ import { resolve, publicResolution } from '../services/resolutionService.js';
 import { setValues, getHistory } from '../services/valueService.js';
 import { listSpecs, createSpec, updateSpec, deleteSpec, addOption, updateOption, deleteOption } from '../services/specificationService.js';
 import { listFormulas, checkFormula, createFormula, updateFormula, deleteFormula } from '../services/formulaService.js';
+import { checkForBuilder } from '../services/formulaBuilderService.js';
 import { listRules, createRule, updateRule, deleteRule } from '../services/assignmentService.js';
 
 const router = Router();
@@ -75,7 +76,10 @@ router.delete('/spec-options/:id', guard(PERM.setup), handle((req) => tx(req, (d
 // ----- formulas ------------------------------------------------------------
 router.get('/formulas', guard(PERM.view), handle((req) => listFormulas(pool, ctx(req).companyId)));
 router.post('/formulas/check', guard(PERM.view), handle(async (req) => {
-  const { parsed, ...rest } = await checkFormula(pool, ctx(req).companyId, req.body?.expression, req.body?.sample ?? null);
+  const body = req.body ?? {};
+  const { parsed, ...rest } = body.itemId || body.machineId
+    ? await checkForBuilder(pool, ctx(req).companyId, body)
+    : await checkFormula(pool, ctx(req).companyId, body.expression, body.sample ?? null);
   return { ok: !!parsed && !rest.problems.length, ...rest };
 }));
 router.post('/formulas', guard(PERM.setup), handle((req) => tx(req, (db, c) => createFormula(db, c, req.body))));

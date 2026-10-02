@@ -283,7 +283,7 @@ function requirePlaces(places) {
 }
 
 /** The selection definition that chooses a raw plate — found by what it searches, never by its id. */
-async function plateSelection(db, companyId, plate) {
+export async function plateSelection(db, companyId, plate) {
   if (!plate) throw invalid('NO_PLATE_CLASS', `There is no ${PLATE_CODE} variant under Steel › Plates, so nothing says where raw plates are filed.`);
   const [rows] = await db.query(
     `SELECT m.id, m.code, m.name, m.status FROM cf_definition_details d

@@ -15,6 +15,7 @@
 import { conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { parseFormula, evaluateFormula, FormulaError } from './formulaEngine.js';
 import { rematerialize } from './valueService.js';
+import { tableSummary } from './resolutionService.js';
 
 const CODE_RE = /^[A-Z][A-Z0-9_]*$/;
 
@@ -61,7 +62,7 @@ async function timingUsage(db, companyId, id) {
  * -> { x, v } / { x, y, v }, its LOOKUP target, for a sample table) is evaluated
  * when given, so the editor can show a result while typing.
  */
-export async function checkFormula(db, companyId, expression, sample = null) {
+export async function checkFormula(db, companyId, expression, sample = null, readers = null) {
   const problems = [];
   let parsed = null;
   try {
@@ -103,18 +104,39 @@ export async function checkFormula(db, companyId, expression, sample = null) {
     }
   }
   let result = null;
-  if (sample && !problems.length && !parsed.usesRollup) {
-    const num = (k) => (sample[k] === undefined || sample[k] === '' || sample[k] === null || typeof sample[k] === 'object' ? null : Number(sample[k]));
-    const tableAt = (k) => (sample[k] && typeof sample[k] === 'object' ? sample[k] : null);
+  let inputs;
+  if ((sample || readers) && !problems.length && !parsed.usesRollup) {
+    const given = sample ?? {};
+    const num = (k) => (given[k] === undefined || given[k] === '' || given[k] === null || typeof given[k] === 'object' ? null : Number(given[k]));
+    const tableAt = (k) => (given[k] && typeof given[k] === 'object' ? given[k] : null);
+    // A typed sample beats the real piece / machine (the time builder lets
+    // people try "what if this plate were 20 mm"); otherwise the real value.
+    const typedOf = (role, code, kind) => (kind === 'number' ? num(`${role}.${code}`) : tableAt(`${role}.${code}`));
+    const side = (role, kind) => (code) => typedOf(role, code, kind) ?? readers?.[role]?.[kind]?.(code) ?? null;
     const context = parsed.usesContext ? {
-      item: (code) => num(`item.${code}`), machine: (code) => num(`machine.${code}`),
-      itemTable: (code) => tableAt(`item.${code}`), machineTable: (code) => tableAt(`machine.${code}`),
+      item: side('item', 'number'), machine: side('machine', 'number'),
+      itemTable: side('item', 'table'), machineTable: side('machine', 'table'),
     } : null;
     result = evaluateFormula(parsed, num, null, context, (code) => tableAt(code));
+    if (readers && context) {
+      // What each name read, and from where — the time builder shows it beside the result.
+      const from = (role, code, kind) => {
+        if (typedOf(role, code, kind) != null) return 'typed';
+        return readers?.[role]?.[kind]?.(code) != null ? (role === 'item' ? 'piece' : 'machine') : null;
+      };
+      inputs = [
+        ...parsed.itemRefs.map((code) => ({ ref: `item.${code}`, value: context.item(code), from: from('item', code, 'number') })),
+        ...parsed.machineRefs.map((code) => ({ ref: `machine.${code}`, value: context.machine(code), from: from('machine', code, 'number') })),
+        ...lookupRefs.filter((r) => r.role !== 'plain').map((r) => {
+          const t = r.role === 'item' ? context.itemTable(r.code) : context.machineTable(r.code);
+          return { ref: `${r.role}.${r.code}`, value: null, chart: t ? tableSummary(known.get(r.code)?.tableConfig ?? null, t) : null, from: from(r.role, r.code, 'table') };
+        }),
+      ];
+    }
   }
   return {
     parsed, problems, kind: parsed.kind, references: parsed.references, rollupTerms: parsed.rollupTerms, usesRollup: parsed.usesRollup,
-    itemRefs: parsed.itemRefs, machineRefs: parsed.machineRefs, lookupRefs, result,
+    itemRefs: parsed.itemRefs, machineRefs: parsed.machineRefs, lookupRefs, result, ...(inputs ? { inputs } : {}),
   };
 }
 

@@ -24,6 +24,7 @@
  *   PUT    /operation-rules/:id
  *   DELETE /operation-rules/:id
  *   POST   /operations/:id/timing        { machineId, itemId?, quantity?, date? } — how long, and why
+ *   GET    /operations/:id/formula-builder?subjectType=&subjectId= — the time builder's fields, machines (values + charts) and real sample pieces
  *
  *   GET    /flows?status=&search=&operationId=
  *   POST   /flows                        { code, name, description? }
@@ -78,6 +79,7 @@ import {
 import {
   listMachineTypes, createMachineType, updateMachineNode, deleteMachineNode,
 } from '../services/classificationService.js';
+import { builderContext } from '../services/formulaBuilderService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -115,6 +117,7 @@ router.delete('/operations/:id', manage, handle((req) => tx(req, (db, c) => dele
 router.post('/operations/:id/rules', manage, handle((req) => tx(req, (db, c) => createTimingRule(db, c, id(req), req.body ?? {}))));
 router.put('/operation-rules/:id', manage, handle((req) => tx(req, (db, c) => updateTimingRule(db, c, id(req), req.body ?? {}))));
 router.delete('/operation-rules/:id', manage, handle((req) => tx(req, (db, c) => deleteTimingRule(db, c, id(req)))));
+router.get('/operations/:id/formula-builder', view, handle((req) => builderContext(pool, ctx(req).companyId, id(req), req.query)));
 router.post('/operations/:id/timing', view, handle((req) => timingPreview(pool, ctx(req).companyId, id(req), req.body ?? {})));
 
 router.get('/flows', view, handle((req) => listFlows(pool, ctx(req).companyId, req.query)));

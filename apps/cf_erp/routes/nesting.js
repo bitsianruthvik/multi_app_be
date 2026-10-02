@@ -4,6 +4,9 @@
  *   GET  /orders/:orderId/lines/:lineId/nesting          the SAVED plan
  *   POST /orders/:orderId/lines/:lineId/nesting/plan     { effort?, guillotine?, seed? } — propose
  *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it
+ *   GET  /orders/:orderId/lines/:lineId/nesting/choices  the pieces (Step A) and plates (Step B) a run considers
+ *   PUT  /orders/:orderId/lines/:lineId/nesting/choices  { excludedCutPlateIds, excludedPlateIds } — the whole
+ *                                                        selection (both empty = reset); applied by every run
  *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the nests as a workbook (Nests / Needed / How to use this)
  *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { file, filename, dryRun, force } — preview, or save
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
@@ -33,7 +36,9 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import { planNesting, acceptNesting, getNesting, assertLineOnOrder } from '../services/nestingService.js';
+import {
+  planNesting, acceptNesting, getNesting, assertLineOnOrder, nestingChoices, saveNestingChoices,
+} from '../services/nestingService.js';
 // The sheet is its own service: the workbook, its locked columns, its banner and
 // the diff a dry run reports are a different job from laying steel out, and
 // nestingService is long enough already.
@@ -71,6 +76,14 @@ router.post('/orders/:orderId/lines/:lineId/nesting/plan', view,
 
 router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
   handle((req) => write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}))));
+
+// THE NESTING CHOICES (init.sql §40): what a run leaves out. Reading them is a
+// look; saving them is part of the order's structure work, so it needs manage.
+router.get('/orders/:orderId/lines/:lineId/nesting/choices', view,
+  handle((req) => read(req, (db, companyId, id) => nestingChoices(db, companyId, id))));
+
+router.put('/orders/:orderId/lines/:lineId/nesting/choices', manage,
+  handle((req) => write(req, (db, c, id) => saveNestingChoices(db, c, id, req.body ?? {}))));
 
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id));

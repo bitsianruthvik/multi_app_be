@@ -101,6 +101,7 @@ import { explode } from './bomService.js';
 import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 import { analyseNest } from './nestGeometry.js';
 import { availability } from './rollOutService.js';
+import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -668,7 +669,9 @@ export function layoutDrift(cutPlates, placed, codes = new Map()) {
   const here = new Set();
   for (const cp of cutPlates) {
     here.add(cp.id);
-    if (cp.manual) continue;
+    // NEST_MANUAL, or left out of this line's nesting by hand (§40): neither
+    // is held to a count — they are laid out by hand, later, or not at all.
+    if (cp.manual || cp.leftOut) continue;
     const needs = cp.pieces ?? 0;
     const got = placed.get(cp.id) ?? 0;
     if (got !== needs) drift.push({ cutPlateId: cp.id, code: cp.code ?? null, needs, placed: got, why: got === 0 ? 'unplaced' : 'count' });
@@ -700,9 +703,12 @@ export function driftSentence(drift) {
  * layout is left out: it is not nested, which is not the same as out of date.
  * Returns Map(lineId -> drift[]).
  */
-export async function layoutDriftOfLines(db, companyId, lineIds, trees) {
+export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOut = null } = {}) {
   const out = new Map();
   if (!lineIds.length) return out;
+  // What each line's nesting choices leave out (§40): exempt from drift, and
+  // counted into `leftOut` (Map lineId -> { cutPlates, pieces }) when asked.
+  const exclBy = await exclusionsOf(db, companyId, lineIds);
   // The code of a cut plate that has since been deleted still names what was laid out.
   const [placedRows] = await db.query(
     `SELECT pl.order_line_id, np.cut_plate_id, COUNT(*) AS pieces, MAX(m.code) AS code
@@ -738,9 +744,15 @@ export async function layoutDriftOfLines(db, companyId, lineIds, trees) {
   const values = await valuesOf(db, companyId, rows.map((r) => r.id));
   for (const lineId of nested) {
     const totals = totalsBy.get(lineId);
+    const excl = exclBy.get(lineId) ?? emptyExclusions();
     const cutPlates = rows.filter((r) => totals.has(r.id)).map((r) => ({
       id: r.id, code: r.code, pieces: Math.round(totals.get(r.id) ?? 0), manual: values.get(r.id)?.manual ?? false,
+      leftOut: excl.cutPlates.has(r.id),
     }));
+    if (leftOut) {
+      const gone = cutPlates.filter((cp) => cp.leftOut && cp.pieces > 0 && !cp.manual);
+      if (gone.length) leftOut.set(lineId, { cutPlates: gone.length, pieces: gone.reduce((a, cp) => a + cp.pieces, 0) });
+    }
     out.set(lineId, layoutDrift(cutPlates, placedBy.get(lineId), codes));
   }
   return out;
@@ -804,6 +816,398 @@ function autoLotNumbers(count, taken) {
     if (!taken.has(no.toUpperCase())) out.push(no);
   }
   return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * Nesting choices — what a line's automatic nesting leaves out (init.sql §40)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * THE USER'S TWO FILTERS, BEFORE ANY NESTING (2026-10-02): "show the cut pieces
+ * and let the user remove any from the list to be considered for nesting", then
+ * "show the list of RMs you will consider based on the thickness of the cut
+ * plates. Let the user unselect any."
+ *
+ *   a cut piece left out   is not offered to the packer on ANY run of this line
+ *                          (Quick, Standard, Deep, re-nest). It stays "plate
+ *                          chosen at nesting": nest it later, or choose its
+ *                          plate by hand. Like NEST_MANUAL, except per line and
+ *                          without writing a value on the cut piece. accept does
+ *                          not hold the layout to it, and layoutDrift exempts it.
+ *   a plate left out       is not a candidate sheet for this line. A steel group
+ *                          whose every candidate is left out cannot be nested,
+ *                          and planNesting refuses rather than half-plan.
+ *
+ * The candidates are the packer's own: candidatePlates + sheetsFor, the same
+ * two calls planNesting makes, so the list on screen IS what the packer sees.
+ */
+export const emptyExclusions = () => ({ cutPlates: new Set(), plates: new Set() });
+
+/**
+ * Map lineId -> { cutPlates: Set, plates: Set }, one read for any number of
+ * lines. A database without §40 yet (a backend deployed ahead of its schema)
+ * answers "nothing left out" rather than failing the order page.
+ */
+export async function exclusionsOf(db, companyId, lineIds) {
+  const ids = [...new Set(lineIds.map(Number))];
+  const out = new Map(ids.map((id) => [id, emptyExclusions()]));
+  if (!ids.length) return out;
+  let rows = [];
+  try {
+    [rows] = await db.query(
+      'SELECT order_line_id, kind, item_id FROM cf_nest_exclusions WHERE company_id = ? AND order_line_id IN (?)',
+      [companyId, ids],
+    );
+  } catch (e) {
+    if (e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146) return out;
+    throw e;
+  }
+  for (const r of rows) {
+    const e = out.get(Number(r.order_line_id));
+    if (e) (r.kind === 'plate' ? e.plates : e.cutPlates).add(Number(r.item_id));
+  }
+  return out;
+}
+
+const exclusionsOfLine = async (db, companyId, lineId) =>
+  (await exclusionsOf(db, companyId, [lineId])).get(Number(lineId)) ?? emptyExclusions();
+
+/** A piece's weight: area × thickness × density (steel when the record does not say). */
+const pieceKg = (steel) => (steel.length > 0 && steel.width > 0 && steel.thickness > 0
+  ? kgOf(steel.length * steel.width, steel.thickness, steel.density) : null);
+
+/**
+ * "N pieces left out · M plates excluded" — the line on the stage, worked out
+ * from what the line needs NOW: a left-out cut piece the line no longer has is
+ * not counted, nor a left-out plate that is no longer an active catalog plate.
+ */
+function choiceSummary(cutPlates, plates, excl) {
+  const out = cutPlates.filter((cp) => cp.pieces > 0 && !cp.manual && excl.cutPlates.has(cp.id));
+  const plateIds = new Set(plates.map((p) => p.id));
+  const platesOut = [...excl.plates].filter((id) => plateIds.has(id));
+  return {
+    cutPlatesLeftOut: out.length,
+    piecesLeftOut: out.reduce((a, cp) => a + cp.pieces, 0),
+    kgLeftOut: round3(out.reduce((a, cp) => a + (pieceKg(cp.steel) ?? 0) * cp.pieces, 0)),
+    platesExcluded: platesOut.length,
+    leftOut: out.map((cp) => ({ ...describeCutPlate(cp), reason: LEFT_OUT_NOTE })),
+    excludedPlates: platesOut.map((id) => { const p = plates.find((x) => x.id === id); return { plateItemId: id, code: p?.code ?? null, name: p?.name ?? null }; }),
+  };
+}
+
+export const LEFT_OUT_NOTE = 'Left out of this line\'s nesting (Nesting › Pieces). Its plate is chosen at nesting — tick it back in to nest it, or choose its plate by hand.';
+
+/**
+ * GET …/nesting/choices — Step A (the pieces) and Step B (the plates), grouped
+ * by steel (thickness × grade × material, the packer's own grouping). Reads,
+ * never writes. Per plate: free stock (ours, and the order customer's own — the
+ * packer offers theirs FIRST and free), the drops of that steel in stock, the
+ * last price paid and the list price as a price per plate.
+ */
+export async function nestingChoices(db, companyId, orderLineId) {
+  const line = await requireLine(db, companyId, orderLineId);
+  const { where, cutPlates } = await surveyLine(db, companyId, line);
+  const [plates, imported, excl] = await Promise.all([
+    candidatePlates(db, companyId, where.plateIds),
+    importedLotsOf(db, companyId, orderLineId),
+    exclusionsOfLine(db, companyId, orderLineId),
+  ]);
+  const settingRows = await cutSettingRows(db, companyId);
+
+  // The pieces, grouped the way the packer groups them.
+  const groups = new Map();
+  const unusable = [];
+  for (const cp of cutPlates) {
+    if (!cp.pieces) continue;
+    const onImported = imported.counts.get(cp.id) ?? 0;
+    const toNest = Math.max(0, cp.pieces - onImported);
+    const kgEach = pieceKg(cp.steel);
+    const row = {
+      cutPlateId: cp.id, code: cp.code, name: cp.name,
+      thickness: cp.steel.thickness, length: cp.steel.length, width: cp.steel.width,
+      grade: cp.steel.grade, material: cp.steel.material,
+      pieces: cp.pieces, onImported, toNest,
+      kgEach, kg: kgEach == null ? null : round3(kgEach * toNest),
+      manual: cp.manual, excluded: excl.cutPlates.has(cp.id),
+      note: cp.manual
+        ? `${NEST_MANUAL_SPEC_CODE} is set on this cut piece, so automatic nesting always leaves it out — clear it under "Leave out of automatic nesting" to nest it.`
+        : (toNest === 0 && onImported ? 'Every piece of it is already on imported nests.' : null),
+    };
+    const gone = missingOnPart(cp.steel);
+    if (gone.length) { unusable.push({ ...row, missing: gone, reason: `It does not say its ${list(gone.map((g) => g.toLowerCase()))}, so it cannot be nested.` }); continue; }
+    const key = groupKey(cp.steel);
+    if (!groups.has(key)) groups.set(key, { key, thickness: cp.steel.thickness, grade: cp.steel.grade, material: cp.steel.material, pieces: [] });
+    groups.get(key).pieces.push(row);
+  }
+
+  // The plates each group would be offered — sheetsFor, exactly as planNesting.
+  const offered = new Map([...groups.values()].map((g) => [g.key, sheetsFor(plates, g)]));
+  const plateIds = [...new Set([...offered.values()].flat().map((p) => p.id))];
+  const [av, paid, listed, offcutRows] = await Promise.all([
+    plateIds.length ? availability(db, companyId, plateIds, { orderId: line.order_id }) : new Map(),
+    lastPricesPaid(db, companyId, plateIds),
+    listPricesOf(db, companyId, plateIds),
+    groups.size ? db.query(
+      `SELECT thickness_mm, grade, material, COUNT(*) AS n, SUM(weight_kg) AS kg,
+              MAX(rect_length_mm * rect_width_mm) AS biggest
+         FROM cf_offcuts
+        WHERE company_id = ? AND deleted_at IS NULL AND status = 'available'
+        GROUP BY thickness_mm, grade, material`,
+      [companyId],
+    ).then(([r]) => r) : [],
+  ]);
+
+  const out = [];
+  for (const g of [...groups.values()].sort((a, b) => a.thickness - b.thickness || String(a.key).localeCompare(String(b.key)))) {
+    const settings = pickCutSettings(settingRows, g.thickness);
+    const platesOf = offered.get(g.key).map((p) => {
+      const e = av.get(p.id);
+      const theirs = Math.floor((e?.theirsFree ?? 0) + 1e-6);
+      const ours = Math.max(0, round3((e?.free ?? 0) - (e?.theirsFree ?? 0)));
+      const kgEach = kgOf(p.steel.length * p.steel.width, p.steel.thickness, p.steel.density);
+      const l = listed.get(p.id);
+      const lp = paid.get(p.id);
+      return {
+        plateItemId: p.id, code: p.code, name: p.name,
+        thickness: p.steel.thickness, length: p.steel.length, width: p.steel.width,
+        grade: p.steel.grade, material: p.steel.material, kgEach,
+        stock: { ours, theirs },
+        // The customer's own plate is offered to the packer first, and free.
+        preferred: theirs > 0,
+        lastPaid: lp ? { unitPrice: lp.unitPrice, currency: lp.currency, orderCode: lp.orderCode, orderedAt: lp.orderedAt } : null,
+        listPrice: l?.listPrice != null
+          ? { price: l.listPrice, basis: l.priceBasis, currency: l.currency, perPlate: perUnitPrice(l.listPrice, l.priceBasis, { weightKg: kgEach }) }
+          : null,
+        excluded: excl.plates.has(p.id),
+      };
+    }).sort((a, b) => Number(b.preferred) - Number(a.preferred)
+      || Number(b.stock.ours > 0) - Number(a.stock.ours > 0)
+      || (b.length * b.width) - (a.length * a.width)
+      || b.length - a.length || b.width - a.width || a.plateItemId - b.plateItemId);
+
+    const drops = offcutRows.filter((r) => Math.abs(Number(r.thickness_mm) - g.thickness) <= EPS
+      && agrees(r.grade, g.grade) && agrees(r.material, g.material));
+    const nestable = g.pieces.filter((p) => !p.manual && p.toNest > 0);
+    const ticked = nestable.filter((p) => !p.excluded);
+    const platesTicked = platesOf.filter((p) => !p.excluded).length;
+    const sum = (rows, f) => round3(rows.reduce((a, r) => a + (Number(f(r)) || 0), 0));
+    out.push({
+      key: g.key, thickness: g.thickness, grade: g.grade, material: g.material,
+      kerfMm: settings.kerfMm, settingsBasis: settings.basis,
+      pieces: g.pieces.sort((a, b) => String(a.code ?? '').localeCompare(String(b.code ?? '')) || a.cutPlateId - b.cutPlateId),
+      plates: platesOf,
+      offcutsInStock: {
+        count: drops.reduce((a, r) => a + Number(r.n), 0),
+        kg: round3(drops.reduce((a, r) => a + Number(r.kg ?? 0), 0)),
+        biggestMm2: drops.length ? Math.max(...drops.map((r) => Number(r.biggest ?? 0))) : null,
+        note: 'Drops of this steel in stock. Automatic nesting does not draw on them yet — it buys by catalog size.',
+      },
+      summary: {
+        cutPlates: nestable.length, pieces: sum(nestable, (p) => p.toNest), kg: sum(nestable, (p) => p.kg),
+        ticked: { cutPlates: ticked.length, pieces: sum(ticked, (p) => p.toNest), kg: sum(ticked, (p) => p.kg) },
+        platesOffered: platesOf.length, platesTicked,
+      },
+      blocked: ticked.length && platesOf.length && !platesTicked ? noPlatesLeft(g) : null,
+      noCandidate: ticked.length && !platesOf.length
+        ? `No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so these pieces have nothing to be cut from. Add the plate to the catalog, or correct the cut pieces' steel.`
+        : null,
+    });
+  }
+
+  const summary = choiceSummary(cutPlates, plates, excl);
+  const blocker = importBlocker(line);
+  return {
+    line: lineHead(line),
+    canSave: !blocker,
+    readOnlyReason: blocker?.message ?? null,
+    groups: out,
+    unusable,
+    manual: cutPlates.filter((cp) => cp.manual && cp.pieces).map(describeManual),
+    excluded: { cutPlateIds: [...excl.cutPlates], plateIds: [...excl.plates] },
+    summary: {
+      ...summary,
+      pieces: round3(out.reduce((a, g) => a + g.summary.pieces, 0)),
+      kg: round3(out.reduce((a, g) => a + g.summary.kg, 0)),
+      ticked: {
+        pieces: round3(out.reduce((a, g) => a + g.summary.ticked.pieces, 0)),
+        kg: round3(out.reduce((a, g) => a + g.summary.ticked.kg, 0)),
+      },
+    },
+    blocked: out.filter((g) => g.blocked).map((g) => g.blocked),
+  };
+}
+
+const noPlatesLeft = (g) => `${fmt(g.thickness)} mm ${[g.grade, g.material].filter(Boolean).join(' ')}: every plate it could be cut from is unticked, so its pieces have nothing to be nested on. Tick at least one plate, or untick the pieces too.`;
+
+/**
+ * PUT …/nesting/choices { excludedCutPlateIds, excludedPlateIds } — the whole
+ * selection for the line, replacing what was there (an empty pair = reset).
+ * Only a cut piece of this line and an active catalog plate may be named; the
+ * line must be open to nesting (frozen, on an open order, not released).
+ * Writes nothing else: the saved layout stays until the next accept.
+ */
+export async function saveNestingChoices(db, c, orderLineId, input = {}) {
+  const companyId = c.companyId;
+  const line = await requireLine(db, companyId, orderLineId, { lock: true });
+  assertNestable(line);
+  const { where, cutPlates } = await surveyLine(db, companyId, line);
+  const plates = await candidatePlates(db, companyId, where.plateIds);
+  const problems = [];
+  const ids = (v, what) => {
+    if (v == null) return [];
+    if (!Array.isArray(v)) { problems.push(`${what} must be a list of ids.`); return []; }
+    const outIds = [];
+    for (const x of v) {
+      const n = Number(x);
+      if (!Number.isInteger(n) || n <= 0) problems.push(`${what}: "${x}" is not an id.`);
+      else if (!outIds.includes(n)) outIds.push(n);
+    }
+    return outIds;
+  };
+  const cutIds = ids(input.excludedCutPlateIds, 'excludedCutPlateIds');
+  const plateIds = ids(input.excludedPlateIds, 'excludedPlateIds');
+  const mine = new Set(cutPlates.map((cp) => cp.id));
+  const plateSet = new Set(plates.map((p) => p.id));
+  for (const id of cutIds) if (!mine.has(id)) problems.push(`Cut piece ${id} is not one of line ${line.line_no}'s cut pieces.`);
+  for (const id of plateIds) if (!plateSet.has(id)) problems.push(`Plate ${id} is not an active catalog plate in this company.`);
+  assertNoProblems(problems, 'Those nesting choices cannot be saved.');
+
+  await db.query('DELETE FROM cf_nest_exclusions WHERE company_id = ? AND order_line_id = ?', [companyId, orderLineId]);
+  const rows = [
+    ...cutIds.map((id) => [companyId, orderLineId, 'cut_plate', id, c.userId ?? null]),
+    ...plateIds.map((id) => [companyId, orderLineId, 'plate', id, c.userId ?? null]),
+  ];
+  if (rows.length) await insertRows(db, 'cf_nest_exclusions', ['company_id', 'order_line_id', 'kind', 'item_id', 'created_by'], rows, 500);
+  return nestingChoices(db, companyId, orderLineId);
+}
+
+/* ---------------------------------------------------------------------------
+ * The rule check — is a laid-out plate following the shop's rules?
+ * ------------------------------------------------------------------------ */
+
+/** The shop's kerf band, whatever the thickness: under 2.5 mm the torch cuts parts short. */
+export const KERF_BAND_MM = Object.freeze({ min: 2.5, max: 5 });
+
+/**
+ * A plate's RULE CHECK — the shop's cutting rules (the ones verifyLot refuses
+ * an accept on, plus the kerf band), asked of one laid-out plate, every answer
+ * kept rather than the first failure. Pure. For the diagram's ✓/⚠ badge.
+ *
+ *   nest      { length, width, pieces [{ x, y, length, width, seqNo, rowNo, rotated }] }
+ *   settings  { kerfMm, seqGapMinMm, seqGapMaxMm }
+ *
+ * Returns { status: 'ok' | 'warn' | 'none', utilisationPct, sharedCuts,
+ * sharedLengthMm, checks: [{ key, ok, label, detail }] }. 'none' = no layout
+ * to check (an imported nest our packer could not fit).
+ */
+export function nestRules(nest, settings) {
+  const k = Number(settings?.kerfMm) || 0;
+  const gapMin = Number(settings?.seqGapMinMm) || 0;
+  const gapMax = Number(settings?.seqGapMaxMm) || 0;
+  const L = Number(nest.length) || 0;
+  const W = Number(nest.width) || 0;
+  const pieces = nest.pieces ?? [];
+  const partsArea = pieces.reduce((a, p) => a + Number(p.length) * Number(p.width), 0);
+  const utilisationPct = L * W > 0 ? round3((partsArea / (L * W)) * 100) : null;
+  const laid = pieces.filter((p) => p.x != null && p.y != null).map((p) => ({
+    ...p, x: Number(p.x), y: Number(p.y), length: Number(p.length), width: Number(p.width),
+    seqNo: Number(p.seqNo) || 1, rowNo: Number(p.rowNo) || 1,
+  }));
+  if (!pieces.length || laid.length < pieces.length) {
+    return {
+      status: 'none', utilisationPct, sharedCuts: 0, sharedLengthMm: 0,
+      checks: [{ key: 'layout', ok: null, label: 'No layout', detail: 'Our packer has no layout for this plate, so its rules cannot be checked on a drawing.' }],
+    };
+  }
+  const checks = [];
+  const add = (key, ok, label, detail) => checks.push({ key, ok, label, detail });
+  const at = (p) => `${p.cutPlateCode ?? 'a piece'} at (${fmt(p.x)}, ${fmt(p.y)})`;
+
+  // Kerf inside the shop's band.
+  const inBand = k >= KERF_BAND_MM.min - EPS && k <= KERF_BAND_MM.max + EPS;
+  add('kerf', inBand, inBand ? `Kerf ${fmt(k)} mm` : `Kerf ${fmt(k)} mm out of band`,
+    inBand ? `Inside the ${KERF_BAND_MM.min}–${KERF_BAND_MM.max} mm band, charged at the rim and between parts.`
+      : `${k < KERF_BAND_MM.min ? 'Below' : 'Above'} the ${KERF_BAND_MM.min}–${KERF_BAND_MM.max} mm band — check Cut settings for ${fmt(nest.thickness ?? null)} mm.`);
+
+  // Every part inside the rim (one kerf off each plate edge).
+  const over = laid.filter((p) => p.x < k - EPS || p.y < k - EPS || p.x + p.length > L - k + EPS || p.y + p.width > W - k + EPS);
+  add('rim', !over.length, over.length ? `${over.length} over the rim` : 'Inside the rim',
+    over.length ? `${at(over[0])}${over.length > 1 ? ` and ${over.length - 1} more` : ''} sit closer than one ${fmt(k)} mm kerf to the plate edge.`
+      : `Every part sits at least one ${fmt(k)} mm kerf in from the plate edge.`);
+
+  // Spacing: no overlap, never closer than one kerf; exactly one kerf = a shared cut.
+  const byX = laid.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+  let overlaps = 0; let tooClose = 0; let shared = 0; let sharedLen = 0; let firstBad = null;
+  for (let i = 0; i < byX.length; i++) {
+    const p = byX[i];
+    for (let j = i + 1; j < byX.length; j++) {
+      const q = byX[j];
+      if (q.x - (p.x + p.length) > k + 1e-3) break;   // sorted by x: every later one is further still
+      const sepX = Math.max(q.x - (p.x + p.length), p.x - (q.x + q.length));
+      const sepY = Math.max(q.y - (p.y + p.width), p.y - (q.y + q.width));
+      const sep = Math.max(sepX, sepY);
+      if (sep < -EPS) { overlaps += 1; firstBad ??= [p, q, 'overlap']; continue; }
+      if (sep < k - EPS) { tooClose += 1; firstBad ??= [p, q, 'close']; continue; }
+      if (Math.abs(sepX - k) <= 1e-3 && sepY < -EPS) { shared += 1; sharedLen += -sepY; }
+      else if (Math.abs(sepY - k) <= 1e-3 && sepX < -EPS) { shared += 1; sharedLen += -sepX; }
+    }
+  }
+  add('spacing', !overlaps && !tooClose,
+    overlaps ? `${overlaps} overlap${overlaps === 1 ? '' : 's'}` : tooClose ? `${tooClose} closer than kerf` : 'No overlaps',
+    firstBad
+      ? `${at(firstBad[0])} and ${at(firstBad[1])} ${firstBad[2] === 'overlap' ? 'overlap' : `are closer than the ${fmt(k)} mm kerf`}.`
+      : `Parts are one kerf apart where they share a cut (${shared}) and further apart elsewhere.`);
+
+  // Rows per sequence: Small 2, Big 3.
+  const seqs = sequenceSummary(laid);
+  const rowsOver = seqs.filter((s) => s.rows > s.rowsAllowed || Math.max(...laid.filter((p) => p.seqNo === s.seqNo).map((p) => p.rowNo)) > s.rowsAllowed);
+  add('rows', !rowsOver.length, rowsOver.length ? `Too many rows in sequence ${rowsOver.map((s) => s.seqNo).join(', ')}` : 'Rows per sequence',
+    rowsOver.length ? `A sequence of Small parts (under ${SMALL_PART_MM} mm both ways) holds 2 rows, one with anything Big holds 3.`
+      : `Every sequence holds what its part size allows (Small 2 rows, Big 3).`);
+
+  // Sequences: their own ground, the gap between them, and the cut order.
+  const boxes = seqs.map((s) => {
+    const ps = laid.filter((p) => p.seqNo === s.seqNo);
+    return {
+      seqNo: s.seqNo,
+      x0: Math.min(...ps.map((p) => p.x)), x1: Math.max(...ps.map((p) => p.x + p.length)),
+      y0: Math.min(...ps.map((p) => p.y)), y1: Math.max(...ps.map((p) => p.y + p.width)),
+    };
+  });
+  let gapBad = null;
+  for (let a = 0; a < boxes.length && !gapBad; a++) {
+    for (let b = a + 1; b < boxes.length; b++) {
+      const p = boxes[a]; const q = boxes[b];
+      const sep = Math.max(Math.max(q.x0 - p.x1, p.x0 - q.x1), Math.max(q.y0 - p.y1, p.y0 - q.y1));
+      if (sep < gapMin - EPS) { gapBad = { p, q, sep }; break; }
+    }
+  }
+  add('sequenceGap', !gapBad, gapBad ? (gapBad.sep < -EPS ? `Sequences ${gapBad.p.seqNo} and ${gapBad.q.seqNo} overlap` : `Sequence gap ${fmt(gapBad.sep)} mm`) : 'Sequence gaps',
+    gapBad
+      ? (gapBad.sep < -EPS ? 'A sequence is cut whole and in order, so two of them cannot share ground.'
+        : `Sequences ${gapBad.p.seqNo} and ${gapBad.q.seqNo} are ${fmt(gapBad.sep)} mm apart; the gap between sequences is ${fmt(gapMin)}–${fmt(gapMax)} mm.`)
+      : boxes.length > 1 ? `Sequences stand at least ${fmt(gapMin)} mm apart.` : 'One sequence on this plate.');
+
+  const mono = (f) => boxes.every((b, i) => i === 0 || f(b) >= f(boxes[i - 1]) - EPS);
+  const ordered = boxes.length < 2 || mono((b) => b.y0) || mono((b) => b.x0);
+  add('order', ordered, ordered ? 'Cut order' : 'Sequence order broken',
+    ordered ? 'Sequences follow one another across the plate in the order they are numbered, so piercing never jumps back.'
+      : 'Sequence numbers do not follow one another across the plate — the head would pierce out of order.');
+
+  const turned = laid.filter((p) => p.rotated).length;
+  add('rotation', true, turned ? `${turned} turned` : 'None turned',
+    turned ? `${turned} part${turned === 1 ? ' is' : 's are'} turned 90°. Allowed: a plate rectangle has no grain to respect.` : 'No part is turned.');
+
+  const req = requiredSize(laid, k);
+  const fits = req.requiredLength <= L + EPS && req.requiredWidth <= W + EPS;
+  add('fits', fits, fits ? 'Fits the plate' : 'Bigger than the plate',
+    fits ? `The layout needs ${fmt(req.requiredLength)} × ${fmt(req.requiredWidth)} of the ${fmt(L)} × ${fmt(W)} plate.`
+      : `The layout needs ${fmt(req.requiredLength)} × ${fmt(req.requiredWidth)} and the plate is ${fmt(L)} × ${fmt(W)}.`);
+
+  return {
+    status: checks.every((c2) => c2.ok !== false) ? 'ok' : 'warn',
+    utilisationPct, sharedCuts: shared, sharedLengthMm: round3(sharedLen), checks,
+  };
 }
 
 /* ---------------------------------------------------------------------------
@@ -950,14 +1354,19 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // `replaceImported: true` plans the whole line, as if nothing were imported.
   const imported = input.replaceImported === true ? { lots: [], counts: new Map(), lotNos: new Set() } : await importedLotsOf(db, companyId, orderLineId);
   const cutPlates = needed.map((cp) => ({ ...cp, pieces: Math.max(0, cp.pieces - (imported.counts.get(cp.id) ?? 0)) }));
+  // THE LINE'S NESTING CHOICES (§40): cut pieces left out and plates excluded,
+  // applied to every run. `ignoreChoices: true` plans as if none were made.
+  const excl = input.ignoreChoices === true ? emptyExclusions() : await exclusionsOfLine(db, companyId, orderLineId);
 
   const problems = [];
   const manual = [];
+  const leftOut = [];
   const seedsTried = [];
   const nestable = [];
   for (const cp of cutPlates) {
     if (!cp.pieces) continue;                       // nothing of it is needed, or it is all on imported lots
     if (cp.manual) { manual.push(describeManual(cp)); continue; }
+    if (excl.cutPlates.has(cp.id)) { leftOut.push(cp); continue; }
     const gone = missingOnPart(cp.steel);
     if (gone.length) {
       problems.push(`${nameOf(cp)} does not say its ${list(gone.map((g) => g.toLowerCase()))}, so it cannot be nested. A rectangle that does not state its steel is refused rather than guessed at — set the value on the cut plate, or mark it ${NEST_MANUAL_SPEC_CODE} and lay it out by hand.`);
@@ -974,6 +1383,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }
     byGroup.get(key).cutPlates.push(cp);
   }
+
+  // A steel whose every candidate plate is excluded cannot be nested — refused
+  // up front, all such groups named at once, rather than half a plan.
+  const blocked = [...byGroup.values()]
+    .filter((g) => sheetsFor(plates, g).length > 0 && !sheetsFor(plates, g).some((p) => !excl.plates.has(p.id)))
+    .map(noPlatesLeft);
+  if (blocked.length) throw invalid('NO_PLATES_LEFT', blocked.length === 1 ? blocked[0] : `${blocked.length} steels have no plate left ticked — tick at least one plate for each.`, { problems: blocked });
 
   const groups = [];
   const sizeAdvice = [];
@@ -998,7 +1414,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   for (const g of [...byGroup.values()].sort((a, b) => a.thickness - b.thickness || String(a.key).localeCompare(String(b.key)))) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
-    const candidates = sheetsFor(plates, g);
+    const candidates = sheetsFor(plates, g).filter((p) => !excl.plates.has(p.id));
     if (!candidates.length) {
       problems.push(`No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so ${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} have nothing to be cut from. Add the plate to the catalog, or correct the cut plate's steel.`);
       groups.push(emptyGroup(g, settings, guillotine, 'no candidate plate'));
@@ -1196,6 +1612,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     basis: 'proposal',
     // What "nest the rest" left alone: the imported nests stay as they are.
     imported: { lots: imported.lots.length, pieces: importedPieces },
+    // What this run left out by the line's nesting choices (§40).
+    choices: choiceSummary(needed, plates, excl),
     settingsNote: 'Kerf is banded by plate thickness and charged at the plate rim as well as between pieces; two parts sharing a boundary are one kerf apart, not two.',
     groups,
     manual,
@@ -1224,6 +1642,7 @@ function lotWasteFields(n, g) {
   return {
     origin: 'auto', verdict: null, forced: false, reasons: [],
     hasLayout: w.hasLayout, waste: w.waste, wasteKg: w.wasteKg, partsKg: w.partsKg, offcuts: w.offcuts,
+    rules: nestRules(n, g),
   };
 }
 
@@ -1441,6 +1860,10 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   // lot goes, imported ones too, and the plan must cover the whole line.
   const replaceImported = plan?.replaceImported === true;
   const imported = replaceImported ? { lots: [], counts: new Map(), lotNos: new Set() } : await importedLotsOf(db, companyId, orderLineId);
+  // The line's nesting choices (§40), read from the DB like everything else:
+  // a left-out cut piece is not required (and may not be placed), an excluded
+  // plate may not carry a lot.
+  const excl = await exclusionsOfLine(db, companyId, orderLineId);
 
   const problems = [];
 
@@ -1448,7 +1871,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   // holding back by hand.
   const required = new Map();
   for (const cp of cutPlates) {
-    if (!cp.pieces || cp.manual) continue;
+    if (!cp.pieces || cp.manual || excl.cutPlates.has(cp.id)) continue;
     const left = cp.pieces - (imported.counts.get(cp.id) ?? 0);
     if (left <= 0) continue;                        // all of it is on imported nests
     if (missingOnPart(cp.steel).length) {
@@ -1475,6 +1898,10 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       problems.push(`${label}: ${nameOf(plate)} has no thickness, length and width in the catalog, so nothing can be checked against it.`);
       continue;
     }
+    if (excl.plates.has(plate.id)) {
+      problems.push(`${label}: ${nameOf(plate)} is excluded from this line's nesting (Nesting › Plates). Tick it back in, or lay the lot out on another plate.`);
+      continue;
+    }
     const settings = pickCutSettings(settingRows, plate.steel.thickness);
     // A lot on the customer's own plate: only their order's customer, and no
     // more of them than they have free (init.sql §35).
@@ -1496,7 +1923,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       settings,
       pieces: [],
     };
-    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts });
+    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates });
     lots.push(lot);
   }
 
@@ -1517,6 +1944,9 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   assertNoProblems(problems, 'That layout cannot be accepted.');
 
   // ---- from here it only writes -------------------------------------------
+  // A left-out cut piece that sat on a lot this accept clears goes back to
+  // "plate chosen at nesting" below — read before the lots go.
+  const leftOutWasOn = await cutPlatesOnLots(db, companyId, orderLineId, [...excl.cutPlates], replaceImported ? null : 'auto');
   const replaced = await clearLots(db, c, orderLineId, replaceImported ? {} : { origin: 'auto' });
   const numbers = autoLotNumbers(lots.length, imported.lotNos);
   const toWrite = lots.map((lot, i) => {
@@ -1555,8 +1985,12 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   // against every piece the line needs of it.
   const blanks = new Map(cutPlates.filter((cp) => cp.pieces).map((cp) => [cp.id, cp.pieces]));
   const quantities = await replaceAreaFractions(db, c, where, [...imported.lots, ...toWrite], blanks);
+  const backToNesting = await backToChosenAtNesting(db, companyId, where,
+    leftOutWasOn.filter((id) => !(imported.counts.get(id) > 0)));
   return {
     line: lineHead(line),
+    choices: choiceSummary(cutPlates, plates, excl),
+    leftOutBackToNesting: backToNesting,
     replacedLots: replaced,
     keptImportedLots: imported.lots.length,
     lots: written.length,
@@ -1654,7 +2088,7 @@ function flattenNests(plan, problems) {
  * rectangles are. Every failure is pushed, none thrown, so the caller can show
  * them all at once.
  */
-function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map() }) {
+function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set() }) {
   const { plate, settings } = lot;
   const k = settings.kerfMm;
   const raw = Array.isArray(n.pieces) ? n.pieces : [];
@@ -1668,6 +2102,10 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
     // NEST_MANUAL means "leave it out of AUTOMATIC nesting" (2026-09-29): it
     // may sit on an imported nest, never on a packed one.
     if (cp.manual) { problems.push(`${at}: ${nameOf(cp)} is marked ${NEST_MANUAL_SPEC_CODE}, so it is left out of automatic nesting and cannot be on a packed plate. Put it on an imported nest, or clear the flag to nest it.`); continue; }
+    if (leftOut.has(cp.id)) {
+      problems.push(`${at}: ${nameOf(cp)} is left out of this line's nesting (Nesting › Pieces), so it cannot be on a packed plate. Tick it back in to nest it.`);
+      continue;
+    }
     if (!required.has(cp.id)) {
       problems.push(importedCounts.get(cp.id)
         ? `${at}: every piece of ${nameOf(cp)} the line needs is already on imported nests, so there is none left for this plate.`
@@ -1783,6 +2221,39 @@ async function clearLots(db, c, orderLineId, { origin = null } = {}) {
   await db.query('UPDATE cf_offcuts SET deleted_at = NOW() WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL', [c.companyId, ids]);
   await db.query('UPDATE cf_plate_lots SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [c.companyId, ids]);
   return ids.length;
+}
+
+/** Which of `cutPlateIds` sit on the line's live lots (of one origin, or any). One read. */
+async function cutPlatesOnLots(db, companyId, orderLineId, cutPlateIds, origin = null) {
+  if (!cutPlateIds.length) return [];
+  const [rows] = await db.query(
+    `SELECT DISTINCT np.cut_plate_id
+       FROM cf_plate_lots pl
+       JOIN cf_nest_placements np ON np.plate_lot_id = pl.id AND np.company_id = pl.company_id AND np.deleted_at IS NULL
+      WHERE pl.company_id = ? AND pl.order_line_id = ? AND pl.deleted_at IS NULL${origin ? ' AND pl.origin = ?' : ''}
+        AND np.cut_plate_id IN (?)`,
+    origin ? [companyId, orderLineId, origin, cutPlateIds] : [companyId, orderLineId, cutPlateIds],
+  );
+  return rows.map((r) => Number(r.cut_plate_id));
+}
+
+/**
+ * LEFT OUT MEANS "PLATE CHOSEN AT NESTING" AGAIN. A cut piece that was on an
+ * accepted lot had its plate line repointed at that lot's plate with the nest's
+ * quantity; once it is left out and the lot is gone, keeping that would let the
+ * buy list buy a share of a plate nobody cuts it from. So its plate line goes
+ * back to the plate SELECTION at the placeholder quantity 1, exactly as
+ * cutPlateService leaves a new blank — and release refuses it until it is
+ * nested or a plate is chosen by hand. Returns the cut plate ids reset.
+ */
+async function backToChosenAtNesting(db, companyId, where, cutPlateIds) {
+  if (!cutPlateIds.length) return [];
+  const { plateSelection } = await import('./cutPlateService.js');
+  const selection = await plateSelection(db, companyId, where.plate);
+  const lines = await plateLinesOf(db, companyId, cutPlateIds, where);
+  const updates = cutPlateIds.filter((id) => lines.has(id)).map((id) => [lines.get(id).line_id, selection.id, 1]);
+  await updateBomLines(db, companyId, updates);
+  return cutPlateIds.filter((id) => lines.has(id));
 }
 
 /* ---------------------------------------------------------------------------
@@ -1944,7 +2415,10 @@ async function plateLinesOf(db, companyId, cutPlateIds, where) {
  */
 export async function getNesting(db, companyId, orderLineId) {
   const line = await requireLine(db, companyId, orderLineId);
-  const { cutPlates } = await surveyLine(db, companyId, line);
+  const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
+  // The line's nesting choices (§40): a left-out cut piece is not drift.
+  const excl = await exclusionsOfLine(db, companyId, orderLineId);
+  const cutPlates = needed.map((cp) => (excl.cutPlates.has(cp.id) ? { ...cp, leftOut: true } : cp));
   const cpById = new Map(cutPlates.map((cp) => [cp.id, cp]));
 
   const [lotRows] = await db.query(
@@ -2065,6 +2539,9 @@ export async function getNesting(db, companyId, orderLineId) {
     sizeAdvice: [],
     problems: [],
     drift,
+    // "N pieces left out · M plates excluded" — only plates that are still
+    // active catalog plates count, so the plates are read only when some are.
+    choices: choiceSummary(needed, excl.plates.size ? await candidatePlates(db, companyId, where.plateIds) : [], excl),
     totals: totalsOf(out),
   };
 }
@@ -2080,7 +2557,7 @@ export function coverageOf(cutPlates, placedCount) {
   return cutPlates.filter((cp) => cp.pieces || placedCount.get(cp.id)).map((cp) => {
     const nested = placedCount.get(cp.id) ?? 0;
     return {
-      cutPlateId: cp.id, cutPlateCode: cp.code ?? nameOf(cp), needed: cp.pieces, nested, diff: nested - cp.pieces, manual: !!cp.manual,
+      cutPlateId: cp.id, cutPlateCode: cp.code ?? nameOf(cp), needed: cp.pieces, nested, diff: nested - cp.pieces, manual: !!cp.manual, leftOut: !!cp.leftOut,
       thickness: cp.steel?.thickness ?? null, length: cp.steel?.length ?? null, width: cp.steel?.width ?? null, grade: cp.steel?.grade ?? null,
     };
   });
@@ -2123,6 +2600,8 @@ function savedWasteFields(l, pieces, storedOffcuts, settingRows) {
     offcuts,
     sequences: hasLayout ? sequenceSummary(pieces) : [],
     notes: l.notes ?? null,
+    rules: nestRules({ length: l.length_mm, width: l.width_mm, thickness: Number(l.thickness_mm), pieces },
+      { kerfMm: l.kerf_mm, seqGapMinMm: l.seq_gap_min_mm, seqGapMaxMm: l.seq_gap_max_mm }),
   };
 }
 

@@ -4268,3 +4268,39 @@ SELECT DISTINCT rc.role_id, rc.team_id, rc.company_id, rc.app_id, pa.capability_
       WHERE x.capability_id = pa.capability_id AND x.deleted_at IS NULL
         AND x.role_id <=> rc.role_id AND x.team_id <=> rc.team_id
         AND x.company_id <=> rc.company_id AND x.app_id <=> rc.app_id);
+
+-- ===========================================================================
+-- 40. NESTING CHOICES — the cut pieces and raw plates a line's nesting leaves out
+-- ===========================================================================
+--
+-- 2026-10-02 (the user: "before any nesting is done, show the cut pieces and let
+-- the user remove any … then show the list of RMs you will consider based on the
+-- thickness of the cut plates; let the user unselect any"). One row per thing
+-- left out of a line's AUTOMATIC nesting:
+--   kind 'cut_plate'  a cut piece (blank) taken out of every run on this line;
+--                     it stays "plate chosen at nesting" — nest it later, or
+--                     choose its plate by hand. Like NEST_MANUAL, but per line
+--                     and without touching the cut piece's values.
+--   kind 'plate'      a catalog raw plate the packer may not draw on for this
+--                     line (it is still a candidate everywhere else).
+-- Applied by every plan (Quick / Standard / Deep, re-nest) and checked again by
+-- accept. Written as a whole line at a time (PUT …/nesting/choices): the line's
+-- rows are deleted and re-inserted, so there is no soft delete (as §38). A row
+-- whose item is no longer a cut piece / candidate of the line is ignored.
+CREATE TABLE IF NOT EXISTS cf_nest_exclusions (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  order_line_id   INT            NOT NULL,
+  kind            ENUM('cut_plate','plate') NOT NULL,
+  item_id         INT            NOT NULL,
+  created_by      INT            NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cnex_item (company_id, order_line_id, kind, item_id),
+  KEY idx_cnex_line (company_id, order_line_id),
+
+  CONSTRAINT fk_cnex_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cnex_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cnex_item    FOREIGN KEY (item_id) REFERENCES cf_master_records(id),
+  CONSTRAINT fk_cnex_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
