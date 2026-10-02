@@ -4425,3 +4425,71 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_bom_lines' AND COLUMN_NAME = 'auto_chosen');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_bom_lines ADD COLUMN auto_chosen TINYINT(1) NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §43  Purchase orders bought FOR a sales order, and what arrives held for it
+-- ============================================================================
+-- A PO line can be bought for one or more sales orders, each for a quantity
+-- (cf_purchase_line_orders). The PO header's for_order_id is only the DEFAULT a
+-- new line takes. Suggest and RFQ create-pos fill the allocations from the buy
+-- list's per-order split. On receipt each allocation's share becomes a HOLD: a
+-- cf_stock_reservations row with held_for_order_id + purchase_line_id and no
+-- requirement_id / order_line_id, so nobody else can take it (availability
+-- subtracts every active reservation). The order's release takes its own holds
+-- first and turns them into requirement reservations. An order is matched by
+-- its NUMBER (code_active), so a revision keeps what was held for the one before.
+CREATE TABLE IF NOT EXISTS cf_purchase_line_orders (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  purchase_line_id  INT            NOT NULL,
+  order_id          INT            NOT NULL,
+  quantity          DECIMAL(18,6)  NOT NULL,
+  qty_received      DECIMAL(18,6)  NOT NULL DEFAULT 0,
+
+  deleted_at        DATETIME       DEFAULT NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT            NULL,
+
+  order_live        INT            GENERATED ALWAYS AS (IF(deleted_at IS NULL, order_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cplo_tenant (company_id, id),
+  UNIQUE KEY uq_cplo_line_order (purchase_line_id, order_live),
+  KEY idx_cplo_line  (company_id, purchase_line_id),
+  KEY idx_cplo_order (company_id, order_id),
+
+  CONSTRAINT fk_cplo_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cplo_line    FOREIGN KEY (company_id, purchase_line_id) REFERENCES cf_purchase_order_lines(company_id, id),
+  CONSTRAINT fk_cplo_order   FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cplo_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'for_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN for_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND INDEX_NAME = 'idx_cpo_for_order');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_purchase_orders ADD KEY idx_cpo_for_order (company_id, for_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND CONSTRAINT_NAME = 'fk_cpo_for_order');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_purchase_orders ADD CONSTRAINT fk_cpo_for_order FOREIGN KEY (company_id, for_order_id) REFERENCES cf_sales_orders(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND COLUMN_NAME = 'held_for_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_reservations ADD COLUMN held_for_order_id INT NULL, ADD COLUMN purchase_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND INDEX_NAME = 'idx_csrv_held');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_stock_reservations ADD KEY idx_csrv_held (company_id, held_for_order_id, status)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND CONSTRAINT_NAME = 'fk_csrv_held_order');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_stock_reservations ADD CONSTRAINT fk_csrv_held_order FOREIGN KEY (company_id, held_for_order_id) REFERENCES cf_sales_orders(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND CONSTRAINT_NAME = 'fk_csrv_purchase_line');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_stock_reservations ADD CONSTRAINT fk_csrv_purchase_line FOREIGN KEY (company_id, purchase_line_id) REFERENCES cf_purchase_order_lines(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

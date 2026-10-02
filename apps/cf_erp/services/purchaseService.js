@@ -56,6 +56,10 @@ import {
 } from './priceService.js';
 import { purchaseOrderTax } from './taxService.js';
 import { inProcurementByItem } from './procurementShared.js';
+import {
+  requireLinkableOrder, allocationsOf, orderCodesOfPos, addAllocation, insertAllocations, dropAllocations,
+  setAllocations, trimAllocations, holdOnReceipt, holdsByOrderItem, linkedOnOrder,
+} from './purchaseLinkService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -163,12 +167,12 @@ async function plannedRows(db, companyId) {
  * q: { show?: short (default) | all, search?, exceptOrderId?, planned?: only | none }
  */
 export async function buyList(db, companyId, q = {}) {
-  const [rows] = await db.query(
-    `SELECT q.item_id, m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by,
+  // One row per item and ORDER, folded into one row per item below: the parts
+  // let what is held / bought for an order cover that order only (init.sql §43).
+  const [parts] = await db.query(
+    `SELECT q.item_id, m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by, o.id AS order_id, o.code AS order_code,
             SUM(GREATEST(q.quantity - q.issued, 0)) AS wanted,
-            SUM(COALESCE(v.reserved, 0)) AS reserved,
-            GROUP_CONCAT(DISTINCT o.code ORDER BY o.code SEPARATOR '\u001f') AS orders,
-            GROUP_CONCAT(DISTINCT o.id ORDER BY o.id SEPARATOR '\u001f') AS order_ids
+            SUM(COALESCE(v.reserved, 0)) AS reserved
        FROM cf_material_requirements q
        JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
        JOIN cf_sales_orders o ON o.id = r.order_id AND o.deleted_at IS NULL AND o.status = 'confirmed'
@@ -178,14 +182,27 @@ export async function buyList(db, companyId, q = {}) {
                    WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL GROUP BY requirement_id) v
               ON v.requirement_id = q.id
       WHERE q.company_id = ? AND q.deleted_at IS NULL
-      GROUP BY q.item_id, m.code, m.name, i.uom, i.tracked_by`,
+      GROUP BY q.item_id, m.code, m.name, i.uom, i.tracked_by, o.id, o.code
+      ORDER BY q.item_id, o.code`,
     [companyId, companyId],
   );
+  const rows = [];
+  for (const p of parts) {
+    let r = rows[rows.length - 1];
+    if (!r || r.item_id !== p.item_id) {
+      r = { item_id: p.item_id, item_code: p.item_code, item_name: p.item_name, uom: p.uom, tracked_by: p.tracked_by, parts: [] };
+      rows.push(r);
+    }
+    r.parts.push({ orderId: p.order_id, orderCode: p.order_code, wanted: round6(p.wanted), reserved: round6(p.reserved) });
+  }
   const planned = await plannedRows(db, companyId);
   const itemIds = [...new Set([...rows.map((r) => r.item_id), ...planned.map((p) => p.item.id)])];
   const onOrder = await onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
   const free = await availability(db, companyId, itemIds);
-  const [estimates, inProc] = await Promise.all([buyEstimates(db, companyId, itemIds), inProcurementByItem(db, companyId, itemIds)]);
+  const [estimates, inProc, holds, linked] = await Promise.all([
+    buyEstimates(db, companyId, itemIds), inProcurementByItem(db, companyId, itemIds),
+    holdsByOrderItem(db, companyId, itemIds), linkedOnOrder(db, companyId, OPEN_STATUSES, { exceptPoId: q.exceptOrderId ?? null }),
+  ]);
   /*
    * Free stock and what is on order are per ITEM, and an item can now be on a
    * released row and on planned rows at once. Each is handed out once, in
@@ -194,10 +211,27 @@ export async function buyList(db, companyId, q = {}) {
    * code and line order, each seeing only what the rows before it left. The
    * item's total to buy is therefore wanted − held − free − on order, never
    * counted twice.
+   *
+   * BOUGHT FOR AN ORDER (init.sql §43). Before that, each order's part of a row
+   * is covered by what is HELD for that order (arrived on a PO bought for it),
+   * then by what is still coming on POs bought for it — those cover nobody
+   * else. Only the rest of a row meets free stock and the UNLINKED part of what
+   * is on order. With no links every number is what it was.
    */
+  const keyOf = (code, itemId) => `${String(code ?? '').toLowerCase()}:${itemId}`;
+  const linkedTotalOf = new Map();
+  for (const [k, qty] of linked) {
+    const itemId = Number(k.slice(k.lastIndexOf(':') + 1));
+    linkedTotalOf.set(itemId, round6((linkedTotalOf.get(itemId) ?? 0) + qty));
+  }
   const left = new Map();                            // itemId -> { free, onOrder } still unclaimed
   const leftOf = (id) => {
-    if (!left.has(id)) left.set(id, { free: free.get(id)?.free ?? 0, onOrder: onOrder.get(id)?.quantity ?? 0 });
+    if (!left.has(id)) {
+      left.set(id, {
+        free: free.get(id)?.free ?? 0,
+        onOrder: round6(Math.max(0, (onOrder.get(id)?.quantity ?? 0) - (linkedTotalOf.get(id) ?? 0))),
+      });
+    }
     return left.get(id);
   };
   const claim = (id, uncovered) => {
@@ -209,38 +243,66 @@ export async function buyList(db, companyId, q = {}) {
     l.onOrder = round6(l.onOrder - fromOrder);
     return { ...shown, toBuy: round6(Math.max(0, uncovered - shown.free - shown.onOrder)) };
   };
+  /** An order's part of a row, after its holds and its own POs: { held, linked, rest }. Consumes them. */
+  const ownCover = (itemId, orderCode, uncovered) => {
+    const k = keyOf(orderCode, itemId);
+    const held = round6(Math.min(holds.get(k) ?? 0, uncovered));
+    if (held > EPS) holds.set(k, round6(holds.get(k) - held));
+    const mine = round6(Math.min(linked.get(k) ?? 0, uncovered - held));
+    if (mine > EPS) linked.set(k, round6(linked.get(k) - mine));
+    return { held, linked: mine, rest: round6(Math.max(0, uncovered - held - mine)) };
+  };
+  /** toBuy handed to the orders of a row, LAST order first (earlier orders met free stock first). */
+  const splitOf = (cover, toBuy) => {
+    const out = [];
+    let left2 = toBuy;
+    for (const p of [...cover].reverse()) {
+      if (left2 <= EPS) break;
+      const t = round6(Math.min(left2, p.rest));
+      if (t > EPS) out.unshift({ orderId: p.orderId, orderCode: p.orderCode, toBuy: t });
+      left2 = round6(left2 - t);
+    }
+    return out;
+  };
   let out = rows.map((r) => {
-    const wanted = round6(r.wanted);
-    const reserved = round6(r.reserved);
+    const wanted = round6(r.parts.reduce((t, p) => t + p.wanted, 0));
+    const reserved = round6(r.parts.reduce((t, p) => t + p.reserved, 0));
     const oo = onOrder.get(r.item_id) ?? { quantity: 0, orders: [] };
-    const uncovered = round6(Math.max(0, wanted - reserved));
-    const c = claim(r.item_id, uncovered);
+    const cover = r.parts.map((p) => ({ ...p, ...ownCover(r.item_id, p.orderCode, round6(Math.max(0, p.wanted - p.reserved))) }));
+    const held = round6(cover.reduce((t, p) => t + p.held, 0));
+    const mine = round6(cover.reduce((t, p) => t + p.linked, 0));
+    const c = claim(r.item_id, round6(cover.reduce((t, p) => t + p.rest, 0)));
     return {
       item: { id: r.item_id, code: r.item_code, name: r.item_name, uom: r.uom, trackedBy: r.tracked_by },
       planned: false,
       source: null,
       wanted,
       reserved,
+      held,
       free: c.free,
-      onOrder: c.onOrder,
+      onOrder: round6(c.onOrder + mine),
       purchaseOrders: oo.orders,
       toBuy: c.toBuy,
-      orders: (r.orders ?? '').split('\u001f').filter(Boolean).map((code, k) => ({ code, id: Number((r.order_ids ?? '').split('\u001f')[k]) })),
+      split: splitOf(cover, c.toBuy),
+      orders: r.parts.map((p) => ({ code: p.orderCode, id: p.orderId })),
     };
   });
   for (const p of planned) {
     const oo = onOrder.get(p.item.id) ?? { quantity: 0, orders: [] };
-    const c = claim(p.item.id, p.wanted);
+    const own = ownCover(p.item.id, p.source.orderCode, p.wanted);
+    const c = claim(p.item.id, own.rest);
     out.push({
       item: p.item,
       planned: true,
       source: p.source,
       wanted: p.wanted,
       reserved: 0,
+      held: own.held,
       free: c.free,
-      onOrder: c.onOrder,
+      onOrder: round6(c.onOrder + own.linked),
       purchaseOrders: oo.orders,
       toBuy: c.toBuy,
+      split: c.toBuy > EPS ? [{ orderId: p.source.orderId, orderCode: p.source.orderCode, toBuy: c.toBuy }] : [],
       orders: [{ code: p.source.orderCode, id: p.source.orderId }],
     });
   }
@@ -402,6 +464,11 @@ export async function getPurchaseOrder(db, companyId, id) {
   );
   const ordered = round6(lines.reduce((t, l) => t + Number(l.quantity), 0));
   const received = round6(lines.reduce((t, l) => t + Number(l.qty_received), 0));
+  // Bought for which sales orders (init.sql §43): the header default, and each line's allocations.
+  const [[forOrder]] = p.for_order_id
+    ? await db.query('SELECT id, code FROM cf_sales_orders WHERE company_id = ? AND id = ?', [companyId, p.for_order_id])
+    : [[]];
+  const alloc = await allocationsOf(db, companyId, lines.map((l) => l.id));
   // The last price paid elsewhere, beside each line — the buyer's yardstick.
   const lastPaid = lines.length ? await lastPricesPaid(db, companyId, lines.map((l) => l.item_id), { exceptOrderId: p.id }) : new Map();
   const priced = lines.filter((l) => l.unit_price != null);
@@ -420,6 +487,7 @@ export async function getPurchaseOrder(db, companyId, id) {
     orderedAt: p.ordered_at,
     notes: p.notes,
     reverseCharge: !!Number(p.reverse_charge ?? 0),
+    forOrder: forOrder ? { id: forOrder.id, code: forOrder.code } : null,
     createdAt: p.created_at,
     totals: {
       lines: lines.length, ordered, received, outstanding: round6(Math.max(0, ordered - received)),
@@ -441,6 +509,8 @@ export async function getPurchaseOrder(db, companyId, id) {
       ...lineTax.get(l.id),
       expectedDate: l.expected_date,
       note: l.note,
+      orders: alloc.get(l.id) ?? [],
+      unlinked: round6(Math.max(0, Number(l.quantity) - (alloc.get(l.id) ?? []).reduce((t, a) => t + a.quantity, 0))),
       receipts: receipts.filter((v) => v.purchase_line_id === l.id)
         .map((v) => ({ id: v.id, code: v.code, date: v.movement_date, quantity: round6(v.quantity) })),
     })),
@@ -512,6 +582,15 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     const { poTax } = await purchaseOrderTax(db, companyId, rows, pl.map((l) => ({ ...l, amount: l.amount == null ? null : Number(l.amount) })));
     for (const [k, v] of poTax) poTaxes.set(k, v);
   }
+  // Bought for which sales orders (init.sql §43): the header default and every order its lines name.
+  const forIds = [...new Set(rows.filter((p) => p.for_order_id).map((p) => p.for_order_id))];
+  const [codesOf, forOrders] = await Promise.all([
+    orderCodesOfPos(db, companyId, rows.map((p) => p.id)),
+    forIds.length
+      ? db.query('SELECT id, code FROM cf_sales_orders WHERE company_id = ? AND id IN (?)', [companyId, forIds])
+        .then(([r]) => new Map(r.map((o) => [o.id, { id: o.id, code: o.code }])))
+      : new Map(),
+  ]);
   const out = rows.map((p) => ({
     id: p.id,
     code: p.code,
@@ -530,6 +609,8 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
       ...poTaxes.get(p.id),
     },
     reverseCharge: !!Number(p.reverse_charge ?? 0),
+    forOrder: forOrders.get(p.for_order_id) ?? null,
+    orderCodes: codesOf.get(p.id) ?? [],
   }));
   if (!paged) return out;
   const [[byStatus], [[sum]]] = counted;
@@ -556,11 +637,11 @@ async function nextCode(db, c, { suggested = false } = {}) {
  * buyer should not have to set up a rule before the first order can be raised
  * (stock movements do the same).
  */
-export async function insertOrder(db, c, { code, supplierId, expectedDate, notes, suggested }) {
+export async function insertOrder(db, c, { code, supplierId, expectedDate, notes, suggested, forOrderId = null }) {
   const [r] = await db.query(
-    `INSERT INTO cf_purchase_orders (company_id, code, supplier_id, status, suggested, expected_date, notes, created_by)
-     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)`,
-    [c.companyId, code ?? null, supplierId ?? null, suggested ? 1 : 0, expectedDate ?? null, notes ?? null, c.userId],
+    `INSERT INTO cf_purchase_orders (company_id, code, supplier_id, status, suggested, expected_date, notes, for_order_id, created_by)
+     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?)`,
+    [c.companyId, code ?? null, supplierId ?? null, suggested ? 1 : 0, expectedDate ?? null, notes ?? null, forOrderId ?? null, c.userId],
   );
   if (!code) await db.query('UPDATE cf_purchase_orders SET code = ? WHERE id = ?', [`PO-${String(r.insertId).padStart(6, '0')}`, r.insertId]);
   return r.insertId;
@@ -581,9 +662,10 @@ export async function createPurchaseOrder(db, c, input = {}) {
   const expectedDate = readDate(input.expectedDate, 'Expected date', problems);
   let code = blank(input.code) ? null : String(input.code).trim();
   if (code && (!CODE_RE.test(code) || code.length > 100)) problems.push('Order number: up to 100 letters, digits and - _ . /, no spaces.');
+  const forOrder = blank(input.forOrderId) ? null : await requireLinkableOrder(db, c.companyId, input.forOrderId, problems);
   assertNoProblems(problems);
   if (!code) code = await nextCode(db, c);
-  const id = await insertOrder(db, c, { code, supplierId, expectedDate, notes: blank(input.notes) ? null : String(input.notes), suggested: false });
+  const id = await insertOrder(db, c, { code, supplierId, expectedDate, notes: blank(input.notes) ? null : String(input.notes), suggested: false, forOrderId: forOrder?.id ?? null });
   return getPurchaseOrder(db, c.companyId, id);
 }
 
@@ -600,6 +682,11 @@ export async function updatePurchaseOrder(db, c, id, input = {}) {
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
   // Reverse charge (init.sql §37): the GST is payable by us, not part of the supplier total.
   if (input.reverseCharge !== undefined) sets.reverse_charge = input.reverseCharge ? 1 : 0;
+  // Only the default for lines added from now on: the lines already there keep their orders.
+  if (input.forOrderId !== undefined) {
+    if (blank(input.forOrderId)) sets.for_order_id = null;
+    else { const o = await requireLinkableOrder(db, c.companyId, input.forOrderId, problems); if (o) sets.for_order_id = o.id; }
+  }
   assertNoProblems(problems);
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_purchase_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
@@ -618,7 +705,11 @@ export async function addPurchaseLine(db, c, poId, input = {}) {
   const expectedDate = readDate(input.expectedDate, 'Expected date', problems);
   const typedPrice = readPrice(input.unitPrice, 'Unit price', problems);
   readCurrency(input.currency, problems);
+  // Bought for a sales order (init.sql §43): the one named, else the header's default; null = for stock.
+  const forOrderId = input.orderId !== undefined ? (blank(input.orderId) ? null : input.orderId) : p.for_order_id;
+  const forOrder = forOrderId == null ? null : await requireLinkableOrder(db, c.companyId, forOrderId, problems);
   assertNoProblems(problems);
+  let lineId;
   const [[existing]] = await db.query(
     'SELECT id, quantity, unit_price FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND item_id = ? AND deleted_at IS NULL',
     [c.companyId, p.id, item.id],
@@ -627,17 +718,20 @@ export async function addPurchaseLine(db, c, poId, input = {}) {
     // A typed price replaces the line's; otherwise the line keeps the one it has.
     await db.query('UPDATE cf_purchase_order_lines SET quantity = ?, unit_price = ? WHERE company_id = ? AND id = ?',
       [round6(Number(existing.quantity) + quantity), typedPrice ?? existing.unit_price, c.companyId, existing.id]);
+    lineId = existing.id;
   } else {
     // No price typed: the last price paid for the item, if it was ever bought.
     const unitPrice = typedPrice
       ?? (await lastPricesPaid(db, c.companyId, [item.id], { exceptOrderId: p.id })).get(item.id)?.unitPrice ?? null;
     const [[{ n }]] = await db.query('SELECT COALESCE(MAX(line_no), 0) AS n FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ?', [c.companyId, p.id]);
-    await db.query(
+    const [ins] = await db.query(
       `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom, expected_date, note, unit_price, currency)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [c.companyId, p.id, Number(n) + 1, item.id, quantity, item.uom, expectedDate, blank(input.note) ? null : String(input.note).slice(0, 500), unitPrice, CURRENCY],
     );
+    lineId = ins.insertId;
   }
+  if (forOrder) await addAllocation(db, c, lineId, forOrder.id, quantity);
   await restate(db, c.companyId, p.id);
   return getPurchaseOrder(db, c.companyId, p.id);
 }
@@ -650,7 +744,11 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
   if (input.quantity !== undefined) {
     const q = readQty(input.quantity, 'Quantity', problems);
     if (q != null && q + EPS < Number(l.qty_received)) problems.push(`${fmt(l.qty_received)} has already been received on this line — the quantity cannot go below that.`);
-    else if (q != null) sets.quantity = q;
+    else if (q != null) {
+      sets.quantity = q;
+      // Less on the line: the orders it is bought for give way, newest first, never below what arrived for them.
+      if (q < Number(l.quantity) - EPS) await trimAllocations(db, c, l, q, problems);
+    }
   }
   if (input.expectedDate !== undefined) sets.expected_date = readDate(input.expectedDate, 'Expected date', problems);
   if (input.note !== undefined) sets.note = blank(input.note) ? null : String(input.note).slice(0, 500);
@@ -671,7 +769,16 @@ export async function removePurchaseLine(db, c, lineId) {
   assertOpen({ status: l.po_status, code: l.po_code }, 'be removed');
   if (Number(l.qty_received) > EPS) throw invalid('RECEIVED', `${fmt(l.qty_received)} has already been received on this line — it cannot be removed.`);
   await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, l.id]);
+  await dropAllocations(db, c.companyId, [l.id]);
   await restate(db, c.companyId, l.purchase_order_id);
+  return getPurchaseOrder(db, c.companyId, l.purchase_order_id);
+}
+
+/** PUT /purchase-lines/:id/orders — which sales orders a line is bought for, and how much for each. */
+export async function setPurchaseLineOrders(db, c, lineId, input = {}) {
+  const l = await requireLine(db, c.companyId, lineId);
+  assertOpen({ status: l.po_status, code: l.po_code });
+  await setAllocations(db, c, l, input.orders);
   return getPurchaseOrder(db, c.companyId, l.purchase_order_id);
 }
 
@@ -693,12 +800,18 @@ export async function suggestPurchase(db, c) {
   const byItem = new Map();
   for (const r of await buyList(db, c.companyId, { show: 'short', exceptOrderId: open?.id ?? null })) {
     const e = byItem.get(r.item.id);
-    if (e) e.toBuy = round6(e.toBuy + r.toBuy);
-    else byItem.set(r.item.id, { ...r });
+    if (e) { e.toBuy = round6(e.toBuy + r.toBuy); e.split = [...e.split, ...(r.split ?? [])]; }
+    else byItem.set(r.item.id, { ...r, split: [...(r.split ?? [])] });
   }
   const rows = [...byItem.values()];
+  // The old lines go, and with them the orders they were bought for.
+  const dropOld = async () => {
+    const [old] = await db.query('SELECT id FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, open.id]);
+    await dropAllocations(db, c.companyId, old.map((l) => l.id));
+  };
   if (!rows.length) {
     if (open) {
+      await dropOld();
       await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, open.id]);
       await db.query("UPDATE cf_purchase_orders SET status = 'cancelled' WHERE company_id = ? AND id = ?", [c.companyId, open.id]);
     }
@@ -706,6 +819,7 @@ export async function suggestPurchase(db, c) {
   }
   let poId = open?.id ?? null;
   if (poId) {
+    await dropOld();
     await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, poId]);
   } else {
     poId = await insertOrder(db, c, {
@@ -722,6 +836,10 @@ export async function suggestPurchase(db, c) {
     // list price: that is what WE sell at, not a price agreed with a supplier.
     [rows.map((r) => [c.companyId, poId, lineNo++, r.item.id, r.toBuy, r.item.uom, r.estSource === 'last_paid' ? r.estUnitPrice : null, CURRENCY])],
   );
+  // Each line is bought for the orders that were short of it, as much as each was short (init.sql §43).
+  const [fresh] = await db.query('SELECT id, item_id FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, poId]);
+  const lineOf = new Map(fresh.map((l) => [l.item_id, l.id]));
+  await insertAllocations(db, c, rows.flatMap((r) => r.split.map((x) => ({ lineId: lineOf.get(r.item.id), orderId: x.orderId, quantity: x.toBuy }))));
   return { order: await getPurchaseOrder(db, c.companyId, poId), lines: rows.length, message: null };
 }
 
@@ -780,8 +898,10 @@ export async function receiveLine(db, c, lineId, input = {}) {
   });
   await db.query('UPDATE cf_stock_movements SET purchase_line_id = ? WHERE company_id = ? AND id = ?', [l.id, c.companyId, movement.id]);
   await db.query('UPDATE cf_purchase_order_lines SET qty_received = qty_received + ? WHERE company_id = ? AND id = ?', [quantity, c.companyId, l.id]);
+  // What was bought for a sales order is held for it as it arrives (init.sql §43).
+  const held = await holdOnReceipt(db, c, l, quantity, movement.lines?.find((x) => x.item?.id === l.item_id)?.batch?.id ?? null);
   await restate(db, c.companyId, l.purchase_order_id);
-  return { movement, order: await getPurchaseOrder(db, c.companyId, l.purchase_order_id) };
+  return { movement, held, order: await getPurchaseOrder(db, c.companyId, l.purchase_order_id) };
 }
 
 /**

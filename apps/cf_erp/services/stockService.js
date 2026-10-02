@@ -129,7 +129,8 @@ async function assertEnough(db, companyId, legs) {
  * the dispatch bay at the same time, and one claim must not eat the other.
  */
 const RESERVATION_SCOPES = {
-  material: { purposes: ['storage', 'wip'], where: 'v.requirement_id IS NOT NULL' },
+  // A hold (§43) guards stock like a material claim: it sits in storage until the order's release takes it.
+  material: { purposes: ['storage', 'wip'], where: '(v.requirement_id IS NOT NULL OR v.held_for_order_id IS NOT NULL)' },
   finished: { purposes: ['dispatch'], where: 'v.order_line_id IS NOT NULL' },
 };
 
@@ -164,7 +165,7 @@ async function assertReservationsKept(db, companyId, legs) {
          LEFT JOIN cf_material_requirements q ON q.id = v.requirement_id
          LEFT JOIN cf_production_releases r ON r.id = q.release_id
          LEFT JOIN cf_sales_order_lines dl ON dl.id = v.order_line_id
-         JOIN cf_sales_orders o ON o.id = COALESCE(r.order_id, dl.order_id)
+         JOIN cf_sales_orders o ON o.id = COALESCE(r.order_id, dl.order_id, v.held_for_order_id)
         WHERE v.company_id = ? AND v.item_id = ? AND IFNULL(v.batch_id, 0) = ? AND v.status = 'active' AND v.deleted_at IS NULL AND ${where}
         ORDER BY o.code`,
       [companyId, k.item.id, k.batch?.id ?? 0],
@@ -1053,15 +1054,18 @@ export async function itemStock(db, companyId, itemId) {
   const rows = await listStock(db, companyId, { itemId: item.id }, { limit: null });
   const [res] = await db.query(
     `SELECT v.id, v.quantity, v.batch_id, b.code AS batch_code, b.status AS batch_status, b.owner_party_id,
-            IF(v.order_line_id IS NULL, 'material', 'finished') AS kind,
-            o.id AS order_id, o.code AS order_code, COALESCE(l.line_no, dl.line_no) AS line_no
+            IF(v.held_for_order_id IS NOT NULL, 'held', IF(v.order_line_id IS NULL, 'material', 'finished')) AS kind,
+            o.id AS order_id, o.code AS order_code, COALESCE(l.line_no, dl.line_no) AS line_no,
+            hp.id AS po_id, hp.code AS po_code
        FROM cf_stock_reservations v
        LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
        LEFT JOIN cf_material_requirements q ON q.id = v.requirement_id
        LEFT JOIN cf_production_releases r ON r.id = q.release_id
        LEFT JOIN cf_sales_order_lines l ON l.id = r.order_line_id
        LEFT JOIN cf_sales_order_lines dl ON dl.id = v.order_line_id
-       JOIN cf_sales_orders o ON o.id = COALESCE(r.order_id, dl.order_id)
+       LEFT JOIN cf_purchase_order_lines hl ON hl.id = v.purchase_line_id
+       LEFT JOIN cf_purchase_orders hp ON hp.id = hl.purchase_order_id
+       JOIN cf_sales_orders o ON o.id = COALESCE(r.order_id, dl.order_id, v.held_for_order_id)
       WHERE v.company_id = ? AND v.item_id = ? AND v.status = 'active' AND v.deleted_at IS NULL ORDER BY o.code, line_no, v.id`,
     [companyId, item.id],
   );
@@ -1082,7 +1086,9 @@ export async function itemStock(db, companyId, itemId) {
     rows,
     reservations: res.map((v) => ({
       id: v.id, quantity: Number(v.quantity), batch: v.batch_id ? { id: v.batch_id, code: v.batch_code, status: v.batch_status } : null,
-      order: { id: v.order_id, code: v.order_code }, lineNo: v.line_no, kind: v.kind,
+      order: { id: v.order_id, code: v.order_code }, lineNo: v.line_no ?? null, kind: v.kind,
+      // A hold (§43): arrived on a PO bought for the order.
+      ...(v.kind === 'held' ? { purchaseOrder: v.po_id ? { id: v.po_id, code: v.po_code } : null } : {}),
     })),
     movements: await listMovements(db, companyId, { itemId: item.id, limit: 20 }),
   };

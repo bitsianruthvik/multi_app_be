@@ -34,8 +34,9 @@
  *   request line ──cf_purchase_order_lines.request_line_id──▶ PO line
  *   PO line ──cf_stock_movements.purchase_line_id──▶ receipt (GRN)
  *   sales order ──cf_purchase_request_lines.source.orders[].id──▶ request line
- * GAPS: a PO raised by hand or by "Suggest what to buy" names no sales order (no
- * request line behind it), so the order filter cannot see it; a released buy-list
+ *   sales order ──cf_purchase_line_orders.order_id──▶ PO line (init.sql §43: bought
+ *     for it, by hand, by Suggest or from an RFQ; what arrives is held for it)
+ * GAP: a released buy-list
  * row is per ITEM across every order that wants it, so an order's "to buy" for a
  * shared item is the item's whole shortage (the row says which orders share it).
  *
@@ -50,6 +51,7 @@ import { invalid, notFound } from '../lib/errors.js';
 import { likeOf } from '../lib/listing.js';
 import { buyList } from './purchaseService.js';
 import { CURRENCY, round2 } from './priceService.js';
+import { heldForOrder, linkedPoIds } from './purchaseLinkService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -458,7 +460,9 @@ export async function orderScope(db, companyId, orderId) {
   });
   const requestLineIds = lines.map((l) => l.id);
   const requestIds = [...new Set(lines.map((l) => l.request_id))];
-  if (!requestLineIds.length) return { orderId: oid, requestLineIds, requestIds, rfqIds: [], poIds: [] };
+  // POs with a line bought for the order (init.sql §43) — by hand, by Suggest or from an RFQ.
+  const linked = await linkedPoIds(db, companyId, oid);
+  if (!requestLineIds.length) return { orderId: oid, requestLineIds, requestIds, rfqIds: [], poIds: linked };
   const [edges] = await db.query(
     `SELECT rl.rfq_id, pol.purchase_order_id
        FROM cf_rfq_lines rl
@@ -475,7 +479,7 @@ export async function orderScope(db, companyId, orderId) {
     requestLineIds,
     requestIds,
     rfqIds: [...new Set(edges.map((e) => e.rfq_id).filter(Boolean))],
-    poIds: [...new Set(edges.map((e) => e.purchase_order_id).filter(Boolean))],
+    poIds: [...new Set([...edges.map((e) => e.purchase_order_id).filter(Boolean), ...linked])],
   };
 }
 
@@ -609,6 +613,7 @@ export async function buyingBoard(db, companyId, q = {}) {
     orderId ? db.query('SELECT id, code, status FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, orderId]).then(([[o]]) => o ?? null) : null,
     supplierId ? db.query('SELECT id, code, name FROM cf_parties WHERE company_id = ? AND id = ?', [companyId, supplierId]).then(([[s]]) => s ?? null) : null,
   ]);
+  const held = orderId ? await heldForOrder(db, companyId, orderId) : null;
   const forOrder = orderId
     ? buyRows.filter((r) => (r.orders ?? []).some((o) => Number(o.id) === orderId) || Number(r.source?.orderId) === orderId)
     : buyRows;
@@ -651,7 +656,7 @@ export async function buyingBoard(db, companyId, q = {}) {
       currency: CURRENCY,
       ...(withRows ? { rows: forOrder.map((r) => buyRowOut(r, orderId)) } : {}),
     },
-    ...(scope ? { receipts, links: { requestLines: scope.requestLineIds.length } } : {}),
+    ...(scope ? { receipts, held, links: { requestLines: scope.requestLineIds.length } } : {}),
     generatedAt: new Date(now).toISOString(),
   };
 }

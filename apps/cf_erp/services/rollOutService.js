@@ -97,6 +97,13 @@ const OWNER_SCOPE = `CASE WHEN b.owner_party_id IS NULL THEN 0
                                OR (b.owner_order_id IS NULL AND b.owner_party_id = so.customer_id)) THEN 1
        ELSE 2 END`;
 
+/*
+ * A HOLD of the order asked about (init.sql §43): stock that arrived on a PO
+ * bought for it — by order number, so every revision. It is free FOR THAT
+ * ORDER (left out of `qty`, counted in `own_held`) and reserved for everyone else.
+ */
+const OWN_HOLD = 'ho.id IS NOT NULL AND so.id IS NOT NULL AND ho.code_active = so.code_active';
+
 /**
  * The two reads availability() is worked out from: usable balances per item and
  * batch, and active reservations per item and batch. Split out so "reserve all"
@@ -119,11 +126,13 @@ export async function availabilityRows(db, companyId, itemIds, { orderId = null 
      HAVING owner_scope < 2`,
     [orderId, companyId, itemIds],
   ), db.query(
-    `SELECT v.item_id, v.batch_id, SUM(v.quantity) AS qty, MAX(${OWNER_SCOPE}) AS owner_scope
+    `SELECT v.item_id, v.batch_id, SUM(IF(${OWN_HOLD}, 0, v.quantity)) AS qty, SUM(IF(${OWN_HOLD}, v.quantity, 0)) AS own_held,
+            MAX(${OWNER_SCOPE}) AS owner_scope
        FROM cf_stock_reservations v
        LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
        LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
        LEFT JOIN cf_sales_orders so ON so.company_id = v.company_id AND so.id = ?
+       LEFT JOIN cf_sales_orders ho ON ho.id = v.held_for_order_id
       WHERE v.company_id = ? AND v.item_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
       GROUP BY v.item_id, v.batch_id
      HAVING owner_scope < 2`,
@@ -141,6 +150,7 @@ export async function availabilityRows(db, companyId, itemIds, { orderId = null 
 export function shapeAvailability(itemIds, bal, res) {
   const out = new Map();
   const reservedOf = new Map(res.map((r) => [`${r.item_id}:${r.batch_id ?? 0}`, Number(r.qty)]));
+  const ownHeldOf = new Map(res.map((r) => [`${r.item_id}:${r.batch_id ?? 0}`, Number(r.own_held ?? 0)]));
   for (const id of itemIds) out.set(id, { available: 0, reserved: 0, free: 0, theirsFree: 0, batches: [] });
   for (const b of bal) {
     const entry = out.get(b.item_id);
@@ -153,6 +163,7 @@ export function shapeAvailability(itemIds, bal, res) {
       entry.batches.push({
         batchId: b.batch_id, code: b.batch_code, status: b.batch_status, receivedOn: dateOnly(b.received_on), available: qty, reserved, free,
         owner: theirs ? 'theirs' : 'ours', ownerPartyId: b.owner_party_id ?? null,
+        ownHeld: ownHeldOf.get(`${b.item_id}:${b.batch_id}`) ?? 0,
       });
     }
     entry.available = round6(entry.available + qty);
@@ -161,7 +172,9 @@ export function shapeAvailability(itemIds, bal, res) {
   }
   for (const r of res) { const e = out.get(r.item_id); if (e) e.reserved = round6(e.reserved + Number(r.qty)); }
   for (const e of out.values()) {
+    // The customer's own lots first, then lots held for the order (§43), then oldest first.
     e.batches.sort((a, b) => Number(b.owner === 'theirs') - Number(a.owner === 'theirs')
+      || Number(b.ownHeld > 0) - Number(a.ownHeld > 0)
       || String(a.receivedOn ?? '').localeCompare(String(b.receivedOn ?? '')) || a.batchId - b.batchId);
   }
   return out;

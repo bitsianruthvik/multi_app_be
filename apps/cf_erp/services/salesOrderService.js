@@ -42,6 +42,7 @@ import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import { salesOrderTax } from "./taxService.js";
 import { autofillLineSelections, PARENT_CLASS_JOIN, NOT_UNDER_CUT_PLATE_WHERE } from './selectionService.js';
 import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
+import { releaseOrderHolds } from './purchaseLinkService.js';
 
 /**
  * Amount per line: Map lineId → { billed, billedUom, amount, amountNote }. One
@@ -538,6 +539,8 @@ export async function setOrderStatus(db, c, id, status) {
       [c.companyId, id],
     );
   }
+  // What arrived held for it (§43) is let go too: closed, lost or cancelled, it will never use it.
+  if (status === 'closed' || status === 'cancelled' || status === 'lost') await releaseOrderHolds(db, c.companyId, id);
   // Locking freezes the values its items hold, so bring them up to date first;
   // reopening a lost order lets them catch up with setup changes made meanwhile.
   if (!wasLocked && willLock) await refreshOrderValues(db, c, id);

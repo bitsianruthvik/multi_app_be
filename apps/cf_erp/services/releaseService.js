@@ -33,6 +33,7 @@ import { estimatorForLine } from './timeEstimateService.js';
 import { cellOwnersOfLine } from './workOrderService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
+import { ownHoldRows, takeHolds, writeHoldTakes } from './purchaseLinkService.js';
 import {
   availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
   lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, CUT_PLATE_CODE, MAX_DEPTH,
@@ -2186,6 +2187,11 @@ async function reserveOne(db, c, q, input = {}) {
   const av = (await availability(db, c.companyId, [q.item_id], { orderId: q.order_id })).get(q.item_id);
   const { rows, result } = takeFrom(q, w.want, av, input);
   await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, rows.map((r) => reservationRow(c, q, r)));
+  // What was held for this order (§43) is free for it: the claim moves off the hold onto the requirement.
+  if (rows.length) {
+    const holds = await ownHoldRows(db, c.companyId, q.order_id, [q.item_id], { lock: true });
+    if (holds.length) await writeHoldTakes(db, c.companyId, rows.flatMap((r) => takeHolds(holds, q.item_id, r.batchId, r.quantity)));
+  }
   return result;
 }
 
@@ -2264,6 +2270,9 @@ export async function reserveRelease(db, c, releaseId, opts = {}) {
       const { bal, res } = await availabilityRows(db, c.companyId, itemIds, { orderId: rel.order_id });
       const stock = freeStock(bal, res);
       const writes = [];
+      // The order's holds (§43) count as free for it; each claim on that stock is taken off a hold.
+      const holds = await ownHoldRows(db, c.companyId, rel.order_id, itemIds, { lock: true });
+      const holdTakes = [];
       for (const q of reqs) {
         const w = wanted(q, sum(heldOf.get(q.id) ?? []));
         let out = w.done;
@@ -2272,6 +2281,7 @@ export async function reserveRelease(db, c, releaseId, opts = {}) {
           for (const r of took.rows) {
             stock.claim(q.item_id, r.batchId, r.quantity);
             writes.push(reservationRow(c, q, r));
+            if (holds.length) holdTakes.push(...takeHolds(holds, q.item_id, r.batchId, r.quantity));
           }
           out = took.result;
         }
@@ -2279,6 +2289,7 @@ export async function reserveRelease(db, c, releaseId, opts = {}) {
         if (out.short > EPS) short.set(q.item_id, { code: q.item_code, uom: q.uom, short: round6((short.get(q.item_id)?.short ?? 0) + out.short) });
       }
       await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, writes, 2000);
+      await writeHoldTakes(db, c.companyId, holdTakes);
     }
     if (missingAt >= 0) throw notFound('Requirement');
   }

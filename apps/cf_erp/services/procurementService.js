@@ -38,6 +38,7 @@ import { buyList, buyEstimates, insertOrder, requireSupplier } from './purchaseS
 import { CURRENCY, readPrice, round2, round4, num, lastPricesPaid } from './priceService.js';
 import { companyTax } from './taxService.js';
 import { todayText } from './invoiceService.js';
+import { insertAllocations } from './purchaseLinkService.js';
 
 export const PR_STATUSES = ['draft', 'submitted', 'approved', 'rejected', 'closed', 'cancelled'];
 export const PR_LINE_STATUSES = ['open', 'in_rfq', 'ordered', 'cancelled'];
@@ -393,9 +394,10 @@ export async function requestFromBuyList(db, c, input = {}) {
   const byItem = new Map();
   for (const r of rows) {
     const e = byItem.get(r.item.id) ?? {
-      item: r.item, toRequest: 0, estUnitPrice: r.estUnitPrice, orders: new Map(), lines: [], planned: false,
+      item: r.item, toRequest: 0, estUnitPrice: r.estUnitPrice, orders: new Map(), lines: [], planned: false, split: [],
     };
     e.toRequest = round6(e.toRequest + (r.toRequest ?? r.toBuy));
+    e.split.push(...(r.split ?? []));
     for (const o of r.orders ?? []) e.orders.set(o.id, o);
     if (r.source) e.lines.push({ orderId: r.source.orderId, orderCode: r.source.orderCode, lineId: r.source.lineId, lineNo: r.source.lineNo });
     if (r.planned) e.planned = true;
@@ -427,7 +429,7 @@ export async function requestFromBuyList(db, c, input = {}) {
       neededBy: null,
       estUnitPrice: e.estUnitPrice ?? null,
       notes: null,
-      source: { from: 'buy_list', planned: e.planned, orders: [...e.orders.values()], lines: e.lines },
+      source: { from: 'buy_list', planned: e.planned, orders: [...e.orders.values()], lines: e.lines, split: splitTo(e.split, qty) },
     });
   }
   assertNoProblems(problems);
@@ -437,6 +439,29 @@ export async function requestFromBuyList(db, c, input = {}) {
   const id = await insertRequest(db, c, { neededBy, notes: text(input.notes, 5000) ?? 'Raised from the buy list.' });
   await insertRequestLines(db, c.companyId, id, 1, take);
   return { ...(await getRequest(db, c, id)), skipped };
+}
+
+/**
+ * The buy list's per-order split, cut down to `qty` (first orders first): how
+ * much of a request line is for which sales order. create-pos turns it into the
+ * PO line's allocations (init.sql §43).
+ */
+export function splitTo(split, qty) {
+  const merged = new Map();
+  for (const x of split ?? []) {
+    const e = merged.get(x.orderId) ?? { orderId: x.orderId, orderCode: x.orderCode, quantity: 0 };
+    e.quantity = round6(e.quantity + Number(x.toBuy ?? x.quantity ?? 0));
+    merged.set(x.orderId, e);
+  }
+  const out = [];
+  let left = round6(qty);
+  for (const e of merged.values()) {
+    if (left <= EPS) break;
+    const t = round6(Math.min(left, e.quantity));
+    if (t > EPS) out.push({ ...e, quantity: t });
+    left = round6(left - t);
+  }
+  return out;
 }
 
 function assertEditable(r) {
@@ -1393,7 +1418,7 @@ export async function createPosFromRfq(db, c, id) {
   const q = await requireRfq(db, c.companyId, id, { lock: true });
   assertRfqOpen(q, 'be ordered');
   const [awarded] = await db.query(
-    `SELECT rl.id, rl.item_id, rl.quantity, rl.uom, rl.request_line_id, pl.request_id,
+    `SELECT rl.id, rl.item_id, rl.quantity, rl.uom, rl.request_line_id, pl.request_id, pl.source AS request_source,
             ql.id AS quote_line_id, ql.unit_price, ql.lead_time_days, ql.qty_offered,
             qt.supplier_id, qt.quote_ref, qt.payment_terms, qt.freight_amount, p.name AS supplier_name, p.code AS supplier_code
        FROM cf_rfq_lines rl
@@ -1428,7 +1453,12 @@ export async function createPosFromRfq(db, c, id) {
     const byItem = new Map();
     for (const l of g.lines) {
       const qty = round6(l.qty_offered != null ? Math.min(Number(l.qty_offered), Number(l.quantity)) : Number(l.quantity));
-      const e = byItem.get(l.item_id) ?? { itemId: l.item_id, uom: l.uom, qty: 0, money: 0, lead: 0, quoteLineId: l.quote_line_id, requestLineId: l.request_line_id, rfqLineIds: [] };
+      const e = byItem.get(l.item_id) ?? { itemId: l.item_id, uom: l.uom, qty: 0, money: 0, lead: 0, quoteLineId: l.quote_line_id, requestLineId: l.request_line_id, rfqLineIds: [], forOrders: [] };
+      // The sales orders the request line was raised for, cut down to what this supplier sends.
+      const src = parseJson(l.request_source);
+      // A request raised before §43 has no split: one order named = all of it for that order.
+      const legacy = src?.orders?.length === 1 ? [{ orderId: Number(src.orders[0].id), orderCode: src.orders[0].code, quantity: qty }] : [];
+      e.forOrders.push(...splitTo(src?.split ?? legacy, qty));
       e.qty = round6(e.qty + qty);
       e.money += qty * Number(l.unit_price);
       e.lead = Math.max(e.lead, Number(l.lead_time_days ?? 0));
@@ -1460,6 +1490,9 @@ export async function createPosFromRfq(db, c, id) {
     `UPDATE cf_rfq_lines SET purchase_line_id = CASE id ${links.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
     [...links.flat(), c.companyId, links.map((x) => x[0])],
   );
+  await insertAllocations(db, c, pos.flatMap((p) => p.items.flatMap((e) => e.forOrders.map((o) => ({
+    lineId: lineOf.get(`${p.poId}:${e.itemId}`).id, orderId: o.orderId, quantity: o.quantity,
+  })))));
   const requestLineIds = awarded.map((a) => a.request_line_id).filter(Boolean);
   if (requestLineIds.length) {
     await db.query("UPDATE cf_purchase_request_lines SET status = 'ordered' WHERE company_id = ? AND id IN (?)", [c.companyId, requestLineIds]);
