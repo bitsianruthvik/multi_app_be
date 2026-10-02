@@ -220,7 +220,7 @@ function readChanges(raw, problems) {
       c.parentId = needId('parentId');
       c.afterLineId = blank(ch.afterLineId) ? null : needId('afterLineId');
       c.quantity = blank(ch.quantity) ? null : ch.quantity;
-      // What the screen showed the copy as (a description edited but not yet saved on its source); absent = "<source's> (copy)".
+      // What the screen showed the copy as (a description edited but not yet saved on its source); absent = the source's own.
       if (ch.role !== undefined) c.role = ch.role == null ? null : String(ch.role).trim().slice(0, 100) || null;
       if (!c.sourceLineId || !c.parentId || (!blank(ch.afterLineId) && !c.afterLineId)) return;
     } else {
@@ -772,11 +772,10 @@ function readRoleText(value, problems) {
   return t;
 }
 
-/** A copy's description says it is one: "Girder G1" becomes "Girder G1 (copy)". Nothing to say when there is none. */
+/** A copy keeps its source's description exactly (user, 2026-10-02: no "(copy)" suffix). Nothing to say when there is none. */
 function copyRole(role) {
   if (role == null || String(role).trim() === '') return null;
-  const t = String(role).trim();
-  return t.endsWith('(copy)') ? t : `${t} (copy)`.slice(0, 100);
+  return String(role).trim().slice(0, 100);
 }
 
 async function pasteReference(db, c, ch, afterLineId) {

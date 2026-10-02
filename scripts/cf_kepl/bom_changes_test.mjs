@@ -740,7 +740,7 @@ try {
   const d1b = await run([{ op: 'role', lineId: dLine, role: 'Left end' }]);
   eq('the same description again changes nothing', [d1b.summary.counts.role, d1b.summary.counts.unchanged], [0, 1]);
   const dCopy = await run([{ op: 'paste', sourceLineId: dLine, parentId: seg1().id, quantity: 1 }]);
-  eq('a copy of a described row says it is a copy', (await lineRow(conn, dCopy.results[0].lineId)).role, 'Left end (copy)');
+  eq('a copy keeps its source description', (await lineRow(conn, dCopy.results[0].lineId)).role, 'Left end');
   const dBad = await refusal(() => run([{ op: 'role', lineId: dLine, role: 'x'.repeat(101) }]));
   eq('a description over 100 characters is refused', dBad?.status, 422);
   const dClear = await run([{ op: 'role', lineId: dLine, role: null }]);
