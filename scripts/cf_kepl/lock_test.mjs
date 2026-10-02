@@ -361,9 +361,9 @@ try {
   says(lockStage0?.detail);
   // The process was stored as lines, structure, values, cut_pieces, LOCK, NESTING, BUYING, PRODUCTION, confirm; it is read in the order the
   // dependencies demand (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): freeze, then nesting, then buying, then production — and
-  // confirm is the order's status now, not a stage, so it is dropped.
-  same('the stages come back in the catalogue order, whatever order they were stored in, without confirm', procBefore.stages.map((st) => st.stageKey),
-    ['lines', 'structure', 'values', 'cut_pieces', 'lock', 'nesting', 'buying', 'production']);
+  // confirm (the order's status) and cut_pieces (made automatically, 2026-10-02) are not stages, so both are dropped.
+  same('the stages come back in the catalogue order, whatever order they were stored in, without confirm or cut_pieces', procBefore.stages.map((st) => st.stageKey),
+    ['lines', 'structure', 'values', 'lock', 'nesting', 'buying', 'production']);
   const nestStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'nesting');
   same('Nesting applies to a line with cut plates even with no NESTING specification, and is not done until a plan is saved', [nestStage0?.applies, nestStage0?.state], [true, 'todo']);
   says(nestStage0?.detail);
@@ -545,7 +545,7 @@ try {
   const unlockedCheck = await REL.releaseCheck(conn, COMPANY, lineD.id);
   same('a line not locked: the release check says one thing, lock first', unlockedCheck.problems, [REL.lockFirst({ line_no: lineD.lineNo, order_code: D.code })]);
   const unlockedErr = await refusal(() => REL.releaseLine(conn, c, lineD.id, { finishedAreaId: f.area.id }));
-  ok('and release refuses it', unlockedErr?.code === 'NOT_READY' && (unlockedErr.problems ?? []).some((p) => p.includes('Freeze the design first — it comes after the values and cut pieces')), (unlockedErr?.problems ?? []).join(' | '));
+  ok('and release refuses it', unlockedErr?.code === 'NOT_READY' && (unlockedErr.problems ?? []).some((p) => p.includes('Freeze the design first — it comes right after the structure and its values')), (unlockedErr?.problems ?? []).join(' | '));
 
   await SO.setOrderStatus(conn, c, A.order.id, 'confirmed');
   // A coding rule changed AFTER the lock: it would give every part a new code.

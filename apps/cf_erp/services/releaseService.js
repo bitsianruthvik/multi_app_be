@@ -50,7 +50,7 @@ const USABLE = "('storage','wip')";
 const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : d ?? null);
 
 /** Release's words for a line built from a template that has not been locked. */
-export const lockFirst = (line) => `Line ${line.line_no} of ${line.order_code} is not frozen. Freeze the design first — it comes after the values and cut pieces.`;
+export const lockFirst = (line) => `Line ${line.line_no} of ${line.order_code} is not frozen. Freeze the design first — it comes right after the structure and its values.`;
 
 async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(

@@ -39,7 +39,7 @@ import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
-import { refreshCutPieces } from './cutPlateService.js';
+import { refreshCutPieces, previewCutPieces } from './cutPlateService.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import {
   rollOutPlan, codeNodes, seedPieceMemo, siblingLines, positionAmong, lockedPiecesOf, nameOf,
@@ -161,8 +161,13 @@ export async function cutPieceGaps(db, companyId, itemIds) {
  *
  * `problems` is every failing check's sentences, flattened — exactly what
  * lockLine refuses with.
+ *
+ * opts.refreshed — lockLine only: what refreshCutPieces said just before. A
+ * plate part still without a cut piece after it is a real problem (with that
+ * run's reason); without it (a look) such a part is made by the freeze, so it
+ * only fails when previewCutPieces says it cannot be made.
  */
-async function lockChecks(db, companyId, line) {
+async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
   const checks = [];
   const add = (c) => { checks.push({ applies: true, problems: [], ...c }); };
   const out = { checks, problems: [], plan: null, coded: null, memo: null, position: null, siblings: [] };
@@ -229,17 +234,50 @@ async function lockChecks(db, companyId, line) {
     problems: structural,
   });
 
-  // 5. The cut pieces, as asked above.
-  add({
-    key: 'cut_pieces', ok: bare.length === 0, applies: cut.applies && cut.parts.length > 0, title: 'Every plate part has its cut piece', stageKey: 'cut_pieces',
-    detail: !cut.applies || !cut.parts.length
-      ? 'No part of this line is cut from plate.'
-      : bare.length === 0
-        ? `All ${plural(cut.parts.length, 'plate part')} are pooled into cut pieces.`
-        : `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${examples([...new Set(bare.map(nameOf))])}.`,
-    todo: bare.length ? 'Cut pieces are made automatically as soon as the values are complete. If they have not appeared, open the Cut pieces stage.' : null,
-    problems: bare.length ? [`${plural(bare.length, 'plate part')} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${examples([...new Set(bare.map(nameOf))])}.`] : [],
-  });
+  // 5. The cut pieces, as asked above. NOT A STAGE ANY MORE (user, 2026-10-02):
+  //    they are made by the system, and by lockLine itself just before these
+  //    checks, so a plate part without one only holds the freeze while the
+  //    values are missing, or when it cannot be made — and then it says why,
+  //    pointing at the Structure tab (where the values are drawn too).
+  const cutApplies = cut.applies && cut.parts.length > 0;
+  const bareNames = examples([...new Set(bare.map(nameOf))]);
+  let cutCheck;
+  if (!cutApplies || bare.length === 0) {
+    cutCheck = {
+      ok: true,
+      detail: !cutApplies ? 'No part of this line is cut from plate.' : `All ${plural(cut.parts.length, 'plate part')} are pooled into cut pieces.`,
+      todo: null,
+      problems: [],
+    };
+  } else if (missingOwn > 0) {
+    cutCheck = {
+      ok: false,
+      detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}.`,
+      todo: 'Cut pieces are made automatically as soon as the values are complete — fill them on the Structure stage.',
+      problems: [`${plural(bare.length, 'plate part')} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}. They are made as soon as the values are filled.`],
+    };
+  } else {
+    // Values complete: the freeze makes them. A look asks whether it could; the real run says what happened.
+    const why = refreshed
+      ? (refreshed.made ? null : refreshed.message ?? null)
+      : await previewCutPieces(db, companyId, line.id).then((r) => (r.ok ? '' : r.message));
+    if (why === '') {
+      cutCheck = {
+        ok: true,
+        detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'gets its' : 'get their'} cut piece when the design is frozen — made automatically, nothing to do.`,
+        todo: null,
+        problems: [],
+      };
+    } else {
+      cutCheck = {
+        ok: false,
+        detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'has' : 'have'} no cut piece, and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`,
+        todo: "Cut pieces are made automatically from each part's thickness, size and grade — fix what is said on the Structure stage, then freeze again.",
+        problems: [`${plural(bare.length, 'plate part')} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`],
+      };
+    }
+  }
+  add({ key: 'cut_pieces', applies: cutApplies, title: 'Every plate part has its cut piece', stageKey: 'structure', ...cutCheck });
 
   // 6. Codes: what lock would write, with the position it would give — every
   //    running number handed out in turn, none drawn.
@@ -435,8 +473,8 @@ export async function lockLine(db, c, lineId) {
   // structure — derived when the line has plate parts and its values are
   // complete, a no-op otherwise, and never a refusal of its own: the checks
   // below say what is missing. (lockPlan must not call it — a look writes nothing.)
-  await refreshCutPieces(db, c, line.id);
-  const run = await lockChecks(db, companyId, line);
+  const refreshed = await refreshCutPieces(db, c, line.id);
+  const run = await lockChecks(db, companyId, line, { refreshed });
   if (run.problems.length) {
     throw invalid('NOT_READY', `Line ${line.line_no} of ${line.order_code} cannot be locked yet.`, { problems: run.problems, detail: { checks: run.checks } });
   }

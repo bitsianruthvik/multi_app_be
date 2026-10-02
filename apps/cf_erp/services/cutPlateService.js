@@ -1645,6 +1645,45 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
 }
 
 /**
+ * Whether refreshCutPieces COULD make a line's cut pieces now — the same
+ * survey and plan, nothing written. For the Freeze design screen's look
+ * (lockService.lockPlan): cut pieces are no longer a stage of their own
+ * (user, 2026-10-02) — a plate part still without one is made by the freeze
+ * itself — so the look only stops the freeze when the plan cannot be made, and
+ * says why. A refusal while WRITING (a coding rule clash) cannot be foreseen
+ * here; lockLine reports that one from the real run. About as many round trips
+ * as refreshCutPieces' up-to-date path.
+ *
+ * Returns { ok, reason, message }; reason is one of refreshCutPieces' reasons,
+ * or 'would_make' when ok.
+ */
+export async function previewCutPieces(db, companyId, lineId) {
+  const line = await requireLine(db, companyId, lineId);
+  const no = (reason, message) => ({ ok: false, reason, message });
+  const frozen = lockOf(line);
+  if (frozen) return no(frozen.reason, frozen.message);
+  if (line.line_type !== 'custom' || !line.item_id) {
+    return no('no_structure', `Line ${line.line_no} of ${line.order_code} sells a catalog item, so it has no parts to cut.`);
+  }
+  const places = await loadPlaces(db, companyId);
+  if (!places.parts || !places.cutPlate) {
+    return no('not_set_up', !places.parts
+      ? 'Nothing in the classification tree says where parts are filed, so there is nothing to pool.'
+      : `There is no ${CUT_PLATE_CODE} variant, so a cut piece has nowhere to be filed.`);
+  }
+  try {
+    const state = await survey(db, companyId, line, places);
+    if (!state.parts.length) return no('no_plate_parts', `Line ${line.line_no} has no plate parts, so there is nothing to cut.`);
+    const selection = await plateSelection(db, companyId, places.plate);
+    await planFor(db, companyId, { line, state, selection });
+  } catch (err) {
+    if (!isRefusal(err)) throw err;
+    return no('cannot_derive', err.message);
+  }
+  return { ok: true, reason: 'would_make', message: `The cut pieces of line ${line.line_no} are made when its design is frozen.` };
+}
+
+/**
  * What was chosen for each rectangle of a line, keyed as the derive groups
  * parts: { plateId, flowId } — the catalog plate its cut plate's plate line
  * holds (chosen by a person, or by nesting; null while it still holds the

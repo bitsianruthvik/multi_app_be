@@ -113,7 +113,21 @@ const readSettings = (v) => {
  * (nothing is deleted); it is simply not shown, and a stage waiting on the
  * customer's yes says so with action 'confirm' instead of a stage key.
  */
-export const RETIRED_STAGE_KEYS = new Set(['confirm']);
+/*
+ * CUT PIECES ARE NOT A STAGE ANY MORE EITHER (user, 2026-10-02: "why do we need
+ * freeze design after cut pieces? … right after structure is locked, we should
+ * auto generate cut pieces — no need to show that separately"). They were
+ * always made by the system (cutPlateService.refreshCutPieces after every
+ * structure / value save, and again inside lockLine before the checks), so a
+ * stage of their own only ever showed a person something they could not do.
+ * A plate part still without a cut piece is now said by Freeze design (while
+ * the values are missing, or when freezing could not make it) and the list
+ * itself opens from a button on Nesting. A stored 'cut_pieces' row is kept and
+ * hidden, exactly like 'confirm'.
+ */
+export const RETIRED_STAGE_KEYS = new Set(['confirm', 'cut_pieces']);
+/** The same keys as an SQL list literal, for the counts and the replace below. Constants, never input. */
+const RETIRED_SQL = [...RETIRED_STAGE_KEYS].map((k) => `'${k}'`).join(', ');
 const confirmFirst = (message) => ({ stageKey: null, action: 'confirm', message });
 const orderStatusOf = (order) => (order.status === 'revised' ? order.status_before_revised ?? order.status : order.status);
 
@@ -235,58 +249,6 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
-    key: 'cut_pieces',
-    label: 'Cut pieces',
-    description: 'The rectangles the plate parts are cut as — made automatically as soon as the values are complete.',
-    /*
-     * WHY THIS IS ITS OWN STAGE AND NOT PART OF NESTING.
-     *
-     * Deriving blanks WRITES: it mints a temporary item per rectangle and puts
-     * an area-fraction quantity on each one. The nesting screen's contract is
-     * that opening it changes nothing — a look is a look — so the write cannot
-     * live behind it.
-     *
-     * Parts pool by (thickness, length, width, grade), so the rectangles follow
-     * the values: they are made as soon as the line's required values are
-     * complete, and again when those change, until the line is locked. So the
-     * stage waits on the values, and says so.
-     *
-     * It applies where the line has plate parts (what cutPlateService pools),
-     * or where a material says it is cut to size.
-     */
-    applies: (ctx) => ctx.cut.parts.length > 0 || ctx.nesting.items.length > 0,
-    state(ctx) {
-      const made = ctx.nesting.cutPieces ?? 0;
-      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
-      if (made > 0 && !bare.length) {
-        return { state: 'done', detail: `${n(made, 'cut piece')} pooled from the line's plate parts`, blockers: [] };
-      }
-      const missing = ctx.values.missing.length;
-      if (missing) {
-        return {
-          waitingOn: { stageKey: 'values', message: `Fill the values first — ${n(missing, 'required value')} still empty.` },
-          state: 'todo',
-          detail: `Waiting for the values — ${n(missing, 'required value')} still empty. Cut pieces are made automatically as soon as they are complete`,
-          blockers: [{
-            count: missing,
-            message: `Line ${ctx.line.line_no}'s cut pieces wait for its values: ${n(missing, 'required value')} ${missing === 1 ? 'is' : 'are'} still empty. They are made automatically as soon as the values are complete.`,
-          }],
-        };
-      }
-      const which = bare.length ? bare : ctx.cut.parts;
-      return {
-        state: made > 0 ? 'partial' : 'todo',
-        detail: which.length
-          ? `${n(which.length, 'plate part')} without a cut piece — ${nameList([...new Set(which.map(nameOf))])}`
-          : `${n(ctx.nesting.items.length, 'material')} to cut — no cut pieces yet`,
-        blockers: [{
-          count: which.length || ctx.nesting.items.length,
-          message: `Line ${ctx.line.line_no} has parts cut from plate with no cut piece yet. Cut pieces are made automatically once the values are complete — if they have not appeared, open this stage to see why.`,
-        }],
-      };
-    },
-  },
-  {
     key: 'lock',
     label: 'Freeze design',
     description: 'Gives out the piece codes: the structure is rolled out into pieces, each with its own code. From then on only the flows change (until release) — any other change means a new revision. It does not need the plates: nesting chooses them afterwards.',
@@ -298,20 +260,23 @@ export const STAGE_CATALOGUE = [
       const blockers = [];
       let waitingOn = null;
       const missing = ctx.values.missing;
+      /*
+       * CUT PIECES NEVER HOLD THE FREEZE ON THEIR OWN (user, 2026-10-02). They
+       * are made by the system from the parts and values — after every save,
+       * and once more by lockLine itself before its checks. So a plate part
+       * with no cut piece yet is either waiting for the values (said in the
+       * values blocker, which is the thing to do) or simply made when the
+       * design is frozen. If freezing cannot make one, lockLine refuses with
+       * the reason (lockService's cut-piece check), on the Freeze screen.
+       */
+      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
       if (missing.length) {
         waitingOn = { stageKey: 'values', message: `Fill the values first — ${n(missing.length, 'required value')} still empty.` };
         const named = missing.slice(0, 2).map((m) => `${m.itemLabel} · ${m.specCode}`);
+        const cutToo = bare.length ? ` The cut pieces of ${n(bare.length, 'plate part')} are made as soon as they are filled.` : '';
         blockers.push({
           count: missing.length,
-          message: `Line ${L}'s design cannot be frozen while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.`,
-        });
-      }
-      const bare = ctx.cut.parts.filter((p) => !p.hasCutPiece);
-      if (bare.length) {
-        waitingOn ??= { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' };
-        blockers.push({
-          count: bare.length,
-          message: `Line ${L} has ${n(bare.length, 'plate part')} with no cut piece yet — ${nameList([...new Set(bare.map(nameOf))], 3)}.`,
+          message: `Line ${L}'s design cannot be frozen while ${n(missing.length, 'required value')} ${missing.length === 1 ? 'is' : 'are'} empty — ${named.join(', ')}${missing.length > 2 ? ` and ${missing.length - 2} more` : ''}.${cutToo}`,
         });
       }
       // A cut plate's raw plate still to be chosen does NOT hold the freeze
@@ -329,7 +294,9 @@ export const STAGE_CATALOGUE = [
         state: blockers.length ? 'todo' : 'partial',
         detail: blockers.length
           ? `Not frozen — ${n(blockers.length, 'thing')} to settle first`
-          : 'Ready to freeze — each piece gets its code when the design is frozen',
+          : bare.length
+            ? `Ready to freeze — the cut pieces of ${n(bare.length, 'plate part')} are made first, then each piece gets its code`
+            : 'Ready to freeze — each piece gets its code when the design is frozen',
         blockers,
         waitingOn,
       };
@@ -417,7 +384,8 @@ export const STAGE_CATALOGUE = [
         const waitingOn = pieces === 0
           ? (missing
             ? { stageKey: 'values', message: `Fill the values first — ${n(missing, 'required value')} still empty.` }
-            : { stageKey: 'cut_pieces', message: 'Make the cut pieces first.' })
+            // Frozen with plate parts and no cut piece: they come from the structure's parts.
+            : { stageKey: 'structure', message: "No cut pieces were made from this line's plate parts — check their thickness, size and grade in the structure." })
           : null;
         return {
           state: 'todo',
@@ -616,7 +584,7 @@ export async function listProcesses(db, companyId) {
     `SELECT p.*,
             (SELECT COUNT(*) FROM cf_process_stages s
               WHERE s.company_id = p.company_id AND s.process_id = p.id AND s.deleted_at IS NULL
-                AND s.stage_key NOT IN ('confirm')) AS stage_count
+                AND s.stage_key NOT IN (${RETIRED_SQL})) AS stage_count
        FROM cf_processes p
       WHERE p.company_id = ? AND p.deleted_at IS NULL
       ORDER BY p.status = 'obsolete', p.code`,
@@ -731,7 +699,7 @@ export async function setProcessStatus(db, c, id, status) {
     // An empty process would stamp itself on orders and then say nothing about
     // them, which looks exactly like a broken screen.
     const [[{ n: stages }]] = await db.query(
-      "SELECT COUNT(*) AS n FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN ('confirm')",
+      `SELECT COUNT(*) AS n FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN (${RETIRED_SQL})`,
       [c.companyId, id],
     );
     if (!Number(stages)) throw invalid('NO_STAGES', `${p.code} has no stages — add some before activating it.`);
@@ -789,7 +757,7 @@ export async function replaceStages(db, c, processId, input = {}) {
   const p = await requireProcess(db, c.companyId, processId, { lock: true });
   const given = Array.isArray(input.stages) ? input.stages : null;
   if (!given) throw invalid('INVALID', 'Send the stages as a list, in the order they are worked.');
-  // 'confirm' is no longer a stage (RETIRED_STAGE_KEYS): an older screen or
+  // 'confirm' and 'cut_pieces' are no longer stages (RETIRED_STAGE_KEYS): an older screen or
   // script that still sends it is not refused — the entry is simply dropped.
   const list = given.filter((s) => !RETIRED_STAGE_KEYS.has(String(s?.stageKey ?? s?.stage_key ?? '').trim()));
 
@@ -866,15 +834,15 @@ export async function replaceStages(db, c, processId, input = {}) {
   }
   assertNoProblems(problems, `The stages of ${p.code} need attention.`);
 
-  // A stored 'confirm' row is KEPT (nothing about it is deleted): it only moves
+  // A stored retired row ('confirm', 'cut_pieces') is KEPT (nothing about it is deleted): it only moves
   // out of the way of the new sequence numbers, which it could otherwise clash
   // with on uq_cps_seq.
   await db.query(
-    "UPDATE cf_process_stages SET deleted_at = NOW() WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN ('confirm')",
+    `UPDATE cf_process_stages SET deleted_at = NOW() WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key NOT IN (${RETIRED_SQL})`,
     [c.companyId, processId],
   );
   await db.query(
-    "UPDATE cf_process_stages SET sequence = 100000 + id WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key IN ('confirm') AND sequence < 100000",
+    `UPDATE cf_process_stages SET sequence = 100000 + id WHERE company_id = ? AND process_id = ? AND deleted_at IS NULL AND stage_key IN (${RETIRED_SQL}) AND sequence < 100000`,
     [c.companyId, processId],
   );
   for (const r of rows) {
@@ -1365,9 +1333,9 @@ async function loadOrderContext(db, companyId, order, lines) {
     releasesStage,
     lotsStage,
     specStage,
-    // 5c. How many cut pieces a line already has. The Cut pieces stage is done
-    // when the rectangles exist; nesting is done when they are laid out. Two
-    // questions, two counts.
+    // 5c. How many cut pieces a line already has (no stage of their own since
+    // 2026-10-02 — Nesting counts them, and Freeze design says when one is
+    // missing); nesting is done when they are laid out. Two questions, two counts.
     lines.length ? db.query(
       `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
          FROM cf_master_records m
@@ -1643,7 +1611,6 @@ function notApplicableDetail(key, ctx) {
     case 'structure': return 'Sells a catalog item with no BOM — there is nothing under it';
     case 'values': return 'Nothing under this line has a required value to capture';
     case 'lock': return 'Sells a catalog item as it is — only a line built from a template has a structure to lock';
-    case 'cut_pieces': return 'No part of this line is cut from plate';
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.

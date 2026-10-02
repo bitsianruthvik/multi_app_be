@@ -7,9 +7,11 @@
  *
  *   CF_FLOW_COMPANY (2), CF_FLOW_LINE (923 — the local KEPL copy: locked, nested)
  *
- * The flow: lines → structure → values → cut pieces → FREEZE DESIGN (key lock)
- * → nesting → buying → production. Confirm is the order's sales status, not a
- * stage, and buying needs it.
+ * The flow: lines → structure (values drawn inside it) → FREEZE DESIGN (key
+ * lock) → nesting → buying → production. Confirm is the order's sales status,
+ * not a stage, and buying needs it. Cut pieces are not a stage either since
+ * 2026-10-02: they are made automatically (and by the freeze itself), a stored
+ * cut_pieces row is kept and hidden, and the list opens from Nesting.
  *
  * EVERYTHING HAPPENS INSIDE ONE TRANSACTION THAT IS ROLLED BACK; the last thing
  * it does is re-count every cf_ table. Like release_nest_material_test it
@@ -17,11 +19,13 @@
  * 6,072-piece roll-out): inside the transaction it is un-frozen, re-cut,
  * re-frozen, confirmed, copied and released — never left so.
  *
- *   1. the stage train: the new order, confirm gone (a stored confirm row kept)
+ *   1. the stage train: the new order, confirm and cut_pieces gone (stored rows
+ *      kept, hidden, dropped from a re-save); no waitingOn points at cut_pieces
  *   2. confirm is allowed before the freeze; buying and production wait on it
  *      with action 'confirm'
  *   3. nesting is refused before the freeze, allowed after
- *   4. a NEW blank has no plate ("chosen at nesting"); the freeze works without
+ *   4. a plate part with no cut piece does not hold the freeze (lockLine makes
+ *      it); a NEW blank has no plate ("chosen at nesting"); the freeze works without
  *      it; release, buying and production then wait on the nest; a plate chosen
  *      by hand before the freeze does as well as a nest
  *   5. the buy list: a confirmed, frozen, nested, unreleased line is PLANNED
@@ -51,7 +55,7 @@ const COMPANY = Number(process.env.CF_FLOW_COMPANY ?? 2);
 const LINE = Number(process.env.CF_FLOW_LINE ?? 923);
 const RUN = `OF${Date.now().toString(36).toUpperCase()}`;
 const EPS = 1e-6;
-const TRAIN = ['lines', 'structure', 'values', 'cut_pieces', 'lock', 'nesting', 'buying', 'production'];
+const TRAIN = ['lines', 'structure', 'values', 'lock', 'nesting', 'buying', 'production'];
 
 let passed = 0;
 let failed = 0;
@@ -117,7 +121,9 @@ try {
 
   /* ---- 1. the train ---------------------------------------------------------- */
   section('1. The stage train');
-  eq('the catalogue is lines, structure, values, cut pieces, freeze, nesting, buying, production', PROC.STAGE_KEYS, TRAIN);
+  eq('the catalogue is lines, structure, values, freeze, nesting, buying, production — no cut pieces', PROC.STAGE_KEYS, TRAIN);
+  ok('cut_pieces is not a stage a process can be built from', !PROC.stageCatalogue().some((s) => s.key === 'cut_pieces'));
+  ok('cut_pieces is retired like confirm', PROC.RETIRED_STAGE_KEYS.has('cut_pieces') && PROC.RETIRED_STAGE_KEYS.has('confirm'));
   eq('lock reads "Freeze design"', PROC.stageCatalogue().find((s) => s.key === 'lock')?.label, 'Freeze design');
   ok('confirm is not a stage a process can be built from', !PROC.stageCatalogue().some((s) => s.key === 'confirm'));
   if (line.process_id) {
@@ -132,6 +138,26 @@ try {
     ok('re-saving with confirm in the list is accepted, and confirm is dropped from it', !resaved.stages.some((s) => s.stageKey === 'confirm') && resaved.stages.length === proc.stages.length);
     eq('a stored confirm row is not deleted', Number(confirmAfter), Number(confirmRows));
     await conn.query('ROLLBACK TO SAVEPOINT resave');
+
+    // A stored cut_pieces row (processes made before 2026-10-02 have one): kept, hidden, dropped from a re-save.
+    await conn.query('SAVEPOINT cutrow');
+    const cutRowsOf = async () => Number((await conn.query("SELECT COUNT(*) AS n FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND stage_key = 'cut_pieces' AND deleted_at IS NULL", [COMPANY, line.process_id]))[0][0].n);
+    if (await cutRowsOf() === 0) {
+      await conn.query("INSERT INTO cf_process_stages (company_id, process_id, stage_key, sequence, requirement) VALUES (?, ?, 'cut_pieces', 99999, 'required')", [COMPANY, line.process_id]);
+    }
+    const cutRows = await cutRowsOf();
+    eq('the process has a stored cut_pieces row', cutRows, 1);
+    const withRow = await PROC.getProcess(conn, COMPANY, line.process_id);
+    ok('getProcess does not show it', !withRow.stages.some((s) => s.stageKey === 'cut_pieces'), withRow.stages.map((s) => s.stageKey).join(', '));
+    const listed = (await PROC.listProcesses(conn, COMPANY)).find((x) => x.id === line.process_id);
+    eq('the process list does not count it', listed?.stageCount, withRow.stages.length);
+    const procWithRow = await PROC.orderProcess(conn, COMPANY, line.order_id);
+    ok('the order shows no cut_pieces stage, on the order or on any line',
+      !procWithRow.stages.some((s) => s.stageKey === 'cut_pieces') && procWithRow.lines.every((l) => !l.stages.some((s) => s.stageKey === 'cut_pieces')));
+    const resaved2 = await PROC.replaceStages(conn, c, line.process_id, { stages: [...withRow.stages.map((s) => ({ stageKey: s.stageKey, requirement: s.requirement })), { stageKey: 'cut_pieces' }] });
+    ok('re-saving with cut_pieces in the list is accepted, and cut_pieces is dropped from it', !resaved2.stages.some((s) => s.stageKey === 'cut_pieces') && resaved2.stages.length === withRow.stages.length);
+    eq('the stored cut_pieces row is not deleted', await cutRowsOf(), cutRows);
+    await conn.query('ROLLBACK TO SAVEPOINT cutrow');
   }
 
   /* ---- 2. confirm before the freeze ------------------------------------------- */
@@ -150,6 +176,10 @@ try {
   eq('buying waits on the header Confirm: no stage key, action confirm', [buyWait0?.stageKey, buyWait0?.action], [null, 'confirm']);
   eq('…in words', buyWait0?.message, 'Confirm the order first — nothing is bought for an inquiry.');
   eq('production waits on the same Confirm', stageOf(proc, 'production')?.waitingOn?.action, 'confirm');
+  /** Every waitingOn on every line: none points at cut_pieces, and each key is a stage the order shows (or null for Confirm). */
+  const badWaits = (pv) => pv.lines.flatMap((l) => l.stages.filter((s) => s.waitingOn && (s.waitingOn.stageKey === 'cut_pieces'
+    || (s.waitingOn.stageKey != null && !l.stages.some((y) => y.stageKey === s.waitingOn.stageKey)))).map((s) => `line ${l.lineNo} ${s.stageKey} → ${s.waitingOn.stageKey}`));
+  eq('no stage waits on cut_pieces or on a stage the order does not show', badWaits(proc), []);
 
   await conn.query('SAVEPOINT unfrozen');
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, LINE]);
@@ -161,6 +191,7 @@ try {
   const lockStage = stageOf(proc, 'lock');
   ok('the freeze does not wait on nesting or say anything about plates', lockStage?.waitingOn?.stageKey !== 'nesting' && !(lockStage?.blockers ?? []).some((b) => /plate/i.test(b.message)),
     JSON.stringify(lockStage?.blockers));
+  eq('un-frozen: still no stage waits on cut_pieces', badWaits(proc), []);
 
   section('3. Nesting is refused before the freeze');
   const planErr = await refusal(() => NEST.planNesting(conn, COMPANY, LINE, { effort: 'quick' }));
@@ -203,11 +234,34 @@ try {
   );
   const oldBlank = cps[0]?.id;
   if (!oldBlank) throw new Error('Line has no cut plates.');
+  const cutPlatesNow = async () => Number((await conn.query(
+    `SELECT COUNT(*) AS n FROM cf_master_records cp JOIN cf_item_details i ON i.master_id = cp.id AND i.deleted_at IS NULL AND i.owner_order_line_id = ?
+       JOIN cf_classification_nodes n ON n.id = cp.classification_id AND n.code = 'CUT_PLATE' WHERE cp.company_id = ? AND cp.deleted_at IS NULL`, [LINE, COMPANY]))[0][0].n);
+  const allCutPlates = await cutPlatesNow();
   // The old blank goes altogether (its code with it), so the rectangle's next blank is a new one.
   await conn.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE company_id = ? AND child_id = ? AND deleted_at IS NULL', [COMPANY, oldBlank]);
   await conn.query('UPDATE cf_boms SET deleted_at = NOW() WHERE company_id = ? AND parent_id = ? AND deleted_at IS NULL', [COMPANY, oldBlank]);
   await conn.query('UPDATE cf_master_records SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, oldBlank]);
   invalidateNodeCache(conn);
+
+  // CUT PIECES DO NOT HOLD THE FREEZE (2026-10-02): a plate part with no cut piece and every value filled is made by the freeze.
+  eq('one plate part now has no cut piece', await cutPlatesNow(), allCutPlates - 1);
+  proc = await PROC.orderProcess(conn, COMPANY, line.order_id);
+  const bareLock = stageOf(proc, 'lock');
+  ok('a plate part without a cut piece: Freeze design is ready, not blocked', bareLock?.state === 'partial' && (bareLock?.blockers ?? []).length === 0 && bareLock?.waitingOn == null,
+    JSON.stringify([bareLock?.state, bareLock?.blockers, bareLock?.waitingOn]));
+  ok('…and says the cut pieces are made first', /cut pieces of \d+ plate parts? (is|are) made first/.test(bareLock?.detail ?? ''), bareLock?.detail);
+  eq('no stage waits on cut_pieces with a part bare', badWaits(proc), []);
+  const barePlan = await LOCK.lockPlan(conn, COMPANY, LINE);
+  const bareCheck = barePlan.checks.find((x) => x.key === 'cut_pieces');
+  ok('the freeze look passes the cut-piece check: made when the design is frozen', bareCheck?.ok === true && /when the design is frozen/.test(bareCheck?.detail ?? ''), JSON.stringify(bareCheck));
+  ok('…and no freeze check points at a cut_pieces stage', barePlan.checks.every((x) => x.stageKey !== 'cut_pieces'));
+  await conn.query('SAVEPOINT freezemakes');
+  const frozeBare = await LOCK.lockLine(conn, c, LINE);
+  ok('lockLine freezes it, making the missing cut piece itself', !!frozeBare.locked?.at && await cutPlatesNow() === allCutPlates, `${await cutPlatesNow()} cut plates, wanted ${allCutPlates}`);
+  await conn.query('ROLLBACK TO SAVEPOINT freezemakes');
+  invalidateNodeCache(conn);
+
   const made = await CUT.refreshCutPieces(conn, c, LINE);
   ok('the refresh made one new cut piece', made.made === true && made.summary?.created === 1, JSON.stringify(made));
   const view = await CUT.getCutPlates(conn, COMPANY, LINE);
