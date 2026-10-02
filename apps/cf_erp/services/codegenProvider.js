@@ -748,6 +748,36 @@ registerEntity('purchase_order', {
   },
 });
 
+// ---- Purchase requests and RFQs (init.sql §39) ------------------------------------
+// Plain running numbers: with no rule a request is PR-000123 and an RFQ is
+// RFQ-000123 (procurementService). A rule takes literals, dates and a sequence;
+// neither document has a value worth putting in its number yet (an RFQ goes to
+// several suppliers, so no supplier code).
+function plainDocumentEntity(entity, label, table) {
+  return {
+    label,
+    tokens: [],
+    tokenPatterns: [],
+    conditionTokens: [],
+    async validateToken(db, companyId, key) {
+      return `"${key}" is not a value ${label.toLowerCase()} can insert — use text, a date and a running number.`;
+    },
+    async validateCondition() {
+      return `${label} rules take no conditions.`;
+    },
+    async loadContext(db, companyId, entityId) {
+      const [[row]] = await db.query(`SELECT id FROM ${table} WHERE company_id = ? AND id = ? AND deleted_at IS NULL`, [companyId, entityId]);
+      if (!row) { const err = new Error(`${label.replace(/s$/, '')} not found.`); err.status = 404; throw err; }
+      return { get: () => null, test: () => ({ ok: false, weight: 0 }) };
+    },
+    async draftContext() {
+      return { get: () => null, test: () => ({ ok: false, weight: 0 }) };
+    },
+  };
+}
+registerEntity('purchase_request', plainDocumentEntity('purchase_request', 'Purchase requests', 'cf_purchase_requests'));
+registerEntity('rfq', plainDocumentEntity('rfq', 'Requests for quotation', 'cf_rfqs'));
+
 // ---- Contractor work orders (init.sql §30) ---------------------------------------
 // A contractor's share of an order line. With no rule the number is WO-000123
 // (workOrderService), like a purchase order's; a rule can lean on the

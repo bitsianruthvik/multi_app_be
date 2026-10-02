@@ -6,6 +6,7 @@ import codegenModule from './modules/codegen/index.js';
 import partiesModule, { registerReferenceCheck } from './modules/parties/index.js';
 import { partyReferences } from './services/salesOrderService.js';
 import { inventoryPartyReferences } from './services/stockService.js';
+import { procurementPartyReferences } from './services/procurementService.js';
 import { PERM } from './lib/http.js';
 // Side effect: registers items and definitions with the code generator.
 import './services/codegenProvider.js';
@@ -24,6 +25,7 @@ const modules = [partiesModule, codegenModule];
 // The parties module cannot import cf_erp, so cf_erp tells it what uses a party.
 registerReferenceCheck(partyReferences);
 registerReferenceCheck(inventoryPartyReferences);
+registerReferenceCheck(procurementPartyReferences);
 
 function mergeResourceDefs() {
   const merged = { ...coreResourceDefs };

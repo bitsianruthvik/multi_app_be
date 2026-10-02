@@ -19,6 +19,7 @@ export const PERM = {
   production: 'cf_erp_production_manage',   // machines, shifts, operations, timing rules, flows and their waits
   inventoryView: 'cf_erp_inventory_view',   // see stocking areas, stock, batches and movements
   inventory: 'cf_erp_inventory_manage',     // stocking areas, receipts, issues, transfers, counts, scrap, batches
+  purchaseApprove: 'cf_erp_purchase_approve', // approve / reject purchase requests (init.sql §39); raising and RFQs use inventory manage
   floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
 };
 

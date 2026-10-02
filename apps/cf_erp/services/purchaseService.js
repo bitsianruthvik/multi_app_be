@@ -54,6 +54,7 @@ import {
   CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
 } from './priceService.js';
 import { purchaseOrderTax } from './taxService.js';
+import { inProcurementByItem } from './procurementShared.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -183,7 +184,7 @@ export async function buyList(db, companyId, q = {}) {
   const itemIds = [...new Set([...rows.map((r) => r.item_id), ...planned.map((p) => p.item.id)])];
   const onOrder = await onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
   const free = await availability(db, companyId, itemIds);
-  const estimates = await buyEstimates(db, companyId, itemIds);
+  const [estimates, inProc] = await Promise.all([buyEstimates(db, companyId, itemIds), inProcurementByItem(db, companyId, itemIds)]);
   /*
    * Free stock and what is on order are per ITEM, and an item can now be on a
    * released row and on planned rows at once. Each is handed out once, in
@@ -243,6 +244,32 @@ export async function buyList(db, companyId, q = {}) {
     });
   }
   out = out.map((row) => withEstimate(row, estimates.get(row.item.id)));
+  /*
+   * IN REQUEST / IN RFQ (init.sql §39, CF_ERP_PROCUREMENT_PLAN): open purchase
+   * request lines not on a PO yet. They do NOT reduce toBuy — only a PO is
+   * "on order" (user decision) — but each row says how much of its toBuy is
+   * already being handled, handed out per item in the same order as free stock
+   * and on-order (RFQ first, the further along), so an item's total is never
+   * counted twice. toRequest = toBuy - inRfq - inRequest is what is still to raise.
+   */
+  const procLeft = new Map();
+  out = out.map((row) => {
+    const p = inProc.get(row.item.id);
+    if (!procLeft.has(row.item.id)) procLeft.set(row.item.id, { rfq: p?.inRfq ?? 0, req: p?.inRequest ?? 0 });
+    const l = procLeft.get(row.item.id);
+    const inRfq = round6(Math.min(l.rfq, row.toBuy));
+    const inRequest = round6(Math.min(l.req, Math.max(0, row.toBuy - inRfq)));
+    l.rfq = round6(l.rfq - inRfq);
+    l.req = round6(l.req - inRequest);
+    return {
+      ...row,
+      inRequest,
+      inRfq,
+      toRequest: round6(Math.max(0, row.toBuy - inRfq - inRequest)),
+      purchaseRequests: p?.requests ?? [],
+      rfqs: p?.rfqs ?? [],
+    };
+  });
   if (String(q.show ?? 'short') !== 'all') out = out.filter((r) => r.toBuy > EPS);
   // Released / planned only — a filter over the rows above, after the stock was
   // handed out, so a row's numbers do not change with the filter.
@@ -261,7 +288,7 @@ export async function buyList(db, companyId, q = {}) {
  * price turned into a price per unit (a per-kg list price × the item's WEIGHT).
  * Three reads for any number of items, whatever the list's length.
  */
-async function buyEstimates(db, companyId, itemIds) {
+export async function buyEstimates(db, companyId, itemIds) {
   if (!itemIds.length) return new Map();
   const [paid, list, measures] = await Promise.all([
     lastPricesPaid(db, companyId, itemIds),
@@ -487,7 +514,7 @@ async function nextCode(db, c, { suggested = false } = {}) {
  * buyer should not have to set up a rule before the first order can be raised
  * (stock movements do the same).
  */
-async function insertOrder(db, c, { code, supplierId, expectedDate, notes, suggested }) {
+export async function insertOrder(db, c, { code, supplierId, expectedDate, notes, suggested }) {
   const [r] = await db.query(
     `INSERT INTO cf_purchase_orders (company_id, code, supplier_id, status, suggested, expected_date, notes, created_by)
      VALUES (?, ?, ?, 'draft', ?, ?, ?, ?)`,
@@ -497,7 +524,7 @@ async function insertOrder(db, c, { code, supplierId, expectedDate, notes, sugge
   return r.insertId;
 }
 
-async function requireSupplier(db, companyId, id, problems) {
+export async function requireSupplier(db, companyId, id, problems) {
   const [[s]] = await db.query('SELECT id, name, is_supplier, status FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(id)]);
   if (!s) { problems.push('That supplier does not exist.'); return null; }
   if (!Number(s.is_supplier)) problems.push(`${s.name} is not marked as a supplier.`);

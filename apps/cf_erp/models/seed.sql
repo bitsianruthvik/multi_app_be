@@ -4,7 +4,7 @@
 -- (features.feature_tag has no unique key, so INSERT IGNORE would duplicate).
 -- ============================================================================
 
--- 1. Features (global). Four view tags, seven manage tags and the floor tag (init.sql §32), matching lib/http.js PERM.
+-- 1. Features (global). Four view tags, seven manage tags, the floor tag (init.sql §32) and purchase approve (§39), matching lib/http.js PERM.
 INSERT INTO features (feature_name, feature_tag, type)
 SELECT x.feature_name, x.feature_tag, x.type
   FROM (
@@ -19,7 +19,8 @@ SELECT x.feature_name, x.feature_tag, x.type
     SELECT 'CF ERP: manage machines, operations and flows',  'cf_erp_production_manage',         'backend'          UNION ALL
     SELECT 'CF ERP: view stock, batches and movements',      'cf_erp_inventory_view',            'frontend'         UNION ALL
     SELECT 'CF ERP: manage stock, batches and movements',    'cf_erp_inventory_manage',          'backend'          UNION ALL
-    SELECT 'CF ERP: record work on the shop floor',          'cf_erp_floor',                     'frontend'
+    SELECT 'CF ERP: record work on the shop floor',          'cf_erp_floor',                     'frontend'         UNION ALL
+    SELECT 'CF ERP: approve purchase requests',              'cf_erp_purchase_approve',          'backend'
   ) x
  WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag AND f.deleted_at IS NULL);
 
@@ -29,11 +30,11 @@ SELECT f.feature_tag, JSON_ARRAY(f.id)
   FROM features f
  WHERE f.feature_tag IN ('cf_erp_catalog_view', 'cf_erp_catalog_manage', 'cf_erp_setup_manage', 'cf_erp_codegen_manage',
                      'cf_erp_orders_view', 'cf_erp_orders_manage', 'cf_erp_parties_manage',
-                     'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor')
+                     'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor', 'cf_erp_purchase_approve')
    AND f.deleted_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
 
--- 3. Every company's admin role gets all twelve, for that company's cf_erp app.
+-- 3. Every company's admin role gets all thirteen, for that company's cf_erp app.
 --    (The backend lets admins through anyway; the frontend's usePermission does not.)
 INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
 SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
@@ -41,7 +42,7 @@ SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
   JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = 'admin' AND r.deleted_at IS NULL
   JOIN features_capability fc ON fc.name IN ('cf_erp_catalog_view', 'cf_erp_catalog_manage', 'cf_erp_setup_manage', 'cf_erp_codegen_manage',
                      'cf_erp_orders_view', 'cf_erp_orders_manage', 'cf_erp_parties_manage',
-                     'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor')
+                     'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor', 'cf_erp_purchase_approve')
                              AND fc.deleted_at IS NULL
  WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
    AND NOT EXISTS (

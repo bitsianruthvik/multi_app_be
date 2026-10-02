@@ -15,6 +15,7 @@ import stockMoneyRoutes from './stockMoney.js';
 import overviewRoutes from './overview.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
+import procurementRoutes from './procurement.js';
 import processRoutes from './process.js';
 import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
@@ -31,6 +32,7 @@ import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
 import { MOVEMENT_TYPES } from '../services/stockService.js';
 import { PO_STATUSES } from '../services/purchaseService.js';
+import { PR_STATUSES, RFQ_STATUSES, RFQ_SUPPLIER_STATUSES } from '../services/procurementService.js';
 import { WEEKDAYS } from '../services/shiftService.js';
 import { ORDER_TYPES, TRANSITIONS } from '../services/salesOrderService.js';
 import { RELATIONS } from '../services/flowService.js';
@@ -80,6 +82,9 @@ router.get('/meta', guard(PERM.view), handle(async () => ({
   batchStatuses: BATCH_STATUSES,
   movementTypes: MOVEMENT_TYPES,
   purchaseStatuses: PO_STATUSES,
+  purchaseRequestStatuses: PR_STATUSES,
+  rfqStatuses: RFQ_STATUSES,
+  rfqSupplierStatuses: RFQ_SUPPLIER_STATUSES,
   drawingSources: DRAWING_SOURCES,
   drawingStatuses: DRAWING_STATUSES,
   drawingSubjectTypes: DRAWING_SUBJECT_TYPES,
@@ -98,6 +103,7 @@ router.use(stockMoneyRoutes);
 router.use(overviewRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
+router.use(procurementRoutes);
 router.use(processRoutes);
 router.use(drawingRoutes);
 router.use(orderValuesRoutes);

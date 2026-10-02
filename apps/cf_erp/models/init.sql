@@ -3973,3 +3973,298 @@ CREATE TABLE IF NOT EXISTS cf_plan_ranks (
   CONSTRAINT fk_cprk_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
   CONSTRAINT fk_cprk_updater FOREIGN KEY (updated_by) REFERENCES users(id)
 );
+
+-- ===========================================================================
+-- 39. PROCUREMENT — purchase request -> RFQ -> quotes -> comparison -> award -> POs
+-- ===========================================================================
+--
+-- TM/CF_ERP_PROCUREMENT_PLAN.md (decided 2026-10-01). User: a purchase request
+-- needs ONE approver before it can go for quotes; an RFQ goes out as a document
+-- per supplier (print + a ready email the buyer sends from their own mail) and
+-- quotes are TYPED in by the buyer. Compare and award PER LINE; prices are net of
+-- tax; only POs count as "on order" — request / RFQ lines show as "in request" /
+-- "in RFQ" on the buy list so nothing is raised twice.
+--
+-- A request line's status is the lock that keeps it in ONE open RFQ at a time:
+-- open (in a draft / submitted / approved request, not in an RFQ) -> in_rfq ->
+-- ordered (on a PO) | cancelled. Closing or cancelling an RFQ puts its
+-- un-ordered request lines back to open.
+--
+-- New tables carry their keys in their CREATE; every ADD on an existing table is
+-- guarded on its own and no key is added in the ALTER that adds its column (TiDB).
+
+CREATE TABLE IF NOT EXISTS cf_purchase_requests (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  code            VARCHAR(100)  NULL,               -- NULL only between the insert and the PR-000123 fallback
+  status          ENUM('draft','submitted','approved','rejected','closed','cancelled') NOT NULL DEFAULT 'draft',
+  needed_by       DATE          NULL,
+  notes           TEXT          NULL,
+  requested_by    INT           NULL,
+  submitted_at    DATETIME      NULL,
+  decided_by      INT           NULL,
+  decided_at      DATETIME      NULL,
+  decision_note   VARCHAR(500)  NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT           NULL,
+
+  code_active     VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cprq_tenant (company_id, id),
+  UNIQUE KEY uq_cprq_code   (company_id, code_active),
+  KEY idx_cprq_status (company_id, status),
+
+  CONSTRAINT fk_cprq_company   FOREIGN KEY (company_id)   REFERENCES companies(id),
+  CONSTRAINT fk_cprq_requester FOREIGN KEY (requested_by) REFERENCES users(id),
+  CONSTRAINT fk_cprq_decider   FOREIGN KEY (decided_by)   REFERENCES users(id),
+  CONSTRAINT fk_cprq_creator   FOREIGN KEY (created_by)   REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_purchase_request_lines (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  request_id      INT            NOT NULL,
+  line_no         INT            NOT NULL,
+  item_id         INT            NOT NULL,
+  quantity        DECIMAL(18,6)  NOT NULL,
+  uom             VARCHAR(20)    NOT NULL DEFAULT 'nos',
+  needed_by       DATE           NULL,
+  est_unit_price  DECIMAL(18,4)  NULL,
+  source          JSON           NULL,             -- the buy-list row it came from: { from, planned, orders, lines }
+  status          ENUM('open','in_rfq','ordered','cancelled') NOT NULL DEFAULT 'open',
+  notes           VARCHAR(500)   NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cprql_tenant (company_id, id),
+  KEY idx_cprql_request (company_id, request_id, line_no),
+  KEY idx_cprql_item    (company_id, item_id, status),
+
+  CONSTRAINT fk_cprql_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cprql_request FOREIGN KEY (company_id, request_id) REFERENCES cf_purchase_requests(company_id, id),
+  CONSTRAINT fk_cprql_item    FOREIGN KEY (company_id, item_id)    REFERENCES cf_item_details(company_id, master_id)
+);
+
+-- Who did what to a request, and when (created, submitted, approved, rejected,
+-- cancelled, closed). A rejected request can be edited and submitted again, so
+-- the decision columns alone would lose the first answer.
+CREATE TABLE IF NOT EXISTS cf_purchase_request_events (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  request_id      INT            NOT NULL,
+  action          VARCHAR(20)    NOT NULL,
+  note            VARCHAR(500)   NULL,
+  user_id         INT            NULL,
+  created_at      DATETIME       DEFAULT CURRENT_TIMESTAMP,
+
+  KEY idx_cpre_request (company_id, request_id, id),
+
+  CONSTRAINT fk_cpre_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpre_request FOREIGN KEY (company_id, request_id) REFERENCES cf_purchase_requests(company_id, id),
+  CONSTRAINT fk_cpre_user    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_rfqs (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  code            VARCHAR(100)  NULL,
+  status          ENUM('draft','sent','closed','awarded','cancelled') NOT NULL DEFAULT 'draft',
+  quotes_due      DATE          NULL,
+  terms           TEXT          NULL,
+  notes           TEXT          NULL,
+  created_by      INT           NULL,
+  sent_at         DATETIME      NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  code_active     VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_crfq_tenant (company_id, id),
+  UNIQUE KEY uq_crfq_code   (company_id, code_active),
+  KEY idx_crfq_status (company_id, status),
+
+  CONSTRAINT fk_crfq_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crfq_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- purchase_line_id: the PO line the awarded line went onto (set by create-pos).
+-- A PO holds one line per item (uq_cpol_item), so two RFQ lines of the same item
+-- awarded to one supplier share one PO line; this column keeps both traceable.
+CREATE TABLE IF NOT EXISTS cf_rfq_lines (
+  id                     INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id             INT            NOT NULL,
+  rfq_id                 INT            NOT NULL,
+  line_no                INT            NOT NULL,
+  request_line_id        INT            NULL,
+  item_id                INT            NOT NULL,
+  quantity               DECIMAL(18,6)  NOT NULL,
+  uom                    VARCHAR(20)    NOT NULL DEFAULT 'nos',
+  needed_by              DATE           NULL,
+  awarded_quote_line_id  INT            NULL,
+  purchase_line_id       INT            NULL,
+
+  deleted_at             DATETIME       DEFAULT NULL,
+  created_at             TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at             TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_crfl_tenant (company_id, id),
+  KEY idx_crfl_rfq     (company_id, rfq_id, line_no),
+  KEY idx_crfl_request (company_id, request_line_id),
+  KEY idx_crfl_item    (company_id, item_id),
+
+  CONSTRAINT fk_crfl_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crfl_rfq      FOREIGN KEY (company_id, rfq_id)           REFERENCES cf_rfqs(company_id, id),
+  CONSTRAINT fk_crfl_request  FOREIGN KEY (company_id, request_line_id)  REFERENCES cf_purchase_request_lines(company_id, id),
+  CONSTRAINT fk_crfl_item     FOREIGN KEY (company_id, item_id)          REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_crfl_po_line  FOREIGN KEY (company_id, purchase_line_id) REFERENCES cf_purchase_order_lines(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_rfq_suppliers (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  rfq_id          INT           NOT NULL,
+  supplier_id     INT           NOT NULL,
+  status          ENUM('invited','sent','quoted','declined') NOT NULL DEFAULT 'invited',
+  sent_at         DATETIME      NULL,
+  contact_email   VARCHAR(255)  NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_crfs_tenant   (company_id, id),
+  UNIQUE KEY uq_crfs_supplier (rfq_id, supplier_id),
+  KEY idx_crfs_rfq (company_id, rfq_id),
+
+  CONSTRAINT fk_crfs_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crfs_rfq      FOREIGN KEY (company_id, rfq_id)      REFERENCES cf_rfqs(company_id, id),
+  CONSTRAINT fk_crfs_supplier FOREIGN KEY (company_id, supplier_id) REFERENCES cf_parties(company_id, id)
+);
+
+-- One live quote per supplier per RFQ: entering it again UPDATES it (upsert).
+CREATE TABLE IF NOT EXISTS cf_quotes (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  rfq_id          INT            NOT NULL,
+  supplier_id     INT            NOT NULL,
+  quote_ref       VARCHAR(100)   NULL,
+  received_on     DATE           NULL,
+  valid_until     DATE           NULL,
+  payment_terms   VARCHAR(255)   NULL,
+  freight_amount  DECIMAL(18,2)  NULL,
+  currency        CHAR(3)        NOT NULL DEFAULT 'INR',
+  notes           TEXT           NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  supplier_live   INT            GENERATED ALWAYS AS (IF(deleted_at IS NULL, supplier_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cqt_tenant   (company_id, id),
+  UNIQUE KEY uq_cqt_supplier (rfq_id, supplier_live),
+  KEY idx_cqt_rfq (company_id, rfq_id),
+
+  CONSTRAINT fk_cqt_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cqt_rfq      FOREIGN KEY (company_id, rfq_id)      REFERENCES cf_rfqs(company_id, id),
+  CONSTRAINT fk_cqt_supplier FOREIGN KEY (company_id, supplier_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cqt_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- unit_price NULL = not quoted. Updated in place (uq_cqtl_line), never
+-- delete-and-insert: an award and a PO line point at the row's id.
+CREATE TABLE IF NOT EXISTS cf_quote_lines (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  quote_id        INT            NOT NULL,
+  rfq_line_id     INT            NOT NULL,
+  unit_price      DECIMAL(18,4)  NULL,
+  gst_rate        DECIMAL(5,2)   NULL,
+  lead_time_days  INT            NULL,
+  qty_offered     DECIMAL(18,6)  NULL,
+  remark          VARCHAR(500)   NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cqtl_tenant (company_id, id),
+  UNIQUE KEY uq_cqtl_line   (quote_id, rfq_line_id),
+  KEY idx_cqtl_rfq_line (company_id, rfq_line_id),
+
+  CONSTRAINT fk_cqtl_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cqtl_quote    FOREIGN KEY (company_id, quote_id)    REFERENCES cf_quotes(company_id, id),
+  CONSTRAINT fk_cqtl_rfq_line FOREIGN KEY (company_id, rfq_line_id) REFERENCES cf_rfq_lines(company_id, id)
+);
+
+-- The award points at a quote line; cf_quote_lines is created after cf_rfq_lines,
+-- so this foreign key comes afterwards, guarded.
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfq_lines' AND CONSTRAINT_NAME = 'fk_crfl_award');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_rfq_lines ADD CONSTRAINT fk_crfl_award FOREIGN KEY (company_id, awarded_quote_line_id) REFERENCES cf_quote_lines(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Traceability on the purchase order line: the quote line it was priced from and
+-- the request line it buys. Columns first, keys in their own ALTERs (TiDB).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'quote_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_order_lines ADD COLUMN quote_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'request_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_order_lines ADD COLUMN request_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND INDEX_NAME = 'idx_cpol_quote_line');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_purchase_order_lines ADD KEY idx_cpol_quote_line (company_id, quote_line_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND INDEX_NAME = 'idx_cpol_request_line');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_purchase_order_lines ADD KEY idx_cpol_request_line (company_id, request_line_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND CONSTRAINT_NAME = 'fk_cpol_quote_line');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_purchase_order_lines ADD CONSTRAINT fk_cpol_quote_line FOREIGN KEY (company_id, quote_line_id) REFERENCES cf_quote_lines(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND CONSTRAINT_NAME = 'fk_cpol_request_line');
+SET @sql = IF(@fk = 0,
+  'ALTER TABLE cf_purchase_order_lines ADD CONSTRAINT fk_cpol_request_line FOREIGN KEY (company_id, request_line_id) REFERENCES cf_purchase_request_lines(company_id, id)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The approve permission (approve / reject purchase requests): a feature, its
+-- capability, and a grant (§32 style) to every role / team / company that holds
+-- a capability CONTAINING purchase manage (cf_erp_inventory_manage — buying runs
+-- on it), for the same app. models/seed.sql lists it for a fresh database's admin.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve purchase requests', 'cf_erp_purchase_approve', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_purchase_approve' AND f.deleted_at IS NULL);
+
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_purchase_approve' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_purchase_approve' AND fc.deleted_at IS NULL);
+
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT rc.role_id, rc.team_id, rc.company_id, rc.app_id, pa.capability_id
+  FROM role_capability rc
+  JOIN features_capability im ON im.capability_id = rc.capability_id AND im.deleted_at IS NULL
+  JOIN features imf ON imf.feature_tag = 'cf_erp_inventory_manage' AND imf.deleted_at IS NULL
+                   AND JSON_CONTAINS(im.features_json, CAST(imf.id AS JSON))
+  JOIN features_capability pa ON pa.name = 'cf_erp_purchase_approve' AND pa.deleted_at IS NULL
+ WHERE rc.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.capability_id = pa.capability_id AND x.deleted_at IS NULL
+        AND x.role_id <=> rc.role_id AND x.team_id <=> rc.team_id
+        AND x.company_id <=> rc.company_id AND x.app_id <=> rc.app_id);
