@@ -24,6 +24,7 @@ import { generate, findConditionsReferencing } from '../modules/codegen/index.js
 import { draftMaster, draftValueMap } from './drafts.js';
 import { bomOfParent, deleteBomOf, placementOf } from './bomGraph.js';
 import { nextRevision } from '../lib/revision.js';
+import { wantsPage, pageArgs, orderBy, likeOf, pageOf } from '../lib/listing.js';
 import { requireUsableFlow } from './flowService.js';
 import { readPrice, readBasis, readCurrency } from './priceService.js';
 import { readItemTax } from './taxService.js';
@@ -570,17 +571,25 @@ export async function getRecordSpecs(db, companyId, id) {
 
 const RECORD_KINDS = ['catalog', 'temporary', 'template', 'selection'];
 
+/** Columns the paged list may sort by (the screen's column keys). BOM size has no cheap sortable expression. */
+const RECORD_SORT = {
+  code: 'm.code', name: 'm.name', shortName: 'm.short_name', kind: 'COALESCE(i.item_type, d.definition_type)',
+  classification: 'c.name', status: 'm.status', rev: 'm.revision', tracked: 'i.tracked_by',
+  chooses: 'd.selection_mode', sourcing: 'i.sourcing',
+};
+const RECORD_STATUSES = ['draft', 'active', 'obsolete'];
+
 export async function listRecords(db, companyId, q = {}) {
-  // Two WHEREs: `base` is every filter but the kind, `where` adds the kind.
-  // The rows read `where`; the per-kind counts read `base` grouped by kind, so
-  // the Items / Definitions chips count every kind whatever the 500-row page
-  // holds — in the same round trip the total always took (2026-10-02: prod had
-  // 199 temporary items the Temporary chip never showed).
-  const base = ['m.company_id = ?', 'm.deleted_at IS NULL'];
-  const baseParams = [companyId];
+  // `rest` is every filter but kind and status. ONE grouped read over `rest`
+  // (kind x status) answers the total, the kind chips (each over the status
+  // filter), the status chips (each over the kind filter) and the tiles — no
+  // per-row work, one round trip beside the rows (prod is ~49 ms per trip;
+  // 2026-10-02: Items tiles counted only the loaded rows).
+  const rest = ['m.company_id = ?', 'm.deleted_at IS NULL'];
+  const restParams = [companyId];
   const kindWhere = [];
   const kindParams = [];
-  if (q.recordKind) { base.push('m.record_kind = ?'); baseParams.push(q.recordKind); }
+  if (q.recordKind) { rest.push('m.record_kind = ?'); restParams.push(q.recordKind); }
   if (q.kind) { kindWhere.push('(i.item_type = ? OR d.definition_type = ?)'); kindParams.push(q.kind, q.kind); }
   // kinds=catalog,template,selection — what a BOM line or order line picker may offer
   const kinds = blank(q.kinds) ? [] : String(q.kinds).split(',').map((k) => k.trim()).filter((k) => RECORD_KINDS.includes(k));
@@ -590,42 +599,42 @@ export async function listRecords(db, companyId, q = {}) {
   // a row is a design, not a catalog item).
   const hideTemporary = q.kind !== 'temporary' && !kinds.includes('temporary') && blank(q.orderId);
   if (hideTemporary) kindWhere.push("(i.item_type IS NULL OR i.item_type <> 'temporary')");
-  const where = base;
-  const params = baseParams;
-  if (q.status) { where.push('m.status = ?'); params.push(q.status); }
-  if (q.usable === '1' || q.usable === 1 || q.usable === true) where.push("m.status <> 'obsolete'");
+  if (q.usable === '1' || q.usable === 1 || q.usable === true) rest.push("m.status <> 'obsolete'");
   if (!blank(q.orderId)) {
-    where.push('i.owner_order_line_id IN (SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ?)');
-    params.push(companyId, Number(q.orderId));
+    rest.push('i.owner_order_line_id IN (SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ?)');
+    restParams.push(companyId, Number(q.orderId));
   }
   if (!blank(q.classificationId)) {
-    where.push('m.classification_id IN (?)');
-    params.push(await subtreeIds(db, companyId, Number(q.classificationId)));
+    rest.push('m.classification_id IN (?)');
+    restParams.push(await subtreeIds(db, companyId, Number(q.classificationId)));
   }
   if (!blank(q.search)) {
-    const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
-    where.push('(m.code LIKE ? OR m.name LIKE ?)');
-    params.push(like, like);
+    const like = likeOf(q.search);
+    rest.push('(m.code LIKE ? OR m.name LIKE ?)');
+    restParams.push(like, like);
   }
-  const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 500);
-  const offset = Math.max(Number(q.offset) || 0, 0);
+  const statusOk = (s) => blank(q.status) || s === q.status;
+  const kindOk = (k) => (q.kind ? k === q.kind
+    : kinds.length ? kinds.includes(k)
+      : !(hideTemporary && k === 'temporary'));
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : { limit: Math.min(Math.max(Number(q.limit) || 100, 1), 500), offset: Math.max(Number(q.offset) || 0, 0) };
+  const where = [...rest];
+  const params = [...restParams];
+  if (!blank(q.status)) { where.push('m.status = ?'); params.push(q.status); }
+  where.push(...kindWhere);
+  params.push(...kindParams);
   const joins = `FROM cf_master_records m
     JOIN cf_classification_nodes c ON c.id = m.classification_id
     LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
     LEFT JOIN cf_definition_details d ON d.master_id = m.id AND d.deleted_at IS NULL`;
-  const baseFrom = `${joins} WHERE ${base.join(' AND ')}`;
-  const countParams = [...params];
-  where.push(...kindWhere);
-  params.push(...kindParams);
-  const from = `FROM cf_master_records m
-    JOIN cf_classification_nodes c ON c.id = m.classification_id
-    LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
-    LEFT JOIN cf_definition_details d ON d.master_id = m.id AND d.deleted_at IS NULL
+  const from = `${joins}
     LEFT JOIN cf_master_records sd ON sd.id = i.source_definition_id
     LEFT JOIN cf_sales_order_lines ol ON ol.id = i.owner_order_line_id
     LEFT JOIN cf_sales_orders so ON so.id = ol.order_id
    WHERE ${where.join(' AND ')}`;
-  const [rows] = await db.query(
+  const order = paged ? orderBy(q, RECORD_SORT, 'm.code IS NULL, m.code, m.id', 'm.id') : 'm.code IS NULL, m.code, m.id';
+  const rowsQuery = db.query(
     `SELECT m.*, c.code AS classification_code, c.name AS classification_name,
             i.item_type, i.tracked_by, i.uom, i.sourcing, i.source_definition_id, i.owner_order_line_id,
             i.list_price, i.price_basis, i.currency AS price_currency,
@@ -639,38 +648,61 @@ export async function listRecords(db, companyId, q = {}) {
               WHERE b2.company_id = m.company_id AND b2.parent_id = m.id AND b2.deleted_at IS NULL
                 AND bl.deleted_at IS NULL) AS bom_line_count
        ${from}
-      ORDER BY m.code IS NULL, m.code, m.id
+      ORDER BY ${order}
       LIMIT ? OFFSET ?`,
-    [...params, limit, offset],
+    [...params, page.limit, page.offset],
   );
-  const [byKind] = await db.query(
-    `SELECT COALESCE(i.item_type, d.definition_type) AS kind, COUNT(*) AS n ${baseFrom} GROUP BY COALESCE(i.item_type, d.definition_type)`,
-    countParams,
+  const matrixQuery = db.query(
+    `SELECT COALESCE(i.item_type, d.definition_type) AS kind, m.status AS status, COUNT(*) AS n, SUM(m.code IS NULL) AS no_code
+       ${joins} WHERE ${rest.join(' AND ')} GROUP BY COALESCE(i.item_type, d.definition_type), m.status`,
+    restParams,
   );
+  // "of N overall": every record of this screen's kind, whatever else is filtered.
+  const overallQuery = paged && q.recordKind
+    ? db.query(
+      `SELECT COALESCE(i.item_type, d.definition_type) AS kind, COUNT(*) AS n ${joins}
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = ? GROUP BY COALESCE(i.item_type, d.definition_type)`,
+      [companyId, q.recordKind],
+    )
+    : Promise.resolve([[]]);
+  const [[rows], [matrix], [overallRows]] = await Promise.all([rowsQuery, matrixQuery, overallQuery]);
   const kindCounts = { catalog: 0, temporary: 0, template: 0, selection: 0 };
+  const statusCounts = Object.fromEntries(RECORD_STATUSES.map((s) => [s, 0]));
   let total = 0;
-  for (const r of byKind) {
+  let noCode = 0;
+  let statusAll = 0;
+  for (const r of matrix) {
     const n = Number(r.n);
-    if (r.kind && kindCounts[r.kind] !== undefined) kindCounts[r.kind] = n;
-    // The total is what the kind filter lets through — the same rule as kindWhere.
-    const passes = q.kind ? r.kind === q.kind
-      : kinds.length ? kinds.includes(r.kind)
-      : !(hideTemporary && r.kind === 'temporary');
-    if (passes) total += n;
+    if (r.kind && kindCounts[r.kind] !== undefined && statusOk(r.status)) kindCounts[r.kind] += n;
+    if (kindOk(r.kind)) {
+      statusCounts[r.status] = (statusCounts[r.status] ?? 0) + n;
+      statusAll += n;
+      if (statusOk(r.status)) { total += n; noCode += Number(r.no_code || 0); }
+    }
   }
-  return {
-    total,
+  const shaped = rows.map((r) => ({
+    ...shapeRecord(r),
+    classificationCode: r.classification_code,
+    classificationName: r.classification_name,
+    sourceDefinitionCode: r.source_definition_code ?? null,
+    bomStatus: r.bom_status ?? null,
+    bomLineCount: r.bom_status ? Number(r.bom_line_count ?? 0) : null,
+    owner: r.owner_order_id ? { orderId: r.owner_order_id, orderCode: r.owner_order_code, lineNo: r.owner_line_no } : null,
+  }));
+  if (!paged) return { total, kindCounts, rows: shaped };
+  const overall = { catalog: 0, temporary: 0, template: 0, selection: 0 };
+  for (const r of overallRows) if (r.kind && overall[r.kind] !== undefined) overall[r.kind] = Number(r.n);
+  return pageOf(shaped, total, page, {
     kindCounts,
-    rows: rows.map((r) => ({
-      ...shapeRecord(r),
-      classificationCode: r.classification_code,
-      classificationName: r.classification_name,
-      sourceDefinitionCode: r.source_definition_code ?? null,
-      bomStatus: r.bom_status ?? null,
-      bomLineCount: r.bom_status ? Number(r.bom_line_count ?? 0) : null,
-      owner: r.owner_order_id ? { orderId: r.owner_order_id, orderCode: r.owner_order_code, lineNo: r.owner_line_no } : null,
-    })),
-  };
+    counts: {
+      total,
+      kind: kindCounts,
+      status: { ...statusCounts, all: statusAll },
+      noCode,
+      // Every record of this screen's kinds, whatever is filtered (the "of N").
+      overall: q.recordKind === 'definition' ? overall.template + overall.selection : overall.catalog + overall.temporary,
+    },
+  });
 }
 
 /**

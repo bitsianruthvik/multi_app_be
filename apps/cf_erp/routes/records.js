@@ -2,6 +2,9 @@
  * records.js — items and definitions, their values and their selection lists.
  *
  *   GET    /records?recordKind=&kind=&status=&classificationId=&search=&limit=&offset=
+ *                                      + paged=1 (sort, dir) -> { rows, total, counts{total,kind,status,noCode,overall}, hasMore };
+ *                                      all=1 = every match (export). lib/listing.js contract.
+ *                                      + paged=1 (sort, dir) -> { rows, total, counts{total,kind,status,noCode,overall}, hasMore }; all=1 = export (lib/listing.js)
  *   POST   /records/preview            draft -> which specs apply, the code and name it would get
  *   POST   /catalog/classification     { parentId, code, name, description?, scope?, sortOrder? }
  *                                      a Family / Subfamily / Variant made mid-flow from the catalog
