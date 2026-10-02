@@ -12,6 +12,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { subtreeIds } from './tree.js';
+import { likeOf } from '../lib/listing.js';
 import { loadMaster, requireMaster } from './records.js';
 import { coerce } from './valueService.js';
 import { rawOf } from './resolutionService.js';
@@ -180,7 +181,7 @@ function criterionSql(c) {
  * its search area, and meeting its mode. Each comes with the values the
  * criteria looked at, so a person can see why it matched.
  */
-export async function findCandidates(db, companyId, definitionId, { limit = 200 } = {}) {
+export async function findCandidates(db, companyId, definitionId, { limit = 200, itemId = null, search = null } = {}) {
   const d = await requireSelection(db, companyId, definitionId);
   const [criteria] = await db.query(
     `SELECT c.*, s.data_type, s.code AS spec_code FROM cf_selection_criteria c JOIN cf_specifications s ON s.id = c.specification_id
@@ -200,7 +201,7 @@ export async function findCandidates(db, companyId, definitionId, { limit = 200 
     params.push(companyId, definitionId);
   }
   if (mode === 'spec_match' || mode === 'both') {
-    if (!criteria.length) return { mode, candidates: [], note: 'No criteria yet — nothing to match.' };
+    if (!criteria.length) return { mode, candidates: [], total: 0, truncated: false, note: 'No criteria yet — nothing to match.' };
     const bySpec = new Map();
     for (const c of criteria) {
       if (!bySpec.has(c.specification_id)) bySpec.set(c.specification_id, []);
@@ -215,7 +216,14 @@ export async function findCandidates(db, companyId, definitionId, { limit = 200 
     }
   }
 
-  const [rows] = await db.query(
+  // One item only (a pick being checked) — the check must not depend on how many candidates come before it.
+  if (itemId !== null && itemId !== undefined && itemId !== '') { where.push('m.id = ?'); params.push(Number(itemId)); }
+  const like = likeOf(search);
+  if (like) { where.push('(m.code LIKE ? OR m.name LIKE ?)'); params.push(like, like); }
+  const cap = Math.min(Number(limit) || 200, 1000);
+
+  // The rows and the true count (same WHERE) together, so the screen can say "showing N of M".
+  const [[rows], [[counted]]] = await Promise.all([db.query(
     `SELECT m.id, m.code, m.name, m.revision, c.name AS classification_name,
             (SELECT a.is_default FROM cf_definition_allowed_items a
               WHERE a.company_id = m.company_id AND a.definition_id = ? AND a.item_id = m.id AND a.deleted_at IS NULL LIMIT 1) AS is_default
@@ -225,8 +233,16 @@ export async function findCandidates(db, companyId, definitionId, { limit = 200 
       WHERE ${where.join(' AND ')}
       ORDER BY is_default DESC, m.code
       LIMIT ?`,
-    [definitionId, ...params, Math.min(Number(limit) || 200, 1000)],
-  );
+    [definitionId, ...params, cap],
+  ), db.query(
+    `SELECT COUNT(*) AS n
+       FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+       JOIN cf_classification_nodes c ON c.id = m.classification_id
+      WHERE ${where.join(' AND ')}`,
+    params,
+  )]);
+  const total = Number(counted.n);
 
   const specIds = [...new Set(criteria.map((c) => c.specification_id))];
   const shown = new Map();
@@ -245,6 +261,8 @@ export async function findCandidates(db, companyId, definitionId, { limit = 200 
   }
   return {
     mode,
+    total,
+    truncated: total > rows.length,
     candidates: rows.map((r) => ({
       id: r.id, code: r.code, name: r.name, revision: r.revision, classificationName: r.classification_name,
       isDefault: !!r.is_default, matchedValues: shown.get(r.id) ?? [],

@@ -243,23 +243,77 @@ export async function deleteAddress(db, c, partyId, addressId) {
   return listAddresses(db, c.companyId, partyId);
 }
 
+// Paging — the same contract as the host's lib/listing.js (the module may not
+// import its host, so the few lines it needs are repeated here).
+const truthy = (v) => v === '1' || v === 1 || v === true || v === 'true';
+const PAGE_MAX = 500;
+const EXPORT_MAX = 50_000;
+const PARTY_SORT = { code: 'code', name: 'name', roles: 'is_customer', contact: 'contact_name', tax: 'tax_number', status: 'status' };
+
+/**
+ * The parties. Old callers (no `paged`) get the bare array they always got.
+ * `paged=1` → { rows, total, counts, limit, offset, hasMore }: search, role and
+ * status filter in SQL, and `counts` answers the role chips (every filter but
+ * the role) and the active / inactive / no-contact figures (every filter) in
+ * the same round trip as the total. `all=1` = every match (an export).
+ * `ids=1,2` reads named parties (a picker showing what is already chosen).
+ */
 export async function listParties(db, companyId, q = {}) {
-  const where = ['company_id = ?', 'deleted_at IS NULL'];
+  const base = ['company_id = ?', 'deleted_at IS NULL'];
   const params = [companyId];
-  if (!blank(q.role)) {
-    const col = ROLES[q.role];
-    if (!col) throw new PartyError(422, 'INVALID', 'Role is customer, supplier or subcontractor.');
-    where.push(`${col} = 1`);
+  let roleCol = null;
+  if (!blank(q.role) && q.role !== 'all') {
+    roleCol = ROLES[q.role];
+    if (!roleCol) throw new PartyError(422, 'INVALID', 'Role is customer, supplier or subcontractor.');
   }
-  if (!blank(q.status)) { where.push('status = ?'); params.push(q.status); }
+  if (!blank(q.status)) { base.push('status = ?'); params.push(q.status); }
   if (!blank(q.search)) {
     const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
-    where.push('(code LIKE ? OR name LIKE ? OR contact_name LIKE ?)');
-    params.push(like, like, like);
+    base.push('(code LIKE ? OR name LIKE ? OR contact_name LIKE ? OR email LIKE ? OR phone LIKE ?)');
+    params.push(like, like, like, like, like);
   }
-  const limit = Math.min(Math.max(Number(q.limit) || 200, 1), 500);
-  const [rows] = await db.query(`SELECT * FROM cf_parties WHERE ${where.join(' AND ')} ORDER BY name, id LIMIT ?`, [...params, limit]);
-  return rows.map(shape);
+  if (!blank(q.ids)) {
+    const ids = String(q.ids).split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0);
+    if (ids.length) { base.push('id IN (?)'); params.push(ids); } else base.push('1 = 0');
+  }
+  const inRole = roleCol ? `${roleCol} = 1` : '1 = 1';
+  const where = `${base.join(' AND ')} AND ${inRole}`;
+  const sortCol = Object.prototype.hasOwnProperty.call(PARTY_SORT, q.sort) ? PARTY_SORT[q.sort] : null;
+  const order = sortCol ? `${sortCol} IS NULL, ${sortCol} ${String(q.dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC'}, id` : 'name, id';
+  if (!truthy(q.paged) && !truthy(q.all)) {
+    const limit = Math.min(Math.max(Number(q.limit) || 200, 1), PAGE_MAX);
+    const [rows] = await db.query(`SELECT * FROM cf_parties WHERE ${where} ORDER BY ${order} LIMIT ?`, [...params, limit]);
+    return rows.map(shape);
+  }
+  const all = truthy(q.all);
+  const limit = all ? EXPORT_MAX : Math.min(Math.max(Number(q.limit) || 100, 1), PAGE_MAX);
+  const offset = all ? 0 : Math.max(Math.floor(Number(q.offset) || 0), 0);
+  const [[rows], [[c]]] = await Promise.all([
+    db.query(`SELECT * FROM cf_parties WHERE ${where} ORDER BY ${order} LIMIT ? OFFSET ?`, [...params, limit, offset]),
+    db.query(
+      `SELECT COUNT(*) AS all_n, SUM(is_customer = 1) AS customer, SUM(is_supplier = 1) AS supplier, SUM(is_subcontractor = 1) AS subcontractor,
+              SUM(${inRole}) AS total,
+              SUM(${inRole} AND status = 'active') AS active,
+              SUM(${inRole} AND status <> 'active') AS inactive,
+              SUM(${inRole} AND (email IS NULL OR email = '') AND (phone IS NULL OR phone = '')) AS no_contact
+         FROM cf_parties WHERE ${base.join(' AND ')}`,
+      params,
+    ),
+  ]);
+  const n = (v) => Number(v) || 0;
+  const total = n(c.total);
+  return {
+    rows: rows.map(shape),
+    total,
+    limit: all ? rows.length : limit,
+    offset,
+    hasMore: !all && offset + rows.length < total,
+    ...(all && total > rows.length ? { truncated: true } : {}),
+    counts: {
+      roles: { customer: n(c.customer), supplier: n(c.supplier), subcontractor: n(c.subcontractor), all: n(c.all_n) },
+      active: n(c.active), inactive: n(c.inactive), noContact: n(c.no_contact),
+    },
+  };
 }
 
 async function requireParty(db, companyId, id) {

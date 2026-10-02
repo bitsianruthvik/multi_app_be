@@ -101,7 +101,7 @@ router.post('/records/:id/revision', guard(PERM.catalog), handle((req) => tx(req
 router.delete('/records/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => deleteRecord(db, c, id(req)))));
 
 router.get('/definitions/:id/selection', guard(PERM.view), handle((req) => getSelection(pool, ctx(req).companyId, id(req))));
-router.get('/definitions/:id/candidates', guard(PERM.view), handle((req) => findCandidates(pool, ctx(req).companyId, id(req), { limit: req.query.limit })));
+router.get('/definitions/:id/candidates', guard(PERM.view), handle((req) => findCandidates(pool, ctx(req).companyId, id(req), { limit: req.query.limit, search: req.query.search, itemId: req.query.itemId })));
 router.post('/definitions/:id/allowed-items', guard(PERM.catalog), handle((req) => tx(req, (db, c) => addAllowedItem(db, c, id(req), req.body))));
 router.post('/allowed-items/:id/default', guard(PERM.catalog), handle((req) => tx(req, (db, c) => setDefaultAllowed(db, c, id(req)))));
 router.delete('/allowed-items/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => removeAllowedItem(db, c, id(req)))));

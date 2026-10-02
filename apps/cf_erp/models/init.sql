@@ -4304,3 +4304,23 @@ CREATE TABLE IF NOT EXISTS cf_nest_exclusions (
   CONSTRAINT fk_cnex_item    FOREIGN KEY (item_id) REFERENCES cf_master_records(id),
   CONSTRAINT fk_cnex_creator FOREIGN KEY (created_by) REFERENCES users(id)
 );
+
+-- ===========================================================================
+-- 41. CLASSIFICATION BY SCREEN — which screen's pop-up made a node
+-- ===========================================================================
+--
+-- 2026-10-02 (the user: classification is managed from the screens that use it,
+-- and NO hand tagging — "tags are error-prone"). What a screen shows is derived:
+-- Items shows the branches that hold items, Definitions the ones that hold
+-- definitions (plus every branch a selection picks from), Machines the machine
+-- families. Only an EMPTY node has nothing to derive from, so it shows on the
+-- screen whose pop-up created it — stamped here, automatically, at creation.
+-- NULL = made before this column (or by a script): shown on Items and on
+-- Definitions so nothing is lost. 'setup' = made by the old Setup screen or the
+-- command palette; read like NULL. Never written after the insert.
+-- VARCHAR, not ENUM: TiDB only lets an ENUM grow at the end, and a new screen
+-- should not need a schema change.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_classification_nodes' AND COLUMN_NAME = 'created_in');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_classification_nodes ADD COLUMN created_in VARCHAR(16) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

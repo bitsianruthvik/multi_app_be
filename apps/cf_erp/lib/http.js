@@ -63,3 +63,8 @@ export function intParam(value, name = 'id') {
   if (!Number.isInteger(n) || n <= 0) throw new CfError(422, 'INVALID', `${name} must be a positive whole number.`);
   return n;
 }
+
+/** Inside a handler: 403 unless the user holds ANY one of the tags. Admins pass. */
+export function assertAnyPerm(req, ...tags) {
+  if (!tags.some((t) => isPermitted(req.user, t))) throw new CfError(403, 'FORBIDDEN', `Permission required: ${tags.join(' or ')}`);
+}

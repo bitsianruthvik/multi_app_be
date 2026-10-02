@@ -13,6 +13,7 @@ import { resolveBatch, publicResolution } from './resolutionService.js';
 import { loadSpecs, coerce, upsertValues, getHistory } from './valueService.js';
 import { draftValueMap } from './drafts.js';
 import { generate } from '../modules/codegen/index.js';
+import { wantsPage, pageArgs, orderBy, likeOf, pageOf, countsBy } from '../lib/listing.js';
 
 export const BATCH_STATUSES = ['available', 'on_hold', 'rejected'];
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
@@ -62,23 +63,78 @@ export async function requireBatch(db, companyId, id) {
   return row;
 }
 
-export async function listBatches(db, companyId, q = {}) {
+const ON_HAND_SQL = '(SELECT COALESCE(SUM(k.quantity), 0) FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id)';
+const BATCH_SORT = {
+  code: 'b.code', item: 'm.code', received: 'b.received_on', supplier: 'p.name', owner: 'op.name', status: 'b.status', unitCost: 'b.unit_cost',
+  onHand: ON_HAND_SQL,
+  value: `(CASE WHEN b.owner_party_id IS NULL AND b.unit_cost IS NOT NULL THEN ${ON_HAND_SQL} * b.unit_cost END)`,
+};
+const BATCH_FROM = `FROM cf_stock_batches b
+  JOIN cf_master_records m ON m.id = b.item_id
+  LEFT JOIN cf_parties p ON p.id = b.supplier_id
+  LEFT JOIN cf_parties op ON op.id = b.owner_party_id`;
+
+/** Batch filters; `skip` leaves facets out ('status', 'owner') so a chip counts the others. */
+function batchWhere(companyId, q, skip = []) {
   const where = ['b.company_id = ?', 'b.deleted_at IS NULL'];
   const params = [companyId];
   if (!blank(q.itemId)) { where.push('b.item_id = ?'); params.push(Number(q.itemId)); }
-  if (!blank(q.status)) { where.push('b.status = ?'); params.push(q.status); }
+  if (!skip.includes('status') && !blank(q.status)) { where.push('b.status = ?'); params.push(q.status); }
   // owner: ours | customer | a party id
-  if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
-  else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
-  else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
+  if (!skip.includes('owner')) {
+    if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
+    else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
+    else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
+  }
   if (!blank(q.search)) {
-    const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+    const like = likeOf(q.search);
     where.push('(b.code LIKE ? OR b.supplier_ref LIKE ? OR m.code LIKE ? OR m.name LIKE ?)');
     params.push(like, like, like, like);
   }
-  const having = String(q.inStock) === '1' ? 'HAVING on_hand <> 0' : '';
-  const [rows] = await db.query(`${SELECT} WHERE ${where.join(' AND ')} ${having} ORDER BY b.id DESC LIMIT 500`, params);
-  return rows.map(shapeBatch);
+  if (String(q.inStock) === '1') where.push(`${ON_HAND_SQL} <> 0`);
+  return { where: where.join(' AND '), params };
+}
+
+/**
+ * Batches, newest first. Without paged=1 / all=1: the old bare array (at most
+ * 500). With paged=1: { rows, total, counts } — counts.statuses (every filter
+ * but the status) and counts.owners (every filter but the owner) feed the
+ * chips; counts.stats is over every filter: { batches, ourBatches, ourValue,
+ * notCosted }.
+ */
+export async function listBatches(db, companyId, q = {}) {
+  if (!wantsPage(q)) {
+    const { where, params } = batchWhere(companyId, q);
+    const [rows] = await db.query(`${SELECT} WHERE ${where} ORDER BY b.id DESC LIMIT 500`, params);
+    return rows.map(shapeBatch);
+  }
+  const page = pageArgs(q, { def: 100 });
+  const all = batchWhere(companyId, q);
+  const noStatus = batchWhere(companyId, q, ['status']);
+  const noOwner = batchWhere(companyId, q, ['owner']);
+  const order = orderBy(q, BATCH_SORT, 'b.id DESC', 'b.id DESC');
+  const [[rows], [[stat]], [statusRows], [ownerRows]] = await Promise.all([
+    db.query(`${SELECT} WHERE ${all.where} ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}`, all.params),
+    db.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(b.owner_party_id IS NULL), 0) AS ours,
+              COALESCE(SUM(CASE WHEN b.owner_party_id IS NULL AND b.unit_cost IS NOT NULL THEN ROUND(${ON_HAND_SQL} * b.unit_cost, 2) END), 0) AS our_value,
+              COALESCE(SUM(b.owner_party_id IS NULL AND b.unit_cost IS NULL), 0) AS not_costed
+         ${BATCH_FROM} WHERE ${all.where}`, all.params),
+    db.query(`SELECT b.status AS k, COUNT(*) AS n ${BATCH_FROM} WHERE ${noStatus.where} GROUP BY b.status`, noStatus.params),
+    db.query(`SELECT b.owner_party_id AS pid, MAX(op.name) AS name, MAX(op.code) AS code, COUNT(*) AS n ${BATCH_FROM} WHERE ${noOwner.where} GROUP BY b.owner_party_id`, noOwner.params),
+  ]);
+  const statuses = countsBy(statusRows, BATCH_STATUSES);
+  const counts = {
+    statuses: { ...statuses, all: Object.values(statuses).reduce((t, n) => t + n, 0) },
+    owners: {
+      ours: ownerRows.filter((r) => r.pid == null).reduce((t, r) => t + Number(r.n), 0),
+      parties: ownerRows.filter((r) => r.pid != null).map((r) => ({ id: r.pid, name: r.name ?? null, code: r.code ?? null, n: Number(r.n) }))
+        .sort((x, y) => String(x.name ?? x.code ?? '').localeCompare(String(y.name ?? y.code ?? ''))),
+    },
+    stats: { batches: Number(stat.total), ourBatches: Number(stat.ours), ourValue: Number(stat.our_value), notCosted: Number(stat.not_costed) },
+  };
+  return pageOf(rows.map(shapeBatch), stat.total, page, { counts });
 }
 
 /** The batch-level rules of an item, as a receipt form needs them (no batch yet). */

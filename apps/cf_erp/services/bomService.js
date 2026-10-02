@@ -343,10 +343,10 @@ export async function removeLine(db, c, lineId) {
 }
 
 /** The catalog items a selection line may take, with the one it holds now. */
-export async function lineCandidates(db, companyId, lineId) {
+export async function lineCandidates(db, companyId, lineId, { limit, search } = {}) {
   const line = await requireLine(db, companyId, lineId);
   if (!line.selection_definition_id) throw invalid('NOT_SELECTION', 'This line is not a selection.');
-  const found = await findCandidates(db, companyId, line.selection_definition_id);
+  const found = await findCandidates(db, companyId, line.selection_definition_id, { limit, search });
   return {
     lineId: line.id,
     selection: { id: line.selection_definition_id, code: line.selection_code, name: line.selection_name },
@@ -363,7 +363,7 @@ export async function resolveLine(db, c, lineId, { itemId } = {}) {
   if (!line.selection_definition_id) throw invalid('NOT_SELECTION', 'Only a selection line has an item to choose.');
   let childId = line.selection_definition_id;
   if (!blank(itemId)) {
-    const { candidates } = await findCandidates(db, c.companyId, line.selection_definition_id, { limit: 1000 });
+    const { candidates } = await findCandidates(db, c.companyId, line.selection_definition_id, { itemId: Number(itemId), limit: 1 });
     const pick = candidates.find((x) => x.id === Number(itemId));
     if (!pick) throw invalid('NOT_A_CANDIDATE', `That item does not satisfy ${line.selection_code ?? line.selection_name}.`);
     childId = pick.id;
@@ -489,8 +489,19 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
 }
 
 /** Where a record is used: the BOMs that hold it, and the selection lines it satisfies. */
-export async function whereUsed(db, companyId, masterId) {
+export async function whereUsed(db, companyId, masterId, { withTotal = false } = {}) {
   await requireMaster(db, companyId, masterId);
+  const WHERE_USED_FROM = `
+       FROM cf_bom_lines l
+       JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
+       JOIN cf_master_records p ON p.id = b.parent_id AND p.deleted_at IS NULL
+       LEFT JOIN cf_item_details pi ON pi.master_id = p.id AND pi.deleted_at IS NULL
+       LEFT JOIN cf_sales_order_lines ol ON ol.id = pi.owner_order_line_id
+       LEFT JOIN cf_sales_orders o ON o.id = ol.order_id
+      WHERE l.company_id = ? AND l.deleted_at IS NULL AND (l.child_id = ? OR l.selection_definition_id = ?)
+        AND (o.id IS NULL OR o.status <> 'revised')`;
+  // The list shows the first 300; the true count rides alongside when asked for (the bare array is the old shape).
+  const counted = withTotal ? db.query(`SELECT COUNT(*) AS n ${WHERE_USED_FROM}`, [companyId, masterId, masterId]) : null;
   const [rows] = await db.query(
     `SELECT l.id AS line_id, l.quantity, l.role, l.position, l.child_id, l.selection_definition_id,
             b.bom_type, b.status AS bom_status, p.id AS parent_id, p.code AS parent_code, p.name AS parent_name,
@@ -509,7 +520,7 @@ export async function whereUsed(db, companyId, masterId) {
       LIMIT 300`,
     [companyId, masterId, masterId],
   );
-  return rows.map((r) => ({
+  const list = rows.map((r) => ({
     lineId: r.line_id,
     quantity: Number(r.quantity),
     role: r.role,
@@ -520,5 +531,8 @@ export async function whereUsed(db, companyId, masterId) {
     parent: { id: r.parent_id, code: r.parent_code, name: r.parent_name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type },
     order: r.order_id ? { id: r.order_id, code: r.order_code } : null,
   }));
+  if (!withTotal) return list;
+  const total = Number((await counted)[0][0].n);
+  return { rows: list, total, truncated: total > list.length };
 }
 

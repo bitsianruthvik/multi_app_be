@@ -30,6 +30,7 @@
  * locked or released line, only not on a closed, lost, cancelled or revised order.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
+import { likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/listing.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES as LOCKED, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { bomOfParent } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
@@ -165,30 +166,72 @@ function assertOpen(order) {
  * earlier one was replaced and is kept for the record (init.sql §27).
  * `revisions=all` lists them too, and so does asking for status=revised.
  */
+/** The status chips of the Orders screen, answered by the server (lib/listing.js). */
+export const ORDER_CHIPS = ['open', 'overdue', 'inquiry', 'quoted', 'confirmed', 'draft', 'closed', 'lost', 'cancelled', 'all'];
+const OPEN_ORDER_STATUSES = ['draft', 'inquiry', 'quoted', 'confirmed'];
+const ORDER_SORT = {
+  code: 'o.code', project: 'COALESCE(o.title, p.name)', type: 'o.order_type', lines: 'line_count',
+  committed: 'o.committed_date', received: 'o.received_on', status: 'o.status', created: 'o.created_at',
+};
+// An earlier revision is filed under the status of the revision that replaced
+// it (the Orders screen's chips), else the status it had when revised.
+const FILED_STATUS = `CASE WHEN o.status = 'revised' THEN COALESCE(
+    (SELECT cur.status FROM cf_sales_orders cur WHERE cur.company_id = o.company_id AND cur.code = o.code
+        AND cur.status <> 'revised' AND cur.deleted_at IS NULL ORDER BY cur.revision DESC LIMIT 1),
+    o.status_before_revised, o.status) ELSE o.status END`;
+
 export async function listOrders(db, companyId, q = {}) {
-  const where = ['o.company_id = ?', 'o.deleted_at IS NULL'];
+  const base = ['o.company_id = ?', 'o.deleted_at IS NULL'];
   const params = [companyId];
-  if (q.revisions !== 'all' && q.status !== 'revised') where.push("o.status <> 'revised'");
-  if (!blank(q.status)) { where.push('o.status = ?'); params.push(q.status); }
-  if (!blank(q.orderType)) { where.push('o.order_type = ?'); params.push(q.orderType); }
-  if (!blank(q.customerId)) { where.push('o.customer_id = ?'); params.push(Number(q.customerId)); }
-  if (q.open === '1' || q.open === 1 || q.open === true) where.push("o.status NOT IN ('closed','lost','cancelled','revised')");
-  if (!blank(q.search)) {
-    const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
-    where.push('(o.code LIKE ? OR o.title LIKE ? OR o.customer_reference LIKE ? OR p.name LIKE ?)');
-    params.push(like, like, like, like);
+  if (!blank(q.status)) { base.push('o.status = ?'); params.push(q.status); }
+  if (!blank(q.orderType)) { base.push('o.order_type = ?'); params.push(q.orderType); }
+  if (!blank(q.customerId)) { base.push('o.customer_id = ?'); params.push(Number(q.customerId)); }
+  if (q.open === '1' || q.open === 1 || q.open === true) base.push("o.status NOT IN ('closed','lost','cancelled','revised')");
+  const like = likeOf(q.search);
+  if (like) {
+    base.push('(o.code LIKE ? OR o.title LIKE ? OR o.customer_reference LIKE ? OR p.name LIKE ? OR p.code LIKE ?)');
+    params.push(like, like, like, like, like);
   }
-  const limit = Math.min(Math.max(Number(q.limit) || 200, 1), 500);
-  const [rows] = await db.query(
-    `SELECT o.*, p.code AS customer_code, p.name AS customer_name,
-            (SELECT COUNT(*) FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL) AS line_count
-       FROM cf_sales_orders o
-       LEFT JOIN cf_parties p ON p.id = o.customer_id
-      WHERE ${where.join(' AND ')}
-      ORDER BY o.created_at DESC, o.id DESC
-      LIMIT ?`,
-    [...params, limit],
-  );
+  if (!blank(q.ids)) {
+    const ids = String(q.ids).split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0);
+    if (ids.length) { base.push('o.id IN (?)'); params.push(ids); } else base.push('1 = 0');
+  }
+  const where = [...base];
+  const rowParams = [...params];
+  if (q.revisions !== 'all' && q.status !== 'revised') where.push("o.status <> 'revised'");
+  // `chip` — the Orders screen's status chip, judged by the filed status.
+  const todayS = today();
+  if (!blank(q.chip) && q.chip !== 'all') {
+    if (!ORDER_CHIPS.includes(q.chip)) throw invalid('INVALID', `chip is one of ${ORDER_CHIPS.join(', ')}.`);
+    if (q.chip === 'open') where.push(`${FILED_STATUS} IN ('draft','inquiry','quoted','confirmed')`);
+    else if (q.chip === 'overdue') { where.push(`o.committed_date < ? AND ${FILED_STATUS} NOT IN ('closed','lost','cancelled','revised')`); rowParams.push(todayS); }
+    else { where.push(`${FILED_STATUS} = ?`); rowParams.push(q.chip); }
+  }
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : { limit: Math.min(Math.max(Number(q.limit) || 200, 1), 500), offset: 0 };
+  const order = orderBy(q, ORDER_SORT, 'o.created_at DESC, o.id DESC', q.sort === 'code' ? `o.revision ${String(q.dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC'}, o.id` : 'o.id');
+  const from = `FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id`;
+  const [[rows], counted] = await Promise.all([
+    db.query(
+      `SELECT o.*, p.code AS customer_code, p.name AS customer_name,
+              (SELECT COUNT(*) FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL) AS line_count
+         ${from}
+        WHERE ${where.join(' AND ')}
+        ORDER BY ${order}
+        LIMIT ? OFFSET ?`,
+      [...rowParams, page.limit, page.offset],
+    ),
+    // The total (rows' filters) and the chip counts (every filter but the chip,
+    // each order once at its latest revision) — two reads beside the rows.
+    paged ? Promise.all([
+      db.query(`SELECT COUNT(*) AS n ${from} WHERE ${where.join(' AND ')}`, rowParams),
+      db.query(
+        `SELECT o.status AS k, COUNT(*) AS n, SUM(o.committed_date < ? AND o.status NOT IN ('closed','lost','cancelled','revised')) AS overdue
+           ${from} WHERE ${base.join(' AND ')} AND o.status <> 'revised' GROUP BY o.status`,
+        [todayS, ...params],
+      ),
+    ]) : null,
+  ]);
   // Each order's total (init.sql §36): its priced lines, and the weights some of them need — two reads.
   const totals = new Map();
   if (rows.length) {
@@ -205,7 +248,18 @@ export async function listOrders(db, companyId, q = {}) {
     const { orderTax } = await salesOrderTax(db, companyId, rows, lines, amounts);
     for (const o of rows) totals.set(o.id, { ...(totals.get(o.id) ?? orderTotal([], new Map())), ...orderTax.get(o.id) });
   }
-  return rows.map((o) => ({ ...shapeOrder(o), total: totals.get(o.id) ?? orderTotal([], new Map()) }));
+  const shaped = rows.map((o) => ({ ...shapeOrder(o), total: totals.get(o.id) ?? orderTotal([], new Map()) }));
+  if (!paged) return shaped;
+  const [[[{ n: total }]], [byStatus]] = counted;
+  const chips = Object.fromEntries(ORDER_CHIPS.map((k) => [k, 0]));
+  for (const r of byStatus) {
+    const n = Number(r.n) || 0;
+    if (chips[r.k] !== undefined) chips[r.k] += n;
+    if (OPEN_ORDER_STATUSES.includes(r.k)) chips.open += n;
+    chips.overdue += Number(r.overdue) || 0;
+    chips.all += n;
+  }
+  return pageOf(shaped, total, page, { counts: { chips } });
 }
 
 function shapeOrder(o) {

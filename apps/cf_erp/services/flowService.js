@@ -176,9 +176,12 @@ export async function getFlow(db, companyId, id) {
     [companyId, id],
   );
   const [[{ line_count: lines }]] = await db.query('SELECT COUNT(*) AS line_count FROM cf_bom_lines WHERE company_id = ? AND operation_flow_id = ? AND deleted_at IS NULL', [companyId, id]);
+  // The list above stops at 100; this is every record that names the flow (same WHERE, still one cheap COUNT).
+  const [[{ record_count: recordCount }]] = await db.query('SELECT COUNT(*) AS record_count FROM cf_master_records WHERE company_id = ? AND default_flow_id = ? AND deleted_at IS NULL', [companyId, id]);
   out.uses = {
     records: records.map((r) => ({ id: r.id, code: r.code, name: r.name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type })),
     bomLines: Number(lines),
+    recordCount: Number(recordCount),
   };
   return out;
 }

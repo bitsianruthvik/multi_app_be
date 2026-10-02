@@ -61,7 +61,7 @@ router.get('/records/:id/bom/tree', guard(PERM.view), handle((req) => {
 }));
 // A catalog item's or definition's BOM, coded the way an order codes its rows — read only.
 router.get('/records/:id/bom/codes', guard(PERM.view), handle((req) => recordBomCodes(pool, ctx(req).companyId, id(req))));
-router.get('/records/:id/where-used', guard(PERM.view), handle((req) => whereUsed(pool, ctx(req).companyId, id(req))));
+router.get('/records/:id/where-used', guard(PERM.view), handle((req) => whereUsed(pool, ctx(req).companyId, id(req), { withTotal: req.query.withTotal === '1' })));
 
 router.post('/records/:id/bom/lines', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => addLine(db, c, id(req), req.body ?? {}))));
 router.post('/records/:id/bom/status', guard(PERM.view), handle((req) => write(req, byRecord(req), (db, c) => setBomStatus(db, c, id(req), req.body?.status))));
@@ -69,7 +69,7 @@ router.post('/records/:id/bom/revision', guard(PERM.view), handle((req) => write
 
 router.put('/bom-lines/:id', guard(PERM.view), handle((req) => write(req, byLine(req), (db, c) => updateLine(db, c, id(req), req.body ?? {}))));
 router.delete('/bom-lines/:id', guard(PERM.view), handle((req) => write(req, byLine(req), (db, c) => removeLine(db, c, id(req)))));
-router.get('/bom-lines/:id/candidates', guard(PERM.view), handle((req) => lineCandidates(pool, ctx(req).companyId, id(req))));
+router.get('/bom-lines/:id/candidates', guard(PERM.view), handle((req) => lineCandidates(pool, ctx(req).companyId, id(req), { limit: req.query.limit, search: req.query.search })));
 router.post('/bom-lines/:id/resolve', guard(PERM.view), handle((req) => write(req, byLine(req), (db, c) => resolveLine(db, c, id(req), { itemId: req.body?.itemId ?? null }))));
 
 // The service names the BOM type of every parent the batch touches; the grant

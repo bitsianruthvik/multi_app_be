@@ -32,6 +32,7 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { EXPORT_MAX, countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/listing.js';
 import { round2, measuresOf, amountOf, num, CURRENCY } from './priceService.js';
 import {
   companyTax, itemTaxOf, partyTaxOf, supplyOf, taxLines, amountInWords, stateName, validateGstin,
@@ -178,7 +179,7 @@ export async function createInvoice(db, c, orderId, input = {}) {
 export async function orderInvoices(db, companyId, orderId) {
   const order = await requireOrder(db, companyId, orderId);
   const [{ rows }, uninvoiced] = await Promise.all([
-    listInvoices(db, companyId, { orderId: order.id }),
+    listInvoices(db, companyId, { orderId: order.id }, { unbounded: true }), // every invoice of the order, no 500 cap, no counts
     uninvoicedShipments(db, companyId, order.id),
   ]);
   return { rows, uninvoiced: uninvoiced.map(({ itemId, orderLineId, ...s }) => ({ ...s, orderLineId })) };
@@ -440,22 +441,53 @@ export async function getInvoice(db, companyId, id) {
   });
 }
 
-/** GET /invoices?status=&orderId=&customerId=&q= → { rows } — newest first, at most 500. */
-export async function listInvoices(db, companyId, q = {}) {
-  const where = ['inv.company_id = ?', 'inv.deleted_at IS NULL'];
+const INVOICE_SORT = {
+  no: 'inv.invoice_no', date: 'inv.invoice_date', customer: 'p.name', order: 'o.code', status: 'inv.status',
+  irn: "(COALESCE(inv.irn, '') <> '')",
+  eway: '(SELECT COUNT(*) FROM cf_eway_bills e WHERE e.company_id = inv.company_id AND e.invoice_id = inv.id AND e.deleted_at IS NULL)',
+};
+const INVOICE_STATUSES = ['draft', 'issued', 'cancelled'];
+
+/**
+ * GET /invoices?status=&orderId=&customerId=&q= → { rows } — newest first, at most 500 (default 200).
+ * paged=1 / all=1 → { rows, total, counts: { status, all, issuedNoIrn } } — counts over every filter but the
+ * status chip, so each chip and stat figure is true of every invoice, not of the loaded page.
+ */
+export async function listInvoices(db, companyId, q = {}, { unbounded = false } = {}) {
+  const base = ['inv.company_id = ?', 'inv.deleted_at IS NULL'];
   const args = [companyId];
-  if (!blank(q.status)) { where.push('inv.status = ?'); args.push(String(q.status)); }
-  if (!blank(q.orderId)) { where.push('inv.order_id = ?'); args.push(Number(q.orderId)); }
-  if (!blank(q.customerId)) { where.push('inv.customer_id = ?'); args.push(Number(q.customerId)); }
-  if (!blank(q.q)) {
-    const like = `%${String(q.q).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
-    where.push('(inv.invoice_no LIKE ? OR o.code LIKE ? OR p.name LIKE ?)');
+  if (!blank(q.orderId)) { base.push('inv.order_id = ?'); args.push(Number(q.orderId)); }
+  if (!blank(q.customerId)) { base.push('inv.customer_id = ?'); args.push(Number(q.customerId)); }
+  const like = likeOf(q.q ?? q.search);
+  if (like) {
+    base.push('(inv.invoice_no LIKE ? OR o.code LIKE ? OR p.name LIKE ?)');
     args.push(like, like, like);
   }
-  const limit = Math.min(Math.max(Number(q.limit) || 200, 1), 500);
-  const [rows] = await db.query(`${INVOICE_SELECT} WHERE ${where.join(' AND ')} ORDER BY inv.id DESC LIMIT ?`, [...args, limit]);
+  const where = [...base];
+  const rowArgs = [...args];
+  if (!blank(q.status) && q.status !== 'all') { where.push('inv.status = ?'); rowArgs.push(String(q.status)); }
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : { limit: unbounded ? EXPORT_MAX : Math.min(Math.max(Number(q.limit) || 200, 1), 500), offset: 0 };
+  const from = 'FROM cf_invoices inv JOIN cf_sales_orders o ON o.id = inv.order_id LEFT JOIN cf_parties p ON p.id = inv.customer_id';
+  const [[rows], counted] = await Promise.all([
+    db.query(`${INVOICE_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${orderBy(q, INVOICE_SORT, 'inv.id DESC', 'inv.id')} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]),
+    paged ? Promise.all([
+      db.query(`SELECT COUNT(*) AS n ${from} WHERE ${where.join(' AND ')}`, rowArgs),
+      db.query(
+        `SELECT inv.status AS k, COUNT(*) AS n, SUM(inv.status = 'issued' AND COALESCE(inv.irn, '') = '') AS no_irn
+           ${from} WHERE ${base.join(' AND ')} GROUP BY inv.status`,
+        args,
+      ),
+    ]) : null,
+  ]);
   const views = await buildViews(db, companyId, rows);
-  return { rows: rows.map((inv) => summaryOf(inv, views.get(inv.id))) };
+  const shaped = rows.map((inv) => summaryOf(inv, views.get(inv.id)));
+  if (!paged) return { rows: shaped };
+  const [[[{ n: total }]], [byStatus]] = counted;
+  const status = countsBy(byStatus, INVOICE_STATUSES);
+  const all = Object.values(status).reduce((t, n) => t + n, 0);
+  const issuedNoIrn = byStatus.reduce((t, r) => t + Number(r.no_irn || 0), 0);
+  return pageOf(shaped, total, page, { counts: { status, all, issuedNoIrn } });
 }
 
 // --- editing a draft -------------------------------------------------------------

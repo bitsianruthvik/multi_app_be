@@ -47,6 +47,7 @@
  * price paid, else the item's list price turned into a price per unit.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
+import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/listing.js';
 import { generate } from '../modules/codegen/index.js';
 import { availability, plannedLines, plannedMaterialOfLines } from './releaseService.js';
 import { postMovement } from './stockService.js';
@@ -446,25 +447,60 @@ export async function getPurchaseOrder(db, companyId, id) {
   };
 }
 
-/** q: { status?: open (default) | all | <one status>, supplierId?, search? } */
+const PO_LINE_SUB = (expr, extra = '') => `(SELECT ${expr} FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL${extra})`;
+const PO_SUBS = {
+  lines: PO_LINE_SUB('COUNT(*)'),
+  ordered: PO_LINE_SUB('COALESCE(SUM(l.quantity), 0)'),
+  received: PO_LINE_SUB('COALESCE(SUM(l.qty_received), 0)'),
+  amount: PO_LINE_SUB('COALESCE(SUM(l.quantity * l.unit_price), 0)'),
+  unpriced: PO_LINE_SUB('COUNT(*)', ' AND l.unit_price IS NULL'),
+};
+/** Columns the Purchase orders screen sorts by on the server. */
+const PO_SORT = {
+  code: 'p.code', status: 'p.status', supplier: 's.name', expected: 'p.expected_date',
+  lines: PO_SUBS.lines, ordered: PO_SUBS.ordered, received: PO_SUBS.received,
+  outstanding: `GREATEST(${PO_SUBS.ordered} - ${PO_SUBS.received}, 0)`, amount: PO_SUBS.amount,
+};
+
+/**
+ * q: { status?: open (default) | all | <one status>, supplierId?, search? }
+ * With paged=1 / all=1 answers { rows, total, counts, ... } — counts.status is
+ * per status over the search + supplier filters (every chip), counts.open / all
+ * likewise, and counts.sum the figures of the orders that match everything
+ * (amount, outstanding, unpriced lines). Without them: the bare array, as ever.
+ */
 export async function listPurchaseOrders(db, companyId, q = {}) {
   const status = blank(q.status) ? 'open' : String(q.status);
-  const where = ['p.company_id = ?', 'p.deleted_at IS NULL'];
+  const base = ['p.company_id = ?', 'p.deleted_at IS NULL'];
   const args = [companyId];
-  if (status === 'open') { where.push('p.status IN (?)'); args.push(OPEN_STATUSES); }
-  else if (status !== 'all') { where.push('p.status = ?'); args.push(status); }
-  if (!blank(q.supplierId)) { where.push('p.supplier_id = ?'); args.push(Number(q.supplierId)); }
-  const [rows] = await db.query(
-    `SELECT p.*, s.name AS supplier_name, s.code AS supplier_code,
-            (SELECT COUNT(*) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS line_count,
-            (SELECT COALESCE(SUM(l.quantity), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS ordered,
-            (SELECT COALESCE(SUM(l.qty_received), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS received,
-            (SELECT COALESCE(SUM(l.quantity * l.unit_price), 0) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL) AS amount,
-            (SELECT COUNT(*) FROM cf_purchase_order_lines l WHERE l.purchase_order_id = p.id AND l.deleted_at IS NULL AND l.unit_price IS NULL) AS unpriced
-       FROM cf_purchase_orders p LEFT JOIN cf_parties s ON s.id = p.supplier_id
-      WHERE ${where.join(' AND ')} ORDER BY p.id DESC`,
-    args,
-  );
+  if (!blank(q.supplierId)) { base.push('p.supplier_id = ?'); args.push(Number(q.supplierId)); }
+  const like = likeOf(q.search);
+  if (like) { base.push('(p.code LIKE ? OR s.name LIKE ? OR s.code LIKE ?)'); args.push(like, like, like); }
+  const where = [...base];
+  const rowArgs = [...args];
+  if (status === 'open') { where.push('p.status IN (?)'); rowArgs.push(OPEN_STATUSES); }
+  else if (status !== 'all') { where.push('p.status = ?'); rowArgs.push(status); }
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : null;
+  const from = 'FROM cf_purchase_orders p LEFT JOIN cf_parties s ON s.id = p.supplier_id';
+  const rowSql = `SELECT p.*, s.name AS supplier_name, s.code AS supplier_code,
+            ${PO_SUBS.lines} AS line_count, ${PO_SUBS.ordered} AS ordered, ${PO_SUBS.received} AS received,
+            ${PO_SUBS.amount} AS amount, ${PO_SUBS.unpriced} AS unpriced
+       ${from}
+      WHERE ${where.join(' AND ')} ORDER BY ${orderBy(q, PO_SORT, 'p.id DESC', 'p.id')}`;
+  const [[rows], counted] = await Promise.all([
+    paged ? db.query(`${rowSql} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]) : db.query(rowSql, rowArgs),
+    paged ? Promise.all([
+      db.query(`SELECT p.status AS k, COUNT(*) AS n ${from} WHERE ${base.join(' AND ')} GROUP BY p.status`, args),
+      db.query(
+        `SELECT COUNT(*) AS n, COALESCE(SUM(t.amount), 0) AS amount, COALESCE(SUM(GREATEST(t.ordered - t.received, 0)), 0) AS outstanding,
+                COALESCE(SUM(t.unpriced), 0) AS unpriced
+           FROM (SELECT p.id, ${PO_SUBS.amount} AS amount, ${PO_SUBS.ordered} AS ordered, ${PO_SUBS.received} AS received, ${PO_SUBS.unpriced} AS unpriced
+                   ${from} WHERE ${where.join(' AND ')}) t`,
+        rowArgs,
+      ),
+    ]) : null,
+  ]);
   // Input GST per order (init.sql §37): the lines of every listed order in one read, then three.
   const poTaxes = new Map();
   if (rows.length) {
@@ -476,7 +512,7 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     const { poTax } = await purchaseOrderTax(db, companyId, rows, pl.map((l) => ({ ...l, amount: l.amount == null ? null : Number(l.amount) })));
     for (const [k, v] of poTax) poTaxes.set(k, v);
   }
-  let out = rows.map((p) => ({
+  const out = rows.map((p) => ({
     id: p.id,
     code: p.code,
     status: p.status,
@@ -495,11 +531,17 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     },
     reverseCharge: !!Number(p.reverse_charge ?? 0),
   }));
-  if (!blank(q.search)) {
-    const term = String(q.search).trim().toLowerCase();
-    out = out.filter((p) => [p.code, p.supplier?.name, p.supplier?.code].some((t) => t && String(t).toLowerCase().includes(term)));
-  }
-  return out;
+  if (!paged) return out;
+  const [[byStatus], [[sum]]] = counted;
+  const statusCounts = countsBy(byStatus, ['draft', 'ordered', 'partially_received', 'received', 'cancelled']);
+  const all = Object.values(statusCounts).reduce((t, n) => t + n, 0);
+  const open = OPEN_STATUSES.reduce((t, k) => t + (statusCounts[k] ?? 0), 0);
+  return pageOf(out, sum.n, page, {
+    counts: {
+      status: statusCounts, open, all,
+      sum: { amount: round2(sum.amount), outstanding: round6(sum.outstanding), unpriced: Number(sum.unpriced) },
+    },
+  });
 }
 
 // --- raising and editing ---------------------------------------------------

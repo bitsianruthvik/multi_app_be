@@ -32,6 +32,7 @@
  */
 import { CfError, invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/listing.js';
 import { generate } from '../modules/codegen/index.js';
 import { buyList, buyEstimates, insertOrder, requireSupplier } from './purchaseService.js';
 import { CURRENCY, readPrice, round2, round4, num, lastPricesPaid } from './priceService.js';
@@ -235,35 +236,61 @@ export async function getRequest(db, c, id) {
   };
 }
 
-/** GET /purchase-requests?status=&q= — ONE read. status: open (draft/submitted/approved) | all (default) | <one status>. */
+const REQUEST_STATUSES = ['draft', 'submitted', 'approved', 'rejected', 'closed', 'cancelled'];
+const REQUEST_OPEN = ['draft', 'submitted', 'approved'];
+/** Columns the Purchase requests screen sorts by on the server. */
+const REQUEST_SORT = {
+  code: 'p.code', status: 'p.status', lines: 'COUNT(l.id)', estTotal: 'COALESCE(SUM(l.quantity * l.est_unit_price), 0)',
+  neededBy: 'p.needed_by', by: 'ru.name',
+};
+
+/**
+ * GET /purchase-requests?status=&q= — status: open (draft/submitted/approved) | all (default) | <one status>.
+ * paged=1 / all=1 add total + counts { status, open, all, estimated, lines, unpricedLines } (the last three over
+ * the requests that match everything); without them the answer is { rows } as before.
+ */
 export async function listRequests(db, companyId, q = {}) {
-  const where = ['p.company_id = ?', 'p.deleted_at IS NULL'];
+  const base = ['p.company_id = ?', 'p.deleted_at IS NULL'];
   const args = [companyId];
   const status = blank(q.status) ? 'all' : String(q.status);
-  if (status === 'open') { where.push("p.status IN ('draft','submitted','approved')"); }
+  const like = likeOf(q.q ?? q.search);
+  if (like) { base.push('(p.code LIKE ? OR p.notes LIKE ? OR ru.name LIKE ?)'); args.push(like, like, like); }
+  const where = [...base];
+  if (status === 'open') where.push(`p.status IN (${REQUEST_OPEN.map((x) => `'${x}'`).join(',')})`);
   else if (status !== 'all') { where.push('p.status = ?'); args.push(status); }
-  if (!blank(q.q ?? q.search)) {
-    const term = `%${String(q.q ?? q.search).trim()}%`;
-    where.push('(p.code LIKE ? OR p.notes LIKE ? OR ru.name LIKE ?)');
-    args.push(term, term, term);
-  }
-  const [rows] = await db.query(
-    `SELECT p.id, p.code, p.status, p.needed_by, p.requested_by, ru.name AS requester_name, p.submitted_at,
+  // the chip's status is the last arg only when it is a single status
+  const rowArgs = args;
+  const baseArgs = args.slice(0, args.length - (status !== 'all' && status !== 'open' ? 1 : 0));
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : null;
+  const users = 'LEFT JOIN users ru ON ru.id = p.requested_by';
+  const rowSql = `SELECT p.id, p.code, p.status, p.needed_by, p.requested_by, ru.name AS requester_name, p.submitted_at,
             p.decided_by, du.name AS decider_name, p.decided_at, p.created_at,
             COUNT(l.id) AS line_count,
             COALESCE(SUM(l.quantity * l.est_unit_price), 0) AS est_total,
             SUM(CASE WHEN l.id IS NOT NULL AND l.est_unit_price IS NULL THEN 1 ELSE 0 END) AS unpriced
        FROM cf_purchase_requests p
-       LEFT JOIN users ru ON ru.id = p.requested_by
+       ${users}
        LEFT JOIN users du ON du.id = p.decided_by
        LEFT JOIN cf_purchase_request_lines l ON l.request_id = p.id AND l.deleted_at IS NULL
       WHERE ${where.join(' AND ')}
       GROUP BY p.id, p.code, p.status, p.needed_by, p.requested_by, ru.name, p.submitted_at, p.decided_by, du.name, p.decided_at, p.created_at
-      ORDER BY p.id DESC`,
-    args,
-  );
-  return {
-    rows: rows.map((p) => ({
+      ORDER BY ${orderBy(q, REQUEST_SORT, 'p.id DESC', 'p.id')}`;
+  const [[rows], counted] = await Promise.all([
+    paged ? db.query(`${rowSql} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]) : db.query(rowSql, rowArgs),
+    paged ? Promise.all([
+      db.query(`SELECT p.status AS k, COUNT(*) AS n FROM cf_purchase_requests p ${users} WHERE ${base.join(' AND ')} GROUP BY p.status`, baseArgs),
+      db.query(
+        `SELECT COUNT(DISTINCT p.id) AS n, COUNT(l.id) AS line_total, COALESCE(SUM(l.quantity * l.est_unit_price), 0) AS estimated,
+                COALESCE(SUM(CASE WHEN l.id IS NOT NULL AND l.est_unit_price IS NULL THEN 1 ELSE 0 END), 0) AS unpriced
+           FROM cf_purchase_requests p ${users}
+           LEFT JOIN cf_purchase_request_lines l ON l.request_id = p.id AND l.deleted_at IS NULL
+          WHERE ${where.join(' AND ')}`,
+        rowArgs,
+      ),
+    ]) : null,
+  ]);
+  const shaped = rows.map((p) => ({
       id: p.id,
       code: p.code,
       status: p.status,
@@ -277,8 +304,15 @@ export async function listRequests(db, companyId, q = {}) {
       decidedBy: userOf(p.decided_by, p.decider_name),
       decidedAt: p.decided_at ?? null,
       createdAt: p.created_at,
-    })),
-  };
+  }));
+  if (!paged) return { rows: shaped };
+  const [[byStatus], [[sum]]] = counted;
+  const statusCounts = countsBy(byStatus, REQUEST_STATUSES);
+  const all = Object.values(statusCounts).reduce((t, n) => t + n, 0);
+  const open = REQUEST_OPEN.reduce((t, k) => t + (statusCounts[k] ?? 0), 0);
+  return pageOf(shaped, sum.n, page, {
+    counts: { status: statusCounts, open, all, estimated: round2(sum.estimated), lines: Number(sum.line_total), unpricedLines: Number(sum.unpriced) },
+  });
 }
 
 /** Validates request lines in bulk; est price defaults to last paid -> list price. */
@@ -782,20 +816,29 @@ function basisQty(ql, asked) {
   return off == null ? a : Math.min(off, a);
 }
 
-/** GET /rfqs?status=&q= — ONE read. status: open (draft/sent) | all (default) | <one status>. */
+/** Columns the RFQs screen sorts by on the server. */
+const RFQ_SORT = {
+  code: 'r.code', status: 'r.status', due: 'r.quotes_due',
+  lines: 'COUNT(DISTINCT rl.id)', suppliers: 'COUNT(DISTINCT s.id)', quotes: 'COUNT(DISTINCT qt.id)',
+};
+
+/**
+ * GET /rfqs?status=&q= — status: open (draft/sent) | all (default) | <one status>.
+ * paged=1 / all=1 add total + counts { status, open, all }; otherwise { rows } as before.
+ */
 export async function listRfqs(db, companyId, q = {}) {
-  const where = ['r.company_id = ?', 'r.deleted_at IS NULL'];
+  const base = ['r.company_id = ?', 'r.deleted_at IS NULL'];
   const args = [companyId];
   const status = blank(q.status) ? 'all' : String(q.status);
+  const like = likeOf(q.q ?? q.search);
+  if (like) { base.push('(r.code LIKE ? OR r.notes LIKE ?)'); args.push(like, like); }
+  const where = [...base];
+  const rowArgs = [...args];
   if (status === 'open') where.push("r.status IN ('draft','sent')");
-  else if (status !== 'all') { where.push('r.status = ?'); args.push(status); }
-  if (!blank(q.q ?? q.search)) {
-    const term = `%${String(q.q ?? q.search).trim()}%`;
-    where.push('(r.code LIKE ? OR r.notes LIKE ?)');
-    args.push(term, term);
-  }
-  const [rows] = await db.query(
-    `SELECT r.id, r.code, r.status, r.quotes_due, r.sent_at, r.created_at,
+  else if (status !== 'all') { where.push('r.status = ?'); rowArgs.push(status); }
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : null;
+  const rowSql = `SELECT r.id, r.code, r.status, r.quotes_due, r.sent_at, r.created_at,
             COUNT(DISTINCT rl.id) AS line_count,
             COUNT(DISTINCT s.id) AS supplier_count,
             COUNT(DISTINCT qt.id) AS quote_count,
@@ -806,23 +849,31 @@ export async function listRfqs(db, companyId, q = {}) {
        LEFT JOIN cf_quotes qt ON qt.rfq_id = r.id AND qt.deleted_at IS NULL
       WHERE ${where.join(' AND ')}
       GROUP BY r.id, r.code, r.status, r.quotes_due, r.sent_at, r.created_at
-      ORDER BY r.id DESC`,
-    args,
-  );
-  return {
-    rows: rows.map((r) => ({
-      id: r.id,
-      code: r.code,
-      status: r.status,
-      quotesDue: r.quotes_due ?? null,
-      lines: Number(r.line_count),
-      suppliers: Number(r.supplier_count),
-      quotes: Number(r.quote_count),
-      linesOrdered: Number(r.ordered_count),
-      sentAt: r.sent_at ?? null,
-      createdAt: r.created_at,
-    })),
-  };
+      ORDER BY ${orderBy(q, RFQ_SORT, 'r.id DESC', 'r.id')}`;
+  const [[rows], counted] = await Promise.all([
+    paged ? db.query(`${rowSql} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]) : db.query(rowSql, rowArgs),
+    paged ? Promise.all([
+      db.query(`SELECT r.status AS k, COUNT(*) AS n FROM cf_rfqs r WHERE ${base.join(' AND ')} GROUP BY r.status`, args),
+      db.query(`SELECT COUNT(*) AS n FROM cf_rfqs r WHERE ${where.join(' AND ')}`, rowArgs),
+    ]) : null,
+  ]);
+  const shaped = rows.map((r) => ({
+    id: r.id,
+    code: r.code,
+    status: r.status,
+    quotesDue: r.quotes_due ?? null,
+    lines: Number(r.line_count),
+    suppliers: Number(r.supplier_count),
+    quotes: Number(r.quote_count),
+    linesOrdered: Number(r.ordered_count),
+    sentAt: r.sent_at ?? null,
+    createdAt: r.created_at,
+  }));
+  if (!paged) return { rows: shaped };
+  const [[byStatus], [[{ n: total }]]] = counted;
+  const statusCounts = countsBy(byStatus, RFQ_STATUSES);
+  const all = Object.values(statusCounts).reduce((t, n) => t + n, 0);
+  return pageOf(shaped, total, page, { counts: { status: statusCounts, open: statusCounts.draft + statusCounts.sent, all } });
 }
 
 /** PUT /rfqs/:id { quotesDue?, terms?, notes? } */

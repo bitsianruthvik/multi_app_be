@@ -20,6 +20,7 @@ import { deleteAllForSubject as deleteValues, rematerialize } from './valueServi
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { findConditionsReferencing } from '../modules/codegen/index.js';
 import { clearProductionMachines } from './operationService.js';
+import { CREATED_IN, assertBranchEmpty, subtreeHoldings, holdsAnything, holdingsText } from './classificationScreenService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const SCOPES = ['item', 'definition', 'both', 'machine'];
@@ -77,9 +78,21 @@ function validateFields(input, problems, { partial = false } = {}) {
   return out;
 }
 
+/**
+ * Which screen's pop-up made a node (init.sql §41). Stamped once, at creation,
+ * never by hand: it only decides where an EMPTY node shows. Absent means NULL,
+ * which shows on Items and Definitions.
+ */
+function readCreatedIn(value, problems) {
+  if (value === undefined || value === null || value === '') return null;
+  if (!CREATED_IN.includes(value)) { problems.push(`createdIn is ${CREATED_IN.join(', ')}.`); return null; }
+  return value;
+}
+
 export async function createNode(db, c, input = {}) {
   const problems = [];
   const fields = validateFields(input, problems);
+  const createdIn = readCreatedIn(input.createdIn, problems);
   let depth = 0;
   let parentId = null;
   if (input.parentId != null) {
@@ -96,10 +109,10 @@ export async function createNode(db, c, input = {}) {
   }
   assertNoProblems(problems);
   const [r] = await db.query(
-    `INSERT INTO cf_classification_nodes (company_id, parent_id, depth, scope, code, name, description, sort_order, status, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_classification_nodes (company_id, parent_id, depth, scope, code, name, description, sort_order, status, created_by, created_in)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, parentId, depth, fields.scope ?? 'both', fields.code, fields.name, fields.description ?? null,
-      fields.sort_order ?? 0, fields.status ?? 'active', c.userId],
+      fields.sort_order ?? 0, fields.status ?? 'active', c.userId, createdIn],
   );
   invalidateNodeCache(db);
   clearProductionMachines(c.companyId);
@@ -125,6 +138,11 @@ export async function updateNode(db, c, id, input = {}) {
     }
   }
   assertNoProblems(problems);
+  // A branch moves only while it is empty: a move rewrites which rules and
+  // defaults reach everything below, and the screens' trees are derived from
+  // what a branch holds — so records move by being re-filed, never silently
+  // with their folder (agreed with the user 2026-10-02).
+  if (movedTo) await assertBranchEmpty(db, c.companyId, node, 'a branch moves only while it is empty; re-file or retire what is in it first');
   const sets = Object.keys(fields).map((k) => `${k} = ?`);
   const params = Object.values(fields);
   if (movedTo) { sets.push('parent_id = ?'); params.push(movedTo); }
@@ -163,12 +181,12 @@ export async function deleteNode(db, c, id) {
   const node = await requireNode(db, c.companyId, id);
   const reasons = [];
   const count = async (sql, params) => Number((await db.query(sql, params))[0][0].n);
+  // What the whole branch holds comes first, in the one sentence every screen
+  // shows: "Plates holds 3 items · 1 definition · 0 machines".
+  const holdings = await subtreeHoldings(db, c.companyId, id);
+  if (holdsAnything(holdings)) reasons.push(holdingsText(holdings));
   const children = await count('SELECT COUNT(*) AS n FROM cf_classification_nodes WHERE company_id = ? AND parent_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   if (children) reasons.push(`${children} ${childLevelWord(node, children)} below it`);
-  const records = await count('SELECT COUNT(*) AS n FROM cf_master_records WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (records) reasons.push(`${records} item(s) or definition(s) classified here`);
-  const machines = await count('SELECT COUNT(*) AS n FROM cf_machines WHERE company_id = ? AND classification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (machines) reasons.push(`${machines} machine(s) of this type`);
   const timings = await count(
     `SELECT COUNT(*) AS n FROM cf_operation_machine_rules WHERE company_id = ? AND subject_type = 'classification' AND subject_id = ? AND deleted_at IS NULL`,
     [c.companyId, id],
@@ -179,7 +197,11 @@ export async function deleteNode(db, c, id) {
   const rules = await findConditionsReferencing(db, c.companyId, 'classification', id);
   if (rules.length) reasons.push(`coding rule(s) ${rules.map((r) => r.code).join(', ')}`);
   if (reasons.length) {
-    throw conflict('IN_USE', `${node.name} still has ${reasons.join('; ')}.`, { problems: reasons });
+    const [first, ...rest] = reasons;
+    const sentence = holdsAnything(holdings)
+      ? `${node.name} ${first}${rest.length ? `; it also has ${rest.join('; ')}` : ''}.`
+      : `${node.name} still has ${reasons.join('; ')}.`;
+    throw conflict('IN_USE', sentence, { problems: reasons, holdings });
   }
   await deleteValues(db, c, 'classification', id);
   await deleteRules(db, c, 'classification', id);
@@ -195,6 +217,7 @@ export async function getNode(db, companyId, id) {
   return {
     id: node.id, parentId: node.parent_id, depth: node.depth, level: levelName(node.depth), scope: node.scope,
     code: node.code, name: node.name, description: node.description, sortOrder: node.sort_order, status: node.status,
+    createdIn: node.created_in ?? null,
     isLeaf: node.depth === LEAF_DEPTH,
     path: path.map((n) => ({ id: n.id, code: n.code, name: n.name, level: levelName(n.depth) })),
   };
@@ -340,18 +363,19 @@ export async function createMachineType(db, c, input = {}) {
 
   const created = { family: false, subfamily: false };
   if (!family) {
-    const made = await createNode(db, c, { code: famSpec.code, name: famSpec.name, scope: 'machine' });
+    const made = await createNode(db, c, { code: famSpec.code, name: famSpec.name, scope: 'machine', createdIn: 'machines' });
     family = { id: made.id, name: made.name };
     created.family = true;
   }
   if (!subfamily) {
-    const made = await createNode(db, c, { parentId: family.id, code: subSpec.code, name: subSpec.name, scope: 'machine' });
+    const made = await createNode(db, c, { parentId: family.id, code: subSpec.code, name: subSpec.name, scope: 'machine', createdIn: 'machines' });
     subfamily = { id: made.id, name: made.name };
     created.subfamily = true;
   }
   const type = await createNode(db, c, {
     parentId: subfamily.id,
     scope: 'machine',
+    createdIn: 'machines',
     code: fields.code,
     name: fields.name,
     description: input.description,
@@ -414,6 +438,9 @@ export async function createCatalogNode(db, c, input = {}) {
     description: input.description,
     scope: input.scope,
     sortOrder: input.sortOrder,
+    // The item and definition forms say which screen they are on; anything
+    // else (the command palette) is 'setup' and shows on both.
+    createdIn: ['items', 'definitions'].includes(input.createdIn) ? input.createdIn : 'setup',
   });
-  return { id: node.id, code: node.code, name: node.name, depth: node.depth, scope: node.scope };
+  return { id: node.id, code: node.code, name: node.name, depth: node.depth, scope: node.scope, createdIn: node.createdIn };
 }

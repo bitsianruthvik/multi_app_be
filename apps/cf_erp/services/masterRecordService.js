@@ -568,20 +568,30 @@ export async function getRecordSpecs(db, companyId, id) {
   return publicResolution(await resolve(db, companyId, { master: m }));
 }
 
+const RECORD_KINDS = ['catalog', 'temporary', 'template', 'selection'];
+
 export async function listRecords(db, companyId, q = {}) {
-  const where = ['m.company_id = ?', 'm.deleted_at IS NULL'];
-  const params = [companyId];
-  if (q.recordKind) { where.push('m.record_kind = ?'); params.push(q.recordKind); }
-  if (q.kind) { where.push('(i.item_type = ? OR d.definition_type = ?)'); params.push(q.kind, q.kind); }
+  // Two WHEREs: `base` is every filter but the kind, `where` adds the kind.
+  // The rows read `where`; the per-kind counts read `base` grouped by kind, so
+  // the Items / Definitions chips count every kind whatever the 500-row page
+  // holds — in the same round trip the total always took (2026-10-02: prod had
+  // 199 temporary items the Temporary chip never showed).
+  const base = ['m.company_id = ?', 'm.deleted_at IS NULL'];
+  const baseParams = [companyId];
+  const kindWhere = [];
+  const kindParams = [];
+  if (q.recordKind) { base.push('m.record_kind = ?'); baseParams.push(q.recordKind); }
+  if (q.kind) { kindWhere.push('(i.item_type = ? OR d.definition_type = ?)'); kindParams.push(q.kind, q.kind); }
   // kinds=catalog,template,selection — what a BOM line or order line picker may offer
-  const kinds = blank(q.kinds) ? [] : String(q.kinds).split(',').map((k) => k.trim()).filter((k) => ['catalog', 'temporary', 'template', 'selection'].includes(k));
-  if (kinds.length) { where.push('(i.item_type IN (?) OR d.definition_type IN (?))'); params.push(kinds, kinds); }
+  const kinds = blank(q.kinds) ? [] : String(q.kinds).split(',').map((k) => k.trim()).filter((k) => RECORD_KINDS.includes(k));
+  if (kinds.length) { kindWhere.push('(i.item_type IN (?) OR d.definition_type IN (?))'); kindParams.push(kinds, kinds); }
   // An order's rows (temporary items, cut plates too) live on the order: a list
   // shows them only when asked for them by name or by order (user, 2026-09-26 —
   // a row is a design, not a catalog item).
-  if (q.kind !== 'temporary' && !kinds.includes('temporary') && blank(q.orderId)) {
-    where.push("(i.item_type IS NULL OR i.item_type <> 'temporary')");
-  }
+  const hideTemporary = q.kind !== 'temporary' && !kinds.includes('temporary') && blank(q.orderId);
+  if (hideTemporary) kindWhere.push("(i.item_type IS NULL OR i.item_type <> 'temporary')");
+  const where = base;
+  const params = baseParams;
   if (q.status) { where.push('m.status = ?'); params.push(q.status); }
   if (q.usable === '1' || q.usable === 1 || q.usable === true) where.push("m.status <> 'obsolete'");
   if (!blank(q.orderId)) {
@@ -599,6 +609,14 @@ export async function listRecords(db, companyId, q = {}) {
   }
   const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 500);
   const offset = Math.max(Number(q.offset) || 0, 0);
+  const joins = `FROM cf_master_records m
+    JOIN cf_classification_nodes c ON c.id = m.classification_id
+    LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+    LEFT JOIN cf_definition_details d ON d.master_id = m.id AND d.deleted_at IS NULL`;
+  const baseFrom = `${joins} WHERE ${base.join(' AND ')}`;
+  const countParams = [...params];
+  where.push(...kindWhere);
+  params.push(...kindParams);
   const from = `FROM cf_master_records m
     JOIN cf_classification_nodes c ON c.id = m.classification_id
     LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
@@ -625,9 +643,24 @@ export async function listRecords(db, companyId, q = {}) {
       LIMIT ? OFFSET ?`,
     [...params, limit, offset],
   );
-  const [[{ total }]] = await db.query(`SELECT COUNT(*) AS total ${from}`, params);
+  const [byKind] = await db.query(
+    `SELECT COALESCE(i.item_type, d.definition_type) AS kind, COUNT(*) AS n ${baseFrom} GROUP BY COALESCE(i.item_type, d.definition_type)`,
+    countParams,
+  );
+  const kindCounts = { catalog: 0, temporary: 0, template: 0, selection: 0 };
+  let total = 0;
+  for (const r of byKind) {
+    const n = Number(r.n);
+    if (r.kind && kindCounts[r.kind] !== undefined) kindCounts[r.kind] = n;
+    // The total is what the kind filter lets through — the same rule as kindWhere.
+    const passes = q.kind ? r.kind === q.kind
+      : kinds.length ? kinds.includes(r.kind)
+      : !(hideTemporary && r.kind === 'temporary');
+    if (passes) total += n;
+  }
   return {
-    total: Number(total),
+    total,
+    kindCounts,
     rows: rows.map((r) => ({
       ...shapeRecord(r),
       classificationCode: r.classification_code,

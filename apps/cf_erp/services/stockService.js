@@ -15,6 +15,7 @@ import { loadMaster, LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionS
 import { requireArea, shapeArea } from './stockingAreaService.js';
 import { requireBatch, checkBatchValues, createBatch, ownerOf } from './batchService.js';
 import { generate } from '../modules/codegen/index.js';
+import { wantsPage, pageArgs, orderBy, pageOf, countsBy } from '../lib/listing.js';
 
 export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
 const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
@@ -783,10 +784,13 @@ function shapeMovement(m) {
   };
 }
 
-export async function listMovements(db, companyId, q = {}) {
+const MOVEMENT_SORT = { code: 'm.code', type: 'm.movement_type', date: 'm.movement_date', reference: 'm.reference' };
+
+/** Movement filters; `skip` leaves one facet out so its chip counts the others. */
+function movementWhere(companyId, q, skip = []) {
   const where = ['m.company_id = ?', 'm.deleted_at IS NULL'];
   const params = [companyId];
-  if (!blank(q.type)) { where.push('m.movement_type = ?'); params.push(q.type); }
+  if (!skip.includes('type') && !blank(q.type)) { where.push('m.movement_type = ?'); params.push(q.type); }
   if (!blank(q.from)) { where.push('m.movement_date >= ?'); params.push(q.from); }
   if (!blank(q.to)) { where.push('m.movement_date <= ?'); params.push(q.to); }
   if (!blank(q.orderId)) { where.push('m.order_id = ?'); params.push(Number(q.orderId)); }
@@ -801,9 +805,40 @@ export async function listMovements(db, companyId, q = {}) {
     const s = like(q.search);
     params.push(s, s, s, s);
   }
-  const limit = Math.min(Number(q.limit) || 200, 500);
-  const [rows] = await db.query(`${MOVEMENT_SELECT} WHERE ${where.join(' AND ')} ORDER BY m.movement_date DESC, m.id DESC LIMIT ${limit}`, params);
-  return rows.map(shapeMovement);
+  return { where: where.join(' AND '), params };
+}
+const MOVEMENT_FROM = 'FROM cf_stock_movements m LEFT JOIN cf_parties p ON p.id = m.party_id LEFT JOIN cf_sales_orders o ON o.id = m.order_id';
+
+/**
+ * Movements, newest first. Without paged=1 / all=1: the old bare array (default
+ * 200, at most 500). With paged=1: { rows, total, counts: { types, month,
+ * receipts, reversed } } — the type chips count every filter but the type; the
+ * stats count every filter.
+ */
+export async function listMovements(db, companyId, q = {}) {
+  if (!wantsPage(q)) {
+    const { where, params } = movementWhere(companyId, q);
+    const limit = Math.min(Number(q.limit) || 200, 500);
+    const [rows] = await db.query(`${MOVEMENT_SELECT} WHERE ${where} ORDER BY m.movement_date DESC, m.id DESC LIMIT ${limit}`, params);
+    return rows.map(shapeMovement);
+  }
+  const page = pageArgs(q, { def: 100 });
+  const all = movementWhere(companyId, q);
+  const noType = movementWhere(companyId, q, ['type']);
+  const month = /^\d{4}-\d{2}$/.test(String(q.month ?? '')) ? String(q.month) : todayText().slice(0, 7);
+  const order = orderBy(q, MOVEMENT_SORT, 'm.movement_date DESC, m.id DESC', 'm.id DESC');
+  const [[rows], [[stat]], [typeRows]] = await Promise.all([
+    db.query(`${MOVEMENT_SELECT} WHERE ${all.where} ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}`, all.params),
+    db.query(
+      `SELECT COUNT(*) AS total, COALESCE(SUM(DATE_FORMAT(m.movement_date, '%Y-%m') = ?), 0) AS month,
+              COALESCE(SUM(m.movement_type = 'receipt' AND m.reversal_of_id IS NULL), 0) AS receipts,
+              COALESCE(SUM(m.reversed_by_id IS NOT NULL), 0) AS reversed
+         ${MOVEMENT_FROM} WHERE ${all.where}`, [month, ...all.params]),
+    db.query(`SELECT m.movement_type AS k, COUNT(*) AS n ${MOVEMENT_FROM} WHERE ${noType.where} GROUP BY m.movement_type`, noType.params),
+  ]);
+  const types = countsBy(typeRows, MOVEMENT_TYPES);
+  const counts = { types: { ...types, all: Object.values(types).reduce((t, n) => t + n, 0) }, month: Number(stat.month), receipts: Number(stat.receipts), reversed: Number(stat.reversed) };
+  return pageOf(rows.map(shapeMovement), stat.total, page, { counts });
 }
 
 /** A movement with its lines: each line's item, batch, the area it left and the area it reached. */
@@ -862,6 +897,7 @@ const STOCK_SELECT = `SELECT k.*, a.code AS area_code, a.name AS area_name, a.pu
   LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
   LEFT JOIN cf_parties op ON op.id = b.owner_party_id
   LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id`;
+const STOCK_FROM = STOCK_SELECT.slice(STOCK_SELECT.indexOf('FROM cf_stock_balances k'));
 
 function shapeStock(k) {
   return {
@@ -914,7 +950,13 @@ export async function valueRows(db, companyId, rows) {
 }
 
 /** What sits where. q: { areaId?, itemId?, batchId?, purpose?, owner? (ours | customer | party id), search?, includeZero? } */
-export async function listStock(db, companyId, q = {}, { limit = 2000 } = {}) {
+/** What a balance row counts as, in SQL — the same rule as categoryOf. */
+const CATEGORY_SQL = `(CASE WHEN b.status = 'rejected' THEN 'rejected' WHEN b.status = 'on_hold' OR a.purpose = 'quarantine' THEN 'held'
+  WHEN a.purpose = 'wip' THEN 'in_process' WHEN a.purpose = 'dispatch' THEN 'dispatch' ELSE 'available' END)`;
+const STOCK_SORT = { item: 'r.code', area: 'a.code', batch: 'b.code', owner: 'op.name', qty: 'k.quantity', category: CATEGORY_SQL, updated: 'k.updated_at' };
+
+/** Stock filters; `skip` leaves facets out ('category', 'owner') so a chip counts the others. */
+function stockWhere(companyId, q, skip = []) {
   const where = ['k.company_id = ?'];
   const params = [companyId];
   if (String(q.includeZero) !== '1') where.push('k.quantity <> 0');
@@ -922,17 +964,67 @@ export async function listStock(db, companyId, q = {}, { limit = 2000 } = {}) {
   if (!blank(q.itemId)) { where.push('k.item_id = ?'); params.push(Number(q.itemId)); }
   if (!blank(q.batchId)) { where.push('k.batch_id = ?'); params.push(Number(q.batchId)); }
   if (!blank(q.purpose)) { where.push('a.purpose = ?'); params.push(q.purpose); }
-  if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
-  else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
-  else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
+  if (!skip.includes('category') && !blank(q.category)) { where.push(`${CATEGORY_SQL} = ?`); params.push(q.category); }
+  if (!skip.includes('owner')) {
+    if (q.owner === 'ours') where.push('b.owner_party_id IS NULL');
+    else if (q.owner === 'customer') where.push('b.owner_party_id IS NOT NULL');
+    else if (!blank(q.owner) && Number.isInteger(Number(q.owner))) { where.push('b.owner_party_id = ?'); params.push(Number(q.owner)); }
+  }
   if (!blank(q.search)) {
     where.push('(r.code LIKE ? OR r.name LIKE ? OR b.code LIKE ?)');
     const s = like(q.search);
     params.push(s, s, s);
   }
-  const [rows] = await db.query(`${STOCK_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.code, a.code, b.code${limit ? ` LIMIT ${Number(limit)}` : ''}`, params);
+  return { where: where.join(' AND '), params };
+}
+
+/**
+ * What sits where. q: { areaId?, itemId?, batchId?, purpose?, category?, owner? (ours | customer | party id), search?, includeZero? }.
+ * Without paged=1 / all=1: the old bare array (at most `limit` rows; null = every row).
+ * With paged=1: { rows, total, counts } — `counts` holds what the screen's chips
+ * and stats show, all over every matching row, not the page:
+ *   categories  per "counts as" (every filter but the category) + all
+ *   owners      { ours, parties: [{ id, name, code, n }] } (every filter but the owner)
+ *   stats       { lines, items, areas, cannotUse } over every filter
+ *   held        customer material per party and unit, over the search + area only
+ */
+export async function listStock(db, companyId, q = {}, { limit = 2000 } = {}) {
+  if (!wantsPage(q)) {
+    const { where, params } = stockWhere(companyId, q);
+    const [rows] = await db.query(`${STOCK_SELECT} WHERE ${where} ORDER BY r.code, a.code, b.code${limit ? ` LIMIT ${Number(limit)}` : ''}`, params);
+    await valueRows(db, companyId, rows);
+    return rows.map(shapeStock);
+  }
+  const page = pageArgs(q, { def: 100 });
+  const all = stockWhere(companyId, q);
+  const noCat = stockWhere(companyId, q, ['category']);
+  const noOwner = stockWhere(companyId, q, ['owner']);
+  const base = stockWhere(companyId, q, ['category', 'owner']);
+  const order = orderBy(q, STOCK_SORT, 'r.code, a.code, b.code, k.id', 'r.code, a.code, b.code, k.id');
+  const [[rows], [[stat]], [catRows], [ownerRows], [heldRows]] = await Promise.all([
+    db.query(`${STOCK_SELECT} WHERE ${all.where} ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}`, all.params),
+    db.query(
+      `SELECT COUNT(*) AS n_lines, COUNT(DISTINCT k.item_id) AS items, COUNT(DISTINCT k.stocking_area_id) AS areas,
+              COALESCE(SUM(${CATEGORY_SQL} IN ('held', 'rejected')), 0) AS cannot_use ${STOCK_FROM} WHERE ${all.where}`, all.params),
+    db.query(`SELECT ${CATEGORY_SQL} AS cat, COUNT(*) AS n ${STOCK_FROM} WHERE ${noCat.where} GROUP BY cat`, noCat.params),
+    db.query(
+      `SELECT b.owner_party_id AS pid, MAX(op.name) AS name, MAX(op.code) AS code, COUNT(*) AS n ${STOCK_FROM} WHERE ${noOwner.where} GROUP BY b.owner_party_id`, noOwner.params),
+    db.query(
+      `SELECT b.owner_party_id AS pid, MAX(op.name) AS name, MAX(op.code) AS code, i.uom AS uom, COUNT(*) AS n, SUM(k.quantity) AS qty
+         ${STOCK_FROM} WHERE ${base.where} AND b.owner_party_id IS NOT NULL GROUP BY b.owner_party_id, i.uom`, base.params),
+  ]);
+  const categories = countsBy(catRows, CATEGORIES, 'cat');
+  const ours = ownerRows.filter((r) => r.pid == null).reduce((t, r) => t + Number(r.n), 0);
+  const parties = ownerRows.filter((r) => r.pid != null).map((r) => ({ id: r.pid, name: r.name ?? null, code: r.code ?? null, n: Number(r.n) }))
+    .sort((x, y) => String(x.name ?? x.code ?? '').localeCompare(String(y.name ?? y.code ?? '')));
+  const counts = {
+    categories: { ...categories, all: Object.values(categories).reduce((t, n) => t + n, 0) },
+    owners: { ours, parties },
+    stats: { lines: Number(stat.n_lines), items: Number(stat.items), areas: Number(stat.areas), cannotUse: Number(stat.cannot_use) },
+    held: heldRows.map((r) => ({ partyId: r.pid, name: r.name ?? r.code ?? 'Customer', uom: r.uom, lines: Number(r.n), quantity: Number(r.qty) })),
+  };
   await valueRows(db, companyId, rows);
-  return rows.map(shapeStock);
+  return pageOf(rows.map(shapeStock), stat.n_lines, page, { counts });
 }
 
 const CATEGORIES = ['available', 'in_process', 'held', 'rejected', 'dispatch'];
@@ -958,7 +1050,7 @@ const moneyOf = (rows) => ({
 export async function itemStock(db, companyId, itemId) {
   const item = await loadMaster(db, companyId, Number(itemId));
   if (!item || item.record_kind !== 'item') throw notFound('Item');
-  const rows = await listStock(db, companyId, { itemId: item.id });
+  const rows = await listStock(db, companyId, { itemId: item.id }, { limit: null });
   const [res] = await db.query(
     `SELECT v.id, v.quantity, v.batch_id, b.code AS batch_code, b.status AS batch_status, b.owner_party_id,
             IF(v.order_line_id IS NULL, 'material', 'finished') AS kind,
@@ -999,7 +1091,7 @@ export async function itemStock(db, companyId, itemId) {
 /** A stocking area and its inventory. `value` is ours at cost. */
 export async function areaInventory(db, companyId, areaId) {
   const area = shapeArea(await requireArea(db, companyId, areaId));
-  const rows = await listStock(db, companyId, { areaId: area.id });
+  const rows = await listStock(db, companyId, { areaId: area.id }, { limit: null });
   return { area, totals: { ...summarise(rows), ...moneyOf(rows.filter((r) => !r.owner)) }, rows, movements: await listMovements(db, companyId, { areaId: area.id, limit: 20 }) };
 }
 

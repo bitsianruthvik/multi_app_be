@@ -35,6 +35,7 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/listing.js';
 import { generate } from '../modules/codegen/index.js';
 import { lineOnOrder, orderClosedWhy, flowSteps, opsOfFlow } from './timeEstimateService.js';
 import { dateText } from './resolutionService.js';
@@ -439,25 +440,52 @@ const shapeWorkOrder = (w) => ({
   updatedAt: w.updated_at,
 });
 
+const WO_CELLS = '(SELECT COUNT(*) FROM cf_work_order_cells c WHERE c.company_id = w.company_id AND c.work_order_id = w.id AND c.deleted_at IS NULL)';
+const WO_STEPS = (cond = '') => `(SELECT COUNT(*) FROM cf_production_steps s WHERE s.company_id = w.company_id AND s.work_order_id = w.id AND s.deleted_at IS NULL${cond})`;
+const WO_SORT = {
+  code: 'w.code', contractor: 'p.name', order: 'o.code', status: 'w.status', cells: WO_CELLS,
+  progress: `IF(${WO_STEPS()} > 0, ${WO_STEPS(" AND s.state = 'done'")} / ${WO_STEPS()}, NULL)`,
+};
+const WO_OPEN = ['draft', 'issued', 'in_progress'];
+
+/**
+ * q: status (open | one | a,b list), contractorId, orderId, lineId, search.
+ * Without paged=1 / all=1: the bare array (newest first, at most 1000, as ever).
+ * With them: { rows, total, counts: { status: {draft…}, open, all } } — counts over every filter but status.
+ */
 export async function listWorkOrders(db, companyId, q = {}) {
-  const where = ['w.company_id = ?', 'w.deleted_at IS NULL'];
+  const base = ['w.company_id = ?', 'w.deleted_at IS NULL'];
   const params = [companyId];
+  if (!blank(q.contractorId)) { base.push('w.contractor_id = ?'); params.push(Number(q.contractorId)); }
+  if (!blank(q.orderId)) { base.push('w.order_id = ?'); params.push(Number(q.orderId)); }
+  if (!blank(q.lineId)) { base.push('w.order_line_id = ?'); params.push(Number(q.lineId)); }
+  const like = likeOf(q.search);
+  if (like) { base.push('(w.code LIKE ? OR p.name LIKE ? OR p.code LIKE ? OR o.code LIKE ?)'); params.push(like, like, like, like); }
+  const where = [...base];
+  const rowParams = [...params];
   if (!blank(q.status)) {
     // "open" = not finished and not cancelled: draft, issued, in progress.
     const statuses = String(q.status).split(',').map((s) => s.trim())
-      .flatMap((s) => (s === 'open' ? ['draft', 'issued', 'in_progress'] : [s])).filter((s) => WO_STATUSES.includes(s));
-    if (statuses.length) { where.push('w.status IN (?)'); params.push(statuses); }
+      .flatMap((s) => (s === 'open' ? WO_OPEN : [s])).filter((s) => WO_STATUSES.includes(s));
+    if (statuses.length) { where.push('w.status IN (?)'); rowParams.push(statuses); }
   }
-  if (!blank(q.contractorId)) { where.push('w.contractor_id = ?'); params.push(Number(q.contractorId)); }
-  if (!blank(q.orderId)) { where.push('w.order_id = ?'); params.push(Number(q.orderId)); }
-  if (!blank(q.lineId)) { where.push('w.order_line_id = ?'); params.push(Number(q.lineId)); }
-  const [rows] = await db.query(`${WO_SELECT} WHERE ${where.join(' AND ')} ORDER BY w.id DESC LIMIT 1000`, params);
-  let out = rows.map(shapeWorkOrder);
-  if (!blank(q.search)) {
-    const term = String(q.search).trim().toLowerCase();
-    out = out.filter((w) => [w.code, w.contractorName, w.contractorCode, w.order.code].some((t) => t && String(t).toLowerCase().includes(term)));
-  }
-  return out;
+  const paged = wantsPage(q);
+  const page = paged ? pageArgs(q, { def: 100 }) : { limit: 1000, offset: 0 };
+  const from = 'FROM cf_work_orders w JOIN cf_parties p ON p.id = w.contractor_id JOIN cf_sales_orders o ON o.id = w.order_id JOIN cf_sales_order_lines l ON l.id = w.order_line_id';
+  const [[rows], counted] = await Promise.all([
+    db.query(`${WO_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${orderBy(q, WO_SORT, 'w.id DESC', 'w.id')} LIMIT ? OFFSET ?`, [...rowParams, page.limit, page.offset]),
+    paged ? Promise.all([
+      db.query(`SELECT COUNT(*) AS n ${from} WHERE ${where.join(' AND ')}`, rowParams),
+      db.query(`SELECT w.status AS k, COUNT(*) AS n ${from} WHERE ${base.join(' AND ')} GROUP BY w.status`, params),
+    ]) : null,
+  ]);
+  const out = rows.map(shapeWorkOrder);
+  if (!paged) return out;
+  const [[[{ n: total }]], [byStatus]] = counted;
+  const status = countsBy(byStatus, WO_STATUSES);
+  const all = Object.values(status).reduce((t, n) => t + n, 0);
+  const open = WO_OPEN.reduce((t, k) => t + status[k], 0);
+  return pageOf(out, total, page, { counts: { status, open, all } });
 }
 
 async function requireWorkOrder(db, companyId, id, { lock = false } = {}) {
