@@ -1385,6 +1385,10 @@ async function loadPacker(injected) {
  */
 export async function planNesting(db, companyId, orderLineId, input = {}) {
   const planStartedAt = Date.now();   // the effort's budget runs from here
+  // PROGRESS (2026-10-03, nestRunService): a background run listens here for its
+  // log and bar. Optional, and a listener that throws never breaks the plan.
+  const say = (text, extra = {}) => { if (input.onProgress) { try { input.onProgress({ text, ...extra }); } catch { /* progress only */ } } };
+  say('Reading the line\'s cut pieces and the catalog plates', { phase: 'reading' });
   const budgetCut = new Map();         // group key -> the clock limited its search
   const line = await requireLine(db, companyId, orderLineId);
   assertFrozen(line);
@@ -1434,6 +1438,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
 
   // A steel whose every candidate plate is excluded cannot be nested — refused
   // up front, all such groups named at once, rather than half a plan.
+  say(`${nestable.reduce((a, cp) => a + cp.pieces, 0)} pieces of ${nestable.length} cut pieces to nest, in ${byGroup.size} steel${byGroup.size === 1 ? '' : 's'} · ${plates.length} plate${plates.length === 1 ? '' : 's'} to choose from${line.nest_plates === 'standard' ? ' (standard only)' : ''}`, { phase: 'grouping' });
   const blocked = [...byGroup.values()]
     .filter((g) => sheetsFor(plates, g).length > 0 && !sheetsFor(plates, g).some((p) => !excl.plates.has(p.id)))
     .map(noPlatesLeft);
@@ -1567,7 +1572,20 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       seedsDropped += mine.dropped ?? 0;
       mine.forEach((seed, round) => jobs.push({ key: pr.g.key, seed, round, input: { ...pr.packInput, seed } }));
     }
-    const runs = await runAll(jobs, { workers: input.workers ?? null, deadlineAt });
+    const steelName = new Map(prepared.map((pr) => [pr.g.key, `${fmt(pr.g.thickness)} mm ${[pr.g.grade, pr.g.material].filter(Boolean).join(' ')}`]));
+    say(`Packing: ${jobs.length} job${jobs.length === 1 ? '' : 's'} (${seedCount} try${seedCount === 1 ? '' : 'ies'} per steel)${planBudgetMs ? `, up to ${Math.round(planBudgetMs / 1000)} s` : ''}`,
+      { phase: 'packing', done: 0, total: jobs.length, budgetMs: planBudgetMs || null });
+    const onJob = ({ job, result, done, total }) => {
+      const name = steelName.get(job.key) ?? job.key;
+      const what = result?.skipped
+        ? `skipped (${result.skipped === 'time' ? 'no time left' : 'already the best possible'})`
+        : result?.ok
+          ? `${(result.out?.nests ?? []).length} plate${(result.out?.nests ?? []).length === 1 ? '' : 's'}${(result.out?.unplaced ?? []).length ? `, ${(result.out.unplaced).reduce((a, u) => a + (Number(u.qty) || 0), 0)} pieces left over` : ''}`
+          : `failed (${result?.error ?? 'unknown error'})`;
+      say(`${name} — try ${job.round + 1}: ${what}`, { phase: 'packing', done, total });
+    };
+    const runs = await runAll(jobs, { workers: input.workers ?? null, deadlineAt, onJob });
+    say('Choosing the best layout for each steel', { phase: 'shaping' });
     const st = runs.stats ?? {};
     for (const pr of prepared) {
       const all = runs

@@ -3,7 +3,10 @@
  *
  *   GET  /orders/:orderId/lines/:lineId/nesting          the SAVED plan
  *   POST /orders/:orderId/lines/:lineId/nesting/plan     { effort?, guillotine?, seed? } — propose
- *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it
+ *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it (and forget the line's finished run)
+ *   POST   /orders/:orderId/lines/:lineId/nesting/runs          { as /plan } — start a BACKGROUND run (or get the one running)
+ *   GET    /orders/:orderId/lines/:lineId/nesting/runs/current  ?plan=1 — status, progress, log; the proposal once done
+ *   DELETE /orders/:orderId/lines/:lineId/nesting/runs/current  dismiss a finished run (services/nestRunService.js)
  *   GET  /orders/:orderId/lines/:lineId/nesting/choices  the pieces (Step A) and plates (Step B) a run considers
  *   PUT  /orders/:orderId/lines/:lineId/nesting/choices  { excludedCutPlateIds, excludedPlateIds } — the whole
  *                                                        selection (both empty = reset); applied by every run
@@ -45,6 +48,8 @@ import {
 // the diff a dry run reports are a different job from laying steel out, and
 // nestingService is long enough already.
 import { exportSheet, importSheet } from '../services/nestingSheetService.js';
+// A run that outlives the page (2026-10-03): the job, its progress and its proposal, in memory.
+import { startRun, currentRun, dismissRun } from '../services/nestRunService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
 
@@ -77,7 +82,21 @@ router.post('/orders/:orderId/lines/:lineId/nesting/plan', view,
   handle((req) => read(req, (db, companyId, id) => planNesting(db, companyId, id, req.body ?? {}))));
 
 router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
-  handle((req) => write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}))));
+  handle(async (req) => {
+    const out = await write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}));
+    // The proposal is now the saved plan: the finished run has done its job.
+    dismissRun(ctx(req).companyId, lineId(req));
+    return out;
+  }));
+
+// BACKGROUND RUNS — the same proposal as /plan, but owned by the server, so
+// leaving the page does not lose it. Read grant, like /plan: it writes nothing.
+router.post('/orders/:orderId/lines/:lineId/nesting/runs', view,
+  handle((req) => read(req, (db, companyId, id) => startRun(companyId, { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null }, id, req.body ?? {}))));
+router.get('/orders/:orderId/lines/:lineId/nesting/runs/current', view,
+  handle((req) => read(req, (db, companyId, id) => currentRun(companyId, id, { withPlan: String(req.query.plan ?? '') === '1' }))));
+router.delete('/orders/:orderId/lines/:lineId/nesting/runs/current', view,
+  handle((req) => read(req, (db, companyId, id) => dismissRun(companyId, id))));
 
 // THE NESTING CHOICES (init.sql §40): what a run leaves out. Reading them is a
 // look; saving them is part of the order's structure work, so it needs manage.

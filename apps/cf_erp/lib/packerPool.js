@@ -159,7 +159,7 @@ const MIN_EXTRA_SEED_MS = 500;
  * be started at all (a restricted host, an older runtime). Slower, same answer,
  * same deadline.
  */
-export async function runAll(jobs, { onFallback = null, workers: workerCap = null, deadlineAt = null } = {}) {
+export async function runAll(jobs, { onFallback = null, workers: workerCap = null, deadlineAt = null, onJob = null } = {}) {
   if (!jobs.length) return [];
   const results = new Array(jobs.length);
   const size = poolSize(jobs.length, workerCap);
@@ -198,6 +198,18 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
     if (roundOf(jobs[i]) === 0 && out) primary.set(jobs[i].key, { floorMs: Number(out.floorMs) || 0, proven: !!out.proven });
     if (out && out.deterministic === false) stats.capped += 1;
   };
+  /*
+   * PROGRESS (2026-10-03): `onJob` hears about every job as it settles — run,
+   * skipped or failed — with how many have settled so far. It is for the
+   * background run's progress bar and log only; a throw in it is swallowed so
+   * a progress listener can never break a pack.
+   */
+  let settled = 0;
+  const told = (i) => {
+    settled += 1;
+    if (!onJob) return;
+    try { onJob({ index: i, job: jobs[i], result: results[i], done: settled, total: jobs.length }); } catch { /* progress only */ }
+  };
 
   /** The input to send for job i, or a skip verdict. Called at dispatch time. */
   const prepare = (i) => {
@@ -234,10 +246,11 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
     stats.workers = 1;
     for (const i of order) {
       const p = prepare(i);
-      if (p.skip) { results[i] = { ok: false, skipped: p.skip }; continue; }
+      if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
       const out = nest(p.input);
       results[i] = { ok: true, out };
       note(i, out);
+      told(i);
     }
     results.stats = stats;
     return results;
@@ -250,7 +263,7 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
         while (next < jobs.length) {
           const i = order[next]; next += 1;
           const p = prepare(i);
-          if (p.skip) { results[i] = { ok: false, skipped: p.skip }; continue; }
+          if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
           w.postMessage({ id: i, input: p.input });
           return;
         }
@@ -260,6 +273,7 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
         if (msg?.ready) { take(); return; }         // the module loaded; start work
         results[msg.id] = msg.ok ? { ok: true, out: msg.out } : { ok: false, error: msg.error };
         if (msg.ok) note(msg.id, msg.out);
+        told(msg.id);
         take();
       });
       w.on('error', reject);
