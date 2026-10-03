@@ -119,15 +119,17 @@ export const NEST_MANUAL_SPEC_CODE = 'NEST_MANUAL';
  * whether it is a mill-STANDARD size or a CUSTOM one (option spec PLATE_KIND:
  * STANDARD / CUSTOM, defaulted CUSTOM on the Plate node — scripts/cf_kepl/
  * plate-kind-setup.mjs). Custom plates cost more, so a line's nesting is told
- * which it may use — cf_sales_order_lines.nest_plates 'standard' | 'any' — and
- * MUST be told before its first run (user: "a setting one needs to select during
- * nesting"). A plate that does not say counts as custom.
+ * which it may use — cf_sales_order_lines.nest_plates 'standard' | 'any'. A line
+ * nobody has set uses STANDARD AND CUSTOM (user, 2026-10-03: "make standard and
+ * custom the default") — requireLine reads NULL as 'any', so every reader sees
+ * one of the two. A plate that does not say counts as custom.
  */
 export const PLATE_KIND_SPEC_CODE = 'PLATE_KIND';
 export const NEST_PLATE_CHOICES = ['standard', 'any'];
 const isStandard = (p) => p.kind === 'STANDARD';
 const allowedBy = (choice) => (p) => choice !== 'standard' || isStandard(p);
-export const PLATES_NOT_CHOSEN = 'Choose which plates nesting may use for this line — standard plates only, or standard and custom.';
+/** The line's plate choice, NULL (never set) read as the default: standard and custom. */
+const plateChoiceOf = (v) => (NEST_PLATE_CHOICES.includes(v) ? v : 'any');
 
 /** Under this on BOTH dimensions a part is Small, and a sequence holds 2 rows. */
 export const SMALL_PART_MM = 200;
@@ -452,6 +454,7 @@ async function requireLine(db, companyId, lineId, { lock = false } = {}) {
     [companyId, lineId],
   );
   if (!l) throw notFound('Order line');
+  l.nest_plates = plateChoiceOf(l.nest_plates);
   return l;
 }
 
@@ -1042,8 +1045,8 @@ export async function nestingChoices(db, companyId, orderLineId) {
   for (const pl of plates) kinds[pl.kind === 'STANDARD' ? 'standard' : pl.kind === 'CUSTOM' ? 'custom' : 'unknown'] += 1;
   return {
     line: lineHead(line),
-    // §44: which plates this line's nesting may use — null until somebody chooses.
-    plateChoice: NEST_PLATE_CHOICES.includes(line.nest_plates) ? line.nest_plates : null,
+    // §44: which plates this line's nesting may use ('any' unless set to 'standard').
+    plateChoice: line.nest_plates,
     plateKinds: kinds,
     canSave: !blocker,
     readOnlyReason: blocker?.message ?? null,
@@ -1388,7 +1391,6 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
   const settingRows = await cutSettingRows(db, companyId);
-  if (!NEST_PLATE_CHOICES.includes(line.nest_plates)) throw invalid('PLATES_NOT_CHOSEN', PLATES_NOT_CHOSEN);
   const everyPlate = await candidatePlates(db, companyId, where.plateIds);
   // Standard only: a custom plate (or one that does not say) is not offered at all.
   const plates = everyPlate.filter(allowedBy(line.nest_plates));
@@ -1702,8 +1704,8 @@ const lineHead = (line) => ({
   quantity: Number(line.quantity), orderStatus: line.order_status,
   // Nesting needs a frozen design and a line not yet released (assertNestable).
   frozen: isFrozenForNesting(line), released: !!line.release_id,
-  // §44: standard plates only / standard and custom — null until chosen (a run refuses until then).
-  plateChoice: NEST_PLATE_CHOICES.includes(line.nest_plates) ? line.nest_plates : null,
+  // §44: standard plates only / standard and custom (the default).
+  plateChoice: line.nest_plates,
 });
 
 const groupHead = (g, settings, guillotine) => ({

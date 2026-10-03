@@ -4497,8 +4497,8 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- ============================================================================
 -- §44  Which plates a line's nesting may use: standard only, or standard + custom
 -- ============================================================================
--- 'standard' | 'any'; NULL = not chosen yet, and a nesting run refuses until it
--- is (nestingService.setNestPlates). A plate says STANDARD / CUSTOM through the
+-- 'standard' | 'any'; NULL = never set, read as 'any' (standard and custom —
+-- the default; nestingService.requireLine). A plate says STANDARD / CUSTOM through the
 -- PLATE_KIND option spec (tenant setup: scripts/cf_kepl/plate-kind-setup.mjs).
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'nest_plates');

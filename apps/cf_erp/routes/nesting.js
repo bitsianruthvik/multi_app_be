@@ -8,7 +8,7 @@
  *   PUT  /orders/:orderId/lines/:lineId/nesting/choices  { excludedCutPlateIds, excludedPlateIds } — the whole
  *                                                        selection (both empty = reset); applied by every run
  *   PUT  /orders/:orderId/lines/:lineId/nesting/plates   { plates: 'standard' | 'any' } — which plates a run may use
- *                                                        (§44; must be set before the first /plan)
+ *                                                        (§44; a line never set uses 'any')
  *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the nests as a workbook (Nests / Needed / How to use this)
  *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { file, filename, dryRun, force } — preview, or save
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped

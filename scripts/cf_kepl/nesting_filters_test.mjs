@@ -418,11 +418,11 @@ try {
   ok('...but can still look, and is told why it cannot save', look.canSave === false && /Freeze the design first/.test(look.readOnlyReason ?? ''));
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE id = ?', [lineId]);
 
-  section('7b. Standard or custom plates (§44): asked before the first run, then obeyed');
+  section('7b. Standard or custom plates (§44): standard and custom by default, standard only when set');
   await conn.query('UPDATE cf_sales_order_lines SET nest_plates = NULL WHERE id = ?', [lineId]);
-  const notChosen = await refusal(() => S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 }));
-  eq('a line nobody has chosen for is not nested (PLATES_NOT_CHOSEN)', notChosen?.code, 'PLATES_NOT_CHOSEN');
-  eq('...and the choices say it is not chosen', (await S.nestingChoices(conn, COMPANY, lineId)).plateChoice, null);
+  const byDefault = await S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 });
+  ok('a line nobody has set nests with standard and custom plates', pieceIds(byDefault).size > 0 && sheetsSeen.at(-1).some((k) => k.startsWith(`pl${P1}`)), JSON.stringify(sheetsSeen.at(-1)));
+  eq('...and the choices say "any"', (await S.nestingChoices(conn, COMPANY, lineId)).plateChoice, 'any');
   const badChoice = await refusal(() => S.setNestPlates(conn, c, lineId, { plates: 'cheap' }));
   eq('only standard or any can be chosen', badChoice?.code, 'INVALID');
   await S.setNestPlates(conn, c, lineId, { plates: 'standard' });
