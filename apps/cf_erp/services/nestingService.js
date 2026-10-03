@@ -114,6 +114,21 @@ export const CUT_PLATE_CODE = 'CUT_PLATE';
 /** The boolean specification that keeps a cut plate out of the packer. */
 export const NEST_MANUAL_SPEC_CODE = 'NEST_MANUAL';
 
+/*
+ * STANDARD OR CUSTOM PLATE (2026-10-03, init.sql §44). A catalog plate says
+ * whether it is a mill-STANDARD size or a CUSTOM one (option spec PLATE_KIND:
+ * STANDARD / CUSTOM, defaulted CUSTOM on the Plate node — scripts/cf_kepl/
+ * plate-kind-setup.mjs). Custom plates cost more, so a line's nesting is told
+ * which it may use — cf_sales_order_lines.nest_plates 'standard' | 'any' — and
+ * MUST be told before its first run (user: "a setting one needs to select during
+ * nesting"). A plate that does not say counts as custom.
+ */
+export const PLATE_KIND_SPEC_CODE = 'PLATE_KIND';
+export const NEST_PLATE_CHOICES = ['standard', 'any'];
+const isStandard = (p) => p.kind === 'STANDARD';
+const allowedBy = (choice) => (p) => choice !== 'standard' || isStandard(p);
+export const PLATES_NOT_CHOSEN = 'Choose which plates nesting may use for this line — standard plates only, or standard and custom.';
+
 /** Under this on BOTH dimensions a part is Small, and a sequence holds 2 rows. */
 export const SMALL_PART_MM = 200;
 
@@ -519,7 +534,7 @@ const SIZE_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE', 'MATERIAL', 'DENSIT
  * out of the pack.
  */
 async function valuesOf(db, companyId, masterIds) {
-  const out = new Map(masterIds.map((id) => [id, { size: new Map(), manual: false }]));
+  const out = new Map(masterIds.map((id) => [id, { size: new Map(), manual: false, kind: null }]));
   if (!masterIds.length) return out;
   const [rows] = await db.query(
     `SELECT v.subject_id, s.code, s.data_type, v.value_number, v.value_text, v.value_bool,
@@ -529,7 +544,7 @@ async function valuesOf(db, companyId, masterIds) {
        LEFT JOIN cf_spec_options o ON o.id = v.option_id
       WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?)
         AND v.deleted_at IS NULL AND s.code IN (?)`,
-    [companyId, masterIds, [...SIZE_CODES, NEST_MANUAL_SPEC_CODE]],
+    [companyId, masterIds, [...SIZE_CODES, NEST_MANUAL_SPEC_CODE, PLATE_KIND_SPEC_CODE]],
   );
   for (const r of rows) {
     const bucket = out.get(r.subject_id);
@@ -539,6 +554,7 @@ async function valuesOf(db, companyId, masterIds) {
       if (r.source === 'entered' && Number(r.value_bool) === 1) bucket.manual = true;
       continue;
     }
+    if (code === PLATE_KIND_SPEC_CODE) { bucket.kind = norm(r.option_value ?? r.value_text); continue; }
     bucket.size.set(code, r);
   }
   return out;
@@ -979,6 +995,9 @@ export async function nestingChoices(db, companyId, orderLineId) {
           ? { price: l.listPrice, basis: l.priceBasis, currency: l.currency, perPlate: perUnitPrice(l.listPrice, l.priceBasis, { weightKg: kgEach }) }
           : null,
         excluded: excl.plates.has(p.id),
+        // §44: STANDARD / CUSTOM (null = it does not say, counted as custom); allowed = the line's choice lets it be used.
+        kind: p.kind ?? null,
+        allowed: allowedBy(line.nest_plates)(p),
       };
     }).sort((a, b) => Number(b.preferred) - Number(a.preferred)
       || Number(b.stock.ours > 0) - Number(a.stock.ours > 0)
@@ -989,7 +1008,8 @@ export async function nestingChoices(db, companyId, orderLineId) {
       && agrees(r.grade, g.grade) && agrees(r.material, g.material));
     const nestable = g.pieces.filter((p) => !p.manual && p.toNest > 0);
     const ticked = nestable.filter((p) => !p.excluded);
-    const platesTicked = platesOf.filter((p) => !p.excluded).length;
+    const platesTicked = platesOf.filter((p) => !p.excluded && p.allowed).length;
+    const standardOffered = platesOf.filter((p) => p.kind === 'STANDARD').length;
     const sum = (rows, f) => round3(rows.reduce((a, r) => a + (Number(f(r)) || 0), 0));
     out.push({
       key: g.key, thickness: g.thickness, grade: g.grade, material: g.material,
@@ -1005,9 +1025,11 @@ export async function nestingChoices(db, companyId, orderLineId) {
       summary: {
         cutPlates: nestable.length, pieces: sum(nestable, (p) => p.toNest), kg: sum(nestable, (p) => p.kg),
         ticked: { cutPlates: ticked.length, pieces: sum(ticked, (p) => p.toNest), kg: sum(ticked, (p) => p.kg) },
-        platesOffered: platesOf.length, platesTicked,
+        platesOffered: platesOf.length, platesTicked, standardOffered,
       },
-      blocked: ticked.length && platesOf.length && !platesTicked ? noPlatesLeft(g) : null,
+      blocked: ticked.length && platesOf.length && !platesTicked
+        ? (line.nest_plates === 'standard' && !standardOffered ? noStandardPlate(g, platesOf.length, ticked.length) : noPlatesLeft(g))
+        : null,
       noCandidate: ticked.length && !platesOf.length
         ? `No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so these pieces have nothing to be cut from. Add the plate to the catalog, or correct the cut pieces' steel.`
         : null,
@@ -1016,8 +1038,13 @@ export async function nestingChoices(db, companyId, orderLineId) {
 
   const summary = choiceSummary(cutPlates, plates, excl);
   const blocker = importBlocker(line);
+  const kinds = { standard: 0, custom: 0, unknown: 0 };
+  for (const pl of plates) kinds[pl.kind === 'STANDARD' ? 'standard' : pl.kind === 'CUSTOM' ? 'custom' : 'unknown'] += 1;
   return {
     line: lineHead(line),
+    // §44: which plates this line's nesting may use — null until somebody chooses.
+    plateChoice: NEST_PLATE_CHOICES.includes(line.nest_plates) ? line.nest_plates : null,
+    plateKinds: kinds,
     canSave: !blocker,
     readOnlyReason: blocker?.message ?? null,
     groups: out,
@@ -1035,6 +1062,22 @@ export async function nestingChoices(db, companyId, orderLineId) {
     },
     blocked: out.filter((g) => g.blocked).map((g) => g.blocked),
   };
+}
+
+const noStandardPlate = (g, customCount, pieces) => `${fmt(g.thickness)} mm ${[g.grade, g.material].filter(Boolean).join(' ')}: no standard plate, and this line is set to standard plates only — ${pieces === 1 ? 'its piece has' : `its ${pieces} cut pieces have`} nothing to be nested on. Allow custom plates for this line, or mark one of its ${customCount} plate${customCount === 1 ? '' : 's'} Standard.`;
+
+/**
+ * PUT …/nesting/plates { plates: 'standard' | 'any' } — which plates this line's
+ * nesting may use (§44). Asked before the first run; changing it later changes
+ * the next run, never the saved layout. The line must be open to nesting.
+ */
+export async function setNestPlates(db, c, orderLineId, input = {}) {
+  const line = await requireLine(db, c.companyId, orderLineId, { lock: true });
+  assertNestable(line);
+  const choice = String(input.plates ?? '').trim().toLowerCase();
+  if (!NEST_PLATE_CHOICES.includes(choice)) throw invalid('INVALID', 'Plates is "standard" (standard plates only) or "any" (standard and custom).');
+  await db.query('UPDATE cf_sales_order_lines SET nest_plates = ? WHERE company_id = ? AND id = ?', [choice, c.companyId, line.id]);
+  return { lineId: line.id, plateChoice: choice };
 }
 
 const noPlatesLeft = (g) => `${fmt(g.thickness)} mm ${[g.grade, g.material].filter(Boolean).join(' ')}: every plate it could be cut from is unticked, so its pieces have nothing to be nested on. Tick at least one plate, or untick the pieces too.`;
@@ -1235,7 +1278,7 @@ async function candidatePlates(db, companyId, plateIds) {
     [companyId, plateIds],
   );
   const values = await valuesOf(db, companyId, rows.map((r) => r.id));
-  return rows.map((r) => ({ ...r, steel: steelOf(values.get(r.id).size) }));
+  return rows.map((r) => ({ ...r, steel: steelOf(values.get(r.id).size), kind: values.get(r.id).kind ?? null }));
 }
 
 /**
@@ -1345,7 +1388,10 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
   const settingRows = await cutSettingRows(db, companyId);
-  const plates = await candidatePlates(db, companyId, where.plateIds);
+  if (!NEST_PLATE_CHOICES.includes(line.nest_plates)) throw invalid('PLATES_NOT_CHOSEN', PLATES_NOT_CHOSEN);
+  const everyPlate = await candidatePlates(db, companyId, where.plateIds);
+  // Standard only: a custom plate (or one that does not say) is not offered at all.
+  const plates = everyPlate.filter(allowedBy(line.nest_plates));
   const theirs = await customerPlates(db, companyId, line.order_id, plates.map((p) => p.id));
 
   // NEST THE REST. Pieces already on imported lots are not demand any more;
@@ -1415,6 +1461,11 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
     const candidates = sheetsFor(plates, g).filter((p) => !excl.plates.has(p.id));
+    if (!candidates.length && line.nest_plates === 'standard' && sheetsFor(everyPlate, g).length) {
+      problems.push(noStandardPlate(g, sheetsFor(everyPlate, g).length, g.cutPlates.length));
+      groups.push(emptyGroup(g, settings, guillotine, 'no standard plate'));
+      continue;
+    }
     if (!candidates.length) {
       problems.push(`No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so ${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} have nothing to be cut from. Add the plate to the catalog, or correct the cut plate's steel.`);
       groups.push(emptyGroup(g, settings, guillotine, 'no candidate plate'));
@@ -1651,6 +1702,8 @@ const lineHead = (line) => ({
   quantity: Number(line.quantity), orderStatus: line.order_status,
   // Nesting needs a frozen design and a line not yet released (assertNestable).
   frozen: isFrozenForNesting(line), released: !!line.release_id,
+  // §44: standard plates only / standard and custom — null until chosen (a run refuses until then).
+  plateChoice: NEST_PLATE_CHOICES.includes(line.nest_plates) ? line.nest_plates : null,
 });
 
 const groupHead = (g, settings, guillotine) => ({

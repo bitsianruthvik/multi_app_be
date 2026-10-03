@@ -308,6 +308,8 @@ try {
   const [[c3q]] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id = ?', [fx.areaLine[fx.C3]]);
   near('a cut plate on no nest goes back to its area fraction', Number(c3q.quantity), (400 * 300) / (2500 * 1250), 1e-6);
 
+  // §44: a line's nesting must be told which plates it may use before it runs.
+  await conn.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [fx.lineId]]);
   const rest = await N.planNesting(conn, COMPANY, fx.lineId, { effort: 'quick', seed: 3 });
   const restPieces = (id) => rest.groups.flatMap((g) => g.nests).reduce((a, x) => a + x.pieces.filter((p) => p.cutPlateId === id).length, 0);
   eq('the plan knows about the imported nest', rest.imported.lots, 1);

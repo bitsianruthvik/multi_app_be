@@ -347,6 +347,8 @@ try {
   /* ---- 2. planning writes nothing -------------------------------------- */
   section('2. planNesting proposes and writes nothing');
   // Not frozen: nesting is refused, proposing and accepting alike.
+  // §44: a line's nesting must be told which plates it may use before it runs.
+  await conn.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [fixture.lineId]]);
   await conn.query('SAVEPOINT unfrozen');
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, fixture.lineId]);
   let unfrozenPlan = null;

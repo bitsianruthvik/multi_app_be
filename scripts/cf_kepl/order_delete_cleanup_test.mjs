@@ -156,6 +156,8 @@ async function buildOrder(db, cat, tag, label) {
 /** Quick nest + accept + exclusion + plan entry/rank + time override. */
 async function loadLine(db, c, f, opId, label) {
   await S.saveNestingChoices(db, c, f.lineId, { excludedCutPlateIds: [f.X] });
+  // §44: a line's nesting must be told which plates it may use before it runs.
+  await db.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [f.lineId]]);
   const plan = await S.planNesting(db, COMPANY, f.lineId, { effort: 'quick', seed: 3 });
   const accepted = await S.acceptNesting(db, c, f.lineId, plan);
   ok(`${label}: the Quick nest was accepted and wrote lots`, Number(accepted.lots) > 0, JSON.stringify(accepted).slice(0, 200));

@@ -233,6 +233,8 @@ try {
   ok('ownFreeStock (for the buy list) is ours only', own.get(F.P) === 4 && own.get(F.S) === 10, JSON.stringify([...own]));
 
   section('3. Nesting: their plates first on their order, never another customer\'s');
+  // §44: a line's nesting must be told which plates it may use before it runs.
+  await conn.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [F.LA, F.LB]]);
   const planA = await NEST.planNesting(conn, COMPANY, F.LA, { pack: onePerPlate, effort: 'quick', seed: 1 });
   const nestsA = planA.groups.flatMap((g) => g.nests);
   eq('4 pieces, one per plate: 4 lots', nestsA.length, 4);

@@ -4493,3 +4493,14 @@ SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND CONSTRAINT_NAME = 'fk_csrv_purchase_line');
 SET @sql = IF(@fk = 0, 'ALTER TABLE cf_stock_reservations ADD CONSTRAINT fk_csrv_purchase_line FOREIGN KEY (company_id, purchase_line_id) REFERENCES cf_purchase_order_lines(company_id, id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §44  Which plates a line's nesting may use: standard only, or standard + custom
+-- ============================================================================
+-- 'standard' | 'any'; NULL = not chosen yet, and a nesting run refuses until it
+-- is (nestingService.setNestPlates). A plate says STANDARD / CUSTOM through the
+-- PLATE_KIND option spec (tenant setup: scripts/cf_kepl/plate-kind-setup.mjs).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'nest_plates');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN nest_plates VARCHAR(16) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

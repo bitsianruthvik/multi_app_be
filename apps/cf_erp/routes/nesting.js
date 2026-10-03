@@ -7,6 +7,8 @@
  *   GET  /orders/:orderId/lines/:lineId/nesting/choices  the pieces (Step A) and plates (Step B) a run considers
  *   PUT  /orders/:orderId/lines/:lineId/nesting/choices  { excludedCutPlateIds, excludedPlateIds } — the whole
  *                                                        selection (both empty = reset); applied by every run
+ *   PUT  /orders/:orderId/lines/:lineId/nesting/plates   { plates: 'standard' | 'any' } — which plates a run may use
+ *                                                        (§44; must be set before the first /plan)
  *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the nests as a workbook (Nests / Needed / How to use this)
  *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { file, filename, dryRun, force } — preview, or save
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
@@ -37,7 +39,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  planNesting, acceptNesting, getNesting, assertLineOnOrder, nestingChoices, saveNestingChoices,
+  planNesting, acceptNesting, getNesting, assertLineOnOrder, nestingChoices, saveNestingChoices, setNestPlates,
 } from '../services/nestingService.js';
 // The sheet is its own service: the workbook, its locked columns, its banner and
 // the diff a dry run reports are a different job from laying steel out, and
@@ -84,6 +86,9 @@ router.get('/orders/:orderId/lines/:lineId/nesting/choices', view,
 
 router.put('/orders/:orderId/lines/:lineId/nesting/choices', manage,
   handle((req) => write(req, (db, c, id) => saveNestingChoices(db, c, id, req.body ?? {}))));
+
+router.put('/orders/:orderId/lines/:lineId/nesting/plates', manage,
+  handle((req) => write(req, (db, c, id) => setNestPlates(db, c, id, req.body ?? {}))));
 
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id));

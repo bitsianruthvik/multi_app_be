@@ -342,6 +342,8 @@ try {
   eq('three rows in cf_nest_exclusions', Number(cnt.n), 3);
 
   section('3. Every run applies them');
+  // §44: a line's nesting must be told which plates it may use before it runs.
+  await conn.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [lineId]]);
   const plan = await S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 });
   ok('the left-out piece B is never placed', !pieceIds(plan).has(B));
   ok('A is placed', pieceIds(plan).has(A));
@@ -415,6 +417,34 @@ try {
   const look = await S.nestingChoices(conn, COMPANY, lineId);
   ok('...but can still look, and is told why it cannot save', look.canSave === false && /Freeze the design first/.test(look.readOnlyReason ?? ''));
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE id = ?', [lineId]);
+
+  section('7b. Standard or custom plates (§44): asked before the first run, then obeyed');
+  await conn.query('UPDATE cf_sales_order_lines SET nest_plates = NULL WHERE id = ?', [lineId]);
+  const notChosen = await refusal(() => S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 }));
+  eq('a line nobody has chosen for is not nested (PLATES_NOT_CHOSEN)', notChosen?.code, 'PLATES_NOT_CHOSEN');
+  eq('...and the choices say it is not chosen', (await S.nestingChoices(conn, COMPANY, lineId)).plateChoice, null);
+  const badChoice = await refusal(() => S.setNestPlates(conn, c, lineId, { plates: 'cheap' }));
+  eq('only standard or any can be chosen', badChoice?.code, 'INVALID');
+  await S.setNestPlates(conn, c, lineId, { plates: 'standard' });
+  const noStd = await S.nestingChoices(conn, COMPANY, lineId);
+  eq('standard chosen and remembered', noStd.plateChoice, 'standard');
+  ok('no fixture plate says Standard, so the steel is blocked — in words', noStd.groups.some((g) => /no standard plate/.test(g.blocked ?? '')), JSON.stringify(noStd.groups.map((g) => g.blocked)));
+  ok('each plate says its kind and that it is not allowed', noStd.groups.flatMap((g) => g.plates).every((p) => p.kind !== 'STANDARD' && p.allowed === false));
+  const planNone = await S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 });
+  ok('a run with no standard plate places nothing and says why', planNone.problems.some((p) => /no standard plate/.test(p)), JSON.stringify(planNone.problems));
+  const [[kindSpec]] = await conn.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'PLATE_KIND' AND deleted_at IS NULL", [COMPANY]);
+  const [[stdOpt]] = await conn.query("SELECT id FROM cf_spec_options WHERE specification_id = ? AND value = 'STANDARD' AND deleted_at IS NULL", [kindSpec.id]);
+  await conn.query("UPDATE cf_spec_values SET deleted_at = NOW() WHERE subject_type = 'master' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL", [P1, kindSpec.id]);
+  await conn.query("INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, option_id, source) VALUES (?, ?, 'master', ?, ?, 'entered')", [COMPANY, kindSpec.id, P1, stdOpt.id]);
+  const planStd = await S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 });
+  ok('with P1 marked Standard, only P1 is offered', sheetsSeen.at(-1).length > 0 && sheetsSeen.at(-1).every((k) => k.startsWith(`pl${P1}`)), JSON.stringify(sheetsSeen.at(-1)));
+  ok('...and the pieces are placed', pieceIds(planStd).size > 0);
+  const stdView = await S.nestingChoices(conn, COMPANY, lineId);
+  ok('the view counts one standard plate and P1 is allowed', stdView.plateKinds.standard >= 1 && stdView.groups.flatMap((g) => g.plates).some((p) => p.plateItemId === P1 && p.kind === 'STANDARD' && p.allowed));
+  await S.setNestPlates(conn, c, lineId, { plates: 'any' });
+  await conn.query("UPDATE cf_spec_values SET deleted_at = NOW() WHERE subject_type = 'master' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL", [P1, kindSpec.id]);
+  const planAny = await S.planNesting(conn, COMPANY, lineId, { pack: spyPacker, effort: 'quick', seed: 7 });
+  ok('standard and custom: P1, no longer marked Standard, is offered and used', sheetsSeen.at(-1).some((k) => k.startsWith(`pl${P1}`)) && pieceIds(planAny).size > 0 && !planAny.problems.some((p) => /no standard plate/.test(p)), JSON.stringify(sheetsSeen.at(-1)));
 
   section('8. The rule check (pure)');
   const good = S.nestRules({

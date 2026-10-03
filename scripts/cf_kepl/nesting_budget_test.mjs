@@ -154,6 +154,8 @@ console.log('\n3. planNesting on the KEPL line, one worker, a 20 s budget');
     const t0 = Date.now();
     let plan = null;
     try {
+      // §44: a line's nesting must be told which plates it may use before it runs.
+      await conn.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id IN (?)", [COMPANY, [LINE]]);
       plan = await S.planNesting(conn, COMPANY, LINE, { effort: 'standard', budgetMs: BUDGET, workers: 1, replaceImported: true });
     } catch (e) {
       console.log(`  SKIP  line ${LINE} of company ${COMPANY} could not be planned here (${e.message}) — sections 1-2 still stand`);
