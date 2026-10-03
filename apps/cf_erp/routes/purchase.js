@@ -3,7 +3,6 @@
  *
  *   GET    /buy-list?show=&search=&summary=   what is short, item by item, each with estUnitPrice/estSource/estCost;
  *                                      summary=1 returns { rows, total: { estCost, currency, items, unpricedItems } }
- *   POST   /buy-list/suggest            writes (or rewrites) the suggested draft order
  *   GET    /purchase-orders?status=&supplierId=&search=
  *   POST   /purchase-orders             { code?, supplierId?, expectedDate?, notes? }
  *   GET    /purchase-orders/:id
@@ -25,7 +24,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  buyList, suggestPurchase, listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, updatePurchaseOrder,
+  buyList, listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, updatePurchaseOrder,
   addPurchaseLine, updatePurchaseLine, removePurchaseLine, markOrdered, cancelPurchaseOrder, receiveLine, buyListTotal,
   setPurchaseLineOrders,
 } from '../services/purchaseService.js';
@@ -42,7 +41,6 @@ router.get('/buy-list', view, handle(async (req) => {
   const rows = await buyList(pool, company(req), req.query);
   return String(req.query.summary ?? '') === '1' ? { rows, total: buyListTotal(rows) } : rows;
 }));
-router.post('/buy-list/suggest', manage, handle((req) => tx(req, (db, c) => suggestPurchase(db, c))));
 
 router.get('/purchase-orders', view, handle((req) => listPurchaseOrders(pool, company(req), req.query)));
 router.post('/purchase-orders', manage, handle((req) => tx(req, (db, c) => createPurchaseOrder(db, c, req.body ?? {}))));

@@ -68,11 +68,15 @@ const fmt = (n) => Number(Number(n).toFixed(3));
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-export const PO_STATUSES = ['draft', 'ordered', 'partially_received', 'received', 'cancelled'];
+// §46 (CF_ERP_PURCHASE_FLOW_PLAN.md): requested → quoting → ordered → partially_received → received.
+// 'draft' is the old word for requested; nothing is written as draft any more.
+export const PO_STATUSES = ['requested', 'quoting', 'ordered', 'partially_received', 'received', 'cancelled'];
+/** Not yet sent to a supplier: still being requested / quoted — editable, not receivable. */
+export const PRE_ORDER_STATUSES = ['requested', 'quoting', 'draft'];
 /** Still expecting steel: these are what "on order" counts and what can be received against. */
-const OPEN_STATUSES = ['draft', 'ordered', 'partially_received'];
+const OPEN_STATUSES = ['requested', 'quoting', 'draft', 'ordered', 'partially_received'];
 export const PO_STATUS_LABEL = {
-  draft: 'Draft', ordered: 'Ordered', partially_received: 'Part received', received: 'Received', cancelled: 'Cancelled',
+  requested: 'Requested', quoting: 'Quoting', draft: 'Requested', ordered: 'Ordered', partially_received: 'Part received', received: 'Received', cancelled: 'Cancelled',
 };
 
 const readDate = (v, label, problems) => {
@@ -424,7 +428,7 @@ const outstandingOf = (l) => round6(Math.max(0, Number(l.quantity) - Number(l.qt
 /** Recomputes the order's status from its lines, after a receipt or a line change. */
 async function restate(db, companyId, poId) {
   const p = await requireOrder(db, companyId, poId);
-  if (p.status === 'draft' || p.status === 'cancelled') return p.status;
+  if (PRE_ORDER_STATUSES.includes(p.status) || p.status === 'cancelled') return p.status;
   const [lines] = await db.query(
     'SELECT quantity, qty_received FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL',
     [companyId, poId],
@@ -488,6 +492,8 @@ export async function getPurchaseOrder(db, companyId, id) {
     notes: p.notes,
     reverseCharge: !!Number(p.reverse_charge ?? 0),
     forOrder: forOrder ? { id: forOrder.id, code: forOrder.code } : null,
+    // §46: the stock check done (lane "Stock checked") — null until it is.
+    stockCheckedAt: p.stock_checked_at ?? null,
     createdAt: p.created_at,
     totals: {
       lines: lines.length, ordered, received, outstanding: round6(Math.max(0, ordered - received)),
@@ -614,7 +620,7 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
   }));
   if (!paged) return out;
   const [[byStatus], [[sum]]] = counted;
-  const statusCounts = countsBy(byStatus, ['draft', 'ordered', 'partially_received', 'received', 'cancelled']);
+  const statusCounts = countsBy(byStatus, PO_STATUSES);
   const all = Object.values(statusCounts).reduce((t, n) => t + n, 0);
   const open = OPEN_STATUSES.reduce((t, k) => t + (statusCounts[k] ?? 0), 0);
   return pageOf(out, sum.n, page, {
@@ -640,7 +646,7 @@ async function nextCode(db, c, { suggested = false } = {}) {
 export async function insertOrder(db, c, { code, supplierId, expectedDate, notes, suggested, forOrderId = null }) {
   const [r] = await db.query(
     `INSERT INTO cf_purchase_orders (company_id, code, supplier_id, status, suggested, expected_date, notes, for_order_id, created_by)
-     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, 'requested', ?, ?, ?, ?, ?)`,
     [c.companyId, code ?? null, supplierId ?? null, suggested ? 1 : 0, expectedDate ?? null, notes ?? null, forOrderId ?? null, c.userId],
   );
   if (!code) await db.query('UPDATE cf_purchase_orders SET code = ? WHERE id = ?', [`PO-${String(r.insertId).padStart(6, '0')}`, r.insertId]);
@@ -784,69 +790,10 @@ export async function setPurchaseLineOrders(db, c, lineId, input = {}) {
 
 // --- suggest, send, receive, cancel ----------------------------------------
 
-/**
- * Suggests what to buy: ONE draft order carrying every short item, rewritten
- * in place each time so pressing the button twice does not buy twice. What is
- * already on another open order is netted off — except this order's own lines,
- * which are about to be replaced.
- */
-export async function suggestPurchase(db, c) {
-  const [[open]] = await db.query(
-    "SELECT * FROM cf_purchase_orders WHERE company_id = ? AND suggested = 1 AND status = 'draft' AND deleted_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE",
-    [c.companyId],
-  );
-  // Released and planned rows of the same item become ONE line: the supplier is
-  // sent an item and a quantity, not our reasons for wanting it.
-  const byItem = new Map();
-  for (const r of await buyList(db, c.companyId, { show: 'short', exceptOrderId: open?.id ?? null })) {
-    const e = byItem.get(r.item.id);
-    if (e) { e.toBuy = round6(e.toBuy + r.toBuy); e.split = [...e.split, ...(r.split ?? [])]; }
-    else byItem.set(r.item.id, { ...r, split: [...(r.split ?? [])] });
-  }
-  const rows = [...byItem.values()];
-  // The old lines go, and with them the orders they were bought for.
-  const dropOld = async () => {
-    const [old] = await db.query('SELECT id FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, open.id]);
-    await dropAllocations(db, c.companyId, old.map((l) => l.id));
-  };
-  if (!rows.length) {
-    if (open) {
-      await dropOld();
-      await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, open.id]);
-      await db.query("UPDATE cf_purchase_orders SET status = 'cancelled' WHERE company_id = ? AND id = ?", [c.companyId, open.id]);
-    }
-    return { order: null, lines: 0, message: 'Nothing is short — every released or planned job has its material held, free in stock or on order.' };
-  }
-  let poId = open?.id ?? null;
-  if (poId) {
-    await dropOld();
-    await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, poId]);
-  } else {
-    poId = await insertOrder(db, c, {
-      code: await nextCode(db, c, { suggested: true }),
-      supplierId: null, expectedDate: null, suggested: true,
-      notes: 'Suggested from what the released and planned jobs are short of.',
-    });
-  }
-  let lineNo = 1;
-  await db.query(
-    `INSERT INTO cf_purchase_order_lines (company_id, purchase_order_id, line_no, item_id, quantity, uom, unit_price, currency)
-     VALUES ?`,
-    // Each line is priced at the last price paid (the buy list has read it). Never the
-    // list price: that is what WE sell at, not a price agreed with a supplier.
-    [rows.map((r) => [c.companyId, poId, lineNo++, r.item.id, r.toBuy, r.item.uom, r.estSource === 'last_paid' ? r.estUnitPrice : null, CURRENCY])],
-  );
-  // Each line is bought for the orders that were short of it, as much as each was short (init.sql §43).
-  const [fresh] = await db.query('SELECT id, item_id FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, poId]);
-  const lineOf = new Map(fresh.map((l) => [l.item_id, l.id]));
-  await insertAllocations(db, c, rows.flatMap((r) => r.split.map((x) => ({ lineId: lineOf.get(r.item.id), orderId: x.orderId, quantity: x.toBuy }))));
-  return { order: await getPurchaseOrder(db, c.companyId, poId), lines: rows.length, message: null };
-}
-
-/** Draft → ordered: the buyer has named the supplier and sent it. */
+/** Requested / quoting → ordered: the buyer has named the supplier and placed it (without an RFQ, or after one). */
 export async function markOrdered(db, c, id, input = {}) {
   const p = await requireOrder(db, c.companyId, id);
-  if (p.status !== 'draft') throw invalid('NOT_DRAFT', `${p.code} is already ${PO_STATUS_LABEL[p.status].toLowerCase()}.`);
+  if (!PRE_ORDER_STATUSES.includes(p.status)) throw invalid('NOT_DRAFT', `${p.code} is already ${PO_STATUS_LABEL[p.status].toLowerCase()}.`);
   const problems = [];
   let supplierId = p.supplier_id;
   if (!blank(input.supplierId)) { const s = await requireSupplier(db, c.companyId, input.supplierId, problems); supplierId = s?.id ?? supplierId; }
@@ -878,7 +825,7 @@ export async function cancelPurchaseOrder(db, c, id, input = {}) {
  */
 export async function receiveLine(db, c, lineId, input = {}) {
   const l = await requireLine(db, c.companyId, lineId);
-  if (l.po_status === 'draft') throw invalid('NOT_ORDERED', `${l.po_code} has not been sent yet — send it to the supplier first.`);
+  if (PRE_ORDER_STATUSES.includes(l.po_status)) throw invalid('NOT_ORDERED', `${l.po_code} has not been placed yet — place it with a supplier first.`);
   assertOpen({ status: l.po_status, code: l.po_code }, 'be received');
   const problems = [];
   const left = outstandingOf(l);
@@ -922,7 +869,7 @@ export function receiptLineFor(l, input, problems = []) {
 export async function purchaseCounts(db, companyId) {
   // Items, not rows: an item short on a released row and a planned row is one item to buy.
   const short = new Set((await buyList(db, companyId, { show: 'short' })).map((r) => r.item.id)).size;
-  const [[{ drafts }]] = await db.query("SELECT COUNT(*) AS drafts FROM cf_purchase_orders WHERE company_id = ? AND status = 'draft' AND deleted_at IS NULL", [companyId]);
+  const [[{ drafts }]] = await db.query("SELECT COUNT(*) AS drafts FROM cf_purchase_orders WHERE company_id = ? AND status IN ('requested','quoting','draft') AND deleted_at IS NULL", [companyId]);
   const [[{ awaiting }]] = await db.query("SELECT COUNT(*) AS awaiting FROM cf_purchase_orders WHERE company_id = ? AND status IN ('ordered','partially_received') AND deleted_at IS NULL", [companyId]);
   return { toBuy: short, draftOrders: Number(drafts), awaitingDelivery: Number(awaiting) };
 }

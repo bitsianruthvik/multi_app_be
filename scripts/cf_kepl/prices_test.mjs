@@ -19,7 +19,7 @@ import '../../apps/cf_erp/services/codegenProvider.js';
 import { createItem, createDefinition, updateRecord, getRecord } from '../../apps/cf_erp/services/masterRecordService.js';
 import {
   createPurchaseOrder, addPurchaseLine, updatePurchaseLine, markOrdered, getPurchaseOrder, listPurchaseOrders,
-  receiveLine, receiptLineFor, buyList, buyListTotal, suggestPurchase,
+  receiveLine, receiptLineFor, buyList, buyListTotal,
 } from '../../apps/cf_erp/services/purchaseService.js';
 import {
   createOrder, addOrderLine, updateOrderLine, getOrder, listOrders, setOrderStatus,
@@ -268,10 +268,12 @@ try {
   ok('quantities are what they were: C toBuy 7', row(C).toBuy === 7 && row(C).wanted === 7);
   const total = buyListTotal(rows);
   ok('total = A + P, one item unpriced', near(total.estCost, row(A).estCost + row(P).estCost) && total.unpricedItems === 1 && total.currency === 'INR', JSON.stringify(total));
-  const sug = await suggestPurchase(db, c);
-  const sa = sug.order.lines.find((l) => l.item.id === A);
-  const sp = sug.order.lines.find((l) => l.item.id === P);
-  ok('suggested order: A priced at the last price paid, P left unpriced (a list price is not a supplier price)', sa?.unitPrice === 100 && sp?.unitPrice === null, JSON.stringify({ sa: sa?.unitPrice, sp: sp?.unitPrice }));
+  // One-PO flow (§46): a request from the sales order prices its lines the same way Suggest did.
+  const { requestFromOrder } = await import('../../apps/cf_erp/services/purchaseFlowService.js');
+  const req = await requestFromOrder(db, c, so.id, { lines: [{ itemId: A, quantity: 1 }, { itemId: P, quantity: 1 }] });
+  const sa = req.lines.find((l) => l.item.id === A);
+  const sp = req.lines.find((l) => l.item.id === P);
+  ok('requested PO: A priced at the last price paid, P left unpriced (a list price is not a supplier price)', sa?.unitPrice === 100 && sp?.unitPrice === null, JSON.stringify({ sa: sa?.unitPrice, sp: sp?.unitPrice }));
 
   section('8. Helpers');
   ok('amountOf per metre without LENGTH → null with the reason', amountOf(10, 'metre', 2, { weightKg: 1, lengthM: null }).amount === null);

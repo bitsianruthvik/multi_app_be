@@ -16,7 +16,8 @@ import overviewRoutes from './overview.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
 import procurementRoutes from './procurement.js';
-import buyingRoutes from './buying.js';
+// One PO, stage by stage (§46) — replaces the Buying board and purchase requests.
+import purchaseFlowRoutes from './purchaseFlow.js';
 import processRoutes from './process.js';
 import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
@@ -105,7 +106,7 @@ router.use(overviewRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
 router.use(procurementRoutes);
-router.use(buyingRoutes);
+router.use(purchaseFlowRoutes);
 router.use(processRoutes);
 router.use(drawingRoutes);
 router.use(orderValuesRoutes);

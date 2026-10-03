@@ -272,7 +272,7 @@ try {
   ok('two draft POs, one per awarded supplier', made.purchaseOrders.length === 2 && made.purchaseOrders.every((p) => /^PO-\d{6}$/.test(p.code)), JSON.stringify(made.purchaseOrders.map((p) => p.code)));
   const po2 = await getPurchaseOrder(db, COMPANY, made.purchaseOrders.find((p) => p.supplier.id === S2).id);
   const po1 = await getPurchaseOrder(db, COMPANY, made.purchaseOrders.find((p) => p.supplier.id === S1).id);
-  ok('S2 PO: draft, supplier S2, A 4 @ 90, B 60 @ 12 (the offered quantity)', po2.status === 'draft' && po2.supplier?.id === S2
+  ok('S2 PO: requested (§46: a new PO starts requested), supplier S2, A 4 @ 90, B 60 @ 12 (the offered quantity)', po2.status === 'requested' && po2.supplier?.id === S2
     && po2.lines.find((l) => l.item.id === A)?.quantity === 4 && po2.lines.find((l) => l.item.id === A)?.unitPrice === 90
     && po2.lines.find((l) => l.item.id === B)?.quantity === 60 && po2.lines.find((l) => l.item.id === B)?.unitPrice === 12, JSON.stringify(po2.lines.map((l) => [l.item.code, l.quantity, l.unitPrice])));
   ok('S1 PO: C 7 @ 50; notes name the RFQ, quote, payment and freight', po1.lines.length === 1 && po1.lines[0].quantity === 7 && po1.lines[0].unitPrice === 50

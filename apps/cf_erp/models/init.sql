@@ -4583,3 +4583,48 @@ SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND CONSTRAINT_NAME = 'fk_cofc_batch');
 SET @sql = IF(@fk = 0, 'ALTER TABLE cf_offcuts ADD CONSTRAINT fk_cofc_batch FOREIGN KEY (company_id, batch_id) REFERENCES cf_stock_batches(company_id, id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §46  One purchase order, stage by stage (CF_ERP_PURCHASE_FLOW_PLAN.md)
+-- ============================================================================
+-- requested → quoting → ordered → partially_received → received (cancelled
+-- before). The RFQ lives UNDER its PO (cf_rfqs.purchase_order_id); each RFQ line
+-- names the PO line it quotes for (po_line_id). stock_checked_at marks the
+-- stock check done (stock held for the sales order, the PO cut to the rest).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders'
+               AND COLUMN_NAME = 'status' AND COLUMN_TYPE NOT LIKE '%''requested''%');
+SET @sql = IF(@col > 0,
+  "ALTER TABLE cf_purchase_orders MODIFY COLUMN status ENUM('draft','ordered','partially_received','received','cancelled','requested','quoting') NOT NULL DEFAULT 'requested'",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'stock_checked_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN stock_checked_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfqs' AND COLUMN_NAME = 'purchase_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_rfqs ADD COLUMN purchase_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfqs' AND INDEX_NAME = 'idx_crfq_po');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_rfqs ADD KEY idx_crfq_po (company_id, purchase_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfqs' AND CONSTRAINT_NAME = 'fk_crfq_po');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_rfqs ADD CONSTRAINT fk_crfq_po FOREIGN KEY (company_id, purchase_order_id) REFERENCES cf_purchase_orders(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfq_lines' AND COLUMN_NAME = 'po_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_rfq_lines ADD COLUMN po_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_rfq_lines' AND INDEX_NAME = 'idx_crfl_po_line');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_rfq_lines ADD KEY idx_crfl_po_line (company_id, po_line_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The old draft PO is a requested one now (idempotent: nothing is 'draft' after).
+UPDATE cf_purchase_orders SET status = 'requested' WHERE status = 'draft';

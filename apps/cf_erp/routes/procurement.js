@@ -58,22 +58,8 @@ const approve = guard(PERM.purchaseApprove);
 const body = (req) => req.body ?? {};
 
 // ---- purchase requests -------------------------------------------------------
-router.get('/purchase-requests', view, handle((req) => P.listRequests(pool, ctx(req).companyId, req.query)));
-router.post('/purchase-requests', manage, handle((req) => tx(req, (db, c) => P.createRequest(db, c, body(req)))));
-router.post('/buy-list/request', manage, handle((req) => tx(req, (db, c) => P.requestFromBuyList(db, c, body(req)))));
-router.get('/purchase-requests/:id', view, handle((req) => P.getRequest(pool, pctx(req), id(req))));
-router.put('/purchase-requests/:id', manage, handle((req) => tx(req, (db, c) => P.updateRequest(db, c, id(req), body(req)))));
-router.post('/purchase-requests/:id/lines', manage, handle((req) => tx(req, (db, c) => P.addRequestLine(db, c, id(req), body(req)))));
-router.put('/purchase-request-lines/:id', manage, handle((req) => tx(req, (db, c) => P.updateRequestLine(db, c, id(req), body(req)))));
-router.delete('/purchase-request-lines/:id', manage, handle((req) => tx(req, (db, c) => P.removeRequestLine(db, c, id(req)))));
-router.post('/purchase-requests/:id/submit', manage, handle((req) => tx(req, (db, c) => P.submitRequest(db, c, id(req)))));
-router.post('/purchase-requests/:id/approve', approve, handle((req) => tx(req, (db, c) => P.approveRequest(db, c, id(req), body(req)))));
-router.post('/purchase-requests/:id/reject', approve, handle((req) => tx(req, (db, c) => P.rejectRequest(db, c, id(req), body(req)))));
-router.post('/purchase-requests/:id/cancel', manage, handle((req) => tx(req, (db, c) => P.cancelRequest(db, c, id(req), body(req)))));
 
 // ---- RFQs ------------------------------------------------------------------------
-router.get('/rfqs', view, handle((req) => P.listRfqs(pool, ctx(req).companyId, req.query)));
-router.post('/rfqs', manage, handle((req) => tx(req, (db, c) => P.createRfq(db, c, body(req)))));
 router.get('/rfqs/:id', view, handle((req) => P.getRfq(pool, pctx(req), id(req))));
 router.put('/rfqs/:id', manage, handle((req) => tx(req, (db, c) => P.updateRfq(db, c, id(req), body(req)))));
 router.post('/rfqs/:id/suppliers', manage, handle((req) => tx(req, (db, c) => P.addRfqSupplier(db, c, id(req), body(req)))));
@@ -92,8 +78,6 @@ router.get('/quotes/:id', view, handle((req) => P.getQuote(pool, pctx(req), id(r
 router.put('/quotes/:id', manage, handle((req) => tx(req, (db, c) => P.updateQuote(db, c, id(req), body(req)))));
 router.get('/rfqs/:id/comparison', view, handle((req) => P.rfqComparison(pool, pctx(req), id(req))));
 router.post('/rfqs/:id/award', manage, handle((req) => tx(req, (db, c) => P.awardRfq(db, c, id(req), body(req)))));
-router.post('/rfqs/:id/create-pos', manage, handle((req) => tx(req, (db, c) => P.createPosFromRfq(db, c, id(req)))));
-router.post('/rfqs/:id/close', manage, handle((req) => tx(req, (db, c) => P.closeRfq(db, c, id(req)))));
 router.post('/rfqs/:id/cancel', manage, handle((req) => tx(req, (db, c) => P.cancelRfq(db, c, id(req)))));
 
 export default router;

@@ -1223,7 +1223,7 @@ async function loadOrderContext(db, companyId, order, lines) {
          FROM cf_purchase_order_lines l
          JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
         WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
-          AND p.status IN ('draft','ordered','partially_received')
+          AND p.status IN ('requested','quoting','draft','ordered','partially_received')
         GROUP BY l.item_id`,
       [companyId, ids],
     );

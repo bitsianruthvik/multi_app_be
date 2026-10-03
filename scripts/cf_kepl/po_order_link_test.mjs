@@ -20,13 +20,13 @@ import '../../apps/cf_erp/services/codegenProvider.js';
 import { createItem } from '../../apps/cf_erp/services/masterRecordService.js';
 import { createOrder, addOrderLine, setOrderStatus } from '../../apps/cf_erp/services/salesOrderService.js';
 import {
-  buyList, suggestPurchase, createPurchaseOrder, addPurchaseLine, updatePurchaseLine, setPurchaseLineOrders,
+  buyList, createPurchaseOrder, addPurchaseLine, updatePurchaseLine, setPurchaseLineOrders,
   markOrdered, receiveLine, getPurchaseOrder, listPurchaseOrders,
 } from '../../apps/cf_erp/services/purchaseService.js';
 import { releaseHold } from '../../apps/cf_erp/services/purchaseLinkService.js';
 import { splitTo } from '../../apps/cf_erp/services/procurementService.js';
 import { availability, reserveRelease } from '../../apps/cf_erp/services/releaseService.js';
-import { buyingBoard } from '../../apps/cf_erp/services/buyingBoardService.js';
+import { orderPurchase } from '../../apps/cf_erp/services/purchaseFlowService.js';
 import { itemStock } from '../../apps/cf_erp/services/stockService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -88,18 +88,17 @@ try {
   ok('A: wanted 16, to buy 16, nothing held', r.wanted === 16 && r.toBuy === 16 && r.held === 0, j(r));
   ok('split: SO1 10, SO2 6', j(r.split.map((x) => [x.orderCode, x.toBuy])) === j([[`${tag}-SO1`, 10], [`${tag}-SO2`, 6]]), j(r.split));
 
-  section('2. Suggest buys each line for the orders short of it');
-  // Other tenant data may be short too; only our item's line matters.
-  const sg = await suggestPurchase(db, c);
-  let po = sg.order;
+  section('2. One PO line bought for two orders (SO1 10 + SO2 6)');
+  // Suggest is gone (one-PO flow, §46): a shared line is set up by hand here.
+  let po = await createPurchaseOrder(db, c, {});
+  po = await addPurchaseLine(db, c, po.id, { itemId: A, quantity: 16, orderId: null });
+  po = await setPurchaseLineOrders(db, c, po.lines[0].id, { orders: [{ orderId: SO1.id, quantity: 10 }, { orderId: SO2.id, quantity: 6 }] });
   let la = po.lines.find((l) => l.item.id === A);
-  ok('Suggest line A 16, bought for SO1 10 + SO2 6, nothing unlinked',
+  ok('line A 16, bought for SO1 10 + SO2 6, nothing unlinked',
     la.quantity === 16 && j(la.orders.map((o) => [o.orderId, o.quantity])) === j([[SO1.id, 10], [SO2.id, 6]]) && la.unlinked === 0, j(la));
-  const again = (await suggestPurchase(db, c)).order;
-  const la2 = again.lines.find((l) => l.item.id === A);
-  ok('Suggest again rewrites the same PO; the line is bought for the same orders, not twice', again.id === po.id && sum(la2.orders) === 16, j(la2.orders));
+  ok('a new PO starts Requested', po.status === 'requested', po.status);
   r = await rowOf(A);
-  ok('after Suggest: to buy 0, on order 16 (all of it bought for these orders)', r.toBuy === 0 && r.onOrder === 16, j(r));
+  ok('then: to buy 0, on order 16 (all of it bought for these orders)', r.toBuy === 0 && r.onOrder === 16, j(r));
 
   section('3. A hand PO: the header order is the default for new lines');
   let hp = await createPurchaseOrder(db, c, { forOrderId: SO1.id });
@@ -157,13 +156,13 @@ try {
   ok('nothing reserved twice: 12 reserved of 12', avAfter.reserved === 12 && avAfter.free === 0, j(avAfter));
 
   section('8. The order\'s Buying stage sees its POs and holds');
-  const b2 = await buyingBoard(db, COMPANY, { orderId: SO2.id, includeClosed: 1 });
-  const poIds = b2.columns.flatMap((col) => col.cards).filter((x) => x.type === 'po').map((x) => x.id);
-  ok('SO2 board shows the Suggest PO (ordered, part received)', poIds.includes(po.id), j(poIds));
-  ok('SO2 board does not show the hand PO (its SO2 share was trimmed)', !poIds.includes(hp.id), j(poIds));
-  ok('SO2 held: one row, 2 of A, from the Suggest PO', b2.held?.total === 1 && b2.held.rows[0].quantity === 2 && b2.held.rows[0].purchaseOrder?.id === po.id, j(b2.held));
-  const b1 = await buyingBoard(db, COMPANY, { orderId: SO1.id, includeClosed: 1 });
-  ok('SO1 board shows the hand PO (bought for SO1 by hand)', b1.columns.flatMap((col) => col.cards).some((x) => x.type === 'po' && x.id === hp.id));
+  const b2 = await orderPurchase(db, COMPANY, SO2.id);
+  const poIds = b2.lanes.flatMap((l) => l.cards).map((x) => x.id);
+  ok('SO2 sees the shared PO (ordered, part received)', poIds.includes(po.id), j(poIds));
+  ok('SO2 does not see the hand PO (its SO2 share was trimmed)', !poIds.includes(hp.id), j(poIds));
+  ok('SO2 held: one row, 2 of A, from the shared PO', b2.held?.total === 1 && b2.held.rows[0].quantity === 2 && b2.held.rows[0].purchaseOrder?.id === po.id, j(b2.held));
+  const b1 = await orderPurchase(db, COMPANY, SO1.id);
+  ok('SO1 sees the hand PO (bought for SO1 by hand)', b1.lanes.flatMap((l) => l.cards).some((x) => x.id === hp.id));
   const st = await itemStock(db, COMPANY, A);
   const held = st.reservations.filter((v) => v.kind === 'held');
   ok('item stock lists the hold: SO2, from the PO, no line', held.length === 1 && held[0].order.id === SO2.id && held[0].purchaseOrder?.id === po.id && held[0].lineNo === null, j(held));
