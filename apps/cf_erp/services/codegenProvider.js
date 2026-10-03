@@ -895,7 +895,7 @@ const PIECE_TOKENS = [
   // User, 2026-09-26: under each parent piece a row's pieces take that row's
   // range, so the three pieces of a drilled copy after 23 plain ones are 24, 25, 26.
   {
-    key: 'piece.seq', label: 'Piece number under its parent piece — carries on across copied rows of the same short name (24, 25, 26); a grouped card shows its range (1-4)', available: true,
+    key: 'piece.seq', label: 'Piece number under its parent piece — carries on across copied rows of the same short name (24, 25, 26); the top piece carries on across the order’s lines of the same design (SPAN1, SPAN2 | SPAN3); a grouped card shows its range (1-4)', available: true,
     phrase: 'the piece number under its parent', example: '24',
     help: 'Its number under its parent piece. A copied row of the same short name carries on the count: 24, 25, 26. A grouped card shows its range, such as 1-4.',
   },

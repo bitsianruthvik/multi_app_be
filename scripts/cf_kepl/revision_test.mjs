@@ -442,7 +442,7 @@ try {
   await LOCK.lockLine(conn, c, a20.id);
   const a1Pieces = { 10: await livePieces(conn, a10.id), 20: await livePieces(conn, a20.id) };
   same('both girder lines locked: 25 pieces each, positions 01 and 02', [a1Pieces[10].length, a1Pieces[20].length, a1Pieces[10][0].code, a1Pieces[20][0].code],
-    [25, 25, `${A.code}-GR-01-1`, `${A.code}-GR-02-1`]);
+    [25, 25, `${A.code}-GR-01-1`, `${A.code}-GR-02-2`]);
   const shapes1 = { 10: await shapeOf(conn, a10.id), 20: await shapeOf(conn, a20.id), 40: await shapeOf(conn, a40.id) };
   const values1 = { 10: await valuesOf(conn, shapes1[10]), 20: await valuesOf(conn, shapes1[20]), 40: await valuesOf(conn, shapes1[40]) };
 
@@ -594,7 +594,7 @@ try {
   eq('so does Home\'s inquiries queue', await cockpitInquiries(), inquiriesBefore + 1);
   const ph10 = await PH.linePlaceholders(conn, COMPANY, b10.id);
   const ph20 = await PH.linePlaceholders(conn, COMPANY, b20.id);
-  same('rev 2\'s lines take the positions rev 1 locked them at', [ph10.position, ph20.position, ph10.rows[0]?.code, ph20.rows[0]?.code], [1, 2, `${A.code}-GR-01-1`, `${A.code}-GR-02-1`]);
+  same('rev 2\'s lines take the positions rev 1 locked them at', [ph10.position, ph20.position, ph10.rows[0]?.code, ph20.rows[0]?.code], [1, 2, `${A.code}-GR-01-1`, `${A.code}-GR-02-2`]);
 
   /* ---- 5. lock in rev 2 ---------------------------------------------------------- */
   section('5. Locking rev 2 retires rev 1\'s pieces, and the codes come back identical');

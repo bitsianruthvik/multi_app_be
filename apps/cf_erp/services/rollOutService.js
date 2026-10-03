@@ -407,7 +407,10 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
   // one count, and it starts again under the next parent piece. The line's own
   // item is not on a BOM row: its pieces are 1 … n on the order line.
   const lineRanges = await rangesOfBoms(db, companyId, [...new Set(all.filter((n) => n.made && n.bom).map((n) => n.bom.id))]);
-  const laid = layOutPieces(root, { quantity: qty, lineRanges, sourceDef, rootAsMaterial: line.order_type !== 'stock' });
+  // The line's own pieces carry on from the order's earlier lines of the same
+  // design (user, 2026-10-03): span qty 2 then span qty 1 = SPAN1, SPAN2, SPAN3.
+  const rootStart = line.id != null && line.order_id != null ? rootStartAmong(await siblingLines(db, companyId, line.id), line.id) : 1;
+  const laid = layOutPieces(root, { quantity: qty, lineRanges, sourceDef, rootAsMaterial: line.order_type !== 'stock', rootStart });
   problems.push(...laid.problems);
   return { problems, fromNothing, tree, all, detail, nodes: laid.nodes, reqs: laid.reqs, truncated: laid.truncated, openPlates };
 }
@@ -426,10 +429,11 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {
  *   lineRanges    rangesOfBoms() over the BOMs of the made nodes
  *   sourceDef     item id -> the template definition it came from (madeFrom)
  *   rootAsMaterial  a root that is not made becomes a requirement (not on a stock order)
+ *   rootStart     the root's first piece number (rootStartAmong; 1 off an order)
  *
  * Returns { nodes, reqs, problems, truncated } — the shapes rollOutPlan documents.
  */
-export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef = new Map(), rootAsMaterial = true }) {
+export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef = new Map(), rootAsMaterial = true, rootStart = 1 }) {
   const problems = [];
   const qty = Number(quantity);
   const nodes = [];
@@ -437,13 +441,13 @@ export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef
   const counters = new Map();   // piece.no: one counter per DESIGN across the whole line
   const rangeOfRow = (d) => (d.lineId != null ? lineRanges.get(d.lineId) ?? null : null);
   const seqOfPiece = (d, i) => {
-    if (d.lineId == null) return i + 1;
+    if (d.lineId == null) return rootStart + i;
     const r = rangeOfRow(d);
     return r?.start != null ? r.start + i : null;
   };
   const seqOfGroup = (d, count) => {
     if (!whole(count)) return null;
-    const start = d.lineId == null ? 1 : rangeOfRow(d)?.start;
+    const start = d.lineId == null ? rootStart : rangeOfRow(d)?.start;
     return start != null ? seqValue(start, Math.round(count)) : null;
   };
   // Children in the order the rows are shown (line number, then line id), so
@@ -532,14 +536,44 @@ export function positionAmong(siblings, lineId) {
 }
 
 /**
+ * The line's FIRST piece number: 1 + the pieces of the order's lines of the
+ * same design that stand before it by position (positionAmong). Position and
+ * quantity merged into ONE count, as rows below already are (user, 2026-10-03):
+ * a span line of 2 at position 1 and one of 1 at position 2 are SPAN1, SPAN2,
+ * SPAN3. Pure. A quantity that is not whole counts rounded up — a piece number
+ * is a whole piece. A frozen line keeps the start it was frozen with (own_start)
+ * and a revision's copy of a frozen line keeps that line's (kept_start).
+ */
+export function rootStartAmong(siblings, lineId) {
+  const me = siblings.find((x) => Number(x.id) === Number(lineId));
+  // Frozen: the numbers it was frozen with. Copied in a revision from a frozen
+  // line: that line's numbers, so it locks to exactly its old codes (as its
+  // position is kept) — the pieces of the earlier revision count, retired or not.
+  if (me?.locked_at && me.own_start != null) return Number(me.own_start);
+  if (me?.kept_start != null) return Number(me.kept_start);
+  const posOf = new Map(siblings.map((s) => [Number(s.id), positionAmong(siblings, s.id)]));
+  const mine = posOf.get(Number(lineId)) ?? positionAmong(siblings, lineId);
+  let before = 0;
+  for (const s of siblings) {
+    if (Number(s.id) === Number(lineId)) continue;
+    if (posOf.get(Number(s.id)) < mine) before += Math.ceil(Number(s.quantity) - 1e-9);
+  }
+  return before + 1;
+}
+
+/**
  * The live lines of an order that sell the same design as this one, in line
  * order — one query. `kept_position` is the position of the locked line a
  * revision's line was copied from (positionAmong).
  */
 export async function siblingLines(db, companyId, lineId) {
   const [rows] = await db.query(
-    `SELECT s.id, s.line_no, s.locked_at, s.lock_position,
-            IF(pv.locked_at IS NOT NULL, pv.lock_position, NULL) AS kept_position
+    `SELECT s.id, s.line_no, s.locked_at, s.lock_position, s.quantity,
+            IF(pv.locked_at IS NOT NULL, pv.lock_position, NULL) AS kept_position,
+            (SELECT MIN(CAST(SUBSTRING_INDEX(p.piece_seq, '-', 1) AS UNSIGNED)) FROM cf_order_pieces p
+              WHERE p.company_id = s.company_id AND p.order_line_id = s.id AND p.depth = 0 AND p.deleted_at IS NULL) AS own_start,
+            (SELECT MIN(CAST(SUBSTRING_INDEX(p.piece_seq, '-', 1) AS UNSIGNED)) FROM cf_order_pieces p
+              WHERE p.company_id = pv.company_id AND p.order_line_id = pv.id AND p.depth = 0 AND pv.locked_at IS NOT NULL) AS kept_start
        FROM cf_sales_order_lines l
        JOIN cf_sales_order_lines s ON s.company_id = l.company_id AND s.order_id = l.order_id
                                   AND s.design_id = l.design_id AND s.deleted_at IS NULL
@@ -647,12 +681,12 @@ function numbersInTurn(db) {
   return new Proxy(db, { get: (target, prop) => (prop === 'query' ? query : Reflect.get(target, prop)) });
 }
 
-const pad2 = (n) => String(n ?? '').padStart(2, '0');
 
 /**
  * The built-in code, for a piece no coding rule applies to — the house shape,
  * built from SHORT NAMES and never from a row's code (a row has none):
- *   the top    {order code}-{short name}-{line position, 2 digits}-{piece seq}
+ *   the top    {order code}-{short name}{piece seq} — piece numbers run on across
+ *              the order's lines of the same design (rootStartAmong)
  *   below      {parent code}-{short name}{piece seq}
  * The top carries the order code, so two orders making the same thing cannot
  * collide (ARCHITECTURE.md §13); everything below carries its parent's code.
@@ -664,7 +698,7 @@ export async function builtInCode(n, parentCode, line, linePosition, memo) {
   const short = shortNameOf(item ?? { name: n.design.name }, def) ?? `I${n.itemId}`;
   const seq = n.pieceSeq ?? n.pieceNo ?? '';
   if (n.parentK == null) {
-    return [line.order_code, short, pad2(linePosition ?? 1), seq].filter((x) => x != null && String(x) !== '').join('-');
+    return [line.order_code, `${short}${seq}`].filter((x) => x != null && String(x) !== '').join('-');
   }
   return `${parentCode}-${short}${seq}`;
 }

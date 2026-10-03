@@ -502,7 +502,7 @@ try {
   await fillThickness(conn, c, f, c40.id);
   eq('a line added after: its rank is 3, but 03 is held by a locked line — so the next free, 04', (await LOCK.lockPlan(conn, COMPANY, c40.id)).position.value, 4);
   await LOCK.lockLine(conn, c, c40.id);
-  same('and it locks as 04', [(await lineRow(conn, c40.id)).lock_position, (await livePieces(conn, c40.id))[0].code], [4, `${Cq.code}-GR-04-1`]);
+  same('and it locks as 04, its girder numbered after the order\'s earlier girders (3)', [(await lineRow(conn, c40.id)).lock_position, (await livePieces(conn, c40.id))[0].code], [4, `${Cq.code}-GR-04-3`]);
 
   /* ---- 6. duplicates, taken codes, holes ---------------------------------------- */
   section('6. Lock refuses two pieces with one code, a code another line holds, and a rule with a hole');

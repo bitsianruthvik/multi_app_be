@@ -846,7 +846,31 @@ async function blankValueChecker(db, companyId, fresh, cutPlateId) {
     }
     x.values = [...sizes.out, ...steel.out];
   };
-  return { rules, options, check };
+  /**
+   * An EXISTING blank's steel gaps: what its chain requires that it holds no
+   * value for and one of its parts can answer. Only ever fills — a value the
+   * blank already has is never touched. A part that cannot answer leaves the
+   * gap (and the Values stage keeps saying so). Returns [{ spec, typed }].
+   */
+  const fill = async (x) => {
+    const own = x.cp.values ?? new Map();
+    const gaps = rules.extras.filter((code) => {
+      const row = own.get(String(code).toUpperCase());
+      return !row || rawOf(row, row.data_type) == null || rawOf(row, row.data_type) === '';
+    });
+    if (!gaps.length) return [];
+    const asked = [];
+    for (const code of gaps) {
+      for (const part of x.group.parts) {
+        const row = (part.values ?? new Map()).get(String(code).toUpperCase());
+        const value = row ? rawOf(row, row.data_type) : null;
+        if (value != null && value !== '') { asked.push({ code, value }); break; }
+      }
+    }
+    const steel = await typed(asked);
+    return steel.out;                                       // a part's answer the rule refuses stays a gap
+  };
+  return { rules, options, check, fill };
 }
 
 /**
@@ -1146,6 +1170,70 @@ async function loopChecker(db, companyId, plan) {
  * Writes the plan, a fixed number of statements whatever its size. Everything
  * that can be refused is refused before the first write.
  */
+/** New value rows on blanks with their history, as setValues writes them. given: [{ subjectId, spec, typed }]. 3 statements. */
+async function insertBlankValues(db, c, given) {
+  const { companyId } = c;
+  if (!given.length) return;
+  await insertRows(db, 'cf_spec_values',
+    ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source', 'created_by'],
+    given.map((w) => [companyId, w.spec.id, 'master', w.subjectId, w.typed.value_number, w.typed.value_text, w.typed.value_bool,
+      w.typed.value_date, w.typed.option_id, w.spec.unit ?? null, 'entered', c.userId]));
+  const [back] = await db.query(
+    `SELECT id, subject_id, specification_id FROM cf_spec_values
+      WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND specification_id IN (?) AND deleted_at IS NULL`,
+    [companyId, [...new Set(given.map((w) => w.subjectId))], [...new Set(given.map((w) => w.spec.id))]],
+  );
+  const idOf = new Map(back.map((r) => [`${r.subject_id}:${r.specification_id}`, r.id]));
+  await insertRows(db, 'cf_spec_value_history',
+    ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
+    given.map((w) => {
+      const valueId = idOf.get(`${w.subjectId}:${w.spec.id}`);
+      if (!valueId) throw new Error(`cf_erp: value row for specification ${w.spec.id} on master ${w.subjectId} vanished between insert and read-back.`);
+      return [companyId, valueId, w.spec.id, 'master', w.subjectId, 'create', null, JSON.stringify(snapshot(w.typed, 'entered', w.spec.unit ?? null)), c.userId];
+    }));
+}
+
+/**
+ * STEEL A BLANK MISSED (2026-10-03). A blank copies its steel (IMPACT_CLASS…)
+ * from its part only when it is MADE. A blank whose size did not change is
+ * left alone by every later derive — so a value filled on the part after the
+ * blank was made never reached it, and the Freeze checklist kept counting it
+ * missing while the Structure grid (which hides cut pieces) said all filled.
+ * Every derive now fills such gaps on existing blanks: only empty values, only
+ * from a part's stored answer. Nothing to fill = 0 statements past one cheap
+ * pre-check; otherwise 1 rules read + 3 writes. Returns how many were filled.
+ */
+async function fillBlankGaps(db, c, places, plan) {
+  const existing = plan.groups.filter((x) => !x.isNew && x.cp);
+  // Pre-check without reading any rule. Every blank sits on the same node, so a
+  // steel code its chain asks for is one some blank of the line already holds
+  // (it was given at birth). A gap = such a code, empty on this blank, that one
+  // of its parts holds. (If EVERY blank missed it, this cannot see it — the
+  // Values stage still names it; a part-only code like HOLED never costs a read.)
+  const filledOn = (row) => row && rawOf(row, row.data_type) != null && rawOf(row, row.data_type) !== '';
+  const blankCodes = new Set();
+  for (const x of existing) for (const [k, row] of x.cp.values ?? new Map()) if (!SPEC_CODES.includes(k) && filledOn(row)) blankCodes.add(k);
+  const maybe = existing.filter((x) => {
+    const own = x.cp.values ?? new Map();
+    return [...blankCodes].some((k) => !filledOn(own.get(k)) && x.group.parts.some((part) => filledOn((part.values ?? new Map()).get(k))));
+  });
+  if (!maybe.length) return 0;
+  const checker = await blankValueChecker(db, c.companyId, [], places.cutPlate.id);
+  if (!checker.rules.extras.length) return 0;
+  const given = [];
+  for (const x of maybe) for (const w of await checker.fill(x)) given.push({ subjectId: x.cp.id, ...w });
+  // A blank may hold a deleted-or-empty row for the spec: soft-delete it first so the new one is the only live row.
+  if (given.length) {
+    await db.query(
+      `UPDATE cf_spec_values SET deleted_at = NOW()
+        WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND (subject_id, specification_id) IN (${given.map(() => '(?, ?)').join(', ')})`,
+      [c.companyId, ...given.flatMap((w) => [w.subjectId, w.spec.id])],
+    );
+    await insertBlankValues(db, c, given);
+  }
+  return given.length;
+}
+
 async function applyPlan(db, c, { line, places, selection, flowId, state, plan }) {
   const { companyId } = c;
   const fresh = plan.groups.filter((x) => x.isNew);
@@ -1255,28 +1343,7 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
 
   // 4. The new blanks' own values — the four sizes and the steel of the part —
   //    with their history, as setValues writes them.
-  if (fresh.length) {
-    const given = fresh.flatMap((x) => x.values.map((w) => ({ subjectId: x.cp.id, ...w })));
-    if (given.length) {
-      await insertRows(db, 'cf_spec_values',
-        ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source', 'created_by'],
-        given.map((w) => [companyId, w.spec.id, 'master', w.subjectId, w.typed.value_number, w.typed.value_text, w.typed.value_bool,
-          w.typed.value_date, w.typed.option_id, w.spec.unit ?? null, 'entered', c.userId]));
-      const [back] = await db.query(
-        `SELECT id, subject_id, specification_id FROM cf_spec_values
-          WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND specification_id IN (?) AND deleted_at IS NULL`,
-        [companyId, fresh.map((x) => x.cp.id), [...new Set(given.map((w) => w.spec.id))]],
-      );
-      const idOf = new Map(back.map((r) => [`${r.subject_id}:${r.specification_id}`, r.id]));
-      await insertRows(db, 'cf_spec_value_history',
-        ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
-        given.map((w) => {
-          const valueId = idOf.get(`${w.subjectId}:${w.spec.id}`);
-          if (!valueId) throw new Error(`cf_erp: value row for specification ${w.spec.id} on master ${w.subjectId} vanished between insert and read-back.`);
-          return [companyId, valueId, w.spec.id, 'master', w.subjectId, 'create', null, JSON.stringify(snapshot(w.typed, 'entered', w.spec.unit ?? null)), c.userId];
-        }));
-    }
-  }
+  if (fresh.length) await insertBlankValues(db, c, fresh.flatMap((x) => x.values.map((w) => ({ subjectId: x.cp.id, ...w }))));
 
   // 5. Plate lines that move: a default filled in, a quantity that follows the
   //    parts or the plate.
@@ -1377,6 +1444,7 @@ async function deriveOpened(db, c, { line, flowId, places, selection, state }, p
   const p = plan ?? await planFor(db, c.companyId, { line, state, selection });
   const changed = writes(p);
   const removed = changed ? await applyPlan(db, c, { line, places, selection, flowId, state, plan: p }) : [];
+  const filled = await fillBlankGaps(db, c, places, p);
   const out = p.groups.map((x) => describe(x.cp, x.group.size, x.group.parts, x.plateLine));
   const created = p.groups.filter((x) => x.isNew).length;
   const updated = p.groups.filter((x) => !x.isNew && x.plateLine.changed).length;
@@ -1386,7 +1454,8 @@ async function deriveOpened(db, c, { line, flowId, places, selection, state }, p
     updated,
     removed,
     unchanged: out.length - created - updated,
-    changed,
+    changed: changed || filled > 0,
+    filled,
   };
 }
 
@@ -1610,7 +1679,9 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
 
   // Nothing would change: done, whatever the values say.
   if (plan && !writes(plan)) {
-    return stop('up_to_date', `The ${plural(plan.groups.length, 'cut piece')} of line ${line.line_no} already match its parts.`, { cutPieces: plan.groups.length });
+    // Same pieces — but one may still lack steel its part has since been given.
+    const filled = await fillBlankGaps(db, c, places, plan);
+    return stop('up_to_date', `The ${plural(plan.groups.length, 'cut piece')} of line ${line.line_no} already match its parts.`, { cutPieces: plan.groups.length, filled });
   }
 
   // Something would change — but only once the values are complete.

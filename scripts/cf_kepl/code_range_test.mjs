@@ -360,7 +360,7 @@ try {
   const withTwo = await SO.addOrderLine(conn, c, order.id, { recordId: f.GR.id, quantity: 1 });
   const second = withTwo.lines.find((l) => l.id !== orderLine.id);
   eq('a second girder line on the order is position 2', await RO.linePositionOf(conn, COMPANY, second.id), 2);
-  eq('its placeholder says so: …-02-1 (one girder, so its number shows)', phOfLine(await linePlaceholders(conn, COMPANY, second.id)), `${tag}-SO-GR${tag}-02-1`);
+  eq('its placeholder says so: …-02-3 (one girder; piece numbers run on after the first line\'s two)', phOfLine(await linePlaceholders(conn, COMPANY, second.id)), `${tag}-SO-GR${tag}-02-3`);
   await SO.removeOrderLine(conn, c, orderLine.id);
   eq('the first line deleted before anything was locked: the second is now 1 — no "2"', await RO.linePositionOf(conn, COMPANY, second.id), 1);
   eq('and its placeholder is …-01-1', phOfLine(await linePlaceholders(conn, COMPANY, second.id)), `${tag}-SO-GR${tag}-01-1`);
