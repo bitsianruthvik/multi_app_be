@@ -4591,6 +4591,17 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- before). The RFQ lives UNDER its PO (cf_rfqs.purchase_order_id); each RFQ line
 -- names the PO line it quotes for (po_line_id). stock_checked_at marks the
 -- stock check done (stock held for the sales order, the PO cut to the rest).
+-- TiDB will not change a column a generated column reads. suggest_live (one
+-- open Suggest draft per company) read status — Suggest is gone, so the key and
+-- the column go first; then the status list can grow.
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND INDEX_NAME = 'uq_cpo_suggest');
+SET @sql = IF(@ix > 0, 'ALTER TABLE cf_purchase_orders DROP INDEX uq_cpo_suggest', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'suggest_live');
+SET @sql = IF(@col > 0, 'ALTER TABLE cf_purchase_orders DROP COLUMN suggest_live', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders'
                AND COLUMN_NAME = 'status' AND COLUMN_TYPE NOT LIKE '%''requested''%');
