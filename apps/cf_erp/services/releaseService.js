@@ -34,6 +34,8 @@ import { cellOwnersOfLine } from './workOrderService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
 import { ownHoldRows, takeHolds, writeHoldTakes } from './purchaseLinkService.js';
+// The production ledger (§45): every step change is followed by its stock move.
+import { ledgerOnSteps, wipArea, writeTransform } from './productionLedgerService.js';
 import {
   availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
   lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, CUT_PLATE_CODE, MAX_DEPTH,
@@ -384,7 +386,7 @@ function findCycle(nodes, steps, deps) {
 // wrote. No column was added for it.
 
 /** The live plate lots of some lines, with how many pieces of each cut plate sit on each. Map(lineId -> Map(lotId -> lot)). One query. */
-async function lotsOfLines(db, companyId, lineIds) {
+export async function lotsOfLines(db, companyId, lineIds) {
   const out = new Map();
   if (!lineIds.length) return out;
   const [rows] = await db.query(
@@ -1903,6 +1905,7 @@ export async function startStep(db, c, stepId, input = {}) {
     [...(at == null ? [] : [at]), machineId, c.companyId, step.id],
   );
   await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });
+  await ledgerOnSteps(db, c, [step.id]);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
@@ -1929,6 +1932,7 @@ export async function recordProgress(db, c, stepId, input = {}) {
     [newGood, round6(scrap), done ? 'done' : 'in_progress', ...(done && at != null ? [at] : []), c.companyId, step.id],
   );
   await logEvent(db, c, step.id, 'progress', { good: round6(good), scrap: round6(scrap), note: blank(input.note) ? null : String(input.note).slice(0, 500), at });
+  await ledgerOnSteps(db, c, [step.id]);
   if (done) await stockFinished(db, c, step.production_item_id);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
@@ -1977,6 +1981,37 @@ export async function stockFinished(db, c, productionItemId) {
     }
     areaId = resolved.area.id;
     await db.query('UPDATE cf_production_releases SET finished_area_id = ? WHERE company_id = ? AND id = ?', [areaId, c.companyId, it.release_id]);
+  }
+  // THE PRODUCTION LEDGER (§45): a piece that stood in work in progress as its
+  // own lot moves on to the finished area as that same lot, with the value it
+  // gathered — nothing is received from nowhere.
+  const wip = await wipArea(db, c);
+  const [[wipLot]] = await db.query(
+    `SELECT b.id, b.unit_cost, k.quantity FROM cf_stock_batches b
+       JOIN cf_stock_balances k ON k.batch_id = b.id AND k.stocking_area_id = ? AND k.company_id = b.company_id
+      WHERE b.company_id = ? AND b.production_item_id = ? AND b.deleted_at IS NULL AND k.quantity > 0 ORDER BY b.id LIMIT 1`,
+    [wip.id, c.companyId, it.id],
+  );
+  if (wipLot && Number(wipLot.quantity) + EPS >= quantity) {
+    const unit = wipLot.unit_cost == null ? null : Number(wipLot.unit_cost);
+    const movementId = await writeTransform(db, c, {
+      reference: `${it.order_code}/${it.line_no}`, notes: `Finished on ${it.order_code} line ${it.line_no}`,
+      orderId: it.order_id, orderLineId: it.order_line_id,
+      legs: [
+        { areaId: wip.id, itemId: it.item_id, batchId: wipLot.id, delta: -quantity, unitCost: unit, value: unit == null ? null : -quantity * unit },
+        { areaId: areaId, itemId: it.item_id, batchId: wipLot.id, delta: quantity, unitCost: unit, value: unit == null ? null : quantity * unit },
+      ],
+    });
+    await db.query('UPDATE cf_production_items SET stocked_qty = stocked_qty + ? WHERE company_id = ? AND id = ?', [quantity, c.companyId, it.id]);
+    await db.query('UPDATE cf_sales_order_lines SET made_qty = made_qty + ? WHERE company_id = ? AND id = ?', [quantity, c.companyId, it.order_line_id]);
+    if (it.order_type !== 'stock') {
+      await db.query(
+        `INSERT INTO cf_stock_reservations (company_id, requirement_id, order_line_id, item_id, batch_id, quantity, status, created_by)
+         VALUES (?, NULL, ?, ?, ?, ?, 'active', ?)`,
+        [c.companyId, it.order_line_id, it.item_id, wipLot.id, quantity, c.userId],
+      );
+    }
+    return { id: movementId };
   }
   // A unit-tracked piece is counted as a quantity for now (the user's "quantity
   // for now"); giving each unit its own number and history is a phase of its own.
@@ -2030,6 +2065,7 @@ export async function holdStep(db, c, stepId, input = {}) {
   // whether a later assignment in one UPDATE sees an earlier one.
   await db.query("UPDATE cf_production_steps SET held_from = ?, state = 'on_hold' WHERE company_id = ? AND id = ?", [step.state, c.companyId, step.id]);
   await logEvent(db, c, step.id, 'hold', { note: String(input.note).slice(0, 500) });
+  await ledgerOnSteps(db, c, [step.id]);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 
@@ -2039,6 +2075,7 @@ export async function resumeStep(db, c, stepId, input = {}) {
   if (step.state !== 'on_hold') throw invalid('INVALID', 'This step is not on hold.');
   await db.query('UPDATE cf_production_steps SET state = ?, held_from = NULL WHERE company_id = ? AND id = ?', [step.held_from ?? 'pending', c.companyId, step.id]);
   await logEvent(db, c, step.id, 'resume', { note: blank(input.note) ? null : String(input.note).slice(0, 500) });
+  await ledgerOnSteps(db, c, [step.id]);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 

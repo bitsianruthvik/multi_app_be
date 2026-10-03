@@ -25,6 +25,8 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { listAreas, createArea, updateArea, deleteArea } from '../services/stockingAreaService.js';
+// The production ledger (§45): work in progress by level, and offcut pieces with their outlines.
+import { wipStock, listOffcuts } from '../services/wipStockService.js';
 import {
   listBatches, getBatch, updateBatch, setBatchStatus, setBatchValues, getBatchHistory, batchTemplate,
 } from '../services/batchService.js';
@@ -47,6 +49,8 @@ router.delete('/stocking-areas/:id', manage, handle((req) => tx(req, (db, c) => 
 
 router.get('/stock', view, handle((req) => listStock(pool, company(req), req.query)));
 router.get('/stock/check', view, handle((req) => checkLedger(pool, company(req))));
+router.get('/stock/wip', view, handle((req) => wipStock(pool, company(req), req.query)));
+router.get('/offcuts', view, handle((req) => listOffcuts(pool, company(req), req.query)));
 router.get('/items/:id/stock', view, handle((req) => itemStock(pool, company(req), id(req))));
 router.get('/items/:id/batch-template', view, handle((req) => batchTemplate(pool, company(req), id(req))));
 

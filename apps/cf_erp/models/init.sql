@@ -4504,3 +4504,82 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'nest_plates');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN nest_plates VARCHAR(16) NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §45  The production ledger: stock follows the steel up and down the BOM
+-- ============================================================================
+-- CF_ERP_WIP_LEDGER_PLAN.md. Pieces JOIN their parent when the joining step
+-- STARTS; a piece SPLITS into its children when the splitting step is DONE; the
+-- top piece goes to finished stock when its flow is done. Every tracker node is
+-- a lot of its own (cf_stock_batches.production_item_id) in the company's ONE
+-- production WIP area. A 'transform' movement carries both sides of a move:
+-- what is consumed (negative legs) and what is made (positive), value conserved.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements'
+               AND COLUMN_NAME = 'movement_type' AND COLUMN_TYPE NOT LIKE '%''transform''%');
+SET @sql = IF(@col > 0,
+  "ALTER TABLE cf_stock_movements MODIFY COLUMN movement_type ENUM('receipt','issue','transfer','adjustment','scrap','return','transform') NOT NULL",
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- What each step has already posted, so the ledger is RECONCILED, never replayed:
+-- ledger_in = quantity joined into the node when this step started; ledger_out =
+-- quantity split out of it when this step was done. A correction posts the
+-- difference (negative = the exact reverse).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'ledger_in');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN ledger_in DECIMAL(18,6) NOT NULL DEFAULT 0, ADD COLUMN ledger_out DECIMAL(18,6) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A parent is a CONTAINER: one row per lot that joined it (a child node's lot,
+-- or bought material from a requirement), with the value it brought, until it
+-- leaves again (a split) — left_movement_id set.
+CREATE TABLE IF NOT EXISTS cf_wip_joins (
+  id                  INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT            NOT NULL,
+  parent_item_id      INT            NOT NULL,        -- cf_production_items: the container
+  step_id             INT            NOT NULL,        -- the step whose start joined it
+  child_item_id       INT            NULL,            -- cf_production_items: a made child
+  requirement_id      INT            NULL,            -- or bought material (a requirement)
+  item_id             INT            NOT NULL,        -- the stock item that went in
+  batch_id            INT            NULL,            -- the lot it came from (NULL = loose)
+  area_id             INT            NOT NULL,        -- the area it came from (a reverse puts it back there)
+  quantity            DECIMAL(18,6)  NOT NULL,
+  value               DECIMAL(18,2)  NULL,
+  joined_movement_id  INT            NOT NULL,
+  left_movement_id    INT            NULL,
+  left_step_id        INT            NULL,
+
+  deleted_at          DATETIME       DEFAULT NULL,
+  created_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT            NULL,
+
+  UNIQUE KEY uq_cwj_tenant (company_id, id),
+  KEY idx_cwj_parent (company_id, parent_item_id),
+  KEY idx_cwj_child  (company_id, child_item_id),
+  KEY idx_cwj_step   (company_id, step_id),
+
+  CONSTRAINT fk_cwj_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwj_parent  FOREIGN KEY (company_id, parent_item_id) REFERENCES cf_production_items(company_id, id),
+  CONSTRAINT fk_cwj_child   FOREIGN KEY (company_id, child_item_id)  REFERENCES cf_production_items(company_id, id),
+  CONSTRAINT fk_cwj_step    FOREIGN KEY (company_id, step_id)        REFERENCES cf_production_steps(company_id, id),
+  CONSTRAINT fk_cwj_req     FOREIGN KEY (company_id, requirement_id) REFERENCES cf_material_requirements(company_id, id),
+  CONSTRAINT fk_cwj_item    FOREIGN KEY (company_id, item_id)        REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_cwj_batch   FOREIGN KEY (company_id, batch_id)       REFERENCES cf_stock_batches(company_id, id),
+  CONSTRAINT fk_cwj_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- An offcut becomes a stock piece (a lot of one) when its plate is cut.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'batch_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_offcuts ADD COLUMN batch_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND INDEX_NAME = 'idx_cofc_batch');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_offcuts ADD KEY idx_cofc_batch (company_id, batch_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND CONSTRAINT_NAME = 'fk_cofc_batch');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_offcuts ADD CONSTRAINT fk_cofc_batch FOREIGN KEY (company_id, batch_id) REFERENCES cf_stock_batches(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

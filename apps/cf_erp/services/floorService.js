@@ -45,6 +45,8 @@ import { operationsForMachine, productionMachineIds } from './operationService.j
 import { machineCalendar } from './shiftService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import { LEAF_DEPTH, levelName } from './tree.js';
+// The production ledger (§45): every step change is followed by its stock move.
+import { ledgerOnSteps } from './productionLedgerService.js';
 
 const EPS = 1e-9;
 const round6 = (n) => Number(Number(n).toFixed(6));
@@ -326,6 +328,8 @@ async function applyStepChanges(db, c, { starts = [], counts = [] }) {
       await db.query(`INSERT INTO cf_step_events (${cols.join(', ')}) VALUES ${part.map(() => holes).join(', ')}`, part.flat());
     }
   }
+  // The production ledger (§45): every step started or counted here posts its stock move.
+  await ledgerOnSteps(db, c, [...startBy.keys(), ...byStep.keys()]);
   // Only the piece a line sells becomes stock, and only when all its steps are done.
   const tops = [...new Set(doneNow.filter((s) => s.item_parent_id == null).map((s) => s.production_item_id))];
   for (const itemId of tops) await stockFinished(db, c, itemId);
