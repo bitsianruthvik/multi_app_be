@@ -37,7 +37,7 @@ import { postMovement } from '../../apps/cf_erp/services/stockService.js';
 import { getAssignment, assignCells } from '../../apps/cf_erp/services/workOrderService.js';
 import { productionMachineIds } from '../../apps/cf_erp/services/operationService.js';
 import {
-  getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings, CONTRACTOR,
+  getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings, putLineSplit, CONTRACTOR,
 } from '../../apps/cf_erp/services/plannerService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -211,18 +211,16 @@ try {
   const idia = lineUnits.filter((u) => u.name === 'Intermediate diaphragm');
   const edia = lineUnits.filter((u) => u.name === 'End diaphragm');
   console.log(`        lots: ${[...idia, ...edia].map((u) => `${u.key} "${u.code}" ×${u.quantity} ${u.tonnes} t`).join(', ')}`);
-  ok('the intermediate diaphragms of a span are ONE unit — one per span', idia.length === 2 && looseRows.length === 2, `${idia.length} units, ${looseRows.length} rows`);
-  ok('keyed g<span piece>.<bom line>, quantity = how many (45), every piece listed', idia.every((u) => {
-    const r = looseRows.find((x) => u.key === `g${x.parent_id}.${x.bom_line_id}`);
-    return !!r && u.quantity === Number(r.q) && u.quantity === 45 && u.pieceIds?.length === Number(r.n) && u.pieceIds.includes(u.pieceId);
-  }), idia.map((u) => `${u.key}:${u.quantity}`).join(' '));
-  ok('a lot is one mark of its span, named by its parent and item', idia.every((u) => u.isMark && u.marks === 1 && u.lot === true
-    && u.groupKey === u.parentKey && byKey.get(u.parentKey)?.level === '0' && u.code.startsWith('SPAN-') && u.code.endsWith(' · Intermediate diaphragm')), idia.map((u) => u.code).join(' | '));
-  ok('the end diaphragms are a lot of 6 per span', edia.length === 2 && edia.every((u) => u.quantity === 6 && u.key.startsWith('g')));
-  ok('no loose diaphragm is left as a unit of its own', !lineUnits.some((u) => /diaphragm/i.test(u.name) && !u.lot));
+  // PLANNER V2 (user, 2026-10-04): each quantity ships on its own — no lot cards.
+  const totalIdia = looseRows.reduce((t, r) => t + Number(r.q), 0);
+  ok('the intermediate diaphragms are one unit EACH (no lot card) — 45 per span', idia.length === totalIdia && totalIdia === 90 && idia.every((u) => u.quantity === 1), `${idia.length} units of ${totalIdia}`);
+  ok('keyed p<piece> (or p<piece>#n for one row of N), never g…', idia.every((u) => /^p[0-9]+(#[0-9]+)?$/.test(u.key)) && !lineUnits.some((u) => u.key.startsWith('g')), idia.slice(0, 4).map((u) => u.key).join(' '));
+  ok('each diaphragm is one mark of its span', idia.every((u) => u.isMark && u.marks === 1 && u.groupKey === u.parentKey && byKey.get(u.parentKey)?.level === '0'));
+  ok('the end diaphragms are 6 units per span', edia.length === 12 && edia.every((u) => u.quantity === 1));
+  ok('every unit carries its work as stages, deepest level first', lineUnits.every((u) => Array.isArray(u.stages) && u.stages.every((st, i) => i === 0 || st.depth < u.stages[i - 1].depth)));
   ok('a real mark (a segment) is never grouped', segments.every((u) => u.key.startsWith('p') && !u.lot));
-  ok('a span counts each lot as one mark', spans.every((u) => u.marks === children(u).reduce((t, x) => t + x.marks, 0)), spans.map((u) => u.marks).join(','));
-  ok('a lot weighs its pieces together', idia.every((u) => u.tonnes > 0 && u.tonnes < 76));
+  ok('a span counts each piece as one mark', spans.every((u) => u.marks === children(u).reduce((t, x) => t + x.marks, 0)), spans.map((u) => u.marks).join(','));
+  ok('a diaphragm weighs something, less than a span', idia.every((u) => u.tonnes > 0 && u.tonnes < 76));
   ok('a span holds marks and is its own group', spans.every((u) => !u.isMark && u.groupKey === u.key && u.marks > 0));
   ok('level 2 shows the segments and the diaphragms whole (a mark is never split)', at('2').some((u) => u.name === 'Girder segment') && diaphragms.every((u) => u.levels.includes('2')) && !at('2').some((u) => u.name === 'Girder line'));
   ok('every level covers the whole line exactly once', ['0', '1', '2'].every((lv) => {
@@ -310,6 +308,39 @@ try {
   ok('still one live row for the unit', Number(live) === 1);
   s = await getPlanner(conn, COMPANY, {});
   ok('GET: moved, and the unplanned one is gone', s.entries[gl.key]?.shipDate === '2026-11-02' && !s.entries[sg.key]);
+  // Planner v2: a stretched bar keeps its first week.
+  w = await measured(() => putEntries(db, c, { entries: [{ unitKey: gl.key, shipDate: '2026-11-02', startDate: '2026-10-12', pinned: true }] }));
+  ok('a stretch saves its start week', w.result.entries[gl.key]?.startDate === '2026-10-12' && w.result.entries[gl.key].shipDate === '2026-11-02');
+  ok('GET shows the start week', (await getPlanner(conn, COMPANY, {})).entries[gl.key]?.startDate === '2026-10-12');
+  err = await refusal(() => putEntries(conn, c, { entries: [{ unitKey: gl.key, shipDate: '2026-11-02', startDate: '2026-11-02' }] }));
+  ok('a start on or after the ship date is refused (422)', err?.status === 422);
+  w = await measured(() => putEntries(db, c, { entries: [{ unitKey: gl.key, shipDate: '2026-11-02', startDate: null, pinned: true }] }));
+  ok('a null start drops the stretch', w.result.entries[gl.key]?.startDate === null);
+
+  // Planner v2: "Plan its parts separately" on a mark row, and back.
+  s = await getPlanner(conn, COMPANY, {});
+  const mark = s.units.find((u) => u.lineId === LINE && u.splittable && u.isMark);
+  ok('a mark with parts below offers the split', !!mark, 'none splittable');
+  ok('a girder line (not a mark) does not', !s.units.find((u) => u.key === gl.key)?.splittable);
+  if (mark) {
+    const kidsBefore = s.units.filter((u) => u.parentKey === mark.key).length;
+    w = await measured(() => putLineSplit(db, c, LINE, { bomLineId: mark.bomLineId, split: true }));
+    ok(`PUT splits records the row (${w.queries} round trips)`, w.result.split === true && Number(w.result.bomLineId) === Number(mark.bomLineId));
+    const s2 = await getPlanner(conn, COMPANY, {});
+    const was = s2.units.find((u) => u.key === mark.key);
+    const kids = s2.units.filter((u) => u.parentKey === mark.key);
+    ok('the split row is no longer a card at any level', was?.split === true && was.levels.length === 0 && !was.isMark, JSON.stringify(was && { split: was.split, levels: was.levels, isMark: was.isMark }));
+    ok(`its parts are the marks now (${kids.length}, before ${kidsBefore})`, kids.length > 0 && kids.every((k) => k.isMark && k.levels.length > 0));
+    ok('its parts carry work in stages', kids.every((k) => Array.isArray(k.stages)));
+    await putLineSplit(conn, c, LINE, { bomLineId: mark.bomLineId, split: true });
+    const [[{ cnt }]] = await conn.query('SELECT COUNT(*) cnt FROM cf_plan_splits WHERE company_id = ? AND order_line_id = ? AND bom_line_id = ? AND deleted_at IS NULL', [COMPANY, LINE, mark.bomLineId]);
+    ok('splitting twice keeps one row', Number(cnt) === 1);
+    await putLineSplit(conn, c, LINE, { bomLineId: mark.bomLineId, split: false });
+    const s3 = await getPlanner(conn, COMPANY, {});
+    ok('"Plan as one unit again" puts it back', s3.units.find((u) => u.key === mark.key)?.isMark === true && !s3.units.some((u) => u.parentKey === mark.key && u.isMark));
+  }
+  err = await refusal(() => putLineSplit(conn, c, LINE, { bomLineId: 999999999, split: true }));
+  ok('a row not on the line is refused', err?.status === 422 || err?.status === 404, String(err?.status));
   const lotUnit = idia[0];
   w = await measured(() => putEntries(db, c, { entries: [{ unitKey: lotUnit.key, shipDate: '2026-10-19', pinned: true }] }));
   ok(`a lot is planned by its key (${lotUnit.key}, ${w.queries} round trips)`, w.result.entries[lotUnit.key]?.shipDate === '2026-10-19');
@@ -441,7 +472,7 @@ try {
   const paths = [];
   const walk = (stack) => { for (const l of stack) { if (l.route) paths.push(`${Object.keys(l.route.methods).join(',')} ${l.route.path}`); else if (l.handle?.stack) walk(l.handle.stack); } };
   walk(indexRouter.stack);
-  ok('GET /planner and the six PUTs are mounted', ['get /planner', 'put /planner/entries', 'put /planner/changes', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/targets', 'put /planner/settings'].every((p) => paths.includes(p)), paths.filter((p) => p.includes('planner')).join(' | '));
+  ok('GET /planner and the seven PUTs are mounted', ['get /planner', 'put /planner/entries', 'put /planner/changes', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/lines/:id/splits', 'put /planner/targets', 'put /planner/settings'].every((p) => paths.includes(p)), paths.filter((p) => p.includes('planner')).join(' | '));
 
   // A trimmed example for the report.
   const ex = await getPlanner(conn, COMPANY, {});

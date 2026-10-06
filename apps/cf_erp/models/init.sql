@@ -4639,3 +4639,31 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- The old draft PO is a requested one now (idempotent: nothing is 'draft' after).
 UPDATE cf_purchase_orders SET status = 'requested' WHERE status = 'draft';
+
+-- ============================================================================
+-- §47  Planner v2: rows planned "their parts separately" (CF_ERP_PLANNER_V2_PLAN.md)
+-- ============================================================================
+-- Per order line: a row (bom_line_id) whose made children ship as their own
+-- units instead of the row itself. The template's SHIP_UNIT stays the default.
+CREATE TABLE IF NOT EXISTS cf_plan_splits (
+  id             INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT        NOT NULL,
+  order_line_id  INT        NOT NULL,
+  bom_line_id    INT        NOT NULL,
+  deleted_at     DATETIME   DEFAULT NULL,
+  created_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT        NULL,
+  UNIQUE KEY uq_cpsp_tenant (company_id, id),
+  UNIQUE KEY uq_cpsp_row    (company_id, order_line_id, bom_line_id),
+  CONSTRAINT fk_cpsp_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpsp_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cpsp_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- A stretched bar: the first week its work is spread from (NULL = booked back
+-- from the ship week, or forward from its material when auto-placed).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plan_entries' AND COLUMN_NAME = 'start_date');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plan_entries ADD COLUMN start_date DATE NULL AFTER ship_date', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

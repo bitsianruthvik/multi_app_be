@@ -18,7 +18,7 @@
  * person (or an applied auto-plan) chose.
  *
  *   GET /planner?from=YYYY-MM-DD
- *   PUT /planner/entries      { entries: [{ unitKey, shipDate|null, pinned }] }
+ *   PUT /planner/entries      { entries: [{ unitKey, shipDate|null, startDate?, pinned }] }
  *   PUT /planner/priorities   { orderIds: [...] }       a whole ranking
  *   PUT /planner/lines/:id/level  { level }             'line' | '0' | '1' … | null
  *   PUT /planner/targets      { 'YYYY-MM': tonnes|null }
@@ -85,7 +85,8 @@ import { LEAF_DEPTH, levelName } from './tree.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
-const UNIT_RE = /^(?:([pl])([1-9]\d*)|(g)([1-9]\d*)\.([1-9]\d*))$/;
+// p<piece>, p<piece>#<n> (the n-th of a row of N, planner v2), l<line>; g<parent>.<row> = an old lot card.
+const UNIT_RE = /^(?:([pl])([1-9]\d*)(?:#([1-9]\d*))?|(g)([1-9]\d*)\.([1-9]\d*))$/;
 const MAX_ENTRIES = 5000;
 const MAX_DEPTH_LEVEL = 15;
 const OPEN_ORDER_STATUSES = ['inquiry', 'quoted', 'confirmed'];
@@ -253,7 +254,7 @@ export async function getPlanner(db, companyId, q = {}) {
       [companyId, companyId],
     ),
     db.query('SELECT month, tonnes FROM cf_plan_targets WHERE company_id = ? ORDER BY month', [companyId]),
-    db.query('SELECT unit_key, ship_date, pinned FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+    db.query('SELECT unit_key, ship_date, start_date, pinned FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL", [companyId]),
     // The machine types: the nodes machines are filed under, with the nodes
     // above them (Family › Subfamily › Variant), in the same read.
@@ -313,7 +314,7 @@ export async function getPlanner(db, companyId, q = {}) {
     releaseIds.length
       ? db.query(
         `SELECT r.order_line_id, pi.order_piece_id, pi.code AS piece_code, pi.item_id, pi.bom_line_id,
-                s.operation_id, s.state, s.quantity, s.qty_good, s.est_minutes, s.machine_id, s.work_order_id
+                s.operation_id, s.sequence, s.state, s.quantity, s.qty_good, s.est_minutes, s.machine_id, s.work_order_id
            FROM cf_production_steps s
            JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id AND pi.deleted_at IS NULL
            JOIN cf_production_releases r ON r.company_id = pi.company_id AND r.id = pi.release_id
@@ -342,6 +343,15 @@ export async function getPlanner(db, companyId, q = {}) {
     });
   }
   const contractorCells = new Set(cellRows.map((c) => `${c.order_piece_id}:${c.operation_id}`));
+  // Rows planned "their parts separately" (§47). A database without §47 yet plans none.
+  const splitsOfLine = new Map();
+  if (lineIds.length) {
+    let rows = [];
+    try {
+      [rows] = await db.query('SELECT order_line_id, bom_line_id FROM cf_plan_splits WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
+    } catch (e) { if (e?.code !== 'ER_NO_SUCH_TABLE' && e?.errno !== 1146) throw e; }
+    for (const r of rows) { if (!splitsOfLine.has(r.order_line_id)) splitsOfLine.set(r.order_line_id, new Set()); splitsOfLine.get(r.order_line_id).add(Number(r.bom_line_id)); }
+  }
 
   // ---- the per-line structure, side by side ---------------------------------
   const structures = await Promise.all(lineRows.map((l) => loadLineStructure(db, companyId, l, l.locked_at ? piecesOfLine.get(l.id) ?? [] : null)));
@@ -395,11 +405,14 @@ export async function getPlanner(db, companyId, q = {}) {
     };
 
     // Per laid-out node: its own work, missing rates, estimate totals and materials.
-    const own = nodes.map(() => ({ work: {}, noRate: new Set(), est: 0, left: 0, steps: 0, doneSteps: 0, materials: new Map() }));
-    const addWork = (k, fn, minutes) => {
+    const own = nodes.map(() => ({ work: {}, noRate: new Set(), est: 0, left: 0, steps: 0, doneSteps: 0, materials: new Map(), seq: [] }));
+    // PLANNER V2: each piece's work also keeps WHERE in its flow it comes (seq),
+    // so a unit's stages can be booked in order — deepest level first.
+    const addWork = (k, fn, minutes, seq = 0) => {
       if (!(minutes > 0)) return;
       const key = String(fn);
       own[k].work[key] = (own[k].work[key] ?? 0) + minutes;
+      own[k].seq.push({ seq: Number(seq) || 0, fn: key, minutes });
       usedFunctions.add(key);
     };
     // Σ of each design's laid-out quantity — a row's setup is shared over its pieces by it.
@@ -420,7 +433,7 @@ export async function getPlanner(db, companyId, q = {}) {
           if (work == null) { own[n.k].noRate.add(`${n.bomLineId ?? 0}:${o.id}`); continue; }
           const minutes = ((setup ?? 0) * share + work * q) * o.passes;
           const onContract = n.lockedPieceId != null && contractorCells.has(`${n.lockedPieceId}:${o.id}`);
-          addWork(n.k, onContract ? CONTRACTOR : functionOfEstimate(f) ?? UNASSIGNED, minutes);
+          addWork(n.k, onContract ? CONTRACTOR : functionOfEstimate(f) ?? UNASSIGNED, minutes, o.seq);
         }
       }
     } else {
@@ -445,7 +458,7 @@ export async function getPlanner(db, companyId, q = {}) {
         if (s.work_order_id) fn = CONTRACTOR;
         else if (s.machine_id && typeOfMachine(s.machine_id)) fn = typeOfMachine(s.machine_id);
         else fn = functionOfEstimate(machineSide.estimate(s.operation_id, readersOf(s.item_id))) ?? UNASSIGNED;
-        addWork(k, fn, left);
+        addWork(k, fn, left, s.sequence);
       }
     }
 
@@ -489,7 +502,14 @@ export async function getPlanner(db, companyId, q = {}) {
     // ---- marks and groups over the laid-out tree ----------------------------
     const kids = nodes.map(() => []);
     for (const n of nodes) if (n.parentK != null) kids[n.parentK].push(n.k);
-    const explicit = nodes.map((n) => shipUnit(n.itemId));
+    // A row the planner was told to plan "its parts separately" (cf_plan_splits,
+    // §47) is no mark of its own; its made children are marks instead — for this
+    // line only. The template's Ships-as-one-unit stays everyone else's default.
+    const splitRows = splitsOfLine.get(line.id) ?? new Set();
+    const emitPiecesPossible = locked && nodes.length > 0 && nodes.every((n) => n.lockedPieceId != null);
+    const isSplit = nodes.map((n) => emitPiecesPossible && n.bomLineId != null && splitRows.has(Number(n.bomLineId)));
+    const explicit = nodes.map((n, k) => (isSplit[k] ? false
+      : (shipUnit(n.itemId) || (n.parentK != null && isSplit[n.parentK]))));
     const hasMarkBelow = new Array(nodes.length).fill(false); // self or a descendant is SHIP_UNIT
     for (let k = nodes.length - 1; k >= 0; k--) {
       if (explicit[k] || kids[k].some((c) => hasMarkBelow[c])) hasMarkBelow[k] = true;
@@ -543,9 +563,11 @@ export async function getPlanner(db, companyId, q = {}) {
     // of a span, the splice sets of a girder line — ships with its siblings of
     // the same design row: those pieces are ONE unit 'g<parent piece>.<bom line>',
     // one mark, quantity = how many. A real SHIP_UNIT mark is never grouped.
+    // PLANNER V2 (user, 2026-10-04): "each quantity can be shipped separately" —
+    // no lot cards any more; a row of N pieces is N units (multiOf below).
     const looseOf = new Array(nodes.length).fill(null);
-    const looseGroups = new Map(); // key -> [k, …] in tree order
-    if (emitPieces) {
+    const looseGroups = new Map();
+    if (false) {
       for (const n of nodes) {
         const k = n.k;
         if (!isUnit[k] || !isMark[k] || explicit[k] || n.parentK == null || n.bomLineId == null) continue;
@@ -559,10 +581,15 @@ export async function getPlanner(db, companyId, q = {}) {
       }
     }
     // A lot counts as one mark (on its first piece).
-    const countsAsMark = (k) => isMark[k] && (looseOf[k] == null || looseGroups.get(looseOf[k])[0] === k);
+    // A unit piece standing for N physical pieces (a leaf row, quantity N) is N units of one.
+    const MULTI_CAP = 500;
+    const multiOf = (k) => {
+      const q = Number(nodes[k].quantity);
+      return emitPieces && isUnit[k] && Number.isInteger(q) && q > 1 && q <= MULTI_CAP && !kids[k].some((c) => isUnit[c]) ? q : 1;
+    };
     const marksBelow = new Array(nodes.length).fill(0);
     for (let k = nodes.length - 1; k >= 0; k--) {
-      marksBelow[k] = (countsAsMark(k) ? 1 : 0) + kids[k].reduce((t, c) => t + marksBelow[c], 0);
+      marksBelow[k] = (isMark[k] ? multiOf(k) : 0) + kids[k].reduce((t, c) => t + marksBelow[c], 0);
     }
     // A parent's OWN work (a girder line's assembly, a span's trial assembly) and
     // own material are planned with its pieces when the line is planned below
@@ -571,6 +598,7 @@ export async function getPlanner(db, companyId, q = {}) {
     // every level the shares add up to exactly the parent's own numbers; a
     // parent whose pieces weigh nothing shares by marks instead.
     const unitWeight = new Map();
+    let shareOfUnit = () => 0;
     if (emitPieces) {
       for (let k = nodes.length - 1; k >= 0; k--) {
         if (!isUnit[k]) continue;
@@ -582,6 +610,7 @@ export async function getPlanner(db, companyId, q = {}) {
         const wa = unitWeight.get(a);
         return wa > 0 ? unitWeight.get(u) / wa : marksBelow[u] / (marksBelow[a] || 1);
       };
+      shareOfUnit = shareOf;
       const inherited = new Map();
       for (const n of nodes) {
         if (!isUnit[n.k]) continue;
@@ -598,6 +627,40 @@ export async function getPlanner(db, companyId, q = {}) {
       for (const [k, into] of inherited) fold(agg.get(k), into);
     }
     const shapeWork = (w) => Object.fromEntries(Object.entries(w).map(([k, v]) => [k, r3(v)]).filter(([, v]) => v > 0));
+    /*
+     * STAGES (planner v2): a unit's work in the order it is done — deepest BOM
+     * level first (cut plates, parts, sub-assemblies, the unit itself, then the
+     * share of its parents' assembly), and inside a level the flow's operations
+     * in sequence. Pieces of one level run side by side, so one sequence
+     * position is one step: its minutes summed across them, per machine type.
+     * [{ depth, steps: [{ fn, minutes }] }], scaled by `f`.
+     */
+    const stagesOf = (rootK, f = 1) => {
+      const cells = new Map();                       // depth -> seq -> fn -> minutes
+      const take = (m, scale, depth) => {
+        for (const e of own[m].seq) {
+          if (!cells.has(depth)) cells.set(depth, new Map());
+          const bySeq = cells.get(depth);
+          if (!bySeq.has(e.seq)) bySeq.set(e.seq, new Map());
+          const byFn = bySeq.get(e.seq);
+          byFn.set(e.fn, (byFn.get(e.fn) ?? 0) + e.minutes * scale);
+        }
+      };
+      const walk = (k) => { take(k, f, nodes[k].depth); for (const ch of kids[k]) walk(ch); };
+      if (rootK == null) { for (const n of nodes) if (n.parentK == null) walk(n.k); } else walk(rootK);
+      // The parents' own work this unit carries (its share of their assembly) comes last.
+      if (rootK != null && emitPieces) {
+        for (let a = nodes[rootK].parentK; a != null; a = nodes[a].parentK) {
+          if (!isUnit[a]) continue;
+          const sh = shareOfUnit(rootK, a);
+          if (sh > 0) take(a, sh * f, nodes[a].depth);
+        }
+      }
+      return [...cells].sort((x, y) => y[0] - x[0]).map(([depth, bySeq]) => ({
+        depth,
+        steps: [...bySeq].sort((x, y) => x[0] - y[0]).flatMap(([, byFn]) => [...byFn].filter(([, m]) => m > 0).map(([fn, m]) => ({ fn, minutes: r3(m) }))),
+      })).filter((st) => st.steps.length);
+    };
     const shapeMaterials = (m) => [...m].map(([itemId, qty]) => ({ itemId, qty: r6(qty) })).filter((x) => x.qty > 0).sort((a, b) => a.itemId - b.itemId);
     const progressOf = (a) => (released ? (a.est > 0 ? r3(1 - a.left / a.est) : (a.steps && a.doneSteps === a.steps ? 1 : 0)) : 0);
     const doneOf = (a) => released && a.steps > 0 && a.doneSteps === a.steps;
@@ -614,6 +677,7 @@ export async function getPlanner(db, companyId, q = {}) {
       tonnes: lineWeight == null ? 0 : r3(lineWeight * Number(line.quantity) * weightToTonnes), noWeight: lineWeight == null,
       work: shapeWork(lineAgg.work), noRate: lineAgg.noRate.size, done: lineDone, progress: lineDone ? 1 : progressOf(lineAgg),
       materials: shapeMaterials(lineAgg.materials), committedDate,
+      stages: stagesOf(null),
     });
 
     // The piece units, with the levels at which each is on the board.
@@ -628,7 +692,12 @@ export async function getPlanner(db, companyId, q = {}) {
         if (m == null) return `p${nodes[k].lockedPieceId}`;
         return nodes[m].parentK == null ? lineKey : `p${nodes[nodes[m].parentK].lockedPieceId}`;
       };
-      const shownAtOf = (n) => levelValues.filter((lv) => Number(lv) === n.depth || (Number(lv) > n.depth && (isMark[n.k] || !hasUnitChild[n.k])));
+      const shownAtOf = (n) => {
+        if (isSplit[n.k]) return [];                                     // its parts are planned instead
+        const underSplit = n.parentK != null && isSplit[n.parentK];
+        return levelValues.filter((lv) => Number(lv) === n.depth || (underSplit && Number(lv) >= nodes[n.parentK].depth)
+          || (Number(lv) > n.depth && (isMark[n.k] || !hasUnitChild[n.k])));
+      };
       const stripOrder = (code) => (code && line.order_code && code.startsWith(`${line.order_code}-`) ? code.slice(line.order_code.length + 1) : code);
       for (const n of nodes) {
         if (!isUnit[n.k]) continue;
@@ -663,16 +732,25 @@ export async function getPlanner(db, companyId, q = {}) {
         const a = agg.get(n.k) ?? blankAgg();
         const w = weightOf(n.itemId);
         const shownAt = shownAtOf(n);
-        units.push({
-          key: `p${n.lockedPieceId}`, orderId: line.order_id, lineId: line.id, level: String(n.depth), levels: shownAt,
-          pieceId: n.lockedPieceId, code: n.code ?? null, name: n.design.name,
-          depth: n.depth, parentKey: n.parentK == null ? lineKey : `p${nodes[n.parentK].lockedPieceId}`,
-          groupKey: groupOf(n.k), isMark: isMark[n.k], marks: marksBelow[n.k],
-          quantity: Number(n.quantity), itemId: n.itemId,
-          tonnes: w == null ? 0 : r3(w * Number(n.quantity) * weightToTonnes), noWeight: w == null,
-          work: shapeWork(a.work), noRate: a.noRate.size, done: doneOf(a), progress: progressOf(a),
-          materials: shapeMaterials(a.materials), committedDate,
-        });
+        const N = multiOf(n.k);
+        const scaleW = (o) => Object.fromEntries(Object.entries(shapeWork(o)).map(([k, v]) => [k, r3(v / N)]));
+        const scaleM = (m) => shapeMaterials(new Map([...m].map(([it, qv]) => [it, qv / N])));
+        const stages = stagesOf(n.k, 1 / N);
+        for (let i = 1; i <= N; i++) {
+          units.push({
+            key: N > 1 ? `p${n.lockedPieceId}#${i}` : `p${n.lockedPieceId}`, orderId: line.order_id, lineId: line.id, level: String(n.depth), levels: shownAt,
+            pieceId: n.lockedPieceId, copy: N > 1 ? i : null, code: N > 1 ? `${stripOrder(n.code) ?? n.design.name} ${i}/${N}` : (n.code ?? null), name: n.design.name,
+            depth: n.depth, parentKey: n.parentK == null ? lineKey : `p${nodes[n.parentK].lockedPieceId}`,
+            groupKey: groupOf(n.k), isMark: isMark[n.k], marks: N > 1 ? 1 : marksBelow[n.k],
+            quantity: Number(n.quantity) / N, itemId: n.itemId,
+            tonnes: w == null ? 0 : r3((w * Number(n.quantity) * weightToTonnes) / N), noWeight: w == null,
+            work: N > 1 ? scaleW(a.work) : shapeWork(a.work), noRate: a.noRate.size, done: doneOf(a), progress: progressOf(a),
+            materials: N > 1 ? scaleM(a.materials) : shapeMaterials(a.materials), committedDate,
+            // Splitting changes something only on a mark with parts below it (they become the marks).
+            stages, split: isSplit[n.k], splittable: n.bomLineId != null && isMark[n.k] && kids[n.k].length > 0 && N === 1,
+            bomLineId: n.bomLineId ?? null,
+          });
+        }
       }
     }
 
@@ -804,7 +882,7 @@ export async function getPlanner(db, companyId, q = {}) {
   const entries = {};
   for (const e of entryRows) {
     if (!unitKeys.has(e.unit_key)) continue;
-    entries[e.unit_key] = { shipDate: dateText(e.ship_date), pinned: !!Number(e.pinned) };
+    entries[e.unit_key] = { shipDate: dateText(e.ship_date), startDate: e.start_date ? dateText(e.start_date) : null, pinned: !!Number(e.pinned) };
   }
   // A line's units in the order dragged by hand (1 = first); units that are gone are left out.
   const ranks = {};
@@ -869,8 +947,15 @@ function parseEntries(list) {
       if (!validDate(String(e.shipDate))) { problems.push(`${at}: shipDate needs a date as YYYY-MM-DD, or null to unplan.`); return; }
       shipDate = String(e.shipDate);
     }
+    // A stretched bar's first week (planner v2); it must come before the ship date.
+    let startDate = null;
+    if (shipDate && e.startDate !== null && e.startDate !== undefined && e.startDate !== '') {
+      if (!validDate(String(e.startDate))) { problems.push(`${at}: startDate needs a date as YYYY-MM-DD, or null.`); return; }
+      if (String(e.startDate) >= shipDate) { problems.push(`${at}: startDate must come before shipDate.`); return; }
+      startDate = String(e.startDate);
+    }
     const pinned = toBool(e.pinned ?? false, `${at}: pinned`, problems);
-    want.push({ unitKey: e.unitKey, ...k, shipDate, pinned: !!pinned });
+    want.push({ unitKey: e.unitKey, ...k, shipDate, startDate, pinned: !!pinned });
   });
   assertNoProblems(problems, 'Some entries need attention.');
   return want;
@@ -966,7 +1051,7 @@ async function writeRanks(db, c, lines) {
 function parseUnitKey(key) {
   const m = UNIT_RE.exec(String(key ?? ''));
   if (!m) return null;
-  return m[3] ? { kind: 'g', id: Number(m[4]), bomLineId: Number(m[5]) } : { kind: m[1], id: Number(m[2]) };
+  return m[4] ? { kind: 'g', id: Number(m[5]), bomLineId: Number(m[6]) } : { kind: m[1], id: Number(m[2]), copy: m[3] ? Number(m[3]) : null };
 }
 
 /**
@@ -1022,11 +1107,11 @@ async function writeEntries(db, c, want) {
     for (let i = 0; i < keep.length; i += 500) {
       const part = keep.slice(i, i + 500);
       await db.query(
-        `INSERT INTO cf_plan_entries (company_id, order_line_id, unit_key, ship_date, pinned, updated_by)
-         VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}
+        `INSERT INTO cf_plan_entries (company_id, order_line_id, unit_key, ship_date, start_date, pinned, updated_by)
+         VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}
          ON DUPLICATE KEY UPDATE order_line_id = VALUES(order_line_id), ship_date = VALUES(ship_date),
-                                 pinned = VALUES(pinned), updated_by = VALUES(updated_by)`,
-        part.flatMap((w) => [c.companyId, w.lineId, w.unitKey, w.shipDate, w.pinned ? 1 : 0, c.userId ?? null]),
+                                 start_date = VALUES(start_date), pinned = VALUES(pinned), updated_by = VALUES(updated_by)`,
+        part.flatMap((w) => [c.companyId, w.lineId, w.unitKey, w.shipDate, w.startDate ?? null, w.pinned ? 1 : 0, c.userId ?? null]),
       );
     }
   }
@@ -1034,10 +1119,10 @@ async function writeEntries(db, c, want) {
   for (const k of drop) out[k] = null;
   if (keep.length) {
     const [rows] = await db.query(
-      'SELECT unit_key, ship_date, pinned FROM cf_plan_entries WHERE company_id = ? AND unit_key IN (?) AND deleted_at IS NULL',
+      'SELECT unit_key, ship_date, start_date, pinned FROM cf_plan_entries WHERE company_id = ? AND unit_key IN (?) AND deleted_at IS NULL',
       [c.companyId, keep.map((w) => w.unitKey)],
     );
-    for (const r of rows) out[r.unit_key] = { shipDate: dateText(r.ship_date), pinned: !!Number(r.pinned) };
+    for (const r of rows) out[r.unit_key] = { shipDate: dateText(r.ship_date), startDate: r.start_date ? dateText(r.start_date) : null, pinned: !!Number(r.pinned) };
   }
   return { entries: out };
 }
@@ -1079,6 +1164,31 @@ export async function putPriorities(db, c, input = {}) {
  * tree ('0', '1' …), or null for the default. Only a locked line breaks down
  * into pieces.
  */
+/**
+ * PUT /planner/lines/:id/splits { bomLineId, split } — plan a row's parts
+ * separately (true) or as one unit again (false), for this line only
+ * (planner v2, §47). The line must be locked: only a locked line is planned
+ * piece by piece. Entries of the row's units stay and simply stop showing.
+ */
+export async function putLineSplit(db, c, lineId, input = {}) {
+  const [[line]] = await db.query('SELECT id, locked_at FROM cf_sales_order_lines WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(lineId)]);
+  if (!line) throw notFound('Order line');
+  if (!line.locked_at) throw invalid('NOT_LOCKED', 'Freeze the design first — a line is planned piece by piece only once it is frozen.');
+  const bomLineId = Number(input.bomLineId);
+  if (!Number.isInteger(bomLineId) || bomLineId <= 0) throw invalid('INVALID', 'Say which row (bomLineId).');
+  const [[piece]] = await db.query('SELECT id FROM cf_order_pieces WHERE company_id = ? AND order_line_id = ? AND bom_line_id = ? AND deleted_at IS NULL LIMIT 1', [c.companyId, line.id, bomLineId]);
+  if (!piece) throw invalid('INVALID', 'That row is not part of this line.');
+  if (input.split === true || input.split === 'true') {
+    await db.query(
+      'INSERT INTO cf_plan_splits (company_id, order_line_id, bom_line_id, created_by) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE deleted_at = NULL',
+      [c.companyId, line.id, bomLineId, c.userId ?? null],
+    );
+  } else {
+    await db.query('UPDATE cf_plan_splits SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND bom_line_id = ? AND deleted_at IS NULL', [c.companyId, line.id, bomLineId]);
+  }
+  return { lineId: line.id, bomLineId, split: input.split === true || input.split === 'true' };
+}
+
 export async function putLineLevel(db, c, lineId, input = {}) {
   const raw = input.level;
   let level = null;

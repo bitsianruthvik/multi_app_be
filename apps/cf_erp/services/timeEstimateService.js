@@ -291,7 +291,8 @@ export function opsOfFlow(steps) {
   for (const s of steps ?? []) {
     const o = ops.get(s.operation_id);
     if (o) o.passes += 1;
-    else ops.set(s.operation_id, { id: s.operation_id, code: s.op_code, name: s.op_name, passes: 1 });
+    // seq: where the operation first comes in the flow — the planner books a unit's work in this order.
+    else ops.set(s.operation_id, { id: s.operation_id, code: s.op_code, name: s.op_name, passes: 1, seq: Number(s.sequence ?? 0) });
   }
   return ops;
 }

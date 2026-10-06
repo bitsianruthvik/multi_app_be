@@ -20,7 +20,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings } from '../services/plannerService.js';
+import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putLineSplit, putTargets, putSettings } from '../services/plannerService.js';
 
 const router = Router();
 
@@ -34,6 +34,8 @@ router.put('/planner/priorities', guard(PERM.production),
   handle((req) => withTransaction((db) => putPriorities(db, ctx(req), req.body ?? {}))));
 router.put('/planner/lines/:id/level', guard(PERM.production),
   handle((req) => withTransaction((db) => putLineLevel(db, ctx(req), intParam(req.params.id, 'id'), req.body ?? {}))));
+router.put('/planner/lines/:id/splits', guard(PERM.production),
+  handle((req) => withTransaction((db) => putLineSplit(db, ctx(req), intParam(req.params.id, 'id'), req.body ?? {}))));
 router.put('/planner/targets', guard(PERM.production),
   handle((req) => withTransaction((db) => putTargets(db, ctx(req), req.body ?? {}))));
 router.put('/planner/settings', guard(PERM.production),
