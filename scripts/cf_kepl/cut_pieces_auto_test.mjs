@@ -132,6 +132,38 @@ const tag = `CPA${Date.now().toString(36).toUpperCase()}`;
 const tok = (key, extra = {}) => ({ segmentType: 'token', tokenKey: key, transform: 'none', isRequired: true, ...extra });
 const lit = (text) => ({ segmentType: 'literal', literalText: text });
 
+/**
+ * CUT FROM (init.sql §48, CF_ERP_CUT_FROM_PLAN.md): parts are found by how they
+ * are cut — their CUT_FROM — and cut plates / raw plates by the places of Setup
+ * › Cutting, never by a classification code any more. This run's parts are cut
+ * from plate (a defaulted CUT_FROM rule on its family, PLATE on its parts
+ * node), and its own nodes are the plate places — for the transaction only.
+ */
+async function cutFromSetup(db, c, { family, partNode, cutNode = null, plateNode = null }) {
+  let [[spec]] = await db.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'CUT_FROM' AND deleted_at IS NULL", [c.companyId]);
+  if (!spec) {
+    const [r] = await db.query("INSERT INTO cf_specifications (company_id, code, name, data_type, status) VALUES (?, 'CUT_FROM', 'Cut from', 'option', 'active')", [c.companyId]);
+    spec = { id: r.insertId };
+    for (const [i, v] of ['PLATE', 'SECTION', 'NONE'].entries()) {
+      await db.query("INSERT INTO cf_spec_options (company_id, specification_id, value, label, sort_order, status) VALUES (?, ?, ?, ?, ?, 'active')", [c.companyId, spec.id, v, v, i + 1]);
+    }
+  }
+  await db.query(
+    `INSERT INTO cf_spec_assignments (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule, sort_order)
+     VALUES (?, ?, 'classification', ?, 'item', 0, 1, 'defaulted', 0)`,
+    [c.companyId, spec.id, family],
+  );
+  await V.setValues(db, c, 'classification', partNode, [{ specCode: 'CUT_FROM', value: 'PLATE' }]);
+  if (cutNode != null) {
+    await db.query("INSERT INTO cf_cut_places (company_id, kind, blanks_node_id) VALUES (?, 'plate', ?) ON DUPLICATE KEY UPDATE blanks_node_id = VALUES(blanks_node_id)", [c.companyId, cutNode]);
+  }
+  if (plateNode != null) {
+    const [[place]] = await db.query("SELECT id FROM cf_cut_places WHERE company_id = ? AND kind = 'plate'", [c.companyId]);
+    await db.query('DELETE FROM cf_cut_place_stock WHERE company_id = ? AND place_id = ?', [c.companyId, place.id]);
+    await db.query('INSERT INTO cf_cut_place_stock (company_id, place_id, node_id) VALUES (?, ?, ?)', [c.companyId, place.id, plateNode]);
+  }
+}
+
 async function buildFixture(db, c) {
   const row = async (id) => {
     const [[n]] = await db.query('SELECT id, parent_id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND id = ?', [COMPANY, id]);
@@ -216,10 +248,15 @@ async function buildFixture(db, c) {
     await createRule(db, c, { subjectType: 'classification', subjectId: partsV.id, specificationId: s.id, captureAt: 'item', valueRule: 'entered', isApplicable: true, isRequired: s.required });
   }
   const mineKeys = new Set(mine.map((s) => `${s.id}:item`));
+  // Cut from (§48) is not switched off: cutFromSetup below answers it on this Variant.
+  const [[cfSpec]] = await db.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'CUT_FROM' AND deleted_at IS NULL", [COMPANY]);
+  if (cfSpec) mineKeys.add(`${cfSpec.id}:item`);
   for (const r of reaching) {
     if (mineKeys.has(`${r.specification_id}:${r.capture_at}`)) continue;
     await createRule(db, c, { subjectType: 'classification', subjectId: partsV.id, specificationId: r.specification_id, captureAt: r.capture_at, isApplicable: false });
   }
+  // Cut from (§48): this run's parts are cut from plate.
+  await cutFromSetup(db, c, { family: partsV.id, partNode: partsV.id });
 
   // Raw plates, filed at the borrowed PLATE, answering whatever it requires today.
   const fillRequired = async (masterId) => {

@@ -29,6 +29,9 @@ import plannerRoutes from './planner.js';
 import floorRoutes from './floor.js';
 import gstRoutes from './gst.js';
 import dashboardRoutes from './dashboard.js';
+// Cut from (§48): Setup › Cutting + the section stock picker, and 1-D section nesting.
+import cuttingRoutes from './cutting.js';
+import sectionNestingRoutes from './sectionNesting.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -118,5 +121,7 @@ router.use(plannerRoutes);
 router.use(floorRoutes);
 router.use(gstRoutes);
 router.use(dashboardRoutes);
+router.use(cuttingRoutes);
+router.use(sectionNestingRoutes);
 
 export default router;

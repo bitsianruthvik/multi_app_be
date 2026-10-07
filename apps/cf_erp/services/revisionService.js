@@ -47,7 +47,6 @@ import { insertRows } from '../lib/db.js';
 import { revisedOrderMessage, latestRevisionSql } from './records.js';
 import { snapshotSubtrees, writeCopies, cutPlateNodes, deleteTemporaryItems } from './treeCopyService.js';
 import { refreshCutPieces, rectangleChoices } from './cutPlateService.js';
-import { CUT_PLATE_CODE } from './nestingService.js';
 import { getOrder } from './salesOrderService.js';
 
 /** The commercial stages a customer order may be revised in. */
@@ -154,7 +153,7 @@ export async function reviseOrder(db, c, orderId) {
   // ---- the rows of every custom line: one deep copy for the whole order -------
   const custom = lines.filter((l) => l.line_type === 'custom' && l.item_id);
   if (custom.length) {
-    const cutPlates = await cutPlateNodes(db, companyId, CUT_PLATE_CODE);
+    const cutPlates = await cutPlateNodes(db, companyId);
     const isCutPlate = (l) => l.child_item_type === 'temporary' && cutPlates.has(l.child_classification_id);
     const snap = await snapshotSubtrees(db, companyId, custom.map((l) => l.item_id), (l) => l.child_item_type === 'temporary' && !isCutPlate(l));
     const { idMap } = await writeCopies(db, c, snap, custom.map((l) => ({ srcId: l.item_id, ownerLineId: newLineOf.get(l.id).id })), {

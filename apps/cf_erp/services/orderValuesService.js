@@ -85,6 +85,7 @@ import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues } from './valueService.js';
+import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 
 /** explode()'s depth cap, so this screen and the Structure tab stop at the same place. */
 const MAX_DEPTH = 15;
@@ -810,7 +811,9 @@ function derivedWrites(r) {
         else if (own) touch(s, null, 'inherited');
         break;
       case 'entered':
-        if (own && own.source !== 'entered') touch(s, null, own.source);
+        // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
+        // 'inherited' under an entered rule; the cut-piece derive owns those rows (valueService too).
+        if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
         break;
       default:
         break;

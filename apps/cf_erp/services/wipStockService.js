@@ -98,6 +98,8 @@ export async function listOffcuts(db, companyId, q = {}) {
   const args = [companyId];
   if (!blank(q.thickness)) { base.push('o.thickness_mm = ?'); args.push(Number(q.thickness)); }
   if (!blank(q.grade)) { base.push('o.grade = ?'); args.push(String(q.grade)); }
+  // Plate offcuts (an outline) or bar offcuts (a length of a section, §48).
+  if (!blank(q.kind) && ['plate', 'bar'].includes(String(q.kind))) { base.push('o.kind = ?'); args.push(String(q.kind)); }
   const like = likeOf(q.search);
   if (like) { base.push('(o.offcut_no LIKE ? OR so.code LIKE ? OR o.grade LIKE ?)'); args.push(like, like, like); }
   const status = blank(q.status) ? 'available' : String(q.status);
@@ -110,12 +112,14 @@ export async function listOffcuts(db, companyId, q = {}) {
        JOIN cf_plate_lots pl ON pl.id = o.plate_lot_id
        LEFT JOIN cf_master_records pm ON pm.id = pl.plate_item_id
        LEFT JOIN cf_stock_batches b ON b.id = o.batch_id
-       LEFT JOIN cf_master_records im ON im.id = b.item_id`;
+       LEFT JOIN cf_master_records im ON im.id = b.item_id
+       LEFT JOIN cf_master_records sm ON sm.id = o.stock_item_id`;
   const paged = wantsPage(q);
   const page = paged ? pageArgs(q, { def: 100 }) : null;
   const sql = `SELECT o.*, so.id AS order_id, so.code AS order_code, l.line_no, pl.lot_no, pl.plate_item_id, pm.code AS plate_code,
-                      b.code AS batch_code, b.unit_cost, im.id AS item_id, im.code AS item_code, im.name AS item_name
-                 ${from} WHERE ${where.join(' AND ')} ORDER BY o.thickness_mm, o.area_mm2 DESC, o.id`;
+                      b.code AS batch_code, b.unit_cost, im.id AS item_id, im.code AS item_code, im.name AS item_name,
+                      sm.code AS stock_item_code, sm.name AS stock_item_name
+                 ${from} WHERE ${where.join(' AND ')} ORDER BY o.kind, o.thickness_mm, o.area_mm2 DESC, o.id`;
   const [[rows], counted] = await Promise.all([
     paged ? db.query(`${sql} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]) : db.query(sql, rowArgs),
     paged ? Promise.all([
@@ -125,6 +129,11 @@ export async function listOffcuts(db, companyId, q = {}) {
   ]);
   const out = rows.map((o) => ({
     id: o.id, offcutNo: o.offcut_no, status: o.status,
+    // 'plate' (an outline on a plate) or 'bar' (a length of a section); a bar
+    // offcut carries its length and the stock bar it was cut from.
+    kind: o.kind ?? 'plate',
+    lengthMm: o.length_mm == null ? null : Number(o.length_mm),
+    stockItem: o.stock_item_id ? { id: o.stock_item_id, code: o.stock_item_code ?? null, name: o.stock_item_name ?? null } : null,
     thickness: o.thickness_mm == null ? null : Number(o.thickness_mm), grade: o.grade ?? null, material: o.material ?? null,
     areaMm2: Number(o.area_mm2), weightKg: o.weight_kg == null ? null : Number(o.weight_kg),
     value: o.unit_cost == null ? null : round2(o.unit_cost),

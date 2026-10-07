@@ -29,6 +29,62 @@ import { requireUsableFlow } from './flowService.js';
 import { readPrice, readBasis, readCurrency } from './priceService.js';
 import { readItemTax } from './taxService.js';
 import { writeEntries, addEntry, entryCount, deleteSelectionRules } from './selectionService.js';
+import { cutFromDetailOf, cutStockOf, sectionSteelOf, CUT_FROM_CODE, CUT_FROM_VALUES } from '../lib/cutFrom.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
+
+/**
+ * CUT FROM on a record's page (CF_ERP_CUT_FROM_PLAN §11.2):
+ *   cutFrom  { value: PLATE|SECTION|NONE|null, source: own|definition|classification|null, from }
+ *   cutStock { own: Ref|null, effective: (Ref & { steel })|null, from: own|definition|null }
+ * Five queries; none of them per anything.
+ */
+async function cutOfRecord(db, companyId, m) {
+  const [detail, stock] = await Promise.all([
+    cutFromDetailOf(db, companyId, [m.id]),
+    cutStockOf(db, companyId, [m.id]),
+  ]);
+  const eff = stock.get(Number(m.id));
+  const ids = [m.cut_stock_id, eff?.stockId].filter((x) => x != null);
+  const steel = ids.length ? await sectionSteelOf(db, companyId, ids) : new Map();
+  const ref = (id) => { const st = steel.get(Number(id)); return st ? { id: st.id, code: st.code, name: st.name } : { id: Number(id), code: null, name: null }; };
+  const effective = eff ? (() => {
+    const st = steel.get(eff.stockId);
+    return {
+      ...ref(eff.stockId),
+      steel: st ? {
+        thickness: st.thickness, width: st.width, depth: st.depth, sectionArea: st.sectionArea, lengthMm: st.lengthMm,
+        grade: st.grade, impactClass: st.impactClass, material: st.material, density: st.density,
+      } : null,
+    };
+  })() : null;
+  return {
+    cutFrom: detail.get(Number(m.id)) ?? { value: null, source: null, from: null },
+    cutStock: { own: m.cut_stock_id != null ? ref(m.cut_stock_id) : null, effective, from: eff?.from ?? null },
+  };
+}
+
+/**
+ * A section a part may name: a live catalog item filed under the section stock
+ * places of Setup › Cutting. null clears. Returns the id, or pushes a problem.
+ */
+async function readCutStock(db, companyId, value, problems) {
+  if (value === null || value === '') return null;
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) { problems.push('cutStockId must be a catalog item id, or null to clear it.'); return undefined; }
+  const places = await cutPlaces(db, companyId);
+  const [[it]] = await db.query(
+    `SELECT m.id, m.code, m.name, m.classification_id, i.item_type FROM cf_master_records m
+       LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+      WHERE m.company_id = ? AND m.id = ? AND m.deleted_at IS NULL`,
+    [companyId, id],
+  );
+  if (!it) { problems.push(`Item ${id} does not exist.`); return undefined; }
+  if (it.item_type !== 'catalog' || !places.section.stockIds.has(Number(it.classification_id))) {
+    problems.push(`${it.code ?? it.name} is not a section in stock — a part is cut from a catalog bar filed under the section stock of Setup › Cutting (angles, beams, channels …).`);
+    return undefined;
+  }
+  return id;
+}
 
 const TEMP_TAX_MESSAGE = 'A row of an order\'s structure takes its HSN code and GST rate from its template — set them there.';
 const SELECTION_TAX_MESSAGE = 'A selection takes its HSN code and GST rate from the catalog item it picks — set them on the item.';
@@ -228,6 +284,26 @@ export async function createDefinition(db, c, input = {}) {
 
 export async function updateRecord(db, c, id, input = {}) {
   const m = await requireMaster(db, c.companyId, id);
+  // CUT FROM (§48): how this definition's / item's pieces are cut, and the
+  // section a section part is cut from. Like any other detail, refused on a
+  // frozen record (a locked line's rows) — assertNotFrozen below.
+  let cutFromWrite;
+  let cutStockWrite;
+  if (input.cutFrom !== undefined || input.cutStockId !== undefined) {
+    const isSelection = m.record_kind === 'definition' && m.definition_type === 'selection';
+    if (isSelection) throw invalid('INVALID', 'A selection chooses a catalog item — it is not cut, so it has no Cut from.');
+    const p = [];
+    if (input.cutFrom !== undefined) {
+      const v = input.cutFrom == null || input.cutFrom === '' ? null : String(input.cutFrom).trim().toUpperCase();
+      if (v != null && !CUT_FROM_VALUES.includes(v)) p.push('cutFrom is PLATE, SECTION or NONE — or null to take it from the definition or classification.');
+      else cutFromWrite = { value: v };
+    }
+    if (input.cutStockId !== undefined) {
+      const sid = await readCutStock(db, c.companyId, input.cutStockId, p);
+      if (sid !== undefined) cutStockWrite = { id: sid };
+    }
+    assertNoProblems(p);
+  }
   // A locked line still takes a new flow — and nothing else — until it is
   // released (records.flowStillOpen). Any other field in the same save is
   // refused in the locked line's one sentence.
@@ -332,10 +408,14 @@ export async function updateRecord(db, c, id, input = {}) {
   }
   assertNoProblems(problems);
 
+  if (cutStockWrite) sets.cut_stock_id = cutStockWrite.id;
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_master_records SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, id]);
   }
+  // Cut from is a specification value: written through the value path, with
+  // its history (null removes the record's own answer, so it inherits again).
+  if (cutFromWrite) await setValues(db, c, 'master', id, [{ specCode: CUT_FROM_CODE, value: cutFromWrite.value }]);
   if (Object.keys(detail).length) {
     const table = m.record_kind === 'item' ? 'cf_item_details' : 'cf_definition_details';
     await db.query(`UPDATE ${table} SET ${Object.keys(detail).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND master_id = ?`,
@@ -549,6 +629,7 @@ export async function getRecord(db, companyId, id) {
     return fl ? { id: fl.id, code: fl.code, name: fl.name, status: fl.status } : null;
   };
   out.defaultFlow = await flowOf(m.default_flow_id);
+  if (m.record_kind === 'item' || m.definition_type === 'template') Object.assign(out, await cutOfRecord(db, companyId, m));
   // A temporary item made the way its template usually is, unless it says otherwise.
   if (!out.defaultFlow && m.source_definition_id) {
     const [[d]] = await db.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [m.source_definition_id]);

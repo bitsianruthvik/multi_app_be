@@ -27,7 +27,7 @@ import { invalid, notFound, conflict } from '../lib/errors.js';
 import { insertRows, pool as sharedPool } from '../lib/db.js';
 import { cachedTracker, copyTracker, readOnce, rememberTracker, trackerCacheKey, trackerStamp } from '../lib/trackerCache.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
-import { cutPlateFlowGaps } from './cutPlateService.js';
+import { cutPlateFlowGaps, sectionStockProblems } from './cutPlateService.js';
 import { resolveTiming } from './operationService.js';
 import { estimatorForLine } from './timeEstimateService.js';
 import { cellOwnersOfLine } from './workOrderService.js';
@@ -38,7 +38,7 @@ import { ownHoldRows, takeHolds, writeHoldTakes } from './purchaseLinkService.js
 import { ledgerOnSteps, wipArea, writeTransform } from './productionLedgerService.js';
 import {
   availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
-  lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, CUT_PLATE_CODE, MAX_DEPTH,
+  lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, MAX_DEPTH,
 } from './rollOutService.js';
 
 // availability moved to rollOutService with the made rule it serves; the
@@ -390,15 +390,15 @@ export async function lotsOfLines(db, companyId, lineIds) {
   const out = new Map();
   if (!lineIds.length) return out;
   const [rows] = await db.query(
-    `SELECT pl.order_line_id, pl.id AS lot_id, pl.lot_no, pl.source, pl.plate_item_id,
+    `SELECT pl.order_line_id, pl.id AS lot_id, pl.lot_no, pl.source, pl.kind, pl.length_mm AS lot_length_mm, pl.plate_item_id,
             m.code AS plate_code, m.name AS plate_name, i.uom, i.tracked_by,
-            np.cut_plate_id, COUNT(np.id) AS pieces
+            np.cut_plate_id, COUNT(np.id) AS pieces, SUM(np.length_mm) AS placed_length
        FROM cf_plate_lots pl
        JOIN cf_master_records m ON m.id = pl.plate_item_id
        LEFT JOIN cf_item_details i ON i.master_id = pl.plate_item_id
        LEFT JOIN cf_nest_placements np ON np.company_id = pl.company_id AND np.plate_lot_id = pl.id AND np.deleted_at IS NULL
       WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
-      GROUP BY pl.order_line_id, pl.id, pl.lot_no, pl.source, pl.plate_item_id, m.code, m.name, i.uom, i.tracked_by, np.cut_plate_id
+      GROUP BY pl.order_line_id, pl.id, pl.lot_no, pl.source, pl.kind, pl.length_mm, pl.plate_item_id, m.code, m.name, i.uom, i.tracked_by, np.cut_plate_id
       ORDER BY pl.id, np.cut_plate_id`,
     [companyId, lineIds],
   );
@@ -407,12 +407,17 @@ export async function lotsOfLines(db, companyId, lineIds) {
     const lots = out.get(r.order_line_id);
     if (!lots.has(r.lot_id)) {
       lots.set(r.lot_id, {
-        id: r.lot_id, lotNo: r.lot_no, source: r.source, plateItemId: r.plate_item_id,
+        id: r.lot_id, lotNo: r.lot_no, source: r.source, kind: r.kind ?? 'plate', plateItemId: r.plate_item_id,
+        lengthMm: r.lot_length_mm == null ? null : Number(r.lot_length_mm),
         plate: { id: r.plate_item_id, code: r.plate_code, name: r.plate_name, uom: r.uom, trackedBy: r.tracked_by },
         byCutPlate: new Map(),
+        lengthByCutPlate: new Map(),
       });
     }
-    if (r.cut_plate_id != null) lots.get(r.lot_id).byCutPlate.set(Number(r.cut_plate_id), Number(r.pieces));
+    if (r.cut_plate_id != null) {
+      lots.get(r.lot_id).byCutPlate.set(Number(r.cut_plate_id), Number(r.pieces));
+      lots.get(r.lot_id).lengthByCutPlate.set(Number(r.cut_plate_id), Number(r.placed_length ?? 0));
+    }
   }
   return out;
 }
@@ -475,8 +480,22 @@ async function nestMaterial(db, companyId, line, plan, { lots: given } = {}) {
   const nodes = plan.nodes ?? [];
   if (!nodes.length) return new Map();
   // `given`: the line's lots already read in bulk (plannedMaterial); otherwise one query.
-  const lots = given !== undefined ? given : (await lotsOfLines(db, companyId, [line.id])).get(line.id);
-  if (!lots?.size) return new Map();
+  const every = given !== undefined ? given : (await lotsOfLines(db, companyId, [line.id])).get(line.id);
+  if (!every?.size) return new Map();
+  // A bar lot (section nesting, CF_ERP_CUT_FROM_PLAN §4.3) is one stock bar;
+  // its cut sections share it by the LENGTH placed on it (barMaterial). Plate
+  // lots go through the rule below exactly as they always have.
+  const bars = [...every.values()].filter((l) => l.kind === 'bar');
+  const lots = new Map([...every].filter(([, l]) => l.kind !== 'bar'));
+  const barPlaced = barMaterial(plan, nodes, bars);
+  if (!lots.size) return barPlaced;
+  const placedPlates = plateMaterial(plan, nodes, lots);
+  for (const [cp, n] of barPlaced) placedPlates.set(cp, (placedPlates.get(cp) ?? 0) + n);
+  return placedPlates;
+}
+
+/** nestMaterial's plate rule: one whole plate per catalog lot, at its nest group's gate. Returns Map(cutPlateId -> pieces on the nest). */
+function plateMaterial(plan, nodes, lots) {
   const placed = new Map();                        // cutPlateId -> pieces on the nest
   const lotPlates = new Set();
   for (const lot of lots.values()) {
@@ -538,6 +557,115 @@ async function nestMaterial(db, companyId, line, plan, { lots: given } = {}) {
 }
 
 /**
+ * nestMaterial's bar rule (section nesting, CF_ERP_CUT_FROM_PLAN §5): each
+ * CATALOG bar lot is one stock bar, shared among the cut sections placed on it
+ * by the LENGTH each takes (placements' length_mm; by pieces when no length is
+ * recorded). A nested cut section's stock-line requirement is replaced by its
+ * shares, per bar item, on its first node; an offcut bar costs nothing to buy.
+ * Like plates, a piece count the line no longer makes is a problem in words.
+ * Returns Map(cutSectionId -> pieces on the bars).
+ */
+function barMaterial(plan, nodes, bars) {
+  const placed = new Map();
+  if (!bars.length) return placed;
+  for (const lot of bars) for (const [cp, n] of lot.byCutPlate) placed.set(cp, (placed.get(cp) ?? 0) + n);
+  const first = new Map();
+  const need = new Map();
+  for (const n of nodes) {
+    const id = Number(n.itemId);
+    if (!placed.has(id)) continue;
+    if (!first.has(id)) first.set(id, n.k);
+    need.set(id, round6((need.get(id) ?? 0) + n.quantity));
+  }
+  const nameOfItem = (id) => nodes[first.get(id)]?.design?.code ?? nodes[first.get(id)]?.design?.name ?? `cut section ${id}`;
+  for (const [cp, n] of placed) {
+    const want = need.get(cp) ?? 0;
+    if (Math.abs(want - n) > EPS) {
+      plan.problems.push(want
+        ? `${nameOfItem(cp)}: the line makes ${fmt(want)} but the saved section nest lays out ${fmt(n)} — nest the sections again, so the bars bought are the bars cut.`
+        : `The saved section nest lays out ${fmt(n)} of cut section ${cp}, which this line no longer makes — nest the sections again, so the bars bought are the bars cut.`);
+    }
+  }
+  const shares = new Map();                         // cutSectionId -> Map(barItemId -> { qty, lot })
+  for (const lot of bars) {
+    if (lot.source !== 'catalog') continue;         // a reused offcut is not bought
+    if (lot.plate.trackedBy === 'individual') {
+      plan.problems.push(`${lot.plate.code ?? lot.plate.name} is tracked unit by unit — no stock is kept of it yet, so bar ${lot.lotNo} cannot be reserved. Track it by quantity or batch.`);
+    }
+    const total = [...lot.lengthByCutPlate.values()].reduce((t, x) => t + x, 0);
+    const pieces = [...lot.byCutPlate.values()].reduce((t, x) => t + x, 0);
+    for (const [cp, n] of lot.byCutPlate) {
+      if (!first.has(cp)) continue;
+      const share = total > 0 ? (lot.lengthByCutPlate.get(cp) ?? 0) / total : (pieces > 0 ? n / pieces : 0);
+      if (!(share > 0)) continue;
+      if (!shares.has(cp)) shares.set(cp, new Map());
+      const byItem = shares.get(cp);
+      const k = Number(lot.plateItemId);
+      if (!byItem.has(k)) byItem.set(k, { qty: 0, lot });
+      byItem.get(k).qty += share;
+    }
+  }
+  const reqs = [];
+  const done = new Set();
+  for (const r of plan.reqs) {
+    const id = r.nodeK != null ? Number(nodes[r.nodeK]?.itemId) : null;
+    if (id == null || !placed.has(id)) { reqs.push(r); continue; }
+    // The cut section's own stock line: its bars take its place, once, on its first node.
+    if (done.has(id) || r.nodeK !== first.get(id)) continue;
+    done.add(id);
+    for (const [itemId, { qty, lot }] of shares.get(id) ?? []) {
+      reqs.push({
+        nodeK: r.nodeK, itemId, bomLineId: r.bomLineId ?? null, quantity: round6(qty),
+        design: { id: itemId, code: lot.plate.code, name: lot.plate.name, uom: lot.plate.uom, trackedBy: lot.plate.trackedBy, kind: 'catalog' },
+        bar: true,
+      });
+    }
+  }
+  plan.reqs = reqs;
+  return placed;
+}
+
+/**
+ * BEFORE SECTION NESTING (CF_ERP_CUT_FROM_PLAN §5): a cut section asks for its
+ * bar at length ÷ stock length, and one bar is bought whole — so the line's
+ * estimate of each bar is rounded UP (per bar item: one profile in one stock
+ * length), the rounding added to the last requirement of that bar, so the sum
+ * is whole and nothing is moved between nodes. Cut sections a section nest
+ * laid out (`placed`) are already whole bars and are left alone.
+ * `isCutSection(itemId)` says which nodes are cut sections.
+ */
+export function roundUpSectionBars(plan, isCutSection, placed = new Map()) {
+  const nodes = plan.nodes ?? [];
+  const byItem = new Map();
+  for (const r of plan.reqs ?? []) {
+    if (r.nodeK == null || r.bar) continue;
+    const id = Number(nodes[r.nodeK]?.itemId);
+    if (!isCutSection(id) || placed.has(id)) continue;
+    if (!byItem.has(r.itemId)) byItem.set(r.itemId, []);
+    byItem.get(r.itemId).push(r);
+  }
+  for (const list of byItem.values()) {
+    const total = round6(list.reduce((t, r) => t + Number(r.quantity), 0));
+    const whole = Math.ceil(total - EPS);
+    const extra = round6(whole - total);
+    if (extra > EPS) list[list.length - 1].quantity = round6(Number(list[list.length - 1].quantity) + extra);
+  }
+}
+
+/** The cut sections among some items: those filed at the section blanks place (Setup › Cutting). One query. */
+async function cutSectionIdsOf(db, companyId, itemIds) {
+  const ids = [...new Set(itemIds.map(Number))];
+  if (!ids.length) return new Set();
+  const [rows] = await db.query(
+    `SELECT m.id FROM cf_master_records m
+       JOIN cf_cut_places cpl ON cpl.company_id = m.company_id AND cpl.kind = 'section' AND cpl.blanks_node_id = m.classification_id
+      WHERE m.company_id = ? AND m.id IN (?)`,
+    [companyId, ids],
+  );
+  return new Set(rows.map((r) => Number(r.id)));
+}
+
+/**
  * A cut plate is released only with a plate: laid out on the saved nest, or a
  * plate chosen on its raw-plate line (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30 — the
  * freeze no longer needs plates, so this is where a missing one is caught).
@@ -574,6 +702,15 @@ async function planFor(db, companyId, line) {
   const placed = await nestMaterial(db, companyId, line, plan);
   const open = openPlateProblem(plan, placed);
   if (open) plan.problems.push(open);
+  // Cut sections (CF_ERP_CUT_FROM_PLAN §5): a section part with no stock bar,
+  // or a cut section with none under it, refuses release in words; before
+  // section nesting each bar is bought whole (rounded up per bar).
+  const temporaries = [...new Set((plan.all ?? []).filter((n) => n.kind === 'temporary').map((n) => Number(n.id)))];
+  if (temporaries.length) {
+    plan.problems.push(...await sectionStockProblems(db, companyId, temporaries));
+    const sections = await cutSectionIdsOf(db, companyId, (plan.nodes ?? []).map((n) => n.itemId));
+    if (sections.size) roundUpSectionBars(plan, (id) => sections.has(id), placed);
+  }
   if (plan.nodes) planSteps(plan);
   plan.lockedPieces = pieces;
   return plan;
@@ -614,13 +751,13 @@ export async function plannedMaterialOfLines(db, companyId, lines) {
   const lineIds = lines.map((l) => Number(l.id));
   const [pieces] = await db.query(
     `SELECT p.id, p.order_line_id, p.parent_id, p.item_id, p.bom_line_id, p.quantity, p.depth,
-            m.code, m.name, (c.code = ?) AS is_cut_plate
+            m.code, m.name, (cpl.kind = 'plate') AS is_cut_plate, (cpl.kind = 'section') AS is_cut_section
        FROM cf_order_pieces p
        JOIN cf_master_records m ON m.id = p.item_id
-       LEFT JOIN cf_classification_nodes c ON c.id = m.classification_id
+       LEFT JOIN cf_cut_places cpl ON cpl.company_id = m.company_id AND cpl.blanks_node_id = m.classification_id
       WHERE p.company_id = ? AND p.order_line_id IN (?) AND p.deleted_at IS NULL
       ORDER BY p.order_line_id, p.sort_order, p.id`,
-    [CUT_PLATE_CODE, companyId, lineIds],
+    [companyId, lineIds],
   );
   const itemIds = [...new Set(pieces.filter((p) => Number(p.depth) < MAX_DEPTH).map((p) => Number(p.item_id)))];
   const [bomRows] = itemIds.length ? await db.query(
@@ -648,6 +785,7 @@ export async function plannedMaterialOfLines(db, companyId, lines) {
     const rows = piecesBy.get(Number(line.id)) ?? [];
     const nodes = rows.map((p, k) => ({
       k, itemId: Number(p.item_id), quantity: Number(p.quantity), depth: Number(p.depth), isCutPlate: !!Number(p.is_cut_plate),
+      isCutSection: !!Number(p.is_cut_section),
       design: { id: Number(p.item_id), code: p.code, name: p.name },
     }));
     const kOf = new Map(rows.map((p, k) => [Number(p.id), k]));
@@ -690,6 +828,8 @@ export async function plannedMaterialOfLines(db, companyId, lines) {
     const plan = { nodes, reqs, problems: [], openPlates };
     const lots = lotsBy.get(Number(line.id)) ?? null;
     const placed = await nestMaterial(db, companyId, line, plan, { lots });
+    const cutSections = new Set(nodes.filter((n) => n.isCutSection).map((n) => n.itemId));
+    if (cutSections.size) roundUpSectionBars(plan, (id) => cutSections.has(id), placed);
     // A lot's requirement is made by nestMaterial; the buy list also wants how its plate is tracked.
     for (const r of plan.reqs) if (r.lot) r.design.trackedBy = lots?.get(r.lot.id)?.plate.trackedBy ?? null;
     const bare = new Set(openPlates.map((o) => o.cutPlateId).filter((id) => !placed.has(id)));
@@ -949,6 +1089,7 @@ export async function releaseCheck(db, companyId, lineId) {
   // Cut plates with no flow are ONE problem with ONE fix, not one line each:
   // fold them into a single sentence the dialog can put a button beside.
   let cutPlatesNoFlow = { missing: 0, flow: null };
+  let cutSectionsNoFlow = { missing: 0, flow: null };
   if (plan.problems.some((p) => p.endsWith(' has no flow — say how it is made.'))) {
     const gaps = await cutPlateFlowGaps(db, companyId, lineId);
     if (gaps.missing) {
@@ -957,6 +1098,16 @@ export async function releaseCheck(db, companyId, lineId) {
       plan.problems = plan.problems.filter((p) => !mine.has(p));
       plan.problems.push(`${k} cut plate${k === 1 ? '' : 's'} ${k === 1 ? 'has' : 'have'} no flow — say how ${k === 1 ? 'it is' : 'they are'} made.`);
       cutPlatesNoFlow = { missing: gaps.missing, flow: gaps.flow };
+    }
+    const sg = gaps.sections;
+    if (sg?.missing) {
+      const mine = new Set(sg.names.map((x) => `${x} has no flow — say how it is made.`));
+      const k = sg.missing;
+      plan.problems = plan.problems.filter((p) => !mine.has(p));
+      plan.problems.push(sg.flow
+        ? `${k} cut section${k === 1 ? '' : 's'} ${k === 1 ? 'has' : 'have'} no flow — give ${k === 1 ? 'it' : 'them'} the cut-section flow.`
+        : `${k} cut section${k === 1 ? '' : 's'} ${k === 1 ? 'has' : 'have'} no flow, and no cut-section flow is set — set one in Setup › Cutting ("Cut sections are made by") first.`);
+      cutSectionsNoFlow = { missing: sg.missing, flow: sg.flow };
     }
   }
   // Finished work has to land somewhere nameable. When one area is obvious it
@@ -978,6 +1129,7 @@ export async function releaseCheck(db, companyId, lineId) {
     finishedArea: finished.area ? { id: finished.area.id, code: finished.area.code, name: finished.area.name, purpose: finished.area.purpose } : null,
     needsFinishedArea: !finished.area,
     cutPlatesNoFlow,
+    cutSectionsNoFlow,
     // No active area of the fitting purpose at all: the dialog offers to create one.
     finishedAreaPurpose: line.order_type === 'stock' ? 'storage' : 'dispatch',
     noFittingArea: areas.every((a) => a.purpose !== (line.order_type === 'stock' ? 'storage' : 'dispatch')),
@@ -1350,7 +1502,8 @@ async function nameLots(db, companyId, releases, items, reqs) {
       if (!f || it.sort_order < f.order) first.set(it.item_id, { key: it.id, order: it.sort_order });
     }
     const queue = new Map();                       // "piece:plate" -> lots in id order
-    for (const { lot, gate } of lotGates(lots, (cp) => first.get(cp) ?? null).gates) {
+    const plateLots = new Map([...lots].filter(([, l]) => l.kind !== 'bar'));   // bar lots carry no lot requirement (barMaterial)
+    for (const { lot, gate } of lotGates(plateLots, (cp) => first.get(cp) ?? null).gates) {
       if (gate == null) continue;
       const k = `${gate}:${lot.plateItemId}`;
       if (!queue.has(k)) queue.set(k, []);

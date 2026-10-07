@@ -20,7 +20,9 @@
  * machine log).
  *
  * HOW A STEP IS RECOGNISED — no setup:
- *   cut     the first step of a CUT-PLATE node: its plate is cut. A nest
+ *   cut     the first step of a CUT-PIECE node (a plate blank or a section
+ *           blank — filed under a blanks place of Setup › Cutting, cf_cut_places):
+ *           its plate or bar is cut. A nest
  *           group's GATE (releaseService.lotGates) cuts every plate of the group
  *           into all the group's cut pieces + its offcuts; a cut plate not on a
  *           nest cuts its own plate requirement into itself; any other node of a
@@ -37,11 +39,21 @@
  * went in; a split hands each child back what it brought (anything bought into
  * the container on the way is shared by value); a cut shares the plate's value
  * by weight, the rest is cutting loss.
+ *
+ * SECTIONS (CF_ERP_CUT_FROM_PLAN.md §11.3). A bar lot (cf_plate_lots kind 'bar')
+ * is cut like a plate lot: its gate's cut takes the stock bar off its
+ * reservation (or, for a bar from an offcut, the offcut stock piece itself) and
+ * makes the section blanks of its group plus a BAR OFFCUT stock piece of an
+ * item "OFC-<profile>-<grade>" filed under the section offcut place, its length
+ * on the batch and on cf_offcuts. Value is shared by weight: a bar weighs its
+ * length × the stock bar's weight per mm, a section blank its section area ×
+ * length × density.
  */
 import { invalid } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { lotsOfLines, lotGates } from './releaseService.js';
 import { unitKgOf, lotPlateKg } from './valuationService.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -51,8 +63,9 @@ const fmt = (n) => Number(Number(n).toFixed(3));
 const groupBy = (rows, k) => { const m = new Map(); for (const r of rows) { const key = r[k]; if (!m.has(key)) m.set(key, []); m.get(key).push(r); } return m; };
 
 export const WIP_AREA_CODE = 'PROD-WIP';
+/** The code plate offcuts were found by before Setup › Cutting; only a fallback now, when no place is set. */
 export const OFFCUT_NODE_CODE = 'OFFCUT';
-const CUT_PLATE_NODE_CODE = 'CUT_PLATE';
+const FALLBACK_DENSITY = 7850;
 
 // --- where WIP lives ------------------------------------------------------------
 
@@ -141,8 +154,9 @@ async function releaseContext(db, companyId, releaseId) {
        FROM cf_material_requirements WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL`,
     [companyId, releaseId],
   );
-  const [cutNode] = await db.query("SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL", [companyId, CUT_PLATE_NODE_CODE]);
-  const cutClass = new Set(cutNode.map((n) => n.id));
+  // A cut node is a blank of either kind, wherever Setup › Cutting files them.
+  const places = await cutPlaces(db, companyId);
+  const cutClass = new Set([...places.plate.blanksIds, ...places.section.blanksIds]);
   const byId = new Map(items.map((i) => [i.id, { ...i, quantity: Number(i.quantity), children: [], steps: [] }]));
   for (const i of byId.values()) if (i.parent_id && byId.has(i.parent_id)) byId.get(i.parent_id).children.push(i);
   for (const s of steps) byId.get(s.production_item_id)?.steps.push(s);
@@ -160,7 +174,7 @@ async function releaseContext(db, companyId, releaseId) {
   for (const i of byId.values()) if (isCutNode(i) && !firstNodeOf.has(i.item_id)) firstNodeOf.set(i.item_id, i);
   const { groups } = lotGates(lots, (cp) => (firstNodeOf.has(cp) ? { key: firstNodeOf.get(cp).id, order: firstNodeOf.get(cp).sort_order } : null));
   const nestedCutPlates = new Set(groups.flatMap((g) => g.cutPlates));
-  return { rel, byId, stepNode, deps, reqs, isCutNode, groups, nestedCutPlates };
+  return { rel, byId, stepNode, deps, reqs, isCutNode, groups, nestedCutPlates, places };
 }
 
 /** What a step is, in the ledger's terms. */
@@ -278,8 +292,9 @@ async function writeReservations(db, companyId, resWrites) {
 // --- offcuts ------------------------------------------------------------------------
 
 /** The catalog item an offcut of this steel is a piece of — made on first need. */
-async function offcutItem(db, c, { thickness, grade, material }) {
-  const [[node]] = await db.query('SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [c.companyId, OFFCUT_NODE_CODE]);
+async function offcutItem(db, c, { thickness, grade, material }, places = null) {
+  let node = places?.plate?.offcutNodeId ? { id: places.plate.offcutNodeId } : null;
+  if (!node) [[node]] = await db.query('SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [c.companyId, OFFCUT_NODE_CODE]);
   if (!node) return null;
   const code = `OFC-${fmt(thickness)}-${String(grade ?? '').replace(/\s+/g, '')}`.toUpperCase().slice(0, 100);
   const [[have]] = await db.query("SELECT m.id FROM cf_master_records m WHERE m.company_id = ? AND m.code = ? AND m.deleted_at IS NULL", [c.companyId, code]);
@@ -309,6 +324,115 @@ async function offcutItem(db, c, { thickness, grade, material }) {
     );
   }
   return r.insertId;
+}
+
+/** The steel of records, one query: Map id -> { CODE: row } (value_number, value_text, option_id, option_value, spec_id). */
+async function steelValues(db, companyId, ids, codes) {
+  const list = [...new Set(ids.filter((x) => x != null).map(Number))];
+  const out = new Map(list.map((id) => [id, {}]));
+  if (!list.length) return out;
+  const [rows] = await db.query(
+    `SELECT v.subject_id, UPPER(s.code) AS code, s.id AS spec_id, v.value_number, v.value_text, v.option_id, o.value AS option_value
+       FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
+       LEFT JOIN cf_spec_options o ON o.id = v.option_id
+      WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL AND s.code IN (?)`,
+    [companyId, list, codes],
+  );
+  for (const r of rows) out.get(Number(r.subject_id))[r.code] = r;
+  return out;
+}
+const numOf = (r) => (r?.value_number == null ? null : Number(r.value_number));
+const textOf = (r) => (r ? (r.option_value ?? r.value_text ?? null) : null);
+const parseJson = (v) => { if (v == null) return null; if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } };
+
+/** kg per mm of a stock bar: section area × density, else its weight over its length. */
+const barKgPerMm = (v) => {
+  const area = numOf(v.SECTION_AREA);
+  const dens = numOf(v.DENSITY) > 0 ? numOf(v.DENSITY) : FALLBACK_DENSITY;
+  if (area > 0) return (area * dens) / 1e9;
+  return numOf(v.WEIGHT) > 0 && numOf(v.LENGTH) > 0 ? numOf(v.WEIGHT) / numOf(v.LENGTH) : null;
+};
+
+const SECTION_STEEL = ['THICKNESS', 'WIDTH', 'DEPTH', 'SECTION_AREA', 'GRADE', 'IMPACT_CLASS', 'MATERIAL', 'DENSITY'];
+
+/**
+ * The item a bar offcut of this section is a piece of — "OFC-<profile>-<grade>"
+ * (e.g. OFC-ISA75X75X8-E350BO) under the section offcut place of Setup ›
+ * Cutting, made on first need with the stock bar's steel and no length: each
+ * piece's length is on its batch and its cf_offcuts row. No place set = null,
+ * and the offcut stays planned (as a plate offcut does).
+ */
+async function sectionOffcutItem(db, c, places, stockItemId) {
+  const nodeId = places?.section?.offcutNodeId;
+  if (!nodeId || !stockItemId) return null;
+  const [[stock]] = await db.query('SELECT id, code, name FROM cf_master_records WHERE company_id = ? AND id = ?', [c.companyId, stockItemId]);
+  if (!stock) return null;
+  const v = (await steelValues(db, c.companyId, [stockItemId], SECTION_STEEL)).get(Number(stockItemId));
+  const word = String(stock.name ?? stock.code ?? 'SEC').trim().split(/\s+/)[0];
+  const dims = [numOf(v.DEPTH), numOf(v.WIDTH), numOf(v.THICKNESS)].filter((x) => x != null).map(fmt);
+  const code = `OFC-${word}${dims.join('X')}-${textOf(v.GRADE) ?? ''}${textOf(v.IMPACT_CLASS) ?? ''}`.replace(/\s+/g, '').toUpperCase().slice(0, 100);
+  const [[have]] = await db.query('SELECT id FROM cf_master_records WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [c.companyId, code]);
+  if (have) return have.id;
+  const name = `Bar offcut ${word} ${dims.join(' x ')} ${[textOf(v.GRADE), textOf(v.IMPACT_CLASS)].filter(Boolean).join(' ')}`.replace(/\s+/g, ' ').trim();
+  const [r] = await db.query(
+    "INSERT INTO cf_master_records (company_id, record_kind, code, name, short_name, classification_id, status, created_by) VALUES (?, 'item', ?, ?, 'OFC', ?, 'active', ?)",
+    [c.companyId, code, name, nodeId, c.userId ?? null],
+  );
+  await db.query(
+    "INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing) VALUES (?, ?, 'catalog', 'batch', 'nos', 'stock')",
+    [r.insertId, c.companyId],
+  );
+  const rows = SECTION_STEEL.map((k) => v[k]).filter(Boolean)
+    .map((x) => [c.companyId, x.spec_id, 'master', r.insertId, x.value_number, x.value_text, x.option_id, 'entered', c.userId ?? null]);
+  if (rows.length) await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'option_id', 'source', 'created_by'], rows);
+  return r.insertId;
+}
+
+/** Kilograms of each output of a cut: a section blank by section area × length × density; anything else as before (unitKgOf). */
+async function outputKg(db, c, ctx, nodes) {
+  const kg = await unitKgOf(db, c.companyId, nodes.map((n) => n.item_id));
+  const sectionIds = nodes.filter((n) => ctx.places.section.blanksIds.has(Number(n.classification_id))).map((n) => n.item_id);
+  if (sectionIds.length) {
+    const v = await steelValues(db, c.companyId, sectionIds, ['SECTION_AREA', 'LENGTH', 'DENSITY']);
+    for (const id of sectionIds) {
+      const x = v.get(Number(id));
+      const area = numOf(x.SECTION_AREA); const len = numOf(x.LENGTH);
+      const dens = numOf(x.DENSITY) > 0 ? numOf(x.DENSITY) : FALLBACK_DENSITY;
+      if (area > 0 && len > 0) kg.set(id, Math.round(((area * len * dens) / 1e9) * 1000) / 1000);
+    }
+  }
+  return kg;
+}
+
+/**
+ * Bars of a cut that come from an OFFCUT (section nesting claimed it at accept,
+ * cf_offcuts 'used'): the offcut stock piece itself goes into the cut — no
+ * requirement was raised for it, because nothing is bought. Legs taking each
+ * offcut out of wherever it lies (WIP first, then storage), at its value.
+ */
+async function offcutBarLegs(db, c, lots) {
+  const fromOffcuts = lots.filter((l) => l.kind === 'bar' && l.source === 'offcut');
+  if (!fromOffcuts.length) return [];
+  const offIds = fromOffcuts.map((l) => Number(parseJson(l.waste_json)?.offcutId)).filter(Boolean);
+  const [offRows] = offIds.length ? await db.query(
+    'SELECT o.id, o.offcut_no, o.batch_id, b.item_id, b.unit_cost FROM cf_offcuts o LEFT JOIN cf_stock_batches b ON b.id = o.batch_id WHERE o.company_id = ? AND o.id IN (?)',
+    [c.companyId, offIds],
+  ) : [[]];
+  const legs = [];
+  for (const l of fromOffcuts) {
+    const o = offRows.find((x) => x.id === Number(parseJson(l.waste_json)?.offcutId));
+    const label = `Offcut ${o?.offcut_no ?? '?'} (bar ${l.lot_no})`;
+    if (!o?.batch_id) throw invalid('NOT_ENOUGH', `${label} is not a stock piece yet, so bar ${l.lot_no} cannot be cut from it — cut the bar it comes from first, or nest the line again without it.`);
+    const [[at]] = await db.query(
+      `SELECT k.stocking_area_id FROM cf_stock_balances k JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose IN ('storage','wip')
+        WHERE k.company_id = ? AND k.item_id = ? AND k.batch_key = ? AND k.quantity >= 1 ORDER BY a.purpose = 'wip' DESC, k.id LIMIT 1`,
+      [c.companyId, o.item_id, o.batch_id],
+    );
+    if (!at) throw invalid('NOT_ENOUGH', `${label} is not in stock, so bar ${l.lot_no} cannot be cut from it — put it back in stock, or nest the line again without it.`);
+    const unit = o.unit_cost == null ? null : Number(o.unit_cost);
+    legs.push({ areaId: at.stocking_area_id, itemId: o.item_id, batchId: o.batch_id, delta: -1, unitCost: unit, value: unit == null ? null : -unit, label });
+  }
+  return legs;
 }
 
 // --- the reconciler --------------------------------------------------------------------
@@ -525,14 +649,20 @@ async function cutStep(db, c, ctx, area, { s, node, k, d }) {
       legs.push(...t.legs);
       resWrites.push(...t.resWrites);
     }
+    const [pl] = lotIds.length ? await db.query('SELECT * FROM cf_plate_lots WHERE company_id = ? AND id IN (?)', [c.companyId, lotIds]) : [[]];
+    legs.push(...await offcutBarLegs(db, c, pl));
     const plateValue = legs.some((l) => l.value == null) && legs.length ? null : -legs.reduce((t, l) => t + (l.value ?? 0), 0);
-    // Weights: each output piece, each offcut, the plates.
-    const kg = await unitKgOf(db, c.companyId, outs.map((n) => n.item_id));
+    // Weights: each output piece, each offcut, the plates (or bars).
+    const kg = await outputKg(db, c, ctx, outs);
     const [offcuts] = lotIds.length ? await db.query("SELECT * FROM cf_offcuts WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL AND status = 'planned'", [c.companyId, lotIds]) : [[]];
     let plateKg = 0;
     if (lotIds.length) {
-      const [pl] = await db.query('SELECT * FROM cf_plate_lots WHERE company_id = ? AND id IN (?)', [c.companyId, lotIds]);
-      plateKg = pl.reduce((t, l) => t + lotPlateKg(l), 0);
+      // A bar weighs its length × the stock bar's kg per mm; a plate as before.
+      const bars = pl.filter((l) => l.kind === 'bar');
+      const perMm = bars.length ? await steelValues(db, c.companyId, bars.map((l) => l.plate_item_id), ['SECTION_AREA', 'DENSITY', 'WEIGHT', 'LENGTH']) : new Map();
+      plateKg = pl.reduce((t, l) => t + (l.kind === 'bar'
+        ? (barKgPerMm(perMm.get(Number(l.plate_item_id)) ?? {}) ?? 0) * Number(l.length_mm)
+        : lotPlateKg(l)), 0);
     } else {
       const pk = await unitKgOf(db, c.companyId, reqs.map((r) => r.item_id));
       plateKg = reqs.reduce((t, r) => t + (pk.get(r.item_id) ?? 0) * Number(r.quantity), 0);
@@ -546,8 +676,11 @@ async function cutStep(db, c, ctx, area, { s, node, k, d }) {
     // Offcuts: each a stock piece of its steel's Offcut item, carrying its outline (cf_offcuts).
     const made = [];
     for (const o of offcuts) {
-      const itemId = await offcutItem(db, c, { thickness: Number(o.thickness_mm), grade: o.grade, material: o.material });
-      if (!itemId) continue;                                  // no Offcuts variant set up: the offcut stays planned
+      const isBar = o.kind === 'bar';
+      const itemId = isBar
+        ? await sectionOffcutItem(db, c, ctx.places, o.stock_item_id)
+        : await offcutItem(db, c, { thickness: Number(o.thickness_mm), grade: o.grade, material: o.material }, ctx.places);
+      if (!itemId) continue;                                  // no offcut place set up: the offcut stays planned
       const v = share(o.weight_kg == null ? null : Number(o.weight_kg));
       // Its lot: the one an earlier cut of this plate made (a cut undone and done
       // again), else a new one named by the order and the offcut — offcut numbers
@@ -560,14 +693,17 @@ async function cutStep(db, c, ctx, area, { s, node, k, d }) {
         if (taken) code = `${code}-${o.id}`;
         const [b] = await db.query(
           'INSERT INTO cf_stock_batches (company_id, item_id, code, received_on, supplier_ref, unit_cost, owner_party_id, notes, created_by) VALUES (?, ?, ?, CURDATE(), ?, ?, ?, ?, ?)',
-          [c.companyId, itemId, code, o.offcut_no, v == null ? null : round4(v), o.owner_party_id ?? null, `Offcut ${o.offcut_no} of ${ctx.rel.order_code} — outline in cf_offcuts #${o.id}`, c.userId ?? null],
+          [c.companyId, itemId, code, o.offcut_no, v == null ? null : round4(v), o.owner_party_id ?? null,
+            isBar ? `Bar offcut ${o.offcut_no} of ${ctx.rel.order_code} — ${fmt(o.length_mm)} mm long (cf_offcuts #${o.id})` : `Offcut ${o.offcut_no} of ${ctx.rel.order_code} — outline in cf_offcuts #${o.id}`,
+            c.userId ?? null],
         );
         batchId = b.insertId;
       }
       legs.push({ areaId: area.id, itemId, batchId, delta: 1, unitCost: v == null ? null : round4(v), value: v, label: o.offcut_no });
       made.push({ id: o.id, batchId });
     }
-    await writeTransform(db, c, { reference: ref, notes: `Plate${lotIds.length > 1 ? 's' : ''} cut: ${outs.length} cut piece row${outs.length === 1 ? '' : 's'}${made.length ? `, ${made.length} offcut${made.length === 1 ? '' : 's'}` : ''}`, orderId: ctx.rel.order_id, orderLineId: ctx.rel.order_line_id, legs });
+    const what = pl.length && pl.every((l) => l.kind === 'bar') ? 'Bar' : 'Plate';
+    await writeTransform(db, c, { reference: ref, notes: `${what}${lotIds.length > 1 ? 's' : ''} cut: ${outs.length} cut piece row${outs.length === 1 ? '' : 's'}${made.length ? `, ${made.length} offcut${made.length === 1 ? '' : 's'}` : ''}`, orderId: ctx.rel.order_id, orderLineId: ctx.rel.order_line_id, legs });
     await writeReservations(db, c.companyId, resWrites);
     for (const r of reqs) await db.query('UPDATE cf_material_requirements SET issued = quantity WHERE company_id = ? AND id = ?', [c.companyId, r.id]);
     for (const m of made) await db.query("UPDATE cf_offcuts SET status = 'available', batch_id = ? WHERE company_id = ? AND id = ?", [m.batchId, c.companyId, m.id]);

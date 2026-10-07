@@ -292,7 +292,10 @@ export async function getPlanner(db, companyId, q = {}) {
       : [[]],
     lineIds.length
       ? db.query(
-        `SELECT pl.order_line_id, pl.id AS lot_id, pl.plate_item_id, np.cut_plate_id, np.length_mm * np.width_mm AS area
+        // A plate lot is shared out by placed AREA; a section bar lot (kind
+        // 'bar', §48) by placed LENGTH — its pieces are all one section wide.
+        `SELECT pl.order_line_id, pl.id AS lot_id, pl.plate_item_id, np.cut_plate_id,
+                CASE WHEN pl.kind = 'bar' THEN np.length_mm ELSE np.length_mm * np.width_mm END AS area
            FROM cf_plate_lots pl
            JOIN cf_nest_placements np ON np.company_id = pl.company_id AND np.plate_lot_id = pl.id AND np.deleted_at IS NULL
           WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL AND pl.plate_item_id IS NOT NULL`,

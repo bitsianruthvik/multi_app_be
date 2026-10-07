@@ -92,24 +92,52 @@ import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRe
 import { ancestors } from './tree.js';
 import { resolve as resolveSpecs, rawOf, dateText } from './resolutionService.js';
 import { temporaryTree } from './instantiationService.js';
-import { requireUsableFlow, cutPlateFlowId } from './flowService.js';
+import { requireUsableFlow, cutPlateFlowId, cutSectionFlowId } from './flowService.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { readRulesOnce, PLACED, rangesOf } from './codeRangeService.js';
 import { generate } from '../modules/codegen/index.js';
 import { refreshValues } from './valueService.js';
 import { autofillLineSelections } from './selectionService.js';
+import { cutPlaces, problemsOf } from '../lib/cutPlaces.js';
+import {
+  resolveCodes, sectionSteelOf, profileKeyOf, profileLabelOf, CUT_FROM_CODE, CUT_FROM_VALUES, STEEL_FROM_STOCK,
+} from '../lib/cutFrom.js';
+
+/**
+ * ---------------------------------------------------------------------------
+ * CUT FROM (2026-10-08, CF_ERP_CUT_FROM_PLAN.md): which parts get a cut piece
+ * is no longer "whatever is filed under FAB_PARTS". Every part says how it is
+ * cut — its CUT_FROM, inherited down the classification and from its template
+ * definition (lib/cutFrom) — and where cut pieces are filed is a company
+ * setting by node id (lib/cutPlaces), never a code. Two methods:
+ *
+ *   PLATE    exactly the derive described above, result for result.
+ *   SECTION  a part cut to length from a stock bar. It names its bar
+ *            (cf_master_records.cut_stock_id, its own or its template
+ *            definition's), takes the bar's steel (STEEL_FROM_STOCK, written
+ *            as 'inherited' where it has no entered value — syncSectionSteel),
+ *            and parts of the same PROFILE (thickness, width, depth, grade,
+ *            impact — the same bar in any stock length) and the same LENGTH
+ *            share one blank filed at the section blanks place. Part -> blank
+ *            quantity 1; blank -> its stock bar at length ÷ stock length,
+ *            until section nesting replaces it with the real bar share.
+ *
+ * Both run in the same load / plan / write: the same reconcile, keyed per
+ * method, the same bulk writes, one values settle for the line, and still
+ * "a derive that changes nothing writes nothing". A part whose CUT_FROM
+ * changes lets go of the blank of its old method in the same reconcile (its
+ * line is dropped; the blank, if nothing else is cut from it, goes).
+ * ---------------------------------------------------------------------------
+ */
 
 /** The four facts that make two parts the same blank. */
 const SPEC_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE'];
-const CUT_PLATE_CODE = 'CUT_PLATE';
-const PLATE_CODE = 'PLATE';
-const PARTS_CODE = 'FAB_PARTS';
+/** What a cut section is given of its own (where its place's rules take them), beside the steel its chain asks a part for. */
+const SECTION_SIZE_CODES = ['THICKNESS', 'WIDTH', 'DEPTH', 'SECTION_AREA', 'LENGTH', 'GRADE', 'DENSITY'];
 /** instantiationService.temporaryTree walks this far down (its MAX_DEPTH + 5). */
 const TREE_DEPTH = 25;
 /** bomGraph.descendantIds' cap, for the loop rule. */
 const LOOP_DEPTH = 25;
-/** Well past Family › Subfamily › Variant, as a guard against a parent_id cycle. */
-const SUBTREE_HOPS = 8;
 const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -220,90 +248,70 @@ function assertOpen(line) {
   if (f) throw invalid(f.code, f.message);
 }
 
-// --- the three places in the classification tree this needs --------------------
+// --- where cut pieces, raw stock and offcuts are filed (lib/cutPlaces) ----------
 
 /**
- * Nodes found by `where` and every live node below each, in one query. `seed_id`
- * says which found node a row hangs under — the same walk tree.subtreeIds does
- * a level at a time.
- */
-const SUBTREES_SQL = (where) => `
-  WITH RECURSIVE sub AS (
-    SELECT n.id, n.parent_id, n.code, n.name, n.id AS seed_id, CAST(0 AS SIGNED) AS hop
-      FROM cf_classification_nodes n
-     WHERE n.company_id = ? AND n.deleted_at IS NULL AND ${where}
-     UNION ALL
-    SELECT c.id, c.parent_id, c.code, c.name, s.seed_id, s.hop + 1
-      FROM sub s
-      JOIN cf_classification_nodes c ON c.company_id = ? AND c.parent_id = s.id AND c.deleted_at IS NULL
-     WHERE s.hop < ?
-  )
-  SELECT id, parent_id, code, name, seed_id, hop FROM sub`;
-
-/**
- * Where the part temporaries are filed (FAB_PARTS — the code is the first
- * answer; "Parts" under "Fabricated" the second, so a tree built by hand still
- * works), where blanks are filed (CUT_PLATE), and where raw plates are filed
- * (PLATE) — with the subtrees of the first two. One query; two only when the
- * parts node has to be found by its name. Never throws: requirePlaces says what
- * is missing, in the order the checks have always been made.
+ * The places, by id, from the one helper every service asks (Setup › Cutting).
+ * Never throws: requirePlaces says what is missing, in its words, for the
+ * methods a line actually uses — a line with no section parts need not hear
+ * that no section place is set.
  */
 async function loadPlaces(db, companyId) {
-  const [rows] = await db.query(SUBTREES_SQL('n.code IN (?)'), [companyId, [PARTS_CODE, CUT_PLATE_CODE, PLATE_CODE], companyId, SUBTREE_HOPS]);
-  const seed = (code) => rows.find((r) => Number(r.hop) === 0 && String(r.code).toUpperCase() === code) ?? null;
-  const under = (node, from) => (node ? from.filter((r) => r.seed_id === node.id).map((r) => r.id) : []);
-  let parts = seed(PARTS_CODE);
-  let partIds = under(parts, rows);
-  if (!parts) {
-    const [[n]] = await db.query(
-      `SELECT n.id, n.code, n.name FROM cf_classification_nodes n
-         JOIN cf_classification_nodes p ON p.id = n.parent_id AND p.deleted_at IS NULL
-        WHERE n.company_id = ? AND n.deleted_at IS NULL AND n.name = 'Parts' AND p.name = 'Fabricated'
-        ORDER BY n.id LIMIT 1`,
-      [companyId],
-    );
-    if (n) {
-      const [sub] = await db.query(SUBTREES_SQL('n.id = ?'), [companyId, n.id, companyId, SUBTREE_HOPS]);
-      parts = n;
-      partIds = under(n, sub);
-    }
-  }
-  const cutPlate = seed(CUT_PLATE_CODE);
-  const plate = seed(PLATE_CODE);
+  const all = await cutPlaces(db, companyId);
   return {
-    parts: parts ? { id: parts.id, code: parts.code, name: parts.name } : null,
-    partIds: new Set(partIds),
-    cutPlate: cutPlate ? { id: cutPlate.id, code: cutPlate.code, name: cutPlate.name } : null,
-    cutIds: under(cutPlate, rows),
-    plate: plate ? { id: plate.id, code: plate.code, name: plate.name } : null,
+    all,
+    cutPlate: all.plate.blanksNodeId ? { id: all.plate.blanksNodeId } : null,
+    cutIds: [...all.plate.blanksIds],
+    cutSection: all.section.blanksNodeId ? { id: all.section.blanksNodeId } : null,
+    sectionIds: [...all.section.blanksIds],
+    blankIds: new Set([...all.plate.blanksIds, ...all.section.blanksIds]),
   };
 }
 
-function requirePlaces(places) {
-  if (!places.parts) throw invalid('NO_PARTS_CLASS', 'Nothing in the classification tree says where parts are filed — add Fabricated › Parts (or a node coded FAB_PARTS) and put the plate parts under it.');
-  if (!places.cutPlate) throw invalid('NO_CUT_PLATE_CLASS', `There is no ${CUT_PLATE_CODE} variant under Steel › Plates — a cut plate has nowhere to be filed.`);
+/** The refusal for a method in use whose blanks place is not set — problemsOf's words. */
+function placeProblem(places, kind) {
+  const p = problemsOf(places.all, kind, ['blanks'])[0];
+  return p ? invalid(kind === 'plate' ? 'NO_CUT_PLATE_CLASS' : 'NO_CUT_SECTION_CLASS', p.text) : null;
 }
 
-/** The selection definition that chooses a raw plate — found by what it searches, never by its id. */
-export async function plateSelection(db, companyId, plate) {
-  if (!plate) throw invalid('NO_PLATE_CLASS', `There is no ${PLATE_CODE} variant under Steel › Plates, so nothing says where raw plates are filed.`);
+function requirePlaces(places, { plate = false, section = false } = {}) {
+  const e = (plate && placeProblem(places, 'plate')) || (section && placeProblem(places, 'section'));
+  if (e) throw e;
+}
+
+/**
+ * The selection definition that chooses a raw plate — found by what it
+ * searches (the plate stock place of Setup › Cutting), never by its id.
+ * `where` is the cutPlaces answer, a list of node ids, or (older callers) a
+ * node { id, code }.
+ */
+export async function plateSelection(db, companyId, where) {
+  const nodeIds = where?.all?.plate ? where.all.plate.stockNodeIds
+    : where?.plate?.stockNodeIds ? where.plate.stockNodeIds
+      : Array.isArray(where) ? where.map(Number)
+        : where?.stockNodeIds ? where.stockNodeIds
+          : where?.id != null ? [Number(where.id)] : [];
+  if (!nodeIds.length) {
+    throw invalid('NO_PLATE_CLASS', 'No raw plate stock is set — choose where it is filed in Setup › Cutting, so a cut plate knows where its raw plate comes from.');
+  }
   const [rows] = await db.query(
-    `SELECT m.id, m.code, m.name, m.status FROM cf_definition_details d
+    `SELECT m.id, m.code, m.name, m.status, n.code AS searches FROM cf_definition_details d
        JOIN cf_master_records m ON m.id = d.master_id AND m.deleted_at IS NULL
+       LEFT JOIN cf_classification_nodes n ON n.id = d.candidate_classification_id
       WHERE d.company_id = ? AND d.deleted_at IS NULL AND d.definition_type = 'selection'
-        AND d.candidate_classification_id = ? AND m.status = 'active'
+        AND d.candidate_classification_id IN (?) AND m.status = 'active'
       ORDER BY m.id`,
-    [companyId, plate.id],
+    [companyId, nodeIds],
   );
   if (!rows.length) {
-    throw invalid('NO_PLATE_SELECTION', `Nothing chooses the raw plate: there is no active selection definition searching ${plate.code}. Make one (the SEL Plate selection) before working out cut plates.`);
+    throw invalid('NO_PLATE_SELECTION', 'Nothing chooses the raw plate: there is no active selection definition searching the raw plate stock. Make one (the SEL Plate selection) before working out cut plates.');
   }
   if (rows.length > 1) {
-    throw invalid('MANY_PLATE_SELECTIONS', `${rows.length} selection definitions search ${plate.code} (${list(rows.map(nameOf))}) — a cut plate cannot be told which one chooses its raw plate. Retire the ones that do not.`);
+    throw invalid('MANY_PLATE_SELECTIONS', `${rows.length} selection definitions search the raw plate stock (${list(rows.map(nameOf))}) — a cut plate cannot be told which one chooses its raw plate. Retire the ones that do not.`);
   }
-  return rows[0];
+  const { searches, ...sel } = rows[0];
+  return sel;
 }
-
 // --- the four values, read where they are already stored -----------------------
 
 /**
@@ -360,7 +368,9 @@ const keyOf = (s) => `${s.thickness}|${s.length}|${s.width}|${s.gradeId != null 
  * children only, to the same depth), joined to the rows mastersOf read. In id
  * order, which is the order the per-record reads came back in. UNION ALL, as
  * every recursive query here that runs on TiDB: a blank reached from several
- * parts comes back once per part, and the IN below counts it once.
+ * parts comes back once per part, and the IN below counts it once. Each row
+ * also carries what CUT_FROM is resolved from (kind, template definition) and
+ * the section it names (its own and its definition's cut_stock_id).
  */
 const TREE_SQL = `
   WITH RECURSIVE walk AS (
@@ -373,20 +383,36 @@ const TREE_SQL = `
       JOIN cf_item_details i ON i.master_id = l.child_id AND i.item_type = 'temporary' AND i.deleted_at IS NULL
      WHERE w.depth < ?
   )
-  SELECT m.id, m.code, m.name, m.status, m.classification_id, i.item_type, m.created_at
+  SELECT m.id, m.code, m.name, m.status, m.classification_id, i.item_type, m.created_at,
+         m.record_kind, m.cut_stock_id, i.source_definition_id,
+         d.cut_stock_id AS def_cut_stock_id, d.code AS def_code, d.name AS def_name
     FROM cf_master_records m
     JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+    LEFT JOIN cf_master_records d ON d.id = i.source_definition_id AND d.deleted_at IS NULL
    WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.id IN (SELECT id FROM walk)
    ORDER BY m.id`;
 
+/** The CUT_FROM answer of a resolved entry, as one of its three words (null = no answer). */
+const cutWordOf = (e) => {
+  const v = e?.optionValue ?? (typeof e?.value === 'string' ? e.value : null);
+  const up = v == null ? null : String(v).toUpperCase();
+  return CUT_FROM_VALUES.includes(up) ? up : null;
+};
+
 /**
- * Everything the reconcile works from: the part temporaries under the line, the
- * cut plates their BOMs already point at, the lines that join them, and the
- * size each of them carries. Four queries.
+ * Everything the reconcile works from: the line's temporaries and how each is
+ * cut (CUT_FROM, resolved for all of them at once), the blanks their BOMs
+ * already point at, the lines that join them, and the values each carries.
+ * Four queries for a line with no section parts; two more when it has some.
  *
  * "Leaf" is not asked of the parts, because after one run they are not leaves
- * any more — each has gained its cut plate. What makes a part a part is where
- * it is filed.
+ * any more — each has gained its cut piece. What makes a part a part is its
+ * CUT_FROM: PLATE or SECTION. A blank is never a part (it is filed at a
+ * blanks place).
+ *
+ * Returns { items, resolved, cutFrom, candidates, plate: { parts, cutPlates,
+ * links }, section: { parts, cutPlates, links, lines, steel }, and parts /
+ * cutPlates / links — the plate ones, as callers have always read them }.
  */
 async function survey(db, companyId, line, places) {
   if (line.line_type !== 'custom') {
@@ -395,28 +421,35 @@ async function survey(db, companyId, line, places) {
   // The walk always holds the line's own item, so "no structure at all" cannot
   // be reached past the check above.
   const [items] = await db.query(TREE_SQL, [line.item_id, companyId, TREE_DEPTH, companyId]);
-  const parts = items.filter((m) => m.item_type === 'temporary' && places.partIds.has(m.classification_id));
+  const candidates = items.filter((m) => m.item_type === 'temporary' && !places.blankIds.has(m.classification_id));
+  const resolved = await resolveCodes(db, companyId, candidates, [CUT_FROM_CODE, ...STEEL_FROM_STOCK]);
+  const cutFrom = new Map(candidates.map((m) => [m.id, cutWordOf(resolved.get(m.id)?.get(CUT_FROM_CODE))]));
+  const plateParts = candidates.filter((m) => cutFrom.get(m.id) === 'PLATE');
+  const sectionParts = candidates.filter((m) => cutFrom.get(m.id) === 'SECTION');
 
-  // The cut plates this line's parts are cut from. A cut plate nothing points
-  // at is deliberately out of scope: an unclaimed one is an offcut, and an
-  // offcut is nobody's to delete.
-  const [links] = parts.length && places.cutIds.length ? await db.query(
-    `SELECT l.id AS line_id, l.quantity, b.parent_id AS part_id, l.child_id AS cut_plate_id, l.created_at
+  // The blanks this line's rows are cut from — asked of EVERY row, not only of
+  // today's parts, so a row whose CUT_FROM changed is seen holding the blank of
+  // its old method and lets go of it. A blank nothing points at is
+  // deliberately out of scope: an unclaimed one is an offcut, and an offcut is
+  // nobody's to delete.
+  const [links] = candidates.length && places.blankIds.size ? await db.query(
+    `SELECT l.id AS line_id, l.quantity, b.parent_id AS part_id, l.child_id AS cut_plate_id, l.created_at,
+            m.classification_id AS blank_classification_id
        FROM cf_boms b
        JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
        JOIN cf_master_records m ON m.id = l.child_id AND m.deleted_at IS NULL
        JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL
       WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.parent_id IN (?) AND m.classification_id IN (?)
       ORDER BY l.id`,
-    [companyId, parts.map((p) => p.id), places.cutIds],
+    [companyId, candidates.map((p) => p.id), [...places.blankIds]],
   ) : [[]];
 
   const cutPlateIds = new Set(links.map((l) => l.cut_plate_id));
-  const cutPlates = items.filter((m) => cutPlateIds.has(m.id));
+  const blanks = items.filter((m) => cutPlateIds.has(m.id));
   // A blank is a temporary child of the part it is cut from, so the walk has
   // it — unless the part sits at the very bottom of the walk's depth. Read
   // those the old way rather than lose them.
-  const lost = [...cutPlateIds].filter((id) => !cutPlates.some((cp) => cp.id === id));
+  const lost = [...cutPlateIds].filter((id) => !blanks.some((cp) => cp.id === id));
   if (lost.length) {
     const [more] = await db.query(
       `SELECT m.id, m.code, m.name, m.status, m.classification_id, i.item_type, m.created_at
@@ -425,22 +458,78 @@ async function survey(db, companyId, line, places) {
         WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL`,
       [companyId, lost],
     );
-    cutPlates.push(...more);
-    cutPlates.sort((a, b) => a.id - b.id);
+    blanks.push(...more);
+    blanks.sort((a, b) => a.id - b.id);
   }
-  const values = await specValuesOf(db, companyId, [...parts.map((p) => p.id), ...cutPlates.map((cp) => cp.id)]);
-  for (const m of [...parts, ...cutPlates]) {
+  const parts = [...plateParts, ...sectionParts];
+  const values = await specValuesOf(db, companyId, [...parts.map((p) => p.id), ...blanks.map((cp) => cp.id)]);
+  for (const m of [...parts, ...blanks]) {
     m.values = values.get(m.id) ?? new Map();
     m.size = sizeOf(m.values);
   }
-  return { parts, cutPlates, links };
+  const sectionClass = places.all.section.blanksIds;
+  const plate = {
+    parts: plateParts,
+    cutPlates: blanks.filter((b) => !sectionClass.has(b.classification_id)),
+    links: links.filter((l) => !sectionClass.has(l.blank_classification_id)),
+  };
+  const section = {
+    parts: sectionParts,
+    cutPlates: blanks.filter((b) => sectionClass.has(b.classification_id)),
+    links: links.filter((l) => sectionClass.has(l.blank_classification_id)),
+    lines: { lines: new Map(), nested: new Set() },
+    steel: new Map(),
+  };
+  if (section.parts.length || section.cutPlates.length) await surveySections(db, companyId, line, places, section);
+  return { items, resolved, cutFrom, candidates, plate, section, parts: plate.parts, cutPlates: plate.cutPlates, links: plate.links };
+}
+
+/** The bar a section part names: its own cut_stock_id, else its template definition's. */
+const partStockOf = (p) => (p.cut_stock_id != null ? Number(p.cut_stock_id) : p.def_cut_stock_id != null ? Number(p.def_cut_stock_id) : null);
+
+/**
+ * The section side of the survey: the bar each section part names, each
+ * section blank's stock line, and the steel of every bar involved. Two
+ * queries. Gives every section part `section` = { stockId, stock, length,
+ * missing[] } and every section blank `section` = { stockId, stock, length },
+ * both with `sizeKey` — the profile + length the reconcile pools by (null
+ * while a part cannot say it).
+ */
+async function surveySections(db, companyId, line, places, section) {
+  const stockPlaces = places.all.section.stockIds;
+  section.lines = await plateLinesOf(db, companyId, line.id, section.cutPlates.map((cp) => cp.id));
+  const blankStock = new Map();
+  for (const cp of section.cutPlates) {
+    const own = (section.lines.lines.get(cp.id) ?? []).find((l) => l.child_record_kind === 'item' && stockPlaces.has(l.child_classification_id));
+    blankStock.set(cp.id, own ? Number(own.child_id) : null);
+  }
+  section.steel = await sectionSteelOf(db, companyId, [...section.parts.map(partStockOf), ...blankStock.values()]);
+  for (const p of section.parts) {
+    const stockId = partStockOf(p);
+    const stock = stockId != null ? section.steel.get(stockId) ?? null : null;
+    const length = p.size.length;
+    const missing = [];
+    if (stockId == null) missing.push('no section chosen');
+    else if (!stock || !stockPlaces.has(Number(stock.classificationId))) missing.push(`${stock ? nameOf(stock) : `item ${stockId}`} is not a section in stock`);
+    if (length == null || length <= 0) missing.push('no LENGTH');
+    const stockOk = !!stock && stockPlaces.has(Number(stock.classificationId));
+    p.section = { stockId, stock, length, missing, stockOk };
+    p.sizeKey = missing.length ? null : `S|${profileKeyOf(stock)}|L${length}`;
+  }
+  for (const cp of section.cutPlates) {
+    const stockId = blankStock.get(cp.id);
+    const stock = stockId != null ? section.steel.get(stockId) ?? null : null;
+    cp.section = { stockId, stock, length: cp.size.length };
+    cp.sizeKey = stock && cp.size.length > 0 ? `S|${profileKeyOf(stock)}|L${cp.size.length}` : null;
+  }
 }
 
 /**
  * Each existing cut plate's own BOM and its live lines, in line order — what
  * bomOfParent + linesOfBom read per blank — and whether an accepted nesting of
  * THIS line has laid it out (see NESTED_NOTE): a placement on one of the
- * line's plate lots names it. One query. Returns
+ * line's lots names it (a plate lot for a cut plate, a bar lot for a cut
+ * section). One query. Returns
  *   { lines: Map(cutPlateId -> [line]), nested: Set(cutPlateId) }
  */
 async function plateLinesOf(db, companyId, orderLineId, cutPlateIds) {
@@ -449,7 +538,7 @@ async function plateLinesOf(db, companyId, orderLineId, cutPlateIds) {
   if (!cutPlateIds.length) return { lines, nested };
   const [rows] = await db.query(
     `SELECT cp.id AS parent_id, l.id, l.line_no, l.child_id, l.design_id, l.position, l.quantity,
-            l.selection_definition_id, ch.record_kind AS child_record_kind,
+            l.selection_definition_id, ch.record_kind AS child_record_kind, ch.classification_id AS child_classification_id,
             EXISTS (SELECT 1 FROM cf_nest_placements np
                       JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
                      WHERE np.company_id = cp.company_id AND np.cut_plate_id = cp.id
@@ -555,8 +644,8 @@ function group(parts) {
  * Returns the plan with no plate lines yet — planPlateLines adds them once the
  * plates they would hold are read.
  */
-function planGroups({ parts, cutPlates, links }) {
-  const groups = group(parts);
+function planGroups({ parts, cutPlates, links }, { groupOf = group, keyOfRecord = (m) => keyOf(m.size) } = {}) {
+  const groups = groupOf(parts);
   const partById = new Map(parts.map((p) => [p.id, p]));
   const byId = new Map(cutPlates.map((cp) => [cp.id, cp]));
   const drops = new Set();
@@ -565,7 +654,7 @@ function planGroups({ parts, cutPlates, links }) {
   for (const l of links) {
     const part = partById.get(l.part_id);
     const cp = byId.get(l.cut_plate_id);
-    if (part && cp && keyOf(part.size) === keyOf(cp.size)) liveLinks.push(l);
+    if (part && cp && keyOfRecord(part) != null && keyOfRecord(part) === keyOfRecord(cp)) liveLinks.push(l);
     else drops.add(l.line_id);
   }
 
@@ -655,18 +744,32 @@ function planPlateLines(plan, plateLines, { selection, pick, plates, carried = n
 }
 
 /**
- * Whether the plan writes anything. A blank nothing is cut from any more only
- * appears when some line was let go of, so the drops cover it.
+ * Whether a method's plan writes anything. A blank nothing is cut from any
+ * more only appears when some line was let go of, so the drops cover it.
  */
-const writes = (plan) => plan.drops.size > 0 || plan.groups.some((x) => x.isNew || x.attachTo.length > 0 || x.plateLine?.changed);
+const writesKind = (plan) => !!plan && (plan.drops.size > 0 || plan.groups.some((x) => x.isNew || x.attachTo.length > 0 || x.plateLine?.changed));
+/** Whether the whole plan (both methods) writes anything. */
+const writes = (plan) => (plan.plate || plan.section ? writesKind(plan.plate) || writesKind(plan.section) : writesKind(plan));
+
+const EMPTY_PLAN = () => ({ groups: [], drops: new Set(), orphans: [] });
+
+/** Both methods' plans as one: `groups` is every group, plate ones first. */
+const combined = (plate, section) => {
+  for (const x of plate.groups) x.kind = 'plate';
+  for (const x of section.groups) x.kind = 'section';
+  return { plate, section, groups: [...plate.groups, ...section.groups] };
+};
 
 /**
- * The whole plan, from what survey() read: the plate lines, the default
- * candidate and the plates, then the reconcile. `carried` — see planPlateLines.
+ * The plate method's plan, from what survey() read: the plate lines, the
+ * default candidate and the plates, then the reconcile. `carried` — see
+ * planPlateLines. No plate part and no plate blank: an empty plan, no query.
  */
-async function planFor(db, companyId, { line, state, selection, carried = null }) {
-  const plateLines = await plateLinesOf(db, companyId, line.id, state.cutPlates.map((cp) => cp.id));
-  const plan = planGroups(state);
+async function planPlateFor(db, companyId, { line, st, selection, carried = null }) {
+  if (!st.parts.length && !st.cutPlates.length) return EMPTY_PLAN();
+  const plan = planGroups(st);
+  if (!plan.groups.length) return plan;     // only blanks to let go of: no plate line to read
+  const plateLines = await plateLinesOf(db, companyId, line.id, st.cutPlates.map((cp) => cp.id));
   // NO DEFAULT PLATE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): "how are the cut pieces
   // showing the plates that happens in the next step of nesting?" A new blank's
   // plate line holds the SELECTION — chosen at nesting — never the selection's
@@ -675,6 +778,91 @@ async function planFor(db, companyId, { line, state, selection, carried = null }
   const pick = null;
   const plates = await platesOf(db, companyId, [...platesWanted(plan, plateLines, selection, pick), ...(carried ? [...carried.values()].map((v) => v.plateId) : [])]);
   planPlateLines(plan, plateLines, { selection, pick, plates, carried });
+  return plan;
+}
+
+/**
+ * The whole plan: the plate method's, then the section method's (which needs
+ * no query of its own — survey read its lines and steel). `carried` — see
+ * planPlateLines; for sections only the flow is carried.
+ */
+async function planFor(db, companyId, { line, state, selection, places, carried = null }) {
+  const plate = await planPlateFor(db, companyId, { line, st: state.plate, selection, carried });
+  const section = planSectionFor({ st: state.section, places, carried });
+  return combined(plate, section);
+}
+
+// --- the section method ------------------------------------------------------------
+
+const SECTION_NESTED_NOTE = 'This quantity comes from the accepted section nesting — the real share of the bar it is cut from, offcut and kerf included — not length ÷ stock length. Nesting the line again is what changes it.';
+export const BAR_FRACTION_CAVEAT = 'The bar quantity is the cut length divided by the stock length — it ignores the saw kerf, the end trim and the leftover, so it is a first answer, not a cutting plan. Section nesting replaces it with the real bars; release rounds it up per section until then.';
+
+/**
+ * The section parts pooled by the blank they share: the same profile (the same
+ * bar in any stock length) and the same cut length. Refuses, naming the parts,
+ * while one has no section, no length, or names something that is not a stock
+ * bar — the way the plate method refuses a part with no size.
+ */
+function sectionGroup(parts) {
+  const short = parts.filter((p) => p.section?.missing?.length);
+  if (short.length) {
+    const named = short.slice(0, 8).map((p) => `${nameOf(p)} (${list(p.section.missing)})`);
+    throw invalid('NO_SECTION', `${short.length === 1 ? 'One part is' : `${short.length} parts are`} cut from a section but cannot be pooled into a cut section yet: ${named.join('; ')}${short.length > 8 ? ', …' : ''}. Choose the section ${short.length === 1 ? 'it is' : 'each is'} cut from (a stock bar) and give ${short.length === 1 ? 'it' : 'them'} a length first.`);
+  }
+  const groups = new Map();
+  for (const p of parts) {
+    if (!groups.has(p.sizeKey)) groups.set(p.sizeKey, { key: p.sizeKey, size: p.size, section: { stock: p.section.stock, length: p.section.length }, parts: [] });
+    groups.get(p.sizeKey).parts.push(p);
+  }
+  return [...groups.values()];
+}
+
+/** How much stock bar one cut section takes before nesting: length ÷ stock length, in words when it cannot be. */
+function barQuantity(length, stock) {
+  if (!(Number(stock?.lengthMm) > 0)) {
+    return { quantity: 1, basis: 'stock has no length', note: `${stock ? nameOf(stock) : 'The stock bar'} has no LENGTH, so how many cut pieces one bar gives is unknown — this is a placeholder of one bar per piece. Give the bar its length.` };
+  }
+  const quantity = round6(length / stock.lengthMm);
+  if (quantity > 1) {
+    return { quantity, basis: 'length', note: `The cut length (${fmt(length)}) is longer than ${nameOf(stock)} (${fmt(stock.lengthMm)}) — it cannot be cut from one bar. Choose a longer stock length.` };
+  }
+  return { quantity, basis: 'length', note: null };
+}
+
+/**
+ * The section method's plan: the same reconcile (planGroups) pooled by profile
+ * + length, then each blank's stock line — exactly one, to the bar its group's
+ * first part names, at length ÷ stock length. Follows a part that changed its
+ * bar to another stock length of the same profile (child and quantity move);
+ * never touches a line an accepted section nesting laid out.
+ */
+function planSectionFor({ st, places, carried = null }) {
+  if (!st.parts.length && !st.cutPlates.length) return EMPTY_PLAN();
+  const plan = planGroups(st, { groupOf: sectionGroup, keyOfRecord: (m) => m.sizeKey ?? null });
+  const stockPlaces = places.all.section.stockIds;
+  const { lines, nested } = st.lines;
+  for (const x of plan.groups) {
+    const all = x.isNew ? [] : (lines.get(x.cp.id) ?? []);
+    const own = all.filter((l) => l.child_record_kind === 'item' && stockPlaces.has(l.child_classification_id));
+    const otherLines = all.length - own.length;
+    const keep = own[0] ?? null;
+    for (const dup of own.slice(1)) plan.drops.add(dup.id);
+    const stock = x.first.section.stock;
+    const q = barQuantity(x.group.section.length, stock);
+    if (!keep) {
+      const was = carried?.get(x.group.key) ?? null;
+      if (x.isNew && was?.flowId != null) x.carriedFlowId = was.flowId;
+      x.plateLine = { ...q, plate: brief(stock), changed: true, otherLines, add: { childId: stock.id, quantity: q.quantity } };
+      continue;
+    }
+    if (nested.has(Number(x.cp.id))) {
+      const held = st.steel.get(Number(keep.child_id)) ?? { id: keep.child_id, code: null, name: null };
+      x.plateLine = { quantity: round6(Number(keep.quantity)), basis: 'nesting', note: SECTION_NESTED_NOTE, plate: brief(held), changed: false, otherLines };
+      continue;
+    }
+    const changed = Number(keep.child_id) !== Number(stock.id) || Math.abs(Number(keep.quantity) - q.quantity) > 1e-9;
+    x.plateLine = { ...q, plate: brief(stock), changed, otherLines, update: changed ? { lineId: keep.id, childId: stock.id, quantity: q.quantity } : null };
+  }
   return plan;
 }
 
@@ -690,11 +878,11 @@ async function planFor(db, companyId, { line, state, selection, carried = null }
  *   item     its item-level rules by spec code: what setValues checks a typed
  *            value against
  */
-async function blankRulesAt(db, companyId, cutPlateId) {
-  const view = await resolveSpecs(db, companyId, { nodeId: cutPlateId });
+async function blankRulesAt(db, companyId, nodeId, sizeCodes = SPEC_CODES) {
+  const view = await resolveSpecs(db, companyId, { nodeId });
   const specs = view.specs ?? [];
   const extras = specs
-    .filter((e) => e.applicable && e.rule?.isRequired && e.rule?.valueRule === 'entered' && !SPEC_CODES.includes(e.spec.code))
+    .filter((e) => e.applicable && e.rule?.isRequired && e.rule?.valueRule === 'entered' && !sizeCodes.includes(e.spec.code))
     .map((e) => e.spec.code);
   const item = new Map(specs.filter((s) => s.captureAt === 'item').map((s) => [String(s.spec.code).toUpperCase(), s]));
   return { extras, item };
@@ -773,12 +961,12 @@ function coerceOnto(rule, code, input, options) {
  * with the words setValues used — called group by group, before anything is
  * written, so the refusal is the one the one-at-a-time derive gave.
  */
-async function blankValueChecker(db, companyId, fresh, cutPlateId) {
-  const rules = await blankRulesAt(db, companyId, cutPlateId);
+async function blankValueChecker(db, companyId, fresh, desc) {
+  const rules = await blankRulesAt(db, companyId, desc.nodeId, desc.sizeCodes);
 
   // Every option of the option specs being written, retired ones too, so a
   // refusal names the same reason coerce gives.
-  const codes = [...SPEC_CODES, ...rules.extras];
+  const codes = [...desc.sizeCodes, ...rules.extras];
   const optionSpecIds = codes.map((code) => rules.item.get(code.toUpperCase())).filter((r) => r?.applicable && r.spec.dataType === 'option').map((r) => r.spec.id);
   const options = new Map();
   if (optionSpecIds.length) {
@@ -802,6 +990,15 @@ async function blankValueChecker(db, companyId, fresh, cutPlateId) {
     return known.has(code.toUpperCase()) ? null : `Unknown specification ${code}.`;
   };
 
+  let alwaysRead = null;
+  const alwaysSpecs = async () => {
+    if (!alwaysRead) {
+      const [rows] = await db.query('SELECT id, UPPER(code) AS code, data_type, default_uom FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN (?)', [companyId, desc.alwaysCodes]);
+      alwaysRead = new Map(rows.map((r) => [r.code, r]));
+    }
+    return alwaysRead;
+  };
+
   const typed = async (entries) => {
     const problems = [];
     const out = [];
@@ -819,15 +1016,36 @@ async function blankValueChecker(db, companyId, fresh, cutPlateId) {
   };
 
   const check = async (x) => {
-    const size = x.group.size;
-    const sizes = await typed([
-      { code: 'THICKNESS', value: size.thickness },
-      { code: 'LENGTH', value: size.length },
-      { code: 'WIDTH', value: size.width },
-      { code: 'GRADE', value: size.gradeId ?? size.gradeText },
-    ]);
+    // A cut plate is given its four sizes, every one required where it is
+    // filed. A cut section is given what its place takes of its bar's size and
+    // its length — a spec its place does not apply (or works out itself) is
+    // simply not written there.
+    let entries = desc.sizeEntries(x);
+    const raw = [];
+    if (!desc.strict) {
+      entries = entries.filter((e) => {
+        if (e.value == null || e.value === '') return false;
+        const rule = rules.item.get(e.code.toUpperCase());
+        const typable = rule && rule.applicable && ['entered', 'defaulted'].includes(rule.rule.valueRule);
+        // SECTION_AREA and DENSITY are what a cut section is weighed by (the
+        // ledger, valuation): written even where its place has no rule for them.
+        if (!typable && (desc.alwaysCodes ?? []).includes(e.code) && (!rule || rule.applicable)) raw.push(e);
+        return typable;
+      });
+    }
+    const sizes = await typed(entries);
+    if (raw.length) {
+      const specs = await alwaysSpecs();
+      for (const e of raw) {
+        const sp = specs.get(e.code);
+        const n = Number(e.value);
+        if (sp && sp.data_type === 'number' && Number.isFinite(n)) sizes.out.push({ spec: { id: sp.id, code: sp.code, unit: sp.default_uom ?? null, dataType: 'number' }, typed: { ...EMPTY, value_number: Number(n.toFixed(6)) } });
+      }
+    }
     if (sizes.problems.length) {
-      throw invalid('CUT_PLATE_SPECS', 'A cut plate cannot be given its size where cut plates are filed — the four specifications have to be set there, the way they are for bought plates.', { problems: sizes.problems });
+      throw invalid(desc.kind === 'plate' ? 'CUT_PLATE_SPECS' : 'CUT_SECTION_SPECS', desc.kind === 'plate'
+        ? 'A cut plate cannot be given its size where cut plates are filed — the four specifications have to be set there, the way they are for bought plates.'
+        : 'A cut section cannot be given its size where cut sections are filed — the rules there refuse the bar\'s own values.', { problems: sizes.problems });
     }
     // Any part of the pool can say what steel this is — they are pooled
     // BECAUSE they share thickness, length, width and grade — so the first one
@@ -842,7 +1060,7 @@ async function blankValueChecker(db, companyId, fresh, cutPlateId) {
       .filter((e) => !(e.value == null || e.value === ''));   // the part cannot say either
     const steel = await typed(asked);
     if (steel.problems.length) {
-      throw invalid('CUT_PLATE_INHERIT', `A cut plate could not take ${asked.map((w) => w.code).join(', ')} from the part it is cut from — the rule where cut plates are filed does not accept the part's own answer.`, { problems: steel.problems });
+      throw invalid(desc.kind === 'plate' ? 'CUT_PLATE_INHERIT' : 'CUT_SECTION_INHERIT', `A ${desc.noun} could not take ${asked.map((w) => w.code).join(', ')} from the part it is cut from — the rule where ${desc.noun}s are filed does not accept the part's own answer.`, { problems: steel.problems });
     }
     x.values = [...sizes.out, ...steel.out];
   };
@@ -935,10 +1153,10 @@ async function effectiveOf(db, companyId, ids, rules) {
  * rules are read once for all of them (readRulesOnce); a dry pass says whether
  * a rule reads `range`, and only then are the first parts' lines read.
  */
-async function nameAndCode(db, c, { line, places, blankRules, fresh }) {
+async function nameAndCode(db, c, { line, desc, blankRules, fresh }) {
   const { companyId } = c;
   const memo = readRulesOnce(db);
-  const chain = await ancestors(db, companyId, places.cutPlate.id);
+  const chain = await ancestors(db, companyId, desc.nodeId);
   let stored = null;
   const effective = async () => {
     if (!stored) stored = await effectiveOf(db, companyId, fresh.map((x) => x.cp.id), blankRules.rules);
@@ -978,7 +1196,7 @@ async function nameAndCode(db, c, { line, places, blankRules, fresh }) {
     const data = {
       master: {
         id: x.cp.id, company_id: companyId, record_kind: 'item', item_type: 'temporary', code: null, name: '(pending)',
-        short_name: 'CUTPL', classification_id: places.cutPlate.id, status: 'draft', owner_order_line_id: line.id, source_definition_id: null,
+        short_name: desc.shortName, classification_id: desc.nodeId, status: 'draft', owner_order_line_id: line.id, source_definition_id: null,
       },
       def: null,
       chain,
@@ -1007,7 +1225,7 @@ async function nameAndCode(db, c, { line, places, blankRules, fresh }) {
       return generate(memo, companyId, 'item', field, draft, { consume: true });
     };
 
-    const fallbackName = `Cut plate ${fmt(size.thickness)} × ${fmt(size.width)} × ${fmt(size.length)}${size.gradeText ? ` ${size.gradeText}` : ''}`;
+    const fallbackName = desc.fallbackName(x, size);
     const named = await render('name').catch(() => null);
     const name = named?.text || fallbackName;
     data.master = { ...data.master, name };
@@ -1203,7 +1421,8 @@ async function insertBlankValues(db, c, given) {
  * from a part's stored answer. Nothing to fill = 0 statements past one cheap
  * pre-check; otherwise 1 rules read + 3 writes. Returns how many were filled.
  */
-async function fillBlankGaps(db, c, places, plan) {
+async function fillBlankGaps(db, c, desc, plan) {
+  if (!desc || !plan) return 0;
   const existing = plan.groups.filter((x) => !x.isNew && x.cp);
   // Pre-check without reading any rule. Every blank sits on the same node, so a
   // steel code its chain asks for is one some blank of the line already holds
@@ -1212,13 +1431,13 @@ async function fillBlankGaps(db, c, places, plan) {
   // Values stage still names it; a part-only code like HOLED never costs a read.)
   const filledOn = (row) => row && rawOf(row, row.data_type) != null && rawOf(row, row.data_type) !== '';
   const blankCodes = new Set();
-  for (const x of existing) for (const [k, row] of x.cp.values ?? new Map()) if (!SPEC_CODES.includes(k) && filledOn(row)) blankCodes.add(k);
+  for (const x of existing) for (const [k, row] of x.cp.values ?? new Map()) if (!desc.sizeCodes.includes(k) && filledOn(row)) blankCodes.add(k);
   const maybe = existing.filter((x) => {
     const own = x.cp.values ?? new Map();
     return [...blankCodes].some((k) => !filledOn(own.get(k)) && x.group.parts.some((part) => filledOn((part.values ?? new Map()).get(k))));
   });
   if (!maybe.length) return 0;
-  const checker = await blankValueChecker(db, c.companyId, [], places.cutPlate.id);
+  const checker = await blankValueChecker(db, c.companyId, [], desc);
   if (!checker.rules.extras.length) return 0;
   const given = [];
   for (const x of maybe) for (const w of await checker.fill(x)) given.push({ subjectId: x.cp.id, ...w });
@@ -1234,47 +1453,104 @@ async function fillBlankGaps(db, c, places, plan) {
   return given.length;
 }
 
-async function applyPlan(db, c, { line, places, selection, flowId, state, plan }) {
+/**
+ * The two cutting methods, as the writer needs them: where a new blank is
+ * filed, its short name and fallback name, the sizes it is given, its stock
+ * line, and the house flow a new one takes. Null for a method whose blanks
+ * place is not set (requirePlaces has refused before anything is written).
+ */
+function methodsOf(places, selection) {
+  const plate = places.cutPlate ? {
+    kind: 'plate',
+    noun: 'cut plate',
+    nodeId: places.cutPlate.id,
+    shortName: 'CUTPL',
+    sizeCodes: SPEC_CODES,
+    strict: true,
+    houseFlow: cutPlateFlowId,
+    usesGivenFlow: true,
+    sizeEntries: (x) => {
+      const size = x.group.size;
+      return [
+        { code: 'THICKNESS', value: size.thickness },
+        { code: 'LENGTH', value: size.length },
+        { code: 'WIDTH', value: size.width },
+        { code: 'GRADE', value: size.gradeId ?? size.gradeText },
+      ];
+    },
+    stockLine: (x) => ({ childId: x.plateLine.add.childId, designId: selection.id, quantity: x.plateLine.add.quantity, role: 'Raw plate', selectionDefinitionId: selection.id }),
+    fallbackName: (x, size) => `Cut plate ${fmt(size.thickness)} × ${fmt(size.width)} × ${fmt(size.length)}${size.gradeText ? ` ${size.gradeText}` : ''}`,
+  } : null;
+  const section = places.cutSection ? {
+    kind: 'section',
+    noun: 'cut section',
+    nodeId: places.cutSection.id,
+    shortName: 'CUTSC',
+    sizeCodes: SECTION_SIZE_CODES,
+    strict: false,
+    houseFlow: cutSectionFlowId,
+    usesGivenFlow: false,
+    alwaysCodes: ['SECTION_AREA', 'DENSITY'],
+    sizeEntries: (x) => {
+      const st = x.group.section.stock;
+      return [
+        { code: 'THICKNESS', value: st.thickness },
+        { code: 'WIDTH', value: st.width },
+        { code: 'DEPTH', value: st.depth },
+        { code: 'SECTION_AREA', value: st.sectionArea },
+        { code: 'LENGTH', value: x.group.section.length },
+        { code: 'GRADE', value: st.gradeId ?? st.grade },
+        { code: 'DENSITY', value: st.density },
+      ];
+    },
+    stockLine: (x) => ({ childId: x.plateLine.add.childId, designId: x.plateLine.add.childId, quantity: x.plateLine.add.quantity, role: 'Raw section', selectionDefinitionId: null }),
+    fallbackName: (x) => `Cut section ${profileLabelOf(x.group.section.stock)} × ${fmt(x.group.section.length)}`,
+  } : null;
+  return { plate, section };
+}
+
+/**
+ * Writes one method's plan — the statements the one-method derive always sent,
+ * in its order — a fixed number of statements whatever its size. Everything
+ * that can be refused was refused (applyPlan) before the first write.
+ * Returns the blanks it removed.
+ */
+async function writeMethod(db, c, { line, desc, flowId, plan }) {
   const { companyId } = c;
   const fresh = plan.groups.filter((x) => x.isNew);
-  const values = fresh.length ? await blankValueChecker(db, companyId, fresh, places.cutPlate.id) : null;
-  const loops = await loopChecker(db, companyId, plan);
-  for (const x of plan.groups) {
-    if (x.isNew) await values.check(x);
-    loops.check(x);
-  }
 
-  // 1. Lines let go of: parts that changed size, a group pulled back onto one
-  //    blank, a blank's duplicate plate lines.
+  // 1. Lines let go of: parts that changed size (or method), a group pulled
+  //    back onto one blank, a blank's duplicate stock lines.
   if (plan.drops.size) {
     await db.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, [...plan.drops]]);
   }
 
-  // 2. The new blanks. A cut plate is a temporary item with no template
+  // 2. The new blanks. A cut piece is a temporary item with no template
   //    definition behind it — derived from the parts, not instantiated from a
   //    blueprint — so its rows are written here rather than through
   //    masterRecordService, whose createItem takes a temporary item's
   //    classification from a template definition. Born a draft like every
   //    other temporary item (decision Q21); counted, not identified — a batch
-  //    of identical rectangles, always made on its order, never stocked. Each
-  //    is written with a code unique to this derive and found again by it
-  //    (TiDB does not hand AUTO_INCREMENT ids out contiguously); nameAndCode
+  //    of identical pieces, always made on its order, never stocked. Each is
+  //    written with a code unique to this derive and found again by it (TiDB
+  //    does not hand AUTO_INCREMENT ids out contiguously); nameAndCode
   //    overwrites every placeholder.
   if (fresh.length) {
-    // How a new cut plate is made: what a revision carried for its rectangle,
-    // else the flow this derive was given, else the house's cut-plate flow
-    // (init.sql §33 — user, 2026-09-30: cutting belongs to the cut plate).
-    // Read only when one of them still needs it; nothing already set changes.
-    const house = flowId == null && fresh.some((x) => x.carriedFlowId == null) ? await cutPlateFlowId(db, companyId) : null;
+    // How a new blank is made: what a revision carried for its group, else the
+    // flow this derive was given (plates), else the house's flow for the
+    // method (init.sql §33 / §48b — cutting belongs to the cut piece). Read
+    // only when one of them still needs it; nothing already set changes.
+    const given = desc.usesGivenFlow ? flowId : null;
+    const house = given == null && fresh.some((x) => x.carriedFlowId == null) ? await desc.houseFlow(db, companyId) : null;
     const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const marker = (i) => `~cut~${token}~${i}`;
     await insertRows(db, 'cf_master_records',
       ['company_id', 'record_kind', 'code', 'name', 'short_name', 'classification_id', 'status', 'default_flow_id', 'created_by'],
-      fresh.map((x, i) => [companyId, 'item', marker(i), '(pending)', 'CUTPL', places.cutPlate.id, 'draft', x.carriedFlowId ?? flowId ?? house, c.userId]));
+      fresh.map((x, i) => [companyId, 'item', marker(i), '(pending)', desc.shortName, desc.nodeId, 'draft', x.carriedFlowId ?? given ?? house, c.userId]));
     const [back] = await db.query('SELECT id, code FROM cf_master_records WHERE company_id = ? AND code LIKE ?', [companyId, `~cut~${token}~%`]);
     const idOf = new Map(back.map((r) => [r.code, r.id]));
-    fresh.forEach((x, i) => { x.cp = { id: idOf.get(marker(i)), code: null, name: '(pending)', status: 'draft', classification_id: places.cutPlate.id }; });
-    if (fresh.some((x) => !x.cp.id)) throw new Error(`cf_erp: ${fresh.length} cut plates written, ${back.length} read back.`);
+    fresh.forEach((x, i) => { x.cp = { id: idOf.get(marker(i)), code: null, name: '(pending)', status: 'draft', classification_id: desc.nodeId }; });
+    if (fresh.some((x) => !x.cp.id)) throw new Error(`cf_erp: ${fresh.length} ${desc.noun}s written, ${back.length} read back.`);
     await insertRows(db, 'cf_item_details',
       ['master_id', 'company_id', 'item_type', 'tracked_by', 'uom', 'sourcing', 'source_definition_id', 'owner_order_line_id'],
       fresh.map((x) => [x.cp.id, companyId, 'temporary', 'quantity', 'nos', 'make', null, line.id]));
@@ -1282,7 +1558,7 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
 
   // 3. Every new BOM line, in the order the one-at-a-time derive made them:
   //    per group, a new blank's line under its first part, the other parts'
-  //    lines to it, then its plate line. A blank legitimately has several
+  //    lines to it, then its stock line. A blank legitimately has several
   //    parents — that is the whole point of pooling — and one blank per piece
   //    of a part: the part's own quantity already says how many pieces there
   //    are, so its line never multiplies.
@@ -1293,9 +1569,7 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
       adds.push({ parentId: x.first.id, childId: x.cp.id, designId: x.cp.id, quantity: 1, role: 'Cut from', place: x.place });
     }
     for (const p of x.attachTo) adds.push({ parentId: p.id, childId: x.cp.id, designId: x.cp.id, quantity: 1, role: 'Cut from' });
-    if (x.plateLine.add) {
-      adds.push({ parentId: x.cp.id, childId: x.plateLine.add.childId, designId: selection.id, quantity: x.plateLine.add.quantity, role: 'Raw plate', selectionDefinitionId: selection.id });
-    }
+    if (x.plateLine.add) adds.push({ parentId: x.cp.id, ...desc.stockLine(x) });
   }
   if (adds.length) {
     // The parent's BOM, created if it has none, and locked so two callers
@@ -1309,7 +1583,7 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
         missing.map((id) => [companyId, id, 'custom', 'draft', null, c.userId]));
       const [made] = await db.query('SELECT id, parent_id FROM cf_boms WHERE company_id = ? AND parent_id IN (?) AND deleted_at IS NULL', [companyId, missing]);
       for (const b of made) bomOf.set(b.parent_id, b.id);
-      if (missing.some((id) => !bomOf.has(id))) throw new Error('cf_erp: a cut plate BOM was written and not read back.');
+      if (missing.some((id) => !bomOf.has(id))) throw new Error(`cf_erp: a ${desc.noun} BOM was written and not read back.`);
     }
     // Next line number: 10 past the highest live one. Next position for a
     // design: past the highest ever given, deleted lines too, so a number is
@@ -1341,12 +1615,12 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
       rows);
   }
 
-  // 4. The new blanks' own values — the four sizes and the steel of the part —
+  // 4. The new blanks' own values — their sizes and the steel of the part —
   //    with their history, as setValues writes them.
   if (fresh.length) await insertBlankValues(db, c, fresh.flatMap((x) => x.values.map((w) => ({ subjectId: x.cp.id, ...w }))));
 
-  // 5. Plate lines that move: a default filled in, a quantity that follows the
-  //    parts or the plate.
+  // 5. Stock lines that move: a default filled in, a quantity that follows the
+  //    parts or the plate, a bar that follows the part to another stock length.
   const updates = plan.groups.map((x) => x.plateLine.update).filter(Boolean);
   if (updates.length) {
     const params = [];
@@ -1375,18 +1649,50 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
     const gone = plan.orphans.filter((cp) => !kept.has(cp.id));
     if (gone.length) {
       await deleteTrees(db, c, gone.map((cp) => cp.id));
-      removed.push(...gone.map((cp) => ({ id: cp.id, code: cp.code, name: cp.name })));
+      removed.push(...gone.map((cp) => ({ id: cp.id, code: cp.code, name: cp.name, kind: desc.kind })));
     }
   }
+  return removed;
+}
+
+/**
+ * Writes the plan: everything that can be refused is refused before the first
+ * write (the blanks' values, the loop rule — every method), then each method's
+ * statements (plates first), then the values settled ONCE for the line, then
+ * names and codes for the new blanks (a code may print a value).
+ */
+async function applyPlan(db, c, { line, places, selection, flowId, state, plan }) {
+  const { companyId } = c;
+  const methods = methodsOf(places, selection);
+  const run = [
+    { kind: 'plate', desc: methods.plate, plan: plan.plate ?? plan },
+    { kind: 'section', desc: methods.section, plan: plan.section ?? EMPTY_PLAN() },
+  ].filter((m) => writesKind(m.plan));
+  for (const m of run) {
+    if (!m.desc) throw placeProblem(places, m.kind);
+    const fresh = m.plan.groups.filter((x) => x.isNew);
+    m.values = fresh.length ? await blankValueChecker(db, companyId, fresh, m.desc) : null;
+    const loops = await loopChecker(db, companyId, m.plan);
+    for (const x of m.plan.groups) {
+      if (x.isNew) await m.values.check(x);
+      loops.check(x);
+    }
+  }
+
+  const removed = [];
+  for (const m of run) removed.push(...await writeMethod(db, c, { line, desc: m.desc, flowId, plan: m.plan }));
 
   // 7. The values, settled once for the line: new blanks worked out from their
   //    rules, and whatever reads them — parts' roll-ups, assemblies above —
   //    walked until nothing moves. New blanks before the parts above them.
-  const settle = [...plan.groups.map((x) => x.cp.id), ...state.parts.map((p) => p.id)];
+  const settle = [...run.flatMap((m) => m.plan.groups.map((x) => x.cp.id)), ...run.flatMap((m) => (m.desc.kind === 'plate' ? state.plate : state.section).parts.map((p) => p.id))];
   await materializeLineRecords(db, c, line.id, settle);
 
   // 8. Names and codes for the new blanks — a code may print a value.
-  if (fresh.length) await nameAndCode(db, c, { line, places, blankRules: values, fresh });
+  for (const m of run) {
+    const fresh = m.plan.groups.filter((x) => x.isNew);
+    if (fresh.length) await nameAndCode(db, c, { line, desc: m.desc, blankRules: m.values, fresh });
+  }
   return removed;
 }
 
@@ -1395,19 +1701,30 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
 function shape(line, selection, cutPlates) {
   return {
     line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, quantity: Number(line.quantity) },
-    selection: { id: selection.id, code: selection.code, name: selection.name },
+    selection: selection ? { id: selection.id, code: selection.code, name: selection.name } : null,
     basis: 'area fraction',
     caveat: AREA_FRACTION_CAVEAT,
+    sectionCaveat: BAR_FRACTION_CAVEAT,
     cutPlates,
   };
 }
 
-const describe = (cp, size, parts, plateLine) => ({
+/**
+ * One blank as every screen reads it. `kind` is 'plate' or 'section'; a cut
+ * section also says its section (the stock bar, `plate` holds the same) and its
+ * cut length. For a cut section `sec` = { stock, length }.
+ */
+const describe = (cp, size, parts, plateLine, kind = 'plate', sec = null) => ({
   id: cp.id,
   code: cp.code,
   name: cp.name,
   status: cp.status,
-  size: { thickness: size.thickness, length: size.length, width: size.width, grade: size.gradeText },
+  kind,
+  size: kind === 'section'
+    ? { thickness: sec?.stock?.thickness ?? null, length: sec?.length ?? null, width: sec?.stock?.width ?? null, depth: sec?.stock?.depth ?? null, grade: sec?.stock?.grade ?? null }
+    : { thickness: size.thickness, length: size.length, width: size.width, grade: size.gradeText },
+  section: kind === 'section' ? brief(sec?.stock ?? null) : null,
+  lengthMm: kind === 'section' ? sec?.length ?? null : null,
   partCount: parts.length,
   parts: parts.map((p) => ({ id: p.id, code: p.code, name: p.name })),
   plate: plateLine.plate,
@@ -1416,11 +1733,98 @@ const describe = (cp, size, parts, plateLine) => ({
   // What the plate column says (CF_ERP_ORDER_FLOW_PLAN): 'at_nesting' — the
   // line still holds the selection, "chosen at nesting"; 'nested' — an accepted
   // nest laid it out (getCutPlates adds the lots); 'chosen' — a plate is on the
-  // line, chosen by hand (or by an earlier default, which reads the same).
-  plateState: plateLine.basis === 'nesting' ? 'nested' : plateLine.plate ? 'chosen' : 'at_nesting',
+  // line, chosen by hand (or by an earlier default, which reads the same). A
+  // cut section's bar is always chosen (its part names it) until it is nested.
+  plateState: plateLine.basis === 'nesting' ? 'nested' : (kind === 'section' || plateLine.plate) ? 'chosen' : 'at_nesting',
   note: plateLine.note,
   otherLines: plateLine.otherLines,
 });
+
+const describeGroup = (x) => describe(x.cp, x.group.size, x.group.parts, x.plateLine, x.kind ?? 'plate', x.group.section ?? null);
+
+/** Which methods a surveyed line uses — a method in use needs its place. */
+const inUse = (state) => ({ plate: state.plate.parts.length > 0, section: state.section.parts.length > 0 });
+const hasAnything = (state) => state.plate.parts.length + state.section.parts.length + state.plate.cutPlates.length + state.section.cutPlates.length > 0;
+
+// --- a section part takes its steel from its bar ----------------------------------
+
+const sameValueRow = (a, b) => {
+  const n = (x) => (x == null ? null : Number(x));
+  const an = n(a.value_number);
+  const bn = n(b.value_number);
+  if ((an === null) !== (bn === null) || (an !== null && Math.abs(an - bn) > 1e-9)) return false;
+  return (a.value_text ?? null) === (b.value_text ?? null)
+    && (a.value_bool == null ? null : Number(a.value_bool)) === (b.value_bool == null ? null : Number(b.value_bool))
+    && (a.option_id ?? null) === (b.option_id ?? null);
+};
+
+/**
+ * A SECTION PART'S STEEL IS ITS BAR'S (§3.2). Where a part's rule takes a
+ * STEEL_FROM_STOCK code as ENTERED and nobody entered it, the part stores its
+ * bar's value as source 'inherited' — so WEIGHT = SECTION_AREA × LENGTH ×
+ * DENSITY and the required GRADE / IMPACT_CLASS are answered by choosing the
+ * section. Choosing another bar moves them; a part that stops being a section
+ * part (or loses its bar) has them taken away. An entered value is never
+ * touched. Asked of every row of the line, from what survey() read — nothing
+ * to change costs nothing. Changes: one soft delete, one insert, one read-back,
+ * one history insert, then the values settled for the rows that moved.
+ * Returns the ids of the rows that changed.
+ */
+async function syncSectionSteel(db, c, line, state) {
+  const { companyId } = c;
+  const sectionIds = new Set(state.section.parts.map((p) => p.id));
+  const puts = [];
+  const drops = [];
+  for (const m of state.candidates ?? []) {
+    const res = state.resolved?.get(m.id);
+    if (!res) continue;
+    const stock = sectionIds.has(m.id) && m.section?.stockOk ? m.section.stock : null;
+    for (const code of STEEL_FROM_STOCK) {
+      const e = res.get(code);
+      if (!e?.rule?.applicable || e.rule.valueRule !== 'entered') continue;
+      const own = e.own;
+      if (own && own.source === 'entered') continue;
+      const src = stock?.rows.get(code) ?? null;
+      const want = src && rawOf(src, src.data_type) != null ? src : null;
+      if (!want) { if (own && own.source === 'inherited') drops.push({ m, own }); continue; }
+      if (own && own.source === 'inherited' && sameValueRow(own, want)) continue;
+      puts.push({ m, own, want });
+    }
+  }
+  if (!puts.length && !drops.length) return [];
+  const old = [...drops.map((d) => d.own), ...puts.map((p) => p.own).filter(Boolean)];
+  if (old.length) await db.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, old.map((r) => r.id)]);
+  const typedOf = (r) => ({ value_number: r.value_number == null ? null : Number(r.value_number), value_text: r.value_text ?? null, value_bool: r.value_bool ?? null, value_date: r.value_date ?? null, option_id: r.option_id ?? null });
+  let idOf = new Map();
+  if (puts.length) {
+    await insertRows(db, 'cf_spec_values',
+      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'source', 'created_by'],
+      puts.map((p) => { const t = typedOf(p.want); return [companyId, p.want.specification_id, 'master', p.m.id, t.value_number, t.value_text, t.value_bool, t.value_date, t.option_id, p.want.uom ?? null, 'inherited', c.userId]; }));
+    const [back] = await db.query(
+      `SELECT id, subject_id, specification_id FROM cf_spec_values
+        WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND specification_id IN (?) AND deleted_at IS NULL`,
+      [companyId, [...new Set(puts.map((p) => p.m.id))], [...new Set(puts.map((p) => p.want.specification_id))]],
+    );
+    idOf = new Map(back.map((r) => [`${r.subject_id}:${r.specification_id}`, r.id]));
+  }
+  await insertRows(db, 'cf_spec_value_history',
+    ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
+    [
+      ...drops.map((d) => [companyId, d.own.id, d.own.specification_id, 'master', d.m.id, 'delete', JSON.stringify(snapshot(d.own)), null, c.userId]),
+      ...puts.map((p) => [companyId, idOf.get(`${p.m.id}:${p.want.specification_id}`) ?? p.own?.id ?? null, p.want.specification_id, 'master', p.m.id,
+        p.own ? 'update' : 'create', p.own ? JSON.stringify(snapshot(p.own)) : null, JSON.stringify(snapshot(typedOf(p.want), 'inherited', p.want.uom ?? null)), c.userId]),
+    ].filter((r) => r[1] != null));
+  const changed = [...new Set([...puts, ...drops].map((x) => x.m.id))];
+  await materializeLineRecords(db, c, line.id, changed);
+  // What the plan reads of those rows (a blank copies its steel from its part).
+  const fresh = await specValuesOf(db, companyId, changed);
+  for (const m of state.candidates) {
+    if (!fresh.has(m.id)) continue;
+    m.values = fresh.get(m.id);
+    m.size = sizeOf(m.values);
+  }
+  return changed;
+}
 
 /** Everything a derive starts from, with the refusals in the order they have always come. */
 async function openForDerive(db, c, orderLineId, input) {
@@ -1433,19 +1837,21 @@ async function openForDerive(db, c, orderLineId, input) {
   if (problems.length) throw invalid('INVALID', 'The flow could not be used.', { problems });
 
   const places = await loadPlaces(db, c.companyId);
-  requirePlaces(places);
-  const selection = await plateSelection(db, c.companyId, places.plate);
   const state = await survey(db, c.companyId, line, places);
+  await syncSectionSteel(db, c, line, state);
+  requirePlaces(places, inUse(state));
+  const selection = state.plate.parts.length ? await plateSelection(db, c.companyId, places) : null;
   return { line, flowId, places, selection, state };
 }
 
 /** A derive from an opened line: plan, and write when the plan changes something. */
 async function deriveOpened(db, c, { line, flowId, places, selection, state }, plan = null) {
-  const p = plan ?? await planFor(db, c.companyId, { line, state, selection });
+  const p = plan ?? await planFor(db, c.companyId, { line, state, selection, places });
   const changed = writes(p);
   const removed = changed ? await applyPlan(db, c, { line, places, selection, flowId, state, plan: p }) : [];
-  const filled = await fillBlankGaps(db, c, places, p);
-  const out = p.groups.map((x) => describe(x.cp, x.group.size, x.group.parts, x.plateLine));
+  const methods = methodsOf(places, selection);
+  const filled = await fillBlankGaps(db, c, methods.plate, p.plate) + await fillBlankGaps(db, c, methods.section, p.section);
+  const out = p.groups.map(describeGroup);
   const created = p.groups.filter((x) => x.isNew).length;
   const updated = p.groups.filter((x) => !x.isNew && x.plateLine.changed).length;
   return {
@@ -1462,14 +1868,15 @@ async function deriveOpened(db, c, { line, flowId, places, selection, state }, p
 // --- the entry points --------------------------------------------------------------
 
 /**
- * Works out the cut plates a line's parts are cut from, and makes the structure
+ * Works out the cut pieces a line's parts are cut from, and makes the structure
  * say so — whether or not the line's values are complete (it is the "Make them
  * now" button; refreshCutPieces is the automatic one). Re-runnable: what is
- * right is left alone, what changed is moved, and a cut plate nothing is cut
+ * right is left alone, what changed is moved, and a cut piece nothing is cut
  * from any more is deleted. A derive that changes nothing writes nothing.
  *
  * input: { flowId? } — how a cut plate is made, put on the ones it creates, so
  * a derived blank is not a node release has to refuse for having no flow.
+ * (A new cut section takes the house's cut-section flow.)
  */
 export async function deriveCutPlates(db, c, orderLineId, input = {}) {
   return deriveOpened(db, c, await openForDerive(db, c, orderLineId, input));
@@ -1484,7 +1891,7 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
  * on the line until somebody typed onto a row that is about to be replaced.
  */
 function missingValues(view, places) {
-  const cut = new Set(places.cutIds);
+  const cut = places.blankIds;
   let missing = 0;
   let items = 0;
   for (const g of view.groups ?? []) {
@@ -1503,7 +1910,8 @@ function missingValues(view, places) {
  * requireLine), so it is right whatever zone the server keeps.
  */
 function lastMadeAt(line, state) {
-  const stamps = [...state.cutPlates.map((cp) => cp.created_at), ...state.links.map((l) => l.created_at)]
+  const stamps = [...state.plate.cutPlates, ...state.section.cutPlates].map((cp) => cp.created_at)
+    .concat([...state.plate.links, ...state.section.links].map((l) => l.created_at))
     .filter(Boolean).map((d) => new Date(d).getTime()).filter(Number.isFinite);
   if (!stamps.length || !line.db_now) return null;
   const age = new Date(line.db_now).getTime() - Math.max(...stamps);
@@ -1511,7 +1919,8 @@ function lastMadeAt(line, state) {
 }
 
 /**
- * The cut plates a line already has, exactly as they stand. Writes nothing.
+ * The cut pieces a line already has — cut plates and cut sections — exactly as
+ * they stand. Writes nothing.
  *
  * Beside them, what the Cut pieces screen needs to say what happens next:
  *   lock        why they are frozen, when they are (closed, released, locked)
@@ -1520,44 +1929,50 @@ function lastMadeAt(line, state) {
  *               parts to cut and the line is open; null otherwise
  *   upToDate    whether a derive would change nothing now — the derive's own
  *               plan, not written; null while it cannot be worked out (a part
- *               with no size, a frozen line)
+ *               with no size or no section, a frozen line)
  *   lastMadeAt  ISO time the newest cut piece or part line was made, or null
- *   parts       how many plate parts the line has
+ *   parts       how many parts the line cuts (plateParts + sectionParts)
  */
 export async function getCutPlates(db, companyId, orderLineId) {
   const line = await requireLine(db, companyId, orderLineId);
   if (!line.item_id) throw invalid('NO_ITEM', `Line ${line.line_no} of ${line.order_code} has no item yet.`);
   const places = await loadPlaces(db, companyId);
-  requirePlaces(places);
-  const selection = await plateSelection(db, companyId, places.plate);
   const state = await survey(db, companyId, line, places);
-  const { parts, cutPlates, links } = state;
+  requirePlaces(places, inUse(state));
+  const usesPlate = state.plate.parts.length > 0 || state.plate.cutPlates.length > 0;
+  const selection = usesPlate ? await plateSelection(db, companyId, places) : null;
+  const { plate: P, section: S } = state;
   const lock = lockOf(line);
 
   // The derive's own plan, not written: the same reconcile the write acts on.
-  const plateLines = await plateLinesOf(db, companyId, orderLineId, cutPlates.map((cp) => cp.id));
-  const { nested } = plateLines;
+  const plateLines = await plateLinesOf(db, companyId, orderLineId, P.cutPlates.map((cp) => cp.id));
+  const nested = new Set([...plateLines.nested, ...S.lines.nested]);
   let plan = null;
+  let planP = null;
   if (!lock) {
-    try { plan = planGroups(state); } catch (err) { if (!(err instanceof CfError)) throw err; }
+    try {
+      planP = usesPlate ? planGroups(P) : EMPTY_PLAN();
+      const planS = planSectionFor({ st: S, places });
+      plan = combined(planP, planS);
+    } catch (err) { if (!(err instanceof CfError)) throw err; plan = null; planP = null; }
   }
   // No default candidate any more: a plate line still holding the selection is
   // waiting for nesting, not behind (planFor).
   const pick = null;
 
-  const keepOf = new Map(cutPlates.map((cp) => [cp.id, ownLines(plateLines.lines.get(cp.id) ?? [], selection)[0] ?? null]));
+  const keepOf = new Map(P.cutPlates.map((cp) => [cp.id, selection ? ownLines(plateLines.lines.get(cp.id) ?? [], selection)[0] ?? null : null]));
   const plates = await platesOf(db, companyId, [
     ...[...keepOf.values()].filter((k) => k && k.child_record_kind === 'item').map((k) => k.child_id),
     ...(pick ? [pick.id] : []),
   ]);
-  if (plan) planPlateLines(plan, plateLines, { selection, pick, plates });
+  if (planP && planP.groups.length) planPlateLines(planP, plateLines, { selection, pick, plates });
 
-  // The nests each nested cut plate sits on, for the plate column ("N-012 · PL-…").
+  // The nests each nested cut piece sits on, for the plate column ("N-012 · PL-…").
   // One query, and only when something is nested.
   const lotsOf = new Map();
   if (nested.size) {
     const [lotRows] = await db.query(
-      `SELECT DISTINCT np.cut_plate_id, pl.id, pl.lot_no, m.code AS plate_code, m.name AS plate_name
+      `SELECT DISTINCT np.cut_plate_id, pl.id, pl.lot_no, pl.kind, m.code AS plate_code, m.name AS plate_name
          FROM cf_nest_placements np
          JOIN cf_plate_lots pl ON pl.id = np.plate_lot_id AND pl.deleted_at IS NULL
          LEFT JOIN cf_master_records m ON m.id = pl.plate_item_id
@@ -1567,14 +1982,22 @@ export async function getCutPlates(db, companyId, orderLineId) {
     );
     for (const r of lotRows) {
       if (!lotsOf.has(Number(r.cut_plate_id))) lotsOf.set(Number(r.cut_plate_id), []);
-      lotsOf.get(Number(r.cut_plate_id)).push({ id: r.id, lotNo: r.lot_no, plate: { code: r.plate_code, name: r.plate_name } });
+      lotsOf.get(Number(r.cut_plate_id)).push({ id: r.id, lotNo: r.lot_no, kind: r.kind ?? 'plate', plate: { code: r.plate_code, name: r.plate_name } });
     }
   }
+  const nestOf = (id) => ({
+    nestLots: lotsOf.get(Number(id)) ?? [],
+    // The first nest it sits on, as the plate column shows it ("N-012 · PL-…");
+    // `lots` says how many nests it is spread over.
+    nest: lotsOf.get(Number(id))?.length
+      ? { nestNo: lotsOf.get(Number(id))[0].lotNo, code: lotsOf.get(Number(id))[0].plate.code ?? null, lots: lotsOf.get(Number(id)).length }
+      : null,
+  });
 
-  const partById = new Map(parts.map((p) => [p.id, p]));
+  const partById = new Map([...P.parts, ...S.parts].map((p) => [p.id, p]));
   const out = [];
-  for (const cp of cutPlates) {
-    const mine = links.filter((l) => l.cut_plate_id === cp.id).map((l) => partById.get(l.part_id)).filter(Boolean);
+  for (const cp of P.cutPlates) {
+    const mine = P.links.filter((l) => l.cut_plate_id === cp.id).map((l) => partById.get(l.part_id)).filter(Boolean);
     const keep = keepOf.get(cp.id);
     const plate = keep && keep.child_record_kind === 'item' ? plates.get(Number(keep.child_id)) ?? null : null;
     const isNested = nested.has(Number(cp.id));
@@ -1591,24 +2014,50 @@ export async function getCutPlates(db, companyId, orderLineId) {
         plate: brief(plate),
         otherLines: 0,
       }),
-      nestLots: lotsOf.get(Number(cp.id)) ?? [],
-      // The first nest it sits on, as the plate column shows it ("N-012 · PL-…");
-      // `lots` says how many nests it is spread over.
-      nest: lotsOf.get(Number(cp.id))?.length
-        ? { nestNo: lotsOf.get(Number(cp.id))[0].lotNo, code: lotsOf.get(Number(cp.id))[0].plate.code ?? null, lots: lotsOf.get(Number(cp.id)).length }
-        : null,
+      ...nestOf(cp.id),
     });
   }
-  const pooled = new Set(links.map((l) => l.part_id));
-  const values = !lock && parts.length ? missingValues(await readLineValues(db, companyId, orderLineId), places) : null;
+  const stockPlaces = places.all.section.stockIds;
+  for (const cp of S.cutPlates) {
+    const mine = S.links.filter((l) => l.cut_plate_id === cp.id).map((l) => partById.get(l.part_id)).filter(Boolean);
+    const keep = (S.lines.lines.get(cp.id) ?? []).find((l) => l.child_record_kind === 'item' && stockPlaces.has(l.child_classification_id)) ?? null;
+    const stock = cp.section?.stock ?? null;
+    const isNested = nested.has(Number(cp.id));
+    const fresh = isNested ? { quantity: null, basis: 'nesting', note: SECTION_NESTED_NOTE } : barQuantity(cp.section?.length, stock);
+    const stored = keep ? round6(Number(keep.quantity)) : null;
+    const stale = !isNested && stored != null && Math.abs(stored - fresh.quantity) > 1e-9;
+    out.push({
+      ...describe(cp, cp.size, mine, {
+        ...fresh,
+        quantity: stored,
+        note: stale ? `${fresh.note ? `${fresh.note} ` : ''}What is written here is ${fmt(stored)}; length ÷ stock length now works out at ${fmt(fresh.quantity)} — work the cut pieces out again to bring it up to date.` : (keep ? fresh.note : 'This cut section has no stock bar under it — work the cut pieces out again.'),
+        plate: brief(stock),
+        otherLines: 0,
+      }, 'section', { stock, length: cp.section?.length ?? null }),
+      ...nestOf(cp.id),
+    });
+  }
+  const pooled = new Set([...P.links, ...S.links].filter((l) => partById.has(l.part_id)).map((l) => l.part_id));
+  const pooledRight = new Set([
+    ...P.links.filter((l) => P.parts.some((p) => p.id === l.part_id)).map((l) => l.part_id),
+    ...S.links.filter((l) => S.parts.some((p) => p.id === l.part_id)).map((l) => l.part_id),
+  ]);
+  const parts = P.parts.length + S.parts.length;
+  const values = !lock && parts ? missingValues(await readLineValues(db, companyId, orderLineId), places) : null;
   return {
     ...shape(line, selection, out),
-    partsWithoutBlank: parts.filter((p) => !pooled.has(p.id)).map((p) => ({ id: p.id, code: p.code, name: p.name, missing: missingOf(p.size) })),
+    partsWithoutBlank: [
+      ...P.parts.filter((p) => !pooledRight.has(p.id)).map((p) => ({ id: p.id, code: p.code, name: p.name, kind: 'plate', missing: missingOf(p.size) })),
+      ...S.parts.filter((p) => !pooledRight.has(p.id)).map((p) => ({ id: p.id, code: p.code, name: p.name, kind: 'section', missing: p.section?.missing ?? [] })),
+    ],
     lock: lock ? { reason: lock.reason, message: lock.message } : null,
     values,
     upToDate: plan ? !writes(plan) : null,
     lastMadeAt: lastMadeAt(line, state),
-    parts: parts.length,
+    parts,
+    plateParts: P.parts.length,
+    sectionParts: S.parts.length,
+    pooled: pooled.size,
   };
 }
 
@@ -1625,10 +2074,15 @@ const isRefusal = (err) => err instanceof CfError || (Number(err?.status) >= 400
  * Call it after every value save and structure change on the line, and inside
  * lock BEFORE the line is stamped locked, on the same transaction. It never
  * throws for a reason a person can act on — a missing setup, a part with no
- * size, a coding rule that clashes — because it runs behind somebody else's
- * save, and a save must not fail because the cut pieces could not follow it.
- * It says why instead, and anything it had begun writing is rolled back to a
- * savepoint first. Something genuinely broken (the database) still throws.
+ * size or no section, a coding rule that clashes — because it runs behind
+ * somebody else's save, and a save must not fail because the cut pieces could
+ * not follow it. It says why instead, and anything it had begun writing is
+ * rolled back to a savepoint first. Something genuinely broken (the database)
+ * still throws.
+ *
+ * Before anything else, a section part's steel follows its bar
+ * (syncSectionSteel) — values-complete or not, since the bar is what answers
+ * the part's grade and size.
  *
  * Cheap when nothing changed, and it writes nothing then: the plan is worked
  * out first, and a plan that changes nothing ends it before the values are
@@ -1642,6 +2096,7 @@ const isRefusal = (err) => err instanceof CfError || (Number(err?.status) >= 400
  *   made     true when cut pieces were created, moved, re-quantified or removed
  *   reason   made | up_to_date | values_missing | no_plate_parts | locked |
  *            released | closed | no_structure | not_set_up | cannot_derive
+ *            (no_plate_parts: the line has no part cut from plate or section)
  *   summary  { cutPieces, created, updated, removed, unchanged } after a
  *            derive; { missing, items } while values are missing; problems on
  *            a refusal
@@ -1658,20 +2113,19 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
   }
 
   const places = await loadPlaces(db, companyId);
-  if (!places.parts || !places.cutPlate) {
-    return stop('not_set_up', !places.parts
-      ? 'Nothing in the classification tree says where parts are filed, so there is nothing to pool.'
-      : `There is no ${CUT_PLATE_CODE} variant, so a cut piece has nowhere to be filed.`);
-  }
   let opened;
   let plan = null;
   let planError = null;
   try {
     const state = await survey(db, companyId, line, places);
-    if (!state.parts.length) return stop('no_plate_parts', `Line ${line.line_no} has no plate parts, so there is nothing to cut.`, { cutPieces: 0 });
-    const selection = await plateSelection(db, companyId, places.plate);
+    if (!hasAnything(state)) return stop('no_plate_parts', `Line ${line.line_no} has no part cut from a plate or a section, so there is nothing to cut.`, { cutPieces: 0 });
+    await syncSectionSteel(db, c, line, state);
+    const use = inUse(state);
+    const missingPlace = (use.plate && placeProblem(places, 'plate')) || (use.section && placeProblem(places, 'section'));
+    if (missingPlace) return stop('not_set_up', missingPlace.message);
+    const selection = use.plate ? await plateSelection(db, companyId, places) : null;
     opened = { line, flowId: null, places, selection, state };
-    try { plan = await planFor(db, companyId, { line, state, selection, carried: opts.carry ?? null }); } catch (err) { if (!isRefusal(err)) throw err; planError = err; }
+    try { plan = await planFor(db, companyId, { line, state, selection, places, carried: opts.carry ?? null }); } catch (err) { if (!isRefusal(err)) throw err; planError = err; }
   } catch (err) {
     if (!isRefusal(err)) throw err;
     return stop('cannot_derive', err.message, { problems: err.problems ?? [] });
@@ -1680,7 +2134,8 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
   // Nothing would change: done, whatever the values say.
   if (plan && !writes(plan)) {
     // Same pieces — but one may still lack steel its part has since been given.
-    const filled = await fillBlankGaps(db, c, places, plan);
+    const methods = methodsOf(places, opened.selection);
+    const filled = await fillBlankGaps(db, c, methods.plate, plan.plate) + await fillBlankGaps(db, c, methods.section, plan.section);
     return stop('up_to_date', `The ${plural(plan.groups.length, 'cut piece')} of line ${line.line_no} already match its parts.`, { cutPieces: plan.groups.length, filled });
   }
 
@@ -1721,7 +2176,7 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
  * Whether refreshCutPieces COULD make a line's cut pieces now — the same
  * survey and plan, nothing written. For the Freeze design screen's look
  * (lockService.lockPlan): cut pieces are no longer a stage of their own
- * (user, 2026-10-02) — a plate part still without one is made by the freeze
+ * (user, 2026-10-02) — a part still without one is made by the freeze
  * itself — so the look only stops the freeze when the plan cannot be made, and
  * says why. A refusal while WRITING (a coding rule clash) cannot be foreseen
  * here; lockLine reports that one from the real run. About as many round trips
@@ -1739,16 +2194,14 @@ export async function previewCutPieces(db, companyId, lineId) {
     return no('no_structure', `Line ${line.line_no} of ${line.order_code} sells a catalog item, so it has no parts to cut.`);
   }
   const places = await loadPlaces(db, companyId);
-  if (!places.parts || !places.cutPlate) {
-    return no('not_set_up', !places.parts
-      ? 'Nothing in the classification tree says where parts are filed, so there is nothing to pool.'
-      : `There is no ${CUT_PLATE_CODE} variant, so a cut piece has nowhere to be filed.`);
-  }
   try {
     const state = await survey(db, companyId, line, places);
-    if (!state.parts.length) return no('no_plate_parts', `Line ${line.line_no} has no plate parts, so there is nothing to cut.`);
-    const selection = await plateSelection(db, companyId, places.plate);
-    await planFor(db, companyId, { line, state, selection });
+    if (!hasAnything(state)) return no('no_plate_parts', `Line ${line.line_no} has no part cut from a plate or a section, so there is nothing to cut.`);
+    const use = inUse(state);
+    const missingPlace = (use.plate && placeProblem(places, 'plate')) || (use.section && placeProblem(places, 'section'));
+    if (missingPlace) return no('not_set_up', missingPlace.message);
+    const selection = use.plate ? await plateSelection(db, companyId, places) : null;
+    await planFor(db, companyId, { line, state, selection, places });
   } catch (err) {
     if (!isRefusal(err)) throw err;
     return no('cannot_derive', err.message);
@@ -1760,7 +2213,8 @@ export async function previewCutPieces(db, companyId, lineId) {
  * What was chosen for each rectangle of a line, keyed as the derive groups
  * parts: { plateId, flowId } — the catalog plate its cut plate's plate line
  * holds (chosen by a person, or by nesting; null while it still holds the
- * selection) and the flow the cut plate is made by. For a REVISION
+ * selection) and the flow the cut plate is made by. A cut section is keyed by
+ * its profile + length with { plateId: null, flowId }. For a REVISION
  * (revisionService): the line that replaces this one hands it to
  * refreshCutPieces, so the same rectangle is cut from the same plate by the
  * same flow, instead of falling back to the selection's default and no flow —
@@ -1772,27 +2226,32 @@ export async function rectangleChoices(db, companyId, lineId) {
   const line = await requireLine(db, companyId, lineId);
   if (line.line_type !== 'custom' || !line.item_id) return out;
   const places = await loadPlaces(db, companyId);
-  if (!places.parts || !places.cutPlate || !places.plate) return out;
   let state;
-  let selection;
+  let selection = null;
   try {
     state = await survey(db, companyId, line, places);
-    if (!state.cutPlates.length) return out;
-    selection = await plateSelection(db, companyId, places.plate);
+    if (!state.plate.cutPlates.length && !state.section.cutPlates.length) return out;
+    if (state.plate.cutPlates.length && places.all.plate.stockNodeIds.length) selection = await plateSelection(db, companyId, places);
   } catch (err) {
     if (isRefusal(err)) return out;
     throw err;
   }
-  const { lines } = await plateLinesOf(db, companyId, line.id, state.cutPlates.map((cp) => cp.id));
-  const [flows] = await db.query('SELECT id, default_flow_id FROM cf_master_records WHERE company_id = ? AND id IN (?)', [companyId, state.cutPlates.map((cp) => cp.id)]);
+  const all = [...state.plate.cutPlates, ...state.section.cutPlates];
+  const { lines } = selection ? await plateLinesOf(db, companyId, line.id, state.plate.cutPlates.map((cp) => cp.id)) : { lines: new Map() };
+  const [flows] = await db.query('SELECT id, default_flow_id FROM cf_master_records WHERE company_id = ? AND id IN (?)', [companyId, all.map((cp) => cp.id)]);
   const flowOf = new Map(flows.map((r) => [r.id, r.default_flow_id ?? null]));
-  for (const cp of state.cutPlates) {
-    if (missingOf(cp.size).length) continue;
-    const keep = ownLines(lines.get(cp.id) ?? [], selection)[0];
-    out.set(keyOf(cp.size), {
-      plateId: keep && keep.child_record_kind === 'item' ? Number(keep.child_id) : null,
-      flowId: flowOf.get(cp.id) ?? null,
-    });
+  if (selection) {
+    for (const cp of state.plate.cutPlates) {
+      if (missingOf(cp.size).length) continue;
+      const keep = ownLines(lines.get(cp.id) ?? [], selection)[0];
+      out.set(keyOf(cp.size), {
+        plateId: keep && keep.child_record_kind === 'item' ? Number(keep.child_id) : null,
+        flowId: flowOf.get(cp.id) ?? null,
+      });
+    }
+  }
+  for (const cp of state.section.cutPlates) {
+    if (cp.sizeKey) out.set(cp.sizeKey, { plateId: null, flowId: flowOf.get(cp.id) ?? null });
   }
   return out;
 }
@@ -1825,71 +2284,262 @@ export async function withCutPieces(db, c, lineId, out) {
   return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, cutPieces } : out;
 }
 
-// --- the flow of every cut plate of a line -----------------------------------------
+// --- the flow of every cut piece of a line -----------------------------------------
 
-/**
- * Which cut plates of a line have no flow, and the flow the house would give
- * them. Read-only and silent: a line with nothing to say (a catalog line, no
- * plate classes) answers zero. Used by the release check so the dialog can
- * offer ONE button instead of listing one problem per cut plate.
- * { total, missing, names[], flow: { id, code, name } | null }
- */
-export async function cutPlateFlowGaps(db, companyId, lineId) {
-  const none = { total: 0, missing: 0, names: [], flow: null };
-  const line = await requireLine(db, companyId, lineId);
-  if (line.line_type !== 'custom' || !line.item_id) return none;
-  const places = await loadPlaces(db, companyId);
-  if (!places.parts || !places.cutPlate || !places.plate) return none;
-  let state;
-  try { state = await survey(db, companyId, line, places); } catch (err) { if (isRefusal(err)) return none; throw err; }
-  if (!state.cutPlates.length) return none;
-  const [rows] = await db.query(
-    'SELECT id, code, name, default_flow_id FROM cf_master_records WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL',
-    [companyId, state.cutPlates.map((cp) => cp.id)],
-  );
-  const bare = rows.filter((r) => r.default_flow_id == null);
-  const [[f]] = await db.query(
-    `SELECT f.id, f.code, f.name FROM cf_company_settings s
-       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_plate_flow_id AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+/** The house flow of a method, with its words: { id, code, name } | null. */
+async function houseFlows(db, companyId) {
+  const [[r]] = await db.query(
+    `SELECT f.id AS p_id, f.code AS p_code, f.name AS p_name, g.id AS s_id, g.code AS s_code, g.name AS s_name
+       FROM cf_company_settings s
+       LEFT JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_plate_flow_id AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+       LEFT JOIN cf_operation_flows g ON g.company_id = s.company_id AND g.id = s.cut_section_flow_id AND g.deleted_at IS NULL AND g.status <> 'obsolete'
       WHERE s.company_id = ?`,
     [companyId],
   );
   return {
-    total: rows.length,
-    missing: bare.length,
-    names: bare.flatMap((r) => [r.code, r.name]).filter(Boolean),
-    flow: f ? { id: f.id, code: f.code, name: f.name } : null,
+    plate: r?.p_id ? { id: r.p_id, code: r.p_code, name: r.p_name } : null,
+    section: r?.s_id ? { id: r.s_id, code: r.s_code, name: r.s_name } : null,
   };
 }
 
 /**
- * Gives every cut plate of the line that has NO flow the company's cut-plate
- * flow (or `flowId`). One set-based UPDATE; a cut plate that already has a flow
+ * Which cut pieces of a line have no flow, and the flow the house would give
+ * them — cut plates as always, cut sections under `sections`. Read-only and
+ * silent: a line with nothing to say (a catalog line, no places) answers zero.
+ * Used by the release check so the dialog can offer ONE button instead of
+ * listing one problem per cut piece.
+ * { total, missing, names[], flow, sections: { total, missing, names[], flow } }
+ */
+export async function cutPlateFlowGaps(db, companyId, lineId) {
+  const empty = () => ({ total: 0, missing: 0, names: [], flow: null });
+  const none = { ...empty(), sections: empty() };
+  const line = await requireLine(db, companyId, lineId);
+  if (line.line_type !== 'custom' || !line.item_id) return none;
+  const places = await loadPlaces(db, companyId);
+  if (!places.blankIds.size) return none;
+  let state;
+  try { state = await survey(db, companyId, line, places); } catch (err) { if (isRefusal(err)) return none; throw err; }
+  const all = [...state.plate.cutPlates, ...state.section.cutPlates];
+  if (!all.length) return none;
+  const [rows] = await db.query(
+    'SELECT id, code, name, default_flow_id FROM cf_master_records WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL',
+    [companyId, all.map((cp) => cp.id)],
+  );
+  const flows = await houseFlows(db, companyId);
+  const isSection = new Set(state.section.cutPlates.map((cp) => cp.id));
+  const of = (list, flow) => {
+    const bare = list.filter((r) => r.default_flow_id == null);
+    return { total: list.length, missing: bare.length, names: bare.flatMap((r) => [r.code, r.name]).filter(Boolean), flow };
+  };
+  return {
+    ...of(rows.filter((r) => !isSection.has(r.id)), flows.plate),
+    sections: of(rows.filter((r) => isSection.has(r.id)), flows.section),
+  };
+}
+
+/**
+ * Gives every cut piece of the line that has NO flow the company's flow for
+ * its method (or the one named): cut plates the cut-plate flow (`flowId`
+ * wins), cut sections the cut-section flow (`sectionFlowId`, else `flowId`,
+ * wins). One set-based UPDATE per method; a cut piece that already has a flow
  * keeps it. Allowed on a locked line until it is released (a flow is the one
  * thing that still changes there — records.flowStillOpen); refused on a
  * released line or a closed/revised order.
- * input: { flowId? } — returns { count, total, flow }.
+ * input: { flowId?, sectionFlowId? } — returns { count, total, flowId, sections: { count, total, flowId } }.
  */
 export async function setCutPlateFlows(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId, { lock: true });
   const f = lockOf(line);
   if (f && f.reason !== 'locked') throw invalid(f.code, f.message);
+  const places = await loadPlaces(db, c.companyId);
+  const state = line.line_type === 'custom' && line.item_id ? await survey(db, c.companyId, line, places) : null;
+  const plateBlanks = state?.plate.cutPlates ?? [];
+  const sectionBlanks = state?.section.cutPlates ?? [];
   const problems = [];
   let flowId;
   if (blank(input.flowId)) {
     flowId = await cutPlateFlowId(db, c.companyId);
-    if (!flowId) throw invalid('NO_CUT_PLATE_FLOW', 'There is no cut-plate flow set. Set one under Production › Flows first, or say which flow.');
+    if (!flowId && (plateBlanks.length || !sectionBlanks.length)) throw invalid('NO_CUT_PLATE_FLOW', 'There is no cut-plate flow set. Set one under Production › Flows first, or say which flow.');
   } else {
     flowId = await requireUsableFlow(db, c.companyId, input.flowId, problems);
     if (problems.length) throw invalid('INVALID', 'The flow could not be used.', { problems });
   }
-  const places = await loadPlaces(db, c.companyId);
-  requirePlaces(places);
-  const state = await survey(db, c.companyId, line, places);
-  if (!state.cutPlates.length) return { count: 0, total: 0, flowId };
+  const sections = { count: 0, total: sectionBlanks.length, flowId: null };
+  if (sectionBlanks.length) {
+    let sFlow = null;
+    if (!blank(input.sectionFlowId)) {
+      sFlow = await requireUsableFlow(db, c.companyId, input.sectionFlowId, problems);
+      if (problems.length) throw invalid('INVALID', 'The flow could not be used.', { problems });
+    } else sFlow = blank(input.flowId) ? await cutSectionFlowId(db, c.companyId) : flowId;
+    sections.flowId = sFlow;
+    const [[{ bare }]] = await db.query('SELECT COUNT(*) AS bare FROM cf_master_records WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL', [c.companyId, sectionBlanks.map((cp) => cp.id)]);
+    if (Number(bare) && !sFlow) throw invalid('NO_CUT_SECTION_FLOW', 'There is no cut-section flow set. Set one under Setup › Cutting first, or say which flow.');
+    if (Number(bare)) {
+      const [r] = await db.query(
+        'UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL',
+        [sFlow, c.companyId, sectionBlanks.map((cp) => cp.id)],
+      );
+      sections.count = r.affectedRows;
+    }
+  }
+  if (!plateBlanks.length) return { count: 0, total: 0, flowId, sections };
   const [r] = await db.query(
     'UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL',
-    [flowId, c.companyId, state.cutPlates.map((cp) => cp.id)],
+    [flowId, c.companyId, plateBlanks.map((cp) => cp.id)],
   );
-  return { count: r.affectedRows, total: state.cutPlates.length, flowId };
+  return { count: r.affectedRows, total: plateBlanks.length, flowId, sections };
+}
+
+// --- for the freeze checks and release: every part, how it is cut, and what it lacks --
+
+/**
+ * Of these items (a line's temporaries — the roll-out's), the PARTS a cut piece
+ * is made for and whether each has one, the made rows whose CUT_FROM has no
+ * answer anywhere, and every section part's trouble — read in a fixed number
+ * of queries. The one survey lockService (freeze checks), processService
+ * (stages) and releaseService (release) ask, so "a part" means the same thing
+ * everywhere.
+ *
+ * Returns {
+ *   places,                          // the cutPlaces answer
+ *   parts: [{ id, code, name, kind: 'plate'|'section', hasCutPiece }],
+ *   unanswered: [{ id, code, name }],  // made rows with a parent and nothing made under them, CUT_FROM unanswered
+ *   sections: [{ id, code, name, stock: Ref|null, lengthMm, problem: string|null }],
+ *   inUse: { plate, section },
+ * }
+ * Only a row with nothing under it but its cut pieces can be "unanswered" (an
+ * assembly is plainly not cut), and never opts.rootId (the line's own item).
+ */
+export async function cutPartsOf(db, companyId, itemIds, { rootId = null } = {}) {
+  const ids = [...new Set(itemIds.map(Number))];
+  const places = await loadPlaces(db, companyId);
+  const out = { places: places.all, parts: [], unanswered: [], sections: [], inUse: { plate: false, section: false } };
+  if (!ids.length) return out;
+  const [rows] = await db.query(
+    `SELECT m.id, m.code, m.name, m.record_kind, m.classification_id, m.cut_stock_id, i.item_type, i.source_definition_id,
+            d.cut_stock_id AS def_cut_stock_id, d.code AS def_code, d.name AS def_name,
+            (SELECT GROUP_CONCAT(DISTINCT x.classification_id) FROM cf_boms b
+               JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
+               JOIN cf_master_records x ON x.id = l.child_id AND x.deleted_at IS NULL
+              WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL) AS child_classes
+       FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL AND i.item_type = 'temporary'
+       LEFT JOIN cf_master_records d ON d.id = i.source_definition_id AND d.deleted_at IS NULL
+      WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL
+      ORDER BY m.id`,
+    [companyId, ids],
+  );
+  const candidates = rows.filter((m) => !places.blankIds.has(Number(m.classification_id)));
+  const resolved = await resolveCodes(db, companyId, candidates, [CUT_FROM_CODE, 'LENGTH']);
+  const sectionParts = [];
+  for (const m of candidates) {
+    const kind = cutWordOf(resolved.get(m.id)?.get(CUT_FROM_CODE));
+    const classes = String(m.child_classes ?? '').split(',').filter(Boolean).map(Number);
+    if (kind === 'PLATE' || kind === 'SECTION') {
+      const k = kind === 'PLATE' ? 'plate' : 'section';
+      const blanksIds = places.all[k].blanksIds;
+      out.parts.push({ id: m.id, code: m.code, name: m.name, kind: k, hasCutPiece: classes.some((x) => blanksIds.has(x)) });
+      out.inUse[k] = true;
+      if (k === 'section') sectionParts.push(m);
+    } else if (kind == null && Number(m.id) !== Number(rootId) && classes.every((x) => places.blankIds.has(x))) {
+      out.unanswered.push({ id: m.id, code: m.code, name: m.name });
+    }
+  }
+  if (sectionParts.length) {
+    const steel = await sectionSteelOf(db, companyId, sectionParts.map(partStockOf));
+    // Every stock length of each profile in use, so "longer than every bar" can be said.
+    const longest = await longestStockOf(db, companyId, places.all.section.stockIds, [...steel.values()]);
+    for (const m of sectionParts) {
+      const stockId = partStockOf(m);
+      const stock = stockId != null ? steel.get(stockId) ?? null : null;
+      const lenRow = resolved.get(m.id)?.get('LENGTH')?.own ?? null;
+      const length = lenRow?.value_number != null ? round6(Number(lenRow.value_number)) : null;
+      let problem = null;
+      if (stockId == null) problem = 'no section chosen';
+      else if (!stock || !places.all.section.stockIds.has(Number(stock.classificationId))) problem = `${stock ? nameOf(stock) : `item ${stockId}`} is not a section in stock`;
+      else if (!(length > 0)) problem = 'no length';
+      else {
+        const max = longest.get(profileKeyOf(stock));
+        if (max != null && length > max) problem = `${fmt(length)} mm is longer than any ${profileLabelOf(stock)} bar — ${fmt(max)} mm is the longest`;
+      }
+      out.sections.push({ id: m.id, code: m.code, name: m.name, stock: brief(stock), lengthMm: length, problem });
+    }
+  }
+  return out;
+}
+
+/**
+ * The longest stock length of each profile (profileKeyOf) among the given bars'
+ * profiles, over every catalog bar in the section stock places. One query.
+ */
+async function longestStockOf(db, companyId, stockClassIds, bars) {
+  const out = new Map();
+  if (!stockClassIds.size || !bars.length) return out;
+  const thick = [...new Set(bars.map((b) => b.thickness).filter((x) => x != null))];
+  if (!thick.length) return out;
+  const [rows] = await db.query(
+    `SELECT m.id, UPPER(s.code) AS code, v.value_number, v.value_text, v.option_id, o.value AS option_value
+       FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog' AND i.deleted_at IS NULL
+       JOIN cf_spec_values v ON v.company_id = m.company_id AND v.subject_type = 'master' AND v.subject_id = m.id AND v.deleted_at IS NULL
+       JOIN cf_specifications s ON s.id = v.specification_id AND s.code IN ('THICKNESS','WIDTH','DEPTH','GRADE','IMPACT_CLASS','LENGTH')
+       LEFT JOIN cf_spec_options o ON o.id = v.option_id
+      WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.classification_id IN (?)
+        AND m.id IN (SELECT t.subject_id FROM cf_spec_values t JOIN cf_specifications ts ON ts.id = t.specification_id AND ts.code = 'THICKNESS'
+                      WHERE t.company_id = ? AND t.subject_type = 'master' AND t.deleted_at IS NULL AND t.value_number IN (?))`,
+    [companyId, [...stockClassIds], companyId, thick],
+  );
+  const byItem = new Map();
+  for (const r of rows) {
+    if (!byItem.has(r.id)) byItem.set(r.id, { rows: new Map() });
+    byItem.get(r.id).rows.set(r.code, r);
+  }
+  for (const it of byItem.values()) {
+    const n = (code) => { const v = it.rows.get(code)?.value_number; return v == null ? null : round6(Number(v)); };
+    const t = (code) => { const r = it.rows.get(code); return r ? (r.option_value ?? r.value_text ?? null) : null; };
+    const prof = {
+      thickness: n('THICKNESS'), width: n('WIDTH'), depth: n('DEPTH'),
+      gradeId: it.rows.get('GRADE')?.option_id ?? null, grade: t('GRADE'),
+      impactId: it.rows.get('IMPACT_CLASS')?.option_id ?? null, impactClass: t('IMPACT_CLASS'),
+    };
+    const len = n('LENGTH');
+    if (len == null) continue;
+    const k = profileKeyOf(prof);
+    out.set(k, Math.max(out.get(k) ?? 0, len));
+  }
+  return out;
+}
+
+/**
+ * What stops release because of a section (§5): a section part with no bar
+ * (or none that is a stock bar), and a cut section with no stock line under
+ * it. In words, one sentence per kind of trouble. Two or three queries; none
+ * when the line cuts nothing from a section.
+ */
+export async function sectionStockProblems(db, companyId, itemIds) {
+  const r = await cutPartsOf(db, companyId, itemIds);
+  const problems = [];
+  const unresolved = r.sections.filter((s) => s.problem === 'no section chosen' || /not a section in stock/.test(s.problem ?? ''));
+  if (unresolved.length) {
+    const names = unresolved.slice(0, 3).map((s) => s.code ?? s.name).join(', ');
+    problems.push(`${plural(unresolved.length, 'part')} ${unresolved.length === 1 ? 'is' : 'are'} cut from a section but ${unresolved.length === 1 ? 'has' : 'have'} no stock bar chosen — ${names}${unresolved.length > 3 ? ` and ${unresolved.length - 3} more` : ''}. Choose the section ${unresolved.length === 1 ? 'it is' : 'each is'} cut from before release.`);
+  }
+  const blanksIds = r.places.section.blanksIds;
+  if (blanksIds.size) {
+    const ids = [...new Set(itemIds.map(Number))];
+    const [bare] = ids.length ? await db.query(
+      `SELECT m.id, m.code, m.name
+         FROM cf_master_records m
+        WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL AND m.classification_id IN (?)
+          AND NOT EXISTS (SELECT 1 FROM cf_boms b
+                            JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
+                            JOIN cf_master_records x ON x.id = l.child_id AND x.deleted_at IS NULL AND x.record_kind = 'item'
+                           WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL)`,
+      [companyId, ids, [...blanksIds]],
+    ) : [[]];
+    if (bare.length) {
+      problems.push(`${plural(bare.length, 'cut section')} ${bare.length === 1 ? 'has' : 'have'} no stock bar under ${bare.length === 1 ? 'it' : 'them'} — ${bare.slice(0, 3).map(nameOf).join(', ')}. Choose the section of the part it is cut from before release.`);
+    }
+  }
+  return problems;
 }

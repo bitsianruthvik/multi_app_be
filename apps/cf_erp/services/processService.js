@@ -53,6 +53,29 @@ import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
 
+/**
+ * Backend B's section nesting state for a line — { needed, accepted } — asked
+ * lazily so this file loads whether or not sectionNestingService exists yet. A
+ * missing module or export reads as { needed: false, accepted: false }.
+ */
+let sectionStateFn;
+async function sectionNestingStateOf(db, companyId, lineId, opts = {}) {
+  if (sectionStateFn === undefined) {
+    try {
+      const mod = await import('./sectionNestingService.js');
+      sectionStateFn = typeof mod.sectionNestingState === 'function' ? mod.sectionNestingState : null;
+    } catch { sectionStateFn = null; }
+  }
+  if (!sectionStateFn) return { needed: false, accepted: false };
+  try {
+    const r = await sectionStateFn(db, companyId, lineId, opts);
+    return { needed: !!r?.needed, accepted: !!r?.accepted };
+  } catch (err) {
+    if (err?.status >= 400 && err?.status < 500) return { needed: false, accepted: false };
+    throw err;
+  }
+}
+
 export const PROCESS_STATUSES = ['draft', 'active', 'obsolete'];
 export const STAGE_REQUIREMENTS = ['required', 'optional'];
 export const PROCESS_ORDER_TYPES = ['customer', 'stock'];
@@ -314,10 +337,22 @@ export const STAGE_CATALOGUE = [
      * the freeze (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): it lays out the frozen
      * pieces, and nestingService refuses a line that is not frozen.
      */
-    applies: (ctx) => ctx.nesting.items.length > 0 || (ctx.nesting.cutPieces ?? 0) > 0 || ctx.cut.parts.length > 0,
+    applies: (ctx) => ctx.nesting.items.length > 0 || (ctx.nesting.cutPieces ?? 0) > 0 || (ctx.nesting.sectionCutPieces ?? 0) > 0
+      || !!ctx.nesting.section?.needed || ctx.cut.parts.length > 0,
     state(ctx) {
       const items = ctx.nesting.items;
       const saved = ctx.nesting.saved;
+      // CUT FROM (2026-10-08): a line with cut SECTIONS needs them laid out on
+      // bars too (section nesting, Backend B) — the stage is done only when
+      // every method the line uses is laid out.
+      const sec = ctx.nesting.section ?? { needed: false, accepted: false };
+      const secPieces = ctx.nesting.sectionCutPieces ?? 0;
+      const secNeeded = !!sec.needed || secPieces > 0;
+      const secPending = secNeeded && !sec.accepted;
+      const secBlocker = {
+        count: secPieces || 1,
+        message: `Line ${ctx.line.line_no} has ${secPieces ? n(secPieces, 'cut section') : 'cut sections'} and no section nesting has been accepted. Section nesting chooses the stock bars they are cut from — buying and release need it.`,
+      };
 
       /*
        * DONE MEANS A PLAN IS SAVED, AND NOTHING WEAKER.
@@ -352,6 +387,13 @@ export const STAGE_CATALOGUE = [
           }],
         };
       }
+      if (saved?.lots > 0 && secPending) {
+        return {
+          state: 'partial',
+          detail: `${n(saved.lots, 'plate')} laid out · ${secPieces ? n(secPieces, 'cut section') : 'the cut sections'} still to lay out on bars`,
+          blockers: [secBlocker],
+        };
+      }
       if (saved?.lots > 0) {
         const byHand = saved.manual > 0 ? `, ${saved.manual} by hand` : '';
         // Left out by the line's nesting choices (§40): their plate is chosen at
@@ -371,13 +413,19 @@ export const STAGE_CATALOGUE = [
       if (ctx.line.line_type === 'custom' && !ctx.lock.lockedAt) {
         return {
           state: 'todo',
-          detail: pieces ? `${n(pieces, 'cut piece')} to lay out once the design is frozen` : 'Waiting for the design to be frozen',
+          detail: pieces + secPieces ? `${n(pieces + secPieces, 'cut piece')} to lay out once the design is frozen` : 'Waiting for the design to be frozen',
           blockers: [{
-            count: pieces || 1,
+            count: (pieces + secPieces) || 1,
             message: `Line ${ctx.line.line_no}'s design is not frozen yet — nesting lays out the frozen pieces.`,
           }],
           waitingOn: { stageKey: 'lock', message: FREEZE_FIRST },
         };
+      }
+      // Only cut sections (no plate cut piece): their bars are the whole stage.
+      if (!pieces && !items.length && secNeeded) {
+        return sec.accepted
+          ? { state: 'done', detail: `${n(secPieces, 'cut section')} laid out on bars`, blockers: [] }
+          : { state: 'todo', detail: `${n(secPieces, 'cut section')} to lay out on bars — no plan accepted yet`, blockers: [secBlocker] };
       }
       if (!items.length) {
         const missing = ctx.values.missing.length;
@@ -1291,10 +1339,10 @@ async function loadOrderContext(db, companyId, order, lines) {
               (SELECT COUNT(*) FROM cf_nest_placements np
                 WHERE np.company_id = pl.company_id AND np.plate_lot_id IN (
                   SELECT p2.id FROM cf_plate_lots p2
-                   WHERE p2.company_id = pl.company_id AND p2.order_line_id = pl.order_line_id AND p2.deleted_at IS NULL)
+                   WHERE p2.company_id = pl.company_id AND p2.order_line_id = pl.order_line_id AND p2.deleted_at IS NULL AND p2.kind = 'plate')
                   AND np.deleted_at IS NULL) AS pieces
          FROM cf_plate_lots pl
-        WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL
+        WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL AND pl.kind = 'plate'
         GROUP BY pl.order_line_id, pl.company_id`,
       [companyId, lineIds],
     ) : [[]];
@@ -1337,12 +1385,12 @@ async function loadOrderContext(db, companyId, order, lines) {
     // 2026-10-02 — Nesting counts them, and Freeze design says when one is
     // missing); nesting is done when they are laid out. Two questions, two counts.
     lines.length ? db.query(
-      `SELECT i.owner_order_line_id AS order_line_id, COUNT(*) AS blanks
+      `SELECT i.owner_order_line_id AS order_line_id, cp.kind, COUNT(*) AS blanks
          FROM cf_master_records m
          JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
-         JOIN cf_classification_nodes n ON n.id = m.classification_id AND n.code = 'CUT_PLATE'
+         JOIN cf_cut_places cp ON cp.company_id = m.company_id AND cp.blanks_node_id = m.classification_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.owner_order_line_id IN (?)
-        GROUP BY i.owner_order_line_id`,
+        GROUP BY i.owner_order_line_id, cp.kind`,
       [companyId, lineIds],
     ) : [[]],
     // 5e. What each locked line was rolled out into (cf_order_pieces): how many
@@ -1359,14 +1407,18 @@ async function loadOrderContext(db, companyId, order, lines) {
     cutPieceGaps(db, companyId, temporaryIds),
     // The classification a cut plate is filed under, so a selection hanging off
     // one can be told from any other unfinished row.
-    db.query("SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = 'CUT_PLATE' AND deleted_at IS NULL", [companyId]),
+    db.query("SELECT blanks_node_id AS id FROM cf_cut_places WHERE company_id = ? AND kind = 'plate' AND blanks_node_id IS NOT NULL", [companyId]),
   ]);
 
   const onOrder = new Map(poRows.map((r) => [r.item_id, Number(r.outstanding) || 0]));
   const { releases, planned, reqRows } = rel;
   const { lotsBy, driftBy, leftOutBy } = lots;
   const { chains, nestSpec, nestingBy, values } = spec;
-  const cutPiecesBy = new Map(blankRows.map((r) => [r.order_line_id, Number(r.blanks)]));
+  const cutPiecesBy = new Map(blankRows.filter((r) => r.kind === 'plate').map((r) => [r.order_line_id, Number(r.blanks)]));
+  const sectionPiecesBy = new Map(blankRows.filter((r) => r.kind === 'section').map((r) => [r.order_line_id, Number(r.blanks)]));
+  // Section nesting's own answer, for every line that has cut sections (one ask a line).
+  const sectionBy = new Map();
+  for (const [lineId] of sectionPiecesBy) sectionBy.set(lineId, await sectionNestingStateOf(db, companyId, lineId, { tree: trees.get(lineId) ?? undefined }));
   const locksBy = new Map(lockedLines.map((id) => [id, { pieces: 0, bomLines: new Set() }]));
   for (const r of pieceRows) {
     const e = locksBy.get(r.order_line_id);
@@ -1393,7 +1445,7 @@ async function loadOrderContext(db, companyId, order, lines) {
     for (const r of ooRows) onOrder.set(r.item_id, Number(r.outstanding) || 0);
   }
 
-  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, driftBy, leftOutBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
+  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }
 
 /**
@@ -1530,6 +1582,8 @@ function lineContext(ctx, order, line) {
       items: split.material.filter((m) => ctx.nestingBy.get(m.id) === true).map((m) => ({ id: m.id, label: m.label })),
       saved: ctx.lotsBy.get(line.id) ?? null,
       cutPieces: ctx.cutPiecesBy.get(line.id) ?? 0,
+      sectionCutPieces: ctx.sectionPiecesBy?.get(line.id) ?? 0,
+      section: ctx.sectionBy?.get(line.id) ?? { needed: false, accepted: false },
       drift: ctx.driftBy.get(line.id) ?? [],
       leftOut: ctx.leftOutBy?.get(line.id) ?? null,
     },

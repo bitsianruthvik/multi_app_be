@@ -23,10 +23,11 @@ import {
   createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf,
 } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
-import { findCandidates, isCutPlateRecord, CUT_PLATE_CLASS_CODE } from './selectionService.js';
+import { findCandidates, isCutPlateRecord, NOT_UNDER_CUT_PLATE_WHERE } from './selectionService.js';
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
+import { readMasters, cutFromDetailOf, cutStockOf, sectionSteelOf } from '../lib/cutFrom.js';
 
 export const ALLOWED_CHILDREN = {
   standard: ['catalog'],
@@ -425,7 +426,7 @@ export async function reviseBom(db, c, parentId, input = {}) {
  * every node carries its quantity per parent and its total — the product of
  * the quantities above it, starting from rootQuantity (a sales line's).
  */
-export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15 } = {}) {
+export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15, withCut = false } = {}) {
   // Side by side; and below, one read per level (the children's BOMs come with their lines).
   const [root, rootBom] = await Promise.all([requireMaster(db, companyId, rootId), bomOfParent(db, companyId, rootId)]);
   const [[rf]] = await db.query(
@@ -502,9 +503,9 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
   // person's: marked, and left out of the count (processService underCutPlate).
   if (unresolvedNodes.length) {
     const [cut] = await db.query(
-      `SELECT pm.id FROM cf_master_records pm JOIN cf_classification_nodes pcls ON pcls.id = pm.classification_id
-        WHERE pm.company_id = ? AND pm.id IN (?) AND pcls.code = ?`,
-      [companyId, [...new Set(unresolvedNodes.map((u) => u.parentId))], CUT_PLATE_CLASS_CODE],
+      `SELECT pm.id FROM cf_master_records pm
+        WHERE pm.company_id = ? AND pm.id IN (?) AND NOT ${NOT_UNDER_CUT_PLATE_WHERE}`,
+      [companyId, [...new Set(unresolvedNodes.map((u) => u.parentId))]],
     );
     const cutIds = new Set(cut.map((r) => r.id));
     for (const u of unresolvedNodes) {
@@ -513,7 +514,38 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
       stats.unresolved--;
     }
   }
+  if (withCut) await annotateCut(db, companyId, rootNode);
   return { root: rootNode, stats, truncated };
+}
+
+/**
+ * CUT FROM on the tree (CF_ERP_CUT_FROM_PLAN §11.2), for the screens that draw
+ * it (the BOM tree, an order line's structure): every item and template node
+ * gains `cutFrom` (PLATE | SECTION | NONE | null — effective, lib/cutFrom) and
+ * `cutStock` ({ id, code, name } — the section it is cut from, its own or its
+ * template definition's — or null). Three queries for the whole tree. Only on
+ * request (explode's withCut): the roll-out, lock and release explode the
+ * same structure and need neither.
+ */
+async function annotateCut(db, companyId, root) {
+  const all = [];
+  const walk = (n) => { all.push(n); for (const k of n.children ?? []) walk(k); };
+  walk(root);
+  const ids = [...new Set(all.filter((n) => n.kind !== 'selection').map((n) => Number(n.id)))];
+  if (!ids.length) return;
+  const masters = await readMasters(db, companyId, ids);
+  const [from, stock] = await Promise.all([
+    cutFromDetailOf(db, companyId, ids, { masters }),
+    cutStockOf(db, companyId, ids, { masters }),
+  ]);
+  const steel = await sectionSteelOf(db, companyId, [...stock.values()].filter(Boolean).map((s) => s.stockId));
+  for (const n of all) {
+    if (n.kind === 'selection') { n.cutFrom = null; n.cutStock = null; continue; }
+    n.cutFrom = from.get(Number(n.id))?.value ?? null;
+    const s = stock.get(Number(n.id));
+    const st = s ? steel.get(s.stockId) : null;
+    n.cutStock = s ? { id: s.stockId, code: st?.code ?? null, name: st?.name ?? null } : null;
+  }
 }
 
 /** Where a record is used: the BOMs that hold it, and the selection lines it satisfies. */

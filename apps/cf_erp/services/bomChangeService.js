@@ -123,7 +123,6 @@ import { BOM_TYPE_BY_KIND, descendantIds } from './bomGraph.js';
 import { explode, writeLineUpdate, writeLineRemoval, addLine, assertEditable, ALLOWED_CHILDREN } from './bomService.js';
 import { refreshValues, setValues } from './valueService.js';
 import { requireUsableFlow } from './flowService.js';
-import { CUT_PLATE_CODE } from './nestingService.js';
 import { insertRows } from '../lib/db.js';
 import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
 import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
@@ -295,13 +294,13 @@ function subtreeKeys(node, into = new Set()) {
  *   opts.allow(bomType)  called once for each BOM type whose lines the batch
  *                        touches ('custom' | 'template' | 'standard'); the route
  *                        throws 403 from it when the grant is missing.
- *   opts.cutPlateCode    the classification code cut plates are filed under
- *                        (CUT_PLATE, as cutPlateService files them). Only a
- *                        test that owns its own classification passes another.
+ *   opts.cutPlateCode    a test that owns its own classification names the
+ *                        node its cut pieces are filed under; otherwise the
+ *                        blanks places of Setup › Cutting are used.
  */
 export async function applyBomChanges(db, c, input = {}, opts = {}) {
   const allow = opts.allow ?? (() => {});
-  const cutPlateCode = opts.cutPlateCode ?? CUT_PLATE_CODE;
+  const cutPlateCode = opts.cutPlateCode ?? null;
   const dryRun = input.dryRun === true || input.dryRun === 'true' || input.dryRun === 1;
   const scope = readScope(input.scope);
   const shapeProblems = [];

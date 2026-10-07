@@ -39,7 +39,8 @@ import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
-import { refreshCutPieces, previewCutPieces } from './cutPlateService.js';
+import { refreshCutPieces, previewCutPieces, cutPartsOf } from './cutPlateService.js';
+import { problemsOf } from '../lib/cutPlaces.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import {
   rollOutPlan, codeNodes, seedPieceMemo, siblingLines, positionAmong, lockedPiecesOf, nameOf,
@@ -51,9 +52,6 @@ const PIECE_COLUMNS = ['company_id', 'order_id', 'order_line_id', 'parent_id', '
 const INSERT_CHUNK = 1000;
 /** How many examples a sentence names before "and N more". */
 const NAMED = 3;
-/** cutPlateService files parts and cut plates here (its own constants). */
-const PARTS_CODE = 'FAB_PARTS';
-const CUT_PLATE_CODE = 'CUT_PLATE';
 
 const count = (n) => Number(n).toLocaleString('en-IN');
 const plural = (n, one, many = `${one}s`) => `${count(n)} ${Number(n) === 1 ? one : many}`;
@@ -98,57 +96,22 @@ export async function assertLineUnlocked(db, companyId, lineId) {
   if (l.locked_at) throw invalid('LOCKED', lockedLineMessage(l.line_no, l.order_code));
 }
 
-// --- plate parts and their cut pieces ------------------------------------------------
+// --- parts and their cut pieces ------------------------------------------------------
 
 /**
- * Of these items, the PLATE PARTS — temporary items filed under the parts
- * classification — and whether each has its cut piece: a temporary child filed
- * under the cut-plate classification. The same two places cutPlateService works
- * from (FAB_PARTS, or Fabricated › Parts; CUT_PLATE), so "has plate parts"
- * means here what it means there. Two queries.
+ * Of these items, the PARTS — temporaries whose CUT_FROM is PLATE or SECTION
+ * (lib/cutFrom; no classification is asked) — and whether each has its cut
+ * piece: a child filed at the blanks place of its method (Setup › Cutting).
+ * cutPlateService.cutPartsOf answers it, so "a part" means here what it means
+ * to the derive. A few queries, whatever the size.
  *
- * Returns { applies, parts: [{ id, code, name, hasCutPiece }] }. `applies` is
- * false where the company files neither — it has no cut pieces to make.
+ * Returns { applies, parts: [{ id, code, name, kind, hasCutPiece }] } — and the
+ * rest of cutPartsOf's answer (unanswered, sections, inUse, places) for the
+ * freeze checks. `applies` is false when no item is a part.
  */
-export async function cutPieceGaps(db, companyId, itemIds) {
-  const ids = [...new Set(itemIds.map(Number))];
-  const none = { applies: false, parts: [] };
-  if (!ids.length) return none;
-  const [nodes] = await db.query(
-    `SELECT n.id, n.code, n.name, p.name AS parent_name
-       FROM cf_classification_nodes n
-       LEFT JOIN cf_classification_nodes p ON p.id = n.parent_id AND p.deleted_at IS NULL
-      WHERE n.company_id = ? AND n.deleted_at IS NULL AND (n.code IN (?) OR n.name = 'Parts')`,
-    [companyId, [PARTS_CODE, CUT_PLATE_CODE]],
-  );
-  const partsNode = nodes.find((n) => n.code === PARTS_CODE)
-    ?? nodes.filter((n) => n.name === 'Parts' && n.parent_name === 'Fabricated').sort((a, b) => a.id - b.id)[0];
-  const cutNode = nodes.find((n) => n.code === CUT_PLATE_CODE);
-  if (!partsNode || !cutNode) return none;
-  const [rows] = await db.query(
-    `WITH RECURSIVE pt AS (
-       SELECT id FROM cf_classification_nodes WHERE company_id = ? AND id = ? AND deleted_at IS NULL
-       UNION ALL
-       SELECT n.id FROM cf_classification_nodes n JOIN pt ON n.parent_id = pt.id WHERE n.company_id = ? AND n.deleted_at IS NULL
-     ), ct AS (
-       SELECT id FROM cf_classification_nodes WHERE company_id = ? AND id = ? AND deleted_at IS NULL
-       UNION ALL
-       SELECT n.id FROM cf_classification_nodes n JOIN ct ON n.parent_id = ct.id WHERE n.company_id = ? AND n.deleted_at IS NULL
-     )
-     SELECT m.id, m.code, m.name,
-            EXISTS (SELECT 1 FROM cf_boms b
-                      JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
-                      JOIN cf_master_records x ON x.id = l.child_id AND x.deleted_at IS NULL
-                     WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL
-                       AND x.classification_id IN (SELECT id FROM ct)) AS has_cut
-       FROM cf_master_records m
-       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL AND i.item_type = 'temporary'
-      WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL
-        AND m.classification_id IN (SELECT id FROM pt)
-      ORDER BY m.id`,
-    [companyId, partsNode.id, companyId, companyId, cutNode.id, companyId, companyId, ids],
-  );
-  return { applies: true, parts: rows.map((r) => ({ id: r.id, code: r.code, name: r.name, hasCutPiece: !!Number(r.has_cut) })) };
+export async function cutPieceGaps(db, companyId, itemIds, opts = {}) {
+  const r = await cutPartsOf(db, companyId, itemIds, opts);
+  return { applies: r.parts.length > 0, ...r };
 }
 
 // --- the checks ---------------------------------------------------------------------
@@ -213,13 +176,13 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
   out.plan = plan;
   const nodes = plan.nodes ?? [];
   const pieces = nodes.filter((n) => n.pieceNo).length;
-  // Cut pieces: every plate part pooled into the rectangle it is cut as. Asked
-  // first, because a plate part with no cut piece is also "made out of
-  // nothing" to the roll-out — and the cut-piece check says why, better.
+  // Cut pieces: every part (CUT_FROM PLATE or SECTION) pooled into the blank it
+  // is cut as. Asked first, because a part with no cut piece is also "made out
+  // of nothing" to the roll-out — and the cut checks say why, better.
   const temporaryIds = (plan.all ?? []).filter((n) => n.kind === 'temporary').map((n) => n.id);
-  const cut = await cutPieceGaps(db, companyId, temporaryIds);
+  const cut = await cutPieceGaps(db, companyId, temporaryIds, { rootId: line.item_id });
   const bare = cut.parts.filter((p) => !p.hasCutPiece);
-  const bareIds = new Set(bare.map((p) => Number(p.id)));
+  const bareIds = new Set([...bare, ...cut.unanswered].map((p) => Number(p.id)));
   const saidByCut = new Set((plan.fromNothing ?? []).filter((f) => bareIds.has(Number(f.id))).map((f) => f.problem));
   const structural = plan.problems.filter((p) => !saidByCut.has(p));
   // A cut plate whose raw plate is still the selection does not stop the
@@ -234,27 +197,77 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
     problems: structural,
   });
 
+  // 4b. CUT FROM (CF_ERP_CUT_FROM_PLAN.md §6). Each check is shown when it has
+  //     something to say: a part whose Cut from has no answer anywhere, a
+  //     section part with no bar / no length / a length no bar has, a method
+  //     in use with no place set in Setup › Cutting — and, as a warning only,
+  //     a line with parts none of which makes a cut piece.
+  if (cut.unanswered.length) {
+    const names = examples([...new Set(cut.unanswered.map(nameOf))], cut.unanswered.length);
+    add({
+      key: 'cut_method', ok: false, title: 'Every part says how it is cut', stageKey: 'structure',
+      detail: `${plural(cut.unanswered.length, 'part')} ${cut.unanswered.length === 1 ? 'does' : 'do'} not say how ${cut.unanswered.length === 1 ? 'it is' : 'they are'} cut — ${names}.`,
+      todo: 'Set "Cut from" (Plate, Section or Not cut) on the part, its definition or its classification.',
+      problems: [`${plural(cut.unanswered.length, 'part')} of line ${line.line_no} ${cut.unanswered.length === 1 ? 'does' : 'do'} not say how ${cut.unanswered.length === 1 ? 'it is' : 'they are'} cut (Cut from is not answered) — ${names}.`],
+    });
+  }
+  const sectionTrouble = cut.sections.filter((s) => s.problem);
+  if (sectionTrouble.length) {
+    const said = sectionTrouble.slice(0, NAMED).map((s) => `${s.code ?? s.name} (${s.problem})`).join('; ');
+    const more = sectionTrouble.length > NAMED ? ` and ${count(sectionTrouble.length - NAMED)} more` : '';
+    add({
+      key: 'section_parts', ok: false, title: 'Every section part has its bar and length', stageKey: 'structure',
+      detail: `${plural(sectionTrouble.length, 'section part')} cannot be cut yet — ${said}${more}.`,
+      todo: 'Choose the section each is cut from (a stock bar) and give it a length that fits a stock bar.',
+      problems: [`${plural(sectionTrouble.length, 'section part')} of line ${line.line_no} cannot be cut yet — ${said}${more}.`],
+    });
+  }
+  // Where its cut pieces go and where its raw stock is filed — the offcut place is production's to need, at the cut.
+  const placeTrouble = ['plate', 'section'].filter((k) => cut.inUse[k]).flatMap((k) => problemsOf(cut.places, k, ['blanks', 'stock']).map((p) => p.text));
+  if (placeTrouble.length) {
+    add({
+      key: 'cut_places', ok: false, title: 'Every cutting method in use has its places', stageKey: 'structure',
+      detail: placeTrouble[0],
+      todo: 'Set them in Setup › Cutting.',
+      problems: placeTrouble,
+    });
+  }
+  const madeParts = temporaryIds.length > 1;
+  if (madeParts && !cut.parts.length && !cut.unanswered.length) {
+    add({
+      // A WARNING (warning: true): said, never a reason to refuse the freeze — lockChecks leaves it out of out.problems.
+      key: 'no_cut_pieces', ok: false, warning: true, applies: true, title: 'Nothing on this line is cut',
+      detail: 'No part of this line is cut from a plate or a section, so it makes no cut piece and nesting has nothing to lay out. If a part should be cut, set its "Cut from".',
+      todo: 'Set "Cut from" on a part that is cut from a plate or a section — or freeze as it is.',
+      problems: [`No part of line ${line.line_no} is cut from a plate or a section — it makes no cut piece.`],
+    });
+  }
+
   // 5. The cut pieces, as asked above. NOT A STAGE ANY MORE (user, 2026-10-02):
   //    they are made by the system, and by lockLine itself just before these
-  //    checks, so a plate part without one only holds the freeze while the
-  //    values are missing, or when it cannot be made — and then it says why,
-  //    pointing at the Structure tab (where the values are drawn too).
+  //    checks, so a part without one only holds the freeze while the values
+  //    are missing, or when it cannot be made — and then it says why, pointing
+  //    at the Structure tab (where the values are drawn too).
   const cutApplies = cut.applies && cut.parts.length > 0;
   const bareNames = examples([...new Set(bare.map(nameOf))]);
+  const kinds = new Set(bare.map((p) => p.kind));
+  const partWord = kinds.size === 1 ? `${[...kinds][0]} part` : 'part';
+  const allKinds = new Set(cut.parts.map((p) => p.kind));
+  const allWord = allKinds.size === 1 ? `${[...allKinds][0]} part` : 'part';
   let cutCheck;
   if (!cutApplies || bare.length === 0) {
     cutCheck = {
       ok: true,
-      detail: !cutApplies ? 'No part of this line is cut from plate.' : `All ${plural(cut.parts.length, 'plate part')} are pooled into cut pieces.`,
+      detail: !cutApplies ? 'No part of this line is cut from a plate or a section.' : `All ${plural(cut.parts.length, allWord)} are pooled into cut pieces.`,
       todo: null,
       problems: [],
     };
   } else if (missingOwn > 0) {
     cutCheck = {
       ok: false,
-      detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}.`,
+      detail: `${plural(bare.length, partWord)} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}.`,
       todo: 'Cut pieces are made automatically as soon as the values are complete — fill them on the Structure stage.',
-      problems: [`${plural(bare.length, 'plate part')} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}. They are made as soon as the values are filled.`],
+      problems: [`${plural(bare.length, partWord)} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece yet — ${bareNames}. They are made as soon as the values are filled.`],
     };
   } else {
     // Values complete: the freeze makes them. A look asks whether it could; the real run says what happened.
@@ -264,20 +277,20 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
     if (why === '') {
       cutCheck = {
         ok: true,
-        detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'gets its' : 'get their'} cut piece when the design is frozen — made automatically, nothing to do.`,
+        detail: `${plural(bare.length, partWord)} ${bare.length === 1 ? 'gets its' : 'get their'} cut piece when the design is frozen — made automatically, nothing to do.`,
         todo: null,
         problems: [],
       };
     } else {
       cutCheck = {
         ok: false,
-        detail: `${plural(bare.length, 'plate part')} ${bare.length === 1 ? 'has' : 'have'} no cut piece, and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`,
-        todo: "Cut pieces are made automatically from each part's thickness, size and grade — fix what is said on the Structure stage, then freeze again.",
-        problems: [`${plural(bare.length, 'plate part')} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`],
+        detail: `${plural(bare.length, partWord)} ${bare.length === 1 ? 'has' : 'have'} no cut piece, and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`,
+        todo: "Cut pieces are made automatically from each part's size and grade (a plate part) or its section and length (a section part) — fix what is said on the Structure stage, then freeze again.",
+        problems: [`${plural(bare.length, partWord)} of line ${line.line_no} ${bare.length === 1 ? 'has' : 'have'} no cut piece and ${bare.length === 1 ? 'it' : 'they'} could not be made — ${bareNames}.${why ? ` ${why}` : ''}`],
       };
     }
   }
-  add({ key: 'cut_pieces', applies: cutApplies, title: 'Every plate part has its cut piece', stageKey: 'structure', ...cutCheck });
+  add({ key: 'cut_pieces', applies: cutApplies, title: allKinds.size === 1 && allKinds.has('section') ? 'Every section part has its cut piece' : allKinds.size > 1 ? 'Every part has its cut piece' : 'Every plate part has its cut piece', stageKey: 'structure', ...cutCheck });
 
   // 6. Codes: what lock would write, with the position it would give — every
   //    running number handed out in turn, none drawn.
@@ -310,7 +323,7 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
     problems: codeProblems,
   });
 
-  out.problems = checks.flatMap((c) => c.problems);
+  out.problems = checks.filter((c) => !c.warning).flatMap((c) => c.problems);
   return out;
 }
 

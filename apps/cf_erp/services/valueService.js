@@ -27,6 +27,7 @@ import { requireNode, subtreeIds } from './tree.js';
 import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS } from './records.js';
 import { resolve, dateText, tableSummary } from './resolutionService.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
+import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const EMPTY = { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null, value_json: null };
@@ -593,7 +594,9 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         else if (own) touch(s, null, 'inherited');
         break;
       case 'entered':
-        if (own && own.source !== 'entered') touch(s, null, own.source);
+        // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
+        // 'inherited' under an entered rule; the cut-piece derive owns those rows, not this.
+        if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
         break;
       default:
         break;

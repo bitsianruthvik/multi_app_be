@@ -18,7 +18,9 @@
  *   GET    /order-lines/:id/structure  the whole structure the line sells
  *   GET    /order-lines/:id/cut-plates the blanks its plate parts are cut from
  *   POST   /order-lines/:id/cut-plates { flowId? } — work them out again; re-runnable
- *   POST   /order-lines/:id/cut-plates/flow { flowId? } — give every cut plate with no flow the house flow; { count }
+ *   POST   /order-lines/:id/cut-plates/flow { flowId?, sectionFlowId? } — give every cut piece with no flow its house flow
+ *                                      (cut plates: the cut-plate flow; cut sections: the cut-section flow); { count, total, flowId, sections }
+ *   (cut-plates answers every cut piece: kind plate|section; a cut section adds section { id, code, name } and lengthMm)
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';

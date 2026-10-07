@@ -57,7 +57,7 @@ const byLine = (req) => (db, c) => parentOfLine(db, c.companyId, id(req));
 router.get('/records/:id/bom', guard(PERM.view), handle((req) => getBom(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/bom/tree', guard(PERM.view), handle((req) => {
   const q = Number(req.query.quantity);
-  return explode(pool, ctx(req).companyId, id(req), { rootQuantity: Number.isFinite(q) && q > 0 ? q : 1 });
+  return explode(pool, ctx(req).companyId, id(req), { rootQuantity: Number.isFinite(q) && q > 0 ? q : 1, withCut: true });
 }));
 // A catalog item's or definition's BOM, coded the way an order codes its rows — read only.
 router.get('/records/:id/bom/codes', guard(PERM.view), handle((req) => recordBomCodes(pool, ctx(req).companyId, id(req))));

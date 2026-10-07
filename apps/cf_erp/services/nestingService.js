@@ -96,7 +96,7 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
-import { subtreeIds } from './tree.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
 import { explode } from './bomService.js';
 import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 import { analyseNest } from './nestGeometry.js';
@@ -107,7 +107,11 @@ import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
  * Vocabulary
  * ------------------------------------------------------------------------ */
 
-/** Where raw plates and cut plates are filed. Found by code, like cutPlateService. */
+/**
+ * The codes raw plates and cut plates were found by until Setup › Cutting
+ * (init.sql §48). Kept as exports for the modules that still import them; this
+ * service now asks cutPlaces() where each is filed, by id.
+ */
 export const PLATE_CODE = 'PLATE';
 export const CUT_PLATE_CODE = 'CUT_PLATE';
 
@@ -442,7 +446,7 @@ function sumWaste(nests) {
  * The line, and the two rules that close it to change
  * ------------------------------------------------------------------------ */
 
-async function requireLine(db, companyId, lineId, { lock = false } = {}) {
+export async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(
     `SELECT l.*, o.id AS order_id, o.code AS order_code, o.status AS order_status,
             o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
@@ -459,7 +463,7 @@ async function requireLine(db, companyId, lineId, { lock = false } = {}) {
 }
 
 /** The same two rules that close a structure to change: cut plates and their lots are part of it. */
-function assertOpen(line) {
+export function assertOpen(line) {
   if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
     throw invalid('ORDER_LOCKED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
       : `Order ${line.order_code} is ${line.order_status} — its structure can no longer change, so its nesting cannot either.`);
@@ -478,12 +482,12 @@ function assertOpen(line) {
 export const isFrozenForNesting = (line) => line.line_type !== 'custom' || !!line.locked_at;
 export const FREEZE_FIRST = 'Freeze the design first — nesting lays out the frozen pieces.';
 
-function assertFrozen(line) {
+export function assertFrozen(line) {
   if (!isFrozenForNesting(line)) throw invalid('NOT_FROZEN', `Line ${line.line_no} of ${line.order_code}: ${FREEZE_FIRST}`);
 }
 
 /** Both: a line open to nesting is frozen, on an open order, and not released. */
-function assertNestable(line) {
+export function assertNestable(line) {
   assertOpen(line);
   assertFrozen(line);
 }
@@ -501,24 +505,26 @@ export async function assertLineOnOrder(db, companyId, orderId, lineId) {
   return line.id;
 }
 
-async function nodeByCode(db, companyId, code) {
-  const [[n]] = await db.query(
-    'SELECT id, code, name FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL',
-    [companyId, code],
-  );
-  return n || null;
-}
-
+/**
+ * Where cut plates and raw plates are filed — Setup › Cutting (cf_cut_places,
+ * lib/cutPlaces.js), by id and with their subtrees. A place not set is refused
+ * in words, as a missing code was before.
+ */
 async function places(db, companyId) {
-  const cutPlate = await nodeByCode(db, companyId, CUT_PLATE_CODE);
-  if (!cutPlate) throw invalid('NO_CUT_PLATE_CLASS', `There is no ${CUT_PLATE_CODE} variant under Steel › Plates, so nothing says where cut plates are filed — work the line's cut plates out first.`);
-  const plate = await nodeByCode(db, companyId, PLATE_CODE);
-  if (!plate) throw invalid('NO_PLATE_CLASS', `There is no ${PLATE_CODE} variant under Steel › Plates, so there is nowhere to look for raw plates to nest on.`);
+  const p = (await cutPlaces(db, companyId)).plate;
+  if (!p.blanksNodeId) throw invalid('NO_CUT_PLATE_CLASS', "No place is set for plate cut pieces, so nothing says where cut plates are filed — choose one in Setup › Cutting, then work the line's cut plates out.");
+  if (!p.stockNodeIds.length) throw invalid('NO_PLATE_CLASS', 'No raw plate stock is set, so there is nowhere to look for raw plates to nest on — choose where plates are filed in Setup › Cutting.');
+  const stockRoot = Math.min(...p.stockNodeIds);
+  const [nodes] = await db.query(
+    'SELECT id, code, name FROM cf_classification_nodes WHERE company_id = ? AND id IN (?)',
+    [companyId, [p.blanksNodeId, stockRoot]],
+  );
+  const node = (id) => nodes.find((n) => Number(n.id) === Number(id)) ?? { id, code: null, name: null };
   return {
-    cutPlateIds: await subtreeIds(db, companyId, cutPlate.id),
-    plateIds: await subtreeIds(db, companyId, plate.id),
-    cutPlate,
-    plate,
+    cutPlateIds: [...p.blanksIds],
+    plateIds: [...p.stockIds],
+    cutPlate: node(p.blanksNodeId),
+    plate: node(stockRoot),
   };
 }
 
@@ -648,7 +654,7 @@ async function surveyLine(db, companyId, line) {
  * surveyLine and layoutDriftOfLines both count with this, so the Nesting screen
  * and the process stage can never disagree about how many pieces a line needs.
  */
-function piecesByRecord(tree) {
+export function piecesByRecord(tree) {
   const totals = new Map();
   (function walk(node) {
     if (node.id != null && node.depth > 0) totals.set(node.id, round6((totals.get(node.id) ?? 0) + Number(node.total)));
@@ -734,7 +740,7 @@ export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOu
        FROM cf_plate_lots pl
        JOIN cf_nest_placements np ON np.plate_lot_id = pl.id AND np.company_id = pl.company_id AND np.deleted_at IS NULL
        LEFT JOIN cf_master_records m ON m.id = np.cut_plate_id
-      WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.order_line_id IN (?)
+      WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.kind = 'plate' AND pl.order_line_id IN (?)
       GROUP BY pl.order_line_id, np.cut_plate_id`,
     [companyId, lineIds],
   );
@@ -751,8 +757,7 @@ export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOu
 
   const totalsBy = new Map(nested.map((id) => [id, trees.get(id) ? piecesByRecord(trees.get(id)) : new Map()]));
   const recordIds = [...new Set([...totalsBy.values()].flatMap((t) => [...t.keys()]))];
-  const cutNode = await nodeByCode(db, companyId, CUT_PLATE_CODE);
-  const cutClassIds = cutNode ? await subtreeIds(db, companyId, cutNode.id) : [];
+  const cutClassIds = [...(await cutPlaces(db, companyId)).plate.blanksIds];
   const [rows] = recordIds.length && cutClassIds.length ? await db.query(
     `SELECT m.id, m.code
        FROM cf_master_records m
@@ -792,7 +797,7 @@ async function importedLotsOf(db, companyId, orderLineId) {
     `SELECT l.id, l.lot_no, l.plate_item_id, l.length_mm, l.width_mm, l.thickness_mm, m.code AS plate_code
        FROM cf_plate_lots l
        LEFT JOIN cf_master_records m ON m.id = l.plate_item_id
-      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.origin = 'imported'
+      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.kind = 'plate' AND l.origin = 'imported'
       ORDER BY l.lot_no, l.id`,
     [companyId, orderLineId],
   );
@@ -970,7 +975,7 @@ export async function nestingChoices(db, companyId, orderLineId) {
       `SELECT thickness_mm, grade, material, COUNT(*) AS n, SUM(weight_kg) AS kg,
               MAX(rect_length_mm * rect_width_mm) AS biggest
          FROM cf_offcuts
-        WHERE company_id = ? AND deleted_at IS NULL AND status = 'available'
+        WHERE company_id = ? AND deleted_at IS NULL AND status = 'available' AND kind = 'plate'
         GROUP BY thickness_mm, grade, material`,
       [companyId],
     ).then(([r]) => r) : [],
@@ -1717,7 +1722,7 @@ function lotWasteFields(n, g) {
   };
 }
 
-const lineHead = (line) => ({
+export const lineHead = (line) => ({
   id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code,
   quantity: Number(line.quantity), orderStatus: line.order_status,
   // Nesting needs a frozen design and a line not yet released (assertNestable).
@@ -2106,7 +2111,7 @@ async function writeLots(db, c, orderLineId, lots) {
   ]), 500);
 
   const [idRows] = await db.query(
-    'SELECT id, lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND lot_no IN (?)',
+    "SELECT id, lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate' AND lot_no IN (?)",
     [companyId, orderLineId, lots.map((l) => l.lotNo)],
   );
   const idByNo = new Map(idRows.map((r) => [String(r.lot_no).toUpperCase(), r.id]));
@@ -2285,7 +2290,7 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
  */
 async function clearLots(db, c, orderLineId, { origin = null } = {}) {
   const [rows] = await db.query(
-    `SELECT id FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL${origin ? ' AND origin = ?' : ''}`,
+    `SELECT id FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate'${origin ? ' AND origin = ?' : ''}`,
     origin ? [c.companyId, orderLineId, origin] : [c.companyId, orderLineId],
   );
   if (!rows.length) return 0;
@@ -2303,7 +2308,7 @@ async function cutPlatesOnLots(db, companyId, orderLineId, cutPlateIds, origin =
     `SELECT DISTINCT np.cut_plate_id
        FROM cf_plate_lots pl
        JOIN cf_nest_placements np ON np.plate_lot_id = pl.id AND np.company_id = pl.company_id AND np.deleted_at IS NULL
-      WHERE pl.company_id = ? AND pl.order_line_id = ? AND pl.deleted_at IS NULL${origin ? ' AND pl.origin = ?' : ''}
+      WHERE pl.company_id = ? AND pl.order_line_id = ? AND pl.deleted_at IS NULL AND pl.kind = 'plate'${origin ? ' AND pl.origin = ?' : ''}
         AND np.cut_plate_id IN (?)`,
     origin ? [companyId, orderLineId, origin, cutPlateIds] : [companyId, orderLineId, cutPlateIds],
   );
@@ -2430,7 +2435,7 @@ async function replaceAreaFractions(db, c, where, lots, required, { restore = nu
  * CASE per column — where one UPDATE a line cost a round trip each (~49 ms on
  * production; a KEPL line has well over a hundred cut plates).
  */
-async function updateBomLines(db, companyId, updates) {
+export async function updateBomLines(db, companyId, updates) {
   for (let i = 0; i < updates.length; i += 500) {
     const part = updates.slice(i, i + 500);
     const child = part.map(() => 'WHEN ? THEN ?').join(' ');
@@ -2498,7 +2503,7 @@ export async function getNesting(db, companyId, orderLineId) {
     `SELECT l.*, m.code AS plate_code, m.name AS plate_name
        FROM cf_plate_lots l
        LEFT JOIN cf_master_records m ON m.id = l.plate_item_id AND m.deleted_at IS NULL
-      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.kind = 'plate'
       ORDER BY l.lot_no, l.id`,
     [companyId, orderLineId],
   );
@@ -2857,6 +2862,12 @@ export async function checkImportedNests(ctx, nests) {
 export async function saveImportedNests(db, c, orderLineId, ctx, checked) {
   const line = await requireLine(db, c.companyId, orderLineId, { lock: true });
   assertNestable(line);
+  // A bar lot (section nesting, sectionNestingService) shares the line's lot
+  // numbers: an imported nest may not take one of its names.
+  const [bars] = await db.query("SELECT lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'bar'", [c.companyId, orderLineId]);
+  const barNos = new Set(bars.map((b) => String(b.lot_no).toUpperCase()));
+  const clash = checked.map((n) => String(n.nestNo).slice(0, 30)).filter((no) => barNos.has(no.toUpperCase()));
+  if (clash.length) throw invalid('LOT_NAME_TAKEN', `${clash.join(', ')} ${clash.length === 1 ? 'is' : 'are'} already the name of a section bar on this line — give the nest${clash.length === 1 ? '' : 's'} another name.`);
   const replaced = await clearLots(db, c, orderLineId);
   const toWrite = checked.map((n) => {
     const { plate, settings, steel, density, check, waste } = n._save;

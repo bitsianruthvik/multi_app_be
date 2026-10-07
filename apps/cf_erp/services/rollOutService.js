@@ -277,8 +277,6 @@ async function madeFromNothing(db, companyId, nodes) {
   return out;
 }
 
-/** The classification code a cut plate is filed at (cutPlateService's own constant). */
-export const CUT_PLATE_CODE = 'CUT_PLATE';
 
 /**
  * Of the temporary items in a structure that have a selection under them, the
@@ -294,9 +292,10 @@ async function cutPlatesAmong(db, companyId, everyNode) {
   if (!parents.size) return new Set();
   const [rows] = await db.query(
     `SELECT m.id FROM cf_master_records m
-       JOIN cf_classification_nodes c ON c.id = m.classification_id AND c.code = ?
-      WHERE m.company_id = ? AND m.id IN (?)`,
-    [CUT_PLATE_CODE, companyId, [...parents]],
+      WHERE m.company_id = ? AND m.id IN (?)
+        AND m.classification_id IN (SELECT cpl.blanks_node_id FROM cf_cut_places cpl
+                                     WHERE cpl.company_id = m.company_id AND cpl.kind = 'plate' AND cpl.blanks_node_id IS NOT NULL)`,
+    [companyId, [...parents]],
   );
   return new Set(rows.map((r) => Number(r.id)));
 }

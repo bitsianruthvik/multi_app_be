@@ -143,8 +143,12 @@ export async function orderFamily(db, companyId, orderId) {
 
 /**
  * Kilograms in one unit of each item: 1 for an item kept in kg (1000 in
- * tonnes); else its stored WEIGHT; else thickness x length x width x density
- * (a plate). null when nothing says. One or two reads.
+ * tonnes); else its stored WEIGHT; else section area x length x density (a
+ * stock bar, or a cut section — CF_ERP_CUT_FROM_PLAN §5); else thickness x
+ * length x width x density (a plate). A cut section that holds only its LENGTH
+ * (its place takes no section area) is weighed by the bar under it: the bar's
+ * section area and density over the cut section's length. null when nothing
+ * says. Two or three reads.
  */
 export async function unitKgOf(db, companyId, itemIds) {
   const ids = [...new Set(itemIds.map(Number))];
@@ -156,7 +160,7 @@ export async function unitKgOf(db, companyId, itemIds) {
     `SELECT v.subject_id, UPPER(s.code) AS code, v.value_number
        FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
       WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL
-        AND s.code IN ('WEIGHT','THICKNESS','LENGTH','WIDTH','DENSITY') AND v.value_number IS NOT NULL`,
+        AND s.code IN ('WEIGHT','THICKNESS','LENGTH','WIDTH','DENSITY','SECTION_AREA') AND v.value_number IS NOT NULL`,
     [companyId, ids],
   );
   const specs = new Map();
@@ -164,13 +168,36 @@ export async function unitKgOf(db, companyId, itemIds) {
     if (!specs.has(v.subject_id)) specs.set(v.subject_id, {});
     specs.get(v.subject_id)[v.code] = Number(v.value_number);
   }
+  // A cut section with a length and no area of its own: the bar under it (its
+  // one stock line) says the area and the density. One read, only when asked.
+  const barless = ids.filter((id) => { const v = specs.get(id) ?? {}; return !(v.WEIGHT > 0) && v.LENGTH > 0 && !(v.SECTION_AREA > 0) && !(v.WIDTH > 0); });
+  const barOf = new Map();
+  if (barless.length) {
+    const [bars] = await db.query(
+      `SELECT b.parent_id, UPPER(s.code) AS code, v.value_number
+         FROM cf_boms b
+         JOIN cf_bom_lines l ON l.company_id = b.company_id AND l.bom_id = b.id AND l.deleted_at IS NULL
+         JOIN cf_cut_places cpl ON cpl.company_id = b.company_id AND cpl.kind = 'section'
+         JOIN cf_master_records pm ON pm.id = b.parent_id AND pm.classification_id = cpl.blanks_node_id
+         JOIN cf_spec_values v ON v.company_id = b.company_id AND v.subject_type = 'master' AND v.subject_id = l.child_id AND v.deleted_at IS NULL
+         JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.code IN ('SECTION_AREA','DENSITY')
+        WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL AND v.value_number IS NOT NULL`,
+      [companyId, barless],
+    );
+    for (const r of bars) {
+      if (!barOf.has(r.parent_id)) barOf.set(r.parent_id, {});
+      if (barOf.get(r.parent_id)[r.code] == null) barOf.get(r.parent_id)[r.code] = Number(r.value_number);
+    }
+  }
   for (const id of ids) {
     const u = byUom.get(id);
     if (u === 'kg' || u === 'kgs') { out.set(id, 1); continue; }
     if (['t', 'mt', 'tonne', 'tonnes', 'ton'].includes(u)) { out.set(id, 1000); continue; }
-    const s = specs.get(id) ?? {};
+    const s = { ...(barOf.get(id) ?? {}), ...(specs.get(id) ?? {}) };
+    const density = s.DENSITY > 0 ? s.DENSITY : (barOf.get(id)?.DENSITY > 0 ? barOf.get(id).DENSITY : FALLBACK_DENSITY);
     if (s.WEIGHT > 0) out.set(id, round3(s.WEIGHT));
-    else if (s.THICKNESS > 0 && s.LENGTH > 0 && s.WIDTH > 0) out.set(id, round3((s.THICKNESS * s.LENGTH * s.WIDTH / 1e9) * (s.DENSITY > 0 ? s.DENSITY : FALLBACK_DENSITY)));
+    else if (s.SECTION_AREA > 0 && s.LENGTH > 0) out.set(id, round3((s.SECTION_AREA * s.LENGTH / 1e9) * density));
+    else if (s.THICKNESS > 0 && s.LENGTH > 0 && s.WIDTH > 0) out.set(id, round3((s.THICKNESS * s.LENGTH * s.WIDTH / 1e9) * density));
   }
   return out;
 }
@@ -190,8 +217,39 @@ export function lotShares(lot) {
   return { parts, offcut, scrap: Math.max(0, 1 - parts - offcut) };
 }
 
-export const lotPlateKg = (lot) => round3((Number(lot.length_mm) * Number(lot.width_mm) * Number(lot.thickness_mm) / 1e9)
-  * (Number(lot.density) > 0 ? Number(lot.density) : FALLBACK_DENSITY));
+export const lotPlateKg = (lot, kgPerMm = null) => {
+  // A BAR lot (kind 'bar', section nesting) is a length of a section, not a
+  // flat plate: lot length × (SECTION_AREA × density ÷ 1e9) of its stock bar —
+  // `kgPerMm` (barKgPerMmOf), else the lot's own section_area_mm2 if a caller read it.
+  if (lot.kind === 'bar') {
+    const density = Number(lot.density) > 0 ? Number(lot.density) : FALLBACK_DENSITY;
+    const perMm = kgPerMm != null ? Number(kgPerMm) : (Number(lot.section_area_mm2) > 0 ? Number(lot.section_area_mm2) * density / 1e9 : null);
+    return perMm != null ? round3(Number(lot.length_mm) * perMm) : 0;
+  }
+  return round3((Number(lot.length_mm) * Number(lot.width_mm) * Number(lot.thickness_mm) / 1e9)
+    * (Number(lot.density) > 0 ? Number(lot.density) : FALLBACK_DENSITY));
+};
+
+/**
+ * Kilograms per millimetre of each stock bar: SECTION_AREA × DENSITY ÷ 1e9 (the
+ * fallback density when the bar has none). Absent when the bar has no section
+ * area. One read. For bar lots: lotPlateKg(lot, perMm.get(lot.plate_item_id)).
+ */
+export async function barKgPerMmOf(db, companyId, itemIds) {
+  const ids = [...new Set(itemIds.map(Number))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const [rows] = await db.query(
+    `SELECT v.subject_id, UPPER(s.code) AS code, v.value_number FROM cf_spec_values v
+       JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.code IN ('SECTION_AREA','DENSITY')
+      WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL AND v.value_number IS NOT NULL`,
+    [companyId, ids],
+  );
+  const by = new Map();
+  for (const r of rows) { if (!by.has(r.subject_id)) by.set(r.subject_id, {}); by.get(r.subject_id)[r.code] = Number(r.value_number); }
+  for (const [id, v] of by) if (v.SECTION_AREA > 0) out.set(id, v.SECTION_AREA * (v.DENSITY > 0 ? v.DENSITY : FALLBACK_DENSITY) / 1e9);
+  return out;
+}
 
 /**
  * What an order has cost in material, per line (every revision of the order).
@@ -231,10 +289,34 @@ export async function orderCosts(db, companyId, orderId) {
   );
   const lineIds = lines.map((l) => l.id);
   const [lots] = lineIds.length ? await db.query(
-    `SELECT id, order_line_id, plate_item_id, lot_no, length_mm, width_mm, thickness_mm, density, waste_json, owner_party_id
+    `SELECT id, order_line_id, plate_item_id, lot_no, kind, length_mm, width_mm, thickness_mm, density, waste_json, owner_party_id
        FROM cf_plate_lots WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL`,
     [companyId, lineIds],
   ) : [[]];
+  // A BAR lot (section nesting): its steel by the bar's weight (lot length ×
+  // section area × density, barKgPerMmOf), split by LENGTH — the pieces placed on it, the
+  // offcut kept from it, the rest scrap. Two reads, only when the order has bars.
+  const barLots = lots.filter((l) => l.kind === 'bar');
+  const barPerMm = barLots.length ? await barKgPerMmOf(db, companyId, barLots.map((l) => l.plate_item_id)) : new Map();
+  const barUse = new Map();
+  if (barLots.length) {
+    const ids = barLots.map((l) => l.id);
+    const [[placedRows], [offcutRows]] = await Promise.all([
+      db.query('SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_nest_placements WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL GROUP BY plate_lot_id', [companyId, ids]),
+      db.query("SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_offcuts WHERE company_id = ? AND plate_lot_id IN (?) AND kind = 'bar' AND deleted_at IS NULL GROUP BY plate_lot_id", [companyId, ids]),
+    ]);
+    for (const r of placedRows) barUse.set(r.plate_lot_id, { parts: Number(r.len ?? 0), offcut: 0 });
+    for (const r of offcutRows) { const e = barUse.get(r.plate_lot_id) ?? { parts: 0, offcut: 0 }; e.offcut = Number(r.len ?? 0); barUse.set(r.plate_lot_id, e); }
+  }
+  const barShares = (lot) => {
+    const L = Number(lot.length_mm);
+    const use = barUse.get(lot.id);
+    if (!(L > 0) || !use) return null;
+    const parts = Math.min(1, use.parts / L);
+    const offcut = Math.min(1 - parts, use.offcut / L);
+    return { parts, offcut, scrap: Math.max(0, 1 - parts - offcut) };
+  };
+  const barLotKg = (lot) => lotPlateKg(lot, barPerMm.get(lot.plate_item_id) ?? null);
 
   // The cost of a plate size: issued to the line, else its average, else its last receipt.
   const plateIds = [...new Set(lots.map((l) => l.plate_item_id))];
@@ -297,8 +379,9 @@ export async function orderCosts(db, companyId, orderId) {
     const issued = e.issuedByItem.get(lot.plate_item_id);
     const unit = issued && issued.costedQty > EPS ? issued.value / issued.costedQty
       : avg.get(lot.plate_item_id) ?? lastCost.get(lot.plate_item_id) ?? null;
-    const shares = lotShares(lot);
-    const kg = lotPlateKg(lot);
+    const isBar = lot.kind === 'bar';
+    const shares = isBar ? barShares(lot) : lotShares(lot);
+    const kg = isBar ? barLotKg(lot) : lotPlateKg(lot);
     if (shares) {
       e.nest.wastageKg = round3(e.nest.wastageKg + kg * shares.scrap);
       e.nest.offcutKg = round3(e.nest.offcutKg + kg * shares.offcut);

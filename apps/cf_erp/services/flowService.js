@@ -621,3 +621,49 @@ export async function cutPlateFlowId(db, companyId) {
   );
   return row?.id ?? null;
 }
+
+/* ===========================================================================
+ * The flow cut SECTIONS are made by (init.sql §48b, CF_ERP_CUT_FROM_PLAN.md)
+ *
+ * The section twin of the cut-plate flow above: a cut section (a part's length
+ * sawn off a stock bar) is made automatically too, so the house says once which
+ * flow a new one takes. Unset: a cut section has no flow and release says so.
+ * ======================================================================== */
+
+/** { flow: { id, code, name, status } | null } */
+export async function getCutSectionFlow(db, companyId) {
+  const [[row]] = await db.query(
+    `SELECT f.id, f.code, f.name, f.status
+       FROM cf_company_settings s
+       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_section_flow_id AND f.deleted_at IS NULL
+      WHERE s.company_id = ?`,
+    [companyId],
+  );
+  return { flow: row ? { id: row.id, code: row.code, name: row.name, status: row.status } : null };
+}
+
+/** input: { flowId } — null clears it. */
+export async function setCutSectionFlow(db, c, input = {}) {
+  if (input.flowId === undefined) throw invalid('INVALID', 'Say which flow — flowId, or null for none.');
+  const problems = [];
+  const flowId = input.flowId == null || String(input.flowId).trim() === '' ? null : await requireUsableFlow(db, c.companyId, input.flowId, problems);
+  assertNoProblems(problems);
+  await db.query(
+    `INSERT INTO cf_company_settings (company_id, cut_section_flow_id, updated_by) VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE cut_section_flow_id = VALUES(cut_section_flow_id), updated_by = VALUES(updated_by)`,
+    [c.companyId, flowId, c.userId ?? null],
+  );
+  return getCutSectionFlow(db, c.companyId);
+}
+
+/** The flow id a new cut section takes, or null: set, live and not obsolete. One round trip. */
+export async function cutSectionFlowId(db, companyId) {
+  const [[row]] = await db.query(
+    `SELECT f.id FROM cf_company_settings s
+       JOIN cf_operation_flows f ON f.company_id = s.company_id AND f.id = s.cut_section_flow_id
+                                AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+      WHERE s.company_id = ?`,
+    [companyId],
+  );
+  return row?.id ?? null;
+}

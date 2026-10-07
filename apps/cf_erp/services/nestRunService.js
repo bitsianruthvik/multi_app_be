@@ -21,6 +21,8 @@
 import { randomUUID } from 'node:crypto';
 import { pool } from '../lib/db.js';
 import { planNesting } from './nestingService.js';
+// One run per line packs plates AND sections (CF_ERP_CUT_FROM_PLAN.md §4.5).
+import { planSectionNesting } from './sectionNestingService.js';
 
 const KEEP_MS = 6 * 60 * 60 * 1000;
 const LOG_CAP = 200;
@@ -64,7 +66,8 @@ export function snapshot(run, { withPlan = false } = {}) {
     log: run.log,
     error: run.error,
     summary: run.summary,
-    ...(withPlan && run.status === 'done' ? { plan: run.plan } : {}),
+    // The section plan (SectionNestingView, as POST …/section-nesting/plan) made by the same run.
+    ...(withPlan && run.status === 'done' ? { plan: run.plan, sections: run.sections } : {}),
   };
 }
 
@@ -85,7 +88,7 @@ export function startRun(companyId, c, lineId, input = {}) {
     id: randomUUID(), companyId: Number(companyId), lineId: Number(lineId),
     status: 'running', phase: 'reading', progress: { done: 0, total: 0 },
     startedAt: Date.now(), finishedAt: null, startedBy: c?.userName ?? c?.email ?? c?.userId ?? null,
-    budgetMs: null, input: clean, log: [], error: null, plan: null, summary: null,
+    budgetMs: null, input: clean, log: [], error: null, plan: null, summary: null, sections: null,
   };
   runs.set(key, run);
   log(run, `Started (${clean.effort ?? 'standard'} effort)`);
@@ -101,8 +104,22 @@ export function startRun(companyId, c, lineId, input = {}) {
     try {
       const plan = await planNesting(pool, companyId, lineId, { ...clean, onProgress });
       run.plan = plan;
+      // Sections next: a failure there is logged, never fails the plate run.
+      try {
+        const sec = await planSectionNesting(pool, companyId, lineId);
+        if (sec.profiles.length) {
+          run.sections = sec;
+          const bars = sec.profiles.reduce((a, p) => a + (p.plan?.barsBought ?? 0), 0);
+          log(run, `Sections: ${sec.profiles.length} profile${sec.profiles.length === 1 ? '' : 's'}, ${bars} bar${bars === 1 ? '' : 's'} to buy${sec.problems.length ? ` · ${sec.problems.length} problem${sec.problems.length === 1 ? '' : 's'} to read` : ''}`);
+        }
+      } catch (e) {
+        log(run, `Sections not planned: ${e?.message ?? e}`);
+      }
       const t = plan.totals ?? {};
-      run.summary = { plates: t.plates ?? 0, pieces: t.pieces ?? 0, wastePct: t.wastePct ?? null, problems: (plan.problems ?? []).length };
+      run.summary = {
+        plates: t.plates ?? 0, pieces: t.pieces ?? 0, wastePct: t.wastePct ?? null, problems: (plan.problems ?? []).length,
+        bars: run.sections ? run.sections.profiles.reduce((a, p) => a + (p.plan?.barsBought ?? 0), 0) : 0,
+      };
       run.status = 'done'; run.phase = 'done';
       log(run, `Finished: ${t.plates ?? 0} plate${t.plates === 1 ? '' : 's'}, ${t.pieces ?? 0} pieces placed${t.wastePct != null ? `, ${t.wastePct}% waste` : ''}${run.summary.problems ? ` · ${run.summary.problems} problem${run.summary.problems === 1 ? '' : 's'} to read` : ''}`);
     } catch (err) {

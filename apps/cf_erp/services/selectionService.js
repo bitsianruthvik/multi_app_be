@@ -20,7 +20,8 @@
  * answer on its own — the default when it is a valid candidate, else the only
  * candidate — is chosen automatically and marked auto_chosen = 1 ("default ·
  * change" on the row) until a person chooses. A cut plate's raw plate (a
- * selection under a CUT_PLATE row) is never filled here: nesting chooses it.
+ * selection under a row filed where cut plates are filed) is never filled
+ * here: nesting chooses it.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { likeOf } from '../lib/listing.js';
@@ -38,16 +39,19 @@ const OPERATORS = {
 };
 const SQL_OP = { eq: '=', neq: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' };
 
-/** The classification a cut plate is filed under — processService's underCutPlate rule, exactly. */
-export const CUT_PLATE_CLASS_CODE = 'CUT_PLATE';
-
 /**
+ * Where cut plates are filed is a company setting (Setup › Cutting, init.sql
+ * §48 cf_cut_places), never a classification code. The SQL below asks the
+ * setting itself, so no caller needs to read it first.
+ *
  * SQL that keeps only selection rows a PERSON (or the system) chooses — not a
- * cut plate's raw plate. `pm` must be the row's parent master record. One JOIN,
- * no subquery in ON (TiDB). Use with NOT_UNDER_CUT_PLATE_WHERE.
+ * cut plate's raw plate. `pm` must be the row's parent master record. The
+ * JOIN is kept for callers that splice it in; the test is a subquery in WHERE
+ * (TiDB takes that; it does not take one in ON). Use with NOT_UNDER_CUT_PLATE_WHERE.
  */
 export const PARENT_CLASS_JOIN = 'LEFT JOIN cf_classification_nodes pcls ON pcls.id = pm.classification_id';
-export const NOT_UNDER_CUT_PLATE_WHERE = `(pcls.code IS NULL OR pcls.code <> '${CUT_PLATE_CLASS_CODE}')`;
+export const NOT_UNDER_CUT_PLATE_WHERE = `(pm.classification_id NOT IN (SELECT cpl.blanks_node_id FROM cf_cut_places cpl
+    WHERE cpl.company_id = pm.company_id AND cpl.kind = 'plate' AND cpl.blanks_node_id IS NOT NULL))`;
 
 async function requireSelection(db, companyId, id) {
   const d = await requireMaster(db, companyId, id, 'Selection definition');
@@ -532,13 +536,14 @@ export async function automaticPick(db, companyId, selectionId) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
-/** Whether a record is filed as a cut plate — a selection under it is the raw plate nesting chooses. */
+/** Whether a record is filed as a cut plate (Setup › Cutting) — a selection under it is the raw plate nesting chooses. */
 export async function isCutPlateRecord(db, companyId, masterId) {
   const [[r]] = await db.query(
-    `SELECT pcls.code FROM cf_master_records pm ${PARENT_CLASS_JOIN} WHERE pm.company_id = ? AND pm.id = ?`,
+    `SELECT pm.id FROM cf_master_records pm
+      WHERE pm.company_id = ? AND pm.id = ? AND NOT ${NOT_UNDER_CUT_PLATE_WHERE}`,
     [companyId, masterId],
   );
-  return r?.code === CUT_PLATE_CLASS_CODE;
+  return !!r;
 }
 
 /**

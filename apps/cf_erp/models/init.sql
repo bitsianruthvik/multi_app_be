@@ -4667,3 +4667,167 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plan_entries' AND COLUMN_NAME = 'start_date');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_plan_entries ADD COLUMN start_date DATE NULL AFTER ship_date', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §48  CUT FROM — plate AND section cutting, places by id (CF_ERP_CUT_FROM_PLAN.md)
+-- ============================================================================
+-- CUT_FROM (option PLATE | SECTION | NONE) says how a definition's / item's
+-- pieces are cut; it is inherited down the classification and from a template
+-- definition to the items made from it, like SHIP_UNIT. A SECTION part names
+-- the stock bar it is cut from in cut_stock_id (a definition's is the default,
+-- an item's overrides). Where cut pieces, raw stock and offcuts are filed is a
+-- company setting by node id (cf_cut_places), not a classification code.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_master_records' AND COLUMN_NAME = 'cut_stock_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_master_records ADD COLUMN cut_stock_id INT NULL AFTER default_flow_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_master_records' AND INDEX_NAME = 'idx_cmr_cut_stock');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_master_records ADD KEY idx_cmr_cut_stock (company_id, cut_stock_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_master_records' AND CONSTRAINT_NAME = 'fk_cmr_cut_stock');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_master_records ADD CONSTRAINT fk_cmr_cut_stock FOREIGN KEY (company_id, cut_stock_id) REFERENCES cf_master_records(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_cut_places (
+  id              INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT        NOT NULL,
+  kind            ENUM('plate','section') NOT NULL,
+  blanks_node_id  INT        NULL,               -- where cut pieces of this kind are filed
+  offcut_node_id  INT        NULL,               -- where offcuts of this kind are filed
+  updated_by      INT        NULL,
+  created_at      TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_ccpl_tenant (company_id, id),
+  UNIQUE KEY uq_ccpl_kind   (company_id, kind),
+  CONSTRAINT fk_ccpl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ccpl_blanks  FOREIGN KEY (company_id, blanks_node_id) REFERENCES cf_classification_nodes(company_id, id),
+  CONSTRAINT fk_ccpl_offcut  FOREIGN KEY (company_id, offcut_node_id) REFERENCES cf_classification_nodes(company_id, id),
+  CONSTRAINT fk_ccpl_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+-- The raw stock of a kind: one or more classification subtrees (plates sit
+-- under one node; angles, beams and channels under three).
+CREATE TABLE IF NOT EXISTS cf_cut_place_stock (
+  id          INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT        NOT NULL,
+  place_id    INT        NOT NULL,
+  node_id     INT        NOT NULL,
+  created_at  TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_ccps_tenant (company_id, id),
+  UNIQUE KEY uq_ccps_node   (company_id, place_id, node_id),
+  CONSTRAINT fk_ccps_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ccps_place   FOREIGN KEY (company_id, place_id) REFERENCES cf_cut_places(company_id, id),
+  CONSTRAINT fk_ccps_node    FOREIGN KEY (company_id, node_id) REFERENCES cf_classification_nodes(company_id, id)
+);
+
+-- Section cutting: saw kerf per cut, trim at each end of a bar, the shortest
+-- leftover kept as a reusable offcut. One row per company; none = these defaults.
+CREATE TABLE IF NOT EXISTS cf_section_settings (
+  company_id      INT            NOT NULL PRIMARY KEY,
+  saw_kerf_mm     DECIMAL(8,2)   NOT NULL DEFAULT 3.00,
+  end_trim_mm     DECIMAL(8,2)   NOT NULL DEFAULT 10.00,
+  min_offcut_mm   DECIMAL(10,2)  NOT NULL DEFAULT 500.00,
+  updated_by      INT            NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_csst_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_csst_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+-- A bar is a lot too: one stock bar, its pieces placed along it (x_mm), its
+-- leftover an offcut with a length. The plate tables carry both kinds.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_plate_lots ADD COLUMN kind ENUM('plate','bar') NOT NULL DEFAULT 'plate' AFTER source", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_offcuts ADD COLUMN kind ENUM('plate','bar') NOT NULL DEFAULT 'plate' AFTER offcut_no", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'length_mm');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_offcuts ADD COLUMN length_mm DECIMAL(12,3) NULL AFTER area_mm2', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_offcuts' AND COLUMN_NAME = 'stock_item_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_offcuts ADD COLUMN stock_item_id INT NULL AFTER length_mm', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- CUT_FROM per cf_erp company, its three options, and a defaulted rule on every
+-- Family that holds a template definition (the same Families as SHIP_UNIT).
+INSERT INTO cf_specifications (company_id, code, name, data_type, description, status)
+SELECT c.id, 'CUT_FROM', 'Cut from', 'option',
+       'How pieces of this kind are cut: from a plate (flat, by thickness, length, width and grade), from a section (a stock bar such as an angle, cut to length), or not cut at all. Set it on a classification or a definition; everything below or made from it follows unless it says otherwise.',
+       'active'
+  FROM companies c
+ WHERE c.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM apps ap WHERE ap.company_id = c.id AND ap.slug = 'cf_erp' AND ap.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_specifications s WHERE s.company_id = c.id AND s.code = 'CUT_FROM' AND s.deleted_at IS NULL);
+
+INSERT INTO cf_spec_options (company_id, specification_id, value, label, sort_order, status)
+SELECT s.company_id, s.id, o.value, o.label, o.sort_order, 'active'
+  FROM cf_specifications s
+  JOIN (SELECT 'PLATE' AS value, 'Plate' AS label, 1 AS sort_order
+        UNION ALL SELECT 'SECTION', 'Section (cut to length)', 2
+        UNION ALL SELECT 'NONE', 'Not cut', 3) o
+ WHERE s.code = 'CUT_FROM' AND s.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_spec_options x
+                    WHERE x.company_id = s.company_id AND x.specification_id = s.id AND x.value = o.value AND x.deleted_at IS NULL);
+
+INSERT INTO cf_spec_assignments
+  (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule)
+SELECT f.company_id, s.id, 'classification', f.id, 'item', 0, 1, 'defaulted'
+  FROM cf_classification_nodes f
+  JOIN cf_specifications s
+    ON s.company_id = f.company_id AND s.code = 'CUT_FROM' AND s.deleted_at IS NULL
+ WHERE f.depth = 0 AND f.deleted_at IS NULL AND f.scope <> 'machine'
+   AND EXISTS (SELECT 1
+                 FROM cf_master_records m
+                 JOIN cf_definition_details d ON d.master_id = m.id AND d.definition_type = 'template' AND d.deleted_at IS NULL
+                 JOIN cf_classification_nodes n  ON n.id = m.classification_id
+                 LEFT JOIN cf_classification_nodes p1 ON p1.id = n.parent_id
+                 LEFT JOIN cf_classification_nodes p2 ON p2.id = p1.parent_id
+                WHERE m.company_id = f.company_id AND m.deleted_at IS NULL
+                  AND f.id = CASE n.depth WHEN 0 THEN n.id WHEN 1 THEN p1.id ELSE p2.id END)
+   AND NOT EXISTS (SELECT 1 FROM cf_spec_assignments a
+                    WHERE a.company_id = f.company_id AND a.specification_id = s.id
+                      AND a.subject_type = 'classification' AND a.subject_id = f.id
+                      AND a.deleted_at IS NULL);
+
+-- Places, once, from the codes they were found by until now (afterwards only
+-- the ids count; Setup › Cutting changes them).
+INSERT INTO cf_cut_places (company_id, kind, blanks_node_id, offcut_node_id)
+SELECT c.id, 'plate',
+       (SELECT n.id FROM cf_classification_nodes n WHERE n.company_id = c.id AND n.code = 'CUT_PLATE' AND n.deleted_at IS NULL ORDER BY n.id LIMIT 1),
+       (SELECT n.id FROM cf_classification_nodes n WHERE n.company_id = c.id AND n.code = 'OFFCUT' AND n.deleted_at IS NULL ORDER BY n.id LIMIT 1)
+  FROM companies c
+ WHERE c.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM apps ap WHERE ap.company_id = c.id AND ap.slug = 'cf_erp' AND ap.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_cut_places p WHERE p.company_id = c.id AND p.kind = 'plate');
+INSERT INTO cf_cut_places (company_id, kind)
+SELECT c.id, 'section'
+  FROM companies c
+ WHERE c.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM apps ap WHERE ap.company_id = c.id AND ap.slug = 'cf_erp' AND ap.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_cut_places p WHERE p.company_id = c.id AND p.kind = 'section');
+INSERT INTO cf_cut_place_stock (company_id, place_id, node_id)
+SELECT p.company_id, p.id, n.id
+  FROM cf_cut_places p
+  JOIN cf_classification_nodes n ON n.company_id = p.company_id AND n.deleted_at IS NULL
+   AND ((p.kind = 'plate' AND n.code = 'PLATE') OR (p.kind = 'section' AND n.code IN ('ANGLES','BEAMS','CHANNELS')))
+ WHERE NOT EXISTS (SELECT 1 FROM cf_cut_place_stock x WHERE x.company_id = p.company_id AND x.place_id = p.id);
+
+-- §48b  The flow a new CUT SECTION takes (Backend A, 2026-10-08) — the section
+-- twin of cut_plate_flow_id (§33): cut sections are made automatically, with
+-- nobody there to choose a flow, so the house says once which flow a new one
+-- takes. Unset = release refuses a cut section with no flow, in words.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'cut_section_flow_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN cut_section_flow_id INT NULL AFTER cut_plate_flow_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND CONSTRAINT_NAME = 'fk_cfcs_cut_section_flow');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_company_settings ADD CONSTRAINT fk_cfcs_cut_section_flow FOREIGN KEY (company_id, cut_section_flow_id) REFERENCES cf_operation_flows(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

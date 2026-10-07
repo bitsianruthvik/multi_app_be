@@ -16,13 +16,16 @@
  *                                      rule where the record sits does not allow it yet.
  *   POST   /items                      { itemType, classificationId | sourceDefinitionId+ownerOrderLineId, name?, code?, uom?, trackedBy?, status?, revision?, values?, listPrice?, priceBasis? }
  *   POST   /definitions                { definitionType, classificationId, name?, code?, selectionMode?, candidateClassificationId?, status?, values? }
- *   GET    /records/:id
+ *   GET    /records/:id                + cutFrom { value, source, from }, cutStock { own, effective (+ steel), from } (items, templates)
  *   GET    /records/:id/specs          every rule that reaches it, with values and where they came from
  *   GET    /records/:id/history        value history
  *   GET    /records/:id/prices         { itemId, currency, listPrice, priceBasis, listUnitPrice, lastPurchasePrice, lastPurchaseDate,
  *                                        lastPurchaseOrder{id,code}|null, lastPurchaseSupplier{id,name}|null } — net of tax (init.sql §36)
  *   PUT    /records/:id                name, description, code (draft only), classification, uom, tracking, selection fields,
- *                                      listPrice (null clears) + priceBasis unit|kg|tonne|metre — catalog items only
+ *                                      listPrice (null clears) + priceBasis unit|kg|tonne|metre — catalog items only;
+ *                                      cutFrom PLATE|SECTION|NONE|null (null = inherit, written as the CUT_FROM value with history),
+ *                                      cutStockId (a catalog bar under the section stock places | null) — definitions and items
+ *                                      (a row of an order: its line's cut pieces follow, as `cutPieces`)
  *   PUT    /records/:id/values         { values: [{ specCode | specificationId, value }] }
  *   POST   /records/:id/status         { status: active | obsolete }
  *   POST   /records/:id/revision       { revision? }  (empty = next label)
@@ -96,7 +99,13 @@ router.get('/records/:id', guard(PERM.view), handle((req) => getRecord(pool, ctx
 router.get('/records/:id/specs', guard(PERM.view), handle((req) => getRecordSpecs(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/prices', guard(PERM.view), handle((req) => itemPrices(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/history', guard(PERM.view), handle((req) => getHistory(pool, ctx(req).companyId, 'master', id(req), req.query.limit)));
-router.put('/records/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => updateRecord(db, c, id(req), req.body))));
+router.put('/records/:id', guard(PERM.catalog), handle((req) => tx(req, async (db, c) => {
+  const out = await updateRecord(db, c, id(req), req.body);
+  // How a row of an order is cut (cutFrom / cutStockId): its line's cut pieces — and a section part's steel — follow.
+  const body = req.body ?? {};
+  if (body.cutFrom === undefined && body.cutStockId === undefined) return out;
+  return withCutPieces(db, c, await ownerLineOf(db, c.companyId, id(req)), out);
+})));
 router.put('/records/:id/values', guard(PERM.catalog), handle((req) => tx(req, async (db, c) => {
   const result = await setValues(db, c, 'master', id(req), req.body?.values);
   // A row of an order: its line's cut pieces follow the new values.

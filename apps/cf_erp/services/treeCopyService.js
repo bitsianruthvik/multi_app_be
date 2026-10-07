@@ -28,6 +28,7 @@
 import { invalid } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { subtreeIds } from './tree.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
 import { dateText, parseJsonCol } from './resolutionService.js';
 
 export const MAX_COPY_DEPTH = 25;
@@ -37,10 +38,21 @@ export const LINE_COLUMNS = ['company_id', 'bom_id', 'line_no', 'child_id', 'des
 
 const chunk = (xs, n) => { const out = []; for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n)); return out; };
 
-/** Classification nodes whose temporary items are cut plates: the CUT_PLATE variant and anything under it. */
-export async function cutPlateNodes(db, companyId, code) {
-  const [[n]] = await db.query('SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [companyId, code]);
-  return n ? new Set(await subtreeIds(db, companyId, n.id)) : new Set();
+/**
+ * Classification nodes whose temporary items are CUT PIECES — cut plates and
+ * cut sections: the blanks places of Setup › Cutting with their subtrees
+ * (lib/cutPlaces). A cut piece is shared by every part cut from it, so a copy
+ * never makes one afresh — the copied line derives its own.
+ * `code` (a test that owns its own classification only): the node coded so,
+ * and everything under it, instead of the setting.
+ */
+export async function cutPlateNodes(db, companyId, code = null) {
+  if (code) {
+    const [[n]] = await db.query('SELECT id FROM cf_classification_nodes WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [companyId, code]);
+    return n ? new Set(await subtreeIds(db, companyId, n.id)) : new Set();
+  }
+  const places = await cutPlaces(db, companyId);
+  return new Set([...places.plate.blanksIds, ...places.section.blanksIds]);
 }
 
 /**

@@ -769,7 +769,7 @@ export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
   const o = await requireOrder(db, companyId, line.order_id);
   if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet.');
   if (c) await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) });
-  const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
+  const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), withCut: true });
   const released = !!(await releaseOfLine(db, companyId, line.id));
   return {
     line: { id: line.id, lineNo: line.line_no, lineType: line.line_type, quantity: Number(line.quantity) },

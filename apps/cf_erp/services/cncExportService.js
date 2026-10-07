@@ -49,13 +49,18 @@ async function requireLine(db, companyId, lineId) {
 
 const baseName = (line, lot) => `${safe(line.order_code)}-L${safe(line.line_no)}-${safe(lot.lot_no)}`;
 
-/** Lots of a line (or one lot), their placements and offcuts: three round trips. */
+/**
+ * Plate lots of a line (or one lot), their placements and offcuts: three round
+ * trips. Plate lots only: a section bar (kind 'bar', init.sql §48) has no DXF —
+ * it is cut to length on the saw, and its plan is the section nesting sheet.
+ */
 async function loadLots(db, companyId, lineId, lotId = null) {
   const [lots] = await db.query(
     `SELECT l.*, m.code AS plate_code, m.name AS plate_name
        FROM cf_plate_lots l
        LEFT JOIN cf_master_records m ON m.id = l.plate_item_id AND m.company_id = l.company_id
       WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL
+        AND l.kind = 'plate'
         ${lotId != null ? 'AND l.id = ?' : ''}
       ORDER BY l.lot_no, l.id`,
     lotId != null ? [companyId, lineId, lotId] : [companyId, lineId],
