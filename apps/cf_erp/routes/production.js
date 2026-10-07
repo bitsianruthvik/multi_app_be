@@ -43,6 +43,7 @@
  *                                        leave the passes unordered.
  *   PUT    /flow-steps/:id               { sequence?, stepName?, notes? }
  *   DELETE /flow-steps/:id
+ *   POST   /flow-steps/:id/replace       { operationId } — released lines keep the old one
  *   POST   /flow-steps/:id/waits         { relation, targetDefinitionId?, targetOperationId?, requiredStatus?, notes? }
  *                                        targetOperationId names an OPERATION, not a step. Where
  *                                        the target's flow repeats it, requiredStatus picks the
@@ -71,7 +72,7 @@ import {
 } from '../services/operationService.js';
 import {
   listFlows, getFlow, createFlow, updateFlow, setFlowStatus, reviseFlow, deleteFlow,
-  addStep, updateStep, moveStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
+  addStep, updateStep, replaceStepOperation, moveStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
 } from '../services/flowService.js';
 import {
   listShifts, createShift, updateShift, deleteShift, copyShifts, listExceptions, createException, deleteException, machineCalendar,
@@ -132,6 +133,7 @@ router.post('/flows/:id/revise', manage, handle((req) => tx(req, (db, c) => revi
 router.delete('/flows/:id', manage, handle((req) => tx(req, (db, c) => deleteFlow(db, c, id(req)))));
 router.post('/flows/:id/steps', manage, handle((req) => tx(req, (db, c) => addStep(db, c, id(req), req.body ?? {}))));
 router.put('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => updateStep(db, c, id(req), req.body ?? {}))));
+router.post('/flow-steps/:id/replace', manage, handle((req) => tx(req, (db, c) => replaceStepOperation(db, c, id(req), req.body ?? {}))));
 router.post('/flow-steps/:id/move', manage, handle((req) => tx(req, (db, c) => moveStep(db, c, id(req), req.body ?? {}))));
 router.delete('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => removeStep(db, c, id(req)))));
 router.post('/flow-steps/:id/waits', manage, handle((req) => tx(req, (db, c) => addWaitRule(db, c, id(req), req.body ?? {}))));

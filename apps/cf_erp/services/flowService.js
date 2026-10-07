@@ -292,7 +292,7 @@ function readSequence(raw, problems) {
 }
 
 async function requireActiveOperation(db, companyId, id, problems) {
-  const [[o]] = await db.query('SELECT id, code, status FROM cf_operations WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(id)]);
+  const [[o]] = await db.query('SELECT id, code, name, status FROM cf_operations WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(id)]);
   if (!o) { problems.push('That operation does not exist.'); return null; }
   if (o.status !== 'active') problems.push(`Operation ${o.code} is inactive.`);
   return o;
@@ -350,6 +350,111 @@ export async function updateStep(db, c, stepId, input = {}) {
       [...Object.values(sets), c.companyId, stepId]);
   }
   return getFlow(db, c.companyId, step.flow_id);
+}
+
+/**
+ * Replace the operation of one step (user, 2026-10-07: "replace inside the flow
+ * a particular operation with another"). The step keeps its place, name, notes
+ * and waits. Lines already RELEASED keep the operation they were released with
+ * (their production steps hold their own copy); everything not yet released
+ * takes the new one.
+ *
+ * What hangs off the old operation for those unreleased lines moves with it —
+ * time overrides (order line × row × operation) and work-order cells (piece ×
+ * operation) — for the rows whose flow IS this flow, and only when the old
+ * operation no longer appears in the flow (a second pass of it keeps them). A
+ * row that already has the new operation keeps its own entry; the old one is
+ * left alone and counted.
+ * input: { operationId } → { flow, replaced: { from, to, released, overridesMoved, cellsMoved, kept, waitsNaming } }
+ */
+export async function replaceStepOperation(db, c, stepId, input = {}) {
+  const step = await requireStep(db, c.companyId, stepId);
+  assertEditable({ status: step.flow_status, code: step.flow_code });
+  const problems = [];
+  if (blank(input.operationId)) throw invalid('INVALID', 'Choose the operation that replaces it.');
+  if (Number(input.operationId) === step.operation_id) throw invalid('SAME_OPERATION', 'That is already this step\'s operation.');
+  const op = await requireActiveOperation(db, c.companyId, input.operationId, problems);
+  assertNoProblems(problems);
+  const [[clash]] = await db.query(
+    'SELECT id FROM cf_operation_flow_steps WHERE company_id = ? AND flow_id = ? AND operation_id = ? AND sequence = ? AND deleted_at IS NULL AND id <> ?',
+    [c.companyId, step.flow_id, op.id, step.sequence, step.id],
+  );
+  if (clash) throw invalid('DUPLICATE_STEP', `${op.name} is already at step ${step.sequence} of this flow — give one of them another number first.`);
+  const [[from]] = await db.query('SELECT id, code, name FROM cf_operations WHERE company_id = ? AND id = ?', [c.companyId, step.operation_id]);
+  const released = await releasedUses(db, c.companyId, step.id);
+  await db.query('UPDATE cf_operation_flow_steps SET operation_id = ? WHERE company_id = ? AND id = ?', [op.id, c.companyId, step.id]);
+
+  let overridesMoved = 0, cellsMoved = 0, kept = 0;
+  const [[still]] = await db.query(
+    'SELECT COUNT(*) AS n FROM cf_operation_flow_steps WHERE company_id = ? AND flow_id = ? AND operation_id = ? AND deleted_at IS NULL',
+    [c.companyId, step.flow_id, step.operation_id],
+  );
+  if (!Number(still.n)) {
+    // The row's flow, as bomGraph.effectiveFlowOf reads it: the row's own, else
+    // the item's, else its template's; the line's own item (no row) from the item.
+    const flowCols = `COALESCE(bl.operation_flow_id, ch.default_flow_id, sdef.default_flow_id) AS row_flow,
+                      COALESCE(lm.default_flow_id, lsd.default_flow_id) AS line_flow`;
+    const flowJoins = `JOIN cf_sales_order_lines ol ON ol.company_id = x.company_id AND ol.id = x.order_line_id AND ol.deleted_at IS NULL
+      LEFT JOIN cf_bom_lines bl ON bl.id = x.bom_line_id
+      LEFT JOIN cf_master_records ch ON ch.id = bl.child_id
+      LEFT JOIN cf_item_details ci ON ci.master_id = bl.child_id AND ci.deleted_at IS NULL
+      LEFT JOIN cf_master_records sdef ON sdef.id = ci.source_definition_id
+      LEFT JOIN cf_master_records lm ON lm.id = ol.item_id
+      LEFT JOIN cf_item_details li ON li.master_id = ol.item_id AND li.deleted_at IS NULL
+      LEFT JOIN cf_master_records lsd ON lsd.id = li.source_definition_id`;
+    const [ovs] = await db.query(
+      `SELECT x.id, x.order_line_id, x.bom_line_id, ${flowCols} FROM cf_time_overrides x ${flowJoins}
+        WHERE x.company_id = ? AND x.operation_id = ? AND x.deleted_at IS NULL`,
+      [c.companyId, step.operation_id],
+    );
+    const [cells] = await db.query(
+      `SELECT x.id, x.order_line_id, x.order_piece_id, x.bom_line_id, ${flowCols}
+         FROM (SELECT w.id, w.company_id, w.order_line_id, w.order_piece_id, p.bom_line_id
+                 FROM cf_work_order_cells w JOIN cf_order_pieces p ON p.id = w.order_piece_id
+                WHERE w.company_id = ? AND w.operation_id = ? AND w.deleted_at IS NULL) x ${flowJoins}`,
+      [c.companyId, step.operation_id],
+    );
+    const lineIds = [...new Set([...ovs, ...cells].map((r) => r.order_line_id))];
+    const [rel] = lineIds.length ? await db.query(
+      'SELECT DISTINCT order_line_id FROM cf_production_releases WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [c.companyId, lineIds],
+    ) : [[]];
+    const releasedLines = new Set(rel.map((r) => r.order_line_id));
+    const ours = (r) => !releasedLines.has(r.order_line_id) && Number(r.bom_line_id == null ? r.line_flow : r.row_flow) === Number(step.flow_id);
+    const ovMine = ovs.filter(ours), cellMine = cells.filter(ours);
+    if (ovMine.length) {
+      const [taken] = await db.query(
+        'SELECT order_line_id, bom_key FROM cf_time_overrides WHERE company_id = ? AND operation_id = ? AND order_line_id IN (?) AND deleted_at IS NULL',
+        [c.companyId, op.id, [...new Set(ovMine.map((r) => r.order_line_id))]],
+      );
+      const has = new Set(taken.map((t) => `${t.order_line_id}:${t.bom_key}`));
+      const move = ovMine.filter((r) => !has.has(`${r.order_line_id}:${r.bom_line_id ?? 0}`));
+      kept += ovMine.length - move.length;
+      if (move.length) await db.query('UPDATE cf_time_overrides SET operation_id = ? WHERE company_id = ? AND id IN (?)', [op.id, c.companyId, move.map((r) => r.id)]);
+      overridesMoved = move.length;
+    }
+    if (cellMine.length) {
+      const [taken] = await db.query(
+        'SELECT order_piece_id FROM cf_work_order_cells WHERE company_id = ? AND operation_id = ? AND order_piece_id IN (?) AND deleted_at IS NULL',
+        [c.companyId, op.id, cellMine.map((r) => r.order_piece_id)],
+      );
+      const has = new Set(taken.map((t) => t.order_piece_id));
+      const move = cellMine.filter((r) => !has.has(r.order_piece_id));
+      kept += cellMine.length - move.length;
+      if (move.length) await db.query('UPDATE cf_work_order_cells SET operation_id = ? WHERE company_id = ? AND id IN (?)', [op.id, c.companyId, move.map((r) => r.id)]);
+      cellsMoved = move.length;
+    }
+  }
+  // Waits elsewhere that name the old operation are the planner's to decide; say how many.
+  const [[waits]] = await db.query(
+    'SELECT COUNT(*) AS n FROM cf_step_wait_rules WHERE company_id = ? AND target_operation_id = ? AND deleted_at IS NULL', [c.companyId, step.operation_id],
+  );
+  return {
+    flow: await getFlow(db, c.companyId, step.flow_id),
+    replaced: {
+      from: from ? { id: from.id, code: from.code, name: from.name } : null, to: { id: op.id, code: op.code, name: op.name },
+      released, overridesMoved, cellsMoved, kept, waitsNaming: Number(waits.n),
+    },
+  };
 }
 
 /**

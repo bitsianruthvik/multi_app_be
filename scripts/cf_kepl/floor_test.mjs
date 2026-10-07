@@ -266,7 +266,9 @@ try {
   ok('a job this machine is not set up for is refused', said(notSetUp, /not set up/));
   const contractorStart = await refusal(() => F.startWork(conn, c, { machineId: M.id, stepIds: [contracted.id] }));
   ok('a contractor\'s step cannot be started on the floor', said(contractorStart, /contractor/));
-  const future = await refusal(() => F.putDay(conn, c, M.id, { date: '2026-10-05', rows: [{ kind: 'stop', reasonId: reason('POWER'), start: '2026-10-05T09:00', end: '2026-10-05T10:00' }] }));
+  // A day well ahead of today (a fixed date turns into the past as the calendar moves on).
+  const ahead = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  const future = await refusal(() => F.putDay(conn, c, M.id, { date: ahead, rows: [{ kind: 'stop', reasonId: reason('POWER'), start: `${ahead}T09:00`, end: `${ahead}T10:00` }] }));
   ok('a day entry in the future is refused', said(future, /future/));
 
   /* ------------------------------------------------------------------------ */
