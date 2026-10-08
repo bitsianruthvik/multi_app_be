@@ -15,7 +15,7 @@
  */
 import { invalid, notFound } from '../lib/errors.js';
 import { loadMaster, requireMachine } from './records.js';
-import { resolve, effectiveByCode, parseJsonCol } from './resolutionService.js';
+import { resolve, effectiveByCode, levelsOfResolution, parseJsonCol } from './resolutionService.js';
 import { valueReaders } from './operationService.js';
 import { checkFormula } from './formulaService.js';
 import { LEAF_DEPTH } from './tree.js';
@@ -196,7 +196,8 @@ export async function checkForBuilder(db, companyId, body = {}) {
   if (!blank(body.itemId)) {
     const item = await loadMaster(db, companyId, Number(body.itemId));
     if (!item || item.record_kind !== 'item') throw invalid('INVALID', 'That piece does not exist.');
-    readers.item = valueReaders(effectiveByCode(await resolve(db, companyId, { master: item })));
+    const ir = await resolve(db, companyId, { master: item });
+    readers.item = valueReaders(effectiveByCode(ir), levelsOfResolution(ir));
   }
   if (!blank(body.machineId)) {
     const machine = await requireMachine(db, companyId, Number(body.machineId));

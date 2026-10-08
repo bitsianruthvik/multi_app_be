@@ -35,7 +35,17 @@
  * chart's range, or a cell the chart marks null, is not an error — the FORMULA'S
  * result is simply missing, with the reason, same as any other unmeasured input
  * (MissingValueError, caught in evaluateFormula).
+ *
+ * WORDS AND TREE LEVELS (2026-10-08, user: "item.family, item.subfamily … we should support"):
+ *   - "text in quotes" is a word: IF(item.GRADE = "E350", 2, 1), IF(item.subfamily = "Parts", 5, 10).
+ *   - item.X of a pick-list or text specification reads as a word; words compare with = and <>
+ *     (case does not matter) and are refused in arithmetic, in words.
+ *   - item.family / item.subfamily / item.variant are the piece's node at that level of the
+ *     classification tree (context.itemLevel); compared with a word, its name or code matches.
+ *   - LOOKUP(t, a, b, c …) takes any number of inputs when t is a ROWS chart (lib/chartTable.js):
+ *     { rows: [[in1, in2, …, result], …] } read left to right — see lookupRows.
  */
+export const LEVEL_REFS = ['FAMILY', 'SUBFAMILY', 'VARIANT'];
 
 export class FormulaError extends Error {
   constructor(message, position = null) {
@@ -69,6 +79,13 @@ function tokenize(src) {
   while (i < src.length) {
     const ch = src[i];
     if (/\s/.test(ch)) { i++; continue; }
+    if (ch === '"' || ch === "'") {
+      const end = src.indexOf(ch, i + 1);
+      if (end < 0) throw new FormulaError('A word in quotes is not closed', i);
+      tokens.push({ t: 'str', v: src.slice(i + 1, end), p: i });
+      i = end + 1;
+      continue;
+    }
     const num = /^(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?/.exec(src.slice(i));
     if (num) { tokens.push({ t: 'num', v: Number(num[0]), p: i }); i += num[0].length; continue; }
     const name = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*/.exec(src.slice(i));
@@ -95,6 +112,7 @@ function parseTokens(tokens) {
   function primary() {
     const tok = peek();
     if (tok.t === 'num') { take(); return { type: 'num', value: tok.v }; }
+    if (tok.t === 'str') { take(); return { type: 'str', value: tok.v }; }
     if (tok.t === 'name') {
       take();
       if (isOp('(')) {
@@ -176,6 +194,7 @@ function walk(ast, visit) {
 function collectRefs(ast, sets) {
   if (ast.type === 'ref') {
     const m = /^(children|item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(ast.name);
+    if (m && m[1].toLowerCase() === 'item' && LEVEL_REFS.includes(m[2].toUpperCase())) { sets.levelRefs.add(m[2].toUpperCase()); return; }
     if (m) ({ children: sets.rollupTerms, item: sets.itemRefs, machine: sets.machineRefs }[m[1].toLowerCase()]).add(m[2].toUpperCase());
     else if (ast.name.includes('.')) throw new FormulaError(`"${ast.name}" is not a name this formula can read`);
     else sets.references.add(ast.name.toUpperCase());
@@ -189,8 +208,8 @@ function collectRefs(ast, sets) {
       if (!t || t.type !== 'ref') {
         throw new FormulaError('LOOKUP\'s first argument names a table specification, e.g. LOOKUP(machine.CUT_SPEED, item.THICKNESS)');
       }
-      if (ast.args.length < 2 || ast.args.length > 3) {
-        throw new FormulaError('LOOKUP takes a table and one value to look up (or two, for a table with two axes)');
+      if (ast.args.length < 2) {
+        throw new FormulaError('LOOKUP takes a chart and the value(s) to look up, e.g. LOOKUP(machine.CUT_SPEED, item.THICKNESS)');
       }
       const cx = /^(item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(t.name);
       if (cx) sets.lookupRefs.push({ role: cx[1].toLowerCase(), code: cx[2].toUpperCase(), arity: ast.args.length });
@@ -221,14 +240,14 @@ function collectRefs(ast, sets) {
 export function parseFormula(expression) {
   if (typeof expression !== 'string' || !expression.trim()) throw new FormulaError('The formula is empty');
   const ast = parseTokens(tokenize(expression));
-  const sets = { references: new Set(), rollupTerms: new Set(), itemRefs: new Set(), machineRefs: new Set(), lookupRefs: [], usesRollupFunction: false };
+  const sets = { references: new Set(), rollupTerms: new Set(), itemRefs: new Set(), machineRefs: new Set(), levelRefs: new Set(), lookupRefs: [], usesRollupFunction: false };
   collectRefs(ast, sets);
   checkRollupPlacement(ast, false);
-  const { references, rollupTerms, itemRefs, machineRefs, lookupRefs, usesRollupFunction } = sets;
+  const { references, rollupTerms, itemRefs, machineRefs, levelRefs, lookupRefs, usesRollupFunction } = sets;
   const usesRollup = usesRollupFunction || rollupTerms.size > 0;
   // A LOOKUP on item.X / machine.X makes this a timing formula even when that
   // is the ONLY item./machine. name in it (e.g. LOOKUP(machine.CUT_SPEED, 12)).
-  const usesContext = itemRefs.size > 0 || machineRefs.size > 0 || lookupRefs.some((r) => r.role === 'item' || r.role === 'machine');
+  const usesContext = itemRefs.size > 0 || machineRefs.size > 0 || levelRefs.size > 0 || lookupRefs.some((r) => r.role === 'item' || r.role === 'machine');
   if (usesContext && usesRollup) throw new FormulaError('A timing formula (item. / machine.) cannot also roll up BOM children');
   if (usesContext && references.size) {
     throw new FormulaError(`${[...references][0]} needs a prefix — in a formula that reads item. or machine. values, say item.${[...references][0]} or machine.${[...references][0]}`);
@@ -246,6 +265,7 @@ export function parseFormula(expression) {
     usesRollup,
     itemRefs: [...itemRefs],
     machineRefs: [...machineRefs],
+    levelRefs: [...levelRefs],
     lookupRefs,
     usesContext,
     kind: usesRollup ? 'rollup' : usesContext ? 'timing' : 'value',
@@ -365,6 +385,71 @@ function lookupTableValue(table, x, y) {
   return { value: top + (bottom - top) * by.t };
 }
 
+/** Two words — or a word and a tree node (its name or code) — are the same, case aside. */
+function sameWord(a, b) {
+  const words = (v) => (v != null && typeof v === 'object' ? [v.name, v.code] : [v]).filter((x) => x != null).map((x) => String(x).trim().toLowerCase());
+  const A = words(a); const B = words(b);
+  return A.some((x) => B.includes(x));
+}
+
+/**
+ * A ROWS chart: table.axes describe the inputs ({ kind: 'spec', dataType, unit } or
+ * { kind: 'level' }), table.rows = [[in1, …, inN, result], …]. Read left to right:
+ *   a level column keeps the rows whose node is the piece's node at that level (by id);
+ *   a word column (pick-list, text) keeps the rows that say the same word;
+ *   a number column keeps the rows AT the first value at or above the piece's (step up) —
+ *   below the smallest or above the largest is a gap, said in words; in 'linear' mode the
+ *   LAST input, when it is a number, reads a straight line between the rows around it.
+ * One row left gives the result; a blank result is a gap too. Never a guess.
+ */
+export function lookupRows(table, inputs) {
+  const EPS = 1e-9;
+  const axes = table.axes ?? [];
+  if (inputs.length !== axes.length) return { missingReason: `reads ${axes.length} value${axes.length === 1 ? '' : 's'} — ${inputs.length} given` };
+  let rows = (table.rows ?? []).filter((r) => Array.isArray(r) && r.length === axes.length + 1);
+  if (!rows.length) return { missingReason: 'has no rows yet' };
+  const labelOf = (a) => `${a.label ?? 'a column'}${a.unit ? ` (${a.unit})` : ''}`;
+  const shown = (v, a) => (v != null && typeof v === 'object' ? (v.name ?? v.code ?? v.id) : `${v}${a.unit ? ` ${a.unit}` : ''}`);
+  for (let i = 0; i < axes.length; i++) {
+    const a = axes[i];
+    const v = inputs[i];
+    if (a.kind === 'level') {
+      const id = v != null && typeof v === 'object' ? Number(v.id) : null;
+      rows = rows.filter((r) => id != null && Number(r[i]) === id);
+      if (!rows.length) return { missingReason: `has no row for ${labelOf(a)} ${shown(v, a)}` };
+      continue;
+    }
+    const isNumber = (a.dataType ?? 'number') === 'number';
+    if (!isNumber) {
+      rows = rows.filter((r) => sameWord(r[i], v));
+      if (!rows.length) return { missingReason: `has no row for ${labelOf(a)} "${shown(v, a)}"` };
+      continue;
+    }
+    const x = Number(v);
+    if (!Number.isFinite(x)) return { missingReason: `needs a number for ${labelOf(a)}` };
+    const values = [...new Set(rows.map((r) => Number(r[i])).filter(Number.isFinite))].sort((p, q) => p - q);
+    if (!values.length) return { missingReason: `has no number in ${labelOf(a)}` };
+    if (x < values[0] - EPS) return { missingReason: `${shown(x, a)} is below the chart, which starts at ${shown(values[0], a)}` };
+    if (x > values[values.length - 1] + EPS) return { missingReason: `${shown(x, a)} is above the chart, which ends at ${shown(values[values.length - 1], a)}` };
+    const last = i === axes.length - 1;
+    const exact = values.find((w) => Math.abs(w - x) < EPS);
+    if (last && table.mode === 'linear' && exact == null) {
+      const lo = values.filter((w) => w < x).pop();
+      const hi = values.find((w) => w > x);
+      const rLo = rows.find((r) => Math.abs(Number(r[i]) - lo) < EPS);
+      const rHi = rows.find((r) => Math.abs(Number(r[i]) - hi) < EPS);
+      const vLo = rLo?.[axes.length]; const vHi = rHi?.[axes.length];
+      if (vLo == null || vHi == null || vLo === '' || vHi === '') return { missingReason: `has a blank result around ${shown(x, a)}` };
+      return { value: Number(vLo) + (Number(vHi) - Number(vLo)) * ((x - lo) / (hi - lo)) };
+    }
+    const at = exact ?? values.find((w) => w > x);
+    rows = rows.filter((r) => Math.abs(Number(r[i]) - at) < EPS);
+  }
+  const out = rows[0][axes.length];
+  if (out == null || out === '' || !Number.isFinite(Number(out))) return { missingReason: 'has a blank result there — the chart marks it as not possible' };
+  return { value: Number(out) };
+}
+
 export function evaluateFormula(parsed, lookup, children = null, context = null, lookupTable = null) {
   if (parsed.usesRollup && !children) return { value: null, error: 'Roll-up terms are evaluated from BOM lines.' };
   if (parsed.usesContext && !context) return { value: null, error: 'item. and machine. values are read when a machine works on an item.' };
@@ -372,6 +457,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   if (parsed.usesContext) {
     for (const code of parsed.itemRefs ?? []) if (!hasValue(context.item(code))) missing.push(`item · ${code}`);
     for (const code of parsed.machineRefs ?? []) if (!hasValue(context.machine(code))) missing.push(`machine · ${code}`);
+    for (const lv of parsed.levelRefs ?? []) if (!context.itemLevel?.(lv)) missing.push(`item · ${lv.toLowerCase()}`);
   }
   // A table not yet fixed, defaulted or entered anywhere reachable is the same
   // class of gap as any other unmeasured input — reported here, before the
@@ -416,6 +502,12 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
     const named = role === 'plain' ? code : `${role}.${code}`;
     const table = tableOf({ role, code });
     if (!table) throw new MissingValueError(`${named} has no chart set yet`);
+    if (Array.isArray(table.rows)) {
+      const inputs = n.args.slice(1).map((a) => ev(a, child, true));
+      const out = lookupRows(table, inputs);
+      if (out.missingReason) throw new MissingValueError(`${named} ${out.missingReason}`);
+      return out.value;
+    }
     const axisCount = Array.isArray(table.y) && table.y.length ? 2 : 1;
     if (n.args.length - 1 !== axisCount) {
       throw new FormulaError(`${code} has ${axisCount} chart axis${axisCount === 1 ? '' : 'es'} — LOOKUP(${code}${axisCount === 1 ? ', x' : ', x, y'}) takes ${axisCount} value${axisCount === 1 ? '' : 's'} to look up, not ${n.args.length - 1}`);
@@ -426,26 +518,45 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
     if (out.missingReason) throw new MissingValueError(`${named} ${out.missingReason}`);
     return out.value;
   }
-  function ev(n, child = null) {
+  /** A number, a word (string) or a tree node ({ id, code, name }); `raw` keeps words and nodes as they are. */
+  function ev(n, child = null, raw = false) {
+    const num = (v, what) => {
+      if (raw || typeof v === 'number') return v;
+      if (v != null && typeof v === 'object') throw new FormulaError(`${what} is a place in the tree — compare it with a name in quotes, e.g. ${what} = "Parts"`);
+      if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
+      if (typeof v === 'string') throw new FormulaError(`${what} is a word ("${v}"), not a number`);
+      return Number(v);
+    };
     switch (n.type) {
       case 'num': return n.value;
+      case 'str': return n.value;
       case 'ref': {
         const t = childTerm(n.name);
         if (t) return Number(child.get(t));
         const cx = CONTEXT_REF.exec(n.name);
-        if (cx) return Number(context[cx[1].toLowerCase()](cx[2].toUpperCase()));
+        if (cx && cx[1].toLowerCase() === 'item' && LEVEL_REFS.includes(cx[2].toUpperCase())) return context.itemLevel(cx[2].toUpperCase());
+        if (cx) return num(context[cx[1].toLowerCase()](cx[2].toUpperCase()), n.name);
         return Number(lookup(n.name.toUpperCase()));
       }
       case 'neg': return -ev(n.arg, child);
       case 'call': {
         if (n.name === LOOKUP_FN) return lookupCall(n, child);
         if (ROLLUP_FUNCTIONS.has(n.name)) return rollup(n);
-        if (n.name === 'IF') return ev(n.args[0], child) ? ev(n.args[1], child) : ev(n.args[2], child);
+        if (n.name === 'IF') return ev(n.args[0], child) ? ev(n.args[1], child, raw) : ev(n.args[2], child, raw);
         return FUNCTIONS[n.name].fn(...n.args.map((a) => ev(a, child)));
       }
       case 'bin': {
+        if (['=', '==', '!=', '<>'].includes(n.op)) {
+          const a = ev(n.left, child, true);
+          const b = ev(n.right, child, true);
+          if (typeof a !== 'number' || typeof b !== 'number') {
+            const same = sameWord(a, b);
+            return bool(n.op === '!=' || n.op === '<>' ? !same : same);
+          }
+        }
         const a = ev(n.left, child);
         const b = ev(n.right, child);
+        if (typeof a !== 'number' || typeof b !== 'number') throw new FormulaError(`Only numbers can be used with ${n.op}`);
         switch (n.op) {
           case '+': return a + b;
           case '-': return a - b;

@@ -15,7 +15,7 @@
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { ancestors, levelName, loadNode, LEAF_DEPTH } from './tree.js';
 import { loadMaster, requireMachine, loadMachine } from './records.js';
-import { resolve, effectiveByCode, dateText } from './resolutionService.js';
+import { resolve, effectiveByCode, levelsOfResolution, dateText } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { syncRecordsUsingOperation } from './flowSpecService.js';
 import { chartBindings } from './chartService.js';
@@ -507,12 +507,22 @@ function winningTiming(rows, rank) {
  * by timingPreview (one machine, one item) and timeEstimateService (every row of
  * an order line at once), so both read values the same way.
  */
-export function valueReaders(map) {
+export function valueReaders(map, levels = null) {
   return {
     number: (code) => {
       const v = map.get(code);
       return v && v.dataType === 'number' ? v.raw : null;
     },
+    // A pick-list or text value, as a word (2026-10-08: words in formulas and charts).
+    text: (code) => {
+      const v = map.get(code);
+      if (!v) return null;
+      if (v.dataType === 'option') return v.optionValue ?? v.display ?? null;
+      if (v.dataType === 'text') return v.raw ?? null;
+      return null;
+    },
+    // item.family / item.subfamily / item.variant: the piece's node at that level (levelsOfResolution).
+    level: (name) => levels?.[name] ?? null,
     // LOOKUP's own reader.
     table: (code) => {
       const v = map.get(code);
@@ -545,8 +555,9 @@ function parsedOf(expression) {
  */
 export function evaluateRuleTimes(rule, { item = null, machine = null } = {}) {
   const context = {
-    item: item ? item.number : () => null,
-    machine: machine ? machine.number : () => null,
+    item: item ? (code) => item.number(code) ?? item.text?.(code) ?? null : () => null,
+    machine: machine ? (code) => machine.number(code) ?? machine.text?.(code) ?? null : () => null,
+    itemLevel: item ? (name) => item.level?.(name) ?? null : () => null,
     itemTable: item ? item.table : () => null,
     machineTable: machine ? machine.table : () => null,
   };
@@ -639,7 +650,7 @@ export async function timingPreview(db, companyId, operationId, input = {}) {
   const itemResolution = item ? await resolve(db, companyId, { master: item }) : null;
   const machineResolution = await resolve(db, companyId, { machine });
   const { setup, work } = evaluateRuleTimes(rule, {
-    item: itemResolution ? valueReaders(effectiveByCode(itemResolution)) : null,
+    item: itemResolution ? valueReaders(effectiveByCode(itemResolution), levelsOfResolution(itemResolution)) : null,
     machine: valueReaders(effectiveByCode(machineResolution)),
   });
   const total = setup.minutes != null && work.minutes != null ? Number((setup.minutes + work.minutes * quantity).toFixed(4)) : null;

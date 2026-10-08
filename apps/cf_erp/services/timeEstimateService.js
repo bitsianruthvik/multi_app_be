@@ -49,7 +49,7 @@ import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { explode } from './bomService.js';
 import { resolveLineRecords } from './orderValuesService.js';
-import { effectiveByCode, parseJsonCol } from './resolutionService.js';
+import { effectiveByCode, levelsOfResolution, parseJsonCol } from './resolutionService.js';
 import { loadTimingSetup, evaluateRuleTimes, valueReaders } from './operationService.js';
 
 const round3 = (n) => (n == null ? null : Number(Number(n).toFixed(3)));
@@ -322,7 +322,7 @@ async function itemReadersOf(db, companyId, lineId) {
   return (itemId) => {
     if (!readers.has(itemId)) {
       const r = resolutions.get(itemId);
-      readers.set(itemId, r ? valueReaders(effectiveByCode(r)) : null);
+      readers.set(itemId, r ? valueReaders(effectiveByCode(r), levelsOfResolution(r)) : null);
     }
     return readers.get(itemId);
   };

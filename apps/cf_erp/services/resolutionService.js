@@ -60,6 +60,12 @@ export const parseJsonCol = (v) => (v == null ? null : typeof v === 'string' ? J
  * Axis units come from table_config; a chart with nothing entered yet says so.
  */
 export function tableSummary(tableConfig, raw) {
+  // A ROWS chart (version 2): how many rows, read by what.
+  if (raw && Array.isArray(raw.rows)) {
+    if (!raw.rows.length) return 'No chart set yet';
+    const by = (tableConfig?.axes ?? []).map((a) => `${a.label ?? a.level ?? a.field}${a.unit ? ` (${a.unit})` : ''}`).join(', ');
+    return `${raw.rows.length} row${raw.rows.length === 1 ? '' : 's'}${by ? `, by ${by}` : ''}`;
+  }
   if (!raw || !Array.isArray(raw.x) || !raw.x.length) return 'No chart set yet';
   const axes = tableConfig?.axes ?? [];
   const fmt = (n) => (Number.isInteger(n) ? String(n) : String(Number(n.toFixed(3))));
@@ -468,6 +474,20 @@ export function publicResolution(r) {
 }
 
 /** Effective value of a spec by code, as the code generator and matching want it. */
+/**
+ * The piece's node at each level of the tree — { FAMILY, SUBFAMILY, VARIANT } → { id, code, name }
+ * — from a resolution's chain (broadest first), for item.family / item.subfamily / item.variant.
+ */
+export function levelsOfResolution(r) {
+  const out = {};
+  for (const s of r?.chain ?? []) {
+    if (s.subjectType !== 'classification') continue;
+    const key = String(s.level ?? '').toUpperCase();
+    if (['FAMILY', 'SUBFAMILY', 'VARIANT'].includes(key)) out[key] = { id: Number(s.subjectId), code: s.code, name: s.name };
+  }
+  return out;
+}
+
 export function effectiveByCode(r) {
   const out = new Map();
   for (const s of r.specs) {

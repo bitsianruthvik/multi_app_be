@@ -82,11 +82,13 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     known = new Map(rows.map((r) => [r.code, { dataType: r.data_type, tableConfig: typeof r.table_config === 'string' ? JSON.parse(r.table_config) : r.table_config }]));
     // Ordinary references must all be numbers — a table read this way (not
     // through LOOKUP) gets its own message, so it says what to do about it.
+    const words = new Set([...parsed.itemRefs, ...parsed.machineRefs]);
     for (const n of [...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs]) {
       const meta = known.get(n);
       if (!meta) problems.push(`Unknown specification ${n}.`);
-      else if (meta.dataType === 'table') problems.push(`${n} is a table — read it with LOOKUP(${n}, …).`);
-      else if (meta.dataType !== 'number') problems.push(`${n} is a ${meta.dataType}, not a number.`);
+      else if (meta.dataType === 'table') problems.push(`${n} is a table — write its name, or LOOKUP(${n}, …).`);
+      // A piece's pick-list or text value is a word: fine to compare ("E350") or to feed a chart.
+      else if (meta.dataType !== 'number' && !(words.has(n) && ['option', 'text'].includes(meta.dataType))) problems.push(`${n} is a ${meta.dataType}, not a number.`);
     }
     // LOOKUP's own target: must exist, must be a table, and must be asked for
     // the number of values its own axes take.
@@ -98,7 +100,7 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
         continue;
       }
       const axisCount = meta.tableConfig?.axes?.length || 1;
-      if (ref.arity - 1 !== axisCount) {
+      if (ref.arity - 1 !== axisCount && !(meta.tableConfig?.version >= 2)) {
         problems.push(`${ref.code} has ${axisCount} chart axis${axisCount === 1 ? '' : 'es'} — LOOKUP(${ref.code}${axisCount === 1 ? ', x' : ', x, y'}) takes ${axisCount} value${axisCount === 1 ? '' : 's'} to look up, not ${ref.arity - 1}.`);
       }
     }
@@ -114,7 +116,9 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     const typedOf = (role, code, kind) => (kind === 'number' ? num(`${role}.${code}`) : tableAt(`${role}.${code}`));
     const side = (role, kind) => (code) => typedOf(role, code, kind) ?? readers?.[role]?.[kind]?.(code) ?? null;
     const context = parsed.usesContext ? {
-      item: side('item', 'number'), machine: side('machine', 'number'),
+      item: (code) => side('item', 'number')(code) ?? readers?.item?.text?.(code) ?? null,
+      machine: (code) => side('machine', 'number')(code) ?? readers?.machine?.text?.(code) ?? null,
+      itemLevel: (name) => readers?.item?.level?.(name) ?? null,
       itemTable: side('item', 'table'), machineTable: side('machine', 'table'),
     } : null;
     result = evaluateFormula(parsed, num, null, context, (code) => tableAt(code));

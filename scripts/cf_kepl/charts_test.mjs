@@ -43,33 +43,67 @@ try {
   const T = `FCH${Date.now() % 100000}`;
 
   // Add a chart on the machine type, in one go.
-  const bad = await refused(() => createChart(db, c, { type: 'classification', id: typeId }, { name: 'x', axes: [{ label: 'Thickness' }] }));
+  const bad = await refused(() => createChart(db, c, { type: 'classification', id: typeId }, { name: 'x', inputs: [{ label: 'Thickness' }] }));
   ok('a chart without its units is refused, in words', !!bad && /unit/.test(JSON.stringify(bad.problems)), JSON.stringify(bad?.problems));
   const made = await createChart(db, c, { type: 'classification', id: typeId }, {
-    name: `${T} gas cutting speed`, resultUnit: 'mm/min', axes: [{ field: 'THICKNESS' }], value: { x: [6, 12, 25], v: [650, 520, 440] },
+    name: `${T} gas cutting speed`, resultUnit: 'mm/min', inputs: [{ field: 'THICKNESS' }], rows: [[6, 650], [12, 520], [25, 440]],
   });
   const chart = made.charts.find((x) => x.specId === made.chartId);
-  ok('added on the machine type: name, result unit, column tied to Thickness with its unit', chart && chart.resultUnit === 'mm/min' && chart.axes[0].field?.code === 'THICKNESS' && chart.axes[0].unit === 'mm', JSON.stringify(chart?.axes));
-  ok('…its values are on the type, and it can be written by its name', chart.own === true && chart.value?.v?.[1] === 520 && chart.shortForm === made.code);
-  const dupe = await createChart(db, c, { type: 'classification', id: typeId }, { name: `${T} gas cutting speed`, resultUnit: 'mm/min', axes: [{ field: 'THICKNESS' }] });
+  ok('added on the machine type: name, result unit, column tied to Thickness with its unit', chart && chart.resultUnit === 'mm/min' && chart.axes[0].field === 'THICKNESS' && chart.axes[0].unit === 'mm', JSON.stringify(chart?.axes));
+  ok('…its values are on the type, and it can be written by its name', chart.own === true && chart.rows?.[1]?.[1] === 520 && chart.shortForm === made.code);
+  const dupe = await createChart(db, c, { type: 'classification', id: typeId }, { name: `${T} gas cutting speed`, resultUnit: 'mm/min', inputs: [{ field: 'THICKNESS' }] });
   ok('a second chart of the same name gets its own code', dupe.code === `${made.code}_2`, dupe.code);
 
   // On a machine of that type: the type's chart, then its own.
   let onMachine = (await listCharts(db, COMPANY, { type: 'machine', id: mc.id })).find((x) => x.specId === made.chartId);
-  ok('a machine of the type sees the chart, from its type', onMachine && !onMachine.own && onMachine.valueFrom?.type === 'classification' && onMachine.value?.v?.[0] === 650);
-  await setValues(db, c, 'machine', mc.id, [{ specificationId: made.chartId, value: { x: [6, 12, 25], v: [700, 560, 470] } }]);
+  ok('a machine of the type sees the chart, from its type', onMachine && !onMachine.own && onMachine.valueFrom?.type === 'classification' && onMachine.rows?.[0]?.[1] === 650);
+  await setValues(db, c, 'machine', mc.id, [{ specificationId: made.chartId, value: { rows: [[6, 700], [12, 560], [25, 470]] } }]);
   onMachine = (await listCharts(db, COMPANY, { type: 'machine', id: mc.id })).find((x) => x.specId === made.chartId);
-  ok('…and its own chart once given one', onMachine.own && onMachine.value.v[0] === 700);
+  ok('…and its own chart once given one', onMachine.own && onMachine.rows[0][1] === 700);
   await setValues(db, c, 'machine', mc.id, [{ specificationId: made.chartId, value: null }]);
   onMachine = (await listCharts(db, COMPANY, { type: 'machine', id: mc.id })).find((x) => x.specId === made.chartId);
-  ok('…and back to the type\'s when its own is taken away', !onMachine.own && onMachine.value.v[0] === 650);
+  ok('…and back to the type\'s when its own is taken away', !onMachine.own && onMachine.rows[0][1] === 650);
 
   // Editing the chart itself.
   const ed = await updateChart(db, c, made.chartId, { resultUnit: 'm/min', mode: 'linear' });
   ok('the chart is edited in place (unit, between rows)', ed.resultUnit === 'm/min' && ed.mode === 'linear');
-  const two = await refused(() => updateChart(db, c, made.chartId, { axes: [{ field: 'THICKNESS' }, { label: 'Hole diameter', unit: 'mm' }] }));
-  ok('a chart with values keeps its number of columns, said in words', !!two && /number of columns/.test(JSON.stringify(two.problems)));
+  const two = await refused(() => updateChart(db, c, made.chartId, { inputs: [{ field: 'THICKNESS' }, { level: 'FAMILY' }] }));
+  ok('a chart with values keeps its number of columns, said in words', !!two && /columns stay/.test(JSON.stringify(two.problems)));
   await updateChart(db, c, made.chartId, { resultUnit: 'mm/min' });
+
+  // Many inputs: Thickness (number), Grade (pick-list), Family (tree level), pasted in words.
+  const [[piece]] = await db.query(
+    `SELECT m.id, t.value_number AS thk, o.value AS grade FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL
+       JOIN cf_spec_values t ON t.subject_id = m.id AND t.subject_type = 'master' AND t.deleted_at IS NULL AND t.value_number IS NOT NULL
+       JOIN cf_specifications ts ON ts.id = t.specification_id AND ts.code = 'THICKNESS'
+       JOIN cf_spec_values g ON g.subject_id = m.id AND g.subject_type = 'master' AND g.deleted_at IS NULL AND g.option_id IS NOT NULL
+       JOIN cf_specifications gs ON gs.id = g.specification_id AND gs.code = 'GRADE'
+       JOIN cf_spec_options o ON o.id = g.option_id
+      WHERE m.company_id = ? AND m.deleted_at IS NULL ORDER BY m.id LIMIT 1`, [COMPANY]);
+  const { resolve, levelsOfResolution } = await import('../../apps/cf_erp/services/resolutionService.js');
+  const pieceRec = (await db.query('SELECT * FROM cf_master_records WHERE id = ?', [piece.id]))[0][0];
+  const lv = levelsOfResolution(await resolve(db, COMPANY, { master: pieceRec }));
+  ok(`a piece knows its family and subfamily (${lv.FAMILY?.name} › ${lv.SUBFAMILY?.name})`, !!lv.FAMILY && !!lv.SUBFAMILY);
+  const thk = Number(piece.thk);
+  const many = await createChart(db, c, { type: 'classification', id: typeId }, {
+    name: `${T} drill time`, resultUnit: 's', inputs: [{ field: 'THICKNESS' }, { field: 'GRADE' }, { level: 'FAMILY' }],
+    rows: [[thk - 1, piece.grade, lv.FAMILY.name, 11], [thk + 2, piece.grade, lv.FAMILY.code, 22], [thk + 2, 'NOT-A-GRADE-X', lv.FAMILY.name, 33]].slice(0, 2),
+  });
+  const mchart = many.charts.find((x) => x.specId === many.chartId);
+  ok('a chart of three inputs: headings from the specifications and the tree', mchart.axes.map((a) => a.label).join(' | ') === 'Thickness | Grade | Family' && mchart.axes[0].unit === 'mm', mchart.axes.map((a) => `${a.label} ${a.unit ?? ''}`).join(' | '));
+  ok('…its rows pasted in words are stored as the tree node and the choice', Number(mchart.rows[0][2]) === lv.FAMILY.id && mchart.rows[1][1] === piece.grade && mchart.nodes[lv.FAMILY.id]?.name === lv.FAMILY.name, JSON.stringify(mchart.rows));
+  const badRow = await refused(() => createChart(db, c, { type: 'classification', id: typeId }, { name: `${T} bad`, resultUnit: 's', inputs: [{ field: 'THICKNESS' }, { level: 'FAMILY' }], rows: [[10, 'No Such Family', 5]] }));
+  ok('a row naming a family the tree does not have is refused, in words', !!badRow && /not a family/.test(JSON.stringify(badRow.problems)), JSON.stringify(badRow?.problems));
+  const [o2] = await db.query("INSERT INTO cf_operations (company_id, code, name, status) VALUES (?, ?, 'Drill test', 'active')", [COMPANY, `${T}-DR`]);
+  const r2 = await createTimingRule(db, c, o2.insertId, { subjectType: 'classification', subjectId: typeId, workExpression: `${many.code} / 60 + IF(item.family = "${lv.FAMILY.name}", 1, 0) + IF(item.GRADE = "${piece.grade}", 2, 0)` });
+  const [[st]] = await db.query('SELECT work_expression FROM cf_operation_machine_rules WHERE id = ?', [r2.id]);
+  ok('the chart by its name reads its three inputs from the piece', st.work_expression.startsWith(`LOOKUP(machine.${many.code}, item.THICKNESS, item.GRADE, item.FAMILY)`), st.work_expression);
+  const pv2 = await timingPreview(db, COMPANY, o2.insertId, { machineId: mc.id, itemId: piece.id });
+  // thk steps up to thk + 2 (the row at or above), its grade, its family: 22 s = 0.3667 min, + 1 + 2.
+  ok(`worked out on the real piece: 22 s / 60 + 1 (family) + 2 (grade) = ${(22 / 60 + 3).toFixed(4)} min`, Math.abs((pv2.work?.minutes ?? -1) - (22 / 60 + 3)) < 1e-3, JSON.stringify(pv2.work));
+  const need2 = (await neededCodesOfFlows(db, COMPANY, [])).size === 0;
+  ok('(sanity) no flows, nothing needed', need2);
 
   // The machine type page.
   const page = await machineTypeDetails(db, COMPANY, typeId);

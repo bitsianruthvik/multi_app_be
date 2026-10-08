@@ -77,7 +77,7 @@
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { rollOutPlan, lockedBothOf, attachLockedCodes, availabilityRows, shapeAvailability } from './rollOutService.js';
 import { resolveLineRecords } from './orderValuesService.js';
-import { effectiveByCode, dateText } from './resolutionService.js';
+import { effectiveByCode, levelsOfResolution, dateText } from './resolutionService.js';
 import { loadMachineSide, flowSteps, opsOfFlow } from './timeEstimateService.js';
 import { valueReaders, productionMachineIds } from './operationService.js';
 import { machinesCalendar } from './shiftService.js';
@@ -398,7 +398,7 @@ export async function getPlanner(db, companyId, q = {}) {
     const over = overridesOfLine.get(line.id) ?? new Map();
     const readers = new Map();
     const readersOf = (itemId) => {
-      if (!readers.has(itemId)) { const v = valuesOf(resolutions, itemId); readers.set(itemId, v ? valueReaders(v) : null); }
+      if (!readers.has(itemId)) { const v = valuesOf(resolutions, itemId); readers.set(itemId, v ? valueReaders(v, levelsOfResolution(resolutions.get(itemId))) : null); }
       return readers.get(itemId);
     };
     const shipUnit = (itemId) => valuesOf(resolutions, itemId)?.get('SHIP_UNIT')?.raw === true;

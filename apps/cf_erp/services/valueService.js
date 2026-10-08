@@ -70,6 +70,43 @@ export function validateTableValue(spec, input) {
   const config = parseJsonCol(spec.table_config);
   const axisCount = config?.axes?.length || 1;
 
+  // A ROWS chart (table_config.version 2, 2026-10-08): { rows: [[in1, …, inN, result], …] } —
+  // any number of inputs (specifications or tree levels), one result. Read by formulaEngine.lookupRows.
+  if (config?.version >= 2) {
+    const axes = config.axes ?? [];
+    if (!Array.isArray(input.rows)) return { problem: `${spec.code} needs its rows — one per case, its inputs then its result.` };
+    const rows = [];
+    const seen = new Set();
+    for (const [n, row] of input.rows.entries()) {
+      const where = `row ${n + 1}`;
+      if (!Array.isArray(row) || row.length !== axes.length + 1) return { problem: `${spec.code}: ${where} needs ${axes.length + 1} cells — ${axes.map((a) => a.label).join(', ')} and the result.` };
+      const out = [];
+      for (const [i, a] of axes.entries()) {
+        const raw = row[i];
+        if (raw === null || raw === undefined || String(raw).trim() === '') return { problem: `${spec.code}: ${where} has no ${a.label}.` };
+        if (a.kind === 'level') {
+          const id = Number(raw);
+          if (!Number.isInteger(id) || id <= 0) return { problem: `${spec.code}: ${where} — ${a.label} must be a place in the tree.` };
+          out.push(id);
+        } else if ((a.dataType ?? 'number') === 'number') {
+          const x = Number(raw);
+          if (!Number.isFinite(x)) return { problem: `${spec.code}: ${where} — ${a.label} is not a number.` };
+          out.push(x);
+        } else out.push(String(raw).trim());
+      }
+      const res = row[axes.length];
+      if (res === null || res === undefined || String(res).trim() === '') out.push(null);
+      else if (!Number.isFinite(Number(res))) return { problem: `${spec.code}: ${where} — the result is not a number (leave it blank where the machine cannot).` };
+      else out.push(Number(res));
+      const key = JSON.stringify(out.slice(0, axes.length)).toLowerCase();
+      if (seen.has(key)) return { problem: `${spec.code}: ${where} repeats the inputs of another row.` };
+      seen.add(key);
+      rows.push(out);
+    }
+    if (!rows.length) return { problem: `${spec.code} needs at least one row.` };
+    return { typed: { ...EMPTY, value_json: { rows } } };
+  }
+
   const axis = (name, arr) => {
     if (!Array.isArray(arr) || !arr.length) return { problem: `${spec.code} needs at least one ${name} value.` };
     const nums = [];
