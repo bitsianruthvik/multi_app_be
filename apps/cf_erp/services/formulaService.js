@@ -126,11 +126,14 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
       // What each name read, and from where — the time builder shows it beside the result.
       const from = (role, code, kind) => {
         if (typedOf(role, code, kind) != null) return 'typed';
-        return readers?.[role]?.[kind]?.(code) != null ? (role === 'item' ? 'piece' : 'machine') : null;
+        const found = readers?.[role]?.[kind]?.(code) ?? (kind === 'number' ? readers?.[role]?.text?.(code) : null);
+        return found != null ? (role === 'item' ? 'piece' : 'machine') : null;
       };
       inputs = [
         ...parsed.itemRefs.map((code) => ({ ref: `item.${code}`, value: context.item(code), from: from('item', code, 'number') })),
         ...parsed.machineRefs.map((code) => ({ ref: `machine.${code}`, value: context.machine(code), from: from('machine', code, 'number') })),
+        // The piece's place in the tree (item.family / subfamily / variant): its node's name.
+        ...(parsed.levelRefs ?? []).map((lv) => { const node = context.itemLevel?.(lv); return { ref: `item.${lv}`, value: node?.name ?? null, from: node ? 'piece' : null }; }),
         ...lookupRefs.filter((r) => r.role !== 'plain').map((r) => {
           const t = r.role === 'item' ? context.itemTable(r.code) : context.machineTable(r.code);
           return { ref: `${r.role}.${r.code}`, value: null, chart: t ? tableSummary(known.get(r.code)?.tableConfig ?? null, t) : null, from: from(r.role, r.code, 'table') };

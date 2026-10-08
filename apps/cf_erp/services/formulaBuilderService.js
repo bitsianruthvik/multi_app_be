@@ -52,7 +52,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
 
   const [[specs], [nodes], [machines], [flows], [rules]] = await Promise.all([
     db.query(`SELECT id, code, name, data_type, measurement_type, default_uom, table_config, description FROM cf_specifications
-               WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND data_type IN ('number', 'table') ORDER BY name`, [companyId]),
+               WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND data_type IN ('number', 'table', 'option', 'text') ORDER BY name`, [companyId]),
     db.query("SELECT id, parent_id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL AND scope = 'machine'", [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]),
     db.query('SELECT DISTINCT flow_id FROM cf_operation_flow_steps WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [companyId, operationId]),
@@ -116,10 +116,14 @@ export async function builderContext(db, companyId, operationId, q = {}) {
   // reaches every piece made from it) — one read.
   const pieceSubjects = [...new Set(samplePieces.flatMap((p) => [p.id, p.source_definition_id]).filter(Boolean))];
   const [pieceValues] = pieceSubjects.length
-    ? await db.query(`SELECT specification_id, subject_id, value_number, value_json FROM cf_spec_values
-        WHERE company_id = ? AND deleted_at IS NULL AND subject_type = 'master' AND subject_id IN (?)`, [companyId, pieceSubjects])
+    ? await db.query(`SELECT v.specification_id, v.subject_id, v.value_number, v.value_json, v.value_text, o.value AS option_value FROM cf_spec_values v LEFT JOIN cf_spec_options o ON o.id = v.option_id
+        WHERE v.company_id = ? AND v.deleted_at IS NULL AND v.subject_type = 'master' AND v.subject_id IN (?)`, [companyId, pieceSubjects])
     : [[]];
-  const valueOf = (row, spec) => (spec.data_type === 'table' ? parseJsonCol(row.value_json) : num(row.value_number));
+  // A pick-list or text value is a word (2026-10-08: words in formulas — IF(item.GRADE = "E350", …)).
+  const valueOf = (row, spec) => (spec.data_type === 'table' ? parseJsonCol(row.value_json)
+    : spec.data_type === 'option' ? (row.option_value ?? null)
+      : spec.data_type === 'text' ? (row.value_text ?? null)
+        : num(row.value_number));
   const bySubject = new Map();
   for (const v of pieceValues) {
     const spec = specById.get(v.specification_id);
@@ -171,7 +175,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
   // Every number / table field a piece might carry; the ones real pieces have first.
   // A chart is offered on the piece side only when a real piece has one (charts live on machines).
   const onPiece = (s) => pieceOut.some((p) => p.values[s.code] != null);
-  const itemFields = specs.filter((s) => (s.data_type === 'number' && !machineSpecIds.has(s.id)) || onPiece(s)).map((s) => {
+  const itemFields = specs.filter((s) => (['number', 'option', 'text'].includes(s.data_type) && !machineSpecIds.has(s.id)) || onPiece(s)).map((s) => {
     const withIt = pieceOut.filter((p) => p.values[s.code] != null);
     return { ...fieldOf(s), example: withIt[0] && s.data_type !== 'table' ? withIt[0].values[s.code] : null, exampleFrom: withIt[0]?.code ?? null, count: withIt.length };
   }).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
