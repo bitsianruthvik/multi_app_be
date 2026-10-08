@@ -18,6 +18,8 @@ import { loadMaster, requireMachine, loadMachine } from './records.js';
 import { resolve, effectiveByCode, dateText } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { syncRecordsUsingOperation } from './flowSpecService.js';
+import { chartBindings } from './chartService.js';
+import { expandCharts, contractCharts } from '../lib/chartFormula.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -197,7 +199,12 @@ function shapeRule(r) {
 export async function listTimingRules(db, companyId, operationId) {
   const [rows] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.operation_id = ? AND r.deleted_at IS NULL
     ORDER BY r.subject_type = 'machine', n.depth, r.effective_from`, [companyId, operationId]);
-  return rows.map(shapeRule);
+  // `display`: the time as a person writes it — a chart read by its own columns by its name (lib/chartFormula).
+  const bindings = await chartBindings(db, companyId);
+  return rows.map(shapeRule).map((r) => {
+    for (const t of [r.setup, r.work]) if (t?.expression != null) t.display = contractCharts(t.expression, bindings);
+    return r;
+  });
 }
 
 /** A timing formula reads item. and machine. values; a constant expression works too. */
@@ -258,8 +265,10 @@ async function readRuleBody(db, companyId, input, problems, existing = null) {
   if (workMinutes != null && workFormulaId) problems.push('Work is a constant or a formula, not both.');
   // §49: an expression given replaces whatever the time was (minutes, a shared formula); not given
   // keeps the rule's own expression as it is.
-  const setupExpr = readTimingExpression(input.setupExpression, 'Setup', problems);
-  const workExpr = readTimingExpression(input.workExpression, 'Work', problems);
+  // A chart written by its name is stored as the LOOKUP it stands for (lib/chartFormula).
+  const bindings = input.setupExpression != null || input.workExpression != null ? await chartBindings(db, companyId) : null;
+  const setupExpr = readTimingExpression(input.setupExpression == null ? input.setupExpression : expandCharts(input.setupExpression, bindings), 'Setup', problems);
+  const workExpr = readTimingExpression(input.workExpression == null ? input.workExpression : expandCharts(input.workExpression, bindings), 'Work', problems);
   const times = {
     setup_minutes: setupMinutes, setup_formula_id: setupFormulaId, setup_expression: existing?.setup_expression ?? null,
     work_minutes: workMinutes, work_formula_id: workFormulaId, work_expression: existing?.work_expression ?? null,

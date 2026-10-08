@@ -49,6 +49,8 @@ import { resolve, publicResolution } from '../services/resolutionService.js';
 import { setValues, getHistory } from '../services/valueService.js';
 import { listSpecs, createSpec, updateSpec, deleteSpec, addOption, updateOption, deleteOption } from '../services/specificationService.js';
 import { listFormulas, checkFormula, createFormula, updateFormula, deleteFormula } from '../services/formulaService.js';
+import { chartBindings } from '../services/chartService.js';
+import { expandCharts } from '../lib/chartFormula.js';
 import { checkForBuilder } from '../services/formulaBuilderService.js';
 import { listRules, createRule, updateRule, deleteRule } from '../services/assignmentService.js';
 
@@ -136,11 +138,14 @@ router.delete('/spec-options/:id', guard(PERM.setup), handle((req) => tx(req, (d
 // ----- formulas ------------------------------------------------------------
 router.get('/formulas', guard(PERM.view), handle((req) => listFormulas(pool, ctx(req).companyId)));
 router.post('/formulas/check', guard(PERM.view), handle(async (req) => {
-  const body = req.body ?? {};
+  const raw = req.body ?? {};
+  // A chart written by its name is checked as the LOOKUP it stands for (lib/chartFormula), and the answer says so.
+  const expanded = typeof raw.expression === 'string' ? expandCharts(raw.expression, await chartBindings(pool, ctx(req).companyId)) : raw.expression;
+  const body = { ...raw, expression: expanded };
   const { parsed, ...rest } = body.itemId || body.machineId
     ? await checkForBuilder(pool, ctx(req).companyId, body)
     : await checkFormula(pool, ctx(req).companyId, body.expression, body.sample ?? null);
-  return { ok: !!parsed && !rest.problems.length, ...rest };
+  return { ok: !!parsed && !rest.problems.length, ...rest, expanded: expanded !== raw.expression ? expanded : null };
 }));
 router.post('/formulas', guard(PERM.setup), handle((req) => tx(req, (db, c) => createFormula(db, c, req.body))));
 router.put('/formulas/:id', guard(PERM.setup), handle((req) => tx(req, (db, c) => updateFormula(db, c, intParam(req.params.id), req.body))));

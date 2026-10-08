@@ -81,6 +81,8 @@ import {
   listMachineTypes, createMachineType, updateMachineNode, deleteMachineNode,
 } from '../services/classificationService.js';
 import { builderContext } from '../services/formulaBuilderService.js';
+import { listCharts, createChart, updateChart, machineTypeDetails } from '../services/chartService.js';
+import { setValues } from '../services/valueService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -109,6 +111,26 @@ router.get('/machine-types', view, handle((req) => listMachineTypes(pool, ctx(re
 router.post('/machine-types', manage, handle((req) => tx(req, (db, c) => createMachineType(db, c, req.body ?? {}))));
 router.put('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => updateMachineNode(db, c, id(req), req.body ?? {}))));
 router.delete('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => deleteMachineNode(db, c, id(req)))));
+
+// CHARTS (chartService) — on a machine type or a machine, in one form: name, the result's unit, its
+// columns (the piece's value each is read by), values. A machine type's chart is every machine's
+// of that type unless a machine has its own (PUT …/machines/:id/charts/:specId/values).
+const specId = (req) => intParam(req.params.specId, 'specId');
+const chartValue = (req) => (req.body?.value === undefined ? null : req.body.value);
+router.get('/machine-types/:id/details', view, handle((req) => machineTypeDetails(pool, ctx(req).companyId, id(req))));
+router.get('/machine-types/:id/charts', view, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'classification', id: id(req) })));
+router.post('/machine-types/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'classification', id: id(req) }, req.body ?? {}))));
+router.put('/machine-types/:id/charts/:specId/values', manage, handle((req) => tx(req, async (db, c) => {
+  await setValues(db, c, 'classification', id(req), [{ specificationId: specId(req), value: chartValue(req) }]);
+  return listCharts(db, c.companyId, { type: 'classification', id: id(req) });
+})));
+router.get('/machines/:id/charts', view, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'machine', id: id(req) })));
+router.post('/machines/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'machine', id: id(req) }, req.body ?? {}))));
+router.put('/machines/:id/charts/:specId/values', manage, handle((req) => tx(req, async (db, c) => {
+  await setValues(db, c, 'machine', id(req), [{ specificationId: specId(req), value: chartValue(req) }]);
+  return listCharts(db, c.companyId, { type: 'machine', id: id(req) });
+})));
+router.put('/charts/:specId', manage, handle((req) => tx(req, (db, c) => updateChart(db, c, specId(req), req.body ?? {}))));
 
 router.get('/operations', view, handle((req) => listOperations(pool, ctx(req).companyId, req.query)));
 router.post('/operations', manage, handle((req) => tx(req, (db, c) => createOperation(db, c, req.body ?? {}))));
