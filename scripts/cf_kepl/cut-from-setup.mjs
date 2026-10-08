@@ -35,6 +35,14 @@ try {
   await db.beginTransaction();
   const [[user]] = await db.query('SELECT id FROM users WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
   const c = { companyId: COMPANY, userId: user?.id ?? null, canManage: true, isAdmin: true };
+  // The schema first: this script needs init.sql §48 / §48b (s48.sql) on the database.
+  const [[schema]] = await db.query(
+    `SELECT (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_cut_places','cf_cut_place_stock','cf_section_settings')) AS t,
+            (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'cut_section_flow_id') AS c`,
+  );
+  if (Number(schema.t) < 3 || Number(schema.c) < 1) {
+    throw new Error('The Cut from schema is not on this database yet — run s48.sql first (it should print SCHEMA-OK), then this script.');
+  }
   const [nodes] = await db.query('SELECT id, code, name, parent_id, depth FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
   const byCode = (code) => nodes.find((n) => String(n.code).toUpperCase() === code) ?? null;
 
@@ -176,6 +184,17 @@ try {
       await db.query('INSERT INTO cf_company_settings (company_id, cut_section_flow_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE cut_section_flow_id = VALUES(cut_section_flow_id)', [COMPANY, flow.id]);
       console.log(`5. cut sections follow ${flow.code} · ${flow.name}`);
     }
+  }
+  // 6. bracing flows (user, 2026-10-08: "add the bracing flows — if required, we will modify them"):
+  //    every Section definition with no flow of its own gets the Bracing angle flow (CG-BRACEANGLE).
+  const [[brace]] = await db.query("SELECT id, code, name FROM cf_operation_flows WHERE company_id = ? AND code = 'CG-BRACEANGLE' AND status = 'active' AND deleted_at IS NULL", [COMPANY]);
+  const sectionDefs = defs.filter((d) => under(d.classification_id, profileNode));
+  const [noFlow] = sectionDefs.length ? await db.query('SELECT id, code, name FROM cf_master_records WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL', [COMPANY, sectionDefs.map((d) => d.id)]) : [[]];
+  if (!brace) console.log(`6. no active CG-BRACEANGLE flow — ${noFlow.length} section definition(s) still have no flow: ${noFlow.map((d) => d.code).join(', ') || 'none'}`);
+  else if (!noFlow.length) console.log('6. every section definition already has a flow');
+  else {
+    await db.query('UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?)', [brace.id, COMPANY, noFlow.map((d) => d.id)]);
+    console.log(`6. ${brace.code} · ${brace.name} set on ${noFlow.length}: ${noFlow.map((d) => d.code).join(', ')}`);
   }
   if (APPLY) { await db.commit(); console.log('COMMITTED'); } else { await db.rollback(); console.log('DRY RUN — rolled back. Add --apply to keep it.'); }
 } catch (err) {
