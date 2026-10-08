@@ -69,7 +69,7 @@ import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 const EPS = 1e-6;
 const FALLBACK_DENSITY = 7850;
 export const BAR_LOT_PREFIX = 'BAR-';
-const STEEL_CODES = ['THICKNESS', 'WIDTH', 'DEPTH', 'SECTION_AREA', 'GRADE', 'IMPACT_CLASS', 'MATERIAL', 'DENSITY', 'LENGTH', 'WEIGHT'];
+const STEEL_CODES = ['THICKNESS', 'WIDTH', 'DEPTH', 'SECTION_AREA', 'GRADE', 'IMPACT_CLASS', 'MATERIAL', 'DENSITY', 'LENGTH', 'WEIGHT', 'CUT_ACROSS'];
 
 const r3 = (n) => Math.round(Number(n) * 1000) / 1000;
 const r6 = (n) => Math.round(Number(n) * 1e6) / 1e6;
@@ -98,7 +98,7 @@ export async function steelOf(db, companyId, ids) {
       WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL AND s.code IN (?)`,
     [companyId, list, STEEL_CODES],
   );
-  const key = { THICKNESS: 'thickness', WIDTH: 'width', DEPTH: 'depth', SECTION_AREA: 'sectionArea', DENSITY: 'density', LENGTH: 'lengthMm', WEIGHT: 'weight', GRADE: 'grade', IMPACT_CLASS: 'impactClass', MATERIAL: 'material' };
+  const key = { THICKNESS: 'thickness', WIDTH: 'width', DEPTH: 'depth', SECTION_AREA: 'sectionArea', DENSITY: 'density', LENGTH: 'lengthMm', WEIGHT: 'weight', GRADE: 'grade', IMPACT_CLASS: 'impactClass', MATERIAL: 'material', CUT_ACROSS: 'cutAcross' };
   for (const r of rows) {
     const o = out.get(Number(r.subject_id));
     if (!o) continue;
@@ -655,7 +655,9 @@ export async function writeSectionPlan(db, c, line, survey, plans, { origin = 'a
     if (claim.length) await db.query("UPDATE cf_offcuts SET status = 'used' WHERE company_id = ? AND id IN (?) AND status = 'available'", [companyId, claim]);
   }
   const quantities = await chargeStockLines(db, c, survey, all.map((x) => x.b));
+  const cuts = await writeSectionCuts(db, c, survey, all.map((x) => x.b));
   return {
+    cuts,
     replacedLots: replaced,
     lots: all.length,
     barsBought: all.filter((x) => x.b.source === 'catalog').length,
@@ -756,6 +758,101 @@ async function chargeStockLines(db, c, survey, bars) {
   return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * Cuts — how much the torch travels on a cut section (user, 2026-10-08)
+ *
+ * The cutting time sits on the cut section (Gas cutting reads item.CUT_LENGTH
+ * and item.THICKNESS), so its cut length is worked out here:
+ *   CUT_ACROSS  the length of ONE cut across the section — its stock bar's
+ *               (each steel family works it out: angle W + D − T, beam and
+ *               channel D + 2W − 2T; init.sql has no shape, the family does)
+ *   CUTS        cuts per piece. Before nesting 1 (pieces sit end to end, each
+ *               comes off with one cut). From a nest — auto or uploaded — the
+ *               real count: on each bar a piece costs a cut unless nothing is
+ *               left after it, and a trimmed bar end is one more cut, charged
+ *               to the first piece; per cut section, total ÷ pieces.
+ *   CUT_LENGTH  CUTS × CUT_ACROSS.
+ * Written straight onto the cut sections: nesting runs on a FROZEN line, whose
+ * records keep what they hold and work nothing out (valueService.materialize).
+ * A value that would not change is not written. Specs a company does not have
+ * are skipped — it has not been set up (scripts/cf_kepl/section-cutting-setup).
+ * ------------------------------------------------------------------------ */
+const CUT_SPECS = ['CUTS', 'CUT_ACROSS', 'CUT_LENGTH'];
+
+/** Cuts per piece for each cut section on these bars: Map blankId -> number. */
+export function cutsFromBars(bars, settings = {}) {
+  const kerf = Number(settings.sawKerfMm ?? 0);
+  const total = new Map();
+  const pieces = new Map();
+  for (const b of bars ?? []) {
+    const cuts = [...(b.cuts ?? [])].sort((x, y) => x.xMm - y.xMm);
+    cuts.forEach((cut, j) => {
+      const id = Number(cut.cutPieceId);
+      let n = 1;
+      if (j === cuts.length - 1 && Number(b.lengthMm) - (Number(cut.xMm) + Number(cut.lengthMm)) <= kerf + 0.5) n = 0;   // ends at the bar's end
+      if (j === 0 && Number(cut.xMm) > 0.5) n += 1;                                                                        // the bar end trimmed first
+      total.set(id, (total.get(id) ?? 0) + n);
+      pieces.set(id, (pieces.get(id) ?? 0) + 1);
+    });
+  }
+  const out = new Map();
+  for (const [id, n] of total) out.set(id, r3(n / pieces.get(id)));
+  return out;
+}
+
+/**
+ * Puts CUTS, CUT_ACROSS and CUT_LENGTH on the survey's cut sections. bars: the
+ * line's nest (every bar), or null for none (1 cut per piece). Returns how
+ * many values were written.
+ */
+export async function writeSectionCuts(db, c, survey, bars) {
+  const companyId = c.companyId;
+  const blanks = [...survey.blanks.values()].filter((b) => b.stockItemId);
+  if (!blanks.length) return 0;
+  const [specs] = await db.query('SELECT id, UPPER(code) AS code, default_uom FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN (?)', [companyId, CUT_SPECS]);
+  const spec = new Map(specs.map((s) => [s.code, s]));
+  if (CUT_SPECS.some((k) => !spec.has(k))) return 0;
+  const fromNest = bars && bars.length ? cutsFromBars(bars, survey.settings) : null;
+  const want = [];
+  for (const b of blanks) {
+    const across = survey.stockById.get(Number(b.stockItemId))?.steel?.cutAcross;
+    const cuts = fromNest?.has(b.id) ? fromNest.get(b.id) : 1;
+    want.push({ id: b.id, code: 'CUTS', value: cuts, source: 'entered' });
+    if (across > 0) {
+      want.push({ id: b.id, code: 'CUT_ACROSS', value: r3(across), source: 'entered' });
+      want.push({ id: b.id, code: 'CUT_LENGTH', value: r3(cuts * across), source: 'calculated' });
+    }
+  }
+  const [have] = await db.query(
+    `SELECT subject_id, specification_id, value_number, source FROM cf_spec_values
+      WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND subject_id IN (?) AND specification_id IN (?)`,
+    [companyId, blanks.map((b) => b.id), specs.map((s) => s.id)],
+  );
+  const now = new Map(have.map((h) => [`${h.subject_id}:${h.specification_id}`, h]));
+  const writes = want.filter((w) => {
+    const h = now.get(`${w.id}:${spec.get(w.code).id}`);
+    return !h || h.value_number == null || Math.abs(Number(h.value_number) - w.value) > 1e-6 || h.source !== w.source;
+  });
+  if (!writes.length) return 0;
+  await db.query(
+    `UPDATE cf_spec_values SET deleted_at = NOW()
+      WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND (subject_id, specification_id) IN (${writes.map(() => '(?, ?)').join(', ')})`,
+    [companyId, ...writes.flatMap((w) => [w.id, spec.get(w.code).id])],
+  );
+  await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'uom', 'source', 'created_by'],
+    writes.map((w) => [companyId, spec.get(w.code).id, 'master', w.id, w.value, spec.get(w.code).default_uom ?? null, w.source, c.userId ?? null]));
+  return writes.length;
+}
+
+/** The line's cut sections given their cuts from what is saved: its accepted nest, else 1 per piece. For the derive and setup scripts. */
+export async function syncSectionCuts(db, c, line, { tree = null } = {}) {
+  const survey = await surveySections(db, c.companyId, line, { tree, light: true });
+  if (!survey.blanks.size) return 0;
+  const { byKey } = await savedPlans(db, c.companyId, survey);
+  const bars = byKey ? [...byKey.values()].flat() : [];
+  return writeSectionCuts(db, c, survey, bars.length ? bars : null);
+}
+
 /** POST /accept — plans again (the database decides, not the request) and writes it. */
 export async function acceptSectionNesting(db, c, lineId) {
   const companyId = c.companyId;
@@ -783,6 +880,7 @@ export async function takeBackSectionNesting(db, c, lineId) {
   if (!survey.barLots.length) throw invalid('NOT_NESTED', `Line ${line.line_no} of ${line.order_code} has no accepted section nesting to take back.`);
   const replaced = await clearBarLots(db, c, line.id, survey.barLots);
   const quantities = await chargeStockLines(db, c, survey, []);
+  await writeSectionCuts(db, c, survey, null);
   return { ...(await getSectionNesting(db, companyId, lineId)), takenBack: { lots: replaced, quantities } };
 }
 

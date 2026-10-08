@@ -175,6 +175,42 @@ try {
   ok('the shared cut section serves both parts', (shared?.parts ?? []).length === 2 || (shared?.partCount ?? 0) === 2, JSON.stringify(shared?.parts ?? shared));
   ok('no bracing got a cut plate', !plateBlanks.some((b) => (b.parts ?? []).some((p) => /X-frame|Side bracing|Cross beam/.test(p.role ?? p.name ?? ''))));
   ok('every cut piece has a code', cp.cutPlates.every((b) => b.code));
+
+  // Cuts on the cut sections (section-cutting-setup): CUTS, CUT_ACROSS, CUT_LENGTH = CUTS × CUT_ACROSS.
+  const cutsOf = async (ids) => {
+    const rows = await all(`SELECT v.subject_id, UPPER(s.code) AS code, v.value_number FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id
+      WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?) AND s.code IN ('CUTS', 'CUT_ACROSS', 'CUT_LENGTH')`, [COMPANY, ids]);
+    const out = new Map(ids.map((id) => [Number(id), {}]));
+    for (const r of rows) out.get(Number(r.subject_id))[r.code] = r.value_number == null ? null : Number(r.value_number);
+    return out;
+  };
+  const cutsMatch = (vals) => [...vals.values()].every((v) => v.CUT_ACROSS > 0 && Math.abs(v.CUT_LENGTH - v.CUTS * v.CUT_ACROSS) < 1e-3);
+  /** Cuts per piece a nest implies — counted independently: a cut after every piece that leaves bar behind it, one more for a trimmed start. */
+  const expectedCuts = (bars, kerf) => {
+    const t = new Map(); const n = new Map();
+    for (const b of bars) {
+      const cuts = [...b.cuts].sort((x, y) => x.xMm - y.xMm);
+      cuts.forEach((cut, j) => {
+        const leftAfter = b.lengthMm - (cut.xMm + cut.lengthMm);
+        const k = (j < cuts.length - 1 || leftAfter > kerf + 0.5 ? 1 : 0) + (j === 0 && cut.xMm > 0.5 ? 1 : 0);
+        t.set(cut.cutPieceId, (t.get(cut.cutPieceId) ?? 0) + k); n.set(cut.cutPieceId, (n.get(cut.cutPieceId) ?? 0) + 1);
+      });
+    }
+    return new Map([...t].map(([id, x]) => [id, Math.round((x / n.get(id)) * 1000) / 1000]));
+  };
+  const nestCutsOk = async (bars, kerf) => {
+    const want = expectedCuts(bars, kerf);
+    const vals = await cutsOf([...want.keys()]);
+    return { ok: [...want].every(([id, x]) => Math.abs((vals.get(id)?.CUTS ?? -1) - x) < 1e-6) && cutsMatch(vals), want: [...want], got: [...vals].map(([id, v]) => [id, v.CUTS, v.CUT_LENGTH]) };
+  };
+
+  const before = await cutsOf(sectionBlanks.map((b) => b.id));
+  ok('before nesting every cut section has 1 cut per piece', [...before.values()].every((v) => v.CUTS === 1), JSON.stringify([...before]));
+  ok('…its length of one cut comes from its bar, and cut length = cuts × that', cutsMatch(before), JSON.stringify([...before]));
+  const a75Blank = sectionBlanks.find((b) => /75/.test(b.section?.code ?? ''));
+  if (a75Blank) ok('an ISA 75 × 75 × 8 cut is 75 + 75 − 8 = 142 mm across', before.get(a75Blank.id)?.CUT_ACROSS === 142, JSON.stringify(before.get(a75Blank.id)));
+  const [[cutFlowRow]] = await db.query("SELECT COUNT(*) AS n FROM cf_master_records m JOIN cf_operation_flows f ON f.id = m.default_flow_id WHERE m.id IN (?) AND f.code = 'CG-CUTSECTION'", [sectionBlanks.map((b) => b.id)]);
+  ok('cut sections are made by gas cutting (CG-CUTSECTION)', Number(cutFlowRow.n) === sectionBlanks.length, String(cutFlowRow.n));
   console.log('    cut piece codes:', cp.cutPlates.map((b) => b.code).join('  '));
 
   /* ---------------------------------------------------------------- 4. confirm + freeze */
@@ -217,6 +253,9 @@ try {
   let sview = await SNEST.getSectionNesting(db, COMPANY, LINE);
   ok('the section nest is accepted', sview.accepted === true);
   const settings = sview.settings;
+  const kerfMm = Number(settings?.sawKerfMm ?? 0);
+  let nc = await nestCutsOk(sview.profiles.flatMap((p) => p.plan?.bars ?? []), kerfMm);
+  ok('the nest sets each cut section\'s cuts per piece, and its cut length follows', nc.ok, JSON.stringify(nc));
   for (const p of sview.profiles) {
     const need = new Map(p.pieces.map((x) => [x.cutPieceId, x.quantity]));
     const got = new Map();
@@ -354,6 +393,8 @@ try {
   sview = await SNEST.getSectionNesting(db, COMPANY, LINE);
   const barsNow = sview.profiles.flatMap((p) => p.plan?.bars ?? []);
   ok(`the line now holds the uploaded bars (${barsNow.length})`, barsNow.length === newBars.length && barsNow.every((b) => newBars.some((x) => x.stock === b.itemCode)), `${barsNow.length} vs ${newBars.length}`);
+  nc = await nestCutsOk(barsNow, kerfMm);
+  ok('an UPLOADED nest sets the cuts the same way', nc.ok, JSON.stringify(nc));
   ok('…and the plate nests were not touched by the bar upload', (await all("SELECT id FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND kind = 'plate' AND deleted_at IS NULL", [COMPANY, LINE])).length === newRows.length);
   // A broken sheet is refused: one cut missing.
   const bad = await readBook(Buffer.from(sFile, 'base64'));

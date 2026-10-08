@@ -93,6 +93,7 @@ import { ancestors } from './tree.js';
 import { resolve as resolveSpecs, rawOf, dateText } from './resolutionService.js';
 import { temporaryTree } from './instantiationService.js';
 import { requireUsableFlow, cutPlateFlowId, cutSectionFlowId } from './flowService.js';
+import { syncSectionCuts } from './sectionNestingService.js';
 import { readLineValues, materializeLineRecords } from './orderValuesService.js';
 import { readRulesOnce, PLACED, rangesOf } from './codeRangeService.js';
 import { generate } from '../modules/codegen/index.js';
@@ -1687,6 +1688,8 @@ async function applyPlan(db, c, { line, places, selection, flowId, state, plan }
   //    walked until nothing moves. New blanks before the parts above them.
   const settle = [...run.flatMap((m) => m.plan.groups.map((x) => x.cp.id)), ...run.flatMap((m) => (m.desc.kind === 'plate' ? state.plate : state.section).parts.map((p) => p.id))];
   await materializeLineRecords(db, c, line.id, settle);
+  // 7b. New cut sections: their cuts and cut length (sectionNestingService.writeSectionCuts).
+  if (run.some((m) => m.kind === 'section')) await syncSectionCuts(db, c, line);
 
   // 8. Names and codes for the new blanks — a code may print a value.
   for (const m of run) {
