@@ -39,6 +39,7 @@
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { loadMaster } from './records.js';
 import { nextRevision } from '../lib/revision.js';
+import { syncRecordsUsingFlows } from './flowSpecService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const TRANSITIONS = { draft: ['active'], active: ['obsolete'], obsolete: ['active'] };
@@ -315,6 +316,7 @@ export async function addStep(db, c, flowId, input = {}) {
     'INSERT INTO cf_operation_flow_steps (company_id, flow_id, sequence, operation_id, step_name, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [c.companyId, flowId, sequence, op.id, stepName, blank(input.notes) ? null : String(input.notes), c.userId],
   );
+  await syncRecordsUsingFlows(db, c, [flowId]);
   return getFlow(db, c.companyId, flowId);
 }
 
@@ -348,6 +350,7 @@ export async function updateStep(db, c, stepId, input = {}) {
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_operation_flow_steps SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, stepId]);
+    if (sets.operation_id) await syncRecordsUsingFlows(db, c, [step.flow_id]);
   }
   return getFlow(db, c.companyId, step.flow_id);
 }
@@ -448,6 +451,7 @@ export async function replaceStepOperation(db, c, stepId, input = {}) {
   const [[waits]] = await db.query(
     'SELECT COUNT(*) AS n FROM cf_step_wait_rules WHERE company_id = ? AND target_operation_id = ? AND deleted_at IS NULL', [c.companyId, step.operation_id],
   );
+  await syncRecordsUsingFlows(db, c, [step.flow_id]);
   return {
     flow: await getFlow(db, c.companyId, step.flow_id),
     replaced: {
@@ -507,6 +511,7 @@ export async function removeStep(db, c, stepId) {
   if (step.flow_status === 'obsolete') throw invalid('OBSOLETE', `${step.flow_code} is obsolete — reactivate it to change its steps.`);
   await db.query('UPDATE cf_step_wait_rules SET deleted_at = NOW() WHERE company_id = ? AND flow_step_id = ? AND deleted_at IS NULL', [c.companyId, stepId]);
   await db.query('UPDATE cf_operation_flow_steps SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, stepId]);
+  await syncRecordsUsingFlows(db, c, [step.flow_id]);
   return getFlow(db, c.companyId, step.flow_id);
 }
 

@@ -26,6 +26,7 @@ import { bomOfParent, deleteBomOf, placementOf } from './bomGraph.js';
 import { nextRevision } from '../lib/revision.js';
 import { wantsPage, pageArgs, orderBy, likeOf, pageOf } from '../lib/listing.js';
 import { requireUsableFlow } from './flowService.js';
+import { syncFlowSpecs, flowSpecWords } from './flowSpecService.js';
 import { readPrice, readBasis, readCurrency } from './priceService.js';
 import { readItemTax } from './taxService.js';
 import { writeEntries, addEntry, entryCount, deleteSelectionRules } from './selectionService.js';
@@ -436,7 +437,15 @@ export async function updateRecord(db, c, id, input = {}) {
   } else if ((moved || detail.tracked_by) && m.record_kind === 'item') {
     await materialize(db, c, id);
   }
-  return getRecord(db, c.companyId, id);
+  // A new flow: the values its operations read become required on the record (flowSpecService).
+  let flowSpecs = null;
+  if (sets.default_flow_id !== undefined && Number(sets.default_flow_id ?? 0) !== Number(m.default_flow_id ?? 0)) {
+    const r = await syncFlowSpecs(db, c, [id]);
+    flowSpecs = { ...r, words: await flowSpecWords(db, c.companyId, r, id) };
+  }
+  const out = await getRecord(db, c.companyId, id);
+  if (flowSpecs) out.flowSpecs = flowSpecs;
+  return out;
 }
 
 export async function setStatus(db, c, id, status) {

@@ -4849,3 +4849,16 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_machine_rules' AND COLUMN_NAME = 'setup_expression');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_machine_rules ADD COLUMN setup_expression TEXT NULL AFTER setup_formula_id', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §50  A record's flow decides which values it needs (2026-10-08)
+-- ============================================================================
+-- Every item.X an operation's time formula reads becomes a REQUIRED value on
+-- the definition / item whose flow holds that operation, unless its chain
+-- already gives it (services/flowSpecService.js). Those rules are marked
+-- origin 'flow' so they can be taken away again when the flow stops reading
+-- them (only when nobody filled them in); a rule made by hand is 'manual'.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_assignments' AND COLUMN_NAME = 'origin');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_spec_assignments ADD COLUMN origin ENUM('manual','flow') NOT NULL DEFAULT 'manual' AFTER sort_order", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

@@ -27,6 +27,7 @@ import { findCandidates, isCutPlateRecord, NOT_UNDER_CUT_PLATE_WHERE } from './s
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
+import { syncFlowSpecs, flowSpecWords } from './flowSpecService.js';
 import { readMasters, cutFromDetailOf, cutStockOf, sectionSteelOf } from '../lib/cutFrom.js';
 
 export const ALLOWED_CHILDREN = {
@@ -249,7 +250,17 @@ export async function addLine(db, c, parentId, input = {}) {
   // already worked out by the copy (instantiationService), so only the parent
   // is refreshed here — it walks up from there as far as anything moves.
   await refreshValues(db, c, [parent.id]);
-  return getBom(db, c.companyId, parent.id);
+  // A line that names its own flow: the row it holds needs what that flow reads (flowSpecService).
+  let flowSpecs = null;
+  if (operationFlowId != null) {
+    const [rows] = await db.query('SELECT DISTINCT child_id FROM cf_bom_lines WHERE company_id = ? AND bom_id = ? AND operation_flow_id = ? AND deleted_at IS NULL', [c.companyId, bom.id, operationFlowId]);
+    const r = await syncFlowSpecs(db, c, rows.map((x) => Number(x.child_id)));
+    const words = r.added.length ? await flowSpecWords(db, c.companyId, { added: r.added.map((x) => ({ ...x, recordId: 0 })) }, 0) : null;
+    flowSpecs = { ...r, words };
+  }
+  const out = await getBom(db, c.companyId, parent.id);
+  if (flowSpecs) out.flowSpecs = flowSpecs;
+  return out;
 }
 
 async function requireLine(db, companyId, lineId) {
@@ -315,6 +326,10 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
       [...Object.values(sets), c.companyId, lineId]);
     out.values = sets.quantity !== undefined && sets.quantity !== Number(line.quantity);
   }
+  if (sets.operation_flow_id !== undefined && Number(sets.operation_flow_id ?? 0) !== Number(line.operation_flow_id ?? 0)) {
+    const r = await syncFlowSpecs(db, c, [line.child_id]);
+    out.flowSpecs = { ...r, words: await flowSpecWords(db, c.companyId, r, line.child_id) };
+  }
   return out;
 }
 
@@ -322,7 +337,9 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
 export async function updateLine(db, c, lineId, input = {}) {
   const w = await writeLineUpdate(db, c, lineId, input);
   if (w.values) await refreshValues(db, c, [w.parentId]);
-  return getBom(db, c.companyId, w.parentId);
+  const bom = await getBom(db, c.companyId, w.parentId);
+  if (w.flowSpecs) bom.flowSpecs = w.flowSpecs;
+  return bom;
 }
 
 /**

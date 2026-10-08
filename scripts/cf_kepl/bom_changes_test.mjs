@@ -701,6 +701,8 @@ try {
   // cost less than that — it is written, and waits for the one refresh.
   section('10b. Quantities under one parent share one refresh');
   const rt = async (changes) => { const m = meter(conn); await run(changes); m.stop(); return m.m.total; };
+  // A NEW flow also brings its values onto the row (flowSpecService) — so the baseline re-saves the same flow, which writes only.
+  await run([{ op: 'flow', lineId: flg1().lineId, flowId: f.flows.FLW1 }]);
   const oneFlow = await rt([{ op: 'flow', lineId: flg1().lineId, flowId: f.flows.FLW1 }]);
   const oneQty = await rt([{ op: 'quantity', lineId: flg1().lineId, quantity: 4 }]);
   const twoQty = await rt([{ op: 'quantity', lineId: flg1().lineId, quantity: 6 }, { op: 'quantity', lineId: web1().lineId, quantity: 2 }]);

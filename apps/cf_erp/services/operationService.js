@@ -17,6 +17,7 @@ import { ancestors, levelName, loadNode, LEAF_DEPTH } from './tree.js';
 import { loadMaster, requireMachine, loadMachine } from './records.js';
 import { resolve, effectiveByCode, dateText } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
+import { syncRecordsUsingOperation } from './flowSpecService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -310,6 +311,7 @@ export async function createTimingRule(db, c, operationId, input = {}) {
       body.work_minutes, body.work_formula_id, body.work_expression, body.effective_from, body.effective_to, body.notes, c.userId],
   );
   clearProductionMachines(c.companyId);
+  await syncRecordsUsingOperation(db, c, operationId);
   return (await listTimingRules(db, c.companyId, operationId)).find((x) => x.id === r.insertId);
 }
 
@@ -334,6 +336,7 @@ export async function updateTimingRule(db, c, id, input = {}) {
       body.effective_from, body.effective_to, body.notes, c.companyId, id],
   );
   clearProductionMachines(c.companyId);
+  await syncRecordsUsingOperation(db, c, rule.operation_id);
   return (await listTimingRules(db, c.companyId, rule.operation_id)).find((x) => x.id === id);
 }
 
@@ -341,6 +344,7 @@ export async function deleteTimingRule(db, c, id) {
   await requireRule(db, c.companyId, id);
   await db.query('UPDATE cf_operation_machine_rules SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   clearProductionMachines(c.companyId);
+  await syncRecordsUsingOperation(db, c, (await db.query('SELECT operation_id FROM cf_operation_machine_rules WHERE company_id = ? AND id = ?', [c.companyId, id]))[0][0].operation_id);
   return { ok: true };
 }
 
