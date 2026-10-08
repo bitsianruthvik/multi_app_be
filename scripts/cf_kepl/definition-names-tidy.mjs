@@ -35,6 +35,7 @@ const EXACT = {
   TSL: 'Top stiffener (left)', TSR: 'Top stiffener (right)',
   HTL: 'Hanger support top stiffener (left)', HTR: 'Hanger support top stiffener (right)',
   CGS: 'Centre gusset',
+  SPL: 'Bow string splice plate',
 };
 
 export function tidyName(name, code = null) {
