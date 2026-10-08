@@ -52,6 +52,8 @@ import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 import { startRun, currentRun, dismissRun } from '../services/nestRunService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
+// Part shapes (init.sql §51): a plate part's DXF, matched to its rows by drawing mark.
+import { getDrawings, uploadDrawings, deleteDrawing } from '../services/partDrawingService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -128,6 +130,15 @@ router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (r
 // not fit our rules (or a cut plate over-covered) needs `force: true`.
 router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
   handle((req) => write(req, (db, c, id) => importSheet(db, c, id, req.body ?? {}))));
+
+// PART SHAPES — DXF per plate part, matched by drawing mark. A dry run reads and matches and
+// writes nothing; saving also refreshes the line's cut plates' cut length and piercings.
+router.get('/orders/:orderId/lines/:lineId/drawings', view,
+  handle((req) => read(req, (db, companyId, id) => getDrawings(db, companyId, null, id))));
+router.post('/orders/:orderId/lines/:lineId/drawings', manage,
+  handle((req) => write(req, (db, c, id) => uploadDrawings(db, c, null, id, req.body ?? {}))));
+router.delete('/orders/:orderId/lines/:lineId/drawings/:drawingId', manage,
+  handle((req) => write(req, (db, c, id) => deleteDrawing(db, c, null, id, intParam(req.params.drawingId, 'drawingId')))));
 
 /** A file out: the buffer, its type, and a download name. */
 const sendFile = (res, out, type) => {

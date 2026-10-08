@@ -15,19 +15,29 @@
  *               average over its pieces on every nest of the line.
  *   PIERCINGS   one per piece (each piece is a contour of its own; holes are drilled, not cut).
  *
+ * PART DRAWINGS (drawingService, init.sql §51). Where the parts a cut plate is cut for have DXF
+ * drawings, a piece's own cut is the drawing's — outline plus cut-outs, not the rectangle's
+ * perimeter — its piercings are 1 + cut-outs, and a shared cut only saves the share of the side
+ * the outline really runs along (a gusset's sloping edge shares nothing with its neighbour).
+ * Averaged over the pieces of the cut plate, parts without a drawing counted as rectangles.
+ *
  * Written straight onto the cut plates: nesting runs on a FROZEN line, whose records keep what
  * they hold (valueService.materialize works nothing out there). A cut plate on no nest goes back
  * to its own perimeter. A value that would not change is not written. Two reads and at most two
  * writes, whatever the size of the line.
  */
 import { insertRows } from '../lib/db.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
+import { drawingFactsOfLine } from './partDrawingService.js';
 
 const r3 = (n) => Math.round(Number(n) * 1000) / 1000;
 const TOL = 0.5;
 
 /**
  * Pure: the cut length of every piece on one plate. pieces: [{ key, x, y, length, width }] with
- * length along x and width along y as placed (null x/y = no layout). Returns Map key -> mm.
+ * length along x and width along y as placed (null x/y = no layout). Optional per piece:
+ * base (its own cut, else its perimeter), coverX / coverY (share of its sides along x / along y
+ * that are really cut straight, else 1). Returns Map key -> mm.
  */
 export function cutLengthsOnPlate(pieces, kerf = 0) {
   const k = Math.max(0, Number(kerf) || 0);
@@ -36,9 +46,9 @@ export function cutLengthsOnPlate(pieces, kerf = 0) {
   for (const p of pieces) {
     const l = Number(p.length);
     const w = Number(p.width);
-    out.set(p.key, 2 * (l + w));
+    out.set(p.key, p.base != null ? Number(p.base) : 2 * (l + w));
     if (p.x != null && p.y != null && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y))) {
-      laid.push({ key: p.key, x0: Number(p.x), y0: Number(p.y), x1: Number(p.x) + l, y1: Number(p.y) + w });
+      laid.push({ key: p.key, x0: Number(p.x), y0: Number(p.y), x1: Number(p.x) + l, y1: Number(p.y) + w, cx: p.coverX ?? 1, cy: p.coverY ?? 1 });
     }
   }
   const touching = (gap) => gap >= -TOL && gap <= k + TOL;
@@ -51,8 +61,9 @@ export function cutLengthsOnPlate(pieces, kerf = 0) {
       const b = laid[j];
       if (b.x0 > a.x1 + k + TOL) break;
       let shared = 0;
-      if (touching(b.x0 - a.x1) || touching(a.x0 - b.x1)) shared += overlap(a.y0, a.y1, b.y0, b.y1);   // side by side
-      if (touching(b.y0 - a.y1) || touching(a.y0 - b.y1)) shared += overlap(a.x0, a.x1, b.x0, b.x1);   // one above the other
+      // A shared edge saves only what both outlines really run along: the sides along y for pieces side by side, along x when stacked.
+      if (touching(b.x0 - a.x1) || touching(a.x0 - b.x1)) shared += overlap(a.y0, a.y1, b.y0, b.y1) * Math.min(a.cy, b.cy);   // side by side
+      if (touching(b.y0 - a.y1) || touching(a.y0 - b.y1)) shared += overlap(a.x0, a.x1, b.x0, b.x1) * Math.min(a.cx, b.cx);   // one above the other
       if (shared > 0) {
         out.set(a.key, out.get(a.key) - shared / 2);
         out.set(b.key, out.get(b.key) - shared / 2);
@@ -82,10 +93,21 @@ export async function writePlateCuts(db, c, orderLineId, cutPlates) {
       WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.kind = 'plate'`,
     [companyId, orderLineId],
   );
+  const facts = await drawingFactsOfLine(db, companyId, orderLineId);
+  const sizeOf = new Map(cutPlates.map((cp) => [Number(cp.id), cp.steel ?? {}]));
   const byLot = new Map();
   for (const r of rows) {
     if (!byLot.has(r.plate_lot_id)) byLot.set(r.plate_lot_id, { kerf: Number(r.kerf_mm) || 0, pieces: [] });
-    byLot.get(r.plate_lot_id).pieces.push({ key: r.id, cutPlateId: Number(r.cut_plate_id), x: r.x_mm, y: r.y_mm, length: r.length_mm, width: r.width_mm });
+    const id = Number(r.cut_plate_id);
+    const f = facts.get(id);
+    const piece = { key: r.id, cutPlateId: id, x: r.x_mm, y: r.y_mm, length: r.length_mm, width: r.width_mm };
+    if (f) {
+      // Laid along its length (x = the cut plate's LENGTH) or turned.
+      const L = Number(sizeOf.get(id)?.length);
+      const along = !(L > 0) || Math.abs(Number(r.length_mm) - L) <= 1;
+      Object.assign(piece, { base: f.cutLengthMm, coverX: along ? f.alongLength : f.alongWidth, coverY: along ? f.alongWidth : f.alongLength });
+    }
+    byLot.get(r.plate_lot_id).pieces.push(piece);
   }
   const sum = new Map();
   const count = new Map();
@@ -94,7 +116,7 @@ export async function writePlateCuts(db, c, orderLineId, cutPlates) {
     const lengths = cutLengthsOnPlate(lot.pieces, lot.kerf);
     for (const p of lot.pieces) {
       const len = lengths.get(p.key);
-      shared += 2 * (Number(p.length) + Number(p.width)) - len;
+      shared += (p.base ?? 2 * (Number(p.length) + Number(p.width))) - len;
       sum.set(p.cutPlateId, (sum.get(p.cutPlateId) ?? 0) + len);
       count.set(p.cutPlateId, (count.get(p.cutPlateId) ?? 0) + 1);
     }
@@ -103,9 +125,13 @@ export async function writePlateCuts(db, c, orderLineId, cutPlates) {
   const want = [];
   for (const cp of cutPlates) {
     const id = Number(cp.id);
+    const f = facts.get(id);
     if (count.has(id)) {
       want.push({ id, code: 'CUT_LENGTH', value: r3(sum.get(id) / count.get(id)), source: 'calculated' });
-      if (spec.has('PIERCINGS')) want.push({ id, code: 'PIERCINGS', value: 1, source: 'entered' });
+      if (spec.has('PIERCINGS')) want.push({ id, code: 'PIERCINGS', value: f ? f.piercings : 1, source: 'entered' });
+    } else if (f) {
+      want.push({ id, code: 'CUT_LENGTH', value: r3(f.cutLengthMm), source: 'calculated' });
+      if (spec.has('PIERCINGS')) want.push({ id, code: 'PIERCINGS', value: f.piercings, source: 'entered' });
     } else {
       const l = Number(cp.steel?.length);
       const w = Number(cp.steel?.width);
@@ -134,4 +160,27 @@ export async function writePlateCuts(db, c, orderLineId, cutPlates) {
       writes.map((w) => [companyId, spec.get(w.code).id, 'master', w.id, w.value, spec.get(w.code).default_uom ?? null, w.source, c.userId ?? null]));
   }
   return { written: writes.length, nested: count.size, shared: r3(shared) };
+}
+
+/** The line's cut plates read from the database (their LENGTH and WIDTH), then writePlateCuts. For drawing uploads and backfills. */
+export async function refreshPlateCuts(db, c, orderLineId) {
+  const companyId = c.companyId;
+  const places = await cutPlaces(db, companyId);
+  const nodes = [...(places.plate?.blanksIds ?? [])];
+  if (!nodes.length) return { written: 0, nested: 0, shared: 0 };
+  const [rows] = await db.query(
+    `SELECT m.id, UPPER(s.code) AS code, v.value_number FROM cf_master_records m
+       JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL AND i.owner_order_line_id = ?
+       LEFT JOIN cf_spec_values v ON v.company_id = m.company_id AND v.subject_type = 'master' AND v.subject_id = m.id AND v.deleted_at IS NULL
+       LEFT JOIN cf_specifications s ON s.id = v.specification_id AND s.code IN ('LENGTH', 'WIDTH')
+      WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.classification_id IN (?)`,
+    [orderLineId, companyId, nodes],
+  );
+  const cps = new Map();
+  for (const r of rows) {
+    if (!cps.has(r.id)) cps.set(r.id, { id: r.id, steel: {} });
+    if (r.code === 'LENGTH') cps.get(r.id).steel.length = Number(r.value_number);
+    if (r.code === 'WIDTH') cps.get(r.id).steel.width = Number(r.value_number);
+  }
+  return writePlateCuts(db, c, orderLineId, [...cps.values()]);
 }

@@ -4862,3 +4862,42 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_assignments' AND COLUMN_NAME = 'origin');
 SET @sql = IF(@col = 0, "ALTER TABLE cf_spec_assignments ADD COLUMN origin ENUM('manual','flow') NOT NULL DEFAULT 'manual' AFTER sort_order", 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §51  Part drawings (2026-10-08)
+-- ============================================================================
+-- A plate part's DXF, uploaded on its order line and matched to the line's
+-- rows by DRAWING MARK (the file name). services/partGeometry.js reads it:
+-- the rectangle around the outline (what nesting lays out), the true area,
+-- the cut length (outline + cut-outs; holes up to 50 mm are drilled) and the
+-- piercings. plateCutsService takes cut length and piercings from here, and a
+-- shared cut only saves the share of a side the outline really runs along.
+-- One live drawing per line and mark; a new upload of the mark replaces it.
+CREATE TABLE IF NOT EXISTS cf_part_drawings (
+  id              INT NOT NULL AUTO_INCREMENT,
+  company_id      INT NOT NULL,
+  order_line_id   INT NOT NULL,
+  mark            VARCHAR(120) NOT NULL,
+  mark_norm       VARCHAR(120) NOT NULL,
+  file_name       VARCHAR(255) NOT NULL,
+  length_mm       DECIMAL(12,3) NOT NULL,
+  width_mm        DECIMAL(12,3) NOT NULL,
+  area_mm2        DECIMAL(16,3) NOT NULL,
+  cut_length_mm   DECIMAL(14,3) NOT NULL,
+  piercings       INT NOT NULL DEFAULT 1,
+  holes           INT NOT NULL DEFAULT 0,
+  inner_cuts      INT NOT NULL DEFAULT 0,
+  geometry_json   MEDIUMTEXT NOT NULL,
+  warnings_json   TEXT NULL,
+  dxf_text        MEDIUMTEXT NULL,
+  deleted_at      DATETIME NULL,
+  created_at      TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT NULL,
+  is_live         TINYINT GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_cpd_tenant (company_id, id),
+  UNIQUE KEY uq_cpd_mark (company_id, order_line_id, mark_norm, is_live),
+  KEY idx_cpd_line (company_id, order_line_id),
+  CONSTRAINT fk_cpd_company FOREIGN KEY (company_id) REFERENCES companies (id),
+  CONSTRAINT fk_cpd_line FOREIGN KEY (order_line_id) REFERENCES cf_sales_order_lines (id)
+);

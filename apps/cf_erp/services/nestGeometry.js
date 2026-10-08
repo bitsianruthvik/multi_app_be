@@ -504,7 +504,9 @@ export function nestToDxf({ lot = {}, pieces = [], offcuts = [] } = {}) {
     if (p?.x == null || p?.y == null) continue;
     const x = Number(p.x); const y = Number(p.y); const l = Number(p.length); const w = Number(p.width);
     if (![x, y, l, w].every(Number.isFinite) || !(l > 0) || !(w > 0)) continue;
-    poly('PARTS', [[x, y], [x + l, y], [x + l, y + w], [x, y + w]]);
+    // A part with a drawing (partDrawingService) is drawn by its true outline, cut-outs and holes, already placed; else its rectangle.
+    if (Array.isArray(p.outline) && p.outline.length) { for (const ring of p.outline) if (ring?.length >= 3) poly('PARTS', ring); }
+    else poly('PARTS', [[x, y], [x + l, y], [x + l, y + w], [x, y + w]]);
     const label = txt(p.code ?? p.cutPlateCode ?? p.cut_plate_code ?? '');
     if (label) {
       const h = Math.max(2, Math.min(50, Math.min(l, w) * 0.25, (l * 0.9) / (label.length * 0.9)));

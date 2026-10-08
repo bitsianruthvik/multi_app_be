@@ -25,6 +25,7 @@
  */
 import JSZip from 'jszip';
 import { notFound, invalid } from '../lib/errors.js';
+import { drawingFactsOfLine } from './partDrawingService.js';
 import { analyseNest, nestToDxf } from './nestGeometry.js';
 
 const DEFAULT_MIN_AREA = 90000;
@@ -69,7 +70,7 @@ async function loadLots(db, companyId, lineId, lotId = null) {
   const ids = lots.map((l) => l.id);
 
   const [placeRows] = await db.query(
-    `SELECT p.plate_lot_id, p.seq_no, p.row_no, p.pos_no, p.x_mm, p.y_mm, p.length_mm, p.width_mm, p.rotated,
+    `SELECT p.plate_lot_id, p.cut_plate_id, p.seq_no, p.row_no, p.pos_no, p.x_mm, p.y_mm, p.length_mm, p.width_mm, p.rotated,
             m.code AS cut_plate_code, m.name AS cut_plate_name
        FROM cf_nest_placements p
        LEFT JOIN cf_master_records m ON m.id = p.cut_plate_id AND m.company_id = p.company_id
@@ -78,8 +79,11 @@ async function loadLots(db, companyId, lineId, lotId = null) {
     [companyId, ids],
   );
   const pieces = new Map(ids.map((id) => [id, []]));
+  // Part shapes (partDrawingService): a cut plate whose pieces all share one drawing is drawn by it.
+  const shapes = await drawingFactsOfLine(db, companyId, lineId);
   for (const p of placeRows) {
     pieces.get(p.plate_lot_id)?.push({
+      outline: placedOutline(shapes.get(Number(p.cut_plate_id))?.rings, p),
       x: p.x_mm == null ? null : Number(p.x_mm),
       y: p.y_mm == null ? null : Number(p.y_mm),
       length: Number(p.length_mm),
@@ -142,6 +146,19 @@ async function offcutThresholds(db, companyId) {
     if (!isMissingColumn(e) && !isMissingTable(e)) throw e;
     return () => ({ minOffcutArea: DEFAULT_MIN_AREA, minOffcutSide: DEFAULT_MIN_SIDE });
   }
+}
+
+/**
+ * A drawing's rings (x along the cut plate's length, origin at its corner) put where the piece
+ * sits: as drawn when the footprint runs along its length, else turned a quarter. Null without
+ * a layout or a drawing.
+ */
+function placedOutline(rings, p) {
+  if (!rings?.length || p.x_mm == null || p.y_mm == null) return null;
+  const x0 = Number(p.x_mm); const y0 = Number(p.y_mm);
+  const ext = rings[0].reduce((m, [x, y]) => [Math.max(m[0], x), Math.max(m[1], y)], [0, 0]);
+  const along = Math.abs(Number(p.length_mm) - ext[0]) <= Math.abs(Number(p.length_mm) - ext[1]);
+  return rings.map((ring) => ring.map(([x, y]) => (along ? [x0 + x, y0 + y] : [x0 + (ext[1] - y), y0 + x])));
 }
 
 const hasLayout = (pcs) => pcs.length > 0 && pcs.every((p) => p.x != null && p.y != null);
