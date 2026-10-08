@@ -102,6 +102,7 @@ import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 import { analyseNest } from './nestGeometry.js';
 import { availability } from './rollOutService.js';
 import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
+import { writePlateCuts } from './plateCutsService.js';
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -2065,7 +2066,10 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   const quantities = await replaceAreaFractions(db, c, where, [...imported.lots, ...toWrite], blanks);
   const backToNesting = await backToChosenAtNesting(db, companyId, where,
     leftOutWasOn.filter((id) => !(imported.counts.get(id) > 0)));
+  // CNC inputs from the nest: cut length less common lines, piercings (plateCutsService).
+  const cuts = await writePlateCuts(db, c, orderLineId, cutPlates);
   return {
+    cuts,
     line: lineHead(line),
     choices: choiceSummary(cutPlates, plates, excl),
     leftOutBackToNesting: backToNesting,
@@ -2898,7 +2902,9 @@ export async function saveImportedNests(db, c, orderLineId, ctx, checked) {
   const quantities = await replaceAreaFractions(db, c, ctx.where,
     toWrite.map((l) => ({ plate: l.plate, pieces: l.pieces })), blanks,
     { restore: { cutPlates: ctx.cutPlates, plateById } });
+  const cuts = await writePlateCuts(db, c, orderLineId, ctx.cutPlates);
   return {
+    cuts,
     replacedLots: replaced,
     lots: written.length,
     pieces: written.reduce((a, l) => a + l.pieces, 0),

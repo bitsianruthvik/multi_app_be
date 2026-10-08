@@ -245,6 +245,37 @@ try {
   const needPlates = (PLATES ? Object.entries({ 'Top chord flange': 2, 'Main web': 1, Stiffener: 6, Gusset: 4, 'Bearing pad': 2 }).reduce((t, [, q]) => t + q * 2, 0) : 0);
   ok(`every plate piece placed (${cover.placed} of ${needPlates})`, Number(cover.placed) === needPlates);
 
+  // CNC inputs from the plate nest (plateCutsService), checked against an independent count:
+  // perimeter less half of each edge shared with a piece one kerf away.
+  const plateCutsOk = async () => {
+    const pl = await all(`SELECT p.plate_lot_id, p.cut_plate_id, p.x_mm x, p.y_mm y, p.length_mm l, p.width_mm w, lt.kerf_mm k FROM cf_nest_placements p
+      JOIN cf_plate_lots lt ON lt.id = p.plate_lot_id WHERE lt.order_line_id = ? AND lt.kind = 'plate' AND lt.deleted_at IS NULL AND p.deleted_at IS NULL`, [LINE]);
+    const sum = new Map(); const n = new Map(); let sharedAny = false;
+    for (const a of pl) {
+      let len = 2 * (Number(a.l) + Number(a.w));
+      if (a.x != null) for (const b of pl) {
+        if (b === a || b.plate_lot_id !== a.plate_lot_id || b.x == null) continue;
+        const k = Number(a.k) + 0.5; const [ax, ay, bx, by] = [a.x, a.y, b.x, b.y].map(Number);
+        const ov = (p0, p1, q0, q1) => Math.max(0, Math.min(p1, q1) - Math.max(p0, q0));
+        const g = (v) => v >= -0.5 && v <= k;
+        let sh = 0;
+        if (g(bx - (ax + Number(a.l))) || g(ax - (bx + Number(b.l)))) sh += ov(ay, ay + Number(a.w), by, by + Number(b.w));
+        if (g(by - (ay + Number(a.w))) || g(ay - (by + Number(b.w)))) sh += ov(ax, ax + Number(a.l), bx, bx + Number(b.l));
+        if (sh > 0) sharedAny = true;
+        len -= sh / 2;
+      }
+      sum.set(a.cut_plate_id, (sum.get(a.cut_plate_id) ?? 0) + len); n.set(a.cut_plate_id, (n.get(a.cut_plate_id) ?? 0) + 1);
+    }
+    const ids = [...sum.keys()];
+    const vals = ids.length ? await all(`SELECT v.subject_id, UPPER(s.code) code, v.value_number FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id
+      WHERE v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?) AND s.code IN ('CUT_LENGTH', 'PIERCINGS')`, [ids]) : [];
+    const got = new Map(); for (const v of vals) got.set(`${v.subject_id}:${v.code}`, Number(v.value_number));
+    const bad = ids.filter((id) => Math.abs((got.get(`${id}:CUT_LENGTH`) ?? -1) - Math.round((sum.get(id) / n.get(id)) * 1000) / 1000) > 1e-3 || got.get(`${id}:PIERCINGS`) !== 1);
+    return { ok: ids.length > 0 && bad.length === 0, sharedAny, bad: bad.map((id) => [id, got.get(`${id}:CUT_LENGTH`), sum.get(id) / n.get(id)]) };
+  };
+  let pc = await plateCutsOk();
+  ok(`the plate nest sets each cut plate's cut length (common lines taken off${pc.sharedAny ? ', some shared here' : ''}) and piercings`, pc.ok, JSON.stringify(pc));
+
   /* ---------------------------------------------------------------- 6. section nesting */
   section('6. Section nesting');
   const splan = await SNEST.planSectionNesting(db, COMPANY, LINE);
@@ -340,6 +371,8 @@ try {
   ok('preview: it can be saved', pDry.canSave === true);
   const pSaved = await NSHEET.importSheet(db, c, LINE, { file: pFile, dryRun: false, force: !!pDry.needsForce });
   ok('saved', pSaved.applied === true, JSON.stringify(pSaved).slice(0, 400));
+  pc = await plateCutsOk();
+  ok('an UPLOADED plate nest sets them the same way', pc.ok, JSON.stringify(pc));
   const lotsAfter = await all("SELECT lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND kind = 'plate' AND deleted_at IS NULL", [COMPANY, LINE]);
   ok(`the line now holds the uploaded nests (${lotsAfter.length} lots)`, lotsAfter.length === newRows.length, `${lotsAfter.length} vs ${newRows.length}`);
   ok('…and the bars were not touched by the plate upload', (await all("SELECT id FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND kind = 'bar' AND deleted_at IS NULL", [COMPANY, LINE])).length === barLots.length);
