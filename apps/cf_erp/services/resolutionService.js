@@ -37,7 +37,7 @@
  * delivered. `frozen` on the result names the order.
  */
 import { ancestors, levelName } from './tree.js';
-import { loadMaster, frozenBy, LIVE_WHEN_FROZEN } from './records.js';
+import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, WORKED_OUT_SPECS, WORKED_OUT_WHY } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
 
@@ -458,6 +458,12 @@ export async function resolve(db, companyId, { master = null, machine = null, no
 
 export function publicResolution(r) {
   const { internal, ...rest } = r;
+  // On an item, a value cutting and nesting write reads as worked out (records.WORKED_OUT_SPECS).
+  if (rest.mode === 'item' && Array.isArray(rest.specs)) {
+    rest.specs = rest.specs.map((s) => (WORKED_OUT_SPECS.has(String(s.spec?.code ?? '').toUpperCase()) && ['entered', 'defaulted'].includes(s.rule?.valueRule)
+      ? { ...s, rule: { ...s.rule, valueRule: 'calculated', workedOut: WORKED_OUT_WHY } }
+      : s));
+  }
   return rest;
 }
 

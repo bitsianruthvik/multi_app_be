@@ -122,6 +122,18 @@ export const flowStillOpen = (frozen) => frozen?.reason === 'locked';
 export const AFTER_LOCK_SPECS = new Set(['NEST_MANUAL']);
 
 /**
+ * Values on an ITEM that nobody types: cutting and nesting work them out and
+ * write them (user, 2026-10-08 — "make them read-only"). CUTS and CUT_ACROSS on
+ * a cut section (sectionNestingService.writeSectionCuts), PIERCINGS on a cut
+ * plate (plateCutsService). Their rules stay 'entered' / 'defaulted' so the
+ * stored value is kept; every screen is told they are worked out, and a typed
+ * write of one is refused. A setup screen (a classification's default) is not
+ * an item and still takes them.
+ */
+export const WORKED_OUT_SPECS = new Set(['CUTS', 'CUT_ACROSS', 'PIERCINGS']);
+export const WORKED_OUT_WHY = 'Worked out by cutting and nesting — from the section, the cut piece and the nest.';
+
+/**
  * Values a FROZEN record still works out from its chain, as if it were live.
  * A frozen record normally shows only what it holds, so a later setup change
  * cannot alter what was locked or delivered. SHIP_UNIT (init.sql §31) is

@@ -211,6 +211,12 @@ try {
   if (a75Blank) ok('an ISA 75 × 75 × 8 cut is 75 + 75 − 8 = 142 mm across', before.get(a75Blank.id)?.CUT_ACROSS === 142, JSON.stringify(before.get(a75Blank.id)));
   const [[cutFlowRow]] = await db.query("SELECT COUNT(*) AS n FROM cf_master_records m JOIN cf_operation_flows f ON f.id = m.default_flow_id WHERE m.id IN (?) AND f.code = 'CG-CUTSECTION'", [sectionBlanks.map((b) => b.id)]);
   ok('cut sections are made by gas cutting (CG-CUTSECTION)', Number(cutFlowRow.n) === sectionBlanks.length, String(cutFlowRow.n));
+  // Worked out, not typed (records.WORKED_OUT_SPECS): every screen sees them read-only, a typed save is refused.
+  const spx = await MR.getRecordSpecs(db, COMPANY, sectionBlanks[0].id);
+  const cutsSpec = (spx.specs ?? []).find((x) => x.spec.code === 'CUTS');
+  ok('Cuts on a cut section reads as worked out, not typeable', cutsSpec?.rule?.valueRule === 'calculated' && !!cutsSpec.rule.workedOut, JSON.stringify(cutsSpec?.rule));
+  const typed = await V.setValues(db, c, 'master', sectionBlanks[0].id, [{ specCode: 'CUTS', value: 3 }]).then(() => null, (e) => e);
+  ok('…and typing Cuts is refused in words', !!typed && /worked out by cutting and nesting/.test(JSON.stringify(typed.problems ?? typed.message)), JSON.stringify(typed?.problems ?? typed?.message));
   console.log('    cut piece codes:', cp.cutPlates.map((b) => b.code).join('  '));
 
   /* ---------------------------------------------------------------- 4. confirm + freeze */

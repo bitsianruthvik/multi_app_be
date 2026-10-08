@@ -24,7 +24,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
-import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS } from './records.js';
+import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, WORKED_OUT_SPECS } from './records.js';
 import { resolve, dateText, tableSummary } from './resolutionService.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
@@ -498,6 +498,7 @@ export async function setValues(db, c, subjectType, subjectId, entries = []) {
       const rule = rules.get(spec.id);
       if (!rule || !rule.applicable) { problems.push(`${spec.code} is not part of this ${machine ? 'machine' : 'item'}'s setup.`); continue; }
       const vr = rule.rule.valueRule;
+      if (master && WORKED_OUT_SPECS.has(String(spec.code).toUpperCase())) { problems.push(`${spec.code} is worked out by cutting and nesting — it cannot be typed in.`); continue; }
       if (vr === 'fixed') { problems.push(`${spec.code} is fixed at ${rule.definedAt.level.toLowerCase()} level — change it there.`); continue; }
       if (['calculated', 'rollup', 'inherited'].includes(vr)) { problems.push(`${spec.code} is ${vr} — it cannot be typed in.`); continue; }
       if (rule.options) allowed = new Set(rule.options.map((o) => o.id));

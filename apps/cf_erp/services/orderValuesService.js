@@ -80,7 +80,7 @@
  *           its usual per-record cost for them.
  */
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
+import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, WORKED_OUT_SPECS, WORKED_OUT_WHY, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol } from './resolutionService.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
@@ -1136,9 +1136,10 @@ function buildView(ctx) {
     const full = new Map();
     let missing = 0;
     for (const s of applicable) {
-      const typeable = s.spec.dataType !== 'table' && ['entered', 'defaulted'].includes(s.rule.valueRule);
+      const workedOut = WORKED_OUT_SPECS.has(String(s.spec.code).toUpperCase());
+      const typeable = !workedOut && s.spec.dataType !== 'table' && ['entered', 'defaulted'].includes(s.rule.valueRule);
       const cell = {
-        rule: s.rule.valueRule,
+        rule: workedOut ? 'calculated' : s.rule.valueRule,
         required: s.rule.isRequired,
         typeable,
         input: typeable ? ownInput(s) : '',
@@ -1146,7 +1147,7 @@ function buildView(ctx) {
         display: typeable ? null : s.value?.display ?? null,
         defaultDisplay: s.rule.valueRule === 'defaulted' && s.value && s.value.source !== 'entered' ? s.value.display : null,
         missing: s.status === 'missing',
-        why: typeable ? null : whyReadOnly(s),
+        why: typeable ? null : workedOut ? WORKED_OUT_WHY : whyReadOnly(s),
         problem: s.problem ?? null,
         note: s.note ?? s.conflict ?? null,
         options: s.spec.dataType === 'option' && s.options ? optionsKey(s) : null,
@@ -1395,6 +1396,7 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       continue;
     }
     const vr = s.rule.valueRule;
+    if (WORKED_OUT_SPECS.has(String(s.spec.code).toUpperCase())) { say(rec, s.spec.code, 'is worked out by cutting and nesting — it cannot be typed in.'); continue; }
     if (vr === 'fixed') { say(rec, s.spec.code, `is fixed at ${s.definedAt.level.toLowerCase()} level — change it there.`); continue; }
     if (READ_ONLY_RULES.includes(vr)) { say(rec, s.spec.code, `is ${vr === 'rollup' ? 'a roll-up' : vr} — it cannot be typed in.`); continue; }
     // A table (a chart) is shown here as a summary but never edited from the
