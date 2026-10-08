@@ -16,7 +16,7 @@
 
 
 -- ############################################################################
--- ## 1. FEATURES — the thirteen permission tags of plan §6                  ##
+-- ## 1. FEATURES — the fourteen permission tags of plan §6                  ##
 -- ############################################################################
 -- These must match lib/http.js PERM exactly. `type` is 'frontend' for a tag the
 -- UI gates a screen on and 'backend' for one that guards a write; the platform
@@ -37,7 +37,13 @@ SELECT x.feature_name, x.feature_tag, x.type
     SELECT 'CF HRMS: view leave balances and requests',       'cf_hrms_leave_view',          'frontend' UNION ALL
     SELECT 'CF HRMS: manage leave types, balances and approvals', 'cf_hrms_leave_manage',    'backend'  UNION ALL
     SELECT 'CF HRMS: generate JD and responsibility profiles','cf_hrms_documents_generate',  'backend'  UNION ALL
-    SELECT 'CF HRMS: run the org-chart import',               'cf_hrms_import_manage',       'backend'
+    SELECT 'CF HRMS: run the org-chart import',               'cf_hrms_import_manage',       'backend'  UNION ALL
+    -- The employee self view. 'frontend' because it gates a SCREEN, and because
+    -- authController only copies frontend tags into the JWT from the company
+    -- role — a 'backend' tag here would never reach `uiPermissions` for a user
+    -- whose grant is company-wide rather than app-scoped, and the screen would
+    -- be invisible to the very person it exists for.
+    SELECT 'CF HRMS: see your own place in the organisation', 'cf_hrms_self_view',            'frontend'
   ) x
  WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag AND f.deleted_at IS NULL);
 
@@ -53,13 +59,13 @@ SELECT f.feature_tag, JSON_ARRAY(f.id)
                          'cf_hrms_people_view', 'cf_hrms_people_manage', 'cf_hrms_people_pii',
                          'cf_hrms_assignments_manage', 'cf_hrms_attendance_view', 'cf_hrms_attendance_manage',
                          'cf_hrms_leave_view', 'cf_hrms_leave_manage', 'cf_hrms_documents_generate',
-                         'cf_hrms_import_manage')
+                         'cf_hrms_import_manage', 'cf_hrms_self_view')
    AND f.deleted_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
 
 
 -- ############################################################################
--- ## 3. GRANTS — every company's admin role gets all thirteen               ##
+-- ## 3. GRANTS — every company's admin role gets all fourteen               ##
 -- ############################################################################
 -- The backend lets admins through anyway (requirePerm); the frontend's
 -- usePermission has NO bypass, so without these rows an admin sees no screens.
@@ -74,8 +80,48 @@ SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
                          'cf_hrms_people_view', 'cf_hrms_people_manage', 'cf_hrms_people_pii',
                          'cf_hrms_assignments_manage', 'cf_hrms_attendance_view', 'cf_hrms_attendance_manage',
                          'cf_hrms_leave_view', 'cf_hrms_leave_manage', 'cf_hrms_documents_generate',
-                         'cf_hrms_import_manage')
+                         'cf_hrms_import_manage', 'cf_hrms_self_view')
                              AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+
+-- ############################################################################
+-- ## 3a. THE `Employee` ROLE — one capability, and only one                  ##
+-- ############################################################################
+-- Every company running cf_hrms gets a role called `Employee` holding exactly
+-- `cf_hrms_self_view` and nothing else. This is the role every minted
+-- shop-floor login carries (scripts/create-employee-logins.mjs), and it is
+-- seeded here rather than created by that script so the permission model is
+-- complete on its own: the script mints identities, it does not invent access.
+--
+-- WHY THE ROLE IS NAMED, NOT TAGGED. `requirePerm` and `isPermitted` both let
+-- `role === 'admin'` through everything, by name, case-insensitively. So the
+-- one thing this role must never be called is anything an admin check matches —
+-- `Employee` is safe, and a company that renames it keeps its grants because
+-- the grant is keyed on the role id, not the word.
+--
+-- Both rows are needed for a working grant, and this file can only write one of
+-- them: `role_capability` is per ROLE (here), `app_user_access` is per USER (the
+-- script, one row per minted login). A role_capability row on its own silently
+-- grants nothing — it is the single most common cause of "the app is there but
+-- empty" on this platform.
+
+INSERT INTO roles (name, company_id)
+SELECT 'Employee', a.company_id
+  FROM apps a
+ WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM roles r
+      WHERE r.company_id = a.company_id AND LOWER(r.name) = 'employee' AND r.deleted_at IS NULL);
+
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = 'employee' AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_hrms_self_view' AND fc.deleted_at IS NULL
  WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
    AND NOT EXISTS (
      SELECT 1 FROM role_capability x
@@ -85,6 +131,10 @@ SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
 -- ############################################################################
 -- ## 4. APP ACCESS — users whose company role is admin may open the app     ##
 -- ############################################################################
+-- Employees are NOT covered here: their login does not exist yet when this file
+-- runs. scripts/create-employee-logins.mjs writes one app_user_access row per
+-- minted login, in the same transaction as the user row, for exactly that
+-- reason.
 
 INSERT INTO app_user_access (user_id, app_id, role_id, company_id)
 SELECT u.id, a.id, u.role_id, a.company_id

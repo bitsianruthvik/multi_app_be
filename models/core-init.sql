@@ -94,10 +94,27 @@ CREATE TABLE IF NOT EXISTS users (
   name VARCHAR(100) NOT NULL,
   email VARCHAR(100) NOT NULL UNIQUE,
   password VARCHAR(255) NOT NULL,
-  role_id INT NOT NULL,
-  team_id INT NOT NULL,
-  company_id INT NOT NULL,
+  -- Nullable, because production is nullable and 13 of its 23 users have no
+  -- team at all. The permission lookup is written for it: authController joins
+  -- `role_capability` with `rc.team_id <=> ?`, the null-safe comparison, so a
+  -- user with no team matches the grants that name no team. Declaring these
+  -- NOT NULL here, as this file used to, meant a database built from this file
+  -- could not hold production's own rows — a restore of a production backup
+  -- died on "Column 'team_id' cannot be null".
+  role_id INT NULL,
+  team_id INT NULL,
+  company_id INT NULL,
   deleted_at DATETIME NULL DEFAULT NULL,
+  -- Per-user UI state, deep-merged by PUT /api/:company/:app/user/preferences
+  -- and read by GET .../user/profile (core/query/profileController.js).
+  --
+  -- This column was live in every running database — local and production —
+  -- while this file did not create it, so a database built from this file alone
+  -- had a profile endpoint that answered 500 "Unknown column 'preferences'".
+  -- Nothing caught it because no database had been built from empty since the
+  -- column was added by hand. See the retrofit at the end of this file for the
+  -- other half of the fix.
+  preferences JSON NULL DEFAULT NULL,
   FOREIGN KEY (role_id) REFERENCES roles(id)
     ON DELETE CASCADE
     ON UPDATE CASCADE,
@@ -126,3 +143,30 @@ CREATE TABLE IF NOT EXISTS app_user_access (
   CONSTRAINT fk_aua_role    FOREIGN KEY (role_id)    REFERENCES roles(id)     ON DELETE CASCADE,
   CONSTRAINT fk_aua_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## RETROFITS — guarded ALTERs, and they belong at the END                  ##
+-- ############################################################################
+-- A guarded ALTER must come after the CREATE TABLE of the table it alters.
+-- Everything above is CREATE TABLE IF NOT EXISTS, which means statement order
+-- in this file is exercised exactly once per database: the first time it meets
+-- an EMPTY schema. After that every ordering mistake is invisible. So new
+-- columns go here, guarded, rather than beside their table.
+--
+-- `users.preferences` is the reason this section exists. It was added to the
+-- live databases by hand and never written down, so for an unknown stretch this
+-- file could not rebuild a working platform: `GET /user/profile` and
+-- `PUT /user/preferences` both name the column, and a fresh database did not
+-- have it. The CREATE TABLE above now declares it for a new database; this
+-- ALTER covers an existing one. Both are needed — neither alone is enough.
+
+SET @needs_preferences = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'users'
+     AND COLUMN_NAME  = 'preferences');
+SET @sql = IF(@needs_preferences = 1,
+  'ALTER TABLE users ADD COLUMN preferences JSON NULL DEFAULT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

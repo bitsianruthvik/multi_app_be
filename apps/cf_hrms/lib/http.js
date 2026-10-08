@@ -26,6 +26,22 @@ export const PERM = {
   leaveManage: 'cf_hrms_leave_manage',            // types, balances, approval
   documentsGenerate: 'cf_hrms_documents_generate',// Role JD / Responsibility Profile
   importManage: 'cf_hrms_import_manage',          // the org-chart import
+
+  /**
+   * `selfView` is the odd one in the other direction: it is the ONLY tag that
+   * grants a person something about THEMSELVES rather than about the company.
+   * It gates exactly one route — GET /user/me/place — and nothing else in this
+   * app checks it. That is deliberate and it must stay that way: a shop-floor
+   * employee holding only this tag can see their own seat, their own managers,
+   * their own team and their own responsibilities, and gets a 403 from every
+   * other endpoint in the app.
+   *
+   * It therefore must never be added to another route's `guard(...)`, and no
+   * route gated on another tag may fall back to it. The whole security boundary
+   * of the self view is that the employee id comes from `req.user.id` via
+   * `hrms_employees.user_id` and is never accepted from the client.
+   */
+  selfView: 'cf_hrms_self_view',                  // your own place in the organisation, and nothing else
 };
 
 /** The tenant and user of a request. The company always comes from the token, never the URL. */

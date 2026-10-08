@@ -92,15 +92,20 @@ function scan(files) {
 
     // Pass 2: every use, checked against where its target is created.
     lines.forEach((text, i) => {
+      // \b matters on REFERENCES: without it the pattern matches the tail of
+      // `pREFERENCES`, so the column `preferences JSON NULL` was read as a
+      // foreign key to a table called "json" and reported as an ordering bug.
+      // A checker that cries wolf is worse than no checker — the real problems
+      // hide in its noise.
       const uses = [
-        ...[...text.matchAll(/ALTER\s+TABLE\s+([`"']?[\w.]+[`"']?)/gi)].map((m) => ['ALTER', m[1]]),
-        ...[...text.matchAll(/REFERENCES\s+([`"']?[\w.]+[`"']?)/gi)].map((m) => ['REFERENCES', m[1]]),
+        ...[...text.matchAll(/\bALTER\s+TABLE\s+([`"']?[\w.]+[`"']?)/gi)].map((m) => ['ALTER', m[1]]),
+        ...[...text.matchAll(/\bREFERENCES\s+([`"']?[\w.]+[`"']?)/gi)].map((m) => ['REFERENCES', m[1]]),
       ];
 
       // `DROP TABLE IF EXISTS x` where x is never created is RETIREMENT, not a
       // bug — it is how a file cleans up a table an older version made. Only a
       // guardless DROP is worth reporting, and even then only as its own class.
-      for (const m of text.matchAll(/DROP\s+TABLE\s+(IF\s+EXISTS\s+)?([`"']?[\w.]+[`"']?)/gi)) {
+      for (const m of text.matchAll(/\bDROP\s+TABLE\s+(IF\s+EXISTS\s+)?([`"']?[\w.]+[`"']?)/gi)) {
         if (m[1]) continue;
         uses.push(['DROP TABLE without IF EXISTS', m[2]]);
       }

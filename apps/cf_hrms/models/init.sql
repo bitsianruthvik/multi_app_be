@@ -1339,6 +1339,15 @@ CREATE TABLE IF NOT EXISTS hrms_employees (
   company_id              INT          NOT NULL,
   employee_code           VARCHAR(50)  NOT NULL,
   full_name               VARCHAR(200) NOT NULL,
+  -- A form of address ('Mr.', 'Ms.'), stored exactly as the source wrote it and
+  -- SEPARATE from the name on purpose. It is not part of a name: full_name is
+  -- what the org-chart import's duplicate-person check keys on, what the people
+  -- list indexes and sorts by, and what a letter template prefixes with a
+  -- salutation of its own — a prefix glued into the name cannot be taken out
+  -- again without guessing where the name starts. It is also NOT `gender`:
+  -- reading 'Ms.' as female is an inference, and this column records what was
+  -- written, not what it implies.
+  salutation              VARCHAR(10)  NULL,
   date_of_birth           DATE         NULL,
   gender                  VARCHAR(40)  NULL,        -- free label, configurable
   phone                   VARCHAR(40)  NULL,
@@ -2440,5 +2449,32 @@ SET @needs_read = (
      AND COLUMN_TYPE NOT LIKE '%READ%');
 SET @sql = IF(@needs_read = 1,
   'ALTER TABLE hrms_audit_log MODIFY COLUMN action ENUM(''CREATE'',''UPDATE'',''DELETE'',''APPROVE'',''GENERATE'',''IMPORT'',''READ'') NOT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ----- 10b. hrms_employees.salutation ---------------------------------------
+-- Added 2026-10-08 for the Org_Chart_V28 import, which carries a `ttl` ('Mr.',
+-- 'Ms.') on 68 of its 71 named people.
+--
+-- DECLARED IN TWO PLACES, AND IT HAS TO BE BOTH. §5a creates the column, so a
+-- database built from this file has it. This ALTER gives it to the databases
+-- that already exist, local and production, which §5a can never reach because
+-- CREATE TABLE IF NOT EXISTS is a no-op on a table that is already there.
+-- Neither half alone is enough, and the half that gets forgotten is usually
+-- this one: core-init.sql had `users.preferences` live in every running database
+-- and declared in no migration, so GET /user/profile answered 500 on any
+-- freshly built one.
+--
+-- And it sits HERE, at the end, below the CREATE it alters — the rule the
+-- comment above this section was written for.
+
+SET @needs_salutation = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_employees'
+     AND COLUMN_NAME  = 'salutation');
+SET @sql = IF(@needs_salutation = 1,
+  'ALTER TABLE hrms_employees ADD COLUMN salutation VARCHAR(10) NULL AFTER full_name',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

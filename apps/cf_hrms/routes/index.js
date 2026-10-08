@@ -10,6 +10,7 @@ import workforceRoutes from './workforce.js';
 import leaveRoutes from './leave.js';
 import documentRoutes from './documents.js';
 import orgChartRoutes from './orgchart.js';
+import selfRoutes from './self.js';
 import importRoutes from './imports.js';
 import overviewRoutes from './overview.js';
 
@@ -103,6 +104,13 @@ router.use(workforceRoutes);
 router.use(leaveRoutes);
 router.use(documentRoutes);
 router.use(orgChartRoutes);
+/**
+ * The employee self view — mounted like every other router, but the only one a
+ * shop-floor login can reach. It holds exactly one route, gated on the one tag
+ * (`cf_hrms_self_view`) that grants a person something about themselves rather
+ * than about the company, and it takes no id from the caller. See routes/self.js.
+ */
+router.use(selfRoutes);
 router.use(importRoutes);
 router.use(overviewRoutes);
 
