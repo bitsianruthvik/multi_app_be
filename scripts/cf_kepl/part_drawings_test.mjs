@@ -7,7 +7,7 @@
  *   cd multi_app_be && node scripts/cf_kepl/part_drawings_test.mjs
  */
 import { pool } from '../../db.js';
-import { getDrawings, uploadDrawings, deleteDrawing, platePartsOfLine, drawingFactsOfLine } from '../../apps/cf_erp/services/partDrawingService.js';
+import { getDrawings, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine } from '../../apps/cf_erp/services/partDrawingService.js';
 import { lotDxf } from '../../apps/cf_erp/services/cncExportService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('Local only.');
@@ -40,7 +40,7 @@ try {
   for (const p of same) await db.query("INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, value_text, source) VALUES (?, ?, 'master', ?, 'Fst p1', 'entered')", [COMPANY, markSpec.id, p.id]);
 
   let view = await getDrawings(db, COMPANY, line.order_id, LINE);
-  ok('no drawings yet: every plate part is listed without one', view.drawings.length === 0 && view.partsWithoutDrawing.length === view.summary.parts && view.summary.usePct === null);
+  ok('no drawings yet: every row of every level is listed without one', view.drawings.length === 0 && view.rowsWithoutDrawing.length === view.summary.rows && view.summary.rows > view.summary.parts && view.summary.usePct === null);
 
   // The part's rectangle with two 40 mm snipes, two drilled holes and a 100 mm opening.
   const { lengthMm: L, widthMm: W } = part;
@@ -49,7 +49,7 @@ try {
   const dry = await uploadDrawings(db, c, line.order_id, LINE, { files: up, dryRun: true });
   const st = Object.fromEntries(dry.files.map((f) => [f.name, f.status]));
   ok('preview: matched by mark whatever the case and spaces → new', st['FST-P1.dxf'] === 'new' && dry.files[0].rows.some((r) => r.id === part.id), JSON.stringify(dry.files[0]).slice(0, 300));
-  ok('preview: a mark no row carries is unmatched, said in words', st['NOPE-9.dxf'] === 'unmatched' && /No plate part/.test(dry.files[1].warnings.join(' ')));
+  ok('preview: a mark no row carries is unmatched, said in words', st['NOPE-9.dxf'] === 'unmatched' && /No row on this line/.test(dry.files[1].warnings.join(' ')));
   ok('preview: a file that is not a DXF drawing is refused in words', st['broken.dxf'] === 'error' && st['photo.pdf'] === 'error' && dry.files[3].problems.length > 0);
   ok('preview writes nothing', !dry.saved && (await db.query('SELECT COUNT(*) n FROM cf_part_drawings WHERE order_line_id = ? AND deleted_at IS NULL', [LINE]))[0][0].n === 0);
   const g = dry.files[0].geometry;
@@ -70,7 +70,7 @@ try {
   view = saved.view;
   ok('saved: one drawing (the unmatched and broken ones are not kept)', saved.saved && view.drawings.length === 1 && view.drawings[0].mark === 'FST-P1');
   const s = view.summary;
-  ok(`the measure: its shape uses ${s.usePct}% of its rectangle, ${s.savingKg} kg is the most true-shape nesting could save`, s.usePct < 100 && s.usePct > 80 && s.savingKg > 0 && s.partsWithDrawing === same.length, JSON.stringify(s));
+  ok(`the measure: its shape uses ${s.usePct}% of its rectangle, ${s.savingKg} kg is the most true-shape nesting could save`, s.usePct < 100 && s.usePct > 80 && s.savingKg > 0 && s.partsWithShape === same.length, JSON.stringify(s));
 
   const facts = (await drawingFactsOfLine(db, COMPANY, LINE)).get(cpId);
   ok('the cut plate takes the drawing: piercings 2, cut length its own', facts && Math.abs((await valueOf('PIERCINGS')) - facts.piercings) < 1e-6 && Math.abs(facts.piercings - 2) < 1e-6, JSON.stringify(facts));
@@ -85,8 +85,29 @@ try {
   const again = await uploadDrawings(db, c, line.order_id, LINE, { files: [file('fst-p1.DXF', shape)], dryRun: false });
   ok('uploading the mark again replaces it', again.files[0].status === 'replaces' && again.view.drawings.length === 1);
 
+  // Every level: a segment's PDF and an assembly's general-arrangement DXF (not one outline) are kept, not read.
+  const rows = await rowsOfLine(db, COMPANY, line);
+  const marked = rows.filter((r) => !r.isPlatePart && r.mark);
+  ok(`rows above the parts carry marks too (${marked.length})`, marked.length >= 2);
+  const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n%âãÏÓ\n1 0 obj << >> endobj\n', 'latin1'), Buffer.alloc(64, 7), Buffer.from('\n%%EOF\n')]);
+  const ga = dxf([lw([[0, 0], [1000, 0], [1000, 500], [0, 500]]), lw([[2000, 0], [3000, 0], [3000, 500], [2000, 500]])]);
+  const levelUp = [
+    { name: `${marked[0].mark}.PDF`, content: pdf.toString('base64') },
+    file(`${marked[1].mark}.dxf`, ga),
+    { name: 'FST-P1.pdf', content: pdf.toString('base64') },
+  ];
+  const lv = await uploadDrawings(db, c, line.order_id, LINE, { files: levelUp, dryRun: true });
+  ok(`a ${marked[0].level}'s PDF matches by its mark, kept without a shape`, lv.files[0].status === 'new' && lv.files[0].fileKind === 'pdf' && lv.files[0].geometry === null && lv.files[0].rows.some((r) => r.level === marked[0].level), JSON.stringify(lv.files[0]).slice(0, 300));
+  ok('an assembly\'s general-arrangement DXF (two outlines) is kept, not refused', lv.files[1].status === 'new' && lv.files[1].problems.length === 0 && lv.files[1].geometry === null, JSON.stringify(lv.files[1]).slice(0, 300));
+  ok('a plate part\'s PDF replaces its DXF, saying it has no shape to read', lv.files[2].status === 'replaces' && /no shape to read/.test(lv.files[2].warnings.join(' ')));
+  const lvSaved = await uploadDrawings(db, c, line.order_id, LINE, { files: levelUp.slice(0, 2), dryRun: false });
+  const segDrawing = lvSaved.view.drawings.find((d) => d.fileKind === 'pdf');
+  ok('saved on every level: the summary counts rows, not just parts', lvSaved.view.summary.rowsWithDrawing >= same.length + 2 && segDrawing?.levels.includes(marked[0].level), JSON.stringify(lvSaved.view.summary));
+  const got = await drawingFile(db, COMPANY, line.order_id, LINE, segDrawing.id);
+  ok('the PDF downloads exactly as uploaded', got.contentType === 'application/pdf' && got.buffer.equals(pdf) && /\.PDF$/i.test(got.filename));
+
   view = await deleteDrawing(db, c, line.order_id, LINE, again.view.drawings[0].id);
-  ok('deleted: no drawings, and the cut plate is back to the rectangle', view.drawings.length === 0 && Math.abs((await valueOf('CUT_LENGTH')) - cutBefore) < 1e-3, `${await valueOf('CUT_LENGTH')} vs ${cutBefore}`);
+  ok('deleted: the part drawing is gone, and its cut plate is back to the rectangle', !view.drawings.some((d) => d.mark === 'FST-P1') && Math.abs((await valueOf('CUT_LENGTH')) - cutBefore) < 1e-3, `${await valueOf('CUT_LENGTH')} vs ${cutBefore}`);
 } catch (e) {
   failed++;
   console.error('  ERROR', e.message, e.problems ? JSON.stringify(e.problems) : '', e.stack?.split('\n').slice(1, 3).join(' '));

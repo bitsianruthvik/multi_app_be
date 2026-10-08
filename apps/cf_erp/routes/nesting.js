@@ -52,8 +52,8 @@ import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 import { startRun, currentRun, dismissRun } from '../services/nestRunService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
-// Part shapes (init.sql §51): a plate part's DXF, matched to its rows by drawing mark.
-import { getDrawings, uploadDrawings, deleteDrawing } from '../services/partDrawingService.js';
+// Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
+import { getDrawings, uploadDrawings, deleteDrawing, drawingFile } from '../services/partDrawingService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -131,12 +131,20 @@ router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (r
 router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
   handle((req) => write(req, (db, c, id) => importSheet(db, c, id, req.body ?? {}))));
 
-// PART SHAPES — DXF per plate part, matched by drawing mark. A dry run reads and matches and
-// writes nothing; saving also refreshes the line's cut plates' cut length and piercings.
+// DRAWINGS — DXF or PDF per row of the line, matched by drawing mark (a plate part's DXF is its
+// shape). A dry run reads and matches and writes nothing; saving also refreshes the line's cut
+// plates' cut length and piercings. /file downloads the drawing itself.
 router.get('/orders/:orderId/lines/:lineId/drawings', view,
   handle((req) => read(req, (db, companyId, id) => getDrawings(db, companyId, null, id))));
 router.post('/orders/:orderId/lines/:lineId/drawings', manage,
   handle((req) => write(req, (db, c, id) => uploadDrawings(db, c, null, id, req.body ?? {}))));
+router.get('/orders/:orderId/lines/:lineId/drawings/:drawingId/file', view, handle(async (req, res) => {
+  const out = await read(req, (db, companyId, id) => drawingFile(db, companyId, null, id, intParam(req.params.drawingId, 'drawingId')));
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.send(out.buffer);
+}));
 router.delete('/orders/:orderId/lines/:lineId/drawings/:drawingId', manage,
   handle((req) => write(req, (db, c, id) => deleteDrawing(db, c, null, id, intParam(req.params.drawingId, 'drawingId')))));
 

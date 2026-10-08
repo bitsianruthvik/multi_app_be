@@ -4901,3 +4901,14 @@ CREATE TABLE IF NOT EXISTS cf_part_drawings (
   CONSTRAINT fk_cpd_company FOREIGN KEY (company_id) REFERENCES companies (id),
   CONSTRAINT fk_cpd_line FOREIGN KEY (order_line_id) REFERENCES cf_sales_order_lines (id)
 );
+
+-- §51b  Drawings on every level (2026-10-08): DXF or PDF, on any row of the line
+-- matched by drawing mark. Only a plate part's DXF is read as a shape, so the
+-- shape columns are empty for the rest; dxf_text holds the file itself (DXF
+-- text, or a PDF as base64 — file_kind says which).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND COLUMN_NAME = 'file_kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_part_drawings ADD COLUMN file_kind ENUM('dxf','pdf') NOT NULL DEFAULT 'dxf' AFTER file_name", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND COLUMN_NAME = 'geometry_json' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_part_drawings MODIFY length_mm DECIMAL(12,3) NULL, MODIFY width_mm DECIMAL(12,3) NULL, MODIFY area_mm2 DECIMAL(16,3) NULL, MODIFY cut_length_mm DECIMAL(14,3) NULL, MODIFY piercings INT NULL, MODIFY holes INT NULL, MODIFY inner_cuts INT NULL, MODIFY geometry_json MEDIUMTEXT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
