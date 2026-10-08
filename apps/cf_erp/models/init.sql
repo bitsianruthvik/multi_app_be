@@ -4831,3 +4831,21 @@ SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND CONSTRAINT_NAME = 'fk_cfcs_cut_section_flow');
 SET @sql = IF(@fk = 0, 'ALTER TABLE cf_company_settings ADD CONSTRAINT fk_cfcs_cut_section_flow FOREIGN KEY (company_id, cut_section_flow_id) REFERENCES cf_operation_flows(company_id, id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §49  Operation times live on the operation's rule (2026-10-08)
+-- ============================================================================
+-- The user: "are all formulas now on the operation itself (which I feel is
+-- ideal)". Each machine rule carries its own work / setup expression — a
+-- number for a fixed time. Shared cf_formulas stay for VALUE formulas only
+-- (weights, areas); scripts/cf_kepl/time-formulas-to-rules.mjs moves the old
+-- time formulas onto their rules and retires them. Until then a rule with no
+-- expression of its own reads its linked formula as before.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_machine_rules' AND COLUMN_NAME = 'work_expression');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_machine_rules ADD COLUMN work_expression TEXT NULL AFTER work_formula_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_machine_rules' AND COLUMN_NAME = 'setup_expression');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_machine_rules ADD COLUMN setup_expression TEXT NULL AFTER setup_formula_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

@@ -249,8 +249,8 @@ try {
   // Some time to copy onto the steps: CRNMV 5 per piece + 2 setup.
   const [[crn]] = await conn.query("SELECT id FROM cf_operations WHERE company_id = ? AND code = 'CRNMV' AND deleted_at IS NULL", [COMPANY]);
   // Only CRNMV gets a time; every other rule is cleared inside the transaction (local rules may carry placeholder times).
-  await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = NULL, setup_minutes = NULL WHERE company_id = ? AND deleted_at IS NULL AND work_formula_id IS NULL', [COMPANY]);
-  await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = 5, setup_minutes = 2 WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, crn.id]);
+  await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = NULL, setup_minutes = NULL, work_expression = NULL, setup_expression = NULL WHERE company_id = ? AND deleted_at IS NULL AND work_formula_id IS NULL', [COMPANY]);
+  await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = 5, setup_minutes = 2, work_expression = NULL, setup_expression = NULL WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, crn.id]);
   // A typed time wins over the formula at release too.
   const segBomLine = (await conn.query('SELECT bom_line_id FROM cf_order_pieces WHERE id = ?', [seg.pieceId]))[0][0].bom_line_id;
   await insert('cf_time_overrides', { company_id: COMPANY, order_line_id: LINE, bom_line_id: segBomLine, operation_id: crn.id, work_minutes: 11 });

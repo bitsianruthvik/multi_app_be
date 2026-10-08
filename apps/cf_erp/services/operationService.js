@@ -160,7 +160,9 @@ export async function deleteOperation(db, c, id) {
 
 // --- machine rules ------------------------------------------------------------
 
-const RULE_SELECT = `SELECT r.*, sf.code AS setup_formula_code, sf.expression AS setup_expression, wf.code AS work_formula_code, wf.expression AS work_expression,
+// A rule's times are its OWN expressions (§49, 2026-10-08: "all formulas on the operation");
+// a rule still pointing at a shared formula (before the move) reads that formula's expression.
+const RULE_SELECT = `SELECT r.*, sf.code AS setup_formula_code, sf.expression AS setup_formula_expression, wf.code AS work_formula_code, wf.expression AS work_formula_expression,
        n.code AS node_code, n.name AS node_name, n.depth AS node_depth, mc.code AS machine_code, mc.name AS machine_name
   FROM cf_operation_machine_rules r
   LEFT JOIN cf_formulas sf ON sf.id = r.setup_formula_id
@@ -169,9 +171,13 @@ const RULE_SELECT = `SELECT r.*, sf.code AS setup_formula_code, sf.expression AS
   LEFT JOIN cf_machines mc ON r.subject_type = 'machine' AND mc.id = r.subject_id`;
 
 function shapeRule(r) {
-  const time = (minutes, formulaId, code, expression) => (minutes != null
-    ? { minutes: Number(minutes), formula: null }
-    : formulaId ? { minutes: null, formula: { id: formulaId, code, expression } } : null);
+  // { minutes, formula: { id, code, expression }, expression } — the rule's own expression has no
+  // formula id or code; `expression` is always the text the time is worked out from.
+  const time = (minutes, formulaId, code, formulaExpression, own) => {
+    if (!blank(own)) return { minutes: null, expression: own, formula: { id: null, code: null, expression: own } };
+    if (minutes != null) return { minutes: Number(minutes), expression: String(Number(minutes)), formula: null };
+    return formulaId ? { minutes: null, expression: formulaExpression, formula: { id: formulaId, code, expression: formulaExpression } } : null;
+  };
   return {
     id: r.id,
     operationId: r.operation_id,
@@ -179,8 +185,8 @@ function shapeRule(r) {
       ? { type: 'machine', id: r.subject_id, code: r.machine_code, name: r.machine_name, level: 'Machine' }
       : { type: 'classification', id: r.subject_id, code: r.node_code, name: r.node_name, level: levelName(r.node_depth) },
     eligible: !!r.eligible,
-    setup: time(r.setup_minutes, r.setup_formula_id, r.setup_formula_code, r.setup_expression),
-    work: time(r.work_minutes, r.work_formula_id, r.work_formula_code, r.work_expression),
+    setup: time(r.setup_minutes, r.setup_formula_id, r.setup_formula_code, r.setup_formula_expression, r.setup_expression),
+    work: time(r.work_minutes, r.work_formula_id, r.work_formula_code, r.work_formula_expression, r.work_expression),
     effectiveFrom: dateText(r.effective_from),
     effectiveTo: dateText(r.effective_to),
     notes: r.notes,
@@ -204,6 +210,24 @@ async function readTimingFormula(db, companyId, raw, label, problems) {
     problems.push(`${label}: ${f.code} reads values of one record — a timing formula reads item.X and machine.X, e.g. item.CUT_LENGTH / machine.CUTTING_SPEED.`);
   }
   return f.id;
+}
+
+/**
+ * A rule's own time expression (§49): item.X and machine.X values, LOOKUP, MIN/MAX/ROUND/IF — or
+ * just a number for a fixed time. '' / null clears it. Returns undefined when not given.
+ */
+function readTimingExpression(raw, label, problems) {
+  if (raw === undefined) return undefined;
+  if (blank(raw)) return null;
+  const expression = String(raw).trim();
+  if (expression.length > 2000) { problems.push(`${label}: the formula is longer than 2,000 characters.`); return null; }
+  let parsed;
+  try { parsed = parseFormula(expression); } catch (e) { problems.push(`${label}: ${e.message}`); return null; }
+  if (parsed.kind === 'rollup' || (parsed.kind === 'value' && parsed.references.length)) {
+    problems.push(`${label}: a time reads item.X and machine.X values (e.g. item.CUT_LENGTH / machine.CUTTING_SPEED), or is a number of minutes.`);
+    return null;
+  }
+  return expression;
 }
 
 function readMinutes(raw, label, problems) {
@@ -231,10 +255,22 @@ async function readRuleBody(db, companyId, input, problems, existing = null) {
   const workFormulaId = await readTimingFormula(db, companyId, pick('workFormulaId', existing?.work_formula_id), 'Work', problems);
   if (setupMinutes != null && setupFormulaId) problems.push('Setup is a constant or a formula, not both.');
   if (workMinutes != null && workFormulaId) problems.push('Work is a constant or a formula, not both.');
+  // §49: an expression given replaces whatever the time was (minutes, a shared formula); not given
+  // keeps the rule's own expression as it is.
+  const setupExpr = readTimingExpression(input.setupExpression, 'Setup', problems);
+  const workExpr = readTimingExpression(input.workExpression, 'Work', problems);
+  const times = {
+    setup_minutes: setupMinutes, setup_formula_id: setupFormulaId, setup_expression: existing?.setup_expression ?? null,
+    work_minutes: workMinutes, work_formula_id: workFormulaId, work_expression: existing?.work_expression ?? null,
+  };
+  if (setupExpr !== undefined) Object.assign(times, { setup_expression: setupExpr, setup_minutes: null, setup_formula_id: null });
+  if (workExpr !== undefined) Object.assign(times, { work_expression: workExpr, work_minutes: null, work_formula_id: null });
+  // Minutes or a formula given the old way replace an own expression.
+  if (setupExpr === undefined && (input.setupMinutes !== undefined || input.setupFormulaId !== undefined)) times.setup_expression = null;
+  if (workExpr === undefined && (input.workMinutes !== undefined || input.workFormulaId !== undefined)) times.work_expression = null;
   // A rule that takes machines out carries no times.
-  Object.assign(out, eligible
-    ? { setup_minutes: setupMinutes, setup_formula_id: setupFormulaId, work_minutes: workMinutes, work_formula_id: workFormulaId }
-    : { setup_minutes: null, setup_formula_id: null, work_minutes: null, work_formula_id: null });
+  Object.assign(out, eligible ? times
+    : { setup_minutes: null, setup_formula_id: null, setup_expression: null, work_minutes: null, work_formula_id: null, work_expression: null });
   out.effective_from = readDate(pick('effectiveFrom', dateText(existing?.effective_from)), 'Valid from', problems);
   out.effective_to = readDate(pick('effectiveTo', dateText(existing?.effective_to)), 'Valid to', problems);
   if (out.effective_from && out.effective_to && out.effective_from > out.effective_to) problems.push('Valid from comes after valid to.');
@@ -257,7 +293,7 @@ async function checkSubject(db, companyId, subjectType, subjectId, problems) {
   problems.push('A rule is for a machine type or a machine.');
 }
 
-/** input: { subjectType, subjectId, eligible?, setupMinutes | setupFormulaId, workMinutes | workFormulaId, effectiveFrom?, effectiveTo?, notes? } */
+/** input: { subjectType, subjectId, eligible?, setupExpression?, workExpression? (or the older setupMinutes | setupFormulaId, workMinutes | workFormulaId), effectiveFrom?, effectiveTo?, notes? } */
 export async function createTimingRule(db, c, operationId, input = {}) {
   await requireOperation(db, c.companyId, operationId);
   const problems = [];
@@ -268,10 +304,10 @@ export async function createTimingRule(db, c, operationId, input = {}) {
   assertNoProblems(problems, 'The rule has problems.');
   const [r] = await db.query(
     `INSERT INTO cf_operation_machine_rules
-       (company_id, operation_id, subject_type, subject_id, eligible, setup_minutes, setup_formula_id, work_minutes, work_formula_id, effective_from, effective_to, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, operationId, subjectType, subjectId, body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id,
-      body.work_minutes, body.work_formula_id, body.effective_from, body.effective_to, body.notes, c.userId],
+       (company_id, operation_id, subject_type, subject_id, eligible, setup_minutes, setup_formula_id, setup_expression, work_minutes, work_formula_id, work_expression, effective_from, effective_to, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, operationId, subjectType, subjectId, body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id, body.setup_expression,
+      body.work_minutes, body.work_formula_id, body.work_expression, body.effective_from, body.effective_to, body.notes, c.userId],
   );
   clearProductionMachines(c.companyId);
   return (await listTimingRules(db, c.companyId, operationId)).find((x) => x.id === r.insertId);
@@ -292,9 +328,9 @@ export async function updateTimingRule(db, c, id, input = {}) {
   const body = await readRuleBody(db, c.companyId, input, problems, rule);
   assertNoProblems(problems, 'The rule has problems.');
   await db.query(
-    `UPDATE cf_operation_machine_rules SET eligible = ?, setup_minutes = ?, setup_formula_id = ?, work_minutes = ?, work_formula_id = ?,
+    `UPDATE cf_operation_machine_rules SET eligible = ?, setup_minutes = ?, setup_formula_id = ?, setup_expression = ?, work_minutes = ?, work_formula_id = ?, work_expression = ?,
             effective_from = ?, effective_to = ?, notes = ? WHERE company_id = ? AND id = ?`,
-    [body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id, body.work_minutes, body.work_formula_id,
+    [body.eligible ? 1 : 0, body.setup_minutes, body.setup_formula_id, body.setup_expression, body.work_minutes, body.work_formula_id, body.work_expression,
       body.effective_from, body.effective_to, body.notes, c.companyId, id],
   );
   clearProductionMachines(c.companyId);
@@ -504,10 +540,12 @@ export function evaluateRuleTimes(rule, { item = null, machine = null } = {}) {
   const evaluate = (time, what) => {
     if (!time) return what === 'setup' ? { minutes: 0, formula: null } : { minutes: null, formula: null, error: 'The rule sets no work time.' };
     if (time.minutes != null) return { minutes: time.minutes, formula: null };
+    const expression = time.expression ?? time.formula?.expression;
+    const name = time.formula?.code ?? null;
     let parsed;
-    try { parsed = parsedOf(time.formula.expression); } catch (e) { return { minutes: null, formula: time.formula.code, error: e.message }; }
+    try { parsed = parsedOf(expression); } catch (e) { return { minutes: null, formula: name, error: e.message }; }
     const out = evaluateFormula(parsed, () => null, null, context);
-    return { minutes: out.value, formula: time.formula.code, missing: out.missing, error: out.error };
+    return { minutes: out.value, formula: name, missing: out.missing, error: out.error };
   };
   return { setup: evaluate(rule.setup, 'setup'), work: evaluate(rule.work, 'work') };
 }
