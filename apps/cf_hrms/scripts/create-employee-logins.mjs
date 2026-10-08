@@ -66,6 +66,19 @@
  * printed to stdout in bulk and never go into the Excel org workbook — that
  * file gets emailed.
  *
+ * THE CREDENTIALS FILE IS WRITE-ONCE, AND THE REASON IS WORTH READING. Its name
+ * carries the TARGET as well as the date (`...-prod-2026-10-08.csv` against
+ * `...-local-...`), and an existing file is never overwritten — a counter is
+ * added instead. The first version of this script used a date-only name, so a
+ * local run and a production run on the same day resolved to the same path and
+ * the second silently replaced the first. That nearly destroyed the only copy
+ * of 71 live passwords: bcrypt means they cannot be read back out of the
+ * database, and re-running does not reissue them (everyone is then
+ * "already has a login" and NO file is written at all), so the accounts would
+ * have been unreachable until an administrator reset each one by hand. The
+ * target is written inside the file too, as a column on every row, because a
+ * file gets renamed and forwarded and its name is not evidence.
+ *
  * THERE IS NO PASSWORD RESET AND NO FORCE-CHANGE-ON-FIRST-LOGIN ON THIS
  * PLATFORM. A minted password is permanent until an administrator changes it on
  * the Access screen. For 71 shop-floor users that is an operational decision,
@@ -188,6 +201,37 @@ const csvCell = (v) => {
   const s = v == null ? '' : String(v);
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
+
+/**
+ * A path that does not exist yet, by adding `-2`, `-3`, … before the extension.
+ *
+ * THIS FUNCTION EXISTS BECAUSE OF A NEAR-MISS, and the reasoning matters more
+ * than the code. The filename used to be date-only, so a local run and a
+ * production run on the same day resolved to the SAME path and the second
+ * silently overwrote the first. The harmless direction happened (prod over
+ * local). The other direction destroys live credentials: the passwords are
+ * bcrypt-hashed in the database and cannot be read back, so overwriting the
+ * file would leave 71 production accounts unreachable until an administrator
+ * reset each one by hand — on a platform with no reset flow.
+ *
+ * It adds a counter rather than refusing, deliberately. By the time this runs
+ * the `users` rows are already committed, so a refusal would strand freshly
+ * minted passwords with nowhere to write them — destroying exactly what it was
+ * trying to protect. A credentials file is write-once: never replaced, always
+ * written somewhere, and the caller is told exactly where.
+ */
+function freePath(preferred) {
+  if (!fs.existsSync(preferred)) return { file: preferred, collided: false };
+  const dir = path.dirname(preferred);
+  const ext = path.extname(preferred);
+  const stem = path.basename(preferred, ext);
+  for (let n = 2; n <= 999; n += 1) {
+    const candidate = path.join(dir, `${stem}-${n}${ext}`);
+    if (!fs.existsSync(candidate)) return { file: candidate, collided: true };
+  }
+  // 999 files with this stem is not a situation to resolve by guessing.
+  throw new Error(`Cannot find a free name for ${preferred} — too many existing files.`);
+}
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
@@ -544,24 +588,45 @@ async function main() {
 
     if (credentials.length) {
       const stamp = new Date().toISOString().slice(0, 10);
-      const file = OPTS.out
-        ? path.resolve(OPTS.out)
-        : path.join(TM_ROOT, `${OPTS.companySlug}-employee-logins-${stamp}.csv`);
+      // THE TARGET IS IN THE FILENAME. A date alone is not a unique name: a
+      // local run and a production run on the same day collide, and the loser
+      // is 71 live passwords that cannot be recovered from the database.
+      const where = TARGET.isProd ? 'prod' : 'local';
+      const { file, collided } = freePath(
+        OPTS.out
+          ? path.resolve(OPTS.out)
+          : path.join(TM_ROOT, `${OPTS.companySlug}-employee-logins-${where}-${stamp}.csv`),
+      );
 
+      // And the target is in the FILE as well as the name, because a file gets
+      // renamed, copied and forwarded. Somebody handing out the local list
+      // against production hands out 71 passwords that do not work and learns
+      // nothing about why. `TARGET.name` is the same string `announce()` already
+      // prints on every run, so this discloses nothing new.
       const lines = [
-        ['employee_code', 'full_name', 'email', 'password', 'login_url'].join(','),
+        ['employee_code', 'full_name', 'email', 'password', 'login_url', 'target', 'database'].join(','),
         ...credentials.map((c) => [
           c.e.employee_code, c.e.full_name, c.email, c.password,
           `/${OPTS.companySlug}/cf_hrms/login`,
+          TARGET.isProd ? 'PRODUCTION' : 'LOCAL',
+          TARGET.name,
         ].map(csvCell).join(',')),
       ];
       fs.writeFileSync(file, `${lines.join('\r\n')}\r\n`, { encoding: 'utf8' });
 
-      console.log(`\n  CREDENTIALS: ${credentials.length} password${credentials.length === 1 ? '' : 's'} written to`);
+      console.log(`\n  CREDENTIALS: ${credentials.length} password${credentials.length === 1 ? '' : 's'} for `
+        + `${TARGET.isProd ? 'PRODUCTION' : 'LOCAL'} written to`);
       console.log(`    ${file}`);
+      if (collided) {
+        console.log('  (A file with the preferred name already existed. It was NOT touched — a');
+        console.log('   credentials file is written once and never replaced.)');
+      }
       console.log('  That path is OUTSIDE both git repositories (TM/ is not a repo). The passwords are');
       console.log('  deliberately not printed here and must not go into the org-chart Excel workbook —');
       console.log('  that file gets emailed. Hand the CSV to HR, then delete it.');
+      console.log('  THESE PASSWORDS EXIST NOWHERE ELSE. They are bcrypt-hashed in the database and');
+      console.log('  cannot be read back, and re-running this script will NOT reissue them — it will');
+      console.log('  report "already has a login" and write no file at all.');
     }
 
     printResetWarning(created);
