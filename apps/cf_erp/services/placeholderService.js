@@ -213,7 +213,11 @@ export async function recordBomCodes(db, companyId, recordId, { tree = null } = 
   const nodes = laid.nodes;
   const noLine = { order_id: null, order_code: null };
   const memo = await seedPieceMemo(db, companyId, noLine, nodes);
-  if (record.code) out.rootCode = record.code;
+  // A DEFINITION is known by its short name, not its code (user, 2026-10-08: "we don't need that code
+  // for definitions, we will be using only shortname") — its BOM reads as an order's would under it:
+  // GS, GS-TFL1, GS-WPL1 … A catalog item keeps its own code; a record with neither falls through.
+  if (record.record_kind === 'definition' && shortNameOf(record, null)) out.rootCode = shortNameOf(record, null);
+  else if (record.code) out.rootCode = record.code;
   else {
     const defId = record.source_definition_id ?? null;
     const def = defId != null ? (memo.get(`master:${defId}`) ?? (await loadMasters(db, companyId, [defId])).get(defId) ?? null) : null;

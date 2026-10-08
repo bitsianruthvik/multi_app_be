@@ -186,8 +186,9 @@ try {
   section('1. A definition with the same child twice: two rows, two codes');
   const f = await buildFixture(conn, c);
   const gdr = await P.recordBomCodes(conn, COMPANY, f.GIRDER);
-  const G = `${f.tag}-GDR`;
-  eq('the top is the definition’s own code', gdr.rootCode, G);
+  // A definition is known by its short name (user, 2026-10-08), not its code ${f.tag}-GDR.
+  const G = 'GDR';
+  eq('the top is the definition’s short name, not its code', gdr.rootCode, G);
   const { out: g, byKey } = await codesByPath(conn, f.GIRDER, gdr);
   eq('the first segment row', g['Girder segment'], `${G}-SEG1`);
   eq('the same segment again — its own code, counted on', g['Girder segment#2'], `${G}-SEG2`);
