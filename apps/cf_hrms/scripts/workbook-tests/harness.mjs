@@ -153,6 +153,12 @@ export const isLastChild = (data, seat) => seat.parent != null
   && data.seats.filter((c) => c.parentPositionId === data.seats[seat.parent].positionId).pop() === seat;
 export const errorsOf = (prep) => (prep.problems ?? []).filter((p) => p.severity === 'error');
 export const codes = (prep) => errorsOf(prep).map((p) => p.code);
+/** The error codes of a plan, each once with how often it occurred: 'SEAT_NOT_FOUND x3, BAD_COUNT'. */
+export const codeList = (prep) => {
+  const n = new Map();
+  for (const c of codes(prep)) n.set(c, (n.get(c) ?? 0) + 1);
+  return [...n].map(([c, k]) => (k > 1 ? `${c} x${k}` : c)).join(', ');
+};
 export const warns = (prep) => (prep.problems ?? []).filter((p) => p.severity === 'warning').map((p) => p.code);
 export const summary = (plan) => Object.entries(plan.counts).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(' ') || '(empty)';
 /** Names of the counters that are not zero, sorted: for "exactly these changes and no others". */
@@ -222,7 +228,9 @@ export function makeCase({ conn, target, company, tag }) {
     // editing (re-exported so a case needs no imports)
     structureRows, rowOfKey, levelOfRow, setSeatTitle, setCell, getCell, keyCol, insertSeat, copyRow, deleteRow, appendRow,
     findRow, findKeyRow, setProvenance, clearProvenance, COLS,
-    labelOf, isLeaf, seatsOfRole, peopleIn, isLastChild, errorsOf, codes, warns, summary, changed, totalChanges,
+    labelOf, isLeaf, seatsOfRole, peopleIn, isLastChild, errorsOf, codes, codeList, warns, summary, changed, totalChanges,
+    /** A check that the plan has no errors, naming them when it has. */
+    noErrors(prep) { const list = codeList(prep); return t.ok(!list, `no errors${list ? ` (${list})` : ''}`); },
   };
   return t;
 }

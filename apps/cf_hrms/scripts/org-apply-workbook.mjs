@@ -39,6 +39,8 @@
  *   4. after the writes, still inside the transaction, the workbook is compared with the database AGAIN and the plan must
  *      now be empty. If it is not, something was written wrongly (or could not be), and everything rolls back.
  *
+ * REGRESSION TESTS: workbook-tests/run.mjs (one command; every apply is rehearsed and rolled back, so nothing is left behind).
+ *
  * EXIT CODES: 0 fine (a dry run's plan printed, an apply done, or nothing to do) | 1 the workbook has problems to fix |
  *   2 refused (wrong company, database or version; stale; already applied; needs --create-only) | 3 the apply failed and was rolled back.
  */

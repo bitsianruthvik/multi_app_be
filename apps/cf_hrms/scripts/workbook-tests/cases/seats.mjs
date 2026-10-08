@@ -112,7 +112,7 @@ export const cases = [
       t.insertSeat(wb, parentRow + 1, { level: t.levelOfRow(wb, parentRow) + 1, title, count: 2, shift, department: dept, location: loc });
       const edited = await t.save(wb);
       const prep = await t.plan(edited);
-      t.ok(t.codes(prep).length === 0, `no errors (${t.codes(prep)})`);
+      t.noErrors(prep);
       t.ok(t.changed(prep.plan) === 'departmentsCreated,rolesCreated,seatsCreated', `only a seat, its new role and its new department are planned (${t.changed(prep.plan)}); the ${data.seats.length} rows that slid down are not touched`);
       const res = await t.rehearse(edited, {}, async (c, info) => {
         const id = Number(info.created[`structure:${parentRow + 1}`].split(':')[1]);
@@ -153,7 +153,7 @@ export const cases = [
       t.need(level < 10, 'the first seat is already at the deepest level');
       t.insertSeat(wb, row + 1, { level: level + 1, title: t.name('second seat'), count: 1, shift });
       const prep = await t.plan(await t.save(wb));
-      t.ok(t.codes(prep).length === 0, `no errors (${t.codes(prep)})`);
+      t.noErrors(prep);
       t.ok(t.changed(prep.plan) === 'rolesCreated,seatsCreated', `${data.seats.length} rows slid down by one and ONLY the new seat is planned (${t.changed(prep.plan)})`);
       t.ok(prep.plan.people.move.length === 0 && prep.plan.responsibilities.move.length === 0 && prep.plan.questions.update.length === 0 && prep.plan.people.employeesUpdate.length === 0,
         'no person, duty or question moved because its Ref number changed');
@@ -257,7 +257,7 @@ export const cases = [
       try {
         const step = async (buffer) => {
           const p = await t.plan(buffer);
-          if (p.refusals.length || t.codes(p).length) throw new Error(`not applicable: ${t.codes(p)} ${p.refusals}`);
+          if (p.refusals.length || t.codes(p).length) throw new Error(`not applicable: ${t.codeList(p)} ${p.refusals}`);
           return t.A.executePlan({ conn, plan: p.plan, loaded: p.loaded, env: p.env, requestId: 'workbook-test-chain' });
         };
         await step(edited);
