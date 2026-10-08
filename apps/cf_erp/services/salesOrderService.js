@@ -332,7 +332,7 @@ export async function getOrder(db, companyId, id) {
   // the id, the customer and the revisions only the order row.
   const linesP = db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, m.status AS item_status, m.revision AS item_revision,
-            i.item_type, i.uom, dz.code AS design_code, dz.name AS design_name,
+            i.item_type, i.uom, dz.code AS design_code, dz.short_name AS design_short_name, dz.name AS design_name,
             b.status AS bom_status, b.revision AS current_bom_revision,
             rel.id AS release_id, rel.created_at AS released_at
        FROM cf_sales_order_lines l
@@ -385,7 +385,7 @@ export async function getOrder(db, companyId, id) {
     ...lineTax.get(l.id),
     tax: lineTax.get(l.id) ?? null,
     item: l.item_id ? { id: l.item_id, code: l.item_code, name: l.item_name, status: l.item_status, kind: l.item_type, uom: l.uom, revision: l.item_revision } : null,
-    design: { id: l.design_id, code: l.design_code, name: l.design_name },
+    design: { id: l.design_id, code: l.design_code, shortName: l.design_short_name ?? null, name: l.design_name },
     bomRevision: l.bom_revision,
     bom: l.bom_status ? { status: l.bom_status, currentRevision: l.current_bom_revision } : null,
     structure: stats.get(l.id) ?? null,

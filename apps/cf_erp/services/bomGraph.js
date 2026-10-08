@@ -33,11 +33,11 @@ export async function bomsOfParents(db, companyId, parentIds) {
 const LINE_COLUMNS = `
   l.id, l.bom_id, l.line_no, l.child_id, l.design_id, l.position, l.role, l.quantity,
   l.selection_definition_id, l.source_line_id, l.notes, l.operation_flow_id, l.auto_chosen,
-  ch.code AS child_code, ch.name AS child_name, ch.record_kind AS child_record_kind, ch.status AS child_status,
+  ch.code AS child_code, ch.short_name AS child_short_name, ch.name AS child_name, ch.record_kind AS child_record_kind, ch.status AS child_status,
   ci.item_type AS child_item_type, ci.uom AS child_uom, ci.tracked_by AS child_tracked_by,
   cd.definition_type AS child_definition_type,
-  dz.code AS design_code, dz.name AS design_name,
-  sd.code AS selection_code, sd.name AS selection_name,
+  dz.code AS design_code, dz.short_name AS design_short_name, dz.name AS design_name,
+  sd.code AS selection_code, sd.short_name AS selection_short_name, sd.name AS selection_name,
   lf.code AS line_flow_code, lf.name AS line_flow_name,
   ch.default_flow_id AS child_flow_id, cf.code AS child_flow_code, cf.name AS child_flow_name,
   sdef.default_flow_id AS def_flow_id, df.code AS def_flow_code, df.name AS def_flow_name`;

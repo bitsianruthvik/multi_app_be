@@ -470,6 +470,13 @@ export async function setStatus(db, c, id, status) {
       if (g?.text) {
         code = g.text;
         await db.query('UPDATE cf_master_records SET code = ? WHERE id = ?', [code, id]);
+      } else if (m.record_kind === 'definition') {
+        // A definition is known by its short name and its code is never shown (user, 2026-10-08):
+        // it is given one quietly — its short name when free, else short name + id, else D + id.
+        const base = String(m.short_name ?? '').trim();
+        const [[taken]] = base ? await db.query('SELECT COUNT(*) AS n FROM cf_master_records WHERE company_id = ? AND code_active = ?', [c.companyId, base.toLowerCase()]) : [[{ n: 1 }]];
+        code = base && !Number(taken.n) ? base : base ? `${base}-${id}` : `D${id}`;
+        await db.query('UPDATE cf_master_records SET code = ? WHERE id = ?', [code, id]);
       } else {
         problems.push('It needs a code — type one in, or add a coding rule that applies.');
       }
@@ -615,7 +622,7 @@ export async function getRecord(db, companyId, id) {
   out.classificationPath = path.map((n) => ({ id: n.id, code: n.code, name: n.name, level: levelName(n.depth) }));
   if (m.source_definition_id) {
     const d = await loadMaster(db, companyId, m.source_definition_id);
-    out.sourceDefinition = d ? { id: d.id, code: d.code, name: d.name, status: d.status } : null;
+    out.sourceDefinition = d ? { id: d.id, code: d.code, shortName: d.short_name ?? null, name: d.name, status: d.status } : null;
   }
   if (m.record_kind === 'definition') {
     const [[counts]] = await db.query(
@@ -714,8 +721,9 @@ export async function listRecords(db, companyId, q = {}) {
   }
   if (!blank(q.search)) {
     const like = likeOf(q.search);
-    rest.push('(m.code LIKE ? OR m.name LIKE ?)');
-    restParams.push(like, like);
+    // A definition is known by its short name (2026-10-08), so search finds it by that too.
+    rest.push('(m.code LIKE ? OR m.name LIKE ? OR m.short_name LIKE ?)');
+    restParams.push(like, like, like);
   }
   const statusOk = (s) => blank(q.status) || s === q.status;
   const kindOk = (k) => (q.kind ? k === q.kind
@@ -744,7 +752,7 @@ export async function listRecords(db, companyId, q = {}) {
             i.list_price, i.price_basis, i.currency AS price_currency,
             COALESCE(i.hsn_code, d.hsn_code) AS hsn_code, COALESCE(i.gst_rate, d.gst_rate) AS gst_rate, COALESCE(i.is_service, d.is_service, 0) AS is_service,
             d.definition_type, d.selection_mode, d.candidate_classification_id,
-            sd.code AS source_definition_code, ol.line_no AS owner_line_no, so.id AS owner_order_id, so.code AS owner_order_code,
+            sd.code AS source_definition_code, sd.short_name AS source_definition_short_name, ol.line_no AS owner_line_no, so.id AS owner_order_id, so.code AS owner_order_code,
             (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status,
             -- The list shows how big a BOM is, not just that there is one, so a
             -- user can see at a glance which records are built and which are bare.
@@ -789,6 +797,7 @@ export async function listRecords(db, companyId, q = {}) {
     classificationCode: r.classification_code,
     classificationName: r.classification_name,
     sourceDefinitionCode: r.source_definition_code ?? null,
+    sourceDefinitionShortName: r.source_definition_short_name ?? null,
     bomStatus: r.bom_status ?? null,
     bomLineCount: r.bom_status ? Number(r.bom_line_count ?? 0) : null,
     owner: r.owner_order_id ? { orderId: r.owner_order_id, orderCode: r.owner_order_code, lineNo: r.owner_line_no } : null,

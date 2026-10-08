@@ -98,11 +98,11 @@ function shapeLine(l, hasBom) {
     quantity: Number(l.quantity),
     notes: l.notes,
     child: {
-      id: l.child_id, code: l.child_code, name: l.child_name, kind, status: l.child_status,
+      id: l.child_id, code: l.child_code, shortName: l.child_short_name ?? null, name: l.child_name, kind, status: l.child_status,
       recordKind: l.child_record_kind, uom: l.child_uom ?? null, hasBom: !!hasBom,
     },
-    design: { id: l.design_id, code: l.design_code, name: l.design_name },
-    selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
+    design: { id: l.design_id, code: l.design_code, shortName: l.design_short_name ?? null, name: l.design_name },
+    selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, shortName: l.selection_short_name ?? null, name: l.selection_name } : null,
     autoChosen: !!l.auto_chosen && l.child_record_kind === 'item',
     resolved: l.child_record_kind === 'item',
     sourceLineId: l.source_line_id,
@@ -161,7 +161,7 @@ export async function getBom(db, companyId, parentId) {
   const childBoms = await bomsOfParents(db, companyId, [...new Set(lines.map((l) => l.child_id))]);
   const order = await ownerOrder(db, companyId, parent);
   return {
-    parent: { id: parent.id, code: parent.code, name: parent.name, kind: kindOf(parent), status: parent.status },
+    parent: { id: parent.id, code: parent.code, shortName: parent.short_name ?? null, name: parent.name, kind: kindOf(parent), status: parent.status },
     bomType,
     canHaveBom: !!bomType,
     allowedChildKinds: ALLOWED_CHILDREN[bomType] ?? [],
@@ -371,7 +371,7 @@ export async function lineCandidates(db, companyId, lineId, { limit, search } = 
   const found = await findCandidates(db, companyId, line.selection_definition_id, { limit, search });
   return {
     lineId: line.id,
-    selection: { id: line.selection_definition_id, code: line.selection_code, name: line.selection_name },
+    selection: { id: line.selection_definition_id, code: line.selection_code, shortName: line.selection_short_name ?? null, name: line.selection_name },
     chosenItemId: line.child_record_kind === 'item' ? line.child_id : null,
     // The system chose it (default, or only candidate) and no person has since — "Keep this item" makes it a person's choice.
     autoChosen: line.child_record_kind === 'item' && line.auto_chosen === 1,
@@ -457,7 +457,7 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
     [root.source_definition_id ?? null, companyId, root.id],
   );
   const rootNode = {
-    key: `r${root.id}`, id: root.id, code: root.code, name: root.name, kind: kindOf(root), status: root.status,
+    key: `r${root.id}`, id: root.id, code: root.code, shortName: root.short_name ?? null, name: root.name, kind: kindOf(root), status: root.status,
     uom: root.uom ?? null, depth: 0, quantity: rootQuantity, total: rootQuantity, lineId: null, lineNo: null,
     position: null, role: null, selection: null, resolved: root.record_kind === 'item',
     flow: rf ? effectiveFlowOf(rf) : null,
@@ -494,10 +494,10 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
           // The line names the node, as it always has; only a line reached
           // through more than one parent has to say which copy it is.
           key: copies.length > 1 ? `l${l.id}#${i}` : `l${l.id}`,
-          id: l.child_id, code: l.child_code, name: l.child_name, kind, status: l.child_status,
+          id: l.child_id, code: l.child_code, shortName: l.child_short_name ?? null, name: l.child_name, kind, status: l.child_status,
           uom: l.child_uom ?? null, depth, quantity: Number(l.quantity), total: Number((parentNode.total * Number(l.quantity)).toFixed(6)),
           lineId: l.id, lineNo: l.line_no, position: l.position, role: l.role,
-          selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, name: l.selection_name } : null,
+          selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, shortName: l.selection_short_name ?? null, name: l.selection_name } : null,
           resolved: l.child_record_kind === 'item',
           // The system chose it (the selection's default, or its only candidate) and no person has since.
           autoChosen: !!l.auto_chosen && l.child_record_kind === 'item',
@@ -581,7 +581,7 @@ export async function whereUsed(db, companyId, masterId, { withTotal = false } =
   const counted = withTotal ? db.query(`SELECT COUNT(*) AS n ${WHERE_USED_FROM}`, [companyId, masterId, masterId]) : null;
   const [rows] = await db.query(
     `SELECT l.id AS line_id, l.quantity, l.role, l.position, l.child_id, l.selection_definition_id,
-            b.bom_type, b.status AS bom_status, p.id AS parent_id, p.code AS parent_code, p.name AS parent_name,
+            b.bom_type, b.status AS bom_status, p.id AS parent_id, p.code AS parent_code, p.short_name AS parent_short_name, p.name AS parent_name,
             p.record_kind, pi.item_type, pd.definition_type, o.id AS order_id, o.code AS order_code
        FROM cf_bom_lines l
        JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
@@ -605,7 +605,7 @@ export async function whereUsed(db, companyId, masterId, { withTotal = false } =
     via: r.child_id === masterId ? 'child' : 'selection',
     bomType: r.bom_type,
     bomStatus: r.bom_status,
-    parent: { id: r.parent_id, code: r.parent_code, name: r.parent_name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type },
+    parent: { id: r.parent_id, code: r.parent_code, shortName: r.parent_short_name ?? null, name: r.parent_name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type },
     order: r.order_id ? { id: r.order_id, code: r.order_code } : null,
   }));
   if (!withTotal) return list;

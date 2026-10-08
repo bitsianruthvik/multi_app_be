@@ -171,7 +171,7 @@ export async function getFlow(db, companyId, id) {
   const out = shapeFlow(f);
   out.steps = await stepsOf(db, companyId, id);
   const [records] = await db.query(
-    `SELECT m.id, m.code, m.name, m.record_kind, i.item_type, d.definition_type FROM cf_master_records m
+    `SELECT m.id, m.code, m.short_name, m.name, m.record_kind, i.item_type, d.definition_type FROM cf_master_records m
        LEFT JOIN cf_item_details i ON i.master_id = m.id LEFT JOIN cf_definition_details d ON d.master_id = m.id
       WHERE m.company_id = ? AND m.default_flow_id = ? AND m.deleted_at IS NULL ORDER BY m.code LIMIT 100`,
     [companyId, id],
@@ -180,7 +180,7 @@ export async function getFlow(db, companyId, id) {
   // The list above stops at 100; this is every record that names the flow (same WHERE, still one cheap COUNT).
   const [[{ record_count: recordCount }]] = await db.query('SELECT COUNT(*) AS record_count FROM cf_master_records WHERE company_id = ? AND default_flow_id = ? AND deleted_at IS NULL', [companyId, id]);
   out.uses = {
-    records: records.map((r) => ({ id: r.id, code: r.code, name: r.name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type })),
+    records: records.map((r) => ({ id: r.id, code: r.code, shortName: r.short_name ?? null, name: r.name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type })),
     bomLines: Number(lines),
     recordCount: Number(recordCount),
   };
