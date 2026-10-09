@@ -407,8 +407,10 @@ function sameWord(a, b) {
  *            that box, each weighted by how near the piece is to it (a line for one column, a
  *            surface for two, the same in more). A corner row the chart has not got is a gap, said
  *            in words — never filled in.
- * Below the smallest or above the largest value is a gap too (no extending past the chart), and so
- * is a blank result (the machine cannot). Never a guess.
+ * Past the chart (user, 2026-10-09: "continue the line"): a straight-line chart EXTENDS each number
+ * column's line from its last two values (below the smallest, the first two) and says so in
+ * `extended`; it needs two values in that column to do it. Step up never extends — below or above
+ * its values is a gap. A blank result (the machine cannot) is always a gap. Never a silent guess.
  */
 export function lookupRows(table, inputs) {
   const EPS = 1e-9;
@@ -421,6 +423,8 @@ export function lookupRows(table, inputs) {
   const isNumber = (a) => a.kind !== 'level' && (a.dataType ?? 'number') === 'number';
   const blankResult = (v) => v == null || v === '' || !Number.isFinite(Number(v));
   const linear = table.mode === 'linear';
+  /** What was read past the chart's edge, in words (straight-line charts only). */
+  const extended = [];
 
   /** Keeps the rows of column i that fit the piece's value — a word, a node, or (step up) a number. */
   const narrow = (i) => {
@@ -448,8 +452,16 @@ export function lookupRows(table, inputs) {
     if (!Number.isFinite(x)) return { missingReason: `needs a number for ${labelOf(a)}` };
     const values = [...new Set(rows.map((r) => Number(r[i])).filter(Number.isFinite))].sort((p, q) => p - q);
     if (!values.length) return { missingReason: `has no number in ${labelOf(a)}` };
-    if (x < values[0] - EPS) return { missingReason: `${shown(x, a)} is below the chart, which starts at ${shown(values[0], a)}` };
-    if (x > values[values.length - 1] + EPS) return { missingReason: `${shown(x, a)} is above the chart, which ends at ${shown(values[values.length - 1], a)}` };
+    const below = x < values[0] - EPS;
+    const above = x > values[values.length - 1] + EPS;
+    if ((below || above) && linear && values.length >= 2) {
+      // Continue the line through the two values at that end.
+      const [lo, hi] = below ? [values[0], values[1]] : [values[values.length - 2], values[values.length - 1]];
+      extended.push(`${a.label ?? 'a column'} ${shown(x, a)} is ${below ? 'below' : 'above'} the chart (${below ? 'starts at' : 'ends at'} ${shown(below ? values[0] : values[values.length - 1], a)}) — the line from ${shown(lo, a)} to ${shown(hi, a)} is continued`);
+      return { lo, hi, t: (x - lo) / (hi - lo) };
+    }
+    if (below) return { missingReason: `${shown(x, a)} is below the chart, which starts at ${shown(values[0], a)}${linear ? ' (one row in that column — a line needs two to continue)' : ''}` };
+    if (above) return { missingReason: `${shown(x, a)} is above the chart, which ends at ${shown(values[values.length - 1], a)}${linear ? ' (one row in that column — a line needs two to continue)' : ''}` };
     const exact = values.find((w) => Math.abs(w - x) < EPS);
     if (exact != null) return { exact };
     const lo = values.filter((w) => w < x).pop();
@@ -483,14 +495,14 @@ export function lookupRows(table, inputs) {
   let value = 0;
   for (const corner of corners) {
     const weight = corner.reduce((m, s) => m * s.w, 1);
-    if (weight < EPS) continue;
+    if (Math.abs(weight) < EPS) continue;
     const row = rows.find((r) => corner.every((s) => Math.abs(Number(r[s.i]) - s.at) < EPS));
     const where = corner.map((s) => `${axes[s.i].label} ${shown(s.at, axes[s.i])}`).join(', ');
     if (!row) return { missingReason: `needs a row at ${where} to work out a value in between` };
     if (blankResult(row[axes.length])) return { missingReason: `has a blank result at ${where} — the chart marks it as not possible` };
     value += weight * Number(row[axes.length]);
   }
-  return { value };
+  return extended.length ? { value, extended } : { value };
 }
 
 export function evaluateFormula(parsed, lookup, children = null, context = null, lookupTable = null) {
@@ -522,6 +534,8 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   }
   if (missing.length) return { value: null, missing: [...new Set(missing)] };
 
+  /** Things worth saying about how the value was found (a chart read past its edge). */
+  const notes = [];
   const bool = (x) => (x ? 1 : 0);
   function rollup(n) {
     const arg = n.args[0];
@@ -561,6 +575,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
       const inputs = alignedArgs(table, n.args.slice(1)).map((a) => ev(a, child, true));
       const out = lookupRows(table, inputs);
       if (out.missingReason) throw new MissingValueError(`${named} ${out.missingReason}`);
+      if (out.extended) notes.push(...out.extended.map((e) => `${named}: ${e}`));
       return out.value;
     }
     const axisCount = Array.isArray(table.y) && table.y.length ? 2 : 1;
@@ -634,7 +649,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   try {
     const value = ev(parsed.ast);
     if (!Number.isFinite(value)) return { value: null, error: 'The result is not a finite number.' };
-    return { value: Number(value.toFixed(6)) };
+    return notes.length ? { value: Number(value.toFixed(6)), notes: [...new Set(notes)] } : { value: Number(value.toFixed(6)) };
   } catch (e) {
     // A LOOKUP outside its chart's range, or on a null cell, is a data gap —
     // reported the way every other unmeasured input is, not as a formula bug.

@@ -40,7 +40,19 @@ ok('a straight line over two number columns, a word and a tree level between the
 ok('…on an edge only two corners count', Math.abs(lookupRows(grid, [15, 'E350', 1, PP]).value - 15) < 1e-9 && Math.abs(lookupRows(grid, [10, 'E350', 2, PP]).value - 20) < 1e-9);
 ok('…a value exactly on a row is that row', lookupRows(grid, [20, 'E350', 3, PP]).value === 40);
 ok('a missing corner is said in words, never filled in', /needs a row at Thickness 10 mm, Coats 3/.test(lookupRows(grid, [15, 'E250', 2, PP]).missingReason ?? ''), lookupRows(grid, [15, 'E250', 2, PP]).missingReason);
-ok('outside the chart is a gap, no extending', /above the chart/.test(lookupRows(grid, [25, 'E350', 2, PP]).missingReason ?? ''));
+{
+  // Past the edge (2026-10-09 "continue the line"): thickness 25 on rows of 10 and 20 → t = 1.5; coats 2 → 0.5.
+  // 1 coat: 10 + 1.5 × 10 = 25; 3 coats: 30 + 1.5 × 10 = 45; between them 35.
+  const up = lookupRows(grid, [25, 'E350', 2, PP]);
+  ok('past the chart a straight line is continued, in every number column at once, and said', Math.abs((up.value ?? -1) - 35) < 1e-9 && /continued/.test((up.extended ?? []).join(' ')), JSON.stringify(up));
+  const both = lookupRows(grid, [5, 'E350', 4, PP]);
+  // thickness 5 → t = -0.5, coats 4 → t = 1.5: 10·1.5·(-0.5) + 20·(-0.5)·(-0.5) + 30·1.5·1.5 + 40·(-0.5)·1.5 ... = bilinear extension
+  const expect = 10 * 1.5 * -0.5 + 20 * -0.5 * -0.5 + 30 * 1.5 * 1.5 + 40 * -0.5 * 1.5;
+  ok('…below in one column and above in another together', Math.abs((both.value ?? -1e9) - expect) < 1e-9 && both.extended?.length === 2, JSON.stringify(both));
+  ok('step up never extends: past its rows is a gap', /above the chart/.test(lookupRows({ ...grid, mode: 'step_up' }, [25, 'E350', 2, PP]).missingReason ?? ''));
+  const one = { mode: 'linear', axes: [NUM('Hole', 'mm'), NUM('Thickness', 'mm')], rows: [[21, 10, 1], [21, 20, 2]] };
+  ok('a column with a single value cannot be continued — said in words', /a line needs two/.test(lookupRows(one, [26, 15]).missingReason ?? ''), lookupRows(one, [26, 15]).missingReason);
+}
 ok('step up on the same rows is unchanged (20 mm, 3 coats)', lookupRows({ ...grid, mode: 'step_up' }, [15, 'E350', 2, PP]).value === 40);
 
 const [tables] = await pool.query("SELECT TABLE_NAME name FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'cf\\_%' ORDER BY TABLE_NAME");
