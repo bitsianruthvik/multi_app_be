@@ -52,9 +52,10 @@ export function contractCharts(expr, bindings) {
     const fields = bindings.get(name.toUpperCase());
     if (!fields) return whole;
     const args = rest.split(',').map((a) => a.trim());
-    // Its own columns in any order: a column reads its own value whatever order they are written in (formulaEngine.alignedArgs).
-    const names = args.map((a) => (/^item\./i.test(a) ? a.slice(5).toUpperCase() : null));
-    const same = args.length === fields.length && names.every(Boolean) && new Set(names).size === names.length && fields.every((f) => names.includes(String(f).toUpperCase()));
+    // Only its own columns IN ITS ORDER become the name; anything else is shown exactly as it was written
+    // (2026-10-09: a LOOKUP typed in another order came back as the bare name and read as a reset).
+    // The engine reads each column by its own value either way (formulaEngine.alignedArgs).
+    const same = args.length === fields.length && args.every((a, i) => a.toLowerCase() === `item.${fields[i]}`.toLowerCase());
     return same ? `machine.${name.toUpperCase()}` : whole;
   });
 }
