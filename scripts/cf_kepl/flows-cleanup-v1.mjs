@@ -90,7 +90,13 @@ const FLOWS = [
   { code: 'BRACING', name: 'Bracing — fit-up, welding, finishing', steps: [['XFRAMEFIT', []], ['MIGWELD', []], ['BLAST', []], ['METALLIZE', []], ['PAINT', []]] },
   { code: 'SEISMIC-STOPPER', name: 'Seismic stopper — finishing', steps: [['BLAST', []], ['METALLIZE', []], ['PAINT', []]] },
   { code: 'PLAIN-PART', name: 'Plain part — dimensional QC (its cutting is on the cut piece)', steps: [['PARTQC', []]] },
-  { code: 'SPLICE-SET', name: 'Splice set — completion check', steps: [['SETCHECK', []]] },
+  // The set is checked once its plates are DRILLED, not finished: their finishing waits for the span's
+  // dismantling, and the girder line (the set's parent) waits for the set before line matching — a
+  // wait for the plates to be complete would close a circle through trial assembly.
+  { code: 'SPLICE-SET', name: 'Splice set — completion check', steps: [['SETCHECK', [
+    { rel: 'children', def: SPLICE_OUTER, op: 'CNCDRILL' },
+    { rel: 'children', def: SPLICE_INNER, op: 'MANDRILL-INNER' },
+  ]]] },
   { code: 'CUT-PLATE', name: 'Cut piece from a plate nest — CNC plasma', steps: [['CNCP-CUT', []]] },
   { code: 'CUT-SECTION', name: 'Cut piece from a section — gas cutting', steps: [['GASCUT', []]] },
 ];
