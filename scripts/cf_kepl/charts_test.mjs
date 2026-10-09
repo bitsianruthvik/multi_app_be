@@ -29,6 +29,19 @@ ok('…but a LOOKUP with other arguments stays long', contractCharts('LOOKUP(mac
 const round = 'item.HOLES * DRILL_TIME / 60 + item.CUT_LENGTH / GAS_CUT_SPEED';
 ok('short → long → short is the same text', contractCharts(expandCharts(round, B), B) === round);
 
+// --- pure: straight lines across every number column (2026-10-09) ---------------
+const { lookupRows } = await import('../../apps/cf_erp/services/formulaEngine.js');
+const NUM = (label, unit) => ({ kind: 'spec', dataType: 'number', label, unit });
+const grid = { mode: 'linear', axes: [NUM('Thickness', 'mm'), { kind: 'spec', dataType: 'option', label: 'Grade' }, NUM('Coats', null), { kind: 'level', label: 'Variant' }],
+  rows: [[10, 'E350', 1, 7, 10], [20, 'E350', 1, 7, 20], [10, 'E350', 3, 7, 30], [20, 'E350', 3, 7, 40], [10, 'E250', 1, 7, 5], [20, 'E250', 3, 7, 9]] };
+const PP = { id: 7, name: 'Plate part' };
+ok('a straight line over two number columns, a word and a tree level between them: the four corners blended', Math.abs(lookupRows(grid, [15, 'E350', 2, PP]).value - 25) < 1e-9);
+ok('…on an edge only two corners count', Math.abs(lookupRows(grid, [15, 'E350', 1, PP]).value - 15) < 1e-9 && Math.abs(lookupRows(grid, [10, 'E350', 2, PP]).value - 20) < 1e-9);
+ok('…a value exactly on a row is that row', lookupRows(grid, [20, 'E350', 3, PP]).value === 40);
+ok('a missing corner is said in words, never filled in', /needs a row at Thickness 10 mm, Coats 3/.test(lookupRows(grid, [15, 'E250', 2, PP]).missingReason ?? ''), lookupRows(grid, [15, 'E250', 2, PP]).missingReason);
+ok('outside the chart is a gap, no extending', /above the chart/.test(lookupRows(grid, [25, 'E350', 2, PP]).missingReason ?? ''));
+ok('step up on the same rows is unchanged (20 mm, 3 coats)', lookupRows({ ...grid, mode: 'step_up' }, [15, 'E350', 2, PP]).value === 40);
+
 const [tables] = await pool.query("SELECT TABLE_NAME name FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'cf\\_%' ORDER BY TABLE_NAME");
 const counts = async () => (await pool.query(tables.map((t) => `SELECT '${t.name}' AS name,COUNT(*) AS n FROM \`${t.name}\``).join(' UNION ALL ')))[0];
 const before = await counts();

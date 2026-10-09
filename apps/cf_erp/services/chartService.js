@@ -10,8 +10,8 @@
  *            text; its heading is the specification's name and its unit) or a LEVEL of the tree
  *            (Family, Subfamily, Variant — a cell names a node at that level);
  *   result   one number: the chart's name and unit (e.g. Drill time, s);
- *   mode     a number between two rows steps up to the next row, or (the last input) reads a
- *            straight line;
+ *   mode     a number between two rows steps up to the next row, or every number column reads
+ *            on straight lines at once (formulaEngine.lookupRows);
  *   rows     [[in1, …, inN, result], …] — read left to right by formulaEngine.lookupRows.
  * One form on the machine type or machine page creates the specification, its rule where it was
  * added (defaulted: a machine type's chart is every machine's of that type unless a machine has
@@ -183,7 +183,7 @@ function readInputs(raw, fields, problems) {
       if (seen.has(f.code)) problems.push(`${which}: ${f.name} is already a column.`);
       seen.add(f.code);
       const unit = blank(a.unit) ? f.unit : String(a.unit).trim();
-      if (f.data_type === 'number' && blank(unit)) problems.push(`${which}: ${f.name} has no unit — say which one.`);
+      // A count (coats, holes, studs) has no unit and needs none: its heading is just its name (user, 2026-10-09).
       return { kind: 'spec', field: f.code, label: f.name, unit: f.data_type === 'number' ? unit : null, dataType: f.data_type };
     }
     problems.push(`${which}: pick a specification of the piece, or a level of the tree.`);

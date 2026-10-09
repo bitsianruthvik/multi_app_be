@@ -181,7 +181,26 @@ export async function updateSpec(db, c, id, input = {}) {
       // relabel or a change of lookup mode does not touch the shape, so those
       // stay free even with values on record.
       const already = spec.data_type === 'table' ? parseJson(spec.table_config) : null;
-      const next = readTableConfig(input.tableConfig, problems);
+      // A chart's columns carry more than this editor shows — the piece's value each is read by
+      // (field), a tree level, its kind, the rows format (version 2). This editor only relabels,
+      // changes a unit or how rows are read; it never drops the rest (2026-10-09: GAS_CUT_SPEED
+      // lost its Thickness link this way and stopped reading by its name).
+      if (already && (already.version >= 2 || (already.axes ?? []).some((a) => a.field || a.kind))) {
+        const inAxes = Array.isArray(input.tableConfig?.axes) ? input.tableConfig.axes : [];
+        const mode = input.tableConfig?.mode ? String(input.tableConfig.mode).trim() : (already.mode ?? 'step_up');
+        if (!TABLE_MODES.includes(mode)) problems.push(`How to read between rows is ${TABLE_MODES.join(' or ')}.`);
+        if (inAxes.length && inAxes.length !== (already.axes ?? []).length) problems.push(`${spec.code} is a chart of ${already.axes.length} column${already.axes.length === 1 ? '' : 's'} — change its columns on the machine type's Charts tab.`);
+        const axes = (already.axes ?? []).map((a, i) => {
+          const given = inAxes[i];
+          if (!given) return a;
+          const label = String(given.label ?? '').trim() || a.label;
+          const unit = given.unit === undefined ? a.unit : (given.unit ? String(given.unit).trim() : null);
+          return { ...a, label, unit };
+        });
+        fields.table_config = JSON.stringify({ ...already, axes, mode });
+        assertNoProblems(problems);
+      }
+      const next = fields.table_config ? null : readTableConfig(input.tableConfig, problems);
       if (already && next && already.axes.length !== next.axes.length) {
         const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [c.companyId, id]);
         if (Number(n)) problems.push(`${spec.code} already has ${n} chart value(s) built for ${already.axes.length} axis${already.axes.length === 1 ? '' : 'es'} — changing to ${next.axes.length} would not match them. Retire it and make a new one instead.`);

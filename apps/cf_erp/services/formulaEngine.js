@@ -394,13 +394,21 @@ function sameWord(a, b) {
 
 /**
  * A ROWS chart: table.axes describe the inputs ({ kind: 'spec', dataType, unit } or
- * { kind: 'level' }), table.rows = [[in1, …, inN, result], …]. Read left to right:
- *   a level column keeps the rows whose node is the piece's node at that level (by id);
- *   a word column (pick-list, text) keeps the rows that say the same word;
- *   a number column keeps the rows AT the first value at or above the piece's (step up) —
- *   below the smallest or above the largest is a gap, said in words; in 'linear' mode the
- *   LAST input, when it is a number, reads a straight line between the rows around it.
- * One row left gives the result; a blank result is a gap too. Never a guess.
+ * { kind: 'level' }), table.rows = [[in1, …, inN, result], …].
+ *
+ * WORD AND TREE COLUMNS make groups: a level column keeps the rows whose node is the piece's node
+ * at that level (by id), a word column (pick-list, text) the rows that say the same word.
+ *
+ * NUMBER COLUMNS, inside the piece's group (user, 2026-10-09: "if it is a metric then it will be
+ * varying proportionally like a straight line vector in multi dimensional space"):
+ *   step_up  read left to right: the rows AT the first value at or above the piece's;
+ *   linear   every number column at once — for each, the values just below and above the piece's
+ *            (one, when it sits on a row), and the result blended from the rows at every corner of
+ *            that box, each weighted by how near the piece is to it (a line for one column, a
+ *            surface for two, the same in more). A corner row the chart has not got is a gap, said
+ *            in words — never filled in.
+ * Below the smallest or above the largest value is a gap too (no extending past the chart), and so
+ * is a blank result (the machine cannot). Never a guess.
  */
 export function lookupRows(table, inputs) {
   const EPS = 1e-9;
@@ -410,44 +418,79 @@ export function lookupRows(table, inputs) {
   if (!rows.length) return { missingReason: 'has no rows yet' };
   const labelOf = (a) => `${a.label ?? 'a column'}${a.unit ? ` (${a.unit})` : ''}`;
   const shown = (v, a) => (v != null && typeof v === 'object' ? (v.name ?? v.code ?? v.id) : `${v}${a.unit ? ` ${a.unit}` : ''}`);
-  for (let i = 0; i < axes.length; i++) {
+  const isNumber = (a) => a.kind !== 'level' && (a.dataType ?? 'number') === 'number';
+  const blankResult = (v) => v == null || v === '' || !Number.isFinite(Number(v));
+  const linear = table.mode === 'linear';
+
+  /** Keeps the rows of column i that fit the piece's value — a word, a node, or (step up) a number. */
+  const narrow = (i) => {
     const a = axes[i];
     const v = inputs[i];
     if (a.kind === 'level') {
       const id = v != null && typeof v === 'object' ? Number(v.id) : null;
       rows = rows.filter((r) => id != null && Number(r[i]) === id);
-      if (!rows.length) return { missingReason: `has no row for ${labelOf(a)} ${shown(v, a)}` };
-      continue;
+      return rows.length ? null : `has no row for ${labelOf(a)} ${shown(v, a)}`;
     }
-    const isNumber = (a.dataType ?? 'number') === 'number';
-    if (!isNumber) {
+    if (!isNumber(a)) {
       rows = rows.filter((r) => sameWord(r[i], v));
-      if (!rows.length) return { missingReason: `has no row for ${labelOf(a)} "${shown(v, a)}"` };
-      continue;
+      return rows.length ? null : `has no row for ${labelOf(a)} "${shown(v, a)}"`;
     }
-    const x = Number(v);
+    const b = bracketOf(i);
+    if (b.missingReason) return b.missingReason;
+    const at = b.exact ?? b.hi;
+    rows = rows.filter((r) => Math.abs(Number(r[i]) - at) < EPS);
+    return null;
+  };
+  /** Where the piece's number sits among column i's values in the rows left: { exact } or { lo, hi, t }. */
+  const bracketOf = (i) => {
+    const a = axes[i];
+    const x = Number(inputs[i]);
     if (!Number.isFinite(x)) return { missingReason: `needs a number for ${labelOf(a)}` };
     const values = [...new Set(rows.map((r) => Number(r[i])).filter(Number.isFinite))].sort((p, q) => p - q);
     if (!values.length) return { missingReason: `has no number in ${labelOf(a)}` };
     if (x < values[0] - EPS) return { missingReason: `${shown(x, a)} is below the chart, which starts at ${shown(values[0], a)}` };
     if (x > values[values.length - 1] + EPS) return { missingReason: `${shown(x, a)} is above the chart, which ends at ${shown(values[values.length - 1], a)}` };
-    const last = i === axes.length - 1;
     const exact = values.find((w) => Math.abs(w - x) < EPS);
-    if (last && table.mode === 'linear' && exact == null) {
-      const lo = values.filter((w) => w < x).pop();
-      const hi = values.find((w) => w > x);
-      const rLo = rows.find((r) => Math.abs(Number(r[i]) - lo) < EPS);
-      const rHi = rows.find((r) => Math.abs(Number(r[i]) - hi) < EPS);
-      const vLo = rLo?.[axes.length]; const vHi = rHi?.[axes.length];
-      if (vLo == null || vHi == null || vLo === '' || vHi === '') return { missingReason: `has a blank result around ${shown(x, a)}` };
-      return { value: Number(vLo) + (Number(vHi) - Number(vLo)) * ((x - lo) / (hi - lo)) };
-    }
-    const at = exact ?? values.find((w) => w > x);
-    rows = rows.filter((r) => Math.abs(Number(r[i]) - at) < EPS);
+    if (exact != null) return { exact };
+    const lo = values.filter((w) => w < x).pop();
+    const hi = values.find((w) => w > x);
+    return { lo, hi, t: (x - lo) / (hi - lo) };
+  };
+
+  if (!linear) {
+    for (let i = 0; i < axes.length; i++) { const why = narrow(i); if (why) return { missingReason: why }; }
+    const out = rows[0][axes.length];
+    if (blankResult(out)) return { missingReason: 'has a blank result there — the chart marks it as not possible' };
+    return { value: Number(out) };
   }
-  const out = rows[0][axes.length];
-  if (out == null || out === '' || !Number.isFinite(Number(out))) return { missingReason: 'has a blank result there — the chart marks it as not possible' };
-  return { value: Number(out) };
+
+  // Straight lines: the piece's group first (every word and tree column, wherever it sits) …
+  for (let i = 0; i < axes.length; i++) if (!isNumber(axes[i])) { const why = narrow(i); if (why) return { missingReason: why }; }
+  const nums = axes.map((a, i) => (isNumber(a) ? i : -1)).filter((i) => i >= 0);
+  if (!nums.length) {
+    const out = rows[0][axes.length];
+    return blankResult(out) ? { missingReason: 'has a blank result there — the chart marks it as not possible' } : { value: Number(out) };
+  }
+  // … then every number column at once: the corners of the box around the piece, blended by nearness.
+  const sides = [];
+  for (const i of nums) {
+    const b = bracketOf(i);
+    if (b.missingReason) return { missingReason: b.missingReason };
+    sides.push(b.exact != null ? [{ i, at: b.exact, w: 1 }] : [{ i, at: b.lo, w: 1 - b.t }, { i, at: b.hi, w: b.t }]);
+  }
+  let corners = [[]];
+  for (const side of sides) corners = corners.flatMap((c) => side.map((s) => [...c, s]));
+  let value = 0;
+  for (const corner of corners) {
+    const weight = corner.reduce((m, s) => m * s.w, 1);
+    if (weight < EPS) continue;
+    const row = rows.find((r) => corner.every((s) => Math.abs(Number(r[s.i]) - s.at) < EPS));
+    const where = corner.map((s) => `${axes[s.i].label} ${shown(s.at, axes[s.i])}`).join(', ');
+    if (!row) return { missingReason: `needs a row at ${where} to work out a value in between` };
+    if (blankResult(row[axes.length])) return { missingReason: `has a blank result at ${where} — the chart marks it as not possible` };
+    value += weight * Number(row[axes.length]);
+  }
+  return { value };
 }
 
 export function evaluateFormula(parsed, lookup, children = null, context = null, lookupTable = null) {
