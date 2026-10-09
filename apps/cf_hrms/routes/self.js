@@ -1,7 +1,8 @@
 /**
- * self.js — the employee self view. One endpoint, one permission, no ids.
+ * self.js — the employee self view. Two endpoints, one permission, no ids.
  *
- *   GET /user/me/place   ?on=YYYY-MM-DD   gated on `cf_hrms_self_view`
+ *   GET /user/me/place      ?on=YYYY-MM-DD   gated on `cf_hrms_self_view`
+ *   GET /user/me/orgchart   ?on=YYYY-MM-DD   gated on `cf_hrms_self_view` (2026-10-09)
  *
  * It sits under `/user/` to match the platform's own URL shape
  * (`/api/:companySlug/:appSlug/user/*` is "authenticated user endpoints" —
@@ -9,10 +10,14 @@
  * no identifier in this path, so there is nothing for a caller to substitute.
  * The employee is found by `req.user.id` → `hrms_employees.user_id`.
  *
- * ── THIS FILE MUST STAY ONE ROUTE LONG ────────────────────────────────────
+ * ── THIS FILE ONLY EVER ANSWERS ABOUT "ME" ────────────────────────────────
  * `cf_hrms_self_view` is the only tag a shop-floor login holds, and the only
- * thing it may ever buy is the caller's own place in the organisation. Every
- * useful-sounding addition breaks that:
+ * thing it may ever buy is the caller's own place in the organisation. The
+ * second route, `/me/orgchart`, is that same place drawn as a chart: the
+ * caller's managers up to the top, their own seats, their branch below and
+ * their dotted-line managers — computed server-side from the caller's own
+ * seats, field-whitelisted, never the whole graph (selfOrgChartService.js).
+ * It takes no id either. Every other useful-sounding addition breaks the rule:
  *
  *   - a `?employeeId=` parameter turns it into a people directory;
  *   - a "my team's attendance" route turns it into the attendance screen with
@@ -35,6 +40,7 @@ import { Router } from 'express';
 import { pool } from '../lib/db.js';
 import { PERM, guard, handle, ctx, dateParam, canSeePii } from '../lib/http.js';
 import { myPlace } from '../services/selfService.js';
+import { myOrgChart } from '../services/selfOrgChartService.js';
 
 const router = Router();
 
@@ -50,6 +56,17 @@ router.get('/user/me/place', guard(PERM.selfView), handle((req) => myPlace(
   pool,
   ctx(req),
   { on: dateParam(req.query.on), canSeePii: canSeePii(req) },
+)));
+
+/**
+ * My slice of the org chart. The company graph is read server-side and cut to
+ * the caller's slice before anything leaves; `/orgchart` itself stays on
+ * `cf_hrms_org_view`, and this tag must never be added to its guard.
+ */
+router.get('/user/me/orgchart', guard(PERM.selfView), handle((req) => myOrgChart(
+  pool,
+  ctx(req),
+  { on: dateParam(req.query.on) },
 )));
 
 export default router;

@@ -67,7 +67,7 @@ const POSITIONS_SQL = `
   SELECT p.id, p.position_code, p.position_title, p.role_id, p.department_id, p.location_id,
          p.sanctioned_headcount, p.default_shift_id, p.status, p.effective_from, p.effective_to,
          r.title AS role_title, r.role_code,
-         d.name AS department_name, l.name AS location_name,
+         d.name AS department_name, d.code AS department_code, d.parent_department_id AS department_parent_id, l.name AS location_name,
          s.code AS shift_code, s.name AS shift_name
     FROM hrms_positions p
     LEFT JOIN hrms_roles       r ON r.company_id = p.company_id AND r.id = p.role_id
@@ -77,6 +77,41 @@ const POSITIONS_SQL = `
    WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED'
      AND ${LIVE_ON('p')}
    ORDER BY p.position_code, p.id`;
+
+/**
+ * The unit tree, read only to RANK units for the chart's process boxes (spec
+ * §15): a pre-order walk, siblings by code then id, so "Purchase · PPC ·
+ * Production · Quality …" comes out in the client's own order. Inactive units
+ * still rank — a position can sit in one.
+ */
+const DEPARTMENTS_SQL = `
+  SELECT id, code, parent_department_id
+    FROM hrms_departments
+   WHERE company_id = ? AND deleted_at IS NULL`;
+
+function departmentRanks(rows) {
+  const kids = new Map();
+  const ids = new Set(rows.map((r) => r.id));
+  const byCode = (a, b) => String(a.code ?? '').localeCompare(String(b.code ?? ''), undefined, { numeric: true }) || a.id - b.id;
+  for (const r of rows) {
+    const parentId = r.parent_department_id != null && ids.has(r.parent_department_id) ? r.parent_department_id : 0;
+    if (!kids.has(parentId)) kids.set(parentId, []);
+    kids.get(parentId).push(r);
+  }
+  const rank = new Map();
+  const walk = (parentId, guard) => {
+    if (guard > 64) return;
+    for (const r of (kids.get(parentId) ?? []).sort(byCode)) {
+      if (rank.has(r.id)) continue;
+      rank.set(r.id, rank.size);
+      walk(r.id, guard + 1);
+    }
+  };
+  walk(0, 0);
+  // A unit caught in a parent cycle never reaches the walk; rank it last rather than drop it.
+  for (const r of [...rows].sort(byCode)) if (!rank.has(r.id)) rank.set(r.id, rank.size);
+  return rank;
+}
 
 /** Every live reporting edge in the company, typed and scoped. Never filtered by type. */
 const EDGES_SQL = `
@@ -278,7 +313,7 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
 
   const [
     [positionRows], [edgeRows], [occupantRows], [contextRows],
-    [requirementRows], [contentRows], [overrideRows], [openPointRows],
+    [requirementRows], [contentRows], [overrideRows], [openPointRows], [departmentRows],
   ] = await Promise.all([
     db.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     db.query(EDGES_SQL, [companyId, asOf, asOf]),
@@ -288,7 +323,9 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     db.query(CONTENT_COUNTS_SQL, [companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf]),
     db.query(OVERRIDE_COUNTS_SQL, [companyId, asOf, asOf]),
     db.query(OPEN_POINT_COUNTS_SQL, [companyId]),
+    db.query(DEPARTMENTS_SQL, [companyId]),
   ]);
+  const departmentRank = departmentRanks(departmentRows);
 
   const employeeIds = [...new Set(occupantRows.map((o) => o.employee_id))];
   const attendanceRows = employeeIds.length
@@ -422,6 +459,12 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       roleTitle: p.role_title ?? null,
       departmentId: p.department_id ?? null,
       departmentName: p.department_name ?? null,
+      // Spec §15: the unit's code is the code of the seat that heads it, and the
+      // rank orders the chart's process boxes in the unit tree's order.
+      departmentCode: p.department_code ?? null,
+      departmentRank: p.department_id != null ? (departmentRank.get(p.department_id) ?? null) : null,
+      // A ROOT unit (no parent) is leadership: the chart keeps its teams a plain tree.
+      departmentIsRoot: p.department_id != null && p.department_name != null && p.department_parent_id == null,
       locationId: p.location_id ?? null,
       locationName: p.location_name ?? null,
       status: p.status,

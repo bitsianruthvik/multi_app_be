@@ -30,8 +30,9 @@ export const PERM = {
   /**
    * `selfView` is the odd one in the other direction: it is the ONLY tag that
    * grants a person something about THEMSELVES rather than about the company.
-   * It gates exactly one route — GET /user/me/place — and nothing else in this
-   * app checks it. That is deliberate and it must stay that way: a shop-floor
+   * It gates exactly two routes — GET /user/me/place and GET /user/me/orgchart
+   * (the employee's own slice of the chart, cut on the server) — and nothing
+   * else in this app checks it. That is deliberate and it must stay that way: a shop-floor
    * employee holding only this tag can see their own seat, their own managers,
    * their own team and their own responsibilities, and gets a 403 from every
    * other endpoint in the app.
