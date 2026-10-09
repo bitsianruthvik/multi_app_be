@@ -43,9 +43,11 @@ const t0 = Date.now();
 const lap = () => `${((Date.now() - t0) / 1000).toFixed(0)}s`;
 
 // ---------------------------------------------------------------------------- the plan
-const RENAME = { 'CG-STIFFFIT-2': 'STIFFFIT-FLIP', 'CG-BRACEFIT': 'XFRAMEFIT' };
-const DELETE_OPS = ['CG-WELDTBD', 'ASSY', 'BLAST', 'CRNTN', 'Cut', 'DRILL', 'FQC', 'METAL', 'PAINT', 'SAW', 'TUG', 'WQC'];
-const INACTIVE_OPS = ['CRNMV', 'EDGEP', 'PQC'];
+const RENAME = { 'CG-STIFFFIT-2': 'STIFFFIT-FLIP', 'CG-BRACEFIT': 'XFRAMEFIT', PQC: 'PARTQC', FQC: 'SETCHECK' };
+// Every made piece needs a flow (release refuses one without): plain parts get a QC step, sets a completion check.
+const RENAME_NAME = { PARTQC: 'Part QC (dimensional)', SETCHECK: 'Set completion check', XFRAMEFIT: 'X-frame / bracing fit-up' };
+const DELETE_OPS = ['CG-WELDTBD', 'ASSY', 'BLAST', 'CRNTN', 'Cut', 'DRILL', 'METAL', 'PAINT', 'SAW', 'TUG', 'WQC'];
+const INACTIVE_OPS = ['CRNMV', 'EDGEP'];
 const SPLICE_OUTER = ['CP', 'WCP', 'TIC', 'BIC', 'BOP', 'TOS', 'BOS', 'WSP'];
 const SPLICE_INNER = ['TIS', 'BIS'];
 // steps: [operation, waits[]]; a wait: { rel, def?: short name(s), op?, status? }
@@ -87,6 +89,8 @@ const FLOWS = [
   { code: 'HOLED-PART', name: 'Holed part — manual drilling', steps: [['MANDRILL', []]] },
   { code: 'BRACING', name: 'Bracing — fit-up, welding, finishing', steps: [['XFRAMEFIT', []], ['MIGWELD', []], ['BLAST', []], ['METALLIZE', []], ['PAINT', []]] },
   { code: 'SEISMIC-STOPPER', name: 'Seismic stopper — finishing', steps: [['BLAST', []], ['METALLIZE', []], ['PAINT', []]] },
+  { code: 'PLAIN-PART', name: 'Plain part — dimensional QC (its cutting is on the cut piece)', steps: [['PARTQC', []]] },
+  { code: 'SPLICE-SET', name: 'Splice set — completion check', steps: [['SETCHECK', []]] },
   { code: 'CUT-PLATE', name: 'Cut piece from a plate nest — CNC plasma', steps: [['CNCP-CUT', []]] },
   { code: 'CUT-SECTION', name: 'Cut piece from a section — gas cutting', steps: [['GASCUT', []]] },
 ];
@@ -95,7 +99,10 @@ const DEF_FLOW = {
   ...Object.fromEntries(SPLICE_OUTER.map((s) => [s, 'SPLICE-OUTER'])), ...Object.fromEntries(SPLICE_INNER.map((s) => [s, 'SPLICE-INNER'])),
   IDW: 'HOLED-PART', ISH: 'HOLED-PART', ESH: 'HOLED-PART', BSH: 'HOLED-PART', SP: 'HOLED-PART', GSP: 'HOLED-PART',
   BLB: 'BRACING', STP: 'SEISMIC-STOPPER',
+  SPLC: 'SPLICE-SET', STO: 'SPLICE-SET', STI: 'SPLICE-SET', SBO: 'SPLICE-SET', SBI: 'SPLICE-SET', SWB: 'SPLICE-SET',
 };
+/** Any other plate or profile part definition: a plain part. */
+const PART_NODES = ['Plate part', 'Profile part'];
 // BOM lines that named an old flow → the new one (null = take the child's own).
 const LINE_FLOW = { 'CG-HOLEDPART': 'HOLED-PART', 'CG-BRACEGUSSET': 'HOLED-PART', 'CG-BLB': 'BRACING', 'CG-PLATEPART': null, 'CG-BRACEANGLE': null };
 const LINE_FLOW_STP = (childName) => (/SEISMIC STOPPER/i.test(childName) ? 'SEISMIC-STOPPER' : null);
@@ -143,7 +150,7 @@ try {
   say(`   inactive (only the old released steps used them): ${INACTIVE_OPS.join(', ')}`);
   const renamed = [];
   for (const o of [...byCode.values()]) {
-    if (!o.code.startsWith('CG-')) continue;
+    if (!o.code.startsWith('CG-') && !RENAME[o.code]) continue;
     const to = RENAME[o.code] ?? o.code.slice(3);
     if (byCode.has(to)) throw new Error(`Cannot rename ${o.code}: ${to} already exists.`);
     await db.query('UPDATE cf_operations SET code = ? WHERE company_id = ? AND id = ?', [to, COMPANY, o.id]);
@@ -151,8 +158,8 @@ try {
     renamed.push(`${o.code}→${to}`);
   }
   say(`   renamed: ${renamed.join(', ')}`);
+  for (const [code, name] of Object.entries(RENAME_NAME)) await db.query("UPDATE cf_operations SET name = ?, status = 'active' WHERE company_id = ? AND id = ?", [name, COMPANY, byCode.get(code).id]);
   const xf = byCode.get('XFRAMEFIT');
-  await db.query("UPDATE cf_operations SET name = 'X-frame / bracing fit-up' WHERE id = ?", [xf.id]);
   const arc = await one("SELECT id FROM cf_classification_nodes WHERE company_id = ? AND scope = 'machine' AND deleted_at IS NULL AND name = 'Arc welding'");
   if (!(await one('SELECT id FROM cf_operation_machine_rules WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [xf.id]))) {
     await createTimingRule(db, c, xf.id, { subjectType: 'classification', subjectId: arc.id, workExpression: '240' });
@@ -191,16 +198,18 @@ try {
   // ---------------------------------------------------------------- 4. defaults
   say('\n4. Default flows and BOM lines');
   const tmpl = await rows(
-    `SELECT m.id, m.short_name, m.default_flow_id FROM cf_master_records m JOIN cf_definition_details dd ON dd.master_id = m.id AND dd.deleted_at IS NULL AND dd.definition_type = 'template'
+    `SELECT m.id, m.short_name, m.default_flow_id, n.name AS node FROM cf_master_records m JOIN cf_definition_details dd ON dd.master_id = m.id AND dd.deleted_at IS NULL AND dd.definition_type = 'template'
+       LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
       WHERE m.company_id = ? AND m.deleted_at IS NULL`);
   let set = 0; let cleared = 0;
   for (const d of tmpl) {
-    const to = DEF_FLOW[d.short_name] ? newFlow.get(DEF_FLOW[d.short_name]) : null;
+    const code = DEF_FLOW[d.short_name] ?? (PART_NODES.includes(d.node) ? 'PLAIN-PART' : null);
+    const to = code ? newFlow.get(code) : null;
     if (Number(d.default_flow_id ?? 0) === Number(to ?? 0)) continue;
     await db.query('UPDATE cf_master_records SET default_flow_id = ? WHERE id = ?', [to, d.id]);
     if (to) set++; else cleared++;
   }
-  say(`   definitions: ${set} set to a new flow, ${cleared} cleared (plain parts, profile parts and sets have no flow of their own)`);
+  say(`   definitions: ${set} set to a new flow, ${cleared} cleared (the bowstring assemblies, which had none)`);
   const lines = await rows(
     `SELECT bl.id, bl.operation_flow_id, cm.name AS child FROM cf_bom_lines bl JOIN cf_master_records cm ON cm.id = bl.child_id
       WHERE bl.company_id = ? AND bl.deleted_at IS NULL AND bl.operation_flow_id IN (?)`, [oldFlowIds.length ? oldFlowIds : [0]]);
