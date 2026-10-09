@@ -43,7 +43,8 @@ import { syncRecordsUsingFlows } from './flowSpecService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const TRANSITIONS = { draft: ['active'], active: ['obsolete'], obsolete: ['active'] };
-export const RELATIONS = ['parent', 'children', 'siblings', 'ancestor'];
+/** descendants (2026-10-10): every piece below at any depth — a span's trial assembly waits for its girder segments, two levels down. */
+export const RELATIONS = ['parent', 'children', 'siblings', 'ancestor', 'descendants'];
 const blank = (v) => v == null || String(v).trim() === '';
 
 async function requireFlow(db, companyId, id) {
@@ -131,7 +132,7 @@ async function stepsOf(db, companyId, flowId) {
   }));
 }
 
-const RELATION_TEXT = { parent: 'its parent', children: 'its children', siblings: 'its siblings' };
+const RELATION_TEXT = { parent: 'its parent', children: 'its children', siblings: 'its siblings', descendants: 'every piece below it' };
 
 /** The rule in one sentence, as the flow screen and the tracker will show it. */
 export function waitText(w) {
@@ -139,7 +140,7 @@ export function waitText(w) {
   const who = w.relation === 'ancestor'
     ? `the nearest ${madeFrom ?? 'ancestor'} above it`
     : `${RELATION_TEXT[w.relation]}${madeFrom && w.relation !== 'parent' ? ` made from ${madeFrom}` : ''}`;
-  const plural = w.relation === 'children' || w.relation === 'siblings';
+  const plural = w.relation === 'children' || w.relation === 'siblings' || w.relation === 'descendants';
   const started = w.required_status === 'started';
   if (w.target_operation_id) {
     // Which pass, said out loud rather than left to be inferred: a flow may run
@@ -519,7 +520,7 @@ export async function removeStep(db, c, stepId) {
 
 /**
  * input: { relation, targetDefinitionId?, targetOperationId?, requiredStatus? }
- *   relation parent | children | siblings | ancestor
+ *   relation parent | children | siblings | ancestor | descendants (every piece below, at any depth)
  *   targetDefinitionId narrows children / siblings to those made from a template
  *     definition; for ancestor it is required (the nearest one of that kind)
  *   targetOperationId  the OPERATION to wait for; empty = the target as a whole.
@@ -532,7 +533,7 @@ export async function addWaitRule(db, c, stepId, input = {}) {
   if (step.flow_status === 'obsolete') throw invalid('OBSOLETE', `${step.flow_code} is obsolete — reactivate it to change its steps.`);
   const problems = [];
   const relation = String(input.relation ?? '');
-  if (!RELATIONS.includes(relation)) problems.push('Wait for its parent, its children, its siblings or an ancestor.');
+  if (!RELATIONS.includes(relation)) problems.push('Wait for its parent, its children, its siblings, an ancestor or the pieces below it.');
   let definitionId = null;
   if (!blank(input.targetDefinitionId)) {
     const def = await loadMaster(db, c.companyId, Number(input.targetDefinitionId));

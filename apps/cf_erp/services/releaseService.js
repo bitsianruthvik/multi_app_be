@@ -244,14 +244,18 @@ function planSteps(plan) {
       if (w.relation === 'parent') targets = node.parentK != null ? [nodes[node.parentK]] : [];
       else if (w.relation === 'children') targets = node.childKs.map((k) => nodes[k]);
       else if (w.relation === 'siblings') targets = node.parentK != null ? nodes[node.parentK].childKs.filter((k) => k !== node.k).map((k) => nodes[k]) : [];
-      else {
+      else if (w.relation === 'descendants') {
+        // Every piece below, at any depth (2026-10-10).
+        const stack = [...node.childKs];
+        while (stack.length) { const k = stack.pop(); targets.push(nodes[k]); stack.push(...nodes[k].childKs); }
+      } else {
         let p = node.parentK != null ? nodes[node.parentK] : null;
         while (p && p.madeFrom !== w.target_definition_id) p = p.parentK != null ? nodes[p.parentK] : null;
         targets = p ? [p] : [];
       }
       if (w.target_definition_id && w.relation !== 'ancestor') targets = targets.filter((t) => t.madeFrom === w.target_definition_id);
       if (!targets.length) continue; // the rule finds nothing here, so it does not apply
-      const plural = w.relation === 'children' || w.relation === 'siblings';
+      const plural = w.relation === 'children' || w.relation === 'siblings' || w.relation === 'descendants';
       const hits = [];
       for (const t of targets) {
         if (w.target_operation_id) {

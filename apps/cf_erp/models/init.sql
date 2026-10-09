@@ -963,7 +963,7 @@ CREATE TABLE IF NOT EXISTS cf_step_wait_rules (
   id                    INT        AUTO_INCREMENT PRIMARY KEY,
   company_id            INT        NOT NULL,
   flow_step_id          INT        NOT NULL,
-  relation              ENUM('parent','children','siblings','ancestor') NOT NULL,
+  relation              ENUM('parent','children','siblings','ancestor','descendants') NOT NULL,
   target_definition_id  INT        NULL,
   target_operation_id   INT        NULL,
   required_status       ENUM('started','done') NOT NULL DEFAULT 'done',
@@ -4929,4 +4929,14 @@ SET @sql = IF(@col = 0, 'ALTER TABLE cf_part_drawings ADD COLUMN drawing_id INT 
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND INDEX_NAME = 'idx_cpd_drawing');
 SET @sql = IF(@key = 0, 'ALTER TABLE cf_part_drawings ADD KEY idx_cpd_drawing (company_id, drawing_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §53  Wait for every piece below (2026-10-10)
+-- ============================================================================
+-- relation 'descendants': every node under the waiting one, at any depth,
+-- optionally made from one template — a span's trial assembly waits for its
+-- girder segments (two levels down) to finish fabrication.
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_wait_rules' AND COLUMN_NAME = 'relation' AND COLUMN_TYPE LIKE '%descendants%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_step_wait_rules MODIFY relation ENUM('parent','children','siblings','ancestor','descendants') NOT NULL", 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
