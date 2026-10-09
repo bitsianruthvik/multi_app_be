@@ -92,7 +92,19 @@ async function main() {
   const unitOf = (n) => { let c = n, g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
   const unitAbove = (n) => { let c = byId.get(n.reportsTo), g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
   const unitNodes = nodes.filter(isUnit);
-  const roleKeyOf = (p) => normKey(p.title);
+  // A seat's role is identified by the role its position points at in the
+  // database. That is only legitimate because section 4 first proves, from the
+  // source alone, that the assignment of seats to roles is right: same role ⇔
+  // same title AND same duty list. Every content check after that compares a
+  // role's rows with its seats' own lists in the chart.
+  const roleKeyByNode = new Map();
+  const roleKeyOf = (p) => roleKeyByNode.get(p.id);
+  // Independent of the importer's code on purpose: what makes two seats the
+  // same kind of work is the chart's own data, and it is re-read here.
+  const dutySig = (p) => JSON.stringify([
+    [...new Set((p.kras || []).map(norm).filter(Boolean).map(normKey))].sort(),
+    [...new Set((p.kpis || []).map((k) => norm(k?.k)).filter(Boolean).map(normKey))].sort(),
+  ]);
 
   const conn = await mysql.createConnection(TARGET.cfg);
   const q = async (sql, p = []) => (await conn.execute(sql, p))[0];
@@ -228,24 +240,61 @@ async function main() {
     roleRows.every((r) => r.default_department_id == null),
     `${roleRows.filter((r) => r.default_department_id != null).length} carry one`);
   const roleById = new Map(roleRows.map((r) => [r.id, r]));
-  const srcRoleKeys = new Map();
-  for (const p of real) if (!srcRoleKeys.has(roleKeyOf(p))) srcRoleKeys.set(roleKeyOf(p), p);
-  same('one role per distinct normalised title, and no others',
-    [...srcRoleKeys.keys()], roleRows.map((r) => normKey(r.title)));
-  const roleCodeBad = [...srcRoleKeys].filter(([k, first]) => {
-    const row = roleRows.find((r) => normKey(r.title) === k);
-    return row && row.role_code !== first.id;
-  });
-  check('a role is coded by the first node that carried its title', roleCodeBad.length === 0,
-    roleCodeBad.slice(0, 5).map(([k, f]) => `"${k}" should be ${f.id}`).join(' | '));
   const posRoleRows = await q(
-    `SELECT p.position_code AS code, r.title AS role_title
+    `SELECT p.position_code AS code, r.title AS role_title, r.role_code
        FROM hrms_positions p JOIN hrms_roles r ON r.company_id=p.company_id AND r.id=p.role_id
       WHERE p.company_id=? AND p.deleted_at IS NULL`, [c]);
-  const posRole = new Map(posRoleRows.map((r) => [r.code, normKey(r.role_title)]));
-  const posRoleBad = real.filter((p) => posRole.get(p.id) !== roleKeyOf(p));
-  check('every position points at the role for its own title', posRoleBad.length === 0,
-    posRoleBad.slice(0, 5).map((p) => `${p.id}: "${roleKeyOf(p)}" vs "${posRole.get(p.id)}"`).join(' | '));
+  const posRole = new Map(posRoleRows.map((r) => [r.code, r]));
+  check('every seat in the chart has a position with a role',
+    real.every((p) => posRole.has(p.id)),
+    real.filter((p) => !posRole.has(p.id)).slice(0, 5).map((p) => p.id).join(', '));
+  for (const p of real) if (posRole.has(p.id)) roleKeyByNode.set(p.id, normKey(posRole.get(p.id).role_title));
+
+  // The two directions of "a role is one kind of work". The first is the
+  // inflation bug's signature: before 2026-10-09 a role was keyed by title
+  // alone, so ten seats with seven different duty lists shared one role and
+  // every one of them carried the union.
+  const seatsByRole = new Map();
+  for (const p of real) {
+    const k = roleKeyOf(p);
+    if (!seatsByRole.has(k)) seatsByRole.set(k, []);
+    seatsByRole.get(k).push(p);
+  }
+  const mixed = [...seatsByRole].filter(([, ps]) =>
+    new Set(ps.map((p) => normKey(p.title))).size > 1 || new Set(ps.map(dutySig)).size > 1);
+  check('seats sharing a role share their title AND their duty list (no inflated job descriptions)',
+    mixed.length === 0,
+    mixed.slice(0, 4).map(([k, ps]) => `"${k}": ${ps.map((p) => p.id).join('/')}`).join(' | '));
+  const sameWork = new Map();
+  for (const p of real) {
+    const k = `${normKey(p.title)}|${dutySig(p)}`;
+    if (!sameWork.has(k)) sameWork.set(k, new Set());
+    sameWork.get(k).add(roleKeyOf(p));
+  }
+  const scattered = [...sameWork.values()].filter((s) => s.size > 1);
+  check('seats with the same title and the same duty list share ONE role (no needless split)',
+    scattered.length === 0, scattered.slice(0, 4).map((s) => [...s].join(' + ')).join(' | '));
+  same('one role per kind of work, and no others',
+    [...sameWork.keys()].map((k) => [...sameWork.get(k)][0]), roleRows.map((r) => normKey(r.title)));
+
+  // A title whose seats all do the same work keeps its exact title; one that
+  // splits keeps the title as a prefix and adds a qualifier, all distinct.
+  const byTitle = new Map();
+  for (const p of real) {
+    const t = normKey(p.title);
+    if (!byTitle.has(t)) byTitle.set(t, []);
+    byTitle.get(t).push(p);
+  }
+  const roleNameBad = [];
+  for (const [t, ps] of byTitle) {
+    const keys = new Set(ps.map(roleKeyOf));
+    if (new Set(ps.map(dutySig)).size === 1) { if (keys.size !== 1 || ![...keys][0] || [...keys][0] !== t) roleNameBad.push(`"${t}" should be unqualified`); }
+    else for (const k of keys) if (!k.startsWith(`${t} (`)) roleNameBad.push(`"${k}" should start "${t} ("`);
+  }
+  check('a role keeps its seats\' title, qualified only when the title splits', roleNameBad.length === 0, roleNameBad.slice(0, 4).join(' | '));
+  const codeBad = [...seatsByRole].filter(([, ps]) => posRole.get(ps[0].id).role_code !== ps[0].id);
+  check('a role is coded by the first seat that holds it', codeBad.length === 0,
+    codeBad.slice(0, 5).map(([k, ps]) => `"${k}" should be ${ps[0].id}`).join(' | '));
 
   // ---- 5. Work contexts ---------------------------------------------------
   const ctxRows = await q('SELECT id, code, name, context_type, location_id, department_id FROM hrms_work_contexts WHERE company_id=? AND deleted_at IS NULL', [c]);

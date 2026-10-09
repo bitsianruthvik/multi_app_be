@@ -60,6 +60,8 @@ const WIPE = has('wipe');
 
 const norm = (s) => String(s ?? '').trim().replace(/\s+/g, ' ');
 const normKey = (s) => norm(s).toLowerCase().replace(/[.;,]+$/, '');
+/** NOW() as the database sees it, as text — the clock its own created_at uses. */
+const dbNow = async (conn) => (await conn.query("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s') AS t"))[0][0].t;
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
 
 /** Set once rows start being written, so a crash can record a FAILED run. */
@@ -215,28 +217,121 @@ function plan(seed, prev) {
     + `machines while the chart draws it under one — so the inheritance is right and still incomplete, and only the `
     + `client can name the rest.`);
 
-  // ---- 3. Roles (deduplicated by normalised title) ----------------------
+  // ---- 3. Roles: one per (title, duty list) -----------------------------
+  // A role is a KIND OF WORK, and its content is the job description of every
+  // seat that holds it. So two seats may share a role only if they share the
+  // same work — same title AND the same duties and KPIs.
+  //
+  // This used to group by title alone, and that inflated job descriptions:
+  // the chart keeps a duty list PER SEAT, each seat's list was attached to the
+  // shared role, and every holder inherited the union. "Operator - Production"
+  // is 10 seats with 7 different lists and NOT ONE duty in common — a printing
+  // operator, a lamination operator and a slitting operator. P136 (slitting)
+  // has 27 duties in the chart and had 106 here, the first of them "operations
+  // of Printing Machines". 22 seats across 6 titles carried 1,122 duties that
+  // were never theirs (measured 2026-10-09).
+  //
+  // Seats whose lists are identical still share a role — the ten "Helper 1"
+  // seats are one role, exactly as before — and a title whose seats all agree
+  // keeps its old key, title and code, so unaffected roles do not churn. Only a
+  // title that genuinely splits gets qualified role titles. The SEAT keeps the
+  // client's title untouched (position_title comes from the node, below); only
+  // the role behind it says which kind of operator it is.
+  //
+  // Considered and rejected: keep one shared role and hang each seat's duties on
+  // the seat as position overlays. With "Operator - Production" sharing nothing,
+  // the role would be empty and all 106 duties seat-level — which the org
+  // workbook can only remove, never edit, and which costs the Departments view
+  // ~13 queries per overlaid seat (≈280 over the link). Plan §9 finding 4 always
+  // said the remedy was to split.
+  const dutySignature = (p) => JSON.stringify([
+    [...new Set((p.kras || []).map(norm).filter(Boolean).map(normKey))].sort(),
+    [...new Set((p.kpis || []).map((k) => norm(k?.k)).filter(Boolean).map(normKey))].sort(),
+  ]);
   const titleNodes = new Map();
   for (const p of real) {
     const key = normKey(p.title);
     if (!titleNodes.has(key)) titleNodes.set(key, []);
     titleNodes.get(key).push(p);
   }
-  const roleGroups = [...titleNodes].map(([key, group]) => ({ key, code: group[0].id, title: norm(group[0].title), nodes: group }));
-  const roleKeyOf = (p) => normKey(p.title);
+  const unitNameOf = (p) => {
+    const id = unitByNode.get(p.id);
+    return id ? unitName(byId.get(id)) : null;
+  };
+  const roleGroups = [];
+  const roleKeyByNode = new Map();
+  const splitTitles = [];
+  for (const [titleKey, group] of titleNodes) {
+    const bySig = new Map();
+    for (const p of group) {
+      const s = dutySignature(p);
+      if (!bySig.has(s)) bySig.set(s, []);
+      bySig.get(s).push(p);
+    }
+    const parts = [...bySig.values()];
+    if (parts.length === 1) {
+      roleGroups.push({ key: titleKey, code: group[0].id, title: norm(group[0].title), nodes: group });
+      for (const p of group) roleKeyByNode.set(p.id, titleKey);
+      continue;
+    }
+    // A qualifier a person can read. Start from the unit the seats sit in
+    // ("Slitting"); only where two parts of this title share a unit, add the
+    // machines they work ("Lamination · Raulimex" against "Lamination · Nord /
+    // Uflex"); only where that still does not tell them apart, add seat codes.
+    // Refining just the colliding parts keeps the common case short.
+    const join = (xs) => [...new Set(xs.filter(Boolean))].join(' / ');
+    const unitLabel = (nodes) => join(nodes.map(unitNameOf));
+    const machineLabel = (nodes, unit) => join(nodes.map((p) => norm(contextsOf(p)[0]?.title))
+      .filter((m) => m && m.toLowerCase() !== String(unit).toLowerCase())
+      .map((m) => m.replace(/\s+machine$/i, '')));
+    const codesLabel = (nodes) => nodes.map((p) => p.id).join(', ');
+    const collide = (ls) => {
+      const seen = new Map();
+      for (const l of ls) seen.set(l.toLowerCase(), (seen.get(l.toLowerCase()) || 0) + 1);
+      return (l) => !l || seen.get(l.toLowerCase()) > 1;
+    };
+    let labels = parts.map(unitLabel);
+    let clash = collide(labels);
+    labels = labels.map((l, i) => {
+      if (!clash(l)) return l;
+      const m = machineLabel(parts[i], l);
+      return [l, m].filter(Boolean).join(' · ');
+    });
+    clash = collide(labels);
+    labels = labels.map((l, i) => (clash(l) ? [l, codesLabel(parts[i])].filter(Boolean).join(' · ') : l));
+    const base = norm(group[0].title);
+    parts.forEach((nodes, i) => {
+      const key = `${titleKey}#${i + 1}`;
+      roleGroups.push({ key, code: nodes[0].id, title: `${base} (${labels[i]})`, nodes });
+      for (const p of nodes) roleKeyByNode.set(p.id, key);
+    });
+    splitTitles.push({ title: base, seats: group.length, parts: parts.map((nodes, i) => ({ label: labels[i], codes: nodes.map((p) => p.id) })) });
+  }
+  const roleKeyOf = (p) => roleKeyByNode.get(p.id);
+  if (splitTitles.length) {
+    const seats = splitTitles.reduce((a, t) => a + t.seats, 0);
+    const roles = splitTitles.reduce((a, t) => a + t.parts.length, 0);
+    note('Seats with the same title but different duties have different roles',
+      `${splitTitles.length} titles are used by seats whose duty lists differ, so they became ${roles} roles for ${seats} `
+      + `seats instead of ${splitTitles.length}. A role's content is the job description of every seat holding it, so `
+      + `sharing one would have given each seat the duties of all the others — "${splitTitles[0].title}" alone would have `
+      + `handed every holder the duties of ${splitTitles[0].parts.length} different jobs. Each seat keeps the chart's own `
+      + `title; only the role behind it is qualified. `
+      + splitTitles.map((t) => `"${t.title}" -> ${t.parts.map((x) => `(${x.label}) ${x.codes.join('/')}`).join('; ')}`).join('. ')
+      + `. If two of these really are the same job, make their duty lists identical in the chart and they will share a role.`);
+  }
+  counts.titlesSplit = splitTitles.length;
   counts.roles = roleGroups.length;
   counts.positions = real.length;
   const merged = roleGroups.filter((g) => g.nodes.length > 1).sort((a, b) => b.nodes.length - a.nodes.length);
   if (merged.length) {
     note('Repeated titles collapsed into shared roles',
       `${real.length} chart nodes became ${roleGroups.length} roles and ${real.length} positions, because ${merged.length} `
-      + `titles were used by more than one node. This is the model working as intended — one "kind of work", many seats `
-      + `— but it is the single change most worth checking, because a role now carries the combined responsibilities of `
-      + `every node that shared its title. The merges, largest first: `
+      + `roles are held by more than one seat. Every seat sharing a role here has the same title AND the same duty list `
+      + `in the chart, so the role's content is exactly each holder's job description — nothing is combined. The shared `
+      + `roles, largest first: `
       + merged.map((m) => `"${m.title}" x${m.nodes.length} (${m.nodes.map((g) => g.id).join(', ')})`).join('; ')
-      + `. Split any of these where the work genuinely differs by machine or department — "${merged[0].title}" now `
-      + `spans ${merged[0].nodes.length} seats in `
-      + `${new Set(merged[0].nodes.map((n) => unitByNode.get(n.id))).size} different units, which is the one most likely to need it.`);
+      + `. "${merged[0].title}" spans ${new Set(merged[0].nodes.map((n) => unitByNode.get(n.id))).size} unit(s).`);
   }
 
   // ---- 4. Positions ----------------------------------------------------
@@ -941,7 +1036,13 @@ async function main() {
   // three stage timestamps are all set because this script does parse, validate
   // and commit in one pass — the UI version (routes/imports.js) will stop between
   // them and write PARSED, then VALIDATED, then COMMITTED on its own rows.
-  const now = new Date();
+  // The DATABASE's own clock, not a JS Date. mysql2 renders a Date in the
+  // machine's zone, so a run committed from an IST laptop recorded 23:27 beside
+  // created_at/updated_at of 17:57 on TiDB (which runs UTC), and a 'what changed
+  // since the import' query silently missed five and a half hours of edits
+  // (2026-10-09). UTC text would not do either: local MySQL runs IST. NOW() in
+  // this session is the clock that fills created_at, wherever that is.
+  const now = await dbNow(conn);
   await ins('hrms_import_runs', {
     source_kind: 'ORG_CHART_HTML', source_file_name: fileName,
     source_hash: hash, source_size_bytes: size, status: 'COMMITTED',
@@ -979,7 +1080,7 @@ async function recordFailure(err) {
       `INSERT INTO hrms_import_runs (company_id, source_kind, source_file_name, source_hash, source_size_bytes,
                                      status, error_text, parsed_at, validated_at, notes)
        VALUES (?, 'ORG_CHART_HTML', ?, ?, ?, 'FAILED', ?, ?, ?, ?)`,
-      [companyId, fileName, hash, size, String(err?.message ?? err).slice(0, 4000), new Date(), new Date(),
+      [companyId, fileName, hash, size, String(err?.message ?? err).slice(0, 4000), await dbNow(conn), await dbNow(conn),
         'Partial write: rows were created before this failed, so the tenant holds an incomplete chart. Re-run with --wipe.'],
     );
     console.error('\n  Recorded a FAILED import run. The tenant holds a partial chart — re-run with --wipe.');
