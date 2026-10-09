@@ -24,9 +24,10 @@ ok('a chart by its name becomes the LOOKUP it stands for', expandCharts('item.CU
 ok('…machine.NAME too, and two columns in order', expandCharts('item.HOLES * machine.drill_time / 60', B) === 'item.HOLES * LOOKUP(machine.DRILL_TIME, item.THICKNESS, item.HOLE_DIA) / 60');
 ok('a LOOKUP written out is left alone', expandCharts('LOOKUP(machine.GAS_CUT_SPEED, item.WIDTH)', B) === 'LOOKUP(machine.GAS_CUT_SPEED, item.WIDTH)');
 ok('item.X of the same name is not a chart', expandCharts('item.GAS_CUT_SPEED + 1', B) === 'item.GAS_CUT_SPEED + 1');
-ok('long → short when it reads its own columns', contractCharts('item.CUT_LENGTH / LOOKUP(machine.GAS_CUT_SPEED, item.THICKNESS) + 5', B) === 'item.CUT_LENGTH / GAS_CUT_SPEED + 5');
+ok('long → short when it reads its own columns', contractCharts('item.CUT_LENGTH / LOOKUP(machine.GAS_CUT_SPEED, item.THICKNESS) + 5', B) === 'item.CUT_LENGTH / machine.GAS_CUT_SPEED + 5');
 ok('…but a LOOKUP with other arguments stays long', contractCharts('LOOKUP(machine.GAS_CUT_SPEED, item.WIDTH)', B) === 'LOOKUP(machine.GAS_CUT_SPEED, item.WIDTH)');
-const round = 'item.HOLES * DRILL_TIME / 60 + item.CUT_LENGTH / GAS_CUT_SPEED';
+ok('machine.NAME is read the same as the bare name', expandCharts('item.CUT_LENGTH / machine.GAS_CUT_SPEED', B) === expandCharts('item.CUT_LENGTH / GAS_CUT_SPEED', B));
+const round = 'item.HOLES * machine.DRILL_TIME / 60 + item.CUT_LENGTH / machine.GAS_CUT_SPEED';
 ok('short → long → short is the same text', contractCharts(expandCharts(round, B), B) === round);
 
 // --- pure: straight lines across every number column (2026-10-09) ---------------
@@ -63,7 +64,7 @@ try {
   });
   const chart = made.charts.find((x) => x.specId === made.chartId);
   ok('added on the machine type: name, result unit, column tied to Thickness with its unit', chart && chart.resultUnit === 'mm/min' && chart.axes[0].field === 'THICKNESS' && chart.axes[0].unit === 'mm', JSON.stringify(chart?.axes));
-  ok('…its values are on the type, and it can be written by its name', chart.own === true && chart.rows?.[1]?.[1] === 520 && chart.shortForm === made.code);
+  ok('…its values are on the type, and it can be written by its name', chart.own === true && chart.rows?.[1]?.[1] === 520 && chart.shortForm === `machine.${made.code}`);
   const dupe = await createChart(db, c, { type: 'classification', id: typeId }, { name: `${T} gas cutting speed`, resultUnit: 'mm/min', inputs: [{ field: 'THICKNESS' }] });
   ok('a second chart of the same name gets its own code', dupe.code === `${made.code}_2`, dupe.code);
 
@@ -129,7 +130,7 @@ try {
   const [[stored]] = await db.query('SELECT work_expression FROM cf_operation_machine_rules WHERE id = ?', [rule.id]);
   ok('saved as the LOOKUP it stands for', stored.work_expression === `item.CUT_LENGTH / LOOKUP(machine.${made.code}, item.THICKNESS)`, stored.work_expression);
   const shown = (await listTimingRules(db, COMPANY, o.insertId)).find((r) => r.id === rule.id);
-  ok('…and shown by its name', shown.work.display === `item.CUT_LENGTH / ${made.code}`, shown.work.display);
+  ok('…and shown by its name', shown.work.display === `item.CUT_LENGTH / machine.${made.code}`, shown.work.display);
   const [f] = await db.query("INSERT INTO cf_operation_flows (company_id, code, name, status) VALUES (?, ?, 'Test flow', 'active')", [COMPANY, `${T}-FL`]);
   await db.query('INSERT INTO cf_operation_flow_steps (company_id, flow_id, sequence, operation_id) VALUES (?, ?, 10, ?)', [COMPANY, f.insertId, o.insertId]);
   const need = (await neededCodesOfFlows(db, COMPANY, [f.insertId])).get(f.insertId);

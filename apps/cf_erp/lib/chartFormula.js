@@ -5,7 +5,10 @@
  * A chart (a table specification on a machine type or machine) whose every column says which of
  * the piece's values it is read by — Thickness → item.THICKNESS — can be written by its name:
  *
- *   item.CUT_LENGTH / GAS_CUT_SPEED      is      item.CUT_LENGTH / LOOKUP(machine.GAS_CUT_SPEED, item.THICKNESS)
+ *   item.CUT_LENGTH / machine.GAS_CUT_SPEED   is   item.CUT_LENGTH / LOOKUP(machine.GAS_CUT_SPEED, item.THICKNESS)
+ *
+ * machine.NAME is the way it is written and shown (2026-10-09: like item.X — "machine." lists every
+ * number and chart the machine has); a bare NAME typed out of habit is read the same.
  *
  * The long form is what is STORED and worked out (formulaEngine, flowSpecService read it as
  * before); the short form is what a person writes and sees. expandCharts turns short into long
@@ -50,6 +53,6 @@ export function contractCharts(expr, bindings) {
     if (!fields) return whole;
     const args = rest.split(',').map((a) => a.trim());
     const same = args.length === fields.length && args.every((a, i) => a.toLowerCase() === `item.${fields[i]}`.toLowerCase());
-    return same ? name.toUpperCase() : whole;
+    return same ? `machine.${name.toUpperCase()}` : whole;
   });
 }

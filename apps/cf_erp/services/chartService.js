@@ -17,7 +17,7 @@
  * added (defaulted: a machine type's chart is every machine's of that type unless a machine has
  * its own) and its rows.
  *
- * In a time formula a chart is written by its name — `item.HOLES * DRILL_TIME / 60` — and reads
+ * In a time formula a chart is written as the machine's — `item.HOLES * machine.DRILL_TIME / 60` — and reads
  * its inputs from the piece by itself (lib/chartFormula.js).
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
@@ -151,7 +151,7 @@ export async function listCharts(db, companyId, subject) {
   );
   for (const c of out.values()) {
     c.usedBy = [...new Set(uses.filter((u) => `${u.work_expression ?? ''} ${u.setup_expression ?? ''}`.toUpperCase().includes(`MACHINE.${c.code.toUpperCase()}`)).map((u) => u.code))];
-    c.shortForm = c.axes.length > 0 && c.axes.every((a) => (a.kind === 'level' ? a.level : a.field)) ? c.code : null;
+    c.shortForm = c.axes.length > 0 && c.axes.every((a) => (a.kind === 'level' ? a.level : a.field)) ? `machine.${c.code}` : null;
     c.nodes = nodeMap;
     // Kept for screens written against the first version: the one- and two-column shape.
     c.value = c.rows ? { rows: c.rows } : null;

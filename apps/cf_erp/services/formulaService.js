@@ -86,7 +86,7 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     for (const n of [...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs]) {
       const meta = known.get(n);
       if (!meta) problems.push(`Unknown specification ${n}.`);
-      else if (meta.dataType === 'table') problems.push(`${n} is a table — write its name, or LOOKUP(${n}, …).`);
+      else if (meta.dataType === 'table') problems.push(`${n} is a chart — write machine.${n} (it reads its columns from the piece), or LOOKUP(machine.${n}, …).`);
       // A piece's pick-list or text value is a word: fine to compare ("E350") or to feed a chart.
       else if (meta.dataType !== 'number' && !(words.has(n) && ['option', 'text'].includes(meta.dataType))) problems.push(`${n} is a ${meta.dataType}, not a number.`);
     }
