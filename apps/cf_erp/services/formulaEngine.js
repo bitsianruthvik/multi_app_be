@@ -536,6 +536,18 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
     if (!pieces) throw new FormulaError('There are no child pieces to average');
     return sum / pieces;
   }
+  /**
+   * A chart's column is tied to a value of the piece (axis.field, or a tree level), so when a LOOKUP
+   * passes exactly those values as item.X — in any order — each column reads its own (user,
+   * 2026-10-09: the chart's inputs were reordered and the time kept the old order). Anything else
+   * (numbers, other values, a different count) is read in the order written.
+   */
+  function alignedArgs(table, args) {
+    const want = (table.axes ?? []).map((a) => String((a.kind === 'level' ? a.level : a.field) ?? '').toUpperCase());
+    const got = args.map((a) => { const m = a.type === 'ref' ? CONTEXT_REF.exec(a.name) : null; return m && m[1].toLowerCase() === 'item' ? m[2].toUpperCase() : null; });
+    const fits = want.length === got.length && want.every(Boolean) && got.every(Boolean) && new Set(got).size === got.length && want.every((w) => got.includes(w));
+    return fits ? want.map((w) => args[got.indexOf(w)]) : args;
+  }
   /** LOOKUP(t, x[, y]) — t is n.args[0], already checked (parseFormula) to be a bare/item./machine. reference. */
   function lookupCall(n, child) {
     const t = n.args[0];
@@ -546,7 +558,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
     const table = tableOf({ role, code });
     if (!table) throw new MissingValueError(`${named} has no chart set yet`);
     if (Array.isArray(table.rows)) {
-      const inputs = n.args.slice(1).map((a) => ev(a, child, true));
+      const inputs = alignedArgs(table, n.args.slice(1)).map((a) => ev(a, child, true));
       const out = lookupRows(table, inputs);
       if (out.missingReason) throw new MissingValueError(`${named} ${out.missingReason}`);
       return out.value;

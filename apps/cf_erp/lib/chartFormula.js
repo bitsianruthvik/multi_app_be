@@ -52,7 +52,9 @@ export function contractCharts(expr, bindings) {
     const fields = bindings.get(name.toUpperCase());
     if (!fields) return whole;
     const args = rest.split(',').map((a) => a.trim());
-    const same = args.length === fields.length && args.every((a, i) => a.toLowerCase() === `item.${fields[i]}`.toLowerCase());
+    // Its own columns in any order: a column reads its own value whatever order they are written in (formulaEngine.alignedArgs).
+    const names = args.map((a) => (/^item\./i.test(a) ? a.slice(5).toUpperCase() : null));
+    const same = args.length === fields.length && names.every(Boolean) && new Set(names).size === names.length && fields.every((f) => names.includes(String(f).toUpperCase()));
     return same ? `machine.${name.toUpperCase()}` : whole;
   });
 }

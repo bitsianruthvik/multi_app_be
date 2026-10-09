@@ -125,6 +125,12 @@ try {
   ok('…and the saved time reads it in the new order', (await exprOf()).startsWith(`LOOKUP(machine.${many.code}, item.GRADE, item.THICKNESS, item.FAMILY)`), await exprOf());
   const pv3 = await timingPreview(db, COMPANY, o2.insertId, { machineId: mc.id, itemId: piece.id });
   ok('…worked out the same on the real piece', Math.abs((pv3.work?.minutes ?? -1) - (22 / 60 + 3)) < 1e-3, JSON.stringify(pv3.work));
+  // A time that still lists the inputs in the OLD order reads each column by its own value.
+  await db.query('UPDATE cf_operation_machine_rules SET work_expression = ? WHERE id = ?', [`LOOKUP(machine.${many.code},item.THICKNESS, item.GRADE, item.FAMILY) / 60 + IF(item.family = "${lv.FAMILY.name}", 1, 0) + IF(item.GRADE = "${piece.grade}", 2, 0)`, r2.id]);
+  const pv4 = await timingPreview(db, COMPANY, o2.insertId, { machineId: mc.id, itemId: piece.id });
+  ok('a time listing the inputs in another order still reads each column by its own value', Math.abs((pv4.work?.minutes ?? -1) - (22 / 60 + 3)) < 1e-3, JSON.stringify(pv4.work));
+  ok('…and is shown by the chart\'s name', (await listTimingRules(db, COMPANY, o2.insertId)).find((r) => r.id === r2.id).work.display.startsWith(`machine.${many.code} / 60`));
+  ok('pure: own columns in another order contract to the name; other values do not', contractCharts('LOOKUP(machine.DRILL_TIME, item.HOLE_DIA, item.THICKNESS)', B) === 'machine.DRILL_TIME' && contractCharts('LOOKUP(machine.DRILL_TIME, item.HOLE_DIA, item.WIDTH)', B) !== 'machine.DRILL_TIME');
   await updateChart(db, c, many.chartId, { inputs: [{ field: 'GRADE', from: 0 }, { field: 'THICKNESS', from: 1 }, { level: 'FAMILY', from: 2 }, { field: 'WIDTH', unit: 'mm', fill: '300' }] });
   mc2 = await rowsOf(many.chartId);
   ok('an input added with the value the rows are for: every row has it', mc2.axes.length === 4 && mc2.rows.every((r) => Number(r[3]) === 300 && r.length === 5), JSON.stringify(mc2.rows));

@@ -388,7 +388,8 @@ async function rewriteTimes(db, companyId, code, oldAxes, newAxes) {
   const re = new RegExp(`LOOKUP\\s*\\(\\s*machine\\.${code.replace(/[^A-Za-z0-9_]/g, '')}\\s*,([^()]*)\\)`, 'gi');
   const swap = (expr) => (expr == null ? expr : String(expr).replace(re, (whole, rest) => {
     const args = rest.split(',').map((x) => x.trim().toUpperCase().replace(/^ITEM\./, 'item.'));
-    return args.length === oldArgs.length && args.every((x, i) => x === oldArgs[i]) ? `LOOKUP(machine.${code}, ${newArgs})` : whole;
+    // Its old inputs in any order (a column reads its own value, formulaEngine.alignedArgs).
+    return args.length === oldArgs.length && new Set(args).size === args.length && oldArgs.every((x) => args.includes(x)) ? `LOOKUP(machine.${code}, ${newArgs})` : whole;
   }));
   const like = `%machine.${code}%`;
   const [rules] = await db.query('SELECT id, work_expression AS w, setup_expression AS s FROM cf_operation_machine_rules WHERE company_id = ? AND deleted_at IS NULL AND (work_expression LIKE ? OR setup_expression LIKE ?)', [companyId, like, like]);
