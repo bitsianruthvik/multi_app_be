@@ -420,6 +420,13 @@ export async function updatePosition(db, { companyId }, id, body) {
   return getPosition(db, companyId, id);
 }
 
+/**
+ * Sets the status and nothing else. NOTE for CLOSED: the chart does not draw a
+ * closed seat, so closing a seat that has direct reports leaves them as tops of
+ * the chart. closePosition (below) is the call that also moves them up; this one
+ * stays exactly as it was because the workbook import calls it after moving the
+ * reporting lines itself.
+ */
 export async function setPositionStatus(db, { companyId }, id, status) {
   await requirePosition(db, companyId, id, { lock: true });
   const problems = [];
@@ -429,26 +436,526 @@ export async function setPositionStatus(db, { companyId }, id, status) {
   return getPosition(db, companyId, id);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Taking a seat off the chart — close it, delete it alone, or delete its team
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * THE BUG THIS REPLACES. deletePosition used to soft-delete every reporting row
+ * that named the seat — `from_position_id = ? OR to_position_id = ?` — and the
+ * second half of that OR is the seat's own TEAM's line to its manager. Delete
+ * "Production Manager" and ten positions lost the only edge that placed them in
+ * the organisation: the chart drew eleven tops and nobody was told. (Measured on
+ * Karni's local data: deleting a seat with four reports took the chart from 1
+ * root to 5. Closing it did exactly the same, because the chart does not draw a
+ * CLOSED seat — see closePosition.)
+ *
+ * So removing a seat is a decision about its team, and the decision is never
+ * made silently:
+ *   THIS_ONLY  the seat goes; its direct reports move UP one level, to the
+ *              seat's own manager — what an organisation does when a job is
+ *              abolished. A seat with no manager has nowhere to send them, so
+ *              it is REFUSED rather than turned into N new tops.
+ *   WITH_TEAM  the seat and every position under it go. If any of them holds a
+ *              live work assignment the whole thing is refused, by name —
+ *              never half a subtree.
+ *   CLOSE      the seat stays, with its history. See closePosition.
+ *
+ * "ITS MANAGER" MEANS THE PRIMARY_MANAGER LINE LIVE TODAY. Reporting is not a
+ * column (plan §2 rule 1, §3.1): there is no position.manager_id, a position
+ * can have several managers with different types and scopes, and only one of
+ * them — the PRIMARY_MANAGER edge — is the line the chart lays its tree out on
+ * (orgChartService). Dotted, functional and project lines are other rows with
+ * other scopes. They are not "the manager", so they are NOT moved; they go with
+ * the seat they point at, and the impact says how many. A position with no live
+ * PRIMARY_MANAGER line is a root. If the manager's own seat is CLOSED the chart
+ * does not draw it either, so the walk goes on up to the first seat that is.
+ *
+ * ONE FUNCTION DECIDES. assess() answers "what would each outcome do, and may
+ * it?" from three company-wide reads, in memory. The impact endpoint serves its
+ * answer, and every write calls it again inside its own transaction and refuses
+ * in the same words — so what the dialog promised and what the server enforces
+ * cannot drift, and a stale dialog is caught by `expect` (the number the person
+ * saw) rather than by luck.
+ *
+ * ROUND TRIPS. The team is walked in memory over one company-wide edge list,
+ * and every write is one statement for the whole set (`IN (...)`, one multi-row
+ * INSERT). A 41-seat team costs the same dozen statements as a leaf — the
+ * difference between 0.6 s and 25 s against production (49 ms a trip).
+ *
+ * Nothing here is a hard delete. Everything is `deleted_at`, and uniqueness
+ * lives on VIRTUAL columns that key off it (uq_hprr_edge), so a moved line is
+ * written as a NEW row and the old one retired — never edited into another
+ * manager's row. The one exception is the unique-key trap in moveReports.
+ */
+export const REMOVAL_MODES = ['THIS_ONLY', 'WITH_TEAM'];
+
+/** The relationship type whose edges ARE the chart's tree. */
+const PRIMARY_MANAGER = 'PRIMARY_MANAGER';
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const liveOnDate = (row, on) =>
+  (!row.effective_from || dateText(row.effective_from) <= on) && (!row.effective_to || dateText(row.effective_to) >= on);
+
 /**
- * Soft-delete. Refused while anyone is assigned to the seat: an occupied
+ * Everything assess() needs, from three queries for the whole company. Positions
+ * are few (Karni: 130) and the chart loads the same edge list on every render,
+ * so reading it all is cheaper than being clever about which rows.
+ */
+async function loadStructure(db, companyId, on) {
+  const [positionRows] = await db.query(
+    `SELECT p.id, p.position_code, p.position_title, p.status, p.effective_from, p.effective_to, r.title AS role_title
+       FROM hrms_positions p
+       LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+      WHERE p.company_id = ? AND p.deleted_at IS NULL`,
+    [companyId],
+  );
+  // Every edge of every type, live or not: assess() needs the primary tree AND a
+  // count of what else touches a seat (secondary, planned and ended lines).
+  const [edges] = await db.query(
+    `SELECT rr.*, t.code AS type_code
+       FROM hrms_position_reporting_relationships rr
+       JOIN hrms_reporting_relationship_types t ON t.company_id = rr.company_id AND t.id = rr.relationship_type_id
+      WHERE rr.company_id = ? AND rr.deleted_at IS NULL`,
+    [companyId],
+  );
+  // The SAME predicate the delete guard has always used (not "ACTIVE and live
+  // today"): a planned or suspended assignment still points at the seat.
+  const [assignmentRows] = await db.query(
+    `SELECT position_id, COUNT(*) AS n FROM hrms_work_assignments
+      WHERE company_id = ? AND deleted_at IS NULL AND status <> 'ENDED' AND position_id IS NOT NULL
+      GROUP BY position_id`,
+    [companyId],
+  );
+
+  const byId = new Map(positionRows.map((p) => [p.id, {
+    id: p.id,
+    code: p.position_code ?? null,
+    title: p.position_title || p.role_title || `Position ${p.id}`,
+    status: p.status,
+    open: p.status !== 'CLOSED' && liveOnDate(p, on),   // does the chart draw it?
+  }]));
+
+  // "The" manager of a position: its PRIMARY_MANAGER line live today — the first
+  // by the chart's own order (is_primary, then id) if the data ever holds two.
+  const parentEdge = new Map();
+  const reportsOf = new Map();
+  const treeCandidates = edges
+    .filter((e) => e.type_code === PRIMARY_MANAGER && liveOnDate(e, on) && byId.has(e.from_position_id) && byId.has(e.to_position_id))
+    .sort((a, b) => (Number(b.is_primary) - Number(a.is_primary)) || (a.id - b.id));
+  for (const e of treeCandidates) {
+    if (parentEdge.has(e.from_position_id)) continue;
+    parentEdge.set(e.from_position_id, e);
+    const list = reportsOf.get(e.to_position_id) ?? [];
+    list.push(e.from_position_id);
+    reportsOf.set(e.to_position_id, list);
+  }
+  for (const list of reportsOf.values()) list.sort((a, b) => a - b);
+
+  return {
+    byId,
+    edges,
+    parentEdge,
+    reportsOf,
+    treeEdgeIds: new Set([...parentEdge.values()].map((e) => e.id)),
+    assignments: new Map(assignmentRows.map((r) => [r.position_id, Number(r.n)])),
+  };
+}
+
+const seatInfo = (s, id) => {
+  const p = s.byId.get(id);
+  return { id: p.id, positionCode: p.code, title: p.title, status: p.status };
+};
+const seatLabel = (p) => (p.positionCode ? `${p.title} (${p.positionCode})` : p.title);
+
+/**
+ * What each outcome would do to this seat, and whether it may. Pure: takes the
+ * structure loadStructure() read and touches no database.
+ */
+function assess(s, id, on) {
+  const seat = s.byId.get(id);
+  if (!seat) throw notFound('Position');
+
+  // The team: every position under this one by PRIMARY_MANAGER lines. Walked a
+  // level at a time over the in-memory map, with a seen-set so a loop in bad
+  // data ends the walk instead of hanging it.
+  const direct = s.reportsOf.get(id) ?? [];
+  const inTeam = new Set([id]);
+  const team = [];
+  let frontier = [id];
+  while (frontier.length) {
+    const next = [];
+    for (const x of frontier) {
+      for (const k of s.reportsOf.get(x) ?? []) {
+        if (inTeam.has(k)) continue;
+        inTeam.add(k);
+        team.push(k);
+        next.push(k);
+      }
+    }
+    frontier = next;
+  }
+
+  // Where a team goes if its seat goes: the first OPEN seat up the primary chain.
+  let up = s.parentEdge.get(id)?.to_position_id ?? null;
+  const climbed = new Set([id]);
+  while (up != null && !s.byId.get(up).open) {
+    if (climbed.has(up) || climbed.size > MAX_CHAIN) { up = null; break; }
+    climbed.add(up);
+    up = s.parentEdge.get(up)?.to_position_id ?? null;
+  }
+  const manager = up == null ? null : seatInfo(s, up);
+
+  const assignmentsOf = (x) => s.assignments.get(x) ?? 0;
+  const ownAssignments = assignmentsOf(id);
+  const blockers = team
+    .filter((x) => assignmentsOf(x) > 0)
+    .map((x) => ({ ...seatInfo(s, x), assignments: assignmentsOf(x) }))
+    .sort((a, b) => a.title.localeCompare(b.title) || a.id - b.id);
+
+  // Lines that touch the seat(s) and are NOT part of the live primary tree:
+  // dotted / functional / project lines, and ended or not-yet-started ones.
+  // They go with the seat. Counted so that "go with it" is a number.
+  const otherLines = (set) => s.edges.filter(
+    (e) => !s.treeEdgeIds.has(e.id) && (set.has(e.from_position_id) || set.has(e.to_position_id)),
+  ).length;
+
+  const noWhere = direct.length > 0 && manager == null;
+  const looped = manager != null && inTeam.has(manager.id);
+  const t = seat.title;
+  const rootReason = `${s.parentEdge.has(id) ? `Every position above ${t} is closed` : `${t} is at the top of the chart`}, so its ${plural(direct.length, 'direct report')} would have nobody to report to. Give them another manager first, or delete it with its team.`;
+  const ok = { allowed: true, code: null, reason: null, problems: [] };
+  const no = (code, reason, problems = []) => ({ allowed: false, code, reason, problems });
+
+  const inUse = ownAssignments > 0
+    && no('IN_USE', `${plural(ownAssignments, 'work assignment')} still ${ownAssignments === 1 ? 'points' : 'point'} at this position. End ${ownAssignments === 1 ? 'it' : 'them'}, or close the position instead of deleting it.`);
+  const loop = looped
+    && no('REPORTING_LOOP', `The position above ${t} is also somewhere under it, which is a loop in the reporting lines. Fix those first.`);
+
+  const close = seat.status === 'CLOSED' ? no('ALREADY_CLOSED', 'It is already closed.')
+    : noWhere ? no('ROOT_HAS_TEAM', rootReason)
+      : loop || ok;
+  const deleteOnly = inUse || (noWhere && no('ROOT_HAS_TEAM', rootReason)) || loop || ok;
+
+  const shown = blockers.slice(0, 3).map(seatLabel).join(', ');
+  const more = blockers.length > 3 ? ` and ${blockers.length - 3} more` : '';
+  const deleteWithTeam = inUse
+    || (blockers.length > 0 && no(
+      'TEAM_IN_USE',
+      `Cannot delete ${t} with its team: ${plural(blockers.length, 'position')} under it still ${blockers.length === 1 ? 'has' : 'have'} people assigned (${shown}${more}). End those assignments first, or close the positions instead.`,
+      blockers.slice(0, 25).map((b) => `${seatLabel(b)} — ${plural(b.assignments, 'work assignment')}`)
+        .concat(blockers.length > 25 ? [`…and ${blockers.length - 25} more`] : []),
+    ))
+    || ok;
+
+  return {
+    on,
+    seat: seatInfo(s, id),
+    manager,
+    directIds: direct,
+    teamIds: team,
+    ownAssignments,
+    blockers,
+    otherLines: { thisOnly: otherLines(new Set([id])), withTeam: otherLines(inTeam) },
+    closedInTeam: team.filter((x) => s.byId.get(x).status === 'CLOSED').length,
+    outcomes: { close, deleteOnly, deleteWithTeam },
+  };
+}
+
+/** The wire shape of an assessment — what the dialog reads before anyone confirms. */
+function shapeImpact(s, a) {
+  const out = (o, extra) => ({ allowed: o.allowed, code: o.code, reason: o.reason, ...extra });
+  return {
+    asOf: a.on,
+    position: a.seat,
+    // Where its direct reports would move to. null = the seat has no open seat above it.
+    manager: a.manager,
+    directReports: a.directIds.map((x) => ({ ...seatInfo(s, x), assignments: s.assignments.get(x) ?? 0 })),
+    team: {
+      count: a.teamIds.length,          // positions under it, all levels
+      total: a.teamIds.length + 1,      // what "with its team" deletes: those, plus the seat
+      closed: a.closedInTeam,
+      blockers: a.blockers,             // team members holding live work assignments
+    },
+    ownAssignments: a.ownAssignments,
+    otherLines: a.otherLines,           // dotted / functional / planned / ended lines that go with it
+    outcomes: {
+      close: out(a.outcomes.close, { movesReports: a.directIds.length }),
+      deleteOnly: out(a.outcomes.deleteOnly, { movesReports: a.directIds.length }),
+      deleteWithTeam: out(a.outcomes.deleteWithTeam, { deletes: a.teamIds.length + 1 }),
+    },
+  };
+}
+
+/**
+ * GET /positions/:id/delete-impact — what closing, deleting alone and deleting
+ * with the team would each do, before anyone does it. A separate read rather
+ * than a field on GET /positions/:id because it costs three company-wide
+ * queries, and that belongs to the one screen that asks, not to every list and
+ * detail load.
+ */
+export async function getDeleteImpact(db, companyId, id) {
+  const on = today();
+  const s = await loadStructure(db, companyId, on);
+  return shapeImpact(s, assess(s, id, on));
+}
+
+function refuse(outcome) {
+  if (!outcome.allowed) throw conflict(outcome.code, outcome.reason, outcome.problems?.length ? { problems: outcome.problems } : {});
+}
+
+/** `expect` is the number the person saw. */
+function readExpect(value, problems) {
+  if (blank(value)) return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) { problems.push('expect must be a whole number.'); return null; }
+  return n;
+}
+/** If the world moved under the dialog, say so instead of doing more than they agreed to. */
+function checkExpect(expect, actual, what) {
+  if (expect != null && expect !== actual) {
+    throw conflict('IMPACT_CHANGED', `This changed while you were deciding: it now ${what(actual)}, not ${expect}. Look again before you confirm.`);
+  }
+}
+
+const noteTrail = (existing, line) => (blank(existing) ? line : `${existing}\n${line}`);
+
+/**
+ * Moves a seat's direct reports to `a.manager`: for each, the PRIMARY_MANAGER
+ * line to the seat becomes the same line (same type, scope, primary flag) to the
+ * manager. Set-based: one INSERT for all of them.
+ *
+ *   keepHistory = false  (delete) the old line is retired by the caller's
+ *     cascade, and the new one keeps the old one's dates — a deleted seat leaves
+ *     no trace, so its team reported to the manager all along, and a chart for
+ *     an earlier date does not grow tops the delete never meant to make.
+ *   keepHistory = true   (close) the old line is ENDED the day before (or
+ *     retired if it began today) and the new one starts today — a closed seat
+ *     keeps its history, so history must show the team reporting to it until now.
+ *
+ * THE UNIQUE-KEY TRAP. uq_hprr_edge is (from, to, type, scope) and takes no
+ * dates, so a report that once reported to this manager — an ended row from an
+ * earlier re-org, which is exactly how this app moves people — already owns the
+ * key the new line needs. An INSERT would die on a duplicate key halfway through
+ * a team. So that row is REUSED, its dates widened to cover the new range. The
+ * org-chart workbook import resolves the same collision the same way
+ * (org-apply-workbook.mjs, "reopened"), so the two paths agree.
+ */
+async function moveReports(db, { companyId, userId }, s, a, { keepHistory }) {
+  if (!a.directIds.length) return [];
+  const target = a.manager;
+  const on = a.on;
+  const yesterday = previousDay(on);
+  const trail = `Moved up from ${seatLabel(a.seat)} on ${on}, when that position was ${keepHistory ? 'closed' : 'deleted'}.`;
+
+  const owned = new Map();
+  for (const f of s.edges) {
+    if (f.to_position_id === target.id) owned.set(`${f.from_position_id}|${f.relationship_type_id}|${f.scope_key}`, f);
+  }
+
+  const rows = [];
+  const widen = [];
+  const endNow = [];
+  const retireNow = [];
+  for (const reportId of a.directIds) {
+    const e = s.parentEdge.get(reportId);
+    const from = keepHistory ? on : dateText(e.effective_from);
+    const to = e.effective_to ? dateText(e.effective_to) : null;
+    const f = owned.get(`${e.from_position_id}|${e.relationship_type_id}|${e.scope_key}`);
+    if (f) {
+      const fFrom = dateText(f.effective_from);
+      const fTo = f.effective_to ? dateText(f.effective_to) : null;
+      const wFrom = fFrom < from ? fFrom : from;
+      const wTo = fTo == null || to == null ? null : (fTo > to ? fTo : to);
+      if (wFrom !== fFrom || wTo !== fTo) widen.push({ id: f.id, from: wFrom, to: wTo });
+    } else {
+      rows.push([
+        companyId, e.from_position_id, target.id, e.relationship_type_id, e.is_primary,
+        e.scope_type, e.scope_label, e.scope_work_context_id, from, to, noteTrail(e.notes, trail), userId,
+      ]);
+    }
+    if (keepHistory) (dateText(e.effective_from) > yesterday ? retireNow : endNow).push(e.id);
+  }
+
+  if (rows.length) {
+    await db.query(
+      `INSERT INTO hrms_position_reporting_relationships
+         (company_id, from_position_id, to_position_id, relationship_type_id, is_primary,
+          scope_type, scope_label, scope_work_context_id, effective_from, effective_to, notes, created_by)
+       VALUES ${rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+      rows.flat(),
+    );
+  }
+  for (const w of widen) {
+    await db.query('UPDATE hrms_position_reporting_relationships SET effective_from = ?, effective_to = ? WHERE company_id = ? AND id = ?', [w.from, w.to, companyId, w.id]);
+  }
+  if (endNow.length) {
+    await db.query(
+      `UPDATE hrms_position_reporting_relationships SET effective_to = ? WHERE company_id = ? AND id IN (${endNow.map(() => '?').join(',')})`,
+      [yesterday, companyId, ...endNow],
+    );
+  }
+  if (retireNow.length) {
+    await db.query(
+      `UPDATE hrms_position_reporting_relationships SET deleted_at = NOW() WHERE company_id = ? AND id IN (${retireNow.map(() => '?').join(',')})`,
+      [companyId, ...retireNow],
+    );
+  }
+  return a.directIds.map((x) => seatInfo(s, x));
+}
+
+/** Append-only; written in the caller's transaction (init.sql §9c). TiDB has no triggers. */
+async function audit(db, { companyId, userId }, entityId, action, before, after) {
+  await db.query(
+    `INSERT INTO hrms_audit_log (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, created_by)
+     VALUES (?, ?, 'hrms_positions', ?, ?, ?, ?, ?)`,
+    [companyId, userId, entityId, action, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, userId],
+  );
+}
+
+/**
+ * Soft-delete a seat — alone (its team moves up) or with everything under it.
+ *
+ * `mode` is required whenever the seat HAS reports: leaving it out would mean
+ * choosing for the caller, which is the bug in a politer form. A seat with no
+ * reports needs no choice and behaves as it always did.
+ *
+ * Still refused while anyone is assigned to a seat that would go: an occupied
  * position that disappears leaves assignments pointing at nothing, and the spec
  * is explicit that referenced records are ended, not deleted (§8).
  */
-export async function deletePosition(db, { companyId }, id) {
-  await requirePosition(db, companyId, id, { lock: true });
-  const [[{ n }]] = await db.query(
-    `SELECT COUNT(*) AS n FROM hrms_work_assignments
-      WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL AND status <> 'ENDED'`,
-    [companyId, id],
-  );
-  if (n) {
-    throw conflict('IN_USE', `${n} work assignment${n === 1 ? '' : 's'} still point at this position. End them, or close the position instead of deleting it.`);
+export async function deletePosition(db, c, id, options = {}) {
+  const { companyId } = c;
+  const problems = [];
+  const mode = readEnum(options.mode, 'Mode', REMOVAL_MODES, problems);
+  const expect = readExpect(options.expect, problems);
+  assertNoProblems(problems);
+
+  const seat = await requirePosition(db, companyId, id, { lock: true });
+  const on = today();
+  const s = await loadStructure(db, companyId, on);
+  const a = assess(s, id, on);
+
+  if (!mode && a.directIds.length) {
+    // Own assignments outrank the missing choice: no mode would have worked.
+    if (a.outcomes.deleteOnly.code === 'IN_USE') refuse(a.outcomes.deleteOnly);
+    throw conflict('HAS_TEAM', `${a.seat.title} has ${plural(a.directIds.length, 'direct report')}${a.teamIds.length > a.directIds.length ? ` (${plural(a.teamIds.length, 'position')} under it in all)` : ''}. ${
+      a.manager
+        ? `Choose to delete it alone, which moves them up to ${a.manager.title}, or to delete it with its team.`
+        : 'There is no open position above it for them to move up to, so the choice is to delete it with its team.'}`);
   }
-  await db.query('UPDATE hrms_positions SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [companyId, id]);
-  await db.query('UPDATE hrms_position_work_contexts SET deleted_at = NOW() WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL', [companyId, id]);
-  await db.query('UPDATE hrms_position_reporting_relationships SET deleted_at = NOW() WHERE company_id = ? AND (from_position_id = ? OR to_position_id = ?) AND deleted_at IS NULL', [companyId, id, id]);
-  await db.query('UPDATE hrms_position_content_overrides SET deleted_at = NOW() WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL', [companyId, id]);
-  return { ok: true, deleted: id };
+  const chosen = mode ?? 'THIS_ONLY';
+  const withTeam = chosen === 'WITH_TEAM';
+  refuse(withTeam ? a.outcomes.deleteWithTeam : a.outcomes.deleteOnly);
+  checkExpect(expect, withTeam ? a.teamIds.length + 1 : a.directIds.length,
+    withTeam ? (n) => `deletes ${plural(n, 'position')}` : (n) => `has ${plural(n, 'direct report')}`);
+
+  const doomed = withTeam ? [id, ...a.teamIds] : [id];
+  const marks = doomed.map(() => '?').join(',');
+
+  // Lock every seat that goes, so two overlapping deletes cannot both proceed,
+  // and notice a seat another request has already removed.
+  const [locked] = await db.query(
+    `SELECT id FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND id IN (${marks}) FOR UPDATE`,
+    [companyId, ...doomed],
+  );
+  if (locked.length !== doomed.length) {
+    throw conflict('IMPACT_CHANGED', 'This changed while you were deciding: part of it has already been removed. Look again before you confirm.');
+  }
+
+  const moved = withTeam ? [] : await moveReports(db, c, s, a, { keepHistory: false });
+
+  const gone = new Set(doomed);
+  const touching = s.edges.filter((e) => gone.has(e.from_position_id) || gone.has(e.to_position_id)).length;
+  await db.query(`UPDATE hrms_positions SET deleted_at = NOW() WHERE company_id = ? AND id IN (${marks})`, [companyId, ...doomed]);
+  await db.query(`UPDATE hrms_position_work_contexts SET deleted_at = NOW() WHERE company_id = ? AND position_id IN (${marks}) AND deleted_at IS NULL`, [companyId, ...doomed]);
+  // Every line that names a seat that is going. The lines from a team that is
+  // NOT going (THIS_ONLY) were replaced by moveReports a moment ago, so this
+  // retires the old ones along with the seat's own and its secondary ones.
+  const [edgeRes] = await db.query(
+    `UPDATE hrms_position_reporting_relationships SET deleted_at = NOW()
+      WHERE company_id = ? AND deleted_at IS NULL AND (from_position_id IN (${marks}) OR to_position_id IN (${marks}))`,
+    [companyId, ...doomed, ...doomed],
+  );
+  if (edgeRes.affectedRows !== touching) {
+    // A line was added or removed between the read and the write. The
+    // transaction rolls back; nothing has changed.
+    throw conflict('IMPACT_CHANGED', 'This changed while you were deciding: someone edited the reporting lines. Look again before you confirm.');
+  }
+  await db.query(`UPDATE hrms_position_content_overrides SET deleted_at = NOW() WHERE company_id = ? AND position_id IN (${marks}) AND deleted_at IS NULL`, [companyId, ...doomed]);
+
+  await audit(db, c, id, 'DELETE',
+    { positionCode: seat.position_code, title: a.seat.title, status: seat.status },
+    { mode: chosen, deletedIds: doomed, movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null });
+
+  return {
+    ok: true,
+    deleted: id,                       // what this endpoint always returned
+    mode: chosen,
+    deletedIds: doomed,
+    deletedCount: doomed.length,
+    movedReports: moved,
+    movedTo: moved.length ? a.manager : null,
+  };
+}
+
+/**
+ * The guard for the two ROUTES that can set CLOSED directly (POST /positions/:id/status
+ * and PUT /positions/:id): a seat with direct reports may not be closed that way,
+ * because the chart does not draw a closed seat and its team would become tops of the
+ * chart. Say so, and point at POST /positions/:id/close, which moves the team up.
+ * setPositionStatus itself is unchanged (the workbook applier calls it directly).
+ */
+export async function refuseCloseWithTeam(db, companyId, id, status) {
+  if (String(status ?? '').trim().toUpperCase() !== 'CLOSED') return;
+  const seat = await requirePosition(db, companyId, id);
+  if (seat.status === 'CLOSED') return;
+  const s = await loadStructure(db, companyId, today());
+  const n = (s.reportsOf.get(id) ?? []).length;
+  if (n > 0) {
+    throw conflict('HAS_TEAM', `${s.byId.get(id).title} has ${plural(n, 'direct report')}, and closing it this way would leave them as separate tops of the chart. Use POST /positions/${id}/close instead: it closes the seat and moves them up to its manager.`);
+  }
+}
+
+/**
+ * Close a seat: it stays, with its history, and leaves the chart.
+ *
+ * Why this is not just setPositionStatus(…, 'CLOSED'): the chart does not draw a
+ * CLOSED seat, and a team whose manager is not drawn becomes tops of the chart —
+ * the same eleven roots as the delete bug, reached by the action the UI now
+ * recommends. So closing a seat that has reports also moves them up, with
+ * history kept (their old line is ended, not erased). A seat with no open
+ * position above it is refused for the same reason deleting one is.
+ *
+ * setPositionStatus is left exactly as it was: the workbook import calls it
+ * after moving the lines itself, and its 172-check suite depends on that. The
+ * status field on the edit form (PUT /positions/:id) goes the same direct way,
+ * so closing a manager from there still drops its team out of the chart — the
+ * dialogs that offer "Close" use this instead.
+ */
+export async function closePosition(db, c, id, options = {}) {
+  const { companyId } = c;
+  const problems = [];
+  const expect = readExpect(options.expect, problems);
+  assertNoProblems(problems);
+
+  const seat = await requirePosition(db, companyId, id, { lock: true });
+  if (seat.status === 'CLOSED') {
+    return { ok: true, alreadyClosed: true, ...(await getPosition(db, companyId, id)), movedReports: [], movedTo: null };
+  }
+
+  const on = today();
+  const s = await loadStructure(db, companyId, on);
+  const a = assess(s, id, on);
+  refuse(a.outcomes.close);
+  checkExpect(expect, a.directIds.length, (n) => `has ${plural(n, 'direct report')}`);
+
+  const moved = await moveReports(db, c, s, a, { keepHistory: true });
+  await db.query("UPDATE hrms_positions SET status = 'CLOSED' WHERE company_id = ? AND id = ?", [companyId, id]);
+  await audit(db, c, id, 'UPDATE',
+    { status: seat.status },
+    { status: 'CLOSED', movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null });
+
+  return { ok: true, ...(await getPosition(db, companyId, id)), movedReports: moved, movedTo: moved.length ? a.manager : null };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

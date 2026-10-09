@@ -8,6 +8,16 @@
  * a role is reading the organisation — anyone who may see the org chart may see
  * what a job is for. Changing the definition of work is a narrower grant.
  *
+ * COPYING CONTENT (services/contentCopyService.js) is the one write whose
+ * permission depends on what it does, so it is checked in the handler:
+ *   mode SEAT  (an overlay on one seat)        cf_hrms_org_manage — the tag
+ *              routes/positions.js asks for on a position override
+ *   mode ROLE  (new rows on the role itself)   cf_hrms_roles_manage
+ *   mode FORK  (a new role AND a seat moved)   both
+ * `cf_hrms_self_view` is in none of them, so the 71 employee logins get a 403
+ * from all four copy routes — including the read of a source, which is
+ * org_view like every other read here.
+ *
  *   GET    /roles                              list + readiness (no purpose / no KRAs)
  *   GET    /roles/overview                     the counts the list's StatStrip shows
  *   GET    /roles/departments                  picker source for the role form
@@ -24,6 +34,11 @@
  *   PUT    /role-content/:kind/:id/group       { roleKraAssignmentId } regroup under a KRA, or null
  *   PUT    /roles/:id/content/:kind/order      { ids: [] } one atomic renumber
  *
+ *   GET    /role-content-copy/source           ?type=role|position&id=&on=  what could be copied from this role or seat
+ *   POST   /role-content-copy/preview          { source, targets[], mode, kinds[], lines?[], on?, effectiveFrom?, forkTitle? }
+ *                                              what a copy WOULD do — counts, seats reached, nothing written
+ *   POST   /role-content-copy                  the same body + { confirm: { seats } }; one transaction
+ *
  *   GET    /role-masters/:kind                 the catalogue + "used by N roles"
  *   POST   /role-masters/:kind
  *   GET    /role-masters/:kind/:id
@@ -37,16 +52,52 @@
  * three separate kinds here and on every screen, deliberately — plan §2 rule 4.
  */
 import { Router } from 'express';
+import { protect } from '../../../core/middleware/authmiddleware.js';
+import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
+import { HrmsError } from '../lib/errors.js';
+import { PERM, guard, handle, ctx, intParam, dateParam, assertPerm } from '../lib/http.js';
 import {
   listRoles, getRole, createRole, updateRole, deleteRole, rolesOverview, listDepartments,
   getRoleContent, addContent, updateContent, removeContent, reorderContent, regroupContent,
   listMaster, getMaster, masterUsage, createMasterItem, updateMasterItem, deleteMasterItem,
 } from '../services/roleContentService.js';
+import {
+  describeCopySource, previewCopy, executeCopy, permissionsForCopyMode,
+} from '../services/contentCopyService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
+
+/**
+ * The permission of a content copy, from its MODE. An unknown mode is not let
+ * through to a validation message: the caller must hold at least one of the two
+ * manage tags, so a login with neither (every cf_hrms_self_view employee) is
+ * refused before anything is read.
+ */
+function assertCopyPermission(req) {
+  const needed = permissionsForCopyMode(req.body?.mode, PERM);
+  if (needed) {
+    for (const tag of needed) assertPerm(req, tag);
+    return;
+  }
+  if (!isPermitted(req.user, PERM.rolesManage) && !isPermitted(req.user, PERM.orgManage)) {
+    throw new HrmsError(403, 'FORBIDDEN', `Permission required: ${PERM.orgManage} or ${PERM.rolesManage}`);
+  }
+}
+
+// ----- copying content between roles and seats -----------------------------
+// Their own prefix, not /roles/:id/..., so no literal path ever has to be kept
+// above a param route to stay reachable.
+router.get('/role-content-copy/source', guard(PERM.orgView), handle((req) => describeCopySource(pool, ctx(req).companyId, req.query)));
+router.post('/role-content-copy/preview', protect, handle((req) => {
+  assertCopyPermission(req);
+  return previewCopy(pool, ctx(req), req.body ?? {});
+}));
+router.post('/role-content-copy', protect, handle((req) => {
+  assertCopyPermission(req);
+  return tx(req, (db, c) => executeCopy(db, c, req.body ?? {}));
+}));
 
 // ----- the content masters -------------------------------------------------
 router.get('/role-masters/:kind', guard(PERM.orgView), handle((req) => listMaster(pool, ctx(req).companyId, req.params.kind)));

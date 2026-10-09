@@ -9,8 +9,19 @@
  *                                           sanctionedHeadcount?, defaultShiftId?, status?, effectiveFrom?, effectiveTo? }
  *   GET    /positions/:id                 ?on=
  *   PUT    /positions/:id                 same fields, all optional
- *   POST   /positions/:id/status          { status }   DRAFT / ACTIVE / FROZEN / CLOSED
- *   DELETE /positions/:id                 refused while anyone is assigned to the seat
+ *   POST   /positions/:id/status          { status }   DRAFT / ACTIVE / FROZEN / CLOSED  (CLOSED refused with HAS_TEAM when the seat has
+ *                                         direct reports: use /close, which moves them up. Same for PUT with status CLOSED.)
+ *   GET    /positions/:id/delete-impact   what closing / deleting alone / deleting with the team would each do,
+ *                                         and whether each is allowed — read BEFORE confirming
+ *   POST   /positions/:id/close           { expect? }  keeps the seat and its history; its direct reports move up
+ *   DELETE /positions/:id                 ?mode=THIS_ONLY|WITH_TEAM&expect=N
+ *                                         THIS_ONLY: the seat goes, its direct reports move up to its manager
+ *                                         WITH_TEAM: the seat and everyone under it go
+ *                                         `mode` is required when the seat has direct reports; `expect` is the
+ *                                         number the person saw (reports moved / positions deleted) and a
+ *                                         different answer is refused as IMPACT_CHANGED. Refused while anyone is
+ *                                         assigned to a seat that would go, and — for THIS_ONLY and close — when
+ *                                         the seat has reports but no open position above it to receive them.
  *
  *   GET    /positions/:id/work-contexts
  *   POST   /positions/:id/work-contexts   { workContextId*, isPrimary?, effectiveFrom?, effectiveTo?, notes? }
@@ -43,7 +54,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  listPositions, getPosition, createPosition, updatePosition, setPositionStatus, deletePosition,
+  listPositions, getPosition, createPosition, updatePosition, setPositionStatus, deletePosition, closePosition, getDeleteImpact, refuseCloseWithTeam,
   listPositionContexts, addPositionContext, updatePositionContext, removePositionContext,
   listPositionReporting, addPositionReporting, updatePositionReporting, endPositionReporting, removePositionReporting,
   listPositionOccupants,
@@ -62,9 +73,18 @@ router.get('/positions/options', guard(PERM.orgView), handle((req) => positionOp
 router.get('/positions', guard(PERM.orgView), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
 router.post('/positions', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createPosition(db, c, req.body ?? {}))));
 router.get('/positions/:id', guard(PERM.orgView), handle((req) => getPosition(pool, ctx(req).companyId, id(req), req.query)));
-router.put('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updatePosition(db, c, id(req), req.body ?? {}))));
-router.post('/positions/:id/status', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => setPositionStatus(db, c, id(req), req.body?.status))));
-router.delete('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deletePosition(db, c, id(req)))));
+router.put('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, async (db, c) => {
+  // CLOSED set directly would orphan the seat's team in the chart; see refuseCloseWithTeam.
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'status')) await refuseCloseWithTeam(db, c.companyId, id(req), req.body.status);
+  return updatePosition(db, c, id(req), req.body ?? {});
+})));
+router.post('/positions/:id/status', guard(PERM.orgManage), handle((req) => tx(req, async (db, c) => {
+  await refuseCloseWithTeam(db, c.companyId, id(req), req.body?.status);
+  return setPositionStatus(db, c, id(req), req.body?.status);
+})));
+router.get('/positions/:id/delete-impact', guard(PERM.orgView), handle((req) => getDeleteImpact(pool, ctx(req).companyId, id(req))));
+router.post('/positions/:id/close', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => closePosition(db, c, id(req), { expect: req.body?.expect }))));
+router.delete('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deletePosition(db, c, id(req), { mode: req.query.mode, expect: req.query.expect }))));
 
 router.get('/positions/:id/work-contexts', guard(PERM.orgView), handle((req) => listPositionContexts(pool, ctx(req).companyId, id(req))));
 router.post('/positions/:id/work-contexts', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addPositionContext(db, c, id(req), req.body ?? {}))));

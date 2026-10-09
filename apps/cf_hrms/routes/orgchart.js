@@ -5,6 +5,7 @@
  *   GET /orgchart                          ?on=&root=   the WHOLE graph in one payload
  *   GET /orgchart/positions/:id/card       ?on=         everything the card modal shows
  *   GET /orgchart/search                   ?q=&on=      KRA / responsibility / KPI / qualification text
+ *   GET /orgchart/departments              ?on=         what each unit is accountable for (spec §13)
  *   GET /orgchart/open-points              ?status=&entityType=&entityId=   grouped by entity
  *   PUT /orgchart/open-points/:id          { status, resolution|answer }    resolve / dismiss / reopen
  *
@@ -32,6 +33,7 @@ import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import {
   buildOrgChart, getPositionCard, searchOrgChart, listOpenPoints, updateOpenPoint,
 } from '../services/orgChartService.js';
+import { buildDepartmentRollup } from '../services/departmentRollupService.js';
 
 const router = Router();
 
@@ -69,6 +71,20 @@ router.get('/orgchart/search', guard(PERM.orgView), handle((req) => searchOrgCha
   pool,
   ctx(req).companyId,
   { q: req.query.q, on: dateParam(req.query.on), limit: req.query.limit },
+)));
+
+/**
+ * The Departments view: every unit, the positions inside it, and the content
+ * those positions carry — de-duplicated within a unit, never across units.
+ *
+ * `cf_hrms_org_view` and nothing weaker. This is the whole organisation's
+ * accountability in one payload; the 71 Karni employees who hold only
+ * `cf_hrms_self_view` get a 403 here, the same as from the rest of this file.
+ */
+router.get('/orgchart/departments', guard(PERM.orgView), handle((req) => buildDepartmentRollup(
+  pool,
+  ctx(req).companyId,
+  { on: dateParam(req.query.on) },
 )));
 
 router.get('/orgchart/open-points', guard(PERM.orgView), handle((req) => listOpenPoints(

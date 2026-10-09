@@ -64,7 +64,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const today = () => new Date().toISOString().slice(0, 10);
 
 /** A DATE column as YYYY-MM-DD, whatever the driver handed back. */
-function isoDate(value) {
+export function isoDate(value) {
   if (!value) return null;
   if (value instanceof Date) {
     const z = new Date(value.getTime() - value.getTimezoneOffset() * 60000);
@@ -80,14 +80,25 @@ function dayBefore(iso) {
   return d.toISOString().slice(0, 10);
 }
 
-/** mysql2 gives JSON columns back parsed on some paths and as text on others. */
+/**
+ * mysql2 gives JSON columns back parsed on some paths and as text on others.
+ *
+ * A string that will not parse is therefore NOT garbage: it is a JSON *string*
+ * the driver already decoded. A KPI's TEXT target is stored as `"95%"`, comes
+ * back as the JS string `95%`, and `JSON.parse('95%')` throws — which this used
+ * to turn into `null`, so every sentence target Karni's chart carried read as
+ * "Target not set" on the Roles screen and in the generated JD (75 KPI links,
+ * found 2026-10-09 while building content copy, which would otherwise have
+ * copied the target as nothing). Parseable text still parses ("95" -> 95).
+ */
 function readJson(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return value;
   try {
     return JSON.parse(value);
   } catch {
-    return null;
+    return value;
   }
 }
 
@@ -154,7 +165,7 @@ function intValue(value, problems, label) {
  * triggers, and an audit row written after the commit is an audit row that can
  * go missing (lib/db.js).
  */
-async function audit(db, c, entityType, entityId, action, before, after) {
+export async function audit(db, c, entityType, entityId, action, before, after) {
   await db.query(
     `INSERT INTO hrms_audit_log (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -503,7 +514,7 @@ export async function getRole(db, companyId, id) {
   return shapeRole(row);
 }
 
-async function requireRole(db, companyId, id) {
+export async function requireRole(db, companyId, id) {
   const [[row]] = await db.query('SELECT * FROM hrms_roles WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
   if (!row) throw notFound('Role');
   return row;
@@ -532,7 +543,7 @@ function roleFields(input, problems, { creating }) {
  * duplicate-key error tells a person nothing. This looks first and names the
  * role they should go and edit instead.
  */
-async function assertTitleFree(db, companyId, title, exceptId = null) {
+export async function assertTitleFree(db, companyId, title, exceptId = null) {
   if (!title) return;
   const [[clash]] = await db.query(
     `SELECT id, role_code, title, status FROM hrms_roles
