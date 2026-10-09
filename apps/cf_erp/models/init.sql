@@ -4924,5 +4924,9 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- "what was it built to" can still be downloaded). A file is matched to rows by
 -- drawing mark AND by the register's links.
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND COLUMN_NAME = 'drawing_id');
-SET @sql = IF(@col = 0, 'ALTER TABLE cf_part_drawings ADD COLUMN drawing_id INT NULL AFTER order_line_id, ADD KEY idx_cpd_drawing (company_id, drawing_id)', 'SELECT 1');
+-- Two statements: TiDB refuses an index on a column added in the same ALTER.
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_part_drawings ADD COLUMN drawing_id INT NULL AFTER order_line_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND INDEX_NAME = 'idx_cpd_drawing');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_part_drawings ADD KEY idx_cpd_drawing (company_id, drawing_id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
