@@ -1,13 +1,17 @@
 /**
  * part_drawings_test.mjs — part shapes (DXF) on an order line (partDrawingService, init.sql §51).
  * Upload by drawing mark (preview, save, replace, delete), the measure (true vs rectangle area),
- * the cut plate's cut length and piercings from the drawing, and the CNC file drawing the outline.
+ * the cut plate's cut length and piercings from the drawing, and the CNC file drawing the outline;
+ * §52 the register: every file is a register revision, a drawing started from a row waits for its
+ * file, uploading over an issued revision makes the next one and the old file stays downloadable.
  * Local only, one rolled-back transaction, every cf_ table re-counted.
  *
  *   cd multi_app_be && node scripts/cf_kepl/part_drawings_test.mjs
  */
 import { pool } from '../../db.js';
-import { getDrawings, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine } from '../../apps/cf_erp/services/partDrawingService.js';
+import '../../apps/cf_erp/services/codegenProvider.js';
+import { getDrawings, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine, startDrawing, registerFile } from '../../apps/cf_erp/services/partDrawingService.js';
+import { getDrawing } from '../../apps/cf_erp/services/drawingService.js';
 import { lotDxf } from '../../apps/cf_erp/services/cncExportService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('Local only.');
@@ -24,6 +28,7 @@ const lw = (pts) => ['0', 'LWPOLYLINE', '8', 'PART', '90', pts.length, '70', 1, 
 const circle = (cx, cy, r) => ['0', 'CIRCLE', '8', 'PART', '10', cx, '20', cy, '40', r].map(String);
 const file = (name, text) => ({ name, content: Buffer.from(text, 'latin1').toString('base64') });
 
+const pdf0 = Buffer.concat([Buffer.from('%PDF-1.4\n', 'latin1'), Buffer.alloc(32, 5), Buffer.from('\n%%EOF\n')]);
 const db = await pool.getConnection();
 try {
   await db.beginTransaction();
@@ -84,6 +89,26 @@ try {
 
   const again = await uploadDrawings(db, c, line.order_id, LINE, { files: [file('fst-p1.DXF', shape)], dryRun: false });
   ok('uploading the mark again replaces it', again.files[0].status === 'replaces' && again.view.drawings.length === 1);
+  // The register: the first save created a drawing, the second made its next revision.
+  const first = saved.view.drawings[0].drawing;
+  ok('the saved file is a register drawing: order code / mark, rev A, issued, linked to its rows', first && first.number === `${(await db.query('SELECT code FROM cf_sales_orders WHERE id = ?', [line.order_id]))[0][0].code}/FST-P1` && first.revision === 'A' && first.status === 'issued' && (await getDrawing(db, COMPANY, first.id)).covers.length === same.length, JSON.stringify(first));
+  const rev = again.view.drawings[0].drawing;
+  ok('uploading over an issued revision makes the next one: A -> B, links carried', again.files[0].register?.action === 'revise' && rev.revision === 'B' && rev.number === first.number && rev.earlier.length === 1 && rev.earlier[0].hasFile && (await getDrawing(db, COMPANY, rev.id)).covers.length === same.length, JSON.stringify(again.files[0].register) + JSON.stringify(rev));
+  ok('rev A is superseded and its file still downloads', (await getDrawing(db, COMPANY, first.id)).status === 'superseded' && (await registerFile(db, COMPANY, first.id)).buffer.toString('latin1') === shape && (await getDrawing(db, COMPANY, first.id)).file?.fileName === 'FST-P1.dxf');
+  // Started from a row before any file exists — the row has no drawing mark at all.
+  const bare = (await rowsOfLine(db, COMPANY, line)).find((r) => !r.mark && !r.isPlatePart);
+  const started = await startDrawing(db, c, line.order_id, LINE, { rowIds: [bare.id], number: 'P103-VDB-401', revision: '0', source: 'customer', status: 'draft' });
+  const wait = started.view.waiting.find((w) => w.drawing.id === started.drawing.id);
+  ok('a drawing started from a row waits for its file, and the row counts as having one', wait && wait.rows.some((r) => r.id === bare.id) && !started.view.rowsWithoutDrawing.some((r) => r.id === bare.id) && started.drawing.status === 'draft', JSON.stringify(started.drawing));
+  let refused = null; try { await startDrawing(db, c, line.order_id, LINE, { rowIds: [999999999], number: 'X' }); } catch (e) { refused = e.message; }
+  ok('a row from another line is refused in words', /not on line/.test(refused ?? ''), refused);
+  const att = await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: 'scan 12.pdf', content: pdf0.toString('base64'), drawingId: started.drawing.id }], dryRun: false });
+  const onIt = att.view.drawings.find((d) => d.drawing?.id === started.drawing.id);
+  ok('its file attached by hand, whatever the file is called: matched by the register link', att.files[0].register?.action === 'attach' && onIt && onIt.rows.some((r) => r.id === bare.id) && !att.view.waiting.some((w) => w.drawing.id === started.drawing.id), JSON.stringify(att.files[0]).slice(0, 400));
+  const att2 = await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: 'scan 13.pdf', content: pdf0.toString('base64'), drawingId: started.drawing.id }], dryRun: true });
+  ok('a draft takes a new file in place, no new revision', att2.files[0].register?.action === 'replace' && att2.files[0].register.revision === '0', JSON.stringify(att2.files[0].register));
+  const back = await deleteDrawing(db, c, line.order_id, LINE, onIt.id);
+  ok('deleting the file leaves the register drawing waiting again', back.waiting.some((w) => w.drawing.id === started.drawing.id));
 
   // Every level: a segment's PDF and an assembly's general-arrangement DXF (not one outline) are kept, not read.
   const rows = await rowsOfLine(db, COMPANY, line);

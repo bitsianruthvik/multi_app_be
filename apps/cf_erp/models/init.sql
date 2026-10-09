@@ -4912,3 +4912,17 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND COLUMN_NAME = 'geometry_json' AND IS_NULLABLE = 'NO');
 SET @sql = IF(@nn = 1, 'ALTER TABLE cf_part_drawings MODIFY length_mm DECIMAL(12,3) NULL, MODIFY width_mm DECIMAL(12,3) NULL, MODIFY area_mm2 DECIMAL(16,3) NULL, MODIFY cut_length_mm DECIMAL(14,3) NULL, MODIFY piercings INT NULL, MODIFY holes INT NULL, MODIFY inner_cuts INT NULL, MODIFY geometry_json MEDIUMTEXT NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §52  A drawing's file is a revision's file (2026-10-09, option B)
+-- ============================================================================
+-- Every file uploaded on an order line belongs to a revision in the drawings
+-- register (cf_drawings, §20): the register says which sheet and revision a
+-- row is built to, cf_part_drawings holds that revision's file. A drawing can
+-- start from a row before its file exists; uploading again over an ISSUED
+-- revision makes the next revision (the old file stays on the old revision, so
+-- "what was it built to" can still be downloaded). A file is matched to rows by
+-- drawing mark AND by the register's links.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND COLUMN_NAME = 'drawing_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_part_drawings ADD COLUMN drawing_id INT NULL AFTER order_line_id, ADD KEY idx_cpd_drawing (company_id, drawing_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

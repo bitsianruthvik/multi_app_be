@@ -15,6 +15,7 @@
  *   DELETE /drawings/:id              a draft with no links only — a typed-wrong number must be removable
  *
  *   GET    /drawings/:id/covers       what this revision covers
+ *   GET    /drawings/:id/file         this revision's file (uploaded on an order line), also an earlier one's
  *   POST   /drawings/:id/links        { subjectId, subjectType?, note? }
  *   DELETE /drawing-links/:id
  *
@@ -32,6 +33,7 @@ import {
   listDrawings, getDrawing, createDrawing, updateDrawing, issueDrawing, retireDrawing,
   reviseDrawing, deleteDrawing, linkDrawing, removeLink, drawingCoverage, drawingsForRecord,
 } from '../services/drawingService.js';
+import { registerFile } from '../services/partDrawingService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -49,6 +51,13 @@ router.post('/drawings/:id/retire', manage, handle((req) => tx(req, (db, c) => r
 router.post('/drawings/:id/revision', manage, handle((req) => tx(req, (db, c) => reviseDrawing(db, c, id(req), req.body ?? {}))));
 router.delete('/drawings/:id', manage, handle((req) => tx(req, (db, c) => deleteDrawing(db, c, id(req)))));
 
+router.get('/drawings/:id/file', view, handle(async (req, res) => {
+  const out = await registerFile(pool, company(req), id(req));
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.send(out.buffer);
+}));
 router.get('/drawings/:id/covers', view, handle((req) => drawingCoverage(pool, company(req), id(req))));
 router.post('/drawings/:id/links', manage, handle((req) => tx(req, (db, c) => linkDrawing(db, c, id(req), req.body ?? {}))));
 router.delete('/drawing-links/:id', manage, handle((req) => tx(req, (db, c) => removeLink(db, c, id(req)))));

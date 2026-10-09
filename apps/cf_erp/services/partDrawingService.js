@@ -16,8 +16,16 @@
  *   - a row whose size is not the drawing's rectangle is said, not changed.
  * Nesting still lays out the rectangle (the row's LENGTH × WIDTH) — option A.
  *
- * NOT the drawings register (drawingService.js, cf_drawings): that one traces which sheet and
- * revision each node was built to and stores no file. This one holds the file itself.
+ * THE REGISTER (option B, 2026-10-09: "go with B for drawings"). Every file here is the file of a
+ * revision in the drawings register (drawingService.js, cf_drawings): the register says which sheet
+ * and revision a row is built to, this table holds that revision's file (drawing_id). So:
+ *   - a drawing can be STARTED from a row before any file exists (startDrawing) — it waits for one;
+ *   - a file that arrives finds its register drawing: the one its mark's file already sits on, else
+ *     one waiting on a matched row, else a new one is created (number = order code / mark);
+ *   - uploading again over an ISSUED revision makes the NEXT revision (links carried, the old file
+ *     stays on the old revision and can still be downloaded); over a DRAFT it just replaces the file;
+ *   - a file belongs to the rows with its drawing mark AND the rows its register drawing is linked to.
+ * Deleting a file leaves the register drawing in place, waiting for a file again.
  *
  * A line released to production takes no drawing changes. One live drawing per line and mark;
  * uploading a mark again replaces it. Cut pieces are never matched — they are worked out.
@@ -27,6 +35,8 @@ import { insertRows } from '../lib/db.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
 import { explode } from './bomService.js';
 import { readPartDrawing, orientTo } from './partGeometry.js';
+import { createDrawing, reviseDrawing } from './drawingService.js';
+import { nextRevision } from '../lib/revision.js';
 
 const FALLBACK_DENSITY = 7850;
 // A row is one TiDB entry (6 MB at most): a 4 MB file is 5.3 MB as base64.
@@ -101,8 +111,16 @@ export async function rowsOfLine(db, companyId, line) {
   const out = new Map(mine.map((r) => [Number(r.id), {
     id: Number(r.id), code: r.code, name: r.name, level: r.level ?? 'Row', depth: depth.get(Number(r.id)) ?? 99,
     pieces: Number(r.id) === Number(line.item_id) ? Number(line.quantity) : Math.round(pieces.get(Number(r.id)) ?? 0),
-    mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null, isPlatePart: false, cutPlateIds: [],
+    mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null, isPlatePart: false, cutPlateIds: [], drawingIds: [],
   }]));
+  // The register drawings (in play: draft or issued) each row is linked to.
+  const [links] = await db.query(
+    `SELECT l.subject_id, l.drawing_id FROM cf_drawing_links l
+       JOIN cf_drawings d ON d.id = l.drawing_id AND d.deleted_at IS NULL AND d.status IN ('draft', 'issued')
+      WHERE l.company_id = ? AND l.subject_type = 'master_record' AND l.deleted_at IS NULL AND l.subject_id IN (?)`,
+    [companyId, ids],
+  );
+  for (const k of links) { const p = out.get(Number(k.subject_id)); if (p && !p.drawingIds.includes(Number(k.drawing_id))) p.drawingIds.push(Number(k.drawing_id)); }
   for (const c of cuts) { const p = out.get(Number(c.parent_id)); if (p) { p.isPlatePart = true; p.cutPlateIds.push(Number(c.child_id)); } }
   for (const v of vals) {
     const p = out.get(Number(v.subject_id));
@@ -120,11 +138,40 @@ export async function platePartsOfLine(db, companyId, line) {
 
 async function liveDrawings(db, companyId, lineId) {
   const [rows] = await db.query(
-    `SELECT id, mark, mark_norm, file_name, file_kind, length_mm, width_mm, area_mm2, cut_length_mm, piercings, holes, inner_cuts, geometry_json, warnings_json, created_at
+    `SELECT id, drawing_id, mark, mark_norm, file_name, file_kind, length_mm, width_mm, area_mm2, cut_length_mm, piercings, holes, inner_cuts, geometry_json, warnings_json, created_at
        FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL ORDER BY mark_norm`,
     [companyId, lineId],
   );
   return rows.map((r) => ({ ...r, geometry: parseJson(r.geometry_json), warnings: parseJson(r.warnings_json) ?? [] }));
+}
+
+/** A file belongs to the rows with its drawing mark and the rows its register drawing is linked to. */
+const matches = (p, d) => (!!p.markNorm && p.markNorm === d.mark_norm) || (d.drawing_id != null && p.drawingIds.includes(Number(d.drawing_id)));
+/** The file a row is read by: its own mark's first, else its register drawing's. */
+const fileFor = (p, files) => files.find((d) => p.markNorm && d.mark_norm === p.markNorm) ?? files.find((d) => d.drawing_id != null && p.drawingIds.includes(Number(d.drawing_id))) ?? null;
+
+/**
+ * The register side of some drawings: Map id -> { id, code, number, revision, status, title,
+ * earlier: [{ id, revision, status, hasFile, fileName }] } — earlier revisions of the same drawing, oldest first.
+ */
+async function registerRefs(db, companyId, ids) {
+  const out = new Map();
+  const want = [...new Set(ids.filter((x) => x != null).map(Number))];
+  if (!want.length) return out;
+  const [rows] = await db.query('SELECT id, code, number, revision, status, title, root_id FROM cf_drawings WHERE company_id = ? AND id IN (?)', [companyId, want]);
+  const roots = [...new Set(rows.map((r) => Number(r.root_id ?? r.id)))];
+  const [revs] = roots.length ? await db.query('SELECT id, revision, status, root_id FROM cf_drawings WHERE company_id = ? AND deleted_at IS NULL AND root_id IN (?) ORDER BY id', [companyId, roots]) : [[]];
+  const [filed] = revs.length ? await db.query('SELECT drawing_id, file_name FROM cf_part_drawings WHERE company_id = ? AND drawing_id IN (?) ORDER BY deleted_at IS NULL, id', [companyId, revs.map((r) => r.id)]) : [[]];
+  // Each revision's newest file name (live last, so it wins).
+  const fileName = new Map(filed.map((f) => [Number(f.drawing_id), f.file_name]));
+  for (const r of rows) {
+    const root = Number(r.root_id ?? r.id);
+    out.set(Number(r.id), {
+      id: Number(r.id), code: r.code, number: r.number, revision: r.revision, status: r.status, title: r.title,
+      earlier: revs.filter((v) => Number(v.root_id) === root && Number(v.id) < Number(r.id)).map((v) => ({ id: Number(v.id), revision: v.revision, status: v.status, hasFile: fileName.has(Number(v.id)), fileName: fileName.get(Number(v.id)) ?? null })),
+    });
+  }
+  return out;
 }
 
 const rowView = (p, g) => ({
@@ -137,35 +184,46 @@ const geometryView = (g) => (g ? {
   cutLengthMm: g.cutLengthMm, piercings: g.piercings, holes: g.holes, holeDiameters: g.holeDiameters, innerCuts: g.innerCuts, rings: g.rings,
 } : null);
 
-function viewOf(line, rows, drawings) {
-  const byMark = new Map();
-  for (const p of rows) if (p.markNorm) { if (!byMark.has(p.markNorm)) byMark.set(p.markNorm, []); byMark.get(p.markNorm).push(p); }
+function viewOf(line, rows, drawings, refs = new Map()) {
   const covered = new Set();
+  const measured = new Set();
   let rectArea = 0; let trueArea = 0; let rectKg = 0; let trueKg = 0;
   const views = drawings.map((d) => {
-    const matched = byMark.get(d.mark_norm) ?? [];
+    const matched = rows.filter((p) => matches(p, d));
     for (const p of matched) {
       covered.add(p.id);
       const g = d.geometry;
-      if (!g || !p.isPlatePart) continue;
+      // A part is measured once, by the file it is read by.
+      if (!g || !p.isPlatePart || measured.has(p.id) || fileFor(p, drawings) !== d) continue;
+      measured.add(p.id);
       const t = p.thicknessMm ?? 0; const rho = p.density ?? FALLBACK_DENSITY;
       rectArea += g.rectAreaMm2 * p.pieces; trueArea += g.areaMm2 * p.pieces;
       rectKg += (g.rectAreaMm2 * t * rho * p.pieces) / 1e9; trueKg += (g.areaMm2 * t * rho * p.pieces) / 1e9;
     }
     return {
       id: d.id, mark: d.mark, fileName: d.file_name, fileKind: d.file_kind ?? 'dxf', uploadedAt: d.created_at,
+      drawing: d.drawing_id != null ? refs.get(Number(d.drawing_id)) ?? null : null,
       levels: [...new Set(matched.map((p) => p.level))],
       geometry: geometryView(d.geometry), rows: matched.map((p) => rowView(p, d.geometry)), warnings: d.warnings,
     };
   });
+  // Register drawings linked to rows of the line that have no file here yet.
+  const filed = new Set(drawings.map((d) => Number(d.drawing_id)).filter(Boolean));
+  const waitingIds = [...new Set(rows.flatMap((p) => p.drawingIds))].filter((id) => !filed.has(id) && refs.has(id));
+  const waiting = waitingIds.map((id) => {
+    const linked = rows.filter((p) => p.drawingIds.includes(id));
+    for (const p of linked) covered.add(p.id);
+    return { drawing: refs.get(id), rows: linked.map((p) => rowView(p, null)) };
+  }).sort((a, b) => String(a.drawing.number).localeCompare(String(b.drawing.number)));
   const parts = rows.filter((p) => p.isPlatePart);
-  const shaped = new Set(drawings.filter((d) => d.geometry).flatMap((d) => (byMark.get(d.mark_norm) ?? []).filter((p) => p.isPlatePart).map((p) => p.id)));
+  const shaped = measured;
   return {
     line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, released: !!Number(line.released) },
     drawings: views,
+    waiting,
     rowsWithoutDrawing: rows.filter((p) => !covered.has(p.id)).map((p) => ({ id: p.id, code: p.code, name: p.name, level: p.level, mark: p.mark, pieces: p.pieces, isPlatePart: p.isPlatePart })),
     summary: {
-      rows: rows.length, rowsWithDrawing: covered.size,
+      rows: rows.length, rowsWithDrawing: covered.size, waiting: waiting.length,
       parts: parts.length, partsWithShape: shaped.size,
       pieces: parts.reduce((a, p) => a + p.pieces, 0), piecesWithShape: parts.filter((p) => shaped.has(p.id)).reduce((a, p) => a + p.pieces, 0),
       rectAreaM2: r3(rectArea / 1e6), trueAreaM2: r3(trueArea / 1e6), usePct: rectArea > 0 ? r1((trueArea / rectArea) * 100) : null,
@@ -177,7 +235,56 @@ function viewOf(line, rows, drawings) {
 export async function getDrawings(db, companyId, orderId, lineId) {
   const line = await requireLine(db, companyId, orderId, lineId);
   const [rows, drawings] = [await rowsOfLine(db, companyId, line), await liveDrawings(db, companyId, line.id)];
-  return viewOf(line, rows, drawings);
+  const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
+  return viewOf(line, rows, drawings, refs);
+}
+
+/** A number no other shop drawing has: "SO-20260930-0001/TF1", else with the line, else numbered on. */
+async function freeNumber(db, companyId, line, mark, taken) {
+  const base = [`${line.order_code}/${mark}`, `${line.order_code}/L${line.line_no}/${mark}`];
+  for (let i = 2; i < 50; i++) base.push(`${line.order_code}/L${line.line_no}/${mark}-${i}`);
+  const cands = base.map((x) => x.slice(0, 150));
+  const [rows] = await db.query("SELECT LOWER(number) AS n FROM cf_drawings WHERE company_id = ? AND source = 'shop' AND deleted_at IS NULL AND LOWER(number) IN (?)", [companyId, cands.map((x) => x.toLowerCase())]);
+  const used = new Set([...rows.map((r) => r.n), ...taken]);
+  const pick = cands.find((x) => !used.has(x.toLowerCase())) ?? `${line.order_code}/${mark}-${Date.now()}`.slice(0, 150);
+  taken.add(pick.toLowerCase());
+  return pick;
+}
+
+/** The live revision (draft or issued) of the drawing `id` belongs to, or null when it was withdrawn. */
+async function liveRevisionOf(db, companyId, id) {
+  const [[x]] = await db.query('SELECT id, root_id FROM cf_drawings WHERE company_id = ? AND id = ?', [companyId, Number(id)]);
+  if (!x) return null;
+  const [[d]] = await db.query(
+    "SELECT * FROM cf_drawings WHERE company_id = ? AND root_id = ? AND deleted_at IS NULL AND status IN ('draft', 'issued') ORDER BY id DESC LIMIT 1",
+    [companyId, Number(x.root_id ?? x.id)],
+  );
+  return d ?? null;
+}
+
+/**
+ * START a drawing from rows of the line, before any file exists — the register entry (number,
+ * revision, title, customer's or ours, draft or issued) linked to those rows. Its file comes later
+ * (upload with drawingId, or by the rows' drawing mark).
+ * input: { rowIds, number, revision?, title?, source?, status?, notes? }
+ */
+export async function startDrawing(db, c, orderId, lineId, input = {}) {
+  const companyId = c.companyId;
+  const line = await requireLine(db, companyId, orderId, lineId);
+  const rows = await rowsOfLine(db, companyId, line);
+  const want = [...new Set((Array.isArray(input.rowIds) ? input.rowIds : []).map(Number).filter(Number.isInteger))];
+  if (!want.length) throw invalid('NO_ROWS', 'Choose the row (or rows) the drawing is for.');
+  const byId = new Map(rows.map((p) => [p.id, p]));
+  const foreign = want.filter((id) => !byId.has(id));
+  if (foreign.length) throw invalid('NOT_ON_LINE', `${foreign.length === 1 ? 'A chosen row is' : `${foreign.length} chosen rows are`} not on line ${line.line_no} of ${line.order_code}.`);
+  const first = byId.get(want[0]);
+  const d = await createDrawing(db, c, {
+    number: input.number, revision: input.revision, source: input.source, status: input.status, notes: input.notes,
+    title: input.title !== undefined ? input.title : first?.name ?? null,
+  });
+  await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'created_by'],
+    want.map((id) => [companyId, d.id, 'master_record', id, c.userId ?? null]));
+  return { drawing: { id: d.id, code: d.code, number: d.number, revision: d.revision, status: d.status }, view: await getDrawings(db, companyId, null, line.id) };
 }
 
 const decode = (content) => Buffer.from(String(content ?? '').replace(/^data:[^,]*,/, ''), 'base64');
@@ -197,16 +304,37 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   const rows = await rowsOfLine(db, companyId, line);
   const byMark = new Map();
   for (const p of rows) if (p.markNorm) { if (!byMark.has(p.markNorm)) byMark.set(p.markNorm, []); byMark.get(p.markNorm).push(p); }
-  const existing = new Map((await liveDrawings(db, companyId, line.id)).map((d) => [d.mark_norm, d]));
+  const live = await liveDrawings(db, companyId, line.id);
+  const existing = new Map(live.map((d) => [d.mark_norm, d]));
+  const fileOfDrawing = new Map(live.filter((d) => d.drawing_id != null).map((d) => [Number(d.drawing_id), d]));
   const seen = new Set();
+  const seenDrawing = new Set();
+  const taken = new Set();
   const out = [];
   for (const f of files) {
     const name = String(f?.name ?? '').trim();
     const kind = kindOf(name);
-    const mark = name.replace(/\.(dxf|pdf)$/i, '').trim();
+    let mark = name.replace(/\.(dxf|pdf)$/i, '').trim();
+    // Attached to a register drawing by hand: its rows' drawing mark, when they share one.
+    const wanted = f?.drawingId != null && f.drawingId !== '' ? Number(f.drawingId) : null;
+    let target = null;
+    let targetProblem = null;
+    if (wanted != null) {
+      const [[d]] = await db.query('SELECT * FROM cf_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, wanted]);
+      const linked = rows.filter((p) => p.drawingIds.includes(wanted));
+      if (!d) targetProblem = 'That register drawing no longer exists.';
+      else if (!['draft', 'issued'].includes(d.status)) targetProblem = `${d.number} rev ${d.revision} is ${d.status} — attach the file to its live revision.`;
+      else if (!linked.length) targetProblem = `${d.number} covers no row of this line.`;
+      else {
+        target = d;
+        const marks = [...new Set(linked.map((p) => p.mark).filter(Boolean))];
+        mark = marks.length === 1 ? marks[0] : String(d.number);
+      }
+    }
     const markNorm = normMark(mark);
-    const entry = { name, mark, fileKind: kind, status: 'error', rows: [], geometry: null, problems: [], warnings: [], _save: null };
+    const entry = { name, mark, fileKind: kind, status: 'error', rows: [], geometry: null, problems: [], warnings: [], register: null, _save: null };
     out.push(entry);
+    if (targetProblem) { entry.problems.push(targetProblem); continue; }
     if (!kind) { entry.problems.push('Only DXF and PDF drawings are taken.'); continue; }
     if (!markNorm) { entry.problems.push('The file name is empty — name it by the drawing mark.'); continue; }
     if (seen.has(markNorm)) { entry.problems.push('Another file in this upload has the same drawing mark.'); continue; }
@@ -215,7 +343,19 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     if (!buf.length) { entry.problems.push('The file is empty.'); continue; }
     if (buf.length > MAX_FILE_BYTES) { entry.problems.push('The file is larger than 4 MB.'); continue; }
     if (kind === 'pdf' && buf.subarray(0, 5).toString('latin1') !== '%PDF-') { entry.problems.push('This does not read as a PDF file.'); continue; }
-    const matched = byMark.get(markNorm) ?? [];
+    // The register drawing it goes on: the one asked for, else the one its mark's file sits on, else
+    // one waiting (no file yet) on a row with its mark.
+    if (!target && existing.get(markNorm)?.drawing_id != null) target = await liveRevisionOf(db, companyId, existing.get(markNorm).drawing_id);
+    if (!target) {
+      const waitingIds = [...new Set((byMark.get(markNorm) ?? []).flatMap((p) => p.drawingIds))].filter((id) => !fileOfDrawing.has(id));
+      if (waitingIds.length) {
+        const [cands] = await db.query("SELECT * FROM cf_drawings WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL AND status IN ('draft', 'issued') ORDER BY id", [companyId, waitingIds]);
+        target = cands.find((d) => normMark(String(d.number).split('/').pop()) === markNorm) ?? cands[0] ?? null;
+      }
+    }
+    if (target && seenDrawing.has(Number(target.id))) { entry.problems.push(`Another file in this upload goes on the same drawing (${target.number}).`); continue; }
+    if (target) seenDrawing.add(Number(target.id));
+    const matched = rows.filter((p) => (p.markNorm && p.markNorm === markNorm) || (target && p.drawingIds.includes(Number(target.id))));
     const plate = matched.filter((p) => p.isPlatePart);
     entry.rows = matched.map((p) => rowView(p, null));
     let g = null;
@@ -242,21 +382,42 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
       }
     }
     if (!matched.length) { entry.status = 'unmatched'; entry.warnings.push(`No row on this line has drawing mark ${mark}.`); continue; }
-    entry.status = existing.has(markNorm) ? 'replaces' : 'new';
-    entry._save = { mark, markNorm, name, kind, g: plate.length ? g : null, warnings: entry.warnings, body: kind === 'dxf' ? text : buf.toString('base64') };
+    const hadFile = target ? fileOfDrawing.has(Number(target.id)) : false;
+    entry.status = existing.has(markNorm) || hadFile ? 'replaces' : 'new';
+    const action = !target ? 'create' : hadFile ? (target.status === 'issued' ? 'revise' : 'replace') : 'attach';
+    const number = target ? target.number : await freeNumber(db, companyId, line, mark, taken);
+    entry.register = {
+      action, drawingId: target ? Number(target.id) : null, code: target?.code ?? null, number,
+      revision: action === 'revise' ? nextRevision(target.revision) : target ? target.revision : 'A',
+      fromRevision: action === 'revise' ? target.revision : null,
+    };
+    entry._save = {
+      mark, markNorm, name, kind, g: plate.length ? g : null, warnings: entry.warnings, body: kind === 'dxf' ? text : buf.toString('base64'),
+      action, target, number, title: matched[0]?.name ?? null, rowIds: matched.map((p) => p.id),
+      replaces: [existing.get(markNorm)?.id, target ? fileOfDrawing.get(Number(target.id))?.id : null].filter(Boolean),
+    };
   }
   const toSave = out.filter((e) => e._save);
   let view = null;
   if (!dryRun && toSave.length) {
-    const replaced = toSave.map((e) => existing.get(e._save.markNorm)?.id).filter(Boolean);
+    const replaced = [...new Set(toSave.flatMap((e) => e._save.replaces))];
+    // The replaced files keep their drawing_id: an issued revision's file stays downloadable from it.
     if (replaced.length) await db.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, replaced]);
     for (const { _save: s } of toSave) {
+      let drawingId;
+      if (s.action === 'create') drawingId = (await createDrawing(db, c, { number: s.number, revision: 'A', title: s.title, source: 'shop', status: 'issued' })).id;
+      else if (s.action === 'revise') drawingId = (await reviseDrawing(db, c, s.target.id, {})).id;
+      else drawingId = Number(s.target.id);
+      const [have] = await db.query("SELECT subject_id FROM cf_drawing_links WHERE company_id = ? AND drawing_id = ? AND subject_type = 'master_record' AND deleted_at IS NULL", [companyId, drawingId]);
+      const linked = new Set(have.map((h) => Number(h.subject_id)));
+      const add = s.rowIds.filter((id) => !linked.has(id));
+      if (add.length) await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'created_by'], add.map((id) => [companyId, drawingId, 'master_record', id, c.userId ?? null]));
       // One at a time: a drawing can be megabytes, and a TiDB statement is one entry.
       await insertRows(db, 'cf_part_drawings', [
-        'company_id', 'order_line_id', 'mark', 'mark_norm', 'file_name', 'file_kind', 'length_mm', 'width_mm', 'area_mm2', 'cut_length_mm',
+        'company_id', 'order_line_id', 'drawing_id', 'mark', 'mark_norm', 'file_name', 'file_kind', 'length_mm', 'width_mm', 'area_mm2', 'cut_length_mm',
         'piercings', 'holes', 'inner_cuts', 'geometry_json', 'warnings_json', 'dxf_text', 'created_by',
       ], [[
-        companyId, line.id, s.mark.slice(0, 120), s.markNorm.slice(0, 120), s.name.slice(0, 255), s.kind,
+        companyId, line.id, drawingId, s.mark.slice(0, 120), s.markNorm.slice(0, 120), s.name.slice(0, 255), s.kind,
         s.g?.lengthMm ?? null, s.g?.widthMm ?? null, s.g?.areaMm2 ?? null, s.g?.cutLengthMm ?? null,
         s.g?.piercings ?? null, s.g?.holes ?? null, s.g?.innerCuts ?? null, s.g ? JSON.stringify(s.g) : null, JSON.stringify(s.warnings), s.body, c.userId ?? null,
       ]]);
@@ -300,10 +461,10 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
   if (!Number(has[0].n)) return out;
   const line = await requireLine(db, companyId, null, lineId);
   const parts = await platePartsOfLine(db, companyId, line);
-  const drawings = new Map((await liveDrawings(db, companyId, line.id)).filter((d) => d.geometry).map((d) => [d.mark_norm, d]));
+  const shaped = (await liveDrawings(db, companyId, line.id)).filter((d) => d.geometry);
   const acc = new Map();
   for (const p of parts) {
-    const d = p.markNorm ? drawings.get(p.markNorm) : null;
+    const d = fileFor(p, shaped);
     const w = Math.max(1, p.pieces);
     for (const cpId of p.cutPlateIds) {
       if (!acc.has(cpId)) acc.set(cpId, { n: 0, cut: 0, pierce: 0, aL: 0, aW: 0, drawn: 0, marks: new Set(), d: null, o: null });
@@ -312,7 +473,7 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
       if (d && p.lengthMm > 0 && p.widthMm > 0) {
         const o = orientTo(d.geometry, p.lengthMm, p.widthMm);
         a.cut += w * d.geometry.cutLengthMm; a.pierce += w * d.geometry.piercings;
-        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(p.markNorm); a.d = d; a.o = o;
+        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(d.id); a.d = d; a.o = o;
       } else {
         a.cut += w * 2 * ((p.lengthMm ?? 0) + (p.widthMm ?? 0)); a.pierce += w; a.aL += w; a.aW += w; a.marks.add(null);
       }
@@ -330,4 +491,15 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
     out.set(cpId, { cutLengthMm: r1(a.cut / a.n), piercings: r3(a.pierce / a.n), alongLength: r3(a.aL / a.n), alongWidth: r3(a.aW / a.n), rings });
   }
   return out;
+}
+
+/** The file of one register revision — also an earlier, superseded one — to download. */
+export async function registerFile(db, companyId, drawingId) {
+  const [[d]] = await db.query(
+    'SELECT file_name, file_kind, dxf_text FROM cf_part_drawings WHERE company_id = ? AND drawing_id = ? AND dxf_text IS NOT NULL ORDER BY deleted_at IS NULL DESC, id DESC LIMIT 1',
+    [companyId, Number(drawingId)],
+  );
+  if (!d) throw notFound('Drawing file');
+  const kind = d.file_kind ?? 'dxf';
+  return { filename: d.file_name, contentType: KINDS[kind], buffer: kind === 'pdf' ? Buffer.from(d.dxf_text, 'base64') : Buffer.from(d.dxf_text, 'latin1') };
 }
