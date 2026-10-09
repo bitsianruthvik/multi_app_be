@@ -285,23 +285,86 @@ export async function createChart(db, c, subject, input = {}) {
   return { chartId: r.insertId, code, charts: await listCharts(db, companyId, subject) };
 }
 
-/** input: { name?, resultUnit?, inputs?, mode? } — the columns are fixed once the chart has rows. */
+/** "A, B" for the words of a row's inputs. */
+const rowWords = (row, n) => row.slice(0, n).map((v) => (v == null || v === '' ? 'blank' : String(v))).join(', ');
+const sameCell = (x, y) => (x == null || x === '' ? y == null || y === '' : String(x).trim().toLowerCase() === String(y ?? '').trim().toLowerCase());
+
+/**
+ * A chart's rows re-laid for new inputs (user, 2026-10-09: "not letting me edit … change the order of
+ * variables or adding new variables or changing the units"). from[i] = the old column the new
+ * column i was, or null for a new one, which takes fill[i] in every existing row. A removed column's
+ * values go; two rows that then read the same and give different results are refused, in words.
+ * Returns { rows } or { problem }.
+ */
+export function relayRows(rows, oldCount, from, fill) {
+  const out = [];
+  const seen = new Map();
+  for (const r of rows) {
+    const next = [...from.map((k, i) => (k != null ? r[k] : fill[i] ?? null)), r[oldCount] ?? null];
+    const key = JSON.stringify(next.slice(0, from.length).map((v) => (v == null ? '' : String(v).trim().toLowerCase())));
+    const had = seen.get(key);
+    if (had) {
+      if (sameCell(had[from.length], next[from.length])) continue;
+      return { problem: `Without the removed input two rows would both read ${rowWords(next, from.length)} but give ${had[from.length] ?? 'blank'} and ${next[from.length] ?? 'blank'}. Change or delete one of them first.` };
+    }
+    seen.set(key, next);
+    out.push(next);
+  }
+  return { rows: out };
+}
+
+/**
+ * input: { name?, resultUnit?, inputs?, mode? }. Each input may carry `from` (the index of the old
+ * column it is — so a moved column moves its values) and, for a new input on a chart that already has
+ * rows, `fill` (the value every existing row is for). Every value of the chart (the type's, a
+ * machine's own, a machine's copy) is re-laid the same way, and every saved time that reads the chart
+ * by its old inputs is rewritten to its new ones. A unit is the heading's word: the rows are not converted.
+ */
 export async function updateChart(db, c, specId, input = {}) {
   const { companyId } = c;
   const s = await specRow(db, companyId, specId);
   const cfg = parseJson(s.table_config) ?? { axes: [], mode: 'step_up' };
+  const oldAxes = cfg.axes ?? [];
   const problems = [];
   const sets = {};
   if (input.name !== undefined) { const n = String(input.name ?? '').trim(); if (!n) problems.push('A chart needs a name.'); else sets.name = n.slice(0, 255); }
   if (input.resultUnit !== undefined) { if (blank(input.resultUnit)) problems.push('Say the unit of what the chart gives.'); else sets.default_uom = String(input.resultUnit).trim().slice(0, 30); }
   if (input.mode !== undefined) { if (!MODES.includes(input.mode)) problems.push('Between two rows the chart steps up or reads a straight line.'); else cfg.mode = input.mode; }
   const given = input.inputs ?? input.axes;
+  let relaid = null;
+  let refsChanged = false;
   if (given !== undefined) {
     const axes = readInputs(given, await fieldsOf(db, companyId), problems);
-    const same = axes.length === (cfg.axes?.length ?? 0) && axes.every((a, i) => inputRef(a) === inputRef(cfg.axes[i] ?? {}) || (cfg.axes[i]?.kind !== 'level' && a.kind === 'spec' && !cfg.axes[i]?.field));
-    if (!same) {
-      const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [companyId, s.id]);
-      if (Number(n)) problems.push('The chart has rows, so its columns stay as they are — add a new chart for other columns.');
+    if (!problems.length) {
+      const from = axes.map((a, i) => {
+        const g = given[i] ?? {};
+        if (g.from != null && g.from !== '' && Number.isInteger(Number(g.from)) && Number(g.from) >= 0 && Number(g.from) < oldAxes.length) return Number(g.from);
+        const k = oldAxes.findIndex((o) => inputRef(o) && String(inputRef(o)).toUpperCase() === String(inputRef(a)).toUpperCase());
+        return k >= 0 ? k : null;
+      });
+      const fill = axes.map((_, i) => (blank(given[i]?.fill) ? null : String(given[i].fill).trim()));
+      const unchanged = from.length === oldAxes.length && from.every((k, i) => k === i);
+      refsChanged = !(axes.length === oldAxes.length && axes.every((x, i) => String(inputRef(x) ?? '').toUpperCase() === String(inputRef(oldAxes[i]) ?? '').toUpperCase()));
+      if (!unchanged) {
+        const [vals] = await db.query('SELECT id, value_json FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL AND value_json IS NOT NULL', [companyId, s.id]);
+        const withRows = vals.map((v) => ({ id: v.id, rows: rowsOfValue(v.value_json) })).filter((v) => v.rows?.length);
+        if (withRows.length) {
+          axes.forEach((x, i) => {
+            if (from[i] == null && fill[i] == null) problems.push(`${x.label} is a new input and the chart already has rows: say which ${x.kind === 'level' ? x.label.toLowerCase() : 'value'} those rows are for.`);
+            if (from[i] != null && x.kind !== (oldAxes[from[i]].kind === 'level' ? 'level' : 'spec')) problems.push(`${x.label} cannot take over a column of another kind.`);
+          });
+          if (!problems.length) {
+            relaid = [];
+            for (const v of withRows) {
+              const r = relayRows(v.rows, oldAxes.length, from, fill);
+              if (r.problem) { problems.push(r.problem); break; }
+              // A new tree-level or pick-list column names its node or choice by name: stored as id / value.
+              const norm = axes.some((x, i) => from[i] == null && (x.kind === 'level' || x.dataType === 'option')) ? (await normaliseRows(db, companyId, axes, r.rows)).rows : r.rows;
+              relaid.push({ id: v.id, rows: norm });
+            }
+          }
+        }
+      }
     }
     cfg.axes = axes;
     cfg.version = 2;
@@ -309,7 +372,56 @@ export async function updateChart(db, c, specId, input = {}) {
   assertNoProblems(problems, 'The chart cannot be changed like that.');
   sets.table_config = JSON.stringify(cfg);
   await db.query(`UPDATE cf_specifications SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`, [...Object.values(sets), companyId, s.id]);
+  for (const v of relaid ?? []) await db.query('UPDATE cf_spec_values SET value_json = ? WHERE company_id = ? AND id = ?', [JSON.stringify({ rows: v.rows }), companyId, v.id]);
+  if (refsChanged) await rewriteTimes(db, companyId, s.code, oldAxes, cfg.axes);
   return chartSpec(await specRow(db, companyId, s.id), await fieldsOf(db, companyId));
+}
+
+/**
+ * Saved times read a chart as LOOKUP(machine.CODE, item.A, item.B) (lib/chartFormula.js). When its
+ * inputs change, every LOOKUP that read it by exactly its old inputs is rewritten to the new ones,
+ * so the time still reads the chart the way the person wrote it (machine.CODE).
+ */
+async function rewriteTimes(db, companyId, code, oldAxes, newAxes) {
+  const oldArgs = oldAxes.map((x) => `item.${String(inputRef(x) ?? '').toUpperCase()}`);
+  const newArgs = newAxes.map((x) => `item.${String(inputRef(x)).toUpperCase()}`).join(', ');
+  const re = new RegExp(`LOOKUP\\s*\\(\\s*machine\\.${code.replace(/[^A-Za-z0-9_]/g, '')}\\s*,([^()]*)\\)`, 'gi');
+  const swap = (expr) => (expr == null ? expr : String(expr).replace(re, (whole, rest) => {
+    const args = rest.split(',').map((x) => x.trim().toUpperCase().replace(/^ITEM\./, 'item.'));
+    return args.length === oldArgs.length && args.every((x, i) => x === oldArgs[i]) ? `LOOKUP(machine.${code}, ${newArgs})` : whole;
+  }));
+  const like = `%machine.${code}%`;
+  const [rules] = await db.query('SELECT id, work_expression AS w, setup_expression AS s FROM cf_operation_machine_rules WHERE company_id = ? AND deleted_at IS NULL AND (work_expression LIKE ? OR setup_expression LIKE ?)', [companyId, like, like]);
+  for (const r of rules) {
+    const w = swap(r.w); const st = swap(r.s);
+    if (w !== r.w || st !== r.s) await db.query('UPDATE cf_operation_machine_rules SET work_expression = ?, setup_expression = ? WHERE company_id = ? AND id = ?', [w, st, companyId, r.id]);
+  }
+  const [forms] = await db.query('SELECT id, expression FROM cf_formulas WHERE company_id = ? AND deleted_at IS NULL AND expression LIKE ?', [companyId, like]);
+  for (const f of forms) { const e = swap(f.expression); if (e !== f.expression) await db.query('UPDATE cf_formulas SET expression = ? WHERE company_id = ? AND id = ?', [e, companyId, f.id]); }
+}
+
+/**
+ * Deletes a chart: the specification, its rules and every value. Refused while a time or a formula
+ * still reads it — they are named, so the person can change them first.
+ */
+export async function deleteChart(db, c, specId) {
+  const { companyId } = c;
+  const s = await specRow(db, companyId, specId);
+  const reads = new RegExp(`machine\\.${s.code.replace(/[^A-Za-z0-9_]/g, '')}(?![A-Za-z0-9_])`, 'i');
+  const like = `%machine.${s.code}%`;
+  const [rules] = await db.query(
+    `SELECT o.code, o.name, r.work_expression AS w, r.setup_expression AS st FROM cf_operation_machine_rules r JOIN cf_operations o ON o.id = r.operation_id AND o.deleted_at IS NULL
+      WHERE r.company_id = ? AND r.deleted_at IS NULL AND (r.work_expression LIKE ? OR r.setup_expression LIKE ?)`, [companyId, like, like]);
+  const [forms] = await db.query('SELECT code, name, expression FROM cf_formulas WHERE company_id = ? AND deleted_at IS NULL AND expression LIKE ?', [companyId, like]);
+  const users = [...new Set([
+    ...rules.filter((r) => reads.test(`${r.w ?? ''} ${r.st ?? ''}`)).map((r) => `operation ${r.code}`),
+    ...forms.filter((f) => reads.test(f.expression ?? '')).map((f) => `formula ${f.code ?? f.name}`),
+  ])];
+  if (users.length) throw invalid('IN_USE', `${s.name} is read by ${users.join(', ')}. Change ${users.length === 1 ? 'that time' : 'those'} first, then delete the chart.`);
+  await db.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [companyId, s.id]);
+  await db.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL', [companyId, s.id]);
+  await db.query('UPDATE cf_specifications SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [companyId, s.id]);
+  return { ok: true, deleted: { specId: s.id, code: s.code, name: s.name } };
 }
 
 /** The machine type page: its path, its machines and its charts (its rules come from GET /classification/:id/resolved). */

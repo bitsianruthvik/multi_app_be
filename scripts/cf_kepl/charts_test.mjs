@@ -7,7 +7,7 @@
  */
 import { pool } from '../../db.js';
 import { expandCharts, contractCharts } from '../../apps/cf_erp/lib/chartFormula.js';
-import { createChart, updateChart, listCharts, machineTypeDetails, chartBindings } from '../../apps/cf_erp/services/chartService.js';
+import { createChart, updateChart, deleteChart, relayRows, listCharts, machineTypeDetails, chartBindings } from '../../apps/cf_erp/services/chartService.js';
 import { setValues } from '../../apps/cf_erp/services/valueService.js';
 import { createTimingRule, listTimingRules, timingPreview } from '../../apps/cf_erp/services/operationService.js';
 import { neededCodesOfFlows } from '../../apps/cf_erp/services/flowSpecService.js';
@@ -81,8 +81,8 @@ try {
   // Editing the chart itself.
   const ed = await updateChart(db, c, made.chartId, { resultUnit: 'm/min', mode: 'linear' });
   ok('the chart is edited in place (unit, between rows)', ed.resultUnit === 'm/min' && ed.mode === 'linear');
-  const two = await refused(() => updateChart(db, c, made.chartId, { inputs: [{ field: 'THICKNESS' }, { level: 'FAMILY' }] }));
-  ok('a chart with values keeps its number of columns, said in words', !!two && /columns stay/.test(JSON.stringify(two.problems)));
+  const two = await refused(() => updateChart(db, c, made.chartId, { inputs: [{ field: 'THICKNESS', from: 0 }, { level: 'FAMILY' }] }));
+  ok('a new input on a chart with rows needs the value those rows are for, said in words', !!two && /new input/.test(JSON.stringify(two.problems)), JSON.stringify(two?.problems));
   await updateChart(db, c, made.chartId, { resultUnit: 'mm/min' });
 
   // Many inputs: Thickness (number), Grade (pick-list), Family (tree level), pasted in words.
@@ -116,6 +116,31 @@ try {
   const pv2 = await timingPreview(db, COMPANY, o2.insertId, { machineId: mc.id, itemId: piece.id });
   // thk steps up to thk + 2 (the row at or above), its grade, its family: 22 s = 0.3667 min, + 1 + 2.
   ok(`worked out on the real piece: 22 s / 60 + 1 (family) + 2 (grade) = ${(22 / 60 + 3).toFixed(4)} min`, Math.abs((pv2.work?.minutes ?? -1) - (22 / 60 + 3)) < 1e-3, JSON.stringify(pv2.work));
+  // Editing the inputs of a chart that has rows and a time reading it (2026-10-09).
+  const rowsOf = async (id) => (await listCharts(db, COMPANY, { type: 'classification', id: typeId })).find((x) => x.specId === id);
+  const exprOf = async () => (await db.query('SELECT work_expression FROM cf_operation_machine_rules WHERE id = ?', [r2.id]))[0][0].work_expression;
+  await updateChart(db, c, many.chartId, { inputs: [{ field: 'GRADE', from: 1 }, { field: 'THICKNESS', from: 0 }, { level: 'FAMILY', from: 2 }] });
+  let mc2 = await rowsOf(many.chartId);
+  ok('inputs reordered: every row\'s values move with their column', mc2.axes.map((a) => a.label).join('|') === 'Grade|Thickness|Family' && mc2.rows[1][0] === piece.grade && Number(mc2.rows[1][1]) === thk + 2 && mc2.rows[1][3] === 22, JSON.stringify(mc2.rows));
+  ok('…and the saved time reads it in the new order', (await exprOf()).startsWith(`LOOKUP(machine.${many.code}, item.GRADE, item.THICKNESS, item.FAMILY)`), await exprOf());
+  const pv3 = await timingPreview(db, COMPANY, o2.insertId, { machineId: mc.id, itemId: piece.id });
+  ok('…worked out the same on the real piece', Math.abs((pv3.work?.minutes ?? -1) - (22 / 60 + 3)) < 1e-3, JSON.stringify(pv3.work));
+  await updateChart(db, c, many.chartId, { inputs: [{ field: 'GRADE', from: 0 }, { field: 'THICKNESS', from: 1 }, { level: 'FAMILY', from: 2 }, { field: 'WIDTH', unit: 'mm', fill: '300' }] });
+  mc2 = await rowsOf(many.chartId);
+  ok('an input added with the value the rows are for: every row has it', mc2.axes.length === 4 && mc2.rows.every((r) => Number(r[3]) === 300 && r.length === 5), JSON.stringify(mc2.rows));
+  ok('…and the time reads the fourth input too', (await exprOf()).includes(`item.FAMILY, item.WIDTH)`), await exprOf());
+  const clash = await refused(() => updateChart(db, c, many.chartId, { inputs: [{ field: 'GRADE', from: 0 }, { level: 'FAMILY', from: 2 }, { field: 'WIDTH', from: 3 }] }));
+  ok('removing an input that two rows differ by (11 and 22) is refused, in words', !!clash && /two rows would both read/.test(JSON.stringify(clash.problems)), JSON.stringify(clash?.problems));
+  await updateChart(db, c, many.chartId, { inputs: [{ field: 'GRADE', from: 0 }, { field: 'THICKNESS', from: 1 }, { level: 'FAMILY', from: 2 }] });
+  mc2 = await rowsOf(many.chartId);
+  ok('removing the added input drops its values, the rest stay', mc2.axes.length === 3 && mc2.rows.every((r) => r.length === 4) && mc2.rows[1][3] === 22 && (await exprOf()).startsWith(`LOOKUP(machine.${many.code}, item.GRADE, item.THICKNESS, item.FAMILY)`));
+  ok('a removed input with identical rows merges them', JSON.stringify(relayRows([[1, 'a', 5], [2, 'a', 5]], 2, [1], [null]).rows) === JSON.stringify([['a', 5]]));
+  // Deleting.
+  const inUse = await refused(() => deleteChart(db, c, many.chartId));
+  ok('a chart a time reads cannot be deleted; the operation is named', !!inUse && new RegExp(`${T}-DR`).test(inUse.message), inUse?.message);
+  const gone = await deleteChart(db, c, dupe.chartId);
+  ok('an unused chart is deleted: gone from the type and from the formula names', gone.ok && !(await listCharts(db, COMPANY, { type: 'classification', id: typeId })).some((x) => x.specId === dupe.chartId) && !(await chartBindings(db, COMPANY)).has(dupe.code));
+
   const need2 = (await neededCodesOfFlows(db, COMPANY, [])).size === 0;
   ok('(sanity) no flows, nothing needed', need2);
 

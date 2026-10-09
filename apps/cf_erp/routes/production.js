@@ -81,7 +81,7 @@ import {
   listMachineTypes, createMachineType, updateMachineNode, deleteMachineNode,
 } from '../services/classificationService.js';
 import { builderContext } from '../services/formulaBuilderService.js';
-import { listCharts, createChart, updateChart, machineTypeDetails, setChartValue } from '../services/chartService.js';
+import { listCharts, createChart, updateChart, deleteChart, machineTypeDetails, setChartValue } from '../services/chartService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -124,6 +124,7 @@ router.get('/machines/:id/charts', view, handle((req) => listCharts(pool, ctx(re
 router.post('/machines/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'machine', id: id(req) }, req.body ?? {}))));
 router.put('/machines/:id/charts/:specId/values', manage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'machine', id: id(req) }, specId(req), chartValue(req)))));
 router.put('/charts/:specId', manage, handle((req) => tx(req, (db, c) => updateChart(db, c, specId(req), req.body ?? {}))));
+router.delete('/charts/:specId', manage, handle((req) => tx(req, (db, c) => deleteChart(db, c, specId(req)))));
 
 router.get('/operations', view, handle((req) => listOperations(pool, ctx(req).companyId, req.query)));
 router.post('/operations', manage, handle((req) => tx(req, (db, c) => createOperation(db, c, req.body ?? {}))));
