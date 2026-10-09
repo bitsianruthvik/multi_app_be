@@ -269,7 +269,8 @@ export async function createChart(db, c, subject, input = {}) {
   if (!code) problems.push('The chart needs a code of letters and numbers.');
   assertNoProblems(problems, 'The chart cannot be added yet.');
   // A code the company already has gets a number after it.
-  const [taken] = await db.query('SELECT UPPER(code) AS code FROM cf_specifications WHERE company_id = ? AND code LIKE ?', [companyId, `${code}%`]);
+  // Live codes only: a deleted chart's code is free again (uq_csp_code is over live rows).
+  const [taken] = await db.query('SELECT UPPER(code) AS code FROM cf_specifications WHERE company_id = ? AND code LIKE ? AND deleted_at IS NULL', [companyId, `${code}%`]);
   const used = new Set(taken.map((t) => t.code));
   if (used.has(code)) { let n = 2; while (used.has(`${code}_${n}`)) n++; code = `${code}_${n}`; }
   const [r] = await db.query(
