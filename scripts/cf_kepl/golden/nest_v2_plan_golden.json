@@ -1,0 +1,1474 @@
+{
+ "line": {
+  "id": "#",
+  "lineNo": 1,
+  "orderId": "#",
+  "orderCode": "TAG-SO",
+  "quantity": 1,
+  "orderStatus": "confirmed",
+  "frozen": true,
+  "released": false,
+  "plateChoice": "any"
+ },
+ "saved": false,
+ "basis": "proposal",
+ "imported": {
+  "lots": 0,
+  "pieces": 0
+ },
+ "choices": {
+  "cutPlatesLeftOut": 0,
+  "piecesLeftOut": 0,
+  "kgLeftOut": 0,
+  "platesExcluded": 0,
+  "leftOut": [],
+  "excludedPlates": []
+ },
+ "settingsNote": "Kerf is banded by plate thickness and charged at the plate rim as well as between pieces; two parts sharing a boundary are one kerf apart, not two.",
+ "groups": [
+  {
+   "key": "14.137|TAG-GA|TAG-STEEL",
+   "thickness": 14.137,
+   "grade": "TAG-GA",
+   "material": "TAG-STEEL",
+   "kerfMm": 3,
+   "seqGapMinMm": 5,
+   "seqGapMaxMm": 8,
+   "orderMarginLengthMm": 100,
+   "orderMarginWidthMm": 50,
+   "offcutMinAreaMm2": 90000,
+   "offcutMinSideMm": 100,
+   "guillotine": false,
+   "settingsBasis": "14.137–14.137 mm band",
+   "cutPlates": [
+    {
+     "id": "cut:G",
+     "code": "TAG-CG",
+     "name": "Nest v2 fixture cut plate G",
+     "pieces": 6,
+     "length": 520,
+     "width": 320,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:A",
+     "code": "TAG-CA",
+     "name": "Nest v2 fixture cut plate A",
+     "pieces": 4,
+     "length": 500,
+     "width": 400,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:S",
+     "code": "TAG-CS",
+     "name": "Nest v2 fixture cut plate S",
+     "pieces": 8,
+     "length": 900,
+     "width": 180,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:P",
+     "code": "TAG-CP",
+     "name": "Nest v2 fixture cut plate P",
+     "pieces": 4,
+     "length": 700,
+     "width": 400,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:F",
+     "code": "TAG-CF",
+     "name": "Nest v2 fixture cut plate F",
+     "pieces": 2,
+     "length": 800,
+     "width": 600,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:H",
+     "code": "TAG-CH",
+     "name": "Nest v2 fixture cut plate H",
+     "pieces": 4,
+     "length": 300,
+     "width": 180,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:R",
+     "code": "TAG-CR",
+     "name": "Nest v2 fixture cut plate R",
+     "pieces": 5,
+     "length": 1200,
+     "width": 400,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:X1",
+     "code": "TAG-CX1",
+     "name": "Nest v2 fixture cut plate X1",
+     "pieces": 1,
+     "length": 350,
+     "width": 350,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    },
+    {
+     "id": "cut:X2",
+     "code": "TAG-CX2",
+     "name": "Nest v2 fixture cut plate X2",
+     "pieces": 1,
+     "length": 350,
+     "width": 350,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL"
+    }
+   ],
+   "candidates": [
+    {
+     "plateItemId": "plate:PA",
+     "code": "TAG-PA",
+     "name": "Nest v2 fixture plate PA",
+     "length": 6000,
+     "width": 2000
+    },
+    {
+     "plateItemId": "plate:PS",
+     "code": "TAG-PS",
+     "name": "Nest v2 fixture plate PS",
+     "length": 3000,
+     "width": 1500
+    }
+   ],
+   "nests": [
+    {
+     "lotNo": "N-001",
+     "plateItemId": "plate:PS",
+     "plateCode": "TAG-PS",
+     "plateName": "Nest v2 fixture plate PS",
+     "source": "catalog",
+     "ownerPartyId": null,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL",
+     "density": 7850,
+     "length": 3000,
+     "width": 1500,
+     "requiredLength": 2987,
+     "requiredWidth": 1415,
+     "sheetArea": 4500000,
+     "usedArea": 3979200,
+     "wasteArea": 520800,
+     "wastePct": 11.573,
+     "weightKg": 499.39,
+     "wasteTotalKg": 57.796,
+     "sequences": [
+      {
+       "seqNo": 1,
+       "rows": 3,
+       "rowsAllowed": 3,
+       "pieces": 12,
+       "size": "big"
+      }
+     ],
+     "pieces": [
+      {
+       "cutPlateId": "cut:R",
+       "cutPlateCode": "TAG-CR",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 3,
+       "y": 3,
+       "length": 1200,
+       "width": 400,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:R",
+       "cutPlateCode": "TAG-CR",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 1206,
+       "y": 3,
+       "length": 1200,
+       "width": 400,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:A",
+       "cutPlateCode": "TAG-CA",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 2409,
+       "y": 3,
+       "length": 500,
+       "width": 400,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:R",
+       "cutPlateCode": "TAG-CR",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 3,
+       "y": 406,
+       "length": 1200,
+       "width": 400,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:R",
+       "cutPlateCode": "TAG-CR",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 1206,
+       "y": 406,
+       "length": 1200,
+       "width": 400,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:A",
+       "cutPlateCode": "TAG-CA",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 2409,
+       "y": 406,
+       "length": 500,
+       "width": 400,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:F",
+       "cutPlateCode": "TAG-CF",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 3,
+       "y": 812,
+       "length": 800,
+       "width": 600,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:F",
+       "cutPlateCode": "TAG-CF",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 806,
+       "y": 812,
+       "length": 800,
+       "width": 600,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 1612,
+       "y": 812,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 1935,
+       "y": 812,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 4
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 2258,
+       "y": 812,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 5
+      },
+      {
+       "cutPlateId": "cut:A",
+       "cutPlateCode": "TAG-CA",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 2584,
+       "y": 812,
+       "length": 400,
+       "width": 500,
+       "rotated": true,
+       "posNo": 6
+      }
+     ],
+     "origin": "auto",
+     "verdict": null,
+     "forced": false,
+     "reasons": [],
+     "hasLayout": true,
+     "waste": {
+      "kerf": 68370,
+      "sequenceGaps": 0,
+      "rim": 13992,
+      "offcut": 0,
+      "wastage": 438438
+     },
+     "wasteKg": {
+      "kerf": 7.587,
+      "sequenceGaps": 0,
+      "rim": 1.553,
+      "offcut": 0,
+      "wastage": 48.656
+     },
+     "partsKg": 441.594,
+     "offcuts": [],
+     "rules": {
+      "status": "ok",
+      "utilisationPct": 88.427,
+      "sharedCuts": 10,
+      "sharedLengthMm": 6140,
+      "checks": [
+       {
+        "key": "kerf",
+        "ok": true,
+        "label": "Kerf 3 mm",
+        "detail": "Inside the 2.5–5 mm band, charged at the rim and between parts."
+       },
+       {
+        "key": "rim",
+        "ok": true,
+        "label": "Inside the rim",
+        "detail": "Every part sits at least one 3 mm kerf in from the plate edge."
+       },
+       {
+        "key": "spacing",
+        "ok": true,
+        "label": "No overlaps",
+        "detail": "Parts are one kerf apart where they share a cut (10) and further apart elsewhere."
+       },
+       {
+        "key": "rows",
+        "ok": true,
+        "label": "Rows per sequence",
+        "detail": "Every sequence holds what its part size allows (Small 2 rows, Big 3)."
+       },
+       {
+        "key": "sequenceGap",
+        "ok": true,
+        "label": "Sequence gaps",
+        "detail": "One sequence on this plate."
+       },
+       {
+        "key": "order",
+        "ok": true,
+        "label": "Cut order",
+        "detail": "Sequences follow one another across the plate in the order they are numbered, so piercing never jumps back."
+       },
+       {
+        "key": "rotation",
+        "ok": true,
+        "label": "4 turned",
+        "detail": "4 parts are turned 90°. Allowed: a plate rectangle has no grain to respect."
+       },
+       {
+        "key": "fits",
+        "ok": true,
+        "label": "Fits the plate",
+        "detail": "The layout needs 2987 × 1415 of the 3000 × 1500 plate."
+       }
+      ]
+     }
+    },
+    {
+     "lotNo": "N-002",
+     "plateItemId": "plate:PS",
+     "plateCode": "TAG-PS",
+     "plateName": "Nest v2 fixture plate PS",
+     "source": "catalog",
+     "ownerPartyId": null,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL",
+     "density": 7850,
+     "length": 3000,
+     "width": 1500,
+     "requiredLength": 2940,
+     "requiredWidth": 1483,
+     "sheetArea": 4500000,
+     "usedArea": 3879700,
+     "wasteArea": 620300,
+     "wastePct": 13.784,
+     "weightKg": 499.39,
+     "wasteTotalKg": 68.838,
+     "sequences": [
+      {
+       "seqNo": 1,
+       "rows": 3,
+       "rowsAllowed": 3,
+       "pieces": 10,
+       "size": "big"
+      },
+      {
+       "seqNo": 2,
+       "rows": 2,
+       "rowsAllowed": 3,
+       "pieces": 11,
+       "size": "big"
+      }
+     ],
+     "pieces": [
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 3,
+       "y": 3,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 906,
+       "y": 3,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 1809,
+       "y": 3,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:P",
+       "cutPlateCode": "TAG-CP",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 3,
+       "y": 186,
+       "length": 700,
+       "width": 400,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:P",
+       "cutPlateCode": "TAG-CP",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 706,
+       "y": 186,
+       "length": 700,
+       "width": 400,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:P",
+       "cutPlateCode": "TAG-CP",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 1409,
+       "y": 186,
+       "length": 700,
+       "width": 400,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:P",
+       "cutPlateCode": "TAG-CP",
+       "seqNo": 1,
+       "rowNo": 2,
+       "x": 2112,
+       "y": 186,
+       "length": 700,
+       "width": 400,
+       "rotated": false,
+       "posNo": 4
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 3,
+       "y": 589,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 906,
+       "y": 589,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 1,
+       "rowNo": 3,
+       "x": 1809,
+       "y": 589,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 3,
+       "y": 774,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 326,
+       "y": 774,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:G",
+       "cutPlateCode": "TAG-CG",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 649,
+       "y": 774,
+       "length": 320,
+       "width": 520,
+       "rotated": true,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:A",
+       "cutPlateCode": "TAG-CA",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 975,
+       "y": 774,
+       "length": 400,
+       "width": 500,
+       "rotated": true,
+       "posNo": 4
+      },
+      {
+       "cutPlateId": "cut:R",
+       "cutPlateCode": "TAG-CR",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 1381,
+       "y": 774,
+       "length": 1200,
+       "width": 400,
+       "rotated": false,
+       "posNo": 5
+      },
+      {
+       "cutPlateId": "cut:X1",
+       "cutPlateCode": "TAG-CX1",
+       "seqNo": 2,
+       "rowNo": 1,
+       "x": 2587,
+       "y": 774,
+       "length": 350,
+       "width": 350,
+       "rotated": false,
+       "posNo": 6
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 2,
+       "rowNo": 2,
+       "x": 3,
+       "y": 1300,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:S",
+       "cutPlateCode": "TAG-CS",
+       "seqNo": 2,
+       "rowNo": 2,
+       "x": 906,
+       "y": 1300,
+       "length": 900,
+       "width": 180,
+       "rotated": false,
+       "posNo": 2
+      },
+      {
+       "cutPlateId": "cut:H",
+       "cutPlateCode": "TAG-CH",
+       "seqNo": 2,
+       "rowNo": 2,
+       "x": 1809,
+       "y": 1300,
+       "length": 300,
+       "width": 180,
+       "rotated": false,
+       "posNo": 3
+      },
+      {
+       "cutPlateId": "cut:H",
+       "cutPlateCode": "TAG-CH",
+       "seqNo": 2,
+       "rowNo": 2,
+       "x": 2112,
+       "y": 1300,
+       "length": 300,
+       "width": 180,
+       "rotated": false,
+       "posNo": 4
+      },
+      {
+       "cutPlateId": "cut:H",
+       "cutPlateCode": "TAG-CH",
+       "seqNo": 2,
+       "rowNo": 2,
+       "x": 2415,
+       "y": 1300,
+       "length": 300,
+       "width": 180,
+       "rotated": false,
+       "posNo": 5
+      }
+     ],
+     "origin": "auto",
+     "verdict": null,
+     "forced": false,
+     "reasons": [],
+     "hasLayout": true,
+     "waste": {
+      "kerf": 91698,
+      "sequenceGaps": 206,
+      "rim": 14388,
+      "offcut": 514008,
+      "wastage": 0
+     },
+     "wasteKg": {
+      "kerf": 10.176,
+      "sequenceGaps": 0.023,
+      "rim": 1.597,
+      "offcut": 57.042,
+      "wastage": 0
+     },
+     "partsKg": 430.551,
+     "offcuts": [
+      {
+       "offcutNo": "N-002-A",
+       "area": 514008,
+       "weightKg": 57.042,
+       "rect": {
+        "x": 1378,
+        "y": 1177,
+        "length": 1619,
+        "width": 120
+       },
+       "bbox": {
+        "x": 3,
+        "y": 3,
+        "length": 2994,
+        "width": 1494
+       },
+       "outline": [
+        [
+         [
+          2712,
+          3
+         ],
+         [
+          2997,
+          3
+         ],
+         [
+          2997,
+          1497
+         ],
+         [
+          3,
+          1497
+         ],
+         [
+          3,
+          1483
+         ],
+         [
+          2718,
+          1483
+         ],
+         [
+          2718,
+          1297
+         ],
+         [
+          972,
+          1297
+         ],
+         [
+          972,
+          1277
+         ],
+         [
+          1378,
+          1277
+         ],
+         [
+          1378,
+          1177
+         ],
+         [
+          2584,
+          1177
+         ],
+         [
+          2584,
+          1127
+         ],
+         [
+          2940,
+          1127
+         ],
+         [
+          2940,
+          771
+         ],
+         [
+          2815,
+          771
+         ],
+         [
+          2815,
+          769
+         ],
+         [
+          2712,
+          769
+         ],
+         [
+          2712,
+          589
+         ],
+         [
+          2815,
+          589
+         ],
+         [
+          2815,
+          183
+         ],
+         [
+          2712,
+          183
+         ]
+        ]
+       ]
+      }
+     ],
+     "rules": {
+      "status": "ok",
+      "utilisationPct": 86.216,
+      "sharedCuts": 25,
+      "sharedLengthMm": 9062,
+      "checks": [
+       {
+        "key": "kerf",
+        "ok": true,
+        "label": "Kerf 3 mm",
+        "detail": "Inside the 2.5–5 mm band, charged at the rim and between parts."
+       },
+       {
+        "key": "rim",
+        "ok": true,
+        "label": "Inside the rim",
+        "detail": "Every part sits at least one 3 mm kerf in from the plate edge."
+       },
+       {
+        "key": "spacing",
+        "ok": true,
+        "label": "No overlaps",
+        "detail": "Parts are one kerf apart where they share a cut (25) and further apart elsewhere."
+       },
+       {
+        "key": "rows",
+        "ok": true,
+        "label": "Rows per sequence",
+        "detail": "Every sequence holds what its part size allows (Small 2 rows, Big 3)."
+       },
+       {
+        "key": "sequenceGap",
+        "ok": true,
+        "label": "Sequence gaps",
+        "detail": "Sequences stand at least 5 mm apart."
+       },
+       {
+        "key": "order",
+        "ok": true,
+        "label": "Cut order",
+        "detail": "Sequences follow one another across the plate in the order they are numbered, so piercing never jumps back."
+       },
+       {
+        "key": "rotation",
+        "ok": true,
+        "label": "4 turned",
+        "detail": "4 parts are turned 90°. Allowed: a plate rectangle has no grain to respect."
+       },
+       {
+        "key": "fits",
+        "ok": true,
+        "label": "Fits the plate",
+        "detail": "The layout needs 2940 × 1483 of the 3000 × 1500 plate."
+       }
+      ]
+     }
+    },
+    {
+     "lotNo": "N-003",
+     "plateItemId": "plate:PS",
+     "plateCode": "TAG-PS",
+     "plateName": "Nest v2 fixture plate PS",
+     "source": "catalog",
+     "ownerPartyId": null,
+     "thickness": 14.137,
+     "grade": "TAG-GA",
+     "material": "TAG-STEEL",
+     "density": 7850,
+     "length": 3000,
+     "width": 1500,
+     "requiredLength": 542,
+     "requiredWidth": 356,
+     "sheetArea": 4500000,
+     "usedArea": 176500,
+     "wasteArea": 4323500,
+     "wastePct": 96.078,
+     "weightKg": 499.39,
+     "wasteTotalKg": 479.802,
+     "sequences": [
+      {
+       "seqNo": 1,
+       "rows": 1,
+       "rowsAllowed": 3,
+       "pieces": 2,
+       "size": "big"
+      }
+     ],
+     "pieces": [
+      {
+       "cutPlateId": "cut:X2",
+       "cutPlateCode": "TAG-CX2",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 3,
+       "y": 3,
+       "length": 350,
+       "width": 350,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:H",
+       "cutPlateCode": "TAG-CH",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 359,
+       "y": 3,
+       "length": 180,
+       "width": 300,
+       "rotated": true,
+       "posNo": 2
+      }
+     ],
+     "origin": "auto",
+     "verdict": null,
+     "forced": false,
+     "reasons": [],
+     "hasLayout": true,
+     "waste": {
+      "kerf": 7152,
+      "sequenceGaps": 0,
+      "rim": 24279,
+      "offcut": 4292069,
+      "wastage": 0
+     },
+     "wasteKg": {
+      "kerf": 0.794,
+      "sequenceGaps": 0,
+      "rim": 2.694,
+      "offcut": 476.314,
+      "wastage": 0
+     },
+     "partsKg": 19.587,
+     "offcuts": [
+      {
+       "offcutNo": "N-003-A",
+       "area": 4292069,
+       "weightKg": 476.314,
+       "rect": {
+        "x": 542,
+        "y": 3,
+        "length": 2455,
+        "width": 1494
+       },
+       "bbox": {
+        "x": 3,
+        "y": 3,
+        "length": 2994,
+        "width": 1494
+       },
+       "outline": [
+        [
+         [
+          542,
+          3
+         ],
+         [
+          2997,
+          3
+         ],
+         [
+          2997,
+          1497
+         ],
+         [
+          3,
+          1497
+         ],
+         [
+          3,
+          356
+         ],
+         [
+          356,
+          356
+         ],
+         [
+          356,
+          306
+         ],
+         [
+          542,
+          306
+         ]
+        ]
+       ]
+      }
+     ],
+     "rules": {
+      "status": "ok",
+      "utilisationPct": 3.922,
+      "sharedCuts": 0,
+      "sharedLengthMm": 0,
+      "checks": [
+       {
+        "key": "kerf",
+        "ok": true,
+        "label": "Kerf 3 mm",
+        "detail": "Inside the 2.5–5 mm band, charged at the rim and between parts."
+       },
+       {
+        "key": "rim",
+        "ok": true,
+        "label": "Inside the rim",
+        "detail": "Every part sits at least one 3 mm kerf in from the plate edge."
+       },
+       {
+        "key": "spacing",
+        "ok": true,
+        "label": "No overlaps",
+        "detail": "Parts are one kerf apart where they share a cut (0) and further apart elsewhere."
+       },
+       {
+        "key": "rows",
+        "ok": true,
+        "label": "Rows per sequence",
+        "detail": "Every sequence holds what its part size allows (Small 2 rows, Big 3)."
+       },
+       {
+        "key": "sequenceGap",
+        "ok": true,
+        "label": "Sequence gaps",
+        "detail": "One sequence on this plate."
+       },
+       {
+        "key": "order",
+        "ok": true,
+        "label": "Cut order",
+        "detail": "Sequences follow one another across the plate in the order they are numbered, so piercing never jumps back."
+       },
+       {
+        "key": "rotation",
+        "ok": true,
+        "label": "1 turned",
+        "detail": "1 part is turned 90°. Allowed: a plate rectangle has no grain to respect."
+       },
+       {
+        "key": "fits",
+        "ok": true,
+        "label": "Fits the plate",
+        "detail": "The layout needs 542 × 356 of the 3000 × 1500 plate."
+       }
+      ]
+     }
+    }
+   ],
+   "unplaced": [],
+   "metrics": {
+    "lots": 3,
+    "plates": 3,
+    "pieces": 35,
+    "areaBought": 13500000,
+    "usedArea": 8035400,
+    "wasteArea": 5464600,
+    "wastePct": 40.479,
+    "weightKg": 1498.17,
+    "wasteTotalKg": 606.436,
+    "waste": {
+     "kerf": 167220,
+     "sequenceGaps": 206,
+     "rim": 52659,
+     "offcut": 4806077,
+     "wastage": 438438
+    },
+    "wasteKg": {
+     "kerf": 18.557,
+     "sequenceGaps": 0.023,
+     "rim": 5.844,
+     "offcut": 533.356,
+     "wastage": 48.656
+    },
+    "partsKg": 891.732,
+    "offcutCount": 2,
+    "thickness": 14.137
+   },
+   "deterministic": true,
+   "budgetCut": false
+  },
+  {
+   "key": "14.137|TAG-GB|TAG-STEEL",
+   "thickness": 14.137,
+   "grade": "TAG-GB",
+   "material": "TAG-STEEL",
+   "kerfMm": 3,
+   "seqGapMinMm": 5,
+   "seqGapMaxMm": 8,
+   "orderMarginLengthMm": 100,
+   "orderMarginWidthMm": 50,
+   "offcutMinAreaMm2": 90000,
+   "offcutMinSideMm": 100,
+   "guillotine": false,
+   "settingsBasis": "14.137–14.137 mm band",
+   "cutPlates": [
+    {
+     "id": "cut:B",
+     "code": "TAG-CB",
+     "name": "Nest v2 fixture cut plate B",
+     "pieces": 2,
+     "length": 600,
+     "width": 250,
+     "thickness": 14.137,
+     "grade": "TAG-GB",
+     "material": "TAG-STEEL"
+    }
+   ],
+   "candidates": [
+    {
+     "plateItemId": "plate:PB",
+     "code": "TAG-PB",
+     "name": "Nest v2 fixture plate PB",
+     "length": 3000,
+     "width": 1500
+    }
+   ],
+   "nests": [
+    {
+     "lotNo": "N-004",
+     "plateItemId": "plate:PB",
+     "plateCode": "TAG-PB",
+     "plateName": "Nest v2 fixture plate PB",
+     "source": "catalog",
+     "ownerPartyId": null,
+     "thickness": 14.137,
+     "grade": "TAG-GB",
+     "material": "TAG-STEEL",
+     "density": 7850,
+     "length": 3000,
+     "width": 1500,
+     "requiredLength": 1209,
+     "requiredWidth": 256,
+     "sheetArea": 4500000,
+     "usedArea": 300000,
+     "wasteArea": 4200000,
+     "wastePct": 93.333,
+     "weightKg": 499.39,
+     "wasteTotalKg": 466.097,
+     "sequences": [
+      {
+       "seqNo": 1,
+       "rows": 1,
+       "rowsAllowed": 3,
+       "pieces": 2,
+       "size": "big"
+      }
+     ],
+     "pieces": [
+      {
+       "cutPlateId": "cut:B",
+       "cutPlateCode": "TAG-CB",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 3,
+       "y": 3,
+       "length": 600,
+       "width": 250,
+       "rotated": false,
+       "posNo": 1
+      },
+      {
+       "cutPlateId": "cut:B",
+       "cutPlateCode": "TAG-CB",
+       "seqNo": 1,
+       "rowNo": 1,
+       "x": 606,
+       "y": 3,
+       "length": 600,
+       "width": 250,
+       "rotated": false,
+       "posNo": 2
+      }
+     ],
+     "origin": "auto",
+     "verdict": null,
+     "forced": false,
+     "reasons": [],
+     "hasLayout": true,
+     "waste": {
+      "kerf": 9504,
+      "sequenceGaps": 0,
+      "rim": 22578,
+      "offcut": 4167918,
+      "wastage": 0
+     },
+     "wasteKg": {
+      "kerf": 1.055,
+      "sequenceGaps": 0,
+      "rim": 2.506,
+      "offcut": 462.537,
+      "wastage": 0
+     },
+     "partsKg": 33.293,
+     "offcuts": [
+      {
+       "offcutNo": "N-004-A",
+       "area": 4167918,
+       "weightKg": 462.537,
+       "rect": {
+        "x": 3,
+        "y": 256,
+        "length": 2994,
+        "width": 1241
+       },
+       "bbox": {
+        "x": 3,
+        "y": 3,
+        "length": 2994,
+        "width": 1494
+       },
+       "outline": [
+        [
+         [
+          1209,
+          3
+         ],
+         [
+          2997,
+          3
+         ],
+         [
+          2997,
+          1497
+         ],
+         [
+          3,
+          1497
+         ],
+         [
+          3,
+          256
+         ],
+         [
+          1209,
+          256
+         ]
+        ]
+       ]
+      }
+     ],
+     "rules": {
+      "status": "ok",
+      "utilisationPct": 6.667,
+      "sharedCuts": 1,
+      "sharedLengthMm": 250,
+      "checks": [
+       {
+        "key": "kerf",
+        "ok": true,
+        "label": "Kerf 3 mm",
+        "detail": "Inside the 2.5–5 mm band, charged at the rim and between parts."
+       },
+       {
+        "key": "rim",
+        "ok": true,
+        "label": "Inside the rim",
+        "detail": "Every part sits at least one 3 mm kerf in from the plate edge."
+       },
+       {
+        "key": "spacing",
+        "ok": true,
+        "label": "No overlaps",
+        "detail": "Parts are one kerf apart where they share a cut (1) and further apart elsewhere."
+       },
+       {
+        "key": "rows",
+        "ok": true,
+        "label": "Rows per sequence",
+        "detail": "Every sequence holds what its part size allows (Small 2 rows, Big 3)."
+       },
+       {
+        "key": "sequenceGap",
+        "ok": true,
+        "label": "Sequence gaps",
+        "detail": "One sequence on this plate."
+       },
+       {
+        "key": "order",
+        "ok": true,
+        "label": "Cut order",
+        "detail": "Sequences follow one another across the plate in the order they are numbered, so piercing never jumps back."
+       },
+       {
+        "key": "rotation",
+        "ok": true,
+        "label": "None turned",
+        "detail": "No part is turned."
+       },
+       {
+        "key": "fits",
+        "ok": true,
+        "label": "Fits the plate",
+        "detail": "The layout needs 1209 × 256 of the 3000 × 1500 plate."
+       }
+      ]
+     }
+    }
+   ],
+   "unplaced": [],
+   "metrics": {
+    "lots": 1,
+    "plates": 1,
+    "pieces": 2,
+    "areaBought": 4500000,
+    "usedArea": 300000,
+    "wasteArea": 4200000,
+    "wastePct": 93.333,
+    "weightKg": 499.39,
+    "wasteTotalKg": 466.097,
+    "waste": {
+     "kerf": 9504,
+     "sequenceGaps": 0,
+     "rim": 22578,
+     "offcut": 4167918,
+     "wastage": 0
+    },
+    "wasteKg": {
+     "kerf": 1.055,
+     "sequenceGaps": 0,
+     "rim": 2.506,
+     "offcut": 462.537,
+     "wastage": 0
+    },
+    "partsKg": 33.293,
+    "offcutCount": 1,
+    "thickness": 14.137
+   },
+   "deterministic": true,
+   "budgetCut": false
+  }
+ ],
+ "manual": [
+  {
+   "id": "cut:M",
+   "code": "TAG-CM",
+   "name": "Nest v2 fixture cut plate M",
+   "pieces": 2,
+   "length": 250,
+   "width": 200,
+   "thickness": 14.137,
+   "grade": "TAG-GA",
+   "material": "TAG-STEEL",
+   "reason": "NEST_MANUAL is set on it, so the packer leaves it alone — lay it out by hand on the screen or in the sheet."
+  }
+ ],
+ "sizeAdvice": [
+  {
+   "thickness": 14.137,
+   "grade": "TAG-GA",
+   "material": "TAG-STEEL",
+   "sheetKey": "pl:PS",
+   "sheetLength": 3000,
+   "sheetWidth": 1500,
+   "nests": 1,
+   "needLength": 542,
+   "needWidth": 356,
+   "orderLength": 650,
+   "orderWidth": 450,
+   "savingArea": 4207500,
+   "savingPct": 93.5
+  },
+  {
+   "thickness": 14.137,
+   "grade": "TAG-GA",
+   "material": "TAG-STEEL",
+   "kind": "ordering margin",
+   "lotNo": null,
+   "plateCode": "TAG-PS",
+   "detail": "TAG-PS is 3000 × 1500; the layout needs 2987 × 1415, so it is being cut closer to the edge than the shop likes — it wants +100 on length and +50 on width spare, because mill edges are not straight. No size you stock is at least 3100 × 1500, which is what would carry this layout with that margin. This is advice, not a blocker."
+  },
+  {
+   "thickness": 14.137,
+   "grade": "TAG-GA",
+   "material": "TAG-STEEL",
+   "kind": "ordering margin",
+   "lotNo": null,
+   "plateCode": "TAG-PS",
+   "detail": "TAG-PS is 3000 × 1500; the layout needs 2940 × 1483, so it is being cut closer to the edge than the shop likes — it wants +100 on length and +50 on width spare, because mill edges are not straight. No size you stock is at least 3050 × 1550, which is what would carry this layout with that margin. This is advice, not a blocker."
+  },
+  {
+   "thickness": 14.137,
+   "grade": "TAG-GB",
+   "material": "TAG-STEEL",
+   "sheetKey": "pl:PB",
+   "sheetLength": 3000,
+   "sheetWidth": 1500,
+   "nests": 1,
+   "needLength": 1209,
+   "needWidth": 256,
+   "orderLength": 1350,
+   "orderWidth": 350,
+   "savingArea": 4027500,
+   "savingPct": 89.5
+  }
+ ],
+ "problems": [],
+ "seeds": [],
+ "budget": {
+  "effort": "quick",
+  "capMs": 20000,
+  "jobs": 2,
+  "jobsRun": 2,
+  "seedsSkippedForTime": 0,
+  "seedsSkippedProven": 0,
+  "jobsCapped": 0,
+  "capped": false,
+  "sync": true,
+  "stopped": false
+ },
+ "totals": {
+  "lots": 4,
+  "plates": 4,
+  "pieces": 37,
+  "areaBought": 18000000,
+  "usedArea": 8335400,
+  "wasteArea": 9664600,
+  "wastePct": 53.692,
+  "weightKg": 1997.56,
+  "wasteTotalKg": 1072.533,
+  "waste": {
+   "kerf": 176724,
+   "sequenceGaps": 206,
+   "rim": 75237,
+   "offcut": 8973995,
+   "wastage": 438438
+  },
+  "wasteKg": {
+   "kerf": 19.612,
+   "sequenceGaps": 0.023,
+   "rim": 8.35,
+   "offcut": 995.893,
+   "wastage": 48.656
+  },
+  "partsKg": 925.025,
+  "offcutCount": 3,
+  "thickness": null,
+  "groups": 2,
+  "unplaced": 0
+ }
+}

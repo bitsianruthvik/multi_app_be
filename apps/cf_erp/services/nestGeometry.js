@@ -424,6 +424,26 @@ function traceOutline(comp, order, label, nx, ny, xs, ys) {
 
 /* ─────────────────────────────── nestToDxf ─────────────────────────────── */
 
+/** The middle of the widest stretch of steel on a few lines across a part ([outline, …openings]). */
+function labelSpot(rings) {
+  let y0 = Infinity; let y1 = -Infinity;
+  for (const [, y] of rings[0]) { if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  let best = null;
+  for (const fr of [0.5, 0.31, 0.69, 0.17, 0.83]) {
+    const y = y0 + (y1 - y0) * fr + 0.0137;
+    const xs = [];
+    for (const ring of rings) {
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i]; const [xj, yj] = ring[j];
+        if ((yi > y) !== (yj > y)) xs.push(((xj - xi) * (y - yi)) / (yj - yi) + xi);
+      }
+    }
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) if (!best || xs[k + 1] - xs[k] > best.w + 1e-9) best = { w: xs[k + 1] - xs[k], x: (xs[k] + xs[k + 1]) / 2, y };
+  }
+  return best;
+}
+
 const LAYERS = [
   { name: 'PLATE', color: 7 },
   { name: 'PARTS', color: 3 },
@@ -505,12 +525,19 @@ export function nestToDxf({ lot = {}, pieces = [], offcuts = [] } = {}) {
     const x = Number(p.x); const y = Number(p.y); const l = Number(p.length); const w = Number(p.width);
     if (![x, y, l, w].every(Number.isFinite) || !(l > 0) || !(w > 0)) continue;
     // A part with a drawing (partDrawingService) is drawn by its true outline, cut-outs and holes, already placed; else its rectangle.
-    if (Array.isArray(p.outline) && p.outline.length) { for (const ring of p.outline) if (ring?.length >= 3) poly('PARTS', ring); }
+    // CUT ORDER (2026-10-10): the pieces come in cut order (a row layout: sequence, row, position; a
+    // free layout: along the plate, by x then y), and within a piece its CUT-OUTS AND HOLES ARE WRITTEN
+    // BEFORE ITS OUTLINE — once the outline is cut the part is loose and nothing more can be cut in it.
+    if (Array.isArray(p.outline) && p.outline.length) { for (const ring of [...p.outline.slice(1), p.outline[0]]) if (ring?.length >= 3) poly('PARTS', ring); }
     else poly('PARTS', [[x, y], [x + l, y], [x + l, y + w], [x, y + w]]);
     const label = txt(p.code ?? p.cutPlateCode ?? p.cut_plate_code ?? '');
     if (label) {
-      const h = Math.max(2, Math.min(50, Math.min(l, w) * 0.25, (l * 0.9) / (label.length * 0.9)));
-      text('LABELS', x + l / 2, y + w / 2, h, label, true);
+      // A drawn part is labelled IN ITS STEEL (the middle of its box may be a window, or outside
+      // an angle altogether) so whatever reads the file back takes the label for the right part.
+      const spot = Array.isArray(p.outline) && p.outline.length ? labelSpot(p.outline) : null;
+      const room = spot ? Math.min(spot.w, l) : l;
+      const h = Math.max(2, Math.min(50, Math.min(l, w) * 0.25, (room * 0.9) / (label.length * 0.9)));
+      text('LABELS', spot ? spot.x : x + l / 2, spot ? spot.y : y + w / 2, h, label, true);
     }
   }
   for (const o of offcuts ?? []) {

@@ -130,6 +130,25 @@ const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + 
 const todayText = () => dateText(new Date());
 const validDate = (s) => typeof s === 'string' && DATE_RE.test(s) && dateText(parseDate(s)) === s;
 
+/**
+ * Every live placement of some lines with the area it is charged by (see the caller). One read.
+ * A database that has not had init.sql §55 yet has no area_mm2: the box is read instead (the
+ * failed statement writes nothing, and the normal path stays one round trip).
+ */
+async function placementsOfLines(db, companyId, lineIds) {
+  const sql = (area) => `SELECT pl.order_line_id, pl.id AS lot_id, pl.plate_item_id, np.cut_plate_id,
+                CASE WHEN pl.kind = 'bar' THEN np.length_mm ELSE ${area} END AS area
+           FROM cf_plate_lots pl
+           JOIN cf_nest_placements np ON np.company_id = pl.company_id AND np.plate_lot_id = pl.id AND np.deleted_at IS NULL
+          WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL AND pl.plate_item_id IS NOT NULL`;
+  try {
+    return await db.query(sql('COALESCE(np.area_mm2, np.length_mm * np.width_mm)'), [companyId, lineIds]);
+  } catch (e) {
+    if (!(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054)) throw e;
+    return db.query(sql('np.length_mm * np.width_mm'), [companyId, lineIds]);
+  }
+}
+
 /** ISO week number of a local date. */
 function isoWeek(d) {
   const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
@@ -291,15 +310,14 @@ export async function getPlanner(db, companyId, q = {}) {
         [companyId, lockedIds])
       : [[]],
     lineIds.length
-      ? db.query(
-        // A plate lot is shared out by placed AREA; a section bar lot (kind
-        // 'bar', §48) by placed LENGTH — its pieces are all one section wide.
-        `SELECT pl.order_line_id, pl.id AS lot_id, pl.plate_item_id, np.cut_plate_id,
-                CASE WHEN pl.kind = 'bar' THEN np.length_mm ELSE np.length_mm * np.width_mm END AS area
-           FROM cf_plate_lots pl
-           JOIN cf_nest_placements np ON np.company_id = pl.company_id AND np.plate_lot_id = pl.id AND np.deleted_at IS NULL
-          WHERE pl.company_id = ? AND pl.order_line_id IN (?) AND pl.deleted_at IS NULL AND pl.plate_item_id IS NOT NULL`,
-        [companyId, lineIds])
+      // A plate lot is shared out by placed AREA; a section bar lot (kind
+      // 'bar', §48) by placed LENGTH — its pieces are all one section wide.
+      // THE AREA IS THE STEEL IN THE PART (area_mm2, §55) when the placement says
+      // it — a gusset drawn by its true shape, a part at a free angle — and the
+      // box round it (length × width) when it does not: every row written before
+      // §55, and every plain rectangle. Sharing a plate by boxes charged a
+      // triangular gusset twice its steel and its rectangular neighbours less.
+      ? placementsOfLines(db, companyId, lineIds)
       : [[]],
     lineIds.length
       ? db.query(

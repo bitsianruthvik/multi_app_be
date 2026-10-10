@@ -93,6 +93,7 @@
  * kerf, sequence gaps, rim, offcut, wastage) in waste_json, and its reusable
  * offcuts as cf_offcuts rows. "Only what is left is wastage."
  */
+import { createHash } from 'node:crypto';
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
@@ -103,6 +104,15 @@ import { analyseNest } from './nestGeometry.js';
 import { availability } from './rollOutService.js';
 import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 import { writePlateCuts } from './plateCutsService.js';
+import { drawingFactsOfLine } from './partDrawingService.js';
+import {
+  shapeOfCutPlate, placeShape, shapedWaste, isPlainPlacement, rotatedFlag, rotationOfRow, normDeg, ringsObject, ringsArea, boxOfShape, displayRings, rimOf,
+} from './nestShapes.js';
+import { shapeJobsAvailable, shapeCapMs, checkpointOf } from './packJob.js';
+// Exact polygon work on laid-out plates, off this thread (the worker pool) when there is much of it.
+import { measurePlates } from './nestMeasure.js';
+
+export { rimOf };
 
 /* ---------------------------------------------------------------------------
  * Vocabulary
@@ -212,6 +222,39 @@ export function publishedKerf(thicknessMm) {
  */
 export const DEFAULT_SEEDS = 1;
 
+/**
+ * HOW LONG A NESTING RUN MAY TAKE (user, 2026-10-10: "increase the timing of it to 5, 10 and 20
+ * mins"). ONE budget for the WHOLE run — every steel of the line, every plan the run makes — from
+ * the moment it starts; lib/packerPool shares it out among the steels. Quick 5 min, Standard
+ * ("normal") 10, Deep 20.
+ *
+ * A budget is a CEILING, not a wait. A search ends as soon as it has proved it cannot do better or
+ * has gone its patience without any improvement (shapePacker.SHAPE_EFFORT says exactly when), so a
+ * small line answers in seconds at any level; a bridge-size line uses the time.
+ *
+ * ONLY A BACKGROUND RUN GETS IT (nestRunService: POST …/nesting/runs, the comparison). A plan made
+ * INSIDE a request — POST …/nesting/plan, the proposal the sheet export makes when nothing is
+ * saved — is held to SYNC_PLAN_BUDGET_MS: no request is kept open for minutes (a proxy would cut
+ * it, and the proposal would be lost with it). The answer says which it was (`budget.sync`).
+ *
+ * CF_NEST_BUDGET_SCALE multiplies the three budgets (a test sets 0.01 so "five minutes" is three
+ * seconds; nothing else should).
+ */
+// `long` (2026-10-10): "We dont actually have a restriction on time. We can even run it for one hour
+// in production and wait for that to happen before working on it."
+export const NEST_BUDGET_MS = Object.freeze({ quick: 5 * 60_000, standard: 10 * 60_000, deep: 20 * 60_000, long: 60 * 60_000 });
+export const EFFORT_LEVELS = Object.freeze(['quick', 'standard', 'deep', 'long']);
+/** 'normal' is the screen's word for 'standard'. Anything else unknown is 'standard'. */
+export const effortOf = (e) => (e === 'normal' ? 'standard' : EFFORT_LEVELS.includes(e) ? e : 'standard');
+/** The row packer knows three levels: 'long' is its 'deep' (it is only ever the floor of a shape job anyway). */
+const rowEffort = (e) => (e === 'long' ? 'deep' : e);
+export const SYNC_PLAN_BUDGET_MS = 20_000;
+const budgetScale = () => { const v = Number(process.env.CF_NEST_BUDGET_SCALE); return Number.isFinite(v) && v > 0 ? v : 1; };
+/** The whole-run budget of an effort level, ms. */
+export const runBudgetMs = (effort) => Math.round((NEST_BUDGET_MS[effort === 'normal' ? 'standard' : effort] ?? NEST_BUDGET_MS.standard) * budgetScale());
+/** What a plan made inside a request may take: the level's budget, but never more than SYNC_PLAN_BUDGET_MS. */
+export const syncBudgetMs = (effort) => Math.min(runBudgetMs(effort), SYNC_PLAN_BUDGET_MS);
+
 export const DEFAULT_CUT_SETTINGS = {
   kerfMm: 3,
   seqGapMinMm: 5,
@@ -251,7 +294,7 @@ const round6 = (n) => Number(Number(n).toFixed(6));
 const num = (v) => (v == null || v === '' ? null : Number(v));
 const pos = (v) => { const n = num(v); return n != null && Number.isFinite(n) && n > 0 ? n : null; };
 const blank = (v) => v == null || String(v).trim() === '';
-const nameOf = (r) => r?.code ?? r?.name ?? `#${r?.id}`;
+export const nameOf = (r) => r?.code ?? r?.name ?? `#${r?.id}`;
 const fmt = (n) => (n == null ? '?' : String(round3(n)));
 const list = (names) => (names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
 
@@ -262,7 +305,7 @@ export const isSmallPart = (length, width) => Number(length) < SMALL_PART_MM && 
 export const rowsPerSequence = (parts) => (parts.every((p) => isSmallPart(p.length, p.width)) ? 2 : 3);
 
 /** Area in mm2 -> kilograms, given a thickness in mm and a density in kg/m3. */
-const kgOf = (areaMm2, thicknessMm, density) =>
+export const kgOf = (areaMm2, thicknessMm, density) =>
   round3((areaMm2 / 1e6) * (Number(thicknessMm) / 1000) * (Number(density) || FALLBACK_DENSITY));
 
 /* ---------------------------------------------------------------------------
@@ -285,7 +328,7 @@ export async function resolveCutSettings(db, companyId, thicknessMm) {
   return pickCutSettings(rows, thicknessMm);
 }
 
-async function cutSettingRows(db, companyId) {
+export async function cutSettingRows(db, companyId) {
   const [rows] = await db.query(
     `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
             order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine,
@@ -312,7 +355,7 @@ const shapeSettings = (r, basis) => ({
   basis,
 });
 
-function pickCutSettings(rows, thicknessMm) {
+export function pickCutSettings(rows, thicknessMm) {
   const t = num(thicknessMm);
   const isDefault = (r) => r.thickness_min_mm == null && r.thickness_max_mm == null;
   const covers = (r) => !isDefault(r)
@@ -386,13 +429,35 @@ const rect4 = (r) => (r ? { x: round3(r.x), y: round3(r.y), length: round3(r.len
  * steel is) and the free area is all wastage; if the unlaid pieces need more
  * than the plate, `overflow` says by how much.
  */
-export function wasteOfLot(lot, pieces) {
+export function wasteOfLot(lot, pieces, pre = undefined) {
   const kg = (a) => kgOf(a, lot.thickness, lot.density);
   const hasLayout = pieces.length > 0 && pieces.every((p) => p.x != null && p.y != null);
   const length = Number(lot.length);
   const width = Number(lot.width);
   if (!(length > 0 && width > 0)) {
     return { hasLayout, waste: zeroWaste(), wasteKg: zeroWaste(), partsArea: 0, partsKg: 0, offcuts: [], json: null, warnings: [] };
+  }
+  // TRUE SHAPES (init.sql §55). A piece may carry `area` (the steel really in it) and
+  // `placedRings` (its outline on the plate). When any piece of the plate is not a rectangle lying
+  // square — a drawn shape, a free angle, a flipped part (`shaped`) — the plate is measured by its
+  // true free regions (nestShapes.shapedWaste). A plate of plain rectangles never comes this way,
+  // so what it reports is exactly what it always reported.
+  // `pre` (wastesOf): that measure, already made off this thread. Left out, it is made here.
+  const shapedArgs = shapedArgsOf(lot, pieces);
+  if (shapedArgs) {
+    const s = pre !== undefined ? pre : shapedWaste(shapedArgs);
+    if (s) {
+      const waste = Object.fromEntries(WASTE_KEYS.map((k) => [k, round3(s.waste[k] ?? 0)]));
+      const offcuts = s.offcuts.map((o, i) => ({
+        offcutNo: `${lot.lotNo ?? 'N'}-${offcutLetters(i)}`, area: round3(o.area), weightKg: kg(o.area),
+        rect: rect4(o.rect), bbox: rect4(o.bbox), outline: o.outline ?? [],
+      }));
+      return {
+        hasLayout, waste, wasteKg: Object.fromEntries(WASTE_KEYS.map((k) => [k, kg(waste[k])])),
+        partsArea: round3(s.partsArea), partsKg: kg(s.partsArea), offcuts, warnings: [], overflow: 0,
+        json: { plateArea: round3(s.plateArea), partsArea: round3(s.partsArea), ...waste, overflow: 0, offcuts: offcuts.length, basis: 'shapes' },
+      };
+    }
   }
   const a = analyseNest({
     length, width,
@@ -403,6 +468,14 @@ export function wasteOfLot(lot, pieces) {
     minOffcutSide: lot.offcutMinSideMm ?? DEFAULT_CUT_SETTINGS.offcutMinSideMm,
   });
   const waste = Object.fromEntries(WASTE_KEYS.map((k) => [k, round3(a.waste?.[k] ?? 0)]));
+  // A part smaller than the box round it (a drawn shape, measured here on its box because the
+  // true-shape measure is not available): the steel in the box that is not part is wastage, so the
+  // causes still add up to the plate. Never the case for a plate of plain rectangles.
+  const boxParts = pieces.some((p) => p.area != null) ? round3(pieces.reduce((s, p) => s + Number(p.area ?? Number(p.length) * Number(p.width)), 0)) : null;
+  if (boxParts != null && Math.abs(boxParts - a.partsArea) > 1e-3) {
+    waste.wastage = round3(Math.max(0, waste.wastage + (a.partsArea - boxParts)));
+    a.partsArea = boxParts;
+  }
   const wasteKg = Object.fromEntries(WASTE_KEYS.map((k) => [k, kg(waste[k])]));
   const offcuts = (a.offcuts ?? []).map((o, i) => ({
     offcutNo: `${lot.lotNo ?? 'N'}-${offcutLetters(i)}`,
@@ -427,6 +500,52 @@ export function wasteOfLot(lot, pieces) {
       offcuts: offcuts.length,
     },
   };
+}
+
+/**
+ * LETTING THE SERVER BREATHE. A line the size of a bridge order is a hundred plates and six
+ * thousand pieces; shaping, checking and measuring them is a second or more of plain loops, and
+ * Node answers nobody else meanwhile. `breather()` gives a function to await inside such a loop:
+ * it hands the event loop back whenever ~25 ms have gone by since it last did, and costs nothing
+ * otherwise. (The heavy geometry is not here at all — nestMeasure sends it to the worker pool.)
+ */
+export function breather(everyMs = 25) {
+  let last = Date.now();
+  return async () => {
+    if (Date.now() - last < everyMs) return;
+    await new Promise((resolve) => { setImmediate(resolve); });
+    last = Date.now();
+  };
+}
+
+/** What nestShapes.shapedWaste is asked about a plate, or null when the plate is plain rectangles (or has no layout). */
+export function shapedArgsOf(lot, pieces) {
+  const length = Number(lot.length); const width = Number(lot.width);
+  if (!(length > 0 && width > 0) || !pieces.length) return null;
+  if (!pieces.every((p) => p.x != null && p.y != null && p.placedRings) || !pieces.some((p) => p.shaped)) return null;
+  return {
+    length, width, kerf: Number(lot.kerfMm) || 0,
+    pieces: pieces.map((p) => ({ rings: p.placedRings, area: p.area ?? ringsArea(p.placedRings) })),
+    minOffcutArea: lot.offcutMinAreaMm2 ?? DEFAULT_CUT_SETTINGS.offcutMinAreaMm2,
+    minOffcutSide: lot.offcutMinSideMm ?? DEFAULT_CUT_SETTINGS.offcutMinSideMm,
+  };
+}
+
+/**
+ * wasteOfLot for MANY plates at once: [[lot, pieces], …] → [wasteOfLot's answer, …]. The plates of
+ * true shapes are measured together off this thread (nestMeasure — a line has a hundred of them
+ * and each is up to a quarter of a second of exact geometry); the rest are worked out here as ever.
+ */
+export async function wastesOf(pairs) {
+  const args = pairs.map(([lot, pieces]) => shapedArgsOf(lot, pieces));
+  const idx = args.map((a, i) => (a ? i : -1)).filter((i) => i >= 0);
+  const res = await measurePlates(idx.map((i) => ({ kind: 'waste', args: args[i] })));
+  const pre = new Array(pairs.length).fill(undefined);
+  idx.forEach((i, k) => { pre[i] = res[k] ?? null; });
+  const out = [];
+  const breathe = breather();
+  for (let i = 0; i < pairs.length; i += 1) { out.push(wasteOfLot(pairs[i][0], pairs[i][1], pre[i])); await breathe(); }
+  return out;
 }
 
 /** Sums of waste / wasteKg over nests that carry them. */
@@ -615,7 +734,7 @@ function missingOnPart(s) {
  * parts — that is what pooling IS — so its totals are summed across every
  * place it appears.
  */
-async function surveyLine(db, companyId, line) {
+export async function surveyLine(db, companyId, line) {
   if (line.line_type !== 'custom') {
     throw invalid('NO_STRUCTURE', `Line ${line.line_no} of ${line.order_code} sells a catalog item, so it has no structure of its own — only a line built from a template has rectangles to nest.`);
   }
@@ -789,50 +908,41 @@ export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOu
 
 /**
  * The line's live IMPORTED lots, and how many pieces of each cut plate they
- * hold. Two queries. `pieces` per lot is aggregated per cut plate — enough to
- * charge each cut plate its share of the plate (replaceAreaFractions) and to
- * take the pieces off the automatic demand.
+ * hold. Two queries (savedLotsOf). `pieces` per lot is aggregated per cut plate —
+ * enough to charge each cut plate its share of the plate (replaceAreaFractions)
+ * and to take the pieces off the automatic demand.
+ *
+ * ONLY THE UPLOAD'S OWN PIECES COUNT (§55). A piece OUR packer added to a
+ * customer's plate afterwards (nest the rest into its free space) is ours, like
+ * an automatic plate: the next plan places it again and the next accept writes
+ * it again, so it is neither taken off the demand nor charged here. `full` is
+ * the lot as savedLotsOf reads it, every placement included.
  */
-async function importedLotsOf(db, companyId, orderLineId) {
-  const [lots] = await db.query(
-    `SELECT l.id, l.lot_no, l.plate_item_id, l.length_mm, l.width_mm, l.thickness_mm, m.code AS plate_code
-       FROM cf_plate_lots l
-       LEFT JOIN cf_master_records m ON m.id = l.plate_item_id
-      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.kind = 'plate' AND l.origin = 'imported'
-      ORDER BY l.lot_no, l.id`,
-    [companyId, orderLineId],
-  );
+export async function importedLotsOf(db, companyId, orderLineId) {
+  const lots = (await savedLotsOf(db, companyId, orderLineId)).filter((l) => l.origin === 'imported');
   const counts = new Map();
-  if (!lots.length) return { lots: [], counts, lotNos: new Set() };
-  const [rows] = await db.query(
-    `SELECT plate_lot_id, cut_plate_id, COUNT(*) AS pieces, SUM(length_mm * width_mm) AS area
-       FROM cf_nest_placements
-      WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL
-      GROUP BY plate_lot_id, cut_plate_id`,
-    [companyId, lots.map((l) => l.id)],
-  );
-  const byLot = new Map(lots.map((l) => [l.id, []]));
-  for (const r of rows) {
-    byLot.get(r.plate_lot_id)?.push({ cutPlateId: Number(r.cut_plate_id), count: Number(r.pieces), area: Number(r.area) });
-    counts.set(Number(r.cut_plate_id), (counts.get(Number(r.cut_plate_id)) ?? 0) + Number(r.pieces));
-  }
-  return {
-    counts,
-    lotNos: new Set(lots.map((l) => String(l.lot_no).toUpperCase())),
-    lots: lots.map((l) => ({
-      id: l.id,
-      lotNo: l.lot_no,
-      plate: {
-        id: l.plate_item_id, code: l.plate_code,
-        steel: { length: Number(l.length_mm), width: Number(l.width_mm), thickness: Number(l.thickness_mm) },
-      },
-      pieces: byLot.get(l.id) ?? [],
-    })),
-  };
+  const out = lots.map((l) => {
+    const per = new Map();
+    for (const p of l.pieces) {
+      if (!isUploadedPiece(l, p)) continue;
+      const e = per.get(p.cutPlateId) ?? { cutPlateId: p.cutPlateId, count: 0, area: 0 };
+      e.count += 1;
+      e.area += p.area ?? p.length * p.width;
+      per.set(p.cutPlateId, e);
+      counts.set(p.cutPlateId, (counts.get(p.cutPlateId) ?? 0) + 1);
+    }
+    return {
+      id: l.id, lotNo: l.lotNo,
+      plate: { id: l.plateItemId, code: l.plateCode, steel: { length: l.length, width: l.width, thickness: l.thickness } },
+      pieces: [...per.values()],
+      full: l,
+    };
+  });
+  return { counts, lotNos: new Set(lots.map((l) => String(l.lotNo).toUpperCase())), lots: out };
 }
 
 /** N-001, N-002 … skipping any number an imported lot already wears. */
-function autoLotNumbers(count, taken) {
+export function autoLotNumbers(count, taken) {
   const out = [];
   let n = 0;
   while (out.length < count) {
@@ -894,7 +1004,7 @@ export async function exclusionsOf(db, companyId, lineIds) {
   return out;
 }
 
-const exclusionsOfLine = async (db, companyId, lineId) =>
+export const exclusionsOfLine = async (db, companyId, lineId) =>
   (await exclusionsOf(db, companyId, [lineId])).get(Number(lineId)) ?? emptyExclusions();
 
 /** A piece's weight: area × thickness × density (steel when the record does not say). */
@@ -1276,7 +1386,7 @@ export function nestRules(nest, settings) {
  * The same blank on the PART is refused, up in eligibility — the asymmetry is
  * the point.
  */
-async function candidatePlates(db, companyId, plateIds) {
+export async function candidatePlates(db, companyId, plateIds) {
   if (!plateIds.length) return [];
   const [rows] = await db.query(
     `SELECT m.id, m.code, m.name
@@ -1300,7 +1410,7 @@ async function candidatePlates(db, companyId, plateIds) {
  * is not offered here (nesting still buys by catalog size). One read.
  * Returns Map plateItemId -> { ownerPartyId, count }.
  */
-async function customerPlates(db, companyId, orderId, plateIds) {
+export async function customerPlates(db, companyId, orderId, plateIds) {
   const out = new Map();
   if (!orderId || !plateIds.length) return out;
   const av = await availability(db, companyId, plateIds, { orderId });
@@ -1317,7 +1427,7 @@ async function customerPlates(db, companyId, orderId, plateIds) {
   return out;
 }
 
-const agrees = (plateValue, groupValue) => plateValue == null || norm(plateValue) === norm(groupValue);
+export const agrees = (plateValue, groupValue) => plateValue == null || norm(plateValue) === norm(groupValue);
 
 function sheetsFor(plates, group) {
   return plates.filter((p) =>
@@ -1410,28 +1520,20 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // what is left is what the packer is asked to place. With nothing imported
   // this is every piece, exactly as before.
   // `replaceImported: true` plans the whole line, as if nothing were imported.
-  const imported = input.replaceImported === true ? { lots: [], counts: new Map(), lotNos: new Set() } : await importedLotsOf(db, companyId, orderLineId);
-  const cutPlates = needed.map((cp) => ({ ...cp, pieces: Math.max(0, cp.pieces - (imported.counts.get(cp.id) ?? 0)) }));
+  // `only` (§55, the comparison): nest exactly THESE pieces — { cutPlateId: quantity } — as if
+  // nothing were saved on the line. It is how our packer is asked for the same set of pieces an
+  // uploaded nesting holds, like for like: a piece held back by hand or left out of automatic
+  // nesting is nested too when the upload nested it. Plate choices still apply.
+  const only = onlyMap(input.only);
+  const imported = input.replaceImported === true || only ? { lots: [], counts: new Map(), lotNos: new Set() } : await importedLotsOf(db, companyId, orderLineId);
   // THE LINE'S NESTING CHOICES (§40): cut pieces left out and plates excluded,
   // applied to every run. `ignoreChoices: true` plans as if none were made.
   const excl = input.ignoreChoices === true ? emptyExclusions() : await exclusionsOfLine(db, companyId, orderLineId);
+  if (only) excl.cutPlates = new Set();
+  const cutPlates = demandedCutPlates(needed, { only, importedCounts: imported.counts });
 
-  const problems = [];
-  const manual = [];
-  const leftOut = [];
   const seedsTried = [];
-  const nestable = [];
-  for (const cp of cutPlates) {
-    if (!cp.pieces) continue;                       // nothing of it is needed, or it is all on imported lots
-    if (cp.manual) { manual.push(describeManual(cp)); continue; }
-    if (excl.cutPlates.has(cp.id)) { leftOut.push(cp); continue; }
-    const gone = missingOnPart(cp.steel);
-    if (gone.length) {
-      problems.push(`${nameOf(cp)} does not say its ${list(gone.map((g) => g.toLowerCase()))}, so it cannot be nested. A rectangle that does not state its steel is refused rather than guessed at — set the value on the cut plate, or mark it ${NEST_MANUAL_SPEC_CODE} and lay it out by hand.`);
-      continue;
-    }
-    nestable.push(cp);
-  }
+  const { nestable, manual, leftOut, problems } = selectNestable(cutPlates, excl);
 
   const byGroup = new Map();
   for (const cp of nestable) {
@@ -1440,6 +1542,15 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       byGroup.set(key, { key, thickness: cp.steel.thickness, grade: cp.steel.grade, material: cp.steel.material, cutPlates: [] });
     }
     byGroup.get(key).cutPlates.push(cp);
+  }
+
+  // WHAT THIS RUN IS ASKED (§55): the demand and its fingerprint, so a finished run can be pulled
+  // up later for exactly the same question and recognised as stale for any other.
+  const facts = await drawingFactsOfLine(db, companyId, orderLineId);
+  if (input.onDemand || input.demandOnly) {
+    const demand = demandOf({ nestable, settingRows, plates, excl, line, facts, guillotine: input.guillotine });
+    if (input.onDemand) { try { input.onDemand(demand); } catch { /* a listener never breaks a plan */ } }
+    if (input.demandOnly) return { line: lineHead(line), demand, problems, manual, leftOut: leftOut.map((cp) => cp.id) };
   }
 
   // A steel whose every candidate plate is excluded cannot be nested — refused
@@ -1452,6 +1563,37 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
 
   const groups = [];
   const sizeAdvice = [];
+  /*
+   * TRUE SHAPES, AND THE PLATES ALREADY SAVED (init.sql §55).
+   *
+   * "Nesting should use the diagrams when diagrams are available": a cut plate whose parts have ONE
+   * drawing is nested by that outline (shapeOfCutPlate), a group holding one is a SHAPE JOB
+   * (services/packJob.js) — the rectangle packer first, its answer handed to shapePacker as the
+   * floor. A group with no drawing is the rectangle job it always was, byte for byte.
+   *
+   * "Nest the rest … using the space left in existing nest or the new nestings": the pieces left
+   * over go FIRST into the free space of the plates already saved for the line — the customer's
+   * own uploaded layouts — and only then onto new plates. Such a plate is handed to the packer as
+   * a sheet with its saved parts FIXED: nothing on it moves. What lands there comes back as an
+   * ADDITION to that lot (plan.additions), stored as ours on the customer's plate.
+   * `shapes: false` plans as before §55 (rectangles, new plates only).
+   */
+  const useShapes = shapeJobsAvailable && !input.pack && input.shapes !== false;
+  const shapeMemo = new Map();
+  const shapeOf = (cp) => { if (!shapeMemo.has(cp.id)) shapeMemo.set(cp.id, shapeOfCutPlate(cp, facts)); return shapeMemo.get(cp.id); };
+  const neededById = new Map(needed.map((cp) => [cp.id, cp]));
+  const fillable = new Map();                        // steel group key → saved customer plates with a layout
+  if (useShapes && !only && input.replaceImported !== true && input.fillExisting !== false) {
+    for (const il of imported.lots) {
+      const l = il.full;
+      if (l.layoutOrigin !== 'customer' || !l.pieces.length || l.pieces.some((p) => p.x == null) || excl.plates.has(l.plateItemId)) continue;
+      const key = `${round3(l.thickness)}|${norm(l.grade)}|${norm(l.material)}`;
+      const fixed = l.pieces.filter((p) => isUploadedPiece(l, p)).map((p, i) => ({ key: `f${i}`, placed: true, rings: placedRingsOfPiece(p, neededById.get(p.cutPlateId), shapeOf) }));
+      if (!fillable.has(key)) fillable.set(key, []);
+      fillable.get(key).push({ lot: l, key: `lot${l.id}`, fixed });
+    }
+  }
+  const additions = [];
 
   /*
    * EVERY GROUP, EVERY SEED, ALL AT ONCE.
@@ -1509,8 +1651,11 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     })));
 
     // KERF IS CHARGED AT THE RIM as well as between pieces — the raw plate's
-    // own edge is cut — so the packer's rim trim IS the kerf, and `margin`
-    // equals `kerf` rather than being a second number.
+    // own edge is cut. THE RIM IS ONE RULE FOR BOTH PACKERS (nestShapes.rimOf):
+    // nestingPacker charges the rim cut itself and takes `margin` as a trim on
+    // top of it; shapePacker takes `margin` as the whole clearance. Both are
+    // handed the figure that makes them leave the SAME clearance at the edge.
+    const rim = rimOf(settings.kerfMm);
     //
     // THE KERF HANDED IN HERE IS THE ONLY ONE THAT COUNTS. The packer carries
     // its own thickness table as a fallback for callers that pass none; this
@@ -1528,13 +1673,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       sheets: sheets.map((s) => ({ key: s.key, length: s.length, width: s.width, available: s.available, preferred: s.preferred, areaCost: s.areaCost })),
       kerf: settings.kerfMm,
       gap: settings.kerfMm,
-      margin: settings.kerfMm,
+      margin: rim.rectMargin,
       thickness: g.thickness,
       sequenceGap: settings.seqGapMinMm,
       smallThreshold: SMALL_PART_MM,
       rowsPerSequence: { small: 2, big: 3 },
       guillotine,
-      effort: input.effort ?? 'standard',
+      effort: rowEffort(input.effort ?? 'standard'),
       seed: input.seed ?? 1,
       restarts: input.restarts ?? undefined,
       // No per-job budget here: the pool hands each job its share of the PLAN's
@@ -1543,14 +1688,30 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       budgetMs: input.pack ? (input.budgetMs ?? null) : null,
     };
 
-    prepared.push({ g, sheets, pieces, settings, guillotine, packInput });
+    // EVERY STEEL IS A SHAPE JOB (2026-10-10: "use the new packer everywhere, even without
+    // drawings"): a piece with a drawing is its outline, one without is its rectangle. The row
+    // packer is the floor the job starts from (services/packJob.js says which layout a plate keeps).
+    const drawn = useShapes && g.cutPlates.some((cp) => shapeOf(cp)?.drawn);
+    const fill = useShapes ? (fillable.get(g.key) ?? []) : [];
+    const shapeInput = useShapes ? {
+      pieces: pieces.map((p) => { const sh = shapeOf(p.cutPlate); return { key: p.key, qty: p.qty, rings: sh?.drawn ? sh.rings : null, length: p.length, width: p.width, grain: 'any', allowMirror: false }; }),
+      sheets: packInput.sheets,
+      // A kerf between parts; at the plate edge the clearance the rectangle packer leaves (rimOf).
+      kerf: settings.kerfMm, margin: rim.shapeMargin, rotations: [0, 90, 180, 270], partInPart: true,
+      effort: input.effort ?? 'standard', seed: input.seed ?? 1,
+    } : null;
+    // A saved plate is owned already: free, one of it, its parts fixed where they are. The job
+    // fills these FIRST (packJob.js), then opens new plates for what is left.
+    const fillSheets = fill.map((e) => ({ key: e.key, length: e.lot.length, width: e.lot.width, available: 1, preferred: true, areaCost: 0, fixed: e.fixed }));
+
+    prepared.push({ g, sheets, pieces, settings, guillotine, packInput, shapeInput, fillSheets, drawn, fill });
   }
 
   // ---- pack everything, in parallel ----------------------------------------
   // Effort carries a seed count too: Deep buys insurance against an unlucky
   // draw, Standard does not pay for it.
   const { EFFORT } = await import('./nestingPacker.js');
-  const level = EFFORT?.[input.effort ?? 'standard'] ?? EFFORT?.standard;
+  const level = EFFORT?.[rowEffort(input.effort ?? 'standard')] ?? EFFORT?.standard;
   const effortSeeds = level?.seeds;
   const seedCount = Math.max(1, Math.trunc(Number(input.seeds ?? effortSeeds ?? DEFAULT_SEEDS)) || 1);
   /*
@@ -1560,7 +1721,11 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
    * for the last in-flight step of each job and for shaping the answer, so the
    * response lands inside the budget rather than just after it.
    */
-  const planBudgetMs = Math.max(0, Number(input.budgetMs ?? level?.capMs ?? 0) || 0);
+  // THE BUDGET (NEST_BUDGET_MS above): what the caller says; else the level's whole-run budget for a
+  // background run, and the short synchronous one for a plan made inside a request. An injected
+  // packer (the tests) keeps the row packer's own figure, as before.
+  const effortAsked = input.effort ?? 'standard';
+  const planBudgetMs = Math.max(0, Number(input.budgetMs ?? (input.pack ? (level?.capMs ?? 0) : input.background === true ? runBudgetMs(effortAsked) : syncBudgetMs(effortAsked))) || 0);
   const reserveMs = Math.min(30_000, Math.round(planBudgetMs * 0.1));
   const deadlineAt = planStartedAt + planBudgetMs - reserveMs;
   const outByGroup = new Map();
@@ -1574,10 +1739,45 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     for (const pr of prepared) {
       // Seeds worked out ONCE and checked against the real generator: two seeds
       // whose streams start in the same place would do identical work twice.
-      const mine = seedsFor(Number(pr.packInput.seed) || 1, seedCount);
+      /*
+       * PICKED UP AGAIN (`input.resume`, nestRunService): `resume.groups[key]` is what the run's
+       * checkpoint kept for this steel — its best layout (`start`), what had gone into the saved
+       * plates (`fill`), and whether it had FINISHED (`done`). Every seed of the steel starts from
+       * that layout; a finished steel gets one job and no time. The seeds are moved on by the
+       * resume count, so a run picked up again does not walk the path it already walked.
+       */
+      const kept = pr.shapeInput ? (input.resume?.groups?.[pr.g.key] ?? null) : null;
+      const mine = seedsFor((Number(pr.packInput.seed) || 1) + (Number(input.resume?.count) || 0) * 7919, kept?.done ? 1 : seedCount);
       seedsDropped += mine.dropped ?? 0;
-      mine.forEach((seed, round) => jobs.push({ key: pr.g.key, seed, round, input: { ...pr.packInput, seed } }));
+      mine.forEach((seed, round) => jobs.push({
+        key: pr.g.key, seed, round,
+        input: pr.shapeInput
+          // pieces / sheets at the top are only what the pool weighs a job by.
+          ? {
+            packer: 'shape', seed, rect: { ...pr.packInput, seed }, shape: { ...pr.shapeInput, seed }, fillSheets: pr.fillSheets, pieces: pr.packInput.pieces, sheets: pr.packInput.sheets,
+            ...(kept ? { resume: { start: kept.start ?? null, fill: kept.fill ?? null, done: kept.done === true } } : {}),
+            ...(input.checkpointMs ? { checkpointMs: input.checkpointMs } : {}),
+          }
+          : { ...pr.packInput, seed },
+      }));
     }
+    /*
+     * CHECKPOINTS (`input.onCheckpoint(key, c)`): the best layout of each steel so far, as the pool's
+     * jobs hand it out (a plate saved, else once a minute), and — once every job of a steel has
+     * settled — its final one, marked `done`. Only a layout no worse than the steel's last one is
+     * passed on. The listener (nestRunService) writes them to the run's row; nothing is written here.
+     */
+    const ckOf = new Map();                            // steel key → { unplaced, areaBought } of the last checkpoint passed on
+    const settledOf = new Map();                       // steel key → results settled so far
+    const passCheckpoint = (key, c, extra = {}) => {
+      if (!input.onCheckpoint || !c) return;
+      const last = ckOf.get(key);
+      if (last && !extra.done && (c.unplaced > last.unplaced || (c.unplaced === last.unplaced && c.areaBought > last.areaBought + 1e-6))) return;
+      ckOf.set(key, { unplaced: c.unplaced, areaBought: c.areaBought });
+      try { input.onCheckpoint(key, { ...c, ...extra }); } catch { /* a listener never breaks a plan */ }
+    };
+    const jobsOf = new Map();
+    for (const j of jobs) jobsOf.set(j.key, (jobsOf.get(j.key) ?? 0) + 1);
     const steelName = new Map(prepared.map((pr) => [pr.g.key, `${fmt(pr.g.thickness)} mm ${[pr.g.grade, pr.g.material].filter(Boolean).join(' ')}`]));
     say(`Packing: ${jobs.length} job${jobs.length === 1 ? '' : 's'} (${seedCount} try${seedCount === 1 ? '' : 'ies'} per steel)${planBudgetMs ? `, up to ${Math.round(planBudgetMs / 1000)} s` : ''}`,
       { phase: 'packing', done: 0, total: jobs.length, budgetMs: planBudgetMs || null });
@@ -1589,8 +1789,61 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
           ? `${(result.out?.nests ?? []).length} plate${(result.out?.nests ?? []).length === 1 ? '' : 's'}${(result.out?.unplaced ?? []).length ? `, ${(result.out.unplaced).reduce((a, u) => a + (Number(u.qty) || 0), 0)} pieces left over` : ''}`
           : `failed (${result?.error ?? 'unknown error'})`;
       say(`${name} — try ${job.round + 1}: ${what}`, { phase: 'packing', done, total });
+      // Every job of this steel has settled: its final layout is its checkpoint, marked done.
+      if (!settledOf.has(job.key)) settledOf.set(job.key, []);
+      settledOf.get(job.key).push({ ...result, seed: job.seed });
+      if (input.onCheckpoint && settledOf.get(job.key).length === jobsOf.get(job.key)) {
+        const won = pickBest(settledOf.get(job.key).filter((r) => !r.skipped));
+        if (won?.out?.packer === 'shape') passCheckpoint(job.key, checkpointOf(won.out), { done: true, seed: won.seed });
+      }
     };
-    const runs = await runAll(jobs, { workers: input.workers ?? null, deadlineAt, onJob });
+    /*
+     * THE BEST SO FAR, FOR THE WHOLE LINE. Every job says when its layout gets better; the best
+     * report of each steel is kept, and once EVERY steel has one (its floor comes in the first
+     * second) the line's figure is their sum: plates, steel bought, waste. It goes to the run's
+     * listener (`onProgress({ best })`) each time it changes — the page is not silent for twenty
+     * minutes, and "stop and use this" has something to show. Waste is against the parts' true steel.
+     */
+    const reports = new Map();                        // job index → its latest report
+    const floors = new Map();                         // steel key → its row layout, until a job of its own reports
+    const partsArea = prepared.reduce((a, pr) => a + pr.g.cutPlates.reduce((b, cp) => b + (shapeOf(cp)?.area ?? cp.steel.length * cp.steel.width) * cp.pieces, 0), 0);
+    let toldBest = null;
+    const onPackProgress = ({ index, progress }) => {
+      if (progress) reports.set(index, progress);
+      if (!input.onProgress) return;
+      const per = new Map();
+      for (const [i, r] of reports) {
+        const cur = per.get(jobs[i].key);
+        if (!cur || r.unplaced < cur.unplaced || (r.unplaced === cur.unplaced && r.areaBought < cur.areaBought - 1e-6)) per.set(jobs[i].key, r);
+      }
+      for (const [k, f] of floors) if (!per.has(k)) per.set(k, f);
+      if (per.size < prepared.length) return;
+      let plates = 0; let area = 0; let unplaced = 0;
+      for (const r of per.values()) { plates += r.plates; area += r.areaBought; unplaced += r.unplaced; }
+      if (toldBest && toldBest.plates === plates && Math.abs(toldBest.area - area) <= 1e-6 && toldBest.unplaced === unplaced) return;
+      toldBest = { plates, area, unplaced };
+      try {
+        input.onProgress({ phase: 'packing', best: { plates, areaBoughtM2: round3(area / 1e6), wastePct: area > 0 ? round3(Math.max(0, 1 - partsArea / area) * 100) : null, unplaced, elapsedMs: Date.now() - planStartedAt, budgetMs: planBudgetMs || null } });
+      } catch { /* progress only */ }
+    };
+    /*
+     * A FIGURE IN THE FIRST SECOND. With more steels than workers the last steel's search starts
+     * minutes in, and the line's figure — which needs every steel — would stay empty until then
+     * (seen on the soak: 31 s of nothing). So a listening run first lays every steel out in rows
+     * (the row packer's one quick pass, all steels at once in the pool: about a second) and the
+     * figure starts from that; each steel's own search replaces its row figure as it reports.
+     */
+    if (input.onProgress && prepared.length > 1) {
+      try {
+        const quick = await runAll(prepared.map((pr) => ({ key: pr.g.key, round: 0, seed: 1, input: { ...pr.packInput, effort: 'quick', restarts: undefined, seed: 1, budgetMs: null } })), { workers: input.workers ?? null, stop: input.control?.stop ?? null });
+        quick.forEach((r, i) => { if (r?.ok) floors.set(prepared[i].g.key, { plates: (r.out.nests ?? []).length, areaBought: Number(r.out.areaBought) || 0, unplaced: (r.out.unplaced ?? []).reduce((a, u) => a + (Number(u.qty) || 0), 0) }); });
+        onPackProgress({ index: -1, progress: null });
+      } catch { /* the figure only starts later */ }
+    }
+    const runs = await runAll(jobs, {
+      workers: input.workers ?? null, deadlineAt, onJob, stop: input.control?.stop ?? null, onProgress: onPackProgress,
+      onCheckpoint: input.onCheckpoint ? ({ job, checkpoint }) => passCheckpoint(job.key, checkpoint, { done: false, seed: job.seed }) : null,
+    });
     say('Choosing the best layout for each steel', { phase: 'shaping' });
     const st = runs.stats ?? {};
     for (const pr of prepared) {
@@ -1632,17 +1885,42 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       // True when the clock, not the effort's own trial count, decided how far
       // the search went: a seed was skipped for time or a search was cut short.
       capped: (st.skippedTime ?? 0) > 0 || (st.capped ?? 0) > 0,
+      // true = made inside a request, so held to the short synchronous budget; a background run has the level's whole budget.
+      sync: input.background !== true && input.budgetMs == null,
+      // true = somebody stopped it ("stop and use this"): every steel has the best layout it had by then.
+      stopped: st.stopped === true,
       packMs: Date.now() - planStartedAt,
     };
   }
 
   // ---- shape the winners ---------------------------------------------------
-  for (const { g, sheets, pieces, settings, guillotine } of prepared) {
-    const out = outByGroup.get(g.key) ?? {};
+  const breathe = breather();
+  for (const { g, sheets, pieces, settings, guillotine, drawn, fill } of prepared) {
+    await breathe();
+    const raw = outByGroup.get(g.key) ?? {};
+    // A shape job answers with both layouts and says which it took (packJob.js).
+    const free = raw.packer === 'shape' && raw.chosen === 'shape' && !!raw.shape;
+    const out = raw.packer === 'shape' ? (free ? raw.shape : (raw.rect ?? {})) : raw;
 
     const sheetByKey = new Map(sheets.map((s) => [s.key, s]));
     const pieceByKey = new Map(pieces.map((p) => [p.key, p]));
-    const nests = (out.nests ?? []).map((n) => shapeNest(n, sheetByKey, pieceByKey, settings, g));
+    let nests;
+    // What the job put into the free space of saved plates, whichever layout the new plates took.
+    for (const n of (raw.fill?.nests ?? []).filter((x) => x.placements?.length)) {
+      const e = fill.find((x) => x.key === n.sheetKey);
+      if (e) additions.push(additionOf(e.lot, n, pieceByKey, settings, shapeOf));
+    }
+    nests = [];
+    for (const n of out.nests ?? []) {
+      if (free) nests.push(shapeFreeNest(n, sheetByKey, pieceByKey, settings, g, shapeOf));
+      else {
+        const nest = shapeNest(n, sheetByKey, pieceByKey, settings, g);
+        // The rectangle layout stands, but a drawn part is still its drawing: true steel, true outline.
+        if (drawn) drawOnto(nest, pieceByKey, shapeOf, g);
+        nests.push(nest);
+      }
+      await breathe();
+    }
     const unplaced = (out.unplaced ?? []).map((u) => ({
       cutPlateId: pieceByKey.get(u.key)?.id ?? null,
       cutPlateCode: nameOf(pieceByKey.get(u.key)?.cutPlate ?? {}),
@@ -1670,23 +1948,65 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       unplaced,
       metrics: metricsOf(nests, g),
       deterministic: out.deterministic ?? null,
-      elapsedMs: out.elapsedMs ?? null,
+      elapsedMs: out.elapsedMs ?? out.tookMs ?? null,
       budgetCut: budgetCut.get(g.key) ?? false,
+      // Only on a group nested by true shape: which layout was taken, and what each would have bought.
+      ...(raw.packer === 'shape' ? {
+        shapes: {
+          taken: free ? 'shape' : 'rectangles',
+          drawings: g.cutPlates.filter((cp) => shapeOf(cp)?.drawn).length,
+          existingPlates: fill.length,
+          addedToExisting: (raw.fill?.nests ?? []).reduce((a, n) => a + (n.placements?.length ?? 0), 0),
+          rectangles: raw.rect ? { plates: (raw.rect.nests ?? []).length, areaBought: round3(Number(raw.rect.areaBought) || 0) } : null,
+          shape: raw.shape ? { plates: (raw.shape.nests ?? []).length, areaBought: round3(Number(raw.shape.totals?.areaBought) || 0), source: raw.shape.source ?? null } : null,
+          // The clock cut the true-shape search short (the row layout stands unless it had already been beaten).
+          timedOut: raw.shape?.deterministic === false || raw.shapeSkippedForTime === true,
+          // 1 = re-run coarser after its worker ran out of memory; 2 = the row layout alone for that reason. Absent = as asked.
+          ...(raw.coarse ? { coarse: raw.coarse } : {}),
+          note: raw.shapeError ?? (raw.shape?.warnings ?? [])[0]
+            ?? (!free && (raw.shape?.deterministic === false || raw.shapeSkippedForTime) ? 'The time allowed ran out before the true-shape layout was finished, so the row layout stands. Run it again at a higher effort to let the drawings be used.' : null),
+        },
+      } : {}),
     });
   }
 
   numberLots(groups, imported.lotNos);
   // Waste and offcuts need the lot number (offcut N-003-A), so they are worked
   // out once the numbers are known.
-  for (const g of groups) {
-    for (const n of g.nests) Object.assign(n, lotWasteFields(n, g));
-    g.metrics = metricsOf(g.nests, g);
-  }
+  // The plates of true shapes are measured TOGETHER, off this thread (wastesOf): a hundred plates
+  // at up to a quarter of a second each is not something to hold the server's one thread for.
+  say('Measuring the plates', { phase: 'shaping' });
+  const allNests = groups.flatMap((g) => g.nests.map((n) => ({ n, g })));
+  const nestWaste = await wastesOf(allNests.map(({ n, g }) => lotWasteArgs(n, g)));
+  for (let i = 0; i < allNests.length; i += 1) { const { n, g } = allNests[i]; Object.assign(n, lotWasteFields(n, g, nestWaste[i])); await breathe(); }
+  for (const g of groups) g.metrics = metricsOf(g.nests, g);
   const importedPieces = [...imported.counts.values()].reduce((a, b) => a + b, 0);
+  // The outlines were needed whole to measure the plates; the answer carries them as the screen draws them.
+  const forScreen = (pieces) => { for (const p of pieces) if (p.rings) p.rings = displayRings(p.rings); };
+  // What an addition leaves of its plate, once it is known what lands there.
+  const addWaste = await wastesOf(additions.map((ad) => {
+    const l = ad._lot;
+    const all = [
+      ...l.pieces.filter((p) => isUploadedPiece(l, p)).map((p) => ({ ...p, placedRings: placedRingsOfPiece(p, neededById.get(p.cutPlateId), shapeOf), shaped: true })),
+      ...ad.pieces.map((p) => ({ ...p, placedRings: p.rings ?? rectRingsObject(p), shaped: true })),
+    ];
+    const st = pickCutSettings(settingRows, l.thickness);
+    return [{ lotNo: l.lotNo, length: l.length, width: l.width, thickness: l.thickness, density: l.density, kerfMm: ad.kerfMm, seqGapMinMm: 0, offcutMinAreaMm2: st.offcutMinAreaMm2, offcutMinSideMm: st.offcutMinSideMm }, all];
+  }));
+  additions.forEach((ad, i) => {
+    const w = addWaste[i];
+    ad.after = { waste: w.waste, wasteKg: w.wasteKg, partsKg: w.partsKg, offcuts: w.offcuts };
+    delete ad._lot;
+    forScreen(ad.pieces);
+  });
+  for (const g of groups) for (const n of g.nests) { forScreen(n.pieces); await breathe(); }
   return {
     line: lineHead(line),
     saved: false,
     basis: 'proposal',
+    // §55 — only on a line with uploaded plates: what this proposal ADDS to them (accept writes
+    // these as ours on the customer's plate), and where every left-over piece went.
+    ...(imported.lots.length ? { additions, rest: restSummary(nestable, groups, additions) } : {}),
     // What "nest the rest" left alone: the imported nests stay as they are.
     imported: { lots: imported.lots.length, pieces: importedPieces },
     // What this run left out by the line's nesting choices (§40).
@@ -1706,20 +2026,116 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   };
 }
 
+/** `only` as a Map cutPlateId → quantity, or null. */
+function onlyMap(only) {
+  if (only == null) return null;
+  const src = only instanceof Map ? [...only] : Object.entries(only);
+  return new Map(src.map(([id, q]) => [Number(id), Math.max(0, Math.trunc(Number(q)) || 0)]));
+}
+
+/**
+ * How many pieces of each cut plate a run is asked for: exactly `only` (never more than the line
+ * needs, and a piece held back by hand is nested like any other), else what the line needs less
+ * what already sits on imported lots.
+ */
+function demandedCutPlates(needed, { only = null, importedCounts = new Map() } = {}) {
+  return only
+    ? needed.map((cp) => ({ ...cp, pieces: Math.min(cp.pieces, only.get(cp.id) ?? 0), manual: false }))
+    : needed.map((cp) => ({ ...cp, pieces: Math.max(0, cp.pieces - (importedCounts.get(cp.id) ?? 0)) }));
+}
+
+/**
+ * Which of the demanded cut plates the packer is handed, and why not the others: held back by
+ * hand, left out by the line's nesting choices, or not stating its steel. ONE rule, for the plan
+ * and for the demand fingerprint, so the two can never disagree about what a run nests.
+ */
+function selectNestable(cutPlates, excl) {
+  const problems = [];
+  const manual = [];
+  const leftOut = [];
+  const nestable = [];
+  for (const cp of cutPlates) {
+    if (!cp.pieces) continue;                       // nothing of it is needed, or it is all on imported lots
+    if (cp.manual) { manual.push(describeManual(cp)); continue; }
+    if (excl.cutPlates.has(cp.id)) { leftOut.push(cp); continue; }
+    const gone = missingOnPart(cp.steel);
+    if (gone.length) {
+      problems.push(`${nameOf(cp)} does not say its ${list(gone.map((g) => g.toLowerCase()))}, so it cannot be nested. A rectangle that does not state its steel is refused rather than guessed at — set the value on the cut plate, or mark it ${NEST_MANUAL_SPEC_CODE} and lay it out by hand.`);
+      continue;
+    }
+    nestable.push(cp);
+  }
+  return { nestable, manual, leftOut, problems };
+}
+
+/**
+ * The demand a plan WOULD be asked, from facts a caller already holds — no read, no packing. The
+ * comparison uses it to recognise the run that answers today's question. Same selection, same
+ * hash as planNesting reports through `onDemand`.
+ *   line          requireLine's row (nest_plates decides standard / any)
+ *   needed        surveyLine().cutPlates
+ *   everyPlate    candidatePlates() — every active catalog plate
+ *   excl          exclusionsOf the line; only / importedCounts / replaceImported as planNesting's input
+ */
+export function demandFor({ line, needed, everyPlate, settingRows, excl, facts, only = null, importedCounts = new Map(), replaceImported = false, guillotine = null }) {
+  const pick = onlyMap(only);
+  const choices = { cutPlates: pick ? new Set() : new Set(excl?.cutPlates ?? []), plates: new Set(excl?.plates ?? []) };
+  const cutPlates = demandedCutPlates(needed, { only: pick, importedCounts: replaceImported || pick ? new Map() : importedCounts });
+  const { nestable } = selectNestable(cutPlates, choices);
+  return demandOf({ nestable, settingRows, plates: everyPlate.filter(allowedBy(line.nest_plates)), excl: choices, line, facts, guillotine });
+}
+
+/**
+ * THE DEMAND FINGERPRINT (§55): what a nesting run was asked, as one hash. Two runs with the same
+ * fingerprint answer the same question, so the later one can be skipped and the earlier pulled
+ * up; anything that could change the answer changes the hash —
+ *   the pieces       each cut plate, how many, its size and steel
+ *   the cut settings kerf, sequence gap and cutting mode for each thickness in play
+ *   the choices      standard / any plates, the plates left out, and the candidate plates themselves
+ *   the drawings     the shape of each cut plate that has one
+ * Effort and seed are NOT in it: a quicker run is still a run of the same demand.
+ */
+export function demandOf({ nestable, settingRows, plates, excl, line, facts, guillotine = null }) {
+  const pieces = nestable.slice().sort((a, b) => a.id - b.id)
+    .map((cp) => [cp.id, cp.pieces, cp.steel.length, cp.steel.width, cp.steel.thickness, norm(cp.steel.grade), norm(cp.steel.material)]);
+  const thicknesses = [...new Set(nestable.map((cp) => cp.steel.thickness))].sort((a, b) => a - b);
+  const settings = thicknesses.map((t) => { const st = pickCutSettings(settingRows, t); return [t, st.kerfMm, st.seqGapMinMm, guillotine == null ? !!st.guillotine : !!guillotine]; });
+  const groups = [...new Map(nestable.map((cp) => [groupKey(cp.steel), cp.steel])).values()];
+  const offered = [...new Map(groups.flatMap((g) => sheetsFor(plates, g)).filter((p) => !excl.plates.has(p.id)).map((p) => [p.id, p])).values()]
+    .sort((a, b) => a.id - b.id).map((p) => [p.id, p.steel.length, p.steel.width, p.steel.thickness]);
+  const drawings = nestable.slice().sort((a, b) => a.id - b.id).filter((cp) => facts?.get?.(cp.id)?.rings)
+    .map((cp) => [cp.id, createHash('sha1').update(JSON.stringify(facts.get(cp.id).rings)).digest('hex').slice(0, 16)]);
+  // `rim`: the clearance our packers leave at the plate edge, in kerfs (nestShapes.rimOf). A run made
+  // under another rim rule laid the same demand out differently — it must read as stale, not current.
+  const body = { v: 3, pieces, settings, plateChoice: line.nest_plates, plates: offered, drawings, rim: rimOf(1).clearance };
+  return {
+    hash: createHash('sha256').update(JSON.stringify(body)).digest('hex'),
+    pieces: pieces.map(([id, qty]) => ({ cutPlateId: id, qty })),
+    pieceCount: pieces.reduce((a, p) => a + p[1], 0),
+    drawings: drawings.length,
+  };
+}
+
 /**
  * The per-nest fields the contract adds, for a lot the packer proposed. It
  * fits by construction, so there is no verdict and nothing was forced.
  */
-function lotWasteFields(n, g) {
-  const w = wasteOfLot({
+function lotWasteArgs(n, g) {
+  // A plate with a drawn or freely turned piece is measured on the outlines (wasteOfLot's true-shape
+  // path); one of plain rectangles is handed over exactly as it always was.
+  const shaped = n.layout === 'free' || n.pieces.some((p) => p.rings);
+  const pieces = shaped ? n.pieces.map((p) => ({ ...p, placedRings: p.rings ?? rectRingsObject(p), shaped: true })) : n.pieces;
+  return [{
     lotNo: n.lotNo, length: n.length, width: n.width, thickness: n.thickness, density: n.density,
     kerfMm: g.kerfMm, seqGapMinMm: g.seqGapMinMm,
     offcutMinAreaMm2: g.offcutMinAreaMm2, offcutMinSideMm: g.offcutMinSideMm,
-  }, n.pieces);
+  }, pieces];
+}
+function lotWasteFields(n, g, w) {
   return {
     origin: 'auto', verdict: null, forced: false, reasons: [],
     hasLayout: w.hasLayout, waste: w.waste, wasteKg: w.wasteKg, partsKg: w.partsKg, offcuts: w.offcuts,
-    rules: nestRules(n, g),
+    rules: n.layout === 'free' ? freeLayoutRules(n) : nestRules(n, g),
   };
 }
 
@@ -1813,6 +2229,152 @@ function shapeNest(n, sheetByKey, pieceByKey, settings, g) {
   };
 }
 
+const rectRingsObject = (p) => ({ outline: [[p.x, p.y], [p.x + p.length, p.y], [p.x + p.length, p.y + p.width], [p.x, p.y + p.width]], cutouts: [], holes: [] });
+
+/**
+ * A saved piece's outline on its plate. In this order: its cut plate's DRAWING placed as the row
+ * says; else the outline the customer's file drew for this very placement (`fileRings`,
+ * cf_nest_placements.rings_json — a part with no drawing that is not a rectangle in the file);
+ * else its cut plate's rectangle placed as the row says; else its box.
+ */
+export function placedRingsOfPiece(p, cp, shapeOf) {
+  const shape = cp ? shapeOf(cp) : null;
+  if (p.fileRings && !shape?.drawn) return p.fileRings;
+  return shape ? placeShape(shape.rings, { x: p.x, y: p.y, rotationDeg: p.rotationDeg ?? (p.rotated ? 90 : 0), mirrored: !!p.mirrored }) : rectRingsObject(p);
+}
+
+/** rings_json of a placement row → { outline, cutouts, holes } or null (a row from before the column, or a plain part). */
+export function fileRingsOfRow(row) {
+  const v = row?.rings_json;
+  if (v == null) return null;
+  let o = v;
+  if (typeof v === 'string') { try { o = JSON.parse(v); } catch { return null; } }
+  return Array.isArray(o?.outline) && o.outline.length >= 3 ? { outline: o.outline, cutouts: o.cutouts ?? [], holes: o.holes ?? [] } : null;
+}
+
+/** shapePacker's placements as pieces: our shape, put where the packer put it, read back as a box. */
+function freePieces(placements, pieceByKey, shapeOf) {
+  const out = (placements ?? []).map((p) => {
+    const src = pieceByKey.get(p.key);
+    const shape = shapeOf(src.cutPlate);
+    const rot = normDeg(p.rotationDeg ?? 0);
+    const mirrored = !!p.mirrored;
+    const rings = placeShape(shape.rings, { x: round3(p.x), y: round3(p.y), rotationDeg: rot, mirrored });
+    const box = boxOfShape(rings);
+    return {
+      cutPlateId: src.id, cutPlateCode: nameOf(src.cutPlate),
+      seqNo: 1, rowNo: 1,
+      x: box.x, y: box.y, length: box.length, width: box.width,
+      rotated: rotatedFlag(rot), rotationDeg: rot, mirrored, area: shape.area,
+      // Its outline on the plate, when it is more than a rectangle lying square.
+      ...(shape.drawn || !isPlainPlacement(rot, mirrored) ? { rings } : {}),
+    };
+  // THE CUT ORDER OF A FREE LAYOUT (it has no rows or sequences to give one): along the plate —
+  // by x, then y — so the head works from one end to the other and never jumps back. `posNo` IS
+  // that order (1…n on the plate); within a part the cutting program takes the cut-outs before
+  // the outline, as it must (nestGeometry.nestToDxf writes them in that order).
+  }).sort((a, b) => a.x - b.x || a.y - b.y || a.cutPlateId - b.cutPlateId);
+  out.forEach((p, i) => { p.posNo = i + 1; });
+  return out;
+}
+
+/**
+ * One nest of the TRUE-SHAPE packer becomes one lot. No rows, no sequences — a free layout has
+ * none (`layout: 'free'`); every piece carries its turn, its true steel and (when it is not a plain
+ * rectangle) its outline on the plate.
+ */
+function shapeFreeNest(n, sheetByKey, pieceByKey, settings, g, shapeOf) {
+  const sheet = sheetByKey.get(n.sheetKey);
+  const pieces = freePieces(n.placements, pieceByKey, shapeOf);
+  const usedArea = pieces.reduce((a, p) => a + p.area, 0);
+  const length = sheet?.length ?? Number(n.sheetLength) ?? 0;
+  const width = sheet?.width ?? Number(n.sheetWidth) ?? 0;
+  const density = sheet?.plate?.steel?.density ?? null;
+  return {
+    lotNo: null,
+    plateItemId: sheet?.id ?? null,
+    plateCode: sheet?.plate?.code ?? n.sheetKey,
+    plateName: sheet?.plate?.name ?? null,
+    source: 'catalog',
+    ownerPartyId: sheet?.ownerPartyId ?? null,
+    thickness: g.thickness, grade: g.grade, material: g.material, density,
+    length, width,
+    ...requiredSize(pieces, settings.kerfMm),
+    sheetArea: round3(length * width),
+    usedArea: round3(usedArea),
+    wasteArea: round3(length * width - usedArea),
+    wastePct: length * width > 0 ? round3(((length * width - usedArea) / (length * width)) * 100) : 0,
+    weightKg: kgOf(length * width, g.thickness, density),
+    wasteTotalKg: kgOf(length * width - usedArea, g.thickness, density),
+    sequences: [],
+    layout: 'free',
+    pieces,
+  };
+}
+
+/** A rectangle layout whose parts have drawings: each drawn piece gets its true steel and outline. */
+function drawOnto(n, pieceByKey, shapeOf, g) {
+  let any = false;
+  for (const p of n.pieces) {
+    const src = pieceByKey.get(`cp${p.cutPlateId}`);
+    const shape = src ? shapeOf(src.cutPlate) : null;
+    if (!shape?.drawn) continue;
+    any = true;
+    p.rotationDeg = p.rotated ? 90 : 0;
+    p.mirrored = false;
+    p.area = shape.area;
+    p.rings = placeShape(shape.rings, { x: p.x, y: p.y, rotationDeg: p.rotationDeg, mirrored: false });
+  }
+  if (!any) return;
+  const usedArea = n.pieces.reduce((a, p) => a + (p.area ?? p.length * p.width), 0);
+  n.usedArea = round3(usedArea);
+  n.wasteArea = round3(n.sheetArea - usedArea);
+  n.wastePct = n.sheetArea > 0 ? round3(((n.sheetArea - usedArea) / n.sheetArea) * 100) : 0;
+  n.wasteTotalKg = kgOf(n.sheetArea - usedArea, g.thickness, n.density);
+}
+
+/** What the packer put into the free space of ONE saved plate: an addition to that lot. */
+function additionOf(lot, n, pieceByKey, settings, shapeOf) {
+  const pieces = freePieces(n.placements, pieceByKey, shapeOf).map((p) => ({ ...p, placedBy: 'ours' }));
+  return {
+    lotId: lot.id, lotNo: lot.lotNo, plateItemId: lot.plateItemId, plateCode: lot.plateCode,
+    thickness: lot.thickness, grade: lot.grade, material: lot.material, length: lot.length, width: lot.width,
+    layoutOrigin: lot.layoutOrigin, sourceFile: lot.sourceFile ?? null,
+    kerfMm: settings.kerfMm,
+    customerPieces: lot.pieces.filter((p) => isUploadedPiece(lot, p)).length,
+    pieces,
+    _lot: lot,
+  };
+}
+
+/** Per left-over cut plate: how many went onto plates already saved, how many onto new ones, how many nowhere. */
+function restSummary(nestable, groups, additions) {
+  const rows = new Map(nestable.map((cp) => [cp.id, { cutPlateId: cp.id, cutPlateCode: nameOf(cp), qty: cp.pieces, onExisting: [], onNew: [], unplaced: 0 }]));
+  const add = (list, lotNo, extra = {}) => { const hit = list.find((x) => x.lotNo === lotNo); if (hit) hit.qty += 1; else list.push({ lotNo, ...extra, qty: 1 }); };
+  for (const ad of additions) for (const p of ad.pieces) { const r = rows.get(p.cutPlateId); if (r) add(r.onExisting, ad.lotNo, { lotId: ad.lotId }); }
+  for (const g of groups) {
+    for (const n of g.nests) for (const p of n.pieces) { const r = rows.get(p.cutPlateId); if (r) add(r.onNew, n.lotNo); }
+    for (const u of g.unplaced) { const r = rows.get(u.cutPlateId); if (r) r.unplaced += u.qty; }
+  }
+  const pieces = [...rows.values()];
+  const count = (f) => pieces.reduce((a, r) => a + f(r), 0);
+  return {
+    pieces,
+    onExisting: count((r) => r.onExisting.reduce((a, x) => a + x.qty, 0)),
+    onNew: count((r) => r.onNew.reduce((a, x) => a + x.qty, 0)),
+    unplaced: count((r) => r.unplaced),
+    existingPlatesUsed: additions.length,
+  };
+}
+
+/** The rule badge of a plate laid out by true shape: no rows to check, the spacing was proved on the outlines. */
+const freeLayoutRules = (n) => ({
+  status: 'ok',
+  utilisationPct: Number(n.length) * Number(n.width) > 0 ? round3(((n.pieces ?? []).reduce((a, p) => a + (p.area ?? p.length * p.width), 0) / (Number(n.length) * Number(n.width))) * 100) : null,
+  sharedCuts: 0, sharedLengthMm: 0,
+  checks: [{ key: 'freeLayout', ok: true, label: 'Laid out by true shape', detail: 'Every part is at least one kerf from the next and from the plate edge, checked on the outlines themselves. A free layout has no rows or sequences: the cut order is along the plate (by x, then y — the piece numbers), cut-outs before outlines.' }],
+});
+
 /**
  * Position along a row is derived rather than trusted: sorting by (sequence,
  * row, x, y) and numbering 1..n makes it dense and unique whatever a packer or
@@ -1853,7 +2415,7 @@ function sequenceSummary(pieces) {
  * added here — it belongs to procurement, not to the layout, and adding it
  * would make every plate look more wasteful than it is.
  */
-function requiredSize(pieces, kerfMm) {
+export function requiredSize(pieces, kerfMm) {
   if (!pieces.length) return { requiredLength: round3(2 * kerfMm), requiredWidth: round3(2 * kerfMm) };
   const maxX = Math.max(...pieces.map((p) => p.x + p.length));
   const maxY = Math.max(...pieces.map((p) => p.y + p.width));
@@ -1861,7 +2423,7 @@ function requiredSize(pieces, kerfMm) {
 }
 
 /** COUNT LOTS FOR PLATES, SUM PLACEMENTS FOR PIECES. Said in the schema, meant here. */
-function metricsOf(nests, g) {
+export function metricsOf(nests, g) {
   const lots = nests.length;
   const pieces = nests.reduce((a, n) => a + n.pieces.length, 0);
   const areaBought = nests.reduce((a, n) => a + n.sheetArea, 0);
@@ -1887,7 +2449,7 @@ function metricsOf(nests, g) {
   };
 }
 
-const totalsOf = (groups) => {
+export const totalsOf = (groups) => {
   const flat = groups.flatMap((g) => g.nests);
   return { ...metricsOf(flat, null), groups: groups.length, unplaced: groups.reduce((a, g) => a + g.unplaced.length, 0) };
 };
@@ -1943,6 +2505,12 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   // a left-out cut piece is not required (and may not be placed), an excluded
   // plate may not carry a lot.
   const excl = await exclusionsOfLine(db, companyId, orderLineId);
+  // §55: a part's shape is its drawing when it has one — read from the DB, like everything else here.
+  const facts = await drawingFactsOfLine(db, companyId, orderLineId);
+  const shapeMemo = new Map();
+  const shapeOf = (cp) => { if (!shapeMemo.has(cp.id)) shapeMemo.set(cp.id, shapeOfCutPlate(cp, facts)); return shapeMemo.get(cp.id); };
+  // What the plan ADDS to plates already saved (the customer's own layouts): never with replaceImported.
+  const additionsIn = replaceImported ? [] : (Array.isArray(plan?.additions) ? plan.additions.filter((a) => Array.isArray(a?.pieces) && a.pieces.length) : []);
 
   const problems = [];
 
@@ -1962,10 +2530,12 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
 
   // An empty plan is fine when there is nothing left to nest — the imported
   // nests already hold it all, and accepting just clears old automatic lots.
-  const submitted = flattenNests(plan, required.size ? problems : []);
+  const submitted = flattenNests(plan, required.size && !additionsIn.length ? problems : []);
 
   const lots = [];
   const placed = new Map();
+  const pending = [];                               // the free layouts' geometry checks, made together below
+  const breathe = breather();
   for (const [i, n] of submitted.entries()) {
     const label = `Lot ${n.lotNo ?? i + 1}`;
     const plate = plateById.get(Number(n.plateItemId));
@@ -2002,8 +2572,25 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       settings,
       pieces: [],
     };
-    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates });
+    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, shapeOf, pending });
     lots.push(lot);
+    await breathe();
+  }
+
+  // ADDITIONS: pieces put into the free space of a saved customer plate. The plate and what the
+  // customer nested on it come from the DB and do not move; what is added is checked against them
+  // on the outlines — a kerf from every part and from the edge — and against the line's needs.
+  const addByLot = new Map();
+  for (const ad of additionsIn) {
+    const il = imported.lots.find((x) => Number(x.id) === Number(ad.lotId));
+    if (!il) { problems.push(`Plate ${ad.lotNo ?? ad.lotId}: the plan adds pieces to it, but it is not an uploaded plate of this line any more. Nest the rest again.`); continue; }
+    if (addByLot.has(il.id)) { problems.push(`Plate ${il.lotNo}: the plan adds to it twice.`); continue; }
+    addByLot.set(il.id, verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, shapeOf, settingRows, pending }));
+  }
+  // Every plate laid out by true shape, checked on its outlines — together, off this thread.
+  if (pending.length) {
+    const checks = await measurePlates(pending.map((q) => ({ kind: 'verify', args: q.args })));
+    pending.forEach((q, i) => q.report(checks[i]));
   }
 
   // Every rectangle the line needs has to be somewhere. A half-nested blank has
@@ -2028,9 +2615,18 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   const leftOutWasOn = await cutPlatesOnLots(db, companyId, orderLineId, [...excl.cutPlates], replaceImported ? null : 'auto');
   const replaced = await clearLots(db, c, orderLineId, replaceImported ? {} : { origin: 'auto' });
   const numbers = autoLotNumbers(lots.length, imported.lotNos);
+  const lotSteel = (lot, pieces) => { const steel = pieces[0]?.cutPlate?.steel ?? {}; return { steel, density: lot.plate.steel.density ?? steel.density }; };
+  const numbered = lots.map((lot) => numberWithinRows(lot.pieces));
+  // What every plate is made of — the true-shape ones measured together, off this thread.
+  const wastes = await wastesOf(lots.map((lot, i) => [{
+    lotNo: numbers[i], length: lot.plate.steel.length, width: lot.plate.steel.width,
+    thickness: lot.plate.steel.thickness, density: lotSteel(lot, numbered[i]).density,
+    kerfMm: lot.settings.kerfMm, seqGapMinMm: lot.settings.seqGapMinMm,
+    offcutMinAreaMm2: lot.settings.offcutMinAreaMm2, offcutMinSideMm: lot.settings.offcutMinSideMm,
+  }, numbered[i]]));
   const toWrite = lots.map((lot, i) => {
     const lotNo = numbers[i];
-    const pieces = numberWithinRows(lot.pieces);
+    const pieces = numbered[i];
     const req = requiredSize(pieces, lot.settings.kerfMm);
     // THE LOT'S STEEL IS THE RECTANGLES', NOT THE PLATE ROW'S. A catalog plate
     // with a blank grade is tolerated as a candidate on purpose — it is a
@@ -2038,14 +2634,8 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
     // does not contradict the pieces. Recording the plate's blank instead would
     // file this lot under a steel of its own, and the saved plan would read
     // back as two groups where one was proposed.
-    const steel = pieces[0]?.cutPlate?.steel ?? {};
-    const density = lot.plate.steel.density ?? steel.density;
-    const w = wasteOfLot({
-      lotNo, length: lot.plate.steel.length, width: lot.plate.steel.width,
-      thickness: lot.plate.steel.thickness, density,
-      kerfMm: lot.settings.kerfMm, seqGapMinMm: lot.settings.seqGapMinMm,
-      offcutMinAreaMm2: lot.settings.offcutMinAreaMm2, offcutMinSideMm: lot.settings.offcutMinSideMm,
-    }, pieces);
+    const { steel, density } = lotSteel(lot, pieces);
+    const w = wastes[i];
     return {
       lotNo, plate: lot.plate, source: lot.source, isManual: lot.isManual, settings: lot.settings, ownerPartyId: lot.ownerPartyId,
       grade: steel.grade ?? lot.plate.steel.grade,
@@ -2053,21 +2643,39 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       density,
       requiredLength: req.requiredLength, requiredWidth: req.requiredWidth,
       origin: 'auto', verdict: null, reasons: null, forced: false, notes: null,
-      waste: w,
+      // Laid out by true shape (no rows): the saved plan says so, so the screen does not hold it to row rules.
+      sourceKind: lot.free ? 'shape' : null,
+      waste: lot.free && w.json ? { ...w, json: { ...w.json, layout: 'free' } } : w,
       pieces,
     };
   });
-  const written = await writeLots(db, c, orderLineId, toWrite);
+  // A customer's plate that gains our pieces — or that still carries ours from an earlier "nest the
+  // rest" — is written again: the customer's placements exactly as they are, ours as this plan has them.
+  const rewriting = replaceImported ? [] : imported.lots.filter((il) => il.full.layoutOrigin === 'customer'
+    && (addByLot.get(il.id)?.length || il.full.pieces.some((p) => !isUploadedPiece(il.full, p))));
+  const rewritten = await relotMany(rewriting.map((il) => [il.full,
+    [...il.full.pieces.filter((p) => isUploadedPiece(il.full, p)), ...(addByLot.get(il.id) ?? [])]]),
+  { plates, settingRows, cpById, shapeOf });
+  if (rewriting.length) await clearLots(db, c, orderLineId, { ids: rewriting.map((il) => il.id), keepFiles: true });
+  const writtenAll = await writeLots(db, c, orderLineId, [...toWrite, ...rewritten]);
+  const newNos = new Set(toWrite.map((l) => String(l.lotNo).toUpperCase()));
+  const written = writtenAll.filter((w) => newNos.has(String(w.lotNo).toUpperCase()));
 
   // The plate quantity on each cut plate's BOM line is charged over EVERY lot
   // it sits on — the imported ones kept, and the automatic ones just written —
   // against every piece the line needs of it.
   const blanks = new Map(cutPlates.filter((cp) => cp.pieces).map((cp) => [cp.id, cp.pieces]));
-  const quantities = await replaceAreaFractions(db, c, where, [...imported.lots, ...toWrite], blanks);
+  const rewrittenIds = new Set(rewriting.map((il) => il.id));
+  const charged = [
+    ...imported.lots.filter((il) => !rewrittenIds.has(il.id)),
+    ...rewritten.map((l) => ({ plate: { id: l.plate.id, code: l.plate.code, steel: { ...l.plate.steel, length: l.lengthMm, width: l.widthMm } }, pieces: l.pieces.map((p) => ({ cutPlateId: p.cutPlateId, area: p.area ?? p.length * p.width })) })),
+    ...toWrite,
+  ];
+  const quantities = await replaceAreaFractions(db, c, where, charged, blanks);
   const backToNesting = await backToChosenAtNesting(db, companyId, where,
     leftOutWasOn.filter((id) => !(imported.counts.get(id) > 0)));
   // CNC inputs from the nest: cut length less common lines, piercings (plateCutsService).
-  const cuts = await writePlateCuts(db, c, orderLineId, cutPlates);
+  const cuts = await writePlateCuts(db, c, orderLineId, cutPlates, { facts });
   return {
     cuts,
     line: lineHead(line),
@@ -2075,6 +2683,8 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
     leftOutBackToNesting: backToNesting,
     replacedLots: replaced,
     keptImportedLots: imported.lots.length,
+    // §55: pieces this accept put on plates the customer's files laid out (stored as ours).
+    additions: { lots: [...addByLot.values()].filter((p) => p.length).length, pieces: [...addByLot.values()].reduce((a, p) => a + p.length, 0), rewrittenLots: rewriting.length },
     lots: written.length,
     plates: written.length,                          // a lot IS a plate; never sum placements for this
     pieces: written.reduce((a, l) => a + l.pieces, 0),
@@ -2096,23 +2706,31 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
  * posNo, x, y, length, width, rotated }] }. x/y may be NULL: on the plate, no
  * layout. Returns [{ id, lotNo, pieces, offcuts }].
  */
-async function writeLots(db, c, orderLineId, lots) {
+export async function writeLots(db, c, orderLineId, lots) {
   if (!lots.length) return [];
   const companyId = c.companyId;
   const user = c.userId ?? null;
   const json = (v) => (v == null ? null : JSON.stringify(v));
-  await insertRows(db, 'cf_plate_lots', [
+  const lotCols = [
     'company_id', 'order_line_id', 'plate_item_id', 'lot_no', 'source', 'thickness_mm', 'length_mm', 'width_mm',
     'required_length_mm', 'required_width_mm', 'grade', 'material', 'density',
     'kerf_mm', 'seq_gap_min_mm', 'seq_gap_max_mm', 'guillotine', 'is_manual',
     'origin', 'check_verdict', 'check_json', 'forced', 'waste_json', 'notes', 'owner_party_id', 'created_by',
-  ], lots.map((l) => [
+  ];
+  // The lot's size is the plate's — or the plate AS THE FILE DREW IT (`lengthMm` / `widthMm`: a
+  // customer may draw the same plate standing up), because the placements are measured on it.
+  const lotRows = lots.map((l) => [
     companyId, orderLineId, l.plate.id, l.lotNo, l.source ?? 'catalog',
-    l.plate.steel.thickness, l.plate.steel.length, l.plate.steel.width,
+    l.plate.steel.thickness, l.lengthMm ?? l.plate.steel.length, l.widthMm ?? l.plate.steel.width,
     l.requiredLength ?? null, l.requiredWidth ?? null, l.grade ?? null, l.material ?? null, l.density ?? null,
     l.settings.kerfMm, l.settings.seqGapMinMm, l.settings.seqGapMaxMm, l.settings.guillotine ? 1 : 0, l.isManual ? 1 : 0,
     l.origin ?? 'auto', l.verdict ?? null, json(l.reasons), l.forced ? 1 : 0, json(l.waste?.json), l.notes ?? null, l.ownerPartyId ?? null, user,
-  ]), 500);
+  ]);
+  // §55: where an uploaded layout came from, and whose positions they are. A database that has
+  // not had §55 yet (a backend deployed ahead of its schema) still takes the columns it knows.
+  const lotCols55 = ['source_kind', 'source_file', 'source_hash', 'layout_origin', 'nest_file_id'];
+  const lotRows55 = lots.map((l) => [l.sourceKind ?? null, l.sourceFile ?? null, l.sourceHash ?? null, l.layoutOrigin === 'customer' ? 'customer' : 'ours', l.nestFileId ?? null]);
+  const has55 = await insertWithNewColumns(db, 'cf_plate_lots', lotCols, lotRows, lotCols55, lotRows55, 500);
 
   const [idRows] = await db.query(
     "SELECT id, lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate' AND lot_no IN (?)",
@@ -2121,15 +2739,20 @@ async function writeLots(db, c, orderLineId, lots) {
   const idByNo = new Map(idRows.map((r) => [String(r.lot_no).toUpperCase(), r.id]));
 
   const placements = [];
+  const placements55 = [];
   const offcuts = [];
   const out = [];
   for (const l of lots) {
     const lotId = idByNo.get(String(l.lotNo).toUpperCase());
     for (const p of l.pieces) {
+      // THE MAPPING (§55): rotation_deg is the turn by the placement convention; a rectangle our
+      // row packer turned is 90. `rotated` stays 1 exactly for a quarter-turned footprint.
+      const deg = p.rotationDeg != null ? normDeg(p.rotationDeg) : (p.rotated ? 90 : 0);
       placements.push([
         companyId, lotId, p.cutPlateId, p.seqNo, p.rowNo, p.posNo,
-        p.x == null ? null : p.x, p.y == null ? null : p.y, p.length, p.width, p.rotated ? 1 : 0, user,
+        p.x == null ? null : p.x, p.y == null ? null : p.y, p.length, p.width, (p.rotationDeg != null ? rotatedFlag(deg) : p.rotated) ? 1 : 0, user,
       ]);
+      placements55.push([deg, p.mirrored ? 1 : 0, p.placedBy === 'customer' ? 'customer' : 'ours', p.area ?? null]);
     }
     for (const o of l.waste?.offcuts ?? []) {
       offcuts.push([
@@ -2142,10 +2765,22 @@ async function writeLots(db, c, orderLineId, lots) {
     }
     out.push({ id: lotId, lotNo: l.lotNo, plateItemId: l.plate.id, pieces: l.pieces.length, offcuts: l.waste?.offcuts?.length ?? 0 });
   }
-  await insertRows(db, 'cf_nest_placements', [
+  const placeCols = [
     'company_id', 'plate_lot_id', 'cut_plate_id', 'seq_no', 'row_no', 'pos_no',
     'x_mm', 'y_mm', 'length_mm', 'width_mm', 'rotated', 'created_by',
-  ], placements, 1000);
+  ];
+  // rings_json (the customer's own outline of a part with no drawing) is written only when some
+  // placement carries one — so a plan of rectangles never names the column, and a database that
+  // has not had it yet still takes everything else (the outline is then not kept: the part reads
+  // back as its rectangle, as before).
+  const flat = l55Pieces(lots);
+  const anyRings = flat.some((q) => q.fileRings);
+  const rows55 = placements.map((r, i) => [...r, ...placements55[i]]);
+  const cols55 = [...placeCols, 'rotation_deg', 'mirrored', 'placed_by', 'area_mm2'];
+  if (has55 && anyRings) {
+    await insertWithNewColumns(db, 'cf_nest_placements', cols55, rows55, ['rings_json'], flat.map((q) => [q.fileRings ? JSON.stringify(q.fileRings) : null]), 500);
+  } else if (has55) await insertRows(db, 'cf_nest_placements', cols55, rows55, 1000);
+  else await insertRows(db, 'cf_nest_placements', placeCols, placements, 1000);
   await insertRows(db, 'cf_offcuts', [
     'company_id', 'order_line_id', 'plate_lot_id', 'offcut_no', 'thickness_mm', 'grade', 'material',
     'density', 'area_mm2', 'weight_kg',
@@ -2154,6 +2789,25 @@ async function writeLots(db, c, orderLineId, lots) {
     'outline_json', 'owner_party_id', 'created_by',
   ], offcuts, 200);
   return out;
+}
+
+/** Every piece of some lots, in the order writeLots lays its placement rows out. */
+const l55Pieces = (lots) => lots.flatMap((l) => l.pieces);
+
+/**
+ * A multi-row INSERT with the §55 columns when the table has them, without when it does not yet
+ * (error 1054 on the first statement — nothing has been written, and MySQL / TiDB leave the
+ * transaction open after a failed statement). Returns whether the new columns were written.
+ */
+async function insertWithNewColumns(db, table, cols, rows, newCols, newRows, chunk) {
+  try {
+    await insertRows(db, table, [...cols, ...newCols], rows.map((r, i) => [...r, ...newRows[i]]), chunk);
+    return true;
+  } catch (e) {
+    if (!(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054)) throw e;
+    await insertRows(db, table, cols, rows, chunk);
+    return false;
+  }
 }
 
 /** `groups[].nests[]`, or a flat `nests[]`. Anything else is said plainly. */
@@ -2170,30 +2824,140 @@ function flattenNests(plan, problems) {
  * rectangles are. Every failure is pushed, none thrown, so the caller can show
  * them all at once.
  */
-function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set() }) {
+/** Our own layouts are stored to the micron: this much is rounding, not a gap. */
+const OUR_TOL_MM = 0.005;
+
+/**
+ * One piece of a plan as a part ON a plate, from the DB's shape for its cut plate: its drawing
+ * when it has one, else its rectangle — put where the plan says (x, y, rotationDeg, mirrored).
+ * Never the rings a request carries.
+ */
+function freePiece(p, cp, shapeOf) {
+  const shape = shapeOf(cp);
+  const rot = normDeg(num(p.rotationDeg) ?? (p.rotated ? 90 : 0));
+  const mirrored = !!p.mirrored;
+  const rings = placeShape(shape.rings, { x: round3(num(p.x) ?? 0), y: round3(num(p.y) ?? 0), rotationDeg: rot, mirrored });
+  const box = boxOfShape(rings);
+  return {
+    cutPlateId: cp.id, cutPlateCode: nameOf(cp), cutPlate: cp, seqNo: 1, rowNo: 1,
+    x: box.x, y: box.y, length: box.length, width: box.width,
+    rotated: rotatedFlag(rot), rotationDeg: rot, mirrored, area: shape.area, placedRings: rings, shaped: true,
+  };
+}
+
+/** A geometry problem of a free layout as a sentence. */
+function freeProblem(label, pr, nameAt, k, plateWords) {
+  const a = nameAt(pr.ai); const b = pr.bi == null ? null : nameAt(pr.bi);
+  if (pr.kind === 'overlap') return `${label}: ${a} and ${b} overlap.`;
+  if (pr.kind === 'too_close') return `${label}: ${a} and ${b} are closer than the ${fmt(k)} mm kerf${pr.distance != null ? ` (${fmt(pr.distance)} mm apart)` : ''}. Parts laid out by shape keep one kerf between them everywhere.`;
+  if (pr.kind === 'outside') return `${label}: ${a} runs past ${plateWords}.`;
+  return `${label}: ${a} sits closer to the edge of ${plateWords} than one ${fmt(k)} mm kerf — the plate's own edge is cut too.`;
+}
+
+/**
+ * The pieces a plan ADDS to one saved customer plate. The plate and the customer's parts come
+ * from the DB (`il.full`) and are fixed; each added piece must be one the line still needs, of the
+ * plate's steel, and a kerf clear of every other part and of the edge. Returns the pieces to store
+ * (placed_by 'ours'); every failure is pushed.
+ */
+function verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts, leftOut, shapeOf, settingRows, pending }) {
+  const l = il.full;
+  const label = `Plate ${l.lotNo} (already saved)`;
+  if (l.layoutOrigin !== 'customer' || !l.pieces.length || l.pieces.some((p) => p.x == null)) {
+    problems.push(`${label}: it has no layout from the customer's file, so nothing can be added to its free space.`);
+    return [];
+  }
+  const k = pickCutSettings(settingRows, l.thickness).kerfMm;
+  const pieces = [];
+  for (const [j, p] of ad.pieces.entries()) {
+    const at = `${label}, added piece ${j + 1}`;
+    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+    if (!cp) continue;
+    if (Math.abs(cp.steel.thickness - l.thickness) > EPS) { problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and the plate is ${fmt(l.thickness)} mm.`); continue; }
+    if (!agrees(l.grade, cp.steel.grade) || !agrees(l.material, cp.steel.material)) { problems.push(`${at}: ${nameOf(cp)} is ${[cp.steel.grade, cp.steel.material].filter(Boolean).join(' ')} and the plate is ${[l.grade, l.material].filter(Boolean).join(' ')}. Grade is not something a layout may mix.`); continue; }
+    pieces.push({ ...freePiece(p, cp, shapeOf), placedBy: 'ours' });
+    placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
+  }
+  const theirs = l.pieces.filter((p) => isUploadedPiece(l, p));
+  const nameAt = (i) => (i >= 0 ? `${pieces[i].cutPlateCode} at (${fmt(pieces[i].x)}, ${fmt(pieces[i].y)})` : `the customer's ${theirs[-1 - i].cutPlateCode ?? 'part'} at (${fmt(theirs[-1 - i].x)}, ${fmt(theirs[-1 - i].y)})`);
+  if (pieces.length) {
+    pending.push({
+      args: {
+        length: l.length, width: l.width, kerf: k, margin: rimOf(k).legalMin, tolerance: OUR_TOL_MM,
+        fixed: theirs.map((p, i) => ({ key: `f${i}`, rings: placedRingsOfPiece(p, cpById.get(p.cutPlateId), shapeOf) })),
+        placements: pieces.map((p, i) => ({ key: i, rings: p.placedRings })),
+      },
+      report: (check) => { for (const pr of [...check.problems, ...check.commonCuts.map((x) => ({ ...x, kind: 'too_close', distance: 0 }))]) problems.push(freeProblem(label, pr, nameAt, k, `the ${fmt(l.length)} × ${fmt(l.width)} plate`)); },
+    });
+  }
+  return pieces;
+}
+
+/**
+ * Is this piece of a plan one the line needs from automatic nesting? Its cut plate, or null with
+ * the reason pushed. The same questions for a new plate and for an addition to a saved one.
+ */
+function pieceCutPlate(p, at, { cpById, required, problems, importedCounts = new Map(), leftOut = new Set() }) {
+  const cp = cpById.get(Number(p.cutPlateId));
+  if (!cp) { problems.push(`${at}: ${p.cutPlateId == null ? 'no cut plate is named' : `cut plate ${p.cutPlateId} is not one of this line's`}.`); return null; }
+  // NEST_MANUAL means "leave it out of AUTOMATIC nesting" (2026-09-29): it
+  // may sit on an imported nest, never on a packed one.
+  if (cp.manual) { problems.push(`${at}: ${nameOf(cp)} is marked ${NEST_MANUAL_SPEC_CODE}, so it is left out of automatic nesting and cannot be on a packed plate. Put it on an imported nest, or clear the flag to nest it.`); return null; }
+  if (leftOut.has(cp.id)) {
+    problems.push(`${at}: ${nameOf(cp)} is left out of this line's nesting (Nesting › Pieces), so it cannot be on a packed plate. Tick it back in to nest it.`);
+    return null;
+  }
+  if (!required.has(cp.id)) {
+    problems.push(importedCounts.get(cp.id)
+      ? `${at}: every piece of ${nameOf(cp)} the line needs is already on imported nests, so there is none left for this plate.`
+      : `${at}: ${nameOf(cp)} is not a rectangle this line needs.`);
+    return null;
+  }
+  return cp;
+}
+
+function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set(), shapeOf = null, pending = [] }) {
   const { plate, settings } = lot;
   const k = settings.kerfMm;
   const raw = Array.isArray(n.pieces) ? n.pieces : [];
   if (!raw.length) { problems.push(`${label}: it has no pieces on it. An empty plate is not a nest — take it out of the plan.`); return; }
 
+  // A FREE LAYOUT (§55) — the true-shape packer's, or any plate with a part at a free angle or
+  // flipped — has no rows to hold it to. It is verified on the outlines themselves: every part
+  // (the DB's shape for its cut plate, placed where the plan says) a kerf from the next and from
+  // the plate edge. A plate of rectangles lying square in rows is verified below, as it always was.
+  const free = !!shapeOf && (n.layout === 'free' || raw.some((p) => !isPlainPlacement(num(p.rotationDeg) ?? (p.rotated ? 90 : 0), !!p.mirrored)));
+  if (free) {
+    const pieces = [];
+    for (const [j, p] of raw.entries()) {
+      const at = `${label}, piece ${j + 1}`;
+      const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+      if (!cp) continue;
+      if (Math.abs(cp.steel.thickness - plate.steel.thickness) > EPS) problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and ${nameOf(plate)} is ${fmt(plate.steel.thickness)} mm.`);
+      if (!agrees(plate.steel.grade, cp.steel.grade)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
+      if (!agrees(plate.steel.material, cp.steel.material)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.material} and ${nameOf(plate)} is ${plate.steel.material}.`);
+      pieces.push(freePiece(p, cp, shapeOf));
+      placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
+    }
+    // THE RIM A VERIFIER HOLDS A LAYOUT TO IS THE LEGAL MINIMUM, one kerf (rimOf().legalMin) — the
+    // same figure the row check below uses — whichever packer laid it. The check itself is exact
+    // polygon work, so it is QUEUED (`pending`) and every free plate of the plan is checked together
+    // off this thread; `report` turns what comes back into sentences.
+    const nameAt = (i) => `${pieces[i].cutPlateCode} at (${fmt(pieces[i].x)}, ${fmt(pieces[i].y)})`;
+    pending.push({
+      args: { length: plate.steel.length, width: plate.steel.width, kerf: k, margin: rimOf(k).legalMin, tolerance: OUR_TOL_MM, placements: pieces.map((p, i) => ({ key: i, rings: p.placedRings })) },
+      report: (check) => { for (const pr of [...check.problems, ...check.commonCuts.map((x) => ({ ...x, kind: 'too_close', distance: 0 }))]) problems.push(freeProblem(label, pr, nameAt, k, `${nameOf(plate)}, which is ${fmt(plate.steel.length)} × ${fmt(plate.steel.width)}`)); },
+    });
+    lot.pieces = pieces;
+    lot.free = true;
+    return;
+  }
+
   const pieces = [];
   for (const [j, p] of raw.entries()) {
     const at = `${label}, piece ${j + 1}`;
-    const cp = cpById.get(Number(p.cutPlateId));
-    if (!cp) { problems.push(`${at}: ${p.cutPlateId == null ? 'no cut plate is named' : `cut plate ${p.cutPlateId} is not one of this line's`}.`); continue; }
-    // NEST_MANUAL means "leave it out of AUTOMATIC nesting" (2026-09-29): it
-    // may sit on an imported nest, never on a packed one.
-    if (cp.manual) { problems.push(`${at}: ${nameOf(cp)} is marked ${NEST_MANUAL_SPEC_CODE}, so it is left out of automatic nesting and cannot be on a packed plate. Put it on an imported nest, or clear the flag to nest it.`); continue; }
-    if (leftOut.has(cp.id)) {
-      problems.push(`${at}: ${nameOf(cp)} is left out of this line's nesting (Nesting › Pieces), so it cannot be on a packed plate. Tick it back in to nest it.`);
-      continue;
-    }
-    if (!required.has(cp.id)) {
-      problems.push(importedCounts.get(cp.id)
-        ? `${at}: every piece of ${nameOf(cp)} the line needs is already on imported nests, so there is none left for this plate.`
-        : `${at}: ${nameOf(cp)} is not a rectangle this line needs.`);
-      continue;
-    }
+    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+    if (!cp) continue;
 
     // The steel has to agree on all three axes. An unknown on the PLATE is
     // tolerated (a catalog gap); an unknown on the PART was refused already.
@@ -2284,6 +3048,15 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
       }
     }
   }
+  // A rectangle layout whose parts have drawings: the plate is still measured on the true outlines.
+  if (shapeOf && pieces.some((p) => shapeOf(p.cutPlate)?.drawn)) {
+    for (const p of pieces) {
+      const sh = shapeOf(p.cutPlate);
+      p.area = sh.area;
+      p.placedRings = placeShape(sh.rings, { x: p.x, y: p.y, rotationDeg: p.rotated ? 90 : 0, mirrored: false });
+      p.shaped = true;
+    }
+  }
   lot.pieces = pieces;
 }
 
@@ -2292,13 +3065,19 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
  * or only those of one origin ("nest the rest" clears only 'auto'). Accepting
  * twice is not double steel. Four round trips at most, whatever the size.
  */
-async function clearLots(db, c, orderLineId, { origin = null } = {}) {
-  const [rows] = await db.query(
-    `SELECT id FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate'${origin ? ' AND origin = ?' : ''}`,
+export async function clearLots(db, c, orderLineId, { origin = null, ids: only = null, keepFiles = false } = {}) {
+  const [all] = await db.query(
+    `SELECT * FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate'${origin ? ' AND origin = ?' : ''}`,
     origin ? [c.companyId, orderLineId, origin] : [c.companyId, orderLineId],
   );
-  if (!rows.length) return 0;
+  // `ids`: only these lots of the line (one plate deleted, or an upload replacing some).
+  const rows = all.filter((r) => !only || only.some((x) => Number(x) === Number(r.id)));
   const ids = rows.map((r) => r.id);
+  if (!ids.length) return 0;
+  // A plate read from a customer's file takes that file with it (§55) — unless the lot is only
+  // being written again (`keepFiles`), when the new row carries the same file on.
+  const fileIds = keepFiles ? [] : rows.map((r) => r.nest_file_id).filter((x) => x != null);
+  if (fileIds.length) await db.query('UPDATE cf_nest_files SET deleted_at = NOW() WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [c.companyId, fileIds]);
   await db.query('UPDATE cf_nest_placements SET deleted_at = NOW() WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL', [c.companyId, ids]);
   await db.query('UPDATE cf_offcuts SET deleted_at = NOW() WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL', [c.companyId, ids]);
   await db.query('UPDATE cf_plate_lots SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [c.companyId, ids]);
@@ -2328,7 +3107,7 @@ async function cutPlatesOnLots(db, companyId, orderLineId, cutPlateIds, origin =
  * cutPlateService leaves a new blank — and release refuses it until it is
  * nested or a plate is chosen by hand. Returns the cut plate ids reset.
  */
-async function backToChosenAtNesting(db, companyId, where, cutPlateIds) {
+export async function backToChosenAtNesting(db, companyId, where, cutPlateIds) {
   if (!cutPlateIds.length) return [];
   const { plateSelection } = await import('./cutPlateService.js');
   const selection = await plateSelection(db, companyId, where.plate);
@@ -2363,7 +3142,7 @@ async function backToChosenAtNesting(db, companyId, where, cutPlateIds) {
  * named: the person accepted this layout, and a quantity counted against a
  * plate the layout does not use would be a worse lie than the fraction was.
  */
-async function replaceAreaFractions(db, c, where, lots, required, { restore = null } = {}) {
+export async function replaceAreaFractions(db, c, where, lots, required, { restore = null } = {}) {
   const charge = new Map();                        // cutPlateId -> Map(plateItemId -> area)
   const plateOf = new Map();                       // plateItemId -> plate
   // A piece is { length, width } (one piece) or { area } (an imported lot's
@@ -2522,15 +3301,42 @@ export async function getNesting(db, companyId, orderLineId) {
 
   const byLot = new Map(lotRows.map((l) => [l.id, []]));
   const placedCount = new Map();
+  // §55: a part's drawing (when it has one) and its true turn. A piece that is not a plain
+  // rectangle lying square carries `rings` — its outline, cut-outs and holes in PLATE mm — so the
+  // diagram draws what is cut; a plain one is drawn from x, y, length, width as it always was.
+  const facts = placeRows.length ? await drawingFactsOfLine(db, companyId, orderLineId) : new Map();
+  const shapes = new Map();
+  const shapeOf = (cutPlateId) => {
+    if (!shapes.has(cutPlateId)) shapes.set(cutPlateId, cpById.has(cutPlateId) ? shapeOfCutPlate(cpById.get(cutPlateId), facts) : null);
+    return shapes.get(cutPlateId);
+  };
+  const breathe = breather();
   for (const p of placeRows) {
-    byLot.get(p.plate_lot_id)?.push({
+    const piece = {
       id: p.id, cutPlateId: p.cut_plate_id, cutPlateCode: p.cut_plate_code ?? p.cut_plate_name,
       seqNo: p.seq_no, rowNo: p.row_no, posNo: p.pos_no,
       // NULL x/y: the piece is on this plate but we found no layout for it.
       x: p.x_mm == null ? null : Number(p.x_mm), y: p.y_mm == null ? null : Number(p.y_mm),
       length: Number(p.length_mm), width: Number(p.width_mm), rotated: !!p.rotated,
-    });
+      rotationDeg: rotationOfRow(p), mirrored: !!Number(p.mirrored ?? 0),
+      // Who put it there: the customer's file, or our packer (also on a customer's plate).
+      placedBy: p.placed_by ?? 'ours',
+    };
+    if (p.area_mm2 != null) piece.area = Number(p.area_mm2);
+    const shape = piece.x == null ? null : shapeOf(p.cut_plate_id);
+    const own = piece.x == null || shape?.drawn ? null : fileRingsOfRow(p);
+    if (own) {
+      // No drawing, and not a rectangle in the customer's file: the outline that file drew.
+      piece.rings = displayRings(own);
+      piece.shapeFrom = 'nesting file';
+      if (piece.area == null && shape) piece.area = shape.area;
+    } else if (shape && (shape.drawn || !isPlainPlacement(piece.rotationDeg, piece.mirrored))) {
+      piece.rings = displayRings(placeShape(shape.rings, { x: piece.x, y: piece.y, rotationDeg: piece.rotationDeg, mirrored: piece.mirrored }));
+      if (piece.area == null) piece.area = shape.area;
+    }
+    byLot.get(p.plate_lot_id)?.push(piece);
     placedCount.set(p.cut_plate_id, (placedCount.get(p.cut_plate_id) ?? 0) + 1);
+    if (piece.rings) await breathe();
   }
 
   // The stored offcuts, one query. A lot saved before waste was recorded has
@@ -2561,7 +3367,7 @@ export async function getNesting(db, companyId, orderLineId) {
   const groups = new Map();
   for (const l of lotRows) {
     const pieces = byLot.get(l.id) ?? [];
-    const usedArea = pieces.reduce((a, p) => a + p.length * p.width, 0);
+    const usedArea = pieces.reduce((a, p) => a + (p.area ?? p.length * p.width), 0);
     const length = Number(l.length_mm);
     const width = Number(l.width_mm);
     const key = `${round3(l.thickness_mm)}|${norm(l.grade)}|${norm(l.material)}`;
@@ -2578,6 +3384,8 @@ export async function getNesting(db, companyId, orderLineId) {
     groups.get(key).nests.push({
       id: l.id, lotNo: l.lot_no, plateItemId: l.plate_item_id, plateCode: l.plate_code, plateName: l.plate_name,
       source: l.source, isManual: !!l.is_manual, ownerPartyId: l.owner_party_id ?? null,
+      // §55: an uploaded layout — the file it was read from, and whose positions these are.
+      sourceKind: l.source_kind ?? null, sourceFile: l.source_file ?? null, layoutOrigin: l.layout_origin ?? 'ours',
       thickness: round3(l.thickness_mm), grade: l.grade, material: l.material, density: l.density == null ? null : Number(l.density),
       length, width,
       requiredLength: l.required_length_mm == null ? null : Number(l.required_length_mm),
@@ -2591,6 +3399,7 @@ export async function getNesting(db, companyId, orderLineId) {
       ...savedWasteFields(l, pieces, offByLot.get(l.id) ?? [], settingRows),
       pieces,
     });
+    await breathe();
   }
 
   const out = [...groups.values()];
@@ -2655,7 +3464,7 @@ function savedWasteFields(l, pieces, storedOffcuts, settingRows) {
   const stored = parseJson(l.waste_json);
   let waste;
   let offcuts = storedOffcuts;
-  let partsArea = pieces.reduce((a, p) => a + p.length * p.width, 0);
+  let partsArea = pieces.reduce((a, p) => a + (p.area ?? p.length * p.width), 0);
   if (stored) {
     waste = Object.fromEntries(WASTE_KEYS.map((k) => [k, round3(stored[k] ?? 0)]));
     if (stored.partsArea != null) partsArea = Number(stored.partsArea);
@@ -2682,14 +3491,47 @@ function savedWasteFields(l, pieces, storedOffcuts, settingRows) {
     offcuts,
     sequences: hasLayout ? sequenceSummary(pieces) : [],
     notes: l.notes ?? null,
-    rules: nestRules({ length: l.length_mm, width: l.width_mm, thickness: Number(l.thickness_mm), pieces },
-      { kerfMm: l.kerf_mm, seqGapMinMm: l.seq_gap_min_mm, seqGapMaxMm: l.seq_gap_max_mm }),
+    // The shop's row rules are OUR packer's rules. A layout copied from the customer's file was
+    // checked as geometry when it was saved (overlap, the plate edge, the kerf): what that check
+    // said is on the lot, and is what is shown.
+    ...(isFreeLot(l, stored) ? { layout: 'free' } : {}),
+    rules: l.layout_origin === 'customer'
+      ? customerLayoutRules(l, pieces)
+      : isFreeLot(l, stored) ? freeLayoutRules({ length: l.length_mm, width: l.width_mm, pieces }) : nestRules({ length: l.length_mm, width: l.width_mm, thickness: Number(l.thickness_mm), pieces },
+        { kerfMm: l.kerf_mm, seqGapMinMm: l.seq_gap_min_mm, seqGapMaxMm: l.seq_gap_max_mm }),
+  };
+}
+
+/**
+ * Is a saved plate a FREE layout (no rows, no sequences)? `source_kind 'shape'` says so for a plate
+ * our packer laid; a plate that came by the Excel sheet keeps `source_kind 'sheet'` (where it came
+ * from) and says it in its stored waste (`waste_json.layout`).
+ */
+export const isFreeLot = (l, stored = undefined) => l.source_kind === 'shape' || (stored === undefined ? parseJson(l.waste_json) : stored)?.layout === 'free';
+
+/** The rule badge of a plate laid out by the customer: clean, or the warnings it was saved with. */
+function customerLayoutRules(l, pieces) {
+  const warnings = parseJson(l.check_json) ?? [];
+  const L = Number(l.length_mm); const W = Number(l.width_mm);
+  const parts = pieces.reduce((a, p) => a + (p.area ?? p.length * p.width), 0);
+  return {
+    status: warnings.length ? 'warn' : 'ok',
+    utilisationPct: L * W > 0 ? round3((parts / (L * W)) * 100) : null,
+    sharedCuts: 0, sharedLengthMm: 0,
+    checks: [{
+      key: 'customerLayout', ok: !warnings.length,
+      label: warnings.length ? `${warnings.length} thing${warnings.length === 1 ? '' : 's'} to read` : 'Customer layout',
+      detail: warnings.length ? warnings.join(' ') : "Copied from the customer's file as drawn: no part overlaps another or leaves the plate, and none is nearer another or the edge than the kerf.",
+    }],
   };
 }
 
 /* ---------------------------------------------------------------------------
  * checkNest — will this imported nest work? Warns, never refuses.
  * ------------------------------------------------------------------------ */
+
+/** What the true-shape packer may take over ONE plate of a sheet upload (it runs inside the request). */
+const CHECK_NEST_BUDGET_MS = 4_000;
 
 /**
  * One plate and the cut plates somebody put on it, with quantities, packed
@@ -2712,8 +3554,9 @@ function savedWasteFields(l, pieces, storedOffcuts, settingRows) {
  * Returns { verdict, reasons, pieces (a layout when fits, else pieces with
  * NULL x/y), requiredLength, requiredWidth }.
  */
-export async function checkNest({ plate, items, settings, pack }) {
+export async function checkNest({ plate, items, settings, pack, shapes = false }) {
   const k = Number(settings.kerfMm) || 0;
+  const rim = rimOf(k);
   const reasons = [];
   const P = plate.steel;
   const pcs = items.reduce((a, it) => a + it.qty, 0);
@@ -2756,7 +3599,7 @@ export async function checkNest({ plate, items, settings, pack }) {
   const packInput = (effort, budgetMs) => ({
     pieces: items.map((it) => ({ key: `cp${it.cutPlate.id}`, length: it.cutPlate.steel.length, width: it.cutPlate.steel.width, qty: it.qty, grain: 'any' })),
     sheets: [{ key: 'sheet', length: P.length, width: P.width, available: 1, preferred: false, areaCost: P.length * P.width }],
-    kerf: k, gap: k, margin: k, thickness: P.thickness,
+    kerf: k, gap: k, margin: rim.rectMargin, thickness: P.thickness,
     sequenceGap: settings.seqGapMinMm,
     smallThreshold: SMALL_PART_MM, rowsPerSequence: { small: 2, big: 3 },
     guillotine: settings.guillotine,
@@ -2777,12 +3620,39 @@ export async function checkNest({ plate, items, settings, pack }) {
     return { verdict: 'fits', reasons, pieces: shaped.pieces, requiredLength: shaped.requiredLength, requiredWidth: shaped.requiredWidth };
   }
 
+  /*
+   * THE SAME PACKER AS AUTOMATIC NESTING (2026-10-10: "use the new packer everywhere"), so "fits"
+   * means the same thing here as there. The rows could not hold every piece: the true-shape
+   * packer is asked for this ONE plate — the job automatic nesting runs (services/packJob.js), in
+   * the worker pool, a few seconds at most. If it places them all the nest FITS, and what is kept
+   * is that free layout (no rows; said on the lot). `shapes` is off for an injected packer.
+   */
+  if (shapes && shapeJobsAvailable) {
+    const job = {
+      packer: 'shape', seed: 1, fillSheets: [],
+      rect: packInput('quick', null),
+      shape: {
+        pieces: items.map((it) => ({ key: `cp${it.cutPlate.id}`, qty: it.qty, rings: null, length: it.cutPlate.steel.length, width: it.cutPlate.steel.width, grain: 'any', allowMirror: false })),
+        sheets: packInput('quick', null).sheets, kerf: k, margin: rim.shapeMargin, rotations: [0, 90, 180, 270], partInPart: true, effort: 'quick', seed: 1,
+      },
+    };
+    let res = null;
+    try { res = (await runAll([{ key: 'check', round: 0, seed: 1, input: job }], { workers: 1, deadlineAt: Date.now() + CHECK_NEST_BUDGET_MS }))[0]; } catch { res = null; }
+    const free = res?.ok && res.out?.chosen === 'shape' ? res.out.shape : null;
+    if (free && free.nests?.length === 1 && !(free.unplaced ?? []).some((u) => Number(u.qty) > 0)) {
+      const pieceByKey = new Map(items.map((it) => [`cp${it.cutPlate.id}`, { id: it.cutPlate.id, cutPlate: it.cutPlate, length: it.cutPlate.steel.length, width: it.cutPlate.steel.width }]));
+      const rect = (cp) => shapeOfCutPlate(cp, null);
+      const pieces = freePieces(free.nests[0].placements, pieceByKey, rect).map((q) => ({ ...q, cutPlate: pieceByKey.get(`cp${q.cutPlateId}`).cutPlate }));
+      return { verdict: 'fits', reasons, pieces, free: true, ...requiredSize(pieces, k) };
+    }
+  }
+
   const need = items.reduce((a, it) => a + (it.cutPlate.steel.length + k) * (it.cutPlate.steel.width + k) * it.qty, 0);
   const have = (P.length - k) * (P.width - k);
   const m2 = (a) => (a / 1e6).toFixed(3);
   const left = (out.unplaced ?? []).reduce((a, u) => a + Number(u.qty || 0), 0) || pcs;
   if (need <= have + EPS) {
-    reasons.push(`The ${pcs} pieces take ${m2(need)} m² with kerf and the plate has ${m2(have)} m² inside its rim, so there is room in principle, but our row-by-row layout could not place ${left} of them. The program this nest came from may manage it; check its drawing before cutting.`);
+    reasons.push(`The ${pcs} pieces take ${m2(need)} m² with kerf and the plate has ${m2(have)} m² inside its rim, so there is room in principle, but our packer could not place ${left} of them. The program this nest came from may manage it; check its drawing before cutting.`);
     return noLayout('tight');
   }
   reasons.push(`The ${pcs} pieces need ${m2(need)} m² with kerf and the plate has only ${m2(have)} m² inside its rim, so they cannot all fit, whatever the layout.`);
@@ -2803,7 +3673,7 @@ export async function importContext(db, companyId, orderLineId, { pack } = {}) {
   const { where, cutPlates } = await surveyLine(db, companyId, line);
   const plates = await candidatePlates(db, companyId, where.plateIds);
   const settingRows = await cutSettingRows(db, companyId);
-  return { line, lineHead: lineHead(line), where, cutPlates, plates, settingRows, pack: await loadPacker(pack) };
+  return { line, lineHead: lineHead(line), where, cutPlates, plates, settingRows, pack: await loadPacker(pack), injected: typeof pack === 'function' };
 }
 
 /** The line's order and release state, for the sheet to say "cannot be saved" before anyone tries. */
@@ -2822,7 +3692,7 @@ export async function checkImportedNests(ctx, nests) {
   const checked = [];
   for (const n of nests) {
     const settings = pickCutSettings(ctx.settingRows, n.plate.steel.thickness);
-    const r = await checkNest({ plate: n.plate, items: n.items, settings, pack: ctx.pack });
+    const r = await checkNest({ plate: n.plate, items: n.items, settings, pack: ctx.pack, shapes: !ctx.injected });
     const steel = n.items[0]?.cutPlate?.steel ?? {};
     const density = n.plate.steel.density ?? steel.density;
     const w = wasteOfLot({
@@ -2884,15 +3754,17 @@ export async function saveImportedNests(db, c, orderLineId, ctx, checked) {
       x: laid ? p.x : null,
       y: laid ? p.y : null,
       length: p.length, width: p.width, rotated: laid ? !!p.rotated : false,
+      // A free layout (the true-shape packer placed what the rows could not): its turn and its steel.
+      ...(laid && check.free ? { rotationDeg: p.rotationDeg, mirrored: !!p.mirrored, area: p.area ?? null } : {}),
     }));
     const lotNo = String(n.nestNo).slice(0, 30);
     return {
       lotNo, plate, source: 'catalog', isManual: false, settings,
       grade: steel.grade ?? plate.steel.grade, material: steel.material ?? plate.steel.material, density,
       requiredLength: check.requiredLength, requiredWidth: check.requiredWidth,
-      origin: 'imported', verdict: check.verdict, reasons: n.reasons, forced: !laid,
+      origin: 'imported', verdict: check.verdict, reasons: n.reasons, forced: !laid, sourceKind: 'sheet',
       notes: String(n.nestNo).length > 30 ? `Nest in the sheet: ${n.nestNo}`.slice(0, 500) : null,
-      waste: { ...waste, offcuts: waste.offcuts.map((o, i) => ({ ...o, offcutNo: `${lotNo}-${offcutLetters(i)}` })) },
+      waste: { ...waste, json: laid && check.free && waste.json ? { ...waste.json, layout: 'free' } : waste.json, offcuts: waste.offcuts.map((o, i) => ({ ...o, offcutNo: `${lotNo}-${offcutLetters(i)}` })) },
       pieces,
     };
   });
@@ -2911,4 +3783,107 @@ export async function saveImportedNests(db, c, orderLineId, ctx, checked) {
     offcuts: written.reduce((a, l) => a + l.offcuts, 0),
     quantities,
   };
+}
+
+/* ---------------------------------------------------------------------------
+ * The saved lots as they are (init.sql §55) — read, and written again
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Every live plate lot of the line with its placements — two reads. The shape every part of this
+ * service works on (and nestCompareService measures).
+ */
+export async function savedLotsOf(db, companyId, lineId) {
+  const [lots] = await db.query(
+    `SELECT l.*, m.code AS plate_code, m.name AS plate_name
+       FROM cf_plate_lots l
+       LEFT JOIN cf_master_records m ON m.id = l.plate_item_id AND m.company_id = l.company_id
+      WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.kind = 'plate'
+      ORDER BY l.lot_no, l.id`,
+    [companyId, lineId],
+  );
+  const [rows] = lots.length ? await db.query(
+    `SELECT p.*, m.code AS cut_plate_code
+       FROM cf_nest_placements p
+       LEFT JOIN cf_master_records m ON m.id = p.cut_plate_id AND m.company_id = p.company_id
+      WHERE p.company_id = ? AND p.plate_lot_id IN (?) AND p.deleted_at IS NULL
+      ORDER BY p.plate_lot_id, p.seq_no, p.row_no, p.pos_no`,
+    [companyId, lots.map((l) => l.id)],
+  ) : [[]];
+  const by = new Map(lots.map((l) => [l.id, []]));
+  for (const p of rows) {
+    by.get(p.plate_lot_id)?.push({
+      id: p.id, cutPlateId: Number(p.cut_plate_id), cutPlateCode: p.cut_plate_code ?? null,
+      seqNo: p.seq_no, rowNo: p.row_no, posNo: p.pos_no,
+      x: p.x_mm == null ? null : Number(p.x_mm), y: p.y_mm == null ? null : Number(p.y_mm),
+      length: Number(p.length_mm), width: Number(p.width_mm), rotated: !!p.rotated,
+      rotationDeg: rotationOfRow(p), mirrored: !!Number(p.mirrored ?? 0),
+      placedBy: p.placed_by ?? 'ours', area: p.area_mm2 == null ? null : Number(p.area_mm2),
+      ...(p.rings_json != null && fileRingsOfRow(p) ? { fileRings: fileRingsOfRow(p) } : {}),
+    });
+  }
+  return lots.map((l) => ({
+    id: l.id, lotNo: l.lot_no, origin: l.origin ?? 'auto', source: l.source,
+    sourceKind: l.source_kind ?? null, sourceFile: l.source_file ?? null, sourceHash: l.source_hash ?? null,
+    layoutOrigin: l.layout_origin ?? 'ours', nestFileId: l.nest_file_id ?? null,
+    plateItemId: Number(l.plate_item_id), plateCode: l.plate_code ?? null, plateName: l.plate_name ?? null,
+    length: Number(l.length_mm), width: Number(l.width_mm), thickness: Number(l.thickness_mm),
+    grade: l.grade, material: l.material, density: l.density == null ? null : Number(l.density),
+    kerfMm: Number(l.kerf_mm), seqGapMinMm: Number(l.seq_gap_min_mm), seqGapMaxMm: Number(l.seq_gap_max_mm), guillotine: !!l.guillotine,
+    isManual: !!l.is_manual, ownerPartyId: l.owner_party_id ?? null,
+    verdict: l.check_verdict ?? null, reasons: parseJson(l.check_json) ?? [], forced: !!l.forced,
+    waste: parseJson(l.waste_json), notes: l.notes ?? null,
+    requiredLength: l.required_length_mm == null ? null : Number(l.required_length_mm),
+    requiredWidth: l.required_width_mm == null ? null : Number(l.required_width_mm),
+    pieces: by.get(l.id) ?? [],
+  }));
+}
+
+/**
+ * Whose piece is it? On an automatic plate every piece is ours. On an uploaded plate it is the
+ * upload's — except a piece OUR packer added to a customer's layout afterwards (nest the rest
+ * into the free space), which the row says (`placed_by = 'ours'`).
+ */
+export const isUploadedPiece = (lot, p) => lot.origin === 'imported' && (lot.layoutOrigin !== 'customer' || p.placedBy === 'customer');
+
+/** A saved lot (savedLotsOf) as writeLots takes it, with some of its pieces gone: waste worked out again. */
+function relotParts(lot, pieces, ctx) {
+  const plate = ctx.plates.find((p) => p.id === lot.plateItemId) ?? { id: lot.plateItemId, code: lot.plateCode, steel: { thickness: lot.thickness, length: lot.length, width: lot.width, grade: lot.grade, material: lot.material, density: lot.density } };
+  const settings = { ...pickCutSettings(ctx.settingRows, lot.thickness), kerfMm: lot.kerfMm, seqGapMinMm: lot.seqGapMinMm, seqGapMaxMm: lot.seqGapMaxMm, guillotine: lot.guillotine };
+  const shaped = pieces.map((p, i) => {
+    const cp = ctx.cpById.get(p.cutPlateId);
+    const shape = cp ? ctx.shapeOf(cp) : null;
+    // The customer's own outline stands in for a part with no drawing; a drawing, once uploaded, wins (and the outline is dropped on the next write).
+    const own = p.fileRings && !shape?.drawn ? p.fileRings : null;
+    const rings = own ?? (shape && p.x != null ? placeShape(shape.rings, { x: p.x, y: p.y, rotationDeg: p.rotationDeg, mirrored: p.mirrored }) : null);
+    return { ...p, fileRings: own, posNo: lot.layoutOrigin === 'customer' ? i + 1 : p.posNo, seqNo: lot.layoutOrigin === 'customer' ? 1 : p.seqNo, rowNo: lot.layoutOrigin === 'customer' ? 1 : p.rowNo, placedRings: rings, shaped: !!own || (!!shape && (shape.drawn || !isPlainPlacement(p.rotationDeg, p.mirrored))), area: p.area ?? shape?.area ?? null };
+  });
+  return {
+    plate, settings, shaped,
+    wasteLot: {
+      lotNo: lot.lotNo, length: lot.length, width: lot.width, thickness: lot.thickness, density: lot.density, kerfMm: lot.kerfMm, seqGapMinMm: lot.seqGapMinMm,
+      offcutMinAreaMm2: settings.offcutMinAreaMm2, offcutMinSideMm: settings.offcutMinSideMm,
+    },
+  };
+}
+function relotDone(lot, { plate, settings, shaped }, waste) {
+  return {
+    lotNo: lot.lotNo, plate, lengthMm: lot.length, widthMm: lot.width, source: lot.source ?? 'catalog', isManual: lot.isManual, settings, ownerPartyId: lot.ownerPartyId,
+    grade: lot.grade, material: lot.material, density: lot.density,
+    ...(shaped.length && shaped.every((p) => p.x != null) ? requiredSize(shaped, lot.kerfMm) : { requiredLength: lot.requiredLength, requiredWidth: lot.requiredWidth }),
+    origin: lot.origin, verdict: lot.verdict, reasons: lot.reasons?.length ? lot.reasons : null, forced: lot.forced, notes: lot.notes,
+    waste: { ...waste, offcuts: waste.offcuts.map((o, i) => ({ ...o, offcutNo: `${lot.lotNo}-${offcutLetters(i)}` })) },
+    pieces: shaped,
+    sourceKind: lot.sourceKind, sourceFile: lot.sourceFile, sourceHash: lot.sourceHash, layoutOrigin: lot.layoutOrigin, nestFileId: lot.nestFileId,
+  };
+}
+export function relot(lot, pieces, ctx) {
+  const parts = relotParts(lot, pieces, ctx);
+  return relotDone(lot, parts, wasteOfLot(parts.wasteLot, parts.shaped));
+}
+/** relot for many plates — [[lot, pieces], …] — their true-shape waste measured together, off this thread. */
+export async function relotMany(pairs, ctx) {
+  const parts = pairs.map(([lot, pieces]) => relotParts(lot, pieces, ctx));
+  const wastes = await wastesOf(parts.map((q) => [q.wasteLot, q.shaped]));
+  return pairs.map(([lot], i) => relotDone(lot, parts[i], wastes[i]));
 }

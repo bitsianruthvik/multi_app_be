@@ -12,13 +12,23 @@
  * take eight times as long. Real seeds in real parallel need real threads.
  */
 import { parentPort, workerData } from 'worker_threads';
-import { nest } from './nestingPacker.js';
+// A job is a rectangle job (nestingPacker, as ever) or a shape job (services/packJob.js, init.sql §55).
+import { runPackJob } from './packJob.js';
 
 if (!parentPort) throw new Error('nestingWorker must be started as a worker thread');
 
 parentPort.on('message', (job) => {
   try {
-    const out = nest(job.input);
+    // STOP AND PROGRESS (2026-10-10). A pack is one long synchronous stretch: no message can reach
+    // it. So the stop is a flag in SHARED memory the search reads as it goes (job.stop, set by the
+    // pool for every job of a run at once), and progress is posted out as the layout gets better.
+    const stop = job.stop ? new Int32Array(job.stop) : null;
+    const out = runPackJob(job.input, {
+      shouldStop: () => !!stop && Atomics.load(stop, 0) !== 0,
+      onProgress: (progress) => parentPort.postMessage({ id: job.id, progress }),
+      // The best layout so far, for the run's checkpoint: when a plate is saved, else once a minute.
+      onCheckpoint: (checkpoint) => parentPort.postMessage({ id: job.id, checkpoint }),
+    });
     parentPort.postMessage({ id: job.id, ok: true, out });
   } catch (err) {
     parentPort.postMessage({ id: job.id, ok: false, error: err?.message ?? String(err) });

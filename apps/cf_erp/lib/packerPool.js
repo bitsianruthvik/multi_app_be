@@ -74,7 +74,7 @@ export function seedsFor(base, n) {
  * good enough proxy: it tracks both how many plates will be opened and how big
  * the knapsacks are. It never affects the answer, only the order of dispatch.
  */
-const weightOf = (j) => (j.input?.pieces ?? []).reduce((a, p) => a + (Number(p.length) || 0) * (Number(p.width) || 0) * (Number(p.qty) || 1), 0);
+const weightOf = (j) => (j.input?.pieces ?? j.input?.rect?.pieces ?? []).reduce((a, p) => a + (Number(p.length) || 0) * (Number(p.width) || 0) * (Number(p.qty) || 1), 0);
 
 /**
  * Roughly how long one TRIAL of a job costs, for ordering under a deadline.
@@ -84,7 +84,7 @@ const weightOf = (j) => (j.input?.pieces ?? []).reduce((a, p) => a + (Number(p.l
  * weighs it against the distinct rows, so pieces x rows tracks it.
  */
 const costOf = (j) => {
-  const ps = j.input?.pieces ?? [];
+  const ps = j.input?.pieces ?? j.input?.rect?.pieces ?? [];
   const qty = ps.reduce((a, p) => a + (Number(p.qty) || 1), 0);
   return qty * Math.max(1, ps.length);
 };
@@ -103,13 +103,59 @@ const hostThreads = () => {
 };
 
 /**
+ * HOW MANY WORKERS THE HOST'S MEMORY CAN CARRY (2026-10-10).
+ *
+ * Every worker is its own V8 heap. Measured on a job the size of the KEPL bridge order
+ * (scripts/cf_kepl/nest_v2_scale_bench.mjs): the server alone ~100 MB, each worker packing true
+ * shapes up to ~320 MB at its worst (its heap is capped, below). The core count says nothing about that — a small
+ * container reports its HOST's cores (Render's free plan: 512 MB and a tenth of a CPU, on a machine
+ * with many) — so the pool also asks how much memory the process may use
+ * (`process.constrainedMemory()`: the container's limit, where there is one) and never starts more
+ * workers than fit in 60 % of it. On a developer's machine this changes nothing.
+ */
+/** What this process may use, bytes: CF_NEST_MEMORY_MB (to rehearse a small instance), else the container's limit, else the machine's memory. */
+export const memoryLimitBytes = () => {
+  const forced = Number(process.env.CF_NEST_MEMORY_MB);
+  if (Number.isFinite(forced) && forced > 0) return forced * 1048576;
+  let limit = 0;
+  try { limit = typeof process.constrainedMemory === 'function' ? Number(process.constrainedMemory()) || 0 : 0; } catch { limit = 0; }
+  const total = os.totalmem();
+  return limit > 0 && limit < total ? limit : total;
+};
+/** A worker's footprint for the count below: its heap cap + 32 young + the thread's own. */
+const workerMb = () => heapCapMb() + 64;
+/**
+ * EACH WORKER'S HEAP IS CAPPED. Left alone, V8 sizes a worker's heap from the MACHINE's memory and
+ * collects lazily: the same 6,000-piece job that needs under 96 MB live (it completes with a 96 MB
+ * old space) was seen holding 380 MB a worker — 2.7 GB with seven — almost all of it garbage. With
+ * a cap the collector keeps up, and the pool's footprint is workers × this, not whatever the host
+ * allows. A job that really does not fit is not lost: its worker dies with an out-of-memory error
+ * and the job is run again in a fresh worker with twice the room, then with no cap (see runAll).
+ * CF_NEST_WORKER_HEAP_MB overrides it (0 = no cap).
+ */
+const WORKER_HEAP_MB = 256;
+/**
+ * The cap follows the instance: 30 % of what the process may use, between 96 MB (a bridge-size
+ * steel completes in that) and WORKER_HEAP_MB. On a 512 MB instance: 153 MB, one worker — the
+ * server (~150 MB with a plan in hand) + the worker (cap + ~64) stays under 400 MB.
+ */
+function heapCapMb() {
+  const v = Number(process.env.CF_NEST_WORKER_HEAP_MB);
+  if (Number.isFinite(v) && v >= 0 && process.env.CF_NEST_WORKER_HEAP_MB !== '' && process.env.CF_NEST_WORKER_HEAP_MB != null) return v;
+  return Math.round(Math.min(WORKER_HEAP_MB, Math.max(96, (memoryLimitBytes() / 1048576) * 0.3)));
+}
+/** A worker with `mb` of old space (0 / Infinity = whatever V8 gives). */
+const startWorker = (mb) => new Worker(WORKER, mb > 0 && Number.isFinite(mb) ? { resourceLimits: { maxOldGenerationSizeMb: mb, maxYoungGenerationSizeMb: 32 } } : {});
+const memoryWorkers = () => Math.max(1, Math.floor((memoryLimitBytes() * 0.6) / (workerMb() * 1048576)));
+
+/**
  * Leave a core for the server itself; never more workers than there is work.
  * `cap` (or CF_NEST_WORKERS) can only LOWER it — the request body reaches this,
  * and a caller must not be able to ask for a thousand threads.
  */
 export const poolSize = (jobs, cap = null) => {
   const envCap = Number(process.env.CF_NEST_WORKERS);
-  let n = Math.max(1, hostThreads() - 1);
+  let n = Math.max(1, Math.min(hostThreads() - 1, memoryWorkers()));
   for (const c of [cap, envCap]) {
     const v = Math.trunc(Number(c));
     if (c != null && c !== '' && Number.isFinite(v) && v >= 1) n = Math.min(n, v);
@@ -159,8 +205,25 @@ const MIN_EXTRA_SEED_MS = 500;
  * be started at all (a restricted host, an older runtime). Slower, same answer,
  * same deadline.
  */
-export async function runAll(jobs, { onFallback = null, workers: workerCap = null, deadlineAt = null, onJob = null } = {}) {
+export async function runAll(jobs, { onFallback = null, workers: workerCap = null, deadlineAt = null, onJob = null, stop = null, onProgress = null, onCheckpoint = null } = {}) {
   if (!jobs.length) return [];
+  /*
+   * STOP AND PROGRESS (2026-10-10 — runs of 5, 10 and 20 minutes).
+   *   stop        an Int32Array over a SharedArrayBuffer, one for the whole plan. Whoever holds it
+   *               stores 1 and EVERY job in flight finishes with the best layout it has, within a
+   *               rebuild (the search reads the flag as it goes — services/nestingWorker.js). A
+   *               group's FIRST seed not yet started still runs, with no time at all, because a
+   *               plan needs a layout for every steel; later seeds are skipped ('stopped').
+   *   onProgress  hears { index, job, progress } whenever a job's layout gets better
+   *               (progress = { plates, areaBought, unplaced, … }, packJob's words).
+   * Neither can change an answer except by ending the search early, which `deterministic: false`
+   * and `stopped: true` on the job's result say.
+   */
+  const stopped = () => !!stop && Atomics.load(stop, 0) !== 0;
+  const progressed = (i, progress) => { if (onProgress) { try { onProgress({ index: i, job: jobs[i], progress }); } catch { /* progress only */ } } };
+  //   onCheckpoint  hears { index, job, checkpoint }: a job's best layout so far, in the form it can
+  //                 be started from again (packJob) — when a plate is saved, else once a minute.
+  const checkpointed = (i, checkpoint) => { if (onCheckpoint) { try { onCheckpoint({ index: i, job: jobs[i], checkpoint }); } catch { /* a listener never breaks a pack */ } } };
   const results = new Array(jobs.length);
   const size = poolSize(jobs.length, workerCap);
 
@@ -192,7 +255,7 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
 
   const primary = new Map();          // group key -> { floorMs, proven } once its round 0 is back
   const started = new Array(jobs.length).fill(false);
-  const stats = { workers: size, jobs: jobs.length, run: 0, skippedTime: 0, skippedProven: 0, capped: 0 };
+  const stats = { workers: size, jobs: jobs.length, run: 0, skippedTime: 0, skippedProven: 0, skippedStopped: 0, capped: 0, stopped: false };
 
   const note = (i, out) => {
     if (roundOf(jobs[i]) === 0 && out) primary.set(jobs[i].key, { floorMs: Number(out.floorMs) || 0, proven: !!out.proven });
@@ -215,6 +278,13 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
   const prepare = (i) => {
     started[i] = true;
     const j = jobs[i];
+    if (stopped()) {
+      stats.stopped = true;
+      // A first seed still has to give its steel a layout: the floor, and nothing more.
+      if (roundOf(j) !== 0) { stats.skippedStopped += 1; return { skip: 'stopped' }; }
+      stats.run += 1;
+      return { input: { ...j.input, budgetMs: 0, deadlineAt: Date.now() } };
+    }
     if (deadlineAt == null) { stats.run += 1; return { input: j.input }; }
     const now = Date.now();
     const left = Math.max(0, deadlineAt - now);
@@ -225,7 +295,16 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
     };
     let share;
     if (roundOf(j) === 0) {
-      share = Math.min(left, (left * size) / Math.max(size, unstarted((x) => roundOf(x) === 0)));
+      /*
+       * WAVES (2026-10-10). With more first seeds than workers somebody has to go second on a
+       * worker, and the old rule — everyone gets (time left × workers / first seeds) — let the first
+       * seven of eight run seven eighths of the budget each and left the eighth, the COSTLIEST
+       * (cheapest go first), one eighth. Now a first seed gets time left ÷ the number of waves
+       * still to fit in: with eight steels on seven workers the cheapest gets half and hands its
+       * worker to the costliest for the other half, and the six in between get all of it. With
+       * one worker it is the equal split it always was, slack flowing to the later ones.
+       */
+      share = left / Math.max(1, Math.ceil(unstarted((x) => roundOf(x) === 0) / size));
     } else {
       const p = primary.get(j.key);
       if (p?.proven) { stats.skippedProven += 1; return { skip: 'proven' }; }
@@ -238,16 +317,18 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
   };
 
   let workers;
+  const cap = heapCapMb();
   try {
-    workers = Array.from({ length: size }, () => new Worker(WORKER));
+    workers = Array.from({ length: size }, () => startWorker(cap));
   } catch (err) {
     if (onFallback) onFallback(err);
-    const { nest } = await import('../services/nestingPacker.js');
+    // The same job runner the workers use: a rectangle job, or a shape job (services/packJob.js).
+    const { runPackJob: nest } = await import('../services/packJob.js');
     stats.workers = 1;
     for (const i of order) {
       const p = prepare(i);
       if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
-      const out = nest(p.input);
+      const out = nest(p.input, { shouldStop: stopped, onProgress: (progress) => progressed(i, progress), onCheckpoint: (checkpoint) => checkpointed(i, checkpoint) });
       results[i] = { ok: true, out };
       note(i, out);
       told(i);
@@ -258,27 +339,60 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
 
   try {
     let next = 0;
-    await Promise.all(workers.map((w) => new Promise((resolve, reject) => {
+    stats.heapRetries = 0;
+    await Promise.all(workers.map((first, slot) => new Promise((resolve, reject) => {
+      /*
+       * ONE SLOT, ONE WORKER AT A TIME — and a worker that runs out of heap is REPLACED, not fatal.
+       * `doing` is the job in flight: if its worker dies of ERR_WORKER_OUT_OF_MEMORY the same job
+       * (the same absolute deadline) goes to a fresh worker OF THE SAME SIZE, marked `coarse: 1` and
+       * then `coarse: 2` (services/packJob.js: fewer convex pieces and a smaller cache, then the row
+       * layout alone). It used to be given twice the room and then no cap at all — on a 512 MB
+       * instance that is how the whole server dies. Any other death fails the plan, as before.
+       */
+      let w = first;
+      let doing = null;                               // { i, input, tries }
+      let room = cap;
       const take = () => {
         while (next < jobs.length) {
           const i = order[next]; next += 1;
           const p = prepare(i);
           if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
-          w.postMessage({ id: i, input: p.input });
+          doing = { i, input: p.input, tries: 0 };
+          w.postMessage({ id: i, input: p.input, stop: stop?.buffer ?? null });
           return;
         }
+        doing = null;
         resolve();
       };
-      w.on('message', (msg) => {
-        if (msg?.ready) { take(); return; }         // the module loaded; start work
-        results[msg.id] = msg.ok ? { ok: true, out: msg.out } : { ok: false, error: msg.error };
-        if (msg.ok) note(msg.id, msg.out);
-        told(msg.id);
-        take();
-      });
-      w.on('error', reject);
-      w.on('exit', (code) => { if (code !== 0 && next < jobs.length) reject(new Error(`packer worker exited ${code}`)); });
+      const wire = (worker) => {
+        worker.on('message', (msg) => {
+          if (worker !== w) return;
+          if (msg?.ready) {
+            if (doing) worker.postMessage({ id: doing.i, input: doing.input, stop: stop?.buffer ?? null });   // a replacement: the job that killed the last one
+            else take();                                                           // the module loaded; start work
+            return;
+          }
+          if (msg.progress) { progressed(msg.id, msg.progress); return; }
+          if (msg.checkpoint) { checkpointed(msg.id, msg.checkpoint); return; }
+          results[msg.id] = msg.ok ? { ok: true, out: msg.out } : { ok: false, error: msg.error };
+          if (msg.ok) note(msg.id, msg.out);
+          told(msg.id);
+          take();
+        });
+        worker.on('error', (err) => {
+          if (worker !== w) return;
+          const oom = err?.code === 'ERR_WORKER_OUT_OF_MEMORY' || /out of memory/i.test(err?.message ?? '');
+          if (!oom || !doing || doing.tries >= 2 || !(room > 0)) { reject(err); return; }
+          doing.tries += 1;
+          stats.heapRetries += 1;
+          doing.input = { ...doing.input, coarse: doing.tries };
+          try { w = startWorker(room); workers[slot] = w; wire(w); } catch (e) { reject(e); }
+        });
+        worker.on('exit', (code) => { if (worker === w && code !== 0 && doing && doing.tries >= 2) reject(new Error(`packer worker exited ${code}`)); });
+      };
+      wire(w);
     })));
+    if (stopped()) stats.stopped = true;
     results.stats = stats;
     return results;
   } finally {

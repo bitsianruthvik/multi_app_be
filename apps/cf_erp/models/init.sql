@@ -4983,3 +4983,179 @@ CREATE TABLE IF NOT EXISTS cf_flow_step_links (
   CONSTRAINT fk_cfsl_after   FOREIGN KEY (company_id, after_step_id) REFERENCES cf_operation_flow_steps(company_id, id),
   CONSTRAINT fk_cfsl_creator FOREIGN KEY (created_by) REFERENCES users(id)
 );
+
+-- ============================================================================
+-- §55  Nesting v2 (2026-10-10): the customer's nesting files, free rotation, saved runs
+-- ============================================================================
+-- A customer nesting DXF is stored exactly as drawn, one file = one plate (services/nestDxfImportService.js):
+--   cf_nest_placements.rotation_deg  counter-clockwise turn of the part, by THE PLACEMENT CONVENTION
+--                                    (normalise to bbox-min (0,0) -> mirror about y -> rotate CCW -> normalise -> move
+--                                    to x_mm, y_mm). NULL on rows written before this section: read it as
+--                                    rotated = 1 -> 90, rotated = 0 -> 0. New rows always carry it, and keep
+--                                    rotated = 1 exactly when the footprint is a quarter turn (90 or 270).
+--   cf_nest_placements.mirrored      1 = flipped about the y axis before the turn.
+--   cf_nest_placements.placed_by     customer = it is where the customer file drew it; ours = our packer put it
+--                                    there (also on a customer plate: nest the rest into the free space).
+--   cf_nest_placements.area_mm2      the part's true area (outline less openings). NULL = length_mm x width_mm.
+--                                    length_mm / width_mm stay the box round the part AS PLACED, x_mm / y_mm its corner.
+--   cf_nest_placements.rings_json    (2026-10-10 hardening) the part's outline AS THE CUSTOMER'S FILE DREW IT, in plate mm:
+--                                    {"outline":[[x,y],...],"cutouts":[[[x,y],...]],"holes":[[[x,y],...]]}, 3 decimals. Written
+--                                    ONLY for a placement whose cut plate has no drawing of its own and whose shape in the
+--                                    file is not a rectangle; NULL everywhere else. It is geometry only (diagram, overlap
+--                                    check, free space, offcuts): the part's weight stays the catalog's until a drawing is
+--                                    uploaded, and a drawing, once there, wins over it. At most 2,000 corners (else NULL).
+--   cf_plate_lots.source_kind        dxf = read from a nesting DXF, sheet = the quantity sheet, NULL = our packer.
+--   cf_plate_lots.source_file / source_hash   the file name and the SHA-256 of its bytes (the same file twice is said).
+--   cf_plate_lots.layout_origin      customer = the positions are the customer's own; ours = we laid it out.
+--   cf_plate_lots.nest_file_id       -> cf_nest_files, the file text itself (a row stays under TiDB's 6 MB entry limit:
+--                                    the service refuses a file over 4 MB).
+-- cf_nest_runs: a nesting run and what it proposed, kept (services/nestRunService.js), so a finished run survives
+-- a restart and can be pulled up to compare with an uploaded nesting. kind auto = our packer, upload = a snapshot
+-- of the uploaded side taken when a comparison is decided. status: running -> ready | failed; a decided
+-- comparison marks the side taken accepted and the other discarded. demand_hash = SHA-256 of what was asked
+-- (cut plates x quantities x cut settings x plate choices x drawings): a run answers only that demand.
+-- scope: line = the whole line, subset = the pieces the uploaded files cover, rest = what the imports leave.
+-- LONG RUNS THAT SURVIVE A SLEEP OR A DEPLOY (2026-10-10; production is one small instance that sleeps and restarts):
+--   heartbeat_at      touched every ~20 s by the process that is working the run. A row still running whose
+--                     heartbeat is old belongs to nobody: it is RESUMED, not failed.
+--   claim_token       who is working it. A resume claims the run with ONE guarded UPDATE (… WHERE id = ? AND the
+--                     heartbeat is stale) and checks affectedRows: two resumes cannot both win.
+--   checkpoint_json   on the run's FIRST row: the best layout of every steel so far (placements only, gzip + base64),
+--                     which steels are finished, the curve. Written every ~60 s and when a whole plate is saved.
+--   checkpoint_at     when; budget_ms = the run's whole budget; budget_used_ms = how much of it was spent by then.
+--   resume_count      how many times it was picked up again (it fails, with the reason, past 10).
+--   claimed_at        when the process working it took it (the start, or the last resume).
+--   quick_deaths      resumes in a row that died within a minute of being claimed. At 2 the run fails with the
+--                     reason instead of being resumed again: a run that kills the server must not loop.
+-- Two statements where a new column gets an index: TiDB refuses an index on a column added in the same ALTER.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements' AND COLUMN_NAME = 'rotation_deg');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_placements ADD COLUMN rotation_deg DECIMAL(7,3) NULL AFTER rotated', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements' AND COLUMN_NAME = 'mirrored');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_placements ADD COLUMN mirrored TINYINT NOT NULL DEFAULT 0 AFTER rotation_deg', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements' AND COLUMN_NAME = 'placed_by');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_nest_placements ADD COLUMN placed_by ENUM('customer','ours') NOT NULL DEFAULT 'ours' AFTER mirrored", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements' AND COLUMN_NAME = 'area_mm2');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_placements ADD COLUMN area_mm2 DECIMAL(16,3) NULL AFTER placed_by', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_placements' AND COLUMN_NAME = 'rings_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_placements ADD COLUMN rings_json MEDIUMTEXT NULL AFTER area_mm2', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'source_kind');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN source_kind VARCHAR(10) NULL AFTER origin', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'source_file');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN source_file VARCHAR(255) NULL AFTER source_kind', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'source_hash');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN source_hash CHAR(64) NULL AFTER source_file', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'layout_origin');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_plate_lots ADD COLUMN layout_origin ENUM('customer','ours') NOT NULL DEFAULT 'ours' AFTER source_hash", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'nest_file_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN nest_file_id INT NULL AFTER layout_origin', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND INDEX_NAME = 'idx_cpl_source_hash');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_plate_lots ADD KEY idx_cpl_source_hash (company_id, order_line_id, source_hash)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+CREATE TABLE IF NOT EXISTS cf_nest_files (
+  id             INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT          NOT NULL,
+  order_line_id  INT          NOT NULL,
+  file_name      VARCHAR(255) NOT NULL,
+  file_kind      VARCHAR(10)  NOT NULL DEFAULT 'dxf',
+  file_hash      CHAR(64)     NOT NULL,
+  byte_size      INT          NOT NULL DEFAULT 0,
+  nest_no        VARCHAR(60)  NULL,
+  file_text      MEDIUMTEXT   NULL,
+
+  deleted_at     DATETIME     DEFAULT NULL,
+  created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT          NULL,
+
+  UNIQUE KEY uq_cnf_tenant (company_id, id),
+  KEY idx_cnf_line (company_id, order_line_id, file_hash),
+
+  CONSTRAINT fk_cnf_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cnf_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cnf_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS cf_nest_runs (
+  id              INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT          NOT NULL,
+  order_line_id   INT          NOT NULL,
+  run_uid         CHAR(36)     NOT NULL,
+  kind            ENUM('auto','upload') NOT NULL DEFAULT 'auto',
+  scope           VARCHAR(10)  NOT NULL DEFAULT 'line',
+  purpose         VARCHAR(10)  NOT NULL DEFAULT 'nest',
+  status          ENUM('running','ready','failed','accepted','discarded') NOT NULL DEFAULT 'running',
+  demand_hash     CHAR(64)     NULL,
+  params_json     TEXT         NULL,
+  plan_json       MEDIUMTEXT   NULL,
+  plan_encoding   VARCHAR(8)   NULL,
+  metrics_json    MEDIUMTEXT   NULL,
+  error_json      TEXT         NULL,
+  log_json        MEDIUMTEXT   NULL,
+  started_at      DATETIME(3)  NULL,
+  finished_at     DATETIME(3)  NULL,
+  dismissed_at    DATETIME     NULL,
+  started_by_name VARCHAR(190) NULL,
+  heartbeat_at    DATETIME(3)  NULL,
+  claim_token     CHAR(36)     NULL,
+  checkpoint_json MEDIUMTEXT   NULL,
+  checkpoint_at   DATETIME(3)  NULL,
+  budget_ms       INT          NULL,
+  budget_used_ms  INT          NULL,
+  resume_count    INT          NOT NULL DEFAULT 0,
+  claimed_at      DATETIME(3)  NULL,
+  quick_deaths    INT          NOT NULL DEFAULT 0,
+
+  deleted_at      DATETIME     DEFAULT NULL,
+  created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT          NULL,
+
+  UNIQUE KEY uq_cnr_tenant (company_id, id),
+  UNIQUE KEY uq_cnr_run    (company_id, run_uid, scope),
+  KEY idx_cnr_line   (company_id, order_line_id, kind, status),
+  KEY idx_cnr_demand (company_id, order_line_id, demand_hash),
+
+  CONSTRAINT fk_cnr_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cnr_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cnr_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+-- cf_nest_runs created before the columns above existed (a database that already had §55): added here, guarded.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'heartbeat_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN heartbeat_at DATETIME(3) NULL AFTER started_by_name', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'claim_token');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN claim_token CHAR(36) NULL AFTER heartbeat_at', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'checkpoint_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN checkpoint_json MEDIUMTEXT NULL AFTER claim_token', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'checkpoint_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN checkpoint_at DATETIME(3) NULL AFTER checkpoint_json', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'budget_ms');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN budget_ms INT NULL AFTER checkpoint_at', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'budget_used_ms');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN budget_used_ms INT NULL AFTER budget_ms', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'resume_count');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN resume_count INT NOT NULL DEFAULT 0 AFTER budget_used_ms', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'claimed_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN claimed_at DATETIME(3) NULL AFTER resume_count', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND COLUMN_NAME = 'quick_deaths');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_nest_runs ADD COLUMN quick_deaths INT NOT NULL DEFAULT 0 AFTER claimed_at', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND INDEX_NAME = 'idx_cnr_live');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_nest_runs ADD KEY idx_cnr_live (status, heartbeat_at)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

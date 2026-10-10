@@ -137,6 +137,46 @@ console.log('\n2. The pool forced to one worker, a 4 s plan budget, 4 groups x 4
   ok('no deadline: every job runs, none skipped', plain.every((r) => r.ok) && plain.stats.run === small.length);
 }
 
+/* ─────────────────── 2b. shape jobs under the pool: waves, progress, stop ─────────────────── */
+console.log('\n2b. Shape jobs (every steel since 2026-10-10): waves of budget, progress, stop-and-use');
+{
+  // The job planNesting builds for a steel: the row input, and the same pieces for the true-shape packer.
+  const shapeJob = (g, seed) => ({
+    packer: 'shape', seed, fillSheets: [],
+    rect: { ...g, seed }, pieces: g.pieces, sheets: g.sheets,
+    shape: { pieces: g.pieces.map((q) => ({ key: q.key, qty: q.qty, rings: null, length: q.length, width: q.width, grain: 'any' })), sheets: g.sheets, kerf: g.kerf, margin: g.margin + g.kerf, rotations: [0, 90, 180, 270], partInPart: true, effort: 'quick', seed },
+  });
+  const steels = [group(21, 6, 12), group(22, 5, 10), group(23, 7, 14)];
+  // WAVES: three first seeds on two workers — the cheapest gets half the budget, the others all of it.
+  {
+    const jobs = steels.map((g, i) => ({ key: i, seed: 1, round: 0, input: shapeJob(g, 1) }));
+    const BUDGET = 6000;
+    const t0 = Date.now();
+    const seen = new Map();
+    const runs = await runAll(jobs, { workers: 2, deadlineAt: t0 + BUDGET, onProgress: ({ index, progress }) => { if (!seen.has(index)) seen.set(index, []); seen.get(index).push(progress); } });
+    const ms = Date.now() - t0;
+    ok(`three steels on two workers, a 6 s plan: back within the budget + 2 s (took ${ms} ms)`, ms <= BUDGET + 2000);
+    ok('every steel answered, as a shape job, with every piece placed', runs.every((r) => r.ok && r.out.packer === 'shape' && !(r.out.unplaced ?? []).length), JSON.stringify(runs.map((r) => r.ok && r.out.chosen)));
+    ok('never worse than its own row floor (plates, then steel)', runs.every((r) => r.out.nests.length <= r.out.rect.nests.length && r.out.areaBought <= r.out.rect.areaBought + 1e-6));
+    ok('every steel reported progress: first its row floor, then only better', [0, 1, 2].every((i) => (seen.get(i)?.length ?? 0) >= 1 && seen.get(i)[0].source === 'rows'
+      && seen.get(i).every((q, k, all) => k === 0 || q.unplaced < all[k - 1].unplaced || q.areaBought <= all[k - 1].areaBought + 1e-6)), JSON.stringify([...seen].map(([i, v]) => [i, v.length])));
+  }
+  // STOP: the flag is set a second in; every job ends at once with a whole layout, the unstarted steel gets its floor, extra seeds are skipped.
+  {
+    const jobs = [];
+    steels.forEach((g, i) => { for (let r = 0; r < 2; r += 1) jobs.push({ key: i, seed: 1 + r * 7919, round: r, input: shapeJob(g, 1 + r * 7919) }); });
+    const stop = new Int32Array(new SharedArrayBuffer(4));
+    const t0 = Date.now();
+    setTimeout(() => { Atomics.store(stop, 0, 1); }, 1000);
+    const runs = await runAll(jobs, { workers: 1, deadlineAt: t0 + 120_000, stop });
+    const ms = Date.now() - t0;
+    ok(`stop after 1 s of a 2-minute budget: everything is back in ${ms} ms`, ms <= 6000);
+    ok('every steel still has a whole layout (its first seed ran, if only the floor)', [0, 1, 2].every((i) => runs.some((r, k) => jobs[k].key === i && jobs[k].round === 0 && r.ok && !(r.out.unplaced ?? []).length)));
+    ok('the extra seeds not yet started were skipped as stopped, and the pool says it was stopped', runs.some((r) => r.skipped === 'stopped') && runs.stats.stopped === true && runs.stats.skippedStopped > 0, JSON.stringify(runs.stats));
+    ok('a stopped search says so, and that the clock did not let it finish', runs.some((r) => r.ok && r.out.stopped === true && r.out.deterministic === false), JSON.stringify(runs.filter((r) => r.ok).map((r) => [r.out.stopped, r.out.deterministic])));
+  }
+}
+
 /* ─────────────────── 3. planNesting on the real KEPL line ─────────────────── */
 console.log('\n3. planNesting on the KEPL line, one worker, a 20 s budget');
 {

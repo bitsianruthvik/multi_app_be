@@ -27,6 +27,8 @@ import JSZip from 'jszip';
 import { notFound, invalid } from '../lib/errors.js';
 import { drawingFactsOfLine } from './partDrawingService.js';
 import { analyseNest, nestToDxf } from './nestGeometry.js';
+import { ringsObject, placeShape, rotationOfRow, isPlainPlacement } from './nestShapes.js';
+import { rectRings } from '../lib/nestDxfReader.js';
 
 const DEFAULT_MIN_AREA = 90000;
 const DEFAULT_MIN_SIDE = 100;
@@ -70,7 +72,7 @@ async function loadLots(db, companyId, lineId, lotId = null) {
   const ids = lots.map((l) => l.id);
 
   const [placeRows] = await db.query(
-    `SELECT p.plate_lot_id, p.cut_plate_id, p.seq_no, p.row_no, p.pos_no, p.x_mm, p.y_mm, p.length_mm, p.width_mm, p.rotated,
+    `SELECT p.*,
             m.code AS cut_plate_code, m.name AS cut_plate_name
        FROM cf_nest_placements p
        LEFT JOIN cf_master_records m ON m.id = p.cut_plate_id AND m.company_id = p.company_id
@@ -81,9 +83,23 @@ async function loadLots(db, companyId, lineId, lotId = null) {
   const pieces = new Map(ids.map((id) => [id, []]));
   // Part shapes (partDrawingService): a cut plate whose pieces all share one drawing is drawn by it.
   const shapes = await drawingFactsOfLine(db, companyId, lineId);
+  // A rectangle lying at a free angle or flipped (§55) is drawn turned, so its own LENGTH × WIDTH
+  // is needed — one more read, and only when the line has such a piece without a drawing.
+  const freeIds = [...new Set(placeRows.filter((p) => p.x_mm != null && !shapes.get(Number(p.cut_plate_id))?.rings
+    && !isPlainPlacement(rotationOfRow(p), !!Number(p.mirrored ?? 0))).map((p) => Number(p.cut_plate_id)))];
+  const sizes = new Map();
+  if (freeIds.length) {
+    const [vals] = await db.query(
+      `SELECT v.subject_id, UPPER(s.code) AS code, v.value_number
+         FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code IN ('LENGTH', 'WIDTH')
+        WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?)`,
+      [companyId, freeIds],
+    );
+    for (const v of vals) { const e = sizes.get(Number(v.subject_id)) ?? {}; e[v.code === 'LENGTH' ? 'length' : 'width'] = Number(v.value_number); sizes.set(Number(v.subject_id), e); }
+  }
   for (const p of placeRows) {
     pieces.get(p.plate_lot_id)?.push({
-      outline: placedOutline(shapes.get(Number(p.cut_plate_id))?.rings, p),
+      outline: placedOutline(shapes.get(Number(p.cut_plate_id))?.rings, p, sizes.get(Number(p.cut_plate_id))),
       x: p.x_mm == null ? null : Number(p.x_mm),
       y: p.y_mm == null ? null : Number(p.y_mm),
       length: Number(p.length_mm),
@@ -153,8 +169,26 @@ async function offcutThresholds(db, companyId) {
  * sits: as drawn when the footprint runs along its length, else turned a quarter. Null without
  * a layout or a drawing.
  */
-function placedOutline(rings, p) {
-  if (!rings?.length || p.x_mm == null || p.y_mm == null) return null;
+function placedOutline(rings, p, size = null) {
+  if (p.x_mm == null || p.y_mm == null) return null;
+  // A part with no drawing whose outline the customer's file drew (rings_json, 2026-10-10): that
+  // outline, as it is — already in plate mm. A drawing, once uploaded, wins.
+  if (!rings?.length && p.rings_json != null) {
+    let o = p.rings_json;
+    if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
+    if (Array.isArray(o?.outline) && o.outline.length >= 3) return [o.outline, ...(o.cutouts ?? []), ...(o.holes ?? [])];
+  }
+  // §55: a placement that says its turn is put there by THE PLACEMENT CONVENTION — any angle,
+  // either hand. Its shape is the part's drawing, else its own rectangle (drawn turned only when
+  // it does not lie square: a plain rectangle is drawn from x, y, length, width as before).
+  if (p.rotation_deg != null || Number(p.mirrored ?? 0)) {
+    const at = { x: Number(p.x_mm), y: Number(p.y_mm), rotationDeg: rotationOfRow(p), mirrored: !!Number(p.mirrored ?? 0) };
+    const o = ringsObject(rings) ?? (!isPlainPlacement(at.rotationDeg, at.mirrored) && size?.length > 0 && size?.width > 0 ? ringsObject(rectRings(size.length, size.width)) : null);
+    if (!o) return null;
+    const placed = placeShape(o, at);
+    return [placed.outline, ...placed.cutouts, ...placed.holes];
+  }
+  if (!rings?.length) return null;
   const x0 = Number(p.x_mm); const y0 = Number(p.y_mm);
   const ext = rings[0].reduce((m, [x, y]) => [Math.max(m[0], x), Math.max(m[1], y)], [0, 0]);
   const along = Math.abs(Number(p.length_mm) - ext[0]) <= Math.abs(Number(p.length_mm) - ext[1]);

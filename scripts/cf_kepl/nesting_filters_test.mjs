@@ -49,7 +49,9 @@ const section = (s) => console.log(`\n${s}`);
  * The packer stub: shelves, then sequences of rows, obeying the same rules the
  * verifier checks — kerf at the rim and between pieces, sequences 5–8 mm apart.
  * ----------------------------------------------------------------------- */
-function shelfPacker({ pieces, sheets, gap, margin, seqGapMin, guillotine, effort, seed }) {
+function shelfPacker({ pieces, sheets, kerf, gap, margin, seqGapMin, guillotine, effort, seed }) {
+  // As the real packer reads its input: the rim cut (one kerf) is charged by the packer itself, and `margin` is a trim ON TOP of it (0 since 2026-10-10 — one kerf at the plate edge).
+  const rim = (Number(margin) || 0) + (Number(kerf ?? gap) || 0);
   const started = Date.now();
   const rowsPerSeq = 3;                  // the fixture's rectangles are all Big
   const remaining = pieces.map((p) => ({ ...p, left: p.qty }));   // by the row OBJECT, never by its key
@@ -58,19 +60,19 @@ function shelfPacker({ pieces, sheets, gap, margin, seqGapMin, guillotine, effor
   const sheet = sheets[0];
   if (!sheet) return { nests, unplaced: pieces.map((p) => ({ key: p.key, qty: p.qty, reason: 'no sheet' })), areaBought: 0, wasteArea: 0, wastePct: 0, deterministic: true, elapsedMs: 0, sizeAdvice: [] };
 
-  const fits = (p) => (p.length <= sheet.length - 2 * margin && p.width <= sheet.width - 2 * margin);
+  const fits = (p) => (p.length <= sheet.length - 2 * rim && p.width <= sheet.width - 2 * rim);
   for (const p of remaining) if (!fits(p)) { unplaced.push({ key: p.key, qty: p.left, reason: `${p.length} × ${p.width} does not fit ${sheet.length} × ${sheet.width}` }); p.left = 0; }
 
   while (remaining.some((p) => p.left > 0)) {
     const placed = [];
-    let y = margin;
+    let y = rim;
     let rowIndex = 0;
     while (remaining.some((p) => p.left > 0)) {
       const row = [];
-      let x = margin;
+      let x = rim;
       let rowHeight = 0;
       for (const p of remaining) {
-        while (p.left > 0 && x + p.length <= sheet.length - margin && y + p.width <= sheet.width - margin) {
+        while (p.left > 0 && x + p.length <= sheet.length - rim && y + p.width <= sheet.width - rim) {
           row.push({ key: p.key, x, y, length: p.length, width: p.width, rotated: false });
           x += p.length + gap;
           rowHeight = Math.max(rowHeight, p.width);

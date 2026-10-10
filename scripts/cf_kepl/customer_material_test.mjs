@@ -80,7 +80,9 @@ async function expectRefusal(label, fn, re) {
 }
 
 /** One piece per plate, plates taken in the order given, each only as often as it is available. */
-function onePerPlate({ pieces, sheets, margin }) {
+function onePerPlate({ pieces, sheets, margin: trim, kerf, gap }) {
+  // As the real packer: one kerf is cut off each edge by the packer itself; `margin` is a trim on top (0 since 2026-10-10).
+  const margin = (Number(trim) || 0) + (Number(kerf ?? gap) || 0);
   const left = sheets.map((s) => ({ ...s, left: s.available == null ? Infinity : s.available }));
   const nests = [];
   const unplaced = [];

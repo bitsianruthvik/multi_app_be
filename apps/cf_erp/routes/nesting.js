@@ -6,7 +6,10 @@
  *   POST /orders/:orderId/lines/:lineId/nesting/accept   { groups | nests } — write it (and forget the line's finished run)
  *   POST   /orders/:orderId/lines/:lineId/nesting/runs          { as /plan } — start a BACKGROUND run (or get the one running)
  *   GET    /orders/:orderId/lines/:lineId/nesting/runs/current  ?plan=1 — status, progress, log; the proposal once done
- *   DELETE /orders/:orderId/lines/:lineId/nesting/runs/current  dismiss a finished run (services/nestRunService.js)
+ *   DELETE /orders/:orderId/lines/:lineId/nesting/runs/current  dismiss a finished run; CANCEL one still working (services/nestRunService.js)
+ *   POST   /orders/:orderId/lines/:lineId/nesting/runs/current/stop  "stop and use this": finish now with the best layout so far
+ *   POST   /orders/:orderId/lines/:lineId/nesting/compare/stop       the same, for the automatic side of a comparison
+ *   DELETE /orders/:orderId/lines/:lineId/nesting/compare            cancel a comparison that is still working
  *   GET  /orders/:orderId/lines/:lineId/nesting/choices  the pieces (Step A) and plates (Step B) a run considers
  *   PUT  /orders/:orderId/lines/:lineId/nesting/choices  { excludedCutPlateIds, excludedPlateIds } — the whole
  *                                                        selection (both empty = reset); applied by every run
@@ -14,6 +17,14 @@
  *                                                        (§44; a line never set uses 'any')
  *   GET  /orders/:orderId/lines/:lineId/nesting/sheet    the nests as a workbook (Nests / Needed / How to use this)
  *   POST /orders/:orderId/lines/:lineId/nesting/sheet    { file, filename, dryRun, force } — preview, or save
+ *   GET    /orders/:orderId/lines/:lineId/nesting/files          the plates saved, the files they came from, what is left over
+ *   POST   /orders/:orderId/lines/:lineId/nesting/files          { files: [{ filename, file }], dryRun, force, mode, remove, choices }
+ *                                                                the CUSTOMER'S nesting, one DXF per plate, copied as drawn (§55)
+ *   GET    /orders/:orderId/lines/:lineId/nesting/files/:lotId   the file one plate was read from
+ *   DELETE /orders/:orderId/lines/:lineId/nesting/lots/:lotId    one plate off the line
+ *   GET    /orders/:orderId/lines/:lineId/nesting/compare        the uploaded nesting beside our automatic one (?with=auto)
+ *   POST   /orders/:orderId/lines/:lineId/nesting/compare        { run: true, effort? } — start the automatic side when none answers this demand
+ *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
  *
@@ -49,7 +60,11 @@ import {
 // nestingService is long enough already.
 import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 // A run that outlives the page (2026-10-03): the job, its progress and its proposal, in memory.
-import { startRun, currentRun, dismissRun } from '../services/nestRunService.js';
+import { startRun, readRun, dismissRun, stopRunAnywhere, cancelRun } from '../services/nestRunService.js';
+// The customer's nesting files (init.sql §55): one DXF per plate, stored exactly as drawn.
+import { uploadNestFiles, getNestFiles, nestFileOf, deleteNestLot } from '../services/nestDxfImportService.js';
+// The uploaded nesting beside our automatic one, and taking one of them.
+import { getCompare, startCompare, acceptCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
 // Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
@@ -81,13 +96,19 @@ router.get('/orders/:orderId/lines/:lineId/nesting', view,
 // A proposal. It runs the packer and writes nothing, so it needs only the read
 // grant — but it is a POST because it is an action with a cost, not a page.
 router.post('/orders/:orderId/lines/:lineId/nesting/plan', view,
-  handle((req) => read(req, (db, companyId, id) => planNesting(db, companyId, id, req.body ?? {}))));
+  handle((req) => read(req, (db, companyId, id) => {
+    // A plan made INSIDE the request: the short synchronous budget, whatever the body says (the
+    // 5 / 10 / 20 minute budgets belong to background runs — POST …/nesting/runs).
+    const { background, control, budgetMs, workers, pack, onProgress, onDemand, resume, onCheckpoint, checkpointMs, ...body } = req.body ?? {};
+    void background; void control; void budgetMs; void workers; void pack; void onProgress; void onDemand; void resume; void onCheckpoint; void checkpointMs;
+    return planNesting(db, companyId, id, body);
+  })));
 
 router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
   handle(async (req) => {
     const out = await write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}));
     // The proposal is now the saved plan: the finished run has done its job.
-    dismissRun(ctx(req).companyId, lineId(req));
+    await dismissRun(ctx(req).companyId, lineId(req), { accepted: true });
     return out;
   }));
 
@@ -95,10 +116,14 @@ router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
 // leaving the page does not lose it. Read grant, like /plan: it writes nothing.
 router.post('/orders/:orderId/lines/:lineId/nesting/runs', view,
   handle((req) => read(req, (db, companyId, id) => startRun(companyId, { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null }, id, req.body ?? {}))));
+// readRun: the run in memory, else — after a restart — the finished one the database kept.
 router.get('/orders/:orderId/lines/:lineId/nesting/runs/current', view,
-  handle((req) => read(req, (db, companyId, id) => currentRun(companyId, id, { withPlan: String(req.query.plan ?? '') === '1' }))));
+  handle((req) => read(req, (db, companyId, id) => readRun(companyId, id, { withPlan: String(req.query.plan ?? '') === '1' }))));
 router.delete('/orders/:orderId/lines/:lineId/nesting/runs/current', view,
   handle((req) => read(req, (db, companyId, id) => dismissRun(companyId, id))));
+// STOP AND USE THIS: the run finishes now with the best layout it has (a proposal like any other).
+router.post('/orders/:orderId/lines/:lineId/nesting/runs/current/stop', view,
+  handle((req) => read(req, (db, companyId, id) => stopRunAnywhere(companyId, id, { purpose: 'nest' }))));
 
 // THE NESTING CHOICES (init.sql §40): what a run leaves out. Reading them is a
 // look; saving them is part of the order's structure work, so it needs manage.
@@ -150,6 +175,37 @@ router.get('/orders/:orderId/lines/:lineId/drawings/:drawingId/file', view, hand
 }));
 router.delete('/orders/:orderId/lines/:lineId/drawings/:drawingId', manage,
   handle((req) => write(req, (db, c, id) => deleteDrawing(db, c, null, id, intParam(req.params.drawingId, 'drawingId')))));
+
+// THE CUSTOMER'S NESTING FILES (§55). One DXF per plate, many in one request, base64 in the JSON
+// body like the sheet. dryRun is the DEFAULT: the answer is what would happen — every file read,
+// matched, checked, and the difference against what is saved — and nothing is written.
+router.get('/orders/:orderId/lines/:lineId/nesting/files', view,
+  handle((req) => read(req, (db, companyId, id) => getNestFiles(db, companyId, id))));
+router.post('/orders/:orderId/lines/:lineId/nesting/files', manage,
+  handle((req) => write(req, (db, c, id) => uploadNestFiles(db, c, id, req.body ?? {}))));
+router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(async (req, res) => {
+  const out = await read(req, (db, companyId, id) => nestFileOf(db, companyId, id, intParam(req.params.lotId, 'lotId')));
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.send(out.buffer);
+}));
+router.delete('/orders/:orderId/lines/:lineId/nesting/lots/:lotId', manage,
+  handle((req) => write(req, (db, c, id) => deleteNestLot(db, c, id, intParam(req.params.lotId, 'lotId')))));
+
+// COMPARE the uploaded nesting with our automatic one, side by side. The GET never packs: it pulls
+// up the automatic run that already answers this demand, or says there is none (or that it is
+// stale). The POST starts that run in the background and returns its id to poll here.
+router.get('/orders/:orderId/lines/:lineId/nesting/compare', view,
+  handle((req) => read(req, (db, companyId, id) => getCompare(db, companyId, id, { with: req.query.with, detail: String(req.query.detail ?? '') === '1' }))));
+router.post('/orders/:orderId/lines/:lineId/nesting/compare', view,
+  handle((req) => read(req, (db, companyId, id) => startCompare(db, { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null }, id, req.body ?? {}))));
+router.post('/orders/:orderId/lines/:lineId/nesting/compare/stop', view,
+  handle((req) => read(req, (db, companyId, id) => stopRunAnywhere(companyId, id, { purpose: 'compare' }))));
+router.delete('/orders/:orderId/lines/:lineId/nesting/compare', view,
+  handle((req) => read(req, (db, companyId, id) => cancelRun(companyId, id, { purpose: 'compare' }))));
+router.post('/orders/:orderId/lines/:lineId/nesting/compare/accept', manage,
+  handle((req) => write(req, (db, c, id) => acceptCompare(db, c, id, req.body ?? {}))));
 
 /** A file out: the buffer, its type, and a download name. */
 const sendFile = (res, out, type) => {
