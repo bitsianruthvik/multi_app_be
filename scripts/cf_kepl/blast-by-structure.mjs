@@ -6,7 +6,9 @@
  *   Girder segment (big)   1 coat 20, 2 coats 35, 3 coats 45   (the sheet's 20 + 15 + 10 per pass)
  *   every small structure  10, whatever the coats              (Plate part, Profile part, Diaphragm,
  *                                                               Bottom Lateral Bracings, Seismic Stoppers)
- * and the BLAST time adds the 15–20 min of manual blasting only on a girder segment.
+ * BLAST_MANUAL_TIME (new, same machine type) is the 15–20 min of manual blasting afterwards, by
+ * Structure: Girder segment 17.5, every small structure 0 — a chart, not an IF (user, same day).
+ * The time is machine.BLAST_TIME + machine.BLAST_MANUAL_TIME.
  *
  *   node scripts/cf_kepl/blast-by-structure.mjs --company 30005            (dry run: rolled back)
  *   node scripts/cf_kepl/blast-by-structure.mjs --company 30005 --apply    (commits)
@@ -17,7 +19,7 @@ const APPLY = process.argv.includes('--apply');
 if (!Number.isInteger(COMPANY)) throw new Error('Usage: --company <id> [--apply]');
 
 const { pool } = await import('../../db.js');
-const { updateChart, setChartValue, listCharts } = await import('../../apps/cf_erp/services/chartService.js');
+const { updateChart, setChartValue, listCharts, createChart } = await import('../../apps/cf_erp/services/chartService.js');
 const { updateTimingRule, listTimingRules } = await import('../../apps/cf_erp/services/operationService.js');
 
 const BIG = 'Girder segment';
@@ -44,7 +46,12 @@ try {
 
   const [[op]] = await db.query("SELECT id FROM cf_operations WHERE company_id = ? AND code = 'BLAST' AND deleted_at IS NULL", [COMPANY]);
   const rule = (await listTimingRules(db, COMPANY, op.id))[0];
-  await updateTimingRule(db, c, rule.id, { workExpression: `machine.BLAST_TIME + IF(item.variant = "${BIG}", 17.5, 0)` });
+  const manualRows = [[BIG, 17.5], ...small.map((n) => [n, 0])];
+  const [[manual]] = await db.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'BLAST_MANUAL_TIME' AND data_type = 'table' AND deleted_at IS NULL", [COMPANY]);
+  if (manual) await setChartValue(db, c, { type: 'classification', id: type.id }, manual.id, manualRows);
+  else await createChart(db, c, { type: 'classification', id: type.id }, { name: 'Manual blasting time', code: 'BLAST_MANUAL_TIME', resultUnit: 'min', mode: 'step_up', inputs: [{ level: 'VARIANT' }], rows: manualRows });
+  console.log(`BLAST_MANUAL_TIME: Variant → min, ${manualRows.length} rows (${BIG} 17.5, the rest 0)`);
+  await updateTimingRule(db, c, rule.id, { workExpression: 'machine.BLAST_TIME + machine.BLAST_MANUAL_TIME' });
   const after = (await listTimingRules(db, COMPANY, op.id))[0];
   console.log(`BLAST time: ${after.work.display ?? after.work.expression}`);
   console.log(`   stored:  ${after.work.expression}`);
