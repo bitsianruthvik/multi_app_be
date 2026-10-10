@@ -74,7 +74,7 @@ export const EXPECTED = {
   APPOINTMENT: ['ref_no', 'letter_date', 'salutation', 'candidate_name', 'candidate_phone', 'candidate_address',
     'designation', 'joining_date', 'place_of_posting', 'probation_months_words', 'notice_days_probation_words',
     'notice_days_confirmed_words', 'reporting_to_name', 'jurisdiction', 'company_name', 'signatory_name',
-    'signatory_designation'],
+    'signatory_designation', 'employee_code'],
 };
 
 /** The company's own values, given by the spec — not the candidate's. Stored with --apply. */
@@ -294,8 +294,16 @@ export async function makeTemplate(kind, sourceBuffer) {
   } else {
     sentence(/appoint you as\s+(.+?)\s+governed by/, 'designation', 'the designation in the opening sentence',
       { note: (m) => facts.designations.push(norm(m[1])) });
-    sentence(new RegExp(`effective from\\s+(${DATE_SRC})`), 'joining_date', 'the date of joining',
-      { note: (m) => { facts.joiningDate = norm(m[1]); } });
+    // The source letter prints no employee code. The user asked for the line (2026-10-11): it follows the
+    // joining date in the same paragraph, so the letterhead and every other sentence stay as they are.
+    {
+      const joinRe = new RegExp(`effective from\\s+(${DATE_SRC})`);
+      const i = paragraphs.findIndex((p, k) => joinRe.test(text(k)));
+      must(i >= 0 ? 1 : 0, 'the date of joining');
+      facts.joiningDate = norm(joinRe.exec(text(i))[1]);
+      must(swap(i, joinRe, 'joining_date', '{joining_date}. Your Employee Code is {employee_code}'), 'the date of joining');
+      replaced.employee_code = 1;
+    }
     sentence(/facility at\s+(.+?)\s*\.\s*$/, 'place_of_posting', 'the place of posting');
     sentence(countRe('^\\s*During the probation period.*?providing\\s+'), 'notice_days_probation_words', 'the notice period during probation',
       { note: (m) => { facts.noticeProbation = norm(m[1]); } });
@@ -534,7 +542,7 @@ function inconsistencies(made) {
   if (a.probation && a.noticeProbation && /^[a-z]/.test(a.probation) && /^[A-Z]/.test(a.noticeProbation)) {
     out.push(`Probation is in lower case ("${a.probation}") and the notice periods start with a capital ("${a.noticeProbation}", "${a.noticeConfirmed}"). The templates keep that.`);
   }
-  out.push('Neither letter prints an employee code, so {employee_code} is not in the appointment template.');
+  out.push('Neither source letter prints an employee code. The appointment template adds "Your Employee Code is {employee_code}." after the joining date (asked for by the user, 2026-10-11).');
   return out;
 }
 
