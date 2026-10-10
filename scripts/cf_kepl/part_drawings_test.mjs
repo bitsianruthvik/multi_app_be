@@ -110,9 +110,42 @@ try {
   const back = await deleteDrawing(db, c, line.order_id, LINE, onIt.id);
   ok('deleting the file leaves the register drawing waiting again', back.waiting.some((w) => w.drawing.id === started.drawing.id));
 
+  // Aimed at one row: no mark needed; the name becomes the mark; another mark is kept with a note.
+  const lineRows = await rowsOfLine(db, COMPANY, line);
+  const markless = lineRows.filter((r) => !r.mark && !r.isPlatePart && r.id !== bare.id);
+  const withMark = lineRows.find((r) => r.mark && !r.isPlatePart);
+  ok('the line has markless rows to aim at', markless.length >= 3, String(markless.length));
+  const aimedIds = [];
+  const tgtPdf = (name, rowId) => ({ name, content: pdf0.toString('base64'), rowId });
+  const t1 = await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('Sheet 7.pdf', markless[0].id)], dryRun: true });
+  ok('aimed preview: matched to that row though it has no mark, nothing written', t1.files[0].status === 'new' && t1.files[0].rows.length === 1 && t1.files[0].rows[0].id === markless[0].id && t1.files[0].markSet === true && !t1.saved, JSON.stringify(t1.files[0]).slice(0, 300));
+  const t1s = await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('Sheet 7.pdf', markless[0].id)], dryRun: false });
+  const after1 = (await rowsOfLine(db, COMPANY, line)).find((r) => r.id === markless[0].id);
+  ok('aimed save on a markless row sets its DRAWING_MARK from the file name', t1s.saved && after1.mark === 'Sheet 7' && t1s.view.drawings.some((d) => d.mark === 'Sheet 7' && d.rows.some((r) => r.id === markless[0].id)), JSON.stringify(after1.mark));
+  aimedIds.push(markless[0].id);
+  const odd = await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('other-name.pdf', withMark.id)], dryRun: false });
+  const oddRow = (await rowsOfLine(db, COMPANY, line)).find((r) => r.id === withMark.id);
+  ok('aimed upload on a row with another mark is accepted, mark kept, the answer says the name differs', odd.saved && oddRow.mark === withMark.mark && /differs from this row's drawing mark/.test(odd.files[0].notes.join(' ')) && odd.files[0].status !== 'error', JSON.stringify(odd.files[0]).slice(0, 300));
+  const bad = await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('x.pdf', 999999999)], dryRun: true });
+  ok('aimed at a row that is not on the line: refused in words', bad.files[0].status === 'error' && /not on this line/.test(bad.files[0].problems.join(' ')));
+  // Round trips: the mark write is one lookup + one update + one insert however many rows are aimed at.
+  const sqlLog = []; const q0 = db.query.bind(db); db.query = (...a) => { sqlLog.push(String(a[0])); return q0(...a); };
+  await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('Q1.pdf', markless[1].id)], dryRun: true }); const dry1 = sqlLog.length; sqlLog.length = 0;
+  await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('Q1.pdf', markless[1].id), tgtPdf('Q2.pdf', markless[2].id), tgtPdf('Q3.pdf', markless[3].id)], dryRun: true }); const dry3 = sqlLog.length; sqlLog.length = 0;
+  await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('Q1.pdf', markless[1].id), tgtPdf('Q2.pdf', markless[2].id), tgtPdf('Q3.pdf', markless[3].id)], dryRun: false });
+  const markSql = sqlLog.filter((x) => /specification_id = [?] AND subject_id IN|INSERT INTO `?cf_spec_values|code = 'DRAWING_MARK'/.test(x));
+  db.query = q0;
+  ok(`preview adds one lookup per file at most (1 file: ${dry1} queries, 3 files: ${dry3}); marks for 3 aimed rows are written in 3 statements (${markSql.length})`, dry3 - dry1 <= 2 * 3 && markSql.length === 3, `${dry1} / ${dry3} / ${markSql.map((x) => x.slice(0, 60)).join(' | ')}`);
+  aimedIds.push(...markless.slice(0, 4).map((r) => r.id), withMark.id);
+  // A released line takes no file changes, aimed or not.
+  await db.query('INSERT INTO cf_production_releases (company_id, order_id, order_line_id, item_id, quantity) VALUES (?, ?, ?, ?, 1)', [COMPANY, line.order_id, LINE, line.item_id]);
+  let rel = null; try { await uploadDrawings(db, c, line.order_id, LINE, { files: [tgtPdf('R.pdf', markless[0].id)], dryRun: false }); } catch (e) { rel = e.message; }
+  ok('a released line still refuses an aimed upload', /released to production/.test(rel ?? ''), rel);
+  await db.query('UPDATE cf_production_releases SET deleted_at = NOW() WHERE order_line_id = ? AND deleted_at IS NULL', [LINE]);
+
   // Every level: a segment's PDF and an assembly's general-arrangement DXF (not one outline) are kept, not read.
   const rows = await rowsOfLine(db, COMPANY, line);
-  const marked = rows.filter((r) => !r.isPlatePart && r.mark);
+  const marked = rows.filter((r) => !r.isPlatePart && r.mark && !aimedIds.includes(r.id));
   ok(`rows above the parts carry marks too (${marked.length})`, marked.length >= 2);
   const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n%âãÏÓ\n1 0 obj << >> endobj\n', 'latin1'), Buffer.alloc(64, 7), Buffer.from('\n%%EOF\n')]);
   const ga = dxf([lw([[0, 0], [1000, 0], [1000, 500], [0, 500]]), lw([[2000, 0], [3000, 0], [3000, 500], [2000, 500]])]);
@@ -126,7 +159,7 @@ try {
   ok('an assembly\'s general-arrangement DXF (two outlines) is kept, not refused', lv.files[1].status === 'new' && lv.files[1].problems.length === 0 && lv.files[1].geometry === null, JSON.stringify(lv.files[1]).slice(0, 300));
   ok('a plate part\'s PDF replaces its DXF, saying it has no shape to read', lv.files[2].status === 'replaces' && /no shape to read/.test(lv.files[2].warnings.join(' ')));
   const lvSaved = await uploadDrawings(db, c, line.order_id, LINE, { files: levelUp.slice(0, 2), dryRun: false });
-  const segDrawing = lvSaved.view.drawings.find((d) => d.fileKind === 'pdf');
+  const segDrawing = lvSaved.view.drawings.find((d) => d.fileKind === 'pdf' && d.mark === marked[0].mark);
   ok('saved on every level: the summary counts rows, not just parts', lvSaved.view.summary.rowsWithDrawing >= same.length + 2 && segDrawing?.levels.includes(marked[0].level), JSON.stringify(lvSaved.view.summary));
   const got = await drawingFile(db, COMPANY, line.order_id, LINE, segDrawing.id);
   ok('the PDF downloads exactly as uploaded', got.contentType === 'application/pdf' && got.buffer.equals(pdf) && /\.PDF$/i.test(got.filename));

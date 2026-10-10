@@ -290,7 +290,10 @@ export async function startDrawing(db, c, orderId, lineId, input = {}) {
 const decode = (content) => Buffer.from(String(content ?? '').replace(/^data:[^,]*,/, ''), 'base64');
 
 /**
- * input: { files: [{ name, content (base64) }], dryRun }. Each file: matched by mark, and for a
+ * input: { files: [{ name, content (base64), rowId?, drawingId? }], dryRun }. A file with a rowId is AIMED at
+ * that row (a master record id of the line): no mark needed — a markless row takes the file name as its
+ * DRAWING_MARK (written on save), a row with another mark keeps it and the answer says so (`notes`).
+ * Each file: matched by mark, and for a
  * plate part a DXF read as its shape. status new | replaces | unmatched | error. A non-dry run
  * saves the new and replacing ones and refreshes the line's cut plates' cut length and piercings.
  */
@@ -304,6 +307,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   const rows = await rowsOfLine(db, companyId, line);
   const byMark = new Map();
   for (const p of rows) if (p.markNorm) { if (!byMark.has(p.markNorm)) byMark.set(p.markNorm, []); byMark.get(p.markNorm).push(p); }
+  const rowById = new Map(rows.map((p) => [p.id, p]));
   const live = await liveDrawings(db, companyId, line.id);
   const existing = new Map(live.map((d) => [d.mark_norm, d]));
   const fileOfDrawing = new Map(live.filter((d) => d.drawing_id != null).map((d) => [Number(d.drawing_id), d]));
@@ -331,8 +335,20 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
         mark = marks.length === 1 ? marks[0] : String(d.number);
       }
     }
+    // Aimed at one row by hand: the row's own mark, else the file's name becomes it.
+    const aimed = f?.rowId != null && f.rowId !== '' ? Number(f.rowId) : null;
+    const tRow = aimed != null ? rowById.get(aimed) ?? null : null;
+    const notes = [];
+    let markFromName = false;
+    if (aimed != null && !tRow) targetProblem = targetProblem ?? 'That row is not on this line.';
+    else if (tRow && !target) {
+      if (tRow.mark) {
+        if (normMark(name) !== tRow.markNorm) notes.push(`The file name ${name} differs from this row's drawing mark ${tRow.mark} — the file is kept for the row, nothing is renamed.`);
+        mark = tRow.mark;
+      } else markFromName = true;
+    }
     const markNorm = normMark(mark);
-    const entry = { name, mark, fileKind: kind, status: 'error', rows: [], geometry: null, problems: [], warnings: [], register: null, _save: null };
+    const entry = { name, mark, fileKind: kind, status: 'error', rows: [], geometry: null, problems: [], warnings: [], notes, targetRowId: tRow?.id ?? null, markSet: false, register: null, _save: null };
     out.push(entry);
     if (targetProblem) { entry.problems.push(targetProblem); continue; }
     if (!kind) { entry.problems.push('Only DXF and PDF drawings are taken.'); continue; }
@@ -347,7 +363,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     // one waiting (no file yet) on a row with its mark.
     if (!target && existing.get(markNorm)?.drawing_id != null) target = await liveRevisionOf(db, companyId, existing.get(markNorm).drawing_id);
     if (!target) {
-      const waitingIds = [...new Set((byMark.get(markNorm) ?? []).flatMap((p) => p.drawingIds))].filter((id) => !fileOfDrawing.has(id));
+      const waitingIds = [...new Set([...(byMark.get(markNorm) ?? []), ...(tRow ? [tRow] : [])].flatMap((p) => p.drawingIds))].filter((id) => !fileOfDrawing.has(id));
       if (waitingIds.length) {
         const [cands] = await db.query("SELECT * FROM cf_drawings WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL AND status IN ('draft', 'issued') ORDER BY id", [companyId, waitingIds]);
         target = cands.find((d) => normMark(String(d.number).split('/').pop()) === markNorm) ?? cands[0] ?? null;
@@ -355,7 +371,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     }
     if (target && seenDrawing.has(Number(target.id))) { entry.problems.push(`Another file in this upload goes on the same drawing (${target.number}).`); continue; }
     if (target) seenDrawing.add(Number(target.id));
-    const matched = rows.filter((p) => (p.markNorm && p.markNorm === markNorm) || (target && p.drawingIds.includes(Number(target.id))));
+    const matched = rows.filter((p) => (tRow && p.id === tRow.id) || (p.markNorm && p.markNorm === markNorm) || (target && p.drawingIds.includes(Number(target.id))));
     const plate = matched.filter((p) => p.isPlatePart);
     entry.rows = matched.map((p) => rowView(p, null));
     let g = null;
@@ -383,6 +399,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     }
     if (!matched.length) { entry.status = 'unmatched'; entry.warnings.push(`No row on this line has drawing mark ${mark}.`); continue; }
     const hadFile = target ? fileOfDrawing.has(Number(target.id)) : false;
+    entry.markSet = markFromName;
     entry.status = existing.has(markNorm) || hadFile ? 'replaces' : 'new';
     const action = !target ? 'create' : hadFile ? (target.status === 'issued' ? 'revise' : 'replace') : 'attach';
     const number = target ? target.number : await freeNumber(db, companyId, line, mark, taken);
@@ -392,7 +409,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
       fromRevision: action === 'revise' ? target.revision : null,
     };
     entry._save = {
-      mark, markNorm, name, kind, g: plate.length ? g : null, warnings: entry.warnings, body: kind === 'dxf' ? text : buf.toString('base64'),
+      markRowId: markFromName ? tRow.id : null, mark, markNorm, name, kind, g: plate.length ? g : null, warnings: entry.warnings, body: kind === 'dxf' ? text : buf.toString('base64'),
       action, target, number, title: matched[0]?.name ?? null, rowIds: matched.map((p) => p.id),
       replaces: [existing.get(markNorm)?.id, target ? fileOfDrawing.get(Number(target.id))?.id : null].filter(Boolean),
     };
@@ -401,6 +418,15 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   let view = null;
   if (!dryRun && toSave.length) {
     const replaced = [...new Set(toSave.flatMap((e) => e._save.replaces))];
+    // Rows aimed at with a file but no mark yet take the file's name as their DRAWING_MARK: one lookup, one insert.
+    const marked = toSave.map((e) => e._save).filter((s) => s.markRowId != null);
+    if (marked.length) {
+      const [[spec]] = await db.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'DRAWING_MARK' AND deleted_at IS NULL", [companyId]);
+      if (spec) {
+        await db.query("UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND subject_type = 'master' AND specification_id = ? AND subject_id IN (?) AND deleted_at IS NULL", [companyId, spec.id, marked.map((s) => s.markRowId)]);
+        await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_text', 'source'], marked.map((s) => [companyId, spec.id, 'master', s.markRowId, s.mark.slice(0, 120), 'entered']));
+      }
+    }
     // The replaced files keep their drawing_id: an issued revision's file stays downloadable from it.
     if (replaced.length) await db.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, replaced]);
     for (const { _save: s } of toSave) {
