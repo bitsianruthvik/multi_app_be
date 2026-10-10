@@ -30,14 +30,21 @@
  * derived here from the file's own entries, not from anything the importer
  * computed. Only the path rule and the raw read are shared, as for the chart.
  *
+ * THE KRA FILE is the third part of the source. The chart holds tasks, not
+ * outcome areas; `<chart>.kras.json` says which KRA each responsibility and KPI
+ * of a role sits under. Section 11 re-derives that grouping from chart + file
+ * the other way round from the importer (role by role from the chart's own
+ * lines, asking the file where each one goes) and compares it with the rows.
+ *
  *   node verify-against-source.mjs --company=karni [--target=prod] [--source=<path>]
  *                                  [--adjustments=<path> | --no-adjustments]
+ *                                  [--kras=<path> | --no-kras]
  *
  * Read-only. Exits 1 on any mismatch.
  */
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
-import { resolveSource, readSeed, resolveAdjustments, readAdjustments } from './orgChartSource.mjs';
+import { resolveSource, readSeed, resolveAdjustments, readAdjustments, resolveKras, readKras } from './orgChartSource.mjs';
 
 const TARGET = resolveTarget();
 const args = process.argv.slice(2);
@@ -87,6 +94,9 @@ async function main() {
   const adjFile = readAdjustments(resolveAdjustments(source));
   const adjEntries = adjFile?.entries ?? [];
   console.log(`  adjustments: ${adjFile ? `${adjFile.file}\n          ${adjEntries.length} entries, sha256 ${adjFile.hash.slice(0, 12)}…` : '(none — the chart alone)'}\n`);
+
+  const kraFile = readKras(resolveKras(source));
+  console.log(`  kras: ${kraFile ? `${kraFile.file}\n          ${kraFile.roles.length} roles, sha256 ${kraFile.hash.slice(0, 12)}…` : '(none — every line is expected ungrouped)'}\n`);
 
   const nodes = seed.positions;
   const byId = new Map(nodes.map((p) => [p.id, p]));
@@ -148,6 +158,9 @@ async function main() {
   check('the committed run used this exact adjustments file (or none, if there is none)',
     (runCounts.adjustmentsHash ?? null) === (adjFile?.hash ?? null),
     `the run recorded ${runCounts.adjustmentsHash ? `${runCounts.adjustmentsFile} sha256 ${String(runCounts.adjustmentsHash).slice(0, 12)}…` : 'no adjustments'}; this run reads ${adjFile ? `${adjFile.fileName} sha256 ${adjFile.hash.slice(0, 12)}…` : 'none'}`);
+  check('the committed run used this exact KRA file (or none, if there is none)',
+    (runCounts.krasHash ?? null) === (kraFile?.hash ?? null),
+    `the run recorded ${runCounts.krasHash ? `${runCounts.krasFile} sha256 ${String(runCounts.krasHash).slice(0, 12)}…` : 'no KRA file'}; this run reads ${kraFile ? `${kraFile.fileName} sha256 ${kraFile.hash.slice(0, 12)}…` : 'none'}`);
   // The entries, by kind, read straight from the file.
   const splitNames = new Map(adjEntries.filter((a) => a.kind === 'split').map((a) => [a.node, a.into.map(norm)]));
   const decidedShared = adjEntries.filter((a) => a.kind === 'shared');
@@ -772,8 +785,138 @@ async function main() {
     + lostTargets.slice(0, 4).map((d) => `${d.nodeId} "${d.target}"`).join(' | '));
 
   // ---- 11. The rule that must never bend: kras are NOT KRAs ---------------
-  const [[kraCount]] = await conn.query('SELECT COUNT(*) n FROM hrms_kra_definitions WHERE company_id=? AND deleted_at IS NULL', [c]);
-  check('no KRA was invented from a task statement', Number(kraCount.n) === 0, `${kraCount.n} KRA definitions exist`);
+  // A KRA never comes from the chart: it comes from the KRA file, and with no
+  // file there are none. What must still never happen is a task statement
+  // promoted to a KRA, so no KRA may carry a responsibility's text.
+  //
+  // THE EXPECTATION, derived role by role from the CHART's lines: for each
+  // role, take the lines its seats carry, find the role's entry in the file (by
+  // the role's title, else by its exact seats), and ask the file which KRA each
+  // line sits under. A line the file does not place is expected UNGROUPED; a
+  // KRA none of whose lines this role still has is expected ABSENT. The
+  // importer goes the other way (file -> assignments), so a mistake in either
+  // walk shows as a difference here.
+  const kraEntries = kraFile?.roles ?? [];
+  const seatKey = (ids) => [...new Set(ids)].sort().join(',');
+  const entryByTitle = new Map(kraEntries.map((e) => [normKey(e.role), e]));
+  const entryBySeats = new Map(kraEntries.filter((e) => Array.isArray(e.seats) && e.seats.length).map((e) => [seatKey(e.seats), e]));
+  const expectedPlace = [];                   // role|kind|line|kra  (kra '' = ungrouped)
+  const expectedKraOrder = new Map();         // roleKey -> [kraKey…] in the file's order
+  const kraSpellings = new Map();             // kraKey -> Set of spellings the file uses
+  const usedEntries = new Set();
+  let expectedUngrouped = 0, expectedGrouped = 0, staleLines = 0;
+  for (const [roleKey, ps] of seatsByRole) {
+    const chartLines = new Set();
+    for (const p of ps) {
+      for (const raw of (p.kras || [])) { const t = normKey(raw); if (t) chartLines.add(`R|${t}`); }
+      for (const k of (p.kpis || [])) { const t = normKey(k?.k); if (t) chartLines.add(`K|${t}`); }
+    }
+    const entry = entryByTitle.get(roleKey) ?? entryBySeats.get(seatKey(ps.map((p) => p.id))) ?? null;
+    if (entry) usedEntries.add(entry);
+    const where = new Map();
+    const order = [];
+    for (const k of (entry?.kras ?? [])) {
+      const kk = normKey(k?.name);
+      if (!kk) continue;
+      let holds = false;
+      for (const [kind, list] of [['R', k.responsibilities], ['K', k.kpis]]) {
+        for (const raw of (Array.isArray(list) ? list : [])) {
+          const line = `${kind}|${normKey(raw)}`;
+          if (!chartLines.has(line)) { staleLines++; continue; }
+          if (!where.has(line)) { where.set(line, kk); holds = true; }
+        }
+      }
+      if (holds) {
+        order.push(kk);
+        if (!kraSpellings.has(kk)) kraSpellings.set(kk, new Set());
+        kraSpellings.get(kk).add(clip(norm(k.name), 200));
+      }
+    }
+    if (order.length) expectedKraOrder.set(roleKey, order);
+    for (const line of chartLines) {
+      const kk = where.get(line) ?? '';
+      if (kk) expectedGrouped++; else expectedUngrouped++;
+      expectedPlace.push(`${roleKey}|${line}|${kk}`);
+    }
+  }
+  const staleRoles = kraEntries.filter((e) => !usedEntries.has(e));
+
+  const placeRows = await q(
+    `SELECT 'R' AS kind, r.title AS role_title, d.description AS line, a.role_id, a.role_kra_assignment_id AS kra_ref,
+            ka.id AS kra_asg_id, ka.role_id AS kra_role_id, kd.name AS kra_name
+       FROM hrms_role_responsibility_assignments a
+       JOIN hrms_roles r ON r.company_id=a.company_id AND r.id=a.role_id
+       JOIN hrms_responsibility_definitions d ON d.company_id=a.company_id AND d.id=a.responsibility_definition_id
+       LEFT JOIN hrms_role_kra_assignments ka ON ka.company_id=a.company_id AND ka.id=a.role_kra_assignment_id AND ka.deleted_at IS NULL
+       LEFT JOIN hrms_kra_definitions kd ON kd.company_id=ka.company_id AND kd.id=ka.kra_definition_id AND kd.deleted_at IS NULL
+      WHERE a.company_id=? AND a.deleted_at IS NULL
+     UNION ALL
+     SELECT 'K', r.title, d.name, a.role_id, a.role_kra_assignment_id, ka.id, ka.role_id, kd.name
+       FROM hrms_role_kpi_assignments a
+       JOIN hrms_roles r ON r.company_id=a.company_id AND r.id=a.role_id
+       JOIN hrms_kpi_definitions d ON d.company_id=a.company_id AND d.id=a.kpi_definition_id
+       LEFT JOIN hrms_role_kra_assignments ka ON ka.company_id=a.company_id AND ka.id=a.role_kra_assignment_id AND ka.deleted_at IS NULL
+       LEFT JOIN hrms_kra_definitions kd ON kd.company_id=ka.company_id AND kd.id=ka.kra_definition_id AND kd.deleted_at IS NULL
+      WHERE a.company_id=? AND a.deleted_at IS NULL`, [c, c]);
+  const showPlace = (k) => { const [role, kind, line, kra] = k.split('|'); return `${role} / ${kind === 'R' ? 'responsibility' : 'KPI'} "${clip(line, 40)}" -> ${kra ? `"${kra}"` : 'ungrouped'}`; };
+  same('every responsibility and KPI sits under the KRA the file says, and an unplaced one under none',
+    expectedPlace, placeRows.map((r) => `${normKey(r.role_title)}|${r.kind}|${normKey(r.line)}|${r.kra_name ? normKey(r.kra_name) : ''}`), showPlace);
+  const foreign = placeRows.filter((r) => r.kra_asg_id != null && Number(r.kra_role_id) !== Number(r.role_id));
+  check('no line sits under a KRA of another role', foreign.length === 0,
+    `${foreign.length}: ` + foreign.slice(0, 4).map((r) => `${r.role_title} / "${clip(r.line, 40)}" -> "${r.kra_name}" of role #${r.kra_role_id}`).join(' | '));
+  const dangling = placeRows.filter((r) => r.kra_ref != null && (r.kra_asg_id == null || r.kra_name == null));
+  check('no line points at a KRA row that is not there', dangling.length === 0,
+    `${dangling.length}: ` + dangling.slice(0, 4).map((r) => `${r.role_title} / "${clip(r.line, 40)}" -> #${r.kra_ref}`).join(' | '));
+  const dbUngrouped = placeRows.filter((r) => r.kra_ref == null).length;
+  check('the ungrouped lines are exactly the ones the file leaves out', dbUngrouped === expectedUngrouped,
+    `db holds ${dbUngrouped} ungrouped lines, chart + file imply ${expectedUngrouped}`);
+
+  const kraAsgRows = await q(
+    `SELECT ka.id, ka.role_id, r.title AS role_title, kd.name AS kra_name, ka.sequence, ka.effective_from, ka.is_mandatory,
+            (SELECT COUNT(*) FROM hrms_role_responsibility_assignments x WHERE x.company_id=ka.company_id AND x.role_kra_assignment_id=ka.id AND x.deleted_at IS NULL)
+          + (SELECT COUNT(*) FROM hrms_role_kpi_assignments y WHERE y.company_id=ka.company_id AND y.role_kra_assignment_id=ka.id AND y.deleted_at IS NULL) AS line_count
+       FROM hrms_role_kra_assignments ka
+       JOIN hrms_roles r ON r.company_id=ka.company_id AND r.id=ka.role_id
+       JOIN hrms_kra_definitions kd ON kd.company_id=ka.company_id AND kd.id=ka.kra_definition_id
+      WHERE ka.company_id=? AND ka.deleted_at IS NULL
+      ORDER BY ka.role_id, ka.sequence, ka.id`, [c]);
+  same('each role holds exactly the KRAs the file gives it, and no others',
+    [...expectedKraOrder].flatMap(([roleKey, ks]) => ks.map((k) => `${roleKey}|${k}`)),
+    kraAsgRows.map((r) => `${normKey(r.role_title)}|${normKey(r.kra_name)}`),
+    (k) => `${k.split('|')[0]} / "${k.split('|')[1]}"`);
+  const dbOrder = new Map();
+  for (const r of kraAsgRows) { const k = normKey(r.role_title); if (!dbOrder.has(k)) dbOrder.set(k, []); dbOrder.get(k).push(r); }
+  const orderBad = [];
+  for (const [roleKey, rows] of dbOrder) {
+    const want = expectedKraOrder.get(roleKey) ?? [];
+    const got = rows.map((r) => normKey(r.kra_name));
+    // Ties would make the order whatever the database felt like, so each KRA
+    // of a role has to carry its own place: 1, 2, 3 … in the file's order.
+    const seqOk = rows.every((r, i) => Number(r.sequence) === i + 1);
+    if (!seqOk || got.join('|') !== want.join('|')) orderBad.push(`${rows[0].role_title}: db [${rows.map((r) => `${r.sequence}:${r.kra_name}`).join(', ')}] vs file [${want.join(', ')}]`);
+  }
+  check('a role\'s KRAs are in the file\'s order, numbered 1, 2, 3 …', orderBad.length === 0, orderBad.slice(0, 3).map((x) => clip(x, 300)).join(' | '));
+  const emptyKras = kraAsgRows.filter((r) => Number(r.line_count) === 0);
+  check('no KRA has zero lines under it', emptyKras.length === 0,
+    `${emptyKras.length}: ` + emptyKras.slice(0, 5).map((r) => `${r.role_title} / "${r.kra_name}"`).join(' | '));
+  check('every KRA is mandatory and in force from the chart date',
+    kraAsgRows.every((r) => Number(r.is_mandatory) === 1 && ymd(r.effective_from) === chartDate),
+    `${kraAsgRows.filter((r) => Number(r.is_mandatory) !== 1 || ymd(r.effective_from) !== chartDate).length} differ`);
+  const contentRoles = new Set([...seatsByRole].filter(([, ps]) => ps.some((p) => (p.kras || []).some((x) => normKey(x)) || (p.kpis || []).some((k) => normKey(k?.k)))).map(([k]) => k));
+  const krasOnEmpty = [...dbOrder.keys()].filter((k) => !contentRoles.has(k));
+  check('a role with no duties and no KPIs has no KRA', krasOnEmpty.length === 0, krasOnEmpty.slice(0, 5).join(', '));
+
+  const kraDefRows = await q('SELECT id, name FROM hrms_kra_definitions WHERE company_id=? AND deleted_at IS NULL', [c]);
+  same('one KRA definition per KRA name in use, and no others (none at all without a KRA file)',
+    [...kraSpellings.keys()], kraDefRows.map((r) => normKey(r.name)), (k) => `"${k}"`);
+  const spellBad = kraDefRows.filter((r) => kraSpellings.has(normKey(r.name)) && !kraSpellings.get(normKey(r.name)).has(r.name));
+  check('a KRA name is spelled the way the file spells it', spellBad.length === 0,
+    spellBad.slice(0, 4).map((r) => `db "${r.name}" vs file ${[...kraSpellings.get(normKey(r.name))].map((x) => `"${x}"`).join(' / ')}`).join(' | '));
+  const kraIsTask = kraDefRows.filter((r) => srcRespTexts.has(normKey(r.name)));
+  check('no KRA was invented from a task statement', kraIsTask.length === 0,
+    `${kraIsTask.length} KRA definitions carry a responsibility's text: ${kraIsTask.slice(0, 3).map((r) => `"${clip(r.name, 50)}"`).join(' | ')}`);
+  console.log(`    note KRAs: ${kraAsgRows.length} on ${dbOrder.size} roles; ${expectedGrouped} lines expected grouped, ${expectedUngrouped} ungrouped (need a KRA); `
+    + `the file holds ${staleLines} line(s) and ${staleRoles.length} role(s) this chart no longer has${staleRoles.length ? ` (${staleRoles.slice(0, 4).map((e) => `"${norm(e.role)}"`).join(', ')})` : ''} — stale, not a fault`);
   const [[qualCount]] = await conn.query('SELECT COUNT(*) n FROM hrms_qualification_definitions WHERE company_id=? AND deleted_at IS NULL', [c]);
   check('no qualification was invented (the source has none)',
     Number(qualCount.n) === nodes.reduce((a, p) => a + (p.quals || []).length, 0),
@@ -938,6 +1081,7 @@ async function main() {
     ['department', 'SELECT code k FROM hrms_departments WHERE company_id=? AND deleted_at IS NULL'],
     ['role title', 'SELECT title k FROM hrms_roles WHERE company_id=? AND deleted_at IS NULL'],
     ['KPI name', 'SELECT name k FROM hrms_kpi_definitions WHERE company_id=? AND deleted_at IS NULL'],
+    ['KRA name', 'SELECT name k FROM hrms_kra_definitions WHERE company_id=? AND deleted_at IS NULL'],
     ['responsibility text', 'SELECT description k FROM hrms_responsibility_definitions WHERE company_id=? AND deleted_at IS NULL'],
   ]) {
     const rows = await q(sql, [c]);

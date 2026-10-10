@@ -7,6 +7,8 @@
  *   POST   /organisation/departments                { name, code?, parentId?, type?, isShared?, serves?: [departmentId], status? }
  *   PUT    /organisation/departments/:id            same fields; parentId moves the branch; serves replaces the list
  *   DELETE /organisation/departments/:id
+ *   GET    /organisation/departments/staffing  ?on=  every department's roles and positions (seats, filled, vacant,
+ *                                                    who is in each seat) in ONE answer, cut from the org chart's own nodes
  *
  *   GET    /organisation/locations                  + locationType, address
  *   POST   /organisation/locations                  { name, code?, locationType, parentId?, address?, status? }
@@ -55,7 +57,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import {
   lookups,
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
@@ -66,6 +68,7 @@ import {
   listHolidays, createHoliday, updateHoliday, deleteHoliday,
   listReportingTypes, createReportingType, updateReportingType, deleteReportingType,
 } from '../services/organisationService.js';
+import { departmentStaffing } from '../services/jobContentService.js';
 
 const router = Router();
 
@@ -81,6 +84,10 @@ router.get('/organisation/lookups', guard(PERM.orgView), handle((req) => lookups
 
 // ----- departments ----------------------------------------------------------
 router.get('/organisation/departments', guard(PERM.orgView), handle((req) => listDepartments(pool, ctx(req).companyId)));
+// Who works in each department: its roles, the positions under each, and the
+// people in them. org_view and nothing weaker — it names every occupant in the
+// company, so the cf_hrms_self_view employee logins get a 403.
+router.get('/organisation/departments/staffing', guard(PERM.orgView), handle((req) => departmentStaffing(pool, ctx(req).companyId, { on: dateParam(req.query.on) })));
 router.post('/organisation/departments', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createDepartment(db, c, req.body))));
 router.put('/organisation/departments/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updateDepartment(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/departments/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deleteDepartment(db, c, intParam(req.params.id)))));

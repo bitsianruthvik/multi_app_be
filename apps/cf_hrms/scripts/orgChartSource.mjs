@@ -90,3 +90,43 @@ export function readAdjustments(file) {
     hash: crypto.createHash('sha256').update(text).digest('hex'),
   };
 }
+
+/**
+ * THE KRA FILE — which outcome area each responsibility and KPI of a role sits
+ * under. The chart cannot say it: its `kras[]` lines are tasks, so a role's
+ * KRAs are written by a person and kept beside the chart.
+ *
+ * Optional. Found next to the source by name — `Org_Chart_V28.html` ->
+ * `Org_Chart_V28.kras.json` — or named with `--kras=<path>`; `--no-kras`
+ * imports the chart with every line ungrouped. Same rule as the adjustments
+ * file: only the path and the raw read are shared, so the importer and the
+ * verifier provably read the same bytes and each interprets them itself.
+ */
+export function resolveKras(sourceFile, argv = process.argv) {
+  if (argv.includes('--no-kras')) return null;
+  const explicit = (argv.find((a) => a.startsWith('--kras=')) || '').split('=').slice(1).join('=');
+  if (explicit) {
+    if (!fs.existsSync(explicit)) throw new Error(`--kras=${explicit}: no such file.`);
+    return explicit;
+  }
+  const beside = sourceFile.replace(/\.[^.\/]+$/, '') + '.kras.json';
+  return fs.existsSync(beside) ? beside : null;
+}
+
+/** The parsed file, its hash and its name — or null when there is none. */
+export function readKras(file) {
+  if (!file) return null;
+  const text = fs.readFileSync(file, 'utf8');
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error(`${file} is not valid JSON: ${e.message}`); }
+  if (!json || !Array.isArray(json.roles)) throw new Error(`${file} has no "roles" array.`);
+  return {
+    file,
+    fileName: path.basename(file),
+    forSource: json.forSource ?? null,
+    roles: json.roles,
+    json,
+    text,
+    hash: crypto.createHash('sha256').update(text).digest('hex'),
+  };
+}

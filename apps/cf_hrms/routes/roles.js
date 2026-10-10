@@ -34,6 +34,17 @@
  *   PUT    /role-content/:kind/:id/group       { roleKraAssignmentId } regroup under a KRA, or null
  *   PUT    /roles/:id/content/:kind/order      { ids: [] } one atomic renumber
  *
+ *   GET    /roles/:id/job-content?on=          the KRAs with their responsibilities and KPIs, in the ONE
+ *                                              shape the org chart panel, the position page and the
+ *                                              Departments screen also draw (services/jobContentService.js)
+ *   POST   /roles/:id/kras                     { name, description? } write a KRA on this role: reuses the
+ *                                              definition of that name, or creates it, and assigns it
+ *   PUT    /role-kras/:id                      { name?, description? } rename; a KRA another role shares is
+ *                                              given its own definition here rather than renamed for both
+ *   DELETE /role-kras/:id                      the KRA goes; ITS LINES STAY on the role, ungrouped
+ *   PUT    /roles/:id/content-group            { roleKraAssignmentId|null, responsibilities: [id], kpis: [id] }
+ *                                              move several lines under one KRA in one write
+ *
  *   GET    /role-content-copy/source           ?type=role|position&id=&on=  what could be copied from this role or seat
  *   POST   /role-content-copy/preview          { source, targets[], mode, kinds[], lines?[], on?, effectiveFrom?, forkTitle? }
  *                                              what a copy WOULD do — counts, seats reached, nothing written
@@ -65,6 +76,9 @@ import {
 import {
   describeCopySource, previewCopy, executeCopy, permissionsForCopyMode,
 } from '../services/contentCopyService.js';
+import {
+  roleJobContent, createRoleKra, renameRoleKra, deleteRoleKra, moveRoleLines,
+} from '../services/jobContentService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -134,6 +148,18 @@ router.get('/roles/:id/content', guard(PERM.orgView), handle((req) => getRoleCon
   intParam(req.params.id),
   { on: dateParam(req.query.on), scope: req.query.scope === 'all' ? 'all' : 'effective' },
 )));
+
+// ----- a role's KRAs, and the lines filed under them -------------------------
+// Reads are the organisation (org_view); every write changes the definition of
+// the work for every seat holding the role (roles_manage). cf_hrms_self_view is
+// in neither, so an employee login gets a 403 from all five.
+router.get('/roles/:id/job-content', guard(PERM.orgView), handle((req) => roleJobContent(
+  pool, ctx(req).companyId, intParam(req.params.id), { on: dateParam(req.query.on) },
+)));
+router.post('/roles/:id/kras', guard(PERM.rolesManage), handle((req) => tx(req, (db, c) => createRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/roles/:id/content-group', guard(PERM.rolesManage), handle((req) => tx(req, (db, c) => moveRoleLines(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/role-kras/:id', guard(PERM.rolesManage), handle((req) => tx(req, (db, c) => renameRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/role-kras/:id', guard(PERM.rolesManage), handle((req) => tx(req, (db, c) => deleteRoleKra(db, c, intParam(req.params.id)))));
 
 // ----- role content --------------------------------------------------------
 router.post('/roles/:id/content/:kind', guard(PERM.rolesManage), handle((req) => tx(req, (db, c) => addContent(db, c, intParam(req.params.id), req.params.kind, req.body))));

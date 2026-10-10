@@ -44,6 +44,16 @@
  *                                           overrideJson?, effectiveFrom?, effectiveTo?, reason? }
  *   DELETE /position-content-overrides/:id
  *
+ *   GET    /positions/:id/job-content     ?on=   the seat's RESOLVED KRAs, responsibilities and KPIs (role + this
+ *                                         seat's changes), every line marked ADDED / CHANGED / OFF or unmarked
+ *   POST   /positions/:id/job-content/add         { kind: RESPONSIBILITY|KPI, text, parentKraDefinitionId?, target?, reason? }
+ *   POST   /positions/:id/job-content/change      { kind, definitionId, text?, target?: { operator?, value }, reason? }
+ *   POST   /positions/:id/job-content/switch-off  { kind, definitionId, reason? }
+ *   POST   /positions/:id/job-content/undo        { kind, definitionId }   back to what the role says
+ *                                         The four writes are override rows underneath (services/jobContentService.js)
+ *                                         and each answers with the job content after the edit. A KRA is refused:
+ *                                         KRAs are fixed at the role.
+ *
  * MULTIPLE REPORTING ROWS PER POSITION ARE NORMAL (v1.1 §13.1). A primary line
  * plus a scoped dotted line is two rows on ONE position — never two positions,
  * and never a second Role invented to hold the second manager.
@@ -52,7 +62,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import {
   listPositions, getPosition, createPosition, updatePosition, setPositionStatus, deletePosition, closePosition, getDeleteImpact, refuseCloseWithTeam,
   listPositionContexts, addPositionContext, updatePositionContext, removePositionContext,
@@ -62,6 +72,9 @@ import {
   positionOptions,
 } from '../services/positionService.js';
 import { resolvePositionReporting } from '../services/reportingResolver.js';
+import {
+  positionJobContent, seatAddLine, seatChangeLine, seatSwitchOffLine, seatUndoLine,
+} from '../services/jobContentService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -103,5 +116,15 @@ router.get('/positions/:id/occupants', guard(PERM.orgView), handle((req) => list
 router.get('/positions/:id/overrides', guard(PERM.orgView), handle((req) => listPositionOverrides(pool, ctx(req).companyId, id(req))));
 router.post('/positions/:id/overrides', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addPositionOverride(db, c, id(req), req.body ?? {}))));
 router.delete('/position-content-overrides/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => removePositionOverride(db, c, id(req)))));
+
+// ----- the seat's job content, and its plain-language edits -------------------
+// The read is org_view, like every other read of a seat. The four writes are
+// org_manage — the tag the override endpoints above already ask for, because
+// that is what they write. cf_hrms_self_view reaches none of the five.
+router.get('/positions/:id/job-content', guard(PERM.orgView), handle((req) => positionJobContent(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) })));
+router.post('/positions/:id/job-content/add', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatAddLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/change', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatChangeLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/switch-off', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatSwitchOffLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/undo', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatUndoLine(db, c, id(req), req.body ?? {}))));
 
 export default router;

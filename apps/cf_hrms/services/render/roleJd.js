@@ -123,7 +123,7 @@ export function reportingLine(rel) {
 /** Heading for the ungrouped bucket: it is the only list when the role has no KRAs. */
 export const additionalHeading = (content, kind) => (
   content.counts.kras
-    ? `Additional ${kind} (not under a key result area)`
+    ? `Additional ${kind === 'kpis' ? 'KPIs' : kind} (not under a key result area)`
     : (kind === 'responsibilities' ? 'Responsibilities' : 'Key performance indicators')
 );
 

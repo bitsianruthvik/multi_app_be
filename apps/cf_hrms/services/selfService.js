@@ -459,6 +459,9 @@ function shapeResponsibilities(resolved) {
     responsibilityClass: i.responsibilityClass ?? null,
     origin: i.origin,
     isSpecificToThisSeat: i.origin !== 'ROLE',
+    // The role says it and this seat does it differently (a different target,
+    // say). Additive, 2026-10-10: the grouped view marks it "Changed for this seat".
+    isChangedForThisSeat: i.overridden === true,
     notes: i.notes ?? null,
   });
   const kpi = (i) => ({
@@ -467,6 +470,7 @@ function shapeResponsibilities(resolved) {
     targetText: i.targetText ?? null,
     frequency: i.frequency ?? null,
     origin: i.origin,
+    isChangedForThisSeat: i.overridden === true,
   });
 
   const areas = (resolved.kras ?? []).map((k) => ({

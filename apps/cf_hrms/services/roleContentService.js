@@ -870,7 +870,7 @@ export function contentOf(kind) {
  * type. BETWEEN takes a range, INFO takes nothing at all, and a percentage with
  * a target of "good" is a target nobody can check.
  */
-function validateTarget(operator, value, measurementType, problems) {
+export function validateTarget(operator, value, measurementType, problems) {
   const empty = value === null || value === undefined || value === '';
   if (!operator || operator === 'INFO') {
     if (!empty) problems.push('An INFO KPI is tracked, not judged — it carries no target value.');

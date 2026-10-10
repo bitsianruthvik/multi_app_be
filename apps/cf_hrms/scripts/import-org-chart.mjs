@@ -54,16 +54,29 @@
  * carries a reason, who decided and when. An entry naming a node the chart no
  * longer has STOPS the import: a new revision must not silently drop a decision.
  *
+ * KRAs. The chart's `kras[]` lines are tasks and import as responsibilities
+ * (rule 3). The outcome areas they belong under are written by a person and
+ * kept in a second optional file beside the chart (`<chart>.kras.json`): per
+ * role, its KRAs in order, and under each the responsibilities (by text) and
+ * KPIs (by name) it holds. KRAs are set per ROLE — two roles may both have a
+ * "Quality" and they are unrelated. This script only GROUPS: it never rewords,
+ * merges or drops a line. Unlike an adjustment, a KRA entry the chart no
+ * longer has does NOT stop the import — a chart revision adds and removes
+ * duties all the time — it is reported as stale; a line the file does not
+ * place is imported ungrouped and counted as needing a KRA. A malformed file
+ * (one line under two KRAs, a KRA named twice in a role) does stop it.
+ *
  * Usage:
  *   node import-org-chart.mjs --company=karni [--dry-run] [--wipe] [--source=<path>]
  *                             [--adjustments=<path> | --no-adjustments]
+ *                             [--kras=<path> | --no-kras]
  *
  * --dry-run prints the validation report and writes nothing.
  * --wipe clears this company's hrms_ rows first (local development only).
  */
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
-import { resolveSource, readSeed, PREVIOUS_FILE_NAME, resolveAdjustments, readAdjustments } from './orgChartSource.mjs';
+import { resolveSource, readSeed, PREVIOUS_FILE_NAME, resolveAdjustments, readAdjustments, resolveKras, readKras } from './orgChartSource.mjs';
 
 const TARGET = resolveTarget();
 
@@ -86,7 +99,7 @@ let RUN_CONTEXT = null;
 // =========================================================== PLAN =========
 // Everything the file means, decided before a single row is written.
 
-function plan(seed, prev, adj = null) {
+function plan(seed, prev, adj = null, kraFile = null) {
   const findings = [];
   const note = (kind, detail) => findings.push({ kind, detail });
   const counts = {};
@@ -732,8 +745,9 @@ function plan(seed, prev, adj = null) {
     + `changed since V12; it matters more now that there are ${counts.responsibilityLines} of them rather than 595. `
     + `${respReused} were textual duplicates and were reused rather than copied, leaving ${respDefs.size} distinct `
     + `responsibilities; a further ${respSkipped} were dropped as the same text arriving twice at one merged role, `
-    + `leaving ${respAssign.length} role assignments. No KRAs exist yet: they have to be written, then these grouped `
-    + `under them. Nothing here is lost by that — a responsibility with no KRA still renders on a JD.`);
+    + `leaving ${respAssign.length} role assignments. The outcome areas themselves are not in the chart: they come `
+    + `from the KRA file beside it (see the key result areas finding). Nothing is lost where that file places nothing — `
+    + `a responsibility with no KRA still renders on a JD.`);
   const longResp = [...respDefs.values()].filter((d) => d.text.length > 250);
   const nameGroups = new Map();
   for (const d of respDefs.values()) {
@@ -836,6 +850,156 @@ function plan(seed, prev, adj = null) {
       + `definition: ${[...byName.keys()].map((n) => `"${n}"`).join(', ')}. The first wording is the definition; every other wording is `
       + `kept verbatim in the notes of the assignment it came from. Read those before the first review cycle — `
       + `"${worst[0]}" is described ${worstDefs.size} different ways in this file.`);
+  }
+
+  // ---- 7b. KRAs: the outcome areas, from the file beside the chart --------
+  // A KRA is an area of outcome ("Wastage & scrap"); the chart holds none, only
+  // the tasks. The file says, per role, which KRA each responsibility and KPI
+  // sits under. This section only GROUPS what sections 6 and 7 already decided
+  // to write: it sets `kraKey` on those assignments and never adds, rewords or
+  // removes one.
+  //
+  // KEYS, and how each one fails:
+  //   role — by its title as this import names it (so a split title is found
+  //          by its qualified title), and failing that by its exact set of
+  //          seats. A role that was renamed AND re-seated is not found: its
+  //          whole entry is stale and its lines import ungrouped.
+  //   line — a responsibility by its text, a KPI by its name, normalised the
+  //          way the definitions are (case, spacing, trailing punctuation). A
+  //          reworded duty is a different duty: stale in the file, ungrouped
+  //          in the tenant, until someone places the new wording.
+  //
+  // KRAs are per ROLE (the user's decision, 2026-10-10): the grouping row is
+  // hrms_role_kra_assignments. hrms_kra_definitions is unique by name, so two
+  // roles that both say "Quality" share one definition ROW — a name, nothing
+  // more; neither role's grouping can see the other's.
+  const kraDefs = new Map();                  // normKey(name) -> { key, name }
+  const kraAssign = [];                       // { roleKey, defKey, sequence, description }
+  const kraStale = [];                        // { role, kra?, what, text? }
+  const kraBySeats = [];                      // roles found by seats, not title
+  if (kraFile) {
+    const problems = [];
+    const groupByTitle = new Map(roleGroups.map((g) => [normKey(g.title), g]));
+    const seatSig = (ids) => [...new Set(ids)].sort().join(',');
+    const groupBySeats = new Map(roleGroups.map((g) => [seatSig(g.nodes.map((n) => n.id)), g]));
+    const lineIndex = (rows) => {
+      const m = new Map();
+      for (const a of rows) { if (!m.has(a.roleKey)) m.set(a.roleKey, new Map()); m.get(a.roleKey).set(a.defKey, a); }
+      return m;
+    };
+    const respOf = lineIndex(respAssign);
+    const kpiOf = lineIndex(kpiAssign);
+    const claimed = new Map();                // roleKey -> the entry that took it
+    kraFile.roles.forEach((entry, i) => {
+      const label = `role entry ${i + 1} ("${norm(entry?.role) || 'no role'}")`;
+      if (!norm(entry?.role)) { problems.push(`${label} has no "role".`); return; }
+      if (!Array.isArray(entry.kras)) { problems.push(`${label} has no "kras" array.`); return; }
+      // The entry's own shape, checked whether or not the chart still has the role.
+      const names = new Set();
+      const placed = new Map();               // kind|line -> KRA name
+      for (const k of entry.kras) {
+        const name = norm(k?.name);
+        if (!name) { problems.push(`${label}: a KRA has no name.`); continue; }
+        if (names.has(normKey(name))) problems.push(`${label}: the KRA "${name}" is listed twice.`);
+        names.add(normKey(name));
+        for (const [kind, list] of [['responsibility', k.responsibilities], ['KPI', k.kpis]]) {
+          if (list !== undefined && !Array.isArray(list)) { problems.push(`${label}: KRA "${name}" — its ${kind} list is not a list.`); continue; }
+          for (const raw of list || []) {
+            const key = `${kind}|${normKey(raw)}`;
+            if (!normKey(raw)) { problems.push(`${label}: KRA "${name}" holds a blank ${kind}.`); continue; }
+            if (placed.has(key)) problems.push(`${label}: the ${kind} "${clip(norm(raw), 80)}" is under both "${placed.get(key)}" and "${name}". A line sits under one KRA.`);
+            else placed.set(key, name);
+          }
+        }
+      }
+      let g = groupByTitle.get(normKey(entry.role));
+      let bySeats = false;
+      if (!g && Array.isArray(entry.seats) && entry.seats.length) { g = groupBySeats.get(seatSig(entry.seats)); bySeats = !!g; }
+      if (!g) { kraStale.push({ role: norm(entry.role), what: 'role', lines: placed.size }); return; }
+      if (claimed.has(g.key)) { problems.push(`${label} and ${claimed.get(g.key)} are both the role "${g.title}".`); return; }
+      claimed.set(g.key, label);
+      if (bySeats) kraBySeats.push({ from: norm(entry.role), to: g.title, seats: entry.seats.join(', ') });
+      let seq = 0;
+      for (const k of entry.kras) {
+        const name = norm(k?.name);
+        if (!name) continue;
+        const hits = [];
+        for (const [what, list, index] of [['responsibility', k.responsibilities, respOf], ['KPI', k.kpis, kpiOf]]) {
+          for (const raw of (Array.isArray(list) ? list : [])) {
+            const a = index.get(g.key)?.get(normKey(raw));
+            if (a) hits.push(a);
+            else if (normKey(raw)) kraStale.push({ role: g.title, kra: name, what, text: norm(raw) });
+          }
+        }
+        // A KRA none of whose lines the chart still has is not created: an
+        // outcome area with nothing under it is a heading over nothing.
+        if (!hits.length) { kraStale.push({ role: g.title, kra: name, what: 'KRA' }); continue; }
+        const defKey = normKey(name);
+        if (!kraDefs.has(defKey)) kraDefs.set(defKey, { key: defKey, name: clip(name, 200) });
+        kraAssign.push({ roleKey: g.key, defKey, sequence: ++seq, description: norm(k.description) || null });
+        for (const a of hits) a.kraKey = defKey;
+      }
+    });
+    if (problems.length) {
+      throw new Error(`The KRA file is not well formed — nothing was imported.\n  - ${problems.join('\n  - ')}\n`
+        + `Fix ${kraFile.file}, or run with --no-kras to import the chart with every line ungrouped.`);
+    }
+  }
+  const titleOfRole = new Map(roleGroups.map((g) => [g.key, g.title]));
+  const linesOfRole = new Map();              // roleKey -> { resp, kpi, ungrouped: [] }
+  for (const [kind, rows, text] of [['resp', respAssign, (a) => respDefs.get(a.defKey).text], ['kpi', kpiAssign, (a) => kpiDefs.get(a.defKey).name]]) {
+    for (const a of rows) {
+      if (!linesOfRole.has(a.roleKey)) linesOfRole.set(a.roleKey, { resp: 0, kpi: 0, ungrouped: [] });
+      const r = linesOfRole.get(a.roleKey);
+      r[kind]++;
+      if (!a.kraKey) r.ungrouped.push(text(a));
+    }
+  }
+  const rolesWithKras = new Set(kraAssign.map((a) => a.roleKey));
+  const rolesNoContent = roleGroups.filter((g) => !linesOfRole.has(g.key));
+  const rolesNoKras = [...linesOfRole.keys()].filter((k) => !rolesWithKras.has(k));
+  const ungrouped = [...linesOfRole].filter(([, r]) => r.ungrouped.length);
+  counts.kraFileRoles = kraFile ? kraFile.roles.length : 0;
+  counts.kraDefinitions = kraDefs.size;
+  counts.kraAssignments = kraAssign.length;
+  counts.rolesWithKras = rolesWithKras.size;
+  counts.rolesWithContentButNoKras = rolesNoKras.length;
+  counts.rolesWithoutContent = rolesNoContent.length;
+  counts.responsibilitiesGrouped = respAssign.filter((a) => a.kraKey).length;
+  counts.kpisGrouped = kpiAssign.filter((a) => a.kraKey).length;
+  counts.linesUngrouped = ungrouped.reduce((n, [, r]) => n + r.ungrouped.length, 0);
+  counts.kraStaleEntries = kraStale.length;
+  if (!kraFile) {
+    note('No KRA file: every responsibility and KPI is ungrouped',
+      `No <chart>.kras.json was found beside the chart (or --no-kras was given), so no key result areas were created and all `
+      + `${respAssign.length + kpiAssign.length} role lines are ungrouped. Every role page will say its job description is not ready. `
+      + `Nothing is lost — the lines are all there — but they sit under no outcome area.`);
+  } else {
+    const shared = [...kraDefs.values()].map((d) => [d.name, kraAssign.filter((a) => a.defKey === d.key).length]).filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
+    note(`Key result areas: ${rolesWithKras.size} roles grouped under ${kraAssign.length} KRAs`,
+      `${kraFile.fileName} groups ${counts.responsibilitiesGrouped} of ${respAssign.length} responsibilities and ${counts.kpisGrouped} of `
+      + `${kpiAssign.length} KPIs under ${kraAssign.length} KRAs on ${rolesWithKras.size} roles (${kraDefs.size} distinct KRA names). `
+      + `KRAs are per role: ${shared.length} names are used by more than one role${shared.length ? ` (${shared.slice(0, 6).map(([n, c]) => `"${n}" x${c}`).join(', ')}${shared.length > 6 ? ', …' : ''})` : ''}, `
+      + `and each such name is one definition row that those roles share as a NAME only — renaming it on the KRA master renames it for all of them. `
+      + `UNGROUPED — NEEDS A KRA: ${counts.linesUngrouped} line${counts.linesUngrouped === 1 ? '' : 's'}`
+      + (ungrouped.length ? ` on ${ungrouped.length} role${ungrouped.length === 1 ? '' : 's'}: `
+        + ungrouped.map(([k, r]) => `"${titleOfRole.get(k)}" ${r.ungrouped.length} (${r.ungrouped.slice(0, 2).map((t) => `"${clip(t, 60)}"`).join(', ')}${r.ungrouped.length > 2 ? ', …' : ''})`).join('; ') : '')
+      + `. ${rolesNoContent.length} roles carry no duties or KPIs in the chart and so get no KRAs: `
+      + `${rolesNoContent.map((g) => `"${g.title}"`).join(', ') || 'none'}.`
+      + (rolesNoKras.length ? ` ${rolesNoKras.length} roles HAVE duties and no KRA at all: ${rolesNoKras.map((k) => `"${titleOfRole.get(k)}"`).join(', ')}.` : '')
+      + (kraBySeats.length ? ` Found by their seats because the title in the file no longer matches: ${kraBySeats.map((m) => `"${m.from}" -> "${m.to}" (${m.seats})`).join('; ')} — update the file's "role".` : '')
+      + (kraFile.forSource && kraFile.forSource !== kraFile.sourceFileName ? ` NOTE: the file says it was written for "${kraFile.forSource}" and this chart is "${kraFile.sourceFileName}"; it was applied anyway, line by line, and whatever no longer fits is listed as stale.` : ''));
+    if (kraStale.length) {
+      const sr = kraStale.filter((x) => x.what === 'role');
+      const sk = kraStale.filter((x) => x.what === 'KRA');
+      const sl = kraStale.filter((x) => x.what === 'responsibility' || x.what === 'KPI');
+      note(`${kraStale.length} stale entries in the KRA file`,
+        `The KRA file names things this chart does not have. They were skipped, not guessed at: `
+        + (sr.length ? `${sr.length} role${sr.length === 1 ? '' : 's'} (${sr.map((x) => `"${x.role}", ${x.lines} lines`).join('; ')}). ` : '')
+        + (sl.length ? `${sl.length} line${sl.length === 1 ? '' : 's'} (${sl.slice(0, 12).map((x) => `${x.role} / ${x.kra}: ${x.what} "${clip(x.text, 60)}"`).join('; ')}${sl.length > 12 ? '; …' : ''}). ` : '')
+        + (sk.length ? `${sk.length} KRA${sk.length === 1 ? '' : 's'} left with no line and so not created (${sk.map((x) => `${x.role} / ${x.kra}`).join('; ')}). ` : '')
+        + `A reworded duty shows up twice: stale here, and ungrouped above under its new wording.`);
+    }
   }
 
   // ---- 8. Qualifications ------------------------------------------------
@@ -1038,6 +1202,7 @@ function plan(seed, prev, adj = null) {
     adjustments: adj ? { fileName: adj.fileName, hash: adj.hash, count: adjEntries.length, entries: adjEntries } : null,
     positions, manpower, edges,
     respDefs, respAssign, kpiDefs, kpiAssign,
+    kraDefs, kraAssign, kras: kraFile ? { fileName: kraFile.fileName, hash: kraFile.hash } : null,
     employees, named, blanks, attendance, openOrg, openNode,
     counts, findings, meta: seed.meta || {}, settings: seed.settings || {},
   };
@@ -1130,7 +1295,12 @@ async function main() {
   const adj = adjPath ? { ...readAdjustments(adjPath), sourceFileName: fileName } : null;
   console.log(`  adjustments: ${adj ? `${adjPath}\n               ${adj.entries.length} entries, sha256 ${adj.hash.slice(0, 12)}…` : '(none — the chart alone)'}\n`);
 
-  const p = plan(seed, prev, adj);
+  // The outcome areas, written by a person. Optional; found beside the source.
+  const kraPath = resolveKras(source);
+  const kraFile = kraPath ? { ...readKras(kraPath), sourceFileName: fileName } : null;
+  console.log(`  kras: ${kraFile ? `${kraPath}\n        ${kraFile.roles.length} roles, sha256 ${kraFile.hash.slice(0, 12)}…` : '(none — every line imports ungrouped)'}\n`);
+
+  const p = plan(seed, prev, adj, kraFile);
 
   const conn = await mysql.createConnection(TARGET.cfg);
   // STRICT, deliberately. The previous version ran with sql_mode = "" and that
@@ -1224,6 +1394,26 @@ async function main() {
     }));
   }
 
+  // ---- 4b. KRAs: one definition per name, one assignment per role + KRA ---
+  // Written before the content they group, so each responsibility and KPI row
+  // can be inserted already pointing at its KRA. `sequence` is the file's order.
+  const kraDefByKey = new Map();
+  for (const d of p.kraDefs.values()) {
+    kraDefByKey.set(d.key, await ins('hrms_kra_definitions', { name: d.name, status: 'ACTIVE' }));
+  }
+  const kraAsgByKey = new Map();              // roleKey|kraKey -> hrms_role_kra_assignments.id
+  for (const a of p.kraAssign) {
+    kraAsgByKey.set(`${a.roleKey}|${a.defKey}`, await ins('hrms_role_kra_assignments', {
+      role_id: roleByKey.get(a.roleKey), kra_definition_id: kraDefByKey.get(a.defKey),
+      is_mandatory: 1, sequence: a.sequence, effective_from: p.chartDate,
+      // A description in the file is this ROLE's reading of the area, so it
+      // goes on the role's row; the definition is shared by name.
+      notes: a.description,
+    }));
+  }
+  // A line's KRA is always a KRA of its OWN role: the key carries the role.
+  const kraOf = (a) => (a.kraKey ? kraAsgByKey.get(`${a.roleKey}|${a.kraKey}`) ?? null : null);
+
   // ---- 5. Positions ----------------------------------------------------
   const posByNode = new Map();
   for (const pos of p.positions) {
@@ -1267,6 +1457,7 @@ async function main() {
   for (const a of p.respAssign) {
     await ins('hrms_role_responsibility_assignments', {
       role_id: roleByKey.get(a.roleKey), responsibility_definition_id: respByKey.get(a.defKey),
+      role_kra_assignment_id: kraOf(a),
       is_mandatory: 1, sequence: a.sequence, effective_from: p.chartDate,
     });
   }
@@ -1282,6 +1473,7 @@ async function main() {
   for (const a of p.kpiAssign) {
     await ins('hrms_role_kpi_assignments', {
       role_id: roleByKey.get(a.roleKey), kpi_definition_id: kpiByKey.get(a.defKey),
+      role_kra_assignment_id: kraOf(a),
       // The TEXT shape roleContentService.validateTarget writes: a JSON string.
       target_operator: a.target ? 'EQ' : 'INFO',
       target_value: a.target ? JSON.stringify(a.target) : null,
@@ -1366,12 +1558,16 @@ async function main() {
     parsed_counts_json: JSON.stringify({
       ...p.counts, chartDate: p.chartDate, letter: p.meta.letter ?? null,
       adjustmentsFile: p.adjustments?.fileName ?? null, adjustmentsHash: p.adjustments?.hash ?? null,
+      // ... and the KRA file's, for the same reason: chart + adjustments + KRAs
+      // are the three things this tenant's content was built from.
+      krasFile: p.kras?.fileName ?? null, krasHash: p.kras?.hash ?? null,
     }),
     findings_json: JSON.stringify(p.findings),
     id_map_json: JSON.stringify(idMap),
     parsed_at: now, validated_at: now, committed_at: now,
     notes: `Imported by scripts/import-org-chart.mjs into company ${COMPANY_SLUG}.`
-      + (p.adjustments ? ` With ${p.adjustments.count} adjustments from ${p.adjustments.fileName} (sha256 ${p.adjustments.hash}).` : ' No adjustments file.'),
+      + (p.adjustments ? ` With ${p.adjustments.count} adjustments from ${p.adjustments.fileName} (sha256 ${p.adjustments.hash}).` : ' No adjustments file.')
+      + (p.kras ? ` KRAs from ${p.kras.fileName} (sha256 ${p.kras.hash}).` : ' No KRA file.'),
   });
 
   RUN_CONTEXT = null;
