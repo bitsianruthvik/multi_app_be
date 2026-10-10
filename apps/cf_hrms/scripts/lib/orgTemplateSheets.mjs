@@ -7,7 +7,7 @@
  * import the same constants and the same outline rule (readOutline below).
  *
  * THE THREE RULES THE LAYOUT EXISTS TO SERVE. Measured on the real Karni chart:
- * 114 positions, 9 levels once the machine boxes are drawn in, 12 titles used by
+ * 114 positions, 9 levels once the machines are drawn in, 12 titles used by
  * more than one seat, ten different seats all called "Helper 1".
  *
  *   1. HIERARCHY IS INDENTATION, NEVER A "REPORTS TO" COLUMN. A seat's title sits
@@ -43,7 +43,7 @@
  * neither Ref nor title can say WHICH database record a row is once the sheet has
  * been edited. So the last column of each editable sheet is a hidden KEY holding
  * the record's database id, prefixed by kind (`pos:1234`, `asg:17`, `rsp:80:301`,
- * `wct:9`, `opn:4`). A row with a key is that record; a row with no key is new; a
+ * `dep:9`, `opn:4`). A row with a key is that record; a row with no key is new; a
  * key that appears twice is a copy-pasted row, and only its first occurrence keeps
  * the identity. The key column is hidden and muted but NOT protected: Excel will
  * not let anyone delete a row that contains a locked cell on a protected sheet, and
@@ -60,10 +60,10 @@ import ExcelJS from 'exceljs';
 // --------------------------------------------------------------- contract ----
 export const SHEET = Object.freeze({
   start: 'Start here',
+  departments: 'Departments',
   structure: 'Structure',
   people: 'People',
   responsibilities: 'Responsibilities',
-  machines: 'Machines & areas',
   questions: 'Questions & doubts',
   lists: 'Lists',
 });
@@ -74,15 +74,25 @@ const LEVEL_NAMES = Array.from({ length: LEVELS }, (_, i) => `Level ${i + 1}`);
 
 /** The hidden last column of every editable sheet: the stable identity of the row's database record. */
 export const KEY_HEADER = 'Key — do not edit';
-/** Bumped whenever the layout changes in a way a reader must know about. 1 was the layout before keys existed. */
-export const SCHEMA_VERSION = 2;
+/**
+ * Bumped whenever the layout changes in a way a reader must know about.
+ *   1  before keys existed
+ *   2  keys and provenance; machines were work contexts on their own sheet
+ *   3  everything is a department: a Departments sheet (name, under, type, shared, serves) replaces Machines & areas,
+ *      and the Structure sheet lost its Machines column
+ */
+export const SCHEMA_VERSION = 3;
+
+/** How many departments one shared crew may serve: one drop-down column each (see buildDepartments for why). */
+export const SERVES_SLOTS = 10;
+const SERVES_HEADERS = Array.from({ length: SERVES_SLOTS }, (_, i) => `Serves ${i + 1}`);
 
 /** Header text is part of the contract: a reader finds its columns by these strings. The key column is always LAST. */
 export const HEADERS = Object.freeze({
-  structure: ['Ref', ...LEVEL_NAMES, 'How many people?', 'Shift', 'Department', 'Location', 'Machines or areas', 'Notes', KEY_HEADER],
+  departments: ['Name', 'Under', 'Type', 'Shared crew?', ...SERVES_HEADERS, KEY_HEADER],
+  structure: ['Ref', ...LEVEL_NAMES, 'How many people?', 'Shift', 'Department', 'Location', 'Notes', KEY_HEADER],
   people: ['Full name', 'Seat', 'Shift', 'Employee code (optional)', 'Joined (optional)', KEY_HEADER],
   responsibilities: ['Seat', 'Responsibility', KEY_HEADER],
-  machines: ['Name', 'Kind', 'Where (optional)', KEY_HEADER],
   questions: ['About (optional)', 'The question', KEY_HEADER],
 });
 
@@ -95,9 +105,13 @@ export const COL = Object.freeze({
   shift: 3 + LEVELS,
   department: 4 + LEVELS,
   location: 5 + LEVELS,
-  machines: 6 + LEVELS,
-  notes: 7 + LEVELS,
-  key: 8 + LEVELS,
+  notes: 6 + LEVELS,
+  key: 7 + LEVELS,
+});
+
+/** The Departments sheet's columns, 1-based. */
+export const DEPT_COL = Object.freeze({
+  name: 1, under: 2, type: 3, shared: 4, firstServes: 5, lastServes: 4 + SERVES_SLOTS, key: 5 + SERVES_SLOTS,
 });
 
 /** The key column of each editable sheet, 1-based (always the last heading). */
@@ -111,17 +125,17 @@ export const KEY_COLUMN = Object.freeze(Object.fromEntries(Object.entries(HEADER
  *                                                 and two rows must not share a key)
  *   rsp:<role id>:<responsibility definition id>  a duty of a ROLE (several seats share a role)
  *   ovr:<hrms_position_content_overrides.id>      a duty added to ONE seat
- *   wct:<hrms_work_contexts.id>                   a machine or area
+ *   dep:<hrms_departments.id>                     a department, process, machine or shared crew
  *   opn:<hrms_open_points.id>                     a question
  */
 export const KEY_KINDS = Object.freeze({
   structure: Object.freeze(['pos']),
   people: Object.freeze(['asg']),
   responsibilities: Object.freeze(['rsp', 'ovr']),
-  machines: Object.freeze(['wct']),
+  departments: Object.freeze(['dep']),
   questions: Object.freeze(['opn']),
 });
-const KEY_SHAPE = /^(pos|asg|ovr|wct|opn):(\d+)$|^(rsp):(\d+):(\d+)$/;
+const KEY_SHAPE = /^(pos|asg|ovr|dep|opn):(\d+)$|^(rsp):(\d+):(\d+)$/;
 /** @returns {null|{kind:string, ids:number[]}} null when the text is not a well-formed key */
 export function parseKey(text) {
   const m = KEY_SHAPE.exec(String(text ?? '').trim().toLowerCase());
@@ -133,7 +147,10 @@ export function parseKey(text) {
 export const PROVENANCE_PREFIX = 'provenance.';
 export const PROVENANCE_FIELDS = Object.freeze(['schemaVersion', 'companySlug', 'companyId', 'target', 'targetName', 'exportedAt', 'contentHash', 'counts']);
 
-export const KINDS = Object.freeze(['Machine', 'Line', 'Area', 'Project', 'Cell', 'Other']);
+/** The labels offered for a department's Type. A label only: nothing anywhere branches on its words. */
+export const DEFAULT_TYPES = Object.freeze(['Department', 'Process', 'Machine / area', 'Shared crew']);
+export const YES = 'Yes';
+export const NO = 'No';
 export const DAY_AND_NIGHT = 'Day & night';
 export const DEFAULT_SHIFTS = Object.freeze(['General', 'Day', 'Night']);
 
@@ -142,7 +159,7 @@ export const EXAMPLE_MARK = 'Example:';
 
 /** Where the hidden `Lists` sheet keeps each thing (column letters). */
 const LISTS = Object.freeze({
-  shiftSeat: 'A', shiftPerson: 'B', kind: 'C',
+  shiftSeat: 'A', shiftPerson: 'B', type: 'C', yesNo: 'D',
   label: 'E', count: 'F', level: 'G', lastLevel: 'H', check: 'I', index: 'J', list: 'K',
 });
 
@@ -150,10 +167,11 @@ const LISTS = Object.freeze({
 export const NAMES = Object.freeze({
   seatShifts: 'ShiftOptions',
   personShifts: 'PersonShiftOptions',
-  kinds: 'KindOptions',
+  types: 'TypeOptions',
+  yesNo: 'YesNo',
   seatLabels: 'SeatLabels',
   rowCheck: 'RowCheck',
-  machines: 'MachineNames',
+  departments: 'DepartmentNames',
 });
 
 // ---------------------------------------------------------------- helpers ----
@@ -169,10 +187,10 @@ export function fingerprintOf(data) {
   const canonical = {
     shifts: data.shifts,
     seats: data.seats.map((s) => [s.key ?? '', squeeze(s.title), s.level, Number(s.count), squeeze(s.shift), squeeze(s.department), squeeze(s.location),
-      (s.machines ?? []).map((m) => squeeze(m).toLowerCase()).sort(), squeeze(s.notes), s.parent ?? -1]),
+      squeeze(s.notes), s.parent ?? -1]),
     people: data.people.map((p) => [p.key ?? '', squeeze(p.name), p.seat, squeeze(p.shift), squeeze(p.code), isoDay(p.joined)]),
     responsibilities: data.responsibilities.map((x) => [x.key ?? '', x.seat, squeeze(x.text)]),
-    machines: data.machines.map((m) => [m.key ?? '', squeeze(m.name), m.kind, squeeze(m.where)]),
+    departments: data.departments.map((d) => [d.key ?? '', squeeze(d.name), squeeze(d.under), squeeze(d.type), d.shared ? 1 : 0, (d.serves ?? []).map(squeeze)]),
     questions: data.questions.map((q) => [q.key ?? '', q.seat ?? -1, squeeze(q.text)]),
   };
   return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
@@ -183,6 +201,7 @@ export const colLetter = (n) => {
   for (let x = n; x > 0; x = Math.floor((x - 1) / 26)) s = String.fromCharCode(65 + ((x - 1) % 26)) + s;
   return s;
 };
+const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
 /** Collapse whitespace the way Excel's TRIM does, so a written title equals what the label formula yields. */
 export const squeeze = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 export const seatRef = (index) => `P${String(index + 1).padStart(3, '0')}`;
@@ -222,62 +241,6 @@ const listsFormulas = (r, last) => {
 /** The seat drop-down: exactly as long as the seats there are. Needs Excel 2010 or later. */
 const seatListSource = (last) =>
   `OFFSET(${SHEET.lists}!$${LISTS.list}$2,0,0,MAX(1,COUNT(${SHEET.lists}!$${LISTS.index}$2:$${LISTS.index}$${last})),1)`;
-
-/** How many machines or areas one seat may list. */
-export const MAX_MACHINES = 15;
-
-/** A machine name as a comparison key: case, spacing and the space after a comma do not matter. */
-export const machineKey = (name) => squeeze(name).toLowerCase().replace(/\s*,\s*/g, ',');
-
-/**
- * Cut a "Machines or areas" cell into machine names.
- *
- * The cell is comma-separated, but a machine can have a comma in its own name ("Slitting, Rewinding and Core Cutting
- * Process" is a real one at Karni), so the pieces are matched against the names on `Machines & areas`: the longest run
- * of pieces that spells a known name wins, and anything else stays a single piece. Without this a machine like that
- * could be exported but never read back.
- *
- * @param {string} text
- * @param {Set<string>} knownKeys  machineKey() of every name on the Machines sheet
- * @returns {string[]} the names as typed (squeezed, in order, empty pieces dropped)
- */
-export function splitMachineList(text, knownKeys) {
-  const pieces = String(text ?? '').split(',').map(squeeze);
-  const out = [];
-  for (let i = 0; i < pieces.length;) {
-    if (!pieces[i]) { i++; continue; }
-    let took = 1;
-    for (let n = pieces.length - i; n >= 2; n--) {
-      if (knownKeys.has(machineKey(pieces.slice(i, i + n).join(',')))) { took = n; break; }
-    }
-    out.push(pieces.slice(i, i + took).join(', '));
-    i += took;
-  }
-  return out;
-}
-
-/**
- * Machines or areas: every comma-separated name must be on `Machines & areas`.
- *
- * The text is cut into pieces with the SUBSTITUTE/REPT/MID split: every comma
- * becomes LEN(text) spaces and piece k is the LEN(text)-wide window starting at
- * (k-1)*LEN(text)+1, trimmed. The spacer and window are LEN(text) long, which is
- * what keeps a long list from sliding out of its window.
- *
- * The usual form of this rule hands MID a ROW(INDIRECT(...)) array and wraps the
- * lot in SUMPRODUCT. This one spells each piece out instead (fifteen of them), so
- * every part is an ordinary scalar formula: nothing volatile, nothing that
- * depends on how an application evaluates arrays, and it can be checked by any
- * spreadsheet engine. A piece past the last comma is allowed to be empty; a piece
- * before it (as in "A,,B" or "A,") must be a known name.
- */
-const machineListRule = (c, r) => {
-  const t = `${c}${r}`;
-  const n = `(LEN(${t})-LEN(SUBSTITUTE(${t},",",""))+1)`;
-  const piece = (k) => `TRIM(MID(SUBSTITUTE(${t},",",REPT(" ",LEN(${t}))),${k - 1}*LEN(${t})+1,LEN(${t})))`;
-  const ok = (k) => `OR(${n}<${k},ISNUMBER(MATCH(${piece(k)},${NAMES.machines},0)))`;
-  return `OR(${t}="",AND(${n}<=${MAX_MACHINES},${Array.from({ length: MAX_MACHINES }, (_, i) => ok(i + 1)).join(',')}))`;
-};
 
 /** Exactly one Level cell on this row holds a title. Same-row references only: a rule sees the typed value, not Lists. */
 const oneTitleRule = (r) => `${levelCols.map((c) => `(LEN(TRIM($${c}${r}))>0)`).join('+')}=1`;
@@ -332,10 +295,10 @@ function validation(spec) {
 // -------------------------------------------------------- example content ----
 const EXAMPLE_MODEL = Object.freeze({
   seats: [
-    { title: 'Plant manager', level: 1, count: 1, shift: 'General', department: 'Operations', location: 'Main plant', machines: [], notes: `${EXAMPLE_MARK} delete the grey rows before you start.` },
-    { title: 'Shift supervisor', level: 2, count: 1, shift: DAY_AND_NIGHT, department: 'Operations', location: 'Main plant', machines: ['Packing line 1'], notes: `${EXAMPLE_MARK} Day & night with 1 means one supervisor on EACH shift.` },
-    { title: 'Operator', level: 2, count: 4, shift: 'Day', department: 'Operations', location: 'Main plant', machines: ['Packing line 1'], notes: `${EXAMPLE_MARK} four operators are ONE row with 4, not four rows.` },
-    { title: 'Accounts executive', level: 2, count: 1, shift: 'General', department: 'Accounts', location: 'Main plant', machines: [], notes: `${EXAMPLE_MARK} no machine, so that cell stays empty.` },
+    { title: 'Plant manager', level: 1, count: 1, shift: 'General', department: 'Operations', location: 'Main plant', notes: `${EXAMPLE_MARK} delete the grey rows before you start.` },
+    { title: 'Shift supervisor', level: 2, count: 1, shift: DAY_AND_NIGHT, department: 'Packing line 1', location: 'Main plant', notes: `${EXAMPLE_MARK} Day & night with 1 means one supervisor on EACH shift. A seat sits in ONE department: here, the machine's.` },
+    { title: 'Operator', level: 2, count: 4, shift: 'Day', department: 'Packing line 1', location: 'Main plant', notes: `${EXAMPLE_MARK} four operators are ONE row with 4, not four rows.` },
+    { title: 'Accounts executive', level: 2, count: 1, shift: 'General', department: 'Accounts', location: 'Main plant', notes: `${EXAMPLE_MARK} the department is picked from the Departments sheet.` },
   ],
   people: [
     { name: `${EXAMPLE_MARK} Asha Verma`, seat: 1, shift: 'Day', code: '', joined: new Date(Date.UTC(2021, 3, 1)) },
@@ -346,7 +309,13 @@ const EXAMPLE_MODEL = Object.freeze({
     { seat: 1, text: `${EXAMPLE_MARK} signs off the handover note at the end of every shift.` },
     { seat: 2, text: `${EXAMPLE_MARK} runs the packing line to the day's job card.` },
   ],
-  machines: [{ name: 'Packing line 1', kind: 'Line', where: `${EXAMPLE_MARK} main plant, east wall` }],
+  departments: [
+    { name: 'Operations', under: '', type: `${EXAMPLE_MARK} Department`, shared: false, serves: [] },
+    { name: 'Accounts', under: '', type: `${EXAMPLE_MARK} Department`, shared: false, serves: [] },
+    { name: 'Packing line 1', under: 'Operations', type: `${EXAMPLE_MARK} Machine / area`, shared: false, serves: [] },
+    { name: 'Labelling line', under: 'Operations', type: `${EXAMPLE_MARK} Machine / area`, shared: false, serves: [] },
+    { name: 'Packing helpers', under: 'Operations', type: `${EXAMPLE_MARK} Shared crew`, shared: true, serves: ['Packing line 1', 'Labelling line'] },
+  ],
   questions: [{ seat: 0, text: `${EXAMPLE_MARK} who covers the Plant manager when they are on leave?` }],
 });
 
@@ -359,7 +328,6 @@ function normalise(input) {
   const seats = src.seats.map((s) => ({
     ...s,
     title: squeeze(s.title),
-    machines: (s.machines ?? []).map(squeeze).filter(Boolean),
   }));
   // The outline rule, checked here once so a malformed input fails loudly instead of producing a workbook that lies.
   seats.forEach((s, i) => {
@@ -380,13 +348,14 @@ function normalise(input) {
     seats,
     people: src.people ?? [],
     responsibilities: src.responsibilities ?? [],
-    machines: src.machines ?? [],
+    departments: src.departments ?? [],
+    types: [...new Set([...DEFAULT_TYPES, ...(src.departmentTypes ?? [])])],
     questions: src.questions ?? [],
     caps: {
       structure: capFor(seats.length, 400, 150),
       people: capFor((src.people ?? []).length, 500, 300),
       responsibilities: capFor((src.responsibilities ?? []).length, 1500, 500),
-      machines: capFor((src.machines ?? []).length, 150, 100),
+      departments: capFor((src.departments ?? []).length, 150, 100),
       questions: capFor((src.questions ?? []).length, 400, 200),
     },
   };
@@ -396,10 +365,10 @@ function normalise(input) {
 /**
  * @param {null|object} input  null = the blank template with grey examples.
  *   Otherwise { company:{name,slug}, generatedOn, shifts:[names], startNotes:[text],
- *     seats:[{title, level, count, shift, department, location, machines:[name], notes}]  (OUTLINE ORDER)
+ *     seats:[{title, level, count, shift, department, location, notes}]  (OUTLINE ORDER; department is a NAME on the Departments sheet)
  *     people:[{name, seat:<index>, shift, code, joined:Date|null}],
  *     responsibilities:[{seat:<index>, text}],
- *     machines:[{name, kind, where}],
+ *     departments:[{name, under, type, shared, serves:[name]}]  (a tree, parents first)  departmentTypes:[label]
  *     questions:[{seat:<index>|null, text}] }
  */
 export function buildOrgWorkbook(input = null) {
@@ -422,7 +391,7 @@ export function buildOrgWorkbook(input = null) {
     structure: model.caps.structure + 1,
     people: model.caps.people + 1,
     responsibilities: model.caps.responsibilities + 1,
-    machines: model.caps.machines + 1,
+    departments: model.caps.departments + 1,
     questions: model.caps.questions + 1,
   };
   const seatShifts = [...model.shifts, DAY_AND_NIGHT];
@@ -431,7 +400,7 @@ export function buildOrgWorkbook(input = null) {
   buildStructure(ws[SHEET.structure], model, last.structure);
   buildPeople(ws[SHEET.people], model, last.people);
   buildResponsibilities(ws[SHEET.responsibilities], model, last.responsibilities);
-  buildMachines(ws[SHEET.machines], model, last.machines);
+  buildDepartments(ws[SHEET.departments], model, last.departments);
   buildQuestions(ws[SHEET.questions], model, last.questions);
   buildStart(ws[SHEET.start], model);
 
@@ -439,10 +408,11 @@ export function buildOrgWorkbook(input = null) {
   const names = wb.definedNames;
   names.add(`${SHEET.lists}!$${LISTS.shiftSeat}$2:$${LISTS.shiftSeat}$${1 + seatShifts.length}`, NAMES.seatShifts);
   names.add(`${SHEET.lists}!$${LISTS.shiftPerson}$2:$${LISTS.shiftPerson}$${1 + model.shifts.length}`, NAMES.personShifts);
-  names.add(`${SHEET.lists}!$${LISTS.kind}$2:$${LISTS.kind}$${1 + KINDS.length}`, NAMES.kinds);
+  names.add(`${SHEET.lists}!$${LISTS.type}$2:$${LISTS.type}$${1 + model.types.length}`, NAMES.types);
+  names.add(`${SHEET.lists}!$${LISTS.yesNo}$2:$${LISTS.yesNo}$3`, NAMES.yesNo);
   names.add(`${SHEET.lists}!$${LISTS.label}$2:$${LISTS.label}$${last.structure}`, NAMES.seatLabels);
   names.add(`${SHEET.lists}!$${LISTS.check}$2:$${LISTS.check}$${last.structure}`, NAMES.rowCheck);
-  names.add(`'${SHEET.machines}'!$A$2:$A$${last.machines}`, NAMES.machines);
+  names.add(`${SHEET.departments}!$A$2:$A$${last.departments}`, NAMES.departments);
 
   return wb;
 }
@@ -450,7 +420,7 @@ export function buildOrgWorkbook(input = null) {
 // ------------------------------------------------------------------ Lists ----
 function buildLists(ws, model, last, seatShifts) {
   ws.properties.tabColor = { argb: AUTO };
-  const widths = { A: 16, B: 16, C: 12, D: 3, E: 54, F: 11, G: 8, H: 12, I: 22, J: 11, K: 54, L: 3, M: 60 };
+  const widths = { A: 16, B: 16, C: 18, D: 8, E: 54, F: 11, G: 8, H: 12, I: 22, J: 11, K: 54, L: 3, M: 60 };
   Object.entries(widths).forEach(([c, w]) => { ws.getColumn(c).width = w; });
 
   const head = (c, text) => {
@@ -460,7 +430,8 @@ function buildLists(ws, model, last, seatShifts) {
   };
   head(LISTS.shiftSeat, 'Shift (seats)');
   head(LISTS.shiftPerson, 'Shift (people)');
-  head(LISTS.kind, 'Kind');
+  head(LISTS.type, 'Department type');
+  head(LISTS.yesNo, 'Yes / No');
   head(LISTS.label, 'Seat label, by Structure row');
   head(LISTS.count, 'Titles in row');
   head(LISTS.level, 'Level');
@@ -474,7 +445,8 @@ function buildLists(ws, model, last, seatShifts) {
 
   seatShifts.forEach((v, i) => { ws.getCell(`${LISTS.shiftSeat}${i + 2}`).value = v; });
   model.shifts.forEach((v, i) => { ws.getCell(`${LISTS.shiftPerson}${i + 2}`).value = v; });
-  KINDS.forEach((v, i) => { ws.getCell(`${LISTS.kind}${i + 2}`).value = v; });
+  model.types.forEach((v, i) => { ws.getCell(`${LISTS.type}${i + 2}`).value = v; });
+  [YES, NO].forEach((v, i) => { ws.getCell(`${LISTS.yesNo}${i + 2}`).value = v; });
 
   // Cached results mirror the formulas row by row, so a viewer that does not recalculate still shows the truth.
   let lastLevel = 0;
@@ -500,7 +472,7 @@ function buildLists(ws, model, last, seatShifts) {
 // -------------------------------------------------------------- Structure ----
 function buildStructure(ws, model, lastRow) {
   ws.properties.tabColor = { argb: REQ };
-  const widths = [7.5, ...Array(LEVELS).fill(11), 10, 13, 18, 16, 32, 38, 14];
+  const widths = [7.5, ...Array(LEVELS).fill(11), 10, 13, 28, 16, 38, 14];
   widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
   const headers = HEADERS.structure;
@@ -534,7 +506,6 @@ function buildStructure(ws, model, lastRow) {
     if (seat.shift) ws.getCell(r, COL.shift).value = seat.shift;
     if (seat.department) ws.getCell(r, COL.department).value = squeeze(seat.department);
     if (seat.location) ws.getCell(r, COL.location).value = squeeze(seat.location);
-    if (seat.machines.length) ws.getCell(r, COL.machines).value = seat.machines.join(', ');
     if (seat.notes) ws.getCell(r, COL.notes).value = squeeze(seat.notes);
   }
 
@@ -564,13 +535,11 @@ function buildStructure(ws, model, lastRow) {
     prompt: 'Day & night means the seat runs both shifts. Count the people needed per shift.',
     errorTitle: 'Pick from the list', error: 'Choose one of the shifts in the list.',
   });
-  dv(rng(COL.machines), {
-    type: 'custom', errorStyle: 'warning',
-    formulae: [machineListRule(colLetter(COL.machines), 2)],
-    promptTitle: 'Machines or areas',
-    prompt: `Names from the Machines & areas sheet, separated by commas (up to ${MAX_MACHINES}).`,
-    errorTitle: 'Machine or area not found',
-    error: `One or more names are not on the Machines & areas sheet, or more than ${MAX_MACHINES} are listed. Check the spelling, or add the machine there first.`,
+  dv(rng(COL.department), {
+    type: 'list', formulae: [NAMES.departments],
+    promptTitle: 'Department',
+    prompt: 'The ONE department this seat sits in: a department, a process, a machine or a shared crew. Add it on the Departments sheet first if it is not in the list.',
+    errorTitle: 'Pick from the list', error: 'Choose a department from the list. A new one is added on the Departments sheet first, so it always has a place in the tree.',
   });
   dv(rng(COL.ref), {
     type: 'any', allowBlank: true, showErrorMessage: false,
@@ -707,27 +676,78 @@ function buildResponsibilities(ws, model, lastRow) {
   addRequiredChecks(ws, { cols: ['A', 'B'], spanFrom: 'A', spanTo: 'B', lastRow, priority: 2 });
 }
 
-// ------------------------------------------------------- Machines & areas ----
-function buildMachines(ws, model, lastRow) {
-  ws.properties.tabColor = { argb: 'FF6C6FB8' };
-  const rows = model.machines.map((m) => ({
+// ------------------------------------------------------------ Departments ----
+/**
+ * Every department, process, machine and shared crew as ONE tree: Name, Under (its parent), Type, Shared crew?, and the
+ * departments a shared crew Serves.
+ *
+ * WHY "SERVES" IS A ROW OF DROP-DOWN COLUMNS (Serves 1 to N) AND NOT A COMMA-SEPARATED CELL, AND NOT A SECOND SHEET.
+ * A person fills in what they can see. A comma list is typed from memory, and one misspelt or comma-bearing name breaks it
+ * without a word. A second sheet of (crew, served) pairs scatters one crew over several rows far from the Shared flag.
+ * One drop-down per cell, on the crew's own row, means: every name is picked, never typed; "who does this crew work for" is
+ * answered by reading one row left to right; and a cell that does not apply is greyed out. The cost is a fixed number of slots;
+ * the export refuses (loudly, never by dropping one) a crew that serves more.
+ *
+ * Names are the only handle a human has on a department, so on this sheet a name is unique (case aside). The database itself
+ * does not insist on that; the workbook has to, or "Under: Packing" and "Department: Packing" could mean two things.
+ */
+function buildDepartments(ws, model, lastRow) {
+  ws.properties.tabColor = { argb: REQ };
+  const rows = model.departments.map((d) => ({
     example: model.examples,
-    values: [squeeze(m.name), m.kind ?? 'Machine', squeeze(m.where), m.key ?? ''],
+    values: [
+      squeeze(d.name), squeeze(d.under), squeeze(d.type), d.shared ? YES : NO,
+      ...Array.from({ length: SERVES_SLOTS }, (_, i) => squeeze(d.serves?.[i])),
+      d.key ?? '',
+    ],
   }));
   fillSimpleSheet(ws, {
-    headers: HEADERS.machines, kinds: ['required', 'required', 'optional'], widths: [36, 14, 36], lastRow, rows,
+    headers: HEADERS.departments,
+    kinds: ['required', 'optional', 'optional', 'optional', ...Array(SERVES_SLOTS).fill('optional')],
+    widths: [34, 30, 18, 12, ...Array(SERVES_SLOTS).fill(24)],
+    lastRow, rows,
   });
-  ws.dataValidations.add(`A2:A${lastRow}`, validation({
-    type: 'custom',
-    formulae: [`AND(ISERROR(FIND(",",A2)),COUNTIF($A$2:$A$${lastRow},A2)=1)`],
-    errorTitle: 'Use a plain, unique name',
-    error: 'A name cannot contain a comma (commas separate machines on the Structure sheet) and cannot be listed twice.',
-  }));
-  ws.dataValidations.add(`B2:B${lastRow}`, validation({
-    type: 'list', formulae: [NAMES.kinds],
-    errorTitle: 'Pick from the list', error: 'Choose Machine, Line, Area, Project, Cell or Other.',
-  }));
-  addRequiredChecks(ws, { cols: ['A', 'B'], spanFrom: 'A', spanTo: 'C', lastRow, priority: 1 });
+  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1, topLeftCell: 'B2', activeCell: 'B2' }];
+  const col = (c) => colLetter(c);
+  const servesRange = `${col(DEPT_COL.firstServes)}2:${col(DEPT_COL.lastServes)}${lastRow}`;
+  const dv = (ref, spec) => ws.dataValidations.add(ref, validation(spec));
+
+  dv(`A2:A${lastRow}`, {
+    type: 'custom', formulae: [`COUNTIF($A$2:$A$${lastRow},A2)=1`],
+    promptTitle: 'Name', prompt: 'Named once. Every other sheet picks this department by its name.',
+    errorTitle: 'Name each one once', error: 'Two departments cannot share a name here, because every other sheet picks a department by its name.',
+  });
+  dv(`B2:B${lastRow}`, {
+    type: 'list', formulae: [NAMES.departments],
+    promptTitle: 'Under', prompt: 'The department this one sits inside. Leave empty for a top-level department.',
+    errorTitle: 'Pick from the list', error: 'Choose one of the departments on this sheet, or leave it empty. Add the parent as its own row first.',
+  });
+  dv(`C2:C${lastRow}`, {
+    type: 'list', formulae: [NAMES.types], errorStyle: 'information',
+    promptTitle: 'Type', prompt: 'A label for the level: Department, Process, Machine / area, Shared crew ... Your own word is fine.',
+    errorTitle: 'A new label?', error: 'That label is not one in use yet. Press Yes to keep it, or No to pick from the list.',
+  });
+  dv(`D2:D${lastRow}`, {
+    type: 'list', formulae: [NAMES.yesNo],
+    promptTitle: 'Shared crew?', prompt: 'Yes if this crew works for SEVERAL departments (one helper serving three machines). Then pick them in the Serves columns.',
+    errorTitle: 'Yes or No', error: 'Choose Yes or No.',
+  });
+  dv(servesRange, {
+    type: 'list', formulae: [NAMES.departments],
+    promptTitle: 'Serves', prompt: 'A department this shared crew works for. One per cell; use the next cell for the next one.',
+    errorTitle: 'Pick from the list', error: 'Choose a department from the list.',
+  });
+
+  // What a person should see without being told. Lower number wins.
+  const ruleSet = (ref, rules) => ws.addConditionalFormatting({ ref, rules });
+  ruleSet(`B2:B${lastRow}`, [{ type: 'expression', priority: 1, formulae: ['AND($B2<>"",$B2=$A2)'], style: { fill: cfFill(BAD) } }]);
+  ruleSet(servesRange, [
+    { type: 'expression', priority: 2, formulae: [`AND(${col(DEPT_COL.firstServes)}2<>"",${col(DEPT_COL.firstServes)}2=$A2)`], style: { fill: cfFill(BAD) } }, // a crew cannot serve itself
+    { type: 'expression', priority: 3, formulae: [`AND(${col(DEPT_COL.firstServes)}2<>"",$D2<>"${YES}")`], style: { fill: cfFill(BAD) } },            // only a shared crew serves
+    { type: 'expression', priority: 4, formulae: ['AND($A2<>"",$D2<>"Yes")'], style: { fill: cfFill('FFF1F1F5') } },                                      // greyed out: does not apply
+  ]);
+  ruleSet(`D2:D${lastRow}`, [{ type: 'expression', priority: 5, formulae: [`AND($D2="${YES}",COUNTA($${col(DEPT_COL.firstServes)}2:$${col(DEPT_COL.lastServes)}2)=0)`], style: { fill: cfFill(WARN) } }]); // shared, but serves nobody yet
+  ruleSet(`A2:A${lastRow}`, [{ type: 'expression', priority: 6, formulae: [`AND(COUNTA($B2:$${col(DEPT_COL.lastServes)}2)>0,LEN(TRIM($A2))=0)`], style: { fill: cfFill(WARN) } }]);
 }
 
 // ------------------------------------------------------ Questions & doubts ----
@@ -749,17 +769,17 @@ function buildQuestions(ws, model, lastRow) {
 /** The words on `Start here`. Plain English, no jargon, about one screen. Edit here. */
 const TEXT = Object.freeze({
   title: 'Organisation chart workbook',
-  blank: 'Fill this in once and your whole organisation is set up in one go: the seats, the people in them, what each seat is responsible for, the machines, and the questions still open.',
+  blank: 'Fill this in once and your whole organisation is set up in one go: the departments (machines and shared crews included), the seats, the people in them, what each seat is responsible for, and the questions still open.',
   sheets: [
-    ['Structure', 'Every seat in the organisation, top to bottom, like an indented list. Put each seat\'s title in ONE of the Level columns. It reports to the nearest row above it that sits one column to the left.'],
+    ['Departments', 'Every department, process, machine and shared crew, as one tree. Fill this in FIRST: name each one once, say which department it sits Under, and pick the departments a shared crew Serves.'],
+    ['Structure', 'Every seat in the organisation, top to bottom, like an indented list. Put each seat\'s title in ONE of the Level columns, and pick the ONE department it sits in. It reports to the nearest row above it that sits one column to the left.'],
     ['People', 'Who sits in which seat. Pick the seat from the list.'],
     ['Responsibilities', 'One line per duty: pick the seat, write the duty.'],
-    ['Machines & areas', 'Every machine, line or area people work on. Name them here once, then pick them on Structure.'],
     ['Questions & doubts', 'Anything still undecided, about one seat or about the whole organisation.'],
   ],
   wrong: [
     ['A seat is not a person.', 'One row on Structure is one SEAT. Need four operators? That is one row with 4 in "How many people?", not four rows. Names go on the People sheet.'],
-    ['A machine is never a manager.', 'Machines do not go on Structure. List them on Machines & areas, then name them on the seat that works them.'],
+    ['A machine is a department, not a manager.', 'Put each machine on Departments, under the process it belongs to, and pick it in the Department column of the seats that work it. A seat sits in ONE department.'],
     ['Day and night is counted per shift.', 'If a seat runs both shifts, choose "Day & night" and write how many people it needs on EACH shift. Two on days and two on nights is 2, not 4.'],
   ],
   headings: [
@@ -771,6 +791,7 @@ const TEXT = Object.freeze({
     ['Never type an ID.', ' Ref fills itself in, and everywhere else you pick the seat from a list.'],
     ['Same title, same job.', ' Seats with one title share one list of responsibilities, so write each duty once.'],
     ['One person in two seats?', ' Add them twice on People, with the same name.'],
+    ['A crew that works for several machines?', ' Give it one row on Departments, set Shared crew? to Yes, and pick each department it works for in the Serves cells. Only a shared crew can serve; a crew cannot serve itself.'],
   ],
   goodRowsBlank: ['Leave the Structure rows where they are.', ' Ref follows the row, so inserting or deleting rows moves seats about. A seat picked elsewhere that turns red must be picked again.'],
   goodRowsFilled: [
@@ -827,7 +848,7 @@ function buildStart(ws, model) {
       const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
       sub = `Filled in from what ${model.company.name} has in the system${model.generatedOn ? ` on ${model.generatedOn}` : ''}: `
         + `${n(model.seats.length, 'seat', 'seats')}, ${n(model.people.length, 'person', 'people')}, `
-        + `${n(model.responsibilities.length, 'responsibility', 'responsibilities')}, ${n(model.machines.length, 'machine or area', 'machines and areas')}, `
+        + `${n(model.responsibilities.length, 'responsibility', 'responsibilities')}, ${n(model.departments.length, 'department', 'departments')}, `
         + `${n(model.questions.length, 'open question', 'open questions')}. Correct what is wrong, add what is missing, and send it back.`;
     }
     cell.value = sub;
@@ -1029,7 +1050,7 @@ export function checkOrgWorkbook(wb, expected = null) {
     need(Boolean(w.sheetProtection?.sheet) === shouldBeProtected, `${w.name} is ${w.sheetProtection?.sheet ? 'protected' : 'not protected'}`);
   }
 
-  const headerKeys = { structure: SHEET.structure, people: SHEET.people, responsibilities: SHEET.responsibilities, machines: SHEET.machines, questions: SHEET.questions };
+  const headerKeys = { departments: SHEET.departments, structure: SHEET.structure, people: SHEET.people, responsibilities: SHEET.responsibilities, questions: SHEET.questions };
   for (const [key, name] of Object.entries(headerKeys)) {
     const w = wb.getWorksheet(name);
     if (!w) continue;
@@ -1076,12 +1097,15 @@ export function checkOrgWorkbook(wb, expected = null) {
     // ExcelJS hands a range's rule back cell by cell, so ask the first data row of each column.
     const dvOf = (name, col) => wb.getWorksheet(name).getCell(`${col}2`).dataValidation;
     need(dvOf(SHEET.structure, colLetter(COL.shift))?.type === 'list', 'Structure Shift has no drop-down');
-    need(dvOf(SHEET.structure, colLetter(COL.machines))?.type === 'custom', 'Structure Machines has no rule');
+    need(dvOf(SHEET.structure, colLetter(COL.department))?.type === 'list', 'Structure Department has no drop-down');
     need(dvOf(SHEET.structure, FIRST_LEVEL_COL)?.type === 'custom', 'Structure Level columns have no one-title rule');
     need(dvOf(SHEET.people, 'B')?.type === 'list', 'People Seat has no drop-down');
     need(dvOf(SHEET.people, 'C')?.type === 'list', 'People Shift has no drop-down');
     need(dvOf(SHEET.responsibilities, 'A')?.type === 'list', 'Responsibilities Seat has no drop-down');
-    need(dvOf(SHEET.machines, 'B')?.type === 'list', 'Machines Kind has no drop-down');
+    need(dvOf(SHEET.departments, 'B')?.type === 'list', 'Departments Under has no drop-down');
+    need(dvOf(SHEET.departments, 'C')?.type === 'list', 'Departments Type has no drop-down');
+    need(dvOf(SHEET.departments, 'D')?.type === 'list', 'Departments Shared crew? has no drop-down');
+    need(dvOf(SHEET.departments, colLetter(DEPT_COL.firstServes))?.type === 'list', 'Departments Serves has no drop-down');
     need(dvOf(SHEET.questions, 'A')?.type === 'list', 'Questions About has no drop-down');
     stats.dropdowns = Object.values(headerKeys).reduce((n, name) => {
       const w = wb.getWorksheet(name);
@@ -1096,18 +1120,19 @@ export function checkOrgWorkbook(wb, expected = null) {
     const bad = outline.filter((o) => o.problem);
     need(bad.length === 0, `outline problems: ${bad.slice(0, 3).map((o) => `row ${o.row} ${o.problem}`).join('; ')}`);
     const labels = new Set(outline.filter((o) => !o.problem).map((o) => seatLabel(o.row - 2, o.title)));
-    const machinesSeen = new Set(usedRows(wb.getWorksheet(SHEET.machines), 3).map((x) => machineKey(x.values[0])));
+    const deptWidth = HEADERS.departments.length - 1;
+    const departments = usedRows(wb.getWorksheet(SHEET.departments), deptWidth);
+    const deptNames = new Set(departments.map((x) => norm(x.values[0])));
 
     const people = usedRows(wb.getWorksheet(SHEET.people), 5);
     const resp = usedRows(wb.getWorksheet(SHEET.responsibilities), 2);
-    const machines = usedRows(wb.getWorksheet(SHEET.machines), 3);
     const questions = usedRows(wb.getWorksheet(SHEET.questions), 2);
     const structRows = usedRows(structure, LAST_COL);
     Object.assign(stats, {
       seats: outline.length,
       deepestLevel: Math.max(0, ...outline.map((o) => o.level ?? 0)),
-      people: people.length, responsibilities: resp.length, machines: machines.length, questions: questions.length,
-      exampleRows: [structRows, people, resp, machines, questions].reduce((n, rows) => n + rows.filter((x) => isExampleRow(x.values)).length, 0),
+      people: people.length, responsibilities: resp.length, departments: departments.length, questions: questions.length,
+      exampleRows: [structRows, people, resp, departments, questions].reduce((n, rows) => n + rows.filter((x) => isExampleRow(x.values)).length, 0),
     });
 
     // ---- the keys: what a reader will use to know which record each row is ----
@@ -1123,7 +1148,7 @@ export function checkOrgWorkbook(wb, expected = null) {
       checkKeys('Structure', outline.map((o) => ({ row: o.row })), SHEET.structure, 'structure', expected.seats);
       checkKeys('People', people, SHEET.people, 'people', expected.people);
       checkKeys('Responsibilities', resp, SHEET.responsibilities, 'responsibilities', expected.responsibilities);
-      checkKeys('Machines', machines, SHEET.machines, 'machines', expected.machines);
+      checkKeys('Departments', departments, SHEET.departments, 'departments', expected.departments);
       checkKeys('Questions', questions, SHEET.questions, 'questions', expected.questions);
     } else {
       for (const [key, name] of Object.entries(headerKeys)) {
@@ -1136,10 +1161,13 @@ export function checkOrgWorkbook(wb, expected = null) {
     for (const x of resp) need(labels.has(x.values[0]), `Responsibilities row ${x.row}: seat "${x.values[0]}" is not on Structure`);
     for (const x of questions) need(!x.values[0] || labels.has(x.values[0]), `Questions row ${x.row}: seat "${x.values[0]}" is not on Structure`);
     for (const x of structRows) {
-      const text = x.values[COL.machines - 1];
-      for (const name of splitMachineList(text, machinesSeen)) {
-        need(machinesSeen.has(machineKey(name)), `Structure row ${x.row}: "${name}" is not on Machines & areas`);
-      }
+      const d = x.values[COL.department - 1];
+      need(!d || deptNames.has(norm(d)), `Structure row ${x.row}: department "${d}" is not on the Departments sheet`);
+    }
+    for (const x of departments) {
+      const [name, under, , , ...serves] = x.values;
+      need(!under || deptNames.has(norm(under)), `Departments row ${x.row}: "${name}" is under "${under}", which is not on the sheet`);
+      for (const s of serves.filter(Boolean)) need(deptNames.has(norm(s)), `Departments row ${x.row}: "${name}" serves "${s}", which is not on the sheet`);
     }
 
     // ---- against the data it was built from ----
@@ -1148,7 +1176,7 @@ export function checkOrgWorkbook(wb, expected = null) {
       eq(outline.length, expected.seats.length, 'structure rows');
       eq(people.length, expected.people.length, 'people');
       eq(resp.length, expected.responsibilities.length, 'responsibilities');
-      eq(machines.length, expected.machines.length, 'machines');
+      eq(departments.length, expected.departments.length, 'departments');
       eq(questions.length, expected.questions.length, 'questions');
       eq(stats.exampleRows, 0, 'example rows left in a filled workbook');
       expected.seats.forEach((seat, i) => {

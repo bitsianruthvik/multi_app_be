@@ -30,7 +30,8 @@
  * REMOVING. A row missing from the workbook is ambiguous (deleted, or the sheet was never filled in), so nothing is removed
  * unless --delete-missing is given, and a sheet with NO rows never removes anything. Even then nothing is erased: a seat is
  * CLOSED (it keeps its history and leaves the chart), a person's assignment is ENDED, a duty is retired, a question dismissed.
- * Only a machine is deleted, and only when nothing refers to it.
+ * A DEPARTMENT (a machine or a shared crew is one) is retired, with the application's own soft delete, only when no seat sits
+ * in it and nothing is under it or refers to it; otherwise the plan names what is in the way.
  *
  * SAFETY, in the order it is checked:
  *   1. the workbook's provenance names the company, database and schema version; a mismatch is REFUSED, never applied;
@@ -53,9 +54,9 @@ import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
 import { loadOrg } from './org-template.mjs';
 import {
-  fingerprintOf, squeeze, seatLabel, machineKey, parseKey, DAY_AND_NIGHT, SHEET,
+  fingerprintOf, squeeze, seatLabel, parseKey, DAY_AND_NIGHT, SHEET,
 } from './lib/orgTemplateSheets.mjs';
-import { readOrgWorkbook, SUPPORTED_SCHEMA_VERSIONS } from './lib/orgWorkbookReader.mjs';
+import { readOrgWorkbook, schemaVersionProblem } from './lib/orgWorkbookReader.mjs';
 import { isDayCode, isNightCode } from '../services/seatCount.js';
 import * as positionSvc from '../services/positionService.js';
 import * as assignmentSvc from '../services/assignmentService.js';
@@ -74,8 +75,6 @@ const dayBefore = (iso) => { const d = new Date(`${iso}T00:00:00`); d.setDate(d.
 const day = (v) => (v == null ? null : String(v).slice(0, 10));
 const joinedText = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : null);
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-/** KIND_OF in org-template.mjs, reversed: 'Machine' -> 'MACHINE'. */
-const typeOfKind = (kind) => String(kind).toUpperCase();
 
 const SOURCE_NOTE = 'Applied from the organisation workbook';
 
@@ -88,7 +87,6 @@ async function loadEnv(conn, companyId) {
   const q = async (sql, params = []) => (await conn.query(sql, params))[0];
   const shifts = await q("SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL AND status = 'ACTIVE' ORDER BY id", [companyId]);
   const roles = await q('SELECT id, title, status FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
-  const departments = await q('SELECT id, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [companyId]);
   const locations = await q('SELECT id, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [companyId]);
   const employees = await q(
     `SELECT id, employee_code AS code, full_name AS name, employment_status AS status, date_of_joining AS joined
@@ -107,7 +105,7 @@ async function loadEnv(conn, companyId) {
     shifts, shiftByName: new Map(shifts.map((s) => [norm(s.name), s])),
     dayShift: shifts.find((s) => isDayCode(s.code)) ?? null, nightShift: shifts.find((s) => isNightCode(s.code)) ?? null,
     roleByTitle: new Map(roles.map((r) => [norm(r.title), r])),
-    departmentByName: new Map(departments.map((d) => [norm(d.name), d])),
+    deptUse: await loadDepartmentUse(q, companyId),
     locationByName: new Map(locations.map((l) => [norm(l.name), l])),
     employees, positionCodes,
     defsByText: new Map(), defById: new Map(defs.map((d) => [d.id, d])),
@@ -119,6 +117,26 @@ async function loadEnv(conn, companyId) {
     env.defsByText.get(key).push(d);
   }
   return env;
+}
+
+/**
+ * What still points at each department, counted the way the service's own delete counts it (live rows only; a CLOSED seat is a
+ * live row and still points at its department). deleteDepartment refuses while any of these is non-zero.
+ */
+async function loadDepartmentUse(q, companyId) {
+  const use = new Map();
+  const slot = (id) => { if (!use.has(id)) use.set(id, { liveSeats: 0, closedSeats: 0, roles: 0, assignments: 0, contexts: 0, servedBy: [] }); return use.get(id); };
+  for (const r of await q("SELECT department_id AS id, status, COUNT(*) AS n FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND department_id IS NOT NULL GROUP BY department_id, status", [companyId])) {
+    slot(r.id)[r.status === 'CLOSED' ? 'closedSeats' : 'liveSeats'] += Number(r.n);
+  }
+  for (const [table, column, field] of [['hrms_roles', 'default_department_id', 'roles'], ['hrms_work_assignments', 'department_id', 'assignments'], ['hrms_work_contexts', 'department_id', 'contexts']]) {
+    for (const r of await q(`SELECT ${column} AS id, COUNT(*) AS n FROM ${table} WHERE company_id = ? AND deleted_at IS NULL AND ${column} IS NOT NULL GROUP BY ${column}`, [companyId])) slot(r.id)[field] += Number(r.n);
+  }
+  for (const r of await q(
+    `SELECT s.department_id AS server, s.serves_department_id AS id FROM hrms_department_serves s
+       JOIN hrms_departments sd ON sd.company_id = s.company_id AND sd.id = s.department_id AND sd.deleted_at IS NULL
+      WHERE s.company_id = ? AND s.deleted_at IS NULL`, [companyId])) slot(r.id).servedBy.push(r.server);
+  return use;
 }
 
 /** The nearest existing name within two edits, to say "did you mean" when a new department or location is typed. */
@@ -164,19 +182,19 @@ function nextCode(codes, fallbackPrefix, fallbackWidth) {
 // ======================================================================================= the plan ====
 function newPlan() {
   return {
-    departments: [], locations: [], roles: [],
-    machines: { create: [], update: [], remove: [] },
+    locations: [], roles: [],
+    departments: { create: [], update: [], remove: [] },
     seats: { create: [], update: [], close: [] },
     people: { employeesCreate: [], employeesUpdate: [], assign: [], move: [], shift: [], end: [] },
     responsibilities: { add: [], retext: [], move: [], remove: [] },
     questions: { create: [], update: [], dismiss: [] },
     notices: [],   // understood, but not (or not fully) saved: { code, sheet, row, message }
-    kept: { seats: [], people: [], responsibilities: [], machines: [], questions: [] }, // in the database, not in the workbook, left alone
+    kept: { seats: [], people: [], responsibilities: [], departments: [], questions: [] }, // in the database, not in the workbook, left alone
     problems: [],  // { severity: 'error'|'warning', code, sheet, row, message }
   };
 }
 
-function makeContext(read, loaded, env, deleteMissing, exportLabels = null) {
+function makeContext(read, loaded, env, deleteMissing, exportLabels = null, exportDeptNames = null) {
   const { data } = loaded;
   const plan = newPlan();
   const X = {
@@ -188,13 +206,13 @@ function makeContext(read, loaded, env, deleteMissing, exportLabels = null) {
     dbSeatIndex: new Map(data.seats.map((s, i) => [s.key, i])),
     dbPeople: new Map(data.people.map((p) => [p.key, p])),
     dbResp: new Map(data.responsibilities.map((r) => [r.key, r])),
-    dbMachine: new Map(data.machines.map((m) => [m.key, m])),
+    dbDept: new Map(data.departments.map((d) => [d.key, d])),
     dbQuestion: new Map(data.questions.map((q) => [q.key, q])),
     seatRefOf: [],            // workbook seat index -> 'pos:ID' | 'new:ROW' | 'lost:ROW'
     newSeat: new Map(),       // 'new:ROW' -> the plan.seats.create entry
-    machineRefOf: new Map(),  // machineKey(name) -> 'wct:ID' | 'new:ROW' | 'lost:ROW'
-    machineNameOf: new Map(), // 'wct:ID' | 'new:ROW' -> the name shown
-    claimed: { seats: new Set(), people: new Set(), responsibilities: new Set(), machines: new Set(), questions: new Set() },
+    deptRefByName: new Map(), // norm(name as the workbook spells it) -> 'dep:ID' | 'new:ROW' | 'lost:ROW'
+    oldDeptNames: new Map(),  // norm(the name a renamed department had at export) -> its key: a cell may still say it
+    claimed: { seats: new Set(), people: new Set(), responsibilities: new Set(), departments: new Set(), questions: new Set() },
     ambiguous: new Map(), stale: new Map(),
   };
   // The label a seat had WHEN THE WORKBOOK WAS WRITTEN. Normally that is what the database says now; the re-check after
@@ -204,6 +222,10 @@ function makeContext(read, loaded, env, deleteMissing, exportLabels = null) {
     const i = X.dbSeatIndex.get(key);
     return i == null ? null : seatLabel(i, data.seats[i].title);
   };
+  // The name a department had WHEN THE WORKBOOK WAS WRITTEN (a seat's Department cell still says it after a rename).
+  X.dbDeptName = (key) => exportDeptNames?.get(key) ?? X.dbDept.get(key)?.name ?? null;
+  /** A department named in a cell: the name on the Departments sheet, or the name a renamed department had when the workbook was written. */
+  X.resolveDept = (name) => X.deptRefByName.get(norm(name)) ?? X.oldDeptNames.get(norm(name)) ?? null;
   X.seatKeyOfIndex = (i) => (i == null ? null : data.seats[i].key);
   X.seatName = (ref) => {
     if (ref == null) return '(the top of the chart)';
@@ -291,11 +313,6 @@ function flushSeatLabelWarnings(X) {
   }
 }
 
-function needDepartment(X, name, row) {
-  if (!name) return;
-  if (X.env.departmentByName.has(norm(name)) || X.plan.departments.some((d) => norm(d.name) === norm(name))) return;
-  X.plan.departments.push({ name, row, similar: nearest(name, [...X.env.departmentByName.values()].map((d) => d.name)) });
-}
 function needLocation(X, name, row) {
   if (!name) return;
   if (X.env.locationByName.has(norm(name)) || X.plan.locations.some((l) => norm(l.name) === norm(name))) return;
@@ -313,57 +330,107 @@ function checkShift(X, name, sheet, row, { seat = false } = {}) {
   return true;
 }
 
-// ================================================================================== machines ====
-function planMachines(X) {
+// ============================================================================== departments ====
+/**
+ * The Departments sheet against the department tree. Everything is matched by KEY; names are only what a person sees, so a rename
+ * keeps every seat in it (seats refer to a department by the key behind its name). The rules below are the service's own
+ * (organisationService: no cycle; only a shared department serves, never itself) plus one the service does not make: names are
+ * unique, because every other sheet picks a department by name.
+ */
+function planDepartments(X) {
   const { read, plan, data } = X;
-  for (const m of data.machines) X.machineNameOf.set(m.key, m.name);
+  const rows = read.departments.filter((w) => w.name);
+  const refOfRow = new Map();
 
-  for (const w of read.machines) {
-    if (!w.name) continue; // already an error from the reader
+  // identity first, so a department can be named as the parent of, or served by, any other
+  for (const w of rows) {
+    let ref;
     if (w.keyState === 'ok') {
-      const db = X.dbMachine.get(w.key);
-      if (!db) {
-        X.err('KEY_NOT_IN_DATABASE', w.sheet, w.row, `Machines & areas row ${w.row} ("${w.name}") has the key ${w.key}, which is not in the database any more (deleted elsewhere?). Clear its Key cell to add it again as new, or delete the row.`);
-        X.machineRefOf.set(machineKey(w.name), `lost:${w.row}`);
-        continue;
+      if (!X.dbDept.has(w.key)) {
+        X.err('KEY_NOT_IN_DATABASE', w.sheet, w.row, `Departments row ${w.row} ("${w.name}") has the key ${w.key}, which is not in the database any more (retired elsewhere?). Clear its Key cell to add it again as new, or delete the row.`);
+        ref = `lost:${w.row}`;
+      } else { ref = w.key; X.claimed.departments.add(w.key); }
+    } else ref = `new:${w.row}`;
+    refOfRow.set(w.row, ref);
+    X.deptRefByName.set(norm(w.name), ref);
+  }
+  for (const w of rows) {
+    const ref = refOfRow.get(w.row);
+    const was = ref.startsWith('dep:') ? X.dbDeptName(ref) : null;
+    if (was && norm(was) !== norm(w.name) && !X.deptRefByName.has(norm(was))) X.oldDeptNames.set(norm(was), ref);
+  }
+  const refOfName = (name, row, what) => {
+    if (!name) return null;
+    const ref = X.resolveDept(name);
+    if (ref?.startsWith('lost:')) { X.err('KEY_NOT_IN_DATABASE', SHEET.departments, row, `Departments row ${row}: ${what} "${name}" is a row whose Key is not in the database; fix that row first.`); return undefined; }
+    if (!ref) { X.err(what === 'Under' ? 'UNKNOWN_PARENT' : 'UNKNOWN_SERVES', SHEET.departments, row, `Departments row ${row}: ${what} "${name}" is not a department on this sheet.`); return undefined; }
+    return ref;
+  };
+
+  const finalParent = new Map();
+  for (const w of rows) {
+    const ref = refOfRow.get(w.row);
+    if (ref.startsWith('lost:')) continue;
+    const parentRef = refOfName(w.under, w.row, 'Under');
+    const servesRefs = [...w.serves, ...(w.servesUnlisted ?? [])].map((s) => refOfName(s, w.row, 'Serves')).filter((r) => r != null);
+    finalParent.set(ref, parentRef ?? null);
+    const nameOf = (r) => rows.find((x) => refOfRow.get(x.row) === r)?.name ?? X.dbDeptName(r) ?? r;
+    if (ref.startsWith('new:')) {
+      plan.departments.create.push({
+        row: w.row, ref, name: w.name, under: w.under, parentRef: parentRef ?? null, type: w.type, shared: w.shared,
+        serves: servesRefs.map((r) => ({ ref: r, name: nameOf(r) })), copied: w.keyState === 'duplicate',
+      });
+      continue;
+    }
+    const db = X.dbDept.get(ref);
+    const set = {};
+    if (w.name !== db.name) set.name = { from: db.name, to: w.name };
+    if ((parentRef ?? null) !== (db.parentKey ?? null) && parentRef !== undefined) {
+      set.parent = { from: db.parentKey, to: parentRef, fromName: db.under, toName: w.under };
+    }
+    if (w.type !== db.type) set.type = { from: db.type, to: w.type };
+    if (w.shared !== db.shared) set.shared = { from: db.shared, to: w.shared };
+    const want = new Set(servesRefs);
+    const have = new Set(db.servesKeys);
+    const add = [...want].filter((r) => !have.has(r)).map((r) => ({ ref: r, name: nameOf(r) }));
+    const remove = [...have].filter((r) => !want.has(r)).map((r) => ({ ref: r, name: nameOf(r) }));
+    if (add.length || remove.length) set.serves = { add, remove, final: [...want] };
+    if (Object.keys(set).length) plan.departments.update.push({ key: ref, id: db.id, row: w.row, label: db.name, set });
+  }
+
+  // a parent that was named by an old name can close a loop the reader could not see
+  if (!read.problems.some((p) => p.code === 'DEPARTMENT_CYCLE')) {
+    const seen = new Set();
+    for (const start of finalParent.keys()) {
+      const path = new Set();
+      let cur = start;
+      while (cur && finalParent.has(cur) && !path.has(cur) && !seen.has(cur)) { path.add(cur); cur = finalParent.get(cur); }
+      if (cur && path.has(cur)) {
+        const name = rows.find((x) => refOfRow.get(x.row) === cur)?.name ?? cur;
+        X.err('DEPARTMENT_CYCLE', SHEET.departments, null, `Departments: "${name}" would sit under itself, round in a circle. A department cannot be under itself, even through others.`);
       }
-      X.claimed.machines.add(w.key);
-      X.machineRefOf.set(machineKey(w.name), w.key);
-      X.machineNameOf.set(w.key, w.name);
-      const set = {};
-      if (w.name !== db.name) set.name = { from: db.name, to: w.name };
-      if (w.kind && typeOfKind(w.kind) !== db.typeCode) set.kind = { from: db.kind, to: w.kind };
-      if (w.where !== db.where) set.where = { from: db.where, to: w.where };
-      if (set.name?.to.includes(',')) X.err('COMMA_IN_NAME', w.sheet, w.row, `Machines & areas row ${w.row}: a machine name cannot contain a comma (commas separate the machines on Structure).`);
-      if (set.where) needLocation(X, w.where, w.row);
-      if (Object.keys(set).length) plan.machines.update.push({ key: w.key, id: db.id, row: w.row, label: db.name, set });
-    } else {
-      const ref = `new:${w.row}`;
-      X.machineRefOf.set(machineKey(w.name), ref);
-      X.machineNameOf.set(ref, w.name);
-      if (w.name.includes(',')) X.err('COMMA_IN_NAME', w.sheet, w.row, `Machines & areas row ${w.row}: a machine name cannot contain a comma (commas separate the machines on Structure).`);
-      needLocation(X, w.where, w.row);
-      plan.machines.create.push({ row: w.row, ref, name: w.name, kind: w.kind, where: w.where, copied: w.keyState === 'duplicate' });
+      path.forEach((p) => seen.add(p));
     }
   }
-  // a machine keeps its name unless the workbook renames it: two different machines may not end up with one name
-  const finalOfDb = new Map(data.machines.map((m) => [m.key, plan.machines.update.find((u) => u.key === m.key)?.set.name?.to ?? m.name]));
-  const seen = new Map();
-  for (const [key, name] of finalOfDb) {
-    if (seen.has(machineKey(name))) X.err('MACHINE_NAME_TAKEN', SHEET.machines, null, `Two machines would both be called "${name}" (${seen.get(machineKey(name))} and ${key}).`);
-    seen.set(machineKey(name), key);
-  }
-  for (const c of plan.machines.create) {
-    if (seen.has(machineKey(c.name))) X.err('MACHINE_NAME_TAKEN', SHEET.machines, c.row, `Machines & areas row ${c.row}: "${c.name}" is already the name of a machine (${seen.get(machineKey(c.name))}). A machine is named once; link it on Structure instead.`);
-    seen.set(machineKey(c.name), c.ref);
+
+  // a name must say one department: against the others on the sheet (the reader did that) and against the ones the sheet leaves alone
+  const keptNames = new Map(data.departments.filter((d) => !X.claimed.departments.has(d.key)).map((d) => [norm(d.name), d]));
+  if (rows.length && !X.deleteMissing) {
+    for (const w of rows) {
+      const other = keptNames.get(norm(w.name));
+      const ref = refOfRow.get(w.row);
+      if (other && other.key !== ref) {
+        X.err('DEPARTMENT_NAME_TAKEN', w.sheet, w.row, `Departments row ${w.row}: "${w.name}" is already the name of another department that is not on this sheet (${other.key}). Every other sheet picks a department by name, so a name must say one department. Rename one of them.`);
+      }
+    }
   }
 
-  const missing = data.machines.filter((m) => !X.claimed.machines.has(m.key));
-  if (!read.machines.length) {
-    if (missing.length) X.notice('SHEET_EMPTY', SHEET.machines, null, `${SHEET.machines} has no rows, so none of the ${missing.length} machines in the database were treated as missing.`);
+  const missing = data.departments.filter((d) => !X.claimed.departments.has(d.key));
+  if (!rows.length) {
+    if (missing.length) X.notice('SHEET_EMPTY', SHEET.departments, null, `${SHEET.departments} has no rows, so none of the ${missing.length} departments in the database were treated as missing.`);
     return;
   }
-  plan.kept.machines = missing;
+  plan.kept.departments = missing;
 }
 
 // ==================================================================================== seats ====
@@ -381,11 +448,14 @@ function planSeats(X) {
     } else X.seatRefOf[i] = `new:${w.row}`;
   });
   const parentRef = (w) => (w.parent == null ? null : X.seatRefOf[w.parent]);
-  const machineRefs = (names, row) => names.map((n) => {
-    const ref = X.machineRefOf.get(machineKey(n));
-    if (ref?.startsWith('lost:')) { X.err('KEY_NOT_IN_DATABASE', SHEET.structure, row, `Structure row ${row}: the machine "${n}" is on a Machines & areas row whose Key is not in the database; fix that row first.`); return null; }
+  /** The department a Structure cell names, as a ref ('dep:ID' | 'new:ROW'), or null for none. */
+  const deptRef = (name, row, title) => {
+    if (!name) return null;
+    const ref = X.resolveDept(name);
+    if (!ref) { X.err('UNKNOWN_DEPARTMENT', SHEET.structure, row, `Structure row ${row} ("${title}"): the department "${name}" is not on the Departments sheet. Add it there first (under the department it belongs to), then pick it here.`); return null; }
+    if (ref.startsWith('lost:')) { X.err('KEY_NOT_IN_DATABASE', SHEET.structure, row, `Structure row ${row} ("${title}"): the department "${name}" is a Departments row whose Key is not in the database; fix that row first.`); return null; }
     return ref;
-  }).filter(Boolean);
+  };
   const dbParentKey = (s) => X.seatKeyOfIndex(s.parent);
 
   // new seats first (in row order, so a new seat's own parent is already known), then edits to existing ones
@@ -398,7 +468,7 @@ function planSeats(X) {
     if (w.count == null) X.err('COUNT_REQUIRED', w.sheet, w.row, `Structure row ${w.row} ("${w.title}") is a new seat and needs "How many people?".`);
     if (w.shift) checkShift(X, w.shift, w.sheet, w.row, { seat: true });
     else X.warn('SHIFT_EMPTY', w.sheet, w.row, `Structure row ${w.row} ("${w.title}") is a new seat with no Shift, so it will have no default shift.`);
-    needDepartment(X, w.department, w.row);
+    const departmentRef = deptRef(w.department, w.row, w.title);
     needLocation(X, w.location, w.row);
     const parent = parentRef(w);
     if (w.parent == null) X.warn('NEW_TOP_LEVEL_SEAT', w.sheet, w.row, `Structure row ${w.row} ("${w.title}") is a new seat at Level 1: it will have no manager. (Indent it under a seat if that is not what you meant.)`);
@@ -406,7 +476,7 @@ function planSeats(X) {
     const entry = {
       row: w.row, ref, title: w.title, roleId: roleDb?.id ?? null, roleTitle: roleDb?.title ?? w.title,
       count: w.count, shift: w.shift, department: w.department, location: w.location,
-      machines: machineRefs(w.machines, w.row), parent, copiedFrom: w.keyState === 'duplicate' ? w.key : null,
+      departmentRef, parent, copiedFrom: w.keyState === 'duplicate' ? w.key : null,
     };
     X.newSeat.set(ref, entry);
     plan.seats.create.push(entry);
@@ -422,14 +492,15 @@ function planSeats(X) {
     if (w.count == null) X.warn('COUNT_KEPT', w.sheet, w.row, `Structure row ${w.row} ("${w.title}"): "How many people?" was cleared, but a seat always has a headcount; ${db.count} was kept.`);
     if (w.shift && w.shift !== db.shift && checkShift(X, w.shift, w.sheet, w.row, { seat: true })) set.shift = { from: db.shift, to: w.shift };
     if (!w.shift && db.shift) X.warn('SHIFT_KEPT', w.sheet, w.row, `Structure row ${w.row} ("${w.title}"): Shift was cleared; "${db.shift}" was kept.`);
-    if (w.department !== db.department) { set.department = { from: db.department, to: w.department }; needDepartment(X, w.department, w.row); }
+    // The department: by KEY. A cell that still holds the name this seat's department had at export time has not been touched, even if
+    // that department was renamed on the Departments sheet (a rename must not move its seats).
+    {
+      const wantDept = deptRef(w.department, w.row, w.title);   // an old name of a renamed department resolves to that department
+      if ((wantDept ?? null) !== (db.departmentKey ?? null) && !(w.department && !wantDept)) {
+        set.department = { from: db.department, to: w.department, toRef: wantDept };
+      }
+    }
     if (w.location !== db.location) { set.location = { from: db.location, to: w.location }; needLocation(X, w.location, w.row); }
-
-    const wantMachines = new Set(machineRefs(w.machines, w.row));
-    const haveMachines = new Set(db.contextLinks.map((l) => `wct:${l.contextId}`));
-    const add = [...wantMachines].filter((m) => !haveMachines.has(m));
-    const remove = [...haveMachines].filter((m) => !wantMachines.has(m));
-    if (add.length || remove.length) set.machines = { add, remove };
 
     const from = dbParentKey(db);
     const to = parentRef(w);
@@ -757,13 +828,48 @@ function planRemovals(X) {
   }
   const aboutClosed = data.questions.filter((q) => q.seat != null && closing.has(data.seats[q.seat].key));
   if (aboutClosed.length) X.notice('QUESTIONS_ABOUT_CLOSED_SEAT', SHEET.questions, null, `${plural(aboutClosed.length, 'open question')} about a closing seat stay open and will be listed as general questions in the next export.`);
-  // machines: only when nothing refers to them (after the plan's own changes)
-  const unlinked = new Map(); // ref -> number of seat links the plan removes
-  for (const u of plan.seats.update) for (const ref of u.set.machines?.remove ?? []) unlinked.set(ref, (unlinked.get(ref) ?? 0) + 1);
-  for (const m of plan.kept.machines) {
-    const links = data.seats.filter((s) => s.contextLinks.some((l) => l.contextId === m.id)).length - (unlinked.get(m.key) ?? 0);
-    plan.machines.remove.push({ key: m.key, id: m.id, name: m.name, stillLinked: Math.max(0, links) });
-    if (links > 0) X.err('MACHINE_IN_USE', SHEET.machines, null, `The machine "${m.name}" is missing from Machines & areas but ${plural(links, 'seat')} still list${links === 1 ? 's' : ''} it (seats that are not in the workbook, or whose rows still name it).`);
+  planDepartmentRemovals(X);
+}
+
+/**
+ * A department missing from the sheet is retired - with the application's own soft delete - only when nothing is left pointing at
+ * it AFTER this plan's other changes (seats moved out, serves rows dropped, children removed first). Anything else is named.
+ */
+function planDepartmentRemovals(X) {
+  const { plan, data, env } = X;
+  if (!plan.kept.departments.length) return;
+  const depth = (d) => { let n = 0; for (let cur = d; cur.parentKey; cur = X.dbDept.get(cur.parentKey) ?? { parentKey: null }) n++; return n; };
+  const removedOk = new Set();
+  const ordered = [...plan.kept.departments].sort((a, b) => depth(b) - depth(a));   // children before parents
+  const movedOut = new Map();                      // department id -> seats the plan moves out of it
+  for (const u of plan.seats.update) {
+    if (!u.set.department) continue;
+    const db = data.seats.find((s) => s.key === u.key);
+    if (db?.departmentId != null && db.departmentKey !== (u.set.department.toRef ?? null)) movedOut.set(db.departmentId, (movedOut.get(db.departmentId) ?? 0) + 1);
+  }
+  const closing = new Set(plan.seats.close.map((s) => s.key));
+  const serveRemoved = new Set();                  // 'serverId>servedId' pairs the plan drops
+  for (const u of plan.departments.update) for (const r of u.set.serves?.remove ?? []) serveRemoved.add(`${u.id}>${X.dbDept.get(r.ref)?.id}`);
+  for (const d of ordered) {
+    const use = env.deptUse.get(d.id) ?? { liveSeats: 0, closedSeats: 0, roles: 0, assignments: 0, contexts: 0, servedBy: [] };
+    const blockers = [];
+    const stay = data.seats.filter((s) => s.departmentId === d.id && !closing.has(s.key)).length - (movedOut.get(d.id) ?? 0);
+    const liveSeats = Math.max(0, use.liveSeats - (movedOut.get(d.id) ?? 0) - data.seats.filter((s) => s.departmentId === d.id && closing.has(s.key)).length);
+    const closedSeats = use.closedSeats + data.seats.filter((s) => s.departmentId === d.id && closing.has(s.key)).length;
+    if (liveSeats > 0 || stay > 0) blockers.push(`${plural(Math.max(liveSeats, stay), 'seat')} sit${Math.max(liveSeats, stay) === 1 ? 's' : ''} in it (move them to another department on Structure first)`);
+    if (closedSeats > 0) blockers.push(`${plural(closedSeats, 'closed seat')} still list${closedSeats === 1 ? 's' : ''} it (a closed seat keeps its department for the record, so the department cannot be retired)`);
+    const kids = data.departments.filter((k) => k.parentKey === d.key && !removedOk.has(k.key)
+      && !plan.departments.update.some((u) => u.key === k.key && u.set.parent && u.set.parent.to !== d.key));
+    if (kids.length) blockers.push(`${plural(kids.length, 'department')} are under it (${nameList(kids.map((k) => `"${k.name}"`), 4)})`.replace(/^1 departments are/, '1 department is'));
+    const servers = use.servedBy.filter((sid) => !removedOk.has(data.departments.find((x) => x.id === sid)?.key) && !serveRemoved.has(`${sid}>${d.id}`));
+    if (servers.length) blockers.push(`${plural(servers.length, 'shared department')} still serve${servers.length === 1 ? 's' : ''} it`);
+    if (use.roles) blockers.push(`${plural(use.roles, 'role')} use it as their default department`);
+    if (use.assignments) blockers.push(`${plural(use.assignments, 'work assignment')} point at it`);
+    if (use.contexts) blockers.push(`${plural(use.contexts, 'work context')} point at it`);
+    plan.departments.remove.push({ key: d.key, id: d.id, name: d.name, depth: depth(d), blockers });
+    if (blockers.length) {
+      X.err('DEPARTMENT_IN_USE', SHEET.departments, null, `The department "${d.name}" (${d.key}) is missing from Departments, but it cannot be removed: ${blockers.join('; ')}.`);
+    } else removedOk.add(d.key);
   }
 }
 
@@ -783,21 +889,22 @@ function countsOf(plan) {
   const u = plan.seats.update;
   const has = (list, field) => list.filter((x) => x.set?.[field]).length;
   return {
-    departmentsCreated: plan.departments.length,
     locationsCreated: plan.locations.length,
     rolesCreated: plan.roles.length,
-    machinesCreated: plan.machines.create.length,
-    machinesRenamed: has(plan.machines.update, 'name'),
-    machinesKindChanged: has(plan.machines.update, 'kind'),
-    machinesMoved: has(plan.machines.update, 'where'),
-    machinesDeleted: plan.machines.remove.length,
+    departmentsCreated: plan.departments.create.length,
+    departmentsRenamed: has(plan.departments.update, 'name'),
+    departmentsMoved: has(plan.departments.update, 'parent'),
+    departmentsRetyped: has(plan.departments.update, 'type'),
+    departmentsSharedChanged: has(plan.departments.update, 'shared'),
+    servesAdded: plan.departments.update.reduce((n, u) => n + (u.set.serves?.add.length ?? 0), 0) + plan.departments.create.reduce((n, d) => n + d.serves.length, 0),
+    servesRemoved: plan.departments.update.reduce((n, u) => n + (u.set.serves?.remove.length ?? 0), 0),
+    departmentsRemoved: plan.departments.remove.length,
     seatsCreated: plan.seats.create.length,
     seatsRetitled: has(u, 'title'),
     headcountsChanged: has(u, 'count'),
     seatShiftsChanged: has(u, 'shift'),
     seatDepartmentsChanged: has(u, 'department'),
     seatLocationsChanged: has(u, 'location'),
-    seatMachinesChanged: has(u, 'machines'),
     seatsMovedToNewManager: has(u, 'parent'),
     seatsClosed: plan.seats.close.length,
     peopleAdded: plan.people.employeesCreate.length,
@@ -822,9 +929,9 @@ function countsOf(plan) {
  * @param {{read: object, loaded: {data: object}, env: object, deleteMissing?: boolean}} args
  * @returns the plan (see newPlan), with plan.counts and plan.empty
  */
-export function planChanges({ read, loaded, env, deleteMissing = false, exportLabels = null }) {
-  const X = makeContext(read, loaded, env, deleteMissing, exportLabels);
-  planMachines(X);
+export function planChanges({ read, loaded, env, deleteMissing = false, exportLabels = null, exportDeptNames = null }) {
+  const X = makeContext(read, loaded, env, deleteMissing, exportLabels, exportDeptNames);
+  planDepartments(X);
   planSeats(X);
   planPeople(X);
   planResponsibilities(X);
@@ -849,7 +956,7 @@ const shortName = (text) => (text.length > 250 ? `${text.slice(0, 249)}…` : te
  * one apply can be traced as one act.
  *
  * ORDER MATTERS, and is the reason this is one function: masters first (a department a seat names must exist before
- * the seat), then roles, machines, seats, the chart's reporting lines (ALL the moved seats are detached before any is
+ * the seat: created parents first, then renames and re-parenting, then serves lists, which may name a department just created), roles, seats, the chart's reporting lines (ALL the moved seats are detached before any is
  * attached, so a swap of two seats never trips the cycle check), then people, duties and questions, and removals last.
  *
  * @returns {{created: Record<string,string>, log: string[]}}  `created` maps 'structure:12' -> 'pos:77' for every row that
@@ -873,10 +980,9 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
   const one = async (sql, params) => (await conn.query(sql, params))[0][0] ?? null;
 
   // ---- ids by ref: what exists now, to which the rows we create are added as we go ----
-  const dept = new Map([...env.departmentByName].map(([k, v]) => [k, v.id]));
+  const dept = new Map(data.departments.map((d) => [d.key, d.id]));
   const loc = new Map([...env.locationByName].map(([k, v]) => [k, v.id]));
   const role = new Map([...env.roleByTitle].map(([k, v]) => [k, v.id]));
-  const machine = new Map(data.machines.map((m) => [m.key, m.id]));
   const seat = new Map(data.seats.map((s) => [s.key, s.positionId]));
   const seatRole = new Map(data.seats.map((s) => [s.key, s.roleId]));
   const employee = new Map(env.employees.map((e) => [`emp:${e.id}`, e.id]));
@@ -884,10 +990,48 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
   const shiftId = (name) => (name ? env.shiftByName.get(norm(name))?.id ?? null : null);
 
   // ---------------------------------------------------------------- masters ----
-  for (const d of plan.departments) {
-    const row = await orgSvc.createDepartment(conn, c, { name: d.name });
-    dept.set(norm(d.name), row.id);
-    say(`department created: ${d.name}`);
+  // ---- departments: create (parents first), rename/retype/share, re-parent (detach all, then attach top-down), then the serves lists ----
+  {
+    const pending = [...plan.departments.create];
+    const placed = new Set();
+    while (pending.length) {
+      const i = pending.findIndex((d) => !d.parentRef || !d.parentRef.startsWith('new:') || placed.has(d.parentRef));
+      if (i < 0) throw new Error('The new departments sit under each other in a circle.');
+      const [d] = pending.splice(i, 1);
+      const row = await orgSvc.createDepartment(conn, c, { name: d.name, type: d.type || null, isShared: d.shared, parentId: d.parentRef ? dept.get(d.parentRef) : null });
+      dept.set(d.ref, row.id);
+      placed.add(d.ref);
+      created[`departments:${d.row}`] = `dep:${row.id}`;
+      say(`department created: ${d.name}`);
+    }
+    for (const u of plan.departments.update) {
+      const body = {};
+      if (u.set.name) body.name = u.set.name.to;
+      if (u.set.type) body.type = u.set.type.to || null;
+      if (u.set.shared) body.isShared = u.set.shared.to;
+      if (u.set.parent) body.parentId = null;     // detach first: two departments that swap places never trip the cycle check
+      if (Object.keys(body).length) await orgSvc.updateDepartment(conn, c, u.id, body);
+    }
+    const toAttach = plan.departments.update.filter((u) => u.set.parent && u.set.parent.to);
+    const waiting = new Set(toAttach.map((u) => u.key));
+    while (toAttach.length) {
+      const i = toAttach.findIndex((u) => !waiting.has(u.set.parent.to));
+      if (i < 0) throw new Error('The departments to move sit under each other in a circle.');
+      const [u] = toAttach.splice(i, 1);
+      await orgSvc.updateDepartment(conn, c, u.id, { parentId: dept.get(u.set.parent.to) });
+      waiting.delete(u.key);
+    }
+    for (const u of plan.departments.update) if (!Object.keys(u.set).every((k) => k === 'serves')) say(`department updated: ${u.label}`);
+    for (const d of plan.departments.create) {
+      if (!d.serves.length) continue;
+      await orgSvc.updateDepartment(conn, c, dept.get(d.ref), { serves: d.serves.map((s) => dept.get(s.ref)) });
+      say(`department serves set: ${d.name}`);
+    }
+    for (const u of plan.departments.update) {
+      if (!u.set.serves) continue;
+      await orgSvc.updateDepartment(conn, c, u.id, { serves: u.set.serves.final.map((r) => dept.get(r)) });
+      say(`department serves changed: ${u.label}`);
+    }
   }
   for (const l of plan.locations) {
     const row = await orgSvc.createLocation(conn, c, { name: l.name, locationType: 'PLANT' });
@@ -898,22 +1042,6 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
     const row = await roleSvc.createRole(conn, c, { title: r.title, status: 'ACTIVE' });
     role.set(norm(r.title), row.id);
     say(`role created: ${r.title}`);
-  }
-
-  // --------------------------------------------------------------- machines ----
-  for (const m of plan.machines.create) {
-    const row = await orgSvc.createWorkContext(conn, c, { name: m.name, contextType: typeOfKind(m.kind), locationId: m.where ? loc.get(norm(m.where)) : null });
-    machine.set(m.ref, row.id);
-    created[`machines:${m.row}`] = `wct:${row.id}`;
-    say(`machine created: ${m.name}`);
-  }
-  for (const u of plan.machines.update) {
-    const body = {};
-    if (u.set.name) body.name = u.set.name.to;
-    if (u.set.kind) body.contextType = typeOfKind(u.set.kind.to);
-    if (u.set.where) body.locationId = u.set.where.to ? loc.get(norm(u.set.where.to)) : null;
-    await orgSvc.updateWorkContext(conn, c, u.id, body);
-    say(`machine updated: ${u.label}`);
   }
 
   // ------------------------------------------------------------------ seats ----
@@ -944,7 +1072,7 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
       `INSERT INTO hrms_positions
          (company_id, position_code, role_id, position_title, department_id, location_id, sanctioned_headcount, default_shift_id, status, effective_from)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
-      [companyId, code, roleId, n.title, n.department ? dept.get(norm(n.department)) : null, n.location ? loc.get(norm(n.location)) : null,
+      [companyId, code, roleId, n.title, n.departmentRef ? dept.get(n.departmentRef) : null, n.location ? loc.get(norm(n.location)) : null,
         n.count, dn ? null : shiftId(n.shift), today]);
     const id = res.insertId;
     seat.set(n.ref, id);
@@ -953,9 +1081,6 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
     created[`structure:${n.row}`] = `pos:${id}`;
     await audit('hrms_positions', id, 'CREATE', null, { positionCode: code, title: n.title, roleId, headcount: n.count, shift: n.shift || null, copiedFrom: n.copiedFrom });
     if (dn) await addManpower(id, roleId, n.count);
-    for (const [i, ref] of n.machines.entries()) {
-      await positionSvc.addPositionContext(conn, c, id, { workContextId: machine.get(ref), isPrimary: i === 0 });
-    }
     say(`seat created: ${n.title} (${code})`);
   }
 
@@ -966,7 +1091,7 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
     const after = {};
     const note = (field, from, to) => { before[field] = from; after[field] = to; };
     if (u.set.title) { cols.position_title = u.set.title.to; note('title', u.set.title.from, u.set.title.to); seatTitle.set(u.key, u.set.title.to); }
-    if (u.set.department) { cols.department_id = u.set.department.to ? dept.get(norm(u.set.department.to)) : null; note('department', u.set.department.from, u.set.department.to); }
+    if (u.set.department) { cols.department_id = u.set.department.toRef ? dept.get(u.set.department.toRef) : null; note('department', u.set.department.from, u.set.department.to); }
     if (u.set.location) { cols.location_id = u.set.location.to ? loc.get(norm(u.set.location.to)) : null; note('location', u.set.location.from, u.set.location.to); }
     const wasDN = db.shift === DAY_AND_NIGHT;
     const finalShift = u.set.shift?.to ?? db.shift;
@@ -989,17 +1114,6 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
         await conn.query('UPDATE hrms_manpower_requirements SET required_count = ? WHERE company_id = ? AND id = ?', [finalCount, companyId, m.id]);
         await audit('hrms_manpower_requirements', m.id, 'UPDATE', { requiredCount: m.count }, { requiredCount: finalCount });
       }
-    }
-    if (u.set.machines) {
-      for (const ref of u.set.machines.remove) {
-        const link = db.contextLinks.find((l) => `wct:${l.contextId}` === ref);
-        if (link) await positionSvc.removePositionContext(conn, c, link.linkId);
-      }
-      const left = db.contextLinks.length - u.set.machines.remove.length;
-      for (const [i, ref] of u.set.machines.add.entries()) {
-        await positionSvc.addPositionContext(conn, c, db.positionId, { workContextId: machine.get(ref), isPrimary: left + i === 0 });
-      }
-      await audit('hrms_position_work_contexts', db.positionId, 'UPDATE', { removed: u.set.machines.remove }, { added: u.set.machines.add });
     }
     say(`seat updated: ${u.label}`);
   }
@@ -1191,9 +1305,9 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
     await audit('hrms_positions', s.id, 'UPDATE', { status: 'ACTIVE' }, { status: 'CLOSED', via: SOURCE_NOTE });
     say(`seat closed: ${s.title}`);
   }
-  for (const m of plan.machines.remove) {
-    await orgSvc.deleteWorkContext(conn, c, m.id);
-    say(`machine deleted: ${m.name}`);
+  for (const d of [...plan.departments.remove].sort((a, b) => b.depth - a.depth)) {   // deepest first: a parent goes only after its children
+    await orgSvc.deleteDepartment(conn, c, d.id);
+    say(`department retired: ${d.name}`);
   }
   return { created, log };
 }
@@ -1207,9 +1321,8 @@ export function checkProvenance({ read, company, target }) {
   const refusals = [];
   const p = read.provenance;
   if (!p) return refusals;
-  if (!SUPPORTED_SCHEMA_VERSIONS.includes(p.schemaVersion)) {
-    refusals.push(`This workbook is schema version ${p.schemaVersion}; this tool understands ${SUPPORTED_SCHEMA_VERSIONS.join(', ')}. Export a fresh workbook with the same version of the tool.`);
-  }
+  const versionProblem = schemaVersionProblem(p.schemaVersion);
+  if (versionProblem) refusals.push(versionProblem);
   if (p.companySlug !== company.slug || p.companyId !== company.id) {
     refusals.push(`This workbook belongs to a different company: it was exported for ${p.companySlug} (company id ${p.companyId}); you are applying it to ${company.slug} (company id ${company.id}).`);
   }
@@ -1227,7 +1340,6 @@ const nameList = (xs, n = 6) => (xs.length > n ? `${xs.slice(0, n).join(', ')} a
 export function describePlan(plan, X) {
   const out = [];
   const L = (s = '') => out.push(s);
-  const nameOfMachine = (ref) => X.machineNameOf.get(ref) ?? ref;
   const rowOf = (r) => (r == null ? '' : ` (row ${r})`);
   const c = plan.counts;
 
@@ -1240,7 +1352,7 @@ export function describePlan(plan, X) {
   line('structure', [
     c.seatsCreated && `${c.seatsCreated} created`, c.seatsRetitled && `${c.seatsRetitled} retitled`, c.headcountsChanged && `${c.headcountsChanged} headcount changed`,
     c.seatShiftsChanged && `${c.seatShiftsChanged} shift changed`, c.seatDepartmentsChanged && `${c.seatDepartmentsChanged} department changed`,
-    c.seatLocationsChanged && `${c.seatLocationsChanged} location changed`, c.seatMachinesChanged && `${c.seatMachinesChanged} machine list changed`,
+    c.seatLocationsChanged && `${c.seatLocationsChanged} location changed`,
     c.seatsMovedToNewManager && `${c.seatsMovedToNewManager} moved to a new manager`, c.seatsClosed && `${c.seatsClosed} CLOSED`]);
   line('people', [
     c.peopleAdded && `${c.peopleAdded} added`, c.peopleSeatedAgain && `${c.peopleSeatedAgain} given another seat`, c.peopleMovedToAnotherSeat && `${c.peopleMovedToAnotherSeat} moved to a different seat`,
@@ -1248,23 +1360,22 @@ export function describePlan(plan, X) {
   line('responsibilities', [
     c.responsibilitiesAdded && `${c.responsibilitiesAdded} added`, c.responsibilitiesReworded && `${c.responsibilitiesReworded} reworded`,
     c.responsibilitiesMoved && `${c.responsibilitiesMoved} moved to another role`, c.responsibilitiesRemoved && `${c.responsibilitiesRemoved} REMOVED`]);
-  line('machines & areas', [
-    c.machinesCreated && `${c.machinesCreated} created`, c.machinesRenamed && `${c.machinesRenamed} renamed`, c.machinesKindChanged && `${c.machinesKindChanged} kind changed`,
-    c.machinesMoved && `${c.machinesMoved} moved to another location`, c.machinesDeleted && `${c.machinesDeleted} DELETED`]);
+  line('departments', [
+    c.departmentsCreated && `${c.departmentsCreated} created`, c.departmentsRenamed && `${c.departmentsRenamed} renamed`, c.departmentsMoved && `${c.departmentsMoved} moved under another`,
+    c.departmentsRetyped && `${c.departmentsRetyped} type changed`, c.departmentsSharedChanged && `${c.departmentsSharedChanged} shared on/off`,
+    c.servesAdded && `${c.servesAdded} serves added`, c.servesRemoved && `${c.servesRemoved} serves removed`, c.departmentsRemoved && `${c.departmentsRemoved} RETIRED`]);
   line('questions', [c.questionsAdded && `${c.questionsAdded} added`, c.questionsChanged && `${c.questionsChanged} changed`, c.questionsDismissed && `${c.questionsDismissed} DISMISSED`]);
-  line('also created', [c.departmentsCreated && `${plural(c.departmentsCreated, 'department')}`, c.locationsCreated && `${plural(c.locationsCreated, 'location')}`, c.rolesCreated && `${plural(c.rolesCreated, 'role')}`]);
+  line('also created', [c.locationsCreated && `${plural(c.locationsCreated, 'location')}`, c.rolesCreated && `${plural(c.rolesCreated, 'role')}`]);
 
-  if (plan.departments.length || plan.locations.length || plan.roles.length) {
+  if (plan.locations.length || plan.roles.length) {
     L(); L('NEW MASTERS (typed in a cell and not in the system yet - check the spelling)');
-    for (const d of plan.departments) L(`  + department "${d.name}"${rowOf(d.row)}${d.similar ? `   <- did you mean "${d.similar}"?` : ''}`);
     for (const l of plan.locations) L(`  + location "${l.name}"${rowOf(l.row)}${l.similar ? `   <- did you mean "${l.similar}"?` : ''}`);
     for (const r of plan.roles) L(`  + role "${r.title}"${rowOf(r.row)}  (a new seat with a title no role has; it starts with no duties)`);
   }
   if (plan.seats.create.length || plan.seats.update.length || plan.seats.close.length) {
     L(); L('SEATS');
     for (const n of plan.seats.create) {
-      const bits = [`under ${X.seatName(n.parent)}`, n.shift && n.shift, `${n.count} ${n.count === 1 ? 'person' : 'people'}`, n.department, n.location,
-        n.machines.length && `machines: ${nameList(n.machines.map(nameOfMachine))}`,
+      const bits = [`under ${X.seatName(n.parent)}`, n.shift && n.shift, `${n.count} ${n.count === 1 ? 'person' : 'people'}`, n.department && `in ${n.department}`, n.location,
         n.roleId != null ? `role "${n.roleTitle}" (existing, shared with ${plural(X.seatsOfRole({ id: n.roleId }) - 1, 'other seat')})` : `NEW role "${n.roleTitle}"`,
         n.copiedFrom && `copy of ${n.copiedFrom}`];
       L(`  + "${n.title}"${rowOf(n.row)}: ${bits.filter(Boolean).join(', ')}`);
@@ -1276,7 +1387,6 @@ export function describePlan(plan, X) {
       if (u.set.shift) bits.push(`shift ${u.set.shift.from} -> ${u.set.shift.to}`);
       if (u.set.department) bits.push(`department "${u.set.department.from}" -> "${u.set.department.to}"`);
       if (u.set.location) bits.push(`location "${u.set.location.from}" -> "${u.set.location.to}"`);
-      if (u.set.machines) bits.push(`machines ${[...u.set.machines.add.map((r) => `+${nameOfMachine(r)}`), ...u.set.machines.remove.map((r) => `-${nameOfMachine(r)}`)].join(' ')}`);
       if (u.set.parent) bits.push(`reports to ${X.seatName(u.set.parent.from)} -> ${X.seatName(u.set.parent.to)}`);
       L(`  ~ "${u.label}" (${u.key})${rowOf(u.row)}: ${bits.join('; ')}`);
     }
@@ -1305,14 +1415,22 @@ export function describePlan(plan, X) {
     for (const m of plan.responsibilities.move) L(`  ~ MOVED from role "${m.fromTitle}" (${plural(m.sharedBy, 'seat')}) to role "${m.toRole.title}" (${plural(m.toShared, 'seat')})${rowOf(m.row)}: ${m.text.slice(0, 70)}...`);
     for (const r of plan.responsibilities.remove) L(`  - REMOVE from ${r.roleId != null ? `role "${r.roleTitle}" (${plural(r.sharedBy, 'seat')})` : 'one seat'}: ${r.text.slice(0, 80)}${r.text.length > 80 ? '...' : ''}`);
   }
-  if (plan.machines.create.length || plan.machines.update.length || plan.machines.remove.length) {
-    L(); L('MACHINES & AREAS');
-    for (const m of plan.machines.create) L(`  + "${m.name}" (${m.kind})${m.where ? ` at ${m.where}` : ''}${rowOf(m.row)}${m.copied ? '  (a copy)' : ''}`);
-    for (const u of plan.machines.update) {
-      const bits = Object.entries(u.set).map(([f, v]) => `${f} "${v.from ?? ''}" -> "${v.to}"`);
-      L(`  ~ "${u.label}"${rowOf(u.row)}: ${bits.join('; ')}`);
+  if (plan.departments.create.length || plan.departments.update.length || plan.departments.remove.length) {
+    L(); L('DEPARTMENTS (machines and shared crews are departments too)');
+    for (const d of plan.departments.create) {
+      const bits = [d.under ? `under "${d.under}"` : 'top level', d.type && `type "${d.type}"`, d.shared && 'shared crew', d.serves.length && `serves ${nameList(d.serves.map((s) => s.name))}`, d.copied && 'a copy'];
+      L(`  + "${d.name}"${rowOf(d.row)}: ${bits.filter(Boolean).join(', ')}`);
     }
-    for (const m of plan.machines.remove) L(`  - DELETE "${m.name}" (${m.key})`);
+    for (const u of plan.departments.update) {
+      const bits = [];
+      if (u.set.name) bits.push(`renamed "${u.set.name.from}" -> "${u.set.name.to}" (its seats stay in it)`);
+      if (u.set.parent) bits.push(`moved from under "${u.set.parent.fromName || '(top level)'}" to under "${u.set.parent.toName || '(top level)'}"`);
+      if (u.set.type) bits.push(`type "${u.set.type.from}" -> "${u.set.type.to}"`);
+      if (u.set.shared) bits.push(u.set.shared.to ? 'now a shared crew' : 'no longer shared (what it served is dropped)');
+      if (u.set.serves) bits.push(`serves ${[...u.set.serves.add.map((s) => `+${s.name}`), ...u.set.serves.remove.map((s) => `-${s.name}`)].join(' ')}`);
+      L(`  ~ "${u.label}" (${u.key})${rowOf(u.row)}: ${bits.join('; ')}`);
+    }
+    for (const d of plan.departments.remove) L(`  - RETIRE "${d.name}" (${d.key})${d.blockers.length ? `  BLOCKED: ${d.blockers.join('; ')}` : ''}`);
   }
   if (plan.questions.create.length || plan.questions.update.length || plan.questions.dismiss.length) {
     L(); L('QUESTIONS & DOUBTS');
@@ -1326,17 +1444,17 @@ export function describePlan(plan, X) {
 /** What is in the database but not in the workbook, left alone because --delete-missing was not given. */
 function describeKept(plan, deleteMissing) {
   const k = plan.kept;
-  const total = k.seats.length + k.people.length + k.responsibilities.length + k.machines.length + k.questions.length;
+  const total = k.seats.length + k.people.length + k.responsibilities.length + k.departments.length + k.questions.length;
   if (!total || deleteMissing) return [];
   const out = ['', 'LEFT ALONE (in the database, not in the workbook)'];
   const row = (n, what, names) => n && out.push(`  ${plural(n, what)}: ${nameList(names)}`);
   row(k.seats.length, 'seat', k.seats.map((s) => `"${s.title}"`));
   row(k.people.length, 'person', k.people.map((p) => p.name));
   row(k.responsibilities.length, 'duty', k.responsibilities.map((r) => `"${r.text.slice(0, 30)}..."`));
-  row(k.machines.length, 'machine', k.machines.map((m) => `"${m.name}"`));
+  row(k.departments.length, 'department', k.departments.map((d) => `"${d.name}"`));
   row(k.questions.length, 'question', k.questions.map((q) => q.key));
   out.push('  Nothing has been removed. If these rows were deleted on purpose, run again with --delete-missing to remove them');
-  out.push('  (a seat is closed, a person\'s assignment ended, a duty retired, a question dismissed; nothing is erased).');
+  out.push('  (a seat is closed, a person\'s assignment ended, a duty retired, a question dismissed, a department retired if nothing is in it; nothing is erased).');
   return out;
 }
 
@@ -1356,7 +1474,7 @@ export async function prepare({ conn, buf, slug, target, deleteMissing }) {
   if (!company) throw new Error(`No company with slug "${slug}" on ${target.name}.`);
   const refusals = checkProvenance({ read, company, target });
   const base = { read, company, refusals };
-  if (refusals.length || read.problems.some((p) => p.severity === 'error' && ['UNKNOWN_SCHEMA_VERSION', 'PROVENANCE_INCOMPLETE', 'MISSING_SHEET', 'BAD_HEADER'].includes(p.code))) {
+  if (refusals.length || read.problems.some((p) => p.severity === 'error' && ['UNKNOWN_SCHEMA_VERSION', 'PROVENANCE_INCOMPLETE', 'MISSING_SHEET', 'OLD_LAYOUT', 'BAD_HEADER'].includes(p.code))) {
     return { ...base, problems: read.problems, plan: null };
   }
   const loaded = await loadOrg(conn, slug);
@@ -1368,12 +1486,10 @@ export async function prepare({ conn, buf, slug, target, deleteMissing }) {
   return { ...base, loaded, env, plan, stale, problems, existingSeats: existing };
 }
 
-/** The little context the report needs to name seats and machines (planChanges keeps its own, private to the planning). */
+/** The little context the report needs to name seats (planChanges keeps its own, private to the planning). */
 function reportContext(prep) {
   const X = makeContext(prep.read, prep.loaded, prep.env, false);
   for (const n of prep.plan.seats.create) X.newSeat.set(n.ref, n);
-  for (const m of prep.loaded.data.machines) X.machineNameOf.set(m.key, m.name);
-  for (const m of prep.plan.machines.create) X.machineNameOf.set(m.ref, m.name);
   return X;
 }
 
@@ -1389,7 +1505,7 @@ async function converges({ conn, prep, created, slug, deleteMissing }) {
     read.responsibilities = read.responsibilities.filter((r) => !(r.identity?.kind === 'rsp' && orphanedRoles.has(r.identity.ids[0])));
     read.questions = read.questions.filter((q) => !closedLabels.has(q.seatText));
   }
-  const sheets = { structure: read.seats, people: read.people, responsibilities: read.responsibilities, machines: read.machines, questions: read.questions };
+  const sheets = { structure: read.seats, people: read.people, responsibilities: read.responsibilities, departments: read.departments, questions: read.questions };
   for (const [sheet, rows] of Object.entries(sheets)) {
     for (const row of rows) {
       const key = created[`${sheet}:${row.row}`];
@@ -1400,7 +1516,8 @@ async function converges({ conn, prep, created, slug, deleteMissing }) {
   const env = await loadEnv(conn, prep.company.id);
   // the seat cells in the workbook still hold the labels the export wrote, whatever has been renamed since
   const exportLabels = new Map(prep.loaded.data.seats.map((s, i) => [s.key, seatLabel(i, s.title)]));
-  const plan = planChanges({ read, loaded, env, deleteMissing, exportLabels });
+  const exportDeptNames = new Map(prep.loaded.data.departments.map((d) => [d.key, d.name]));
+  const plan = planChanges({ read, loaded, env, deleteMissing, exportLabels, exportDeptNames });
   return { plan, errors: plan.problems.filter((p) => p.severity === 'error') };
 }
 

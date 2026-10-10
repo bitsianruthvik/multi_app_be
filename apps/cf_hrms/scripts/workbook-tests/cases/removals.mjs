@@ -1,8 +1,8 @@
 /**
  * Deleting rows, and the other sheets' edits that can remove something (case 7 of the brief). A row missing from the workbook is
  * ambiguous (deleted, or the sheet was never filled in), so nothing is removed without --delete-missing; and even then nothing
- * is erased: a seat is CLOSED, an assignment ENDED, a duty retired, a question DISMISSED. Only a machine is deleted, and only
- * when nothing refers to it.
+ * is erased: a seat is CLOSED, an assignment ENDED, a duty retired, a question DISMISSED. A department is
+ * retired only when no seat sits in it and nothing is under it (see departments.mjs).
  */
 export const name = 'removals';
 
@@ -14,7 +14,7 @@ export const cases = [
     async run(t) {
       const { buf, data } = await t.freshExport();
       const wb = await t.open(buf);
-      const seat = t.need(data.seats.find((s) => t.isLeaf(data, s) && !t.peopleIn(data, s).length && s.contextLinks.length === 0 && t.seatsOfRole(data, s) === 1)
+      const seat = t.need(data.seats.find((s) => t.isLeaf(data, s) && !t.peopleIn(data, s).length && t.seatsOfRole(data, s) === 1)
         ?? data.seats.find((s) => t.isLeaf(data, s) && !t.peopleIn(data, s).length), 'no empty leaf seat to delete');
       t.deleteRow(wb, 'Structure', t.rowOfKey(wb, seat.key));
       const edited = await t.save(wb);
@@ -69,7 +69,7 @@ export const cases = [
     },
   },
   {
-    name: 'DELETE guards: an occupied seat, a machine still in use, and an emptied sheet',
+    name: 'DELETE guards: an occupied seat, and an emptied sheet',
     async run(t) {
       const { buf, data } = await t.freshExport();
       const occupied = t.part(data.seats.find((s) => t.isLeaf(data, s) && t.peopleIn(data, s).length > 0), 'no occupied leaf seat');
@@ -86,13 +86,6 @@ export const cases = [
         const p2 = await t.plan(await t.save(wb2), { deleteMissing: true });
         t.ok(t.codes(p2).length === 0 && p2.plan.counts.seatsClosed === 1 && p2.plan.counts.peopleEnded === people.length, `seat row and ${people.length} person row(s) deleted: they are ended, then the seat is closed`);
       }
-      const machine = t.part(data.machines.find((m) => data.seats.some((s) => s.contextLinks.some((l) => l.contextId === m.id))), 'no machine is used by a seat');
-      if (machine) {
-        const wb3 = await t.open(buf);
-        t.deleteRow(wb3, 'Machines & areas', t.findKeyRow(wb3, 'Machines & areas', machine.key));
-        const p3 = await t.plan(await t.save(wb3), { deleteMissing: true });
-        t.ok(p3.problems.some((e) => e.severity === 'error' && ['UNKNOWN_MACHINE', 'MACHINE_IN_USE'].includes(e.code)), `a machine that seats still name ("${machine.name}") is never deleted (${t.codes(p3)[0]})`);
-      }
       if (data.people.length) {
         const wb4 = await t.open(buf);
         const ws = wb4.getWorksheet('People');
@@ -100,7 +93,7 @@ export const cases = [
         const p4 = await t.plan(await t.save(wb4), { deleteMissing: true });
         t.ok(p4.plan.counts.peopleEnded === 0 && p4.plan.notices.some((n) => n.code === 'SHEET_EMPTY'), 'People emptied entirely + --delete-missing: NOBODY is ended (an empty sheet means "not filled in")');
       } else t.partial.push('no people to empty the People sheet of');
-      t.need(occupied || machine || data.people.length, 'nothing to guard');
+      t.need(occupied || data.people.length, 'nothing to guard');
     },
   },
   {
@@ -120,61 +113,6 @@ export const cases = [
       }));
       t.ok(res.status === 'REHEARSED', `applied, and the post-write re-check agreed (${t.why(res)})`);
       t.ok(res.status === 'REHEARSED' && Number(res.observed.kept) === data.responsibilities.filter((r) => r.roleId === seat.roleId).length, 'the role still holds all of its duties');
-    },
-  },
-  {
-    name: 'MACHINES: rename (seats follow by key), change kind and place; then delete one once nothing refers to it',
-    async run(t) {
-      const { buf, data } = await t.freshExport();
-      const known = new Set(data.machines.map((x) => t.S.machineKey(x.name)));
-      const m = t.need(data.machines.find((x) => data.seats.some((s) => s.contextLinks.some((l) => l.contextId === x.id)) && !x.name.includes(',')), 'no comma-free machine is used by a seat');
-      const linked = data.seats.filter((s) => s.contextLinks.some((l) => l.contextId === m.id));
-      const newName = `${m.name} ${t.tag}`;
-      const newLoc = t.name('Loc');
-      const wb = await t.open(buf);
-      const mrow = t.findKeyRow(wb, 'Machines & areas', m.key);
-      t.setCell(wb, 'Machines & areas', mrow, 1, newName);
-      t.setCell(wb, 'Machines & areas', mrow, 2, m.kind === 'Line' ? 'Area' : 'Line');
-      t.setCell(wb, 'Machines & areas', mrow, 3, newLoc);
-      for (const s of linked) { // a careful person renames it on every seat that names it
-        const r = t.rowOfKey(wb, s.key);
-        const names = t.S.splitMachineList(String(t.getCell(wb, 'Structure', r, t.COLS.machines)), known).map((n) => (t.S.machineKey(n) === t.S.machineKey(m.name) ? newName : n));
-        t.setCell(wb, 'Structure', r, t.COLS.machines, names.join(', '));
-      }
-      const edited = await t.save(wb);
-      const prep = await t.plan(edited);
-      t.ok(t.codes(prep).length === 0 && t.changed(prep.plan) === 'locationsCreated,machinesKindChanged,machinesMoved,machinesRenamed',
-        `renamed by KEY: the ${linked.length} seat(s) that name it are unchanged (no unlink and relink), and "${newLoc}" is a new location (${t.changed(prep.plan)})`);
-      const res = await t.rehearse(edited, {}, async (c) => ({
-        ctx: (await t.q('SELECT c.name, c.context_type, l.name loc FROM hrms_work_contexts c LEFT JOIN hrms_locations l ON l.id = c.location_id WHERE c.id = ?', [m.id], c))[0],
-        links: (await t.q('SELECT COUNT(*) n FROM hrms_position_work_contexts WHERE work_context_id = ? AND deleted_at IS NULL', [m.id], c))[0].n,
-      }));
-      if (t.ok(res.status === 'REHEARSED', `applied (${t.why(res)})`)) {
-        t.ok(res.observed.ctx.name === newName && res.observed.ctx.loc === newLoc && Number(res.observed.links) === linked.length, `renamed and moved: ${JSON.stringify(res.observed.ctx)}; still linked to ${res.observed.links} seat(s)`);
-      }
-
-      // delete: only if nothing else (assignments, manpower, scopes, rosters) refers to it
-      const others = await t.q(
-        `SELECT (SELECT COUNT(*) FROM hrms_work_assignment_contexts WHERE company_id = ? AND work_context_id = ? AND deleted_at IS NULL)
-              + (SELECT COUNT(*) FROM hrms_manpower_requirements WHERE company_id = ? AND work_context_id = ? AND deleted_at IS NULL)
-              + (SELECT COUNT(*) FROM hrms_shift_rosters WHERE company_id = ? AND work_context_id = ? AND deleted_at IS NULL) AS n`,
-        [t.companyId, m.id, t.companyId, m.id, t.companyId, m.id]);
-      if (Number(others[0].n) > 0) { t.partial.push('the machine is referenced outside position links, so deleting it is refused by design'); return; }
-      const wb2 = await t.open(buf);
-      for (const s of linked) {
-        const r = t.rowOfKey(wb2, s.key);
-        const names = t.S.splitMachineList(String(t.getCell(wb2, 'Structure', r, t.COLS.machines)), known).filter((n) => t.S.machineKey(n) !== t.S.machineKey(m.name));
-        t.setCell(wb2, 'Structure', r, t.COLS.machines, names.join(', ') || null);
-      }
-      t.deleteRow(wb2, 'Machines & areas', t.findKeyRow(wb2, 'Machines & areas', m.key));
-      const edited2 = await t.save(wb2);
-      const without = await t.plan(edited2);
-      t.ok(without.plan.counts.seatMachinesChanged === linked.length && without.plan.counts.machinesDeleted === 0 && without.plan.kept.machines.some((x) => x.key === m.key),
-        `without the flag the machine stays, and the ${linked.length} seat link(s) to it are taken off`);
-      const r2 = await t.rehearse(edited2, { deleteMissing: true }, async (c) => ({
-        gone: (await t.q('SELECT deleted_at FROM hrms_work_contexts WHERE id = ?', [m.id], c))[0].deleted_at !== null,
-      }));
-      t.ok(r2.status === 'REHEARSED' && r2.observed.gone, `with --delete-missing the machine is deleted once nothing refers to it (${r2.status === 'REHEARSED' ? 'yes' : t.why(r2)})`);
     },
   },
   {

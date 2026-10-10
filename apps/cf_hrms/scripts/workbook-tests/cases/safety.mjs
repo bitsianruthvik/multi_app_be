@@ -35,7 +35,7 @@ export const cases = [
       const wb3 = await t.open(buf);
       t.setProvenance(wb3, 'schemaVersion', 99);
       const p4 = await t.plan(await t.save(wb3));
-      t.ok(p4.refusals.some((r) => /schema version 99/.test(r)) && p4.plan === null, 'an unknown schema version (99) is REFUSED');
+      t.ok(p4.refusals.some((r) => /layout 99/.test(r)) && p4.plan === null, 'an unknown schema version (99) is REFUSED');
       // (e) the other database
       const wb4 = await t.open(buf);
       t.setProvenance(wb4, 'target', t.target.isProd ? 'local' : 'prod');
@@ -91,7 +91,7 @@ export const cases = [
     },
   },
   {
-    name: 'BAD DATA pasted past the in-sheet rules is an error here: count, shift, machine, two titles, skipped level, date, seat',
+    name: 'BAD DATA pasted past the in-sheet rules is an error here: count, shift, department, two titles, skipped level, date, seat',
     async run(t) {
       const { buf, data } = await t.freshExport();
       t.need(data.seats.length >= 10, 'fewer than ten seats');
@@ -99,9 +99,9 @@ export const cases = [
       const set = (i, col, v) => t.setCell(wb, 'Structure', t.rowOfKey(wb, data.seats[i].key), col, v);
       set(4, t.COLS.count, 'abc');
       set(5, t.COLS.shift, 'Swing');
-      set(6, t.COLS.machines, 'No Such Machine');
+      set(6, t.COLS.department, 'No Such Department');
       const c1 = t.codes(await t.plan(await t.save(wb)));
-      t.ok(c1.includes('BAD_COUNT') && c1.includes('BAD_SHIFT') && c1.includes('UNKNOWN_MACHINE'), `count "abc", shift "Swing" and machine "No Such Machine" are all ERRORS (${c1.join(', ')})`);
+      t.ok(c1.includes('BAD_COUNT') && c1.includes('BAD_SHIFT') && c1.includes('UNKNOWN_DEPARTMENT'), `count "abc", shift "Swing" and department "No Such Department" are all ERRORS (${c1.join(', ')})`);
 
       const wb2 = await t.open(buf);
       wb2.getWorksheet('Structure').getRow(t.rowOfKey(wb2, data.seats[7].key)).getCell(t.S.COL.lastLevel).value = 'A second title in the same row';
@@ -128,21 +128,24 @@ export const cases = [
     },
   },
   {
-    name: 'MACHINE NAMES: a new name with a comma and a duplicate are refused; an existing comma name still round-trips',
+    name: 'DEPARTMENT NAMES: a name used twice (any capitals) is refused; one that is not on Departments is refused on Structure',
     async run(t) {
       const { buf, data } = await t.freshExport();
-      const machine = t.need(data.machines[0], 'no machines');
+      const dept = t.need(data.departments[0], 'no departments');
       const wb = await t.open(buf);
-      t.appendRow(wb, 'Machines & areas', [`Press ${t.tag}, Press 2`, 'Machine', '']);
-      t.appendRow(wb, 'Machines & areas', [machine.name.toUpperCase(), 'Machine', '']);
+      t.appendDepartment(wb, { name: dept.name.toUpperCase() === dept.name ? dept.name.toLowerCase() : dept.name.toUpperCase() });
       const prep = await t.plan(await t.save(wb));
-      t.ok(t.codes(prep).includes('COMMA_IN_NAME'), 'a NEW machine name with a comma is refused (it could not be told apart from two machines)');
-      t.ok(t.codes(prep).some((c) => c === 'DUPLICATE_NAME' || c === 'MACHINE_NAME_TAKEN'), `a machine named twice (different case) is refused (${t.codeList(prep)})`);
-      const withComma = data.machines.find((m) => m.name.includes(','));
+      t.ok(t.codes(prep).includes('DUPLICATE_NAME'), `a department named twice (different capitals) is refused (${t.codeList(prep)})`);
+      const wb2 = await t.open(buf);
+      const seat = t.need(data.seats[0], 'no seats');
+      t.setCell(wb2, 'Structure', t.rowOfKey(wb2, seat.key), t.COLS.department, `Nowhere ${t.tag}`);
+      const p2 = await t.plan(await t.save(wb2));
+      t.ok(t.codes(p2).includes('UNKNOWN_DEPARTMENT'), 'a seat pointed at a department that is not on Departments is refused: a new one is added on Departments first');
+      const withComma = data.departments.find((d) => d.name.includes(','));
       if (withComma) {
         const same = await t.plan(buf);
-        t.ok(same.plan.empty && same.problems.length === 0, `the existing machine "${withComma.name}" (a comma in its name) still round-trips untouched`);
-      } else t.partial.push('no existing machine has a comma in its name');
+        t.ok(same.plan.empty && same.problems.length === 0, `the existing department "${withComma.name}" (a comma in its name) still round-trips untouched`);
+      } else t.partial.push('no existing department has a comma in its name');
     },
   },
 ];

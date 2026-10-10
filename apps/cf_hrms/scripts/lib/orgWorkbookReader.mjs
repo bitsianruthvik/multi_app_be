@@ -30,22 +30,38 @@
  * visible is not a row, even if its hidden key is still there: that is how "I cleared this row" reads.
  */
 import {
-  SHEET, HEADERS, COL, LEVELS, KEY_COLUMN, KEY_HEADER, KEY_KINDS, SCHEMA_VERSION, EXAMPLE_MARK, MAX_MACHINES,
-  KINDS, DAY_AND_NIGHT, DEFAULT_SHIFTS, PROVENANCE_FIELDS,
-  cellText, readOutline, readProvenanceBlock, parseKey, squeeze, seatLabel, machineKey, splitMachineList,
+  SHEET, HEADERS, COL, DEPT_COL, KEY_COLUMN, KEY_HEADER, KEY_KINDS, SCHEMA_VERSION, EXAMPLE_MARK,
+  YES, NO, DAY_AND_NIGHT, DEFAULT_SHIFTS, PROVENANCE_FIELDS,
+  cellText, readOutline, readProvenanceBlock, parseKey, squeeze, seatLabel,
 } from './orgTemplateSheets.mjs';
+
+const norm = (s) => squeeze(s).toLowerCase();
 
 /** Schema versions this reader understands. A workbook stamped with any other is refused, never guessed at. */
 export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([SCHEMA_VERSION]);
 
+/**
+ * The sentence for a workbook whose schema version this tool does not read, or null when it does. An OLDER one gets told to
+ * re-export, in words: its sheets are laid out differently, and applying it by guesswork is exactly the harm this prevents.
+ */
+export function schemaVersionProblem(version) {
+  if (SUPPORTED_SCHEMA_VERSIONS.includes(version)) return null;
+  if (Number.isFinite(version) && version < SCHEMA_VERSION) {
+    return `This workbook was exported by an older version of the tool (layout ${version}; the current layout is ${SCHEMA_VERSION}). Its sheets are laid out differently `
+      + '(machines used to be a sheet of their own; they are departments now), so it cannot be applied. Export a fresh workbook from the system and make your edits in that one.';
+  }
+  return `This workbook has layout ${version}, which this tool does not understand (it reads ${SUPPORTED_SCHEMA_VERSIONS.join(', ')}). `
+    + 'Export a fresh workbook with the same version of the tool you are applying with.';
+}
+
 const SHEET_OF = Object.freeze({
-  structure: SHEET.structure, people: SHEET.people, responsibilities: SHEET.responsibilities,
-  machines: SHEET.machines, questions: SHEET.questions,
+  departments: SHEET.departments, structure: SHEET.structure, people: SHEET.people, responsibilities: SHEET.responsibilities,
+  questions: SHEET.questions,
 });
 export const DATA_SHEETS = Object.freeze(Object.keys(SHEET_OF));
 
 /** Sheet-level limits, from the database columns the values end up in. */
-const LIMITS = Object.freeze({ title: 200, name: 200, code: 50, departmentOrLocation: 200, machineName: 200, text: 4000 });
+const LIMITS = Object.freeze({ title: 200, name: 200, code: 50, departmentOrLocation: 200, type: 40, text: 4000 });
 
 // ------------------------------------------------------------------ cells ----
 const valueOf = (cell) => {
@@ -132,7 +148,7 @@ export function resolveSeatCell(text, seats) {
  * @returns {{
  *   kind: 'prefilled'|'blank'|'legacy'|'unknown',
  *   provenance: null|object, lists: {seatShifts:string[], personShifts:string[]},
- *   seats: object[], people: object[], responsibilities: object[], machines: object[], questions: object[],
+ *   departments: object[], seats: object[], people: object[], responsibilities: object[], questions: object[],
  *   skippedExamples: Record<string, number>, problems: object[], stats: object
  * }}
  */
@@ -141,22 +157,13 @@ export function readOrgWorkbook(wb) {
   const add = (severity, code, sheet, row, message) => problems.push({ severity, code, sheet, row: row ?? null, message });
   const result = {
     kind: 'unknown', provenance: null, lists: { seatShifts: [], personShifts: [] },
-    seats: [], people: [], responsibilities: [], machines: [], questions: [],
+    departments: [], seats: [], people: [], responsibilities: [], questions: [],
     skippedExamples: Object.fromEntries(DATA_SHEETS.map((k) => [k, 0])), problems,
     stats: { rows: {}, keyed: {}, blankKey: {}, duplicateKey: {} },
   };
 
-  // ---- the sheets are there ----
-  const sheets = {};
-  for (const [key, name] of Object.entries(SHEET_OF)) {
-    sheets[key] = wb.getWorksheet(name);
-    if (!sheets[key]) add('error', 'MISSING_SHEET', name, null, `The sheet "${name}" is missing.`);
-  }
-  if (problems.some((p) => p.severity === 'error')) return result;
-
-  // ---- provenance, and so what KIND of workbook this is ----
+  // ---- provenance FIRST: a workbook from an older layout is refused as that, not reported as "a sheet is missing" ----
   const block = readProvenanceBlock(wb.getWorksheet(SHEET.start));
-  const hasKeyHeader = Object.fromEntries(DATA_SHEETS.map((k) => [k, textAt(sheets[k], 1, KEY_COLUMN[k]) === KEY_HEADER]));
   if (block) {
     const missing = PROVENANCE_FIELDS.filter((f) => !block[f]);
     if (missing.length) {
@@ -169,22 +176,35 @@ export function readOrgWorkbook(wb) {
       schemaVersion: Number(block.schemaVersion), companySlug: block.companySlug, companyId: Number(block.companyId),
       target: block.target, targetName: block.targetName, exportedAt: block.exportedAt, contentHash: block.contentHash, counts,
     };
-    if (!SUPPORTED_SCHEMA_VERSIONS.includes(result.provenance.schemaVersion)) {
-      add('error', 'UNKNOWN_SCHEMA_VERSION', SHEET.start, null,
-        `This workbook is schema version ${block.schemaVersion}; this reader understands ${SUPPORTED_SCHEMA_VERSIONS.join(', ')}. `
-        + 'Export a fresh workbook with the same version of the tool you are applying with.');
+    const versionProblem = schemaVersionProblem(result.provenance.schemaVersion);
+    if (versionProblem) {
+      add('error', 'UNKNOWN_SCHEMA_VERSION', SHEET.start, null, versionProblem);
       return result;
     }
     if (!counts || !Number.isFinite(result.provenance.companyId)) {
       add('error', 'PROVENANCE_INCOMPLETE', SHEET.start, null, 'The hidden provenance block cannot be read (company id or counts are not valid).');
       return result;
     }
-    result.kind = 'prefilled';
-  } else if (DATA_SHEETS.every((k) => hasKeyHeader[k])) {
-    result.kind = 'blank';
-  } else {
-    result.kind = 'legacy';
   }
+
+  // ---- the sheets are there ----
+  const sheets = {};
+  for (const [key, name] of Object.entries(SHEET_OF)) {
+    sheets[key] = wb.getWorksheet(name);
+    if (!sheets[key]) add('error', 'MISSING_SHEET', name, null, `The sheet "${name}" is missing.`);
+  }
+  if (!sheets.departments && wb.getWorksheet('Machines & areas')) {
+    problems.length = 0;
+    add('error', 'OLD_LAYOUT', SHEET.departments, null, schemaVersionProblem(1));
+    return result;
+  }
+  if (problems.some((p) => p.severity === 'error')) return result;
+
+  // ---- what KIND of workbook this is ----
+  const hasKeyHeader = Object.fromEntries(DATA_SHEETS.map((k) => [k, textAt(sheets[k], 1, KEY_COLUMN[k]) === KEY_HEADER]));
+  if (block) result.kind = 'prefilled';
+  else if (DATA_SHEETS.every((k) => hasKeyHeader[k])) result.kind = 'blank';
+  else result.kind = 'legacy';
 
   // ---- the headings are the contract ----
   for (const k of DATA_SHEETS) {
@@ -235,30 +255,81 @@ export function readOrgWorkbook(wb) {
     result.stats.blankKey[k] = rows.filter((x) => x.keyState === 'none').length;
   };
 
-  // ============================ Machines & areas (read first: Structure checks its names against it) ============================
+  // ============================ Departments (read first: every other sheet picks a department by its name) ============================
   {
-    const sh = sheets.machines;
+    const sh = sheets.departments;
     const seen = new Map();
-    const names = new Map(); // machineKey -> first row
+    const names = new Map(); // norm(name) -> first row
+    const rows = [];
     for (let r = 2; r <= sh.rowCount; r++) {
-      const values = [1, 2, 3].map((c) => textAt(sh, r, c));
+      const values = Array.from({ length: DEPT_COL.lastServes }, (_, i) => textAt(sh, r, i + 1));
       if (!values.some(Boolean)) continue;
-      if (values.some((v) => v.startsWith(EXAMPLE_MARK))) { result.skippedExamples.machines++; continue; }
-      const id = keyOf('machines', r, seen);
-      const [name, kindText, where] = values;
-      const row = { sheet: SHEET.machines, row: r, ...id, name, kind: canon(KINDS, kindText) ?? '', where };
-      if (!name) add('error', 'NAME_REQUIRED', SHEET.machines, r, `Machines & areas row ${r} has no Name.`);
-      else if (name.length > LIMITS.machineName) add('error', 'TEXT_TOO_LONG', SHEET.machines, r, `Machines & areas row ${r}: the name is over ${LIMITS.machineName} characters.`);
-      if (name && names.has(machineKey(name))) add('error', 'DUPLICATE_NAME', SHEET.machines, r, `Machines & areas row ${r}: "${name}" is already listed on row ${names.get(machineKey(name))}. A machine is named once.`);
-      else if (name) names.set(machineKey(name), r);
-      if (!kindText) add('error', 'KIND_REQUIRED', SHEET.machines, r, `Machines & areas row ${r} ("${name}") has no Kind.`);
-      else if (!row.kind) add('error', 'BAD_KIND', SHEET.machines, r, `Machines & areas row ${r}: "${kindText}" is not one of ${KINDS.join(', ')}.`);
-      if (where.length > LIMITS.departmentOrLocation) add('error', 'TEXT_TOO_LONG', SHEET.machines, r, `Machines & areas row ${r}: "Where" is over ${LIMITS.departmentOrLocation} characters.`);
-      result.machines.push(row);
+      if (values.some((v) => v.startsWith(EXAMPLE_MARK))) { result.skippedExamples.departments++; continue; }
+      const id = keyOf('departments', r, seen);
+      const [name, under, type, sharedText, ...serveCells] = values;
+      const row = { sheet: SHEET.departments, row: r, ...id, name, under, type, shared: false, serves: [] };
+      if (!name) add('error', 'NAME_REQUIRED', SHEET.departments, r, `Departments row ${r} has no Name.`);
+      else if (name.length > LIMITS.name) add('error', 'TEXT_TOO_LONG', SHEET.departments, r, `Departments row ${r}: the name is over ${LIMITS.name} characters.`);
+      if (name) {
+        if (names.has(norm(name))) add('error', 'DUPLICATE_NAME', SHEET.departments, r, `Departments row ${r}: "${name}" is already on row ${names.get(norm(name))}. Every other sheet picks a department by its name, so each is named once (capital letters do not count).`);
+        else names.set(norm(name), r);
+      }
+      if (type.length > LIMITS.type) add('error', 'TEXT_TOO_LONG', SHEET.departments, r, `Departments row ${r} ("${name}"): Type is over ${LIMITS.type} characters. It is a short label such as Department or Machine / area.`);
+      if (sharedText) {
+        const yn = [YES, NO].find((x) => x.toLowerCase() === sharedText.toLowerCase());
+        if (!yn) add('error', 'BAD_YES_NO', SHEET.departments, r, `Departments row ${r} ("${name}"): Shared crew? must be Yes or No, not "${sharedText}".`);
+        else row.shared = yn === YES;
+      }
+      const seenServes = new Set();
+      for (const s of serveCells.filter(Boolean)) {
+        if (seenServes.has(norm(s))) { add('warning', 'DUPLICATE_SERVES', SHEET.departments, r, `Departments row ${r} ("${name}"): "${s}" is picked twice in Serves; once is enough.`); continue; }
+        seenServes.add(norm(s));
+        row.serves.push(s);
+      }
+      rows.push(row);
     }
-    tally('machines', result.machines);
+    // what the names point at: spelling as written on the sheet, and the same checks the service layer makes (plus the sheet's own)
+    const canonical = new Map(rows.filter((x) => x.name).map((x) => [norm(x.name), x.name]));
+    for (const row of rows) {
+      if (row.under) {
+        const c = canonical.get(norm(row.under));
+        // An existing row may still say the OLD name of a parent renamed on this sheet; only the database knows, so the planner decides.
+        if (!c && row.keyState === 'ok') row.underUnlisted = true;
+        else if (!c) add('error', 'UNKNOWN_PARENT', SHEET.departments, row.row, `Departments row ${row.row} ("${row.name}"): Under "${row.under}" is not a department on this sheet. Add the parent as its own row first, or leave Under empty for a top-level department.`);
+        else if (norm(c) === norm(row.name)) add('error', 'PARENT_IS_SELF', SHEET.departments, row.row, `Departments row ${row.row}: "${row.name}" cannot be under itself.`);
+        else row.under = c;
+      }
+      row.servesUnlisted = [];
+      row.serves = row.serves.map((s) => {
+        const c = canonical.get(norm(s));
+        if (!c && row.keyState === 'ok') { row.servesUnlisted.push(s); return null; }
+        if (!c) { add('error', 'UNKNOWN_SERVES', SHEET.departments, row.row, `Departments row ${row.row} ("${row.name}"): Serves "${s}" is not a department on this sheet.`); return null; }
+        if (norm(c) === norm(row.name)) { add('error', 'SERVES_SELF', SHEET.departments, row.row, `Departments row ${row.row}: "${row.name}" cannot serve itself. List the OTHER departments it works for.`); return null; }
+        return c;
+      }).filter(Boolean);
+      if ((row.serves.length || row.servesUnlisted.length) && !row.shared) {
+        add('error', 'SERVES_NOT_SHARED', SHEET.departments, row.row, `Departments row ${row.row} ("${row.name}"): only a shared crew serves other departments. Set Shared crew? to Yes, or clear its Serves cells.`);
+      }
+    }
+    // a department may not sit, however indirectly, under itself
+    const parentOf = new Map(rows.filter((x) => x.name && x.under && norm(x.under) !== norm(x.name)).map((x) => [norm(x.name), norm(x.under)]));
+    const inCycle = new Set();
+    for (const row of rows) {
+      let cur = norm(row.name);
+      const path = [];
+      const onPath = new Set();
+      while (cur && parentOf.has(cur) && !onPath.has(cur)) { onPath.add(cur); path.push(cur); cur = parentOf.get(cur); }
+      if (cur && onPath.has(cur) && !inCycle.has(cur)) {
+        const loop = path.slice(path.indexOf(cur));
+        loop.forEach((c) => inCycle.add(c));
+        const first = rows.find((x) => norm(x.name) === loop[0]);
+        add('error', 'DEPARTMENT_CYCLE', SHEET.departments, first?.row, `Departments: ${loop.map((c) => `"${canonical.get(c)}"`).join(' sits under ')} sits under "${canonical.get(loop[0])}" again, round in a circle. A department cannot be under itself, even through others.`);
+      }
+    }
+    result.departments = rows;
+    tally('departments', rows);
   }
-  const machineKeys = new Map(result.machines.filter((m) => m.name).map((m) => [machineKey(m.name), m.name]));
+  const deptCanonical = new Map(result.departments.filter((d) => d.name).map((d) => [norm(d.name), d.name]));
 
   // ============================ Structure ============================
   {
@@ -281,7 +352,7 @@ export function readOrgWorkbook(wb) {
       const seat = {
         sheet: SHEET.structure, row: r, ref: o.ref, ...id, label: seatLabel(r - 2, title),
         level: o.level, title, parent: null, outlineIndex: outline.indexOf(o),
-        count: null, shift: '', department: '', location: '', machines: [], notes: '',
+        count: null, shift: '', department: '', location: '', notes: '',
       };
       if (o.problem === 'Skipped a level') {
         add('error', 'SKIPPED_LEVEL', SHEET.structure, r, `Structure row ${r} ("${title}") sits at Level ${o.level} but nothing above it is at Level ${o.level - 1}, so it has no manager. Indent it one level, or give it a manager.`);
@@ -308,22 +379,15 @@ export function readOrgWorkbook(wb) {
       }
       seat.department = textAt(sh, r, COL.department);
       seat.location = textAt(sh, r, COL.location);
+      // A seat sits in ONE department, picked from the Departments sheet: a new one is added there first, so it has a parent and a type.
+      if (seat.department) {
+        const known = deptCanonical.get(norm(seat.department));
+        if (!known && seat.keyState === 'ok') seat.departmentUnlisted = true; // an existing seat may still say the OLD name of a renamed department: the planner decides
+        else if (!known) add('error', 'UNKNOWN_DEPARTMENT', SHEET.structure, r, `Structure row ${r} ("${title}"): the department "${seat.department}" is not on the Departments sheet. Add it there first (under the department it belongs to), then pick it here.`);
+        else seat.department = known;
+      }
       for (const [what, v] of [['Department', seat.department], ['Location', seat.location]]) {
         if (v.length > LIMITS.departmentOrLocation) add('error', 'TEXT_TOO_LONG', SHEET.structure, r, `Structure row ${r}: ${what} is over ${LIMITS.departmentOrLocation} characters.`);
-      }
-      // Machines or areas: comma separated, each on the Machines sheet (a name may itself hold a comma)
-      const machineText = textAt(sh, r, COL.machines);
-      if (machineText) {
-        if (/(^|,)\s*(,|$)/.test(machineText)) add('warning', 'EMPTY_PIECE', SHEET.structure, r, `Structure row ${r} ("${title}"): the Machines cell has an empty piece between commas; it was ignored.`);
-        const seenHere = new Set();
-        for (const name of splitMachineList(machineText, new Set(machineKeys.keys()))) {
-          const canonical = machineKeys.get(machineKey(name));
-          if (!canonical) { add('error', 'UNKNOWN_MACHINE', SHEET.structure, r, `Structure row ${r} ("${title}"): "${name}" is not on Machines & areas. Check the spelling, or add it there first.`); continue; }
-          if (seenHere.has(machineKey(canonical))) { add('warning', 'DUPLICATE_MACHINE', SHEET.structure, r, `Structure row ${r} ("${title}"): "${canonical}" is listed twice; once is enough.`); continue; }
-          seenHere.add(machineKey(canonical));
-          seat.machines.push(canonical);
-        }
-        if (seat.machines.length > MAX_MACHINES) add('error', 'TOO_MANY_MACHINES', SHEET.structure, r, `Structure row ${r} ("${title}"): ${seat.machines.length} machines listed, the most a seat may list is ${MAX_MACHINES}.`);
       }
       seat.notes = textAt(sh, r, COL.notes);
       seatIndexOfOutline.set(seat.outlineIndex, result.seats.length);
@@ -341,7 +405,7 @@ export function readOrgWorkbook(wb) {
     // A row with details but no title: the details would vanish without a word, so say so.
     for (let r = 2; r <= sh.rowCount; r++) {
       if (titledRows.has(r)) continue;
-      const rest = [COL.count, COL.shift, COL.department, COL.location, COL.machines, COL.notes].map((c) => textAt(sh, r, c));
+      const rest = [COL.count, COL.shift, COL.department, COL.location, COL.notes].map((c) => textAt(sh, r, c));
       if (rest.some(Boolean) && !rest.some((v) => v.startsWith(EXAMPLE_MARK))) {
         add('error', 'NO_TITLE', SHEET.structure, r, `Structure row ${r} has details (${rest.filter(Boolean).slice(0, 2).join('; ')}) but no seat title in any Level column.`);
       }

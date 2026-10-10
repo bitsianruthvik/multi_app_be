@@ -2,7 +2,7 @@
  * The case that closes the gap every other case has: they edit the workbook with ExcelJS, which is not what a person uses. This
  * one drives REAL Excel through COM (Windows with Excel installed; run it with --excel): it opens a copy of a fresh export, does
  * what a person does (retitle, change a count, insert a row, copy a row and insert the copy, delete a row, pick a new seat for a
- * person from the live drop-down labels, add a duty, a question and a machine), saves it as Excel saves it, and the applier reads
+ * person from the live drop-down labels, add a duty, a question and a machine department), saves it as Excel saves it, and the applier reads
  * THAT file. What it proves that nothing else does: the hidden Key travels with a copied row, survives an inserted and a deleted
  * row, dates and formulas come back from Excel's own writer as the reader expects, and the plan is exactly the edits made.
  *
@@ -48,10 +48,12 @@ export const cases = [
       try {
         const job = {
           inFile: path.join(dir, 'in.xlsx'), outFile: path.join(dir, 'out.xlsx'),
-          col: { firstLevel: t.S.COL.firstLevel, count: t.S.COL.count, shift: t.S.COL.shift, machines: t.S.COL.machines },
+          col: { firstLevel: t.S.COL.firstLevel, count: t.S.COL.count, shift: t.S.COL.shift, department: t.S.COL.department },
           retitleRow: rowOf(retitle), retitleLevel: levelOf(retitle), retitleTo: `${retitle.title} [${t.tag}]`,
           countRow: rowOf(count), countTo: count.count + 3,
           insertAt: rowOf(insertAfter) + 1, insertLevel: levelOf(insertAfter) + 1, insertTitle: t.name('inserted seat'), insertShift: (await t.env()).shifts[0].name, machineName: t.name('Line'),
+          deptCol: { name: t.S.DEPT_COL.name, under: t.S.DEPT_COL.under, type: t.S.DEPT_COL.type, shared: t.S.DEPT_COL.shared },
+          underName: (data.departments.find((d) => !d.shared) ?? data.departments[0])?.name ?? '',
           copyRow: rowOf(copy), deleteRow: rowOf(del),
           personRow: t.findKeyRow(wb, 'People', person.key), targetTitle: target.title,
           dutySeatTitle: dutySeat.title, dutyText: `ZZ ${t.tag} duty typed in Excel.`,
@@ -69,7 +71,7 @@ export const cases = [
         const prep = await t.plan(out);
         t.ok(prep.refusals.length === 0 && t.codes(prep).length === 0, `the Excel-written file reads cleanly (${t.codeList(prep) || 'no errors'})`);
         t.ok(prep.read.problems.some((p) => p.code === 'DUPLICATE_KEY'), 'the copied row carried its hidden Key with it, so it is read as a copy (a repeated key)');
-        t.ok(t.changed(prep.plan) === 'headcountsChanged,machinesCreated,peopleMovedToAnotherSeat,questionsAdded,responsibilitiesAdded,rolesCreated,seatsCreated,seatsRetitled',
+        t.ok(t.changed(prep.plan) === 'departmentsCreated,headcountsChanged,peopleMovedToAnotherSeat,questionsAdded,responsibilitiesAdded,rolesCreated,seatsCreated,seatsRetitled',
           `the plan is exactly the edits that were made, and no others (${t.summary(prep.plan)})`);
         t.ok(prep.plan.counts.seatsCreated === 2 && prep.plan.counts.rolesCreated === 1, 'two new seats (the inserted one, the copy); only the inserted one needs a new role');
         t.ok(prep.plan.kept.seats.some((s) => s.key === del.key) && prep.plan.kept.questions.some((q) => q.key === question.key), 'the deleted seat and question are LEFT ALONE without the flag');

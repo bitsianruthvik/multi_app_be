@@ -109,6 +109,7 @@ export const cases = [
       const title = t.name('seat');
       const dept = t.name('Dept');
       const loc = env.locationByName.values().next().value?.name ?? '';
+      t.appendDepartment(wb, { name: dept, type: 'Department' });
       t.insertSeat(wb, parentRow + 1, { level: t.levelOfRow(wb, parentRow) + 1, title, count: 2, shift, department: dept, location: loc });
       const edited = await t.save(wb);
       const prep = await t.plan(edited);
@@ -166,7 +167,7 @@ export const cases = [
     async run(t) {
       const { buf, data } = await t.freshExport();
       const wb = await t.open(buf);
-      const leaf = t.need(data.seats.find((s) => t.isLeaf(data, s) && s.parentPositionId != null && s.contextLinks.length > 0 && t.seatsOfRole(data, s) > 1)
+      const leaf = t.need(data.seats.find((s) => t.isLeaf(data, s) && s.parentPositionId != null && s.departmentId != null && t.seatsOfRole(data, s) > 1)
         ?? data.seats.find((s) => t.isLeaf(data, s) && s.parentPositionId != null), 'no leaf seat to copy');
       const row = t.rowOfKey(wb, leaf.key);
       t.copyRow(wb, 'Structure', row, row + 1);
@@ -178,9 +179,8 @@ export const cases = [
       const res = await t.rehearse(edited, {}, async (c, info) => {
         const id = Number(info.created[`structure:${row + 1}`].split(':')[1]);
         return {
-          copy: (await t.q('SELECT position_code, position_title, role_id FROM hrms_positions WHERE id = ?', [id], c))[0],
-          orig: (await t.q('SELECT position_code, position_title, role_id FROM hrms_positions WHERE id = ?', [leaf.positionId], c))[0],
-          links: await t.q('SELECT work_context_id FROM hrms_position_work_contexts WHERE position_id = ? AND deleted_at IS NULL', [id], c),
+          copy: (await t.q('SELECT position_code, position_title, role_id, department_id FROM hrms_positions WHERE id = ?', [id], c))[0],
+          orig: (await t.q('SELECT position_code, position_title, role_id, department_id FROM hrms_positions WHERE id = ?', [leaf.positionId], c))[0],
           edge: await t.q('SELECT to_position_id FROM hrms_position_reporting_relationships WHERE from_position_id = ? AND deleted_at IS NULL AND effective_to IS NULL', [id], c),
           seatsOfRole: (await t.q('SELECT COUNT(*) n FROM hrms_positions WHERE role_id = ? AND deleted_at IS NULL', [leaf.roleId], c))[0].n,
         };
@@ -189,7 +189,7 @@ export const cases = [
       const o = res.observed;
       t.ok(o.copy.role_id === leaf.roleId && o.orig.role_id === leaf.roleId, `the copy shares the original's role ("${leaf.roleTitle}"), so it shares its duties: nothing was forked`);
       t.ok(o.copy.position_code && o.copy.position_code !== o.orig.position_code && o.copy.position_title === leaf.title, `it has its own position code (${o.copy.position_code}, the original has ${o.orig.position_code}) and the same title`);
-      t.ok(o.links.length === leaf.contextLinks.length && o.edge[0]?.to_position_id === leaf.parentPositionId, `the same machines (${o.links.length}) and the same manager as the original`);
+      t.ok(o.copy.department_id === o.orig.department_id && o.edge[0]?.to_position_id === leaf.parentPositionId, 'the same department and the same manager as the original');
       t.ok(Number(o.seatsOfRole) === sharedBefore + 1, 'the role now has exactly one more seat');
     },
   },
@@ -207,40 +207,29 @@ export const cases = [
     },
   },
   {
-    name: "CHANGE a seat's department, location and machine list",
+    name: "CHANGE a seat's department and location (a NEW department is added on Departments first, then picked)",
     async run(t) {
-      // Since 2026-10-10 a machine is a DEPARTMENT, so a freshly imported company has no work contexts and the
-      // "Machines or areas" cell is empty everywhere. The department and location halves must still be tested then
-      // (they are how a seat's machine is said now), so the machine half is the optional part, not the whole case.
       const { buf, data } = await t.freshExport();
-      const withMachine = data.seats.find((s) => s.contextLinks.length === 1);
-      const machineB = withMachine ? data.machines.find((m) => !withMachine.contextLinks.some((l) => l.contextId === m.id) && !m.name.includes(',')) : null;
-      const seat = t.need(withMachine && machineB ? withMachine : data.seats.find((s) => s.department), 'no seat has a department');
-      const swapMachine = Boolean(withMachine && machineB);
-      if (!swapMachine) t.partial.push('no seat with exactly one machine and a second machine to swap in (machines are departments now), so the machine list was left alone');
+      const seat = t.need(data.seats.find((s) => s.department), 'no seat has a department');
       const dept = t.name('Dept');
       const loc = t.name('Loc');
       const wb = await t.open(buf);
+      t.appendDepartment(wb, { name: dept, type: 'Machine / area' });
       const row = t.rowOfKey(wb, seat.key);
       t.setCell(wb, 'Structure', row, t.COLS.department, dept);
       t.setCell(wb, 'Structure', row, t.COLS.location, loc);
-      if (swapMachine) t.setCell(wb, 'Structure', row, t.COLS.machines, machineB.name);
       const edited = await t.save(wb);
       const prep = await t.plan(edited);
-      const want = ['departmentsCreated', 'locationsCreated', 'seatDepartmentsChanged', 'seatLocationsChanged', ...(swapMachine ? ['seatMachinesChanged'] : [])].join(',');
-      t.ok(t.changed(prep.plan) === want, `department and location${swapMachine ? ' and machine list' : ''} changed, and the two new names are new masters (${t.changed(prep.plan)})`);
+      t.ok(t.changed(prep.plan) === 'departmentsCreated,locationsCreated,seatDepartmentsChanged,seatLocationsChanged', `department and location changed; the department is created on its own sheet, the location is a new master (${t.changed(prep.plan)})`);
       const res = await t.rehearse(edited, {}, async (c) => ({
-        pos: (await t.q('SELECT d.name dn, l.name ln FROM hrms_positions p LEFT JOIN hrms_departments d ON d.id = p.department_id LEFT JOIN hrms_locations l ON l.id = p.location_id WHERE p.id = ?', [seat.positionId], c))[0],
-        links: await t.q('SELECT work_context_id, is_primary FROM hrms_position_work_contexts WHERE position_id = ? AND deleted_at IS NULL', [seat.positionId], c),
+        pos: (await t.q('SELECT d.name dn, d.department_type dt, l.name ln FROM hrms_positions p LEFT JOIN hrms_departments d ON d.id = p.department_id LEFT JOIN hrms_locations l ON l.id = p.location_id WHERE p.id = ?', [seat.positionId], c))[0],
       }));
       if (!t.ok(res.status === 'REHEARSED', `applied (${t.why(res)})`)) return;
-      t.ok(res.observed.pos.dn === dept && res.observed.pos.ln === loc, `department "${res.observed.pos.dn}", location "${res.observed.pos.ln}"`);
-      if (swapMachine) t.ok(res.observed.links.length === 1 && res.observed.links[0].work_context_id === machineB.id && res.observed.links[0].is_primary === 1, `the machine is now "${machineB.name}" (primary), the old link removed`);
-      else t.ok(res.observed.links.length === seat.contextLinks.length, 'no work-context link was written for a seat whose Machines cell was not touched');
+      t.ok(res.observed.pos.dn === dept && res.observed.pos.dt === 'Machine / area' && res.observed.pos.ln === loc, `department "${res.observed.pos.dn}" (${res.observed.pos.dt}), location "${res.observed.pos.ln}"`);
     },
   },
   {
-    name: 'MOVE a seat to another EXISTING department (how a seat changes machine now): only its department changes, nothing is created',
+    name: 'MOVE a seat to another EXISTING department: only its department changes, nothing is created',
     async run(t) {
       const { buf, data } = await t.freshExport();
       // A department name is what the cell holds, so the target must be a name exactly one department carries.
@@ -260,12 +249,10 @@ export const cases = [
       const res = await t.rehearse(edited, {}, async (c) => ({
         deptId: (await t.q('SELECT department_id d FROM hrms_positions WHERE id = ?', [seat.positionId], c))[0].d,
         depts: Number((await t.q('SELECT COUNT(*) n FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [t.companyId], c))[0].n),
-        links: Number((await t.q('SELECT COUNT(*) n FROM hrms_position_work_contexts WHERE position_id = ? AND deleted_at IS NULL', [seat.positionId], c))[0].n),
       }));
       if (!t.ok(res.status === 'REHEARSED', `applied (${t.why(res)})`)) return;
       t.ok(res.observed.deptId === target.id, `the seat now sits in "${target.name}" — the existing department, by id`);
       t.ok(res.observed.depts === before, 'no department was created or removed');
-      t.ok(res.observed.links === seat.contextLinks.length, 'and no work-context link was written');
     },
   },
   {
@@ -307,7 +294,7 @@ export const cases = [
         const wb2 = await t.open(second.buf);
         t.deleteRow(wb2, 'Structure', t.rowOfKey(wb2, leaf.key));
         const parentRow = t.rowOfKey(wb2, parent.key);
-        t.insertSeat(wb2, parentRow + 1, { level: t.levelOfRow(wb2, parentRow) + 1, title: leaf.title, count: leaf.count, shift: leaf.shift, department: leaf.department, location: leaf.location, machines: leaf.machines.join(', ') });
+        t.insertSeat(wb2, parentRow + 1, { level: t.levelOfRow(wb2, parentRow) + 1, title: leaf.title, count: leaf.count, shift: leaf.shift, department: leaf.department, location: leaf.location });
         wb2.getWorksheet('Structure').getRow(parentRow + 1).getCell(t.COLS.key).value = leaf.key;
         const back = await t.save(wb2);
         const p2 = await t.plan(back);
@@ -334,7 +321,7 @@ export const cases = [
         && (t.levelOfRow(wb, t.rowOfKey(wb, s.key)) ?? 10) < 10), 'no other seat to move it under');
       t.deleteRow(wb, 'Structure', t.rowOfKey(wb, leaf.key));
       const orow = t.rowOfKey(wb, other.key);
-      t.insertSeat(wb, orow + 1, { level: t.levelOfRow(wb, orow) + 1, title: leaf.title, count: leaf.count, shift: leaf.shift, department: leaf.department, location: leaf.location, machines: leaf.machines.join(', ') });
+      t.insertSeat(wb, orow + 1, { level: t.levelOfRow(wb, orow) + 1, title: leaf.title, count: leaf.count, shift: leaf.shift, department: leaf.department, location: leaf.location });
       wb.getWorksheet('Structure').getRow(orow + 1).getCell(t.COLS.key).value = leaf.key;
       const prep = await t.plan(await t.save(wb));
       t.ok(t.codes(prep).length === 0 && t.changed(prep.plan) === 'seatsMovedToNewManager' && prep.plan.seats.update[0].set.parent.to === other.key, `moved under "${other.title}" as ONE move`);

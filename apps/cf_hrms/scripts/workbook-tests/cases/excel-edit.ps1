@@ -27,7 +27,7 @@ try {
   $p = $wb.Worksheets.Item('People')
   $r = $wb.Worksheets.Item('Responsibilities')
   $q = $wb.Worksheets.Item('Questions & doubts')
-  $m = $wb.Worksheets.Item('Machines & areas')
+  $m = $wb.Worksheets.Item('Departments')
   $l = $wb.Worksheets.Item('Lists')
   $xlUp = -4162
 
@@ -43,7 +43,7 @@ try {
   $s.Cells.Item([int]$j.insertAt, [int]$j.col.firstLevel + [int]$j.insertLevel - 1).Value2 = $j.insertTitle
   $s.Cells.Item([int]$j.insertAt, [int]$j.col.count).Value2 = 2
   $s.Cells.Item([int]$j.insertAt, [int]$j.col.shift).Value2 = $j.insertShift
-  $s.Cells.Item([int]$j.insertAt, [int]$j.col.machines).Value2 = $j.machineName
+  $s.Cells.Item([int]$j.insertAt, [int]$j.col.department).Value2 = $j.machineName
   Write-Output "inserted a seat at row $($j.insertAt)"
 
   $s.Cells.Item([int]$j.retitleRow, [int]$j.col.firstLevel + [int]$j.retitleLevel - 1).Value2 = $j.retitleTo
@@ -51,11 +51,12 @@ try {
   $s.Cells.Item([int]$j.countRow, [int]$j.col.count).Value2 = [int]$j.countTo
   Write-Output "headcount of row $($j.countRow) -> $($j.countTo)"
 
-  # ---- the new machine, then the sheets that name seats ----
-  $lastM = $m.Cells.Item($m.Rows.Count, 1).End($xlUp).Row + 1
-  $m.Cells.Item($lastM, 1).Value2 = $j.machineName
-  $m.Cells.Item($lastM, 2).Value2 = 'Line'
-  Write-Output "machine added on Machines & areas row $lastM"
+  # ---- the new machine (a department), then the sheets that name seats ----
+  $lastM = $m.Cells.Item($m.Rows.Count, [int]$j.deptCol.name).End($xlUp).Row + 1
+  $m.Cells.Item($lastM, [int]$j.deptCol.name).Value2 = $j.machineName
+  $m.Cells.Item($lastM, [int]$j.deptCol.under).Value2 = $j.underName
+  $m.Cells.Item($lastM, [int]$j.deptCol.type).Value2 = 'Machine / area'
+  Write-Output "machine department added on Departments row $lastM"
   $xl.CalculateFull()
 
   $dash = [string][char]0x2014

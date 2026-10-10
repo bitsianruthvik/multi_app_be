@@ -20,8 +20,8 @@
  *
  *   - Hierarchy: the PRIMARY_MANAGER edge of each position, walked depth-first
  *     (siblings in position-code order, as the org chart screen orders them).
- *     Machines are never in the outline: they are not managers, and the importer
- *     already re-pointed anything that hung under one to its nearest human.
+ *     Departments (machines and shared crews included) are never in the outline:
+ *     they are boxes seats sit in, not managers. They have their own sheet.
  *   - Day & night: a position with a Day AND a Night manpower requirement is a
  *     "Day & night" seat, and the count is the per-shift number.
  *   - Responsibilities belong to a ROLE in the database, and several seats can
@@ -34,7 +34,7 @@
  *     and the like are not in the workbook; their counts are printed.
  *
  * THE ROUND TRIP. Every row of a pre-filled workbook carries a hidden KEY, the
- * database id of the record it shows (pos:, asg:, rsp:, ovr:, wct:, opn: - see
+ * database id of the record it shows (pos:, asg:, rsp:, ovr:, dep:, opn: - see
  * lib/orgTemplateSheets.mjs), and `Start here` carries the provenance (company,
  * database, time, schema version, a fingerprint of what the sheets show). The
  * ids ride on the rows `loadOrg` returns, so org-apply-workbook.mjs can read a
@@ -55,7 +55,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import ExcelJS from 'exceljs';
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
-import { buildOrgWorkbook, checkOrgWorkbook, fingerprintOf, squeeze, seatRef, DAY_AND_NIGHT, LEVELS, SCHEMA_VERSION } from './lib/orgTemplateSheets.mjs';
+import { buildOrgWorkbook, checkOrgWorkbook, fingerprintOf, squeeze, seatRef, DAY_AND_NIGHT, LEVELS, SCHEMA_VERSION, SERVES_SLOTS } from './lib/orgTemplateSheets.mjs';
 
 const TM_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 
@@ -76,7 +76,6 @@ const utcDate = (text) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(text ?? ''));
   return m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : null;
 };
-const KIND_OF = { MACHINE: 'Machine', LINE: 'Line', AREA: 'Area', PROJECT: 'Project', CELL: 'Cell', OTHER: 'Other' };
 
 // -------------------------------------------------------------- the loading ----
 /**
@@ -164,7 +163,7 @@ async function loadOrg(conn, slug) {
   if (deepest > LEVELS) throw new Error(`The chart is ${deepest} levels deep and the workbook has ${LEVELS} Level columns.`);
   const indexOfPosition = new Map(ordered.map((o, i) => [o.p.id, i]));
 
-  // ---- shifts, machines, notes per seat ----
+  // ---- shifts and notes per seat ----
   const manpower = await q(
     `SELECT m.id, m.position_id, m.shift_id, s.code AS shift_code, m.required_count AS n
        FROM hrms_manpower_requirements m
@@ -173,19 +172,9 @@ async function loadOrg(conn, slug) {
   const manpowerOf = new Map();
   for (const m of manpower) { if (!manpowerOf.has(m.position_id)) manpowerOf.set(m.position_id, []); manpowerOf.get(m.position_id).push(m); }
 
-  const posContexts = await q(
-    `SELECT c.id AS link_id, c.position_id, c.work_context_id AS context_id, c.is_primary, wc.name
-       FROM hrms_position_work_contexts c
-       JOIN hrms_work_contexts wc ON wc.company_id = c.company_id AND wc.id = c.work_context_id AND wc.deleted_at IS NULL
-      WHERE c.company_id = ? AND c.deleted_at IS NULL AND ${live('c')}
-      ORDER BY c.is_primary DESC, wc.name`, [id, today, today]);
-  const machinesOf = new Map();
-  const contextLinksOf = new Map();
-  for (const c of posContexts) {
-    if (!machinesOf.has(c.position_id)) { machinesOf.set(c.position_id, []); contextLinksOf.set(c.position_id, []); }
-    machinesOf.get(c.position_id).push(squeeze(c.name));
-    contextLinksOf.get(c.position_id).push({ linkId: c.link_id, contextId: c.context_id, name: squeeze(c.name), isPrimary: Boolean(c.is_primary) });
-  }
+  // Machines are departments now. A seat-to-machine link from the OLD work-context model cannot be shown or set here: say how many.
+  const [{ n: retiredLinks }] = await q('SELECT COUNT(*) AS n FROM hrms_position_work_contexts WHERE company_id = ? AND deleted_at IS NULL', [id]);
+  if (retiredLinks) notInWorkbook.push(`${retiredLinks} seat-to-machine link(s) from the old work-context model (machines are departments now; the workbook cannot show or set them)`);
 
   // reporting lines that are not the main one have no column: say them in words, in Notes
   const otherLines = new Map();
@@ -230,7 +219,6 @@ async function loadOrg(conn, slug) {
       shift,
       department: squeeze(p.department),
       location: squeeze(p.location),
-      machines: machinesOf.get(p.id) ?? [],
       notes: notes.join(' '),
       parent,                       // index into `seats`; the workbook builder ignores it, the self-check uses it
       positionId: p.id, roleId: p.role_id, code: p.code, roleTitle: p.role_title,
@@ -243,9 +231,9 @@ async function loadOrg(conn, slug) {
       shiftId: p.shift_id ?? null,
       shiftCode: p.shift_code ?? null,
       departmentId: p.department_id ?? null,
+      departmentKey: p.department != null ? `dep:${p.department_id}` : null,
       locationId: p.location_id ?? null,
       manpower: reqs.map((r) => ({ id: r.id, shiftId: r.shift_id, shiftCode: r.shift_code, count: Number(r.n) })),
-      contextLinks: contextLinksOf.get(p.id) ?? [],
     };
   });
 
@@ -265,26 +253,85 @@ async function loadOrg(conn, slug) {
   if (splitTitles) warnings.push(`${splitTitles} title(s) belong to more than one role in the system; a reader that groups seats by title will merge them`);
   if (mergedRoles) warnings.push(`${mergedRoles} role(s) are used by seats with different titles; a reader that groups seats by title will split them`);
 
-  // ---- machines & areas ----
-  const contexts = await q(
-    `SELECT wc.id, wc.name, wc.context_type AS type, wc.location_id, wc.status, l.name AS location
-       FROM hrms_work_contexts wc
-       LEFT JOIN hrms_locations l ON l.company_id = wc.company_id AND l.id = wc.location_id AND l.deleted_at IS NULL
-      WHERE wc.company_id = ? AND wc.deleted_at IS NULL`, [id]);
-  const machines = contexts
-    .map((c) => ({
-      name: squeeze(c.name), kind: KIND_OF[c.type] ?? 'Other', where: squeeze(c.location),
-      key: `wct:${c.id}`, id: c.id, locationId: c.location_id ?? null, typeCode: c.type, status: c.status,
-    }))
-    .sort((a, b) => natural(a.name, b.name));
-  for (const m of machines) {
-    if (m.name.includes(',')) {
-      warnings.push(`machine "${m.name}" has a comma in its name: the Machines column is read against the machine list so it still round-trips, `
-        + 'but Machines & areas will not let anyone type a comma, so the name cannot be re-entered by hand');
-    }
+  // ---- departments: ONE tree (departments, processes, machines, shared crews) ----
+  const deptRows = await q(
+    `SELECT id, code, name, parent_department_id AS parent_id, department_type AS type, is_shared, status
+       FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL`, [id]);
+  const serveRows = await q(
+    `SELECT s.department_id, s.serves_department_id
+       FROM hrms_department_serves s
+       JOIN hrms_departments d ON d.company_id = s.company_id AND d.id = s.serves_department_id AND d.deleted_at IS NULL
+      WHERE s.company_id = ? AND s.deleted_at IS NULL ORDER BY s.department_id, s.serves_department_id`, [id]);
+  const deptById = new Map(deptRows.map((d) => [d.id, d]));
+  // The workbook names a department by its NAME, so a name must say one department. The database does not insist; the sheet has to.
+  const byName = new Map();
+  for (const d of deptRows) {
+    const k = squeeze(d.name).toLowerCase();
+    if (!byName.has(k)) byName.set(k, []);
+    byName.get(k).push(d.id);
   }
-  const machineNames = new Set(machines.map((m) => m.name.toLowerCase()));
-  for (const s of seats) for (const n of s.machines) if (!machineNames.has(n.toLowerCase())) warnings.push(`seat ${s.code} works "${n}", which is not in the machine list`);
+  const sameName = [...byName].filter(([, ids]) => ids.length > 1);
+  if (sameName.length) {
+    throw new Error(`Departments share a name (case aside): ${sameName.slice(0, 5).map(([k, ids]) => `"${k}" (ids ${ids.join(', ')})`).join('; ')}. `
+      + 'The workbook picks a department by its name, so rename one of each pair in the application first.');
+  }
+  const servedBy = new Map();
+  for (const s of serveRows) {
+    if (!deptById.has(s.department_id)) continue;
+    if (!servedBy.has(s.department_id)) servedBy.set(s.department_id, []);
+    servedBy.get(s.department_id).push(s.serves_department_id);
+  }
+  const deptKids = new Map();
+  const deptRoots = [];
+  for (const d of deptRows) {
+    if (d.parent_id != null && deptById.has(d.parent_id) && d.parent_id !== d.id) {
+      if (!deptKids.has(d.parent_id)) deptKids.set(d.parent_id, []);
+      deptKids.get(d.parent_id).push(d);
+    } else deptRoots.push(d);
+  }
+  const bySiblingOrder = (a, b) => natural(a.code ?? '', b.code ?? '') || natural(a.name, b.name) || a.id - b.id;
+  deptRoots.sort(bySiblingOrder);
+  for (const list of deptKids.values()) list.sort(bySiblingOrder);
+  const deptOrder = [];
+  const deptSeen = new Set();
+  const deptWalk = (root) => {
+    const stack = [root];
+    while (stack.length) {
+      const d = stack.pop();
+      if (deptSeen.has(d.id)) continue;
+      deptSeen.add(d.id);
+      deptOrder.push(d);
+      const kids = deptKids.get(d.id) ?? [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+  };
+  deptRoots.forEach(deptWalk);
+  const deptLoop = deptRows.filter((d) => !deptSeen.has(d.id)).sort(bySiblingOrder);
+  for (const d of deptLoop) deptWalk(d);
+  if (deptLoop.length) warnings.push(`${deptLoop.length} department(s) sit in a loop of parents and are shown as top-level`);
+  let servesNotShown = 0;
+  const departments = deptOrder.map((d) => {
+    const parent = d.parent_id != null && d.parent_id !== d.id ? deptById.get(d.parent_id) : null;
+    const shared = Boolean(d.is_shared);
+    const served = (servedBy.get(d.id) ?? []).map((sid) => deptById.get(sid)).filter(Boolean).sort((a, b) => natural(a.name, b.name));
+    if (!shared && served.length) servesNotShown += served.length;
+    if (shared && served.length > SERVES_SLOTS) {
+      throw new Error(`The shared department "${squeeze(d.name)}" serves ${served.length} departments; the workbook has ${SERVES_SLOTS} Serves columns, and dropping any would be a silent change.`);
+    }
+    return {
+      key: `dep:${d.id}`, id: d.id, code: d.code ?? null, status: d.status,
+      name: squeeze(d.name), under: parent ? squeeze(parent.name) : '', parentKey: parent ? `dep:${parent.id}` : null, parentId: parent ? parent.id : null,
+      type: squeeze(d.type), shared,
+      // a serves row on a department that is not shared is not shown (the service forbids it): it is neither compared nor changed
+      serves: shared ? served.map((s) => squeeze(s.name)) : [],
+      servesKeys: shared ? served.map((s) => `dep:${s.id}`) : [],
+    };
+  });
+  if (servesNotShown) notInWorkbook.push(`${servesNotShown} serves row(s) on departments that are not marked shared`);
+  const departmentTypes = [...new Set(departments.map((d) => d.type).filter(Boolean))].sort(natural);
+  for (const s of seats) {
+    if (s.departmentId != null && !deptById.has(s.departmentId)) warnings.push(`seat ${s.code} sits in a department that no longer exists; its Department cell is empty`);
+  }
 
   // ---- people ----
   const assignments = await q(
@@ -427,7 +474,7 @@ async function loadOrg(conn, slug) {
     generatedOn: longDate(),
     shifts: [...shiftName.values()],
     startNotes,
-    seats, people, responsibilities, machines, questions,
+    seats, people, responsibilities, departments, departmentTypes, questions,
   };
 
   const stats = {
@@ -442,7 +489,9 @@ async function loadOrg(conn, slug) {
     responsibilitiesFromSeatOverrides: overridesAdded,
     rolesSharedBySeveralSeats: sharedRoles.length,
     seatsLeftWithNoRowsBecauseTheirRoleIsShared: sharedRoleSeatsLeftEmpty,
-    machines: machines.length,
+    departments: departments.length,
+    sharedDepartments: departments.filter((d) => d.shared).length,
+    servesRows: departments.reduce((n, d) => n + d.serves.length, 0),
     questions: questions.length,
     organisationWideQuestions: questions.filter((x) => x.seat == null).length,
     otherReportingLinesWrittenAsNotes: otherLineCount,
@@ -472,7 +521,7 @@ export async function exportWorkbook(conn, slug, target) {
     contentHash: fingerprintOf(data),
     counts: {
       structure: data.seats.length, people: data.people.length, responsibilities: data.responsibilities.length,
-      machines: data.machines.length, questions: data.questions.length,
+      departments: data.departments.length, questions: data.questions.length,
     },
   };
   return { ...loaded, wb: buildOrgWorkbook(data) };
@@ -520,7 +569,7 @@ async function main() {
   console.log(`written   ${file}  (${(fs.statSync(file).size / 1024).toFixed(0)} KB)`);
   console.log(`sheets    ${reread.worksheets.map((w) => `${w.name}${w.state === 'hidden' ? ' (hidden)' : ''}`).join(' | ')}`);
   console.log(`in file   ${stats.seats} seat rows, deepest in Level ${stats.deepestLevel}, ${stats.people} people, ${stats.responsibilities} responsibilities, `
-    + `${stats.machines} machines, ${stats.questions} questions, ${stats.dropdowns} drop-down columns, ${stats.exampleRows} example rows`);
+    + `${stats.departments} departments, ${stats.questions} questions, ${stats.dropdowns} drop-down columns, ${stats.exampleRows} example rows`);
   if (loaded) {
     const pv = loaded.data.provenance;
     console.log(`round trip  every row carries its database id in the hidden last column; stamped ${pv.companySlug} (id ${pv.companyId}), `

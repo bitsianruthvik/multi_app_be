@@ -121,9 +121,22 @@ async function main() {
   // ---- 0. PROVENANCE: is the database holding THIS file? -------------------
   // Without this, a verifier left pointed at the previous version would pass
   // every check it could still find and prove nothing at all.
-  const runs = await q('SELECT source_file_name, source_hash, source_size_bytes, status, parsed_counts_json FROM hrms_import_runs WHERE company_id=? AND deleted_at IS NULL ORDER BY id DESC', [c]);
-  check('exactly one committed import run', runs.filter((r) => r.status === 'COMMITTED').length === 1,
-    `${runs.length} runs, ${runs.filter((r) => r.status === 'COMMITTED').length} committed — a second committed run means two charts are mixed in here`);
+  //
+  // ORG-CHART runs only. hrms_import_runs also records every Excel workbook
+  // apply (source_kind EXCEL), and those are legitimate edits made on top of
+  // the chart, not a second chart. Counting them made the first workbook apply
+  // read as "two charts are mixed in here" (found 2026-10-10, when the workbook
+  // suite's --commit case left two EXCEL runs behind). They are reported on a
+  // line of their own instead: after one, the database has legitimately moved
+  // away from the chart, and content checks below may differ for that reason.
+  const allRuns = await q('SELECT source_kind, source_file_name, source_hash, source_size_bytes, status, parsed_counts_json FROM hrms_import_runs WHERE company_id=? AND deleted_at IS NULL ORDER BY id DESC', [c]);
+  const runs = allRuns.filter((r) => r.source_kind === 'ORG_CHART_HTML');
+  const workbookApplies = allRuns.filter((r) => r.source_kind !== 'ORG_CHART_HTML' && r.status === 'COMMITTED').length;
+  if (workbookApplies) {
+    console.log(`    note ${workbookApplies} workbook apply run(s) since the chart import — a difference below may be an edit made in Excel, not an import fault`);
+  }
+  check('exactly one committed org-chart import run', runs.filter((r) => r.status === 'COMMITTED').length === 1,
+    `${runs.length} org-chart runs, ${runs.filter((r) => r.status === 'COMMITTED').length} committed — a second committed run means two charts are mixed in here`);
   const run = runs.find((r) => r.status === 'COMMITTED');
   check('the committed run is this exact file', !!run && run.source_hash === hash && run.source_file_name === fileName && Number(run.source_size_bytes) === size,
     run ? `db recorded ${run.source_file_name} sha256 ${String(run.source_hash).slice(0, 12)}… (${run.source_size_bytes} bytes); this file is ${fileName} sha256 ${hash.slice(0, 12)}… (${size} bytes)` : 'no committed run');

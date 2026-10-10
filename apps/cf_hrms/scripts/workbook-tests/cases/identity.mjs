@@ -62,7 +62,7 @@ export const cases = [
       t.ok(read.problems.filter((p) => p.severity === 'error').length === 0, 'the reader finds no errors in an untouched export');
       const rows = read.stats.rows;
       t.ok(rows.structure === data.seats.length && rows.people === data.people.length && rows.responsibilities === data.responsibilities.length
-        && rows.machines === data.machines.length && rows.questions === data.questions.length, 'every row the database showed is a row in the workbook');
+        && rows.departments === data.departments.length && rows.questions === data.questions.length, 'every row the database showed is a row in the workbook');
       t.ok(Object.values(read.stats.blankKey).every((n) => n === 0) && Object.values(read.stats.duplicateKey).every((n) => !n), 'every row carries a key, and no key repeats');
     },
   },

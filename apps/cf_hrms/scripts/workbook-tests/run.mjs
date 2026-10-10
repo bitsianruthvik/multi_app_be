@@ -39,11 +39,12 @@ import * as people from './cases/people.mjs';
 import * as duties from './cases/duties.mjs';
 import * as removals from './cases/removals.mjs';
 import * as safety from './cases/safety.mjs';
+import * as departments from './cases/departments.mjs';
 import * as blank from './cases/blank.mjs';
 import * as commit from './cases/commit.mjs';
 import * as excel from './cases/excel.mjs';
 
-const SUITES = [identity, seats, people, duties, removals, safety, blank, commit, excel];
+const SUITES = [identity, seats, departments, people, duties, removals, safety, blank, commit, excel];
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
 const value = (name) => { const a = args.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : null; };
@@ -125,7 +126,7 @@ async function main() {
     let header;
     try {
       const { data } = await T.exportWorkbook(conn, slug, target);
-      header = `${data.seats.length} seats, ${data.people.length} people, ${data.responsibilities.length} duties, ${data.machines.length} machines, ${data.questions.length} questions`;
+      header = `${data.seats.length} seats, ${data.people.length} people, ${data.responsibilities.length} duties, ${data.departments.length} departments, ${data.questions.length} questions`;
     } catch (e) {
       console.error(`${company.name} has nothing to export (${e.message}). Import its chart first.`);
       process.exitCode = 2;

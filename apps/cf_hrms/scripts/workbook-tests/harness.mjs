@@ -30,17 +30,19 @@ export class Skip extends Error {
 
 export const SHEETS = Object.freeze({
   structure: S.SHEET.structure, people: S.SHEET.people, responsibilities: S.SHEET.responsibilities,
-  machines: S.SHEET.machines, questions: S.SHEET.questions, start: S.SHEET.start,
+  departments: S.SHEET.departments, questions: S.SHEET.questions, start: S.SHEET.start,
 });
 const KEY_OF_SHEET = Object.freeze({
   [S.SHEET.structure]: 'structure', [S.SHEET.people]: 'people', [S.SHEET.responsibilities]: 'responsibilities',
-  [S.SHEET.machines]: 'machines', [S.SHEET.questions]: 'questions',
+  [S.SHEET.departments]: 'departments', [S.SHEET.questions]: 'questions',
 });
 /** Structure's columns. */
 export const COLS = Object.freeze({
   count: S.COL.count, shift: S.COL.shift, department: S.COL.department, location: S.COL.location,
-  machines: S.COL.machines, notes: S.COL.notes, key: S.COL.key,
+  notes: S.COL.notes, key: S.COL.key,
 });
+/** The Departments sheet's columns. */
+export const DEPT = S.DEPT_COL;
 
 // ------------------------------------------------------------------------ editing a workbook ----
 export async function open(buf) {
@@ -83,9 +85,9 @@ export const keyCol = (sheet) => S.KEY_COLUMN[KEY_OF_SHEET[sheet]];
 
 /**
  * Insert a new Structure row at `at` (every row from there moves down one, as in Excel) and fill it in. Blank key.
- * `level` is 1-based; machines is the comma-separated text a person would type.
+ * `level` is 1-based.
  */
-export function insertSeat(wb, at, { level, title, count = 1, shift = '', department = '', location = '', machines = '' }) {
+export function insertSeat(wb, at, { level, title, count = 1, shift = '', department = '', location = '' }) {
   const ws = wb.getWorksheet(SHEETS.structure);
   ws.spliceRows(at, 0, new Array(S.COL.key).fill(null));
   const row = ws.getRow(at);
@@ -94,7 +96,6 @@ export function insertSeat(wb, at, { level, title, count = 1, shift = '', depart
   if (shift) row.getCell(COLS.shift).value = shift;
   if (department) row.getCell(COLS.department).value = department;
   if (location) row.getCell(COLS.location).value = location;
-  if (machines) row.getCell(COLS.machines).value = machines;
   return at;
 }
 /** Copy row `from` (its key and all, but not its formulas) into a new row inserted at `at`: what copy and paste does. */
@@ -107,6 +108,34 @@ export function copyRow(wb, sheet, from, at) {
   }
   ws.spliceRows(at, 0, values);
   return at;
+}
+/**
+ * Add a department on the first empty row of Departments, the way a person types one. `serves` is a list of names (one per Serves
+ * column). Returns the row. Blank Key, so it is a CREATE.
+ */
+export function appendDepartment(wb, { name, under = '', type = 'Department', shared = false, serves = [] }) {
+  const ws = wb.getWorksheet(SHEETS.departments);
+  let r = ws.rowCount;
+  while (r > 1 && !String(ws.getRow(r).getCell(DEPT.name).value ?? '').trim()) r--;
+  const row = ws.getRow(r + 1);
+  row.getCell(DEPT.name).value = name;
+  if (under) row.getCell(DEPT.under).value = under;
+  if (type) row.getCell(DEPT.type).value = type;
+  row.getCell(DEPT.shared).value = shared ? S.YES : S.NO;
+  serves.forEach((s, i) => { row.getCell(DEPT.firstServes + i).value = s; });
+  return r + 1;
+}
+/** Set the Serves cells of a Departments row to exactly these names. */
+export function setServes(wb, row, names) {
+  const ws = wb.getWorksheet(SHEETS.departments);
+  for (let i = 0; i < S.SERVES_SLOTS; i++) ws.getRow(row).getCell(DEPT.firstServes + i).value = names[i] ?? null;
+}
+/** The Serves names a Departments row currently holds. */
+export function servesOf(wb, row) {
+  const ws = wb.getWorksheet(SHEETS.departments);
+  const out = [];
+  for (let i = 0; i < S.SERVES_SLOTS; i++) { const v = ws.getRow(row).getCell(DEPT.firstServes + i).value; if (v != null && String(v).trim()) out.push(String(v)); }
+  return out;
 }
 export const deleteRow = (wb, sheet, row) => wb.getWorksheet(sheet).spliceRows(row, 1);
 /** Put `values` on the first empty row at the end of a simple sheet. */
@@ -227,7 +256,7 @@ export function makeCase({ conn, target, company, tag }) {
 
     // editing (re-exported so a case needs no imports)
     structureRows, rowOfKey, levelOfRow, setSeatTitle, setCell, getCell, keyCol, insertSeat, copyRow, deleteRow, appendRow,
-    findRow, findKeyRow, setProvenance, clearProvenance, COLS,
+    appendDepartment, setServes, servesOf, findRow, findKeyRow, setProvenance, clearProvenance, COLS, DEPT,
     labelOf, isLeaf, seatsOfRole, peopleIn, isLastChild, errorsOf, codes, codeList, warns, summary, changed, totalChanges,
     /** A check that the plan has no errors, naming them when it has. */
     noErrors(prep) { const list = codeList(prep); return t.ok(!list, `no errors${list ? ` (${list})` : ''}`); },
