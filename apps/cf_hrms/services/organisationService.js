@@ -354,7 +354,7 @@ export async function lookups(db, companyId) {
     [companyId],
   );
   const [departments] = await db.query(
-    `SELECT id, code, name, status FROM hrms_departments
+    `SELECT id, code, name, department_type, is_shared, parent_department_id, status FROM hrms_departments
       WHERE company_id = ? AND deleted_at IS NULL ORDER BY name`,
     [companyId],
   );
@@ -365,7 +365,10 @@ export async function lookups(db, companyId) {
   );
   return {
     locations: locations.map((r) => ({ id: r.id, code: r.code, name: r.name, locationType: r.location_type, status: r.status })),
-    departments: departments.map((r) => ({ id: r.id, code: r.code, name: r.name, status: r.status })),
+    departments: departments.map((r) => ({
+      id: r.id, code: r.code, name: r.name, status: r.status,
+      parentId: r.parent_department_id ?? null, type: r.department_type ?? null, isShared: Boolean(r.is_shared),
+    })),
     shifts: shifts.map((r) => ({ id: r.id, code: r.code, name: r.name, status: r.status })),
     locationTypes: LOCATION_TYPES,
     contextTypes: CONTEXT_TYPES,
@@ -374,24 +377,105 @@ export async function lookups(db, companyId) {
 }
 
 /* ------------------------------------------------------------ departments */
+// THE ONE TREE (init.sql §1b). A machine, an area and a shared crew are
+// departments; `type` is the company's own label for the level and NOTHING here
+// or anywhere else may branch on its text. `isShared` + `serves` are the facts:
+// a shared department serves other departments (hrms_department_serves) and is
+// drawn as one box pointing at each.
 
-const mapDepartment = (r) => ({
+const mapDepartment = (r, serves = []) => ({
   id: r.id,
   code: r.code,
   name: r.name,
   parentId: r.parent_department_id,
+  type: r.department_type ?? null,
+  isShared: Boolean(r.is_shared),
+  serves,
   status: r.status,
   createdAt: r.created_at,
 });
 
+/** departmentId -> [served department ids], live rows only. One query for the company (or one department). */
+async function servesByDepartment(db, companyId, departmentId = null) {
+  const [rows] = await db.query(
+    `SELECT s.department_id, s.serves_department_id
+       FROM hrms_department_serves s
+       JOIN hrms_departments d ON d.company_id = s.company_id AND d.id = s.serves_department_id AND d.deleted_at IS NULL
+      WHERE s.company_id = ? AND s.deleted_at IS NULL${departmentId ? ' AND s.department_id = ?' : ''}
+      ORDER BY s.department_id, s.serves_department_id`,
+    departmentId ? [companyId, departmentId] : [companyId],
+  );
+  const map = new Map();
+  for (const r of rows) {
+    if (!map.has(r.department_id)) map.set(r.department_id, []);
+    map.get(r.department_id).push(r.serves_department_id);
+  }
+  return map;
+}
+
 export async function listDepartments(db, companyId) {
   const [rows] = await db.query(
-    `SELECT id, code, name, parent_department_id, status, created_at
+    `SELECT id, code, name, parent_department_id, department_type, is_shared, status, created_at
        FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL
       ORDER BY name`,
     [companyId],
   );
-  return { rows: toPreOrder(rows, 'parent_department_id', mapDepartment) };
+  const serves = await servesByDepartment(db, companyId);
+  // The labels already in use, so the form can offer them instead of inventing a list.
+  const types = [...new Set(rows.map((r) => r.department_type).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  return { rows: toPreOrder(rows, 'parent_department_id', (r) => mapDepartment(r, serves.get(r.id) ?? [])), types };
+}
+
+/**
+ * Replace a shared department's serves list. Validates in words (TiDB holds no
+ * CHECK): every id must be a live department of this company, none may be the
+ * department itself, and the list is only meaningful on a shared department.
+ * Rows are retired, never erased; a pair that comes back is a new row.
+ */
+async function writeServes(db, c, departmentId, isShared, wanted) {
+  const ids = [...new Set((wanted ?? []).map((v) => Number(v)))];
+  if (ids.some((v) => !Number.isInteger(v) || v <= 0)) {
+    throw invalid('VALIDATION', 'Serves: every entry must be a department.', { problems: ['Serves: every entry must be a department id.'] });
+  }
+  if (ids.includes(departmentId)) {
+    throw invalid('VALIDATION', 'A department cannot serve itself.', { problems: ['A department cannot serve itself. List the OTHER departments this one works for.'] });
+  }
+  if (ids.length && !isShared) {
+    throw invalid('VALIDATION', 'Only a shared department serves other departments.', {
+      problems: ['Only a shared department serves other departments. Mark this one as shared first, or clear the list.'],
+    });
+  }
+  if (ids.length) {
+    const [found] = await db.query(
+      `SELECT id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
+      [c.companyId, ...ids],
+    );
+    const have = new Set(found.map((r) => r.id));
+    const missing = ids.filter((v) => !have.has(v));
+    if (missing.length) {
+      throw invalid('BAD_REFERENCE', 'A department this one is said to serve does not exist.', {
+        problems: [`${missing.length === 1 ? 'A department' : `${missing.length} departments`} in the serves list ${missing.length === 1 ? 'does' : 'do'} not exist in this company.`],
+      });
+    }
+  }
+  const current = (await servesByDepartment(db, c.companyId, departmentId)).get(departmentId) ?? [];
+  const gone = current.filter((v) => !ids.includes(v));
+  const added = ids.filter((v) => !current.includes(v));
+  if (gone.length) {
+    await db.query(
+      `UPDATE hrms_department_serves SET deleted_at = NOW()
+        WHERE company_id = ? AND department_id = ? AND deleted_at IS NULL AND serves_department_id IN (${gone.map(() => '?').join(',')})`,
+      [c.companyId, departmentId, ...gone],
+    );
+  }
+  if (added.length) {
+    await db.query(
+      `INSERT INTO hrms_department_serves (company_id, department_id, serves_department_id, created_by)
+       VALUES ${added.map(() => '(?, ?, ?, ?)').join(', ')}`,
+      added.flatMap((v) => [c.companyId, departmentId, v, c.userId]),
+    );
+  }
+  return { before: current, after: ids };
 }
 
 function departmentFields(input, problems, { partial = false } = {}) {
@@ -408,14 +492,31 @@ function departmentFields(input, problems, { partial = false } = {}) {
     }
     out.code = code;
   }
+  // A label, free text. Trimmed and length-checked; its WORDS are never read.
+  if (input.type !== undefined) {
+    const type = nullableStr(input.type);
+    if (type && type.length > 40) problems.push('Type: up to 40 characters. It is a label for the level — "Department", "Machine / area" — not a description.');
+    out.department_type = type;
+  }
+  if (input.isShared !== undefined) {
+    if (![true, false, 0, 1, '0', '1'].includes(input.isShared)) problems.push('Shared must be yes or no.');
+    out.is_shared = [true, 1, '1'].includes(input.isShared) ? 1 : 0;
+  }
   if (input.status !== undefined) out.status = enumOf(input.status, STATUSES, 'Status', problems, 'ACTIVE');
   return out;
+}
+
+function servesInput(input, problems) {
+  if (input.serves === undefined) return undefined;
+  if (!Array.isArray(input.serves)) { problems.push('Serves must be a list of departments.'); return undefined; }
+  return input.serves;
 }
 
 export async function createDepartment(db, c, input = {}) {
   const problems = [];
   const fields = departmentFields(input, problems);
   const parentId = idOrNull(input.parentId, 'Parent department', problems);
+  const serves = servesInput(input, problems);
   assertNoProblems(problems);
   await assertCodeFree(db, 'hrms_departments', c.companyId, fields.code, null, 'Department');
   await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Department');
@@ -424,7 +525,8 @@ export async function createDepartment(db, c, input = {}) {
     parent_department_id: parentId,
     status: fields.status ?? 'ACTIVE',
   });
-  await audit(db, c, 'hrms_departments', id, 'CREATE', null, { ...fields, parent_department_id: parentId });
+  const served = serves ? await writeServes(db, c, id, fields.is_shared === 1, serves) : null;
+  await audit(db, c, 'hrms_departments', id, 'CREATE', null, { ...fields, parent_department_id: parentId, ...(served ? { serves: served.after } : {}) });
   return getDepartment(db, c.companyId, id);
 }
 
@@ -440,8 +542,17 @@ export async function updateDepartment(db, c, id, input = {}) {
     await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, id, parentId, 'Department');
     fields.parent_department_id = parentId;
   }
+  const serves = servesInput(input, problems);
+  assertNoProblems(problems);
+  const sharedAfter = fields.is_shared !== undefined ? fields.is_shared === 1 : Boolean(before.is_shared);
   await updateRow(db, 'hrms_departments', c.companyId, id, fields);
-  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before), fields);
+  // Un-sharing a department retires what it served: a serves row on a department
+  // that is not shared is a line on the chart from a box that no longer has one.
+  const served = serves !== undefined
+    ? await writeServes(db, c, id, sharedAfter, serves)
+    : (!sharedAfter && before.is_shared ? await writeServes(db, c, id, false, []) : null);
+  const beforeServes = served ? served.before : [];
+  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...(served ? { serves: served.after } : {}) });
   return getDepartment(db, c.companyId, id);
 }
 
@@ -450,18 +561,22 @@ export async function deleteDepartment(db, c, id) {
   await assertNoLiveChildren(db, 'hrms_departments', 'parent_department_id', c.companyId, id, 'Department');
   await assertNotReferenced(db, c.companyId, id, [
     { table: 'hrms_work_contexts', column: 'department_id', label: 'work context' },
+    { table: 'hrms_department_serves', column: 'serves_department_id', label: 'shared department that serves it', plural: 'shared departments that serve it' },
     { table: 'hrms_roles', column: 'default_department_id', label: 'role' },
     { table: 'hrms_positions', column: 'department_id', label: 'position' },
     { table: 'hrms_work_assignments', column: 'department_id', label: 'work assignment' },
   ]);
+  // What it served goes with it; what serves IT was refused above.
+  const served = await writeServes(db, c, id, false, []);
   await softDelete(db, 'hrms_departments', c.companyId, id);
-  await audit(db, c, 'hrms_departments', id, 'DELETE', mapDepartment(before), null);
+  await audit(db, c, 'hrms_departments', id, 'DELETE', mapDepartment(before, served.before), null);
   return { ok: true, id };
 }
 
 async function getDepartment(db, companyId, id) {
   const row = await requireRow(db, 'hrms_departments', companyId, id, 'Department');
-  return mapDepartment(row);
+  const serves = await servesByDepartment(db, companyId, id);
+  return mapDepartment(row, serves.get(id) ?? []);
 }
 
 /* -------------------------------------------------------------- locations */

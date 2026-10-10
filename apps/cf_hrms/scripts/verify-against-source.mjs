@@ -24,13 +24,20 @@
  * sides at once, and then no check can see it. Only the file path and the raw
  * read are shared, so that both scripts provably read the same bytes.
  *
+ * THE ADJUSTMENTS FILE is part of the source. Where a person decided something
+ * the chart cannot say (one box is three machines; this crew serves those two;
+ * this seat is not shared), the expectation is chart + adjustments, and it is
+ * derived here from the file's own entries, not from anything the importer
+ * computed. Only the path rule and the raw read are shared, as for the chart.
+ *
  *   node verify-against-source.mjs --company=karni [--target=prod] [--source=<path>]
+ *                                  [--adjustments=<path> | --no-adjustments]
  *
  * Read-only. Exits 1 on any mismatch.
  */
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
-import { resolveSource, readSeed } from './orgChartSource.mjs';
+import { resolveSource, readSeed, resolveAdjustments, readAdjustments } from './orgChartSource.mjs';
 
 const TARGET = resolveTarget();
 const args = process.argv.slice(2);
@@ -76,7 +83,10 @@ async function main() {
 
   const source = resolveSource();
   const { seed, hash, size, fileName } = readSeed(source);
-  console.log(`  source: ${source}\n          ${size.toLocaleString()} bytes, sha256 ${hash.slice(0, 12)}…\n`);
+  console.log(`  source: ${source}\n          ${size.toLocaleString()} bytes, sha256 ${hash.slice(0, 12)}…`);
+  const adjFile = readAdjustments(resolveAdjustments(source));
+  const adjEntries = adjFile?.entries ?? [];
+  console.log(`  adjustments: ${adjFile ? `${adjFile.file}\n          ${adjEntries.length} entries, sha256 ${adjFile.hash.slice(0, 12)}…` : '(none — the chart alone)'}\n`);
 
   const nodes = seed.positions;
   const byId = new Map(nodes.map((p) => [p.id, p]));
@@ -86,12 +96,8 @@ async function main() {
 
   // ---- the walks, re-derived ------------------------------------------------
   const managerOf = (p) => { let c = byId.get(p.reportsTo), g = 0; while (c && c.kind === 'machine' && g++ < 50) c = byId.get(c.reportsTo); return c || null; };
-  const contextsOf = (p) => { const out = []; let c = byId.get(p.reportsTo), g = 0; while (c && c.kind !== 'role' && g++ < 50) { if (c.kind === 'machine') out.push(c); c = byId.get(c.reportsTo); } return out; };
   const isUnit = (n) => !!norm(n.dtype);
   const unitName = (n) => norm(n.dept) || norm(n.title);
-  const unitOf = (n) => { let c = n, g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
-  const unitAbove = (n) => { let c = byId.get(n.reportsTo), g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
-  const unitNodes = nodes.filter(isUnit);
   // A seat's role is identified by the role its position points at in the
   // database. That is only legitimate because section 4 first proves, from the
   // source alone, that the assignment of seats to roles is right: same role ⇔
@@ -115,12 +121,26 @@ async function main() {
   // ---- 0. PROVENANCE: is the database holding THIS file? -------------------
   // Without this, a verifier left pointed at the previous version would pass
   // every check it could still find and prove nothing at all.
-  const runs = await q('SELECT source_file_name, source_hash, source_size_bytes, status FROM hrms_import_runs WHERE company_id=? AND deleted_at IS NULL ORDER BY id DESC', [c]);
+  const runs = await q('SELECT source_file_name, source_hash, source_size_bytes, status, parsed_counts_json FROM hrms_import_runs WHERE company_id=? AND deleted_at IS NULL ORDER BY id DESC', [c]);
   check('exactly one committed import run', runs.filter((r) => r.status === 'COMMITTED').length === 1,
     `${runs.length} runs, ${runs.filter((r) => r.status === 'COMMITTED').length} committed — a second committed run means two charts are mixed in here`);
   const run = runs.find((r) => r.status === 'COMMITTED');
   check('the committed run is this exact file', !!run && run.source_hash === hash && run.source_file_name === fileName && Number(run.source_size_bytes) === size,
     run ? `db recorded ${run.source_file_name} sha256 ${String(run.source_hash).slice(0, 12)}… (${run.source_size_bytes} bytes); this file is ${fileName} sha256 ${hash.slice(0, 12)}… (${size} bytes)` : 'no committed run');
+
+  // ... and with THESE adjustments. A tenant imported before a decision was
+  // recorded (or after it was changed) is not what chart + file now imply, and
+  // every department check below would fail for a reason this states plainly.
+  const runCounts = (() => { const v = run?.parsed_counts_json; if (v == null) return {}; if (typeof v === 'string') { try { return JSON.parse(v); } catch { return {}; } } return v; })();
+  check('the committed run used this exact adjustments file (or none, if there is none)',
+    (runCounts.adjustmentsHash ?? null) === (adjFile?.hash ?? null),
+    `the run recorded ${runCounts.adjustmentsHash ? `${runCounts.adjustmentsFile} sha256 ${String(runCounts.adjustmentsHash).slice(0, 12)}…` : 'no adjustments'}; this run reads ${adjFile ? `${adjFile.fileName} sha256 ${adjFile.hash.slice(0, 12)}…` : 'none'}`);
+  // The entries, by kind, read straight from the file.
+  const splitNames = new Map(adjEntries.filter((a) => a.kind === 'split').map((a) => [a.node, a.into.map(norm)]));
+  const decidedShared = adjEntries.filter((a) => a.kind === 'shared');
+  const decidedNotShared = new Set(adjEntries.filter((a) => a.kind === 'notShared').map((a) => a.seat));
+  const stale = adjEntries.flatMap((a) => [a.node, a.seat, ...(a.seats ?? [])].filter((id) => id !== undefined && !byId.has(id)));
+  check('every adjustment names a node this chart still has', stale.length === 0, `not in the chart: ${stale.join(', ')}`);
 
   // ---- 1. Location --------------------------------------------------------
   const locRows = await q('SELECT id, code, name FROM hrms_locations WHERE company_id=? AND deleted_at IS NULL', [c]);
@@ -129,40 +149,237 @@ async function main() {
     `db ${locRows.length} rows${locRows[0] ? ` named "${locRows[0].name}"` : ''}, source subtitle implies "${expectedLoc}"`);
   const locationId = locRows[0]?.id ?? null;
 
-  // ---- 2. DEPARTMENTS -----------------------------------------------------
-  const deptRows = await q('SELECT id, code, name, parent_department_id, status FROM hrms_departments WHERE company_id=? AND deleted_at IS NULL', [c]);
+  // ---- 2. DEPARTMENTS: one tree, machines and shared crews included --------
+  // Re-derived TOP-DOWN, from the root seat outward, carrying "the department
+  // we are inside" down the chart. The importer works the other way (each seat
+  // walks UP to its nearest unit), so a mistake in one direction is not
+  // repeated in the other. Nothing here is imported from the importer.
+  //
+  // What the source implies:
+  //   * a machine node is a department — except a "... Process" node, which is
+  //     only a heading over the one section beneath it;
+  //   * a `dtype` seat opens a department — unless it stands directly under a
+  //     machine of the same name (it IS that machine), or it carries the name
+  //     of the unit already around it (a repeat), or a seat hanging from the
+  //     same place already opened a department of that name (one unit, several
+  //     senior people);
+  //   * every seat belongs to the department it is inside.
+  const deptRows = await q('SELECT id, code, name, parent_department_id, department_type, is_shared, status FROM hrms_departments WHERE company_id=? AND deleted_at IS NULL', [c]);
   const deptByCode = new Map(deptRows.map((r) => [r.code, r]));
   const deptById = new Map(deptRows.map((r) => [r.id, r]));
+  const serveRows = await q(
+    `SELECT s.department_id, s.serves_department_id FROM hrms_department_serves s WHERE s.company_id=? AND s.deleted_at IS NULL`, [c]);
 
-  same('exactly the source\'s dtype seats became departments',
-    unitNodes.map((n) => n.id), deptRows.map((r) => r.code));
+  const childrenOf = new Map();
+  for (const n of nodes) {
+    const k = byId.has(n.reportsTo) ? n.reportsTo : '';
+    if (!childrenOf.has(k)) childrenOf.set(k, []);
+    childrenOf.get(k).push(n);
+  }
+  const childNodes = (id) => childrenOf.get(id) || [];
+  const isProcessHeading = (n) => n.kind === 'machine' && /\bprocess$/i.test(norm(n.title));
 
-  const deptNameBad = unitNodes.filter((u) => deptByCode.has(u.id) && norm(deptByCode.get(u.id).name) !== clip(unitName(u), 200));
-  check('every department name is the source `dept` field (else the title)', deptNameBad.length === 0,
-    deptNameBad.slice(0, 5).map((u) => `${u.id}: source "${unitName(u)}" vs db "${deptByCode.get(u.id).name}"`).join(' | '));
-
-  const parentBad = unitNodes.filter((u) => {
-    if (!deptByCode.has(u.id)) return false;
-    const dbParent = deptByCode.get(u.id).parent_department_id;
-    const srcParent = unitAbove(u);
-    const dbParentCode = dbParent == null ? null : deptById.get(dbParent)?.code ?? '(dangling)';
-    return dbParentCode !== (srcParent ? srcParent.id : null);
+  // The source shape the "Process" rule rests on. If a later chart breaks it,
+  // this fails first and says so, rather than the tree checks failing obscurely.
+  const processNodes = machines.filter(isProcessHeading);
+  const processBad = processNodes.filter((m) => {
+    const ks = childNodes(m.id);
+    return ks.length !== 1 || norm(ks[0].dtype) !== 'section';
   });
-  check('every unit hangs under the unit that encloses it', parentBad.length === 0,
-    parentBad.slice(0, 6).map((u) => {
-      const dbParent = deptByCode.get(u.id).parent_department_id;
-      return `${u.id}: source parent ${unitAbove(u)?.id ?? 'ROOT'} vs db ${dbParent == null ? 'ROOT' : deptById.get(dbParent)?.code ?? 'dangling'}`;
-    }).join(' | '));
+  check('every "... Process" node is a heading over exactly one section seat', processBad.length === 0,
+    processBad.map((m) => `${m.id} "${norm(m.title)}" has ${childNodes(m.id).length} children`).join(' | '));
 
-  // A section must end up under a department, never free-floating: the source's
-  // 15 sections all sit inside something, so none may come out as a root.
-  const sectionRoots = unitNodes.filter((u) => norm(u.dtype) === 'section' && deptByCode.has(u.id) && deptByCode.get(u.id).parent_department_id == null);
-  check('no section became a root department', sectionRoots.length === 0, sectionRoots.map((u) => u.id).join(', '));
-  const srcRoots = unitNodes.filter((u) => !unitAbove(u));
+  const exp = new Map();          // code -> { code, name, parent, kind }
+  const expSeat = new Map();      // seat id -> department code
+  // Two seats "hang from the same place" when they are inside the same
+  // department, whatever seat they report to: P102/P103/P104/P071 all report to
+  // a Director who sits in Management, so they share Management's map.
+  const siblingMaps = new Map();   // department code ('' for none) -> Map(name -> code)
+  const openedIn = (dept) => { const k = dept ?? ''; if (!siblingMaps.has(k)) siblingMaps.set(k, new Map()); return siblingMaps.get(k); };
+  const startsDept = new Set();   // seats at which a department starts (its own row, or a namesake's)
+  const descend = (n, inside, unitNames) => {
+    // `inside`    the department code we are in when we reach n
+    // `unitNames` names of the UNIT departments around us, nearest last
+    const opened = openedIn(inside);
+    let here = inside;
+    let names = unitNames;
+    if (n.kind === 'machine' && splitNames.has(n.id)) {
+      // One box, several departments by decision. Whoever stands under it has
+      // to be placed by an adjustment; until then they are "under the split".
+      splitNames.get(n.id).forEach((name, i) => exp.set(`${n.id}-${i + 1}`, { code: `${n.id}-${i + 1}`, name, parent: inside, kind: 'machine' }));
+      here = `split:${n.id}`;
+    } else if (n.kind === 'machine') {
+      if (!isProcessHeading(n)) {
+        exp.set(n.id, { code: n.id, name: norm(n.title), parent: inside, kind: 'machine' });
+        here = n.id;
+      }
+    } else if (isUnit(n)) {
+      const name = unitName(n);
+      const parentNode = byId.get(n.reportsTo);
+      const isItsMachine = parentNode && parentNode.kind === 'machine' && !isProcessHeading(parentNode) && normKey(parentNode.title) === normKey(name);
+      const repeats = unitNames.length && normKey(unitNames[unitNames.length - 1]) === normKey(name);
+      if (isItsMachine || repeats) {
+        // no department of its own: `here` stays the machine, or the unit around it
+      } else if (opened.has(normKey(name))) {
+        here = opened.get(normKey(name));
+        names = [...unitNames, name];
+        startsDept.add(n.id);
+      } else {
+        exp.set(n.id, { code: n.id, name, parent: inside, kind: norm(n.dtype) });
+        startsDept.add(n.id);
+        opened.set(normKey(name), n.id);
+        here = n.id;
+        names = [...unitNames, name];
+      }
+    }
+    if (n.kind !== 'machine') expSeat.set(n.id, here);
+    for (const k of childNodes(n.id)) descend(k, here, names);
+  };
+  for (const root of childNodes('')) descend(root, null, []);
+
+  // ---- shared seats: what a person decided first, then what the chart marks --
+  // By decision (adjustments): the listed seats serve the listed departments.
+  // By the chart: a shared seat serves the departments of the seats it is
+  // `sharedWith` plus its own manager's; or, standing under a machine, that
+  // machine alone when the whole crew there is shared (one box drawn for
+  // several machines), and otherwise that machine and its neighbours.
+  // A seat reporting to a placed seat, with no department starting in between,
+  // goes with it. A seat decided "not shared" stays where the tree puts it.
+  const sharedKeyOf = (codes) => codes.join('+');
+  const expServed = new Map();     // seat id -> sorted department codes it serves
+  const customName = new Map();    // served-set key -> a name the adjustment gave
+  for (const a of decidedShared) {
+    const codes = [...new Set(a.serves)].sort();
+    for (const id of a.seats) expServed.set(id, codes);
+    if (norm(a.name)) customName.set(sharedKeyOf(codes), norm(a.name));
+  }
+  const decidedSeats = new Set(expServed.keys());
+  /** The nearest seat above that has been given a shared department, unless a department starts first. */
+  const leadOf = (p) => {
+    let up = byId.get(p.reportsTo), g = 0;
+    while (up && g++ < 60) {
+      if (up.kind === 'machine' || startsDept.has(up.id)) return null;
+      if ((expServed.get(up.id)?.length ?? 0) > 1) return up.id;
+      up = byId.get(up.reportsTo);
+    }
+    return null;
+  };
+  const sharedSeats = real.filter((p) => p.kind === 'shared');
+  const undecidedUnderSplit = [];
+  for (const s of sharedSeats) {
+    if (decidedSeats.has(s.id)) continue;
+    if (decidedNotShared.has(s.id)) { expServed.set(s.id, [expSeat.get(s.id)]); continue; }
+    let lead = null;
+    { let up = byId.get(s.reportsTo), g = 0; while (up && g++ < 60) { if (up.kind === 'machine' || startsDept.has(up.id)) break; if (decidedSeats.has(up.id)) { lead = up.id; break; } up = byId.get(up.reportsTo); } }
+    if (lead) { expServed.set(s.id, expServed.get(lead)); continue; }
+    let set;
+    if (Array.isArray(s.sharedWith) && s.sharedWith.length) {
+      set = [s.reportsTo, ...s.sharedWith].filter((id) => expSeat.has(id)).map((id) => expSeat.get(id));
+    } else {
+      let m = byId.get(s.reportsTo), g = 0;
+      while (m && m.kind === 'shared' && g++ < 50) m = byId.get(m.reportsTo);
+      if (!m || m.kind !== 'machine' || isProcessHeading(m)) set = [expSeat.get(s.id)];
+      else if (splitNames.has(m.id)) { undecidedUnderSplit.push(s.id); set = [expSeat.get(s.id)]; }
+      else {
+        const crew = childNodes(m.id).filter((k) => k.kind !== 'machine');
+        set = crew.every((k) => k.kind === 'shared')
+          ? [m.id]
+          : [m.id, ...childNodes(m.reportsTo).filter((k) => k.kind === 'machine' && k.id !== m.id && !isProcessHeading(k) && !splitNames.has(k.id)).map((k) => k.id)];
+      }
+    }
+    expServed.set(s.id, [...new Set(set)].sort());
+  }
+  // A served set of two or more is a shared department; one is just that department.
+  const expSharedSets = new Map();   // key -> codes
+  for (const [id, codes] of expServed) if (codes.length > 1) { expSharedSets.set(sharedKeyOf(codes), codes); expSeat.set(id, `shared:${sharedKeyOf(codes)}`); }
+  for (const p of real) {
+    if (expServed.has(p.id) || startsDept.has(p.id)) continue;
+    const lead = leadOf(p);
+    if (lead) expSeat.set(p.id, expSeat.get(lead));
+  }
+  const unplaced = real.filter((p) => String(expSeat.get(p.id)).startsWith('split:'));
+  check('every seat under a split machine is placed by an adjustment', unplaced.length === 0 && undecidedUnderSplit.length === 0,
+    [...unplaced.map((p) => `${p.id} "${norm(p.title)}" (${expSeat.get(p.id)})`), ...undecidedUnderSplit].slice(0, 8).join(' | '));
+
+  // ---- compare with the database ------------------------------------------
+  const plainRows = deptRows.filter((r) => Number(r.is_shared) !== 1);
+  const sharedRows = deptRows.filter((r) => Number(r.is_shared) === 1);
+  const servesOf = new Map();        // shared dept id -> sorted served codes
+  for (const r of sharedRows) servesOf.set(r.id, []);
+  const strayServes = [];
+  for (const s of serveRows) {
+    const code = deptById.get(s.serves_department_id)?.code ?? `#${s.serves_department_id}`;
+    if (servesOf.has(s.department_id)) servesOf.get(s.department_id).push(code);
+    else strayServes.push(`${deptById.get(s.department_id)?.code ?? `#${s.department_id}`} -> ${code}`);
+  }
+  for (const v of servesOf.values()) v.sort();
+
+  same('exactly the source\'s units and machines became departments (one per real thing)',
+    [...exp.keys()], plainRows.map((r) => r.code));
+
+  const machineDeptBad = machines.filter((m) => {
+    const rows = deptRows.filter((r) => r.code === m.id);
+    if (splitNames.has(m.id)) return rows.length !== 0;     // its parts are checked just below
+    return isProcessHeading(m) ? rows.length !== 0 : rows.length !== 1;
+  });
+  // A split, checked against the FILE entry by entry: the box has no row, and
+  // each named part is one row with that name, under what encloses the box.
+  const splitBad = [];
+  for (const [nodeId, names] of splitNames) {
+    if (deptRows.some((r) => r.code === nodeId)) splitBad.push(`${nodeId} still has a department of its own`);
+    names.forEach((name, i) => {
+      const rows = deptRows.filter((r) => r.code === `${nodeId}-${i + 1}`);
+      if (rows.length !== 1) splitBad.push(`${nodeId}-${i + 1} "${name}": ${rows.length} rows`);
+      else if (norm(rows[0].name) !== name) splitBad.push(`${nodeId}-${i + 1} is named "${rows[0].name}", the decision says "${name}"`);
+      else if (Number(rows[0].is_shared) === 1) splitBad.push(`${nodeId}-${i + 1} "${name}" is marked shared`);
+    });
+    const extra = deptRows.filter((r) => new RegExp(`^${nodeId}-\\d+$`).test(String(r.code)) && Number(String(r.code).split('-').pop()) > names.length);
+    if (extra.length) splitBad.push(`${extra.map((r) => r.code).join(', ')}: more parts than the decision names`);
+  }
+  check('every split in the adjustments file is applied: the box has no row, each named part has one', splitBad.length === 0, splitBad.slice(0, 6).join(' | '));
+  check('every machine node is exactly one department, and a process heading is none',
+    machineDeptBad.length === 0,
+    machineDeptBad.slice(0, 6).map((m) => `${m.id} "${norm(m.title)}": ${deptRows.filter((r) => r.code === m.id).length} rows`).join(' | '));
+
+  const deptNameBad = [...exp.values()].filter((d) => deptByCode.has(d.code) && norm(deptByCode.get(d.code).name) !== clip(d.name, 200));
+  check('every department name is the source `dept` field, or the machine\'s title', deptNameBad.length === 0,
+    deptNameBad.slice(0, 5).map((d) => `${d.code}: source "${d.name}" vs db "${deptByCode.get(d.code).name}"`).join(' | '));
+
+  const dbParentCode = (r) => (r.parent_department_id == null ? null : deptById.get(r.parent_department_id)?.code ?? '(dangling)');
+  const parentBad = [...exp.values()].filter((d) => deptByCode.has(d.code) && dbParentCode(deptByCode.get(d.code)) !== d.parent);
+  check('every department hangs under the department that encloses it', parentBad.length === 0,
+    parentBad.slice(0, 6).map((d) => `${d.code}: source parent ${d.parent ?? 'ROOT'} vs db ${dbParentCode(deptByCode.get(d.code)) ?? 'ROOT'}`).join(' | '));
+
+  // THE DUPLICATE CHECK, on the database alone. Whatever the rules above say,
+  // one real thing drawn twice has a recognisable shape: a department carrying
+  // its parent's name, or two of one name under one parent.
+  const sameAsParent = deptRows.filter((r) => r.parent_department_id != null && normKey(deptById.get(r.parent_department_id)?.name) === normKey(r.name));
+  const bySiblingName = new Map();
+  for (const r of deptRows) {
+    const k = `${r.parent_department_id ?? 'ROOT'}|${normKey(r.name)}`;
+    bySiblingName.set(k, [...(bySiblingName.get(k) || []), r.code]);
+  }
+  const siblingTwins = [...bySiblingName.values()].filter((v) => v.length > 1);
+  // ... and one that only shows against the chart: a unit name used again
+  // further down the same branch (the "Slitting" flag on a slitting operator).
+  const nameDownBranch = deptRows.filter((r) => {
+    let cur = deptById.get(r.parent_department_id), g = 0;
+    while (cur && g++ < 60) { if (normKey(cur.name) === normKey(r.name)) return true; cur = deptById.get(cur.parent_department_id); }
+    return false;
+  });
+  check('no department repeats the one above it, and no two siblings share a name (one department per real thing)',
+    sameAsParent.length === 0 && siblingTwins.length === 0 && nameDownBranch.length === 0,
+    [...sameAsParent.map((r) => `${r.code} "${r.name}" repeats its parent`),
+      ...siblingTwins.map((v) => `"${deptByCode.get(v[0]).name}" x${v.length} under one parent (${v.join(', ')})`),
+      ...nameDownBranch.filter((r) => !sameAsParent.includes(r)).map((r) => `${r.code} "${r.name}" repeats a department further up its branch`)].slice(0, 6).join(' | '));
+
+  check('no section became a root department',
+    [...exp.values()].filter((d) => d.kind !== 'dept' && deptByCode.has(d.code) && deptByCode.get(d.code).parent_department_id == null).length === 0,
+    [...exp.values()].filter((d) => d.kind !== 'dept' && deptByCode.get(d.code)?.parent_department_id == null).map((d) => d.code).join(', '));
+  const srcRoots = [...exp.values()].filter((d) => d.parent == null);
   check('exactly the source\'s top unit is a root', deptRows.filter((r) => r.parent_department_id == null).length === srcRoots.length,
-    `db ${deptRows.filter((r) => r.parent_department_id == null).length} roots, source implies ${srcRoots.length} (${srcRoots.map((u) => u.id).join(', ')})`);
+    `db ${deptRows.filter((r) => r.parent_department_id == null).length} roots, source implies ${srcRoots.length} (${srcRoots.map((u) => u.code).join(', ')})`);
 
-  // No cycle, and the tree is reachable from a root.
   let cyclic = 0;
   for (const r of deptRows) {
     const seen = new Set(); let cur = r;
@@ -172,6 +389,79 @@ async function main() {
     }
   }
   check('the department tree has no cycle', cyclic === 0, `${cyclic} rows loop`);
+
+  // The label is free text and no logic reads it — but the IMPORT chose these
+  // four, and a machine labelled "Department" would mislead whoever reads it.
+  const labelBad = deptRows.filter((r) => {
+    if (Number(r.is_shared) === 1) return r.department_type !== 'Shared crew';
+    const d = exp.get(r.code);
+    if (!d) return false;
+    if (d.kind === 'machine') return r.department_type !== 'Machine / area';
+    if (d.kind === 'dept') return r.department_type !== 'Department';
+    return !['Process', 'Section'].includes(r.department_type);
+  });
+  check('every department carries the label its source kind implies', labelBad.length === 0,
+    labelBad.slice(0, 6).map((r) => `${r.code} "${r.name}" is labelled "${r.department_type}"`).join(' | '));
+  const processLabelBad = processNodes.filter((m) => {
+    const section = childNodes(m.id)[0];
+    return section && deptByCode.get(section.id)?.department_type !== 'Process';
+  });
+  check('the section under a "... Process" heading is the one labelled Process', processLabelBad.length === 0
+    && deptRows.filter((r) => r.department_type === 'Process').length === processNodes.length,
+    `${deptRows.filter((r) => r.department_type === 'Process').length} labelled Process, source has ${processNodes.length} headings`);
+
+  // ---- shared departments ---------------------------------------------------
+  same('one shared department per distinct set of departments served, and no others',
+    [...expSharedSets.keys()], sharedRows.map((r) => sharedKeyOf(servesOf.get(r.id))),
+    (k) => `serves ${k}`);
+  check('only a shared department has serves rows, and none serves itself',
+    strayServes.length === 0 && serveRows.every((s) => s.department_id !== s.serves_department_id),
+    strayServes.slice(0, 4).join(' | ') || 'a department serves itself');
+  same('every serves row is one the source implies, once',
+    [...expSharedSets.values()].flatMap((codes) => codes.map((x) => `${sharedKeyOf(codes)}>${x}`)),
+    serveRows.filter((s) => servesOf.has(s.department_id)).map((s) => `${sharedKeyOf(servesOf.get(s.department_id))}>${deptById.get(s.serves_department_id)?.code}`));
+  // Its place in the tree: the nearest department that is every served
+  // department's ancestor or the department itself.
+  const upChain = (code) => { const out = []; let cur = deptByCode.get(code), g = 0; while (cur && g++ < 60) { out.push(cur.code); cur = deptById.get(cur.parent_department_id); } return out; };
+  const sharedPlaceBad = sharedRows.filter((r) => {
+    const codes = servesOf.get(r.id);
+    if (!codes.length) return true;
+    const chains = codes.map(upChain);
+    const want = chains[0].find((x) => chains.every((ch) => ch.includes(x))) ?? null;
+    return dbParentCode(r) !== want;
+  });
+  check('a shared department hangs under the nearest department enclosing everything it serves', sharedPlaceBad.length === 0,
+    sharedPlaceBad.map((r) => `${r.code} is under ${dbParentCode(r) ?? 'ROOT'}`).join(' | '));
+  // Its name: "Shared · A + B", at most three named, then "+ N more", in tree order.
+  // Where a department sits in the chart's own order: its node's place, and for
+  // a split machine's part, the box's place then the part number.
+  const chartPlace = (code) => {
+    const whole = nodes.findIndex((n) => n.id === code);
+    if (whole >= 0) return whole;
+    const m = /^(.*)-(\d+)$/.exec(String(code));
+    const box = m ? nodes.findIndex((n) => n.id === m[1]) : -1;
+    return box >= 0 ? box + Number(m[2]) / 1000 : 1e9;
+  };
+  const treeRank = new Map();
+  { const walk = (parentId) => { for (const r of deptRows.filter((x) => (x.parent_department_id ?? null) === parentId && Number(x.is_shared) !== 1)
+      .sort((a, b) => chartPlace(a.code) - chartPlace(b.code))) { treeRank.set(r.code, treeRank.size); walk(r.id); } };
+    walk(null); }
+  const sharedNameBad = sharedRows.filter((r) => {
+    const names = [...servesOf.get(r.id)].sort((a, b) => treeRank.get(a) - treeRank.get(b)).map((x) => deptByCode.get(x)?.name);
+    const want = customName.get(sharedKeyOf(servesOf.get(r.id))) ?? `Shared · ${names.slice(0, 3).join(' + ')}${names.length > 3 ? ` + ${names.length - 3} more` : ''}`;
+    return norm(r.name) !== clip(want, 200);
+  });
+  check('a shared department is named for what it serves', sharedNameBad.length === 0,
+    sharedNameBad.map((r) => `${r.code} "${r.name}"`).join(' | '));
+  check('every department is ACTIVE', deptRows.every((r) => r.status === 'ACTIVE'),
+    `${deptRows.filter((r) => r.status !== 'ACTIVE').length} are not`);
+
+  /** What a seat's department_id means in the source's terms: a code, or `shared:<served codes>`. */
+  const dbDeptKey = (departmentId) => {
+    const r = deptById.get(departmentId);
+    if (!r) return null;
+    return Number(r.is_shared) === 1 ? `shared:${sharedKeyOf(servesOf.get(r.id))}` : r.code;
+  };
 
   // ---- 3. Positions -------------------------------------------------------
   const posRows = await q(
@@ -194,19 +484,47 @@ async function main() {
   const locBad = real.filter((p) => posByCode.has(p.id) && posByCode.get(p.id).location_id !== locationId);
   check('every position sits at the one location', locBad.length === 0, locBad.slice(0, 5).map((p) => p.id).join(', '));
 
-  // THE DEPARTMENT ASSIGNMENT, position by position. This is the new field and
-  // the one most worth re-deriving: it is the product of a tree walk, and a
-  // tree walk is exactly the kind of thing that is wrong in one branch only.
-  const deptBad = real.filter((p) => {
-    if (!posByCode.has(p.id)) return false;
-    const want = unitOf(p);
-    const got = posByCode.get(p.id).department_id;
-    return (want ? deptByCode.get(want.id)?.id : null) !== (got ?? null);
-  });
-  check('every position carries its nearest enclosing unit', deptBad.length === 0,
-    deptBad.slice(0, 8).map((p) => `${p.id}: source unit ${unitOf(p)?.id ?? 'none'} vs db dept id ${posByCode.get(p.id).department_id}`).join(' | '));
+  // THE DEPARTMENT ASSIGNMENT, seat by seat — the product of a tree walk, which
+  // is exactly the kind of thing that is wrong in one branch only. A dedicated
+  // seat sits in its machine's department, a shared seat in the shared
+  // department for what it serves, everything else in its unit.
+  const deptBad = real.filter((p) => posByCode.has(p.id) && dbDeptKey(posByCode.get(p.id).department_id) !== expSeat.get(p.id));
+  check('every seat sits in the department the chart puts it in', deptBad.length === 0,
+    deptBad.slice(0, 8).map((p) => `${p.id} "${norm(p.title)}": source ${expSeat.get(p.id) ?? 'none'} vs db ${dbDeptKey(posByCode.get(p.id).department_id) ?? 'none'}`).join(' | '));
   check('no position is left without a department', posRows.every((r) => r.department_id != null),
     `${posRows.filter((r) => r.department_id == null).length} positions have none; the source's root seat is a unit, so every node resolves`);
+  const servingSeats = real.filter((p) => expServed.has(p.id));
+  const sharedSeatBad = servingSeats.filter((p) => {
+    const got = deptById.get(posByCode.get(p.id)?.department_id);
+    if (!got) return true;
+    return expServed.get(p.id).length > 1
+      ? Number(got.is_shared) !== 1 || sharedKeyOf(servesOf.get(got.id)) !== sharedKeyOf(expServed.get(p.id))
+      : Number(got.is_shared) === 1 || got.code !== expServed.get(p.id)[0];
+  });
+  check('each shared seat is in a department serving exactly what the source implies (or, serving one, in that one)',
+    sharedSeatBad.length === 0,
+    sharedSeatBad.map((p) => `${p.id}: source serves ${expServed.get(p.id).join('+')} vs db ${dbDeptKey(posByCode.get(p.id)?.department_id)}`).join(' | '));
+  // Each decision, by name, so a failure says WHICH decision the database lost.
+  const decisionBad = [];
+  for (const a of decidedShared) {
+    const want = sharedKeyOf([...new Set(a.serves)].sort());
+    for (const id of a.seats) {
+      const got = deptById.get(posByCode.get(id)?.department_id);
+      const has = got && Number(got.is_shared) === 1 ? sharedKeyOf(servesOf.get(got.id)) : null;
+      if (has !== want) decisionBad.push(`${id} should be in a shared department serving ${want}; it is in ${got ? `${got.code}${has ? ` serving ${has}` : ' (not shared)'}` : 'none'}`);
+    }
+  }
+  check('every "shared" decision in the adjustments file holds: those seats, serving exactly those departments', decisionBad.length === 0, decisionBad.slice(0, 5).join(' | '));
+  const notSharedBad = [...decidedNotShared].filter((id) => {
+    const got = deptById.get(posByCode.get(id)?.department_id);
+    return !got || Number(got.is_shared) === 1 || got.code !== expSeat.get(id);
+  });
+  check('every "not shared" decision holds: that seat sits in its own department, not a shared one', notSharedBad.length === 0,
+    notSharedBad.map((id) => `${id}: db ${dbDeptKey(posByCode.get(id)?.department_id)}, the decision implies ${expSeat.get(id)}`).join(' | '));
+  const kindOfSeat = (p) => { const k = String(expSeat.get(p.id)); return k.startsWith('shared:') ? 'shared' : (exp.get(k)?.kind === 'machine' ? 'machine' : 'unit'); };
+  const seatSplit = { machine: 0, shared: 0, unit: 0 };
+  for (const p of real) seatSplit[kindOfSeat(p)] += 1;
+  console.log(`  seats by where they sit: ${seatSplit.machine} in a machine's department, ${seatSplit.shared} in a shared department, ${seatSplit.unit} elsewhere (${real.length})\n`);
 
   // Shift: DN is two shifts and must be NULL, never a third shift row.
   const shiftRows = await q('SELECT id, code FROM hrms_shifts WHERE company_id=? AND deleted_at IS NULL', [c]);
@@ -227,9 +545,6 @@ async function main() {
   check('every position is ACTIVE from the chart date',
     posRows.every((r) => r.status === 'ACTIVE' && ymd(r.effective_from) === chartDate),
     `${posRows.filter((r) => r.status !== 'ACTIVE').length} not ACTIVE, ${posRows.filter((r) => ymd(r.effective_from) !== chartDate).length} dated otherwise`);
-  check('every department is ACTIVE', deptRows.every((r) => r.status === 'ACTIVE'),
-    `${deptRows.filter((r) => r.status !== 'ACTIVE').length} are not`);
-
   // ---- 4. Roles -----------------------------------------------------------
   const roleRows = await q('SELECT id, role_code, title, default_department_id, status, effective_from FROM hrms_roles WHERE company_id=? AND deleted_at IS NULL', [c]);
   check('every role is ACTIVE from the chart date',
@@ -296,19 +611,18 @@ async function main() {
   check('a role is coded by the first seat that holds it', codeBad.length === 0,
     codeBad.slice(0, 5).map(([k, ps]) => `"${k}" should be ${ps[0].id}`).join(' | '));
 
-  // ---- 5. Work contexts ---------------------------------------------------
-  const ctxRows = await q('SELECT id, code, name, context_type, location_id, department_id FROM hrms_work_contexts WHERE company_id=? AND deleted_at IS NULL', [c]);
-  const ctxByCode = new Map(ctxRows.map((r) => [r.code, r]));
-  same('exactly the machine nodes became work contexts',
-    machines.map((m) => m.id), ctxRows.map((r) => r.code));
-  const ctxNameBad = machines.filter((m) => ctxByCode.has(m.id) && norm(ctxByCode.get(m.id).name) !== clip(norm(m.title), 200));
-  check('every context name matches', ctxNameBad.length === 0, ctxNameBad.map((m) => m.id).join(', '));
-  check('every context is a MACHINE at the one location', ctxRows.every((r) => r.context_type === 'MACHINE' && r.location_id === locationId),
-    `${ctxRows.filter((r) => r.context_type !== 'MACHINE').length} wrong type, ${ctxRows.filter((r) => r.location_id !== locationId).length} wrong location`);
-  // Deliberately not set: the source says which unit a machine sits in, but the
-  // import was scoped to positions. If that changes, this check is the reminder.
-  check('no machine was given a department (not in scope, so not guessed)', ctxRows.every((r) => r.department_id == null),
-    `${ctxRows.filter((r) => r.department_id != null).length} contexts carry one`);
+  // ---- 5. Work contexts are RETIRED: the import writes none -----------------
+  // Machines are departments (section 2). The tables stay in the schema; a row
+  // in any of them after an import means the old path is still running beside
+  // the new one, and then a seat has two answers to "where does it work".
+  for (const [label, table] of [
+    ['work context', 'hrms_work_contexts'],
+    ['position-to-context link', 'hrms_position_work_contexts'],
+    ['assignment-to-context link', 'hrms_work_assignment_contexts'],
+  ]) {
+    const [[n]] = await conn.query(`SELECT COUNT(*) n FROM ${table} WHERE company_id=? AND deleted_at IS NULL`, [c]);
+    check(`no ${label} was written (machines are departments)`, Number(n.n) === 0, `${n.n} live rows in ${table}`);
+  }
 
   // ---- 6. Formal reporting: every edge, re-derived -------------------------
   const edgeRows = await q(
@@ -330,20 +644,6 @@ async function main() {
   check('exactly the source\'s root seats have no manager',
     real.length - new Set(edgeRows.filter((e) => e.type === 'PRIMARY_MANAGER').map((e) => e.src)).size === srcRootNodes.length,
     `source implies ${srcRootNodes.length} roots (${srcRootNodes.map((p) => p.id).join(', ')})`);
-
-  // ---- 7. Position -> context links ---------------------------------------
-  const linkRows = await q(
-    `SELECT p.position_code AS pos, w.code AS ctx, l.is_primary
-       FROM hrms_position_work_contexts l
-       JOIN hrms_positions p ON p.company_id=l.company_id AND p.id=l.position_id
-       JOIN hrms_work_contexts w ON w.company_id=l.company_id AND w.id=l.work_context_id
-      WHERE l.company_id=? AND l.deleted_at IS NULL`, [c]);
-  const expectedLinks = real.flatMap((p) => contextsOf(p).map((m, i) => `${p.id}>${m.id}:${i === 0 ? 1 : 0}`));
-  same('every machine context link matches the source, and there are no others',
-    expectedLinks, linkRows.map((l) => `${l.pos}>${l.ctx}:${Number(l.is_primary)}`));
-  check('every machine is worked by at least one position',
-    machines.every((m) => linkRows.some((l) => l.ctx === m.id)),
-    machines.filter((m) => !linkRows.some((l) => l.ctx === m.id)).map((m) => m.id).join(', '));
 
   // ---- 8. Manpower: the day/night doubling, plan §9.1 ----------------------
   const mpRows = await q(
@@ -624,7 +924,6 @@ async function main() {
     ['employee', 'SELECT full_name k FROM hrms_employees WHERE company_id=? AND deleted_at IS NULL'],
     ['department', 'SELECT code k FROM hrms_departments WHERE company_id=? AND deleted_at IS NULL'],
     ['role title', 'SELECT title k FROM hrms_roles WHERE company_id=? AND deleted_at IS NULL'],
-    ['work context', 'SELECT code k FROM hrms_work_contexts WHERE company_id=? AND deleted_at IS NULL'],
     ['KPI name', 'SELECT name k FROM hrms_kpi_definitions WHERE company_id=? AND deleted_at IS NULL'],
     ['responsibility text', 'SELECT description k FROM hrms_responsibility_definitions WHERE company_id=? AND deleted_at IS NULL'],
   ]) {

@@ -20,9 +20,14 @@
  * ── WHICH UNIT A POSITION COUNTS IN ──────────────────────────────────────
  * `hrms_positions.department_id`, read as stored. The importer set it by walking
  * up the chart from the position ITSELF to the nearest unit, so a unit's own
- * head job sits inside the unit it heads, not above it. Checked 2026-10-09
- * against a fresh walk over all 130 Karni positions: 130 agree. Walking again
- * here would be a second copy of the importer's rule.
+ * head job sits inside the unit it heads, not above it. Walking again here
+ * would be a second copy of the importer's rule.
+ *
+ * Since 2026-10-10 a "unit" is ANY department: a machine and a shared crew are
+ * departments in the same tree, so an operator's duties roll up under his
+ * machine and the Printing process shows only what its Incharge carries. Each
+ * unit carries `type` (the company's label, never logic) and `isShared`. This
+ * service no longer reads work contexts at all.
  *
  * ── WHERE THE LINES COME FROM ─────────────────────────────────────────────
  * Content resolution is contentResolver.js (plan §2 rule 6) and nothing else.
@@ -45,7 +50,8 @@
  * question a Role JD for a position answers.
  *
  * ── ROUND TRIPS ───────────────────────────────────────────────────────────
- * Six queries for the whole company, issued together and grouped in JS, plus
+ * Five queries for the whole company (six until the work-context read was
+ * retired, 2026-10-10), issued together and grouped in JS, plus
  * ~13 for each position that carries a seat-level exception. The payload
  * reports the exact number it used (`queries`), counted at the connection.
  *
@@ -60,7 +66,7 @@ import { resolveContent, targetText } from './contentResolver.js';
  * ══════════════════════════════════════════════════════════════════════════ */
 
 const UNITS_SQL = `
-  SELECT id, code, name, parent_department_id, status
+  SELECT id, code, name, parent_department_id, department_type, is_shared, status
     FROM hrms_departments
    WHERE company_id = ? AND deleted_at IS NULL
    ORDER BY name, code, id`;
@@ -87,14 +93,6 @@ const PRIMARY_EDGES_SQL = `
    WHERE rr.company_id = ? AND rr.deleted_at IS NULL AND t.code = 'PRIMARY_MANAGER'
      AND ${LIVE_ON('rr')}
    ORDER BY rr.is_primary DESC, t.sort_order, rr.id`;
-
-/** The machine a seat works on. It is what tells three units called "Slitting" apart. */
-const CONTEXTS_SQL = `
-  SELECT c.position_id, c.is_primary, wc.name
-    FROM hrms_position_work_contexts c
-    JOIN hrms_work_contexts wc ON wc.company_id = c.company_id AND wc.id = c.work_context_id
-   WHERE c.company_id = ? AND c.deleted_at IS NULL AND ${LIVE_ON('c')}
-   ORDER BY c.is_primary DESC, wc.name`;
 
 /**
  * Which rows of a role layer are in force on a date. THE TWIN of
@@ -279,27 +277,27 @@ function linesFromResolved(content) {
 /* ══════════════════════════════════════════════════════════════════════════
  * Telling units apart
  * ══════════════════════════════════════════════════════════════════════════
- * 32 units, 24 names. "Sales & Marketing" is four sibling units, "Slitting" is
- * a unit with three children also called "Slitting", and "BFL" and
- * "Lamination" each contain a unit of their own name. A list that prints the
- * bare name shows identical rows and reads as broken.
+ * The V28 import used to leave 32 units carrying 24 names ("Sales & Marketing"
+ * four times, "Slitting" inside "Slitting"). Since 2026-10-10 the importer
+ * makes one department per real thing, so Karni has no clash left — but a
+ * company can still create two departments of one name by hand, and a list
+ * that prints the bare name twice reads as broken.
  *
  * The parent path separates a unit from a namesake ELSEWHERE in the tree, and
  * the screen always shows it. It cannot separate SIBLINGS of one name, nor a
  * unit from a same-named parent, so those get a qualifier. Each unit is a job
  * as well as a unit, and the first fact that actually differs is used:
- *   1. the machine its head works on — "SP Ultraflex 1" / "SP Ultraflex 2";
- *   2. its head's title — "AGM - Sales & Marketing" / "Associate - …";
- *   3. its code, which is unique by constraint.
+ *   1. its head's title — "AGM - Sales & Marketing" / "Associate - …";
+ *   2. its code, which is unique by constraint.
+ * (The machine its head works on used to come first. A machine is a department
+ * now, so it is already the unit's own name.)
  */
-function qualifyUnits(units, headsOf, positionById, primaryContextOf) {
+function qualifyUnits(units, headsOf, positionById) {
   const norm = (s) => clean(s).toLowerCase();
   const candidates = (u) => {
     const heads = headsOf.get(u.id) ?? [];
-    const contexts = [...new Set(heads.map((id) => primaryContextOf.get(id)).filter(Boolean))];
     const titles = [...new Set(heads.map((id) => positionById.get(id)?.title).filter(Boolean))];
     return {
-      context: contexts.length === 1 ? contexts[0] : null,
       head: titles.length ? titles.join(', ') : null,
       code: u.code || `#${u.id}`,
     };
@@ -311,7 +309,7 @@ function qualifyUnits(units, headsOf, positionById, primaryContextOf) {
     byName.set(k, [...(byName.get(k) ?? []), u]);
   }
   const unitById = new Map(units.map((u) => [u.id, u]));
-  const ORDER = ['context', 'head', 'code'];
+  const ORDER = ['head', 'code'];
 
   for (const u of units) {
     u.clash = (byName.get(norm(u.name))?.length ?? 0) > 1;
@@ -367,12 +365,11 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
   const counted = { query: (...args) => { queries += 1; return db.query(...args); } };
 
   const [
-    [unitRows], [positionRows], [edgeRows], [contextRows], [contentRows], [overlayRows],
+    [unitRows], [positionRows], [edgeRows], [contentRows], [overlayRows],
   ] = await Promise.all([
     counted.query(UNITS_SQL, [companyId]),
     counted.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     counted.query(PRIMARY_EDGES_SQL, [companyId, asOf, asOf]),
-    counted.query(CONTEXTS_SQL, [companyId, asOf, asOf]),
     counted.query(CONTENT_SQL, [companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf]),
     counted.query(OVERLAY_POSITIONS_SQL, [companyId]),
   ]);
@@ -394,10 +391,6 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
   const primaryManagerOf = new Map();
   for (const e of edgeRows) {
     if (!primaryManagerOf.has(e.from_position_id)) primaryManagerOf.set(e.from_position_id, e.to_position_id);
-  }
-  const primaryContextOf = new Map();
-  for (const c of contextRows) {
-    if (!primaryContextOf.has(c.position_id)) primaryContextOf.set(c.position_id, c.name);
   }
 
   /* ── lines: one dictionary, keyed by what the line says ─────────────── */
@@ -450,6 +443,10 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
     code: u.code ?? null,
     name: clean(u.name) || `Unit ${u.id}`,
     parentId: u.parent_department_id ?? null,
+    // The company's own label for the level, and whether it serves other
+    // departments. Labels are for people; nothing here branches on the text.
+    type: u.department_type ?? null,
+    isShared: Boolean(u.is_shared),
     status: u.status,
   }));
   const unitById = new Map(units.map((u) => [u.id, u]));
@@ -492,7 +489,7 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
     }));
   }
 
-  qualifyUnits(units, headsOf, positionById, primaryContextOf);
+  qualifyUnits(units, headsOf, positionById);
 
   /* ── per unit: its own positions' lines, de-duplicated ────────────────── */
   const byCode = (a, b) => String(positionById.get(a)?.code ?? '').localeCompare(String(positionById.get(b)?.code ?? ''), undefined, { numeric: true }) || a - b;
@@ -533,6 +530,8 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
       code: u.code,
       name: u.name,
       parentId: u.parentId,
+      type: u.type,
+      isShared: u.isShared,
       status: u.status,
       depth,
       // Root first, parent last. The screen prints it above the name.

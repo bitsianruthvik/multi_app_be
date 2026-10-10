@@ -74,7 +74,7 @@ if (flag('list')) {
 // ---------------------------------------------------------------- is the database holding still? ----
 const SIGNED = ['hrms_positions', 'hrms_roles', 'hrms_employees', 'hrms_work_assignments', 'hrms_open_points', 'hrms_work_contexts',
   'hrms_responsibility_definitions', 'hrms_role_responsibility_assignments', 'hrms_position_reporting_relationships',
-  'hrms_position_work_contexts', 'hrms_manpower_requirements', 'hrms_departments', 'hrms_locations', 'hrms_shifts', 'hrms_import_runs'];
+  'hrms_position_work_contexts', 'hrms_manpower_requirements', 'hrms_departments', 'hrms_department_serves', 'hrms_locations', 'hrms_shifts', 'hrms_import_runs'];
 /** Row count, highest id and latest update of everything an export reads, as one string. Rolled-back rehearsals do not change it. */
 async function signature(conn, companyId) {
   const sql = SIGNED.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n, COALESCE(MAX(id), 0) AS mx, COALESCE(MAX(updated_at), '') AS u FROM ${t} WHERE company_id = ?`).join(' UNION ALL ');

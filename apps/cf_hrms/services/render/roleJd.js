@@ -294,9 +294,13 @@ function positionContextDocx(pc) {
     ['Status', titleCase(pc.position.status)],
   ]));
 
-  out.push(h2('Machines, lines and areas'));
-  if (!pc.workContexts.length) out.push(italic('No machine, line, area or project is linked to this position yet.'));
-  else for (const c of pc.workContexts) {
+  // Machines are DEPARTMENTS since 2026-10-10, so the seat's department (above)
+  // already says where the work happens and a new document has no work contexts.
+  // The section is printed only when the snapshot carries some — an older
+  // document re-rendered from its snapshot still lists them — because "nothing
+  // is linked yet" would now read as missing data on every seat.
+  if ((pc.workContexts ?? []).length) out.push(h2('Machines, lines and areas'));
+  for (const c of pc.workContexts ?? []) {
     out.push(bullet(`${c.workContextName ?? c.name}${c.contextType ? ` (${titleCase(c.contextType)})` : ''}${c.isPrimary ? ' — primary' : ''}`));
   }
 
@@ -621,9 +625,9 @@ function writePositionContextPdf(kit, pc) {
     ['Status', titleCase(pc.position.status)],
   ]);
 
-  kit.heading('Machines, lines and areas', 2);
-  if (!pc.workContexts.length) kit.note('No machine, line, area or project is linked to this position yet.');
-  else for (const c of pc.workContexts) {
+  // See positionContextDocx: printed only when the snapshot carries work contexts.
+  if ((pc.workContexts ?? []).length) kit.heading('Machines, lines and areas', 2);
+  for (const c of pc.workContexts ?? []) {
     kit.bullet(`${c.workContextName ?? c.name}${c.contextType ? ` (${titleCase(c.contextType)})` : ''}${c.isPrimary ? ' — primary' : ''}`);
   }
 

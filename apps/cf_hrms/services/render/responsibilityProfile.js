@@ -122,11 +122,15 @@ export async function renderProfileDocx(snapshot) {
       ['Status', titleCase(a.status)],
     ]));
 
-    // Contexts: machines and areas are never managers (plan §2 rule 3).
+    // Contexts: machines and areas are never managers (plan §2 rule 3). Since
+    // 2026-10-10 a machine is the assignment's DEPARTMENT (the table above), so
+    // this section is printed only when the snapshot carries work contexts —
+    // "nothing is linked yet" would read as missing data on every assignment.
     const ctxSection = sectionOf(sections, 'contexts');
-    children.push(h2(ctxSection.heading));
-    if (!a.contexts.length) children.push(italic(ctxSection.note ?? 'Not recorded yet.'));
-    else for (const c of a.contexts) children.push(bullet(contextLine(c)));
+    if ((a.contexts ?? []).length) {
+      children.push(h2(ctxSection.heading));
+      for (const c of a.contexts) children.push(bullet(contextLine(c)));
+    }
 
     // THE SET. Never flattened.
     const repSection = sectionOf(sections, 'reporting');
@@ -216,10 +220,12 @@ export async function renderProfilePdf(snapshot) {
       ['Status', titleCase(a.status)],
     ]);
 
+    // See the docx half: printed only when the snapshot carries work contexts.
     const ctxSection = sectionOf(sections, 'contexts');
-    kit.heading(ctxSection.heading, 2);
-    if (!a.contexts.length) kit.note(ctxSection.note ?? 'Not recorded yet.');
-    else for (const c of a.contexts) kit.bullet(contextLine(c));
+    if ((a.contexts ?? []).length) {
+      kit.heading(ctxSection.heading, 2);
+      for (const c of a.contexts) kit.bullet(contextLine(c));
+    }
 
     const repSection = sectionOf(sections, 'reporting');
     kit.heading(repSection.heading, 2);

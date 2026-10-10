@@ -209,26 +209,63 @@ export const cases = [
   {
     name: "CHANGE a seat's department, location and machine list",
     async run(t) {
+      // Since 2026-10-10 a machine is a DEPARTMENT, so a freshly imported company has no work contexts and the
+      // "Machines or areas" cell is empty everywhere. The department and location halves must still be tested then
+      // (they are how a seat's machine is said now), so the machine half is the optional part, not the whole case.
       const { buf, data } = await t.freshExport();
-      const seat = t.need(data.seats.find((s) => s.contextLinks.length === 1), 'no seat with exactly one machine');
-      const machineB = t.need(data.machines.find((m) => !seat.contextLinks.some((l) => l.contextId === m.id) && !m.name.includes(',')), 'no second machine to swap in');
+      const withMachine = data.seats.find((s) => s.contextLinks.length === 1);
+      const machineB = withMachine ? data.machines.find((m) => !withMachine.contextLinks.some((l) => l.contextId === m.id) && !m.name.includes(',')) : null;
+      const seat = t.need(withMachine && machineB ? withMachine : data.seats.find((s) => s.department), 'no seat has a department');
+      const swapMachine = Boolean(withMachine && machineB);
+      if (!swapMachine) t.partial.push('no seat with exactly one machine and a second machine to swap in (machines are departments now), so the machine list was left alone');
       const dept = t.name('Dept');
       const loc = t.name('Loc');
       const wb = await t.open(buf);
       const row = t.rowOfKey(wb, seat.key);
       t.setCell(wb, 'Structure', row, t.COLS.department, dept);
       t.setCell(wb, 'Structure', row, t.COLS.location, loc);
-      t.setCell(wb, 'Structure', row, t.COLS.machines, machineB.name);
+      if (swapMachine) t.setCell(wb, 'Structure', row, t.COLS.machines, machineB.name);
       const edited = await t.save(wb);
       const prep = await t.plan(edited);
-      t.ok(t.changed(prep.plan) === 'departmentsCreated,locationsCreated,seatDepartmentsChanged,seatLocationsChanged,seatMachinesChanged', `department, location and machine list changed, and the two new names are new masters (${t.changed(prep.plan)})`);
+      const want = ['departmentsCreated', 'locationsCreated', 'seatDepartmentsChanged', 'seatLocationsChanged', ...(swapMachine ? ['seatMachinesChanged'] : [])].join(',');
+      t.ok(t.changed(prep.plan) === want, `department and location${swapMachine ? ' and machine list' : ''} changed, and the two new names are new masters (${t.changed(prep.plan)})`);
       const res = await t.rehearse(edited, {}, async (c) => ({
         pos: (await t.q('SELECT d.name dn, l.name ln FROM hrms_positions p LEFT JOIN hrms_departments d ON d.id = p.department_id LEFT JOIN hrms_locations l ON l.id = p.location_id WHERE p.id = ?', [seat.positionId], c))[0],
         links: await t.q('SELECT work_context_id, is_primary FROM hrms_position_work_contexts WHERE position_id = ? AND deleted_at IS NULL', [seat.positionId], c),
       }));
       if (!t.ok(res.status === 'REHEARSED', `applied (${t.why(res)})`)) return;
       t.ok(res.observed.pos.dn === dept && res.observed.pos.ln === loc, `department "${res.observed.pos.dn}", location "${res.observed.pos.ln}"`);
-      t.ok(res.observed.links.length === 1 && res.observed.links[0].work_context_id === machineB.id && res.observed.links[0].is_primary === 1, `the machine is now "${machineB.name}" (primary), the old link removed`);
+      if (swapMachine) t.ok(res.observed.links.length === 1 && res.observed.links[0].work_context_id === machineB.id && res.observed.links[0].is_primary === 1, `the machine is now "${machineB.name}" (primary), the old link removed`);
+      else t.ok(res.observed.links.length === seat.contextLinks.length, 'no work-context link was written for a seat whose Machines cell was not touched');
+    },
+  },
+  {
+    name: 'MOVE a seat to another EXISTING department (how a seat changes machine now): only its department changes, nothing is created',
+    async run(t) {
+      const { buf, data } = await t.freshExport();
+      // A department name is what the cell holds, so the target must be a name exactly one department carries.
+      const depts = await t.q('SELECT id, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [t.companyId]);
+      const count = new Map();
+      for (const d of depts) count.set(d.name.trim().toLowerCase(), (count.get(d.name.trim().toLowerCase()) ?? 0) + 1);
+      const unique = depts.filter((d) => count.get(d.name.trim().toLowerCase()) === 1);
+      const seat = t.need(data.seats.find((s) => s.departmentId != null && unique.some((d) => d.id === s.departmentId)), 'no seat sits in a uniquely named department');
+      const target = t.need(unique.find((d) => d.id !== seat.departmentId), 'no second uniquely named department to move to');
+      const before = Number((await t.q('SELECT COUNT(*) n FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [t.companyId]))[0].n);
+      const wb = await t.open(buf);
+      t.setCell(wb, 'Structure', t.rowOfKey(wb, seat.key), t.COLS.department, target.name);
+      const edited = await t.save(wb);
+      const prep = await t.plan(edited);
+      t.ok(t.codes(prep).length === 0 && t.changed(prep.plan) === 'seatDepartmentsChanged' && prep.plan.counts.seatDepartmentsChanged === 1,
+        `exactly one change: one seat's department, and no department is created (${t.changed(prep.plan)})`);
+      const res = await t.rehearse(edited, {}, async (c) => ({
+        deptId: (await t.q('SELECT department_id d FROM hrms_positions WHERE id = ?', [seat.positionId], c))[0].d,
+        depts: Number((await t.q('SELECT COUNT(*) n FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [t.companyId], c))[0].n),
+        links: Number((await t.q('SELECT COUNT(*) n FROM hrms_position_work_contexts WHERE position_id = ? AND deleted_at IS NULL', [seat.positionId], c))[0].n),
+      }));
+      if (!t.ok(res.status === 'REHEARSED', `applied (${t.why(res)})`)) return;
+      t.ok(res.observed.deptId === target.id, `the seat now sits in "${target.name}" — the existing department, by id`);
+      t.ok(res.observed.depts === before, 'no department was created or removed');
+      t.ok(res.observed.links === seat.contextLinks.length, 'and no work-context link was written');
     },
   },
   {

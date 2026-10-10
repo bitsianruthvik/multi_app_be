@@ -24,8 +24,17 @@
  * model adds later does not leak here by default. Deliberately NOT sent:
  * employee ids and codes, assignment ids, allocation percentages, employment
  * status, attendance marks, content counts (KRAs/KPIs/…), open-point counts,
- * role/department/location ids (the department CODE, tree rank and is-root flag travel,
- * for the process grouping — spec §15), position status, effective dates, edge ids.
+ * role and location ids, position status, effective dates, edge ids.
+ *
+ * DEPARTMENTS DO TRAVEL, deliberately (2026-10-10). Machines and shared crews
+ * are departments now and the chart cannot be drawn without the tree, so each
+ * node carries its `departmentId` and the payload carries `departments` — but
+ * only the departments of the slice's own seats, their ancestors, and, for a
+ * shared department, the departments it serves (with THEIR ancestors, so every
+ * parentId in the payload resolves). A department the employee's branch never
+ * touches is not sent: its name, its place in the tree and the fact that it
+ * exists stay out. Fields per department are copied by name, like everything
+ * else here — id, code, name, parentId, type, isShared, serves, rank.
  * Contact details, identifiers and anything salary-adjacent are not in the
  * read model at all.
  */
@@ -41,17 +50,16 @@ const EMPLOYEE_ID_BY_USER = `
    LIMIT 1`;
 
 /** One slice node. Names and shifts of the people in the seat, the seat's own words, nothing else. */
-function sliceNode(n, myEmployeeId, relation) {
+function sliceNode(n, myEmployeeId, relation, sameAs = new Map()) {
   return {
     id: n.id,
     positionCode: n.positionCode ?? null,
     title: n.title,
     displayTitle: n.displayTitle,
     roleTitle: n.roleTitle ?? null,
+    // Org structure, not personal data. The id points into `departments`.
+    departmentId: n.departmentId ?? null,
     departmentName: n.departmentName ?? null,
-    // Org structure, not personal data: the chart groups a team by work process
-    // and needs the unit's code (= the code of the seat heading it) and its
-    // place in the unit tree (spec §15).
     departmentCode: n.departmentCode ?? null,
     departmentRank: n.departmentRank ?? null,
     departmentIsRoot: Boolean(n.departmentIsRoot),
@@ -66,16 +74,17 @@ function sliceNode(n, myEmployeeId, relation) {
       shiftName: r.shiftName ?? null,
       requiredCount: r.requiredCount,
     })),
-    // Where the work happens — a machine or area name, never a person.
-    contexts: (n.contexts ?? []).map((c) => ({
-      name: c.name,
-      contextType: c.contextType ?? null,
-      isPrimary: Boolean(c.isPrimary),
-    })),
+    // Retired: a machine is the seat's department now. Always empty; kept so a
+    // client written before the change still finds an array.
+    contexts: [],
     occupants: (n.occupants ?? []).map((o) => ({
       name: o.name,
       shiftCode: o.shiftCode ?? null,
       isMe: o.employeeId === myEmployeeId,
+      // One person in two seats of this slice: both rows carry the same key so
+      // the chart can join them. An ordinal within this response, never an id;
+      // null for everyone who appears once.
+      sameAs: sameAs.get(o.employeeId) ?? null,
     })),
     relation,
   };
@@ -94,6 +103,46 @@ function sliceEdge(e) {
     scopeWorkContextName: e.scopeWorkContextName ?? null,
     scopeSentence: e.scopeSentence ?? null,
   };
+}
+
+/**
+ * Pure: the departments an employee's slice may see. Exported for the test
+ * script. Start from the departments the slice's seats sit in; add each one's
+ * ancestors; for a shared department add what it serves, and those
+ * departments' ancestors. Nothing else — and every `parentId` and every id in
+ * `serves` that is returned is itself in the result.
+ */
+export function sliceDepartments(departments, seatDepartmentIds) {
+  const byId = new Map((departments ?? []).map((d) => [d.id, d]));
+  const keep = new Set();
+  const addWithAncestors = (id) => {
+    let cur = byId.get(id);
+    let guard = 0;
+    while (cur && !keep.has(cur.id) && guard < 100) {
+      guard += 1;
+      keep.add(cur.id);
+      cur = cur.parentId != null ? byId.get(cur.parentId) : null;
+    }
+  };
+  for (const id of seatDepartmentIds) if (id != null) addWithAncestors(id);
+  for (const id of [...keep]) {
+    const d = byId.get(id);
+    if (d?.isShared) for (const served of d.serves ?? []) addWithAncestors(served);
+  }
+  return (departments ?? [])
+    .filter((d) => keep.has(d.id))
+    .map((d) => ({
+      id: d.id,
+      code: d.code ?? null,
+      name: d.name,
+      parentId: d.parentId != null && keep.has(d.parentId) ? d.parentId : null,
+      type: d.type ?? null,
+      isShared: Boolean(d.isShared),
+      // Only a department that is itself in the slice BECAUSE it is shared lists
+      // what it serves; all of those were added above, so none dangles.
+      serves: d.isShared ? (d.serves ?? []).filter((id) => keep.has(id)) : [],
+      rank: d.rank ?? null,
+    }));
 }
 
 /**
@@ -141,7 +190,7 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   const asOf = dateText(on) || today();
 
   const empty = (reason) => ({
-    asOf, linked: false, reason, nodes: [], edges: [], mySeatIds: [],
+    asOf, linked: false, reason, nodes: [], edges: [], departments: [], mySeatIds: [],
     counts: { positions: 0, managers: 0, reports: 0, dotted: 0 },
   });
 
@@ -169,9 +218,13 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   };
   const keep = new Set([...self, ...managers, ...reports, ...dotted]);
 
-  const nodes = graph.nodes
-    .filter((n) => keep.has(n.id))
-    .map((n) => sliceNode(n, employee.id, relationOf(n.id)));
+  const kept = graph.nodes.filter((n) => keep.has(n.id));
+  const seatsOf = new Map();
+  for (const n of kept) for (const o of n.occupants ?? []) seatsOf.set(o.employeeId, (seatsOf.get(o.employeeId) ?? 0) + 1);
+  const sameAs = new Map();
+  for (const [employeeId, seats] of seatsOf) if (seats > 1) sameAs.set(employeeId, `s${sameAs.size + 1}`);
+
+  const nodes = kept.map((n) => sliceNode(n, employee.id, relationOf(n.id), sameAs));
   const edges = graph.edges
     .filter((e) => keep.has(e.fromPositionId) && keep.has(e.toPositionId))
     .map(sliceEdge);
@@ -182,6 +235,7 @@ export async function myOrgChart(db, ctx, { on } = {}) {
     reason: null,
     nodes,
     edges,
+    departments: sliceDepartments(graph.departments, nodes.map((n) => n.departmentId)),
     mySeatIds: mine,
     counts: {
       positions: nodes.length,
@@ -192,4 +246,4 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   };
 }
 
-export default { myOrgChart, computeSlice };
+export default { myOrgChart, computeSlice, sliceDepartments };

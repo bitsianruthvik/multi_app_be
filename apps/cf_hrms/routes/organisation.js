@@ -3,9 +3,9 @@
  *
  *   GET    /organisation/lookups                    locations + departments + shifts for pickers
  *
- *   GET    /organisation/departments                pre-ordered tree, depth + child counts
- *   POST   /organisation/departments                { name, code?, parentId?, status? }
- *   PUT    /organisation/departments/:id            same fields; parentId moves the branch
+ *   GET    /organisation/departments                pre-ordered tree, depth + child counts; + type, isShared, serves[], and `types` in use
+ *   POST   /organisation/departments                { name, code?, parentId?, type?, isShared?, serves?: [departmentId], status? }
+ *   PUT    /organisation/departments/:id            same fields; parentId moves the branch; serves replaces the list
  *   DELETE /organisation/departments/:id
  *
  *   GET    /organisation/locations                  + locationType, address

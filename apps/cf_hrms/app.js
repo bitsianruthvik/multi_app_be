@@ -16,7 +16,7 @@ const resourceDefs = JSON.parse(
  * Data model: HRMS_Core_V1_Taxonomy + HRMS_Core_V1_Architecture, with every
  * decision, every platform adaptation and every deviation from the spec
  * recorded in TM/CF_HRMS_PLAN.md. READ THAT FIRST. models/init.sql explains
- * each of the 46 tables and why it is shaped the way it is.
+ * each of the 47 tables and why it is shaped the way it is.
  *
  * The model in one sentence: the centre is not the employee row and not the
  * org-chart box, it is the WORK ASSIGNMENT — what one person is actually doing

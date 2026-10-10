@@ -1,5 +1,5 @@
 -- ============================================================================
--- cf_hrms — People + Organisation Definition. Full schema, 46 tables.
+-- cf_hrms — People + Organisation Definition. Full schema, 47 tables.
 -- ============================================================================
 -- Built from HRMS_Core_V1_Taxonomy + HRMS_Core_V1_Architecture (the complete
 -- logical model) and Org_Chart_V12.html (Karni Packaging, Unit 2 — the first
@@ -153,11 +153,27 @@ CREATE TABLE IF NOT EXISTS hrms_locations (
 
 
 -- ----- 1b. Departments ------------------------------------------------------
--- Functional units — Production, Quality, Accounts, HR — hierarchical, because
--- "Printing" sits under "Production" and a JD names the deeper one.
+-- THE ONE TREE (2026-10-10). Everything the organisation is made of is a
+-- department or a sub-department: Production, the Printing process under it,
+-- the Pelican machine under that, and the crew two areas share. A machine used
+-- to be a separate thing (hrms_work_contexts, §1c) and the two ideas overlapped
+-- until nobody could say which one a seat belonged to. Now a position has
+-- exactly one department_id and that is the whole answer.
 --
--- SERVICE RULE (no CHECK in TiDB): a department may not be its own ancestor.
--- organisationService.js walks parent_department_id on save and rejects a cycle.
+-- `department_type` is a LABEL the company chooses — "Department", "Process",
+-- "Machine / area", "Shared crew". It is free text on purpose and NO LOGIC MAY
+-- BRANCH ON IT: another client will call the same level a "Line" or a "Cell".
+-- What the code may branch on is the tree (parent_department_id) and is_shared.
+--
+-- `is_shared` marks a department that exists to serve OTHER departments — one
+-- crew working two areas. Which ones is hrms_department_serves (§1b-2). It is
+-- drawn as one box pointing at each of them, never cloned per machine.
+--
+-- SERVICE RULES (no CHECK in TiDB), all in organisationService.js:
+--   * a department may not be its own ancestor (the walk up parent_department_id);
+--   * is_shared is 0 or 1;
+--   * only a shared department may have serves rows, and clearing is_shared
+--     retires them.
 
 CREATE TABLE IF NOT EXISTS hrms_departments (
   id                   INT          AUTO_INCREMENT PRIMARY KEY,
@@ -165,6 +181,8 @@ CREATE TABLE IF NOT EXISTS hrms_departments (
   code                 VARCHAR(50)  NULL,
   name                 VARCHAR(200) NOT NULL,
   parent_department_id INT          NULL,
+  department_type      VARCHAR(40)  NULL,                    -- a label only; also a guarded ALTER in §10c
+  is_shared            TINYINT(1)   NOT NULL DEFAULT 0,      -- serves other departments; also a guarded ALTER in §10c
   status               ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
 
   deleted_at           DATETIME     DEFAULT NULL,
@@ -185,7 +203,59 @@ CREATE TABLE IF NOT EXISTS hrms_departments (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
+-- ----- 1b-2. Which departments a shared department serves --------------------
+-- One row per (shared department, department it serves). "Shared · Packing
+-- Machine 1 & 2 + Loading" has two rows. The shared department still has ONE
+-- parent in the tree (the nearest unit that encloses everything it serves);
+-- these rows are the extra lines the chart draws from its box.
+--
+-- Soft-delete-aware uniqueness the way the rest of the file does it: the
+-- generated column is NULL once the row is retired, so a pair can be removed
+-- and added again without tripping the key.
+--
+-- SERVICE RULES (no CHECK in TiDB), organisationService.js:
+--   * department_id must be a live department with is_shared = 1;
+--   * a department does not serve itself;
+--   * serves_department_id must be a live department of the same company (the
+--     composite FK holds the company half).
+
+CREATE TABLE IF NOT EXISTS hrms_department_serves (
+  id                   INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id           INT        NOT NULL,
+  department_id        INT        NOT NULL,
+  serves_department_id INT        NOT NULL,
+  notes                TEXT       NULL,
+
+  deleted_at           DATETIME   DEFAULT NULL,
+  created_at           TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at           TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by           INT        NULL,
+
+  serves_active        INT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, serves_department_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hdsv_tenant (company_id, id),
+  UNIQUE KEY uq_hdsv_pair   (company_id, department_id, serves_active),
+  KEY idx_hdsv_department (company_id, department_id),
+  KEY idx_hdsv_serves     (company_id, serves_department_id),
+
+  CONSTRAINT fk_hdsv_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hdsv_department FOREIGN KEY (company_id, department_id)        REFERENCES hrms_departments(company_id, id),
+  CONSTRAINT fk_hdsv_serves     FOREIGN KEY (company_id, serves_department_id) REFERENCES hrms_departments(company_id, id),
+  CONSTRAINT fk_hdsv_creator    FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
 -- ----- 1c. Work contexts — THE REASON MACHINES ARE NOT MANAGERS -------------
+-- RETIRED FROM THE MODEL'S SURFACE, 2026-10-10 — NOT DROPPED. A machine, an
+-- area and a shared crew are DEPARTMENTS now (§1b), and a seat's one
+-- department_id says where it works. The org-chart import no longer writes
+-- this table or hrms_position_work_contexts, and the chart and department
+-- read models no longer read them. The tables, their link tables and the
+-- scope_work_context_id / work_context_id columns elsewhere all stay: this
+-- file never drops, the admin screens still work on them, and a reporting
+-- scope may still name one. What follows is the original reasoning, and the
+-- rule it protects — a machine is never a manager — is unchanged.
+--
 -- (Non-negotiable 3.) The source org chart draws the Pelican machine as a box
 -- with people under it, and every naive import turns that box into a manager.
 -- It is not one. A machine, line, area, project or cell is an operational
@@ -2406,7 +2476,7 @@ CREATE TABLE IF NOT EXISTS hrms_import_runs (
 
 
 -- ============================================================================
--- End of cf_hrms schema. 46 tables.
+-- End of cf_hrms schema. 47 tables.
 --
 -- Deliberately NOT created here:
 --   * The five derived views the spec §7 lists (v_active_work_assignments,
@@ -2476,5 +2546,38 @@ SET @needs_salutation = (
      AND COLUMN_NAME  = 'salutation');
 SET @sql = IF(@needs_salutation = 1,
   'ALTER TABLE hrms_employees ADD COLUMN salutation VARCHAR(10) NULL AFTER full_name',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ----- 10c. hrms_departments.department_type / is_shared ---------------------
+-- Added 2026-10-10 when machines and shared crews became departments (§1b).
+-- Declared in the CREATE in §1b AND here, for the same reason as §10b: the
+-- CREATE reaches a new database, this reaches the ones that already exist.
+--
+-- One column per ALTER. TiDB has refused a multi-clause ALTER that MySQL takes
+-- (ADD COLUMN + ADD KEY on the new column, cf_erp 2026-10-09), so nothing here
+-- relies on two changes landing in one statement.
+--
+-- hrms_department_serves needs no retrofit: it is a new table, and
+-- CREATE TABLE IF NOT EXISTS in §1b-2 reaches old and new databases alike.
+
+SET @needs_department_type = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_departments'
+     AND COLUMN_NAME  = 'department_type');
+SET @sql = IF(@needs_department_type = 1,
+  'ALTER TABLE hrms_departments ADD COLUMN department_type VARCHAR(40) NULL AFTER parent_department_id',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @needs_is_shared = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_departments'
+     AND COLUMN_NAME  = 'is_shared');
+SET @sql = IF(@needs_is_shared = 1,
+  'ALTER TABLE hrms_departments ADD COLUMN is_shared TINYINT(1) NOT NULL DEFAULT 0 AFTER department_type',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

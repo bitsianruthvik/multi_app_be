@@ -5,10 +5,23 @@
  * ── WHAT THE CHART IS ─────────────────────────────────────────────────────
  * Nodes are POSITIONS. Edges are `hrms_position_reporting_relationships` live
  * on the view date — ALL of them, typed and scoped. Occupants are the work
- * assignments filling each seat. Work contexts are CHIPS on a node and never
- * nodes of their own: a machine is not a manager (plan §2 rule 3), and the
- * import already re-pointed every machine-parented position at its nearest
- * human ancestor (spec §6), so nothing is skipped at render time.
+ * assignments filling each seat.
+ *
+ * ── EVERYTHING ELSE IS A DEPARTMENT (2026-10-10) ──────────────────────────
+ * A machine, an area and a shared crew are departments in the ONE tree
+ * (`hrms_departments`), and a seat has exactly one: `node.departmentId`. The
+ * whole tree travels as `departments` — id, code, name, parentId, type (a
+ * label, never logic), isShared, serves[], rank — so the client can draw
+ * "department → process → machine" and one shared box pointing at each
+ * department it serves. A machine is still never a manager (plan §2 rule 3):
+ * the import re-pointed every machine-parented position at its nearest human
+ * ancestor, so nothing is skipped at render time.
+ *
+ * Work contexts are RETIRED from this read model. `node.contexts` is always
+ * an empty array, kept only so a client written before the change does not
+ * crash; this file no longer reads hrms_position_work_contexts at all. (The
+ * one remaining mention is a reporting edge's optional scope, which is the
+ * reporting model's business, not the chart's.)
  *
  * ── THE SERVER NEVER PICKS "THE" MANAGER ──────────────────────────────────
  * Every live edge travels in the payload with its type and its scope. The
@@ -34,8 +47,10 @@
  * ── ONE PAYLOAD, A HANDFUL OF QUERIES ─────────────────────────────────────
  * Karni is 114 positions, max depth 8. The whole graph travels in one response
  * with no pagination, and it is assembled from a fixed number of company-wide
- * queries (positions, edges, occupants, contexts, requirements, content counts,
- * open points, attendance) joined in memory. Nothing in here runs per node.
+ * queries (positions, edges, occupants, department serves, requirements,
+ * content counts, open points, departments, attendance) joined in memory.
+ * Nothing in here runs per node — and the count did not grow when departments
+ * joined the payload: the serves read took the slot the contexts read left.
  */
 import { notFound, invalid } from '../lib/errors.js';
 import { dateText, today, LIVE_ON, requirePosition, listPositionOverrides } from './positionService.js';
@@ -79,15 +94,52 @@ const POSITIONS_SQL = `
    ORDER BY p.position_code, p.id`;
 
 /**
- * The unit tree, read only to RANK units for the chart's process boxes (spec
- * §15): a pre-order walk, siblings by code then id, so "Purchase · PPC ·
- * Production · Quality …" comes out in the client's own order. Inactive units
- * still rank — a position can sit in one.
+ * The department tree — the whole of it, because it IS the organisation's
+ * structure and the chart draws it. `rank` is a pre-order walk, siblings by
+ * code then id, so "Purchase · PPC · Production · Quality …" comes out in the
+ * client's own order. Inactive departments still travel and still rank — a
+ * position can sit in one.
  */
 const DEPARTMENTS_SQL = `
-  SELECT id, code, parent_department_id
+  SELECT id, code, name, parent_department_id, department_type, is_shared
     FROM hrms_departments
    WHERE company_id = ? AND deleted_at IS NULL`;
+
+/** Which departments each shared department serves. One row per line the chart draws from a shared box. */
+const SERVES_SQL = `
+  SELECT s.department_id, s.serves_department_id
+    FROM hrms_department_serves s
+   WHERE s.company_id = ? AND s.deleted_at IS NULL
+   ORDER BY s.department_id, s.serves_department_id`;
+
+/**
+ * The contract the chart is built against (CF_HRMS_PLAN.md §9.4). `type` is the
+ * company's own label and nothing may branch on its text; `isShared` and
+ * `serves` are the facts. A serves row pointing at a department that is gone is
+ * dropped rather than sent as a dangling id.
+ */
+export function shapeDepartments(departmentRows, serveRows, rank) {
+  const live = new Set(departmentRows.map((r) => r.id));
+  const servesBy = new Map();
+  for (const r of serveRows) {
+    if (!live.has(r.department_id) || !live.has(r.serves_department_id)) continue;
+    const list = servesBy.get(r.department_id) ?? [];
+    list.push(r.serves_department_id);
+    servesBy.set(r.department_id, list);
+  }
+  return departmentRows
+    .map((r) => ({
+      id: r.id,
+      code: r.code ?? null,
+      name: r.name,
+      parentId: r.parent_department_id != null && live.has(r.parent_department_id) ? r.parent_department_id : null,
+      type: r.department_type ?? null,
+      isShared: Boolean(r.is_shared),
+      serves: servesBy.get(r.id) ?? [],
+      rank: rank.get(r.id) ?? null,
+    }))
+    .sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9));
+}
 
 function departmentRanks(rows) {
   const kids = new Map();
@@ -141,15 +193,6 @@ const OCCUPANTS_SQL = `
    WHERE wa.company_id = ? AND wa.deleted_at IS NULL AND wa.status = 'ACTIVE'
      AND wa.position_id IS NOT NULL AND ${LIVE_ON('wa')}
    ORDER BY wa.is_primary DESC, e.full_name`;
-
-/** The chips. One Helper covering four machines is ONE position with four rows here. */
-const CONTEXTS_SQL = `
-  SELECT c.position_id, c.is_primary, c.effective_from, c.effective_to,
-         wc.id AS context_id, wc.code AS context_code, wc.name AS context_name, wc.context_type
-    FROM hrms_position_work_contexts c
-    JOIN hrms_work_contexts wc ON wc.company_id = c.company_id AND wc.id = c.work_context_id
-   WHERE c.company_id = ? AND c.deleted_at IS NULL AND ${LIVE_ON('c')}
-   ORDER BY c.is_primary DESC, wc.name`;
 
 /** Day/night working, as the import recorded it (plan §9.1). The source of `shiftPattern` and of a DN position's strength. */
 const REQUIREMENTS_SQL = `
@@ -221,9 +264,10 @@ const ATTENDANCE_SQL = `
  * Spec §2 says: append the PARENT'S TITLE in brackets. That is the rule, and it
  * is the first thing tried — but on the real data it is not always enough: two
  * "Helper 1" positions both report to Printing Incharge and differ only by the
- * machine they cover. So when the parent does not separate them, the primary
- * work context is appended after it, and a position code is the last resort.
- * A title used once is never decorated.
+ * machine they cover. So when the parent does not separate them, the seat's
+ * DEPARTMENT is tried — a machine is a department now, so this is the same
+ * "Helper 1 (… · Pelican Machine)" it always was — and a position code is the
+ * last resort. A title used once is never decorated.
  */
 function buildDisplayTitles(positions, primaryParentTitleById, primaryContextNameById) {
   const byTitle = new Map();
@@ -243,10 +287,15 @@ function buildDisplayTitles(positions, primaryParentTitleById, primaryContextNam
     const candidates = [
       (p) => primaryParentTitleById.get(p.id) ?? null,
       (p) => primaryContextNameById.get(p.id) ?? null,
+      // Parent, plus the department only for the seats whose parent is shared
+      // with another seat of this title — "Helper 1 (Incharge - Production ·
+      // Pelican Machine)" beside "Helper 1 (Store Supervisor - Films)". Adding the
+      // department to every one of them would only make the unambiguous longer.
       (p) => {
         const parent = primaryParentTitleById.get(p.id);
         const context = primaryContextNameById.get(p.id);
-        return parent && context ? `${parent} · ${context}` : parent ?? context ?? null;
+        const parentShared = parent && group.filter((o) => primaryParentTitleById.get(o.id) === parent).length > 1;
+        return parent && context && parentShared ? `${parent} · ${context}` : parent ?? context ?? null;
       },
       (p) => p.positionCode ?? `#${p.id}`,
     ];
@@ -312,13 +361,13 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   const startedAt = Date.now();
 
   const [
-    [positionRows], [edgeRows], [occupantRows], [contextRows],
+    [positionRows], [edgeRows], [occupantRows], [serveRows],
     [requirementRows], [contentRows], [overrideRows], [openPointRows], [departmentRows],
   ] = await Promise.all([
     db.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     db.query(EDGES_SQL, [companyId, asOf, asOf]),
     db.query(OCCUPANTS_SQL, [companyId, asOf, asOf]),
-    db.query(CONTEXTS_SQL, [companyId, asOf, asOf]),
+    db.query(SERVES_SQL, [companyId]),
     db.query(REQUIREMENTS_SQL, [companyId, asOf, asOf]),
     db.query(CONTENT_COUNTS_SQL, [companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf]),
     db.query(OVERRIDE_COUNTS_SQL, [companyId, asOf, asOf]),
@@ -326,6 +375,7 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     db.query(DEPARTMENTS_SQL, [companyId]),
   ]);
   const departmentRank = departmentRanks(departmentRows);
+  const departments = shapeDepartments(departmentRows, serveRows, departmentRank);
 
   const employeeIds = [...new Set(occupantRows.map((o) => o.employee_id))];
   const attendanceRows = employeeIds.length
@@ -345,7 +395,6 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   };
 
   const occupantsByPosition = group(occupantRows, 'position_id');
-  const contextsByPosition = group(contextRows, 'position_id');
   const requirementsByPosition = group(requirementRows, 'position_id');
 
   const contentByRole = new Map();
@@ -390,11 +439,11 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     const t = baseTitleOf.get(parent);
     if (t) primaryParentTitle.set(child, t);
   }
+  // The second qualifier for a repeated title: the seat's department. It used
+  // to be the primary work context, and for a seat on a machine it is the same
+  // words — the machine is the department.
   const primaryContextName = new Map();
-  for (const [positionId, rows] of contextsByPosition) {
-    const primary = rows.find((r) => r.is_primary) ?? rows[0];
-    if (primary) primaryContextName.set(positionId, primary.context_name);
-  }
+  for (const p of positionRows) if (p.department_name) primaryContextName.set(p.id, p.department_name);
 
   /* ── assemble the nodes ────────────────────────────────────────────────── */
   const allNodes = positionRows.map((p) => {
@@ -441,14 +490,6 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       openPoints,
     };
 
-    const contexts = (contextsByPosition.get(p.id) ?? []).map((c) => ({
-      id: c.context_id,
-      code: c.context_code ?? null,
-      name: c.context_name,
-      contextType: c.context_type,
-      isPrimary: Boolean(c.is_primary),
-    }));
-
     return {
       id: p.id,
       positionCode: p.position_code ?? null,
@@ -459,8 +500,9 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       roleTitle: p.role_title ?? null,
       departmentId: p.department_id ?? null,
       departmentName: p.department_name ?? null,
-      // Spec §15: the unit's code is the code of the seat that heads it, and the
-      // rank orders the chart's process boxes in the unit tree's order.
+      // The seat's ONE department — a unit, a machine or a shared crew; look it
+      // up in `departments` for its parent, label and what it serves. The four
+      // flat fields below are kept for clients that still read them.
       departmentCode: p.department_code ?? null,
       departmentRank: p.department_id != null ? (departmentRank.get(p.department_id) ?? null) : null,
       // A ROOT unit (no parent) is leadership: the chart keeps its teams a plain tree.
@@ -476,7 +518,9 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       defaultShift: p.default_shift_id
         ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null }
         : null,
-      contexts,
+      // Retired: machines are departments. Always empty, kept so a client
+      // written before the change still finds an array.
+      contexts: [],
       occupants,
       requirements,
       vacancies: Math.max(0, effectiveSanctioned - occupants.length),
@@ -565,6 +609,9 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     root: rootInfo,
     nodes,
     edges,
+    // The WHOLE tree, also when the chart is re-rooted: a subtree's seats still
+    // need their departments' ancestors to be drawn in place.
+    departments,
     counts: {
       positions: nodes.length,
       sanctioned,
@@ -597,13 +644,14 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
   const position = await requirePosition(db, companyId, positionId);
 
   const [
-    [[head]], [contextRows], [occupantRows], [requirementRows], [openPointRows], [parentRows], [reportRows],
+    [[head]], [occupantRows], [requirementRows], [openPointRows], [parentRows], [reportRows],
   ] = await Promise.all([
     db.query(
       `SELECT p.id, p.position_code, p.position_title, p.role_id, p.sanctioned_headcount, p.status,
               p.effective_from, p.effective_to,
               r.title AS role_title, r.role_code, r.role_purpose, r.role_summary, r.status AS role_status,
-              d.id AS department_id, d.name AS department_name,
+              d.id AS department_id, d.name AS department_name, d.code AS department_code,
+              d.department_type, d.is_shared AS department_is_shared,
               l.id AS location_id, l.name AS location_name,
               s.id AS shift_id, s.code AS shift_code, s.name AS shift_name
          FROM hrms_positions p
@@ -614,7 +662,6 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
         WHERE p.company_id = ? AND p.id = ?`,
       [companyId, positionId],
     ),
-    db.query(`${CONTEXTS_SQL.replace('WHERE c.company_id = ?', 'WHERE c.company_id = ? AND c.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
     db.query(`${OCCUPANTS_SQL.replace('WHERE wa.company_id = ?', 'WHERE wa.company_id = ? AND wa.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
     db.query(`${REQUIREMENTS_SQL.replace('WHERE m.company_id = ?', 'WHERE m.company_id = ? AND m.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
     db.query(
@@ -784,6 +831,9 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     roleSummary: head.role_summary ?? null,
     departmentId: head.department_id ?? null,
     departmentName: head.department_name ?? null,
+    departmentCode: head.department_code ?? null,
+    departmentType: head.department_type ?? null,
+    departmentIsShared: Boolean(head.department_is_shared),
     locationId: head.location_id ?? null,
     locationName: head.location_name ?? null,
     sanctionedHeadcount,
@@ -822,13 +872,8 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
         status: head.role_status ?? null,
       }
       : null,
-    contexts: contextRows.map((c) => ({
-      id: c.context_id,
-      code: c.context_code ?? null,
-      name: c.context_name,
-      contextType: c.context_type,
-      isPrimary: Boolean(c.is_primary),
-    })),
+    // Retired with the chart's: the seat's department says where it works.
+    contexts: [],
     occupants,
     requirements,
     // THE RESOLVED SET, never one manager. Each row carries its type, its scope
@@ -856,7 +901,7 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
       kpis: content.kpis.length,
       qualifications: content.qualifications.length,
       occupants: occupants.length,
-      contexts: contextRows.length,
+      contexts: 0,
       directReports: reportRows.length,
       openPoints: openPointRows.filter((o) => o.status === 'OPEN').length,
     },

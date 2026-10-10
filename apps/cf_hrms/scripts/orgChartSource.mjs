@@ -53,3 +53,40 @@ export function readSeed(file) {
     size: Buffer.byteLength(html),
   };
 }
+
+/**
+ * THE ADJUSTMENTS FILE — decisions a person made that the chart cannot express
+ * ("IBC 1/2/3 is three machines", "this seat is not shared after all").
+ *
+ * Optional. Found next to the source by name — `Org_Chart_V28.html` ->
+ * `Org_Chart_V28.adjustments.json` — or named with `--adjustments=<path>`;
+ * `--no-adjustments` reads the chart alone. Like the source, the importer and
+ * the verifier must read the SAME bytes, so the path rule and the read live
+ * here. What the entries MEAN does not: each script interprets them itself.
+ */
+export function resolveAdjustments(sourceFile, argv = process.argv) {
+  if (argv.includes('--no-adjustments')) return null;
+  const explicit = (argv.find((a) => a.startsWith('--adjustments=')) || '').split('=').slice(1).join('=');
+  if (explicit) {
+    if (!fs.existsSync(explicit)) throw new Error(`--adjustments=${explicit}: no such file.`);
+    return explicit;
+  }
+  const beside = sourceFile.replace(/\.[^.\\/]+$/, '') + '.adjustments.json';
+  return fs.existsSync(beside) ? beside : null;
+}
+
+/** The parsed file, its hash and its name — or null when there is none. */
+export function readAdjustments(file) {
+  if (!file) return null;
+  const text = fs.readFileSync(file, 'utf8');
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error(`${file} is not valid JSON: ${e.message}`); }
+  if (!json || !Array.isArray(json.adjustments)) throw new Error(`${file} has no "adjustments" array.`);
+  return {
+    file,
+    fileName: path.basename(file),
+    forSource: json.forSource ?? null,
+    entries: json.adjustments,
+    hash: crypto.createHash('sha256').update(text).digest('hex'),
+  };
+}

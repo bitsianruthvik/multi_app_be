@@ -13,8 +13,10 @@
  * rules that matter, all measured against the real file:
  *
  *   1. A machine is never a manager. 47 nodes hang directly under one. Their
- *      formal manager is the nearest non-machine ancestor; the machines they
- *      passed become work contexts on the position.
+ *      formal manager is the nearest non-machine ancestor. The machine itself
+ *      is a DEPARTMENT (2026-10-10): everything the chart draws that is not a
+ *      seat is a department or a sub-department, and a seat has exactly one.
+ *      hrms_work_contexts is no longer written.
  *   2. Only 71 of the 83 `people` rows are people. The other 12 have a blank
  *      name — they are seat markers the client used to record a shift and an
  *      attendance state for an unfilled seat. Importing them would create 12
@@ -29,7 +31,9 @@
  *      takes over, which is how every position gets a department.
  *
  * WHAT V28 ADDED over V12, and what was done with it:
- *   dept / dtype  -> hrms_departments (32 units) + positions.department_id
+ *   dept / dtype  -> hrms_departments + positions.department_id. Machines and
+ *                    shared crews are departments too; a shared one says which
+ *                    departments it serves in hrms_department_serves.
  *   kpis[]        -> hrms_kpi_definitions + hrms_role_kpi_assignments (the path
  *                    existed and had never been exercised; V12 held zero KPIs)
  *   ttl           -> NOT written. See the finding: there is no salutation column,
@@ -39,15 +43,27 @@
  *   meta.letter   -> recorded on the import run only; no table owns a letter's
  *                    effective date or signatory yet.
  *
+ * ADJUSTMENTS. Some things about an organisation are true and not in the chart:
+ * one box drawn for three machines, a crew two machines share, a seat marked
+ * shared that is not. Those are a person's decisions, and they live in an
+ * optional file beside the chart (`<chart>.adjustments.json`, see
+ * orgChartSource.mjs) — never in this script, which must stay a general tool.
+ * Three kinds: `split` a machine node into several named departments;
+ * `shared` — these seats are a crew serving these departments; `notShared` —
+ * this seat sits in its own department whatever the chart marks. Every entry
+ * carries a reason, who decided and when. An entry naming a node the chart no
+ * longer has STOPS the import: a new revision must not silently drop a decision.
+ *
  * Usage:
  *   node import-org-chart.mjs --company=karni [--dry-run] [--wipe] [--source=<path>]
+ *                             [--adjustments=<path> | --no-adjustments]
  *
  * --dry-run prints the validation report and writes nothing.
  * --wipe clears this company's hrms_ rows first (local development only).
  */
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
-import { resolveSource, readSeed, PREVIOUS_FILE_NAME } from './orgChartSource.mjs';
+import { resolveSource, readSeed, PREVIOUS_FILE_NAME, resolveAdjustments, readAdjustments } from './orgChartSource.mjs';
 
 const TARGET = resolveTarget();
 
@@ -70,7 +86,7 @@ let RUN_CONTEXT = null;
 // =========================================================== PLAN =========
 // Everything the file means, decided before a single row is written.
 
-function plan(seed, prev) {
+function plan(seed, prev, adj = null) {
   const findings = [];
   const note = (kind, detail) => findings.push({ kind, detail });
   const counts = {};
@@ -81,6 +97,58 @@ function plan(seed, prev) {
   const machines = nodes.filter((p) => p.kind === 'machine');
   const real = nodes.filter((p) => p.kind !== 'machine');   // role + shared = a position
 
+  // ---- 0. Adjustments: read, checked against THIS chart, before anything else
+  // Every problem is collected and reported at once, and any problem is fatal.
+  const adjEntries = adj?.entries ?? [];
+  const adjProblems = [];
+  const who = (a, i) => `adjustment ${i + 1} (${a?.kind ?? 'no kind'})`;
+  const splitOf = new Map();                  // machine node id -> { names, entry }
+  const adjShared = [];                       // { seats, serves, name, entry }
+  const adjNotShared = new Map();             // seat id -> entry
+  if (adj?.forSource && adj.forSource !== adj.sourceFileName) {
+    adjProblems.push(`${adj.fileName} says it is for "${adj.forSource}" but the chart being imported is "${adj.sourceFileName}". Decisions made about one revision are not carried to another by accident: review them and update "forSource".`);
+  }
+  adjEntries.forEach((a, i) => {
+    for (const k of ['reason', 'decidedBy', 'decidedOn']) if (!norm(a?.[k])) adjProblems.push(`${who(a, i)} has no "${k}". Every decision says why, who and when.`);
+    if (a?.kind === 'split') {
+      const n = byId.get(a.node);
+      const names = Array.isArray(a.into) ? a.into.map(norm) : [];
+      if (!n) adjProblems.push(`${who(a, i)} splits node "${a.node}", which this chart does not have.`);
+      else if (n.kind !== 'machine') adjProblems.push(`${who(a, i)} splits ${a.node} "${norm(n.title)}", which is a seat, not a machine or area.`);
+      if (names.length < 2 || names.some((x) => !x)) adjProblems.push(`${who(a, i)}: "into" must name two or more departments.`);
+      if (new Set(names.map(normKey)).size !== names.length) adjProblems.push(`${who(a, i)}: "into" names the same department twice.`);
+      if (splitOf.has(a.node)) adjProblems.push(`${who(a, i)}: ${a.node} is split twice.`);
+      splitOf.set(a.node, { names, entry: a });
+    } else if (a?.kind === 'shared') {
+      const seats = Array.isArray(a.seats) ? a.seats : [];
+      const serves = Array.isArray(a.serves) ? a.serves : [];
+      if (!seats.length) adjProblems.push(`${who(a, i)} names no seats.`);
+      for (const id of seats) {
+        const n = byId.get(id);
+        if (!n) adjProblems.push(`${who(a, i)} names seat "${id}", which this chart does not have.`);
+        else if (n.kind === 'machine') adjProblems.push(`${who(a, i)} names ${id} "${norm(n.title)}" as a seat; it is a machine.`);
+        if (adjShared.some((o) => o.seats.includes(id))) adjProblems.push(`${who(a, i)}: seat ${id} is already placed by an earlier shared adjustment.`);
+      }
+      if (new Set(serves).size < 2) adjProblems.push(`${who(a, i)}: a shared department serves two or more departments.`);
+      adjShared.push({ seats, serves: [...new Set(serves)], name: norm(a.name) || null, entry: a });
+    } else if (a?.kind === 'notShared') {
+      const n = byId.get(a.seat);
+      if (!n) adjProblems.push(`${who(a, i)} names seat "${a.seat}", which this chart does not have.`);
+      else if (n.kind !== 'shared') adjProblems.push(`${who(a, i)}: ${a.seat} "${norm(n.title)}" is not marked shared in this chart, so there is nothing to undo.`);
+      if (adjShared.some((o) => o.seats.includes(a.seat))) adjProblems.push(`${who(a, i)}: seat ${a.seat} is also placed by a shared adjustment.`);
+      adjNotShared.set(a.seat, a);
+    } else {
+      adjProblems.push(`${who(a, i)}: unknown kind. Known kinds are split, shared, notShared.`);
+    }
+  });
+  const failAdjustments = () => {
+    if (!adjProblems.length) return;
+    throw new Error(`The adjustments file does not fit this chart — nothing was imported.\n  - ${adjProblems.join('\n  - ')}\n`
+      + `Fix ${adj.file}, or run with --no-adjustments to import the chart alone.`);
+  };
+  failAdjustments();
+  counts.adjustments = adjEntries.length;
+
   counts.sourceNodes = nodes.length;
   counts.sourceRoleNodes = nodes.filter((p) => p.kind === 'role').length;
   counts.sourceSharedNodes = nodes.filter((p) => p.kind === 'shared').length;
@@ -88,7 +156,10 @@ function plan(seed, prev) {
 
   /**
    * The two ancestor walks, reproduced from the source tool (`managerOf` /
-   * `machinesOf`) including their cycle guards.
+   * `machinesOf`) including their cycle guards. `contextsOf` no longer feeds
+   * anything that is written — machines are departments now (section 1) — and
+   * survives only to word a split role's qualifier in section 3 the way it has
+   * always been worded, so role titles do not move when the model does.
    *
    * One deliberate difference. The tool collects machines only while the ancestor
    * is itself a machine, which loses the context of a node sitting under a SHARED
@@ -114,108 +185,353 @@ function plan(seed, prev) {
     return out;
   };
 
-  // ---- 1. Departments and sections -------------------------------------
-  // A `dtype` node heads a unit AND holds a job. The unit's extent is "this
-  // node and everything below it, until a deeper unit takes over", so the walk
-  // that answers "which unit is this position in" starts AT the node and goes
-  // up through machines and shared nodes alike — containment in the chart is
-  // the tree, not the reporting line.
+  // ---- 1. Departments: ONE tree — units, machines and shared crews ---------
+  // Everything the chart draws that is not a person's seat is a department or a
+  // sub-department (the user's decision, 2026-10-10). Two things in the file
+  // say "here is a unit": a seat carrying `dtype` (it heads a department or a
+  // section AND holds a job), and a `kind:'machine'` node (a machine, an area
+  // or a process — never a seat). Both become rows of hrms_departments, and a
+  // position then takes the NEAREST one that encloses it, walking up the chart
+  // from the seat itself.
+  //
+  // ONE DEPARTMENT PER REAL THING. The chart says the same thing twice in four
+  // shapes, and each is collapsed by a rule read off the data, never a list:
+  //
+  //   (a) A machine node whose ONLY child is a unit seat that itself contains
+  //       machines is a heading over that unit, not a second unit ("Printing
+  //       Process" over the Printing section and its three machines). The
+  //       heading is merged into the section and gets no row.
+  //   (b) A unit whose nearest enclosing UNIT has the same name repeats it
+  //       (the "Slitting" flag on each slitting operator, inside Slitting). No
+  //       row; its seats fall to the machine they stand under.
+  //   (c) A unit sitting directly under a machine of the same name IS that
+  //       machine ("Inspection" under the Inspection machine). One row, the
+  //       machine's.
+  //   (d) Units of one name hanging from the same place are one unit with
+  //       several senior people in it ("Sales & Marketing" x4). One row, coded
+  //       by the first of them in the chart.
+  //
+  // Names are compared normalised (case, spacing, trailing punctuation) and
+  // nothing else: "Ink" under "Ink Mixing" is NOT collapsed, because deciding
+  // those are one thing would be reading meaning into two different names.
   const isUnit = (n) => !!norm(n.dtype);
+  const isMachine = (n) => n.kind === 'machine';
   const unitName = (n) => norm(n.dept) || norm(n.title);
+  const sameName = (a, b) => normKey(a) === normKey(b);
   const unitOf = (n) => { let c = n, g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
   const unitAbove = (n) => { let c = byId.get(n.reportsTo), g = 0; while (c && g++ < 60) { if (isUnit(c)) return c; c = byId.get(c.reportsTo); } return null; };
+  const order = new Map(nodes.map((n, i) => [n.id, i]));
+  const kidsOf = new Map();
+  for (const n of nodes) {
+    if (!byId.has(n.reportsTo)) continue;
+    if (!kidsOf.has(n.reportsTo)) kidsOf.set(n.reportsTo, []);
+    kidsOf.get(n.reportsTo).push(n);
+  }
+  const kids = (n) => kidsOf.get(n.id) || [];
+  const hasMachineBelow = (n, g = 0) => g < 60 && kids(n).some((k) => isMachine(k) || hasMachineBelow(k, g + 1));
 
+  // The raw `dtype` units, exactly as the chart flags them. Kept for two things
+  // only: the role qualifiers in section 3 (so split role titles do not move
+  // when the department model does) and the report of what was collapsed.
   const unitNodes = nodes.filter(isUnit);
-  const depthOf = (n) => { let d = 0, c = unitAbove(n); while (c) { d++; c = unitAbove(c); } return d; };
-  const units = unitNodes
-    .map((n) => ({ node: n, code: n.id, name: unitName(n), dtype: norm(n.dtype), parentNodeId: unitAbove(n)?.id ?? null, depth: depthOf(n) }))
-    .sort((a, b) => a.depth - b.depth || a.code.localeCompare(b.code));   // parents before children
-
   const unitByNode = new Map(real.map((p) => [p.id, unitOf(p)?.id ?? null]));
-  const orphans = real.filter((p) => !unitByNode.get(p.id));
-  counts.departments = units.filter((u) => u.dtype === 'dept').length;
-  counts.sections = units.filter((u) => u.dtype === 'section').length;
-  counts.departmentUnits = units.length;
-  counts.positionsWithDepartment = real.length - orphans.length;
 
-  const perUnit = new Map();
-  for (const p of real) {
-    const k = unitByNode.get(p.id);
-    if (k) perUnit.set(k, (perUnit.get(k) || 0) + 1);
+  // (a)
+  const headingOver = new Map();              // machine id -> the unit seat it is a heading for
+  for (const m of machines) {
+    const ks = kids(m);
+    if (ks.length === 1 && isUnit(ks[0]) && hasMachineBelow(ks[0])) headingOver.set(m.id, ks[0]);
   }
-  const unitLine = (u) => `${u.name}${u.dtype === 'section' ? ' [section]' : ''} (${u.code}, ${perUnit.get(u.code) || 0} positions)`;
-  note('Departments are imported now, and every position has one',
-    `V12 carried no department data at all, and that import's own report said so. V28 marks ${units.length} seats with a `
-    + `\`dtype\`: ${counts.departments} departments and ${counts.sections} sections. Each became an hrms_departments row — a section as a `
-    + `child of the department that encloses it — and all ${counts.positionsWithDepartment} of the ${real.length} positions were then given the `
-    + `nearest enclosing unit, walking up the chart through machines and shared seats. A \`dtype\` seat is still a job: it `
-    + `keeps its people, its headcount and its responsibilities, and it also sits inside the unit it heads. The unit's name `
-    + `is the node's \`dept\` field (set on all ${units.length}); the job title is kept separately, which is why "Printing" and `
-    + `"Incharge - Production" are both right for the same row. Largest first: `
-    + [...units].sort((a, b) => (perUnit.get(b.code) || 0) - (perUnit.get(a.code) || 0)).slice(0, 8).map(unitLine).join('; ')
-    + `. Nothing was invented from title text — a seat without \`dtype\` creates no unit.`);
-  if (orphans.length) {
-    note('Positions with no department',
-      `${orphans.length} positions sit above every \`dtype\` seat in the chart and so have no enclosing unit: `
-      + `${orphans.map((p) => `${p.id} "${norm(p.title)}"`).join(', ')}. Their department is left empty rather than guessed.`);
+  // (b), (c)
+  const repeatsEnclosing = (u) => { const up = unitAbove(u); return !!up && sameName(unitName(u), unitName(up)); };
+  const machineItNames = (u) => {
+    const m = byId.get(u.reportsTo);
+    return m && isMachine(m) && !headingOver.has(m.id) && sameName(unitName(u), m.title) ? m : null;
+  };
+  // (d) — needs "where does this unit hang", which needs the units above it, so
+  // it is memoised and only ever recurses upward.
+  const canonical = new Map();                // unit id -> the unit id that carries the row
+  const deptKeyAt = (n) => {                  // the department this node opens, or null
+    // A heading has no row; a SPLIT machine has several, and which of them a
+    // seat below it belongs to is for an adjustment to say, not this walk.
+    if (isMachine(n)) return headingOver.has(n.id) || splitOf.has(n.id) ? null : n.id;
+    if (!isUnit(n) || repeatsEnclosing(n)) return null;
+    const m = machineItNames(n);
+    if (m) return m.id;
+    if (!canonical.has(n.id)) {
+      canonical.set(n.id, n.id);              // provisional: a same-named unit further down must not recurse back here
+      const hangsFrom = containerAbove(n);
+      const twins = unitNodes.filter((o) => !repeatsEnclosing(o) && !machineItNames(o)
+        && sameName(unitName(o), unitName(n)) && containerAbove(o) === hangsFrom)
+        .sort((a, b) => order.get(a.id) - order.get(b.id));
+      for (const t of twins) canonical.set(t.id, twins[0].id);
+    }
+    return canonical.get(n.id);
+  };
+  const containerAt = (n) => { let c = n, g = 0; while (c && g++ < 80) { const k = deptKeyAt(c); if (k) return k; c = byId.get(c.reportsTo); } return null; };
+  function containerAbove(n) { const up = byId.get(n.reportsTo); return up ? containerAt(up) : null; }
+
+  const deptMap = new Map();                  // key -> department
+  const addDept = (d) => { deptMap.set(d.key, d); return d; };
+  for (const n of nodes) {
+    if (splitOf.has(n.id)) {
+      // One box in the chart, several departments by decision. Coded <node>-1,
+      // <node>-2 … in the order the adjustment names them, so the codes are
+      // stable for as long as the decision is.
+      if (headingOver.has(n.id)) adjProblems.push(`${n.id} "${norm(n.title)}" is a heading over one section, not a machine; it cannot be split.`);
+      splitOf.get(n.id).names.forEach((name, i) => addDept({
+        key: `${n.id}-${i + 1}`, code: `${n.id}-${i + 1}`, node: n, part: i + 1, name, type: 'Machine / area',
+        parentKey: containerAbove(n), isShared: 0, serves: [], origin: 'machine', splitFrom: n.id,
+      }));
+      continue;
+    }
+    const key = deptKeyAt(n);
+    if (!key || key !== n.id) continue;       // not a department, or folded into another node's row
+    const absorbed = [...headingOver].filter(([, u]) => deptKeyAt(u) === key).map(([mid]) => mid);
+    addDept({
+      key, code: n.id, node: n,
+      name: isMachine(n) ? norm(n.title) : unitName(n),
+      type: isMachine(n) ? 'Machine / area' : (norm(n.dtype) === 'dept' ? 'Department' : (absorbed.length ? 'Process' : 'Section')),
+      parentKey: containerAbove(n), isShared: 0, serves: [], origin: isMachine(n) ? 'machine' : 'unit',
+    });
   }
 
-  const dupUnitNames = new Map();
-  for (const u of units) {
-    const k = normKey(u.name);
-    if (!dupUnitNames.has(k)) dupUnitNames.set(k, []);
-    dupUnitNames.get(k).push(u);
-  }
-  const repeated = [...dupUnitNames.values()].filter((v) => v.length > 1);
-  if (repeated.length) {
-    // Two shapes are worth naming, and both are computable rather than asserted:
-    // siblings that all claim one name, and a unit nested inside one of its own name.
-    const siblings = repeated.filter((v) => new Set(v.map((u) => u.parentNodeId)).size === 1);
-    const nested = repeated.filter((v) => v.some((u) => v.some((o) => o !== u && o.code === u.parentNodeId)));
-    note('The same unit name is claimed by several seats',
-      `${units.length} units carry only ${dupUnitNames.size} distinct names, because ${repeated.length} names are claimed by more than one `
-      + `seat: ` + repeated.map((v) => `"${v[0].name}" x${v.length} (${v.map((u) => `${u.code} ${norm(u.node.title)}`).join(', ')})`).join('; ')
-      + `. Each is a separate row — collapsing them would decide something the chart does not say. `
-      + (siblings.length
-        ? `In ${siblings.length} case${siblings.length === 1 ? '' : 's'} (${siblings.map((v) => `"${v[0].name}" x${v.length}`).join(', ')}) the seats `
-          + `all hang from the same place and all claim one name, which usually means one unit with several senior `
-          + `people in it rather than several units. ` : '')
-      + (nested.length
-        ? `In ${nested.length} case${nested.length === 1 ? '' : 's'} (${nested.map((v) => `"${v[0].name}"`).join(', ')}) a unit sits INSIDE a unit of its `
-          + `own name, which usually means one unit whose machine seats were each marked as a section. ` : '')
-      + `Merge any of them on the Departments screen and the positions follow.`);
-  }
-
-  // ---- 2. Work contexts (the machines) ---------------------------------
-  const ctxLinks = [];
-  const sharedParents = new Set();
-  let directlyUnderMachine = 0, viaShared = 0;
-  for (const p of real) {
-    const ctxs = contextsOf(p);
-    const direct = byId.get(p.reportsTo)?.kind === 'machine';
-    if (ctxs.length && !direct) sharedParents.add(p.reportsTo);
-    for (const [i, m] of ctxs.entries()) {
-      ctxLinks.push({
-        nodeId: p.id, machineId: m.id, isPrimary: i === 0 ? 1 : 0,
-        notes: direct
-          ? 'From the org chart: this position sat directly under the machine node.'
-          : 'From the org chart: inherited through a shared position that sat under this machine.',
+  // ---- 2. Shared seats: one department per distinct set of departments served
+  // V28 marks 8 seats `kind:'shared'`. What each one is shared BETWEEN is read
+  // from the only three things the chart gives:
+  //   * `sharedWith` — named seats. Their departments, plus the department of
+  //     the seat it reports to, are what it serves. Exact as far as it goes,
+  //     and lossy: the chart named people, a department is coarser.
+  //   * where it stands. Under a machine whose WHOLE crew is shared, the
+  //     machine node is itself several machines drawn as one box ("IBC 1/2/3")
+  //     and the crew is simply that department's crew: nothing to point at.
+  //   * the odd one out. A single shared seat among dedicated seats under one
+  //     machine is shared with something BEYOND that machine, and the chart
+  //     does not say what. The neighbouring machines under the same unit are
+  //     the only candidates the file offers — a GUESS, and reported as one.
+  // A set of one is not sharing: the seat sits in that department. A set of
+  // two or more gets a department of its own, under the nearest department
+  // that encloses everything it serves, with one hrms_department_serves row
+  // per department served. Never cloned per machine.
+  const deptOrder = () => {
+    const rank = new Map();
+    const walk = (parentKey, g) => {
+      if (g > 60) return;
+      for (const d of [...deptMap.values()].filter((x) => x.parentKey === parentKey)
+        .sort((a, b) => (order.get(a.node?.id) ?? 1e9) - (order.get(b.node?.id) ?? 1e9) || (a.part ?? 0) - (b.part ?? 0))) {
+        if (rank.has(d.key)) continue;
+        rank.set(d.key, rank.size);
+        walk(d.key, g + 1);
+      }
+    };
+    walk(null, 0);
+    return rank;
+  };
+  const baseRank = deptOrder();
+  const chainUp = (key) => { const out = []; let k = key, g = 0; while (k && g++ < 60) { out.push(k); k = deptMap.get(k)?.parentKey ?? null; } return out; };
+  const nearestCommon = (keys) => {
+    const chains = keys.map(chainUp);
+    return chains[0].find((k) => chains.every((c) => c.includes(k))) ?? null;
+  };
+  const sharedDecisions = [];
+  const sharedDeptOfSeat = new Map();         // seat id -> shared department key
+  /** The shared department for a set of served departments — one per distinct set, made on first use. */
+  const sharedDeptFor = (keys, name = null) => {
+    const deptKey = `shared:${keys.join('+')}`;
+    if (!deptMap.has(deptKey)) {
+      const names = keys.map((k) => deptMap.get(k).name);
+      const joined = `SH-${keys.join('-')}`;
+      addDept({
+        key: deptKey, node: null, origin: 'shared', isShared: 1, serves: keys, type: 'Shared crew',
+        code: joined.length <= 50 ? joined : `SH-${keys[0]}-${keys.length}-${keys.join('').split('').reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7).toString(36)}`,
+        name: clip(name || `Shared · ${names.slice(0, 3).join(' + ')}${names.length > 3 ? ` + ${names.length - 3} more` : ''}`, 200),
+        parentKey: nearestCommon(keys), seats: [],
       });
     }
-    if (ctxs.length) { if (direct) directlyUnderMachine++; else viaShared++; }
+    return deptKey;
+  };
+  const byRank = (keys) => [...new Set(keys.filter(Boolean))].sort((a, b) => baseRank.get(a) - baseRank.get(b));
+
+  // (i) What a person decided. These come first and are never second-guessed.
+  for (const s of adjShared) {
+    const unknown = s.serves.filter((k) => !deptMap.has(k) || deptMap.get(k).isShared);
+    if (unknown.length) {
+      adjProblems.push(`A shared adjustment (seats ${s.seats.join(', ')}) serves ${unknown.map((k) => `"${k}"`).join(', ')}, which ${unknown.length === 1 ? 'is' : 'are'} not a department this chart and these adjustments produce. Departments are coded by their node id; a split machine's parts are <node>-1, <node>-2 ….`);
+      continue;
+    }
+    const keys = byRank(s.serves);
+    const deptKey = sharedDeptFor(keys, s.name);
+    for (const id of s.seats) {
+      sharedDeptOfSeat.set(id, deptKey);
+      deptMap.get(deptKey).seats.push(id);
+      sharedDecisions.push({
+        id, title: norm(byId.get(id).title), serves: keys, names: keys.map((k) => deptMap.get(k).name), department: deptMap.get(deptKey).name,
+        shared: true, guess: Boolean(s.entry.needsConfirmation), decided: true,
+        basis: `by decision (${norm(s.entry.decidedBy)}, ${norm(s.entry.decidedOn)}): ${norm(s.entry.reason)} Serves`,
+      });
+    }
   }
-  counts.workContexts = machines.length;
-  counts.contextLinks = ctxLinks.length;
-  counts.positionsWithContext = directlyUnderMachine + viaShared;
-  note('Machines became work contexts, not managers',
-    `${counts.positionsWithContext} positions now carry a machine as a work context. Of those, ${directlyUnderMachine} hung directly `
-    + `under a machine node in the chart and have been re-pointed to their nearest human ancestor — a machine is never `
-    + `a manager. The other ${viaShared} sat under a SHARED position that itself sat under a machine; their manager is `
-    + `unchanged (that shared position is a real supervisory job), but they have inherited its machine, which the `
-    + `original chart did not record. Check those ${viaShared}: they hang from `
-    + `${[...sharedParents].map((id) => `${id} "${norm(byId.get(id)?.title)}"`).join(', ')}, whose own title says it covers several `
-    + `machines while the chart draws it under one — so the inheritance is right and still incomplete, and only the `
-    + `client can name the rest.`);
+  failAdjustments();
+  /** The nearest seat above this one that a decision placed, with no department opening in between. */
+  const placedAbove = (p) => {
+    let c = byId.get(p.reportsTo), g = 0;
+    while (c && g++ < 60) {
+      if (sharedDeptOfSeat.has(c.id)) return c;
+      if (isMachine(c) || deptKeyAt(c)) return null;
+      c = byId.get(c.reportsTo);
+    }
+    return null;
+  };
+
+  // (ii) What the chart marks as shared and nobody has decided about.
+  for (const s of real.filter((p) => p.kind === 'shared')) {
+    if (sharedDeptOfSeat.has(s.id)) continue;                 // decided above
+    if (adjNotShared.has(s.id)) {
+      const e = adjNotShared.get(s.id);
+      const key = containerAt(s);
+      sharedDecisions.push({ id: s.id, title: norm(s.title), serves: [key], names: [deptMap.get(key)?.name], department: deptMap.get(key)?.name,
+        shared: false, guess: false, decided: true,
+        basis: `NOT shared, by decision (${norm(e.decidedBy)}, ${norm(e.decidedOn)}): ${norm(e.reason)} It stays in` });
+      continue;
+    }
+    const lead = placedAbove(s);
+    if (lead) {
+      const d = deptMap.get(sharedDeptOfSeat.get(lead.id));
+      sharedDecisions.push({ id: s.id, title: norm(s.title), serves: d.serves, names: d.serves.map((k) => deptMap.get(k).name), department: d.name,
+        shared: true, guess: false, decided: true,
+        basis: `reports to ${lead.id} "${norm(lead.title)}" with no department in between, so it goes where that seat was placed. Serves` });
+      continue;
+    }
+    let keys, basis, guess = false;
+    if (Array.isArray(s.sharedWith) && s.sharedWith.length) {
+      const seats = [byId.get(s.reportsTo), ...s.sharedWith.map((id) => byId.get(id))].filter(Boolean);
+      keys = seats.map(containerAt);
+      basis = `sharedWith names ${s.sharedWith.join(', ')}; with the seat it reports to (${s.reportsTo}) those sit in`;
+    } else {
+      let m = byId.get(s.reportsTo), g = 0;
+      while (m && m.kind === 'shared' && g++ < 50) m = byId.get(m.reportsTo);
+      if (!m || !isMachine(m) || headingOver.has(m.id)) {
+        keys = [containerAt(s)];
+        basis = 'stands under no machine and names nobody, so nothing says what it is shared between; it stays in';
+      } else if (splitOf.has(m.id)) {
+        throw new Error(`${s.id} "${norm(s.title)}" is a shared seat under ${m.id} "${norm(m.title)}", which an adjustment splits into ${splitOf.get(m.id).names.join(', ')} — and no adjustment says which of them it serves. Add a "shared" adjustment naming it (or the seat it reports to).`);
+      } else {
+        const crew = kids(m).filter((k) => !isMachine(k));
+        if (crew.every((k) => k.kind === 'shared')) {
+          keys = [m.id];
+          basis = `every seat under ${m.id} "${norm(m.title)}" is shared, so that one box stands for several machines and this is its crew:`;
+        } else {
+          const neighbours = kids(byId.get(m.reportsTo) || { id: null }).filter((k) => isMachine(k) && k.id !== m.id && !headingOver.has(k.id) && !splitOf.has(k.id));
+          keys = [m.id, ...neighbours.map((k) => k.id)];
+          guess = neighbours.length > 0;
+          basis = neighbours.length
+            ? `the only shared seat among ${crew.length} under ${m.id} "${norm(m.title)}", so it is shared beyond that machine; the chart does not say with what, and the neighbouring machine${neighbours.length === 1 ? '' : 's'} under the same unit ${neighbours.length === 1 ? 'is' : 'are'} the only candidate${neighbours.length === 1 ? '' : 's'}:`
+            : `the only shared seat under ${m.id} "${norm(m.title)}", which has no neighbouring machine to share with:`;
+        }
+      }
+    }
+    keys = byRank(keys);
+    const names = keys.map((k) => deptMap.get(k).name);
+    let deptKey = keys[0];
+    if (keys.length > 1) {
+      deptKey = sharedDeptFor(keys);
+      deptMap.get(deptKey).seats.push(s.id);
+      sharedDeptOfSeat.set(s.id, deptKey);
+    }
+    sharedDecisions.push({ id: s.id, title: norm(s.title), serves: keys, names, department: deptMap.get(deptKey).name, shared: keys.length > 1, guess, basis });
+  }
+
+  // Every seat's ONE department. A seat reporting to a shared seat, with no
+  // department of its own in between, goes where that shared seat went.
+  const deptKeyByNode = new Map();
+  // The same holds for any seat an adjustment placed. A seat that reaches a
+  // SPLIT machine without having been placed is an error, never a silent
+  // fall-through to the unit above: the decision to split is incomplete.
+  for (const p of real) {
+    let c = p, g = 0, key = null;
+    while (c && g++ < 80 && !key) {
+      if (splitOf.has(c.id)) {
+        adjProblems.push(`${p.id} "${norm(p.title)}" stands under ${c.id} "${norm(c.title)}", which is split into ${splitOf.get(c.id).names.join(', ')}, and no adjustment says which it belongs to. Name it (or the seat it reports to) in a "shared" adjustment.`);
+        break;
+      }
+      key = sharedDeptOfSeat.get(c.id) || deptKeyAt(c);
+      c = byId.get(c.reportsTo);
+    }
+    deptKeyByNode.set(p.id, key);
+  }
+  failAdjustments();
+
+  // Parents before children; a shared department is never a parent.
+  const depthOfDept = (d) => chainUp(d.key).length;
+  const finalRank = deptOrder();
+  const departments = [...deptMap.values()].sort((a, b) => depthOfDept(a) - depthOfDept(b) || finalRank.get(a.key) - finalRank.get(b.key));
+  const serves = departments.flatMap((d) => d.serves.map((k) => ({ deptKey: d.key, servesKey: k })));
+
+  const orphans = real.filter((p) => !deptKeyByNode.get(p.id));
+  const seatsIn = (origin) => real.filter((p) => deptMap.get(deptKeyByNode.get(p.id))?.origin === origin).length;
+  const perDept = new Map();
+  for (const p of real) { const k = deptKeyByNode.get(p.id); if (k) perDept.set(k, (perDept.get(k) || 0) + 1); }
+  counts.sourceUnitFlags = unitNodes.length;
+  counts.departmentRows = departments.length;
+  counts.unitDepartments = departments.filter((d) => d.origin === 'unit').length;
+  counts.machineDepartments = departments.filter((d) => d.origin === 'machine').length;
+  counts.sharedDepartments = departments.filter((d) => d.origin === 'shared').length;
+  counts.departmentServes = serves.length;
+  counts.positionsWithDepartment = real.length - orphans.length;
+  counts.seatsInMachineDepartment = seatsIn('machine');
+  counts.seatsInSharedDepartment = seatsIn('shared');
+  counts.seatsElsewhere = seatsIn('unit');
+
+  const headings = [...headingOver].map(([mid, u]) => `${mid} "${norm(byId.get(mid).title)}" -> ${u.id} ${unitName(u)}`);
+  const repeats = unitNodes.filter(repeatsEnclosing);
+  const namesMachine = unitNodes.filter((u) => !repeatsEnclosing(u) && machineItNames(u));
+  const twinGroups = new Map();
+  for (const [id, to] of canonical) { if (!twinGroups.has(to)) twinGroups.set(to, []); twinGroups.get(to).push(id); }
+  const twinSets = [...twinGroups].filter(([, ids]) => ids.length > 1);
+  const deptLine = (d) => `${d.name} [${d.type}] (${d.code}, ${perDept.get(d.key) || 0} seats)`;
+  note('Everything is a department now — machines and shared crews included',
+    `The chart flags ${unitNodes.length} seats as heading a unit (\`dtype\`) and draws ${machines.length} machine or process boxes. Those `
+    + `${unitNodes.length + machines.length} became ${departments.length - counts.sharedDepartments} departments, plus ${counts.sharedDepartments} for shared crews: `
+    + `${counts.unitDepartments} from unit seats, ${counts.machineDepartments} from machines (type "Machine / area"). Every one of the ${real.length} positions has `
+    + `exactly one: ${counts.seatsInMachineDepartment} sit directly in a machine's department, ${counts.seatsInSharedDepartment} in a shared one and `
+    + `${counts.seatsElsewhere} in a department, process or section. Work contexts are no longer written. `
+    + `What was collapsed, so that one real thing is one department: `
+    + `(a) ${headings.length} process headings merged into the section they sit over — ${headings.join('; ')}. `
+    + `(b) ${repeats.length} unit flags that only repeat the unit around them — ${repeats.map((u) => `${u.id} "${unitName(u)}" inside ${unitAbove(u).id}`).join(', ')}. `
+    + `(c) ${namesMachine.length} unit flags that name the machine they stand under — ${namesMachine.map((u) => `${u.id} "${unitName(u)}" = ${machineItNames(u).id}`).join(', ')}. `
+    + `(d) ${twinSets.length} name${twinSets.length === 1 ? '' : 's'} claimed by several seats hanging from one place — `
+    + `${twinSets.map(([to, ids]) => `"${unitName(byId.get(to))}" x${ids.length} (${ids.join(', ')}) kept as ${to}`).join('; ') || 'none'}. `
+    + `Largest first: ${[...departments].sort((a, b) => (perDept.get(b.key) || 0) - (perDept.get(a.key) || 0)).slice(0, 8).map(deptLine).join('; ')}. `
+    + `The \`type\` is a label for people to read; nothing in the app decides anything from its text.`);
+  if (adjEntries.length) {
+    const say = (a) => {
+      const tail = ` — ${norm(a.reason)} [${norm(a.decidedBy)}, ${norm(a.decidedOn)}]${a.needsConfirmation ? ' *** NEEDS CONFIRMATION — this one was inferred, not stated ***' : ''}`;
+      if (a.kind === 'split') return `SPLIT ${a.node} "${norm(byId.get(a.node).title)}" into ${a.into.map((n, i) => `${n} (${a.node}-${i + 1})`).join(', ')}${tail}`;
+      if (a.kind === 'shared') return `SHARED: seats ${a.seats.join(', ')} serve ${a.serves.map((k) => `${deptMap.get(k).name} (${k})`).join(' + ')}${tail}`;
+      return `NOT SHARED: ${a.seat} "${norm(byId.get(a.seat).title)}"${tail}`;
+    };
+    note(`${adjEntries.length} adjustments applied on top of the chart`,
+      `From ${adj.fileName} (sha256 ${adj.hash.slice(0, 12)}…), which records decisions the chart cannot express. All ${adjEntries.length} fitted this chart and were applied: ` + adjEntries.map((a, i) => `(${i + 1}) ${say(a)}`).join(' ')
+      + ` A split machine has no row of its own; its parts are coded <node>-1, <node>-2 … in the order the file names them. Had any entry named a node this chart does not have, the import would have stopped.`);
+  }
+  const nearMiss = departments.filter((d) => d.origin === 'unit' && isMachine(byId.get(d.node.reportsTo) || {})
+    && !headingOver.has(d.node.reportsTo) && kids(byId.get(d.node.reportsTo)).length === 1);
+  if (nearMiss.length) {
+    note('A section that is the whole of a differently named machine',
+      nearMiss.map((d) => `${d.code} "${d.name}" is the only thing under ${d.node.reportsTo} "${norm(byId.get(d.node.reportsTo).title)}"`).join('; ')
+      + `. The names differ, so both were kept: the machine as a department with no seats of its own, the section inside it. `
+      + `If they are one thing, rename one to match the other in the chart (or merge them on the Departments screen) and `
+      + `the next import makes one department of them.`);
+  }
+  note(`${sharedDecisions.length} shared seats: where each one went`,
+    sharedDecisions.map((s) => `${s.id} "${s.title}" — ${s.basis} ${s.names.join(' + ')}. `
+      + (s.shared ? `Department: "${s.department}"${s.guess ? ' (A GUESS — confirm what this seat is shared between)' : ''}.` : `Department: "${s.department}", not a shared one.`)).join(' ')
+    + ` A seat stays ONE position whatever it serves; a shared department is one box with a line to each department it serves.`);
+  if (orphans.length) {
+    note('Positions with no department',
+      `${orphans.length} positions sit above every unit and machine in the chart and so have no enclosing department: `
+      + `${orphans.map((p) => `${p.id} "${norm(p.title)}"`).join(', ')}. Their department is left empty rather than guessed.`);
+  }
 
   // ---- 3. Roles: one per (title, duty list) -----------------------------
   // A role is a KIND OF WORK, and its content is the job description of every
@@ -331,7 +647,7 @@ function plan(seed, prev) {
       + `in the chart, so the role's content is exactly each holder's job description — nothing is combined. The shared `
       + `roles, largest first: `
       + merged.map((m) => `"${m.title}" x${m.nodes.length} (${m.nodes.map((g) => g.id).join(', ')})`).join('; ')
-      + `. "${merged[0].title}" spans ${new Set(merged[0].nodes.map((n) => unitByNode.get(n.id))).size} unit(s).`);
+      + `. "${merged[0].title}" spans ${new Set(merged[0].nodes.map((n) => deptKeyByNode.get(n.id))).size} department(s).`);
   }
 
   // ---- 4. Positions ----------------------------------------------------
@@ -343,7 +659,7 @@ function plan(seed, prev) {
     roleKey: roleKeyOf(p),
     req: Math.max(0, Number(p.req) || 0),
     shift: p.shift === 'DN' ? null : (p.shift || 'G'),
-    unitNodeId: unitByNode.get(p.id) || null,
+    deptKey: deptKeyByNode.get(p.id) || null,
   }));
   const manpower = [];
   let sanctioned = 0;
@@ -696,13 +1012,10 @@ function plan(seed, prev) {
     + `Nothing here is recoverable from the database afterwards — re-import from the file when there is somewhere to put it.`);
   const sharedWith = nodes.filter((n) => Array.isArray(n.sharedWith) && n.sharedWith.length);
   if (sharedWith.length) {
-    note('One seat is "shared with" four others and nothing holds that',
+    note('"Shared with" names people; a department is coarser',
       sharedWith.map((n) => `${n.id} "${norm(n.title)}" (reports to ${n.reportsTo}) is marked shared with `
         + `${n.sharedWith.map((id) => `${id} ${norm(nodes.find((x) => x.id === id)?.title || '?')}`).join(', ')}`).join('; ')
-      + `. This is a new field in V28 and it is not a dotted line, not a machine context and not a second manager — it `
-      + `reads as "this person serves these people too". Nothing was written for it, because every available table `
-      + `would have turned it into a reporting claim the chart does not make. If it means they are functionally `
-      + `accountable to those four, say so and it becomes four FUNCTIONAL_MANAGER rows; the type is already seeded.`);
+      + `. Where each went is in the shared-seat finding. A department is coarser than a list of people: no table holds seat-to-seat sharing, and it is not a reporting line, so the names themselves were not written anywhere.`);
   }
   if (seed.meta?.letter) {
     const l = seed.meta.letter;
@@ -717,12 +1030,13 @@ function plan(seed, prev) {
     `Four source fields are ignored by design: \`arrange\` (how the tool draws children), \`id\` on each person row (the `
     + `tool's own row key — stable, but hrms_employees has no external_ref column to hold it, so people are matched by `
     + `name), \`settings\` (colours and the four-row operator template) and \`view\`. Node ids ARE kept: they are the `
-    + `position codes, the work-context codes, the department codes and the role codes, which is what lets `
+    + `position codes, the department codes (a unit by its heading seat, a machine by its own node) and the role codes, which is what lets `
     + `verify-against-source.mjs tie a row back to the chart.`);
 
   return {
-    chartDate, nodes, byId, real, machines, units, unitByNode, roleGroups, roleKeyOf,
-    positions, manpower, edges, ctxLinks,
+    chartDate, nodes, byId, real, machines, departments, serves, deptKeyByNode, sharedDecisions, roleGroups, roleKeyOf,
+    adjustments: adj ? { fileName: adj.fileName, hash: adj.hash, count: adjEntries.length, entries: adjEntries } : null,
+    positions, manpower, edges,
     respDefs, respAssign, kpiDefs, kpiAssign,
     employees, named, blanks, attendance, openOrg, openNode,
     counts, findings, meta: seed.meta || {}, settings: seed.settings || {},
@@ -792,7 +1106,7 @@ const WIPE_ORDER = [
   'hrms_role_responsibility_assignments', 'hrms_role_kpi_assignments', 'hrms_role_kra_assignments',
   'hrms_roles', 'hrms_responsibility_definitions', 'hrms_kpi_definitions', 'hrms_kra_definitions',
   'hrms_qualification_definitions', 'hrms_open_points', 'hrms_work_contexts',
-  'hrms_departments', 'hrms_locations', 'hrms_import_runs',
+  'hrms_department_serves', 'hrms_departments', 'hrms_locations', 'hrms_import_runs',
 ];
 
 async function main() {
@@ -811,7 +1125,12 @@ async function main() {
   const prev = prevPath ? readSeed(prevPath).seed : null;
   console.log(`  compared with: ${prevPath || '(not found — the title-change list will be skipped)'}\n`);
 
-  const p = plan(seed, prev);
+  // Decisions the chart cannot express. Optional; found beside the source.
+  const adjPath = resolveAdjustments(source);
+  const adj = adjPath ? { ...readAdjustments(adjPath), sourceFileName: fileName } : null;
+  console.log(`  adjustments: ${adj ? `${adjPath}\n               ${adj.entries.length} entries, sha256 ${adj.hash.slice(0, 12)}…` : '(none — the chart alone)'}\n`);
+
+  const p = plan(seed, prev, adj);
 
   const conn = await mysql.createConnection(TARGET.cfg);
   // STRICT, deliberately. The previous version ran with sql_mode = "" and that
@@ -870,29 +1189,32 @@ async function main() {
     location_type: 'PLANT', status: 'ACTIVE',
   });
 
-  // ---- 2. Departments and sections, parents first ----------------------
-  const deptByNode = new Map();
-  for (const u of p.units) {
-    deptByNode.set(u.code, await ins('hrms_departments', {
-      code: u.code,
-      name: clip(u.name, 200),
-      parent_department_id: u.parentNodeId ? deptByNode.get(u.parentNodeId) : null,
+  // ---- 2. Departments, parents first (plan() sorted them) ----------------
+  // Units, machines and shared crews alike. `department_type` is a label only.
+  const deptByKey = new Map();
+  for (const d of p.departments) {
+    deptByKey.set(d.key, await ins('hrms_departments', {
+      code: d.code,
+      name: clip(d.name, 200),
+      parent_department_id: d.parentKey ? deptByKey.get(d.parentKey) : null,
+      department_type: d.type,
+      is_shared: d.isShared,
       status: 'ACTIVE',
     }));
   }
+  for (const sv of p.serves) {
+    await ins('hrms_department_serves', {
+      department_id: deptByKey.get(sv.deptKey), serves_department_id: deptByKey.get(sv.servesKey),
+    });
+  }
   const deptOfNode = (nodeId) => {
-    const unit = p.unitByNode.get(nodeId);
-    return unit ? deptByNode.get(unit) : null;
+    const key = p.deptKeyByNode.get(nodeId);
+    return key ? deptByKey.get(key) : null;
   };
 
-  // ---- 3. Work contexts (the machines) ---------------------------------
-  const ctxByNode = new Map();
-  for (const m of p.machines) {
-    ctxByNode.set(m.id, await ins('hrms_work_contexts', {
-      code: m.id, name: clip(norm(m.title), 200), context_type: 'MACHINE',
-      location_id: locationId, status: 'ACTIVE', external_ref: m.id,
-    }));
-  }
+  // ---- 3. (was: work contexts) ------------------------------------------
+  // Nothing. A machine is a department now; hrms_work_contexts and
+  // hrms_position_work_contexts are left in the schema and not written.
 
   // ---- 4. Roles --------------------------------------------------------
   const roleByKey = new Map();
@@ -915,14 +1237,6 @@ async function main() {
       default_shift_id: pos.shift ? shiftId(pos.shift) : null,
       status: 'ACTIVE', effective_from: p.chartDate,
     }));
-  }
-
-  // ---- 6. Position -> work contexts -------------------------------------
-  for (const l of p.ctxLinks) {
-    await ins('hrms_position_work_contexts', {
-      position_id: posByNode.get(l.nodeId), work_context_id: ctxByNode.get(l.machineId),
-      is_primary: l.isPrimary, effective_from: p.chartDate, notes: l.notes,
-    });
   }
 
   // ---- 7. Formal reporting ---------------------------------------------
@@ -1024,9 +1338,10 @@ async function main() {
 
   // ---- 13. Record the run ----------------------------------------------
   const idMap = {
-    departments: Object.fromEntries(deptByNode),
+    departments: Object.fromEntries(p.departments.map((d) => [d.code, deptByKey.get(d.key)])),
     positions: Object.fromEntries(posByNode),
-    workContexts: Object.fromEntries(ctxByNode),
+    sharedSeats: p.sharedDecisions,
+    adjustments: p.adjustments?.entries ?? [],
     roles: Object.fromEntries(roleByKey),
     employees: Object.fromEntries(p.employees.map((e) => [e.code, empByKey.get(e.key)])),
     // The one V28 field with nowhere to live. Kept here so it survives the run.
@@ -1046,11 +1361,17 @@ async function main() {
   await ins('hrms_import_runs', {
     source_kind: 'ORG_CHART_HTML', source_file_name: fileName,
     source_hash: hash, source_size_bytes: size, status: 'COMMITTED',
-    parsed_counts_json: JSON.stringify({ ...p.counts, chartDate: p.chartDate, letter: p.meta.letter ?? null }),
+    // The adjustments file's hash sits beside the source's: together they are
+    // what this tenant was built from, and the verifier checks both.
+    parsed_counts_json: JSON.stringify({
+      ...p.counts, chartDate: p.chartDate, letter: p.meta.letter ?? null,
+      adjustmentsFile: p.adjustments?.fileName ?? null, adjustmentsHash: p.adjustments?.hash ?? null,
+    }),
     findings_json: JSON.stringify(p.findings),
     id_map_json: JSON.stringify(idMap),
     parsed_at: now, validated_at: now, committed_at: now,
-    notes: `Imported by scripts/import-org-chart.mjs into company ${COMPANY_SLUG}.`,
+    notes: `Imported by scripts/import-org-chart.mjs into company ${COMPANY_SLUG}.`
+      + (p.adjustments ? ` With ${p.adjustments.count} adjustments from ${p.adjustments.fileName} (sha256 ${p.adjustments.hash}).` : ' No adjustments file.'),
   });
 
   RUN_CONTEXT = null;
