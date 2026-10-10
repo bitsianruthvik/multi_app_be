@@ -804,6 +804,8 @@ async function main() {
   const expectedKraOrder = new Map();         // roleKey -> [kraKey…] in the file's order
   const kraSpellings = new Map();             // kraKey -> Set of spellings the file uses
   const usedEntries = new Set();
+  const expectedPurpose = [];                 // role|purpose ('' = none)
+  const dutiesNoPurpose = [];
   let expectedUngrouped = 0, expectedGrouped = 0, staleLines = 0;
   for (const [roleKey, ps] of seatsByRole) {
     const chartLines = new Set();
@@ -813,6 +815,9 @@ async function main() {
     }
     const entry = entryByTitle.get(roleKey) ?? entryBySeats.get(seatKey(ps.map((p) => p.id))) ?? null;
     if (entry) usedEntries.add(entry);
+    const purposeText = typeof entry?.purpose === 'string' ? entry.purpose.trim() : '';
+    expectedPurpose.push(`${roleKey}|${purposeText}`);
+    if (!purposeText && chartLines.size) dutiesNoPurpose.push(roleKey);
     const where = new Map();
     const order = [];
     for (const k of (entry?.kras ?? [])) {
@@ -905,6 +910,19 @@ async function main() {
   const contentRoles = new Set([...seatsByRole].filter(([, ps]) => ps.some((p) => (p.kras || []).some((x) => normKey(x)) || (p.kpis || []).some((k) => normKey(k?.k)))).map(([k]) => k));
   const krasOnEmpty = [...dbOrder.keys()].filter((k) => !contentRoles.has(k));
   check('a role with no duties and no KPIs has no KRA', krasOnEmpty.length === 0, krasOnEmpty.slice(0, 5).join(', '));
+
+  // PURPOSE: hrms_roles.role_purpose is the file's sentence for that role,
+  // exactly, and empty where the file gives none (every role, with no file).
+  const purposeRows = await q('SELECT title, role_purpose FROM hrms_roles WHERE company_id=? AND deleted_at IS NULL', [c]);
+  same('every role carries exactly the purpose the file gives it, and none where the file gives none',
+    expectedPurpose, purposeRows.map((r) => `${normKey(r.title)}|${r.role_purpose ?? ''}`),
+    (k) => `${k.split('|')[0]}: ${k.split('|').slice(1).join('|') ? `"${clip(k.split('|').slice(1).join('|'), 60)}"` : 'no purpose'}`);
+  // Only where there is a file: without one, no purposes is exactly what is expected.
+  check('no role with duties is left without a purpose (the file gives every such role one)',
+    !kraFile || dutiesNoPurpose.length === 0,
+    `${dutiesNoPurpose.length} roles have duties and no purpose in the file: ${dutiesNoPurpose.slice(0, 6).join(', ')}`);
+  console.log(`    note purposes: ${purposeRows.filter((r) => String(r.role_purpose ?? '').trim()).length} of ${purposeRows.length} roles have one; `
+    + `${purposeRows.filter((r) => String(r.role_purpose ?? '').trim() && dbOrder.has(normKey(r.title))).length} have a purpose AND a KRA (the job-description readiness rule)`);
 
   const kraDefRows = await q('SELECT id, name FROM hrms_kra_definitions WHERE company_id=? AND deleted_at IS NULL', [c]);
   same('one KRA definition per KRA name in use, and no others (none at all without a KRA file)',

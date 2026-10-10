@@ -66,6 +66,12 @@
  * place is imported ungrouped and counted as needing a KRA. A malformed file
  * (one line under two KRAs, a KRA named twice in a role) does stop it.
  *
+ * PURPOSE. The same file carries each role's `purpose` — one sentence saying
+ * why the role exists, the opening line of its job description — and it is
+ * written to hrms_roles.role_purpose verbatim. The chart holds none. A role
+ * with no duties still has an entry (its `kras` is empty) and a purpose
+ * marked `purposeBasis: "title only"`. --no-kras leaves every purpose empty.
+ *
  * Usage:
  *   node import-org-chart.mjs --company=karni [--dry-run] [--wipe] [--source=<path>]
  *                             [--adjustments=<path> | --no-adjustments]
@@ -873,6 +879,7 @@ function plan(seed, prev, adj = null, kraFile = null) {
   // hrms_role_kra_assignments. hrms_kra_definitions is unique by name, so two
   // roles that both say "Quality" share one definition ROW — a name, nothing
   // more; neither role's grouping can see the other's.
+  const PURPOSE_BASES = ['duties', 'title only', 'reviewed'];
   const kraDefs = new Map();                  // normKey(name) -> { key, name }
   const kraAssign = [];                       // { roleKey, defKey, sequence, description }
   const kraStale = [];                        // { role, kra?, what, text? }
@@ -912,6 +919,10 @@ function plan(seed, prev, adj = null, kraFile = null) {
           }
         }
       }
+      if (entry.purpose !== undefined && entry.purpose !== null && typeof entry.purpose !== 'string') problems.push(`${label}: "purpose" is not text.`);
+      if (norm(entry.purposeBasis) && !PURPOSE_BASES.includes(norm(entry.purposeBasis))) {
+        problems.push(`${label}: "purposeBasis" is "${norm(entry.purposeBasis)}"; it is one of ${PURPOSE_BASES.map((b) => `"${b}"`).join(', ')}.`);
+      }
       let g = groupByTitle.get(normKey(entry.role));
       let bySeats = false;
       if (!g && Array.isArray(entry.seats) && entry.seats.length) { g = groupBySeats.get(seatSig(entry.seats)); bySeats = !!g; }
@@ -919,6 +930,12 @@ function plan(seed, prev, adj = null, kraFile = null) {
       if (claimed.has(g.key)) { problems.push(`${label} and ${claimed.get(g.key)} are both the role "${g.title}".`); return; }
       claimed.set(g.key, label);
       if (bySeats) kraBySeats.push({ from: norm(entry.role), to: g.title, seats: entry.seats.join(', ') });
+      // The purpose rides on the role group itself: section 4 of the commit
+      // writes it with the role. Verbatim — only the ends are trimmed.
+      if (typeof entry.purpose === 'string' && entry.purpose.trim()) {
+        g.purpose = entry.purpose.trim();
+        g.purposeBasis = norm(entry.purposeBasis) || null;
+      }
       let seq = 0;
       for (const k of entry.kras) {
         const name = norm(k?.name);
@@ -969,6 +986,21 @@ function plan(seed, prev, adj = null, kraFile = null) {
   counts.kpisGrouped = kpiAssign.filter((a) => a.kraKey).length;
   counts.linesUngrouped = ungrouped.reduce((n, [, r]) => n + r.ungrouped.length, 0);
   counts.kraStaleEntries = kraStale.length;
+  const withPurpose = roleGroups.filter((g) => g.purpose);
+  const dutiesNoPurpose = roleGroups.filter((g) => !g.purpose && linesOfRole.has(g.key));
+  const idleNoPurpose = roleGroups.filter((g) => !g.purpose && !linesOfRole.has(g.key));
+  counts.rolesWithPurpose = withPurpose.length;
+  counts.rolesPurposeFromTitleOnly = withPurpose.filter((g) => g.purposeBasis === 'title only').length;
+  counts.rolesWithDutiesButNoPurpose = dutiesNoPurpose.length;
+  if (kraFile) {
+    note(`Role purposes: ${withPurpose.length} of ${roleGroups.length} roles have one`,
+      `${kraFile.fileName} gives ${withPurpose.length} roles a one-sentence purpose, written to the role verbatim; it is the opening line of the job description. `
+      + `${counts.rolesPurposeFromTitleOnly} of them are marked "title only": the chart gives those roles no duties, so the sentence rests on the title, the department and the reporting line and says less. `
+      + (dutiesNoPurpose.length ? `NO PURPOSE, though the role has duties: ${dutiesNoPurpose.map((g) => `"${g.title}"`).join(', ')}. ` : 'Every role with duties has one. ')
+      + (idleNoPurpose.length ? `No purpose and no duties: ${idleNoPurpose.map((g) => `"${g.title}"`).join(', ')}. ` : '')
+      + `A job description counts as ready when the role has a purpose AND at least one KRA, so ${withPurpose.filter((g) => rolesWithKras.has(g.key)).length} roles are ready; `
+      + `a role with no duties has no KRA and stays not ready whatever its purpose says.`);
+  }
   if (!kraFile) {
     note('No KRA file: every responsibility and KPI is ungrouped',
       `No <chart>.kras.json was found beside the chart (or --no-kras was given), so no key result areas were created and all `
@@ -1390,7 +1422,7 @@ async function main() {
   const roleByKey = new Map();
   for (const g of p.roleGroups) {
     roleByKey.set(g.key, await ins('hrms_roles', {
-      role_code: g.code, title: clip(g.title, 200), status: 'ACTIVE', effective_from: p.chartDate,
+      role_code: g.code, title: clip(g.title, 200), role_purpose: g.purpose ?? null, status: 'ACTIVE', effective_from: p.chartDate,
     }));
   }
 

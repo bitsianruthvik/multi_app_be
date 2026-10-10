@@ -6,8 +6,9 @@
  * which nobody at a client should have to edit. So:
  *
  *   node kra-review.mjs export --company=karni [--out=<path.xlsx>] [--source=<chart>] [--kras=<path>]
- *       Writes TM/<Company>_KRA_review.xlsx: a Summary sheet (each role's KRAs
- *       with line counts) and a Lines sheet, one row per (role, line):
+ *       Writes TM/<Company>_KRA_review.xlsx: a Roles sheet (one row per role,
+ *       with its one-sentence purpose), a KRAs sheet (each role's KRAs with
+ *       line counts) and a Lines sheet, one row per (role, line):
  *       Role · KRA · Kind · Text · Target · Move to KRA · Comment.
  *
  *   node kra-review.mjs apply --workbook=<path.xlsx> [--apply] [--force] [--source=<chart>] [--kras=<path>]
@@ -19,8 +20,10 @@
  *     to move the line there. A name the role does not have yet makes a NEW KRA
  *     (added after the role's others). An ungrouped line (KRA blank) is placed
  *     the same way.
- *   - Summary sheet, "Rename KRA to": a new name for that KRA of that role.
+ *   - KRAs sheet, "Rename KRA to": a new name for that KRA of that role.
  *     Renaming onto a name the role already has merges the two.
+ *   - Roles sheet, "Change purpose to": a new one-sentence purpose for that
+ *     role. It replaces the sentence in the file and is marked "reviewed".
  *   - "Comment" anywhere: printed back by `apply`, never stored.
  * Editing Role, KRA, Kind, Text or Target does nothing: this workbook groups, it
  * does not reword. A row whose text no longer matches is reported and skipped.
@@ -57,9 +60,20 @@ const normKey = (s) => norm(s).toLowerCase().replace(/[.;,]+$/, '');
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
 const NO_KRA = '(no KRA yet)';
 
-const SUMMARY = 'Summary';
+const ROLES = 'Roles';
+const SUMMARY = 'KRAs';
 const LINES = 'Lines';
 const ABOUT = 'About';
+const ROLE_COLS = [
+  { header: 'Role', key: 'role', width: 44 },
+  { header: 'Seats', key: 'seats', width: 16 },
+  { header: 'KRAs', key: 'kras', width: 7 },
+  { header: 'Lines', key: 'lines', width: 7 },
+  { header: 'Purpose', key: 'purpose', width: 80 },
+  { header: 'Basis', key: 'basis', width: 12 },
+  { header: 'Change purpose to', key: 'change', width: 80, edit: true },
+  { header: 'Comment', key: 'comment', width: 40, edit: true },
+];
 const SUMMARY_COLS = [
   { header: 'Role', key: 'role', width: 44 },
   { header: 'Seats', key: 'seats', width: 16 },
@@ -134,6 +148,7 @@ async function exportWorkbook() {
   const entryByTitle = new Map(kf.roles.map((e) => [normKey(e.role), e]));
   const entryBySeats = new Map(kf.roles.filter((e) => Array.isArray(e.seats) && e.seats.length).map((e) => [seatSig(e.seats), e]));
 
+  const roleRows = [];
   const summary = [];
   const lines = [];
   const empty = [];
@@ -145,9 +160,13 @@ async function exportWorkbook() {
       ...resp.filter((x) => x.role_id === r.id).map((x) => ({ kind: 'Responsibility', k: 'R', text: x.text, target: '' })),
       ...kpis.filter((x) => x.role_id === r.id).map((x) => ({ kind: 'KPI', k: 'K', text: x.text, target: String(readJson(x.target_value) ?? '') })),
     ];
-    if (!mine.length) { empty.push({ role: r.title, seats: roleSeats.join(', ') }); continue; }
     const entry = entryByTitle.get(normKey(r.title)) ?? entryBySeats.get(seatSig(roleSeats)) ?? null;
     if (entry) usedEntries.add(entry);
+    // Every role has a row on the Roles sheet, duties or not: the purpose is
+    // the one thing a role with no duties still has to be reviewed for.
+    const roleRow = { role: r.title, seats: roleSeats.join(', '), kras: 0, lines: mine.length, purpose: typeof entry?.purpose === 'string' ? entry.purpose.trim() : '', basis: norm(entry?.purposeBasis) };
+    roleRows.push(roleRow);
+    if (!mine.length) { empty.push({ role: r.title, seats: roleSeats.join(', ') }); continue; }
     const where = new Map();                  // k|line -> index of the KRA in the entry
     (entry?.kras ?? []).forEach((k, i) => {
       for (const t of (k.responsibilities ?? [])) if (!where.has(`R|${normKey(t)}`)) where.set(`R|${normKey(t)}`, i);
@@ -165,6 +184,7 @@ async function exportWorkbook() {
       // importer does not create it either. It is listed on the About sheet.
       if (!b.rows.length) continue;
       no++;
+      roleRow.kras = no;
       summary.push({ role: r.title, seats: roleSeats.join(', '), no, kra: b.name, resp: b.rows.filter((x) => x.k === 'R').length, kpi: b.rows.filter((x) => x.k === 'K').length });
       // Responsibilities first, then KPIs, each in the role's own order.
       for (const l of [...b.rows.filter((x) => x.k === 'R'), ...b.rows.filter((x) => x.k === 'K')]) lines.push({ role: r.title, kra: b.name, kind: l.kind, text: l.text, target: l.target });
@@ -205,17 +225,19 @@ async function exportWorkbook() {
     ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: Math.max(1, ws.rowCount), column: cols.length } };
     return ws;
   };
+  sheet(ROLES, ROLE_COLS, roleRows);
   sheet(SUMMARY, SUMMARY_COLS, summary);
   sheet(LINES, LINE_COLS, lines);
 
   const about = wb.addWorksheet(ABOUT);
   about.columns = [{ width: 26 }, { width: 110 }];
   const aboutRows = [
-    ['What this is', `The key result areas (KRAs) drafted for each role of ${company.name}, and the responsibilities and KPIs grouped under them. Review it and send it back; your changes are read from the two amber columns.`],
-    ['To move a line', 'On the Lines sheet, type the KRA it should sit under in "Move to KRA". Use the name of another KRA of the same role (see the Summary sheet), or type a new name to create a KRA for that role.'],
-    ['To rename a KRA', 'On the Summary sheet, type the new name in "Rename KRA to". It renames that KRA for that role only. Renaming onto a name the role already has merges the two.'],
+    ['What this is', `The one-sentence purpose and the key result areas (KRAs) drafted for each role of ${company.name}, and the responsibilities and KPIs grouped under the KRAs. Review it and send it back; your changes are read from the amber columns.`],
+    ['To change a purpose', 'On the Roles sheet, type the sentence you want in "Change purpose to". One sentence saying why the role exists; it opens the job description. "Basis" says what the draft was written from: "duties" (the role\'s own duties and KRAs) or "title only" (the chart gives the role no duties, so the sentence rests on its title, department and reporting line — read these with extra care).'],
+    ['To move a line', 'On the Lines sheet, type the KRA it should sit under in "Move to KRA". Use the name of another KRA of the same role (see the KRAs sheet), or type a new name to create a KRA for that role.'],
+    ['To rename a KRA', 'On the KRAs sheet, type the new name in "Rename KRA to". It renames that KRA for that role only. Renaming onto a name the role already has merges the two.'],
     ['Comments', 'Write anything in "Comment". Comments are read back and listed, not stored.'],
-    ['Please do not edit', 'Role, KRA, Kind, Text and Target. This review only groups: no responsibility or KPI is reworded, merged or dropped here. A changed text is skipped.'],
+    ['Please do not edit', 'Role, Seats, Purpose, Basis, KRA, Kind, Text and Target. This review only groups: no responsibility or KPI is reworded, merged or dropped here. A changed text is skipped.'],
     ['KRAs are per role', 'Two roles may both have a KRA called "Quality"; they are unrelated. Renaming one does not rename the other.'],
     ['Roles', `${new Set(summary.map((s) => s.role)).size} with duties, ${summary.filter((s) => s.kra !== NO_KRA).length} KRAs, ${lines.length} lines (${ungrouped} not yet under a KRA).`],
     ['Roles with no duties', empty.length ? `${empty.length} roles have no responsibilities or KPIs in the chart and so no KRAs: ${empty.map((e) => e.role).join(', ')}.` : 'None.'],
@@ -232,6 +254,7 @@ async function exportWorkbook() {
   await wb.xlsx.writeFile(out);
   console.log(`  wrote ${out}`);
   console.log(`  ${new Set(summary.map((s) => s.role)).size} roles, ${summary.filter((s) => s.kra !== NO_KRA).length} KRAs, ${lines.length} lines (${ungrouped} ungrouped), ${empty.length} roles without duties`);
+  console.log(`  ${roleRows.length} roles on the Roles sheet, ${roleRows.filter((x) => x.purpose).length} with a purpose (${roleRows.filter((x) => x.basis === 'title only').length} from the title only)`);
   console.log(`  made from ${kf.fileName} sha256 ${kf.hash.slice(0, 12)}…`);
 }
 
@@ -243,10 +266,11 @@ async function applyWorkbook() {
   const APPLY = has('apply');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(wbPath);
+  const wsR = wb.getWorksheet(ROLES);
   const wsS = wb.getWorksheet(SUMMARY);
   const wsL = wb.getWorksheet(LINES);
   const wsA = wb.getWorksheet(ABOUT);
-  if (!wsS || !wsL) throw new Error(`${wbPath} is not a KRA review workbook: it needs the sheets "${SUMMARY}" and "${LINES}".`);
+  if (!wsR || !wsS || !wsL) throw new Error(`${wbPath} is not a KRA review workbook of the current layout: it needs the sheets "${ROLES}", "${SUMMARY}" and "${LINES}". Export a fresh one.`);
 
   // Columns by HEADER, so a reviewer who reorders or inserts a column breaks nothing.
   const table = (ws, cols) => {
@@ -262,6 +286,7 @@ async function applyWorkbook() {
     }
     return rows;
   };
+  const rRows = table(wsR, ROLE_COLS);
   const sRows = table(wsS, SUMMARY_COLS);
   const lRows = table(wsL, LINE_COLS);
 
@@ -276,7 +301,7 @@ async function applyWorkbook() {
 
   const data = JSON.parse(kf.text);
   const entryOf = new Map(data.roles.map((e) => [normKey(e.role), e]));
-  const seatsOf = new Map(sRows.map((s) => [normKey(s.role), s.seats.split(',').map(norm).filter(Boolean)]));
+  const seatsOf = new Map([...sRows, ...rRows].map((s) => [normKey(s.role), s.seats.split(',').map(norm).filter(Boolean)]));
   const kraOf = (entry, name) => (entry.kras ?? []).find((k) => normKey(k.name) === normKey(name)) ?? null;
   const listOf = (kra, kind) => { const key = kind === 'KPI' ? 'kpis' : 'responsibilities'; if (!Array.isArray(kra[key])) kra[key] = []; return kra[key]; };
   const findLine = (entry, kind, text) => {
@@ -288,7 +313,24 @@ async function applyWorkbook() {
     return null;
   };
 
-  const changes = { moves: [], placed: [], newKras: [], renames: [], merges: [], removed: [], skipped: [], comments: [] };
+  const changes = { purposes: [], moves: [], placed: [], newKras: [], renames: [], merges: [], removed: [], skipped: [], comments: [] };
+
+  // ---- 0. purposes -------------------------------------------------------
+  for (const r of rRows) {
+    if (r.comment) changes.comments.push(`Roles row ${r.row} — ${r.role}: ${r.comment}`);
+    if (!r.change) continue;
+    let entry = entryOf.get(normKey(r.role));
+    if (!entry) {
+      entry = { role: r.role, seats: seatsOf.get(normKey(r.role)) ?? [], kras: [] };
+      data.roles.push(entry);
+      entryOf.set(normKey(r.role), entry);
+    }
+    if ((entry.purpose ?? '').trim() === r.change) continue;
+    changes.purposes.push(`${entry.role}: "${entry.purpose ?? '(none)'}"  ->  "${r.change}"`);
+    entry.purpose = r.change;
+    // A person wrote this one, so it no longer rests on the draft's basis.
+    entry.purposeBasis = 'reviewed';
+  }
   // Renames asked for, by role: old name -> new name. Read before the moves so
   // a "Move to KRA" may use either the old or the new name of a renamed KRA.
   const renameOf = new Map();
@@ -366,9 +408,10 @@ async function applyWorkbook() {
     entry.kras = keep;
   }
 
-  const total = changes.moves.length + changes.placed.length + changes.renames.length + changes.merges.length;
+  const total = changes.purposes.length + changes.moves.length + changes.placed.length + changes.renames.length + changes.merges.length;
   const say = (title, list) => { if (list.length) { console.log(`\n  ${title} (${list.length})`); list.forEach((x) => console.log(`    ${x}`)); } };
   console.log(`\n  ${APPLY ? 'APPLYING' : 'DRY RUN — nothing written'}: ${wbPath} -> ${kf.file}`);
+  say('Purpose changed', changes.purposes);
   say('Moved to another KRA', changes.moves);
   say('Placed under a KRA (was ungrouped)', changes.placed);
   say('New KRAs', changes.newKras);
@@ -383,7 +426,7 @@ async function applyWorkbook() {
   data.history = Array.isArray(data.history) ? data.history : [];
   data.history.push({
     on: new Date().toISOString().slice(0, 10), by: 'kra-review.mjs apply', workbook: path.basename(wbPath),
-    moved: changes.moves.length, placed: changes.placed.length, newKras: changes.newKras.length,
+    purposes: changes.purposes.length, moved: changes.moves.length, placed: changes.placed.length, newKras: changes.newKras.length,
     renamed: changes.renames.length, merged: changes.merges.length, removedEmpty: changes.removed.length,
   });
   fs.copyFileSync(kf.file, `${kf.file}.bak`);
