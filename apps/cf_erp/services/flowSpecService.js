@@ -14,16 +14,19 @@
  * rule makes it required.
  *
  * Kept right afterwards (syncRecordsUsingFlows / syncRecordsUsingOperation): choosing a flow, a flow's
- * steps changing, and an operation's formula changing all run it again for the records concerned. A
- * flow-made rule no longer needed is removed only when nobody filled it in (the record, or for a
- * definition every item made from it) — a typed value is never lost.
+ * steps changing, an operation's formula changing and a chart's inputs changing all run it again for
+ * the records concerned. A flow-made rule no longer needed is REMOVED — the smallest set to fill
+ * (user, 2026-10-10: "values that are not required are retiring and values that are required are
+ * coming up"); a value typed for it stays stored, it is only no longer asked for.
  *
- * Which flow is a record's:
- *   definition       its default flow
+ * Which flow is a record's (user, same day: "the temp item field list should be based on the flow
+ * it is attached to … this list should get fixed once we freeze"):
+ *   definition       its default flow — its rules are ITS OWN and do not reach the rows made from it
+ *                    (resolutionService.loadRules drops an inherited flow-made rule)
  *   catalog item     its default flow
- *   temporary item   its OWN default flow, or the flow its BOM line names — only when it differs from
- *                    its definition's (the definition's rules already reach it). Frozen / released lines
- *                    are left alone.
+ *   temporary item   the flow its BOM line names, else its own (stamped when the row was made —
+ *                    instantiationService). Every row carries its own flow's rules. A row of a FROZEN
+ *                    (locked) or released line is left alone: its list is the one it had at freeze.
  * All set-based: a fixed number of queries whatever the number of records.
  */
 import { parseFormula } from './formulaEngine.js';
@@ -57,7 +60,7 @@ export async function neededCodesOfFlows(db, companyId, flowIds) {
 }
 
 /** The flow each record runs by (see the header), and whether it may be touched. */
-async function flowsOf(db, companyId, ids) {
+async function flowsOf(db, companyId, ids, { includeLocked = false } = {}) {
   // A row of a frozen (locked) or released line is fixed — its rules are not touched.
   const [rows] = await db.query(
     `SELECT m.id, m.record_kind, m.default_flow_id, i.item_type, d.default_flow_id AS def_flow,
@@ -75,10 +78,8 @@ async function flowsOf(db, companyId, ids) {
     let flow = null;
     if (r.record_kind === 'definition') flow = r.default_flow_id;
     else if (r.item_type === 'temporary') {
-      if (Number(r.locked)) continue;
-      const own = r.line_flow ?? r.default_flow_id;
-      flow = own != null && Number(own) !== Number(r.def_flow ?? 0) ? own : null;
-      if (flow == null) { out.set(Number(r.id), { flow: null, temporaryOnDefinition: true }); continue; }
+      if (Number(r.locked) && !includeLocked) continue;
+      flow = r.line_flow ?? r.default_flow_id;
     } else flow = r.default_flow_id;
     out.set(Number(r.id), { flow: flow == null ? null : Number(flow) });
   }
@@ -89,12 +90,13 @@ async function flowsOf(db, companyId, ids) {
  * Bring records' flow-made rules in line with their flows. Returns
  * { added: [{ recordId, code }], removed: [...], kept: [{ recordId, code, why }], unknown: [code] }.
  */
-export async function syncFlowSpecs(db, c, recordIds) {
+export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
   const { companyId } = c;
   const ids = [...new Set(recordIds.map(Number).filter(Boolean))];
   const result = { added: [], removed: [], kept: [], unknown: [] };
   if (!ids.length) return result;
-  const flows = await flowsOf(db, companyId, ids);
+  // opts.includeLocked: only for the one-time migration that gives every frozen row the list it has today.
+  const flows = await flowsOf(db, companyId, ids, opts);
   const flowIds = [...new Set([...flows.values()].map((f) => f.flow).filter((f) => f != null))];
   const needOf = await neededCodesOfFlows(db, companyId, flowIds);
 
@@ -130,7 +132,7 @@ export async function syncFlowSpecs(db, c, recordIds) {
   const adds = [];
   for (const id of ids) {
     const f = flows.get(id);
-    if (!f || f.temporaryOnDefinition) continue;
+    if (!f) continue;
     const need = f.flow != null ? needOf.get(f.flow) ?? new Set() : new Set();
     for (const code of need) {
       if (!specOf.has(code) || ownFlowRule.has(`${id}:${code}`)) continue;
@@ -154,7 +156,7 @@ export async function syncFlowSpecs(db, c, recordIds) {
       ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'origin', 'created_by'], adds);
   }
 
-  // Flow-made rules no longer needed: removed unless somebody filled them in.
+  // Flow-made rules no longer needed are removed; a value typed for one stays stored.
   const stale = mine.filter((r) => {
     const f = flows.get(Number(r.subject_id));
     if (!f) return false;
@@ -162,23 +164,8 @@ export async function syncFlowSpecs(db, c, recordIds) {
     return !need.has(r.code);
   });
   if (stale.length) {
-    const subjects = [...new Set(stale.map((r) => Number(r.subject_id)))];
-    const [filled] = await db.query(
-      `SELECT DISTINCT v.specification_id, COALESCE(i.source_definition_id, v.subject_id) AS owner, v.subject_id
-         FROM cf_spec_values v
-         LEFT JOIN cf_item_details i ON i.master_id = v.subject_id AND i.deleted_at IS NULL AND i.source_definition_id IN (?)
-        WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL
-          AND (v.subject_id IN (?) OR i.source_definition_id IN (?))
-          AND (v.value_number IS NOT NULL OR v.value_text IS NOT NULL OR v.value_bool IS NOT NULL OR v.value_date IS NOT NULL OR v.option_id IS NOT NULL)`,
-      [subjects, companyId, subjects, subjects],
-    );
-    const hasValue = new Set(filled.map((r) => `${r.owner}:${r.specification_id}`).concat(filled.map((r) => `${r.subject_id}:${r.specification_id}`)));
-    const drop = [];
-    for (const r of stale) {
-      if (hasValue.has(`${r.subject_id}:${r.spec_id}`)) result.kept.push({ recordId: Number(r.subject_id), code: r.code, why: 'its flow no longer reads it, but it holds values' });
-      else { drop.push(r.id); result.removed.push({ recordId: Number(r.subject_id), code: r.code }); }
-    }
-    if (drop.length) await db.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, drop]);
+    for (const r of stale) result.removed.push({ recordId: Number(r.subject_id), code: r.code });
+    await db.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, stale.map((r) => r.id)]);
   }
   return result;
 }

@@ -121,7 +121,7 @@ export async function snapshotSubtrees(db, companyId, rootIds, copies) {
       snap.values.get(v.subject_id).push(v);
     }
     const [rules] = await db.query(
-      `SELECT id, specification_id, subject_id, capture_at, is_required, is_applicable, value_rule, formula_id, sort_order
+      `SELECT id, specification_id, subject_id, capture_at, is_required, is_applicable, value_rule, formula_id, sort_order, origin
          FROM cf_spec_assignments
         WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL`,
       [companyId, part],
@@ -303,8 +303,8 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
   const rules = srcIds.flatMap((id) => (snap.rules.get(id) ?? []).map((r) => ({ ...r, subject_id: idMap.get(id) })));
   if (rules.length) {
     await insertRows(db, 'cf_spec_assignments',
-      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'formula_id', 'sort_order', 'created_by'],
-      rules.map((r) => [companyId, r.specification_id, 'master', r.subject_id, r.capture_at, r.is_required, r.is_applicable, r.value_rule, r.formula_id, r.sort_order, c.userId]), rows);
+      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'formula_id', 'sort_order', 'origin', 'created_by'],
+      rules.map((r) => [companyId, r.specification_id, 'master', r.subject_id, r.capture_at, r.is_required, r.is_applicable, r.value_rule, r.formula_id, r.sort_order, r.origin ?? 'manual', c.userId]), rows);
     const withOptions = rules.filter((r) => snap.ruleOptions.has(r.id));
     if (withOptions.length) {
       const ruleId = new Map();

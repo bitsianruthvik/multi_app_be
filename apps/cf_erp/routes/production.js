@@ -35,6 +35,10 @@
  *   POST   /flows/:id/status             { status }  draft → active → obsolete
  *   POST   /flows/:id/revise             { revision? }
  *   DELETE /flows/:id
+ *   PUT    /flows/:id/steps              { steps: [{ id?, operationId, stepName?, notes?, group?, waits? }], dryRun? }
+ *                                        The WHOLE list in order, in one save: new steps added, missing ones
+ *                                        removed, numbers rewritten 10, 20, 30 …, waits matched, records
+ *                                        re-synced once. What the flow page's edit mode sends (applyFlowChanges).
  *   POST   /flow-steps/:id/move          { direction: 'up' | 'down' } — renumbers in 10s
  *   POST   /flows/:id/steps              { operationId, sequence?, stepName?, notes? }
  *                                        A flow MAY repeat an operation — welded, crane-turned,
@@ -72,7 +76,7 @@ import {
 } from '../services/operationService.js';
 import {
   listFlows, getFlow, createFlow, updateFlow, setFlowStatus, reviseFlow, deleteFlow,
-  addStep, updateStep, replaceStepOperation, moveStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow,
+  addStep, updateStep, replaceStepOperation, moveStep, removeStep, addWaitRule, removeWaitRule, getCutPlateFlow, setCutPlateFlow, applyFlowChanges,
 } from '../services/flowService.js';
 import {
   listShifts, createShift, updateShift, deleteShift, copyShifts, listExceptions, createException, deleteException, machineCalendar,
@@ -148,6 +152,7 @@ router.post('/flows/:id/status', manage, handle((req) => tx(req, (db, c) => setF
 router.post('/flows/:id/revise', manage, handle((req) => tx(req, (db, c) => reviseFlow(db, c, id(req), req.body ?? {}))));
 router.delete('/flows/:id', manage, handle((req) => tx(req, (db, c) => deleteFlow(db, c, id(req)))));
 router.post('/flows/:id/steps', manage, handle((req) => tx(req, (db, c) => addStep(db, c, id(req), req.body ?? {}))));
+router.put('/flows/:id/steps', manage, handle((req) => tx(req, (db, c) => applyFlowChanges(db, c, id(req), req.body ?? {}))));
 router.put('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => updateStep(db, c, id(req), req.body ?? {}))));
 router.post('/flow-steps/:id/replace', manage, handle((req) => tx(req, (db, c) => replaceStepOperation(db, c, id(req), req.body ?? {}))));
 router.post('/flow-steps/:id/move', manage, handle((req) => tx(req, (db, c) => moveStep(db, c, id(req), req.body ?? {}))));

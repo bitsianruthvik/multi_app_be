@@ -99,9 +99,9 @@ export async function builderContext(db, companyId, operationId, q = {}) {
     flowIds.length
       ? db.query(`${pieceSql}
           WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item'
-            AND (m.default_flow_id IN (?) OR def.default_flow_id IN (?)
+            AND (m.default_flow_id IN (?)
                  OR m.id IN (SELECT l.child_id FROM cf_bom_lines l WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.operation_flow_id IN (?)))
-          ORDER BY m.id DESC LIMIT ${MAX_PIECES}`, [companyId, flowIds, flowIds, companyId, flowIds])
+          ORDER BY m.id DESC LIMIT ${MAX_PIECES}`, [companyId, flowIds, companyId, flowIds])
       : [[]],
   ]);
   let samplePieces = pieces.map((p) => ({ ...p, fromOperation: true }));

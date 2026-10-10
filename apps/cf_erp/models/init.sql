@@ -4940,3 +4940,46 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_wait_rules' AND COLUMN_NAME = 'relation' AND COLUMN_TYPE LIKE '%descendants%');
 SET @sql = IF(@has = 0, "ALTER TABLE cf_step_wait_rules MODIFY relation ENUM('parent','children','siblings','ancestor','descendants') NOT NULL", 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §54  Parallel lanes in a flow (2026-10-10)
+-- ============================================================================
+-- A flow is no longer only a list by sequence number: a step records which steps
+-- it STARTS AFTER (cf_flow_step_links) and the LANE it is drawn in, so two
+-- stretches of work can run side by side and meet again. cf_operation_flows.linked
+-- = 1 once the flow page has saved the flow (flowService.applyFlowChanges); a flow
+-- with linked = 0 is a legacy one and is still read by the old rule: every step
+-- waits for all the steps of the sequence number before it. `sequence` stays the
+-- display and tracker order — on a linked flow it is the ROW the step sits in.
+-- Two statements per table: TiDB refuses an index on a column added in the same ALTER.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME = 'linked');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flows ADD COLUMN linked TINYINT NOT NULL DEFAULT 0 AFTER status', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flow_steps' AND COLUMN_NAME = 'lane');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flow_steps ADD COLUMN lane INT NOT NULL DEFAULT 0 AFTER sequence', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+CREATE TABLE IF NOT EXISTS cf_flow_step_links (
+  id             INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT        NOT NULL,
+  flow_id        INT        NOT NULL,
+  step_id        INT        NOT NULL,
+  after_step_id  INT        NOT NULL,
+
+  deleted_at     DATETIME   DEFAULT NULL,
+  created_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT        NULL,
+
+  is_live        TINYINT    GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cfsl_tenant (company_id, id),
+  UNIQUE KEY uq_cfsl_link   (company_id, step_id, after_step_id, is_live),
+  KEY idx_cfsl_flow  (company_id, flow_id),
+  KEY idx_cfsl_after (company_id, after_step_id),
+
+  CONSTRAINT fk_cfsl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cfsl_flow    FOREIGN KEY (company_id, flow_id)       REFERENCES cf_operation_flows(company_id, id),
+  CONSTRAINT fk_cfsl_step    FOREIGN KEY (company_id, step_id)       REFERENCES cf_operation_flow_steps(company_id, id),
+  CONSTRAINT fk_cfsl_after   FOREIGN KEY (company_id, after_step_id) REFERENCES cf_operation_flow_steps(company_id, id),
+  CONSTRAINT fk_cfsl_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);

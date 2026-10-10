@@ -100,6 +100,7 @@ import { generate } from '../modules/codegen/index.js';
 import { refreshValues } from './valueService.js';
 import { autofillLineSelections } from './selectionService.js';
 import { cutPlaces, problemsOf } from '../lib/cutPlaces.js';
+import { syncFlowSpecs } from './flowSpecService.js';
 import {
   resolveCodes, sectionSteelOf, profileKeyOf, profileLabelOf, CUT_FROM_CODE, CUT_FROM_VALUES, STEEL_FROM_STOCK,
 } from '../lib/cutFrom.js';
@@ -1852,6 +1853,11 @@ async function deriveOpened(db, c, { line, flowId, places, selection, state }, p
   const p = plan ?? await planFor(db, c.companyId, { line, state, selection, places });
   const changed = writes(p);
   const removed = changed ? await applyPlan(db, c, { line, places, selection, flowId, state, plan: p }) : [];
+  // A cut piece is an order row like any other: the values its own flow reads are its rules (flowSpecService).
+  if (changed) {
+    const [rows] = await db.query("SELECT master_id FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND item_type = 'temporary' AND source_definition_id IS NULL AND deleted_at IS NULL", [c.companyId, line.id]);
+    if (rows.length) await syncFlowSpecs(db, c, rows.map((x) => x.master_id));
+  }
   const methods = methodsOf(places, selection);
   const filled = await fillBlankGaps(db, c, methods.plate, p.plate) + await fillBlankGaps(db, c, methods.section, p.section);
   const out = p.groups.map(describeGroup);
@@ -2385,11 +2391,14 @@ export async function setCutPlateFlows(db, c, lineId, input = {}) {
       sections.count = r.affectedRows;
     }
   }
-  if (!plateBlanks.length) return { count: 0, total: 0, flowId, sections };
+  // Given a flow, a cut piece asks for what that flow reads.
+  const follow = async () => { const ids = [...sectionBlanks, ...plateBlanks].map((cp) => cp.id); if (ids.length) await syncFlowSpecs(db, c, ids); };
+  if (!plateBlanks.length) { await follow(); return { count: 0, total: 0, flowId, sections }; }
   const [r] = await db.query(
     'UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL',
     [flowId, c.companyId, plateBlanks.map((cp) => cp.id)],
   );
+  await follow();
   return { count: r.affectedRows, total: plateBlanks.length, flowId, sections };
 }
 

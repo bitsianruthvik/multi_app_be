@@ -18,8 +18,11 @@
  *   POST   /definitions                { definitionType, classificationId, name?, code?, selectionMode?, candidateClassificationId?, status?, values? }
  *   GET    /records/:id                + cutFrom { value, source, from }, cutStock { own, effective (+ steel), from } (items, templates)
  *   GET    /records/:id/specs          every rule that reaches it, with values and where they came from
+ *   GET    /records/:id/value-reasons  WHY each value is asked: its flow reads it (which operations), set by hand (where, and
+ *                                      whether anything in its flow reads it), or worked out; + what it holds that is no
+ *                                      longer asked for (services/valueReasonService.js)
  *   GET    /records/:id/history        value history
- *   GET    /records/:id/prices         { itemId, currency, listPrice, priceBasis, listUnitPrice, lastPurchasePrice, lastPurchaseDate,
+ *   GET    /records/:id/prices        { itemId, currency, listPrice, priceBasis, listUnitPrice, lastPurchasePrice, lastPurchaseDate,
  *                                        lastPurchaseOrder{id,code}|null, lastPurchaseSupplier{id,name}|null } — net of tax (init.sql §36)
  *   PUT    /records/:id                name, description, code (draft only), classification, uom, tracking, selection fields,
  *                                      listPrice (null clears) + priceBasis unit|kg|tonne|metre — catalog items only;
@@ -59,6 +62,7 @@ import { createCatalogNode } from '../services/classificationService.js';
 import { addCatalogOption } from '../services/specificationService.js';
 import { withCutPieces, ownerLineOf } from '../services/cutPlateService.js';
 import { itemPrices } from '../services/priceService.js';
+import { getValueReasons } from '../services/valueReasonService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -97,7 +101,8 @@ router.post('/definitions', guard(PERM.catalog), handle((req) => tx(req, (db, c)
 
 router.get('/records/:id', guard(PERM.view), handle((req) => getRecord(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/specs', guard(PERM.view), handle((req) => getRecordSpecs(pool, ctx(req).companyId, id(req))));
-router.get('/records/:id/prices', guard(PERM.view), handle((req) => itemPrices(pool, ctx(req).companyId, id(req))));
+router.get('/records/:id/value-reasons', guard(PERM.view), handle((req) => getValueReasons(pool, ctx(req).companyId, id(req))));
+router.get('/records/:id/prices',guard(PERM.view), handle((req) => itemPrices(pool, ctx(req).companyId, id(req))));
 router.get('/records/:id/history', guard(PERM.view), handle((req) => getHistory(pool, ctx(req).companyId, 'master', id(req), req.query.limit)));
 router.put('/records/:id', guard(PERM.catalog), handle((req) => tx(req, async (db, c) => {
   const out = await updateRecord(db, c, id(req), req.body);

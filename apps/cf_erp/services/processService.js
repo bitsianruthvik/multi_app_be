@@ -1166,7 +1166,7 @@ async function missingRequiredValues(db, companyId, chains) {
   if (!chains.size) return perItem;
   const assignments = await loadSubjectRows(db, companyId, {
     table: 'cf_spec_assignments',
-    columns: 't.subject_type, t.subject_id, t.specification_id, t.is_required, t.is_applicable, t.value_rule, sp.code AS spec_code, sp.name AS spec_name, sp.data_type',
+    columns: 't.subject_type, t.subject_id, t.specification_id, t.is_required, t.is_applicable, t.value_rule, t.origin, sp.code AS spec_code, sp.name AS spec_name, sp.data_type',
     join: 'JOIN cf_specifications sp ON sp.id = t.specification_id AND sp.deleted_at IS NULL',
     where: "t.capture_at = 'item'",
     chains,
@@ -1195,9 +1195,10 @@ async function missingRequiredValues(db, companyId, chains) {
     // Most specific wins, whole: walk broad → narrow and let the later rule
     // replace the earlier one, exactly as `resolve` does with its sorted list.
     const won = new Map();
-    for (const s of subjects) for (const a of rulesAt.get(`${s.type}:${s.id}`) ?? []) won.set(a.specification_id, a);
-
     const self = subjects[subjects.length - 1];
+    // A flow-made rule is its own record's only (resolutionService.loadRules).
+    for (const s of subjects) for (const a of rulesAt.get(`${s.type}:${s.id}`) ?? []) if (a.origin !== 'flow' || s === self) won.set(a.specification_id, a);
+
     const above = subjects.slice(0, -1);
     const entry = perItem.get(itemId);
     for (const a of won.values()) {

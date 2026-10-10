@@ -207,6 +207,39 @@ export async function listTimingRules(db, companyId, operationId) {
   });
 }
 
+/**
+ * The times a flow step card shows, for many operations at once: each one's MAIN rule (mainRuleOf),
+ * its two times with the short `display` form, who the rule is for and how many rules there are.
+ * Two round trips whatever the number of operations. Map operationId -> time; an operation with no
+ * rule is simply absent (see NO_TIME).
+ *   { setup: { minutes, expression, display, formula }, work: {…}, ruleId, subject, eligible, rules }
+ */
+export async function mainTimesOf(db, companyId, operationIds) {
+  const ids = [...new Set(operationIds.map(Number))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const [rows] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.operation_id IN (?) AND r.deleted_at IS NULL ORDER BY r.operation_id, r.id`, [companyId, ids]);
+  if (!rows.length) return out;
+  const bindings = await chartBindings(db, companyId);
+  const byOp = new Map();
+  for (const r of rows) { if (!byOp.has(r.operation_id)) byOp.set(r.operation_id, []); byOp.get(r.operation_id).push(r); }
+  const time = (t) => (t
+    ? { minutes: t.minutes ?? null, expression: t.expression ?? null, display: t.expression != null ? contractCharts(t.expression, bindings) : null, formula: t.formula ?? null }
+    : { ...NO_TIME.setup });
+  for (const [operationId, rules] of byOp) {
+    const main = mainRuleOf(rules);
+    out.set(Number(operationId), { setup: time(main.setup), work: time(main.work), ruleId: main.id, subject: main.subject, eligible: main.eligible, rules: rules.length });
+  }
+  return out;
+}
+
+/** What mainTimesOf's caller shows for an operation that has no rule yet. */
+export const NO_TIME = Object.freeze({
+  setup: Object.freeze({ minutes: null, expression: null, display: null, formula: null }),
+  work: Object.freeze({ minutes: null, expression: null, display: null, formula: null }),
+  ruleId: null, subject: null, eligible: null, rules: 0,
+});
+
 /** A timing formula reads item. and machine. values; a constant expression works too. */
 async function readTimingFormula(db, companyId, raw, label, problems) {
   if (blank(raw)) return null;

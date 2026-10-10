@@ -124,7 +124,7 @@ async function loadAssignment(db, companyId, orderId, lineId, { lock = false } =
       WHERE m.company_id = ? AND m.id = ?`,
     [companyId, bomLineIds.length ? bomLineIds : [0], companyId, line.item_id ?? 0],
   );
-  const flowOf = new Map(flowRows.map((r) => [r.bom_line_id ?? 0, r.operation_flow_id ?? r.child_flow_id ?? r.def_flow_id ?? null]));
+  const flowOf = new Map(flowRows.map((r) => [r.bom_line_id ?? 0, r.operation_flow_id ?? r.child_flow_id ?? null]));
   const steps = await flowSteps(db, companyId, [...new Set([...flowOf.values()].filter(Boolean))]);
   const opsOfFlowId = new Map([...steps].map(([id, s]) => [id, opsOfFlow(s)]));
   for (const p of pieces) {

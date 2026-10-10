@@ -29,6 +29,7 @@ import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { bomOfParent, bomsOfParents, linesOfBoms, childKindOf } from './bomGraph.js';
 import { materializeLineRecords } from './orderValuesService.js';
 import { nameNewItems } from './codeRangeService.js';
+import { syncFlowSpecs } from './flowSpecService.js';
 
 const MAX_DEPTH = 20;
 
@@ -163,8 +164,10 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const marker = (i) => `~tpl~${token}~${i}`;
   await insertRows(db, 'cf_master_records',
-    ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'created_by'],
-    order.map((n, i) => [companyId, 'item', marker(i), '(pending)', null, null, n.def.classification_id, 'draft', null, c.userId]));
+    // default_flow_id: the row takes its definition's flow NOW and keeps it (user, 2026-10-10) — a later
+    // change of the definition's flow reaches new orders only.
+    ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'default_flow_id', 'created_by'],
+    order.map((n, i) => [companyId, 'item', marker(i), '(pending)', null, null, n.def.classification_id, 'draft', null, n.def.default_flow_id ?? null, c.userId]));
   const [back] = await db.query('SELECT id, code FROM cf_master_records WHERE company_id = ? AND code LIKE ?', [companyId, `~tpl~${token}~%`]);
   const idOf = new Map(back.map((r) => [r.code, r.id]));
   order.forEach((n, i) => { n.id = idOf.get(marker(i)); });
@@ -225,6 +228,8 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
 
   // ---- 6. values, then names and codes — a code may print a value ----------
   const created = order.map((n) => n.id);
+  // The values each row's own flow reads become its rules (flowSpecService) before the values settle.
+  await syncFlowSpecs(db, c, created);
   await materializeLineRecords(db, c, ownerLineId, created);
   await nameNewItems(db, c, {
     rootId: root.id,

@@ -24,6 +24,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { ancestors, loadNode, LEVELS } from './tree.js';
 import { requireMachine } from './records.js';
 import { setValues } from './valueService.js';
+import { syncRecordsUsingOperation } from './flowSpecService.js';
 
 const MODES = ['step_up', 'linear'];
 const LEVEL_KEYS = LEVELS.map((l) => l.toUpperCase());          // FAMILY, SUBFAMILY, VARIANT
@@ -374,7 +375,10 @@ export async function updateChart(db, c, specId, input = {}) {
   sets.table_config = JSON.stringify(cfg);
   await db.query(`UPDATE cf_specifications SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`, [...Object.values(sets), companyId, s.id]);
   for (const v of relaid ?? []) await db.query('UPDATE cf_spec_values SET value_json = ? WHERE company_id = ? AND id = ?', [JSON.stringify({ rows: v.rows }), companyId, v.id]);
-  if (refsChanged) await rewriteTimes(db, companyId, s.code, oldAxes, cfg.axes);
+  if (refsChanged) {
+    // The times read other values of the piece now: every record whose flow holds such an operation is re-checked.
+    for (const operationId of await rewriteTimes(db, companyId, s.code, oldAxes, cfg.axes)) await syncRecordsUsingOperation(db, c, operationId);
+  }
   return chartSpec(await specRow(db, companyId, s.id), await fieldsOf(db, companyId));
 }
 
@@ -393,13 +397,15 @@ async function rewriteTimes(db, companyId, code, oldAxes, newAxes) {
     return args.length === oldArgs.length && new Set(args).size === args.length && oldArgs.every((x) => args.includes(x)) ? `LOOKUP(machine.${code}, ${newArgs})` : whole;
   }));
   const like = `%machine.${code}%`;
-  const [rules] = await db.query('SELECT id, work_expression AS w, setup_expression AS s FROM cf_operation_machine_rules WHERE company_id = ? AND deleted_at IS NULL AND (work_expression LIKE ? OR setup_expression LIKE ?)', [companyId, like, like]);
+  const [rules] = await db.query('SELECT id, operation_id, work_expression AS w, setup_expression AS s FROM cf_operation_machine_rules WHERE company_id = ? AND deleted_at IS NULL AND (work_expression LIKE ? OR setup_expression LIKE ?)', [companyId, like, like]);
+  const touched = new Set();
   for (const r of rules) {
     const w = swap(r.w); const st = swap(r.s);
-    if (w !== r.w || st !== r.s) await db.query('UPDATE cf_operation_machine_rules SET work_expression = ?, setup_expression = ? WHERE company_id = ? AND id = ?', [w, st, companyId, r.id]);
+    if (w !== r.w || st !== r.s) { await db.query('UPDATE cf_operation_machine_rules SET work_expression = ?, setup_expression = ? WHERE company_id = ? AND id = ?', [w, st, companyId, r.id]); touched.add(Number(r.operation_id)); }
   }
   const [forms] = await db.query('SELECT id, expression FROM cf_formulas WHERE company_id = ? AND deleted_at IS NULL AND expression LIKE ?', [companyId, like]);
   for (const f of forms) { const e = swap(f.expression); if (e !== f.expression) await db.query('UPDATE cf_formulas SET expression = ? WHERE company_id = ? AND id = ?', [e, companyId, f.id]); }
+  return [...touched];
 }
 
 /**

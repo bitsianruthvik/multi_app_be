@@ -778,7 +778,8 @@ try {
   ok('more than twice the rows, the same round trips', small.tally.n === big.tally.n && (await rowsOf(G3.lines[0].id)) > 2 * (await rowsOf(G1.lines[0].id)), `${small.tally.n} vs ${big.tally.n}`);
   // Most of it is making the line's cut pieces from scratch (cutPlateService's
   // own bulk derive, ~44 on the KEPL line); the copy itself is ~30 statements.
-  ok('and under a hundred for a line, not one a row', small.tally.n <= 100, String(small.tally.n));
+  // 110 since 2026-10-10: the cut pieces a revision derives also take the values their own flow reads (a fixed handful of reads, not one a row).
+  ok('and about a hundred for a line, not one a row', small.tally.n <= 110, String(small.tally.n));
 
   await conn.rollback();
   console.log('\nrolled back.');

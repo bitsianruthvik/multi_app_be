@@ -7,6 +7,7 @@
  *     dryRun?: boolean,
  *     changes: [ { op: 'quantity', lineId, quantity }
  *              | { op: 'flow',     lineId, flowId }            (null clears it)
+ *              | { op: 'ownFlow',  recordId, flowId }          (the ROW'S OWN flow; null = none)
  *              | { op: 'remove',   lineId }
  *              | { op: 'paste',    sourceLineId, parentId, afterLineId?, quantity? } ] }
  *   -> { applied, dryRun, summary: { sentence, counts }, results }
@@ -84,6 +85,19 @@
  * rectangle does take its cut plate, and the nesting stage then says the layout
  * is out of date.
  *
+ * A ROW'S OWN FLOW (ownFlow — user, 2026-10-10)
+ * An order row's flow is its own: stamped from its definition when the row was
+ * made, and kept (bomGraph.effectiveFlowOf). 'flow' is what the BOM LINE says
+ * for this parent; 'ownFlow' sets the row's own — cf_master_records.default_flow_id
+ * of a temporary item that sits in the structure being changed — which is the
+ * only flow the TOP row of an order line has (nothing holds it, so no line can
+ * name one). It goes through masterRecordService.updateRecord, the record page's
+ * own path, so its guards and flowSpecService apply unchanged. "Take the
+ * definition's flow again" is the pair, in one save: ownFlow = the definition's
+ * flow, and flow = null on the row's line. Like 'flow' it is how a thing is
+ * made, so it still goes through on a frozen line until release — and there,
+ * as everywhere, a frozen row's field list does not move.
+ *
  * ORDER, AND WHAT A PASTE COPIES
  * Pastes run first, then quantity and flow changes, then removals. So a paste
  * copies what is SAVED — the clipboard's snapshot, not the half-edited screen —
@@ -127,8 +141,11 @@ import { insertRows } from '../lib/db.js';
 import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
 import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
 import { writeLineValues } from './orderValuesService.js';
+import { updateRecord } from './masterRecordService.js';
 
-export const OPS = ['quantity', 'flow', 'role', 'remove', 'paste', 'arrange', 'values'];
+export const OPS = ['quantity', 'flow', 'ownFlow', 'role', 'remove', 'paste', 'arrange', 'values'];
+/** The changes that are only HOW a thing is made — what a frozen line still takes until release. */
+const FLOW_OPS = new Set(['flow', 'ownFlow']);
 const MAX_CHANGES = 1000;
 const ID_CHUNK = 500;   // ids per IN list
 const FROZEN_CODES = new Set(['OBSOLETE', 'ORDER_CLOSED', 'RELEASED', 'LOCKED']);
@@ -202,7 +219,13 @@ function readChanges(raw, problems) {
       if (!v) problems.push(`${where}: ${key} must be a positive whole number.`);
       return v;
     };
-    if (op === 'values') {
+    if (op === 'ownFlow') {
+      c.recordId = needId('recordId');
+      if (!c.recordId) return;
+      if (ch.flowId === undefined) { problems.push(`${where}: say which flow — flowId, or null for no flow.`); return; }
+      c.flowId = blank(ch.flowId) ? null : posInt(ch.flowId);
+      if (!blank(ch.flowId) && !c.flowId) { problems.push(`${where}: flowId must be a positive whole number, or null.`); return; }
+    } else if (op === 'values') {
       if (!Array.isArray(ch.writes)) { problems.push(`${where}: values need a list of writes.`); return; }
       if (ch.writes.length > 20000 || ch.writes.some((w) => !posInt(w?.recordId) || typeof w.specCode !== 'string' || !w.specCode.trim())) { problems.push(`${where}: each value needs a record and specification code.`); return; }
       c.writes = ch.writes;
@@ -356,6 +379,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   const touched = new Set();
   for (const ch of changes) {
     if (ch.op === 'values') { touched.add(scope.orderLineId ? 'custom' : 'standard'); continue; }
+    // An order row's own flow is order design, like the flow its line names: the Custom BOM's grant.
+    if (ch.op === 'ownFlow') { if (byRecord.get(ch.recordId)?.[0]?.node.kind === 'temporary') touched.add('custom'); continue; }
     if (ch.op === 'arrange') {
       for (const g of ch.groups) {
         const t = byRecord.get(g.parentId)?.[0]?.node;
@@ -373,7 +398,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   for (const bomType of touched) allow(bomType);
 
   // A batch of nothing but flow changes — the one kind a locked line still takes.
-  const flowOnly = changes.length > 0 && changes.every((ch) => ch.op === 'flow');
+  const flowOnly = changes.length > 0 && changes.every((ch) => FLOW_OPS.has(ch.op));
   if (line) {
     if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
       throw conflict('ORDER_CLOSED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
@@ -390,6 +415,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   // ---- everything that can be checked without writing ---------------------
   const problems = [...shapeProblems];
   const seen = { quantity: new Set(), flow: new Set(), role: new Set(), remove: new Set() };
+  const ownFlows = [];
+  const seenOwn = new Set();
   const flowIds = new Map(); // flow id -> [labels]
   const pastes = [];
   const updates = [];
@@ -406,6 +433,29 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       })) problems.push('Shared child values are read-only here. Open that item or definition to change its values.');
       if (valueChanges.length) problems.push('Give the value changes once.');
       valueChanges.push(ch); continue;
+    }
+    if (ch.op === 'ownFlow') {
+      const places = byRecord.get(ch.recordId);
+      if (!places) {
+        problems.push(`Record ${ch.recordId} is not part of this structure — it may have changed since the screen was opened. Reload it and make the change again.`);
+        continue;
+      }
+      const node = places[0].node;
+      const label = pathLabel(node);
+      if (node.kind !== 'temporary') {
+        problems.push(`${label} is not a row of an order — its own flow is set on ${node.kind === 'catalog' ? 'the item' : 'the definition'} itself. Here, choose the flow its line names.`);
+        continue;
+      }
+      if (seenOwn.has(ch.recordId)) { problems.push(`${label} is given more than one flow of its own — say it once.`); continue; }
+      seenOwn.add(ch.recordId);
+      ch.places = places;
+      ch.label = label;
+      if (ch.flowId != null) {
+        if (!flowIds.has(ch.flowId)) flowIds.set(ch.flowId, []);
+        flowIds.get(ch.flowId).push(label);
+      }
+      ownFlows.push(ch);
+      continue;
     }
     if (ch.op === 'arrange') {
       if (arrangements.length) problems.push('Give the new row arrangement once.');
@@ -475,6 +525,12 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     problems.push(removedKeys.has(e.node.key)
       ? `${lineLabel(e)} is changed and removed in the same save — take one of them out.`
       : `${lineLabel(e)} is changed, but it also goes when a line above it is removed — take the change out, or keep the line above.`);
+  }
+
+  for (const ch of ownFlows) {
+    if (ch.places.every((pl) => doomed.has(pl.node.key))) {
+      problems.push(`${ch.label} is given a flow, but it also goes when a line is removed — take the change out, or keep the line.`);
+    }
   }
 
   // Pastes: the source, where it goes, and whether it may go there.
@@ -662,8 +718,22 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
           ? { op: 'role', lineId, from: e.node.role ?? null, to: ch.role, changed: sets.role !== undefined }
           : ch.op === 'quantity'
             ? { op: 'quantity', lineId, from: Number(e.node.quantity), to: ch.quantity, changed: sets.quantity !== undefined }
-            : { op: 'flow', lineId, from: savedFlow, to: ch.flowId ?? null, changed: sets.operationFlowId !== undefined };
+            : { op: 'flow', lineId, recordId: e.node.id, from: savedFlow, to: ch.flowId ?? null, changed: sets.operationFlowId !== undefined };
       }
+    }
+
+    // 2b. A row's own flow — the record page's own write (its guards, and the
+    //     row's field list following its flow: flowSpecService). After the lines,
+    //     so "take the definition's flow again" ends on the row's own flow.
+    for (const ch of ownFlows) {
+      const node = ch.places[0].node;
+      const saved = ownFlowIdOf(node);
+      const changed = (ch.flowId ?? null) !== saved;
+      if (changed) {
+        const r = await attempt(ch.label, () => updateRecord(db, c, ch.recordId, { defaultFlowId: ch.flowId }));
+        if (!r.ok) continue;
+      }
+      results[ch.index] = { op: 'ownFlow', recordId: ch.recordId, from: saved, to: ch.flowId ?? null, changed };
     }
 
     // 3. Removals, shallowest first: a parent takes its subtree with it, so a
@@ -722,12 +792,21 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
  * The summary
  * ======================================================================== */
 
+/** The row's own saved flow, from its node: what applies once its line names none. */
+const ownFlowIdOf = (node) => (node.flow?.from === 'line' ? node.flow.usual?.id ?? null : node.flow?.id ?? null);
+
 function countsOf(results, removes, doomed, removedKeys) {
   const done = results.filter(Boolean);
   const pasted = done.filter((r) => r.op === 'paste');
+  const lineFlows = done.filter((r) => r.op === 'flow' && r.changed);
+  const ownFlows = done.filter((r) => r.op === 'ownFlow' && r.changed);
+  const byLineToo = new Set(lineFlows.map((r) => r.recordId));
   return {
     quantity: done.filter((r) => r.op === 'quantity' && r.changed).length,
-    flow: done.filter((r) => r.op === 'flow' && r.changed).length,
+    flow: lineFlows.length,
+    // Rows whose OWN flow changed; flowRows counts a row once when its line's choice changed too ("take again").
+    ownFlow: ownFlows.length,
+    flowRows: lineFlows.length + ownFlows.filter((r) => !byLineToo.has(r.recordId)).length,
     role: done.filter((r) => r.op === 'role' && r.changed).length,
     rearranged: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.reordered, 0),
     moved: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.moved, 0),
@@ -737,7 +816,7 @@ function countsOf(results, removes, doomed, removedKeys) {
     removed: done.filter((r) => r.op === 'remove' && !r.withParent).length,
     // Rows drawn below a removed line that are not removed in their own right.
     removedBeneath: [...doomed].filter((k) => !removedKeys.has(k)).length,
-    unchanged: done.filter((r) => (r.op === 'quantity' || r.op === 'flow' || r.op === 'role') && !r.changed).length,
+    unchanged: done.filter((r) => (r.op === 'quantity' || r.op === 'flow' || r.op === 'ownFlow' || r.op === 'role') && !r.changed).length,
     changes: results.length,
   };
 }
@@ -745,7 +824,7 @@ function countsOf(results, removes, doomed, removedKeys) {
 function sentenceOf(k) {
   const bits = [];
   if (k.quantity) bits.push(plural(k.quantity, 'quantity changed', 'quantities changed'));
-  if (k.flow) bits.push(plural(k.flow, 'flow changed', 'flows changed'));
+  if (k.flowRows) bits.push(plural(k.flowRows, 'flow changed', 'flows changed'));
   if (k.role) bits.push(plural(k.role, 'description changed', 'descriptions changed'));
   if (k.rearranged) bits.push(plural(k.rearranged, 'BOM rearranged', 'BOMs rearranged'));
   if (k.moved) bits.push(plural(k.moved, 'row moved to another parent', 'rows moved to another parent'));

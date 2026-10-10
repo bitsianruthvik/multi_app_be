@@ -290,8 +290,9 @@ try {
   ok('the day off is 0 minutes; the extra Sunday is 240', oneA.days.find((d) => d.date === '2026-10-02').minutes === 0 && oneB.days.find((d) => d.date === '2026-10-11').minutes === 240);
 
   // Round trips.
+  // 64: lanes (§54) read the step links of the flows once more — a fixed cost, not one per piece.
   console.log(`        round trips: GET ${report.unlockedTrips} unlocked (1 unit), ${report.lockedTrips} locked (${lineUnits.length} units, ${pieces.length} pieces), ${report.lockedMs} ms`);
-  ok(`GET round trips do not grow with pieces (${report.unlockedTrips} → ${report.lockedTrips})`, report.lockedTrips <= report.unlockedTrips + 6 && report.lockedTrips <= 60, `${report.unlockedTrips} ${report.lockedTrips}`);
+  ok(`GET round trips do not grow with pieces (${report.unlockedTrips} → ${report.lockedTrips})`, report.lockedTrips <= report.unlockedTrips + 6 && report.lockedTrips <= 64, `${report.unlockedTrips} ${report.lockedTrips}`);
 
   /* ------------------------------------------------------------------------ */
   section('4. Writes');

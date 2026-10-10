@@ -1,8 +1,11 @@
 /**
  * bomSheet.js — an order line's structure as a spreadsheet, out and back in.
  *
- *   GET  /order-lines/:id/sheet          the workbook (?format=csv for a CSV)
+ *   GET  /order-lines/:id/sheet          the workbook: the BOM as the screen shows it,
+ *                                        two rows per line (orderSheetService; .xlsx only)
  *   POST /order-lines/:id/sheet          { fileBase64, dryRun? } — read it back
+ *   GET  /records/:id/bom/sheet          a catalog item's or definition's BOM, one row
+ *   POST /records/:id/bom/sheet          per line (bomSheetService; ?format=csv for a CSV)
  *
  * The same grant as the rest of a sales order's structure, for the same reason
  * orders.js splits them: downloading the sheet is reading the order, importing
@@ -17,16 +20,15 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
 import { requireMaster } from '../services/records.js';
 import { bomTypeOf } from '../services/bomGraph.js';
-import {
-  exportSheet, importSheet, exportRecordSheet, importRecordSheet,
-} from '../services/bomSheetService.js';
+import { exportRecordSheet, importRecordSheet } from '../services/bomSheetService.js';
+import { exportOrderSheet, importOrderSheet } from '../services/orderSheetService.js';
 import { withCutPieces } from '../services/cutPlateService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
 
 router.get('/order-lines/:id/sheet', guard(PERM.ordersView), handle(async (req, res) => {
-  const out = await exportSheet(pool, ctx(req).companyId, id(req), { format: req.query.format });
+  const out = await exportOrderSheet(pool, ctx(req).companyId, id(req));
   res.setHeader('Content-Type', out.contentType);
   res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
   res.setHeader('Content-Length', String(out.buffer.length));
@@ -38,7 +40,7 @@ router.get('/order-lines/:id/sheet', guard(PERM.ordersView), handle(async (req, 
 // An applied sheet is followed by the line's cut pieces (cutPlateService.refreshCutPieces).
 router.post('/order-lines/:id/sheet', guard(PERM.orders), handle((req) => withTransaction(async (db) => {
   const c = ctx(req);
-  const out = await importSheet(db, c, id(req), req.body ?? {});
+  const out = await importOrderSheet(db, c, id(req), req.body ?? {});
   return out.applied ? withCutPieces(db, c, id(req), out) : out;
 })));
 

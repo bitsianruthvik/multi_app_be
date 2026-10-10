@@ -45,7 +45,7 @@ const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 const codegen = await imp('apps/cf_erp/modules/codegen/service.js');
 const B = await imp('apps/cf_erp/services/bomService.js');
 const BC = await imp('apps/cf_erp/services/bomChangeService.js');
-const SHEET = await imp('apps/cf_erp/services/bomSheetService.js');
+const SHEET = await imp('apps/cf_erp/services/orderSheetService.js'); // the order line's own sheet: the screen, two rows per line
 const REL = await imp('apps/cf_erp/services/releaseService.js');
 const LOCK = await imp('apps/cf_erp/services/lockService.js');
 const ROLL = await imp('apps/cf_erp/services/rollOutService.js');
@@ -457,9 +457,9 @@ try {
   const bc = await refusal(() => BC.applyBomChanges(conn, c, { scope: { orderLineId: lineA.id }, changes: [{ op: 'quantity', lineId: segLine.id, quantity: 2 }] }));
   refusedLocked('a batch of structure edits (edit mode)', bc);
   eq('... as the 409 edit mode promises for a frozen structure', bc?.status, 409);
-  const sheet = await SHEET.exportSheet(conn, COMPANY, lineA.id);
+  const sheet = await SHEET.exportOrderSheet(conn, COMPANY, lineA.id);
   ok('the BOM sheet still comes out — a locked line\'s sheet is a record worth having', sheet.buffer.length > 0);
-  refusedLocked('but a BOM sheet does not go back in', await refusal(() => SHEET.importSheet(conn, c, lineA.id, { fileBase64: sheet.buffer.toString('base64') })));
+  refusedLocked('but a BOM sheet does not go back in', await refusal(() => SHEET.importOrderSheet(conn, c, lineA.id, { fileBase64: sheet.buffer.toString('base64') })));
   const [[partRow]] = await conn.query(
     'SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE i.owner_order_line_id = ? AND m.classification_id = ? AND m.deleted_at IS NULL ORDER BY m.id LIMIT 1',
     [lineA.id, f.v.part.id],
@@ -484,7 +484,7 @@ try {
   // User, 2026-09-30: how a thing is made may still change on a locked line,
   // until it is released — and nothing else may (records.flowStillOpen).
   section('4b. How a row is made still changes on a locked line — and only that');
-  const flow2 = await FLOWS.createFlow(conn, c, { code: `${tag}-FL2`, name: `Make ${tag} another way` });
+  const flow2 = await FLOWS.createFlow(conn, c, { code: `${tag}-FLB`, name: `Make ${tag} another way` });
   await FLOWS.addStep(conn, c, flow2.id, { operationId: f.op.id });
   await FLOWS.setFlowStatus(conn, c, flow2.id, 'active');
   eq('the Structure tab says flows can still change', struct.order.flowsEditable, true);
@@ -646,6 +646,295 @@ try {
   const stdLine = std.lines.find((l) => l.lineType === 'standard');
   const stdPlan = await LOCK.lockPlan(conn, COMPANY, stdLine.id);
   ok('a line selling a catalog item as it is has nothing to lock, and says so', stdPlan.canLock === false && stdPlan.checks[0].detail.includes('only a line built from a template'), stdPlan.checks[0].detail);
+
+  /* ---- 11b. an order row's flow and field list are its own (user, 2026-10-10) ------------- */
+  section('11b. An order row keeps the flow it was made with; its fields follow ITS flow; freezing fixes the list');
+  {
+    const mkSpec = async (sfx) => {
+      const [r] = await conn.query("INSERT INTO cf_specifications (company_id, code, name, data_type, status) VALUES (?, ?, ?, 'number', 'active')", [COMPANY, `${tag}_${sfx}`, `Flow value ${sfx} ${tag}`]);
+      return { id: r.insertId, code: `${tag}_${sfx}` };
+    };
+    const SA = await mkSpec('FA'); const SB = await mkSpec('FB'); const SC = await mkSpec('FC');
+    const MINE = [SA.code, SB.code, SC.code];
+    const [[mc]] = await conn.query('SELECT id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
+    // The fixture's flow (every template is on it) now reads A; a second flow reads B; a third operation reads C.
+    const ruleA = await OPS.createTimingRule(conn, c, f.op.id, { subjectType: 'machine', subjectId: mc.id, workExpression: `item.${SA.code} * 2` });
+    const op2 = await OPS.createOperation(conn, c, { code: `${tag}-OPB`, name: `Other ${tag}` });
+    await OPS.createTimingRule(conn, c, op2.id, { subjectType: 'machine', subjectId: mc.id, workExpression: `item.${SB.code} + 1` });
+    const op3 = await OPS.createOperation(conn, c, { code: `${tag}-OPC`, name: `Third ${tag}` });
+    await OPS.createTimingRule(conn, c, op3.id, { subjectType: 'machine', subjectId: mc.id, workExpression: `item.${SC.code} + 1` });
+    const flow2 = await FLOWS.createFlow(conn, c, { code: `${tag}-FLX`, name: `Other ${tag}` });
+    await FLOWS.addStep(conn, c, flow2.id, { operationId: op2.id });
+    await FLOWS.setFlowStatus(conn, c, flow2.id, 'active');
+
+    /** recordId -> sorted list of this test's fields the Values view gives the row. */
+    const fieldsOfLine = async (lineId) => {
+      const view = await OV.readLineValues(conn, COMPANY, lineId);
+      const out = new Map();
+      for (const g of view.groups) for (const r of g.rows) out.set(Number(r.id), Object.keys(r.cells).filter((k) => MINE.includes(k)).sort());
+      return { view, out };
+    };
+    const rowsOf = async (lineId, def) => (await conn.query(
+      `SELECT m.id, m.default_flow_id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+        WHERE i.company_id = ? AND i.owner_order_line_id = ? AND i.source_definition_id = ? AND m.deleted_at IS NULL ORDER BY m.id`, [COMPANY, lineId, def.id]))[0];
+    const defFields = async (def) => (await conn.query(
+      `SELECT UPPER(s.code) AS code FROM cf_spec_assignments a JOIN cf_specifications s ON s.id = a.specification_id
+        WHERE a.company_id = ? AND a.subject_type = 'master' AND a.subject_id = ? AND a.origin = 'flow' AND a.deleted_at IS NULL AND s.code IN (?) ORDER BY s.code`, [COMPANY, def.id, MINE]))[0].map((r) => r.code);
+    const flowOfRow = async (lineId, recordId) => {
+      const s = await SO.lineStructure(conn, COMPANY, lineId);
+      let hit = null;
+      (function walk(n) { if (Number(n.id) === Number(recordId)) hit = n; (n.children ?? []).forEach(walk); }(s.root));
+      return hit?.flow?.id ?? null;
+    };
+    // The Excel of the line names exactly the fields the Values view gives each row (orderSheetService).
+    const excelAgrees = async (lineId, label) => {
+      const sheet = await imp('apps/cf_erp/services/orderSheetService.js').catch(() => null);
+      if (!sheet?.exportOrderSheet) { console.log('        (the order sheet is not built yet — Excel check skipped)'); return; }
+      const { default: ExcelJS } = await import('exceljs');
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load((await sheet.exportOrderSheet(conn, COMPANY, lineId)).buffer);
+      const text = [];
+      wb.getWorksheet('BOM').eachRow((row) => row.eachCell((cell) => text.push(String(cell.value?.richText ? cell.value.richText.map((t) => t.text).join('') : cell.value ?? ''))));
+      const all = text.join('\n');
+      const { view } = await fieldsOfLine(lineId);
+      const names = new Map(view.groups.flatMap((g) => g.columns.map((col) => [col.code, col.name])));
+      const shown = new Set(view.groups.flatMap((g) => g.rows.flatMap((r) => Object.keys(r.cells))).filter((k) => MINE.includes(k)));
+      const want = MINE.filter((k) => shown.has(k)); const notWant = MINE.filter((k) => !shown.has(k));
+      const nameOf = (k) => names.get(k) ?? `Flow value ${k.slice(-2)} ${tag}`;
+      ok(`${label}: the Excel has every field the screen has, and none it has not`, want.every((k) => all.includes(nameOf(k))) && notWant.every((k) => !all.includes(nameOf(k))), `want ${want}, not ${notWant}`);
+    };
+
+    // -- a new order: every row takes its definition's flow and that flow's fields
+    const Z = await girderOrder(conn, c, f, 'Z', [1]);
+    const lineZ = Z.lines[0];
+    const seg = (await rowsOf(lineZ.id, f.SG))[0]; const web = (await rowsOf(lineZ.id, f.WB))[0];
+    eq('a new order row is stamped with its definition\'s flow', Number(seg.default_flow_id), Number(f.flow.id));
+    let F = await fieldsOfLine(lineZ.id);
+    same('…and asks for what that flow reads (A), on the segment and on the web', [F.out.get(Number(seg.id)), F.out.get(Number(web.id))], [[SA.code], [SA.code]]);
+    await excelAgrees(lineZ.id, 'new order');
+
+    // -- the DEFINITION's flow changes: the order does not move
+    await MR.updateRecord(conn, c, f.SG.id, { defaultFlowId: flow2.id });
+    same('the definition now asks for B, not A', await defFields(f.SG), [SB.code]);
+    eq('the order\'s segment row is still made by the flow it was born with', Number(await flowOfRow(lineZ.id, seg.id)), Number(f.flow.id));
+    F = await fieldsOfLine(lineZ.id);
+    same('…and still asks for A only', F.out.get(Number(seg.id)), [SA.code]);
+    let o2 = await SO.addOrderLine(conn, c, Z.order.id, { recordId: f.GR.id, quantity: 1 });
+    const line2 = o2.lines[o2.lines.length - 1];
+    const seg2 = (await rowsOf(line2.id, f.SG))[0];
+    eq('a line added AFTER the change takes the definition\'s new flow', Number(seg2.default_flow_id), Number(flow2.id));
+    same('…and asks for B', (await fieldsOfLine(line2.id)).out.get(Number(seg2.id)), [SB.code]);
+    await excelAgrees(lineZ.id, 'after the definition\'s flow changed');
+
+    // -- the steps INSIDE the flow both the web definition and the web row are on change
+    await OV.writeLineValues(conn, c, lineZ.id, { writes: [{ recordId: web.id, specCode: SA.code, value: 7 }] });
+    await FLOWS.addStep(conn, c, f.flow.id, { operationId: op3.id });
+    F = await fieldsOfLine(lineZ.id);
+    same('a step added to the flow: the row now asks for A and C', F.out.get(Number(web.id)), [SA.code, SC.code]);
+    same('…and so does its definition', await defFields(f.WB), [SA.code, SC.code]);
+    await OPS.updateTimingRule(conn, c, ruleA.id, { workExpression: '5' });
+    F = await fieldsOfLine(lineZ.id);
+    same('the first step stops reading A: A retires from the row, C stays', F.out.get(Number(web.id)), [SC.code]);
+    same('…and from the definition', await defFields(f.WB), [SC.code]);
+    const [[kept]] = await conn.query("SELECT value_number FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL", [COMPANY, web.id, SA.id]);
+    eq('the 7 typed for A is still stored — it is only no longer asked for', Number(kept?.value_number), 7);
+    await excelAgrees(lineZ.id, 'after the flow\'s steps changed');
+
+    // -- the flow ON THE ORDER ROW changes
+    const [[webLine]] = await conn.query('SELECT bl.id FROM cf_bom_lines bl WHERE bl.company_id = ? AND bl.child_id = ? AND bl.deleted_at IS NULL', [COMPANY, web.id]);
+    await B.updateLine(conn, c, webLine.id, { operationFlowId: flow2.id });
+    F = await fieldsOfLine(lineZ.id);
+    same('the row is given another flow: it asks for B, no longer C', F.out.get(Number(web.id)), [SB.code]);
+    same('its definition is untouched by that', await defFields(f.WB), [SC.code]);
+    await excelAgrees(lineZ.id, 'after the row\'s flow changed');
+
+    // -- FREEZE, then change everything: the frozen line's list does not move
+    const missing = [];
+    F = await fieldsOfLine(lineZ.id);
+    for (const g of F.view.groups) for (const r of g.rows) for (const [code, cell] of Object.entries(r.cells)) if (cell.missing) missing.push({ recordId: r.id, specCode: code, value: 1 });
+    if (missing.length) await OV.writeLineValues(conn, c, lineZ.id, { writes: missing });
+    await LOCK.lockLine(conn, c, lineZ.id);
+    const frozenList = JSON.stringify([...(await fieldsOfLine(lineZ.id)).out.entries()]);
+    await MR.updateRecord(conn, c, f.WB.id, { defaultFlowId: flow2.id });            // the definition's flow
+    await OPS.updateTimingRule(conn, c, ruleA.id, { workExpression: `item.${SA.code} + item.${SC.code}` });   // the steps' formula
+    await FLOWS.addStep(conn, c, flow2.id, { operationId: op3.id });                  // a step in the row's flow
+    await B.updateLine(conn, c, webLine.id, { operationFlowId: null });               // the row's own flow (still allowed on a frozen line)
+    eq('frozen: after the definition\'s flow, the flows\' steps and formulas and the row\'s own flow all changed, its field list is exactly the same',
+      JSON.stringify([...(await fieldsOfLine(lineZ.id)).out.entries()]), frozenList);
+    same('…while the line that is NOT frozen followed (its segment is on the second flow: B and now C)', (await fieldsOfLine(line2.id)).out.get(Number(seg2.id)), [SB.code, SC.code]);
+    await excelAgrees(lineZ.id, 'frozen');
+  }
+
+  /* ---- 11c. the top row's own flow, taking the definition's flow again, and WHY a value is asked ---- */
+  section('11c. ownFlow on the top row · take the definition\'s flow again · why each value is asked');
+  {
+    const VR = await imp('apps/cf_erp/services/valueReasonService.js');
+    const recordsRouter = (await imp('apps/cf_erp/routes/records.js')).default;
+    const mkSpec = async (sfx) => {
+      const [r] = await conn.query("INSERT INTO cf_specifications (company_id, code, name, data_type, status) VALUES (?, ?, ?, 'number', 'active')", [COMPANY, `${tag}_${sfx}`, `Reason value ${sfx} ${tag}`]);
+      return { id: r.insertId, code: `${tag}_${sfx}` };
+    };
+    // GA, GB: read by a flow only. GH: set by hand, read by nothing. GM: set by hand AND read by an operation.
+    const GA = await mkSpec('GA'); const GB = await mkSpec('GB'); const GH = await mkSpec('GH'); const GM = await mkSpec('GM');
+    const MINE = [GA.code, GB.code, GH.code, GM.code];
+    const [[mc]] = await conn.query('SELECT id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
+    const opP = await OPS.createOperation(conn, c, { code: `${tag}-OPP`, name: `Drill ${tag}` });
+    const ruleP = await OPS.createTimingRule(conn, c, opP.id, { subjectType: 'machine', subjectId: mc.id, workExpression: `item.${GA.code} * 2 + item.${GM.code}` });
+    const opQ = await OPS.createOperation(conn, c, { code: `${tag}-OPQ`, name: `Paint ${tag}` });
+    await OPS.createTimingRule(conn, c, opQ.id, { subjectType: 'machine', subjectId: mc.id, workExpression: `item.${GB.code} + 1` });
+    const mkFlow = async (sfx, op) => {
+      const fl = await FLOWS.createFlow(conn, c, { code: `${tag}-F${sfx}`, name: `Flow ${sfx} ${tag}` });
+      await FLOWS.addStep(conn, c, fl.id, { operationId: op.id });
+      await FLOWS.setFlowStatus(conn, c, fl.id, 'active');
+      return fl;
+    };
+    const flowP = await mkFlow('P', opP); const flowQ = await mkFlow('Q', opQ);
+    // Two rules made by hand on the Segments variant: GH optional, GM required.
+    for (const [spec, required] of [[GH, 0], [GM, 1]]) {
+      await conn.query(
+        `INSERT INTO cf_spec_assignments (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule, sort_order)
+         VALUES (?, ?, 'classification', ?, 'item', ?, 1, 'entered', 5)`, [COMPANY, spec.id, f.v.seg.id, required]);
+    }
+
+    const flowRules = async (recordId) => (await conn.query(
+      `SELECT UPPER(s.code) AS code FROM cf_spec_assignments a JOIN cf_specifications s ON s.id = a.specification_id
+        WHERE a.company_id = ? AND a.subject_type = 'master' AND a.subject_id = ? AND a.origin = 'flow' AND a.deleted_at IS NULL AND s.code IN (?) ORDER BY s.code`, [COMPANY, recordId, MINE]))[0].map((r) => r.code);
+    const ownFlowOf = async (recordId) => Number((await conn.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [recordId]))[0][0].default_flow_id) || null;
+    const nodeOf = async (lineId, recordId) => {
+      const s = await SO.lineStructure(conn, COMPANY, lineId);
+      let hit = null;
+      (function walk(n) { if (!hit && Number(n.id) === Number(recordId)) hit = n; (n.children ?? []).forEach(walk); }(s.root));
+      return hit;
+    };
+    const cellsOf = async (lineId, recordId) => {
+      const view = await OV.readLineValues(conn, COMPANY, lineId);
+      for (const g of view.groups) for (const r of g.rows) if (Number(r.id) === Number(recordId)) return Object.keys(r.cells).filter((k) => MINE.includes(k)).sort();
+      return null;
+    };
+    const rowsOf = async (lineId, def) => (await conn.query(
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+        WHERE i.company_id = ? AND i.owner_order_line_id = ? AND i.source_definition_id = ? AND m.deleted_at IS NULL ORDER BY m.id`, [COMPANY, lineId, def.id]))[0];
+    const batch = (lineId, changes, more = {}) => BC.applyBomChanges(conn, c, { scope: { orderLineId: lineId }, changes, ...more });
+
+    const Y = await girderOrder(conn, c, f, 'Y', [1]);
+    const lineY = Y.lines[0];
+    const X = await girderOrder(conn, c, f, 'X', [1]);
+    const top = (await rowsOf(lineY.id, f.GR))[0];
+    const seg = (await rowsOf(lineY.id, f.SG))[0];
+    const web = (await rowsOf(lineY.id, f.WB))[0];
+    const otherTop = (await rowsOf(X.lines[0].id, f.GR))[0];
+    const [[segLine]] = await conn.query('SELECT bl.id FROM cf_bom_lines bl WHERE bl.company_id = ? AND bl.child_id = ? AND bl.deleted_at IS NULL', [COMPANY, seg.id]);
+
+    // ---- (a) the top row's own flow --------------------------------------------------------
+    const topNode = await nodeOf(lineY.id, top.id);
+    same('the top row has no BOM line; it is made by its own flow, the one its definition had', [topNode.lineId, topNode.flow?.from, Number(topNode.flow?.id)], [null, 'item', Number(f.flow.id)]);
+    eq('…and the structure says what its definition is made by today', Number(topNode.definitionFlow?.id), Number(f.flow.id));
+    const topBefore = await flowRules(top.id);
+    const dry = await batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowP.id }], { dryRun: true });
+    same('a dry run says what Save would do', [dry.applied, dry.dryRun, dry.results[0]?.op, dry.results[0]?.changed, dry.summary.sentence], [false, true, 'ownFlow', true, '1 flow changed']);
+    same('…and writes nothing: the row\'s flow and its field list are as they were', [await ownFlowOf(top.id), await flowRules(top.id)], [Number(f.flow.id), topBefore]);
+    const done = await batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowP.id }]);
+    same('saved: the result names the row, from and to', [done.results[0].recordId, Number(done.results[0].from), Number(done.results[0].to), done.results[0].changed], [top.id, Number(f.flow.id), Number(flowP.id), true]);
+    eq('the row\'s OWN flow is the new one', await ownFlowOf(top.id), Number(flowP.id));
+    const topAfter = await nodeOf(lineY.id, top.id);
+    same('the structure shows it — still the row\'s own, not a line\'s choice', [Number(topAfter.flow.id), topAfter.flow.from], [Number(flowP.id), 'item']);
+    same('its fields follow: it now asks for what the new flow reads (A and M)', await flowRules(top.id), [GA.code, GM.code]);
+    same('…on the Values view too', await cellsOf(lineY.id, top.id), [GA.code, GM.code]);
+    eq('its definition is untouched', Number((await conn.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [f.GR.id]))[0][0].default_flow_id), Number(f.flow.id));
+    const again = await batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowP.id }]);
+    same('the same flow again changes nothing', [again.results[0].changed, again.summary.sentence], [false, 'nothing to change']);
+    const foreign = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: otherTop.id, flowId: flowP.id }]));
+    ok('a row of ANOTHER structure is refused, never guessed at', foreign?.status === 422 && (foreign.problems ?? []).some((p) => p.includes('is not part of this structure')), (foreign?.problems ?? [foreign?.message]).join(' | '));
+    says((foreign?.problems ?? [])[0]);
+    eq('…and it was not touched', await ownFlowOf(otherTop.id), Number(f.flow.id));
+    const shared = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: f.MAT.id, flowId: flowP.id }]));
+    ok('a catalog item in the tree is not an order row: its own flow is set on the item', (shared?.problems ?? []).some((p) => p.includes('is not a row of an order')), (shared?.problems ?? [shared?.message]).join(' | '));
+    const twice = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }, { op: 'ownFlow', recordId: top.id, flowId: flowP.id }]));
+    ok('two flows for one row in one save is refused', (twice?.problems ?? []).some((p) => p.includes('say it once')), (twice?.problems ?? [twice?.message]).join(' | '));
+    const noFlow = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: 999999999 }]));
+    ok('a flow that does not exist is a problem in words', noFlow?.status === 422 && (noFlow.problems ?? []).length === 1, (noFlow?.problems ?? [noFlow?.message]).join(' | '));
+
+    // ---- (b) take the definition's flow again ------------------------------------------------
+    // The segment row was stamped with its definition's flow; give its LINE a choice, and type a value for it.
+    await batch(lineY.id, [{ op: 'flow', lineId: segLine.id, flowId: flowQ.id }]);
+    same('the segment\'s line names Q: it asks for B', await flowRules(seg.id), [GB.code]);
+    await OV.writeLineValues(conn, c, lineY.id, { writes: [{ recordId: seg.id, specCode: GB.code, value: 9 }] });
+    const stamped = await ownFlowOf(seg.id);
+    await MR.updateRecord(conn, c, f.SG.id, { defaultFlowId: flowP.id });           // the DEFINITION moves on
+    let segNode = await nodeOf(lineY.id, seg.id);
+    same('the definition moved on: the row is still made by Q (its line), its own flow is the one it was born with',
+      [Number(segNode.flow.id), segNode.flow.from, Number(segNode.flow.usual?.id)], [Number(flowQ.id), 'line', stamped]);
+    same('…and the structure reports the definition\'s flow of today, which differs', [Number(segNode.definitionFlow?.id), segNode.definitionFlow?.code], [Number(flowP.id), flowP.code]);
+    const take = await batch(lineY.id, [{ op: 'ownFlow', recordId: seg.id, flowId: flowP.id }, { op: 'flow', lineId: segLine.id, flowId: null }]);
+    same('"take again" is ONE save of two changes — and one flow changed, in words', [take.results.map((r) => [r.op, r.changed]), take.summary.sentence], [[['ownFlow', true], ['flow', true]], '1 flow changed']);
+    segNode = await nodeOf(lineY.id, seg.id);
+    same('the row is on its definition\'s flow, as its OWN', [Number(segNode.flow.id), segNode.flow.from, Number(segNode.definitionFlow.id)], [Number(flowP.id), 'item', Number(flowP.id)]);
+    eq('its line names no flow any more', (await conn.query('SELECT operation_flow_id FROM cf_bom_lines WHERE id = ?', [segLine.id]))[0][0].operation_flow_id, null);
+    same('its fields follow: A is asked (M was already required by hand), B retires', await flowRules(seg.id), [GA.code]);
+    same('…on the Values view: A, the two hand-made ones, and no B', await cellsOf(lineY.id, seg.id), [GA.code, GH.code, GM.code]);
+    // A row with no flow at all still says what its definition is made by.
+    await batch(lineY.id, [{ op: 'ownFlow', recordId: web.id, flowId: null }]);
+    const webNode = await nodeOf(lineY.id, web.id);
+    const [[webDef]] = await conn.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [f.WB.id]);
+    same('a row with NO flow still reports its definition\'s', [webNode.flow, Number(webNode.definitionFlow?.id)], [null, Number(webDef.default_flow_id)]);
+
+    // ---- (c) why each value is asked -----------------------------------------------------------
+    ok('GET /records/:id/value-reasons is a route, behind protect and a permission check',
+      recordsRouter.stack.some((l) => l.route?.path === '/records/:id/value-reasons' && l.route.methods.get && l.route.stack.length === 3 && l.route.stack[0].name === 'protect'));
+    const why = await VR.getValueReasons(conn, COMPANY, seg.id);
+    const reasonOf = (out, code) => out.values.find((v) => v.code === code)?.reason ?? null;
+    same('it names the flow the row is made by', [Number(why.flow?.id), why.flow?.code, why.frozen], [Number(flowP.id), flowP.code, null]);
+    same('a flow-made value names the flow and the operation that reads it',
+      [reasonOf(why, GA.code)?.kind, Number(reasonOf(why, GA.code)?.flow?.id), reasonOf(why, GA.code)?.operations.map((o) => o.code)], ['flow', Number(flowP.id), [opP.code]]);
+    same('…and is required', why.values.find((v) => v.code === GA.code)?.required, true);
+    same('a hand-made value nothing reads comes back with readBy: [] — set on the Variant',
+      [reasonOf(why, GH.code)?.kind, reasonOf(why, GH.code)?.at.level, reasonOf(why, GH.code)?.at.name, reasonOf(why, GH.code)?.readBy], ['manual', 'Variant', f.v.seg.name, []]);
+    same('a hand-made value an operation also reads lists it',
+      [reasonOf(why, GM.code)?.kind, reasonOf(why, GM.code)?.at.level, reasonOf(why, GM.code)?.readBy.map((o) => [Number(o.id), o.code, o.name])], ['manual', 'Variant', [[Number(opP.id), opP.code, opP.name]]]);
+    same('the retired value with a stored number is "no longer asked for", not on the list',
+      [why.notAsked.filter((n) => n.code === GB.code).map((n) => n.display), why.values.some((v) => v.code === GB.code)], [['9'], false]);
+    ok('a value that comes by itself is "derived", saying how', why.values.some((v) => v.reason.kind === 'derived' && v.reason.how === 'defaulted' && v.code === 'CUT_FROM'), JSON.stringify(why.values.map((v) => [v.code, v.reason.kind])));
+    const whyDef = await VR.getValueReasons(conn, COMPANY, f.SG.id);
+    same('a definition answers the same way, by its own default flow',
+      [Number(whyDef.flow?.id), reasonOf(whyDef, GA.code)?.kind, reasonOf(whyDef, GA.code)?.operations.map((o) => o.code), reasonOf(whyDef, GH.code)?.readBy], [Number(flowP.id), 'flow', [opP.code], []]);
+    eq('a record of another company is a 404', (await refusal(() => VR.getValueReasons(conn, COMPANY + 1000000, seg.id)))?.status, 404);
+    // Round trips: more values, the same number of queries.
+    const few = counting(conn);
+    const whyFew = await VR.getValueReasons(few.db, COMPANY, seg.id);
+    const extra = [await mkSpec('G1'), await mkSpec('G2'), await mkSpec('G3')];
+    await OPS.updateTimingRule(conn, c, ruleP.id, { workExpression: `item.${GA.code} * 2 + item.${GM.code} + ${extra.map((s) => `item.${s.code}`).join(' + ')}` });
+    const many = counting(conn);
+    const whyMany = await VR.getValueReasons(many.db, COMPANY, seg.id);
+    console.log(`        value-reasons: ${few.tally.n} round trips for ${whyFew.values.length} values, ${many.tally.n} for ${whyMany.values.length}`);
+    ok('three more values, the same round trips', whyMany.values.length === whyFew.values.length + 3 && many.tally.n === few.tally.n, `${few.tally.n} vs ${many.tally.n}; ${whyFew.values.length} vs ${whyMany.values.length} values`);
+    ok('…and a dozen or so, not one a value', many.tally.n <= 16, `${many.tally.n}`);
+
+    // ---- frozen, then released --------------------------------------------------------------
+    await batch(lineY.id, [{ op: 'ownFlow', recordId: web.id, flowId: flowP.id }]);   // every made row needs a flow to be released
+    const missing = [];
+    const view = await OV.readLineValues(conn, COMPANY, lineY.id);
+    for (const g of view.groups) for (const r of g.rows) for (const [code, cell] of Object.entries(r.cells)) if (cell.missing) missing.push({ recordId: r.id, specCode: code, value: 1 });
+    if (missing.length) await OV.writeLineValues(conn, c, lineY.id, { writes: missing });
+    await LOCK.lockLine(conn, c, lineY.id);
+    const frozenFields = [await flowRules(top.id), await cellsOf(lineY.id, top.id)];
+    const mixed = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }, { op: 'quantity', lineId: segLine.id, quantity: 3 }]));
+    ok('frozen: an own flow with anything else in the save is refused in the locked line\'s sentence, as a 409', mixed?.status === 409 && mixed?.code === 'LOCKED' && LOCKED_WORDS.test(mixed?.message ?? ''), mixed ? `${mixed.status} ${mixed.code}: ${mixed.message}` : 'it was accepted');
+    const frozenSave = await batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }]);
+    same('frozen: an own flow alone still goes through — it is only how the row is made', [frozenSave.results[0].changed, await ownFlowOf(top.id)], [true, Number(flowQ.id)]);
+    same('…but its FIELD LIST does not move: still what it had at freeze, no B', [await flowRules(top.id), await cellsOf(lineY.id, top.id)], frozenFields);
+    const whyFrozen = await VR.getValueReasons(conn, COMPANY, top.id);
+    same('the reasons say the row is frozen, and a value kept from the old flow names no operation of today\'s',
+      [whyFrozen.frozen?.reason, Number(whyFrozen.flow?.id), reasonOf(whyFrozen, GA.code)?.kind, reasonOf(whyFrozen, GA.code)?.operations], ['locked', Number(flowQ.id), 'flow', []]);
+    await SO.setOrderStatus(conn, c, Y.order.id, 'confirmed');
+    const relY = await REL.releaseLine(conn, c, lineY.id, { finishedAreaId: f.area.id });
+    ok('the line is released', !!relY?.id);
+    const relOwn = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowP.id }]));
+    ok('released: an own flow is refused in the usual words, as a 409',
+      relOwn?.status === 409 && relOwn?.code === 'RELEASED' && /was released to production — its structure is frozen\. Take the release back, while nothing has started, to change it\.$/.test(relOwn?.message ?? ''),
+      relOwn ? `${relOwn.status} ${relOwn.code}: ${relOwn.message}` : 'it was accepted');
+    says(relOwn?.message);
+    eq('…and the row keeps its flow', await ownFlowOf(top.id), Number(flowQ.id));
+  }
 
   await conn.rollback();
   console.log('\nrolled back.');

@@ -1,8 +1,14 @@
-/** Excel round trips on owned fixtures. Local only; all changes roll back. */
+/**
+ * Excel round trips on owned fixtures. Local only; all changes roll back.
+ * A catalog item's or definition's BOM is one row per line (bomSheetService). An ORDER LINE's sheet is the screen,
+ * two rows per line (orderSheetService) — its own suite is order_sheet_test.mjs; here it is only held to the same
+ * round trip, quantity and frozen-line promises as the record sheets beside it.
+ */
 import ExcelJS from 'exceljs';
 import { pool } from '../../db.js';
 import '../../apps/cf_erp/services/codegenProvider.js';
 import { exportSheet, importSheet, FIXED_COLUMNS } from '../../apps/cf_erp/services/bomSheetService.js';
+import { exportOrderSheet, importOrderSheet } from '../../apps/cf_erp/services/orderSheetService.js';
 import { addOrderLine } from '../../apps/cf_erp/services/salesOrderService.js';
 import { listMachines } from '../../apps/cf_erp/services/machineService.js';
 
@@ -60,20 +66,48 @@ try {
     return { wb, ws: wb.getWorksheet('BOM'), out };
   };
   const run = async (scope, wb, dryRun = true) => importSheet(db, c, scope, { file: Buffer.from(await wb.xlsx.writeBuffer()), dryRun });
+  // The order line's own sheet: pairs of rows found by the hidden id each carries (N|<line>:<record> / V|…).
+  const freshLine = async () => {
+    const out = await exportOrderSheet(db, companyId, orderLine.id);
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.load(out.buffer);
+    return { wb, ws: wb.getWorksheet('BOM'), out };
+  };
+  const runLine = async (wb, dryRun = true) => importOrderSheet(db, c, orderLine.id, { file: Buffer.from(await wb.xlsx.writeBuffer()), dryRun });
+  const pairOf = (ws, lineId) => {
+    let names = null, values = null;
+    ws.eachRow((row) => { for (let i = 1; i <= row.cellCount; i++) { const v = String(row.getCell(i).value ?? ''); if (v.startsWith(`N|${lineId}:`)) names = row; if (v.startsWith(`V|${lineId}:`)) values = row; } });
+    if (!names || !values) throw new Error(`Missing order-line pair ${lineId}`);
+    return { names, values, cellOf: (label) => { for (let i = 2; i <= names.cellCount; i++) if (names.getCell(i).value === label) return values.getCell(i); throw new Error(`No ${label} on pair ${lineId}`); } };
+  };
   const attempt = async (label, fn) => {
     await db.query('SAVEPOINT sheet_case');
     try { await fn(); } catch (e) { failed++; console.error(`FAIL ${label}: ${e.message}`, e.problems ?? ''); }
     finally { await db.query('ROLLBACK TO SAVEPOINT sheet_case'); }
   };
 
-  for (const scope of [record(item), record(template), orderLine.id]) await attempt('round trip', async () => {
+  for (const scope of [record(item), record(template)]) await attempt('round trip', async () => {
     const { wb, ws } = await fresh(scope);
     const preview = await run(scope, wb);
     ok('unchanged workbook has no changes or problems', preview.ok && preview.changes.length === 0);
     ok('editable columns come first and name stays frozen', ws.getCell('B1').value === 'Quantity' && ws.views[0].xSplit === 1);
     ok('workbook has instructions', !!wb.getWorksheet('How to use this'));
   });
-  for (const [scope, id] of [[record(item), itemLine], [record(template), templateLine], [orderLine.id, customLine.id]]) await attempt('quantity and text', async () => {
+  await attempt('order line round trip', async () => {
+    const { wb, ws, out } = await freshLine();
+    const preview = await runLine(wb);
+    ok('order line: unchanged workbook has no changes or problems', preview.ok && preview.changes.length === 0);
+    ok('order line: two rows per BOM row under one banner, and no instructions sheet', ws.actualRowCount === 1 + 2 * out.rows && out.rows > 0 && wb.worksheets.length === 1 && !wb.getWorksheet('How to use this'));
+  });
+  await attempt('order line quantity', async () => {
+    const { wb, ws } = await freshLine();
+    pairOf(ws, customLine.id).cellOf('Qty').value = 7;
+    const old = await qty(customLine.id), preview = await runLine(wb);
+    ok('order line: preview reports the quantity', preview.ok && preview.summary.quantityChanged === 1 && preview.summary.roleChanged === 0 && preview.summary.notesChanged === 0);
+    ok('order line: preview leaves database untouched', await qty(customLine.id) === old);
+    const applied = await runLine(wb, false);
+    ok('order line: apply saves the quantity', applied.applied === true && await qty(customLine.id) === 7);
+  });
+  for (const [scope, id] of [[record(item), itemLine], [record(template), templateLine]]) await attempt('quantity and text', async () => {
     const { wb, ws } = await fresh(scope);
     const row = find(ws, id); cell(ws, row, 'quantity', 7); cell(ws, row, 'role', 'Edited role'); cell(ws, row, 'notes', 'Edited notes');
     const old = await qty(id), preview = await run(scope, wb);
@@ -115,11 +149,11 @@ try {
     ok('self reference refused in preview', !(await run(record(item), wb)).ok);
   });
   await attempt('frozen workbook', async () => {
-    const { wb } = await fresh(orderLine.id);
+    const { wb } = await freshLine();
     await db.query('UPDATE cf_sales_order_lines SET locked_at=NOW() WHERE id=?', [orderLine.id]);
-    let refused = false; try { await run(orderLine.id, wb); } catch { refused = true; }
+    let refused = false; try { await runLine(wb); } catch { refused = true; }
     ok('locked order refuses upload', refused);
-    ok('locked order still downloads', (await fresh(orderLine.id)).out.rows > 0);
+    ok('locked order still downloads', (await freshLine()).out.rows > 0);
   });
   await attempt('machine paging', async () => {
     const mf = await node(null, 0, 'MF', 'machine');

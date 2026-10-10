@@ -130,7 +130,7 @@ async function loadRules(db, companyId, chain) {
   const f = subjectFilter(chain, 'a');
   const [rows] = await db.query(
     `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
-            a.value_rule, a.formula_id, a.sort_order,
+            a.value_rule, a.formula_id, a.sort_order, a.origin,
             s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals, s.table_config,
             f.code AS formula_code, f.name AS formula_name, f.expression AS formula_expression, f.version AS formula_version
        FROM cf_spec_assignments a
@@ -139,7 +139,10 @@ async function loadRules(db, companyId, chain) {
       WHERE a.company_id = ? AND a.deleted_at IS NULL AND (${f.sql})`,
     [companyId, ...f.params],
   );
-  return rows;
+  // A flow-made rule belongs to the record whose flow reads the value: it never reaches the items
+  // made from a definition (each row has its own, from its own flow — flowSpecService).
+  const self = chain.find((s) => s.self);
+  return rows.filter((r) => r.origin !== 'flow' || (self && r.subject_type === self.subjectType && Number(r.subject_id) === Number(self.subjectId)));
 }
 
 async function loadValues(db, companyId, chain) {

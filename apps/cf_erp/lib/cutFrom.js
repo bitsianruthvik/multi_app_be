@@ -101,7 +101,7 @@ export async function resolveCodes(db, companyId, masters, codes) {
      SELECT 'n' AS t, up.seed, up.id, up.code AS node_code, up.name AS node_name, up.hop, NULL AS subject_type, NULL AS subject_id, NULL AS is_required, NULL AS is_applicable, NULL AS value_rule, NULL AS sort_order, NULL AS code, NULL AS value_number, NULL AS value_text, NULL AS value_bool, NULL AS value_date, NULL AS option_id, NULL AS source, NULL AS uom, NULL AS data_type, NULL AS option_value FROM up
      UNION ALL
      SELECT 'a', NULL, a.id, NULL, NULL, NULL, a.subject_type, a.subject_id, a.is_required, a.is_applicable, a.value_rule, a.sort_order,
-            UPPER(s.code), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            UPPER(s.code), NULL, NULL, NULL, NULL, NULL, a.origin, NULL, NULL, NULL
        FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL AND s.code IN (?)
       WHERE a.company_id = ? AND a.deleted_at IS NULL AND a.capture_at = 'item'
@@ -154,7 +154,8 @@ export async function resolveCodes(db, companyId, masters, codes) {
     for (const code of upper) {
       let win = null;
       chain.forEach((s, i) => {
-        const list = (rulesAt.get(key(s.t, s.id)) ?? []).filter((r) => r.code === code)
+        // `source` carries a rule's origin here: a flow-made rule is its own record's only.
+        const list = (rulesAt.get(key(s.t, s.id)) ?? []).filter((r) => r.code === code && !(r.source === 'flow' && !s.self))
           .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
         for (const r of list) win = { r, i };
       });

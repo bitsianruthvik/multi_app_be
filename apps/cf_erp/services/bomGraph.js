@@ -107,20 +107,34 @@ export async function loadLine(db, companyId, lineId) {
 
 /**
  * How the child of a line is made: the flow the line names (the child in THIS
- * parent), else the child's own default, else — for a temporary item — its
- * template's. A selection line never names one: once its catalog item is
- * chosen, that item's default applies. Null for things with no flow.
+ * parent), else the child's own. A selection line never names one: once its
+ * catalog item is chosen, that item's default applies. Null for things with no flow.
+ *
+ * AN ORDER ROW'S FLOW IS ITS OWN (user, 2026-10-10): a temporary item takes its
+ * definition's flow WHEN IT IS MADE (instantiationService stamps default_flow_id)
+ * and never follows the definition afterwards — "change the flow on definition, it
+ * shouldn't change the flow on the order". So there is no fall-back to the template
+ * here any more; `definition` only says what the definition's flow is today, for
+ * a screen that offers to take it again.
  */
 export function effectiveFlowOf(line) {
+  const definition = line.def_flow_id ? { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name } : null;
   if (line.operation_flow_id) {
     // `usual`: what applies once this line's own choice is taken away ("reset to default"); null = none.
-    const usual = line.child_flow_id ? { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item' }
-      : line.def_flow_id ? { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name, from: 'template' } : null;
-    return { id: line.operation_flow_id, code: line.line_flow_code, name: line.line_flow_name, from: 'line', usual };
+    const usual = line.child_flow_id ? { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item' } : null;
+    return { id: line.operation_flow_id, code: line.line_flow_code, name: line.line_flow_name, from: 'line', usual, definition };
   }
-  if (line.child_flow_id) return { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item' };
-  if (line.def_flow_id) return { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name, from: 'template' };
+  if (line.child_flow_id) return { id: line.child_flow_id, code: line.child_flow_code, name: line.child_flow_name, from: 'item', definition };
   return null;
+}
+
+/**
+ * What the row's DEFINITION is made by today — { id, code, name } or null (no definition, or it has
+ * no flow). Said for EVERY row, also one with no flow at all, where effectiveFlowOf is null and its
+ * `definition` is lost: the screen offers "take the definition's flow again" from it.
+ */
+export function definitionFlowOf(line) {
+  return line?.def_flow_id ? { id: line.def_flow_id, code: line.def_flow_code, name: line.def_flow_name } : null;
 }
 
 /** catalog | temporary | template | selection for a line's child. */

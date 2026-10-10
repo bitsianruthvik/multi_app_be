@@ -20,7 +20,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import {
   bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, linesOfBomsWithChildBom, loadLine, childKindOf, descendantIds,
-  createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf,
+  createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf, definitionFlowOf,
 } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
 import { findCandidates, isCutPlateRecord, NOT_UNDER_CUT_PLATE_WHERE } from './selectionService.js';
@@ -109,6 +109,8 @@ function shapeLine(l, hasBom) {
     // The flow this line names, and the one that applies (line, else the child's default).
     flow: l.operation_flow_id ? { id: l.operation_flow_id, code: l.line_flow_code, name: l.line_flow_name } : null,
     effectiveFlow: effectiveFlowOf(l),
+    // What its definition is made by today — also when the row itself has no flow (bomGraph.definitionFlowOf).
+    definitionFlow: definitionFlowOf(l),
   };
 }
 
@@ -461,6 +463,7 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
     uom: root.uom ?? null, depth: 0, quantity: rootQuantity, total: rootQuantity, lineId: null, lineNo: null,
     position: null, role: null, selection: null, resolved: root.record_kind === 'item',
     flow: rf ? effectiveFlowOf(rf) : null,
+    definitionFlow: definitionFlowOf(rf),
     bom: rootBom ? { id: rootBom.id, bomType: rootBom.bom_type, status: rootBom.status, revision: rootBom.revision } : null,
     children: [],
   };
@@ -502,6 +505,7 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
           // The system chose it (the selection's default, or its only candidate) and no person has since.
           autoChosen: !!l.auto_chosen && l.child_record_kind === 'item',
           flow: effectiveFlowOf(l),
+          definitionFlow: definitionFlowOf(l),
           bom: cb ? { id: cb.id, bomType: cb.bom_type, status: cb.status, revision: cb.revision } : null,
           children: [],
         };

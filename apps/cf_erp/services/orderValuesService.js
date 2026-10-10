@@ -316,7 +316,7 @@ async function loadContext(db, companyId, lineId, { lock = false } = {}) {
   const [[ruleRows], [valueRows]] = await Promise.all([
     db.query(
       `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
-              a.value_rule, a.formula_id, a.sort_order,
+              a.value_rule, a.formula_id, a.sort_order, a.origin,
               s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals, s.table_config,
               f.code AS formula_code, f.name AS formula_name, f.expression AS formula_expression, f.version AS formula_version
          FROM cf_spec_assignments a
@@ -474,6 +474,7 @@ function resolveRecord(ctx, rec) {
   const rules = [];
   for (const s of chain) {
     for (const r of ctx.rulesBySubject.get(subjectKey(s.subjectType, s.subjectId)) ?? []) {
+      if (r.origin === 'flow' && !s.self) continue;   // a flow-made rule is its own record's only (resolutionService.loadRules)
       rules.push({ ...r, levelIndex: levelOf.get(subjectKey(r.subject_type, r.subject_id)) });
     }
   }

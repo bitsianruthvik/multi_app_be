@@ -2,8 +2,9 @@
  * flow_specs_test.mjs — a record's flow decides which values it needs (init.sql §50, 2026-10-08).
  * Choosing a flow makes every item.X its operations' times read REQUIRED on the record, unless the
  * chain gives it some other way; an optional rule of its own is made required (never a second rule);
- * a flow's steps or an operation's time changing re-syncs; a rule no longer read goes unless it
- * holds a value; a frozen line's rows are left alone.
+ * a flow's steps or an operation's time changing re-syncs; a rule no longer read GOES (its value stays
+ * stored — the smallest set to fill, user 2026-10-10); a frozen line's rows are left alone; a flow-made
+ * rule is its own record's and does not reach the rows made from a definition.
  * Local only, one rolled-back transaction, every cf_ table re-counted.
  *
  *   cd multi_app_be && node scripts/cf_kepl/flow_specs_test.mjs
@@ -70,12 +71,13 @@ try {
   ok('an operation\'s time changing re-syncs: W added', by(W.code).length === 1 && by(W.code)[0].is_required === 1);
   ok('…and X, no longer read and never filled in, goes', by(X.code).length === 0, JSON.stringify(rs));
 
-  // A filled-in flow rule stays when its flow stops reading it.
+  // A flow rule goes when its flow stops reading it, filled in or not — the value stays stored.
   await db.query("INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, value_number) VALUES (?, ?, 'master', ?, 7)", [COMPANY, W.id, def.id]);
   const [[step]] = await db.query('SELECT id FROM cf_operation_flow_steps WHERE company_id = ? AND flow_id = ? AND deleted_at IS NULL', [COMPANY, flowId]);
   await removeStep(db, c, step.id);
   rs = await rulesOf(def.id);
-  ok('removing the step: W holds a value, so its rule stays', by(W.code).length === 1);
+  ok('removing the step: W is no longer read, so its rule goes although it holds a value', by(W.code).length === 0, JSON.stringify(rs));
+  ok('…and the value is still stored', Number((await db.query("SELECT value_number FROM cf_spec_values WHERE company_id = ? AND specification_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL", [COMPANY, W.id, def.id]))[0][0]?.value_number) === 7);
   ok('a manual rule is never removed by the sync (Y stays)', by(Y.code).length === 1);
 
   // A frozen line's rows are left alone.

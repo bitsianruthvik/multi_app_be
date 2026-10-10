@@ -97,7 +97,14 @@ function assertOrderOpen(order) {
 async function loadFlows(db, companyId, flowIds) {
   const out = new Map();
   if (!flowIds.length) return out;
-  const [flows] = await db.query('SELECT id, code, name, status, revision FROM cf_operation_flows WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [companyId, flowIds]);
+  const [flows] = await db.query('SELECT id, code, name, status, revision, linked FROM cf_operation_flows WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [companyId, flowIds]);
+  // A LINKED flow (init.sql §54) is read by what each step starts after, not by its numbers.
+  const linkedIds = flows.filter((f) => f.linked).map((f) => f.id);
+  const [links] = linkedIds.length ? await db.query(
+    'SELECT step_id, after_step_id FROM cf_flow_step_links WHERE company_id = ? AND flow_id IN (?) AND deleted_at IS NULL', [companyId, linkedIds],
+  ) : [[]];
+  const afterOf = new Map();
+  for (const l of links) { if (!afterOf.has(l.step_id)) afterOf.set(l.step_id, []); afterOf.get(l.step_id).push(l.after_step_id); }
   const [steps] = await db.query(
     `SELECT s.id, s.flow_id, s.sequence, s.operation_id, s.step_name, o.code AS op_code, o.name AS op_name, o.status AS op_status
        FROM cf_operation_flow_steps s JOIN cf_operations o ON o.id = s.operation_id
@@ -113,8 +120,8 @@ async function loadFlows(db, companyId, flowIds) {
       WHERE w.company_id = ? AND w.flow_step_id IN (?) AND w.deleted_at IS NULL ORDER BY w.id`,
     [companyId, stepIds],
   ) : [[]];
-  for (const f of flows) out.set(f.id, { ...f, steps: [] });
-  for (const s of steps) out.get(s.flow_id)?.steps.push({ ...s, waits: rules.filter((w) => w.flow_step_id === s.id) });
+  for (const f of flows) out.set(f.id, { ...f, linked: !!f.linked, steps: [] });
+  for (const s of steps) out.get(s.flow_id)?.steps.push({ ...s, after: afterOf.get(s.id) ?? [], waits: rules.filter((w) => w.flow_step_id === s.id) });
   return out;
 }
 
@@ -190,7 +197,11 @@ function planSteps(plan) {
       steps.push(s);
       node.stepKs.push(s.k);
     }
-    node.groups = bySequence(node.stepKs.map((k) => steps[k]));
+    // groups[0] is "the node's first steps" for everything below (the default wait on its
+    // children, the nest, "started"). A linked flow's first steps are those that start after nothing.
+    const mine = node.stepKs.map((k) => steps[k]);
+    node.linked = !!flows.get(node.flowId)?.linked;
+    node.groups = node.linked ? [mine.filter((s) => !s.fs.after.length)] : bySequence(mine);
   }
   /** The other steps of this piece running the same operation, in flow order. */
   const passesOf = (s) => nodes[s.nodeK].stepKs.map((k) => steps[k]).filter((x) => x.operationId === s.operationId);
@@ -206,8 +217,21 @@ function planSteps(plan) {
   for (const r of reqs) if (r.nodeK != null) r.stepK = nodes[r.nodeK].stepKs[0] ?? null;
 
   const deps = [];
-  // Flow order: every step waits for the steps of the previous sequence number.
+  // Flow order. A LINKED flow (lanes, init.sql §54): each step waits for exactly the steps it
+  // starts after — the one above it in its lane, the step its lane split from, or the last step of
+  // every lane that meets at it. A legacy flow: every step waits for the steps of the previous
+  // sequence number.
   for (const node of nodes) {
+    if (node.linked) {
+      const byFlowStep = new Map(node.stepKs.map((k) => [steps[k].flowStepId, steps[k]]));
+      for (const k of node.stepKs) {
+        for (const a of steps[k].fs.after) {
+          const p = byFlowStep.get(a);
+          if (p) deps.push({ stepK: k, targetStepK: p.k, required: 'done', origin: 'flow' });
+        }
+      }
+      continue;
+    }
     for (let g = 1; g < node.groups.length; g++) {
       for (const s of node.groups[g]) for (const p of node.groups[g - 1]) deps.push({ stepK: s.k, targetStepK: p.k, required: 'done', origin: 'flow' });
     }
