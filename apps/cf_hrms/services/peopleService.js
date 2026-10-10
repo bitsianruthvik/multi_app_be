@@ -149,7 +149,7 @@ async function writeEvent(conn, { companyId, userId }, employeeId, eventType, ev
 // ── employees ───────────────────────────────────────────────────────────────
 
 const EMPLOYEE_COLUMNS = `
-  e.id, e.employee_code AS employeeCode, e.full_name AS fullName,
+  e.id, e.employee_code AS employeeCode, e.full_name AS fullName, e.salutation,
   e.date_of_birth AS dateOfBirth, e.gender, e.phone, e.email,
   e.address_json AS addressJson, e.emergency_contact_json AS emergencyContactJson,
   e.date_of_joining AS dateOfJoining, e.employment_type AS employmentType,
@@ -406,6 +406,55 @@ export async function getEmployee(exec, companyId, id, asOf = today()) {
     },
     totalAllocationPercent: active.reduce((s, a) => s + (a.allocationPercent ?? 0), 0),
   };
+}
+
+/**
+ * One employee for a surface that shows CONTACT DETAILS only to a caller holding
+ * cf_hrms_people_pii — the org chart's side panel (2026-10-10).
+ *
+ * `getEmployee` above hands phone and email to every cf_hrms_people_view holder,
+ * and the Employees screens were built on that. The panel is read by far more
+ * people (anyone who can open the chart and an employee), so it asks through
+ * this instead (`GET /people/employees/:id?contact=1`):
+ *
+ *   holds people_pii   the record as it is, `contact: 'SHOWN'`, and ONE audit row
+ *                      (action READ, event PII_READ, kind CONTACT) naming whose
+ *                      phone / email were shown — never the values;
+ *   does not           the same record with phone, email, date of birth, address
+ *                      and emergency contact REMOVED on the server, and
+ *                      `contact: 'HIDDEN'`. Removed, not hidden by the screen.
+ *
+ * No audit row when there was nothing on file to show.
+ */
+export async function getEmployeeContactGated(exec, c, id, asOf = today(), { canSeePii = false, requestId = null } = {}) {
+  const detail = await getEmployee(exec, c.companyId, id, asOf);
+  if (!canSeePii) {
+    return {
+      ...detail,
+      contact: 'HIDDEN',
+      employee: {
+        ...detail.employee,
+        phone: null, email: null, dateOfBirth: null, addressJson: null, emergencyContactJson: null, userEmail: null,
+      },
+    };
+  }
+  const shown = ['phone', 'email'].filter((k) => detail.employee[k]);
+  if (shown.length) {
+    await exec.query(
+      `INSERT INTO hrms_audit_log
+         (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, request_id, created_by)
+       VALUES (?, ?, 'hrms_employees', ?, 'READ', NULL, ?, ?, ?)`,
+      [
+        c.companyId, c.userId, detail.employee.id,
+        JSON.stringify({
+          event: 'PII_READ', kind: 'CONTACT', surface: 'org-chart-panel',
+          employeeId: detail.employee.id, employeeCode: detail.employee.employeeCode, fields: shown,
+        }),
+        requestId, c.userId,
+      ],
+    );
+  }
+  return { ...detail, contact: 'SHOWN' };
 }
 
 /** Assignments only — the Work tab, without re-reading the whole record. */

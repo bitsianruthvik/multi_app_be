@@ -47,7 +47,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam, canSeePii } from '../lib/http.js';
 import {
-  listEmployees, getEmployee, createEmployee, updateEmployee, deleteEmployee, assignmentsFor,
+  listEmployees, getEmployee, getEmployeeContactGated, createEmployee, updateEmployee, deleteEmployee, assignmentsFor,
   listIdentifiers, createIdentifier, updateIdentifier, deleteIdentifier,
   listDocuments, addDocument, updateDocument, deleteDocument, readDocumentFile,
   listEvents, createEvent,
@@ -77,8 +77,17 @@ router.post('/people/employees', guard(PERM.peopleManage), handle((req) => (
   tx(req, (db, c) => createEmployee(db, c, req.body ?? {}, reqId(req)))
 )));
 
+/**
+ * `?contact=1` is the org chart panel's read: contact details only for a caller
+ * holding cf_hrms_people_pii (and audited when shown), stripped on the server
+ * for everyone else. Without the flag the answer is what it has always been.
+ */
 router.get('/people/employees/:id', guard(PERM.peopleView), handle((req) => (
-  getEmployee(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
+  req.query.contact === '1'
+    ? getEmployeeContactGated(pool, ctx(req), id(req), dateParam(req.query.asOf, 'asOf'), {
+      canSeePii: canSeePii(req), requestId: reqId(req),
+    })
+    : getEmployee(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
 )));
 
 router.put('/people/employees/:id', guard(PERM.peopleManage), handle((req) => (
