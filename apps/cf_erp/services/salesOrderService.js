@@ -43,6 +43,7 @@ import { salesOrderTax } from "./taxService.js";
 import { autofillLineSelections, PARENT_CLASS_JOIN, NOT_UNDER_CUT_PLATE_WHERE } from './selectionService.js';
 import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
 import { releaseOrderHolds } from './purchaseLinkService.js';
+import { releaseOrderAllocations, retireRequisitionsOfLines } from './requisitionLifecycle.js';
 
 /**
  * Amount per line: Map lineId → { billed, billedUom, amount, amountNote }. One
@@ -540,7 +541,11 @@ export async function setOrderStatus(db, c, id, status) {
     );
   }
   // What arrived held for it (§43) is let go too: closed, lost or cancelled, it will never use it.
-  if (status === 'closed' || status === 'cancelled' || status === 'lost') await releaseOrderHolds(db, c.companyId, id);
+  if (status === 'closed' || status === 'cancelled' || status === 'lost') {
+    await releaseOrderHolds(db, c.companyId, id);
+    // ...and what was still COMING for it on purchase orders is bought for nobody now (§56): another order can be planned on it.
+    await releaseOrderAllocations(db, c.companyId, id);
+  }
   // Locking freezes the values its items hold, so bring them up to date first;
   // reopening a lost order lets them catch up with setup changes made meanwhile.
   if (!wasLocked && willLock) await refreshOrderValues(db, c, id);
@@ -713,6 +718,8 @@ export async function updateOrderLine(db, c, lineId, input = {}) {
  */
 async function retireLineOwnedRows(db, companyId, lineIds) {
   if (!lineIds.length) return;
+  // The lines' requisitions (§56): their holds are let go, what was coming for them is bought for nobody.
+  await retireRequisitionsOfLines(db, companyId, lineIds);
   await db.query(
     `UPDATE cf_nest_placements p JOIN cf_plate_lots l ON l.company_id = p.company_id AND l.id = p.plate_lot_id
         SET p.deleted_at = NOW()

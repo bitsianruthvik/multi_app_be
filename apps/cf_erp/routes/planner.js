@@ -13,6 +13,11 @@
  *   PUT /planner/targets               { 'YYYY-MM': tonnes | null }
  *   PUT /planner/settings              { minLinesPerMonth?, allowPartialLines? }
  *
+ * MATERIAL (init.sql §56, TM/CF_ERP_BUYING_V2.md §5). GET carries the material-ready engine's answer on
+ * every unit (`units[].material`), its summary (`materialReady`) and, on a stored placement the material no
+ * longer allows, `entries[key].blocked`. PUT entries / changes REFUSE (422 MATERIAL_NOT_READY, every card
+ * named) a card placed or moved to before the week its material allows, or placed while it waits.
+ *
  * Grants are production's: cf_erp_production_view to see the plan,
  * cf_erp_production_manage to change it. Every write is one transaction and
  * returns what it changed.
@@ -27,9 +32,10 @@ const router = Router();
 router.get('/planner', guard(PERM.productionView),
   handle((req) => getPlanner(pool, ctx(req).companyId, { from: req.query.from })));
 router.put('/planner/entries', guard(PERM.production),
-  handle((req) => withTransaction((db) => putEntries(db, ctx(req), req.body ?? {}))));
+  // The material check reads the plan on the pool (side by side, outside the write's transaction) — §56.
+  handle((req) => withTransaction((db) => putEntries(db, ctx(req), req.body ?? {}, { reader: pool }))));
 router.put('/planner/changes', guard(PERM.production),
-  handle((req) => withTransaction((db) => putChanges(db, ctx(req), req.body ?? {}))));
+  handle((req) => withTransaction((db) => putChanges(db, ctx(req), req.body ?? {}, { reader: pool }))));
 router.put('/planner/priorities', guard(PERM.production),
   handle((req) => withTransaction((db) => putPriorities(db, ctx(req), req.body ?? {}))));
 router.put('/planner/lines/:id/level', guard(PERM.production),

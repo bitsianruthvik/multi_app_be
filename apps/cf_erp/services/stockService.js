@@ -16,6 +16,7 @@ import { requireArea, shapeArea } from './stockingAreaService.js';
 import { requireBatch, checkBatchValues, createBatch, ownerOf } from './batchService.js';
 import { generate } from '../modules/codegen/index.js';
 import { wantsPage, pageArgs, orderBy, pageOf, countsBy } from '../lib/listing.js';
+import { unreceive } from './purchaseLinkService.js';
 
 export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
 const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
@@ -712,6 +713,24 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
       unitCost: numOrNull(row.unit_cost), value: row.value == null ? null : round2(-Number(row.value)),
     });
   }
+  /*
+   * A RECEIPT ON A PURCHASE LINE (§56): what it did on arrival is undone first — the share of it still
+   * held for the sales order is let go, the purchase line and its shares get their received quantity
+   * back down (so the requisition shows it as still coming and production waits for the PO date again).
+   * Refused there, naming the order, only when the stock is reserved for production or already issued.
+   */
+  let unreceived = null;
+  if (m.movement_type === 'receipt' && m.purchase_line_id) {
+    const byLot = new Map();
+    for (const l of legs) {
+      if (l.delta >= 0) continue;
+      const k = `${l.item.id}:${l.batch?.id ?? 0}`;
+      const e = byLot.get(k) ?? { itemId: l.item.id, batchId: l.batch?.id ?? null, quantity: 0, label: label(l.item, l.batch) };
+      e.quantity = round6(e.quantity - l.delta);
+      byLot.set(k, e);
+    }
+    unreceived = await unreceive(db, c, m, [...byLot.values()]);
+  }
   // The stock it put somewhere must still be there to take back — and not be reserved.
   await assertEnough(db, c.companyId, legs);
   if (m.movement_type !== 'adjustment') await assertReservationsKept(db, c.companyId, legs);
@@ -735,7 +754,12 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
   }
   await savePools(db, c.companyId, pools, revId);
   await db.query('UPDATE cf_stock_movements SET reversed_by_id = ? WHERE company_id = ? AND id = ?', [revId, c.companyId, m.id]);
-  return getMovement(db, c.companyId, revId);
+  const out = await getMovement(db, c.companyId, revId);
+  if (!unreceived) return out;
+  // What the reversal did to buying and to the plan (TM/CF_ERP_BUYING_V2.md §3): holds let go, and the planned cards now late / waiting.
+  const { plannedUnitsOfOrders } = await import('./plannerService.js');
+  const orderIds = [...new Set(unreceived.released.map((r) => r.orderId))];
+  return { ...out, purchase: { ...unreceived, plannedUnits: { orderIds, ...(await plannedUnitsOfOrders(db, c.companyId, orderIds)) } } };
 }
 
 

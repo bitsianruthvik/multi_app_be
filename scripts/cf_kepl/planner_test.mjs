@@ -430,7 +430,10 @@ try {
   report.putChangesTrips = w.queries;
   ok(`PUT changes: entries and the line's order in one call (${w.queries} round trips)`, w.result.entries[g1.key]?.shipDate === '2026-10-19' && w.result.entries[g2.key]?.shipDate === '2026-10-26'
     && JSON.stringify(w.result.ranks[LINE]) === JSON.stringify([g2.key, g1.key, g3.key]), JSON.stringify(w.result));
-  ok('PUT changes stays small (≤ 8 round trips)', w.queries <= 8, String(w.queries));
+  // Buying v2 (init.sql §56): a save that PLACES a card first asks the material-ready engine whether it may — ONE planner
+  // read (the same fixed round trips as GET, on the pool in a route, so side by side) — and then makes its own ≤ 8.
+  const oneRead = await measured(() => getPlanner(db, COMPANY, {}));
+  ok(`PUT changes stays small: its own ≤ 8 round trips on top of one planner read (${w.queries} = ${oneRead.queries} + ${w.queries - oneRead.queries})`, w.queries - oneRead.queries <= 8 && w.queries - oneRead.queries >= 0, String(w.queries));
   s = await getPlanner(conn, COMPANY, {});
   ok('GET shows the moves and the ranks (1 = first)', s.entries[g1.key]?.shipDate === '2026-10-19' && s.ranks[g2.key] === 1 && s.ranks[g1.key] === 2 && s.ranks[g3.key] === 3);
   // a move = the same unit to another week; a reorder = the whole order again

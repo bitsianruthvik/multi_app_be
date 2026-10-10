@@ -250,7 +250,19 @@ async function takeRequirement(db, c, req, qty, label) {
   );
   const reserved = res.reduce((t, r) => t + Number(r.quantity), 0);
   if (reserved + EPS < qty) {
-    throw invalid('MATERIAL_NOT_RESERVED', `${label} needs ${fmt(qty)} — only ${fmt(reserved)} is in stock and reserved for it. Receive and reserve it before starting.`);
+    // §56: the refusal says what the material is waiting on — the requisition, the purchase order and its date.
+    // Read only here, on the way out (materialReadyService is imported when asked for: it reads release's planned material).
+    let waiting = '';
+    try {
+      const [[rel]] = await db.query(
+        'SELECT r.order_line_id FROM cf_material_requirements q JOIN cf_production_releases r ON r.id = q.release_id WHERE q.company_id = ? AND q.id = ?',
+        [c.companyId, req.id],
+      );
+      const { materialWaitWords } = await import('./materialReadyService.js');
+      const words = rel ? await materialWaitWords(db, c.companyId, rel.order_line_id, [req.item_id]) : [];
+      if (words.length) waiting = ` It is waiting on — ${words.join(' ')}`;
+    } catch { /* the refusal below is what matters; it is said without the detail */ }
+    throw invalid('MATERIAL_NOT_RESERVED', `${label} needs ${fmt(qty)} — only ${fmt(reserved)} is in stock and reserved for it. Receive and reserve it before starting.${waiting}`, { detail: { itemId: req.item_id, requirementId: req.id } });
   }
   let left = qty;
   const legs = [];

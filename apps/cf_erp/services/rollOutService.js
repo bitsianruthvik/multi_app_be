@@ -110,8 +110,19 @@ const OWN_HOLD = 'ho.id IS NOT NULL AND so.id IS NOT NULL AND ho.code_active = s
  * can read them ONCE and keep them current in memory as it claims stock
  * (releaseService.reserveRelease), through the same shapeAvailability.
  * opts.orderId — see availability(). Rows of someone else's lots are left out.
+ * opts.lineId  — (init.sql §56) the order LINE asked about: a hold that belongs
+ *                to ANOTHER line's requisition line of the same order is not this
+ *                line's to take (it stays reserved); a hold with no requisition
+ *                line is the whole order's, as before.
+ * opts.holds   — 'own' (default): the order's own holds count as free for it.
+ *                'none': they stay reserved like anybody's — what the STOCK CHECK
+ *                asks, so stock already held for the order is not held twice.
  */
-export async function availabilityRows(db, companyId, itemIds, { orderId = null } = {}) {
+export async function availabilityRows(db, companyId, itemIds, { orderId = null, lineId = null, holds = 'own' } = {}) {
+  const byLine = holds !== 'none' && lineId != null;
+  const ownHold = holds === 'none' ? '0'
+    : byLine ? `(${OWN_HOLD} AND (v.pr_line_id IS NULL OR prl.order_line_id = ${Number(lineId)}))` : OWN_HOLD;
+  const prJoin = byLine ? 'LEFT JOIN cf_requisition_lines prl ON prl.id = v.pr_line_id AND prl.deleted_at IS NULL' : '';
   // Side by side: neither read needs the other.
   const [[bal], [res]] = await Promise.all([db.query(
     `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.code AS batch_code, b.status AS batch_status, b.received_on,
@@ -126,13 +137,14 @@ export async function availabilityRows(db, companyId, itemIds, { orderId = null 
      HAVING owner_scope < 2`,
     [orderId, companyId, itemIds],
   ), db.query(
-    `SELECT v.item_id, v.batch_id, SUM(IF(${OWN_HOLD}, 0, v.quantity)) AS qty, SUM(IF(${OWN_HOLD}, v.quantity, 0)) AS own_held,
+    `SELECT v.item_id, v.batch_id, SUM(IF(${ownHold}, 0, v.quantity)) AS qty, SUM(IF(${ownHold}, v.quantity, 0)) AS own_held,
             MAX(${OWNER_SCOPE}) AS owner_scope
        FROM cf_stock_reservations v
        LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
        LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
        LEFT JOIN cf_sales_orders so ON so.company_id = v.company_id AND so.id = ?
        LEFT JOIN cf_sales_orders ho ON ho.id = v.held_for_order_id
+       ${prJoin}
       WHERE v.company_id = ? AND v.item_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
       GROUP BY v.item_id, v.batch_id
      HAVING owner_scope < 2`,

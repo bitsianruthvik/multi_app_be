@@ -52,6 +52,7 @@ import { layoutDriftOfLines, driftSentence, FREEZE_FIRST } from './nestingServic
 import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
+import { lineReadiness, dayWords, DATED_PO_STATUSES } from './materialReadyService.js';
 
 /**
  * Backend B's section nesting state for a line — { needed, accepted } — asked
@@ -498,31 +499,59 @@ export const STAGE_CATALOGUE = [
       }
       const rows = ctx.buyRows;
       if (!rows.length) return { state: 'done', detail: 'Nothing to buy', blockers: [] };
-      // Covered = held for the line, free in stock, or on order. On order counts:
-      // the plan's "done when every material is covered (held / free / on order)".
-      const open = rows.filter((m) => m.held + m.free + m.onOrder + EPS < m.required);
-      const onOrderOnly = rows.filter((m) => m.held + m.free + EPS < m.required && m.held + m.free + m.onOrder + EPS >= m.required);
+      /*
+       * BUYING V2 (init.sql §56, TM/CF_ERP_BUYING_V2.md): the rows are the
+       * material-ready engine's — the one the planner and release read — so
+       * this stage and the board cannot disagree. A material is DECIDED when
+       * it is held for the line (stock check, receipt, reservation, issue), on
+       * a purchase order WITH A RECEIVING DATE, or its buying was SKIPPED (it
+       * waits for stock). Free stock nobody earmarked is not a decision, and
+       * neither is a request with no date. The stage is done when every
+       * material is decided; the detail says how many are skipped / waiting.
+       */
+      // A line the engine does not answer for (its order is not open; a catalog line not released) is judged as it
+      // always was: free stock and what is on order for the item count.
+      const here = (m) => m.held + (m.legacy ? m.free : 0);
+      const decided = (m) => m.skipped || here(m) + m.onOrder + EPS >= m.required;
+      const open = rows.filter((m) => !decided(m));
+      const skipped = rows.filter((m) => m.skipped && here(m) + m.onOrder + EPS < m.required);
+      const waiting = skipped.filter((m) => m.state === 'waiting');
+      const skippedWords = skipped.length
+        ? `${skipped.length} skipped${waiting.length ? ` (${waiting.length} waiting for stock)` : ' (in stock now)'}` : '';
       // A catalog line has no freeze, so the buy list counts it once it is released.
       const unreleasedHint = open.length && ctx.buySource === 'estimate' && !ctx.release && ctx.made.length > 0
         ? { stageKey: 'production', message: 'Release the line first — the buy list counts this line once it is released.' } : null;
       if (!open.length) {
+        const fromStock = rows.filter((m) => here(m) + EPS >= m.required).length;
+        const onOrder = rows.length - fromStock - skipped.length;
+        const last = rows.map((m) => m.date).filter((d) => d && d > ctx.today).sort().at(-1);
+        const parts = [
+          fromStock ? `${fromStock} held in stock` : '',
+          onOrder ? `${onOrder} on order${last ? `, last delivery ${dayWords(last)}` : ''}` : '',
+          skippedWords,
+        ].filter(Boolean);
         return {
           state: 'done',
-          detail: onOrderOnly.length
-            ? `All ${n(rows.length, 'material')} covered — ${onOrderOnly.length} on order`
-            : `All ${n(rows.length, 'material')} held or in stock`,
+          detail: `All ${n(rows.length, 'material')} decided — ${parts.join(', ')}`,
           blockers: [],
+          summary: { materials: rows.length, fromStock, onOrder, skipped: skipped.length, waiting: waiting.length, open: 0 },
         };
       }
-      const short = (m) => round6(m.required - m.held - m.free - m.onOrder);
+      const why = (m) => {
+        const lack = round6(m.required - here(m) - m.onOrder);
+        if (m.asked + EPS >= lack) return `${m.label} asked for, not ordered with a date`;
+        if (m.free + EPS >= lack) return `${m.label} in stock but not held`;
+        return `${m.label} short ${lack}`;
+      };
       return {
         state: open.length < rows.length ? 'partial' : 'todo',
-        detail: `${n(open.length, 'material')} to buy — ${nameList(open.map((m) => `${m.label} short ${short(m)}`))}`,
+        detail: `${n(open.length, 'material')} to decide — ${nameList(open.map(why))}${skippedWords ? ` · ${skippedWords}` : ''}`,
         blockers: [{
           count: open.length,
-          message: `Line ${ctx.line.line_no} is short of ${n(open.length, 'material')} with nothing on order — ${nameList(open.map((m) => m.label), 3)}.`,
+          message: `Line ${ctx.line.line_no} has ${n(open.length, 'material')} with no decision yet — hold stock, order with a date, or skip: ${nameList(open.map((m) => m.label), 3)}.`,
         }],
         waitingOn: unreleasedHint,
+        summary: { materials: rows.length, skipped: skipped.length, waiting: waiting.length, open: open.length },
       };
     },
   },
@@ -1265,19 +1294,8 @@ async function loadOrderContext(db, companyId, order, lines) {
   const lockedLines = lines.filter((l) => l.locked_at).map((l) => l.id);
   const temporaryIds = [...itemIds].filter((id) => detail.get(id)?.item_type === 'temporary');
 
-  const onOrderOf = async (ids) => {
-    if (!ids.length) return [];
-    const [rows] = await db.query(
-      `SELECT l.item_id, SUM(GREATEST(l.quantity - l.qty_received, 0)) AS outstanding
-         FROM cf_purchase_order_lines l
-         JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
-        WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.item_id IN (?)
-          AND p.status IN ('requested','quoting','draft','ordered','partially_received')
-        GROUP BY l.item_id`,
-      [companyId, ids],
-    );
-    return rows;
-  };
+  // What is on order, and whether each line's material is ready, come from THE material-ready engine
+  // (materialReadyService, §56) — one status set for "a purchase order that gives a date", for every reader.
 
   // 5. Releases and how far their steps have got — then, for the released
   //    lines, their requirements; for the frozen ones, the planned material.
@@ -1373,12 +1391,12 @@ async function loadOrderContext(db, companyId, order, lines) {
   })();
 
   const [
-    free, poRows, rel, lots, spec, [blankRows], [pieceRows], cut, [cutClassRows],
+    free, ready, rel, lots, spec, [blankRows], [pieceRows], cut, [cutClassRows],
   ] = await Promise.all([
     // 3. Free stock, once, for every item that could be drawn from it.
     itemIds.size ? availability(db, companyId, [...itemIds]) : new Map(),
-    // 4. What is already on order, so "short" can tell waiting from missing.
-    onOrderOf([...itemIds]),
+    // 4. The material-ready state of every open line (this order's among them, in claim order with the rest).
+    lineReadiness(db, companyId, { full: true }),
     releasesStage,
     lotsStage,
     specStage,
@@ -1411,7 +1429,11 @@ async function loadOrderContext(db, companyId, order, lines) {
     db.query("SELECT blanks_node_id AS id FROM cf_cut_places WHERE company_id = ? AND kind = 'plate' AND blanks_node_id IS NOT NULL", [companyId]),
   ]);
 
-  const onOrder = new Map(poRows.map((r) => [r.item_id, Number(r.outstanding) || 0]));
+  // On order = still to come on purchase orders placed with a date-giving status (ordered / part received).
+  const onOrder = new Map();
+  for (const p of ready.supply.poLines) {
+    if (DATED_PO_STATUSES.includes(p.status)) onOrder.set(p.itemId, round6((onOrder.get(p.itemId) ?? 0) + Math.max(0, p.quantity - p.received)));
+  }
   const { releases, planned, reqRows } = rel;
   const { lotsBy, driftBy, leftOutBy } = lots;
   const { chains, nestSpec, nestingBy, values } = spec;
@@ -1435,18 +1457,17 @@ async function loadOrderContext(db, companyId, order, lines) {
     if (!requiredBy.has(r.order_line_id)) requiredBy.set(r.order_line_id, []);
     requiredBy.get(r.order_line_id).push({ id: r.item_id, label: r.code ?? r.name, required: round6(r.wanted), held: round6(r.held) });
   }
-  // Free stock and on-order for what those name that the trees did not (a nest's plates).
+  // Free stock for what those name that the trees did not (a nest's plates) — only a line the engine
+  // does not answer for (its order is not open) still reads it from here.
   const extra = [...new Set([
     ...reqRows.map((r) => r.item_id),
     ...[...planned.values()].flatMap((p) => p.reqs.map((q) => q.itemId)),
   ])].filter((id) => !itemIds.has(id));
-  if (extra.length) {
-    const [more, ooRows] = await Promise.all([availability(db, companyId, extra), onOrderOf(extra)]);
-    for (const [id, v] of more) free.set(id, v);
-    for (const r of ooRows) onOrder.set(r.item_id, Number(r.outstanding) || 0);
+  if (extra.length && lines.some((l) => !ready.byLine.get(Number(l.id))?.known)) {
+    for (const [id, v] of await availability(db, companyId, extra)) free.set(id, v);
   }
 
-  return { trees, detail, free, onOrder, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
+  return { trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }
 
 /**
@@ -1531,7 +1552,34 @@ function splitLine(ctx, order, line) {
  * splitLine has always done.
  */
 function buyRowsOf(ctx, line, material) {
-  const withStock = (m) => ({ ...m, free: ctx.free.get(m.id)?.free ?? 0, onOrder: ctx.onOrder.get(m.id) ?? 0 });
+  /*
+   * THE ENGINE'S ROWS (materialReadyService, §56) when it answers for this
+   * line — an open order whose material is known. Per material:
+   *   held     issued + reserved + held for the line or its order   (here today)
+   *   onOrder  purchase lines bought FOR it, placed, with a date
+   *   asked    bought for it but only requested / quoting, or ordered with no date
+   *   free     unearmarked stock the engine found for the rest (soft)
+   *   pooled   dated purchase lines bought for nobody that could serve it (soft)
+   *   short    covered by nothing · skipped: buying was skipped for it
+   *   state / date / text: the engine's own for this material
+   */
+  const res = ctx.ready?.byLine.get(Number(line.id));
+  if (res?.known) {
+    const sum = (r, pred) => round6(r.cover.filter(pred).reduce((t, x) => t + x.qty, 0));
+    return {
+      buySource: ctx.releases.has(line.id) ? 'released' : 'planned',
+      buyRows: res.reasons.map((r) => ({
+        id: r.item.id, label: r.item.code ?? r.item.name, required: r.need,
+        held: sum(r, (x) => x.kind === 'issued' || x.kind === 'reserved' || x.kind === 'held'),
+        onOrder: sum(r, (x) => x.kind === 'po' && !x.pooled && x.status === 'dated'),
+        asked: sum(r, (x) => x.kind === 'po' && x.status !== 'dated'),
+        free: sum(r, (x) => x.kind === 'free'),
+        pooled: sum(r, (x) => x.kind === 'po' && !!x.pooled),
+        short: r.short, skipped: !!r.skipped, state: r.state, date: r.date, text: r.text,
+      })),
+    };
+  }
+  const withStock = (m) => ({ ...m, free: ctx.free.get(m.id)?.free ?? 0, onOrder: ctx.onOrder.get(m.id) ?? 0, asked: 0, pooled: 0, short: 0, skipped: false, state: null, date: null, legacy: true });
   const released = ctx.releases.has(line.id);
   if (released) return { buySource: 'released', buyRows: (ctx.requiredBy.get(line.id) ?? []).map(withStock) };
   const planned = ctx.planned.get(Number(line.id));
@@ -1593,6 +1641,7 @@ function lineContext(ctx, order, line) {
     confirmed: ['confirmed', 'closed'].includes(orderStatusOf(order)),
     planned: ctx.planned.get(Number(line.id)) ?? null,
     ...buyRowsOf(ctx, line, split.material),
+    today: ctx.ready?.today ?? null,
     lock: { lockedAt: line.locked_at ?? null, pieces: ctx.locksBy.get(line.id)?.pieces ?? 0 },
     // This line's plate parts, each once, and whether each has its cut piece.
     cut: { parts: [...new Set(split.made.map((x) => x.id))].map((id) => ctx.partById.get(id)).filter(Boolean) },
@@ -1657,6 +1706,8 @@ function stageForLine(stage, kind, ctx, overrideValue) {
     // One line saying what this stage is waiting on, and where to go for it.
     // Only while the stage is not done.
     waitingOn: out.state === 'done' ? null : out.waitingOn ?? null,
+    // Buying (§56): how many materials are decided / skipped / waiting — the numbers behind the detail.
+    ...(out.summary ? { summary: out.summary } : {}),
   };
 }
 

@@ -16,8 +16,9 @@ import {
   buyList, getPurchaseOrder, insertOrder, requireSupplier, PRE_ORDER_STATUSES, PO_STATUS_LABEL,
 } from './purchaseService.js';
 import { getRfq, rfqComparison, upsertQuote, awardRfq } from './procurementService.js';
-import { requireLinkableOrder, insertAllocations, allocationsOf, linkedPoIds, heldForOrder } from './purchaseLinkService.js';
+import { requireLinkableOrder, insertAllocations, allocationsOf, linkedPoIds, heldForOrder, trimAllocations } from './purchaseLinkService.js';
 import { availability } from './releaseService.js';
+import { adoptOrderCover, orderRequisitions } from './requisitionService.js';
 import { lastPricesPaid, CURRENCY, round2 } from './priceService.js';
 
 const EPS = 1e-6;
@@ -100,6 +101,8 @@ export async function requestFromOrder(db, c, orderId, input = {}) {
       ids.map((id, k) => [c.companyId, poId, k + 1, id, clean.get(id), found.get(id).uom ?? 'nos', prices.get(id)?.unitPrice ?? null, CURRENCY]));
     const [made] = await db.query('SELECT id, item_id, quantity FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, poId]);
     await insertAllocations(db, c, made.map((l) => ({ lineId: l.id, orderId: order.id, quantity: Number(l.quantity) })));
+    // §56: where the order's lines have requisitions, the request is handed to their lines (in line order, each up to what it lacks).
+    await adoptOrderCover(db, c, [order.id]);
     return getPurchaseOrder(db, c.companyId, poId);
   }
   assertNoProblems(problems, 'The request cannot be raised.');
@@ -122,7 +125,8 @@ export async function stockCheck(db, c, poId) {
   const p = await requirePo(db, c.companyId, poId);
   const orderId = await orderOfPo(db, c.companyId, p);
   const lines = await poLines(db, c.companyId, p.id);
-  const av = lines.length ? await availability(db, c.companyId, lines.map((l) => l.item_id), { orderId }) : new Map();
+  // holds: 'none' — what is already held for this order is cover it has, not stock it could hold again (§56).
+  const av = lines.length ? await availability(db, c.companyId, lines.map((l) => l.item_id), { orderId, holds: 'none' }) : new Map();
   return {
     purchaseOrder: { id: p.id, code: p.code, status: p.status, stockCheckedAt: p.stock_checked_at },
     orderId,
@@ -150,7 +154,8 @@ export async function applyStockCheck(db, c, poId, input = {}) {
   const lines = await poLines(db, c.companyId, p.id);
   const problems = [];
   if ([...want.values()].some((h) => h > EPS) && !orderId) problems.push(`${p.code} is not bought for one sales order — stock can only be held for an order.`);
-  const av = lines.length ? await availability(db, c.companyId, lines.map((l) => l.item_id), { orderId }) : new Map();
+  const av = lines.length ? await availability(db, c.companyId, lines.map((l) => l.item_id), { orderId, holds: 'none' }) : new Map();
+  const allocOf = await allocationsOf(db, c.companyId, lines.map((l) => l.id));
   const holds = [];
   for (const l of lines) {
     const h = round6(want.get(l.id) ?? 0);
@@ -162,25 +167,50 @@ export async function applyStockCheck(db, c, poId, input = {}) {
   }
   assertNoProblems(problems, 'The stock cannot be held.');
   for (const { l, h, e } of holds) {
+    /*
+     * WHOSE HOLD (§56). The line's shares for this order say which requisition
+     * line each part of it was asked for: the hold is cut the same way, in the
+     * order of the shares, so the stock lands on the requisition line it
+     * replaces buying for. A share with no requisition line — and anything
+     * beyond the shares — is held for the order as a whole, as before.
+     */
+    const shares = [];
+    let toShare = h;
+    for (const a of (allocOf.get(l.id) ?? []).filter((x) => x.orderId === orderId)) {
+      if (toShare <= EPS) break;
+      const t = round6(Math.min(toShare, Math.max(0, a.quantity - a.received)));
+      if (t <= EPS) continue;
+      shares.push({ prLineId: a.prLineId ?? null, quantity: t });
+      toShare = round6(toShare - t);
+    }
+    if (toShare > EPS) shares.push({ prLineId: null, quantity: toShare });
     // Lots first for an item kept by batch (oldest first), else loose stock.
-    let left = h;
+    const lots = l.tracked_by === 'batch'
+      ? (e?.batches ?? []).filter((x) => x.status === 'available' && x.free > EPS).map((b) => ({ batchId: b.batchId, free: b.free }))
+      : [{ batchId: null, free: h }];
     const rows = [];
-    if (l.tracked_by === 'batch') {
-      for (const b of (e?.batches ?? []).filter((x) => x.status === 'available' && x.free > EPS)) {
+    for (const s of shares) {
+      let left = s.quantity;
+      for (const b of lots) {
         if (left <= EPS) break;
-        const t = Math.min(left, b.free);
-        rows.push([c.companyId, orderId, null, l.item_id, b.batchId, round6(t), c.userId ?? null]);
+        const t = round6(Math.min(left, b.free));
+        if (t <= EPS) continue;
+        rows.push([c.companyId, orderId, s.prLineId, null, l.item_id, b.batchId, t, c.userId ?? null]);
+        b.free = round6(b.free - t);
         left = round6(left - t);
       }
-    } else rows.push([c.companyId, orderId, null, l.item_id, null, round6(left), c.userId ?? null]);
-    await insertRows(db, 'cf_stock_reservations', ['company_id', 'held_for_order_id', 'purchase_line_id', 'item_id', 'batch_id', 'quantity', 'created_by'], rows);
+    }
+    await insertRows(db, 'cf_stock_reservations', ['company_id', 'held_for_order_id', 'pr_line_id', 'purchase_line_id', 'item_id', 'batch_id', 'quantity', 'created_by'], rows);
     const rest = round6(Number(l.quantity) - h);
     if (rest <= EPS) {
       await db.query('UPDATE cf_purchase_order_lines SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, l.id]);
       await db.query('UPDATE cf_purchase_line_orders SET deleted_at = NOW() WHERE company_id = ? AND purchase_line_id = ? AND deleted_at IS NULL', [c.companyId, l.id]);
     } else {
       await db.query('UPDATE cf_purchase_order_lines SET quantity = ? WHERE company_id = ? AND id = ?', [rest, c.companyId, l.id]);
-      await db.query('UPDATE cf_purchase_line_orders SET quantity = LEAST(quantity, ?) WHERE company_id = ? AND purchase_line_id = ? AND deleted_at IS NULL', [rest, c.companyId, l.id]);
+      // The shares give way, newest first, never below what arrived — so they never add up to more than the line.
+      const trimProblems = [];
+      await trimAllocations(db, c, l, rest, trimProblems);
+      assertNoProblems(trimProblems, 'The stock cannot be held.');
     }
   }
   const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, p.id]);
@@ -299,6 +329,14 @@ export async function placeOrder(db, c, poId, input = {}) {
           WHERE company_id = ? AND id = ?`,
         [target, no++, r.unit_price, r.quote_line_id, r.lead_time_days != null ? addDays(today, r.lead_time_days) : null, ...(qty != null ? [qty] : []), c.companyId, r.po_line_id],
       );
+      // The supplier offered less than was asked: the line's shares (sales orders, requisition lines — §56)
+      // give way to the quantity ordered, so nothing counts steel that was never ordered. The shares themselves
+      // travel with the line: they name the PO line, not the purchase order.
+      if (qty != null && qty < Number(r.quantity) - EPS) {
+        const trimProblems = [];
+        await trimAllocations(db, c, { id: r.po_line_id }, qty, trimProblems);
+        assertNoProblems(trimProblems, 'The order cannot be placed.');
+      }
     }
     const lead = Math.max(0, ...mine.map((r) => Number(r.lead_time_days ?? 0)));
     await db.query("UPDATE cf_purchase_orders SET status = 'ordered', supplier_id = ?, ordered_at = NOW(), suggested = 0, expected_date = ? WHERE company_id = ? AND id = ?",
@@ -394,6 +432,10 @@ export async function purchaseBoard(db, companyId, q = {}) {
 
 /** GET /orders/:id/purchase — a sales order's buying: its shortfall, its POs by lane, and the stock held for it. */
 export async function orderPurchase(db, companyId, orderId) {
-  const [shortfall, board, held] = await Promise.all([orderShortfall(db, companyId, orderId), purchaseBoard(db, companyId, { orderId }), heldForOrder(db, companyId, orderId)]);
-  return { shortfall, lanes: board.lanes, held };
+  const [shortfall, board, held, reqs] = await Promise.all([
+    orderShortfall(db, companyId, orderId), purchaseBoard(db, companyId, { orderId }), heldForOrder(db, companyId, orderId),
+    // §56: the order's requisitions with their cover and material-ready state (and the lines that have none yet).
+    orderRequisitions(db, companyId, orderId),
+  ]);
+  return { shortfall, lanes: board.lanes, held, requisitions: reqs.requisitions, linesWithout: reqs.linesWithout, today: reqs.today };
 }

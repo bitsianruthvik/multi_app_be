@@ -48,6 +48,7 @@ import { revisedOrderMessage, latestRevisionSql } from './records.js';
 import { snapshotSubtrees, writeCopies, cutPlateNodes, deleteTemporaryItems } from './treeCopyService.js';
 import { refreshCutPieces, rectangleChoices } from './cutPlateService.js';
 import { getOrder } from './salesOrderService.js';
+import { carryRequisitions, returnRequisitions } from './requisitionLifecycle.js';
 
 /** The commercial stages a customer order may be revised in. */
 const REVISABLE = new Set(['inquiry', 'quoted', 'confirmed']);
@@ -149,6 +150,8 @@ export async function reviseOrder(db, c, orderId) {
     [companyId, newId],
   );
   const newLineOf = new Map(fresh.map((l) => [Number(l.revises_line_id), l]));
+  // Each line's requisition (§56) moves to its copy: the holds, purchase allocations and skips stay with the live line.
+  await carryRequisitions(db, companyId, newId);
 
   // ---- the rows of every custom line: one deep copy for the whole order -------
   const custom = lines.filter((l) => l.line_type === 'custom' && l.item_id);
@@ -252,6 +255,9 @@ export async function discardRevision(db, c, orderId) {
   if (!prev || prev.status !== 'revised') {
     throw invalid('NO_PREVIOUS', `The revision ${label} replaced is not there to go back to, so it cannot be discarded. Cancel it instead.`);
   }
+
+  // The requisitions go back to the lines they came from (§56), before this revision's lines are deleted.
+  await returnRequisitions(db, companyId, o.id);
 
   // ---- everything the revision holds, in bulk ---------------------------------
   const lineIds = lines.map((l) => l.id);

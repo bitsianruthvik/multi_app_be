@@ -1110,6 +1110,21 @@ export async function releasePreview(db, companyId, lineId) {
  * What releasing a line would create, and what stops it — nothing is written.
  * { ok, problems, summary: { pieces, groups, steps, waits, requirements }, materials }
  */
+async function materialReadyOfLine(db, companyId, lineId) {
+  // Imported when asked for: materialReadyService reads planned material from this module.
+  const { lineReadiness, shapeLineReady } = await import('./materialReadyService.js');
+  const all = await lineReadiness(db, companyId, { full: true });
+  return shapeLineReady(all.byLine.get(Number(lineId)));
+}
+
+/** What a step's material is waiting on, in words (requisition, purchase order, date) — for the refusal to start it. */
+async function materialWaitOf(db, companyId, step) {
+  const [rows] = await db.query('SELECT DISTINCT item_id FROM cf_material_requirements WHERE company_id = ? AND step_id = ? AND deleted_at IS NULL', [companyId, step.id]);
+  if (!rows.length || !step.order_line_id) return [];
+  const { materialWaitWords } = await import('./materialReadyService.js');
+  return (await materialWaitWords(db, companyId, step.order_line_id, rows.map((r) => r.item_id))).map((t) => `Waiting on — ${t}`);
+}
+
 export async function releaseCheck(db, companyId, lineId) {
   const line = await requireLine(db, companyId, lineId);
   const plan = await planFor(db, companyId, line);
@@ -1172,6 +1187,9 @@ export async function releaseCheck(db, companyId, lineId) {
     },
     truncated: !!plan.truncated,
     materials: await materialSummary(db, companyId, plan.reqs ?? [], { orderId: line.order_id ?? null }),
+    // §56: the material-ready engine's answer for the line (TM/CF_ERP_BUYING_V2.md §4). Never a problem of the release:
+    // a line is released with material missing — its units cannot be PLANNED, and its steps cannot START, until it is here.
+    materialReady: await materialReadyOfLine(db, companyId, line.id),
   };
 }
 
@@ -1376,6 +1394,17 @@ export async function unrelease(db, c, releaseId) {
   if (Number(started)) throw conflict('STARTED', `Work has started on line ${rel.line_no} of ${rel.order_code} (${started} step${Number(started) === 1 ? '' : 's'}) — a started release is not taken back.`);
   const [[{ issued }]] = await db.query('SELECT COALESCE(SUM(issued), 0) AS issued FROM cf_material_requirements WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL', [c.companyId, releaseId]);
   if (Number(issued) > EPS) throw conflict('ISSUED', `Material was already issued to line ${rel.line_no} of ${rel.order_code} — a release with issues is not taken back.`);
+  // §56: what was reserved for a material the line has a REQUISITION line for goes back to that line as a hold —
+  // it was earmarked for this order, and taking the release back does not hand it to another one. The rest is let go.
+  await db.query(
+    `UPDATE cf_stock_reservations v
+       JOIN cf_material_requirements q ON q.id = v.requirement_id
+       JOIN cf_production_releases r ON r.id = q.release_id
+       JOIN cf_requisition_lines pl ON pl.company_id = v.company_id AND pl.order_line_id = r.order_line_id AND pl.item_id = v.item_id AND pl.deleted_at IS NULL
+        SET v.requirement_id = NULL, v.held_for_order_id = r.order_id, v.pr_line_id = pl.id
+      WHERE v.company_id = ? AND q.release_id = ? AND v.status = 'active'`,
+    [c.companyId, releaseId],
+  );
   await db.query(
     `UPDATE cf_stock_reservations v JOIN cf_material_requirements q ON q.id = v.requirement_id
         SET v.status = 'released', v.closed_at = NOW()
@@ -1998,7 +2027,7 @@ export function readAt(raw, releaseEpoch) {
 
 async function requireStep(db, companyId, stepId) {
   const [[s]] = await db.query(
-    `SELECT s.*, pi.release_id, r.order_id, UNIX_TIMESTAMP(r.created_at) AS release_epoch, o.code AS order_code, o.status AS order_status, op.code AS op_code, op.name AS op_name
+    `SELECT s.*, pi.release_id, r.order_id, r.order_line_id, UNIX_TIMESTAMP(r.created_at) AS release_epoch, o.code AS order_code, o.status AS order_status, op.code AS op_code, op.name AS op_name
        FROM cf_production_steps s
        JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
        JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
@@ -2070,6 +2099,8 @@ export async function startStep(db, c, stepId, input = {}) {
   const beforeReady = s.status === 'not_ready' && !!input.allowNotReady;
   if (s.status !== 'ready' && !beforeReady) {
     const why = s.status === 'not_ready' ? s.blockers.map((b) => b.text) : [`It is ${s.status.replace('_', ' ')}.`];
+    // §56: a step held up by material says what that material is waiting on — the requisition, the purchase order, the date.
+    if (s.status === 'not_ready' && s.blockers.some((b) => b.kind === 'material')) why.push(...await materialWaitOf(db, c.companyId, step));
     throw invalid('NOT_READY', `${s.label} cannot start yet.`, { problems: why });
   }
   let machineId = null;
@@ -2402,13 +2433,14 @@ async function reserveOne(db, c, q, input = {}) {
   const have = sum(await activeReservations(db, c.companyId, q.id));
   const w = wanted(q, have, input);
   if (w.done) return w.done;
-  const av = (await availability(db, c.companyId, [q.item_id], { orderId: q.order_id })).get(q.item_id);
+  // §56: what is held for ANOTHER line's requisition line of this order is not this line's to take.
+  const av = (await availability(db, c.companyId, [q.item_id], { orderId: q.order_id, lineId: q.order_line_id })).get(q.item_id);
   const { rows, result } = takeFrom(q, w.want, av, input);
   await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, rows.map((r) => reservationRow(c, q, r)));
   // What was held for this order (§43) is free for it: the claim moves off the hold onto the requirement.
   if (rows.length) {
     const holds = await ownHoldRows(db, c.companyId, q.order_id, [q.item_id], { lock: true });
-    if (holds.length) await writeHoldTakes(db, c.companyId, rows.flatMap((r) => takeHolds(holds, q.item_id, r.batchId, r.quantity)));
+    if (holds.length) await writeHoldTakes(db, c.companyId, rows.flatMap((r) => takeHolds(holds, q.item_id, r.batchId, r.quantity, q.order_line_id)));
   }
   return result;
 }
@@ -2485,7 +2517,8 @@ export async function reserveRelease(db, c, releaseId, opts = {}) {
         [c.companyId, reqs.map((q) => q.id)],
       );
       const heldOf = groupBy(held, 'requirement_id');
-      const { bal, res } = await availabilityRows(db, c.companyId, itemIds, { orderId: rel.order_id });
+      // §56: the line's own requisition holds and the order's count as free for it — never another line's.
+      const { bal, res } = await availabilityRows(db, c.companyId, itemIds, { orderId: rel.order_id, lineId: rel.order_line_id });
       const stock = freeStock(bal, res);
       const writes = [];
       // The order's holds (§43) count as free for it; each claim on that stock is taken off a hold.
@@ -2499,7 +2532,7 @@ export async function reserveRelease(db, c, releaseId, opts = {}) {
           for (const r of took.rows) {
             stock.claim(q.item_id, r.batchId, r.quantity);
             writes.push(reservationRow(c, q, r));
-            if (holds.length) holdTakes.push(...takeHolds(holds, q.item_id, r.batchId, r.quantity));
+            if (holds.length) holdTakes.push(...takeHolds(holds, q.item_id, r.batchId, r.quantity, q.order_line_id));
           }
           out = took.result;
         }

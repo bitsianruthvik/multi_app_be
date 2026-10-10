@@ -5159,3 +5159,117 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_runs' AND INDEX_NAME = 'idx_cnr_live');
 SET @sql = IF(@key = 0, 'ALTER TABLE cf_nest_runs ADD KEY idx_cnr_live (status, heartbeat_at)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §56  Buying v2 (2026-10-10): the REQUISITION, and production that really waits for its material
+-- ============================================================================
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_BUYING_V2.md. Services: requisitionService.js
+-- (the requisition), materialReadyService.js (the one material-ready engine, on the server).
+--
+-- cf_requisitions        ONE live requisition (PR) per SALES-ORDER LINE (uq_crq_line). It is the record the old flow
+--                        never had: a "request" was a purchase order in status requested, and a request met from
+--                        stock was a CANCELLED purchase order. New tables, not cf_purchase_requests: those are a
+--                        buyer's document across orders (draft -> submitted -> approved, lines with a JSON source),
+--                        still read by the buy list as "in request" - a per-line requisition in them would be
+--                        counted twice and would need an approval it does not have.
+--                        A requisition has NO stored status: it is worked out from its lines on every read.
+-- cf_requisition_lines   one line per MATERIAL the order line needs (uq_crql_item). quantity = the need when the
+--                        lines were last brought up to date (the live need is always read from the line itself:
+--                        a released line's requirements, a frozen line's planned material). A line is covered by
+--                        any mix of
+--                          stock      holds made by the STOCK CHECK (cf_stock_reservations.pr_line_id)
+--                          purchase   allocations of purchase order lines (cf_purchase_line_orders.pr_line_id),
+--                                     each with its own quantity; its date is the PO line's, else the PO's
+--                          skip       skipped = 1, with who / when / why: this material will not be bought for this
+--                                     line - it waits for stock.
+-- cf_purchase_line_orders.pr_line_id   the requisition line an allocation is for. NULL = bought for the order as a
+--                        whole (every row written before this section) - usable by any line of that order.
+--                        Two lines of ONE order may now share a PO line, so the unique key becomes
+--                        (purchase_line_id, order_live, pr_key): pr_key = the requisition line, 0 for none.
+-- cf_stock_reservations.pr_line_id     the requisition line a HOLD belongs to (held_for_order_id stays set, so every
+--                        older reader still sees the order's hold). NULL = held for the order as a whole.
+-- cf_plan_entries.material_state / material_date   what the material-ready engine said when the card was placed, so
+--                        a later read can say what changed ("was 20 Oct, now 14 Nov").
+-- Two statements where a new column gets an index: TiDB refuses an index on a column added in the same ALTER.
+CREATE TABLE IF NOT EXISTS cf_requisitions (
+  id             INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT          NOT NULL,
+  code           VARCHAR(140) NOT NULL,
+  order_id       INT          NOT NULL,
+  order_line_id  INT          NOT NULL,
+  notes          VARCHAR(500) NULL,
+  synced_at      DATETIME     NULL,
+
+  deleted_at     DATETIME     DEFAULT NULL,
+  created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT          NULL,
+  line_live      INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, order_line_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_crq_tenant (company_id, id),
+  UNIQUE KEY uq_crq_line   (company_id, line_live),
+  KEY idx_crq_order (company_id, order_id),
+
+  CONSTRAINT fk_crq_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crq_order   FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_crq_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_crq_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS cf_requisition_lines (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  requisition_id INT           NOT NULL,
+  order_line_id  INT           NOT NULL,
+  item_id        INT           NOT NULL,
+  quantity       DECIMAL(18,6) NOT NULL DEFAULT 0,
+  uom            VARCHAR(20)   NULL,
+  skipped        TINYINT       NOT NULL DEFAULT 0,
+  skipped_by     INT           NULL,
+  skipped_at     DATETIME      NULL,
+  skip_note      VARCHAR(500)  NULL,
+
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  item_live      INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, item_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_crql_tenant (company_id, id),
+  UNIQUE KEY uq_crql_item   (requisition_id, item_live),
+  KEY idx_crql_line (company_id, order_line_id, item_id),
+  KEY idx_crql_item (company_id, item_id),
+
+  CONSTRAINT fk_crql_company     FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crql_requisition FOREIGN KEY (company_id, requisition_id) REFERENCES cf_requisitions(company_id, id),
+  CONSTRAINT fk_crql_item        FOREIGN KEY (company_id, item_id) REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_crql_skipper     FOREIGN KEY (skipped_by) REFERENCES users(id),
+  CONSTRAINT fk_crql_creator     FOREIGN KEY (created_by) REFERENCES users(id)
+);
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'pr_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_line_orders ADD COLUMN pr_line_id INT NULL AFTER order_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'pr_key');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_line_orders ADD COLUMN pr_key INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, COALESCE(pr_line_id, 0), NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND INDEX_NAME = 'uq_cplo_line_order_pr');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_purchase_line_orders ADD UNIQUE KEY uq_cplo_line_order_pr (purchase_line_id, order_live, pr_key)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- The old key allowed one allocation per (PO line, order). It goes only once the wider key above is there.
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND INDEX_NAME = 'uq_cplo_line_order');
+SET @sql = IF(@key > 0, 'ALTER TABLE cf_purchase_line_orders DROP INDEX uq_cplo_line_order', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND INDEX_NAME = 'idx_cplo_pr_line');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_purchase_line_orders ADD KEY idx_cplo_pr_line (company_id, pr_line_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND COLUMN_NAME = 'pr_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_reservations ADD COLUMN pr_line_id INT NULL AFTER held_for_order_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_reservations' AND INDEX_NAME = 'idx_csrv_pr_line');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_stock_reservations ADD KEY idx_csrv_pr_line (company_id, pr_line_id, status)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plan_entries' AND COLUMN_NAME = 'material_state');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plan_entries ADD COLUMN material_state VARCHAR(10) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plan_entries' AND COLUMN_NAME = 'material_date');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plan_entries ADD COLUMN material_date DATE NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

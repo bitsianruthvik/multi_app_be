@@ -75,7 +75,10 @@
  *   Nothing is paid per piece.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
-import { rollOutPlan, lockedBothOf, attachLockedCodes, availabilityRows, shapeAvailability } from './rollOutService.js';
+import { rollOutPlan, lockedBothOf, attachLockedCodes } from './rollOutService.js';
+import {
+  lineNeeds, loadSupply, evaluate, giveBack, takeAgain, orderRanks, orderKeyOf, today as clockToday, dayWords, DATED_PO_STATUSES,
+} from './materialReadyService.js';
 import { resolveLineRecords } from './orderValuesService.js';
 import { effectiveByCode, levelsOfResolution, dateText } from './resolutionService.js';
 import { loadMachineSide, flowSteps, opsOfFlow } from './timeEstimateService.js';
@@ -90,7 +93,8 @@ const UNIT_RE = /^(?:([pl])([1-9]\d*)(?:#([1-9]\d*))?|(g)([1-9]\d*)\.([1-9]\d*))
 const MAX_ENTRIES = 5000;
 const MAX_DEPTH_LEVEL = 15;
 const OPEN_ORDER_STATUSES = ['inquiry', 'quoted', 'confirmed'];
-const OPEN_PO_STATUSES = ['ordered', 'partially_received'];
+// One status set for "a purchase order that gives a date" — the material-ready engine's own (§56).
+const OPEN_PO_STATUSES = DATED_PO_STATUSES;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export const DEFAULT_SETTINGS = { minLinesPerMonth: 1, allowPartialLines: true };
 export const CONTRACTOR = 'contractor';
@@ -127,8 +131,20 @@ const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 const parseDate = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
-const todayText = () => dateText(new Date());
+// Today is the material-ready engine's today (one clock; a test can set it).
+const todayText = () => clockToday();
 const validDate = (s) => typeof s === 'string' && DATE_RE.test(s) && dateText(parseDate(s)) === s;
+/**
+ * The first plan period that STARTS on or after a date: periods are ISO weeks
+ * cut at month ends, so that is the date itself when it is a Monday or the
+ * first of a month, else the next one. Material that arrives on a Wednesday
+ * lets its work start the week after — the rule the board has always used.
+ */
+export function periodFloor(text) {
+  let d = parseDate(text);
+  while (!(d.getDay() === 1 || d.getDate() === 1)) d = addDays(d, 1);
+  return dateText(d);
+}
 
 /**
  * Every live placement of some lines with the area it is charged by (see the caller). One read.
@@ -207,7 +223,7 @@ async function loadOrderLines(db, companyId) {
   const [rows] = await db.query(
     `SELECT o.id AS order_id, o.code AS order_code, o.order_type, o.status AS order_status, o.committed_date AS order_committed,
             o.plan_priority, o.customer_id, p.name AS customer_name,
-            ol.id, ol.line_no, ol.item_id, ol.quantity, ol.made_qty, ol.delivered_qty, ol.committed_date,
+            ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.made_qty, ol.delivered_qty, ol.committed_date,
             ol.locked_at, ol.plan_level, ol.description, m.name AS item_name, m.code AS item_code,
             (SELECT r.id FROM cf_production_releases r
               WHERE r.company_id = ol.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
@@ -258,11 +274,27 @@ function valuesOf(resolutions, itemId) {
  * ======================================================================== */
 
 export async function getPlanner(db, companyId, q = {}) {
+  return (await buildSnapshot(db, companyId, q)).snapshot;
+}
+
+/**
+ * The snapshot, and the entries as they are STORED. `overrides` (a save being
+ * checked): Map(unitKey -> { shipDate, startDate, pinned } | null) laid over
+ * the stored entries, and Map(unitKey -> rank) over the stored ranks — the
+ * material-ready engine then answers for the plan as it would be saved.
+ */
+/*
+ * onlyOrderIds (a Set): build the UNITS of those orders only — the roll-out is paid for their lines alone —
+ * while every other open line still claims material, each as ONE consumer (its whole need, in the ranking's
+ * place; cards pinned on those other lines are not seen). What a purchase-line edit asks: "which planned
+ * cards of the orders this is bought for does it make late?" without a whole planner read.
+ */
+async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOverrides = null, onlyOrderIds = null } = {}) {
   const horizon = horizonOf(q.from);
   const today = todayText();
 
   // ---- orders, and what the company stored about the plan -------------------
-  const [lineRows, [[settingRow]], [targetRows], [entryRows], [machineRowsAll], [nodeRows], [rankRows], production] = await Promise.all([
+  const [allLineRows, [[settingRow]], [targetRows], [entryRows], [machineRowsAll], [nodeRows], [rankRows], production] = await Promise.all([
     loadOrderLines(db, companyId),
     // The settings row (if any) and WEIGHT's unit, in one read.
     db.query(
@@ -273,7 +305,7 @@ export async function getPlanner(db, companyId, q = {}) {
       [companyId, companyId],
     ),
     db.query('SELECT month, tonnes FROM cf_plan_targets WHERE company_id = ? ORDER BY month', [companyId]),
-    db.query('SELECT unit_key, ship_date, start_date, pinned FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+    db.query('SELECT unit_key, ship_date, start_date, pinned, material_state, material_date FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND status = 'active' AND deleted_at IS NULL", [companyId]),
     // The machine types: the nodes machines are filed under, with the nodes
     // above them (Family › Subfamily › Variant), in the same read.
@@ -289,6 +321,7 @@ export async function getPlanner(db, companyId, q = {}) {
     // Plan usage counts the machines that do production work, not the asset register.
     productionMachineIds(db, companyId),
   ]);
+  const lineRows = onlyOrderIds ? allLineRows.filter((l) => onlyOrderIds.has(Number(l.order_id))) : allLineRows;
   const machineRows = machineRowsAll.filter((m) => production.has(m.id));
   const weightToTonnes = String(settingRow?.weight_uom ?? 'kg').toLowerCase().startsWith('t') ? 1 : 0.001;
   const settings = settingRow?.min_lines_per_month != null
@@ -404,6 +437,9 @@ export async function getPlanner(db, companyId, q = {}) {
   const units = [];
   const orders = new Map();
   const materialItems = new Set();
+  // What each unit draws, as the roll-out shares it out — for EVERY line, released ones too: the
+  // material-ready engine shares a line's need over its units by it (unit.materials stays empty on a released line).
+  const unitShares = new Map();
 
   lineRows.forEach((line, li) => {
     const st = structures[li];
@@ -483,8 +519,9 @@ export async function getPlanner(db, companyId, q = {}) {
       }
     }
 
-    // Materials — not for a released line (release has its own requirements).
-    if (!released) {
+    // Materials. A released line has its own requirements, so its units LIST none (unit.materials) —
+    // but how its material is shared over its units is worked out all the same, for the engine.
+    {
       const placements = placementsOfLine.get(line.id) ?? [];
       const lotArea = new Map();
       for (const p of placements) lotArea.set(p.lot_id, (lotArea.get(p.lot_id) ?? 0) + Number(p.area || 0));
@@ -501,7 +538,7 @@ export async function getPlanner(db, companyId, q = {}) {
       const addMat = (k, itemId, qty) => {
         if (!(qty > 0)) return;
         own[k].materials.set(itemId, (own[k].materials.get(itemId) ?? 0) + qty);
-        materialItems.add(itemId);
+        if (!released) materialItems.add(itemId);
       };
       for (const r of st.reqs ?? []) {
         if (r.nodeK == null) continue;
@@ -689,6 +726,7 @@ export async function getPlanner(db, companyId, q = {}) {
     // The line unit.
     const lineWeight = weightOf(line.item_id);
     const lineDone = Number(line.made_qty ?? 0) >= Number(line.quantity) - 1e-9 || doneOf(lineAgg);
+    unitShares.set(lineKey, shapeMaterials(lineAgg.materials));
     units.push({
       key: lineKey, orderId: line.order_id, lineId: line.id, level: 'line', levels: ['line'], pieceId: null,
       code: line.item_code ?? null, name: line.item_name ?? line.description ?? `Line ${line.line_no}`,
@@ -697,7 +735,7 @@ export async function getPlanner(db, companyId, q = {}) {
       quantity: Number(line.quantity), itemId: line.item_id ?? null,
       tonnes: lineWeight == null ? 0 : r3(lineWeight * Number(line.quantity) * weightToTonnes), noWeight: lineWeight == null,
       work: shapeWork(lineAgg.work), noRate: lineAgg.noRate.size, done: lineDone, progress: lineDone ? 1 : progressOf(lineAgg),
-      materials: shapeMaterials(lineAgg.materials), committedDate,
+      materials: released ? [] : shapeMaterials(lineAgg.materials), committedDate,
       stages: stagesOf(null),
     });
 
@@ -757,7 +795,9 @@ export async function getPlanner(db, companyId, q = {}) {
         const scaleW = (o) => Object.fromEntries(Object.entries(shapeWork(o)).map(([k, v]) => [k, r3(v / N)]));
         const scaleM = (m) => shapeMaterials(new Map([...m].map(([it, qv]) => [it, qv / N])));
         const stages = stagesOf(n.k, 1 / N);
+        const mats = N > 1 ? scaleM(a.materials) : shapeMaterials(a.materials);
         for (let i = 1; i <= N; i++) {
+          unitShares.set(N > 1 ? `p${n.lockedPieceId}#${i}` : `p${n.lockedPieceId}`, mats);
           units.push({
             key: N > 1 ? `p${n.lockedPieceId}#${i}` : `p${n.lockedPieceId}`, orderId: line.order_id, lineId: line.id, level: String(n.depth), levels: shownAt,
             pieceId: n.lockedPieceId, copy: N > 1 ? i : null, code: N > 1 ? `${stripOrder(n.code) ?? n.design.name} ${i}/${N}` : (n.code ?? null), name: n.design.name,
@@ -766,7 +806,7 @@ export async function getPlanner(db, companyId, q = {}) {
             quantity: Number(n.quantity) / N, itemId: n.itemId,
             tonnes: w == null ? 0 : r3((w * Number(n.quantity) * weightToTonnes) / N), noWeight: w == null,
             work: N > 1 ? scaleW(a.work) : shapeWork(a.work), noRate: a.noRate.size, done: doneOf(a), progress: progressOf(a),
-            materials: N > 1 ? scaleM(a.materials) : shapeMaterials(a.materials), committedDate,
+            materials: released ? [] : mats, committedDate,
             // Splitting changes something only on a mark with parts below it (they become the marks).
             stages, split: isSplit[n.k], splittable: n.bomLineId != null && isMark[n.k] && kids[n.k].length > 0 && N === 1,
             bomLineId: n.bomLineId ?? null,
@@ -853,63 +893,82 @@ export async function getPlanner(db, companyId, q = {}) {
     functions.push({ key: UNASSIGNED, name: 'No machine type', machines: 0, capacity: {}, noShifts: false, unlimited: true, used: true });
   }
 
-  // ---- supply ---------------------------------------------------------------------
-  const supply = {};
-  const itemIds = [...materialItems];
-  if (itemIds.length) {
-    const [{ bal, res }, [poRows], [itemRows]] = await Promise.all([
-      availabilityRows(db, companyId, itemIds),
-      db.query(
-        `SELECT l.item_id, l.quantity, COALESCE(l.qty_received, 0) AS qty_received, COALESCE(l.expected_date, po.expected_date) AS expected_date,
-                po.code, po.id AS po_id
-           FROM cf_purchase_order_lines l
-           JOIN cf_purchase_orders po ON po.company_id = l.company_id AND po.id = l.purchase_order_id AND po.deleted_at IS NULL
-          WHERE l.company_id = ? AND l.item_id IN (?) AND l.deleted_at IS NULL AND po.status IN (?)
-            AND l.quantity > COALESCE(l.qty_received, 0)`,
-        [companyId, itemIds, OPEN_PO_STATUSES],
-      ),
-      db.query(
-        `SELECT m.id, m.code, m.name, i.uom FROM cf_master_records m
-           LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
-          WHERE m.company_id = ? AND m.id IN (?)`,
-        [companyId, itemIds],
-      ),
-    ]);
-    const free = shapeAvailability(itemIds, bal, res);
-    const info = new Map(itemRows.map((r) => [r.id, r]));
-    for (const id of itemIds) {
-      const lots = [];
-      const f = free.get(id)?.free ?? 0;
-      if (f > 0) lots.push({ date: today, qty: r6(f), source: 'stock', received: true });
-      supply[id] = { name: info.get(id)?.name ?? null, code: info.get(id)?.code ?? null, uom: info.get(id)?.uom ?? null, lots };
-    }
-    for (const p of poRows) {
-      supply[p.item_id].lots.push({
-        date: dateText(p.expected_date) ?? null,
-        qty: r6(Number(p.quantity) - Number(p.qty_received)),
-        source: p.code ?? `PO-${p.po_id}`,
-        received: false,
-      });
-    }
-    // By date — stock (today) first; a line with no date waits at the end.
-    for (const s of Object.values(supply)) {
-      s.lots.sort((a, b) => String(a.date ?? '9999-99-99').localeCompare(String(b.date ?? '9999-99-99'))
-        || Number(b.received) - Number(a.received) || String(a.source).localeCompare(String(b.source)));
-    }
-  }
-
   // ---- entries --------------------------------------------------------------------
   const unitKeys = new Set(units.map((u) => u.key));
   const entries = {};
+  const stored = new Map();                          // as saved, before any override: what a save is compared with
+  const placedWith = new Map();                      // unit -> what the engine said when the card was placed
   for (const e of entryRows) {
     if (!unitKeys.has(e.unit_key)) continue;
-    entries[e.unit_key] = { shipDate: dateText(e.ship_date), startDate: e.start_date ? dateText(e.start_date) : null, pinned: !!Number(e.pinned) };
+    const row = { shipDate: dateText(e.ship_date), startDate: e.start_date ? dateText(e.start_date) : null, pinned: !!Number(e.pinned) };
+    entries[e.unit_key] = row;
+    stored.set(e.unit_key, row);
+    placedWith.set(e.unit_key, { state: e.material_state ?? null, date: e.material_date ? dateText(e.material_date) : null });
+  }
+  if (overrides) {
+    for (const [k, v] of overrides) {
+      if (!unitKeys.has(k)) continue;
+      if (v == null) delete entries[k]; else entries[k] = { shipDate: v.shipDate, startDate: v.startDate ?? null, pinned: !!v.pinned };
+    }
   }
   // A line's units in the order dragged by hand (1 = first); units that are gone are left out.
   const ranks = {};
   for (const r of rankRows) if (unitKeys.has(r.unit_key)) ranks[r.unit_key] = Number(r.rank_no);
+  if (rankOverrides) for (const [k, v] of rankOverrides) if (unitKeys.has(k)) ranks[k] = v;
 
-  return {
+  // ---- material: THE engine (materialReadyService), for every unit at every level -----------
+  const mr = await unitReadiness(db, companyId, { lineRows, allLines: allLineRows, units, orders: orderList, unitShares, entries, ranks, today });
+  const counts = { ready: 0, dated: 0, late: 0, waiting: 0 };
+  for (const u of units) {
+    const res = mr.results.get(u.key);
+    if (!res) { u.material = null; continue; }
+    const need = mr.needs.get(u.lineId);
+    u.material = shapeUnitMaterial(res, { today, known: need?.known ?? false, incomplete: need?.known && !need.ready ? need.why : null });
+    if (u.levels.includes(mr.levelOfLine.get(u.lineId) ?? 'line')) counts[res.state] += 1;
+    /*
+     * unit.materials is what the OLD browser gate asks the pooled `supply` for.
+     * What is already issued, reserved or held for THIS order is not asked for
+     * again — the old gate took an order's own holds out of the free stock and
+     * then found the order short of them.
+     */
+    if (u.materials.length) {
+      const hard = new Map();
+      for (const r of res.reasons) {
+        const h = r.cover.filter((x) => x.kind === 'issued' || x.kind === 'reserved' || x.kind === 'held').reduce((t, x) => t + x.qty, 0);
+        if (h > 0 && r.need > 0) hard.set(Number(r.item.id), Math.min(1, h / r.need));
+      }
+      if (hard.size) u.materials = u.materials.map((m) => (hard.has(Number(m.itemId)) ? { ...m, qty: r6(m.qty * (1 - hard.get(Number(m.itemId)))) } : m)).filter((m) => m.qty > 0);
+    }
+  }
+
+  // ---- supply (the OLD browser gate's pooled lots — kept until the new board ships) ----------
+  const supply = {};
+  for (const id of materialItems) {
+    const it = mr.supply.items.get(id);
+    const lots = [];
+    const f = mr.supply.freeOurs.get(id) ?? 0;
+    if (f > 0) lots.push({ date: today, qty: r6(f), source: 'stock', received: true });
+    supply[id] = { name: it?.name ?? null, code: it?.code ?? null, uom: it?.uom ?? null, lots };
+  }
+  for (const p of mr.supply.poLines) {
+    if (!supply[p.itemId] || !OPEN_PO_STATUSES.includes(p.status)) continue;
+    supply[p.itemId].lots.push({ date: p.due ?? null, qty: r6(p.quantity - p.received), source: p.code ?? `PO-${p.poId}`, received: false });
+  }
+  // By date — stock (today) first; a line with no date waits at the end.
+  for (const s of Object.values(supply)) {
+    s.lots.sort((a, b) => String(a.date ?? '9999-99-99').localeCompare(String(b.date ?? '9999-99-99'))
+      || Number(b.received) - Number(a.received) || String(a.source).localeCompare(String(b.source)));
+  }
+
+  // ---- placements the material no longer allows: reported, never moved ---------------------
+  const unitOf = new Map(units.map((u) => [u.key, u]));
+  let blockedEntries = 0;
+  for (const [k, e] of Object.entries(entries)) {
+    const b = entryBlock(unitOf.get(k)?.material, e, placedWith.get(k));
+    if (b) { e.blocked = b; blockedEntries += 1; }
+  }
+
+  const snapshot = {
     horizon: { from: horizon.from, to: horizon.to, today, periods: horizon.periods },
     settings,
     targets,
@@ -919,7 +978,256 @@ export async function getPlanner(db, companyId, q = {}) {
     supply,
     entries,
     ranks,
+    // §56: the engine's summary. counts = the units at each line's saved level.
+    materialReady: { engine: 2, today, counts, blockedEntries },
   };
+  return { snapshot, stored };
+}
+
+/* ===========================================================================
+ * Material: the one engine, per unit
+ * ======================================================================== */
+
+/**
+ * THE CLAIM ORDER OF UNITS — who is served first when two units want the same
+ * stock or the same unallocated purchase line. Deterministic:
+ *   1. cards PINNED by hand (a stored entry with pinned = 1) before all others
+ *   2. the order's place in the planner's ranking (plan_priority, then the
+ *      order's committed date, then its id) — materialReadyService.orderRanks
+ *   3. the line, in the order the planner lists lines (order id, line number)
+ *   4. the unit's rank on its line as dragged by hand (cf_plan_ranks), else
+ *   5. the unit's place in the snapshot (the piece tree's own order)
+ * Claims are worked out with every line at its SAVED level (line.level).
+ */
+function claimOrderOfUnits(list, { entries, ranks, oRank, lineIdx, unitIdx }) {
+  const keyOf = (u) => [entries[u.key]?.pinned ? 0 : 1, oRank.get(u.orderId) ?? 1e9, lineIdx.get(u.lineId) ?? 1e9, ranks[u.key] ?? 1e9, unitIdx.get(u.key)];
+  const keys = new Map(list.map((u) => [u.key, keyOf(u)]));
+  return [...list].sort((a, b) => { const x = keys.get(a.key), y = keys.get(b.key); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; });
+}
+
+/**
+ * The engine's answer for every unit. A line's NEED per material is the one
+ * the requisition and release use (lineNeeds); the units of a level share it in
+ * the proportions the roll-out draws it (`unitShares` — a nested plate by the
+ * area each unit's parts take of it), so at any level the units' needs add up
+ * to the line's need exactly, and the same plate is never counted for two
+ * units. A line whose need is not known yet (not frozen) is judged on the
+ * roll-out's estimate. Units off their line's saved level are answered "as if
+ * the line were planned at that level", against what the OTHER lines leave.
+ * Round trips: lineNeeds (≤ 4) + loadSupply (5); nothing per unit.
+ */
+async function unitReadiness(db, companyId, { lineRows, allLines = lineRows, units: ownUnits, orders, unitShares, entries, ranks, today }) {
+  const needs = await lineNeeds(db, companyId, allLines);
+  // A line whose units were not built (a restricted read) still claims: one consumer, its whole need.
+  const built = new Set(lineRows.map((l) => l.id));
+  const units = allLines.length === lineRows.length ? ownUnits
+    : [...ownUnits, ...allLines.filter((l) => !built.has(l.id)).map((l) => ({ key: `l${l.id}`, lineId: l.id, orderId: l.order_id, levels: ['line'] }))];
+  const itemIds = new Set();
+  for (const n of needs.values()) for (const id of n.items.keys()) itemIds.add(id);
+  for (const list of unitShares.values()) for (const m of list) itemIds.add(Number(m.itemId));
+  const supply = await loadSupply(db, companyId, [...itemIds], { needs, todayText: today });
+
+  const lineOf = new Map(allLines.map((l) => [l.id, l]));
+  const lineIdx = new Map(allLines.map((l, i) => [l.id, i]));
+  const unitIdx = new Map(units.map((u, i) => [u.key, i]));
+  const oRank = orderRanks(allLines);
+  const levelOfLine = new Map();
+  for (const o of orders) for (const l of o.lines) levelOfLine.set(l.id, l.level);
+  const unitsOfLine = new Map();
+  for (const u of units) { if (!unitsOfLine.has(u.lineId)) unitsOfLine.set(u.lineId, []); unitsOfLine.get(u.lineId).push(u); }
+  const order = (list) => claimOrderOfUnits(list, { entries, ranks, oRank, lineIdx, unitIdx });
+
+  /** The units of one level of a line as consumers: each its share of the line's need. */
+  const consumersOf = (lineId, set) => {
+    const line = lineOf.get(lineId);
+    const n = needs.get(lineId);
+    const demand = n?.known ? n.items : null;
+    const shareMaps = set.map((u) => new Map((unitShares.get(u.key) ?? []).map((m) => [Number(m.itemId), m.qty])));
+    const ids = new Set(demand ? demand.keys() : []);
+    for (const sm of shareMaps) for (const id of sm.keys()) ids.add(id);
+    const out = set.map((u) => ({ key: u.key, lineId, orderKey: orderKeyOf(line.order_code), customerId: line.customer_id ?? null, needs: [] }));
+    for (const id of ids) {
+      const S = shareMaps.reduce((t, sm) => t + (sm.get(id) ?? 0), 0);
+      const N = demand ? (demand.get(id)?.need ?? 0) : S;
+      if (!(N > 1e-9)) continue;                     // drawn by the roll-out but not bought (a reused offcut's plate)
+      set.forEach((u, i) => {
+        const qty = S > 1e-9 ? ((shareMaps[i].get(id) ?? 0) * N) / S : N / set.length;
+        if (qty > 1e-9) out[i].needs.push({ itemId: id, qty });
+      });
+    }
+    return out;
+  };
+  const setAt = (lineId, level) => (unitsOfLine.get(lineId) ?? []).filter((u) => u.levels.includes(level));
+
+  // 1. Every line at its saved level, all units in one claim order.
+  const active = [];
+  const activeKeysOf = new Map();
+  for (const l of allLines) {
+    let set = setAt(l.id, levelOfLine.get(l.id) ?? 'line');
+    if (!set.length) set = setAt(l.id, 'line');
+    activeKeysOf.set(l.id, set.map((u) => u.key));
+    active.push(...set);
+  }
+  const consumerOf = new Map();
+  for (const l of allLines) {
+    const set = active.filter((u) => u.lineId === l.id);
+    for (const c of consumersOf(l.id, set)) consumerOf.set(c.key, c);
+  }
+  const main = evaluate(supply, order(active).map((u) => consumerOf.get(u.key)), { full: true });
+  const results = new Map(main.results);
+
+  // 2. The other levels of each line: its own claims given back, that level served, then put back.
+  for (const l of lineRows) {
+    const mine = unitsOfLine.get(l.id) ?? [];
+    const levels = [...new Set(mine.flatMap((u) => u.levels))].filter((lv) => lv !== (levelOfLine.get(l.id) ?? 'line'));
+    if (!levels.length || mine.every((u) => results.has(u.key))) continue;
+    const taken = (activeKeysOf.get(l.id) ?? []).flatMap((k) => main.takes.get(k) ?? []);
+    giveBack(taken);
+    for (const lv of levels) {
+      const set = setAt(l.id, lv);
+      if (set.every((u) => results.has(u.key))) continue;
+      const cons = new Map(consumersOf(l.id, set).map((c) => [c.key, c]));
+      const alt = evaluate(supply, order(set).map((u) => cons.get(u.key)), { full: true });
+      for (const [k, r] of alt.results) if (!results.has(k)) results.set(k, r);
+      for (const t of alt.takes.values()) giveBack(t);
+    }
+    takeAgain(taken);
+  }
+  return { results, needs, supply, levelOfLine };
+}
+
+/** At most this many reasons ride on a unit in the snapshot (the rest are counted): 200 units × 25 plates is a megabyte. */
+export const MAX_UNIT_REASONS = 3;
+const REASON_RANK = { waiting: 0, late: 1, dated: 2, ready: 3 };
+
+/**
+ * A unit's engine result as the snapshot carries it: reasons only for what is
+ * not simply here — what it waits on first, then what is overdue, then the
+ * latest dates — the first MAX_UNIT_REASONS of them, `moreReasons` counting
+ * the rest. The line's full list is GET /order-lines/:id/material-ready.
+ */
+function shapeUnitMaterial(res, { today, known, incomplete = null }) {
+  const all = res.reasons.filter((r) => r.state !== 'ready' || r.cover.some((x) => x.kind === 'free'))
+    .sort((a, b) => REASON_RANK[a.state] - REASON_RANK[b.state] || String(b.date ?? '').localeCompare(String(a.date ?? '')) || Number(a.item.id) - Number(b.item.id));
+  const reasons = all.slice(0, MAX_UNIT_REASONS)
+    .map((r) => ({
+      ...r, item: { id: r.item.id, code: r.item.code ?? null, name: r.item.name ?? null, uom: r.item.uom ?? null },
+      need: r6(r.need), short: r6(r.short), cover: r.cover.map((x) => ({ ...x, qty: r6(x.qty) })),
+    }));
+  return {
+    state: res.state,
+    readyDate: res.readyDate,
+    // The first week its work may start (null = any week): the period that starts on or after the day the last material arrives.
+    earliest: res.readyDate && res.readyDate > today ? periodFloor(res.readyDate) : null,
+    soft: !!res.soft,
+    materials: res.materials,
+    // The line's need is not known yet (not frozen): judged on the roll-out's estimate.
+    ...(known ? {} : { estimate: true }),
+    // Some of the line's material is not known yet (a cut plate with no plate: nest the line) — judged on what is.
+    ...(incomplete ? { incomplete } : {}),
+    text: res.text,
+    reasons,
+    ...(all.length > reasons.length ? { moreReasons: all.length - reasons.length } : {}),
+  };
+}
+
+/**
+ * Why a stored placement cannot stand as it is, or null: { kind: 'waiting' |
+ * 'material_late', message, readyDate, earliest, was: { state, date } }.
+ * `was` is what the engine said when the card was placed, so the message can
+ * say what changed. Reported on every read; nothing is ever moved by itself.
+ */
+function entryBlock(m, e, was) {
+  if (!m || !e?.shipDate) return null;
+  const before = { state: was?.state ?? null, date: was?.date ?? null };
+  if (m.state === 'waiting') {
+    const changed = before.state && before.state !== 'waiting'
+      ? ` When this card was placed its material was ${before.state === 'ready' ? 'here' : `due ${dayWords(before.date)}`}.` : '';
+    return { kind: 'waiting', message: `${m.text}${changed}`, readyDate: null, earliest: null, was: before };
+  }
+  if (!m.earliest) return null;
+  const startsEarly = !!e.startDate && e.startDate < m.earliest;
+  if (!(e.shipDate < m.earliest) && !startsEarly) return null;
+  const moved = before.date && before.date !== m.readyDate ? ` (it was ${dayWords(before.date)} when this card was placed)`
+    : before.state === 'ready' ? ' (it was here when this card was placed)' : '';
+  return {
+    kind: 'material_late',
+    message: `Its material now arrives ${dayWords(m.readyDate)}${moved} — ${startsEarly && !(e.shipDate < m.earliest) ? `its bar starts in the week of ${dayWords(e.startDate)}` : `it is planned to ship in the week of ${dayWords(e.shipDate)}`}. Move it to the week of ${dayWords(m.earliest)} or later. ${m.text}`,
+    readyDate: m.readyDate, earliest: m.earliest, was: before,
+  };
+}
+
+/**
+ * The PLANNED cards of some orders that their material no longer allows — after
+ * a purchase line's date or quantity changed, a PO was cancelled, a receipt was
+ * reversed. Only those orders' units are built (buildSnapshot onlyOrderIds).
+ * { late, waiting, units: [{ unitKey, code, name, order: { id, code }, line: { id, lineNo }, kind:
+ *   'material_late' | 'waiting', week (the placement's week), startDate, wasDate, wasState (what the
+ *   engine said when the card was placed), readyDate (now), earliest, message }] }
+ */
+export async function plannedUnitsOfOrders(db, companyId, orderIds) {
+  const ids = [...new Set((orderIds ?? []).map(Number).filter(Boolean))];
+  const out = { late: 0, waiting: 0, units: [] };
+  if (!ids.length) return out;
+  const { snapshot } = await buildSnapshot(db, companyId, {}, { onlyOrderIds: new Set(ids) });
+  const unitOf = new Map(snapshot.units.map((u) => [u.key, u]));
+  const orderOf = new Map(snapshot.orders.map((o) => [o.id, o]));
+  for (const [k, e] of Object.entries(snapshot.entries)) {
+    if (!e.blocked) continue;
+    const u = unitOf.get(k);
+    const o = orderOf.get(u.orderId);
+    const l = o?.lines.find((x) => x.id === u.lineId);
+    if (e.blocked.kind === 'waiting') out.waiting += 1; else out.late += 1;
+    out.units.push({
+      unitKey: k, code: u.code ?? null, name: u.name ?? null, order: { id: u.orderId, code: o?.code ?? null }, line: { id: u.lineId, lineNo: l?.lineNo ?? null },
+      kind: e.blocked.kind, week: e.shipDate, startDate: e.startDate ?? null, wasDate: e.blocked.was.date, wasState: e.blocked.was.state,
+      readyDate: e.blocked.readyDate, earliest: e.blocked.earliest, message: e.blocked.message,
+    });
+  }
+  return out;
+}
+
+/**
+ * A SAVE IS REFUSED where the material says no (§56): a card being placed or
+ * moved (its week or its start changes) must not ship — or start — before the
+ * week its material allows, and cannot be placed at all while it waits. Cards
+ * that stay where they are are not checked here (they are flagged on the next
+ * read), nor is a card whose delivery is merely overdue. The engine answers for
+ * the plan AS IT WOULD BE SAVED (the new pins change who claims stock first).
+ * Returns Map(unitKey -> { state, date }) to store on the entries.
+ * `reader`: where the planner read is made — the pool in a route (side by
+ * side, outside the write's transaction), the transaction itself in a test.
+ */
+async function materialGate(reader, c, want, { rankOverrides = null } = {}) {
+  const said = new Map();
+  if (!want.some((w) => w.shipDate != null)) return said;
+  const overrides = new Map(want.map((w) => [w.unitKey, w.shipDate == null ? null : { shipDate: w.shipDate, startDate: w.startDate ?? null, pinned: w.pinned }]));
+  const { snapshot, stored } = await buildSnapshot(reader, c.companyId, {}, { overrides, rankOverrides });
+  const unitOf = new Map(snapshot.units.map((u) => [u.key, u]));
+  const orderCode = new Map(snapshot.orders.map((o) => [o.id, o.code]));
+  const problems = [];
+  const refused = [];
+  for (const w of want) {
+    if (w.shipDate == null) continue;
+    const u = unitOf.get(w.unitKey);
+    const m = u?.material;
+    if (!m) continue;
+    said.set(w.unitKey, { state: m.state, date: m.readyDate });
+    const was = stored.get(w.unitKey);
+    if (was && was.shipDate === w.shipDate && (was.startDate ?? null) === (w.startDate ?? null)) continue;
+    const who = `${orderCode.get(u.orderId) ?? 'Order'} · ${u.code ?? u.name ?? w.unitKey}`;
+    if (m.state === 'waiting') {
+      problems.push(`${who} cannot be planned yet — it is waiting for material. ${m.text}`);
+      refused.push({ unitKey: w.unitKey, kind: 'waiting', readyDate: null, earliest: null });
+    } else if (m.earliest && (w.shipDate < m.earliest || (w.startDate && w.startDate < m.earliest))) {
+      problems.push(`${who} cannot ${w.shipDate < m.earliest ? `ship in the week of ${dayWords(w.shipDate)}` : `start in the week of ${dayWords(w.startDate)}`} — its material arrives ${dayWords(m.readyDate)}. Plan it for the week of ${dayWords(m.earliest)} or later. ${m.text}`);
+      refused.push({ unitKey: w.unitKey, kind: 'material_late', readyDate: m.readyDate, earliest: m.earliest });
+    }
+  }
+  if (problems.length) {
+    throw invalid('MATERIAL_NOT_READY', problems.length === 1 ? problems[0] : `${problems.length} cards cannot be placed there — their material is not ready.`, { problems, detail: { units: refused } });
+  }
+  return said;
 }
 
 /* ===========================================================================
@@ -940,13 +1248,13 @@ const toBool = (v, label, problems) => {
  * unit must be a live piece or line of this company. One read to check, one
  * statement to retire, one (chunked) upsert, one read back.
  */
-export async function putEntries(db, c, input = {}) {
+export async function putEntries(db, c, input = {}, { reader = db } = {}) {
   const list = Array.isArray(input.entries) ? input.entries : null;
   if (!list) throw invalid('INVALID', 'Send the entries: { entries: [{ unitKey, shipDate, pinned }] }.');
   const want = parseEntries(list);
   if (!want.length) return { entries: {} };
   await attachLines(db, c, want);
-  return writeEntries(db, c, want);
+  return writeEntries(db, c, want, await materialGate(reader, c, want));
 }
 
 const KEY_WORDS = "unitKey is 'p<piece id>', 'l<line id>' or 'g<parent piece id>.<bom line id>'.";
@@ -1024,7 +1332,7 @@ function parseRanks(list) {
  * up to four reads, one retire, the upsert (per 500), one read back, and per
  * save of ranks one delete + one insert.
  */
-export async function putChanges(db, c, input = {}) {
+export async function putChanges(db, c, input = {}, { reader = db } = {}) {
   const entryList = input.entries == null ? [] : input.entries;
   const rankList = input.ranks == null ? [] : input.ranks;
   if (!Array.isArray(entryList) || !Array.isArray(rankList)) {
@@ -1045,7 +1353,9 @@ export async function putChanges(db, c, input = {}) {
   for (const u of ranked) if (u.lineId !== u.rankLine) problems.push(`${u.unitKey} is not a unit of line ${u.rankLine}.`);
   assertNoProblems(problems, 'Some ranks name units of another line.');
 
-  const out = want.length ? await writeEntries(db, c, want) : { entries: {} };
+  // The order of a line's units being saved in the same call decides who claims material first, too.
+  const rankOverrides = new Map(lines.flatMap((l) => l.units.map((u, i) => [u.unitKey, i + 1])));
+  const out = want.length ? await writeEntries(db, c, want, await materialGate(reader, c, want, { rankOverrides })) : { entries: {} };
   const ranks = await writeRanks(db, c, lines);
   return { entries: out.entries, ranks };
 }
@@ -1114,7 +1424,7 @@ async function attachLines(db, c, want) {
 }
 
 /** Retire / upsert entries whose lines are attached; returns what changed. */
-async function writeEntries(db, c, want) {
+async function writeEntries(db, c, want, said = new Map()) {
   const drop = want.filter((w) => w.shipDate == null).map((w) => w.unitKey);
   const keep = want.filter((w) => w.shipDate != null);
   if (drop.length) {
@@ -1128,11 +1438,14 @@ async function writeEntries(db, c, want) {
     for (let i = 0; i < keep.length; i += 500) {
       const part = keep.slice(i, i + 500);
       await db.query(
-        `INSERT INTO cf_plan_entries (company_id, order_line_id, unit_key, ship_date, start_date, pinned, updated_by)
-         VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}
+        // material_state / material_date (§56): what the engine said as the card was placed, so a later read can say what changed.
+        `INSERT INTO cf_plan_entries (company_id, order_line_id, unit_key, ship_date, start_date, pinned, updated_by, material_state, material_date)
+         VALUES ${part.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}
          ON DUPLICATE KEY UPDATE order_line_id = VALUES(order_line_id), ship_date = VALUES(ship_date),
-                                 start_date = VALUES(start_date), pinned = VALUES(pinned), updated_by = VALUES(updated_by)`,
-        part.flatMap((w) => [c.companyId, w.lineId, w.unitKey, w.shipDate, w.startDate ?? null, w.pinned ? 1 : 0, c.userId ?? null]),
+                                 start_date = VALUES(start_date), pinned = VALUES(pinned), updated_by = VALUES(updated_by),
+                                 material_state = VALUES(material_state), material_date = VALUES(material_date)`,
+        part.flatMap((w) => [c.companyId, w.lineId, w.unitKey, w.shipDate, w.startDate ?? null, w.pinned ? 1 : 0, c.userId ?? null,
+          said.get(w.unitKey)?.state ?? null, said.get(w.unitKey)?.date ?? null]),
       );
     }
   }

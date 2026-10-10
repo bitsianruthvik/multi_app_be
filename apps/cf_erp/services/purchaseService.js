@@ -416,6 +416,32 @@ async function requireLine(db, companyId, id) {
   return l;
 }
 
+/** The OPEN sales orders (by number, so the live revision) some purchase lines are bought for. 1 read. */
+async function ordersBoughtFor(db, companyId, { lineIds = null, poId = null }) {
+  if (lineIds && !lineIds.length) return [];
+  const [rows] = await db.query(
+    `SELECT DISTINCT so.id
+       FROM cf_purchase_line_orders a
+       JOIN cf_purchase_order_lines l ON l.id = a.purchase_line_id
+       JOIN cf_sales_orders ao ON ao.id = a.order_id
+       JOIN cf_sales_orders so ON so.company_id = ao.company_id AND so.code_active = ao.code_active AND so.status IN ('inquiry','quoted','confirmed')
+      WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${poId ? 'l.purchase_order_id = ?' : 'a.purchase_line_id IN (?)'}`,
+    [companyId, poId ?? lineIds],
+  );
+  return rows.map((r) => r.id);
+}
+
+/**
+ * plannedUnits (§56, TM/CF_ERP_BUYING_V2.md §3): what the change just made did to the PLAN — the planned
+ * cards of the orders the purchase line(s) were bought for that are now late or waiting. Worked out by
+ * the material-ready engine for those orders only (the others claim as whole lines), so the screen need
+ * not read the whole planner after a date edit. `orderIds` are read BEFORE the write (a cut can drop a share).
+ */
+async function plannedUnitsAfter(db, companyId, orderIds, change) {
+  const { plannedUnitsOfOrders } = await import('./plannerService.js');
+  return { change, orderIds, ...(await plannedUnitsOfOrders(db, companyId, orderIds)) };
+}
+
 /** A cancelled or fully received order is history. */
 function assertOpen(p, what = 'change') {
   if (p.status === 'cancelled') throw invalid('CANCELLED', `${p.code} was cancelled — nothing more can ${what}.`);
@@ -747,6 +773,7 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
   assertOpen({ status: l.po_status, code: l.po_code });
   const problems = [];
   const sets = {};
+  const boughtFor = input.quantity !== undefined || input.expectedDate !== undefined ? await ordersBoughtFor(db, c.companyId, { lineIds: [l.id] }) : null;
   if (input.quantity !== undefined) {
     const q = readQty(input.quantity, 'Quantity', problems);
     if (q != null && q + EPS < Number(l.qty_received)) problems.push(`${fmt(l.qty_received)} has already been received on this line — the quantity cannot go below that.`);
@@ -767,8 +794,21 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
       [...Object.values(sets), c.companyId, l.id]);
   }
   await restate(db, c.companyId, l.purchase_order_id);
-  return getPurchaseOrder(db, c.companyId, l.purchase_order_id);
+  const po = await getPurchaseOrder(db, c.companyId, l.purchase_order_id);
+  // Only a date or a quantity can move the plan; a price or a note does not ask.
+  const moved = (sets.expected_date !== undefined && (sets.expected_date ?? null) !== (planDate(l.expected_date) ?? null)) || (sets.quantity !== undefined && sets.quantity < Number(l.quantity) - EPS);
+  if (!boughtFor || !moved) return po;
+  return {
+    ...po,
+    plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, {
+      purchaseLineId: l.id, purchaseOrder: { id: po.id, code: po.code },
+      ...(sets.expected_date !== undefined ? { date: { from: planDate(l.expected_date), to: sets.expected_date ?? null } } : {}),
+      ...(sets.quantity !== undefined ? { quantity: { from: Number(l.quantity), to: sets.quantity } } : {}),
+    }),
+  };
 }
+
+const planDate = (d) => (d == null ? null : d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : String(d).slice(0, 10));
 
 export async function removePurchaseLine(db, c, lineId) {
   const l = await requireLine(db, c.companyId, lineId);
@@ -814,8 +854,10 @@ export async function cancelPurchaseOrder(db, c, id, input = {}) {
   const [[{ n }]] = await db.query('SELECT COALESCE(SUM(qty_received), 0) AS n FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, p.id]);
   if (Number(n) > EPS) throw invalid('RECEIVED', `${fmt(n)} has already been received against ${p.code} — it cannot be cancelled.`);
   const note = blank(input.reason) ? p.notes : `${p.notes ? `${p.notes}\n` : ''}Cancelled: ${String(input.reason).slice(0, 255)}`;
+  const boughtFor = await ordersBoughtFor(db, c.companyId, { poId: p.id });
   await db.query("UPDATE cf_purchase_orders SET status = 'cancelled', suggested = 0, notes = ? WHERE company_id = ? AND id = ?", [note, c.companyId, p.id]);
-  return getPurchaseOrder(db, c.companyId, p.id);
+  const po = await getPurchaseOrder(db, c.companyId, p.id);
+  return { ...po, plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, { purchaseOrder: { id: p.id, code: p.code }, cancelled: true }) };
 }
 
 /**
