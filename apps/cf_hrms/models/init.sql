@@ -1130,9 +1130,9 @@ CREATE TABLE IF NOT EXISTS hrms_role_working_conditions (
 -- Assignment may exist with no Position at all. What a Position adds is the
 -- FORMAL structure: the org chart, sanctioned headcount and vacancy.
 --
--- Vacancy is DERIVED, never stored: sanctioned_headcount minus the count of
--- active work assignments pointing at this position. Storing a filled count
--- would be a second source of truth that drifts the first time someone ends an
+-- Vacancy is DERIVED, never stored: a position is vacant when no live work
+-- assignment points at it (services/seatCount.js). Storing a filled flag would
+-- be a second source of truth that drifts the first time someone ends an
 -- assignment without touching the position.
 
 
@@ -1141,13 +1141,21 @@ CREATE TABLE IF NOT EXISTS hrms_role_working_conditions (
 -- `position_title` overrides the role's title for display only ("Printing
 -- Operator - Pelican"); the JD still resolves content from the role.
 --
--- `sanctioned_headcount` is DECIMAL(8,2) and defaults to 1. Decimal, because the
--- spec allows GROUPED positions — one "Helper" position with headcount 6 rather
--- than six identical positions — and because half a head is how shared
--- allocations get expressed. If the company later moves to one-seat-per-position
--- the value simply stays 1 and no schema changes (spec's own note).
+-- ONE POSITION IS ONE CHAIR (2026-10-10): one person, one shift. Six helpers
+-- are six positions, drawn as one card (services/positionCards.js).
 --
--- `default_shift_id` is why hrms_shifts is created in section 1.
+-- `sanctioned_headcount` is ALWAYS 1. The column stays (no DDL was needed for
+-- the change — the spec's own note said "the value simply stays 1") but nothing
+-- reads it for a count: positionService stores 1 whatever a caller sends, and
+-- services/seatCount.js is the one definition of seats, filled and vacant. It
+-- used to hold a GROUPED position's headcount ("Helper" x 6); do not bring
+-- that back by reading it.
+--
+-- `default_shift_id` is THE POSITION'S SHIFT, not a default: the chair is on
+-- that shift and so is whoever sits in it (changing it moves the occupant's
+-- assignment too). Set on every position the app creates — the company's
+-- General shift when none is named. NULL only in a company with no shifts.
+-- It is also why hrms_shifts is created in section 1.
 --
 -- status DRAFT/ACTIVE/FROZEN/CLOSED: FROZEN is a real state (a sanctioned slot
 -- a company has decided not to fill this year) and is distinct from CLOSED.
@@ -1883,8 +1891,8 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- ## 7. WORKFORCE — requirement, roster, attendance                          ##
 -- ############################################################################
 -- Three different numbers that a naive HRMS collapses into one:
---   SANCTIONED headcount — hrms_positions.sanctioned_headcount. What the company
---     has approved as a slot.
+--   SANCTIONED headcount — the number of live, non-CLOSED hrms_positions (one
+--     position is one seat; the sanctioned_headcount column is always 1).
 --   REQUIRED manpower — hrms_manpower_requirements. What operations actually
 --     needs on a shift, on a machine, in a date range. It is routinely higher
 --     during a campaign and lower in a lean month, and it is NOT the sanctioned
@@ -1900,9 +1908,14 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- may both be NULL for a broad requirement ("we need 4 packers this month").
 -- No CHECK; workforceService.js rejects the empty case.
 --
--- The org-chart import writes here for the DN (day+night) shift pattern: DN is
--- two shifts' worth of people, not one shift, so it becomes TWO requirement rows
--- rather than one position with an impossible default shift.
+-- NO LONGER DECIDES SEATS (2026-10-10). The retired org-chart import wrote two
+-- position-level rows here for a DN (day+night) position, and the seat count
+-- was read from them. A position is one chair on one shift now, day and night
+-- are two positions, and `scripts/one-chair-positions.mjs` retired those rows:
+-- a chair IS the requirement. Nothing in services/ reads this table for a seat
+-- count, a vacancy or a shift pattern. It remains for what the header above
+-- says it is for — what operations needs on a shift, when that differs from
+-- the sanctioned positions.
 
 CREATE TABLE IF NOT EXISTS hrms_manpower_requirements (
   id              INT          AUTO_INCREMENT PRIMARY KEY,

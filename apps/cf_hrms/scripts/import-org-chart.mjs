@@ -83,6 +83,7 @@
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
 import { resolveSource, readSeed, PREVIOUS_FILE_NAME, resolveAdjustments, readAdjustments, resolveKras, readKras } from './orgChartSource.mjs';
+import { oneChairRefusal } from './lib/oneChairGuard.mjs';
 
 const TARGET = resolveTarget();
 
@@ -1308,6 +1309,18 @@ const WIPE_ORDER = [
 
 async function main() {
   announce(TARGET);
+  // RETIRED for a tenant on the one-chair model (2026-10-10) — lib/oneChairGuard.mjs says why and how it is detected.
+  // First thing, before the source is even read: a dry run of a retired import is not worth a report either.
+  {
+    const guardConn = await mysql.createConnection(TARGET.cfg);
+    try {
+      const [[guardCompany]] = await guardConn.query('SELECT id, name FROM companies WHERE slug = ? AND deleted_at IS NULL', [COMPANY_SLUG]);
+      const refusal = guardCompany ? await oneChairRefusal(guardConn, guardCompany.id, guardCompany.name, 'The org chart import') : null;
+      if (refusal) { console.error(refusal); process.exit(2); }
+    } finally {
+      await guardConn.end();
+    }
+  }
   if (WIPE && TARGET.isProd) {
     throw new Error("--wipe is refused against production. Deleting a live tenant's rows is not something a convenience flag should do; write a deliberate script if you really mean it.");
   }

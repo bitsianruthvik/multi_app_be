@@ -30,31 +30,35 @@
  * mistake plan §2 rule 9 exists to prevent, and `reportingResolver.js` stays
  * the only implementation of "who does this person answer to".
  *
- * ── TWO DERIVED NUMBERS THAT ARE EASY TO GET WRONG ────────────────────────
- * `shiftPattern` is NOT stored. It is `DN` when the position has live
- * `hrms_manpower_requirements` for both a day and a night shift; otherwise the
- * `default_shift_id`'s code; `G` when there is none. That is how the import
- * recorded day/night working (plan §9.1) — a DN position keeps
- * `sanctioned_headcount` meaning ONE SEAT and carries a requirement row per
- * shift instead.
+ * ── ONE POSITION IS ONE CHAIR (2026-10-10) ────────────────────────────────
+ * A position is for one person on one shift (services/seatCount.js). So a node
+ * has 0 or 1 `occupants`, `vacancies` is 0 or 1, `sanctionedHeadcount` and
+ * `effectiveSanctioned` are 1, `requirements` is always `[]`, and
+ * `shiftPattern` is the position's own shift code — never `DN`: day and night
+ * are two positions. `overFilled` is true only when the data is wrong (two
+ * live assignments on one chair); both people still travel so the screen can
+ * show the problem instead of hiding a person.
  *
- * `vacancies` therefore follows the same fork: a DN position's sanctioned
- * strength is `Σ(requiredCount)` across its live requirement rows, everything
- * else is `sanctioned_headcount`. Reading `sanctioned_headcount` for a DN
- * position silently HALVES the vacancies — across Karni it is the difference
- * between the true 156 and a wrong 101.
+ * The payload STAYS position-shaped — one node per position, edges position to
+ * position. What the client draws is CARDS: `node.cardId` groups the chairs of
+ * one role in one department under one manager card (services/positionCards.js
+ * is the rule). Sibling chairs of a card carry the same `displayTitle`.
  *
  * ── ONE PAYLOAD, A HANDFUL OF QUERIES ─────────────────────────────────────
- * Karni is 114 positions, max depth 8. The whole graph travels in one response
+ * Karni is 220 positions, max depth 8. The whole graph travels in one response
  * with no pagination, and it is assembled from a fixed number of company-wide
- * queries (positions, edges, occupants, department serves, requirements,
- * content counts, open points, departments, attendance) joined in memory.
- * Nothing in here runs per node — and the count did not grow when departments
- * joined the payload: the serves read took the slot the contexts read left.
+ * queries (positions, edges, occupants, department serves, content counts,
+ * overrides, open points, departments, attendance) joined in memory. Nothing in
+ * here runs per node. The manpower-requirements read is gone: a chair is the
+ * requirement.
  */
 import { notFound, invalid } from '../lib/errors.js';
 import { dateText, today, LIVE_ON, requirePosition, listPositionOverrides } from './positionService.js';
-import { effectiveSeats, shiftPattern as seatShiftPattern } from './seatCount.js';
+import {
+  SEATS_PER_POSITION, HOLDS_SEAT_SQL, OCCUPANT_COUNT_SQL,
+  shiftPattern as seatShiftPattern, vacancies as seatVacancies, overFilled as seatOverFilled,
+} from './seatCount.js';
+import { computeCards, loadCards } from './positionCards.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
 
@@ -178,7 +182,11 @@ const EDGES_SQL = `
    WHERE rr.company_id = ? AND rr.deleted_at IS NULL AND ${LIVE_ON('rr')}
    ORDER BY rr.is_primary DESC, t.sort_order, rr.id`;
 
-/** Who is actually in the seats. An employee with three assignments appears in three boxes — correct. */
+/**
+ * Who is in each chair: at most one person. "In the chair" is seatCount.js's
+ * predicate (not ENDED, in date). An employee with three assignments appears in
+ * three positions — correct.
+ */
 const OCCUPANTS_SQL = `
   SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.assignment_title,
          wa.allocation_percent, wa.is_primary, wa.role_id, wa.default_shift_id,
@@ -190,19 +198,8 @@ const OCCUPANTS_SQL = `
     JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
     LEFT JOIN hrms_shifts s ON s.company_id = wa.company_id AND s.id = wa.default_shift_id
     LEFT JOIN hrms_roles  r ON r.company_id = wa.company_id AND r.id = wa.role_id
-   WHERE wa.company_id = ? AND wa.deleted_at IS NULL AND wa.status = 'ACTIVE'
-     AND wa.position_id IS NOT NULL AND ${LIVE_ON('wa')}
+   WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}
    ORDER BY wa.is_primary DESC, e.full_name`;
-
-/** Day/night working, as the import recorded it (plan §9.1). The source of `shiftPattern` and of a DN position's strength. */
-const REQUIREMENTS_SQL = `
-  SELECT m.position_id, m.shift_id, m.required_count, m.work_context_id,
-         s.code AS shift_code, s.name AS shift_name
-    FROM hrms_manpower_requirements m
-    LEFT JOIN hrms_shifts s ON s.company_id = m.company_id AND s.id = m.shift_id
-   WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.position_id IS NOT NULL
-     AND ${LIVE_ON('m')}
-   ORDER BY s.code, m.id`;
 
 /**
  * The badge on the box. Content lives on the ROLE, so the counts are per role
@@ -268,8 +265,32 @@ const ATTENDANCE_SQL = `
  * DEPARTMENT is tried — a machine is a department now, so this is the same
  * "Helper 1 (… · Pelican Machine)" it always was — and a position code is the
  * last resort. A title used once is never decorated.
+ *
+ * ONE CHAIR PER POSITION (2026-10-10): what is told apart is CARDS, not
+ * positions. The seven chairs of one card are the same job under the same
+ * manager, so they are one entry here (represented by the lowest id) and all
+ * seven get the same display title — "Helper 1" is repeated only when another
+ * CARD is also called "Helper 1". The code used as a last resort is the card's
+ * base code (`P124` for `P124-1 … P124-7`).
  */
-function buildDisplayTitles(positions, primaryParentTitleById, primaryContextNameById) {
+const baseCode = (code) => (code == null ? null : String(code).replace(/-\d+$/, ''));
+
+function buildDisplayTitles(allPositions, primaryParentTitleById, primaryContextNameById) {
+  // One entry per card and title. (Chairs of one card normally share a title;
+  // if someone renamed one, it is told apart by its own name.)
+  const units = new Map();
+  for (const p of allPositions) {
+    const key = `${p.cardId}|${p.title}`;
+    const unit = units.get(key);
+    if (!unit) units.set(key, { id: p.id, title: p.title, positionCode: p.positionCode, memberIds: [p.id] });
+    else {
+      unit.memberIds.push(p.id);
+      if (p.id < unit.id) { unit.id = p.id; unit.positionCode = p.positionCode; }
+    }
+  }
+  for (const unit of units.values()) if (unit.memberIds.length > 1) unit.positionCode = baseCode(unit.positionCode);
+  const positions = [...units.values()];
+
   const byTitle = new Map();
   for (const p of positions) {
     const list = byTitle.get(p.title) ?? [];
@@ -278,9 +299,10 @@ function buildDisplayTitles(positions, primaryParentTitleById, primaryContextNam
   }
 
   const display = new Map();
+  const setAll = (unit, text) => { for (const id of unit.memberIds) display.set(id, text); };
   for (const [title, group] of byTitle) {
     if (group.length < 2) {
-      for (const p of group) display.set(p.id, title);
+      for (const p of group) setAll(p, title);
       continue;
     }
     // Try qualifiers in order of how much they say, keeping the spec's form first.
@@ -312,7 +334,7 @@ function buildDisplayTitles(positions, primaryParentTitleById, primaryContextNam
       return parent ? `${parent} · ${p.positionCode ?? `#${p.id}`}` : (p.positionCode ?? `#${p.id}`);
     };
     const make = chosen ?? fallback;
-    for (const p of group) display.set(p.id, `${title} (${make(p)})`);
+    for (const p of group) setAll(p, `${title} (${make(p)})`);
   }
   return display;
 }
@@ -362,13 +384,12 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
 
   const [
     [positionRows], [edgeRows], [occupantRows], [serveRows],
-    [requirementRows], [contentRows], [overrideRows], [openPointRows], [departmentRows],
+    [contentRows], [overrideRows], [openPointRows], [departmentRows],
   ] = await Promise.all([
     db.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     db.query(EDGES_SQL, [companyId, asOf, asOf]),
     db.query(OCCUPANTS_SQL, [companyId, asOf, asOf]),
     db.query(SERVES_SQL, [companyId]),
-    db.query(REQUIREMENTS_SQL, [companyId, asOf, asOf]),
     db.query(CONTENT_COUNTS_SQL, [companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf]),
     db.query(OVERRIDE_COUNTS_SQL, [companyId, asOf, asOf]),
     db.query(OPEN_POINT_COUNTS_SQL, [companyId]),
@@ -395,7 +416,6 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   };
 
   const occupantsByPosition = group(occupantRows, 'position_id');
-  const requirementsByPosition = group(requirementRows, 'position_id');
 
   const contentByRole = new Map();
   for (const r of contentRows) {
@@ -445,22 +465,17 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   const primaryContextName = new Map();
   for (const p of positionRows) if (p.department_name) primaryContextName.set(p.id, p.department_name);
 
+  /* ── the cards: which chairs are drawn together (positionCards.js) ──────── */
+  const cardOf = computeCards(
+    positionRows.map((p) => ({ id: p.id, roleId: p.role_id, departmentId: p.department_id })),
+    primaryParentOf,
+  );
+
   /* ── assemble the nodes ────────────────────────────────────────────────── */
   const allNodes = positionRows.map((p) => {
-    const requirements = (requirementsByPosition.get(p.id) ?? []).map((r) => ({
-      shiftId: r.shift_id ?? null,
-      shiftCode: r.shift_code ?? null,
-      shiftName: r.shift_name ?? null,
-      workContextId: r.work_context_id ?? null,
-      requiredCount: num(r.required_count),
-    }));
-    // Both derived, never stored, and both come from services/seatCount.js —
-    // the ONE implementation. This arithmetic used to be written out here, again
-    // in positionService and a third time in routes/overview.js, and the copies
-    // drifted: the chart said 156 vacant while the Positions screen said 101.
-    const shiftPattern = seatShiftPattern(p.shift_code, requirements);
-    const sanctionedHeadcount = num(p.sanctioned_headcount);
-    const effectiveSanctioned = effectiveSeats(sanctionedHeadcount, requirements);
+    // One chair, on its own shift. The numbers come from services/seatCount.js —
+    // the ONE implementation; nothing here reads sanctioned_headcount.
+    const shiftPattern = seatShiftPattern(p.shift_code);
 
     const occupants = (occupantsByPosition.get(p.id) ?? []).map((o) => {
       const attendance = attendanceByEmployee.get(o.employee_id) ?? null;
@@ -492,6 +507,9 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
 
     return {
       id: p.id,
+      // The card this chair is drawn in: the lowest position id among the chairs
+      // of the same role and department under the same manager card.
+      cardId: cardOf.get(p.id) ?? p.id,
       positionCode: p.position_code ?? null,
       title: baseTitleOf.get(p.id),
       displayTitle: baseTitleOf.get(p.id),          // replaced below once duplicates are known
@@ -510,21 +528,25 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       locationId: p.location_id ?? null,
       locationName: p.location_name ?? null,
       status: p.status,
-      sanctionedHeadcount,
-      // What the box actually has to fill on this date — `sanctionedHeadcount`
-      // for a single-shift seat, Σ(requiredCount) for a DN one.
-      effectiveSanctioned,
+      // Always 1, both of them: a position is one chair. Kept by name because
+      // clients written before the change read them.
+      sanctionedHeadcount: SEATS_PER_POSITION,
+      effectiveSanctioned: SEATS_PER_POSITION,
+      // The position's own shift code. Never 'DN' — day and night are two positions.
       shiftPattern,
+      // The position's shift. null only where the company has no shifts at all.
       defaultShift: p.default_shift_id
         ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null }
         : null,
       // Retired: machines are departments. Always empty, kept so a client
       // written before the change still finds an array.
       contexts: [],
+      // 0 or 1. Two is wrong data, flagged by overFilled and still shown.
       occupants,
-      requirements,
-      vacancies: Math.max(0, effectiveSanctioned - occupants.length),
-      overFilled: occupants.length > effectiveSanctioned,
+      // Retired: a chair is the requirement. Always empty.
+      requirements: [],
+      vacancies: seatVacancies(occupants.length),
+      overFilled: seatOverFilled(occupants.length),
       counts,
       hasContent: counts.kras + counts.responsibilities + counts.kpis + counts.qualifications + counts.openPoints > 0,
       effectiveFrom: dateText(p.effective_from),
@@ -584,17 +606,21 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   }
 
   /* ── totals, over exactly the nodes being returned ─────────────────────── */
-  let sanctioned = 0;
+  // filled + vacant = positions, always: an over-filled chair is ONE filled seat.
   let filled = 0;
   let vacant = 0;
   let present = 0;
   let absent = 0;
-  const byShiftPattern = { G: 0, D: 0, N: 0, DN: 0 };
+  const byShiftPattern = { G: 0, D: 0, N: 0 };
+  const byShift = {};
   for (const n of nodes) {
-    sanctioned += n.effectiveSanctioned;
-    filled += n.occupants.length;
-    vacant += n.vacancies;
+    const isFilled = n.vacancies === 0;
+    if (isFilled) filled += 1; else vacant += 1;
     byShiftPattern[n.shiftPattern] = (byShiftPattern[n.shiftPattern] ?? 0) + 1;
+    const shiftName = n.defaultShift?.name ?? n.defaultShift?.code ?? 'No shift';
+    const shift = byShift[shiftName] ?? (byShift[shiftName] = { positions: 0, filled: 0 });
+    shift.positions += 1;
+    if (isFilled) shift.filled += 1;
     for (const o of n.occupants) {
       if (o.attendanceStatus === 'PRESENT') present += 1;
       else if (o.attendanceStatus === 'ABSENT') absent += 1;
@@ -613,10 +639,15 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     // need their departments' ancestors to be drawn in place.
     departments,
     counts: {
+      // One position is one seat, so these two are the same number.
       positions: nodes.length,
-      sanctioned,
+      sanctioned: nodes.length,
       filled,
       vacant,
+      // How many boxes the chart draws.
+      cards: new Set(nodes.map((n) => n.cardId)).size,
+      // By shift NAME: { General: { positions, filled }, Day: …, Night: … }.
+      byShift,
       present,
       absent,
       edges: edges.length,
@@ -636,15 +667,35 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
  * ══════════════════════════════════════════════════════════════════════════
  * Everything the modal shows that the graph deliberately leaves out. The
  * reporting block comes from `reportingResolver.resolvePositionReporting` —
- * the one implementation — so a vacant manager seat, several people in one seat
- * and a scoped dotted line all arrive already explained.
+ * the one implementation — so a vacant manager seat and a scoped dotted line
+ * arrive already explained.
+ *
+ * ONE CHAIR (2026-10-10). The card is about ONE position: `shift` is its shift,
+ * `occupants` holds at most one person. `cardId` and `siblings` say which other
+ * positions are drawn in the same box (same role and department under the same
+ * manager card), each with its shift and who is in it.
+ *
+ * `directReports`: by default the positions whose line points at THIS position.
+ * With `scope: 'card'` it is the positions reporting to ANY position of this
+ * card — the team reports to the card, and which chair a line happens to name
+ * (the same-shift one, by the migration's rule) is not what a reader is asking.
+ * Each row carries `toPositionId` so the client can still tell.
  */
-export async function getPositionCard(db, companyId, positionId, { on } = {}) {
+export async function getPositionCard(db, companyId, positionId, { on, scope } = {}) {
   const asOf = dateText(on) || today();
-  const position = await requirePosition(db, companyId, positionId);
+  const [position, cards] = await Promise.all([
+    requirePosition(db, companyId, positionId),
+    loadCards(db, companyId, asOf),
+  ]);
+  // A closed position is in no card: it stands alone.
+  const cardId = cards.cardOf.get(positionId) ?? positionId;
+  const cardIds = cards.members.get(cardId) ?? [positionId];
+  const siblingIds = cardIds.filter((x) => x !== positionId);
+  const reportTargets = String(scope ?? '').toLowerCase() === 'card' ? cardIds : [positionId];
+  const marks = (list) => list.map(() => '?').join(',');
 
   const [
-    [[head]], [occupantRows], [requirementRows], [openPointRows], [parentRows], [reportRows],
+    [[head]], [occupantRows], [openPointRows], [parentRows], [reportRows], [siblingRows],
   ] = await Promise.all([
     db.query(
       `SELECT p.id, p.position_code, p.position_title, p.role_id, p.sanctioned_headcount, p.status,
@@ -663,7 +714,6 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
       [companyId, positionId],
     ),
     db.query(`${OCCUPANTS_SQL.replace('WHERE wa.company_id = ?', 'WHERE wa.company_id = ? AND wa.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
-    db.query(`${REQUIREMENTS_SQL.replace('WHERE m.company_id = ?', 'WHERE m.company_id = ? AND m.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
     db.query(
       `SELECT op.* FROM hrms_open_points op
         WHERE op.company_id = ? AND op.deleted_at IS NULL AND op.entity_type = 'POSITION' AND op.entity_id = ?
@@ -683,22 +733,46 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     // Direct reports: the other half of the seat's shape, and the reason the card
     // can answer "who works for this position" without re-reading the graph.
     db.query(
-      `SELECT rr.from_position_id AS id, fp.position_code, COALESCE(fp.position_title, fr.title) AS title,
+      `SELECT rr.from_position_id AS id, rr.to_position_id, fp.position_code, COALESCE(fp.position_title, fr.title) AS title,
               t.code AS type_code, t.name AS type_name,
-              (SELECT COUNT(*) FROM hrms_work_assignments wa
-                WHERE wa.company_id = rr.company_id AND wa.position_id = fp.id AND wa.deleted_at IS NULL
-                  AND wa.status = 'ACTIVE' AND ${LIVE_ON('wa')}) AS occupied
+              ${OCCUPANT_COUNT_SQL('fp')} AS occupied
          FROM hrms_position_reporting_relationships rr
          JOIN hrms_positions fp ON fp.company_id = rr.company_id AND fp.id = rr.from_position_id
          LEFT JOIN hrms_roles fr ON fr.company_id = rr.company_id AND fr.id = fp.role_id
          JOIN hrms_reporting_relationship_types t ON t.company_id = rr.company_id AND t.id = rr.relationship_type_id
-        WHERE rr.company_id = ? AND rr.to_position_id = ? AND rr.deleted_at IS NULL AND ${LIVE_ON('rr')}
+        WHERE rr.company_id = ? AND rr.to_position_id IN (${marks(reportTargets)}) AND rr.deleted_at IS NULL AND ${LIVE_ON('rr')}
           AND fp.deleted_at IS NULL AND fp.status <> 'CLOSED'
         ORDER BY fp.position_code, fp.id`,
       // The occupancy sub-select's dates come first — it is earlier in the text.
-      [asOf, asOf, companyId, positionId, asOf, asOf],
+      [asOf, asOf, companyId, ...reportTargets, asOf, asOf],
     ),
+    // The other chairs of this card, each with its shift and whoever is in it.
+    siblingIds.length
+      ? db.query(
+        `SELECT p.id, p.position_code, s.id AS shift_id, s.code AS shift_code, s.name AS shift_name,
+                wa.employee_id, e.full_name
+           FROM hrms_positions p
+           LEFT JOIN hrms_shifts s ON s.company_id = p.company_id AND s.id = p.default_shift_id
+           LEFT JOIN hrms_work_assignments wa ON wa.company_id = p.company_id AND wa.position_id = p.id
+                AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}
+           LEFT JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+          WHERE p.company_id = ? AND p.id IN (${marks(siblingIds)})
+          ORDER BY p.position_code, p.id, wa.is_primary DESC, wa.id`,
+        [asOf, asOf, companyId, ...siblingIds],
+      )
+      : [[]],
   ]);
+
+  const siblings = [];
+  for (const r of siblingRows) {
+    if (siblings.some((x) => x.positionId === r.id)) continue;   // a second row only if a chair is wrongly double-filled
+    siblings.push({
+      positionId: r.id,
+      positionCode: r.position_code ?? null,
+      shift: r.shift_id ? { id: r.shift_id, code: r.shift_code ?? null, name: r.shift_name ?? null } : null,
+      occupant: r.employee_id != null ? { employeeId: r.employee_id, name: r.full_name } : null,
+    });
+  }
 
   const employeeIds = [...new Set(occupantRows.map((o) => o.employee_id))];
   const attendance = new Map();
@@ -721,18 +795,11 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     listPositionOverrides(db, companyId, positionId),
   ]);
 
-  const requirements = requirementRows.map((r) => ({
-    shiftId: r.shift_id ?? null,
-    shiftCode: r.shift_code ?? null,
-    shiftName: r.shift_name ?? null,
-    requiredCount: num(r.required_count),
-  }));
   // seatCount.js is the one definition — see the note at the other call site.
-  const shiftPattern = seatShiftPattern(head.shift_code, requirements);
-  const sanctionedHeadcount = num(head.sanctioned_headcount);
-  const effectiveSanctioned = shiftPattern === 'DN'
-    ? requirements.reduce((t, r) => t + r.requiredCount, 0)
-    : sanctionedHeadcount;
+  const shiftPattern = seatShiftPattern(head.shift_code);
+  const sanctionedHeadcount = SEATS_PER_POSITION;
+  const effectiveSanctioned = SEATS_PER_POSITION;
+  const shift = head.shift_id ? { id: head.shift_id, code: head.shift_code ?? null, name: head.shift_name ?? null } : null;
 
   const occupants = occupantRows.map((o) => {
     const a = attendance.get(o.employee_id) ?? null;
@@ -836,10 +903,15 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     departmentIsShared: Boolean(head.department_is_shared),
     locationId: head.location_id ?? null,
     locationName: head.location_name ?? null,
+    // The box this position is drawn in, its own shift, and the other chairs of that box.
+    cardId,
+    shift,
+    siblings,
     sanctionedHeadcount,
     effectiveSanctioned,
     shiftPattern,
-    vacancies: Math.max(0, effectiveSanctioned - occupants.length),
+    vacancies: seatVacancies(occupants.length),
+    overFilled: seatOverFilled(occupants.length),
     kras: content.kras.map(contentItem),
     responsibilities: content.responsibilities.map(contentItem),
     kpis: content.kpis.map(contentItem),
@@ -853,14 +925,15 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
       sanctionedHeadcount,
       effectiveSanctioned,
       shiftPattern,
-      defaultShift: head.shift_id ? { id: head.shift_id, code: head.shift_code, name: head.shift_name } : null,
+      cardId,
+      defaultShift: shift,
       departmentId: head.department_id ?? null,
       departmentName: head.department_name ?? null,
       locationId: head.location_id ?? null,
       locationName: head.location_name ?? null,
       effectiveFrom: dateText(head.effective_from),
       effectiveTo: dateText(head.effective_to),
-      vacancies: Math.max(0, effectiveSanctioned - occupants.length),
+      vacancies: seatVacancies(occupants.length),
     },
     role: head.role_id
       ? {
@@ -875,7 +948,8 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     // Retired with the chart's: the seat's department says where it works.
     contexts: [],
     occupants,
-    requirements,
+    // Retired: a chair is the requirement. Always empty.
+    requirements: [],
     // THE RESOLVED SET, never one manager. Each row carries its type, its scope
     // sentence, its manager candidates and whether that seat is vacant.
     reporting: reportingRows,
@@ -888,7 +962,10 @@ export async function getPositionCard(db, companyId, positionId, { on } = {}) {
     directReports: reportRows.map((r) => ({
       positionId: r.id, positionCode: r.position_code ?? null, title: r.title ?? null,
       typeCode: r.type_code, typeName: r.type_name, occupied: num(r.occupied),
+      // Which chair of the card the line names (always this one unless scope=card).
+      toPositionId: r.to_position_id,
     })),
+    directReportsScope: String(scope ?? '').toLowerCase() === 'card' ? 'card' : 'position',
     content,
     // The position layer on top of the role's content. The three-way resolution
     // itself is contentResolver.js's job (plan §2 rule 6) — these are listed so
@@ -932,6 +1009,10 @@ export async function searchOrgChart(db, companyId, { q, on, limit = 200 } = {})
   if (!words.length) throw invalid('INVALID', 'Type something to search for.');
 
   const cap = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  // Hits are positions, and seven chairs of one card all match the same role
+  // line — so each hit says which card it is drawn in and the client can show
+  // one box, not seven. Read beside the searches, not after them.
+  const cardsPromise = loadCards(db, companyId, asOf);
   const perKind = await Promise.all(SEARCH_KINDS.map(async ({ kind, table, def, fk }) => {
     const wordSql = words.map(() => `CONCAT_WS(' ', d.name, d.description) LIKE ? ESCAPE '\\\\'`).join(' AND ');
     const [rows] = await db.query(
@@ -952,10 +1033,12 @@ export async function searchOrgChart(db, companyId, { q, on, limit = 200 } = {})
     return rows.map((r) => ({ ...r, kind }));
   }));
 
+  const { cardOf } = await cardsPromise;
   const byPosition = new Map();
   for (const r of perKind.flat()) {
     const entry = byPosition.get(r.position_id) ?? {
       positionId: r.position_id,
+      cardId: cardOf.get(r.position_id) ?? r.position_id,
       positionCode: r.position_code ?? null,
       title: r.title,
       matches: [],

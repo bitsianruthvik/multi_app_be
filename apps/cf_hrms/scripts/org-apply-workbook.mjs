@@ -58,6 +58,7 @@ import {
 } from './lib/orgTemplateSheets.mjs';
 import { readOrgWorkbook, schemaVersionProblem } from './lib/orgWorkbookReader.mjs';
 import { isDayCode, isNightCode } from '../services/seatCount.js';
+import { oneChairRefusal } from './lib/oneChairGuard.mjs';
 import * as positionSvc from '../services/positionService.js';
 import * as assignmentSvc from '../services/assignmentService.js';
 import * as peopleSvc from '../services/peopleService.js';
@@ -1663,6 +1664,13 @@ async function main() {
   const conn = await mysql.createConnection({ ...target.cfg, dateStrings: true });
   let code = 0;
   try {
+    // RETIRED for a tenant on the one-chair model (2026-10-10) — lib/oneChairGuard.mjs. The workbook's Headcount and
+    // "Day & night" columns write sanctioned_headcount and per-shift requirement rows, which nothing reads any more.
+    // Only this command line is guarded: prepare / applyWorkbook stay importable for the regression suite.
+    const [[guardCompany]] = await conn.query('SELECT id, name FROM companies WHERE slug = ? AND deleted_at IS NULL', [slug]);
+    const refusal = guardCompany ? await oneChairRefusal(conn, guardCompany.id, guardCompany.name, 'Applying an organisation workbook') : null;
+    if (refusal) { console.error(refusal); process.exitCode = 2; return; }
+
     // the plan, read-only (an --apply plans again, inside its own transaction, so the plan is for the state it writes into)
     const prep = await prepare({ conn, buf, slug, target, deleteMissing: flags.deleteMissing });
     printHeader({ file: abs, buf, prep, target, apply, flags });

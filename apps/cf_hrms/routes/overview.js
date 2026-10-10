@@ -22,14 +22,10 @@
  * key hides its card (§4.1) instead of rendering a misleading zero. That is the
  * same contract fab_erp's /pulse uses.
  *
- * SEATS ARE COUNTED THE ORG CHART'S WAY, NOT THE POSITION LIST'S. A position
- * that works day AND night keeps `sanctioned_headcount = 1` — ONE SEAT — and
- * carries an hrms_manpower_requirements row per shift instead (plan §9.1). Its
- * real strength is Σ(required_count). Summing `sanctioned_headcount` instead,
- * which is what positionService.listPositions does for its filtered StatStrip,
- * reports 114 sanctioned and 101 vacant for Karni where the truth is 169 and
- * 156. The cockpit must agree with the org chart, so the fork below is a copy
- * of orgChartService's — if one changes, change both.
+ * SEATS. One position is one seat (2026-10-10): positions = seats, a seat is
+ * filled when a live work assignment points at it, CLOSED positions do not
+ * count. The rule and its SQL live in services/seatCount.js and nowhere else,
+ * so the cockpit, the Positions screen and the org chart cannot disagree.
  *
  * Plain lists still go through the generic query API; what lands here is only
  * aggregation across service boundaries.
@@ -132,21 +128,14 @@ async function readCounts(db, companyId, on) {
 }
 
 /**
- * Sanctioned / filled / vacant across every live, non-CLOSED seat.
- *
- * `eff` is the org chart's `effectiveSanctioned`: Σ(required_count) when the
- * position has live manpower requirements on both a day and a night shift,
- * otherwise `sanctioned_headcount`. A CLOSED seat is excluded — counting its
- * headcount invents vacancies nobody is hiring for.
+ * Positions / filled / vacant across every live, non-CLOSED position. The rule
+ * is services/seatCount.js's; `sanctioned` equals `positions` and is kept
+ * because Home's cards read it.
  */
-// The rule lives in services/seatCount.js — see its header for why. This used
-// to be a hand-copied fork of orgChartService's, with a comment saying "if one
-// changes, change both". They did not both change, and the Positions screen
-// disagreed with its own nav badge in production.
 const SEATS = SEAT_TOTALS_SQL(LIVE_ON);
 
 async function readSeats(db, companyId, on) {
-  const [[row]] = await db.query(SEATS, [companyId, on, on, companyId, on, on, companyId, on, on]);
+  const [[row]] = await db.query(SEATS, [companyId, on, on, companyId, on, on]);
   return {
     positions: n(row.positions),
     sanctioned: n(row.sanctioned),

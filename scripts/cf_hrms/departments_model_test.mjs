@@ -72,8 +72,9 @@ ok(chart.nodes.every((n) => n.departmentId == null
     && n.departmentRank === deptById.get(n.departmentId).rank && n.departmentIsRoot === (deptById.get(n.departmentId).parentId == null))),
 'departmentName / Code / Rank / IsRoot still agree with the tree');
 ok(chart.nodes.every((n) => Array.isArray(n.contexts) && n.contexts.length === 0), 'node.contexts is an empty array');
-// 9 company-wide reads + attendance when anyone is seated. It was the same before departments joined the payload.
-const expectedQueries = 9 + (chart.nodes.some((n) => n.occupants.length) ? 1 : 0);
+// 8 company-wide reads + attendance when anyone is seated. It was 9 until 2026-10-10: one position is one chair, so the
+// manpower-requirements read is gone (services/seatCount.js). Cards are computed in memory from rows already read.
+const expectedQueries = 8 + (chart.nodes.some((n) => n.occupants.length) ? 1 : 0);
 ok(counted.n === expectedQueries, 'the chart still costs the same number of queries', `${counted.n} (expected ${expectedQueries})`);
 const sharedDepts = chart.departments.filter((d) => d.isShared);
 if (!sharedDepts.length) skip('shared departments in the payload', 'this company has none');
@@ -98,7 +99,8 @@ if (chart.nodes.length) {
 /* ── 2. the employee slice, for every linked employee ─────────────────────── */
 const [linked] = await pool.query(
   'SELECT e.id, e.user_id, e.full_name FROM hrms_employees e WHERE e.company_id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL', [companyId]);
-const NODE_KEYS = 'contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
+// cardId joined the whitelist on 2026-10-10 (one chair per position; chairs are drawn in cards).
+const NODE_KEYS = 'cardId,contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
 if (!linked.length) skip('the employee slice', 'no employee is linked to a login (run create-employee-logins.mjs --apply)');
 else {
   let leaks = 0, dangling = 0, badKeys = 0, missing = 0, wide = 0, slices = 0, emptyCtx = 0, withShared = 0;

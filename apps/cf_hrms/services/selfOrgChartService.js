@@ -8,6 +8,13 @@
  *   - the seats I hold;
  *   - every seat BELOW each seat I hold (all PRIMARY_MANAGER descendants — a
  *     manager of managers sees the whole branch);
+ *   - ONE CHAIR PER POSITION (2026-10-10): a team reports to the CARD. The day
+ *     and the night in-charge are two positions of one card and each crew
+ *     member's line names one of the two chairs, so "below me" starts from
+ *     EVERY chair of my card — both in-charges see the whole crew. Those other
+ *     chairs of my card travel too (relation `SAME_CARD`): without them the
+ *     other shift's crew would arrive with lines pointing at a seat the payload
+ *     does not carry. The chain UP still follows my own position's manager only;
  *   - the seats my own seats report to on a NON-primary line (dotted,
  *     functional, …) — the seat alone, never that manager's chain or branch.
  * Peers in other branches are not in it. Edges travel only when BOTH ends are
@@ -53,6 +60,8 @@ const EMPLOYEE_ID_BY_USER = `
 function sliceNode(n, myEmployeeId, relation, sameAs = new Map()) {
   return {
     id: n.id,
+    // Which box this chair is drawn in. A position id of this company, nothing more.
+    cardId: n.cardId ?? n.id,
     positionCode: n.positionCode ?? null,
     title: n.title,
     displayTitle: n.displayTitle,
@@ -64,7 +73,8 @@ function sliceNode(n, myEmployeeId, relation, sameAs = new Map()) {
     departmentRank: n.departmentRank ?? null,
     departmentIsRoot: Boolean(n.departmentIsRoot),
     locationName: n.locationName ?? null,
-    // Seat design, needed to draw the box's rows (a vacancy is an empty row).
+    // Seat design, needed to draw the card's rows (a vacant position is an empty
+    // row). One chair: both counts are 1 and requirements is always empty.
     shiftPattern: n.shiftPattern,
     defaultShift: n.defaultShift ? { code: n.defaultShift.code ?? null, name: n.defaultShift.name ?? null } : null,
     sanctionedHeadcount: n.sanctionedHeadcount,
@@ -147,9 +157,11 @@ export function sliceDepartments(departments, seatDepartmentIds) {
 
 /**
  * Pure: which seats are in the slice, and why. Exported for the test script.
- * `edges` are the read model's edges; `mine` the seats the caller holds.
+ * `edges` are the read model's edges; `mine` the seats the caller holds;
+ * `cardMates` the other chairs of the caller's card(s) — the walk DOWN starts
+ * from them as well, because a team reports to the card.
  */
-export function computeSlice(edges, mine) {
+export function computeSlice(edges, mine, cardMates = []) {
   const up = new Map();      // child -> [managers] (primary)
   const down = new Map();    // manager -> [children] (primary)
   for (const e of edges) {
@@ -175,14 +187,15 @@ export function computeSlice(edges, mine) {
     return seen;
   };
   const self = new Set(mine);
+  const sameCard = new Set(cardMates.filter((id) => !self.has(id)));
   const managers = walk(mine, up);
-  const reports = walk(mine, down);
+  const reports = walk([...mine, ...sameCard], down);
   const dotted = new Set();
   for (const e of edges) {
     if (e.typeCode === PRIMARY) continue;
     if (self.has(e.fromPositionId)) dotted.add(e.toPositionId);
   }
-  return { self, managers, reports, dotted };
+  return { self, managers, reports, dotted, sameCard };
 }
 
 export async function myOrgChart(db, ctx, { on } = {}) {
@@ -191,7 +204,7 @@ export async function myOrgChart(db, ctx, { on } = {}) {
 
   const empty = (reason) => ({
     asOf, linked: false, reason, nodes: [], edges: [], departments: [], mySeatIds: [],
-    counts: { positions: 0, managers: 0, reports: 0, dotted: 0 },
+    counts: { positions: 0, managers: 0, reports: 0, dotted: 0, sameCard: 0 },
   });
 
   const [[employee]] = await db.query(EMPLOYEE_ID_BY_USER, [companyId, userId]);
@@ -209,14 +222,17 @@ export async function myOrgChart(db, ctx, { on } = {}) {
     return empty('You are not in a seat on the organisation chart on this date.');
   }
 
-  const { self, managers, reports, dotted } = computeSlice(graph.edges, mine);
+  const myCards = new Set(graph.nodes.filter((n) => mine.includes(n.id)).map((n) => n.cardId));
+  const cardMates = graph.nodes.filter((n) => myCards.has(n.cardId) && !mine.includes(n.id)).map((n) => n.id);
+  const { self, managers, reports, dotted, sameCard } = computeSlice(graph.edges, mine, cardMates);
   const relationOf = (id) => {
     if (self.has(id)) return 'SELF';
+    if (sameCard.has(id)) return 'SAME_CARD';
     if (managers.has(id)) return 'MANAGER';
     if (reports.has(id)) return 'REPORT';
     return 'DOTTED_MANAGER';
   };
-  const keep = new Set([...self, ...managers, ...reports, ...dotted]);
+  const keep = new Set([...self, ...sameCard, ...managers, ...reports, ...dotted]);
 
   const kept = graph.nodes.filter((n) => keep.has(n.id));
   const seatsOf = new Map();
@@ -242,6 +258,7 @@ export async function myOrgChart(db, ctx, { on } = {}) {
       managers: nodes.filter((n) => n.relation === 'MANAGER').length,
       reports: nodes.filter((n) => n.relation === 'REPORT').length,
       dotted: nodes.filter((n) => n.relation === 'DOTTED_MANAGER').length,
+      sameCard: nodes.filter((n) => n.relation === 'SAME_CARD').length,
     },
   };
 }

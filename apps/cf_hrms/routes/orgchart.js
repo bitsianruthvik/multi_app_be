@@ -3,7 +3,8 @@
  * `CF_HRMS_ORG_CHART_SPEC.md` §9, which is the fixed API contract.)
  *
  *   GET /orgchart                          ?on=&root=   the WHOLE graph in one payload
- *   GET /orgchart/positions/:id/card       ?on=         everything the card modal shows
+ *   GET /orgchart/positions/:id/card       ?on=&scope=  everything the card modal shows about ONE position;
+ *                                                       scope=card widens directReports to the whole card
  *   GET /orgchart/search                   ?q=&on=      KRA / responsibility / KPI / qualification text
  *   GET /orgchart/departments              ?on=         what each unit is accountable for (spec §13)
  *   GET /orgchart/open-points              ?status=&entityType=&entityId=   grouped by entity
@@ -39,7 +40,7 @@ const router = Router();
 
 /**
  * The graph. `on` drives every effective-date filter in it — positions, edges,
- * assignments, context links, manpower requirements and attendance all read as
+ * assignments and attendance all read as
  * of the same day, so nothing in the payload can disagree with anything else.
  * `root` re-roots at one position and returns its subtree down the
  * PRIMARY_MANAGER tree.
@@ -58,12 +59,19 @@ router.get('/orgchart', guard(PERM.orgView), handle((req) => buildOrgChart(
  * assignments and attendance, contexts, open points, and the RESOLVED reporting
  * set from `reportingResolver.resolvePositionReporting` — every row with its
  * type, its scope sentence, who is in that seat now and whether it is vacant.
+ *
+ * One position is one chair: `shift` is its shift, `occupants` has at most one
+ * person, `cardId` + `siblings` name the other positions drawn in the same box.
+ * `directReports` is the positions whose line points at THIS position; with
+ * `?scope=card` it is the positions reporting to ANY position of the card
+ * (each row says which, in `toPositionId`). The default stays per-position so
+ * a caller that never heard of cards gets what it always got.
  */
 router.get('/orgchart/positions/:id/card', guard(PERM.orgView), handle((req) => getPositionCard(
   pool,
   ctx(req).companyId,
   intParam(req.params.id),
-  { on: dateParam(req.query.on) },
+  { on: dateParam(req.query.on), scope: req.query.scope },
 )));
 
 /** Multi-word AND across the four content kinds, answering with positions. */

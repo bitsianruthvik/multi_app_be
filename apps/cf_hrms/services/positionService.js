@@ -1,4 +1,7 @@
-import { EFFECTIVE_SEATS_SQL, effectiveSeats, vacancies as vacancyOf } from './seatCount.js';
+import {
+  SEATS_PER_POSITION, HOLDS_SEAT_SQL, filledSeats, vacancies as vacancyOf, overFilled as overFilledOf,
+} from './seatCount.js';
+import { computeCards, cardMembers, loadCards, chairOnShift } from './positionCards.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -7,6 +10,16 @@ import { EFFECTIVE_SEATS_SQL, effectiveSeats, vacancies as vacancyOf } from './s
  * who is in it. That is why formal reporting lives between positions and not
  * between people — a vacancy still has a manager, and replacing a person does
  * not rewrite the chart.
+ *
+ * ONE POSITION IS ONE CHAIR (2026-10-10; services/seatCount.js has the rule).
+ * A position is for one person on one shift. `sanctioned_headcount` is always
+ * written as 1 whatever a caller sends; `default_shift_id` is the position's
+ * shift, set on create (the company's General shift when none is given) and
+ * never cleared. Twelve helpers are twelve positions — "one more like this" is
+ * addSiblingPosition, and the chart draws the twelve as one CARD
+ * (services/positionCards.js). Reporting lines run chair to chair, but a team
+ * reports to the CARD: taking one chair away leaves its team with the card's
+ * other chairs, and only the card's last chair sends the team up a level.
  *
  * Position is OPTIONAL on a work assignment (non-negotiable 5). Nothing in this
  * file may be made a precondition of doing work; an SME that has never written
@@ -25,9 +38,9 @@ import { EFFECTIVE_SEATS_SQL, effectiveSeats, vacancies as vacancyOf } from './s
  *     identity-bearing fields of a live row cannot be edited, only ended and
  *     replaced — and `replacesId` on a create does both inside one transaction.
  *
- * VACANCY IS A FACT, NOT AN ERROR. sanctioned − filled is reported as a number
- * and never as a failure; 156 of Karni's 169 seats are vacant and that is the
- * truth the system exists to show.
+ * VACANCY IS A FACT, NOT AN ERROR. A position with nobody in it is reported as
+ * vacant and never as a failure; 149 of Karni's 220 positions are vacant and
+ * that is the truth the system exists to show.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 
@@ -242,13 +255,16 @@ const OVERRIDE_SELECT = (table, fk) => `
  * Positions
  * ══════════════════════════════════════════════════════════════════════════ */
 
-function shapePosition(p) {
-  // sanctionedHeadcount stays the raw column — it means ONE SEAT and the edit
-  // form writes it back. `seats` is the effective strength for the date, which
-  // is what fill and vacancy are measured against. services/seatCount.js says why.
-  const sanctioned = Number(p.sanctioned_headcount ?? 0);
-  const seats = Number(p.effective_seats ?? sanctioned);
-  const filled = Number(p.filled_count ?? 0);
+/**
+ * `people` is who holds this chair on the date: none or one. Two is wrong data
+ * (assignmentService refuses it); it shows as overFilled and still counts as
+ * one filled seat. `sanctionedHeadcount`, `seats`, `filledCount` and
+ * `vacancyCount` keep their names for the screens that read them — they are
+ * now 1, 1, 0|1 and 1|0.
+ */
+function shapePosition(p, people = []) {
+  const live = people.length;
+  const first = people[0] ?? null;
   return {
     id: p.id,
     positionCode: p.position_code,
@@ -261,13 +277,18 @@ function shapePosition(p) {
     departmentName: p.department_name ?? null,
     locationId: p.location_id,
     locationName: p.location_name ?? null,
-    sanctionedHeadcount: sanctioned,
-    seats,
-    filledCount: filled,
-    // A fact, not an error. Never negative on the wire: an over-filled seat is
-    // its own signal (filledCount > sanctionedHeadcount) and is not a vacancy.
-    vacancyCount: vacancyOf(seats, filled),
-    overFilled: filled > seats,
+    sanctionedHeadcount: SEATS_PER_POSITION,
+    seats: SEATS_PER_POSITION,
+    filledCount: filledSeats(live),
+    // A fact, not an error.
+    vacancyCount: vacancyOf(live),
+    overFilled: overFilledOf(live),
+    // The one person in this position, or null when it is vacant.
+    occupant: first
+      ? { employeeId: first.employee_id, name: first.full_name, employeeCode: first.employee_code ?? null, assignmentId: first.assignment_id }
+      : null,
+    // The position's shift, as an object and (older readers) as three flat fields.
+    shift: p.default_shift_id ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null } : null,
     defaultShiftId: p.default_shift_id,
     shiftCode: p.shift_code ?? null,
     shiftName: p.shift_name ?? null,
@@ -286,12 +307,6 @@ const POSITION_SELECT = `
   SELECT p.*, r.title AS role_title, r.role_code,
          d.name AS department_name, l.name AS location_name,
          s.code AS shift_code, s.name AS shift_name,
-         ${EFFECTIVE_SEATS_SQL('p')} AS effective_seats,
-         (SELECT COUNT(*) FROM hrms_work_assignments wa
-           WHERE wa.company_id = p.company_id AND wa.position_id = p.id AND wa.deleted_at IS NULL
-             AND wa.status = 'ACTIVE'
-             AND (wa.effective_from IS NULL OR wa.effective_from <= ?)
-             AND (wa.effective_to IS NULL OR wa.effective_to >= ?)) AS filled_count,
          (SELECT COUNT(*) FROM hrms_position_work_contexts c
            WHERE c.company_id = p.company_id AND c.position_id = p.id AND c.deleted_at IS NULL) AS context_count,
          (SELECT COUNT(*) FROM hrms_position_reporting_relationships rr
@@ -304,12 +319,29 @@ const POSITION_SELECT = `
     LEFT JOIN hrms_locations   l ON l.company_id = p.company_id AND l.id = p.location_id
     LEFT JOIN hrms_shifts      s ON s.company_id = p.company_id AND s.id = p.default_shift_id`;
 
+/**
+ * Who holds which chair on a date — one read for the whole company (or one
+ * position), joined to the rows in memory. "Holds" is seatCount.js's predicate.
+ * @returns {Map<number, Array>} position id -> the people in it (normally one)
+ */
+async function occupantsByPosition(db, companyId, on, positionId = null) {
+  const [rows] = await db.query(
+    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, e.full_name, e.employee_code
+       FROM hrms_work_assignments wa
+       JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+      WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}${positionId == null ? '' : ' AND wa.position_id = ?'}
+      ORDER BY wa.is_primary DESC, wa.id`,
+    positionId == null ? [companyId, on, on] : [companyId, on, on, positionId],
+  );
+  const by = new Map();
+  for (const r of rows) by.set(r.position_id, [...(by.get(r.position_id) ?? []), r]);
+  return by;
+}
+
 export async function listPositions(db, companyId, query = {}) {
   const on = dateText(query.on) || today();
   const where = ['p.company_id = ?', 'p.deleted_at IS NULL'];
-  // EFFECTIVE_SEATS_SQL comes first in the SELECT and takes four date params
-  // (two subqueries x two date bounds); then filled_count takes two.
-  const params = [on, on, on, on, on, on, companyId];
+  const params = [companyId];
 
   if (!blank(query.status)) {
     const statuses = String(query.status).split(',').map((s) => s.trim().toUpperCase()).filter((s) => POSITION_STATUSES.includes(s));
@@ -324,16 +356,23 @@ export async function listPositions(db, companyId, query = {}) {
     params.push(like, like, like);
   }
 
-  const [rows] = await db.query(`${POSITION_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.title, p.position_code, p.id`, params);
-  const items = rows.map(shapePosition);
+  const [[rows], people] = await Promise.all([
+    db.query(`${POSITION_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.title, p.position_code, p.id`, params),
+    occupantsByPosition(db, companyId, on),
+  ]);
+  const items = rows.map((p) => shapePosition(p, people.get(p.id)));
   return {
     asOf: on,
     items,
     total: items.length,
     // The StatStrip's numbers, computed over the SAME filtered set the list
-    // shows, so they can never disagree with the rows underneath.
+    // shows, so they can never disagree with the rows underneath. A position is
+    // one seat, so `sanctioned` is the number of rows. (A CLOSED row is listed
+    // when the filter asks for it and is then counted here too; the chart and
+    // Home never count one.)
     totals: {
-      sanctioned: items.reduce((n, p) => n + p.seats, 0),
+      positions: items.length,
+      sanctioned: items.length,
       filled: items.reduce((n, p) => n + p.filledCount, 0),
       vacant: items.reduce((n, p) => n + p.vacancyCount, 0),
       overFilled: items.filter((p) => p.overFilled).length,
@@ -343,9 +382,19 @@ export async function listPositions(db, companyId, query = {}) {
 
 export async function getPosition(db, companyId, id, query = {}) {
   const on = dateText(query.on) || today();
-  const [[row]] = await db.query(`${POSITION_SELECT} WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`, [on, on, on, on, on, on, companyId, id]);
+  const [[[row]], people] = await Promise.all([
+    db.query(`${POSITION_SELECT} WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`, [companyId, id]),
+    occupantsByPosition(db, companyId, on, id),
+  ]);
   if (!row) throw notFound('Position');
-  return { asOf: on, position: shapePosition(row) };
+  return { asOf: on, position: shapePosition(row, people.get(row.id)) };
+}
+
+/** The shift a new position gets when none is named: General (a code starting 'G'), else the company's first. */
+async function generalShiftId(db, companyId) {
+  const [shifts] = await db.query('SELECT id, code FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [companyId]);
+  const general = shifts.find((s) => String(s.code ?? '').trim().toUpperCase().startsWith('G'));
+  return (general ?? shifts[0])?.id ?? null;
 }
 
 async function readPositionBody(db, companyId, body, { partial = false, current = null } = {}) {
@@ -374,16 +423,18 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
     }
   }
 
-  if (!partial || has('sanctionedHeadcount')) {
-    const raw = body.sanctionedHeadcount;
-    if (blank(raw)) out.sanctioned_headcount = partial ? (current?.sanctioned_headcount ?? 1) : 1;
-    else {
-      const n = Number(raw);
-      if (!Number.isFinite(n) || n < 0) problems.push('Sanctioned headcount cannot be negative.');
-      else if (n > 99999) problems.push('Sanctioned headcount is up to 99999.');
-      else out.sanctioned_headcount = n;
-    }
+  // The position's shift. A new position with none named gets the company's
+  // General shift; an existing one cannot be left without one — a chair is on a
+  // shift, and "no shift" is how the old day/night box used to be written.
+  if (!partial && out.default_shift_id == null) out.default_shift_id = await generalShiftId(db, companyId);
+  if (partial && has('defaultShiftId') && out.default_shift_id == null && !problems.some((p) => /shift/i.test(p))) {
+    if (current?.default_shift_id != null) problems.push('A position is on one shift. Choose the shift this position works.');
+    else delete out.default_shift_id;
   }
+
+  // One position is one seat. Whatever a caller sends here is ignored without
+  // complaint — older forms still post the field — and 1 is what is stored.
+  if (!partial || has('sanctionedHeadcount')) out.sanctioned_headcount = SEATS_PER_POSITION;
   if (!partial || has('status')) out.status = readEnum(body.status, 'Status', POSITION_STATUSES, problems, current?.status ?? 'DRAFT');
   if (!partial || has('effectiveFrom')) out.effective_from = readDate(body.effectiveFrom, 'Effective from', problems);
   if (!partial || has('effectiveTo')) out.effective_to = readDate(body.effectiveTo, 'Effective to', problems);
@@ -407,6 +458,12 @@ export async function createPosition(db, { companyId, userId }, body) {
   return getPosition(db, companyId, res.insertId);
 }
 
+/**
+ * Changing a position's SHIFT moves the person in it: the chair is on a shift,
+ * so whoever sits in it is on that shift too. Their work assignment's
+ * `default_shift_id` follows in the same transaction (a planned successor's
+ * too); ended assignments keep the shift they were worked on.
+ */
 export async function updatePosition(db, { companyId }, id, body) {
   const current = await requirePosition(db, companyId, id, { lock: true });
   const data = await readPositionBody(db, companyId, body, { partial: true, current });
@@ -417,7 +474,110 @@ export async function updatePosition(db, { companyId }, id, body) {
       [...keys.map((k) => data[k]), companyId, id],
     );
   }
-  return getPosition(db, companyId, id);
+  let occupantsMoved = 0;
+  if (data.default_shift_id != null && data.default_shift_id !== current.default_shift_id) {
+    const [res] = await db.query(
+      `UPDATE hrms_work_assignments wa SET wa.default_shift_id = ?
+        WHERE wa.company_id = ? AND wa.position_id = ? AND ${HOLDS_SEAT_SQL('wa')}
+          AND (wa.effective_to IS NULL OR wa.effective_to >= ?)`,
+      [data.default_shift_id, companyId, id, today()],
+    );
+    occupantsMoved = res.affectedRows;
+  }
+  return { ...(await getPosition(db, companyId, id)), occupantsMovedToShift: occupantsMoved };
+}
+
+/** `P021-3` -> `P021`; a code with no `-<digits>` tail is its own base. */
+const siblingBase = (code) => String(code).replace(/-\d+$/, '');
+
+/**
+ * POST /positions/:id/add-sibling — one more position like this one: a new,
+ * VACANT chair in the same card.
+ *
+ *   - same role, title, department, location, status and dates as the source;
+ *   - shift = `shiftId` when given, else the source's;
+ *   - the source's reporting lines (every type, not yet ended), each pointed at
+ *     the manager card's chair on the NEW position's shift when that card has
+ *     one, else exactly where the source points — the rule the migration used
+ *     (scripts/one-chair-positions.mjs), so a night chair lands under the night
+ *     in-charge without anyone drawing a line;
+ *   - NO position-level content: a change made "for this position only" was
+ *     made for that position. The new one starts from the role;
+ *   - code = the source's code without a trailing `-<digits>`, plus `-<n>` with
+ *     the lowest n >= 2 that is free. The source keeps its code.
+ *
+ * The same role, department and manager card put it in the source's card by
+ * construction (services/positionCards.js). Returns what create returns.
+ */
+export async function addSiblingPosition(db, c, id, body = {}) {
+  const { companyId, userId } = c;
+  const source = await requirePosition(db, companyId, id, { lock: true });
+  const sourceTitle = source.position_title || `Position ${source.id}`;
+  if (source.status === 'CLOSED') {
+    throw conflict('POSITION_CLOSED', `${sourceTitle} is closed, so another position like it cannot be added. Reopen it first, or create a new position.`);
+  }
+
+  const problems = [];
+  const givenShiftId = readInt(body.shiftId, 'Shift', problems);
+  if (givenShiftId != null) await exists(db, companyId, 'hrms_shifts', givenShiftId, 'shift', problems);
+  assertNoProblems(problems);
+  const shiftId = givenShiftId ?? source.default_shift_id ?? await generalShiftId(db, companyId);
+
+  // The code. Only live positions hold a code (uq_hpos_code keys off deleted_at).
+  let code = null;
+  if (!blank(source.position_code)) {
+    const base = siblingBase(source.position_code);
+    const [taken] = await db.query(
+      'SELECT position_code FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND LOWER(position_code) LIKE ?',
+      [companyId, `${base.toLowerCase().replace(/[\\%_]/g, (m) => `\\${m}`)}-%`],
+    );
+    const used = new Set(taken.map((r) => String(r.position_code).toLowerCase()));
+    let n = 2;
+    while (used.has(`${base}-${n}`.toLowerCase())) n += 1;
+    code = `${base}-${n}`;
+    if (code.length > 50) throw invalid('INVALID', `The next code would be ${code}, which is longer than 50 characters. Shorten ${source.position_code} first.`);
+  }
+
+  const [res] = await db.query(
+    `INSERT INTO hrms_positions (company_id, position_code, role_id, position_title, department_id, location_id,
+                                 sanctioned_headcount, default_shift_id, status, effective_from, effective_to, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [companyId, code, source.role_id, source.position_title, source.department_id, source.location_id,
+      SEATS_PER_POSITION, shiftId, source.status, dateText(source.effective_from), dateText(source.effective_to), userId],
+  );
+  const newId = res.insertId;
+
+  // Its reporting lines: the source's, on the new chair's shift where the manager card has that shift.
+  const on = today();
+  const [lines] = await db.query(
+    `SELECT * FROM hrms_position_reporting_relationships
+      WHERE company_id = ? AND from_position_id = ? AND deleted_at IS NULL AND (effective_to IS NULL OR effective_to >= ?)
+      ORDER BY id`,
+    [companyId, id, on],
+  );
+  const reportsTo = [];
+  if (lines.length) {
+    const cards = await loadCards(db, companyId, on);
+    const shiftOf = (positionId) => cards.positions.get(positionId)?.shiftId ?? null;
+    const rows = lines.map((e) => {
+      const managerCard = cards.members.get(cards.cardOf.get(e.to_position_id)) ?? [];
+      const to = chairOnShift(managerCard, shiftOf, shiftId, e.to_position_id);
+      reportsTo.push({ toPositionId: to, relationshipTypeId: e.relationship_type_id });
+      return [companyId, newId, to, e.relationship_type_id, e.is_primary, e.scope_type, e.scope_label, e.scope_work_context_id,
+        dateText(e.effective_from), e.effective_to ? dateText(e.effective_to) : null, e.notes, userId];
+    });
+    await db.query(
+      `INSERT INTO hrms_position_reporting_relationships
+         (company_id, from_position_id, to_position_id, relationship_type_id, is_primary,
+          scope_type, scope_label, scope_work_context_id, effective_from, effective_to, notes, created_by)
+       VALUES ${rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+      rows.flat(),
+    );
+  }
+
+  await audit(db, c, newId, 'CREATE', null,
+    { addedBeside: id, positionCode: code, roleId: source.role_id, defaultShiftId: shiftId, reportsTo });
+  return getPosition(db, companyId, newId);
 }
 
 /**
@@ -451,10 +611,16 @@ export async function setPositionStatus(db, { companyId }, id, status) {
  *
  * So removing a seat is a decision about its team, and the decision is never
  * made silently:
- *   THIS_ONLY  the seat goes; its direct reports move UP one level, to the
- *              seat's own manager — what an organisation does when a job is
- *              abolished. A seat with no manager has nowhere to send them, so
- *              it is REFUSED rather than turned into N new tops.
+ *   THIS_ONLY  the seat goes; its direct reports are re-homed. A TEAM REPORTS
+ *              TO THE CARD (2026-10-10, one chair per position): while another
+ *              open chair of the same card remains, each report moves to that
+ *              card's chair on the report's own shift, else to its first
+ *              remaining chair — nobody changes manager-in-the-chart because
+ *              one of two in-charge chairs was removed. Only when the seat was
+ *              the card's LAST chair do they move UP one level, to the seat's
+ *              own manager — what an organisation does when a job is abolished.
+ *              A last chair with no manager has nowhere to send them, so it is
+ *              REFUSED rather than turned into N new tops.
  *   WITH_TEAM  the seat and every position under it go. If any of them holds a
  *              live work assignment the whole thing is refused, by name —
  *              never half a subtree.
@@ -503,7 +669,8 @@ const liveOnDate = (row, on) =>
  */
 async function loadStructure(db, companyId, on) {
   const [positionRows] = await db.query(
-    `SELECT p.id, p.position_code, p.position_title, p.status, p.effective_from, p.effective_to, r.title AS role_title
+    `SELECT p.id, p.position_code, p.position_title, p.status, p.effective_from, p.effective_to, r.title AS role_title,
+            p.role_id, p.department_id, p.default_shift_id
        FROM hrms_positions p
        LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
       WHERE p.company_id = ? AND p.deleted_at IS NULL`,
@@ -533,6 +700,9 @@ async function loadStructure(db, companyId, on) {
     title: p.position_title || p.role_title || `Position ${p.id}`,
     status: p.status,
     open: p.status !== 'CLOSED' && liveOnDate(p, on),   // does the chart draw it?
+    roleId: p.role_id,
+    departmentId: p.department_id ?? null,
+    shiftId: p.default_shift_id ?? null,
   }]));
 
   // "The" manager of a position: its PRIMARY_MANAGER line live today — the first
@@ -551,11 +721,20 @@ async function loadStructure(db, companyId, on) {
   }
   for (const list of reportsOf.values()) list.sort((a, b) => a - b);
 
+  // The cards, over the positions the chart draws — the same rule and the same
+  // inputs the chart uses (positionCards.js), so "the other chairs of this
+  // card" here are the rows the person saw in the box.
+  const openParent = new Map();
+  for (const [from, e] of parentEdge) openParent.set(from, e.to_position_id);
+  const cardOf = computeCards([...byId.values()].filter((p) => p.open), openParent);
+
   return {
     byId,
     edges,
     parentEdge,
     reportsOf,
+    cardOf,
+    cardMembersOf: cardMembers(cardOf),
     treeEdgeIds: new Set([...parentEdge.values()].map((e) => e.id)),
     assignments: new Map(assignmentRows.map((r) => [r.position_id, Number(r.n)])),
   };
@@ -603,7 +782,29 @@ function assess(s, id, on) {
     climbed.add(up);
     up = s.parentEdge.get(up)?.to_position_id ?? null;
   }
-  const manager = up == null ? null : seatInfo(s, up);
+
+  // A team reports to the CARD. While another open chair of this seat's card
+  // remains, the reports stay with the card: each goes to the remaining chair
+  // on its OWN shift, else to the first remaining one (the migration's rule).
+  // Only the card's last chair sends them up.
+  const cardId = s.cardOf.get(id);
+  const remaining = cardId == null ? [] : (s.cardMembersOf.get(cardId) ?? []).filter((x) => x !== id);
+  const withinCard = remaining.length > 0;
+  const targetOf = new Map();
+  for (const reportId of direct) {
+    const to = withinCard
+      ? chairOnShift(remaining, (x) => s.byId.get(x).shiftId, s.byId.get(reportId).shiftId, remaining[0])
+      : up;
+    if (to != null) targetOf.set(reportId, to);
+  }
+  const targetIds = [...new Set(targetOf.values())].sort((x, y) => x - y);
+  const targets = targetIds.map((x) => ({ ...seatInfo(s, x), reports: direct.filter((r) => targetOf.get(r) === x).length }));
+  // `manager` is what the wire has always called "where the reports go": the
+  // one target, or the one taking most of them when a card splits them by shift.
+  const main = withinCard
+    ? ([...targets].sort((x, y) => y.reports - x.reports || x.id - y.id)[0]?.id ?? remaining[0])
+    : up;
+  const manager = main == null ? null : seatInfo(s, main);
 
   const assignmentsOf = (x) => s.assignments.get(x) ?? 0;
   const ownAssignments = assignmentsOf(id);
@@ -620,7 +821,7 @@ function assess(s, id, on) {
   ).length;
 
   const noWhere = direct.length > 0 && manager == null;
-  const looped = manager != null && inTeam.has(manager.id);
+  const looped = targetIds.some((x) => inTeam.has(x)) || (manager != null && inTeam.has(manager.id));
   const t = seat.title;
   const rootReason = `${s.parentEdge.has(id) ? `Every position above ${t} is closed` : `${t} is at the top of the chart`}, so its ${plural(direct.length, 'direct report')} would have nobody to report to. Give them another manager first, or delete it with its team.`;
   const ok = { allowed: true, code: null, reason: null, problems: [] };
@@ -651,6 +852,12 @@ function assess(s, id, on) {
     on,
     seat: seatInfo(s, id),
     manager,
+    // Where each direct report goes, and whether that is inside the card.
+    withinCard,
+    targetOf,
+    targets,
+    cardId: cardId ?? id,
+    remainingInCard: remaining.length,
     directIds: direct,
     teamIds: team,
     ownAssignments,
@@ -667,9 +874,18 @@ function shapeImpact(s, a) {
   return {
     asOf: a.on,
     position: a.seat,
-    // Where its direct reports would move to. null = the seat has no open seat above it.
+    // Where its direct reports would move to. null = nowhere: it is its card's
+    // last chair and has no open seat above it.
     manager: a.manager,
-    directReports: a.directIds.map((x) => ({ ...seatInfo(s, x), assignments: s.assignments.get(x) ?? 0 })),
+    // 'CARD' = they stay with the card, on its other chair(s); 'UP' = this is
+    // the card's last chair, so they go up a level. `moveTargets` lists every
+    // chair that takes some, with how many.
+    movesReportsTo: a.directIds.length === 0 ? null : (a.withinCard ? 'CARD' : 'UP'),
+    moveTargets: a.targets,
+    card: { cardId: a.cardId, otherPositions: a.remainingInCard },
+    directReports: a.directIds.map((x) => ({
+      ...seatInfo(s, x), assignments: s.assignments.get(x) ?? 0, movesToPositionId: a.targetOf.get(x) ?? null,
+    })),
     team: {
       count: a.teamIds.length,          // positions under it, all levels
       total: a.teamIds.length + 1,      // what "with its team" deletes: those, plus the seat
@@ -720,9 +936,11 @@ function checkExpect(expect, actual, what) {
 const noteTrail = (existing, line) => (blank(existing) ? line : `${existing}\n${line}`);
 
 /**
- * Moves a seat's direct reports to `a.manager`: for each, the PRIMARY_MANAGER
- * line to the seat becomes the same line (same type, scope, primary flag) to the
- * manager. Set-based: one INSERT for all of them.
+ * Moves a seat's direct reports to where assess() said each one goes
+ * (`a.targetOf` — another chair of the seat's card, or the seat's manager when
+ * it was the card's last chair): for each, the PRIMARY_MANAGER line to the seat
+ * becomes the same line (same type, scope, primary flag) to its target.
+ * Set-based: one INSERT for all of them.
  *
  *   keepHistory = false  (delete) the old line is retired by the caller's
  *     cascade, and the new one keeps the old one's dates — a deleted seat leaves
@@ -742,14 +960,16 @@ const noteTrail = (existing, line) => (blank(existing) ? line : `${existing}\n${
  */
 async function moveReports(db, { companyId, userId }, s, a, { keepHistory }) {
   if (!a.directIds.length) return [];
-  const target = a.manager;
   const on = a.on;
   const yesterday = previousDay(on);
-  const trail = `Moved up from ${seatLabel(a.seat)} on ${on}, when that position was ${keepHistory ? 'closed' : 'deleted'}.`;
+  // Each report has its own target (a.targetOf): another chair of the seat's
+  // card while one remains, the seat's manager when it was the last.
+  const trail = `Moved ${a.withinCard ? 'across' : 'up'} from ${seatLabel(a.seat)} on ${on}, when that position was ${keepHistory ? 'closed' : 'deleted'}.`;
 
+  const targetIds = new Set(a.targetOf.values());
   const owned = new Map();
   for (const f of s.edges) {
-    if (f.to_position_id === target.id) owned.set(`${f.from_position_id}|${f.relationship_type_id}|${f.scope_key}`, f);
+    if (targetIds.has(f.to_position_id)) owned.set(`${f.to_position_id}|${f.from_position_id}|${f.relationship_type_id}|${f.scope_key}`, f);
   }
 
   const rows = [];
@@ -758,9 +978,10 @@ async function moveReports(db, { companyId, userId }, s, a, { keepHistory }) {
   const retireNow = [];
   for (const reportId of a.directIds) {
     const e = s.parentEdge.get(reportId);
+    const targetId = a.targetOf.get(reportId);
     const from = keepHistory ? on : dateText(e.effective_from);
     const to = e.effective_to ? dateText(e.effective_to) : null;
-    const f = owned.get(`${e.from_position_id}|${e.relationship_type_id}|${e.scope_key}`);
+    const f = owned.get(`${targetId}|${e.from_position_id}|${e.relationship_type_id}|${e.scope_key}`);
     if (f) {
       const fFrom = dateText(f.effective_from);
       const fTo = f.effective_to ? dateText(f.effective_to) : null;
@@ -769,7 +990,7 @@ async function moveReports(db, { companyId, userId }, s, a, { keepHistory }) {
       if (wFrom !== fFrom || wTo !== fTo) widen.push({ id: f.id, from: wFrom, to: wTo });
     } else {
       rows.push([
-        companyId, e.from_position_id, target.id, e.relationship_type_id, e.is_primary,
+        companyId, e.from_position_id, targetId, e.relationship_type_id, e.is_primary,
         e.scope_type, e.scope_label, e.scope_work_context_id, from, to, noteTrail(e.notes, trail), userId,
       ]);
     }
@@ -800,7 +1021,14 @@ async function moveReports(db, { companyId, userId }, s, a, { keepHistory }) {
       [companyId, ...retireNow],
     );
   }
-  return a.directIds.map((x) => seatInfo(s, x));
+  return a.directIds.map((x) => ({ ...seatInfo(s, x), movedToPositionId: a.targetOf.get(x) }));
+}
+
+/** "to Printing Incharge (P024-2)" / "up to Production Manager" — where a seat's reports go, in the dialog's words. */
+function whereTo(a) {
+  if (!a.withinCard) return `up to ${a.manager.title}`;
+  const names = a.targets.map(seatLabel);
+  return `to ${names.length <= 2 ? names.join(' and ') : `${names.slice(0, 2).join(', ')} and ${names.length - 2} more`}, in the same card`;
 }
 
 /** Append-only; written in the caller's transaction (init.sql §9c). TiDB has no triggers. */
@@ -840,7 +1068,7 @@ export async function deletePosition(db, c, id, options = {}) {
     if (a.outcomes.deleteOnly.code === 'IN_USE') refuse(a.outcomes.deleteOnly);
     throw conflict('HAS_TEAM', `${a.seat.title} has ${plural(a.directIds.length, 'direct report')}${a.teamIds.length > a.directIds.length ? ` (${plural(a.teamIds.length, 'position')} under it in all)` : ''}. ${
       a.manager
-        ? `Choose to delete it alone, which moves them up to ${a.manager.title}, or to delete it with its team.`
+        ? `Choose to delete it alone, which moves them ${whereTo(a)}, or to delete it with its team.`
         : 'There is no open position above it for them to move up to, so the choice is to delete it with its team.'}`);
   }
   const chosen = mode ?? 'THIS_ONLY';
@@ -885,7 +1113,10 @@ export async function deletePosition(db, c, id, options = {}) {
 
   await audit(db, c, id, 'DELETE',
     { positionCode: seat.position_code, title: a.seat.title, status: seat.status },
-    { mode: chosen, deletedIds: doomed, movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null });
+    {
+      mode: chosen, deletedIds: doomed, movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null,
+      movedWithinCard: moved.length ? a.withinCard : null, moves: moved.map((m) => [m.id, m.movedToPositionId]),
+    });
 
   return {
     ok: true,
@@ -893,8 +1124,10 @@ export async function deletePosition(db, c, id, options = {}) {
     mode: chosen,
     deletedIds: doomed,
     deletedCount: doomed.length,
-    movedReports: moved,
+    movedReports: moved,               // each says where it went: movedToPositionId
     movedTo: moved.length ? a.manager : null,
+    movedWithinCard: moved.length ? a.withinCard : null,
+    movedToPositions: moved.length ? a.targets : [],
   };
 }
 
@@ -912,7 +1145,7 @@ export async function refuseCloseWithTeam(db, companyId, id, status) {
   const s = await loadStructure(db, companyId, today());
   const n = (s.reportsOf.get(id) ?? []).length;
   if (n > 0) {
-    throw conflict('HAS_TEAM', `${s.byId.get(id).title} has ${plural(n, 'direct report')}, and closing it this way would leave them as separate tops of the chart. Use POST /positions/${id}/close instead: it closes the seat and moves them up to its manager.`);
+    throw conflict('HAS_TEAM', `${s.byId.get(id).title} has ${plural(n, 'direct report')}, and closing it this way would leave them as separate tops of the chart. Use POST /positions/${id}/close instead: it closes the position and moves them to another position of the same card, or up to its manager when it is the card's last one.`);
   }
 }
 
@@ -953,9 +1186,19 @@ export async function closePosition(db, c, id, options = {}) {
   await db.query("UPDATE hrms_positions SET status = 'CLOSED' WHERE company_id = ? AND id = ?", [companyId, id]);
   await audit(db, c, id, 'UPDATE',
     { status: seat.status },
-    { status: 'CLOSED', movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null });
+    {
+      status: 'CLOSED', movedReportIds: moved.map((m) => m.id), movedToId: moved.length ? a.manager.id : null,
+      movedWithinCard: moved.length ? a.withinCard : null, moves: moved.map((m) => [m.id, m.movedToPositionId]),
+    });
 
-  return { ok: true, ...(await getPosition(db, companyId, id)), movedReports: moved, movedTo: moved.length ? a.manager : null };
+  return {
+    ok: true,
+    ...(await getPosition(db, companyId, id)),
+    movedReports: moved,
+    movedTo: moved.length ? a.manager : null,
+    movedWithinCard: moved.length ? a.withinCard : null,
+    movedToPositions: moved.length ? a.targets : [],
+  };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1337,7 +1580,7 @@ export async function listPositionOccupants(db, companyId, positionId, query = {
        LEFT JOIN hrms_departments d ON d.company_id = wa.company_id AND d.id = wa.department_id
        LEFT JOIN hrms_locations l ON l.company_id = wa.company_id AND l.id = wa.location_id
       WHERE wa.company_id = ? AND wa.position_id = ? AND wa.deleted_at IS NULL
-      ORDER BY (wa.status = 'ACTIVE') DESC, wa.effective_from DESC`,
+      ORDER BY (wa.status <> 'ENDED') DESC, wa.effective_from DESC`,
     [companyId, positionId],
   );
   const items = rows.map((w) => ({
@@ -1355,7 +1598,8 @@ export async function listPositionOccupants(db, companyId, positionId, query = {
     locationName: w.location_name,
     effectiveFrom: dateText(w.effective_from),
     effectiveTo: dateText(w.effective_to),
-    liveOnDate: w.status === 'ACTIVE'
+    // seatCount.js's rule: anything not ENDED and in date holds the chair.
+    liveOnDate: w.status !== 'ENDED'
       && (!w.effective_from || dateText(w.effective_from) <= on)
       && (!w.effective_to || dateText(w.effective_to) >= on),
   }));

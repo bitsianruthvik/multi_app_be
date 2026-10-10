@@ -33,6 +33,11 @@
  *   - role_id is validated against positions.role_id when a position is named,
  *     unless `allowRoleException: true` is passed with a reason;
  *   - an employee holds at most one is_primary assignment at a time;
+ *   - a POSITION holds at most one person at a time (2026-10-10, one chair per
+ *     position): a second live assignment on a position is refused with 409
+ *     POSITION_FILLED on every path that could seat someone — create, edit,
+ *     reopen. An assignment created on a position takes the position's shift
+ *     unless it names its own;
  *   - at most one live relationship of a type whose allow_multiple = 0;
  *   - a manager may not be the assignment itself, nor another assignment of the
  *     same employee, nor the employee themselves;
@@ -48,6 +53,7 @@ import {
   readContentOverride, shapeOverride,
 } from './positionService.js';
 import { assignmentRelationships, resolveReporting } from './reportingResolver.js';
+import { HOLDS_SEAT_SQL } from './seatCount.js';
 
 export const ASSIGNMENT_STATUSES = ['PLANNED', 'ACTIVE', 'SUSPENDED', 'ENDED'];
 /** Statuses that put a person on the job today. ENDED and PLANNED do not. */
@@ -307,8 +313,9 @@ async function readAssignmentBody(db, companyId, body, { partial = false, curren
   // Spec rule: "if position_id is present, validate role_id against
   // positions.role_id unless an explicit exception is supported." The exception
   // is supported, and it must be asked for out loud.
+  let pos = null;
   if (positionId != null) {
-    const pos = await exists(db, companyId, 'hrms_positions', positionId, 'position', problems);
+    pos = await exists(db, companyId, 'hrms_positions', positionId, 'position', problems);
     if (pos) {
       if (pos.status === 'CLOSED') problems.push('That position is closed. Reopen it, or leave the position blank — a position is optional.');
       if (roleId != null && pos.role_id !== roleId && !bool(body.allowRoleException)) {
@@ -333,6 +340,11 @@ async function readAssignmentBody(db, companyId, body, { partial = false, curren
       out[col] = v;
     }
   }
+
+  // A position is on one shift, so the person put in it is too — unless the
+  // caller says otherwise. Only on create: an edit that leaves the shift alone
+  // leaves it alone.
+  if (!partial && out.default_shift_id == null && pos?.default_shift_id != null) out.default_shift_id = pos.default_shift_id;
 
   if (!partial || has('assignmentTitle')) out.assignment_title = readText(body.assignmentTitle, 'Assignment title', 200, problems);
   if (!partial || has('reason')) out.reason = readText(body.reason, 'Reason', 300, problems);
@@ -397,6 +409,43 @@ async function assertOnePrimary(db, companyId, employeeId, effectiveFrom, effect
   );
 }
 
+/**
+ * One person per position. A position is one chair (services/seatCount.js), so
+ * a second assignment that would hold it on any of the same days is refused —
+ * by name, because "already filled" is only useful if it says by whom.
+ *
+ * What holds a chair is seatCount's predicate: not deleted, not ENDED. The
+ * dates are compared as ranges, so a successor can be PLANNED from the day
+ * after the current person's last day, and `replacesId` (which ends the old
+ * assignment first) passes untouched. The position row is locked first, so two
+ * requests seating two people in the same chair cannot both get through.
+ */
+async function assertPositionFree(db, companyId, positionId, { from, to, excludeId = null }) {
+  if (positionId == null) return;
+  await db.query('SELECT id FROM hrms_positions WHERE company_id = ? AND id = ? FOR UPDATE', [companyId, positionId]);
+  const params = [companyId, positionId, to ?? '9999-12-31', from ?? '0001-01-01'];
+  let sql = `SELECT wa.id, wa.employee_id, e.full_name, wa.effective_from, wa.effective_to,
+                    p.position_code, COALESCE(p.position_title, r.title) AS position_title
+               FROM hrms_work_assignments wa
+               JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+               JOIN hrms_positions p ON p.company_id = wa.company_id AND p.id = wa.position_id
+               LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+              WHERE wa.company_id = ? AND wa.position_id = ? AND ${HOLDS_SEAT_SQL('wa')}
+                AND (wa.effective_from IS NULL OR wa.effective_from <= ?)
+                AND (wa.effective_to IS NULL OR wa.effective_to >= ?)`;
+  if (excludeId) { sql += ' AND wa.id <> ?'; params.push(excludeId); }
+  const [rows] = await db.query(`${sql} ORDER BY wa.effective_from, wa.id LIMIT 1`, params);
+  if (!rows.length) return;
+  const r = rows[0];
+  const seat = `${r.position_title ?? 'This position'}${r.position_code ? ` (${r.position_code})` : ''}`;
+  const until = r.effective_to ? ` until ${dateText(r.effective_to)}` : '';
+  throw conflict(
+    'POSITION_FILLED',
+    `${seat} is already filled by ${r.full_name}${until}. A position is for one person — end that assignment first, or add another position like this one.`,
+    { positionId, occupant: { employeeId: r.employee_id, name: r.full_name, assignmentId: r.id } },
+  );
+}
+
 export async function createAssignment(db, { companyId, userId }, body) {
   const { data, employeeId, effectiveFrom, effectiveTo } = await readAssignmentBody(db, companyId, body);
   if (data.is_primary) await assertOnePrimary(db, companyId, employeeId, effectiveFrom, effectiveTo, null, bool(body.demoteOther));
@@ -408,6 +457,8 @@ export async function createAssignment(db, { companyId, userId }, body) {
   if (replacesId) {
     await endAssignment(db, { companyId }, replacesId, { effectiveTo: previousDay(data.effective_from ?? today()) });
   }
+  // After the replacement was ended, so handing a chair over is one request.
+  if (data.status !== 'ENDED') await assertPositionFree(db, companyId, data.position_id, { from: effectiveFrom, to: effectiveTo });
 
   const cols = { company_id: companyId, created_by: userId, ...data };
   const keys = Object.keys(cols);
@@ -459,6 +510,14 @@ export async function updateAssignment(db, { companyId }, id, body) {
   if (data.is_primary) {
     await assertOnePrimary(db, companyId, employeeId ?? current.employee_id, effectiveFrom, effectiveTo, id, bool(body.demoteOther));
   }
+  // Only when this edit could seat the person somewhere new or for longer: a
+  // different position, a reopened status, or different dates. Renaming an
+  // assignment never trips over a chair that was already wrongly shared.
+  if (['position_id', 'status', 'effective_from', 'effective_to'].some((k) => k in data)) {
+    const nextStatus = data.status ?? current.status;
+    const nextPosition = 'position_id' in data ? data.position_id : current.position_id;
+    if (nextStatus !== 'ENDED') await assertPositionFree(db, companyId, nextPosition, { from: effectiveFrom, to: effectiveTo, excludeId: id });
+  }
   const keys = Object.keys(data);
   if (keys.length) {
     await db.query(
@@ -471,11 +530,18 @@ export async function updateAssignment(db, { companyId }, id, body) {
 
 export async function setAssignmentStatus(db, ctxIds, id, status) {
   const { companyId } = ctxIds;
-  await requireAssignment(db, companyId, id, { lock: true });
+  const current = await requireAssignment(db, companyId, id, { lock: true });
   const problems = [];
   const next = readEnum(status, 'Status', ASSIGNMENT_STATUSES, problems);
   assertNoProblems(problems);
   if (next === 'ENDED') return endAssignment(db, ctxIds, id, {});
+  // Reopening an ended assignment puts the person back in the chair — which
+  // someone else may have taken since.
+  if (current.status === 'ENDED') {
+    await assertPositionFree(db, companyId, current.position_id, {
+      from: dateText(current.effective_from), to: dateText(current.effective_to), excludeId: id,
+    });
+  }
   await db.query('UPDATE hrms_work_assignments SET status = ? WHERE company_id = ? AND id = ?', [next, companyId, id]);
   return getAssignment(db, companyId, id);
 }

@@ -8,6 +8,8 @@
  * `reportingResolver.js` both exist because a rule that was written twice
  * drifted and then disagreed with itself in production — the org chart said 156
  * vacant seats while the Positions screen said 101, adjacent on the same page.
+ * (That was the old several-seats-per-position rule; a position is one chair
+ * now and seatCount.js says so. The lesson is unchanged.)
  * This is the third file of that kind, and the cheapest way to earn a fourth is
  * to re-derive "what does this position actually do" somewhere else.
  *
@@ -614,7 +616,7 @@ export async function resolveContent(db, companyId, opts = {}) {
             ignored.push({
               layer, overrideId: o.id, action, contentType: kind, definitionId,
               name: o.definitionName ?? null,
-              why: 'Nothing to override — the role does not carry this on this date. An ADD would put it on the seat.',
+              why: 'Nothing to override — the role does not carry this on this date. An ADD would put it on the position.',
             });
             continue;
           }

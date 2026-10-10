@@ -24,7 +24,7 @@
  * pattern the resolver's own header describes — "not the role's X, mine":
  *     SUPPRESS the role's line  +  ADD a new line, written for this seat
  * The ADD's `override_json` carries `replacesDefinitionId` so the two rows read
- * as ONE change on screen ("Changed for this seat — the role says: …") and are
+ * as ONE change on screen ("Changed for this position — the role says: …") and are
  * undone together. The resolver ignores json keys it does not know on an ADD, so
  * the JD shows the new line as specific to the position and lists the role's
  * line among the seat's exceptions. A change to a KPI TARGET alone is a plain
@@ -44,6 +44,7 @@ import {
   requireRole, audit, createMasterItem, addContent, removeContent, validateTarget, CONTENT,
 } from './roleContentService.js';
 import { buildOrgChart } from './orgChartService.js';
+import { SEATS_PER_POSITION } from './seatCount.js';
 
 const KINDS = ['RESPONSIBILITY', 'KPI'];
 const DEF_COLUMN = { RESPONSIBILITY: 'responsibility_definition_id', KPI: 'kpi_definition_id' };
@@ -150,7 +151,7 @@ function wasText(item) {
   };
   const other = [...new Set(changes.map((c) => c.field))].filter((f) => LABEL[f]).map((f) => LABEL[f]);
   if (other.length) bits.push(`Also changed here: ${other.join(', ')}`);
-  return bits.join('. ') || 'Changed for this seat';
+  return bits.join('. ') || 'Changed for this position';
 }
 
 /** A line the seat switched off, rebuilt from the resolver's `suppressed` entry. */
@@ -326,7 +327,7 @@ export async function positionJobContent(db, companyId, positionId, { on } = {})
 function readKind(value) {
   const kind = String(value ?? '').trim().toUpperCase();
   if (kind === 'KRA') {
-    throw invalid('KRA_FIXED_AT_ROLE', 'KRAs are set on the role and are the same for every seat holding it. Change them on the role.');
+    throw invalid('KRA_FIXED_AT_ROLE', 'KRAs are set on the role and are the same for every position holding it. Change them on the role.');
   }
   if (!KINDS.includes(kind)) throw invalid('INVALID', 'Say whether this is a responsibility or a KPI.');
   return kind;
@@ -790,9 +791,11 @@ export async function moveRoleLines(db, c, roleId, body = {}) {
  * ══════════════════════════════════════════════════════════════════════════
  * Built FROM THE ORG CHART'S OWN NODES, not from a second query over positions,
  * so a department's seats, filled and vacant here are the chart's numbers by
- * construction (seats = effectiveSanctioned, vacant = the server's `vacancies`:
- * services/seatCount.js, and `seatCount` in the frontend's orgChartLayout.ts).
- * The whole company in one answer — Karni is 114 positions — so the Departments
+ * construction. One position is one seat (services/seatCount.js): `seats` is
+ * the number of positions, and each position row is filled (one `occupant`) or
+ * vacant. Each row also carries its `shift` and its `cardId`, so the screen can
+ * show seven chairs of one card as one line with seven rows.
+ * The whole company in one answer — Karni is 220 positions — so the Departments
  * screen makes one request, not one per department and never one per position.
  */
 export async function departmentStaffing(db, companyId, { on } = {}) {
@@ -816,9 +819,9 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
       });
     }
     const role = dept.roles.get(roleKey);
-    const seats = Number(n.effectiveSanctioned ?? n.sanctionedHeadcount ?? 0);
-    const filled = n.occupants.length;
-    const vacant = Number(n.vacancies ?? Math.max(0, seats - filled));
+    const vacant = Number(n.vacancies);
+    const seats = SEATS_PER_POSITION;
+    const filled = seats - vacant;
     role.seats += seats;
     role.filled += filled;
     role.vacant += vacant;
@@ -827,11 +830,18 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
       positionCode: n.positionCode,
       title: n.displayTitle ?? n.title,
       status: n.status,
+      cardId: n.cardId,
       shiftPattern: n.shiftPattern,
+      shift: n.defaultShift,
       seats,
       filled,
       vacant,
       overFilled: n.overFilled === true,
+      // The one person in the position, or null. `occupants` is the same person
+      // as a list, for the screens written when a position held several.
+      occupant: n.occupants[0]
+        ? { employeeId: n.occupants[0].employeeId, name: n.occupants[0].name, employeeCode: n.occupants[0].employeeCode ?? null }
+        : null,
       occupants: n.occupants.map((o) => ({ employeeId: o.employeeId, name: o.name, employeeCode: o.employeeCode ?? null })),
       // Whether this seat reads differently from its role (an add / change / switch-off).
       hasSeatChanges: false,

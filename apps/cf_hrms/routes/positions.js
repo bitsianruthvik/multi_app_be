@@ -6,16 +6,27 @@
  *   GET    /positions                     ?on=&status=&roleId=&departmentId=&locationId=&search=
  *                                                      rows + sanctioned/filled/vacant totals over the SAME filtered set
  *   POST   /positions                     { roleId*, positionCode?, positionTitle?, departmentId?, locationId?,
- *                                           sanctionedHeadcount?, defaultShiftId?, status?, effectiveFrom?, effectiveTo? }
+ *                                           defaultShiftId?, status?, effectiveFrom?, effectiveTo? }
+ *                                         One position is one chair: sanctionedHeadcount is ignored and stored as 1;
+ *                                         defaultShiftId is the position's shift (the company's General shift when absent).
+ *                                         Rows carry `shift` {id,code,name} and `occupant` {employeeId,name,employeeCode}|null.
  *   GET    /positions/:id                 ?on=
- *   PUT    /positions/:id                 same fields, all optional
+ *   PUT    /positions/:id                 same fields, all optional. Changing defaultShiftId also moves the person in
+ *                                         the position to that shift (their assignment's default shift), same transaction.
+ *   POST   /positions/:id/add-sibling     { shiftId? }  one more VACANT position in the same card: same role, title,
+ *                                         department, location, status; shift = shiftId or the source's; the source's
+ *                                         reporting lines (same-shift manager chair where the manager card has one);
+ *                                         no position-level content copied; code = base-<n>, lowest free n >= 2.
+ *                                         Returns what POST /positions returns: { asOf, position }.
  *   POST   /positions/:id/status          { status }   DRAFT / ACTIVE / FROZEN / CLOSED  (CLOSED refused with HAS_TEAM when the seat has
  *                                         direct reports: use /close, which moves them up. Same for PUT with status CLOSED.)
  *   GET    /positions/:id/delete-impact   what closing / deleting alone / deleting with the team would each do,
  *                                         and whether each is allowed — read BEFORE confirming
- *   POST   /positions/:id/close           { expect? }  keeps the seat and its history; its direct reports move up
+ *   POST   /positions/:id/close           { expect? }  keeps the seat and its history; its direct reports move to another
+ *                                         position of the same card, or UP to its manager when it is the card's last one
  *   DELETE /positions/:id                 ?mode=THIS_ONLY|WITH_TEAM&expect=N
- *                                         THIS_ONLY: the seat goes, its direct reports move up to its manager
+ *                                         THIS_ONLY: the seat goes, its direct reports move (same rule as close:
+ *                                                    the card's other positions first, up only from its last one)
  *                                         WITH_TEAM: the seat and everyone under it go
  *                                         `mode` is required when the seat has direct reports; `expect` is the
  *                                         number the person saw (reports moved / positions deleted) and a
@@ -64,7 +75,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import {
-  listPositions, getPosition, createPosition, updatePosition, setPositionStatus, deletePosition, closePosition, getDeleteImpact, refuseCloseWithTeam,
+  listPositions, getPosition, createPosition, updatePosition, addSiblingPosition, setPositionStatus, deletePosition, closePosition, getDeleteImpact, refuseCloseWithTeam,
   listPositionContexts, addPositionContext, updatePositionContext, removePositionContext,
   listPositionReporting, addPositionReporting, updatePositionReporting, endPositionReporting, removePositionReporting,
   listPositionOccupants,
@@ -95,6 +106,8 @@ router.post('/positions/:id/status', guard(PERM.orgManage), handle((req) => tx(r
   await refuseCloseWithTeam(db, c.companyId, id(req), req.body?.status);
   return setPositionStatus(db, c, id(req), req.body?.status);
 })));
+// One more chair in the same card. Creating a position, so the same permission as POST /positions.
+router.post('/positions/:id/add-sibling', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addSiblingPosition(db, c, id(req), req.body ?? {}))));
 router.get('/positions/:id/delete-impact', guard(PERM.orgView), handle((req) => getDeleteImpact(pool, ctx(req).companyId, id(req))));
 router.post('/positions/:id/close', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => closePosition(db, c, id(req), { expect: req.body?.expect }))));
 router.delete('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deletePosition(db, c, id(req), { mode: req.query.mode, expect: req.query.expect }))));

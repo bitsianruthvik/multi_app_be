@@ -289,8 +289,9 @@ function positionContextDocx(pc) {
     ['Position title', pc.position.displayTitle ?? pc.position.positionTitle],
     ['Department', pc.position.departmentName],
     ['Location', pc.position.locationName],
-    ['Default shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
-    ['Sanctioned seats', `${pc.position.seats} (${pc.position.filledCount} filled, ${pc.position.vacancyCount} vacant)`],
+    // One position is one chair on one shift: it is filled or it is vacant.
+    ['Shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
+    ['Filled', pc.position.filledCount > 0 ? 'Yes' : 'No — vacant'],
     ['Status', titleCase(pc.position.status)],
   ]));
 
@@ -620,8 +621,9 @@ function writePositionContextPdf(kit, pc) {
     ['Position title', pc.position.displayTitle ?? pc.position.positionTitle],
     ['Department', pc.position.departmentName],
     ['Location', pc.position.locationName],
-    ['Default shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
-    ['Sanctioned seats', `${pc.position.seats} (${pc.position.filledCount} filled, ${pc.position.vacancyCount} vacant)`],
+    // One position is one chair on one shift: it is filled or it is vacant.
+    ['Shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
+    ['Filled', pc.position.filledCount > 0 ? 'Yes' : 'No — vacant'],
     ['Status', titleCase(pc.position.status)],
   ]);
 

@@ -71,8 +71,11 @@ export const cases = [
       const env = await t.env();
       const { buf, data } = await t.freshExport();
       const existing = t.need(data.people[2] ?? data.people[0], 'nobody holds a seat');
-      const seatA = t.need(data.seats[1] ?? data.seats[0], 'no seats');
-      const seatB = t.need(data.seats.find((s) => s.key !== existing.seatKey && !data.people.some((p) => p.employeeId === existing.employeeId && p.seatKey === s.key)), 'no second seat to give');
+      // One person per position (2026-10-10): both additions need a VACANT seat. The services refuse a second
+      // person on a filled one (409 POSITION_FILLED), which is what this case used to do with seats[1].
+      const empty = data.seats.filter((s) => !t.peopleIn(data, s).length);
+      const seatA = t.need(empty[0], 'no vacant seat');
+      const seatB = t.need(empty.find((s) => s.key !== seatA.key && s.key !== existing.seatKey), 'no second vacant seat to give');
       const newName = `New Person ${t.tag}`;
       const joined = new Date(Date.UTC(2026, 9, 1));
       const shift = env.shifts[0]?.name ?? '';

@@ -159,8 +159,8 @@ export function scopeSentence(scope) {
 /**
  * Who is sitting in a position right now. A formal reporting row names a SEAT,
  * so the person is resolved at read time — that is the entire reason formal
- * reporting survives a resignation. Several people may share a seat
- * (sanctioned_headcount > 1) and the honest answer is then all of them.
+ * reporting survives a resignation. A position holds ONE person (2026-10-10);
+ * a second row here means the data is wrong, and the honest answer is then both.
  */
 async function occupantsOf(db, companyId, positionIds, on) {
   if (!positionIds.length) return new Map();
@@ -263,7 +263,7 @@ function shapeFormal(r, occupants) {
     endsOn: dateText(r.effective_to),
     supersededById: null,
     note: people.length === 0
-      ? 'Inherited from the position. That seat is vacant, so no person holds this line right now.'
+      ? 'Inherited from the position. That position is vacant, so no person holds this line right now.'
       : people.length > 1
         ? `Inherited from the position. ${people.length} people currently hold that seat.`
         : 'Inherited from the position.',

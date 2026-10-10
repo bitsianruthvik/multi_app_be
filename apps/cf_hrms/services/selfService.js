@@ -53,6 +53,7 @@ import { pool } from '../lib/db.js';
 import { dateText, today, LIVE_ON } from './positionService.js';
 import { resolveReporting, scopeSentence } from './reportingResolver.js';
 import { resolveContent } from './contentResolver.js';
+import { loadCards } from './positionCards.js';
 
 /* ── words ──────────────────────────────────────────────────────────────── */
 
@@ -173,7 +174,7 @@ function selfRelationship(row, seat, canSeePii) {
     seatPositionId: row.managerPosition?.id ?? null,
     scopeKey: row.scope.key,
     vacant: row.vacant,
-    /** A seat with sanctioned headcount > 1 can hold several people; all of them are the answer. */
+    /** A position holds one person, so this is empty unless the data is wrong (two people on one chair). */
     alsoHeldBy: (row.managerCandidates ?? []).slice(1).map((m) => otherPerson(m, canSeePii)),
     endsOn: row.endsOn,
     note: row.note,
@@ -460,7 +461,7 @@ function shapeResponsibilities(resolved) {
     origin: i.origin,
     isSpecificToThisSeat: i.origin !== 'ROLE',
     // The role says it and this seat does it differently (a different target,
-    // say). Additive, 2026-10-10: the grouped view marks it "Changed for this seat".
+    // say). Additive, 2026-10-10: the grouped view marks it "Changed for this position".
     isChangedForThisSeat: i.overridden === true,
     notes: i.notes ?? null,
   });
@@ -605,14 +606,26 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
   }
 
   // ── the team, in four queries: who reports into me, and who sits beside me
-  const mySeatIds = [...new Set(assignments.map((a) => a.position_id).filter((x) => x != null))];
+  //
+  // A TEAM REPORTS TO THE CARD (2026-10-10, one chair per position). The day
+  // in-charge and the night in-charge are two positions of one card, and each
+  // crew member's line names one of the two chairs — by shift, as the migration
+  // drew it. "Who reports to me" therefore asks about every chair of MY card, so
+  // both in-charges see the whole crew; and "who else reports to my manager"
+  // asks about every chair of my MANAGER's card. Two more company-wide reads
+  // (services/positionCards.js), whatever the size of the team.
+  const ownSeatIds = [...new Set(assignments.map((a) => a.position_id).filter((x) => x != null))];
+  const cards = ownSeatIds.length ? await loadCards(db, companyId, asOf) : null;
+  const cardChairs = (positionId) => cards?.members.get(cards.cardOf.get(positionId)) ?? [positionId];
+  const mySeatIds = [...new Set(ownSeatIds.flatMap(cardChairs))];
   const managerEmployeeIds = [...new Set(
     reportsTo.map((r) => r.person?.employeeId).filter((x) => x != null),
   )];
   const managerSeatIds = [...new Set(
     reportsTo.filter((r) => r.origin === 'POSITION')
       .map((r) => r.seatPositionId)
-      .filter((x) => x != null),
+      .filter((x) => x != null)
+      .flatMap(cardChairs),
   )];
 
   const teamMap = await reportsInto(
@@ -647,14 +660,14 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
   collect(`E:${employee.id}`);
   for (const pid of mySeatIds) collect(`P:${pid}`);
 
-  // Peers: same manager, same relationship type, same scope. Matching on the
-  // scope is what stops the night-shift crew being shown as peers of the day
-  // crew just because both answer to the same incharge.
+  // Peers: same manager CARD, same relationship type, same scope. The day and
+  // night crews under one in-charge card are one team and are peers; a line
+  // with a different scope (one machine, one project) is a different team.
   const peersSeen = new Map();
   for (const line of reportsTo) {
     const keys = [];
     if (line.person?.employeeId != null) keys.push(`E:${line.person.employeeId}`);
-    if (line.seatPositionId != null) keys.push(`P:${line.seatPositionId}`);
+    if (line.seatPositionId != null) for (const chair of cardChairs(line.seatPositionId)) keys.push(`P:${chair}`);
     for (const key of keys) {
       for (const r of teamMap.get(key) ?? []) {
         if (r.employee_id === employee.id) continue;

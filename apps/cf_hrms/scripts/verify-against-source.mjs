@@ -45,6 +45,7 @@
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
 import { resolveSource, readSeed, resolveAdjustments, readAdjustments, resolveKras, readKras } from './orgChartSource.mjs';
+import { oneChairRefusal } from './lib/oneChairGuard.mjs';
 
 const TARGET = resolveTarget();
 const args = process.argv.slice(2);
@@ -87,6 +88,19 @@ const same = (name, expected, actual, show = (x) => x) => {
 
 async function main() {
   announce(TARGET);
+  // RETIRED for a tenant on the one-chair model (2026-10-10) — lib/oneChairGuard.mjs. The source chart describes
+  // positions with several seats; a company split into one chair per position no longer matches it BY DESIGN, so every
+  // check below would fail for a reason that is not a fault.
+  {
+    const guardConn = await mysql.createConnection(TARGET.cfg);
+    try {
+      const [[guardCompany]] = await guardConn.query('SELECT id, name FROM companies WHERE slug = ? AND deleted_at IS NULL', [COMPANY_SLUG]);
+      const refusal = guardCompany ? await oneChairRefusal(guardConn, guardCompany.id, guardCompany.name, 'Verifying against the source chart') : null;
+      if (refusal) { console.error(refusal); process.exit(2); }
+    } finally {
+      await guardConn.end();
+    }
+  }
 
   const source = resolveSource();
   const { seed, hash, size, fileName } = readSeed(source);
