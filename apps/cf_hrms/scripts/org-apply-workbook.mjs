@@ -1162,7 +1162,7 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
   let codeNo = 0;
   for (const e of plan.people.employeesCreate) {
     const code = e.code ?? codes(++codeNo);
-    const row = await peopleSvc.createEmployee(conn, c, { employeeCode: code, fullName: e.name, dateOfJoining: e.joined ?? today }, requestId);
+    const row = await peopleSvc.createEmployee(conn, c, { fullName: e.name, dateOfJoining: e.joined ?? today }, requestId, { importedCode: code });
     employee.set(e.ref, row.employee.id); // getEmployee answers { employee, assignments, ... }, not the bare row
     say(`employee created: ${e.name} (${code})`);
   }
@@ -1171,7 +1171,7 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
     if (u.set.name) body.fullName = u.set.name.to;
     if (u.set.code) body.employeeCode = u.set.code.to;
     if (u.set.joined) body.dateOfJoining = u.set.joined.to;
-    await peopleSvc.updateEmployee(conn, c, u.employeeId, body, requestId);
+    await peopleSvc.updateEmployee(conn, c, u.employeeId, body, requestId, { allowCodeChange: true });
     say(`employee updated: ${u.label}`);
   }
   const eventFor = (employeeId, type, summary, details, assignmentId) => peopleSvc.createEvent(conn, c, employeeId,

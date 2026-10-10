@@ -57,33 +57,67 @@ function id(req) {
   return n;
 }
 
-export function createCodegenRouter({ viewPerm, managePerm }) {
+/**
+ * `entityTypes` (optional) limits the router to some entity types — a list, or
+ * a function (entityType) => boolean. Two apps mount this module on the same
+ * tables (cf_erp for its items and orders, cf_hrms for employee codes), and
+ * each must see only its own rules: a rule of a type outside the filter is not
+ * listed, reads as not found, and cannot be written, previewed or explained.
+ * Without it every registered type is served, as before.
+ */
+export function createCodegenRouter({ viewPerm, managePerm, entityTypes = null }) {
   const router = Router();
   const view = [protect, requirePerm(viewPerm)];
   const manage = [protect, requirePerm(managePerm)];
 
-  router.get('/codegen/entities', view, handle(async () => listEntities()));
+  const allows = entityTypes == null
+    ? () => true
+    : typeof entityTypes === 'function' ? (t) => !!entityTypes(t) : (t) => entityTypes.includes(t);
+  /** A named type outside the filter is answered exactly as a type nobody registered. */
+  const checkType = (entityType) => {
+    if (typeof entityType === 'string' && !allows(entityType)) {
+      throw new CodegenError(422, 'UNKNOWN_ENTITY', `Nothing called "${entityType}" uses the code generator.`);
+    }
+  };
+  /** A saved rule of a type outside the filter does not exist for this router. */
+  const ownScheme = async (db, companyId, schemeId) => {
+    const scheme = await getScheme(db, companyId, schemeId);
+    if (!allows(scheme.entityType)) throw new CodegenError(404, 'NOT_FOUND', 'Coding rule not found.');
+    return scheme;
+  };
+
+  router.get('/codegen/entities', view, handle(async () => listEntities().filter((e) => allows(e.entityType))));
 
   router.get('/codegen/schemes', view, handle(async (req) => {
     const { companyId } = who(req);
-    return listSchemes(pool, companyId, { entityType: req.query.entityType || undefined });
+    checkType(req.query.entityType);
+    const schemes = await listSchemes(pool, companyId, { entityType: req.query.entityType || undefined });
+    return schemes.filter((s) => allows(s.entityType));
   }));
 
-  router.get('/codegen/schemes/:id', view, handle(async (req) => getScheme(pool, who(req).companyId, id(req))));
+  router.get('/codegen/schemes/:id', view, handle(async (req) => ownScheme(pool, who(req).companyId, id(req))));
 
   router.post('/codegen/schemes', manage, handle(async (req) => {
     const { companyId, userId } = who(req);
+    checkType(req.body?.entityType);
     return inTransaction((db) => createScheme(db, companyId, userId, req.body ?? {}));
   }));
 
   router.put('/codegen/schemes/:id', manage, handle(async (req) => {
     const { companyId, userId } = who(req);
-    return inTransaction((db) => updateScheme(db, companyId, userId, id(req), req.body ?? {}));
+    checkType(req.body?.entityType);
+    return inTransaction(async (db) => {
+      if (entityTypes != null) await ownScheme(db, companyId, id(req));
+      return updateScheme(db, companyId, userId, id(req), req.body ?? {});
+    });
   }));
 
   router.delete('/codegen/schemes/:id', manage, handle(async (req) => {
     const { companyId } = who(req);
-    return inTransaction((db) => deleteScheme(db, companyId, id(req)));
+    return inTransaction(async (db) => {
+      if (entityTypes != null) await ownScheme(db, companyId, id(req));
+      return deleteScheme(db, companyId, id(req));
+    });
   }));
 
   /**
@@ -95,6 +129,7 @@ export function createCodegenRouter({ viewPerm, managePerm }) {
   router.post('/codegen/preview', view, handle(async (req) => {
     const { companyId } = who(req);
     const b = req.body ?? {};
+    checkType(b.entityType);
     const subject = b.entityId != null ? { entityId: Number(b.entityId) } : { draft: b.draft ?? {} };
     const conn = await pool.getConnection();
     try {
@@ -122,6 +157,7 @@ export function createCodegenRouter({ viewPerm, managePerm }) {
    */
   router.post('/codegen/explain', view, handle(async (req) => {
     const { companyId } = who(req);
+    checkType(req.body?.entityType);
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();

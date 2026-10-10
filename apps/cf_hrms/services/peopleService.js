@@ -15,8 +15,11 @@
  *
  * WHY SO MUCH LIVES HERE. TiDB runs with `tidb_enable_check_constraint = 0`, so
  * every rule the schema *documents* is a rule this file has to *enforce*:
- *   - employee_code unique per company, case-insensitively, with a sentence a
- *     person can act on rather than a duplicate-key error;
+ *   - employee_code is ISSUED HERE and nowhere else (services/codeService.js,
+ *     from the company's rule under Code formats), in the transaction that
+ *     creates the employee. A code in a request body is ignored on create and
+ *     on update; no endpoint changes one. Unique per company,
+ *     case-insensitively;
  *   - contractor_id set exactly when employment_type = CONTRACT;
  *   - EXITED needs an exit_date, and cannot be set while the person still holds
  *     work assignments — the refusal names them;
@@ -34,6 +37,7 @@ import {
   assertDocumentMime, assertPhotoMime,
   MAX_DOCUMENT_STORED_BYTES, MAX_PHOTO_STORED_BYTES,
 } from './documentStorage.js';
+import { issueEmployeeCode } from './codeService.js';
 
 // ── small shared helpers ────────────────────────────────────────────────────
 
@@ -120,8 +124,11 @@ async function auditPiiRead(conn, { companyId, userId }, employee, identifiers, 
   );
 }
 
-/** Every other audited change in this file. `before`/`after` never carry a blob or a PII value. */
-async function audit(conn, { companyId, userId }, entityType, entityId, action, before, after, requestId) {
+/**
+ * Every other audited change in this file. `before`/`after` never carry a blob or a PII value.
+ * Exported for hiringService.js, whose steps are audited the same way.
+ */
+export async function audit(conn, { companyId, userId }, entityType, entityId, action, before, after, requestId) {
   await conn.query(
     `INSERT INTO hrms_audit_log
        (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, request_id, created_by)
@@ -556,9 +563,20 @@ async function assertNoOpenAssignments(conn, companyId, employeeId, fullName) {
   );
 }
 
-export async function createEmployee(conn, c, body = {}, requestId = null) {
+/**
+ * THE CODE IS ISSUED, NEVER TYPED (spec §1.4). `body.employeeCode` is not read:
+ * the code comes from the company's rule, inside this transaction, so a create
+ * that fails gives its number back.
+ *
+ * `options` is for server code only — no route passes it:
+ *   codeContext   where the person starts work ({ departmentId, locationId,
+ *                 roleId, shiftId }), for a rule that prints or tests one. The
+ *                 hiring flow passes the position's; a plain create has none.
+ *   importedCode  a code the person ALREADY HOLDS elsewhere. Only the retired
+ *                 workbook applier (scripts/org-apply-workbook.mjs) passes it.
+ */
+export async function createEmployee(conn, c, body = {}, requestId = null, options = {}) {
   const problems = [];
-  const employeeCode = trim(body.employeeCode, 50);
   const fullName = trim(body.fullName, 200);
   const dateOfJoining = dateOrNull(body.dateOfJoining);
   const employmentType = String(body.employmentType ?? 'EMPLOYEE').toUpperCase();
@@ -567,7 +585,6 @@ export async function createEmployee(conn, c, body = {}, requestId = null) {
   const exitDate = dateOrNull(body.exitDate);
   const userId = body.userId ? Number(body.userId) : null;
 
-  if (!employeeCode) problems.push('An employee code is required.');
   if (!fullName) problems.push('A name is required.');
   if (!dateOfJoining) problems.push('A date of joining is required.');
   else if (!isDate(dateOfJoining)) problems.push('The date of joining must be a date (YYYY-MM-DD).');
@@ -577,17 +594,24 @@ export async function createEmployee(conn, c, body = {}, requestId = null) {
   checkStatus(problems, employmentStatus, exitDate, dateOfJoining);
   assertNoProblems(problems, 'This employee cannot be saved yet.');
 
-  await assertCodeFree(conn, c.companyId, employeeCode);
   await assertUserInCompany(conn, c.companyId, userId);
+
+  // Last, after everything that can refuse: nothing is asked of the generator
+  // for a record that was never going to be saved.
+  const importedCode = trim(options.importedCode, 50);
+  if (importedCode) await assertCodeFree(conn, c.companyId, importedCode);
+  const employeeCode = importedCode ?? await issueEmployeeCode(conn, c.companyId, {
+    ...(options.codeContext ?? {}), joiningDate: dateOfJoining, employmentType, userId: c.userId,
+  });
 
   const [res] = await conn.query(
     `INSERT INTO hrms_employees
-       (company_id, employee_code, full_name, date_of_birth, gender, phone, email,
+       (company_id, employee_code, full_name, salutation, date_of_birth, gender, phone, email,
         address_json, emergency_contact_json, date_of_joining, employment_type,
         contractor_id, employment_status, exit_date, user_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      c.companyId, employeeCode, fullName, dateOrNull(body.dateOfBirth), trim(body.gender, 40),
+      c.companyId, employeeCode, fullName, trim(body.salutation, 10), dateOrNull(body.dateOfBirth), trim(body.gender, 40),
       trim(body.phone, 40), trim(body.email, 200),
       asJson(body.addressJson ?? body.address), asJson(body.emergencyContactJson ?? body.emergencyContact),
       dateOfJoining, employmentType, contractorId, employmentStatus, exitDate, userId, c.userId,
@@ -609,7 +633,12 @@ export async function createEmployee(conn, c, body = {}, requestId = null) {
   return getEmployee(conn, c.companyId, id);
 }
 
-export async function updateEmployee(conn, c, id, body = {}, requestId = null) {
+/**
+ * The employee code does not change here: `body.employeeCode` is ignored
+ * (spec §1.4). `options.allowCodeChange` exists for the retired workbook
+ * applier alone, which corrected codes typed into a sheet — no route passes it.
+ */
+export async function updateEmployee(conn, c, id, body = {}, requestId = null, options = {}) {
   const [[before]] = await conn.query(
     `SELECT id, employee_code AS employeeCode, full_name AS fullName, date_of_birth AS dateOfBirth,
             gender, phone, email, address_json AS addressJson, emergency_contact_json AS emergencyContactJson,
@@ -624,7 +653,7 @@ export async function updateEmployee(conn, c, id, body = {}, requestId = null) {
   // silently clear an exit date it never showed.
   const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
   const next = {
-    employeeCode: has('employeeCode') ? trim(body.employeeCode, 50) : before.employeeCode,
+    employeeCode: options.allowCodeChange === true && has('employeeCode') ? trim(body.employeeCode, 50) : before.employeeCode,
     fullName: has('fullName') ? trim(body.fullName, 200) : before.fullName,
     dateOfBirth: has('dateOfBirth') ? dateOrNull(body.dateOfBirth) : before.dateOfBirth,
     gender: has('gender') ? trim(body.gender, 40) : before.gender,

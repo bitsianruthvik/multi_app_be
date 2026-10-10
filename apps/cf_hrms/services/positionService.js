@@ -2,6 +2,7 @@ import {
   SEATS_PER_POSITION, HOLDS_SEAT_SQL, filledSeats, vacancies as vacancyOf, overFilled as overFilledOf,
 } from './seatCount.js';
 import { computeCards, cardMembers, loadCards, chairOnShift } from './positionCards.js';
+import { openHiringsByPosition, COMING_OR_LIVE_SQL, splitComing, dayText } from './hiringRead.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -261,8 +262,11 @@ const OVERRIDE_SELECT = (table, fk) => `
  * one filled seat. `sanctionedHeadcount`, `seats`, `filledCount` and
  * `vacancyCount` keep their names for the screens that read them — they are
  * now 1, 1, 0|1 and 1|0.
+ *
+ * `hiring` is the OPEN hiring on the position, or null (services/hiringRead.js).
+ * A position somebody is being hired for is still vacant.
  */
-function shapePosition(p, people = []) {
+function shapePosition(p, people = [], hiring = null, joining = null) {
   const live = people.length;
   const first = people[0] ?? null;
   return {
@@ -287,6 +291,9 @@ function shapePosition(p, people = []) {
     occupant: first
       ? { employeeId: first.employee_id, name: first.full_name, employeeCode: first.employee_code ?? null, assignmentId: first.assignment_id }
       : null,
+    hiring: hiring ?? null,
+    // Who is due to join it from a later date, or null. Still vacant until then.
+    joining: joining ?? null,
     // The position's shift, as an object and (older readers) as three flat fields.
     shift: p.default_shift_id ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null } : null,
     defaultShiftId: p.default_shift_id,
@@ -322,20 +329,26 @@ const POSITION_SELECT = `
 /**
  * Who holds which chair on a date — one read for the whole company (or one
  * position), joined to the rows in memory. "Holds" is seatCount.js's predicate.
- * @returns {Map<number, Array>} position id -> the people in it (normally one)
+ *
+ * The same read also finds who is DUE TO JOIN a position from a later date
+ * (hiringRead.js): the rows are "not over yet" rather than "in date", and are
+ * split in memory.
+ * @returns {{ live: Map<number, Array>, joining: Map<number, object> }}
+ *   live: position id -> the people in it (normally one); joining: position id -> who joins it
  */
 async function occupantsByPosition(db, companyId, on, positionId = null) {
   const [rows] = await db.query(
-    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, e.full_name, e.employee_code
+    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code
        FROM hrms_work_assignments wa
        JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
-      WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}${positionId == null ? '' : ' AND wa.position_id = ?'}
+      WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}${positionId == null ? '' : ' AND wa.position_id = ?'}
       ORDER BY wa.is_primary DESC, wa.id`,
-    positionId == null ? [companyId, on, on] : [companyId, on, on, positionId],
+    positionId == null ? [companyId, on] : [companyId, on, positionId],
   );
+  const { live, joining } = splitComing(rows, on);
   const by = new Map();
-  for (const r of rows) by.set(r.position_id, [...(by.get(r.position_id) ?? []), r]);
-  return by;
+  for (const r of live) by.set(r.position_id, [...(by.get(r.position_id) ?? []), r]);
+  return { live: by, joining };
 }
 
 export async function listPositions(db, companyId, query = {}) {
@@ -356,11 +369,13 @@ export async function listPositions(db, companyId, query = {}) {
     params.push(like, like, like);
   }
 
-  const [[rows], people] = await Promise.all([
+  // One extra read for the whole list, never one per row.
+  const [[rows], people, hirings] = await Promise.all([
     db.query(`${POSITION_SELECT} WHERE ${where.join(' AND ')} ORDER BY r.title, p.position_code, p.id`, params),
     occupantsByPosition(db, companyId, on),
+    openHiringsByPosition(db, companyId),
   ]);
-  const items = rows.map((p) => shapePosition(p, people.get(p.id)));
+  const items = rows.map((p) => shapePosition(p, people.live.get(p.id), hirings.get(p.id), people.joining.get(p.id)));
   return {
     asOf: on,
     items,
@@ -382,12 +397,13 @@ export async function listPositions(db, companyId, query = {}) {
 
 export async function getPosition(db, companyId, id, query = {}) {
   const on = dateText(query.on) || today();
-  const [[[row]], people] = await Promise.all([
+  const [[[row]], people, hirings] = await Promise.all([
     db.query(`${POSITION_SELECT} WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`, [companyId, id]),
     occupantsByPosition(db, companyId, on, id),
+    openHiringsByPosition(db, companyId, id),
   ]);
   if (!row) throw notFound('Position');
-  return { asOf: on, position: shapePosition(row, people.get(row.id)) };
+  return { asOf: on, position: shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id)) };
 }
 
 /** The shift a new position gets when none is named: General (a code starting 'G'), else the company's first. */
@@ -694,6 +710,18 @@ async function loadStructure(db, companyId, on) {
     [companyId],
   );
 
+  // What promises a position to somebody: an open hiring, or a person appointed
+  // from a later date. Either stops a close or a delete (assess, below).
+  const hirings = await openHiringsByPosition(db, companyId);
+  const [comingRows] = await db.query(
+    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code
+       FROM hrms_work_assignments wa
+       JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+      WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND wa.effective_from > ?`,
+    [companyId, on],
+  );
+  const { joining } = splitComing(comingRows, on);
+
   const byId = new Map(positionRows.map((p) => [p.id, {
     id: p.id,
     code: p.position_code ?? null,
@@ -737,6 +765,8 @@ async function loadStructure(db, companyId, on) {
     cardMembersOf: cardMembers(cardOf),
     treeEdgeIds: new Set([...parentEdge.values()].map((e) => e.id)),
     assignments: new Map(assignmentRows.map((r) => [r.position_id, Number(r.n)])),
+    hirings,
+    joining,
   };
 }
 
@@ -825,7 +855,26 @@ function assess(s, id, on) {
   const t = seat.title;
   const rootReason = `${s.parentEdge.has(id) ? `Every position above ${t} is closed` : `${t} is at the top of the chart`}, so its ${plural(direct.length, 'direct report')} would have nobody to report to. Give them another manager first, or delete it with its team.`;
   const ok = { allowed: true, code: null, reason: null, problems: [] };
-  const no = (code, reason, problems = []) => ({ allowed: false, code, reason, problems });
+  const no = (code, reason, problems = [], extra = null) => ({ allowed: false, code, reason, problems, extra });
+
+  // PROMISED TO SOMEBODY. A position with an open hiring, or with a person
+  // appointed from a later date, can be neither closed nor deleted: the hiring
+  // would be left pointing at a chair that is gone, and the person would arrive
+  // to no position. Both outrank every other reason — nothing else the person
+  // fixes makes the removal possible.
+  const hiring = s.hirings.get(id) ?? null;
+  const joiner = s.joining.get(id) ?? null;
+  const hiringOpen = hiring && no('HIRING_OPEN', 'A hiring is open for this position. Close the hiring first.', [],
+    { existing: { id: hiring.id, stage: hiring.stage }, detail: { hiringId: hiring.id, positionId: id } });
+  const joinerDue = joiner && no('POSITION_FILLED',
+    `${joiner.name} joins this position on ${dayText(joiner.date)}. End that assignment first.`, [],
+    { detail: { positionId: id, joining: joiner } });
+  const promised = hiringOpen || joinerDue;
+  const teamHirings = team.filter((x) => s.hirings.has(x)).map((x) => ({ ...seatInfo(s, x), hiringId: s.hirings.get(x).id }));
+  const teamHiringOpen = teamHirings.length > 0 && no('HIRING_OPEN',
+    `${plural(teamHirings.length, 'position')} under ${seat.title} ${teamHirings.length === 1 ? 'has' : 'have'} a hiring open (${teamHirings.slice(0, 3).map(seatLabel).join(', ')}${teamHirings.length > 3 ? ` and ${teamHirings.length - 3} more` : ''}). Close ${teamHirings.length === 1 ? 'that hiring' : 'those hirings'} first.`,
+    teamHirings.slice(0, 25).map(seatLabel),
+    { existing: { id: teamHirings[0]?.hiringId }, detail: { hiringId: teamHirings[0]?.hiringId, hiringIds: teamHirings.map((x) => x.hiringId) } });
 
   const inUse = ownAssignments > 0
     && no('IN_USE', `${plural(ownAssignments, 'work assignment')} still ${ownAssignments === 1 ? 'points' : 'point'} at this position. End ${ownAssignments === 1 ? 'it' : 'them'}, or close the position instead of deleting it.`);
@@ -833,13 +882,13 @@ function assess(s, id, on) {
     && no('REPORTING_LOOP', `The position above ${t} is also somewhere under it, which is a loop in the reporting lines. Fix those first.`);
 
   const close = seat.status === 'CLOSED' ? no('ALREADY_CLOSED', 'It is already closed.')
-    : noWhere ? no('ROOT_HAS_TEAM', rootReason)
-      : loop || ok;
-  const deleteOnly = inUse || (noWhere && no('ROOT_HAS_TEAM', rootReason)) || loop || ok;
+    : promised || (noWhere ? no('ROOT_HAS_TEAM', rootReason)
+      : loop || ok);
+  const deleteOnly = promised || inUse || (noWhere && no('ROOT_HAS_TEAM', rootReason)) || loop || ok;
 
   const shown = blockers.slice(0, 3).map(seatLabel).join(', ');
   const more = blockers.length > 3 ? ` and ${blockers.length - 3} more` : '';
-  const deleteWithTeam = inUse
+  const deleteWithTeam = promised || inUse || teamHiringOpen
     || (blockers.length > 0 && no(
       'TEAM_IN_USE',
       `Cannot delete ${t} with its team: ${plural(blockers.length, 'position')} under it still ${blockers.length === 1 ? 'has' : 'have'} people assigned (${shown}${more}). End those assignments first, or close the positions instead.`,
@@ -861,6 +910,8 @@ function assess(s, id, on) {
     directIds: direct,
     teamIds: team,
     ownAssignments,
+    hiring,
+    joining: joiner,
     blockers,
     otherLines: { thisOnly: otherLines(new Set([id])), withTeam: otherLines(inTeam) },
     closedInTeam: team.filter((x) => s.byId.get(x).status === 'CLOSED').length,
@@ -893,6 +944,9 @@ function shapeImpact(s, a) {
       blockers: a.blockers,             // team members holding live work assignments
     },
     ownAssignments: a.ownAssignments,
+    // What promises this position to somebody: its open hiring, the person due to join it. Either blocks all three outcomes.
+    hiring: a.hiring,
+    joining: a.joining,
     otherLines: a.otherLines,           // dotted / functional / planned / ended lines that go with it
     outcomes: {
       close: out(a.outcomes.close, { movesReports: a.directIds.length }),
@@ -916,7 +970,7 @@ export async function getDeleteImpact(db, companyId, id) {
 }
 
 function refuse(outcome) {
-  if (!outcome.allowed) throw conflict(outcome.code, outcome.reason, outcome.problems?.length ? { problems: outcome.problems } : {});
+  if (!outcome.allowed) throw conflict(outcome.code, outcome.reason, { ...(outcome.problems?.length ? { problems: outcome.problems } : {}), ...(outcome.extra ?? {}) });
 }
 
 /** `expect` is the number the person saw. */
@@ -1065,7 +1119,7 @@ export async function deletePosition(db, c, id, options = {}) {
 
   if (!mode && a.directIds.length) {
     // Own assignments outrank the missing choice: no mode would have worked.
-    if (a.outcomes.deleteOnly.code === 'IN_USE') refuse(a.outcomes.deleteOnly);
+    if (['IN_USE', 'HIRING_OPEN', 'POSITION_FILLED'].includes(a.outcomes.deleteOnly.code)) refuse(a.outcomes.deleteOnly);
     throw conflict('HAS_TEAM', `${a.seat.title} has ${plural(a.directIds.length, 'direct report')}${a.teamIds.length > a.directIds.length ? ` (${plural(a.teamIds.length, 'position')} under it in all)` : ''}. ${
       a.manager
         ? `Choose to delete it alone, which moves them ${whereTo(a)}, or to delete it with its team.`
@@ -1143,6 +1197,9 @@ export async function refuseCloseWithTeam(db, companyId, id, status) {
   const seat = await requirePosition(db, companyId, id);
   if (seat.status === 'CLOSED') return;
   const s = await loadStructure(db, companyId, today());
+  // Promised to somebody — an open hiring, a person due to join: not closed this way either.
+  const { close } = assess(s, id, today()).outcomes;
+  if (['HIRING_OPEN', 'POSITION_FILLED'].includes(close.code)) refuse(close);
   const n = (s.reportsOf.get(id) ?? []).length;
   if (n > 0) {
     throw conflict('HAS_TEAM', `${s.byId.get(id).title} has ${plural(n, 'direct report')}, and closing it this way would leave them as separate tops of the chart. Use POST /positions/${id}/close instead: it closes the position and moves them to another position of the same card, or up to its manager when it is the card's last one.`);

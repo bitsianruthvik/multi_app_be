@@ -2,6 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import indexRoutes from './routes/index.js';
+import codegenModule from '../cf_erp/modules/codegen/index.js';
+import { PERM } from './lib/http.js';
+// Side effect: registers employee codes and letter references with the code generator.
+import { EMPLOYEE_ENTITY, HIRING_ENTITY } from './services/codegenProvider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,7 +20,7 @@ const resourceDefs = JSON.parse(
  * Data model: HRMS_Core_V1_Taxonomy + HRMS_Core_V1_Architecture, with every
  * decision, every platform adaptation and every deviation from the spec
  * recorded in TM/CF_HRMS_PLAN.md. READ THAT FIRST. models/init.sql explains
- * each of the 47 tables and why it is shaped the way it is.
+ * each of the 51 tables and why it is shaped the way it is.
  *
  * The model in one sentence: the centre is not the employee row and not the
  * org-chart box, it is the WORK ASSIGNMENT — what one person is actually doing
@@ -26,6 +30,14 @@ const resourceDefs = JSON.parse(
  * the platform conventions are the same, but nothing is imported across apps:
  * this app's rules are its own and a shared helper would drag one app's model
  * decisions into another's.
+ *
+ * ONE EXCEPTION, and it is a module, not an app's model: the code generator
+ * (apps/cf_erp/modules/codegen). It was written to be lifted — nothing in it
+ * imports from cf_erp, entities register a provider, the host supplies the
+ * permission tags — and employee codes and letter reference numbers come from
+ * it (TM/CF_HRMS_HIRING_SPEC.md §1). It is imported, never copied; what an
+ * employee offers it is services/codegenProvider.js. Its tables (cf_code_*)
+ * are created by cf_erp's schema files.
  */
 export default {
   slug: 'cf_hrms',
@@ -33,6 +45,12 @@ export default {
 
   register(server) {
     server.use('/api/:companySlug/cf_hrms', indexRoutes);
+    // Code formats: the generator's own routes (/codegen/…), limited to this
+    // app's two entity types — cf_erp's item and order rules are not shown here,
+    // and its own mount leaves these two out.
+    server.use('/api/:companySlug/cf_hrms', codegenModule.createRouter({
+      viewPerm: PERM.orgView, managePerm: PERM.orgManage, entityTypes: [EMPLOYEE_ENTITY, HIRING_ENTITY],
+    }));
   },
 
   // Nothing executes these — apps/_loader.js ignores the field and push-to-prod

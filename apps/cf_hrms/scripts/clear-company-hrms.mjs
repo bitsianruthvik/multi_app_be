@@ -48,8 +48,14 @@ const MAX_BACKUP_AGE_MIN = 120;
  * Found the hard way, mid-operation, after clearing Karni's production: 3 shifts
  * and 6 relationship types went with the chart data and had to be put back from
  * the backup.
+ *
+ * The letter templates and the hiring settings (2026-10-10) are configuration
+ * too — the company's own offer and appointment letters, its signatory, its
+ * notice periods — and reference nothing that is cleared. They are kept for a
+ * second reason: a template's bytes are a blob, which a JSON backup cannot put
+ * back. Hirings and their letters are data and are cleared with the rest.
  */
-const KEEP = new Set(['hrms_shifts', 'hrms_reporting_relationship_types']);
+const KEEP = new Set(['hrms_shifts', 'hrms_reporting_relationship_types', 'hrms_letter_templates', 'hrms_hiring_settings']);
 
 const main = async () => {
   const slug = arg('company');
@@ -129,7 +135,7 @@ const main = async () => {
     console.log(`\n  ${total} rows would be deleted from ${Object.values(live).filter(Boolean).length} tables`);
     console.log(`  backup is ${Math.round(ageMin)} minute(s) old and holds this company's rows`);
     console.log('  NOT touched: companies, users, roles, teams, role_capability, app_user_access');
-    console.log(`  NOT touched (seed.sql owns these, and the importer needs them): ${[...KEEP].join(', ')}`);
+    console.log(`  NOT touched (per-company configuration, never chart data): ${[...KEEP].join(', ')}`);
 
     if (notInBackup.length) {
       console.log('\n  THE BACKUP IS BEHIND THE DATABASE:');

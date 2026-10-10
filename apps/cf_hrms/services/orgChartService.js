@@ -59,6 +59,7 @@ import {
   shiftPattern as seatShiftPattern, vacancies as seatVacancies, overFilled as seatOverFilled,
 } from './seatCount.js';
 import { computeCards, loadCards } from './positionCards.js';
+import { openHiringsByPosition, shapePositionHiring, COMING_OR_LIVE_SQL, splitComing } from './hiringRead.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
 
@@ -82,17 +83,24 @@ const num = (v) => (v == null ? 0 : Number(v));
  * vacancies nobody is hiring for. DRAFT and FROZEN stay, tagged by `status`,
  * because a chart that hides a frozen seat hides a real hole.
  */
+// The OPEN hiring of a position rides along on two unique keys (uq_hhir_open: at most one open hiring
+// per position; uq_hhlt_current: at most one current offer letter per hiring), so the join adds no rows
+// and the chart costs no extra read for it.
 const POSITIONS_SQL = `
   SELECT p.id, p.position_code, p.position_title, p.role_id, p.department_id, p.location_id,
          p.sanctioned_headcount, p.default_shift_id, p.status, p.effective_from, p.effective_to,
          r.title AS role_title, r.role_code,
          d.name AS department_name, d.code AS department_code, d.parent_department_id AS department_parent_id, l.name AS location_name,
-         s.code AS shift_code, s.name AS shift_name
+         s.code AS shift_code, s.name AS shift_name,
+         hi.id AS hiring_id, hi.stage AS hiring_stage, hi.candidate_name AS hiring_candidate_name, hl.id AS hiring_offer_letter_id
     FROM hrms_positions p
     LEFT JOIN hrms_roles       r ON r.company_id = p.company_id AND r.id = p.role_id
     LEFT JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
     LEFT JOIN hrms_locations   l ON l.company_id = p.company_id AND l.id = p.location_id
     LEFT JOIN hrms_shifts      s ON s.company_id = p.company_id AND s.id = p.default_shift_id
+    LEFT JOIN hrms_hirings        hi ON hi.company_id = p.company_id AND hi.open_position = p.id
+    LEFT JOIN hrms_hiring_letters hl ON hl.company_id = hi.company_id AND hl.hiring_id = hi.id
+                                    AND hl.kind = 'OFFER' AND hl.is_current = 1 AND hl.deleted_at IS NULL
    WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED'
      AND ${LIVE_ON('p')}
    ORDER BY p.position_code, p.id`;
@@ -186,6 +194,10 @@ const EDGES_SQL = `
  * Who is in each chair: at most one person. "In the chair" is seatCount.js's
  * predicate (not ENDED, in date). An employee with three assignments appears in
  * three positions — correct.
+ *
+ * The read is widened from "in date" to "not over yet" so it also brings whoever is
+ * DUE TO JOIN a position later (hiringRead.splitComing separates them): the `joining`
+ * marker costs no extra query. One `?` for the date, after the company.
  */
 const OCCUPANTS_SQL = `
   SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.assignment_title,
@@ -198,7 +210,7 @@ const OCCUPANTS_SQL = `
     JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
     LEFT JOIN hrms_shifts s ON s.company_id = wa.company_id AND s.id = wa.default_shift_id
     LEFT JOIN hrms_roles  r ON r.company_id = wa.company_id AND r.id = wa.role_id
-   WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}
+   WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}
    ORDER BY wa.is_primary DESC, e.full_name`;
 
 /**
@@ -383,18 +395,20 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
   const startedAt = Date.now();
 
   const [
-    [positionRows], [edgeRows], [occupantRows], [serveRows],
+    [positionRows], [edgeRows], [occupantAndComingRows], [serveRows],
     [contentRows], [overrideRows], [openPointRows], [departmentRows],
   ] = await Promise.all([
     db.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     db.query(EDGES_SQL, [companyId, asOf, asOf]),
-    db.query(OCCUPANTS_SQL, [companyId, asOf, asOf]),
+    db.query(OCCUPANTS_SQL, [companyId, asOf]),
     db.query(SERVES_SQL, [companyId]),
     db.query(CONTENT_COUNTS_SQL, [companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf, companyId, asOf, asOf]),
     db.query(OVERRIDE_COUNTS_SQL, [companyId, asOf, asOf]),
     db.query(OPEN_POINT_COUNTS_SQL, [companyId]),
     db.query(DEPARTMENTS_SQL, [companyId]),
   ]);
+  // In the chair on the date, and due to join it later.
+  const { live: occupantRows, joining: joiningByPosition } = splitComing(occupantAndComingRows, asOf);
   const departmentRank = departmentRanks(departmentRows);
   const departments = shapeDepartments(departmentRows, serveRows, departmentRank);
 
@@ -547,6 +561,12 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       requirements: [],
       vacancies: seatVacancies(occupants.length),
       overFilled: seatOverFilled(occupants.length),
+      // The OPEN hiring on this position, or null. A position being hired for is still vacant.
+      hiring: p.hiring_id
+        ? shapePositionHiring({ id: p.hiring_id, stage: p.hiring_stage, candidate_name: p.hiring_candidate_name, has_offer_letter: p.hiring_offer_letter_id })
+        : null,
+      // Who is due to join it from a later date, or null. Vacant until then: no count moves.
+      joining: joiningByPosition.get(p.id) ?? null,
       counts,
       hasContent: counts.kras + counts.responsibilities + counts.kpis + counts.qualifications + counts.openPoints > 0,
       effectiveFrom: dateText(p.effective_from),
@@ -644,6 +664,10 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       sanctioned: nodes.length,
       filled,
       vacant,
+      // Open hirings among these positions. Each is on a vacant one, so this is part of `vacant`.
+      hiring: nodes.filter((n) => n.hiring).length,
+      // Positions somebody is due to join on a later date. Also still counted vacant (or filled, by the person leaving).
+      joining: nodes.filter((n) => n.joining).length,
       // How many boxes the chart draws.
       cards: new Set(nodes.map((n) => n.cardId)).size,
       // By shift NAME: { General: { positions, filled }, Day: …, Night: … }.
@@ -695,7 +719,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
   const marks = (list) => list.map(() => '?').join(',');
 
   const [
-    [[head]], [occupantRows], [openPointRows], [parentRows], [reportRows], [siblingRows],
+    [[head]], [occupantAndComingRows], [openPointRows], [parentRows], [reportRows], [siblingRows], hiringByPosition,
   ] = await Promise.all([
     db.query(
       `SELECT p.id, p.position_code, p.position_title, p.role_id, p.sanctioned_headcount, p.status,
@@ -713,7 +737,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
         WHERE p.company_id = ? AND p.id = ?`,
       [companyId, positionId],
     ),
-    db.query(`${OCCUPANTS_SQL.replace('WHERE wa.company_id = ?', 'WHERE wa.company_id = ? AND wa.position_id = ?')}`, [companyId, positionId, asOf, asOf]),
+    db.query(`${OCCUPANTS_SQL.replace('WHERE wa.company_id = ?', 'WHERE wa.company_id = ? AND wa.position_id = ?')}`, [companyId, positionId, asOf]),
     db.query(
       `SELECT op.* FROM hrms_open_points op
         WHERE op.company_id = ? AND op.deleted_at IS NULL AND op.entity_type = 'POSITION' AND op.entity_id = ?
@@ -750,27 +774,35 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     siblingIds.length
       ? db.query(
         `SELECT p.id, p.position_code, s.id AS shift_id, s.code AS shift_code, s.name AS shift_name,
-                wa.employee_id, e.full_name
+                wa.id AS assignment_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code
            FROM hrms_positions p
            LEFT JOIN hrms_shifts s ON s.company_id = p.company_id AND s.id = p.default_shift_id
            LEFT JOIN hrms_work_assignments wa ON wa.company_id = p.company_id AND wa.position_id = p.id
-                AND ${HOLDS_SEAT_SQL('wa')} AND ${LIVE_ON('wa')}
+                AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}
            LEFT JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
           WHERE p.company_id = ? AND p.id IN (${marks(siblingIds)})
           ORDER BY p.position_code, p.id, wa.is_primary DESC, wa.id`,
-        [asOf, asOf, companyId, ...siblingIds],
+        [asOf, companyId, ...siblingIds],
       )
       : [[]],
+    // The open hirings of the company, for this position and the other chairs of its card: one read.
+    openHiringsByPosition(db, companyId),
   ]);
 
+  const { live: occupantRows, joining: joiningByPosition } = splitComing(occupantAndComingRows, asOf);
+  // Each other chair once, with whoever is in it today and whoever is due to join it.
+  const siblingPeople = splitComing(siblingRows.filter((r) => r.employee_id != null).map((r) => ({ ...r, position_id: r.id })), asOf);
   const siblings = [];
   for (const r of siblingRows) {
-    if (siblings.some((x) => x.positionId === r.id)) continue;   // a second row only if a chair is wrongly double-filled
+    if (siblings.some((x) => x.positionId === r.id)) continue;   // a chair has several rows when it has a joiner, or is wrongly double-filled
+    const inIt = siblingPeople.live.find((x) => x.position_id === r.id) ?? null;
     siblings.push({
       positionId: r.id,
       positionCode: r.position_code ?? null,
       shift: r.shift_id ? { id: r.shift_id, code: r.shift_code ?? null, name: r.shift_name ?? null } : null,
-      occupant: r.employee_id != null ? { employeeId: r.employee_id, name: r.full_name } : null,
+      occupant: inIt ? { employeeId: inIt.employee_id, name: inIt.full_name } : null,
+      hiring: hiringByPosition.get(r.id) ?? null,
+      joining: siblingPeople.joining.get(r.id) ?? null,
     });
   }
 
@@ -912,6 +944,10 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     shiftPattern,
     vacancies: seatVacancies(occupants.length),
     overFilled: seatOverFilled(occupants.length),
+    // The OPEN hiring on this position, or null.
+    hiring: hiringByPosition.get(head.id) ?? null,
+    // Who is due to join it from a later date, or null.
+    joining: joiningByPosition.get(head.id) ?? null,
     kras: content.kras.map(contentItem),
     responsibilities: content.responsibilities.map(contentItem),
     kpis: content.kpis.map(contentItem),

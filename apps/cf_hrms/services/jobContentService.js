@@ -843,6 +843,10 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
         ? { employeeId: n.occupants[0].employeeId, name: n.occupants[0].name, employeeCode: n.occupants[0].employeeCode ?? null }
         : null,
       occupants: n.occupants.map((o) => ({ employeeId: o.employeeId, name: o.name, employeeCode: o.employeeCode ?? null })),
+      // The OPEN hiring on this position, or null — the chart's own, so the two screens agree.
+      hiring: n.hiring ?? null,
+      // …and who is due to join it from a later date, or null.
+      joining: n.joining ?? null,
       // Whether this seat reads differently from its role (an add / change / switch-off).
       hasSeatChanges: false,
     });

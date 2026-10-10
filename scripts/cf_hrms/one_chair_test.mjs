@@ -483,8 +483,16 @@ try {
 
   // close w2 (Day, occupied from tomorrow by the hand-over): helpers on Day and General → only w1 (Night) remains
   const impact2 = await POS.getDeleteImpact(db, COMPANY, w2.id);
-  ok(impact2.movesReportsTo === 'CARD' && impact2.manager?.id === w1.id && impact2.outcomes.deleteOnly.code === 'IN_USE',
-    'impact: no chair on their shift remains, so they go to the first remaining chair; delete is refused while someone is assigned');
+  // A person due to join a position (2026-10-11) stops it being closed or deleted: POSITION_FILLED, naming them.
+  ok(impact2.movesReportsTo === 'CARD' && impact2.manager?.id === w1.id && impact2.outcomes.deleteOnly.code === 'POSITION_FILLED'
+    && impact2.outcomes.close.code === 'POSITION_FILLED' && impact2.joining?.name === `${TAG} Person 5` && impact2.joining.date === POS.dateText(tomorrow),
+  'impact: no chair on their shift remains, so they go to the first remaining chair; close and delete are refused while someone is due to join');
+  const promisedDirect = await caught(() => POS.refuseCloseWithTeam(db, COMPANY, w2.id, 'CLOSED'));
+  const promisedClose = await caught(() => POS.closePosition(db, c, w2.id, { expect: 2 }));
+  ok(promisedDirect?.code === 'POSITION_FILLED' && promisedClose?.code === 'POSITION_FILLED' && promisedClose.message.includes(`${TAG} Person 5`),
+    'closing it, either way, is refused while the successor is due', promisedClose?.message);
+  await ASG.deleteAssignment(db, c, successorOnW2.id);
+  ok((await POS.getDeleteImpact(db, COMPANY, w2.id)).outcomes.close.allowed, 'with that assignment removed it can be closed');
   const refusedDirect = await caught(() => POS.refuseCloseWithTeam(db, COMPANY, w2.id, 'CLOSED'));
   ok(refusedDirect?.code === 'HAS_TEAM' && refusedDirect.message.includes('same card'), 'setting CLOSED directly on a chair with a team is still refused and points at /close');
   const close2 = await POS.closePosition(db, c, w2.id, { expect: 2 });
@@ -529,7 +537,6 @@ try {
   const blocked = await caught(() => POS.deletePosition(db, c, top.id, { mode: 'WITH_TEAM', expect: 5 }));
   ok(blocked?.code === 'TEAM_IN_USE', 'delete with its team is still refused while anyone under it is assigned', blocked?.code);
   await ASG.endAssignment(db, c, a3.id, {});
-  await ASG.deleteAssignment(db, c, successorOnW2.id);
   const delTeam = await POS.deletePosition(db, c, top.id, { mode: 'WITH_TEAM', expect: 5 });
   ok(delTeam.deletedCount === 5 && delTeam.movedReports.length === 0, 'delete with its team still deletes the chair and everyone under it');
   await POS.deletePosition(db, c, top2.id, {});

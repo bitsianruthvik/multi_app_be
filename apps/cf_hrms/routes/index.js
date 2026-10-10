@@ -13,6 +13,7 @@ import orgChartRoutes from './orgchart.js';
 import selfRoutes from './self.js';
 import importRoutes from './imports.js';
 import overviewRoutes from './overview.js';
+import hiringRoutes from './hiring.js';
 
 const router = Router();
 
@@ -113,5 +114,7 @@ router.use(orgChartRoutes);
 router.use(selfRoutes);
 router.use(importRoutes);
 router.use(overviewRoutes);
+// Hiring on a vacant position: JD -> offer -> appointment (routes/hiring.js).
+router.use(hiringRoutes);
 
 export default router;

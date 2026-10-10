@@ -54,7 +54,8 @@ export default {
 
   register(server) {
     server.use('/api/:companySlug/cf_erp', indexRoutes);
-    server.use('/api/:companySlug/cf_erp', codegenModule.createRouter({ viewPerm: PERM.view, managePerm: PERM.codegen }));
+    // The module's tables are shared with cf_hrms (employee codes); its hrms_* rules belong on its own screen.
+    server.use('/api/:companySlug/cf_erp', codegenModule.createRouter({ viewPerm: PERM.view, managePerm: PERM.codegen, entityTypes: (t) => !t.startsWith('hrms_') }));
     server.use('/api/:companySlug/cf_erp', partiesModule.createRouter({ viewPerm: PERM.ordersView, managePerm: PERM.parties }));
     // A body too large to read, or not JSON, answered as { code, message } on cf_erp's own paths (lib/http.js).
     server.use(bodyErrors);

@@ -54,6 +54,7 @@ import {
 } from './positionService.js';
 import { assignmentRelationships, resolveReporting } from './reportingResolver.js';
 import { HOLDS_SEAT_SQL } from './seatCount.js';
+import { assertNoOpenHiring } from './hiringRead.js';
 
 export const ASSIGNMENT_STATUSES = ['PLANNED', 'ACTIVE', 'SUSPENDED', 'ENDED'];
 /** Statuses that put a person on the job today. ENDED and PLANNED do not. */
@@ -446,8 +447,14 @@ async function assertPositionFree(db, companyId, positionId, { from, to, exclude
   );
 }
 
-export async function createAssignment(db, { companyId, userId }, body) {
+/**
+ * `options.hiringId` is for hiringService alone — the hiring that is appointing
+ * its own candidate. Every other caller is refused (409 HIRING_OPEN) while a
+ * hiring is open on the position: the chair is promised to a candidate.
+ */
+export async function createAssignment(db, { companyId, userId }, body, options = {}) {
   const { data, employeeId, effectiveFrom, effectiveTo } = await readAssignmentBody(db, companyId, body);
+  if (data.status !== 'ENDED') await assertNoOpenHiring(db, companyId, data.position_id, { exceptHiringId: options.hiringId ?? null });
   if (data.is_primary) await assertOnePrimary(db, companyId, employeeId, effectiveFrom, effectiveTo, null, bool(body.demoteOther));
 
   // `replacesId` is the honest way to change work that is already live: the old
@@ -516,6 +523,8 @@ export async function updateAssignment(db, { companyId }, id, body) {
   if (['position_id', 'status', 'effective_from', 'effective_to'].some((k) => k in data)) {
     const nextStatus = data.status ?? current.status;
     const nextPosition = 'position_id' in data ? data.position_id : current.position_id;
+    // Moving a person INTO a position somebody is being hired for is the same refusal as creating one there.
+    if (nextStatus !== 'ENDED' && nextPosition !== current.position_id) await assertNoOpenHiring(db, companyId, nextPosition);
     if (nextStatus !== 'ENDED') await assertPositionFree(db, companyId, nextPosition, { from: effectiveFrom, to: effectiveTo, excludeId: id });
   }
   const keys = Object.keys(data);
@@ -538,6 +547,7 @@ export async function setAssignmentStatus(db, ctxIds, id, status) {
   // Reopening an ended assignment puts the person back in the chair — which
   // someone else may have taken since.
   if (current.status === 'ENDED') {
+    await assertNoOpenHiring(db, companyId, current.position_id);
     await assertPositionFree(db, companyId, current.position_id, {
       from: dateText(current.effective_from), to: dateText(current.effective_to), excludeId: id,
     });

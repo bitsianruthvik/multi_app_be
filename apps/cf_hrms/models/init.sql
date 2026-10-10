@@ -1,5 +1,5 @@
 -- ============================================================================
--- cf_hrms — People + Organisation Definition. Full schema, 47 tables.
+-- cf_hrms — People + Organisation Definition. Full schema, 51 tables.
 -- ============================================================================
 -- Built from HRMS_Core_V1_Taxonomy + HRMS_Core_V1_Architecture (the complete
 -- logical model) and Org_Chart_V12.html (Karni Packaging, Unit 2 — the first
@@ -2489,7 +2489,8 @@ CREATE TABLE IF NOT EXISTS hrms_import_runs (
 
 
 -- ============================================================================
--- End of cf_hrms schema. 47 tables.
+-- End of cf_hrms schema as first built: 47 tables. Section 11 (hiring), below the
+-- retrofits, adds four more: 51.
 --
 -- Deliberately NOT created here:
 --   * The five derived views the spec §7 lists (v_active_work_assignments,
@@ -2594,3 +2595,241 @@ SET @sql = IF(@needs_is_shared = 1,
   'ALTER TABLE hrms_departments ADD COLUMN is_shared TINYINT(1) NOT NULL DEFAULT 0 AFTER department_type',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 11. HIRING — filling a vacant position (TM/CF_HRMS_HIRING_SPEC.md §2)    ##
+-- ############################################################################
+-- Added 2026-10-10. A HIRING is the work of filling ONE vacant position:
+--
+--   JD  ->  OFFER  ->  APPOINTMENT  ->  DONE
+--                \->  CLOSED (DECLINED | LAPSED | CANCELLED), from any stage before DONE
+--
+-- THE CANDIDATE IS A DRAFT UNTIL DONE. Their name, phone, address and offered
+-- pay live on the hiring row and nowhere else: no hrms_employees row, no
+-- employee code, not in any headcount. Appointing is ONE transaction in
+-- services/hiringService.js that issues the code, creates the employee, puts
+-- them in the position and stores the appointment letter — or does none of it.
+--
+-- All four tables are new, so CREATE TABLE IF NOT EXISTS reaches old and new
+-- databases alike and nothing here needs a retrofit in section 10. They sit
+-- after every table they reference (positions, employees, work assignments,
+-- generated documents), which is why this section is at the end of the file.
+--
+-- stage / close_reason / kind are VARCHAR, not ENUM: TiDB does not enforce an
+-- ENUM the way MySQL does (it has stored '' in one), and a new stage must not be
+-- an ALTER on a live table. hiringService.js validates every value it writes.
+
+
+-- ----- 11a. Hirings -----------------------------------------------------------
+-- ONE OPEN HIRING PER POSITION is a database guarantee, not a service promise:
+-- `open_position` is the position id while the hiring is open (not DONE, not
+-- CLOSED, not deleted) and NULL otherwise, and MySQL never compares NULLs in a
+-- unique index — so any number of finished hirings can point at a position and
+-- at most one live one.
+--
+-- `ref_no` is the letter reference (KPPL/HR/26-27/003), issued by the code
+-- generator with the FIRST offer letter and printed on the appointment letter
+-- too. It is kept when a hiring is closed: a number that went out on a letter is
+-- never handed to somebody else.
+--
+-- The terms (designation, department_name, reporting_to_*, place_of_posting,
+-- probation and notice) are TEXT AS IT WILL PRINT, filled from the position and
+-- the company's hiring settings when the hiring starts and editable until the
+-- offer is accepted. They are deliberately not foreign keys: a letter says what
+-- was offered, and must keep saying it after the department is renamed.
+--
+-- `candidate_address` is the address as it prints, line breaks kept.
+--
+-- jd_document_id / employee_id / assignment_id are what each stage produced:
+-- the frozen job description (a ROLE_JD row of hrms_generated_documents for
+-- this position), and at DONE the employee and the work assignment.
+
+CREATE TABLE IF NOT EXISTS hrms_hirings (
+  id                      INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id              INT           NOT NULL,
+  position_id             INT           NOT NULL,
+  stage                   VARCHAR(20)   NOT NULL DEFAULT 'JD',   -- JD | OFFER | APPOINTMENT | DONE | CLOSED
+  close_reason            VARCHAR(20)   NULL,                    -- DECLINED | LAPSED | CANCELLED
+  close_note              VARCHAR(500)  NULL,
+  ref_no                  VARCHAR(100)  NULL,
+
+  candidate_salutation    VARCHAR(10)   NULL,
+  candidate_name          VARCHAR(200)  NULL,
+  candidate_phone         VARCHAR(40)   NULL,
+  candidate_email         VARCHAR(200)  NULL,
+  candidate_address       TEXT          NULL,
+  candidate_gender        VARCHAR(40)   NULL,
+  candidate_date_of_birth DATE          NULL,
+
+  designation             VARCHAR(200)  NULL,
+  department_name         VARCHAR(200)  NULL,
+  reporting_to_title      VARCHAR(200)  NULL,
+  reporting_to_name       VARCHAR(200)  NULL,
+  place_of_posting        VARCHAR(300)  NULL,
+  proposed_joining_date   DATE          NULL,
+  offer_date              DATE          NULL,
+  offer_valid_until       DATE          NULL,
+  annual_ctc              DECIMAL(14,2) NULL,
+  probation_months        INT           NOT NULL DEFAULT 3,
+  notice_days_probation   INT           NOT NULL DEFAULT 15,
+  notice_days_confirmed   INT           NOT NULL DEFAULT 30,
+  signatory_name          VARCHAR(200)  NULL,
+  signatory_designation   VARCHAR(200)  NULL,
+
+  offer_accepted_on       DATE          NULL,
+  joining_date            DATE          NULL,
+  appointment_date        DATE          NULL,
+
+  jd_document_id          INT           NULL,
+  employee_id             INT           NULL,
+  assignment_id           INT           NULL,
+
+  deleted_at              DATETIME      DEFAULT NULL,
+  created_at              TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at              TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by              INT           NULL,
+
+  open_position           INT           GENERATED ALWAYS AS (
+                            IF(deleted_at IS NULL AND stage NOT IN ('DONE', 'CLOSED'), position_id, NULL)) VIRTUAL,
+  ref_active              VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(ref_no), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hhir_tenant (company_id, id),
+  UNIQUE KEY uq_hhir_open   (company_id, open_position),
+  UNIQUE KEY uq_hhir_ref    (company_id, ref_active),
+  KEY idx_hhir_position (company_id, position_id),
+  KEY idx_hhir_stage    (company_id, stage, updated_at),
+  KEY idx_hhir_employee (company_id, employee_id),
+
+  CONSTRAINT fk_hhir_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hhir_position   FOREIGN KEY (company_id, position_id)    REFERENCES hrms_positions(company_id, id),
+  CONSTRAINT fk_hhir_jd         FOREIGN KEY (company_id, jd_document_id) REFERENCES hrms_generated_documents(company_id, id),
+  CONSTRAINT fk_hhir_employee   FOREIGN KEY (company_id, employee_id)    REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hhir_assignment FOREIGN KEY (company_id, assignment_id)  REFERENCES hrms_work_assignments(company_id, id),
+  CONSTRAINT fk_hhir_creator    FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 11b. Hiring letters ----------------------------------------------------
+-- The offer letter and the appointment letter, every version of each. A letter
+-- that was generated is kept even after it is generated again — the one that
+-- went to the candidate may be version 1 — and `is_current` marks the latest.
+-- `current_key` makes "one current letter per hiring per kind" a database
+-- guarantee, the same way hrms_generated_documents.current_target does.
+--
+-- BYTES IN THE ROW, like every other file in this app (no persistent disk on
+-- Render's free plan): DEFLATE-compressed through services/documentStorage.js,
+-- which refuses anything near TiDB's ~6 MB row limit before the INSERT.
+-- `size_bytes` is the size as rendered, before compression.
+--
+-- `snapshot_json` is the values the letter printed, so "what did we offer" has
+-- an answer without opening the file. It holds a salary and an address: this
+-- table is deliberately NOT in resourceDef.json, so the generic query API cannot
+-- read it, and the routes that do are gated on cf_hrms_people_view.
+
+CREATE TABLE IF NOT EXISTS hrms_hiring_letters (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  hiring_id     INT           NOT NULL,
+  kind          VARCHAR(20)   NOT NULL,                -- OFFER | APPOINTMENT
+  version       INT           NOT NULL DEFAULT 1,
+  is_current    TINYINT(1)    NOT NULL DEFAULT 1,
+  file_name     VARCHAR(255)  NOT NULL,
+  mime_type     VARCHAR(100)  NOT NULL DEFAULT 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  size_bytes    INT           NULL,                    -- as rendered, pre-compression
+  storage       VARCHAR(16)   NULL,                    -- 'db' | 's3'
+  compression   VARCHAR(16)   NULL,                    -- 'deflate' | NULL
+  content       LONGBLOB      NULL,
+  snapshot_json JSON          NULL,                    -- the values printed
+  generated_by  INT           NULL,                    -- platform user
+  generated_at  TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+
+  current_key   VARCHAR(60)   GENERATED ALWAYS AS (
+                  IF(deleted_at IS NULL AND is_current = 1, CONCAT(hiring_id, ':', kind), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hhlt_tenant  (company_id, id),
+  UNIQUE KEY uq_hhlt_current (company_id, current_key),
+  KEY idx_hhlt_hiring (company_id, hiring_id, kind, version),
+
+  CONSTRAINT fk_hhlt_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hhlt_hiring    FOREIGN KEY (company_id, hiring_id) REFERENCES hrms_hirings(company_id, id),
+  CONSTRAINT fk_hhlt_generator FOREIGN KEY (generated_by) REFERENCES users(id),
+  CONSTRAINT fk_hhlt_creator   FOREIGN KEY (created_by)   REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 11c. Letter templates --------------------------------------------------
+-- A company's own offer and appointment letter: a .docx whose text carries
+-- placeholders in braces ({candidate_name}, {annual_ctc} ...), filled by
+-- services/letterRenderer.js. A company with no row here gets the built-in
+-- letter. An upload replaces the current one and the old row is kept
+-- (`is_current` 0), so a letter can be traced to the template that made it.
+-- Same byte storage as 11b.
+
+CREATE TABLE IF NOT EXISTS hrms_letter_templates (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  kind         VARCHAR(20)   NOT NULL,                 -- OFFER | APPOINTMENT
+  file_name    VARCHAR(255)  NOT NULL,
+  size_bytes   INT           NULL,                     -- as uploaded, pre-compression
+  storage      VARCHAR(16)   NULL,                     -- 'db' | 's3'
+  compression  VARCHAR(16)   NULL,                     -- 'deflate' | NULL
+  content      LONGBLOB      NULL,
+  uploaded_by  INT           NULL,                     -- platform user
+  uploaded_at  TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  is_current   TINYINT(1)    NOT NULL DEFAULT 1,
+
+  deleted_at   DATETIME      DEFAULT NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT           NULL,
+
+  current_kind VARCHAR(20)   GENERATED ALWAYS AS (IF(deleted_at IS NULL AND is_current = 1, kind, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hltp_tenant  (company_id, id),
+  UNIQUE KEY uq_hltp_current (company_id, current_kind),
+
+  CONSTRAINT fk_hltp_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hltp_uploader FOREIGN KEY (uploaded_by) REFERENCES users(id),
+  CONSTRAINT fk_hltp_creator  FOREIGN KEY (created_by)  REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 11d. Hiring settings ---------------------------------------------------
+-- ONE ROW PER COMPANY: what a letter prints that is the company's and not the
+-- candidate's, and the terms a new hiring starts with. A company with no row
+-- reads as the defaults below with its own name — the row is written the first
+-- time somebody saves the settings.
+--
+-- Never soft-deleted: the unique key is plainly on company_id. `deleted_at` is
+-- here only because every table carries it.
+
+CREATE TABLE IF NOT EXISTS hrms_hiring_settings (
+  id                    INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id            INT           NOT NULL,
+  company_legal_name    VARCHAR(200)  NULL,
+  signatory_name        VARCHAR(200)  NULL,
+  signatory_designation VARCHAR(200)  NULL,
+  place_of_posting      VARCHAR(300)  NULL,
+  jurisdiction          VARCHAR(200)  NULL,
+  probation_months      INT           NOT NULL DEFAULT 3,
+  notice_days_probation INT           NOT NULL DEFAULT 15,
+  notice_days_confirmed INT           NOT NULL DEFAULT 30,
+  offer_valid_days      INT           NOT NULL DEFAULT 7,
+
+  deleted_at            DATETIME      DEFAULT NULL,
+  created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by            INT           NULL,
+
+  UNIQUE KEY uq_hhst_tenant  (company_id, id),
+  UNIQUE KEY uq_hhst_company (company_id),
+
+  CONSTRAINT fk_hhst_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hhst_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
