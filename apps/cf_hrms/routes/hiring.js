@@ -17,6 +17,9 @@
  *          { hiring, employee: { id, employeeCode, fullName }, assignmentId, letter, unfilled }
  *   POST   /hirings/:id/close                { reason, note? }        -> CLOSED         { hiring }
  *   GET    /hirings/:id/letters/:letterId/file                        { fileName, mimeType, contentBase64 }
+ *   PUT    /hirings/:id/signed/:kind     { fileName, contentBase64 }  kind = offer | appointment; PDF, JPG or PNG   { hiring, signed }
+ *   GET    /hirings/:id/signed/:kind/file                             { fileName, mimeType, contentBase64 }
+ *   DELETE /hirings/:id/signed/:kind                                  { hiring }
  *   GET    /hirings/:id/jd/preview                                    { preview, readiness } — live at JD, the frozen copy after
  *   GET    /hirings/:id/jd/file          ?format=docx|pdf             the job description, in every stage, same shape
  *   GET    /hiring/close-reasons         ?hiringId=                   { groups: [{ label, reasons }] }
@@ -47,7 +50,7 @@ import {
   generateOfferLetter, acceptOffer, appoint, closeHiring,
   readLetterFile, readJdFile,
   getSettings, updateSettings, listTemplates, putTemplate, readTemplateFile, listPlaceholders,
-  jdPreview, listCloseReasons,
+  jdPreview, listCloseReasons, putSigned, readSignedFile, deleteSigned,
 } from '../services/hiringService.js';
 
 const router = Router();
@@ -93,6 +96,11 @@ router.post('/hirings/:id/close', write, handle((req) => tx(req, (db, c) => clos
 router.get('/hirings/:id/letters/:letterId/file', read, handle((req) => (
   readLetterFile(pool, ctx(req).companyId, id(req), intParam(req.params.letterId, 'letterId'))
 )));
+// Signed copies: the candidate's signed offer, the signed appointment letter. :kind is offer | appointment.
+router.put('/hirings/:id/signed/:kind', write, handle((req) => tx(req, (db, c) => putSigned(db, c, id(req), req.params.kind, req.body ?? {}, reqId(req)))));
+router.get('/hirings/:id/signed/:kind/file', read, handle((req) => readSignedFile(pool, ctx(req).companyId, id(req), req.params.kind)));
+router.delete('/hirings/:id/signed/:kind', write, handle((req) => tx(req, (db, c) => deleteSigned(db, c, id(req), req.params.kind, reqId(req)))));
+
 // The job description: what will be (or was) frozen, and its file — ?format=docx|pdf, in every stage.
 router.get('/hirings/:id/jd/preview', read, handle((req) => jdPreview(pool, ctx(req), id(req))));
 router.get('/hirings/:id/jd/file', read, handle((req) => readJdFile(pool, ctx(req), id(req), req.query.format)));

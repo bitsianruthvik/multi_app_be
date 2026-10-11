@@ -440,6 +440,11 @@ const [vacantRows] = await pool.query(
 const [[someone]] = await pool.query(
   "SELECT id, full_name FROM hrms_employees WHERE company_id = ? AND deleted_at IS NULL AND employment_status = 'ACTIVE' ORDER BY id LIMIT 1", [COMPANY]);
 
+const PDF = (text) => Buffer.from(`%PDF-1.4\n% ${text}\n%%EOF\n`);
+const PNG = (text) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(text)]);
+const JPG = (text) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(text)]);
+const upload = (fileName, buffer) => ({ fileName, contentBase64: buffer.toString('base64') });
+
 const CANDIDATE = {
   candidateSalutation: 'Ms.', candidateName: `Test Candidate ${TAG}`, candidatePhone: '9000000000', candidateEmail: `${TAG.toLowerCase()}@example.test`,
   candidateAddress: 'Flat 1, Example Towers,\nSample Street,\nHyderabad 500001.', candidateGender: 'Female', candidateDateOfBirth: '1995-04-03',
@@ -471,7 +476,7 @@ if (vacantRows.length < 2 || !someone) {
     }
     ok(started.terms.offerDate === on && started.terms.offerValidUntil === addDays(on, 7), 'the offer is dated today and valid for the settings’ 7 days', `${started.terms.offerDate} -> ${started.terms.offerValidUntil}`);
     if (Number(target.managed)) ok(Boolean(started.terms.reportingToTitle) && Boolean(started.terms.reportingToName), 'reporting-to is the manager position’s title and the person in it');
-    ok(JSON.stringify(started.can) === JSON.stringify({ edit: false, confirmJd: true, generateOffer: false, acceptOffer: false, appoint: false, close: true }),
+    ok(JSON.stringify(started.can) === JSON.stringify({ edit: false, confirmJd: true, generateOffer: false, acceptOffer: false, appoint: false, close: true, uploadSignedOffer: false, uploadSignedAppointment: false }),
       'at JD the server will take: confirm the JD, or close', JSON.stringify(started.can));
     ok(started.missing.offerLetter.length === 3 && started.missing.appoint.length === 3 && started.letters.length === 0 && started.jd === null,
       '`missing` says in words what the offer letter and the appointment still need', JSON.stringify(started.missing));
@@ -592,6 +597,9 @@ if (vacantRows.length < 2 || !someone) {
     ok(nested.candidate.gender === 'F' && nested.terms.reportingToTitle === 'Plant Head' && nested.candidate.name === CANDIDATE.candidateName,
       'the same save accepts the nested shape it returns (candidate.*, terms.*), changing only what was sent');
     ok(refused(await caught(() => HIRE.acceptOffer(db, c, H, {})), 422, 'NO_OFFER_LETTER'), 'accepting before a letter exists is refused');
+    ok(refused(await caught(() => HIRE.putSigned(db, c, H, 'offer', upload('signed.pdf', PDF('x')))), 409, 'WRONG_STAGE')
+      && refused(await caught(() => HIRE.putSigned(db, c, H, 'appointment', upload('signed.pdf', PDF('x')))), 409, 'WRONG_STAGE')
+      && refused(await caught(() => HIRE.readSignedFile(db, COMPANY, H, 'offer')), 404, 'NOT_FOUND'), 'no signed copy can be uploaded before there is an offer letter (409 WRONG_STAGE)');
 
     // ── OFFER: the letter ──
     const refBefore = await counterOf(db, 'hrms_hiring');
@@ -620,6 +628,41 @@ if (vacantRows.length < 2 || !someone) {
     ok(offer1.hiring.statusLine === `Offer sent to ${CANDIDATE.candidateName}` && offer1.hiring.can.acceptOffer && offer1.hiring.can.generateOffer,
       'the status line reads "Offer sent to …"; accepting and generating again are both offered', offer1.hiring.statusLine);
 
+    // ── §5.3: the candidate's signed offer ──
+    ok(offer1.hiring.can.uploadSignedOffer === true && offer1.hiring.can.uploadSignedAppointment === false && JSON.stringify(offer1.hiring.signed) === JSON.stringify({ offer: null, appointment: null }),
+      'once the offer letter exists a signed offer may be uploaded; `signed` is { offer: null, appointment: null }');
+    const pdf = PDF(`signed offer ${TAG}`);
+    const s1 = await HIRE.putSigned(db, c, H, 'offer', upload('Signed offer.pdf', pdf));
+    ok(JSON.stringify(Object.keys(s1)) === JSON.stringify(['hiring', 'signed']) && s1.signed.id > 0 && s1.signed.fileName === 'Signed offer.pdf' && s1.signed.mimeType === 'application/pdf'
+      && s1.signed.sizeBytes === pdf.length && Boolean(s1.signed.uploadedAt) && 'uploadedByName' in s1.signed && s1.hiring.signed.offer.id === s1.signed.id && s1.hiring.signed.appointment === null,
+    'PUT /hirings/:id/signed/offer returns { hiring, signed } and the hiring carries it', JSON.stringify(s1.signed));
+    ok(s1.hiring.stage === 'OFFER' && s1.hiring.offerAccepted === false && s1.hiring.offerAcceptedOn === null && s1.hiring.can.acceptOffer === true,
+      'uploading a signed offer does NOT accept the offer — that stays its own step');
+    ok(s1.hiring.letters.length === 1 && s1.hiring.letters[0].id === offer1.letter.id && s1.hiring.letters[0].isCurrent === true && s1.hiring.letters.every((l) => l.kind === 'OFFER')
+      && s1.hiring.statusLine === `Offer sent to ${CANDIDATE.candidateName}`, 'the letters list and the current offer letter are untouched: a signed copy is not a letter');
+    ok(refused(await caught(() => HIRE.readLetterFile(db, COMPANY, H, s1.signed.id)), 404, 'NOT_FOUND'), 'nor is it served as one (GET …/letters/:id/file: 404)');
+    const got = await HIRE.readSignedFile(db, COMPANY, H, 'OFFER');
+    ok(got.fileName === 'Signed offer.pdf' && got.mimeType === 'application/pdf' && Buffer.compare(Buffer.from(got.contentBase64, 'base64'), pdf) === 0, 'GET …/signed/offer/file returns the bytes that were uploaded');
+    const png = PNG(`replacement ${TAG}`);
+    const s2 = await HIRE.putSigned(db, c, H, 'offer', { fileName: 'scan.png', contentBase64: `data:image/png;base64,${png.toString('base64')}` });
+    const [signedRows] = await db.query("SELECT id, is_current, deleted_at FROM hrms_hiring_letters WHERE company_id = ? AND hiring_id = ? AND kind = 'OFFER_SIGNED' ORDER BY id", [COMPANY, H]);
+    ok(s2.signed.id !== s1.signed.id && s2.signed.mimeType === 'image/png' && s2.signed.fileName === 'scan.png' && signedRows.length === 2
+      && signedRows[0].deleted_at !== null && signedRows[0].is_current === 0 && signedRows[1].deleted_at === null && signedRows[1].is_current === 1
+      && Buffer.compare(Buffer.from((await HIRE.readSignedFile(db, COMPANY, H, 'offer')).contentBase64, 'base64'), png) === 0,
+    'uploading again REPLACES it: one current file, the one before it retired (a data: URL is taken too)');
+    const docxLike = await docx(p(run('not a scan')));
+    for (const [label, body] of [['a Word file', upload('letter.docx', docxLike)], ['a text file named .pdf', upload('fake.pdf', Buffer.from('hello'))], ['an empty file', upload('empty.pdf', Buffer.alloc(0))]]) {
+      const e = await caught(() => HIRE.putSigned(db, c, H, 'offer', body));
+      ok(refused(e, 422, 'INVALID') && e.problems?.length === 1, `${label}: 422 INVALID`, why(e));
+    }
+    // Incompressible bytes behind a real PDF header: too large to store even compressed.
+    const huge = Buffer.concat([Buffer.from('%PDF-1.4\n'), crypto.randomBytes(3 * 1024 * 1024 + 4096)]);
+    const tooBig = await caught(() => HIRE.putSigned(db, c, H, 'offer', upload('huge.pdf', huge)));
+    ok(refused(tooBig, 422, 'INVALID') && /limit/.test(tooBig.message) && /MB/.test(tooBig.message), 'a file over the storage ceiling: 422 INVALID, in the document store’s own sentence (both sizes and the limit)', why(tooBig));
+    ok(refused(await caught(() => HIRE.putSigned(db, c, H, 'memo', upload('x.pdf', pdf))), 422, 'INVALID') && refused(await caught(() => HIRE.putSigned(db, c, H, 'offer', {})), 422, 'INVALID'),
+      'a kind that is not offer or appointment, or no file at all: 422');
+    ok((await HIRE.getHiring(db, COMPANY, H)).hiring.signed.offer.id === s2.signed.id, 'none of those refusals disturbed the copy on file');
+
     await HIRE.updateHiring(db, c, H, { annualCtc: '4,00,000' });
     const offer2 = await HIRE.generateOfferLetter(db, c, H);
     ok(offer2.letter.version === 2 && offer2.letter.isCurrent && offer2.hiring.refNo === offer1.hiring.refNo && offer2.letter.fileName.endsWith('_v2.docx'),
@@ -640,6 +683,34 @@ if (vacantRows.length < 2 || !someone) {
     const accepted = (await HIRE.acceptOffer(db, c, H, {})).hiring;
     ok(accepted.stage === 'APPOINTMENT' && accepted.offerAccepted === true && accepted.offerAcceptedOn === on && accepted.can.appoint && accepted.can.edit
       && !accepted.can.generateOffer && !accepted.can.acceptOffer && accepted.missing.appoint.length === 0, 'accept-offer moves to APPOINTMENT; appointing is now offered', JSON.stringify(accepted.can));
+
+    // ── §5.2: NOTHING is created by an acceptance ──
+    const nothingYet = async (label) => {
+      const [[rows]] = await db.query(
+        `SELECT (SELECT COUNT(*) FROM hrms_employees WHERE company_id = ? AND full_name = ?) AS employees,
+                (SELECT COUNT(*) FROM hrms_work_assignments WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL AND status <> 'ENDED') AS assignments,
+                (SELECT COUNT(*) FROM hrms_hiring_letters WHERE company_id = ? AND hiring_id = ? AND kind LIKE 'APPOINTMENT%') AS letters,
+                (SELECT COUNT(*) FROM hrms_employment_events ev JOIN hrms_employees e ON e.id = ev.employee_id WHERE e.company_id = ? AND e.full_name = ?) AS events`,
+        [COMPANY, CANDIDATE.candidateName, COMPANY, target.id, COMPANY, H, COMPANY, CANDIDATE.candidateName]);
+      const waiting = (await HIRE.getHiring(db, COMPANY, H)).hiring;
+      ok(Number(rows.employees) === 0 && Number(rows.assignments) === 0 && Number(rows.letters) === 0 && Number(rows.events) === 0
+        && await counterOf(db, 'hrms_employee') === baselineCounter && waiting.employee === null && waiting.assignmentId === null && waiting.joiningDate === null
+        && waiting.stage === 'APPOINTMENT' && (await POS.getPosition(db, COMPANY, target.id)).position.vacancyCount === 1,
+      label, JSON.stringify(rows));
+    };
+    await nothingYet('accepting the offer created NOTHING: no employee, no employee code taken, no assignment, no appointment letter, no event');
+    ok(accepted.statusLine === `Offer accepted by ${CANDIDATE.candidateName} · appointment letter to generate`
+      && (await POS.getPosition(db, COMPANY, target.id)).position.hiring.statusLine === accepted.statusLine
+      && (await HIRE.listHirings(db, COMPANY, { status: 'open' })).hirings.some((x) => x.id === H && x.offerAccepted && x.proposedJoiningDate === CANDIDATE.proposedJoiningDate),
+    'while it waits the hiring reads "Offer accepted by … · appointment letter to generate", on the position too, and is listed under open', accepted.statusLine);
+    // The wait may be weeks. Whatever is read or edited in the meantime, still nothing exists.
+    await HIRE.updateHiring(db, c, H, { proposedJoiningDate: addDays(on, 21) });
+    await HIRE.jdPreview(db, c, H);
+    await buildOrgChart(db, COMPANY, { on: addDays(on, 30) });
+    await HIRE.putSigned(db, c, H, 'offer', upload('signed-after-accept.pdf', PDF('later')));
+    await HIRE.updateHiring(db, c, H, { proposedJoiningDate: CANDIDATE.proposedJoiningDate });
+    await nothingYet('…and still nothing after reads, an edit and a signed-offer upload during the wait: only "appoint" creates the employee');
+    ok(refused(await caught(() => HIRE.putSigned(db, c, H, 'appointment', upload('x.pdf', PDF('x')))), 409, 'WRONG_STAGE'), 'a signed appointment letter cannot be uploaded before the appointment');
     ok(refused(await caught(() => HIRE.generateOfferLetter(db, c, H)), 409, 'WRONG_STAGE'), 'the offer letter can no longer be generated again once accepted');
     ok(same({ ...(await POS.getPosition(db, COMPANY, target.id)).position.hiring, stage: 'JD', candidateName: null, statusLine: 'Job description to confirm' })
       && (await POS.getPosition(db, COMPANY, target.id)).position.hiring.candidateName === CANDIDATE.candidateName
@@ -696,14 +767,50 @@ if (vacantRows.length < 2 || !someone) {
     ok(apValues.employee_code === done.employee.employeeCode && apValues.joining_date === LETTER.letterDate(on), 'the letter was rendered WITH the employee code (it is in the values it was given)');
     ok(done.hiring.letters.length === 3 && done.hiring.letters.filter((l) => l.isCurrent).length === 2, 'three letters are stored: two offers and the appointment');
 
+    // ── §5.3: the signed appointment letter, also filed on the employee's page ──
+    const docsOf = async () => (await PEOPLE.listDocuments(db, COMPANY, done.employee.id)).items;
+    ok((await docsOf()).length === 0 && done.hiring.can.uploadSignedAppointment === true, 'after the appointment a signed appointment letter may be uploaded; the employee has no documents yet');
+    const jpg = JPG(`signed appointment ${TAG}`);
+    const a1 = await HIRE.putSigned(db, c, H, 'appointment', upload('Signed appointment.jpg', jpg));
+    const filed1 = await docsOf();
+    ok(a1.signed.mimeType === 'image/jpeg' && a1.hiring.signed.appointment.id === a1.signed.id && a1.hiring.signed.offer !== null && filed1.length === 1
+      && filed1[0].documentType === 'Signed appointment letter' && filed1[0].fileName === 'Signed appointment.jpg' && a1.signed.employeeDocumentId === filed1[0].id,
+    'it is on the hiring AND in the employee’s documents as "Signed appointment letter"; the hiring names that document', JSON.stringify(filed1.map((d) => [d.id, d.documentType])));
+    const filedBytes = await PEOPLE.readDocumentFile(db, COMPANY, filed1[0].id);
+    ok(Buffer.compare(Buffer.from(filedBytes.dataBase64, 'base64'), jpg) === 0 && Buffer.compare(Buffer.from((await HIRE.readSignedFile(db, COMPANY, H, 'appointment')).contentBase64, 'base64'), jpg) === 0,
+      'both hold the bytes that were uploaded');
+    const pdf2 = PDF(`signed appointment, rescanned ${TAG}`);
+    const a2 = await HIRE.putSigned(db, c, H, 'appointment', upload('Signed appointment.pdf', pdf2));
+    const filed2 = await docsOf();
+    ok(filed2.length === 1 && filed2[0].id !== filed1[0].id && filed2[0].fileName === 'Signed appointment.pdf' && a2.signed.employeeDocumentId === filed2[0].id
+      && Buffer.compare(Buffer.from((await PEOPLE.readDocumentFile(db, COMPANY, filed2[0].id)).dataBase64, 'base64'), pdf2) === 0,
+    'replacing it replaces the employee’s copy: still one document, the new file');
+    const afterSigned = (await HIRE.getHiring(db, COMPANY, H)).hiring;
+    ok(afterSigned.letters.length === 3 && afterSigned.letters.filter((l) => l.isCurrent).length === 2 && afterSigned.letters.every((l) => ['OFFER', 'APPOINTMENT'].includes(l.kind))
+      && afterSigned.stage === 'DONE', 'the letters are still the three generated ones, two current');
+    const s3 = await HIRE.putSigned(db, c, H, 'offer', upload('offer-late.png', PNG('late')));
+    ok(s3.signed.fileName === 'offer-late.png' && (await docsOf()).length === 1, 'the signed OFFER can still be replaced after the appointment, and is not filed on the employee');
+    const removed = await HIRE.deleteSigned(db, c, H, 'appointment');
+    ok(JSON.stringify(Object.keys(removed)) === JSON.stringify(['hiring']) && removed.hiring.signed.appointment === null && removed.hiring.signed.offer !== null && (await docsOf()).length === 0
+      && refused(await caught(() => HIRE.readSignedFile(db, COMPANY, H, 'appointment')), 404, 'NOT_FOUND'),
+    'DELETE …/signed/appointment removes it from the hiring and from the employee’s documents');
+    ok(refused(await caught(() => HIRE.deleteSigned(db, c, H, 'appointment')), 404, 'NOT_FOUND'), 'removing it twice: 404');
+    // The employee's copy deleted on the employee's page first: replacing on the hiring still works.
+    const a3 = await HIRE.putSigned(db, c, H, 'appointment', upload('again.pdf', pdf2));
+    await PEOPLE.deleteDocument(db, c, a3.signed.employeeDocumentId);
+    const a4 = await HIRE.putSigned(db, c, H, 'appointment', upload('again2.pdf', pdf2));
+    ok((await docsOf()).length === 1 && (await docsOf())[0].id === a4.signed.employeeDocumentId, 'a copy somebody deleted from the employee’s page does not stand in the way of a replacement');
+    const [[signedAudit]] = await db.query("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_hiring_letters' AND action IN ('CREATE', 'DELETE')", [COMPANY]);
+    ok(Number(signedAudit.n) >= 8, 'every upload and removal is in the audit log', `${signedAudit.n}`);
+
     // ── afterwards ──
     const after = (await POS.getPosition(db, COMPANY, target.id)).position;
     ok(after.filledCount === 1 && after.vacancyCount === 0 && after.occupant?.employeeId === done.employee.id && after.hiring === null,
       'the position is filled by the new employee, and carries no open hiring');
     const chartAfter = (await buildOrgChart(db, COMPANY, {})).counts;
     ok(chartAfter.filled === chartBefore.filled + 1 && chartAfter.vacant === chartBefore.vacant - 1 && chartAfter.hiring === openBefore, 'the chart: one more filled, one fewer vacant, and this hiring no longer open');
-    ok(done.hiring.statusLine === `${CANDIDATE.candidateName} appointed as ${done.employee.employeeCode}` && Object.values(done.hiring.can).every((x) => x === false),
-      'the hiring reads "… appointed as <code>" and accepts nothing further', done.hiring.statusLine);
+    ok(done.hiring.statusLine === `${CANDIDATE.candidateName} appointed as ${done.employee.employeeCode}` && JSON.stringify(Object.entries(done.hiring.can).filter(([, v]) => v).map(([k]) => k)) === JSON.stringify(['uploadSignedOffer', 'uploadSignedAppointment']),
+      'the hiring reads "… appointed as <code>" and accepts nothing further but signed copies', done.hiring.statusLine);
     const lists = { open: await HIRE.listHirings(db, COMPANY, { status: 'open' }), done: await HIRE.listHirings(db, COMPANY, { status: 'done' }),
       all: await HIRE.listHirings(db, COMPANY, {}), byPos: await HIRE.listHirings(db, COMPANY, { positionId: target.id }) };
     const mine = (list) => list.hirings.find((x) => x.id === H);
@@ -738,6 +845,10 @@ if (vacantRows.length < 2 || !someone) {
     ok(refused(await caught(() => HIRE.startHiring(db, { ...c, companyId: OTHER }, target.id)), 404, 'NOT_FOUND'), 'starting a hiring on another company’s position: 404');
     const [[otherLetter]] = await db.query('SELECT id FROM hrms_hiring_letters WHERE company_id = ? AND hiring_id = ? LIMIT 1', [COMPANY, H]);
     ok(refused(await caught(() => HIRE.readLetterFile(db, COMPANY, H + 1, otherLetter.id)), 404, 'NOT_FOUND'), 'a letter is only served under its own hiring');
+    ok(refused(await caught(() => HIRE.readSignedFile(db, OTHER, H, 'offer')), 404, 'NOT_FOUND') && refused(await caught(() => HIRE.readSignedFile(db, OTHER, H, 'appointment')), 404, 'NOT_FOUND')
+      && refused(await caught(() => HIRE.putSigned(db, { ...c, companyId: OTHER }, H, 'offer', upload('x.pdf', PDF('x')))), 404, 'NOT_FOUND')
+      && refused(await caught(() => HIRE.deleteSigned(db, { ...c, companyId: OTHER }, H, 'offer')), 404, 'NOT_FOUND')
+      && (await HIRE.getHiring(db, COMPANY, H)).hiring.signed.offer !== null, 'a signed copy from another company: read, upload and remove are all 404, and it is still there');
   });
 
   /* ══ 5. a closed hiring ═════════════════════════════════════════════════ */
@@ -753,7 +864,7 @@ if (vacantRows.length < 2 || !someone) {
     const closed = (await HIRE.closeHiring(db, c, H, { reason: 'declined', note: 'Took another offer.' })).hiring;
     ok(closed.stage === 'CLOSED' && closed.closeReason === 'OFFER_DECLINED' && closed.closeReasonLabel === 'Candidate declined the offer' && closed.closeNote === 'Took another offer.'
       && closed.refNo === ref && closed.employee === null
-      && closed.statusLine === `${CANDIDATE.candidateName} declined the offer` && Object.values(closed.can).every((x) => x === false),
+      && closed.statusLine === `${CANDIDATE.candidateName} declined the offer` && JSON.stringify(Object.entries(closed.can).filter(([, v]) => v).map(([k]) => k)) === JSON.stringify(['uploadSignedOffer']),
     'closed with the OLD code "declined": stored and read as OFFER_DECLINED, with its label; the reference stays, there is no employee', closed.statusLine);
     const inList = (await HIRE.listHirings(db, COMPANY, { status: 'closed' })).hirings.find((x) => x.id === H);
     ok(inList.closeReason === 'OFFER_DECLINED' && inList.closeReasonLabel === 'Candidate declined the offer', 'the Closed list row carries the reason and its label');
@@ -769,6 +880,10 @@ if (vacantRows.length < 2 || !someone) {
       && Number((await db.query('SELECT COUNT(*) AS n FROM hrms_employees WHERE company_id = ?', [COMPANY]))[0][0].n) === employeesBefore, 'no employee code was used and no employee row exists');
     ok(refused(await caught(() => HIRE.closeHiring(db, c, H, { reason: 'CANCELLED' })), 409, 'WRONG_STAGE') && refused(await caught(() => HIRE.appoint(db, c, H, { joiningDate: on })), 409, 'WRONG_STAGE')
       && refused(await caught(() => HIRE.updateHiring(db, c, H, { designation: 'x' })), 409, 'WRONG_STAGE'), 'close again, appoint, edit: all 409');
+    const lateSigned = await HIRE.putSigned(db, c, H, 'offer', upload('signed-then-declined.pdf', PDF('declined')));
+    ok(lateSigned.hiring.stage === 'CLOSED' && lateSigned.hiring.signed.offer.fileName === 'signed-then-declined.pdf'
+      && refused(await caught(() => HIRE.putSigned(db, c, H, 'appointment', upload('x.pdf', PDF('x')))), 409, 'WRONG_STAGE'),
+    'a hiring closed after its offer still takes the signed offer; it never takes a signed appointment letter');
     ok((await POS.getPosition(db, COMPANY, target.id)).position.hiring === null, 'the position carries no hiring any more');
     const moved = await ASG.createAssignment(db, c, { employeeId: someone.id, roleId: target.role_id, positionId: target.id, effectiveFrom: on, isPrimary: false });
     ok(moved.assignment.positionId === target.id, 'and an existing employee can be moved there again');
@@ -1027,6 +1142,7 @@ section('[8] Permissions and the two Code formats screens, over HTTP');
 
     const HIRING_ROUTES = [
       ['GET', '/hirings'], ['GET', '/hirings?status=open&positionId=1'], ['GET', '/hirings/1'], ['POST', '/positions/1/hiring', {}],
+      ['PUT', '/hirings/1/signed/offer', { fileName: 'x.pdf', contentBase64: 'JVBERi0=' }], ['GET', '/hirings/1/signed/offer/file'], ['DELETE', '/hirings/1/signed/appointment'],
       ['GET', '/hirings/1/jd/preview'], ['GET', '/hirings/1/jd/file?format=pdf'], ['GET', '/hiring/close-reasons'], ['GET', '/hiring/close-reasons?hiringId=1'],
       ['POST', '/hirings/1/confirm-jd', {}], ['PUT', '/hirings/1', { candidateName: 'x' }], ['POST', '/hirings/1/offer-letter', {}],
       ['POST', '/hirings/1/accept-offer', {}], ['POST', '/hirings/1/appoint', { joiningDate: on }], ['POST', '/hirings/1/close', { reason: 'CANCELLED' }],

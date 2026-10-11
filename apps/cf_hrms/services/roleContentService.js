@@ -36,6 +36,7 @@
  * top without re-querying.
  */
 import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js';
+import { loadAssignmentIndex } from './leavePolicyRead.js';
 
 // ---------------------------------------------------------------------------
 // Vocabularies. These mirror models/init.sql; routes/index.js /meta serves the
@@ -511,7 +512,9 @@ export async function getRole(db, companyId, id) {
     [companyId, id],
   );
   if (!row) throw notFound('Role');
-  return shapeRole(row);
+  // The leave policy given to THIS role, or null when it follows the location (spec §8.3).
+  const leave = await loadAssignmentIndex(db, companyId);
+  return { ...shapeRole(row), leavePolicy: { own: leave.byRole.get(row.id) ?? null } };
 }
 
 export async function requireRole(db, companyId, id) {

@@ -215,3 +215,25 @@ SELECT a.company_id, s.code, s.name, s.start_time, s.end_time, s.crosses_midnigh
    AND NOT EXISTS (
      SELECT 1 FROM hrms_shifts x
       WHERE x.company_id = a.company_id AND x.code = s.code AND x.deleted_at IS NULL);
+
+-- SEVEN DAYS FOR EVERY SHIFT THAT HAS NONE (2026-10-11, hrms_shift_days). A
+-- shift's hours are per day of the week; one seeded a moment ago — or made
+-- before the day rows existed — gets its own times on Monday to Saturday and
+-- Sunday off (no times = working days without fixed hours). A weekday that
+-- already has a row is left alone, so this never undoes an edit.
+INSERT INTO hrms_shift_days (company_id, shift_id, weekday, is_working, start_time, end_time, crosses_midnight, break_minutes)
+SELECT s.company_id, s.id, d.weekday,
+       IF(d.weekday <= 6, 1, 0),
+       IF(d.weekday <= 6, s.start_time, NULL),
+       IF(d.weekday <= 6, s.end_time, NULL),
+       IF(d.weekday <= 6 AND s.start_time IS NOT NULL AND s.end_time IS NOT NULL AND s.end_time <= s.start_time, 1, 0),
+       0
+  FROM hrms_shifts s
+  JOIN (SELECT 1 AS weekday UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7) d
+ WHERE s.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM hrms_shift_days x
+      WHERE x.company_id = s.company_id AND x.shift_id = s.id AND x.weekday = d.weekday);
+-- (hrms_shifts.week_summary is left NULL here: a reader with no stored line
+-- prints the line of exactly this default week — services/shiftRead.js — and the
+-- application writes the column on the first edit.)

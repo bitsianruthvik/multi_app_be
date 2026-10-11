@@ -25,12 +25,19 @@
  *   PUT    /organisation/contractors/:id
  *   DELETE /organisation/contractors/:id
  *
- *   GET    /organisation/shifts
+ *   GET    /organisation/shifts                     { shifts } — each with its seven days, weekly hours, summary, calendar
+ *   GET    /organisation/shifts/:id                 { shift }
  *   POST   /organisation/shifts                     { code, name, startTime?, endTime?, crossesMidnight?, graceInMinutes?, graceOutMinutes?, status? }
  *   PUT    /organisation/shifts/:id
  *   DELETE /organisation/shifts/:id
  *
- *   GET    /organisation/holidays?year=             ordered by date
+ *   GET    /organisation/holiday-calendars          { calendars }
+ *   GET    /organisation/holiday-calendars/:id?year=   { calendar, holidays, years }
+ *   POST   /organisation/holiday-calendars          { name, description? }      PUT / DELETE /:id (409 IN_USE while a shift selects it)
+ *   POST   /organisation/holiday-calendars/:id/holidays    { date, name, isOptional? }   409 DUPLICATE
+ *   POST   /organisation/holiday-calendars/:id/copy-year   { fromYear, toYear } -> { copied, skipped, note }
+ *
+ *   GET    /organisation/holidays?year=             every calendar's, ordered by date
  *   POST   /organisation/holidays                   { holidayDate, name, locationId?, isOptional? }
  *   PUT    /organisation/holidays/:id
  *   DELETE /organisation/holidays/:id
@@ -64,8 +71,10 @@ import {
   listLocations, createLocation, updateLocation, deleteLocation,
   listWorkContexts, createWorkContext, updateWorkContext, deleteWorkContext,
   listContractors, createContractor, updateContractor, deleteContractor,
-  listShifts, createShift, updateShift, deleteShift,
+  listShifts, getShiftDetail, createShift, updateShift, deleteShift,
   listHolidays, createHoliday, updateHoliday, deleteHoliday,
+  listHolidayCalendars, getHolidayCalendar, createHolidayCalendar, updateHolidayCalendar, deleteHolidayCalendar,
+  createCalendarHoliday, copyHolidayYear,
   listReportingTypes, createReportingType, updateReportingType, deleteReportingType,
 } from '../services/organisationService.js';
 import { departmentStaffing } from '../services/jobContentService.js';
@@ -115,9 +124,20 @@ router.delete('/organisation/contractors/:id', guard(PERM.peopleManage), handle(
 
 // ----- shifts ---------------------------------------------------------------
 router.get('/organisation/shifts', guard(PERM.orgView), handle((req) => listShifts(pool, ctx(req).companyId)));
+router.get('/organisation/shifts/:id', guard(PERM.orgView), handle((req) => getShiftDetail(pool, ctx(req).companyId, intParam(req.params.id))));
 router.post('/organisation/shifts', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createShift(db, c, req.body))));
 router.put('/organisation/shifts/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updateShift(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/shifts/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deleteShift(db, c, intParam(req.params.id)))));
+
+// ----- holiday calendars ----------------------------------------------------
+// A named list of dated holidays; a shift selects one (spec §6.2).
+router.get('/organisation/holiday-calendars', guard(PERM.orgView), handle((req) => listHolidayCalendars(pool, ctx(req).companyId)));
+router.post('/organisation/holiday-calendars', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createHolidayCalendar(db, c, req.body ?? {}))));
+router.get('/organisation/holiday-calendars/:id', guard(PERM.orgView), handle((req) => getHolidayCalendar(pool, ctx(req).companyId, intParam(req.params.id), { year: req.query.year })));
+router.put('/organisation/holiday-calendars/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updateHolidayCalendar(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/organisation/holiday-calendars/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deleteHolidayCalendar(db, c, intParam(req.params.id)))));
+router.post('/organisation/holiday-calendars/:id/holidays', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createCalendarHoliday(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/organisation/holiday-calendars/:id/copy-year', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => copyHolidayYear(db, c, intParam(req.params.id), req.body ?? {}))));
 
 // ----- holidays -------------------------------------------------------------
 router.get('/organisation/holidays', guard(PERM.orgView), handle((req) => listHolidays(pool, ctx(req).companyId, { year: req.query.year })));

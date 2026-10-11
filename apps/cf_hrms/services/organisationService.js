@@ -34,6 +34,10 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 
+import {
+  WEEKDAY_NAMES, hhmm, spanMinutes, shapeDay, defaultWeek, weekOf, summaryOf, weeklyHoursOf, mirrorOf, weekdayName,
+} from './shiftRead.js';
+
 // Codes travel through imports, exports and spreadsheets. No spaces, no commas.
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_.\-]*$/;
 const STATUSES = ['ACTIVE', 'INACTIVE'];
@@ -910,35 +914,153 @@ async function getContractor(db, companyId, id) {
 }
 
 /* ----------------------------------------------------------------- shifts */
+/*
+ * A SHIFT HAS HOURS PER DAY OF THE WEEK (spec §6, 2026-10-11). Seven rows in
+ * hrms_shift_days, weekday 1 = Monday … 7 = Sunday; the day logic — hours, the
+ * night shift that ends next day, the summary line — is services/shiftRead.js.
+ *
+ * WHAT IS KEPT IN STEP ON THE SHIFT ROW, on every write, so older readers and
+ * every position read keep working without a query of their own:
+ *   start_time / end_time / crosses_midnight   mirror the first working day with hours
+ *   week_summary                                the line "Mon–Sat 08:00–20:00"
+ *
+ * A shift may also SELECT ONE HOLIDAY CALENDAR (holiday_calendar_id; NULL = no
+ * holidays). Several shifts may share one.
+ *
+ * THE FIRST SHAPE STILL WORKS. A body with startTime / endTime and no `days`
+ * (what the first Shifts screen sends) sets those hours on every working day —
+ * Monday to Saturday for a new shift — and every answer still carries
+ * startTime, endTime, isFlexible, crossesMidnight beside the new fields.
+ */
 
-const mapShift = (r) => ({
-  id: r.id,
-  code: r.code,
-  name: r.name,
-  // NULL start/end is the FLEXIBLE shift and is deliberate (init.sql §1e): a
-  // General shift in an SME has no fixed hours, and writing 09:00–18:00 would
-  // turn every late arrival into a fabricated exception.
-  startTime: r.start_time ? String(r.start_time).slice(0, 5) : null,
-  endTime: r.end_time ? String(r.end_time).slice(0, 5) : null,
-  isFlexible: !r.start_time && !r.end_time,
-  crossesMidnight: !!r.crosses_midnight,
-  graceInMinutes: Number(r.grace_in_minutes),
-  graceOutMinutes: Number(r.grace_out_minutes),
-  status: r.status,
-  createdAt: r.created_at,
-});
+const SHIFT_COLUMNS = `s.id, s.code, s.name, s.start_time, s.end_time, s.crosses_midnight, s.grace_in_minutes, s.grace_out_minutes,
+       s.status, s.created_at, s.week_summary, s.holiday_calendar_id, hc.name AS holiday_calendar_name`;
+const SHIFT_FROM = `FROM hrms_shifts s
+       LEFT JOIN hrms_holiday_calendars hc ON hc.company_id = s.company_id AND hc.id = s.holiday_calendar_id AND hc.deleted_at IS NULL`;
 
-export async function listShifts(db, companyId) {
-  const [rows] = await db.query(
-    `SELECT id, code, name, start_time, end_time, crosses_midnight, grace_in_minutes, grace_out_minutes, status, created_at
-       FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL
-      ORDER BY status, code`,
-    [companyId],
-  );
-  return { rows: rows.map(mapShift) };
+function mapShift(r, dayRows = [], positionCount = 0) {
+  const days = weekOf(dayRows, r);
+  return {
+    id: r.id,
+    code: r.code,
+    name: r.name,
+    // NULL start/end is the FLEXIBLE shift and is deliberate (init.sql §1e): a
+    // General shift in an SME has no fixed hours, and writing 09:00–18:00 would
+    // turn every late arrival into a fabricated exception.
+    startTime: r.start_time ? String(r.start_time).slice(0, 5) : null,
+    endTime: r.end_time ? String(r.end_time).slice(0, 5) : null,
+    isFlexible: !r.start_time && !r.end_time,
+    crossesMidnight: !!r.crosses_midnight,
+    graceInMinutes: Number(r.grace_in_minutes),
+    graceOutMinutes: Number(r.grace_out_minutes),
+    status: r.status,
+    createdAt: r.created_at,
+    // Seven days, always (shiftRead.weekOf fills a weekday that has no row).
+    days,
+    weeklyHours: weeklyHoursOf(days),
+    workingDays: days.filter((d) => d.isWorking).length,
+    summary: summaryOf(days),
+    holidayCalendar: r.holiday_calendar_id && r.holiday_calendar_name ? { id: r.holiday_calendar_id, name: r.holiday_calendar_name } : null,
+    positionCount: Number(positionCount) || 0,
+  };
 }
 
-function shiftFields(input, problems, { partial = false, current = null } = {}) {
+async function shiftDayRows(db, companyId, shiftId = null) {
+  const [rows] = await db.query(
+    `SELECT shift_id, weekday, is_working, start_time, end_time, break_minutes
+       FROM hrms_shift_days WHERE company_id = ? AND deleted_at IS NULL${shiftId == null ? '' : ' AND shift_id = ?'}
+      ORDER BY shift_id, weekday`,
+    shiftId == null ? [companyId] : [companyId, shiftId],
+  );
+  const by = new Map();
+  for (const r of rows) by.set(r.shift_id, [...(by.get(r.shift_id) ?? []), r]);
+  return by;
+}
+
+async function shiftPositionCounts(db, companyId, shiftId = null) {
+  const [rows] = await db.query(
+    `SELECT default_shift_id AS shift_id, COUNT(*) AS n FROM hrms_positions
+      WHERE company_id = ? AND deleted_at IS NULL AND status <> 'CLOSED' AND default_shift_id IS NOT NULL${shiftId == null ? '' : ' AND default_shift_id = ?'}
+      GROUP BY default_shift_id`,
+    shiftId == null ? [companyId] : [companyId, shiftId],
+  );
+  return new Map(rows.map((r) => [r.shift_id, Number(r.n)]));
+}
+
+/** GET /organisation/shifts -> { shifts } (and `rows`, the name the first screen read). Three reads, whatever the number of shifts. */
+export async function listShifts(db, companyId) {
+  const [[rows], days, counts] = await Promise.all([
+    db.query(`SELECT ${SHIFT_COLUMNS} ${SHIFT_FROM} WHERE s.company_id = ? AND s.deleted_at IS NULL ORDER BY s.status, s.code`, [companyId]),
+    shiftDayRows(db, companyId),
+    shiftPositionCounts(db, companyId),
+  ]);
+  const shifts = rows.map((r) => mapShift(r, days.get(r.id), counts.get(r.id)));
+  return { shifts, rows: shifts };
+}
+
+async function loadShift(db, companyId, id) {
+  const [[row]] = await db.query(`SELECT ${SHIFT_COLUMNS} ${SHIFT_FROM} WHERE s.company_id = ? AND s.id = ? AND s.deleted_at IS NULL`, [companyId, id]);
+  if (!row) throw notFound('Shift');
+  const [days, counts] = await Promise.all([shiftDayRows(db, companyId, id), shiftPositionCounts(db, companyId, id)]);
+  return mapShift(row, days.get(id), counts.get(id));
+}
+
+/** `{ shift }`, with the shift's own fields beside it — what the first screen read off a create or an update. */
+const shiftAnswer = (shift) => ({ ...shift, shift });
+
+/** GET /organisation/shifts/:id -> { shift } */
+export async function getShiftDetail(db, companyId, id) {
+  return shiftAnswer(await loadShift(db, companyId, id));
+}
+
+/**
+ * The seven days of a body, checked. Returns the days in the wire shape, or
+ * null when the body has no `days`. Every problem is pushed, in plain words.
+ */
+function readShiftDays(input, problems) {
+  if (input.days === undefined) return null;
+  if (!Array.isArray(input.days) || input.days.length !== 7) {
+    problems.push('A shift has seven days, Monday to Sunday. Send all seven.');
+    return null;
+  }
+  const seen = new Set();
+  const out = [];
+  for (const raw of input.days) {
+    const weekday = Number(raw?.weekday);
+    const day = WEEKDAY_NAMES[weekday - 1];
+    if (!Number.isInteger(weekday) || !day) { problems.push('A day of the week is a number from 1 (Monday) to 7 (Sunday).'); continue; }
+    if (seen.has(weekday)) { problems.push(`${day} is there twice.`); continue; }
+    seen.add(weekday);
+    const isWorking = raw.isWorking === true || raw.isWorking === 1 || raw.isWorking === 'true';
+    if (!isWorking) { out.push(shapeDay({ weekday, isWorking: false })); continue; }
+    const start = timeOrNull(raw.startTime, `${day}: the start time`, problems);
+    const end = timeOrNull(raw.endTime, `${day}: the end time`, problems);
+    if (!!start !== !!end) {
+      problems.push(`${day}: give both a start and an end time, or leave both blank for a working day without fixed hours.`);
+      continue;
+    }
+    const breakRaw = raw.breakMinutes === undefined || raw.breakMinutes === null || raw.breakMinutes === '' ? 0 : Number(raw.breakMinutes);
+    if (!Number.isInteger(breakRaw) || breakRaw < 0) { problems.push(`${day}: the break is a whole number of minutes.`); continue; }
+    const span = spanMinutes(hhmm(start), hhmm(end));
+    if (span === null && breakRaw > 0) { problems.push(`${day}: a break needs a start and an end time to be taken from.`); continue; }
+    if (span !== null && breakRaw >= span) { problems.push(`${day}: the break (${breakRaw} minutes) is as long as the working day or longer.`); continue; }
+    out.push(shapeDay({ weekday, isWorking: true, startTime: start, endTime: end, breakMinutes: breakRaw }));
+  }
+  return out.length === 7 ? out.sort((a, b) => a.weekday - b.weekday) : null;
+}
+
+/** The first screen's times, HH:MM or null; `undefined` when the body does not touch them. */
+function readLegacyTimes(input, problems) {
+  if (input.startTime === undefined && input.endTime === undefined) return undefined;
+  const start = timeOrNull(input.startTime, 'Start time', problems);
+  const end = timeOrNull(input.endTime, 'End time', problems);
+  // A half-specified shift is the one state the attendance service cannot
+  // read: it is neither "flexible" nor "these are the hours".
+  if (!!start !== !!end) problems.push('Give both a start and an end time, or leave both blank for a flexible shift with no fixed hours.');
+  return { start: hhmm(start), end: hhmm(end) };
+}
+
+function shiftFields(input, problems, { partial = false } = {}) {
   const out = {};
   if (!partial || input.code !== undefined) {
     const code = str(input.code);
@@ -952,96 +1074,275 @@ function shiftFields(input, problems, { partial = false, current = null } = {}) 
     if (!name || name.length > 100) problems.push('Name is required, up to 100 characters.');
     out.name = name;
   }
-  const touchesTimes = !partial || input.startTime !== undefined || input.endTime !== undefined;
-  if (touchesTimes) {
-    const start = timeOrNull(input.startTime, 'Start time', problems);
-    const end = timeOrNull(input.endTime, 'End time', problems);
-    // A half-specified shift is the one state the attendance service cannot
-    // read: it is neither "flexible" nor "these are the hours".
-    if (!!start !== !!end) {
-      problems.push('Give both a start and an end time, or leave both blank for a flexible shift with no fixed hours.');
-    }
-    out.start_time = start;
-    out.end_time = end;
-  }
-  if (!partial || input.crossesMidnight !== undefined) out.crosses_midnight = bool(input.crossesMidnight);
   if (input.graceInMinutes !== undefined) out.grace_in_minutes = intInRange(input.graceInMinutes, 0, 240, 'Grace in', problems);
   if (input.graceOutMinutes !== undefined) out.grace_out_minutes = intInRange(input.graceOutMinutes, 0, 240, 'Grace out', problems);
   if (input.status !== undefined) out.status = enumOf(input.status, STATUSES, 'Status', problems, 'ACTIVE');
-
-  // crosses_midnight is STORED, not derived (init.sql §1e) — so it can disagree
-  // with the clock, and a night shift filed as a day shift silently halves every
-  // shift-length calculation downstream.
-  const start = out.start_time !== undefined ? out.start_time : current?.start_time ?? null;
-  const end = out.end_time !== undefined ? out.end_time : current?.end_time ?? null;
-  const crosses = out.crosses_midnight !== undefined ? out.crosses_midnight : (current?.crosses_midnight ? 1 : 0);
-  if (start && end) {
-    if (end <= start && !crosses) problems.push('This shift ends before it starts, so tick "crosses midnight" — or correct the times.');
-    if (end > start && crosses) problems.push('"Crosses midnight" is ticked but the end time is later the same day. Untick it, or correct the times.');
-  }
   return out;
+}
+
+/** `holidayCalendarId` of a body: a calendar of this company, null for "no holidays", `undefined` when not sent. */
+async function readShiftCalendar(db, companyId, input, problems) {
+  if (input.holidayCalendarId === undefined) return undefined;
+  const id = idOrNull(input.holidayCalendarId, 'Holiday calendar', problems);
+  if (id == null) return null;
+  const [[row]] = await db.query('SELECT id FROM hrms_holiday_calendars WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
+  if (!row) problems.push('That holiday calendar does not exist. Pick one from the list, or "No holidays".');
+  return id;
+}
+
+/** Writes the seven rows (in place — there is one row per weekday, for good) and what the shift row mirrors. */
+async function writeShiftDays(db, c, shiftId, days) {
+  for (const d of days) {
+    await db.query(
+      `INSERT INTO hrms_shift_days (company_id, shift_id, weekday, is_working, start_time, end_time, crosses_midnight, break_minutes, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE is_working = VALUES(is_working), start_time = VALUES(start_time), end_time = VALUES(end_time),
+                               crosses_midnight = VALUES(crosses_midnight), break_minutes = VALUES(break_minutes), deleted_at = NULL`,
+      [c.companyId, shiftId, d.weekday, d.isWorking ? 1 : 0, d.startTime, d.endTime, d.crossesMidnight ? 1 : 0, d.breakMinutes, c.userId],
+    );
+  }
+  await updateRow(db, 'hrms_shifts', c.companyId, shiftId, { ...mirrorOf(days), week_summary: summaryOf(days) });
 }
 
 export async function createShift(db, c, input = {}) {
   const problems = [];
   const fields = shiftFields(input, problems);
+  const sentDays = readShiftDays(input, problems);
+  const legacy = readLegacyTimes(input, problems);
+  const calendarId = await readShiftCalendar(db, c.companyId, input, problems);
   assertNoProblems(problems);
   await assertCodeFree(db, 'hrms_shifts', c.companyId, fields.code, null, 'Shift');
+  // No days sent: the week every shift starts with — its times Monday to Saturday, Sunday off.
+  const days = sentDays ?? defaultWeek(legacy?.start ?? null, legacy?.end ?? null);
   const id = await insertRow(db, 'hrms_shifts', c.companyId, c.userId, {
     ...fields,
-    crosses_midnight: fields.crosses_midnight ?? 0,
+    ...mirrorOf(days),
+    week_summary: summaryOf(days),
+    holiday_calendar_id: calendarId ?? null,
     grace_in_minutes: fields.grace_in_minutes ?? 0,
     grace_out_minutes: fields.grace_out_minutes ?? 0,
     status: fields.status ?? 'ACTIVE',
   });
-  await audit(db, c, 'hrms_shifts', id, 'CREATE', null, fields);
-  return getShift(db, c.companyId, id);
+  await writeShiftDays(db, c, id, days);
+  await audit(db, c, 'hrms_shifts', id, 'CREATE', null, { ...fields, holidayCalendarId: calendarId ?? null, summary: summaryOf(days) });
+  return shiftAnswer(await loadShift(db, c.companyId, id));
 }
 
 export async function updateShift(db, c, id, input = {}) {
-  const before = await requireRow(db, 'hrms_shifts', c.companyId, id, 'Shift');
+  const before = await loadShift(db, c.companyId, id);
   const problems = [];
-  const fields = shiftFields(input, problems, { partial: true, current: before });
+  const fields = shiftFields(input, problems, { partial: true });
+  const sentDays = readShiftDays(input, problems);
+  const legacy = readLegacyTimes(input, problems);
+  const calendarId = await readShiftCalendar(db, c.companyId, input, problems);
   assertNoProblems(problems);
   if (fields.code !== undefined) await assertCodeFree(db, 'hrms_shifts', c.companyId, fields.code, id, 'Shift');
+  if (calendarId !== undefined) fields.holiday_calendar_id = calendarId;
   await updateRow(db, 'hrms_shifts', c.companyId, id, fields);
-  await audit(db, c, 'hrms_shifts', id, 'UPDATE', mapShift(before), fields);
-  return getShift(db, c.companyId, id);
+  // Days as sent; or the first screen's two times, put on every day that is a working day today.
+  const days = sentDays ?? (legacy
+    ? before.days.map((d) => shapeDay({ ...d, startTime: d.isWorking ? legacy.start : null, endTime: d.isWorking ? legacy.end : null, breakMinutes: legacy.start ? d.breakMinutes : 0 }))
+    : null);
+  if (days) await writeShiftDays(db, c, id, days);
+  await audit(db, c, 'hrms_shifts', id, 'UPDATE', { code: before.code, name: before.name, status: before.status, summary: before.summary, holidayCalendarId: before.holidayCalendar?.id ?? null },
+    { ...fields, ...(days ? { summary: summaryOf(days) } : {}) });
+  return shiftAnswer(await loadShift(db, c.companyId, id));
 }
 
 export async function deleteShift(db, c, id) {
-  const before = await requireRow(db, 'hrms_shifts', c.companyId, id, 'Shift');
+  const before = await loadShift(db, c.companyId, id);
+  // Said first and by number: it is the one reference a person can do something about from here.
+  const [[used]] = await db.query('SELECT COUNT(*) AS n FROM hrms_positions WHERE company_id = ? AND default_shift_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+  if (Number(used.n) > 0) {
+    const n = Number(used.n);
+    throw conflict('IN_USE', `${n} position${n === 1 ? ' is' : 's are'} on this shift. Move ${n === 1 ? 'it' : 'them'} to another shift first, or set this one inactive.`, {
+      problems: [`${n} position${n === 1 ? ' is' : 's are'} on the ${before.name} shift.`],
+      detail: { positionCount: n },
+    });
+  }
   await assertNotReferenced(db, c.companyId, id, [
-    { table: 'hrms_positions', column: 'default_shift_id', label: 'position' },
     { table: 'hrms_work_assignments', column: 'default_shift_id', label: 'work assignment' },
     { table: 'hrms_shift_rosters', column: 'shift_id', label: 'roster entry', plural: 'roster entries' },
     { table: 'hrms_attendance_records', column: 'shift_id', label: 'attendance record' },
     { table: 'hrms_manpower_requirements', column: 'shift_id', label: 'manpower requirement' },
   ]);
   await softDelete(db, 'hrms_shifts', c.companyId, id);
-  await audit(db, c, 'hrms_shifts', id, 'DELETE', mapShift(before), null);
+  // Its seven days go with it.
+  await db.query('UPDATE hrms_shift_days SET deleted_at = NOW() WHERE company_id = ? AND shift_id = ?', [c.companyId, id]);
+  await audit(db, c, 'hrms_shifts', id, 'DELETE', { code: before.code, name: before.name, summary: before.summary }, null);
   return { ok: true, id };
 }
 
-async function getShift(db, companyId, id) {
-  const row = await requireRow(db, 'hrms_shifts', companyId, id, 'Shift');
-  return mapShift(row);
+/* ------------------------------------------------- holiday calendars */
+/*
+ * A HOLIDAY CALENDAR is a named list of dated holidays; a shift selects one.
+ * Nothing is invented here: a new calendar starts empty.
+ *
+ * A date is in a calendar once (409 DUPLICATE, naming the holiday already
+ * there); the same date may be in two calendars.
+ *
+ * Holidays written before calendars existed (POST /organisation/holidays, which
+ * still works) belong to the company's "Company holidays" calendar, created the
+ * first time it is needed.
+ */
+
+export const DEFAULT_CALENDAR_NAME = 'Company holidays';
+const COPY_YEAR_NOTE = 'Only holidays on a fixed date repeat. Festival dates move each year — check each one before relying on this calendar.';
+
+const dayText = (v) => (v instanceof Date
+  ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  : String(v).slice(0, 10));
+
+const mapHoliday = (r) => {
+  const date = dayText(r.holiday_date);
+  return {
+    id: r.id,
+    date,
+    weekday: weekdayName(date),
+    name: r.name,
+    isOptional: !!r.is_optional,
+    calendarId: r.calendar_id ?? null,
+    // The first shape's names, kept.
+    holidayDate: date,
+    locationId: r.location_id ?? null,
+    locationName: r.location_name ?? null,
+    createdAt: r.created_at,
+  };
+};
+
+const mapCalendar = (r, extra = {}) => ({
+  id: r.id,
+  name: r.name,
+  description: r.description ?? null,
+  status: r.status,
+  holidayCount: Number(extra.holidayCount ?? 0),
+  nextHoliday: extra.nextHoliday ?? null,
+  shiftCount: Number(extra.shiftCount ?? 0),
+});
+
+async function requireCalendar(db, companyId, id) {
+  const [[row]] = await db.query('SELECT * FROM hrms_holiday_calendars WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
+  if (!row) throw notFound('Holiday calendar');
+  return row;
+}
+
+/** Counts, next holiday and shifts using it — for every calendar (or one), in three grouped reads. */
+async function calendarFacts(db, companyId, calendarId = null) {
+  const one = calendarId == null ? '' : ' AND calendar_id = ?';
+  const args = calendarId == null ? [companyId] : [companyId, calendarId];
+  const today = dayText(new Date());
+  const [[counts], [upcoming], [shifts]] = await Promise.all([
+    db.query(`SELECT calendar_id, COUNT(*) AS n FROM hrms_holidays WHERE company_id = ? AND deleted_at IS NULL${one} GROUP BY calendar_id`, args),
+    db.query(`SELECT calendar_id, holiday_date, name FROM hrms_holidays WHERE company_id = ? AND deleted_at IS NULL AND holiday_date >= ?${one} ORDER BY holiday_date, id`,
+      calendarId == null ? [companyId, today] : [companyId, today, calendarId]),
+    db.query(`SELECT holiday_calendar_id AS calendar_id, COUNT(*) AS n FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL${calendarId == null ? '' : ' AND holiday_calendar_id = ?'} GROUP BY holiday_calendar_id`, args),
+  ]);
+  const next = new Map();
+  for (const h of upcoming) if (!next.has(h.calendar_id)) next.set(h.calendar_id, { date: dayText(h.holiday_date), name: h.name });
+  const countOf = new Map(counts.map((r) => [r.calendar_id, Number(r.n)]));
+  const shiftsOf = new Map(shifts.map((r) => [r.calendar_id, Number(r.n)]));
+  return (id) => ({ holidayCount: countOf.get(id) ?? 0, nextHoliday: next.get(id) ?? null, shiftCount: shiftsOf.get(id) ?? 0 });
+}
+
+/** GET /organisation/holiday-calendars -> { calendars } */
+export async function listHolidayCalendars(db, companyId) {
+  const [[rows], facts] = await Promise.all([
+    db.query('SELECT * FROM hrms_holiday_calendars WHERE company_id = ? AND deleted_at IS NULL ORDER BY status, name, id', [companyId]),
+    calendarFacts(db, companyId),
+  ]);
+  return { calendars: rows.map((r) => mapCalendar(r, facts(r.id))) };
+}
+
+/** GET /organisation/holiday-calendars/:id?year= -> { calendar, holidays, years } — every year when none is asked for. */
+export async function getHolidayCalendar(db, companyId, id, { year } = {}) {
+  const row = await requireCalendar(db, companyId, id);
+  let y = null;
+  if (year !== undefined && year !== null && year !== '') {
+    y = Number(year);
+    if (!Number.isInteger(y) || y < 1900 || y > 2200) throw invalid('INVALID', 'year is a four-digit year.');
+  }
+  const [[holidays], [years], facts] = await Promise.all([
+    db.query(
+      `SELECT h.* FROM hrms_holidays h WHERE h.company_id = ? AND h.calendar_id = ? AND h.deleted_at IS NULL${y ? ' AND YEAR(h.holiday_date) = ?' : ''} ORDER BY h.holiday_date, h.id`,
+      y ? [companyId, id, y] : [companyId, id]),
+    db.query('SELECT DISTINCT YEAR(holiday_date) AS y FROM hrms_holidays WHERE company_id = ? AND calendar_id = ? AND deleted_at IS NULL ORDER BY y', [companyId, id]),
+    calendarFacts(db, companyId, id),
+  ]);
+  return { calendar: mapCalendar(row, facts(id)), holidays: holidays.map(mapHoliday), years: years.map((r) => Number(r.y)) };
+}
+
+function calendarFields(input, problems, { partial = false } = {}) {
+  const out = {};
+  if (!partial || input.name !== undefined) {
+    const name = str(input.name);
+    if (!name || name.length > 150) problems.push('A calendar needs a name, up to 150 characters.');
+    out.name = name;
+  }
+  if (input.description !== undefined) {
+    const description = nullableStr(input.description);
+    if (description && description.length > 500) problems.push('The description is up to 500 characters.');
+    out.description = description;
+  }
+  if (input.status !== undefined) out.status = enumOf(input.status, STATUSES, 'Status', problems, 'ACTIVE');
+  return out;
+}
+
+export async function createHolidayCalendar(db, c, input = {}) {
+  const problems = [];
+  const fields = calendarFields(input, problems);
+  assertNoProblems(problems);
+  await assertNameFree(db, 'hrms_holiday_calendars', c.companyId, fields.name, null, 'Holiday calendar', 'Open that calendar instead of making a second one with the same name.');
+  const id = await insertRow(db, 'hrms_holiday_calendars', c.companyId, c.userId, { ...fields, status: fields.status ?? 'ACTIVE' });
+  await audit(db, c, 'hrms_holiday_calendars', id, 'CREATE', null, fields);
+  return { calendar: mapCalendar(await requireCalendar(db, c.companyId, id)) };
+}
+
+export async function updateHolidayCalendar(db, c, id, input = {}) {
+  const before = await requireCalendar(db, c.companyId, id);
+  const problems = [];
+  const fields = calendarFields(input, problems, { partial: true });
+  assertNoProblems(problems);
+  if (fields.name !== undefined) {
+    await assertNameFree(db, 'hrms_holiday_calendars', c.companyId, fields.name, id, 'Holiday calendar', 'Two calendars with one name cannot be told apart on a shift.');
+  }
+  await updateRow(db, 'hrms_holiday_calendars', c.companyId, id, fields);
+  await audit(db, c, 'hrms_holiday_calendars', id, 'UPDATE', { name: before.name, description: before.description, status: before.status }, fields);
+  const facts = await calendarFacts(db, c.companyId, id);
+  return { calendar: mapCalendar(await requireCalendar(db, c.companyId, id), facts(id)) };
+}
+
+/** 409 IN_USE while a shift selects it. Its holidays go with it. */
+export async function deleteHolidayCalendar(db, c, id) {
+  const before = await requireCalendar(db, c.companyId, id);
+  const [shifts] = await db.query('SELECT id, name FROM hrms_shifts WHERE company_id = ? AND holiday_calendar_id = ? AND deleted_at IS NULL ORDER BY name', [c.companyId, id]);
+  if (shifts.length) {
+    const names = shifts.map((s) => s.name).join(', ');
+    throw conflict('IN_USE', `${shifts.length === 1 ? 'The ' : ''}${names} shift${shifts.length === 1 ? ' uses' : 's use'} this calendar. Choose another calendar on ${shifts.length === 1 ? 'that shift' : 'those shifts'} first.`, {
+      problems: shifts.map((s) => `The ${s.name} shift uses this calendar.`),
+      detail: { shiftCount: shifts.length, shiftIds: shifts.map((s) => s.id) },
+    });
+  }
+  const [gone] = await db.query('UPDATE hrms_holidays SET deleted_at = NOW() WHERE company_id = ? AND calendar_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+  await softDelete(db, 'hrms_holiday_calendars', c.companyId, id);
+  await audit(db, c, 'hrms_holiday_calendars', id, 'DELETE', { name: before.name, holidays: gone.affectedRows }, null);
+  return { ok: true, id, deletedHolidays: gone.affectedRows };
+}
+
+/** The calendar a holiday goes to when none is named: "Company holidays", made on first use. */
+async function defaultCalendarId(db, c) {
+  const [[row]] = await db.query(
+    'SELECT id FROM hrms_holiday_calendars WHERE company_id = ? AND deleted_at IS NULL AND LOWER(name) = LOWER(?) ORDER BY id LIMIT 1',
+    [c.companyId, DEFAULT_CALENDAR_NAME],
+  );
+  if (row) return row.id;
+  const id = await insertRow(db, 'hrms_holiday_calendars', c.companyId, c.userId, { name: DEFAULT_CALENDAR_NAME, description: 'Holidays entered before calendars existed.', status: 'ACTIVE' });
+  await audit(db, c, 'hrms_holiday_calendars', id, 'CREATE', null, { name: DEFAULT_CALENDAR_NAME, reason: 'a holiday was added without naming a calendar' });
+  return id;
 }
 
 /* --------------------------------------------------------------- holidays */
 
-const mapHoliday = (r) => ({
-  id: r.id,
-  holidayDate: r.holiday_date instanceof Date
-    ? r.holiday_date.toISOString().slice(0, 10)
-    : String(r.holiday_date).slice(0, 10),
-  name: r.name,
-  locationId: r.location_id,
-  locationName: r.location_name ?? null,
-  isOptional: !!r.is_optional,
-  createdAt: r.created_at,
-});
-
+/** GET /organisation/holidays?year= — every calendar's holidays, by date (the first screen's list). */
 export async function listHolidays(db, companyId, { year } = {}) {
   const params = [companyId];
   let where = '';
@@ -1050,21 +1351,22 @@ export async function listHolidays(db, companyId, { year } = {}) {
     params.push(Number(year));
   }
   const [rows] = await db.query(
-    `SELECT h.id, h.holiday_date, h.name, h.location_id, h.is_optional, h.created_at, l.name AS location_name
+    `SELECT h.id, h.holiday_date, h.name, h.location_id, h.calendar_id, h.is_optional, h.created_at, l.name AS location_name
        FROM hrms_holidays h
        LEFT JOIN hrms_locations l ON l.company_id = h.company_id AND l.id = h.location_id AND l.deleted_at IS NULL
       WHERE h.company_id = ? AND h.deleted_at IS NULL${where}
-      ORDER BY h.holiday_date`,
+      ORDER BY h.holiday_date, h.id`,
     params,
   );
-  return { rows: rows.map(mapHoliday) };
+  const holidays = rows.map(mapHoliday);
+  return { rows: holidays, holidays };
 }
 
+/** `date` (or the first shape's `holidayDate`), `name`, `isOptional`. */
 function holidayFields(input, problems, { partial = false } = {}) {
   const out = {};
-  if (!partial || input.holidayDate !== undefined) {
-    out.holiday_date = dateOnly(input.holidayDate, 'Date', problems);
-  }
+  const sentDate = input.date !== undefined ? input.date : input.holidayDate;
+  if (!partial || sentDate !== undefined) out.holiday_date = dateOnly(sentDate, 'Date', problems);
   if (!partial || input.name !== undefined) {
     const name = str(input.name);
     if (!name || name.length > 200) problems.push('Name is required, up to 200 characters.');
@@ -1074,19 +1376,36 @@ function holidayFields(input, problems, { partial = false } = {}) {
   return out;
 }
 
-export async function createHoliday(db, c, input = {}) {
+/** `{ holiday }`, with the holiday's own fields beside it for the first screen. */
+const holidayAnswer = (holiday) => ({ ...holiday, holiday });
+
+async function addHoliday(db, c, calendarId, input) {
   const problems = [];
   const fields = holidayFields(input, problems);
   const locationId = idOrNull(input.locationId, 'Location', problems);
   assertNoProblems(problems);
-  await assertHolidayFree(db, c.companyId, fields.holiday_date, locationId, null);
+  await assertHolidayFree(db, c.companyId, calendarId, fields.holiday_date, locationId, null);
   const id = await insertRow(db, 'hrms_holidays', c.companyId, c.userId, {
-    ...fields,
-    location_id: locationId,
-    is_optional: fields.is_optional ?? 0,
+    ...fields, calendar_id: calendarId, location_id: locationId, is_optional: fields.is_optional ?? 0,
   });
-  await audit(db, c, 'hrms_holidays', id, 'CREATE', null, { ...fields, location_id: locationId });
-  return getHoliday(db, c.companyId, id);
+  await audit(db, c, 'hrms_holidays', id, 'CREATE', null, { ...fields, calendar_id: calendarId, location_id: locationId });
+  return holidayAnswer(await getHoliday(db, c.companyId, id));
+}
+
+/** POST /organisation/holiday-calendars/:id/holidays { date, name, isOptional? } -> { holiday } — 409 DUPLICATE for a date already in it. */
+export async function createCalendarHoliday(db, c, calendarId, input = {}) {
+  await requireCalendar(db, c.companyId, calendarId);
+  return addHoliday(db, c, calendarId, input);
+}
+
+/** POST /organisation/holidays — the first screen's route: into the calendar named by `calendarId`, else "Company holidays". */
+export async function createHoliday(db, c, input = {}) {
+  let calendarId = null;
+  if (input.calendarId !== undefined && input.calendarId !== null && input.calendarId !== '') {
+    calendarId = Number(input.calendarId);
+    await requireCalendar(db, c.companyId, calendarId);
+  } else calendarId = await defaultCalendarId(db, c);
+  return addHoliday(db, c, calendarId, input);
 }
 
 export async function updateHoliday(db, c, id, input = {}) {
@@ -1098,13 +1417,11 @@ export async function updateHoliday(db, c, id, input = {}) {
     : before.location_id;
   assertNoProblems(problems);
   if (input.locationId !== undefined) fields.location_id = locationId;
-  const date = fields.holiday_date ?? (before.holiday_date instanceof Date
-    ? before.holiday_date.toISOString().slice(0, 10)
-    : String(before.holiday_date).slice(0, 10));
-  await assertHolidayFree(db, c.companyId, date, locationId, id);
+  const date = fields.holiday_date ?? dayText(before.holiday_date);
+  await assertHolidayFree(db, c.companyId, before.calendar_id, date, locationId, id);
   await updateRow(db, 'hrms_holidays', c.companyId, id, fields);
   await audit(db, c, 'hrms_holidays', id, 'UPDATE', mapHoliday(before), fields);
-  return getHoliday(db, c.companyId, id);
+  return holidayAnswer(await getHoliday(db, c.companyId, id));
 }
 
 export async function deleteHoliday(db, c, id) {
@@ -1115,20 +1432,20 @@ export async function deleteHoliday(db, c, id) {
 }
 
 /**
- * uq_hhol_day covers (company, location_key, date) — but the index only names
- * itself. "Republic Day is already on the calendar for this location" is what a
- * person can act on.
+ * The unique index (uq_hhol_calday) covers calendar, location and date — but an
+ * index only names itself. "15 August is already in this calendar: Independence
+ * Day" is what a person can act on.
  */
-async function assertHolidayFree(db, companyId, date, locationId, excludeId) {
+async function assertHolidayFree(db, companyId, calendarId, date, locationId, excludeId) {
   const [[clash]] = await db.query(
     `SELECT id, name FROM hrms_holidays
       WHERE company_id = ? AND deleted_at IS NULL AND holiday_date = ?
-        AND IFNULL(location_id, 0) = ? AND id <> ?`,
-    [companyId, date, locationId ?? 0, excludeId ?? 0],
+        AND IFNULL(calendar_id, 0) = ? AND IFNULL(location_id, 0) = ? AND id <> ?`,
+    [companyId, date, calendarId ?? 0, locationId ?? 0, excludeId ?? 0],
   );
   if (clash) {
-    throw conflict('DUPLICATE', `${date} is already a holiday${locationId ? ' for this location' : ''}: ${clash.name}.`, {
-      problems: [`${date} is already on the calendar as "${clash.name}"${locationId ? ' for this location' : ' company-wide'}. Edit that row instead of adding a second one.`],
+    throw conflict('DUPLICATE', `${date} is already a holiday in this calendar: ${clash.name}.`, {
+      problems: [`${date} is already in this calendar as "${clash.name}". Edit that one instead of adding a second.`],
       existing: { id: clash.id, name: clash.name },
     });
   }
@@ -1143,6 +1460,57 @@ async function getHoliday(db, companyId, id) {
   );
   if (!row) throw notFound('Holiday');
   return mapHoliday(row);
+}
+
+/**
+ * POST /organisation/holiday-calendars/:id/copy-year { fromYear, toYear }
+ * -> { copied, skipped: [{ date, name, why }], note }
+ *
+ * Each holiday of one year, on the same day and month of another. A date the
+ * calendar already has is skipped (never overwritten), and so is 29 February
+ * into a year that has none. `note` says what nobody should forget: a festival
+ * does not fall on the same date twice.
+ */
+export async function copyHolidayYear(db, c, calendarId, input = {}) {
+  await requireCalendar(db, c.companyId, calendarId);
+  const fromYear = Number(input.fromYear);
+  const toYear = Number(input.toYear);
+  const problems = [];
+  for (const [y, label] of [[fromYear, 'The year to copy from'], [toYear, 'The year to copy to']]) {
+    if (!Number.isInteger(y) || y < 1900 || y > 2200) problems.push(`${label} is a four-digit year.`);
+  }
+  if (!problems.length && fromYear === toYear) problems.push('Copy to a different year.');
+  assertNoProblems(problems);
+
+  const [source] = await db.query(
+    'SELECT holiday_date, name, is_optional FROM hrms_holidays WHERE company_id = ? AND calendar_id = ? AND deleted_at IS NULL AND location_id IS NULL AND YEAR(holiday_date) = ? ORDER BY holiday_date, id',
+    [c.companyId, calendarId, fromYear],
+  );
+  const [existing] = await db.query(
+    'SELECT holiday_date, name FROM hrms_holidays WHERE company_id = ? AND calendar_id = ? AND deleted_at IS NULL AND location_id IS NULL AND YEAR(holiday_date) = ?',
+    [c.companyId, calendarId, toYear],
+  );
+  const taken = new Map(existing.map((h) => [dayText(h.holiday_date), h.name]));
+  const skipped = [];
+  let copied = 0;
+  for (const h of source) {
+    const monthDay = dayText(h.holiday_date).slice(5);
+    const date = `${toYear}-${monthDay}`;
+    const real = new Date(`${date}T00:00:00Z`);
+    if (Number.isNaN(real.getTime()) || real.toISOString().slice(5, 10) !== monthDay) {
+      skipped.push({ date, name: h.name, why: `${toYear} has no 29 February.` });
+      continue;
+    }
+    if (taken.has(date)) {
+      skipped.push({ date, name: h.name, why: `${date} is already in this calendar${taken.get(date) === h.name ? '' : ` as "${taken.get(date)}"`}.` });
+      continue;
+    }
+    await insertRow(db, 'hrms_holidays', c.companyId, c.userId, { calendar_id: calendarId, holiday_date: date, name: h.name, is_optional: h.is_optional ? 1 : 0 });
+    taken.set(date, h.name);
+    copied += 1;
+  }
+  await audit(db, c, 'hrms_holiday_calendars', calendarId, 'UPDATE', null, { copiedYear: { fromYear, toYear, copied, skipped: skipped.length } });
+  return { copied, skipped, note: COPY_YEAR_NOTE };
 }
 
 /* -------------------------------------------------- reporting types */

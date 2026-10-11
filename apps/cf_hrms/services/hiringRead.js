@@ -46,7 +46,8 @@ export function statusLineOf(h, today = null) {
       if (!name) return 'Candidate details to enter';
       return h.has_offer_letter ? `Offer sent to ${name}` : `Offer letter to generate for ${name}`;
     case 'APPOINTMENT':
-      return `Offer accepted by ${name || 'the candidate'}`;
+      // Nothing is created by an acceptance: the hiring waits here, for days or weeks, until somebody generates the letter.
+      return `Offer accepted by ${name || 'the candidate'} · appointment letter to generate`;
     case 'DONE': {
       const joining = h.joining_date ? String(h.joining_date instanceof Date ? dayIso(h.joining_date) : h.joining_date).slice(0, 10) : null;
       if (joining && today && joining > today) return `${name || 'The candidate'} joins on ${dayText(joining)}`;

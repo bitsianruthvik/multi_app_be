@@ -61,6 +61,8 @@ import {
 import { computeCards, loadCards } from './positionCards.js';
 import { openHiringsByPosition, shapePositionHiring, COMING_OR_LIVE_SQL, splitComing } from './hiringRead.js';
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
+import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
+import { effectiveFor } from './leavePolicyRead.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
 
@@ -92,7 +94,7 @@ const POSITIONS_SQL = `
          p.sanctioned_headcount, p.default_shift_id, p.status, p.effective_from, p.effective_to,
          r.title AS role_title, r.role_code,
          d.name AS department_name, d.code AS department_code, d.parent_department_id AS department_parent_id, l.name AS location_name,
-         s.code AS shift_code, s.name AS shift_name,
+         s.code AS shift_code, s.name AS shift_name, ${SHIFT_SUMMARY_COLUMNS_SQL('s')},
          hi.id AS hiring_id, hi.stage AS hiring_stage, hi.candidate_name AS hiring_candidate_name, hl.id AS hiring_offer_letter_id
     FROM hrms_positions p
     LEFT JOIN hrms_roles       r ON r.company_id = p.company_id AND r.id = p.role_id
@@ -555,7 +557,7 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       shiftPattern,
       // The position's shift. null only where the company has no shifts at all.
       defaultShift: p.default_shift_id
-        ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null }
+        ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null, summary: summaryFromRow(p, 'shift_') }
         : null,
       // Retired: machines are departments. Always empty, kept so a client
       // written before the change still finds an array.
@@ -735,7 +737,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
               d.id AS department_id, d.name AS department_name, d.code AS department_code,
               d.department_type, d.is_shared AS department_is_shared,
               l.id AS location_id, l.name AS location_name,
-              s.id AS shift_id, s.code AS shift_code, s.name AS shift_name
+              s.id AS shift_id, s.code AS shift_code, s.name AS shift_name, ${SHIFT_SUMMARY_COLUMNS_SQL('s')}
          FROM hrms_positions p
          LEFT JOIN hrms_roles       r ON r.company_id = p.company_id AND r.id = p.role_id
          LEFT JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
@@ -780,7 +782,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     // The other chairs of this card, each with its shift and whoever is in it.
     siblingIds.length
       ? db.query(
-        `SELECT p.id, p.position_code, s.id AS shift_id, s.code AS shift_code, s.name AS shift_name,
+        `SELECT p.id, p.position_code, s.id AS shift_id, s.code AS shift_code, s.name AS shift_name, ${SHIFT_SUMMARY_COLUMNS_SQL('s')},
                 wa.id AS assignment_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code,
                 ${NOTICE_COLUMNS_SQL('x')}
            FROM hrms_positions p
@@ -808,7 +810,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     siblings.push({
       positionId: r.id,
       positionCode: r.position_code ?? null,
-      shift: r.shift_id ? { id: r.shift_id, code: r.shift_code ?? null, name: r.shift_name ?? null } : null,
+      shift: r.shift_id ? { id: r.shift_id, code: r.shift_code ?? null, name: r.shift_name ?? null, summary: summaryFromRow(r, 'shift_') } : null,
       occupant: inIt ? { employeeId: inIt.employee_id, name: inIt.full_name, notice: noticeOf(inIt, asOf) } : null,
       hiring: hiringByPosition.get(r.id) ?? null,
       joining: siblingPeople.joining.get(r.id) ?? null,
@@ -830,7 +832,9 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
   }
 
   // The resolved formal set and the role's content, both through their one owner.
-  const [reporting, roleContent, overrides] = await Promise.all([
+  const [leavePolicy, reporting, roleContent, overrides] = await Promise.all([
+    // Which leave policy applies here: role, else location, else company (the one resolution).
+    effectiveFor(db, companyId, { roleId: head.role_id, locationId: head.location_id }),
     resolvePositionReporting(db, companyId, positionId, { on: asOf }),
     position.role_id ? getRoleContent(db, companyId, position.role_id, { on: asOf }) : null,
     listPositionOverrides(db, companyId, positionId),
@@ -840,7 +844,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
   const shiftPattern = seatShiftPattern(head.shift_code);
   const sanctionedHeadcount = SEATS_PER_POSITION;
   const effectiveSanctioned = SEATS_PER_POSITION;
-  const shift = head.shift_id ? { id: head.shift_id, code: head.shift_code ?? null, name: head.shift_name ?? null } : null;
+  const shift = head.shift_id ? { id: head.shift_id, code: head.shift_code ?? null, name: head.shift_name ?? null, summary: summaryFromRow(head, 'shift_') } : null;
 
   const occupants = occupantRows.map((o) => {
     const a = attendance.get(o.employee_id) ?? null;
@@ -958,6 +962,8 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     hiring: hiringByPosition.get(head.id) ?? null,
     // Who is due to join it from a later date, or null.
     joining: joiningByPosition.get(head.id) ?? null,
+    // { policy, from: ROLE | LOCATION | COMPANY | null, line }
+    leavePolicy,
     // "Hire a replacement": the person in it is on notice and nobody is lined up yet.
     canHireReplacement: occupants.some((o) => o.notice) && !hiringByPosition.get(head.id) && !joiningByPosition.get(head.id) && head.status !== 'CLOSED',
     kras: content.kras.map(contentItem),

@@ -341,6 +341,37 @@ CREATE TABLE IF NOT EXISTS hrms_contractors (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
+-- ----- 1d-2. Holiday calendars — BEFORE shifts and holidays, which point at it --
+-- Added 2026-10-11 (CF_HRMS_HIRING_SPEC.md §6). A holiday calendar is a named
+-- list of dated holidays (hrms_holidays.calendar_id, §1f). A shift selects one
+-- (hrms_shifts.holiday_calendar_id, §1e); several shifts may share one. A new
+-- calendar starts empty — nothing here invents a list of holidays.
+--
+-- It sits here, above both tables that reference it, because this file builds by
+-- ORDER. An existing database gets the two referencing columns from section 10d.
+
+CREATE TABLE IF NOT EXISTS hrms_holiday_calendars (
+  id           INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  name         VARCHAR(150) NOT NULL,
+  description  VARCHAR(500) NULL,
+  status       VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE | INACTIVE
+
+  deleted_at   DATETIME     DEFAULT NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT          NULL,
+
+  name_active  VARCHAR(150) GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hhcl_tenant (company_id, id),
+  UNIQUE KEY uq_hhcl_name   (company_id, name_active),
+
+  CONSTRAINT fk_hhcl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hhcl_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
 -- ----- 1e. Shifts — CREATED EARLY ON PURPOSE --------------------------------
 -- Positions (1.4) and Work Assignments (1.6) both carry default_shift_id, and
 -- the spec calls those "deferred FK" because it assumed a migration per table.
@@ -356,6 +387,14 @@ CREATE TABLE IF NOT EXISTS hrms_contractors (
 -- crosses_midnight is stored rather than derived from end_time < start_time,
 -- because a shift with NULL times can still be a night shift by policy, and
 -- because the attendance service must not re-derive a wall-clock rule per read.
+--
+-- SINCE 2026-10-11 A SHIFT'S HOURS ARE PER DAY OF THE WEEK (hrms_shift_days,
+-- §1e-2, seven rows per shift). The three columns above stay and MIRROR the
+-- first working day that has hours, so everything written before keeps reading
+-- a shift the way it did. `week_summary` is the same idea for the one line a
+-- position shows under its shift ("Mon–Sat 08:00–20:00"): organisationService
+-- writes it whenever it writes the days, so no read needs the day rows for it.
+-- `holiday_calendar_id` is the calendar the shift observes; NULL = no holidays.
 
 CREATE TABLE IF NOT EXISTS hrms_shifts (
   id                 INT          AUTO_INCREMENT PRIMARY KEY,
@@ -368,6 +407,8 @@ CREATE TABLE IF NOT EXISTS hrms_shifts (
   grace_in_minutes   INT          NOT NULL DEFAULT 0,
   grace_out_minutes  INT          NOT NULL DEFAULT 0,
   status             ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+  holiday_calendar_id INT         NULL,              -- the calendar this shift observes; NULL = no holidays
+  week_summary       VARCHAR(200) NULL,              -- "Mon–Sat 08:00–20:00", kept in step with hrms_shift_days
 
   deleted_at         DATETIME     DEFAULT NULL,
   created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -379,9 +420,50 @@ CREATE TABLE IF NOT EXISTS hrms_shifts (
   UNIQUE KEY uq_hshf_tenant (company_id, id),
   UNIQUE KEY uq_hshf_code   (company_id, code_active),
   KEY idx_hshf_status (company_id, status),
+  KEY idx_hshf_calendar (company_id, holiday_calendar_id),
 
-  CONSTRAINT fk_hshf_company FOREIGN KEY (company_id) REFERENCES companies(id),
-  CONSTRAINT fk_hshf_creator FOREIGN KEY (created_by) REFERENCES users(id)
+  CONSTRAINT fk_hshf_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hshf_calendar FOREIGN KEY (company_id, holiday_calendar_id) REFERENCES hrms_holiday_calendars(company_id, id),
+  CONSTRAINT fk_hshf_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 1e-2. Shift days — a shift's hours, per day of the week ---------------
+-- Added 2026-10-11 (spec §6). SEVEN ROWS PER SHIFT, ALWAYS: weekday 1 = Monday
+-- … 7 = Sunday. A day is working or not; a working day has a start, an end and
+-- a break, or — the flexible shift — none of them.
+--
+-- `crosses_midnight` is derived on write (the end is at or before the start:
+-- 20:00–08:00) and stored for the same reason it is on hrms_shifts.
+--
+-- A row is updated in place — there is one per weekday for good — so the unique
+-- key is plainly on (shift, weekday). The rule that there are seven, that a
+-- working day has both times or neither, and that a break is shorter than the
+-- day lives in organisationService.js; services/shiftRead.js fills a weekday
+-- that has no row when it reads, so a shift is never shown with fewer than seven.
+
+CREATE TABLE IF NOT EXISTS hrms_shift_days (
+  id               INT         AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT         NOT NULL,
+  shift_id         INT         NOT NULL,
+  weekday          TINYINT     NOT NULL,              -- 1 = Monday … 7 = Sunday
+  is_working       TINYINT(1)  NOT NULL DEFAULT 1,
+  start_time       TIME        NULL,                  -- NULL on a working day = no fixed hours
+  end_time         TIME        NULL,
+  crosses_midnight TINYINT(1)  NOT NULL DEFAULT 0,
+  break_minutes    INT         NOT NULL DEFAULT 0,
+
+  deleted_at       DATETIME    DEFAULT NULL,
+  created_at       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by       INT         NULL,
+
+  UNIQUE KEY uq_hshd_tenant (company_id, id),
+  UNIQUE KEY uq_hshd_day    (company_id, shift_id, weekday),
+
+  CONSTRAINT fk_hshd_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hshd_shift   FOREIGN KEY (company_id, shift_id) REFERENCES hrms_shifts(company_id, id),
+  CONSTRAINT fk_hshd_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
@@ -394,6 +476,11 @@ CREATE TABLE IF NOT EXISTS hrms_shifts (
 -- `location_key` exists only so the unique index can treat "company-wide" as a
 -- single value: MySQL does not compare NULLs in a unique index, so without it
 -- a company-wide holiday could be inserted twice.
+--
+-- SINCE 2026-10-11 A HOLIDAY BELONGS TO A CALENDAR (`calendar_id`, §1d-2), and
+-- the uniqueness is per calendar: 15 August may be in two calendars, and once
+-- in each. The key is uq_hhol_calday; the old one (uq_hhol_day, a date once per
+-- company) is retired by section 10d on a database that still has it.
 
 CREATE TABLE IF NOT EXISTS hrms_holidays (
   id           INT          AUTO_INCREMENT PRIMARY KEY,
@@ -402,6 +489,7 @@ CREATE TABLE IF NOT EXISTS hrms_holidays (
   holiday_date DATE         NOT NULL,
   name         VARCHAR(200) NOT NULL,
   is_optional  TINYINT(1)   NOT NULL DEFAULT 0,
+  calendar_id  INT          NULL,                   -- the calendar it is in
 
   deleted_at   DATETIME     DEFAULT NULL,
   created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
@@ -412,10 +500,11 @@ CREATE TABLE IF NOT EXISTS hrms_holidays (
   date_active  DATE         GENERATED ALWAYS AS (IF(deleted_at IS NULL, holiday_date, NULL)) VIRTUAL,
 
   UNIQUE KEY uq_hhol_tenant (company_id, id),
-  UNIQUE KEY uq_hhol_day    (company_id, location_key, date_active),
+  UNIQUE KEY uq_hhol_calday (company_id, calendar_id, location_key, date_active),
   KEY idx_hhol_date (company_id, holiday_date),
 
   CONSTRAINT fk_hhol_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hhol_calendar FOREIGN KEY (company_id, calendar_id) REFERENCES hrms_holiday_calendars(company_id, id),
   CONSTRAINT fk_hhol_location FOREIGN KEY (company_id, location_id) REFERENCES hrms_locations(company_id, id),
   CONSTRAINT fk_hhol_creator  FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -2126,8 +2215,11 @@ CREATE TABLE IF NOT EXISTS hrms_attendance_regularizations (
 -- `unit` DAY / HALF_DAY / HOUR decides what `quantity` on a request MEANS, and
 -- what a balance counts in. Mixing units inside one type is how balances become
 -- unauditable, so the unit is on the type and never on the request.
--- `annual_entitlement` is the simple V1 accrual: a number per period, no policy
--- engine. Accrual rules, carry-forward and encashment are explicitly out of V1.
+-- `annual_entitlement` IS NO LONGER READ (2026-10-11). It was the simple V1
+-- accrual — a number per period — before leave policies existed. How much of a
+-- leave type somebody gets, how it is earned, what carries forward and what is
+-- paid out now live in the POLICY RULE (section 13, hrms_leave_policy_rules).
+-- The column stays, because this file has no DROPs; nothing writes or reads it.
 
 CREATE TABLE IF NOT EXISTS hrms_leave_types (
   id                 INT           AUTO_INCREMENT PRIMARY KEY,
@@ -2900,4 +2992,225 @@ CREATE TABLE IF NOT EXISTS hrms_employee_exits (
   CONSTRAINT fk_hexi_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
   CONSTRAINT fk_hexi_creator  FOREIGN KEY (created_by) REFERENCES users(id),
   CONSTRAINT fk_hexi_closer   FOREIGN KEY (closed_by)  REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 10d. RETROFITS for shifts by weekday and holiday calendars (2026-10-11)  ##
+-- ############################################################################
+-- At the END of the file, like every retrofit (see section 10): each statement
+-- below alters a table created far above it, and a guarded ALTER above its
+-- CREATE is what once stopped this file at 35 of 46 tables.
+--
+-- Declared in the CREATEs (§1e, §1f) AND here, for the reason §10b gives: the
+-- CREATE reaches a new database, this reaches the ones that already exist. On a
+-- database built from this file every guard below is false and nothing runs.
+--
+-- One change per ALTER (TiDB has refused a multi-clause one). The one DROP is of
+-- an INDEX, guarded, after its replacement exists: uq_hhol_day allowed a date
+-- once per company, and a date must now be allowed once per CALENDAR. No data is
+-- touched by it.
+--
+-- NOT HERE: the rows. Seven day rows for every existing shift, their summary
+-- line, and a "Company holidays" calendar for holidays that have none are
+-- written by scripts/apply-shift-calendar-schema.mjs (existing databases) and by
+-- seed.sql (the shifts it seeds). This file is the schema.
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_shifts' AND COLUMN_NAME = 'holiday_calendar_id');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_shifts ADD COLUMN holiday_calendar_id INT NULL AFTER status', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_shifts' AND COLUMN_NAME = 'week_summary');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_shifts ADD COLUMN week_summary VARCHAR(200) NULL AFTER holiday_calendar_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_shifts' AND INDEX_NAME = 'idx_hshf_calendar');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_shifts ADD KEY idx_hshf_calendar (company_id, holiday_calendar_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_shifts' AND CONSTRAINT_NAME = 'fk_hshf_calendar');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_shifts ADD CONSTRAINT fk_hshf_calendar FOREIGN KEY (company_id, holiday_calendar_id) REFERENCES hrms_holiday_calendars(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_holidays' AND COLUMN_NAME = 'calendar_id');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_holidays ADD COLUMN calendar_id INT NULL AFTER is_optional', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_holidays' AND INDEX_NAME = 'uq_hhol_calday');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_holidays ADD UNIQUE KEY uq_hhol_calday (company_id, calendar_id, location_key, date_active)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_holidays' AND CONSTRAINT_NAME = 'fk_hhol_calendar');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_holidays ADD CONSTRAINT fk_hhol_calendar FOREIGN KEY (company_id, calendar_id) REFERENCES hrms_holiday_calendars(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_holidays' AND INDEX_NAME = 'uq_hhol_day');
+SET @sql = IF(@c > 0, 'ALTER TABLE hrms_holidays DROP INDEX uq_hhol_day', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 13. LEAVE POLICIES (CF_HRMS_HIRING_SPEC.md §8, 2026-10-11)               ##
+-- ############################################################################
+-- A LEAVE TYPE is a company-wide name (hrms_leave_types, §8a). How much of it
+-- somebody gets, how it is earned and what happens to what is left over is a
+-- LEAVE POLICY: a named, standalone set of rules, one rule per leave type it
+-- grants. A policy belongs to no role and no location by itself — it is
+-- ASSIGNED, at three levels, and the most specific wins:
+--
+--     company default  ->  location  ->  role
+--
+-- A position's policy is its role's assignment, else its location's, else the
+-- company default, else none. That resolution has ONE implementation
+-- (services/leavePolicyRead.js); nothing else re-derives it.
+--
+-- hrms_leave_types.annual_entitlement (§8a) IS NO LONGER READ: the quantity of
+-- a leave type lives in the policy rule now. The column stays — no DROPs in
+-- this file — and nothing writes or reads it.
+--
+-- This round defines policies and where they apply. Balances, accrual runs,
+-- applying for leave and approvals are not built on them yet (§8b, §8c are the
+-- older tables for those and are untouched).
+--
+-- All three tables are new: CREATE TABLE IF NOT EXISTS reaches old and new
+-- databases alike. basis / accrual / carry_forward / applies_to / status / scope
+-- are VARCHAR, validated by services/leavePolicyService.js.
+
+
+-- ----- 13a. Leave policies ---------------------------------------------------
+-- status DRAFT | ACTIVE | ARCHIVED. Only an ACTIVE policy can be assigned, and
+-- an assigned policy cannot be archived or put back to draft (the service says
+-- where it is used) — so every assignment always points at an ACTIVE policy.
+-- year_starts_month: 1 = January to December, 4 = April to March.
+
+CREATE TABLE IF NOT EXISTS hrms_leave_policies (
+  id                INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT           NOT NULL,
+  code              VARCHAR(50)   NULL,
+  name              VARCHAR(150)  NOT NULL,
+  description       VARCHAR(1000) NULL,
+  year_starts_month TINYINT       NOT NULL DEFAULT 1,
+  status            VARCHAR(20)   NOT NULL DEFAULT 'DRAFT',
+
+  deleted_at        DATETIME      DEFAULT NULL,
+  created_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT           NULL,
+
+  code_active       VARCHAR(50)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(code), NULL)) VIRTUAL,
+  name_active       VARCHAR(150)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlpo_tenant (company_id, id),
+  UNIQUE KEY uq_hlpo_code   (company_id, code_active),
+  UNIQUE KEY uq_hlpo_name   (company_id, name_active),
+  KEY idx_hlpo_status (company_id, status),
+
+  CONSTRAINT fk_hlpo_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hlpo_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 13b. Leave policy rules -----------------------------------------------
+-- One rule per (policy, leave type). A policy's rules are saved as a SET: the
+-- editor sends all of them and the service replaces the set in one transaction,
+-- so a policy is never half-changed. That is why the unique key is plain and a
+-- rule has no life of its own (its id changes on a save).
+--
+--   basis     PER_YEAR          `days` a year
+--             PER_EVENT         `days` each time it happens (maternity, bereavement)
+--             UNLIMITED_UNPAID  no quantity (leave without pay)
+--   accrual   UPFRONT           all at the start of the year
+--             MONTHLY           days / 12 each month
+--             PER_DAYS_WORKED   one day for every `days_worked_per_leave_day` days worked
+--             ON_REQUEST        granted when it happens
+--             EARNED_BY_WORK    credited when a holiday or weekly off is worked (compensatory off)
+--   carry_forward  NONE | CAPPED (`carry_forward_cap_days`) | ALL
+--   applies_to     ANYONE | WOMEN | MEN
+-- A column that does not apply to the rule's basis and accrual is stored NULL
+-- (or 0): the service clears what a combination makes meaningless, so no reader
+-- has to ask whether a stale number counts.
+
+CREATE TABLE IF NOT EXISTS hrms_leave_policy_rules (
+  id                        INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id                INT           NOT NULL,
+  policy_id                 INT           NOT NULL,
+  leave_type_id             INT           NOT NULL,
+  sort_order                INT           NOT NULL DEFAULT 0,
+  basis                     VARCHAR(20)   NOT NULL DEFAULT 'PER_YEAR',
+  days                      DECIMAL(6,2)  NULL,
+  accrual                   VARCHAR(20)   NOT NULL DEFAULT 'UPFRONT',
+  days_worked_per_leave_day INT           NULL,
+  prorate_on_joining        TINYINT(1)    NOT NULL DEFAULT 0,
+  allowed_in_probation      TINYINT(1)    NOT NULL DEFAULT 1,
+  wait_days_after_joining   INT           NOT NULL DEFAULT 0,
+  carry_forward             VARCHAR(20)   NOT NULL DEFAULT 'NONE',
+  carry_forward_cap_days    DECIMAL(6,2)  NULL,
+  encashable                TINYINT(1)    NOT NULL DEFAULT 0,
+  encash_cap_days           DECIMAL(6,2)  NULL,
+  max_days_at_once          DECIMAL(6,2)  NULL,
+  min_notice_days           INT           NOT NULL DEFAULT 0,
+  half_day_allowed          TINYINT(1)    NOT NULL DEFAULT 0,
+  count_days_off_between    TINYINT(1)    NOT NULL DEFAULT 0,
+  proof_after_days          DECIMAL(6,2)  NULL,                 -- NULL = never
+  applies_to                VARCHAR(20)   NOT NULL DEFAULT 'ANYONE',
+  max_times_in_service      INT           NULL,                 -- NULL = no limit
+  expires_after_days        INT           NULL,
+  negative_balance_allowed  TINYINT(1)    NOT NULL DEFAULT 0,
+  notes                     VARCHAR(500)  NULL,
+
+  deleted_at                DATETIME      DEFAULT NULL,         -- never set; a rule is replaced with its set
+  created_at                TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at                TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by                INT           NULL,
+
+  UNIQUE KEY uq_hlpr_tenant (company_id, id),
+  UNIQUE KEY uq_hlpr_type   (company_id, policy_id, leave_type_id),
+  KEY idx_hlpr_leave_type (company_id, leave_type_id),
+
+  CONSTRAINT fk_hlpr_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hlpr_policy  FOREIGN KEY (company_id, policy_id)     REFERENCES hrms_leave_policies(company_id, id),
+  CONSTRAINT fk_hlpr_type    FOREIGN KEY (company_id, leave_type_id) REFERENCES hrms_leave_types(company_id, id),
+  CONSTRAINT fk_hlpr_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ----- 13c. Leave policy assignments -------------------------------------------
+-- Where a policy applies. scope COMPANY (both ids NULL), LOCATION (location_id)
+-- or ROLE (role_id). ONE LIVE ROW PER TARGET is a database guarantee:
+-- `target_key` is 'COMPANY:0', 'LOCATION:<id>' or 'ROLE:<id>' while the row is
+-- live and NULL once it is removed.
+
+CREATE TABLE IF NOT EXISTS hrms_leave_policy_assignments (
+  id           INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  scope        VARCHAR(20)  NOT NULL,                 -- COMPANY | LOCATION | ROLE
+  location_id  INT          NULL,
+  role_id      INT          NULL,
+  policy_id    INT          NOT NULL,
+
+  deleted_at   DATETIME     DEFAULT NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT          NULL,
+
+  target_key   VARCHAR(40)  GENERATED ALWAYS AS (
+                 IF(deleted_at IS NULL, CONCAT(scope, ':', IFNULL(location_id, IFNULL(role_id, 0))), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlpa_tenant (company_id, id),
+  UNIQUE KEY uq_hlpa_target (company_id, target_key),
+  KEY idx_hlpa_policy (company_id, policy_id),
+
+  CONSTRAINT fk_hlpa_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hlpa_policy   FOREIGN KEY (company_id, policy_id)   REFERENCES hrms_leave_policies(company_id, id),
+  CONSTRAINT fk_hlpa_location FOREIGN KEY (company_id, location_id) REFERENCES hrms_locations(company_id, id),
+  CONSTRAINT fk_hlpa_role     FOREIGN KEY (company_id, role_id)     REFERENCES hrms_roles(company_id, id),
+  CONSTRAINT fk_hlpa_creator  FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

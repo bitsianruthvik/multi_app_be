@@ -38,6 +38,9 @@ const UNIQUE_MESSAGES = {
   uq_hcon_name: 'A contractor with that name already exists.',
   uq_hshf_code: 'A shift with that code already exists.',
   uq_hhol_day: 'That date is already a holiday for this location.',
+  uq_hhol_calday: 'That date is already a holiday in this calendar.',
+  uq_hhcl_name: 'A holiday calendar with that name already exists.',
+  uq_hshd_day: 'That shift already has that day of the week.',
   uq_hrrt_code: 'A reporting relationship type with that code already exists.',
 
   uq_hkrd_code: 'A KRA with that code already exists.',

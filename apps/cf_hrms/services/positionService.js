@@ -4,6 +4,8 @@ import {
 import { computeCards, cardMembers, loadCards, chairOnShift } from './positionCards.js';
 import { openHiringsByPosition, COMING_OR_LIVE_SQL, splitComing, dayText } from './hiringRead.js';
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
+import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
+import { effectiveFor } from './leavePolicyRead.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -300,7 +302,8 @@ function shapePosition(p, people = [], hiring = null, joining = null, on = today
     // Who is due to join it from a later date, or null. Still vacant until then.
     joining: joining ?? null,
     // The position's shift, as an object and (older readers) as three flat fields.
-    shift: p.default_shift_id ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null } : null,
+    // `summary` is the shift's week in one line: "Mon–Sat 08:00–20:00" (services/shiftRead.js).
+    shift: p.default_shift_id ? { id: p.default_shift_id, code: p.shift_code ?? null, name: p.shift_name ?? null, summary: summaryFromRow(p, 'shift_') } : null,
     defaultShiftId: p.default_shift_id,
     shiftCode: p.shift_code ?? null,
     shiftName: p.shift_name ?? null,
@@ -318,7 +321,7 @@ function shapePosition(p, people = [], hiring = null, joining = null, on = today
 const POSITION_SELECT = `
   SELECT p.*, r.title AS role_title, r.role_code,
          d.name AS department_name, l.name AS location_name,
-         s.code AS shift_code, s.name AS shift_name,
+         s.code AS shift_code, s.name AS shift_name, ${SHIFT_SUMMARY_COLUMNS_SQL('s')},
          (SELECT COUNT(*) FROM hrms_position_work_contexts c
            WHERE c.company_id = p.company_id AND c.position_id = p.id AND c.deleted_at IS NULL) AS context_count,
          (SELECT COUNT(*) FROM hrms_position_reporting_relationships rr
@@ -410,7 +413,10 @@ export async function getPosition(db, companyId, id, query = {}) {
     openHiringsByPosition(db, companyId, id),
   ]);
   if (!row) throw notFound('Position');
-  return { asOf: on, position: shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id), on) };
+  // The leave policy this position falls under: its role's, else its location's, else the company's
+  // (leavePolicyRead.resolveEffective — the one resolution). One read; the list does not carry it.
+  const leavePolicy = await effectiveFor(db, companyId, { roleId: row.role_id, locationId: row.location_id });
+  return { asOf: on, position: { ...shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id), on), leavePolicy } };
 }
 
 /** The shift a new position gets when none is named: General (a code starting 'G'), else the company's first. */

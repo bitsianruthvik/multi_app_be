@@ -51,7 +51,7 @@
  */
 import { HrmsError, invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { dateText, today, requirePosition, LIVE_ON } from './positionService.js';
-import { createEmployee, createEvent, audit } from './peopleService.js';
+import { createEmployee, createEvent, audit, addDocument, deleteDocument } from './peopleService.js';
 import { createAssignment } from './assignmentService.js';
 import {
   generate as generateDocument, readDocumentFile, previewDocument, renderFromSnapshot, getDocument,
@@ -63,6 +63,7 @@ import {
   OPEN_STAGES, statusLineOf, CLOSE_REASON_GROUPS, LEGACY_CLOSE_REASONS, closeReasonCode, closeReasonLabel, closeReasonOf, closeReasonsFor,
 } from './hiringRead.js';
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf, shortDay } from './exitRead.js';
+import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import {
   LETTER_KINDS, PLACEHOLDERS, DOCX_MIME,
   letterValues, letterDate, renderLetter, inspectTemplate, builtInTemplate, builtInFileName,
@@ -275,7 +276,7 @@ const HIRING_SELECT = `
          p.position_code, p.position_title, p.role_id, p.department_id AS position_department_id,
          p.location_id AS position_location_id, p.default_shift_id, p.status AS position_status,
          r.title AS role_title, d.name AS position_department_name,
-         s.code AS shift_code, s.name AS shift_name,
+         s.code AS shift_code, s.name AS shift_name, ${SHIFT_SUMMARY_COLUMNS_SQL('s')},
          e.employee_code, e.full_name AS employee_name,
          ol.id AS has_offer_letter,
          gd.generated_at AS jd_generated_at
@@ -304,9 +305,10 @@ function shapeSummary(h, asOf) {
     roleTitle: h.role_title ?? h.position_title ?? '',
     // The position's department. What the LETTER prints is terms.departmentName.
     departmentName: h.position_department_name ?? null,
-    shift: h.default_shift_id ? { id: h.default_shift_id, code: h.shift_code ?? null, name: h.shift_name ?? null } : null,
+    shift: h.default_shift_id ? { id: h.default_shift_id, code: h.shift_code ?? null, name: h.shift_name ?? null, summary: summaryFromRow(h, 'shift_') } : null,
     candidateName: h.candidate_name ?? null,
     offerAccepted: Boolean(h.offer_accepted_on),
+    offerAcceptedOn: dateText(h.offer_accepted_on),
     proposedJoiningDate: dateText(h.proposed_joining_date),
     createdAt: stamp(h.created_at),
     updatedAt: stamp(h.updated_at),
@@ -355,6 +357,10 @@ export function readiness(h) {
       acceptOffer: h.stage === 'OFFER' && Boolean(h.has_offer_letter),
       appoint: h.stage === 'APPOINTMENT' && appoint.length === 0,
       close: open,
+      // Signed copies (spec §5.3): the candidate's signed offer once an offer letter exists — at any later
+      // stage, closed included; the signed appointment letter once the person is appointed.
+      uploadSignedOffer: Boolean(h.has_offer_letter),
+      uploadSignedAppointment: h.stage === 'DONE',
     },
   };
 }
@@ -394,6 +400,8 @@ function shapeHiring(h, letters, asOf) {
     assignmentId: h.assignment_id ?? null,
     jd: h.jd_document_id ? { documentId: h.jd_document_id, generatedAt: stamp(h.jd_generated_at) } : null,
     letters: letters.map(shapeLetter),
+    // Filled by getHiring: the signed copy of each letter, or null.
+    signed: { offer: null, appointment: null },
     ...readiness(h),
   };
 }
@@ -411,9 +419,9 @@ async function loadLetters(db, companyId, hiringId) {
     `SELECT l.id, l.kind, l.version, l.is_current, l.file_name, l.size_bytes, l.generated_at, u.name AS generated_by_name
        FROM hrms_hiring_letters l
        LEFT JOIN users u ON u.id = l.generated_by
-      WHERE l.company_id = ? AND l.hiring_id = ? AND l.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.hiring_id = ? AND l.deleted_at IS NULL AND l.kind IN (?)
       ORDER BY l.generated_at DESC, l.id DESC`,
-    [companyId, hiringId],
+    [companyId, hiringId, LETTER_KINDS],
   );
   return rows;
 }
@@ -421,6 +429,7 @@ async function loadLetters(db, companyId, hiringId) {
 export async function getHiring(db, companyId, id) {
   const h = await loadRow(db, companyId, id);
   const hiring = shapeHiring(h, await loadLetters(db, companyId, id), today());
+  hiring.signed = await loadSigned(db, companyId, id);
   // While it is open: the person on notice in the position, whom this hiring replaces. The
   // joining date must be after their last working day, so the screen is told that day.
   const leaving = OPEN_STAGES.includes(h.stage) ? (await holdersFrom(db, companyId, h.position_id, today())).find((x) => x.exit_id != null) : null;
@@ -921,12 +930,195 @@ export async function readLetterFile(db, companyId, id, letterId) {
     `SELECT l.file_name, l.mime_type, l.storage, l.compression, l.content
        FROM hrms_hiring_letters l
        JOIN hrms_hirings h ON h.company_id = l.company_id AND h.id = l.hiring_id AND h.deleted_at IS NULL
-      WHERE l.company_id = ? AND l.hiring_id = ? AND l.id = ? AND l.deleted_at IS NULL`,
-    [companyId, id, letterId],
+      WHERE l.company_id = ? AND l.hiring_id = ? AND l.id = ? AND l.deleted_at IS NULL AND l.kind IN (?)`,
+    [companyId, id, letterId, LETTER_KINDS],
   );
   if (!row) throw notFound('That letter');
   const buffer = await unpack(row, 'letter');
   return { fileName: row.file_name, mimeType: row.mime_type || DOCX_MIME, contentBase64: buffer.toString('base64') };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Signed copies (spec §5.3)
+ * ══════════════════════════════════════════════════════════════════════════
+ * The candidate's signed offer and the signed appointment letter: a PDF, a JPG
+ * or a PNG, one current file per kind, replaceable, removable.
+ *
+ * THEY LIVE IN hrms_hiring_letters, UNDER THEIR OWN KINDS — OFFER_SIGNED and
+ * APPOINTMENT_SIGNED — so no new table. Every read of the letters a hiring
+ * GENERATES names its kinds (OFFER / APPOINTMENT): a signed copy is never in
+ * `letters`, never a version of a letter, and never "the current offer letter"
+ * that lets an offer be accepted. uq_hhlt_current still allows one current row
+ * per (hiring, kind), which is the "one file per kind" rule for free.
+ *
+ * A file that is replaced or removed is soft-deleted, not kept as a version:
+ * what matters is the signed copy on file, not the scans that preceded it.
+ *
+ * UPLOADING A SIGNED OFFER DOES NOT ACCEPT THE OFFER. That stays its own step.
+ *
+ * THE SIGNED APPOINTMENT LETTER IS ALSO FILED IN THE EMPLOYEE'S DOCUMENTS
+ * (hrms_employee_documents, through peopleService.addDocument — type "Signed
+ * appointment letter"), so it is on the employee's page. The hiring's row holds
+ * that document's id in snapshot_json.employeeDocumentId; replacing the signed
+ * copy removes that document and files the new one, removing it removes the
+ * document. A copy somebody already deleted from the employee's page is simply
+ * not there to remove.
+ */
+
+const SIGNED_KINDS = { offer: 'OFFER_SIGNED', appointment: 'APPOINTMENT_SIGNED' };
+export const SIGNED_DOCUMENT_TYPE = 'Signed appointment letter';
+
+function readSignedKind(value) {
+  const key = String(value ?? '').trim().toLowerCase();
+  if (!SIGNED_KINDS[key]) throw invalid('INVALID', 'A signed copy is of the offer letter or of the appointment letter.');
+  return key;
+}
+
+/** PDF, JPG or PNG, told by the file's first bytes — not by its name or what the browser said. */
+function signedMime(buffer) {
+  if (buffer.length >= 5 && buffer.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  return null;
+}
+
+const readSnapshot = (v) => { if (v == null) return {}; if (typeof v === 'object') return v; try { return JSON.parse(v); } catch { return {}; } };
+
+const shapeSigned = (l) => ({
+  id: l.id,
+  fileName: l.file_name,
+  mimeType: l.mime_type,
+  sizeBytes: Number(l.size_bytes) || 0,
+  uploadedAt: stamp(l.generated_at),
+  uploadedByName: l.generated_by_name ?? null,
+  // Appointment only: the copy filed on the employee's page.
+  employeeDocumentId: readSnapshot(l.snapshot_json).employeeDocumentId ?? null,
+});
+
+async function signedRows(db, companyId, hiringId, { lock = false } = {}) {
+  const [rows] = await db.query(
+    `SELECT l.id, l.kind, l.version, l.file_name, l.mime_type, l.size_bytes, l.generated_at, l.snapshot_json, u.name AS generated_by_name
+       FROM hrms_hiring_letters l
+       LEFT JOIN users u ON u.id = l.generated_by
+      WHERE l.company_id = ? AND l.hiring_id = ? AND l.deleted_at IS NULL AND l.is_current = 1 AND l.kind IN (?)${lock ? ' FOR UPDATE' : ''}`,
+    [companyId, hiringId, Object.values(SIGNED_KINDS)],
+  );
+  return rows;
+}
+
+/** `signed` on a hiring: { offer: SignedMeta | null, appointment: SignedMeta | null }. */
+async function loadSigned(db, companyId, hiringId) {
+  const rows = await signedRows(db, companyId, hiringId);
+  const of = (kind) => { const r = rows.find((x) => x.kind === kind); return r ? shapeSigned(r) : null; };
+  return { offer: of(SIGNED_KINDS.offer), appointment: of(SIGNED_KINDS.appointment) };
+}
+
+/** Takes a signed copy off the hiring, and its copy off the employee's page. */
+async function retireSigned(conn, c, row, requestId) {
+  await conn.query('UPDATE hrms_hiring_letters SET is_current = 0, deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, row.id]);
+  const documentId = readSnapshot(row.snapshot_json).employeeDocumentId;
+  if (documentId) {
+    try { await deleteDocument(conn, c, documentId, requestId); } catch (e) { if (e?.code !== 'NOT_FOUND') throw e; }
+  }
+}
+
+/**
+ * PUT /hirings/:id/signed/:kind { fileName, contentBase64 } -> { hiring, signed }
+ * 422 INVALID (not a PDF / JPG / PNG, or too large to store) · 409 WRONG_STAGE.
+ */
+export async function putSigned(conn, c, id, kindParam, body = {}, requestId = null) {
+  const key = readSignedKind(kindParam);
+  const kind = SIGNED_KINDS[key];
+  const h = await loadRow(conn, c.companyId, id, { lock: true });
+  const can = readiness(h).can;
+  if (key === 'offer' && !can.uploadSignedOffer) throw wrongStage('There is no offer letter yet. Generate it first; the signed copy is of that letter.');
+  if (key === 'appointment' && !can.uploadSignedAppointment) {
+    throw wrongStage(h.stage === 'CLOSED' ? 'This hiring was closed without an appointment, so there is no appointment letter to have signed.'
+      : 'The appointment letter has not been generated yet. Its signed copy comes after that.');
+  }
+
+  const fileName = clean(body.fileName)?.slice(0, 255) ?? null;
+  const raw = body.contentBase64 ?? body.dataBase64;
+  const problems = [];
+  if (!fileName) problems.push('The file needs a name.');
+  if (!raw || typeof raw !== 'string') problems.push('No file was received.');
+  assertNoProblems(problems, 'That file cannot be saved.');
+  const base64 = raw.startsWith('data:') && raw.includes(',') ? raw.slice(raw.indexOf(',') + 1) : raw;
+  const refuse = (sentence) => invalid('INVALID', sentence, { problems: [sentence] });
+  if (base64.length / 4 * 3 > 24 * 1024 * 1024) throw refuse('That file is over the 24 MB upload limit.');
+  const buffer = Buffer.from(base64, 'base64');
+  if (!buffer.length) throw refuse('That file is empty.');
+  const mimeType = signedMime(buffer);
+  if (!mimeType) throw refuse('A signed copy is a PDF, a JPG or a PNG. Scan or photograph the signed letter and upload that.');
+  let packed;
+  try {
+    packed = await packForStorage(buffer, MAX_DOCUMENT_STORED_BYTES, 'signed copy');
+  } catch (e) {
+    // documentStorage's own sentence — both sizes and the limit — as this route's 422.
+    if (e?.code === 'FILE_TOO_LARGE') throw refuse(e.message);
+    throw e;
+  }
+
+  // One current file per kind: the one before it goes, with its copy on the employee's page.
+  const before = (await signedRows(conn, c.companyId, id, { lock: true })).find((r) => r.kind === kind) ?? null;
+  if (before) await retireSigned(conn, c, before, requestId);
+
+  // The signed appointment letter is also filed under the employee's documents.
+  let employeeDocumentId = null;
+  if (key === 'appointment' && h.employee_id) {
+    const filed = await addDocument(conn, c, h.employee_id, {
+      documentType: SIGNED_DOCUMENT_TYPE,
+      title: `${SIGNED_DOCUMENT_TYPE}${h.ref_no ? ` — ${h.ref_no}` : ''}`,
+      fileName,
+      mimeType,
+      dataBase64: base64,
+      issueDate: dateText(h.appointment_date),
+      notes: 'Filed from the hiring. Replace or remove it there.',
+    }, requestId);
+    employeeDocumentId = filed.id;
+  }
+
+  const [[last]] = await conn.query(
+    'SELECT COALESCE(MAX(version), 0) AS v FROM hrms_hiring_letters WHERE company_id = ? AND hiring_id = ? AND kind = ?', [c.companyId, id, kind]);
+  const [ins] = await conn.query(
+    `INSERT INTO hrms_hiring_letters
+       (company_id, hiring_id, kind, version, is_current, file_name, mime_type, size_bytes, storage, compression, content,
+        snapshot_json, generated_by, created_by)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, id, kind, Number(last.v) + 1, fileName, mimeType, packed.sizeBytes, packed.storage, packed.compression, packed.content,
+      JSON.stringify({ signed: true, employeeDocumentId }), c.userId, c.userId],
+  );
+  await audit(conn, c, 'hrms_hiring_letters', ins.insertId, 'CREATE', before ? { replaced: before.id } : null,
+    { hiringId: Number(id), kind, fileName, mimeType, sizeBytes: packed.sizeBytes, employeeDocumentId }, requestId);
+
+  const answer = await getHiring(conn, c.companyId, id);
+  return { ...answer, signed: answer.hiring.signed[key] };
+}
+
+/** GET /hirings/:id/signed/:kind/file -> { fileName, mimeType, contentBase64 } */
+export async function readSignedFile(db, companyId, id, kindParam) {
+  const kind = SIGNED_KINDS[readSignedKind(kindParam)];
+  const [[row]] = await db.query(
+    `SELECT l.file_name, l.mime_type, l.storage, l.compression, l.content
+       FROM hrms_hiring_letters l
+       JOIN hrms_hirings h ON h.company_id = l.company_id AND h.id = l.hiring_id AND h.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.hiring_id = ? AND l.kind = ? AND l.is_current = 1 AND l.deleted_at IS NULL`,
+    [companyId, id, kind],
+  );
+  if (!row) throw notFound('That signed copy');
+  const buffer = await unpack(row, 'signed copy');
+  return { fileName: row.file_name, mimeType: row.mime_type, contentBase64: buffer.toString('base64') };
+}
+
+/** DELETE /hirings/:id/signed/:kind -> { hiring } — and the copy on the employee's page with it. */
+export async function deleteSigned(conn, c, id, kindParam, requestId = null) {
+  const key = readSignedKind(kindParam);
+  await loadRow(conn, c.companyId, id, { lock: true });
+  const row = (await signedRows(conn, c.companyId, id, { lock: true })).find((r) => r.kind === SIGNED_KINDS[key]) ?? null;
+  if (!row) throw notFound('That signed copy');
+  await retireSigned(conn, c, row, requestId);
+  await audit(conn, c, 'hrms_hiring_letters', row.id, 'DELETE', { hiringId: Number(id), kind: row.kind, fileName: row.file_name }, null, requestId);
+  return getHiring(conn, c.companyId, id);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1108,5 +1300,5 @@ export default {
   HIRING_STAGES, CLOSE_REASONS, readiness,
   getSettings, updateSettings, listTemplates, putTemplate, readTemplateFile, listPlaceholders,
   listHirings, getHiring, startHiring, confirmJd, readJdFile, jdPreview, jdReadiness, listCloseReasons, updateHiring,
-  generateOfferLetter, acceptOffer, readLetterFile, appoint, closeHiring,
+  generateOfferLetter, acceptOffer, readLetterFile, appoint, closeHiring, putSigned, readSignedFile, deleteSigned,
 };

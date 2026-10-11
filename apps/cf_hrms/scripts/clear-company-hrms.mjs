@@ -55,7 +55,10 @@ const MAX_BACKUP_AGE_MIN = 120;
  * second reason: a template's bytes are a blob, which a JSON backup cannot put
  * back. Hirings and their letters are data and are cleared with the rest.
  */
-const KEEP = new Set(['hrms_shifts', 'hrms_reporting_relationship_types', 'hrms_letter_templates', 'hrms_hiring_settings']);
+// …and so are a shift's seven days, the holiday calendars and their holidays (2026-10-11): a shift is
+// kept, so the week and the calendar it points at are kept with it.
+const KEEP = new Set(['hrms_shifts', 'hrms_shift_days', 'hrms_holiday_calendars', 'hrms_holidays',
+  'hrms_reporting_relationship_types', 'hrms_letter_templates', 'hrms_hiring_settings']);
 
 const main = async () => {
   const slug = arg('company');

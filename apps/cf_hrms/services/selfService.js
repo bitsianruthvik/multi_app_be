@@ -55,6 +55,8 @@ import { resolveReporting, scopeSentence } from './reportingResolver.js';
 import { resolveContent } from './contentResolver.js';
 import { loadCards } from './positionCards.js';
 import { exitsForEmployees } from './exitRead.js';
+import { summaryFromRow } from './shiftRead.js';
+import { leaveOfPosition } from './leavePolicyService.js';
 
 /* ── words ──────────────────────────────────────────────────────────────── */
 
@@ -200,10 +202,11 @@ const EMPLOYEE_BY_USER = `
 const MY_ASSIGNMENTS = `
   SELECT wa.id, wa.assignment_title, wa.allocation_percent, wa.is_primary, wa.status,
          wa.effective_from, wa.effective_to, wa.role_id, wa.position_id,
+         COALESCE(p.role_id, wa.role_id) AS leave_role_id, COALESCE(wa.location_id, p.location_id) AS leave_location_id,
          r.title AS role_title, r.role_purpose,
          p.position_code, COALESCE(p.position_title, pr.title) AS position_title,
          d.name AS department_name, l.name AS location_name,
-         s.code AS shift_code, s.name AS shift_name, s.start_time, s.end_time, s.crosses_midnight
+         s.code AS shift_code, s.name AS shift_name, s.start_time, s.end_time, s.crosses_midnight, s.week_summary
     FROM hrms_work_assignments wa
     LEFT JOIN hrms_roles r ON r.company_id = wa.company_id AND r.id = wa.role_id
     LEFT JOIN hrms_positions p ON p.company_id = wa.company_id AND p.id = wa.position_id
@@ -272,7 +275,8 @@ const SELECT_PERSON_COLS = `
   wa.id AS assignment_id, wa.employee_id, wa.assignment_title, wa.position_id, wa.is_primary AS seat_primary,
   e.employee_code, e.full_name, e.phone, e.email, e.date_of_birth, e.address_json, e.emergency_contact_json,
   r.title AS role_title, p.position_code, COALESCE(p.position_title, pr.title) AS position_title,
-  d.name AS department_name, sh.code AS shift_code, sh.name AS shift_name`;
+  d.name AS department_name, sh.code AS shift_code, sh.name AS shift_name,
+  sh.week_summary, sh.start_time, sh.end_time`;
 
 const JOIN_PERSON = `
   JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id AND e.deleted_at IS NULL
@@ -425,7 +429,7 @@ function teamMember(r, canSeePii) {
     assignmentId: r.assignment_id,
     person: otherPerson(r, canSeePii),
     departmentName: r.department_name ?? null,
-    shift: r.shift_code ? { code: r.shift_code, name: r.shift_name } : null,
+    shift: r.shift_code ? { code: r.shift_code, name: r.shift_name, summary: summaryFromRow(r) } : null,
     relationshipType: { code: r.type_code, name: r.type_name, isFormal: Boolean(r.is_formal) },
     lineStyle: r.is_formal ? 'SOLID' : 'DOTTED',
     isPrimary: Boolean(r.is_primary),
@@ -591,6 +595,8 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
         ? {
           code: a.shift_code,
           name: a.shift_name,
+          // The shift's week in one line: "Mon–Sat 08:00–20:00".
+          summary: summaryFromRow(a),
           // The general shift has no times on purpose (seed.sql §6), so this
           // is null for staff and a real window for the plant's D and N.
           startTime: a.start_time == null ? null : String(a.start_time).slice(0, 5),
@@ -708,11 +714,15 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
   const primarySeat = seats.find((s) => s.isPrimary) ?? seats[0] ?? null;
   // Their own notice, when they are on one: it is their record.
   const exit = (await exitsForEmployees(db, companyId, [employee.id])).get(employee.id) ?? null;
+  // "Your leave": the policy their primary position falls under, with its rules in words. It is theirs to read.
+  const primaryAssignment = assignments.find((a) => a.is_primary) ?? assignments[0] ?? null;
+  const leavePolicy = await leaveOfPosition(db, companyId, { roleId: primaryAssignment?.leave_role_id ?? null, locationId: primaryAssignment?.leave_location_id ?? null });
 
   return {
     asOf,
     linked: true,
     exit,
+    leavePolicy,
 
     me: {
       employeeId: employee.id,

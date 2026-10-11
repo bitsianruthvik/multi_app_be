@@ -37,10 +37,13 @@
  * and it audits every unmasked read.
  */
 import { Router } from 'express';
-import { pool } from '../lib/db.js';
-import { PERM, guard, handle, ctx, dateParam, canSeePii } from '../lib/http.js';
+import { pool, withTransaction } from '../lib/db.js';
+import { PERM, guard, handle, ctx, dateParam, canSeePii, intParam } from '../lib/http.js';
 import { myPlace } from '../services/selfService.js';
 import { myOrgChart } from '../services/selfOrgChartService.js';
+import {
+  teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
+} from '../services/teamScopeService.js';
 
 const router = Router();
 
@@ -68,5 +71,36 @@ router.get('/user/me/orgchart', guard(PERM.selfView), handle((req) => myOrgChart
   ctx(req),
   { on: dateParam(req.query.on) },
 )));
+
+/**
+ * WHAT AN EMPLOYEE LOGIN MAY CHANGE (spec §7): for the positions BELOW them —
+ * and for no other — the position's responsibilities and KPIs, and its shift.
+ *
+ *   GET    /user/me/team/positions/:id/job-content            = GET  /positions/:id/job-content
+ *   POST   /user/me/team/positions/:id/job-content/add        = POST /positions/:id/job-content/add
+ *   POST   /user/me/team/positions/:id/job-content/change       …/change
+ *   POST   /user/me/team/positions/:id/job-content/switch-off   …/switch-off
+ *   POST   /user/me/team/positions/:id/job-content/undo         …/undo
+ *   GET    /user/me/team/shifts                               { shifts: [{ id, code, name, summary }] }
+ *   PUT    /user/me/team/positions/:id/shift  { shiftId }     = PUT  /positions/:id with defaultShiftId only
+ *
+ * Gated on the one self tag, like everything in this file — and then on THE
+ * RULE, which services/teamScopeService.js runs on every call from the
+ * caller's own employee and position (never from anything the client sends):
+ * outside it, 403 NOT_YOUR_TEAM. Each write calls the same service function the
+ * HR route calls, so validation, the KRA refusal and the audit row are the same.
+ */
+const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
+const positionId = (req) => intParam(req.params.id);
+
+router.get('/user/me/team/shifts', guard(PERM.selfView), handle((req) => teamShifts(pool, ctx(req))));
+router.get('/user/me/team/positions/:id/job-content', guard(PERM.selfView), handle((req) => (
+  teamJobContent(pool, ctx(req), positionId(req), { on: dateParam(req.query.on) })
+)));
+router.post('/user/me/team/positions/:id/job-content/add', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamAddLine(db, c, positionId(req), req.body ?? {}))));
+router.post('/user/me/team/positions/:id/job-content/change', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeLine(db, c, positionId(req), req.body ?? {}))));
+router.post('/user/me/team/positions/:id/job-content/switch-off', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamSwitchOffLine(db, c, positionId(req), req.body ?? {}))));
+router.post('/user/me/team/positions/:id/job-content/undo', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamUndoLine(db, c, positionId(req), req.body ?? {}))));
+router.put('/user/me/team/positions/:id/shift', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeShift(db, c, positionId(req), req.body ?? {}))));
 
 export default router;

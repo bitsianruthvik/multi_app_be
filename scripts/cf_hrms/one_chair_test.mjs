@@ -411,8 +411,8 @@ try {
     ok(s1.edges.some((e) => e.fromPositionId === w1.id && e.toPositionId === mgr2.id), 'the night operator\'s line to the night chair is in the slice');
     ok(s1.nodes.length === 8 && s1.counts.sameCard === 1 && s1.counts.reports === 5 && s1.counts.managers === 1, 'nothing beyond the fixture branch is in it',
       `${s1.nodes.length} nodes ${JSON.stringify(s1.counts)}`);
-    const NODE_KEYS = 'cardId,contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
-    ok(s1.nodes.every((n) => Object.keys(n).sort().join(',') === NODE_KEYS), 'the whitelist is the old one plus cardId', Object.keys(s1.nodes[0]).sort().join(','));
+    const NODE_KEYS = 'canEdit,cardId,contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
+    ok(s1.nodes.every((n) => Object.keys(n).sort().join(',') === NODE_KEYS), 'the whitelist is the old one plus cardId, and canEdit (spec §7, 2026-10-11)', Object.keys(s1.nodes[0]).sort().join(','));
     ok(s1.nodes.every((n) => n.occupants.every((o) => Object.keys(o).sort().join(',') === 'isMe,name,sameAs,shiftCode')), 'occupants still carry no ids');
     const place = await myPlace(db, { companyId: COMPANY, userId: freeUser.id }, {});
     const reportNames = place.reports.map((r) => r.person.name);

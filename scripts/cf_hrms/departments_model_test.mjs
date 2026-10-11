@@ -100,7 +100,8 @@ if (chart.nodes.length) {
 const [linked] = await pool.query(
   'SELECT e.id, e.user_id, e.full_name FROM hrms_employees e WHERE e.company_id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL', [companyId]);
 // cardId joined the whitelist on 2026-10-10 (one chair per position; chairs are drawn in cards).
-const NODE_KEYS = 'cardId,contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
+// canEdit joined on 2026-10-11 (what a login may change in its own team, CF_HRMS_HIRING_SPEC §7).
+const NODE_KEYS = 'canEdit,cardId,contexts,defaultShift,departmentCode,departmentId,departmentIsRoot,departmentName,departmentRank,displayTitle,effectiveSanctioned,id,locationName,occupants,positionCode,relation,requirements,roleTitle,sanctionedHeadcount,shiftPattern,title';
 if (!linked.length) skip('the employee slice', 'no employee is linked to a login (run create-employee-logins.mjs --apply)');
 else {
   let leaks = 0, dangling = 0, badKeys = 0, missing = 0, wide = 0, slices = 0, emptyCtx = 0, withShared = 0;

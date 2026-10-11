@@ -51,7 +51,7 @@ import { buildOrgChart } from './orgChartService.js';
 const PRIMARY = 'PRIMARY_MANAGER';
 
 const EMPLOYEE_ID_BY_USER = `
-  SELECT e.id
+  SELECT e.id, e.employment_status
     FROM hrms_employees e
    WHERE e.company_id = ? AND e.user_id = ? AND e.deleted_at IS NULL
    LIMIT 1`;
@@ -198,18 +198,32 @@ export function computeSlice(edges, mine, cardMates = []) {
   return { self, managers, reports, dotted, sameCard };
 }
 
-export async function myOrgChart(db, ctx, { on } = {}) {
+/**
+ * WHO I AM IN THE CHART, AND WHAT IS AROUND ME — the one computation behind
+ * both the employee's chart (myOrgChart, below) and what an employee login may
+ * change (services/teamScopeService.js, spec §7). There is no second definition
+ * of "below me": both read `relationOf` / `canChange` from here.
+ *
+ * The employee comes from the session's user id and from nothing else.
+ *
+ *   relationOf(positionId)  SELF | SAME_CARD | MANAGER | REPORT | DOTTED_MANAGER | null (not in my slice)
+ *   canChange(positionId)   true only for REPORT: a position that reports, at any
+ *                           depth, to a position of MY CARD. Never my own position,
+ *                           never the other chairs of my card, never anybody above
+ *                           me (a position that is both above and below me, in a
+ *                           loop of bad data, counts as above), never anything else.
+ *
+ * Not linked to an employee, left the company, or in no position on the date:
+ * `linked: false` with the reason, and canChange() is false for everything.
+ */
+export async function loadMySlice(db, ctx, { on } = {}) {
   const { companyId, userId } = ctx;
   const asOf = dateText(on) || today();
-
-  const empty = (reason) => ({
-    asOf, linked: false, reason, nodes: [], edges: [], departments: [], mySeatIds: [],
-    counts: { positions: 0, managers: 0, reports: 0, dotted: 0, sameCard: 0 },
-  });
+  const none = (reason) => ({ linked: false, reason, asOf, employee: null, relationOf: () => null, canChange: () => false });
 
   const [[employee]] = await db.query(EMPLOYEE_ID_BY_USER, [companyId, userId]);
   if (!employee) {
-    return empty('This login is not linked to an employee record, so there is no place in the '
+    return none('This login is not linked to an employee record, so there is no place in the '
       + 'organisation to show. An HR administrator can link it on the employee\'s record.');
   }
 
@@ -218,9 +232,7 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   const mine = graph.nodes
     .filter((n) => (n.occupants ?? []).some((o) => o.employeeId === employee.id))
     .map((n) => n.id);
-  if (!mine.length) {
-    return empty('You are not in a seat on the organisation chart on this date.');
-  }
+  if (!mine.length) return none('You are not in a seat on the organisation chart on this date.');
 
   const myCards = new Set(graph.nodes.filter((n) => mine.includes(n.id)).map((n) => n.cardId));
   const cardMates = graph.nodes.filter((n) => myCards.has(n.cardId) && !mine.includes(n.id)).map((n) => n.id);
@@ -230,8 +242,27 @@ export async function myOrgChart(db, ctx, { on } = {}) {
     if (sameCard.has(id)) return 'SAME_CARD';
     if (managers.has(id)) return 'MANAGER';
     if (reports.has(id)) return 'REPORT';
-    return 'DOTTED_MANAGER';
+    if (dotted.has(id)) return 'DOTTED_MANAGER';
+    return null;
   };
+  // Somebody who has left changes nothing, whatever a stale assignment row says.
+  const active = employee.employment_status !== 'EXITED';
+  const canChange = (id) => active && relationOf(Number(id)) === 'REPORT';
+  return { linked: true, reason: null, asOf, employee, graph, mine, self, managers, reports, dotted, sameCard, relationOf, canChange };
+}
+
+export async function myOrgChart(db, ctx, { on } = {}) {
+  const { companyId, userId } = ctx;
+  const asOf = dateText(on) || today();
+
+  const empty = (reason) => ({
+    asOf, linked: false, reason, nodes: [], edges: [], departments: [], mySeatIds: [],
+    counts: { positions: 0, managers: 0, reports: 0, dotted: 0, sameCard: 0 },
+  });
+
+  const slice = await loadMySlice(db, ctx, { on: asOf });
+  if (!slice.linked) return empty(slice.reason);
+  const { employee, graph, mine, self, managers, reports, dotted, sameCard, relationOf } = slice;
   const keep = new Set([...self, ...sameCard, ...managers, ...reports, ...dotted]);
 
   const kept = graph.nodes.filter((n) => keep.has(n.id));
@@ -240,7 +271,9 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   const sameAs = new Map();
   for (const [employeeId, seats] of seatsOf) if (seats > 1) sameAs.set(employeeId, `s${sameAs.size + 1}`);
 
-  const nodes = kept.map((n) => sliceNode(n, employee.id, relationOf(n.id), sameAs));
+  // `canEdit` (spec §7): true only for a position BELOW me — the one test, canChange(), that the
+  // /user/me/team routes run again on every write. The screen mirrors it; the server decides.
+  const nodes = kept.map((n) => ({ ...sliceNode(n, employee.id, relationOf(n.id), sameAs), canEdit: slice.canChange(n.id) }));
   const edges = graph.edges
     .filter((e) => keep.has(e.fromPositionId) && keep.has(e.toPositionId))
     .map(sliceEdge);
@@ -263,4 +296,4 @@ export async function myOrgChart(db, ctx, { on } = {}) {
   };
 }
 
-export default { myOrgChart, computeSlice, sliceDepartments };
+export default { myOrgChart, loadMySlice, computeSlice, sliceDepartments };
