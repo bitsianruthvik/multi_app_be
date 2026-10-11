@@ -14,6 +14,7 @@ import selfRoutes from './self.js';
 import importRoutes from './imports.js';
 import overviewRoutes from './overview.js';
 import hiringRoutes from './hiring.js';
+import exitRoutes from './exits.js';
 
 const router = Router();
 
@@ -116,5 +117,7 @@ router.use(importRoutes);
 router.use(overviewRoutes);
 // Hiring on a vacant position: JD -> offer -> appointment (routes/hiring.js).
 router.use(hiringRoutes);
+// Leaving: notice, and closing an employee (routes/exits.js).
+router.use(exitRoutes);
 
 export default router;

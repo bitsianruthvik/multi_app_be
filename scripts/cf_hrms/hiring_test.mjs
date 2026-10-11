@@ -56,6 +56,8 @@ import { scanParagraphs, replaceRanges, plainText } from '../../apps/cf_hrms/ser
 import { unpack } from '../../apps/cf_hrms/services/documentStorage.js';
 import { dateParts } from '../../apps/cf_hrms/services/codegenProvider.js';
 import { buildOrgChart, getPositionCard } from '../../apps/cf_hrms/services/orgChartService.js';
+import { previewDocument } from '../../apps/cf_hrms/services/documentService.js';
+import { CLOSE_REASON_GROUPS } from '../../apps/cf_hrms/services/hiringRead.js';
 import { departmentStaffing } from '../../apps/cf_hrms/services/jobContentService.js';
 import {
   buildAndVerify, verifyTemplate, LETTERS, EXPECTED, TEMPLATES_DIR, KARNI_SETTINGS,
@@ -521,14 +523,53 @@ if (vacantRows.length < 2 || !someone) {
     // ── JD ──
     ok(refused(await caught(() => HIRE.updateHiring(db, c, H, { candidateName: 'Too early' })), 409, 'WRONG_STAGE'), 'the candidate cannot be entered before the JD is confirmed (409)');
     ok(refused(await caught(() => HIRE.generateOfferLetter(db, c, H)), 409, 'WRONG_STAGE') && refused(await caught(() => HIRE.acceptOffer(db, c, H, {})), 409, 'WRONG_STAGE')
-      && refused(await caught(() => HIRE.readJdFile(db, COMPANY, H)), 404, 'NOT_FOUND'), 'no offer letter, no acceptance and no JD file before the JD is confirmed');
+      , 'no offer letter and no acceptance before the JD is confirmed');
+
+    // ── §3.3: what will go into the JD, and its file, before anything is frozen ──
+    /** A snapshot without the moment it was built — the only thing two builds a second apart differ in. */
+    // Keys sorted: MySQL stores a JSON object with its keys in its own order.
+    const sorted = (v) => (Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().filter((k) => k !== 'generatedAt').map((k) => [k, sorted(v[k])])) : v);
+    const timeless = (x) => JSON.stringify(sorted(JSON.parse(JSON.stringify(x))));   // through JSON first: a Date becomes the string it is stored as
+    const docsBefore = Number((await db.query('SELECT COUNT(*) AS n FROM hrms_generated_documents WHERE company_id = ?', [COMPANY]))[0][0].n);
+    const live = await HIRE.jdPreview(db, c, H);
+    const fromDocuments = await previewDocument(db, c, { type: 'ROLE_JD', positionId: target.id });
+    ok(JSON.stringify(Object.keys(live.preview)) === JSON.stringify(Object.keys(fromDocuments)) && timeless(live.preview) === timeless(fromDocuments)
+      && live.preview.persisted === false && live.preview.documentType === 'ROLE_JD' && live.preview.snapshot.positionContext.position.id === target.id,
+    'GET /hirings/:id/jd/preview at JD is exactly GET /documents/preview for the position’s ROLE_JD');
+    ok(live.readiness.ready === true && Array.isArray(live.readiness.missing) && live.readiness.missing.every((m) => typeof m === 'string' && !/[_{}]/.test(m))
+      && live.readiness.missing.length === live.preview.snapshot.summary.emptySections.filter((k) => !['suppressed', 'exceptions'].includes(k)).length,
+    'readiness says it can be confirmed, and names the empty sections in plain words', JSON.stringify(live.readiness));
+    const liveDocx = await HIRE.readJdFile(db, c, H);
+    const livePdf = await HIRE.readJdFile(db, c, H, 'pdf');
+    ok(/\.docx$/.test(liveDocx.fileName) && liveDocx.mimeType === LETTER.DOCX_MIME && Boolean((await JSZip.loadAsync(Buffer.from(liveDocx.contentBase64, 'base64'))).file('word/document.xml'))
+      && /\.pdf$/.test(livePdf.fileName) && livePdf.mimeType === 'application/pdf' && Buffer.from(livePdf.contentBase64, 'base64').subarray(0, 5).toString() === '%PDF-',
+    'the JD downloads as .docx and as .pdf BEFORE it is confirmed');
+    ok(Number((await db.query('SELECT COUNT(*) AS n FROM hrms_generated_documents WHERE company_id = ?', [COMPANY]))[0][0].n) === docsBefore
+      && (await HIRE.getHiring(db, COMPANY, H)).hiring.jd === null, 'and neither the preview nor the downloads stored anything');
+    ok(refused(await caught(() => HIRE.readJdFile(db, c, H, 'xlsx')), 422, 'INVALID'), 'a format that is not docx or pdf is refused');
     const jd = (await HIRE.confirmJd(db, c, H)).hiring;
     ok(jd.stage === 'OFFER' && jd.jd?.documentId > 0 && Boolean(jd.jd.generatedAt) && jd.statusLine === 'Candidate details to enter', 'confirm-jd freezes a JD and moves to OFFER', jd.statusLine);
     const [[jdRow]] = await db.query('SELECT document_type, position_id, role_id, JSON_EXTRACT(snapshot_json, "$.positionContext.position.id") AS pid FROM hrms_generated_documents WHERE company_id = ? AND id = ?', [COMPANY, jd.jd.documentId]);
     ok(jdRow.document_type === 'ROLE_JD' && jdRow.position_id === target.id && Number(jdRow.pid) === target.id, 'the frozen JD is the POSITION-level job description, made by the documents service');
-    const jdFile = await HIRE.readJdFile(db, COMPANY, H);
+    const jdFile = await HIRE.readJdFile(db, c, H);
     const jdZip = await JSZip.loadAsync(Buffer.from(jdFile.contentBase64, 'base64'));
     ok(/\.docx$/.test(jdFile.fileName) && jdFile.mimeType === LETTER.DOCX_MIME && Boolean(jdZip.file('word/document.xml')), 'GET /hirings/:id/jd/file returns it as { fileName, mimeType, contentBase64 }');
+    const frozen = await HIRE.jdPreview(db, c, H);
+    const [[stored]] = await db.query('SELECT snapshot_json FROM hrms_generated_documents WHERE company_id = ? AND id = ?', [COMPANY, jd.jd.documentId]);
+    const storedSnapshot = typeof stored.snapshot_json === 'string' ? JSON.parse(stored.snapshot_json) : stored.snapshot_json;
+    ok(frozen.preview.persisted === true && frozen.preview.documentId === jd.jd.documentId && frozen.preview.documentType === 'ROLE_JD'
+      && JSON.stringify(frozen.preview.snapshot) === JSON.stringify(storedSnapshot) && timeless(frozen.preview.snapshot) === timeless(live.preview.snapshot) && frozen.readiness.ready === true,
+    'after confirmation the preview is the FROZEN copy: the stored snapshot, which is what was previewed');
+    // The role is rewritten after the freeze: the hiring still shows what was confirmed.
+    const purposeThen = frozen.preview.snapshot.role.rolePurpose;
+    await db.query('UPDATE hrms_roles SET role_purpose = ? WHERE company_id = ? AND id = ?', [`${TAG} rewritten later`, COMPANY, target.role_id]);
+    const afterRewrite = await HIRE.jdPreview(db, c, H);
+    ok(afterRewrite.preview.snapshot.role.rolePurpose === purposeThen
+      && (await previewDocument(db, c, { type: 'ROLE_JD', positionId: target.id })).snapshot.role.rolePurpose === `${TAG} rewritten later`,
+    'rewriting the role afterwards changes the documents preview and NOT the hiring’s frozen JD');
+    await db.query('UPDATE hrms_roles SET role_purpose = ? WHERE company_id = ? AND id = ?', [purposeThen, COMPANY, target.role_id]);
+    const frozenPdf = await HIRE.readJdFile(db, c, H, 'pdf');
+    ok(Buffer.from(frozenPdf.contentBase64, 'base64').subarray(0, 5).toString() === '%PDF-' && frozenPdf.mimeType === 'application/pdf', 'the frozen JD downloads as .pdf too');
     ok(refused(await caught(() => HIRE.confirmJd(db, c, H)), 409, 'WRONG_STAGE'), 'confirming twice is refused');
 
     // ── OFFER: details ──
@@ -686,7 +727,8 @@ if (vacantRows.length < 2 || !someone) {
     ok(refused(await caught(() => HIRE.getHiring(db, OTHER, H)), 404, 'NOT_FOUND'), 'GET /hirings/:id from another company: 404');
     ok(refused(await caught(() => HIRE.readLetterFile(db, OTHER, H, done.letter.id)), 404, 'NOT_FOUND')
       && refused(await caught(() => HIRE.readLetterFile(db, OTHER, H, offer1.letter.id)), 404, 'NOT_FOUND'), 'a letter file from another company: 404');
-    ok(refused(await caught(() => HIRE.readJdFile(db, OTHER, H)), 404, 'NOT_FOUND'), 'the JD file from another company: 404');
+    ok(refused(await caught(() => HIRE.readJdFile(db, { ...c, companyId: OTHER }, H)), 404, 'NOT_FOUND') && refused(await caught(() => HIRE.jdPreview(db, { ...c, companyId: OTHER }, H)), 404, 'NOT_FOUND')
+      && refused(await caught(() => HIRE.listCloseReasons(db, OTHER, H)), 404, 'NOT_FOUND'), 'the JD file, the JD preview and the close reasons of this hiring from another company: 404');
     ok((await HIRE.listHirings(db, OTHER, {})).hirings.every((x) => x.id !== H), 'it is not in the other company’s list');
     for (const [name, fn] of [['edit', () => HIRE.updateHiring(db, { ...c, companyId: OTHER }, H, { designation: 'x' })],
       ['close', () => HIRE.closeHiring(db, { ...c, companyId: OTHER }, H, { reason: 'CANCELLED' })],
@@ -704,14 +746,25 @@ if (vacantRows.length < 2 || !someone) {
     const employeesBefore = Number((await db.query('SELECT COUNT(*) AS n FROM hrms_employees WHERE company_id = ?', [COMPANY]))[0][0].n);
     const counterBefore = await counterOf(db, 'hrms_employee');
     const H = (await HIRE.startHiring(db, c, target.id)).hiring.id;
-    ok(refused(await caught(() => HIRE.closeHiring(db, c, H, { reason: 'BORED' })), 422, 'INVALID'), 'closing needs one of the three reasons');
+    ok(refused(await caught(() => HIRE.closeHiring(db, c, H, { reason: 'BORED' })), 422, 'INVALID'), 'a reason nobody has heard of is refused');
     await HIRE.confirmJd(db, c, H);
     await HIRE.updateHiring(db, c, H, CANDIDATE);
     const ref = (await HIRE.generateOfferLetter(db, c, H)).hiring.refNo;
     const closed = (await HIRE.closeHiring(db, c, H, { reason: 'declined', note: 'Took another offer.' })).hiring;
-    ok(closed.stage === 'CLOSED' && closed.closeReason === 'DECLINED' && closed.closeNote === 'Took another offer.' && closed.refNo === ref && closed.employee === null
-      && closed.statusLine === `Offer declined by ${CANDIDATE.candidateName}` && Object.values(closed.can).every((x) => x === false),
-    'closed as DECLINED: the reference stays with it, there is no employee, nothing more is accepted', closed.statusLine);
+    ok(closed.stage === 'CLOSED' && closed.closeReason === 'OFFER_DECLINED' && closed.closeReasonLabel === 'Candidate declined the offer' && closed.closeNote === 'Took another offer.'
+      && closed.refNo === ref && closed.employee === null
+      && closed.statusLine === `${CANDIDATE.candidateName} declined the offer` && Object.values(closed.can).every((x) => x === false),
+    'closed with the OLD code "declined": stored and read as OFFER_DECLINED, with its label; the reference stays, there is no employee', closed.statusLine);
+    const inList = (await HIRE.listHirings(db, COMPANY, { status: 'closed' })).hirings.find((x) => x.id === H);
+    ok(inList.closeReason === 'OFFER_DECLINED' && inList.closeReasonLabel === 'Candidate declined the offer', 'the Closed list row carries the reason and its label');
+    // A row closed by the first release holds the old code itself.
+    await db.query("UPDATE hrms_hirings SET close_reason = 'LAPSED' WHERE id = ?", [H]);
+    const old = (await HIRE.getHiring(db, COMPANY, H)).hiring;
+    ok(old.closeReason === 'NO_RESPONSE' && old.closeReasonLabel === 'Candidate did not reply; the offer lapsed' && old.statusLine === `${CANDIDATE.candidateName} did not reply; the offer lapsed`,
+      'a hiring stored with an old code (LAPSED) READS as the new one', old.statusLine);
+    await db.query("UPDATE hrms_hirings SET close_reason = 'CANCELLED' WHERE id = ?", [H]);
+    ok((await HIRE.getHiring(db, COMPANY, H)).hiring.closeReason === 'OTHER', 'CANCELLED reads as OTHER');
+    await db.query("UPDATE hrms_hirings SET close_reason = 'OFFER_DECLINED' WHERE id = ?", [H]);
     ok(await counterOf(db, 'hrms_employee') === counterBefore
       && Number((await db.query('SELECT COUNT(*) AS n FROM hrms_employees WHERE company_id = ?', [COMPANY]))[0][0].n) === employeesBefore, 'no employee code was used and no employee row exists');
     ok(refused(await caught(() => HIRE.closeHiring(db, c, H, { reason: 'CANCELLED' })), 409, 'WRONG_STAGE') && refused(await caught(() => HIRE.appoint(db, c, H, { joiningDate: on })), 409, 'WRONG_STAGE')
@@ -729,9 +782,63 @@ if (vacantRows.length < 2 || !someone) {
     for (const stage of ['JD', 'OFFER']) {
       const other2 = (await HIRE.startHiring(db, c, vacantRows[1].id)).hiring;
       if (stage === 'OFFER') await HIRE.confirmJd(db, c, other2.id);
-      const cancelled = (await HIRE.closeHiring(db, c, other2.id, { reason: stage === 'JD' ? 'CANCELLED' : 'LAPSED' })).hiring;
-      ok(cancelled.stage === 'CLOSED' && cancelled.refNo === null && cancelled.statusLine === (stage === 'JD' ? 'Hiring cancelled' : 'Offer lapsed'), `a hiring can be closed from ${stage}`, cancelled.statusLine);
+      const cancelled = (await HIRE.closeHiring(db, c, other2.id, { reason: stage === 'JD' ? 'CANCELLED' : 'ON_HOLD' })).hiring;
+      ok(cancelled.stage === 'CLOSED' && cancelled.refNo === null && cancelled.closeReason === (stage === 'JD' ? 'OTHER' : 'ON_HOLD')
+        && cancelled.statusLine === (stage === 'JD' ? 'Hiring closed' : 'Hiring is on hold for now'),
+      `a hiring can be closed from ${stage}${stage === 'JD' ? ' — with the old code CANCELLED and no note, as the first release sent it' : ''}`, cancelled.statusLine);
     }
+
+    // ── §3.4: which reason applies when ──
+    const everything = HIRE.listCloseReasons ? (await HIRE.listCloseReasons(db, COMPANY)).groups : [];
+    const allCodes = everything.flatMap((g) => g.reasons.map((r) => r.code));
+    ok(everything.length === 2 && everything[0].label === 'The candidate' && everything[1].label === 'The company' && allCodes.length === 14
+      && allCodes.join(' ') === 'OFFER_DECLINED NO_RESPONSE DID_NOT_JOIN PAY_NOT_AGREED STAYED_WITH_EMPLOYER CANDIDATE_WITHDREW CHECKS_FAILED ANOTHER_CANDIDATE FILLED_INTERNALLY ON_HOLD NOT_NEEDED OFFER_WITHDRAWN STARTED_BY_MISTAKE OTHER',
+    'GET /hiring/close-reasons: two groups, the fourteen codes, in the spec’s order');
+    const one = (code) => everything.flatMap((g) => g.reasons).find((r) => r.code === code);
+    ok(everything.flatMap((g) => g.reasons).every((r) => JSON.stringify(Object.keys(r)) === JSON.stringify(['code', 'label', 'hint', 'noteRequired', 'next']) && r.label && r.hint)
+      && one('FILLED_INTERNALLY').next === 'MOVE_EMPLOYEE' && one('NOT_NEEDED').next === 'REMOVE_POSITION' && one('OFFER_DECLINED').next === 'REHIRE'
+      && ['ON_HOLD', 'STARTED_BY_MISTAKE', 'OTHER'].every((k) => one(k).next === null)
+      && allCodes.filter((k) => one(k).noteRequired).join(' ') === 'OFFER_WITHDRAWN OTHER',
+    'each is { code, label, hint, noteRequired, next }; a note is required for OFFER_WITHDRAWN and OTHER only');
+    ok(CLOSE_REASON_GROUPS.flatMap((g) => g.reasons).every((r) => r.code.length <= 20), 'every code fits the column');
+
+    const ANY = ['FILLED_INTERNALLY', 'ON_HOLD', 'NOT_NEEDED', 'STARTED_BY_MISTAKE', 'OTHER'];
+    const walk = (await HIRE.startHiring(db, c, vacantRows[1].id)).hiring.id;
+    /** At the hiring's present state: the list offers exactly `expected`, and a close with each of the 14 is taken or refused to match. */
+    const checkStage = async (label, expected) => {
+      const offeredNow = (await HIRE.listCloseReasons(db, COMPANY, walk)).groups.flatMap((g) => g.reasons.map((r) => r.code));
+      const wrong = [];
+      for (const code of allCodes) {
+        await db.query('SAVEPOINT try_close');
+        const e = await caught(() => HIRE.closeHiring(db, c, walk, { reason: code, note: 'because' }));
+        await db.query('ROLLBACK TO SAVEPOINT try_close');
+        const taken = e === null;
+        if (taken !== expected.includes(code) || (!taken && !refused(e, 422, 'INVALID'))) wrong.push(`${code}:${taken ? 'taken' : e.code}`);
+      }
+      ok(offeredNow.join(' ') === allCodes.filter((k) => expected.includes(k)).join(' ') && wrong.length === 0,
+        `${label}: ${expected.length} reasons are offered, and exactly those are accepted (the other ${14 - expected.length}: 422 INVALID)`, `offered ${offeredNow.join(' ')}; wrong ${wrong.join(' ')}`);
+    };
+    await checkStage('at JD', ANY);
+    await HIRE.confirmJd(db, c, walk);
+    await checkStage('at OFFER with no candidate named', [...ANY, 'PAY_NOT_AGREED', 'STAYED_WITH_EMPLOYER']);
+    await HIRE.updateHiring(db, c, walk, CANDIDATE);
+    await checkStage('candidate named, no offer letter yet', [...ANY, 'PAY_NOT_AGREED', 'STAYED_WITH_EMPLOYER', 'CANDIDATE_WITHDREW', 'CHECKS_FAILED', 'ANOTHER_CANDIDATE']);
+    await HIRE.generateOfferLetter(db, c, walk);
+    const OFFERED = [...ANY, 'PAY_NOT_AGREED', 'STAYED_WITH_EMPLOYER', 'CHECKS_FAILED', 'ANOTHER_CANDIDATE', 'OFFER_DECLINED', 'NO_RESPONSE', 'OFFER_WITHDRAWN'];
+    await checkStage('offer letter sent', OFFERED);
+    for (const code of ['OFFER_WITHDRAWN', 'OTHER']) {
+      await db.query('SAVEPOINT try_close');
+      const noNote = await caught(() => HIRE.closeHiring(db, c, walk, { reason: code, note: '  ' }));
+      await db.query('ROLLBACK TO SAVEPOINT try_close');
+      ok(refused(noNote, 422, 'INVALID') && noNote.problems.length === 1 && /note/.test(noNote.problems[0]), `${code} without a note: 422 INVALID, asking for the note`, why(noNote));
+    }
+    await HIRE.acceptOffer(db, c, walk, {});
+    await checkStage('offer accepted', [...OFFERED, 'DID_NOT_JOIN']);
+    const didNot = (await HIRE.closeHiring(db, c, walk, { reason: 'DID_NOT_JOIN' })).hiring;
+    ok(didNot.closeReason === 'DID_NOT_JOIN' && didNot.closeReasonLabel === 'Candidate accepted but did not join' && didNot.statusLine === `${CANDIDATE.candidateName} accepted but did not join`,
+      'closed after acceptance as DID_NOT_JOIN, with a status line that reads as a sentence', didNot.statusLine);
+    ok(refused(await caught(() => HIRE.listCloseReasons(db, COMPANY, 999999999)), 404, 'NOT_FOUND') && refused(await caught(() => HIRE.listCloseReasons(db, COMPANY, 'abc')), 422, 'INVALID'),
+      'close reasons for a hiring that does not exist: 404; for an id that is not a number: 422');
   });
 
   /* ══ 6. a future joining date; a failure late in the appointment ════════ */
@@ -920,6 +1027,7 @@ section('[8] Permissions and the two Code formats screens, over HTTP');
 
     const HIRING_ROUTES = [
       ['GET', '/hirings'], ['GET', '/hirings?status=open&positionId=1'], ['GET', '/hirings/1'], ['POST', '/positions/1/hiring', {}],
+      ['GET', '/hirings/1/jd/preview'], ['GET', '/hirings/1/jd/file?format=pdf'], ['GET', '/hiring/close-reasons'], ['GET', '/hiring/close-reasons?hiringId=1'],
       ['POST', '/hirings/1/confirm-jd', {}], ['PUT', '/hirings/1', { candidateName: 'x' }], ['POST', '/hirings/1/offer-letter', {}],
       ['POST', '/hirings/1/accept-offer', {}], ['POST', '/hirings/1/appoint', { joiningDate: on }], ['POST', '/hirings/1/close', { reason: 'CANCELLED' }],
       ['GET', '/hirings/1/letters/1/file'], ['GET', '/hirings/1/jd/file'], ['GET', '/hiring/settings'], ['PUT', '/hiring/settings', { offerValidDays: 9 }],

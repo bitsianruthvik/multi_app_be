@@ -291,7 +291,8 @@ async function readAssignmentBody(db, companyId, body, { partial = false, curren
     if (employeeId != null) {
       const emp = await exists(db, companyId, 'hrms_employees', employeeId, 'employee', problems);
       if (emp && emp.employment_status === 'EXITED') {
-        problems.push(`${emp.full_name} has exited. Record historical work with effective dates on an existing assignment rather than opening a new one.`);
+        // Not one problem among several: nothing about the rest of the form can make this work.
+        throw conflict('EMPLOYEE_LEFT', `${emp.full_name} has left the company and cannot be given new work.`, { detail: { employeeId } });
       }
       out.employee_id = employeeId;
     }
@@ -421,7 +422,7 @@ async function assertOnePrimary(db, companyId, employeeId, effectiveFrom, effect
  * assignment first) passes untouched. The position row is locked first, so two
  * requests seating two people in the same chair cannot both get through.
  */
-async function assertPositionFree(db, companyId, positionId, { from, to, excludeId = null }) {
+async function assertPositionFree(db, companyId, positionId, { from, to, excludeId = null, excludeIds = [] }) {
   if (positionId == null) return;
   await db.query('SELECT id FROM hrms_positions WHERE company_id = ? AND id = ? FOR UPDATE', [companyId, positionId]);
   const params = [companyId, positionId, to ?? '9999-12-31', from ?? '0001-01-01'];
@@ -435,6 +436,7 @@ async function assertPositionFree(db, companyId, positionId, { from, to, exclude
                 AND (wa.effective_from IS NULL OR wa.effective_from <= ?)
                 AND (wa.effective_to IS NULL OR wa.effective_to >= ?)`;
   if (excludeId) { sql += ' AND wa.id <> ?'; params.push(excludeId); }
+  if (excludeIds.length) { sql += ' AND wa.id NOT IN (?)'; params.push(excludeIds); }
   const [rows] = await db.query(`${sql} ORDER BY wa.effective_from, wa.id LIMIT 1`, params);
   if (!rows.length) return;
   const r = rows[0];
@@ -451,6 +453,11 @@ async function assertPositionFree(db, companyId, positionId, { from, to, exclude
  * `options.hiringId` is for hiringService alone — the hiring that is appointing
  * its own candidate. Every other caller is refused (409 HIRING_OPEN) while a
  * hiring is open on the position: the chair is promised to a candidate.
+ *
+ * `options.exceptAssignmentIds`, also hiringService's alone: the assignment of
+ * the person ON NOTICE whom the candidate replaces. It is still open-ended (it
+ * ends when their leaving is closed), so it is left out of the one-person check
+ * — hiringService has already checked the joining date is after their last day.
  */
 export async function createAssignment(db, { companyId, userId }, body, options = {}) {
   const { data, employeeId, effectiveFrom, effectiveTo } = await readAssignmentBody(db, companyId, body);
@@ -465,7 +472,9 @@ export async function createAssignment(db, { companyId, userId }, body, options 
     await endAssignment(db, { companyId }, replacesId, { effectiveTo: previousDay(data.effective_from ?? today()) });
   }
   // After the replacement was ended, so handing a chair over is one request.
-  if (data.status !== 'ENDED') await assertPositionFree(db, companyId, data.position_id, { from: effectiveFrom, to: effectiveTo });
+  if (data.status !== 'ENDED') {
+    await assertPositionFree(db, companyId, data.position_id, { from: effectiveFrom, to: effectiveTo, excludeIds: options.exceptAssignmentIds ?? [] });
+  }
 
   const cols = { company_id: companyId, created_by: userId, ...data };
   const keys = Object.keys(cols);

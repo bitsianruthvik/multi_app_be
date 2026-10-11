@@ -3,6 +3,7 @@ import {
 } from './seatCount.js';
 import { computeCards, cardMembers, loadCards, chairOnShift } from './positionCards.js';
 import { openHiringsByPosition, COMING_OR_LIVE_SQL, splitComing, dayText } from './hiringRead.js';
+import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -266,9 +267,11 @@ const OVERRIDE_SELECT = (table, fk) => `
  * `hiring` is the OPEN hiring on the position, or null (services/hiringRead.js).
  * A position somebody is being hired for is still vacant.
  */
-function shapePosition(p, people = [], hiring = null, joining = null) {
+function shapePosition(p, people = [], hiring = null, joining = null, on = today()) {
   const live = people.length;
   const first = people[0] ?? null;
+  // On notice: still in the position and still counted, with a last working day (exitRead.js).
+  const notice = noticeOf(first, on);
   return {
     id: p.id,
     positionCode: p.position_code,
@@ -289,8 +292,10 @@ function shapePosition(p, people = [], hiring = null, joining = null) {
     overFilled: overFilledOf(live),
     // The one person in this position, or null when it is vacant.
     occupant: first
-      ? { employeeId: first.employee_id, name: first.full_name, employeeCode: first.employee_code ?? null, assignmentId: first.assignment_id }
+      ? { employeeId: first.employee_id, name: first.full_name, employeeCode: first.employee_code ?? null, assignmentId: first.assignment_id, notice }
       : null,
+    // "Hire a replacement": the person in it is on notice and nobody is lined up yet.
+    canHireReplacement: Boolean(notice) && !hiring && !joining && p.status !== 'CLOSED',
     hiring: hiring ?? null,
     // Who is due to join it from a later date, or null. Still vacant until then.
     joining: joining ?? null,
@@ -338,9 +343,11 @@ const POSITION_SELECT = `
  */
 async function occupantsByPosition(db, companyId, on, positionId = null) {
   const [rows] = await db.query(
-    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code
+    `SELECT wa.id AS assignment_id, wa.position_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code,
+            ${NOTICE_COLUMNS_SQL('x')}
        FROM hrms_work_assignments wa
        JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+       ${NOTICE_JOIN_SQL('wa', 'x')}
       WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}${positionId == null ? '' : ' AND wa.position_id = ?'}
       ORDER BY wa.is_primary DESC, wa.id`,
     positionId == null ? [companyId, on] : [companyId, on, positionId],
@@ -375,7 +382,7 @@ export async function listPositions(db, companyId, query = {}) {
     occupantsByPosition(db, companyId, on),
     openHiringsByPosition(db, companyId),
   ]);
-  const items = rows.map((p) => shapePosition(p, people.live.get(p.id), hirings.get(p.id), people.joining.get(p.id)));
+  const items = rows.map((p) => shapePosition(p, people.live.get(p.id), hirings.get(p.id), people.joining.get(p.id), on));
   return {
     asOf: on,
     items,
@@ -403,7 +410,7 @@ export async function getPosition(db, companyId, id, query = {}) {
     openHiringsByPosition(db, companyId, id),
   ]);
   if (!row) throw notFound('Position');
-  return { asOf: on, position: shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id)) };
+  return { asOf: on, position: shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id), on) };
 }
 
 /** The shift a new position gets when none is named: General (a code starting 'G'), else the company's first. */

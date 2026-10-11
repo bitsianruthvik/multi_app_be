@@ -54,6 +54,7 @@ import { dateText, today, LIVE_ON } from './positionService.js';
 import { resolveReporting, scopeSentence } from './reportingResolver.js';
 import { resolveContent } from './contentResolver.js';
 import { loadCards } from './positionCards.js';
+import { exitsForEmployees } from './exitRead.js';
 
 /* ── words ──────────────────────────────────────────────────────────────── */
 
@@ -705,10 +706,13 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
   }
 
   const primarySeat = seats.find((s) => s.isPrimary) ?? seats[0] ?? null;
+  // Their own notice, when they are on one: it is their record.
+  const exit = (await exitsForEmployees(db, companyId, [employee.id])).get(employee.id) ?? null;
 
   return {
     asOf,
     linked: true,
+    exit,
 
     me: {
       employeeId: employee.id,

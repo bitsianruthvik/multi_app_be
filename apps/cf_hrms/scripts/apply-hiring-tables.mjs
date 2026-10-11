@@ -15,7 +15,8 @@ import { fileURLToPath } from 'url';
 import mysql from 'mysql2/promise';
 import { resolveTarget, announce } from './dbTarget.mjs';
 
-const TABLES = ['hrms_hirings', 'hrms_hiring_letters', 'hrms_letter_templates', 'hrms_hiring_settings'];
+// hrms_employee_exits (leaving, spec §4) was added on 2026-10-11; it references only hrms_employees.
+const TABLES = ['hrms_hirings', 'hrms_hiring_letters', 'hrms_letter_templates', 'hrms_hiring_settings', 'hrms_employee_exits'];
 const APPLY = process.argv.includes('--apply');
 const sqlPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../models/init.sql');
 const sql = fs.readFileSync(sqlPath, 'utf8');

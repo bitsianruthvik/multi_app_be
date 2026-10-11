@@ -53,9 +53,7 @@ export function statusLineOf(h, today = null) {
       return `${name || 'The candidate'} appointed${h.employee_code ? ` as ${h.employee_code}` : ''}`;
     }
     case 'CLOSED':
-      if (h.close_reason === 'DECLINED') return name ? `Offer declined by ${name}` : 'Offer declined';
-      if (h.close_reason === 'LAPSED') return name ? `Offer to ${name} lapsed` : 'Offer lapsed';
-      return 'Hiring cancelled';
+      return closedLine(h.close_reason, name);
     default:
       return '';
   }
@@ -63,6 +61,76 @@ export function statusLineOf(h, today = null) {
 
 function dayIso(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/* ── why a hiring was closed (spec §3.4) ─────────────────────────────────────
+ * Fourteen reasons in two groups, most likely first. `applies` says at which
+ * point of a hiring a reason makes sense — nobody "declined the offer" before
+ * an offer letter exists — and `next` what the screen offers straight after:
+ *   REHIRE           start a new hiring for the position
+ *   MOVE_EMPLOYEE    move an existing employee here
+ *   REMOVE_POSITION  the remove dialog
+ *   null             nothing
+ * `line` is the hiring's status line once closed, with the candidate's name.
+ *
+ * What `applies` reads off a hiring row: has_offer_letter, candidate_name, stage.
+ */
+const named = (h) => Boolean(h.candidate_name && String(h.candidate_name).trim());
+const offered = (h) => Boolean(h.has_offer_letter);
+const fromOffer = (h) => h.stage === 'OFFER' || h.stage === 'APPOINTMENT';
+const anyTime = () => true;
+const who = (name) => name || 'The candidate';
+
+export const CLOSE_REASON_GROUPS = [
+  {
+    label: 'The candidate',
+    reasons: [
+      { code: 'OFFER_DECLINED', label: 'Candidate declined the offer', hint: 'They said no to the offer letter.', noteRequired: false, next: 'REHIRE', applies: offered, line: (n) => `${who(n)} declined the offer` },
+      { code: 'NO_RESPONSE', label: 'Candidate did not reply; the offer lapsed', hint: 'The offer passed its valid-until date without an answer.', noteRequired: false, next: 'REHIRE', applies: offered, line: (n) => `${who(n)} did not reply; the offer lapsed` },
+      { code: 'DID_NOT_JOIN', label: 'Candidate accepted but did not join', hint: 'They accepted the offer and then did not turn up.', noteRequired: false, next: 'REHIRE', applies: (h) => h.stage === 'APPOINTMENT', line: (n) => `${who(n)} accepted but did not join` },
+      { code: 'PAY_NOT_AGREED', label: 'Could not agree on pay', hint: 'The pay we could offer and the pay they wanted did not meet.', noteRequired: false, next: 'REHIRE', applies: fromOffer, line: (n) => (n ? `Could not agree on pay with ${n}` : 'Could not agree on pay') },
+      { code: 'STAYED_WITH_EMPLOYER', label: 'Candidate stayed with their current employer', hint: 'Their employer kept them, with or without a counter-offer.', noteRequired: false, next: 'REHIRE', applies: fromOffer, line: (n) => `${who(n)} stayed with their current employer` },
+      { code: 'CANDIDATE_WITHDREW', label: 'Candidate withdrew before an offer was made', hint: 'They pulled out before any offer letter went to them.', noteRequired: false, next: 'REHIRE', applies: (h) => named(h) && !offered(h), line: (n) => `${who(n)} withdrew before an offer was made` },
+      { code: 'CHECKS_FAILED', label: 'Documents or background check did not clear', hint: 'Their papers or references did not check out.', noteRequired: false, next: 'REHIRE', applies: named, line: (n) => `${who(n)}: documents or background check did not clear` },
+    ],
+  },
+  {
+    label: 'The company',
+    reasons: [
+      { code: 'ANOTHER_CANDIDATE', label: 'We chose another candidate', hint: 'Someone else is being hired for this position.', noteRequired: false, next: 'REHIRE', applies: named, line: () => 'Closed: we chose another candidate' },
+      { code: 'FILLED_INTERNALLY', label: 'An existing employee will take the position', hint: 'The position will be filled by moving someone who already works here.', noteRequired: false, next: 'MOVE_EMPLOYEE', applies: anyTime, line: () => 'Closed: an existing employee will take the position' },
+      { code: 'ON_HOLD', label: 'Hiring is on hold for now', hint: 'The position stays; nobody is being hired for it for the moment.', noteRequired: false, next: null, applies: anyTime, line: () => 'Hiring is on hold for now' },
+      { code: 'NOT_NEEDED', label: 'The position is no longer needed', hint: 'Nobody will be hired. You can remove the position next.', noteRequired: false, next: 'REMOVE_POSITION', applies: anyTime, line: () => 'Closed: the position is no longer needed' },
+      { code: 'OFFER_WITHDRAWN', label: 'We withdrew the offer', hint: 'The company took the offer back. Say why in the note.', noteRequired: true, next: 'REHIRE', applies: offered, line: (n) => (n ? `We withdrew the offer to ${n}` : 'We withdrew the offer') },
+      { code: 'STARTED_BY_MISTAKE', label: 'Started by mistake', hint: 'This hiring should not have been started.', noteRequired: false, next: null, applies: anyTime, line: () => 'Closed: started by mistake' },
+      { code: 'OTHER', label: 'Something else', hint: 'None of the above. Say what happened in the note.', noteRequired: true, next: null, applies: anyTime, line: () => 'Hiring closed' },
+    ],
+  },
+];
+
+/** The three codes of the first release, and what each is now. Read as the new one; still taken on a write for one release. */
+export const LEGACY_CLOSE_REASONS = { DECLINED: 'OFFER_DECLINED', LAPSED: 'NO_RESPONSE', CANCELLED: 'OTHER' };
+
+/** A stored or sent code as today's code. */
+export const closeReasonCode = (code) => (code == null ? null : LEGACY_CLOSE_REASONS[code] ?? code);
+export const closeReasonOf = (code) => CLOSE_REASON_GROUPS.flatMap((g) => g.reasons).find((r) => r.code === closeReasonCode(code)) ?? null;
+export const closeReasonLabel = (code) => closeReasonOf(code)?.label ?? null;
+function closedLine(code, name) {
+  return closeReasonOf(code)?.line(name) ?? 'Hiring closed';
+}
+
+/**
+ * The reasons that apply to a hiring as it stands (or all of them, with no
+ * hiring), in the shape GET /hiring/close-reasons returns. A group with nothing
+ * left is dropped.
+ */
+export function closeReasonsFor(h = null) {
+  return CLOSE_REASON_GROUPS
+    .map((g) => ({
+      label: g.label,
+      reasons: g.reasons.filter((r) => !h || r.applies(h)).map(({ code, label, hint, noteRequired, next }) => ({ code, label, hint, noteRequired, next })),
+    }))
+    .filter((g) => g.reasons.length);
 }
 
 /** What a position read carries about its open hiring. Spec §2.5 — exactly these four fields. */
@@ -162,4 +230,5 @@ export function splitComing(rows, on) {
 export default {
   OPEN_STAGES, statusLineOf, shapePositionHiring, openHiringsByPosition, assertNoOpenHiring,
   COMING_OR_LIVE_SQL, startsAfter, shapeJoining, splitComing, dayText,
+  CLOSE_REASON_GROUPS, LEGACY_CLOSE_REASONS, closeReasonCode, closeReasonOf, closeReasonLabel, closeReasonsFor,
 };

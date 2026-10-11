@@ -2833,3 +2833,71 @@ CREATE TABLE IF NOT EXISTS hrms_hiring_settings (
   CONSTRAINT fk_hhst_company FOREIGN KEY (company_id) REFERENCES companies(id),
   CONSTRAINT fk_hhst_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 12. LEAVING — notice and closing an employee (CF_HRMS_HIRING_SPEC.md §4) ##
+-- ############################################################################
+-- Added 2026-10-11. AN EMPLOYEE IS NEVER DELETED. Leaving is
+--
+--   ACTIVE  ->  NOTICE  ->  EXITED        (hrms_employees.employment_status)
+--                  \->  ACTIVE again, when the notice is withdrawn
+--
+-- and this table is the record of each time it happened: who decided
+-- (RESIGNED = the employee, REMOVED = the company), why, the day notice was
+-- given and the last working day.
+--
+--   OPEN       the person is on notice. They stay in their position and in
+--              every count until the record is closed.
+--   WITHDRAWN  the resignation or removal was taken back. Kept, not deleted:
+--              that somebody resigned in March and stayed is part of the file.
+--   CLOSED     the person has left. services/exitService.js closes in ONE
+--              transaction: employee EXITED with exit_date = last working day,
+--              every open work assignment ended on that day, an EXIT employment
+--              event, and the linked login's access to the company's apps
+--              removed.
+--
+-- ONE OPEN RECORD PER EMPLOYEE is a database guarantee: `open_employee` is the
+-- employee id while the record is OPEN and NULL otherwise, and MySQL never
+-- compares NULLs in a unique index. The same column is what the org chart joins
+-- on to mark a person "on notice" without a query of its own.
+--
+-- exit_type / reason_code / status are VARCHAR, not ENUM (TiDB does not enforce
+-- one). The reasons are a list in code — exitRead.js — validated on write.
+--
+-- A new table, so CREATE TABLE IF NOT EXISTS reaches old and new databases
+-- alike and nothing here needs a retrofit in section 10.
+
+CREATE TABLE IF NOT EXISTS hrms_employee_exits (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  employee_id      INT           NOT NULL,
+  exit_type        VARCHAR(20)   NOT NULL,                 -- RESIGNED | REMOVED
+  reason_code      VARCHAR(30)   NOT NULL,
+  note             VARCHAR(1000) NULL,
+  notice_date      DATE          NOT NULL,
+  last_working_day DATE          NOT NULL,
+  status           VARCHAR(20)   NOT NULL DEFAULT 'OPEN',  -- OPEN | WITHDRAWN | CLOSED
+  closed_on        DATE          NULL,                     -- the day the record was closed
+  withdrawn_on     DATE          NULL,
+  withdraw_note    VARCHAR(1000) NULL,
+  close_note       VARCHAR(1000) NULL,
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by       INT           NULL,
+  closed_by        INT           NULL,
+
+  open_employee    INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL AND status = 'OPEN', employee_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hexi_tenant (company_id, id),
+  UNIQUE KEY uq_hexi_open   (company_id, open_employee),
+  KEY idx_hexi_employee (company_id, employee_id, status),
+  KEY idx_hexi_status   (company_id, status, last_working_day),
+
+  CONSTRAINT fk_hexi_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hexi_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hexi_creator  FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_hexi_closer   FOREIGN KEY (closed_by)  REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

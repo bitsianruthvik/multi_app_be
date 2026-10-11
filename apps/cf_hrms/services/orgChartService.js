@@ -60,6 +60,7 @@ import {
 } from './seatCount.js';
 import { computeCards, loadCards } from './positionCards.js';
 import { openHiringsByPosition, shapePositionHiring, COMING_OR_LIVE_SQL, splitComing } from './hiringRead.js';
+import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
 
@@ -205,11 +206,13 @@ const OCCUPANTS_SQL = `
          wa.effective_from, wa.effective_to,
          e.employee_code, e.full_name, e.employment_status,
          s.code AS shift_code, s.name AS shift_name,
-         r.title AS role_title
+         r.title AS role_title,
+         ${NOTICE_COLUMNS_SQL('x')}
     FROM hrms_work_assignments wa
     JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
     LEFT JOIN hrms_shifts s ON s.company_id = wa.company_id AND s.id = wa.default_shift_id
     LEFT JOIN hrms_roles  r ON r.company_id = wa.company_id AND r.id = wa.role_id
+    ${NOTICE_JOIN_SQL('wa', 'x')}
    WHERE wa.company_id = ? AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}
    ORDER BY wa.is_primary DESC, e.full_name`;
 
@@ -505,6 +508,8 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
         // The assignment's own shift, falling back to the seat's default.
         shiftCode: o.shift_code ?? p.shift_code ?? null,
         attendanceStatus: attendance ? attendance.status : null,
+        // On notice: { exitId, exitType, lastWorkingDay, daysLeft }, or null. Still in the position, still counted.
+        notice: noticeOf(o, asOf),
       };
     });
 
@@ -668,6 +673,8 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       hiring: nodes.filter((n) => n.hiring).length,
       // Positions somebody is due to join on a later date. Also still counted vacant (or filled, by the person leaving).
       joining: nodes.filter((n) => n.joining).length,
+      // People in these positions who are on notice. They are part of `filled`.
+      onNotice: nodes.reduce((t, n) => t + n.occupants.filter((o) => o.notice).length, 0),
       // How many boxes the chart draws.
       cards: new Set(nodes.map((n) => n.cardId)).size,
       // By shift NAME: { General: { positions, filled }, Day: …, Night: … }.
@@ -774,12 +781,14 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     siblingIds.length
       ? db.query(
         `SELECT p.id, p.position_code, s.id AS shift_id, s.code AS shift_code, s.name AS shift_name,
-                wa.id AS assignment_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code
+                wa.id AS assignment_id, wa.employee_id, wa.effective_from, e.full_name, e.employee_code,
+                ${NOTICE_COLUMNS_SQL('x')}
            FROM hrms_positions p
            LEFT JOIN hrms_shifts s ON s.company_id = p.company_id AND s.id = p.default_shift_id
            LEFT JOIN hrms_work_assignments wa ON wa.company_id = p.company_id AND wa.position_id = p.id
                 AND ${HOLDS_SEAT_SQL('wa')} AND ${COMING_OR_LIVE_SQL('wa')}
            LEFT JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+           ${NOTICE_JOIN_SQL('wa', 'x')}
           WHERE p.company_id = ? AND p.id IN (${marks(siblingIds)})
           ORDER BY p.position_code, p.id, wa.is_primary DESC, wa.id`,
         [asOf, companyId, ...siblingIds],
@@ -800,7 +809,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
       positionId: r.id,
       positionCode: r.position_code ?? null,
       shift: r.shift_id ? { id: r.shift_id, code: r.shift_code ?? null, name: r.shift_name ?? null } : null,
-      occupant: inIt ? { employeeId: inIt.employee_id, name: inIt.full_name } : null,
+      occupant: inIt ? { employeeId: inIt.employee_id, name: inIt.full_name, notice: noticeOf(inIt, asOf) } : null,
       hiring: hiringByPosition.get(r.id) ?? null,
       joining: siblingPeople.joining.get(r.id) ?? null,
     });
@@ -851,6 +860,7 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
       effectiveTo: dateText(o.effective_to),
       attendanceStatus: a ? a.status : null,
       attendanceShiftCode: a ? a.shift_code ?? null : null,
+      notice: noticeOf(o, asOf),
     };
   });
 
@@ -948,6 +958,8 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
     hiring: hiringByPosition.get(head.id) ?? null,
     // Who is due to join it from a later date, or null.
     joining: joiningByPosition.get(head.id) ?? null,
+    // "Hire a replacement": the person in it is on notice and nobody is lined up yet.
+    canHireReplacement: occupants.some((o) => o.notice) && !hiringByPosition.get(head.id) && !joiningByPosition.get(head.id) && head.status !== 'CLOSED',
     kras: content.kras.map(contentItem),
     responsibilities: content.responsibilities.map(contentItem),
     kpis: content.kpis.map(contentItem),

@@ -840,9 +840,9 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
       // The one person in the position, or null. `occupants` is the same person
       // as a list, for the screens written when a position held several.
       occupant: n.occupants[0]
-        ? { employeeId: n.occupants[0].employeeId, name: n.occupants[0].name, employeeCode: n.occupants[0].employeeCode ?? null }
+        ? { employeeId: n.occupants[0].employeeId, name: n.occupants[0].name, employeeCode: n.occupants[0].employeeCode ?? null, notice: n.occupants[0].notice ?? null }
         : null,
-      occupants: n.occupants.map((o) => ({ employeeId: o.employeeId, name: o.name, employeeCode: o.employeeCode ?? null })),
+      occupants: n.occupants.map((o) => ({ employeeId: o.employeeId, name: o.name, employeeCode: o.employeeCode ?? null, notice: o.notice ?? null })),
       // The OPEN hiring on this position, or null — the chart's own, so the two screens agree.
       hiring: n.hiring ?? null,
       // …and who is due to join it from a later date, or null.

@@ -17,7 +17,9 @@
  *          { hiring, employee: { id, employeeCode, fullName }, assignmentId, letter, unfilled }
  *   POST   /hirings/:id/close                { reason, note? }        -> CLOSED         { hiring }
  *   GET    /hirings/:id/letters/:letterId/file                        { fileName, mimeType, contentBase64 }
- *   GET    /hirings/:id/jd/file                                       the frozen job description, same shape
+ *   GET    /hirings/:id/jd/preview                                    { preview, readiness } — live at JD, the frozen copy after
+ *   GET    /hirings/:id/jd/file          ?format=docx|pdf             the job description, in every stage, same shape
+ *   GET    /hiring/close-reasons         ?hiringId=                   { groups: [{ label, reasons }] }
  *
  *   GET    /hiring/settings                                           { settings }
  *   PUT    /hiring/settings                  settings fields, camelCase                 { settings }
@@ -45,6 +47,7 @@ import {
   generateOfferLetter, acceptOffer, appoint, closeHiring,
   readLetterFile, readJdFile,
   getSettings, updateSettings, listTemplates, putTemplate, readTemplateFile, listPlaceholders,
+  jdPreview, listCloseReasons,
 } from '../services/hiringService.js';
 
 const router = Router();
@@ -70,6 +73,8 @@ router.put('/hiring/templates/:kind', guard(PERM.orgManage), handle((req) => (
 router.get('/hiring/templates/:kind/file', read, handle((req) => readTemplateFile(pool, ctx(req).companyId, req.params.kind)));
 
 router.get('/hiring/placeholders', read, handle(async () => listPlaceholders()));
+// The reasons a hiring may be closed with — all of them, or with ?hiringId= those that apply to it as it stands.
+router.get('/hiring/close-reasons', read, handle((req) => listCloseReasons(pool, ctx(req).companyId, req.query.hiringId)));
 
 // ── hirings ─────────────────────────────────────────────────────────────────
 
@@ -88,6 +93,8 @@ router.post('/hirings/:id/close', write, handle((req) => tx(req, (db, c) => clos
 router.get('/hirings/:id/letters/:letterId/file', read, handle((req) => (
   readLetterFile(pool, ctx(req).companyId, id(req), intParam(req.params.letterId, 'letterId'))
 )));
-router.get('/hirings/:id/jd/file', read, handle((req) => readJdFile(pool, ctx(req).companyId, id(req))));
+// The job description: what will be (or was) frozen, and its file — ?format=docx|pdf, in every stage.
+router.get('/hirings/:id/jd/preview', read, handle((req) => jdPreview(pool, ctx(req), id(req))));
+router.get('/hirings/:id/jd/file', read, handle((req) => readJdFile(pool, ctx(req), id(req), req.query.format)));
 
 export default router;

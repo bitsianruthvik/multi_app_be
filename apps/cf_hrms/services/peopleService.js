@@ -38,6 +38,7 @@ import {
   MAX_DOCUMENT_STORED_BYTES, MAX_PHOTO_STORED_BYTES,
 } from './documentStorage.js';
 import { issueEmployeeCode } from './codeService.js';
+import { exitsForEmployees } from './exitRead.js';
 
 // ── small shared helpers ────────────────────────────────────────────────────
 
@@ -302,7 +303,12 @@ export async function listEmployees(exec, companyId, query = {}) {
 
   const csv = (v) => String(v ?? '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 
-  const statuses = csv(query.status).filter((s) => EMPLOYMENT_STATUSES.includes(s));
+  // Working and on notice, unless asked otherwise (spec §4.5): somebody who has
+  // left is still on file — under status=EXITED — but is not in the everyday
+  // list. status=ALL is every status.
+  const asked = csv(query.status);
+  const statuses = asked.includes('ALL') ? []
+    : asked.length ? asked.filter((s) => EMPLOYMENT_STATUSES.includes(s)) : ['ACTIVE', 'NOTICE'];
   if (statuses.length) {
     where.push(`e.employment_status IN (${statuses.map(() => '?').join(',')})`);
     args.push(...statuses);
@@ -339,9 +345,11 @@ export async function listEmployees(exec, companyId, query = {}) {
   );
 
   const ids = rows.map((r) => r.id);
-  const [assignments, docs] = await Promise.all([
+  const [assignments, docs, exits] = await Promise.all([
     assignmentsForEmployees(exec, companyId, ids, asOf),
     documentHealth(exec, companyId, ids, asOf),
+    // The open leaving record, or the closed one of somebody who has left: one read for the list.
+    exitsForEmployees(exec, companyId, ids),
   ]);
 
   const items = rows.map((row) => {
@@ -352,6 +360,7 @@ export async function listEmployees(exec, companyId, query = {}) {
     const primary = active[0] ?? null;
     return {
       ...shapeEmployee(row),
+      exit: exits.get(row.id) ?? null,
       activeAssignmentCount: active.length,
       openAssignmentCount: mine.filter((a) => a.isOpen).length,
       assignmentCount: mine.length,
@@ -396,10 +405,13 @@ export async function getEmployee(exec, companyId, id, asOf = today()) {
     [companyId, row.id, companyId, row.id],
   );
 
+  const exit = (await exitsForEmployees(exec, companyId, [row.id])).get(row.id) ?? null;
+
   const active = assignments.filter((a) => a.isActive);
   return {
     asOf,
-    employee: shapeEmployee(row),
+    // `exit`: on notice (the open record), or how and when they left. null for everybody else.
+    employee: { ...shapeEmployee(row), exit },
     assignments,
     counts: {
       assignments: assignments.length,

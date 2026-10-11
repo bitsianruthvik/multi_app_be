@@ -53,18 +53,24 @@ import { HrmsError, invalid, notFound, conflict, assertNoProblems } from '../lib
 import { dateText, today, requirePosition, LIVE_ON } from './positionService.js';
 import { createEmployee, createEvent, audit } from './peopleService.js';
 import { createAssignment } from './assignmentService.js';
-import { generate as generateDocument, readDocumentFile } from './documentService.js';
+import {
+  generate as generateDocument, readDocumentFile, previewDocument, renderFromSnapshot, getDocument,
+} from './documentService.js';
 import { packForStorage, unpack, MAX_DOCUMENT_STORED_BYTES } from './documentStorage.js';
 import { issueHiringRef } from './codeService.js';
 import { HOLDS_SEAT_SQL } from './seatCount.js';
-import { OPEN_STAGES, statusLineOf } from './hiringRead.js';
+import {
+  OPEN_STAGES, statusLineOf, CLOSE_REASON_GROUPS, LEGACY_CLOSE_REASONS, closeReasonCode, closeReasonLabel, closeReasonOf, closeReasonsFor,
+} from './hiringRead.js';
+import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf, shortDay } from './exitRead.js';
 import {
   LETTER_KINDS, PLACEHOLDERS, DOCX_MIME,
   letterValues, letterDate, renderLetter, inspectTemplate, builtInTemplate, builtInFileName,
 } from './letterRenderer.js';
 
 export const HIRING_STAGES = ['JD', 'OFFER', 'APPOINTMENT', 'DONE', 'CLOSED'];
-export const CLOSE_REASONS = ['DECLINED', 'LAPSED', 'CANCELLED'];
+/** The fourteen reasons of spec §3.4 (hiringRead.js holds them, with when each applies). */
+export const CLOSE_REASONS = CLOSE_REASON_GROUPS.flatMap((g) => g.reasons.map((r) => r.code));
 
 const SETTINGS_DEFAULTS = { probation_months: 3, notice_days_probation: 15, notice_days_confirmed: 30, offer_valid_days: 7 };
 
@@ -288,7 +294,9 @@ function shapeSummary(h, asOf) {
   return {
     id: h.id,
     stage: h.stage,
-    closeReason: h.close_reason ?? null,
+    // The code as it is today: a hiring closed under one of the first release's three codes reads as its new one.
+    closeReason: closeReasonCode(h.close_reason),
+    closeReasonLabel: closeReasonLabel(h.close_reason),
     refNo: h.ref_no ?? null,
     positionId: h.position_id,
     positionCode: h.position_code ?? null,
@@ -412,7 +420,14 @@ async function loadLetters(db, companyId, hiringId) {
 
 export async function getHiring(db, companyId, id) {
   const h = await loadRow(db, companyId, id);
-  return { hiring: shapeHiring(h, await loadLetters(db, companyId, id), today()) };
+  const hiring = shapeHiring(h, await loadLetters(db, companyId, id), today());
+  // While it is open: the person on notice in the position, whom this hiring replaces. The
+  // joining date must be after their last working day, so the screen is told that day.
+  const leaving = OPEN_STAGES.includes(h.stage) ? (await holdersFrom(db, companyId, h.position_id, today())).find((x) => x.exit_id != null) : null;
+  hiring.replacing = leaving
+    ? { employeeId: leaving.employee_id, name: leaving.full_name, ...noticeOf(leaving) }
+    : null;
+  return { hiring };
 }
 
 /** ?status=open|done|closed|all (all when absent) &positionId= */
@@ -440,21 +455,26 @@ export async function listHirings(db, companyId, query = {}) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * Who holds — or is due to hold — a position from a date on. "Holds" is
- * seatCount's predicate (not deleted, not ENDED); the dates are compared as a
- * range, so a person appointed from next month is found today.
+ * Everybody who holds — or is due to hold — a position from a date on, earliest
+ * first. "Holds" is seatCount's predicate (not deleted, not ENDED); the dates
+ * are compared as a range, so a person appointed from next month is found today.
+ *
+ * Each row says whether that person is ON NOTICE (exit_id, exit_last_working_day
+ * — exitRead.js): their position may be hired for, and they are not in the way
+ * of somebody who joins after their last working day.
  */
-async function occupantFrom(db, companyId, positionId, from) {
-  const [[row]] = await db.query(
-    `SELECT wa.id, wa.employee_id, wa.effective_from, e.full_name
+async function holdersFrom(db, companyId, positionId, from) {
+  const [rows] = await db.query(
+    `SELECT wa.id, wa.employee_id, wa.effective_from, e.full_name, ${NOTICE_COLUMNS_SQL('x')}
        FROM hrms_work_assignments wa
        JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+       ${NOTICE_JOIN_SQL('wa', 'x')}
       WHERE wa.company_id = ? AND wa.position_id = ? AND ${HOLDS_SEAT_SQL('wa')}
         AND (wa.effective_to IS NULL OR wa.effective_to >= ?)
-      ORDER BY wa.effective_from, wa.id LIMIT 1`,
+      ORDER BY wa.effective_from, wa.id`,
     [companyId, positionId, from],
   );
-  return row ?? null;
+  return rows;
 }
 
 function positionFilled(position, occupant, on) {
@@ -506,8 +526,10 @@ export async function startHiring(conn, c, positionId, requestId = null) {
   const position = await positionFacts(conn, c.companyId, positionId, on, { lock: true });
   if (position.status === 'CLOSED') throw conflict('POSITION_CLOSED', 'That position is closed. Reopen it before hiring for it.');
 
-  const occupant = await occupantFrom(conn, c.companyId, positionId, on);
-  if (occupant) throw positionFilled(position, occupant, on);
+  // Filled by somebody who is staying: refused. Filled by somebody ON NOTICE: this is
+  // "Hire a replacement", and it is allowed — the position is about to be vacant.
+  const staying = (await holdersFrom(conn, c.companyId, positionId, on)).find((x) => x.exit_id == null);
+  if (staying) throw positionFilled(position, staying, on);
 
   const [[open]] = await conn.query(
     'SELECT id, stage FROM hrms_hirings WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL AND stage IN (?) LIMIT 1',
@@ -548,10 +570,69 @@ export async function startHiring(conn, c, positionId, requestId = null) {
  * JD -> OFFER
  * ══════════════════════════════════════════════════════════════════════════ */
 
+/** What a section of the job description is called when it is said to be empty. Keys are the JD builder's. */
+const JD_SECTION_WORDS = {
+  purpose: 'the role’s purpose',
+  summary: 'a summary of the role',
+  kras: 'key result areas',
+  responsibilities: 'responsibilities',
+  kpis: 'KPIs',
+  skills: 'skills',
+  qualifications: 'qualifications',
+  experience: 'experience',
+  authorities: 'authorities',
+  relationships: 'working relationships',
+  conditions: 'working conditions',
+};
+
+/**
+ * Whether a job description can be confirmed, read off the JD builder's own
+ * snapshot — so the preview, the readiness and the confirm step cannot disagree.
+ *
+ *   missing  every section nothing has been written for, in plain words. The
+ *            JD still prints each of them, saying so.
+ *   ready    false only when the role has NO purpose AND NO key result area:
+ *            a job description of a title alone is not one. Anything more may
+ *            be confirmed.
+ */
+export function jdReadiness(snapshot) {
+  const empty = snapshot?.summary?.emptySections ?? [];
+  return {
+    ready: !(empty.includes('purpose') && empty.includes('kras')),
+    missing: empty.filter((k) => JD_SECTION_WORDS[k]).map((k) => JD_SECTION_WORDS[k]),
+  };
+}
+
+/** The position's job description as the system holds it NOW: the documents service's own preview, nothing stored. */
+const liveJd = (db, c, h) => previewDocument(db, c, { type: 'ROLE_JD', positionId: h.position_id, on: today() });
+
+/**
+ * GET /hirings/:id/jd/preview -> { preview, readiness }
+ *
+ * `preview` is the object GET /documents/preview returns for this position's
+ * ROLE_JD — { persisted, asOf, documentType, snapshot } — built by the same
+ * function, so the screen draws it with the component it already has:
+ *   - until the JD is confirmed, from the system as it is now (persisted: false);
+ *   - afterwards, from the FROZEN copy (persisted: true, with its documentId):
+ *     what was confirmed, even if the role has been rewritten since.
+ */
+export async function jdPreview(db, c, id) {
+  const h = await loadRow(db, c.companyId, id);
+  if (!h.jd_document_id) {
+    const preview = await liveJd(db, c, h);
+    return { preview, readiness: jdReadiness(preview.snapshot) };
+  }
+  const { document, snapshot } = await getDocument(db, c.companyId, h.jd_document_id);
+  return {
+    preview: { persisted: true, asOf: snapshot?.asOf ?? null, documentType: snapshot?.documentType ?? 'ROLE_JD', snapshot, documentId: document.id },
+    readiness: jdReadiness(snapshot),
+  };
+}
+
 /**
  * Freezes the position's job description and moves on to the offer.
- * 422 JD_NOT_READY only when the role has NO purpose AND NO key result area —
- * a job description of a title alone is not one. Anything more proceeds.
+ * 422 JD_NOT_READY only when the role has NO purpose AND NO key result area
+ * (jdReadiness, above — the same answer the preview gave).
  */
 export async function confirmJd(conn, c, id, requestId = null) {
   const h = await loadRow(conn, c.companyId, id, { lock: true });
@@ -559,14 +640,7 @@ export async function confirmJd(conn, c, id, requestId = null) {
     throw wrongStage(OPEN_STAGES.includes(h.stage) ? 'The job description of this hiring is already confirmed.' : 'This hiring is finished.');
   }
 
-  const [[role]] = await conn.query(
-    `SELECT r.role_purpose,
-            (SELECT COUNT(*) FROM hrms_role_kra_assignments k
-              WHERE k.company_id = r.company_id AND k.role_id = r.id AND k.deleted_at IS NULL) AS kras
-       FROM hrms_roles r WHERE r.company_id = ? AND r.id = ?`,
-    [c.companyId, h.role_id],
-  );
-  if (!clean(role?.role_purpose) && !Number(role?.kras)) {
+  if (!jdReadiness((await liveJd(conn, c, h)).snapshot).ready) {
     throw invalid('JD_NOT_READY', 'This role has no job description yet. Write its purpose or add a key result area, then confirm.', {
       problems: ['The role has no purpose written.', 'The role has no key result areas.'],
     });
@@ -579,11 +653,24 @@ export async function confirmJd(conn, c, id, requestId = null) {
   return getHiring(conn, c.companyId, id);
 }
 
-export async function readJdFile(db, companyId, id) {
-  const h = await loadRow(db, companyId, id);
-  if (!h.jd_document_id) throw notFound('The job description of this hiring');
-  const file = await readDocumentFile(db, companyId, h.jd_document_id, 'docx');
-  return { fileName: file.fileName, mimeType: file.mimeType, contentBase64: file.dataBase64 };
+const JD_MIME = { docx: DOCX_MIME, pdf: 'application/pdf' };
+
+/**
+ * GET /hirings/:id/jd/file?format=docx|pdf — in EVERY stage.
+ * Before the JD is confirmed it is rendered from the system as it is now and
+ * nothing is stored; afterwards it is the frozen copy.
+ */
+export async function readJdFile(db, c, id, formatParam = 'docx') {
+  const format = String(formatParam ?? 'docx').trim().toLowerCase() || 'docx';
+  if (!JD_MIME[format]) throw invalid('INVALID', 'format is docx or pdf.');
+  const h = await loadRow(db, c.companyId, id);
+  if (h.jd_document_id) {
+    const file = await readDocumentFile(db, c.companyId, h.jd_document_id, format);
+    return { fileName: file.fileName, mimeType: file.mimeType, contentBase64: file.dataBase64 };
+  }
+  const { snapshot } = await liveJd(db, c, h);
+  const buffer = await renderFromSnapshot(snapshot, format);
+  return { fileName: `${snapshot.fileBaseName}.${format}`, mimeType: JD_MIME[format], contentBase64: buffer.toString('base64') };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -885,8 +972,20 @@ export async function appoint(conn, c, id, body = {}, requestId = null) {
   // 1. The position, locked, and still free from the joining date on.
   const position = await positionFacts(conn, c.companyId, h.position_id, today(), { lock: true });
   if (position.status === 'CLOSED') throw conflict('POSITION_CLOSED', 'That position has been closed. Reopen it, or close this hiring.');
-  const occupant = await occupantFrom(conn, c.companyId, h.position_id, joiningDate);
-  if (occupant) throw positionFilled(position, occupant, today());
+  // Anybody in it who is staying — including somebody whose notice was withdrawn since the hiring
+  // started — still fills it. Somebody on notice does not, provided the candidate joins after they go.
+  const holders = await holdersFrom(conn, c.companyId, h.position_id, joiningDate);
+  const staying = holders.find((x) => x.exit_id == null);
+  if (staying) throw positionFilled(position, staying, today());
+  const leaving = holders.filter((x) => x.exit_id != null);
+  const tooEarly = leaving.find((x) => joiningDate <= noticeOf(x).lastWorkingDay);
+  if (tooEarly) {
+    const sentence = `${tooEarly.full_name} is in this position until ${shortDay(noticeOf(tooEarly).lastWorkingDay)}, their last working day. The date of joining must be after it.`;
+    throw invalid('NOT_READY', sentence, {
+      problems: [sentence],
+      detail: { positionId: h.position_id, replacing: { employeeId: tooEarly.employee_id, name: tooEarly.full_name, ...noticeOf(tooEarly) } },
+    });
+  }
 
   // 2. The employee — code issued inside, by the company's rule, from where they start work.
   const created = await createEmployee(conn, c, {
@@ -919,7 +1018,7 @@ export async function appoint(conn, c, id, body = {}, requestId = null) {
     status: 'ACTIVE',
     effectiveFrom: joiningDate,
     reason: `Appointed through hiring${h.ref_no ? ` ${h.ref_no}` : ''}`,
-  }, { hiringId: h.id });
+  }, { hiringId: h.id, exceptAssignmentIds: leaving.map((x) => x.id) });
   await audit(conn, c, 'hrms_work_assignments', assignment.id, 'CREATE', null,
     { employeeId: employee.id, positionId: position.id, roleId: position.role_id, effectiveFrom: joiningDate, hiringId: h.id }, requestId);
   await createEvent(conn, c, employee.id, {
@@ -958,7 +1057,27 @@ export async function appoint(conn, c, id, body = {}, requestId = null) {
  * Closing
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** POST /hirings/:id/close { reason, note? } — any stage before DONE. The letter reference stays with the hiring. */
+/**
+ * GET /hiring/close-reasons?hiringId= -> { groups: [{ label, reasons: [{ code, label, hint, noteRequired, next }] }] }
+ * With a hiring: only the reasons that apply to it as it stands, most likely
+ * first. Without: all fourteen.
+ */
+export async function listCloseReasons(db, companyId, hiringId = null) {
+  if (hiringId === undefined || hiringId === null || hiringId === '') return { groups: closeReasonsFor(null) };
+  const id = Number(hiringId);
+  if (!Number.isInteger(id) || id <= 0) throw invalid('INVALID', 'hiringId must be a positive whole number.');
+  return { groups: closeReasonsFor(await loadRow(db, companyId, id)) };
+}
+
+/**
+ * POST /hirings/:id/close { reason: <code>, note? } — any stage before DONE.
+ * 422 INVALID when the reason does not apply at this point of the hiring, or
+ * its note is required and missing. The letter reference stays with the hiring.
+ *
+ * The first release's three codes (DECLINED, LAPSED, CANCELLED) are still taken
+ * for one release, as they always were — no stage rule, no required note — and
+ * stored as the code each has become.
+ */
 export async function closeHiring(conn, c, id, body = {}, requestId = null) {
   const h = await loadRow(conn, c.companyId, id, { lock: true });
   if (!readiness(h).can.close) {
@@ -966,22 +1085,28 @@ export async function closeHiring(conn, c, id, body = {}, requestId = null) {
       ? 'This person has been appointed, so the hiring cannot be closed. If they are not joining, end their assignment and mark the employee exited.'
       : 'This hiring is already closed.');
   }
-  const reason = String(body.reason ?? '').trim().toUpperCase();
+  const sent = String(body.reason ?? '').trim().toUpperCase();
+  const legacy = Object.prototype.hasOwnProperty.call(LEGACY_CLOSE_REASONS, sent);
+  const reason = closeReasonOf(sent);
   const note = clean(body.note);
   const problems = [];
-  if (!CLOSE_REASONS.includes(reason)) problems.push('Say why: the offer was declined, it lapsed, or the hiring is cancelled.');
+  if (!reason) problems.push('Pick a reason for closing this hiring.');
+  else if (!legacy) {
+    if (!reason.applies(h)) problems.push(`“${reason.label}” does not apply to this hiring as it stands. Pick another reason.`);
+    if (reason.noteRequired && !note) problems.push('Add a note saying what happened.');
+  }
   if (note && note.length > 500) problems.push('The note is up to 500 characters.');
   assertNoProblems(problems, 'This hiring cannot be closed yet.');
 
   await conn.query("UPDATE hrms_hirings SET stage = 'CLOSED', close_reason = ?, close_note = ? WHERE company_id = ? AND id = ?",
-    [reason, note, c.companyId, id]);
-  await audit(conn, c, 'hrms_hirings', id, 'UPDATE', { stage: h.stage }, { stage: 'CLOSED', closeReason: reason }, requestId);
+    [reason.code, note, c.companyId, id]);
+  await audit(conn, c, 'hrms_hirings', id, 'UPDATE', { stage: h.stage }, { stage: 'CLOSED', closeReason: reason.code }, requestId);
   return getHiring(conn, c.companyId, id);
 }
 
 export default {
   HIRING_STAGES, CLOSE_REASONS, readiness,
   getSettings, updateSettings, listTemplates, putTemplate, readTemplateFile, listPlaceholders,
-  listHirings, getHiring, startHiring, confirmJd, readJdFile, updateHiring,
+  listHirings, getHiring, startHiring, confirmJd, readJdFile, jdPreview, jdReadiness, listCloseReasons, updateHiring,
   generateOfferLetter, acceptOffer, readLetterFile, appoint, closeHiring,
 };
