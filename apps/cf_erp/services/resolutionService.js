@@ -16,7 +16,16 @@
  *
  * Values (Q8) — a value may sit at any level; for a record:
  *   entered     its own value
- *   defaulted   its own entered value, else the nearest value above
+ *   defaulted   its own entered value, else the nearest value above — or, when the
+ *               rule NAMES A FORMULA, the formula's answer (2026-10-12: "calculated,
+ *               but a person may type over it"). The formula is a calculated one or
+ *               a roll-up, by what it reads. An entered value of the record's own
+ *               REPLACES the answer and is reported as typed by hand, with the
+ *               answer beside it (`derived`); taking the entered value away brings
+ *               the answer back. An entered value EQUAL to the answer is simply
+ *               shown as the answer. Where the formula cannot be worked out the
+ *               nearest value above stands in, and a required one with nothing at
+ *               all is missing — a person types it.
  *   fixed       the nearest value above; its own entry cannot override
  *   calculated  the formula over its other values, evaluated here
  *   rollup      the formula over its BOM children — Σ line quantity × child
@@ -37,7 +46,7 @@
  * delivered. `frozen` on the result names the order.
  */
 import { ancestors, levelName } from './tree.js';
-import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, WORKED_OUT_SPECS, WORKED_OUT_WHY } from './records.js';
+import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
 
@@ -206,6 +215,161 @@ export function displayOf(raw, spec, optionById) {
   }
 }
 
+/* ===========================================================================
+ * Formulas — ONE second pass, for resolve() and for orderValuesService's mirror
+ * ======================================================================== */
+
+/** A Defaulted rule that names a formula: the formula gives the default, a typed value of the record's own replaces it. */
+export const isWorkedDefault = (rule) => rule?.valueRule === 'defaulted' && !!rule.formula;
+
+/**
+ * Whether a typed number says the same as the calculated one: the same at the
+ * specification's own decimals (what a person sees and types), else to a millionth.
+ */
+export function sameAsCalculated(typed, calculated, decimals) {
+  if (typed == null || calculated == null) return false;
+  const a = Number(typed);
+  const b = Number(calculated);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  if (decimals != null && Number.isFinite(Number(decimals))) return a.toFixed(Number(decimals)) === b.toFixed(Number(decimals));
+  return Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(b));
+}
+
+/** What the drawing says about a record (records.DRAWING_FACT_SPECS), from its own value rows: Map code -> number. */
+export function drawingFactsOf(ownRows) {
+  const out = new Map();
+  for (const v of ownRows ?? []) {
+    const code = String(v.spec_code ?? '').toUpperCase();
+    if (DRAWING_FACT_SPECS.has(code) && v.value_number != null) out.set(code, Number(v.value_number));
+  }
+  return out;
+}
+
+/** The specs a formula works out: calculated, roll-up, and Defaulted rules that name one. */
+const formulaSpecs = (specs) => specs.filter((s) => s.applicable && s.captureAt === 'item'
+  && (['calculated', 'rollup'].includes(s.rule.valueRule) || isWorkedDefault(s.rule)));
+
+/** Whether any of a record's formulas reads its BOM children, and which of their values: { any, terms }. */
+export function rollupNeeds(specs, parse) {
+  const terms = new Set();
+  let any = false;
+  for (const s of formulaSpecs(specs)) {
+    if (s.rule.valueRule === 'rollup') any = true;
+    if (!s.rule.formula) continue;
+    const p = parse(s.rule.formula.expression);
+    if (p instanceof Error) continue;
+    if (s.rule.valueRule === 'rollup' || p.usesRollup) { any = any || p.usesRollup; p.rollupTerms.forEach((t) => terms.add(t)); }
+  }
+  return { any, terms: [...terms] };
+}
+
+/** What a frozen record's formula value is: nothing is worked out again, so only where it came from. */
+function frozenDerived(entry, own) {
+  return { source: isWorkedDefault(entry.rule) && own.source === 'entered' ? 'typed' : 'calculated', overridable: false, rollup: own.source === 'rollup', frozen: true };
+}
+
+/**
+ * Works out every formula value of ONE record, in dependency order, writing the
+ * answers onto `specs` (and `effectiveRows`, for materialisation). A formula
+ * waits while one of its own inputs is itself a formula value not yet worked
+ * out; whatever is still waiting when nothing moves is a cycle. Roll-ups read
+ * the BOM children's stored values — other records, so they never wait in here.
+ *
+ *   parse(expression)  the parsed formula, or the Error it would not parse with
+ *   children           the record's BOM lines for a roll-up ([] = no lines yet, null = no BOM)
+ *   facts              what its drawing says (drawingFactsOf) — names a formula may read
+ *   fallbacks          Map(entry -> fn): the nearest value above, for a Defaulted formula with no answer
+ *
+ * `derived` on an entry says where a formula value comes from, for every screen:
+ *   source       'calculated' | 'drawing' (a fact of the drawing fed it) | 'typed' (typed by hand over it)
+ *   overridable  a person may type over it (a Defaulted rule that names the formula)
+ *   rollup       it reads the BOM children
+ *   calculated   { raw, display } — typed: the answer it replaced (null when there is none yet);
+ *                held: the answer the typed value equals
+ *   calculatedFrom  typed: 'calculated' | 'drawing' — what the replaced answer is
+ *   held         the record holds a typed value EQUAL to the answer — it is shown as the answer
+ *   waiting / problem   typed, with no answer: what the formula waits for, or why it has none
+ */
+export function workOutFormulas(specs, { parse, children = null, isMachine = false, optionById, effectiveRows, fallbacks = null, facts = null }) {
+  const lookup = new Map();
+  for (const s of specs) if (s.value && s.spec.dataType === 'number') lookup.set(s.spec.code, s.value.raw);
+  // The names a value "from the drawing" was fed by: the facts themselves, then whatever was worked out from them.
+  const drawn = new Set();
+  for (const [code, n] of facts ?? []) { if (!lookup.has(code)) lookup.set(code, n); drawn.add(code); }
+  // A calculated spec may read another table specification of the SAME
+  // record through LOOKUP(TABLE_CODE, x) with no item./machine. prefix —
+  // "any spec can be a table" is the point, not only machine rate charts.
+  const tableLookup = new Map();
+  for (const s of specs) if (s.value && s.spec.dataType === 'table') tableLookup.set(s.spec.code, { mode: s.spec.tableConfig?.mode, axes: s.spec.tableConfig?.axes, ...s.value.raw });
+  const calc = formulaSpecs(specs);
+  const parsedOf = new Map();
+  for (const s of calc) if (s.rule.formula) parsedOf.set(s, parse(s.rule.formula.expression));
+  const rollupOf = (s) => s.rule.valueRule === 'rollup' || (isWorkedDefault(s.rule) && !(parsedOf.get(s) instanceof Error) && !!parsedOf.get(s)?.usesRollup);
+  const typedOver = (s) => isWorkedDefault(s.rule) && s.value?.source === 'entered';
+  const shown = (s, raw) => ({ raw, display: displayOf(raw, s.spec, optionById) });
+  /** No answer: a typed value stands as it is (and says why nothing is beside it); anything else takes the status. */
+  const none = (s, status, extra = {}) => {
+    if (typedOver(s)) s.derived = { source: 'typed', overridable: true, rollup: rollupOf(s), calculated: null, waiting: extra.missingInputs ?? null, problem: extra.problem ?? extra.note ?? null };
+    else { s.status = status; Object.assign(s, extra); }
+  };
+  const done = new Set();
+  let moved = true;
+  while (moved) {
+    moved = false;
+    for (const s of calc) {
+      if (done.has(s)) continue;
+      const isRollup = rollupOf(s);
+      const overridable = isWorkedDefault(s.rule);
+      if (!s.rule.formula) { s.status = 'formula_missing'; done.add(s); moved = true; continue; }
+      const parsed = parsedOf.get(s);
+      if (parsed instanceof Error) { none(s, 'formula_error', { problem: parsed.message }); done.add(s); moved = true; continue; }
+      if (isRollup && (!children || !children.length)) {
+        none(s, 'no_bom', { note: isMachine ? 'A machine has no BOM.' : children ? 'Its BOM has no lines yet.' : 'It has no BOM to roll up.' });
+        done.add(s); moved = true; continue;
+      }
+      const waiting = parsed.references.some((code) => !lookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
+      if (waiting) continue;
+      const out = evaluateFormula(parsed, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null, null,
+        (code) => tableLookup.get(code) ?? null);
+      done.add(s);
+      moved = true;
+      if (out.value === null) {
+        none(s, out.missing ? 'waiting_inputs' : 'formula_error', { ...(out.missing ? { missingInputs: out.missing } : {}), ...(out.error ? { problem: out.error } : {}) });
+        continue;
+      }
+      const from = isRollup ? `BOM · ${children.length} line${children.length === 1 ? '' : 's'}` : `formula ${s.rule.formula.code}`;
+      const source = parsed.references.some((code) => drawn.has(code)) ? 'drawing' : 'calculated';
+      if (typedOver(s)) {
+        // Typed by hand. Equal to the answer: it IS the answer, as far as anyone reading it can tell
+        // (the typed row stays — nothing a person entered is taken away). Different: both are said.
+        if (sameAsCalculated(s.value.raw, out.value, s.spec.decimals)) {
+          s.value = { ...s.value, source: 'defaulted', from };
+          s.status = 'default';
+          s.derived = { source, overridable: true, rollup: isRollup, held: true, calculated: shown(s, out.value) };
+          if (source === 'drawing') drawn.add(s.spec.code);
+        } else s.derived = { source: 'typed', overridable: true, rollup: isRollup, calculated: shown(s, out.value), calculatedFrom: source };
+        continue;
+      }
+      s.value = { ...shown(s, out.value), source: overridable ? 'defaulted' : isRollup ? 'rollup' : 'calculated', from };
+      s.status = overridable ? 'default' : isRollup ? 'rollup' : 'calculated';
+      s.derived = { source, overridable, rollup: isRollup };
+      if (source === 'drawing') drawn.add(s.spec.code);
+      lookup.set(s.spec.code, out.value);
+      effectiveRows.set(s.spec.id, { value_number: out.value, value_text: null, value_bool: null, value_date: null, option_id: null });
+    }
+  }
+  for (const s of calc) {
+    if (!done.has(s)) none(s, 'formula_cycle', { problem: 'This formula depends on itself through other calculated values.' });
+  }
+  // A Defaulted formula with no answer: the nearest value above stands in; a required one with nothing at all is missing.
+  for (const s of calc) {
+    if (!isWorkedDefault(s.rule) || s.value) continue;
+    fallbacks?.get(s)?.();
+    if (!s.value && s.rule.isRequired) s.status = 'missing';
+  }
+}
+
+
 /**
  * Resolves a master record (saved, or a draft with `draftValues`) or a
  * classification node. Returns the public shape plus `internal` (the rows
@@ -270,6 +434,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
 
   const specs = [];
   const effectiveRows = new Map();
+  const fallbacks = new Map();
   for (const { rule: r, overridden } of merged.values()) {
     const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
     let allowed;
@@ -316,6 +481,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
     if (frozen && !LIVE_WHEN_FROZEN.has(spec.code)) {
       if (own) entry.value = view(own, own.source, 'here');
       entry.status = 'frozen';
+      if (own && entry.rule.formula) entry.derived = frozenDerived(entry, own);
       continue;
     }
 
@@ -323,6 +489,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
       if (['calculated', 'rollup', 'inherited'].includes(r.value_rule)) { entry.status = 'computed_on_items'; continue; }
       if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set_here'; effectiveRows.set(spec.id, own); }
       else if (above) { entry.value = view(above.row, above.row.source, chain[above.levelIndex].level); entry.status = 'default_from_above'; }
+      else if (isWorkedDefault(entry.rule)) entry.status = 'computed_on_items';
       continue;
     }
 
@@ -332,7 +499,10 @@ export async function resolve(db, companyId, { master = null, machine = null, no
         break;
       case 'defaulted':
         if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
-        else if (above) { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); }
+        // Its formula gives the default (second pass); the value above only stands in where it cannot.
+        else if (isWorkedDefault(entry.rule)) {
+          if (above) fallbacks.set(entry, () => { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); });
+        } else if (above) { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); }
         break;
       case 'fixed':
         if (above) {
@@ -371,7 +541,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
       default:
         break; // calculated and rollup: second pass
     }
-    if (entry.rule.isRequired && !entry.value && ['entered', 'defaulted'].includes(r.value_rule)) entry.status = 'missing';
+    if (entry.rule.isRequired && !entry.value && ['entered', 'defaulted'].includes(r.value_rule) && !isWorkedDefault(entry.rule)) entry.status = 'missing';
   }
 
   // Calculated and roll-up values, in dependency order. A formula waits while
@@ -379,66 +549,12 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   // is still waiting when nothing moves is a cycle. Roll-ups read the BOM
   // children's stored values — other records, so they never wait inside here.
   if (mode === 'item' && !frozen) {
-    const lookup = new Map();
-    for (const s of specs) if (s.value && s.spec.dataType === 'number') lookup.set(s.spec.code, s.value.raw);
-    // A calculated spec may read another table specification of the SAME
-    // record through LOOKUP(TABLE_CODE, x) with no item./machine. prefix —
-    // "any spec can be a table" is the point, not only machine rate charts.
-    const tableLookup = new Map();
-    for (const s of specs) if (s.value && s.spec.dataType === 'table') tableLookup.set(s.spec.code, { mode: s.spec.tableConfig?.mode, axes: s.spec.tableConfig?.axes, ...s.value.raw });
-    const calc = specs.filter((s) => s.applicable && s.captureAt === 'item' && ['calculated', 'rollup'].includes(s.rule.valueRule));
-    const parsedOf = new Map();
-    for (const s of calc) {
-      if (!s.rule.formula) continue;
-      try { parsedOf.set(s, parseFormula(s.rule.formula.expression)); } catch (e) { parsedOf.set(s, e); }
-    }
+    const parse = (expression) => { try { return parseFormula(expression); } catch (e) { return e; } };
+    const needs = rollupNeeds(specs, parse);
     let children = null;
-    const rollupTerms = new Set();
-    for (const [s, p] of parsedOf) if (s.rule.valueRule === 'rollup' && !(p instanceof Error)) p.rollupTerms.forEach((t) => rollupTerms.add(t));
-    if (!isMachine && master.id != null && calc.some((s) => s.rule.valueRule === 'rollup')) {
-      children = await rollupChildren(db, companyId, master.id, [...rollupTerms]);
-    }
-    const done = new Set();
-    let moved = true;
-    while (moved) {
-      moved = false;
-      for (const s of calc) {
-        if (done.has(s)) continue;
-        const isRollup = s.rule.valueRule === 'rollup';
-        if (!s.rule.formula) { s.status = 'formula_missing'; done.add(s); moved = true; continue; }
-        const parsed = parsedOf.get(s);
-        if (parsed instanceof Error) { s.status = 'formula_error'; s.problem = parsed.message; done.add(s); moved = true; continue; }
-        if (isRollup && (!children || !children.length)) {
-          s.status = 'no_bom';
-          s.note = isMachine ? 'A machine has no BOM.' : children ? 'Its BOM has no lines yet.' : 'It has no BOM to roll up.';
-          done.add(s); moved = true; continue;
-        }
-        const waiting = parsed.references.some((code) => !lookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
-        if (waiting) continue;
-        const out = evaluateFormula(parsed, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null, null,
-          (code) => tableLookup.get(code) ?? null);
-        done.add(s);
-        moved = true;
-        if (out.value === null) {
-          s.status = out.missing ? 'waiting_inputs' : 'formula_error';
-          if (out.missing) s.missingInputs = out.missing;
-          if (out.error) s.problem = out.error;
-        } else {
-          s.value = {
-            raw: out.value,
-            display: displayOf(out.value, s.spec, optionById),
-            source: isRollup ? 'rollup' : 'calculated',
-            from: isRollup ? `BOM · ${children.length} line${children.length === 1 ? '' : 's'}` : `formula ${s.rule.formula.code}`,
-          };
-          s.status = isRollup ? 'rollup' : 'calculated';
-          lookup.set(s.spec.code, out.value);
-          effectiveRows.set(s.spec.id, { value_number: out.value, value_text: null, value_bool: null, value_date: null, option_id: null });
-        }
-      }
-    }
-    for (const s of calc) {
-      if (!done.has(s)) { s.status = 'formula_cycle'; s.problem = 'This formula depends on itself through other calculated values.'; }
-    }
+    if (!isMachine && master.id != null && needs.any) children = await rollupChildren(db, companyId, master.id, needs.terms);
+    const mine = draftValues || selfIndex < 0 ? [] : values.filter((v) => levelOf.get(`${v.subject_type}:${v.subject_id}`) === selfIndex);
+    workOutFormulas(specs, { parse, children, isMachine, optionById, effectiveRows, fallbacks, facts: drawingFactsOf(mine) });
   }
 
   specs.sort((a, b) => CAPTURE_DEPTH[a.captureAt] - CAPTURE_DEPTH[b.captureAt]
@@ -449,8 +565,9 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   if (!draftValues && selfIndex >= 0) {
     for (const v of values) if (levelOf.get(`${v.subject_type}:${v.subject_id}`) === selfIndex) ownRows.set(v.specification_id, v);
   }
+  // What the drawing says is a fact the record holds, not a value somebody forgot to ask for.
   const unassigned = [...ownRows.values()]
-    .filter((v) => !resolvedItemSpecs.has(v.specification_id))
+    .filter((v) => !resolvedItemSpecs.has(v.specification_id) && !DRAWING_FACT_SPECS.has(String(v.spec_code ?? '').toUpperCase()))
     .map((v) => ({ code: v.spec_code, name: v.spec_name, source: v.source, raw: rawOf(v, v.data_type) }));
 
   return {
@@ -467,10 +584,10 @@ export async function resolve(db, companyId, { master = null, machine = null, no
 
 export function publicResolution(r) {
   const { internal, ...rest } = r;
-  // On an item, a value cutting and nesting write reads as worked out (records.WORKED_OUT_SPECS).
+  // On an item, a value cutting and nesting write — or the drawing — reads as worked out (records.workedOutWhy).
   if (rest.mode === 'item' && Array.isArray(rest.specs)) {
-    rest.specs = rest.specs.map((s) => (WORKED_OUT_SPECS.has(String(s.spec?.code ?? '').toUpperCase()) && ['entered', 'defaulted'].includes(s.rule?.valueRule)
-      ? { ...s, rule: { ...s.rule, valueRule: 'calculated', workedOut: WORKED_OUT_WHY } }
+    rest.specs = rest.specs.map((s) => (workedOutWhy(s.spec?.code) && ['entered', 'defaulted'].includes(s.rule?.valueRule) && !isWorkedDefault(s.rule)
+      ? { ...s, rule: { ...s.rule, valueRule: 'calculated', workedOut: workedOutWhy(s.spec.code) } }
       : s));
   }
   return rest;

@@ -81,7 +81,7 @@ import {
 } from './materialReadyService.js';
 import { resolveLineRecords } from './orderValuesService.js';
 import { effectiveByCode, levelsOfResolution, dateText } from './resolutionService.js';
-import { loadMachineSide, flowSteps, opsOfFlow } from './timeEstimateService.js';
+import { loadMachineSide, flowSteps, opsOfFlow, estimateOnMachine } from './timeEstimateService.js';
 import { valueReaders, productionMachineIds } from './operationService.js';
 import { machinesCalendar } from './shiftService.js';
 import { LEAF_DEPTH, levelName } from './tree.js';
@@ -368,7 +368,7 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
     releaseIds.length
       ? db.query(
         `SELECT r.order_line_id, pi.order_piece_id, pi.code AS piece_code, pi.item_id, pi.bom_line_id,
-                s.operation_id, s.sequence, s.state, s.quantity, s.qty_good, s.est_minutes, s.machine_id, s.work_order_id
+                s.operation_id, s.sequence, s.state, s.quantity, s.qty_good, s.eff_minutes AS est_minutes, s.machine_id, s.work_order_id
            FROM cf_production_steps s
            JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id AND pi.deleted_at IS NULL
            JOIN cf_production_releases r ON r.company_id = pi.company_id AND r.id = pi.release_id
@@ -485,8 +485,13 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
         for (const o of ops.values()) {
           const f = machineSide.estimate(o.id, readersOf(n.itemId));
           const ov = over.get(`${n.bomLineId ?? 0}:${o.id}`) ?? null;
-          const work = ov?.work != null ? ov.work : f.work;
-          const setup = ov?.setup != null ? ov.setup : f.setup;
+          // §58: an operation ONE machine alone can do is planned on that machine's own time — the
+          // same rule release applies (writeSteps). Everything else is planned on the standard.
+          const sole = f.work != null ? machineSide.soleMachine(o.id) : null;
+          const onSole = sole != null ? machineSide.estimateOn(o.id, readersOf(n.itemId), sole) : null;
+          const t = onSole?.ok ? onSole : f;
+          const work = ov?.work != null ? ov.work : t.work;
+          const setup = ov?.setup != null ? ov.setup : t.setup;
           if (work == null) { own[n.k].noRate.add(`${n.bomLineId ?? 0}:${o.id}`); continue; }
           const minutes = ((setup ?? 0) * share + work * q) * o.passes;
           const onContract = n.lockedPieceId != null && contractorCells.has(`${n.lockedPieceId}:${o.id}`);
@@ -1753,4 +1758,120 @@ export async function putSettings(db, c, input = {}) {
     [c.companyId, next.minLinesPerMonth, next.allowPartialLines ? 1 : 0, c.userId ?? null],
   );
   return { settings: next };
+}
+
+/* ===========================================================================
+ * §58 — a unit's MACHINES: which machine its steps are on, and what each would take
+ * ======================================================================== */
+
+/**
+ * The planner books on machine TYPES (a "function" is a type; capacity is the type's machines
+ * together). Inside a type a unit's steps can be put on ONE machine — that is what this pair does.
+ * Only a RELEASED line has steps to put anywhere; before release a type with a single machine is
+ * already planned on that machine's time (getPlanner) and the rest on the standard.
+ *
+ * The steps of a unit = the not-started, in-house steps of its piece and everything under it
+ * ('p<piece>' — and 'p<piece>#n', whose n pieces are one row and share their steps) or of its whole
+ * line ('l<line>'). One read (a recursive walk down cf_order_pieces).
+ */
+async function unitSteps(db, companyId, unitKey) {
+  const u = parseUnitKey(unitKey);
+  if (!u || u.kind === 'g') throw invalid('INVALID', 'That is not a card of the plan.');
+  const base = `SELECT s.id, s.operation_id, s.machine_id, s.eff_minutes, s.est_minutes, pi.code AS piece_code, r.order_line_id
+                  FROM cf_production_steps s
+                  JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id AND pi.deleted_at IS NULL
+                  JOIN cf_production_releases r ON r.company_id = pi.company_id AND r.id = pi.release_id AND r.deleted_at IS NULL
+                 WHERE s.company_id = ? AND s.deleted_at IS NULL AND s.work_order_id IS NULL
+                   AND (s.state = 'pending' OR (s.state = 'on_hold' AND s.held_from = 'pending'))`;
+  if (u.kind === 'l') {
+    const [rows] = await db.query(`${base} AND r.order_line_id = ?`, [companyId, u.id]);
+    return { unit: u, rows };
+  }
+  const [rows] = await db.query(
+    `WITH RECURSIVE sub AS (
+       SELECT id FROM cf_order_pieces WHERE company_id = ? AND id = ? AND deleted_at IS NULL
+       UNION ALL
+       SELECT p.id FROM cf_order_pieces p JOIN sub ON p.parent_id = sub.id WHERE p.company_id = ? AND p.deleted_at IS NULL)
+     ${base} AND pi.order_piece_id IN (SELECT id FROM sub)`,
+    [companyId, u.id, companyId, companyId],
+  );
+  return { unit: u, rows };
+}
+
+const r3m = (n) => Math.round(Number(n) * 1000) / 1000;
+
+/**
+ * GET /planner/units/:unitKey/machines — per machine type the unit still has work on: the minutes
+ * now, and for EVERY machine of that type what the same steps would take there (old → new), whether
+ * it has its own chart, and — when its chart has no answer for a piece — that it is not available,
+ * with the sentence. ROUND TRIPS: steps 1 + machine side 5 + ONE dry pass of estimateOnMachine a
+ * machine type the unit has work on (≈ 14 for a line; a unit rarely spans more than a few types).
+ */
+export async function getUnitMachines(db, companyId, unitKey) {
+  const { unit, rows } = await unitSteps(db, companyId, unitKey);
+  const out = { unitKey: String(unitKey), released: rows.length > 0, sharedRow: unit.copy != null, functions: [] };
+  if (!rows.length) {
+    out.note = 'A machine is picked once the line is released and has steps that have not started. Until then a machine type with a single machine is planned on that machine\'s own time, every other on the standard.';
+    return out;
+  }
+  const operations = new Map(rows.map((r) => [r.operation_id, { id: r.operation_id, code: String(r.operation_id) }]));
+  const side = await loadMachineSide(db, companyId, operations);
+  // A step belongs to the machine type whose machines can do it (two types that can: it shows under both).
+  const groups = new Map();
+  for (const r of rows) {
+    for (const x of side.machinesOf(r.operation_id)) {
+      if (!groups.has(x.typeId)) groups.set(x.typeId, { typeId: x.typeId, steps: new Map(), machines: new Map() });
+      const g = groups.get(x.typeId);
+      g.steps.set(r.id, r);
+      g.machines.set(x.machine.id, x.machine);
+    }
+  }
+  for (const g of [...groups.values()].sort((a, b) => a.typeId - b.typeId)) {
+    const steps = [...g.steps.values()];
+    const dry = await estimateOnMachine(db, { companyId }, steps.map((x) => x.id), undefined, { apply: false, refuse: false, compare: [...g.machines.keys()] });
+    const now = steps.reduce((t, x) => t + Number(x.eff_minutes ?? 0), 0);
+    const standard = steps.reduce((t, x) => t + Number(x.est_minutes ?? 0), 0);
+    const onIds = new Set(steps.map((x) => x.machine_id ?? 0));
+    const node = side.nodeOf(g.typeId);
+    out.functions.push({
+      key: String(g.typeId), name: node?.name ?? `Machine type ${g.typeId}`, steps: steps.length, stepIds: steps.map((x) => x.id),
+      minutesNow: r3m(now), standardMinutes: r3m(standard),
+      // the one machine every step is on, or null (none, or several)
+      machineId: onIds.size === 1 && !onIds.has(0) ? [...onIds][0] : null, mixed: onIds.size > 1,
+      machines: (dry.compare ?? []).map((cmp) => {
+        const m = g.machines.get(cmp.machineId);
+        const available = cmp.cannot.length === 0;
+        return {
+          id: m.id, code: m.code, name: m.name, ownChart: cmp.own, available,
+          minutes: available ? cmp.minutes : null, change: available ? r3m(cmp.minutes - now) : null,
+          reason: available ? null : `${cmp.cannot[0]}${cmp.cannot.length > 1 ? ` (and ${cmp.cannot.length - 1} more)` : ''}`,
+          stepsHere: steps.filter((x) => x.machine_id === m.id).length,
+        };
+      }).sort((a, b) => String(a.code).localeCompare(String(b.code))),
+    });
+  }
+  if (unit.copy != null) out.note = 'These pieces are one row of the order: they share their steps, so they move to a machine together.';
+  return out;
+}
+
+/**
+ * PUT /planner/units/:unitKey/machine { functionKey, machineId | null } — puts the unit's not-started
+ * steps of that machine type on one machine (null = off any machine: back to the standard time).
+ * estimateOnMachine does the write and refuses, in words, a machine whose chart has no answer.
+ * → { before, after, change, steps, machines: getUnitMachines(...) }.
+ */
+export async function putUnitMachine(db, c, unitKey, input = {}) {
+  const fn = String(input.functionKey ?? '');
+  const machineId = input.machineId == null || input.machineId === '' ? null : Number(input.machineId);
+  if (machineId != null && !(Number.isInteger(machineId) && machineId > 0)) throw invalid('INVALID', 'machineId is a machine, or null to take the steps off their machine.');
+  const view = await getUnitMachines(db, c.companyId, unitKey);
+  const group = view.functions.find((g) => g.key === fn);
+  if (!group) throw invalid('INVALID', view.released ? 'This card has no open work on that machine type.' : view.note);
+  if (machineId != null && !group.machines.some((m) => m.id === machineId)) throw invalid('NOT_ELIGIBLE', `That machine is not one of ${group.name}'s machines for this work.`);
+  const r = await estimateOnMachine(db, c, group.stepIds, machineId);
+  return {
+    unitKey: String(unitKey), functionKey: fn, machineId, steps: r.steps.length, changed: r.changed,
+    before: r.minutesBefore, after: r.minutesAfter, change: r3m(r.minutesAfter - r.minutesBefore),
+    machines: await getUnitMachines(db, c.companyId, unitKey),
+  };
 }

@@ -229,7 +229,7 @@ export async function instantiateTemplate(db, c, { definition, ownerLineId, plac
   // ---- 6. values, then names and codes — a code may print a value ----------
   const created = order.map((n) => n.id);
   // The values each row's own flow reads become its rules (flowSpecService) before the values settle.
-  await syncFlowSpecs(db, c, created);
+  await syncFlowSpecs(db, c, created, { settle: false });   // the values are worked out on the next line, once
   await materializeLineRecords(db, c, ownerLineId, created);
   await nameNewItems(db, c, {
     rootId: root.id,

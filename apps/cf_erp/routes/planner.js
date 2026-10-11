@@ -10,6 +10,8 @@
  *                                      Save button: entries + each line's unit order (§38), one transaction
  *   PUT /planner/priorities            { orderIds: [...] }  (the whole ranking)
  *   PUT /planner/lines/:id/level       { level: 'line' | '0' | '1' … | null }
+ *   GET /planner/units/:unitKey/machines   per machine type: minutes now, and on each machine (§58)
+ *   PUT /planner/units/:unitKey/machine    { functionKey, machineId | null } — put its open steps on one machine
  *   PUT /planner/targets               { 'YYYY-MM': tonnes | null }
  *   PUT /planner/settings              { minLinesPerMonth?, allowPartialLines? }
  *
@@ -25,7 +27,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putLineSplit, putTargets, putSettings } from '../services/plannerService.js';
+import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putLineSplit, putTargets, putSettings, getUnitMachines, putUnitMachine } from '../services/plannerService.js';
 
 const router = Router();
 
@@ -42,6 +44,11 @@ router.put('/planner/lines/:id/level', guard(PERM.production),
   handle((req) => withTransaction((db) => putLineLevel(db, ctx(req), intParam(req.params.id, 'id'), req.body ?? {}))));
 router.put('/planner/lines/:id/splits', guard(PERM.production),
   handle((req) => withTransaction((db) => putLineSplit(db, ctx(req), intParam(req.params.id, 'id'), req.body ?? {}))));
+// §58 — a card's machines: what its open steps take on each machine of a type, and putting them on one.
+router.get('/planner/units/:unitKey/machines', guard(PERM.productionView),
+  handle((req) => getUnitMachines(pool, ctx(req).companyId, req.params.unitKey)));
+router.put('/planner/units/:unitKey/machine', guard(PERM.production),
+  handle((req) => withTransaction((db) => putUnitMachine(db, ctx(req), req.params.unitKey, req.body ?? {}))));
 router.put('/planner/targets', guard(PERM.production),
   handle((req) => withTransaction((db) => putTargets(db, ctx(req), req.body ?? {}))));
 router.put('/planner/settings', guard(PERM.production),

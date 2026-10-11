@@ -7,6 +7,7 @@
  * (models/init.sql §8). The kind of the parent fixes the BOM's type.
  */
 import { kindOf } from './records.js';
+import { levelName } from './tree.js';
 
 export const BOM_TYPE_BY_KIND = { catalog: 'standard', template: 'template', temporary: 'custom' };
 export const bomTypeOf = (master) => BOM_TYPE_BY_KIND[kindOf(master)] ?? null;
@@ -215,27 +216,81 @@ export async function rollupChildren(db, companyId, parentId, specCodes) {
   const lines = await linesOfBom(db, companyId, bom.id);
   if (!lines.length) return [];
   const itemIds = lines.filter((l) => l.child_record_kind === 'item').map((l) => l.child_id);
+  const childIds = [...new Set(lines.map((l) => l.child_id))];
   const values = new Map(itemIds.map((id) => [id, new Map()]));
+  const words = new Map(itemIds.map((id) => [id, new Map()]));
   if (itemIds.length && specCodes.length) {
     const [rows] = await db.query(
-      `SELECT v.subject_id, s.code, v.value_number FROM cf_spec_values v
+      `SELECT v.subject_id, s.code, v.value_number, v.value_text, o.value AS option_value, o.label AS option_label
+         FROM cf_spec_values v
          JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
+         LEFT JOIN cf_spec_options o ON o.id = v.option_id
         WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL
           AND s.code IN (?)`,
       [companyId, itemIds, specCodes],
     );
-    for (const r of rows) if (r.value_number != null) values.get(r.subject_id).set(r.code.toUpperCase(), Number(r.value_number));
+    for (const r of rows) {
+      const code = r.code.toUpperCase();
+      if (r.value_number != null) values.get(r.subject_id).set(code, Number(r.value_number));
+      const w = valueWord({ optionValue: r.option_value, optionLabel: r.option_label, text: r.value_text });
+      if (w != null) words.get(r.subject_id).set(code, w);
+    }
   }
+  // What each child IS, for a formula that tells children apart (formulaEngine: children.name / .variant …).
+  const [kin] = await db.query(
+    `SELECT m.id, d.code AS def_code, d.short_name AS def_short_name, d.name AS def_name,
+            n1.depth AS d1, n1.code AS c1, n1.name AS n1, n2.depth AS d2, n2.code AS c2, n2.name AS n2, n3.depth AS d3, n3.code AS c3, n3.name AS n3
+       FROM cf_master_records m
+       LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+       LEFT JOIN cf_master_records d ON d.company_id = m.company_id AND d.id = i.source_definition_id AND d.deleted_at IS NULL
+       LEFT JOIN cf_classification_nodes n1 ON n1.company_id = m.company_id AND n1.id = m.classification_id AND n1.deleted_at IS NULL
+       LEFT JOIN cf_classification_nodes n2 ON n2.company_id = m.company_id AND n2.id = n1.parent_id AND n2.deleted_at IS NULL
+       LEFT JOIN cf_classification_nodes n3 ON n3.company_id = m.company_id AND n3.id = n2.parent_id AND n3.deleted_at IS NULL
+      WHERE m.company_id = ? AND m.id IN (?)`,
+    [companyId, childIds],
+  );
+  const kinOf = new Map(kin.map((k) => [k.id, k]));
   return lines.map((l) => {
     const isItem = l.child_record_kind === 'item';
     const own = values.get(l.child_id);
+    const k = kinOf.get(l.child_id) ?? {};
+    const levels = {};
+    for (const i of [1, 2, 3]) if (k[`d${i}`] != null) levels[levelName(Number(k[`d${i}`])).toUpperCase()] = { code: k[`c${i}`], name: k[`n${i}`] };
     return {
       lineId: l.id,
       label: isItem ? (l.child_code ?? l.child_name) : `${l.child_code ?? l.child_name} (not chosen yet)`,
       quantity: Number(l.quantity),
       get: (code) => (isItem ? own.get(code) ?? null : null),
+      word: childWordReader({
+        names: [l.child_name, l.child_short_name, l.child_code, k.def_name, k.def_short_name, k.def_code],
+        role: l.role, levels, valueWord: (code) => (isItem ? words.get(l.child_id)?.get(code) ?? null : null),
+      }),
     };
   });
+}
+
+/** A pick-list or text value as a word a formula can compare: an option by its value or its label. */
+export function valueWord({ optionValue = null, optionLabel = null, text = null }) {
+  if (optionValue != null || optionLabel != null) return { names: [optionValue, optionLabel] };
+  return text != null && String(text).trim() !== '' ? String(text) : null;
+}
+
+/**
+ * How a roll-up formula reads what a BOM child IS (formulaEngine CHILD_WORDS), the same for
+ * resolve() and for orderValuesService's mirror:
+ *   NAME     the row's own name, short name or code — or those of the template it was made from
+ *   ROLE     the description on its BOM line
+ *   VARIANT / SUBFAMILY / FAMILY   its place in the tree, by name or code
+ *   <CODE>   a pick-list or text value of the child's own
+ */
+export function childWordReader({ names, role, levels, valueWord: valueOf }) {
+  const named = { names: names.filter((x) => x != null && String(x).trim() !== '') };
+  return (code) => {
+    if (code === 'NAME') return named;
+    if (code === 'ROLE') return role ?? null;
+    if (code === 'VARIANT' || code === 'SUBFAMILY' || code === 'FAMILY') return levels?.[code] ?? null;
+    return valueOf(code);
+  };
 }
 
 /** A record's own stored value rows for some specifications, keyed by spec id. */

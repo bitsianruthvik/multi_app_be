@@ -83,6 +83,8 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     // Ordinary references must all be numbers — a table read this way (not
     // through LOOKUP) gets its own message, so it says what to do about it.
     const words = new Set([...parsed.itemRefs, ...parsed.machineRefs]);
+    // A BOM child's pick-list or text value is a word too: children.PART_FUNCTION = "Web" tells children apart.
+    for (const n of parsed.rollupTerms) words.add(n);
     for (const n of [...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs]) {
       const meta = known.get(n);
       if (!meta) problems.push(`Unknown specification ${n}.`);

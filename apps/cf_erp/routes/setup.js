@@ -142,7 +142,7 @@ router.post('/formulas/check', guard(PERM.view), handle(async (req) => {
   // A chart written by its name is checked as the LOOKUP it stands for (lib/chartFormula), and the answer says so.
   const expanded = typeof raw.expression === 'string' ? expandCharts(raw.expression, await chartBindings(pool, ctx(req).companyId)) : raw.expression;
   const body = { ...raw, expression: expanded };
-  const { parsed, ...rest } = body.itemId || body.machineId
+  const { parsed, ...rest } = body.itemId || body.machineId || body.machineTypeId
     ? await checkForBuilder(pool, ctx(req).companyId, body)
     : await checkFormula(pool, ctx(req).companyId, body.expression, body.sample ?? null);
   return { ok: !!parsed && !rest.problems.length, ...rest, expanded: expanded !== raw.expression ? expanded : null };

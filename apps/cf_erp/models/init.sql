@@ -5273,3 +5273,49 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plan_entries' AND COLUMN_NAME = 'material_date');
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_plan_entries ADD COLUMN material_date DATE NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- §58  Machine times (2026-10-12): a machine's own chart COUNTS — two times on every production step.
+-- Additive and guarded: safe to re-run. Service: timeEstimateService.estimateOnMachine (the one writer).
+-- (§57 is left for the derived-values work going on beside this one.)
+--
+-- est_setup_minutes / est_work_minutes / est_minutes   the STANDARD time, exactly as before: the machine
+--                        TYPE's rule and values, written at release and never changed after.
+-- mach_setup_minutes / mach_work_minutes / mach_minutes  the MACHINE time: the same rule worked out with the
+--                        value chain of the machine the step is on (machine_id) - the machine's own entered
+--                        values over its type's. A typed time (cf_time_overrides) still wins over both.
+--                        NULL while no machine is on the step, or the machine gave no answer.
+-- mach_machine_id        the machine those three were worked out for; mach_at when.
+-- eff_setup_minutes / eff_work_minutes / eff_minutes    THE TIME TO USE - the machine time when it is for the
+--                        machine the step is on now, else the standard. Worked out by the database (VIRTUAL),
+--                        so no reader re-derives it and a writer that moved machine_id without re-estimating
+--                        falls back to the standard instead of showing another machine's number.
+-- idx_cprs_machine       "the not-started steps on this machine" (a machine's chart was edited).
+-- Separate statements for a column and its index: TiDB refuses an index on a column added in the same ALTER.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'mach_setup_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN mach_setup_minutes DECIMAL(12,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'mach_work_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN mach_work_minutes DECIMAL(12,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'mach_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN mach_minutes DECIMAL(14,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'mach_machine_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN mach_machine_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'mach_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN mach_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'eff_setup_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN eff_setup_minutes DECIMAL(12,3) GENERATED ALWAYS AS (IF(machine_id IS NOT NULL AND machine_id = mach_machine_id AND mach_minutes IS NOT NULL, mach_setup_minutes, est_setup_minutes)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'eff_work_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN eff_work_minutes DECIMAL(12,3) GENERATED ALWAYS AS (IF(machine_id IS NOT NULL AND machine_id = mach_machine_id AND mach_minutes IS NOT NULL, mach_work_minutes, est_work_minutes)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'eff_minutes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN eff_minutes DECIMAL(14,3) GENERATED ALWAYS AS (IF(machine_id IS NOT NULL AND machine_id = mach_machine_id AND mach_minutes IS NOT NULL, mach_minutes, est_minutes)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND INDEX_NAME = 'idx_cprs_machine');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_production_steps ADD KEY idx_cprs_machine (company_id, machine_id, state)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

@@ -23,6 +23,16 @@
  * and `machineInfo` with the basis), and when an input is missing it says what
  * in plain words (`missing`) — never an invented number.
  *
+ * THAT IS THE STANDARD TIME (est_* on a production step). Since init.sql §58 a
+ * step also carries a MACHINE time (mach_*): the same rule with the value chain
+ * of the machine the step is on — its own entered values over its type's. It is
+ * written by estimateOnMachine (bottom of this file), the ONE writer of a
+ * step's machine, the moment a machine is known (release when one machine alone
+ * can do the operation, the planner's card, the floor's start), and what every
+ * reader uses is eff_* — the machine time when there is one, else the standard.
+ * A machine whose chart has no answer is refused in words, never given the
+ * type's number. ARCHITECTURE.md §13 "a machine's own chart COUNTS".
+ *
  * ONE COMPUTATION. The arithmetic is operationService.evaluateRuleTimes — the
  * same function timingPreview (the machine screen's "time this") uses. What is
  * new here is doing it for every (row, operation) of a line at once:
@@ -148,7 +158,7 @@ export async function loadMachineSide(db, companyId, operations, date) {
     const [[ruleRows], [valueRows]] = await Promise.all([
       db.query(
         `SELECT a.specification_id, a.subject_type, a.subject_id, a.is_applicable, a.value_rule,
-                s.code AS spec_code, s.data_type, s.table_config
+                s.code AS spec_code, s.name AS spec_name, s.data_type, s.table_config
            FROM cf_spec_assignments a
            JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL
           WHERE a.company_id = ? AND a.deleted_at IS NULL AND a.capture_at = 'item' AND (${sa.sql})`,
@@ -261,7 +271,78 @@ export async function loadMachineSide(db, companyId, operations, date) {
       machineInfo: { basis: c.basis, id: c.id, code: c.code, name: c.name }, missing: null,
     };
   }
-  return { estimate };
+  /* ---- §58: the same rule on ONE machine (its own entered values over its type's) ---- */
+
+  /** Every active machine that may do the operation: [{ machine, rule, typeId }]. */
+  const machinesOfOp = new Map();
+  const machinesOf = (opId) => {
+    if (!machinesOfOp.has(opId)) {
+      machinesOfOp.set(opId, (perOp.get(opId) ?? []).flatMap((t) => t.machines.map((x) => ({ machine: x.machine, rule: x.rule, typeId: t.nodeId }))));
+    }
+    return machinesOfOp.get(opId);
+  };
+  /** The one machine that can do the operation, when there is exactly one — then it IS the machine, nobody has to pick. */
+  const soleMachine = (opId) => { const l = machinesOf(opId); return l.length === 1 ? l[0].machine.id : null; };
+  /** A machine "has its own chart" when a value was entered on the machine itself (a copy of its type's is not its own). */
+  const hasOwnValues = (machineId) => {
+    for (const v of (valuesAt.get(subjectKey('machine', machineId)) ?? new Map()).values()) {
+      if (v.source != null && v.source !== 'entered') continue;
+      if (v.value_number != null || v.value_json != null) return true;
+    }
+    return false;
+  };
+  const specNames = new Map();   // CODE -> { name, dataType, tableConfig }
+  for (const m of rulesAt.values()) {
+    for (const r of m.values()) {
+      specNames.set(String(r.spec_code).toUpperCase(), { name: r.spec_name ?? r.spec_code, dataType: r.data_type, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
+    }
+  }
+  const expressionsOf = (rule) => [rule?.work, rule?.setup].map((t) => t?.expression ?? t?.formula?.expression ?? '').join(' ');
+  const wordOf = (v) => (v == null || v === '' ? 'nothing' : typeof v === 'object' ? (v.name ?? v.code ?? String(v.id ?? '')) : String(v));
+  /** The charts a rule reads, each with the piece's values it is read by: "Cut speed (Thickness 40 mm, Grade E350)". */
+  const chartWords = (rule, item) => {
+    const out = [];
+    const seen = new Set();
+    for (const m of expressionsOf(rule).matchAll(/machine\.([A-Za-z0-9_]+)/gi)) {
+      const code = m[1].toUpperCase();
+      const spec = specNames.get(code);
+      if (!spec || spec.dataType !== 'table' || seen.has(code)) continue;
+      seen.add(code);
+      const axes = (spec.tableConfig?.axes ?? []).map((a) => {
+        const label = a.label ?? a.field ?? a.level ?? '';
+        if (a.kind === 'level') return `${label} ${wordOf(item?.level?.(a.level))}`;
+        const v = a.field ? (item?.number(String(a.field).toUpperCase()) ?? item?.text?.(String(a.field).toUpperCase()) ?? null) : null;
+        return `${label} ${wordOf(v)}${v != null && a.unit ? ` ${a.unit}` : ''}`;
+      });
+      out.push(`${spec.name}${axes.length ? ` (${axes.join(', ')})` : ''}`);
+    }
+    return out;
+  };
+  /**
+   * The estimate for one operation on one item ON ONE MACHINE: the rule that applies to that machine,
+   * fed the machine's value chain (valuesOfChain(..., true): its own entered values over its type's).
+   * { ok: true, setup, work, machine, own } or { ok: false, kind: 'not_eligible' | 'cannot', reason } —
+   * never the type's number in place of an answer the machine does not have.
+   */
+  function estimateOn(opId, item, machineId) {
+    const op = operations.get(opId) ?? { code: String(opId) };
+    const opName = op.name && op.name !== op.code ? `${op.name} (${op.code})` : op.code;
+    const hit = machinesOf(opId).find((x) => Number(x.machine.id) === Number(machineId));
+    if (!hit) {
+      const m = setup.machines.find((x) => Number(x.id) === Number(machineId));
+      return { ok: false, kind: 'not_eligible', reason: m ? `${m.code} is not set up to do ${opName}.` : `That machine is not active, so it cannot do ${opName}.` };
+    }
+    const m = hit.machine;
+    const info = { id: m.id, code: m.code, name: m.name, typeId: hit.typeId };
+    const r = evaluateRuleTimes(hit.rule, { item, machine: readersOfMachine(m) });
+    if (r.work.minutes != null && r.setup.minutes != null) {
+      return { ok: true, setup: round3(r.setup.minutes), work: round3(r.work.minutes), machine: info, own: hasOwnValues(m.id) };
+    }
+    const charts = chartWords(hit.rule, item);
+    const chartPart = charts.length ? ` its chart ${charts.join(' and ')} has no answer —` : '';
+    return { ok: false, kind: 'cannot', machine: info, own: hasOwnValues(m.id), reason: `${m.code} cannot do ${opName} on this piece:${chartPart} ${reasonOf(r, op)}`.replace(/\s+/g, ' ') };
+  }
+  return { estimate, estimateOn, machinesOf, soleMachine, hasOwnValues, nodeOf: (id) => setup.nodesById.get(id) ?? null };
 }
 
 /* ===========================================================================
@@ -346,9 +427,10 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
   const over = overrides ?? await loadOverrides(db, companyId, lineId);
   if (!pairs.length) return () => null;
   const itemReaders = await itemReadersOf(db, companyId, lineId);
-  const { estimate } = await loadMachineSide(db, companyId, ops, date);
+  const side = await loadMachineSide(db, companyId, ops, date);
+  const { estimate, estimateOn } = side;
   const memo = new Map();
-  return (bomLineId, itemId, operationId) => {
+  const cell = (bomLineId, itemId, operationId) => {
     const mk = `${itemId}:${operationId}`;
     if (!memo.has(mk)) memo.set(mk, estimate(operationId, itemReaders(itemId)));
     const f = memo.get(mk);
@@ -366,6 +448,237 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
       note: o?.note ?? null,
     };
   };
+  const memoOn = new Map();
+  /**
+   * §58 — the same cell ON ONE MACHINE. A typed time still wins: typed work needs no chart at all,
+   * so a machine whose chart cannot answer is not refused for a row someone typed.
+   * { ok, work, setup, overridden, machine, own } | { ok: false, kind, reason }.
+   */
+  cell.onMachine = (bomLineId, itemId, operationId, machineId) => {
+    const mk = `${itemId}:${operationId}:${machineId}`;
+    if (!memoOn.has(mk)) memoOn.set(mk, estimateOn(operationId, itemReaders(itemId), machineId));
+    const m = memoOn.get(mk);
+    if (!m.ok && m.kind === 'not_eligible') return m;
+    const o = over.get(`${bomLineId ?? 0}:${operationId}`) ?? null;
+    if (o?.work != null) {
+      const std = cell(bomLineId, itemId, operationId);
+      return { ok: true, work: o.work, setup: o.setup != null ? o.setup : (m.ok ? m.setup : std.setup ?? 0), overridden: true, machine: m.machine, own: !!m.own };
+    }
+    if (!m.ok) return m;
+    return { ok: true, work: m.work, setup: o?.setup != null ? o.setup : m.setup, overridden: false, machine: m.machine, own: !!m.own };
+  };
+  /** The one machine that can do the operation (exactly one eligible, active) — it is known without anyone picking. */
+  cell.soleMachine = (operationId) => side.soleMachine(operationId);
+  cell.side = side;
+  return cell;
+}
+
+/* ===========================================================================
+ * §58 — MACHINE TIMES: the one writer of a step's machine and its machine time
+ * ======================================================================== */
+
+/** minutes of a step = setup once + work a piece × its quantity (as release writes est_minutes). */
+export const stepMinutes = (setup, work, quantity) => (work == null ? null : Number(((setup ?? 0) + work * Number(quantity)).toFixed(3)));
+const num = (v) => (v == null ? null : Number(v));
+const NOT_STARTED_SQL = "(s.state = 'pending' OR (s.state = 'on_hold' AND s.held_from = 'pending'))";
+export const MACHINE_CANNOT = 'MACHINE_CANNOT';
+
+/**
+ * THE function every write of cf_production_steps.machine_id goes through (the production ledger's
+ * rule, "every step write must call ledgerOnSteps", for machines). It works out the MACHINE time of
+ * steps — the step's rule with the machine's value chain, the line's typed times over it — and
+ * writes machine_id + mach_* together, so eff_* (the time every reader uses) is right the moment the
+ * machine is known.
+ *
+ *   machineId   a machine id   put these steps on that machine (only steps not started yet: a started
+ *                              step belongs to the machine that started it)
+ *               null           take them off their machine: back to the standard time
+ *               undefined      the machine each step ALREADY has — after a write that set machine_id
+ *                              itself, or when the machine's chart changed
+ *   opts.apply           false = a dry run: nothing is written, the same answer comes back
+ *   opts.refuse          true (default): a step the machine cannot take (not set up for the
+ *                        operation, or its chart has no answer while the standard has one) throws
+ *                        MACHINE_CANNOT naming machine, chart and the piece's values — nothing is written
+ *   opts.notStartedOnly  leave started and done steps exactly as they are. (Even without it a started
+ *                        step that HAS its machine's time keeps it — history is never rewritten;
+ *                        only one that has none yet, from before §58, is given it.)
+ *   opts.compare         [machine ids] — a dry look at the same steps on each of those machines, in the
+ *                        same pass (no more reads): out.compare = [{ machineId, minutes, cannot, own }]
+ *   opts.dropCannot      with refuse false: a not-started step its machine can no longer answer for is
+ *                        taken OFF the machine (counted in `dropped`), never left on the type's number
+ *
+ * Returns { steps: [{ id, pieceCode, operation, state, quantity, machineId, standard, machine,
+ * before, after, cannot, skipped }], changed, minutesBefore, minutesAfter, cannot: [sentence], dropped }.
+ * before / after = the EFFECTIVE minutes (machine time when on a machine, else standard).
+ *
+ * ROUND TRIPS: steps 1 · machine side 5 · the lines' typed times 1 · values 6-8 a LINE (side by side)
+ * · one UPDATE per 500 steps. The same for 1 step or 5,000 of a line.
+ */
+export async function estimateOnMachine(db, c, stepIds, machineId, opts = {}) {
+  const { apply = true, refuse = true, notStartedOnly = false, dropCannot = false, date } = opts;
+  const companyId = c.companyId;
+  const ids = [...new Set((stepIds ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = { steps: [], changed: 0, minutesBefore: 0, minutesAfter: 0, cannot: [], dropped: 0, written: 0 };
+  if (!ids.length) return out;
+  const explicit = machineId !== undefined;
+  const target = explicit && machineId != null ? Number(machineId) : null;
+  const rows = [];
+  for (let i = 0; i < ids.length; i += 5000) {
+    const [part] = await db.query(
+      `SELECT s.id, s.state, s.held_from, s.quantity, s.operation_id, s.machine_id, s.work_order_id,
+              s.est_setup_minutes, s.est_work_minutes, s.est_minutes, s.mach_minutes, s.mach_machine_id, s.eff_minutes,
+              ${NOT_STARTED_SQL} AS not_started,
+              pi.item_id, pi.bom_line_id, pi.code AS piece_code, r.order_line_id, op.code AS op_code, op.name AS op_name
+         FROM cf_production_steps s
+         JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id
+         JOIN cf_production_releases r ON r.company_id = pi.company_id AND r.id = pi.release_id
+         JOIN cf_operations op ON op.id = s.operation_id
+        WHERE s.company_id = ? AND s.id IN (?) AND s.deleted_at IS NULL`,
+      [companyId, ids.slice(i, i + 5000)],
+    );
+    rows.push(...part);
+  }
+  // Which steps this call may touch, and the machine each is worked out for.
+  const work = [];
+  for (const s of rows) {
+    const notStarted = !!Number(s.not_started);
+    const shaped = {
+      id: s.id, pieceCode: s.piece_code ?? null, operation: { id: s.operation_id, code: s.op_code, name: s.op_name }, state: s.state,
+      quantity: Number(s.quantity), machineId: s.machine_id ?? null,
+      standard: { setup: num(s.est_setup_minutes), work: num(s.est_work_minutes), minutes: num(s.est_minutes) },
+      machine: null, before: num(s.eff_minutes), after: num(s.eff_minutes), cannot: null, skipped: null,
+    };
+    out.steps.push(shaped);
+    if ((explicit || notStartedOnly) && !notStarted) { shaped.skipped = 'started'; continue; }
+    // HISTORY IS NOT REWRITTEN, whoever calls: a started or done step that already has the machine
+    // time of the machine it is on keeps it (a later chart edit must not move it). One that has none
+    // (written before §58 — the backfill) is given it once.
+    if (!notStarted && s.machine_id != null && Number(s.mach_machine_id) === Number(s.machine_id) && s.mach_minutes != null) { shaped.skipped = 'started'; continue; }
+    work.push({ s, shaped, machine: explicit ? target : s.machine_id ?? null });
+  }
+  const toEvaluate = work.filter((w) => w.machine != null);
+  const compareIds = [...new Set((opts.compare ?? []).map(Number))];
+  const needed = compareIds.length ? work : toEvaluate;
+  if (needed.length) {
+    const operations = new Map();
+    for (const { s } of needed) if (!operations.has(s.operation_id)) operations.set(s.operation_id, { id: s.operation_id, code: s.op_code, name: s.op_name });
+    const lineIds = [...new Set(needed.map((w) => w.s.order_line_id))];
+    const [side, [overRows], ...readersByLine] = await Promise.all([
+      loadMachineSide(db, companyId, operations, date),
+      db.query('SELECT order_line_id, bom_line_id, operation_id, work_minutes, setup_minutes FROM cf_time_overrides WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]),
+      ...lineIds.map((lineId) => itemReadersOf(db, companyId, lineId)),
+    ]);
+    const readersOfLine = new Map(lineIds.map((id, i) => [id, readersByLine[i]]));
+    const over = new Map(overRows.map((o) => [`${o.order_line_id}:${o.bom_line_id ?? 0}:${o.operation_id}`, { work: num(o.work_minutes), setup: num(o.setup_minutes) }]));
+    const memo = new Map();
+    /** One step on one machine: { machine: { setup, work, minutes, own } | null, cannot: sentence | null, own }. */
+    const onMachine = (s, machine) => {
+      const mk = `${s.order_line_id}:${s.item_id}:${s.operation_id}:${machine}`;
+      if (!memo.has(mk)) memo.set(mk, side.estimateOn(s.operation_id, readersOfLine.get(s.order_line_id)(s.item_id), machine));
+      const m = memo.get(mk);
+      const o = over.get(`${s.order_line_id}:${s.bom_line_id ?? 0}:${s.operation_id}`) ?? null;
+      const piece = s.piece_code ?? `step ${s.id}`;
+      if (!m.ok && m.kind === 'not_eligible') return { machine: null, cannot: `${piece}: ${m.reason}`, own: false, notEligible: true };
+      let workMin = null;
+      let setupMin = null;
+      if (o?.work != null) { workMin = o.work; setupMin = o.setup != null ? o.setup : (m.ok ? m.setup : num(s.est_setup_minutes) ?? 0); }
+      else if (m.ok) { workMin = m.work; setupMin = o?.setup != null ? o.setup : m.setup; }
+      // No answer on this machine. With a standard time that is a refusal; with none, the step simply has no time yet.
+      if (workMin == null) return { machine: null, cannot: s.est_minutes != null ? `${piece}: ${m.reason}` : null, own: !!m.own };
+      return { machine: { setup: round3(setupMin), work: round3(workMin), minutes: stepMinutes(setupMin, workMin, s.quantity), own: !!m.own }, cannot: null, own: !!m.own };
+    };
+    for (const w of toEvaluate) {
+      const r = onMachine(w.s, w.machine);
+      w.shaped.machine = r.machine;
+      w.shaped.cannot = r.cannot;
+    }
+    if (compareIds.length) {
+      out.compare = compareIds.map((id) => {
+        const c2 = { machineId: id, minutes: 0, cannot: [], own: side.hasOwnValues(id), steps: work.length };
+        for (const w of work) {
+          const r = onMachine(w.s, id);
+          if (r.cannot) c2.cannot.push(r.cannot);
+          else c2.minutes += r.machine?.minutes ?? w.shaped.standard.minutes ?? 0;
+        }
+        c2.minutes = round3(c2.minutes);
+        return c2;
+      });
+    }
+  }
+  out.cannot = out.steps.filter((x) => x.cannot).map((x) => x.cannot);
+  if (out.cannot.length && refuse) {
+    const [[mc]] = target != null ? await db.query('SELECT code FROM cf_machines WHERE company_id = ? AND id = ?', [companyId, target]) : [[null]];
+    const n = out.cannot.length;
+    throw invalid(MACHINE_CANNOT, `${mc?.code ?? 'That machine'} cannot take ${n === 1 ? 'this step' : `${n} of these steps`}.`, { problems: out.cannot.slice(0, 50) });
+  }
+  // What each step ends up with.
+  const writes = [];
+  for (const w of work) {
+    const { s, shaped } = w;
+    let machine = w.machine;
+    if (shaped.cannot) {
+      if (explicit || !dropCannot) { shaped.skipped = 'cannot'; continue; }   // a dry run of a refusal, or left as it is
+      machine = null;                                                         // taken off its machine
+      out.dropped += 1;
+    }
+    const mt = machine != null ? shaped.machine : null;
+    shaped.machineId = machine;
+    shaped.after = mt?.minutes ?? shaped.standard.minutes;
+    const same = (s.machine_id ?? null) === machine && (machine == null ? s.mach_machine_id == null && s.mach_minutes == null
+      : Number(s.mach_machine_id) === machine && num(s.mach_minutes) === (mt?.minutes ?? null));
+    if (!same) writes.push([s.id, machine, mt?.setup ?? null, mt?.work ?? null, mt?.minutes ?? null]);
+  }
+  for (const x of out.steps) {
+    out.minutesBefore += x.before ?? 0;
+    out.minutesAfter += x.after ?? 0;
+    if ((x.before ?? null) !== (x.after ?? null)) out.changed += 1;
+  }
+  out.minutesBefore = round3(out.minutesBefore);
+  out.minutesAfter = round3(out.minutesAfter);
+  if (apply) {
+    for (let i = 0; i < writes.length; i += 500) {
+      const part = writes.slice(i, i + 500);
+      const cases = () => `CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} END`;
+      const col = (k) => part.flatMap((r) => [r[0], r[k]]);
+      await db.query(
+        `UPDATE cf_production_steps
+            SET machine_id = ${cases()}, mach_machine_id = ${cases()}, mach_setup_minutes = ${cases()}, mach_work_minutes = ${cases()},
+                mach_minutes = ${cases()}, mach_at = NOW()
+          WHERE company_id = ? AND id IN (?)`,
+        [...col(1), ...col(1), ...col(2), ...col(3), ...col(4), companyId, part.map((r) => r[0])],
+      );
+    }
+    out.written = writes.length;
+  }
+  return out;
+}
+
+/** The ids of the steps on a machine that have not started (what a change of its chart re-times). One read. */
+export async function notStartedStepsOn(db, companyId, machineId) {
+  const [rows] = await db.query(
+    `SELECT s.id FROM cf_production_steps s
+       JOIN cf_production_items pi ON pi.company_id = s.company_id AND pi.id = s.production_item_id AND pi.deleted_at IS NULL
+       JOIN cf_production_releases r ON r.company_id = pi.company_id AND r.id = pi.release_id AND r.deleted_at IS NULL
+      WHERE s.company_id = ? AND s.machine_id = ? AND s.deleted_at IS NULL AND ${NOT_STARTED_SQL}`,
+    [companyId, Number(machineId)],
+  );
+  return rows.map((r) => r.id);
+}
+
+export const impactOf = (r) => ({
+  steps: r.steps.length, changed: r.changed, minutesBefore: r.minutesBefore, minutesAfter: r.minutesAfter,
+  minutesChange: round3(r.minutesAfter - r.minutesBefore), dropped: r.dropped, cannot: r.cannot.slice(0, 20),
+});
+
+/**
+ * A MACHINE's own chart or value changed: its not-started steps are timed again; started and done
+ * steps keep their numbers. A step the machine can no longer answer for is taken off it (dropped).
+ * apply false = the dry run the Charts tab shows before saving. → { steps, changed, minutesBefore,
+ * minutesAfter, minutesChange, dropped, cannot }.
+ */
+export async function reestimateMachine(db, c, machineId, { apply = true } = {}) {
+  const ids = await notStartedStepsOn(db, c.companyId, machineId);
+  return impactOf(await estimateOnMachine(db, c, ids, undefined, { apply, refuse: false, notStartedOnly: true, dropCannot: true }));
 }
 
 /* ===========================================================================

@@ -382,7 +382,11 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
     ),
     db.query(
       `SELECT ws.id, ws.machine_id, ws.step_id, ws.operator_id, opr.name AS operator_name, ws.started_at, ws.ended_at, ws.end_kind,
-              ws.qty_good, ws.qty_scrap, s.est_work_minutes, s.est_setup_minutes, ${WEIGHT_COLS}
+              ws.qty_good, ws.qty_scrap,
+              -- §58: a session is judged against the time of the machine it ran on — the step's machine time
+              -- when that is this machine, else the standard.
+              IF(ws.machine_id = s.machine_id, s.eff_work_minutes, s.est_work_minutes) AS est_work_minutes,
+              IF(ws.machine_id = s.machine_id, s.eff_setup_minutes, s.est_setup_minutes) AS est_setup_minutes, ${WEIGHT_COLS}
          FROM cf_work_sessions ws
          JOIN cf_production_steps s ON s.id = ws.step_id
          JOIN cf_production_items pi ON pi.id = s.production_item_id
@@ -809,8 +813,8 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
       `SELECT x.*, op.code AS op_code, op.name AS op_name FROM (
          SELECT r.order_line_id AS line_id, s.operation_id,
               COUNT(*) AS steps, SUM(s.state = 'done') AS done, SUM(s.state = 'in_progress') AS in_progress, SUM(s.state = 'on_hold') AS on_hold,
-              SUM(s.est_minutes IS NOT NULL) AS with_est, SUM(COALESCE(s.est_minutes, 0)) AS est_total,
-              SUM(COALESCE(s.est_minutes, 0) * IF(s.state = 'done', 1, LEAST(1, s.qty_good / NULLIF(s.quantity, 0)))) AS est_done,
+              SUM(s.eff_minutes IS NOT NULL) AS with_est, SUM(COALESCE(s.eff_minutes, 0)) AS est_total,
+              SUM(COALESCE(s.eff_minutes, 0) * IF(s.state = 'done', 1, LEAST(1, s.qty_good / NULLIF(s.quantity, 0)))) AS est_done,
               SUM(IF(s.state = 'done', 1, LEAST(1, COALESCE(s.qty_good / NULLIF(s.quantity, 0), 0)))) AS count_done,
               AVG(s.sequence) AS seq, SUM(s.work_order_id IS NOT NULL) AS contracted
            FROM cf_production_releases r
@@ -825,9 +829,9 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     // Progress recorded in the pace window and in the period, in minutes and in step shares.
     db.query(
       `SELECT r.order_line_id AS line_id,
-              SUM(IF(t >= ?, e.qty_good * COALESCE(s.est_minutes, 0) / NULLIF(s.quantity, 0), 0)) AS est_pace,
+              SUM(IF(t >= ?, e.qty_good * COALESCE(s.eff_minutes, 0) / NULLIF(s.quantity, 0), 0)) AS est_pace,
               SUM(IF(t >= ?, e.qty_good / NULLIF(s.quantity, 0), 0)) AS cnt_pace,
-              SUM(IF(t >= ? AND t < ?, e.qty_good * COALESCE(s.est_minutes, 0) / NULLIF(s.quantity, 0), 0)) AS est_period,
+              SUM(IF(t >= ? AND t < ?, e.qty_good * COALESCE(s.eff_minutes, 0) / NULLIF(s.quantity, 0), 0)) AS est_period,
               SUM(IF(t >= ? AND t < ?, e.qty_good / NULLIF(s.quantity, 0), 0)) AS cnt_period
          FROM (SELECT step_id, qty_good, UNIX_TIMESTAMP(COALESCE(at, created_at)) AS t FROM cf_step_events
                 WHERE company_id = ? AND event = 'progress' AND COALESCE(at, created_at) >= FROM_UNIXTIME(?)) e

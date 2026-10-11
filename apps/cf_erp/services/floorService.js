@@ -47,6 +47,7 @@ import { LOCKED_ORDER_STATUSES } from './records.js';
 import { LEAF_DEPTH, levelName } from './tree.js';
 // The production ledger (§45): every step change is followed by its stock move.
 import { ledgerOnSteps } from './productionLedgerService.js';
+import { estimateOnMachine } from './timeEstimateService.js';
 
 const EPS = 1e-9;
 const round6 = (n) => Number(Number(n).toFixed(6));
@@ -268,6 +269,16 @@ async function applyStepChanges(db, c, { starts = [], counts = [] }) {
   // Start: pending -> in progress; the earliest start wins.
   if (startBy.size) {
     const list = [...startBy.values()];
+    // §58 — a step that starts on a machine takes that machine's time. Done first, while the step is
+    // still not started: estimateOnMachine writes machine_id + the machine time together, and REFUSES
+    // (in words: machine, chart, the piece's values) a step the machine's chart has no answer for.
+    const firstOn = new Map();
+    for (const x of list) {
+      if (x.step.state !== 'pending' || x.machineId == null) continue;
+      if (!firstOn.has(x.machineId)) firstOn.set(x.machineId, []);
+      firstOn.get(x.machineId).push(x.step.id);
+    }
+    for (const [machineId, stepIds] of firstOn) await estimateOnMachine(db, c, stepIds, machineId);
     const ids = list.map((x) => x.step.id);
     const caseAt = list.map(() => 'WHEN ? THEN FROM_UNIXTIME(?)').join(' ');
     const caseMachine = list.map(() => 'WHEN ? THEN ?').join(' ');

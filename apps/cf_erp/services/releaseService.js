@@ -29,7 +29,7 @@ import { cachedTracker, copyTracker, readOnce, rememberTracker, trackerCacheKey,
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { cutPlateFlowGaps, sectionStockProblems } from './cutPlateService.js';
 import { resolveTiming } from './operationService.js';
-import { estimatorForLine } from './timeEstimateService.js';
+import { estimatorForLine, estimateOnMachine, stepMinutes } from './timeEstimateService.js';
 import { cellOwnersOfLine } from './workOrderService.js';
 import { postMovement } from './stockService.js';
 import { generate } from '../modules/codegen/index.js';
@@ -1248,7 +1248,10 @@ export async function finishedArea(db, companyId, line, givenId) {
 const ITEM_COLUMNS = ['company_id', 'release_id', 'parent_id', 'item_id', 'bom_line_id', 'piece_no', 'quantity', 'code',
   'flow_id', 'flow_revision', 'depth', 'sort_order', 'order_piece_id', 'created_by'];
 const STEP_COLUMNS = ['company_id', 'production_item_id', 'flow_step_id', 'operation_id', 'sequence', 'step_name', 'quantity',
-  'est_setup_minutes', 'est_work_minutes', 'est_minutes', 'work_order_id', 'created_by'];
+  'est_setup_minutes', 'est_work_minutes', 'est_minutes', 'work_order_id', 'created_by',
+  // §58: the machine a step is on and its machine time. Written here only for the ONE case a machine
+  // is known at release — the operation has exactly one machine that can do it (estimate.soleMachine).
+  'machine_id', 'mach_machine_id', 'mach_setup_minutes', 'mach_work_minutes', 'mach_minutes'];
 const WRITE_CHUNK = 2000;
 
 /**
@@ -1298,7 +1301,19 @@ async function writeSteps(db, c, releaseId, plan, estimate, owners) {
     const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
     const total = work != null ? Number(((setup ?? 0) + work * Number(s.quantity)).toFixed(3)) : null;
     const workOrderId = node.lockedPieceId != null ? owners.get(`${node.lockedPieceId}:${s.operationId}`) ?? null : null;
-    return [c.companyId, node.id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, setup, work, total, workOrderId, c.userId];
+    // §58 — the STANDARD time above is the machine type's. Where one machine alone can do the
+    // operation it IS the machine: the step is on it from the start, with that machine's own time
+    // (timeEstimateService: cell.onMachine is estimateOnMachine's arithmetic, typed times still on top).
+    // A step a contractor does, a step with no standard time, and a machine that cannot answer get none.
+    let machineId = null;
+    let mach = null;
+    const sole = workOrderId == null && total != null ? estimate.soleMachine?.(s.operationId) ?? null : null;
+    if (sole != null) {
+      const m = estimate.onMachine(node.bomLineId, node.itemId, s.operationId, sole);
+      if (m.ok) { machineId = sole; mach = { setup: m.setup ?? 0, work: m.work, minutes: stepMinutes(m.setup ?? 0, m.work, s.quantity) }; }
+    }
+    return [c.companyId, node.id, s.flowStepId, s.operationId, s.sequence, s.stepName, s.quantity, setup, work, total, workOrderId, c.userId,
+      machineId, machineId, mach?.setup ?? null, mach?.work ?? null, mach?.minutes ?? null];
   });
   const keys = new Set(plan.steps.map((s) => keyOf(plan.nodes[s.nodeK].id, s.flowStepId)));
   if (keys.size !== plan.steps.length) throw new Error(`cf_erp: release ${releaseId} would run one flow step twice on one piece — the steps cannot be told apart.`);
@@ -1697,6 +1712,13 @@ export const shapeStep = (s, pieceLabel) => ({
   estSetupMinutes: s.est_setup_minutes == null ? null : Number(s.est_setup_minutes),
   estWorkMinutes: s.est_work_minutes == null ? null : Number(s.est_work_minutes),
   estMinutes: s.est_minutes == null ? null : Number(s.est_minutes),
+  // §58 — the MACHINE time (the step's rule on the machine it is on) and THE TIME TO USE (eff*):
+  // the machine time when the step is on a machine, else the standard. timeBasis says which.
+  machMinutes: s.mach_minutes == null ? null : Number(s.mach_minutes),
+  effSetupMinutes: s.eff_setup_minutes == null ? null : Number(s.eff_setup_minutes),
+  effWorkMinutes: s.eff_work_minutes == null ? null : Number(s.eff_work_minutes),
+  effMinutes: s.eff_minutes == null ? null : Number(s.eff_minutes),
+  timeBasis: s.machine_id != null && s.machine_id === s.mach_machine_id && s.mach_minutes != null ? 'machine' : 'standard',
   startedAt: s.started_at,
   finishedAt: s.finished_at,
   waits: s._waits,
@@ -2111,9 +2133,13 @@ export async function startStep(db, c, stepId, input = {}) {
     const rule = await resolveTiming(db, c.companyId, step.operation_id, m);
     if (!rule || !rule.eligible) throw invalid('NOT_ELIGIBLE', `${m.code} is not set up to do ${step.op_name} (${step.op_code}).`);
     machineId = m.id;
+    // §58: the step goes on this machine WITH its machine time — or is refused, in words, when the
+    // machine's chart has no answer for the piece. Done while the step is still not started.
+    await estimateOnMachine(db, c, [step.id], machineId);
   }
+  // No machine named: a machine the step was already planned on stays (COALESCE).
   await db.query(
-    `UPDATE cf_production_steps SET state = 'in_progress', started_at = ${at == null ? 'NOW()' : 'FROM_UNIXTIME(?)'}, machine_id = ? WHERE company_id = ? AND id = ?`,
+    `UPDATE cf_production_steps SET state = 'in_progress', started_at = ${at == null ? 'NOW()' : 'FROM_UNIXTIME(?)'}, machine_id = COALESCE(?, machine_id) WHERE company_id = ? AND id = ?`,
     [...(at == null ? [] : [at]), machineId, c.companyId, step.id],
   );
   await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });

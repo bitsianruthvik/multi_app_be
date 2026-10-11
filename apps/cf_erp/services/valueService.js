@@ -24,8 +24,8 @@
 import { isDeepStrictEqual } from 'node:util';
 import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
-import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, WORKED_OUT_SPECS } from './records.js';
-import { resolve, dateText, tableSummary } from './resolutionService.js';
+import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
+import { resolve, dateText, tableSummary, isWorkedDefault, sameAsCalculated } from './resolutionService.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 
@@ -535,7 +535,10 @@ export async function setValues(db, c, subjectType, subjectId, entries = []) {
       const rule = rules.get(spec.id);
       if (!rule || !rule.applicable) { problems.push(`${spec.code} is not part of this ${machine ? 'machine' : 'item'}'s setup.`); continue; }
       const vr = rule.rule.valueRule;
-      if (master && WORKED_OUT_SPECS.has(String(spec.code).toUpperCase())) { problems.push(`${spec.code} is worked out by cutting and nesting — it cannot be typed in.`); continue; }
+      if (master && !isWorkedDefault(rule.rule) && workedOutWhy(spec.code)) {
+        problems.push(DRAWING_FACT_SPECS.has(String(spec.code).toUpperCase()) ? `${spec.code} is read from the drawing — it cannot be typed in.` : `${spec.code} is worked out by cutting and nesting — it cannot be typed in.`);
+        continue;
+      }
       if (vr === 'fixed') { problems.push(`${spec.code} is fixed at ${rule.definedAt.level.toLowerCase()} level — change it there.`); continue; }
       if (['calculated', 'rollup', 'inherited'].includes(vr)) { problems.push(`${spec.code} is ${vr} — it cannot be typed in.`); continue; }
       if (rule.options) allowed = new Set(rule.options.map((o) => o.id));
@@ -544,8 +547,12 @@ export async function setValues(db, c, subjectType, subjectId, entries = []) {
       continue;
     }
     const out = await coerce(db, c.companyId, spec, e.value, allowed);
-    if (out.problem) problems.push(out.problem);
-    else writes.push({ spec, typed: out.typed });
+    if (out.problem) { problems.push(out.problem); continue; }
+    // A number typed over a calculated value that says the same as the calculated one is no
+    // override: the typed value is taken away and the cell follows its formula (orderValuesService does the same).
+    const rule = rules?.get(spec.id);
+    if (out.typed && rule && isWorkedDefault(rule.rule) && sameAsCalculated(out.typed.value_number, answerOf(rule), rule.spec.decimals)) out.typed = null;
+    writes.push({ spec, typed: out.typed });
   }
   if (problems.length) throw invalid('INVALID_VALUES', 'Some values could not be saved.', { problems });
 
@@ -587,6 +594,14 @@ export async function materializeMachine(db, c, machineId) {
   return storeDerived(db, c, 'machine', machine.id, await resolve(db, c.companyId, { machine }));
 }
 
+/** What a Defaulted formula gives for a resolved spec right now (whether or not a typed value sits over it), or null. */
+function answerOf(entry) {
+  const d = entry.derived ?? null;
+  if (!d) return null;
+  if (d.source === 'typed' || d.held) return d.calculated?.raw ?? null;
+  return entry.value?.raw ?? null;
+}
+
 async function storeDerived(db, c, subjectType, subjectId, r) {
   const { ownRows, effectiveRows } = r.internal;
   // Nothing in either loop reads a value back, so the writes are collected and
@@ -616,7 +631,8 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         break;
       case 'defaulted':
         if (own && own.source === 'entered') break;
-        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted');
+        // A formula's answer is stored as what it is (calculated / rollup); a default from above as 'defaulted'.
+        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), s.derived ? (s.derived.rollup ? 'rollup' : 'calculated') : 'defaulted');
         else if (own) touch(s, null, 'defaulted');
         break;
       case 'calculated':

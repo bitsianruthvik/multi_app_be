@@ -44,8 +44,29 @@
  *     classification tree (context.itemLevel); compared with a word, its name or code matches.
  *   - LOOKUP(t, a, b, c …) takes any number of inputs when t is a ROWS chart (lib/chartTable.js):
  *     { rows: [[in1, in2, …, result], …] } read left to right — see lookupRows.
+ *
+ * VALUES THAT MAY BE ABSENT, AND CHILDREN BY KIND (2026-10-12, "values from the drawing and from the parts"):
+ *   - FIRST(a, b, …) is the first of its expressions that has every value it reads:
+ *     FIRST(TRUE_AREA, LENGTH * WIDTH) is the drawing's true area where there is one, else the
+ *     rectangle. Nothing inside FIRST makes the formula wait unless NONE of its expressions can be
+ *     worked out — then it waits for what the LAST one reads (the fallback a person can fill).
+ *   - Inside SUM / AVG, IF chooses PER CHILD and only the branch taken is read:
+ *     SUM(IF(children.name = "Web", children.HOLES, 0)) adds the holes of the web children and
+ *     does not wait for a stiffener that has no HOLES.
+ *   - A child can be told by words: children.name (the row's own name, or the name, short name or
+ *     code of the template it was made from), children.role (the description on its BOM line),
+ *     children.variant / .subfamily / .family (its place in the tree, by name or code), and any
+ *     pick-list or text value of the child (children.PART_FUNCTION = "Top flange"). A word that is
+ *     not there simply does not match — it never makes a roll-up wait.
+ *   - CONTAINS(word, "text") is 1 when the word holds the text (case does not matter); AND(a, b, …),
+ *     OR(a, b, …) and NOT(a) join tests. A test is 1 or 0, as every comparison already is.
+ *   - NONZERO(x) — or NONZERO(x, "what was looked for") — is x, and NO VALUE when x is 0: a count
+ *     of children that finds none is "the structure does not say", not a real zero. The formula
+ *     then waits (for "what was looked for") and a person fills the value — typing 0 where 0 is meant.
  */
 export const LEVEL_REFS = ['FAMILY', 'SUBFAMILY', 'VARIANT'];
+/** children.<word>: what a BOM child IS, read as a word — never a specification code (see the header). */
+export const CHILD_WORDS = ['NAME', 'ROLE', ...LEVEL_REFS];
 
 export class FormulaError extends Error {
   constructor(message, position = null) {
@@ -56,7 +77,12 @@ export class FormulaError extends Error {
 
 /** A LOOKUP that fell outside the chart, or landed on a null cell — reported as `missing`, never as `error`, because it is a data gap, not a formula mistake. */
 export class MissingValueError extends FormulaError {
-  constructor(reason) { super(reason); this.isMissing = true; }
+  /** `reason`: a sentence (a chart's gap), or the list of inputs that have no value yet. */
+  constructor(reason) {
+    super(Array.isArray(reason) ? reason.join(', ') : reason);
+    this.isMissing = true;
+    this.codes = Array.isArray(reason) ? reason : [reason];
+  }
 }
 
 const FUNCTIONS = {
@@ -68,6 +94,15 @@ const FUNCTIONS = {
   FLOOR: { min: 1, max: 1, fn: Math.floor },
   ROUND: { min: 1, max: 2, fn: (x, d = 0) => { const f = 10 ** Math.trunc(d); return Math.round(x * f) / f; } },
   IF: { min: 3, max: 3, lazy: true },
+  AND: { min: 1, max: Infinity, fn: (...a) => (a.every((x) => !!x) ? 1 : 0) },
+  OR: { min: 1, max: Infinity, fn: (...a) => (a.some((x) => !!x) ? 1 : 0) },
+  NOT: { min: 1, max: 1, fn: (x) => (x ? 0 : 1) },
+  /** The first expression that has every value it reads — evaluated in ev (lazy). */
+  FIRST: { min: 1, max: Infinity, lazy: true },
+  /** CONTAINS(word, "text") — evaluated in ev: its arguments are words. */
+  CONTAINS: { min: 2, max: 2, lazy: true },
+  /** NONZERO(x[, "what was looked for"]) — x, or no value when x is 0 (evaluated in ev). */
+  NONZERO: { min: 1, max: 2, lazy: true },
 };
 const ROLLUP_FUNCTIONS = new Set(['SUM', 'COUNT', 'AVG']);
 const LOOKUP_FN = 'LOOKUP';
@@ -191,17 +226,21 @@ function walk(ast, visit) {
  * `LOOKUP(machine.CUT_SPEED, item.THICKNESS)` still records item.THICKNESS as
  * an ordinary timing reference.
  */
-function collectRefs(ast, sets) {
+function collectRefs(ast, sets, lazy = false, inRollup = false) {
   if (ast.type === 'ref') {
     const m = /^(children|item|machine)\.([A-Za-z_][A-Za-z0-9_]*)$/i.exec(ast.name);
     if (m && m[1].toLowerCase() === 'item' && LEVEL_REFS.includes(m[2].toUpperCase())) { sets.levelRefs.add(m[2].toUpperCase()); return; }
-    if (m) ({ children: sets.rollupTerms, item: sets.itemRefs, machine: sets.machineRefs }[m[1].toLowerCase()]).add(m[2].toUpperCase());
-    else if (ast.name.includes('.')) throw new FormulaError(`"${ast.name}" is not a name this formula can read`);
-    else sets.references.add(ast.name.toUpperCase());
+    if (m && m[1].toLowerCase() === 'children' && CHILD_WORDS.includes(m[2].toUpperCase())) { sets.childWords.add(m[2].toUpperCase()); return; }
+    if (m) {
+      const role = m[1].toLowerCase();
+      ({ children: sets.rollupTerms, item: sets.itemRefs, machine: sets.machineRefs }[role]).add(m[2].toUpperCase());
+      if (!lazy && role !== 'children') (role === 'item' ? sets.requiredItemRefs : sets.requiredMachineRefs).add(m[2].toUpperCase());
+    } else if (ast.name.includes('.')) throw new FormulaError(`"${ast.name}" is not a name this formula can read`);
+    else { sets.references.add(ast.name.toUpperCase()); if (!lazy) sets.requiredReferences.add(ast.name.toUpperCase()); }
     return;
   }
-  if (ast.type === 'bin') { collectRefs(ast.left, sets); collectRefs(ast.right, sets); return; }
-  if (ast.type === 'neg') { collectRefs(ast.arg, sets); return; }
+  if (ast.type === 'bin') { collectRefs(ast.left, sets, lazy, inRollup); collectRefs(ast.right, sets, lazy, inRollup); return; }
+  if (ast.type === 'neg') { collectRefs(ast.arg, sets, lazy, inRollup); return; }
   if (ast.type === 'call') {
     if (ast.name === LOOKUP_FN) {
       const t = ast.args[0];
@@ -215,13 +254,19 @@ function collectRefs(ast, sets) {
       if (cx) sets.lookupRefs.push({ role: cx[1].toLowerCase(), code: cx[2].toUpperCase(), arity: ast.args.length });
       else if (t.name.includes('.')) throw new FormulaError(`"${t.name}" is not a name this formula can read`);
       else sets.lookupRefs.push({ role: 'plain', code: t.name.toUpperCase(), arity: ast.args.length });
-      for (let i = 1; i < ast.args.length; i++) collectRefs(ast.args[i], sets);
+      for (let i = 1; i < ast.args.length; i++) collectRefs(ast.args[i], sets, lazy, inRollup);
       return;
     }
-    if (ROLLUP_FUNCTIONS.has(ast.name)) sets.usesRollupFunction = true;
-    ast.args.forEach((a) => collectRefs(a, sets));
+    const rollup = ROLLUP_FUNCTIONS.has(ast.name);
+    if (rollup) sets.usesRollupFunction = true;
+    // What sits inside FIRST — and, per child of a roll-up, in the branches of an IF — is read only
+    // when it is needed (see the header), so it is not something the formula has to wait for.
+    ast.args.forEach((a, i) => collectRefs(a, sets, lazy || isLazyArg(ast, i, inRollup || rollup), inRollup || rollup));
   }
 }
+
+/** Whether argument i of a call is read only when needed: all of FIRST's, and an IF's branches inside a roll-up. */
+const isLazyArg = (call, i, inRollup) => call.name === 'FIRST' || (inRollup && call.name === 'IF' && i > 0);
 
 /**
  * Parses an expression. Returns { ast, references, rollupTerms, usesRollup,
@@ -240,11 +285,14 @@ function collectRefs(ast, sets) {
 export function parseFormula(expression) {
   if (typeof expression !== 'string' || !expression.trim()) throw new FormulaError('The formula is empty');
   const ast = parseTokens(tokenize(expression));
-  const sets = { references: new Set(), rollupTerms: new Set(), itemRefs: new Set(), machineRefs: new Set(), levelRefs: new Set(), lookupRefs: [], usesRollupFunction: false };
+  const sets = {
+    references: new Set(), rollupTerms: new Set(), itemRefs: new Set(), machineRefs: new Set(), levelRefs: new Set(), lookupRefs: [], usesRollupFunction: false,
+    requiredReferences: new Set(), requiredItemRefs: new Set(), requiredMachineRefs: new Set(), childWords: new Set(),
+  };
   collectRefs(ast, sets);
   checkRollupPlacement(ast, false);
   const { references, rollupTerms, itemRefs, machineRefs, levelRefs, lookupRefs, usesRollupFunction } = sets;
-  const usesRollup = usesRollupFunction || rollupTerms.size > 0;
+  const usesRollup = usesRollupFunction || rollupTerms.size > 0 || sets.childWords.size > 0;
   // A LOOKUP on item.X / machine.X makes this a timing formula even when that
   // is the ONLY item./machine. name in it (e.g. LOOKUP(machine.CUT_SPEED, 12)).
   const usesContext = itemRefs.size > 0 || machineRefs.size > 0 || levelRefs.size > 0 || lookupRefs.some((r) => r.role === 'item' || r.role === 'machine');
@@ -261,7 +309,12 @@ export function parseFormula(expression) {
   return {
     ast,
     references: [...references],
+    // What the formula cannot do without — a name read only inside FIRST is not one of these.
+    requiredReferences: [...sets.requiredReferences],
+    requiredItemRefs: [...sets.requiredItemRefs],
+    requiredMachineRefs: [...sets.requiredMachineRefs],
     rollupTerms: [...rollupTerms],
+    childWords: [...sets.childWords],
     usesRollup,
     itemRefs: [...itemRefs],
     machineRefs: [...machineRefs],
@@ -300,11 +353,43 @@ function checkRollupPlacement(n, inside) {
   if (n.type === 'call') n.args.forEach((a) => checkRollupPlacement(a, inside));
 }
 
-/** The children.X terms one expression reads. */
+/** A child's VALUE term (children.WEIGHT), not one of its words (children.name). */
+const childValueTerm = (name) => { const t = childTerm(name); return t && !CHILD_WORDS.includes(t) ? t : null; };
+
+/** The children.X value terms one expression reads. */
 function termsIn(ast) {
   const terms = new Set();
-  walk(ast, (n) => { if (n.type === 'ref') { const t = childTerm(n.name); if (t) terms.add(t); } });
+  walk(ast, (n) => { if (n.type === 'ref') { const t = childValueTerm(n.name); if (t) terms.add(t); } });
   return [...terms];
+}
+
+const WORD_TESTS = new Set(['=', '==', '!=', '<>']);
+/**
+ * The children.X numbers a roll-up's expression needs from EVERY child: not what is read only when
+ * needed (the branches of an IF, anything inside FIRST), and not a value that is only compared as a
+ * word (children.PART_FUNCTION = "Web") — a word that is not there just does not match.
+ */
+function neededTermsIn(ast) {
+  const terms = new Set();
+  (function scan(n, asWord) {
+    if (n.type === 'ref') { const t = childValueTerm(n.name); if (t && !asWord) terms.add(t); return; }
+    if (n.type === 'bin') { const w = WORD_TESTS.has(n.op); scan(n.left, w); scan(n.right, w); return; }
+    if (n.type === 'neg') { scan(n.arg, false); return; }
+    if (n.type === 'call') n.args.forEach((a, i) => { if (!isLazyArg(n, i, true)) scan(a, n.name === 'CONTAINS'); });
+  }(ast, false));
+  return [...terms];
+}
+
+/** Every plain / context / child name an expression reads that has no value now — what FIRST says it is waiting for. */
+function missingIn(ast, has) {
+  const out = new Set();
+  (function scan(n, asWord) {
+    if (n.type === 'ref') { if (!asWord) { const m = has(n.name); if (m) out.add(m); } return; }
+    if (n.type === 'bin') { const w = WORD_TESTS.has(n.op); scan(n.left, w); scan(n.right, w); return; }
+    if (n.type === 'neg') { scan(n.arg, false); return; }
+    if (n.type === 'call') n.args.forEach((a, i) => { if (!(n.name === LOOKUP_FN && i === 0)) scan(a, n.name === 'CONTAINS'); });
+  }(ast, false));
+  return [...out];
 }
 
 const hasValue = (v) => v !== null && v !== undefined && !Number.isNaN(v);
@@ -386,10 +471,17 @@ function lookupTableValue(table, x, y) {
 }
 
 /** Two words — or a word and a tree node (its name or code) — are the same, case aside. */
+/** Every way a word may be said: a plain word, a tree node (name, code), or a thing with several names. */
+const wordsOf = (v) => (v != null && typeof v === 'object' ? (Array.isArray(v.names) ? v.names : [v.name, v.code]) : [v])
+  .filter((x) => x != null && String(x).trim() !== '').map((x) => String(x).trim().toLowerCase());
 function sameWord(a, b) {
-  const words = (v) => (v != null && typeof v === 'object' ? [v.name, v.code] : [v]).filter((x) => x != null).map((x) => String(x).trim().toLowerCase());
-  const A = words(a); const B = words(b);
+  const A = wordsOf(a); const B = wordsOf(b);
   return A.some((x) => B.includes(x));
+}
+/** CONTAINS: one of the word's names holds the text. An empty text holds nothing. */
+function holdsWord(word, text) {
+  const T = wordsOf(text);
+  return T.length > 0 && wordsOf(word).some((x) => T.some((t) => x.includes(t)));
 }
 
 /**
@@ -508,10 +600,10 @@ export function lookupRows(table, inputs) {
 export function evaluateFormula(parsed, lookup, children = null, context = null, lookupTable = null) {
   if (parsed.usesRollup && !children) return { value: null, error: 'Roll-up terms are evaluated from BOM lines.' };
   if (parsed.usesContext && !context) return { value: null, error: 'item. and machine. values are read when a machine works on an item.' };
-  const missing = parsed.references.filter((code) => !hasValue(lookup(code)));
+  const missing = (parsed.requiredReferences ?? parsed.references).filter((code) => !hasValue(lookup(code)));
   if (parsed.usesContext) {
-    for (const code of parsed.itemRefs ?? []) if (!hasValue(context.item(code))) missing.push(`item · ${code}`);
-    for (const code of parsed.machineRefs ?? []) if (!hasValue(context.machine(code))) missing.push(`machine · ${code}`);
+    for (const code of parsed.requiredItemRefs ?? parsed.itemRefs ?? []) if (!hasValue(context.item(code))) missing.push(`item · ${code}`);
+    for (const code of parsed.requiredMachineRefs ?? parsed.machineRefs ?? []) if (!hasValue(context.machine(code))) missing.push(`machine · ${code}`);
     for (const lv of parsed.levelRefs ?? []) if (!context.itemLevel?.(lv)) missing.push(`item · ${lv.toLowerCase()}`);
   }
   // A table not yet fixed, defaulted or entered anywhere reachable is the same
@@ -526,7 +618,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   if (parsed.usesRollup) {
     walk(parsed.ast, (n) => {
       if (n.type !== 'call' || !ROLLUP_FUNCTIONS.has(n.name) || n.name === 'COUNT' || !n.args.length) return;
-      const terms = termsIn(n.args[0]);
+      const terms = neededTermsIn(n.args[0]);
       for (const child of children) {
         for (const t of terms) if (!hasValue(child.get(t))) missing.push(`${child.label} · ${t}`);
       }
@@ -537,6 +629,17 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   /** Things worth saying about how the value was found (a chart read past its edge). */
   const notes = [];
   const bool = (x) => (x ? 1 : 0);
+  /** A child's word: what it is (children.name / role / variant …) or a pick-list / text value of its own. */
+  const childWord = (child, t) => child?.word?.(t) ?? null;
+  /** The name of a reference when it has no value now, as `missing` lists it — else null. */
+  const lacks = (child) => (name) => {
+    const t = childTerm(name);
+    if (t) return CHILD_WORDS.includes(t) || !child || hasValue(child.get(t)) ? null : `${child.label} · ${t}`;
+    const cx = CONTEXT_REF.exec(name);
+    if (cx && cx[1].toLowerCase() === 'item' && LEVEL_REFS.includes(cx[2].toUpperCase())) return context?.itemLevel?.(cx[2].toUpperCase()) ? null : `item · ${cx[2].toLowerCase()}`;
+    if (cx) return hasValue(context?.[cx[1].toLowerCase()]?.(cx[2].toUpperCase())) ? null : `${cx[1].toLowerCase()} · ${cx[2].toUpperCase()}`;
+    return hasValue(lookup(name.toUpperCase())) ? null : name.toUpperCase();
+  };
   function rollup(n) {
     const arg = n.args[0];
     if (n.name === 'COUNT') {
@@ -544,7 +647,13 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
       const terms = termsIn(arg);
       return children.filter((ch) => terms.every((t) => hasValue(ch.get(t)))).reduce((t, ch) => t + ch.quantity, 0);
     }
-    const sum = children.reduce((t, ch) => t + ch.quantity * ev(arg, ch), 0);
+    // Every child is asked, so a roll-up that has to wait says ALL it waits for, not the first.
+    const waiting = [];
+    let sum = 0;
+    for (const ch of children) {
+      try { sum += ch.quantity * ev(arg, ch); } catch (e) { if (!e.isMissing) throw e; waiting.push(...e.codes); }
+    }
+    if (waiting.length) throw new MissingValueError([...new Set(waiting)]);
     if (n.name === 'SUM') return sum;
     const pieces = children.reduce((t, ch) => t + ch.quantity, 0);
     if (!pieces) throw new FormulaError('There are no child pieces to average');
@@ -602,17 +711,47 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
       case 'str': return n.value;
       case 'ref': {
         const t = childTerm(n.name);
-        if (t) return Number(child.get(t));
+        if (t) {
+          // What the child IS reads as a word; so does a pick-list or text value of its own.
+          if (CHILD_WORDS.includes(t)) return childWord(child, t) ?? '';
+          const v = child.get(t);
+          if (hasValue(v)) return Number(v);
+          // Compared as a word: its word, and a word that is not there matches nothing.
+          if (raw) return childWord(child, t) ?? '';
+          throw new MissingValueError([`${child.label} · ${t}`]);
+        }
         const cx = CONTEXT_REF.exec(n.name);
         if (cx && cx[1].toLowerCase() === 'item' && LEVEL_REFS.includes(cx[2].toUpperCase())) return context.itemLevel(cx[2].toUpperCase());
-        if (cx) return num(context[cx[1].toLowerCase()](cx[2].toUpperCase()), n.name);
-        return Number(lookup(n.name.toUpperCase()));
+        if (cx) {
+          const v = context[cx[1].toLowerCase()](cx[2].toUpperCase());
+          if (!hasValue(v)) throw new MissingValueError([`${cx[1].toLowerCase()} · ${cx[2].toUpperCase()}`]);
+          return num(v, n.name);
+        }
+        const v = lookup(n.name.toUpperCase());
+        if (!hasValue(v)) throw new MissingValueError([n.name.toUpperCase()]);
+        return Number(v);
       }
       case 'neg': return -ev(n.arg, child);
       case 'call': {
         if (n.name === LOOKUP_FN) return lookupCall(n, child);
         if (ROLLUP_FUNCTIONS.has(n.name)) return rollup(n);
         if (n.name === 'IF') return ev(n.args[0], child) ? ev(n.args[1], child, raw) : ev(n.args[2], child, raw);
+        if (n.name === 'CONTAINS') return bool(holdsWord(ev(n.args[0], child, true), ev(n.args[1], child, true)));
+        if (n.name === 'NONZERO') {
+          const x = ev(n.args[0], child);
+          if (x !== 0) return x;
+          const what = n.args[1] ? ev(n.args[1], child, true) : null;
+          throw new MissingValueError([typeof what === 'string' && what.trim() ? what.trim() : 'something to count below this row']);
+        }
+        if (n.name === 'FIRST') {
+          // The first expression that can be worked out; when none can, it waits for the LAST one's inputs.
+          for (const a of n.args) {
+            try { return ev(a, child, raw); } catch (e) { if (!e.isMissing) throw e; }
+          }
+          const last = n.args[n.args.length - 1];
+          const lacking = missingIn(last, lacks(child));
+          throw new MissingValueError(lacking.length ? lacking : ['a value']);
+        }
         return FUNCTIONS[n.name].fn(...n.args.map((a) => ev(a, child)));
       }
       case 'bin': {
@@ -653,7 +792,7 @@ export function evaluateFormula(parsed, lookup, children = null, context = null,
   } catch (e) {
     // A LOOKUP outside its chart's range, or on a null cell, is a data gap —
     // reported the way every other unmeasured input is, not as a formula bug.
-    if (e.isMissing) return { value: null, missing: [e.message] };
+    if (e.isMissing) return { value: null, missing: e.codes ?? [e.message] };
     return { value: null, error: e.message };
   }
 }

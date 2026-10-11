@@ -25,6 +25,7 @@ import { ancestors, loadNode, LEVELS } from './tree.js';
 import { requireMachine } from './records.js';
 import { setValues } from './valueService.js';
 import { syncRecordsUsingOperation } from './flowSpecService.js';
+import { reestimateMachine } from './timeEstimateService.js';
 
 const MODES = ['step_up', 'linear'];
 const LEVEL_KEYS = LEVELS.map((l) => l.toUpperCase());          // FAMILY, SUBFAMILY, VARIANT
@@ -249,7 +250,28 @@ export async function setChartValue(db, c, subject, specId, value) {
   const cfg = parseJson(s.table_config) ?? {};
   const v = value == null || value === '' ? null : (cfg.version >= 2 ? await normaliseRows(db, c.companyId, cfg.axes ?? [], value) : value);
   await setValues(db, c, subject.type, subject.id, [{ specificationId: s.id, value: v }]);
+  // §58 — WHAT A CHART CHANGE RE-TIMES.
+  //   a MACHINE's own chart (given, edited, or handed back to its type's): the steps on that machine
+  //   that have not started are timed again; started and done steps keep their numbers.
+  //   a machine TYPE's chart: nothing — the standard time is fixed at release ("Times are fixed at
+  //   release"), and a machine time is fixed when the machine was put on the step. Today's rule, kept.
+  if (subject.type === 'machine') await reestimateMachine(db, c, subject.id);
   return listCharts(db, c.companyId, subject);
+}
+
+/**
+ * §58 — the dry run of setChartValue on a machine: what saving these rows (null = back to the type's
+ * chart) would do to the steps planned on it. It writes inside the caller's transaction and the
+ * ROUTE rolls that transaction back, so the answer is exactly what the save would give.
+ * → { steps, changed, minutesBefore, minutesAfter, minutesChange, dropped, cannot }.
+ */
+export async function chartValueImpact(db, c, machineId, specId, value) {
+  const s = await specRow(db, c.companyId, specId);
+  const cfg = parseJson(s.table_config) ?? {};
+  const v = value == null || value === '' ? null : (cfg.version >= 2 ? await normaliseRows(db, c.companyId, cfg.axes ?? [], value) : value);
+  await setValues(db, c, 'machine', machineId, [{ specificationId: s.id, value: v }]);
+  // minutesBefore = what the steps carry now (stored), minutesAfter = with these rows.
+  return reestimateMachine(db, c, machineId, { apply: false });
 }
 
 /**

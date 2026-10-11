@@ -1195,7 +1195,7 @@ async function missingRequiredValues(db, companyId, chains) {
   if (!chains.size) return perItem;
   const assignments = await loadSubjectRows(db, companyId, {
     table: 'cf_spec_assignments',
-    columns: 't.subject_type, t.subject_id, t.specification_id, t.is_required, t.is_applicable, t.value_rule, t.origin, sp.code AS spec_code, sp.name AS spec_name, sp.data_type',
+    columns: 't.subject_type, t.subject_id, t.specification_id, t.is_required, t.is_applicable, t.value_rule, t.formula_id, t.origin, sp.code AS spec_code, sp.name AS spec_name, sp.data_type',
     join: 'JOIN cf_specifications sp ON sp.id = t.specification_id AND sp.deleted_at IS NULL',
     where: "t.capture_at = 'item'",
     chains,
@@ -1239,6 +1239,8 @@ async function missingRequiredValues(db, companyId, chains) {
       const ownRaw = rawValueOf(own, type);
       let has = false;
       if (a.value_rule === 'entered') has = ownRaw !== null;
+      // A Defaulted rule that names a formula: typed, or what the formula stored (resolutionService) — else the value above.
+      else if (a.formula_id != null && ownRaw !== null) has = true;
       else {
         // 'defaulted': the item's own ENTERED value, else the nearest above.
         if (ownRaw !== null && own.source === 'entered') has = true;

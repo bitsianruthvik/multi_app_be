@@ -42,6 +42,20 @@
  * would write in it now, so a default that is only SHOWN and left alone is not
  * turned into a typed value.
  *
+ * TYPED OVER A CALCULATED VALUE (2026-10-12). A value a formula gives and a
+ * person may type over (a Defaulted rule that names a formula) is written like
+ * any default: the calculated number, in grey italics, in a white cell. Where
+ * somebody HAS typed over it the cell holds the typed number, and the field's
+ * NAME above it ends " — typed" (TYPED_MARK) — a name is plain text, so the mark
+ * survives sorting, filtering, another program and a save, which a cell comment
+ * does not; the comment is there too, and says what the calculated value is.
+ * On the way back in:
+ *   a number different from the calculated one   -> typed over it (an override)
+ *   the calculated number itself                 -> no override (writeLineValues hands it back)
+ *   an EMPTY cell under a "— typed" name         -> the override is taken away; the calculated value returns
+ * This is the same save as the screen's, cell by cell: a cell says something
+ * only about its own value, so emptying one field never touches another.
+ *
  * ROUND TRIPS (production is ~49 ms a hop)
  *   download  readLineValues (8) + explode (3 + one per level) + placeholders
  *   upload    the same reads, then at most one writeLineValues for every value
@@ -65,6 +79,10 @@ const MAX_PAIRS = 20000;
 const ID_RE = /^([NV])\|((?:ROOT|\d+(?:#\d+)?):\d+)$/;
 
 export const BANNER = 'The grey row above each line names its fields — type in the white cells under them; grey cells are worked out, amber cells still need a value.';
+/** What a field's name ends with when its value was typed by hand over a calculated one. */
+export const TYPED_MARK = ' — typed';
+/** Added to the banner of a sheet that has such fields. */
+export const TYPED_BANNER = ' A name ending "— typed" holds a number typed by hand over a calculated one: empty its cell to go back to the calculated value.';
 
 const GREY_NAMES = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
 const GREY = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
@@ -124,6 +142,14 @@ async function loadLayout(db, companyId, lineId) {
 
 /** The fields a pair is written with — a dimension the row does not have is left out. */
 const sheetFields = (row) => row.fields.filter((f) => f.kind !== 'na');
+/** Whether a field holds a number typed by hand over a calculated one. */
+const typedOver = (f) => f.kind === 'value' && f.from === 'typed' && f.state === 'typed';
+/** A field's name as the sheet writes it — and reads it back: the typed-over mark is part of the name. */
+const sheetLabelOf = (f) => (typedOver(f) ? `${f.label}${TYPED_MARK}` : f.label);
+/** The comment on a typed-over cell. */
+const typedNote = (f) => (f.calculated != null
+  ? `Typed by hand — the calculated value is ${f.calculated}. Empty this cell to go back to it.`
+  : `Typed by hand — nothing is calculated here yet${f.noCalc ? ` (${f.noCalc})` : ''}.`);
 
 /** What a download writes in a field's cell. A number that reads as one is a number, so Excel treats it as one. */
 function cellValueOf(f) {
@@ -148,10 +174,11 @@ export async function exportOrderSheet(db, companyId, lineId) {
   const idCol = widest + 2;
   // Each column as wide as the longest name or value that lands in it (the names are small print), within reason.
   const widths = Array.from({ length: widest }, () => 12);
-  for (const r of rows) sheetFields(r).forEach((f, i) => { widths[i] = Math.min(34, Math.max(widths[i], Math.ceil(f.label.length * 0.85) + 2, f.value.length + 3)); });
+  for (const r of rows) sheetFields(r).forEach((f, i) => { widths[i] = Math.min(34, Math.max(widths[i], Math.ceil(sheetLabelOf(f).length * 0.85) + 2, f.value.length + 3)); });
   ws.columns = [{ width: 46 }, ...widths.map((width) => ({ width })), { width: 18, hidden: true }];
 
-  const banner = ws.addRow([view.lock ? `${view.lock.message} This sheet is a record — it cannot be uploaded.` : BANNER]);
+  const anyTyped = rows.some((r) => sheetFields(r).some(typedOver));
+  const banner = ws.addRow([view.lock ? `${view.lock.message} This sheet is a record — it cannot be uploaded.` : `${BANNER}${anyTyped ? TYPED_BANNER : ''}`]);
   banner.font = { italic: true, color: { argb: 'FF595959' } };
   banner.height = 20;
 
@@ -174,7 +201,7 @@ export async function exportOrderSheet(db, companyId, lineId) {
 
   for (const row of rows) {
     const fields = sheetFields(row);
-    const names = ws.addRow([row.code || null, ...fields.map((f) => f.label)]);
+    const names = ws.addRow([row.code || null, ...fields.map(sheetLabelOf)]);
     const values = ws.addRow([row.label, ...fields.map(cellValueOf)]);
     names.getCell(idCol).value = `N|${row.id}`;
     values.getCell(idCol).value = `V|${row.id}`;
@@ -191,6 +218,8 @@ export async function exportOrderSheet(db, companyId, lineId) {
     fields.forEach((f, i) => {
       const c = values.getCell(i + 2);
       c.border = BOX;
+      // Typed over a calculated value: said on the cell as well as in its name (the name is what is read back).
+      if (typedOver(f)) c.note = typedNote(f);
       if (!f.editable) { c.fill = GREY; return; }
       if (f.kind === 'value' && f.missing) c.fill = AMBER;
       // A default that is only shown is not the row's own value: it reads as one.
@@ -360,7 +389,7 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
   for (const { row, names, values } of matched) {
     const where = row.label;
     const fields = sheetFields(row);
-    const byLabel = new Map(fields.map((f) => [f.label, f]));
+    const byLabel = new Map(fields.map((f) => [sheetLabelOf(f), f]));
     const expectedHead = { names: row.code || '', values: row.label };
     if (!sameText(names.cells[1], expectedHead.names)) problems.push(`${where}: its code (${expectedHead.names || 'empty'}) was changed to "${names.cells[1] ?? ''}". A code is given by the system — it is not typed in this sheet.`);
     if (!sameText(values.cells[1], expectedHead.values)) problems.push(`${where}: its name was changed to "${values.cells[1] ?? ''}". A row is renamed on the screen, not in this sheet.`);

@@ -163,7 +163,9 @@ function addOp(agg, s, op) {
   if (op.state === 'running') agg.running += 1;
   agg.cntT += op.total;
   agg.cntD += op.done;
-  const est = s.est_minutes == null ? null : Number(s.est_minutes);
+  // §58: the time to use — the machine time when the step is on a machine, else the standard.
+  const minutes = s.eff_minutes !== undefined ? s.eff_minutes : s.est_minutes;
+  const est = minutes == null ? null : Number(minutes);
   if (est == null) agg.minKnown = false;
   else { agg.minT += est; agg.minD += op.total > 0 ? est * (op.done / op.total) : 0; }
   const b = agg.byOp.get(s.operation_id) ?? { operationId: s.operation_id, done: 0, total: 0 };

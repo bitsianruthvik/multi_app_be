@@ -9,6 +9,8 @@
  *   GET    /machines/:id/specs           resolved specifications
  *   PUT    /machines/:id/values          { values: [{ specificationId | specCode, value }] }
  *   GET    /machines/:id/history
+ *   GET    /machines/:id/time-impact     §58: its not-started steps, their minutes now and freshly estimated
+ *   POST   /machines/:id/charts/:specId/impact  { value } §58: dry run — what saving those rows would re-time
  *
  *   GET    /machine-types                the machine side of the classification tree, with machine counts
  *   POST   /machine-types                { family: {id}|{code,name}, subfamily: {id}|{code,name}, code, name, description? }
@@ -68,7 +70,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  listMachines, getMachine, createMachine, updateMachine, deleteMachine, getMachineSpecs, setMachineValues, getMachineHistory,
+  listMachines, getMachine, createMachine, updateMachine, deleteMachine, getMachineSpecs, setMachineValues, getMachineHistory, machineTimeImpact,
 } from '../services/machineService.js';
 import {
   listOperations, getOperation, createOperation, updateOperation, deleteOperation,
@@ -85,7 +87,7 @@ import {
   listMachineTypes, createMachineType, updateMachineNode, deleteMachineNode,
 } from '../services/classificationService.js';
 import { builderContext } from '../services/formulaBuilderService.js';
-import { listCharts, createChart, updateChart, deleteChart, machineTypeDetails, setChartValue } from '../services/chartService.js';
+import { listCharts, createChart, updateChart, deleteChart, machineTypeDetails, setChartValue, chartValueImpact } from '../services/chartService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -127,6 +129,16 @@ router.put('/machine-types/:id/charts/:specId/values', manage, handle((req) => t
 router.get('/machines/:id/charts', view, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'machine', id: id(req) })));
 router.post('/machines/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'machine', id: id(req) }, req.body ?? {}))));
 router.put('/machines/:id/charts/:specId/values', manage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'machine', id: id(req) }, specId(req), chartValue(req)))));
+// §58 — what a machine's own chart means for the plan. time-impact: the steps planned on it now.
+// charts/:specId/impact: a DRY RUN of saving those rows (the write is made and rolled back).
+const DRY = Symbol('dry run');
+const dryTx = async (req, fn) => {
+  let out;
+  try { await tx(req, async (db, c) => { out = await fn(db, c); throw DRY; }); } catch (e) { if (e !== DRY) throw e; }
+  return out;
+};
+router.get('/machines/:id/time-impact', view, handle((req) => machineTimeImpact(pool, ctx(req).companyId, id(req))));
+router.post('/machines/:id/charts/:specId/impact', manage, handle((req) => dryTx(req, (db, c) => chartValueImpact(db, c, id(req), specId(req), chartValue(req)))));
 router.put('/charts/:specId', manage, handle((req) => tx(req, (db, c) => updateChart(db, c, specId(req), req.body ?? {}))));
 router.delete('/charts/:specId', manage, handle((req) => tx(req, (db, c) => deleteChart(db, c, specId(req)))));
 

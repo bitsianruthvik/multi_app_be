@@ -134,6 +134,25 @@ export const WORKED_OUT_SPECS = new Set(['CUTS', 'CUT_ACROSS', 'PIERCINGS']);
 export const WORKED_OUT_WHY = 'Worked out by cutting and nesting — from the section, the cut piece and the nest.';
 
 /**
+ * What a plate part's DRAWING says about it (user, 2026-10-12: "use the true shape wherever
+ * possible"): written on the part by drawingValueService whenever its shape is read, replaced or
+ * taken away — TRUE_AREA (mm², the outline less its cut-outs and holes), DRAWN_HOLES (drilled holes)
+ * and DRAWN_HOLE_DIA (their diameter, mm; the commonest when they differ, the larger on a tie).
+ *
+ * They are FACTS, not fields: a record needs no rule to hold one, both resolvers put them among
+ * the names a formula can read (FIRST(TRUE_AREA, LENGTH * WIDTH)), and a value worked out from one
+ * is reported as "from the drawing". Nobody types them — a typed write is refused. Stored with
+ * source 'entered', like PIERCINGS, so no rule change ever sweeps them away.
+ */
+export const DRAWING_FACT_SPECS = new Set(['TRUE_AREA', 'DRAWN_HOLES', 'DRAWN_HOLE_DIA']);
+export const DRAWING_FACT_WHY = 'Read from the drawing of this part — it changes when the drawing does.';
+/** Why nobody types this value on an item, or null when it is typed like any other. */
+export const workedOutWhy = (code) => {
+  const c = String(code ?? '').toUpperCase();
+  return WORKED_OUT_SPECS.has(c) ? WORKED_OUT_WHY : DRAWING_FACT_SPECS.has(c) ? DRAWING_FACT_WHY : null;
+};
+
+/**
  * Values a FROZEN record still works out from its chain, as if it were live.
  * A frozen record normally shows only what it holds, so a later setup change
  * cannot alter what was locked or delivered. SHIP_UNIT (init.sql §31) is

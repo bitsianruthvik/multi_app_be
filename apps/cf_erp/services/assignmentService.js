@@ -86,6 +86,18 @@ async function checkRuleBody(db, companyId, spec, body, subject, problems) {
     if (valueRule === 'calculated' && parsed.usesRollup) problems.push(`${f.code} reads BOM children — use it with a Roll-up rule.`);
     if (valueRule === 'rollup' && !parsed.usesRollup) problems.push(`${f.code} does not read BOM children — a roll-up needs e.g. SUM(children.${spec.code}).`);
     if (valueRule === 'calculated' && parsed.references.includes(spec.code)) problems.push(`${f.code} reads ${spec.code} itself.`);
+  } else if (valueRule === 'defaulted' && formulaId) {
+    // A Defaulted rule may name a formula: the formula gives the default and a typed value replaces
+    // it (resolutionService — "calculated, but a person may type over it"). Calculated or roll-up, by what it reads.
+    if (spec.data_type !== 'number') problems.push(`${spec.code} is a ${spec.data_type}; only numbers are calculated.`);
+    if (captureAt !== 'item') problems.push('A default worked out by a formula is an item-level rule.');
+    const [[f]] = await db.query('SELECT id, code, expression, status FROM cf_formulas WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, formulaId]);
+    if (!f) { problems.push('That formula does not exist.'); return; }
+    if (f.status !== 'active') problems.push(`Formula ${f.code} is inactive.`);
+    const parsed = parseFormula(f.expression);
+    if (parsed.usesContext) { problems.push(`${f.code} reads item. and machine. values — it is a timing formula for operations, not a specification rule.`); return; }
+    if (parsed.usesRollup && subject.machine) problems.push('A machine has no BOM — nothing to roll up.');
+    if (parsed.references.includes(spec.code)) problems.push(`${f.code} reads ${spec.code} itself.`);
   } else if (formulaId) {
     problems.push(`A ${valueRule} rule does not use a formula.`);
   }
@@ -147,7 +159,7 @@ export async function listRules(db, companyId, subjectType, subjectId) {
     specificationId: r.specification_id, specCode: r.spec_code, specName: r.spec_name, dataType: r.data_type, unit: r.default_uom,
     subjectType: r.subject_type, subjectId: r.subject_id,
     captureAt: r.capture_at, valueRule: r.value_rule, isRequired: !!r.is_required, isApplicable: !!r.is_applicable,
-    formulaId: r.formula_id, formulaCode: r.formula_code, sortOrder: r.sort_order,
+    formulaId: r.formula_id, formulaCode: r.formula_code, sortOrder: r.sort_order, origin: r.origin ?? 'manual',
     optionIds: opts.filter((o) => o.assignment_id === r.id).map((o) => o.id),
     optionValues: opts.filter((o) => o.assignment_id === r.id).map((o) => o.value),
   }));
@@ -176,7 +188,21 @@ export async function createRule(db, c, input = {}) {
   );
   await writeOptions(db, c, r.insertId, optionIds);
   await rematerialize(db, c, subject.reach);
+  await followWorkedOut(db, c, subject, spec.id, null, body);
   return (await listRules(db, c.companyId, subjectType, subjectId)).find((x) => x.id === r.insertId);
+}
+
+/**
+ * A rule that says how a value is WORKED OUT (a recipe, or a Defaulted rule that names a formula)
+ * was added, changed or removed above the records: the ones whose own flow-made rule asks for that
+ * value are brought in line (flowSpecService.syncRecordsAskedFor). Nothing for any other rule.
+ */
+async function followWorkedOut(db, c, subject, specificationId, old, body) {
+  if (subject.machine || subject.reach?.masterId) return;   // a machine, or one item's own rule: nobody below it
+  const worked = (valueRule, formulaId, origin) => origin === 'flow' || (valueRule === 'defaulted' && formulaId != null);
+  if (!(old && worked(old.value_rule, old.formula_id, old.origin)) && !(body && body.isApplicable && worked(body.valueRule, body.formulaId, null))) return;
+  const { syncRecordsAskedFor } = await import('./flowSpecService.js');
+  await syncRecordsAskedFor(db, c, specificationId);
 }
 
 export async function updateRule(db, c, id, input = {}) {
@@ -202,6 +228,7 @@ export async function updateRule(db, c, id, input = {}) {
   );
   if (optionIds !== null || !body.isApplicable) await writeOptions(db, c, id, body.isApplicable ? optionIds ?? [] : []);
   await rematerialize(db, c, subject.reach);
+  await followWorkedOut(db, c, subject, rule.specification_id, rule, body);
   return (await listRules(db, c.companyId, rule.subject_type, rule.subject_id)).find((x) => x.id === id);
 }
 
@@ -211,6 +238,7 @@ export async function deleteRule(db, c, id) {
   await db.query('UPDATE cf_spec_assignment_options SET deleted_at = NOW() WHERE company_id = ? AND assignment_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   await rematerialize(db, c, subject.reach);
+  await followWorkedOut(db, c, subject, rule.specification_id, rule, null);
   return { ok: true };
 }
 

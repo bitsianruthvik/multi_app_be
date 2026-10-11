@@ -144,6 +144,10 @@ function effective(view, col, row, cell, canEdit) {
     display: cell.display ?? null,
     defaultDisplay: cell.defaultDisplay ?? null,
     missing: !!cell.missing,
+    // Where a formula value comes from ('calculated' | 'drawing' | 'typed' over it), and what a typed one replaced.
+    from: pick('from') ?? null,
+    calculated: cell.calculated ?? null,
+    noCalc: cell.noCalc ?? null,
     typeable,
     editable: !!canEdit && !!view.editable && !row.readOnly && typeable,
   };
@@ -165,6 +169,9 @@ const optionText = (o) => o.label || o.value;
  *   a 'value' field also carries
  *     code, name, unit, dataType
  *     state      'typed' (its own value) | 'default' (a default shown) | 'worked' (not typed here) | 'empty'
+ *     from       where a formula value comes from: 'calculated' | 'drawing' | 'typed' (typed by hand
+ *                over the calculated one) — null for a value no formula gives
+ *     calculated on a 'typed' one: the calculated value it replaced, as text (null when there is none yet)
  *     input      the record's own typed value as the server takes it ('' when none; an option's id)
  *     missing    required and still empty — the amber cell
  *     why        why it is not typed, when it is not
@@ -211,7 +218,7 @@ export function orderSheetLayout({ root, view, codes = null }) {
     return {
       key: code, kind: 'value', label, value: String(value), editable: c.editable,
       code, name: col.name, unit: col.unit ?? null, dataType: col.dataType, rule: c.rule, required: c.required,
-      state, input: c.input, missing: missingOf(node, code),
+      state, input: c.input, missing: missingOf(node, code), from: c.from, calculated: c.calculated, noCalc: c.noCalc,
       why: c.editable ? null : (info.row.readOnly ?? c.why ?? (node.kind !== 'temporary' ? 'It is not one of this order’s own rows.' : !open ? (view.lock?.message ?? 'This line no longer changes.') : null)),
       options: col.dataType === 'option' ? (c.options ?? []).map((o) => ({ id: o.id, text: optionText(o) })) : null,
     };

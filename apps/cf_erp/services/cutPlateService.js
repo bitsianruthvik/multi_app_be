@@ -2295,6 +2295,15 @@ export async function withCutPieces(db, c, lineId, out) {
   // Selection rows the system can answer on its own (a default, or one candidate) — before the cut pieces are worked out.
   await autofillLineSelections(db, c, lineId, { refresh: (ids) => refreshValues(db, c, ids) });
   const cutPieces = await refreshCutPieces(db, c, lineId);
+  // A size or a drawing mark may have changed without the cut pieces changing: the parts' values from
+  // their drawings (true area, holes) follow the save too. A derive has already done it
+  // (partDrawingService.shapesAfterCutPieces); one count when the line has no drawing; never fails the save.
+  if (!cutPieces?.made) {
+    const { drawingValuesAfterSave } = await import('./drawingValueService.js');
+    const moved = await drawingValuesAfterSave(db, c, lineId);
+    // The save's own picture of the values was drawn before they moved: drawn again, so the screen is not a save behind.
+    if ((moved.written || moved.cleared) && out && typeof out === 'object' && !Array.isArray(out) && out.view?.groups) out = { ...out, view: await readLineValues(db, c.companyId, lineId) };
+  }
   return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, cutPieces } : out;
 }
 

@@ -54,7 +54,17 @@
  * record itself. On an own node, a person may type what valueService.setValues
  * accepts: `entered`, and `defaulted` (to override the default). `fixed`,
  * `calculated`, `rollup` and `inherited` come back with their worked-out value
- * and the reason they are not typed. A line whose order is closed, lost or
+ * and the reason they are not typed.
+ *
+ * TYPED OVER A CALCULATED VALUE (2026-10-12). A `defaulted` rule that names a
+ * formula is a calculated value a person may type over (resolutionService). Its
+ * cell says where the number comes from — `from`: 'calculated' | 'drawing' |
+ * 'typed' — and a typed one carries `calculated`, the answer it replaced, so the
+ * grid can show both and offer the way back. Emptying the cell takes the typed
+ * value away (the answer returns); typing the answer itself is the same as
+ * emptying it — nothing is stored that says no more than the formula does. A
+ * value somebody typed is never removed by anything but that person.
+ * A line whose order is closed, lost or
  * cancelled, or which is locked or released to production, is read-only (409
  * on write), as bomChangeService treats a frozen structure.
  *
@@ -80,9 +90,10 @@
  *           its usual per-record cost for them.
  */
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, WORKED_OUT_SPECS, WORKED_OUT_WHY, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
+import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
-import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol } from './resolutionService.js';
+import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol, isWorkedDefault, rollupNeeds, workOutFormulas, drawingFactsOf } from './resolutionService.js';
+import { childWordReader, valueWord } from './bomGraph.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues } from './valueService.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
@@ -206,11 +217,11 @@ const STRUCTURE_SQL = `
  * and linesOfBom (what a roll-up reads) does not filter them either.
  */
 const RECORDS_SQL = `
-  SELECT m.id, m.record_kind, m.code, m.name, m.status, m.classification_id,
+  SELECT m.id, m.record_kind, m.code, m.short_name, m.name, m.status, m.classification_id,
          (m.deleted_at IS NOT NULL) AS is_deleted,
          i.item_type, i.tracked_by, i.uom, i.source_definition_id, i.owner_order_line_id,
          d.definition_type,
-         sd.id AS def_id, sd.code AS def_code, sd.name AS def_name,
+         sd.id AS def_id, sd.code AS def_code, sd.short_name AS def_short_name, sd.name AS def_name,
          so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
          ol.line_no AS owner_line_no, ol.locked_at AS owner_line_locked_at, rel.id AS owner_release_id,
          bh.id AS bom_id,
@@ -434,7 +445,10 @@ function placementOf(ctx, itemId) {
   return { line_id: held[0].id, parent_id: held[0].parentId, parent_code: parent?.code ?? null, parent_name: parent?.name ?? null };
 }
 
-/** rollupChildren: one entry per line of the record's BOM, reading each child's stored numbers. */
+/**
+ * rollupChildren: one entry per line of the record's BOM, reading each child's stored numbers —
+ * and, for a formula that tells children apart, what each child IS (bomGraph.childWordReader).
+ */
 function rollupChildrenOf(ctx, rec) {
   if (!rec.bom_id) return null;
   const lines = ctx.linesByParent.get(rec.id) ?? [];
@@ -443,17 +457,28 @@ function rollupChildrenOf(ctx, rec) {
     const isItem = child?.record_kind === 'item';
     const name = child ? (child.code ?? child.name) : `#${l.childId}`;
     const own = isItem ? ctx.store.get(subjectKey('master', l.childId)) : null;
+    const rowOf = (code) => {
+      if (!isItem || !own) return null;
+      for (const row of own.values()) if (String(row.spec_code).toUpperCase() === code) return row;
+      return null;
+    };
+    const levels = {};
+    for (const n of (child?.classification_id != null ? ctx.chains.get(child.classification_id) : null) ?? []) levels[levelName(n.depth).toUpperCase()] = { code: n.code, name: n.name };
     return {
       lineId: l.id,
       label: isItem ? name : `${name} (not chosen yet)`,
       quantity: Number(l.quantity),
-      get: (code) => {
-        if (!isItem || !own) return null;
-        for (const row of own.values()) {
-          if (row.value_number != null && String(row.spec_code).toUpperCase() === code) return Number(row.value_number);
-        }
-        return null;
-      },
+      get: (code) => { const row = rowOf(code); return row && row.value_number != null ? Number(row.value_number) : null; },
+      word: childWordReader({
+        names: [child?.name, child?.short_name, child?.code, child?.def_name, child?.def_short_name, child?.def_code],
+        role: l.role, levels,
+        valueWord: (code) => {
+          const row = rowOf(code);
+          if (!row) return null;
+          const o = row.option_id != null ? (ctx.optionsBySpec.get(row.specification_id) ?? []).find((x) => x.id === row.option_id) : null;
+          return valueWord({ optionValue: o?.value ?? null, optionLabel: o?.label ?? null, text: row.value_text ?? null });
+        },
+      }),
     };
   });
 }
@@ -471,12 +496,24 @@ function resolveRecord(ctx, rec) {
   const selfIndex = chain.findIndex((s) => s.self);
   const aboveTop = selfIndex >= 0 ? selfIndex - 1 : chain.length - 1;
 
-  const rules = [];
+  let rules = [];
+  // ctx.thaw (the compare report only): how a flow-asked value WOULD be worked out — the nearest recipe above, by spec.
+  const recipes = new Map();
   for (const s of chain) {
     for (const r of ctx.rulesBySubject.get(subjectKey(s.subjectType, s.subjectId)) ?? []) {
-      if (r.origin === 'flow' && !s.self) continue;   // a flow-made rule is its own record's only (resolutionService.loadRules)
+      if (r.origin === 'flow' && !s.self) {   // a flow-made rule is its own record's only (resolutionService.loadRules)
+        if (ctx.thaw && s.subjectType === 'classification' && r.is_applicable && r.value_rule === 'defaulted' && r.formula_id) recipes.set(r.specification_id, r);
+        continue;
+      }
       rules.push({ ...r, levelIndex: levelOf.get(subjectKey(r.subject_type, r.subject_id)) });
     }
+  }
+  // A frozen row keeps the typed rule it was frozen with; the report reads it as the recipe would have it.
+  if (ctx.thaw && recipes.size) {
+    rules = rules.map((r) => {
+      const how = r.origin === 'flow' && r.value_rule === 'entered' ? recipes.get(r.specification_id) : null;
+      return how ? { ...r, value_rule: 'defaulted', formula_id: how.formula_id, formula_code: how.formula_code, formula_name: how.formula_name, formula_expression: how.formula_expression, formula_version: how.formula_version } : r;
+    });
   }
   rules.sort((a, b) => a.levelIndex - b.levelIndex || a.sort_order - b.sort_order || a.id - b.id);
 
@@ -524,6 +561,7 @@ function resolveRecord(ctx, rec) {
 
   const specs = [];
   const effectiveRows = new Map();
+  const fallbacks = new Map();
   for (const { rule: r, overridden } of merged.values()) {
     const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
     let allowed;
@@ -566,9 +604,19 @@ function resolveRecord(ctx, rec) {
       return v;
     };
 
-    if (frozen && !LIVE_WHEN_FROZEN.has(spec.code)) {
+    if (frozen && !ctx.thaw && !LIVE_WHEN_FROZEN.has(spec.code)) {
       if (own) entry.value = view(own, own.source, 'here');
       entry.status = 'frozen';
+      if (own && entry.rule.formula) entry.derived = { source: isWorkedDefault(entry.rule) && own.source === 'entered' ? 'typed' : 'calculated', overridable: false, rollup: own.source === 'rollup', frozen: true };
+      continue;
+    }
+
+    if (mode === 'setup') {
+      // resolve()'s setup mode — a definition in the structure (a selection not chosen yet) holds defaults, nothing is worked out on it.
+      if (['calculated', 'rollup', 'inherited'].includes(r.value_rule)) { entry.status = 'computed_on_items'; continue; }
+      if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set_here'; effectiveRows.set(spec.id, own); }
+      else if (above) { entry.value = view(above.row, above.row.source, chain[above.levelIndex].level); entry.status = 'default_from_above'; }
+      else if (isWorkedDefault(entry.rule)) entry.status = 'computed_on_items';
       continue;
     }
 
@@ -578,7 +626,10 @@ function resolveRecord(ctx, rec) {
         break;
       case 'defaulted':
         if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
-        else if (above) { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); }
+        // Its formula gives the default (second pass); the value above only stands in where it cannot.
+        else if (isWorkedDefault(entry.rule)) {
+          if (above) fallbacks.set(entry, () => { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); });
+        } else if (above) { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); }
         break;
       case 'fixed':
         if (above) {
@@ -616,60 +667,15 @@ function resolveRecord(ctx, rec) {
       default:
         break; // calculated and rollup: second pass
     }
-    if (entry.rule.isRequired && !entry.value && ['entered', 'defaulted'].includes(r.value_rule)) entry.status = 'missing';
+    if (entry.rule.isRequired && !entry.value && ['entered', 'defaulted'].includes(r.value_rule) && !isWorkedDefault(entry.rule)) entry.status = 'missing';
   }
 
-  if (mode === 'item' && !frozen) {
-    const lookup = new Map();
-    for (const s of specs) if (s.value && s.spec.dataType === 'number') lookup.set(s.spec.code, s.value.raw);
-    const calc = specs.filter((s) => s.applicable && s.captureAt === 'item' && ['calculated', 'rollup'].includes(s.rule.valueRule));
-    const parsedOf = new Map();
-    for (const s of calc) {
-      if (!s.rule.formula) continue;
-      parsedOf.set(s, parsed(ctx, s.rule.formula.expression));
-    }
-    let children = null;
-    if (calc.some((s) => s.rule.valueRule === 'rollup')) children = rollupChildrenOf(ctx, rec);
-    const done = new Set();
-    let moved = true;
-    while (moved) {
-      moved = false;
-      for (const s of calc) {
-        if (done.has(s)) continue;
-        const isRollup = s.rule.valueRule === 'rollup';
-        if (!s.rule.formula) { s.status = 'formula_missing'; done.add(s); moved = true; continue; }
-        const p = parsedOf.get(s);
-        if (p instanceof Error) { s.status = 'formula_error'; s.problem = p.message; done.add(s); moved = true; continue; }
-        if (isRollup && (!children || !children.length)) {
-          s.status = 'no_bom';
-          s.note = children ? 'Its BOM has no lines yet.' : 'It has no BOM to roll up.';
-          done.add(s); moved = true; continue;
-        }
-        const waiting = p.references.some((code) => !lookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
-        if (waiting) continue;
-        const out = evaluateFormula(p, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null);
-        done.add(s);
-        moved = true;
-        if (out.value === null) {
-          s.status = out.missing ? 'waiting_inputs' : 'formula_error';
-          if (out.missing) s.missingInputs = out.missing;
-          if (out.error) s.problem = out.error;
-        } else {
-          s.value = {
-            raw: out.value,
-            display: displayOf(out.value, s.spec, optionById),
-            source: isRollup ? 'rollup' : 'calculated',
-            from: isRollup ? `BOM · ${children.length} line${children.length === 1 ? '' : 's'}` : `formula ${s.rule.formula.code}`,
-          };
-          s.status = isRollup ? 'rollup' : 'calculated';
-          lookup.set(s.spec.code, out.value);
-          effectiveRows.set(s.spec.id, { value_number: out.value, value_text: null, value_bool: null, value_date: null, option_id: null });
-        }
-      }
-    }
-    for (const s of calc) {
-      if (!done.has(s)) { s.status = 'formula_cycle'; s.problem = 'This formula depends on itself through other calculated values.'; }
-    }
+  // Formulas: resolve()'s own second pass (resolutionService.workOutFormulas), fed from the loaded rows.
+  if (mode === 'item' && (!frozen || ctx.thaw)) {
+    const parse = (expression) => parsed(ctx, expression);
+    const children = rollupNeeds(specs, parse).any ? rollupChildrenOf(ctx, rec) : null;
+    const mine = selfIndex >= 0 ? (ctx.store.get(subjectKey('master', rec.id))?.values() ?? []) : [];
+    workOutFormulas(specs, { parse, children, optionById, effectiveRows, fallbacks, facts: drawingFactsOf(mine) });
   }
 
   specs.sort((a, b) => CAPTURE_DEPTH[a.captureAt] - CAPTURE_DEPTH[b.captureAt]
@@ -679,7 +685,7 @@ function resolveRecord(ctx, rec) {
   const ownRows = new Map();
   if (selfIndex >= 0) for (const { v, i } of values) if (i === selfIndex) ownRows.set(v.specification_id, v);
   const unassigned = [...ownRows.values()]
-    .filter((v) => !resolvedItemSpecs.has(v.specification_id))
+    .filter((v) => !resolvedItemSpecs.has(v.specification_id) && !DRAWING_FACT_SPECS.has(String(v.spec_code ?? '').toUpperCase()))
     .map((v) => ({ code: v.spec_code, name: v.spec_name, source: v.source, raw: rawOf(v, v.data_type) }));
 
   return {
@@ -689,7 +695,7 @@ function resolveRecord(ctx, rec) {
     missingRequired: specs.filter((s) => s.status === 'missing').map((s) => ({ code: s.spec.code, name: s.spec.name })),
     problems: specs.filter((s) => s.problem).map((s) => `${s.spec.code}: ${s.problem}`),
     unassignedValues: unassigned,
-    frozen,
+    frozen: ctx.thaw ? null : frozen,
     internal: { ownRows, effectiveRows },
   };
 }
@@ -796,7 +802,8 @@ function derivedWrites(r) {
         break;
       case 'defaulted':
         if (own && own.source === 'entered') break;
-        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted');
+        // A formula's answer is stored as what it is (calculated / rollup); a default from above as 'defaulted'.
+        if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), s.derived ? (s.derived.rollup ? 'rollup' : 'calculated') : 'defaulted');
         else if (own) touch(s, null, 'defaulted');
         break;
       case 'calculated':
@@ -1050,6 +1057,18 @@ function whyReadOnly(s) {
   return null;
 }
 
+/** Why a formula a person may type over has no answer here: what it waits for, or what is wrong with it. Null when it has one. */
+function whyNoAnswer(s) {
+  if (!isWorkedDefault(s.rule)) return null;
+  const d = s.derived ?? null;
+  const typed = d?.source === 'typed';
+  if (typed ? d.calculated != null : s.value != null) return null;
+  if (s.status === 'frozen') return null;
+  const waiting = (typed ? d.waiting : s.missingInputs) ?? null;
+  if (waiting?.length) return `waiting for ${waiting.slice(0, 3).join(', ')}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ''}`;
+  return (typed ? d.problem : s.problem ?? s.note) ?? null;
+}
+
 /** What an input starts at: the record's own typed value — a default from above is not its own. */
 function ownInput(s) {
   const own = s.value && (s.value.source === 'entered' || s.rule.valueRule === 'entered');
@@ -1072,8 +1091,15 @@ function ownInput(s) {
  * column or says something (an own value, a worked-out value, a gap, a
  * problem). A cell with no fields is an empty value that follows the column.
  *
- *   column { code, name, dataType, unit, decimals, rule, required, why?, options?, editable }
- *   cell   { input?, display?, defaultDisplay?, missing?, rule?, required?, why?, problem?, note?, options? }
+ *   column { code, name, dataType, unit, decimals, rule, required, why?, options?, from?, editable }
+ *   cell   { input?, display?, defaultDisplay?, missing?, rule?, required?, why?, problem?, note?, options?,
+ *            from?, calculated?, noCalc? }
+ *
+ *   from            where a formula value comes from: 'calculated' (worked out), 'drawing' (from the
+ *                   part's drawing) or 'typed' (typed by hand over the calculated one). On the column
+ *                   when it is the same for most rows; null = not a formula value.
+ *   calculated      on a 'typed' cell: the calculated value it replaced, in words
+ *   noCalc          on a cell a formula could not fill: what it waits for, or why it has no answer
  *
  *   input           the record's OWN typed value, as an input edits it (an option's id)
  *   display         the value in words, for a value that is not typed here
@@ -1137,8 +1163,9 @@ function buildView(ctx) {
     const full = new Map();
     let missing = 0;
     for (const s of applicable) {
-      const workedOut = WORKED_OUT_SPECS.has(String(s.spec.code).toUpperCase());
+      const workedOut = isWorkedDefault(s.rule) ? null : workedOutWhy(s.spec.code);
       const typeable = !workedOut && s.spec.dataType !== 'table' && ['entered', 'defaulted'].includes(s.rule.valueRule);
+      const d = s.derived ?? null;
       const cell = {
         rule: workedOut ? 'calculated' : s.rule.valueRule,
         required: s.rule.isRequired,
@@ -1148,10 +1175,14 @@ function buildView(ctx) {
         display: typeable ? null : s.value?.display ?? null,
         defaultDisplay: s.rule.valueRule === 'defaulted' && s.value && s.value.source !== 'entered' ? s.value.display : null,
         missing: s.status === 'missing',
-        why: typeable ? null : workedOut ? WORKED_OUT_WHY : whyReadOnly(s),
+        why: typeable ? null : workedOut ?? whyReadOnly(s),
         problem: s.problem ?? null,
         note: s.note ?? s.conflict ?? null,
         options: s.spec.dataType === 'option' && s.options ? optionsKey(s) : null,
+        // Where a formula value comes from, and — typed over — the answer it replaced.
+        from: d?.source ?? null,
+        calculated: d?.source === 'typed' ? d.calculated?.display ?? null : null,
+        noCalc: whyNoAnswer(s),
       };
       if (cell.missing) missing += 1;
       full.set(s.spec.code, { s, cell });
@@ -1223,6 +1254,7 @@ function buildView(ctx) {
         required: commonest(col.cells.map((x) => x.required)),
         why: commonest(col.cells.map((x) => x.why)),
         options: commonest(col.cells.map((x) => x.options)),
+        from: commonest(col.cells.map((x) => x.from)),
         editable: col.editable,
       }));
     const byCode = new Map(columns.map((col) => [col.code, col]));
@@ -1241,6 +1273,9 @@ function buildView(ctx) {
         if (cell.problem) out.problem = cell.problem;
         if (cell.note) out.note = cell.note;
         if (cell.options !== col.options) out.options = cell.options;
+        if (cell.from !== col.from) out.from = cell.from;
+        if (cell.calculated != null) out.calculated = cell.calculated;
+        if (cell.noCalc) out.noCalc = cell.noCalc;
         cells[code] = out;
       }
       return { ...row, cells };
@@ -1248,6 +1283,7 @@ function buildView(ctx) {
     for (const col of columns) {
       if (col.why == null) delete col.why;
       if (col.options == null) delete col.options;
+      if (col.from == null) delete col.from;
     }
     return { key: g.key, own: g.own, classification: g.classification, columns, rows };
   };
@@ -1397,7 +1433,10 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       continue;
     }
     const vr = s.rule.valueRule;
-    if (WORKED_OUT_SPECS.has(String(s.spec.code).toUpperCase())) { say(rec, s.spec.code, 'is worked out by cutting and nesting — it cannot be typed in.'); continue; }
+    if (!isWorkedDefault(s.rule) && workedOutWhy(s.spec.code)) {
+      say(rec, s.spec.code, DRAWING_FACT_SPECS.has(String(s.spec.code).toUpperCase()) ? 'is read from the drawing — it cannot be typed in.' : 'is worked out by cutting and nesting — it cannot be typed in.');
+      continue;
+    }
     if (vr === 'fixed') { say(rec, s.spec.code, `is fixed at ${s.definedAt.level.toLowerCase()} level — change it there.`); continue; }
     if (READ_ONLY_RULES.includes(vr)) { say(rec, s.spec.code, `is ${vr === 'rollup' ? 'a roll-up' : vr} — it cannot be typed in.`); continue; }
     // A table (a chart) is shown here as a summary but never edited from the
@@ -1411,7 +1450,7 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       continue;
     }
     if (!plan.has(rec.id)) plan.set(rec.id, []);
-    plan.get(rec.id).push({ spec: { id: s.spec.id, code: s.spec.code, default_uom: s.spec.unit }, typed: out.typed, source: 'entered' });
+    plan.get(rec.id).push({ spec: { id: s.spec.id, code: s.spec.code, default_uom: s.spec.unit }, typed: out.typed, source: 'entered', worked: isWorkedDefault(s.rule) });
   }
   if (problems.length) {
     throw invalid('INVALID', `${dryRun ? 'These values cannot be saved' : 'Nothing was saved'} — ${plural(problems.length, 'problem')} to fix first.`, { problems, detail: { cells } });
@@ -1438,6 +1477,30 @@ export async function writeLineValues(db, c, lineId, input = {}) {
     if (typed.length || own.length) moved.push(id);
   }
   note(refreshInMemory(ctx, moved));
+
+  // A number typed over a calculated value that SAYS THE SAME as the calculated one is not an
+  // override: it is taken away again, so the cell follows the formula from here on. Asked after
+  // everything above has settled, because the answer may depend on the other values of this save.
+  const handedBack = [];
+  for (const id of written) {
+    const given = plan.get(id).filter((w) => w.worked && w.typed);
+    if (!given.length) continue;
+    const r = resolveRecord(ctx, ctx.records.get(id));
+    const same = given.filter((w) => r.specs.find((x) => x.captureAt === 'item' && x.spec.id === w.spec.id)?.derived?.held);
+    if (!same.length) continue;
+    note(applyToStore(ctx, id, same.map((w) => ({ spec: w.spec, typed: null, source: 'entered' }))));
+    note(materializeInMemory(ctx, id));
+    handedBack.push(id);
+  }
+  if (handedBack.length) note(refreshInMemory(ctx, handedBack));
+  // What a person changed is what ends up different from what was loaded (a value typed and handed back is not).
+  const net = (ch) => {
+    const b = initial.get(ch.recordId)?.get(ch.specId) ?? null;
+    const a = ctx.store.get(subjectKey('master', ch.recordId))?.get(ch.specId) ?? null;
+    if (!b && !a) return false;
+    return !(b && a && sameValue(b, a) && b.source === a.source);
+  };
+  if (handedBack.length) { const kept = typedChanges.filter(net); typedChanges.length = 0; typedChanges.push(...kept); }
 
   // ---- write the net difference -------------------------------------------
   let flushed = { values: 0, history: [] };
@@ -1507,6 +1570,81 @@ export async function writeLineValues(db, c, lineId, input = {}) {
     // worked out from the same rows that were just written — no second read.
     view: view ?? buildView(ctx),
   };
+}
+
+/**
+ * TYPED AGAINST CALCULATED, for one line — every value of the line's own rows that a formula
+ * gives and a person may type over, with the two numbers side by side. Read-only. The setup
+ * script's report and its `--compare` use it (scripts/cf_kepl/derived-values-setup.mjs).
+ *
+ *   opts.thaw   work a FROZEN line out as if it were open, and read a typed flow-made value as the
+ *               recipe above it would have it. A check only: nothing is written, and the line
+ *               itself still shows exactly what it was frozen with.
+ *   opts.facts  Map recordId -> { TRUE_AREA, DRAWN_HOLES, DRAWN_HOLE_DIA } laid over what the rows
+ *               hold (drawingValueService.planFacts) — a frozen line's rows hold no drawing facts.
+ *
+ * → { line, order, frozen, rows: [{ recordId, row, name, depth, code, spec, unit, decimals, formula,
+ *      state, typed, calculated, difference, from, waiting }], counts }
+ *   state  'typed'      typed by hand and DIFFERENT from the calculated value
+ *          'same'       typed by hand and equal to it (shown as calculated; the typed row is kept)
+ *          'calculated' nothing typed — the formula's answer stands
+ *          'typed_only' typed by hand, and the formula has no answer (waiting says why)
+ *          'empty'      nothing typed and no answer yet
+ */
+export async function compareLineValues(db, companyId, lineId, { thaw = false, facts = null } = {}) {
+  const ctx = await loadContext(db, companyId, lineId);
+  const { line } = ctx;
+  const frozen = LOCKED_ORDER_STATUSES.has(line.orderStatus) ? 'closed' : line.releaseId ? 'released' : line.lockedAt ? 'locked' : null;
+  ctx.thaw = !!thaw;
+  for (const [recordId, f] of facts ?? []) {
+    const own = ownStore(ctx, Number(recordId));
+    for (const code of DRAWING_FACT_SPECS) {
+      // Keyed apart from the stored rows: drawingFactsOf reads a fact by its code, the later one winning.
+      if (f?.[code] != null) own.set(`fact:${code}`, { specification_id: `fact:${code}`, spec_code: code, value_number: f[code], source: 'entered' });
+      else for (const [k, row] of own) if (String(row.spec_code).toUpperCase() === code) own.delete(k);
+    }
+  }
+  const depthOf = new Map([[line.itemId, 0], ...ctx.lines.map((l) => [l.childId, l.depth])]);
+  const rows = [];
+  const counts = { typed: 0, same: 0, calculated: 0, typed_only: 0, empty: 0 };
+  // Tree order, as the screen draws it.
+  const order = [];
+  const seen = new Set();
+  (function walk(id) { if (seen.has(id)) return; seen.add(id); order.push(id); for (const l of ctx.linesByParent.get(id) ?? []) walk(l.childId); }(line.itemId));
+  for (const id of order) {
+    const rec = ctx.records.get(id);
+    if (!rec || rec.is_deleted || !isOwn(ctx, rec)) continue;
+    const r = resolveRecord(ctx, rec);
+    for (const s of r.specs) {
+      if (!s.applicable || s.captureAt !== 'item' || !isWorkedDefault(s.rule)) continue;
+      const d = s.derived ?? null;
+      let state; let typed = null; let calculated = null;
+      if (d?.source === 'typed') { typed = s.value.raw; calculated = d.calculated?.raw ?? null; state = calculated == null ? 'typed_only' : 'typed'; }
+      else if (d?.held) { typed = s.value.raw; calculated = d.calculated.raw; state = 'same'; }
+      else if (d && s.value) { calculated = s.value.raw; state = 'calculated'; }
+      else if (s.value?.source === 'entered') { typed = s.value.raw; state = 'typed_only'; }
+      else state = 'empty';
+      counts[state] += 1;
+      rows.push({
+        recordId: rec.id, row: labelOf(rec, ctx), name: rec.name, depth: depthOf.get(rec.id) ?? 0,
+        code: s.spec.code, spec: s.spec.name, unit: s.spec.unit ?? null, decimals: s.spec.decimals ?? null, formula: s.rule.formula?.code ?? null,
+        state, typed, calculated,
+        difference: typed != null && calculated != null ? Number((typed - calculated).toFixed(6)) : null,
+        from: d?.source === 'typed' ? d.calculatedFrom ?? null : d?.source ?? null,
+        waiting: (d?.source === 'typed' ? d.waiting : s.missingInputs) ?? null,
+      });
+    }
+  }
+  return {
+    line: { id: line.id, lineNo: line.lineNo }, order: { id: line.orderId, code: line.orderCode, status: line.orderStatus, revision: line.orderRevision },
+    frozen, rows, counts,
+  };
+}
+
+/** Every own record of a line worked out again and stored (materializeLineRecords for all of them) — the setup script, after its rules change. */
+export async function materializeLine(db, c, lineId) {
+  const [rows] = await db.query("SELECT master_id FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND item_type = 'temporary' AND deleted_at IS NULL", [c.companyId, lineId]);
+  return rows.length ? materializeLineRecords(db, c, lineId, rows.map((r) => r.master_id)) : { records: 0, values: 0 };
 }
 
 /** For the test: the mirror, exposed so it can be compared with resolve() record by record. */

@@ -18,7 +18,7 @@ import { loadMaster, requireMachine } from './records.js';
 import { resolve, effectiveByCode, levelsOfResolution, parseJsonCol } from './resolutionService.js';
 import { valueReaders } from './operationService.js';
 import { checkFormula } from './formulaService.js';
-import { LEAF_DEPTH } from './tree.js';
+import { LEAF_DEPTH, ancestors } from './tree.js';
 
 const MAX_MACHINES = 60;
 const MAX_PIECES = 30;
@@ -92,7 +92,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
       ? db.query(`SELECT DISTINCT specification_id FROM cf_spec_assignments WHERE company_id = ? AND deleted_at IS NULL AND capture_at = 'item' AND (${scope.join(' OR ')})`, [companyId, ...scopeParams])
       : [[]],
     scope.length
-      ? db.query(`SELECT specification_id, subject_type, subject_id, value_number, value_json FROM cf_spec_values WHERE company_id = ? AND deleted_at IS NULL AND (${scope.join(' OR ')})`, [companyId, ...scopeParams])
+      ? db.query(`SELECT specification_id, subject_type, subject_id, value_number, value_json, source FROM cf_spec_values WHERE company_id = ? AND deleted_at IS NULL AND (${scope.join(' OR ')})`, [companyId, ...scopeParams])
       : [[]],
     // Real pieces that go through this operation: their flow (own, their
     // template's, or the BOM line's) has a step for it. Newest first.
@@ -164,8 +164,15 @@ export async function builderContext(db, companyId, operationId, q = {}) {
       }
     }
     const type = nodeById.get(m.classification_id);
-    return { id: m.id, code: m.code, name: m.name, typeName: type?.name ?? null, values };
+    // §58: "own chart" = a value entered on the machine itself (a copy of its type's is not its own).
+    const ownChart = machineValues.some((v) => v.subject_type === 'machine' && v.subject_id === m.id && (v.source == null || v.source === 'entered') && (v.value_number != null || v.value_json != null));
+    return { id: m.id, code: m.code, name: m.name, typeId: m.classification_id, typeName: type?.name ?? null, ownChart, values };
   });
+  // §58 — the STANDARD the preview shows first: the machine type the rule is for (a machine's rule: its type).
+  const standardNode = subjectType === 'classification' ? nodeById.get(subjectId)
+    : subjectType === 'machine' ? nodeById.get(machines.find((m) => m.id === subjectId)?.classification_id)
+      : nodeById.get(reached[0]?.classification_id);
+  const standard = standardNode ? { typeId: standardNode.id, typeName: standardNode.name } : null;
 
   const machineFields = [...machineSpecIds].map((id) => specById.get(id)).filter(Boolean).map((s) => {
     const withIt = machinesOut.filter((m) => m.values[s.code] != null);
@@ -182,6 +189,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
 
   return {
     operation: { id: op.id, code: op.code, name: op.name },
+    standard,
     machines: machinesOut,
     machineFields,
     itemFields,
@@ -195,6 +203,27 @@ export async function builderContext(db, companyId, operationId, q = {}) {
  * with any typed sample value laid over them. Returns `inputs` — what each name
  * read and from where.
  */
+/** code -> { raw, dataType, tableConfig } of a machine type: its own number / chart values, else the nearest above. 2 reads. */
+async function typeValueMap(db, companyId, nodeId) {
+  const chain = await ancestors(db, companyId, nodeId);   // root first
+  const out = new Map();
+  if (!chain.length) return out;
+  const depthOf = new Map(chain.map((n, i) => [Number(n.id), i]));
+  const [rows] = await db.query(
+    `SELECT v.subject_id, v.value_number, v.value_json, s.code, s.data_type, s.table_config
+       FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.data_type IN ('number', 'table')
+      WHERE v.company_id = ? AND v.deleted_at IS NULL AND v.subject_type = 'classification' AND v.subject_id IN (?)`,
+    [companyId, chain.map((n) => n.id)],
+  );
+  rows.sort((a, b) => depthOf.get(Number(a.subject_id)) - depthOf.get(Number(b.subject_id)));   // deepest last: it wins
+  for (const r of rows) {
+    const raw = r.data_type === 'number' ? num(r.value_number) : parseJsonCol(r.value_json);
+    if (raw == null) continue;
+    out.set(r.code, { raw, dataType: r.data_type, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
+  }
+  return out;
+}
+
 export async function checkForBuilder(db, companyId, body = {}) {
   const readers = {};
   if (!blank(body.itemId)) {
@@ -206,6 +235,10 @@ export async function checkForBuilder(db, companyId, body = {}) {
   if (!blank(body.machineId)) {
     const machine = await requireMachine(db, companyId, Number(body.machineId));
     readers.machine = valueReaders(effectiveByCode(await resolve(db, companyId, { machine })));
+  } else if (!blank(body.machineTypeId)) {
+    // §58 — the STANDARD: the machine TYPE's own values, the way release reads them
+    // (timeEstimateService valuesOfChain(…, false): the type's value, else the nearest above).
+    readers.machine = valueReaders(await typeValueMap(db, companyId, Number(body.machineTypeId)));
   }
   return checkFormula(db, companyId, body.expression, body.sample ?? null, readers);
 }

@@ -28,6 +28,20 @@
  *                    instantiationService). Every row carries its own flow's rules. A row of a FROZEN
  *                    (locked) or released line is left alone: its list is the one it had at freeze.
  * All set-based: a fixed number of queries whatever the number of records.
+ *
+ * HOW A FLOW-ASKED VALUE COMES (2026-10-12, "values from the drawing and from the parts"). The flow
+ * says the record NEEDS the value; the classification may say HOW it is worked out:
+ *
+ *   a RECIPE   a rule ON A CLASSIFICATION NODE with origin 'flow', Defaulted, naming a formula. It
+ *              reaches no record by itself (every resolver drops a flow-made rule that is not the
+ *              record's own) — it only says: "a record under this node whose flow asks for this
+ *              value gets it from this formula, and a person may type over it".
+ *
+ * So a record's own flow-made rule is written as the recipe says — Defaulted, that formula, required
+ * — where there is one (nearest node up), and Entered, required where there is none. The same when
+ * the chain holds an ordinary Defaulted rule with a formula that is not required: the record's own
+ * rule repeats it, required. An existing flow-made rule is brought in line on the next sync (a typed
+ * value stays exactly as typed — it now sits over the formula's answer); a frozen row is not touched.
  */
 import { parseFormula } from './formulaEngine.js';
 import { readMasters, resolveCodes } from '../lib/cutFrom.js';
@@ -64,6 +78,7 @@ async function flowsOf(db, companyId, ids, { includeLocked = false } = {}) {
   // A row of a frozen (locked) or released line is fixed — its rules are not touched.
   const [rows] = await db.query(
     `SELECT m.id, m.record_kind, m.default_flow_id, i.item_type, d.default_flow_id AS def_flow,
+            (CASE WHEN ol.deleted_at IS NULL THEN ol.id END) AS line_id,
             (SELECT bl.operation_flow_id FROM cf_bom_lines bl WHERE bl.company_id = m.company_id AND bl.child_id = m.id AND bl.deleted_at IS NULL AND bl.operation_flow_id IS NOT NULL ORDER BY bl.id LIMIT 1) AS line_flow,
             (ol.locked_at IS NOT NULL OR EXISTS (SELECT 1 FROM cf_production_releases r WHERE r.company_id = m.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL)) AS locked
        FROM cf_master_records m
@@ -81,19 +96,46 @@ async function flowsOf(db, companyId, ids, { includeLocked = false } = {}) {
       if (Number(r.locked) && !includeLocked) continue;
       flow = r.line_flow ?? r.default_flow_id;
     } else flow = r.default_flow_id;
-    out.set(Number(r.id), { flow: flow == null ? null : Number(flow) });
+    out.set(Number(r.id), { flow: flow == null ? null : Number(flow), kind: r.record_kind, lineId: r.item_type === 'temporary' && r.line_id != null ? Number(r.line_id) : null });
   }
   return out;
 }
 
 /**
+ * A record whose flow-made rule just became "worked out" (or stopped being): its values are worked
+ * out again and stored, so what reads STORED values — a parent's roll-up, an operation's time — sees
+ * the formula's answer. One pass per order line (orderValuesService.materializeLineRecords: a fixed
+ * number of statements whatever the number of rows); a catalog item, which has no line, by itself.
+ */
+async function settleValues(db, c, flows, recordIds) {
+  const byLine = new Map();
+  const alone = [];
+  for (const id of new Set(recordIds)) {
+    const f = flows.get(id);
+    if (!f || f.kind !== 'item') continue;
+    if (f.lineId == null) { alone.push(id); continue; }
+    if (!byLine.has(f.lineId)) byLine.set(f.lineId, []);
+    byLine.get(f.lineId).push(id);
+  }
+  if (byLine.size) {
+    const { materializeLineRecords } = await import('./orderValuesService.js');
+    for (const [lineId, ids] of byLine) await materializeLineRecords(db, c, lineId, ids);
+  }
+  if (alone.length) {
+    const { refreshValues } = await import('./valueService.js');
+    await refreshValues(db, c, alone);
+  }
+}
+
+/**
  * Bring records' flow-made rules in line with their flows. Returns
- * { added: [{ recordId, code }], removed: [...], kept: [{ recordId, code, why }], unknown: [code] }.
+ * { added: [{ recordId, code }], removed: [...], kept: [{ recordId, code, why }], unknown: [code],
+ *   changed: [{ recordId, code, to: 'worked out' | 'typed' }] — own flow-made rules brought in line with a recipe }.
  */
 export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
   const { companyId } = c;
   const ids = [...new Set(recordIds.map(Number).filter(Boolean))];
-  const result = { added: [], removed: [], kept: [], unknown: [] };
+  const result = { added: [], removed: [], kept: [], changed: [], unknown: [] };
   if (!ids.length) return result;
   // opts.includeLocked: only for the one-time migration that gives every frozen row the list it has today.
   const flows = await flowsOf(db, companyId, ids, opts);
@@ -102,7 +144,7 @@ export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
 
   // The record's own flow-made rules (to remove what is no longer needed).
   const [mine] = await db.query(
-    `SELECT a.id, a.subject_id, s.id AS spec_id, UPPER(s.code) AS code FROM cf_spec_assignments a
+    `SELECT a.id, a.subject_id, s.id AS spec_id, UPPER(s.code) AS code, a.value_rule, a.formula_id FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id
       WHERE a.company_id = ? AND a.subject_type = 'master' AND a.subject_id IN (?) AND a.origin = 'flow' AND a.deleted_at IS NULL`,
     [companyId, ids],
@@ -120,7 +162,7 @@ export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
   // A rule the record already has of its own, made by hand (one live rule per record × spec × level):
   // never a second one beside it — an optional entered one is made required instead.
   const [ownManual] = specOf.size ? await db.query(
-    `SELECT a.id, a.subject_id, UPPER(s.code) AS code, a.value_rule, a.is_required, a.is_applicable FROM cf_spec_assignments a
+    `SELECT a.id, a.subject_id, UPPER(s.code) AS code, a.value_rule, a.formula_id, a.is_required, a.is_applicable FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id
       WHERE a.company_id = ? AND a.subject_type = 'master' AND a.subject_id IN (?) AND a.capture_at = 'item'
         AND a.origin = 'manual' AND a.deleted_at IS NULL AND s.code IN (?)`,
@@ -129,31 +171,58 @@ export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
   const manualOf = new Map(ownManual.map((r) => [`${r.subject_id}:${r.code}`, r]));
   const makeRequired = [];
 
+  // How a flow-asked value is worked out for this record, if anything says: the chain's own Defaulted
+  // rule with a formula (the nearest wins, as in resolution), else the nearest recipe above. Null = typed.
+  const howOf = (e) => {
+    const b = e?.below ?? null;
+    if (b && b.applicable && b.valueRule === 'defaulted' && b.formulaId != null) return b.formulaId;
+    return e?.recipe?.formulaId ?? null;
+  };
   const adds = [];
+  const reshape = new Map();   // "rule|formula" -> ids of the record's own flow-made rules to bring in line
   for (const id of ids) {
     const f = flows.get(id);
     if (!f) continue;
     const need = f.flow != null ? needOf.get(f.flow) ?? new Set() : new Set();
     for (const code of need) {
-      if (!specOf.has(code) || ownFlowRule.has(`${id}:${code}`)) continue;
-      const manual = manualOf.get(`${id}:${code}`);
-      if (manual) {
-        if (manual.is_applicable && manual.value_rule === 'entered' && !manual.is_required) { makeRequired.push(manual.id); result.added.push({ recordId: id, code, madeRequired: true }); }
+      if (!specOf.has(code)) continue;
+      const e = resolved.get(id)?.get(code);
+      const how = howOf(e);
+      const mineNow = ownFlowRule.get(`${id}:${code}`);
+      if (mineNow) {
+        // Its own flow-made rule is there: as the recipe says today, or typed where nothing says.
+        const want = how != null ? 'defaulted' : 'entered';
+        if (mineNow.value_rule !== want || (mineNow.formula_id == null ? null : Number(mineNow.formula_id)) !== how) {
+          const k = `${want}|${how ?? ''}`;
+          if (!reshape.has(k)) reshape.set(k, { valueRule: want, formulaId: how, ids: [] });
+          reshape.get(k).ids.push(mineNow.id);
+          result.changed.push({ recordId: id, code, to: how != null ? 'worked out' : 'typed' });
+        }
         continue;
       }
-      const e = resolved.get(id)?.get(code);
+      const manual = manualOf.get(`${id}:${code}`);
+      if (manual) {
+        const asked = manual.value_rule === 'entered' || (manual.value_rule === 'defaulted' && manual.formula_id != null);
+        if (manual.is_applicable && asked && !manual.is_required) { makeRequired.push(manual.id); result.added.push({ recordId: id, code, madeRequired: true }); }
+        continue;
+      }
       const rule = e?.rule ?? null;
-      if (rule && rule.applicable && rule.valueRule !== 'entered') continue;        // comes by itself
-      if (rule && rule.applicable && rule.isRequired) continue;                      // already asked, required
+      const worked = !!rule && rule.valueRule === 'defaulted' && rule.formulaId != null;
+      if (rule && rule.applicable && rule.valueRule !== 'entered' && !worked) continue;   // comes by itself
+      if (rule && rule.applicable && rule.isRequired) continue;                           // already asked, required
       if (rule && !rule.applicable) { result.kept.push({ recordId: id, code, why: 'switched off on purpose above it' }); continue; }
-      adds.push([companyId, specOf.get(code), 'master', id, 'item', 1, 1, 'entered', 'flow', c.userId ?? null]);
-      result.added.push({ recordId: id, code });
+      adds.push([companyId, specOf.get(code), 'master', id, 'item', 1, 1, how != null ? 'defaulted' : 'entered', how, 'flow', c.userId ?? null]);
+      result.added.push({ recordId: id, code, ...(how != null ? { workedOut: true } : {}) });
     }
   }
   if (makeRequired.length) await db.query('UPDATE cf_spec_assignments SET is_required = 1 WHERE company_id = ? AND id IN (?)', [companyId, makeRequired]);
   if (adds.length) {
     await insertRows(db, 'cf_spec_assignments',
-      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'origin', 'created_by'], adds);
+      ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'formula_id', 'origin', 'created_by'], adds);
+  }
+  // One UPDATE per shape (there are as many shapes as recipes — a handful), never one per record.
+  for (const g of reshape.values()) {
+    await db.query('UPDATE cf_spec_assignments SET value_rule = ?, formula_id = ? WHERE company_id = ? AND id IN (?)', [g.valueRule, g.formulaId, companyId, g.ids]);
   }
 
   // Flow-made rules no longer needed are removed; a value typed for one stays stored.
@@ -167,6 +236,9 @@ export async function syncFlowSpecs(db, c, recordIds, opts = {}) {
     for (const r of stale) result.removed.push({ recordId: Number(r.subject_id), code: r.code });
     await db.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, stale.map((r) => r.id)]);
   }
+  // opts.settle === false: the caller works the values out itself right after (a template copy does).
+  const reworked = [...result.added.filter((a) => a.workedOut).map((a) => a.recordId), ...result.changed.map((x) => x.recordId)];
+  if (reworked.length && opts.settle !== false) await settleValues(db, c, flows, reworked);
   return result;
 }
 
@@ -180,6 +252,19 @@ export async function recordsUsingFlows(db, companyId, flowIds) {
     [companyId, flowIds, companyId, flowIds],
   );
   return rows.map((r) => Number(r.id));
+}
+
+/**
+ * After the way a value is worked out changes on a classification or a definition (a recipe added,
+ * repointed or removed; a Defaulted rule given or losing its formula): every record whose own
+ * flow-made rule asks for that value takes the new way. One query to find them, then the usual sync.
+ */
+export async function syncRecordsAskedFor(db, c, specificationId) {
+  const [rows] = await db.query(
+    "SELECT DISTINCT subject_id FROM cf_spec_assignments WHERE company_id = ? AND subject_type = 'master' AND origin = 'flow' AND specification_id = ? AND deleted_at IS NULL",
+    [c.companyId, specificationId],
+  );
+  return rows.length ? syncFlowSpecs(db, c, rows.map((r) => Number(r.subject_id))) : null;
 }
 
 export async function syncRecordsUsingFlows(db, c, flowIds) {

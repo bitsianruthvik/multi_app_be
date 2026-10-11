@@ -19,6 +19,7 @@ import { materializeMachine, setValues, deleteAllForSubject as deleteValues, get
 import { deleteAllForSubject as deleteRules } from './assignmentService.js';
 import { generate } from '../modules/codegen/index.js';
 import { operationsForMachine, productionMachineIds, clearProductionMachines } from './operationService.js';
+import { reestimateMachine, notStartedStepsOn, estimateOnMachine } from './timeEstimateService.js';
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const blank = (v) => v == null || String(v).trim() === '';
@@ -154,6 +155,9 @@ export async function updateMachine(db, c, id, input = {}) {
   // A new machine type brings new rules and defaults.
   if (moved) await materializeMachine(db, c, id);
   clearProductionMachines(c.companyId);
+  // §58: another type, or switched off — the steps planned on it that have not started are timed again
+  // (a step it can no longer take comes off the machine and is back on the standard time).
+  if (moved || (sets.status !== undefined && sets.status !== m.status)) await reestimateMachine(db, c, id);
   return getMachine(db, c.companyId, id);
 }
 
@@ -164,6 +168,8 @@ export async function updateMachine(db, c, id, input = {}) {
  */
 export async function deleteMachine(db, c, id) {
   await requireMachine(db, c.companyId, id);
+  // §58: nothing stays planned on a machine that is gone — its not-started steps go back to the standard time.
+  await estimateOnMachine(db, c, await notStartedStepsOn(db, c.companyId, id), null);
   await deleteValues(db, c, 'machine', id);
   await deleteRules(db, c, 'machine', id);
   await db.query(
@@ -186,7 +192,18 @@ export async function getMachineSpecs(db, companyId, id) {
 
 export async function setMachineValues(db, c, id, values) {
   const result = await setValues(db, c, 'machine', id, values);
-  return { ...result, specs: await getMachineSpecs(db, c.companyId, id) };
+  // §58: a machine's own value changed — its not-started steps are timed again (timeImpact says how many, by how much).
+  const timeImpact = await reestimateMachine(db, c, id);
+  return { ...result, specs: await getMachineSpecs(db, c.companyId, id), timeImpact };
+}
+
+/**
+ * §58 — what this machine's own values mean for the plan: its not-started steps, their time now and
+ * what a fresh estimate gives. GET /machines/:id/time-impact (a read; nothing is written).
+ */
+export async function machineTimeImpact(db, companyId, id) {
+  await requireMachine(db, companyId, id);
+  return reestimateMachine(db, { companyId }, id, { apply: false });
 }
 
 export const getMachineHistory = (db, companyId, id, limit) => getHistory(db, companyId, 'machine', id, limit);

@@ -72,6 +72,9 @@ export async function readMasters(db, companyId, ids) {
 }
 
 /**
+ * (Also: rule.formulaId / rule.origin; `below` — the rule that would win without the record's own
+ * flow-made one; `recipe` — { formulaId, at } when a classification above says how a flow-asked
+ * value is worked out. flowSpecService reads the three.)
  * Per record, per code: { rule: { valueRule, isRequired, applicable } | null,
  * value: raw | null, optionValue, row (the value row the answer came from),
  * own (the record's own stored row, any source), source: 'own' | 'definition'
@@ -101,7 +104,7 @@ export async function resolveCodes(db, companyId, masters, codes) {
      SELECT 'n' AS t, up.seed, up.id, up.code AS node_code, up.name AS node_name, up.hop, NULL AS subject_type, NULL AS subject_id, NULL AS is_required, NULL AS is_applicable, NULL AS value_rule, NULL AS sort_order, NULL AS code, NULL AS value_number, NULL AS value_text, NULL AS value_bool, NULL AS value_date, NULL AS option_id, NULL AS source, NULL AS uom, NULL AS data_type, NULL AS option_value FROM up
      UNION ALL
      SELECT 'a', NULL, a.id, NULL, NULL, NULL, a.subject_type, a.subject_id, a.is_required, a.is_applicable, a.value_rule, a.sort_order,
-            UPPER(s.code), NULL, NULL, NULL, NULL, NULL, a.origin, NULL, NULL, NULL
+            UPPER(s.code), NULL, NULL, NULL, NULL, a.formula_id, a.origin, NULL, NULL, NULL
        FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL AND s.code IN (?)
       WHERE a.company_id = ? AND a.deleted_at IS NULL AND a.capture_at = 'item'
@@ -153,15 +156,30 @@ export async function resolveCodes(db, companyId, masters, codes) {
     const mine = new Map();
     for (const code of upper) {
       let win = null;
+      let recipe = null;
+      let below = null;
       chain.forEach((s, i) => {
         // `source` carries a rule's origin here: a flow-made rule is its own record's only.
-        const list = (rulesAt.get(key(s.t, s.id)) ?? []).filter((r) => r.code === code && !(r.source === 'flow' && !s.self))
-          .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
-        for (const r of list) win = { r, i };
+        const all = (rulesAt.get(key(s.t, s.id)) ?? []).filter((r) => r.code === code).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+        for (const r of all) {
+          if (r.source === 'flow' && !s.self) {
+            // On a classification it is a RECIPE (flowSpecService): how the value is worked out for a
+            // record under it whose flow asks for it. It reaches no record by itself.
+            if (s.t === 'classification' && Number(r.is_applicable) && r.value_rule === 'defaulted' && r.option_id != null) recipe = { formulaId: Number(r.option_id), at: s.label };
+            continue;
+          }
+          win = { r, i };
+          // …and the rule that would win WITHOUT the record's own flow-made one (flowSpecService asks).
+          if (r.source !== 'flow') below = r;
+        }
       });
       const own = valueAt.get(`${key('master', m.id)}:${code}`) ?? null;
-      const entry = { rule: null, value: null, optionValue: null, row: null, own, source: null, from: null };
-      if (win) entry.rule = { valueRule: win.r.value_rule, isRequired: !!win.r.is_required, applicable: !!win.r.is_applicable };
+      const entry = {
+        rule: null, value: null, optionValue: null, row: null, own, source: null, from: null, recipe,
+        below: below ? { valueRule: below.value_rule, isRequired: !!below.is_required, applicable: !!below.is_applicable, formulaId: below.option_id != null ? Number(below.option_id) : null } : null,
+      };
+      // `option_id` carries a rule's formula here (the rows of the three shapes share their columns).
+      if (win) entry.rule = { valueRule: win.r.value_rule, isRequired: !!win.r.is_required, applicable: !!win.r.is_applicable, formulaId: win.r.option_id != null ? Number(win.r.option_id) : null, origin: win.r.source };
       if (win && win.r.is_applicable) {
         let at = null;
         const above = () => {
@@ -174,6 +192,8 @@ export async function resolveCodes(db, companyId, masters, codes) {
         const vr = win.r.value_rule;
         if (mode === 'setup') at = own ? { row: own, i: selfIndex } : above();
         else if (vr === 'entered') at = own ? { row: own, i: selfIndex } : null;
+        // A Defaulted rule that names a formula: typed, or what its formula stored — else the value above stands in (resolutionService).
+        else if (vr === 'defaulted' && win.r.option_id != null) at = own ? { row: own, i: selfIndex } : above();
         else if (vr === 'defaulted') at = own && own.source === 'entered' ? { row: own, i: selfIndex } : above();
         else if (vr === 'fixed') at = above();
         else at = own ? { row: own, i: selfIndex } : null;   // calculated / rollup / inherited: what is stored

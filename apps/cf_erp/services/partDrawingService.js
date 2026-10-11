@@ -49,6 +49,12 @@
  *
  * A line released to production takes no drawing changes. One live drawing per line and mark;
  * uploading a mark again replaces it. Cut pieces are never matched — they are worked out.
+ *
+ * WHAT A SHAPE SAYS IS WRITTEN ON THE PART (2026-10-12): its true area, its holes and their
+ * diameter, as values the tenant's formulas read — the part's weight and surface by its TRUE shape
+ * (drawingValueService.refreshDrawingValues). Run here after every upload (a new file, a replaced
+ * one, a new revision), every delete and every late read, so no part keeps the area of a drawing
+ * it no longer has.
  */
 import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
@@ -294,6 +300,9 @@ export async function shapesAfterCutPieces(db, c, lineId) {
     const { refreshPlateCuts } = await import('./plateCutsService.js');
     out.written = (await refreshPlateCuts(db, c, lineId)).written;
   }
+  // The parts' own values from their shapes (true area, holes) — and whatever is worked out from them.
+  const { refreshDrawingValues } = await import('./drawingValueService.js');
+  out.values = await refreshDrawingValues(db, c, lineId);
   return out;
 }
 
@@ -591,6 +600,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   }
   const toSave = out.filter((e) => e._save);
   let view = null;
+  let values = null;
   if (!dryRun && toSave.length) {
     const replaced = [...new Set(toSave.flatMap((e) => e._save.replaces))];
     // Rows aimed at with a file but no mark yet take the file's name as their DRAWING_MARK: one lookup, one insert.
@@ -625,9 +635,12 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     }
     const { refreshPlateCuts } = await import('./plateCutsService.js');
     await refreshPlateCuts(db, c, line.id);
+    // The parts take their true area and holes from the new shapes; a replaced drawing's are replaced with it.
+    const { refreshDrawingValues } = await import('./drawingValueService.js');
+    values = await refreshDrawingValues(db, c, line.id, { force: true });
     view = await getDrawings(db, companyId, null, line.id);
   }
-  return { dryRun, saved: !dryRun && toSave.length > 0, files: out.map(({ _save, ...e }) => e), view };
+  return { dryRun, saved: !dryRun && toSave.length > 0, files: out.map(({ _save, ...e }) => e), view, ...(values ? { values } : {}) };
 }
 
 export async function deleteDrawing(db, c, orderId, lineId, drawingId) {
@@ -638,6 +651,9 @@ export async function deleteDrawing(db, c, orderId, lineId, drawingId) {
   if (!r.affectedRows) throw notFound('Drawing');
   const { refreshPlateCuts } = await import('./plateCutsService.js');
   await refreshPlateCuts(db, c, line.id);
+  // Its parts go back to their rectangle (or to another drawing that still fits them).
+  const { refreshDrawingValues } = await import('./drawingValueService.js');
+  await refreshDrawingValues(db, c, line.id, { force: true });
   return getDrawings(db, companyId, null, line.id);
 }
 

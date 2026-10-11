@@ -19,7 +19,14 @@
  *            operations of the record's flow that ALSO read it; an empty list is the signal the
  *            question exists for — a hand-made value nothing in its flow reads.
  *   derived  the value comes by itself (calculated, roll-up, inherited, fixed, defaulted): nobody
- *            has to fill it. `readBy` says what reads it, the same way.
+ *            has to fill it. `readBy` says what reads it, the same way. `how` is 'drawing' when a
+ *            fact of the part's drawing fed it; `overridable` when a person may type over it.
+ *   typedOver  (2026-10-12) a value somebody TYPED BY HAND over a calculated one — a Defaulted rule
+ *            that names a formula, holding an entered value that differs from the formula's answer.
+ *            `value` is what was typed, `calculated` the answer it replaced (null when there is
+ *            none yet, with `waiting` / `problem` saying why), `from` whether that answer is
+ *            calculated or from the drawing. A typed value EQUAL to the answer is not one of these:
+ *            it reads as the answer (derived).
  *
  * `notAsked` is what the record still HOLDS but no rule asks for any more (a retired flow value keeps
  * the number typed for it — flowSpecService). `frozen`: a row of a frozen or released line keeps the
@@ -143,11 +150,21 @@ export async function getValueReasons(db, companyId, id) {
     const readBy = readers.get(code) ?? [];
     const at = { level: s.definedAt.level, code: s.definedAt.code ?? null, name: s.definedAt.name ?? null };
     let reason;
-    if (flowMade.has(Number(s.rule.assignmentId))) reason = { kind: 'flow', flow, operations: readBy };
+    const d = s.derived ?? null;
+    const formula = s.rule.formula?.code ? { code: s.rule.formula.code, name: s.rule.formula.name } : null;
+    if (d?.source === 'typed') {
+      reason = {
+        kind: 'typedOver', value: s.value?.display ?? null, calculated: d.calculated?.display ?? null, from: d.calculatedFrom ?? null,
+        waiting: d.waiting ?? null, problem: d.problem ?? null, at, readBy, ...(formula ? { formula } : {}),
+      };
+    } else if (d) {
+      // A formula's answer — whoever asked for the value (a rule on the tree, or the record's own flow).
+      reason = { kind: 'derived', how: d.source === 'drawing' ? 'drawing' : d.rollup ? 'rollup' : 'calculated', at, readBy, ...(d.overridable ? { overridable: true } : {}), ...(formula ? { formula } : {}) };
+    } else if (flowMade.has(Number(s.rule.assignmentId))) reason = { kind: 'flow', flow, operations: readBy };
     else if (DERIVED.has(s.rule.valueRule)) {
       reason = { kind: 'derived', how: s.rule.valueRule, at, readBy };
       if (s.rule.workedOut) reason.note = s.rule.workedOut;
-      else if (s.rule.formula?.code) reason.formula = { code: s.rule.formula.code, name: s.rule.formula.name };
+      else if (formula) reason.formula = formula;
     } else reason = { kind: 'manual', at, readBy };
     values.push({ code: s.spec.code, name: s.spec.name, required: !!s.rule.isRequired, valueRule: s.rule.valueRule, hasValue: s.value != null, reason });
   }
