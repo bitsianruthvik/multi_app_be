@@ -1860,6 +1860,11 @@ async function deriveOpened(db, c, { line, flowId, places, selection, state }, p
   }
   const methods = methodsOf(places, selection);
   const filled = await fillBlankGaps(db, c, methods.plate, p.plate) + await fillBlankGaps(db, c, methods.section, p.section);
+  // The cut plates may exist only since now: a plate part's drawing saved before them is read as its
+  // shape, and the cut plates take its cut length and piercings (partDrawingService). One count when
+  // the line has no DXF; imported here because that service's readers import this one's.
+  const { shapesAfterCutPieces } = await import('./partDrawingService.js');
+  await shapesAfterCutPieces(db, c, line.id);
   const out = p.groups.map(describeGroup);
   const created = p.groups.filter((x) => x.isNew).length;
   const updated = p.groups.filter((x) => !x.isNew && x.plateLine.changed).length;

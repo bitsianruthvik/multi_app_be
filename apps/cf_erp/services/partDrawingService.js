@@ -7,8 +7,8 @@
  * every row of the line — span, girder line, segment, assembly, part — whose DRAWING_MARK says the
  * same (case, spaces, hyphens, underscores and the ending do not matter). DXF or PDF.
  *
- * For every row it is the row's drawing, kept and downloadable. For a PLATE PART (a row cut into a
- * cut plate) a DXF is also read as its shape (partGeometry.js), and that is used for:
+ * For every row it is the row's drawing, kept and downloadable. For a PLATE PART a DXF is also read
+ * as its shape (partGeometry.js), and that is used for:
  *   - the measure the user asked for: how much of each part's rectangle is real part, and so the
  *     most a true-shape nesting could save on the line (summary.savingKg);
  *   - CNC inputs: plateCutsService takes cut length and piercings from the parts' drawings, and a
@@ -27,12 +27,33 @@
  *   - a file belongs to the rows with its drawing mark AND the rows its register drawing is linked to.
  * Deleting a file leaves the register drawing in place, waiting for a file again.
  *
+ * WHAT A PLATE PART IS (2026-10-11) — decided from the row's OWN data, never from when its cut
+ * plate happened to be made:
+ *     a row is a plate part when its CUT_FROM, resolved for that row the way every spec is resolved
+ *     (lib/cutFrom.js: classification chain -> template definition -> the row; "Plate part" says
+ *     PLATE, "Profile part" SECTION, assemblies NONE), is PLATE — OR it already has a cut plate
+ *     below it (a row made before CUT_FROM, or one whose CUT_FROM changed and has not been
+ *     re-derived yet, is still cut from that plate).
+ * It is exactly the test the cut-piece derive applies (cutPlateService.survey), so "this row will
+ * get a cut plate" and "this row's DXF is a shape" cannot disagree. cutPlateIds stays what it was:
+ * the cut plates that exist today (empty until the line's values are complete).
+ *
+ * A SHAPE DOES NOT DEPEND ON WHEN THE FILE ARRIVED. A plate part's DXF stored without a shape
+ * (uploaded while the row was not known as a plate part, or before this rule) is read from its
+ * stored text by readMissingShapes — ONE read of the texts that lack a shape, ONE bulk UPDATE —
+ * at three moments: when cut pieces are derived (shapesAfterCutPieces, called by cutPlateService),
+ * on every read that shows or uses shapes (getDrawings, drawingFactsOfLine), and by the backfill
+ * (scripts/cf_kepl/drawings-read-shapes.mjs). A file that is not one plate part cannot be refused
+ * any more by then — it is kept as a plain drawing and says why in its warnings (NOT_ONE_PLATE),
+ * which is also what stops it being parsed again on every read.
+ *
  * A line released to production takes no drawing changes. One live drawing per line and mark;
  * uploading a mark again replaces it. Cut pieces are never matched — they are worked out.
  */
 import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
+import { cutFromOf } from '../lib/cutFrom.js';
 import { explode } from './bomService.js';
 import { readPartDrawing, orientTo } from './partGeometry.js';
 import { createDrawing, reviseDrawing } from './drawingService.js';
@@ -72,10 +93,12 @@ export async function rowsOfLine(db, companyId, line) {
   const cutNodes = new Set([...(places.plate?.blanksIds ?? []), ...(places.plate?.offcutIds ?? []), ...(places.section?.blanksIds ?? []), ...(places.section?.offcutIds ?? [])].map(Number));
   const plateNodes = [...(places.plate?.blanksIds ?? [])];
   const [rows] = await db.query(
-    `SELECT m.id, m.code, m.name, m.classification_id, n.name AS level
+    `SELECT m.id, m.code, m.name, m.classification_id, n.name AS level,
+            m.record_kind, i.item_type, i.source_definition_id, d.code AS def_code, d.name AS def_name
        FROM cf_master_records m
        JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL AND i.owner_order_line_id = ?
        LEFT JOIN cf_classification_nodes n ON n.id = m.classification_id
+       LEFT JOIN cf_master_records d ON d.id = i.source_definition_id AND d.deleted_at IS NULL
       WHERE m.company_id = ? AND m.deleted_at IS NULL`,
     [line.id, companyId],
   );
@@ -89,6 +112,8 @@ export async function rowsOfLine(db, companyId, line) {
       WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.parent_id IN (?)`,
     [plateNodes, companyId, ids],
   ) : [[]];
+  // How each row is cut, resolved for all of them at once (one round trip) — the derive's own test.
+  const cutFrom = await cutFromOf(db, companyId, ids, { masters: mine });
   const [vals] = await db.query(
     `SELECT v.subject_id, UPPER(s.code) AS code, v.value_number, v.value_text
        FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id
@@ -114,7 +139,9 @@ export async function rowsOfLine(db, companyId, line) {
   const out = new Map(mine.map((r) => [Number(r.id), {
     id: Number(r.id), code: r.code, name: r.name, level: r.level ?? 'Row', depth: depth.get(Number(r.id)) ?? 99,
     pieces: Number(r.id) === Number(line.item_id) ? Number(line.quantity) : Math.round(pieces.get(Number(r.id)) ?? 0),
-    mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null, isPlatePart: false, cutPlateIds: [], drawingIds: [],
+    mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null,
+    // THE RULE (see the header): cut from plate by its own CUT_FROM — or, below, by a cut plate it already has.
+    cutFrom: cutFrom.get(Number(r.id)) ?? null, isPlatePart: cutFrom.get(Number(r.id)) === 'PLATE', cutPlateIds: [], drawingIds: [],
     parentId: null, seq: seqOf.get(Number(r.id)) ?? 0,
   }]));
   // The nearest row above that is one of the line's own (a cut piece or a catalog row in between is passed over).
@@ -141,7 +168,7 @@ export async function rowsOfLine(db, companyId, line) {
   return [...out.values()].sort((a, b) => a.depth - b.depth || String(a.mark ?? '~').localeCompare(String(b.mark ?? '~')) || a.id - b.id);
 }
 
-/** The line's plate parts only (rows cut into a cut plate). */
+/** The line's plate parts only (rows cut from plate — see the header's rule; cutPlateIds may still be empty). */
 export async function platePartsOfLine(db, companyId, line) {
   return (await rowsOfLine(db, companyId, line)).filter((r) => r.isPlatePart);
 }
@@ -159,6 +186,116 @@ async function liveDrawings(db, companyId, lineId) {
 const matches = (p, d) => (!!p.markNorm && p.markNorm === d.mark_norm) || (d.drawing_id != null && p.drawingIds.includes(Number(d.drawing_id)));
 /** The file a row is read by: its own mark's first, else its register drawing's. */
 const fileFor = (p, files) => files.find((d) => p.markNorm && d.mark_norm === p.markNorm) ?? files.find((d) => d.drawing_id != null && p.drawingIds.includes(Number(d.drawing_id))) ?? null;
+
+/** Said (and stored in warnings_json) of a plate part's DXF that could not be read as ONE plate after it was saved. */
+export const NOT_ONE_PLATE = 'No shape was read from this drawing, so the part is nested and cut as its rectangle: ';
+const notOnePlate = (d) => (d.warnings ?? []).some((w) => String(w).startsWith(NOT_ONE_PLATE));
+const sizeWarning = (p, g) => {
+  const o = orientTo(g, p.lengthMm, p.widthMm);
+  return o.sizeMatches === false ? `${p.code ?? p.name} is ${p.lengthMm} × ${p.widthMm} on the order, and the drawing's rectangle is ${o.swap ? `${g.widthMm} × ${g.lengthMm}` : `${g.lengthMm} × ${g.widthMm}`} — nesting lays out the order's size.` : null;
+};
+// One statement carries every shape of the pass; past this many drawings it is cut in two (a shape is ~10–150 kB of JSON).
+const SHAPE_WRITE_CHUNK = 100;
+const SHAPE_COLUMNS = ['length_mm', 'width_mm', 'area_mm2', 'cut_length_mm', 'piercings', 'holes', 'inner_cuts', 'geometry_json', 'warnings_json'];
+const SHAPE_FIELD = { length_mm: 'lengthMm', width_mm: 'widthMm', area_mm2: 'areaMm2', cut_length_mm: 'cutLengthMm', piercings: 'piercings', holes: 'holes', inner_cuts: 'innerCuts' };
+
+/**
+ * THE LATE READ. Every live DXF of the line that belongs to a plate part and has no shape yet is
+ * read from its stored text — in memory for this answer (`drawings` is changed in place: geometry
+ * and warnings) and, unless `persist` is false, saved so it is never parsed again.
+ *   rows      rowsOfLine's answer        drawings  liveDrawings' answer
+ * Work is bounded: only files that lack a shape and were not already found not to be one plate
+ * (NOT_ONE_PLATE) are read. Round trips: 0 when nothing lacks a shape, else ONE read of those
+ * texts + ONE bulk UPDATE (per SHAPE_WRITE_CHUNK drawings) — never one per row.
+ * A file read late cannot be refused, so what an upload would have refused is said in its warnings;
+ * a size that disagrees with a row is warned in the same words as at upload.
+ * → { looked, read: [{ id, mark, rows }], notOnePlate: [{ id, mark, why, known }], sizeMismatches: [text], writes }
+ */
+export async function readMissingShapes(db, companyId, rows, drawings, { persist = true } = {}) {
+  const out = { looked: 0, read: [], notOnePlate: [], sizeMismatches: [], writes: [] };
+  const todo = [];
+  for (const d of drawings) {
+    if ((d.file_kind ?? 'dxf') !== 'dxf' || d.geometry) continue;
+    const plate = rows.filter((p) => p.isPlatePart && matches(p, d));
+    if (!plate.length) continue;
+    out.looked += 1;
+    if (notOnePlate(d)) { out.notOnePlate.push({ id: d.id, mark: d.mark, why: d.warnings.find((w) => String(w).startsWith(NOT_ONE_PLATE)).slice(NOT_ONE_PLATE.length), known: true }); continue; }
+    todo.push({ d, plate });
+  }
+  if (!todo.length) return out;
+  const [texts] = await db.query('SELECT id, dxf_text FROM cf_part_drawings WHERE company_id = ? AND id IN (?) AND dxf_text IS NOT NULL', [companyId, todo.map((t) => t.d.id)]);
+  const textOf = new Map(texts.map((t) => [Number(t.id), t.dxf_text]));
+  for (const { d, plate } of todo) {
+    const text = textOf.get(Number(d.id));
+    if (text == null) continue;
+    const got = readPartDrawing(text);
+    const g = got.geometry ?? null;
+    const warnings = new Set([...(d.warnings ?? []), ...got.warnings]);
+    if (g) {
+      for (const p of plate) { const w = sizeWarning(p, g); if (w) { warnings.add(w); out.sizeMismatches.push(w); } }
+      out.read.push({ id: d.id, mark: d.mark, rows: plate.length });
+    } else {
+      const why = got.problems.join(' ') || 'it does not read as one plate part.';
+      warnings.add(`${NOT_ONE_PLATE}${why}`);
+      out.notOnePlate.push({ id: d.id, mark: d.mark, why, known: false });
+    }
+    d.geometry = g; d.warnings = [...warnings];
+    out.writes.push({ id: Number(d.id), g, warnings: d.warnings });
+  }
+  if (persist) await writeShapes(db, companyId, out.writes);
+  return out;
+}
+
+/** The shapes of a late read, saved: ONE UPDATE for all of them (a file that already has a shape is left alone). */
+export async function writeShapes(db, companyId, writes) {
+  for (let i = 0; i < writes.length; i += SHAPE_WRITE_CHUNK) {
+    const part = writes.slice(i, i + SHAPE_WRITE_CHUNK);
+    const valueOf = (w, col) => (col === 'warnings_json' ? JSON.stringify(w.warnings) : col === 'geometry_json' ? (w.g ? JSON.stringify(w.g) : null) : w.g ? w.g[SHAPE_FIELD[col]] ?? null : null);
+    const sets = SHAPE_COLUMNS.map((col) => `${col} = CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} ELSE ${col} END`);
+    const params = SHAPE_COLUMNS.flatMap((col) => part.flatMap((w) => [w.id, valueOf(w, col)]));
+    await db.query(`UPDATE cf_part_drawings SET ${sets.join(', ')} WHERE company_id = ? AND id IN (?) AND geometry_json IS NULL AND deleted_at IS NULL`, [...params, companyId, part.map((w) => w.id)]);
+  }
+  return writes.length;
+}
+
+/**
+ * The late read for one line by its id (the derive hook and the backfill script): readMissingShapes'
+ * answer plus `line` { id, lineNo, orderId, orderCode, released }. `persist: false` leaves the
+ * saving to the caller (writeShapes with the answer's `writes` — the backfill saves an order at once).
+ */
+export async function lateShapesOfLine(db, companyId, lineId, { persist = true } = {}) {
+  const line = await requireLine(db, companyId, null, lineId);
+  const late = await readMissingShapes(db, companyId, await rowsOfLine(db, companyId, line), await liveDrawings(db, companyId, line.id), { persist });
+  return { line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, released: !!Number(line.released) }, ...late };
+}
+
+/**
+ * After a line's cut pieces were derived (cutPlateService.deriveOpened): the plate parts' drawings
+ * that still lack a shape are read (readMissingShapes), and the cut plates — which may exist only
+ * since a moment ago — take cut length and piercings from the shapes. ONE count when the line has
+ * no DXF at all; a fixed number of round trips otherwise, whatever the size of the line.
+ * → { drawings, read, notOnePlate, written }
+ */
+export async function shapesAfterCutPieces(db, c, lineId) {
+  const companyId = c.companyId;
+  const [[n]] = await db.query(
+    `SELECT COALESCE(SUM(geometry_json IS NULL AND dxf_text IS NOT NULL), 0) AS bare, COALESCE(SUM(geometry_json IS NOT NULL), 0) AS shaped
+       FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf'`,
+    [companyId, lineId],
+  );
+  const out = { drawings: Number(n.bare) + Number(n.shaped), read: 0, notOnePlate: 0, written: 0 };
+  if (!out.drawings) return out;
+  let shaped = Number(n.shaped);
+  if (Number(n.bare)) {
+    const late = await lateShapesOfLine(db, companyId, lineId);
+    out.read = late.read.length; out.notOnePlate = late.notOnePlate.length; shaped += late.read.length;
+  }
+  if (shaped) {
+    const { refreshPlateCuts } = await import('./plateCutsService.js');
+    out.written = (await refreshPlateCuts(db, c, lineId)).written;
+  }
+  return out;
+}
 
 /**
  * The register side of some drawings: Map id -> { id, code, number, revision, status, title,
@@ -273,6 +410,8 @@ export async function drawingTree(db, companyId, orderId, lineId) {
 export async function getDrawings(db, companyId, orderId, lineId) {
   const line = await requireLine(db, companyId, orderId, lineId);
   const [rows, drawings] = [await rowsOfLine(db, companyId, line), await liveDrawings(db, companyId, line.id)];
+  // The safety net: a plate part's drawing saved without a shape is read now, shown, and kept.
+  await readMissingShapes(db, companyId, rows, drawings);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
   return viewOf(line, rows, drawings, refs);
 }
@@ -419,7 +558,8 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
       // Not a DXF at all (a DWG, a binary DXF, something renamed) is refused whatever row it is for.
       const notDxf = readPartDrawing(text.slice(0, 4096)).problems.find((x) => /DWG|binary DXF|does not read as a DXF/.test(x));
       if (notDxf && !/(^|\n)\s*0\s*\r?\n\s*SECTION/.test(text)) { entry.problems.push(notDxf); continue; }
-      // A plate part's DXF is its shape; any other row's DXF is only kept (a GA is not one outline).
+      // A plate part's DXF is its shape — whether or not its cut plate exists yet (the header's rule);
+      // any other row's DXF (an assembly, a profile part) is only kept (a GA is not one outline).
       if (plate.length || !matched.length) {
         const read = readPartDrawing(text);
         entry.warnings.push(...read.warnings);
@@ -430,10 +570,7 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     if (g) {
       entry.geometry = geometryView(g);
       entry.rows = matched.map((p) => rowView(p, g));
-      for (const p of plate) {
-        const o = orientTo(g, p.lengthMm, p.widthMm);
-        if (o.sizeMatches === false) entry.warnings.push(`${p.code ?? p.name} is ${p.lengthMm} × ${p.widthMm} on the order, and the drawing's rectangle is ${o.swap ? `${g.widthMm} × ${g.lengthMm}` : `${g.lengthMm} × ${g.widthMm}`} — nesting lays out the order's size.`);
-      }
+      for (const p of plate) { const w = sizeWarning(p, g); if (w) entry.warnings.push(w); }
     }
     if (!matched.length) { entry.status = 'unmatched'; entry.warnings.push(`No row on this line has drawing mark ${mark}.`); continue; }
     const hadFile = target ? fileOfDrawing.has(Number(target.id)) : false;
@@ -520,12 +657,17 @@ export async function drawingFile(db, companyId, orderId, lineId, drawingId) {
  * rings only when every piece of the cut plate has the same shape, oriented to its length.
  */
 export async function drawingFactsOfLine(db, companyId, lineId) {
-  const [has] = await db.query('SELECT COUNT(*) AS n FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND geometry_json IS NOT NULL', [companyId, lineId]);
+  // A DXF without a shape counts too: it may be a plate part's, saved before the row was known as one.
+  const [has] = await db.query("SELECT COUNT(*) AS n FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND (geometry_json IS NOT NULL OR (file_kind = 'dxf' AND dxf_text IS NOT NULL))", [companyId, lineId]);
   const out = new Map();
   if (!Number(has[0].n)) return out;
   const line = await requireLine(db, companyId, null, lineId);
-  const parts = await platePartsOfLine(db, companyId, line);
-  const shaped = (await liveDrawings(db, companyId, line.id)).filter((d) => d.geometry);
+  const rows = await rowsOfLine(db, companyId, line);
+  const parts = rows.filter((r) => r.isPlatePart);
+  const drawings = await liveDrawings(db, companyId, line.id);
+  // The safety net: nesting, cut length and the CNC file never see a plate part "without a shape" because of ordering.
+  await readMissingShapes(db, companyId, rows, drawings);
+  const shaped = drawings.filter((d) => d.geometry);
   const acc = new Map();
   for (const p of parts) {
     const d = fileFor(p, shaped);

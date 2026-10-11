@@ -4,13 +4,30 @@
  * the cut plate's cut length and piercings from the drawing, and the CNC file drawing the outline;
  * §52 the register: every file is a register revision, a drawing started from a row waits for its
  * file, uploading over an issued revision makes the next one and the old file stays downloadable.
+ * THE ORDERING TRAP (2026-10-11): a plate part is one by its own CUT_FROM, not by having a cut
+ * plate — on a fixture of this run's own (nodes, templates, order, two lines of different sizes,
+ * NO cut pieces) with the real T&T 24 m files: shapes are read at upload, a drawing stored without
+ * one is read late (list read, facts read, cut-piece derive, backfill script) and kept, assemblies
+ * and the profile part stay plain, and the round trips do not grow with the line.
  * Local only, one rolled-back transaction, every cf_ table re-counted.
  *
  *   cd multi_app_be && node scripts/cf_kepl/part_drawings_test.mjs
  */
+import fs from 'fs';
+import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { pool } from '../../db.js';
 import '../../apps/cf_erp/services/codegenProvider.js';
-import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine, startDrawing, registerFile } from '../../apps/cf_erp/services/partDrawingService.js';
+import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine, startDrawing, registerFile, shapesAfterCutPieces, NOT_ONE_PLATE } from '../../apps/cf_erp/services/partDrawingService.js';
+import { attachNodeCache, detachNodeCache } from '../../apps/cf_erp/lib/db.js';
+import * as CLS from '../../apps/cf_erp/services/classificationService.js';
+import * as MR from '../../apps/cf_erp/services/masterRecordService.js';
+import * as B from '../../apps/cf_erp/services/bomService.js';
+import * as SO from '../../apps/cf_erp/services/salesOrderService.js';
+import * as V from '../../apps/cf_erp/services/valueService.js';
+import * as PARTIES from '../../apps/cf_erp/modules/parties/service.js';
+import { deriveCutPlates } from '../../apps/cf_erp/services/cutPlateService.js';
+import { readShapes } from './drawings-read-shapes.mjs';
 import { getDrawing } from '../../apps/cf_erp/services/drawingService.js';
 import { lotDxf } from '../../apps/cf_erp/services/cncExportService.js';
 
@@ -207,10 +224,176 @@ try {
 
   view = await deleteDrawing(db, c, line.order_id, LINE, again.view.drawings[0].id);
   ok('deleted: the part drawing is gone, and its cut plate is back to the rectangle', !view.drawings.some((d) => d.mark === 'FST-P1') && Math.abs((await valueOf('CUT_LENGTH')) - cutBefore) < 1e-3, `${await valueOf('CUT_LENGTH')} vs ${cutBefore}`);
+
+  // ══ THE ORDERING TRAP (2026-10-11): drawings uploaded BEFORE the line's cut pieces exist ══
+  console.log('\n  the ordering trap — a fixture of this run\'s own, with the T&T 24 m files');
+  attachNodeCache(db);
+  const tag = `PDT${Date.now().toString(36).toUpperCase()}`;
+  const DIR = fileURLToPath(new URL('../../../TT_24M_DXF/', import.meta.url));
+  const manifest = JSON.parse(fs.readFileSync(`${DIR}manifest.json`, 'utf8'));
+  const real = (name, extra = {}) => ({ name, content: fs.readFileSync(`${DIR}${name}`).toString('base64'), ...extra });
+  const plateFiles = manifest.parts.map((p) => ({ mark: p.mark, file: p.file, t: p.thicknessMm, l: p.lengthMm, w: p.widthMm }));
+  ok(`the folder holds the plate files (${plateFiles.length}) and the assembly files`, plateFiles.length >= 38 && fs.existsSync(`${DIR}G1.dxf`) && fs.existsSync(`${DIR}ANG1.dxf`));
+
+  // Own classification: a family with the CUT_FROM rule, and under it an assembly, a plate-part and a profile-part node.
+  const fam = await CLS.createNode(db, c, { code: `${tag}-F`, name: `${tag} fabricated` });
+  const mid = await CLS.createNode(db, c, { parentId: fam.id, code: `${tag}-M`, name: `${tag} kinds` });
+  const nodeOf = async (code, name) => (await CLS.createNode(db, c, { parentId: mid.id, code: `${tag}-${code}`, name: `${tag} ${name}` })).id;
+  const asmNode = await nodeOf('A', 'assembly'); const plateNode = await nodeOf('P', 'plate part'); const profNode = await nodeOf('S', 'profile part');
+  const [[cfSpec]] = await db.query("SELECT id FROM cf_specifications WHERE company_id = ? AND code = 'CUT_FROM' AND deleted_at IS NULL", [COMPANY]);
+  await db.query("INSERT INTO cf_spec_assignments (company_id, specification_id, subject_type, subject_id, capture_at, is_required, is_applicable, value_rule, sort_order) VALUES (?, ?, 'classification', ?, 'item', 0, 1, 'defaulted', 0)", [COMPANY, cfSpec.id, fam.id]);
+  await V.setValues(db, c, 'classification', plateNode, [{ specCode: 'CUT_FROM', value: 'PLATE' }]);
+  await V.setValues(db, c, 'classification', profNode, [{ specCode: 'CUT_FROM', value: 'SECTION' }]);
+  await V.setValues(db, c, 'classification', asmNode, [{ specCode: 'CUT_FROM', value: 'NONE' }]);
+
+  // Templates: one per plate mark, the angle, and two girders (3 plates / every plate) of the same depth.
+  const tpl = async (code, classificationId) => MR.setStatus(db, c, (await MR.createDefinition(db, c, { definitionType: 'template', classificationId, code: `${tag}-${code}`, name: `${tag} ${code}`, shortName: `${tag}${code}`.slice(0, 30) })).id, 'active');
+  const markOfDef = new Map();
+  const plateTpl = new Map();
+  for (const p of plateFiles) { const t = await tpl(p.mark, plateNode); plateTpl.set(p.mark, t.id); markOfDef.set(Number(t.id), p.mark); }
+  const angle = await tpl('ANG1', profNode); markOfDef.set(Number(angle.id), 'ANG1');
+  const girder = async (key, marks) => {
+    const seg = await tpl(`SEG${key}`, asmNode); markOfDef.set(Number(seg.id), 'G1-S1');
+    for (const m of marks) await B.addLine(db, c, seg.id, { childId: plateTpl.get(m), quantity: 2 });
+    await B.addLine(db, c, seg.id, { childId: angle.id, quantity: 4 });
+    await B.setBomStatus(db, c, seg.id, 'active');
+    const g = await tpl(`G${key}`, asmNode); markOfDef.set(Number(g.id), 'G1');
+    await B.addLine(db, c, g.id, { childId: seg.id, quantity: 1 });
+    await B.setBomStatus(db, c, g.id, 'active');
+    return g;
+  };
+  const smallMarks = ['TF-S1', 'WEB-S1', 'BS1'];
+  const gSmall = await girder('S', smallMarks);
+  const gBig = await girder('L', plateFiles.map((p) => p.mark));
+  const cust = await PARTIES.createParty(db, c, { code: `${tag}-CU`, name: `${tag} bridge co`, roles: ['customer'] });
+  const order = await SO.createOrder(db, c, { orderType: 'customer', customerId: cust.id, code: `${tag}-SO`, committedDate: '2026-12-31' });
+  const addLine = async (recordId) => { const o = await SO.addOrderLine(db, c, order.id, { recordId, quantity: 1 }); return o.lines[o.lines.length - 1]; };
+  const smallL = await addLine(gSmall.id);
+  const bigL = await addLine(gBig.id);
+  // Each row's mark and (for plates) the size its file is drawn to — written as values, the way the Values screen leaves them.
+  const [specRows] = await db.query("SELECT id, UPPER(code) AS code FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN ('LENGTH', 'WIDTH', 'THICKNESS', 'DRAWING_MARK')", [COMPANY]);
+  const specId = Object.fromEntries(specRows.map((x) => [x.code, x.id]));
+  const sizeOfMark = new Map(plateFiles.map((p) => [p.mark, p]));
+  const [temps] = await db.query("SELECT m.id, i.source_definition_id AS def, i.owner_order_line_id AS line_id FROM cf_item_details i JOIN cf_master_records m ON m.id = i.master_id AND m.deleted_at IS NULL WHERE i.company_id = ? AND i.item_type = 'temporary' AND i.deleted_at IS NULL AND i.owner_order_line_id IN (?)", [COMPANY, [smallL.id, bigL.id]]);
+  const valueRows = [];
+  for (const t of temps) {
+    const mark = markOfDef.get(Number(t.def)); if (!mark) continue;
+    valueRows.push([COMPANY, specId.DRAWING_MARK, 'master', t.id, null, mark, 'entered']);
+    const sz = sizeOfMark.get(mark);
+    if (sz) valueRows.push([COMPANY, specId.LENGTH, 'master', t.id, sz.l, null, 'entered'], [COMPANY, specId.WIDTH, 'master', t.id, sz.w, null, 'entered'], [COMPANY, specId.THICKNESS, 'master', t.id, sz.t, null, 'entered']);
+  }
+  await db.query("UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND subject_id IN (?) AND specification_id IN (?)", [COMPANY, temps.map((t) => t.id), Object.values(specId)]);
+  await db.query('INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, value_number, value_text, source) VALUES ?', [valueRows]);
+
+  const lineRow = async (id) => (await db.query('SELECT * FROM cf_sales_order_lines WHERE id = ?', [id]))[0][0];
+  const [bigLine, smallLine] = [await lineRow(bigL.id), await lineRow(smallL.id)];
+  const bigRows = await rowsOfLine(db, COMPANY, bigLine);
+  const plateRowsBig = bigRows.filter((r) => r.isPlatePart);
+  ok(`no cut piece exists on the line, yet its ${plateRowsBig.length} plate rows are plate parts by their own CUT_FROM`, plateRowsBig.length === plateFiles.length && plateRowsBig.every((r) => r.cutFrom === 'PLATE' && r.cutPlateIds.length === 0), `${plateRowsBig.length} / ${plateFiles.length}`);
+  const angRow = bigRows.find((r) => r.mark === 'ANG1'); const asmRows = bigRows.filter((r) => ['G1', 'G1-S1'].includes(r.mark));
+  ok('the profile part (cut from a section) and the assemblies are not', angRow && angRow.cutFrom === 'SECTION' && !angRow.isPlatePart && asmRows.length === 2 && asmRows.every((r) => !r.isPlatePart && r.cutFrom === 'NONE'), JSON.stringify([angRow?.cutFrom, asmRows.map((r) => r.cutFrom)]));
+
+  // (a) At upload: every plate file is read as its shape, the assemblies and the angle are kept plain.
+  const allFiles = [...plateFiles.map((p) => real(p.file)), real('G1.dxf'), real('G1-S1.dxf'), real('ANG1.dxf')];
+  const pre = await uploadDrawings(db, c, order.id, bigL.id, { files: allFiles, dryRun: true });
+  const preBy = new Map(pre.files.map((x) => [x.name, x]));
+  const platePre = plateFiles.map((p) => preBy.get(p.file));
+  ok(`preview: all ${plateFiles.length} plate files read their shape and match their row's size`, platePre.every((x) => x.status === 'new' && x.geometry && x.rows.length === 1 && x.rows[0].isPlatePart && x.rows[0].sizeMatches === true), JSON.stringify(platePre.find((x) => !(x.status === 'new' && x.geometry && x.rows[0]?.sizeMatches === true)) ?? null).slice(0, 300));
+  const web = preBy.get('WEB-S2.dxf').geometry;
+  ok('…with the facts the take-off states (WEB-S2: 9450 × 1150, 180 drilled holes, one piercing)', Math.abs(web.lengthMm - 9450) < 0.2 && Math.abs(web.widthMm - 1150) < 0.2 && web.holes === 180 && web.piercings === 1, JSON.stringify({ l: web.lengthMm, w: web.widthMm, h: web.holes }));
+  ok('preview: the assembly drawings (many outlines) and the angle are accepted as plain drawings', ['G1.dxf', 'G1-S1.dxf', 'ANG1.dxf'].every((n) => preBy.get(n).status === 'new' && preBy.get(n).geometry === null && preBy.get(n).problems.length === 0), JSON.stringify(['G1.dxf', 'G1-S1.dxf', 'ANG1.dxf'].map((n) => [preBy.get(n).status, preBy.get(n).problems])));
+  const aimedMulti = await uploadDrawings(db, c, order.id, bigL.id, { files: [real('G1.dxf', { name: 'X-MULTI.dxf', rowId: plateRowsBig[0].id })], dryRun: true });
+  ok('a file of many outlines aimed at a plate row is still refused, in the same sentence — though the row has no cut plate', aimedMulti.files[0].status === 'error' && /more than one part/.test(aimedMulti.files[0].problems.join(' ')), JSON.stringify(aimedMulti.files[0]).slice(0, 300));
+  const savedBig = await uploadDrawings(db, c, order.id, bigL.id, { files: allFiles, dryRun: false });
+  const shapesStored = async (lineId) => Number((await db.query('SELECT COUNT(*) n FROM cf_part_drawings WHERE order_line_id = ? AND deleted_at IS NULL AND geometry_json IS NOT NULL', [lineId]))[0][0].n);
+  const sb = savedBig.view.summary;
+  ok(`saved: ${plateFiles.length} shapes stored, the summary counts every plate part as shaped (${sb.partsWithShape} of ${sb.parts}, use ${sb.usePct}%)`, savedBig.saved && await shapesStored(bigL.id) === plateFiles.length && sb.parts === plateFiles.length && sb.partsWithShape === plateFiles.length && sb.usePct > 50 && sb.usePct < 100, JSON.stringify(sb));
+  const plain = savedBig.view.drawings.filter((d) => ['G1', 'G1-S1', 'ANG1'].includes(d.mark));
+  ok('saved: the assemblies and the angle are plain drawings, stored as drawn', plain.length === 3 && plain.every((d) => d.geometry === null && d.warnings.length === 0) && (await drawingFile(db, COMPANY, order.id, bigL.id, plain.find((d) => d.mark === 'G1').id)).buffer.equals(fs.readFileSync(`${DIR}G1.dxf`)));
+  const savedSmall = await uploadDrawings(db, c, order.id, smallL.id, { files: [...smallMarks.map((m) => real(`${m}.dxf`)), real('G1.dxf'), real('G1-S1.dxf'), real('ANG1.dxf')], dryRun: false });
+  ok('the small line the same: 3 shapes, 3 plain', savedSmall.saved && await shapesStored(smallL.id) === 3 && savedSmall.view.drawings.length === 6);
+
+  // The state production is in: files saved by the old rule — a plain drawing, no shape.
+  const forget = (lineId) => db.query('UPDATE cf_part_drawings SET geometry_json = NULL, length_mm = NULL, width_mm = NULL, area_mm2 = NULL, cut_length_mm = NULL, piercings = NULL, holes = NULL, inner_cuts = NULL, warnings_json = ? WHERE order_line_id = ? AND deleted_at IS NULL', ['[]', lineId]);
+  const counted = async (fn) => { const log = []; const q = db.query.bind(db); db.query = (...a) => { log.push(String(a[0]).replace(/\s+/g, ' ').trim()); return q(...a); }; try { return { out: await fn(), n: log.length, sql: log }; } finally { db.query = q; } };
+  const writesIn = (r) => r.sql.filter((x) => /^(UPDATE|INSERT|DELETE)/i.test(x));
+
+  // (c) Lazily on the list read — shown at once, kept, and never parsed twice.
+  await forget(bigL.id); await forget(smallL.id);
+  // One row disagrees with its file, and one plate row's stored file is not one plate at all.
+  const dsp = plateRowsBig.find((r) => r.mark === 'DSP'); const pad = plateRowsBig.find((r) => r.mark === 'PAD');
+  await db.query("UPDATE cf_spec_values SET value_number = value_number + 25 WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND specification_id = ? AND deleted_at IS NULL", [COMPANY, dsp.id, specId.WIDTH]);
+  await db.query('UPDATE cf_part_drawings SET dxf_text = ? WHERE order_line_id = ? AND mark_norm = ? AND deleted_at IS NULL', [fs.readFileSync(`${DIR}G1-S1.dxf`, 'latin1'), bigL.id, 'PAD']);
+  ok('the old state: no shape stored on either line', await shapesStored(bigL.id) === 0 && await shapesStored(smallL.id) === 0);
+  const lazyBig = await counted(() => getDrawings(db, COMPANY, order.id, bigL.id));
+  const lb = lazyBig.out.summary;
+  ok(`list read: the shapes are there in the same answer (${lb.partsWithShape} of ${lb.parts}) and kept (${await shapesStored(bigL.id)} stored)`, lb.partsWithShape === plateFiles.length - 1 && await shapesStored(bigL.id) === plateFiles.length - 1, JSON.stringify(lb));
+  ok('…with ONE read of the texts and ONE bulk update, whatever the number of drawings', lazyBig.sql.filter((x) => /SELECT id, dxf_text/.test(x)).length === 1 && writesIn(lazyBig).length === 1 && /^UPDATE cf_part_drawings SET/.test(writesIn(lazyBig)[0]), writesIn(lazyBig).map((x) => x.slice(0, 50)).join(' | '));
+  const dspView = lazyBig.out.drawings.find((d) => d.mark === 'DSP');
+  ok('…a row whose size disagrees with its file is warned in the upload\'s words, and sizeMatches says so', dspView.rows[0].sizeMatches === false && dspView.warnings.some((w) => /nesting lays out the order's size/.test(w)) && dspView.geometry, JSON.stringify(dspView.warnings));
+  const padView = lazyBig.out.drawings.find((d) => d.mark === 'PAD');
+  ok('…a stored file that is not one plate stays a plain drawing and says why', padView.geometry === null && padView.warnings.some((w) => w.startsWith(NOT_ONE_PLATE) && /more than one part/.test(w)), JSON.stringify(padView.warnings).slice(0, 300));
+  ok('…the assemblies and the angle are untouched (no shape, no warning)', lazyBig.out.drawings.filter((d) => ['G1', 'G1-S1', 'ANG1'].includes(d.mark)).every((d) => d.geometry === null && d.warnings.length === 0));
+  const [[storedDsp]] = await db.query("SELECT length_mm, cut_length_mm, piercings, warnings_json FROM cf_part_drawings WHERE order_line_id = ? AND mark_norm = 'DSP' AND deleted_at IS NULL", [bigL.id]);
+  ok('…the columns beside the shape are filled too, and the warnings stored', Math.abs(Number(storedDsp.length_mm) - 575) < 0.2 && Number(storedDsp.cut_length_mm) > 1000 && Number(storedDsp.piercings) === 1 && /nesting lays out/.test(storedDsp.warnings_json), JSON.stringify(storedDsp).slice(0, 200));
+  const againBig = await counted(() => getDrawings(db, COMPANY, order.id, bigL.id));
+  ok(`a second list read parses and writes nothing (${againBig.n} queries, was ${lazyBig.n})`, writesIn(againBig).length === 0 && !againBig.sql.some((x) => /SELECT id, dxf_text/.test(x)) && againBig.n === lazyBig.n - 2 && againBig.out.summary.partsWithShape === plateFiles.length - 1, `${againBig.n} vs ${lazyBig.n}`);
+  const lazySmall = await counted(() => getDrawings(db, COMPANY, order.id, smallL.id));
+  const againSmall = await counted(() => getDrawings(db, COMPANY, order.id, smallL.id));
+  ok(`the list read asks the same number of queries at 3 and at ${plateFiles.length} plate parts — late read ${lazySmall.n} = ${lazyBig.n}, plain read ${againSmall.n} = ${againBig.n}`, lazySmall.n === lazyBig.n && againSmall.n === againBig.n && lazySmall.out.summary.partsWithShape === 3);
+
+  // (c) The same net under nesting / cut length / CNC: drawingFactsOfLine.
+  await forget(smallL.id);
+  const factsLate = await counted(() => drawingFactsOfLine(db, COMPANY, smallL.id));
+  ok('the facts read (nesting, cut length, CNC) reads late shapes too and keeps them', await shapesStored(smallL.id) === 3 && writesIn(factsLate).length === 1 && factsLate.out.size === 0);
+
+  // (b) When cut pieces are derived: the hook.
+  await forget(smallL.id); await forget(bigL.id);
+  const hookSmall = await counted(() => shapesAfterCutPieces(db, c, smallL.id));
+  const hookBig = await counted(() => shapesAfterCutPieces(db, c, bigL.id));
+  ok(`the cut-piece hook reads what lacks a shape (${hookSmall.out.read} and ${hookBig.out.read}) in the same number of queries at both sizes (${hookSmall.n} = ${hookBig.n})`, hookSmall.out.read === 3 && hookBig.out.read === plateFiles.length - 1 && hookBig.out.notOnePlate === 1 && hookSmall.n === hookBig.n && await shapesStored(bigL.id) === plateFiles.length - 1, JSON.stringify([hookSmall.out, hookBig.out, hookSmall.n, hookBig.n]));
+  ok('…with one bulk update of the drawings at most', hookBig.sql.filter((x) => /^UPDATE cf_part_drawings/.test(x)).length === 1 && hookSmall.sql.filter((x) => /^UPDATE cf_part_drawings/.test(x)).length === 1);
+  const hookAgain = await counted(() => shapesAfterCutPieces(db, c, bigL.id));
+  ok(`…and run again it reads no file (${hookAgain.n} queries)`, hookAgain.out.read === 0 && !hookAgain.sql.some((x) => /SELECT id, dxf_text|^UPDATE cf_part_drawings/.test(x)));
+  await db.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE order_line_id = ? AND deleted_at IS NULL', [LINE]);   // the borrowed line: no drawing left on it
+  const hookNone = await counted(() => shapesAfterCutPieces(db, c, LINE));
+  ok('…a line with no DXF costs the derive ONE query', hookNone.n === 1 && hookNone.out.drawings === 0, String(hookNone.n));
+
+  // The hook inside a real derive — the borrowed line (it has cut plates, a plate selection and a nest): its part's
+  // drawing sits there without a shape and its cut plate still says the rectangle, as on production today.
+  await db.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE id = ?', [LINE]);
+  const reup = await uploadDrawings(db, c, line.order_id, LINE, { files: [file('FST-P1.dxf', shape)], dryRun: false });
+  const cutDrawn = await valueOf('CUT_LENGTH');
+  ok('the borrowed line: the part has its drawing and its cut plate the drawing\'s cut length', reup.saved && Math.abs(cutDrawn - cutBefore) > 1, `${cutBefore} → ${cutDrawn}`);
+  await forget(LINE);
+  await db.query("UPDATE cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'CUT_LENGTH' SET v.value_number = ? WHERE v.subject_type = 'master' AND v.subject_id = ? AND v.deleted_at IS NULL", [cutBefore, cpId]);
+  ok('…put back into the old state: no shape, the rectangle\'s cut length', await shapesStored(LINE) === 0 && Math.abs((await valueOf('CUT_LENGTH')) - cutBefore) < 1e-3);
+  const derived = await counted(() => deriveCutPlates(db, c, LINE));
+  ok(`deriving the line's cut pieces reads the shape and gives the cut plate its cut length (${cutBefore} → ${await valueOf('CUT_LENGTH')})`, await shapesStored(LINE) === 1 && Math.abs((await valueOf('CUT_LENGTH')) - cutDrawn) < 1e-3 && derived.sql.filter((x) => /^UPDATE cf_part_drawings SET length_mm/.test(x)).length === 1, `${await shapesStored(LINE)} stored, ${await valueOf('CUT_LENGTH')} vs ${cutDrawn}`);
+
+  // The backfill script: a dry run changes nothing, applying is idempotent.
+  await forget(bigL.id); await forget(smallL.id);
+  await db.query('SAVEPOINT backfill_dry');
+  const said = [];
+  const dryFill = await readShapes(db, { companyId: COMPANY, orderCode: order.code, log: (x) => said.push(x) });
+  await db.query('ROLLBACK TO SAVEPOINT backfill_dry');
+  const mine = dryFill.orders.find((o) => o.code === order.code);
+  ok(`backfill dry run reports the order: ${mine?.looked} looked at, ${mine?.read.length} read, ${mine?.notOnePlate.length} not one plate, ${mine?.sizeMismatches.length} size mismatch — and rolled back leaves nothing`, dryFill.orders.length === 1 && mine.looked === plateFiles.length + 3 && mine.read.length === plateFiles.length - 1 + 3 && mine.notOnePlate.length === 1 && mine.notOnePlate[0].mark === 'PAD' && /more than one part/.test(mine.notOnePlate[0].why) && mine.sizeMismatches.length === 1 && await shapesStored(bigL.id) === 0 && await shapesStored(smallL.id) === 0, JSON.stringify({ ...mine, read: mine?.read.length }));
+  ok('…in words a person can read', said.some((x) => x.startsWith(`${order.code}: `) && /shapes read/.test(x)) && said.some((x) => /not one plate part — PAD/.test(x)) && said.some((x) => /^ {4}size — /.test(x)), said.join(' / ').slice(0, 300));
+  const applied = await counted(() => readShapes(db, { companyId: COMPANY, orderCode: order.code, log: () => {} }));
+  ok('backfill applied: every shape stored, with ONE update of the drawings for the whole order (two lines)', await shapesStored(bigL.id) === plateFiles.length - 1 && await shapesStored(smallL.id) === 3 && applied.sql.filter((x) => /^UPDATE cf_part_drawings/.test(x)).length === 1);
+  const twice = await counted(() => readShapes(db, { companyId: COMPANY, orderCode: order.code, log: () => {} }));
+  ok('backfill again: nothing read, nothing written (the file that is not one plate is only named again)', twice.out.totals.read === 0 && writesIn(twice).length === 0 && twice.out.totals.notOnePlate === 1 && twice.out.orders[0].notOnePlate[0].known === true, JSON.stringify(twice.out.totals));
+  const all = await counted(() => readShapes(db, { companyId: COMPANY, log: () => {} }));
+  ok('backfill over the whole company finds nothing else to read here', all.out.totals.read === 0 && writesIn(all).length === 0, JSON.stringify(all.out.totals));
+  // The script itself, as the user runs it (its own connection: it sees only committed rows — none lack a shape).
+  const cli = spawnSync(process.execPath, ['scripts/cf_kepl/drawings-read-shapes.mjs', '--company', String(COMPANY)], { encoding: 'utf8' });
+  ok('the script runs as a dry run by default and says so', cli.status === 0 && /DRY RUN — rolled back/.test(cli.stdout) && !/COMMITTED/.test(cli.stdout), (cli.stdout + cli.stderr).slice(-300));
 } catch (e) {
   failed++;
   console.error('  ERROR', e.message, e.problems ? JSON.stringify(e.problems) : '', e.stack?.split('\n').slice(1, 3).join(' '));
 } finally {
+  detachNodeCache(db);
   await db.rollback();
   db.release();
   const after = await counts();
