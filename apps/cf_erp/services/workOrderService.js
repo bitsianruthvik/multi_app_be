@@ -503,7 +503,7 @@ export async function getWorkOrder(db, companyId, id) {
   const w = await requireWorkOrder(db, companyId, id);
   // The header (WO_SELECT) already carries the progress; this is the scope.
   const [cells] = await db.query(
-    `SELECT c.order_piece_id, c.operation_id, p.code AS piece_code, p.sort_order, p.quantity, m.name AS item_name,
+    `SELECT c.order_piece_id, c.operation_id, p.code AS piece_code, p.sort_order, p.quantity, p.item_id, m.name AS item_name,
             o.code AS op_code, o.name AS op_name
        FROM cf_work_order_cells c
        JOIN cf_order_pieces p ON p.id = c.order_piece_id
@@ -518,7 +518,7 @@ export async function getWorkOrder(db, companyId, id) {
   for (const c of cells) {
     let row = byPiece.get(c.order_piece_id);
     if (!row) {
-      row = { pieceId: c.order_piece_id, pieceCode: c.piece_code, name: c.item_name, quantity: Number(c.quantity), operations: [], operationIds: [] };
+      row = { pieceId: c.order_piece_id, itemId: c.item_id, pieceCode: c.piece_code, name: c.item_name, quantity: Number(c.quantity), operations: [], operationIds: [] };
       byPiece.set(c.order_piece_id, row);
       scope.push(row);
     }

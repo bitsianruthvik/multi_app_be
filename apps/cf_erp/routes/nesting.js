@@ -68,7 +68,7 @@ import { getCompare, startCompare, acceptCompare } from '../services/nestCompare
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
 // Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
-import { getDrawings, uploadDrawings, deleteDrawing, drawingFile, startDrawing } from '../services/partDrawingService.js';
+import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, startDrawing } from '../services/partDrawingService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -161,6 +161,9 @@ router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
 // plates' cut length and piercings. /file downloads the drawing itself.
 router.get('/orders/:orderId/lines/:lineId/drawings', view,
   handle((req) => read(req, (db, companyId, id) => getDrawings(db, companyId, null, id))));
+// THE TREE: every row of the line with its parent and whether it has a drawing (view permission) — the viewer's levels.
+router.get('/orders/:orderId/lines/:lineId/drawings/tree', view,
+  handle((req) => read(req, (db, companyId, id) => drawingTree(db, companyId, null, id))));
 router.post('/orders/:orderId/lines/:lineId/drawings', manage,
   handle((req) => write(req, (db, c, id) => uploadDrawings(db, c, null, id, req.body ?? {}))));
 // START a register drawing from rows before its file exists: { rowIds, number, revision?, title?, source?, status? }.

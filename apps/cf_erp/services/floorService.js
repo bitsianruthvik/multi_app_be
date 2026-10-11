@@ -563,6 +563,9 @@ function shapeFloorStep(s, it, rel, extra = {}) {
     orderCode,
     orderId: rel?.order_id ?? s.order_id ?? null,
     lineNo: rel?.line_no ?? null,
+    // Where the piece sits on the order, so "View drawing" needs no lookup: the line and the BOM row it is a piece of.
+    lineId: rel?.order_line_id ?? s.order_line_id ?? null,
+    itemId: it?.item_id ?? null,
     sequence: s.sequence,
     state: s.state,
     ...extra,

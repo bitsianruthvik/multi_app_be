@@ -99,9 +99,12 @@ export async function rowsOfLine(db, companyId, line) {
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
   const pieces = new Map();
   const depth = new Map([[Number(line.item_id), 0]]);
+  const parentOf = new Map();   // node id -> the node above it (first met), for the drawing tree
+  const seqOf = new Map();      // node id -> its place in the BOM walk
   (function walk(node, d) {
     for (const ch of node.children ?? []) {
       if (ch.id != null) {
+        if (!parentOf.has(Number(ch.id))) { parentOf.set(Number(ch.id), node.id != null ? Number(node.id) : Number(line.item_id)); seqOf.set(Number(ch.id), seqOf.size + 1); }
         pieces.set(Number(ch.id), (pieces.get(Number(ch.id)) ?? 0) + Number(ch.total ?? 0));
         if (!depth.has(Number(ch.id))) depth.set(Number(ch.id), d + 1);
       }
@@ -112,7 +115,14 @@ export async function rowsOfLine(db, companyId, line) {
     id: Number(r.id), code: r.code, name: r.name, level: r.level ?? 'Row', depth: depth.get(Number(r.id)) ?? 99,
     pieces: Number(r.id) === Number(line.item_id) ? Number(line.quantity) : Math.round(pieces.get(Number(r.id)) ?? 0),
     mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null, isPlatePart: false, cutPlateIds: [], drawingIds: [],
+    parentId: null, seq: seqOf.get(Number(r.id)) ?? 0,
   }]));
+  // The nearest row above that is one of the line's own (a cut piece or a catalog row in between is passed over).
+  for (const p of out.values()) {
+    let up = parentOf.get(p.id);
+    for (let hops = 0; up != null && !out.has(up) && hops < 50; hops++) up = parentOf.get(up);
+    p.parentId = up != null && out.has(up) ? up : null;
+  }
   // The register drawings (in play: draft or issued) each row is linked to.
   const [links] = await db.query(
     `SELECT l.subject_id, l.drawing_id FROM cf_drawing_links l
@@ -229,6 +239,34 @@ function viewOf(line, rows, drawings, refs = new Map()) {
       rectAreaM2: r3(rectArea / 1e6), trueAreaM2: r3(trueArea / 1e6), usePct: rectArea > 0 ? r1((trueArea / rectArea) * 100) : null,
       rectKg: r1(rectKg), trueKg: r1(trueKg), savingKg: r1(rectKg - trueKg),
     },
+  };
+}
+
+/**
+ * Every row of the line with its place in the structure and whether it has a drawing — ONE set-based read for the
+ * viewer's breadcrumb and "parts in this assembly" list, so production screens need no round trip per level.
+ * [{ rowId, parentId, code, name, level, depth, seq, mark, hasDrawing, drawingId, fileKind, fileName, number, revision, status,
+ *    isPlatePart, cutPlateIds }]
+ * (`drawingId` is the file's id for GET …/drawings/:id/file). Fixed number of queries whatever the size of the line.
+ */
+export async function drawingTree(db, companyId, orderId, lineId) {
+  const line = await requireLine(db, companyId, orderId, lineId);
+  const rows = await rowsOfLine(db, companyId, line);
+  const drawings = await liveDrawings(db, companyId, line.id);
+  const refs = await registerRefs(db, companyId, drawings.map((d) => d.drawing_id));
+  return {
+    line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, released: !!Number(line.released) },
+    rows: rows.map((p) => {
+      const d = fileFor(p, drawings);
+      const ref = d?.drawing_id != null ? refs.get(Number(d.drawing_id)) : null;
+      return {
+        rowId: p.id, parentId: p.parentId, code: p.code, name: p.name, level: p.level, depth: p.depth, seq: p.seq, mark: p.mark,
+        hasDrawing: !!d, drawingId: d ? Number(d.id) : null, fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
+        number: ref?.number ?? null, revision: ref?.revision ?? null, status: ref?.status ?? null,
+        // A plate part's cut plates, so the nesting screen (which knows cut plates, not rows) can find the part's drawing.
+        isPlatePart: p.isPlatePart, cutPlateIds: p.cutPlateIds,
+      };
+    }).sort((a, b) => a.depth - b.depth || a.seq - b.seq),
   };
 }
 

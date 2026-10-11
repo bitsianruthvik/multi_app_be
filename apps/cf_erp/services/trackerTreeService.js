@@ -255,7 +255,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
     const n = {
       id: `p${it.id}`, parentId: it.parent_id ? `p${it.parent_id}` : `l${l.order_line_id}`, kind: 'piece',
       code: it.code ?? it._label, name: it.item_name, qty: quantity, pieceNo: it.piece_no ?? null,
-      basis: quantity > 1 ? 'row' : 'piece', itemId: it.item_id, lineId: l.order_line_id, releaseId: it.release_id,
+      basis: quantity > 1 ? 'row' : 'piece', itemId: it.item_id, lineId: l.order_line_id, orderId: l.order_id, releaseId: it.release_id,
       kids: [], agg: emptyAgg(),
       ops: (data.stepsOf.get(it.id) ?? []).map((s) => ({ s, op: operationOf(s, ctx) })),
     };
@@ -305,7 +305,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
     };
     if (n.kind === 'piece') { out.pieceNo = n.pieceNo; out.basis = n.basis; out.itemId = n.itemId; }
     if (n.kind !== 'order') { out.lineId = n.lineId; out.releaseId = n.releaseId; }
-    if (n.kind !== 'piece') out.orderId = n.orderId;
+    out.orderId = n.orderId;
     if (n.kids.length) {
       out.pieces = n.agg.pieces;
       out.steps = n.agg.steps;

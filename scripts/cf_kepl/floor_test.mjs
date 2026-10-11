@@ -129,6 +129,7 @@ try {
   report.queue = { queries: qm.queries, ms: qm.ms, total: qm.result.total };
   let queue = qm.result;
   const stepById = new Map(data.steps.map((s) => [s.id, s]));
+  ok('every queued step says which order line and BOM row its piece is (View drawing needs no lookup)', queue.next.length > 0 && queue.next.every((s) => Number.isInteger(s.lineId) && Number.isInteger(s.itemId) && Number.isInteger(s.orderId)));
   ok('every queued step is an operation this machine may do', queue.next.every((s) => elig.has(s.operationId)));
   ok('no done step and nothing on a work order is queued', queue.next.every((s) => s.state !== 'done' && !stepById.get(s.id).work_order_id));
   ok('the queue holds every eligible open step of the line', queue.total === best.steps.length, `${queue.total} vs ${best.steps.length}`);

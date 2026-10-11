@@ -218,6 +218,7 @@ try {
   ok('the list filters by contractor', list.length === 1 && list[0].id === woA.id && list[0].order.id === ORDER);
   ok('the list filters by status', (await listWorkOrders(conn, COMPANY, { status: 'cancelled', orderId: ORDER })).some((x) => x.id === woB2.id));
   w = await getWorkOrder(conn, COMPANY, woA.id);
+  ok('every scope row names the BOM row its piece is of (View drawing needs it)', w.scope.every((x) => Number.isInteger(x.itemId) && x.itemId > 0));
   ok('the detail groups its scope by piece, in tree order', w.scope.length === aPieces.size && w.cellCount === owned.size
     && JSON.stringify(w.scope.map((x) => x.pieceId)) === JSON.stringify(v.rows.filter((r) => aPieces.has(r.pieceId)).map((r) => r.pieceId)) && w.scope.every((s) => s.operations.length > 0), JSON.stringify(w.scope.slice(0, 2)));
   ok('no progress before release', w.progress === null);

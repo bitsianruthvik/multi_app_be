@@ -10,7 +10,7 @@
  */
 import { pool } from '../../db.js';
 import '../../apps/cf_erp/services/codegenProvider.js';
-import { getDrawings, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine, startDrawing, registerFile } from '../../apps/cf_erp/services/partDrawingService.js';
+import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, platePartsOfLine, rowsOfLine, drawingFactsOfLine, startDrawing, registerFile } from '../../apps/cf_erp/services/partDrawingService.js';
 import { getDrawing } from '../../apps/cf_erp/services/drawingService.js';
 import { lotDxf } from '../../apps/cf_erp/services/cncExportService.js';
 
@@ -163,6 +163,47 @@ try {
   ok('saved on every level: the summary counts rows, not just parts', lvSaved.view.summary.rowsWithDrawing >= same.length + 2 && segDrawing?.levels.includes(marked[0].level), JSON.stringify(lvSaved.view.summary));
   const got = await drawingFile(db, COMPANY, line.order_id, LINE, segDrawing.id);
   ok('the PDF downloads exactly as uploaded', got.contentType === 'application/pdf' && got.buffer.equals(pdf) && /\.PDF$/i.test(got.filename));
+
+  // ── Any level (2026-10-11): a multi-loop DXF on a NON-plate row is a plain drawing; on a plate row it is still refused. ──
+  const asm = rows.find((r) => !r.isPlatePart && r.depth > 0 && !aimedIds.includes(r.id) && !marked.slice(0, 2).some((m) => m.id === r.id));
+  const asmMark = 'ASM-ANY-1';
+  const multi = dxf([lw([[0, 0], [1000, 0], [1000, 500], [0, 500]]), lw([[2000, 0], [3000, 0], [3000, 500], [2000, 500]]), circle(500, 250, 20)]);
+  const asmUp = await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: `${asmMark}.dxf`, content: Buffer.from(multi, 'latin1').toString('base64'), rowId: asm.id }], dryRun: false });
+  const asmFile = asmUp.view.drawings.find((d) => d.mark === asmMark);
+  ok('an assembly row takes a multi-loop DXF: accepted and stored, no plate geometry', asmUp.saved && asmFile && asmFile.geometry === null && asmFile.fileKind === 'dxf' && asmFile.rows.some((r) => r.id === asm.id), JSON.stringify(asmUp.files[0]).slice(0, 300));
+  ok('…and it is stored as drawn', (await drawingFile(db, COMPANY, line.order_id, LINE, asmFile.id)).buffer.toString('latin1') === multi);
+  const factsAfter = await drawingFactsOfLine(db, COMPANY, LINE);
+  ok('…and gives no plate facts (no cut plate takes its cut length or piercings from it)', ![...factsAfter.values()].some((f) => f.marks?.has?.(asmFile.id)) && asmFile.geometry === null);
+  const plateRow = parts.find((p) => !same.some((x) => x.id === p.id)) ?? part;
+  const plateMulti = await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: 'PLT-MULTI.dxf', content: Buffer.from(multi, 'latin1').toString('base64'), rowId: plateRow.id }], dryRun: true });
+  ok('a plate-part row still refuses a multi-loop DXF with the same sentence as before', plateMulti.files[0].status === 'error' && /more than one part/.test(plateMulti.files[0].problems.join(' ')), JSON.stringify(plateMulti.files[0]).slice(0, 300));
+  // The count of queries a dry run asks does not depend on the row's kind.
+  const log2 = []; const q1 = db.query.bind(db); db.query = (...a) => { log2.push(1); return q1(...a); };
+  await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: 'K1.dxf', content: Buffer.from(multi, 'latin1').toString('base64'), rowId: asm.id }], dryRun: true }); const nAsm = log2.length; log2.length = 0;
+  await uploadDrawings(db, c, line.order_id, LINE, { files: [{ name: 'K2.dxf', content: Buffer.from(shape, 'latin1').toString('base64'), rowId: plateRow.id }], dryRun: true }); const nPlate = log2.length; log2.length = 0;
+  db.query = q1;
+  ok(`a dry run asks the same number of queries for an assembly and a plate row (${nAsm} vs ${nPlate})`, Math.abs(nAsm - nPlate) <= 1);
+
+  // ── The tree: every row with its parent and whether it has a drawing, in a fixed number of queries. ──
+  const tree = await drawingTree(db, COMPANY, line.order_id, LINE);
+  const byId = new Map(tree.rows.map((r) => [r.rowId, r]));
+  ok(`the tree lists every row of the line (${tree.rows.length}) with the shape the viewer needs`, tree.rows.length === rows.length && tree.rows.every((r) => 'parentId' in r && 'hasDrawing' in r && 'drawingId' in r && 'fileKind' in r && 'revision' in r && r.name && r.level), JSON.stringify(tree.rows[0]));
+  const roots = tree.rows.filter((r) => r.parentId == null);
+  ok('exactly one top row, every other row has a parent that is on the line', roots.length === 1 && roots[0].depth === 0 && tree.rows.every((r) => r.parentId == null || byId.has(r.parentId)), `${roots.length} roots`);
+  ok('a row drawing is flagged and points at its file', byId.get(asm.id).hasDrawing && byId.get(asm.id).drawingId === asmFile.id && byId.get(asm.id).fileKind === 'dxf' && tree.rows.some((r) => !r.hasDrawing && r.drawingId == null));
+  ok('the walk up from any row reaches the top (breadcrumb)', tree.rows.every((r) => { let x = r, n = 0; while (x.parentId != null && n++ < 60) x = byId.get(x.parentId); return x.parentId == null && x.rowId === roots[0].rowId; }));
+  let none = null; try { await drawingTree(db, 999999, line.order_id, LINE); } catch (e) { none = e.message; }
+  ok('another company sees nothing of this line (not found)', /not found/i.test(none ?? ''), none);
+  const countQ = async (lid, oid) => { const l = []; const o = db.query.bind(db); db.query = (...a) => { l.push(1); return o(...a); }; try { const t = await drawingTree(db, COMPANY, oid, lid); return { n: l.length, rows: t.rows.length }; } finally { db.query = o; } };
+  // Never a borrowed line id: whichever other custom lines the tenant has today, the smallest tree among a few.
+  const [others] = await db.query("SELECT id, order_id FROM cf_sales_order_lines WHERE company_id = ? AND deleted_at IS NULL AND line_type = 'custom' AND item_id IS NOT NULL AND id <> ? ORDER BY id DESC LIMIT 8", [COMPANY, LINE]);
+  const big = await countQ(LINE, line.order_id);
+  // The BOM explode asks once per level of depth, never per row — an absolute ceiling holds on its own.
+  ok(`the tree is read in a fixed handful of queries (${big.rows} rows: ${big.n})`, big.n <= 25, String(big.n));
+  let sm = null;
+  for (const o of others) { try { const c = await countQ(o.id, o.order_id); if (c.rows > 0 && (!sm || c.rows < sm.rows)) sm = c; } catch { /* a line that cannot be read is no comparison */ } }
+  if (sm && big.rows > 5 * sm.rows) ok(`…and they do not grow with rows (${sm.rows} rows: ${sm.n} queries, ${big.rows} rows: ${big.n})`, big.n - sm.n <= 6, `${sm.n} vs ${big.n}`);
+  else console.log(`        no much smaller line to compare with today (${sm ? sm.rows : 'none'}) — the ceiling above stands alone`);
 
   view = await deleteDrawing(db, c, line.order_id, LINE, again.view.drawings[0].id);
   ok('deleted: the part drawing is gone, and its cut plate is back to the rectangle', !view.drawings.some((d) => d.mark === 'FST-P1') && Math.abs((await valueOf('CUT_LENGTH')) - cutBefore) < 1e-3, `${await valueOf('CUT_LENGTH')} vs ${cutBefore}`);
