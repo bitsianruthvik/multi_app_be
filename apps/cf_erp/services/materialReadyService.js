@@ -151,7 +151,7 @@ export function claimOrderOfLines(lines) {
  * }). need is the whole quantity (issued and reserved are part of it).
  * Round trips: 1 for the released lines + 3 for the frozen ones, whatever their number.
  */
-export async function lineNeeds(db, companyId, lines) {
+export async function lineNeeds(db, companyId, lines, { planned: plannedGiven = null } = {}) {
   const out = new Map();
   const released = lines.filter((l) => l.release_id);
   const frozen = lines.filter((l) => !l.release_id && l.locked_at && l.item_id);
@@ -172,8 +172,10 @@ export async function lineNeeds(db, companyId, lines) {
         ORDER BY r.order_line_id, m.code, q.item_id`,
       [companyId, companyId, released.map((l) => l.release_id)],
     ).then(([r]) => r) : [],
-    plannedMaterialOfLines(db, companyId, frozen),
+    // `planned` given: the frozen lines' planned material already worked out (plannerService keeps it while nothing it is read from has changed).
+    plannedGiven ?? plannedMaterialOfLines(db, companyId, frozen),
   ]);
+  const isFrozen = new Set(frozen.map((l) => Number(l.id)));
   for (const l of lines) {
     const base = { known: false, source: null, ready: false, openPlates: 0, why: null, items: new Map() };
     if (l.release_id) Object.assign(base, { known: true, source: 'released', ready: true });
@@ -197,7 +199,7 @@ export async function lineNeeds(db, companyId, lines) {
   }
   for (const [lineId, p] of planned) {
     const e = out.get(Number(lineId));
-    if (!e) continue;
+    if (!e || !isFrozen.has(Number(lineId))) continue;
     Object.assign(e, { known: true, source: 'planned', ready: !!p.ready, openPlates: Number(p.openPlates ?? 0) });
     if (!p.ready) e.why = `${p.openPlates} cut plate${p.openPlates === 1 ? ' has' : 's have'} no plate yet — nest the line, so their plates are known.`;
     for (const r of p.reqs) {
@@ -209,6 +211,8 @@ export async function lineNeeds(db, companyId, lines) {
       e.items.set(Number(r.itemId), cur);
     }
   }
+  // What plannedMaterialOfLines answered, as it answered it (a caller may keep it and hand it back as `planned`).
+  out.plannedRaw = planned;
   return out;
 }
 
@@ -226,7 +230,13 @@ const addTo = (map, key, q) => { const b = map.get(key) ?? bucket(); b.q = round
  * `needs` (lineNeeds) gives the issued / reserved part of each released line.
  * The result is MUTABLE: evaluate() takes from it.
  */
-export async function loadSupply(db, companyId, itemIds, { needs = new Map(), todayText = today() } = {}) {
+/*
+ * opts.lean (a purchase-line edit asking about a few orders — every round trip counts there):
+ *   balances and reservations come in ONE read (a UNION ALL, each string column from one side only),
+ *   the requisition lines are the ones the caller already read (opts.prLines, any items), and the
+ *   item names are read only when a need does not already carry them. Same rows, same supply.
+ */
+export async function loadSupply(db, companyId, itemIds, { needs = new Map(), todayText = today(), lean = false, prLines: prGiven = null } = {}) {
   const supply = {
     today: todayText,
     issued: new Map(), reserved: new Map(), heldLine: new Map(), heldOrder: new Map(),
@@ -244,7 +254,9 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
   }
   const ids = [...new Set(itemIds.map(Number))];
   if (!ids.length) return supply;
-  const [[bal], [res], [poRows], [prLines], [names]] = await Promise.all([
+  const wanted = new Set(ids);
+  const unknown = ids.filter((id) => !supply.items.has(id));
+  const [[bal], [res], [poRows], [prLines], [names]] = lean ? await leanSupplyRows(db, companyId, ids, { prGiven: prGiven ? prGiven.filter((p) => wanted.has(Number(p.item_id))) : null, unknown }) : await Promise.all([
     db.query(
       `SELECT k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.status AS batch_status, b.owner_party_id, oo.code AS owner_order
          FROM cf_stock_balances k
@@ -362,6 +374,49 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
     });
   }
   return supply;
+}
+
+const PO_LINES_SQL = `SELECT l.id, l.item_id, l.quantity, l.qty_received, COALESCE(l.expected_date, p.expected_date) AS due, p.status, p.code, p.id AS po_id,
+              a.id AS a_id, a.quantity AS a_quantity, a.qty_received AS a_received, o.code AS order_code, prl.order_line_id
+         FROM cf_purchase_order_lines l
+         JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
+         LEFT JOIN cf_purchase_line_orders a ON a.company_id = l.company_id AND a.purchase_line_id = l.id AND a.deleted_at IS NULL
+         LEFT JOIN cf_sales_orders o ON o.id = a.order_id AND o.deleted_at IS NULL
+         LEFT JOIN cf_requisition_lines prl ON prl.id = a.pr_line_id AND prl.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.item_id IN (?) AND l.deleted_at IS NULL AND p.status IN (?) AND l.quantity > l.qty_received
+        ORDER BY l.id, a.id`;
+
+/** loadSupply's rows in as few reads as they take: 2, +1 when the requisition lines are not given, +1 when an item's name is not known. */
+async function leanSupplyRows(db, companyId, ids, { prGiven, unknown }) {
+  const [stock] = await db.query(
+    `SELECT 0 AS src, k.item_id, k.batch_id, SUM(k.quantity) AS qty, b.status AS batch_status, b.owner_party_id, oo.code AS owner_order,
+            NULL AS is_hold, NULL AS order_code, NULL AS order_line_id
+       FROM cf_stock_balances k
+       JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose IN ('storage','wip')
+       LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
+       LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
+      WHERE k.company_id = ? AND k.item_id IN (?) AND k.quantity > 0
+      GROUP BY k.item_id, k.batch_id, b.status, b.owner_party_id, oo.code
+      UNION ALL
+     SELECT 1, v.item_id, v.batch_id, SUM(v.quantity), NULL, NULL, NULL,
+            (v.held_for_order_id IS NOT NULL), ho.code, prl.order_line_id
+       FROM cf_stock_reservations v
+       LEFT JOIN cf_sales_orders ho ON ho.id = v.held_for_order_id AND ho.deleted_at IS NULL
+       LEFT JOIN cf_requisition_lines prl ON prl.id = v.pr_line_id AND prl.deleted_at IS NULL
+      WHERE v.company_id = ? AND v.item_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
+      GROUP BY v.item_id, v.batch_id, (v.held_for_order_id IS NOT NULL), ho.code, prl.order_line_id`,
+    [companyId, ids, companyId, ids],
+  );
+  const poRows = await db.query(PO_LINES_SQL, [companyId, ids, LIVE_PO_STATUSES]);
+  const prLines = prGiven ? [prGiven] : await db.query(
+    `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped, pl.skipped_at, pl.skip_note, r.code
+       FROM cf_requisition_lines pl JOIN cf_requisitions r ON r.id = pl.requisition_id AND r.deleted_at IS NULL
+      WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.item_id IN (?)`, [companyId, ids]);
+  const names = unknown.length ? await db.query(
+    `SELECT m.id, m.code, m.name, i.uom, i.tracked_by FROM cf_master_records m
+       LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+      WHERE m.company_id = ? AND m.id IN (?)`, [companyId, unknown]) : [[]];
+  return [[stock.filter((r) => Number(r.src) === 0)], [stock.filter((r) => Number(r.src) === 1)], poRows, prLines, names];
 }
 
 const ALLOC_RANK = { dated: 0, undated: 1, asked: 2 };

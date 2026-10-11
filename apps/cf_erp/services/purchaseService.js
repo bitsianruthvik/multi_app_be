@@ -431,15 +431,28 @@ async function ordersBoughtFor(db, companyId, { lineIds = null, poId = null }) {
   return rows.map((r) => r.id);
 }
 
+/** As a select-list column: the open sales orders (by number) a purchase line (`l`) or a whole PO (`p`) is bought for, comma-joined ids. */
+const boughtForColumn = (by) => `(SELECT GROUP_CONCAT(DISTINCT so.id) FROM cf_purchase_line_orders a
+         JOIN cf_purchase_order_lines al ON al.id = a.purchase_line_id
+         JOIN cf_sales_orders ao ON ao.id = a.order_id
+         JOIN cf_sales_orders so ON so.company_id = ao.company_id AND so.code_active = ao.code_active AND so.status IN ('inquiry','quoted','confirmed')
+        WHERE a.deleted_at IS NULL AND ${by}) AS bought_for`;
+/** …read back. A list long enough to have been cut by GROUP_CONCAT's limit is read again in full. */
+async function boughtForOf(db, companyId, row, key) {
+  const text = row.bought_for == null ? '' : String(row.bought_for);
+  if (text.length >= 1000) return ordersBoughtFor(db, companyId, key);
+  return text ? text.split(',').map(Number).sort((x, y) => x - y) : [];
+}
+
 /**
  * plannedUnits (§56, TM/CF_ERP_BUYING_V2.md §3): what the change just made did to the PLAN — the planned
  * cards of the orders the purchase line(s) were bought for that are now late or waiting. Worked out by
  * the material-ready engine for those orders only (the others claim as whole lines), so the screen need
  * not read the whole planner after a date edit. `orderIds` are read BEFORE the write (a cut can drop a share).
  */
-async function plannedUnitsAfter(db, companyId, orderIds, change) {
+async function plannedUnitsAfter(db, companyId, orderIds, change, stamp) {
   const { plannedUnitsOfOrders } = await import('./plannerService.js');
-  return { change, orderIds, ...(await plannedUnitsOfOrders(db, companyId, orderIds)) };
+  return { change, orderIds, ...(await plannedUnitsOfOrders(db, companyId, orderIds, { stamp })) };
 }
 
 /** A cancelled or fully received order is history. */
@@ -471,10 +484,18 @@ const shapeLastPaid = (p) => (p
   : null);
 
 export async function getPurchaseOrder(db, companyId, id) {
-  const p = await requireOrder(db, companyId, id);
-  const [[sup]] = p.supplier_id
-    ? await db.query('SELECT id, code, name FROM cf_parties WHERE company_id = ? AND id = ?', [companyId, p.supplier_id])
-    : [[]];
+  // The header with its supplier and the sales order it is for: one read (they were three).
+  const [[p]] = await db.query(
+    `SELECT p.*, s.id AS sup_id, s.code AS sup_code, s.name AS sup_name, fo.id AS for_id, fo.code AS for_code
+       FROM cf_purchase_orders p
+       LEFT JOIN cf_parties s ON s.company_id = p.company_id AND s.id = p.supplier_id
+       LEFT JOIN cf_sales_orders fo ON fo.company_id = p.company_id AND fo.id = p.for_order_id
+      WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`,
+    [companyId, Number(id)],
+  );
+  if (!p) throw notFound('Purchase order');
+  const sup = p.sup_id ? { id: p.sup_id, code: p.sup_code, name: p.sup_name } : null;
+  const forOrder = p.for_id ? { id: p.for_id, code: p.for_code } : null;
   const [lines] = await db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, i.tracked_by
        FROM cf_purchase_order_lines l
@@ -495,9 +516,6 @@ export async function getPurchaseOrder(db, companyId, id) {
   const ordered = round6(lines.reduce((t, l) => t + Number(l.quantity), 0));
   const received = round6(lines.reduce((t, l) => t + Number(l.qty_received), 0));
   // Bought for which sales orders (init.sql §43): the header default, and each line's allocations.
-  const [[forOrder]] = p.for_order_id
-    ? await db.query('SELECT id, code FROM cf_sales_orders WHERE company_id = ? AND id = ?', [companyId, p.for_order_id])
-    : [[]];
   const alloc = await allocationsOf(db, companyId, lines.map((l) => l.id));
   // The last price paid elsewhere, beside each line — the buyer's yardstick.
   const lastPaid = lines.length ? await lastPricesPaid(db, companyId, lines.map((l) => l.item_id), { exceptOrderId: p.id }) : new Map();
@@ -769,11 +787,35 @@ export async function addPurchaseLine(db, c, poId, input = {}) {
 }
 
 export async function updatePurchaseLine(db, c, lineId, input = {}) {
-  const l = await requireLine(db, c.companyId, lineId);
+  /*
+   * A date or a quantity can move the PLAN, so the answer says which planned cards it did (plannedUnits).
+   * ROUND TRIPS (2026-10-11; ~49 ms each on production, one after another inside the transaction): the
+   * orders the line is bought for and the plan-structure stamp ride on the read of the line itself; the
+   * order's status is worked out from the purchase order read for the answer (no second read); a date-only
+   * edit does not restate at all; and the planned cards come the lean way (plannerService) — 15 in all for
+   * a date edit while the plan's structure is kept, where it was 54.
+   */
+  const asksPlan = input.quantity !== undefined || input.expectedDate !== undefined;
+  let l;
+  let planStamp;
+  let boughtFor = null;
+  if (asksPlan) {
+    const { planStampColumns, planStampOf } = await import('./plannerService.js');
+    const [[row]] = await db.query(
+      `SELECT l.*, p.status AS po_status, p.code AS po_code, p.supplier_id,
+              ${boughtForColumn('a.purchase_line_id = l.id')}, ${planStampColumns(c.companyId)}
+         FROM cf_purchase_order_lines l JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`,
+      [c.companyId, Number(lineId)],
+    );
+    if (!row) throw notFound('Purchase order line');
+    l = row;
+    planStamp = planStampOf(row);
+    boughtFor = await boughtForOf(db, c.companyId, row, { lineIds: [row.id] });
+  } else l = await requireLine(db, c.companyId, lineId);
   assertOpen({ status: l.po_status, code: l.po_code });
   const problems = [];
   const sets = {};
-  const boughtFor = input.quantity !== undefined || input.expectedDate !== undefined ? await ordersBoughtFor(db, c.companyId, { lineIds: [l.id] }) : null;
   if (input.quantity !== undefined) {
     const q = readQty(input.quantity, 'Quantity', problems);
     if (q != null && q + EPS < Number(l.qty_received)) problems.push(`${fmt(l.qty_received)} has already been received on this line — the quantity cannot go below that.`);
@@ -793,8 +835,17 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
     await db.query(`UPDATE cf_purchase_order_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, l.id]);
   }
-  await restate(db, c.companyId, l.purchase_order_id);
-  const po = await getPurchaseOrder(db, c.companyId, l.purchase_order_id);
+  let po = await getPurchaseOrder(db, c.companyId, l.purchase_order_id);
+  // The order's status follows its lines — only a quantity can move it, and the lines were just read for the answer.
+  if (sets.quantity !== undefined && !PRE_ORDER_STATUSES.includes(po.status) && po.status !== 'cancelled') {
+    const any = po.lines.some((x) => x.received > EPS);
+    const all = po.lines.length > 0 && po.lines.every((x) => x.received >= x.quantity - EPS);
+    const status = all ? 'received' : any ? 'partially_received' : 'ordered';
+    if (status !== po.status) {
+      await db.query('UPDATE cf_purchase_orders SET status = ? WHERE company_id = ? AND id = ?', [status, c.companyId, po.id]);
+      po = { ...po, status };
+    }
+  }
   // Only a date or a quantity can move the plan; a price or a note does not ask.
   const moved = (sets.expected_date !== undefined && (sets.expected_date ?? null) !== (planDate(l.expected_date) ?? null)) || (sets.quantity !== undefined && sets.quantity < Number(l.quantity) - EPS);
   if (!boughtFor || !moved) return po;
@@ -804,7 +855,7 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
       purchaseLineId: l.id, purchaseOrder: { id: po.id, code: po.code },
       ...(sets.expected_date !== undefined ? { date: { from: planDate(l.expected_date), to: sets.expected_date ?? null } } : {}),
       ...(sets.quantity !== undefined ? { quantity: { from: Number(l.quantity), to: sets.quantity } } : {}),
-    }),
+    }, planStamp),
   };
 }
 
@@ -849,15 +900,23 @@ export async function markOrdered(db, c, id, input = {}) {
 }
 
 export async function cancelPurchaseOrder(db, c, id, input = {}) {
-  const p = await requireOrder(db, c.companyId, id);
+  // One read: the order, what has been received against it, the sales orders it is bought for, and the plan-structure stamp.
+  const { planStampColumns, planStampOf } = await import('./plannerService.js');
+  const [[p]] = await db.query(
+    `SELECT p.*, (SELECT COALESCE(SUM(x.qty_received), 0) FROM cf_purchase_order_lines x WHERE x.company_id = p.company_id AND x.purchase_order_id = p.id AND x.deleted_at IS NULL) AS received_total,
+            ${boughtForColumn('al.purchase_order_id = p.id')}, ${planStampColumns(c.companyId)}
+       FROM cf_purchase_orders p WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`,
+    [c.companyId, Number(id)],
+  );
+  if (!p) throw notFound('Purchase order');
   if (p.status === 'cancelled') throw invalid('CANCELLED', `${p.code} is already cancelled.`);
-  const [[{ n }]] = await db.query('SELECT COALESCE(SUM(qty_received), 0) AS n FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, p.id]);
+  const n = p.received_total;
   if (Number(n) > EPS) throw invalid('RECEIVED', `${fmt(n)} has already been received against ${p.code} — it cannot be cancelled.`);
   const note = blank(input.reason) ? p.notes : `${p.notes ? `${p.notes}\n` : ''}Cancelled: ${String(input.reason).slice(0, 255)}`;
-  const boughtFor = await ordersBoughtFor(db, c.companyId, { poId: p.id });
+  const boughtFor = await boughtForOf(db, c.companyId, p, { poId: p.id });
   await db.query("UPDATE cf_purchase_orders SET status = 'cancelled', suggested = 0, notes = ? WHERE company_id = ? AND id = ?", [note, c.companyId, p.id]);
   const po = await getPurchaseOrder(db, c.companyId, p.id);
-  return { ...po, plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, { purchaseOrder: { id: p.id, code: p.code }, cancelled: true }) };
+  return { ...po, plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, { purchaseOrder: { id: p.id, code: p.code }, cancelled: true }, planStampOf(p)) };
 }
 
 /**

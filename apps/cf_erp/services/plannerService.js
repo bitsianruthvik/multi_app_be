@@ -917,7 +917,9 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   if (rankOverrides) for (const [k, v] of rankOverrides) if (unitKeys.has(k)) ranks[k] = v;
 
   // ---- material: THE engine (materialReadyService), for every unit at every level -----------
-  const mr = await unitReadiness(db, companyId, { lineRows, allLines: allLineRows, units, orders: orderList, unitShares, entries, ranks, today });
+  const levelOfLine = new Map();
+  for (const o of orderList) for (const l of o.lines) levelOfLine.set(l.id, l.level);
+  const mr = await unitReadiness(db, companyId, { lineRows, allLines: allLineRows, units, levelOfLine, unitShares, entries, ranks, today });
   const counts = { ready: 0, dated: 0, late: 0, waiting: 0 };
   for (const u of units) {
     const res = mr.results.get(u.key);
@@ -981,7 +983,8 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
     // §56: the engine's summary. counts = the units at each line's saved level.
     materialReady: { engine: 2, today, counts, blockedEntries },
   };
-  return { snapshot, stored };
+  // structure: what a later, lean read needs of this one (plannedUnitsOfOrders keeps it while nothing it came from has changed).
+  return { snapshot, stored, structure: { lineRows, units, unitShares, levelOfLine, planned: mr.needs.plannedRaw ?? null } };
 }
 
 /* ===========================================================================
@@ -1016,8 +1019,8 @@ function claimOrderOfUnits(list, { entries, ranks, oRank, lineIdx, unitIdx }) {
  * the line were planned at that level", against what the OTHER lines leave.
  * Round trips: lineNeeds (≤ 4) + loadSupply (5); nothing per unit.
  */
-async function unitReadiness(db, companyId, { lineRows, allLines = lineRows, units: ownUnits, orders, unitShares, entries, ranks, today }) {
-  const needs = await lineNeeds(db, companyId, allLines);
+async function unitReadiness(db, companyId, { lineRows, allLines = lineRows, units: ownUnits, levelOfLine, unitShares, entries, ranks, today, planned = null, supplyOpts = {} }) {
+  const needs = await lineNeeds(db, companyId, allLines, { planned });
   // A line whose units were not built (a restricted read) still claims: one consumer, its whole need.
   const built = new Set(lineRows.map((l) => l.id));
   const units = allLines.length === lineRows.length ? ownUnits
@@ -1025,14 +1028,12 @@ async function unitReadiness(db, companyId, { lineRows, allLines = lineRows, uni
   const itemIds = new Set();
   for (const n of needs.values()) for (const id of n.items.keys()) itemIds.add(id);
   for (const list of unitShares.values()) for (const m of list) itemIds.add(Number(m.itemId));
-  const supply = await loadSupply(db, companyId, [...itemIds], { needs, todayText: today });
+  const supply = await loadSupply(db, companyId, [...itemIds], { needs, todayText: today, ...supplyOpts });
 
   const lineOf = new Map(allLines.map((l) => [l.id, l]));
   const lineIdx = new Map(allLines.map((l, i) => [l.id, i]));
   const unitIdx = new Map(units.map((u, i) => [u.key, i]));
   const oRank = orderRanks(allLines);
-  const levelOfLine = new Map();
-  for (const o of orders) for (const l of o.lines) levelOfLine.set(l.id, l.level);
   const unitsOfLine = new Map();
   for (const u of units) { if (!unitsOfLine.has(u.lineId)) unitsOfLine.set(u.lineId, []); unitsOfLine.get(u.lineId).push(u); }
   const order = (list) => claimOrderOfUnits(list, { entries, ranks, oRank, lineIdx, unitIdx });
@@ -1165,26 +1166,176 @@ function entryBlock(m, e, was) {
  *   'material_late' | 'waiting', week (the placement's week), startDate, wasDate, wasState (what the
  *   engine said when the card was placed), readyDate (now), earliest, message }] }
  */
-export async function plannedUnitsOfOrders(db, companyId, orderIds) {
+export async function plannedUnitsOfOrders(db, companyId, orderIds, { stamp = undefined, lean = true } = {}) {
   const ids = [...new Set((orderIds ?? []).map(Number).filter(Boolean))];
+  if (!ids.length) return { late: 0, waiting: 0, units: [] };
+  if (!lean) return fullPlannedUnits(db, companyId, ids, null);
+  const st = stamp === undefined ? await planStructureStamp(db, companyId) : stamp;
+  const kept = keptStructure(companyId, st, ids);
+  return (kept && await leanPlannedUnits(db, companyId, ids, kept)) || fullPlannedUnits(db, companyId, ids, st);
+}
+
+/** The answer's rows, in one fixed order (order number, line, unit) — whichever way they were worked out. */
+function plannedUnitRows(found) {
   const out = { late: 0, waiting: 0, units: [] };
-  if (!ids.length) return out;
-  const { snapshot } = await buildSnapshot(db, companyId, {}, { onlyOrderIds: new Set(ids) });
+  found.sort((x, y) => String(x.order.code).localeCompare(String(y.order.code)) || Number(x.line.lineNo ?? 0) - Number(y.line.lineNo ?? 0) || x.line.id - y.line.id
+    || String(x.unitKey).localeCompare(String(y.unitKey), undefined, { numeric: true }));
+  for (const u of found) { if (u.kind === 'waiting') out.waiting += 1; else out.late += 1; out.units.push(u); }
+  return out;
+}
+const plannedUnitRow = (k, u, order, lineNo, e) => ({
+  unitKey: k, code: u.code ?? null, name: u.name ?? null, order, line: { id: u.lineId, lineNo },
+  kind: e.blocked.kind, week: e.shipDate, startDate: e.startDate ?? null, wasDate: e.blocked.was.date, wasState: e.blocked.was.state,
+  readyDate: e.blocked.readyDate, earliest: e.blocked.earliest, message: e.blocked.message,
+});
+
+/** The whole way: the planner's own read, with only those orders' units built. Remembers the structure for the lean way. */
+async function fullPlannedUnits(db, companyId, ids, st) {
+  const { snapshot, structure } = await buildSnapshot(db, companyId, {}, { onlyOrderIds: new Set(ids) });
+  if (st) keepStructure(companyId, st, ids, structure);
   const unitOf = new Map(snapshot.units.map((u) => [u.key, u]));
   const orderOf = new Map(snapshot.orders.map((o) => [o.id, o]));
+  const found = [];
   for (const [k, e] of Object.entries(snapshot.entries)) {
     if (!e.blocked) continue;
     const u = unitOf.get(k);
     const o = orderOf.get(u.orderId);
-    const l = o?.lines.find((x) => x.id === u.lineId);
-    if (e.blocked.kind === 'waiting') out.waiting += 1; else out.late += 1;
-    out.units.push({
-      unitKey: k, code: u.code ?? null, name: u.name ?? null, order: { id: u.orderId, code: o?.code ?? null }, line: { id: u.lineId, lineNo: l?.lineNo ?? null },
-      kind: e.blocked.kind, week: e.shipDate, startDate: e.startDate ?? null, wasDate: e.blocked.was.date, wasState: e.blocked.was.state,
-      readyDate: e.blocked.readyDate, earliest: e.blocked.earliest, message: e.blocked.message,
+    found.push(plannedUnitRow(k, u, { id: u.orderId, code: o?.code ?? null }, o?.lines.find((x) => x.id === u.lineId)?.lineNo ?? null, e));
+  }
+  return plannedUnitRows(found);
+}
+
+/* ---------------------------------------------------------------------------
+ * THE LEAN WAY (2026-10-11). A purchase-line edit asks "which planned cards of
+ * the orders this is bought for are now late?" — the whole way costs a planner
+ * read of those orders (their roll-out and value mirror: ~40 round trips, 2 s
+ * on production). But a PO edit changes none of what that read is spent on:
+ * WHICH units a line has, at which level, and how its need is shared over
+ * them. So that STRUCTURE is kept, per order, with the frozen lines' planned
+ * material, under a STAMP — one row of COUNT + MAX(updated_at) over every table
+ * the structure is read from (orders, lines, pieces, nests, splits, items,
+ * BOMs, values and their rules, releases …), read in the same round trip as
+ * the purchase line itself. While the stamp is the same, the lean way reads
+ * only what moves: the open lines, the plan entries and ranks, the requisition
+ * lines, the released lines' requirements and the supply — 5 round trips — and
+ * runs the SAME engine code (unitReadiness → evaluate → entryBlock).
+ *   - a stamp that differs, an order not kept, a frozen line whose planned
+ *     material is not kept, a line that is neither frozen nor released (its
+ *     shares follow stock): the whole way, which then keeps what it read.
+ *   - nothing is kept when a table changed within the last 2 s (updated_at has
+ *     one-second grain: a second change in that second would not move the stamp).
+ *   - kept per process, 10 minutes at most. GET /planner never reads it.
+ * scripts/cf_kepl/buying_v2_scale_test.mjs holds the golden comparison: the
+ * lean answer equals the whole one byte for byte, at two sizes.
+ * ------------------------------------------------------------------------ */
+const STRUCTURE_TTL_MS = 10 * 60 * 1000;
+const STAMP_TABLES = ['cf_sales_orders', 'cf_sales_order_lines', 'cf_order_pieces', 'cf_plate_lots', 'cf_nest_placements', 'cf_plan_splits', 'cf_production_releases',
+  'cf_item_details', 'cf_master_records', 'cf_definition_details', 'cf_boms', 'cf_bom_lines', 'cf_spec_values', 'cf_spec_assignments', 'cf_specifications', 'cf_spec_options',
+  'cf_formulas', 'cf_classification_nodes', 'cf_cut_places'];
+/** The stamp as SQL select-list columns (plan_stamp, plan_now) for a query that already runs; companyId is inlined as a number. */
+export function planStampColumns(companyId) {
+  const c = Number(companyId);
+  const part = (t) => `(SELECT CONCAT(COUNT(*), '/', COALESCE(MAX(updated_at), '')) FROM ${t} WHERE company_id = ${c})`;
+  return `CONCAT_WS('|', ${STAMP_TABLES.map(part).join(', ')}) AS plan_stamp, CAST(NOW() AS CHAR) AS plan_now`;
+}
+export const planStampOf = (row) => (row?.plan_stamp ? { text: String(row.plan_stamp), now: String(row.plan_now ?? '') } : null);
+export async function planStructureStamp(db, companyId) {
+  const [[row]] = await db.query(`SELECT ${planStampColumns(companyId)}`);
+  return planStampOf(row);
+}
+const kept = new Map();                              // companyId -> { stamp, at, orders: Map(orderId -> structure), planned: Map }
+/** Tests, and anything that edits structure with raw SQL. */
+export function clearPlanStructure() { kept.clear(); }
+function keptStructure(companyId, st, ids) {
+  const e = kept.get(Number(companyId));
+  if (!st || !e || e.stamp !== st.text || Date.now() - e.at > STRUCTURE_TTL_MS || !e.planned) return null;
+  return ids.every((id) => e.orders.has(id)) ? e : null;
+}
+function keepStructure(companyId, st, ids, structure) {
+  // Settled only: every table's last change at least 2 s before the stamp was read.
+  const last = (st.text.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/g) ?? []).sort().at(-1) ?? '';
+  if (!st.now || (last && Date.parse(`${st.now.slice(0, 19).replace(' ', 'T')}Z`) - Date.parse(`${last.replace(' ', 'T')}Z`) < 2000)) return;
+  let e = kept.get(Number(companyId));
+  if (!e || e.stamp !== st.text) { e = { stamp: st.text, at: Date.now(), orders: new Map(), planned: null }; kept.set(Number(companyId), e); }
+  e.at = Date.now();
+  e.planned = structure.planned;
+  for (const id of ids) {
+    const lines = structure.lineRows.filter((l) => Number(l.order_id) === id);
+    // A line neither frozen nor released has ONE unit whose shares are the roll-out's estimate — and that follows stock. Not kept.
+    if (lines.some((l) => !l.locked_at && !l.release_id)) { e.orders.delete(id); continue; }
+    const lineIds = new Set(lines.map((l) => l.id));
+    const units = structure.units.filter((u) => lineIds.has(u.lineId)).map((u) => ({ key: u.key, lineId: u.lineId, orderId: u.orderId, levels: u.levels, code: u.code ?? null, name: u.name ?? null }));
+    e.orders.set(id, {
+      lineIds: [...lineIds], units,
+      shares: new Map(units.map((u) => [u.key, structure.unitShares.get(u.key) ?? []])),
+      levels: new Map(lines.map((l) => [l.id, structure.levelOfLine.get(l.id) ?? 'line'])),
     });
   }
-  return out;
+}
+
+/** The lean way; null when something it needs is not kept (the caller then goes the whole way). 5 round trips. */
+async function leanPlannedUnits(db, companyId, ids, e) {
+  const today = todayText();
+  const allLineRows = await loadOrderLines(db, companyId);
+  if (allLineRows.some((l) => !l.release_id && l.locked_at && l.item_id && !e.planned.has(Number(l.id)))) return null;
+  const want = new Set(ids);
+  const lineRows = allLineRows.filter((l) => want.has(Number(l.order_id)));
+  const units = [];
+  const unitShares = new Map();
+  const levelOfLine = new Map();
+  for (const l of lineRows) {
+    const o = e.orders.get(Number(l.order_id));
+    if (!o.lineIds.includes(l.id)) return null;      // a line the kept structure does not know
+    levelOfLine.set(l.id, o.levels.get(l.id));
+    for (const u of o.units) if (u.lineId === l.id) { units.push(u); unitShares.set(u.key, o.shares.get(u.key)); }
+  }
+  if (ids.some((id) => e.orders.get(id).lineIds.some((lid) => !lineRows.some((l) => l.id === lid)))) return null;   // …or one that is gone
+  // The plan entries, the ranks and the requisition lines: one read (each string column comes from one side only).
+  const [mix] = await db.query(
+    `SELECT 0 AS src, e.unit_key, e.ship_date, e.start_date, e.pinned AS n1, e.material_state, e.material_date,
+            NULL AS pr_id, NULL AS requisition_id, NULL AS order_line_id, NULL AS item_id, NULL AS quantity, NULL AS skipped_at, NULL AS skip_note, NULL AS code
+       FROM cf_plan_entries e WHERE e.company_id = ? AND e.deleted_at IS NULL
+      UNION ALL
+     SELECT 1, r.unit_key, NULL, NULL, r.rank_no, NULL, NULL, NULL, NULL, r.order_line_id, NULL, NULL, NULL, NULL, NULL
+       FROM cf_plan_ranks r WHERE r.company_id = ?
+      UNION ALL
+     SELECT 2, NULL, NULL, NULL, pl.skipped, NULL, NULL, pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped_at, pl.skip_note, rq.code
+       FROM cf_requisition_lines pl JOIN cf_requisitions rq ON rq.id = pl.requisition_id AND rq.deleted_at IS NULL
+      WHERE pl.company_id = ? AND pl.deleted_at IS NULL`,
+    [companyId, companyId, companyId],
+  );
+  const unitKeys = new Set(units.map((u) => u.key));
+  const entries = {};
+  const placedWith = new Map();
+  const ranked = [];
+  const prLines = [];
+  for (const r of mix) {
+    const src = Number(r.src);
+    if (src === 0) {
+      if (!unitKeys.has(r.unit_key)) continue;
+      entries[r.unit_key] = { shipDate: dateText(r.ship_date), startDate: r.start_date ? dateText(r.start_date) : null, pinned: !!Number(r.n1) };
+      placedWith.set(r.unit_key, { state: r.material_state ?? null, date: r.material_date ? dateText(r.material_date) : null });
+    } else if (src === 1) { if (unitKeys.has(r.unit_key)) ranked.push(r); } else {
+      prLines.push({ id: r.pr_id, requisition_id: r.requisition_id, order_line_id: r.order_line_id, item_id: r.item_id, quantity: r.quantity, skipped: r.n1, skipped_at: r.skipped_at, skip_note: r.skip_note, code: r.code });
+    }
+  }
+  const ranks = {};
+  for (const r of ranked.sort((x, y) => x.order_line_id - y.order_line_id || Number(x.n1) - Number(y.n1))) ranks[r.unit_key] = Number(r.n1);
+  const mr = await unitReadiness(db, companyId, { lineRows, allLines: allLineRows, units, levelOfLine, unitShares, entries, ranks, today, planned: e.planned, supplyOpts: { lean: true, prLines } });
+  const lineOf = new Map(lineRows.map((l) => [l.id, l]));
+  const unitOf = new Map(units.map((u) => [u.key, u]));
+  const found = [];
+  for (const [k, en] of Object.entries(entries)) {
+    const u = unitOf.get(k);
+    const res = mr.results.get(k);
+    if (!res) continue;
+    const need = mr.needs.get(u.lineId);
+    const blocked = entryBlock(shapeUnitMaterial(res, { today, known: need?.known ?? false, incomplete: need?.known && !need.ready ? need.why : null }), en, placedWith.get(k));
+    if (!blocked) continue;
+    const l = lineOf.get(u.lineId);
+    found.push(plannedUnitRow(k, u, { id: u.orderId, code: l.order_code }, l.line_no, { ...en, blocked }));
+  }
+  return plannedUnitRows(found);
 }
 
 /**

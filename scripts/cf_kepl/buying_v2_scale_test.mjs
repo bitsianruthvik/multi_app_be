@@ -28,6 +28,7 @@ import * as PF from '../../apps/cf_erp/services/purchaseFlowService.js';
 import * as PS from '../../apps/cf_erp/services/purchaseService.js';
 import * as PL from '../../apps/cf_erp/services/plannerService.js';
 import { migrate } from './buying-pr-migrate.mjs';
+import { unownedShares } from './buying-unowned-shares.mjs';
 import { harness, simple, girder, quietCodes, addDays, PER_GIRDER } from './lib/buyingFixture.mjs';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -89,10 +90,44 @@ try {
     out.lastDate = mine.at(-1).material.readyDate;
     out.payloadKb = Math.round(JSON.stringify(snap).length / 1024);
     out.materialKb = Math.round(JSON.stringify(snap.units.map((u) => u.material)).length / 1024);
-    await m('save', (q) => PL.putEntries(q, c, { entries: [{ unitKey: O.units.at(-1), shipDate: mine.at(-1).material.earliest, pinned: true }] }));
-    // A PO line's date moved: the edit answers with the planned units it made late, from the engine for THIS order's units only.
-    const edit = await m('poDate', (q) => PS.updatePurchaseLine(q, c, made.purchaseOrders.at(-1).lines[0].id, { expectedDate: D(90) }));
-    out.poDateLate = edit.plannedUnits.late;
+    // Three cards planned (first, middle, last girder), each in the first week its material allows.
+    const picks = [...new Set([0, Math.floor(n / 2), n - 1])].map((i) => mine[i]);
+    await m('save', (q) => PL.putEntries(q, c, { entries: picks.map((u) => ({ unitKey: u.key, shipDate: u.material.earliest, pinned: false })) }));
+    /*
+     * A PURCHASE-LINE EDIT ANSWERS FOR THE PLAN (plannedUnits) — THE LEAN WAY AGAINST THE WHOLE WAY.
+     * GOLDEN: after each of three edits (a date moved later, a quantity cut, the PO cancelled) the answer
+     * the edit returned — worked out the lean way from the kept structure — must equal, byte for byte,
+     * the whole way's (plannedUnitsOfOrders { lean: false }: the planner's own read of this order).
+     * The structure is only kept once every table it comes from has been still for 2 s: wait for that.
+     */
+    await new Promise((r) => { setTimeout(r, 2300); });
+    PL.clearPlanStructure();
+    const lineB = made.purchaseOrders.at(-1).lines[0].id;
+    const lineA = made.purchaseOrders[0].lines[0];
+    const answer = (x) => j({ late: x.late, waiting: x.waiting, units: x.units });
+    const whole = async () => answer(await PL.plannedUnitsOfOrders(db, COMPANY, [O.id], { lean: false }));
+    await db.query('SAVEPOINT edit');
+    const cold = await m('poDateCold', (q) => PS.updatePurchaseLine(q, c, lineB, { expectedDate: D(90) }));
+    const wholeDate = await whole();
+    out.goldenCold = answer(cold.plannedUnits) === wholeDate;
+    await db.query('ROLLBACK TO SAVEPOINT edit');
+    const warm = await m('poDate', (q) => PS.updatePurchaseLine(q, c, lineB, { expectedDate: D(90) }));
+    out.goldenDate = answer(warm.plannedUnits) === wholeDate;
+    out.poDateLate = warm.plannedUnits.late;
+    out.bytes = wholeDate.length;
+    await db.query('ROLLBACK TO SAVEPOINT edit');
+    const cut = await m('poQty', (q) => PS.updatePurchaseLine(q, c, lineA.id, { quantity: lineA.quantity / 2 }));
+    out.goldenQty = answer(cut.plannedUnits) === await whole();
+    out.poQtyHit = cut.plannedUnits.late + cut.plannedUnits.waiting;
+    await db.query('ROLLBACK TO SAVEPOINT edit');
+    const gone = await m('poCancel', (q) => PS.cancelPurchaseOrder(q, c, made.purchaseOrders.at(-1).id, { reason: 'golden' }));
+    out.goldenCancel = answer(gone.plannedUnits) === await whole();
+    out.poCancelHit = gone.plannedUnits.late + gone.plannedUnits.waiting;
+    await db.query('ROLLBACK TO SAVEPOINT edit');
+    // The purchase order itself, as the edit answers it: its supplier and its sales order now ride on the header's read.
+    const po = await PS.getPurchaseOrder(db, COMPANY, made.purchaseOrders.at(-1).id);
+    const [[ref]] = await db.query('SELECT p.supplier_id, s.code AS sc, s.name AS sn, p.for_order_id, fo.code AS fc FROM cf_purchase_orders p LEFT JOIN cf_parties s ON s.id = p.supplier_id LEFT JOIN cf_sales_orders fo ON fo.id = p.for_order_id WHERE p.id = ?', [po.id]);
+    out.poHeader = j([po.supplier, po.forOrder]) === j([{ id: ref.supplier_id, code: ref.sc, name: ref.sn }, { id: ref.for_order_id, code: ref.fc }]);
     await db.query('ROLLBACK TO SAVEPOINT scale');
     return out;
   }
@@ -114,11 +149,20 @@ try {
     ['snapshot', 'the planner snapshot (the engine over every unit)'],
     ['save', 'a planner save with its material check'],
     ['raise', 'raising the requisition'],
-    ['poDate', 'a PO line date edit with its plannedUnits'],
+    ['poDate', 'a PO line DATE edit with its plannedUnits (lean)'],
+    ['poQty', 'a PO line QUANTITY cut with its plannedUnits (lean)'],
+    ['poCancel', 'a PO CANCEL with its plannedUnits (lean)'],
+    ['poDateCold', 'the same date edit with nothing kept (the whole way)'],
   ]) {
     ok(`${what}: ${small[name]} round trips at ${SMALL} units, ${big[name]} at ${BIG} — equal`, small[name] === big[name], `${small[name]} vs ${big[name]}`);
   }
-  ok(`the PO date edit reports the one planned card it made late, in fewer round trips than a planner read (${big.poDate} < ${big.snapshot})`, small.poDateLate === 1 && big.poDateLate === 1 && big.poDate < big.snapshot, `${big.poDateLate} ${big.poDate} ${big.snapshot}`);
+  ok(`GOLDEN, ${SMALL} units: the lean answer equals the whole way's byte for byte after a date edit, a quantity cut and a cancel (and so does the first, un-kept edit)`, small.goldenDate && small.goldenQty && small.goldenCancel && small.goldenCold, j([small.goldenCold, small.goldenDate, small.goldenQty, small.goldenCancel]));
+  ok(`GOLDEN, ${BIG} units: the same (${big.bytes} bytes compared for the date edit)`, big.goldenDate && big.goldenQty && big.goldenCancel && big.goldenCold, j([big.goldenCold, big.goldenDate, big.goldenQty, big.goldenCancel]));
+  ok(`…and the answers are not empty: the date edit made ${big.poDateLate} planned cards late, the cut hit ${big.poQtyHit}, the cancel ${big.poCancelHit}`, small.poDateLate === 3 && big.poDateLate === 3 && big.poQtyHit >= 1 && big.poCancelHit === 3, j([small.poDateLate, big.poDateLate, big.poQtyHit, big.poCancelHit]));
+  ok(`a PO line DATE edit is ≤ 15 round trips: ${big.poDate} (it was ${big.poDateCold} the whole way)`, big.poDate <= 15, String(big.poDate));
+  ok(`a PO CANCEL is ≤ 15 round trips: ${big.poCancel}`, big.poCancel <= 15, String(big.poCancel));
+  ok(`a PO line QUANTITY cut is ≤ 17: ${big.poQty} (it also reads and trims the line's shares, and may restate the order)`, big.poQty <= 17, String(big.poQty));
+  ok('getPurchaseOrder still names the supplier and the sales order (now read with the header)', small.poHeader && big.poHeader);
   ok(`the engine itself is ≤ 10 reads (lines 1, needs ≤ 4, supply 5): ${big.engineLines}`, big.engineLines <= 10, String(big.engineLines));
   ok(`the requisition read is the engine + 5: ${big.read}`, big.read <= big.engineLines + 5, String(big.read));
   console.log(`        times at ${BIG} units: read ${big.readMs} ms, stock check ${big.stockDryMs} / ${big.stockApplyMs} ms, snapshot ${big.snapshotMs} ms (payload ${big.payloadKb} kB, of which material ${big.materialKb} kB), save ${big.saveMs} ms`);
@@ -159,6 +203,13 @@ try {
   console.log(`        engine before: ${old}`);
   ok('before: M1 line 1 dated (3 held + 1 coming), line 2 dated; M2 dated; M3 waiting (short); M4 waiting (asked)', old === j([['dated', D(12)], ['dated', D(12)], ['dated', D(20)], ['waiting', null], ['waiting', null]]), old);
   const shapeBefore = await shape();
+  // The READ-ONLY report of shares still "for the order as a whole" (scripts/cf_kepl/buying-unowned-shares.mjs).
+  const rep0 = await H.measured(db, (q) => unownedShares(q, COMPANY));
+  const mineOf = (rep) => rep.rows.filter((r) => r.order.code.startsWith(tag));
+  ok(`the unowned-shares report lists the three old-shape shares still to come (M1, M2, M4), each "no requisition" — ${rep0.queries} reads`, mineOf(rep0.result).length === 3 && mineOf(rep0.result).every((r) => r.why === 'no requisition')
+    && j(mineOf(rep0.result).map((r) => [r.order.code.slice(tag.length + 1), r.outstanding]).sort()) === j([['M1', 7], ['M2', 3], ['M4', 1]]) && rep0.queries === 4, j(mineOf(rep0.result).map((r) => [r.order.code, r.why, r.outstanding])));
+  ok('…with the PO, its status and supplier, the item, the date and the order', (() => { const r = mineOf(rep0.result).find((x) => x.order.id === M2.id); return r.po.status === 'partially_received' && r.supplier === `${tag} S1` && r.item.id === Y && r.quantity === 5 && r.received === 2 && r.expectedDate === D(20) && r.liveOrder.status === 'confirmed'; })());
+  ok('…and it wrote nothing', (await shape()) === shapeBefore);
   const dry = await H.measured(db, (q) => migrate(q, c, { apply: false }));
   console.log(`        dry run: ${j(dry.result)}  (${dry.queries} round trips)`);
   ok('DRY RUN: it would create a requisition for each of my 5 lines …', dry.result.requisitionsCreated >= 5 && dry.result.written === false);
@@ -180,6 +231,20 @@ try {
   const v2 = (await RQ.orderRequisitions(db, COMPANY, M2.id)).requisitions[0].lines[0];
   ok('M2: the 2 received are held for its requisition line, 3 still coming on the PO', v2.cover.held === 2 && v2.cover.ordered === 3 && v2.purchase[0].received === 2 && v2.status === 'covered', j(v2.cover));
   ok('M3 has an open requisition; M4\'s is "asked"', (await RQ.orderRequisitions(db, COMPANY, M3.id)).requisitions[0].status === 'open' && (await RQ.orderRequisitions(db, COMPANY, M4.id)).requisitions[0].lines[0].status === 'asked');
+  ok('after the migration the report has none of them left', mineOf(await unownedShares(db, COMPANY)).length === 0);
+  // Three shares the migration cannot hand over, each for its own reason.
+  let poX = await PS.createPurchaseOrder(db, c, { supplierId: F.S2, forOrderId: M3.id, expectedDate: D(30) });
+  poX = await PS.addPurchaseLine(db, c, poX.id, { itemId: Z, quantity: 5 });
+  poX = await PS.addPurchaseLine(db, c, poX.id, { itemId: Y, quantity: 1 });
+  let rep = mineOf(await unownedShares(db, COMPANY));
+  ok('a new order-level share a requisition line still lacks reads "to adopt"; one of an item the released line never asks for reads "released, not asked"',
+    j(rep.map((r) => [r.item.id, r.why]).sort()) === j([[Z, 'to adopt'], [Y, 'released, not asked']].sort()), j(rep.map((r) => [r.item.code, r.why, r.detail])));
+  await RQ.raiseRequisitions(db, c, M3.id, {});
+  rep = mineOf(await unownedShares(db, COMPANY));
+  ok('refreshed: 2 were handed to the requisition line; the 3 left over read "above the need"', rep.find((r) => r.item.id === Z)?.why === 'above the need' && rep.find((r) => r.item.id === Z).outstanding === 3, j(rep.map((r) => [r.item.code, r.why, r.outstanding])));
+  const all = await unownedShares(db, COMPANY, { all: true });
+  ok('totals add up, by reason', all.totals.shares === all.rows.length && Object.values(all.totals.byWhy).reduce((t, e) => t + e.shares, 0) === all.rows.length);
+  await PS.cancelPurchaseOrder(db, c, poX.id, { reason: 'report fixture' });
   const shapeApplied = await shape();
   const again = await migrate(db, c, { apply: true });
   ok('IDEMPOTENT: a second apply creates nothing and hands nothing over', again.requisitionsCreated === 0 && again.requisitionLinesAdded === 0 && again.holdsHandedOver === 0 && again.allocationsHandedOver === 0 && again.changed.length === 0, j(again));
