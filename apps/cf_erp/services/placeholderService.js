@@ -55,6 +55,38 @@ const sharedOr = (values) => {
 };
 const pieceSeqOf = (pieces) => sharedOr(pieces.map((p) => p.pieceSeq));
 
+/** One # as the numbers it takes: { from, to } and, when there are few, the values themselves. */
+const holeOf = (nums) => {
+  const vals = [...new Set(nums.map(Number).filter(Number.isFinite))].sort((a, b) => a - b);
+  if (!vals.length) return null;
+  return { from: vals[0], to: vals[vals.length - 1], ...(vals.length <= 6 ? { values: vals } : {}) };
+};
+
+/**
+ * A code cut at its #s — [{ text } | { from, to, values? }] — so a screen can show
+ * the numbers each # takes (CG(1,2,3)-L4) without working the numbering out again.
+ * The parent's code leads the child's, so its #s are the parent's own segments;
+ * `own` lists this design's #s left to right. Null when the #s in the code and the
+ * numbers known for them do not match (the screen then keeps the plain code).
+ */
+export function segmentsOf(code, parentCode, parentSegments, own) {
+  if (code == null) return null;
+  const led = parentCode != null && parentSegments && code.startsWith(parentCode);
+  if (parentCode != null && !led && code.includes('#')) return null;
+  const out = led ? parentSegments.map((x) => ({ ...x })) : [];
+  const parts = (led ? code.slice(parentCode.length) : code).split('#');
+  // Both of a design's numbers can differ piece to piece while its rule prints only one: the place under the parent (pieceSeq) wins.
+  if (parts.length - 1 > own.length || own.length - (parts.length - 1) > 1) return null;
+  parts.forEach((text, i) => {
+    if (text) {
+      const last = out[out.length - 1];
+      if (last && last.text != null) last.text += text; else out.push({ text });
+    }
+    if (i < parts.length - 1) out.push({ ...own[i] });
+  });
+  return out;
+}
+
 /**
  * GET /order-lines/:id/placeholders
  *
@@ -95,7 +127,7 @@ export async function linePlaceholders(db, companyId, lineId) {
     memo,
     fallback: (n, parentCode) => builtInCode(n, parentCode, line, out.position, memo),
   });
-  out.rows = coded.rows.map(({ bomLineId, itemId, code, seqRange, pieces }) => ({ bomLineId, itemId, code, seqRange, pieces }));
+  out.rows = coded.rows.map(({ bomLineId, itemId, code, seqRange, pieces, segments }) => ({ bomLineId, itemId, code, seqRange, pieces, segments }));
   out.missing = coded.missing;
   return out;
 }
@@ -132,6 +164,7 @@ export async function codeDesigns(rules, companyId, nodes, { keyOf, draft = {}, 
     groups.get(key).push(n);
   }
   const placeholder = new Map(); // design key -> its text
+  const segmentsOfDesign = new Map(); // design key -> its text cut at the #s
   for (const [key, pieces] of groups) {
     const first = pieces[0];
     const parent = first.parentK != null ? nodes[first.parentK] : null;
@@ -155,6 +188,14 @@ export async function codeDesigns(rules, companyId, nodes, { keyOf, draft = {}, 
       }
     }
     placeholder.set(key, code);
+    // The numbers each # of this design's own part takes: its number among the pieces (pieceNo)
+    // and its place under one parent piece (pieceSeq) — the roll-out's own values, not worked out again.
+    const own = [];
+    if (pieceSeq === HOLE) own.push(holeOf(pieces.filter((p) => p.parentK === first.parentK).map((p) => p.pieceSeq)));
+    if (pieceNo === HOLE) own.push(holeOf(pieces.map((p) => p.pieceNo)));
+    const known = own.filter(Boolean);
+    const segments = known.length === own.length ? segmentsOf(code, parentCode, parent ? segmentsOfDesign.get(keyOf(parent)) ?? null : null, known) : null;
+    segmentsOfDesign.set(key, segments);
     // What # runs over under one parent piece: the row's own range there.
     let seqRange = null;
     if (pieceSeq === HOLE) {
@@ -167,6 +208,7 @@ export async function codeDesigns(rules, companyId, nodes, { keyOf, draft = {}, 
       itemId: first.itemId,
       code,
       seqRange,
+      segments,
       pieces: Number(pieces.reduce((sum, p) => sum + Number(p.quantity ?? 1), 0).toFixed(6)),
     });
   }

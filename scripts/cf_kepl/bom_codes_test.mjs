@@ -201,6 +201,10 @@ try {
   const isRow = [...byKey.values()].find((r) => r.code === `${G}-IS#`);
   eq('the # runs over 1–2 under the girder', isRow?.seqRange, [1, 2]);
   eq('… and the row stands for 2 pieces', isRow?.pieces, 2);
+  eq('the code cut at its #: the numbers the # takes ride along', isRow?.segments, [{ text: `${G}-IS` }, { from: 1, to: 2, values: [1, 2] }]);
+  const plateRow = [...byKey.values()].find((r) => r.code === `${G}-IS#-PLT1`);
+  eq('a child carries its parent’s # and its own text after it', plateRow?.segments, [{ text: `${G}-IS` }, { from: 1, to: 2, values: [1, 2] }, { text: '-PLT1' }]);
+  eq('a code with no # is one text segment', byKey.get([...byKey.keys()].find((k) => byKey.get(k).code === `${G}-SEG1`))?.segments, [{ text: `${G}-SEG1` }]);
   eq('nothing is missing, nothing is a problem', [gdr.missing.length, gdr.problems.length], [0, 0]);
 
   section('2. A catalog item: physical numbering across rows of one short name');

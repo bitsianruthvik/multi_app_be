@@ -211,16 +211,23 @@ export async function getFlow(db, companyId, id) {
   const [records] = await db.query(
     `SELECT m.id, m.code, m.short_name, m.name, m.record_kind, i.item_type, d.definition_type FROM cf_master_records m
        LEFT JOIN cf_item_details i ON i.master_id = m.id LEFT JOIN cf_definition_details d ON d.master_id = m.id
-      WHERE m.company_id = ? AND m.default_flow_id = ? AND m.deleted_at IS NULL ORDER BY m.code LIMIT 100`,
+      WHERE m.company_id = ? AND m.default_flow_id = ? AND m.deleted_at IS NULL
+        AND COALESCE(i.item_type, '') <> 'temporary' ORDER BY m.code LIMIT 100`,
     [companyId, id],
   );
   const [[{ line_count: lines }]] = await db.query('SELECT COUNT(*) AS line_count FROM cf_bom_lines WHERE company_id = ? AND operation_flow_id = ? AND deleted_at IS NULL', [companyId, id]);
-  // The list above stops at 100; this is every record that names the flow (same WHERE, still one cheap COUNT).
-  const [[{ record_count: recordCount }]] = await db.query('SELECT COUNT(*) AS record_count FROM cf_master_records WHERE company_id = ? AND default_flow_id = ? AND deleted_at IS NULL', [companyId, id]);
+  // "Made by it" is the CATALOG: items and definitions. An order row carries its own flow since 2026-10-10, so
+  // every row of every order would land here and bury them (user, 2026-10-11) — order rows are only counted.
+  // The list above stops at 100; these are the full counts (one cheap read).
+  const [[cnt]] = await db.query(
+    `SELECT SUM(COALESCE(i.item_type, '') <> 'temporary') AS record_count, SUM(COALESCE(i.item_type, '') = 'temporary') AS order_rows
+       FROM cf_master_records m LEFT JOIN cf_item_details i ON i.master_id = m.id
+      WHERE m.company_id = ? AND m.default_flow_id = ? AND m.deleted_at IS NULL`, [companyId, id]);
   out.uses = {
     records: records.map((r) => ({ id: r.id, code: r.code, shortName: r.short_name ?? null, name: r.name, kind: r.record_kind === 'item' ? r.item_type : r.definition_type })),
     bomLines: Number(lines),
-    recordCount: Number(recordCount),
+    recordCount: Number(cnt.record_count ?? 0),
+    orderRows: Number(cnt.order_rows ?? 0),
   };
   return out;
 }
