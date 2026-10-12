@@ -18,7 +18,7 @@ import { loadMaster, requireMachine } from './records.js';
 import { resolve, effectiveByCode, levelsOfResolution, parseJsonCol } from './resolutionService.js';
 import { valueReaders } from './operationService.js';
 import { checkFormula } from './formulaService.js';
-import { LEAF_DEPTH, ancestors } from './tree.js';
+import { LEAF_DEPTH, ancestors, levelName } from './tree.js';
 
 const MAX_MACHINES = 60;
 const MAX_PIECES = 30;
@@ -50,14 +50,25 @@ export async function builderContext(db, companyId, operationId, q = {}) {
   const subjectId = blank(q.subjectId) ? null : Number(q.subjectId);
   if (subjectType && !['classification', 'machine'].includes(subjectType)) throw invalid('INVALID', 'subjectType is classification or machine.');
 
-  const [[specs], [nodes], [machines], [flows], [rules]] = await Promise.all([
+  const [[specs], [nodes], [machines], [flows], [rules], [options], [itemNodes]] = await Promise.all([
     db.query(`SELECT id, code, name, data_type, measurement_type, default_uom, table_config, description FROM cf_specifications
                WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND data_type IN ('number', 'table', 'option', 'text') ORDER BY name`, [companyId]),
     db.query("SELECT id, parent_id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL AND scope = 'machine'", [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]),
     db.query('SELECT DISTINCT flow_id FROM cf_operation_flow_steps WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [companyId, operationId]),
     db.query('SELECT subject_type, subject_id FROM cf_operation_machine_rules WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL AND eligible = 1', [companyId, operationId]),
+    // What the preview offers to choose from: a pick-list's options, and the pieces' tree at each level.
+    db.query("SELECT specification_id, value, label FROM cf_spec_options WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY sort_order, id", [companyId]),
+    db.query("SELECT id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL AND scope <> 'machine' AND depth <= ? ORDER BY name", [companyId, LEAF_DEPTH]),
   ]);
+  const optionsOf = new Map();
+  for (const o of options) {
+    if (!optionsOf.has(o.specification_id)) optionsOf.set(o.specification_id, []);
+    optionsOf.get(o.specification_id).push({ value: o.value, label: o.label ?? o.value });
+  }
+  const withOptions = (s) => (s.data_type === 'option' ? { options: optionsOf.get(s.id) ?? [] } : {});
+  const levels = {};
+  for (const n of itemNodes) (levels[levelName(n.depth).toUpperCase()] ??= []).push({ id: n.id, code: n.code, name: n.name });
   const specById = new Map(specs.map((s) => [s.id, s]));
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
   // A machine's type chain, deepest first (the same bound as tree.ancestors).
@@ -176,7 +187,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
 
   const machineFields = [...machineSpecIds].map((id) => specById.get(id)).filter(Boolean).map((s) => {
     const withIt = machinesOut.filter((m) => m.values[s.code] != null);
-    return { ...fieldOf(s), example: withIt[0] ? (s.data_type === 'table' ? null : withIt[0].values[s.code]) : null, exampleFrom: withIt[0]?.code ?? null, count: withIt.length };
+    return { ...fieldOf(s), ...withOptions(s), example: withIt[0] ? (s.data_type === 'table' ? null : withIt[0].values[s.code]) : null, exampleFrom: withIt[0]?.code ?? null, count: withIt.length };
   }).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 
   // Every number / table field a piece might carry; the ones real pieces have first.
@@ -184,7 +195,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
   const onPiece = (s) => pieceOut.some((p) => p.values[s.code] != null);
   const itemFields = specs.filter((s) => (['number', 'option', 'text'].includes(s.data_type) && !machineSpecIds.has(s.id)) || onPiece(s)).map((s) => {
     const withIt = pieceOut.filter((p) => p.values[s.code] != null);
-    return { ...fieldOf(s), example: withIt[0] && s.data_type !== 'table' ? withIt[0].values[s.code] : null, exampleFrom: withIt[0]?.code ?? null, count: withIt.length };
+    return { ...fieldOf(s), ...withOptions(s), example: withIt[0] && s.data_type !== 'table' ? withIt[0].values[s.code] : null, exampleFrom: withIt[0]?.code ?? null, count: withIt.length };
   }).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 
   return {
@@ -193,6 +204,7 @@ export async function builderContext(db, companyId, operationId, q = {}) {
     machines: machinesOut,
     machineFields,
     itemFields,
+    levels,
     samplePieces: pieceOut,
   };
 }
@@ -240,5 +252,20 @@ export async function checkForBuilder(db, companyId, body = {}) {
     // (timeEstimateService valuesOfChain(…, false): the type's value, else the nearest above).
     readers.machine = valueReaders(await typeValueMap(db, companyId, Number(body.machineTypeId)));
   }
-  return checkFormula(db, companyId, body.expression, body.sample ?? null, readers);
+  // A tree level chosen in the preview ("what if this were a Diaphragm") comes as the node's id.
+  const sample = body.sample && typeof body.sample === 'object' ? body.sample : null;
+  const picked = new Map();
+  for (const [k, v] of Object.entries(sample ?? {})) {
+    const m = /^item\.(family|subfamily|variant)$/i.exec(k);
+    if (m && v !== '' && v != null && Number.isInteger(Number(v))) picked.set(m[1].toUpperCase(), Number(v));
+  }
+  if (picked.size) {
+    const [nodes] = await db.query("SELECT id, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL AND scope <> 'machine' AND id IN (?)", [companyId, [...picked.values()]]);
+    const byId = new Map(nodes.map((n) => [Number(n.id), { id: Number(n.id), code: n.code, name: n.name }]));
+    const typedLevels = {};
+    for (const [lv, id] of picked) if (byId.has(id)) typedLevels[lv] = byId.get(id);
+    const real = readers.item?.level;
+    readers.item = { ...(readers.item ?? valueReaders(new Map())), level: (name) => typedLevels[name] ?? real?.(name) ?? null, typedLevels };
+  }
+  return checkFormula(db, companyId, body.expression, sample, readers);
 }

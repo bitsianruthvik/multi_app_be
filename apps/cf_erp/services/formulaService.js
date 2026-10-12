@@ -117,9 +117,14 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     // people try "what if this plate were 20 mm"); otherwise the real value.
     const typedOf = (role, code, kind) => (kind === 'number' ? num(`${role}.${code}`) : tableAt(`${role}.${code}`));
     const side = (role, kind) => (code) => typedOf(role, code, kind) ?? readers?.[role]?.[kind]?.(code) ?? null;
+    // A pick-list or text value tried in the preview is a WORD ("what if the grade were E410"), never a number.
+    const typedWord = (role, code) => {
+      const v = given[`${role}.${code}`];
+      return ['option', 'text'].includes(known.get(code)?.dataType) && v != null && typeof v !== 'object' && String(v).trim() !== '' ? String(v).trim() : null;
+    };
     const context = parsed.usesContext ? {
-      item: (code) => side('item', 'number')(code) ?? readers?.item?.text?.(code) ?? null,
-      machine: (code) => side('machine', 'number')(code) ?? readers?.machine?.text?.(code) ?? null,
+      item: (code) => typedWord('item', code) ?? side('item', 'number')(code) ?? readers?.item?.text?.(code) ?? null,
+      machine: (code) => typedWord('machine', code) ?? side('machine', 'number')(code) ?? readers?.machine?.text?.(code) ?? null,
       itemLevel: (name) => readers?.item?.level?.(name) ?? null,
       itemTable: side('item', 'table'), machineTable: side('machine', 'table'),
     } : null;
@@ -127,7 +132,7 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     if (readers && context) {
       // What each name read, and from where — the time builder shows it beside the result.
       const from = (role, code, kind) => {
-        if (typedOf(role, code, kind) != null) return 'typed';
+        if (typedOf(role, code, kind) != null || (kind === 'number' && typedWord(role, code) != null)) return 'typed';
         const found = readers?.[role]?.[kind]?.(code) ?? (kind === 'number' ? readers?.[role]?.text?.(code) : null);
         return found != null ? (role === 'item' ? 'piece' : 'machine') : null;
       };
@@ -135,7 +140,7 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
         ...parsed.itemRefs.map((code) => ({ ref: `item.${code}`, value: context.item(code), from: from('item', code, 'number') })),
         ...parsed.machineRefs.map((code) => ({ ref: `machine.${code}`, value: context.machine(code), from: from('machine', code, 'number') })),
         // The piece's place in the tree (item.family / subfamily / variant): its node's name.
-        ...(parsed.levelRefs ?? []).map((lv) => { const node = context.itemLevel?.(lv); return { ref: `item.${lv}`, value: node?.name ?? null, from: node ? 'piece' : null }; }),
+        ...(parsed.levelRefs ?? []).map((lv) => { const node = context.itemLevel?.(lv); return { ref: `item.${lv}`, value: node?.name ?? null, from: node ? (readers?.item?.typedLevels?.[lv] ? 'typed' : 'piece') : null }; }),
         ...lookupRefs.filter((r) => r.role !== 'plain').map((r) => {
           const t = r.role === 'item' ? context.itemTable(r.code) : context.machineTable(r.code);
           return { ref: `${r.role}.${r.code}`, value: null, chart: t ? tableSummary(known.get(r.code)?.tableConfig ?? null, t) : null, from: from(r.role, r.code, 'table') };

@@ -93,7 +93,20 @@ try {
   log.length = 0;
   const ctx = await builderContext(db, COMPANY, opCut, { subjectType: 'classification', subjectId: tCut });
   const reads = log.length;
-  ok(`a fixed number of reads (${reads})`, reads <= 10, String(reads));
+  // 12 since the preview's dropdowns: pick-list options and the pieces' tree, both in the first parallel batch.
+  ok(`a fixed number of reads (${reads})`, reads <= 12, String(reads));
+  ok('the pieces\' tree comes by level, for item.variant', Array.isArray(ctx.levels?.VARIANT) && ctx.levels.VARIANT.every((n) => n.id && n.name), JSON.stringify(Object.keys(ctx.levels ?? {})));
+  ok('a pick-list field comes with its options', ctx.itemFields.filter((f) => f.dataType === 'option').every((f) => Array.isArray(f.options)));
+  {
+    const v = ctx.levels.VARIANT[0];
+    const r = await checkForBuilder(db, COMPANY, { expression: 'IF(item.variant = "no such variant", 1, 2)', sample: { 'item.variant': v.id } });
+    ok('a variant chosen in the preview is read by its name', r.result?.value === 2 && r.inputs?.some((i) => i.ref === 'item.VARIANT' && i.value === v.name && i.from === 'typed'), JSON.stringify([r.result, r.inputs]));
+    const opt = ctx.itemFields.find((f) => f.dataType === 'option' && f.options?.length);
+    if (opt) {
+      const w = await checkForBuilder(db, COMPANY, { expression: `IF(item.${opt.code} = "${opt.options[0].value}", 5, 9)`, machineTypeId: tCut, sample: { [`item.${opt.code}`]: opt.options[0].value } });
+      ok('a pick-list value chosen in the preview is a word', w.result?.value === 5 && w.inputs?.some((i) => i.from === 'typed'), JSON.stringify([w.result, w.inputs]));
+    }
+  }
   ok('no subquery inside a JOIN ... ON', !log.some((q) => /\bON\b[^()]*\(\s*SELECT/i.test(q)));
   ok('the machines under the type, and only them', ctx.machines.map((m) => m.id).sort().join() === [m1, m2].sort().join(), JSON.stringify(ctx.machines.map((m) => m.code)));
   const P1 = ctx.machines.find((m) => m.id === m1);
