@@ -7,7 +7,7 @@
  */
 import { pool } from '../../db.js';
 import { expandCharts, contractCharts } from '../../apps/cf_erp/lib/chartFormula.js';
-import { createChart, updateChart, deleteChart, relayRows, listCharts, machineTypeDetails, chartBindings } from '../../apps/cf_erp/services/chartService.js';
+import { createChart, updateChart, deleteChart, relayRows, listCharts, machineTypeDetails, chartBindings, setChartValue } from '../../apps/cf_erp/services/chartService.js';
 import { setValues } from '../../apps/cf_erp/services/valueService.js';
 import { createTimingRule, listTimingRules, timingPreview } from '../../apps/cf_erp/services/operationService.js';
 import { neededCodesOfFlows } from '../../apps/cf_erp/services/flowSpecService.js';
@@ -89,6 +89,16 @@ try {
   await setValues(db, c, 'machine', mc.id, [{ specificationId: made.chartId, value: null }]);
   onMachine = (await listCharts(db, COMPANY, { type: 'machine', id: mc.id })).find((x) => x.specId === made.chartId);
   ok('…and back to the type\'s when its own is taken away', !onMachine.own && onMachine.rows[0][1] === 650);
+
+  // Clear chart on the machine TYPE: its rows go, and the chart stays (2026-10-12).
+  {
+    const before = (await listCharts(db, COMPANY, { type: 'classification', id: typeId })).find((x) => x.specId === dupe.chartId ?? dupe.specId);
+    const id = before?.specId ?? dupe.chartId;
+    await setChartValue(db, c, { type: 'classification', id: typeId }, id, [[6, 100], [12, 80]]);
+    const filled = (await listCharts(db, COMPANY, { type: 'classification', id: typeId })).find((x) => x.specId === id);
+    const after = (await setChartValue(db, c, { type: 'classification', id: typeId }, id, null)).find((x) => x.specId === id);
+    ok('Clear chart on the type empties its rows and keeps the chart', filled?.rows?.length === 2 && after && !after.rows?.length, JSON.stringify([filled?.rows, after?.rows]));
+  }
 
   // Editing the chart itself.
   const ed = await updateChart(db, c, made.chartId, { resultUnit: 'm/min', mode: 'linear' });
