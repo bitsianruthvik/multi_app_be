@@ -422,7 +422,7 @@ async function assertOnePrimary(db, companyId, employeeId, effectiveFrom, effect
  * assignment first) passes untouched. The position row is locked first, so two
  * requests seating two people in the same chair cannot both get through.
  */
-async function assertPositionFree(db, companyId, positionId, { from, to, excludeId = null, excludeIds = [] }) {
+export async function assertPositionFree(db, companyId, positionId, { from, to, excludeId = null, excludeIds = [] }) {
   if (positionId == null) return;
   await db.query('SELECT id FROM hrms_positions WHERE company_id = ? AND id = ? FOR UPDATE', [companyId, positionId]);
   const params = [companyId, positionId, to ?? '9999-12-31', from ?? '0001-01-01'];

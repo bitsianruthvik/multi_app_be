@@ -3214,3 +3214,40 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policy_assignments (
   CONSTRAINT fk_hlpa_role     FOREIGN KEY (company_id, role_id)     REFERENCES hrms_roles(company_id, id),
   CONSTRAINT fk_hlpa_creator  FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 14. DEPARTMENT LABELS (CF_HRMS_HIRING_SPEC.md §9, 2026-10-12)            ##
+-- ############################################################################
+-- Everything is a department. A department carries a LABEL
+-- (hrms_departments.department_type, text, still never branched on) and a
+-- separate fact, is_shared. The label is chosen from the company's own short
+-- list, which is this table. A new company starts with Department, Section,
+-- Machine; they are written the first time the list is read
+-- (services/departmentLabelService.js), so a company never has an empty list.
+--
+-- The department keeps the label's NAME, not its id: renaming a label renames it
+-- on every department that uses it, in the same transaction, and every read that
+-- already prints department_type goes on working untouched.
+--
+-- Unique name per company, without case, among live rows (name_active).
+CREATE TABLE IF NOT EXISTS hrms_department_labels (
+  id           INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  name         VARCHAR(40)  NOT NULL,
+  sort_order   INT          NOT NULL DEFAULT 0,
+
+  deleted_at   DATETIME     DEFAULT NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT          NULL,
+
+  name_active  VARCHAR(40)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hdlb_tenant (company_id, id),
+  UNIQUE KEY uq_hdlb_name   (company_id, name_active),
+  KEY idx_hdlb_order (company_id, sort_order),
+
+  CONSTRAINT fk_hdlb_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hdlb_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

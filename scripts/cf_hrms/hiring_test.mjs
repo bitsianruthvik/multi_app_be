@@ -1180,20 +1180,20 @@ section('[8] Permissions and the two Code formats screens, over HTTP');
       const missing = await call(admin, 'POST', `${api}/positions/999999999/hiring`, {});
       ok(missing.status === 404 && missing.json.code === 'NOT_FOUND' && typeof missing.json.message === 'string', 'an error is { code, message }', JSON.stringify(missing.json));
 
-      // Code formats, cf_hrms side: its two entity types and nothing else.
+      // Code formats, cf_hrms side: its six entity types and nothing else (four more since spec §11, 2026-10-12).
       const entities = await call(admin, 'GET', `${api}/codegen/entities`);
-      ok(entities.status === 200 && JSON.stringify(entities.json.map((e) => e.entityType).sort()) === JSON.stringify(['hrms_employee', 'hrms_hiring']),
-        'cf_hrms Code formats offers exactly hrms_employee and hrms_hiring', JSON.stringify(entities.json.map?.((e) => e.entityType)));
+      ok(entities.status === 200 && JSON.stringify(entities.json.map((e) => e.entityType)) === JSON.stringify(['hrms_department', 'hrms_role', 'hrms_position', 'hrms_location', 'hrms_employee', 'hrms_hiring']),
+        'cf_hrms Code formats offers exactly its six: departments, roles, positions, locations, employees, letters', JSON.stringify(entities.json.map?.((e) => e.entityType)));
       const emp = entities.json.find((e) => e.entityType === 'hrms_employee');
       const ref = entities.json.find((e) => e.entityType === 'hrms_hiring');
-      ok(emp.label === 'Employee codes' && JSON.stringify(emp.tokens.map((t) => t.key)) === JSON.stringify(['department.code', 'department.name', 'location.code', 'location.name', 'role.code',
+      ok(emp.label === 'Employees' && JSON.stringify(emp.tokens.map((t) => t.key)) === JSON.stringify(['department.code', 'department.name', 'location.code', 'location.name', 'role.code',
         'shift.code', 'joining.yy', 'joining.yyyy', 'joining.mm', 'joining.fy', 'employment.type'])
         && JSON.stringify(emp.conditionTokens.map((t) => `${t.key}:${t.operators.join('/')}`)) === JSON.stringify(['department:under/eq/in', 'location:eq/in', 'employment.type:eq/in'])
         && emp.tokens.every((t) => t.label && t.phrase && t.help && t.example), 'hrms_employee: the 11 tokens and 3 condition tokens of the spec, each with label, phrase, help, example');
-      ok(ref.label === 'Letter reference numbers' && JSON.stringify(ref.tokens.map((t) => t.key)) === JSON.stringify(['fy', 'yy', 'yyyy', 'mm', 'department.code', 'location.code'])
+      ok(ref.label === 'Letters (reference numbers)' && JSON.stringify(ref.tokens.map((t) => t.key)) === JSON.stringify(['fy', 'yy', 'yyyy', 'mm', 'department.code', 'location.code'])
         && ref.conditionTokens.length === 0 && ref.tokens.every((t) => t.label && t.phrase && t.help && t.example), 'hrms_hiring: its 6 tokens and no conditions');
       const schemes = await call(admin, 'GET', `${api}/codegen/schemes`);
-      ok(schemes.status === 200 && schemes.json.every((s) => s.entityType.startsWith('hrms_')) && (!IS_KARNI || schemes.json.length === 2), 'GET /codegen/schemes lists its own rules only', `${schemes.json.length}`);
+      ok(schemes.status === 200 && schemes.json.every((s) => s.entityType.startsWith('hrms_')) && (!IS_KARNI || schemes.json.length === 6), 'GET /codegen/schemes lists its own rules only', `${schemes.json.length}`);
       ok((await call(admin, 'GET', `${api}/codegen/schemes?entityType=item`)).status === 422
         && (await call(admin, 'POST', `${api}/codegen/preview`, { entityType: 'item', draft: {} })).status === 422
         && (await call(admin, 'POST', `${api}/codegen/explain`, { entityType: 'sales_order' })).status === 422

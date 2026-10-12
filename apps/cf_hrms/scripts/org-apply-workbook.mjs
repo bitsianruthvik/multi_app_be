@@ -999,7 +999,8 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
       const i = pending.findIndex((d) => !d.parentRef || !d.parentRef.startsWith('new:') || placed.has(d.parentRef));
       if (i < 0) throw new Error('The new departments sit under each other in a circle.');
       const [d] = pending.splice(i, 1);
-      const row = await orgSvc.createDepartment(conn, c, { name: d.name, type: d.type || null, isShared: d.shared, parentId: d.parentRef ? dept.get(d.parentRef) : null });
+      // A label typed in the workbook that the company's list lacks is added to the list (spec §9).
+      const row = await orgSvc.createDepartment(conn, c, { name: d.name, type: d.type || null, isShared: d.shared, parentId: d.parentRef ? dept.get(d.parentRef) : null }, { addMissingLabel: true });
       dept.set(d.ref, row.id);
       placed.add(d.ref);
       created[`departments:${d.row}`] = `dep:${row.id}`;
@@ -1011,7 +1012,7 @@ export async function executePlan({ conn, plan, loaded, env, requestId }) {
       if (u.set.type) body.type = u.set.type.to || null;
       if (u.set.shared) body.isShared = u.set.shared.to;
       if (u.set.parent) body.parentId = null;     // detach first: two departments that swap places never trip the cycle check
-      if (Object.keys(body).length) await orgSvc.updateDepartment(conn, c, u.id, body);
+      if (Object.keys(body).length) await orgSvc.updateDepartment(conn, c, u.id, body, { addMissingLabel: true });
     }
     const toAttach = plan.departments.update.filter((u) => u.set.parent && u.set.parent.to);
     const waiting = new Set(toAttach.map((u) => u.key));

@@ -21,7 +21,7 @@
  *   GET    /roles                              list + readiness (no purpose / no KRAs)
  *   GET    /roles/overview                     the counts the list's StatStrip shows
  *   GET    /roles/departments                  picker source for the role form
- *   POST   /roles                              { roleCode?, title, rolePurpose?, roleSummary?, defaultDepartmentId?, status?, effectiveFrom?, effectiveTo? }
+ *   POST   /roles                              { title, rolePurpose?, roleSummary?, defaultDepartmentId?, status?, effectiveFrom?, effectiveTo? }
  *   GET    /roles/:id
  *   PUT    /roles/:id                          same fields
  *   DELETE /roles/:id                          soft delete; refused while a position or assignment uses it

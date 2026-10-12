@@ -4,14 +4,14 @@
  *   GET    /organisation/lookups                    locations + departments + shifts for pickers
  *
  *   GET    /organisation/departments                pre-ordered tree, depth + child counts; + type, isShared, serves[], and `types` in use
- *   POST   /organisation/departments                { name, code?, parentId?, type?, isShared?, serves?: [departmentId], status? }
+ *   POST   /organisation/departments                { name, parentId?, type? (one of the company's labels), isShared?, serves?: [departmentId], status? }
  *   PUT    /organisation/departments/:id            same fields; parentId moves the branch; serves replaces the list
  *   DELETE /organisation/departments/:id
  *   GET    /organisation/departments/staffing  ?on=  every department's roles and positions (seats, filled, vacant,
  *                                                    who is in each seat) in ONE answer, cut from the org chart's own nodes
  *
  *   GET    /organisation/locations                  + locationType, address
- *   POST   /organisation/locations                  { name, code?, locationType, parentId?, address?, status? }
+ *   POST   /organisation/locations                  { name, locationType, parentId?, address?, status? }
  *   PUT    /organisation/locations/:id
  *   DELETE /organisation/locations/:id
  *
@@ -78,6 +78,7 @@ import {
   listReportingTypes, createReportingType, updateReportingType, deleteReportingType,
 } from '../services/organisationService.js';
 import { departmentStaffing } from '../services/jobContentService.js';
+import { listLabels, createLabel, updateLabel, reorderLabels, deleteLabel } from '../services/departmentLabelService.js';
 
 const router = Router();
 
@@ -100,6 +101,23 @@ router.get('/organisation/departments/staffing', guard(PERM.orgView), handle((re
 router.post('/organisation/departments', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createDepartment(db, c, req.body))));
 router.put('/organisation/departments/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updateDepartment(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/departments/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deleteDepartment(db, c, intParam(req.params.id)))));
+
+// ----- department labels (spec §9) -------------------------------------------
+// The company's own short list: Department, Section, Machine to begin with. A
+// department's label (`type`) must be one of these. A rename also renames it on
+// every department that uses it; a delete in use is 409 IN_USE with
+// detail.departmentCount unless ?moveTo=<labelId> says where its departments go.
+//   GET    /organisation/department-labels            { labels: [{ id, name, sortOrder, departmentCount }] }
+//   POST   /organisation/department-labels            { name }               -> the label (also under `label`)
+//   PUT    /organisation/department-labels/order      { ids: number[] }      -> { labels }
+//   PUT    /organisation/department-labels/:id        { name?, sortOrder? }  -> the label (also under `label`)
+//   DELETE /organisation/department-labels/:id        ?moveTo=<labelId>      -> { ok, id, departmentsMoved }
+router.get('/organisation/department-labels', guard(PERM.orgView), handle((req) => listLabels(pool, ctx(req).companyId)));
+router.post('/organisation/department-labels', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createLabel(db, c, req.body ?? {}))));
+// Before /:id, or "order" would be read as an id.
+router.put('/organisation/department-labels/order', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => reorderLabels(db, c, req.body ?? {}))));
+router.put('/organisation/department-labels/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updateLabel(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/organisation/department-labels/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deleteLabel(db, c, intParam(req.params.id), { moveTo: req.query.moveTo ?? null }))));
 
 // ----- locations ------------------------------------------------------------
 router.get('/organisation/locations', guard(PERM.orgView), handle((req) => listLocations(pool, ctx(req).companyId)));

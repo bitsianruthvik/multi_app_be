@@ -37,6 +37,8 @@
  */
 import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadAssignmentIndex } from './leavePolicyRead.js';
+import { issueRoleCode, acceptImportedCode } from './codeService.js';
+import { ROLE_ENTITY } from './codegenProvider.js';
 
 // ---------------------------------------------------------------------------
 // Vocabularies. These mirror models/init.sql; routes/index.js /meta serves the
@@ -525,7 +527,8 @@ export async function requireRole(db, companyId, id) {
 
 function roleFields(input, problems, { creating }) {
   const out = {};
-  if (creating || input.roleCode !== undefined) out.role_code = str(input.roleCode, 50, problems, 'Role code');
+  // No code here: a role's code is issued when it is created (codeService) and never
+  // changes. `input.roleCode` is not read, on create or on update.
   if (creating || input.title !== undefined) out.title = str(input.title, 200, problems, 'Title', { required: true });
   if (creating || input.rolePurpose !== undefined) out.role_purpose = str(input.rolePurpose, 4000, problems, 'Purpose');
   if (creating || input.roleSummary !== undefined) out.role_summary = str(input.roleSummary, 4000, problems, 'Summary');
@@ -568,12 +571,18 @@ async function assertDepartment(db, companyId, departmentId) {
   if (!dept) throw invalid('BAD_REFERENCE', 'That department does not exist in this company.');
 }
 
-export async function createRole(db, c, input = {}) {
+/**
+ * `options.importedCode` — a code the role ALREADY HOLDS elsewhere. Only the
+ * retired workbook and import scripts pass it; no route does.
+ */
+export async function createRole(db, c, input = {}, options = {}) {
   const problems = [];
   const fields = roleFields(input ?? {}, problems, { creating: true });
   assertNoProblems(problems);
   await assertTitleFree(db, c.companyId, fields.title);
   await assertDepartment(db, c.companyId, fields.default_department_id);
+  fields.role_code = (await acceptImportedCode(db, c.companyId, ROLE_ENTITY, options.importedCode))
+    ?? await issueRoleCode(db, c.companyId, { title: fields.title, defaultDepartmentId: fields.default_department_id, userId: c.userId });
 
   const cols = Object.keys(fields);
   const [r] = await db.query(

@@ -178,11 +178,11 @@ else {
   const tag = `ZZT${Date.now().toString(36)}`;
   try {
     await conn.beginTransaction();
-    const a = await createDepartment(conn, c, { name: `${tag} A`, type: 'Machine / area' });
-    const b = await createDepartment(conn, c, { name: `${tag} B`, type: '  Line  ' });
-    ok(a.type === 'Machine / area' && a.isShared === false && a.serves.length === 0, 'create: type is stored, not shared by default');
-    ok(b.type === 'Line', 'create: the label is trimmed', JSON.stringify(b.type));
-    const s = await createDepartment(conn, c, { name: `${tag} Shared`, type: 'Shared crew', isShared: true, serves: [a.id, b.id] });
+    const a = await createDepartment(conn, c, { name: `${tag} A`, type: 'Machine' });
+    const b = await createDepartment(conn, c, { name: `${tag} B`, type: '  section  ' });
+    ok(a.type === 'Machine' && a.isShared === false && a.serves.length === 0, 'create: type is stored, not shared by default');
+    ok(b.type === 'Section', 'create: the label is trimmed and spelled as the company’s list spells it', JSON.stringify(b.type));
+    const s = await createDepartment(conn, c, { name: `${tag} Shared`, type: 'Section', isShared: true, serves: [a.id, b.id] });
     ok(s.isShared === true && s.serves.slice().sort().join() === [a.id, b.id].sort().join(), 'create: a shared department with what it serves');
 
     const e1 = await refused(() => createDepartment(conn, c, { name: `${tag} bad`, serves: [a.id] }));
@@ -192,7 +192,7 @@ else {
     const e3 = await refused(() => updateDepartment(conn, c, s.id, { serves: [987654321] }));
     ok(e3 && /not exist/i.test(JSON.stringify(e3.problems ?? e3.message)), 'refused: serving a department that does not exist');
     const e4 = await refused(() => createDepartment(conn, c, { name: `${tag} long`, type: 'x'.repeat(41) }));
-    ok(e4 && /40/.test(JSON.stringify(e4.problems ?? e4.message)), 'refused: a label over 40 characters');
+    ok(e4 && e4.status === 422 && /not one of/.test(JSON.stringify(e4.problems ?? e4.message)), 'refused: a label that is not in the company’s list');
     const e5 = await refused(() => createDepartment(conn, c, { name: `${tag} maybe`, isShared: 'perhaps' }));
     ok(!!e5, 'refused: isShared that is not yes or no');
     const [[other]] = await conn.query('SELECT d.id FROM hrms_departments d WHERE d.company_id <> ? AND d.deleted_at IS NULL LIMIT 1', [companyId]);
@@ -216,7 +216,7 @@ else {
     ok(gone.ok === true, 'delete: allowed once nothing serves it');
 
     const list = await listDepartments(conn, companyId);
-    ok(Array.isArray(list.types) && list.types.includes('Line'), 'list: the labels in use are offered back');
+    ok(Array.isArray(list.types) && ['Department', 'Section', 'Machine'].every((t) => list.types.includes(t)), 'list: the company’s labels are offered');
     ok(list.rows.every((r) => 'type' in r && typeof r.isShared === 'boolean' && Array.isArray(r.serves)), 'list: every row carries type, isShared and serves');
     const look = await lookups(conn, companyId);
     ok(look.departments.every((d) => 'parentId' in d && 'type' in d && 'isShared' in d), 'lookups: departments carry parentId, type, isShared');

@@ -6,6 +6,8 @@ import { openHiringsByPosition, COMING_OR_LIVE_SQL, splitComing, dayText } from 
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
+import { issuePositionCode, acceptImportedCode } from './codeService.js';
+import { POSITION_ENTITY, cardCodeOf } from './codegenProvider.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -437,7 +439,8 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
     if (roleId != null) await exists(db, companyId, 'hrms_roles', roleId, 'role', problems);
     if (roleId != null) out.role_id = roleId;
   }
-  if (!partial || has('positionCode')) out.position_code = readText(body.positionCode, 'Position code', 50, problems);
+  // No code here: a position's code is issued when it is created (codeService) and
+  // never changes. `body.positionCode` is not read, on create or on update.
   if (!partial || has('positionTitle')) out.position_title = readText(body.positionTitle, 'Position title', 200, problems);
 
   for (const [key, col, table, label] of [
@@ -476,9 +479,17 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
   return out;
 }
 
-export async function createPosition(db, { companyId, userId }, body) {
+/**
+ * `options.importedCode` — a code the position ALREADY HOLDS elsewhere. Only
+ * the retired workbook and import scripts pass it; no route does.
+ */
+export async function createPosition(db, { companyId, userId }, body, options = {}) {
   const data = await readPositionBody(db, companyId, body);
-  const cols = { company_id: companyId, created_by: userId, ...data };
+  const positionCode = (await acceptImportedCode(db, companyId, POSITION_ENTITY, options.importedCode))
+    ?? await issuePositionCode(db, companyId, {
+      roleId: data.role_id, departmentId: data.department_id, locationId: data.location_id, shiftId: data.default_shift_id, userId,
+    });
+  const cols = { company_id: companyId, created_by: userId, position_code: positionCode, ...data };
   const keys = Object.keys(cols);
   const [res] = await db.query(
     `INSERT INTO hrms_positions (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
@@ -516,9 +527,6 @@ export async function updatePosition(db, { companyId }, id, body) {
   return { ...(await getPosition(db, companyId, id)), occupantsMovedToShift: occupantsMoved };
 }
 
-/** `P021-3` -> `P021`; a code with no `-<digits>` tail is its own base. */
-const siblingBase = (code) => String(code).replace(/-\d+$/, '');
-
 /**
  * POST /positions/:id/add-sibling — one more position like this one: a new,
  * VACANT chair in the same card.
@@ -532,8 +540,11 @@ const siblingBase = (code) => String(code).replace(/-\d+$/, '');
  *     in-charge without anyone drawing a line;
  *   - NO position-level content: a change made "for this position only" was
  *     made for that position. The new one starts from the role;
- *   - code = the source's code without a trailing `-<digits>`, plus `-<n>` with
- *     the lowest n >= 2 that is free. The source keeps its code.
+ *   - code = the next code of the company's rule for positions, like any other
+ *     new position (codeService). The rule is offered `card.code` — the code of
+ *     this card's first position without a trailing `-<digits>` — so a company
+ *     that numbers its chairs P021-1, P021-2 can go on doing so with a rule of
+ *     `{card.code}-{#}`. The source keeps its code.
  *
  * The same role, department and manager card put it in the source's card by
  * construction (services/positionCards.js). Returns what create returns.
@@ -552,20 +563,14 @@ export async function addSiblingPosition(db, c, id, body = {}) {
   assertNoProblems(problems);
   const shiftId = givenShiftId ?? source.default_shift_id ?? await generalShiftId(db, companyId);
 
-  // The code. Only live positions hold a code (uq_hpos_code keys off deleted_at).
-  let code = null;
-  if (!blank(source.position_code)) {
-    const base = siblingBase(source.position_code);
-    const [taken] = await db.query(
-      'SELECT position_code FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND LOWER(position_code) LIKE ?',
-      [companyId, `${base.toLowerCase().replace(/[\\%_]/g, (m) => `\\${m}`)}-%`],
-    );
-    const used = new Set(taken.map((r) => String(r.position_code).toLowerCase()));
-    let n = 2;
-    while (used.has(`${base}-${n}`.toLowerCase())) n += 1;
-    code = `${base}-${n}`;
-    if (code.length > 50) throw invalid('INVALID', `The next code would be ${code}, which is longer than 50 characters. Shorten ${source.position_code} first.`);
-  }
+  // The code, through the generator. The card is read once, here, and used again for the reporting lines below.
+  const on = today();
+  const cards = await loadCards(db, companyId, on);
+  const cardHead = cards.positions.get(cards.cardOf.get(id));
+  const code = await issuePositionCode(db, companyId, {
+    roleId: source.role_id, departmentId: source.department_id, locationId: source.location_id, shiftId,
+    cardCode: cardCodeOf(cardHead?.code ?? source.position_code), userId,
+  });
 
   const [res] = await db.query(
     `INSERT INTO hrms_positions (company_id, position_code, role_id, position_title, department_id, location_id,
@@ -577,7 +582,6 @@ export async function addSiblingPosition(db, c, id, body = {}) {
   const newId = res.insertId;
 
   // Its reporting lines: the source's, on the new chair's shift where the manager card has that shift.
-  const on = today();
   const [lines] = await db.query(
     `SELECT * FROM hrms_position_reporting_relationships
       WHERE company_id = ? AND from_position_id = ? AND deleted_at IS NULL AND (effective_to IS NULL OR effective_to >= ?)
@@ -586,7 +590,6 @@ export async function addSiblingPosition(db, c, id, body = {}) {
   );
   const reportsTo = [];
   if (lines.length) {
-    const cards = await loadCards(db, companyId, on);
     const shiftOf = (positionId) => cards.positions.get(positionId)?.shiftId ?? null;
     const rows = lines.map((e) => {
       const managerCard = cards.members.get(cards.cardOf.get(e.to_position_id)) ?? [];

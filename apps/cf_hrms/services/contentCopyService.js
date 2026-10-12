@@ -60,6 +60,7 @@ import {
 } from './roleContentService.js';
 import { resolveContent } from './contentResolver.js';
 import { today as localToday } from './positionService.js';
+import { issueRoleCode } from './codeService.js';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Vocabulary
@@ -1240,8 +1241,9 @@ export async function executeCopy(db, c, body) {
       const [ins] = await db.query(
         `INSERT INTO hrms_roles (company_id, role_code, title, role_purpose, role_summary, default_department_id, status,
                                  effective_from, effective_to, created_by)
-         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [c.companyId, u.fork.newRoleTitle, old.role_purpose, old.role_summary, old.default_department_id, old.status,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        // A role made here is a role like any other: its code comes from the company's rule.
+        [c.companyId, await issueRoleCode(db, c.companyId, { title: u.fork.newRoleTitle, defaultDepartmentId: old.default_department_id, userId: c.userId }), u.fork.newRoleTitle, old.role_purpose, old.role_summary, old.default_department_id, old.status,
           old.effective_from, old.effective_to, c.userId],
       );
       const newRoleId = ins.insertId;

@@ -229,7 +229,7 @@ try {
   const [[dottedType]] = await db.query("SELECT id FROM hrms_reporting_relationship_types WHERE company_id = ? AND code = 'DOTTED_LINE' AND deleted_at IS NULL", [COMPANY]);
   if (!G || !D || !N || !primaryType) throw new Error('This company needs General, Day and Night shifts and a PRIMARY_MANAGER type for the write sections.');
 
-  const dept = await createDepartment(db, c, { name: `${TAG} Dept`, type: 'Test' });
+  const dept = await createDepartment(db, c, { name: `${TAG} Dept`, type: 'Section' });
   const role = async (name) => (await RC.createRole(db, c, { title: `${TAG} ${name}`, status: 'ACTIVE' })).id;
   const [roleTop, roleMgr, roleCrew, roleLeaf] = [await role('Head'), await role('Incharge'), await role('Operator'), await role('Helper')];
   const mkPos = async (code, roleId, title, shiftId, extra = {}) => (await POS.createPosition(db, c, {
@@ -268,7 +268,8 @@ try {
   const mgr2 = (await POS.addSiblingPosition(db, c, mgr1.id, { shiftId: N.id })).position;
   const src = await row(mgr1.id);
   const sib = await row(mgr2.id);
-  ok(mgr2.positionCode === `${TAG}-MGR-2` && (await row(mgr1.id)).position_code === `${TAG}-MGR`, 'code: source keeps its code, the new one is <code>-2', mgr2.positionCode);
+  ok(Boolean(mgr2.positionCode) && mgr2.positionCode !== mgr1.positionCode && (await row(mgr1.id)).position_code === mgr1.positionCode && mgr1.positionCode !== `${TAG}-MGR`,
+    'code: the source keeps its code (issued, not the one typed), the new one gets the next code of the company’s rule', `${mgr1.positionCode} ${mgr2.positionCode}`);
   ok(sib.role_id === src.role_id && sib.position_title === src.position_title && sib.department_id === src.department_id
     && sib.location_id === src.location_id && sib.status === src.status && Number(sib.sanctioned_headcount) === 1,
   'same role, title, department, location and status; one seat');
@@ -287,7 +288,7 @@ try {
   if (dottedType) await reportTo(w1.id, top.id, dottedType.id);
   const w2 = (await POS.addSiblingPosition(db, c, w1.id, { shiftId: D.id })).position;
   const w3 = (await POS.addSiblingPosition(db, c, w2.id, {})).position;
-  ok(w2.positionCode === `${TAG}-W-2` && w3.positionCode === `${TAG}-W-3`, 'codes: a sibling of <code>-2 strips the tail and takes the lowest free number (-3)', `${w2.positionCode} ${w3.positionCode}`);
+  ok(new Set([w1.positionCode, w2.positionCode, w3.positionCode]).size === 3 && [w2, w3].every((p) => Boolean(p.positionCode)), 'codes: every sibling gets a code of its own from the generator', `${w1.positionCode} ${w2.positionCode} ${w3.positionCode}`);
   ok(w3.defaultShiftId === D.id, 'no shiftId = the source\'s shift');
   ok((await managerOf(w2.id)) === mgr1.id, 'same-shift rule: a DAY chair added beside a night one reports to the manager card\'s DAY chair');
   ok((await managerOf(w3.id)) === mgr1.id && (await managerOf(w1.id)) === mgr2.id, 'the source\'s own line is untouched; a second day chair also lands under the day in-charge');
@@ -296,7 +297,7 @@ try {
   } else skip('dotted line copied', 'this company has no DOTTED_LINE type');
   await POS.deletePosition(db, c, w3.id, {});
   const w3b = (await POS.addSiblingPosition(db, c, w1.id, {})).position;
-  ok(w3b.positionCode === `${TAG}-W-3`, 'a deleted position frees its code: the next sibling is -3 again', w3b.positionCode);
+  ok(Boolean(w3b.positionCode) && w3b.positionCode !== w3.positionCode, 'a deleted position’s code is never issued again: the next sibling gets a new one', `${w3.positionCode} ${w3b.positionCode}`);
   await POS.updatePosition(db, c, w3b.id, { defaultShiftId: D.id });
   const closedSrc = await mkPos('CL', roleLeaf, 'Closed one', G.id, { status: 'CLOSED' });
   const closedErr = await caught(() => POS.addSiblingPosition(db, c, closedSrc.id, {}));

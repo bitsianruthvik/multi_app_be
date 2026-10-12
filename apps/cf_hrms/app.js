@@ -5,7 +5,9 @@ import indexRoutes from './routes/index.js';
 import codegenModule from '../cf_erp/modules/codegen/index.js';
 import { PERM } from './lib/http.js';
 // Side effect: registers employee codes and letter references with the code generator.
-import { EMPLOYEE_ENTITY, HIRING_ENTITY } from './services/codegenProvider.js';
+import {
+  EMPLOYEE_ENTITY, HIRING_ENTITY, DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY,
+} from './services/codegenProvider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,10 +48,10 @@ export default {
   register(server) {
     server.use('/api/:companySlug/cf_hrms', indexRoutes);
     // Code formats: the generator's own routes (/codegen/…), limited to this
-    // app's two entity types — cf_erp's item and order rules are not shown here,
-    // and its own mount leaves these two out.
+    // app's six entity types — cf_erp's item and order rules are not shown here,
+    // and its own mount leaves every hrms_ type out.
     server.use('/api/:companySlug/cf_hrms', codegenModule.createRouter({
-      viewPerm: PERM.orgView, managePerm: PERM.orgManage, entityTypes: [EMPLOYEE_ENTITY, HIRING_ENTITY],
+      viewPerm: PERM.orgView, managePerm: PERM.orgManage, entityTypes: [DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY, EMPLOYEE_ENTITY, HIRING_ENTITY],
     }));
   },
 

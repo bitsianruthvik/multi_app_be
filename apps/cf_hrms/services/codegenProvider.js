@@ -19,6 +19,9 @@
  */
 import { registerEntity, listEntities } from '../../cf_erp/modules/codegen/index.js';
 
+// Departments, roles, positions and locations (spec §11). Imported first, so they are listed first.
+export * from './codegenOrgProvider.js';
+
 export const EMPLOYEE_ENTITY = 'hrms_employee';
 export const HIRING_ENTITY = 'hrms_hiring';
 
@@ -205,7 +208,7 @@ const idsExist = async (db, companyId, table, ids) => {
 };
 
 const employeeProvider = {
-  label: 'Employee codes',
+  label: 'Employees',
   tokens: EMPLOYEE_TOKENS,
   tokenPatterns: [],
   conditionTokens: EMPLOYEE_CONDITIONS,
@@ -304,7 +307,7 @@ async function hiringContext(db, companyId, draft = {}) {
 }
 
 const hiringProvider = {
-  label: 'Letter reference numbers',
+  label: 'Letters (reference numbers)',
   tokens: HIRING_TOKENS,
   tokenPatterns: [],
   conditionTokens: [],

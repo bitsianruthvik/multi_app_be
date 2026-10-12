@@ -33,6 +33,9 @@
  * missing (init.sql §9c).
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
+import { ensureLabels, resolveLabel } from './departmentLabelService.js';
+import { issueDepartmentCode, issueLocationCode, acceptImportedCode } from './codeService.js';
+import { DEPARTMENT_ENTITY, LOCATION_ENTITY } from './codegenProvider.js';
 
 import {
   WEEKDAY_NAMES, hhmm, spanMinutes, shapeDay, defaultWeek, weekOf, summaryOf, weeklyHoursOf, mirrorOf, weekdayName,
@@ -425,8 +428,8 @@ export async function listDepartments(db, companyId) {
     [companyId],
   );
   const serves = await servesByDepartment(db, companyId);
-  // The labels already in use, so the form can offer them instead of inventing a list.
-  const types = [...new Set(rows.map((r) => r.department_type).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  // The company's own labels, in its order (departmentLabelService) — what the form offers.
+  const types = (await ensureLabels(db, companyId)).map((l) => l.name);
   return { rows: toPreOrder(rows, 'parent_department_id', (r) => mapDepartment(r, serves.get(r.id) ?? [])), types };
 }
 
@@ -489,19 +492,9 @@ function departmentFields(input, problems, { partial = false } = {}) {
     if (!name || name.length > 200) problems.push('Name is required, up to 200 characters.');
     out.name = name;
   }
-  if (!partial || input.code !== undefined) {
-    const code = nullableStr(input.code);
-    if (code && (!CODE_RE.test(code) || code.length > 50)) {
-      problems.push('Code: up to 50 letters, digits, "_", "-" or "." with no spaces. Leave it blank if you do not use codes.');
-    }
-    out.code = code;
-  }
-  // A label, free text. Trimmed and length-checked; its WORDS are never read.
-  if (input.type !== undefined) {
-    const type = nullableStr(input.type);
-    if (type && type.length > 40) problems.push('Type: up to 40 characters. It is a label for the level — "Department", "Machine / area" — not a description.');
-    out.department_type = type;
-  }
+  // NO CODE HERE. A department's code is issued when it is created
+  // (codeService) and never changes; `input.code` is not read. The label
+  // (`input.type`) is checked against the company's list by the caller.
   if (input.isShared !== undefined) {
     if (![true, false, 0, 1, '0', '1'].includes(input.isShared)) problems.push('Shared must be yes or no.');
     out.is_shared = [true, 1, '1'].includes(input.isShared) ? 1 : 0;
@@ -516,14 +509,23 @@ function servesInput(input, problems) {
   return input.serves;
 }
 
-export async function createDepartment(db, c, input = {}) {
+/**
+ * `options.importedCode` — a code the department ALREADY HOLDS elsewhere. Only
+ * the retired workbook and import scripts pass it; no route does. Everybody
+ * else gets the next code of the company's rule.
+ * `options.addMissingLabel` — theirs too: a label the list lacks is added to it.
+ */
+export async function createDepartment(db, c, input = {}, options = {}) {
   const problems = [];
   const fields = departmentFields(input, problems);
   const parentId = idOrNull(input.parentId, 'Parent department', problems);
   const serves = servesInput(input, problems);
   assertNoProblems(problems);
-  await assertCodeFree(db, 'hrms_departments', c.companyId, fields.code, null, 'Department');
+  // The label must be one of the company's list; a department created with none takes the first.
+  fields.department_type = await resolveLabel(db, c.companyId, input.type, { fallbackToFirst: true, addIfMissing: options.addMissingLabel === true, userId: c.userId });
   await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Department');
+  fields.code = (await acceptImportedCode(db, c.companyId, DEPARTMENT_ENTITY, options.importedCode))
+    ?? await issueDepartmentCode(db, c.companyId, { name: fields.name, type: fields.department_type, parentId, userId: c.userId });
   const id = await insertRow(db, 'hrms_departments', c.companyId, c.userId, {
     ...fields,
     parent_department_id: parentId,
@@ -534,12 +536,14 @@ export async function createDepartment(db, c, input = {}) {
   return getDepartment(db, c.companyId, id);
 }
 
-export async function updateDepartment(db, c, id, input = {}) {
+export async function updateDepartment(db, c, id, input = {}, options = {}) {
   const before = await requireRow(db, 'hrms_departments', c.companyId, id, 'Department');
   const problems = [];
   const fields = departmentFields(input, problems, { partial: true });
   assertNoProblems(problems);
-  if (fields.code !== undefined) await assertCodeFree(db, 'hrms_departments', c.companyId, fields.code, id, 'Department');
+  if (input.type !== undefined) {
+    fields.department_type = await resolveLabel(db, c.companyId, input.type, { fallbackToFirst: options.addMissingLabel === true, addIfMissing: options.addMissingLabel === true, userId: c.userId });
+  }
   if (input.parentId !== undefined) {
     const parentId = idOrNull(input.parentId, 'Parent department', problems);
     assertNoProblems(problems);
@@ -613,13 +617,7 @@ function locationFields(input, problems, { partial = false } = {}) {
     if (!name || name.length > 200) problems.push('Name is required, up to 200 characters.');
     out.name = name;
   }
-  if (!partial || input.code !== undefined) {
-    const code = nullableStr(input.code);
-    if (code && (!CODE_RE.test(code) || code.length > 50)) {
-      problems.push('Code: up to 50 letters, digits, "_", "-" or "." with no spaces. Leave it blank if you do not use codes.');
-    }
-    out.code = code;
-  }
+  // No code here: a location's code is issued when it is created and never changes.
   if (!partial || input.locationType !== undefined) {
     out.location_type = enumOf(input.locationType, LOCATION_TYPES, 'Type', problems, 'PLANT');
   }
@@ -631,13 +629,15 @@ function locationFields(input, problems, { partial = false } = {}) {
   return out;
 }
 
-export async function createLocation(db, c, input = {}) {
+/** `options.importedCode`: as for a department — the retired import scripts only. */
+export async function createLocation(db, c, input = {}, options = {}) {
   const problems = [];
   const fields = locationFields(input, problems);
   const parentId = idOrNull(input.parentId, 'Parent location', problems);
   assertNoProblems(problems);
-  await assertCodeFree(db, 'hrms_locations', c.companyId, fields.code, null, 'Location');
   await assertNoCycle(db, 'hrms_locations', 'parent_location_id', c.companyId, null, parentId, 'Location');
+  fields.code = (await acceptImportedCode(db, c.companyId, LOCATION_ENTITY, options.importedCode))
+    ?? await issueLocationCode(db, c.companyId, { name: fields.name, address: fields.address_json ?? null, userId: c.userId });
   const id = await insertRow(db, 'hrms_locations', c.companyId, c.userId, {
     ...fields,
     parent_location_id: parentId,
@@ -652,7 +652,6 @@ export async function updateLocation(db, c, id, input = {}) {
   const problems = [];
   const fields = locationFields(input, problems, { partial: true });
   assertNoProblems(problems);
-  if (fields.code !== undefined) await assertCodeFree(db, 'hrms_locations', c.companyId, fields.code, id, 'Location');
   if (input.parentId !== undefined) {
     const parentId = idOrNull(input.parentId, 'Parent location', problems);
     assertNoProblems(problems);

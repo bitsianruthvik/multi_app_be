@@ -5,7 +5,7 @@
  *   GET    /positions/options                          every picker a position form needs, in one request
  *   GET    /positions                     ?on=&status=&roleId=&departmentId=&locationId=&search=
  *                                                      rows + sanctioned/filled/vacant totals over the SAME filtered set
- *   POST   /positions                     { roleId*, positionCode?, positionTitle?, departmentId?, locationId?,
+ *   POST   /positions                     { roleId*, positionTitle?, departmentId?, locationId?,
  *                                           defaultShiftId?, status?, effectiveFrom?, effectiveTo? }
  *                                         One position is one chair: sanctionedHeadcount is ignored and stored as 1;
  *                                         defaultShiftId is the position's shift (the company's General shift when absent).
@@ -16,7 +16,7 @@
  *   POST   /positions/:id/add-sibling     { shiftId? }  one more VACANT position in the same card: same role, title,
  *                                         department, location, status; shift = shiftId or the source's; the source's
  *                                         reporting lines (same-shift manager chair where the manager card has one);
- *                                         no position-level content copied; code = base-<n>, lowest free n >= 2.
+ *                                         no position-level content copied; code = the next code of the company's rule (codeService).
  *                                         Returns what POST /positions returns: { asOf, position }.
  *   POST   /positions/:id/status          { status }   DRAFT / ACTIVE / FROZEN / CLOSED  (CLOSED refused with HAS_TEAM when the seat has
  *                                         direct reports: use /close, which moves them up. Same for PUT with status CLOSED.)

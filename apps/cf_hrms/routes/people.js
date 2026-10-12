@@ -54,6 +54,7 @@ import {
   setPhoto, readPhoto, deletePhoto,
   pickers,
 } from '../services/peopleService.js';
+import { positionsHeld, moveEmployee } from '../services/employeePositionsService.js';
 
 const router = Router();
 
@@ -107,6 +108,24 @@ router.delete('/people/employees/:id', guard(PERM.peopleManage), handle((req) =>
  */
 router.get('/people/employees/:id/assignments', guard(PERM.peopleView), handle((req) => (
   assignmentsFor(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
+)));
+
+/**
+ * Positions held (spec §10): every position the person has had, newest first,
+ * and how each ended. `?on=` is the date "current" is judged on (today).
+ */
+router.get('/people/employees/:id/positions', guard(PERM.peopleView), handle((req) => (
+  positionsHeld(pool, ctx(req).companyId, id(req), { on: req.query.on ? dateParam(req.query.on) : undefined })
+)));
+
+/**
+ * Move to another position: { positionId, effectiveFrom?, keepCurrent?, fromAssignmentId? }.
+ * The current position ends the day before the new one starts, in one
+ * transaction. `keepCurrent: true` adds a second position and ends nothing.
+ * 409 POSITION_FILLED, HIRING_OPEN, EMPLOYEE_LEFT — the assignment service's own.
+ */
+router.post('/people/employees/:id/move', guard(PERM.peopleManage), handle((req) => (
+  tx(req, (db, c) => moveEmployee(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
 // ── identifiers (PII) ───────────────────────────────────────────────────────
