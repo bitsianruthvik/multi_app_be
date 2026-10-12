@@ -310,6 +310,14 @@ await rolledBack(async (db) => {
 await rolledBack(async (db) => {
   const G = (await db.query('SELECT id, code FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]))[0][0] ?? null;
 
+  // THE TEST OWNS ITS POSITION RULE. The tenant's own (a plain running number, role code plus number, or
+  // none at all) is switched off for this transaction, so no check below depends on how it codes positions.
+  await db.query("UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND entity_type = 'hrms_position' AND deleted_at IS NULL", [COMPANY]);
+  await createScheme(db, COMPANY, c.userId, {
+    code: `${TAG}_BASE`, name: `${TAG} base`, entityType: 'hrms_position', targetField: 'code', seqScope: 'prefix', priority: 0, status: 'active', conditions: [],
+    segments: [{ segmentType: 'literal', literalText: `${TAG}P` }, { segmentType: 'sequence', format: '000' }],
+  });
+
   // ── a code a client sends is ignored, on create and on update ──
   const dept = await ORG.createDepartment(db, c, { name: `${TAG} Quality Control`, code: `${TAG}HACK`, type: 'Machine' });
   const role = await RC.createRole(db, c, { title: `${TAG} Quality Inspector`, roleCode: `${TAG}HACK`, status: 'ACTIVE', defaultDepartmentId: dept.id });
@@ -433,6 +441,23 @@ await rolledBack(async (db) => {
   ok(noCard?.status === 422 && noCard.code === 'TOKEN_MISSING' && /card\.code/.test(noCard.message), 'under that rule a position created on its own has no card code: 422 TOKEN_MISSING, in words', why(noCard));
   const savedPreview = await generate(db, COMPANY, 'hrms_position', 'code', { entityId: s1.id }, { consume: false });
   ok(savedPreview.text === `${lone.positionCode}-5`, 'previewing a SAVED position reads its card from the chart', JSON.stringify(savedPreview));
+
+  // ── role code plus number (setup-codes.mjs --position-by-role): {role.code}-{#}, counted per role ──
+  const byRoleA = await RC.createRole(db, c, { title: `${TAG} Zeta Alpha`, status: 'ACTIVE' });
+  const byRoleB = await RC.createRole(db, c, { title: `${TAG} Zeta Beta`, status: 'ACTIVE' });
+  await rule('hrms_position', 'BYROLE', [tok('role.code'), lit('-'), seq('0')], [{ tokenKey: 'role', operator: 'in', value: `${byRoleA.id},${byRoleB.id}` }]);
+  const mkBy = async (r) => (await POS.createPosition(db, c, { roleId: r.id, status: 'ACTIVE' })).position;
+  const ra1 = await mkBy(byRoleA);
+  const ra2 = await mkBy(byRoleA);
+  await db.query('INSERT INTO hrms_positions (company_id, position_code, role_id) VALUES (?, ?, ?), (?, ?, ?)',
+    [COMPANY, `${byRoleA.roleCode}-3`, byRoleA.id, COMPANY, `${byRoleA.roleCode}-4`.toLowerCase(), byRoleA.id]);
+  const ra5 = (await POS.addSiblingPosition(db, c, ra1.id, {})).position;
+  const rb1 = await mkBy(byRoleB);
+  const rb2 = await mkBy(byRoleB);
+  ok(ra1.positionCode === `${byRoleA.roleCode}-1` && ra2.positionCode === `${byRoleA.roleCode}-2` && ra5.positionCode === `${byRoleA.roleCode}-5`
+    && rb1.positionCode === `${byRoleB.roleCode}-1` && rb2.positionCode === `${byRoleB.roleCode}-2` && byRoleA.roleCode !== byRoleB.roleCode,
+  'under {role.code}-{#}: two positions of a role are <role>-1 and <role>-2, the next one (added beside the first) continues past the numbers already used (-5), and another role starts its own count at -1',
+  [ra1, ra2, ra5, rb1, rb2].map((p) => p.positionCode).join(' '));
 
   // ── a code too long for the column is refused in words ──
   await rule('hrms_location', 'LONG', [lit('X'.repeat(60)), seq('0')]);
@@ -664,7 +689,7 @@ section('[5] Permissions and shapes, over HTTP');
       const preview = await call(admin, 'POST', `${api}/codegen/preview`, { entityType: 'hrms_role', draft: { title: 'Quality Inspector' } });
       ok(preview.status === 200 && typeof preview.json.text === 'string' && preview.json.text.length > 0, 'POST /codegen/preview for a role that is not saved yet shows the shape of its code', JSON.stringify(preview.json));
       const schemes = await call(admin, 'GET', `${api}/codegen/schemes?entityType=hrms_position`);
-      ok(schemes.status === 200 && schemes.json.length >= 1 && schemes.json.every((s) => s.entityType === 'hrms_position'), `${company.name} has a rule for positions (setup-codes.mjs)`);
+      ok(schemes.status === 200 && Array.isArray(schemes.json) && schemes.json.every((s) => s.entityType === 'hrms_position'), 'GET /codegen/schemes?entityType=hrms_position lists position rules only (whatever rule the company has, or none)');
     } else skip('an admin login', 'this company has no admin login with access to the app');
   } finally {
     await new Promise((resolve) => listener.close(resolve));
