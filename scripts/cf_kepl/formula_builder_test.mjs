@@ -89,6 +89,34 @@ try {
   await val(other, 'CUT_LENGTH', 1);
   ok('fixture built', true);
 
+  // 2026-10-12 — a WORD on the machine side: a text value on the type, typed over on one machine.
+  console.log('\nA word on the machine type');
+  {
+    S.MODEL = await spec('MODEL', { data_type: 'text' });
+    await rule('MODEL', 'classification', tCut, 'defaulted');
+    await ins('cf_spec_values', { specification_id: S.MODEL, subject_type: 'classification', subject_id: tCut, value_text: 'Fast one' });
+    await ins('cf_spec_values', { specification_id: S.MODEL, subject_type: 'machine', subject_id: m2, value_text: 'Slow one', source: 'entered' });
+    const expr = `IF(machine.${T}MODEL = "Fast one", 2, 7)`;
+    const std = await checkForBuilder(db, COMPANY, { expression: expr, machineTypeId: tCut });
+    ok('the Standard reads the type\'s word', std.result?.value === 2 && std.inputs?.some((i) => i.value === 'Fast one' && i.from === 'machine'), JSON.stringify([std.result, std.inputs, std.problems]));
+    const on2 = await checkForBuilder(db, COMPANY, { expression: expr, machineId: m2 });
+    ok('a machine\'s own word beats its type\'s', on2.result?.value === 7, JSON.stringify([on2.result, on2.inputs]));
+    const tried = await checkForBuilder(db, COMPANY, { expression: expr, machineTypeId: tCut, sample: { [`machine.${T}MODEL`]: 'other' } });
+    ok('a machine word can be tried in the preview', tried.result?.value === 7 && tried.inputs?.some((i) => i.from === 'typed'), JSON.stringify([tried.result, tried.inputs]));
+    // The same through release's reader (timeEstimateService): the type's standard, then one machine.
+    const { loadMachineSide } = await import('../../apps/cf_erp/services/timeEstimateService.js');
+    const [[r0]] = await conn.query('SELECT id FROM cf_operation_machine_rules WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [COMPANY, opCut]);
+    await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = NULL, work_expression = ? WHERE id = ?', [expr, r0.id]);
+    const side = await loadMachineSide(db, COMPANY, new Map([[opCut, { id: opCut, code: `${T}CUT`, name: 'Cutting' }]]), undefined);
+    const est = side.estimate(opCut, null);
+    ok('release: the standard time reads the type\'s word', est.work === 2, JSON.stringify(est));
+    const onM = side.estimateOn(opCut, null, m2);
+    ok('release: on a machine, its own word', onM?.ok && onM.work === 7, JSON.stringify(onM));
+    await conn.query('UPDATE cf_operation_machine_rules SET work_minutes = 3, work_expression = NULL WHERE id = ?', [r0.id]);
+    await conn.query('UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND specification_id = ?', [COMPANY, S.MODEL]);
+    await conn.query('UPDATE cf_spec_assignments SET deleted_at = NOW() WHERE company_id = ? AND specification_id = ?', [COMPANY, S.MODEL]);
+  }
+
   console.log('\nContext for a rule on the Cutters type');
   log.length = 0;
   const ctx = await builderContext(db, COMPANY, opCut, { subjectType: 'classification', subjectId: tCut });

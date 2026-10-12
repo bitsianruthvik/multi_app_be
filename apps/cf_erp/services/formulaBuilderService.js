@@ -215,23 +215,25 @@ export async function builderContext(db, companyId, operationId, q = {}) {
  * with any typed sample value laid over them. Returns `inputs` — what each name
  * read and from where.
  */
-/** code -> { raw, dataType, tableConfig } of a machine type: its own number / chart values, else the nearest above. 2 reads. */
+/** code -> { raw, dataType, tableConfig } of a machine type: its own number / chart / word values, else the nearest above. 2 reads. */
 async function typeValueMap(db, companyId, nodeId) {
   const chain = await ancestors(db, companyId, nodeId);   // root first
   const out = new Map();
   if (!chain.length) return out;
   const depthOf = new Map(chain.map((n, i) => [Number(n.id), i]));
   const [rows] = await db.query(
-    `SELECT v.subject_id, v.value_number, v.value_json, s.code, s.data_type, s.table_config
-       FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.data_type IN ('number', 'table')
+    `SELECT v.subject_id, v.value_number, v.value_json, v.value_text, o.value AS option_value, s.code, s.data_type, s.table_config
+       FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.data_type IN ('number', 'table', 'option', 'text')
+       LEFT JOIN cf_spec_options o ON o.id = v.option_id
       WHERE v.company_id = ? AND v.deleted_at IS NULL AND v.subject_type = 'classification' AND v.subject_id IN (?)`,
     [companyId, chain.map((n) => n.id)],
   );
   rows.sort((a, b) => depthOf.get(Number(a.subject_id)) - depthOf.get(Number(b.subject_id)));   // deepest last: it wins
   for (const r of rows) {
-    const raw = r.data_type === 'number' ? num(r.value_number) : parseJsonCol(r.value_json);
+    const raw = r.data_type === 'number' ? num(r.value_number) : r.data_type === 'table' ? parseJsonCol(r.value_json)
+      : r.data_type === 'option' ? (r.option_value ?? null) : (blank(r.value_text) ? null : String(r.value_text));
     if (raw == null) continue;
-    out.set(r.code, { raw, dataType: r.data_type, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
+    out.set(r.code, { raw, dataType: r.data_type, optionValue: r.data_type === 'option' ? raw : null, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
   }
   return out;
 }

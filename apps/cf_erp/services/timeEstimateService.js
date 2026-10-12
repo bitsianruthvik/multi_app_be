@@ -165,9 +165,10 @@ export async function loadMachineSide(db, companyId, operations, date) {
         [companyId, ...sa.params],
       ),
       db.query(
-        `SELECT v.specification_id, v.subject_type, v.subject_id, v.value_number, v.value_json, v.source
+        `SELECT v.specification_id, v.subject_type, v.subject_id, v.value_number, v.value_json, v.value_text, o.value AS option_value, v.source
            FROM cf_spec_values v
            JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
+           LEFT JOIN cf_spec_options o ON o.id = v.option_id
           WHERE v.company_id = ? AND v.deleted_at IS NULL AND (${sv.sql})`,
         [companyId, ...sv.params],
       ),
@@ -190,7 +191,10 @@ export async function loadMachineSide(db, companyId, operations, date) {
     if (!row) return null;
     if (dataType === 'number') return row.value_number == null ? null : Number(row.value_number);
     if (dataType === 'table') return row.value_json == null ? null : parseJsonCol(row.value_json);
-    return null; // timing formulas read numbers and charts only
+    // A machine's pick-list or text value is a word (2026-10-12: IF(machine.MODEL = "…", …), a chart read by one).
+    if (dataType === 'option') return row.option_value ?? null;
+    if (dataType === 'text') return row.value_text == null || String(row.value_text).trim() === '' ? null : String(row.value_text);
+    return null;
   };
   /** code -> { raw, dataType, tableConfig } for a chain, the way resolve() gives a machine (self = last) or a type (setup mode). */
   const valuesOfChain = (chain, selfIsMachine) => {
@@ -202,7 +206,7 @@ export async function loadMachineSide(db, companyId, operations, date) {
     const selfIndex = chain.length - 1;
     for (const [specId, { rule }] of merged) {
       if (!rule.is_applicable) continue;
-      if (!['number', 'table'].includes(rule.data_type)) continue;
+      if (!['number', 'table', 'option', 'text'].includes(rule.data_type)) continue;
       const own = valuesAt.get(chain[selfIndex])?.get(specId) ?? null;
       let above = null;
       for (let i = selfIndex - 1; i >= 0 && !above; i--) above = valuesAt.get(chain[i])?.get(specId) ?? null;
@@ -215,7 +219,7 @@ export async function loadMachineSide(db, companyId, operations, date) {
       else if (rule.value_rule === 'fixed') row = above;
       const raw = rawOf(row, rule.data_type);
       if (raw == null) continue;
-      out.set(rule.spec_code, { raw, dataType: rule.data_type, tableConfig: rule.data_type === 'table' ? parseJsonCol(rule.table_config) : null });
+      out.set(rule.spec_code, { raw, dataType: rule.data_type, optionValue: rule.data_type === 'option' ? raw : null, tableConfig: rule.data_type === 'table' ? parseJsonCol(rule.table_config) : null });
     }
     return out;
   };
