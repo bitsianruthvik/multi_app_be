@@ -5,7 +5,14 @@
  *   GET /order-lines/:id/values
  *       every node of the line's structure that takes values, grouped by kind of
  *       thing, with each applicable item-level spec, its rule and its value
- *   PUT /order-lines/:id/values   { dryRun?: boolean, writes: [{ recordId, specCode, value }] }
+ *   GET /order-lines/:id/design-uses?group=|recordId=|drawingId=
+ *       the rows a design is used by (a link group, a row and its copies, a drawing's rows)
+ *       with their codes and pieces
+ *   PUT /order-lines/:id/values   { dryRun?: boolean, links?: 'all' | 'one', writes: [{ recordId, specCode, value, links? }] }
+ *       `links` — on a linked copy ("same design"): 'all' gives every copy the value, 'one' only
+ *       the rows named (they stop being copies); said nothing, only the rows named change and the
+ *       answer's `links.needsChoice` says a choice was due. The answer carries `links`
+ *       { needsChoice, touched, breaks, skipped, after } and `view.links`.
  *       one transaction, all or nothing, every problem at once (422 `problems`,
  *       and `detail.cells` as { recordId, specCode, problem }); a closed order or
  *       a released line is a 409. A dry run is the real write in a SAVEPOINT,
@@ -29,6 +36,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { readLineValues, writeLineValues } from '../services/orderValuesService.js';
 import { withCutPieces } from '../services/cutPlateService.js';
+import { designUses } from '../services/partDrawingService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -43,6 +51,9 @@ const requireAny = (tags) => (req, res, next) => {
 };
 
 router.get('/order-lines/:id/values', guard(PERM.ordersView), handle((req) => readLineValues(pool, ctx(req).companyId, id(req))));
+// The rows one design is used by, and their pieces ("used by N pieces") — for a link group, a row
+// or a drawing: ?group= | ?recordId= | ?drawingId= (linked copies, init.sql §59). Read only.
+router.get('/order-lines/:id/design-uses', guard(PERM.ordersView), handle((req) => designUses(pool, ctx(req).companyId, id(req), req.query ?? {})));
 // Saved values are followed by the line's cut pieces: made as soon as the
 // required values are complete, and made again when they change (user,
 // 2026-09-26) — cutPlateService.refreshCutPieces, which never fails the save.

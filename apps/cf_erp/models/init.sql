@@ -5319,3 +5319,27 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND INDEX_NAME = 'idx_cprs_machine');
 SET @sql = IF(@key = 0, 'ALTER TABLE cf_production_steps ADD KEY idx_cprs_machine (company_id, machine_id, state)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- §59  Linked copies — "same design" (2026-10-12, CF_ERP_LINKED_COPIES_PLAN.md)
+-- Additive and guarded: safe to re-run. Service: linkService (newGroupKey, fingerprints, readLinks, settleLine).
+-- (§57 stays unused.)
+--
+-- link_group   an opaque key the application makes (base36 time + random). Every live temporary item of ONE
+--              order line that carries the same key is one group of copies of the same design. NULL = not linked.
+--              "Linked" is the key AND an equal design fingerprint, worked out on read - never stored - so a
+--              write path that forgets the group shows as a broken link, never as a wrong fan-out.
+-- link_apart   1 = a person said "keep this one apart": never offered for re-linking.
+-- idx_cid_link "the members of this group".
+-- Separate statements for a column and its index: TiDB refuses an index on a column added in the same ALTER.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'link_group');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN link_group VARCHAR(32) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'link_apart');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN link_apart TINYINT NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND INDEX_NAME = 'idx_cid_link');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_item_details ADD KEY idx_cid_link (company_id, link_group)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME IN ('link_group', 'link_apart')) = 2
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND INDEX_NAME = 'idx_cid_link') = 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

@@ -604,6 +604,63 @@ try {
   ok('the record pair still calls exportRecordSheet / importRecordSheet', /exportRecordSheet\(pool/.test(src) && /importRecordSheet\(db, c, id\(req\)/.test(src));
   ok('the order-line download takes no ?format — it is always .xlsx', !/exportOrderSheet\([^)]*format/.test(src));
 
+  section('10b. Linked copies: a grey "Same as" cell out, `links` on the way in (init.sql §59)');
+  {
+    const { buildLinkFixture, newTag } = await imp('scripts/cf_kepl/link_fixture.mjs');
+    const BCL = await imp('apps/cf_erp/services/bomChangeService.js');
+    const lf = await buildLinkFixture(conn, c, { tag: newTag('OSL'), parts: 0 });
+    let lr = await lf.rows();
+    await OV.writeLineValues(conn, c, lf.lineId, { writes: [{ recordId: lr.segments[0].flange.id, specCode: 'LENGTH', value: 7000 }] });
+    const before0 = await download(lf.lineId);
+    const cellsOf = (d) => { const out = []; d.ws.eachRow((row) => row.eachCell((cell) => out.push(String(cell.value ?? '')))); return out; };
+    ok('no copies, no "Same as" cell anywhere', !cellsOf(before0).includes('Same as'));
+    await BCL.applyBomChanges(conn, c, { scope: { orderLineId: lf.lineId }, changes: [{ op: 'paste', sourceLineId: lr.segments[0].node.lineId, parentId: lr.girder.id }] });
+    lr = await lf.rows();
+    const [A, B2] = lr.segments;
+    const d = await download(lf.lineId);
+    /** The pair of sheet rows of one record's place, and the column of a field by its name. */
+    const pairOf = (dd, node) => {
+      let names = null; let values = null;
+      dd.ws.eachRow((row) => { row.eachCell((cell) => { const t = String(cell.value ?? ''); if (t === `N|${node.lineId}:${node.id}`) names = row; if (t === `V|${node.lineId}:${node.id}`) values = row; }); });
+      const col = (label) => { let at = 0; names.eachCell((cell, i) => { if (String(cell.value ?? '') === label) at = i; }); return at; };
+      return { names, values, col };
+    };
+    const pa = pairOf(d, A.flange);
+    const sameCol = pa.col('Same as');
+    const layout = L.orderSheetLayout({ root: (await B.explode(conn, COMPANY, lr.girder.id, { rootQuantity: 1 })).root, view: await OV.readLineValues(conn, COMPANY, lf.lineId), codes: null });
+    const lastOf = layout.find((x) => x.nodeId === A.flange.id).fields.at(-1);
+    eq('the layout gives a linked row one more field, last: Same as, never editable', [lastOf.key, lastOf.kind, lastOf.label, lastOf.editable, /^1 other: /.test(lastOf.value)], [L.SAME, 'same', 'Same as', false, true]);
+    ok('the sheet writes it as the last cell of the pair, grey, naming the other copy', sameCol > 1 && /^1 other: /.test(String(pa.values.getCell(sameCol).value)) && pa.values.getCell(sameCol).fill?.fgColor?.argb === 'FFEFEFEF' && sameCol === layout.find((x) => x.nodeId === A.flange.id).fields.filter((x) => x.kind !== 'na').length + 1, String(pa.values.getCell(sameCol).value));
+    eq('sameAsText: counts the others, names the first three, counts the rest', [L.sameAsText({ rows: { 1: { g: 'k', n: 6 } }, groups: { k: [1, 2, 3, 4, 5, 6] } }, 1, (id) => `R${id}`), L.sameAsText({ rows: { 1: { same: [2] } }, groups: {} }, 1, () => 'x'), L.sameAsText(null, 1, () => 'x')], ['5 others: R2, R3, R4 +2 more', '', '']);
+    ok('a row that is not a copy has no such cell', pairOf(d, lr.girder.children[0]).col('Same as') > 0 && (() => { let at = 0; d.ws.eachRow((row) => row.eachCell((cell) => { if (String(cell.value ?? '') === 'ROOT') at += 1; })); return true; })());
+    eq('nothing edited is nothing changed, links or not', [(await upload(d.wb, true, lf.lineId)).changes.length, (await upload(d.wb, true, lf.lineId)).ok], [0, true]);
+    // Type a length on ONE copy.
+    pa.values.getCell(pa.col('L (mm)')).value = 7100;
+    const ask = await upload(d.wb, true, lf.lineId);
+    eq('a value typed on one copy, nothing said: the preview says a choice is due', [ask.ok, ask.summary.valuesChanged, ask.links.needsChoice, ask.links.touched[0]?.recordId, ask.links.touched[0]?.count], [true, 1, true, A.flange.id, 2]);
+    const withAll = await OS.importOrderSheet(conn, c, lf.lineId, { file: Buffer.from(await d.wb.xlsx.writeBuffer()), dryRun: true, links: 'all' });
+    eq('links: all for the whole file — the copy follows, nothing breaks', [withAll.links.needsChoice, withAll.links.breaks.length, withAll.links.after.rows[B2.flange.id]?.n], [false, 0, 2]);
+    const applied = await OS.importOrderSheet(conn, c, lf.lineId, { file: Buffer.from(await d.wb.xlsx.writeBuffer()), links: 'all' });
+    const [[n7100]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND s.code = 'LENGTH' AND v.value_number = 7100 AND v.deleted_at IS NULL", [COMPANY, [A.flange.id, B2.flange.id]]);
+    eq('applied: both copies hold it and are still linked', [applied.applied, Number(n7100.n), applied.links.after.rows[A.flange.id]?.n], [true, 2, 2]);
+    // A quantity on one copy's child, for all copies of its parent.
+    const d2 = await download(lf.lineId);
+    const pw = pairOf(d2, A.web);
+    pw.values.getCell(pw.col('Qty')).value = 2;
+    const qAsk = await upload(d2.wb, true, lf.lineId);
+    const qAll = await OS.importOrderSheet(conn, c, lf.lineId, { file: Buffer.from(await d2.wb.xlsx.writeBuffer()), links: 'all' });
+    const [qRows] = await conn.query('SELECT quantity FROM cf_bom_lines WHERE id IN (?)', [[A.web.lineId, B2.web.lineId]]);
+    eq('a quantity: asked when unsaid; with all, repeated on the copy\'s line and flagged', [qAsk.links.needsChoice, qAsk.links.touched[0]?.reason, qRows.map((x) => Number(x.quantity)), qAll.changes.filter((x) => x.fanned).length, qAll.links.breaks.length], [true, 'quantity', [2, 2], 1, 0]);
+    // The grey cell is not typed.
+    const d3 = await download(lf.lineId);
+    const p3 = pairOf(d3, A.flange);
+    p3.values.getCell(p3.col('Same as')).value = 'nobody';
+    const typed = await upload(d3.wb, true, lf.lineId);
+    ok('a changed "Same as" is refused in words', !typed.ok && typed.problems.some((p) => /Same as .* was changed to "nobody".*chosen on the screen/.test(p)), typed.problems.join(' | '));
+    const badLinks = await OS.importOrderSheet(conn, c, lf.lineId, { file: Buffer.from(await d3.wb.xlsx.writeBuffer()), dryRun: true, links: 'some' });
+    ok('links must be all or one', badLinks.problems.some((p) => /links must be/.test(p)));
+  }
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {

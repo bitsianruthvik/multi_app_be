@@ -25,6 +25,7 @@
  *   valuesModel.computeGaps (nothing typed)         missingOf
  *   lib/stripLayout (dimensions, roll-ups, total,
  *     SHIP_UNIT, PART_FUNCTION, sheetLabel)         the constants below
+ *   lib/bomGridLayout.sameAsText / SAME             sameAsText / SAME  (the row's link chip, in words)
  *
  * Change a rule on one side and that test fails until the other follows.
  * Nothing here reads the database or knows about Excel.
@@ -61,7 +62,30 @@ export const fieldLabel = (code, name, unit) => `${sheetLabel(code, name)}${unit
 export const QTY = '$quantity';
 export const TOTAL = '$total';
 export const FLOW = '$flow';
-export const FIXED_LABELS = { [QTY]: 'Qty', [TOTAL]: 'Total', [FLOW]: 'Flow' };
+/** "Same as" — the row is a linked copy of other rows (the screen's link chip; init.sql §59). Never typed. */
+export const SAME = '$same';
+export const FIXED_LABELS = { [QTY]: 'Qty', [TOTAL]: 'Total', [FLOW]: 'Flow', [SAME]: 'Same as' };
+/** How many of the other copies are named before the rest are counted. */
+export const SAME_LISTED = 3;
+
+/**
+ * lib/bomGridLayout.sameAsText — what the "Same as" cell says for a row that is a linked copy:
+ * how many other rows are the same design, and the first few of them by the code they show
+ * ("2 others: L(2)-1-TFL1, L(3)-1-TFL1"; past three, "+2 more"). '' for a row that is not linked —
+ * a suggestion or a row kept apart is not a link, and the sheet says nothing of it.
+ *   links     the values view's `links` block ({ rows: { id: { g, n } | … }, groups: { key: [ids] } })
+ *   shownOf   (recordId) => the text a row is known by (its code as shown, else its name)
+ */
+export function sameAsText(links, recordId, shownOf) {
+  const mine = links?.rows?.[recordId];
+  const members = mine?.g ? links.groups?.[mine.g] ?? [] : [];
+  const others = members.filter((id) => Number(id) !== Number(recordId));
+  if (!others.length) return '';
+  const named = others.slice(0, SAME_LISTED).map((id) => String(shownOf(Number(id)) ?? '').trim()).filter(Boolean);
+  const more = others.length - named.length;
+  const head = `${others.length} ${others.length === 1 ? 'other' : 'others'}`;
+  return named.length ? `${head}: ${named.join(', ')}${more > 0 ? ` +${more} more` : ''}` : head;
+}
 
 /** bomModel.isCutPiece — rows the system makes by itself under a plate or section part. */
 export const isCutPiece = (n) => n.role === 'Cut from' || n.role === 'Raw plate';
@@ -161,7 +185,8 @@ const optionText = (o) => o.label || o.value;
  *
  *   row    { id, key, nodeId, lineId, depth, name, label, code, hasChildren, fields }
  *   field  { key, kind, label, value, editable, ... }
- *     kind 'quantity' | 'total' | 'flow' | 'value' | 'na'
+ *     kind 'quantity' | 'total' | 'flow' | 'value' | 'na' | 'same'
+ *          ('same' — "Same as": the row is a linked copy; which rows it is the same design as)
  *          ('na' is a dimension the row does not have: the grid still draws its
  *           slot, empty, so Thk · L · W line up — the sheet leaves it out)
  *     value      the text the screen shows in that cell
@@ -201,6 +226,10 @@ export function orderSheetLayout({ root, view, codes = null }) {
   const shown = [...dims, ...used.filter((c) => !DIMS.has(c.code))];
   const shownByCode = new Map(shown.map((c) => [c.code, c]));
   const open = !!view?.editable;
+  // What a linked copy is known by in another row's "Same as" cell: the code it shows, else its name.
+  const firstRowOf = new Map();
+  for (const r of rows) if (!firstRowOf.has(r.node.id)) firstRowOf.set(r.node.id, r.node);
+  const shownOf = (id) => { const n = firstRowOf.get(id); return n ? codeShown(n, codes) || rowLabel(n.name, n.role) : ''; };
 
   const valueField = (r, code) => {
     const node = r.node;
@@ -253,6 +282,9 @@ export function orderSheetLayout({ root, view, codes = null }) {
       { key: FLOW, kind: 'flow', label: FIXED_LABELS[FLOW], value: n.flow?.code ?? '', editable: false, why: 'How a row is made is chosen on the screen, not in this sheet.' },
       ...codesInOrder.map((code) => valueField(r, code)),
     ];
+    // A linked copy says so, last: the screen's link chip, in words. Grey — it is chosen on the screen.
+    const same = sameAsText(view?.links, n.id, shownOf);
+    if (same) fields.push({ key: SAME, kind: 'same', label: FIXED_LABELS[SAME], value: same, editable: false, why: 'Which rows are copies of each other is chosen on the screen, not in this sheet.' });
     // A label names its field on the way back in, so two fields of one row may not share one.
     const count = new Map();
     for (const f of fields) if (f.kind !== 'na') count.set(f.label, (count.get(f.label) ?? 0) + 1);

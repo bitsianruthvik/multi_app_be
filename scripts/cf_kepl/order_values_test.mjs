@@ -421,7 +421,7 @@ try {
 
   section('3. The read: one row per record, grouped by kind of thing, every applicable spec');
   const { out: view, n: readTrips } = await roundTrips(conn, () => OV.readLineValues(conn, COMPANY, f.lineId));
-  eq('the read costs 8 round trips', readTrips, 8);
+  eq('the read costs 9 round trips (8, and one for what a design fingerprint needs: drawing links + cut places)', readTrips, 9);
   eq('ten rows: nine own items and the shared bolt (in one place per record, not per BOM line)', view.counts.rows, 10);
   eq('nine of them are this order\'s own', view.counts.own, 9);
   eq('one is shared', view.counts.shared, 1);
@@ -686,6 +686,34 @@ try {
   eq('writes that are not a list are a 422', shape?.status, 422);
   const noLine = await refusal(() => OV.readLineValues(conn, COMPANY, 2147483000));
   eq('a line that does not exist is a 404', noLine?.status, 404);
+
+  section('13b. Linked copies: the view says who is linked, a write says whether the copies follow (init.sql §59)');
+  {
+    const { buildLinkFixture, newTag } = await imp('scripts/cf_kepl/link_fixture.mjs');
+    const BCL = await imp('apps/cf_erp/services/bomChangeService.js');
+    const lf = await buildLinkFixture(conn, c, { tag: newTag('OVL'), parts: 0 });
+    let lr = await lf.rows();
+    await OV.writeLineValues(conn, c, lf.lineId, { writes: [{ recordId: lr.segments[0].flange.id, specCode: 'LENGTH', value: 9000 }, { recordId: lr.segments[0].flange.id, specCode: 'WIDTH', value: 400 }] });
+    const fresh = await OV.readLineValues(conn, COMPANY, lf.lineId);
+    eq('a line with no copies has an empty links block', [Object.keys(fresh.links.rows).length, Object.keys(fresh.links.groups).length], [0, 0]);
+    await BCL.applyBomChanges(conn, c, { scope: { orderLineId: lf.lineId }, changes: [{ op: 'paste', sourceLineId: lr.segments[0].node.lineId, parentId: lr.girder.id }] });
+    lr = await lf.rows();
+    const [A, B2] = lr.segments;
+    const { out: linked, n: linkedTrips } = await roundTrips(conn, () => OV.readLineValues(conn, COMPANY, lf.lineId));
+    eq('the read still costs 9 round trips with linked rows', linkedTrips, 9);
+    eq('a copied row and its original say their group and its size', [linked.links.rows[A.flange.id]?.n, linked.links.rows[B2.flange.id]?.n, linked.links.rows[A.flange.id]?.g === linked.links.rows[B2.flange.id]?.g], [2, 2, true]);
+    ok('rows of the line that take no values are in the links block all the same (finding F4)', linked.links.rows[A.node.id]?.n === 2 && linked.links.groups[linked.links.rows[A.node.id].g].length === 2);
+    const ask = await OV.writeLineValues(conn, c, lf.lineId, { dryRun: true, writes: [{ recordId: B2.flange.id, specCode: 'LENGTH', value: 9100 }] });
+    eq('said nothing: only the row named would change, and the answer says a choice is due', [ask.links.needsChoice, ask.summary.changed, ask.links.fanned, ask.links.breaks.map((b) => b.recordId).sort()], [true, 1, 0, [A.flange.id, A.node.id, B2.flange.id, B2.node.id].sort()]);   // a pair that parts leaves two rows on their own
+    const all = await OV.writeLineValues(conn, c, lf.lineId, { links: 'all', writes: [{ recordId: B2.flange.id, specCode: 'LENGTH', value: 9100 }] });
+    eq('links: all — both copies written, nothing breaks, the view shows them linked', [all.links.needsChoice, all.summary.changed, all.links.fanned, all.links.breaks.length, all.view.links.rows[A.flange.id]?.n], [false, 2, 1, 0, 2]);
+    const [[both]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND s.code = 'LENGTH' AND v.value_number = 9100 AND v.deleted_at IS NULL", [COMPANY, [A.flange.id, B2.flange.id]]);
+    eq('…and stored on both', Number(both.n), 2);
+    const one = await OV.writeLineValues(conn, c, lf.lineId, { writes: [{ recordId: B2.flange.id, specCode: 'WIDTH', value: 410, links: 'one' }] });
+    eq('links: one on the write — that row alone, and it stops being a copy (so does the row above it)', [one.links.needsChoice, one.summary.changed, one.view.links.rows[B2.flange.id]?.g ?? null, one.view.links.rows[A.node.id]?.g ?? null, one.view.links.rows[A.web.id]?.n], [false, 1, null, null, 2]);
+    const bad = await refusal(() => OV.writeLineValues(conn, c, lf.lineId, { links: 'both', writes: [] }));
+    eq('links must be all or one', [bad?.status, /links must be/.test((bad?.problems ?? []).join(' '))], [422, true]);
+  }
 
   await conn.rollback();
   console.log('\nrolled back.');

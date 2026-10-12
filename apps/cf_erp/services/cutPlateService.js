@@ -2292,6 +2292,15 @@ export async function ownerLineOf(db, companyId, recordId) {
  */
 export async function withCutPieces(db, c, lineId, out) {
   if (lineId == null) return out;
+  // Linked copies (init.sql §59): whatever this save changed, a row that is no longer the same
+  // design as its copies stops being one. Skipped when the save settled itself (it says so with
+  // `links`); ONE round trip when the line has no linked row; never fails the save.
+  if (!(out && typeof out === 'object' && !Array.isArray(out) && out.links)) {
+    try {
+      const { settleLine } = await import('./linkService.js');
+      await settleLine(db, c, lineId);
+    } catch { /* a link left unsettled reads as broken — it is never a wrong fan-out */ }
+  }
   // Selection rows the system can answer on its own (a default, or one candidate) — before the cut pieces are worked out.
   await autofillLineSelections(db, c, lineId, { refresh: (ids) => refreshValues(db, c, ids) });
   const cutPieces = await refreshCutPieces(db, c, lineId);

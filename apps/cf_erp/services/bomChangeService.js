@@ -138,12 +138,26 @@ import { explode, writeLineUpdate, writeLineRemoval, addLine, assertEditable, AL
 import { refreshValues, setValues } from './valueService.js';
 import { requireUsableFlow } from './flowService.js';
 import { insertRows } from '../lib/db.js';
-import { snapshotSubtrees, writeCopies, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
+import { snapshotSubtrees, writeCopies, copyDrawingLinks, cutPlateNodes, LINE_COLUMNS } from './treeCopyService.js';
 import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
-import { writeLineValues } from './orderValuesService.js';
+import { writeLineValues, loadContext, LINK_CHOICES } from './orderValuesService.js';
+import { readLinks, settleLine, linksBlock, linksOf, planLink, writeLink, writeUnlink, correspondingLine, isOwnRow } from './linkService.js';
 import { updateRecord } from './masterRecordService.js';
 
-export const OPS = ['quantity', 'flow', 'ownFlow', 'role', 'remove', 'paste', 'arrange', 'values'];
+export const OPS = ['quantity', 'flow', 'ownFlow', 'role', 'remove', 'paste', 'arrange', 'values', 'link', 'unlink'];
+/**
+ * LINKED COPIES (init.sql §59, linkService) — rows of one order line that are the same design.
+ *   { op: 'link', recordIds }                 link rows by hand; they must be the same design (422 LINK_NOT_EQUAL)
+ *   { op: 'unlink', recordId, keepApart? }    take one row out of its group (keepApart: never suggest it again)
+ *   `links: 'all' | 'one'` on values / quantity / remove — whether the other copies follow:
+ *     values    the same value on every copy of the row
+ *     quantity  a child's quantity is part of its PARENT's design (decision D2): repeated on the
+ *     remove    corresponding line of every copy of the parent
+ *   Said nothing, the server changes only the rows named — and says `links.needsChoice` when that
+ *   took a row out of its group, so the screen can ask once. Which rows are linked is order design:
+ *   link and unlink still go through on a LOCKED line, until it is released.
+ */
+const LINK_OPS = new Set(['link', 'unlink']);
 /** The changes that are only HOW a thing is made — what a frozen line still takes until release. */
 const FLOW_OPS = new Set(['flow', 'ownFlow']);
 const MAX_CHANGES = 1000;
@@ -225,7 +239,17 @@ function readChanges(raw, problems) {
       if (ch.flowId === undefined) { problems.push(`${where}: say which flow — flowId, or null for no flow.`); return; }
       c.flowId = blank(ch.flowId) ? null : posInt(ch.flowId);
       if (!blank(ch.flowId) && !c.flowId) { problems.push(`${where}: flowId must be a positive whole number, or null.`); return; }
+    } else if (op === 'link') {
+      const ids = Array.isArray(ch.recordIds) ? [...new Set(ch.recordIds.map(posInt))] : [];
+      if (ids.length < 2 || ids.some((x) => !x)) { problems.push(`${where}: give the rows to link — recordIds, two or more.`); return; }
+      c.recordIds = ids;
+    } else if (op === 'unlink') {
+      c.recordId = needId('recordId');
+      if (!c.recordId) return;
+      c.keepApart = ch.keepApart === true || ch.keepApart === 1 || ch.keepApart === 'true';
     } else if (op === 'values') {
+      if (ch.links != null && !LINK_CHOICES.includes(ch.links)) { problems.push(`${where}: links must be "all" or "one".`); return; }
+      c.links = ch.links ?? null;
       if (!Array.isArray(ch.writes)) { problems.push(`${where}: values need a list of writes.`); return; }
       if (ch.writes.length > 20000 || ch.writes.some((w) => !posInt(w?.recordId) || typeof w.specCode !== 'string' || !w.specCode.trim())) { problems.push(`${where}: each value needs a record and specification code.`); return; }
       c.writes = ch.writes;
@@ -248,6 +272,10 @@ function readChanges(raw, problems) {
     } else {
       c.lineId = needId('lineId');
       if (!c.lineId) return;
+      if (op === 'quantity' || op === 'remove') {
+        if (ch.links != null && !LINK_CHOICES.includes(ch.links)) { problems.push(`${where}: links must be "all" or "one".`); return; }
+        c.links = ch.links ?? null;
+      }
       if (op === 'quantity') c.quantity = ch.quantity;
       if (op === 'role') {
         // The row's description (the text after the dot). Empty clears it.
@@ -378,6 +406,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   // ---- who may do this, and whether anything may change at all ------------
   const touched = new Set();
   for (const ch of changes) {
+    if (LINK_OPS.has(ch.op)) { touched.add('custom'); continue; }   // which rows are copies is order design
     if (ch.op === 'values') { touched.add(scope.orderLineId ? 'custom' : 'standard'); continue; }
     // An order row's own flow is order design, like the flow its line names: the Custom BOM's grant.
     if (ch.op === 'ownFlow') { if (byRecord.get(ch.recordId)?.[0]?.node.kind === 'temporary') touched.add('custom'); continue; }
@@ -398,7 +427,9 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   for (const bomType of touched) allow(bomType);
 
   // A batch of nothing but flow changes — the one kind a locked line still takes.
-  const flowOnly = changes.length > 0 && changes.every((ch) => FLOW_OPS.has(ch.op));
+  const flowOnly = changes.length > 0 && changes.every((ch) => FLOW_OPS.has(ch.op) || LINK_OPS.has(ch.op));
+  // The order line whose rows these are (linked copies live inside one line), when there is one.
+  const linkLineId = scope.orderLineId ?? root.owner_order_line_id ?? null;
   if (line) {
     if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
       throw conflict('ORDER_CLOSED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
@@ -424,8 +455,14 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   const arrangements = [];
   const valueChanges = [];
   const copyKeys = new Set();
+  const linkChanges = [];
 
   for (const ch of changes) {
+    if (LINK_OPS.has(ch.op)) {
+      if (!linkLineId) problems.push('Rows are linked as copies on an order line only.');
+      else linkChanges.push(ch);
+      continue;
+    }
     if (ch.op === 'values') {
       if (!scope.orderLineId && ch.writes.some((w) => {
         const id = Number(w.recordId), node = byRecord.get(id)?.[0]?.node;
@@ -507,6 +544,65 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     }
   }
 
+  // ---- linked copies: what stands before this save, and which copies follow -----
+  // Only a batch that changes the STRUCTURE asks (a child's quantity, a removal, a paste, a
+  // move), and only on a line that has linked rows at all: one cheap question, then the line's
+  // links as they stand (9 reads). A values-only batch costs nothing here — writeLineValues
+  // works from its own load.
+  const structural = updates.some((u) => u.op === 'quantity') || removes.length > 0 || pastes.length > 0 || arrangements.length > 0;
+  let pre = null;
+  if (linkLineId && structural) {
+    const [[any]] = await db.query(
+      "SELECT 1 AS x FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND item_type = 'temporary' AND link_group IS NOT NULL AND deleted_at IS NULL LIMIT 1",
+      [companyId, linkLineId],
+    );
+    if (any) pre = await readLinks(db, companyId, linkLineId);
+  }
+  const linkTouched = [];   // structure changes that land on a linked row: [{ recordId, label, group, count, members, specs, reason, choice }]
+  const linkSkipped = [];
+  const fannedChanges = [];
+  let linkConflicts = 0;
+  /** Notes a change to the design of a linked row; returns the members of its group, or null when it is not linked. */
+  const touchLinked = (node, reason, choice) => {
+    const g = pre?.byRecord.get(node.id)?.g;
+    if (!g) return null;
+    const members = pre.groups.get(g);
+    let t = linkTouched.find((x) => x.recordId === node.id && x.reason === reason);
+    if (!t) { t = { recordId: node.id, label: pathLabel(node), group: g, count: members.length, members, specs: [], reason, choice, said: [] }; linkTouched.push(t); }
+    t.said.push(choice);
+    t.choice = t.said.includes('one') ? 'one' : t.said.every((x) => x === 'all') ? 'all' : null;
+    return members;
+  };
+  if (pre) {
+    // A child's quantity, and whether a child is there at all, is its PARENT's design (D2): under
+    // "all copies" the same change is made on the corresponding line of every copy of the parent.
+    for (const ch of [...updates.filter((u) => u.op === 'quantity'), ...removes]) {
+      const parent = ch.entry.parent;
+      const members = touchLinked(parent, ch.op, ch.links ?? null);
+      if (!members || ch.links !== 'all') continue;
+      for (const mateId of members) {
+        if (mateId === parent.id) continue;
+        const twin = correspondingLine(pre.ctx, pre.prints, parent.id, ch.lineId, mateId);
+        const e = twin ? lines.get(twin.id) : null;
+        const mateLabel = pathLabel(byRecord.get(mateId)?.[0]?.node ?? { name: `#${mateId}` });
+        if (!e) { linkSkipped.push({ recordId: mateId, label: mateLabel, op: ch.op, why: 'it has no line that corresponds to this one' }); continue; }
+        if (seen[ch.op].has(twin.id)) {
+          const other = ch.op === 'quantity' ? updates.find((u) => u.op === 'quantity' && u.lineId === twin.id) : null;
+          if (other && !near(other.quantity, ch.quantity)) {
+            linkConflicts += 1;
+            problems.push(`${lineLabel(ch.entry)}: two different quantities are given for linked copies of one design (${lineLabel(e)} gets ${other.quantity}) — "apply to all copies" needs one. Give one, or save these rows on their own.`);
+          }
+          continue;
+        }
+        if (ch.op === 'remove' && seen.quantity.has(twin.id)) { linkSkipped.push({ recordId: mateId, label: mateLabel, op: ch.op, why: 'its line is changed in this save' }); continue; }
+        seen[ch.op].add(twin.id);
+        const copy = { index: changes.length + fannedChanges.length, op: ch.op, lineId: twin.id, entry: e, fanned: true, ...(ch.op === 'quantity' ? { quantity: ch.quantity } : {}) };
+        fannedChanges.push(copy);
+        (ch.op === 'quantity' ? updates : removes).push(copy);
+      }
+    }
+  }
+
   // Flows named by the batch: one read each, the same rule the mutator applies.
   for (const [flowId, labels] of flowIds) {
     const found = [];
@@ -585,6 +681,7 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     const row = sourceRows.get(ch.sourceLineId);
     ch.source = { entry: src, row };
     ch.target = target;
+    touchLinked(target, 'add', null);   // a row added below a linked row: that row stops being a copy (no fan-out in v1)
     if (targetType === 'custom') {
       if (kind === 'template') {
         problems.push(`${what} is a template line — on an order it is laid out as rows. Add the template to ${into} with Add line instead.`);
@@ -623,10 +720,12 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   }
 
   if (problems.length) {
-    throw invalid('INVALID', `${dryRun ? 'These changes cannot be saved' : 'Nothing was saved'} — ${plural(problems.length, 'problem', 'problems')} to fix first.`, { problems });
+    throw invalid(linkConflicts === problems.length ? 'LINK_CONFLICT' : 'INVALID', `${dryRun ? 'These changes cannot be saved' : 'Nothing was saved'} — ${plural(problems.length, 'problem', 'problems')} to fix first.`, { problems });
   }
 
   // ---- apply, inside a savepoint the whole batch can go back to ------------
+  const valueLinks = [];   // what writeLineValues said about linked copies
+  let settled = null;
   const batch = savepointName('batch');
   await db.query(`SAVEPOINT ${batch}`);
   const applyProblems = [];
@@ -651,12 +750,15 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     // or any other part of the same save is refused.
     for (const ch of valueChanges) {
       const r = await attempt('Specification values', async () => {
-        if (scope.orderLineId) return writeLineValues(db, c, scope.orderLineId, { writes: ch.writes });
-        if (root.owner_order_line_id) return writeLineValues(db, c, root.owner_order_line_id, { writes: ch.writes });
+        if (scope.orderLineId) return writeLineValues(db, c, scope.orderLineId, { writes: ch.writes, links: ch.links });
+        if (root.owner_order_line_id) return writeLineValues(db, c, root.owner_order_line_id, { writes: ch.writes, links: ch.links });
         const out = await setValues(db, c, 'master', root.id, ch.writes);
         return { summary: { changed: out.changes.length, records: out.changes.length ? 1 : 0 } };
       });
-      if (r.ok) results[ch.index] = { op: 'values', changed: r.out.summary.changed, records: r.out.summary.records };
+      if (r.ok) {
+        results[ch.index] = { op: 'values', changed: r.out.summary.changed, records: r.out.summary.records, fanned: r.out.links?.fanned ?? 0 };
+        if (r.out.links) valueLinks.push(r.out.links);
+      }
     }
 
     // 1. Pastes, from what is saved. Every copied subtree is read before any
@@ -777,6 +879,32 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     if (applyProblems.length) {
       throw invalid('INVALID', `${dryRun ? 'These changes cannot be saved' : 'Nothing was saved'} — ${plural(applyProblems.length, 'problem', 'problems')} to fix first.`, { problems: applyProblems });
     }
+    for (const ch of fannedChanges) if (results[ch.index]) results[ch.index].fanned = true;
+
+    // 5. Linked copies — rows linked or unlinked by hand, then the stored groups brought in line
+    //    with the designs as they now stand (linkService.settleLine): a row changed on its own, or
+    //    whose children changed, stops being a copy, and so does a linked row above it. From ONE
+    //    load of the line as it now is (9 reads) and at most one UPDATE per 500 rows. Link ops are
+    //    judged against the line AFTER the rest of the batch, so "make them equal and link them"
+    //    is one save, and a dry run says exactly what the save would.
+    if (linkLineId && (pre || linkChanges.length || pastes.some((p) => p.mode === 'copy'))) {
+      const ctx = await loadContext(db, companyId, linkLineId);
+      for (const ch of linkChanges) {
+        if (ch.op === 'link') {
+          const plan = planLink(ctx, linksOf(ctx, ctx.designExtras), ch.recordIds);
+          if (plan.problem) throw invalid(plan.problem.code, plan.problem.message, { problems: [plan.problem.message], detail: { differences: plan.problem.differences ?? [], recordIds: ch.recordIds } });
+          await writeLink(db, c, ctx, plan);
+          results[ch.index] = { op: 'link', group: plan.key, recordIds: plan.recordIds };
+        } else {
+          const rec = ctx.records.get(ch.recordId);
+          if (!isOwnRow(ctx, rec)) throw invalid('LINK_OTHER_LINE', `Record ${ch.recordId} is not a row of line ${ctx.line.lineNo} of ${ctx.line.orderCode} — reload the structure and try again.`, { problems: [`Record ${ch.recordId} is not a row of this line.`] });
+          const was = rec.link_group ?? null;
+          await writeUnlink(db, c, ctx, ch.recordId, ch.keepApart);
+          results[ch.index] = { op: 'unlink', recordId: ch.recordId, was, keepApart: ch.keepApart };
+        }
+      }
+      settled = await settleLine(db, c, linkLineId, { ctx });
+    }
     if (dryRun) await db.query(`ROLLBACK TO SAVEPOINT ${batch}`);
   } catch (e) {
     // Whatever went wrong, the batch leaves nothing behind in the caller's transaction.
@@ -785,7 +913,19 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
   }
 
   const counts = countsOf(results, removes, doomed, removedKeys);
-  return { applied: !dryRun, dryRun, summary: { sentence: sentenceOf(counts), counts }, results };
+  // What happened to linked copies, in the shape of plan §3. A later settle sees everything an
+  // earlier one did, so a row is listed once, by what it ended as.
+  const breakOf = new Map();
+  for (const b of [...valueLinks.flatMap((v) => v.breaks ?? []), ...(settled?.breaks ?? [])]) breakOf.set(b.recordId, b);
+  const touchedAll = [...valueLinks.flatMap((v) => v.touched ?? []), ...linkTouched.map(({ said, ...t }) => t)];
+  const links = {
+    needsChoice: valueLinks.some((v) => v.needsChoice) || touchedAll.some((t) => t.choice == null && (t.reason === 'quantity' || t.reason === 'remove') && breakOf.has(t.recordId)),
+    touched: touchedAll,
+    breaks: [...breakOf.values()],
+    skipped: [...valueLinks.flatMap((v) => v.skipped ?? []), ...linkSkipped],
+    after: settled?.links ? linksBlock(settled.links) : valueLinks.length ? valueLinks[valueLinks.length - 1].after : null,
+  };
+  return { applied: !dryRun, dryRun, summary: { sentence: sentenceOf(counts), counts }, results, links };
 }
 
 /* ===========================================================================
@@ -811,6 +951,9 @@ function countsOf(results, removes, doomed, removedKeys) {
     rearranged: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.reordered, 0),
     moved: done.filter((r) => r.op === 'arrange').reduce((n, r) => n + r.moved, 0),
     values: done.filter((r) => r.op === 'values').reduce((n, r) => n + r.changed, 0),
+    linked: done.filter((r) => r.op === 'link').reduce((n, r) => n + r.recordIds.length, 0),
+    unlinked: done.filter((r) => r.op === 'unlink').length,
+    onCopies: done.filter((r) => r.fanned === true).length + done.filter((r) => r.op === 'values').reduce((n, r) => n + (r.fanned ?? 0), 0),
     pasted: pasted.length,
     copiedItems: pasted.reduce((n, r) => n + r.created, 0),
     removed: done.filter((r) => r.op === 'remove' && !r.withParent).length,
@@ -829,6 +972,8 @@ function sentenceOf(k) {
   if (k.rearranged) bits.push(plural(k.rearranged, 'BOM rearranged', 'BOMs rearranged'));
   if (k.moved) bits.push(plural(k.moved, 'row moved to another parent', 'rows moved to another parent'));
   if (k.values) bits.push(plural(k.values, 'value changed', 'values changed'));
+  if (k.linked) bits.push(`${k.linked} rows linked as copies`);
+  if (k.unlinked) bits.push(plural(k.unlinked, 'row unlinked', 'rows unlinked'));
   if (k.pasted) {
     bits.push(`${plural(k.pasted, 'line pasted', 'lines pasted')}${k.copiedItems ? ` (${plural(k.copiedItems, 'new row', 'new rows')})` : ''}`);
   }
@@ -967,9 +1112,12 @@ async function copyInto(db, c, snap, ch, afterLineId) {
   const sharedPlates = new Set(); // cut plates the copy points at rather than duplicates
   if (ch.mode === 'line' && row.child_item_type === 'temporary') sharedPlates.add(labelOf(ch.source.entry.node));
   if (ch.mode === 'copy') {
-    const out = await writeCopies(db, c, snap, [{ srcId: row.child_id, ownerLineId: target.owner_order_line_id }]);
+    // A copy on an order line is LINKED to what it was copied from, row by row ("same design",
+    // linkService): each copied row takes its source's group, and the drawings it is built to.
+    const out = await writeCopies(db, c, snap, [{ srcId: row.child_id, ownerLineId: target.owner_order_line_id }], { links: target.owner_order_line_id ? 'same' : null });
     if (!out.levels.length) throw invalid('NOT_FOUND', `${labelOf(ch.source.entry.node)} could not be read to copy it.`);
     ({ idMap, levels } = out);
+    if (target.owner_order_line_id) await copyDrawingLinks(db, c, idMap);
     for (const label of out.shared) sharedPlates.add(label);
   }
 

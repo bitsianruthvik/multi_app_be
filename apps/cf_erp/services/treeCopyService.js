@@ -30,6 +30,7 @@ import { insertRows } from '../lib/db.js';
 import { subtreeIds } from './tree.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
 import { dateText, parseJsonCol } from './resolutionService.js';
+import { newGroupKey } from './linkService.js';
 
 export const MAX_COPY_DEPTH = 25;
 const ID_CHUNK = 500;   // ids per IN list
@@ -73,7 +74,7 @@ export async function snapshotSubtrees(db, companyId, rootIds, copies) {
     for (const part of chunk(level, ID_CHUNK)) {
       const [rows] = await db.query(
         `SELECT m.id, m.code, m.name, m.short_name, m.description, m.classification_id, m.default_flow_id, m.status,
-                i.tracked_by, i.uom, i.source_definition_id,
+                i.tracked_by, i.uom, i.source_definition_id, i.link_group,
                 b.id AS bom_id, b.status AS bom_status, b.source_bom_id, b.revision AS bom_revision, b.notes AS bom_notes
            FROM cf_master_records m
            JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL AND i.item_type = 'temporary'
@@ -181,6 +182,16 @@ const markerToken = () => `${Date.now().toString(36)}${Math.random().toString(36
  *             at the same item (the shared cut plate of a paste) unless this
  *             says no (a revision derives the new line's own).
  *
+ *   links     how the copies are LINKED to what they were copied from ("same design", linkService):
+ *             'same'   a copy made beside its original (a paste): each copied row takes its
+ *                      source's group key; a source with none gets a new one, written on both —
+ *                      so a copy of a copy joins the same group. One extra UPDATE.
+ *             'fresh'  a copy made INSTEAD of its original (a revision, a copied order): every
+ *                      group among the sources becomes a new group among the copies — the copies
+ *                      stay linked to each other, never to the rows they came from (a group
+ *                      stays inside one order line).
+ *             absent   the copies are not linked at all.
+ *
  * The TOP line of each root is the caller's to write — a paste puts it into the
  * target's BOM, a revision hangs the root on its new sales line.
  *
@@ -193,7 +204,7 @@ const markerToken = () => `${Date.now().toString(36)}${Math.random().toString(36
  * Returns { idMap: Map(source id -> copy id), levels: [[source id]] (parents
  * before children), shared: Set(labels of temporary items pointed at, not copied) }.
  */
-export async function writeCopies(db, c, snap, roots, { keepLine = () => true, chunk: rows = 200 } = {}) {
+export async function writeCopies(db, c, snap, roots, { keepLine = () => true, chunk: rows = 200, links = null } = {}) {
   const companyId = c.companyId;
 
   // ---- which items, parents before children, and whose line each belongs to --
@@ -235,12 +246,37 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
   for (const b of born) idMap.set(Number(String(b.code).split('~').pop()), b.id);
   if (idMap.size !== srcIds.length) throw new Error(`cf_erp: ${srcIds.length} copies written, ${idMap.size} read back.`);
 
+  // The group each copy joins (see `links` above). 'same' also puts a keyless source into its new group.
+  const keyOf = new Map();
+  const newlyKeyed = [];
+  if (links === 'same') {
+    for (const id of srcIds) {
+      const had = snap.items.get(id).link_group ?? null;
+      const key = had ?? newGroupKey();
+      keyOf.set(id, key);
+      if (!had) { newlyKeyed.push([id, key]); snap.items.get(id).link_group = key; }   // a second paste of the same source joins it
+    }
+  } else if (links === 'fresh') {
+    const fresh = new Map();
+    for (const id of srcIds) {
+      const had = snap.items.get(id).link_group ?? null;
+      if (!had) continue;
+      if (!fresh.has(had)) fresh.set(had, newGroupKey());
+      keyOf.set(id, fresh.get(had));
+    }
+  }
   await insertRows(db, 'cf_item_details',
-    ['master_id', 'company_id', 'item_type', 'tracked_by', 'uom', 'sourcing', 'source_definition_id', 'owner_order_line_id'],
+    ['master_id', 'company_id', 'item_type', 'tracked_by', 'uom', 'sourcing', 'source_definition_id', 'owner_order_line_id', 'link_group'],
     srcIds.map((id) => {
       const s = snap.items.get(id);
-      return [idMap.get(id), companyId, 'temporary', s.tracked_by, s.uom, 'make', s.source_definition_id, ownerOf.get(id)];
+      return [idMap.get(id), companyId, 'temporary', s.tracked_by, s.uom, 'make', s.source_definition_id, ownerOf.get(id), keyOf.get(id) ?? null];
     }), rows);
+  for (const part of chunk(newlyKeyed, ID_CHUNK)) {
+    const params = [];
+    const whens = part.map(([id, key]) => { params.push(id, key); return 'WHEN ? THEN ?'; }).join(' ');
+    params.push(companyId, part.map(([id]) => id));
+    await db.query(`UPDATE cf_item_details SET link_group = CASE master_id ${whens} END, link_apart = 0 WHERE company_id = ? AND master_id IN (?) AND deleted_at IS NULL`, params);
+  }
 
   // ---- their BOMs -------------------------------------------------------------
   const withBom = srcIds.filter((id) => snap.items.get(id).bom_id);
@@ -325,6 +361,33 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
     await db.query('UPDATE cf_master_records SET code = NULL WHERE company_id = ? AND id IN (?)', [companyId, part]);
   }
   return { idMap, levels, shared };
+}
+
+/**
+ * The drawings each copied row is built to: every live LINK of a source row is copied onto its
+ * copy, pointing at the same drawing revision with the same note. The drawings are never touched —
+ * a revision of a drawing is its own row — and the source keeps its links exactly as they were.
+ * A copy without them would not be the same design as its original (the drawing is part of the
+ * design), so every deep copy calls this: a paste, a revision, a copied order.
+ * One read per 500 rows, one INSERT. `idMap`: Map(source id -> copy id). → how many links were written.
+ */
+export async function copyDrawingLinks(db, c, idMap, { chunk: rows = 500 } = {}) {
+  const companyId = c.companyId;
+  const links = [];
+  for (const part of chunk([...idMap.keys()], ID_CHUNK)) {
+    const [found] = await db.query(
+      `SELECT drawing_id, subject_type, subject_id, note FROM cf_drawing_links
+        WHERE company_id = ? AND subject_type = 'master_record' AND subject_id IN (?) AND deleted_at IS NULL
+        ORDER BY id`,
+      [companyId, part],
+    );
+    links.push(...found);
+  }
+  if (links.length) {
+    await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'note', 'created_by'],
+      links.map((l) => [companyId, l.drawing_id, l.subject_type, idMap.get(Number(l.subject_id)), l.note, c.userId ?? null]), rows);
+  }
+  return links.length;
 }
 
 /**

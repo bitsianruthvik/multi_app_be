@@ -97,6 +97,7 @@ import { childWordReader, valueWord } from './bomGraph.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues } from './valueService.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
+import { loadDesignExtras, linksOf, linksBlock, settleLine, designValueOf } from './linkService.js';
 
 /** explode()'s depth cap, so this screen and the Structure tab stop at the same place. */
 const MAX_DEPTH = 15;
@@ -141,6 +142,8 @@ const labelOf = (rec, ctx = null) => {
   }
   return parts.join(' › ');
 };
+/** labelOf, for the services that work from this one's context (linkService). */
+export const labelOfRecord = (rec, ctx = null) => (rec ? labelOf(rec, ctx) : null);
 const isOwn = (ctx, rec) => rec.record_kind === 'item' && rec.item_type === 'temporary' && rec.owner_order_line_id === ctx.line.id;
 
 /** The structure tree's own words for a node that is not this order's work (BomPanel.whyNotValues). */
@@ -217,9 +220,10 @@ const STRUCTURE_SQL = `
  * and linesOfBom (what a roll-up reads) does not filter them either.
  */
 const RECORDS_SQL = `
-  SELECT m.id, m.record_kind, m.code, m.short_name, m.name, m.status, m.classification_id,
+  SELECT m.id, m.record_kind, m.code, m.short_name, m.name, m.status, m.classification_id, m.cut_stock_id,
          (m.deleted_at IS NOT NULL) AS is_deleted,
          i.item_type, i.tracked_by, i.uom, i.source_definition_id, i.owner_order_line_id,
+         i.link_group, i.link_apart,
          d.definition_type,
          sd.id AS def_id, sd.code AS def_code, sd.short_name AS def_short_name, sd.name AS def_name,
          so.id AS owner_order_id, so.code AS owner_order_code, so.status AS owner_order_status,
@@ -271,7 +275,7 @@ const subjectKey = (type, id) => `${type}:${id}`;
  * take turns instead of each re-working roll-ups from what the other has not
  * committed yet.
  */
-async function loadContext(db, companyId, lineId, { lock = false } = {}) {
+export async function loadContext(db, companyId, lineId, { lock = false } = {}) {
   const line = await loadLine(db, companyId, lineId, { lock });
 
   // ---- the structure ------------------------------------------------------
@@ -324,7 +328,10 @@ async function loadContext(db, companyId, lineId, { lock = false } = {}) {
   const masterIds = [...new Set([...records.values()].flatMap((r) => (r.def_id ? [r.id, r.def_id] : [r.id])))];
   const scopeA = subjectScope('a', clsIds, masterIds);
   const scopeV = subjectScope('v', clsIds, masterIds);
-  const [[ruleRows], [valueRows]] = await Promise.all([
+  // The 9th read (init.sql §59): the drawings linked to the line's own rows and the cut places —
+  // what a row's design fingerprint needs beyond its values (linkService). Out with the two below.
+  const ownIds = [...records.values()].filter((r) => !r.is_deleted && r.record_kind === 'item' && r.item_type === 'temporary' && r.owner_order_line_id === line.id).map((r) => r.id);
+  const [[ruleRows], [valueRows], designExtras] = await Promise.all([
     db.query(
       `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
               a.value_rule, a.formula_id, a.sort_order, a.origin,
@@ -343,6 +350,7 @@ async function loadContext(db, companyId, lineId, { lock = false } = {}) {
         WHERE v.company_id = ? AND v.deleted_at IS NULL AND (${scopeV.sql})`,
       [companyId, ...scopeV.params],
     ),
+    loadDesignExtras(db, companyId, ownIds),
   ]);
 
   const rulesBySubject = new Map();
@@ -396,7 +404,7 @@ async function loadContext(db, companyId, lineId, { lock = false } = {}) {
 
   return {
     companyId, line, lines, linesByParent, linesByChild, truncated, records, chains,
-    rulesBySubject, specMeta, store, optionsBySpec, narrowedBy,
+    rulesBySubject, specMeta, store, optionsBySpec, narrowedBy, designExtras,
     formulaCache: new Map(),
   };
 }
@@ -489,7 +497,7 @@ function rollupChildrenOf(ctx, rec) {
  * from the loaded rows. Kept in resolve()'s own order, statement for
  * statement, so the two read side by side.
  */
-function resolveRecord(ctx, rec) {
+export function resolveRecord(ctx, rec) {
   const chain = chainOf(ctx, rec);
   const mode = rec.record_kind === 'item' ? 'item' : 'setup';
   const levelOf = new Map(chain.map((s, i) => [subjectKey(s.subjectType, s.subjectId), i]));
@@ -1145,11 +1153,13 @@ function buildView(ctx) {
   // ---- every row, every cell, in full --------------------------------------
   const groups = new Map();
   const counts = { rows: 0, own: 0, shared: 0, missingOwn: 0, missingShared: 0, rowsMissing: 0, unresolved: 0, noValues: 0 };
+  const resolved = new Map();   // shared with the links below: every record is worked out once
   for (const id of order) {
     const rec = ctx.records.get(id);
     if (!rec || rec.is_deleted) continue;
     if (rec.record_kind !== 'item') { counts.unresolved += 1; continue; } // a selection not chosen yet
     const r = resolveRecord(ctx, rec);
+    resolved.set(id, r);
     const applicable = r.specs.filter((s) => s.applicable && s.captureAt === 'item');
     if (!applicable.length) { counts.noValues += 1; continue; }
 
@@ -1301,6 +1311,9 @@ function buildView(ctx) {
     counts,
     optionLists,
     groups: list.map(shapeGroup),
+    // Linked copies (init.sql §59) — keyed by record id and top-level, because a row with no
+    // applicable value is not in `groups` at all (finding F4): { rows: { id: {g,n} | {same} | {apart} }, groups }.
+    links: linksBlock(linksOf(ctx, ctx.designExtras, { resolved })),
   };
 }
 
@@ -1312,6 +1325,9 @@ function buildView(ctx) {
 export async function readLineValues(db, companyId, lineId) {
   return buildView(await loadContext(db, companyId, lineId));
 }
+
+/** What a save on a linked copy may say: `all` = every copy of the design, `one` = only the rows named (they stop being copies). */
+export const LINK_CHOICES = ['all', 'one'];
 
 /** Every write as given, or the problem with its shape. */
 function readWrites(input, problems) {
@@ -1332,7 +1348,8 @@ function readWrites(input, problems) {
       problems.push(`${where}: value must be text, a number, yes/no, a table or null.`);
       return;
     }
-    out.push({ index: i, recordId, specCode: w.specCode.trim().toUpperCase(), value });
+    if (w.links != null && !LINK_CHOICES.includes(w.links)) { problems.push(`${where}: links must be "all" (every linked copy) or "one" (only this row).`); return; }
+    out.push({ index: i, recordId, specCode: w.specCode.trim().toUpperCase(), value, links: w.links ?? null });
   });
   return out;
 }
@@ -1372,6 +1389,8 @@ export async function writeLineValues(db, c, lineId, input = {}) {
   const dryRun = input.dryRun === true || input.dryRun === 'true' || input.dryRun === 1 || input.dryRun === '1';
   const shapeProblems = [];
   const writes = readWrites(input.writes, shapeProblems);
+  if (input.links != null && !LINK_CHOICES.includes(input.links)) shapeProblems.push('links must be "all" (every linked copy) or "one" (only the rows named).');
+  const linkChoice = input.links ?? null;
   if (shapeProblems.length) throw invalid('INVALID', `${dryRun ? 'These values cannot be saved' : 'Nothing was saved'} — ${plural(shapeProblems.length, 'problem')} to fix first.`, { problems: shapeProblems });
 
   const ctx = await loadContext(db, c.companyId, lineId, { lock: true });
@@ -1398,6 +1417,14 @@ export async function writeLineValues(db, c, lineId, input = {}) {
   const resolutions = new Map();
   const plan = new Map(); // recordId -> [{ spec, typed, source }]
   const seen = new Set();
+  // Linked copies as they stand BEFORE this save, and the valid writes that land on one.
+  // (A line with no linked row at all pays nothing for this: no fingerprints, no settle.)
+  const anyLinked = [...ctx.records.values()].some((r) => r.link_group);
+  const pre = anyLinked ? linksOf(ctx, ctx.designExtras, { resolved: resolutions }) : { byRecord: new Map(), groups: new Map() };
+  const flowRules = new Set();
+  for (const list of ctx.rulesBySubject.values()) for (const r of list) if (r.origin === 'flow') flowRules.add(r.id);
+  const explicit = new Map();   // `${recordId}:${SPEC}` -> typed, for every valid write as given
+  const onLinked = [];          // [{ w, rec, s, typed, group }]
   for (const w of writes) {
     const rec = ctx.records.get(w.recordId);
     if (!rec || rec.is_deleted || !inStructure.has(w.recordId)) {
@@ -1451,9 +1478,55 @@ export async function writeLineValues(db, c, lineId, input = {}) {
     }
     if (!plan.has(rec.id)) plan.set(rec.id, []);
     plan.get(rec.id).push({ spec: { id: s.spec.id, code: s.spec.code, default_uom: s.spec.unit }, typed: out.typed, source: 'entered', worked: isWorkedDefault(s.rule) });
+    explicit.set(key, out.typed);
+    const group = pre.byRecord.get(rec.id)?.g ?? null;
+    if (group && designValueOf(s, flowRules).design) onLinked.push({ w, rec, s, typed: out.typed, group });
+  }
+
+  // ---- linked copies: what was changed on one, and whether the others follow ----
+  // `all` adds the same write for every other copy; `one` (and saying nothing) adds none, and the
+  // settle below then takes the row out of its group. A batch that already gives every copy the
+  // same value needs no choice. Two different values for one design under `all` cannot both be true.
+  const touched = new Map();   // recordId -> { recordId, label, group, count, members, specs, reason, choice }
+  const skipped = [];
+  const fanned = new Map();    // `${recordId}:${SPEC}` -> typed, added for a copy
+  const sameTyped = (a, b) => (a == null || b == null ? a == null && b == null : sameValue({ ...EMPTY, ...a }, { ...EMPTY, ...b }));
+  let linkConflicts = 0;
+  for (const { w, rec, s, typed, group } of onLinked) {
+    const members = pre.groups.get(group);
+    const mates = members.filter((id) => id !== rec.id);
+    const unanimous = mates.every((id) => explicit.has(`${id}:${w.specCode}`) && sameTyped(explicit.get(`${id}:${w.specCode}`), typed));
+    const choice = w.links ?? linkChoice ?? (unanimous ? 'all' : null);
+    if (!touched.has(rec.id)) touched.set(rec.id, { recordId: rec.id, label: labelOf(rec, ctx), group, count: members.length, members, specs: [], reason: 'values', choice, said: [] });
+    const t = touched.get(rec.id);
+    t.specs.push(s.spec.code);
+    t.said.push(choice);
+    // One row, several values: `one` on any of them takes the row out; `all` only when every one says so.
+    t.choice = t.said.includes('one') ? 'one' : t.said.every((x) => x === 'all') ? 'all' : null;
+    if (choice !== 'all') continue;
+    for (const id of mates) {
+      const k = `${id}:${w.specCode}`;
+      const other = explicit.has(k) ? explicit.get(k) : fanned.has(k) ? fanned.get(k) : undefined;
+      if (other !== undefined) {
+        if (!sameTyped(other, typed)) { linkConflicts += 1; say(rec, s.spec.code, `is given two different values for linked copies of one design (${labelOf(ctx.records.get(id), ctx)} gets another) — "apply to all copies" needs one value. Give one, or save these rows on their own.`); }
+        continue;
+      }
+      const mate = ctx.records.get(id);
+      if (!resolutions.has(id)) resolutions.set(id, resolveRecord(ctx, mate));
+      const ms = resolutions.get(id).specs.find((x) => x.captureAt === 'item' && x.spec.code.toUpperCase() === w.specCode);
+      const cannot = !ms || !ms.applicable ? 'this value is not part of its setup'
+        : frozenBy(mate) ? 'it is frozen'
+          : (!isWorkedDefault(ms.rule) && workedOutWhy(ms.spec.code)) || ms.spec.dataType === 'table' || !['entered', 'defaulted'].includes(ms.rule.valueRule) ? 'the value is not typed on it'
+            : null;
+      const coerced = cannot ? null : await coerceFor(db, ctx, ms, w.value);
+      if (cannot || coerced.problem) { skipped.push({ recordId: id, label: labelOf(mate, ctx), specCode: s.spec.code, why: cannot ?? coerced.problem }); continue; }
+      if (!plan.has(id)) plan.set(id, []);
+      plan.get(id).push({ spec: { id: ms.spec.id, code: ms.spec.code, default_uom: ms.spec.unit }, typed: coerced.typed, source: 'entered', worked: isWorkedDefault(ms.rule) });
+      fanned.set(k, coerced.typed);
+    }
   }
   if (problems.length) {
-    throw invalid('INVALID', `${dryRun ? 'These values cannot be saved' : 'Nothing was saved'} — ${plural(problems.length, 'problem')} to fix first.`, { problems, detail: { cells } });
+    throw invalid(linkConflicts === problems.length ? 'LINK_CONFLICT' : 'INVALID', `${dryRun ? 'These values cannot be saved' : 'Nothing was saved'} — ${plural(problems.length, 'problem')} to fix first.`, { problems, detail: { cells } });
   }
 
   // ---- work it out in memory ----------------------------------------------
@@ -1505,11 +1578,15 @@ export async function writeLineValues(db, c, lineId, input = {}) {
   // ---- write the net difference -------------------------------------------
   let flushed = { values: 0, history: [] };
   let view = null;
+  let breaks = [];
   if (order.records.length) {
     const sp = `cf_order_values_${savepointNo += 1}`;
     await db.query(`SAVEPOINT ${sp}`);
     try {
       flushed = await flush(db, c, ctx, initial, order);
+      // Linked copies: a row changed on its own is not a copy any more — and neither is a linked
+      // row above it. Worked out from the same rows in memory; at most one UPDATE per 500 rows.
+      if (anyLinked) breaks = (await settleLine(db, c, lineId, { ctx })).breaks;
       // A parent OUTSIDE this structure reads one of these records too. Nothing
       // builds that today; if it ever happens, valueService does the rest from
       // the flushed rows, at its own per-record cost — and the grid is read
@@ -1550,12 +1627,27 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       + (derived.length ? `; ${plural(derived.length, 'worked-out value')} ${dryRun ? 'would follow' : 'followed'}` : '')
       + ` across ${plural(records, 'item')}.`;
 
+  const finalView = view ?? buildView(ctx);
+  const broke = new Set(breaks.map((b) => b.recordId));
+  const touchedList = [...touched.values()].map(({ said, ...t }) => t);
   return {
     applied: !dryRun,
     dryRun,
+    // Linked copies (plan §3): what was touched, what stops being a copy, what could not follow.
+    // needsChoice — a linked row was changed on its own and nobody said whether the copies follow:
+    // the server changed only the rows named (it never changes a row the request did not name).
+    links: {
+      needsChoice: touchedList.some((t) => t.choice == null && broke.has(t.recordId)),
+      touched: touchedList,
+      breaks,
+      skipped,
+      fanned: fanned.size,
+      after: finalView.links,
+    },
     summary: {
       sentence,
       given: writes.length,
+      fanned: fanned.size,
       changed: typedChanges.length,
       derived: derived.length,
       records,
@@ -1568,7 +1660,7 @@ export async function writeLineValues(db, c, lineId, input = {}) {
     }),
     // What the grid looks like now (for a dry run: what it WOULD look like),
     // worked out from the same rows that were just written — no second read.
-    view: view ?? buildView(ctx),
+    view: finalView,
   };
 }
 
@@ -1645,6 +1737,42 @@ export async function compareLineValues(db, companyId, lineId, { thaw = false, f
 export async function materializeLine(db, c, lineId) {
   const [rows] = await db.query("SELECT master_id FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND item_type = 'temporary' AND deleted_at IS NULL", [c.companyId, lineId]);
   return rows.length ? materializeLineRecords(db, c, lineId, rows.map((r) => r.master_id)) : { records: 0, values: 0 };
+}
+
+/**
+ * What some cells of a line hold, for a service that wants to fill only the EMPTY ones (a drawing's
+ * size, the thickness and grade its file name states — partDrawingService). Pure, from a context.
+ * → Map(recordId -> Map(CODE -> { typeable, empty, raw, optionValue, display, options })) for the
+ *   order's own rows asked for; a spec that does not apply to a row is absent from its map.
+ *   typeable   the rule lets a person type it on this row (entered / defaulted, not a table, not
+ *              worked out) — whether the LINE still takes values (ctx.line.lockedAt) is the caller's to ask
+ *   empty      nothing is there at all — not typed, no default, no calculated answer
+ *   options    for an option spec: [{ id, value, label }] this row may take
+ */
+export function cellStates(ctx, recordIds, codes) {
+  const want = new Set(codes.map((x) => String(x).toUpperCase()));
+  const out = new Map();
+  for (const id of recordIds) {
+    const rec = ctx.records.get(Number(id));
+    if (!rec || rec.is_deleted || !isOwn(ctx, rec)) continue;
+    const cells = new Map();
+    for (const s of resolveRecord(ctx, rec).specs) {
+      const code = String(s.spec.code).toUpperCase();
+      if (!want.has(code) || !s.applicable || s.captureAt !== 'item') continue;
+      const workedOut = isWorkedDefault(s.rule) ? null : workedOutWhy(s.spec.code);
+      cells.set(code, {
+        typeable: !workedOut && s.spec.dataType !== 'table' && ['entered', 'defaulted'].includes(s.rule.valueRule),
+        empty: s.value == null,
+        raw: s.value?.raw ?? null,
+        optionValue: s.value?.optionValue ?? null,
+        display: s.value?.display ?? null,
+        dataType: s.spec.dataType,
+        options: s.spec.dataType === 'option' ? (s.options ?? []) : null,
+      });
+    }
+    out.set(Number(id), cells);
+  }
+  return out;
 }
 
 /** For the test: the mirror, exposed so it can be compared with resolve() record by record. */

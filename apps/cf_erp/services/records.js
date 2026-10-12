@@ -164,6 +164,16 @@ export const workedOutWhy = (code) => {
 export const LIVE_WHEN_FROZEN = new Set(['SHIP_UNIT']);
 
 /**
+ * Values that are NOT part of a row's DESIGN — a linked copy ("same design", linkService, init.sql
+ * §59) stays linked whatever these say; they are never fanned out to the other copies and never
+ * asked about: the drawing mark (decision D4 — rows equal except their mark are the same design;
+ * the drawing itself counts through the register link), what cutting and nesting work out, what
+ * the drawing says (it follows the drawing, which is already in the fingerprint), and the planning
+ * values set after lock.
+ */
+export const NOT_DESIGN_SPECS = new Set(['DRAWING_MARK', ...WORKED_OUT_SPECS, ...DRAWING_FACT_SPECS, ...AFTER_LOCK_SPECS, ...LIVE_WHEN_FROZEN]);
+
+/**
  * What freezes this record, or null: its order is closed, lost, cancelled or
  * revised (reason 'closed'; orderStatus says which), its line was released to
  * production ('released'), or its line was LOCKED ('locked' — the pieces and

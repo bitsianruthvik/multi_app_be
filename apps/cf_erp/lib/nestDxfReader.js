@@ -817,6 +817,79 @@ function hintsFrom(strings, filename) {
   return h;
 }
 
+/**
+ * The thickness and grade a FILE NAME carries beside its mark or code: TFL1_25mm_E350.dxf,
+ * L(1,5)-1-TFL1_t25.dxf. Tokens are set off by an underscore, a space, a comma or a semicolon —
+ * OUTSIDE brackets, so the comma of L(1,5) is not one — and a token that reads as a thickness
+ * (25mm, 25thk, t25, thk25) or as a grade is a hint. The FIRST token never is: a name is a mark or
+ * a code first (a part marked E350 keeps its mark).
+ * → { thicknessMm, grade, hintTokens: [], rest: [], restText } — restText is the name without its
+ *   ending and its hint tokens, the other tokens as they were written.
+ */
+export function nameTokenHints(filename) {
+  const base = String(filename ?? '').split(/[\\/]/).pop().replace(/\.(dxf|pdf)$/i, '').trim();
+  const tokens = [];   // { text, lead } — lead: the separators written before it
+  let cur = ''; let lead = ''; let depth = 0; let gap = '';
+  for (const ch of base) {
+    if (ch === '(') depth += 1;
+    if (!depth && /[_\s,;]/.test(ch)) {
+      if (cur) { tokens.push({ text: cur, lead }); cur = ''; gap = ''; }
+      gap += ch;
+    } else { if (!cur) lead = gap; cur += ch; }
+    if (ch === ')') depth = Math.max(0, depth - 1);
+  }
+  if (cur) tokens.push({ text: cur, lead });
+  const out = { thicknessMm: null, grade: null, hintTokens: [], rest: [], restText: '' };
+  tokens.forEach((t, i) => {
+    const tok = t.text;
+    if (i > 0) {
+      const m = tok.match(/^(\d+(?:\.\d+)?)\s*(?:mm|thk|t)$/i) ?? tok.match(/^(?:t|thk)(\d+(?:\.\d+)?)$/i);
+      if (m && Number(m[1]) > 0 && Number(m[1]) <= 300) { if (out.thicknessMm == null) out.thicknessMm = Number(m[1]); out.hintTokens.push(tok); return; }
+      const g = tok.match(GRADE);
+      if (g && g[1].length === tok.length) { if (out.grade == null) out.grade = tok.toUpperCase(); out.hintTokens.push(tok); return; }
+    }
+    out.restText += (out.rest.length ? t.lead || '_' : '') + tok;
+    out.rest.push(tok);
+  });
+  return out;
+}
+
+/**
+ * The thickness and grade a part drawing's own WORDS state (its title block, a note): every TEXT,
+ * MTEXT and attribute of the file, blocks included, read without building any geometry. Stricter
+ * than a nest's title hints — a part drawing is full of dimensions, so a bare "150 mm" is NOT a
+ * thickness here: only THK / THICK / T= / PL forms and a full L x W x T size are.
+ * → { thicknessMm, grade, texts } — nulls when the file says neither (or does not read).
+ */
+export function dxfTextHints(text) {
+  const out = { thicknessMm: null, grade: null, texts: 0 };
+  let dxf;
+  try { dxf = readSections(pairsOf(String(text ?? ''))); } catch { return out; }
+  const strings = [];
+  const take = (e) => {
+    if (!['TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'].includes(e.type)) return;
+    let s = e.type === 'MTEXT' ? plainMtext(e.codes.filter((p) => p[0] === 3).map((p) => p[1]).join('') + str(e.codes, 1)) : str(e.codes, 1);
+    s = s.replace(/%%[cdpCDP]/g, '').trim();
+    if (s) strings.push(s);
+  };
+  dxf.entities.forEach(take);
+  for (const b of dxf.blocks.values()) b.entities.forEach(take);
+  out.texts = strings.length;
+  for (const s of strings) {
+    for (const line of s.split('\n')) {
+      if (out.thicknessMm == null) {
+        const t = line.match(/(?:THK|THICK(?:NESS)?)\s*[=:.]?\s*(\d+(?:\.\d+)?)/i) ?? line.match(/(\d+(?:\.\d+)?)\s*(?:mm)?\s*(?:THK|THICK)(?![a-z])/i)
+          ?? line.match(/(?:^|[^A-Z0-9])T\s*[=:]\s*(\d+(?:\.\d+)?)/i) ?? line.match(/(?:^|[^A-Z0-9])PL(?:T|ATE)?\.?\s*(\d+(?:\.\d+)?)\s*(?:mm)?(?![0-9]*\s*[x×*])/i);
+        const three = t ? null : line.match(SIZE3);
+        if (t && Number(t[1]) > 0 && Number(t[1]) <= 300) out.thicknessMm = Number(t[1]);
+        else if (three) { const v = three.slice(1, 4).map(Number).sort((a, b) => a - b); if (v[0] > 0 && v[0] <= 300 && v[1] >= 50) out.thicknessMm = v[0]; }
+      }
+      if (out.grade == null) { const m = line.match(GRADE); if (m) out.grade = m[1].replace(/\s+/g, ' ').trim().toUpperCase(); }
+    }
+  }
+  return out;
+}
+
 /* ───────────────────────────── readNestDxf ───────────────────────────── */
 
 /**

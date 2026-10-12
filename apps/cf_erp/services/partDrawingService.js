@@ -50,6 +50,16 @@
  * A line released to production takes no drawing changes. One live drawing per line and mark;
  * uploading a mark again replaces it. Cut pieces are never matched — they are worked out.
  *
+ * BY CODE, AND TO EVERY COPY (2026-10-12, CF_ERP_LINKED_COPIES_PLAN.md). A file is matched in this
+ * order: aimed at a row or a register drawing → its NAME as the end of the rows' code, the way the
+ * screen prints it (`L(1,5)-1-TFL1.dxf`; lib/drawingName.js — the code preview before the design
+ * is frozen, the real piece codes after) → its name as a drawing mark (whole, then without the
+ * thickness / grade it carries). Matching never depends on sizes: drawings are often uploaded
+ * before a dimension is typed. Every linked copy of a row found ("same design", linkService) takes
+ * the drawing too — the drawing is part of the design, so a copy without it would stop being one.
+ * The size, thickness and grade a file states go into the cells that are still EMPTY, in one bulk
+ * write (uploadDrawings says how).
+ *
  * WHAT A SHAPE SAYS IS WRITTEN ON THE PART (2026-10-12): its true area, its holes and their
  * diameter, as values the tenant's formulas read — the part's weight and surface by its TRUE shape
  * (drawingValueService.refreshDrawingValues). Run here after every upload (a new file, a replaced
@@ -64,6 +74,8 @@ import { explode } from './bomService.js';
 import { readPartDrawing, orientTo } from './partGeometry.js';
 import { createDrawing, reviseDrawing } from './drawingService.js';
 import { nextRevision } from '../lib/revision.js';
+import { parseDrawingName, matchCodePattern, codeWithNumbers } from '../lib/drawingName.js';
+import { dxfTextHints } from '../lib/nestDxfReader.js';
 
 const FALLBACK_DENSITY = 7850;
 // A row is one TiDB entry (6 MB at most): a 4 MB file is 5.3 MB as base64.
@@ -78,7 +90,7 @@ const parseJson = (v) => { if (v == null) return null; if (typeof v !== 'string'
 
 async function requireLine(db, companyId, orderId, lineId) {
   const [[l]] = await db.query(
-    `SELECT l.id, l.order_id, l.line_no, l.line_type, l.item_id, l.quantity, o.code AS order_code,
+    `SELECT l.id, l.order_id, l.line_no, l.line_type, l.item_id, l.quantity, l.locked_at, o.code AS order_code,
             EXISTS (SELECT 1 FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL) AS released
        FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL${orderId != null ? ' AND l.order_id = ?' : ''}`,
@@ -452,17 +464,32 @@ async function liveRevisionOf(db, companyId, id) {
  * START a drawing from rows of the line, before any file exists — the register entry (number,
  * revision, title, customer's or ours, draft or issued) linked to those rows. Its file comes later
  * (upload with drawingId, or by the rows' drawing mark).
- * input: { rowIds, number, revision?, title?, source?, status?, notes? }
+ * input: { rowIds, number, revision?, title?, source?, status?, notes?, links? }
+ * Every linked copy of a chosen row is covered too ("same design" — the drawing is part of it),
+ * unless `links: 'one'`; the answer's `fanOut` says which rows were added.
  */
 export async function startDrawing(db, c, orderId, lineId, input = {}) {
   const companyId = c.companyId;
   const line = await requireLine(db, companyId, orderId, lineId);
   const rows = await rowsOfLine(db, companyId, line);
-  const want = [...new Set((Array.isArray(input.rowIds) ? input.rowIds : []).map(Number).filter(Number.isInteger))];
-  if (!want.length) throw invalid('NO_ROWS', 'Choose the row (or rows) the drawing is for.');
+  const chosen = [...new Set((Array.isArray(input.rowIds) ? input.rowIds : []).map(Number).filter(Number.isInteger))];
+  if (!chosen.length) throw invalid('NO_ROWS', 'Choose the row (or rows) the drawing is for.');
   const byId = new Map(rows.map((p) => [p.id, p]));
-  const foreign = want.filter((id) => !byId.has(id));
+  const foreign = chosen.filter((id) => !byId.has(id));
   if (foreign.length) throw invalid('NOT_ON_LINE', `${foreign.length === 1 ? 'A chosen row is' : `${foreign.length} chosen rows are`} not on line ${line.line_no} of ${line.order_code}.`);
+  // The copies of the rows chosen: one cheap question, and the line's links only when it has any.
+  const fanOut = { fromRowIds: [], added: [], skipped: [] };
+  const [[anyLinked]] = await db.query(
+    "SELECT 1 AS x FROM cf_item_details WHERE company_id = ? AND master_id IN (?) AND link_group IS NOT NULL AND deleted_at IS NULL LIMIT 1",
+    [companyId, chosen],
+  );
+  if (anyLinked) {
+    const mates = matesOf(await linksOfLine(db, companyId, line.id), chosen).filter((m) => byId.has(m.id));
+    fanOut.fromRowIds = [...new Set(mates.map((m) => m.from))];
+    if (input.links === 'one') fanOut.skipped = mates.map((m) => ({ rowId: m.id, why: 'only the rows chosen were asked for' }));
+    else fanOut.added = mates.map((m) => m.id);
+  }
+  const want = [...chosen, ...fanOut.added];
   const first = byId.get(want[0]);
   const d = await createDrawing(db, c, {
     number: input.number, revision: input.revision, source: input.source, status: input.status, notes: input.notes,
@@ -470,24 +497,167 @@ export async function startDrawing(db, c, orderId, lineId, input = {}) {
   });
   await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'created_by'],
     want.map((id) => [companyId, d.id, 'master_record', id, c.userId ?? null]));
-  return { drawing: { id: d.id, code: d.code, number: d.number, revision: d.revision, status: d.status }, view: await getDrawings(db, companyId, null, line.id) };
+  // A drawing started on some copies only makes them a different design from the rest.
+  if (anyLinked && fanOut.skipped.length) { const { settleLine } = await import('./linkService.js'); await settleLine(db, c, line.id); }
+  return { drawing: { id: d.id, code: d.code, number: d.number, revision: d.revision, status: d.status }, fanOut, view: await getDrawings(db, companyId, null, line.id) };
 }
 
 const decode = (content) => Buffer.from(String(content ?? '').replace(/^data:[^,]*,/, ''), 'base64');
+const r2 = (n) => Math.round(Number(n) * 100) / 100;
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const listOf = (xs, max = 3) => (xs.length <= max ? xs.join(', ') : `${xs.slice(0, max).join(', ')} and ${xs.length - max} more`);
 
 /**
- * input: { files: [{ name, content (base64), rowId?, drawingId? }], dryRun }. A file with a rowId is AIMED at
- * that row (a master record id of the line): no mark needed — a markless row takes the file name as its
- * DRAWING_MARK (written on save), a row with another mark keeps it and the answer says so (`notes`).
- * Each file: matched by mark, and for a
- * plate part a DXF read as its shape. status new | replaces | unmatched | error. A non-dry run
- * saves the new and replacing ones and refreshes the line's cut plates' cut length and piercings.
+ * THE CODES A FILE NAME IS MATCHED AGAINST (lib/drawingName.js): one entry per row of the line.
+ * Before the design is frozen a row has no code, so it is the code its pieces WILL get, printed
+ * with the numbers each # stands for (placeholderService — what the screen shows); once the line is
+ * locked, the real code of each of its pieces (cf_order_pieces). A fixed handful of round trips.
+ * → { rows: [{ id, texts: [code] , code, segments, pieces }], frozen }
+ */
+export async function codeRowsOfLine(db, companyId, line, rowIds = null) {
+  const keep = rowIds ? new Set(rowIds.map(Number)) : null;
+  const out = new Map();
+  if (line.locked_at) {
+    const [pieces] = await db.query(
+      'SELECT item_id, code FROM cf_order_pieces WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL ORDER BY sort_order, id',
+      [companyId, line.id],
+    );
+    for (const p of pieces) {
+      const id = Number(p.item_id);
+      if (keep && !keep.has(id)) continue;
+      if (!out.has(id)) out.set(id, { id, texts: [], code: null, segments: null, pieces: 0 });
+      const row = out.get(id);
+      row.texts.push(p.code); row.pieces += 1;
+    }
+    return { rows: [...out.values()], frozen: true };
+  }
+  const { linePlaceholders } = await import('./placeholderService.js');
+  let ph;
+  try { ph = await linePlaceholders(db, companyId, line.id); } catch { return { rows: [], frozen: false }; }
+  for (const r of ph.rows ?? []) {
+    const id = Number(r.itemId);
+    if ((keep && !keep.has(id)) || r.code == null) continue;
+    if (!out.has(id)) out.set(id, { id, texts: [], code: r.code, segments: r.segments ?? null, pieces: 0 });
+    const row = out.get(id);
+    row.texts.push(codeWithNumbers(r.code, r.segments));
+    row.pieces += Number(r.pieces ?? 0);
+  }
+  return { rows: [...out.values()], frozen: false };
+}
+
+/**
+ * The line as the Values screen loads it (orderValuesService.loadContext — 9 reads, whatever its
+ * size) with its linked copies worked out from the same rows: what an upload needs to send a
+ * drawing to every copy and to fill only the cells that are still empty. null when the line cannot
+ * be read that way (no structure yet).
+ */
+async function linksOfLine(db, companyId, lineId) {
+  const { loadContext } = await import('./orderValuesService.js');
+  const { readLinks } = await import('./linkService.js');
+  let ctx;
+  try { ctx = await loadContext(db, companyId, lineId); } catch { return null; }
+  return readLinks(db, companyId, lineId, { ctx });
+}
+
+/** Every effective link-mate of some rows that is not one of them: [{ from, id }]. */
+function matesOf(links, ids) {
+  if (!links) return [];
+  const have = new Set(ids);
+  const out = [];
+  for (const id of ids) {
+    const g = links.byRecord.get(id)?.g;
+    if (!g) continue;
+    for (const m of links.groups.get(g)) if (!have.has(m)) { have.add(m); out.push({ from: id, id: m }); }
+  }
+  return out;
+}
+
+const SIZE_TOL = 1;   // mm: partGeometry.orientTo's own tolerance for "the drawing is the row's size"
+const sameNumber = (a, b) => a != null && b != null && Math.abs(Number(a) - Number(b)) <= 0.011;
+const sameWord = (a, b) => String(a ?? '').replace(/[\s_-]+/g, '').toUpperCase() === String(b ?? '').replace(/[\s_-]+/g, '').toUpperCase();
+
+/**
+ * What a file can say about the VALUES of its rows — the drawing's rectangle (LENGTH, WIDTH; a
+ * plate part's DXF only), and the thickness and grade its name or its own words state — and which
+ * of those go into EMPTY cells. A filled cell is never changed: one that disagrees is said.
+ *   offers   [{ specCode, value, from: 'drawing' | 'name' | 'title' }]
+ *   cells    orderValuesService.cellStates' answer       rows   the rows the file goes to
+ * → { values: [{ specCode, value, from, rows: [ids to write], kept: [ids that keep their own] }], warnings }
+ */
+function planValues(offers, rows, cells, labelOf) {
+  const values = [];
+  const warnings = [];
+  for (const o of offers) {
+    const v = { specCode: o.specCode, value: o.value, from: o.from, rows: [], kept: [] };
+    const differ = [];
+    for (const p of rows) {
+      if (o.plateOnly && !p.isPlatePart) continue;
+      const cell = cells.get(p.id)?.get(o.specCode);
+      if (!cell || !cell.typeable) continue;
+      if (cell.empty) {
+        if (cell.dataType === 'option' && !(cell.options ?? []).some((x) => sameWord(x.value, o.value) || sameWord(x.label, o.value))) {
+          if (!warnings.some((w) => w.startsWith(`${o.value} `))) warnings.push(`${o.value} (from the ${o.from === 'name' ? 'file name' : 'drawing'}) is not one of the choices of ${o.specCode} here — it is not written.`);
+          continue;
+        }
+        // A size is only written when it does not contradict the other side already typed.
+        if (o.pairWith) {
+          const other = cells.get(p.id)?.get(o.pairWith.specCode);
+          if (other && !other.empty && Math.abs(Number(other.raw) - o.pairWith.value) > SIZE_TOL) continue;
+        }
+        v.rows.push(p.id);
+        continue;
+      }
+      v.kept.push(p.id);
+      const same = cell.dataType === 'option' ? sameWord(cell.optionValue, o.value) || sameWord(cell.display, o.value) : cell.dataType === 'number' ? sameNumber(cell.raw, o.value) : sameWord(cell.raw, o.value);
+      if (!same && !o.quiet) differ.push(`${labelOf(p)} (${cell.display ?? cell.raw})`);
+    }
+    if (differ.length) warnings.push(`${o.specCode} is already ${differ.length === 1 ? `filled on ${differ[0]}` : `filled on ${listOf(differ)}`}; the ${o.from === 'name' ? 'file name' : o.from === 'title' ? 'drawing\'s title' : 'drawing'} says ${o.value} — the order's value is kept.`);
+    if (v.rows.length || v.kept.length) values.push(v);
+  }
+  return { values, warnings };
+}
+
+/**
+ * input: { files: [{ name, content (base64), rowId?, drawingId?, links?, replaceOnMembers? }], dryRun,
+ *          links?, replaceOnMembers? }  (the two last: the default for every file)
+ *
+ * WHICH ROWS A FILE IS FOR — in this order, the first that finds a row wins (`matchedBy`):
+ *   row / register   it is AIMED: rowId (a row of the line) or drawingId (a register drawing).
+ *                    A markless row aimed at takes the file name as its DRAWING_MARK (written on
+ *                    save); a row with another mark keeps it and the answer says so (`notes`).
+ *   code             its NAME is the end of the rows' code, as the screen prints it:
+ *                    `L(1,5)-1-TFL1.dxf`, `L(2-4)-1-TFL1.dxf` (lib/drawingName.js). Before the
+ *                    design is frozen that is the code preview; after, the real piece codes.
+ *   mark             its name is a row's DRAWING_MARK — the whole name first, then the name
+ *                    without the thickness / grade it carries (`TFL1_25mm_E350.dxf` → TFL1).
+ * THEN EVERY LINKED COPY of every row found takes the drawing too ("same design", linkService) —
+ * unless `links: 'one'` on a file aimed at a row, which keeps it to that row (it then stops being
+ * a copy: the drawing is part of the design). One register drawing; cf_drawing_links carries the
+ * extra rows. `fanOut` says which rows were added.
+ *
+ * WHAT IS REFUSED OR ASKED
+ *   error      two files of one upload reaching the same row (the later one); a name whose
+ *              brackets do not read; what was refused before (not a DXF, too large…)
+ *   conflict   a row reached through a copy or a code already has ANOTHER live drawing. Nothing is
+ *              saved for that file unless `replaceOnMembers: true`, which takes the other drawing
+ *              off those rows.
+ *   a note     a name that reaches rows which are not the same design, or only some pieces of a
+ *              row (the drawing goes on the whole row — decision D5).
+ *
+ * VALUES (per file `values`, the line's total as `valuesWritten`). Into EMPTY cells only, one bulk
+ * write for all files and rows: LENGTH and WIDTH from a plate part's drawing rectangle, THICKNESS
+ * and GRADE from the file name (`_25mm_E350`) else the drawing's own words. A filled cell that
+ * disagrees is a warning. A locked line takes the drawing and no value. The parts' true area and
+ * holes follow as before (drawingValueService).
+ *
+ * Each file: status new | replaces | unmatched | conflict | error. A non-dry run saves the new and
+ * replacing ones and refreshes the line's cut plates' cut length and piercings.
  */
 export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   const companyId = c.companyId;
   const line = await requireLine(db, companyId, orderId, lineId);
   const files = Array.isArray(input.files) ? input.files : [];
-  if (!files.length) throw invalid('NO_FILES', 'Choose one or more drawings (DXF or PDF) — each named by its drawing mark.');
+  if (!files.length) throw invalid('NO_FILES', 'Choose one or more drawings (DXF or PDF) — each named by its drawing mark or its code.');
   if (Number(line.released)) throw invalid('RELEASED', `Line ${line.line_no} of ${line.order_code} is released to production — its drawings can no longer change.`);
   const dryRun = input.dryRun !== false;
   const rows = await rowsOfLine(db, companyId, line);
@@ -497,13 +667,20 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
   const live = await liveDrawings(db, companyId, line.id);
   const existing = new Map(live.map((d) => [d.mark_norm, d]));
   const fileOfDrawing = new Map(live.filter((d) => d.drawing_id != null).map((d) => [Number(d.drawing_id), d]));
+  // The line's values and linked copies (one load), and — only when a file is not aimed — the codes names are matched against.
+  const links = await linksOfLine(db, companyId, line.id);
+  const labelOf = (p) => p.code ?? (p.mark ? `${p.name} (${p.mark})` : p.name);
+  let codeRows = null;
+  const codesOnce = async () => { codeRows ??= (await codeRowsOfLine(db, companyId, line, rows.map((p) => p.id))).rows; return codeRows; };
   const seen = new Set();
   const seenDrawing = new Set();
   const taken = new Set();
+  const claimed = new Map();   // row id -> the file of this upload that goes to it
   const out = [];
   for (const f of files) {
     const name = String(f?.name ?? '').trim();
     const kind = kindOf(name);
+    const parsed = parseDrawingName(name);
     let mark = name.replace(/\.(dxf|pdf)$/i, '').trim();
     // Attached to a register drawing by hand: its rows' drawing mark, when they share one.
     const wanted = f?.drawingId != null && f.drawingId !== '' ? Number(f.drawingId) : null;
@@ -533,8 +710,25 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
         mark = tRow.mark;
       } else markFromName = true;
     }
+    // Not aimed: its name as a code (the end of the rows' printed code), then as a drawing mark.
+    let matchedBy = wanted != null ? 'register' : aimed != null ? 'row' : 'none';
+    let codeHits = null;
+    if (wanted == null && aimed == null && !targetProblem) {
+      if (parsed.kind === 'code' && parsed.problems.length) targetProblem = `The brackets in ${name} do not read: ${parsed.problems.join(' ')}`;
+      else {
+        const hits = parsed.pattern ? matchCodePattern(parsed.pattern, await codesOnce()).filter((h) => rowById.has(h.id)) : [];
+        if (hits.length) { matchedBy = 'code'; codeHits = hits; mark = parsed.base; }
+        else if (byMark.has(parsed.markFull)) matchedBy = 'mark';
+        else if (parsed.markStripped && byMark.has(parsed.markStripped)) { matchedBy = 'mark'; mark = parsed.base; }
+      }
+    }
     const markNorm = normMark(mark);
-    const entry = { name, mark, fileKind: kind, status: 'error', rows: [], geometry: null, problems: [], warnings: [], notes, targetRowId: tRow?.id ?? null, markSet: false, register: null, _save: null };
+    const entry = {
+      name, mark, fileKind: kind, status: 'error', matchedBy, pattern: matchedBy === 'code' ? parsed.base : null,
+      hints: { thicknessMm: parsed.hints.thicknessMm, grade: parsed.hints.grade },
+      rows: [], geometry: null, problems: [], warnings: [], notes, targetRowId: tRow?.id ?? null, markSet: false, register: null,
+      fanOut: { fromRowIds: [], added: [], skipped: [] }, values: [], _save: null, _offers: null,
+    };
     out.push(entry);
     if (targetProblem) { entry.problems.push(targetProblem); continue; }
     if (!kind) { entry.problems.push('Only DXF and PDF drawings are taken.'); continue; }
@@ -548,8 +742,22 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     // The register drawing it goes on: the one asked for, else the one its mark's file sits on, else
     // one waiting (no file yet) on a row with its mark.
     if (!target && existing.get(markNorm)?.drawing_id != null) target = await liveRevisionOf(db, companyId, existing.get(markNorm).drawing_id);
+    const hitIds = new Set((codeHits ?? []).map((h) => h.id));
+    // The rows found for the file itself (before its copies are added).
+    const directOf = () => rows.filter((p) => (tRow && p.id === tRow.id) || hitIds.has(p.id) || (p.markNorm && p.markNorm === markNorm) || (target && p.drawingIds.includes(Number(target.id))));
+    let direct = directOf();
+    // What the file says about copies, read early: a file aimed at ONE row and kept to it is that row's own drawing.
+    const choice = f?.links ?? input.links ?? null;
+    const onlyThis = choice === 'one' && tRow != null;
+    // …else the ONE live drawing every row found is already read by: the same sheet under a new
+    // name is a new file for it (a draft's file replaced, an issued one revised) — not a second drawing.
+    if (!target && direct.length && !onlyThis) {
+      const current = new Set(direct.map((p) => fileFor(p, live)));
+      const only = current.size === 1 ? [...current][0] : null;
+      if (only?.drawing_id != null && (matchedBy === 'code' || (matchedBy === 'row' && !tRow?.mark))) target = await liveRevisionOf(db, companyId, only.drawing_id);
+    }
     if (!target) {
-      const waitingIds = [...new Set([...(byMark.get(markNorm) ?? []), ...(tRow ? [tRow] : [])].flatMap((p) => p.drawingIds))].filter((id) => !fileOfDrawing.has(id));
+      const waitingIds = [...new Set([...(byMark.get(markNorm) ?? []), ...(tRow ? [tRow] : []), ...direct].flatMap((p) => p.drawingIds))].filter((id) => !fileOfDrawing.has(id));
       if (waitingIds.length) {
         const [cands] = await db.query("SELECT * FROM cf_drawings WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL AND status IN ('draft', 'issued') ORDER BY id", [companyId, waitingIds]);
         target = cands.find((d) => normMark(String(d.number).split('/').pop()) === markNorm) ?? cands[0] ?? null;
@@ -557,9 +765,24 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     }
     if (target && seenDrawing.has(Number(target.id))) { entry.problems.push(`Another file in this upload goes on the same drawing (${target.number}).`); continue; }
     if (target) seenDrawing.add(Number(target.id));
-    const matched = rows.filter((p) => (tRow && p.id === tRow.id) || (p.markNorm && p.markNorm === markNorm) || (target && p.drawingIds.includes(Number(target.id))));
+    direct = directOf();
+    // Every linked copy of a row found takes the drawing too — unless a file aimed at ONE row says otherwise.
+    const mates = matesOf(links, direct.map((p) => p.id)).filter((m) => rowById.has(m.id));
+    entry.fanOut.fromRowIds = [...new Set(mates.map((m) => m.from))];
+    if (onlyThis) {
+      entry.fanOut.skipped = mates.map((m) => ({ rowId: m.id, label: labelOf(rowById.get(m.id)), why: 'only this row was asked for' }));
+      if (mates.length) notes.push(`${labelOf(tRow)} has ${plural(mates.length, 'linked copy', 'linked copies')}; with this drawing on it alone it stops being a copy of ${mates.length === 1 ? 'it' : 'them'}.`);
+    } else entry.fanOut.added = mates.map((m) => m.id);
+    const added = onlyThis ? [] : mates.map((m) => rowById.get(m.id));
+    const matched = [...direct, ...added];
     const plate = matched.filter((p) => p.isPlatePart);
     entry.rows = matched.map((p) => rowView(p, null));
+    if (added.length) notes.push(`Goes to ${plural(matched.length, 'linked row')} — ${plural(added.length, 'copy', 'copies')} of ${direct.length === 1 ? labelOf(direct[0]) : 'the rows it names'}.`);
+    if (codeHits) {
+      const partial = codeHits.filter((h) => h.partial && rowById.has(h.id));
+      if (partial.length) notes.push(`${name} names only some of the pieces of ${listOf(partial.map((h) => labelOf(rowById.get(h.id))))} — a drawing belongs to the whole row, so it goes on ${partial.length === 1 ? 'it' : 'each of them'} as a whole.`);
+      if (links && new Set(direct.map((p) => links.fp.get(p.id))).size > 1) notes.push(`The ${direct.length} rows this name reaches are not all the same design — the drawing is attached to every one of them.`);
+    }
     let g = null;
     let text = null;
     if (kind === 'dxf') {
@@ -581,8 +804,35 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
       entry.rows = matched.map((p) => rowView(p, g));
       for (const p of plate) { const w = sizeWarning(p, g); if (w) entry.warnings.push(w); }
     }
-    if (!matched.length) { entry.status = 'unmatched'; entry.warnings.push(`No row on this line has drawing mark ${mark}.`); continue; }
+    if (!matched.length) {
+      entry.status = 'unmatched';
+      entry.warnings.push(parsed.kind === 'code' ? `No row on this line has a code ending in ${parsed.base}.` : `No row on this line has drawing mark ${mark}.`);
+      continue;
+    }
+    // One drawing file per row in an upload: the later file is the one refused.
+    const clash = matched.filter((p) => claimed.has(p.id));
+    if (clash.length) {
+      entry.problems.push(`${listOf(clash.map(labelOf))} already ${clash.length === 1 ? 'takes' : 'take'} ${claimed.get(clash[0].id)} from this upload — a row takes one drawing file at a time.`);
+      continue;
+    }
+    for (const p of matched) claimed.set(p.id, name);
     const hadFile = target ? fileOfDrawing.has(Number(target.id)) : false;
+    const replaces = [existing.get(markNorm)?.id, target ? fileOfDrawing.get(Number(target.id))?.id : null].filter(Boolean);
+    // A row reached through a copy or a code that is already read by ANOTHER live drawing.
+    const reached = new Set([...added.map((p) => p.id), ...hitIds]);
+    const conflicts = matched.filter((p) => reached.has(p.id)).flatMap((p) => live.filter((d) => matches(p, d) && !replaces.includes(d.id)).map((d) => ({ p, d })));
+    const replaceOnMembers = (f?.replaceOnMembers ?? input.replaceOnMembers) === true;
+    if (conflicts.length) {
+      entry.conflicts = conflicts.map(({ p, d }) => ({ rowId: p.id, label: labelOf(p), drawingId: Number(d.id), fileName: d.file_name, mark: d.mark }));
+      if (!replaceOnMembers) {
+        entry.status = 'conflict';
+        entry.warnings.push(`${listOf(conflicts.map(({ p, d }) => `${labelOf(p)} (${d.file_name})`))} already ${conflicts.length === 1 ? 'has' : 'have'} another drawing — choose "Replace on all" to put this one in its place, or leave ${conflicts.length === 1 ? 'it' : 'them'} out.`);
+        for (const p of matched) claimed.delete(p.id);
+        continue;
+      }
+      const byMarkStill = conflicts.filter(({ p, d }) => p.markNorm && p.markNorm === d.mark_norm);
+      if (byMarkStill.length) notes.push(`${listOf(byMarkStill.map(({ p }) => labelOf(p)))} still ${byMarkStill.length === 1 ? 'carries' : 'carry'} the drawing mark of the drawing replaced — that file goes with it only when no other row uses it.`);
+    }
     entry.markSet = markFromName;
     entry.status = existing.has(markNorm) || hadFile ? 'replaces' : 'new';
     const action = !target ? 'create' : hadFile ? (target.status === 'issued' ? 'revise' : 'replace') : 'attach';
@@ -592,15 +842,53 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
       revision: action === 'revise' ? nextRevision(target.revision) : target ? target.revision : 'A',
       fromRevision: action === 'revise' ? target.revision : null,
     };
+    // What the file can say about its rows' values (written into empty cells only, below).
+    const offers = [];
+    if (g && plate.length) {
+      const [long, short] = [Math.max(g.lengthMm, g.widthMm), Math.min(g.lengthMm, g.widthMm)].map(r2);
+      offers.push({ specCode: 'LENGTH', value: long, from: 'drawing', plateOnly: true, quiet: true, pairWith: { specCode: 'WIDTH', value: short } });
+      offers.push({ specCode: 'WIDTH', value: short, from: 'drawing', plateOnly: true, quiet: true, pairWith: { specCode: 'LENGTH', value: long } });
+    }
+    const words = text != null && (parsed.hints.thicknessMm == null || parsed.hints.grade == null) ? dxfTextHints(text) : { thicknessMm: null, grade: null };
+    const thickness = parsed.hints.thicknessMm ?? words.thicknessMm;
+    const grade = parsed.hints.grade ?? words.grade;
+    if (thickness != null) offers.push({ specCode: 'THICKNESS', value: thickness, from: parsed.hints.thicknessMm != null ? 'name' : 'title' });
+    if (grade != null) offers.push({ specCode: 'GRADE', value: grade, from: parsed.hints.grade != null ? 'name' : 'title' });
+    entry.hints = { thicknessMm: thickness ?? null, grade: grade ?? null };
+    entry._offers = { offers, rows: matched };
     entry._save = {
       markRowId: markFromName ? tRow.id : null, mark, markNorm, name, kind, g: plate.length ? g : null, warnings: entry.warnings, body: kind === 'dxf' ? text : buf.toString('base64'),
-      action, target, number, title: matched[0]?.name ?? null, rowIds: matched.map((p) => p.id),
-      replaces: [existing.get(markNorm)?.id, target ? fileOfDrawing.get(Number(target.id))?.id : null].filter(Boolean),
+      action, target, number, title: matched[0]?.name ?? null, rowIds: matched.map((p) => p.id), replaces,
+      detach: replaceOnMembers ? conflicts.map(({ p, d }) => ({ rowId: p.id, fileId: Number(d.id), drawingId: d.drawing_id != null ? Number(d.drawing_id) : null })) : [],
     };
   }
   const toSave = out.filter((e) => e._save);
+
+  // ---- the values the files state, for the cells that are still empty (from the load above) ----
+  const offering = toSave.filter((e) => e._offers.offers.length);
+  let writes = [];
+  if (offering.length) {
+    const { cellStates } = await import('./orderValuesService.js');
+    const ctx = links?.ctx ?? null;
+    if (ctx) {
+      const frozen = !!ctx.line.lockedAt;
+      const cells = cellStates(ctx, [...new Set(offering.flatMap((e) => e._offers.rows.map((p) => p.id)))], ['LENGTH', 'WIDTH', 'THICKNESS', 'GRADE']);
+      for (const e of offering) {
+        const planned = planValues(e._offers.offers, e._offers.rows, cells, labelOf);
+        e.values = planned.values.map(({ specCode, value, from, rows: to, kept }) => ({ specCode, value, from, rows: frozen ? [] : to, kept: frozen ? [...kept, ...to] : kept }));
+        e.warnings.push(...planned.warnings);
+        if (frozen) { if (planned.values.some((v) => v.rows.length)) e.notes.push('The design is frozen — the drawing is attached, and no value is written from it.'); continue; }
+        for (const v of planned.values) for (const id of v.rows) writes.push({ recordId: id, specCode: v.specCode, value: v.value });
+      }
+      // Two files saying two things for one cell cannot both be written: the first stands.
+      const first = new Map();
+      writes = writes.filter((w) => { const k = `${w.recordId}:${w.specCode}`; if (first.has(k)) return false; first.set(k, w); return true; });
+    }
+  }
+
   let view = null;
   let values = null;
+  let valuesWritten = null;
   if (!dryRun && toSave.length) {
     const replaced = [...new Set(toSave.flatMap((e) => e._save.replaces))];
     // Rows aimed at with a file but no mark yet take the file's name as their DRAWING_MARK: one lookup, one insert.
@@ -614,6 +902,26 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     }
     // The replaced files keep their drawing_id: an issued revision's file stays downloadable from it.
     if (replaced.length) await db.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [companyId, replaced]);
+    // "Replace on all": the other drawing comes off the rows this one now goes to — its register
+    // link in one statement, and the file itself when no row of the line is left to read it.
+    const detach = toSave.flatMap((e) => e._save.detach);
+    if (detach.length) {
+      const pairs = detach.filter((d) => d.drawingId != null);
+      if (pairs.length) {
+        await db.query(
+          `UPDATE cf_drawing_links SET deleted_at = NOW()
+            WHERE company_id = ? AND subject_type = 'master_record' AND deleted_at IS NULL AND (drawing_id, subject_id) IN (${pairs.map(() => '(?, ?)').join(', ')})`,
+          [companyId, ...pairs.flatMap((d) => [d.drawingId, d.rowId])],
+        );
+      }
+      const gone = new Map();   // file id -> rows taken off it
+      for (const d of detach) { if (!gone.has(d.fileId)) gone.set(d.fileId, new Set()); gone.get(d.fileId).add(d.rowId); }
+      const orphaned = [...gone].filter(([fileId, off]) => {
+        const file = live.find((x) => Number(x.id) === fileId);
+        return file && rows.filter((p) => matches(p, file)).every((p) => off.has(p.id));
+      }).map(([fileId]) => fileId);
+      if (orphaned.length) await db.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [companyId, orphaned]);
+    }
     for (const { _save: s } of toSave) {
       let drawingId;
       if (s.action === 'create') drawingId = (await createDrawing(db, c, { number: s.number, revision: 'A', title: s.title, source: 'shop', status: 'issued' })).id;
@@ -633,14 +941,78 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
         s.g?.piercings ?? null, s.g?.holes ?? null, s.g?.innerCuts ?? null, s.g ? JSON.stringify(s.g) : null, JSON.stringify(s.warnings), s.body, c.userId ?? null,
       ]]);
     }
+    // The sizes, thickness and grade the files state, into the empty cells: ONE bulk write for
+    // every file and every row (orderValuesService — rules, history, what is worked out from them,
+    // and the linked copies settled). Every copy takes the same value, so nothing stops being one.
+    if (writes.length) {
+      try {
+        const { writeLineValues } = await import('./orderValuesService.js');
+        const w = await writeLineValues(db, c, line.id, { writes });
+        valuesWritten = { written: w.summary.changed, derived: w.summary.derived, records: w.summary.records };
+      } catch (err) {
+        valuesWritten = { written: 0, error: err?.problems?.length ? err.problems.slice(0, 3).join(' ') : err?.message ?? String(err) };
+        for (const e of offering) { e.values = e.values.map((v) => ({ ...v, kept: [...v.kept, ...v.rows], rows: [] })); e.warnings.push(`The values from the drawing were not written: ${valuesWritten.error}`); }
+      }
+    }
     const { refreshPlateCuts } = await import('./plateCutsService.js');
     await refreshPlateCuts(db, c, line.id);
     // The parts take their true area and holes from the new shapes; a replaced drawing's are replaced with it.
     const { refreshDrawingValues } = await import('./drawingValueService.js');
     values = await refreshDrawingValues(db, c, line.id, { force: true });
+    // The drawing a row is built to is part of its design: a row that got one alone is not a copy any more.
+    // (ONE round trip when nothing on the line is linked; the value write above has done it otherwise.)
+    if (!(valuesWritten && !valuesWritten.error)) { const { settleLine } = await import('./linkService.js'); await settleLine(db, c, line.id); }
     view = await getDrawings(db, companyId, null, line.id);
   }
-  return { dryRun, saved: !dryRun && toSave.length > 0, files: out.map(({ _save, ...e }) => e), view, ...(values ? { values } : {}) };
+  return {
+    dryRun, saved: !dryRun && toSave.length > 0, files: out.map(({ _save, _offers, ...e }) => e), view,
+    ...(values ? { values } : {}), ...(valuesWritten ? { valuesWritten } : {}),
+  };
+}
+
+/**
+ * GET /order-lines/:id/design-uses?group=|recordId=|drawingId= — the rows one design is used by,
+ * and the pieces they are ("used by N pieces"). Codes are not shared between copies: each row keeps
+ * its own, so they are listed, never merged.
+ *   group      a link group's key (as GET values gives it)      recordId   a row: its group, or itself
+ *   drawingId  a drawing FILE of the line (the id GET …/drawings and …/drawings/tree give), else a
+ *              register drawing's id: the rows it is on
+ * → { rows: [{ recordId, label, code, segments, pieces }], pieces: [{ code, recordId }], total, frozen }
+ *   code / segments  the row's code as the screen prints it (the preview before the design is
+ *                    frozen, null once it is: the pieces then carry the codes)
+ *   pieces           before the design is frozen there are no piece codes yet: [] — `total` still
+ *                    says how many pieces the rows stand for
+ */
+export async function designUses(db, companyId, lineId, query = {}) {
+  const line = await requireLine(db, companyId, null, lineId);
+  const { readLinks } = await import('./linkService.js');
+  const { labelOfRecord } = await import('./orderValuesService.js');
+  const links = await readLinks(db, companyId, line.id);
+  let ids = [];
+  if (query.group != null && query.group !== '') ids = links.groups.get(String(query.group)) ?? [];
+  else if (query.recordId != null && query.recordId !== '') {
+    const id = Number(query.recordId);
+    if (!links.fp.has(id)) throw notFound('Row');
+    const g = links.byRecord.get(id)?.g;
+    ids = g ? links.groups.get(g) : [id];
+  } else if (query.drawingId != null && query.drawingId !== '') {
+    const want = Number(query.drawingId);
+    const rows = await rowsOfLine(db, companyId, line);
+    const live = await liveDrawings(db, companyId, line.id);
+    const file = live.find((d) => Number(d.id) === want) ?? null;
+    ids = file ? rows.filter((p) => matches(p, file)).map((p) => p.id) : rows.filter((p) => p.drawingIds.includes(want)).map((p) => p.id);
+    if (!file && !ids.length) throw notFound('Drawing');
+  } else throw invalid('INVALID', 'Say which design — group, recordId or drawingId.');
+  const coded = await codeRowsOfLine(db, companyId, line, ids);
+  const byId = new Map(coded.rows.map((r) => [r.id, r]));
+  const order = new Map([[links.ctx.line.itemId, 0], ...links.ctx.lines.map((l, i) => [l.childId, i + 1])]);
+  const sorted = [...ids].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0) || a - b);
+  const rows = sorted.map((id) => {
+    const r = byId.get(id);
+    return { recordId: id, label: labelOfRecord(links.ctx.records.get(id), links.ctx), code: coded.frozen ? null : r?.code ?? null, segments: coded.frozen ? null : r?.segments ?? null, pieces: r?.pieces ?? 0 };
+  });
+  const pieces = coded.frozen ? sorted.flatMap((id) => (byId.get(id)?.texts ?? []).map((code) => ({ code, recordId: id }))) : [];
+  return { rows, pieces, total: rows.reduce((n, r) => n + Number(r.pieces ?? 0), 0), frozen: coded.frozen };
 }
 
 export async function deleteDrawing(db, c, orderId, lineId, drawingId) {

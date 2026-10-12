@@ -43,9 +43,8 @@
  * record at a time. Discarding is the same: a fixed set of bulk statements.
  */
 import { invalid, notFound } from '../lib/errors.js';
-import { insertRows } from '../lib/db.js';
 import { revisedOrderMessage, latestRevisionSql } from './records.js';
-import { snapshotSubtrees, writeCopies, cutPlateNodes, deleteTemporaryItems } from './treeCopyService.js';
+import { snapshotSubtrees, writeCopies, copyDrawingLinks, cutPlateNodes, deleteTemporaryItems } from './treeCopyService.js';
 import { refreshCutPieces, rectangleChoices } from './cutPlateService.js';
 import { getOrder } from './salesOrderService.js';
 import { carryRequisitions, returnRequisitions } from './requisitionLifecycle.js';
@@ -163,6 +162,9 @@ export async function reviseOrder(db, c, orderId) {
       // A line to a cut plate is not copied: the new line derives its own.
       keepLine: (l) => !isCutPlate(l),
       chunk: COPY_CHUNK,
+      // Linked copies come along as groups OF THE NEW REVISION: the rows of rev 2 stay copies of
+      // each other, never of rev 1's rows (a group stays inside one order line — init.sql §59).
+      links: 'fresh',
     });
     const missing = custom.filter((l) => !idMap.has(Number(l.item_id)));
     if (missing.length) throw new Error(`cf_erp: the rows of line ${missing.map((l) => l.line_no).join(', ')} of ${label} could not be read to copy them.`);
@@ -172,20 +174,8 @@ export async function reviseOrder(db, c, orderId) {
     // drawings are never touched — a revision of a drawing is its own row — and
     // the old row keeps its links exactly as they were (drawingService copies
     // links forward, never moves them). One read per 500 rows, one INSERT.
-    const links = [];
-    for (const part of chunk([...idMap.keys()], ID_CHUNK)) {
-      const [rows] = await db.query(
-        `SELECT drawing_id, subject_type, subject_id, note FROM cf_drawing_links
-          WHERE company_id = ? AND subject_type = 'master_record' AND subject_id IN (?) AND deleted_at IS NULL
-          ORDER BY id`,
-        [companyId, part],
-      );
-      links.push(...rows);
-    }
-    if (links.length) {
-      await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'note', 'created_by'],
-        links.map((l) => [companyId, l.drawing_id, l.subject_type, idMap.get(Number(l.subject_id)), l.note, c.userId ?? null]), COPY_CHUNK);
-    }
+    // (treeCopyService.copyDrawingLinks — a paste copies them the same way.)
+    await copyDrawingLinks(db, c, idMap, { chunk: COPY_CHUNK });
 
     for (const part of chunk(custom, ID_CHUNK)) {
       const params = [];

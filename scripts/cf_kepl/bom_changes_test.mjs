@@ -779,6 +779,45 @@ try {
   eq('after lock a description is frozen like the rest', [dLocked?.status, dLocked?.code], [409, 'LOCKED']);
   eq('and nothing was written', (await lineRow(conn, dLine)).role, 'Mid');
 
+  section('10f. Linked copies: a paste links row by row; link / unlink; the links block (init.sql §59)');
+  {
+    const { buildLinkFixture, newTag } = await imp('scripts/cf_kepl/link_fixture.mjs');
+    const lf = await buildLinkFixture(conn, c, { tag: newTag('BCL'), parts: 0 });
+    const go = (changes, extra = {}) => apply({ scope: { orderLineId: lf.lineId }, changes, ...extra });
+    const keyOf = async (id) => (await conn.query('SELECT link_group FROM cf_item_details WHERE master_id = ?', [id]))[0][0]?.link_group ?? null;
+    let lr = await lf.rows();
+    const plain = await go([{ op: 'role', lineId: lr.segments[0].flange.lineId, role: 'Top' }]);
+    eq('every answer carries a links block; with nothing link-relevant it is empty and `after` is null', [plain.links.needsChoice, plain.links.touched, plain.links.breaks, plain.links.skipped, plain.links.after], [false, [], [], [], null]);
+    const dryPaste = await go([{ op: 'paste', sourceLineId: lr.segments[0].node.lineId, parentId: lr.girder.id }], { dryRun: true });
+    ok('a dry-run paste says the copy WOULD be linked, and writes no key', Object.values(dryPaste.links.after.rows).filter((x) => x.n === 2).length === 6 && (await keyOf(lr.segments[0].node.id)) === null, JSON.stringify(dryPaste.links.after.rows));
+    const pasted = await go([{ op: 'paste', sourceLineId: lr.segments[0].node.lineId, parentId: lr.girder.id }]);
+    lr = await lf.rows();
+    const [A, B2] = lr.segments;
+    eq('the paste links the segment, its flange and its web to their originals — three groups of two', [await keyOf(A.node.id) === await keyOf(B2.node.id), await keyOf(A.flange.id) === await keyOf(B2.flange.id), await keyOf(A.web.id) === await keyOf(B2.web.id), new Set([await keyOf(A.node.id), await keyOf(A.flange.id), await keyOf(A.web.id)]).size, Object.keys(pasted.links.after.groups).length], [true, true, true, 3, 3]);
+    ok('…and nothing of the keys is null', !!(await keyOf(A.node.id)) && !!(await keyOf(B2.web.id)));
+    const twoPastes = await go([{ op: 'paste', sourceLineId: A.web.lineId, parentId: A.node.id }, { op: 'paste', sourceLineId: A.web.lineId, parentId: A.node.id }], { dryRun: true });
+    ok('two pastes of one source in one save join ONE group (four webs), and the parent they land in stops being a copy', Object.values(twoPastes.links.after.rows).filter((x) => x.g === twoPastes.links.after.rows[A.web.id].g).length === 4 && twoPastes.links.breaks.some((b) => b.recordId === A.node.id) && twoPastes.links.touched.some((t) => t.recordId === A.node.id && t.reason === 'add'), JSON.stringify(twoPastes.links.breaks));
+    const valuesOp = await go([{ op: 'values', links: 'all', writes: [{ recordId: A.flange.id, specCode: 'LENGTH', value: 8000 }] }]);
+    eq('a values change takes links too: all → both flanges, nothing breaks', [valuesOp.results[0].changed, valuesOp.results[0].fanned, valuesOp.links.breaks.length, valuesOp.links.after.rows[B2.flange.id]?.n, valuesOp.summary.counts.onCopies], [2, 1, 0, 2, 1]);
+    const un = await go([{ op: 'unlink', recordId: B2.web.id, keepApart: true }]);
+    eq('unlink: the row is out and kept apart; a group of one is no group', [await keyOf(B2.web.id), await keyOf(A.web.id), un.links.after.rows[B2.web.id], un.results[0].op, un.summary.counts.unlinked], [null, null, { apart: true }, 'unlink', 1]);
+    const li = await go([{ op: 'link', recordIds: [A.web.id, B2.web.id] }]);
+    eq('link: together again under one key', [!!(await keyOf(A.web.id)), await keyOf(A.web.id) === await keyOf(B2.web.id), li.links.after.rows[A.web.id]?.n, li.summary.counts.linked], [true, true, 2, 2]);
+    const ne = await refusal(() => go([{ op: 'link', recordIds: [A.web.id, A.flange.id] }]));
+    eq('link of unequal rows: 422 LINK_NOT_EQUAL', [ne?.status, ne?.code], [422, 'LINK_NOT_EQUAL']);
+    const short = await refusal(() => go([{ op: 'link', recordIds: [A.web.id] }]));
+    eq('link needs two rows', [short?.status, has(short?.problems, 'two or more')], [422, true]);
+    const together = await go([{ op: 'values', links: 'one', writes: [{ recordId: B2.flange.id, specCode: 'LENGTH', value: 8100 }, { recordId: A.flange.id, specCode: 'LENGTH', value: 8100 }] }, { op: 'link', recordIds: [A.flange.id, B2.flange.id] }], { dryRun: true });
+    ok('"make them equal and link them" is one save: link is judged after the rest of the batch', together.links.after.rows[A.flange.id]?.n === 2 && together.results[1].op === 'link');
+    const qd = await go([{ op: 'quantity', lineId: B2.flange.lineId, quantity: 3 }], { dryRun: true });
+    const qs = await go([{ op: 'quantity', lineId: B2.flange.lineId, quantity: 3, links: 'all' }]);
+    eq('a child quantity: asked when unsaid, repeated on the copy with all', [qd.links.needsChoice, qd.links.touched[0]?.recordId, qd.links.touched[0]?.reason, qs.links.needsChoice, qs.results.filter((x) => x?.op === 'quantity').length, Number((await lineRow(conn, A.flange.lineId)).quantity)], [true, B2.node.id, 'quantity', false, 2, 3]);
+    await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, lf.lineId]);
+    const lockedLink = await go([{ op: 'unlink', recordId: B2.web.id }]);
+    const lockedQty = await refusal(() => go([{ op: 'quantity', lineId: B2.flange.lineId, quantity: 5, links: 'all' }]));
+    eq('locked: unlink goes through, a quantity does not', [lockedLink.applied, lockedQty?.status, lockedQty?.code], [true, 409, 'LOCKED']);
+  }
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {

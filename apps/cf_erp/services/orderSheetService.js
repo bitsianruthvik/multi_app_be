@@ -38,6 +38,15 @@
  * changed field name, a pair this line does not have, a pair without its row of
  * values. Rows are neither added nor removed here — that is the screen's.
  *
+ * LINKED COPIES ("same design", init.sql §59). A row that is a linked copy carries one more grey
+ * cell, last: "Same as" — how many other rows are the same design, and the first of them
+ * (lib/orderSheetLayout.sameAsText; the screen's link chip in words). It is never typed. A changed
+ * value or quantity on such a row is the screen's own question: the import body takes
+ * `links: 'all' | 'one'` for the whole file — 'all' gives every copy the value (and repeats a
+ * child's quantity on the corresponding line of every copy of its parent), 'one' changes only the
+ * rows the sheet changed, which then stop being copies. Said nothing, only those rows change and
+ * the report's `links.needsChoice` says a choice was due (the preview offers the two).
+ *
  * "Unchanged" means unchanged: a cell is compared with exactly what a download
  * would write in it now, so a default that is only SHOWN and left alone is not
  * turned into a typed value.
@@ -68,7 +77,8 @@ import { requireMaster } from './records.js';
 import { explode, writeLineUpdate, assertEditable } from './bomService.js';
 import { refreshValues } from './valueService.js';
 import { dateText } from './resolutionService.js';
-import { readLineValues, writeLineValues } from './orderValuesService.js';
+import { readLineValues, writeLineValues, LINK_CHOICES } from './orderValuesService.js';
+import { readLinks, settleLine, linksBlock, correspondingLine } from './linkService.js';
 import { linePlaceholders } from './placeholderService.js';
 import { orderSheetLayout, placeholderKey } from '../lib/orderSheetLayout.js';
 
@@ -420,6 +430,7 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
 
       if (f.kind === 'total') { problems.push(`${where}: Total (${f.value}) was changed to "${text}". ${f.why} Change Qty instead.`); continue; }
       if (f.kind === 'flow') { problems.push(`${where}: Flow (${f.value || 'none'}) was changed to "${text}". ${f.why}`); continue; }
+      if (f.kind === 'same') { problems.push(`${where}: Same as (${f.value}) was changed to "${text}". ${f.why}`); continue; }
       if (f.kind === 'quantity') {
         if (!f.editable) { problems.push(`${where}: Qty (${f.value}) was changed to "${text}". ${f.why}`); continue; }
         const q = Number(text);
@@ -467,10 +478,49 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
   // goes first because it is all-or-nothing by itself, and it only runs when
   // nothing else in the sheet is wrong.
   const writes = [...valuePlan.values()].map((v) => ({ recordId: v.recordId, specCode: v.code, value: v.value }));
+  // Linked copies: one choice for the whole file (see the header).
+  const linkChoice = input.links ?? null;
+  if (linkChoice != null && !LINK_CHOICES.includes(linkChoice)) problems.push('links must be "all" (every linked copy) or "one" (only the rows the sheet changed).');
+  // A changed quantity is its PARENT's design: which linked parents it lands on, and — under
+  // "all" — the corresponding line of every copy of that parent. One cheap question, then the
+  // line's links (9 reads) only when it has any.
+  const qtyTouched = [];
+  const qtySkipped = [];
+  if (qtyPlan.size && !problems.length) {
+    const [[any]] = await db.query(
+      "SELECT 1 AS x FROM cf_item_details WHERE company_id = ? AND owner_order_line_id = ? AND item_type = 'temporary' AND link_group IS NOT NULL AND deleted_at IS NULL LIMIT 1",
+      [c.companyId, lineId],
+    );
+    const pre = any ? await readLinks(db, c.companyId, lineId) : null;
+    const parentOf = new Map(pre ? pre.ctx.lines.map((l) => [l.id, l.parentId]) : []);
+    const rowOfLine = new Map(rows.filter((r) => r.lineId != null).map((r) => [r.lineId, r]));
+    for (const [lineIdOfRow, q] of [...qtyPlan]) {
+      const parentId = parentOf.get(lineIdOfRow);
+      const g = parentId != null ? pre.byRecord.get(parentId)?.g : null;
+      if (!g) continue;
+      const members = pre.groups.get(g);
+      const parentRow = rows.find((r) => r.nodeId === parentId);
+      qtyTouched.push({ recordId: parentId, label: parentRow?.label ?? q.row.label, group: g, count: members.length, members, specs: [], reason: 'quantity', choice: linkChoice });
+      if (linkChoice !== 'all') continue;
+      for (const mateId of members) {
+        if (mateId === parentId) continue;
+        const twin = correspondingLine(pre.ctx, pre.prints, parentId, lineIdOfRow, mateId);
+        const twinRow = twin ? rowOfLine.get(twin.id) : null;
+        if (!twinRow) { qtySkipped.push({ recordId: mateId, op: 'quantity', why: 'it has no line that corresponds to this one' }); continue; }
+        const said = qtyPlan.get(twin.id);
+        if (said) {
+          if (!near(said.to, q.to)) problems.push(`${q.row.label}: two different quantities are given for linked copies of one design (${twinRow.label} gets ${said.to}) — "apply to all copies" needs one.`);
+          continue;
+        }
+        qtyPlan.set(twin.id, { row: twinRow, from: Number(twinRow.fields.find((f) => f.kind === 'quantity')?.value), to: q.to, fanned: true });
+        touched.add(twinRow.id);
+      }
+    }
+  }
   let valuesOut = null;
   if (writes.length && (dryRun || !problems.length)) {
     try {
-      valuesOut = await writeLineValues(db, c, lineId, { dryRun, writes });
+      valuesOut = await writeLineValues(db, c, lineId, { dryRun, writes, links: linkChoice });
     } catch (e) {
       if (!(e instanceof CfError) || !Array.isArray(e.problems) || !e.problems.length) throw e;
       problems.push(...e.problems);
@@ -484,7 +534,7 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
     changes.push({ action: 'value', field: v.f.label, rowId: v.row.id, path: v.row.label, from: v.from, to: v.to });
   }
   for (const [lineIdOfRow, q] of qtyPlan) {
-    changes.push({ action: 'update', field: 'quantity', rowId: q.row.id, path: q.row.label, from: q.from, to: q.to, lineId: lineIdOfRow });
+    changes.push({ action: 'update', field: 'quantity', rowId: q.row.id, path: q.row.label, from: q.from, to: q.to, lineId: lineIdOfRow, ...(q.fanned ? { fanned: true } : {}) });
   }
   // Quantities first in the list a person reads — structure before values, as on the screen.
   changes.sort((a, b) => Number(b.action === 'update') - Number(a.action === 'update'));
@@ -502,7 +552,17 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
     if (dryRun) return report({ ...summary, quantityChanged: 0, valuesChanged: 0, sentence: 'nothing — fix the sheet first' });
     assertNoProblems(problems, `That sheet was not applied — ${plural(problems.length, 'problem', 'problems')} to fix first.`);
   }
-  if (dryRun) return report(summary);
+  // What the sheet does to linked copies. A preview works the values out for real (in a savepoint)
+  // and the quantities from the links as they stand: a quantity changed on one copy and not said
+  // for all is a choice still due.
+  const linksOf = (after, breaks) => ({
+    needsChoice: !!valuesOut?.links?.needsChoice || qtyTouched.some((t) => t.choice == null),
+    touched: [...(valuesOut?.links?.touched ?? []), ...qtyTouched],
+    breaks,
+    skipped: [...(valuesOut?.links?.skipped ?? []), ...qtySkipped],
+    after,
+  });
+  if (dryRun) return { ...report(summary), links: linksOf(valuesOut?.links?.after ?? view.links ?? null, valuesOut?.links?.breaks ?? []) };
 
   // ---- apply: the values are in (above); now the quantities, with ONE refresh
   // of what they roll up into for all of them.
@@ -512,5 +572,9 @@ export async function importOrderSheet(db, c, lineId, input = {}) {
     if (changed.values) refreshParents.add(changed.parentId);
   }
   if (refreshParents.size) await refreshValues(db, c, [...refreshParents]);
-  return { ...report(summary), applied: true };
+  // A parent whose child's quantity changed on its own is not a copy any more (one round trip when nothing is linked).
+  const settled = qtyPlan.size ? await settleLine(db, c, lineId) : null;
+  const breakOf = new Map();
+  for (const b of [...(valuesOut?.links?.breaks ?? []), ...(settled?.breaks ?? [])]) breakOf.set(b.recordId, b);
+  return { ...report(summary), applied: true, links: linksOf(settled?.links ? linksBlock(settled.links) : valuesOut?.links?.after ?? view.links ?? null, [...breakOf.values()]) };
 }

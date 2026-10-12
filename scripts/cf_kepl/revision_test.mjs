@@ -781,6 +781,36 @@ try {
   // 110 since 2026-10-10: the cut pieces a revision derives also take the values their own flow reads (a fixed handful of reads, not one a row).
   ok('and about a hundred for a line, not one a row', small.tally.n <= 110, String(small.tally.n));
 
+  section('11b. Linked copies come along as groups of the NEW revision (init.sql §59)');
+  {
+    const { buildLinkFixture, newTag } = await imp('scripts/cf_kepl/link_fixture.mjs');
+    const BCL = await imp('apps/cf_erp/services/bomChangeService.js');
+    const OVL = await imp('apps/cf_erp/services/orderValuesService.js');
+    const lf = await buildLinkFixture(conn, c, { tag: newTag('RVL'), parts: 0 });
+    let lr = await lf.rows();
+    await OVL.writeLineValues(conn, c, lf.lineId, { writes: [{ recordId: lr.segments[0].flange.id, specCode: 'LENGTH', value: 7000 }, { recordId: lr.segments[0].flange.id, specCode: 'WIDTH', value: 300 }] });
+    await BCL.applyBomChanges(conn, c, { scope: { orderLineId: lf.lineId }, changes: [{ op: 'paste', sourceLineId: lr.segments[0].node.lineId, parentId: lr.girder.id }] });
+    lr = await lf.rows();
+    // A drawing on both flanges: part of their design, and it must follow them into the revision.
+    const dwg = await DWG.createDrawing(conn, c, { number: `${lf.tag}/TFL`, revision: 'A', source: 'shop', status: 'issued' });
+    for (const s of lr.segments) await conn.query("INSERT INTO cf_drawing_links (company_id, drawing_id, subject_type, subject_id) VALUES (?, ?, 'master_record', ?)", [COMPANY, dwg.id, s.flange.id]);
+    const keysOf = async (lineId) => (await conn.query("SELECT i.master_id, i.link_group FROM cf_item_details i WHERE i.company_id = ? AND i.owner_order_line_id = ? AND i.item_type = 'temporary' AND i.deleted_at IS NULL AND i.link_group IS NOT NULL", [COMPANY, lineId]))[0];
+    const oldKeys = await keysOf(lf.lineId);
+    const oldView = await OVL.readLineValues(conn, COMPANY, lf.lineId);
+    eq('rev 1: three groups of two (segment, flange, web)', JSON.stringify([oldKeys.length, new Set(oldKeys.map((k) => k.link_group)).size, Object.keys(oldView.links.groups).length]), '[6,3,3]');
+    await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE company_id = ? AND id = ?', [COMPANY, lf.lineId]);
+    const rev2 = await REV.reviseOrder(conn, c, lf.order.id);
+    const newLine = rev2.lines.find((l) => Number(l.lineNo ?? l.line_no) === Number(lf.line.lineNo ?? lf.line.line_no)) ?? rev2.lines[0];
+    const newKeys = await keysOf(newLine.id);
+    eq('rev 2 has the same groups among ITS rows', JSON.stringify([newKeys.length, new Set(newKeys.map((k) => k.link_group)).size]), '[6,3]');
+    ok('…under keys of its own: no row of rev 2 is in a group with a row of rev 1', !newKeys.some((k) => oldKeys.some((o) => o.link_group === k.link_group)));
+    eq('rev 1 keeps its keys exactly as they were', JSON.stringify(await keysOf(lf.lineId)), JSON.stringify(oldKeys));
+    const newView = await OVL.readLineValues(conn, COMPANY, newLine.id);
+    eq('the copies are still the same design in rev 2 (their drawing links came too): three effective groups of two', JSON.stringify([Object.keys(newView.links.groups).length, Object.values(newView.links.groups).every((ids) => ids.length === 2)]), '[3,true]');
+    const [[dl]] = await conn.query("SELECT COUNT(*) AS n FROM cf_drawing_links WHERE company_id = ? AND drawing_id = ? AND deleted_at IS NULL", [COMPANY, dwg.id]);
+    eq('the drawing covers four rows now: two of each revision', Number(dl.n), 4);
+  }
+
   await conn.rollback();
   console.log('\nrolled back.');
 } catch (err) {
