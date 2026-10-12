@@ -157,8 +157,10 @@ try {
     ok('replacing an operation syncs', r.synced === true);
   }
   await db.query('INSERT INTO cf_production_steps SET ?', [{ company_id: COMPANY, production_item_id: 999999, flow_step_id: idB, operation_id: B, sequence: 20, quantity: 1 }]);
-  e = await refused(() => applyFlowChanges(db, c, F, { steps: f.steps.map((s) => (s.id === idB ? { id: s.id, operationId: C } : keep(s))) }));
-  ok('a step already in production cannot change its operation', /already in production \(1 released step\)/.test(e?.problems?.[0] ?? ''), JSON.stringify(e?.problems));
+  // 2026-10-12: a step already in production MAY change its operation — released work keeps its own copy.
+  r = await applyFlowChanges(db, c, F, { dryRun: true, steps: f.steps.map((s) => (s.id === idB ? { id: s.id, operationId: C } : keep(s))) });
+  ok('a step already in production can change its operation, and the summary says what released work keeps',
+    r.changes.replaced === 1 && r.changes.releasedKept === 1 && /1 step already released keeps the operation it was released with/.test(r.summary), r.summary);
   r = await applyFlowChanges(db, c, F, { steps: f.steps.map((s) => (s.id === idB ? keep(s, { stepName: 'Renamed', notes: 'A note' }) : keep(s))) });
   f = r.flow;
   ok('…but it can still be renamed and moved', stepOf(f, B).stepName === 'Renamed' && stepOf(f, B).notes === 'A note' && r.summary === '1 step edited.', r.summary);

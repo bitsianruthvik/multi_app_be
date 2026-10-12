@@ -676,8 +676,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
  * number — uq_cofs_operation_seq — so the second takes the next one up: 20, 21.)
  *
  * Refused, all problems at once: an obsolete flow; an operation that does not exist, or an inactive
- * one on a new step or a changed one; a step whose operation changes after production steps were
- * released from it (releasedUses); an `after` that names no step of the list, or the step itself;
+ * one on a new step or a changed one; an `after` that names no step of the list, or the step itself;
  * a CIRCLE; a LANE LEFT OPEN — the flow must end in one step, so every lane a split opened has to
  * meet another again (user, 2026-10-10: "If a parallel doesn't get closed, don't let it save");
  * a wait rule that makes no sense or is there twice. An operation changed in place goes through
@@ -733,10 +732,9 @@ export async function applyFlowChanges(db, c, flowId, input = {}) {
     else if (!op) say('That operation does not exist.');
     const opChanged = !!op && !!old && Number(old.operation.id) !== Number(op.id);
     if (op && (!old || opChanged) && op.status !== 'active') say(`Operation ${op.code} is inactive.`);
-    if (opChanged && releasedOf.get(Number(old.id))) {
-      const used = releasedOf.get(Number(old.id));
-      say(`This step is already in production (${used} released step${used === 1 ? '' : 's'}), so its operation cannot change. Add a new step with the other operation for future orders.`);
-    }
+    // A step already in production MAY change its operation (user, 2026-10-12: "it should let me change
+    // it"): released work holds its own copy of the step, so it keeps what it was released with and only
+    // what is released from now on takes the new operation. The summary says how many keep the old one.
     const key = !blank(raw.key) ? String(raw.key) : old ? String(old.id) : `#${i + 1}`;
     if (byKey.has(key)) say('Its key is used by another step of the list.');
     let lane = 0;
@@ -895,6 +893,9 @@ export async function applyFlowChanges(db, c, flowId, input = {}) {
   // A legacy flow is written the first time it is saved here even when nothing else changed: its links.
   const toWrite = words.length > 0 || linksChanged || (!flow.linked && want.length > 0);
   let summary = words.length ? `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.` : toWrite ? 'Saved.' : 'Nothing changed.';
+  const releasedKept = replaced.reduce((n, w) => n + (releasedOf.get(Number(w.old.id)) ?? 0), 0);
+  changes.releasedKept = releasedKept;
+  if (releasedKept) summary += ` ${plural(releasedKept, 'step', 'steps')} already released ${releasedKept === 1 ? 'keeps' : 'keep'} the operation ${releasedKept === 1 ? 'it was' : 'they were'} released with; what is released from now on takes the new one.`;
   const operationsChanged = !!(changes.added || changes.removed || changes.replaced);
   if (dryRun || !toWrite) {
     return { flow: await getFlow(db, c.companyId, flowId), summary, changes, synced: false, dryRun };
