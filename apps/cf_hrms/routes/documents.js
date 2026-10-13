@@ -31,6 +31,7 @@
  * a curl.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { HrmsError } from '../lib/errors.js';
@@ -84,7 +85,7 @@ router.get('/documents/status', guard(PERM.documents.view), handle(async (req) =
   ...(await listDocuments(pool, ctx(req).companyId, { limit: 25 })),
 })));
 
-router.get('/documents', guard(PERM.documents.view), handle((req) => listDocuments(pool, ctx(req).companyId, req.query)));
+router.get('/documents', guard(PERM.documents.view), listed('documents'), handle((req) => listDocuments(pool, ctx(req).companyId, req.query)));
 
 /**
  * Generate. One transaction: snapshot row, then the two renders, then the audit

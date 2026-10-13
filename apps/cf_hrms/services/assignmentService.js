@@ -56,6 +56,7 @@ import { assignmentRelationships, resolveReporting } from './reportingResolver.j
 import { HOLDS_SEAT_SQL } from './seatCount.js';
 import { assertNoOpenHiring } from './hiringRead.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL, scopeToday } from './accessScope.js';
+import { inBatch } from '../lib/batch.js';
 
 export const ASSIGNMENT_STATUSES = ['PLANNED', 'ACTIVE', 'SUSPENDED', 'ENDED'];
 /** Statuses that put a person on the job today. ENDED and PLANNED do not. */
@@ -63,8 +64,15 @@ const LIVE_STATUSES = ['ACTIVE', 'SUSPENDED'];
 
 async function exists(db, companyId, table, id, label, problems) {
   if (id == null) return null;
+  // In a bulk run (lib/batch.js) the same role, department, location and shift are asked for row after
+  // row, and none of them can go away meanwhile: an upload never removes. Positions and people are
+  // what a run changes, so those are always read.
+  const steady = inBatch(db) && ['hrms_roles', 'hrms_departments', 'hrms_locations', 'hrms_shifts'].includes(table);
+  const key = `exists:${table}:${id}`;
+  if (steady && db.hrmsBatch.has(key)) return db.hrmsBatch.get(key);
   const [[row]] = await db.query(`SELECT * FROM ${table} WHERE company_id = ? AND id = ? AND deleted_at IS NULL`, [companyId, id]);
   if (!row) problems.push(`That ${label} does not exist in this company.`);
+  if (steady && row) db.hrmsBatch.set(key, row);
   return row ?? null;
 }
 
@@ -500,6 +508,8 @@ export async function createAssignment(db, { companyId, userId }, body, options 
       await addAssignmentContext(db, { companyId, userId }, res.insertId, { workContextId: ctxId });
     }
   }
+  // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
+  if (inBatch(db)) return { assignment: { id: res.insertId } };
   return getAssignment(db, companyId, res.insertId);
 }
 

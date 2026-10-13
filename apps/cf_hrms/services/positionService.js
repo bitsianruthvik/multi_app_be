@@ -8,6 +8,7 @@ import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
 import { issuePositionCode, acceptImportedCode } from './codeService.js';
 import { POSITION_ENTITY, cardCodeOf } from './codegenProvider.js';
+import { inBatch } from '../lib/batch.js';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -115,11 +116,18 @@ export const LIVE_ON = (alias) =>
 /** Reference existence checks. Each pushes a sentence rather than throwing, so a form gets every problem at once. */
 async function exists(db, companyId, table, id, label, problems) {
   if (id == null) return null;
+  // In a bulk run (lib/batch.js) the same role, department, location and shift are asked for row after
+  // row, and none of them can go away meanwhile: an upload never removes. Positions and people are
+  // what a run changes, so those are always read.
+  const steady = inBatch(db) && ['hrms_roles', 'hrms_departments', 'hrms_locations', 'hrms_shifts'].includes(table);
+  const key = `exists:${table}:${id}`;
+  if (steady && db.hrmsBatch.has(key)) return db.hrmsBatch.get(key);
   const [[row]] = await db.query(
     `SELECT * FROM ${table} WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
     [companyId, id],
   );
   if (!row) problems.push(`That ${label} does not exist in this company.`);
+  if (steady && row) db.hrmsBatch.set(key, row);
   return row ?? null;
 }
 
@@ -495,6 +503,8 @@ export async function createPosition(db, { companyId, userId }, body, options = 
     `INSERT INTO hrms_positions (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
     keys.map((k) => cols[k]),
   );
+  // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
+  if (inBatch(db)) return { position: { id: res.insertId, positionCode } };
   return getPosition(db, companyId, res.insertId);
 }
 
@@ -524,6 +534,7 @@ export async function updatePosition(db, { companyId }, id, body) {
     );
     occupantsMoved = res.affectedRows;
   }
+  if (inBatch(db)) return { position: { id }, occupantsMovedToShift: occupantsMoved };
   return { ...(await getPosition(db, companyId, id)), occupantsMovedToShift: occupantsMoved };
 }
 

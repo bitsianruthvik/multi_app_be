@@ -1,0 +1,218 @@
+/**
+ * listFilters.js — search and filters, the same way on every list.
+ * (TM/CF_HRMS_HIRING_SPEC.md §13.1; the names are listed in §13.6.)
+ *
+ *   router.get('/positions', guard(…), listed('positions'), handle(…))
+ *
+ * `listed(name)` reads the address (`?q=&department=&state=`), narrows the rows
+ * of the answer the handler gives, and adds two numbers to it:
+ *
+ *   total   how many rows the list holds for this login before these filters
+ *   count   how many are left ("38 of 220")
+ *
+ * IT COSTS NO QUERY of its own, with one exception: "department and below"
+ * needs the department tree, one read, only when that filter is used. The rows
+ * are already in memory — every one of these lists is read whole — so narrowing
+ * them here is exact and cannot disagree with what a row shows.
+ *
+ * THE SAME FUNCTION FEEDS THE EXCEL DOWNLOAD (services/excel/engine.js):
+ * "Download Excel" holds what the list shows because it asks `filterRows` with
+ * the same address and the same spec.
+ *
+ * Filters a list service already took in its own query (`status`, `roleId`,
+ * `search` …) keep working as they did; they are applied by the service, before
+ * `total` is counted.
+ */
+import { pool } from './db.js';
+import { ctx } from './http.js';
+
+const blank = (v) => v === undefined || v === null || String(v).trim() === '';
+const lower = (v) => String(v ?? '').trim().toLowerCase();
+const csv = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+const idSet = (v) => new Set(csv(v).map(Number).filter((n) => Number.isInteger(n) && n > 0));
+/** yes / no from an address: 1, true, yes — 0, false, no. Anything else is not a filter. */
+const yesNo = (v) => (['1', 'true', 'yes'].includes(lower(v)) ? true : (['0', 'false', 'no'].includes(lower(v)) ? false : null));
+const day = (v) => (v == null ? null : (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10)));
+
+const matchesText = (fields) => (row, value) => {
+  const needle = lower(value);
+  return fields.some((f) => lower(typeof f === 'function' ? f(row) : row[f]).includes(needle));
+};
+const oneOfIds = (pick) => (row, value) => { const ids = idSet(value); return !ids.size || ids.has(Number(pick(row))); };
+const oneOfWords = (pick) => (row, value) => { const words = csv(value).map(lower); return !words.length || words.includes(lower(pick(row))); };
+const flag = (pick) => (row, value) => { const want = yesNo(value); return want === null || Boolean(pick(row)) === want; };
+/** "This department and everything below it." `tree.below(id)` is that set of ids. */
+const inDepartment = (pick) => (row, value, tree) => {
+  const ids = idSet(value);
+  if (!ids.size) return true;
+  const own = Number(pick(row));
+  return [...ids].some((id) => tree.below(id).has(own));
+};
+
+/**
+ * One entry per list: `key` is where the rows are in the answer (several keys
+ * when an answer carries the same rows under two names), `filters` is
+ * parameter -> test. A parameter that is absent or blank is no filter.
+ */
+export const LIST_SPECS = {
+  departments: {
+    key: ['rows'],
+    filters: {
+      q: matchesText(['name', 'code']),
+      label: oneOfWords((r) => r.type),
+      shared: flag((r) => r.isShared),
+      status: oneOfWords((r) => r.status),
+      // Under this department, at any depth (the department itself is not "under" itself).
+      parent: (row, value, tree) => { const ids = idSet(value); return !ids.size || [...ids].some((id) => id !== row.id && tree.below(id).has(row.id)); },
+    },
+    needsTree: ['parent'],
+  },
+  locations: { key: ['rows'], filters: { q: matchesText(['name', 'code']), status: oneOfWords((r) => r.status) } },
+  roles: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['title', 'roleCode']),
+      status: oneOfWords((r) => r.status),
+      hasPositions: flag((r) => r.positionCount > 0),
+      jdReady: flag((r) => r.jdReady),
+      hasPurpose: flag((r) => r.hasPurpose),
+    },
+  },
+  positions: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['positionCode', 'positionTitle', 'roleTitle', (r) => r.occupant?.name, (r) => r.occupant?.employeeCode]),
+      department: inDepartment((r) => r.departmentId),
+      role: oneOfIds((r) => r.roleId),
+      shift: oneOfIds((r) => r.defaultShiftId),
+      location: oneOfIds((r) => r.locationId),
+      // filled | vacant | hiring | notice — several, comma-separated, are "any of".
+      state: (row, value) => {
+        const want = csv(value).map(lower);
+        if (!want.length) return true;
+        const is = {
+          filled: Boolean(row.occupant), vacant: !row.occupant, hiring: Boolean(row.hiring), notice: Boolean(row.occupant?.notice),
+        };
+        return want.some((w) => is[w]);
+      },
+    },
+    needsTree: ['department'],
+  },
+  employees: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['fullName', 'employeeCode']),
+      department: inDepartment((r) => r.departmentId),
+      role: oneOfIds((r) => r.roleId),
+      shift: oneOfIds((r) => r.shiftId),
+      location: oneOfIds((r) => r.locationId),
+      joinedFrom: (row, value) => { const d = day(row.dateOfJoining); return blank(value) || (d != null && d >= String(value).slice(0, 10)); },
+      joinedTo: (row, value) => { const d = day(row.dateOfJoining); return blank(value) || (d != null && d <= String(value).slice(0, 10)); },
+      hasLogin: flag((r) => r.userId != null),
+    },
+    needsTree: ['department'],
+  },
+  hirings: {
+    key: ['hirings'],
+    filters: {
+      q: matchesText(['candidateName', 'positionCode', 'roleTitle', 'refNo']),
+      stage: oneOfWords((r) => r.stage),
+      department: inDepartment((r) => r.departmentId),
+      role: oneOfIds((r) => r.roleId),
+    },
+    needsTree: ['department'],
+  },
+  documents: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['title', (r) => r.target?.label, (r) => r.target?.roleTitle, (r) => r.target?.positionCode, (r) => r.target?.employeeName]),
+      role: oneOfIds((r) => r.target?.roleId),
+      from: (row, value) => { const d = day(row.generatedAt); return blank(value) || (d != null && d >= String(value).slice(0, 10)); },
+      to: (row, value) => { const d = day(row.generatedAt); return blank(value) || (d != null && d <= String(value).slice(0, 10)); },
+    },
+  },
+  shifts: {
+    key: ['shifts', 'rows'],
+    filters: { q: matchesText(['name', 'code']), status: oneOfWords((r) => r.status), calendar: oneOfIds((r) => r.holidayCalendar?.id) },
+  },
+  holidays: {
+    key: ['holidays', 'rows'],
+    filters: { q: matchesText(['name']), calendar: oneOfIds((r) => r.calendarId), optional: flag((r) => r.isOptional) },
+  },
+  holidayCalendars: { key: ['calendars', 'rows'], filters: { q: matchesText(['name']), status: oneOfWords((r) => r.status) } },
+  leavePolicies: {
+    key: ['policies'],
+    filters: {
+      q: matchesText(['name', 'code']),
+      status: oneOfWords((r) => r.status),
+      used: flag((r) => Boolean(r.usedBy?.company) || (r.usedBy?.locations ?? 0) > 0 || (r.usedBy?.roles ?? 0) > 0),
+    },
+  },
+  libraries: {
+    key: ['items'],
+    filters: { q: matchesText(['name', 'code', 'description']), status: oneOfWords((r) => r.status), used: flag((r) => (r.usageCount ?? 0) > 0) },
+  },
+  reportingTypes: { key: ['rows'], filters: { q: matchesText(['name', 'code']), status: oneOfWords((r) => r.status) } },
+  // The service narrows these itself (q, roleId, state); here only the two numbers are added.
+  logins: { key: ['logins'], filters: {} },
+};
+
+/** The department tree of a company, as "this one and everything below it". One read. */
+export async function departmentTree(db, companyId) {
+  const [rows] = await db.query('SELECT id, parent_department_id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  const childrenOf = new Map();
+  for (const r of rows) if (r.parent_department_id != null) childrenOf.set(r.parent_department_id, [...(childrenOf.get(r.parent_department_id) ?? []), r.id]);
+  const memo = new Map();
+  return {
+    below(id) {
+      const key = Number(id);
+      if (memo.has(key)) return memo.get(key);
+      const out = new Set();
+      const walk = [key];
+      while (walk.length) { const x = walk.pop(); if (out.has(x)) continue; out.add(x); walk.push(...(childrenOf.get(x) ?? [])); }
+      memo.set(key, out);
+      return out;
+    },
+  };
+}
+const NO_TREE = { below: (id) => new Set([Number(id)]) };
+
+/** Which of a spec's filters the address actually uses. */
+export const activeFilters = (spec, query = {}) => Object.keys(spec.filters).filter((name) => !blank(query[name]));
+
+/** The rows a spec and an address leave. Reads the department tree only when a filter needs it. */
+export async function filterRows(db, companyId, rows, query, spec) {
+  const active = activeFilters(spec, query);
+  if (!active.length) return rows;
+  const tree = (spec.needsTree ?? []).some((n) => active.includes(n)) ? await departmentTree(db, companyId) : NO_TREE;
+  return rows.filter((row) => active.every((name) => spec.filters[name](row, query[name], tree)));
+}
+
+/** Narrows an answer in place of its rows, and adds `total` and `count`. */
+export async function applyListFilters(db, companyId, body, query, spec) {
+  if (!body || typeof body !== 'object') return body;
+  const key = spec.key.find((k) => Array.isArray(body[k]));
+  if (!key) return body;
+  const all = body[key];
+  const rows = await filterRows(db, companyId, all, query, spec);
+  const out = { ...body, total: all.length, count: rows.length };
+  for (const k of spec.key) if (Array.isArray(body[k])) out[k] = rows;
+  return out;
+}
+
+/** The step for a route: `listed('positions')`, between the guard and the handler. */
+export const listed = (name) => {
+  const spec = LIST_SPECS[name];
+  if (!spec) throw new Error(`[cf_hrms] listed(): no list called "${name}".`);
+  return Object.assign((req, res, next) => {
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      if (res.statusCode >= 400) return send(body);
+      applyListFilters(pool, ctx(req).companyId, body, req.query, spec).then(send, () => send(body));
+      return res;
+    };
+    next();
+  }, { hrmsStep: Object.keys(spec.filters).length ? `filters: ${Object.keys(spec.filters).join(', ')}` : 'adds total and count' });
+};
+
+export default { LIST_SPECS, listed, filterRows, applyListFilters, departmentTree, activeFilters };

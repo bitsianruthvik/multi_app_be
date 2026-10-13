@@ -44,6 +44,7 @@
  * active assignment instead, which is the only place they are true.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam, canSeePii } from '../lib/http.js';
 import { inPosition, inEmployee, companyWide, showsPeople, takesEmployee, employeePaper } from '../lib/gates.js';
@@ -72,7 +73,7 @@ router.get('/people/pickers', guard([PERM.employees.view, PERM.hiring.view]), ha
 
 // ── employees ───────────────────────────────────────────────────────────────
 
-router.get('/people/employees', guard(PERM.employees.view), showsPeople, handle(async (req) => (
+router.get('/people/employees', guard(PERM.employees.view), showsPeople, listed('employees'), handle(async (req) => (
   // Scoped to the login's department; and a search reads phone and email only for somebody who may see them —
   // otherwise typing digits into the box would say whose number it is.
   listEmployees(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req), searchContact: canSeePii(req) })

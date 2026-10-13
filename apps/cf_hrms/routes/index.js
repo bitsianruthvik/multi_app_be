@@ -17,6 +17,7 @@ import hiringRoutes from './hiring.js';
 import exitRoutes from './exits.js';
 import accessRoutes from './access.js';
 import codegenGateRoutes from './codegen.js';
+import excelRoutes from './excel.js';
 
 const router = Router();
 
@@ -125,5 +126,7 @@ router.use(exitRoutes);
 // routes are the code generator's and are mounted after this router in app.js (routes/codegen.js).
 router.use(accessRoutes);
 router.use(codegenGateRoutes);
+// Download and upload by Excel, one engine for every entity (routes/excel.js).
+router.use(excelRoutes);
 
 export default router;

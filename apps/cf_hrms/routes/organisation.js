@@ -63,6 +63,7 @@
  * organisationService.js are the ones TiDB cannot hold.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, ANY_VIEW, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import { departmentWrite, companyWide } from '../lib/gates.js';
@@ -94,7 +95,7 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 router.get('/organisation/lookups', guard(ANY_VIEW), handle((req) => lookups(pool, ctx(req).companyId)));
 
 // ----- departments ----------------------------------------------------------
-router.get('/organisation/departments', guard([PERM.org.view, PERM.positions.view]), handle((req) => listDepartments(pool, ctx(req).companyId)));
+router.get('/organisation/departments', guard([PERM.org.view, PERM.positions.view]), listed('departments'), handle((req) => listDepartments(pool, ctx(req).companyId)));
 // Who works in each department: its roles, the positions under each, and the
 // people in them. org_view and nothing weaker — it names every occupant in the
 // company, so the cf_hrms_self_view employee logins get a 403.
@@ -121,7 +122,7 @@ router.put('/organisation/department-labels/:id', guard(PERM.org.edit), companyW
 router.delete('/organisation/department-labels/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLabel(db, c, intParam(req.params.id), { moveTo: req.query.moveTo ?? null }))));
 
 // ----- locations ------------------------------------------------------------
-router.get('/organisation/locations', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLocations(pool, ctx(req).companyId)));
+router.get('/organisation/locations', guard([PERM.org.view, PERM.positions.view]), listed('locations'), handle((req) => listLocations(pool, ctx(req).companyId)));
 router.post('/organisation/locations', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLocation(db, c, req.body))));
 router.put('/organisation/locations/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLocation(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/locations/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLocation(db, c, intParam(req.params.id)))));
@@ -142,7 +143,7 @@ router.put('/organisation/contractors/:id', guard(PERM.employees.edit), companyW
 router.delete('/organisation/contractors/:id', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteContractor(db, c, intParam(req.params.id)))));
 
 // ----- shifts ---------------------------------------------------------------
-router.get('/organisation/shifts', guard([PERM.time.view, PERM.positions.view]), handle((req) => listShifts(pool, ctx(req).companyId)));
+router.get('/organisation/shifts', guard([PERM.time.view, PERM.positions.view]), listed('shifts'), handle((req) => listShifts(pool, ctx(req).companyId)));
 router.get('/organisation/shifts/:id', guard([PERM.time.view, PERM.positions.view]), handle((req) => getShiftDetail(pool, ctx(req).companyId, intParam(req.params.id))));
 router.post('/organisation/shifts', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createShift(db, c, req.body))));
 router.put('/organisation/shifts/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateShift(db, c, intParam(req.params.id), req.body))));
@@ -150,7 +151,7 @@ router.delete('/organisation/shifts/:id', guard(PERM.time.remove), companyWide('
 
 // ----- holiday calendars ----------------------------------------------------
 // A named list of dated holidays; a shift selects one (spec §6.2).
-router.get('/organisation/holiday-calendars', guard(PERM.time.view), handle((req) => listHolidayCalendars(pool, ctx(req).companyId)));
+router.get('/organisation/holiday-calendars', guard(PERM.time.view), listed('holidayCalendars'), handle((req) => listHolidayCalendars(pool, ctx(req).companyId)));
 router.post('/organisation/holiday-calendars', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createHolidayCalendar(db, c, req.body ?? {}))));
 router.get('/organisation/holiday-calendars/:id', guard(PERM.time.view), handle((req) => getHolidayCalendar(pool, ctx(req).companyId, intParam(req.params.id), { year: req.query.year })));
 router.put('/organisation/holiday-calendars/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateHolidayCalendar(db, c, intParam(req.params.id), req.body ?? {}))));
@@ -159,13 +160,13 @@ router.post('/organisation/holiday-calendars/:id/holidays', guard(PERM.time.edit
 router.post('/organisation/holiday-calendars/:id/copy-year', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => copyHolidayYear(db, c, intParam(req.params.id), req.body ?? {}))));
 
 // ----- holidays -------------------------------------------------------------
-router.get('/organisation/holidays', guard(PERM.time.view), handle((req) => listHolidays(pool, ctx(req).companyId, { year: req.query.year })));
+router.get('/organisation/holidays', guard(PERM.time.view), listed('holidays'), handle((req) => listHolidays(pool, ctx(req).companyId, { year: req.query.year })));
 router.post('/organisation/holidays', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createHoliday(db, c, req.body))));
 router.put('/organisation/holidays/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateHoliday(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/holidays/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteHoliday(db, c, intParam(req.params.id)))));
 
 // ----- reporting relationship types -----------------------------------------
-router.get('/organisation/reporting-types', guard([PERM.setup.view, PERM.positions.view]), handle((req) => listReportingTypes(pool, ctx(req).companyId)));
+router.get('/organisation/reporting-types', guard([PERM.setup.view, PERM.positions.view]), listed('reportingTypes'), handle((req) => listReportingTypes(pool, ctx(req).companyId)));
 router.post('/organisation/reporting-types', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createReportingType(db, c, req.body))));
 router.put('/organisation/reporting-types/:id', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateReportingType(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/reporting-types/:id', guard(PERM.setup.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteReportingType(db, c, intParam(req.params.id)))));

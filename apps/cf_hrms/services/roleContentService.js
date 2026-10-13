@@ -39,6 +39,7 @@ import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js'
 import { loadAssignmentIndex } from './leavePolicyRead.js';
 import { issueRoleCode, acceptImportedCode } from './codeService.js';
 import { ROLE_ENTITY } from './codegenProvider.js';
+import { inBatch } from '../lib/batch.js';
 
 // ---------------------------------------------------------------------------
 // Vocabularies. These mirror models/init.sql; routes/index.js /meta serves the
@@ -402,6 +403,7 @@ export async function createMasterItem(db, c, kind, input = {}) {
     [c.companyId, ...cols.map((k) => fields[k]), c.userId],
   );
   await audit(db, c, m.table, r.insertId, 'CREATE', null, fields);
+  if (inBatch(db)) return { id: r.insertId, code: fields.code ?? null };
   return getMaster(db, c.companyId, kind, r.insertId);
 }
 
@@ -421,6 +423,7 @@ export async function updateMasterItem(db, c, kind, id, input = {}) {
     [...cols.map((k) => fields[k]), c.companyId, id],
   );
   await audit(db, c, m.table, id, 'UPDATE', m.shape(before), fields);
+  if (inBatch(db)) return { id };
   return getMaster(db, c.companyId, kind, id);
 }
 
@@ -590,6 +593,8 @@ export async function createRole(db, c, input = {}, options = {}) {
     [c.companyId, ...cols.map((k) => fields[k]), c.userId],
   );
   await audit(db, c, 'hrms_roles', r.insertId, 'CREATE', null, fields);
+  // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
+  if (inBatch(db)) return { id: r.insertId, roleCode: fields.role_code };
   return getRole(db, c.companyId, r.insertId);
 }
 
@@ -609,6 +614,7 @@ export async function updateRole(db, c, id, input = {}) {
     );
     await audit(db, c, 'hrms_roles', id, 'UPDATE', { title: before.title, status: before.status }, fields);
   }
+  if (inBatch(db)) return { id };
   return getRole(db, c.companyId, id);
 }
 

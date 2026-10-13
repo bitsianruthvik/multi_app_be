@@ -39,6 +39,7 @@ import {
 } from './documentStorage.js';
 import { issueEmployeeCode } from './codeService.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL, scopeToday } from './accessScope.js';
+import { inBatch } from '../lib/batch.js';
 import { exitsForEmployees } from './exitRead.js';
 
 // ── small shared helpers ────────────────────────────────────────────────────
@@ -386,6 +387,11 @@ export async function listEmployees(exec, companyId, query = {}, { departmentIds
       totalAllocationPercent: active.reduce((sum, a) => sum + (a.allocationPercent ?? 0), 0),
       primaryAssignmentId: primary?.id ?? null,
       primaryRoleTitle: primary?.roleTitle ?? null,
+      // What the list's filters read (lib/listFilters.js): the role, position and shift of the main work.
+      roleId: primary?.roleId ?? null,
+      positionId: primary?.positionId ?? null,
+      positionCode: primary?.positionCode ?? null,
+      shiftId: primary?.shiftId ?? null,
       departmentId: primary?.departmentId ?? null,
       departmentName: primary?.departmentName ?? null,
       locationId: primary?.locationId ?? null,
@@ -661,6 +667,8 @@ export async function createEmployee(conn, c, body = {}, requestId = null, optio
   }
   await audit(conn, c, 'hrms_employees', id, 'CREATE', null, { employeeCode, fullName, employmentType, employmentStatus }, requestId);
 
+  // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
+  if (inBatch(conn)) return { employee: { id, employeeCode, fullName } };
   return getEmployee(conn, c.companyId, id);
 }
 
@@ -738,6 +746,8 @@ export async function updateEmployee(conn, c, id, body = {}, requestId = null, o
       id, c.companyId,
     ],
   );
+  // The salutation was only ever written when a person was added; it is saved here when it is sent.
+  if (has('salutation')) await conn.query('UPDATE hrms_employees SET salutation = ? WHERE id = ? AND company_id = ?', [trim(body.salutation, 10), id, c.companyId]);
 
   // Events, written here because nothing else will. Each one is the sentence a
   // person would write in the file, not a diff.
@@ -767,6 +777,7 @@ export async function updateEmployee(conn, c, id, body = {}, requestId = null, o
     { ...next, addressJson: undefined, emergencyContactJson: undefined },
     requestId);
 
+  if (inBatch(conn)) return { employee: { id } };
   return getEmployee(conn, c.companyId, id);
 }
 

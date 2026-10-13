@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, need } from '../lib/http.js';
 import { companyWide } from '../lib/gates.js';
@@ -65,7 +66,7 @@ router.delete('/leave/types/:id', guard(PERM.leave.remove), companyWide('This be
 
 // ── policies ────────────────────────────────────────────────────────────────
 router.get('/leave/policy-templates', guard(PERM.leave.view), handle(async () => listTemplates()));
-router.get('/leave/policies', guard(PERM.leave.view), handle((req) => listPolicies(pool, ctx(req).companyId)));
+router.get('/leave/policies', guard(PERM.leave.view), listed('leavePolicies'), handle((req) => listPolicies(pool, ctx(req).companyId)));
 // Before /leave/policies/:id, or "preview-summary" would be read as an id.
 router.post('/leave/policies/preview-summary', guard(PERM.leave.view), handle((req) => previewRuleSummary(pool, ctx(req).companyId, req.body ?? {})));
 router.get('/leave/policies/:id', guard(PERM.leave.view), handle((req) => getPolicy(pool, ctx(req).companyId, id(req))));

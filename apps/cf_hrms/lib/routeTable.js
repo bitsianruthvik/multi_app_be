@@ -83,6 +83,7 @@ const AREA_OF_FILE = [
   ['Documents', (p) => p.startsWith('/documents')],
   ['Leave', (p) => p.startsWith('/leave')],
   ['Code formats', (p) => p.startsWith('/codegen')],
+  ['Excel', (p) => p.startsWith('/excel')],
   ['Everything else', () => true],
 ];
 // A hiring is started on a position and lives under /hirings; both belong with Hiring.
@@ -116,7 +117,8 @@ export function renderAccessDoc(rows) {
   out.push('- **scope: the position / the person / the department** — for a login whose access role is “only their department and below”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.');
   out.push('- **whole-company logins only** — the thing belongs to no department, so a department-scoped login cannot change it.');
   out.push('- `cf_hrms_contact_view` and `cf_hrms_pay_view` also change what a route RETURNS: without them contact details and pay are removed from the answer on the server.');
-  out.push('- `upload` rights guard the Excel uploads; none of those routes exists yet.');
+  out.push('- **filters: …** — the search and filters that list takes in its address (`?q=&status=`); it answers `total` and `count` beside its rows.');
+  out.push('- `upload` rights guard the Excel uploads (the Excel section).');
   out.push('');
 
   const sections = new Map();

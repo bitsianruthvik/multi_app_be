@@ -36,6 +36,7 @@ import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js'
 import { ensureLabels, resolveLabel } from './departmentLabelService.js';
 import { issueDepartmentCode, issueLocationCode, acceptImportedCode } from './codeService.js';
 import { DEPARTMENT_ENTITY, LOCATION_ENTITY } from './codegenProvider.js';
+import { inBatch } from '../lib/batch.js';
 
 import {
   WEEKDAY_NAMES, hhmm, spanMinutes, shapeDay, defaultWeek, weekOf, summaryOf, weeklyHoursOf, mirrorOf, weekdayName,
@@ -533,6 +534,8 @@ export async function createDepartment(db, c, input = {}, options = {}) {
   });
   const served = serves ? await writeServes(db, c, id, fields.is_shared === 1, serves) : null;
   await audit(db, c, 'hrms_departments', id, 'CREATE', null, { ...fields, parent_department_id: parentId, ...(served ? { serves: served.after } : {}) });
+  // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
+  if (inBatch(db)) return { id, code: fields.code };
   return getDepartment(db, c.companyId, id);
 }
 
@@ -561,6 +564,7 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
     : (!sharedAfter && before.is_shared ? await writeServes(db, c, id, false, []) : null);
   const beforeServes = served ? served.before : [];
   await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...(served ? { serves: served.after } : {}) });
+  if (inBatch(db)) return { id };
   return getDepartment(db, c.companyId, id);
 }
 
@@ -644,6 +648,7 @@ export async function createLocation(db, c, input = {}, options = {}) {
     status: fields.status ?? 'ACTIVE',
   });
   await audit(db, c, 'hrms_locations', id, 'CREATE', null, { ...fields, parent_location_id: parentId });
+  if (inBatch(db)) return { id, code: fields.code };
   return getLocation(db, c.companyId, id);
 }
 
@@ -660,6 +665,7 @@ export async function updateLocation(db, c, id, input = {}) {
   }
   await updateRow(db, 'hrms_locations', c.companyId, id, fields);
   await audit(db, c, 'hrms_locations', id, 'UPDATE', mapLocation(before), fields);
+  if (inBatch(db)) return { id };
   return getLocation(db, c.companyId, id);
 }
 

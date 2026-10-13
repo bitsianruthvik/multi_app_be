@@ -27,6 +27,7 @@ import {
   EMPLOYEE_ENTITY, HIRING_ENTITY, DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY,
 } from './codegenProvider.js';
 import { invalid, conflict } from '../lib/errors.js';
+import { ruleReader } from '../lib/batch.js';
 
 const MAX_TRIES = 50;
 
@@ -114,7 +115,10 @@ async function isTaken(conn, companyId, entityType, code) {
   return Boolean(row);
 }
 
-async function issue(conn, companyId, entityType, context) {
+async function issue(connection, companyId, entityType, context) {
+  // In a bulk run the company's code rules are read once, not once a row (lib/batch.js). The running
+  // number is still taken from its table, under its lock, every time.
+  const conn = ruleReader(connection);
   const { userId = null, ...draft } = context ?? {};
   const { what, max } = CODE_HOME[entityType];
   await ensureDefaultRule(conn, companyId, entityType, userId);
@@ -127,7 +131,7 @@ async function issue(conn, companyId, entityType, context) {
     if (out.text.length > max) {
       throw invalid('CODE_TOO_LONG', `The code format gives ${out.text}, which is longer than the ${max} characters a ${what} can hold. Shorten the format under Code formats.`);
     }
-    if (!(await isTaken(conn, companyId, entityType, out.text))) return out.text;
+    if (!(await isTaken(connection, companyId, entityType, out.text))) return out.text;
     // No running number, or one that did not move the text: trying again gives the same code.
     if (out.number == null || out.text === previous) {
       throw conflict('CODE_IN_USE', `The code format gives ${out.text}, which is already in use. Add a running number to it under Code formats.`);

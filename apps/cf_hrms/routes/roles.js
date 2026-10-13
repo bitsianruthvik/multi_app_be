@@ -63,6 +63,7 @@
  * three separate kinds here and on every screen, deliberately — plan §2 rule 4.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { HrmsError } from '../lib/errors.js';
@@ -124,7 +125,7 @@ router.post('/role-content-copy', guard([PERM.roles.edit, PERM.positions.edit], 
 }));
 
 // ----- the content masters -------------------------------------------------
-router.get('/role-masters/:kind', guard([PERM.roles.view, PERM.positions.view]), handle((req) => listMaster(pool, ctx(req).companyId, req.params.kind)));
+router.get('/role-masters/:kind', guard([PERM.roles.view, PERM.positions.view]), listed('libraries'), handle((req) => listMaster(pool, ctx(req).companyId, req.params.kind)));
 router.get('/role-masters/:kind/:id', guard([PERM.roles.view, PERM.positions.view]), handle((req) => getMaster(pool, ctx(req).companyId, req.params.kind, intParam(req.params.id))));
 router.get('/role-masters/:kind/:id/usage', guard([PERM.roles.view, PERM.positions.view]), handle((req) => masterUsage(pool, ctx(req).companyId, req.params.kind, intParam(req.params.id))));
 router.post('/role-masters/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createMasterItem(db, c, req.params.kind, req.body))));
@@ -136,7 +137,7 @@ router.delete('/role-masters/:kind/:id', guard(PERM.roles.remove), companyWide('
 // Express matches in order and a literal path after a param never runs.
 router.get('/roles/overview', guard(PERM.roles.view), handle((req) => rolesOverview(pool, ctx(req).companyId)));
 router.get('/roles/departments', guard(PERM.roles.view), handle((req) => listDepartments(pool, ctx(req).companyId)));
-router.get('/roles', guard(PERM.roles.view), handle((req) => listRoles(pool, ctx(req).companyId)));
+router.get('/roles', guard(PERM.roles.view), listed('roles'), handle((req) => listRoles(pool, ctx(req).companyId)));
 router.post('/roles', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createRole(db, c, req.body))));
 router.get('/roles/:id', guard(PERM.roles.view), handle((req) => getRole(pool, ctx(req).companyId, intParam(req.params.id))));
 router.put('/roles/:id', guard(PERM.roles.edit, { note: 'status RETIRED also needs cf_hrms_roles_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => {

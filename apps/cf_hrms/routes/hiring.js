@@ -43,6 +43,7 @@
  * DONE land together or not at all (services/hiringService.js).
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { inPosition, companyWide, showsHiring, takesHiring } from '../lib/gates.js';
@@ -85,7 +86,7 @@ router.get('/hiring/close-reasons', guard(PERM.hiring.view), handle((req) => lis
 
 // ── hirings ─────────────────────────────────────────────────────────────────
 
-router.get('/hirings', guard(PERM.hiring.view), handle(async (req) => listHirings(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req) })));
+router.get('/hirings', guard(PERM.hiring.view), listed('hirings'), handle(async (req) => listHirings(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req) })));
 router.get('/hirings/:id', guard(PERM.hiring.view), inPosition('hiring'), showsHiring, handle((req) => getHiring(pool, ctx(req).companyId, id(req))));
 
 router.post('/positions/:id/hiring', guard(PERM.hiring.edit), inPosition(), showsHiring, handle((req) => tx(req, (db, c) => startHiring(db, c, id(req), reqId(req)))));

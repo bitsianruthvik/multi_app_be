@@ -184,8 +184,9 @@ try {
     ok(theirs.length >= 8 && theirs.every((k) => ours.has(k)), 'every route of the code generator is behind a guard of this app', theirs.filter((k) => !ours.has(k)).join(', '));
     const used = new Set(rows.flatMap((r) => (r.guard ? [...r.guard.anyOf, ...r.guard.also] : [])));
     const unused = ALL_TAGS.filter((t) => !used.has(t));
-    ok(same(unused, [PERM.org.upload, PERM.roles.upload, PERM.positions.upload, PERM.employees.upload, PERM.time.upload, PERM.documents.remove]),
-      'every right opens a route, except the Excel uploads (round C) and removing a generated document (no such route yet)', unused.join(', '));
+    // The five upload rights guard the Excel uploads since round C (routes/excel.js).
+    ok(same(unused, [PERM.documents.remove]),
+      'every right opens a route, except removing a generated document (no such route yet)', unused.join(', '));
     ok(rows.filter((r) => r.guard?.anyOf.includes(PERM.selfView)).every((r) => r.path.startsWith('/user/me')) && rows.filter((r) => r.path.startsWith('/user/me')).every((r) => r.guard.anyOf.join() === PERM.selfView),
       'cf_hrms_self_view guards the /user/me routes and nothing else, and they ask for nothing else');
   }

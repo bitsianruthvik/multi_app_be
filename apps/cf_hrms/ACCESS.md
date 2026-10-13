@@ -34,7 +34,8 @@ How to read the tables below:
 - **scope: the position / the person / the department** — for a login whose access role is “only their department and below”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.
 - **whole-company logins only** — the thing belongs to no department, so a department-scoped login cannot change it.
 - `cf_hrms_contact_view` and `cf_hrms_pay_view` also change what a route RETURNS: without them contact details and pay are removed from the answer on the server.
-- `upload` rights guard the Excel uploads; none of those routes exists yet.
+- **filters: …** — the search and filters that list takes in its address (`?q=&status=`); it answers `total` and `count` beside its rows.
+- `upload` rights guard the Excel uploads (the Excel section).
 
 ## Access
 
@@ -46,7 +47,7 @@ How to read the tables below:
 | `POST /access/roles` | `cf_hrms_access_manage` |  |
 | `PUT /access/roles/:roleId` | `cf_hrms_access_manage` |  |
 | `DELETE /access/roles/:roleId` | `cf_hrms_access_manage` |  |
-| `GET /access/logins` | `cf_hrms_access_manage` |  |
+| `GET /access/logins` | `cf_hrms_access_manage` | adds total and count |
 | `POST /access/logins` | `cf_hrms_access_manage` |  |
 | `PUT /access/logins/:userId` | `cf_hrms_access_manage` |  |
 | `POST /access/logins/:userId/disable` | `cf_hrms_access_manage` |  |
@@ -72,7 +73,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` |  |
-| `GET /organisation/departments` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
+| `GET /organisation/departments` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, label, shared, status, parent |
 | `GET /organisation/departments/staffing` | `cf_hrms_org_view` |  |
 | `POST /organisation/departments` | `cf_hrms_org_edit` | scope: the department |
 | `PUT /organisation/departments/:id` | `cf_hrms_org_edit` | scope: the department |
@@ -82,7 +83,7 @@ How to read the tables below:
 | `PUT /organisation/department-labels/order` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/department-labels/:id` | `cf_hrms_org_edit` | whole-company logins only |
 | `DELETE /organisation/department-labels/:id` | `cf_hrms_org_remove` | whole-company logins only |
-| `GET /organisation/locations` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
+| `GET /organisation/locations` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, status |
 | `POST /organisation/locations` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/locations/:id` | `cf_hrms_org_edit` | whole-company logins only |
 | `DELETE /organisation/locations/:id` | `cf_hrms_org_remove` | whole-company logins only |
@@ -94,23 +95,23 @@ How to read the tables below:
 | `POST /organisation/contractors` | `cf_hrms_employees_edit` | whole-company logins only |
 | `PUT /organisation/contractors/:id` | `cf_hrms_employees_edit` | whole-company logins only |
 | `DELETE /organisation/contractors/:id` | `cf_hrms_employees_edit` | whole-company logins only |
-| `GET /organisation/shifts` | `cf_hrms_time_view` or `cf_hrms_positions_view` |  |
+| `GET /organisation/shifts` | `cf_hrms_time_view` or `cf_hrms_positions_view` | filters: q, status, calendar |
 | `GET /organisation/shifts/:id` | `cf_hrms_time_view` or `cf_hrms_positions_view` |  |
 | `POST /organisation/shifts` | `cf_hrms_time_edit` | whole-company logins only |
 | `PUT /organisation/shifts/:id` | `cf_hrms_time_edit` | whole-company logins only |
 | `DELETE /organisation/shifts/:id` | `cf_hrms_time_remove` | whole-company logins only |
-| `GET /organisation/holiday-calendars` | `cf_hrms_time_view` |  |
+| `GET /organisation/holiday-calendars` | `cf_hrms_time_view` | filters: q, status |
 | `POST /organisation/holiday-calendars` | `cf_hrms_time_edit` | whole-company logins only |
 | `GET /organisation/holiday-calendars/:id` | `cf_hrms_time_view` |  |
 | `PUT /organisation/holiday-calendars/:id` | `cf_hrms_time_edit` | whole-company logins only |
 | `DELETE /organisation/holiday-calendars/:id` | `cf_hrms_time_remove` | whole-company logins only |
 | `POST /organisation/holiday-calendars/:id/holidays` | `cf_hrms_time_edit` | whole-company logins only |
 | `POST /organisation/holiday-calendars/:id/copy-year` | `cf_hrms_time_edit` | whole-company logins only |
-| `GET /organisation/holidays` | `cf_hrms_time_view` |  |
+| `GET /organisation/holidays` | `cf_hrms_time_view` | filters: q, calendar, optional |
 | `POST /organisation/holidays` | `cf_hrms_time_edit` | whole-company logins only |
 | `PUT /organisation/holidays/:id` | `cf_hrms_time_edit` | whole-company logins only |
 | `DELETE /organisation/holidays/:id` | `cf_hrms_time_remove` | whole-company logins only |
-| `GET /organisation/reporting-types` | `cf_hrms_setup_view` or `cf_hrms_positions_view` |  |
+| `GET /organisation/reporting-types` | `cf_hrms_setup_view` or `cf_hrms_positions_view` | filters: q, status |
 | `POST /organisation/reporting-types` | `cf_hrms_setup_edit` | whole-company logins only |
 | `PUT /organisation/reporting-types/:id` | `cf_hrms_setup_edit` | whole-company logins only |
 | `DELETE /organisation/reporting-types/:id` | `cf_hrms_setup_remove` | whole-company logins only |
@@ -122,7 +123,7 @@ How to read the tables below:
 | `GET /role-content-copy/source` | `cf_hrms_roles_view` or `cf_hrms_positions_view` |  |
 | `POST /role-content-copy/preview` | `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | by what it copies to: a position needs cf_hrms_positions_edit, a role cf_hrms_roles_edit, a role of its own both |
 | `POST /role-content-copy` | `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | by what it copies to: a position needs cf_hrms_positions_edit, a role cf_hrms_roles_edit, a role of its own both |
-| `GET /role-masters/:kind` | `cf_hrms_roles_view` or `cf_hrms_positions_view` |  |
+| `GET /role-masters/:kind` | `cf_hrms_roles_view` or `cf_hrms_positions_view` | filters: q, status, used |
 | `GET /role-masters/:kind/:id` | `cf_hrms_roles_view` or `cf_hrms_positions_view` |  |
 | `GET /role-masters/:kind/:id/usage` | `cf_hrms_roles_view` or `cf_hrms_positions_view` |  |
 | `POST /role-masters/:kind` | `cf_hrms_roles_edit` | whole-company logins only |
@@ -130,7 +131,7 @@ How to read the tables below:
 | `DELETE /role-masters/:kind/:id` | `cf_hrms_roles_remove` | whole-company logins only |
 | `GET /roles/overview` | `cf_hrms_roles_view` |  |
 | `GET /roles/departments` | `cf_hrms_roles_view` |  |
-| `GET /roles` | `cf_hrms_roles_view` |  |
+| `GET /roles` | `cf_hrms_roles_view` | filters: q, status, hasPositions, jdReady, hasPurpose |
 | `POST /roles` | `cf_hrms_roles_edit` | whole-company logins only |
 | `GET /roles/:id` | `cf_hrms_roles_view` |  |
 | `PUT /roles/:id` | `cf_hrms_roles_edit` | whole-company logins only; status RETIRED also needs cf_hrms_roles_remove |
@@ -152,7 +153,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /positions/options` | `cf_hrms_positions_view` or `cf_hrms_hiring_view` or `cf_hrms_employees_view` |  |
-| `GET /positions` | `cf_hrms_positions_view` |  |
+| `GET /positions` | `cf_hrms_positions_view` | filters: q, department, role, shift, location, state |
 | `POST /positions` | `cf_hrms_positions_edit` | scope: the department it is created in |
 | `GET /positions/:id` | `cf_hrms_positions_view` |  |
 | `PUT /positions/:id` | `cf_hrms_positions_edit` | scope: the position; scope: a department it is moved to |
@@ -198,7 +199,7 @@ How to read the tables below:
 | `GET /hiring/templates/:kind/file` | `cf_hrms_hiring_view` or `cf_hrms_setup_view` **and** `cf_hrms_pay_view` |  |
 | `GET /hiring/placeholders` | `cf_hrms_hiring_view` or `cf_hrms_setup_view` |  |
 | `GET /hiring/close-reasons` | `cf_hrms_hiring_view` |  |
-| `GET /hirings` | `cf_hrms_hiring_view` |  |
+| `GET /hirings` | `cf_hrms_hiring_view` | filters: q, stage, department, role |
 | `GET /hirings/:id` | `cf_hrms_hiring_view` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
 | `POST /positions/:id/hiring` | `cf_hrms_hiring_edit` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
 | `POST /hirings/:id/confirm-jd` | `cf_hrms_hiring_edit` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
@@ -219,7 +220,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /people/pickers` | `cf_hrms_employees_view` or `cf_hrms_hiring_view` |  |
-| `GET /people/employees` | `cf_hrms_employees_view` | contact details only with cf_hrms_contact_view |
+| `GET /people/employees` | `cf_hrms_employees_view` | contact details only with cf_hrms_contact_view; filters: q, department, role, shift, location, joinedFrom, joinedTo, hasLogin |
 | `POST /people/employees` | `cf_hrms_employee_create` **and** `cf_hrms_employees_edit` | whole-company logins only; contact details only with cf_hrms_contact_view |
 | `GET /people/employees/:id` | `cf_hrms_employees_view` | scope: the person; contact details only with cf_hrms_contact_view |
 | `PUT /people/employees/:id` | `cf_hrms_employees_edit` | scope: the person; contact details are not written without cf_hrms_contact_view; contact details only with cf_hrms_contact_view |
@@ -281,7 +282,7 @@ How to read the tables below:
 | `GET /documents/meta` | `cf_hrms_documents_view` |  |
 | `GET /documents/preview` | `cf_hrms_documents_view` |  |
 | `GET /documents/status` | `cf_hrms_documents_view` |  |
-| `GET /documents` | `cf_hrms_documents_view` |  |
+| `GET /documents` | `cf_hrms_documents_view` | filters: q, role, from, to |
 | `POST /documents/generate` | `cf_hrms_documents_edit` |  |
 | `GET /documents/:id` | `cf_hrms_documents_view` |  |
 | `GET /documents/:id/download` | `cf_hrms_documents_view` |  |
@@ -296,7 +297,7 @@ How to read the tables below:
 | `PUT /leave/types/:id` | `cf_hrms_leave_edit` | whole-company logins only |
 | `DELETE /leave/types/:id` | `cf_hrms_leave_remove` | whole-company logins only |
 | `GET /leave/policy-templates` | `cf_hrms_leave_view` |  |
-| `GET /leave/policies` | `cf_hrms_leave_view` |  |
+| `GET /leave/policies` | `cf_hrms_leave_view` | filters: q, status, used |
 | `POST /leave/policies/preview-summary` | `cf_hrms_leave_view` |  |
 | `GET /leave/policies/:id` | `cf_hrms_leave_view` |  |
 | `POST /leave/policies` | `cf_hrms_leave_edit` | whole-company logins only |
@@ -319,6 +320,51 @@ How to read the tables below:
 | `PUT /codegen/schemes/:id` | `cf_hrms_setup_edit` | whole-company logins only |
 | `DELETE /codegen/schemes/:id` | `cf_hrms_setup_remove` **and** `cf_hrms_setup_edit` | whole-company logins only |
 
+## Excel
+
+| Route | Right | Also |
+|---|---|---|
+| `GET /excel/entities` | any login with access to the app |  |
+| `GET /excel/departments/workbook` | `cf_hrms_org_view` |  |
+| `POST /excel/departments/preview` | `cf_hrms_org_upload` **and** `cf_hrms_org_view` |  |
+| `POST /excel/departments/apply` | `cf_hrms_org_upload` **and** `cf_hrms_org_view` |  |
+| `GET /excel/locations/workbook` | `cf_hrms_org_view` |  |
+| `POST /excel/locations/preview` | `cf_hrms_org_upload` **and** `cf_hrms_org_view` | whole-company logins only |
+| `POST /excel/locations/apply` | `cf_hrms_org_upload` **and** `cf_hrms_org_view` | whole-company logins only |
+| `GET /excel/roles/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/roles/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/roles/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/positions/workbook` | `cf_hrms_positions_view` |  |
+| `POST /excel/positions/preview` | `cf_hrms_positions_upload` **and** `cf_hrms_positions_view` |  |
+| `POST /excel/positions/apply` | `cf_hrms_positions_upload` **and** `cf_hrms_positions_view` |  |
+| `GET /excel/employees/workbook` | `cf_hrms_employees_view` |  |
+| `POST /excel/employees/preview` | `cf_hrms_employees_upload` **and** `cf_hrms_employees_view` | a file with NEW rows also needs cf_hrms_employee_bulk_add; contact columns only with cf_hrms_contact_view |
+| `POST /excel/employees/apply` | `cf_hrms_employees_upload` **and** `cf_hrms_employees_view` | a file with NEW rows also needs cf_hrms_employee_bulk_add; contact columns only with cf_hrms_contact_view |
+| `GET /excel/holidays/workbook` | `cf_hrms_time_view` |  |
+| `POST /excel/holidays/preview` | `cf_hrms_time_upload` **and** `cf_hrms_time_view` | whole-company logins only |
+| `POST /excel/holidays/apply` | `cf_hrms_time_upload` **and** `cf_hrms_time_view` | whole-company logins only |
+| `GET /excel/shifts/workbook` | `cf_hrms_time_view` |  |
+| `POST /excel/shifts/preview` | `cf_hrms_time_upload` **and** `cf_hrms_time_view` | whole-company logins only |
+| `POST /excel/shifts/apply` | `cf_hrms_time_upload` **and** `cf_hrms_time_view` | whole-company logins only |
+| `GET /excel/library-kras/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-kras/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-kras/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/library-responsibilities/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-responsibilities/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-responsibilities/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/library-kpis/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-kpis/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-kpis/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/library-skills/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-skills/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-skills/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/library-qualifications/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-qualifications/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-qualifications/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/library-authorities/workbook` | `cf_hrms_roles_view` |  |
+| `POST /excel/library-authorities/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `POST /excel/library-authorities/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+
 ## Everything else
 
 | Route | Right | Also |
@@ -330,4 +376,4 @@ How to read the tables below:
 | `GET /overview/nav-counts` | any login with access to the app |  |
 | `GET /overview/home` | any login with access to the app |  |
 
-234 routes.
+274 routes.

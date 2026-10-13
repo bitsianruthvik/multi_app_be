@@ -72,6 +72,7 @@
  * Reads: `cf_hrms_org_view`. Writes: `cf_hrms_org_manage`.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam, need } from '../lib/http.js';
 import { inPosition, newPositionBody, positionBody } from '../lib/gates.js';
@@ -95,7 +96,7 @@ const id = (req) => intParam(req.params.id);
 // Before /positions/:id, or Express would try to read "options" as an id.
 router.get('/positions/options', guard([PERM.positions.view, PERM.hiring.view, PERM.employees.view]), handle((req) => positionOptions(pool, ctx(req).companyId)));
 
-router.get('/positions', guard(PERM.positions.view), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
+router.get('/positions', guard(PERM.positions.view), listed('positions'), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
 router.post('/positions', guard(PERM.positions.edit), newPositionBody, handle((req) => tx(req, (db, c) => createPosition(db, c, req.body ?? {}))));
 router.get('/positions/:id', guard(PERM.positions.view), handle((req) => getPosition(pool, ctx(req).companyId, id(req), req.query)));
 router.put('/positions/:id', guard(PERM.positions.edit), inPosition(), positionBody, handle((req) => tx(req, async (db, c) => {

@@ -26,6 +26,7 @@
  * Nothing here logs a request or a response body.
  */
 import { Router } from 'express';
+import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { forgetAccess } from '../lib/accessContext.js';
@@ -52,7 +53,7 @@ router.post('/access/roles', manage, handle((req) => tx(req, (db, c) => createRo
 router.put('/access/roles/:roleId', manage, handle((req) => tx(req, (db, c) => updateRole(db, c, roleId(req), req.body ?? {}, reqId(req)))));
 router.delete('/access/roles/:roleId', manage, handle((req) => tx(req, (db, c) => deleteRole(db, c, roleId(req), reqId(req)))));
 
-router.get('/access/logins', manage, handle((req) => listLogins(pool, ctx(req), req.query)));
+router.get('/access/logins', manage, listed('logins'), handle((req) => listLogins(pool, ctx(req), req.query)));
 router.post('/access/logins', manage, handle((req) => tx(req, (db, c) => createLogin(db, c, req.body ?? {}, reqId(req)))));
 router.put('/access/logins/:userId', manage, handle((req) => tx(req, (db, c) => updateLogin(db, c, userId(req), req.body ?? {}, reqId(req)))));
 router.post('/access/logins/:userId/disable', manage, handle((req) => tx(req, (db, c) => disableLogin(db, c, userId(req), reqId(req)))));

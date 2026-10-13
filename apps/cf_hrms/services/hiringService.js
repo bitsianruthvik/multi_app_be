@@ -304,6 +304,7 @@ function shapeSummary(h, asOf) {
     roleId: h.role_id,
     roleTitle: h.role_title ?? h.position_title ?? '',
     // The position's department. What the LETTER prints is terms.departmentName.
+    departmentId: h.position_department_id ?? null,
     departmentName: h.position_department_name ?? null,
     shift: h.default_shift_id ? { id: h.default_shift_id, code: h.shift_code ?? null, name: h.shift_name ?? null, summary: summaryFromRow(h, 'shift_') } : null,
     candidateName: h.candidate_name ?? null,
