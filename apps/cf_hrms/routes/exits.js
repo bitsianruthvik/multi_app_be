@@ -24,6 +24,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { inEmployee, showsPeople } from '../lib/gates.js';
 import { listExitReasons } from '../services/exitRead.js';
 import { startExit, updateExit, withdrawExit, closeExit, listExits } from '../services/exitService.js';
 
@@ -33,16 +34,15 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
 
-const read = guard(PERM.peopleView);
-const write = guard(PERM.peopleManage);
+// Reading a person's leaving: cf_hrms_employees_view. Every write: cf_hrms_employee_close. Both inside the login's scope.
 
-router.get('/people/exit-reasons', read, handle(async () => listExitReasons()));
+router.get('/people/exit-reasons', guard([PERM.employees.view, PERM.employeeClose]), handle(async () => listExitReasons()));
 
-router.get('/people/employees/:id/exits', read, handle((req) => listExits(pool, ctx(req).companyId, id(req))));
+router.get('/people/employees/:id/exits', guard(PERM.employees.view), inEmployee(), handle((req) => listExits(pool, ctx(req).companyId, id(req))));
 
-router.post('/people/employees/:id/exit', write, handle((req) => tx(req, (db, c) => startExit(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.put('/people/employees/:id/exit', write, handle((req) => tx(req, (db, c) => updateExit(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.post('/people/employees/:id/exit/withdraw', write, handle((req) => tx(req, (db, c) => withdrawExit(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.post('/people/employees/:id/exit/close', write, handle((req) => tx(req, (db, c) => closeExit(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/people/employees/:id/exit', guard(PERM.employeeClose), inEmployee(), showsPeople, handle((req) => tx(req, (db, c) => startExit(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.put('/people/employees/:id/exit', guard(PERM.employeeClose), inEmployee(), showsPeople, handle((req) => tx(req, (db, c) => updateExit(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/people/employees/:id/exit/withdraw', guard(PERM.employeeClose), inEmployee(), showsPeople, handle((req) => tx(req, (db, c) => withdrawExit(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/people/employees/:id/exit/close', guard(PERM.employeeClose), inEmployee(), showsPeople, handle((req) => tx(req, (db, c) => closeExit(db, c, id(req), req.body ?? {}, reqId(req)))));
 
 export default router;

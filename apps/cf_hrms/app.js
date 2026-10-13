@@ -12,9 +12,28 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const resourceDefs = JSON.parse(
-  fs.readFileSync(path.join(__dirname, 'resourceDef.json'), 'utf-8'),
-);
+/**
+ * NOTHING OF THIS APP IS REGISTERED WITH THE GENERIC QUERY API (2026-10-12, spec §12.6).
+ *
+ * resourceDef.json describes 46 hrms tables for /api/query/v1/base_resource.
+ * That endpoint knows the caller's company and nothing else: it runs no rights
+ * check and has no app context, and so served any login of the tenant — an
+ * Employee login, or one whose access to this app had been removed — every
+ * employee's phone, email, address and date of birth (cfHrmsEmployee), every
+ * work assignment and the audit log. Rights, the department scope and the
+ * contact rule mean nothing with that door open.
+ *
+ * No screen of this app and no other code reads an hrms resource through it
+ * (checked: no `cfHrms…` resource is named anywhere in the frontend or the
+ * backend), so none is registered. The file stays as the description of the
+ * tables. To bring ONE back, register it here by name — and only a table
+ * that holds nothing about a person.
+ */
+const resourceDefs = {};
+/** What the file describes — for the test that none of it is reachable. */
+export const DESCRIBED_RESOURCES = Object.keys(JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'resourceDef.json'), 'utf-8').replace(/^﻿/, ''),
+));
 
 /**
  * cf_hrms — People + Organisation Definition.
@@ -51,7 +70,7 @@ export default {
     // app's six entity types — cf_erp's item and order rules are not shown here,
     // and its own mount leaves every hrms_ type out.
     server.use('/api/:companySlug/cf_hrms', codegenModule.createRouter({
-      viewPerm: PERM.orgView, managePerm: PERM.orgManage, entityTypes: [DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY, EMPLOYEE_ENTITY, HIRING_ENTITY],
+      viewPerm: PERM.setup.view, managePerm: PERM.setup.edit, entityTypes: [DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY, EMPLOYEE_ENTITY, HIRING_ENTITY],
     }));
   },
 

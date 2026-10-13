@@ -21,12 +21,12 @@ const router = Router();
  * with a rule behind it: effective-dated writes, the three-way content
  * resolution, approvals, document generation and the import.
  */
-router.get('/workforce/status', guard(PERM.attendanceView), handle(async () => ({
+router.get('/workforce/status', guard(PERM.time.view), handle(async () => ({
   section: 'workforce',
   implemented: false,
   phase: 9,
-  viewPermission: PERM.attendanceView,
-  managePermission: PERM.attendanceManage,
+  viewPermission: PERM.time.view,
+  managePermission: PERM.time.edit,
   items: [],
   total: 0,
 })));

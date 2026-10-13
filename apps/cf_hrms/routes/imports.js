@@ -21,12 +21,12 @@ const router = Router();
  * with a rule behind it: effective-dated writes, the three-way content
  * resolution, approvals, document generation and the import.
  */
-router.get('/imports/status', guard(PERM.importManage), handle(async () => ({
+router.get('/imports/status', guard(PERM.employeeBulkAdd), handle(async () => ({
   section: 'imports',
   implemented: false,
   phase: 8,
-  viewPermission: PERM.importManage,
-  managePermission: PERM.importManage,
+  viewPermission: PERM.employeeBulkAdd,
+  managePermission: PERM.employeeBulkAdd,
   items: [],
   total: 0,
 })));

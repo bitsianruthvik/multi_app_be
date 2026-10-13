@@ -233,17 +233,17 @@ export function readCopyRequest(body = {}) {
 }
 
 /**
- * What a caller must hold for a mode: SEAT is org_manage (the same tag
- * routes/positions.js asks for on a position override), ROLE is roles_manage,
+ * What a caller must hold for a mode: SEAT is positions_edit (the same tag
+ * routes/positions.js asks for on a position override), ROLE is roles_edit,
  * FORK needs both because it writes a role AND moves a seat. `null` for a mode
  * nobody has heard of — the route then asks for either tag, so an unknown mode
  * is still a 403 for anyone holding neither (cf_hrms_self_view reaches none of it).
  */
 export function permissionsForCopyMode(mode, PERM) {
   switch (String(mode ?? '').toUpperCase()) {
-    case 'SEAT': return [PERM.orgManage];
-    case 'ROLE': return [PERM.rolesManage];
-    case 'FORK': return [PERM.rolesManage, PERM.orgManage];
+    case 'SEAT': return [PERM.positions.edit];
+    case 'ROLE': return [PERM.roles.edit];
+    case 'FORK': return [PERM.roles.edit, PERM.positions.edit];
     default: return null;
   }
 }

@@ -53,6 +53,7 @@ const UNIQUE_MESSAGES = {
   uq_hatd_name: 'That authority is already in the catalogue.',
 
   uq_hdlb_name: 'A label with that name already exists.',
+  uq_hacr_role: 'That role already has its access settings.',
   uq_hrol_code: 'A role with that code already exists.',
   uq_hrol_title: 'A role with that title already exists.',
   uq_hrka_pair: 'This role already has that KRA.',

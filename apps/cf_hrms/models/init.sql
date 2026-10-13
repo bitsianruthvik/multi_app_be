@@ -3251,3 +3251,51 @@ CREATE TABLE IF NOT EXISTS hrms_department_labels (
   CONSTRAINT fk_hdlb_company FOREIGN KEY (company_id) REFERENCES companies(id),
   CONSTRAINT fk_hdlb_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 15. ACCESS ROLES (CF_HRMS_HIRING_SPEC.md section 12, 2026-10-12)         ##
+-- ############################################################################
+-- An access role is a PLATFORM role (a `roles` row of the company) plus what
+-- this app adds to it: the label people see, a description, and its SCOPE.
+--
+--   scope = COMPANY      the rights apply everywhere
+--   scope = DEPARTMENT   they apply to the login own department and below
+--                        (services/accessScope.js)
+--
+-- The RIGHTS themselves are not here. They are ordinary platform rows:
+-- role_capability -> features_capability -> features, one single-feature
+-- capability per tag, granted for THIS company and THIS app only. This table
+-- never grants anything; a role with no row here keeps the whole company as its
+-- scope, which is what every role had before this table existed.
+--
+-- template_key marks a ready-made role (OWNER, HR_MANAGER, HR_EXECUTIVE,
+-- DEPARTMENT_HEAD, EMPLOYEE). is_locked: its rights cannot be changed and it
+-- cannot be deleted (Owner and Employee).
+--
+-- One live row per platform role (role_active).
+CREATE TABLE IF NOT EXISTS hrms_access_roles (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  role_id       INT           NOT NULL,                 -- roles.id, of the same company
+  label         VARCHAR(100)  NOT NULL,
+  description   VARCHAR(500)  NULL,
+  scope         VARCHAR(20)   NOT NULL DEFAULT 'COMPANY',   -- COMPANY | DEPARTMENT
+  template_key  VARCHAR(30)   NULL,
+  is_locked     TINYINT(1)    NOT NULL DEFAULT 0,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+
+  role_active   INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, role_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hacr_tenant (company_id, id),
+  UNIQUE KEY uq_hacr_role   (company_id, role_active),
+  KEY idx_hacr_template (company_id, template_key),
+
+  CONSTRAINT fk_hacr_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hacr_role    FOREIGN KEY (role_id)    REFERENCES roles(id),
+  CONSTRAINT fk_hacr_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

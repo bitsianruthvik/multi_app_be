@@ -617,9 +617,10 @@ try {
     ok('the preview states what each way of copying would reach: seat 1; role 4; fork 1 + a new role', rb.SEAT.seats === 1 && rb.ROLE.seats === 4 && rb.FORK.seats === 1 && rb.FORK.newRoles === 1, JSON.stringify(rb));
 
     // permissions, as the route asks for them
-    const PERM = { orgManage: 'cf_hrms_org_manage', rolesManage: 'cf_hrms_roles_manage' };
-    ok('SEAT asks for org_manage only', JSON.stringify(CC.permissionsForCopyMode('seat', PERM)) === JSON.stringify([PERM.orgManage]));
-    ok('ROLE asks for roles_manage only', JSON.stringify(CC.permissionsForCopyMode('ROLE', PERM)) === JSON.stringify([PERM.rolesManage]));
+    // The rights of spec §12.1 (2026-10-12): a copy onto a position is positions_edit, onto a role roles_edit.
+    const PERM = { positions: { edit: 'cf_hrms_positions_edit' }, roles: { edit: 'cf_hrms_roles_edit' } };
+    ok('SEAT asks for positions_edit only', JSON.stringify(CC.permissionsForCopyMode('seat', PERM)) === JSON.stringify([PERM.positions.edit]));
+    ok('ROLE asks for roles_edit only', JSON.stringify(CC.permissionsForCopyMode('ROLE', PERM)) === JSON.stringify([PERM.roles.edit]));
     ok('FORK asks for both', CC.permissionsForCopyMode('FORK', PERM).length === 2);
     ok('no mode names cf_hrms_self_view', !JSON.stringify(['SEAT', 'ROLE', 'FORK'].map((m) => CC.permissionsForCopyMode(m, PERM))).includes('self_view'));
   }

@@ -440,9 +440,12 @@ export async function getHiring(db, companyId, id) {
 }
 
 /** ?status=open|done|closed|all (all when absent) &positionId= */
-export async function listHirings(db, companyId, query = {}) {
+export async function listHirings(db, companyId, query = {}, { departmentIds = null } = {}) {
+  // A login scoped to a department sees the hirings on positions inside it (accessScope.js); none when its scope is empty.
+  if (departmentIds && !departmentIds.length) return { hirings: [] };
   const where = ['h.company_id = ?', 'h.deleted_at IS NULL'];
   const params = [companyId];
+  if (departmentIds) { where.push('p.department_id IN (?)'); params.push(departmentIds); }
   const status = String(query.status ?? 'all').trim().toLowerCase();
   if (!['open', 'done', 'closed', 'all'].includes(status)) throw invalid('INVALID', 'status is open, done, closed or all.');
   if (status === 'open') { where.push('h.stage IN (?)'); params.push(OPEN_STAGES); }

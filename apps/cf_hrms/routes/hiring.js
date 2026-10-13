@@ -45,6 +45,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { inPosition, companyWide, showsHiring, takesHiring } from '../lib/gates.js';
 import {
   listHirings, getHiring, startHiring, confirmJd, updateHiring,
   generateOfferLetter, acceptOffer, appoint, closeHiring,
@@ -52,6 +53,7 @@ import {
   getSettings, updateSettings, listTemplates, putTemplate, readTemplateFile, listPlaceholders,
   jdPreview, listCloseReasons, putSigned, readSignedFile, deleteSigned,
 } from '../services/hiringService.js';
+import { peopleFilter } from '../services/accessScope.js';
 
 const router = Router();
 
@@ -59,50 +61,52 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
 
-const read = guard(PERM.peopleView);
-const write = guard(PERM.peopleManage);
+// Rights (spec §12.1): reads cf_hrms_hiring_view; every step cf_hrms_hiring_edit — except the last,
+// POST …/appoint, which is cf_hrms_employee_create. Letters and their signed copies also need
+// cf_hrms_pay_view; without it the CTC is absent from every answer here (showsHiring) and is not
+// read from a body (takesHiring). A hiring is on a position: all of it follows the login's scope.
 
 // ── settings, templates, placeholders ───────────────────────────────────────
 
-router.get('/hiring/settings', read, handle((req) => getSettings(pool, ctx(req).companyId)));
-router.put('/hiring/settings', guard(PERM.orgManage), handle((req) => (
+router.get('/hiring/settings', guard([PERM.hiring.view, PERM.setup.view]), handle((req) => getSettings(pool, ctx(req).companyId)));
+router.put('/hiring/settings', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => (
   tx(req, (db, c) => updateSettings(db, c, req.body ?? {}, reqId(req)))
 )));
 
-router.get('/hiring/templates', read, handle((req) => listTemplates(pool, ctx(req).companyId)));
-router.put('/hiring/templates/:kind', guard(PERM.orgManage), handle((req) => (
+router.get('/hiring/templates', guard([PERM.hiring.view, PERM.setup.view]), handle((req) => listTemplates(pool, ctx(req).companyId)));
+router.put('/hiring/templates/:kind', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => (
   tx(req, (db, c) => putTemplate(db, c, req.params.kind, req.body ?? {}, reqId(req)))
 )));
-router.get('/hiring/templates/:kind/file', read, handle((req) => readTemplateFile(pool, ctx(req).companyId, req.params.kind)));
+router.get('/hiring/templates/:kind/file', guard([PERM.hiring.view, PERM.setup.view], { also: [PERM.payView] }), handle((req) => readTemplateFile(pool, ctx(req).companyId, req.params.kind)));
 
-router.get('/hiring/placeholders', read, handle(async () => listPlaceholders()));
+router.get('/hiring/placeholders', guard([PERM.hiring.view, PERM.setup.view]), handle(async () => listPlaceholders()));
 // The reasons a hiring may be closed with — all of them, or with ?hiringId= those that apply to it as it stands.
-router.get('/hiring/close-reasons', read, handle((req) => listCloseReasons(pool, ctx(req).companyId, req.query.hiringId)));
+router.get('/hiring/close-reasons', guard(PERM.hiring.view), handle((req) => listCloseReasons(pool, ctx(req).companyId, req.query.hiringId)));
 
 // ── hirings ─────────────────────────────────────────────────────────────────
 
-router.get('/hirings', read, handle((req) => listHirings(pool, ctx(req).companyId, req.query)));
-router.get('/hirings/:id', read, handle((req) => getHiring(pool, ctx(req).companyId, id(req))));
+router.get('/hirings', guard(PERM.hiring.view), handle(async (req) => listHirings(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req) })));
+router.get('/hirings/:id', guard(PERM.hiring.view), inPosition('hiring'), showsHiring, handle((req) => getHiring(pool, ctx(req).companyId, id(req))));
 
-router.post('/positions/:id/hiring', write, handle((req) => tx(req, (db, c) => startHiring(db, c, id(req), reqId(req)))));
+router.post('/positions/:id/hiring', guard(PERM.hiring.edit), inPosition(), showsHiring, handle((req) => tx(req, (db, c) => startHiring(db, c, id(req), reqId(req)))));
 
-router.post('/hirings/:id/confirm-jd', write, handle((req) => tx(req, (db, c) => confirmJd(db, c, id(req), reqId(req)))));
-router.put('/hirings/:id', write, handle((req) => tx(req, (db, c) => updateHiring(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.post('/hirings/:id/offer-letter', write, handle((req) => tx(req, (db, c) => generateOfferLetter(db, c, id(req), reqId(req)))));
-router.post('/hirings/:id/accept-offer', write, handle((req) => tx(req, (db, c) => acceptOffer(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.post('/hirings/:id/appoint', write, handle((req) => tx(req, (db, c) => appoint(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.post('/hirings/:id/close', write, handle((req) => tx(req, (db, c) => closeHiring(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/hirings/:id/confirm-jd', guard(PERM.hiring.edit), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => confirmJd(db, c, id(req), reqId(req)))));
+router.put('/hirings/:id', guard(PERM.hiring.edit), inPosition('hiring'), takesHiring, showsHiring, handle((req) => tx(req, (db, c) => updateHiring(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/hirings/:id/offer-letter', guard(PERM.hiring.edit, { also: [PERM.payView] }), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => generateOfferLetter(db, c, id(req), reqId(req)))));
+router.post('/hirings/:id/accept-offer', guard(PERM.hiring.edit), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => acceptOffer(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/hirings/:id/appoint', guard(PERM.employeeCreate), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => appoint(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.post('/hirings/:id/close', guard(PERM.hiring.edit), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => closeHiring(db, c, id(req), req.body ?? {}, reqId(req)))));
 
-router.get('/hirings/:id/letters/:letterId/file', read, handle((req) => (
+router.get('/hirings/:id/letters/:letterId/file', guard(PERM.hiring.view, { also: [PERM.payView] }), inPosition('hiring'), handle((req) => (
   readLetterFile(pool, ctx(req).companyId, id(req), intParam(req.params.letterId, 'letterId'))
 )));
 // Signed copies: the candidate's signed offer, the signed appointment letter. :kind is offer | appointment.
-router.put('/hirings/:id/signed/:kind', write, handle((req) => tx(req, (db, c) => putSigned(db, c, id(req), req.params.kind, req.body ?? {}, reqId(req)))));
-router.get('/hirings/:id/signed/:kind/file', read, handle((req) => readSignedFile(pool, ctx(req).companyId, id(req), req.params.kind)));
-router.delete('/hirings/:id/signed/:kind', write, handle((req) => tx(req, (db, c) => deleteSigned(db, c, id(req), req.params.kind, reqId(req)))));
+router.put('/hirings/:id/signed/:kind', guard(PERM.hiring.edit, { also: [PERM.payView] }), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => putSigned(db, c, id(req), req.params.kind, req.body ?? {}, reqId(req)))));
+router.get('/hirings/:id/signed/:kind/file', guard(PERM.hiring.view, { also: [PERM.payView] }), inPosition('hiring'), handle((req) => readSignedFile(pool, ctx(req).companyId, id(req), req.params.kind)));
+router.delete('/hirings/:id/signed/:kind', guard(PERM.hiring.edit, { also: [PERM.payView] }), inPosition('hiring'), showsHiring, handle((req) => tx(req, (db, c) => deleteSigned(db, c, id(req), req.params.kind, reqId(req)))));
 
 // The job description: what will be (or was) frozen, and its file — ?format=docx|pdf, in every stage.
-router.get('/hirings/:id/jd/preview', read, handle((req) => jdPreview(pool, ctx(req), id(req))));
-router.get('/hirings/:id/jd/file', read, handle((req) => readJdFile(pool, ctx(req), id(req), req.query.format)));
+router.get('/hirings/:id/jd/preview', guard(PERM.hiring.view), inPosition('hiring'), handle((req) => jdPreview(pool, ctx(req), id(req))));
+router.get('/hirings/:id/jd/file', guard(PERM.hiring.view), inPosition('hiring'), handle((req) => readJdFile(pool, ctx(req), id(req), req.query.format)));
 
 export default router;

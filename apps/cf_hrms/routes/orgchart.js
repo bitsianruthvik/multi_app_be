@@ -31,6 +31,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
+import { companyWide } from '../lib/gates.js';
 import {
   buildOrgChart, getPositionCard, searchOrgChart, listOpenPoints, updateOpenPoint,
 } from '../services/orgChartService.js';
@@ -45,7 +46,7 @@ const router = Router();
  * `root` re-roots at one position and returns its subtree down the
  * PRIMARY_MANAGER tree.
  */
-router.get('/orgchart', guard(PERM.orgView), handle((req) => buildOrgChart(
+router.get('/orgchart', guard(PERM.positions.view), handle((req) => buildOrgChart(
   pool,
   ctx(req).companyId,
   {
@@ -67,7 +68,7 @@ router.get('/orgchart', guard(PERM.orgView), handle((req) => buildOrgChart(
  * (each row says which, in `toPositionId`). The default stays per-position so
  * a caller that never heard of cards gets what it always got.
  */
-router.get('/orgchart/positions/:id/card', guard(PERM.orgView), handle((req) => getPositionCard(
+router.get('/orgchart/positions/:id/card', guard(PERM.positions.view), handle((req) => getPositionCard(
   pool,
   ctx(req).companyId,
   intParam(req.params.id),
@@ -75,7 +76,7 @@ router.get('/orgchart/positions/:id/card', guard(PERM.orgView), handle((req) => 
 )));
 
 /** Multi-word AND across the four content kinds, answering with positions. */
-router.get('/orgchart/search', guard(PERM.orgView), handle((req) => searchOrgChart(
+router.get('/orgchart/search', guard(PERM.positions.view), handle((req) => searchOrgChart(
   pool,
   ctx(req).companyId,
   { q: req.query.q, on: dateParam(req.query.on), limit: req.query.limit },
@@ -89,13 +90,13 @@ router.get('/orgchart/search', guard(PERM.orgView), handle((req) => searchOrgCha
  * accountability in one payload; the 71 Karni employees who hold only
  * `cf_hrms_self_view` get a 403 here, the same as from the rest of this file.
  */
-router.get('/orgchart/departments', guard(PERM.orgView), handle((req) => buildDepartmentRollup(
+router.get('/orgchart/departments', guard(PERM.positions.view), handle((req) => buildDepartmentRollup(
   pool,
   ctx(req).companyId,
   { on: dateParam(req.query.on) },
 )));
 
-router.get('/orgchart/open-points', guard(PERM.orgView), handle((req) => listOpenPoints(
+router.get('/orgchart/open-points', guard(PERM.positions.view), handle((req) => listOpenPoints(
   pool,
   ctx(req).companyId,
   req.query,
@@ -106,7 +107,7 @@ router.get('/orgchart/open-points', guard(PERM.orgView), handle((req) => listOpe
  * when, and it writes its audit row in the same transaction, because TiDB has
  * no triggers and an audit row written afterwards is one that can go missing.
  */
-router.put('/orgchart/open-points/:id', guard(PERM.orgManage), handle((req) => withTransaction(
+router.put('/orgchart/open-points/:id', guard(PERM.positions.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => withTransaction(
   (db) => updateOpenPoint(db, ctx(req), intParam(req.params.id), req.body ?? {}),
 )));
 

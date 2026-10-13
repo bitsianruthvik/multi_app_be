@@ -46,6 +46,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam, canSeePii } from '../lib/http.js';
+import { inPosition, inEmployee, companyWide, showsPeople, takesEmployee, employeePaper } from '../lib/gates.js';
 import {
   listEmployees, getEmployee, getEmployeeContactGated, createEmployee, updateEmployee, deleteEmployee, assignmentsFor,
   listIdentifiers, createIdentifier, updateIdentifier, deleteIdentifier,
@@ -54,6 +55,7 @@ import {
   setPhoto, readPhoto, deletePhoto,
   pickers,
 } from '../services/peopleService.js';
+import { peopleFilter } from '../services/accessScope.js';
 import { positionsHeld, moveEmployee } from '../services/employeePositionsService.js';
 
 const router = Router();
@@ -66,15 +68,17 @@ const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
 
 // ── pickers ─────────────────────────────────────────────────────────────────
 
-router.get('/people/pickers', guard(PERM.peopleView), handle((req) => pickers(pool, ctx(req).companyId)));
+router.get('/people/pickers', guard([PERM.employees.view, PERM.hiring.view]), handle((req) => pickers(pool, ctx(req).companyId)));
 
 // ── employees ───────────────────────────────────────────────────────────────
 
-router.get('/people/employees', guard(PERM.peopleView), handle((req) => (
-  listEmployees(pool, ctx(req).companyId, req.query)
+router.get('/people/employees', guard(PERM.employees.view), showsPeople, handle(async (req) => (
+  // Scoped to the login's department; and a search reads phone and email only for somebody who may see them —
+  // otherwise typing digits into the box would say whose number it is.
+  listEmployees(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req), searchContact: canSeePii(req) })
 )));
 
-router.post('/people/employees', guard(PERM.peopleManage), handle((req) => (
+router.post('/people/employees', guard(PERM.employeeCreate, { also: [PERM.employees.edit] }), companyWide('A person joins your department through a hiring on one of its positions.'), showsPeople, handle((req) => (
   tx(req, (db, c) => createEmployee(db, c, req.body ?? {}, reqId(req)))
 )));
 
@@ -83,7 +87,7 @@ router.post('/people/employees', guard(PERM.peopleManage), handle((req) => (
  * holding cf_hrms_people_pii (and audited when shown), stripped on the server
  * for everyone else. Without the flag the answer is what it has always been.
  */
-router.get('/people/employees/:id', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id', guard(PERM.employees.view), inEmployee(), showsPeople, handle((req) => (
   req.query.contact === '1'
     ? getEmployeeContactGated(pool, ctx(req), id(req), dateParam(req.query.asOf, 'asOf'), {
       canSeePii: canSeePii(req), requestId: reqId(req),
@@ -91,11 +95,11 @@ router.get('/people/employees/:id', guard(PERM.peopleView), handle((req) => (
     : getEmployee(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
 )));
 
-router.put('/people/employees/:id', guard(PERM.peopleManage), handle((req) => (
+router.put('/people/employees/:id', guard(PERM.employees.edit), inEmployee(), takesEmployee, showsPeople, handle((req) => (
   tx(req, (db, c) => updateEmployee(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.delete('/people/employees/:id', guard(PERM.peopleManage), handle((req) => (
+router.delete('/people/employees/:id', guard(PERM.employeeClose), inEmployee(), handle((req) => (
   tx(req, (db, c) => deleteEmployee(db, c, id(req), reqId(req)))
 )));
 
@@ -106,7 +110,7 @@ router.delete('/people/employees/:id', guard(PERM.peopleManage), handle((req) =>
  * jobs is part of seeing the person. Creating, changing or ending one belongs to
  * assignments.js and its own permission — this endpoint has no write twin.
  */
-router.get('/people/employees/:id/assignments', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/assignments', guard(PERM.employees.view), inEmployee(), handle((req) => (
   assignmentsFor(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
 )));
 
@@ -114,7 +118,7 @@ router.get('/people/employees/:id/assignments', guard(PERM.peopleView), handle((
  * Positions held (spec §10): every position the person has had, newest first,
  * and how each ended. `?on=` is the date "current" is judged on (today).
  */
-router.get('/people/employees/:id/positions', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/positions', guard(PERM.employees.view), inEmployee(), handle((req) => (
   positionsHeld(pool, ctx(req).companyId, id(req), { on: req.query.on ? dateParam(req.query.on) : undefined })
 )));
 
@@ -124,7 +128,7 @@ router.get('/people/employees/:id/positions', guard(PERM.peopleView), handle((re
  * transaction. `keepCurrent: true` adds a second position and ends nothing.
  * 409 POSITION_FILLED, HIRING_OPEN, EMPLOYEE_LEFT — the assignment service's own.
  */
-router.post('/people/employees/:id/move', guard(PERM.peopleManage), handle((req) => (
+router.post('/people/employees/:id/move', guard(PERM.positions.edit), inEmployee(), inPosition('position', (req) => req.body?.positionId), handle((req) => (
   tx(req, (db, c) => moveEmployee(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
@@ -139,7 +143,7 @@ router.post('/people/employees/:id/move', guard(PERM.peopleManage), handle((req)
  * The values never travel in the URL, only in the response body — a query string
  * ends up in access logs, browser history and proxy traces.
  */
-router.get('/people/employees/:id/identifiers', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/identifiers', guard(PERM.employees.view), inEmployee(), handle((req) => (
   listIdentifiers(pool, ctx(req), id(req), {
     reveal: req.query.reveal === '1' || req.query.reveal === 'true',
     canSeePii: canSeePii(req),
@@ -147,33 +151,33 @@ router.get('/people/employees/:id/identifiers', guard(PERM.peopleView), handle((
   })
 )));
 
-router.post('/people/employees/:id/identifiers', guard(PERM.peopleManage), handle((req) => (
+router.post('/people/employees/:id/identifiers', guard(PERM.employees.edit, { also: [PERM.contactView] }), inEmployee(), handle((req) => (
   tx(req, (db, c) => createIdentifier(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.put('/people/identifiers/:id', guard(PERM.peopleManage), handle((req) => (
+router.put('/people/identifiers/:id', guard(PERM.employees.edit, { also: [PERM.contactView] }), inEmployee('identifier'), handle((req) => (
   tx(req, (db, c) => updateIdentifier(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.delete('/people/identifiers/:id', guard(PERM.peopleManage), handle((req) => (
+router.delete('/people/identifiers/:id', guard(PERM.employees.edit, { also: [PERM.contactView] }), inEmployee('identifier'), handle((req) => (
   tx(req, (db, c) => deleteIdentifier(db, c, id(req), reqId(req)))
 )));
 
 // ── documents ───────────────────────────────────────────────────────────────
 
-router.get('/people/employees/:id/documents', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/documents', guard(PERM.employees.view), inEmployee(), handle((req) => (
   listDocuments(pool, ctx(req).companyId, id(req), dateParam(req.query.asOf, 'asOf'))
 )));
 
-router.post('/people/employees/:id/documents', guard(PERM.peopleManage), handle((req) => (
+router.post('/people/employees/:id/documents', guard(PERM.employees.edit), inEmployee(), handle((req) => (
   tx(req, (db, c) => addDocument(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.put('/people/documents/:id', guard(PERM.peopleManage), handle((req) => (
+router.put('/people/documents/:id', guard(PERM.employees.edit), inEmployee('employeeDocument'), handle((req) => (
   tx(req, (db, c) => updateDocument(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.delete('/people/documents/:id', guard(PERM.peopleManage), handle((req) => (
+router.delete('/people/documents/:id', guard(PERM.employees.edit), inEmployee('employeeDocument'), handle((req) => (
   tx(req, (db, c) => deleteDocument(db, c, id(req), reqId(req)))
 )));
 
@@ -185,13 +189,13 @@ router.delete('/people/documents/:id', guard(PERM.peopleManage), handle((req) =>
  * an <a href> download would arrive at the API with no Authorization header at
  * all. The browser rebuilds a Blob from this and opens or saves it.
  */
-router.get('/people/documents/:id/file', guard(PERM.peopleView), handle((req) => (
+router.get('/people/documents/:id/file', guard(PERM.employees.view), inEmployee('employeeDocument'), employeePaper, handle((req) => (
   readDocumentFile(pool, ctx(req).companyId, id(req))
 )));
 
 // ── employment events ───────────────────────────────────────────────────────
 
-router.get('/people/employees/:id/events', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/events', guard(PERM.employees.view), inEmployee(), handle((req) => (
   listEvents(pool, ctx(req).companyId, id(req))
 )));
 
@@ -201,21 +205,21 @@ router.get('/people/employees/:id/events', guard(PERM.peopleView), handle((req) 
  * change) it writes itself, in the same transaction as the change. There is
  * deliberately no DELETE: a timeline you can edit backwards is not a history.
  */
-router.post('/people/employees/:id/events', guard(PERM.peopleManage), handle((req) => (
+router.post('/people/employees/:id/events', guard(PERM.employees.edit), inEmployee(), handle((req) => (
   tx(req, (db, c) => createEvent(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
 // ── photo ───────────────────────────────────────────────────────────────────
 
-router.put('/people/employees/:id/photo', guard(PERM.peopleManage), handle((req) => (
+router.put('/people/employees/:id/photo', guard(PERM.employees.edit), inEmployee(), handle((req) => (
   tx(req, (db, c) => setPhoto(db, c, id(req), req.body ?? {}, reqId(req)))
 )));
 
-router.get('/people/employees/:id/photo', guard(PERM.peopleView), handle((req) => (
+router.get('/people/employees/:id/photo', guard(PERM.employees.view), inEmployee(), handle((req) => (
   readPhoto(pool, ctx(req).companyId, id(req))
 )));
 
-router.delete('/people/employees/:id/photo', guard(PERM.peopleManage), handle((req) => (
+router.delete('/people/employees/:id/photo', guard(PERM.employees.edit), inEmployee(), handle((req) => (
   tx(req, (db, c) => deletePhoto(db, c, id(req), reqId(req)))
 )));
 

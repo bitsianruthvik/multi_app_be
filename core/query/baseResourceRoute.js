@@ -10,6 +10,26 @@ import bcrypt from "bcryptjs";
 // Router
 const router = express.Router();
 
+// The core tables that hold identities, roles and grants. Generic WRITES to
+// them need an administrator — see the write branch below.
+const ACCESS_TABLES = new Set([
+  "users", "teams", "companies", "apps", "roles",
+  "features", "features_capability", "role_capability", "app_user_access",
+]);
+
+// Is this user, as the database has them NOW, on their company's `admin` role?
+async function isCompanyAdmin(user) {
+  const userId = Number(user?.id);
+  const companyId = Number(user?.companyId ?? user?.company_id);
+  if (!userId || !companyId) return false;
+  const [[row]] = await pool.query(
+    `SELECT r.name FROM users u JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
+      WHERE u.id = ? AND u.company_id = ? AND u.deleted_at IS NULL LIMIT 1`,
+    [userId, companyId],
+  );
+  return String(row?.name ?? "").toLowerCase() === "admin";
+}
+
 // Validate incoming base_resource-like requests and allow some public paths
 const validateRequest = (req, res, next) => {
   try {
@@ -181,6 +201,20 @@ router.post("/base_resource", async (req, res) => {
       // `resource` string this used to splice straight into the statement.
       const table = target.table;
       const allowed = target.allowlist;
+
+      // The tables that decide who may do what are written by an administrator
+      // only (2026-10-12, TM/CF_HRMS_HIRING_SPEC.md §12.6). This endpoint has no
+      // app context and checks no permission, so without this any signed-in user
+      // could reset the admin's password, take the admin role or grant their own
+      // role any capability. The role is read from the database, not the token:
+      // a token outlives a demotion. Reads, and writes to every other resource,
+      // are not affected. The worker service token passes, as it does below.
+      if (ACCESS_TABLES.has(table) && !req.user?.is_service && !(await isCompanyAdmin(req.user))) {
+        return res.status(403).json({
+          success: false,
+          error: `Only an administrator can change '${resource}'.`,
+        });
+      }
 
       let query;
       let params;

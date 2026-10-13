@@ -51,6 +51,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { inEmployee, assignmentBody } from '../lib/gates.js';
 import {
   listAssignments, getAssignment, createAssignment, updateAssignment,
   setAssignmentStatus, endAssignment, deleteAssignment,
@@ -60,51 +61,52 @@ import {
   assignmentOptions, managerAssignments,
 } from '../services/assignmentService.js';
 import { assignmentRelationships, resolveReporting } from '../services/reportingResolver.js';
+import { peopleFilter } from '../services/accessScope.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 
 // Before /assignments/:id, or "options" would be read as an id.
-router.get('/assignments/options', guard(PERM.peopleView), handle((req) => assignmentOptions(pool, ctx(req).companyId, req.query)));
+router.get('/assignments/options', guard([PERM.positions.view, PERM.employees.view]), handle((req) => assignmentOptions(pool, ctx(req).companyId, req.query)));
 
-router.get('/assignments', guard(PERM.peopleView), handle((req) => listAssignments(pool, ctx(req).companyId, req.query)));
-router.post('/assignments', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => createAssignment(db, c, req.body ?? {}))));
-router.get('/assignments/:id', guard(PERM.peopleView), handle((req) => getAssignment(pool, ctx(req).companyId, id(req), req.query)));
-router.put('/assignments/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => updateAssignment(db, c, id(req), req.body ?? {}))));
-router.post('/assignments/:id/status', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => setAssignmentStatus(db, c, id(req), req.body?.status))));
-router.post('/assignments/:id/end', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => endAssignment(db, c, id(req), req.body ?? {}))));
-router.delete('/assignments/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => deleteAssignment(db, c, id(req)))));
+router.get('/assignments', guard(PERM.employees.view), handle(async (req) => listAssignments(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req) })));
+router.post('/assignments', guard(PERM.positions.edit), assignmentBody, handle((req) => tx(req, (db, c) => createAssignment(db, c, req.body ?? {}))));
+router.get('/assignments/:id', guard(PERM.employees.view), inEmployee('assignment'), handle((req) => getAssignment(pool, ctx(req).companyId, id(req), req.query)));
+router.put('/assignments/:id', guard(PERM.positions.edit), inEmployee('assignment'), assignmentBody, handle((req) => tx(req, (db, c) => updateAssignment(db, c, id(req), req.body ?? {}))));
+router.post('/assignments/:id/status', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => setAssignmentStatus(db, c, id(req), req.body?.status))));
+router.post('/assignments/:id/end', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => endAssignment(db, c, id(req), req.body ?? {}))));
+router.delete('/assignments/:id', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => deleteAssignment(db, c, id(req)))));
 
-router.get('/assignments/:id/contexts', guard(PERM.peopleView), handle((req) => listAssignmentContexts(pool, ctx(req).companyId, id(req))));
-router.post('/assignments/:id/contexts', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => addAssignmentContext(db, c, id(req), req.body ?? {}))));
-router.delete('/work-assignment-contexts/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => removeAssignmentContext(db, c, id(req)))));
+router.get('/assignments/:id/contexts', guard(PERM.employees.view), inEmployee('assignment'), handle((req) => listAssignmentContexts(pool, ctx(req).companyId, id(req))));
+router.post('/assignments/:id/contexts', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => addAssignmentContext(db, c, id(req), req.body ?? {}))));
+router.delete('/work-assignment-contexts/:id', guard(PERM.positions.edit), inEmployee('assignmentContext'), handle((req) => tx(req, (db, c) => removeAssignmentContext(db, c, id(req)))));
 
 // v1.1 §13.5. The whole set, with scopes — this is the contract.
-router.get('/assignments/:id/reporting-relationships', guard(PERM.peopleView),
+router.get('/assignments/:id/reporting-relationships', guard(PERM.employees.view), inEmployee('assignment'),
   handle((req) => assignmentRelationships(pool, ctx(req).companyId, id(req), {
     on: req.query.on,
     includeEnded: req.query.includeEnded === '1' || req.query.includeEnded === 'true',
   })));
 // v1.1 §13.5. Formal defaults + assignment additions/narrowings, each tagged with its layer.
-router.get('/assignments/:id/resolved-reporting', guard(PERM.peopleView),
+router.get('/assignments/:id/resolved-reporting', guard(PERM.employees.view), inEmployee('assignment'),
   handle((req) => resolveReporting(pool, ctx(req).companyId, id(req), { on: req.query.on })));
 
-router.post('/assignments/:id/reporting-relationships', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => addAssignmentReporting(db, c, id(req), req.body ?? {}))));
-router.put('/assignment-reporting-relationships/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => updateAssignmentReporting(db, c, id(req), req.body ?? {}))));
-router.post('/assignment-reporting-relationships/:id/end', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => endAssignmentReporting(db, c, id(req), req.body ?? {}))));
-router.delete('/assignment-reporting-relationships/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => removeAssignmentReporting(db, c, id(req)))));
+router.post('/assignments/:id/reporting-relationships', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => addAssignmentReporting(db, c, id(req), req.body ?? {}))));
+router.put('/assignment-reporting-relationships/:id', guard(PERM.positions.edit), inEmployee('assignmentReporting'), handle((req) => tx(req, (db, c) => updateAssignmentReporting(db, c, id(req), req.body ?? {}))));
+router.post('/assignment-reporting-relationships/:id/end', guard(PERM.positions.edit), inEmployee('assignmentReporting'), handle((req) => tx(req, (db, c) => endAssignmentReporting(db, c, id(req), req.body ?? {}))));
+router.delete('/assignment-reporting-relationships/:id', guard(PERM.positions.edit), inEmployee('assignmentReporting'), handle((req) => tx(req, (db, c) => removeAssignmentReporting(db, c, id(req)))));
 
 /**
  * Which of a manager's own assignments they wear over this one. Namespaced
  * under /assignment-managers rather than /employees so it cannot collide with
  * people.js, which owns the /employees prefix.
  */
-router.get('/assignment-managers/:id/assignments', guard(PERM.peopleView),
+router.get('/assignment-managers/:id/assignments', guard([PERM.positions.view, PERM.employees.view]),
   handle((req) => managerAssignments(pool, ctx(req).companyId, id(req), { on: req.query.on })));
 
-router.get('/assignments/:id/overrides', guard(PERM.peopleView), handle((req) => listAssignmentOverrides(pool, ctx(req).companyId, id(req))));
-router.post('/assignments/:id/overrides', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => addAssignmentOverride(db, c, id(req), req.body ?? {}))));
-router.delete('/work-assignment-content-overrides/:id', guard(PERM.assignmentsManage), handle((req) => tx(req, (db, c) => removeAssignmentOverride(db, c, id(req)))));
+router.get('/assignments/:id/overrides', guard(PERM.employees.view), inEmployee('assignment'), handle((req) => listAssignmentOverrides(pool, ctx(req).companyId, id(req))));
+router.post('/assignments/:id/overrides', guard(PERM.positions.edit), inEmployee('assignment'), handle((req) => tx(req, (db, c) => addAssignmentOverride(db, c, id(req), req.body ?? {}))));
+router.delete('/work-assignment-content-overrides/:id', guard(PERM.positions.edit), inEmployee('assignmentOverride'), handle((req) => tx(req, (db, c) => removeAssignmentOverride(db, c, id(req)))));
 
 export default router;

@@ -31,10 +31,9 @@
  * aggregation across service boundaries.
  */
 import { Router } from 'express';
-import { protect } from '../../../core/middleware/authmiddleware.js';
-import { isPermitted } from '../../../core/middleware/requirePerm.js';
+import { scopeOf } from '../services/accessScope.js';
 import { pool } from '../lib/db.js';
-import { PERM, ctx, handle, dateParam } from '../lib/http.js';
+import { PERM, guard, can, ctx, handle, dateParam } from '../lib/http.js';
 import { rolesOverview } from '../services/roleContentService.js';
 import { LIVE_ON, dateText } from '../services/positionService.js';
 import { SEAT_TOTALS_SQL } from '../services/seatCount.js';
@@ -179,13 +178,17 @@ async function readRecentPeople(db, companyId) {
 async function collect(req, { withPeople }) {
   const { companyId } = ctx(req);
   const on = dateParam(req.query.on);
-  const may = (tag) => isPermitted(req.user, tag);
+  const may = (tag) => (Array.isArray(tag) ? tag.some((t) => can(req, t)) : can(req, tag));
+  // The structure is the company's; the people numbers are only for somebody whose access covers the whole of it.
+  const STRUCTURE = [PERM.positions.view, PERM.org.view, PERM.roles.view];
+  const wholeCompany = (await scopeOf(req)).all;
+  const PEOPLE = wholeCompany ? PERM.employees.view : [];
 
   const [sizes, seats, roles, people] = await Promise.all([
     readCounts(pool, companyId, on),
-    may(PERM.orgView) ? readSeats(pool, companyId, on) : Promise.resolve(null),
-    may(PERM.orgView) ? rolesOverview(pool, companyId) : Promise.resolve(null),
-    withPeople && may(PERM.peopleView) ? readRecentPeople(pool, companyId) : Promise.resolve(null),
+    may(STRUCTURE) ? readSeats(pool, companyId, on) : Promise.resolve(null),
+    may(STRUCTURE) ? rolesOverview(pool, companyId) : Promise.resolve(null),
+    withPeople && may(PEOPLE) ? readRecentPeople(pool, companyId) : Promise.resolve(null),
   ]);
 
   const counts = {};
@@ -194,7 +197,7 @@ async function collect(req, { withPeople }) {
     for (const [key, value] of Object.entries(entries)) counts[key] = value;
   };
 
-  take(PERM.orgView, {
+  take(STRUCTURE, {
     openPoints: sizes.openPoints,
     departments: sizes.departments,
     locations: sizes.locations,
@@ -206,7 +209,7 @@ async function collect(req, { withPeople }) {
     rolesNoPurpose: roles?.noPurpose ?? 0,
     rolesNoKras: roles?.noKras ?? 0,
   });
-  take(PERM.peopleView, {
+  take(PEOPLE, {
     employees: sizes.employees,
     employeesNoAssignment: sizes.employeesNoAssignment,
     activeAssignments: sizes.activeAssignments,
@@ -214,7 +217,7 @@ async function collect(req, { withPeople }) {
     documentsExpiring: sizes.documentsExpiring,
     documentsExpired: sizes.documentsExpired,
   });
-  take(PERM.attendanceView, {
+  take(PERM.time.view, {
     attendanceExpected: sizes.attendanceExpected,
     attendanceMarked: sizes.attendanceMarked,
     // Never negative: attendance can be recorded for someone whose assignment
@@ -222,11 +225,11 @@ async function collect(req, { withPeople }) {
     attendanceUnmarked: Math.max(0, sizes.attendanceExpected - sizes.attendanceMarked),
     regularisationsPending: sizes.regularisationsPending,
   });
-  take(PERM.leaveView, {
+  take(PERM.leave.view, {
     leavePending: sizes.leavePending,
     leaveTypes: sizes.leaveTypes,
   });
-  take(PERM.documentsGenerate, { generatedDocuments: sizes.generatedDocuments });
+  take(PERM.documents.view, { generatedDocuments: sizes.generatedDocuments });
 
   return { asOf: on, counts, recentPeople: people };
 }
@@ -239,7 +242,7 @@ async function collect(req, { withPeople }) {
  * Advisory by design: the client swallows a failure and renders no badges, and
  * a key that is absent (because the caller cannot see it) simply has no badge.
  */
-router.get('/overview/nav-counts', protect, handle(async (req) => {
+router.get('/overview/nav-counts', guard(PERM.signedIn), handle(async (req) => {
   const { counts } = await collect(req, { withPeople: false });
   const badges = {
     vacancies: counts.vacantSeats,
@@ -261,6 +264,6 @@ router.get('/overview/nav-counts', protect, handle(async (req) => {
 }));
 
 /** Everything Home renders. One request, four queries, no per-card endpoint. */
-router.get('/overview/home', protect, handle((req) => collect(req, { withPeople: true })));
+router.get('/overview/home', guard(PERM.signedIn), handle((req) => collect(req, { withPeople: true })));
 
 export default router;

@@ -16,59 +16,97 @@
 
 
 -- ############################################################################
--- ## 1. FEATURES — the fourteen permission tags of plan §6                  ##
+-- ## 1. FEATURES — the rights of CF_HRMS_HIRING_SPEC.md §12.1               ##
 -- ############################################################################
--- These must match lib/http.js PERM exactly. `type` is 'frontend' for a tag the
--- UI gates a screen on and 'backend' for one that guards a write; the platform
--- treats both the same, it is documentation for whoever reads the features list.
+-- GENERATED from lib/access.js (ALL_TAGS, tagName): nine areas × view / edit /
+-- remove / upload, and seven named rights. They must match lib/http.js PERM
+-- exactly — which is built from the same file. All are 'frontend': the platform
+-- copies only frontend tags into a login token from the company role.
+--
+-- The fourteen tags of the first release (cf_hrms_org_manage, _people_view …)
+-- are NOT created any more. Where they exist they stay, and nothing reads them;
+-- a company that still holds them is moved over by scripts/setup-access.mjs.
+-- `features.feature_tag` is unique, deleted rows included — hence no deleted_at
+-- test in the guard below.
 
 INSERT INTO features (feature_name, feature_tag, type)
-SELECT x.feature_name, x.feature_tag, x.type
+SELECT x.feature_name, x.feature_tag, 'frontend'
   FROM (
-    SELECT 'CF HRMS: view organisation, roles and positions' AS feature_name, 'cf_hrms_org_view'           AS feature_tag, 'frontend' AS type UNION ALL
-    SELECT 'CF HRMS: manage locations, departments, contexts, positions and formal reporting', 'cf_hrms_org_manage',         'backend'  UNION ALL
-    SELECT 'CF HRMS: manage roles and all role content',      'cf_hrms_roles_manage',        'backend'  UNION ALL
-    SELECT 'CF HRMS: view employees and their assignments',   'cf_hrms_people_view',         'frontend' UNION ALL
-    SELECT 'CF HRMS: manage employees, documents and events', 'cf_hrms_people_manage',       'backend'  UNION ALL
-    SELECT 'CF HRMS: read unmasked statutory identifiers',    'cf_hrms_people_pii',          'backend'  UNION ALL
-    SELECT 'CF HRMS: manage work assignments and actual reporting', 'cf_hrms_assignments_manage', 'backend'  UNION ALL
-    SELECT 'CF HRMS: view roster and attendance',             'cf_hrms_attendance_view',     'frontend' UNION ALL
-    SELECT 'CF HRMS: manage roster, attendance and regularisation', 'cf_hrms_attendance_manage', 'backend'  UNION ALL
-    SELECT 'CF HRMS: view leave balances and requests',       'cf_hrms_leave_view',          'frontend' UNION ALL
-    SELECT 'CF HRMS: manage leave types, balances and approvals', 'cf_hrms_leave_manage',    'backend'  UNION ALL
-    SELECT 'CF HRMS: generate JD and responsibility profiles','cf_hrms_documents_generate',  'backend'  UNION ALL
-    SELECT 'CF HRMS: run the org-chart import',               'cf_hrms_import_manage',       'backend'  UNION ALL
-    -- The employee self view. 'frontend' because it gates a SCREEN, and because
-    -- authController only copies frontend tags into the JWT from the company
-    -- role — a 'backend' tag here would never reach `uiPermissions` for a user
-    -- whose grant is company-wide rather than app-scoped, and the screen would
-    -- be invisible to the very person it exists for.
-    SELECT 'CF HRMS: see your own place in the organisation', 'cf_hrms_self_view',            'frontend'
+    SELECT 'CF HRMS: organisation — view' AS feature_name, 'cf_hrms_org_view' AS feature_tag UNION ALL
+    SELECT 'CF HRMS: organisation — add and change', 'cf_hrms_org_edit' UNION ALL
+    SELECT 'CF HRMS: organisation — remove', 'cf_hrms_org_remove' UNION ALL
+    SELECT 'CF HRMS: organisation — upload from excel', 'cf_hrms_org_upload' UNION ALL
+    SELECT 'CF HRMS: roles — view', 'cf_hrms_roles_view' UNION ALL
+    SELECT 'CF HRMS: roles — add and change', 'cf_hrms_roles_edit' UNION ALL
+    SELECT 'CF HRMS: roles — remove', 'cf_hrms_roles_remove' UNION ALL
+    SELECT 'CF HRMS: roles — upload from excel', 'cf_hrms_roles_upload' UNION ALL
+    SELECT 'CF HRMS: positions — view', 'cf_hrms_positions_view' UNION ALL
+    SELECT 'CF HRMS: positions — add and change', 'cf_hrms_positions_edit' UNION ALL
+    SELECT 'CF HRMS: positions — remove', 'cf_hrms_positions_remove' UNION ALL
+    SELECT 'CF HRMS: positions — upload from excel', 'cf_hrms_positions_upload' UNION ALL
+    SELECT 'CF HRMS: employees — view', 'cf_hrms_employees_view' UNION ALL
+    SELECT 'CF HRMS: employees — add and change', 'cf_hrms_employees_edit' UNION ALL
+    SELECT 'CF HRMS: employees — upload from excel', 'cf_hrms_employees_upload' UNION ALL
+    SELECT 'CF HRMS: hiring — view', 'cf_hrms_hiring_view' UNION ALL
+    SELECT 'CF HRMS: hiring — add and change', 'cf_hrms_hiring_edit' UNION ALL
+    SELECT 'CF HRMS: documents — view', 'cf_hrms_documents_view' UNION ALL
+    SELECT 'CF HRMS: documents — add and change', 'cf_hrms_documents_edit' UNION ALL
+    SELECT 'CF HRMS: documents — remove', 'cf_hrms_documents_remove' UNION ALL
+    SELECT 'CF HRMS: time — view', 'cf_hrms_time_view' UNION ALL
+    SELECT 'CF HRMS: time — add and change', 'cf_hrms_time_edit' UNION ALL
+    SELECT 'CF HRMS: time — remove', 'cf_hrms_time_remove' UNION ALL
+    SELECT 'CF HRMS: time — upload from excel', 'cf_hrms_time_upload' UNION ALL
+    SELECT 'CF HRMS: leave — view', 'cf_hrms_leave_view' UNION ALL
+    SELECT 'CF HRMS: leave — add and change', 'cf_hrms_leave_edit' UNION ALL
+    SELECT 'CF HRMS: leave — remove', 'cf_hrms_leave_remove' UNION ALL
+    SELECT 'CF HRMS: setup — view', 'cf_hrms_setup_view' UNION ALL
+    SELECT 'CF HRMS: setup — add and change', 'cf_hrms_setup_edit' UNION ALL
+    SELECT 'CF HRMS: setup — remove', 'cf_hrms_setup_remove' UNION ALL
+    SELECT 'CF HRMS: create an employee', 'cf_hrms_employee_create' UNION ALL
+    SELECT 'CF HRMS: close an employee', 'cf_hrms_employee_close' UNION ALL
+    SELECT 'CF HRMS: add employees from excel', 'cf_hrms_employee_bulk_add' UNION ALL
+    SELECT 'CF HRMS: see contact details', 'cf_hrms_contact_view' UNION ALL
+    SELECT 'CF HRMS: see pay', 'cf_hrms_pay_view' UNION ALL
+    SELECT 'CF HRMS: manage logins and access', 'cf_hrms_access_manage' UNION ALL
+    SELECT 'CF HRMS: see their own place', 'cf_hrms_self_view'
   ) x
- WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag AND f.deleted_at IS NULL);
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag);
 
 
 -- ############################################################################
--- ## 2. CAPABILITIES — one per feature, named after it                      ##
+-- ## 2. CAPABILITIES — one per right, named after it, holding only it       ##
 -- ############################################################################
+-- A capability that held two features would grant two. services/accessGrants.js
+-- checks exactly this shape and repairs one that has drifted.
 
 INSERT INTO features_capability (name, features_json)
 SELECT f.feature_tag, JSON_ARRAY(f.id)
   FROM features f
- WHERE f.feature_tag IN ('cf_hrms_org_view', 'cf_hrms_org_manage', 'cf_hrms_roles_manage',
-                         'cf_hrms_people_view', 'cf_hrms_people_manage', 'cf_hrms_people_pii',
-                         'cf_hrms_assignments_manage', 'cf_hrms_attendance_view', 'cf_hrms_attendance_manage',
-                         'cf_hrms_leave_view', 'cf_hrms_leave_manage', 'cf_hrms_documents_generate',
-                         'cf_hrms_import_manage', 'cf_hrms_self_view')
+ WHERE f.feature_tag IN (
+         'cf_hrms_org_view', 'cf_hrms_org_edit', 'cf_hrms_org_remove', 'cf_hrms_org_upload',
+         'cf_hrms_roles_view', 'cf_hrms_roles_edit', 'cf_hrms_roles_remove', 'cf_hrms_roles_upload',
+         'cf_hrms_positions_view', 'cf_hrms_positions_edit', 'cf_hrms_positions_remove', 'cf_hrms_positions_upload',
+         'cf_hrms_employees_view', 'cf_hrms_employees_edit', 'cf_hrms_employees_upload', 'cf_hrms_hiring_view',
+         'cf_hrms_hiring_edit', 'cf_hrms_documents_view', 'cf_hrms_documents_edit', 'cf_hrms_documents_remove',
+         'cf_hrms_time_view', 'cf_hrms_time_edit', 'cf_hrms_time_remove', 'cf_hrms_time_upload',
+         'cf_hrms_leave_view', 'cf_hrms_leave_edit', 'cf_hrms_leave_remove', 'cf_hrms_setup_view',
+         'cf_hrms_setup_edit', 'cf_hrms_setup_remove', 'cf_hrms_employee_create', 'cf_hrms_employee_close',
+         'cf_hrms_employee_bulk_add', 'cf_hrms_contact_view', 'cf_hrms_pay_view', 'cf_hrms_access_manage',
+         'cf_hrms_self_view')
    AND f.deleted_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
 
 
 -- ############################################################################
--- ## 3. GRANTS — every company's admin role gets all fourteen               ##
+-- ## 3. GRANTS — every company's admin role (the Owner) holds every right   ##
 -- ############################################################################
--- The backend lets admins through anyway (requirePerm); the frontend's
--- usePermission has NO bypass, so without these rows an admin sees no screens.
+-- The backend lets the Owner through anyway; the frontend has NO bypass, so
+-- without these rows an Owner sees no screens. No broader than before: the same
+-- one role per company that held all fourteen old tags now holds all of these.
+-- Always for the company's OWN cf_hrms app (never app_id NULL, which the
+-- platform reads as "every app"), and never twice: role_capability has no
+-- unique key, so the NOT EXISTS is the only thing keeping a re-run from
+-- doubling the rows.
 -- A grant needs role_capability AND app_user_access (section 4) — one without
 -- the other is the usual cause of "the app is there but empty".
 
@@ -76,13 +114,19 @@ INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id
 SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
   FROM apps a
   JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = 'admin' AND r.deleted_at IS NULL
-  JOIN features_capability fc ON fc.name IN ('cf_hrms_org_view', 'cf_hrms_org_manage', 'cf_hrms_roles_manage',
-                         'cf_hrms_people_view', 'cf_hrms_people_manage', 'cf_hrms_people_pii',
-                         'cf_hrms_assignments_manage', 'cf_hrms_attendance_view', 'cf_hrms_attendance_manage',
-                         'cf_hrms_leave_view', 'cf_hrms_leave_manage', 'cf_hrms_documents_generate',
-                         'cf_hrms_import_manage', 'cf_hrms_self_view')
-                             AND fc.deleted_at IS NULL
+  JOIN features_capability fc ON fc.deleted_at IS NULL AND fc.name IN (
+         'cf_hrms_org_view', 'cf_hrms_org_edit', 'cf_hrms_org_remove', 'cf_hrms_org_upload',
+         'cf_hrms_roles_view', 'cf_hrms_roles_edit', 'cf_hrms_roles_remove', 'cf_hrms_roles_upload',
+         'cf_hrms_positions_view', 'cf_hrms_positions_edit', 'cf_hrms_positions_remove', 'cf_hrms_positions_upload',
+         'cf_hrms_employees_view', 'cf_hrms_employees_edit', 'cf_hrms_employees_upload', 'cf_hrms_hiring_view',
+         'cf_hrms_hiring_edit', 'cf_hrms_documents_view', 'cf_hrms_documents_edit', 'cf_hrms_documents_remove',
+         'cf_hrms_time_view', 'cf_hrms_time_edit', 'cf_hrms_time_remove', 'cf_hrms_time_upload',
+         'cf_hrms_leave_view', 'cf_hrms_leave_edit', 'cf_hrms_leave_remove', 'cf_hrms_setup_view',
+         'cf_hrms_setup_edit', 'cf_hrms_setup_remove', 'cf_hrms_employee_create', 'cf_hrms_employee_close',
+         'cf_hrms_employee_bulk_add', 'cf_hrms_contact_view', 'cf_hrms_pay_view', 'cf_hrms_access_manage',
+         'cf_hrms_self_view')
  WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
+   AND fc.capability_id = (SELECT MIN(f2.capability_id) FROM features_capability f2 WHERE f2.name = fc.name AND f2.deleted_at IS NULL)
    AND NOT EXISTS (
      SELECT 1 FROM role_capability x
       WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
@@ -122,10 +166,37 @@ SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
   FROM apps a
   JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = 'employee' AND r.deleted_at IS NULL
   JOIN features_capability fc ON fc.name = 'cf_hrms_self_view' AND fc.deleted_at IS NULL
+       AND fc.capability_id = (SELECT MIN(f2.capability_id) FROM features_capability f2 WHERE f2.name = 'cf_hrms_self_view' AND f2.deleted_at IS NULL)
  WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
    AND NOT EXISTS (
      SELECT 1 FROM role_capability x
       WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+
+-- ############################################################################
+-- ## 3b. ACCESS ROLES — the two every company has from the start            ##
+-- ############################################################################
+-- hrms_access_roles is what this app adds to a platform role: its label and
+-- its scope (init.sql §15). The company's `admin` role is the Owner — never
+-- renamed, the platform's bypass is on that name — and `Employee` is Employee.
+-- The other ready-made roles (HR manager, HR executive, Department head) are
+-- made for a company by scripts/setup-access.mjs, not here: this file gives a
+-- new company exactly what the old one did, and nothing more.
+
+INSERT INTO hrms_access_roles (company_id, role_id, label, description, scope, template_key, is_locked)
+SELECT a.company_id, r.id, t.label, t.description, t.scope, t.template_key, 1
+  FROM apps a
+  JOIN (
+    SELECT 'admin' AS platform_name, 'OWNER' AS template_key, 'Owner' AS label, 'COMPANY' AS scope,
+           'Everything, including logins and access. Its rights cannot be reduced.' AS description UNION ALL
+    SELECT 'employee', 'EMPLOYEE', 'Employee', 'DEPARTMENT',
+           'Their own place in the organisation, and nothing else.'
+  ) t
+  JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = t.platform_name AND r.deleted_at IS NULL
+ WHERE a.slug = 'cf_hrms' AND a.deleted_at IS NULL
+   AND r.id = (SELECT MIN(r2.id) FROM roles r2 WHERE r2.company_id = a.company_id AND LOWER(r2.name) = t.platform_name AND r2.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM hrms_access_roles x WHERE x.company_id = a.company_id AND x.role_id = r.id AND x.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM hrms_access_roles x WHERE x.company_id = a.company_id AND x.template_key = t.template_key AND x.deleted_at IS NULL);
 
 
 -- ############################################################################

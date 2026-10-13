@@ -73,7 +73,8 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, dateParam, need } from '../lib/http.js';
+import { inPosition, newPositionBody, positionBody } from '../lib/gates.js';
 import {
   listPositions, getPosition, createPosition, updatePosition, addSiblingPosition, setPositionStatus, deletePosition, closePosition, getDeleteImpact, refuseCloseWithTeam,
   listPositionContexts, addPositionContext, updatePositionContext, removePositionContext,
@@ -92,52 +93,55 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 
 // Before /positions/:id, or Express would try to read "options" as an id.
-router.get('/positions/options', guard(PERM.orgView), handle((req) => positionOptions(pool, ctx(req).companyId)));
+router.get('/positions/options', guard([PERM.positions.view, PERM.hiring.view, PERM.employees.view]), handle((req) => positionOptions(pool, ctx(req).companyId)));
 
-router.get('/positions', guard(PERM.orgView), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
-router.post('/positions', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => createPosition(db, c, req.body ?? {}))));
-router.get('/positions/:id', guard(PERM.orgView), handle((req) => getPosition(pool, ctx(req).companyId, id(req), req.query)));
-router.put('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, async (db, c) => {
+router.get('/positions', guard(PERM.positions.view), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
+router.post('/positions', guard(PERM.positions.edit), newPositionBody, handle((req) => tx(req, (db, c) => createPosition(db, c, req.body ?? {}))));
+router.get('/positions/:id', guard(PERM.positions.view), handle((req) => getPosition(pool, ctx(req).companyId, id(req), req.query)));
+router.put('/positions/:id', guard(PERM.positions.edit), inPosition(), positionBody, handle((req) => tx(req, async (db, c) => {
+  // Closing a position is removing it, by whichever door.
+  if (String(req.body?.status ?? '').toUpperCase() === 'CLOSED') need(req, PERM.positions.remove);
   // CLOSED set directly would orphan the seat's team in the chart; see refuseCloseWithTeam.
   if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'status')) await refuseCloseWithTeam(db, c.companyId, id(req), req.body.status);
   return updatePosition(db, c, id(req), req.body ?? {});
 })));
-router.post('/positions/:id/status', guard(PERM.orgManage), handle((req) => tx(req, async (db, c) => {
+router.post('/positions/:id/status', guard(PERM.positions.edit, { note: 'status CLOSED also needs cf_hrms_positions_remove' }), inPosition(), handle((req) => tx(req, async (db, c) => {
+  if (String(req.body?.status ?? '').toUpperCase() === 'CLOSED') need(req, PERM.positions.remove);
   await refuseCloseWithTeam(db, c.companyId, id(req), req.body?.status);
   return setPositionStatus(db, c, id(req), req.body?.status);
 })));
 // One more chair in the same card. Creating a position, so the same permission as POST /positions.
-router.post('/positions/:id/add-sibling', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addSiblingPosition(db, c, id(req), req.body ?? {}))));
-router.get('/positions/:id/delete-impact', guard(PERM.orgView), handle((req) => getDeleteImpact(pool, ctx(req).companyId, id(req))));
-router.post('/positions/:id/close', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => closePosition(db, c, id(req), { expect: req.body?.expect }))));
-router.delete('/positions/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => deletePosition(db, c, id(req), { mode: req.query.mode, expect: req.query.expect }))));
+router.post('/positions/:id/add-sibling', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => addSiblingPosition(db, c, id(req), req.body ?? {}))));
+router.get('/positions/:id/delete-impact', guard(PERM.positions.view), handle((req) => getDeleteImpact(pool, ctx(req).companyId, id(req))));
+router.post('/positions/:id/close', guard(PERM.positions.remove), inPosition(), handle((req) => tx(req, (db, c) => closePosition(db, c, id(req), { expect: req.body?.expect }))));
+router.delete('/positions/:id', guard(PERM.positions.remove), inPosition(), handle((req) => tx(req, (db, c) => deletePosition(db, c, id(req), { mode: req.query.mode, expect: req.query.expect }))));
 
-router.get('/positions/:id/work-contexts', guard(PERM.orgView), handle((req) => listPositionContexts(pool, ctx(req).companyId, id(req))));
-router.post('/positions/:id/work-contexts', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addPositionContext(db, c, id(req), req.body ?? {}))));
-router.put('/position-work-contexts/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updatePositionContext(db, c, id(req), req.body ?? {}))));
-router.delete('/position-work-contexts/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => removePositionContext(db, c, id(req)))));
+router.get('/positions/:id/work-contexts', guard(PERM.positions.view), handle((req) => listPositionContexts(pool, ctx(req).companyId, id(req))));
+router.post('/positions/:id/work-contexts', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => addPositionContext(db, c, id(req), req.body ?? {}))));
+router.put('/position-work-contexts/:id', guard(PERM.positions.edit), inPosition('positionContext'), handle((req) => tx(req, (db, c) => updatePositionContext(db, c, id(req), req.body ?? {}))));
+router.delete('/position-work-contexts/:id', guard(PERM.positions.edit), inPosition('positionContext'), handle((req) => tx(req, (db, c) => removePositionContext(db, c, id(req)))));
 
-router.get('/positions/:id/reporting-relationships', guard(PERM.orgView), handle((req) => listPositionReporting(pool, ctx(req).companyId, id(req), req.query)));
-router.get('/positions/:id/resolved-reporting', guard(PERM.orgView), handle((req) => resolvePositionReporting(pool, ctx(req).companyId, id(req), req.query)));
-router.post('/positions/:id/reporting-relationships', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addPositionReporting(db, c, id(req), req.body ?? {}))));
-router.put('/position-reporting-relationships/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => updatePositionReporting(db, c, id(req), req.body ?? {}))));
-router.post('/position-reporting-relationships/:id/end', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => endPositionReporting(db, c, id(req), req.body ?? {}))));
-router.delete('/position-reporting-relationships/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => removePositionReporting(db, c, id(req)))));
+router.get('/positions/:id/reporting-relationships', guard(PERM.positions.view), handle((req) => listPositionReporting(pool, ctx(req).companyId, id(req), req.query)));
+router.get('/positions/:id/resolved-reporting', guard(PERM.positions.view), handle((req) => resolvePositionReporting(pool, ctx(req).companyId, id(req), req.query)));
+router.post('/positions/:id/reporting-relationships', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => addPositionReporting(db, c, id(req), req.body ?? {}))));
+router.put('/position-reporting-relationships/:id', guard(PERM.positions.edit), inPosition('positionReporting'), handle((req) => tx(req, (db, c) => updatePositionReporting(db, c, id(req), req.body ?? {}))));
+router.post('/position-reporting-relationships/:id/end', guard(PERM.positions.edit), inPosition('positionReporting'), handle((req) => tx(req, (db, c) => endPositionReporting(db, c, id(req), req.body ?? {}))));
+router.delete('/position-reporting-relationships/:id', guard(PERM.positions.edit), inPosition('positionReporting'), handle((req) => tx(req, (db, c) => removePositionReporting(db, c, id(req)))));
 
-router.get('/positions/:id/occupants', guard(PERM.orgView), handle((req) => listPositionOccupants(pool, ctx(req).companyId, id(req), req.query)));
+router.get('/positions/:id/occupants', guard(PERM.positions.view), handle((req) => listPositionOccupants(pool, ctx(req).companyId, id(req), req.query)));
 
-router.get('/positions/:id/overrides', guard(PERM.orgView), handle((req) => listPositionOverrides(pool, ctx(req).companyId, id(req))));
-router.post('/positions/:id/overrides', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => addPositionOverride(db, c, id(req), req.body ?? {}))));
-router.delete('/position-content-overrides/:id', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => removePositionOverride(db, c, id(req)))));
+router.get('/positions/:id/overrides', guard(PERM.positions.view), handle((req) => listPositionOverrides(pool, ctx(req).companyId, id(req))));
+router.post('/positions/:id/overrides', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => addPositionOverride(db, c, id(req), req.body ?? {}))));
+router.delete('/position-content-overrides/:id', guard(PERM.positions.edit), inPosition('positionOverride'), handle((req) => tx(req, (db, c) => removePositionOverride(db, c, id(req)))));
 
 // ----- the seat's job content, and its plain-language edits -------------------
 // The read is org_view, like every other read of a seat. The four writes are
 // org_manage — the tag the override endpoints above already ask for, because
 // that is what they write. cf_hrms_self_view reaches none of the five.
-router.get('/positions/:id/job-content', guard(PERM.orgView), handle((req) => positionJobContent(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) })));
-router.post('/positions/:id/job-content/add', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatAddLine(db, c, id(req), req.body ?? {}))));
-router.post('/positions/:id/job-content/change', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatChangeLine(db, c, id(req), req.body ?? {}))));
-router.post('/positions/:id/job-content/switch-off', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatSwitchOffLine(db, c, id(req), req.body ?? {}))));
-router.post('/positions/:id/job-content/undo', guard(PERM.orgManage), handle((req) => tx(req, (db, c) => seatUndoLine(db, c, id(req), req.body ?? {}))));
+router.get('/positions/:id/job-content', guard(PERM.positions.view), handle((req) => positionJobContent(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) })));
+router.post('/positions/:id/job-content/add', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatAddLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/change', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatChangeLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/switch-off', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatSwitchOffLine(db, c, id(req), req.body ?? {}))));
+router.post('/positions/:id/job-content/undo', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatUndoLine(db, c, id(req), req.body ?? {}))));
 
 export default router;

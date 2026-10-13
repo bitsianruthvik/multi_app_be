@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, need } from '../lib/http.js';
+import { companyWide } from '../lib/gates.js';
 import {
   listLeaveTypes, createLeaveType, updateLeaveType, deleteLeaveType,
   listPolicies, getPolicy, createPolicy, updatePolicy, deletePolicy, listTemplates, previewRuleSummary,
@@ -31,7 +32,7 @@ const router = Router();
  *   PUT    /leave/assignments                   { scope, locationId?, roleId?, policyId | null }  -> { assignments }
  *   GET    /leave/policy-for                    ?positionId=  |  ?roleId=&locationId=            -> { effective }
  *
- * Reads: `cf_hrms_leave_view`. Writes: `cf_hrms_leave_manage`. An employee
+ * Reads: `cf_hrms_leave_view`. Writes: `cf_hrms_leave_edit`; deletes: `cf_hrms_leave_remove`. An employee
  * login holds neither; a person reads their OWN policy on `/user/me/place`.
  *
  * STILL TO COME: balances, accrual runs, applying for leave and approvals.
@@ -40,12 +41,12 @@ const router = Router();
  * standalone list. `/leave/status` below is the stub those screens were wired
  * to, and it still answers "nothing yet" for them.
  */
-router.get('/leave/status', guard(PERM.leaveView), handle(async () => ({
+router.get('/leave/status', guard(PERM.leave.view), handle(async () => ({
   section: 'leave',
   implemented: false,
   phase: 10,
-  viewPermission: PERM.leaveView,
-  managePermission: PERM.leaveManage,
+  viewPermission: PERM.leave.view,
+  managePermission: PERM.leave.edit,
   items: [],
   total: 0,
   // What IS built: leave types, policies and where they apply.
@@ -55,28 +56,38 @@ router.get('/leave/status', guard(PERM.leaveView), handle(async () => ({
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
-const read = guard(PERM.leaveView);
-const write = guard(PERM.leaveManage);
 
 // ── leave types ─────────────────────────────────────────────────────────────
-router.get('/leave/types', read, handle((req) => listLeaveTypes(pool, ctx(req).companyId)));
-router.post('/leave/types', write, handle((req) => tx(req, (db, c) => createLeaveType(db, c, req.body ?? {}, reqId(req)))));
-router.put('/leave/types/:id', write, handle((req) => tx(req, (db, c) => updateLeaveType(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.delete('/leave/types/:id', write, handle((req) => tx(req, (db, c) => deleteLeaveType(db, c, id(req), reqId(req)))));
+router.get('/leave/types', guard(PERM.leave.view), handle((req) => listLeaveTypes(pool, ctx(req).companyId)));
+router.post('/leave/types', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLeaveType(db, c, req.body ?? {}, reqId(req)))));
+router.put('/leave/types/:id', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLeaveType(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.delete('/leave/types/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLeaveType(db, c, id(req), reqId(req)))));
 
 // ── policies ────────────────────────────────────────────────────────────────
-router.get('/leave/policy-templates', read, handle(async () => listTemplates()));
-router.get('/leave/policies', read, handle((req) => listPolicies(pool, ctx(req).companyId)));
+router.get('/leave/policy-templates', guard(PERM.leave.view), handle(async () => listTemplates()));
+router.get('/leave/policies', guard(PERM.leave.view), handle((req) => listPolicies(pool, ctx(req).companyId)));
 // Before /leave/policies/:id, or "preview-summary" would be read as an id.
-router.post('/leave/policies/preview-summary', read, handle((req) => previewRuleSummary(pool, ctx(req).companyId, req.body ?? {})));
-router.get('/leave/policies/:id', read, handle((req) => getPolicy(pool, ctx(req).companyId, id(req))));
-router.post('/leave/policies', write, handle((req) => tx(req, (db, c) => createPolicy(db, c, req.body ?? {}, reqId(req)))));
-router.put('/leave/policies/:id', write, handle((req) => tx(req, (db, c) => updatePolicy(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.delete('/leave/policies/:id', write, handle((req) => tx(req, (db, c) => deletePolicy(db, c, id(req), reqId(req)))));
+router.post('/leave/policies/preview-summary', guard(PERM.leave.view), handle((req) => previewRuleSummary(pool, ctx(req).companyId, req.body ?? {})));
+router.get('/leave/policies/:id', guard(PERM.leave.view), handle((req) => getPolicy(pool, ctx(req).companyId, id(req))));
+router.post('/leave/policies', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createPolicy(db, c, req.body ?? {}, reqId(req)))));
+router.put('/leave/policies/:id', guard(PERM.leave.edit, { note: 'archiving it, or saving it without a leave type it had, also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle(async (req) => {
+  // Archiving a policy, and taking a leave type out of one, are removals.
+  if (String(req.body?.status ?? '').toUpperCase() === 'ARCHIVED') need(req, PERM.leave.remove);
+  if (Array.isArray(req.body?.rules)) {
+    const [had] = await pool.query('SELECT leave_type_id FROM hrms_leave_policy_rules WHERE company_id = ? AND policy_id = ? AND deleted_at IS NULL', [ctx(req).companyId, id(req)]);
+    const kept = new Set(req.body.rules.map((r) => Number(r?.leaveTypeId)));
+    if (had.some((r) => !kept.has(r.leave_type_id))) need(req, PERM.leave.remove);
+  }
+  return tx(req, (db, c) => updatePolicy(db, c, id(req), req.body ?? {}, reqId(req)));
+}));
+router.delete('/leave/policies/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deletePolicy(db, c, id(req), reqId(req)))));
 
 // ── where a policy applies: company default -> location -> role ─────────────
-router.get('/leave/assignments', read, handle((req) => getAssignments(pool, ctx(req).companyId)));
-router.put('/leave/assignments', write, handle((req) => tx(req, (db, c) => putAssignment(db, c, req.body ?? {}, reqId(req)))));
-router.get('/leave/policy-for', read, handle((req) => policyFor(pool, ctx(req).companyId, req.query)));
+router.get('/leave/assignments', guard(PERM.leave.view), handle((req) => getAssignments(pool, ctx(req).companyId)));
+router.put('/leave/assignments', guard(PERM.leave.edit, { note: 'clearing one (policyId: null) also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => {
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'policyId') && (req.body.policyId === null || req.body.policyId === '')) need(req, PERM.leave.remove);
+  return tx(req, (db, c) => putAssignment(db, c, req.body ?? {}, reqId(req)));
+}));
+router.get('/leave/policy-for', guard(PERM.leave.view), handle((req) => policyFor(pool, ctx(req).companyId, req.query)));
 
 export default router;

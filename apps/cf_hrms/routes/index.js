@@ -15,6 +15,8 @@ import importRoutes from './imports.js';
 import overviewRoutes from './overview.js';
 import hiringRoutes from './hiring.js';
 import exitRoutes from './exits.js';
+import accessRoutes from './access.js';
+import codegenGateRoutes from './codegen.js';
 
 const router = Router();
 
@@ -51,7 +53,7 @@ router.get('/health', (req, res) => res.json({ ok: true, app: 'cf_hrms' }));
  * ENUM values in models/init.sql; keeping them in one endpoint means a screen
  * never hard-codes a status string that a later migration renames.
  */
-router.get('/meta', guard(PERM.orgView), handle(async () => ({
+router.get('/meta', guard(PERM.signedIn), handle(async () => ({
   locationTypes: ['PLANT', 'OFFICE', 'UNIT', 'BRANCH', 'SITE', 'OTHER'],
   contextTypes: ['MACHINE', 'LINE', 'AREA', 'PROJECT', 'CELL', 'OTHER'],
   activeStatuses: ['ACTIVE', 'INACTIVE'],
@@ -119,5 +121,9 @@ router.use(overviewRoutes);
 router.use(hiringRoutes);
 // Leaving: notice, and closing an employee (routes/exits.js).
 router.use(exitRoutes);
+// Logins and access roles (routes/access.js), and the rights of the Code formats screen, whose own
+// routes are the code generator's and are mounted after this router in app.js (routes/codegen.js).
+router.use(accessRoutes);
+router.use(codegenGateRoutes);
 
 export default router;

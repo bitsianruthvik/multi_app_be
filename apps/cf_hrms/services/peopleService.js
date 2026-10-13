@@ -38,6 +38,7 @@ import {
   MAX_DOCUMENT_STORED_BYTES, MAX_PHOTO_STORED_BYTES,
 } from './documentStorage.js';
 import { issueEmployeeCode } from './codeService.js';
+import { EMPLOYEE_IN_DEPARTMENTS_SQL, scopeToday } from './accessScope.js';
 import { exitsForEmployees } from './exitRead.js';
 
 // ── small shared helpers ────────────────────────────────────────────────────
@@ -296,10 +297,23 @@ async function documentHealth(exec, companyId, employeeIds, asOf = today()) {
  * shows none, which is a real and visible gap rather than a blank that looks
  * like missing data.
  */
-export async function listEmployees(exec, companyId, query = {}) {
+/**
+ * `options.departmentIds` — the scope of a login that sees only its own
+ * department and below (services/accessScope.js): null for the whole company,
+ * else the people whose current position is in one of those departments (none
+ * when the list is empty).
+ * `options.searchContact` — whether the search box may match phone and email.
+ * False for somebody who cannot see contact details.
+ */
+export async function listEmployees(exec, companyId, query = {}, { departmentIds = null, searchContact = true } = {}) {
   const asOf = dateOrNull(query.asOf) || today();
+  if (departmentIds && !departmentIds.length) return { asOf, total: 0, items: [] };
   const where = ['e.company_id = ?', 'e.deleted_at IS NULL'];
   const args = [companyId];
+  if (departmentIds) {
+    where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e'));
+    args.push(scopeToday(), scopeToday(), departmentIds);
+  }
 
   const csv = (v) => String(v ?? '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 
@@ -324,9 +338,14 @@ export async function listEmployees(exec, companyId, query = {}) {
   }
   const search = trim(query.search, 120);
   if (search) {
-    where.push('(e.full_name LIKE ? OR e.employee_code LIKE ? OR e.phone LIKE ? OR e.email LIKE ?)');
     const like = `%${search}%`;
-    args.push(like, like, like, like);
+    if (searchContact) {
+      where.push('(e.full_name LIKE ? OR e.employee_code LIKE ? OR e.phone LIKE ? OR e.email LIKE ?)');
+      args.push(like, like, like, like);
+    } else {
+      where.push('(e.full_name LIKE ? OR e.employee_code LIKE ?)');
+      args.push(like, like);
+    }
   }
 
   const limit = Math.min(Math.max(Number(query.limit) || 500, 1), 2000);

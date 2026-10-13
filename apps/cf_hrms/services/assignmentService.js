@@ -55,6 +55,7 @@ import {
 import { assignmentRelationships, resolveReporting } from './reportingResolver.js';
 import { HOLDS_SEAT_SQL } from './seatCount.js';
 import { assertNoOpenHiring } from './hiringRead.js';
+import { EMPLOYEE_IN_DEPARTMENTS_SQL, scopeToday } from './accessScope.js';
 
 export const ASSIGNMENT_STATUSES = ['PLANNED', 'ACTIVE', 'SUSPENDED', 'ENDED'];
 /** Statuses that put a person on the job today. ENDED and PLANNED do not. */
@@ -177,10 +178,18 @@ async function allocationTotals(db, companyId, employeeIds, on) {
   return new Map(rows.map((r) => [r.employee_id, { total: Number(r.total), assignments: Number(r.n) }]));
 }
 
-export async function listAssignments(db, companyId, query = {}) {
+export async function listAssignments(db, companyId, query = {}, { departmentIds = null } = {}) {
   const on = dateText(query.on) || today();
   const where = ['wa.company_id = ?', 'wa.deleted_at IS NULL'];
   const params = [on, on, on, on, companyId];
+  // A login scoped to a department: the work of people whose current position is inside it (accessScope.js).
+  if (departmentIds) {
+    if (!departmentIds.length) {
+      return { asOf: on, items: [], total: 0, totals: { assignments: 0, live: 0, noManager: 0, noPosition: 0, overAllocatedEmployees: 0, roleDiffersFromPosition: 0 } };
+    }
+    where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e'));
+    params.push(scopeToday(), scopeToday(), departmentIds);
+  }
 
   if (!blank(query.status)) {
     const statuses = String(query.status).split(',').map((s) => s.trim().toUpperCase()).filter((s) => ASSIGNMENT_STATUSES.includes(s));

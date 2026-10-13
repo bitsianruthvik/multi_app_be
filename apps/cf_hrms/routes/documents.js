@@ -31,8 +31,6 @@
  * a curl.
  */
 import { Router } from 'express';
-import { protect } from '../../../core/middleware/authmiddleware.js';
-import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { HrmsError } from '../lib/errors.js';
@@ -43,30 +41,18 @@ import {
 
 const router = Router();
 
-/**
- * Reading a generated document needs either side's view permission. Written once
- * so the five read routes cannot disagree about who may see a JD.
- */
-const READ_TAGS = [PERM.orgView, PERM.peopleView, PERM.documentsGenerate];
-const canRead = (req, res, next) => {
-  if (READ_TAGS.some((tag) => isPermitted(req.user, tag))) return next();
-  return res.status(403).json({
-    error: 'FORBIDDEN',
-    message: `Permission required: ${PERM.orgView} or ${PERM.peopleView}`,
-  });
-};
-const readGuard = [protect, canRead];
+// Reading a generated document: cf_hrms_documents_view. Making one: cf_hrms_documents_edit. (Spec §12.1.)
 
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 
 /** The vocabulary a Documents screen builds its pickers from. */
-router.get('/documents/meta', readGuard, handle(async () => ({
+router.get('/documents/meta', guard(PERM.documents.view), handle(async () => ({
   documentTypes: DOCUMENT_TYPES,
   formats: FORMATS,
   templateVersion: TEMPLATE_VERSION,
   snapshotVersion: SNAPSHOT_VERSION,
-  generatePermission: PERM.documentsGenerate,
-  readPermissions: [PERM.orgView, PERM.peopleView],
+  generatePermission: PERM.documents.edit,
+  readPermissions: [PERM.documents.view],
   transports: ['base64', 'binary'],
 })));
 
@@ -77,7 +63,7 @@ router.get('/documents/meta', readGuard, handle(async () => ({
  *
  * Declared before `/documents/:id` or Express reads "preview" as an id.
  */
-router.get('/documents/preview', readGuard, handle((req) => (
+router.get('/documents/preview', guard(PERM.documents.view), handle((req) => (
   previewDocument(pool, ctx(req), {
     type: req.query.type,
     roleId: req.query.roleId,
@@ -88,35 +74,35 @@ router.get('/documents/preview', readGuard, handle((req) => (
 )));
 
 /** Kept from the Phase 1 stub so a screen wired early still gets an answer. */
-router.get('/documents/status', readGuard, handle(async (req) => ({
+router.get('/documents/status', guard(PERM.documents.view), handle(async (req) => ({
   section: 'documents',
   implemented: true,
   phase: 7,
-  viewPermission: PERM.orgView,
-  managePermission: PERM.documentsGenerate,
+  viewPermission: PERM.documents.view,
+  managePermission: PERM.documents.edit,
   templateVersion: TEMPLATE_VERSION,
   ...(await listDocuments(pool, ctx(req).companyId, { limit: 25 })),
 })));
 
-router.get('/documents', readGuard, handle((req) => listDocuments(pool, ctx(req).companyId, req.query)));
+router.get('/documents', guard(PERM.documents.view), handle((req) => listDocuments(pool, ctx(req).companyId, req.query)));
 
 /**
  * Generate. One transaction: snapshot row, then the two renders, then the audit
  * row. The response carries the snapshot so a screen can show the document it
  * just made without a second request.
  */
-router.post('/documents/generate', guard(PERM.documentsGenerate), handle((req) => (
+router.post('/documents/generate', guard(PERM.documents.edit), handle((req) => (
   tx(req, (db, c) => generate(db, c, req.body ?? {}, req.id ?? null))
 )));
 
 /** The stored snapshot. This is what a preview of an EXISTING document reads. */
-router.get('/documents/:id', readGuard, handle((req) => getDocument(pool, ctx(req).companyId, intParam(req.params.id))));
+router.get('/documents/:id', guard(PERM.documents.view), handle((req) => getDocument(pool, ctx(req).companyId, intParam(req.params.id))));
 
 /**
  * The stored bytes. `transport=binary` for a real file response; the default
  * base64 JSON is what the frontend client can actually consume.
  */
-router.get('/documents/:id/download', readGuard, handle(async (req, res) => {
+router.get('/documents/:id/download', guard(PERM.documents.view), handle(async (req, res) => {
   const format = String(req.query.format ?? 'docx').toLowerCase();
   const transport = String(req.query.transport ?? 'base64').toLowerCase();
   if (!['base64', 'binary'].includes(transport)) {
