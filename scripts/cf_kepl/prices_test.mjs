@@ -205,7 +205,7 @@ try {
   ok('per tonne: 72000 × 0.6 t = 43200', o.lines.find((l) => l.lineNo === 900).amount === 43200 && o.lines.find((l) => l.lineNo === 900).billed === 0.6);
   o = await addOrderLine(db, c, so.id, { recordId: C, quantity: 1, rate: 5, rateBasis: 'tonne' });
   const lC = o.lines.find((l) => l.item?.id === C);
-  ok('per tonne on an item with no WEIGHT → amount null, and it says why', lC.amount === null && /no WEIGHT/.test(lC.amountNote ?? ''), JSON.stringify(lC));
+  ok('per tonne on an item with no WEIGHT → amount null, and it says why', lC.amount === null && /weight is not known yet/.test(lC.amountNote ?? ''), JSON.stringify(lC));
   ok('total covers what can be worked out: 4500 + 2400 + 43200 = 50100, not complete', o.total.amount === 50100 && o.total.complete === false && o.total.unmeasuredLines.includes(lC.lineNo), JSON.stringify(o.total));
   o = await updateOrderLine(db, c, lC.id, { rateBasis: 'unit' });
   ok('per unit instead → 5; total 50105, complete', o.total.amount === 50105 && o.total.complete === true, JSON.stringify(o.total));

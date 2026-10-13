@@ -108,7 +108,9 @@ export async function measuresOf(db, companyId, itemIds) {
 export function billedQuantity(basis, quantity, measure, unitUom = 'nos') {
   const q = Number(quantity);
   const out = (exact, uom) => ({ billed: round6(exact), exact, uom, note: null });
-  const none = (uom, what, per) => ({ billed: null, exact: null, uom, note: `It has no ${what} yet, so a price per ${per} cannot be turned into an amount.` });
+  const none = (uom, what, per) => ({ billed: null, exact: null, uom, note: what === 'WEIGHT'
+    ? `Its weight is not known yet, so a price per ${per} cannot be turned into an amount. A made-to-order item's weight is added up from its parts in Structure — some still need sizes.`
+    : `Its length is not known yet, so a price per ${per} cannot be turned into an amount. Enter its length in Structure.` });
   switch (basis ?? 'unit') {
     case 'kg': return measure?.weightKg != null ? out(q * measure.weightKg, 'kg') : none('kg', 'WEIGHT', 'kg');
     case 'tonne': return measure?.weightKg != null ? out((q * measure.weightKg) / 1000, 't') : none('t', 'WEIGHT', 'tonne');

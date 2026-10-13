@@ -633,7 +633,8 @@ export async function addOrderLine(db, c, orderId, input = {}) {
 
   if (lineNo == null) {
     const [[{ top }]] = await db.query('SELECT MAX(line_no) AS top FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [c.companyId, orderId]);
-    lineNo = (Number(top) || 0) + 10;
+    // 1, 2, 3 … (user, 2026-10-13: 10, 20, 30 read as a code, not as "the first line"). Older orders keep the numbers they have.
+    lineNo = (Number(top) || 0) + 1;
   }
   // Counts deleted lines too: a position is never given out twice.
   const [[{ top: topPos }]] = await db.query('SELECT MAX(position) AS top FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND design_id = ?', [c.companyId, orderId, rec.id]);
@@ -785,8 +786,11 @@ export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
       editable: !LOCKED.has(o.status) && !line.locked_at && !released,
       locked: !!line.locked_at,
       released,
-      // How each row is made still changes on a locked line until release (records.flowStillOpen).
+      // How each row is made is open until release — but once the line is locked (design frozen) ONLY a row
+      // with no flow may still be given one (records.flowStillOpen, init.sql §60): flowsFillOnly says so,
+      // and the screens show a row that has a flow as read-only.
       flowsEditable: !LOCKED.has(o.status) && !released,
+      flowsFillOnly: !LOCKED.has(o.status) && !released && !!line.locked_at,
     },
     ...tree,
   };
