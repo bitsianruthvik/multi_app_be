@@ -323,13 +323,25 @@ try {
 
     f = F.nestFile(name('X5'), PS, [F.place(fx, 'R', 100, 100), F.place(fx, 'X1', 1500, 100, 0, false, null)]);
     out = await one(f);
-    const amb = out.problemList.find((p) => p.code === 'PART_AMBIGUOUS');
-    ok('an unlabelled part that could be two cut plates: the choices are listed', out.canSave === false && !!amb && amb.message.includes(f.filename) && amb.message.includes(psCode) && amb.message.includes(fx.code('X1')) && amb.message.includes(fx.code('X2')) && amb.choices.length === 2, J(out.problems));
-    if (DOC) doc.ambiguous = amb;
-    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [amb.partId]: fx.cut.X2 } } });
-    ok('…settled by `choices`', out.canSave === true && out.problems.length === 0 && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.X2 && x.qty === 1) && out.files[0].placements.find((p) => p.partId === amb.partId).by === 'choice', J(out.problems));
-    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [amb.partId]: fx.code('R') } } });
+    // IDENTICAL CUT PLATES, NO LABEL: shared out by the quantity each still needs (2026-10-13) — no question asked.
+    const sharedOne = out.files[0].placements.find((p) => p.by === 'quantity');
+    ok('an unlabelled part that could be two IDENTICAL cut plates is shared out by quantity, not asked about', out.canSave === true && !out.problemList.some((p) => p.code === 'PART_AMBIGUOUS') && sharedOne?.cutPlateId === fx.cut.X1 && sharedOne.alternatives?.length === 1 && sharedOne.alternatives[0].cutPlateId === fx.cut.X2
+      && out.files[0].notes.some((n) => /shared out/.test(n) && n.includes(fx.code('X1')) && n.includes(fx.code('X2'))), J([out.problems, out.files[0].notes, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
+    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [sharedOne.partId]: fx.cut.X2 } } });
+    ok('…the user choosing by hand still wins', out.canSave === true && out.problems.length === 0 && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.X2 && x.qty === 1) && out.files[0].placements.find((p) => p.partId === sharedOne.partId).by === 'choice', J(out.problems));
+    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [sharedOne.partId]: fx.code('R') } } });
     ok('…and a choice it cannot be is refused', has(out, 'CHOICE_INVALID', f.filename, fx.code('X1')), J(out.problems));
+    // A labelled twin is counted first: the unlabelled one gets what is left.
+    f = F.nestFile(name('X5b'), PS, [F.place(fx, 'X1', 100, 100), F.place(fx, 'X1', 1500, 100, 0, false, null)]);
+    out = await one(f);
+    ok('a labelled twin is counted first: the unlabelled part is shared out to the OTHER cut plate', out.canSave === true && out.files[0].placements.find((p) => p.by === 'label')?.cutPlateId === fx.cut.X1 && out.files[0].placements.find((p) => p.by === 'quantity')?.cutPlateId === fx.cut.X2, J([out.problems, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
+    // One more than the line needs of both together: sharing out would over-fill, so THAT part is asked about.
+    f = F.nestFile(name('X5c'), PS, [F.place(fx, 'X1', 100, 100, 0, false, null), F.place(fx, 'X1', 600, 100, 0, false, null), F.place(fx, 'X1', 1500, 100, 0, false, null)]);
+    out = await one(f);
+    const amb = out.problemList.find((p) => p.code === 'PART_AMBIGUOUS');
+    ok('one part more than the line needs of both: two are shared out (one each), the third is PART_AMBIGUOUS with its choices and says why', out.canSave === false && out.problemList.filter((p) => p.code === 'PART_AMBIGUOUS').length === 1 && !!amb && amb.message.includes(f.filename) && amb.message.includes(psCode) && amb.message.includes(fx.code('X1')) && amb.message.includes(fx.code('X2')) && amb.choices.length === 2 && /needs no more/.test(amb.message)
+      && out.files[0].placements.filter((p) => p.by === 'quantity').map((p) => p.cutPlateId).sort().join() === [fx.cut.X1, fx.cut.X2].sort().join(), J([out.problems, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
+    if (DOC) doc.ambiguous = amb;
 
     f = F.nestFile(name('X6'), PS, [F.place(fx, 'R', 100, 100), F.place(fx, 'R', 100, 600, 0, false, fx.code('G'))]);
     out = await one(f);
@@ -471,7 +483,9 @@ try {
      * never worse than the row packer (plates, then steel), every plate legal on its outlines,
      * every piece the line needs placed exactly once. The row packer itself is still there
      * (`shapes: false`) and still gives the plan it always gave — the golden snapshot, less the
-     * `budget` block (the budgets changed, the layout did not).
+     * `budget` block (the budgets changed, the layout did not) and less what was ADDED to the answer
+     * on 2026-10-13 to say where a shape comes from (`shapeFrom`, `shapeNote`, the proposal's `notes`):
+     * words about the layout, not the layout.
      */
     const rowsOnly = await N.planNesting(conn, COMPANY, fx.lineId, { ...input, shapes: false });
     // NEST_V2_GOLDEN=write regenerates the snapshot — ONLY for a deliberate change of the row packer's input
@@ -479,8 +493,9 @@ try {
     if (process.env.NEST_V2_GOLDEN === 'write') fs.writeFileSync(path.join(BE, 'scripts/cf_kepl/golden/nest_v2_plan_golden.json'), `${JSON.stringify(F.normalisePlan(rowsOnly, fx), null, 1)}
 `);
     const golden = JSON.parse(fs.readFileSync(path.join(BE, 'scripts/cf_kepl/golden/nest_v2_plan_golden.json'), 'utf8'));
-    const noBudget = (plan) => { const q = JSON.parse(JSON.stringify(plan)); delete q.budget; return JSON.stringify(q); };
+    const noBudget = (plan) => { const q = JSON.parse(JSON.stringify(plan, (k, v) => (k === 'shapeFrom' || k === 'shapeNote' ? undefined : v))); delete q.budget; delete q.notes; return JSON.stringify(q); };
     ok('the row packer alone (shapes: false) still lays the line out exactly as the golden snapshot has it', noBudget(F.normalisePlan(rowsOnly, fx)) === noBudget(golden));
+    ok('…and every cut plate and every placed piece of a proposal says where its shape comes from', rowsOnly.groups.every((g) => g.cutPlates.every((cp) => ['drawing', 'dimensions'].includes(cp.shapeFrom) && 'shapeNote' in cp) && g.nests.every((n) => n.pieces.every((p) => ['drawing', 'dimensions'].includes(p.shapeFrom)))) && Array.isArray(rowsOnly.notes));
     ok(`no drawings, the new packer: never worse than the row packer — ${without.totals.plates} plates / ${(without.totals.areaBought / 1e6).toFixed(3)} m² against ${rowsOnly.totals.plates} / ${(rowsOnly.totals.areaBought / 1e6).toFixed(3)}`,
       without.totals.unplaced === 0 && (without.totals.plates < rowsOnly.totals.plates || (without.totals.plates === rowsOnly.totals.plates && without.totals.areaBought <= rowsOnly.totals.areaBought + 1e-6)) && without.totals.wastePct <= rowsOnly.totals.wastePct + 1e-6);
     let illegal = 0;
@@ -499,6 +514,12 @@ try {
     ok('…so, measured on the same true parts, no more waste', withDrawings.totals.weightKg <= without.totals.weightKg + 1e-6 && withDrawings.totals.partsKg < without.totals.partsKg);
     const gA = withDrawings.groups.find((g) => g.shapes);
     ok('the steel with drawings in it was a shape job, and says which layout it took', !!gA && ['shape', 'rectangles'].includes(gA.shapes.taken) && gA.shapes.drawings === 5 && gA.shapes.rectangles.plates >= gA.nests.length, J(gA?.shapes));
+    // THE DRAWING DECIDES (2026-10-13): a steel with a drawing that is not a rectangle takes the true-shape layout — also on a tie.
+    ok('a steel with a drawing that is not a rectangle: rule "drawings" — the true-shape layout is taken (free layouts), and nothing had to be explained', gA.shapes.rule === 'drawings' && gA.shapes.realDrawings === 3 && gA.shapes.taken === 'shape' && gA.nests.every((n) => n.layout === 'free') && withDrawings.notes.length === 0, J([gA.shapes, withDrawings.notes]));
+    ok('…a steel with no such drawing keeps rule "better" (the true-shape layout only when it beats the rows)', without.groups.filter((g) => g.shapes).every((g) => g.shapes.rule === 'better' && g.shapes.realDrawings === 0) && withDrawings.groups.filter((g) => g.shapes && g !== gA).every((g) => g.shapes.rule === 'better'), J(withDrawings.groups.map((g) => g.shapes?.rule)));
+    ok('…and never at a cost: no more plates and no more steel than its own row layout', gA.nests.length <= gA.shapes.rectangles.plates && gA.shapes.shape.areaBought <= gA.shapes.rectangles.areaBought + 1e-6, J(gA.shapes));
+    ok('every cut plate of the proposal says where its shape comes from: the five drawn ones "drawing", the rest "dimensions"', withDrawings.groups.flatMap((g) => g.cutPlates).every((cp) => cp.shapeFrom === (['G', 'A', 'S', 'P', 'F'].some((k) => fx.cut[k] === cp.id) ? 'drawing' : 'dimensions') && cp.shapeNote === null)
+      && withDrawings.groups.flatMap((g) => g.nests).flatMap((n) => n.pieces).every((p) => p.shapeFrom === (['G', 'A', 'S', 'P', 'F'].some((k) => fx.cut[k] === p.cutPlateId) ? 'drawing' : 'dimensions')), J(withDrawings.groups.flatMap((g) => g.cutPlates).map((cp) => [cp.code, cp.shapeFrom])));
     const drawnPiece = withDrawings.groups.flatMap((g) => g.nests).flatMap((n) => n.pieces).find((p) => p.cutPlateId === fx.cut.G);
     ok('a drawn part carries its true steel and its outline on the plate', drawnPiece.area < 520 * 320 && drawnPiece.rings?.outline?.length === 4 && Number.isFinite(drawnPiece.rotationDeg), J(drawnPiece));
     let bad = 0;
@@ -513,7 +534,50 @@ try {
     const acc = await N.acceptNesting(conn, c, fx.lineId, withDrawings);
     ok('the plan is accepted as proposed', acc.lots === withDrawings.totals.plates && acc.pieces === withDrawings.totals.pieces);
     const saved = await N.getNesting(conn, COMPANY, fx.lineId);
+    ok('the saved plan (GET …/nesting) says shapeFrom on every cut plate and every placed piece', saved.groups.flatMap((g) => g.cutPlates).every((cp) => cp.shapeFrom === (['G', 'A', 'S', 'P', 'F'].some((k) => fx.cut[k] === cp.id) ? 'drawing' : 'dimensions') && 'shapeNote' in cp)
+      && saved.groups.flatMap((g) => g.nests).flatMap((n) => n.pieces).every((p) => p.shapeFrom === (['G', 'A', 'S', 'P', 'F'].some((k) => fx.cut[k] === p.cutPlateId) ? 'drawing' : 'dimensions')), J(saved.groups.flatMap((g) => g.cutPlates).map((cp) => [cp.code, cp.shapeFrom])));
     ok('the saved plan reads back with the same steel bought and the same true parts', Math.abs(saved.totals.areaBought - withDrawings.totals.areaBought) < 1e-3 && Math.abs(saved.totals.partsKg - withDrawings.totals.partsKg) < 0.01 && saved.drift.filter((d) => !d.manual).length === 0, J([saved.totals.partsKg, withDrawings.totals.partsKg]));
+
+    // F.4 — nests.csv: the parts' area is their TRUE steel, not the rectangles round them.
+    {
+      const JSZip = (await import('jszip')).default;
+      const zip = await JSZip.loadAsync((await CNC.lineCncZip(conn, COMPANY, fx.lineId)).buffer);
+      const csv = (await zip.file('nests.csv').async('string')).replace(/^\uFEFF/, '').trim().split(/\r\n/).map((r) => r.split(','));
+      const col = csv[0].indexOf('Parts area m2');
+      const listed = csv.slice(1).reduce((a, r) => a + Number(r[col]), 0);
+      const truly = saved.groups.flatMap((g) => g.nests).flatMap((n) => n.pieces).reduce((a, p) => a + (p.area ?? p.length * p.width), 0) / 1e6;
+      const boxes = saved.groups.flatMap((g) => g.nests).flatMap((n) => n.pieces).reduce((a, p) => a + p.length * p.width, 0) / 1e6;
+      ok(`nests.csv lists the parts' true area (${listed.toFixed(3)} m², the outlines) — not the rectangles round them (${boxes.toFixed(3)} m²)`, col >= 0 && Math.abs(listed - truly) <= 0.001 * csv.length && listed < boxes - 0.05, J([listed, truly, boxes]));
+    }
+    // F.3 — a drawing removed (or added) AFTER the plates were saved: the plates say they are stale, and what they show is measured on today's shapes.
+    {
+      const before = saved.groups.flatMap((g) => g.nests);
+      ok('a plate saved with today\'s drawings is not stale', before.every((n) => n.stale === undefined));
+      await F.removeDrawings(conn, fx);
+      const gone = await N.getNesting(conn, COMPANY, fx.lineId);
+      const nowNests = gone.groups.flatMap((g) => g.nests);
+      const hadDrawn = (n) => n.pieces.some((p) => ['G', 'A', 'S', 'P', 'F'].some((k) => fx.cut[k] === p.cutPlateId));
+      const stale = nowNests.filter((n) => n.stale === true);
+      ok('the drawings are deleted after nesting: every plate that held a drawn part says stale, with the reason in words; the others do not', stale.length > 0 && nowNests.every((n) => (n.stale === true) === hadDrawn(before.find((b) => b.id === n.id))) && stale.every((n) => /drawing was added, replaced or removed after this plate was nested/.test(n.staleReason)), J(nowNests.map((n) => [n.lotNo, n.stale])));
+      const g1 = stale.flatMap((n) => n.pieces).find((p) => p.cutPlateId === fx.cut.G);
+      ok('…and it is measured on the shapes as they are now: the part is its rectangle again (steel, shapeFrom)', g1.area === 520 * 320 && g1.shapeFrom === 'dimensions' && stale.every((n) => Math.abs(n.usedArea - n.pieces.reduce((a, p) => a + (p.area ?? p.length * p.width), 0)) < 0.01), J([g1.area, g1.shapeFrom]));
+      ok('…a plate laid out by true shape whose drawings are gone no longer fits its own layout (the rectangles overlap): it says so — staleInvalid, "Nest the line again" — or it adds up', stale.some((n) => n.staleInvalid === true && /Nest the line again/.test(n.staleReason)) && stale.every((n) => n.staleInvalid === true || identityGap([n]) <= 1), J(stale.map((n) => [n.lotNo, n.staleInvalid, identityGap([n])])));
+      ok('…the parts weigh more than they did with their drawings (the saved figure would have been too light)', gone.totals.partsKg > saved.totals.partsKg + 1, J([gone.totals.partsKg, saved.totals.partsKg]));
+      await F.addDrawings(conn, fx);
+      const back = await N.getNesting(conn, COMPANY, fx.lineId);
+      ok('with the drawings back the same plates are not stale any more — nothing was written by looking', back.groups.flatMap((g) => g.nests).every((n) => n.stale === undefined) && Math.abs(back.totals.partsKg - saved.totals.partsKg) < 0.01);
+      // The usual order: the line is nested as rectangles FIRST, the drawings arrive afterwards.
+      await F.removeDrawings(conn, fx);
+      const rects = await N.planNesting(conn, COMPANY, fx.lineId, input);
+      await N.acceptNesting(conn, c, fx.lineId, rects);
+      const asRects = await N.getNesting(conn, COMPANY, fx.lineId);
+      await F.addDrawings(conn, fx);
+      const late = await N.getNesting(conn, COMPANY, fx.lineId);
+      const lateStale = late.groups.flatMap((g) => g.nests).filter((n) => n.stale);
+      const lg = lateStale.flatMap((n) => n.pieces).find((p) => p.cutPlateId === fx.cut.G);
+      ok('nested as rectangles, drawings uploaded afterwards: the plates holding those parts are stale but still LEGAL (a drawing lies inside its rectangle), and add up on the true shapes', asRects.groups.flatMap((g) => g.nests).every((n) => !n.stale) && lateStale.length > 0 && lateStale.every((n) => !n.staleInvalid) && identityGap(lateStale) <= 1 && lg.area < 520 * 320 && lg.shapeFrom === 'drawing' && late.totals.partsKg < asRects.totals.partsKg - 1, J([lateStale.map((n) => [n.lotNo, n.staleInvalid, identityGap([n])]), lg?.area, late.totals.partsKg, asRects.totals.partsKg]));
+      await N.acceptNesting(conn, c, fx.lineId, withDrawings);
+    }
 
     // A FREE layout, made by hand from that plan: two gussets taken onto a plate of their own, one
     // of them turned 30° and flipped.
@@ -819,6 +883,137 @@ try {
     await U.deleteNestLot(conn, c, fx.lineId, (await liveLots(fx))[0].id);
     let stale = null; try { await U._test.applyChanges(conn, c, fx.lineId, ctx, { removeIds: [ctx.saved[1].id], keep: ctx.saved.filter((l) => l.id !== ctx.saved[1].id) }); } catch (e) { stale = e; }
     ok('a save worked out against plates that have changed since is refused (CHANGED_MEANWHILE, 409), nothing written', stale?.code === 'CHANGED_MEANWHILE' && stale.status === 409 && /changed while/.test(stale.message) && (await liveLots(fx)).length === 2, J([stale?.code, stale?.message]));
+  }
+
+  /* ───────────── 20. three things real files do (nest-reference-files.mjs, 2026-10-13) ───────────── */
+  if (want(20)) {
+    section('20. Part names that are file names, marking on an ETCHING layer, the grade written in full');
+    await clearLine(fx);
+    const PS = { length: 3000, width: 1500 };
+    // The two identical 350 × 350 pieces, named as a nesting program names a part: after its file.
+    let f = F.nestFile(`${fx.tag}-FN_${F.T}mm_3000x1500.dxf`, PS, [F.place(fx, 'X1', 100, 100, 0, false, `${fx.code('X1')}_14THK_1NOS`), F.place(fx, 'X2', 600, 100, 0, false, `${fx.code('X2')}.dxf`), F.place(fx, 'R', 100, 600, 0, false, `${fx.code('R')}_14THK_5NOS`)]);
+    let out = await upload(fx, [f]);
+    ok('CODE_14THK_1NOS and CODE.dxf are read as the code: the identical pieces are told apart by label, nothing is ambiguous', out.problems.length === 0 && out.files[0].placed === 3 && out.files[0].placements.every((p) => p.by === 'label')
+      && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.X1 && x.qty === 1) && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.X2 && x.qty === 1), J([out.problems, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
+    f = F.nestFile(`${fx.tag}-FN2_${F.T}mm_3000x1500.dxf`, PS, [F.place(fx, 'X1', 100, 100, 0, false, 'ZZ-77_14THK'), F.place(fx, 'X2', 600, 100, 0, false, 'ZZ-78_14THK')]);
+    out = await upload(fx, [f]);
+    ok('…a name that starts with no code of ours is still not a label: the identical pieces are shared out by quantity, none by label', out.files[0].placements.length === 2 && out.files[0].placements.every((p) => p.by === 'quantity') && !out.problemList.some((p) => p.code === 'PART_AMBIGUOUS'), J([out.problems, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
+    // Marking geometry on a layer called ETCHING: a closed outline inside a part that has no drawing.
+    f = F.nestFile(`${fx.tag}-ET_${F.T}mm_3000x1500.dxf`, PS, [F.place(fx, 'R', 100, 100)]);
+    const etch = ['0', 'LWPOLYLINE', '8', 'ETCHING', '90', '4', '70', '1', '10', '200', '20', '300', '10', '240', '20', '300', '10', '240', '20', '370', '10', '200', '20', '370'].join('\r\n');
+    const text = f.text.replace(/0\r\nENDSEC\r\n0\r\nEOF/, `${etch}\r\n0\r\nENDSEC\r\n0\r\nEOF`);
+    out = await upload(fx, [{ filename: f.filename, file: Buffer.from(text, 'latin1').toString('base64') }]);
+    ok('a closed marking outline on layer ETCHING is not a cut-out of the part it is scribed on', text !== f.text && out.problems.length === 0 && out.files[0].parts === 1 && out.files[0].placements[0].rings.cutouts.length === 0 && out.files[0].placements[0].shapeFrom === 'dimensions', J([out.problems, out.files[0].notes]));
+    // The fixture's grades are its own names, so the rule is checked on the function the upload uses.
+    ok('the grade in full is the catalog\'s grade: IS 2062 E350 BR, E350BR and E350 agree; E250, E350A / E350C and E3500 do not; "IS 2062" alone disagrees with nothing',
+      U.sameGrade('IS 2062 E350 BR', 'E350') && U.sameGrade('E350BR', 'E350') && U.sameGrade('E350', 'e350 br') && U.sameGrade('E350', 'E350') && U.sameGrade('IS 2062', 'E350')
+      && !U.sameGrade('E250', 'E350') && !U.sameGrade('E350A', 'E350C') && !U.sameGrade('E3500', 'E350') && !U.sameGrade('IS 2062 E250 BR', 'E350'));
+  }
+  /* ───────────── 21. nothing lost quietly; the plate; marking; kerf; identical pieces; where a shape comes from (2026-10-13) ───────────── */
+  if (want(21)) {
+    section('21. Nothing is lost quietly: open outlines, two plates, shapes beside the plate; a frame, inches, marking, kerf compensation; shapeFrom');
+    await clearLine(fx);
+    const PS = { length: 3000, width: 1500 };
+    const psCode = fx.plateCode('PS');
+    const LN = (layer, p, q, colour = null) => ['0', 'LINE', '8', layer, ...(colour != null ? ['62', String(colour)] : []), '10', String(p[0]), '20', String(p[1]), '11', String(q[0]), '21', String(q[1])];
+    const PL = (layer, pts) => ['0', 'LWPOLYLINE', '8', layer, '90', String(pts.length), '70', '1', ...pts.flatMap(([x, y]) => ['10', String(x), '20', String(y)])];
+    const TX = (p, s) => ['0', 'TEXT', '8', 'TEXT', '10', String(p[0]), '20', String(p[1]), '40', '30', '1', s];
+    const rect = (x, y, l, w) => [[x, y], [x + l, y], [x + l, y + w], [x, y + w]];
+    let seq = 0;
+    /** The base file — one R (1200 × 400, no drawing) at (100, 100) on a drawn plate — with more entities put into it. */
+    const withEnts = (ents, parts = [F.place(fx, 'R', 100, 100)], opts = {}) => {
+      const f = F.nestFile(`${fx.tag}-Z${++seq}_${F.T}mm_3000x1500.dxf`, PS, parts, opts);
+      const text = f.text.replace(/0\r\nENDSEC\r\n0\r\nEOF/, `${ents.map((e) => e.join('\r\n')).join('\r\n')}${ents.length ? '\r\n' : ''}0\r\nENDSEC\r\n0\r\nEOF`);
+      return { filename: f.filename, file: Buffer.from(text, 'latin1').toString('base64') };
+    };
+    const codesOf = (list) => list.map((x) => x.code);
+    const tabbed = (gap) => [LN('PART', [100, 700], [250 - gap / 2, 700]), LN('PART', [250 + gap / 2, 700], [400, 700]), LN('PART', [400, 700], [400, 880]), LN('PART', [400, 880], [100, 880]), LN('PART', [100, 880], [100, 700])];
+
+    // ---- A. no silent loss
+    let f = withEnts(tabbed(1.5));
+    let out = await upload(fx, [f]);
+    ok('a 1.5 mm micro-joint in an outline is closed: the part is read (2 of 2), status ok, and a note says a gap was closed', out.canSave === true && out.files[0].status === 'ok' && out.files[0].parts === 2 && out.files[0].placed === 2 && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.H) && out.files[0].notes.some((n) => /1 gap in an outline closed \(1\.5 mm/.test(n)), J([out.problems, out.files[0].notes, out.files[0].counts]));
+    f = withEnts(tabbed(4.2));
+    out = await upload(fx, [f]);
+    const open = out.problemList.find((p) => p.code === 'OPEN_CONTOUR');
+    ok('a 4.2 mm gap is NOT closed and NOT dropped: OPEN_CONTOUR blocks, naming the file, the gap and where it is', out.canSave === false && out.files[0].status === 'error' && !!open && open.message.startsWith(`${f.filename}: `) && /about 300 x 180 at \(100, 700\) is not a closed outline: its ends are 4\.2 mm apart at \(250, 700\)\. Close it in the nesting program and export again\./.test(open.message) && open.gapMm === 4.2, J(out.problems));
+    f = withEnts([PL('SHEET', rect(3500, 0, 3000, 1500)), PL('PART', rect(3600, 100, 1200, 400))]);
+    out = await upload(fx, [f]);
+    ok('two plates in one file: MULTIPLE_PLATES blocks and says how many — the first is not read with the second dropped', out.canSave === false && out.problemList.some((p) => p.code === 'MULTIPLE_PLATES' && p.plates === 2 && p.message.includes(f.filename) && /holds 2 plates/.test(p.message) && /One file is one plate/.test(p.message)), J(out.problems));
+    f = withEnts([PL('PART', rect(3200, 100, 300, 180))]);
+    out = await upload(fx, [f]);
+    const beside = out.warningList.find((w) => w.code === 'SHAPE_IGNORED');
+    ok('a cut plate drawn BESIDE the plate is a warning that names it and needs force — not a note', out.canSave === true && out.needsForce === true && out.files[0].status === 'warning' && !!beside && beside.needsForce === true && beside.message.includes(fx.code('H')) && /OUTSIDE the plate/.test(beside.message) && out.files[0].placed === 1, J([out.warnings, out.files[0].notes]));
+    const unforced = await upload(fx, [f], { dryRun: false });
+    ok('…a save without force writes nothing', unforced.applied === false && /Not saved/.test(unforced.message) && (await liveLots(fx)).length === 0, unforced.message);
+    f = withEnts([PL('PART', rect(3200, 100, 333, 222))]);
+    out = await upload(fx, [f]);
+    ok('a closed shape beside the plate that is nobody\'s is a SHAPE_IGNORED warning too', out.warningList.some((w) => w.code === 'SHAPE_IGNORED' && /1 closed shape drawn outside the plate is not read as a part \(the first 333 × 222 at \(3200, 100\)\)/.test(w.message)), J(out.warnings));
+    f = withEnts([LN('PART', [100, 1080], [100, 700]), LN('PART', [100, 700], [1300, 700]), LN('PART', [1300, 700], [1300, 1080])]);
+    out = await upload(fx, [f]);
+    ok('three sides of a part-sized shape: a SHAPE_IGNORED warning that needs force', out.needsForce === true && out.warningList.some((w) => w.code === 'SHAPE_IGNORED' && /does not close into a shape/.test(w.message)), J(out.warnings));
+    f = withEnts([['0', 'HATCH', '8', 'PART', '2', 'SOLID', '70', '1']]);
+    out = await upload(fx, [f]);
+    ok('a HATCH (a filled area the reader does not read) is a SHAPE_IGNORED warning', out.warningList.some((w) => w.code === 'SHAPE_IGNORED' && /1 HATCH item/.test(w.message)), J(out.warnings));
+
+    // ---- B. the plate
+    f = withEnts([PL('0', rect(-300, -700, 3600, 2500)), PL('0', rect(2300, -650, 900, 300))], [F.place(fx, 'R', 100, 100)], { options: { plateLayer: '0', partLayer: '0' } });
+    f.filename = `${fx.tag}-frame.dxf`;
+    out = await upload(fx, [f]);
+    ok('a drawing frame on layer 0 round the plate: the plate is the catalog-size rectangle inside it, the title box is not a part, and a note says so', out.canSave === true && out.files[0].status === 'ok' && out.files[0].plate.code === psCode && out.files[0].plate.resolvedBy === 'size' && out.files[0].parts === 1 && out.files[0].notes.some((n) => /A frame \(3600 x 2500\) is drawn round the plate/.test(n)), J([out.problems, out.warnings, out.files[0].notes]));
+    f = withEnts([TX([1400, 300], '25 mm'), TX([1500, 1600], 'THK 99')]);
+    out = await upload(fx, [f]);
+    ok('a loose "25 mm" is not a thickness, and a title "THK 99" loses to the file name: the plate is found, with a note that they disagree', out.canSave === true && out.files[0].plate.code === psCode && out.files[0].notes.some((n) => /say 99 mm thick and the file name says/.test(n)), J([out.problems, out.files[0].notes]));
+    f = withEnts([...rect(0, 0, 3000, 1500).map((p, i, all) => LN('0', p, all[(i + 1) % 4])), LN('REMNANT', [2000, 0], [2000, 1500])], [F.place(fx, 'R', 100, 100)], { style: 'segments' });
+    out = await upload(fx, [{ filename: f.filename, file: f.file }]);
+    ok('a crop line on a REMNANT layer across a plate drawn as loose lines does not split it', out.files[0].plate?.code === psCode && out.files[0].plate.drawn === true && out.files[0].placed === 1 && !out.problemList.some((p) => p.code === 'PLATE_NOT_FOUND'), J([out.problems, out.files[0].notes, out.files[0].plate]));
+    f = F.nestFile(`${fx.tag}-inch.dxf`, PS, [F.place(fx, 'R', 100, 100), F.place(fx, 'G', 100, 600, 17), F.place(fx, 'H', 1500, 100, 0, false, null)], { options: { units: 'in', insUnits: null } });
+    out = await upload(fx, [{ filename: f.filename, file: f.file }]);
+    ok('inches with no units in the header and nothing in the name: read as inches because every part is then a cut plate — and a note says so', out.canSave === true && out.files[0].units === 'in' && out.files[0].plate.code === psCode && out.files[0].placed === 3 && out.files[0].placements.find((p) => p.cutPlateId === fx.cut.R)?.length === 1200 && out.files[0].notes.some((n) => /read as drawn in inches/.test(n)), J([out.problems, out.files[0].units, out.files[0].notes]));
+
+    // ---- C. marking
+    f = withEnts([PL('LAYER_3', rect(200, 350, 40, 70)), PL('LAYER_3', rect(260, 350, 40, 70)), LN('LAYER_3', [700, 100], [700, 500])]);
+    out = await upload(fx, [f]);
+    ok('closed letters on the layer of a marking line inside the part: marking, not cut-outs — status ok, the part is its rectangle', out.files[0].status === 'ok' && out.files[0].placements[0].rings.cutouts.length === 0 && out.files[0].placements[0].shapeFrom === 'dimensions' && out.files[0].placements[0].area === 480000 && out.files[0].notes.some((n) => /read as marking/.test(n)), J([out.warnings, out.files[0].notes]));
+    f = withEnts([PL('LAYER_3', rect(200, 350, 40, 70)), PL('LAYER_3', rect(260, 350, 40, 70))]);
+    out = await upload(fx, [f]);
+    const unsure = out.warningList.find((w) => w.code === 'MARKING_UNSURE');
+    ok('the same letters with nothing to give them away, on a part with no drawing: NOT stored as cut-outs, and MARKING_UNSURE needs force', out.files[0].status === 'warning' && !!unsure && unsure.needsForce === true && unsure.message.includes(fx.code('R')) && /2 closed shapes inside it on layer LAYER_3/.test(unsure.message) && /NOT stored as cut-outs/.test(unsure.message) && out.files[0].placements[0].rings.cutouts.length === 0 && out.files[0].placements[0].shapeFrom === 'dimensions', J([out.warnings, out.files[0].placements[0].rings.cutouts.length]));
+    f = withEnts([PL('LAYER_3', rect(300, 700, 40, 70))], [F.place(fx, 'R', 100, 100), F.place(fx, 'G', 100, 600)]);
+    out = await upload(fx, [f]);
+    ok('…on a part that HAS a drawing, the drawing decides: no such opening in it, so it is marking — a note, no warning', out.files[0].status === 'ok' && out.files[0].placed === 2 && out.files[0].placements.find((p) => p.cutPlateId === fx.cut.G).shapeFrom === 'drawing' && out.files[0].notes.some((n) => /not in the part's drawing: read as marking/.test(n)), J([out.problems, out.warnings, out.files[0].notes]));
+    f = withEnts([PL('PART', rect(200, 350, 40, 70))]);
+    out = await upload(fx, [f]);
+    const fromFile = out.warningList.find((w) => w.code === 'CUTOUTS_FROM_FILE');
+    ok('an opening on the cut layer itself in a part with no drawing: kept as a cut-out from the nesting file, with CUTOUTS_FROM_FILE (needs force)', !!fromFile && fromFile.needsForce === true && fromFile.message.includes(fx.code('R')) && out.files[0].placements[0].shapeFrom === 'nesting file' && out.files[0].placements[0].rings.cutouts.length === 1, J([out.warnings, out.files[0].placements[0]]));
+    f = withEnts([...rect(100, 700, 1200, 400).map((p, i, all) => LN('PART', p, all[(i + 1) % 4], 1)), LN('PART', [700, 700], [700, 1100], 2), TX([400, 900], fx.code('R'))]);
+    out = await upload(fx, [f]);
+    ok('a line of another COLOUR from edge to edge of a part drawn as loose lines: read as marking — the part is one 1200 × 400, and a note says why', out.files[0].status === 'ok' && out.files[0].parts === 2 && out.files[0].placed === 2 && out.files[0].placements.every((p) => p.cutPlateId === fx.cut.R && p.length === 1200) && out.files[0].notes.some((n) => /colour 2 on layer PART run from edge to edge/.test(n)), J([out.problems, out.files[0].notes]));
+
+    // ---- D. kerf compensation
+    const grown = (sfx, x, y) => ({ ...F.place(fx, sfx, x - 1.5, y - 1.5), shape: D.rectShape(fx.parts[sfx].length + 3, fx.parts[sfx].width + 3) });
+    f = F.nestFile(`${fx.tag}-KERF_${F.T}mm_3000x1500.dxf`, PS, [grown('R', 100, 100), grown('R', 100, 600), grown('H', 1500, 100)]);
+    out = await upload(fx, [f]);
+    const kr = out.files[0].placements.find((p) => p.cutPlateId === fx.cut.R);
+    ok('every part drawn 1.5 mm oversize all round: matched to the nominal size, stored there, ONE note, no warning', out.canSave === true && out.files[0].status === 'ok' && out.files[0].kerfOffsetMm === 1.5 && out.files[0].placed === 3 && kr.x === 100 && kr.y === 100 && kr.length === 1200 && kr.width === 400 && out.files[0].notes.filter((n) => /1\.5 mm oversize on every side — kerf compensation/.test(n)).length === 1 && out.warnings.length === 0, J([out.problems, out.warnings, out.files[0].notes, kr]));
+    f = F.nestFile(`${fx.tag}-KERF2_${F.T}mm_3000x1500.dxf`, PS, [grown('R', 100, 100), F.place(fx, 'R', 100, 600), grown('H', 1500, 100)]);
+    out = await upload(fx, [f]);
+    ok('…but a file in which one part is NOT oversize is not kerf-compensated: the oversize parts are refused at the ordinary tolerance', out.canSave === false && !out.files[0].kerfOffsetMm && out.problemList.filter((p) => p.code === 'PART_LABEL_MISMATCH').length === 2, J(out.problems));
+
+    // ---- E. identical cut plates, shared out over the whole request
+    const lone = (n) => F.nestFile(`${fx.tag}-TW${n}_${F.T}mm_3000x1500.dxf`, PS, [F.place(fx, 'X1', 100, 100, 0, false, null), F.place(fx, 'R', 100, 500 + 50 * n)]);
+    out = await upload(fx, [lone(1), lone(2), lone(3)]);
+    ok('three files, each with one unlabelled 350 × 350 that could be X1 or X2: the first two share them out (X1, then X2), the third is PART_AMBIGUOUS', out.files[0].placements.find((p) => p.by === 'quantity')?.cutPlateId === fx.cut.X1 && out.files[1].placements.find((p) => p.by === 'quantity')?.cutPlateId === fx.cut.X2
+      && out.files[2].errors.some((e) => e.code === 'PART_AMBIGUOUS' && e.choices.length === 2) && out.files[0].status === 'ok' && out.files[1].status === 'ok', J(out.files.map((x) => [x.status, x.placements.map((p) => [p.cutPlateCode, p.by]), codesOf(x.errors)])));
+    const saved = await upload(fx, [lone(1)], { dryRun: false });
+    out = await upload(fx, [lone(2), lone(3)]);
+    ok('…and what an earlier upload already nested counts: after file 1 is SAVED (X1), file 2 gets X2 and file 3 is asked about', saved.applied === true && out.files[0].placements.find((p) => p.by === 'quantity')?.cutPlateId === fx.cut.X2 && out.files[1].errors.some((e) => e.code === 'PART_AMBIGUOUS'), J(out.files.map((x) => [x.status, x.placements.map((p) => [p.cutPlateCode, p.by]), codesOf(x.errors)])));
+    await clearLine(fx);
+
+    // ---- G. where a shape comes from
+    f = F.nestFile(`${fx.tag}-SF_${F.T}mm_3000x1500.dxf`, PS, [F.place(fx, 'R', 100, 100), F.place(fx, 'G', 100, 600), F.place(fx, 'F', 1500, 100)]);
+    out = await upload(fx, [f]);
+    ok('every placement of the preview says shapeFrom: "drawing" for a drawn cut plate, "dimensions" for a rectangle', out.files[0].placements.length === 3 && out.files[0].placements.every((p) => p.shapeFrom === (p.cutPlateId === fx.cut.R ? 'dimensions' : 'drawing')), J(out.files[0].placements.map((p) => [p.cutPlateCode, p.shapeFrom])));
   }
 } catch (err) {
   failed += 1;

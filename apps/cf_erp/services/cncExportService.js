@@ -98,8 +98,12 @@ async function loadLots(db, companyId, lineId, lotId = null) {
     for (const v of vals) { const e = sizes.get(Number(v.subject_id)) ?? {}; e[v.code === 'LENGTH' ? 'length' : 'width'] = Number(v.value_number); sizes.set(Number(v.subject_id), e); }
   }
   for (const p of placeRows) {
+    const outline = placedOutline(shapes.get(Number(p.cut_plate_id))?.rings, p, sizes.get(Number(p.cut_plate_id)));
     pieces.get(p.plate_lot_id)?.push({
-      outline: placedOutline(shapes.get(Number(p.cut_plate_id))?.rings, p, sizes.get(Number(p.cut_plate_id))),
+      outline,
+      // The steel in the part: its outline less its openings, when it has an outline here (a drawing, the
+      // customer's own outline, a rectangle lying at an angle) — else the rectangle length × width.
+      area: outline?.length ? Math.max(0, ringArea(outline[0]) - outline.slice(1).reduce((a, r) => a + ringArea(r), 0)) : Number(p.length_mm) * Number(p.width_mm),
       x: p.x_mm == null ? null : Number(p.x_mm),
       y: p.y_mm == null ? null : Number(p.y_mm),
       length: Number(p.length_mm),
@@ -172,11 +176,12 @@ async function offcutThresholds(db, companyId) {
 function placedOutline(rings, p, size = null) {
   if (p.x_mm == null || p.y_mm == null) return null;
   // A part with no drawing whose outline the customer's file drew (rings_json, 2026-10-10): that
-  // outline, as it is — already in plate mm. A drawing, once uploaded, wins.
-  if (!rings?.length && p.rings_json != null) {
+  // outline, as it is — already in plate mm. A drawing, once uploaded, wins — except over the
+  // outline of a ProNest job (`asCut`, 2026-10-13), which is what the shop nested to cut.
+  if (p.rings_json != null) {
     let o = p.rings_json;
     if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
-    if (Array.isArray(o?.outline) && o.outline.length >= 3) return [o.outline, ...(o.cutouts ?? []), ...(o.holes ?? [])];
+    if ((!rings?.length || o?.asCut) && Array.isArray(o?.outline) && o.outline.length >= 3) return [o.outline, ...(o.cutouts ?? []), ...(o.holes ?? [])];
   }
   // §55: a placement that says its turn is put there by THE PLACEMENT CONVENTION — any angle,
   // either hand. Its shape is the part's drawing, else its own rectangle (drawn turned only when
@@ -194,6 +199,9 @@ function placedOutline(rings, p, size = null) {
   const along = Math.abs(Number(p.length_mm) - ext[0]) <= Math.abs(Number(p.length_mm) - ext[1]);
   return rings.map((ring) => ring.map(([x, y]) => (along ? [x0 + x, y0 + y] : [x0 + (ext[1] - y), y0 + x])));
 }
+
+/** The area a ring of corners encloses, whichever way round it is drawn. */
+const ringArea = (pts) => { let a = 0; for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) a += pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1]; return Math.abs(a / 2); };
 
 const hasLayout = (pcs) => pcs.length > 0 && pcs.every((p) => p.x != null && p.y != null);
 
@@ -275,7 +283,8 @@ export async function lineCncZip(db, companyId, lineId) {
   for (const lot of lots) {
     const pcs = pieces.get(lot.id) ?? [];
     const plateArea = Number(lot.length_mm) * Number(lot.width_mm);
-    const partsArea = pcs.reduce((a, p) => a + p.length * p.width, 0);
+    // The parts' TRUE steel (their drawings), not the rectangles round them: what the CNC files beside this list cut.
+    const partsArea = pcs.reduce((a, p) => a + (p.area ?? p.length * p.width), 0);
     const laid = hasLayout(pcs);
     let file = '';
     let note = '';

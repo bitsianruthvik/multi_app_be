@@ -124,7 +124,7 @@ export function isPlainRect(o) {
 /**
  * A cut plate's shape: its drawing when partDrawingService has ONE shape for every piece of it
  * (`facts.get(id).rings`, x along its LENGTH), else the rectangle LENGTH × WIDTH.
- * → { rings: { outline, cutouts, holes }, drawn: boolean, area, length, width }
+ * → { rings: { outline, cutouts, holes }, drawn: boolean, area, length, width, shapeFrom, shapeNote }
  */
 export function shapeOfCutPlate(cp, facts = null) {
   const L = Number(cp?.steel?.length ?? cp?.length);
@@ -132,10 +132,25 @@ export function shapeOfCutPlate(cp, facts = null) {
   const drawn = ringsObject(facts?.get?.(Number(cp?.id))?.rings ?? null);
   if (drawn) {
     const b = boxOf(drawn.outline);
-    return { rings: drawn, drawn: true, area: r3(ringsArea(drawn)), length: r3(b.x1 - b.x0), width: r3(b.y1 - b.y0) };
+    return { rings: drawn, drawn: true, area: r3(ringsArea(drawn)), length: r3(b.x1 - b.x0), width: r3(b.y1 - b.y0), shapeFrom: 'drawing', shapeNote: null };
   }
   if (!(L > 0 && W > 0)) return null;
-  return { rings: ringsObject(rectRings(L, W)), drawn: false, area: r3(L * W), length: L, width: W };
+  return { rings: ringsObject(rectRings(L, W)), drawn: false, area: r3(L * W), length: L, width: W, ...shapeFromOf(cp, facts) };
+}
+
+/**
+ * WHERE A CUT PLATE'S SHAPE COMES FROM, for every answer that describes one (2026-10-13):
+ *   shapeFrom  'drawing'     its part drawing's outline
+ *              'dimensions'  the rectangle LENGTH × WIDTH
+ *   shapeNote  a sentence, only when it is 'dimensions' ALTHOUGH a drawing exists on its rows (rows
+ *              with different drawings pooled into one cut plate, or one row drawn and one not).
+ * ('nesting file' — the customer's own outline on one plate — is said per placed piece, not here.)
+ * No query: it reads what drawingFactsOfLine already holds.
+ */
+export function shapeFromOf(cp, facts = null) {
+  const f = facts?.get?.(Number(cp?.id)) ?? null;
+  if (f?.rings && ringsObject(f.rings)) return { shapeFrom: 'drawing', shapeNote: null };
+  return { shapeFrom: 'dimensions', shapeNote: f?.shapeNote ?? null };
 }
 
 /** THE PLACEMENT CONVENTION, on { outline, cutouts, holes }. Points rounded to a tenth of a micron. */

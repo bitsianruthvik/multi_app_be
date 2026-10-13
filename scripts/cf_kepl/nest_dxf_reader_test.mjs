@@ -308,7 +308,7 @@ section('11. bad files, empty nests, hints');
   ok('hints from the file name N12_16mm_E350.dxf', h.nestNo === 'N12' && h.thicknessMm === 16 && h.grade === 'E350' && h.plateSize === null, JSON.stringify(h));
   const h2 = readNestDxf(one, { filename: 'C:\\nests\\KEPL-ROB_P0042_T25_12000x2500_S355J2.DXF' }).hints;
   ok('…and from P0042_T25_12000x2500_S355J2', h2.nestNo === 'P0042' && h2.thicknessMm === 25 && h2.grade === 'S355J2' && h2.plateSize?.length === 12000 && h2.plateSize?.width === 2500, JSON.stringify(h2));
-  ok('no file name, no title: every hint is null', Object.values(readNestDxf(one).hints).every((v) => v === null));
+  ok('no file name, no title: every hint is null (and `from` says nothing gave one)', (() => { const { from, ...hints } = readNestDxf(one).hints; return Object.values(hints).every((v) => v === null) && Object.values(from).every((v) => v === null); })());
 
   // A single part with holes and nothing else is a PART, not a plate holding round parts.
   const lone = readNestDxf(makeNestDxf({ plate: PLATE, parts: [{ shape: S.splice, x: 0, y: 0 }], style: 'segments' }));
@@ -467,6 +467,197 @@ section('14. speed with crossings');
   const ms2 = performance.now() - t;
   console.log(`        700 free parts + a 20 × 10 block, ${entityCount(mixed)} entities: read in ${ms2.toFixed(0)} ms`);
   ok(`a ${entityCount(mixed)}-entity mixed file reads in under 2 s (${ms2.toFixed(0)} ms): 900 parts`, entityCount(mixed) >= 3000 && ms2 < 2000 && n2.parts.length === 900, String(n2.parts.length));
+}
+
+/* ───────────── 2026-10-13: nothing lost quietly, the plate, marking, kerf compensation ───────────── */
+{
+  const f6 = (n) => String(Number(Number(n).toFixed(6)));
+  const LN = (layer, p, q, colour = null) => ['0', 'LINE', '8', layer, ...(colour != null ? ['62', String(colour)] : []), '10', f6(p[0]), '20', f6(p[1]), '11', f6(q[0]), '21', f6(q[1])];
+  const PL = (layer, pts, colour = null) => ['0', 'LWPOLYLINE', '8', layer, ...(colour != null ? ['62', String(colour)] : []), '90', String(pts.length), '70', '1', ...pts.flatMap(([x, y, b]) => ['10', f6(x), '20', f6(y), ...(b ? ['42', f6(b)] : [])])];
+  const TX = (layer, p, h, s) => ['0', 'TEXT', '8', layer, '10', f6(p[0]), '20', f6(p[1]), '40', f6(h), '1', s, '72', '1', '11', f6(p[0]), '21', f6(p[1]), '73', '2'];
+  const file = (ents, { insunits = 4, scale = 1 } = {}) => {
+    const body = ents.flat().map((v, i, all) => (i % 2 === 1 && ['10', '20', '11', '21', '40'].includes(all[i - 1]) && all[i - 1] !== '1' ? f6(Number(v) * scale) : v));
+    return [...(insunits == null ? [] : ['0', 'SECTION', '2', 'HEADER', '9', '$INSUNITS', '70', String(insunits), '0', 'ENDSEC']), '0', 'SECTION', '2', 'ENTITIES', ...body, '0', 'ENDSEC', '0', 'EOF'].join('\r\n');
+  };
+  const rect = (x, y, l, w) => [[x, y], [x + l, y], [x + l, y + w], [x, y + w]];
+  const sides = (layer, c, colour = null) => c.map((p, i) => LN(layer, p, c[(i + 1) % c.length], colour));
+  const plate = PL('PLATE', rect(0, 0, 3000, 1500));
+  const R = { key: 'r', codes: ['R-1'], rings: null, length: 1200, width: 400 };
+  const Q = { key: 'q', codes: ['Q-1'], rings: null, length: 800, width: 200 };
+  const codes = (list) => list.map((x) => x.code).join();
+
+  section('15. A gap in an outline: closed when it is a tab or a sloppy corner, SAID when it is wider — never dropped quietly');
+  {
+    // 1200 × 400 as four lines, with a 1.5 mm tab left in the middle of its bottom edge.
+    const tab = (gap) => [LN('CUT', [100, 100], [700 - gap / 2, 100]), LN('CUT', [700 + gap / 2, 100], [1300, 100]), LN('CUT', [1300, 100], [1300, 500]), LN('CUT', [1300, 500], [100, 500]), LN('CUT', [100, 500], [100, 100])];
+    let n = readNestDxf(file([plate, ...tab(1.5), TX('TXT', [700, 300], 30, 'R-1')]));
+    let m = matchNest(n, [R, Q]);
+    ok('a 1.5 mm micro-joint is closed: the part is read, matched, and a note says a gap was closed and where', n.parts.length === 1 && n.closedGaps === 1 && m.placements[0]?.candidateKey === 'r' && n.problems.length === 0 && n.warnings.some((w) => /1 gap in an outline closed \(1\.5 mm, at \(700, 100\)\)/.test(w)), JSON.stringify([n.parts.length, n.warnings, n.problems]));
+    // A line that stops 0.3 mm short of its corner.
+    n = readNestDxf(file([plate, LN('CUT', [100, 100], [1299.7, 100]), LN('CUT', [1300, 100], [1300, 500]), LN('CUT', [1300, 500], [100, 500]), LN('CUT', [100, 500], [100, 100])]));
+    ok('a line 0.3 mm short of its corner is closed too', n.parts.length === 1 && n.closedGaps === 1 && Math.abs(n.parts[0].bbox.length - 1200) < 0.01, JSON.stringify([n.parts.map((p) => p.bbox), n.warnings]));
+    // 4.2 mm: wider than any tab. Not closed; the file is refused with where and how wide.
+    n = readNestDxf(file([plate, ...tab(4.2), PL('CUT', rect(100, 700, 800, 200))]));
+    const open = n.problems.find((p) => p.code === 'OPEN_CONTOUR');
+    ok('a 4.2 mm gap is NOT closed: OPEN_CONTOUR names the shape, the gap and where it is', n.parts.length === 1 && !!open && open.gapMm === 4.2 && open.at[0] === 700 && open.at[1] === 100 && /about 1200 x 400 at \(100, 100\) is not a closed outline: its ends are 4\.2 mm apart at \(700, 100\)\. Close it in the nesting program and export again\./.test(open.message), JSON.stringify(n.problems));
+    ok('…and it is not ALSO said as "lead-ins ignored"', !n.warnings.some((w) => /lead-ins/.test(w)), JSON.stringify(n.warnings));
+    n = readNestDxf(file([plate, ...tab(1.5), PL('CUT', rect(100, 700, 800, 200))]), { gapTolMm: 0 });
+    ok('gapTolMm: 0 closes nothing — the same tab is then an OPEN_CONTOUR, not a vanished part', n.parts.length === 1 && n.problems[0]?.code === 'OPEN_CONTOUR' && n.problems[0].gapMm === 1.5, JSON.stringify(n.problems));
+    // Two loose ends 1.5 mm apart that do NOT point at each other (two lead-ins side by side) are never joined.
+    n = readNestDxf(file([plate, ...sides('CUT', rect(100, 100, 1200, 400)), LN('CUT', [400, 100], [400, 92]), LN('CUT', [401.5, 100], [401.5, 92])]));
+    ok('two lead-ins whose loose ends are 1.5 mm apart are not joined into a shape', n.parts.length === 1 && n.closedGaps === 0 && n.problems.length === 0 && n.warnings.some((w) => /2 lines that do not close/.test(w)), JSON.stringify([n.parts.length, n.closedGaps, n.warnings]));
+    // Two different parts, each closed, 1.5 mm apart: nothing to join, two parts.
+    n = readNestDxf(file([plate, ...sides('CUT', rect(100, 100, 300, 180)), ...sides('CUT', rect(401.5, 100, 300, 180))]));
+    ok('two closed parts 1.5 mm apart stay two parts', n.parts.length === 2 && n.closedGaps === 0);
+    // Three sides only: it could have been a part — a caution, not a note.
+    n = readNestDxf(file([plate, LN('CUT', [100, 500], [100, 100]), LN('CUT', [100, 100], [1300, 100]), LN('CUT', [1300, 100], [1300, 500]), PL('CUT', rect(100, 700, 800, 200))]));
+    ok('three sides of a part (ends 1200 mm apart) are a SHAPE_IGNORED caution that needs the user\'s eye', n.problems.length === 0 && n.cautions.length === 1 && n.cautions[0].code === 'SHAPE_IGNORED' && /1200 x 400 at \(100, 100\)/.test(n.cautions[0].message), JSON.stringify([n.problems, n.cautions]));
+    // Rapid moves hopping over parts, a lead-in, an exploded dimension: still only a note.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), PL('CUT', rect(100, 700, 800, 200)), PL('CUT', rect(1500, 100, 800, 200)),
+      LN('CUT', [50, 50], [700, 300]), LN('CUT', [700, 300], [500, 800]), LN('CUT', [500, 800], [1900, 200]), LN('CUT', [1900, 200], [2900, 1400]),
+      LN('0', [1500, 320], [1500, 400]), LN('0', [2300, 320], [2300, 400]), LN('0', [1500, 390], [2300, 390])]));
+    ok('rapid moves across parts and an exploded dimension are a note, not a problem or a caution', n.parts.length === 3 && !n.problems.length && !n.cautions.length && n.warnings.some((w) => /lines that do not close into a shape ignored/.test(w)), JSON.stringify([n.problems, n.cautions, n.warnings]));
+  }
+
+  section('16. More than one plate in a file is refused in words; what is not read is a caution');
+  {
+    const sheet = (ox, layer) => [PL(layer, rect(ox, 0, 3000, 1500)), PL('0', rect(ox + 100, 100, 1200, 400)), TX('0', [ox + 700, 300], 30, 'R-1'), PL('0', rect(ox + 100, 700, 800, 200)), TX('0', [ox + 500, 800], 30, 'Q-1')];
+    let n = readNestDxf(file([...sheet(0, 'PLATE'), ...sheet(3500, 'PLATE')]));
+    ok('two plates on a plate layer: MULTIPLE_PLATES, "it holds 2 plates"', n.plates === 2 && n.problems.length === 1 && n.problems[0].code === 'MULTIPLE_PLATES' && n.problems[0].plates === 2 && /it holds 2 plates \(each 3000 x 1500\)\. One file is one plate/.test(n.problems[0].message), JSON.stringify(n.problems));
+    n = readNestDxf(file([...sheet(0, '0'), ...sheet(3500, '0'), ...sheet(7000, '0')]));
+    ok('three plates with everything on layer 0: MULTIPLE_PLATES 3, and the first plate is the one shown', n.plates === 3 && n.problems[0]?.code === 'MULTIPLE_PLATES' && n.plate.length === 3000 && n.parts.length === 2, JSON.stringify([n.plates, n.problems, n.parts.length]));
+    // Two equal parts with holes and NO plate drawn are two parts, not two plates.
+    const holed = (x) => [PL('0', rect(x, 0, 500, 300)), ['0', 'CIRCLE', '8', '0', '10', String(x + 100), '20', '100', '40', '11'], ['0', 'CIRCLE', '8', '0', '10', String(x + 300), '20', '100', '40', '11']];
+    n = readNestDxf(file([...holed(0), ...holed(600)]));
+    ok('two equal holed parts with no plate drawn are two parts, not two plates', n.plates === 1 && n.problems.length === 0 && n.parts.length === 2 && n.plate.found === 'bounds', JSON.stringify([n.plates, n.problems, n.parts.length, n.plate.found]));
+    // A closed shape beside the plate is handed to the caller, with its label.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), PL('CUT', rect(3200, 100, 800, 200)), TX('TXT', [3600, 200], 30, 'Q-1')]));
+    ok('a closed shape beside the plate comes back in `outside` with its label (the caller says what it is)', n.outside.length === 1 && n.outside[0].bbox.x === 3200 && n.outside[0].labels[0] === 'Q-1' && n.outside[0].inFrame === false && n.plates === 1, JSON.stringify(n.outside));
+    // Things the reader does not read.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), ['0', 'HATCH', '8', 'CUT', '2', 'SOLID', '70', '1'], ['0', 'INSERT', '8', 'CUT', '2', 'GHOST', '10', '0', '20', '0']]));
+    ok('a HATCH and a block the file does not define are SHAPE_IGNORED cautions', n.cautions.length === 2 && n.cautions.every((c) => c.code === 'SHAPE_IGNORED') && n.cautions.some((c) => /1 HATCH item/.test(c.message)) && n.cautions.some((c) => /"GHOST"/.test(c.message)), JSON.stringify(n.cautions));
+    n = readNestDxf(file([plate, ['0', 'SPLINE', '8', 'CUT', '70', '9', '71', '3', '10', '100', '20', '100', '10', '700', '20', '100', '10', '700', '20', '500', '10', '100', '20', '500']]));
+    ok('a spline given only by control points is a CURVE_APPROXIMATE caution', n.cautions.some((c) => c.code === 'CURVE_APPROXIMATE'), JSON.stringify(n.cautions));
+  }
+
+  section('17. The plate: a frame round it, loose dimension text, a crop line, inches');
+  {
+    const inner = [PL('0', rect(0, 0, 3000, 1500)), PL('0', rect(100, 100, 1200, 400)), TX('0', [700, 300], 30, 'R-1'), PL('0', rect(100, 700, 800, 200)), TX('0', [500, 800], 30, 'Q-1')];
+    const frame = [PL('0', rect(-300, -700, 3600, 2500)), PL('0', rect(2300, -650, 900, 300)), TX('0', [2750, -500], 40, 'DRG NO 17')];
+    let n = readNestDxf(file([...frame, ...inner]), { plateSizes: [{ length: 3000, width: 1500 }, { length: 6000, width: 2500 }] });
+    ok('a frame on layer 0 round a plate of a catalog size: the plate is the inner rectangle, a note says so, the title box is not a part', n.plate.length === 3000 && n.plate.width === 1500 && n.parts.length === 2 && n.warnings.some((w) => /A frame \(3600 x 2500\) is drawn round the plate: the plate is the 3000 x 1500 rectangle inside it/.test(w)) && n.outside.length === 1 && n.outside[0].inFrame === true && n.plates === 1, JSON.stringify([n.plate.length, n.parts.length, n.warnings, n.outside]));
+    n = readNestDxf(file([...frame, ...inner]), { filename: 'N7_12mm_3000x1500.dxf' });
+    ok('…or of the size the file name states', n.plate.length === 3000 && n.parts.length === 2);
+    n = readNestDxf(file([...frame, ...inner]));
+    ok('with nothing to say what a plate is, the outer rectangle stays the plate — and `plate.inside` names the rectangle that may be the real one', n.plate.length === 3600 && n.plate.inside?.length === 3000 && n.plate.inside?.width === 1500, JSON.stringify(n.plate));
+    // A plate of a catalog size holding one big holed rectangle is not a frame.
+    n = readNestDxf(file([PL('0', rect(0, 0, 3000, 1500)), PL('0', rect(100, 100, 2500, 1250)), PL('0', rect(300, 300, 200, 200)), PL('0', rect(900, 300, 200, 200))]), { plateSizes: [{ length: 3000, width: 1500 }, { length: 2500, width: 1250 }] });
+    ok('a plate of a catalog size is never peeled, even when the one part on it is the size of another plate', n.plate.length === 3000 && n.parts.length === 1 && n.parts[0].rings.cutouts.length === 2, JSON.stringify([n.plate.length, n.parts.length]));
+
+    // Words: a bare "25 mm" is a dimension, not a thickness; the file name wins over the words.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), TX('0', [1400, 300], 20, '25 mm'), TX('0', [1500, 1530], 40, '3000')]), { filename: 'N62_12mm_E350_3000x1500.dxf' });
+    ok('a loose "25 mm" is not the plate\'s thickness: the file name\'s 12 mm is', n.hints.thicknessMm === 12 && n.hints.from.thicknessMm === 'file name', JSON.stringify(n.hints));
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), TX('0', [1400, 300], 20, '25 mm')]));
+    ok('…and with no file name it is no thickness at all', n.hints.thicknessMm === null);
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), TX('TITLE', [0, -200], 60, 'MATERIAL: IS 2062 E350 BR   THK 16')]), { filename: 'N9_12mm_3000x1500.dxf' });
+    ok('a title that says THK 16 against a file name that says 12mm: the name is taken, and a note says they disagree', n.hints.thicknessMm === 12 && n.hints.grade != null && n.warnings.some((w) => /say 16 mm thick and the file name says 12 mm — the file name is taken/.test(w)), JSON.stringify([n.hints, n.warnings]));
+    for (const [words, t] of [['PL 12 x 3000 x 1500 E350', 12], ['THK 16', 16], ['20 THK', 20], ['T = 25', 25], ['PL 10', 10], ['Nest N-1  |  12 mm  |  E350  |  3000 x 1500', 12]]) {
+      n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), TX('TITLE', [0, -200], 60, words)]));
+      ok(`"${words}" in the title is ${t} mm`, n.hints.thicknessMm === t && n.hints.from.thicknessMm === 'words', JSON.stringify(n.hints));
+    }
+
+    // A crop line across a plate drawn as loose lines.
+    const loose = [...sides('0', rect(0, 0, 3000, 1500)), PL('0', rect(100, 100, 1200, 400))];
+    n = readNestDxf(file([...loose, LN('REMNANT', [2000, 0], [2000, 1500])]));
+    ok('a crop line on a REMNANT layer does not split the plate: it is 3000 × 1500 and a note says the line was ignored', n.plate.length === 3000 && n.plate.width === 1500 && n.parts.length === 1 && n.warnings.some((w) => /offcut \/ remnant layer/.test(w)), JSON.stringify([n.plate.length, n.parts.length, n.warnings]));
+    n = readNestDxf(file([...loose, LN('0', [2000, 0], [2000, 1500])]), { plateSizes: [{ length: 3000, width: 1500 }] });
+    const rest = matchNest(n, [R]);
+    ok('a crop line on layer 0: the two halves together are the 3000 × 1500 plate, and the empty half is scrap, not an unknown part', n.plate.found === 'outline' && n.plate.length === 3000 && rest.placements.length === 1 && rest.unmatched.every((u) => u.maybeScrap), JSON.stringify([n.plate, rest.placements.length, rest.unmatched]));
+
+    // Inches with no units in the header.
+    const inch = file([plate, PL('CUT', rect(100, 100, 1200, 400)), TX('TXT', [700, 300], 30, 'R-1')], { insunits: null, scale: 1 / 25.4 });
+    n = readNestDxf(inch);
+    const asMm = matchNest(n, [R, Q]);
+    const n2 = readNestDxf(inch, { units: 'in' });
+    const asIn = matchNest(n2, [R, Q]);
+    ok('a file in inches with no units: unitsStated is false and nothing matches as mm; read again with units: "in" the part matches', n.unitsStated === false && n.units === 'mm' && asMm.placements.length === 0 && n2.units === 'in' && asIn.placements.length === 1 && Math.abs(n2.plate.length - 3000) < 0.01, JSON.stringify([n.unitsStated, asMm.placements.length, n2.units, asIn.placements.length, n2.plate.length]));
+    ok('a file that states millimetres says unitsStated: true', readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400))])).unitsStated === true);
+  }
+
+  section('18. Marking is not a cut-out: by where it lies, its layer and its colour');
+  {
+    const letters = (layer, colour = null) => [PL(layer, rect(200, 350, 40, 70), colour), PL(layer, rect(260, 350, 40, 70), colour)];
+    // A layout line inside the part on layer M gives the layer away: the closed letters on it are marking.
+    let n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), ...letters('LAYER_3'), LN('LAYER_3', [700, 100], [700, 500])]));
+    ok('closed letters on the layer of an open marking line inside the part are left out of it', n.parts.length === 1 && n.parts[0].rings.cutouts.length === 0 && !n.parts[0].ringsNoMarks && n.markingStyles.includes('LAYER_3|') && n.warnings.some((w) => /2 closed shapes inside parts.*read as marking/.test(w)) && n.warnings.some((w) => /1 open line inside parts ignored/.test(w)), JSON.stringify([n.parts[0].rings.cutouts.length, n.markingStyles, n.warnings]));
+    // The same by COLOUR on the cut layer.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400), 1), ...letters('CUT', 2), LN('CUT', [700, 150], [700, 450], 2)]));
+    ok('…and the same told apart only by colour (62)', n.parts[0].rings.cutouts.length === 0 && n.markingStyles.includes('CUT|2'), JSON.stringify([n.parts[0].rings.cutouts.length, n.markingStyles]));
+    // No marking line: nothing says what the letters are. The part comes both ways.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), ...letters('LAYER_3')]));
+    const p = n.parts[0];
+    ok('closed shapes in another layer with nothing to give them away: the part comes with them (`rings`) and without (`ringsNoMarks`)', p.rings.cutouts.length === 2 && p.ringsNoMarks?.cutouts.length === 0 && p.unsureMarks === 2 && p.unsureStyle === 'layer LAYER_3' && p.areaNoMarks === 480000, JSON.stringify([p.rings.cutouts.length, p.ringsNoMarks, p.unsureMarks, p.unsureStyle]));
+    let m = matchNest(n, [R]);
+    ok('…a cut plate with no drawing is matched without them, and the placement says how many were left out', m.placements[0]?.candidateKey === 'r' && m.placements[0].marksLeftOut === 2, JSON.stringify(m.placements));
+    const windowed = { key: 'w', codes: ['W-1'], rings: [rect(0, 0, 1200, 400), rect(100, 250, 40, 70), rect(160, 250, 40, 70)], length: 1200, width: 400 };
+    m = matchNest(n, [windowed]);
+    ok('…a cut plate whose DRAWING has those two openings is matched with them: they are cut-outs', m.placements[0]?.candidateKey === 'w' && !m.placements[0].marksLeftOut && m.placements[0].by === 'shape', JSON.stringify(m.placements));
+    // Round holes are holes whatever layer they are on; the same layer as the outline is a cut-out.
+    n = readNestDxf(file([plate, PL('CUT', rect(100, 100, 1200, 400)), ['0', 'CIRCLE', '8', 'HOLES', '10', '300', '20', '300', '40', '11'], PL('CUT', rect(600, 250, 100, 100))]));
+    ok('a drill-size circle on another layer is a hole, and a closed shape on the outline\'s own layer a cut-out — neither is in doubt', n.parts[0].rings.holes.length === 1 && n.parts[0].rings.cutouts.length === 1 && !n.parts[0].ringsNoMarks);
+    // A marking line from edge to edge of a part drawn as loose lines, in another colour.
+    const split = file([plate, ...sides('CUT', rect(100, 100, 1200, 400), 1), LN('CUT', [700, 100], [700, 500], 2)]);
+    n = readNestDxf(split);
+    ok('a line of another colour from edge to edge splits the part in two — and the reader names the style to try as marking', n.parts.length === 2 && n.splitStyles.length === 1 && n.splitStyles[0] === 'CUT|2', JSON.stringify([n.parts.length, n.splitStyles]));
+    n = readNestDxf(split, { markingStyles: n.splitStyles });
+    ok('…read again with that style as marking, it is one 1200 × 400 part', n.parts.length === 1 && n.parts[0].bbox.length === 1200 && n.warnings.some((w) => /1 line drawn in a marking colour or layer read as marking/.test(w)), JSON.stringify([n.parts.length, n.warnings]));
+    n = readNestDxf(file([plate, ...sides('CUT', rect(100, 100, 600, 400)), ...sides('CUT', rect(700, 100, 600, 400)).slice(0, 3)]));
+    ok('a common cut in the parts\' own style is not offered as marking', n.parts.length === 2 && n.splitStyles.length === 0, JSON.stringify([n.parts.length, n.splitStyles]));
+  }
+
+  section('19. Kerf-compensated outlines: matched at nominal size only when EVERY part is oversize by the same offset');
+  {
+    const grown = (x, y, l, w, d) => rect(x - d, y - d, l + 2 * d, w + 2 * d);
+    const labelled = (d1, d2 = d1) => file([plate, PL('CUT', grown(100, 100, 1200, 400, d1)), TX('TXT', [700, 300], 30, 'R-1'), PL('CUT', grown(100, 700, 800, 200, d2)), TX('TXT', [500, 800], 30, 'Q-1')]);
+    let m = matchNest(readNestDxf(labelled(1.5)), [R, Q]);
+    ok('every part 1.5 mm oversize all round: matched to its nominal size, the offset recorded', m.kerfOffsetMm === 1.5 && m.placements.length === 2 && m.unmatched.length === 0 && m.placements.every((p) => p.by === 'label'), JSON.stringify([m.kerfOffsetMm, m.placements.length, m.unmatched]));
+    const at = m.placements.find((p) => p.candidateKey === 'r');
+    ok('…and placed where the NOMINAL part is (100, 100), not where the torch path starts', Math.abs(at.x - 100) < 0.01 && Math.abs(at.y - 100) < 0.01 && Math.abs(m.nominal.get(at.partId).full.outline[0][0] - 100) < 0.01, JSON.stringify(at));
+    m = matchNest(readNestDxf(labelled(1.5, 0)), [R, Q]);
+    ok('one part oversize and one not: NOT kerf compensation — the oversize part stays unmatched at the ordinary tolerance', m.kerfOffsetMm === 0 && m.placements.length === 1 && m.unmatched.length === 1, JSON.stringify([m.kerfOffsetMm, m.placements.length, m.unmatched.length]));
+    m = matchNest(readNestDxf(labelled(1.5, 0.6)), [R, Q]);
+    ok('two parts oversize by DIFFERENT offsets (1.5 and 0.6): not uniform, nothing is matched', m.kerfOffsetMm === 0 && m.placements.length === 0, JSON.stringify([m.kerfOffsetMm, m.placements.length]));
+    m = matchNest(readNestDxf(labelled(4)), [R, Q]);
+    ok('4 mm a side is more than half any kerf: not taken as compensation', m.kerfOffsetMm === 0 && m.placements.length === 0);
+    m = matchNest(readNestDxf(labelled(1.5)), [R, Q], { kerfOffsetMaxMm: 0 });
+    ok('kerfOffsetMaxMm: 0 switches it off', m.kerfOffsetMm === 0 && m.placements.length === 0);
+    // The torch path with ROUNDED corners (an arc of the offset's radius round each corner), a shaped part with a hole, unlabelled, turned.
+    const cand = candidateOf(S.gusset, { key: 'cp-gusset', codes: ['GP-7'] });
+    const frameCand = candidateOf(S.frame, { key: 'cp-frame', codes: ['FR-1'] });
+    const openRing = (r) => (Math.hypot(r[0][0] - r[r.length - 1][0], r[0][1] - r[r.length - 1][1]) < 1e-9 ? r.slice(0, -1) : r);
+    const nominal = placeRings(cand.rings, { x: 400, y: 300, rotationDeg: 33, mirrored: false }).map(openRing);
+    const framed = placeRings(frameCand.rings, { x: 1500, y: 300, rotationDeg: 0, mirrored: false }).map(openRing);
+    const d = 1.2;
+    const round = (ring, out) => {            // every corner pushed out along both its sides' normals, with the arc between
+      const ccw = ring.reduce((a, pt, i) => a + (ring[(i + ring.length - 1) % ring.length][0] * pt[1] - pt[0] * ring[(i + ring.length - 1) % ring.length][1]), 0) > 0 ? ring : ring.slice().reverse();
+      const pts = [];
+      for (let i = 0; i < ccw.length; i++) {
+        const a = ccw[(i + ccw.length - 1) % ccw.length]; const b = ccw[i]; const c = ccw[(i + 1) % ccw.length];
+        const n1 = Math.atan2(-(b[0] - a[0]), b[1] - a[1]) + (out ? 0 : Math.PI); const n2 = Math.atan2(-(c[0] - b[0]), c[1] - b[1]) + (out ? 0 : Math.PI);
+        let sweep = n2 - n1; while (sweep > Math.PI) sweep -= 2 * Math.PI; while (sweep < -Math.PI) sweep += 2 * Math.PI;
+        const convex = out ? sweep > 0 : sweep < 0;
+        if (convex) for (let k = 0; k <= 6; k++) { const t = n1 + (sweep * k) / 6; pts.push([b[0] + d * Math.cos(t), b[1] + d * Math.sin(t)]); }
+        else { const h = (n1 + sweep / 2); const r = d / Math.cos(sweep / 2); pts.push([b[0] + r * Math.cos(h), b[1] + r * Math.sin(h)]); }
+      }
+      return pts;
+    };
+    const torch = [nominal, framed].flatMap((rings) => [PL('CUT', round(rings[0], true)), ...rings.slice(1).map((r) => PL('CUT', round(r, false)))]);
+    const nk = readNestDxf(file([plate, ...torch, PL('CUT', grown(100, 1000, 800, 200, d))]));
+    m = matchNest(nk, [cand, frameCand, Q]);
+    const g = m.placements.find((p) => p.candidateKey === 'cp-gusset');
+    const fr = m.placements.find((p) => p.candidateKey === 'cp-frame');
+    ok('a turned trapezoid and a frame with its window, drawn as the torch\'s path (rounded corners 1.2 mm out, the window 1.2 mm in): matched by shape at the nominal size', m.kerfOffsetMm === 1.2 && m.placements.length === 3 && g?.by === 'shape' && Math.abs(g.rotationDeg - 33) < 0.05 && ringsDeviation(placeRings(cand.rings, g), nominal) < 0.3 && fr?.by === 'shape' && ringsDeviation(placeRings(frameCand.rings, fr), framed) < 0.3, JSON.stringify([m.kerfOffsetMm, m.placements, m.unmatched]));
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

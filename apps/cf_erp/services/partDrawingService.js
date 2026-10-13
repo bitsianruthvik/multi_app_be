@@ -1041,8 +1041,9 @@ export async function drawingFile(db, companyId, orderId, lineId, drawingId) {
 /**
  * For plateCutsService and the CNC file: per cut plate of the line, what its parts' shapes say,
  * averaged over the pieces it is cut for (parts without a shape count as rectangles).
- * Map cutPlateId -> { cutLengthMm, piercings, alongLength, alongWidth, rings | null }
- * rings only when every piece of the cut plate has the same shape, oriented to its length.
+ * Map cutPlateId -> { cutLengthMm, piercings, alongLength, alongWidth, rings | null, pieces, drawnPieces, drawings, shapeNote | null }
+ * rings only when every piece of the cut plate has the same shape, oriented to its length;
+ * shapeNote says why not, when some piece of it does have a drawing.
  */
 export async function drawingFactsOfLine(db, companyId, lineId) {
   // A DXF without a shape counts too: it may be a plate part's, saved before the row was known as one.
@@ -1082,7 +1083,15 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
       // Turned a quarter, not mirrored: the drawing's x becomes the length.
       rings = a.o.swap ? g.rings.map((ring) => ring.map(([x, y]) => [y, Math.round((g.lengthMm - x) * 10) / 10])) : g.rings;
     }
-    out.set(cpId, { cutLengthMm: r1(a.cut / a.n), piercings: r3(a.pierce / a.n), alongLength: r3(a.aL / a.n), alongWidth: r3(a.aW / a.n), rings });
+    /*
+     * WHY IT IS A RECTANGLE ALTHOUGH A DRAWING EXISTS (the pooled cut plate): said in words, so every
+     * screen that shows the cut plate can say where its shape comes from (nestShapes.shapeFromOf).
+     */
+    const kinds = [...a.marks].filter((x) => x != null).length;
+    const shapeNote = rings ? null
+      : a.marks.has(null) ? `${a.drawn} of its ${a.n} pieces ${a.drawn === 1 ? 'has' : 'have'} a drawing and the ${a.n - a.drawn === 1 ? 'other has' : 'others have'} none, so it is nested as its rectangle.`
+        : `Its rows have ${kinds} different drawings, so it is nested as its rectangle.`;
+    out.set(cpId, { cutLengthMm: r1(a.cut / a.n), piercings: r3(a.pierce / a.n), alongLength: r3(a.aL / a.n), alongWidth: r3(a.aW / a.n), rings, pieces: a.n, drawnPieces: a.drawn, drawings: kinds, shapeNote });
   }
   return out;
 }

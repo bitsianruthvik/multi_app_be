@@ -12,12 +12,22 @@
  *                     answer, untouched. Only when asked for by name (`shapes: false`), when a test
  *                     injects its own packer, or when shapePacker.js cannot be loaded.
  *
- * WHICH LAYOUT A PLATE KEEPS — ONE RULE. The job makes the row layout (the floor) and the
- * true-shape layout seeded with it, and takes the true-shape one ONLY WHEN IT IS BETTER: fewer
- * pieces left off, less steel bought, or the same steel on fewer plates (`chosen: 'shape'`). When
- * it is not better, the row layout stands, rows and sequences and all (`chosen: 'rect'`). So a
- * group's plates are all free layouts (no rows, no sequences; cut order by position) or all row
- * layouts — never a free layout that merely re-states the rows.
+ * WHICH LAYOUT A PLATE KEEPS — TWO RULES, by what the steel's pieces are.
+ *   A steel with a REAL DRAWING (`input.shapesDecide`: a cut plate of it has a drawing whose
+ *   outline is not its bounding rectangle — 2026-10-13, "if we have the exact diagram then the cut
+ *   pieces should be based on the diagram and not the dimensions"): THE DRAWING DECIDES. The
+ *   true-shape layout is taken ALWAYS (`chosen: 'shape'`), also when it only ties with the rows —
+ *   unless it leaves MORE pieces off than the row layout, or could not be made at all (no time, no
+ *   memory, an error). Then the rows stand and `rowsBecause` says which: 'unplaced' | 'time' |
+ *   'memory' | 'error' | 'unavailable'. Never worse than the rows in steel: the true-shape search
+ *   starts from the row layout and may only keep what buys no more.
+ *   Every other steel (no drawing, or drawings that are plain rectangles with holes): the job
+ *   makes the row layout (the floor) and the true-shape layout seeded with it, and takes the
+ *   true-shape one ONLY WHEN IT IS BETTER: fewer pieces left off, less steel bought, or the same
+ *   steel on fewer plates. When it is not better, the row layout stands, rows and sequences and all
+ *   (`chosen: 'rect'`).
+ * Either way a group's plates are all free layouts (no rows, no sequences; cut order by position)
+ * or all row layouts.
  *
  * A SHAPE JOB, IN ORDER.
  *   1. THE FLOOR. nestingPacker on every piece, new plates only — the same input a rectangle job
@@ -129,6 +139,9 @@ function runShapeJob(input, hooks = {}) {
   const noWorse = (a, b) => a.off <= b.off && a.area <= b.area + 1e-6 && a.plates <= b.plates;
   const errors = [];
   let outOfTime = false;
+  // The drawing decides (see the header): why the rows stand although it should have.
+  const shapesDecide = input.shapesDecide === true;
+  let rowsBecause = null;
   const resume = input.resume ?? null;
   const coarse = Math.max(0, Math.trunc(Number(input.coarse) || 0));
   // What a coarser re-run changes in the true-shape packer's input (see the header).
@@ -172,6 +185,13 @@ function runShapeJob(input, hooks = {}) {
       // was ('start' — a steel picked up again that found nothing better): it was a true-shape layout
       // that beat the rows when it was kept. (The row layout handed in as a start is never "taken".)
       if ((shape.source === 'shape' || (kept && shape.source === 'start')) && beats(ss, rs)) return { chosen: 'shape', rect, shape: slim(shape), score: ss };
+      // THE DRAWING DECIDES: a steel with a real drawing takes the true-shape layout even when it does
+      // not beat the rows (it is then the rows' own positions, read as outlines: a free layout whose
+      // every part is its drawing) — unless it leaves more pieces off than the rows do.
+      if (shapesDecide && (shape.nests ?? []).length && ss.off <= rs.off) return { chosen: 'shape', rect, shape: slim(shape), score: ss, tied: true };
+      if (shapesDecide) rowsBecause = { why: 'unplaced', shapeOff: ss.off, rowsOff: rs.off };
+    } else if (shapesDecide) {
+      rowsBecause = { why: coarse >= 2 ? 'memory' : outOfTime ? 'time' : errors.length ? 'error' : 'unavailable' };
     }
     return { chosen: 'rect', rect, shape: slim(shape), score: rs };
   };
@@ -220,6 +240,10 @@ function runShapeJob(input, hooks = {}) {
     unplaced: win?.unplaced ?? [],
     areaBought: result.score.area,
     deterministic: !outOfTime && [floor, result.rect, result.shape, result.fill].every((o) => (o?.deterministic ?? true) !== false),
+    /** A steel with a real drawing: true when the true-shape layout was to be taken whatever the rows did. */
+    shapesDecide,
+    /** …and, when the rows stand all the same, why: { why: 'unplaced' | 'time' | 'memory' | 'error' | 'unavailable', shapeOff?, rowsOff? }. */
+    rowsBecause: result.chosen === 'rect' ? rowsBecause : null,
     /** The clock left no room to try the drawings at all: the answer is the rectangle layout. */
     shapeSkippedForTime: outOfTime,
     /** 0 = as asked; 1 = re-run coarser after its worker ran out of heap; 2 = the row layout alone. */

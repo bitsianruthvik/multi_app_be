@@ -24,13 +24,22 @@
  * once and closes both of its neighbours.
  * Two straight cuts of one connected drawing that CROSS with no end at the crossing (a block of
  * equal parts: a rim and long cuts right across it) get a point there, so every cell is a face.
+ * GAPS (2026-10-13): before the lines on no closed path are dropped, two loose ends that are a
+ * sloppy corner or a micro-joint apart are joined (GAP_CLOSE_MM) and a warning says so. What is
+ * still dropped is looked at as chains: inside a part it is marking; a plain run in the scrap that
+ * would enclose a part is AN OUTLINE LEFT OPEN — a `problem` (OPEN_CONTOUR) or a `caution`
+ * (SHAPE_IGNORED), never only a warning.
  * Parts common-cut against the plate's own edge leave no loop round them all: they fill their
  * rectangle exactly, and what is left of the plate (`skeleton`) is not a part. A part lying across
  * the plate's edge is returned with `outsidePlate` / `outsideMm`.
  *
  * The loops then nest inside each other. The largest one holding all the others is the PLATE
- * (unless everything inside it is a drilled hole — then it is one part with its holes);
- * the loops directly inside it are PARTS; a loop inside a part is its cut-out or hole; a loop
+ * (unless everything inside it is a drilled hole — then it is one part with its holes; and unless
+ * it is a drawing FRAME: not a size a plate comes in, with a rectangle inside it that is). A second
+ * plate beside the first is a `problem` (MULTIPLE_PLATES); any other closed shape beside the plate
+ * comes back in `outside`;
+ * the loops directly inside it are PARTS; a loop inside a part is its cut-out or hole — or MARKING,
+ * told by its layer and colour (see `kindOf` in readNestDxf); a loop
  * inside a cut-out is a part again (a small part nested in a window), and so on down.
  * Parts come out in PLATE coordinates: the plate's lower-left corner is (0,0), in mm.
  *
@@ -44,6 +53,26 @@ import { invalid } from './errors.js';
 
 const ARC_STEP_DEG = 5;                 // the same flattening as partGeometry.js
 const JOIN_TOL = 0.1;                   // mm: ends closer than this are one point
+/*
+ * GAPS IN AN OUTLINE (2026-10-13). Real files leave them: a micro-joint (tab) is 0.2 – 1.5 mm of
+ * contour left uncut so the part stays in the skeleton, and hand-drawn CAD stops a line a few
+ * tenths short of its corner. Two loose ends are joined when they are
+ *   - up to CORNER_GAP_MM apart, whichever way they point (a sloppy corner), or
+ *   - up to GAP_CLOSE_MM apart AND each points at the other (a tab: the cut carries straight on).
+ * 2 mm is under the narrowest kerf this shop cuts with (2.5 mm), so two DIFFERENT parts are never
+ * that close; and the "pointing at each other" rule keeps a lead-in's loose end from being joined
+ * to its neighbour's. Anything wider stays open and is SAID (OPEN_CONTOUR), never dropped quietly.
+ */
+export const GAP_CLOSE_MM = 2;
+const CORNER_GAP_MM = 0.5;
+const FACING_COS = Math.cos((20 * Math.PI) / 180);
+/** An open chain is "a part left open" from this much enclosed steel (50 × 50) and this many straight runs. */
+const OPEN_PART_MIN_AREA = 2500;
+const OPEN_PART_MIN_SEGMENTS = 3;
+/** Its ends this near each other (or within a tenth of its length) → an outline with a gap: it blocks. */
+const OPEN_PART_GAP_BLOCK_MM = 25;
+/** Kerf compensation (matchNest): the most a file's outlines may be drawn outside the part, per side. */
+export const KERF_OFFSET_MAX_MM = 3;
 const MIN_LOOP_AREA = 1;                // mm²: anything smaller is not a shape
 const PIERCE_MAX_DIA = 2;               // mm: a circle this small is a pierce mark, not a hole
 const MAX_CHARS = 40e6;
@@ -54,8 +83,10 @@ const UNIT_NAME = { 0: 'mm', 1: 'in', 2: 'ft', 4: 'mm', 5: 'cm', 6: 'm' };
 const B = '(^|[^A-Z])';
 const E = '([^A-Z]|$)';
 /** Layers that are plainly not something cut out of the plate. Their words are still read. */
-const SKIP_LAYER = new RegExp(`${B}(DIM|DIMS|DIMENSION|TEXT|NOTE|ANNO|CENT|CENTER|CENTRE|CL|HATCH|TITLE|BORDER|FRAME|DEFPOINTS|VIEWPORT|RAPID|RAPIDS|TRAVERSE|LEAD|LEADS|LEADIN|LEADINS|LEADOUT|LEADOUTS|PIERCE|PIERCING|MARK|MARKING|SCRIBE|ETCH|ENGRAVE)${E}`, 'i');
+const SKIP_LAYER = new RegExp(`${B}(DIM|DIMS|DIMENSION|TEXT|NOTE|ANNO|CENT|CENTER|CENTRE|CL|HATCH|TITLE|BORDER|FRAME|DEFPOINTS|VIEWPORT|RAPID|RAPIDS|TRAVERSE|LEAD|LEADS|LEADIN|LEADINS|LEADOUT|LEADOUTS|PIERCE|PIERCING|MARK|MARKS|MARKING|MARKINGS|SCRIBE|SCRIBING|ETCH|ETCHING|ENGRAVE|ENGRAVING)${E}`, 'i');
 const OFFCUT_LAYER = /(OFFCUT|REMNANT|SCRAP|SKELETON|WASTE)/i;
+/** Entities this reader does not read, that can hold a shape: said when a file has them. */
+const UNREAD_SHAPES = new Set(['HATCH', 'SOLID', 'TRACE', '3DFACE', 'REGION', 'MLINE', 'BODY', '3DSOLID', 'MESH', 'SURFACE', 'WIPEOUT']);
 const PLATE_LAYER = new RegExp(`${B}(PLATE|SHEET|STOCK|MATERIAL|RAWPLATE)${E}`, 'i');
 
 const r4 = (n) => Math.round(n * 1e4) / 1e4;
@@ -298,6 +329,7 @@ function readSections(pairs) {
       let j = i + 1;
       for (; j < pairs.length && pairs[j][0] !== 0; j++) {
         if (pairs[j][0] === 8) e.layer = pairs[j][1];
+        else if (pairs[j][0] === 62) e.color = Number(pairs[j][1]);
         e.codes.push(pairs[j]);
       }
       i = j - 1;
@@ -367,20 +399,25 @@ function plainMtext(s) {
 /**
  * Every entity, blocks opened out, as loose paths, closed rings and words — in file units × scale.
  */
-function explode(dxf, scale, warnings) {
-  const open = [];      // { pts, line, layer, chain }
-  const closed = [];    // { pts, layer, chain }
+function explode(dxf, scale, warnings, cautions = [], dropStyles = null) {
+  const open = [];      // { pts, line, layer, chain, style }
+  const closed = [];    // { pts, layer, chain, style }
   const texts = [];     // { text, at, alt, layer, chain }
-  const stats = { skippedLayer: 0, pierce: 0, unknownBlocks: new Set(), tooDeep: false, splines: 0, count: 0 };
+  const stats = { skippedLayer: 0, pierce: 0, unknownBlocks: new Set(), tooDeep: false, splines: 0, splinesByControl: 0, count: 0, marking: 0, unread: new Map() };
   let instance = 0;
+  /*
+   * STYLE = the layer and the entity's own colour (group 62; by-layer and by-block count as none):
+   * what a nesting program tells a cut from a marking by when both are drawn on the plate.
+   */
+  let style = '0|';
 
   const bump = () => { if (++stats.count > MAX_PRIMITIVES) throw invalid('TOO_BIG', 'That file holds more shapes than one plate can — is it one nest per file?'); };
   const path = (m, pts, layer, chain, line = false) => {
     if (pts.length < 2) return;
     bump();
-    open.push({ pts: pts.map((p) => apply(m, p)), line, layer, chain });
+    open.push({ pts: pts.map((p) => apply(m, p)), line, layer, chain, style });
   };
-  const ring = (m, pts, layer, chain) => { bump(); closed.push({ pts: pts.map((p) => apply(m, p)), layer, chain }); };
+  const ring = (m, pts, layer, chain) => { bump(); closed.push({ pts: pts.map((p) => apply(m, p)), layer, chain, style }); };
   const poly = (m, verts, isClosed, layer, chain) => {
     if (verts.length < 2) return;
     const n = verts.length;
@@ -405,6 +442,12 @@ function explode(dxf, scale, warnings) {
       const isText = e.type === 'TEXT' || e.type === 'MTEXT' || e.type === 'ATTRIB';
       if (!isText && e.type !== 'INSERT' && SKIP_LAYER.test(layer)) {
         if (e.type !== 'VERTEX' && e.type !== 'SEQEND') stats.skippedLayer++;
+        continue;
+      }
+      style = `${layer}|${e.color == null || e.color === 256 || e.color === 0 ? '' : e.color}`;
+      // A style the caller says is marking (readNestDxf `markingStyles`): not a cut, so not read as one.
+      if (!isText && e.type !== 'INSERT' && dropStyles?.has(style)) {
+        if (e.type !== 'VERTEX' && e.type !== 'SEQEND') stats.marking++;
         continue;
       }
       switch (e.type) {
@@ -469,6 +512,7 @@ function explode(dxf, scale, warnings) {
           const pts = fit.length >= 2 ? fit : ctrl;
           if (pts.length < 2) break;
           stats.splines++;
+          if (fit.length < 2) stats.splinesByControl++;
           if ((num(c, 70) & 1) === 1 && pts.length > 2) ring(m, pts, layer, chain);
           else path(m, pts, layer, chain);
           break;
@@ -514,6 +558,7 @@ function explode(dxf, scale, warnings) {
           break;
         }
         default:
+          if (UNREAD_SHAPES.has(e.type)) stats.unread.set(e.type, (stats.unread.get(e.type) ?? 0) + 1);
           break;
       }
     }
@@ -522,9 +567,16 @@ function explode(dxf, scale, warnings) {
 
   if (stats.skippedLayer) warnings.push(`${plural(stats.skippedLayer, 'item', 'items')} on dimension, border, lead-in or rapid-move layers ignored.`);
   if (stats.pierce) warnings.push(`${plural(stats.pierce, 'pierce mark', 'pierce marks')} ignored.`);
-  if (stats.splines) warnings.push(`${plural(stats.splines, 'curve (spline) was', 'curves (splines) were')} read through their points — their shape is approximate.`);
-  for (const n of stats.unknownBlocks) warnings.push(`The file places a block called "${n}" that it does not define — whatever is in it is missing.`);
-  if (stats.tooDeep) warnings.push('Blocks inside blocks deeper than this reads were left out.');
+  if (stats.marking) warnings.push(`${plural(stats.marking, 'line', 'lines')} drawn in a marking colour or layer read as marking, not as cuts.`);
+  if (stats.splines - stats.splinesByControl) warnings.push(`${plural(stats.splines - stats.splinesByControl, 'curve (spline) was', 'curves (splines) were')} read through their points — their shape is approximate.`);
+  // What could have been a part and was not read is never only a note: these need the user's eye.
+  if (stats.splinesByControl) cautions.push({ code: 'CURVE_APPROXIMATE', message: `${plural(stats.splinesByControl, 'curve is a spline', 'curves are splines')} given only by control points, which this reads as straight runs between those points — the outline is approximate, several mm off on a tight curve. Export the nest with its curves as arcs or polylines, or save anyway.` });
+  for (const n of stats.unknownBlocks) cautions.push({ code: 'SHAPE_IGNORED', message: `the file places a block called "${n}" that it does not define — whatever is in it (a part, perhaps) is missing. Export the nest again with its blocks, or save anyway.` });
+  if (stats.tooDeep) cautions.push({ code: 'SHAPE_IGNORED', message: 'blocks inside blocks deeper than this reads were left out — a part may be missing. Explode the blocks in the nesting program and export again, or save anyway.' });
+  if (stats.unread.size) {
+    const total = [...stats.unread.values()].reduce((a, q) => a + q, 0);
+    cautions.push({ code: 'SHAPE_IGNORED', message: `the file holds ${[...stats.unread].map(([k, q]) => `${q} ${k}`).join(', ')} ${total === 1 ? 'item' : 'items'} — filled areas and solids, which this does not read. A part drawn only that way is missing. Export outlines as lines or polylines, or save anyway.` });
+  }
   return { open, closed, texts };
 }
 
@@ -534,9 +586,9 @@ function explode(dxf, scale, warnings) {
  * The closed loops a set of loose paths makes: the faces of their graph, after the paths on no
  * closed path are dropped. Returns { loops: [{ pts, layer, chain }], strays }.
  */
-function loopsFromPaths(paths, tol) {
+function loopsFromPaths(paths, tol, gapTol = 0) {
   const loops = [];
-  if (!paths.length) return { loops, strays: 0 };
+  if (!paths.length) return { loops, strays: 0, chains: [], closedGaps: [], splitStyles: [] };
 
   // 1. Ends that are one point.
   const nodes = [];
@@ -561,8 +613,8 @@ function loopsFromPaths(paths, tol) {
   const edges = [];
   for (const s of paths) {
     const a = s.pts[0]; const z = s.pts[s.pts.length - 1];
-    if (s.pts.length >= 4 && Math.abs(a[0] - z[0]) <= tol && Math.abs(a[1] - z[1]) <= tol) { loops.push({ pts: s.pts.slice(0, -1), layer: s.layer, chain: s.chain }); continue; }
-    edges.push({ u: nodeAt(a), v: nodeAt(z), pts: s.pts, line: s.line && s.pts.length === 2, layer: s.layer, chain: s.chain });
+    if (s.pts.length >= 4 && Math.abs(a[0] - z[0]) <= tol && Math.abs(a[1] - z[1]) <= tol) { loops.push({ pts: s.pts.slice(0, -1), layer: s.layer, chain: s.chain, style: s.style }); continue; }
+    edges.push({ u: nodeAt(a), v: nodeAt(z), pts: s.pts, line: s.line && s.pts.length === 2, layer: s.layer, chain: s.chain, style: s.style });
   }
 
   // 2. A straight line is cut wherever a node lies on it (a T of a common cut, a lead-in, a crossing);
@@ -595,7 +647,7 @@ function loopsFromPaths(paths, tol) {
       on.sort((a, b) => a.t - b.t);
       let prev = e.u;
       for (const o of [...on, { id: e.v }]) {
-        if (o.id !== prev) split.push({ u: prev, v: o.id, pts: [nodes[prev], nodes[o.id]], line: true, layer: e.layer, chain: e.chain });
+        if (o.id !== prev) split.push({ u: prev, v: o.id, pts: [nodes[prev], nodes[o.id]], line: true, layer: e.layer, chain: e.chain, style: e.style });
         prev = o.id;
       }
     }
@@ -707,13 +759,132 @@ function loopsFromPaths(paths, tol) {
     return made;
   };
 
+  /**
+   * 3b. GAPS (see GAP_CLOSE_MM): two loose ends — nodes only one line reaches — that are a sloppy
+   * corner or a tab apart are joined by a straight cut. Nearest pairs first, each end once.
+   * Returns the joins made: [{ edge, gap, at }].
+   */
+  const closeGaps = (list) => {
+    const deg = new Int32Array(nodes.length);
+    const dir = new Array(nodes.length);
+    for (const e of list) {
+      const p = e.pts; const n = p.length;
+      deg[e.u]++; deg[e.v]++;
+      dir[e.u] = [p[0][0] - p[1][0], p[0][1] - p[1][1]];                  // the way the line would carry on past its end
+      dir[e.v] = [p[n - 1][0] - p[n - 2][0], p[n - 1][1] - p[n - 2][1]];
+    }
+    const loose = [];
+    for (let id = 0; id < nodes.length; id++) if (deg[id] === 1) loose.push(id);
+    if (loose.length < 2) return [];
+    const cell = new Map();
+    const key = (p) => `${Math.floor(p[0] / gapTol)},${Math.floor(p[1] / gapTol)}`;
+    for (const id of loose) { const k = key(nodes[id]); if (cell.has(k)) cell.get(k).push(id); else cell.set(k, [id]); }
+    const pairs = [];
+    for (const a of loose) {
+      const gx = Math.floor(nodes[a][0] / gapTol); const gy = Math.floor(nodes[a][1] / gapTol);
+      for (let i = gx - 1; i <= gx + 1; i++) {
+        for (let j = gy - 1; j <= gy + 1; j++) {
+          for (const b of cell.get(`${i},${j}`) ?? []) {
+            if (b <= a) continue;
+            const d = Math.hypot(nodes[b][0] - nodes[a][0], nodes[b][1] - nodes[a][1]);
+            if (d <= gapTol) pairs.push({ a, b, d });
+          }
+        }
+      }
+    }
+    pairs.sort((p, q) => p.d - q.d);
+    const used = new Set();
+    const made = [];
+    for (const { a, b, d } of pairs) {
+      if (used.has(a) || used.has(b) || d < 1e-9) continue;
+      if (d > CORNER_GAP_MM) {
+        const ux = (nodes[b][0] - nodes[a][0]) / d; const uy = (nodes[b][1] - nodes[a][1]) / d;
+        const la = Math.hypot(dir[a][0], dir[a][1]) || 1; const lb = Math.hypot(dir[b][0], dir[b][1]) || 1;
+        if ((dir[a][0] * ux + dir[a][1] * uy) / la < FACING_COS || (-dir[b][0] * ux - dir[b][1] * uy) / lb < FACING_COS) continue;
+      }
+      used.add(a); used.add(b);
+      const edge = { u: a, v: b, pts: [nodes[a], nodes[b]], line: true, layer: list.find((e) => e.u === a || e.v === a).layer, chain: [], style: null, closing: true };
+      made.push({ edge, gap: d, at: [(nodes[a][0] + nodes[b][0]) / 2, (nodes[a][1] + nodes[b][1]) / 2] });
+    }
+    return made;
+  };
+
   const first = tidy(edges);
+  const joins = gapTol > tol ? closeGaps(first) : [];
+  for (const j of joins) { const near = first.find((e) => e.u === j.edge.u || e.v === j.edge.u); j.edge.chain = near.chain; j.edge.style = near.style; first.push(j.edge); }
   let live = closedOnly(first);
-  let strays = first.length - live.length;
+  let kept = new Set(live);
+  const dropped = first.filter((e) => !kept.has(e));
   if (crossings(live)) {
     const again = tidy(live);
     live = closedOnly(again);
-    strays += again.length - live.length;
+    kept = new Set(live);
+    for (const e of again) if (!kept.has(e)) dropped.push(e);
+  }
+  // A join that closed nothing (its chain is still on no closed path) was not a gap in an outline.
+  const closedGaps = joins.filter((j) => !dropped.includes(j.edge)).map((j) => ({ gap: j.gap, at: j.at }));
+  const stray = dropped.filter((e) => !e.closing);
+  const strays = stray.length;
+
+  /**
+   * 4b. WHAT WAS DROPPED, as chains: the dropped lines that hang together. Each says whether it
+   * is one plain run from end to end touching nothing that was kept (`simple` — the shape of an
+   * outline left open, as against a lead-in, which hangs off a contour, or a dimension, which
+   * branches), its ends, its length and points to probe where it lies.
+   */
+  const chains = [];
+  if (stray.length) {
+    const liveNode = new Uint8Array(nodes.length);
+    for (const e of live) { liveNode[e.u] = 1; liveNode[e.v] = 1; }
+    const comp = new Map();
+    const find = (x) => { let r = x; while (comp.get(r) !== r) r = comp.get(r); comp.set(x, r); return r; };
+    for (const e of stray) { for (const id of [e.u, e.v]) if (!comp.has(id)) comp.set(id, id); const a = find(e.u); const b = find(e.v); if (a !== b) comp.set(a, b); }
+    const groups = new Map();
+    for (const e of stray) { const r = find(e.u); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(e); }
+    const lenOf = (e) => { let s = 0; for (let k = 1; k < e.pts.length; k++) s += Math.hypot(e.pts[k][0] - e.pts[k - 1][0], e.pts[k][1] - e.pts[k - 1][1]); return s; };
+    for (const list of groups.values()) {
+      const deg = new Map();
+      let length = 0; let segments = 0; let touchesLive = false;
+      const styleLen = new Map();
+      for (const e of list) {
+        const l = lenOf(e);
+        length += l; segments += e.pts.length - 1;
+        styleLen.set(e.style, (styleLen.get(e.style) ?? 0) + l);
+        for (const id of [e.u, e.v]) { deg.set(id, (deg.get(id) ?? 0) + 1); if (liveNode[id]) touchesLive = true; }
+      }
+      const ends = [...deg].filter(([, d]) => d === 1).map(([id]) => id);
+      const simple = !touchesLive && ends.length === 2 && [...deg.values()].every((d) => d <= 2);
+      let pts = null;
+      if (simple) {
+        // Walk it from one end to the other.
+        const at = new Map();
+        for (const e of list) for (const id of [e.u, e.v]) { if (!at.has(id)) at.set(id, []); at.get(id).push(e); }
+        pts = [];
+        let node = ends[0]; let via = null;
+        for (let guard = list.length; guard-- > 0;) {
+          const e = at.get(node).find((x) => x !== via);
+          if (!e) break;
+          const seq = e.u === node ? e.pts : e.pts.slice().reverse();
+          for (let k = pts.length ? 1 : 0; k < seq.length; k++) pts.push(seq[k]);
+          via = e; node = e.u === node ? e.v : e.u;
+        }
+      }
+      // Probes: the middle of every straight run, and of long runs every 25 mm or so (at most ~200 a chain).
+      const probes = [];
+      const step = Math.max(25, length / 200);
+      for (const e of list) {
+        for (let k = 1; k < e.pts.length; k++) {
+          const p = e.pts[k - 1]; const q = e.pts[k];
+          const n = Math.max(1, Math.round(Math.hypot(q[0] - p[0], q[1] - p[1]) / step));
+          for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; probes.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]); }
+        }
+      }
+      chains.push({
+        lines: list.length, length, segments, simple, touchesLive, pts, probes,
+        style: [...styleLen].sort((a, b) => b[1] - a[1])[0][0],
+        ends: ends.length === 2 ? [nodes[ends[0]], nodes[ends[1]]] : null,
+      });
+    }
   }
 
   // 6. Faces: leave each node by the next edge clockwise from the one arrived on. Every bounded
@@ -756,10 +927,20 @@ function loopsFromPaths(paths, tol) {
   const lengthOf = (e) => { let s = 0; for (let k = 1; k < e.pts.length; k++) s += Math.hypot(e.pts[k][0] - e.pts[k - 1][0], e.pts[k][1] - e.pts[k - 1][1]); return s; };
   for (const fc of faces) {
     let all = 0; let both = 0;
-    for (const x of fc.halves) { const l = lengthOf(live[x >> 1]); all += l; if (faceOf[x ^ 1] !== -1) both += l; }
-    loops.push({ pts: fc.pts, layer: fc.layer, chain: fc.chain, shared: all > 0 ? both / all : 0 });
+    const styleLen = new Map();
+    for (const x of fc.halves) { const e = live[x >> 1]; const l = lengthOf(e); all += l; if (faceOf[x ^ 1] !== -1) both += l; styleLen.set(e.style, (styleLen.get(e.style) ?? 0) + l); }
+    // A face is drawn in the style most of its boundary is drawn in.
+    fc.style = [...styleLen].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    loops.push({ pts: fc.pts, layer: fc.layer, chain: fc.chain, style: fc.style, shared: all > 0 ? both / all : 0 });
   }
-  return { loops, strays };
+  // A cut shared by two faces, drawn in a style that is neither face's own: it may be a MARKING line
+  // from edge to edge of one part, not a cut between two (readNestDxf `splitStyles`).
+  const splitStyles = new Set();
+  live.forEach((e, i) => {
+    const a = faceOf[2 * i]; const b = faceOf[2 * i + 1];
+    if (a !== -1 && b !== -1 && a !== b && e.style != null && faces[a].style !== e.style && faces[b].style !== e.style) splitStyles.add(e.style);
+  });
+  return { loops, strays, chains, closedGaps, splitStyles: [...splitStyles] };
 }
 const midOfPath = (pts) => pts[pts.length >> 1];
 
@@ -784,9 +965,18 @@ function hintsFrom(strings, filename) {
       if (two) { const v = two.slice(1, 3).map(Number).sort((a, b) => a - b); if (v[0] >= 50) h.plateSize = { length: v[1], width: v[0] }; }
     }
     if (h.thicknessMm == null) {
-      const t = s.match(/(?:THK|THICK(?:NESS)?)\s*[=:.]?\s*(\d+(?:\.\d+)?)/i) ?? s.match(/(?:^|[^A-Z0-9])T\s*[=:]\s*(\d+(?:\.\d+)?)/i)
-        ?? s.match(/(?:^|[^0-9.x×*])(\d+(?:\.\d+)?)\s*mm(?![a-z])(?!\s*[x×*])/i) ?? s.match(/(?:^|[^A-Z0-9])PL\.?\s*(\d+(?:\.\d+)?)(?![0-9]*\s*[x×*])/i);
+      // A thickness is read from WORDS only in a form that says it is one: THK 12, 12 THK, T = 12, PL 12
+      // (and the L x W x T size above). A bare "25 mm" is a dimension somebody left on the drawing.
+      const t = s.match(/(?:THK|THICK(?:NESS)?)\s*[=:.]?\s*(\d+(?:\.\d+)?)/i) ?? s.match(/(\d+(?:\.\d+)?)\s*(?:mm)?\s*(?:THK|THICK)(?![a-z])/i)
+        ?? s.match(/(?:^|[^A-Z0-9])T\s*[=:]\s*(\d+(?:\.\d+)?)/i) ?? s.match(/(?:^|[^A-Z0-9])PL\.?\s*(\d+(?:\.\d+)?)(?![0-9]*\s*[x×*])/i);
       if (t && Number(t[1]) > 0 && Number(t[1]) <= 300) h.thicknessMm = Number(t[1]);
+      else {
+        // …and "12 mm" as a field of its own in a title line of several fields (our own CNC export:
+        // "Nest N-007 | Plate P | 12 mm | E350 | 3000 x 1000").
+        const fields = s.split(/\s*[|;,]\s*/);
+        const f = fields.length >= 2 ? fields.map((x) => x.trim().match(/^(\d+(?:\.\d+)?)\s*mm$/i)).find(Boolean) : null;
+        if (f && Number(f[1]) > 0 && Number(f[1]) <= 300) h.thicknessMm = Number(f[1]);
+      }
     }
     if (h.grade == null) { const m = s.match(GRADE); if (m) h.grade = m[1].replace(/\s+/g, ' ').trim().toUpperCase(); }
     if (h.nestNo == null) {
@@ -896,7 +1086,12 @@ export function dxfTextHints(text) {
  * Reads one plate's nesting DXF.
  *
  * @param {string|Uint8Array} text  the file
- * @param {{ filename?: string, joinTolMm?: number, plateOutline?: boolean, plateSize?: { length, width } }} [opts]
+ * @param {{ filename?: string, joinTolMm?: number, gapTolMm?: number, plateOutline?: boolean, plateSize?: { length, width },
+ *           plateSizes?: Array<{ length, width }>, units?: 'in', markingStyles?: string[] }} [opts]
+ *        gapTolMm: the widest gap in an outline that is closed (GAP_CLOSE_MM; 0 closes nothing).
+ *        plateSizes: every size a plate comes in (the catalog's) — tells the plate from a frame round it, and two plates from two parts.
+ *        units: 'in' reads a file whose header names no unit as inches.
+ *        markingStyles: styles ("LAYER|colour", as `splitStyles` gives them) to read as marking, not as cuts.
  *        plateSize: the plate's size when the caller knows it (mm) — a common-cut nest whose rim is that size has its plate drawn.
  *        plateOutline: say outright
  *        that the file does (true) or does not (false) draw the plate, instead of letting the reader judge
@@ -908,31 +1103,46 @@ export function dxfTextHints(text) {
  *   hints: { thicknessMm, grade, nestNo, plateSize },
  *   offcuts: Array<{ outline, bbox, label }>,   // loops on an offcut / remnant layer (our own export draws them)
  *   skeleton: { outline, bbox } | null,         // what is left of the plate, when parts are common-cut against its edge
- *   (each part also says: commonCut 0…1, outsidePlate, outsideMm)
- *   warnings: string[],
+ *   (each part also says: commonCut 0…1, outsidePlate, outsideMm; and — when closed shapes inside it
+ *    may be marking — ringsNoMarks, areaNoMarks, unsureMarks, unsureStyle)
+ *   unitsStated: boolean, plates: number, closedGaps: number,
+ *   outside: Array<{ rings, bbox, area, labels, inFrame, layer }>,   // closed shapes beside the plate
+ *   splitStyles: string[], markingStyles: string[],
+ *   problems: Array<{ code: 'OPEN_CONTOUR'|'MULTIPLE_PLATES', message, … }>,                // block the file
+ *   cautions: Array<{ code: 'SHAPE_IGNORED'|'CURVE_APPROXIMATE', message, … }>,             // need the user's eye
+ *   warnings: string[],                                                                    // notes
  * }}
  * @throws an Error with .code 'BAD_FILE' | 'EMPTY_NEST' | 'TOO_BIG'
  */
-export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline, plateSize } = {}) {
+export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, gapTolMm = GAP_CLOSE_MM, plateOutline, plateSize, plateSizes, units, markingStyles } = {}) {
   const warnings = [];
+  const problems = [];      // { code, message, … } — block the file
+  const cautions = [];      // { code, message, … } — need the user's eye (a save needs force)
   const dxf = readSections(pairsOf(toText(text)));
-  const unitCode = dxf.units ?? 0;
+  const unitsStated = dxf.units != null && dxf.units !== 0;
+  const unitCode = units === 'in' ? 1 : dxf.units ?? 0;
   const scale = UNIT[unitCode] ?? 1;
   if (!(unitCode in UNIT)) warnings.push('The file names a unit this reader does not know; it is read as millimetres.');
   const tol = Math.max(0.01, Number(joinTolMm) || JOIN_TOL);
+  const gapTol = Math.max(0, Number(gapTolMm) || 0);
 
-  const raw = explode(dxf, scale, warnings);
-  const fromPaths = loopsFromPaths(raw.open, tol);
-  if (fromPaths.strays) warnings.push(`${plural(fromPaths.strays, 'line that does', 'lines that do')} not close into a shape ignored (lead-ins, rapid moves).`);
+  const raw = explode(dxf, scale, warnings, cautions, markingStyles?.length ? new Set(markingStyles) : null);
+  // A line on an offcut / remnant layer (the crop line that marks the piece to keep) is not a cut of
+  // the nest: it must not split the plate it runs across. Such lines close only among themselves.
+  const cutPaths = raw.open.filter((p) => !OFFCUT_LAYER.test(p.layer));
+  const offPaths = raw.open.filter((p) => OFFCUT_LAYER.test(p.layer));
+  const fromPaths = loopsFromPaths(cutPaths, tol, gapTol);
+  const fromOff = loopsFromPaths(offPaths, tol, 0);
+  if (fromOff.strays) warnings.push(`${plural(fromOff.strays, 'line', 'lines')} on an offcut / remnant layer (a crop line) ignored — not a cut of the nest.`);
 
   // Every loop, counter-clockwise, biggest first; a contour drawn twice is one contour.
   let loops = [];
-  for (const l of [...raw.closed, ...fromPaths.loops]) {
+  for (const l of [...raw.closed, ...fromPaths.loops, ...fromOff.loops]) {
     const pts = cleanRing(l.pts);
     if (pts.length < 3) continue;
     const area = signedArea(pts);
     if (area < MIN_LOOP_AREA) continue;
-    loops.push({ pts, area, box: boxOf(pts), layer: l.layer ?? '0', chain: l.chain ?? [], shared: l.shared ?? 0, outsideMm: 0, parent: null, kids: [] });
+    loops.push({ pts, area, box: boxOf(pts), layer: l.layer ?? '0', style: l.style ?? null, chain: l.chain ?? [], shared: l.shared ?? 0, outsideMm: 0, parent: null, kids: [] });
   }
   loops.sort((a, b) => b.area - a.area);
   const sameBox = (a, b) => Math.abs(a.x0 - b.x0) <= 2 * tol && Math.abs(a.y0 - b.y0) <= 2 * tol && Math.abs(a.x1 - b.x1) <= 2 * tol && Math.abs(a.y1 - b.y1) <= 2 * tol;
@@ -960,51 +1170,102 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
 
   // The words, and what they say about the plate (needed to tell a plate from one big part).
   const titleHints = hintsFrom(raw.texts.map((t) => t.text), null);
+  const nameHints = hintsFrom([], filename);
   const sizeIs = (box, size) => {
     if (!size) return false;
     const d = [box.x1 - box.x0, box.y1 - box.y0].sort((a, b) => a - b);
     return Math.abs(d[1] - size.length) <= 1 && Math.abs(d[0] - size.width) <= 1;
   };
+  const sizeOf = (s) => (s && Number(s.length) > 0 && Number(s.width) > 0 ? { length: Math.max(Number(s.length), Number(s.width)), width: Math.min(Number(s.length), Number(s.width)) } : null);
+  const boxSize = (b) => sizeOf({ length: b.x1 - b.x0, width: b.y1 - b.y0 });
+  const sizeWordsOf = (b) => `${r1(Math.max(b.x1 - b.x0, b.y1 - b.y0))} x ${r1(Math.min(b.x1 - b.x0, b.y1 - b.y0))}`;
 
   // THE PLATE: the loop on a plate layer, else the one loop that holds all the others — unless
   // that reads as a single part with its holes.
-  const known = plateSize && Number(plateSize.length) > 0 && Number(plateSize.width) > 0
-    ? { length: Math.max(Number(plateSize.length), Number(plateSize.width)), width: Math.min(Number(plateSize.length), Number(plateSize.width)) } : null;
-  const isPlateSize = (box) => sizeIs(box, titleHints.plateSize) || sizeIs(box, known);
+  // A size "a plate comes in": the plate named by the caller, the size the title or the file name
+  // states, or any plate of the catalog (`plateSizes`).
+  const known = sizeOf(plateSize);
+  const catalog = (plateSizes ?? []).map(sizeOf).filter(Boolean);
+  const isPlateSize = (box) => sizeIs(box, titleHints.plateSize) || sizeIs(box, known) || sizeIs(box, nameHints.plateSize) || catalog.some((s) => sizeIs(box, s));
+  const isRect = (l) => l.area >= 0.98 * (l.box.x1 - l.box.x0) * (l.box.y1 - l.box.y0);
+  const ancestorsOf = (l) => { const out = []; for (let p = l.parent; p; p = p.parent) out.push(p); return out; };
   /** A loop that is not inside the plate but lies partly over it: a part across the plate's edge. */
   const straddles = (l, b) => Math.min(l.box.x1, b.x1) - Math.max(l.box.x0, b.x0) > tol && Math.min(l.box.y1, b.y1) - Math.max(l.box.y0, b.y0) > tol
     && (l.box.x0 < b.x0 - tol || l.box.x1 > b.x1 + tol || l.box.y0 < b.y0 - tol || l.box.y1 > b.y1 + tol);
   const textIn = (l) => raw.texts.some((t) => [t.at, t.alt].some((q) => insidePoly(q, l.pts) && !l.kids.some((k) => insidePoly(q, k.pts))));
+  /** Its loops are parts (one has a label in it, or openings of its own) — not the bare holes of one part. */
+  const holdsParts = (l) => l.kids.some((k) => k.kids.length) || raw.texts.some((t) => l.kids.some((k) => insidePoly(t.at, k.pts) || insidePoly(t.alt, k.pts)));
 
-  let plateLoop = plateOutline === false ? null : loops.find((l) => PLATE_LAYER.test(l.layer)) ?? null;
+  let plateLoop = null;
+  if (plateOutline !== false) {
+    // On a plate layer: the biggest loop that is not inside another loop of a plate layer (the first that holds something).
+    const onLayer = loops.filter((l) => PLATE_LAYER.test(l.layer) && !ancestorsOf(l).some((a) => PLATE_LAYER.test(a.layer)));
+    plateLoop = onLayer.find((l) => l.kids.length) ?? onLayer[0] ?? null;
+  }
   if (plateLoop && !plateLoop.kids.length) throw invalid('EMPTY_NEST', 'The file draws a plate with nothing nested on it.');
   if (!plateLoop && plateOutline !== false && roots[0].kids.length) {
     const r = roots[0];
     const others = roots.slice(1);
     // The other loops outside it may only be parts lying across its edge — and then it must be a plain rectangle.
-    const holdsAll = others.every((l) => straddles(l, r.box)) && (!others.length || r.area >= 0.98 * (r.box.x1 - r.box.x0) * (r.box.y1 - r.box.y0));
+    const holdsAll = others.every((l) => straddles(l, r.box)) && (!others.length || isRect(r));
     if (holdsAll) {
       const textInKid = raw.texts.some((t) => r.kids.some((k) => insidePoly(t.at, k.pts) || insidePoly(t.alt, k.pts)));
       // One part with its drilled holes and nothing else: every loop inside is a bare hole on the part's own layer.
       const drilled = (k) => { const c = circleOf(k.pts); return !!c && 2 * c.r <= DRILL_MAX_DIA_MM + 1e-6; };
       const onePart = !others.length && plateOutline !== true && !isPlateSize(r.box) && !textInKid && r.kids.every((k) => !k.kids.length && k.layer === r.layer && drilled(k));
       if (!onePart) plateLoop = r;
+      /*
+       * A FRAME ROUND THE PLATE with no layer to say so (a drawing sheet flattened to layer 0): the
+       * outermost rectangle is then the sheet's border, not the plate. When it is not a size a plate
+       * comes in and exactly one rectangle inside it is — one that holds loops of its own — that
+       * inner rectangle is the plate and the outer one a frame. Again, for a frame inside a frame.
+       */
+      while (plateLoop && isRect(plateLoop) && !isPlateSize(plateLoop.box)) {
+        const sized = plateLoop.kids.filter((k) => k.kids.length && isRect(k) && isPlateSize(k.box));
+        if (!sized.length) break;
+        plateLoop = sized[0];       // two of them are two plates on one sheet: said below
+      }
+    } else {
+      // No loop holds the others. Rectangles side by side that each hold parts, each a size a plate
+      // comes in (or all one size): several plates in one file. The first is read, and the file is refused.
+      const like = roots.filter((l) => isRect(l) && l.kids.length && (isPlateSize(l.box) || holdsParts(l)));
+      if (like.length >= 2 && (like.filter((l) => isPlateSize(l.box)).length >= 2 || like.every((l) => sizeIs(l.box, boxSize(like[0].box))))) plateLoop = like[0];
     }
   }
+  const frames = plateLoop ? ancestorsOf(plateLoop) : [];
   let partLoops;
   let plate;
   let skeleton = null;
+  const outsideLoops = [];        // { loop, inFrame } — closed shapes that are neither the plate nor on it
+  let plates = 1;
   if (plateLoop) {
     partLoops = plateLoop.kids.slice();
     const b = plateLoop.box;
-    let across = 0; let outside = 0;
-    for (const l of roots) {
-      if (l === plateLoop) continue;
+    let across = 0;
+    const consider = (l, inFrame) => {
       // A PART ACROSS THE PLATE'S EDGE is still a part: it is returned, flagged, with how far out it reaches.
-      if (!plateLoop.parent && straddles(l, b)) { l.outsideMm = Math.max(b.x0 - l.box.x0, l.box.x1 - b.x1, b.y0 - l.box.y0, l.box.y1 - b.y1, 0); partLoops.push(l); across++; } else outside++;
+      if (straddles(l, b)) { l.outsideMm = Math.max(b.x0 - l.box.x0, l.box.x1 - b.x1, b.y0 - l.box.y0, l.box.y1 - b.y1, 0); partLoops.push(l); across++; } else outsideLoops.push({ loop: l, inFrame });
+    };
+    const top = frames.length ? frames[frames.length - 1] : plateLoop;
+    for (const l of roots) if (l !== top) consider(l, false);
+    let inner = plateLoop;
+    for (const fr of frames) { for (const k of fr.kids) if (k !== inner) consider(k, true); inner = fr; }
+    if (frames.length) warnings.push(`A frame (${sizeWordsOf(frames[0].box)}) is drawn round the plate: the plate is the ${sizeWordsOf(b)} rectangle inside it.`);
+    /*
+     * MORE THAN ONE PLATE IN THE FILE (a job exported as "all sheets"). One file is one plate, so the
+     * file is REFUSED in words — never read as its first plate with the others dropped. Another plate
+     * is a rectangle outside this one that holds loops and is on a plate layer, or is this plate's
+     * size, or a size a plate comes in.
+     */
+    const otherPlates = outsideLoops.filter((o) => isRect(o.loop) && o.loop.kids.length && (PLATE_LAYER.test(o.loop.layer) || sizeIs(o.loop.box, boxSize(b)) || isPlateSize(o.loop.box)));
+    if (otherPlates.length) {
+      plates = 1 + otherPlates.length;
+      const sizes = [...new Set([plateLoop, ...otherPlates.map((o) => o.loop)].map((l) => sizeWordsOf(l.box)))];
+      problems.push({ code: 'MULTIPLE_PLATES', plates, message: `it holds ${plates} plates (${sizes.length === 1 ? `each ${sizes[0]}` : sizes.join(', ')}). One file is one plate — export each plate as its own file and upload them together. Nothing of this file is taken.` });
+      for (const o of otherPlates) outsideLoops.splice(outsideLoops.indexOf(o), 1);
     }
     if (across) warnings.push(`${plural(across, 'part lies', 'parts lie')} partly off the plate.`);
-    if (outside) warnings.push(`${plural(outside, 'shape', 'shapes')} drawn outside the plate ignored.`);
+    if (outsideLoops.length) warnings.push(`${plural(outsideLoops.length, 'shape', 'shapes')} drawn outside the plate ignored.`);
     plate = { length: r4(b.x1 - b.x0), width: r4(b.y1 - b.y0), origin: [b.x0, b.y0], outline: plateLoop.pts, found: 'outline' };
     if (!partLoops.length) throw invalid('EMPTY_NEST', 'The file draws a plate with nothing nested on it.');
   } else {
@@ -1021,19 +1282,85 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
     plate = { length: r4(b.x1 - b.x0), width: r4(b.y1 - b.y0), origin: [b.x0, b.y0], outline: [[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]], found: drawn ? 'outline' : 'bounds' };
     if (!drawn) warnings.push('The file does not draw the plate itself, so the plate here is only the rectangle round the parts — positions are measured from its lower-left corner.');
   }
+  // When the plate found is no size a plate comes in, a rectangle inside it that holds everything else may be the real plate.
+  if (plateLoop && !isPlateSize(plateLoop.box)) {
+    const holders = plateLoop.kids.filter((k) => k.kids.length);
+    if (holders.length === 1 && isRect(holders[0]) && isRect(plateLoop)) plate.inside = boxSize(holders[0].box);
+  }
   const [ox, oy] = plate.origin;
   const local = (pts) => pts.map(([x, y]) => [r4(x - ox), r4(y - oy)]);
+  const here = (p) => `(${r1(p[0] - ox)}, ${r1(p[1] - oy)})`;
   plate.outline = local(plate.outline);
   plate.origin = [r4(ox / scale), r4(oy / scale)];       // where the plate's corner is in the FILE, in the file's units
 
+  /*
+   * WHAT DID NOT CLOSE INTO A SHAPE (the chains of dropped lines) — said by what it most likely is:
+   *   - lying wholly inside one part: marking (a layout line, scribed letters) or the lead-in of a
+   *     cut-out. Not a cut. Its style, when it is not the part's own, is a MARKING style: closed
+   *     shapes drawn in it inside parts are marking too, never cut-outs;
+   *   - one plain run of lines in the scrap that would enclose a part's worth of steel if its ends
+   *     met: AN OUTLINE LEFT OPEN. Ends near each other → the file is refused (OPEN_CONTOUR), with
+   *     where and how wide; far apart → a warning that needs the user's eye (SHAPE_IGNORED);
+   *   - anything else: lead-ins, rapid moves, a leftover dimension — a note, as before.
+   */
+  const homeOf = (pt) => partLoops.find((l) => pt[0] >= l.box.x0 && pt[0] <= l.box.x1 && pt[1] >= l.box.y0 && pt[1] <= l.box.y1 && insidePoly(pt, l.pts)) ?? null;
+  const markStyles = new Set(markingStyles ?? []);
+  let leadLike = 0; let inParts = 0;
+  for (const ch of fromPaths.chains) {
+    const homes = new Set(ch.probes.map(homeOf));
+    if (homes.size === 1 && !homes.has(null)) {
+      inParts += ch.lines;
+      const home = [...homes][0];
+      if (ch.style != null && home.style != null && ch.style !== home.style) markStyles.add(ch.style);
+      continue;
+    }
+    const enclosed = ch.simple && ch.segments >= OPEN_PART_MIN_SEGMENTS && homes.size === 1 ? Math.abs(signedArea(ch.pts)) : 0;
+    if (enclosed < OPEN_PART_MIN_AREA) { leadLike += ch.lines; continue; }
+    const gap = Math.hypot(ch.ends[0][0] - ch.ends[1][0], ch.ends[0][1] - ch.ends[1][1]);
+    const cb = boxOf(ch.pts);
+    const where = `about ${sizeWordsOf(cb)} at ${here([cb.x0, cb.y0])}`;
+    const mid = [(ch.ends[0][0] + ch.ends[1][0]) / 2, (ch.ends[0][1] + ch.ends[1][1]) / 2];
+    const extra = { at: [r1(mid[0] - ox), r1(mid[1] - oy)], gapMm: r1(gap), bbox: { x: r4(cb.x0 - ox), y: r4(cb.y0 - oy), length: r4(cb.x1 - cb.x0), width: r4(cb.y1 - cb.y0) } };
+    if (gap <= Math.max(OPEN_PART_GAP_BLOCK_MM, 0.1 * ch.length)) {
+      problems.push({ code: 'OPEN_CONTOUR', ...extra, message: `a shape ${where} is not a closed outline: its ends are ${r1(gap)} mm apart at ${here(mid)}. Close it in the nesting program and export again.` });
+    } else {
+      cautions.push({ code: 'SHAPE_IGNORED', ...extra, message: `a run of lines ${where} does not close into a shape (its ends are ${r1(gap)} mm apart), so it is not read as a part. If it is a part, close its outline in the nesting program and export again — or save anyway.` });
+    }
+  }
+  if (leadLike) warnings.push(`${plural(leadLike, 'line that does', 'lines that do')} not close into a shape ignored (lead-ins, rapid moves).`);
+  if (inParts) warnings.push(`${plural(inParts, 'open line', 'open lines')} inside parts ignored: marking, or the lead-ins of cut-outs — not cuts.`);
+  if (fromPaths.closedGaps.length) {
+    const widest = fromPaths.closedGaps.reduce((a, g) => (g.gap > a.gap ? g : a));
+    warnings.push(`${plural(fromPaths.closedGaps.length, 'gap', 'gaps')} in ${fromPaths.closedGaps.length === 1 ? 'an outline' : 'outlines'} closed (${fromPaths.closedGaps.length === 1 ? '' : 'the widest '}${r1(widest.gap) || '< 0.1'} mm, at ${here(widest.at)}): a micro-joint left uncut, or a line drawn short of its corner.`);
+  }
+
   // PARTS, all the way down: a loop inside a part is its cut-out; a loop inside a cut-out is a part.
+  /*
+   * …unless it is MARKING. A closed shape inside a part is
+   *   'cut'     a round hole of drilling size, or drawn in the part's own style (layer and colour);
+   *   'mark'    drawn in a marking style (see above): never a cut-out, left out of the part;
+   *   'unsure'  drawn in another style with nothing to say which it is. The part then comes with
+   *             its rings both ways (`rings` with, `ringsNoMarks` without) and matchNest lets the
+   *             cut plate's own drawing decide.
+   */
+  const drillHole = (k) => { const c = circleOf(k.pts); return !!c && 2 * c.r <= DRILL_MAX_DIA_MM + 1e-6; };
+  const kindOf = (loop, c) => (drillHole(c) || c.style == null || loop.style == null || c.style === loop.style ? 'cut' : markStyles.has(c.style) ? 'mark' : 'unsure');
   const parts = [];
+  let marksLeftOut = 0;
   const take = (loop, within) => {
-    const part = { loop, within, inner: loop.kids, labels: [], labelFrom: null };
+    const inner = []; const unsure = [];
+    for (const c of loop.kids) {
+      const kind = kindOf(loop, c);
+      if (kind === 'mark') { marksLeftOut += 1; continue; }
+      inner.push(c);
+      if (kind === 'unsure') unsure.push(c);
+    }
+    const part = { loop, within, inner, unsure, labels: [], labelFrom: null };
     parts.push(part);
-    for (const cut of loop.kids) for (const nested of cut.kids) take(nested, part);
+    for (const cut of inner) for (const nested of cut.kids) take(nested, part);
   };
   for (const l of partLoops) take(l, null);
+  if (marksLeftOut) warnings.push(`${plural(marksLeftOut, 'closed shape', 'closed shapes')} inside parts, drawn in the layer or colour of the marking lines, read as marking (scribed letters) — not as cut-outs.`);
   parts.sort((a, b) => Math.round(a.loop.box.y0) - Math.round(b.loop.box.y0) || a.loop.box.x0 - b.loop.box.x0 || a.loop.box.y0 - b.loop.box.y0);
   parts.forEach((p, i) => { p.id = `P${i + 1}`; });
 
@@ -1041,8 +1368,9 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
   // of the block the part is an INSERT of; then, for a part still unnamed, the nearest short text.
   const bySize = parts.slice().sort((a, b) => a.loop.area - b.loop.area);
   const holder = (pt) => bySize.find((p) => pt[0] >= p.loop.box.x0 && pt[0] <= p.loop.box.x1 && pt[1] >= p.loop.box.y0 && pt[1] <= p.loop.box.y1
-    && insidePoly(pt, p.loop.pts) && !p.inner.some((c) => insidePoly(pt, c.pts))) ?? null;
+    && insidePoly(pt, p.loop.pts) && !p.inner.some((c) => !p.unsure.includes(c) && insidePoly(pt, c.pts))) ?? null;
   const offcuts = offcutLoops.map((l) => ({ loop: l, label: null }));
+  const outside = outsideLoops.map((o) => ({ ...o, labels: [] }));
   const loose = [];
   for (const t of raw.texts) {
     const lines = t.text.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -1052,7 +1380,11 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
       continue;
     }
     const p = holder(t.at) ?? holder(t.alt);
-    if (p) { for (const s of lines) if (!p.labels.includes(s)) p.labels.push(s); p.labelFrom = 'inside'; } else loose.push({ ...t, lines });
+    if (p) { for (const s of lines) if (!p.labels.includes(s)) p.labels.push(s); p.labelFrom = 'inside'; } else {
+      loose.push({ ...t, lines });
+      const o = outside.find((x) => insidePoly(t.at, x.loop.pts) && !x.loop.kids.some((k) => insidePoly(t.at, k.pts)));
+      if (o && lines[0] && o.labels.length < 3) o.labels.push(lines[0]);
+    }
   }
   const perInstance = new Map();
   for (const p of parts) for (const c of p.loop.chain) perInstance.set(c.id, (perInstance.get(c.id) ?? 0) + 1);
@@ -1072,25 +1404,61 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
   }
   for (const p of parts) if (!p.labelFrom && p.near) { p.labels.push(p.near.text); p.labelFrom = 'near'; }
 
-  const hints = hintsFrom(loose.map((t) => t.text), filename);
+  /*
+   * HINTS: what the words outside the parts and the FILE NAME say about the plate. THE FILE NAME
+   * WINS — somebody typed it to say what the plate is; a loose text is whatever was left on the
+   * drawing (a title, but also a dimension). A text that disagrees with the name is a note.
+   */
+  const wordHints = hintsFrom(loose.map((t) => t.text), null);
+  const sameSizeHint = (a, b) => Math.abs(a.length - b.length) <= 1 && Math.abs(a.width - b.width) <= 1;
+  const hints = {
+    thicknessMm: nameHints.thicknessMm ?? wordHints.thicknessMm,
+    grade: nameHints.grade ?? wordHints.grade,
+    nestNo: wordHints.nestNo ?? nameHints.nestNo,
+    plateSize: nameHints.plateSize ?? wordHints.plateSize,
+    from: {
+      thicknessMm: nameHints.thicknessMm != null ? 'file name' : wordHints.thicknessMm != null ? 'words' : null,
+      grade: nameHints.grade != null ? 'file name' : wordHints.grade != null ? 'words' : null,
+      plateSize: nameHints.plateSize != null ? 'file name' : wordHints.plateSize != null ? 'words' : null,
+    },
+  };
+  if (nameHints.thicknessMm != null && wordHints.thicknessMm != null && Math.abs(nameHints.thicknessMm - wordHints.thicknessMm) > 0.01) {
+    warnings.push(`The words in the file say ${wordHints.thicknessMm} mm thick and the file name says ${nameHints.thicknessMm} mm — the file name is taken.`);
+  }
+  if (nameHints.plateSize && wordHints.plateSize && !sameSizeHint(nameHints.plateSize, wordHints.plateSize)) {
+    warnings.push(`The words in the file mention ${wordHints.plateSize.length} x ${wordHints.plateSize.width} and the file name says the plate is ${nameHints.plateSize.length} x ${nameHints.plateSize.width} — the file name is taken.`);
+  }
   if (plate.found === 'outline' && hints.plateSize && !sizeIs({ x0: 0, y0: 0, x1: plate.length, y1: plate.width }, hints.plateSize)) {
     const d = [plate.length, plate.width].sort((a, b) => b - a);
     const ratio = hints.plateSize.length / (d[0] || 1);
-    warnings.push(`The words in the file say the plate is ${hints.plateSize.length} x ${hints.plateSize.width}, but the plate drawn is ${r1(d[0])} x ${r1(d[1])}.${dxf.units == null && Math.abs(ratio - 25.4) < 0.3 ? ' The file does not say its units — it looks drawn in inches.' : ''}`);
+    warnings.push(`The ${hints.from.plateSize === 'file name' ? 'file name says' : 'words in the file say'} the plate is ${hints.plateSize.length} x ${hints.plateSize.width}, but the plate drawn is ${r1(d[0])} x ${r1(d[1])}.${!unitsStated && units !== 'in' && Math.abs(ratio - 25.4) < 0.3 ? ' The file does not say its units — it looks drawn in inches.' : ''}`);
   }
 
   const boxOut = (b) => ({ x: r4(b.x0 - ox), y: r4(b.y0 - oy), length: r4(b.x1 - b.x0), width: r4(b.y1 - b.y0) });
+  const ringsOf = (loop, inner) => {
+    const cutouts = []; const holes = [];
+    for (const c of inner) (drillHole(c) ? holes : cutouts).push(local(c.pts));
+    return { outline: local(loop.pts), cutouts, holes };
+  };
   return {
     units: UNIT_NAME[unitCode] ?? 'mm',
+    unitsStated: unitsStated || units === 'in',     // false: the header names no unit, so millimetres were assumed
     plate,
+    plates,                                         // how many plates the file holds (more than 1 is a MULTIPLE_PLATES problem)
     parts: parts.map((p) => {
-      const cutouts = []; const holes = [];
-      for (const c of p.inner) { const circ = circleOf(c.pts); (circ && 2 * circ.r <= DRILL_MAX_DIA_MM + 1e-6 ? holes : cutouts).push(local(c.pts)); }
+      const sure = p.unsure.length ? p.inner.filter((c) => !p.unsure.includes(c)) : p.inner;
       return {
         id: p.id,
-        rings: { outline: local(p.loop.pts), cutouts, holes },
+        rings: ringsOf(p.loop, p.inner),
         bbox: boxOut(p.loop.box),
         area: r4(p.loop.area - p.inner.reduce((s, c) => s + c.area, 0)),
+        // Closed shapes inside it in ANOTHER layer / colour than its outline, that may be marking: the part without them.
+        ...(p.unsure.length ? {
+          ringsNoMarks: ringsOf(p.loop, sure),
+          areaNoMarks: r4(p.loop.area - sure.reduce((s, c) => s + c.area, 0)),
+          unsureMarks: p.unsure.length,
+          unsureStyle: styleWords(p.unsure[0].style),
+        } : {}),
         labels: p.labels,
         labelFrom: p.labelFrom,
         layer: p.loop.layer,
@@ -1104,8 +1472,24 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, plateOutline
     hints,
     offcuts: offcuts.map((o) => ({ outline: local(o.loop.pts), bbox: boxOut(o.loop.box), label: o.label })),
     skeleton: skeleton ? { outline: local(skeleton.pts), bbox: boxOut(skeleton.box) } : null,
+    // Closed shapes that are neither the plate nor on it (and not another plate): the caller says what they are.
+    outside: outside.map((o) => ({ rings: ringsOf(o.loop, o.loop.kids), bbox: boxOut(o.loop.box), area: r4(o.loop.area), labels: o.labels, inFrame: o.inFrame, layer: o.loop.layer })),
+    // Styles in which a line runs from edge to edge of what would otherwise be one shape: read again with
+    // `markingStyles` set to these, the file may make more sense (the caller decides — it knows the cut plates).
+    splitStyles: fromPaths.splitStyles,
+    markingStyles: [...markStyles],
+    closedGaps: fromPaths.closedGaps.length,
+    problems,
+    cautions,
     warnings,
   };
+}
+/** "layer X" / "colour 2 on layer X" — a style in words. */
+export function styleWords(style) {
+  const s = String(style ?? '');
+  const i = s.lastIndexOf('|');
+  const layer = i < 0 ? s : s.slice(0, i); const colour = i < 0 ? '' : s.slice(i + 1);
+  return colour ? `colour ${colour} on layer ${layer}` : `layer ${layer}`;
 }
 
 /* ───────────────────────────── matchNest ───────────────────────────── */
@@ -1301,17 +1685,38 @@ const sizeWords = (a, b) => `${r1(Math.max(a, b))} x ${r1(Math.min(a, b))}`;
  * @param nest        what readNestDxf returned
  * @param candidates  [{ key, codes: string[], rings | null, length, width }] — rings as partGeometry
  *                    gives them ([outline, …inner]) or as { outline, cutouts, holes }
- * @returns {{ placements, unmatched, counts, ambiguous }}
- *   placements[]: { partId, candidateKey, x, y, rotationDeg, mirrored, by: 'label'|'shape'|'size', confidence, error }
+ * @param opts        { toleranceMm = 0.5, kerfOffsetMaxMm = KERF_OFFSET_MAX_MM (0 = never),
+ *                      prefer = null | (candidateKey) => boolean — ProNest parts only: the candidates to look among first }
+ * @returns {{ placements, unmatched, counts, ambiguous, kerfOffsetMm, nominal }}
+ *   placements[]: { partId, candidateKey, x, y, rotationDeg, mirrored, by: 'label'|'shape'|'size', confidence, error, marksLeftOut? }
+ *   kerfOffsetMm: 0, or the one offset every part was drawn oversize by; then `nominal` is a
+ *                 Map partId → { full, bare } — the parts' rings at nominal size
  *   ambiguous[]:  { partId, candidateKeys, options: placement[] } — the placement it would have as each
+ *
+ * A PART OF A PRONEST JOB (lib/nifReader.nestOfNif sets `outlineOnly`, `labelFrom: 'name'` and
+ * `nameSize` on it; a DXF part has none of them and is read exactly as before) goes down a longer
+ * ladder, stopping at the first rung that gives an answer:
+ *   label      one of the candidates' codes standing in the part's NAME — the shop's free text,
+ *              "16MM-WEB PL1-2150X6130- 4": a code is looked for as whole words of it, never as the
+ *              thickness, the size or the quantity it also holds;
+ *   shape      the OUTLINE alone against the candidate's outline (the shop drills holes later, so
+ *              holes and openings on either side are not compared), any angle, either hand;
+ *   size       the rectangle round the outline = the candidate's length × width;
+ *   name size  the size written in the name = the candidate's length × width, when the outline
+ *              itself is another size because it was altered for cutting (a web drawn wider for
+ *              camber): `by: 'name size'`, with `outlineDiffers { drawn: [a, b], cutPiece: [l, w] }`.
+ * A label whose candidate is neither the outline's shape nor the name's size does not end the
+ * search (the name is a loose label): the other rungs are tried over every candidate first.
  */
-export function matchNest(nest, candidates, { toleranceMm = 0.5 } = {}) {
+export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm = KERF_OFFSET_MAX_MM, prefer = null } = {}) {
   const tol = Number(toleranceMm) > 0 ? Number(toleranceMm) : 0.5;
   const cands = (candidates ?? []).map((c) => {
     const hasRings = ringList(c.rings).length > 0;
     const shape = shapeOf(hasRings ? c.rings : rectRings(c.length, c.width), { normalise: true });
     return {
       key: c.key, hasRings, shape,
+      // The outline alone (no holes, no openings): what a ProNest part is compared with.
+      bare: shape && shape.inner.length ? shapeOf([shape.outline], { normalise: true }) : shape,
       name: (c.codes ?? []).find((s) => String(s ?? '').trim()) ?? String(c.key),
       length: Number(c.length) > 0 ? Number(c.length) : shape?.length ?? 0,
       width: Number(c.width) > 0 ? Number(c.width) : shape?.width ?? 0,
@@ -1328,71 +1733,252 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5 } = {}) {
     const whole = byCode.get(normCode(label));
     if (whole) return whole;
     const out = [];
-    for (const w of String(label).split(/[\s,;:|()[\]=]+/)) for (const k of byCode.get(normCode(w)) ?? []) if (!out.includes(k)) out.push(k);
+    const words = String(label).split(/[\s,;:|()[\]=]+/).filter(Boolean);
+    for (const w of words) for (const k of byCode.get(normCode(w)) ?? []) if (!out.includes(k)) out.push(k);
+    if (out.length) return out;
+    // A part named after the file it was imported from — CODE_12THK_4NOS, CODE.dxf: the code is the
+    // start of the word, up to an underscore (the longest such start that is a code).
+    for (const w of words) {
+      const bits = w.replace(/\.(dxf|dwg)$/i, '').split('_');
+      for (let n = bits.length; n >= 1; n--) {
+        const hit = byCode.get(normCode(bits.slice(0, n).join('_')));
+        if (hit) { for (const k of hit) if (!out.includes(k)) out.push(k); break; }
+      }
+    }
+    return out;
+  };
+  /**
+   * The candidates whose code stands in a ProNest part NAME: the whole name, else a run of its
+   * words (split at spaces, dashes and underscores — a code may hold those itself) that is a code.
+   * Never a word that is only a number, a thickness ("16MM") or a size ("2150X6130"): every name
+   * ends in a quantity, and a drawing mark "4" must not answer to it.
+   */
+  const codeWord = (n) => n.length >= 2 && /[A-Z]/.test(n) && !/^\d+(\.\d+)?MM$/.test(n) && !/^\d+(\.\d+)?X\d/.test(n);
+  const namedIn = (name) => {
+    const whole = byCode.get(normCode(name));
+    if (whole) return whole;
+    const atoms = String(name).toUpperCase().split(/[\s\-_]+/).filter(Boolean);
+    const out = [];
+    for (let i = 0; i < atoms.length; i++) {
+      let run = '';
+      for (let j = i; j < atoms.length && j < i + 8; j++) {
+        run += atoms[j];
+        if (!codeWord(run)) continue;
+        for (const k of byCode.get(run) ?? []) if (!out.includes(k)) out.push(k);
+      }
+    }
     return out;
   };
 
-  const placements = []; const unmatched = []; const ambiguous = [];
-  const counts = Object.fromEntries(cands.map((c) => [c.key, 0]));
+  const preferred = typeof prefer === 'function' ? cands.filter((c) => prefer(c.key)) : null;
 
   /** tier 2 = the shape itself (or a true rectangle of the right size); tier 1 = only the rectangle round it. */
-  const tryFit = (c, shape) => {
-    const exact = fitShape(c.shape, shape, tol);
+  const tryFit = (c, shape, outlineOnly = false) => {
+    const exact = fitShape(outlineOnly ? c.bare : c.shape, shape, tol);
     if (exact) return { ...exact, tier: 2, by: c.hasRings ? 'shape' : 'size' };
     if (!c.hasRings || shape.isRect) { const loose = fitSize(c, shape, tol); if (loose) return { ...loose, tier: 1, by: 'size' }; }
     return null;
   };
   const placement = (part, c, fit, by) => {
     const ratio = Math.min(1, fit.error / (fit.tolEff || tol));
-    const base = fit.tier === 1 ? (by === 'label' ? 0.7 : 0.5) : by === 'label' ? 1 : by === 'shape' ? 0.9 : 0.75;
-    return { partId: part.id, candidateKey: c.key, x: fit.x, y: fit.y, rotationDeg: fit.rotationDeg, mirrored: fit.mirrored, by, confidence: Math.round((base - (fit.tier === 1 ? 0 : 0.2 * ratio)) * 100) / 100, error: Math.round(fit.error * 1e3) / 1e3 };
+    // tier 0: only the size in the part's name agrees (a ProNest part whose outline was altered for cutting).
+    const base = fit.tier === 0 ? (by === 'label' ? 0.6 : 0.4) : fit.tier === 1 ? (by === 'label' ? 0.7 : 0.5) : by === 'label' ? 1 : by === 'shape' ? 0.9 : 0.75;
+    return {
+      partId: part.id, candidateKey: c.key, x: fit.x, y: fit.y, rotationDeg: fit.rotationDeg, mirrored: fit.mirrored, by, confidence: Math.round((base - (fit.tier === 2 ? 0.2 * ratio : 0)) * 100) / 100, error: Math.round(fit.error * 1e3) / 1e3,
+      ...(fit.outlineDiffers ? { outlineDiffers: fit.outlineDiffers } : {}),
+    };
+  };
+  /**
+   * The size in a ProNest part's NAME against the candidate's length × width (±1 mm: names are whole
+   * numbers). The candidate is laid along the rectangle round the outline, its length on the side
+   * nearer its own; where it sits is the outline's own box.
+   */
+  const fitNameSize = (c, shape, nameSize, drawnSize = null) => {
+    if (!nameSize || !(c.length > 0 && c.width > 0)) return null;
+    const [n0, n1] = nameSize;
+    const off = Math.min(Math.max(Math.abs(n0 - c.length), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - c.length)));
+    if (!(off <= 1)) return null;
+    const { a, b, angleDeg, corners } = shape.mbr;
+    const along = Math.abs(a - c.length) + Math.abs(b - c.width) <= Math.abs(a - c.width) + Math.abs(b - c.length);
+    let rotationDeg = Math.min(...(along ? [angleDeg, angleDeg + 180] : [angleDeg + 90, angleDeg + 270]).map((d) => normDeg(Math.round(d * 1e4) / 1e4)));
+    const snap = Math.round(rotationDeg / 90) * 90;
+    if (Math.abs(rotationDeg - snap) < 0.003) rotationDeg = normDeg(snap);
+    const box = boxOf(corners);
+    return {
+      x: r4(box.x0), y: r4(box.y0), rotationDeg, mirrored: false, error: off, tolEff: 1, tier: 0,
+      // `drawn`: the part as it lies in its own drawing when the job says so (the smallest rectangle round a cambered web is a tilted one).
+      outlineDiffers: { drawn: (drawnSize ?? [a, b]).slice().sort((p, q) => q - p).map(r1), cutPiece: [r1(Math.max(c.length, c.width)), r1(Math.min(c.length, c.width))] },
+    };
   };
 
-  for (const part of nest?.parts ?? []) {
-    const shape = shapeOf(part.rings, { normalise: false });
-    if (!shape) { unmatched.push({ partId: part.id, bbox: part.bbox, labels: part.labels ?? [], why: 'Its outline could not be read.' }); continue; }
+  /** One part, with the rings given: { placed, tier } | { ambiguous, tier } | { unmatched }. */
+  const decide = (part, rings, pool = cands) => {
+    const loose = !!part.outlineOnly;                  // a ProNest part: its outline alone, and its name a loose label
+    const shape = shapeOf(loose ? [ringList(rings)[0] ?? []] : rings, { normalise: false });
+    if (!shape) return { unmatched: { partId: part.id, bbox: part.bbox, labels: part.labels ?? [], why: 'Its outline could not be read.' } };
     const size = sizeWords(shape.mbr.a, shape.mbr.b);
     const fitOf = new Map();
-    const fit = (c) => { if (!fitOf.has(c)) fitOf.set(c, tryFit(c, shape)); return fitOf.get(c); };
+    const fit = (c) => { if (!fitOf.has(c)) fitOf.set(c, tryFit(c, shape, loose)); return fitOf.get(c); };
+    const byName = (list) => (loose && part.nameSize ? list.map((c) => ({ c, f: fitNameSize(c, shape, part.nameSize, part.drawnSize ?? null) })).filter((h) => h.f) : []);
     const best = (list) => {
       const hits = list.map((c) => ({ c, f: fit(c) })).filter((h) => h.f);
       const top = Math.max(0, ...hits.map((h) => h.f.tier));
       return hits.filter((h) => h.f.tier === top);
     };
+    const settle = (hits, by) => (hits.length === 1
+      ? { placed: placement(part, hits[0].c, hits[0].f, by ?? hits[0].f.by), tier: hits[0].f.tier }
+      : { ambiguous: { partId: part.id, candidateKeys: hits.map((h) => h.c.key), options: hits.map((h) => placement(part, h.c, h.f, by ?? h.f.by)) }, tier: hits[0].f.tier });
 
     // 1. The label, when the shape agrees.
     const labelled = [];
-    for (const l of part.labels ?? []) for (const c of named(l)) if (!labelled.includes(c)) labelled.push(c);
+    for (const l of part.labels ?? []) for (const c of (loose ? namedIn(l) : named(l))) if (pool.includes(c) && !labelled.includes(c)) labelled.push(c);
     const sure = part.labelFrom !== 'near';            // a text only NEAR the part is a guess at its label
+    let mislabelled = null;                            // a ProNest name that names a candidate of another shape: said only if nothing else explains the part
     if (labelled.length) {
       const hits = best(labelled);
-      if (hits.length === 1) { placements.push(placement(part, hits[0].c, hits[0].f, 'label')); counts[hits[0].c.key]++; continue; }
-      if (hits.length > 1) { ambiguous.push({ partId: part.id, candidateKeys: hits.map((h) => h.c.key), options: hits.map((h) => placement(part, h.c, h.f, 'label')) }); continue; }
+      if (hits.length) return settle(hits, 'label');
+      // The name holds the code AND the size of the cut piece, and the outline was altered for cutting.
+      const sized = byName(labelled);
+      if (sized.length) return settle(sized, 'label');
       if (sure) {
         const c = labelled[0];
-        const other = best(cands.filter((k) => !labelled.includes(k)));
+        const other = best(pool.filter((k) => !labelled.includes(k)));
         const really = other.length ? ` It has the shape of ${other.map((h) => h.c.name).join(' or ')}.` : '';
         const their = sizeWords(c.length, c.width);
         const same = their === size;
-        unmatched.push({
+        const said = { unmatched: {
           partId: part.id, bbox: part.bbox, labels: part.labels,
-          why: `It is labelled "${part.labels.find((l) => named(l).includes(c)) ?? c.name}", but it is not the shape of ${c.name} — ${c.name} is ${their}${same ? ' with a different outline or holes' : `, this is ${size}`}.${really}`,
-        });
-        continue;
+          why: `It is labelled "${loose ? c.name : part.labels.find((l) => named(l).includes(c)) ?? c.name}", but it is not the shape of ${c.name} — ${c.name} is ${their}${same ? ' with a different outline or holes' : `, this is ${size}`}.${really}`,
+        } };
+        if (!loose) return said;
+        mislabelled = said;
       }
     }
 
     // 2. The shape at any angle and hand; 3. the rectangle round it.
-    const hits = best(cands);
-    if (hits.length === 1) { placements.push(placement(part, hits[0].c, hits[0].f, hits[0].f.by)); counts[hits[0].c.key]++; continue; }
-    if (hits.length > 1) { ambiguous.push({ partId: part.id, candidateKeys: hits.map((h) => h.c.key), options: hits.map((h) => placement(part, h.c, h.f, h.f.by)) }); continue; }
+    const hits = best(pool);
+    if (hits.length) return settle(hits, null);
+    // 4. (a ProNest part) the size written in its name, when its outline is another size.
+    const sized = byName(pool);
+    if (sized.length) return settle(sized, 'name size');
+    if (mislabelled) return mislabelled;
     const said = (part.labels ?? []).length && !labelled.length ? `Its label "${part.labels[0]}" is not one of the codes, and none` : 'None';
     // A face closed in by cuts it shares with its neighbours, that is nobody's shape: most likely the scrap between them.
     const maybeScrap = Number(part.commonCut) > 0 && !(part.labels ?? []).length;
-    unmatched.push({
+    return { unmatched: {
       partId: part.id, bbox: part.bbox, labels: part.labels ?? [], maybeScrap,
       why: `${said} of the cut plates is this shape (${size}${shape.inner.length ? `, ${plural(shape.inner.length, 'opening', 'openings')}` : ''}).${maybeScrap ? ' It is closed in by cuts it shares with the parts round it, so it may be the scrap between parts.' : ''}`,
+    } };
+  };
+
+  /**
+   * Every part. `ringsFor(part)` gives the rings to read it by (its own, or — kerf compensation —
+   * the nominal ones). A part that comes with closed shapes inside it that MAY BE MARKING
+   * (`ringsNoMarks`, see readNestDxf) is read with them first — when the cut plate's drawing has
+   * those openings they are cut-outs — and without them only when that explains it better; the
+   * placement then says `marksLeftOut`.
+   */
+  const pass = (ringsFor) => {
+    const out = { placements: [], unmatched: [], ambiguous: [] };
+    for (const part of nest?.parts ?? []) {
+      const { full, bare } = ringsFor(part);
+      // A ProNest part is looked for among the cut plates its plate could be cut into FIRST (`prefer`: the
+      // job states the thickness) — a thicker or far thinner one of the same shape must not win on a higher
+      // rung — and among all of them only when none of those is it (the answer then says the thickness).
+      let res = part.outlineOnly && preferred ? decide(part, full, preferred) : decide(part, full);
+      if (part.outlineOnly && preferred && res.unmatched) { const wide = decide(part, full); if (!wide.unmatched) res = wide; }
+      if (part.outlineOnly) {
+        // Matched by its outline whatever is inside it. Closed shapes inside it that MAY BE MARKING are
+        // cut-outs only when the cut plate's own drawing has them, where they are; else they are left out.
+        if (bare && !res.unmatched) {
+          const whole = shapeOf(full, { normalise: false });
+          const has = (key) => { const c = cands.find((k) => k.key === key); return !!(c?.hasRings && whole && c.shape.inner.length === whole.inner.length && fitShape(c.shape, whole, tol)); };
+          for (const o of res.placed ? [res.placed] : res.ambiguous.options) if (!has(o.candidateKey)) o.marksLeftOut = part.unsureMarks ?? 0;
+        }
+      } else if (bare && !(res.placed && res.tier === 2)) {
+        const alt = decide(part, bare);
+        if (!alt.unmatched && (res.unmatched || alt.tier > res.tier)) {
+          res = alt;
+          const n = part.unsureMarks ?? 0;
+          if (res.placed) res.placed.marksLeftOut = n; else for (const o of res.ambiguous.options) o.marksLeftOut = n;
+        }
+      }
+      if (res.placed) out.placements.push(res.placed);
+      else if (res.ambiguous) out.ambiguous.push(res.ambiguous);
+      else out.unmatched.push(res.unmatched);
+    }
+    return out;
+  };
+  const tally = (list) => { const counts = Object.fromEntries(cands.map((c) => [c.key, 0])); for (const pl of list) counts[pl.candidateKey]++; return counts; };
+
+  let found = pass((part) => ({ full: part.rings, bare: part.ringsNoMarks ?? null }));
+  let kerfOffsetMm = 0;
+  let nominal = null;
+  /*
+   * KERF-COMPENSATED OUTLINES (a toolpath export: the path of the torch's centre, every outline
+   * drawn half a kerf OUTSIDE its part). Looked for only when some part of the file matched nothing as
+   * drawn: if every part is then bigger than some cut plate by ONE offset, the same on all sides
+   * and for every part (at most `kerfOffsetMaxMm` a side), the parts are read at their nominal
+   * size — each outline taken in by that offset, each opening let out by it — and matched with the
+   * ordinary tolerance. All of them must then match; otherwise the answer is the first one.
+   */
+  const parts = nest?.parts ?? [];
+  // (A part with curves may match as drawn even so — a flattened curve is given some slack — which is
+  // why the test is "some part matched nothing", and every part, matched or not, must show the offset.)
+  if (kerfOffsetMaxMm > 0 && parts.length && found.unmatched.some((u) => !u.maybeScrap)) {
+    const perPart = parts.map((part) => {
+      const shape = shapeOf(part.rings, { normalise: false });
+      const list = [];
+      if (shape) {
+        for (const c of cands) {
+          for (const [l, w] of [[c.shape.mbr.a, c.shape.mbr.b], [c.shape.mbr.b, c.shape.mbr.a]]) {
+            const da = shape.mbr.a - l; const db = shape.mbr.b - w;
+            if (Math.abs(da - db) <= 0.3 && da + db > 2 * tol && (da + db) / 4 <= kerfOffsetMaxMm + 0.05) list.push((da + db) / 4);
+          }
+        }
+      }
+      return list;
     });
+    if (perPart.every((l) => l.length)) {
+      for (const d0 of [...new Set(perPart[0].map((d) => Math.round(d * 20) / 20))]) {
+        const near = perPart.map((l) => l.reduce((a, d) => (Math.abs(d - d0) < Math.abs(a - d0) ? d : a)));
+        if (near.some((d) => Math.abs(d - d0) > 0.15)) continue;
+        const offset = near.reduce((a, d) => a + d, 0) / near.length;
+        const taken = new Map(parts.map((part) => [part.id, { full: offsetRings(part.rings, offset), bare: part.ringsNoMarks ? offsetRings(part.ringsNoMarks, offset) : null }]));
+        const again = pass((part) => taken.get(part.id));
+        if (!again.unmatched.length) {
+          found = again;
+          kerfOffsetMm = Math.round(offset * 100) / 100;
+          nominal = new Map([...taken].map(([id, r]) => [id, r]));
+          break;
+        }
+      }
+    }
   }
-  return { placements, unmatched, counts, ambiguous };
+  return { ...found, counts: tally(found.placements), kerfOffsetMm, nominal };
+}
+
+/** A counter-clockwise ring moved IN by d all round (out when d < 0): each corner to where its two sides, moved, meet. */
+function offsetRing(ring, d) {
+  const n = ring.length;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const p = ring[(i + n - 1) % n]; const q = ring[i]; const r = ring[(i + 1) % n];
+    let ax = q[0] - p[0]; let ay = q[1] - p[1]; let bx = r[0] - q[0]; let by = r[1] - q[1];
+    const la = Math.hypot(ax, ay); const lb = Math.hypot(bx, by);
+    if (la < 1e-9 || lb < 1e-9) continue;
+    ax /= la; ay /= la; bx /= lb; by /= lb;
+    const k = 1 + ax * bx + ay * by;                         // 1 + the normals' dot product
+    const pt = k < 1e-3 ? [q[0] - d * ay, q[1] + d * ax] : [q[0] + (d * (-ay - by)) / k, q[1] + (d * (ax + bx)) / k];
+    // A rounded corner of the torch path (an arc of radius d) comes in to one point: keep it once.
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(last[0] - pt[0], last[1] - pt[1]) > 0.05) out.push(pt);
+  }
+  while (out.length > 3 && Math.hypot(out[0][0] - out[out.length - 1][0], out[0][1] - out[out.length - 1][1]) <= 0.05) out.pop();
+  return out;
+}
+/** Rings { outline, cutouts, holes } as drawn round the torch's centre line → the part itself: outline in by d, openings out by d. */
+function offsetRings(rings, d) {
+  const ccw = (r) => cleanRing(r);
+  return { outline: offsetRing(ccw(rings.outline), d), cutouts: (rings.cutouts ?? []).map((r) => offsetRing(ccw(r), -d)), holes: (rings.holes ?? []).map((r) => offsetRing(ccw(r), -d)) };
 }

@@ -279,7 +279,8 @@ export async function writePlateCuts(db, c, orderLineId, cutPlates, { facts: kno
     for (const q of lot.pieces) {
       if (q.x == null || q.y == null) continue;
       const shape = shapeOf(q.cutPlateId);
-      if (shape?.drawn || !q.fileRings) q.rings = shape ? placeShape(shape.rings, { x: Number(q.x), y: Number(q.y), rotationDeg: q.rotationDeg ?? 0, mirrored: q.mirrored }) : null;
+      // (`asCut`: the outline of a ProNest job is what is cut, also beside a drawing.)
+      if ((shape?.drawn && !q.fileRings?.asCut) || !q.fileRings) q.rings = shape ? placeShape(shape.rings, { x: Number(q.x), y: Number(q.y), rotationDeg: q.rotationDeg ?? 0, mirrored: q.mirrored }) : null;
       else q.rings = q.fileRings;
     }
   }

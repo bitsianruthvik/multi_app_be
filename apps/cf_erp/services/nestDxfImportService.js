@@ -10,11 +10,18 @@
  *
  * WHAT ONE FILE GOES THROUGH
  *   read      lib/nestDxfReader.readNestDxf — the plate, the parts on it, the words (thickness,
- *             grade, nest number, plate size) in the title or the file name.
+ *             grade, nest number, plate size) in the title or the file name. What it cannot take
+ *             as drawn is never dropped with only a note (2026-10-13): an outline left open or a
+ *             second plate BLOCKS (OPEN_CONTOUR, MULTIPLE_PLATES); anything else that could have
+ *             been a part is a WARNING that needs `force` (SHAPE_IGNORED, CURVE_APPROXIMATE,
+ *             MARKING_UNSURE, CUTOUTS_FROM_FILE). A file may be read a second time another way —
+ *             as inches, or with a line style taken as marking — when only that explains it.
  *   match     matchNest against the line's cut plates. A cut plate answers to its own code, to the
  *             DRAWING MARK and the item code of the rows cut from it; its shape is its drawing
  *             when the line has one for it (partDrawingService.drawingFactsOfLine), else its
- *             rectangle LENGTH × WIDTH.
+ *             rectangle LENGTH × WIDTH. Kerf-compensated outlines (every part oversize by one
+ *             offset) are matched at nominal size; parts that could be any of several IDENTICAL
+ *             cut plates are shared out by the quantity the line still needs (`by: 'quantity'`).
  *   plate     named in the request (`plateCode`), else found by the size the file draws / says,
  *             exactly as the nesting sheet finds a plate by size: length and width either way
  *             round, ±0.5 mm, told apart by thickness, grade and material.
@@ -49,6 +56,23 @@
  * live plates once more UNDER the lock and refuses (CHANGED_MEANWHILE) when another save got in
  * first. Nothing is written in either case.
  *
+ * PRONEST JOB FILES (2026-10-13). The same upload takes a ProNest job (.nif) beside the DXFs: one
+ * file is a whole JOB — every nest of one plate thickness, a nest perhaps cut on N identical
+ * plates. lib/nifReader.readNif reads and CHECKS it (a file of another ProNest version, or one that
+ * does not agree with itself, is refused whole, in words); `expandJobs` then turns every nest, as
+ * many times as it is cut, into "one file = one plate" and the steps below run unchanged — the same
+ * answer, the same diff, the same checks. What is different for a ProNest part:
+ *   match    its label is the shop's free-text part NAME and it is matched by its OUTLINE alone
+ *            (matchNest's longer ladder: label, shape, size, the size in the name);
+ *   steel    the job says the thickness and only "MS": the grade is the matched cut pieces'. A cut
+ *            piece up to 2 mm THINNER than the plate is taken with a warning (PART_THINNER_THAN_PLATE:
+ *            the shop cuts 9 mm packings from 10 mm plate);
+ *   shape    the nested outline is what is stored and measured (`shapeFrom: 'nesting file'`), also
+ *            when the cut piece has a drawing — it is what will be cut. Marking is never a cut-out;
+ *   lots     `<job>-N07` (`-1…-N` when the nest is cut on N plates): uploading the job again
+ *            REPLACES its plates, and a plate of it the new upload no longer makes is removed;
+ *   file     kept ONCE for all its plates, as base64 (cf_nest_files.file_kind 'pronest').
+ *
  * ROUND TRIPS (TiDB is ~49 ms each): a fixed number whatever the files hold — the reads are the
  * line, its cut plates, the catalog plates, the drawings and the saved lots; the writes are bulk.
  * The one thing that grows is the file text itself, sent in statements of at most ~8 MB.
@@ -56,7 +80,8 @@
 import { createHash } from 'node:crypto';
 import { invalid, notFound, CfError } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
-import { readNestDxf, matchNest } from '../lib/nestDxfReader.js';
+import { readNestDxf, matchNest, styleWords } from '../lib/nestDxfReader.js';
+import { readNif, isNif, nestOfNif } from '../lib/nifReader.js';
 import { drawingFactsOfLine } from './partDrawingService.js';
 import { writePlateCuts } from './plateCutsService.js';
 import {
@@ -77,6 +102,12 @@ export const MAX_NEST_FILE_BYTES = 4 * 1024 * 1024;
 export const MAX_NEST_FILES = 200;
 /** As stored (utf8mb4): under TiDB's 6 MB entry with room for the row's other columns. */
 const MAX_STORED_FILE_BYTES = 5.5 * 1024 * 1024;
+/** One request may make at most this many plates (a ProNest job is many plates in one file). */
+export const MAX_NEST_PLATES = 600;
+/** A ProNest part's cut piece may be this much THINNER than the plate it is nested on (a warning, not a refusal). */
+export const THINNER_MAX_MM = 2;
+/** A plate lot's number (cf_plate_lots.lot_no). */
+const LOT_NO_MAX = 30;
 const FILE_INSERT_BYTES = 8 * 1024 * 1024;
 const SIZE_TOL = 0.5;
 
@@ -92,6 +123,19 @@ const norm = (s) => (blank(s) ? null : String(s).trim().toUpperCase());
 const sameSize = (a, b, tol = SIZE_TOL) => Math.abs(Number(a) - Number(b)) <= tol;
 const eitherWay = (l, w, L, W) => (sameSize(l, L) && sameSize(w, W)) || (sameSize(l, W) && sameSize(w, L));
 const parseJson = (v) => { if (v == null) return null; if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } };
+/**
+ * A grade as a file writes it against the catalog's: the same, or the same with the standard in
+ * front or a quality suffix behind — "IS 2062 E350 BR" and "E350BR" are the catalog's "E350". Two
+ * sub-grades (E350A / E350C) or two strengths (E250 / E350) are not. A word that is only the
+ * standard says nothing about the grade, so it disagrees with nothing.
+ */
+const gradeKey = (s) => squash(s).replace(/^IS2062/, '');
+export function sameGrade(a, b) {
+  const x = gradeKey(a); const y = gradeKey(b);
+  if (!x || !y || x === y) return true;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  return long.startsWith(short) && !/\d/.test(long.slice(short.length));
+}
 const stem = (name) => String(name ?? '').split(/[\\/]/).pop().replace(/\.[A-Za-z0-9]{1,5}$/, '');
 
 /* ───────────────────────────── the saved state ───────────────────────────── */
@@ -148,7 +192,7 @@ function readFiles(input) {
   if (raw.length > MAX_NEST_FILES) throw invalid('TOO_MANY_FILES', `${raw.length} files is more than one upload takes (${MAX_NEST_FILES}). Send them in two goes — a second upload adds to the first.`);
   return raw.map((f, i) => {
     const filename = String(f?.filename ?? f?.name ?? `file ${i + 1}`).split(/[\\/]/).pop().slice(0, 255);
-    const out = { index: i, filename, plateCode: blank(f?.plateCode) ? null : String(f.plateCode).trim(), nestNo: blank(f?.nestNo) ? null : String(f.nestNo).trim(), buffer: null, hash: null, problem: null };
+    const out = { index: i, filename, plateCode: blank(f?.plateCode) ? null : String(f.plateCode).trim(), nestNo: blank(f?.nestNo) ? null : String(f.nestNo).trim(), buffer: null, hash: null, problem: null, kind: 'dxf' };
     const body = f?.file ?? f?.content ?? f?.fileBase64;
     try {
       if (f?.text != null && body == null) out.buffer = Buffer.from(String(f.text), 'latin1');
@@ -157,9 +201,11 @@ function readFiles(input) {
     } catch { out.problem = { code: 'BAD_FILE', message: 'it could not be read — send it as base64.' }; }
     if (out.buffer && !out.buffer.length) out.problem = { code: 'BAD_FILE', message: 'the file is empty.' };
     if (out.buffer && out.buffer.length > MAX_NEST_FILE_BYTES) out.problem = { code: 'FILE_TOO_BIG', message: `it is ${(out.buffer.length / 1048576).toFixed(1)} MB and one nesting file may be at most ${MAX_NEST_FILE_BYTES / 1048576} MB.` };
+    // A ProNest job (.nif) is binary and is kept as base64 — a third longer, all ASCII: 4 MB is 5.4 MB stored.
+    if (out.buffer && isNif(out.buffer, filename)) out.kind = 'pronest';
     // The text is kept in a utf8mb4 column: every byte above 0x7F is stored as two. A file of
     // accented or binary bytes could pass the 4 MB cap and still overflow TiDB's 6 MB row.
-    if (out.buffer && !out.problem) {
+    if (out.buffer && !out.problem && out.kind === 'dxf') {
       let high = 0;
       for (let b = 0; b < out.buffer.length; b += 1) if (out.buffer[b] > 127) high += 1;
       if (out.buffer.length + high > MAX_STORED_FILE_BYTES) out.problem = { code: 'FILE_TOO_BIG', message: `it holds ${high} non-ASCII bytes and would take ${((out.buffer.length + high) / 1048576).toFixed(1)} MB to store — more than one row holds. Export the nest as a plain ASCII DXF.` };
@@ -167,6 +213,67 @@ function readFiles(input) {
     if (out.buffer && !out.problem) out.hash = createHash('sha256').update(out.buffer).digest('hex');
     return out;
   });
+}
+
+/* ───────────────────────────── a ProNest job is many plates ───────────────────────────── */
+
+const pad2 = (n) => String(n).padStart(2, '0');
+/** The job a ProNest lot number belongs to: "16MM-NECL-PATNA-N07-2" → "16MM-NECL-PATNA". */
+const jobOfLotNo = (lotNo) => /^(.*)-N\d+(?:-\d+)?$/.exec(String(lotNo ?? '').toUpperCase())?.[1] ?? null;
+
+/**
+ * Every .nif of the request read (lib/nifReader — pure, checked against itself) and opened into
+ * its plates: one entry per nest and per plate it is cut on, each shaped like an uploaded file so
+ * prepareFile takes it unchanged. A job that cannot be read stays ONE entry carrying the reason.
+ *
+ * LOT NUMBERS ARE THE JOB'S: `<job>-N<nest>`, and `-<k>` when the nest is cut on more than one
+ * plate — the same job uploaded again lands on the same plates and replaces them. The job is the
+ * name ProNest keeps inside the file (a renamed file is still the same job); `nestNo` on the
+ * request's file overrides it, for two jobs that carry the same name.
+ *
+ * → { plates: [file-like], jobs: [{ file, doc | null, error | null, prefix }] }
+ */
+function expandJobs(files) {
+  const plates = []; const jobs = [];
+  for (const file of files) {
+    if (file.kind !== 'pronest' || file.problem) { plates.push(file); continue; }
+    let doc = null;
+    try { doc = readNif(file.buffer, { filename: file.filename }); } catch (e) {
+      const known = ['BAD_FILE', 'TOO_BIG', 'UNSUPPORTED_VERSION', 'NEST_CHECK_FAILED', 'EMPTY_NEST'].includes(e?.code);
+      // The reader names the file itself: the entry's own "<file>: " goes in front of the rest.
+      const said = known ? String(e.message).replace(/^"[^"]*" /, 'it ').replace(/^The file /, 'it ') : 'it could not be read as a ProNest job.';
+      file.problem = { code: known ? e.code : 'BAD_FILE', message: said, ...(e?.check ? { check: e.check } : {}), ...(e?.program ? { program: e.program, version: e.version, supported: e.supported } : {}) };
+      jobs.push({ file, doc: null, error: file.problem, prefix: null });
+      plates.push(file);
+      continue;
+    }
+    const total = doc.nests.reduce((a, n) => a + n.quantity, 0);
+    if (plates.length + total > MAX_NEST_PLATES) {
+      file.problem = { code: 'TOO_BIG', message: `it is ${plural(total, 'plate', 'plates')} (${plural(doc.nests.length, 'nest', 'nests')}, some cut on several plates) and one upload makes at most ${MAX_NEST_PLATES}. Send the jobs in two goes — a second upload adds to the first.` };
+      jobs.push({ file, doc, error: file.problem, prefix: null });
+      plates.push(file);
+      continue;
+    }
+    const prefixFull = String(file.nestNo ?? doc.jobName ?? stem(file.filename)).replace(/\s+/g, ' ').trim() || 'JOB';
+    // Room for "-N07-12" within the lot number: the job's name is cut, never the nest's number.
+    const widest = Math.max(...doc.nests.map((n) => `-N${pad2(n.nestNo)}${n.quantity > 1 ? `-${n.quantity}` : ''}`.length));
+    const prefix = prefixFull.slice(0, LOT_NO_MAX - widest).trim();
+    const job = { file, doc, error: null, prefix, entries: [] };
+    jobs.push(job);
+    for (const nest of doc.nests) {
+      const base = `${prefix}-N${pad2(nest.nestNo)}`;
+      const shared = { nest: null, match: null };      // read and matched once for all the plates of the nest
+      for (let k = 1; k <= nest.quantity; k += 1) {
+        const lotNo = nest.quantity > 1 ? `${base}-${k}` : base;
+        plates.push({
+          index: plates.length, filename: `${file.filename} nest ${nest.nestNo}`, plateCode: file.plateCode, nestNo: lotNo,
+          buffer: file.buffer, hash: createHash('sha256').update(`${file.hash}|nest ${nest.nestNo}|plate ${k}`).digest('hex'), problem: null, kind: 'pronest',
+          pronest: { job, doc, nest, shared, sourceFile: file.filename, fileHash: file.hash, prefix, base, copy: k },
+        });
+      }
+    }
+  }
+  return { plates, jobs };
 }
 
 /* ───────────────────────────── one file ───────────────────────────── */
@@ -203,7 +310,11 @@ function resolvePlate({ file, nest, placed, ctx }) {
   }
   let hits = ctx.plates.filter((p) => usable(p) && eitherWay(p.steel.length, p.steel.width, size.length, size.width));
   const sizeWords = `${fmt(Math.max(size.length, size.width))} × ${fmt(Math.min(size.length, size.width))}`;
-  if (!hits.length) return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${sizeWords}. Add it to the catalog, or name the plate you mean (plateCode).` } };
+  if (!hits.length) {
+    // The rectangle taken as the plate holds ONE rectangle that holds everything else: perhaps a frame round the real plate.
+    const inner = drawn && nest.plate.inside ? ` (That rectangle holds one other, ${fmt(nest.plate.inside.length)} × ${fmt(nest.plate.inside.width)}, with everything else inside it — if the outer one is a drawing frame, the plate is that, and no catalog plate is that size either.)` : '';
+    return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${sizeWords}.${inner} Add it to the catalog, or name the plate you mean (plateCode).` } };
+  }
   if (thickness != null) {
     const t = hits.filter((p) => Math.abs(p.steel.thickness - thickness) <= 0.01);
     if (!t.length) {
@@ -212,10 +323,12 @@ function resolvePlate({ file, nest, placed, ctx }) {
     hits = t;
   }
   if (hits.length > 1) {
-    const hintGrade = norm(hints.grade);
+    const hintGrade = gradeKey(hints.grade) ? norm(hints.grade) : null;   // "IS 2062" alone names no grade
     const exact = hits.filter((p) => norm(p.steel.grade) === (hintGrade ?? grade) && (material == null || norm(p.steel.material) === material));
+    // The file's grade written in full (E350BR, IS 2062 E350 BR) is the catalog's E350.
+    const same = exact.length || !hintGrade ? [] : hits.filter((p) => p.steel.grade != null && sameGrade(p.steel.grade, hintGrade) && (material == null || norm(p.steel.material) === material));
     const loose = hits.filter((p) => agrees(p.steel.grade, hintGrade ?? grade) && agrees(p.steel.material, material));
-    hits = exact.length ? exact : loose.length ? loose : hits;
+    hits = exact.length ? exact : same.length ? same : loose.length ? loose : hits;
   }
   if (hits.length > 1) {
     return { error: { code: 'PLATE_AMBIGUOUS', message: `${sizeWords}${thickness != null ? ` at ${fmt(thickness)} mm` : ''} is ${plural(hits.length, 'catalog plate', 'catalog plates')} (${hits.map((p) => `${p.code}${p.steel.grade ? ` ${p.steel.grade}` : ''}`).join(', ')}) — name the one you mean (plateCode).`, choices: hits.map((p) => p.code) } };
@@ -232,11 +345,17 @@ const cornersOf = (o) => o.outline.length + o.cutouts.reduce((a, r) => a + r.len
 export const MAX_FILE_RING_CORNERS = 2000;
 
 /**
- * Reads, matches, places and checks ONE file — IN THREE STEPS, because two of the things it needs
- * are exact polygon work that must not hold the server's thread (services/nestMeasure.js):
+ * Reads, matches, places and checks ONE file — IN FOUR STEPS, because one of the things it needs
+ * is known only when EVERY file of the request has been read, and two are exact polygon work that
+ * must not hold the server's thread (services/nestMeasure.js):
  *
- *   prepareFile(file, ctx, choices) → { entry, verifyArgs, verified, measured }
- *     reads the DXF, matches its parts, finds the plate. `verifyArgs` (or null) is what
+ *   prepareFile(file, ctx, choices) → { entry, sure, share, verifyArgs, verified, measured }
+ *     reads the DXF, matches its parts, finds the plate. `sure` is what it placed for certain
+ *     (by label, shape, size, steel, or the user's choice);
+ *   share(left)
+ *     shares out the parts that could be any of several IDENTICAL cut plates, by what the line
+ *     still needs of each (`left`: Map cutPlateId → pieces not yet nested, over the whole
+ *     request — see quotaOf). Then sets `verifyArgs` (or leaves it null): what
  *     nestShapes.verifyPlate is asked about the layout;
  *   verified(check) → [lot, pieces] | null
  *     takes that answer, says the overlaps / the edge / the kerf, builds what a save stores, and
@@ -244,8 +363,8 @@ export const MAX_FILE_RING_CORNERS = 2000;
  *   measured(waste)
  *     takes that answer: the file's metrics and `entry._lot`, what a save writes.
  *
- * uploadNestFiles runs the three steps for every file with the two measurements made together,
- * off this thread; `processFile` runs them in place (tests, one file).
+ * uploadNestFiles runs the steps for every file with the two measurements made together, off this
+ * thread; `processFile` runs them in place (tests, one file).
  * Pure but for what `ctx` already holds. `entry` is the file's entry in the answer.
  */
 function prepareFile(file, ctx, choices) {
@@ -253,34 +372,122 @@ function prepareFile(file, ctx, choices) {
     filename: file.filename, bytes: file.buffer?.length ?? 0, hash: file.hash, nestNo: null, lotNo: null,
     status: 'ok', action: null, units: null, plate: null, parts: 0, placed: 0,
     placements: [], counts: [], errors: [], warnings: [], notes: [], metrics: null,
+    // Where it came from: a DXF is its own file; a plate of a ProNest job says its job and its nest.
+    sourceFile: file.pronest?.sourceFile ?? file.filename, sourceKind: file.kind === 'pronest' ? 'pronest' : 'dxf',
   };
-  const done = { entry, verifyArgs: null, verified: () => null, measured: () => {} };
+  const nif = file.pronest ?? null;
+  if (nif) {
+    Object.assign(entry, { jobName: nif.doc.jobName ?? null, program: nif.doc.program, version: nif.doc.version, jobNestNo: nif.nest.nestNo, jobNests: nif.doc.nests.length, nestQuantity: nif.nest.quantity, copy: nif.copy });
+    entry._nif = { fileIndex: nif.job.file.index, nestNo: nif.nest.nestNo, copy: nif.copy, prefix: nif.prefix, fileHash: nif.fileHash };
+  } else if (file.kind === 'pronest') {
+    entry._nif = { fileIndex: file.index, failed: true };
+  }
+  const done = { entry, sure: [], share: () => {}, verifyArgs: null, verified: () => null, measured: () => {} };
   const name = () => (entry.plate?.code ? `plate ${entry.plate.code}` : entry.nestNo ? `nest ${entry.nestNo}` : 'its plate');
   const err = (code, message, extra = {}) => entry.errors.push({ code, message: `${file.filename}: ${message}`, ...extra });
-  const partErr = (code, part, message, extra = {}) => entry.errors.push({ code, partId: part.id, message: `${file.filename}, ${name()}, part ${part.id}${part.labels?.length ? ` ("${part.labels[0]}")` : ''} at ${at(part.bbox)}: ${message}`, ...extra });
+  // A ProNest nest holds the SAME part many times (132 stiffeners): what is wrong with one is wrong
+  // with all of them, and is said once — the first piece named, the others counted (`partIds`, `count`).
+  const said = new Map();
+  const partErr = (code, part, message, extra = {}) => {
+    const text = `${file.filename}, ${name()}, part ${part.id}${part.labels?.length ? ` ("${part.labels[0]}")` : ''} at ${at(part.bbox)}: ${message}`;
+    if (!nif) { entry.errors.push({ code, partId: part.id, message: text, ...extra }); return; }
+    const key = `${code}|${part.partName}|${message}`;
+    const first = said.get(key);
+    if (first) {
+      first.error.count += 1; first.error.partIds.push(part.id);
+      first.error.message = `${first.text} The same goes for ${plural(first.error.count - 1, 'more piece', 'more pieces')} of this part on the nest.`;
+      return;
+    }
+    const error = { code, partId: part.id, partName: part.partName ?? null, partIds: [part.id], count: 1, message: text, ...extra };
+    said.set(key, { error, text });
+    entry.errors.push(error);
+  };
   const warn = (code, message, extra = {}) => entry.warnings.push({ code, needsForce: true, message: `${file.filename}, ${name()}: ${message}`, ...extra });
   const settle = () => { entry.status = entry.errors.length ? 'error' : entry.warnings.length ? 'warning' : 'ok'; };
 
-  if (file.problem) { err(file.problem.code, file.problem.message); settle(); return done; }
+  if (file.problem) { const { code, message, ...rest } = file.problem; err(code, message, rest); settle(); return done; }
 
   // A plate named in the request is known before the file is read: its size tells the reader that
   // a block of parts cut edge to edge and filling that size IS the plate (lib/nestDxfReader `plateSize`).
+  // Every catalog plate's size goes too (`plateSizes`): a rectangle of one of those sizes inside a
+  // bigger one is the plate inside a drawing frame.
   const named = file.plateCode ? plateByCode(ctx, file.plateCode) : null;
   const sizeOfNamed = named?.steel?.length > 0 && named?.steel?.width > 0 ? { length: named.steel.length, width: named.steel.width } : null;
+  const reading = {};
+  // A plate of a ProNest job is already read (expandJobs): its nest in the form a DXF plate has, made
+  // and matched ONCE for all the plates the nest is cut on. Its parts are true outlines: no kerf offset.
+  const read = (extra = {}) => (nif
+    ? (nif.shared.nest ??= nestOfNif(nif.doc, nif.nest))
+    : readNestDxf(file.buffer, { filename: file.filename, plateSizes: ctx.plateSizes, ...(sizeOfNamed ? { plateSize: sizeOfNamed } : {}), ...reading, ...extra }));
+  // The job states its thickness: a cut piece of it — or up to 2 mm thinner — is what its parts are looked for among first.
+  const cutFromJob = (key) => { const d = Number(nif.nest.plate.thickness) - ctx.cpByKey.get(key).steel.thickness; return d >= -0.0005 && d <= THINNER_MAX_MM + 0.0005; };
+  const match = (n) => (nif
+    ? (nif.shared.match ??= matchNest(n, ctx.candidates, { toleranceMm: 0.5, kerfOffsetMaxMm: 0, prefer: cutFromJob }))
+    : matchNest(n, ctx.candidates, { toleranceMm: 0.5 }));
   let nest;
-  try { nest = readNestDxf(file.buffer, { filename: file.filename, ...(sizeOfNamed ? { plateSize: sizeOfNamed } : {}) }); } catch (e) {
+  try { nest = read(); } catch (e) {
     err(e?.code && ['BAD_FILE', 'EMPTY_NEST', 'TOO_BIG'].includes(e.code) ? e.code : 'BAD_FILE', e?.message ?? 'it could not be read as a DXF drawing.');
     settle();
     return done;
+  }
+
+  // ---- which cut plate each part is ----------------------------------------
+  let m = match(nest);
+  /*
+   * ANOTHER READING OF THE SAME FILE, taken only when it explains the file and the first does not.
+   * The reader cannot know two things the cut plates can settle:
+   *   - INCHES with no units in the header: nothing is the size of a cut plate as millimetres, and
+   *     every part is one at × 25.4;
+   *   - a MARKING LINE from edge to edge of a part, on the cut layer in another colour (or on a
+   *     layer of its own): read as a cut it splits the part into two shapes that are nobody's;
+   *     read as marking, every part is a cut plate.
+   * At most two more reads of the file, in memory — no round trip.
+   */
+  const lost = (x) => x.unmatched.filter((u) => !u.maybeScrap).length;
+  const found = (x) => x.placements.length + x.ambiguous.length;
+  const secondReading = [];
+  const tryReading = (extra, better) => {
+    try {
+      const n2 = read(extra); const m2 = match(n2);
+      if (!better(m2)) return false;
+      nest = n2; m = m2; Object.assign(reading, extra);
+      return true;
+    } catch { return false; }
+  };
+  if (!nest.unitsStated && nest.parts.length && !found(m)) {
+    if (tryReading({ units: 'in' }, (m2) => found(m2) > 0 && !lost(m2))) secondReading.push('The file does not say its units. Read as millimetres nothing in it is the size of a cut plate; read as inches every part is one — so it was read as drawn in inches.');
+  }
+  if (lost(m) && nest.splitStyles?.length) {
+    const styles = nest.splitStyles;
+    if (tryReading({ markingStyles: styles }, (m2) => found(m2) > 0 && !lost(m2))) secondReading.push(`Lines drawn in ${list(styles.map(styleWords))} run from edge to edge of parts. Read as cuts they split a part into shapes that are no cut plate; read as marking every part is one — so they were read as marking, not as cuts.`);
   }
   entry.units = nest.units;
   entry.parts = nest.parts.length;
   entry.nestNo = file.nestNo ?? nest.hints?.nestNo ?? stem(file.filename);
   entry.lotNo = String(entry.nestNo).slice(0, 30);
   for (const w of nest.warnings ?? []) entry.notes.push(w);
+  for (const s of secondReading) entry.notes.push(s);
+  if (nif && nif.nest.quantity > 1) entry.notes.push(`ProNest cuts this nest on ${nif.nest.quantity} identical plates: it is ${nif.nest.quantity} plates here (${nif.base}-1 … ${nif.base}-${nif.nest.quantity}), this one plate ${nif.copy}.`);
+  // What the reader could not take as it is drawn: an outline left open, more than one plate.
+  for (const { code, message, ...rest } of nest.problems ?? []) err(code, message, rest);
 
-  // ---- which cut plate each part is ----------------------------------------
-  const m = matchNest(nest, ctx.candidates, { toleranceMm: 0.5 });
+  /*
+   * KERF-COMPENSATED OUTLINES (matchNest `kerfOffsetMm`): every part is drawn that much outside its
+   * true edge, all of them alike. They were matched at their nominal size, and from here on the
+   * part IS its nominal outline — what is checked, measured and stored. One note says so.
+   */
+  if (m.kerfOffsetMm) {
+    for (const p of nest.parts) {
+      const n = m.nominal?.get(p.id);
+      if (!n) continue;
+      p.rings = n.full;
+      if (n.bare) p.ringsNoMarks = n.bare;
+      p.bbox = boxOfShape(n.full);
+    }
+    entry.kerfOffsetMm = m.kerfOffsetMm;
+    entry.notes.push(`The parts are drawn ${fmt(m.kerfOffsetMm)} mm oversize on every side — kerf compensation: the file is the path of the torch, not the parts — and were matched to their nominal size. They are stored at their nominal size, where the file has them.`);
+  }
+
   const partById = new Map(nest.parts.map((p) => [p.id, p]));
   /*
    * A PART LYING ACROSS THE PLATE'S EDGE (`outsidePlate`, the reader's own finding) is a part
@@ -294,7 +501,10 @@ function prepareFile(file, ctx, choices) {
   for (const pl of m.placements) if (!across.has(pl.partId)) placed.push({ ...pl, part: partById.get(pl.partId), cp: ctx.cpByKey.get(pl.candidateKey) });
 
   // ---- the plate -----------------------------------------------------------
-  const res = resolvePlate({ file, nest, placed, ctx });
+  // Parts that could be any of several cut plates of ONE steel say as much about the plate's steel as a part that is settled.
+  const oneSteel = (keys) => { const a = ctx.cpByKey.get(keys[0]).steel; return keys.every((key) => { const s = ctx.cpByKey.get(key).steel; return Math.abs(s.thickness - a.thickness) <= 0.0005 && norm(s.grade) === norm(a.grade) && norm(s.material) === norm(a.material); }); };
+  const alike = m.ambiguous.filter((a) => !across.has(a.partId) && oneSteel(a.candidateKeys)).map((a) => ({ cp: ctx.cpByKey.get(a.candidateKeys[0]) }));
+  const res = resolvePlate({ file, nest, placed: [...placed, ...alike], ctx });
   if (res.error) err(res.error.code, res.error.message, res.error.choices ? { choices: res.error.choices } : {});
   const plate = res.plate ?? null;
   const drawn = nest.plate.found === 'outline';
@@ -310,9 +520,9 @@ function prepareFile(file, ctx, choices) {
       lotL = flat ? P.length : P.width; lotW = flat ? P.width : P.length;
     }
     if (nest.hints?.thicknessMm != null && Math.abs(Number(nest.hints.thicknessMm) - P.thickness) > 0.01) {
-      err('PLATE_WRONG_THICKNESS', `the file says ${fmt(nest.hints.thicknessMm)} mm and ${plate.code} is ${fmt(P.thickness)} mm.`);
+      err('PLATE_WRONG_THICKNESS', `the ${nest.hints.from?.thicknessMm === 'file name' ? 'file name' : 'file'} says ${fmt(nest.hints.thicknessMm)} mm and ${plate.code} is ${fmt(P.thickness)} mm.`);
     }
-    if (nest.hints?.grade && P.grade && squash(nest.hints.grade) !== squash(P.grade)) {
+    if (nest.hints?.grade && P.grade && !sameGrade(nest.hints.grade, P.grade)) {
       err('PLATE_WRONG_GRADE', `the file says ${nest.hints.grade} and ${plate.code} is ${P.grade}.`);
     }
   }
@@ -326,6 +536,30 @@ function prepareFile(file, ctx, choices) {
     ? { itemId: plate.id, code: plate.code, name: plate.name ?? null, thickness: plate.steel.thickness, grade: plate.steel.grade ?? null, material: plate.steel.material ?? null, length: lotL, width: lotW, drawn, resolvedBy: res.by, offset: [dx, dy], kerfMm: k }
     : { itemId: null, code: null, length: lotL, width: lotW, drawn, resolvedBy: null, offset: [0, 0], kerfMm: k };
 
+  /*
+   * NOTHING THAT COULD HAVE BEEN A PART IS DROPPED WITH ONLY A NOTE (2026-10-13). What the reader
+   * could not read as it should — a curve given by control points, a block the file does not
+   * define, a filled area, a run of lines that does not close — is a WARNING that needs "save
+   * anyway". So is a closed shape drawn OUTSIDE the plate: when it is one of this line's cut plates
+   * the warning names it; inside a drawing frame, and nobody's shape, it is the sheet's own
+   * furniture (a title block) and stays the reader's note.
+   */
+  for (const { code, message, ...rest } of nest.cautions ?? []) warn(code, message, rest);
+  if (nest.outside?.length) {
+    const beside = nest.outside.map((o, i) => ({ id: `O${i + 1}`, rings: o.rings, bbox: o.bbox, labels: o.labels ?? [], labelFrom: o.labels?.length ? 'inside' : null, inFrame: o.inFrame }));
+    const om = matchNest({ parts: beside }, ctx.candidates, { toleranceMm: 0.5, kerfOffsetMaxMm: 0 });
+    const ours = new Map([...om.placements.map((pl) => [pl.partId, [pl.candidateKey]]), ...om.ambiguous.map((a) => [a.partId, a.candidateKeys])]);
+    const mine = beside.filter((o) => ours.has(o.id));
+    const others = beside.filter((o) => !ours.has(o.id) && !o.inFrame);
+    if (mine.length) {
+      const words = mine.slice(0, 3).map((o) => `${ours.get(o.id).map((key) => ctx.cpByKey.get(key).code).join(' or ')} at ${at(o.bbox)}`);
+      warn('SHAPE_IGNORED', `${plural(mine.length, 'shape', 'shapes')} drawn OUTSIDE the plate ${mine.length === 1 ? 'is one of this line\'s cut plates' : 'are this line\'s cut plates'} (${words.join(', ')}${mine.length > 3 ? ', …' : ''}) and ${mine.length === 1 ? 'is' : 'are'} not nested — only what is on the plate is read. Move ${mine.length === 1 ? 'it' : 'them'} onto the plate in the nesting program, or save anyway without ${mine.length === 1 ? 'it' : 'them'}.`, { shapes: mine.map((o) => o.bbox) });
+    }
+    if (others.length) {
+      warn('SHAPE_IGNORED', `${plural(others.length, 'closed shape', 'closed shapes')} drawn outside the plate ${others.length === 1 ? 'is' : 'are'} not read as ${others.length === 1 ? 'a part' : 'parts'} (the first ${fmt(others[0].bbox.length)} × ${fmt(others[0].bbox.width)} at ${at(others[0].bbox)}). If ${others.length === 1 ? 'it is a part' : 'one is a part'}, move it onto the plate in the nesting program — or save anyway.`, { shapes: others.map((o) => o.bbox) });
+    }
+  }
+
   // ---- parts hanging off the plate -------------------------------------------
   for (const id of across) {
     const part = partById.get(id);
@@ -337,7 +571,9 @@ function prepareFile(file, ctx, choices) {
   }
 
   // ---- parts that could be more than one cut plate --------------------------
-  const chosen = choices?.[file.filename] ?? choices?.[stem(file.filename)] ?? {};
+  // A ProNest job may be answered once for the whole job, and by the part's NAME — every piece of that part, on every nest.
+  const chosen = nif ? { ...(choices?.[stem(nif.sourceFile)] ?? {}), ...(choices?.[nif.sourceFile] ?? {}), ...(choices?.[file.filename] ?? {}) } : choices?.[file.filename] ?? choices?.[stem(file.filename)] ?? {};
+  const choiceFor = (part) => chosen[part.id] ?? (nif && part.partName != null ? chosen[part.partName] : undefined);
   const keyOfChoice = (v) => {
     if (v == null) return null;
     const s = String(v).trim();
@@ -347,184 +583,339 @@ function prepareFile(file, ctx, choices) {
     return cp ? `cp${cp.id}` : null;
   };
   const steelFits = (cp) => !plate || (Math.abs(cp.steel.thickness - plate.steel.thickness) <= 0.0005 && agrees(plate.steel.grade, cp.steel.grade) && agrees(plate.steel.material, cp.steel.material));
+  // How much THINNER than the plate a cut piece is (ProNest only): 0 = the same, null = thicker, or thinner by more than is taken.
+  const thinnerBy = (cp) => { if (!plate) return 0; const d = plate.steel.thickness - cp.steel.thickness; return Math.abs(d) <= 0.0005 ? 0 : (nif && d > 0 && d <= THINNER_MAX_MM + 0.0005 ? d : null); };
+  /**
+   * Of the cut pieces a ProNest part could be, the ones whose steel fits its plate — in this order:
+   * the thickness its NAME states ("9MM-…" on a 10 mm job), the plate's own thickness, then one up
+   * to 2 mm thinner. (A DXF part: the plate's own steel, as before.)
+   */
+  const fitting = (keys, part) => {
+    if (!nif || !plate) return keys.filter((key) => steelFits(ctx.cpByKey.get(key)));
+    const ok = keys.filter((key) => { const cp = ctx.cpByKey.get(key); return thinnerBy(cp) != null && agrees(plate.steel.grade, cp.steel.grade) && agrees(plate.steel.material, cp.steel.material); });
+    const named = part?.nameThickness != null ? ok.filter((key) => Math.abs(ctx.cpByKey.get(key).steel.thickness - part.nameThickness) <= 0.01) : [];
+    const exact = ok.filter((key) => thinnerBy(ctx.cpByKey.get(key)) === 0);
+    return named.length ? named : exact.length ? exact : ok;
+  };
+  const optionsOf = (keys) => keys.map((key) => { const cp = ctx.cpByKey.get(key); return { key, cutPlateId: cp.id, code: cp.code, thickness: cp.steel.thickness, grade: cp.steel.grade ?? null }; });
+  const pending = [];           // still open after the user's choices and the plate's steel: { a, part, keys }
   for (const a of m.ambiguous) {
     if (across.has(a.partId)) continue;               // said above; which cut plate it is no longer matters
     const part = partById.get(a.partId);
-    const want = keyOfChoice(chosen[a.partId]);
+    const asked = choiceFor(part);
+    const want = keyOfChoice(asked);
     let pick = null; let by = null;
-    if (chosen[a.partId] != null) {
+    if (asked != null) {
       if (want && a.candidateKeys.includes(want)) { pick = want; by = 'choice'; } else {
-        partErr('CHOICE_INVALID', part, `"${chosen[a.partId]}" was chosen for it, but it can only be ${list(a.candidateKeys.map((key) => ctx.cpByKey.get(key).code))}.`, { choices: a.candidateKeys.map((key) => ({ key, cutPlateId: ctx.cpByKey.get(key).id, code: ctx.cpByKey.get(key).code })) });
+        partErr('CHOICE_INVALID', part, `"${asked}" was chosen for it, but it can only be ${list(a.candidateKeys.map((key) => ctx.cpByKey.get(key).code))}.`, { choices: a.candidateKeys.map((key) => ({ key, cutPlateId: ctx.cpByKey.get(key).id, code: ctx.cpByKey.get(key).code })) });
         continue;
       }
     } else {
-      const fit = a.candidateKeys.filter((key) => steelFits(ctx.cpByKey.get(key)));
-      if (plate && fit.length === 1) { pick = fit[0]; by = 'steel'; }
-    }
-    if (!pick) {
-      const options = a.candidateKeys.map((key) => { const cp = ctx.cpByKey.get(key); return { key, cutPlateId: cp.id, code: cp.code, thickness: cp.steel.thickness, grade: cp.steel.grade ?? null }; });
-      partErr('PART_AMBIGUOUS', part, `it could be ${list(options.map((o) => `${o.code} (${steelWords(o)})`))} — they are the same shape. Say which (choices), or label the part in the file.`, { choices: options });
-      continue;
+      const fit = fitting(a.candidateKeys, part);
+      if (plate && fit.length === 1) { pick = fit[0]; by = 'steel'; } else { pending.push({ a, part, keys: plate && fit.length ? fit : a.candidateKeys }); continue; }
     }
     const opt = a.options.find((o) => o.candidateKey === pick);
     placed.push({ ...opt, by, part, cp: ctx.cpByKey.get(pick) });
   }
+  done.sure = placed.slice();
 
-  // ---- parts that are none of the line's cut plates -------------------------
-  /*
-   * A CLOSED AREA BETWEEN COMMON-CUT PARTS that matches nothing (`maybeScrap`: every side of it is
-   * a cut shared with a part, and it carries no label) is the scrap between parts, not a part the
-   * line forgot: it is a NOTE, it blocks nothing, and it is left out of the layout check. Anything
-   * else unmatched is still a part nobody can name, and blocks.
-   */
-  const scrap = new Set();
-  for (const u of m.unmatched) {
-    if (across.has(u.partId)) continue;
-    const part = partById.get(u.partId) ?? { id: u.partId, bbox: u.bbox, labels: u.labels };
-    if (u.maybeScrap) {
-      scrap.add(u.partId);
-      (entry.scrap ??= []).push({ partId: u.partId, x: part.bbox.x, y: part.bbox.y, length: part.bbox.length, width: part.bbox.width });
-      continue;
+  done.share = (left = null) => {
+    /*
+     * IDENTICAL CUT PLATES, NO LABEL (2026-10-13). A part that could be any of several cut plates
+     * of the SAME shape, thickness, grade and material is physically the same piece of steel
+     * whichever it is called — in a bridge that is the rule (left / right, span 1 / span 2). Such
+     * parts are SHARED OUT by what the line still needs of each cut plate, in a fixed order (parts
+     * as the file has them, cut plates by code): `by: 'quantity'`, with the others it could have
+     * been in `alternatives`, and one note. A part stays PART_AMBIGUOUS only when its candidates
+     * differ in steel, or the line needs no more of any of them (one more would over-fill).
+     * The user's own `choices` were settled above and always win.
+     */
+    const shared = new Map();     // the codes it was shared between → how many parts
+    for (const { a, part, keys } of pending) {
+      const order = keys.slice().sort((p, q) => String(ctx.cpByKey.get(p).code).localeCompare(String(ctx.cpByKey.get(q).code), undefined, { numeric: true }) || ctx.cpByKey.get(p).id - ctx.cpByKey.get(q).id);
+      const same = left && order.length > 1 && oneSteel(order);
+      const pick = same ? order.find((key) => (left.get(ctx.cpByKey.get(key).id) ?? 0) > 0) ?? null : null;
+      if (!pick) {
+        const options = optionsOf(a.candidateKeys);
+        const full = same ? ` The line needs no more of ${order.length === 2 ? 'either' : 'any of them'} — the files already nest every piece of each — so one more cannot be shared out.` : '';
+        partErr('PART_AMBIGUOUS', part, `it could be ${list(options.map((o) => `${o.code} (${steelWords(o)})`))} — they are the same shape.${full} Say which (choices), or label the part in the file.`, { choices: options });
+        continue;
+      }
+      const cp = ctx.cpByKey.get(pick);
+      left.set(cp.id, (left.get(cp.id) ?? 0) - 1);
+      const opt = a.options.find((o) => o.candidateKey === pick);
+      placed.push({ ...opt, by: 'quantity', part, cp, alternatives: order.filter((key) => key !== pick).map((key) => ({ key, cutPlateId: ctx.cpByKey.get(key).id, code: ctx.cpByKey.get(key).code })) });
+      const codes = order.map((key) => ctx.cpByKey.get(key).code).join('|');
+      shared.set(codes, (shared.get(codes) ?? 0) + 1);
     }
-    if (/^It is labelled/.test(u.why ?? '')) partErr('PART_LABEL_MISMATCH', part, u.why);
-    else partErr('PART_UNKNOWN', part, `${u.why ?? 'It matches no cut plate.'} It is not one of this line's cut plates.`);
-  }
-  if (scrap.size) {
-    const first = partById.get([...scrap][0]);
-    entry.notes.push(`${plural(scrap.size, 'closed area', 'closed areas')} between common-cut parts ${scrap.size === 1 ? 'matches' : 'match'} no cut plate (the first at ${at(first.bbox)}, ${fmt(first.bbox.length)} × ${fmt(first.bbox.width)}) — taken as the scrap between the parts, not as a part.`);
-  }
-  if (nest.skeleton) entry.notes.push(`The parts are cut against the plate's own edge; what is left of the plate (${fmt(nest.skeleton.bbox?.length)} × ${fmt(nest.skeleton.bbox?.width)} overall) is its remainder, not a part.`);
+    if (shared.size) {
+      const total = [...shared.values()].reduce((x, y) => x + y, 0);
+      entry.notes.push(`${plural(total, 'unlabelled part', 'unlabelled parts')} that could each be any of several identical cut plates ${total === 1 ? 'was' : 'were'} shared out by the quantity the line still needs of each: ${[...shared].map(([codes, n]) => `${n} between ${list(codes.split('|'))}`).join('; ')}. They are the same shape, thickness and grade, so the steel is the same either way — choose by hand (choices) if it matters which is which.`);
+    }
 
-  // ---- the steel has to agree, part by part ---------------------------------
-  if (plate) {
-    for (const pl of placed) {
-      const s = pl.cp.steel;
-      if (Math.abs(s.thickness - plate.steel.thickness) > 0.0005) partErr('PART_WRONG_THICKNESS', pl.part, `${pl.cp.code} is ${fmt(s.thickness)} mm and ${plate.code} is ${fmt(plate.steel.thickness)} mm, so it cannot be cut from it.`, { cutPlateCode: pl.cp.code });
-      else if (!agrees(plate.steel.grade, s.grade)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.grade ?? 'of no stated grade'} and ${plate.code} is ${plate.steel.grade}. A nest cannot mix grades.`, { cutPlateCode: pl.cp.code });
-      else if (!agrees(plate.steel.material, s.material)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.material ?? 'of no stated material'} and ${plate.code} is ${plate.steel.material}.`, { cutPlateCode: pl.cp.code });
+    // ---- parts that are none of the line's cut plates -------------------------
+    /*
+     * A CLOSED AREA BETWEEN COMMON-CUT PARTS that matches nothing (`maybeScrap`: every side of it is
+     * a cut shared with a part, and it carries no label) is the scrap between parts, not a part the
+     * line forgot: it is a NOTE, it blocks nothing, and it is left out of the layout check. Anything
+     * else unmatched is still a part nobody can name, and blocks.
+     */
+    const scrap = new Set();
+    for (const u of m.unmatched) {
+      if (across.has(u.partId)) continue;
+      const part = partById.get(u.partId) ?? { id: u.partId, bbox: u.bbox, labels: u.labels };
+      if (u.maybeScrap) {
+        scrap.add(u.partId);
+        (entry.scrap ??= []).push({ partId: u.partId, x: part.bbox.x, y: part.bbox.y, length: part.bbox.length, width: part.bbox.width });
+        continue;
+      }
+      if (/^It is labelled/.test(u.why ?? '')) partErr('PART_LABEL_MISMATCH', part, u.why);
+      else partErr('PART_UNKNOWN', part, `${u.why ?? 'It matches no cut plate.'} It is not one of this line's cut plates.`);
     }
-  }
+    if (scrap.size) {
+      const first = partById.get([...scrap][0]);
+      entry.notes.push(`${plural(scrap.size, 'closed area', 'closed areas')} between common-cut parts ${scrap.size === 1 ? 'matches' : 'match'} no cut plate (the first at ${at(first.bbox)}, ${fmt(first.bbox.length)} × ${fmt(first.bbox.width)}) — taken as the scrap between the parts, not as a part.`);
+    }
+    if (nest.skeleton) entry.notes.push(`The parts are cut against the plate's own edge; what is left of the plate (${fmt(nest.skeleton.bbox?.length)} × ${fmt(nest.skeleton.bbox?.width)} overall) is its remainder, not a part.`);
 
-  // ---- the layout itself, on the customer's own lines -----------------------
-  const move = (rings) => { const o = ringsObject(rings); const f = (r) => r.map(([x, y]) => [x + dx, y + dy]); return { outline: f(o.outline), cutouts: o.cutouts.map(f), holes: o.holes.map(f) }; };
-  const cpOfPart = new Map(placed.map((pl) => [pl.partId, pl.cp]));
-  // What is checked: every shape ON the plate that is a part (not one hanging off it, not scrap).
-  const onPlate = nest.parts.filter((p) => !across.has(p.id) && !scrap.has(p.id));
-  const label = (i) => { const part = onPlate[i]; const cp = cpOfPart.get(part.id); return `${cp ? cp.code : `part ${part.id}`} at ${at({ x: part.bbox.x + dx, y: part.bbox.y + dy })}`; };
-  // Our kerf, and one kerf at the edge (rimOf().legalMin): the same legal minimum our own layouts
-  // are verified against — but a customer's layout only WARNS below it (their program may cut
-  // with another kerf), where ours is refused.
-  done.verifyArgs = { length: lotL, width: lotW, kerf: k, margin: rimOf(k).legalMin, rim: drawn, placements: onPlate.map((p) => ({ key: p.id, rings: move(p.rings) })) };
+    // ---- the steel has to agree, part by part ---------------------------------
+    if (plate) {
+      const thinner = new Map();                      // cut plate id → { cp, parts } — ProNest: a piece cut from the next plate up
+      for (const pl of placed) {
+        const s = pl.cp.steel;
+        const by = thinnerBy(pl.cp);
+        if (by != null && by > 0 && agrees(plate.steel.grade, s.grade) && agrees(plate.steel.material, s.material)) {
+          if (!thinner.has(pl.cp.id)) thinner.set(pl.cp.id, { cp: pl.cp, parts: [] });
+          thinner.get(pl.cp.id).parts.push(pl.partId);
+        } else if (Math.abs(s.thickness - plate.steel.thickness) > 0.0005) partErr('PART_WRONG_THICKNESS', pl.part, `${pl.cp.code} is ${fmt(s.thickness)} mm and ${plate.code} is ${fmt(plate.steel.thickness)} mm, so it cannot be cut from it.`, { cutPlateCode: pl.cp.code });
+        else if (!agrees(plate.steel.grade, s.grade)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.grade ?? 'of no stated grade'} and ${plate.code} is ${plate.steel.grade}. A nest cannot mix grades.`, { cutPlateCode: pl.cp.code });
+        else if (!agrees(plate.steel.material, s.material)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.material ?? 'of no stated material'} and ${plate.code} is ${plate.steel.material}.`, { cutPlateCode: pl.cp.code });
+      }
+      for (const { cp, parts } of thinner.values()) {
+        warn('PART_THINNER_THAN_PLATE', `${cp.code} is ${fmt(cp.steel.thickness)} mm and is nested on ${fmt(plate.steel.thickness)} mm plate (${plural(parts.length, 'piece', 'pieces')}). A piece may be cut from the next plate up — it is then ${fmt(plate.steel.thickness)} mm thick, not ${fmt(cp.steel.thickness)} — so check that is meant, then save anyway. The cut piece keeps its own thickness and weight.`,
+          { cutPlateId: cp.id, cutPlateCode: cp.code, cutPlateThickness: cp.steel.thickness, plateThickness: plate.steel.thickness, parts });
+      }
+    }
 
-  done.verified = (check) => {
-    const close = [];
-    const rim = [];
-    for (const pr of check.problems) {
-      const A = onPlate[pr.ai]; const B = pr.bi != null && pr.bi >= 0 ? onPlate[pr.bi] : null;
-      if (pr.kind === 'overlap') entry.errors.push({ code: 'OVERLAP', partId: A.id, otherPartId: B?.id ?? null, message: `${file.filename}, ${name()}: ${label(pr.ai)} and ${label(pr.bi)} overlap — two parts cannot be cut from the same steel.` });
-      else if (pr.kind === 'outside') entry.errors.push({ code: 'OUTSIDE_PLATE', partId: A.id, message: `${file.filename}, ${name()}: ${label(pr.ai)} runs off the plate, which is ${fmt(lotL)} × ${fmt(lotW)}${drawn ? '' : ' (the file does not draw it, so its parts are measured from the plate corner)'}.` });
-      else if (pr.kind === 'too_close') close.push({ a: A.id, b: B?.id ?? null, distance: pr.distance ?? null, text: `${label(pr.ai)} and ${label(pr.bi)}${pr.distance != null ? ` are ${fmt(pr.distance)} mm apart` : ''}` });
-      else if (pr.kind === 'in_rim') rim.push({ a: A.id, text: label(pr.ai) });
+    // ---- matched by the size in its name: how the nested outline differs --------
+    {
+      const byCode = new Map();
+      for (const pl of placed) if (pl.outlineDiffers && !byCode.has(pl.cp.id)) byCode.set(pl.cp.id, pl);
+      for (const pl of byCode.values()) {
+        const d = pl.outlineDiffers;
+        entry.notes.push(`${pl.cp.code} ("${pl.part.partName ?? pl.part.labels?.[0] ?? ''}") was matched by the size in its name: it is drawn ${fmt(d.drawn[0])} × ${fmt(d.drawn[1])}, the cut piece is ${fmt(d.cutPiece[0])} × ${fmt(d.cutPiece[1])} — the nesting's outline is another size (camber, or an allowance for cutting). The nested outline is what is cut: it is what is stored and measured here; the cut piece keeps its own size.`);
+      }
     }
-    if (close.length) {
-      warn('TOO_CLOSE', `${close[0].text}${close.length > 1 ? ` (and ${plural(close.length - 1, 'more pair', 'more pairs')})` : ''} — closer than the ${fmt(k)} mm kerf we cut ${fmt(plate?.steel.thickness ?? null)} mm plate with. The customer's program may use another kerf — save anyway to keep the layout as drawn.`, { pairs: close.slice(0, 50) });
-    }
-    if (rim.length) {
-      warn('IN_RIM', `${rim[0].text}${rim.length > 1 ? ` and ${plural(rim.length - 1, 'more part', 'more parts')}` : ''} ${rim.length > 1 ? 'sit' : 'sits'} nearer the plate edge than one ${fmt(k)} mm kerf. A plate edge is not straight, so we keep a kerf clear of it — save anyway to keep the layout as drawn.`, { parts: rim.slice(0, 50).map((r) => r.a) });
-    }
-    if (check.commonCuts.length) entry.notes.push(`${plural(check.commonCuts.length, 'common cut', 'common cuts')}: parts that touch share one cut line.`);
-    if (!drawn && plate) entry.notes.push(dx || dy ? `The file does not draw the plate, so its parts are placed ${fmt(dx)} mm in from the plate's lower-left corner.` : 'The file does not draw the plate, so its parts are measured from the plate\'s lower-left corner.');
 
-    // ---- what it stores: our shape, placed exactly where the file has it --------
-    const pieces = [];
-    const count = new Map();
-    let fromFile = 0; let tooIntricate = 0;
-    for (const pl of placed.sort((p, q) => (p.part.bbox.y - q.part.bbox.y) || (p.part.bbox.x - q.part.bbox.x))) {
-      const shape = ctx.shapeOf(pl.cp);
-      const rot = normDeg(pl.rotationDeg ?? 0);
-      let rings = placeShape(shape.rings, { x: Number(pl.x) + dx, y: Number(pl.y) + dy, rotationDeg: rot, mirrored: !!pl.mirrored });
-      /*
-       * A CUT PLATE WITH NO DRAWING, DRAWN BY THE CUSTOMER AS SOMETHING OTHER THAN A RECTANGLE
-       * (it was matched by its label or by the box round it): the customer's own outline is kept
-       * for this placement — the diagram, the overlap check, the free space and the offcuts then
-       * use the real shape instead of a rectangle that is not there. On THIS PLATE the steel in the
-       * part (`area`, cf_nest_placements.area_mm2) is then the outline's — otherwise the plate would
-       * not add up — but nothing is written on the cut plate itself: its catalog LENGTH, WIDTH and
-       * weight stay what they are until a drawing is uploaded, and a drawing, once there, wins.
-       */
-      let fileRings = null;
-      if (!shape.drawn && pl.part?.rings) {
-        const own = move(pl.part.rings);
-        const b = boxOfShape(own);
-        const boxArea = b.length * b.width;
-        const notARectangle = own.cutouts.length > 0 || own.holes.length > 0 || ringsArea(own) < boxArea - Math.max(1, boxArea * 1e-4);
-        // Lying square it must not be a rectangle; at a free angle a rectangle's own outline IS what placeShape gives.
-        const turnedRect = !isPlainPlacement(rot, !!pl.mirrored) && own.outline.length === 4 && !own.cutouts.length && !own.holes.length;
-        if (notARectangle && !turnedRect) {
+    /*
+     * MARKING, NOT CUT-OUTS. A part that came with closed shapes inside it in another layer or
+     * colour than its outline (`ringsNoMarks`) and was matched WITHOUT them (`marksLeftOut`) is from
+     * here on the part without them: scribed letters are never stored as cut-outs. When its cut
+     * plate has a drawing, the drawing has no such openings — they are marking, and a note says so.
+     * When it has none, nothing can tell: a warning that needs "save anyway".
+     */
+    const bare = new Set(placed.filter((pl) => pl.marksLeftOut > 0 && pl.part?.ringsNoMarks).map((pl) => pl.partId));
+    const ringsOfPart = (p) => (bare.has(p.id) ? p.ringsNoMarks : p.rings);
+    {
+      const told = placed.filter((pl) => bare.has(pl.partId) && ctx.shapeOf(pl.cp).drawn);
+      const untold = placed.filter((pl) => bare.has(pl.partId) && !ctx.shapeOf(pl.cp).drawn);
+      const count = (xs) => xs.reduce((n, pl) => n + pl.marksLeftOut, 0);
+      if (told.length) entry.notes.push(`${plural(count(told), 'closed shape', 'closed shapes')} inside ${plural(told.length, 'part', 'parts')}, drawn in another layer or colour than the outline, ${count(told) === 1 ? 'is' : 'are'} not in the part's drawing: read as marking, not as ${count(told) === 1 ? 'a cut-out' : 'cut-outs'}.`);
+      if (untold.length) {
+        const pl = untold[0];
+        warn('MARKING_UNSURE', `${pl.cp.code} at ${at({ x: pl.part.bbox.x + dx, y: pl.part.bbox.y + dy })} has ${plural(pl.marksLeftOut, 'closed shape', 'closed shapes')} inside it on ${pl.part.unsureStyle ?? 'another layer'} — not the layer and colour of its outline — and no drawing to say whether ${pl.marksLeftOut === 1 ? 'it is a cut-out' : 'they are cut-outs'} or marking${untold.length > 1 ? ` (and ${plural(untold.length - 1, 'more part', 'more parts')} like it)` : ''}. ${count(untold) === 1 ? 'It is' : 'They are'} NOT stored as ${count(untold) === 1 ? 'a cut-out' : 'cut-outs'}. Upload the part's drawing if ${count(untold) === 1 ? 'it is one' : 'they are'} — or save anyway.`, { parts: untold.map((x) => x.partId) });
+      }
+    }
+
+    // ---- the layout itself, on the customer's own lines -----------------------
+    const move = (rings) => { const o = ringsObject(rings); const f = (r) => r.map(([x, y]) => [x + dx, y + dy]); return { outline: f(o.outline), cutouts: o.cutouts.map(f), holes: o.holes.map(f) }; };
+    const cpOfPart = new Map(placed.map((pl) => [pl.partId, pl.cp]));
+    // What is checked: every shape ON the plate that is a part (not one hanging off it, not scrap).
+    const onPlate = nest.parts.filter((p) => !across.has(p.id) && !scrap.has(p.id));
+    const label = (i) => { const part = onPlate[i]; const cp = cpOfPart.get(part.id); return `${cp ? cp.code : `part ${part.id}`} at ${at({ x: part.bbox.x + dx, y: part.bbox.y + dy })}`; };
+    // Our kerf, and one kerf at the edge (rimOf().legalMin): the same legal minimum our own layouts
+    // are verified against — but a customer's layout only WARNS below it (their program may cut
+    // with another kerf), where ours is refused.
+    done.verifyArgs = { length: lotL, width: lotW, kerf: k, margin: rimOf(k).legalMin, rim: drawn, placements: onPlate.map((p) => ({ key: p.id, rings: move(ringsOfPart(p)) })) };
+
+    done.verified = (check) => {
+      const close = [];
+      const rim = [];
+      const commonLine = [];        // ProNest: two pieces of ONE common-line-cut group — one cut between them, drawn a kerf apart
+      for (const pr of check.problems) {
+        const A = onPlate[pr.ai]; const B = pr.bi != null && pr.bi >= 0 ? onPlate[pr.bi] : null;
+        if (pr.kind === 'too_close' && nif && A.clcGroup && B && A.clcGroup === B.clcGroup) { commonLine.push(pr.distance ?? null); continue; }
+        if (pr.kind === 'overlap') entry.errors.push({ code: 'OVERLAP', partId: A.id, otherPartId: B?.id ?? null, message: `${file.filename}, ${name()}: ${label(pr.ai)} and ${label(pr.bi)} overlap — two parts cannot be cut from the same steel.` });
+        else if (pr.kind === 'outside') entry.errors.push({ code: 'OUTSIDE_PLATE', partId: A.id, message: `${file.filename}, ${name()}: ${label(pr.ai)} runs off the plate, which is ${fmt(lotL)} × ${fmt(lotW)}${drawn ? '' : ' (the file does not draw it, so its parts are measured from the plate corner)'}.` });
+        else if (pr.kind === 'too_close') close.push({ a: A.id, b: B?.id ?? null, distance: pr.distance ?? null, text: `${label(pr.ai)} and ${label(pr.bi)}${pr.distance != null ? ` are ${fmt(pr.distance)} mm apart` : ''}` });
+        else if (pr.kind === 'in_rim') rim.push({ a: A.id, text: label(pr.ai) });
+      }
+      if (close.length) {
+        warn('TOO_CLOSE', `${close[0].text}${close.length > 1 ? ` (and ${plural(close.length - 1, 'more pair', 'more pairs')})` : ''} — closer than the ${fmt(k)} mm kerf we cut ${fmt(plate?.steel.thickness ?? null)} mm plate with. The customer's program may use another kerf — save anyway to keep the layout as drawn.`, { pairs: close.slice(0, 50) });
+      }
+      if (rim.length) {
+        warn('IN_RIM', `${rim[0].text}${rim.length > 1 ? ` and ${plural(rim.length - 1, 'more part', 'more parts')}` : ''} ${rim.length > 1 ? 'sit' : 'sits'} nearer the plate edge than one ${fmt(k)} mm kerf. A plate edge is not straight, so we keep a kerf clear of it — save anyway to keep the layout as drawn.`, { parts: rim.slice(0, 50).map((r) => r.a) });
+      }
+      if (check.commonCuts.length) entry.notes.push(`${plural(check.commonCuts.length, 'common cut', 'common cuts')}: parts that touch share one cut line.`);
+      if (commonLine.length) {
+        const gaps = commonLine.filter((d) => d != null);
+        entry.notes.push(`${plural(commonLine.length, 'pair of pieces is', 'pairs of pieces are')} cut on a common line in ProNest${gaps.length ? ` (drawn ${fmt(Math.min(...gaps))}${Math.max(...gaps) - Math.min(...gaps) > 0.01 ? ` – ${fmt(Math.max(...gaps))}` : ''} mm apart)` : ''}: one cut between the two, so being closer than our ${fmt(k)} mm kerf is as meant.`);
+      }
+      if (!drawn && plate) entry.notes.push(dx || dy ? `The file does not draw the plate, so its parts are placed ${fmt(dx)} mm in from the plate's lower-left corner.` : 'The file does not draw the plate, so its parts are measured from the plate\'s lower-left corner.');
+
+      // ---- what it stores: our shape, placed exactly where the file has it --------
+      const pieces = [];
+      const count = new Map();
+      let fromFile = 0; let tooIntricate = 0; let plainInFile = 0; let overDrawing = 0;
+      const openings = [];          // parts with no drawing whose file outline has openings that are not round holes
+      for (const pl of placed.sort((p, q) => (p.part.bbox.y - q.part.bbox.y) || (p.part.bbox.x - q.part.bbox.x))) {
+        const shape = ctx.shapeOf(pl.cp);
+        const rot = normDeg(pl.rotationDeg ?? 0);
+        let rings = placeShape(shape.rings, { x: Number(pl.x) + dx, y: Number(pl.y) + dy, rotationDeg: rot, mirrored: !!pl.mirrored });
+        // Our drawing has holes or a shaped edge and the file draws the bare rectangle (holes drilled later): our drawing is stored.
+        if (shape.drawn && pl.by === 'size' && !nif) plainInFile += 1;
+        /*
+         * A CUT PLATE WITH NO DRAWING, DRAWN BY THE CUSTOMER AS SOMETHING OTHER THAN A RECTANGLE
+         * (it was matched by its label or by the box round it): the customer's own outline is kept
+         * for this placement — the diagram, the overlap check, the free space and the offcuts then
+         * use the real shape instead of a rectangle that is not there. On THIS PLATE the steel in the
+         * part (`area`, cf_nest_placements.area_mm2) is then the outline's — otherwise the plate would
+         * not add up — but nothing is written on the cut plate itself: its catalog LENGTH, WIDTH and
+         * weight stay what they are until a drawing is uploaded, and a drawing, once there, wins.
+         */
+        let fileRings = null;
+        const partRings = pl.part ? ringsOfPart(pl.part) : null;
+        /*
+         * A PRONEST PART keeps the NESTED OUTLINE whatever it is — a rectangle, a cambered web, a part
+         * whose cut piece has a drawing with holes the nesting leaves out: it is what will be cut, so
+         * it is what is drawn, checked and measured (`asCut`: it stands also when a drawing is there,
+         * where a DXF's outline gives way to one).
+         */
+        if (nif && partRings) {
+          const own = move(partRings);
           if (cornersOf(own) <= MAX_FILE_RING_CORNERS) {
             const r = (ring) => ring.map(([x, y]) => [r3(x), r3(y)]);
-            fileRings = { outline: r(own.outline), cutouts: own.cutouts.map(r), holes: own.holes.map(r) };
+            fileRings = { outline: r(own.outline), cutouts: own.cutouts.map(r), holes: own.holes.map(r), asCut: true };
             rings = fileRings;
-            fromFile += 1;
+            if (shape.drawn) overDrawing += 1;
+            if (own.cutouts.length && !shape.drawn) openings.push({ pl, n: own.cutouts.length });
           } else tooIntricate += 1;
+        } else if (!shape.drawn && partRings) {
+          const own = move(partRings);
+          const b = boxOfShape(own);
+          const boxArea = b.length * b.width;
+          const notARectangle = own.cutouts.length > 0 || own.holes.length > 0 || ringsArea(own) < boxArea - Math.max(1, boxArea * 1e-4);
+          // Lying square it must not be a rectangle; at a free angle a rectangle's own outline IS what placeShape gives.
+          const turnedRect = !isPlainPlacement(rot, !!pl.mirrored) && own.outline.length === 4 && !own.cutouts.length && !own.holes.length;
+          if (notARectangle && !turnedRect) {
+            if (cornersOf(own) <= MAX_FILE_RING_CORNERS) {
+              const r = (ring) => ring.map(([x, y]) => [r3(x), r3(y)]);
+              fileRings = { outline: r(own.outline), cutouts: own.cutouts.map(r), holes: own.holes.map(r) };
+              rings = fileRings;
+              fromFile += 1;
+              if (own.cutouts.length) openings.push({ pl, n: own.cutouts.length });
+            } else tooIntricate += 1;
+          }
         }
+        const box = boxOfShape(rings);
+        const piece = {
+          partId: pl.partId, cutPlateId: pl.cp.id, cutPlateCode: pl.cp.code,
+          seqNo: 1, rowNo: 1, posNo: pieces.length + 1,
+          x: box.x, y: box.y, length: box.length, width: box.width,
+          rotationDeg: rot, mirrored: !!pl.mirrored, placedBy: 'customer', area: fileRings ? r3(ringsArea(fileRings)) : shape.area,
+          by: pl.by, confidence: pl.confidence ?? null,
+          shaped: shape.drawn || !!fileRings || !isPlainPlacement(rot, !!pl.mirrored), placedRings: rings,
+          ...(fileRings ? { fileRings } : {}),
+          shapeFrom: fileRings ? 'nesting file' : shape.shapeFrom,
+          ...(pl.alternatives ? { alternatives: pl.alternatives } : {}),
+          ...(nif ? { partName: pl.part?.partName ?? null } : {}),
+          ...(pl.outlineDiffers ? { outlineDiffers: pl.outlineDiffers } : {}),
+        };
+        pieces.push(piece);
+        count.set(pl.cp.id, (count.get(pl.cp.id) ?? 0) + 1);
       }
-      const box = boxOfShape(rings);
-      const piece = {
-        partId: pl.partId, cutPlateId: pl.cp.id, cutPlateCode: pl.cp.code,
-        seqNo: 1, rowNo: 1, posNo: pieces.length + 1,
-        x: box.x, y: box.y, length: box.length, width: box.width,
-        rotationDeg: rot, mirrored: !!pl.mirrored, placedBy: 'customer', area: fileRings ? r3(ringsArea(fileRings)) : shape.area,
-        by: pl.by, confidence: pl.confidence ?? null,
-        shaped: shape.drawn || !!fileRings || !isPlainPlacement(rot, !!pl.mirrored), placedRings: rings,
-        ...(fileRings ? { fileRings, shapeFrom: 'nesting file' } : {}),
-      };
-      pieces.push(piece);
-      count.set(pl.cp.id, (count.get(pl.cp.id) ?? 0) + 1);
-    }
-    if (fromFile) entry.notes.push(`${plural(fromFile, 'part has', 'parts have')} no drawing and ${fromFile === 1 ? 'is' : 'are'} not a rectangle in the file: ${fromFile === 1 ? 'its shape is' : 'their shapes are'} taken from the nesting file. The cut plate's own size and weight stay the catalog's until a drawing is uploaded.`);
-    if (tooIntricate) entry.notes.push(`${plural(tooIntricate, 'part without a drawing is', 'parts without a drawing are')} too intricate in the file to keep the outline of (more than ${MAX_FILE_RING_CORNERS} corners): stored as the rectangle round ${tooIntricate === 1 ? 'it' : 'them'}.`);
-    entry.placed = pieces.length;
-    entry.counts = [...count].map(([id, qty]) => ({ cutPlateId: id, cutPlateCode: ctx.cpById.get(id).code, qty }));
-    entry.placements = pieces.map((p) => ({
-      partId: p.partId, cutPlateId: p.cutPlateId, cutPlateCode: p.cutPlateCode, x: p.x, y: p.y, length: p.length, width: p.width,
-      rotationDeg: p.rotationDeg, mirrored: p.mirrored, placedBy: 'customer', area: p.area, by: p.by, confidence: p.confidence, rings: displayRings(p.placedRings),
-      ...(p.shapeFrom ? { shapeFrom: p.shapeFrom } : {}),
-    }));
-    settle();
-    if (!(plate && pieces.length)) return null;
+      if (fromFile) entry.notes.push(`${plural(fromFile, 'part has', 'parts have')} no drawing and ${fromFile === 1 ? 'is' : 'are'} not a rectangle in the file: ${fromFile === 1 ? 'its shape is' : 'their shapes are'} taken from the nesting file. The cut plate's own size and weight stay the catalog's until a drawing is uploaded.`);
+      if (overDrawing) entry.notes.push(`${plural(overDrawing, 'part has', 'parts have')} a drawing and ${overDrawing === 1 ? 'is' : 'are'} stored as the nesting file's outline all the same: it is what will be cut (holes the drawing has and the nesting leaves out are drilled later).`);
+      if (tooIntricate) entry.notes.push(`${plural(tooIntricate, 'part without a drawing is', 'parts without a drawing are')} too intricate in the file to keep the outline of (more than ${MAX_FILE_RING_CORNERS} corners): stored as the rectangle round ${tooIntricate === 1 ? 'it' : 'them'}.`);
+      if (plainInFile) entry.notes.push(`${plural(plainInFile, 'part is', 'parts are')} drawn in the file as a plain rectangle although ${plainInFile === 1 ? 'its drawing has' : 'their drawings have'} holes or a shaped edge (holes drilled later, perhaps): stored as ${plainInFile === 1 ? 'its drawing' : 'their drawings'}, not as the file drew ${plainInFile === 1 ? 'it' : 'them'}.`);
+      // Openings that are not round holes, on a part with no drawing: they may be cut-outs or scribed
+      // letters on the cut layer — nothing can tell. Stored as cut-outs, with a warning that needs force.
+      if (openings.length) {
+        const { pl, n } = openings[0];
+        warn('CUTOUTS_FROM_FILE', `${pl.cp.code} at ${at({ x: pl.part.bbox.x + dx, y: pl.part.bbox.y + dy })} has no drawing, and the file draws ${plural(n, 'opening', 'openings')} in it that ${n === 1 ? 'is not a round hole' : 'are not round holes'}${openings.length > 1 ? ` (and ${plural(openings.length - 1, 'more part', 'more parts')} like it)` : ''}. ${n === 1 && openings.length === 1 ? 'It is stored as a cut-out' : 'They are stored as cut-outs'}, taken from the nesting file. Check ${n === 1 && openings.length === 1 ? 'it is a cut-out' : 'they are cut-outs'} and not scribed marking — then save anyway, or upload the part's drawing.`, { parts: openings.map((o) => o.pl.partId) });
+      }
+      entry.placed = pieces.length;
+      entry.counts = [...count].map(([id, qty]) => ({ cutPlateId: id, cutPlateCode: ctx.cpById.get(id).code, qty }));
+      entry.placements = pieces.map((p) => ({
+        partId: p.partId, cutPlateId: p.cutPlateId, cutPlateCode: p.cutPlateCode, x: p.x, y: p.y, length: p.length, width: p.width,
+        rotationDeg: p.rotationDeg, mirrored: p.mirrored, placedBy: 'customer', area: p.area, by: p.by, confidence: p.confidence, rings: displayRings(p.placedRings),
+        shapeFrom: p.shapeFrom,
+        ...(p.alternatives ? { alternatives: p.alternatives } : {}),
+        ...(p.partName !== undefined ? { partName: p.partName } : {}),
+        ...(p.outlineDiffers ? { outlineDiffers: p.outlineDiffers } : {}),
+      }));
+      settle();
+      if (!(plate && pieces.length)) return null;
 
-    const steel = ctx.cpById.get(pieces[0].cutPlateId).steel;
-    const density = plate.steel.density ?? steel.density ?? null;
-    const wasteLot = {
-      lotNo: entry.lotNo, length: lotL, width: lotW, thickness: plate.steel.thickness, density, kerfMm: k, seqGapMinMm: settings.seqGapMinMm,
-      offcutMinAreaMm2: settings.offcutMinAreaMm2, offcutMinSideMm: settings.offcutMinSideMm,
-    };
-    done.measured = (waste) => {
-      const plateKg = kgOf(lotL * lotW, plate.steel.thickness, density);
-      entry.metrics = {
-        plateKg, partsKg: waste.partsKg, wasteKgTotal: r3(plateKg - waste.partsKg), wastePct: lotL * lotW > 0 ? r3(((lotL * lotW - waste.partsArea) / (lotL * lotW)) * 100) : null,
-        waste: waste.waste, wasteKg: waste.wasteKg, offcuts: waste.offcuts.length, offcutKg: r3(waste.offcuts.reduce((a, o) => a + (o.weightKg ?? 0), 0)),
+      const steel = ctx.cpById.get(pieces[0].cutPlateId).steel;
+      const density = plate.steel.density ?? steel.density ?? null;
+      const wasteLot = {
+        lotNo: entry.lotNo, length: lotL, width: lotW, thickness: plate.steel.thickness, density, kerfMm: k, seqGapMinMm: settings.seqGapMinMm,
+        offcutMinAreaMm2: settings.offcutMinAreaMm2, offcutMinSideMm: settings.offcutMinSideMm,
       };
-      const maxX = Math.max(...pieces.map((p) => p.x + p.length)); const maxY = Math.max(...pieces.map((p) => p.y + p.width));
-      entry._lot = {
-        lotNo: entry.lotNo, plate, lengthMm: lotL, widthMm: lotW, source: 'catalog', isManual: false, settings,
-        grade: steel.grade ?? plate.steel.grade, material: steel.material ?? plate.steel.material, density,
-        requiredLength: r3(maxX + k), requiredWidth: r3(maxY + k),
-        origin: 'imported', verdict: null, reasons: null, forced: false,
-        notes: String(entry.nestNo).length > 30 ? `Nest in the file: ${entry.nestNo}`.slice(0, 500) : null,
-        waste, pieces,
-        sourceKind: 'dxf', sourceFile: file.filename, sourceHash: file.hash, layoutOrigin: 'customer',
+      done.measured = (waste) => {
+        const plateKg = kgOf(lotL * lotW, plate.steel.thickness, density);
+        entry.metrics = {
+          plateKg, partsKg: waste.partsKg, wasteKgTotal: r3(plateKg - waste.partsKg), wastePct: lotL * lotW > 0 ? r3(((lotL * lotW - waste.partsArea) / (lotL * lotW)) * 100) : null,
+          waste: waste.waste, wasteKg: waste.wasteKg, offcuts: waste.offcuts.length, offcutKg: r3(waste.offcuts.reduce((a, o) => a + (o.weightKg ?? 0), 0)),
+        };
+        const maxX = Math.max(...pieces.map((p) => p.x + p.length)); const maxY = Math.max(...pieces.map((p) => p.y + p.width));
+        entry._lot = {
+          lotNo: entry.lotNo, plate, lengthMm: lotL, widthMm: lotW, source: 'catalog', isManual: false, settings,
+          grade: steel.grade ?? plate.steel.grade, material: steel.material ?? plate.steel.material, density,
+          requiredLength: r3(maxX + k), requiredWidth: r3(maxY + k),
+          origin: 'imported', verdict: null, reasons: null, forced: false,
+          notes: String(entry.nestNo).length > 30 ? `Nest in the file: ${entry.nestNo}`.slice(0, 500) : null,
+          waste, pieces,
+          sourceKind: nif ? 'pronest' : 'dxf', sourceFile: nif ? nif.sourceFile : file.filename, sourceHash: file.hash, layoutOrigin: 'customer',
+        };
       };
+      return [wasteLot, pieces];
     };
-    return [wasteLot, pieces];
+    settle();
   };
+  settle();
   return done;
 }
 
-/** The three steps of prepareFile in place, on this thread — one file, or a test. */
-function processFile(file, ctx, choices) {
+/**
+ * What the line still needs of each cut plate once everything CERTAIN is counted — the pieces the
+ * request's files place for sure, and the customer's pieces on saved uploaded plates the request
+ * leaves alone: Map cutPlateId → pieces. What prepareFile's `share` hands out from.
+ * `opts`: { mode, remove } of the request (a plate it replaces or removes no longer counts).
+ */
+function quotaOf(stages, ctx, { mode = 'merge', remove = [] } = {}) {
+  const left = new Map(ctx.cutPlates.map((cp) => [cp.id, Number(cp.pieces) || 0]));
+  const take = (id) => left.set(id, (left.get(id) ?? 0) - 1);
+  const nos = new Set(stages.map((s) => s.entry.lotNo?.toUpperCase()).filter(Boolean));
+  const names = new Set(stages.map((s) => String(s.entry.filename).toLowerCase()));
+  const gone = new Set(remove.map((r) => String(r).trim().toUpperCase()));
+  // A ProNest job uploaded again replaces or removes every plate saved from it.
+  const jobs = new Set(stages.map((s) => s.entry._nif?.prefix?.toUpperCase()).filter(Boolean));
+  for (const l of ctx.saved ?? []) {
+    if (l.origin !== 'imported' || mode === 'replace') continue;
+    if (l.sourceKind === 'pronest' && jobs.has(jobOfLotNo(l.lotNo))) continue;
+    if (nos.has(l.lotNo.toUpperCase()) || (l.sourceFile && names.has(l.sourceFile.toLowerCase())) || gone.has(String(l.id)) || gone.has(l.lotNo.toUpperCase())) continue;
+    for (const p of l.pieces) if (isUploadedPiece(l, p)) take(p.cutPlateId);
+  }
+  for (const s of stages) for (const pl of s.sure) take(pl.cp.id);
+  return left;
+}
+
+/** The steps of prepareFile in place, on this thread — one file, or a test. */
+function processFile(file, ctx, choices, opts = {}) {
   const st = prepareFile(file, ctx, choices);
+  st.share(quotaOf([st], ctx, opts));
   if (st.verifyArgs) {
     const pair = st.verified(verifyPlate(st.verifyArgs));
     if (pair) st.measured(wasteOfLot(...pair));
@@ -533,9 +924,12 @@ function processFile(file, ctx, choices) {
 }
 
 /** Every file of a request through prepareFile, the two measurements made together off this thread. */
-async function processFiles(files, ctx, choices) {
+async function processFiles(files, ctx, choices, opts = {}) {
   const stages = [];
   for (const f of files) { stages.push(prepareFile(f, ctx, choices)); await new Promise((resolve) => { setImmediate(resolve); }); }
+  // Identical cut plates are shared out over the WHOLE request, in the order the files were sent.
+  const left = quotaOf(stages, ctx, opts);
+  for (const s of stages) s.share(left);
   const checking = stages.filter((s) => s.verifyArgs);
   const checks = await measurePlates(checking.map((s) => ({ kind: 'verify', args: s.verifyArgs })));
   const pairs = [];
@@ -543,6 +937,64 @@ async function processFiles(files, ctx, choices) {
   const wastes = await wastesOf(pairs.map((x) => x.pair));
   pairs.forEach((x, i) => x.s.measured(wastes[i]));
   return stages.map((s) => s.entry);
+}
+
+/* ───────────────────────────── a ProNest job in the answer ───────────────────────────── */
+
+const WORST = { ok: 0, warning: 1, error: 2 };
+
+/**
+ * The entries as the answer gives them. A DXF is its own entry. A NEST of a ProNest job is ONE
+ * entry however many plates it is cut on (`nestQuantity`): the first plate's, with `lotNos` and
+ * `copies: [{ copy, lotNo, action, status, counts, lotId? }]` saying each plate — the plates of a
+ * nest are the same layout, and differ at most in which of several identical cut plates a piece
+ * was shared out to (`copies[].counts`). What only the save needs (`_lot`, `_nif`) stays inside.
+ */
+function presentEntries(entries, lotIds = null) {
+  const out = []; const heads = new Map();
+  const idOf = (e) => (lotIds && e.lotNo ? { lotId: lotIds.get(e.lotNo.toUpperCase()) ?? null } : {});
+  for (const { _lot, _nif, ...e } of entries) {
+    if (!_nif || _nif.failed) { out.push({ ...e, ...idOf(e) }); continue; }
+    const key = `${_nif.fileIndex}|${_nif.nestNo}`;
+    const one = { copy: _nif.copy, lotNo: e.lotNo, action: e.action, status: e.status, counts: e.counts, ...idOf(e) };
+    const head = heads.get(key);
+    if (!head) {
+      const { copy, ...rest } = e;
+      const first = { ...rest, ...idOf(e), errors: e.errors.slice(), warnings: e.warnings.slice(), lotNos: [e.lotNo], copies: [one] };
+      heads.set(key, first); out.push(first);
+      continue;
+    }
+    head.lotNos.push(e.lotNo); head.copies.push(one);
+    for (const x of e.errors) if (!head.errors.some((y) => y.code === x.code && y.message === x.message)) head.errors.push(x);
+    for (const x of e.warnings) if (!head.warnings.some((y) => y.code === x.code && y.message === x.message)) head.warnings.push(x);
+    if (WORST[e.status] > WORST[head.status]) head.status = e.status;
+  }
+  return out;
+}
+
+/**
+ * One line per ProNest job of the request: what it holds, how much of it was recognised and by
+ * which rule, and — plainly — what the job itself has NOT nested (`notNested`: the shop's own
+ * left-over, by the names in the job; the line's `leftOver` says the same in cut plates).
+ */
+function jobSummaries(jobs, entries) {
+  return jobs.map((j) => {
+    const base = { filename: j.file.filename, sourceKind: 'pronest', bytes: j.file.buffer?.length ?? 0, program: j.doc?.program ?? j.error?.program ?? null, version: j.doc?.version ?? j.error?.version ?? null, jobName: j.doc?.jobName ?? null };
+    if (!j.doc || j.error) {
+      return { ...base, status: 'error', lotPrefix: null, nests: j.doc?.counts.nests ?? 0, plates: j.doc?.counts.plates ?? 0, parts: j.doc?.counts.parts ?? 0, placed: 0, matched: 0, matchedBy: {}, notNested: [], notes: [], error: { code: j.error.code, message: `${j.file.filename}: ${j.error.message}` } };
+    }
+    const mine = entries.filter((e) => e._nif && !e._nif.failed && e._nif.fileIndex === j.file.index);
+    const matchedBy = {}; let matched = 0;
+    for (const e of mine) for (const p of e.placements) { matched += 1; matchedBy[p.by] = (matchedBy[p.by] ?? 0) + 1; }
+    return {
+      ...base, status: mine.reduce((w, e) => (WORST[e.status] > WORST[w] ? e.status : w), 'ok'), lotPrefix: j.prefix,
+      nests: j.doc.counts.nests, plates: j.doc.counts.plates, parts: j.doc.counts.parts,
+      placed: j.doc.counts.pieces,          // pieces the job nests, over all its plates
+      matched, matchedBy,                   // of them, recognised as cut plates of this line — and by which rule
+      notNested: j.doc.partsList.filter((p) => p.notNested > 0).map((p) => ({ name: p.name, required: p.required, nested: p.nested, notNested: p.notNested })),
+      notes: j.doc.notes,
+    };
+  });
 }
 
 /* ───────────────────────────── the context ───────────────────────────── */
@@ -593,6 +1045,8 @@ async function uploadContext(db, companyId, lineId) {
   const candidates = usable.map((cp) => { const s = shapeOf(cp); return { key: `cp${cp.id}`, codes: [...codes.get(cp.id)], rings: s.drawn ? s.rings : null, length: cp.steel.length, width: cp.steel.width }; });
   return {
     ...ctx, facts, saved, excl, candidates, shapeOf,
+    // Every size a catalog plate comes in: what tells the reader a plate from the drawing frame round it.
+    plateSizes: ctx.plates.filter((p) => p.steel?.length > 0 && p.steel?.width > 0).map((p) => ({ length: p.steel.length, width: p.steel.width })),
     cpByKey: new Map(usable.map((cp) => [`cp${cp.id}`, cp])),
     cpById: new Map(ctx.cutPlates.map((cp) => [cp.id, cp])),
     barNos: new Set(bars.map((b) => String(b.lot_no).toUpperCase())),
@@ -630,7 +1084,8 @@ function changeOf(old, now, codeOf) {
 /**
  * POST …/nesting/files — the preview (dryRun, the default) or the save.
  *
- *   input.files     [{ filename, file (base64), plateCode?, nestNo? }]
+ *   input.files     [{ filename, file (base64), plateCode?, nestNo? }] — DXFs (one plate each) and ProNest
+ *                   jobs (.nif: every nest of the job; `nestNo` then names the JOB, see expandJobs)
  *   input.dryRun    default TRUE: read, match, check, say the difference — write nothing
  *   input.force     save although a file has warnings (closer than kerf, inside the rim) or a cut
  *                   plate is nested more often than the line needs
@@ -643,7 +1098,9 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   const force = truthy(input.force);
   const mode = String(input.mode ?? 'merge').toLowerCase() === 'replace' ? 'replace' : 'merge';
   const removeAsk = Array.isArray(input.remove) ? input.remove : [];
-  const files = input.files == null && removeAsk.length ? [] : readFiles(input);
+  const sent = input.files == null && removeAsk.length ? [] : readFiles(input);
+  // A ProNest job is read here and opened into its plates: from now on `files` is one entry per plate.
+  const { plates: files, jobs } = expandJobs(sent);
   const companyId = c.companyId;
   const ctx = await uploadContext(db, companyId, lineId);
   const codeOf = (id) => ctx.cpById.get(id)?.code ?? `#${id}`;
@@ -652,7 +1109,7 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   const blocker = importBlocker(ctx.line);
   if (blocker) problems.push({ code: blocker.code ?? 'INVALID', message: blocker.message });
 
-  const entries = await processFiles(files, ctx, input.choices ?? null);
+  const entries = await processFiles(files, ctx, input.choices ?? null, { mode, remove: removeAsk });
 
   // ---- the same file twice, two files for one nest -------------------------
   const byHash = new Map();
@@ -664,8 +1121,11 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     }
     if (e.lotNo) {
       const key = e.lotNo.toUpperCase();
-      if (byNest.has(key) && !e.errors.some((x) => x.code === 'DUPLICATE_FILE')) e.errors.push({ code: 'DUPLICATE_NEST', message: `${e.filename}: it is nest ${e.nestNo}, and so is ${byNest.get(key).filename}. One file is one plate — give each its own nest number (in the file, in its name, or as nestNo).` });
-      else if (!byNest.has(key)) byNest.set(key, e);
+      if (byNest.has(key) && !e.errors.some((x) => x.code === 'DUPLICATE_FILE')) {
+        e.errors.push({ code: 'DUPLICATE_NEST', message: e._nif
+          ? `${e.filename}: it would be plate ${e.lotNo}, and so would ${byNest.get(key).filename} — the two jobs carry the same name${e.jobName ? ` ("${e.jobName}")` : ''}. Give one of them its own (nestNo on the file).`
+          : `${e.filename}: it is nest ${e.nestNo}, and so is ${byNest.get(key).filename}. One file is one plate — give each its own nest number (in the file, in its name, or as nestNo).` });
+      } else if (!byNest.has(key)) byNest.set(key, e);
       if (ctx.barNos.has(key)) e.errors.push({ code: 'LOT_NAME_TAKEN', message: `${e.filename}: ${e.lotNo} is already the name of a section bar on this line — give the nest another name (nestNo).` });
     }
   }
@@ -673,8 +1133,9 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   // ---- against what is saved: replaced, added, unchanged, removed -------------
   const saved = ctx.saved;
   const imported = saved.filter((l) => l.origin === 'imported');
+  // A DXF also finds its plate by its file name; a plate of a ProNest job only by its lot number (the job's file is many plates).
   const targetOf = (e) => imported.find((l) => l.lotNo.toUpperCase() === e.lotNo?.toUpperCase())
-    ?? imported.find((l) => l.sourceFile && l.sourceFile.toLowerCase() === e.filename.toLowerCase())
+    ?? (e._nif ? null : imported.find((l) => l.sourceKind !== 'pronest' && l.sourceFile && l.sourceFile.toLowerCase() === e.filename.toLowerCase()))
     ?? null;
   const diff = { added: [], replaced: [], unchanged: [], removed: [], droppedAuto: [], droppedOurs: [], renumbered: [] };
   const replacing = new Map();                      // saved lot id → entry
@@ -708,7 +1169,18 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     removing.set(hit.id, hit);
   }
   if (mode === 'replace') for (const l of imported) if (!replacing.has(l.id)) removing.set(l.id, l);
-  for (const l of removing.values()) diff.removed.push(describe(l));
+  /*
+   * A PRONEST JOB IS UPLOADED WHOLE. A plate saved from an earlier upload of the same job that this
+   * upload no longer makes — a nest taken out of the job, a nest now cut on fewer plates — goes with
+   * it, also in `merge`: otherwise the old nest would stay beside the new job and nest its pieces twice.
+   */
+  const jobsSent = new Set(entries.filter((e) => e._nif?.prefix).map((e) => e._nif.prefix.toUpperCase()));
+  const jobGone = new Set();
+  for (const l of imported) {
+    if (l.sourceKind !== 'pronest' || replacing.has(l.id) || removing.has(l.id) || !jobsSent.has(jobOfLotNo(l.lotNo))) continue;
+    removing.set(l.id, l); jobGone.add(l.id);
+  }
+  for (const l of removing.values()) diff.removed.push({ ...describe(l), ...(jobGone.has(l.id) ? { because: 'the job uploaded now no longer has this plate' } : {}) });
 
   // ---- an uploaded nest number an automatic plate already wears: ours moves ---
   const goneIds = new Set([...removing.keys(), ...[...replacing].filter(([, e]) => e).map(([id]) => id)]);
@@ -732,7 +1204,7 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     for (const p of l.pieces) if (isUploadedPiece(l, p)) m.set(p.cutPlateId, (m.get(p.cutPlateId) ?? 0) + 1);
     for (const [id, q] of m) { customer.set(id, (customer.get(id) ?? 0) + q); addWhere(id, `${l.lotNo} (saved)`, q); }
   }
-  for (const e of fresh) for (const cnt of e.counts) { customer.set(cnt.cutPlateId, (customer.get(cnt.cutPlateId) ?? 0) + cnt.qty); addWhere(cnt.cutPlateId, e.filename, cnt.qty); }
+  for (const e of fresh) for (const cnt of e.counts) { customer.set(cnt.cutPlateId, (customer.get(cnt.cutPlateId) ?? 0) + cnt.qty); addWhere(cnt.cutPlateId, e._nif && e.nestQuantity > 1 ? `${e.filename}, plate ${e._nif.copy} of ${e.nestQuantity}` : e.filename, cnt.qty); }
   const surplus = [];
   for (const [id, got] of customer) {
     const need = ctx.cpById.get(id)?.pieces ?? 0;
@@ -773,14 +1245,21 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   ];
   const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, finalLots, ctx.excl);
 
-  for (const e of entries) { for (const x of e.errors) problems.push(x); if (e.action !== 'unchanged') for (const w of e.warnings) warnings.push(w); e.status = e.errors.length ? 'error' : e.warnings.length ? 'warning' : 'ok'; }
+  // The plates a nest is cut on say the same thing in the same words: each is said once.
+  const once = new Set();
+  const fresher = (e, x) => { if (!e._nif) return true; const key = `${e._nif.fileIndex}|${e._nif.nestNo ?? ''}|${x.code}|${x.message}`; if (once.has(key)) return false; once.add(key); return true; };
+  for (const e of entries) {
+    for (const x of e.errors) if (fresher(e, x)) problems.push(x);
+    if (e.action !== 'unchanged') for (const w of e.warnings) if (fresher(e, w)) warnings.push(w);
+    e.status = e.errors.length ? 'error' : e.warnings.length ? 'warning' : 'ok';
+  }
   const changes = fresh.length + removing.size + dropLots.size + rewrite.size;
   const canSave = problems.length === 0 && changes > 0;
   const needsForce = warnings.some((w) => w.needsForce);
 
   const say = [];
   if (problems.length) say.push(`${plural(problems.length, 'thing needs', 'things need')} fixing before this can be saved`);
-  if (entries.length) say.push(`${plural(entries.length, 'file', 'files')} read`);
+  if (sent.length) say.push(`${plural(sent.length, 'file', 'files')} read${jobs.length ? ` (${plural(jobs.length, 'ProNest job', 'ProNest jobs')}: ${plural(jobs.reduce((a, j) => a + (j.error ? 0 : j.doc.counts.nests), 0), 'nest', 'nests')}, ${plural(jobs.reduce((a, j) => a + (j.error ? 0 : j.doc.counts.plates), 0), 'plate', 'plates')})` : ''}`);
   const d = diff;
   const parts = [d.added.length && `${d.added.length} added`, d.replaced.length && `${d.replaced.length} replaced`, d.unchanged.length && `${d.unchanged.length} unchanged`, d.removed.length && `${d.removed.length} removed`].filter(Boolean);
   if (parts.length) say.push(`plates: ${parts.join(', ')}`);
@@ -791,7 +1270,9 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
 
   const out = {
     line: lineHead(ctx.line), dryRun, applied: false, mode, canSave, needsForce, engine: VERIFY_ENGINE,
-    files: entries.map(({ _lot, ...e }) => e),
+    files: presentEntries(entries),
+    // One line per ProNest job of the request ([] when it holds none).
+    jobs: jobSummaries(jobs, entries),
     problems: problems.map((p) => p.message), problemList: problems,
     warnings: warnings.map((w) => w.message), warningList: warnings,
     diff, coverage, leftOver, surplus,
@@ -810,7 +1291,7 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   const lotIds = new Map(saved2.written.map((w) => [String(w.lotNo).toUpperCase(), w.id]));
   return {
     ...out, applied: true, forced: needsForce,
-    files: out.files.map((e) => ({ ...e, lotId: e.lotNo ? lotIds.get(e.lotNo.toUpperCase()) ?? null : null })),
+    files: presentEntries(entries, lotIds),
     saved: { lots: saved2.written.length, pieces: saved2.written.reduce((a, l) => a + l.pieces, 0), offcuts: saved2.written.reduce((a, l) => a + l.offcuts, 0), removedLots: saved2.removed, quantities: saved2.quantities, cuts: saved2.cuts },
     message: `Saved. ${out.message}`,
   };
@@ -866,7 +1347,9 @@ async function applyChanges(db, c, lineId, ctx, { fresh = [], removeIds = [], re
 
   // Plates that go: their placements, their offcuts — and the file of one that is not rewritten.
   const rewriteIds = new Set(rewrite.map((r) => r.lot.id));
-  const goneFiles = ctx.saved.filter((l) => removeIds.includes(l.id) && !rewriteIds.has(l.id) && l.nestFileId).map((l) => l.nestFileId);
+  // (A ProNest job's file is ONE row for all its plates: it goes only when the last of them does.)
+  const fileStays = new Set(ctx.saved.filter((l) => l.nestFileId && (!removeIds.includes(l.id) || rewriteIds.has(l.id))).map((l) => l.nestFileId));
+  const goneFiles = [...new Set(ctx.saved.filter((l) => removeIds.includes(l.id) && !rewriteIds.has(l.id) && l.nestFileId && !fileStays.has(l.nestFileId)).map((l) => l.nestFileId))];
   const removed = removeIds.length ? await clearLots(db, c, lineId, { ids: removeIds, keepFiles: true }) : 0;
   if (goneFiles.length) await db.query('UPDATE cf_nest_files SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND id IN (?) AND deleted_at IS NULL', [companyId, lineId, goneFiles]);
 
@@ -889,22 +1372,33 @@ async function applyChanges(db, c, lineId, ctx, { fresh = [], removeIds = [], re
   }
 
   // The files themselves, then their ids back by hash.
+  // One row per FILE. A DXF is its plate's file, kept as its text. A ProNest job is kept ONCE for
+  // all the plates it makes, as base64 (it is binary) under its own hash; `nest_no` is then the job's name.
   const fileOf = new Map(files.map((f) => [f.hash, f]));
-  const rows = fresh.map((e) => { const f = fileOf.get(e.hash); return [companyId, lineId, e.filename, 'dxf', e.hash, f.buffer.length, String(e.nestNo).slice(0, 60), f.buffer.toString('latin1'), c.userId ?? null]; });
+  const storedHash = (e) => fileOf.get(e.hash)?.pronest?.fileHash ?? e.hash;
+  const byStored = new Map();
+  for (const e of fresh) {
+    const f = fileOf.get(e.hash); const key = storedHash(e);
+    if (byStored.has(key)) continue;
+    byStored.set(key, f.pronest
+      ? [companyId, lineId, f.pronest.sourceFile, 'pronest', key, f.buffer.length, String(f.pronest.doc.jobName ?? f.pronest.prefix).slice(0, 60), f.buffer.toString('base64'), c.userId ?? null]
+      : [companyId, lineId, e.filename, 'dxf', e.hash, f.buffer.length, String(e.nestNo).slice(0, 60), f.buffer.toString('latin1'), c.userId ?? null]);
+  }
+  const rows = [...byStored.values()];
   let batch = []; let bytes = 0;
   const flush = async () => { if (batch.length) await insertRows(db, 'cf_nest_files', ['company_id', 'order_line_id', 'file_name', 'file_kind', 'file_hash', 'byte_size', 'nest_no', 'file_text', 'created_by'], batch, batch.length); batch = []; bytes = 0; };
-  for (const r of rows) { if (bytes + r[5] > FILE_INSERT_BYTES) await flush(); batch.push(r); bytes += r[5]; }
+  for (const r of rows) { if (bytes + r[7].length > FILE_INSERT_BYTES) await flush(); batch.push(r); bytes += r[7].length; }
   await flush();
   const idByHash = new Map();
   if (rows.length) {
-    const [ids] = await db.query('SELECT id, file_hash FROM cf_nest_files WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_hash IN (?) ORDER BY id', [companyId, lineId, fresh.map((e) => e.hash)]);
+    const [ids] = await db.query('SELECT id, file_hash FROM cf_nest_files WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_hash IN (?) ORDER BY id', [companyId, lineId, rows.map((r) => r[4])]);
     for (const r of ids) idByHash.set(r.file_hash, r.id);
   }
 
   const toWrite = [
     ...fresh.map((e) => {
       const reasons = e.warnings.map((w) => w.message);
-      return { ...e._lot, verdict: reasons.length ? 'tight' : 'fits', reasons: reasons.length ? reasons : null, forced: forced && reasons.length > 0, nestFileId: idByHash.get(e.hash) ?? null, waste: { ...e._lot.waste, offcuts: e._lot.waste.offcuts.map((o, i) => ({ ...o, offcutNo: `${e._lot.lotNo}-${offcutLetters(i)}` })) } };
+      return { ...e._lot, verdict: reasons.length ? 'tight' : 'fits', reasons: reasons.length ? reasons : null, forced: forced && reasons.length > 0, nestFileId: idByHash.get(storedHash(e)) ?? null, waste: { ...e._lot.waste, offcuts: e._lot.waste.offcuts.map((o, i) => ({ ...o, offcutNo: `${e._lot.lotNo}-${offcutLetters(i)}` })) } };
     }),
     ...(await relotMany(rewrite.map((r) => [r.lot, r.pieces]), ctx)),
   ];
@@ -983,7 +1477,7 @@ export async function getNestFiles(db, companyId, lineId) {
   const ctx = await importContext(db, companyId, lineId);
   const [saved, excl] = await Promise.all([savedLotsOf(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId)]);
   const fileIds = saved.map((l) => l.nestFileId).filter(Boolean);
-  const [files] = fileIds.length ? await db.query('SELECT id, file_name, file_hash, byte_size, nest_no, created_at, created_by FROM cf_nest_files WHERE company_id = ? AND id IN (?)', [companyId, fileIds]) : [[]];
+  const [files] = fileIds.length ? await db.query('SELECT id, file_name, file_kind, file_hash, byte_size, nest_no, created_at, created_by FROM cf_nest_files WHERE company_id = ? AND id IN (?)', [companyId, fileIds]) : [[]];
   const fileById = new Map(files.map((f) => [f.id, f]));
   const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
   const codeOf = (id) => cpById.get(id)?.code ?? `#${id}`;
@@ -992,7 +1486,7 @@ export async function getNestFiles(db, companyId, lineId) {
   return {
     line: lineHead(ctx.line),
     canUpload: !blocker, readOnlyReason: blocker?.message ?? null,
-    limits: { maxFiles: MAX_NEST_FILES, maxFileBytes: MAX_NEST_FILE_BYTES, kinds: ['dxf'] },
+    limits: { maxFiles: MAX_NEST_FILES, maxFileBytes: MAX_NEST_FILE_BYTES, kinds: ['dxf', 'nif'], maxPlates: MAX_NEST_PLATES },
     plates: saved.map((l) => {
       const f = l.nestFileId ? fileById.get(l.nestFileId) : null;
       const customer = l.pieces.filter((p) => isUploadedPiece(l, p));
@@ -1000,7 +1494,8 @@ export async function getNestFiles(db, companyId, lineId) {
       return {
         lotId: l.id, lotNo: l.lotNo, origin: l.origin, sourceKind: l.sourceKind, layoutOrigin: l.layoutOrigin,
         plateItemId: l.plateItemId, plateCode: l.plateCode, thickness: l.thickness, grade: l.grade, length: l.length, width: l.width,
-        file: f ? { id: f.id, filename: f.file_name, hash: f.file_hash, bytes: Number(f.byte_size), nestNo: f.nest_no, uploadedAt: f.created_at } : null,
+        // kind 'pronest': the file is a whole ProNest job, the same one for every plate of it (`nestNo` is then the job's name).
+        file: f ? { id: f.id, filename: f.file_name, kind: f.file_kind ?? 'dxf', hash: f.file_hash, bytes: Number(f.byte_size), nestNo: f.nest_no, uploadedAt: f.created_at } : null,
         pieces: l.pieces.length, customerPieces: customer.length, ourPieces: ours.length,
         parts: tally(customer, codeOf), addedByUs: tally(ours, codeOf),
         verdict: l.verdict, forced: l.forced, warnings: l.reasons,
@@ -1010,16 +1505,20 @@ export async function getNestFiles(db, companyId, lineId) {
   };
 }
 
-/** GET …/nesting/files/:lotId — the customer's file a plate was read from, as it was sent. */
+/**
+ * GET …/nesting/files/:lotId — the customer's file a plate was read from, as it was sent, byte for
+ * byte: a DXF, or the whole ProNest job (.nif) the plate is one nest of.
+ */
 export async function nestFileOf(db, companyId, lineId, lotId) {
   const [[row]] = await db.query(
-    `SELECT f.file_name, f.file_text
+    `SELECT f.file_name, f.file_kind, f.file_text
        FROM cf_plate_lots l JOIN cf_nest_files f ON f.id = l.nest_file_id AND f.company_id = l.company_id
       WHERE l.company_id = ? AND l.order_line_id = ? AND l.id = ? AND l.deleted_at IS NULL`,
     [companyId, lineId, Number(lotId)],
   );
   if (!row || row.file_text == null) throw notFound('Nesting file');
+  if (row.file_kind === 'pronest') return { filename: row.file_name, contentType: 'application/octet-stream', buffer: Buffer.from(row.file_text, 'base64') };
   return { filename: row.file_name, contentType: 'application/dxf', buffer: Buffer.from(row.file_text, 'latin1') };
 }
 
-export const _test = { processFile, prepareFile, uploadContext, resolvePlate, applyChanges, DEFAULT_CUT_SETTINGS };
+export const _test = { processFile, prepareFile, uploadContext, resolvePlate, applyChanges, expandJobs, readFiles, DEFAULT_CUT_SETTINGS };
