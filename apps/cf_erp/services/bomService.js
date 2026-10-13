@@ -27,6 +27,7 @@ import { findCandidates, isCutPlateRecord, NOT_UNDER_CUT_PLATE_WHERE } from './s
 import { instantiateTemplate, defaultCandidate, deleteTemporaryTree, checkTemplate } from './instantiationService.js';
 import { nextRevision } from '../lib/revision.js';
 import { requireUsableFlow } from './flowService.js';
+import { frozenFlowChange, frozenFlowMessage, ensureLineFlowCopies } from './frozenFlowService.js';
 import { syncFlowSpecs, flowSpecWords } from './flowSpecService.js';
 import { readMasters, cutFromDetailOf, cutStockOf, sectionSteelOf } from '../lib/cutFrom.js';
 
@@ -138,7 +139,8 @@ async function ownerOrder(db, companyId, parent) {
 /**
  * The one rule for "this structure can still change". Exported so the BOM sheet asks the same question.
  * opts.flowOnly: the change is ONLY how a line is made (operation_flow_id) —
- * that still goes through on a locked line until it is released (records.flowStillOpen).
+ * that still goes through on a locked line until it is released (records.flowStillOpen),
+ * and there only for a row that has no flow yet: the caller checks that (writeLineUpdate).
  */
 export async function assertEditable(db, companyId, parent, opts = {}) {
   if (parent.status === 'obsolete') throw invalid('OBSOLETE', `${labelOf(parent)} is obsolete — reactivate it to change its BOM.`);
@@ -301,7 +303,7 @@ export async function parentOfLine(db, companyId, lineId) {
 export async function writeLineUpdate(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId);
   const parent = await requireMaster(db, c.companyId, line.parent_id);
-  // Only a new flow still goes through on a locked line (records.flowStillOpen).
+  // Only a flow for a row that has none still goes through on a locked line (records.flowStillOpen).
   const flowOnly = input.operationFlowId !== undefined
     && Object.keys(input).every((k) => k === 'operationFlowId' || input[k] === undefined);
   await assertEditable(db, c.companyId, parent, { flowOnly });
@@ -310,6 +312,7 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
   }
   const problems = [];
   const sets = {};
+  let frozenFill = null;
   if (input.quantity !== undefined) sets.quantity = readQuantity(input.quantity, problems, true);
   if (input.role !== undefined) sets.role = readRole(input.role, problems);
   if (input.lineNo !== undefined) sets.line_no = readLineNo(input.lineNo, problems) ?? line.line_no;
@@ -318,6 +321,11 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
     // A Template BOM holds the selection definition itself; a Custom BOM keeps it beside the chosen item.
     const isSelection = !!line.selection_definition_id || childKindOf(line) === 'selection';
     sets.operation_flow_id = await readLineFlow(db, c.companyId, input.operationFlowId, isSelection, problems);
+    // Frozen design (init.sql §60): the row's flow — the line's, else its item's — may be filled in, never changed or cleared.
+    if (!problems.length && parent.owner_line_locked_at) {
+      frozenFill = frozenFlowChange(line.operation_flow_id ?? line.child_flow_id ?? null, sets.operation_flow_id ?? line.child_flow_id ?? null);
+      if (frozenFill === 'refuse') throw invalid('FLOW_FROZEN', frozenFlowMessage(line.child_code ?? line.child_name));
+    }
   }
   if (sets.role && !isSystemRole(sets.role) && sameName(sets.role, line.child_name)
       && !(await otherUsesOfChild(db, c.companyId, line.bom_id, line.design_id, lineId))) sets.role = null;
@@ -332,6 +340,8 @@ export async function writeLineUpdate(db, c, lineId, input = {}) {
     const r = await syncFlowSpecs(db, c, [line.child_id]);
     out.flowSpecs = { ...r, words: await flowSpecWords(db, c.companyId, r, line.child_id) };
   }
+  // A flow given to a row of a frozen line is frozen with it: the line takes its own copy now.
+  if (frozenFill === 'fill') await ensureLineFlowCopies(db, c, parent.owner_order_line_id, { flowIds: [sets.operation_flow_id] });
   return out;
 }
 

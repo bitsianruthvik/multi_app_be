@@ -39,6 +39,7 @@ import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/l
 import { generate } from '../modules/codegen/index.js';
 import { lineOnOrder, orderClosedWhy, flowSteps, opsOfFlow } from './timeEstimateService.js';
 import { dateText } from './resolutionService.js';
+import { frozenFlowsOfLine, frozenIdOf } from './frozenFlowService.js';
 
 export const WO_STATUSES = ['draft', 'issued', 'in_progress', 'done', 'cancelled'];
 /** Where a cell can be added: a work order the contractor has not started on. */
@@ -124,7 +125,9 @@ async function loadAssignment(db, companyId, orderId, lineId, { lock = false } =
       WHERE m.company_id = ? AND m.id = ?`,
     [companyId, bomLineIds.length ? bomLineIds : [0], companyId, line.item_id ?? 0],
   );
-  const flowOf = new Map(flowRows.map((r) => [r.bom_line_id ?? 0, r.operation_flow_id ?? r.child_flow_id ?? null]));
+  // The line is locked here, so each of those flows is read as the line's own copy of it (init.sql §60).
+  const copies = await frozenFlowsOfLine(db, companyId, line);
+  const flowOf = new Map(flowRows.map((r) => [r.bom_line_id ?? 0, frozenIdOf(copies, r.operation_flow_id ?? r.child_flow_id ?? null)]));
   const steps = await flowSteps(db, companyId, [...new Set([...flowOf.values()].filter(Boolean))]);
   const opsOfFlowId = new Map([...steps].map(([id, s]) => [id, opsOfFlow(s)]));
   for (const p of pieces) {

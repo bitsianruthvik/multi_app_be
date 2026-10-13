@@ -101,6 +101,7 @@ import { refreshValues } from './valueService.js';
 import { autofillLineSelections } from './selectionService.js';
 import { cutPlaces, problemsOf } from '../lib/cutPlaces.js';
 import { syncFlowSpecs } from './flowSpecService.js';
+import { ensureLineFlowCopies } from './frozenFlowService.js';
 import {
   resolveCodes, sectionSteelOf, profileKeyOf, profileLabelOf, CUT_FROM_CODE, CUT_FROM_VALUES, STEEL_FROM_STOCK,
 } from '../lib/cutFrom.js';
@@ -2374,9 +2375,10 @@ export async function cutPlateFlowGaps(db, companyId, lineId) {
  * its method (or the one named): cut plates the cut-plate flow (`flowId`
  * wins), cut sections the cut-section flow (`sectionFlowId`, else `flowId`,
  * wins). One set-based UPDATE per method; a cut piece that already has a flow
- * keeps it. Allowed on a locked line until it is released (a flow is the one
- * thing that still changes there — records.flowStillOpen); refused on a
- * released line or a closed/revised order.
+ * keeps it. Allowed on a locked line until it is released (a flow for a row
+ * that has none is the one thing a frozen line still takes —
+ * records.flowStillOpen), and there the line takes its own copy of the flow at
+ * once (init.sql §60); refused on a released line or a closed/revised order.
  * input: { flowId?, sectionFlowId? } — returns { count, total, flowId, sections: { count, total, flowId } }.
  */
 export async function setCutPlateFlows(db, c, lineId, input = {}) {
@@ -2414,8 +2416,12 @@ export async function setCutPlateFlows(db, c, lineId, input = {}) {
       sections.count = r.affectedRows;
     }
   }
-  // Given a flow, a cut piece asks for what that flow reads.
-  const follow = async () => { const ids = [...sectionBlanks, ...plateBlanks].map((cp) => cp.id); if (ids.length) await syncFlowSpecs(db, c, ids); };
+  // Given a flow, a cut piece asks for what that flow reads — and on a frozen line the flow is frozen with it.
+  const follow = async () => {
+    const ids = [...sectionBlanks, ...plateBlanks].map((cp) => cp.id);
+    if (ids.length) await syncFlowSpecs(db, c, ids);
+    if (line.locked_at) await ensureLineFlowCopies(db, c, line.id, { flowIds: [flowId, sections.flowId] });
+  };
   if (!plateBlanks.length) { await follow(); return { count: 0, total: 0, flowId, sections }; }
   const [r] = await db.query(
     'UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id IN (?) AND default_flow_id IS NULL AND deleted_at IS NULL',

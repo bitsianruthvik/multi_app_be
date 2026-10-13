@@ -138,17 +138,22 @@ try {
   const releaseId = (await REL.liveReleaseOfLine(conn, COMPANY, line.id))?.id;
   ok('the line is released', Number.isInteger(releaseId));
 
-  // What release wrote: every step with the flow step it was copied from, and every wait.
+  // What release wrote: every step with the flow step it was copied from, and every wait. Since 2026-10-12
+  // (init.sql §60) a locked line is released from its OWN copy of each flow, so a step is told apart here by
+  // the catalog flow that copy was made from — until then the steps named the catalog flow itself.
   const [steps] = await conn.query(
-    `SELECT s.id, s.production_item_id AS item, s.flow_step_id, s.operation_id, s.sequence, fs.flow_id
+    `SELECT s.id, s.production_item_id AS item, s.flow_step_id, s.operation_id, s.sequence, COALESCE(f.source_flow_id, f.id) AS flow_id,
+            f.owner_order_line_id AS copy_of_line
        FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
        JOIN cf_operation_flow_steps fs ON fs.id = s.flow_step_id
+       JOIN cf_operation_flows f ON f.id = fs.flow_id
       WHERE s.company_id = ? AND pi.release_id = ? AND s.deleted_at IS NULL ORDER BY s.id`, [COMPANY, releaseId]);
   const [deps] = await conn.query(
     `SELECT d.step_id, d.target_step_id, d.target_item_id, d.required, d.origin
        FROM cf_step_dependencies d JOIN cf_production_steps s ON s.id = d.step_id JOIN cf_production_items pi ON pi.id = s.production_item_id
       WHERE d.company_id = ? AND pi.release_id = ? AND d.deleted_at IS NULL`, [COMPANY, releaseId]);
   const stepById = new Map(steps.map((s) => [s.id, s]));
+  ok('every released step comes from the line\x27s own copy of its flow', steps.length > 0 && steps.every((s) => Number(s.copy_of_line) === Number(line.id)));
   const code = (s) => codeOfOp.get(s.operation_id);
   /** The waits written for the piece made by one flow: { CODE: [codes it waits for] }, and everything that is not a plain flow wait. */
   const waitsOf = (flowId) => {

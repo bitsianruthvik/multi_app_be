@@ -35,6 +35,12 @@
  *
  * Revision and status work like the masters': draft → active → obsolete, the
  * revision label moves on, the id never changes.
+ *
+ * AN ORDER LINE'S COPY IS NOT A CATALOG FLOW (init.sql §60, frozenFlowService). A frozen line keeps
+ * its own copy of every flow it uses, in this same table with owner_order_line_id set. Everything
+ * here is about CATALOG flows: a copy is in no list and no picker, no row may name one, and every
+ * change to one is refused (requireFlow / requireStep with forWrite) — it is what the order froze.
+ * Changing or obsoleting the catalog flow never reaches a copy.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { loadMaster } from './records.js';
@@ -49,20 +55,29 @@ const TRANSITIONS = { draft: ['active'], active: ['obsolete'], obsolete: ['activ
 export const RELATIONS = ['parent', 'children', 'siblings', 'ancestor', 'descendants'];
 const blank = (v) => v == null || String(v).trim() === '';
 
-async function requireFlow(db, companyId, id) {
+/** The one sentence for a change asked of an order line's copy. */
+const assertNotCopy = (code, ownerLineId) => {
+  if (ownerLineId != null) throw conflict('FROZEN_FLOW_COPY', `This is the copy of ${code} a frozen order line keeps — it stays as it was when the order's design was frozen. Change ${code} itself under Production › Flows; orders frozen before the change keep what they had.`);
+};
+
+/** forWrite: the caller is about to change the flow — refused for an order line's copy. */
+async function requireFlow(db, companyId, id, { forWrite = false } = {}) {
   const [[row]] = await db.query('SELECT * FROM cf_operation_flows WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
   if (!row) throw notFound('Flow');
+  if (forWrite) assertNotCopy(row.code, row.owner_order_line_id);
   return row;
 }
 
+/** A step, for a change to it or to its waits: every caller writes, so a copy's step is always refused. */
 async function requireStep(db, companyId, id) {
   const [[row]] = await db.query(
-    `SELECT s.*, f.status AS flow_status, f.code AS flow_code, f.linked AS flow_linked FROM cf_operation_flow_steps s
+    `SELECT s.*, f.status AS flow_status, f.code AS flow_code, f.linked AS flow_linked, f.owner_order_line_id AS flow_owner_line FROM cf_operation_flow_steps s
        JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL
       WHERE s.company_id = ? AND s.id = ? AND s.deleted_at IS NULL`,
     [companyId, id],
   );
   if (!row) throw notFound('Flow step');
+  assertNotCopy(row.flow_code, row.flow_owner_line);
   return row;
 }
 
@@ -76,7 +91,8 @@ const shapeFlow = (f) => ({
 });
 
 export async function listFlows(db, companyId, q = {}) {
-  const where = ['f.company_id = ?', 'f.deleted_at IS NULL'];
+  // Catalog flows only — an order line's copy of one is not a flow anybody picks or edits.
+  const where = ['f.company_id = ?', 'f.deleted_at IS NULL', 'f.owner_order_line_id IS NULL'];
   const params = [companyId];
   if (!blank(q.status)) { where.push('f.status = ?'); params.push(q.status); }
   if (!blank(q.search)) {
@@ -260,7 +276,7 @@ export async function createFlow(db, c, input = {}) {
 }
 
 export async function updateFlow(db, c, id, input = {}) {
-  const flow = await requireFlow(db, c.companyId, id);
+  const flow = await requireFlow(db, c.companyId, id, { forWrite: true });
   const problems = [];
   const f = readFlow(input, problems, true);
   if (f.code !== undefined && f.code !== flow.code && flow.status !== 'draft') problems.push('A flow code is fixed once the flow is active.');
@@ -274,7 +290,7 @@ export async function updateFlow(db, c, id, input = {}) {
 
 /** Activation needs steps, every operation active, and every wait target still valid. */
 export async function setFlowStatus(db, c, id, status) {
-  const flow = await requireFlow(db, c.companyId, id);
+  const flow = await requireFlow(db, c.companyId, id, { forWrite: true });
   if (flow.status === status) return getFlow(db, c.companyId, id);
   if (!(TRANSITIONS[flow.status] ?? []).includes(status)) throw invalid('BAD_TRANSITION', `A ${flow.status} flow cannot become ${status}.`);
   if (status === 'active') {
@@ -297,7 +313,7 @@ export async function setFlowStatus(db, c, id, status) {
 }
 
 export async function reviseFlow(db, c, id, input = {}) {
-  const flow = await requireFlow(db, c.companyId, id);
+  const flow = await requireFlow(db, c.companyId, id, { forWrite: true });
   if (flow.status === 'obsolete') throw invalid('OBSOLETE', 'Reactivate the flow before revising it.');
   const label = blank(input.revision) ? nextRevision(flow.revision) : String(input.revision).trim();
   if (label.length > 20) throw invalid('INVALID', 'Revision is up to 20 characters.');
@@ -306,8 +322,13 @@ export async function reviseFlow(db, c, id, input = {}) {
   return getFlow(db, c.companyId, id);
 }
 
+/**
+ * "Still used" is asked of the POINTERS — records and BOM lines that name the flow. A frozen line's
+ * copy of it is not a user: it stands on its own, so the catalog flow may go obsolete (or, once no
+ * row names it, be deleted) and the frozen line still has every step.
+ */
 export async function deleteFlow(db, c, id) {
-  const flow = await requireFlow(db, c.companyId, id);
+  const flow = await requireFlow(db, c.companyId, id, { forWrite: true });
   const [[{ record_count: records }]] = await db.query('SELECT COUNT(*) AS record_count FROM cf_master_records WHERE company_id = ? AND default_flow_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   const [[{ line_count: lines }]] = await db.query('SELECT COUNT(*) AS line_count FROM cf_bom_lines WHERE company_id = ? AND operation_flow_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   const reasons = [];
@@ -356,7 +377,7 @@ async function requireActiveOperation(db, companyId, id, problems) {
 
 /** input: { operationId, sequence?, stepName?, notes? } — sequence defaults to 10 past the last. */
 export async function addStep(db, c, flowId, input = {}) {
-  const flow = await requireFlow(db, c.companyId, flowId);
+  const flow = await requireFlow(db, c.companyId, flowId, { forWrite: true });
   assertEditable(flow);
   assertBySequence(flow);
   const problems = [];
@@ -418,10 +439,11 @@ export async function updateStep(db, c, stepId, input = {}) {
  * Replace the operation of one step (user, 2026-10-07: "replace inside the flow
  * a particular operation with another"). The step keeps its place, name, notes
  * and waits. Lines already RELEASED keep the operation they were released with
- * (their production steps hold their own copy); everything not yet released
- * takes the new one.
+ * (their production steps hold their own copy), and so do lines whose design is
+ * FROZEN (locked): they read their own copy of the flow (init.sql §60), which
+ * this does not touch. Everything not yet frozen takes the new one.
  *
- * What hangs off the old operation for those unreleased lines moves with it —
+ * What hangs off the old operation for those unfrozen lines moves with it —
  * time overrides (order line × row × operation) and work-order cells (piece ×
  * operation) — for the rows whose flow IS this flow, and only when the old
  * operation no longer appears in the flow (a second pass of it keeps them). A
@@ -456,7 +478,7 @@ export async function replaceStepOperation(db, c, stepId, input = {}, opts = {})
     // The row's flow, as bomGraph.effectiveFlowOf reads it: the row's own, else
     // the item's, else its template's; the line's own item (no row) from the item.
     const flowCols = `COALESCE(bl.operation_flow_id, ch.default_flow_id) AS row_flow,
-                      lm.default_flow_id AS line_flow`;
+                      lm.default_flow_id AS line_flow, ol.locked_at AS line_locked_at`;
     const flowJoins = `JOIN cf_sales_order_lines ol ON ol.company_id = x.company_id AND ol.id = x.order_line_id AND ol.deleted_at IS NULL
       LEFT JOIN cf_bom_lines bl ON bl.id = x.bom_line_id
       LEFT JOIN cf_master_records ch ON ch.id = bl.child_id
@@ -482,7 +504,8 @@ export async function replaceStepOperation(db, c, stepId, input = {}, opts = {})
       'SELECT DISTINCT order_line_id FROM cf_production_releases WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [c.companyId, lineIds],
     ) : [[]];
     const releasedLines = new Set(rel.map((r) => r.order_line_id));
-    const ours = (r) => !releasedLines.has(r.order_line_id) && Number(r.bom_line_id == null ? r.line_flow : r.row_flow) === Number(step.flow_id);
+    // A locked line's flow is frozen — its overrides and cells stay on the operation its own copy still has.
+    const ours = (r) => !releasedLines.has(r.order_line_id) && r.line_locked_at == null && Number(r.bom_line_id == null ? r.line_flow : r.row_flow) === Number(step.flow_id);
     const ovMine = ovs.filter(ours), cellMine = cells.filter(ours);
     if (ovMine.length) {
       const [taken] = await db.query(
@@ -689,7 +712,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
  * → { flow, summary, changes: { added, removed, replaced, edited, waitsAdded, waitsRemoved, orderChanged, lanesChanged, renumbered }, synced, dryRun }
  */
 export async function applyFlowChanges(db, c, flowId, input = {}) {
-  const flow = await requireFlow(db, c.companyId, flowId);
+  const flow = await requireFlow(db, c.companyId, flowId, { forWrite: true });
   assertEditable(flow);
   if (!Array.isArray(input.steps)) throw invalid('INVALID', 'Send the whole list of steps, in order.');
   const dryRun = input.dryRun === true;
@@ -964,9 +987,9 @@ export async function applyFlowChanges(db, c, flowId, input = {}) {
   return { flow: await getFlow(db, c.companyId, flowId), summary, changes, synced: operationsChanged, dryRun: false };
 }
 
-/** A flow a record or a BOM line may name: live and not obsolete. */
+/** A flow a record or a BOM line may name: a CATALOG flow (never an order line's copy), live and not obsolete. */
 export async function requireUsableFlow(db, companyId, id, problems) {
-  const [[f]] = await db.query('SELECT id, code, status FROM cf_operation_flows WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(id)]);
+  const [[f]] = await db.query('SELECT id, code, status FROM cf_operation_flows WHERE company_id = ? AND id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL', [companyId, Number(id)]);
   if (!f) { problems.push('That flow does not exist.'); return null; }
   if (f.status === 'obsolete') { problems.push(`Flow ${f.code} is obsolete.`); return null; }
   return f.id;

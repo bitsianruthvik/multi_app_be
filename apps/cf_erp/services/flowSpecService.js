@@ -273,7 +273,10 @@ export async function syncRecordsUsingFlows(db, c, flowIds) {
 
 /** After an operation's time formula changes: every record whose flow holds that operation. */
 export async function syncRecordsUsingOperation(db, c, operationId) {
-  const [flows] = await db.query('SELECT DISTINCT flow_id FROM cf_operation_flow_steps WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [c.companyId, operationId]);
+  // Catalog flows only: no record names a frozen order line's copy of a flow (init.sql §60), and a frozen row is not synced anyway.
+  const [flows] = await db.query(
+    `SELECT DISTINCT s.flow_id FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.owner_order_line_id IS NULL
+      WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL`, [c.companyId, operationId]);
   return syncRecordsUsingFlows(db, c, flows.map((f) => Number(f.flow_id)));
 }
 

@@ -58,6 +58,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { explode } from './bomService.js';
+import { frozenFlowsOfLine, freezeTree } from './frozenFlowService.js';
 import { resolveLineRecords } from './orderValuesService.js';
 import { effectiveByCode, levelsOfResolution, parseJsonCol } from './resolutionService.js';
 import { loadTimingSetup, evaluateRuleTimes, valueReaders } from './operationService.js';
@@ -697,6 +698,8 @@ async function loadTimesContext(db, companyId, orderId, lineId, { lock = false, 
   if (!line.item_id) return ctx;
 
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), maxDepth: 15 });
+  // A frozen line's rows are timed by the line's own copy of each flow (init.sql §60) — one read, none before lock.
+  freezeTree(tree.root, await frozenFlowsOfLine(db, companyId, line));
   // Rows in the order the tree shows them: line number, then line id.
   const rows = [];
   const walk = (n, parentKey) => {

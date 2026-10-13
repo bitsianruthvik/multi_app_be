@@ -110,6 +110,12 @@ export const lockedLineMessage = (lineNo, orderCode) =>
  * temporary item's default_flow_id and a BOM line's operation_flow_id still
  * change while the line is locked, and ONLY those. Released, or on a closed or
  * revised order: frozen like everything else.
+ *
+ * NARROWED 2026-10-12 ("once the order passes through freeze design nothing should
+ * change"): what a locked line still takes is a flow for a row that HAS NONE — the
+ * cut pieces above are the case. A row that has a flow keeps it; changing or
+ * clearing it is refused (frozenFlowService.frozenFlowChange / frozenFlowMessage),
+ * and the flow given is copied for the line there and then (init.sql §60).
  */
 export const flowStillOpen = (frozen) => frozen?.reason === 'locked';
 

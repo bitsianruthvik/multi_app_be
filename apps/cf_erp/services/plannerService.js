@@ -76,6 +76,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { rollOutPlan, lockedBothOf, attachLockedCodes } from './rollOutService.js';
+import { frozenFlowMap } from './frozenFlowService.js';
 import {
   lineNeeds, loadSupply, evaluate, giveBack, takeAgain, orderRanks, orderKeyOf, today as clockToday, dayWords, DATED_PO_STATUSES,
 } from './materialReadyService.js';
@@ -249,14 +250,14 @@ async function loadOrderLines(db, companyId) {
  * values — WEIGHT, SHIP_UNIT and the inputs of the timing formulas). The two
  * are independent, so they go out together.
  */
-async function loadLineStructure(db, companyId, line, lockedPieces) {
+async function loadLineStructure(db, companyId, line, lockedPieces, frozenFlows = new Map()) {
   if (!line.item_id) return { problems: ['This line has no item yet.'], nodes: [], reqs: [], resolutions: new Map() };
   const lockedBoth = lockedPieces ? lockedBothOf(lockedPieces) : null;
   const [plan, resolutions] = await Promise.all([
     rollOutPlan(db, companyId, {
       id: line.id, order_id: line.order_id, order_code: line.order_code, order_type: line.order_type,
       line_no: line.line_no, item_id: line.item_id, quantity: line.quantity,
-    }, { lockedBoth }),
+    }, { lockedBoth, frozenFlows }),
     resolveLineRecords(db, companyId, line.id).catch(() => new Map()),
   ]);
   if (lockedPieces) attachLockedCodes(plan.nodes, lockedPieces);
@@ -408,7 +409,9 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   }
 
   // ---- the per-line structure, side by side ---------------------------------
-  const structures = await Promise.all(lineRows.map((l) => loadLineStructure(db, companyId, l, l.locked_at ? piecesOfLine.get(l.id) ?? [] : null)));
+  // A locked line is planned by its OWN copy of each flow (init.sql §60): the copies of every locked line, one read.
+  const frozenFlows = await frozenFlowMap(db, companyId, lockedIds);
+  const structures = await Promise.all(lineRows.map((l) => loadLineStructure(db, companyId, l, l.locked_at ? piecesOfLine.get(l.id) ?? [] : null, frozenFlows.get(Number(l.id)))));
 
   // ---- flows, operations, the machine side: once for every line -------------
   const flowIds = new Set();

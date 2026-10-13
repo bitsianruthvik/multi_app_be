@@ -5343,3 +5343,51 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME IN ('link_group', 'link_apart')) = 2
       AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND INDEX_NAME = 'idx_cid_link') = 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- §60  A frozen order line keeps its own copy of every flow it uses (2026-10-12) — the same text as TM/s60.sql
+-- Additive and guarded: safe to re-run. Service: frozenFlowService (ensureLineFlowCopies, frozenFlowMap).
+--
+-- User, 2026-10-12: "Once the order passes through freeze design nothing should change." A locked line
+-- used to read the shared catalog flow by id until release, so a catalog edit changed the order. Now
+-- lock COPIES every flow the line uses — header, steps, links, wait rules — and every read on a locked
+-- line goes through the copy. The rows' pointers (cf_bom_lines.operation_flow_id,
+-- cf_master_records.default_flow_id) are NEVER repointed: they keep naming the catalog flow, and the
+-- copy is found by (owner_order_line_id, source_flow_id). No pointer anywhere names a copy.
+--
+-- owner_order_line_id  NULL = a catalog flow. Set = the copy this order line reads once it is locked.
+-- source_flow_id       the catalog flow it was copied from. source_revision: that flow's revision label then.
+-- code_catalog         the code, for CATALOG flows only — a copy keeps its source's code and name (they
+--                      are printed on order screens and in release messages), so it must not count as a
+--                      second flow of that code. Replaces code_active in the unique key; code_active
+--                      stays (TiDB does not change a generated column in place).
+-- uq_cof_catalog_code  one live catalog flow per code (was uq_cof_code).
+-- uq_cof_owner_source  one live copy of a flow per order line; its first two columns are also
+--                      "the copies of this line".
+-- A statement each: TiDB refuses an index on a column added in the same ALTER.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME = 'owner_order_line_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flows ADD COLUMN owner_order_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME = 'source_flow_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flows ADD COLUMN source_flow_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME = 'source_revision');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flows ADD COLUMN source_revision VARCHAR(20) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME = 'code_catalog');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_operation_flows ADD COLUMN code_catalog VARCHAR(50) GENERATED ALWAYS AS (IF(deleted_at IS NULL AND owner_order_line_id IS NULL, LOWER(code), NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_catalog_code');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_operation_flows ADD UNIQUE KEY uq_cof_catalog_code (company_id, code_catalog)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_owner_source');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_operation_flows ADD UNIQUE KEY uq_cof_owner_source (company_id, owner_order_line_id, source_flow_id, code_active)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- The old key goes LAST, and only once the new one is there: no moment without a unique code.
+SET @new = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_catalog_code');
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_code');
+SET @sql = IF(@key > 0 AND @new > 0, 'ALTER TABLE cf_operation_flows DROP INDEX uq_cof_code', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND COLUMN_NAME IN ('owner_order_line_id', 'source_flow_id', 'source_revision', 'code_catalog')) = 4
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME IN ('uq_cof_catalog_code', 'uq_cof_owner_source')) = 2
+      AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_code') = 0,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

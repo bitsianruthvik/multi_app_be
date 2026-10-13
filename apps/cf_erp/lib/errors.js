@@ -54,6 +54,8 @@ const UNIQUE_MESSAGES = {
   uq_cpt_code: 'A party with that code already exists.',
   uq_cop_code: 'An operation with that code already exists.',
   uq_cof_code: 'A flow with that code already exists.',
+  uq_cof_catalog_code: 'A flow with that code already exists.',
+  uq_cof_owner_source: 'This order line already has its copy of that flow — try again.',
   uq_cofs_operation_seq: 'This flow already does that operation at this sequence number. A flow may repeat an operation — give the repeat its own, later sequence number so the order of the passes is clear.',
   uq_cswr_rule: 'This step already waits for that.',
   uq_cmc_code: 'A machine with that code already exists.',

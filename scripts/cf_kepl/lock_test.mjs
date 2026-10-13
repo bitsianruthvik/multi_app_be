@@ -480,33 +480,42 @@ try {
   const orderView = await SO.getOrder(conn, COMPANY, A.order.id);
   same('and the order says the line is locked, at which position', [!!orderView.lines[0].lock?.lockedAt, orderView.lines[0].lock?.position], [true, 1]);
 
-  /* ---- 4b. flows stay open until release ----------------------------------------- */
-  // User, 2026-09-30: how a thing is made may still change on a locked line,
-  // until it is released — and nothing else may (records.flowStillOpen).
-  section('4b. How a row is made still changes on a locked line — and only that');
+  /* ---- 4b. a frozen line's flows: filled in, never changed ------------------------- */
+  // User, 2026-09-30: how a thing is made stayed open on a locked line until release.
+  // NARROWED 2026-10-12 ("once the order passes through freeze design nothing should change"):
+  // a locked line takes a flow only for a row that has NONE; a row that has one keeps it
+  // (records.flowStillOpen, frozenFlowService). Until then this section asserted the old rule.
+  section('4b. On a locked line a row with no flow may be given one — a row that has a flow keeps it');
+  const frozenFlow = (label, err) => ok(`refused: ${label}`, err?.code === 'FLOW_FROZEN' && /design is frozen, so the flow of .* cannot change\. Make a new revision of the order/.test(err?.message ?? ''), err ? `${err.code}: ${err.message}` : 'it was accepted');
   const flow2 = await FLOWS.createFlow(conn, c, { code: `${tag}-FLB`, name: `Make ${tag} another way` });
   await FLOWS.addStep(conn, c, flow2.id, { operationId: f.op.id });
   await FLOWS.setFlowStatus(conn, c, flow2.id, 'active');
-  eq('the Structure tab says flows can still change', struct.order.flowsEditable, true);
+  same('the Structure tab says flows are open, but only to fill in a missing one', [struct.order.flowsEditable, struct.order.flowsFillOnly], [true, true]);
   same('... and that the line is locked, not released', [struct.order.locked, struct.order.released], [true, false]);
   const flowOf = async (recordId) => (await conn.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [recordId]))[0][0].default_flow_id;
   const partFlowWas = await flowOf(partRow.id);
-  const newFlow = await MR.updateRecord(conn, c, partRow.id, { defaultFlowId: flow2.id });
-  eq('a row\'s "usually made by" changes on its own', newFlow.defaultFlowId, flow2.id);
-  eq('... and is saved', await flowOf(partRow.id), flow2.id);
-  refusedLocked('but a flow with any other field is refused whole', await refusal(() => MR.updateRecord(conn, c, partRow.id, { defaultFlowId: f.flow.id, name: 'Renamed' })));
-  eq('... and the flow did not change with it', await flowOf(partRow.id), flow2.id);
-  await MR.updateRecord(conn, c, partRow.id, { defaultFlowId: partFlowWas });
-  eq('cleared again, it goes back to its template\'s flow', await flowOf(partRow.id), partFlowWas);
+  frozenFlow('another flow for a row that has one', await refusal(() => MR.updateRecord(conn, c, partRow.id, { defaultFlowId: flow2.id })));
+  frozenFlow('clearing the flow of a row that has one', await refusal(() => MR.updateRecord(conn, c, partRow.id, { defaultFlowId: null })));
+  eq('... and the row keeps its flow', await flowOf(partRow.id), partFlowWas);
+  eq('the same flow again is not a change', (await MR.updateRecord(conn, c, partRow.id, { defaultFlowId: partFlowWas })).defaultFlowId, partFlowWas);
+  refusedLocked('a flow with any other field is refused whole', await refusal(() => MR.updateRecord(conn, c, partRow.id, { defaultFlowId: f.flow.id, name: 'Renamed' })));
+  // A row with no flow (a cut piece before the house flow is set): emptied by hand here, as nothing else may.
+  const copiesOf = async (flowId) => Number((await conn.query('SELECT COUNT(*) AS n FROM cf_operation_flows WHERE company_id = ? AND owner_order_line_id = ? AND source_flow_id = ? AND deleted_at IS NULL', [COMPANY, lineA.id, flowId]))[0][0].n);
+  eq('locking gave the line its own copy of the flow its rows use', await copiesOf(f.flow.id), 1);
+  await conn.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE id = ?', [partRow.id]);
+  const filled = await MR.updateRecord(conn, c, partRow.id, { defaultFlowId: flow2.id });
+  eq('a row with NO flow is given one', filled.defaultFlowId, flow2.id);
+  eq('... and the line takes its own copy of that flow at once', await copiesOf(flow2.id), 1);
+  await conn.query('UPDATE cf_master_records SET default_flow_id = ? WHERE id = ?', [partFlowWas, partRow.id]);
   const lineFlow = async (lineId) => (await conn.query('SELECT operation_flow_id FROM cf_bom_lines WHERE id = ?', [lineId]))[0][0].operation_flow_id;
-  await B.updateLine(conn, c, segLine.id, { operationFlowId: flow2.id });
-  eq('a BOM line\'s flow changes through the line dialog', await lineFlow(segLine.id), flow2.id);
-  refusedLocked('but not with its quantity in the same save', await refusal(() => B.updateLine(conn, c, segLine.id, { operationFlowId: null, quantity: 2 })));
+  frozenFlow('a BOM line naming another flow than the one its row is made by', await refusal(() => B.updateLine(conn, c, segLine.id, { operationFlowId: flow2.id })));
+  eq('... the line names no flow of its own, as before', await lineFlow(segLine.id), null);
+  refusedLocked('nor with its quantity in the same save', await refusal(() => B.updateLine(conn, c, segLine.id, { operationFlowId: null, quantity: 2 })));
   const dry = await BC.applyBomChanges(conn, c, { scope: { orderLineId: lineA.id }, dryRun: true, changes: [{ op: 'flow', lineId: segLine.id, flowId: null }] });
-  ok('edit mode checks a flow-only batch without refusing it', dry.dryRun === true && dry.summary.counts.flow === 1, JSON.stringify(dry.summary));
-  const bcFlow = await BC.applyBomChanges(conn, c, { scope: { orderLineId: lineA.id }, changes: [{ op: 'flow', lineId: segLine.id, flowId: null }] });
-  ok('and saves it', bcFlow.applied === true && bcFlow.summary.counts.flow === 1, JSON.stringify(bcFlow.summary));
-  eq('... the line is back on the usual flow', await lineFlow(segLine.id), null);
+  ok('edit mode checks a flow-only batch without refusing it (none -> none changes nothing)', dry.dryRun === true && dry.summary.counts.unchanged === 1, JSON.stringify(dry.summary));
+  const bcDry = await refusal(() => BC.applyBomChanges(conn, c, { scope: { orderLineId: lineA.id }, dryRun: true, changes: [{ op: 'flow', lineId: segLine.id, flowId: flow2.id }] }));
+  ok('edit mode names a changed flow as a problem, in the frozen sentence — in the dry run too', (bcDry?.problems ?? []).some((p) => /design is frozen, so the flow of .* cannot change/.test(p)), JSON.stringify(bcDry?.problems ?? bcDry?.message));
+  eq('... and nothing was written', await lineFlow(segLine.id), null);
   const mixed = await refusal(() => BC.applyBomChanges(conn, c, { scope: { orderLineId: lineA.id }, changes: [{ op: 'flow', lineId: segLine.id, flowId: flow2.id }, { op: 'quantity', lineId: segLine.id, quantity: 2 }] }));
   refusedLocked('a batch with a flow AND anything else is refused whole', mixed);
   eq('... as a 409', mixed?.status, 409);
@@ -636,7 +645,8 @@ try {
   await LOCK.lockLine(lb.db, c, H.lines[1].id);
   console.log(`        lockLine: ${ls.tally.n} round trips for ${hs.summary.nodes} pieces, ${lb.tally.n} for ${hb.summary.nodes}`);
   ok('lockLine: the same round trips too', ls.tally.n === lb.tally.n, `${ls.tally.n} vs ${lb.tally.n}`);
-  ok('and a few dozen, not one a piece', lb.tally.n <= 60, `${lb.tally.n}`);
+  // 72, was 60: lock now also copies the line's flows (init.sql §60) — nine statements here, whatever the number of flows.
+  ok('and a few dozen, not one a piece', lb.tally.n <= 72, `${lb.tally.n}`);
 
   /* ---- 11. not found -------------------------------------------------------------------- */
   section('11. Not found, a line of another company, and a catalog line');
@@ -758,8 +768,9 @@ try {
     await MR.updateRecord(conn, c, f.WB.id, { defaultFlowId: flow2.id });            // the definition's flow
     await OPS.updateTimingRule(conn, c, ruleA.id, { workExpression: `item.${SA.code} + item.${SC.code}` });   // the steps' formula
     await FLOWS.addStep(conn, c, flow2.id, { operationId: op3.id });                  // a step in the row's flow
-    await B.updateLine(conn, c, webLine.id, { operationFlowId: null });               // the row's own flow (still allowed on a frozen line)
-    eq('frozen: after the definition\'s flow, the flows\' steps and formulas and the row\'s own flow all changed, its field list is exactly the same',
+    // the row's own flow no longer changes on a frozen line (2026-10-12; until then this step changed it)
+    eq('frozen: changing the row\'s own flow is refused', (await refusal(() => B.updateLine(conn, c, webLine.id, { operationFlowId: null })))?.code, 'FLOW_FROZEN');
+    eq('frozen: after the definition\'s flow and the flows\' steps and formulas all changed, its field list is exactly the same',
       JSON.stringify([...(await fieldsOfLine(lineZ.id)).out.entries()]), frozenList);
     same('…while the line that is NOT frozen followed (its segment is on the second flow: B and now C)', (await fieldsOfLine(line2.id)).out.get(Number(seg2.id)), [SB.code, SC.code]);
     await excelAgrees(lineZ.id, 'frozen');
@@ -919,12 +930,14 @@ try {
     const frozenFields = [await flowRules(top.id), await cellsOf(lineY.id, top.id)];
     const mixed = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }, { op: 'quantity', lineId: segLine.id, quantity: 3 }]));
     ok('frozen: an own flow with anything else in the save is refused in the locked line\'s sentence, as a 409', mixed?.status === 409 && mixed?.code === 'LOCKED' && LOCKED_WORDS.test(mixed?.message ?? ''), mixed ? `${mixed.status} ${mixed.code}: ${mixed.message}` : 'it was accepted');
-    const frozenSave = await batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }]);
-    same('frozen: an own flow alone still goes through — it is only how the row is made', [frozenSave.results[0].changed, await ownFlowOf(top.id)], [true, Number(flowQ.id)]);
-    same('…but its FIELD LIST does not move: still what it had at freeze, no B', [await flowRules(top.id), await cellsOf(lineY.id, top.id)], frozenFields);
+    // 2026-10-12: a frozen design keeps each row's flow — until then an own flow alone still went through here.
+    const frozenSave = await refusal(() => batch(lineY.id, [{ op: 'ownFlow', recordId: top.id, flowId: flowQ.id }]));
+    ok('frozen: an own flow alone is refused too — the row has a flow, and a frozen design keeps it', frozenSave?.status === 422 && (frozenSave.problems ?? []).some((p) => /design is frozen, so the flow of .* cannot change\. Make a new revision of the order/.test(p)), frozenSave ? (frozenSave.problems ?? [frozenSave.message]).join(' | ') : 'it was accepted');
+    eq('…the row keeps the flow it was frozen with', await ownFlowOf(top.id), Number(flowP.id));
+    same('…and its FIELD LIST: still what it had at freeze, no B', [await flowRules(top.id), await cellsOf(lineY.id, top.id)], frozenFields);
     const whyFrozen = await VR.getValueReasons(conn, COMPANY, top.id);
-    same('the reasons say the row is frozen, and a value kept from the old flow names no operation of today\'s',
-      [whyFrozen.frozen?.reason, Number(whyFrozen.flow?.id), reasonOf(whyFrozen, GA.code)?.kind, reasonOf(whyFrozen, GA.code)?.operations], ['locked', Number(flowQ.id), 'flow', []]);
+    same('the reasons say the row is frozen, name the flow the row names, and the operation of the line\'s own copy that reads the value',
+      [whyFrozen.frozen?.reason, Number(whyFrozen.flow?.id), reasonOf(whyFrozen, GA.code)?.kind, (reasonOf(whyFrozen, GA.code)?.operations ?? []).length > 0], ['locked', Number(flowP.id), 'flow', true]);
     await SO.setOrderStatus(conn, c, Y.order.id, 'confirmed');
     const relY = await REL.releaseLine(conn, c, lineY.id, { finishedAreaId: f.area.id });
     ok('the line is released', !!relY?.id);
@@ -933,7 +946,7 @@ try {
       relOwn?.status === 409 && relOwn?.code === 'RELEASED' && /was released to production — its structure is frozen\. Take the release back, while nothing has started, to change it\.$/.test(relOwn?.message ?? ''),
       relOwn ? `${relOwn.status} ${relOwn.code}: ${relOwn.message}` : 'it was accepted');
     says(relOwn?.message);
-    eq('…and the row keeps its flow', await ownFlowOf(top.id), Number(flowQ.id));
+    eq('…and the row keeps its flow', await ownFlowOf(top.id), Number(flowP.id));
   }
 
   await conn.rollback();

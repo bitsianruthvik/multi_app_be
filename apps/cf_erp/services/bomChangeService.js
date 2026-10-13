@@ -135,6 +135,7 @@ import { invalid, notFound, conflict, CfError, translateDbError } from '../lib/e
 import { requireMaster, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { BOM_TYPE_BY_KIND, descendantIds } from './bomGraph.js';
 import { explode, writeLineUpdate, writeLineRemoval, addLine, assertEditable, ALLOWED_CHILDREN } from './bomService.js';
+import { frozenFlowChange, frozenFlowMessage } from './frozenFlowService.js';
 import { refreshValues, setValues } from './valueService.js';
 import { requireUsableFlow } from './flowService.js';
 import { insertRows } from '../lib/db.js';
@@ -438,7 +439,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
     if (line.release_id) {
       throw conflict('RELEASED', `Line ${line.line_no} of ${line.order_code} was released to production — its structure is frozen. Take the release back, while nothing has started, to change it.`);
     }
-    // Only flows still change on a locked line, until it is released (records.flowStillOpen).
+    // Only a flow for a row that has none still goes through on a locked line, until it is released
+    // (records.flowStillOpen) — each flow change is checked for that below.
     if (line.locked_at && !flowOnly) throw conflict('LOCKED', lockedLineMessage(line.line_no, line.order_code));
   }
   await assertOpen(db, companyId, root, { flowOnly });
@@ -487,6 +489,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       seenOwn.add(ch.recordId);
       ch.places = places;
       ch.label = label;
+      // Frozen design: a row's own flow may be filled in, never changed or cleared (init.sql §60).
+      if (line?.locked_at && frozenFlowChange(ownFlowIdOf(node), ch.flowId) === 'refuse') { problems.push(frozenFlowMessage(label)); continue; }
       if (ch.flowId != null) {
         if (!flowIds.has(ch.flowId)) flowIds.set(ch.flowId, []);
         flowIds.get(ch.flowId).push(label);
@@ -534,6 +538,8 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
       updates.push(ch);
     } else if (ch.op === 'flow') {
       if (ch.flowId != null && (e.node.selection || e.node.kind === 'selection')) { problems.push(`${label}: ${SELECTION_FLOW}`); continue; }
+      // Frozen design: the row's flow (the line's, else its item's) may be filled in, never changed or cleared.
+      if (line?.locked_at && frozenFlowChange(e.node.flow?.id ?? null, ch.flowId ?? ownFlowIdOf(e.node)) === 'refuse') { problems.push(frozenFlowMessage(label)); continue; }
       if (ch.flowId != null) {
         if (!flowIds.has(ch.flowId)) flowIds.set(ch.flowId, []);
         flowIds.get(ch.flowId).push(label);

@@ -450,7 +450,7 @@ try {
   const inquiriesBefore = await cockpitInquiries();
   const A = await newOrder(conn, c, f, 'A', [f.GR.id, f.GR.id, { recordId: f.MAT.id, quantity: 5 }, f.SG.id]);
   const [a10, a20, a30, a40] = A.lines;
-  same('four lines: two girders, the catalog material, a segment', A.lines.map((l) => [l.lineNo, l.lineType]), [[10, 'custom'], [20, 'custom'], [30, 'standard'], [40, 'custom']]);
+  same('four lines: two girders, the catalog material, a segment', A.lines.map((l) => [l.lineNo, l.lineType]), [[1, 'custom'], [2, 'custom'], [3, 'standard'], [4, 'custom']]);
   for (const l of [a10, a20, a40]) {
     const r = await fillAndCut(conn, c, f, l.id);
     ok(`line ${l.lineNo}: its values filled, its cut pieces made automatically`, r.made === true && r.summary.cutPieces === 3, r.message);
@@ -463,7 +463,7 @@ try {
   const a10After = await cutPlatesOf(conn, f, a10.id);
   same('line 10\'s web is cut from PL2 now, the rest from the default PL1', a10After.map((p) => [p.name.includes('500') ? 'web' : 'other', p.plate]),
     a10After.map((p) => [p.name.includes('500') ? 'web' : 'other', p.name.includes('500') ? f.PL2.id : f.PL1.id]));
-  ok('a cut plate code is the tenant\'s own shape: order, line, the rectangle', a10After.some((p) => p.code === `${A.code}-10-CUTPL-12X500X2000-E350`), a10After.map((p) => p.code).join(', '));
+  ok('a cut plate code is the tenant\'s own shape: order, line, the rectangle', a10After.some((p) => p.code === `${A.code}-1-CUTPL-12X500X2000-E350`), a10After.map((p) => p.code).join(', '));
   // A chart is a specification value too: revisions must preserve it and its audit history.
   const chartSpec = await SPEC.createSpec(conn, c, { code: `${tag}_CHART`, name: `${tag} chart`, dataType: 'table',
     tableConfig: { axes: [{ label: 'Thickness', unit: 'mm' }, { label: 'Diameter', unit: 'mm' }], mode: 'step_up' } });
@@ -514,7 +514,7 @@ try {
   ok('and none of them locked', A2.lines.every((l) => l.lock == null));
   eq('the catalog line sells the same catalog item', b30.item.id, a30.item.id);
   ok('each custom line sells a new row of its own', [b10, b20, b40].every((l, i) => l.item.id !== [a10, a20, a40][i].item.id));
-  same('cut pieces made again for each custom line — 3 rectangles each', A2.cutPieces.map((x) => [x.lineNo, x.made, x.reason]), [[10, true, 'made'], [20, true, 'made'], [40, true, 'made']]);
+  same('cut pieces made again for each custom line — 3 rectangles each', A2.cutPieces.map((x) => [x.lineNo, x.made, x.reason]), [[1, true, 'made'], [2, true, 'made'], [4, true, 'made']]);
   says(A2.cutPieces[0].message);
 
   const shapes2 = { 10: await shapeOf(conn, b10.id), 20: await shapeOf(conn, b20.id), 40: await shapeOf(conn, b40.id) };
@@ -672,7 +672,7 @@ try {
   await LOCK.lockLine(conn, c, B2.lines[1].id);
   same('and locks to exactly its rev 1 codes', pieceShape(await livePieces(conn, B2.lines[1].id)), pieceShape(b1Pieces[20]));
   eq('the dropped line\'s rev 1 pieces are retired with the rest', (await livePieces(conn, Bq.lines[0].id)).length, 0);
-  const again = (await SO.addOrderLine(conn, c, B2.id, { recordId: f.GR.id, quantity: 1, lineNo: 10 })).lines.find((l) => l.lineNo === 10);
+  const again = (await SO.addOrderLine(conn, c, B2.id, { recordId: f.GR.id, quantity: 1, lineNo: 1 })).lines.find((l) => l.lineNo === 1);
   await fillAndCut(conn, c, f, again.id);
   const reuse = await LOCK.lockPlan(conn, COMPANY, again.id, { nodes: true });
   same('a span added back as line 10 takes position 01, and nothing calls its codes taken', [reuse.position?.value, reuse.canLock, reuse.taken.length], [1, true, 0]);
@@ -693,7 +693,7 @@ try {
   await SO.setOrderStatus(conn, c, Cq.order.id, 'confirmed');
   const rel = await REL.releaseLine(conn, c, cLine.id, { finishedAreaId: f.area.id });
   const relErr = await refusal(() => REV.reviseOrder(conn, c, Cq.order.id));
-  ok('revising is refused, in words: take the release back first', relErr?.code === 'RELEASED' && relErr.status === 422 && /Line 10 of \S+ is released to production — take the release back first/.test(relErr.message), relErr?.message);
+  ok('revising is refused, in words: take the release back first', relErr?.code === 'RELEASED' && relErr.status === 422 && /Line 1 of \S+ is released to production — take the release back first/.test(relErr.message), relErr?.message);
   says(relErr?.message);
   eq('and nothing was written', (await SO.listOrders(conn, COMPANY, { revisions: 'all' })).filter((o) => o.code === Cq.code).length, 1);
   await REL.unrelease(conn, c, rel.id);

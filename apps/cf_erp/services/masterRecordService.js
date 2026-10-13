@@ -16,6 +16,7 @@
 import { invalid, conflict, assertNoProblems } from '../lib/errors.js';
 import { ancestors, levelName, loadNode, subtreeIds } from './tree.js';
 import { loadMaster, requireMaster, kindOf, frozenBy, assertNotFrozen, flowStillOpen } from './records.js';
+import { frozenFlowChange, frozenFlowMessage, ensureLineFlowCopies } from './frozenFlowService.js';
 import { requireLeaf } from './classificationService.js';
 import { resolve, publicResolution, TRACK_DEPTH } from './resolutionService.js';
 import { setValues, materialize, rematerialize, deleteAllForSubject as deleteValues } from './valueService.js';
@@ -305,9 +306,10 @@ export async function updateRecord(db, c, id, input = {}) {
     }
     assertNoProblems(p);
   }
-  // A locked line still takes a new flow — and nothing else — until it is
-  // released (records.flowStillOpen). Any other field in the same save is
-  // refused in the locked line's one sentence.
+  // A locked line still takes a flow for a row that has none — and nothing
+  // else — until it is released (records.flowStillOpen). Any other field in the
+  // same save is refused in the locked line's one sentence; a row that already
+  // has a flow keeps it (checked below, once the flow asked for is read).
   const flowOnly = input.defaultFlowId !== undefined
     && Object.keys(input).every((k) => k === 'defaultFlowId' || input[k] === undefined);
   if (!(flowOnly && flowStillOpen(frozenBy(m)))) assertNotFrozen(m, flowOnly ? 'flow' : 'details');
@@ -315,6 +317,7 @@ export async function updateRecord(db, c, id, input = {}) {
   const sets = {};
   const detail = {};
   const laterEntries = [];
+  let frozenFill = null;
 
   if (input.name !== undefined) {
     const name = String(input.name ?? '').trim();
@@ -329,6 +332,11 @@ export async function updateRecord(db, c, id, input = {}) {
   if (input.defaultFlowId !== undefined) {
     if (m.record_kind === 'definition' && m.definition_type === 'selection') problems.push('A selection chooses a catalog item — it is not made here, so it has no flow.');
     else sets.default_flow_id = blank(input.defaultFlowId) ? null : await requireUsableFlow(db, c.companyId, input.defaultFlowId, problems);
+    // Frozen design: the row's flow may be filled in, never changed or cleared (init.sql §60).
+    if (!problems.length && frozenBy(m)?.reason === 'locked') {
+      frozenFill = frozenFlowChange(m.default_flow_id, sets.default_flow_id);
+      if (frozenFill === 'refuse') throw invalid('FLOW_FROZEN', frozenFlowMessage(m.code ?? m.name));
+    }
   }
   if (input.code !== undefined) {
     const code = blank(input.code) ? null : String(input.code).trim();
@@ -443,6 +451,8 @@ export async function updateRecord(db, c, id, input = {}) {
     const r = await syncFlowSpecs(db, c, [id]);
     flowSpecs = { ...r, words: await flowSpecWords(db, c.companyId, r, id) };
   }
+  // A flow given to a row of a frozen line is frozen with it: the line takes its own copy now.
+  if (frozenFill === 'fill') await ensureLineFlowCopies(db, c, m.owner_order_line_id, { flowIds: [sets.default_flow_id] });
   const out = await getRecord(db, c.companyId, id);
   if (flowSpecs) out.flowSpecs = flowSpecs;
   return out;

@@ -50,7 +50,8 @@ export async function listOperations(db, companyId, q = {}) {
   }
   const [rows] = await db.query(
     `SELECT o.*,
-            (SELECT COUNT(DISTINCT s.flow_id) FROM cf_operation_flow_steps s WHERE s.company_id = o.company_id AND s.operation_id = o.id AND s.deleted_at IS NULL) AS flow_count,
+            (SELECT COUNT(DISTINCT s.flow_id) FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL AND f.owner_order_line_id IS NULL
+              WHERE s.company_id = o.company_id AND s.operation_id = o.id AND s.deleted_at IS NULL) AS flow_count,
             (SELECT COUNT(*) FROM cf_operation_machine_rules r WHERE r.company_id = o.company_id AND r.operation_id = o.id AND r.deleted_at IS NULL) AS rule_count
        FROM cf_operations o WHERE ${where.join(' AND ')} ORDER BY o.code`,
     params,
@@ -88,9 +89,10 @@ export async function getOperation(db, companyId, id) {
     // A flow may run one operation more than once, so DISTINCT over a row
     // carrying s.sequence would list the same flow once per pass. Group it:
     // the sequence shown is where the operation FIRST comes up, and `times`
-    // says how many passes there are.
+    // says how many passes there are. Catalog flows only: a frozen order line's own copy
+    // of a flow (init.sql §60) carries the same code and is not a flow of the catalog.
     `SELECT f.id, f.code, f.name, f.status, MIN(s.sequence) AS sequence, COUNT(*) AS times
-       FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL
+       FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL AND f.owner_order_line_id IS NULL
       WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL
       GROUP BY f.id, f.code, f.name, f.status ORDER BY f.code`,
     [companyId, id],
@@ -148,6 +150,7 @@ export async function updateOperation(db, c, id, input = {}) {
 export async function deleteOperation(db, c, id) {
   const o = await requireOperation(db, c.companyId, id);
   const reasons = [];
+  // A frozen order line's copy of a flow counts here too (it shows under its flow's code): the line still runs the operation.
   const [flows] = await db.query(
     `SELECT DISTINCT f.code FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.deleted_at IS NULL
       WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL LIMIT 6`, [c.companyId, id]);

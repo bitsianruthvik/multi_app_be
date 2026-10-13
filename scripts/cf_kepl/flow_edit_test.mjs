@@ -69,6 +69,10 @@ try {
   ok('a locked piece to hang work on', !!piece);
   await db.query('UPDATE cf_bom_lines SET operation_flow_id = ? WHERE id = ?', [flow.id, piece.bom_line_id]);
   const L = piece.order_line_id, BL = piece.bom_line_id;
+  // Since 2026-10-12 a FROZEN (locked) line reads its own copy of the flow, so a replace in the catalog moves
+  // nothing of its: the line is put back to "not frozen yet" here (rolled back with the rest) to check what moves,
+  // and frozen again further down to check that nothing does.
+  await db.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE id = ?', [L]);
   await db.query('INSERT INTO cf_time_overrides SET ?', [{ company_id: company, order_line_id: L, bom_line_id: BL, operation_id: B, work_minutes: 5 }]);
   await db.query('INSERT INTO cf_work_order_cells SET ?', [{ company_id: company, work_order_id: 999999, order_line_id: L, order_piece_id: piece.id, operation_id: B }]);
   let r = await replaceStepOperation(db, c, sB.id, { operationId: E });
@@ -93,6 +97,12 @@ try {
   await db.query('INSERT INTO cf_time_overrides SET ?', [{ company_id: company, order_line_id: L, bom_line_id: BL, operation_id: A, work_minutes: 11 }]); // the A row moved to D above, so A is free; now both exist
   r = await replaceStepOperation(db, c, sA.id, { operationId: A });
   ok('replace: a row that already has the new operation keeps its own; the old is counted', r.replaced.kept === 1 && r.replaced.overridesMoved === 0);
+  // The piece's line FROZEN again: its entries stay on the old operation (its flow is its own copy now).
+  await db.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE id = ?', [L]);
+  r = await replaceStepOperation(db, c, sB.id, { operationId: X });
+  ok('replace: a frozen line keeps its override and cell on the old operation', r.replaced.overridesMoved === 0 && r.replaced.cellsMoved === 0);
+  const [[ovE]] = await db.query('SELECT COUNT(*) n FROM cf_time_overrides WHERE company_id = ? AND order_line_id = ? AND bom_line_id = ? AND operation_id = ? AND deleted_at IS NULL', [company, L, BL, E]);
+  ok('…the override is still on E', Number(ovE.n) === 1);
   // The piece's line released (inside the rolled-back transaction): its entries stay on the old operation.
   await db.query('INSERT INTO cf_production_releases SET ?', [{ company_id: company, order_id: 0, order_line_id: L, item_id: 0, quantity: 1 }]);
   const [[relRow]] = await db.query('SELECT COUNT(*) n FROM cf_production_releases WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [company, L]);

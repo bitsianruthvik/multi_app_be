@@ -42,6 +42,7 @@ import { invalid, notFound } from '../lib/errors.js';
 import { loadMasters } from './records.js';
 import { LEAF_DEPTH } from './tree.js';
 import { explode } from './bomService.js';
+import { frozenFlowsOfLine, ensureLineFlowCopies, freezeTree } from './frozenFlowService.js';
 import { generate } from '../modules/codegen/index.js';
 import { rangesOfBoms, seqValue, readRulesOnce, shortNameOf } from './codeRangeService.js';
 
@@ -341,11 +342,23 @@ async function cutPlatesAmong(db, companyId, everyNode) {
  *             still the selection ("chosen at nesting"): not a problem here,
  *             no node, no requirement; release checks them against the nest
  *   tree, all (every design node considered), detail (item details by id), truncated
+ *
+ * FLOWS OF A LOCKED LINE (init.sql §60, frozenFlowService). A locked line reads its own copy of each
+ * flow, so every node's `flow.id` — and the `flowId` of each laid-out node — is the COPY's id here
+ * (`flow.sourceId` = the catalog flow the row names). Release, its preview and the planner all get
+ * their flows from this, so none of them resolves a flow on its own.
+ *   frozenFlows  the line's copies, source -> copy, when the caller already read them (the planner,
+ *                for every line at once; a caller that reads no flows passes an empty Map); left
+ *                out, they are read here — one query — for a line with locked_at
+ *   ensure       c — release only: copies any flow the locked line has no copy of yet, before
+ *                reading them (a line locked before §60). The one case in which this writes.
  */
-export async function rollOutPlan(db, companyId, line, { lockedBoth = null } = {}) {
+export async function rollOutPlan(db, companyId, line, { lockedBoth = null, frozenFlows = undefined, ensure = null } = {}) {
   const problems = [];
   const qty = Number(line.quantity);
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: qty, maxDepth: MAX_DEPTH });
+  if (ensure && line.locked_at) freezeTree(tree.root, (await ensureLineFlowCopies(db, ensure, line.id, { tree: tree.root })).flows);
+  else freezeTree(tree.root, frozenFlows ?? await frozenFlowsOfLine(db, companyId, line));
   if (tree.truncated) problems.push(`The structure is more than ${MAX_DEPTH} levels deep.`);
 
   // 1. Every design node: is it an item, is it made or material, is it usable?

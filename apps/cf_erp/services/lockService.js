@@ -42,6 +42,7 @@ import { readLineValues, materializeLineRecords } from './orderValuesService.js'
 import { refreshCutPieces, previewCutPieces, cutPartsOf } from './cutPlateService.js';
 import { problemsOf } from '../lib/cutPlaces.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
+import { ensureLineFlowCopies } from './frozenFlowService.js';
 import {
   rollOutPlan, codeNodes, seedPieceMemo, siblingLines, positionAmong, lockedPiecesOf, nameOf,
 } from './rollOutService.js';
@@ -537,6 +538,12 @@ export async function lockLine(db, c, lineId) {
     await retireCellsOfRetiredPieces(db, companyId, { orderCode: line.order_code, beforeRevision: Number(line.order_revision) });
   }
   await writePieces(db, c, line, plan.nodes);
+  // HOW each thing is made freezes too (user, 2026-10-12: "once the order passes through freeze
+  // design nothing should change"): the line takes its own copy of every flow its structure names,
+  // and reads those from now on (frozenFlowService, init.sql §60). A row with no flow yet is not
+  // asked for one here — the checks above still leave that to release — and takes its copy when
+  // the flow is given. A fixed number of statements whatever the number of flows and steps.
+  await ensureLineFlowCopies(db, c, line.id, { tree: plan.tree?.root });
   await db.query(
     'UPDATE cf_sales_order_lines SET locked_at = NOW(), locked_by = ?, lock_position = ? WHERE company_id = ? AND id = ?',
     [c.userId ?? null, run.position, companyId, line.id],

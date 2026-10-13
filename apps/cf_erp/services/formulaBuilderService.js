@@ -55,7 +55,9 @@ export async function builderContext(db, companyId, operationId, q = {}) {
                WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND data_type IN ('number', 'table', 'option', 'text') ORDER BY name`, [companyId]),
     db.query("SELECT id, parent_id, depth, code, name FROM cf_classification_nodes WHERE company_id = ? AND deleted_at IS NULL AND scope = 'machine'", [companyId]),
     db.query("SELECT id, code, name, classification_id FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY code", [companyId]),
-    db.query('SELECT DISTINCT flow_id FROM cf_operation_flow_steps WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL', [companyId, operationId]),
+    // Catalog flows: rows name those, never a frozen order line's copy of one (init.sql §60).
+    db.query(`SELECT DISTINCT s.flow_id FROM cf_operation_flow_steps s JOIN cf_operation_flows f ON f.id = s.flow_id AND f.owner_order_line_id IS NULL
+               WHERE s.company_id = ? AND s.operation_id = ? AND s.deleted_at IS NULL`, [companyId, operationId]),
     db.query('SELECT subject_type, subject_id FROM cf_operation_machine_rules WHERE company_id = ? AND operation_id = ? AND deleted_at IS NULL AND eligible = 1', [companyId, operationId]),
     // What the preview offers to choose from: a pick-list's options, and the pieces' tree at each level.
     db.query("SELECT specification_id, value, label FROM cf_spec_options WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' ORDER BY sort_order, id", [companyId]),

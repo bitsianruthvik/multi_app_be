@@ -32,7 +32,7 @@ export async function navCounts(db, companyId) {
     one(db, "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND record_kind = 'definition'", c),
     one(db, "SELECT COUNT(*) FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
     one(db, "SELECT COUNT(*) FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
-    one(db, "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND status = 'draft'", c),
+    one(db, "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL AND status = 'draft'", c),
     one(db, 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0', c),
     one(db, `SELECT COUNT(*) FROM cf_stock_batches b WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.status <> 'available'
               AND EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id AND k.quantity <> 0)`, c),
@@ -62,7 +62,7 @@ export async function search(db, companyId, q) {
           WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.status <> 'revised' AND (o.code LIKE ? OR o.title LIKE ? OR p.name LIKE ?) ORDER BY o.id DESC LIMIT 6`, [like, like, like]),
     run('SELECT id, code, name, serial_number FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ? OR serial_number LIKE ?) ORDER BY code LIMIT 5', [like, like, like]),
     run('SELECT id, code, name FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
-    run('SELECT id, code, name, status FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
+    run('SELECT id, code, name, status FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
     run(`SELECT b.id, b.code, b.supplier_ref, m.code AS item_code FROM cf_stock_batches b JOIN cf_master_records m ON m.id = b.item_id
           WHERE b.company_id = ? AND b.deleted_at IS NULL AND (b.code LIKE ? OR b.supplier_ref LIKE ?) ORDER BY b.id DESC LIMIT 5`, [like, like]),
     run('SELECT id, code, name FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND (code LIKE ? OR name LIKE ?) ORDER BY code LIMIT 5', [like, like]),
@@ -109,7 +109,7 @@ export async function cockpit(db, companyId) {
     one(db, `SELECT COUNT(*) FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
               WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'draft' AND i.item_type = 'catalog'`, c),
     one(db, "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND status = 'draft' AND record_kind = 'definition'", c),
-    one(db, "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND status = 'draft'", c),
+    one(db, "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL AND status = 'draft'", c),
     one(db, `SELECT COUNT(*) FROM cf_machines mc WHERE mc.company_id = ? AND mc.deleted_at IS NULL AND mc.status = 'active'
               AND NOT EXISTS (SELECT 1 FROM cf_machine_shifts s WHERE s.company_id = mc.company_id AND s.machine_id = mc.id AND s.deleted_at IS NULL)`, c),
     one(db, `SELECT COUNT(*) FROM cf_stock_batches b WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.status <> 'available'

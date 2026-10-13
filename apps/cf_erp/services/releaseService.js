@@ -136,9 +136,14 @@ async function loadFlows(db, companyId, flowIds) {
  *   rowsMayBeDraft  a line not locked yet: its rows are drafts until lock
  *                   activates them, so a draft row is not a problem to report
  *                   — "lock the line first" is the one thing to say
+ *   ensure          c — releaseLine only: a locked line with a flow it has no copy of yet is given
+ *                   the copy first (frozenFlowService). A look (preview, check) never writes.
+ *
+ * A LOCKED line's flows are its own copies (init.sql §60): rollOutPlan hands every node the copy's
+ * id, so loadFlows below reads the copies and the production steps carry their step and rule ids.
  */
-async function buildPlan(db, companyId, line, { lockedBoth = null, rowsMayBeDraft = false } = {}) {
-  const plan = await rollOutPlan(db, companyId, line, { lockedBoth });
+async function buildPlan(db, companyId, line, { lockedBoth = null, rowsMayBeDraft = false, ensure = null } = {}) {
+  const plan = await rollOutPlan(db, companyId, line, { lockedBoth, ensure });
   const { problems, all, detail, tree } = plan;
   if (tree.root.made === undefined) return plan;
 
@@ -713,7 +718,7 @@ export function openPlateProblem(plan, placed) {
  * carries its locked codes (by path key) and follows the lock's own
  * made-or-stock decisions; a node the lock did not roll out is a problem.
  */
-async function planFor(db, companyId, line) {
+async function planFor(db, companyId, line, { ensure = null } = {}) {
   const problems = [];
   if (line.order_status === 'revised') problems.push(revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision));
   else if (line.order_status !== 'confirmed') problems.push(`Order ${line.order_code} is ${line.order_status} — only a confirmed order is released to production.`);
@@ -722,7 +727,7 @@ async function planFor(db, companyId, line) {
   if (line.line_type === 'custom' && !line.locked_at) problems.push(lockFirst(line));
   if (problems.length) return { problems, nodes: [], steps: [], deps: [], reqs: [] };
   const pieces = line.locked_at ? await lockedPiecesOf(db, companyId, line.id) : null;
-  const plan = await buildPlan(db, companyId, line, { lockedBoth: pieces ? lockedBothOf(pieces) : null });
+  const plan = await buildPlan(db, companyId, line, { lockedBoth: pieces ? lockedBothOf(pieces) : null, ensure });
   if (pieces) {
     for (const u of attachLockedCodes(plan.nodes ?? [], pieces)) plan.problems.push(unmatchedProblem(u, plan.nodes));
   }
@@ -1335,7 +1340,8 @@ async function writeSteps(db, c, releaseId, plan, estimate, owners) {
 export async function releaseLine(db, c, lineId, input = {}) {
   const line = await requireLine(db, c.companyId, lineId, { lock: true });
   await db.query('SELECT id FROM cf_sales_orders WHERE company_id = ? AND id = ? FOR UPDATE', [c.companyId, line.order_id]);
-  const plan = await planFor(db, c.companyId, line);
+  // ensure: the line is released from its OWN copies of its flows, also one locked before copies were made.
+  const plan = await planFor(db, c.companyId, line, { ensure: c });
   if (plan.problems.length) throw invalid('NOT_READY', `Line ${line.line_no} of ${line.order_code} cannot be released yet.`, { problems: plan.problems });
   // A line built from a template was brought up to date and frozen when it was
   // LOCKED (lockService), so there is nothing to refresh here.

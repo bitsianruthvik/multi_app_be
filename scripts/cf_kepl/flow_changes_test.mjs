@@ -146,6 +146,9 @@ try {
   if (piece) {
     const [[released]] = await db.query('SELECT COUNT(*) AS n FROM cf_production_releases WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, piece.order_line_id]);
     await db.query('UPDATE cf_production_releases SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, piece.order_line_id]);
+    // Since 2026-10-12 a frozen (locked) line keeps its own copy of the flow and nothing of its moves: the line is
+    // put back to "not frozen yet" for this check (rolled back with the rest). frozen_flows_test covers the frozen side.
+    await db.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE id = ?', [piece.order_line_id]);
     await db.query('UPDATE cf_bom_lines SET operation_flow_id = ? WHERE id = ?', [F, piece.bom_line_id]);
     await db.query('INSERT INTO cf_time_overrides SET ?', [{ company_id: COMPANY, order_line_id: piece.order_line_id, bom_line_id: piece.bom_line_id, operation_id: C, work_minutes: 5 }]);
     r = await applyFlowChanges(db, c, F, { steps: f.steps.map((s) => (s.id === idC ? { id: s.id, operationId: D } : keep(s))) });

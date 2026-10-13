@@ -37,11 +37,12 @@
  *
  * Nothing is written and resolve() is not touched: the record's own flow-made rules are read beside
  * it (the Values tab's mirror of resolve() is compared with it field by field). A fixed number of
- * queries whatever the number of values — resolve()'s own, plus at most five here.
+ * queries whatever the number of values — resolve()'s own, plus at most five here (six for a row of a frozen line).
  */
 import { requireMaster, kindOf } from './records.js';
 import { resolve, publicResolution, rawOf, displayOf, parseJsonCol } from './resolutionService.js';
 import { parseFormula } from './formulaEngine.js';
+import { frozenFlowsOfLine, frozenIdOf } from './frozenFlowService.js';
 
 const DERIVED = new Set(['calculated', 'rollup', 'inherited', 'fixed', 'defaulted']);
 
@@ -61,6 +62,16 @@ async function flowOfRecord(db, companyId, m) {
   if (flowId == null) return null;
   const [[f]] = await db.query('SELECT id, code, name FROM cf_operation_flows WHERE company_id = ? AND id = ?', [companyId, flowId]);
   return f ? { id: Number(f.id), code: f.code, name: f.name } : null;
+}
+
+/**
+ * The flow id to read a record's OPERATIONS by: a row of a frozen line is made by the line's own copy of
+ * its flow (init.sql §60), so what reads its values is what that copy holds — one more read, only then.
+ * The flow SHOWN stays the catalog flow the row names (flowOfRecord): the copy has no page of its own.
+ */
+async function readFlowIdOf(db, companyId, m, flow) {
+  if (!flow || !m.owner_line_locked_at) return flow?.id ?? null;
+  return frozenIdOf(await frozenFlowsOfLine(db, companyId, { id: m.owner_order_line_id, locked_at: m.owner_line_locked_at }), flow.id);
 }
 
 /**
@@ -134,7 +145,7 @@ export async function getValueReasons(db, companyId, id) {
   const m = await requireMaster(db, companyId, id);
   const r = publicResolution(await resolve(db, companyId, { master: m }));
   const flow = await flowOfRecord(db, companyId, m);
-  const readers = await readersOfFlow(db, companyId, flow?.id ?? null);
+  const readers = await readersOfFlow(db, companyId, await readFlowIdOf(db, companyId, m, flow));
   // The record's OWN flow-made rules — the origin resolve() does not carry.
   const [own] = await db.query(
     `SELECT a.id FROM cf_spec_assignments a

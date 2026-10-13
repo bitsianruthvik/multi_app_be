@@ -113,7 +113,8 @@ export async function linePlaceholders(db, companyId, lineId) {
   // A locked line rolls out as it was locked: its 'both' items stay made or
   // drawn as the lock decided (rollOutService.madeRule), not as stock stands today.
   const lockedBoth = line.locked_at ? lockedBothOf(await lockedPiecesOf(db, companyId, line.id)) : null;
-  const plan = await rollOutPlan(db, companyId, line, { lockedBoth });
+  // Codes do not depend on flows: the line's own copies of them are not read (an empty map, no query).
+  const plan = await rollOutPlan(db, companyId, line, { lockedBoth, frozenFlows: new Map() });
   const nodes = plan.nodes ?? [];
   if (!nodes.length) return out;
   out.position = await linePositionOf(db, companyId, line.id);
