@@ -401,9 +401,11 @@ export const STAGE_CATALOGUE = [
         // nesting, so buying and release wait on them — said here, not hidden.
         const out = ctx.nesting.leftOut;
         const leftOut = out?.pieces ? ` · ${n(out.pieces, 'piece')} left out (plate chosen at nesting)` : '';
+        // §61: cut from loose offcuts in the yard — on no plate, so said apart.
+        const loose = ctx.nesting.untracked?.pieces ? ` · ${n(ctx.nesting.untracked.pieces, 'piece')} cut from untracked offcuts` : '';
         return {
           state: 'done',
-          detail: `${n(saved.lots, 'plate')} laid out, ${n(saved.pieces, 'piece')} placed${byHand}${leftOut}`,
+          detail: `${n(saved.lots, 'plate')} laid out, ${n(saved.pieces, 'piece')} placed${byHand}${leftOut}${loose}`,
           blockers: [],
         };
       }
@@ -1372,8 +1374,10 @@ async function loadOrderContext(db, companyId, order, lines) {
     }]));
     // leftOutBy: cut pieces a line's nesting choices leave out (§40) — no drift, but said on the stage.
     const leftOutBy = new Map();
-    const driftBy = await layoutDriftOfLines(db, companyId, lines.filter((l) => (lotsBy.get(l.id)?.lots ?? 0) > 0).map((l) => l.id), trees, { leftOut: leftOutBy });
-    return { lotsBy, driftBy, leftOutBy };
+    // untrackedBy (§61): pieces marked as cut from untracked offcuts — no drift, said on the stage.
+    const untrackedBy = new Map();
+    const driftBy = await layoutDriftOfLines(db, companyId, lines.filter((l) => (lotsBy.get(l.id)?.lots ?? 0) > 0).map((l) => l.id), trees, { leftOut: leftOutBy, untracked: untrackedBy });
+    return { lotsBy, driftBy, leftOutBy, untrackedBy };
   })();
 
   // 6. Specification chains for every item, the NESTING answer on each, and the
@@ -1437,7 +1441,7 @@ async function loadOrderContext(db, companyId, order, lines) {
     if (DATED_PO_STATUSES.includes(p.status)) onOrder.set(p.itemId, round6((onOrder.get(p.itemId) ?? 0) + Math.max(0, p.quantity - p.received)));
   }
   const { releases, planned, reqRows } = rel;
-  const { lotsBy, driftBy, leftOutBy } = lots;
+  const { lotsBy, driftBy, leftOutBy, untrackedBy } = lots;
   const { chains, nestSpec, nestingBy, values } = spec;
   const cutPiecesBy = new Map(blankRows.filter((r) => r.kind === 'plate').map((r) => [r.order_line_id, Number(r.blanks)]));
   const sectionPiecesBy = new Map(blankRows.filter((r) => r.kind === 'section').map((r) => [r.order_line_id, Number(r.blanks)]));
@@ -1469,7 +1473,7 @@ async function loadOrderContext(db, companyId, order, lines) {
     for (const [id, v] of await availability(db, companyId, extra)) free.set(id, v);
   }
 
-  return { trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
+  return { trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, untrackedBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }
 
 /**
@@ -1637,6 +1641,7 @@ function lineContext(ctx, order, line) {
       section: ctx.sectionBy?.get(line.id) ?? { needed: false, accepted: false },
       drift: ctx.driftBy.get(line.id) ?? [],
       leftOut: ctx.leftOutBy?.get(line.id) ?? null,
+      untracked: ctx.untrackedBy?.get(line.id) ?? null,
     },
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,

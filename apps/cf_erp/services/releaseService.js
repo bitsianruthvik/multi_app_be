@@ -25,6 +25,7 @@
  */
 import { invalid, notFound, conflict } from '../lib/errors.js';
 import { insertRows, pool as sharedPool } from '../lib/db.js';
+import { untrackedOf, untrackedOfLine, effectiveUntracked } from '../lib/nestUntracked.js';
 import { cachedTracker, copyTracker, readOnce, rememberTracker, trackerCacheKey, trackerStamp } from '../lib/trackerCache.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { cutPlateFlowGaps, sectionStockProblems } from './cutPlateService.js';
@@ -509,45 +510,70 @@ export function lotGates(lots, firstOf) {
  * empty when the line is not nested — so the caller can tell which cut plates
  * a nest covers (openPlateProblem).
  */
-async function nestMaterial(db, companyId, line, plan, { lots: given } = {}) {
+async function nestMaterial(db, companyId, line, plan, { lots: given, untracked: givenMarks } = {}) {
   const nodes = plan.nodes ?? [];
   if (!nodes.length) return new Map();
   // `given`: the line's lots already read in bulk (plannedMaterial); otherwise one query.
-  const every = given !== undefined ? given : (await lotsOfLines(db, companyId, [line.id])).get(line.id);
-  if (!every?.size) return new Map();
+  // §61 `givenMarks`: the line's marks (cut from untracked offcuts), read in bulk the same way; otherwise one query.
+  const [every, marks] = await Promise.all([
+    given !== undefined ? given : lotsOfLines(db, companyId, [line.id]).then((m) => m.get(line.id)),
+    givenMarks !== undefined ? givenMarks : untrackedOfLine(db, companyId, line.id),
+  ]);
+  if (!every?.size && !marks?.size) return new Map();
   // A bar lot (section nesting, CF_ERP_CUT_FROM_PLAN §4.3) is one stock bar;
   // its cut sections share it by the LENGTH placed on it (barMaterial). Plate
   // lots go through the rule below exactly as they always have.
-  const bars = [...every.values()].filter((l) => l.kind === 'bar');
-  const lots = new Map([...every].filter(([, l]) => l.kind !== 'bar'));
+  const bars = [...(every?.values() ?? [])].filter((l) => l.kind === 'bar');
+  const lots = new Map([...(every ?? [])].filter(([, l]) => l.kind !== 'bar'));
   const barPlaced = barMaterial(plan, nodes, bars);
-  if (!lots.size) return barPlaced;
-  const placedPlates = plateMaterial(plan, nodes, lots);
+  if (!lots.size && !marks?.size) return barPlaced;
+  const placedPlates = plateMaterial(plan, nodes, lots, marks);
   for (const [cp, n] of barPlaced) placedPlates.set(cp, (placedPlates.get(cp) ?? 0) + n);
   return placedPlates;
 }
 
-/** nestMaterial's plate rule: one whole plate per catalog lot, at its nest group's gate. Returns Map(cutPlateId -> pieces on the nest). */
-function plateMaterial(plan, nodes, lots) {
+/**
+ * nestMaterial's plate rule: one whole plate per catalog lot, at its nest group's gate. Returns
+ * Map(cutPlateId -> pieces COVERED: on the nest, or cut from untracked offcuts).
+ *
+ * §61 CUT FROM UNTRACKED OFFCUTS (`marks`, lib/nestUntracked): a piece the line marked as cut from a
+ * loose offcut in the yard has no plate and asks for none — no requirement, no reservation, nothing
+ * issued, no heat number — and does not stop release. A cut plate is covered when its pieces on the
+ * nest and its marked pieces (never more than it still needs: min(marked, made − nested)) add up to
+ * what the line makes; its own raw-plate line then makes no requirement, exactly as for a nested one.
+ * Exported, pure, for the suites.
+ */
+export function plateMaterial(plan, nodes, lots, marks = null) {
   const placed = new Map();                        // cutPlateId -> pieces on the nest
   const lotPlates = new Set();
   for (const lot of lots.values()) {
     lotPlates.add(Number(lot.plateItemId));
     for (const [cp, n] of lot.byCutPlate) placed.set(cp, (placed.get(cp) ?? 0) + n);
   }
+  // What the plan makes of every cut plate that is nested OR marked.
+  const madeOf = new Map();
+  if (marks?.size) for (const n of nodes) if (marks.has(Number(n.itemId))) madeOf.set(Number(n.itemId), round6((madeOf.get(Number(n.itemId)) ?? 0) + n.quantity));
+  const marked = effectiveUntracked(marks, madeOf, placed);
+  const covered = new Map(placed);                 // cutPlateId -> pieces on the nest + marked
+  for (const [cp, q] of marked) {
+    // A cut plate on no plate counts as covered only when EVERY piece of it is marked; a part-marked
+    // one is still a cut plate with no plate for the rest (openPlateProblem / its own plate line).
+    if (!placed.has(cp) && Math.abs((madeOf.get(cp) ?? 0) - q) > EPS) continue;
+    covered.set(cp, (covered.get(cp) ?? 0) + q);
+  }
   const first = new Map();                         // cutPlateId -> first node k
   const need = new Map();                          // cutPlateId -> pieces the plan makes
   for (const n of nodes) {
-    if (!placed.has(Number(n.itemId))) continue;
+    if (!covered.has(Number(n.itemId))) continue;
     if (!first.has(Number(n.itemId))) first.set(Number(n.itemId), n.k);
     need.set(Number(n.itemId), round6((need.get(Number(n.itemId)) ?? 0) + n.quantity));
   }
   const nameOfItem = (id) => nodes[first.get(id)]?.design?.code ?? nodes[first.get(id)]?.design?.name ?? `cut plate ${id}`;
   for (const [cp, n] of placed) {
     const want = need.get(cp) ?? 0;
-    if (Math.abs(want - n) > EPS) {
+    if (Math.abs(want - n - (marked.get(cp) ?? 0)) > EPS) {
       plan.problems.push(want
-        ? `${nameOfItem(cp)}: the line makes ${fmt(want)} but the saved nest lays out ${fmt(n)} — nest the line again, so the plates bought are the plates cut.`
+        ? `${nameOfItem(cp)}: the line makes ${fmt(want)} but the saved nest lays out ${fmt(n)}${marked.get(cp) ? ` and ${fmt(marked.get(cp))} ${marked.get(cp) === 1 ? 'is' : 'are'} cut from untracked offcuts` : ''} — nest the line again (or mark the rest as cut from offcuts), so the plates bought are the plates cut.`
         : `The saved nest lays out ${fmt(n)} of cut plate ${cp}, which this line no longer makes — nest the line again, so the plates bought are the plates cut.`);
     }
   }
@@ -573,9 +599,16 @@ function plateMaterial(plan, nodes, lots) {
       lot: { id: lot.id, lotNo: lot.lotNo },
     });
   }
-  // A cut plate's own raw-plate line, now that the nest says which plates.
-  const isPlateLine = (r) => r.nodeK != null && placed.has(Number(nodes[r.nodeK].itemId))
-    && (r.design?.selection != null || lotPlates.has(Number(r.itemId)));
+  // A cut plate's own raw-plate line, now that the nest says which plates. §61: a cut plate on NO
+  // plate whose every piece is cut from untracked offcuts asks for nothing at all — its BOM is its raw
+  // plate (cutPlateService writes it so), whatever that line points at now.
+  const isPlateLine = (r) => {
+    if (r.nodeK == null) return false;
+    const id = Number(nodes[r.nodeK].itemId);
+    if (!covered.has(id)) return false;
+    if (!placed.has(id)) return true;
+    return r.design?.selection != null || lotPlates.has(Number(r.itemId));
+  };
   // Each lot's requirement takes the place of its gate's plate line, so the
   // material list keeps the tree's order; any left over go at the end.
   const reqs = [];
@@ -586,7 +619,7 @@ function plateMaterial(plan, nodes, lots) {
   }
   for (const k of [...byGate.keys()].sort((a, b) => a - b)) reqs.push(...byGate.get(k));
   plan.reqs = reqs;
-  return placed;
+  return covered;
 }
 
 /**
@@ -776,7 +809,7 @@ async function planFor(db, companyId, line, { ensure = null } = {}) {
  *   reqs        [{ nodeK, itemId, bomLineId, quantity, design }] — release's shape
  *   openPlates  cut plates with no plate yet: still the selection, not on the nest
  *   ready       no such cut plate — the line's material is known and can be bought
- * Round trips: 3 for any number of lines (pieces, BOM lines, plate lots); 0 for none.
+ * Round trips: 3 for any number of lines (pieces, BOM lines, plate lots + the §61 marks beside them); 0 for none.
  */
 export async function plannedMaterialOfLines(db, companyId, lines) {
   const out = new Map();
@@ -810,7 +843,8 @@ export async function plannedMaterialOfLines(db, companyId, lines) {
     if (!bomOf.has(Number(r.parent_id))) bomOf.set(Number(r.parent_id), []);
     bomOf.get(Number(r.parent_id)).push(r);
   }
-  const lotsBy = await lotsOfLines(db, companyId, lineIds);
+  // §61: the lines' marks (cut from untracked offcuts) — one read beside the lots.
+  const [lotsBy, marksBy] = await Promise.all([lotsOfLines(db, companyId, lineIds), untrackedOf(db, companyId, lineIds)]);
 
   const piecesBy = new Map(lineIds.map((id) => [id, []]));
   for (const p of pieces) piecesBy.get(Number(p.order_line_id))?.push(p);
@@ -860,7 +894,7 @@ export async function plannedMaterialOfLines(db, companyId, lines) {
     for (const k of roots) visit(k);
     const plan = { nodes, reqs, problems: [], openPlates };
     const lots = lotsBy.get(Number(line.id)) ?? null;
-    const placed = await nestMaterial(db, companyId, line, plan, { lots });
+    const placed = await nestMaterial(db, companyId, line, plan, { lots, untracked: marksBy.get(Number(line.id)) ?? new Map() });
     const cutSections = new Set(nodes.filter((n) => n.isCutSection).map((n) => n.itemId));
     if (cutSections.size) roundUpSectionBars(plan, (id) => cutSections.has(id), placed);
     // A lot's requirement is made by nestMaterial; the buy list also wants how its plate is tracked.
@@ -959,9 +993,15 @@ async function codedPreview(db, companyId, line) {
     // A frozen line whose cut plates wait for nesting says so, as release would.
     // The lots are read only when there is such a cut plate at all.
     if (plan.openPlates?.length) {
-      const lots = (await lotsOfLines(db, companyId, [line.id])).get(line.id);
+      const [lots, marks] = await Promise.all([lotsOfLines(db, companyId, [line.id]).then((m) => m.get(line.id)), untrackedOfLine(db, companyId, line.id)]);
       const placed = new Map();
       for (const lot of lots?.values() ?? []) for (const [cp, n] of lot.byCutPlate) placed.set(cp, (placed.get(cp) ?? 0) + n);
+      // §61: a cut plate whose every piece left is cut from untracked offcuts has what it needs.
+      const madeOf = new Map();
+      for (const n of nodes) if (marks.has(Number(n.itemId))) madeOf.set(Number(n.itemId), (madeOf.get(Number(n.itemId)) ?? 0) + Number(n.quantity));
+      for (const [cp, q] of effectiveUntracked(marks, madeOf, placed)) {
+        if ((placed.get(cp) ?? 0) + q >= (madeOf.get(cp) ?? 0) - EPS) placed.set(cp, (placed.get(cp) ?? 0) + q);
+      }
       const open = openPlateProblem(plan, placed);
       if (open) plan.problems.push(open);
     }

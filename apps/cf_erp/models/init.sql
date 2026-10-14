@@ -5391,3 +5391,49 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME IN ('uq_cof_catalog_code', 'uq_cof_owner_source')) = 2
       AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_operation_flows' AND INDEX_NAME = 'uq_cof_code') = 0,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §61  Cut pieces cut from UNTRACKED OFFCUTS (2026-10-14) — the same text as TM/s61.sql
+-- Additive and guarded: safe to re-run. Service: services/nestUntrackedService.js; read by lib/nestUntracked.js.
+--
+-- User, 2026-10-14: after the ProNest upload ~180 pieces are left over — packings and small plates the shop
+-- cuts from loose offcuts in the yard that are NOT in the system. They are marked here, per order line and cut
+-- piece, with how many: no plate, no lot, no placement. A marked piece is not "left over", is not nested by our
+-- packer, asks release for no plate and needs no heat number. Its steel is charged at the plate rate per kg of
+-- the catalog plate named in rate_plate_item_id (the plate of the same steel the line would buy, chosen when
+-- it is marked); it adds no plate and no waste to any figure. A later upload that nests such a piece covers it
+-- and the mark shrinks (the upload writes the smaller quantity, and says so). Undo = deleted_at.
+--
+-- quantity            pieces of that cut piece marked. Readers never count more than the line still needs
+--                     after what is nested (min(quantity, needed - nested)).
+-- rate_plate_item_id  the catalog plate whose rate (per kg) prices these pieces. NULL = no plate of that steel.
+-- uq_cnu_piece        one row per line and cut piece, live or not: marking again revives the row.
+CREATE TABLE IF NOT EXISTS cf_nest_untracked (
+  id                  INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT        NOT NULL,
+  order_line_id       INT        NOT NULL,
+  cut_plate_id        INT        NOT NULL,
+  quantity            INT        NOT NULL DEFAULT 0,
+  rate_plate_item_id  INT        NULL,
+
+  deleted_at          DATETIME   DEFAULT NULL,
+  created_at          TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP  DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT        NULL,
+  updated_by          INT        NULL,
+
+  UNIQUE KEY uq_cnu_tenant (company_id, id),
+  UNIQUE KEY uq_cnu_piece (company_id, order_line_id, cut_plate_id),
+
+  CONSTRAINT fk_cnu_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cnu_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cnu_cut     FOREIGN KEY (company_id, cut_plate_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cnu_plate   FOREIGN KEY (company_id, rate_plate_item_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cnu_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_cnu_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_untracked'
+             AND COLUMN_NAME IN ('company_id', 'order_line_id', 'cut_plate_id', 'quantity', 'rate_plate_item_id', 'deleted_at')) = 6
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_untracked'
+             AND INDEX_NAME IN ('uq_cnu_tenant', 'uq_cnu_piece')) = 2,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

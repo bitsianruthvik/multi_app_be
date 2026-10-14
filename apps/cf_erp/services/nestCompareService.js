@@ -38,6 +38,7 @@ import {
 } from './nestingService.js';
 import { savedLotsOf, coverageOfLots, isUploadedPiece, measureSavedLots } from './nestDxfImportService.js';
 import { drawingFactsOfLine } from './partDrawingService.js';
+import { untrackedOfLine } from '../lib/nestUntracked.js';
 import { cutsOfLotsAsync } from './plateCutsService.js';
 import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 import { shapeOfCutPlate } from './nestShapes.js';
@@ -229,7 +230,7 @@ const describeRun = (row) => (row ? {
  */
 async function compareState(db, companyId, lineId) {
   const ctx = await importContext(db, companyId, lineId);
-  const [saved, facts, excl] = await Promise.all([savedLotsOf(db, companyId, lineId), drawingFactsOfLine(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId)]);
+  const [saved, facts, excl, untracked] = await Promise.all([savedLotsOf(db, companyId, lineId), drawingFactsOfLine(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId), untrackedOfLine(db, companyId, lineId)]);
   const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
   const shapes = new Map();
   const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
@@ -245,7 +246,7 @@ async function compareState(db, companyId, lineId) {
   let demandSubset = null; let demandLine = null; let demandError = null;
   try {
     assertFrozen(ctx.line);
-    const args = { line: ctx.line, needed: ctx.cutPlates, everyPlate: ctx.plates, settingRows: ctx.settingRows, excl, facts };
+    const args = { line: ctx.line, needed: ctx.cutPlates, everyPlate: ctx.plates, settingRows: ctx.settingRows, excl, facts, untracked };
     demandLine = demandFor({ ...args, replaceImported: true });
     demandSubset = Object.keys(only).length ? demandFor({ ...args, only }) : null;
   } catch (e) { demandError = { code: e?.code ?? 'INVALID', message: e?.message ?? String(e) }; }
@@ -267,7 +268,7 @@ async function compareState(db, companyId, lineId) {
   // A finished run of ANOTHER demand: what "stale" means.
   const stale = rows.find((r) => USABLE.has(r.status) && r.demand_hash && r.demand_hash !== demandSubset?.hash && r.demand_hash !== demandLine?.hash) ?? null;
   const failed = rows.find((r) => r.status === 'failed') ?? null;
-  return { ctx, saved, facts, excl, cpById, mctx, uploadedLots, subset, only, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed };
+  return { ctx, saved, facts, excl, untracked, cpById, mctx, uploadedLots, subset, only, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed };
 }
 
 async function plansOf(db, companyId, rowIds) {
@@ -408,7 +409,7 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
   const upPieces = [...want.values()].reduce((a, b) => a + b, 0);
   const overNested = [...st.subset].filter(([id, q]) => q > (st.cpById.get(id)?.pieces ?? 0)).map(([id, q]) => ({ cutPlateId: id, cutPlateCode: st.cpById.get(id)?.code ?? `#${id}`, uploaded: q, needed: st.cpById.get(id)?.pieces ?? 0 }));
 
-  const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, st.saved, st.excl);
+  const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, st.saved, st.excl, st.untracked);
   const lineSide = st.rowLine && planLine ? await sideOf(st.rowLine, planLine, lineNests) : null;
   const savedSide = await measure(savedNests);
   const { delta, verdict } = judge(uploaded?.metrics ?? null, autoSide?.metrics ?? null);
@@ -554,7 +555,7 @@ export async function acceptCompare(db, c, lineId, input = {}) {
   const accepted = await acceptNesting(db, c, lineId, { ...plan, replaceImported: true });
   await db.query("UPDATE cf_nest_runs SET status = 'accepted' WHERE company_id = ? AND id IN (?)", [companyId, [...new Set([...rows.map((r) => r.id), whole.id])]]);
   const after = await savedLotsOf(db, companyId, lineId);
-  const { leftOver } = coverageOfLots(st.ctx.cutPlates, after, st.excl);
+  const { leftOver } = coverageOfLots(st.ctx.cutPlates, after, st.excl, st.untracked);
   return {
     decision: 'auto', runId: String(input.runId), accepted,
     // uploadedPlates / plates as before; the rest (2026-10-10) says everything that went, in numbers.

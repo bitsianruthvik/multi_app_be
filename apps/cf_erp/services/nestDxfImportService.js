@@ -104,6 +104,7 @@ import {
 import { measurePlates } from './nestMeasure.js';
 import { memoryRun } from './nestRunService.js';
 import { missingPlatesOf } from './nestPlateCatalogService.js';
+import { untrackedOfLine, effectiveUntracked, shrunkUntracked } from '../lib/nestUntracked.js';
 
 export { savedLotsOf, isUploadedPiece };
 import {
@@ -168,13 +169,19 @@ function countsOn(lots) {
 
 /**
  * Needed against nested, cut plate by cut plate — and what is LEFT OVER, exactly.
- *   coverage  [{ cutPlateId, cutPlateCode, needed, nested, customer, ours, diff, manual, leftOut }]
+ *   coverage  [{ cutPlateId, cutPlateCode, needed, nested, customer, ours, diff, manual, leftOut, untracked }]
  *   leftOver  [{ cutPlateId, cutPlateCode, qty, thickness, length, width, grade, manual, leftOut }]
+ *   untracked [{ cutPlateId, cutPlateCode, qty, marked }] — §61, pieces marked as cut from untracked
+ *             offcuts that still count (`marked` = what the mark holds; `qty` = min(marked, needed − nested))
+ * `marks` (§61): the line's marks (lib/nestUntracked untrackedOfLine). A marked piece is not left over.
  */
-export function coverageOfLots(cutPlates, lots, excl = null) {
+export function coverageOfLots(cutPlates, lots, excl = null, marks = null) {
   const counts = countsOn(lots);
+  const nestedOf = (id) => { const c = counts.get(id); return c ? c.customer + c.ours : 0; };
+  const counted = effectiveUntracked(marks, new Map(cutPlates.map((cp) => [cp.id, cp.pieces])), nestedOf);
   const coverage = [];
   const leftOver = [];
+  const untracked = [];
   const seen = new Set();
   for (const cp of cutPlates) {
     seen.add(cp.id);
@@ -182,10 +189,12 @@ export function coverageOfLots(cutPlates, lots, excl = null) {
     const nested = c.customer + c.ours;
     if (!cp.pieces && !nested) continue;
     const leftOut = !!excl?.cutPlates?.has(cp.id);
-    coverage.push({ cutPlateId: cp.id, cutPlateCode: cp.code ?? `#${cp.id}`, needed: cp.pieces, nested, customer: c.customer, ours: c.ours, diff: nested - cp.pieces, manual: !!cp.manual, leftOut });
-    if (nested < cp.pieces) {
+    const marked = counted.get(cp.id) ?? 0;
+    coverage.push({ cutPlateId: cp.id, cutPlateCode: cp.code ?? `#${cp.id}`, needed: cp.pieces, nested, customer: c.customer, ours: c.ours, diff: nested - cp.pieces, manual: !!cp.manual, leftOut, untracked: marked });
+    if (marked) untracked.push({ cutPlateId: cp.id, cutPlateCode: cp.code ?? `#${cp.id}`, qty: marked, marked: Number(marks.get(cp.id)?.qty ?? marked) });
+    if (nested + marked < cp.pieces) {
       leftOver.push({
-        cutPlateId: cp.id, cutPlateCode: cp.code ?? `#${cp.id}`, qty: cp.pieces - nested,
+        cutPlateId: cp.id, cutPlateCode: cp.code ?? `#${cp.id}`, qty: cp.pieces - nested - marked,
         thickness: cp.steel?.thickness ?? null, length: cp.steel?.length ?? null, width: cp.steel?.width ?? null, grade: cp.steel?.grade ?? null,
         manual: !!cp.manual, leftOut,
       });
@@ -193,9 +202,9 @@ export function coverageOfLots(cutPlates, lots, excl = null) {
   }
   for (const [id, c] of counts) {
     if (seen.has(id)) continue;                    // a piece of a cut plate the line no longer has
-    coverage.push({ cutPlateId: id, cutPlateCode: `#${id}`, needed: 0, nested: c.customer + c.ours, customer: c.customer, ours: c.ours, diff: c.customer + c.ours, manual: false, leftOut: false });
+    coverage.push({ cutPlateId: id, cutPlateCode: `#${id}`, needed: 0, nested: c.customer + c.ours, customer: c.customer, ours: c.ours, diff: c.customer + c.ours, manual: false, leftOut: false, untracked: 0 });
   }
-  return { coverage, leftOver };
+  return { coverage, leftOver, untracked };
 }
 
 /* ───────────────────────────── reading the request ───────────────────────────── */
@@ -1256,7 +1265,7 @@ function jobSummaries(jobs, entries, tables = null) {
  * beside the cut piece (2026-10-14). Two reads, whatever the size.
  * → [{ cutPlateId, code, name, mark }]
  */
-async function rowsCutFrom(db, companyId, cutPlateIds) {
+export async function rowsCutFrom(db, companyId, cutPlateIds) {
   if (!cutPlateIds.length) return [];
   const [parents] = await db.query(
     `SELECT bl.child_id AS cut_plate_id, m.id, m.code, m.name
@@ -1281,11 +1290,12 @@ async function rowsCutFrom(db, companyId, cutPlateIds) {
 /** Everything an upload is checked against, read once (a fixed number of round trips). */
 async function uploadContext(db, companyId, lineId) {
   const ctx = await importContext(db, companyId, lineId);
-  const [facts, rows, saved, excl] = await Promise.all([
+  const [facts, rows, saved, excl, untracked] = await Promise.all([
     drawingFactsOfLine(db, companyId, lineId),
     rowsCutFrom(db, companyId, ctx.cutPlates.map((cp) => cp.id)),
     savedLotsOf(db, companyId, lineId),
     exclusionsOfLine(db, companyId, lineId),
+    untrackedOfLine(db, companyId, lineId),
   ]);
   const [bars] = await db.query("SELECT lot_no FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'bar'", [companyId, lineId]);
   // A cut plate answers to its own code, and to the drawing mark and item code of every row cut from it.
@@ -1303,7 +1313,7 @@ async function uploadContext(db, companyId, lineId) {
   const usable = ctx.cutPlates.filter((cp) => cp.steel?.length > 0 && cp.steel?.width > 0 && cp.steel?.thickness > 0);
   const candidates = usable.map((cp) => { const s = shapeOf(cp); return { key: `cp${cp.id}`, codes: [...codes.get(cp.id)], rings: s.drawn ? s.rings : null, length: cp.steel.length, width: cp.steel.width }; });
   return {
-    ...ctx, facts, saved, excl, candidates, shapeOf,
+    ...ctx, facts, saved, excl, untracked, candidates, shapeOf,
     partsOf: new Map([...partsOf].map(([id, m]) => [id, [...m.values()].sort((a, b) => String(a.name ?? a.mark).localeCompare(String(b.name ?? b.mark)))])),
     // Every size a catalog plate comes in: what tells the reader a plate from the drawing frame round it.
     plateSizes: ctx.plates.filter((p) => p.steel?.length > 0 && p.steel?.width > 0).map((p) => ({ length: p.steel.length, width: p.steel.width })),
@@ -1518,7 +1528,17 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     ...kept.filter((l) => !dropLots.has(l.id)).map((l) => (rewrite.has(l.id) ? { ...l, pieces: rewrite.get(l.id).pieces } : l)),
     ...fresh.map((e) => ({ id: null, lotNo: e.lotNo, origin: 'imported', layoutOrigin: 'customer', plateItemId: e._lot.plate.id, plateCode: e._lot.plate.code, length: e._lot.lengthMm, width: e._lot.widthMm, pieces: e._lot.pieces })),
   ];
-  const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, finalLots, ctx.excl);
+  const { coverage, leftOver, untracked } = coverageOfLots(ctx.cutPlates, finalLots, ctx.excl, ctx.untracked);
+  // §61: a piece marked as cut from untracked offcuts that these files nest is COVERED by them — the
+  // mark shrinks (the save writes the smaller number). Said, never silent.
+  const shrinks = shrunkUntracked(ctx.untracked, new Map(untracked.map((u) => [u.cutPlateId, u.qty])))
+    .map((s) => ({ ...s, cutPlateCode: codeOf(s.cutPlateId) }));
+  const untrackedOut = {
+    pieces: untracked.reduce((a, u) => a + u.qty, 0),
+    cutPieces: untracked.length,
+    shrinks,
+    message: shrinks.length ? untrackedShrinkSentence(shrinks) : null,
+  };
 
   // The plates a nest is cut on say the same thing in the same words: each is said once.
   const once = new Set();
@@ -1547,6 +1567,7 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   if (surplus.length) say.push(`${plural(surplus.length, 'cut plate is', 'cut plates are')} nested more often than the line needs`);
   const leftPieces = leftOver.filter((x) => !x.manual && !x.leftOut).reduce((a, x) => a + x.qty, 0);
   if (leftPieces) say.push(`${plural(leftPieces, 'piece is', 'pieces are')} left over — nest the rest afterwards`);
+  if (shrinks.length) say.push(untrackedOut.message.replace(/\.$/, ''));
 
   const out = {
     line: lineHead(ctx.line), dryRun, applied: false, mode, canSave, needsForce, engine: VERIFY_ENGINE,
@@ -1558,6 +1579,8 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     problems: problems.map((p) => p.message), problemList: problems,
     warnings: warnings.map((w) => w.message), warningList: warnings,
     diff, coverage, leftOver, surplus,
+    // §61: pieces marked as cut from untracked offcuts after this upload, and the marks it shrinks.
+    untracked: untrackedOut,
     // Every cut piece of the line, once, with the parts it is cut for: how the review names a cut piece (no extra read).
     cutPieces: ctx.cutPlates.map((cp) => ({
       cutPlateId: cp.id, code: cp.code, name: cp.name ?? null,
@@ -1566,7 +1589,7 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     })),
     // Plates these files are cut on that are not catalog items ([] when every plate was found): POST …/nesting/plates adds them.
     missingPlates,
-    totals: totalsOfLots(finalLots, leftOver),
+    totals: totalsOfLots(finalLots, leftOver, untracked),
     message: `${say.join('; ') || 'Nothing to do'}.`,
   };
   if (dryRun || !canSave) return out;
@@ -1577,6 +1600,8 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     fresh, removeIds: [...goneIds, ...dropLots.keys(), ...rewrite.keys()], rewrite: [...rewrite.values()], clashing, files, keep: kept.filter((l) => !dropLots.has(l.id) && !rewrite.has(l.id)),
     forced: needsForce,
   });
+  // §61: the marks these files cover shrink — written, so the costs read what the screen says.
+  await writeUntrackedShrinks(db, c, lineId, shrinks);
   diff.renumbered = saved2.renumbered;
   const lotIds = new Map(saved2.written.map((w) => [String(w.lotNo).toUpperCase(), w.id]));
   return {
@@ -1587,7 +1612,29 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   };
 }
 
-function totalsOfLots(lots, leftOver) {
+/** "3 pieces marked as cut from untracked offcuts are nested in these files now — the marks drop to 7 (NF-CP 10 → 7)." */
+function untrackedShrinkSentence(shrinks) {
+  const covered = shrinks.reduce((a, s) => a + s.was - s.now, 0);
+  const each = shrinks.slice(0, 6).map((s) => `${s.cutPlateCode} ${s.was} → ${s.now}`).join(', ');
+  const more = shrinks.length > 6 ? ` and ${shrinks.length - 6} more` : '';
+  return `${plural(covered, 'piece marked as cut from untracked offcuts is', 'pieces marked as cut from untracked offcuts are')} nested in these files now, so the mark shrinks (${each}${more}).`;
+}
+
+/** §61: the marks an upload covers, made smaller (0 = undone). One statement. */
+async function writeUntrackedShrinks(db, c, lineId, shrinks) {
+  if (!shrinks.length) return;
+  const ids = shrinks.map((s) => s.cutPlateId);
+  await db.query(
+    `UPDATE cf_nest_untracked
+        SET quantity = CASE cut_plate_id ${shrinks.map(() => 'WHEN ? THEN ?').join(' ')} ELSE quantity END,
+            deleted_at = CASE WHEN (CASE cut_plate_id ${shrinks.map(() => 'WHEN ? THEN ?').join(' ')} ELSE quantity END) <= 0 THEN NOW() ELSE deleted_at END,
+            updated_by = ?
+      WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND cut_plate_id IN (?)`,
+    [...shrinks.flatMap((s) => [s.cutPlateId, s.now]), ...shrinks.flatMap((s) => [s.cutPlateId, s.now]), c.userId ?? null, c.companyId, lineId, ids],
+  );
+}
+
+function totalsOfLots(lots, leftOver, untracked = []) {
   const customerLot = (l) => l.origin === 'imported';
   return {
     plates: lots.length,
@@ -1597,6 +1644,8 @@ function totalsOfLots(lots, leftOver) {
     piecesAddedByUs: lots.filter(customerLot).reduce((a, l) => a + l.pieces.filter((p) => !isUploadedPiece(l, p)).length, 0),
     leftOverPieces: leftOver.reduce((a, x) => a + x.qty, 0),
     leftOverToNest: leftOver.filter((x) => !x.manual && !x.leftOut).reduce((a, x) => a + x.qty, 0),
+    // §61: on no plate, so in no plate figure.
+    untrackedPieces: untracked.reduce((a, x) => a + x.qty, 0),
   };
 }
 
@@ -1750,11 +1799,11 @@ export async function deleteNestLot(db, c, lineId, lotId) {
   const keep = ctx.saved.filter((l) => l.id !== lot.id);
   const res = await applyChanges(db, c, lineId, ctx, { removeIds: [lot.id], keep });
   const codeOf = (id) => ctx.cpById.get(id)?.code ?? `#${id}`;
-  const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, keep, ctx.excl);
+  const { coverage, leftOver, untracked } = coverageOfLots(ctx.cutPlates, keep, ctx.excl, ctx.untracked);
   return {
     line: lineHead(ctx.line), applied: true,
     removed: { lotId: lot.id, lotNo: lot.lotNo, origin: lot.origin, filename: lot.sourceFile, plateCode: lot.plateCode, pieces: lot.pieces.length, parts: tally(lot.pieces, codeOf) },
-    coverage, leftOver, totals: totalsOfLots(keep, leftOver),
+    coverage, leftOver, totals: totalsOfLots(keep, leftOver, untracked),
     saved: { removedLots: res.removed, quantities: res.quantities, cuts: res.cuts },
     message: `${lot.lotNo} is off the line; ${plural(lot.pieces.length, 'piece goes', 'pieces go')} back to be nested.`,
   };
@@ -1765,13 +1814,13 @@ export async function deleteNestLot(db, c, lineId, lotId) {
 /** GET …/nesting/files — the plates saved on the line, the files they came from, and what is left over. */
 export async function getNestFiles(db, companyId, lineId) {
   const ctx = await importContext(db, companyId, lineId);
-  const [saved, excl] = await Promise.all([savedLotsOf(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId)]);
+  const [saved, excl, marks] = await Promise.all([savedLotsOf(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId), untrackedOfLine(db, companyId, lineId)]);
   const fileIds = saved.map((l) => l.nestFileId).filter(Boolean);
   const [files] = fileIds.length ? await db.query('SELECT id, file_name, file_kind, file_hash, byte_size, nest_no, created_at, created_by FROM cf_nest_files WHERE company_id = ? AND id IN (?)', [companyId, fileIds]) : [[]];
   const fileById = new Map(files.map((f) => [f.id, f]));
   const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
   const codeOf = (id) => cpById.get(id)?.code ?? `#${id}`;
-  const { coverage, leftOver } = coverageOfLots(ctx.cutPlates, saved, excl);
+  const { coverage, leftOver, untracked } = coverageOfLots(ctx.cutPlates, saved, excl, marks);
   const blocker = importBlocker(ctx.line);
   return {
     line: lineHead(ctx.line),
@@ -1791,7 +1840,7 @@ export async function getNestFiles(db, companyId, lineId) {
         verdict: l.verdict, forced: l.forced, warnings: l.reasons,
       };
     }),
-    coverage, leftOver, totals: totalsOfLots(saved, leftOver),
+    coverage, leftOver, untracked, totals: totalsOfLots(saved, leftOver, untracked),
   };
 }
 

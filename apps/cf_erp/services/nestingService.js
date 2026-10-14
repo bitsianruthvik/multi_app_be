@@ -98,6 +98,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
+import { untrackedOf, untrackedOfLine, effectiveUntracked } from '../lib/nestUntracked.js';
 import { explode } from './bomService.js';
 import { runAll, pickBest, seedsFor } from '../lib/packerPool.js';
 import { analyseNest } from './nestGeometry.js';
@@ -823,6 +824,8 @@ export function layoutDrift(cutPlates, placed, codes = new Map()) {
     if (cp.manual || cp.leftOut) continue;
     const needs = cp.pieces ?? 0;
     const got = placed.get(cp.id) ?? 0;
+    // §61: pieces marked as cut from untracked offcuts (cp.untracked, held to what is left) need no plate.
+    if (got < needs && got + (cp.untracked ?? 0) >= needs) continue;
     if (got !== needs) drift.push({ cutPlateId: cp.id, code: cp.code ?? null, needs, placed: got, why: got === 0 ? 'unplaced' : 'count' });
   }
   for (const [id, got] of placed) {
@@ -852,12 +855,14 @@ export function driftSentence(drift) {
  * layout is left out: it is not nested, which is not the same as out of date.
  * Returns Map(lineId -> drift[]).
  */
-export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOut = null } = {}) {
+export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOut = null, untracked = null } = {}) {
   const out = new Map();
   if (!lineIds.length) return out;
   // What each line's nesting choices leave out (§40): exempt from drift, and
   // counted into `leftOut` (Map lineId -> { cutPlates, pieces }) when asked.
-  const exclBy = await exclusionsOf(db, companyId, lineIds);
+  // §61: pieces marked as cut from untracked offcuts are not drift either — counted into `untracked`
+  // (Map lineId -> { cutPlates, pieces }) when asked.
+  const [exclBy, marksBy] = await Promise.all([exclusionsOf(db, companyId, lineIds), untrackedOf(db, companyId, lineIds)]);
   // The code of a cut plate that has since been deleted still names what was laid out.
   const [placedRows] = await db.query(
     `SELECT pl.order_line_id, np.cut_plate_id, COUNT(*) AS pieces, MAX(m.code) AS code
@@ -901,6 +906,9 @@ export async function layoutDriftOfLines(db, companyId, lineIds, trees, { leftOu
       const gone = cutPlates.filter((cp) => cp.leftOut && cp.pieces > 0 && !cp.manual);
       if (gone.length) leftOut.set(lineId, { cutPlates: gone.length, pieces: gone.reduce((a, cp) => a + cp.pieces, 0) });
     }
+    const marked = effectiveUntracked(marksBy.get(lineId), new Map(cutPlates.map((cp) => [cp.id, cp.pieces])), placedBy.get(lineId));
+    for (const cp of cutPlates) if (marked.has(cp.id)) cp.untracked = marked.get(cp.id);
+    if (untracked && marked.size) untracked.set(lineId, { cutPlates: marked.size, pieces: [...marked.values()].reduce((a, q) => a + q, 0) });
     out.set(lineId, layoutDrift(cutPlates, placedBy.get(lineId), codes));
   }
   return out;
@@ -1046,11 +1054,14 @@ export const LEFT_OUT_NOTE = 'Left out of this line\'s nesting (Nesting › Piec
 export async function nestingChoices(db, companyId, orderLineId) {
   const line = await requireLine(db, companyId, orderLineId);
   const { where, cutPlates } = await surveyLine(db, companyId, line);
-  const [plates, imported, excl] = await Promise.all([
+  const [plates, imported, excl, marks] = await Promise.all([
     candidatePlates(db, companyId, where.plateIds),
     importedLotsOf(db, companyId, orderLineId),
     exclusionsOfLine(db, companyId, orderLineId),
+    untrackedOfLine(db, companyId, orderLineId),
   ]);
+  // §61: pieces marked as cut from untracked offcuts are not to nest.
+  const marked = untrackedDemand(cutPlates, marks, imported.counts);
   const settingRows = await cutSettingRows(db, companyId);
 
   // The pieces, grouped the way the packer groups them.
@@ -1059,18 +1070,20 @@ export async function nestingChoices(db, companyId, orderLineId) {
   for (const cp of cutPlates) {
     if (!cp.pieces) continue;
     const onImported = imported.counts.get(cp.id) ?? 0;
-    const toNest = Math.max(0, cp.pieces - onImported);
+    const untracked = marked.get(cp.id) ?? 0;
+    const toNest = Math.max(0, cp.pieces - onImported - untracked);
     const kgEach = pieceKg(cp.steel);
     const row = {
       cutPlateId: cp.id, code: cp.code, name: cp.name,
       thickness: cp.steel.thickness, length: cp.steel.length, width: cp.steel.width,
       grade: cp.steel.grade, material: cp.steel.material,
-      pieces: cp.pieces, onImported, toNest,
+      pieces: cp.pieces, onImported, untracked, toNest,
       kgEach, kg: kgEach == null ? null : round3(kgEach * toNest),
       manual: cp.manual, excluded: excl.cutPlates.has(cp.id),
       note: cp.manual
         ? `${NEST_MANUAL_SPEC_CODE} is set on this cut piece, so automatic nesting always leaves it out — clear it under "Leave out of automatic nesting" to nest it.`
-        : (toNest === 0 && onImported ? 'Every piece of it is already on imported nests.' : null),
+        : (toNest === 0 && untracked ? (onImported ? 'Every piece of it is on imported nests or cut from untracked offcuts.' : 'Every piece of it is cut from untracked offcuts.')
+          : toNest === 0 && onImported ? 'Every piece of it is already on imported nests.' : null),
     };
     const gone = missingOnPart(cp.steel);
     if (gone.length) { unusable.push({ ...row, missing: gone, reason: `It does not say its ${list(gone.map((g) => g.toLowerCase()))}, so it cannot be nested.` }); continue; }
@@ -1433,7 +1446,8 @@ export async function customerPlates(db, companyId, orderId, plateIds) {
 
 export const agrees = (plateValue, groupValue) => plateValue == null || norm(plateValue) === norm(groupValue);
 
-function sheetsFor(plates, group) {
+/** The catalog plates a steel (thickness, grade, material) may be cut from — the packer's own candidates. */
+export function sheetsFor(plates, group) {
   return plates.filter((p) =>
     p.steel.thickness != null
     && Math.abs(p.steel.thickness - group.thickness) <= EPS
@@ -1534,7 +1548,10 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // applied to every run. `ignoreChoices: true` plans as if none were made.
   const excl = input.ignoreChoices === true ? emptyExclusions() : await exclusionsOfLine(db, companyId, orderLineId);
   if (only) excl.cutPlates = new Set();
-  const cutPlates = demandedCutPlates(needed, { only, importedCounts: imported.counts });
+  // §61: pieces marked as cut from untracked offcuts are not demand either — on every run but `only`
+  // (the comparison's like-for-like subset), and also when the whole line is planned again.
+  const untracked = only ? new Map() : untrackedDemand(needed, await untrackedOfLine(db, companyId, orderLineId), imported.counts);
+  const cutPlates = demandedCutPlates(needed, { only, importedCounts: imported.counts, untracked });
 
   const seedsTried = [];
   const { nestable, manual, leftOut, problems } = selectNestable(cutPlates, excl);
@@ -2076,10 +2093,19 @@ function onlyMap(only) {
  * needs, and a piece held back by hand is nested like any other), else what the line needs less
  * what already sits on imported lots.
  */
-function demandedCutPlates(needed, { only = null, importedCounts = new Map() } = {}) {
+function demandedCutPlates(needed, { only = null, importedCounts = new Map(), untracked = new Map() } = {}) {
   return only
     ? needed.map((cp) => ({ ...cp, pieces: Math.min(cp.pieces, only.get(cp.id) ?? 0), manual: false }))
-    : needed.map((cp) => ({ ...cp, pieces: Math.max(0, cp.pieces - (importedCounts.get(cp.id) ?? 0)) }));
+    : needed.map((cp) => ({ ...cp, pieces: Math.max(0, cp.pieces - (importedCounts.get(cp.id) ?? 0) - (untracked.get(cp.id) ?? 0)) }));
+}
+
+/**
+ * §61: the pieces of each cut plate marked as cut from untracked offcuts that a run is NOT asked for —
+ * never more than the line needs less what the imported plates (which stay) already hold.
+ * Map(cutPlateId -> pieces). `stored` is untrackedOfLine's Map.
+ */
+export function untrackedDemand(needed, stored, importedCounts = new Map()) {
+  return effectiveUntracked(stored, new Map(needed.map((cp) => [cp.id, cp.pieces])), importedCounts);
 }
 
 /**
@@ -2115,10 +2141,13 @@ function selectNestable(cutPlates, excl) {
  *   everyPlate    candidatePlates() — every active catalog plate
  *   excl          exclusionsOf the line; only / importedCounts / replaceImported as planNesting's input
  */
-export function demandFor({ line, needed, everyPlate, settingRows, excl, facts, only = null, importedCounts = new Map(), replaceImported = false, guillotine = null }) {
+export function demandFor({ line, needed, everyPlate, settingRows, excl, facts, only = null, importedCounts = new Map(), replaceImported = false, guillotine = null, untracked = null }) {
   const pick = onlyMap(only);
   const choices = { cutPlates: pick ? new Set() : new Set(excl?.cutPlates ?? []), plates: new Set(excl?.plates ?? []) };
-  const cutPlates = demandedCutPlates(needed, { only: pick, importedCounts: replaceImported || pick ? new Map() : importedCounts });
+  const counts = replaceImported || pick ? new Map() : importedCounts;
+  // §61 `untracked`: the line's marks (untrackedOfLine), taken off exactly as planNesting takes them off.
+  const marked = pick || !untracked ? new Map() : untrackedDemand(needed, untracked, counts);
+  const cutPlates = demandedCutPlates(needed, { only: pick, importedCounts: counts, untracked: marked });
   const { nestable } = selectNestable(cutPlates, choices);
   return demandOf({ nestable, settingRows, plates: everyPlate.filter(allowedBy(line.nest_plates)), excl: choices, line, facts, guillotine });
 }
@@ -2555,6 +2584,8 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   // a left-out cut piece is not required (and may not be placed), an excluded
   // plate may not carry a lot.
   const excl = await exclusionsOfLine(db, companyId, orderLineId);
+  // §61: pieces marked as cut from untracked offcuts are not asked of the layout (planNesting's rule).
+  const untracked = untrackedDemand(cutPlates, await untrackedOfLine(db, companyId, orderLineId), imported.counts);
   // §55: a part's shape is its drawing when it has one — read from the DB, like everything else here.
   const facts = await drawingFactsOfLine(db, companyId, orderLineId);
   const shapeMemo = new Map();
@@ -2569,8 +2600,8 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
   const required = new Map();
   for (const cp of cutPlates) {
     if (!cp.pieces || cp.manual || excl.cutPlates.has(cp.id)) continue;
-    const left = cp.pieces - (imported.counts.get(cp.id) ?? 0);
-    if (left <= 0) continue;                        // all of it is on imported nests
+    const left = cp.pieces - (imported.counts.get(cp.id) ?? 0) - (untracked.get(cp.id) ?? 0);
+    if (left <= 0) continue;                        // all of it is on imported nests (or cut from untracked offcuts)
     if (missingOnPart(cp.steel).length) {
       problems.push(`${nameOf(cp)} does not say its ${list(missingOnPart(cp.steel).map((g) => g.toLowerCase()))}, so a layout naming it cannot be accepted. Set the value, or mark it ${NEST_MANUAL_SPEC_CODE}.`);
       continue;
@@ -2622,7 +2653,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
       settings,
       pieces: [],
     };
-    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, shapeOf, pending });
+    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, untracked, shapeOf, pending });
     lots.push(lot);
     await breathe();
   }
@@ -2635,7 +2666,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}) {
     const il = imported.lots.find((x) => Number(x.id) === Number(ad.lotId));
     if (!il) { problems.push(`Plate ${ad.lotNo ?? ad.lotId}: the plan adds pieces to it, but it is not an uploaded plate of this line any more. Nest the rest again.`); continue; }
     if (addByLot.has(il.id)) { problems.push(`Plate ${il.lotNo}: the plan adds to it twice.`); continue; }
-    addByLot.set(il.id, verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, shapeOf, settingRows, pending }));
+    addByLot.set(il.id, verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, untracked, shapeOf, settingRows, pending }));
   }
   // Every plate laid out by true shape, checked on its outlines — together, off this thread.
   if (pending.length) {
@@ -2910,7 +2941,7 @@ function freeProblem(label, pr, nameAt, k, plateWords) {
  * plate's steel, and a kerf clear of every other part and of the edge. Returns the pieces to store
  * (placed_by 'ours'); every failure is pushed.
  */
-function verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts, leftOut, shapeOf, settingRows, pending }) {
+function verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts, leftOut, untracked = new Map(), shapeOf, settingRows, pending }) {
   const l = il.full;
   const label = `Plate ${l.lotNo} (already saved)`;
   if (l.layoutOrigin !== 'customer' || !l.pieces.length || l.pieces.some((p) => p.x == null)) {
@@ -2921,7 +2952,7 @@ function verifyAddition(ad, il, { cpById, required, placed, problems, importedCo
   const pieces = [];
   for (const [j, p] of ad.pieces.entries()) {
     const at = `${label}, added piece ${j + 1}`;
-    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut, untracked });
     if (!cp) continue;
     if (Math.abs(cp.steel.thickness - l.thickness) > EPS) { problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and the plate is ${fmt(l.thickness)} mm.`); continue; }
     if (!agrees(l.grade, cp.steel.grade) || !agrees(l.material, cp.steel.material)) { problems.push(`${at}: ${nameOf(cp)} is ${[cp.steel.grade, cp.steel.material].filter(Boolean).join(' ')} and the plate is ${[l.grade, l.material].filter(Boolean).join(' ')}. Grade is not something a layout may mix.`); continue; }
@@ -2947,7 +2978,7 @@ function verifyAddition(ad, il, { cpById, required, placed, problems, importedCo
  * Is this piece of a plan one the line needs from automatic nesting? Its cut plate, or null with
  * the reason pushed. The same questions for a new plate and for an addition to a saved one.
  */
-function pieceCutPlate(p, at, { cpById, required, problems, importedCounts = new Map(), leftOut = new Set() }) {
+function pieceCutPlate(p, at, { cpById, required, problems, importedCounts = new Map(), leftOut = new Set(), untracked = new Map() }) {
   const cp = cpById.get(Number(p.cutPlateId));
   if (!cp) { problems.push(`${at}: ${p.cutPlateId == null ? 'no cut plate is named' : `cut plate ${p.cutPlateId} is not one of this line's`}.`); return null; }
   // NEST_MANUAL means "leave it out of AUTOMATIC nesting" (2026-09-29): it
@@ -2958,15 +2989,17 @@ function pieceCutPlate(p, at, { cpById, required, problems, importedCounts = new
     return null;
   }
   if (!required.has(cp.id)) {
-    problems.push(importedCounts.get(cp.id)
-      ? `${at}: every piece of ${nameOf(cp)} the line needs is already on imported nests, so there is none left for this plate.`
-      : `${at}: ${nameOf(cp)} is not a rectangle this line needs.`);
+    problems.push(untracked.get(cp.id)
+      ? `${at}: every piece of ${nameOf(cp)} the line still needs is marked as cut from untracked offcuts, so there is none left for this plate. Undo the mark to nest it.`
+      : importedCounts.get(cp.id)
+        ? `${at}: every piece of ${nameOf(cp)} the line needs is already on imported nests, so there is none left for this plate.`
+        : `${at}: ${nameOf(cp)} is not a rectangle this line needs.`);
     return null;
   }
   return cp;
 }
 
-function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set(), shapeOf = null, pending = [] }) {
+function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set(), untracked = new Map(), shapeOf = null, pending = [] }) {
   const { plate, settings } = lot;
   const k = settings.kerfMm;
   const raw = Array.isArray(n.pieces) ? n.pieces : [];
@@ -2981,7 +3014,7 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
     const pieces = [];
     for (const [j, p] of raw.entries()) {
       const at = `${label}, piece ${j + 1}`;
-      const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+      const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut, untracked });
       if (!cp) continue;
       if (Math.abs(cp.steel.thickness - plate.steel.thickness) > EPS) problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and ${nameOf(plate)} is ${fmt(plate.steel.thickness)} mm.`);
       if (!agrees(plate.steel.grade, cp.steel.grade)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
@@ -3006,7 +3039,7 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
   const pieces = [];
   for (const [j, p] of raw.entries()) {
     const at = `${label}, piece ${j + 1}`;
-    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut });
+    const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut, untracked });
     if (!cp) continue;
 
     // The steel has to agree on all three axes. An unknown on the PLATE is
@@ -3330,7 +3363,7 @@ export async function getNesting(db, companyId, orderLineId) {
   const line = await requireLine(db, companyId, orderLineId);
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   // The line's nesting choices (§40): a left-out cut piece is not drift.
-  const excl = await exclusionsOfLine(db, companyId, orderLineId);
+  const [excl, marks] = await Promise.all([exclusionsOfLine(db, companyId, orderLineId), untrackedOfLine(db, companyId, orderLineId)]);
   const cutPlates = needed.map((cp) => (excl.cutPlates.has(cp.id) ? { ...cp, leftOut: true } : cp));
   const cpById = new Map(cutPlates.map((cp) => [cp.id, cp]));
 
@@ -3516,7 +3549,10 @@ export async function getNesting(db, companyId, orderLineId) {
   // not rewrite the plan; it makes it OUT OF DATE, and saying which rectangles
   // drifted is more use than a stale flag. A line not nested yet has no drift.
   const codes = new Map(placeRows.map((p) => [p.cut_plate_id, p.cut_plate_code ?? p.cut_plate_name]));
-  const drift = lotRows.length ? layoutDrift(cutPlates, placedCount, codes) : [];
+  // §61: pieces marked as cut from untracked offcuts are neither left over nor drift.
+  const marked = effectiveUntracked(marks, new Map(cutPlates.map((cp) => [cp.id, cp.pieces])), placedCount);
+  const withMarks = cutPlates.map((cp) => (marked.has(cp.id) ? { ...cp, untracked: marked.get(cp.id) } : cp));
+  const drift = lotRows.length ? layoutDrift(withMarks, placedCount, codes) : [];
 
   const importedLots = lotRows.filter((l) => l.origin === 'imported');
   const importedIds = new Set(importedLots.map((l) => l.id));
@@ -3527,7 +3563,9 @@ export async function getNesting(db, companyId, orderLineId) {
     imported: { lots: importedLots.length, pieces: placeRows.filter((p) => importedIds.has(p.plate_lot_id)).length },
     // Needed against nested, every cut plate the line needs — the same numbers
     // the sheet's Needed tab and the import preview show.
-    coverage: coverageOf(cutPlates, placedCount),
+    coverage: coverageOf(withMarks, placedCount),
+    // §61: what is marked as cut from untracked offcuts — on no plate, so in no plate and no waste figure.
+    untracked: untrackedSummary(withMarks),
     groups: out,
     manual: cutPlates.filter((cp) => cp.manual && cp.pieces).map(describeManual),
     sizeAdvice: [],
@@ -3550,11 +3588,31 @@ const parseJson = (v) => {
 export function coverageOf(cutPlates, placedCount) {
   return cutPlates.filter((cp) => cp.pieces || placedCount.get(cp.id)).map((cp) => {
     const nested = placedCount.get(cp.id) ?? 0;
+    // §61 `untracked`: pieces marked as cut from untracked offcuts (cp.untracked, already held to what is left).
+    // `diff` stays nested − needed; `leftOver` is what is still to place: needed − nested − untracked.
+    const untracked = cp.untracked ?? 0;
     return {
       cutPlateId: cp.id, cutPlateCode: cp.code ?? nameOf(cp), needed: cp.pieces, nested, diff: nested - cp.pieces, manual: !!cp.manual, leftOut: !!cp.leftOut,
+      untracked, leftOver: Math.max(0, cp.pieces - nested - untracked),
       thickness: cp.steel?.thickness ?? null, length: cp.steel?.length ?? null, width: cp.steel?.width ?? null, grade: cp.steel?.grade ?? null,
     };
   });
+}
+
+/**
+ * §61 — "n pieces · x kg cut from untracked offcuts" for a line: cutPlates carry `untracked` (the
+ * count that holds). { pieces, kg, cutPieces: [{ cutPlateId, code, name, qty, kgEach, kg }] }.
+ */
+export function untrackedSummary(cutPlates) {
+  const rows = cutPlates.filter((cp) => (cp.untracked ?? 0) > 0).map((cp) => {
+    const kgEach = cp.steel ? pieceKg(cp.steel) : null;
+    return { cutPlateId: cp.id, code: cp.code ?? null, name: cp.name ?? null, qty: cp.untracked, kgEach, kg: kgEach == null ? null : round3(kgEach * cp.untracked) };
+  });
+  return {
+    pieces: rows.reduce((a, r) => a + r.qty, 0),
+    kg: round3(rows.reduce((a, r) => a + (r.kg ?? 0), 0)),
+    cutPieces: rows,
+  };
 }
 
 /**

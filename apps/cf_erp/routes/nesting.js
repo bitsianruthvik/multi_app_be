@@ -24,6 +24,9 @@
  *   DELETE /orders/:orderId/lines/:lineId/nesting/lots/:lotId    one plate off the line
  *   POST   /orders/:orderId/lines/:lineId/nesting/plates         { plates: [{ key, kind, code?, name? }], dryRun } — plates the files use
  *                                                                that the catalog does not have, added to it (orders manage AND catalog manage)
+ *   GET    /orders/:orderId/lines/:lineId/nesting/untracked      what is left over, what is marked as cut from untracked offcuts, kg and cost (init.sql §61)
+ *   POST   /orders/:orderId/lines/:lineId/nesting/untracked      { pieces?: [{ cutPlateId, quantity? }], all?, dryRun? } — mark left-over pieces
+ *   DELETE /orders/:orderId/lines/:lineId/nesting/untracked      { cutPlateIds? } — undo (none = every mark)
  *   GET    /orders/:orderId/lines/:lineId/nesting/compare        the uploaded nesting beside our automatic one (?with=auto)
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare        { run: true, effort? } — start the automatic side when none answers this demand
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
@@ -67,6 +70,8 @@ import { startRun, readRun, dismissRun, stopRunAnywhere, cancelRun } from '../se
 import { uploadNestFiles, getNestFiles, nestFileOf, deleteNestLot } from '../services/nestDxfImportService.js';
 // Plates an uploaded nesting is cut on that are not in the catalog yet (2026-10-14).
 import { createNestPlates } from '../services/nestPlateCatalogService.js';
+// Pieces cut from loose offcuts in the yard that are not in the system (init.sql §61, 2026-10-14).
+import { getUntracked, markUntracked, unmarkUntracked } from '../services/nestUntrackedService.js';
 // The uploaded nesting beside our automatic one, and taking one of them.
 import { getCompare, startCompare, acceptCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
@@ -205,6 +210,15 @@ router.delete('/orders/:orderId/lines/:lineId/nesting/lots/:lotId', manage,
 // nesting, so it needs the order grant; it writes catalog items, so it needs the catalog grant too.
 router.post('/orders/:orderId/lines/:lineId/nesting/plates', manage,
   handle((req) => { assertPerm(req, PERM.catalog); return write(req, (db, c, id) => createNestPlates(db, c, id, req.body ?? {})); }));
+
+// CUT FROM UNTRACKED OFFCUTS (§61): the pieces the files leave over that the shop cuts from loose offcuts in the
+// yard. Marked, they are no longer left over, need no plate and no heat number; their steel is charged at the plate rate.
+router.get('/orders/:orderId/lines/:lineId/nesting/untracked', view,
+  handle((req) => read(req, (db, companyId, id) => getUntracked(db, companyId, id))));
+router.post('/orders/:orderId/lines/:lineId/nesting/untracked', manage,
+  handle((req) => write(req, (db, c, id) => markUntracked(db, c, id, req.body ?? {}))));
+router.delete('/orders/:orderId/lines/:lineId/nesting/untracked', manage,
+  handle((req) => write(req, (db, c, id) => unmarkUntracked(db, c, id, { ...(req.query ?? {}), ...(req.body ?? {}) }))));
 
 // COMPARE the uploaded nesting with our automatic one, side by side. The GET never packs: it pulls
 // up the automatic run that already answers this demand, or says there is none (or that it is
