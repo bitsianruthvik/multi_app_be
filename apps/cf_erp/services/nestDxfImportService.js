@@ -77,6 +77,14 @@
  *            REPLACES its plates, and a plate of it the new upload no longer makes is removed;
  *   file     kept ONCE for all its plates, as base64 (cf_nest_files.file_kind 'pronest').
  *
+ * A PLATE THE CATALOG DOES NOT HAVE (2026-10-14). A file or a nest whose plate no catalog item
+ * matches still answers PLATE_NOT_FOUND and saves nothing — and the answer now says, structurally,
+ * which plates are missing (`missingPlates`: once per thickness × size × grade × impact class, with
+ * the code each would get), so the screen can add them (services/nestPlateCatalogService.js, POST
+ * …/nesting/plates) and read the files again. The grade and the impact class are the cut pieces'
+ * matched on the nest — matching runs BEFORE the plate is looked for, so the vote is there also
+ * when the plate is not.
+ *
  * ROUND TRIPS (TiDB is ~49 ms each): a fixed number whatever the files hold — the reads are the
  * line, its cut plates, the catalog plates, the drawings and the saved lots; the writes are bulk.
  * The one thing that grows is the file text itself, sent in statements of at most ~8 MB.
@@ -95,6 +103,7 @@ import {
 } from './nestingService.js';
 import { measurePlates } from './nestMeasure.js';
 import { memoryRun } from './nestRunService.js';
+import { missingPlatesOf } from './nestPlateCatalogService.js';
 
 export { savedLotsOf, isUploadedPiece };
 import {
@@ -299,6 +308,28 @@ function resolvePlate({ file, nest, placed, ctx }) {
   const grade = vote((s) => norm(s.grade));
   const material = vote((s) => norm(s.material));
   const impact = vote((s) => norm(s.impactClass));
+  /*
+   * WHAT IS KNOWN OF A PLATE THE CATALOG DOES NOT HAVE (2026-10-14): its size and thickness from the
+   * file, its grade, impact class, material and density from the cut pieces matched on it (the vote
+   * above, as the cut pieces write them) — else the grade the file itself states. More than one
+   * grade or impact class among the pieces is said (`mixed`); the one most pieces have is taken.
+   */
+  const asWritten = (key, v) => (v == null ? null : steels.map(key).find((x) => norm(x) === v) ?? null);
+  const kinds = (key) => { const n = new Map(); for (const s of steels) { const v = norm(key(s)); if (v != null) n.set(v, (n.get(v) ?? 0) + 1); } return [...n].sort((a, b) => b[1] - a[1]); };
+  const missingOf = (size, frame = false) => {
+    const hinted = gradeKey(hints.grade) ? String(hints.grade).trim() : null;
+    const grades = kinds((s) => s.grade); const impacts = kinds((s) => s.impactClass);
+    const said = [];
+    if (grades.length > 1) said.push(`The cut pieces on it are of ${plural(grades.length, 'grade', 'grades')} (${grades.map(([g, n]) => `${g} × ${n}`).join(', ')}): the plate is taken as ${grades[0][0]}.`);
+    if (impacts.length > 1) said.push(`The cut pieces on it are of ${plural(impacts.length, 'impact class', 'impact classes')} (${impacts.map(([g, n]) => `${g} × ${n}`).join(', ')}): the plate is taken as ${impacts[0][0]}.`);
+    return {
+      thickness: thickness ?? null, length: Math.max(size.length, size.width), width: Math.min(size.length, size.width),
+      grade: asWritten((s) => s.grade, grade) ?? hinted, impactClass: asWritten((s) => s.impactClass, impact),
+      material: asWritten((s) => s.material, material), density: vote((s) => (s.density > 0 ? r3(s.density) : null)),
+      ...(said.length ? { mixed: said.join(' ') } : {}), ...(frame ? { frame: true } : {}),
+    };
+  };
+  const ADD_IT = 'It can be added to the catalog from here (Add to the catalog)';
 
   if (file.plateCode) {
     const plate = byCode(file.plateCode);
@@ -319,12 +350,12 @@ function resolvePlate({ file, nest, placed, ctx }) {
   if (!hits.length) {
     // The rectangle taken as the plate holds ONE rectangle that holds everything else: perhaps a frame round the real plate.
     const inner = drawn && nest.plate.inside ? ` (That rectangle holds one other, ${fmt(nest.plate.inside.length)} × ${fmt(nest.plate.inside.width)}, with everything else inside it — if the outer one is a drawing frame, the plate is that, and no catalog plate is that size either.)` : '';
-    return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${sizeWords}.${inner} Add it to the catalog, or name the plate you mean (plateCode).` } };
+    return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${sizeWords}.${inner} ${ADD_IT}, or name the plate you mean (plateCode).`, missing: missingOf(size, !!inner) } };
   }
   if (thickness != null) {
     const t = hits.filter((p) => Math.abs(p.steel.thickness - thickness) <= 0.01);
     if (!t.length) {
-      return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${fmt(thickness)} mm × ${sizeWords} — that size is in the catalog only at ${list([...new Set(hits.map((p) => fmt(p.steel.thickness)))])} mm.` } };
+      return { error: { code: 'PLATE_NOT_FOUND', message: `no catalog plate is ${fmt(thickness)} mm × ${sizeWords} — that size is in the catalog only at ${list([...new Set(hits.map((p) => fmt(p.steel.thickness)))])} mm. ${ADD_IT}, or name the plate you mean (plateCode).`, missing: missingOf(size) } };
     }
     hits = t;
   }
@@ -576,6 +607,8 @@ function prepareFile(file, ctx, choices) {
   const laddered = m.placements.filter((pl) => unheeded.has(pl.partId)).map((pl) => ({ cp: ctx.cpByKey.get(pl.candidateKey) }));
   const res = resolvePlate({ file, nest, placed: [...placed, ...alike, ...laddered], ctx });
   if (res.error) err(res.error.code, res.error.message, res.error.choices ? { choices: res.error.choices } : {});
+  // A plate the catalog does not have: what is known of it stays on the entry for the answer's `missingPlates`.
+  if (res.error?.missing) entry._missing = res.error.missing;
   const plate = res.plate ?? null;
   const drawn = nest.plate.found === 'outline';
   // The lot is the plate AS THE FILE DREW IT: a customer may draw 2500 × 1250 standing up.
@@ -1041,7 +1074,7 @@ const WORST = { ok: 0, warning: 1, error: 2 };
 function presentEntries(entries, lotIds = null) {
   const out = []; const heads = new Map();
   const idOf = (e) => (lotIds && e.lotNo ? { lotId: lotIds.get(e.lotNo.toUpperCase()) ?? null } : {});
-  for (const { _lot, _nif, _parts, _rank, ...e } of entries) {
+  for (const { _lot, _nif, _parts, _rank, _missing, ...e } of entries) {
     if (!_nif || _nif.failed) { out.push({ ...e, ...idOf(e) }); continue; }
     const key = `${_nif.fileIndex}|${_nif.nestNo}`;
     const one = { copy: _nif.copy, lotNo: e.lotNo, action: e.action, status: e.status, counts: e.counts, ...idOf(e) };
@@ -1490,6 +1523,11 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
   const canSave = problems.length === 0 && changes > 0;
   const needsForce = warnings.some((w) => w.needsForce);
 
+  // ---- plates the catalog does not have: once each, with the code each would get ---------------
+  const missingPlates = await missingPlatesOf(db, companyId, ctx, entries.filter((e) => e._missing).map((e) => ({
+    ...e._missing, filename: e.sourceFile ?? e.filename, nestNo: e._nif ? e.jobNestNo ?? null : e.nestNo ?? null,
+  })), { alikeGrade: sameGrade });
+
   const say = [];
   if (problems.length) say.push(`${plural(problems.length, 'thing needs', 'things need')} fixing before this can be saved`);
   if (sent.length) say.push(`${plural(sent.length, 'file', 'files')} read${jobs.length ? ` (${plural(jobs.length, 'ProNest job', 'ProNest jobs')}: ${plural(jobs.reduce((a, j) => a + (j.error ? 0 : j.doc.counts.nests), 0), 'nest', 'nests')}, ${plural(jobs.reduce((a, j) => a + (j.error ? 0 : j.doc.counts.plates), 0), 'plate', 'plates')})` : ''}`);
@@ -1511,6 +1549,8 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     problems: problems.map((p) => p.message), problemList: problems,
     warnings: warnings.map((w) => w.message), warningList: warnings,
     diff, coverage, leftOver, surplus,
+    // Plates these files are cut on that are not catalog items ([] when every plate was found): POST …/nesting/plates adds them.
+    missingPlates,
     totals: totalsOfLots(finalLots, leftOver),
     message: `${say.join('; ') || 'Nothing to do'}.`,
   };

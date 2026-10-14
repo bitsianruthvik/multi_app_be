@@ -22,6 +22,8 @@
  *                                                                the CUSTOMER'S nesting, one DXF per plate, copied as drawn (§55)
  *   GET    /orders/:orderId/lines/:lineId/nesting/files/:lotId   the file one plate was read from
  *   DELETE /orders/:orderId/lines/:lineId/nesting/lots/:lotId    one plate off the line
+ *   POST   /orders/:orderId/lines/:lineId/nesting/plates         { plates: [{ key, kind, code?, name? }], dryRun } — plates the files use
+ *                                                                that the catalog does not have, added to it (orders manage AND catalog manage)
  *   GET    /orders/:orderId/lines/:lineId/nesting/compare        the uploaded nesting beside our automatic one (?with=auto)
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare        { run: true, effort? } — start the automatic side when none answers this demand
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
@@ -51,7 +53,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
 import {
   planNesting, acceptNesting, getNesting, assertLineOnOrder, nestingChoices, saveNestingChoices, setNestPlates,
 } from '../services/nestingService.js';
@@ -63,6 +65,8 @@ import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 import { startRun, readRun, dismissRun, stopRunAnywhere, cancelRun } from '../services/nestRunService.js';
 // The customer's nesting files (init.sql §55): one DXF per plate, stored exactly as drawn.
 import { uploadNestFiles, getNestFiles, nestFileOf, deleteNestLot } from '../services/nestDxfImportService.js';
+// Plates an uploaded nesting is cut on that are not in the catalog yet (2026-10-14).
+import { createNestPlates } from '../services/nestPlateCatalogService.js';
 // The uploaded nesting beside our automatic one, and taking one of them.
 import { getCompare, startCompare, acceptCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
@@ -195,6 +199,12 @@ router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(a
 }));
 router.delete('/orders/:orderId/lines/:lineId/nesting/lots/:lotId', manage,
   handle((req) => write(req, (db, c, id) => deleteNestLot(db, c, id, intParam(req.params.lotId, 'lotId')))));
+
+// PLATES THE FILES USE THAT THE CATALOG DOES NOT HAVE (2026-10-14): the preview lists them
+// (`missingPlates`), this adds them — custom sizes unless told otherwise. It is asked from an order's
+// nesting, so it needs the order grant; it writes catalog items, so it needs the catalog grant too.
+router.post('/orders/:orderId/lines/:lineId/nesting/plates', manage,
+  handle((req) => { assertPerm(req, PERM.catalog); return write(req, (db, c, id) => createNestPlates(db, c, id, req.body ?? {})); }));
 
 // COMPARE the uploaded nesting with our automatic one, side by side. The GET never packs: it pulls
 // up the automatic run that already answers this demand, or says there is none (or that it is
