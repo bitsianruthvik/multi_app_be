@@ -130,6 +130,22 @@ section('2b. matchNest for a ProNest part — the rungs, on parts made by hand')
   ok('…of two that fit with an allowance, the smaller allowance', r.candidateKey === 'nearer' && r.allowanceMm === 5, J(r));
   r = one({ ...part('P1', 'FLANGE', flange), nameSize: null }, [fl('tf', 6120, 500)]);
   ok('…with no size in the name, the outline\x27s own size does the same (by "size")', r.candidateKey === 'tf' && r.by === 'size' && r.allowanceMm === 15, J(r));
+  // 2026-10-14 — THE USER'S OWN CHOICE (placeAs), and what the ladder found on its way (facts).
+  {
+    const p = part('P1', '25MM-TOP FL1-500X6135- 8', flange);
+    const m = matchNest({ parts: [p] }, [fl('exact', 6135, 500), fl('short', 6120, 500), fl('far', 3000, 400), { ...drilled, key: 'drawn' }], { kerfOffsetMaxMm: 0 });
+    ok('facts: the rectangle round the part, and the candidates the ladder found to fit it', J(m.facts.get('P1').size) === J([6135, 500]) && m.facts.get('P1').fits.get('exact') === 'size' && !m.facts.get('P1').fits.has('short'), J([m.facts.get('P1').size, [...m.facts.get('P1').fits]]));
+    let c = m.placeAs(p, 'exact');
+    ok('placeAs: the candidate the ladder matched is the ladder\x27s own placement', c.candidateKey === 'exact' && c.x === m.placements[0].x && c.rotationDeg === m.placements[0].rotationDeg && c.outlineDiffers === undefined, J(c));
+    c = m.placeAs(p, 'short');
+    ok('…another one, 15 mm shorter and the same width: laid where the part is drawn, with the allowance said', c.candidateKey === 'short' && c.by === 'choice' && c.allowanceMm === 15 && c.x === 5 && c.y === 5 && c.rotationDeg === 0 && J(c.outlineDiffers) === J({ drawn: [6135, 500], cutPiece: [6120, 500] }), J(c));
+    c = m.placeAs(p, 'far');
+    ok('…one of quite another size: taken all the same, both sizes said, no allowance', c.candidateKey === 'far' && c.allowanceMm === undefined && J(c.outlineDiffers) === J({ drawn: [6135, 500], cutPiece: [3000, 400] }) && c.x === 5 && c.y === 5, J(c));
+    ok('…and a key that is no candidate gives nothing', m.placeAs(p, 'nobody') === null);
+    const q = part('P2', '12MM-SPLICE-300X600- 4', plain);
+    const m2 = matchNest({ parts: [q] }, [drilled, bare], { kerfOffsetMaxMm: 0 });
+    ok('facts: a true-shape fit is remembered as "shape", a rectangle of the size as "size"', m2.facts.get('P2').fits.get('drilled') === 'shape' && m2.facts.get('P2').fits.get('bare') === 'size', J([...m2.facts.get('P2').fits]));
+  }
   r = one(part('P1', '12MM-GP-7-900X900- 2', plain), [{ ...bare, length: 900, width: 400 }, { key: 'other', codes: ['ZZ-3'], rings: null, length: 600, width: 300 }]);
   ok('a name that holds a code of ANOTHER shape and size does not end the search: the outline finds the cut piece it is', r.candidateKey === 'other' && r.by === 'size', J(r));
   r = one(part('P1', '12MM-GP-7-900X900- 2', plain), [{ ...bare, length: 900, width: 400 }]);

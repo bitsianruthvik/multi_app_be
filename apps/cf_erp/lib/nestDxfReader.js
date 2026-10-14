@@ -1694,6 +1694,11 @@ const sizeWords = (a, b) => `${r1(Math.max(a, b))} x ${r1(Math.min(a, b))}`;
  *   kerfOffsetMm: 0, or the one offset every part was drawn oversize by; then `nominal` is a
  *                 Map partId → { full, bare } — the parts' rings at nominal size
  *   ambiguous[]:  { partId, candidateKeys, options: placement[] } — the placement it would have as each
+ *   facts:        Map partId → { size: [a, b], fits: Map candidateKey → 'shape' | 'size' } — the rectangle round
+ *                 the part, and the candidates the ladder found to fit it on its way (nothing is fitted for this)
+ *   placeAs(part, candidateKey) → the placement the part has AS that candidate, whatever the ladder said (the
+ *                 user chose it): the ladder's own when it fits, else laid along the part's rectangle with
+ *                 `outlineDiffers` (and `allowanceMm` when it is only the length allowance). null: no such candidate.
  *
  * A PART OF A PRONEST JOB (lib/nifReader.nestOfNif sets `outlineOnly`, `labelFrom: 'name'` and
  * `nameSize` on it; a DXF part has none of them and is read exactly as before) goes down a longer
@@ -1796,7 +1801,7 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
    * numbers). The candidate is laid along the rectangle round the outline, its length on the side
    * nearer its own; where it sits is the outline's own box.
    */
-  const fitNameSize = (c, shape, nameSize, drawnSize = null) => {
+  const fitNameSize = (c, shape, nameSize, drawnSize = null, forced = false) => {
     if (!nameSize || !(c.length > 0 && c.width > 0)) return null;
     const [n0, n1] = nameSize;
     let off = Math.min(Math.max(Math.abs(n0 - c.length), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - c.length)));
@@ -1808,8 +1813,10 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
       const [nl, nw] = n0 >= n1 ? [n0, n1] : [n1, n0];
       const [cl, cw] = c.length >= c.width ? [c.length, c.width] : [c.width, c.length];
       const over = nl - cl;
-      if (!(Math.abs(nw - cw) <= 1 && over > 1 && over <= CUT_ALLOWANCE_MAX_MM)) return null;
-      allowanceMm = r1(over); off = over;
+      const allowed = Math.abs(nw - cw) <= 1 && over > 1 && over <= CUT_ALLOWANCE_MAX_MM;
+      // `forced`: the user chose this candidate — it is laid here whatever its size (placeAs).
+      if (!allowed && !forced) return null;
+      if (allowed) { allowanceMm = r1(over); off = over; }
     }
     const { a, b, angleDeg, corners } = shape.mbr;
     const along = Math.abs(a - c.length) + Math.abs(b - c.width) <= Math.abs(a - c.width) + Math.abs(b - c.length);
@@ -1833,13 +1840,23 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
   };
 
   /** One part, with the rings given: { placed, tier } | { ambiguous, tier } | { unmatched }. */
+  let facts = null;                                  // the pass being made: Map partId → { size, fits }
   const decide = (part, rings, pool = cands) => {
     const loose = !!part.outlineOnly;                  // a ProNest part: its outline alone, and its name a loose label
     const shape = shapeOf(loose ? [ringList(rings)[0] ?? []] : rings, { normalise: false });
     if (!shape) return { unmatched: { partId: part.id, bbox: part.bbox, labels: part.labels ?? [], why: 'Its outline could not be read.' } };
     const size = sizeWords(shape.mbr.a, shape.mbr.b);
     const fitOf = new Map();
-    const fit = (c) => { if (!fitOf.has(c)) fitOf.set(c, tryFit(c, shape, loose)); return fitOf.get(c); };
+    // What fitted is remembered (`facts`): the list a person picks a cut piece from is ranked by it.
+    const known = facts ? (facts.get(part.id) ?? facts.set(part.id, { size: [r1(Math.max(shape.mbr.a, shape.mbr.b)), r1(Math.min(shape.mbr.a, shape.mbr.b))], fits: new Map() }).get(part.id)) : null;
+    const fit = (c) => {
+      if (!fitOf.has(c)) {
+        const f = tryFit(c, shape, loose);
+        fitOf.set(c, f);
+        if (f && known && known.fits.get(c.key) !== 'shape') known.fits.set(c.key, f.by === 'shape' ? 'shape' : 'size');
+      }
+      return fitOf.get(c);
+    };
     const byName = (list) => (loose && part.nameSize ? list.map((c) => ({ c, f: fitNameSize(c, shape, part.nameSize, part.drawnSize ?? null) })).filter((h) => h.f) : []);
     const best = (list) => {
       const hits = list.map((c) => ({ c, f: fit(c) })).filter((h) => h.f);
@@ -1906,7 +1923,8 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
    * placement then says `marksLeftOut`.
    */
   const pass = (ringsFor) => {
-    const out = { placements: [], unmatched: [], ambiguous: [] };
+    const out = { placements: [], unmatched: [], ambiguous: [], facts: new Map() };
+    facts = out.facts;
     for (const part of nest?.parts ?? []) {
       const { full, bare } = ringsFor(part);
       // A ProNest part is looked for among the cut plates its plate could be cut into FIRST (`prefer`: the
@@ -1982,7 +2000,42 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
       }
     }
   }
-  return { ...found, counts: tally(found.placements), kerfOffsetMm, nominal };
+  facts = null;
+  /**
+   * THE USER'S OWN CHOICE (2026-10-14): the part AS the candidate named, whatever the ladder said.
+   * What the ladder found for that pair stands as it is. Otherwise the candidate is laid along the
+   * rectangle round the part, where the part is drawn — and the placement says how the two differ
+   * (`outlineDiffers`; `allowanceMm` when the part is only longer by a cutting allowance).
+   * `part` is read by the rings it has NOW (kerf-compensated parts are nominal by then).
+   */
+  const placeAs = (part, candidateKey) => {
+    const c = cands.find((k) => k.key === candidateKey);
+    if (!c || !part) return null;
+    const mine = found.placements.find((pl) => pl.partId === part.id && pl.candidateKey === candidateKey)
+      ?? found.ambiguous.find((a) => a.partId === part.id)?.options.find((o) => o.candidateKey === candidateKey);
+    if (mine) return { ...mine };
+    const loose = !!part.outlineOnly;
+    const shapeFor = (rings) => shapeOf(loose ? [ringList(rings)[0] ?? []] : rings, { normalise: false });
+    const full = shapeFor(part.rings);
+    const bare = part.ringsNoMarks ? shapeFor(part.ringsNoMarks) : null;
+    if (!full && !bare) return null;
+    // Closed shapes inside it that MAY BE MARKING are cut-outs only when the candidate's own drawing has them.
+    let marks = false;
+    let f = full ? tryFit(c, full, loose) : null;
+    if (loose && bare && f) {
+      const whole = shapeOf(part.rings, { normalise: false });
+      marks = !(c.hasRings && whole && c.shape.inner.length === whole.inner.length && fitShape(c.shape, whole, tol));
+    }
+    if (!f && bare) { marks = true; if (!loose) f = tryFit(c, bare, false); }
+    const shape = (marks ? bare : null) ?? full ?? bare;
+    if (!f && loose && part.nameSize) f = fitNameSize(c, shape, part.nameSize, part.drawnSize ?? null);
+    if (!f) f = fitNameSize(c, shape, [shape.mbr.a, shape.mbr.b], loose ? part.drawnSize ?? null : null, true);
+    if (!f) return null;
+    const made = placement(part, c, f, 'choice');
+    if (marks) made.marksLeftOut = part.unsureMarks ?? 0;
+    return made;
+  };
+  return { ...found, counts: tally(found.placements), kerfOffsetMm, nominal, placeAs };
 }
 
 /** A counter-clockwise ring moved IN by d all round (out when d < 0): each corner to where its two sides, moved, meet. */

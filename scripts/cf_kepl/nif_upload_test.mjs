@@ -67,6 +67,7 @@ const J10 = nifFile('10MM-NECL-PATNA.nif');
 const J12 = nifFile('12MM-NECL-PATNA SPAN1.nif');
 const J16 = nifFile('16MM-NECL-PATNA.nif');
 const J20 = nifFile('20MM-NECL-PATNA.nif');
+const J25 = nifFile('25MM-NECL-PATNA -SPAN1.nif');
 const asReq = (f, extra = {}) => ({ filename: f.filename, file: f.file, ...extra });
 /** The same job saved again: one byte of its settings text is another — nothing the nests are read from. */
 function resaved(f) {
@@ -165,7 +166,7 @@ async function buildFixture(db) {
   };
   const cut = {}; const partRow = {}; const plateLine = {}; const mark = {};
   let n = 0;
-  for (const [sfx, [t, len, wid, qty, plateSfx, m]] of Object.entries(parts)) {
+  const addPart = async (sfx, [t, len, wid, qty, plateSfx, m]) => {
     n += 1;
     mark[sfx] = m.startsWith('Z') ? `${tag}-${m}` : m;
     const row = await master({ code: `${tag}-PT-${sfx}`, name: `ProNest fixture part ${sfx}`, classificationId: partNode, itemType: 'temporary', ownerLineId: lineId });
@@ -177,8 +178,18 @@ async function buildFixture(db) {
     const [, pl, pw] = plateSize[plateSfx];
     plateLine[sfx] = await bomLine(cp, plates[plateSfx], (len * wid) / (pl * pw), 1);
     cut[sfx] = cp; partRow[sfx] = row;
-  }
-  const fx = { tag, GA, GB, lineId, orderId: o.insertId, spec, plates, parts, cut, partRow, plateLine, mark, code: (sfx) => `${tag}-C${sfx}`, plateCode: (sfx) => `${tag}-${sfx}`, sfxOfCut: (id) => Object.keys(cut).find((k) => Number(cut[k]) === Number(id)) ?? null };
+  };
+  for (const [sfx, def] of Object.entries(parts)) await addPart(sfx, def);
+  /** A catalog plate and cut pieces added after the fixture was built (and a cut-settings band for a new thickness). */
+  const addPlate = async (sfx, [t, l, w, g]) => {
+    plateSize[sfx] = [t, l, w, g];
+    plates[sfx] = await master({ code: `${tag}-${sfx}`, name: `ProNest fixture plate ${sfx}`, classificationId: plateNode, itemType: 'catalog', listPrice: 62000 });
+    await setVals(plates[sfx], steel(t, l, w, g));
+    await db.query('INSERT INTO cf_cut_settings (company_id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm, order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine) VALUES (?, ?, ?, 3, 5, 8, 100, 50, 50, 0)', [COMPANY, t, t]);
+  };
+  const addParts = async (more) => { for (const [sfx, def] of Object.entries(more)) { parts[sfx] = def; await addPart(sfx, def); } };
+  const fx = {
+    addPlate, addParts, tag, GA, GB, lineId, orderId: o.insertId, spec, plates, parts, cut, partRow, plateLine, mark, code: (sfx) => `${tag}-C${sfx}`, plateCode: (sfx) => `${tag}-${sfx}`, sfxOfCut: (id) => Object.keys(cut).find((k) => Number(cut[k]) === Number(id)) ?? null };
 
   // Two drawings, as an upload would file them, each with BOLT HOLES the nesting does not cut.
   const drawing = async (sfx, loops) => {
@@ -489,8 +500,11 @@ try {
     const n1 = out.files[0];
     ok('choices keyed by the job\'s file and the PART NAME settle every piece of that part: nest 1 (WEB PL2, ×4) is the cut piece chosen, by "choice", on all four plates', n1.placements.length === 1 && n1.placements[0].by === 'choice' && n1.placements[0].cutPlateId === fx.cut.WEBB2 && n1.copies.every((k) => J(sfxCounts(k.counts)) === J({ WEBB2: 1 })) && out.problems.length === 0, J([n1.placements[0], n1.copies.map((k) => sfxCounts(k.counts)), out.problems]));
     ok('…the other two long webs are still shared out by quantity, into what is left (2 + 6)', out.coverage.find((x) => x.cutPlateId === fx.cut.WEBB1).nested === 6 && out.coverage.find((x) => x.cutPlateId === fx.cut.WEBB2).nested === 6, J(out.coverage.filter((x) => [fx.cut.WEBB1, fx.cut.WEBB2].includes(x.cutPlateId))));
-    const bad = await upload([asReq(again)], { choices: { [J16.filename]: { '16MM-WEB PL2-2128X11944- 4': fx.cut.CG } } });
-    ok('a choice it cannot be → CHOICE_INVALID, once for the nest', bad.problemList.filter((x) => x.code === 'CHOICE_INVALID').length === 1 && /was chosen for it, but it can only be/.test(bad.problemList.find((x) => x.code === 'CHOICE_INVALID').message));
+    // (2026-10-14) Any cut piece of the line may be chosen — also one the ladder would never have offered.
+    const odd = await upload([asReq(again)], { choices: { [J16.filename]: { '16MM-WEB PL2-2128X11944- 4': fx.cut.CG } } });
+    ok('a cut piece the part "cannot be" may be chosen all the same: taken, by "choice", and the answer says how the sizes differ', !odd.problemList.some((x) => x.code === 'CHOICE_INVALID') && odd.files[0].placements[0].by === 'choice' && odd.files[0].placements[0].chosen === true && odd.files[0].placements[0].cutPlateId === fx.cut.CG && J(odd.files[0].placements[0].outlineDiffers?.cutPiece) === J([490, 350]), J([odd.problems, odd.files[0].placements[0]]));
+    const bad = await upload([asReq(again)], { choices: { [J16.filename]: { '16MM-WEB PL2-2128X11944- 4': 'NO-SUCH-CUT-PIECE' } } });
+    ok('a choice that names no cut piece of the line → CHOICE_INVALID, once for the nest', bad.problemList.filter((x) => x.code === 'CHOICE_INVALID').length === 1 && /"NO-SUCH-CUT-PIECE" was chosen for it, but that is not one of this line's cut pieces\./.test(bad.problemList.find((x) => x.code === 'CHOICE_INVALID').message), J(bad.problems));
 
     const lots = await liveLots();
     const one = lots.find((l) => l.lot_no === '16MM-NECL-PATNA-N02-3');
@@ -503,6 +517,106 @@ try {
     // Every plate of the 12 mm job off: its file goes with the last one.
     for (const l of after.filter((x) => x.lot_no.startsWith('12MM'))) await U.deleteNestLot(conn, c, fx.lineId, l.id);
     ok('all four plates of the 12 mm job taken off: its stored file goes with the last of them', (await liveFiles()).filter((x) => x.file_name === J12.filename).length === 0 && (await liveLots()).length === 21);
+  }
+
+  /* ───────────── 8. the parts table, and choosing the cut piece (2026-10-14) ───────────── */
+  section('8. The 25 mm job (5 nests, 116 pieces) — every part says its match; any match can be changed; an unmatched part is given its cut piece');
+  {
+    // Its own cut pieces: the flanges at their FINISHED length (the shop nests them 15 mm over), one flange
+    // at the nested size, a 23 mm twin, and NOTHING for the bottom inner splice plate — only a near miss.
+    await fx.addPlate('P25', [25, 12000, 2500, 'A']);
+    await fx.addParts({
+      TF: [25, 6120, 500, 8, 'P25', 'ZT-F'],                  // "TOP FL1-500X6135": 15 mm over
+      TFX: [25, 6135, 500, 8, 'P25', 'ZT-FX'],                // the same flange at the nested size
+      BF: [25, 6120, 750, 8, 'P25', 'ZB-F'],                  // "BTM FL1-750X6135": matched only with the allowance
+      TF23: [23, 6135, 500, 1, 'P25', 'ZT-F23'],              // 2 mm thinner than the plate
+      SPTO: [25, 2290, 700, 8, 'P25', 'ZS-TO'],
+      SPTI: [25, 2290, 275, 20, 'P25', 'ZS-TI'],
+      SPBO: [25, 1770, 950, 8, 'P25', 'ZS-BO'],
+      EDS: [25, 2150, 240, 49, 'P25', 'ZE-DS'],
+      SPBX: [25, 1800, 400, 16, 'P25', 'ZS-BX'],              // NOT "BTM INNER PL-400x1770": 30 mm longer
+    });
+    const TOP = '25MM-EG1-IG1 TOP FL1-500X6135- 8'; const BTM = '25MM-EG1-IG1 BTM FL1-750X6135- 8'; const INNER = '25MM-SP2 BTM INNER PL-400x1770- 16';
+    const rowOf = (out, name) => out.jobs[0].partRows.find((r) => r.partName === name);
+    const all = Object.keys(fx.cut).length;
+
+    const t = counting(conn);
+    const dry = await upload([asReq(J25)], {}, t.db);
+    trips.preview25 = t.tally.n;
+    const job = dry.jobs[0];
+    ok('jobs[].partRows: one row per part NAME of the job (7), however many nests hold it — and jobs[].parts is still the number', job.partRows.length === 7 && job.parts === 7 && job.partRows.every((r) => r.key === r.partName && r.candidates.length === all && r.pieces > 0) && sum(job.partRows, (r) => r.pieces) === 116, J(job.partRows.map((r) => [r.partName, r.pieces, r.status, r.candidates.length])));
+    ok('every placement points at its row (partKey = the part name)', dry.files.every((f) => f.placements.every((p) => p.partKey === p.partName && !!rowOf(dry, p.partKey))));
+    const top = rowOf(dry, TOP); const btm = rowOf(dry, BTM); const inner = rowOf(dry, INNER);
+    ok('a part matched outright (two cut pieces are its size — the 25 mm one, by its steel): status "matched", what it is and by which rung, its drawn size and the size in its name, the nests it is on', top.status === 'matched' && top.matched.cutPlateId === fx.cut.TFX && top.matched.by === 'steel' && top.matched.pieces === 8 && top.matched.allowanceMm === undefined && J(top.drawn) === J([6135, 500]) && J(top.nameSize) === J([6135, 500]) && J(top.nests) === J([1, 3, 5]) && top.open === 0 && top.pieces === 8, J({ ...top, candidates: 0 }));
+    console.log(`    candidates for "${TOP}" (the first five of ${top.candidates.length}):`);
+    for (const k of top.candidates.slice(0, 5)) console.log(`      ${String(k.fit).padStart(9)}  ${fx.sfxOfCut(k.cutPlateId).padEnd(5)} ${k.thickness} × ${k.width} × ${k.length}  needs ${k.needed}  — ${k.why}`);
+    const sfxOrder = top.candidates.map((k) => fx.sfxOfCut(k.cutPlateId));
+    ok('its candidates: the same size first, then the cutting allowance, then the nearest by size', J(sfxOrder.slice(0, 3)) === J(['TFX', 'TF', 'BF']) && top.candidates[0].why === 'same size' && top.candidates[1].why === '15 mm longer, same width' && top.candidates[2].why === '15 mm longer, 250 mm narrower' && top.candidates[0].fit === 1000000 && top.candidates[1].fit === 2000015 && top.candidates[2].fit === 3000265, J(top.candidates.slice(0, 4)));
+    const sortedAll = (r) => r.candidates.every((k, i) => i === 0 || r.candidates[i - 1].fit <= k.fit);
+    const onceEach = (r) => new Set(r.candidates.map((k) => k.cutPlateId)).size === all && Object.values(fx.cut).every((id) => r.candidates.some((k) => k.cutPlateId === Number(id)));
+    ok('every row lists EVERY cut piece of the line once, sorted by fit (smaller is better)', job.partRows.every((r) => sortedAll(r) && onceEach(r)));
+    const cls = (k) => (k.thickness === 25 ? 0 : k.thickness === 23 ? 1 : 2);
+    ok('the plate\'s thickness, then up to 2 mm thinner, then the others — an impossible one is never above a possible one, and says its thickness', job.partRows.every((r) => r.candidates.every((k, i) => (i === 0 || cls(r.candidates[i - 1]) <= cls(k)) && k.possible === (cls(k) < 2) && (cls(k) < 2 || k.why === `other thickness (${k.thickness} mm)`)))
+      && top.candidates.find((k) => k.cutPlateId === fx.cut.TF23).why === 'same size · 2 mm thinner than the plate' && top.candidates.find((k) => k.cutPlateId === fx.cut.WEBA).why === 'other thickness (16 mm)', J(top.candidates.filter((k) => cls(k) > 0).slice(0, 3)));
+    ok('a candidate says code, name, thickness, length ≥ width, grade and how many the line needs', (() => { const k = top.candidates[1]; return k.code === fx.code('TF') && !!k.name && k.thickness === 25 && k.length === 6120 && k.width === 500 && k.grade === fx.GA && k.needed === 8; })(), J(top.candidates[1]));
+    ok('THE ALLOWANCE IS CALLED OUT: the bottom flange is status "allowance", matched with allowanceMm 15 through the size in its name', btm.status === 'allowance' && btm.matched.cutPlateId === fx.cut.BF && btm.matched.allowanceMm === 15 && btm.matched.by === 'name size' && J(btm.matched.outlineDiffers) === J({ drawn: [6135, 750], cutPiece: [6120, 750] }) && btm.candidates[0].cutPlateId === fx.cut.BF && btm.candidates[0].why === '15 mm longer, same width', J({ ...btm, candidates: btm.candidates.slice(0, 2) }));
+    const others = Object.entries(job.matchedBy).filter(([k]) => k !== 'allowance').reduce((a, [, v]) => a + v, 0);
+    ok(`…and matchedBy.allowance counts its 8 pieces as an "of which": ${J(job.matchedBy)} — matched (${job.matched}) is still the sum of the other keys`, job.matchedBy.allowance === 8 && job.matchedBy['name size'] === 8 && others === job.matched && job.matched === 100, J([job.matchedBy, job.matched]));
+    ok('a part that matched nothing: status "unmatched", matched null, every piece open — PART_UNKNOWN points at the row, and the nearest cut piece leads its list', inner.status === 'unmatched' && inner.matched === null && inner.open === 16 && inner.pieces === 16 && dry.canSave === false && dry.problemList.filter((x) => x.code === 'PART_UNKNOWN').every((x) => x.partKey === INNER) && dry.problemList.some((x) => x.code === 'PART_UNKNOWN')
+      && inner.candidates[0].cutPlateId === fx.cut.SPBX && inner.candidates[0].why === 'same width, 30 mm shorter', J([{ ...inner, candidates: inner.candidates.slice(0, 2) }, dry.problems.slice(0, 2)]));
+    ok('rows come worst first: unmatched, then the allowance, then the matched', J(job.partRows.map((r) => r.status)) === J(['unmatched', 'allowance', 'matched', 'matched', 'matched', 'matched', 'matched']), J(job.partRows.map((r) => r.status)));
+
+    // ---- choosing for the part that matched nothing --------------------------------
+    const pick = { [J25.filename]: { [INNER]: fx.cut.SPBX } };
+    const t2 = counting(conn);
+    const fixed = await upload([asReq(J25)], { choices: pick }, t2.db);
+    trips.preview25chosen = t2.tally.n;
+    const innerPl = fixed.files.flatMap((f) => f.placements).filter((p) => p.partName === INNER);
+    ok('A CHOICE MAPS AN UNMATCHED PART: one answer by the part name covers all 16 pieces on 4 nests — by "choice", chosen, laid where they are drawn, the nested outline stored', innerPl.length === 16 && innerPl.every((p) => p.by === 'choice' && p.chosen === true && p.cutPlateId === fx.cut.SPBX && p.shapeFrom === 'nesting file' && J(p.outlineDiffers) === J({ drawn: [1770, 400], cutPiece: [1800, 400] }) && p.allowanceMm === undefined && Math.abs(Math.max(p.length, p.width) - 1770) < 0.1)
+      && !fixed.problemList.some((x) => x.code === 'PART_UNKNOWN') && fixed.problems.length === 0 && fixed.canSave === true, J([fixed.problems, innerPl[0] && { ...innerPl[0], rings: 0 }]));
+    ok('…its row now reads "chosen", and a note says how the sizes differ and what is stored', rowOf(fixed, INNER).status === 'chosen' && rowOf(fixed, INNER).matched.cutPlateId === fx.cut.SPBX && rowOf(fixed, INNER).matched.by === 'choice' && rowOf(fixed, INNER).open === 0 && fixed.jobs[0].matchedBy.choice === 16 && fixed.jobs[0].matched === 116
+      && fixed.files.some((f) => f.notes.some((s) => s.includes(`${fx.code('SPBX')} was chosen for "${INNER}", which is another size: it is drawn 1770 × 400, the cut piece is 1800 × 400. The nested outline is what is cut`))), J([rowOf(fixed, INNER).status, fixed.jobs[0].matchedBy, fixed.files.flatMap((f) => f.notes).filter((s) => /was chosen/.test(s))[0]]));
+    ok(`…and the choice costs no round trip: the preview is ${trips.preview25chosen} with it, ${trips.preview25} without — what every other job costs (${trips.preview10})`, trips.preview25chosen === trips.preview25 && trips.preview25 === trips.preview10, J(trips));
+
+    // ---- changing what the ladder matched ------------------------------------------
+    let out = await upload([asReq(J25)], { choices: { [J25.filename]: { ...pick[J25.filename], [TOP]: fx.cut.TF } } });
+    let topPl = out.files.flatMap((f) => f.placements).filter((p) => p.partName === TOP);
+    ok('A CHOICE OVERRIDES A LADDER MATCH: the top flange, matched by size to the 6135 one, is the 6120 one because the user said so — with the allowance said', topPl.length === 8 && topPl.every((p) => p.by === 'choice' && p.chosen === true && p.cutPlateId === fx.cut.TF && p.allowanceMm === 15) && rowOf(out, TOP).status === 'chosen' && rowOf(out, TOP).matched.allowanceMm === 15 && out.problems.length === 0
+      && out.coverage.find((x) => x.cutPlateId === fx.cut.TF).nested === 8 && out.coverage.find((x) => x.cutPlateId === fx.cut.TFX).nested === 0, J([out.problems, topPl[0] && { ...topPl[0], rings: 0 }]));
+    ok('…a piece the user chose is under "choice", never in the allowance count (still the 8 of the bottom flange)', out.jobs[0].matchedBy.allowance === 8 && out.jobs[0].matchedBy.choice === 24, J(out.jobs[0].matchedBy));
+    out = await upload([asReq(J25)], { choices: { [J25.filename]: { ...pick[J25.filename], [TOP]: fx.cut.TF }, [`${J25.filename} nest 1`]: { P1: fx.cut.TFX } } });
+    topPl = out.files.flatMap((f) => f.placements.map((p) => ({ ...p, nest: f.jobNestNo }))).filter((p) => p.partName === TOP);
+    ok('A PART ID BEATS ITS NAME: nest 1\'s P1 is the cut piece chosen for it, the other 7 pieces the one chosen for the name — the row says both', topPl.filter((p) => p.cutPlateId === fx.cut.TFX).length === 1 && topPl.find((p) => p.cutPlateId === fx.cut.TFX).partId === 'P1' && topPl.find((p) => p.cutPlateId === fx.cut.TFX).nest === 1 && topPl.filter((p) => p.cutPlateId === fx.cut.TF).length === 7 && topPl.every((p) => p.by === 'choice')
+      && J(rowOf(out, TOP).matchedTo.map((x) => [fx.sfxOfCut(x.cutPlateId), x.pieces])) === J([['TF', 7], ['TFX', 1]]) && rowOf(out, TOP).matched.cutPlateId === fx.cut.TF, J(rowOf(out, TOP).matchedTo));
+    out = await upload([asReq(J25)], { choices: { [J25.filename.replace(/\.nif$/, '')]: { [INNER]: fx.code('SPBX') } } });
+    ok('the old key forms still work: the job named without ".nif", the cut piece by its code', out.problems.length === 0 && rowOf(out, INNER).status === 'chosen', J(out.problems));
+
+    // ---- what is refused, and what still blocks ------------------------------------
+    out = await upload([asReq(J25)], { choices: { [J25.filename]: { [INNER]: 'NOT-A-CUT-PIECE' } } });
+    let bad = out.problemList.filter((x) => x.code === 'CHOICE_INVALID');
+    ok('CHOICE_INVALID — a value that is no cut piece of the line: said once per nest the part is on, the part left unmatched', bad.length === 4 && bad.every((x) => x.partName === INNER && x.partKey === INNER && /"NOT-A-CUT-PIECE" was chosen for it, but that is not one of this line's cut pieces\./.test(x.message)) && rowOf(out, INNER).status === 'unmatched' && out.canSave === false && !out.problemList.some((x) => x.code === 'PART_UNKNOWN'), J(out.problems.slice(0, 2)));
+    out = await upload([asReq(J25)], { choices: { [J25.filename]: { ...pick[J25.filename], 'NO SUCH PART': fx.cut.TF } } });
+    bad = out.problemList.filter((x) => x.code === 'CHOICE_INVALID');
+    ok('CHOICE_INVALID — a part name that is not a part of that job: said once, for the job', bad.length === 1 && J(bad[0].parts) === J(['NO SUCH PART']) && bad[0].message === `${J25.filename}: a cut piece was chosen for "NO SUCH PART", but that is not a part of this job. Nothing was done with it — take the choice away, or choose again.` && out.canSave === false, J(out.problems));
+    out = await upload([asReq(J25)], { choices: { [`${J25.filename} nest 2`]: { P99: fx.cut.TF }, ...pick } });
+    bad = out.problemList.filter((x) => x.code === 'CHOICE_INVALID');
+    ok('…and a part id the nest does not have: said once, for the nest', bad.length === 1 && /nest 2: a cut piece was chosen for "P99", but that is not a part of this nest\./.test(bad[0].message), J(out.problems));
+    out = await upload([asReq(J25)], { choices: { [J25.filename]: { [INNER]: fx.cut.WEBA } } });
+    ok('A CHOSEN CUT PIECE OF ANOTHER THICKNESS STILL BLOCKS: PART_WRONG_THICKNESS, in words', out.canSave === false && out.problemList.some((x) => x.code === 'PART_WRONG_THICKNESS' && x.message.includes(`${fx.code('WEBA')} is 16 mm and ${fx.plateCode('P25')} is 25 mm, so it cannot be cut from it.`)) && rowOf(out, INNER).status === 'chosen', J(out.problems.slice(0, 2)));
+    out = await upload([asReq(J25)], { choices: { [J25.filename]: { ...pick[J25.filename] }, [`${J25.filename} nest 1`]: { P1: fx.cut.TF23 } } });
+    ok('…one 2 mm thinner is the warning it always was (PART_THINNER_THAN_PLATE), not a blocker', out.problems.length === 0 && out.warningList.some((w) => w.code === 'PART_THINNER_THAN_PLATE' && w.cutPlateId === fx.cut.TF23) && out.needsForce === true, J([out.problems, out.warnings]));
+
+    // ---- saved with the choice ------------------------------------------------------
+    const lotsBefore = (await liveLots()).length;
+    const t3 = counting(conn);
+    const saved = await upload([asReq(J25)], { choices: pick, dryRun: false, force: fixed.needsForce }, t3.db);
+    trips.save25 = t3.tally.n;
+    const [rows] = await conn.query("SELECT p.cut_plate_id, p.rings_json FROM cf_nest_placements p JOIN cf_plate_lots l ON l.id = p.plate_lot_id AND l.company_id = p.company_id WHERE l.company_id = ? AND l.order_line_id = ? AND l.deleted_at IS NULL AND l.lot_no LIKE '25MM-%' AND p.deleted_at IS NULL", [COMPANY, fx.lineId]);
+    ok(`SAVED with the choice: 5 plates, 116 pieces — in ${trips.save25} round trips, what the 11-nest job cost (${trips.save16})`, saved.applied === true && saved.saved.lots === 5 && saved.saved.pieces === 116 && (await liveLots()).length === lotsBefore + 5 && trips.save25 === trips.save16, J([saved.message, trips]));
+    ok('…the 16 chosen pieces are stored as that cut piece, with the nested outline', rows.filter((r) => Number(r.cut_plate_id) === Number(fx.cut.SPBX)).length === 16 && rows.filter((r) => Number(r.cut_plate_id) === Number(fx.cut.SPBX)).every((r) => /"asCut":\s*true/.test(typeof r.rings_json === 'string' ? r.rings_json : J(r.rings_json))), J(rows.slice(0, 1)));
+    const view = await N.getNesting(conn, COMPANY, fx.lineId);
+    const kept = view.groups.flatMap((g) => g.nests).filter((x) => x.lotNo.startsWith('25MM-')).flatMap((x) => x.pieces).filter((p) => p.cutPlateId === fx.cut.SPBX);
+    ok('…and GET …/nesting shows them at the size they are nested (1770 × 400), not the cut piece\'s 1800', kept.length === 16 && kept.every((p) => Math.abs(Math.max(p.length, p.width) - 1770) < 0.1 && p.shapeFrom === 'nesting file'), J(kept.slice(0, 1).map((p) => [p.length, p.width, p.shapeFrom])));
   }
 } catch (err) {
   failed += 1;

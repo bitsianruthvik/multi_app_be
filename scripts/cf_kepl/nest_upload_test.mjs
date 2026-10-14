@@ -320,6 +320,21 @@ try {
     f = F.nestFile(name('X4'), PS, [F.place(fx, 'R', 100, 100), { shape: D.rectShape(333, 222), x: 1500, y: 100, label: 'ZZ-9' }]);
     out = await one(f);
     ok('a part that is none of the line\'s cut plates', out.canSave === false && has(out, 'PART_UNKNOWN', f.filename, psCode, 'P2', 'ZZ-9', '333 x 222'), J(out.problems));
+    // THE PARTS TABLE (2026-10-14): one row per distinct DXF part, with every cut piece of the line ranked for it.
+    {
+      const rows = out.dxfPartRows; const lost = rows.find((r) => r.status === 'unmatched'); const found = rows.find((r) => r.status === 'matched');
+      const all = Object.keys(fx.cut).length;
+      ok('dxfPartRows: the unmatched part first — its label, size, file and part id, nothing matched, and EVERY cut piece of the line best fit first', rows.length === 2 && rows[0] === lost && lost.label === 'ZZ-9' && J(lost.drawn) === J([333, 222]) && lost.matched === null && lost.open === 1 && lost.pieces === 1 && J(lost.files) === J([{ filename: f.filename, partIds: ['P2'] }])
+        && lost.candidates.length === all && lost.candidates.every((k, i) => i === 0 || lost.candidates[i - 1].fit <= k.fit) && lost.candidates.every((k) => typeof k.why === 'string' && k.why.length > 0 && k.length >= k.width)
+        && out.problemList.find((p) => p.code === 'PART_UNKNOWN').partKey === lost.key, J([rows.map((r) => ({ ...r, candidates: r.candidates.length })), all, lost.candidates.slice(0, 3)]));
+      ok('…and the matched part says what it is and how; its placement points at its row; its own cut piece leads its list ("same size")', found.matched.cutPlateId === fx.cut.R && found.matched.by === 'label' && found.label === fx.code('R') && J(found.drawn) === J([1200, 400]) && out.files[0].placements[0].partKey === found.key && found.candidates[0].cutPlateId === fx.cut.R && found.candidates[0].why === 'same size' && found.candidates[0].needed === 5, J([{ ...found, candidates: found.candidates.slice(0, 2) }, out.files[0].placements[0].partKey]));
+      const picked = await one(f, { choices: { [f.filename]: { P2: fx.cut.H } } });
+      const pl = picked.files[0].placements.find((p) => p.partId === 'P2');
+      ok('A CHOICE MAPS AN UNMATCHED DXF PART: taken as the cut piece chosen (by "choice", chosen), the outline in the file stored because it is another size — and a note says so', !picked.problemList.some((p) => p.code === 'PART_UNKNOWN') && pl?.by === 'choice' && pl.chosen === true && pl.cutPlateId === fx.cut.H && pl.shapeFrom === 'nesting file' && pl.length === 333 && pl.width === 222 && J(pl.outlineDiffers) === J({ drawn: [333, 222], cutPiece: [300, 180] })
+        && picked.dxfPartRows.find((r) => r.label === 'ZZ-9').status === 'chosen' && picked.files[0].notes.some((n) => n.includes(`${fx.code('H')} was chosen for "ZZ-9", which is another size: it is drawn 333 × 222, the cut piece is 300 × 180.`)), J([picked.problems, pl && { ...pl, rings: 0 }, picked.files[0].notes]));
+      const swapped = await one(f, { choices: { [f.filename]: { P1: fx.cut.H, P2: fx.cut.H } } });
+      ok('A CHOICE OVERRIDES A LABEL MATCH: the part labelled as one cut piece is the other because the user said so', swapped.files[0].placements.every((p) => p.by === 'choice' && p.cutPlateId === fx.cut.H) && swapped.dxfPartRows.every((r) => r.status === 'chosen'), J(swapped.files[0].placements.map((p) => [p.partId, p.cutPlateCode, p.by])));
+    }
 
     f = F.nestFile(name('X5'), PS, [F.place(fx, 'R', 100, 100), F.place(fx, 'X1', 1500, 100, 0, false, null)]);
     out = await one(f);
@@ -329,8 +344,14 @@ try {
       && out.files[0].notes.some((n) => /shared out/.test(n) && n.includes(fx.code('X1')) && n.includes(fx.code('X2'))), J([out.problems, out.files[0].notes, out.files[0].placements.map((p) => [p.cutPlateCode, p.by])]));
     out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [sharedOne.partId]: fx.cut.X2 } } });
     ok('…the user choosing by hand still wins', out.canSave === true && out.problems.length === 0 && out.files[0].counts.some((x) => x.cutPlateId === fx.cut.X2 && x.qty === 1) && out.files[0].placements.find((p) => p.partId === sharedOne.partId).by === 'choice', J(out.problems));
+    // (2026-10-14) Any cut piece of the line may be chosen for any part; only what names no cut piece, or no part, is refused.
     out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [sharedOne.partId]: fx.code('R') } } });
-    ok('…and a choice it cannot be is refused', has(out, 'CHOICE_INVALID', f.filename, fx.code('X1')), J(out.problems));
+    const forced = out.files[0].placements.find((p) => p.partId === sharedOne.partId);
+    ok('…a cut piece the ladder would not have offered may be chosen all the same (it was CHOICE_INVALID before): taken, and the answer says how the sizes differ', !out.problemList.some((p) => p.code === 'CHOICE_INVALID') && forced?.by === 'choice' && forced.chosen === true && forced.cutPlateId === fx.cut.R && J(forced.outlineDiffers) === J({ drawn: [350, 350], cutPiece: [1200, 400] }) && forced.shapeFrom === 'nesting file' && forced.length === 350, J([out.problems, forced && { ...forced, rings: 0 }]));
+    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { [sharedOne.partId]: 'NOT-A-CUT-PIECE' } } });
+    ok('…a choice that names no cut piece of the line is refused', has(out, 'CHOICE_INVALID', f.filename, '"NOT-A-CUT-PIECE" was chosen for it, but that is not one of this line\'s cut pieces.'), J(out.problems));
+    out = await upload(fx, [{ filename: f.filename, file: f.file }], { choices: { [f.filename]: { P77: fx.cut.R } } });
+    ok('…and so is a choice for a part the file does not have', has(out, 'CHOICE_INVALID', f.filename, 'a cut piece was chosen for "P77", but that is not a part of this file.'), J(out.problems));
     // A labelled twin is counted first: the unlabelled one gets what is left.
     f = F.nestFile(name('X5b'), PS, [F.place(fx, 'X1', 100, 100), F.place(fx, 'X1', 1500, 100, 0, false, null)]);
     out = await one(f);
