@@ -240,6 +240,11 @@ try {
     ok('the line is now over-covered: an error that names the surplus parts and where they are', dry.needsForce === true && over.length === 2 && dry.surplus.length === 2
       && over.some((w) => w.cutPlateCode === fx.code('R') && w.surplus === 1 && w.message.includes(extra.filename) && /needs only 5/.test(w.message))
       && over.some((w) => w.cutPlateCode === fx.code('H') && w.surplus === 1), J(dry.warnings));
+    // Review wording (2026-10-14): every cut piece of the line once, with the parts it is cut for (name, mark).
+    const piecesById = new Map((dry.cutPieces ?? []).map((c) => [c.cutPlateId, c]));
+    ok('cutPieces: every cut piece of the line once, with its size and the parts cut from it', dry.cutPieces?.length > 0 && piecesById.size === dry.cutPieces.length
+      && dry.cutPieces.every((c) => c.code && Array.isArray(c.parts) && c.thickness > 0 && c.length > 0 && c.width > 0)
+      && dry.surplus.every((s) => piecesById.get(s.cutPlateId)?.parts.some((p) => p.mark || p.name)), J(dry.cutPieces?.slice(0, 3)));
     const refused = await upload(fx, [extra], { dryRun: false });
     ok('…and it is NOT saved without force', refused.applied === false && /Not saved/.test(refused.message) && (await liveLots(fx)).length === 4, refused.message);
     if (DOC) doc.overCoverage = { warnings: dry.warnings, surplus: dry.surplus, message: refused.message };

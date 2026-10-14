@@ -1252,13 +1252,14 @@ function jobSummaries(jobs, entries, tables = null) {
 
 /**
  * The rows cut from each cut plate — the item whose BOM holds it — with their code and DRAWING
- * MARK: the other names a customer's file may give a part. Two reads, whatever the size.
- * → [{ cutPlateId, code, mark }]
+ * MARK: the other names a customer's file may give a part — and its NAME, which the review shows
+ * beside the cut piece (2026-10-14). Two reads, whatever the size.
+ * → [{ cutPlateId, code, name, mark }]
  */
 async function rowsCutFrom(db, companyId, cutPlateIds) {
   if (!cutPlateIds.length) return [];
   const [parents] = await db.query(
-    `SELECT bl.child_id AS cut_plate_id, m.id, m.code
+    `SELECT bl.child_id AS cut_plate_id, m.id, m.code, m.name
        FROM cf_bom_lines bl
        JOIN cf_boms b ON b.id = bl.bom_id AND b.company_id = bl.company_id AND b.deleted_at IS NULL
        JOIN cf_master_records m ON m.id = b.parent_id AND m.company_id = b.company_id AND m.deleted_at IS NULL
@@ -1274,7 +1275,7 @@ async function rowsCutFrom(db, companyId, cutPlateIds) {
     [companyId, [...new Set(parents.map((p) => p.id))]],
   );
   const markOf = new Map(marks.map((r) => [Number(r.subject_id), r.value_text]));
-  return parents.map((p) => ({ cutPlateId: Number(p.cut_plate_id), code: p.code ?? null, mark: markOf.get(Number(p.id)) ?? null }));
+  return parents.map((p) => ({ cutPlateId: Number(p.cut_plate_id), code: p.code ?? null, name: p.name ?? null, mark: markOf.get(Number(p.id)) ?? null }));
 }
 
 /** Everything an upload is checked against, read once (a fixed number of round trips). */
@@ -1290,12 +1291,20 @@ async function uploadContext(db, companyId, lineId) {
   // A cut plate answers to its own code, and to the drawing mark and item code of every row cut from it.
   const codes = new Map(ctx.cutPlates.map((cp) => [cp.id, new Set([cp.code].filter(Boolean))]));
   for (const row of rows) { const s = codes.get(row.cutPlateId); if (s) { if (row.mark) s.add(row.mark); if (row.code) s.add(row.code); } }
+  // The parts each cut piece is cut for, by name and mark, once each: what the review calls the cut piece.
+  const partsOf = new Map();
+  for (const row of rows) {
+    if (!row.name && !row.mark) continue;
+    if (!partsOf.has(row.cutPlateId)) partsOf.set(row.cutPlateId, new Map());
+    partsOf.get(row.cutPlateId).set(`${row.name ?? ''}|${row.mark ?? ''}`, { name: row.name ?? null, mark: row.mark ?? null });
+  }
   const shapes = new Map();
   const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
   const usable = ctx.cutPlates.filter((cp) => cp.steel?.length > 0 && cp.steel?.width > 0 && cp.steel?.thickness > 0);
   const candidates = usable.map((cp) => { const s = shapeOf(cp); return { key: `cp${cp.id}`, codes: [...codes.get(cp.id)], rings: s.drawn ? s.rings : null, length: cp.steel.length, width: cp.steel.width }; });
   return {
     ...ctx, facts, saved, excl, candidates, shapeOf,
+    partsOf: new Map([...partsOf].map(([id, m]) => [id, [...m.values()].sort((a, b) => String(a.name ?? a.mark).localeCompare(String(b.name ?? b.mark)))])),
     // Every size a catalog plate comes in: what tells the reader a plate from the drawing frame round it.
     plateSizes: ctx.plates.filter((p) => p.steel?.length > 0 && p.steel?.width > 0).map((p) => ({ length: p.steel.length, width: p.steel.width })),
     cpByKey: new Map(usable.map((cp) => [`cp${cp.id}`, cp])),
@@ -1549,6 +1558,12 @@ export async function uploadNestFiles(db, c, lineId, input = {}) {
     problems: problems.map((p) => p.message), problemList: problems,
     warnings: warnings.map((w) => w.message), warningList: warnings,
     diff, coverage, leftOver, surplus,
+    // Every cut piece of the line, once, with the parts it is cut for: how the review names a cut piece (no extra read).
+    cutPieces: ctx.cutPlates.map((cp) => ({
+      cutPlateId: cp.id, code: cp.code, name: cp.name ?? null,
+      thickness: cp.steel?.thickness ?? null, length: cp.steel?.length ?? null, width: cp.steel?.width ?? null, grade: cp.steel?.grade ?? null,
+      needed: Number(cp.pieces) || 0, parts: ctx.partsOf.get(cp.id) ?? [],
+    })),
     // Plates these files are cut on that are not catalog items ([] when every plate was found): POST …/nesting/plates adds them.
     missingPlates,
     totals: totalsOfLots(finalLots, leftOver),
