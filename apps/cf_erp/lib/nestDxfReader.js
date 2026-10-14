@@ -73,6 +73,8 @@ const OPEN_PART_MIN_SEGMENTS = 3;
 const OPEN_PART_GAP_BLOCK_MM = 25;
 /** Kerf compensation (matchNest): the most a file's outlines may be drawn outside the part, per side. */
 export const KERF_OFFSET_MAX_MM = 3;
+/** A ProNest part may be nested this much LONGER than its cut piece (a cutting / trimming allowance on the long side). */
+export const CUT_ALLOWANCE_MAX_MM = 25;
 const MIN_LOOP_AREA = 1;                // mm²: anything smaller is not a shape
 const PIERCE_MAX_DIA = 2;               // mm: a circle this small is a pierce mark, not a hole
 const MAX_CHARS = 40e6;
@@ -1786,6 +1788,7 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
     return {
       partId: part.id, candidateKey: c.key, x: fit.x, y: fit.y, rotationDeg: fit.rotationDeg, mirrored: fit.mirrored, by, confidence: Math.round((base - (fit.tier === 2 ? 0.2 * ratio : 0)) * 100) / 100, error: Math.round(fit.error * 1e3) / 1e3,
       ...(fit.outlineDiffers ? { outlineDiffers: fit.outlineDiffers } : {}),
+      ...(fit.allowanceMm != null ? { allowanceMm: fit.allowanceMm } : {}),
     };
   };
   /**
@@ -1796,8 +1799,18 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
   const fitNameSize = (c, shape, nameSize, drawnSize = null) => {
     if (!nameSize || !(c.length > 0 && c.width > 0)) return null;
     const [n0, n1] = nameSize;
-    const off = Math.min(Math.max(Math.abs(n0 - c.length), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - c.length)));
-    if (!(off <= 1)) return null;
+    let off = Math.min(Math.max(Math.abs(n0 - c.length), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - c.length)));
+    let allowanceMm = null;
+    if (!(off <= 1)) {
+      // CUTTING ALLOWANCE (2026-10-14, from a shop's real jobs): the long side is nested a little OVER the finished
+      // length — flanges 6135 for 6120, 11950 / 11955 for 11940, webs 6130 for 6120 — and trimmed after welding.
+      // The short side is the finished width exactly. Accepted up to CUT_ALLOWANCE_MAX_MM over, never under.
+      const [nl, nw] = n0 >= n1 ? [n0, n1] : [n1, n0];
+      const [cl, cw] = c.length >= c.width ? [c.length, c.width] : [c.width, c.length];
+      const over = nl - cl;
+      if (!(Math.abs(nw - cw) <= 1 && over > 1 && over <= CUT_ALLOWANCE_MAX_MM)) return null;
+      allowanceMm = r1(over); off = over;
+    }
     const { a, b, angleDeg, corners } = shape.mbr;
     const along = Math.abs(a - c.length) + Math.abs(b - c.width) <= Math.abs(a - c.width) + Math.abs(b - c.length);
     let rotationDeg = Math.min(...(along ? [angleDeg, angleDeg + 180] : [angleDeg + 90, angleDeg + 270]).map((d) => normDeg(Math.round(d * 1e4) / 1e4)));
@@ -1805,10 +1818,18 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
     if (Math.abs(rotationDeg - snap) < 0.003) rotationDeg = normDeg(snap);
     const box = boxOf(corners);
     return {
-      x: r4(box.x0), y: r4(box.y0), rotationDeg, mirrored: false, error: off, tolEff: 1, tier: 0,
+      x: r4(box.x0), y: r4(box.y0), rotationDeg, mirrored: false, error: off, tolEff: 1, tier: 0, ...(allowanceMm != null ? { allowanceMm } : {}),
       // `drawn`: the part as it lies in its own drawing when the job says so (the smallest rectangle round a cambered web is a tilted one).
       outlineDiffers: { drawn: (drawnSize ?? [a, b]).slice().sort((p, q) => q - p).map(r1), cutPiece: [r1(Math.max(c.length, c.width)), r1(Math.min(c.length, c.width))] },
     };
+  };
+
+  /** Candidates that fit EXACTLY beat those that fit only with a cutting allowance; among those, the smallest allowance. */
+  const exactFirst = (hits) => {
+    const exact = hits.filter((h) => h.f.allowanceMm == null);
+    if (exact.length) return exact;
+    const least = Math.min(...hits.map((h) => h.f.allowanceMm));
+    return hits.filter((h) => h.f.allowanceMm - least < 0.05);
   };
 
   /** One part, with the rings given: { placed, tier } | { ambiguous, tier } | { unmatched }. */
@@ -1860,7 +1881,13 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
     if (hits.length) return settle(hits, null);
     // 4. (a ProNest part) the size written in its name, when its outline is another size.
     const sized = byName(pool);
-    if (sized.length) return settle(sized, 'name size');
+    if (sized.length) return settle(exactFirst(sized), 'name size');
+    // 5. (a ProNest part) no size in its name, or none that fits: the OUTLINE's own size, over by a cutting allowance.
+    if (loose) {
+      const { a, b } = shape.mbr;
+      const drawn = pool.map((c) => ({ c, f: fitNameSize(c, shape, [a, b], part.drawnSize ?? null) })).filter((h) => h.f);
+      if (drawn.length) return settle(exactFirst(drawn), 'size');
+    }
     if (mislabelled) return mislabelled;
     const said = (part.labels ?? []).length && !labelled.length ? `Its label "${part.labels[0]}" is not one of the codes, and none` : 'None';
     // A face closed in by cuts it shares with its neighbours, that is nobody's shape: most likely the scrap between them.

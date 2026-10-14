@@ -653,7 +653,9 @@ async function places(db, companyId) {
  * Reading the line: its cut plates, how many of each, and their steel
  * ------------------------------------------------------------------------ */
 
-const SIZE_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE', 'MATERIAL', 'DENSITY'];
+// IMPACT_CLASS (2026-10-14): two catalog plates of one size, thickness and grade differ only by it (E350 BO / E350 BR) —
+// an uploaded nest is told which by the cut pieces on it (nestDxfImportService.resolvePlate).
+const SIZE_CODES = ['THICKNESS', 'LENGTH', 'WIDTH', 'GRADE', 'MATERIAL', 'DENSITY', 'IMPACT_CLASS'];
 
 /**
  * Every value an item ends up with is STORED on the item (decision Q18), so the
@@ -708,6 +710,7 @@ function steelOf(values) {
     grade: opt('GRADE'),
     material: opt('MATERIAL'),
     density: n('DENSITY'),
+    impactClass: opt('IMPACT_CLASS'),
   };
 }
 

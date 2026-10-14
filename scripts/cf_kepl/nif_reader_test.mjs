@@ -117,6 +117,19 @@ section('2b. matchNest for a ProNest part — the rungs, on parts made by hand')
   ok('…never the quantity, the thickness or the size the name also holds (cut pieces coded "7", "12MM", "300X600" are not named by it)', J(r.ambiguous) === J(['seven', 'mm', 'sz']), J(r));
   r = one(part('P1', '12MM-WEB-280X600- 2', plain), [{ key: 'web', codes: ['ZZ-2'], rings: null, length: 600, width: 280 }]);
   ok('name size: drawn 600 × 300, named 280X600 — the cut piece of 600 × 280 is it, by "name size", saying both sizes', r.candidateKey === 'web' && r.by === 'name size' && J(r.outlineDiffers) === J({ drawn: [600, 300], cutPiece: [600, 280] }), J(r));
+  // 2026-10-14 — CUTTING ALLOWANCE (from a shop's real jobs: flanges nested 6135 for 6120, 11955 for 11940).
+  const flange = { outline: rect(6135, 500, 5, 5), cutouts: [], holes: [] };
+  const fl = (key, length, width) => ({ key, codes: [`ZZ-${key}`], rings: null, length, width });
+  r = one(part('P1', '25MM-TOP FL1-500X6135- 8', flange), [fl('tf', 6120, 500), fl('wide', 6120, 750)]);
+  ok('allowance: named and drawn 15 mm longer than the cut piece, same width — matched, the allowance said', r.candidateKey === 'tf' && r.allowanceMm === 15 && J(r.outlineDiffers?.cutPiece) === J([6120, 500]), J(r));
+  r = one(part('P1', '25MM-TOP FL1-500X6135- 8', flange), [fl('exact', 6135, 500), fl('short', 6120, 500)]);
+  ok('…a cut piece of exactly that size beats one that fits only with an allowance', r.candidateKey === 'exact' && r.allowanceMm == null, J(r));
+  r = one(part('P1', '25MM-TOP FL1-500X6135- 8', flange), [fl('far', 6100, 500), fl('thin', 6120, 480), fl('longer', 6140, 500)]);
+  ok('…never more than 25 mm over, never another width, never SHORTER than the cut piece', typeof r.unmatched === 'string', J(r));
+  r = one(part('P1', '25MM-TOP FL1-500X6135- 8', flange), [fl('near', 6125, 500), fl('nearer', 6130, 500)]);
+  ok('…of two that fit with an allowance, the smaller allowance', r.candidateKey === 'nearer' && r.allowanceMm === 5, J(r));
+  r = one({ ...part('P1', 'FLANGE', flange), nameSize: null }, [fl('tf', 6120, 500)]);
+  ok('…with no size in the name, the outline\x27s own size does the same (by "size")', r.candidateKey === 'tf' && r.by === 'size' && r.allowanceMm === 15, J(r));
   r = one(part('P1', '12MM-GP-7-900X900- 2', plain), [{ ...bare, length: 900, width: 400 }, { key: 'other', codes: ['ZZ-3'], rings: null, length: 600, width: 300 }]);
   ok('a name that holds a code of ANOTHER shape and size does not end the search: the outline finds the cut piece it is', r.candidateKey === 'other' && r.by === 'size', J(r));
   r = one(part('P1', '12MM-GP-7-900X900- 2', plain), [{ ...bare, length: 900, width: 400 }]);

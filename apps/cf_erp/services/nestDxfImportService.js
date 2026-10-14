@@ -293,6 +293,7 @@ function resolvePlate({ file, nest, placed, ctx }) {
   const thickness = hints.thicknessMm ?? vote((s) => (s.thickness > 0 ? r3(s.thickness) : null));
   const grade = vote((s) => norm(s.grade));
   const material = vote((s) => norm(s.material));
+  const impact = vote((s) => norm(s.impactClass));
 
   if (file.plateCode) {
     const plate = byCode(file.plateCode);
@@ -330,10 +331,19 @@ function resolvePlate({ file, nest, placed, ctx }) {
     const loose = hits.filter((p) => agrees(p.steel.grade, hintGrade ?? grade) && agrees(p.steel.material, material));
     hits = exact.length ? exact : same.length ? same : loose.length ? loose : hits;
   }
+  // Still two or more: plates of one size, thickness and grade that differ by impact class (E350 BO / E350 BR).
+  // The cut pieces on the nest say which — the plate of THEIR impact class (user, 2026-10-14: "it should pick
+  // that info from the cut piece"). Only when exactly that narrows it; a nest of mixed classes still asks.
+  let byImpact = false;
+  if (hits.length > 1 && impact != null) {
+    const same = hits.filter((p) => norm(p.steel.impactClass) === impact);
+    const mixed = new Set(steels.map((s) => norm(s.impactClass)).filter((v) => v != null)).size > 1;
+    if (same.length >= 1 && same.length < hits.length && !mixed) { hits = same; byImpact = true; }
+  }
   if (hits.length > 1) {
     return { error: { code: 'PLATE_AMBIGUOUS', message: `${sizeWords}${thickness != null ? ` at ${fmt(thickness)} mm` : ''} is ${plural(hits.length, 'catalog plate', 'catalog plates')} (${hits.map((p) => `${p.code}${p.steel.grade ? ` ${p.steel.grade}` : ''}`).join(', ')}) — name the one you mean (plateCode).`, choices: hits.map((p) => p.code) } };
   }
-  return { plate: hits[0], by: 'size' };
+  return { plate: hits[0], by: 'size', ...(byImpact ? { byImpactClass: steels.find((s) => s.impactClass != null)?.impactClass ?? null } : {}) };
 }
 
 /** A catalog plate by its code (exactly, else ignoring spaces, dashes and underscores). */
@@ -532,6 +542,7 @@ function prepareFile(file, ctx, choices) {
   // kerf in from the plate's corner (when there is room), and the answer says by how much.
   let dx = 0; let dy = 0;
   if (!drawn && plate && nest.plate.length + 2 * k <= lotL + 1e-6 && nest.plate.width + 2 * k <= lotW + 1e-6) { dx = k; dy = k; }
+  if (plate && res.byImpactClass) entry.notes.push(`${plate.code} was chosen among plates of this size, thickness and grade because the cut pieces on the nest are ${res.byImpactClass}.`);
   entry.plate = plate
     ? { itemId: plate.id, code: plate.code, name: plate.name ?? null, thickness: plate.steel.thickness, grade: plate.steel.grade ?? null, material: plate.steel.material ?? null, length: lotL, width: lotW, drawn, resolvedBy: res.by, offset: [dx, dy], kerfMm: k }
     : { itemId: null, code: null, length: lotL, width: lotW, drawn, resolvedBy: null, offset: [0, 0], kerfMm: k };
@@ -703,6 +714,10 @@ function prepareFile(file, ctx, choices) {
       for (const pl of placed) if (pl.outlineDiffers && !byCode.has(pl.cp.id)) byCode.set(pl.cp.id, pl);
       for (const pl of byCode.values()) {
         const d = pl.outlineDiffers;
+        if (pl.allowanceMm != null) {
+          entry.notes.push(`${pl.cp.code} ("${pl.part.partName ?? pl.part.labels?.[0] ?? ''}") is nested ${fmt(pl.allowanceMm)} mm longer than the cut piece (${fmt(d.cutPiece[0])} × ${fmt(d.cutPiece[1])}) — taken as the cutting allowance. The nested outline is what is cut; the cut piece keeps its own length and weight.`);
+          continue;
+        }
         entry.notes.push(`${pl.cp.code} ("${pl.part.partName ?? pl.part.labels?.[0] ?? ''}") was matched by the size in its name: it is drawn ${fmt(d.drawn[0])} × ${fmt(d.drawn[1])}, the cut piece is ${fmt(d.cutPiece[0])} × ${fmt(d.cutPiece[1])} — the nesting's outline is another size (camber, or an allowance for cutting). The nested outline is what is cut: it is what is stored and measured here; the cut piece keeps its own size.`);
       }
     }
@@ -829,7 +844,7 @@ function prepareFile(file, ctx, choices) {
           shapeFrom: fileRings ? 'nesting file' : shape.shapeFrom,
           ...(pl.alternatives ? { alternatives: pl.alternatives } : {}),
           ...(nif ? { partName: pl.part?.partName ?? null } : {}),
-          ...(pl.outlineDiffers ? { outlineDiffers: pl.outlineDiffers } : {}),
+          ...(pl.outlineDiffers ? { outlineDiffers: pl.outlineDiffers } : {}), ...(pl.allowanceMm != null ? { allowanceMm: pl.allowanceMm } : {}),
         };
         pieces.push(piece);
         count.set(pl.cp.id, (count.get(pl.cp.id) ?? 0) + 1);
@@ -852,7 +867,7 @@ function prepareFile(file, ctx, choices) {
         shapeFrom: p.shapeFrom,
         ...(p.alternatives ? { alternatives: p.alternatives } : {}),
         ...(p.partName !== undefined ? { partName: p.partName } : {}),
-        ...(p.outlineDiffers ? { outlineDiffers: p.outlineDiffers } : {}),
+        ...(p.outlineDiffers ? { outlineDiffers: p.outlineDiffers } : {}), ...(p.allowanceMm != null ? { allowanceMm: p.allowanceMm } : {}),
       }));
       settle();
       if (!(plate && pieces.length)) return null;
