@@ -43,6 +43,8 @@ router.get('/commands/options', guard(ANY_ACTION, { note: NOTE }), handle(async 
   return {
     departments: r.departments.map((d) => ({ id: d.id, label: labelOf('department', d, r), parentId: d.parentId })),
     labels: r.labels,
+    // Every group with its labels (spec §15): add_department's `labels` field picks one per group other than Kind.
+    labelGroups: r.labelGroups,
     roles: r.roles.map((x) => ({ id: x.id, label: x.name })),
     positions: r.positions.map((p) => ({ id: p.id, label: labelOf('position', p, r), roleId: p.roleId, departmentId: p.departmentId, vacant: p.occupantId == null })),
     employees: r.employees.map((e) => ({ id: e.id, label: labelOf('employee', e, r) })),

@@ -10,8 +10,9 @@
  *   total   how many rows the list holds for this login before these filters
  *   count   how many are left ("38 of 220")
  *
- * IT COSTS NO QUERY of its own, with one exception: "department and below"
- * needs the department tree, one read, only when that filter is used. The rows
+ * IT COSTS NO QUERY of its own, with two exceptions, each read only when its
+ * filter is used: "department and below" needs the department tree (one read),
+ * and `label` needs every department's labels (two reads, spec §15.3). The rows
  * are already in memory — every one of these lists is read whole — so narrowing
  * them here is exact and cannot disagree with what a row shows.
  *
@@ -25,6 +26,7 @@
  */
 import { pool } from './db.js';
 import { ctx } from './http.js';
+import { labelIndex, labelMatcher } from '../services/labelGroupService.js';
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === '';
 const lower = (v) => String(v ?? '').trim().toLowerCase();
@@ -41,6 +43,13 @@ const matchesText = (fields) => (row, value) => {
 const oneOfIds = (pick) => (row, value) => { const ids = idSet(value); return !ids.size || ids.has(Number(pick(row))); };
 const oneOfWords = (pick) => (row, value) => { const words = csv(value).map(lower); return !words.length || words.includes(lower(pick(row))); };
 const flag = (pick) => (row, value) => { const want = yesNo(value); return want === null || Boolean(pick(row)) === want; };
+/**
+ * `label=<labelId>[,<labelId>…]` (spec §15.3): the department `pick(row)` gives
+ * carries the labels asked for — labels of one group are "any of", groups
+ * combine as "and". A department's OWN labels only, never its parents'. A
+ * Kind label's name is still taken (§13.6 had `label=Section`).
+ */
+const byLabel = (pick) => (row, value, aux) => aux.labelTest(value)(pick(row));
 /** "This department and everything below it." `tree.below(id)` is that set of ids. */
 const inDepartment = (pick) => (row, value, tree) => {
   const ids = idSet(value);
@@ -59,13 +68,14 @@ export const LIST_SPECS = {
     key: ['rows'],
     filters: {
       q: matchesText(['name', 'code']),
-      label: oneOfWords((r) => r.type),
+      label: byLabel((r) => r.id),
       shared: flag((r) => r.isShared),
       status: oneOfWords((r) => r.status),
       // Under this department, at any depth (the department itself is not "under" itself).
       parent: (row, value, tree) => { const ids = idSet(value); return !ids.size || [...ids].some((id) => id !== row.id && tree.below(id).has(row.id)); },
     },
     needsTree: ['parent'],
+    needsLabels: ['label'],
   },
   locations: { key: ['rows'], filters: { q: matchesText(['name', 'code']), status: oneOfWords((r) => r.status) } },
   roles: {
@@ -83,6 +93,7 @@ export const LIST_SPECS = {
     filters: {
       q: matchesText(['positionCode', 'positionTitle', 'roleTitle', (r) => r.occupant?.name, (r) => r.occupant?.employeeCode]),
       department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
       role: oneOfIds((r) => r.roleId),
       shift: oneOfIds((r) => r.defaultShiftId),
       location: oneOfIds((r) => r.locationId),
@@ -97,12 +108,14 @@ export const LIST_SPECS = {
       },
     },
     needsTree: ['department'],
+    needsLabels: ['label'],
   },
   employees: {
     key: ['items'],
     filters: {
       q: matchesText(['fullName', 'employeeCode']),
       department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
       role: oneOfIds((r) => r.roleId),
       shift: oneOfIds((r) => r.shiftId),
       location: oneOfIds((r) => r.locationId),
@@ -111,6 +124,7 @@ export const LIST_SPECS = {
       hasLogin: flag((r) => r.userId != null),
     },
     needsTree: ['department'],
+    needsLabels: ['label'],
   },
   hirings: {
     key: ['hirings'],
@@ -118,9 +132,11 @@ export const LIST_SPECS = {
       q: matchesText(['candidateName', 'positionCode', 'roleTitle', 'refNo']),
       stage: oneOfWords((r) => r.stage),
       department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
       role: oneOfIds((r) => r.roleId),
     },
     needsTree: ['department'],
+    needsLabels: ['label'],
   },
   documents: {
     key: ['items'],
@@ -180,12 +196,21 @@ const NO_TREE = { below: (id) => new Set([Number(id)]) };
 /** Which of a spec's filters the address actually uses. */
 export const activeFilters = (spec, query = {}) => Object.keys(spec.filters).filter((name) => !blank(query[name]));
 
-/** The rows a spec and an address leave. Reads the department tree only when a filter needs it. */
+/** The rows a spec and an address leave. Reads the department tree / the labels only when a filter needs them. */
 export async function filterRows(db, companyId, rows, query, spec) {
   const active = activeFilters(spec, query);
   if (!active.length) return rows;
   const tree = (spec.needsTree ?? []).some((n) => active.includes(n)) ? await departmentTree(db, companyId) : NO_TREE;
-  return rows.filter((row) => active.every((name) => spec.filters[name](row, query[name], tree)));
+  const index = (spec.needsLabels ?? []).some((n) => active.includes(n)) ? await labelIndex(db, companyId) : null;
+  const tests = new Map();
+  const aux = {
+    below: (id) => tree.below(id),
+    labelTest: (value) => {
+      if (!tests.has(value)) tests.set(value, index ? labelMatcher(index, value) : () => true);
+      return tests.get(value);
+    },
+  };
+  return rows.filter((row) => active.every((name) => spec.filters[name](row, query[name], aux)));
 }
 
 /** Narrows an answer in place of its rows, and adds `total` and `count`. */

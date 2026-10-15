@@ -3334,3 +3334,117 @@ CREATE TABLE IF NOT EXISTS hrms_search_vectors (
 
   CONSTRAINT fk_hsv_company FOREIGN KEY (company_id) REFERENCES companies(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 17. LABELS IN GROUPS (CF_HRMS_HIRING_SPEC.md §15, 2026-10-15)           ##
+-- ############################################################################
+-- A department's labels belong to named GROUPS, one label per group per
+-- department. Every company has the group "Kind" (required); its labels are the
+-- Department / Section / Machine list of §14. Other groups are the company's
+-- own ("Unit": Unit 1, Unit 2 …) and may be optional (a department may have
+-- none of that group).
+--
+--   hrms_label_groups            the groups, in the company's order
+--   hrms_department_labels       (§14) gains group_id: a label belongs to ONE group;
+--                                its name is unique WITHIN the group
+--   hrms_department_label_links  department -> its label in a group; ONE live
+--                                link per (department, group) (group_active)
+--
+-- hrms_departments.department_type STAYS and is kept equal to the department's
+-- Kind label name: writes go through the links and mirror into it in the same
+-- transaction (services/labelGroupService.js), so every older reader of the
+-- column — code-format conditions, the chart, the command bar — keeps working.
+--
+-- On a database that already has §14, scripts/apply-label-groups.mjs makes the
+-- Kind group per company, moves the labels into it and links every department
+-- from its department_type. It is idempotent and safe to run again after a
+-- deploy (it relinks any department written by an older backend meanwhile).
+--
+-- group_id is NULL-able on purpose: an older backend that is still running when
+-- the columns arrive inserts labels without it; the script (and the service,
+-- on first read) moves such a label into Kind.
+CREATE TABLE IF NOT EXISTS hrms_label_groups (
+  id           INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  name         VARCHAR(40)  NOT NULL,
+  sort_order   INT          NOT NULL DEFAULT 0,
+  is_required  TINYINT(1)   NOT NULL DEFAULT 0,
+  is_kind      TINYINT(1)   NOT NULL DEFAULT 0,       -- the company's Kind group: never removed, always required
+
+  deleted_at   DATETIME     DEFAULT NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT          NULL,
+
+  name_active  VARCHAR(40)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+  kind_active  TINYINT      GENERATED ALWAYS AS (IF(deleted_at IS NULL AND is_kind = 1, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlgr_tenant (company_id, id),
+  UNIQUE KEY uq_hlgr_name   (company_id, name_active),
+  UNIQUE KEY uq_hlgr_kind   (company_id, kind_active),
+  KEY idx_hlgr_order (company_id, sort_order),
+
+  CONSTRAINT fk_hlgr_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hlgr_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 17a. hrms_department_labels.group_id ----------------------------------
+-- One change per ALTER (TiDB, see §10c).
+SET @needs_label_group = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_department_labels'
+     AND COLUMN_NAME  = 'group_id');
+SET @sql = IF(@needs_label_group = 1,
+  'ALTER TABLE hrms_department_labels ADD COLUMN group_id INT NULL AFTER company_id',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- A label's name is unique within its group (was: within the company).
+SET @needs_label_group_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_department_labels'
+     AND INDEX_NAME   = 'uq_hdlb_group_name');
+SET @sql = IF(@needs_label_group_key = 1,
+  'ALTER TABLE hrms_department_labels ADD UNIQUE KEY uq_hdlb_group_name (company_id, group_id, name_active)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @has_label_name_key = (
+  SELECT COUNT(*) > 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME   = 'hrms_department_labels'
+     AND INDEX_NAME   = 'uq_hdlb_name');
+SET @sql = IF(@has_label_name_key = 1,
+  'ALTER TABLE hrms_department_labels DROP INDEX uq_hdlb_name',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 17b. a department's label in each group -------------------------------
+CREATE TABLE IF NOT EXISTS hrms_department_label_links (
+  id             INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT          NOT NULL,
+  department_id  INT          NOT NULL,
+  group_id       INT          NOT NULL,
+  label_id       INT          NOT NULL,
+
+  deleted_at     DATETIME     DEFAULT NULL,
+  created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT          NULL,
+
+  group_active   INT          GENERATED ALWAYS AS (IF(deleted_at IS NULL, group_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hdll_tenant (company_id, id),
+  UNIQUE KEY uq_hdll_one    (company_id, department_id, group_active),
+  KEY idx_hdll_label (company_id, label_id),
+  KEY idx_hdll_group (company_id, group_id),
+
+  CONSTRAINT fk_hdll_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hdll_department FOREIGN KEY (company_id, department_id) REFERENCES hrms_departments(company_id, id),
+  CONSTRAINT fk_hdll_group      FOREIGN KEY (company_id, group_id)      REFERENCES hrms_label_groups(company_id, id),
+  CONSTRAINT fk_hdll_label      FOREIGN KEY (company_id, label_id)      REFERENCES hrms_department_labels(company_id, id),
+  CONSTRAINT fk_hdll_creator    FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

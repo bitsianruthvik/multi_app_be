@@ -127,8 +127,9 @@ await rolledBack(async (db) => {
   // ── a company that has never had a list ──
   const first = await LABELS.listLabels(db, OTHER);
   ok(JSON.stringify(names(first)) === JSON.stringify(['Department', 'Section', 'Machine']) && first.labels.every((l, i) => l.sortOrder === i + 1 && l.departmentCount === 0 && l.id > 0)
-    && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount']),
-  'a company with no list gets Department, Section, Machine the first time it is read: { labels: [{ id, name, sortOrder, departmentCount }] }', JSON.stringify(first.labels));
+    // groupId joined on 2026-10-15: every label belongs to a group, and these are the Kind group's (CF_HRMS_HIRING_SPEC §15.2).
+    && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount', 'groupId']) && first.labels.every((l) => l.groupId === first.labels[0].groupId),
+  'a company with no list gets Department, Section, Machine the first time it is read: { labels: [{ id, name, sortOrder, departmentCount, groupId }] }', JSON.stringify(first.labels));
   ok(JSON.stringify((await LABELS.listLabels(db, OTHER)).labels.map((l) => l.id)) === JSON.stringify(first.labels.map((l) => l.id)), 'a second read writes nothing more');
   await db.query('DELETE FROM hrms_department_labels WHERE company_id = ?', [OTHER]);
   await db.query("INSERT INTO hrms_departments (company_id, code, name, department_type) VALUES (?, ?, ?, 'Bay'), (?, ?, ?, 'section')", [OTHER, `${TAG}X1`, `${TAG} X1`, OTHER, `${TAG}X2`, `${TAG} X2`]);
@@ -151,8 +152,9 @@ await rolledBack(async (db) => {
   ok(refused(await caught(() => LABELS.createLabel(db, c, { name: `${TAG} LINE` })), 409, 'DUPLICATE') && refused(await caught(() => LABELS.createLabel(db, c, { name: '   ' })), 422, 'INVALID')
     && refused(await caught(() => LABELS.createLabel(db, c, { name: 'x'.repeat(41) })), 422, 'INVALID') && refused(await caught(() => LABELS.createLabel(db, c, {})), 422, 'INVALID'),
   'the same name in other capitals: 409 DUPLICATE; no name, or over 40 characters: 422');
-  const dbDup = await caught(() => db.query('INSERT INTO hrms_department_labels (company_id, name) VALUES (?, ?)', [COMPANY, `${TAG} line`]));
-  ok(dbDup?.errno === 1062, 'and the database refuses it too (uq_hdlb_name, without case)', dbDup?.code ?? 'accepted');
+  // Since §15 a name is unique within its group (uq_hdlb_group_name), so the raw insert names the group.
+  const dbDup = await caught(() => db.query('INSERT INTO hrms_department_labels (company_id, group_id, name) VALUES (?, ?, ?)', [COMPANY, line.groupId, `${TAG} line`]));
+  ok(dbDup?.errno === 1062, 'and the database refuses it too (uq_hdlb_group_name, without case)', dbDup?.code ?? 'accepted');
 
   // a department and its label
   const d1 = await ORG.createDepartment(db, c, { name: `${TAG} One`, type: `${TAG} line` });

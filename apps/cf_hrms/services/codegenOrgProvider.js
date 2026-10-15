@@ -24,6 +24,7 @@
  * `help`, `example`) and the Code formats screen shows them as written.
  */
 import { registerEntity, listEntities } from '../../cf_erp/modules/codegen/index.js';
+import { readModel, KNOWN_GROUP_IDS } from './labelGroupService.js';
 
 export const DEPARTMENT_ENTITY = 'hrms_department';
 export const ROLE_ENTITY = 'hrms_role';
@@ -82,19 +83,40 @@ const DEPARTMENT_TOKENS = [
   },
 ];
 
+/**
+ * LABELS IN GROUPS (spec §15.3). `label` is the Kind condition — the one every
+ * rule written before groups uses — and keeps working. `label.<groupId>` tests
+ * the department's label in that group. Group ids are the company's own, so the
+ * per-group conditions offered on the Code formats screen are added to its
+ * answer by routes/codegen.js (labelConditionsFor).
+ */
+export const LABEL_GROUP_TOKEN = /^label\.(\d+)$/;
+export const labelGroupCondition = (groupId, groupName = 'a group') => ({
+  key: `label.${groupId}`, label: groupName, operators: ['eq', 'in'], valueKind: 'departmentLabel', groupId: Number(groupId),
+  phrase: `the ${groupName} label`, help: `Holds for departments whose ${groupName} label is one you choose. Scores 1 point.`,
+});
+
 const DEPARTMENT_CONDITIONS = [
   {
-    key: 'label', label: 'Label', operators: ['eq', 'in'], valueKind: 'departmentLabel',
-    phrase: 'the label', help: 'Holds for departments with the labels you choose, so machines can be coded one way and sections another. Scores 1 point.',
+    key: 'label', label: 'Kind', operators: ['eq', 'in'], valueKind: 'departmentLabel',
+    phrase: 'the Kind label', help: 'Holds for departments with the Kind labels you choose (Department, Section, Machine …), so machines can be coded one way and sections another. Scores 1 point.',
   },
 ];
+
+/** The per-group conditions of a company, for the Code formats screen (every group but Kind, which is `label`). */
+export async function labelConditionsFor(db, companyId) {
+  const model = await readModel(db, companyId);
+  return model.groups.filter((g) => Number(g.is_kind) !== 1).map((g) => labelGroupCondition(g.id, g.name));
+}
 
 /** draft: { name?, type? (the label's name; `label` is read too), parentId? } */
 async function departmentContext(db, companyId, draft = {}) {
   const [rows] = await db.query(
-    `SELECT 'L' AS kind, id, name, NULL AS code, sort_order FROM hrms_department_labels WHERE company_id = ? AND deleted_at IS NULL
+    `SELECT 'L' AS kind, l.id, l.name, NULL AS code, l.sort_order, l.group_id FROM hrms_department_labels l
+       JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.is_kind = 1 AND g.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.deleted_at IS NULL
      UNION ALL
-     SELECT 'P', id, name, code, 0 FROM hrms_departments WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
+     SELECT 'P', id, name, code, 0, NULL FROM hrms_departments WHERE company_id = ? AND id = ? AND deleted_at IS NULL`,
     [companyId, companyId, Number(draft.parentId) || 0],
   );
   const labels = rows.filter((r) => r.kind === 'L').sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
@@ -102,6 +124,9 @@ async function departmentContext(db, companyId, draft = {}) {
   const given = clean(draft.type ?? draft.label);
   // A department created with no label gets the first of the list (organisationService) — so does its code.
   const label = given ? (labels.find((l) => l.name.toLowerCase() === given.toLowerCase()) ?? { id: null, name: given }) : (labels[0] ?? null);
+  // Its label id in each group (spec §15.3); Kind's from the name when the draft gives no ids.
+  const inGroup = new Map(Object.entries(draft.labels ?? {}).map(([g, l]) => [Number(g), Number(l)]).filter(([, l]) => l > 0));
+  if (label?.id != null && label.group_id != null && !inGroup.has(label.group_id)) inGroup.set(label.group_id, label.id);
   const name = clean(draft.name);
   return {
     get(key) {
@@ -116,20 +141,51 @@ async function departmentContext(db, companyId, draft = {}) {
     },
     test(cond) {
       if (cond.token_key === 'label') return { ok: label?.id != null && idList(cond).includes(label.id), weight: 1 };
+      const g = LABEL_GROUP_TOKEN.exec(cond.token_key);
+      if (g) { const mine = inGroup.get(Number(g[1])); return { ok: mine != null && idList(cond).includes(mine), weight: 1 }; }
       return { ok: false, weight: 0 };
     },
   };
 }
 
+/**
+ * The generator checks a rule's conditions with `conditionTokens.find((t) =>
+ * t.key === key)`. A `label.<groupId>` key is answered by trying the groups this
+ * server has read (KNOWN_GROUP_IDS — group ids are unique across companies);
+ * validateCondition then checks the group is the company's own.
+ */
+const conditionTokens = new Proxy(DEPARTMENT_CONDITIONS, {
+  get(target, prop, receiver) {
+    if (prop !== 'find') return Reflect.get(target, prop, receiver);
+    return (test) => {
+      const hit = target.find(test);
+      if (hit) return hit;
+      for (const id of KNOWN_GROUP_IDS) { const t = labelGroupCondition(id); if (test(t)) return t; }
+      return undefined;
+    };
+  },
+});
+
 const departmentProvider = {
   label: 'Departments',
   tokens: DEPARTMENT_TOKENS,
   tokenPatterns: [],
-  conditionTokens: DEPARTMENT_CONDITIONS,
+  conditionTokens,
   validateToken: tokenCheck(DEPARTMENT_TOKENS, 'a department code'),
   async validateCondition(db, companyId, cond) {
-    if (cond.token_key !== 'label') return null;
-    return (await idsExist(db, companyId, 'hrms_department_labels', idList(cond))) ? null : 'Choose from the company’s labels.';
+    const g = LABEL_GROUP_TOKEN.exec(cond.token_key);
+    if (cond.token_key !== 'label' && !g) return null;
+    const ids = idList(cond);
+    if (!ids.length || ids.some((v) => !Number.isInteger(v) || v <= 0)) return 'Choose from the company’s labels.';
+    // `label`: Kind labels; `label.<groupId>`: that group's labels — of this company.
+    const [rows] = await db.query(
+      `SELECT l.id FROM hrms_department_labels l
+         JOIN hrms_label_groups gr ON gr.company_id = l.company_id AND gr.id = l.group_id AND gr.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.id IN (?) AND ${g ? 'gr.id = ?' : 'gr.is_kind = 1'}`,
+      g ? [companyId, ids, Number(g[1])] : [companyId, ids],
+    );
+    if (rows.length === new Set(ids).size) return null;
+    return g ? 'Choose from that group’s labels.' : 'Choose from the company’s Kind labels.';
   },
   async loadContext(db, companyId, entityId) {
     const [[d]] = await db.query(
@@ -137,7 +193,11 @@ const departmentProvider = {
       [companyId, entityId],
     );
     if (!d) throw notFoundError('Department');
-    return departmentContext(db, companyId, { name: d.name, type: d.department_type, parentId: d.parent_department_id });
+    const [links] = await db.query(
+      'SELECT group_id, label_id FROM hrms_department_label_links WHERE company_id = ? AND department_id = ? AND deleted_at IS NULL', [companyId, entityId]);
+    return departmentContext(db, companyId, {
+      name: d.name, type: d.department_type, parentId: d.parent_department_id, labels: Object.fromEntries(links.map((k) => [k.group_id, k.label_id])),
+    });
   },
   async draftContext(db, companyId, draft) {
     return departmentContext(db, companyId, draft ?? {});

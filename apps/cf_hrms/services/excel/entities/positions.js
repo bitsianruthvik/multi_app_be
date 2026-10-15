@@ -6,6 +6,7 @@
  */
 import { PERM, words, coded, textOf, changedKeys, inScope, loops, todayText } from './_shared.js';
 import * as POS from '../../positionService.js';
+import { labelState, groupColumns, groupCells } from './_labels.js';
 
 const STATUSES = ['DRAFT', 'ACTIVE', 'FROZEN'];
 
@@ -32,7 +33,7 @@ export default {
 
   async load(db, c, env) {
     const on = todayText();
-    const [[rows], [edges], [people], [roles], [departments], [shifts], [locations], [[type]]] = await Promise.all([
+    const [[rows], [edges], [people], [roles], [departments], [shifts], [locations], [[type]], groups] = await Promise.all([
       db.query(
         `SELECT p.id, p.position_code, p.role_id, p.department_id, p.default_shift_id, p.location_id, p.status, p.updated_at, r.title AS role_title
            FROM hrms_positions p LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
@@ -51,6 +52,7 @@ export default {
       db.query('SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId]),
       db.query('SELECT id, code, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name', [c.companyId]),
       db.query("SELECT id FROM hrms_reporting_relationship_types WHERE company_id = ? AND code = 'PRIMARY_MANAGER' AND deleted_at IS NULL ORDER BY id LIMIT 1", [c.companyId]),
+      labelState(db, c.companyId),
     ]);
     const lists = {
       roles: coded('Roles', roles), departments: coded('Departments', departments), shifts: coded('Shifts', shifts), locations: coded('Locations', locations),
@@ -66,12 +68,13 @@ export default {
       cells: {
         code: p.position_code, role: textOf(lists.roles, p.role_id), department: textOf(lists.departments, p.department_id), shift: textOf(lists.shifts, p.default_shift_id),
         location: textOf(lists.locations, p.location_id), reportsTo: textOf(lists.positions, manager.get(p.id)?.toId ?? null), status: p.status, person: person.get(p.id) ?? null,
+        ...groupCells(groups.model, groups.ofDepartment, p.department_id, { kind: true }),
       },
     }]));
-    return { lists, current, primaryTypeId: type?.id ?? null };
+    return { lists, current, primaryTypeId: type?.id ?? null, model: groups.model };
   },
 
-  columns: () => [
+  columns: (state) => [
     { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The position’s code.', example: 'P021-2' },
     { key: 'role', header: 'Role', kind: 'list', list: 'roles', required: true, width: 36, meaning: 'The job this position is for.', example: 'R014 — Shift In-charge' },
     { key: 'department', header: 'Department', kind: 'list', list: 'departments', required: true, width: 34, meaning: 'Where the position sits.', example: 'D004 — Production' },
@@ -80,6 +83,8 @@ export default {
     { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = the top of the chart.', example: 'P004 — Plant Head' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 12, meaning: 'DRAFT, ACTIVE or FROZEN (kept, not to be filled).', example: 'ACTIVE' },
     { key: 'person', header: 'Person', kind: 'info', width: 30, meaning: 'Who is in the position today.', example: 'Asha Verma (KP0031)' },
+    // Its department's label in each group, for reading and sorting (spec §15.3). Ignored on upload.
+    ...groupColumns(state.model, ['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person'], { info: true, kind: true }),
   ],
   labelOf: (row) => `New position — ${row.values.role ?? ''}`.trim(),
 

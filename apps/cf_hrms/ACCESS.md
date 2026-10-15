@@ -83,6 +83,11 @@ How to read the tables below:
 | `PUT /organisation/department-labels/order` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/department-labels/:id` | `cf_hrms_org_edit` | whole-company logins only |
 | `DELETE /organisation/department-labels/:id` | `cf_hrms_org_remove` | whole-company logins only |
+| `GET /organisation/label-groups` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
+| `POST /organisation/label-groups` | `cf_hrms_org_edit` | whole-company logins only |
+| `PUT /organisation/label-groups/order` | `cf_hrms_org_edit` | whole-company logins only |
+| `PUT /organisation/label-groups/:id` | `cf_hrms_org_edit` | whole-company logins only |
+| `DELETE /organisation/label-groups/:id` | `cf_hrms_org_remove` | whole-company logins only |
 | `GET /organisation/locations` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, status |
 | `POST /organisation/locations` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/locations/:id` | `cf_hrms_org_edit` | whole-company logins only |
@@ -153,7 +158,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /positions/options` | `cf_hrms_positions_view` or `cf_hrms_hiring_view` or `cf_hrms_employees_view` |  |
-| `GET /positions` | `cf_hrms_positions_view` | filters: q, department, role, shift, location, state |
+| `GET /positions` | `cf_hrms_positions_view` | filters: q, department, label, role, shift, location, state |
 | `POST /positions` | `cf_hrms_positions_edit` | scope: the department it is created in |
 | `GET /positions/:id` | `cf_hrms_positions_view` |  |
 | `PUT /positions/:id` | `cf_hrms_positions_edit` | scope: the position; scope: a department it is moved to |
@@ -199,7 +204,7 @@ How to read the tables below:
 | `GET /hiring/templates/:kind/file` | `cf_hrms_hiring_view` or `cf_hrms_setup_view` **and** `cf_hrms_pay_view` |  |
 | `GET /hiring/placeholders` | `cf_hrms_hiring_view` or `cf_hrms_setup_view` |  |
 | `GET /hiring/close-reasons` | `cf_hrms_hiring_view` |  |
-| `GET /hirings` | `cf_hrms_hiring_view` | filters: q, stage, department, role |
+| `GET /hirings` | `cf_hrms_hiring_view` | filters: q, stage, department, label, role |
 | `GET /hirings/:id` | `cf_hrms_hiring_view` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
 | `POST /positions/:id/hiring` | `cf_hrms_hiring_edit` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
 | `POST /hirings/:id/confirm-jd` | `cf_hrms_hiring_edit` | scope: the position; pay only with cf_hrms_pay_view, the candidate’s contact only with cf_hrms_contact_view |
@@ -220,7 +225,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /people/pickers` | `cf_hrms_employees_view` or `cf_hrms_hiring_view` |  |
-| `GET /people/employees` | `cf_hrms_employees_view` | contact details only with cf_hrms_contact_view; filters: q, department, role, shift, location, joinedFrom, joinedTo, hasLogin |
+| `GET /people/employees` | `cf_hrms_employees_view` | contact details only with cf_hrms_contact_view; filters: q, department, label, role, shift, location, joinedFrom, joinedTo, hasLogin |
 | `POST /people/employees` | `cf_hrms_employee_create` **and** `cf_hrms_employees_edit` | whole-company logins only; contact details only with cf_hrms_contact_view |
 | `GET /people/employees/:id` | `cf_hrms_employees_view` | scope: the person; contact details only with cf_hrms_contact_view |
 | `PUT /people/employees/:id` | `cf_hrms_employees_edit` | scope: the person; contact details are not written without cf_hrms_contact_view; contact details only with cf_hrms_contact_view |
@@ -311,13 +316,13 @@ How to read the tables below:
 
 | Route | Right | Also |
 |---|---|---|
-| `GET /codegen/entities` | `cf_hrms_setup_view` |  |
+| `GET /codegen/entities` | `cf_hrms_setup_view` | adds the company’s label groups to what a department rule can test |
 | `GET /codegen/schemes` | `cf_hrms_setup_view` |  |
 | `GET /codegen/schemes/:id` | `cf_hrms_setup_view` |  |
-| `POST /codegen/preview` | `cf_hrms_setup_view` |  |
-| `POST /codegen/explain` | `cf_hrms_setup_view` |  |
-| `POST /codegen/schemes` | `cf_hrms_setup_edit` | whole-company logins only |
-| `PUT /codegen/schemes/:id` | `cf_hrms_setup_edit` | whole-company logins only |
+| `POST /codegen/preview` | `cf_hrms_setup_view` | reads the company’s label groups first |
+| `POST /codegen/explain` | `cf_hrms_setup_view` | reads the company’s label groups first |
+| `POST /codegen/schemes` | `cf_hrms_setup_edit` | whole-company logins only; reads the company’s label groups first |
+| `PUT /codegen/schemes/:id` | `cf_hrms_setup_edit` | whole-company logins only; reads the company’s label groups first |
 | `DELETE /codegen/schemes/:id` | `cf_hrms_setup_remove` **and** `cf_hrms_setup_edit` | whole-company logins only |
 
 ## Excel
@@ -381,4 +386,4 @@ How to read the tables below:
 | `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 | `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 
-279 routes.
+284 routes.

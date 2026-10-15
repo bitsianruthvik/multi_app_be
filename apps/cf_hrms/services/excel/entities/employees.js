@@ -22,6 +22,7 @@
 import { PERM, words, coded, changedKeys, inScope, todayText, day } from './_shared.js';
 import * as PEOPLE from '../../peopleService.js';
 import { createAssignment } from '../../assignmentService.js';
+import { labelState, groupColumns, groupCells } from './_labels.js';
 
 const TYPES = ['EMPLOYEE', 'CONTRACT', 'TRAINEE', 'CONSULTANT', 'OTHER'];
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -49,7 +50,7 @@ export default {
 
   async load(db, c, env) {
     const on = todayText();
-    const [[rows], [work], [positions], [holders], [hirings]] = await Promise.all([
+    const [[rows], [work], [positions], [holders], [hirings], groups] = await Promise.all([
       db.query(
         `SELECT id, employee_code, full_name, salutation, gender, date_of_birth, date_of_joining, phone, email, address_json, employment_type, employment_status, updated_at
            FROM hrms_employees WHERE company_id = ? AND deleted_at IS NULL ORDER BY full_name, id`, [c.companyId]),
@@ -68,6 +69,7 @@ export default {
         `SELECT DISTINCT wa.position_id FROM hrms_work_assignments wa
           WHERE wa.company_id = ? AND wa.deleted_at IS NULL AND wa.status <> 'ENDED' AND wa.position_id IS NOT NULL AND (wa.effective_to IS NULL OR wa.effective_to >= ?)`, [c.companyId, on]),
       db.query('SELECT open_position FROM hrms_hirings WHERE company_id = ? AND open_position IS NOT NULL', [c.companyId]),
+      labelState(db, c.companyId),
     ]);
     const held = new Set(holders.map((h) => h.position_id));
     const hiring = new Set(hirings.map((h) => h.open_position));
@@ -85,6 +87,7 @@ export default {
         cells: {
           code: e.employee_code, salutation: e.salutation || null, name: e.full_name, gender: e.gender || null,
           joined: day(e.date_of_joining), type: e.employment_type, status: e.employment_status, position: m?.position_code ?? null,
+          ...groupCells(groups.model, groups.ofDepartment, m?.department_id ?? null, { kind: true }),
           ...(contact ? { born: day(e.date_of_birth), phone: e.phone || null, email: e.email || null, address: address.line1 ? String(address.line1) : null } : {}),
         },
       }];
@@ -96,7 +99,7 @@ export default {
         salutation: words('Salutation', usedIn('salutation', ['Mr.', 'Ms.', 'Mrs.', 'Dr.'])), gender: words('Gender', usedIn('gender', ['Male', 'Female', 'Other'])),
         type: words('Employment type', TYPES), vacant,
       },
-      current, positions: new Map(all.entries.map((e) => [e.key.toLowerCase(), e])), held, hiring,
+      current, positions: new Map(all.entries.map((e) => [e.key.toLowerCase(), e])), held, hiring, model: groups.model,
     };
   },
 
@@ -120,6 +123,8 @@ export default {
         key: 'position', header: 'Position', kind: 'list', list: 'vacant', lenient: true, newOnly: true, width: 34,
         meaning: 'NEW rows only: a vacant position to put the person in from the date of joining. On an existing row it shows their position and is ignored.', example: 'P021-2 — Operator',
       },
+      // The labels of the department of their position, for reading and sorting (spec §15.3). Ignored on upload.
+      ...groupColumns(state.model, ['Code', 'Salutation', 'Name', 'Gender', 'Date of birth', 'Date of joining', 'Phone', 'Email', 'Address', 'Employment type', 'Status', 'Position'], { info: true, kind: true }),
     ];
   },
 

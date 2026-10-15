@@ -99,6 +99,7 @@ pool.getConnection = async () => inside;
 const TAG = `ZZXL${Date.now().toString(36).toUpperCase().slice(-5)}`;
 const q = async (sql, params) => (await db.query(sql, params))[0];
 const one = async (sql, params) => (await q(sql, params))[0] ?? null;
+let groupHeads = [];
 const ins = async (sql, params) => (await db.query(sql, params))[0].insertId;
 const pad2 = (n) => String(n).padStart(2, '0');
 const dayText = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -263,13 +264,15 @@ try {
   {
     const file = await download(O, 'positions', `?department=${D.root}`);
     const book = await open(file.contentBase64);
+    // Since 2026-10-15 positions and employees end with one info column per label group (CF_HRMS_HIRING_SPEC §15.3).
+    groupHeads = (await q('SELECT name FROM hrms_label_groups WHERE company_id = ? AND deleted_at IS NULL ORDER BY sort_order, id', [COMPANY])).map((r) => r.name);
     const { wb, ws } = book;
     ok(/^[A-Za-z0-9]+-Positions-\d{4}-\d{2}-\d{2}\.xlsx$/.test(file.fileName) && file.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' && file.rows === 6,
       'the answer is { fileName, mimeType, contentBase64, rows } and the file is named Company-Positions-date.xlsx', file.fileName);
     ok(JSON.stringify(wb.worksheets.map((s) => s.name)) === JSON.stringify(['How to use', 'Data', 'Lists', '_meta']) && wb.getWorksheet('_meta').state === 'veryHidden',
       'four sheets: How to use first, Data, Lists, and a hidden _meta');
     ok(String(ws.getCell(1, 1).value) === '_id' && String(ws.getCell(1, 2).value) === '_seen' && ws.getColumn(1).hidden === true && ws.getColumn(2).hidden === true
-      && JSON.stringify([...book.head.keys()].slice(2)) === JSON.stringify(['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person']) && String(ws.getCell(1, 4).value) === 'Role ★',
+      && JSON.stringify([...book.head.keys()].slice(2)) === JSON.stringify(['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person', ...groupHeads]) && String(ws.getCell(1, 4).value) === 'Role ★',
     'the Data sheet: hidden _id and _seen, then the columns of the spec — the required ones starred', [...book.head.keys()].join(', '));
     ok(ws.views?.[0]?.state === 'frozen' && ws.views[0].ySplit === 1 && ws.getCell(1, 3).font?.bold === true && Boolean(ws.sheetProtection?.sheet), 'the header row is frozen and bold, and the sheet is protected');
     const row = book.find('Code', `${TAG}-IN`);
@@ -577,7 +580,7 @@ try {
 
     const hidden = await download(noContact, 'employees', `?department=${D.root}`);
     const hb = await open(hidden.contentBase64);
-    ok(JSON.stringify([...hb.head.keys()].slice(2)) === JSON.stringify(['Code', 'Salutation', 'Name', 'Gender', 'Date of joining', 'Employment type', 'Status', 'Position']) && !Buffer.from(hidden.contentBase64, 'base64').includes(Buffer.from('9100000001')),
+    ok(JSON.stringify([...hb.head.keys()].slice(2)) === JSON.stringify(['Code', 'Salutation', 'Name', 'Gender', 'Date of joining', 'Employment type', 'Status', 'Position', ...groupHeads]) && !Buffer.from(hidden.contentBase64, 'base64').includes(Buffer.from('9100000001')),
       'without contact access the file has NO date of birth, phone, email or address columns — and no phone number anywhere in it', [...hb.head.keys()].join(', '));
     const renamed = await edited(hidden.contentBase64, (b) => { b.set(b.find('Code', `${TAG}HEAD`), 'Name', `${TAG} Person HEAD renamed`); b.append({ Name: `${TAG} Added without contact`, 'Date of joining': '2026-10-02' }); });
     const hiddenApply = await apply(noContact, 'employees', renamed, { add: 1, change: 1 });

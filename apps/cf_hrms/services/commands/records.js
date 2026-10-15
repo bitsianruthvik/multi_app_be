@@ -25,7 +25,12 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
   const q = (sql, params = [companyId]) => db.query(sql, params).then(([rows]) => rows);
   const [departments, labels, roles, kras, positions, held, employees, shifts] = await Promise.all([
     q('SELECT id, code, name, department_type, parent_department_id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY id'),
-    q('SELECT name FROM hrms_department_labels WHERE company_id = ? AND deleted_at IS NULL ORDER BY sort_order, id'),
+    // Every group's labels, group order (spec §15). Kind's are `labels`; the others `otherLabels`.
+    q(`SELECT l.id, l.name, l.group_id, g.name AS group_name, g.is_kind, g.is_required
+         FROM hrms_department_labels l
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.deleted_at IS NULL
+        ORDER BY g.sort_order, g.id, l.sort_order, l.id`),
     q("SELECT id, role_code, title, status FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL AND status <> 'RETIRED' ORDER BY id"),
     q(`SELECT a.id, a.role_id, a.kra_definition_id, d.name
          FROM hrms_role_kra_assignments a
@@ -67,7 +72,9 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
     companyId,
     on: asOf,
     departments: departments.map((d) => ({ id: d.id, code: d.code ?? null, name: d.name, label: d.department_type, parentId: d.parent_department_id })),
-    labels: labels.map((l) => l.name),
+    labels: labels.filter((l) => Number(l.is_kind) === 1).map((l) => l.name),
+    labelGroups: labelGroupsOf(labels),
+    otherLabels: labels.filter((l) => Number(l.is_kind) !== 1).map((l) => ({ id: l.id, name: l.name, groupId: l.group_id, groupName: l.group_name })),
     roles: roles.map((r) => ({ id: r.id, code: r.role_code ?? null, name: r.title })),
     roleKras: kras.reduce((m, k) => m.set(k.role_id, [...(m.get(k.role_id) ?? []), { id: k.id, definitionId: k.kra_definition_id, name: k.name }]), new Map()),
     positions: P,
@@ -78,6 +85,17 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
     shifts: shifts.map((s) => ({ id: s.id, code: s.code ?? null, name: s.name })),
     deptById,
   };
+}
+
+/** [{ id, name, isKind, isRequired, labels: [{ id, name }] }] in group order. */
+function labelGroupsOf(rows) {
+  const out = [];
+  for (const l of rows) {
+    let g = out.find((x) => x.id === l.group_id);
+    if (!g) { g = { id: l.group_id, name: l.group_name, isKind: Number(l.is_kind) === 1, isRequired: Number(l.is_required) === 1, labels: [] }; out.push(g); }
+    g.labels.push({ id: l.id, name: l.name });
+  }
+  return out;
 }
 
 /** The records of one kind of field. */

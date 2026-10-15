@@ -317,16 +317,34 @@ function readDepartment(cl, R) {
     : /\bmachine\b/.test(lower) ? 'Machine'
       : /\b(department|dept|division)\b/.test(lower) ? 'Department' : null;
   const known = R.recs.labels.find((l) => l.toLowerCase() === (label ?? '').toLowerCase())
-    ?? R.recs.labels.find((l) => new RegExp(`\\b${l.toLowerCase()}\\b`).test(lower));
+    ?? R.recs.labels.find((l) => new RegExp(`\\b${escapeRe(l.toLowerCase())}\\b`).test(lower));
   let body = stripLead(masked);
+  // Labels of the company's other groups, by name ("… in Unit 2", "… of the Plant area"): taken out of the
+  // sentence before the place is read, so "under Production in Unit 2" is Production, labelled Unit 2.
+  const others = [];
+  for (const l of [...(R.recs.otherLabels ?? [])].sort((a, b) => b.name.length - a.name.length)) {
+    if (others.some((o) => o.groupId === l.groupId)) continue;
+    // "in Unit 2" / "of the Plant area" — a place word before it, or its group's name after it; and
+    // nothing but the end or another cue after it, so "under Plant Maintenance" is not read as the label Plant.
+    const name = escapeRe(l.name);
+    const after = `(?:\\s+(?:${escapeRe(l.groupName)}|group|label))?(?=\\s*(?:$|[,;.]|\\b(?:under|below|inside|within|in|of|at|and|with|for)\\b))`;
+    const m = new RegExp(`\\s*,?\\s*\\b(?:in|of|at|for|from|on|with|labelled|labeled)\\s+(?:the\\s+)?${name}\\b${after}`, 'i').exec(body)
+      ?? new RegExp(`\\b${name}\\s+${escapeRe(l.groupName)}\\b(?=\\s*(?:$|[,;.]|\\b(?:under|below|inside|within|in|of|at|and|with|for)\\b))`, 'i').exec(body);
+    if (!m) continue;
+    others.push(l);
+    body = `${body.slice(0, m.index)} ${body.slice(m.index + m[0].length)}`.replace(/\s+/g, ' ').trim();
+  }
   let under = null;
   const t = tailTarget(body, ['under', 'below', 'beneath', 'inside', 'within', 'in', 'into', 'of'], ['department'], R, { minScore: 0.8 });
   if (t) { under = t.field; body = t.head; }
   let name = quotedIn(body, quotes)[0] ?? null;
   if (!name) {
     const called = /\b(?:called|named)\s+(.+)$/i.exec(body);
-    const raw = called ? called[1] : body
-      .replace(/^(?:new\s+|sub-?)?(?:department|dept|section|unit|division|machine)\s+(?:for\s+|of\s+)?/i, '')
+    // "a Machine department Printing 3": a Kind label's name may stand before the thing-word.
+    const kindWords = R.recs.labels.map((l) => escapeRe(l)).join('|') || 'department';
+    const lead = new RegExp(`^(?:new\\s+|sub-?)?(?:(?:${kindWords})\\s+)?(?:department|dept|section|unit|division|machine)\\s+(?:for\\s+|of\\s+)?`, 'i');
+    const raw = called ? called[1] : stripArticles(body)
+      .replace(lead, '')
       .replace(/\s+(?:department|dept|section|unit|division|machine)$/i, '');
     name = tidyName(unmask(stripArticles(raw), quotes));
   }
@@ -334,8 +352,14 @@ function readDepartment(cl, R) {
     name: { value: name || null, fromText: name || null, confidence: name ? (quotedIn(masked, quotes).length ? 1 : 0.85) : 0 },
     label: { value: known ?? R.recs.labels[0] ?? 'Department', fromText: label, confidence: known ? 1 : 0.7 },
     under: under ?? undefined,
+    // The other groups' labels: their ids, comma-separated (the screen shows one choice per group).
+    labels: others.length
+      ? { value: others.map((l) => l.id).join(','), fromText: others.map((l) => l.name).join(', '), confidence: 1 }
+      : undefined,
   };
 }
+
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function readRole(cl) {
   const { masked, quotes } = cl;
