@@ -1048,22 +1048,87 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
       bucket[kind] = (roleLines.get(`${kind}:${p.roleId}`) ?? [])
         .map(({ definitionId, lineKey }) => ({ kind, definitionId, lineKey, origin: 'ROLE', overridden: false, changes: [] }));
     }
-    const rows = overlayOf.get(Number(p.id)) ?? [];
-    for (const action of ACTION_ORDER) {
-      for (const o of rows.filter((r) => r.action === action)) {
-        const kind = o.contentType;
-        if (!overlayKinds.includes(kind) || o[DEF_FIELD[kind]] == null) continue;
-        const definitionId = Number(o[DEF_FIELD[kind]]);
-        const at = action === 'ADD' ? findIn(bucket[kind], definitionId) : findIn(bucket[kind], definitionId, o.lineKey);
-        if (action === 'SUPPRESS') { if (at >= 0) bucket[kind].splice(at, 1); continue; }
-        if (action === 'OVERRIDE') { if (at >= 0) applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
-        if (at >= 0) { applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
-        bucket[kind].push({ kind, definitionId, lineKey: o.lineKey ?? null, origin: 'POSITION', overridden: false, changes: [] });
-      }
+    overlayBucket(bucket, overlayOf.get(Number(p.id)) ?? [], overlayKinds, 'POSITION');
+    out.set(Number(p.id), wanted.flatMap((kind) => bucket[kind].map(flatLine)));
+  }
+  return out;
+}
+
+/** What the batch readers return per line. `layer` is the wire name of the layer that last shaped it. */
+const flatLine = (l) => ({
+  kind: l.kind, definitionId: l.definitionId, lineKey: l.lineKey ?? null, origin: l.origin, overridden: l.overridden,
+  layer: l.layer ?? wireLayer(l.origin),
+});
+
+/**
+ * One overlay layer applied to a flat bucket of lines ({ [kind]: line[] }) —
+ * SUPPRESS, then OVERRIDE, then ADD; an ADD of a line already present is an
+ * override; a SUPPRESS of a line not present is ignored. The batch readers'
+ * copy of layerItems' rule, for lines that only need identity and origin.
+ */
+function overlayBucket(bucket, rows, overlayKinds, layer) {
+  for (const action of ACTION_ORDER) {
+    for (const o of rows.filter((r) => r.action === action)) {
+      const kind = o.contentType;
+      if (!overlayKinds.includes(kind) || !bucket[kind] || o[DEF_FIELD[kind]] == null) continue;
+      const definitionId = Number(o[DEF_FIELD[kind]]);
+      const at = action === 'ADD' ? findIn(bucket[kind], definitionId) : findIn(bucket[kind], definitionId, o.lineKey);
+      if (action === 'SUPPRESS') { if (at >= 0) bucket[kind].splice(at, 1); continue; }
+      if (action === 'OVERRIDE') { if (at >= 0) applyOverrideJson(bucket[kind][at], o, layer); continue; }
+      if (at >= 0) { applyOverrideJson(bucket[kind][at], o, layer); continue; }
+      bucket[kind].push({ kind, definitionId, lineKey: o.lineKey ?? null, origin: layer, overridden: false, changes: [] });
     }
-    out.set(Number(p.id), wanted.flatMap((kind) => bucket[kind].map((l) => ({
-      kind: l.kind, definitionId: l.definitionId, origin: l.origin, overridden: l.overridden,
-    }))));
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * effectiveLinesForAssignments — the person layer on top, for MANY people
+ * ══════════════════════════════════════════════════════════════════════════
+ * "Who owns X?" (spec §21) answers with PEOPLE, and a person's job is their
+ * position's lines plus their own changes (§16.2): Add a line, Change one,
+ * Switch one off — stored against the assignment, ending when they move. This
+ * is the same overlay rule once more, over effectiveLinesForPositions' answer,
+ * with every person's overlay rows read in ONE query. `ask_test.mjs` checks it
+ * against resolveContent({ workAssignmentId }).
+ *
+ * @param assignments    [{ workAssignmentId, positionId, roleId }]
+ * @param positionLines  effectiveLinesForPositions' Map for those positions (read here when absent)
+ * @returns Map(workAssignmentId -> [{ kind, definitionId, lineKey, origin: 'ROLE'|'POSITION'|'ASSIGNMENT', overridden, layer }])
+ */
+export async function effectiveLinesForAssignments(db, companyId, assignments, { on, kinds = [...CONTENT_TYPES], positionLines = null } = {}) {
+  const date = dateText(on) || today();
+  const list = (assignments ?? []).filter((a) => a && a.workAssignmentId && a.positionId);
+  const out = new Map();
+  if (!list.length) return out;
+  const wanted = kinds.filter((k) => ROLE_CONTENT_KEY[k]);
+  const overlayKinds = wanted.filter((k) => CONTENT_TYPES.includes(k));
+  const lines = positionLines ?? await effectiveLinesForPositions(
+    db, companyId,
+    [...new Map(list.map((a) => [Number(a.positionId), { id: Number(a.positionId), roleId: Number(a.roleId) }])).values()],
+    { on: date, kinds: wanted },
+  );
+  const ids = [...new Set(list.map((a) => Number(a.workAssignmentId)))];
+  const rows = overlayKinds.length
+    ? (await db.query(
+      `SELECT o.* FROM hrms_work_assignment_content_overrides o
+        WHERE o.company_id = ? AND o.work_assignment_id IN (?) AND o.deleted_at IS NULL AND o.content_type IN (?)
+        ORDER BY o.content_type, o.action, o.id`,
+      [companyId, ids, overlayKinds],
+    ))[0].map((r) => ({ ...shapeOverride(r), workAssignmentId: Number(r.work_assignment_id) })).filter((o) => liveOn(o, date))
+    : [];
+  const overlayOf = new Map();
+  for (const o of rows) {
+    if (!overlayOf.has(o.workAssignmentId)) overlayOf.set(o.workAssignmentId, []);
+    overlayOf.get(o.workAssignmentId).push(o);
+  }
+  for (const a of list) {
+    const bucket = {};
+    for (const kind of wanted) bucket[kind] = [];
+    for (const l of lines.get(Number(a.positionId)) ?? []) {
+      if (bucket[l.kind]) bucket[l.kind].push({ ...l, changes: [] });
+    }
+    overlayBucket(bucket, overlayOf.get(Number(a.workAssignmentId)) ?? [], overlayKinds, 'ASSIGNMENT');
+    out.set(Number(a.workAssignmentId), wanted.flatMap((kind) => bucket[kind].map(flatLine)));
   }
   return out;
 }

@@ -6,7 +6,9 @@
  *   node build-search-index.mjs --company=karni --apply
  *   node build-search-index.mjs --company=karni --apply --target=prod
  *
- * Embeds every KRA / responsibility / KPI / qualification definition whose vector
+ * Embeds every KRA / responsibility / KPI / qualification definition — and, since
+ * "Who owns X?" (spec §21), every role (title + purpose), position with its own
+ * title, department (name + labels) and location — whose vector
  * is missing, or was made from different wording, or by a different model —
  * on THIS machine, with the built-in model (services/semantic/embedder.js). The
  * job content never goes anywhere but the target database. Writes in bulk

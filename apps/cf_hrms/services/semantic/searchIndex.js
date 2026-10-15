@@ -27,6 +27,7 @@
  */
 import crypto from 'node:crypto';
 import { embed, MODEL_ID, toBlob, fromBlob } from './embedder.js';
+import { DEPARTMENT_LABELS_SQL, parseLabelList } from '../labelGroupService.js';
 
 /** The four masters a search ranks. QUALIFICATION has no position overlay (contentResolver.js). */
 export const DEFINITION_SOURCES = {
@@ -77,6 +78,73 @@ export async function loadDefinitions(db, companyId, kinds = ALL_KINDS) {
       return { kind, id: Number(r.id), name: r.name, description: r.description, text, hash: textHash(text) };
     });
   }));
+  return lists.flat();
+}
+
+/* ── the structure: roles, positions, departments, locations (spec §21) ─── */
+
+/**
+ * "Who owns X?" also matches the STRUCTURE, not only job lines: a role by its
+ * title and purpose, a position by its own title (only when it says something
+ * the role's title does not — 169 of Karni's 220 say the same), a department by
+ * its name with its labels ("Maintenance — Section · Unit 2"), a location by its
+ * name and type. Same table, same hash rule, `definition_id` = the record's id.
+ * `kind` is VARCHAR(20), so no schema change.
+ */
+export const ENTITY_KINDS = ['ROLE', 'POSITION', 'DEPARTMENT', 'LOCATION'];
+export const INDEX_KINDS = [...ALL_KINDS, ...ENTITY_KINDS];
+
+const entityRow = (kind, id, text, extra = {}) => ({ kind, id: Number(id), text, hash: textHash(text), ...extra });
+const clean = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+
+/** The words each record is matched by. Exported for the tests and the Ask "why" line. */
+export const entityText = {
+  ROLE: (title, purpose) => (clean(purpose) ? `${clean(title)}. ${clean(purpose)}` : clean(title)),
+  POSITION: (title) => clean(title),
+  DEPARTMENT: (name, labels) => {
+    const tags = (labels ?? []).map(clean).filter((l) => l && l.toLowerCase() !== clean(name).toLowerCase());
+    return tags.length ? `${clean(name)} — ${tags.join(' · ')}` : clean(name);
+  },
+  LOCATION: (name, type) => (type ? `${clean(name)} (${String(type).toLowerCase()})` : clean(name)),
+};
+
+/**
+ * Every live record of the given structure kinds: { kind, id, text, hash, ... }.
+ * One query per kind, in parallel. A department's labels come in its own row
+ * (labelGroupService.DEPARTMENT_LABELS_SQL), so this is still one query.
+ */
+export async function loadEntities(db, companyId, kinds = ENTITY_KINDS) {
+  const read = {
+    ROLE: async () => {
+      const [rows] = await db.query(
+        'SELECT id, title, role_purpose FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+      return rows.map((r) => entityRow('ROLE', r.id, entityText.ROLE(r.title, r.role_purpose), { name: r.title }));
+    },
+    POSITION: async () => {
+      const [rows] = await db.query(
+        `SELECT p.id, p.position_title FROM hrms_positions p
+           JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+          WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED'
+            AND p.position_title IS NOT NULL AND TRIM(p.position_title) <> ''
+            AND LOWER(TRIM(p.position_title)) <> LOWER(TRIM(r.title))`, [companyId]);
+      return rows.map((r) => entityRow('POSITION', r.id, entityText.POSITION(r.position_title), { name: r.position_title }));
+    },
+    DEPARTMENT: async () => {
+      const [rows] = await db.query(
+        `SELECT d.id, d.name, ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+           FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL`, [companyId]);
+      return rows.map((r) => {
+        const labels = parseLabelList(r.label_list).map((l) => l.name);
+        return entityRow('DEPARTMENT', r.id, entityText.DEPARTMENT(r.name, labels), { name: r.name, labels });
+      });
+    },
+    LOCATION: async () => {
+      const [rows] = await db.query(
+        'SELECT id, name, location_type FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+      return rows.map((r) => entityRow('LOCATION', r.id, entityText.LOCATION(r.name, r.location_type), { name: r.name }));
+    },
+  };
+  const lists = await Promise.all(kinds.filter((k) => read[k]).map((k) => read[k]()));
   return lists.flat();
 }
 
@@ -163,7 +231,10 @@ export async function vectorsFor(db, companyId, defs, { cap = INLINE_CAP } = {})
  * it goes, so a run that is stopped half-way keeps what it did.
  */
 export async function buildIndex(db, companyId, { apply = false, batch = 64, log = () => {} } = {}) {
-  const defs = await loadDefinitions(db, companyId, ALL_KINDS);
+  const defs = [
+    ...await loadDefinitions(db, companyId, ALL_KINDS),
+    ...await loadEntities(db, companyId, ENTITY_KINDS),
+  ];
   const [rows] = await db.query(
     'SELECT kind, definition_id, text_hash FROM hrms_search_vectors WHERE company_id = ? AND model = ? AND deleted_at IS NULL',
     [companyId, MODEL_ID],

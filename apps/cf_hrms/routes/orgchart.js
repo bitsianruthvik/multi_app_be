@@ -6,6 +6,8 @@
  *   GET /orgchart/positions/:id/card       ?on=&scope=  everything the card modal shows about ONE position;
  *                                                       scope=card widens directReports to the whole card
  *   GET /orgchart/search                   ?q=&on=&kinds=&mode=&limit=   job content, by meaning or exact words
+ *   GET /orgchart/ask                      ?q=&on=&kinds=&mode=&department=&label=&location=&limit=
+ *                                                       "Who owns X?" — people first, then vacant positions (spec §21)
  *   GET /orgchart/departments              ?on=         what each unit is accountable for (spec §13)
  *   GET /orgchart/open-points              ?status=&entityType=&entityId=   grouped by entity
  *   PUT /orgchart/open-points/:id          { status, resolution|answer }    resolve / dismiss / reopen
@@ -39,6 +41,8 @@ import {
   buildOrgChart, getPositionCard, searchJobContent, listOpenPoints, updateOpenPoint,
 } from '../services/orgChartService.js';
 import { buildDepartmentRollup } from '../services/departmentRollupService.js';
+import { askWhoOwns } from '../services/semantic/askService.js';
+import { scopeOf } from '../services/accessScope.js';
 
 const router = Router();
 
@@ -92,6 +96,36 @@ router.get('/orgchart/search', guard(PERM.positions.view), handle((req) => searc
     limit: req.query.limit,
     kinds: req.query.kinds,
     mode: req.query.mode,
+  },
+)));
+
+/**
+ * "Who owns X?" (spec §21; services/semantic/askService.js). A question in,
+ * people out: leading question words are taken off, the rest is matched by
+ * meaning against job lines at every layer (role, position, person), roles,
+ * position titles, departments and locations; answers grouped by person, then
+ * the vacant positions that match.
+ *   kinds       comma list of KRA, RESPONSIBILITY, KPI, ROLE, DEPARTMENT (default: what the question names, else all)
+ *   mode        meaning (default) | exact
+ *   department  id — that department and the ones below it
+ *   label       label ids, comma list
+ *   location    id
+ * Rights as the chart (positions view). A department-scoped login gets PEOPLE
+ * from its scope only; positions stay company-wide, without outside names.
+ */
+router.get('/orgchart/ask', guard(PERM.positions.view), handle(async (req) => askWhoOwns(
+  pool,
+  ctx(req).companyId,
+  {
+    q: req.query.q,
+    on: dateParam(req.query.on),
+    kinds: req.query.kinds,
+    mode: req.query.mode,
+    department: req.query.department,
+    label: req.query.label,
+    location: req.query.location,
+    limit: req.query.limit,
+    scope: await scopeOf(req),
   },
 )));
 
