@@ -210,6 +210,7 @@ How to read the tables below:
 | `GET /orgchart` | `cf_hrms_positions_view` |  |
 | `GET /orgchart/positions/:id/card` | `cf_hrms_positions_view` |  |
 | `GET /orgchart/search` | `cf_hrms_positions_view` |  |
+| `GET /orgchart/ask` | `cf_hrms_positions_view` |  |
 | `GET /orgchart/departments` | `cf_hrms_positions_view` |  |
 | `GET /orgchart/open-points` | `cf_hrms_positions_view` |  |
 | `PUT /orgchart/open-points/:id` | `cf_hrms_positions_edit` | whole-company logins only |
@@ -439,4 +440,4 @@ How to read the tables below:
 | `GET /performance/bands` | `cf_hrms_performance_view` | narrowed to the login’s department |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-336 routes.
+337 routes.
