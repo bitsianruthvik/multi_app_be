@@ -3928,3 +3928,95 @@ CREATE TABLE IF NOT EXISTS hrms_performance_target_changes (
   CONSTRAINT fk_hpft_kpi     FOREIGN KEY (company_id, plan_kpi_id) REFERENCES hrms_performance_plan_kpis(company_id, id),
   CONSTRAINT fk_hpft_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 21. ACTUALS AGAINST PERFORMANCE PLANS (CF_HRMS_HIRING_SPEC.md §19)       ##
+-- ############################################################################
+-- Added 2026-10-15. An ACTUAL is what a person achieved on one plan KPI for one
+-- SLOT — the sub-period it is for: a KPI entered monthly in a quarterly plan
+-- has three slots ("Oct 2026", "Nov 2026", "Dec 2026"); a KPI entered once per
+-- plan has one slot, the period itself. Slots are computed
+-- (services/performance/slots.js), never stored on their own: an actual keeps
+-- its slot's first and last day.
+--
+--   hrms_performance_actuals             NEVER OVERWRITTEN. A correction closes
+--                                        the live row (closed_at / closed_by)
+--                                        and opens a new one that points at it
+--                                        (corrects_id) and says why
+--                                        (correction_reason). One LIVE row per
+--                                        (plan KPI, slot): `live_slot` is the
+--                                        slot's first day while the row is
+--                                        live, NULL once closed, and is unique.
+--   hrms_performance_plan_kpis.combine_rule
+--                                        SUM | AVERAGE | LAST — how a KPI's
+--                                        slots make one actual. Set from the
+--                                        unit when a plan is made (%, minutes,
+--                                        hours, days -> AVERAGE; counts, MT, m,
+--                                        ₹ -> SUM; words -> AVERAGE of met /
+--                                        not met); NULL on an older row = the
+--                                        same default, and
+--                                        apply-actuals-schema.mjs fills it in.
+--   hrms_performance_settings.band_on_track / band_at_risk
+--                                        the status bands, in % of achievement:
+--                                        on track >= 90, at risk >= 70, behind
+--                                        below that (the defaults).
+--
+-- Achievement, KRA and plan scores are COMPUTED ON READ and never stored
+-- (services/performance/scoring.js — one place, used by every read).
+-- apps/cf_hrms/scripts/apply-actuals-schema.mjs makes exactly these changes.
+
+-- ----- 21a. hrms_performance_plan_kpis.combine_rule ----------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_plan_kpis' AND COLUMN_NAME = 'combine_rule');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_plan_kpis ADD COLUMN combine_rule VARCHAR(8) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 21b. the status bands ------------------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_settings' AND COLUMN_NAME = 'band_on_track');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_settings ADD COLUMN band_on_track DECIMAL(5,2) NOT NULL DEFAULT 90.00', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_settings' AND COLUMN_NAME = 'band_at_risk');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_settings ADD COLUMN band_at_risk DECIMAL(5,2) NOT NULL DEFAULT 70.00', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 21c. Actuals ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_actuals (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  plan_id            INT           NOT NULL,
+  plan_kpi_id        INT           NOT NULL,
+  slot_start         DATE          NOT NULL,                       -- the slot's first day
+  slot_end           DATE          NOT NULL,                       -- and its last
+  value_number       DECIMAL(18,4) NULL,                           -- a KPI with a number target
+  value_text         VARCHAR(500)  NULL,                           -- words, beside met / not met
+  met                VARCHAR(3)    NULL,                           -- YES | NO, for a target written as words
+  note               VARCHAR(1000) NULL,
+  source             VARCHAR(10)   NOT NULL DEFAULT 'MANUAL',      -- MANUAL | EXCEL | SYSTEM | FORMULA
+  entered_by         INT           NULL,
+  entered_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  corrects_id        INT           NULL,                           -- the row this one corrects
+  correction_reason  VARCHAR(500)  NULL,                           -- why (required for a correction)
+  closed_at          DATETIME(3)   NULL,                           -- set when a correction replaces it
+  closed_by          INT           NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,                   -- never written: an actual is corrected, not removed
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+
+  -- One live row per (plan KPI, slot); closed rows are kept beside it.
+  live_slot          DATE          GENERATED ALWAYS AS (IF(closed_at IS NULL, slot_start, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpfa_tenant (company_id, id),
+  UNIQUE KEY uq_hpfa_live   (company_id, plan_kpi_id, live_slot),
+  KEY idx_hpfa_plan (company_id, plan_id, closed_at),
+  KEY idx_hpfa_kpi  (company_id, plan_kpi_id, slot_start),
+
+  CONSTRAINT fk_hpfa_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfa_plan     FOREIGN KEY (company_id, plan_id)     REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpfa_kpi      FOREIGN KEY (company_id, plan_kpi_id) REFERENCES hrms_performance_plan_kpis(company_id, id),
+  CONSTRAINT fk_hpfa_corrects FOREIGN KEY (company_id, corrects_id) REFERENCES hrms_performance_actuals(company_id, id),
+  CONSTRAINT fk_hpfa_enterer  FOREIGN KEY (entered_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfa_closer   FOREIGN KEY (closed_by)  REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

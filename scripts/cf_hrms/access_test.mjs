@@ -185,9 +185,9 @@ try {
     const used = new Set(rows.flatMap((r) => (r.guard ? [...r.guard.anyOf, ...r.guard.also] : [])));
     const unused = ALL_TAGS.filter((t) => !used.has(t));
     // The five upload rights guard the Excel uploads since round C (routes/excel.js).
-    // Performance upload is the Excel of plans — step 5 (spec §18.3).
-    ok(same(unused, [PERM.documents.remove, PERM.performance.upload]),
-      'every right opens a route, except removing a generated document and uploading plans (no such routes yet)', unused.join(', '));
+    // Performance upload is the Excel of actuals since step 5 (spec §19.3).
+    ok(same(unused, [PERM.documents.remove]),
+      'every right opens a route, except removing a generated document (no such route yet)', unused.join(', '));
     ok(rows.filter((r) => r.guard?.anyOf.includes(PERM.selfView)).every((r) => r.path.startsWith('/user/me')) && rows.filter((r) => r.path.startsWith('/user/me')).every((r) => r.guard.anyOf.join() === PERM.selfView),
       'cf_hrms_self_view guards the /user/me routes and nothing else, and they ask for nothing else');
   }

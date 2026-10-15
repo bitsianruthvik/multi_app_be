@@ -179,6 +179,23 @@ export const LIST_SPECS = {
       label: byLabel((r) => r.departmentId),
       frequency: oneOfWords((r) => r.frequency),
       weightsOk: flag((r) => r.weightsOk),
+      // spec §19.3: ON_TRACK, AT_RISK, BEHIND, NO_DATA (comma-separated = any of)
+      band: oneOfWords((r) => r.band),
+    },
+    needsTree: ['department'],
+    needsLabels: ['label'],
+  },
+  // Performance › Actuals (spec §19.3): one row per person × KPI × slot.
+  actuals: {
+    key: ['rows'],
+    filters: {
+      q: matchesText(['employeeName', 'employeeCode', 'positionCode', 'positionTitle', 'kpiName', 'kraName']),
+      department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
+      role: oneOfIds((r) => r.roleId),
+      manager: oneOfIds((r) => r.managerPositionId),
+      band: oneOfWords((r) => r.band),
+      missing: flag((r) => !r.actual),
     },
     needsTree: ['department'],
     needsLabels: ['label'],

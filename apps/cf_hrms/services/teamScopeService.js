@@ -43,6 +43,7 @@ import { summaryFromRow } from './shiftRead.js';
 import {
   listPlans, readPlan, planEmployeeId, setKraWeight, addKpi, changeKpi, removeKpi,
 } from './performance/planService.js';
+import { actualsGrid, narrowGrid, enterOne, actualHistory } from './performance/actualsService.js';
 
 const notYours = (message, detail = undefined) => new HrmsError(403, 'NOT_YOUR_TEAM', message, detail ? { detail } : {});
 
@@ -212,7 +213,23 @@ export async function teamAddKpi(db, c, planId, body) { await assertPlanInMyTeam
 export async function teamChangeKpi(db, c, planId, kpiId, body) { await assertPlanInMyTeam(db, c, planId); return changeKpi(db, c, planId, kpiId, body); }
 export async function teamRemoveKpi(db, c, planId, kpiId) { await assertPlanInMyTeam(db, c, planId); return removeKpi(db, c, planId, kpiId); }
 
+/* ── actuals (spec §19.2): a manager login enters them for the people below them ── */
+
+/** GET /user/me/team/actuals — the Actuals grid, narrowed to the people below me today. */
+export async function teamActuals(db, c, query = {}) {
+  const ids = await myTeamEmployeeIds(db, c);
+  const grid = await actualsGrid(db, c.companyId, query, { employeeIds: ids, canEnter: true });
+  return { ...(await narrowGrid(db, c.companyId, grid, query)), people: ids.length };
+}
+/** PUT /user/me/team/actuals — one cell of a plan of a person below me (the same writer as HR's). */
+export async function teamEnterActual(db, c, body = {}) {
+  await assertPlanInMyTeam(db, c, Number(body.planId));
+  return enterOne(db, c, body);
+}
+export async function teamActualHistory(db, c, planId, kpiId) { await assertPlanInMyTeam(db, c, planId); return actualHistory(db, c.companyId, planId, kpiId); }
+
 export default {
+  teamActuals, teamEnterActual, teamActualHistory,
   assertInMyTeam, teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
   teamPlans, teamPlan, assertPlanInMyTeam, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
   assertPersonInMyTeam, teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,

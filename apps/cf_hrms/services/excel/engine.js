@@ -7,6 +7,10 @@
  *   entity, label, area                     'positions', 'Positions', 'positions'
  *   list                                    which list its download follows (lib/listFilters.js) and how to read it
  *   wholeCompany                            true when its records belong to no department
+ *   idsFirst                                true: on an upload, `load` is told the ids in the
+ *                                           file's hidden column (env.fileIds) and loads just
+ *                                           those records (actuals: rows that are not one
+ *                                           table's rows, spec §19.3)
  *   load(db, c, env)   -> state             every list and every current row, read ONCE:
  *                                           { lists: { key: { label, entries: [{ text, key, id? }] } },
  *                                             current: Map<id, { id, seen, label, cells, inScope? }>, … }
@@ -141,7 +145,17 @@ async function analyse(db, c, def, body, env) {
   }
   if (Number(meta.schemaVersion) !== SCHEMA_VERSION) { fileProblems.push('This file was downloaded with an older layout. Download a fresh file and fill that in.'); return answer(); }
 
-  const state = await def.load(db, c, env);
+  // An entity whose records are named by the file reads only those (one pass over the hidden column, in memory).
+  let fileIds = null;
+  if (def.idsFirst) {
+    fileIds = [];
+    for (let n = 2; n <= opened.lastRow && fileIds.length <= MAX_DATA_ROWS; n += 1) {
+      const idCell = cellOf(opened.sheet.getRow(n).getCell(1));
+      const id = idCell.kind === 'number' ? idCell.value : Number(idCell.value);
+      if (idCell.kind !== 'empty' && Number.isInteger(id) && id > 0) fileIds.push(id);
+    }
+  }
+  const state = await def.load(db, c, fileIds ? { ...env, fileIds } : env);
   const columns = def.columns(state, env);
   const lists = listsOf(state);
   const missing = columns.filter((col) => editable(col) && !opened.columnAt.has(col.header));

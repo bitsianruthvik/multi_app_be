@@ -14,7 +14,8 @@
  *
  * <entity> is one of: departments, locations, roles, positions, employees, holidays, shifts,
  * library-kras, library-responsibilities, library-kpis, library-skills, library-qualifications,
- * library-authorities. Each is its own route, so each carries its own right (ACCESS.md):
+ * library-authorities, actuals (spec §19.3: one row per person × KPI × slot of `?periodId=`;
+ * the upload needs performance upload). Each is its own route, so each carries its own right (ACCESS.md):
  * the download needs the area's `view`, the upload the area's `upload` (and `view`).
  *
  * EMPLOYEES: a file with NEW rows also needs `cf_hrms_employee_bulk_add`; without

@@ -311,8 +311,8 @@ try {
       && (emps.ws.dataValidations.model[`${emps.ws.getColumn(emps.col('Date of joining')).letter}2:${emps.ws.getColumn(emps.col('Date of joining')).letter}${3 + 1 + EXTRA_ROWS}`] ?? emps.ws.dataValidations.model[`${emps.ws.getColumn(emps.col('Date of joining')).letter}2`])?.type === 'date',
     'a date column holds real dates, shown as year-month-day, and its cells accept only dates');
     const list = await call(O, 'GET', '/excel/entities');
-    ok(list.status === 200 && JSON.stringify(list.json.map((e) => e.entity)) === JSON.stringify(['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts', 'library-kras', 'library-responsibilities', 'library-kpis', 'library-skills', 'library-qualifications', 'library-authorities'])
-      && list.json.every((e) => e.label && e.area && e.canDownload === true && e.canUpload === true), 'GET /excel/entities -> the thirteen files, [{ entity, label, area, canDownload, canUpload }]');
+    ok(list.status === 200 && JSON.stringify(list.json.map((e) => e.entity)) === JSON.stringify(['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts', 'library-kras', 'library-responsibilities', 'library-kpis', 'library-skills', 'library-qualifications', 'library-authorities', 'actuals'])
+      && list.json.every((e) => e.label && e.area && e.canDownload === true && e.canUpload === true), 'GET /excel/entities -> the fourteen files, [{ entity, label, area, canDownload, canUpload }]');
   }
 
   /* ══ 3. every entity ══════════════════════════════════════════════════════ */
@@ -333,9 +333,11 @@ try {
     'library-qualifications': { query: `?q=${TAG}`, at: ['Name', `${TAG} Qualification`], change: ['Qualification type', 'LICENCE'], add: () => ({ Name: `${TAG} Added qualification`, 'Qualification type': 'CERTIFICATION' }), read: 'Qualification type' },
     'library-authorities': { query: `?q=${TAG}`, at: ['Name', `${TAG} Authority`], change: ['What the holder may do', 'May stop the line and call maintenance.'], add: () => ({ Name: `${TAG} Added authority`, 'Authority type': 'APPROVE', 'What the holder may do': 'May approve overtime.' }), read: 'What the holder may do' },
   };
-  ok(same(Object.keys(CASES), ENTITIES.map((e) => e.entity)), 'every entity the engine knows is tested here', ENTITIES.map((e) => e.entity).filter((e) => !CASES[e]).join(', '));
+  // Actuals (spec §19.3) are rows of person × KPI × slot, never added by a file: their round trip is in actuals_test.mjs.
+  const ROUND_TRIP = ENTITIES.filter((e) => e.entity !== 'actuals');
+  ok(same(Object.keys(CASES), ROUND_TRIP.map((e) => e.entity)), 'every entity the engine knows is tested here (actuals: in actuals_test.mjs)', ROUND_TRIP.map((e) => e.entity).filter((e) => !CASES[e]).join(', '));
   const issuedOf = {};
-  for (const def of ENTITIES) {
+  for (const def of ROUND_TRIP) {
     const k = CASES[def.entity];
     try {
       const file = await download(O, def.entity, k.query);
@@ -633,7 +635,9 @@ try {
     const up = await preview(exec, 'positions', file.json?.contentBase64 ?? '');
     const ap = await apply(exec, 'positions', file.json?.contentBase64 ?? '', { add: 0, change: 0 });
     const ents = (await call(exec, 'GET', '/excel/entities')).json;
-    ok(file.status === 200 && up.status === 403 && up.json.code === 'FORBIDDEN' && ap.status === 403 && ents.every((e) => e.canDownload === true && e.canUpload === false),
+    ok(file.status === 200 && up.status === 403 && up.json.code === 'FORBIDDEN' && ap.status === 403 && ents.every((e) => e.canUpload === false)
+      // performance view reaches a ready-made role through setup-access (LATE_AREAS), which this test does not run
+      && ents.filter((e) => e.area !== 'performance').every((e) => e.canDownload === true),
       'view is enough to DOWNLOAD and not to upload: an HR executive gets the file, and 403 on preview and apply', `${file.status} ${up.status} ${ap.status}`);
     const wrong = [];
     for (const def of ENTITIES) {

@@ -5,6 +5,8 @@
  *   year start month   1..12 (India: 4, April)
  *   default frequency  for a role that has none (QUARTERLY)
  *   rating scale       an ordered list of labels, low to high (used in step 6, stored now)
+ *   bands              the achievement a plan or KPI needs to be "on track" (90) and
+ *                      "at risk" (70); below that it is "behind" (spec §19.1)
  *   role frequency     hrms_roles.performance_frequency, NULL = the default
  *
  * A company with no row reads the defaults; the first save writes the row.
@@ -14,6 +16,7 @@
 import { invalid, conflict, notFound } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { FREQUENCIES, FREQUENCY_LABEL, isFrequency } from './periods.js';
+import { DEFAULT_BANDS, BAND_WORDS } from './scoring.js';
 
 export const DEFAULT_SCALE = [
   { value: 1, label: 'Needs improvement' },
@@ -22,7 +25,7 @@ export const DEFAULT_SCALE = [
   { value: 4, label: 'Exceeds expectations' },
   { value: 5, label: 'Outstanding' },
 ];
-export const DEFAULTS = Object.freeze({ yearStartMonth: 4, defaultFrequency: 'QUARTERLY', ratingScale: DEFAULT_SCALE });
+export const DEFAULTS = Object.freeze({ yearStartMonth: 4, defaultFrequency: 'QUARTERLY', ratingScale: DEFAULT_SCALE, bands: DEFAULT_BANDS });
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 const readJson = (v) => { if (v == null || typeof v === 'object') return v ?? null; try { return JSON.parse(v); } catch { return null; } };
@@ -36,6 +39,11 @@ export async function readSettings(db, companyId) {
     yearStartMonth: Number(row?.year_start_month ?? DEFAULTS.yearStartMonth),
     defaultFrequency: row?.default_frequency ?? DEFAULTS.defaultFrequency,
     ratingScale: Array.isArray(scale) && scale.length ? scale : DEFAULT_SCALE,
+    // A database before apply-actuals-schema.mjs has no band columns: the defaults.
+    bands: {
+      onTrack: row?.band_on_track != null ? Number(row.band_on_track) : DEFAULT_BANDS.onTrack,
+      atRisk: row?.band_at_risk != null ? Number(row.band_at_risk) : DEFAULT_BANDS.atRisk,
+    },
   };
 }
 
@@ -51,7 +59,7 @@ function readScale(input, problems) {
   return labels.map((label, i) => ({ value: i + 1, label }));
 }
 
-/** PUT /performance/settings { yearStartMonth?, defaultFrequency?, ratingScale? } */
+/** PUT /performance/settings { yearStartMonth?, defaultFrequency?, ratingScale?, bands?: { onTrack, atRisk } } */
 export async function saveSettings(db, c, input = {}) {
   const before = await readSettings(db, c.companyId);
   const problems = [];
@@ -67,6 +75,14 @@ export async function saveSettings(db, c, input = {}) {
     else next.defaultFrequency = f;
   }
   if (input.ratingScale !== undefined) next.ratingScale = readScale(input.ratingScale, problems) ?? before.ratingScale;
+  if (input.bands !== undefined) {
+    const b = input.bands ?? {};
+    const onTrack = b.onTrack === undefined ? before.bands.onTrack : Number(b.onTrack);
+    const atRisk = b.atRisk === undefined ? before.bands.atRisk : Number(b.atRisk);
+    if (![onTrack, atRisk].every((n) => Number.isFinite(n) && n > 0 && n <= 120)) problems.push('A band starts at a percentage above 0 and up to 120.');
+    else if (!(atRisk < onTrack)) problems.push(`"${BAND_WORDS.AT_RISK}" must start below "${BAND_WORDS.ON_TRACK}".`);
+    else next.bands = { onTrack: Math.round(onTrack * 100) / 100, atRisk: Math.round(atRisk * 100) / 100 };
+  }
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
 
   if (next.yearStartMonth !== before.yearStartMonth) {
@@ -82,9 +98,13 @@ export async function saveSettings(db, c, input = {}) {
                              rating_scale = VALUES(rating_scale), updated_by = VALUES(updated_by)`,
     [c.companyId, next.yearStartMonth, next.defaultFrequency, JSON.stringify(next.ratingScale), c.userId, c.userId],
   );
+  // The bands only when they change: a database before apply-actuals-schema.mjs has no such columns.
+  if (next.bands.onTrack !== before.bands.onTrack || next.bands.atRisk !== before.bands.atRisk) {
+    await db.query('UPDATE hrms_performance_settings SET band_on_track = ?, band_at_risk = ? WHERE company_id = ?', [next.bands.onTrack, next.bands.atRisk, c.companyId]);
+  }
   const { saved, ...was } = before;
   await audit(db, c, 'hrms_performance_settings', c.companyId, before.saved ? 'UPDATE' : 'CREATE', was, {
-    yearStartMonth: next.yearStartMonth, defaultFrequency: next.defaultFrequency, ratingScale: next.ratingScale,
+    yearStartMonth: next.yearStartMonth, defaultFrequency: next.defaultFrequency, ratingScale: next.ratingScale, bands: next.bands,
   });
   return getSettingsPage(db, c.companyId);
 }
@@ -110,6 +130,8 @@ export async function getSettingsPage(db, companyId) {
     yearStartMonthName: MONTH_NAMES[settings.yearStartMonth - 1],
     defaultFrequency: settings.defaultFrequency,
     ratingScale: settings.ratingScale,
+    bands: settings.bands,
+    bandWords: BAND_WORDS,
     saved: settings.saved,
     frequencies: FREQUENCIES.map((f) => ({ value: f, label: FREQUENCY_LABEL[f] })),
     roles: roles.map((r) => ({

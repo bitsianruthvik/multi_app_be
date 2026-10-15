@@ -10,7 +10,8 @@ import employees from './employees.js';
 import holidays from './holidays.js';
 import shifts from './shifts.js';
 import libraries from './libraries.js';
+import actuals from './actuals.js';
 
-export const ENTITIES = [departments, locations, roles, positions, employees, holidays, shifts, ...libraries];
+export const ENTITIES = [departments, locations, roles, positions, employees, holidays, shifts, ...libraries, actuals];
 
 export default ENTITIES;

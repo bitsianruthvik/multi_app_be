@@ -31,6 +31,8 @@ import {
   FREQUENCIES, FREQUENCY_LABEL, isFrequency, periodStartingOn, periodsOfYear, yearOf, yearLabel,
 } from './periods.js';
 import { DIRECTIONS, planTargetOf, planTargetText } from './targets.js';
+import { COMBINE_RULES, COMBINE_WORDS, defaultCombine } from './scoring.js';
+import { loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, periodOfRow, actualHistory } from './actualsService.js';
 
 export const PLAN_STATUSES = ['DRAFT', 'ACTIVE', 'CLOSED', 'CANCELLED'];
 export const ENTRY_FREQUENCIES = ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'HALF_YEARLY', 'YEARLY'];
@@ -324,7 +326,7 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
       kpiRows.push([c.companyId, planId, kraSort == null ? null : kraIdOf.get(`${planId}|${kraSort}`) ?? null,
         clip(wholeWording(item.name, item.description), 250) ?? 'KPI', item.definitionId ?? null, item.lineKey ?? null,
         clip(t.unit, 30), t.direction, t.targetNumber, clip(t.targetText, 500), num(item.weightPercent), sort,
-        clip(t.unit, 30), t.direction, t.targetNumber, clip(t.jobTargetText, 500), num(item.weightPercent), c.userId]);
+        clip(t.unit, 30), t.direction, t.targetNumber, clip(t.jobTargetText, 500), num(item.weightPercent), defaultCombine(t.unit, t.direction), c.userId]);
       sort += 1;
     };
     p.job.kras.forEach((k, i) => k.kpis.forEach((item) => add(item, i)));
@@ -334,8 +336,8 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
     await db.query(
       `INSERT INTO hrms_performance_plan_kpis
          (company_id, plan_id, plan_kra_id, name, kpi_definition_id, line_key, unit, direction, target_number, target_text, weight_percent, sort_order,
-          job_unit, job_direction, job_target_number, job_target_text, job_weight_percent, created_by)
-       VALUES ${kpiRows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+          job_unit, job_direction, job_target_number, job_target_text, job_weight_percent, combine_rule, created_by)
+       VALUES ${kpiRows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
       kpiRows.flat(),
     );
   }
@@ -406,7 +408,8 @@ function shapeListRow(r) {
 }
 
 /**
- * GET /performance/plans?periodId=&status=… — one query (the list filters run in memory, lib/listFilters.js).
+ * GET /performance/plans?periodId=&status=&band=… — five queries: the list, the settings and
+ * the scores' three (the list filters run in memory, lib/listFilters.js).
  * Cancelled plans are listed only when asked for (status=CANCELLED).
  */
 export async function listPlans(db, companyId, { periodId, employeeIds = null } = {}, scopeDeptIds = null) {
@@ -416,7 +419,10 @@ export async function listPlans(db, companyId, { periodId, employeeIds = null } 
   if (employeeIds) { where.push('pl.employee_id IN (?)'); params.push(employeeIds.length ? employeeIds : [0]); }
   if (scopeDeptIds) { where.push('pl.department_id IN (?)'); params.push(scopeDeptIds.length ? scopeDeptIds : [0]); }
   const [rows] = await db.query(`${PLAN_LIST_SQL} WHERE ${where.join(' AND ')} ORDER BY pp.start_date DESC, e.full_name, pl.id`, params);
-  return { items: rows.map(shapeListRow) };
+  // The Score column (spec §19.3): every plan scored in three more queries, whatever their number.
+  const scores = await scorePlans(db, companyId, rows);
+  const none = { score: null, band: 'NO_DATA', bandLabel: 'No data', basedOn: { counted: 0, total: 0 }, scoreLine: null };
+  return { items: rows.map((r) => ({ ...shapeListRow(r), ...(scores.get(Number(r.id)) ?? none) })) };
 }
 
 /** The plan row with what a read needs, or 404. */
@@ -458,6 +464,7 @@ function shapeKpi(r, changes) {
     target: planTargetText(target),
     frequency: r.entry_frequency ?? null,
     weightPercent: num(r.weight_percent),
+    combine: r.combine_rule ?? defaultCombine(r.unit, r.direction),
     mark,
     markLabel: MARK[mark],
     job: job ? { ...job, target: job.written ?? planTargetText(job) } : null,
@@ -468,14 +475,15 @@ function shapeKpi(r, changes) {
 /**
  * One plan, whole: header, KRA headings (weights, running total), their KPIs
  * with the mark and what the job says, KPIs under no KRA, dated target
- * changes. Five queries.
- * `can`: what THIS caller may do, given by the route ({ edit, activate, cancel, changeTarget }).
+ * changes — and (spec §19.3) each KPI's slots with their actuals, the combined
+ * actual, achievement and band; each KRA's score; the plan's score "based on N
+ * of M KPIs". Seven queries.
+ * `can`: what THIS caller may do, given by the route ({ edit, activate, cancel, changeTarget, enterActuals }).
  */
 export async function readPlan(db, companyId, planId, can = {}) {
   const r = await planRow(db, companyId, planId);
-  const [[kras], [kpis], [changes], [manager]] = await Promise.all([
-    db.query('SELECT * FROM hrms_performance_plan_kras WHERE company_id = ? AND plan_id = ? AND deleted_at IS NULL ORDER BY sort_order, id', [companyId, r.id]),
-    db.query('SELECT * FROM hrms_performance_plan_kpis WHERE company_id = ? AND plan_id = ? AND deleted_at IS NULL ORDER BY sort_order, id', [companyId, r.id]),
+  const [parts, [changes], [manager], settings] = await Promise.all([
+    loadPlanParts(db, companyId, [r.id]),
     db.query(
       `SELECT tc.*, u.name AS by_name FROM hrms_performance_target_changes tc LEFT JOIN users u ON u.id = tc.created_by
         WHERE tc.company_id = ? AND tc.plan_id = ? ORDER BY tc.effective_from, tc.id`, [companyId, r.id]),
@@ -489,7 +497,12 @@ export async function readPlan(db, companyId, planId, can = {}) {
         WHERE p.company_id = ? AND p.id = ?`,
       [iso(r.copied_on), iso(r.copied_on), companyId, r.manager_position_id],
     ).then(([rows]) => rows) : [],
+    readSettings(db, companyId),
   ]);
+  const kras = parts.kras.get(Number(r.id)) ?? [];
+  const kpis = parts.kpis.get(Number(r.id)) ?? [];
+  const period = periodOfRow(r);
+  const score = planScoreParts(period, kras, kpis, parts.actuals, settings.bands);
   const unitOf = new Map(kpis.map((k) => [Number(k.id), k.unit ?? null]));
   const changesOf = new Map();
   for (const ch of changes) {
@@ -502,8 +515,9 @@ export async function readPlan(db, companyId, planId, can = {}) {
     });
     changesOf.set(Number(ch.plan_kpi_id), list);
   }
-  const shaped = kpis.map((k) => shapeKpi(k, changesOf.get(Number(k.id)) ?? []));
-  const list = shapeListRow(r);
+  const shaped = kpis.map((k) => ({ ...shapeKpi(k, changesOf.get(Number(k.id)) ?? []), actuals: kpiActualsView(k, score, parts.actuals) }));
+  const list = { ...shapeListRow(r), ...scoreSummary(score) };
+  const takesActuals = r.status === 'ACTIVE' && r.period_status !== 'CLOSED';
   const weights = weightState(kras.filter((k) => k.weight_percent != null).length, list.weightTotal, kras.length);
   const m = manager ?? null;
   return {
@@ -516,14 +530,23 @@ export async function readPlan(db, companyId, planId, can = {}) {
         activate: Boolean(can.activate ?? can.edit) && r.status === 'DRAFT',
         cancel: Boolean(can.cancel) && (r.status === 'DRAFT' || r.status === 'ACTIVE'),
         changeTarget: Boolean(can.edit) && r.status === 'ACTIVE',
+        enterActuals: Boolean(can.enterActuals ?? can.edit) && takesActuals,
       },
+      actualsLine: takesActuals ? null : (r.status === 'DRAFT' ? 'Actuals are entered once the plan is activated.'
+        : r.status === 'CANCELLED' ? 'This plan was cancelled: it takes no actuals.' : `${period.name} is closed: its actuals can be read, not changed.`),
     },
     kras: kras.map((k) => ({
       id: k.id, name: k.name, lineKey: k.line_key ?? null, weightPercent: num(k.weight_percent), jobWeightPercent: num(k.job_weight_percent),
       mark: k.added_on_plan ? 'ADDED' : (sameNum(k.weight_percent, k.job_weight_percent) ? 'FROM_JOB' : 'CHANGED'),
       kpis: shaped.filter((x) => Number(x.planKraId) === Number(k.id)),
+      score: score.kras.get(Number(k.id))?.score ?? null,
+      band: score.kras.get(Number(k.id))?.band ?? 'NO_DATA',
+      basedOn: { counted: score.kras.get(Number(k.id))?.counted ?? 0, total: score.kras.get(Number(k.id))?.total ?? 0 },
     })),
     ungroupedKpis: shaped.filter((x) => x.planKraId == null),
+    ungroupedScore: score.ungrouped ? { score: score.ungrouped.score, band: score.ungrouped.band, basedOn: { counted: score.ungrouped.counted, total: score.ungrouped.total } } : null,
+    bands: settings.bands,
+    combineRules: COMBINE_RULES.map((v) => ({ value: v, label: COMBINE_WORDS[v] })),
     marks: MARK,
     directions: DIRECTIONS.map((d) => ({ value: d, label: { HIGHER_BETTER: 'Higher is better', LOWER_BETTER: 'Lower is better', EXACT: 'Exactly', TEXT: 'Written as words' }[d] })),
     entryFrequencies: ENTRY_FREQUENCIES,
@@ -558,6 +581,14 @@ export async function myPlans(db, c) {
     plans,
     past: mine.past.map(({ id, period, status, kraCount, kpiCount }) => ({ id, period, status, kraCount, kpiCount })),
   };
+}
+
+/** GET /user/me/plan/:id/kpis/:kpiId/actuals — a KPI's actuals on one of MY plans, corrections included. */
+export async function myActualHistory(db, c, planId, kpiId) {
+  const [[e]] = await db.query('SELECT id FROM hrms_employees WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1', [c.companyId, c.userId]);
+  const owner = await planEmployeeId(db, c.companyId, planId);
+  if (!e || owner == null || owner !== Number(e.id)) throw notFound('Plan');
+  return actualHistory(db, c.companyId, planId, kpiId);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -613,7 +644,15 @@ export async function setKraWeight(db, c, planId, kraId, body = {}) {
   return { ok: true };
 }
 
-/** POST …/plans/:id/kpis { planKraId?, name, direction, targetNumber | targetText, unit?, frequency?, weightPercent? } — draft only. */
+/** The combine rule a body asks for (spec §19.1): SUM | AVERAGE | LAST, or undefined when it says nothing. */
+function readCombine(body, problems) {
+  if (body.combine === undefined || body.combine === null || body.combine === '') return undefined;
+  const v = String(body.combine).toUpperCase();
+  if (!COMBINE_RULES.includes(v)) { problems.push('Choose how the slots make one actual: added up, average, or latest.'); return undefined; }
+  return v;
+}
+
+/** POST …/plans/:id/kpis { planKraId?, name, direction, targetNumber | targetText, unit?, frequency?, weightPercent?, combine? } — draft only. */
 export async function addKpi(db, c, planId, body = {}) {
   await draftPlan(db, c.companyId, planId);
   const problems = [];
@@ -629,16 +668,17 @@ export async function addKpi(db, c, planId, body = {}) {
   const frequency = body.frequency ? String(body.frequency).toUpperCase() : null;
   if (frequency && !ENTRY_FREQUENCIES.includes(frequency)) problems.push('Choose how often it is measured.');
   const weight = readWeight(body.weightPercent, problems, 'A weight');
+  const combine = readCombine(body, problems) ?? defaultCombine(t.unit, t.direction);
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
   const [[s]] = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM hrms_performance_plan_kpis WHERE company_id = ? AND plan_id = ?', [c.companyId, planId]);
   const [res] = await db.query(
     `INSERT INTO hrms_performance_plan_kpis
-       (company_id, plan_id, plan_kra_id, name, unit, direction, target_number, target_text, entry_frequency, weight_percent, sort_order, added_on_plan, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-    [c.companyId, planId, planKraId, name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, Number(s.next), c.userId],
+       (company_id, plan_id, plan_kra_id, name, unit, direction, target_number, target_text, entry_frequency, weight_percent, combine_rule, sort_order, added_on_plan, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+    [c.companyId, planId, planKraId, name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, combine, Number(s.next), c.userId],
   );
   await db.query('UPDATE hrms_performance_plans SET no_kpis = 0 WHERE company_id = ? AND id = ?', [c.companyId, planId]);
-  await audit(db, c, 'hrms_performance_plan_kpis', res.insertId, 'CREATE', null, { planId: Number(planId), name, ...t, frequency, weightPercent: weight });
+  await audit(db, c, 'hrms_performance_plan_kpis', res.insertId, 'CREATE', null, { planId: Number(planId), name, ...t, frequency, weightPercent: weight, combine });
   return { ok: true, id: res.insertId };
 }
 
@@ -652,7 +692,7 @@ const differsFromJob = (k) => !k.added_on_plan && (
   || (k.direction === 'TEXT' && (k.target_text ?? null) !== (k.job_target_text ?? null)) || !sameNum(k.weight_percent, k.job_weight_percent)
   || k.entry_frequency != null);
 
-/** PUT …/plans/:id/kpis/:kpiId { direction?, targetNumber?, targetText?, unit?, frequency?, weightPercent?, name? (added ones only) } — draft only. */
+/** PUT …/plans/:id/kpis/:kpiId { direction?, targetNumber?, targetText?, unit?, frequency?, weightPercent?, combine?, name? (added ones only) } — draft only. */
 export async function changeKpi(db, c, planId, kpiId, body = {}) {
   await draftPlan(db, c.companyId, planId);
   const k = await kpiOf(db, c.companyId, planId, kpiId);
@@ -667,17 +707,20 @@ export async function changeKpi(db, c, planId, kpiId, body = {}) {
   const frequency = body.frequency !== undefined ? (body.frequency ? String(body.frequency).toUpperCase() : null) : k.entry_frequency;
   if (frequency && !ENTRY_FREQUENCIES.includes(frequency)) problems.push('Choose how often it is measured.');
   const weight = body.weightPercent !== undefined ? readWeight(body.weightPercent, problems, 'A weight') : num(k.weight_percent);
+  // The combine rule: as asked; else, when it was the old unit's default, the new unit's default follows.
+  const wasDefault = (k.combine_rule ?? defaultCombine(k.unit, k.direction)) === defaultCombine(k.unit, k.direction);
+  const combine = readCombine(body, problems) ?? (wasDefault ? defaultCombine(t.unit, t.direction) : k.combine_rule);
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
   const next = { ...k, name, unit: t.unit, direction: t.direction, target_number: t.targetNumber, target_text: t.targetText, entry_frequency: frequency, weight_percent: weight };
   const changed = differsFromJob(next) ? 1 : 0;
   await db.query(
-    `UPDATE hrms_performance_plan_kpis SET name = ?, unit = ?, direction = ?, target_number = ?, target_text = ?, entry_frequency = ?, weight_percent = ?, changed_on_plan = ?
+    `UPDATE hrms_performance_plan_kpis SET name = ?, unit = ?, direction = ?, target_number = ?, target_text = ?, entry_frequency = ?, weight_percent = ?, combine_rule = ?, changed_on_plan = ?
       WHERE company_id = ? AND id = ?`,
-    [name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, changed, c.companyId, kpiId],
+    [name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, combine, changed, c.companyId, kpiId],
   );
   await audit(db, c, 'hrms_performance_plan_kpis', Number(kpiId), 'UPDATE',
-    { name: k.name, unit: k.unit, direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, frequency: k.entry_frequency, weightPercent: num(k.weight_percent) },
-    { name, ...t, frequency, weightPercent: weight, planId: Number(planId) });
+    { name: k.name, unit: k.unit, direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, frequency: k.entry_frequency, weightPercent: num(k.weight_percent), combine: k.combine_rule },
+    { name, ...t, frequency, weightPercent: weight, combine, planId: Number(planId) });
   return { ok: true, changedFromJob: Boolean(changed) };
 }
 
@@ -788,6 +831,6 @@ export async function changeTarget(db, c, planId, kpiId, body = {}) {
 }
 
 export default {
-  PLAN_STATUSES, periodOf, listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee, myPlans,
+  PLAN_STATUSES, periodOf, listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee, myPlans, myActualHistory,
   setKraWeight, addKpi, changeKpi, removeKpi, activatePlan, cancelPlan, forEachPlan, changeTarget,
 };

@@ -21,6 +21,15 @@
  *   POST /performance/plans/:id/kpis/:kpiId/target     { …target, effectiveFrom?, reason }   active   performance edit
  *   GET  /performance/employees/:id/plans              a person's plans (employee page)       performance view
  *
+ * ACTUALS (spec §19):
+ *   GET  /performance/actuals?periodId=&slot=&department=&label=&role=&manager=&band=&q=&missing=
+ *                                                      the Actuals grid: person × KPI for a slot   performance view
+ *   PUT  /performance/actuals                          { planId, kpiId, slotStart, value? | met?, note?, reason? }
+ *                                                      one cell: enter, or correct with a reason   performance edit
+ *   GET  /performance/plans/:id/kpis/:kpiId/actuals    a KPI's actuals, corrections included      performance view
+ *   GET  /performance/bands?periodId=                  the org chart's "Colour by performance"     performance view
+ *   (Excel: GET/POST /excel/actuals/… — routes/excel.js; the upload needs performance upload.)
+ *
  * Removing a KPI from a DRAFT is part of shaping the draft (edit); removing a
  * PLAN is cancelling it (remove). The department scope (§12.3) applies to every
  * plan: lists are narrowed to it, a plan outside it answers 403 OUT_OF_SCOPE.
@@ -38,6 +47,7 @@ import {
   listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee,
   setKraWeight, addKpi, changeKpi, removeKpi, activatePlan, cancelPlan, forEachPlan, changeTarget,
 } from '../services/performance/planService.js';
+import { actualsGrid, narrowGrid, enterOne, actualHistory, chartBands } from '../services/performance/actualsService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -102,6 +112,28 @@ router.post('/performance/plans/:id/kpis', guard(PERM.performance.edit), inPlan,
 router.put('/performance/plans/:id/kpis/:kpiId', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => changeKpi(db, c, id(req), intParam(req.params.kpiId, 'kpiId'), req.body ?? {}))));
 router.delete('/performance/plans/:id/kpis/:kpiId', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => removeKpi(db, c, id(req), intParam(req.params.kpiId, 'kpiId')))));
 router.post('/performance/plans/:id/kpis/:kpiId/target', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => changeTarget(db, c, id(req), intParam(req.params.kpiId, 'kpiId'), req.body ?? {}))));
+
+/* ── actuals (spec §19) ───────────────────────────────────────────────── */
+
+router.get('/performance/actuals', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => {
+  const c = ctx(req);
+  const grid = await actualsGrid(pool, c.companyId, req.query ?? {}, { scopeDeptIds: await peopleFilter(req), canEnter: can(req, PERM.performance.edit) });
+  return narrowGrid(pool, c.companyId, grid, req.query ?? {});
+}));
+
+/** The plan named in a body must be of a person inside the login's department. */
+const inBodyPlan = Object.assign(step(async (req) => {
+  const employeeId = await planEmployeeId(pool, ctx(req).companyId, intParam(req.body?.planId, 'planId'));
+  if (employeeId == null) throw notFound('Plan');
+  await assertEmployeeInScope(req, employeeId);
+}), { hrmsStep: 'scope: the person the plan is for' });
+
+router.put('/performance/actuals', guard(PERM.performance.edit), inBodyPlan, handle((req) => tx(req, (db, c) => enterOne(db, c, req.body ?? {}))));
+router.get('/performance/plans/:id/kpis/:kpiId/actuals', guard(PERM.performance.view), inPlan,
+  handle((req) => actualHistory(pool, ctx(req).companyId, id(req), intParam(req.params.kpiId, 'kpiId'))));
+router.get('/performance/bands', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+  chartBands(pool, ctx(req).companyId, { periodId: req.query.periodId ? intParam(req.query.periodId, 'periodId') : null }, await peopleFilter(req))
+)));
 
 /* ── a person's plans ─────────────────────────────────────────────────── */
 

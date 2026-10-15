@@ -79,6 +79,10 @@ How to read the tables below:
 | `PUT /user/me/team/plans/:id/kras/:kraId` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/plans/:id/kpis` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
+| `GET /user/me/plan/:id/kpis/:kpiId/actuals` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/actuals` | `cf_hrms_self_view` |  |
+| `PUT /user/me/team/actuals` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/plans/:id/kpis/:kpiId/actuals` | `cf_hrms_self_view` |  |
 | `DELETE /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
@@ -392,6 +396,9 @@ How to read the tables below:
 | `GET /excel/library-authorities/workbook` | `cf_hrms_roles_view` |  |
 | `POST /excel/library-authorities/preview` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
 | `POST /excel/library-authorities/apply` | `cf_hrms_roles_upload` **and** `cf_hrms_roles_view` | whole-company logins only |
+| `GET /excel/actuals/workbook` | `cf_hrms_performance_view` |  |
+| `POST /excel/actuals/preview` | `cf_hrms_performance_upload` **and** `cf_hrms_performance_view` |  |
+| `POST /excel/actuals/apply` | `cf_hrms_performance_upload` **and** `cf_hrms_performance_view` |  |
 
 ## Everything else
 
@@ -415,7 +422,7 @@ How to read the tables below:
 | `POST /performance/periods/:id/close` | `cf_hrms_performance_edit` | whole-company logins only |
 | `POST /performance/plans/preview` | `cf_hrms_performance_edit` | narrowed to the login’s department |
 | `POST /performance/plans/create` | `cf_hrms_performance_edit` | narrowed to the login’s department |
-| `GET /performance/plans` | `cf_hrms_performance_view` | filters: q, status, department, label, frequency, weightsOk; narrowed to the login’s department |
+| `GET /performance/plans` | `cf_hrms_performance_view` | filters: q, status, department, label, frequency, weightsOk, band; narrowed to the login’s department |
 | `POST /performance/plans/activate` | `cf_hrms_performance_edit` | scope: each plan’s person |
 | `POST /performance/plans/cancel` | `cf_hrms_performance_remove` | scope: each plan’s person |
 | `GET /performance/plans/:id` | `cf_hrms_performance_view` | scope: the person the plan is for |
@@ -426,6 +433,10 @@ How to read the tables below:
 | `PUT /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `DELETE /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `POST /performance/plans/:id/kpis/:kpiId/target` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `GET /performance/actuals` | `cf_hrms_performance_view` | narrowed to the login’s department |
+| `PUT /performance/actuals` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `GET /performance/plans/:id/kpis/:kpiId/actuals` | `cf_hrms_performance_view` | scope: the person the plan is for |
+| `GET /performance/bands` | `cf_hrms_performance_view` | narrowed to the login’s department |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-325 routes.
+336 routes.

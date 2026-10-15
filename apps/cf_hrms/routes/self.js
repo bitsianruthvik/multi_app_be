@@ -45,8 +45,9 @@ import {
   teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
   teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
   teamPlans, teamPlan, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
+  teamActuals, teamEnterActual, teamActualHistory,
 } from '../services/teamScopeService.js';
-import { myPlans } from '../services/performance/planService.js';
+import { myPlans, myActualHistory } from '../services/performance/planService.js';
 
 const router = Router();
 
@@ -125,6 +126,15 @@ router.get('/user/me/team/plans/:id', guard(PERM.selfView), handle((req) => team
 router.put('/user/me/team/plans/:id/kras/:kraId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamSetKraWeight(db, c, intParam(req.params.id), intParam(req.params.kraId, 'kraId'), req.body ?? {}))));
 router.post('/user/me/team/plans/:id/kpis', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamAddKpi(db, c, intParam(req.params.id), req.body ?? {}))));
 router.put('/user/me/team/plans/:id/kpis/:kpiId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeKpi(db, c, intParam(req.params.id), intParam(req.params.kpiId, 'kpiId'), req.body ?? {}))));
+/*
+ * ACTUALS (spec §19.2). My own actuals are read on My plan (above, read-only; a KPI's
+ * corrections through the history route). A manager login enters actuals for the
+ * people below them — the same rule, the same writer as HR's PUT /performance/actuals.
+ */
+router.get('/user/me/plan/:id/kpis/:kpiId/actuals', guard(PERM.selfView), handle((req) => myActualHistory(pool, ctx(req), intParam(req.params.id), intParam(req.params.kpiId, 'kpiId'))));
+router.get('/user/me/team/actuals', guard(PERM.selfView), handle((req) => teamActuals(pool, ctx(req), req.query ?? {})));
+router.put('/user/me/team/actuals', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamEnterActual(db, c, req.body ?? {}))));
+router.get('/user/me/team/plans/:id/kpis/:kpiId/actuals', guard(PERM.selfView), handle((req) => teamActualHistory(pool, ctx(req), intParam(req.params.id), intParam(req.params.kpiId, 'kpiId'))));
 router.delete('/user/me/team/plans/:id/kpis/:kpiId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamRemoveKpi(db, c, intParam(req.params.id), intParam(req.params.kpiId, 'kpiId')))));
 
 export default router;
