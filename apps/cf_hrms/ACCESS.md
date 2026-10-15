@@ -165,6 +165,7 @@ How to read the tables below:
 | Route | Right | Also |
 |---|---|---|
 | `GET /positions/options` | `cf_hrms_positions_view` or `cf_hrms_hiring_view` or `cf_hrms_employees_view` |  |
+| `GET /positions/new-shift` | `cf_hrms_positions_view` |  |
 | `GET /positions` | `cf_hrms_positions_view` | filters: q, department, label, role, shift, location, state |
 | `POST /positions` | `cf_hrms_positions_edit` | scope: the department it is created in |
 | `GET /positions/:id` | `cf_hrms_positions_view` |  |
@@ -400,4 +401,4 @@ How to read the tables below:
 | `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 | `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 
-298 routes.
+299 routes.

@@ -9,7 +9,8 @@
  *   leave type   a company-wide name (Casual leave). Quantities do not live on
  *                it any more: hrms_leave_types.annual_entitlement is not read.
  *   policy       a named set of rules, one per leave type it grants. Standalone.
- *   assignment   company default -> location -> role; the most specific wins.
+ *   assignment   company default -> location -> label -> role; the most specific
+ *                wins (a label: a department label, spec §17).
  *                The resolution is leavePolicyRead.resolveEffective and nothing
  *                here re-derives it.
  *
@@ -304,24 +305,32 @@ export async function previewRuleSummary(db, companyId, body = {}) {
  * Policies
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** Live positions of the company with what the resolution needs of each: one query. */
+/** Live positions of the company with what the resolution needs of each (and what a warning names): one query. */
 async function livePositions(db, companyId) {
   const [rows] = await db.query(
-    "SELECT id, role_id, location_id FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND status <> 'CLOSED'", [companyId]);
+    `SELECT p.id, p.role_id, p.location_id, p.department_id, p.position_code, COALESCE(p.position_title, r.title) AS title, d.name AS department_name
+       FROM hrms_positions p
+       LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+       LEFT JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
+      WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED'`, [companyId]);
   return rows;
 }
 
-/** For every policy: is it the company default, how many locations and roles name it, how many positions end up under it. */
+/** What the resolution needs of a position row. */
+const targetOf = (p) => ({ roleId: p.role_id, locationId: p.location_id, departmentId: p.department_id });
+
+/** For every policy: is it the company default, how many locations, labels and roles name it, how many positions end up under it. */
 function usageOf(index, positions) {
-  const blank = () => ({ company: false, locations: 0, roles: 0, positions: 0 });
+  const blank = () => ({ company: false, locations: 0, roles: 0, labels: 0, positions: 0 });
   const by = new Map();
   const of = (id) => { if (!by.has(id)) by.set(id, blank()); return by.get(id); };
   if (index.company) of(index.company.id).company = true;
   for (const ref of index.byLocation.values()) of(ref.id).locations += 1;
   for (const ref of index.byRole.values()) of(ref.id).roles += 1;
+  for (const l of index.byLabel.values()) of(l.policy.id).labels += 1;
   let unassigned = 0;
   for (const p of positions) {
-    const effective = resolveEffective(index, { roleId: p.role_id, locationId: p.location_id });
+    const effective = resolveEffective(index, targetOf(p));
     if (effective.policy) of(effective.policy.id).positions += 1; else unassigned += 1;
   }
   return { usedBy: (id) => by.get(id) ?? blank(), unassigned };
@@ -411,15 +420,19 @@ async function assertPolicyNameFree(conn, companyId, { name, code }, exceptId = 
 /** Where a policy is assigned, in sentences. Empty when nowhere. */
 async function whereUsed(conn, companyId, policyId) {
   const [rows] = await conn.query(
-    `SELECT a.scope, l.name AS location_name, r.title AS role_title
+    `SELECT a.scope, l.name AS location_name, r.title AS role_title, dl.name AS label_name
        FROM hrms_leave_policy_assignments a
        LEFT JOIN hrms_locations l ON l.company_id = a.company_id AND l.id = a.location_id
        LEFT JOIN hrms_roles r ON r.company_id = a.company_id AND r.id = a.role_id
+       LEFT JOIN hrms_department_labels dl ON dl.company_id = a.company_id AND dl.id = a.label_id
       WHERE a.company_id = ? AND a.policy_id = ? AND a.deleted_at IS NULL
-      ORDER BY FIELD(a.scope, 'COMPANY', 'LOCATION', 'ROLE'), l.name, r.title`,
+      ORDER BY FIELD(a.scope, 'COMPANY', 'LOCATION', 'LABEL', 'ROLE'), l.name, dl.name, r.title`,
     [companyId, policyId],
   );
-  return rows.map((a) => (a.scope === 'COMPANY' ? 'It is the company default.' : a.scope === 'LOCATION' ? `The location ${a.location_name ?? ''} uses it.` : `The role ${a.role_title ?? ''} uses it.`));
+  return rows.map((a) => (a.scope === 'COMPANY' ? 'It is the company default.'
+    : a.scope === 'LOCATION' ? `The location ${a.location_name ?? ''} uses it.`
+      : a.scope === 'LABEL' ? `The label ${a.label_name ?? ''} uses it.`
+        : `The role ${a.role_title ?? ''} uses it.`));
 }
 
 /** The leave types a template needs, by code -> id; the ones the company lacks are created. */
@@ -543,16 +556,40 @@ export function listTemplates() {
  * Where a policy applies
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** GET /leave/assignments */
+/**
+ * GET /leave/assignments — five reads sent together, whatever the size of the company.
+ *
+ * `labels` (spec §17): every label of every group, group order, each with its
+ * own policy (or null), `positionCount` = the positions whose policy comes from
+ * this label (a role's own policy beats it; a department's OWN labels only),
+ * and `conflicts` = those positions whose labels point to different policies —
+ * where this label is the one that won or one that lost.
+ */
 export async function getAssignments(db, companyId) {
-  const [index, positions, [locations], [roles]] = await Promise.all([
+  const [index, positions, [locations], [roles], [labels]] = await Promise.all([
     loadAssignmentIndex(db, companyId),
     livePositions(db, companyId),
     db.query('SELECT id, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name, id', [companyId]),
     db.query('SELECT id, title FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+    db.query(
+      `SELECT l.id, l.name, g.id AS group_id, g.name AS group_name
+         FROM hrms_department_labels l
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.deleted_at IS NULL
+        ORDER BY g.sort_order, g.id, l.sort_order, l.id`, [companyId]),
   ]);
   const positionsOfRole = new Map();
   for (const p of positions) positionsOfRole.set(p.role_id, (positionsOfRole.get(p.role_id) ?? 0) + 1);
+  const reached = new Map();
+  const conflictsOf = new Map();
+  for (const p of positions) {
+    const e = resolveEffective(index, targetOf(p));
+    if (e.from !== 'LABEL') continue;
+    reached.set(e.label.id, (reached.get(e.label.id) ?? 0) + 1);
+    if (!e.conflict) continue;
+    const item = { positionId: p.id, positionCode: p.position_code ?? null, title: p.title ?? null, departmentName: p.department_name ?? null, line: e.line };
+    for (const id of [e.label.id, ...e.conflict.map((x) => x.label.id)]) conflictsOf.set(id, [...(conflictsOf.get(id) ?? []), item]);
+  }
   return {
     company: { policy: index.company },
     locations: locations.map((l) => ({
@@ -561,6 +598,15 @@ export async function getAssignments(db, companyId) {
       policy: index.byLocation.get(l.id) ?? null,
       // What a position at this location gets when its role has no policy of its own.
       effective: resolveEffective(index, { locationId: l.id }),
+    })),
+    labels: labels.map((l) => ({
+      groupId: l.group_id,
+      groupName: l.group_name,
+      labelId: l.id,
+      name: l.name,
+      policy: index.byLabel.get(l.id)?.policy ?? null,
+      positionCount: reached.get(l.id) ?? 0,
+      conflicts: (conflictsOf.get(l.id) ?? []).sort((a, b) => String(a.positionCode ?? '').localeCompare(String(b.positionCode ?? ''))),
     })),
     // Only the roles that have a policy of their own.
     roles: roles.filter((r) => index.byRole.has(r.id)).map((r) => ({
@@ -571,19 +617,21 @@ export async function getAssignments(db, companyId) {
 }
 
 /**
- * PUT /leave/assignments { scope, locationId?, roleId?, policyId | null } -> { assignments }
+ * PUT /leave/assignments { scope, locationId?, roleId?, labelId?, policyId | null } -> { assignments }
  * null removes the assignment at that level (the next level up then applies).
  * Only an ACTIVE policy can be assigned.
  */
 export async function putAssignment(conn, c, body = {}, requestId = null) {
   const problems = [];
   const scope = String(body.scope ?? '').trim().toUpperCase();
-  if (!SCOPES.includes(scope)) problems.push('Say where the policy applies: the company, a location or a role.');
+  if (!SCOPES.includes(scope)) problems.push('Say where the policy applies: the company, a location, a label or a role.');
   const idOf = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
   const locationId = scope === 'LOCATION' ? idOf(body.locationId) : null;
   const roleId = scope === 'ROLE' ? idOf(body.roleId) : null;
+  const labelId = scope === 'LABEL' ? idOf(body.labelId) : null;
   if (scope === 'LOCATION' && !(Number.isInteger(locationId) && locationId > 0)) problems.push('Choose the location.');
   if (scope === 'ROLE' && !(Number.isInteger(roleId) && roleId > 0)) problems.push('Choose the role.');
+  if (scope === 'LABEL' && !(Number.isInteger(labelId) && labelId > 0)) problems.push('Choose the label.');
   if (!has(body, 'policyId')) problems.push('Choose the policy, or none to remove it.');
   const policyId = idOf(body.policyId);
   if (policyId !== null && !(Number.isInteger(policyId) && policyId > 0)) problems.push('That policy is not a policy.');
@@ -597,6 +645,14 @@ export async function putAssignment(conn, c, body = {}, requestId = null) {
     const [[row]] = await conn.query('SELECT id FROM hrms_roles WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, roleId]);
     if (!row) throw notFound('That role');
   }
+  if (scope === 'LABEL') {
+    // A live label of a live group of THIS company.
+    const [[row]] = await conn.query(
+      `SELECT l.id FROM hrms_department_labels l
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+        WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`, [c.companyId, labelId]);
+    if (!row) throw notFound('That label');
+  }
   let policy = null;
   if (policyId !== null) {
     policy = await loadPolicyRow(conn, c.companyId, policyId);
@@ -606,7 +662,7 @@ export async function putAssignment(conn, c, body = {}, requestId = null) {
     }
   }
 
-  const key = `${scope}:${locationId ?? roleId ?? 0}`;
+  const key = `${scope}:${locationId ?? roleId ?? labelId ?? 0}`;
   const [[current]] = await conn.query('SELECT id, policy_id FROM hrms_leave_policy_assignments WHERE company_id = ? AND target_key = ? FOR UPDATE', [c.companyId, key]);
   let madeId = null;
   if (policy === null) {
@@ -614,18 +670,18 @@ export async function putAssignment(conn, c, body = {}, requestId = null) {
   } else if (current) {
     await conn.query('UPDATE hrms_leave_policy_assignments SET policy_id = ? WHERE company_id = ? AND id = ?', [policy.id, c.companyId, current.id]);
   } else {
-    const [ins] = await conn.query('INSERT INTO hrms_leave_policy_assignments (company_id, scope, location_id, role_id, policy_id, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-      [c.companyId, scope, locationId, roleId, policy.id, c.userId]);
+    const [ins] = await conn.query('INSERT INTO hrms_leave_policy_assignments (company_id, scope, location_id, role_id, label_id, policy_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [c.companyId, scope, locationId, roleId, labelId, policy.id, c.userId]);
     madeId = ins.insertId;
   }
   if (current || policy) {
     await audit(conn, c, 'hrms_leave_policy_assignments', current?.id ?? madeId, policy ? (current ? 'UPDATE' : 'CREATE') : 'DELETE',
-      current ? { policyId: current.policy_id } : null, { scope, locationId, roleId, policyId: policy?.id ?? null }, requestId);
+      current ? { policyId: current.policy_id } : null, { scope, locationId, roleId, labelId, policyId: policy?.id ?? null }, requestId);
   }
   return { assignments: await getAssignments(conn, c.companyId) };
 }
 
-/** GET /leave/policy-for?positionId=  (or roleId=&locationId=) -> { effective } */
+/** GET /leave/policy-for?positionId=  (or roleId=&locationId=&departmentId=) -> { effective } */
 export async function policyFor(db, companyId, query = {}) {
   const idOf = (v, label) => {
     if (v === undefined || v === null || v === '') return null;
@@ -635,24 +691,26 @@ export async function policyFor(db, companyId, query = {}) {
   };
   let roleId = idOf(query.roleId, 'roleId');
   let locationId = idOf(query.locationId, 'locationId');
+  let departmentId = idOf(query.departmentId, 'departmentId');
   const positionId = idOf(query.positionId, 'positionId');
   if (positionId !== null) {
-    const [[p]] = await db.query('SELECT role_id, location_id FROM hrms_positions WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, positionId]);
+    const [[p]] = await db.query('SELECT role_id, location_id, department_id FROM hrms_positions WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, positionId]);
     if (!p) throw notFound('That position');
     roleId = p.role_id;
     locationId = p.location_id;
-  } else if (roleId === null && locationId === null) {
-    throw invalid('INVALID', 'Say which position — or which role and location — to answer for.');
+    departmentId = p.department_id;
+  } else if (roleId === null && locationId === null && departmentId === null) {
+    throw invalid('INVALID', 'Say which position — or which role, department and location — to answer for.');
   }
-  return { effective: resolveEffective(await loadAssignmentIndex(db, companyId), { roleId, locationId }) };
+  return { effective: resolveEffective(await loadAssignmentIndex(db, companyId), { roleId, locationId, departmentId }) };
 }
 
 /**
  * A person's own leave: the policy their position falls under, with its rules
  * and their sentences. For /user/me/place. Two reads.
  */
-export async function leaveOfPosition(db, companyId, { roleId = null, locationId = null } = {}) {
-  const effective = resolveEffective(await loadAssignmentIndex(db, companyId), { roleId, locationId });
+export async function leaveOfPosition(db, companyId, { roleId = null, locationId = null, departmentId = null } = {}) {
+  const effective = resolveEffective(await loadAssignmentIndex(db, companyId), { roleId, locationId, departmentId });
   if (!effective.policy) return { ...effective, rules: [] };
   return { ...effective, rules: (await rulesOfPolicies(db, companyId, [effective.policy.id])).get(effective.policy.id) ?? [] };
 }

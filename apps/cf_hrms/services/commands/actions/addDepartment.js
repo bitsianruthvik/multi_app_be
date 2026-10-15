@@ -60,7 +60,12 @@ export default {
       problems.push(`There is already a department called ${name} there.`);
     }
     const others = otherLabelsOf(step, ctx, problems);
-    const made = { kind: 'department', name, label, inside: under ? under.inside : !scoped, parentStep: under?.step ?? null };
+    // Its labels in group order (Kind by name, then the others) — what a position added to it later in the plan starts its shift from.
+    const labelRefs = (ctx.recs.labelGroups ?? []).flatMap((g) => {
+      const l = g.isKind ? g.labels.find((x) => x.name.toLowerCase() === String(label).toLowerCase()) : g.labels.find((x) => others.some((o) => o.id === x.id));
+      return l ? [{ groupId: g.id, groupName: g.name, labelId: l.id, name: l.name }] : [];
+    });
+    const made = { kind: 'department', name, label, labelRefs, inside: under ? under.inside : !scoped, parentStep: under?.step ?? null };
     ctx.preview.departments.push({
       key: step.id, name, label, labels: others.map((l) => ({ groupId: l.groupId, groupName: l.groupName, labelId: l.id, name: l.name })),
       parentId: under?.step ? null : under?.id ?? null,

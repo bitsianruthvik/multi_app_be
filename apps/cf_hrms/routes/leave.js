@@ -29,9 +29,9 @@ const router = Router();
  *   POST   /leave/policies/preview-summary      { rule }  -> { summary, problems } — the sentence as it is typed; writes nothing
  *   GET    /leave/policy-templates              { note, templates }
  *
- *   GET    /leave/assignments                   { company, locations, roles, unassignedPositions }
- *   PUT    /leave/assignments                   { scope, locationId?, roleId?, policyId | null }  -> { assignments }
- *   GET    /leave/policy-for                    ?positionId=  |  ?roleId=&locationId=            -> { effective }
+ *   GET    /leave/assignments                   { company, locations, labels, roles, unassignedPositions }
+ *   PUT    /leave/assignments                   { scope, locationId?, roleId?, labelId?, policyId | null }  -> { assignments }
+ *   GET    /leave/policy-for                    ?positionId=  |  ?roleId=&locationId=&departmentId=  -> { effective }
  *
  * Reads: `cf_hrms_leave_view`. Writes: `cf_hrms_leave_edit`; deletes: `cf_hrms_leave_remove`. An employee
  * login holds neither; a person reads their OWN policy on `/user/me/place`.
@@ -83,7 +83,7 @@ router.put('/leave/policies/:id', guard(PERM.leave.edit, { note: 'archiving it, 
 }));
 router.delete('/leave/policies/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deletePolicy(db, c, id(req), reqId(req)))));
 
-// ── where a policy applies: company default -> location -> role ─────────────
+// ── where a policy applies: company default -> location -> label -> role (spec §17) ──
 router.get('/leave/assignments', guard(PERM.leave.view), handle((req) => getAssignments(pool, ctx(req).companyId)));
 router.put('/leave/assignments', guard(PERM.leave.edit, { note: 'clearing one (policyId: null) also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => {
   if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'policyId') && (req.body.policyId === null || req.body.policyId === '')) need(req, PERM.leave.remove);

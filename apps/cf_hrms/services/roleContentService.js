@@ -518,7 +518,7 @@ export async function getRole(db, companyId, id) {
   );
   if (!row) throw notFound('Role');
   // The leave policy given to THIS role, or null when it follows the location (spec §8.3).
-  const leave = await loadAssignmentIndex(db, companyId);
+  const leave = await loadAssignmentIndex(db, companyId, { labels: false });
   return { ...shapeRole(row), leavePolicy: { own: leave.byRole.get(row.id) ?? null } };
 }
 

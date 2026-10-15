@@ -3183,17 +3183,21 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policy_rules (
 
 
 -- ----- 13c. Leave policy assignments -------------------------------------------
--- Where a policy applies. scope COMPANY (both ids NULL), LOCATION (location_id)
--- or ROLE (role_id). ONE LIVE ROW PER TARGET is a database guarantee:
--- `target_key` is 'COMPANY:0', 'LOCATION:<id>' or 'ROLE:<id>' while the row is
--- live and NULL once it is removed.
+-- Where a policy applies. scope COMPANY (both ids NULL), LOCATION (location_id),
+-- ROLE (role_id) or LABEL (label_id, a department label — spec §17, §19 below).
+-- ONE LIVE ROW PER TARGET is a database guarantee: `target_key` is 'COMPANY:0',
+-- 'LOCATION:<id>', 'ROLE:<id>' or 'LABEL:<id>' while the row is live and NULL
+-- once it is removed. label_id's foreign key is added in §19 (the labels table
+-- is created below this one); on a database made before §17, §19 also adds the
+-- column and rebuilds target_key with label_id in it.
 
 CREATE TABLE IF NOT EXISTS hrms_leave_policy_assignments (
   id           INT          AUTO_INCREMENT PRIMARY KEY,
   company_id   INT          NOT NULL,
-  scope        VARCHAR(20)  NOT NULL,                 -- COMPANY | LOCATION | ROLE
+  scope        VARCHAR(20)  NOT NULL,                 -- COMPANY | LOCATION | ROLE | LABEL
   location_id  INT          NULL,
   role_id      INT          NULL,
+  label_id     INT          NULL,
   policy_id    INT          NOT NULL,
 
   deleted_at   DATETIME     DEFAULT NULL,
@@ -3202,11 +3206,12 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policy_assignments (
   created_by   INT          NULL,
 
   target_key   VARCHAR(40)  GENERATED ALWAYS AS (
-                 IF(deleted_at IS NULL, CONCAT(scope, ':', IFNULL(location_id, IFNULL(role_id, 0))), NULL)) VIRTUAL,
+                 IF(deleted_at IS NULL, CONCAT(scope, ':', IFNULL(location_id, IFNULL(role_id, IFNULL(label_id, 0)))), NULL)) VIRTUAL,
 
   UNIQUE KEY uq_hlpa_tenant (company_id, id),
   UNIQUE KEY uq_hlpa_target (company_id, target_key),
   KEY idx_hlpa_policy (company_id, policy_id),
+  KEY idx_hlpa_label (company_id, label_id),
 
   CONSTRAINT fk_hlpa_company  FOREIGN KEY (company_id) REFERENCES companies(id),
   CONSTRAINT fk_hlpa_policy   FOREIGN KEY (company_id, policy_id)   REFERENCES hrms_leave_policies(company_id, id),
@@ -3605,4 +3610,83 @@ SET @needs_hwco_line_idx = (
 SET @sql = IF(@needs_hwco_line_idx = 1,
   'ALTER TABLE hrms_work_assignment_content_overrides ADD KEY idx_hwco_line (company_id, line_key)',
   'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 19. LEAVE POLICY AND DEFAULT SHIFT BY LABEL (CF_HRMS_HIRING_SPEC.md §17)  ##
+-- ############################################################################
+-- Added 2026-10-15.
+--
+--   hrms_leave_policy_assignments  scope LABEL with label_id: a policy for every
+--                                  position whose department carries the label.
+--                                  The resolution is role -> label -> location ->
+--                                  company (services/leavePolicyRead.js).
+--                                  target_key gains label_id, so 'LABEL:<id>' is
+--                                  one live row per label. `scope` is already
+--                                  VARCHAR(20): LABEL needs no change to it.
+--   hrms_department_labels         default_shift_id ("New positions start on"):
+--                                  the shift a NEW position gets when none is
+--                                  named — the first label of its department, in
+--                                  group order, that has one; else the General
+--                                  shift. Existing positions never change.
+--
+-- One change per ALTER (TiDB, see §10c). Every step is guarded: a no-op on a
+-- database that has it, including one built from this file a moment ago.
+-- apps/cf_hrms/scripts/apply-label-defaults.mjs makes exactly these changes.
+
+-- ----- 19a. hrms_leave_policy_assignments.label_id ---------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND COLUMN_NAME = 'label_id');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_assignments ADD COLUMN label_id INT NULL AFTER role_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND INDEX_NAME = 'idx_hlpa_label');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_assignments ADD KEY idx_hlpa_label (company_id, label_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND CONSTRAINT_NAME = 'fk_hlpa_label');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_assignments ADD CONSTRAINT fk_hlpa_label FOREIGN KEY (company_id, label_id) REFERENCES hrms_department_labels(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 19b. target_key with label_id in it -----------------------------------
+-- TiDB cannot change a generated column's expression, so a target_key that does
+-- not mention label_id yet is dropped (its unique key first) and added again.
+-- COMPANY, LOCATION and ROLE rows get exactly the key they had.
+SET @old_target = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND COLUMN_NAME = 'target_key'
+             AND GENERATION_EXPRESSION NOT LIKE '%label_id%');
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND INDEX_NAME = 'uq_hlpa_target');
+SET @sql = IF(@old_target > 0 AND @c > 0, 'ALTER TABLE hrms_leave_policy_assignments DROP INDEX uq_hlpa_target', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@old_target > 0, 'ALTER TABLE hrms_leave_policy_assignments DROP COLUMN target_key', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND COLUMN_NAME = 'target_key');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_assignments ADD COLUMN target_key VARCHAR(40) GENERATED ALWAYS AS (IF(deleted_at IS NULL, CONCAT(scope, '':'', IFNULL(location_id, IFNULL(role_id, IFNULL(label_id, 0)))), NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_assignments' AND INDEX_NAME = 'uq_hlpa_target');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_assignments ADD UNIQUE KEY uq_hlpa_target (company_id, target_key)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 19c. hrms_department_labels.default_shift_id --------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_department_labels' AND COLUMN_NAME = 'default_shift_id');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_department_labels ADD COLUMN default_shift_id INT NULL AFTER sort_order', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_department_labels' AND INDEX_NAME = 'idx_hdlb_default_shift');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_department_labels ADD KEY idx_hdlb_default_shift (company_id, default_shift_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_department_labels' AND CONSTRAINT_NAME = 'fk_hdlb_default_shift');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_department_labels ADD CONSTRAINT fk_hdlb_default_shift FOREIGN KEY (company_id, default_shift_id) REFERENCES hrms_shifts(company_id, id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

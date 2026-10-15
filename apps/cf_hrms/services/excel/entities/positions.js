@@ -1,5 +1,8 @@
 /**
- * Positions in Excel. Code (issued) · Role★ · Department★ · Shift★ · Location · Reports to · Status · Person (info).
+ * Positions in Excel. Code (issued) · Role★ · Department★ · Shift · Location · Reports to · Status · Person (info).
+ * A NEW row with the Shift left blank starts on its department's label default, else General
+ * (spec §17.2, services/newPositionShift.js — worked out in memory, no query per row); an existing
+ * row cannot be left without a shift.
  * A position is one chair for one person on one shift. Writes go through positionService:
  * the code, the shift that moves the person with it, the reporting line that is ended and not overwritten.
  * Closed positions are not in the file and not in its lists; closing is done on the screen.
@@ -7,6 +10,7 @@
 import { PERM, words, coded, textOf, changedKeys, inScope, loops, todayText } from './_shared.js';
 import * as POS from '../../positionService.js';
 import { labelState, groupColumns, groupCells } from './_labels.js';
+import { chooseNewShift } from '../../newPositionShift.js';
 
 const STATUSES = ['DRAFT', 'ACTIVE', 'FROZEN'];
 
@@ -49,7 +53,7 @@ export default {
             AND (wa.effective_from IS NULL OR wa.effective_from <= ?) AND (wa.effective_to IS NULL OR wa.effective_to >= ?)`, [c.companyId, on, on]),
       db.query('SELECT id, role_code AS code, title AS name FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY title', [c.companyId]),
       db.query('SELECT id, code, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY name', [c.companyId]),
-      db.query('SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId]),
+      db.query('SELECT id, code, name, status FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [c.companyId]),
       db.query('SELECT id, code, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name', [c.companyId]),
       db.query("SELECT id FROM hrms_reporting_relationship_types WHERE company_id = ? AND code = 'PRIMARY_MANAGER' AND deleted_at IS NULL ORDER BY id LIMIT 1", [c.companyId]),
       labelState(db, c.companyId),
@@ -71,14 +75,24 @@ export default {
         ...groupCells(groups.model, groups.ofDepartment, p.department_id, { kind: true }),
       },
     }]));
-    return { lists, current, primaryTypeId: type?.id ?? null, model: groups.model };
+    // Each department's labels that carry a default shift, in group order: what a new row with no shift starts on.
+    const shiftLabels = new Map();
+    for (const [departmentId, names] of groups.ofDepartment) {
+      const list = [];
+      for (const g of groups.model.groups) {
+        const l = names.has(g.id) ? groups.model.labelsOf(g.id).find((x) => x.name === names.get(g.id)) : null;
+        if (l?.default_shift_id != null) list.push({ labelId: l.id, name: l.name, groupName: g.name, defaultShiftId: l.default_shift_id });
+      }
+      if (list.length) shiftLabels.set(departmentId, list);
+    }
+    return { lists, current, primaryTypeId: type?.id ?? null, model: groups.model, shiftLabels, shiftRows: shifts };
   },
 
   columns: (state) => [
     { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The position’s code.', example: 'P021-2' },
     { key: 'role', header: 'Role', kind: 'list', list: 'roles', required: true, width: 36, meaning: 'The job this position is for.', example: 'R014 — Shift In-charge' },
     { key: 'department', header: 'Department', kind: 'list', list: 'departments', required: true, width: 34, meaning: 'Where the position sits.', example: 'D004 — Production' },
-    { key: 'shift', header: 'Shift', kind: 'list', list: 'shifts', required: true, width: 18, meaning: 'The one shift this position works.', example: 'D — Day' },
+    { key: 'shift', header: 'Shift', kind: 'list', list: 'shifts', width: 18, meaning: 'The one shift this position works. Blank on a new row: the shift its department’s label starts new positions on, else the General shift.', example: 'D — Day' },
     { key: 'location', header: 'Location', kind: 'list', list: 'locations', width: 22, meaning: 'Where it is based, if the company has more than one place.', example: 'L01 — Unit 2' },
     { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = the top of the chart.', example: 'P004 — Plant Head' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 12, meaning: 'DRAFT, ACTIVE or FROZEN (kept, not to be filled).', example: 'ACTIVE' },
@@ -89,6 +103,19 @@ export default {
   labelOf: (row) => `New position — ${row.values.role ?? ''}`.trim(),
 
   check(row, state, env) {
+    if (!row.isNew && row.current && row.values.shift == null && row.current.cells.shift != null) {
+      row.problems.push('Shift: a position is on one shift. Choose the shift it works.');
+    }
+    if (row.isNew && !row.entries.shift) {
+      // spec §17.2: none named -> the department's label default, else General. Said in the preview.
+      const choice = chooseNewShift({ labels: state.shiftLabels.get(row.entries.department?.id ?? null) ?? [], shifts: state.shiftRows });
+      if (!choice.shift) row.problems.push('Shift: this company has no shift yet. Add one under Shifts first.');
+      else {
+        row.entries.shift = { id: choice.shift.id };
+        const why = choice.from === 'LABEL' ? `from the label ${choice.label.name}` : 'the company’s general shift';
+        row.values.shift = `${textOf(state.lists.shifts, choice.shift.id) ?? choice.shift.name} (${why})`;
+      }
+    }
     row.managerId = row.entries.reportsTo?.id ?? null;
     if (!row.isNew && row.managerId === row.id) row.problems.push('Reports to: a position cannot report to itself.');
     if (row.isNew && row.values.status == null) row.values.status = 'ACTIVE';

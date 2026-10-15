@@ -203,6 +203,7 @@ const MY_ASSIGNMENTS = `
   SELECT wa.id, wa.assignment_title, wa.allocation_percent, wa.is_primary, wa.status,
          wa.effective_from, wa.effective_to, wa.role_id, wa.position_id,
          COALESCE(p.role_id, wa.role_id) AS leave_role_id, COALESCE(wa.location_id, p.location_id) AS leave_location_id,
+         COALESCE(p.department_id, wa.department_id) AS leave_department_id,
          r.title AS role_title, r.role_purpose,
          p.position_code, COALESCE(p.position_title, pr.title) AS position_title,
          d.name AS department_name, l.name AS location_name,
@@ -716,7 +717,7 @@ export async function myPlace(db, ctx, { on, canSeePii = false } = {}) {
   const exit = (await exitsForEmployees(db, companyId, [employee.id])).get(employee.id) ?? null;
   // "Your leave": the policy their primary position falls under, with its rules in words. It is theirs to read.
   const primaryAssignment = assignments.find((a) => a.is_primary) ?? assignments[0] ?? null;
-  const leavePolicy = await leaveOfPosition(db, companyId, { roleId: primaryAssignment?.leave_role_id ?? null, locationId: primaryAssignment?.leave_location_id ?? null });
+  const leavePolicy = await leaveOfPosition(db, companyId, { roleId: primaryAssignment?.leave_role_id ?? null, locationId: primaryAssignment?.leave_location_id ?? null, departmentId: primaryAssignment?.leave_department_id ?? null });
 
   return {
     asOf,

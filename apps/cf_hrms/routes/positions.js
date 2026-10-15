@@ -3,6 +3,8 @@
  * and position content overlays. (Plan §5.4, §7.)
  *
  *   GET    /positions/options                          every picker a position form needs, in one request
+ *   GET    /positions/new-shift ?departmentId=&likePositionId=   { suggestion: { shift, from, label, line } } — the shift a new
+ *                                                      position would start on and why (spec §17.2); writes nothing
  *   GET    /positions                     ?on=&status=&roleId=&departmentId=&locationId=&search=
  *                                                      rows + sanctioned/filled/vacant totals over the SAME filtered set
  *   POST   /positions                     { roleId*, positionTitle?, departmentId?, locationId?,
@@ -85,7 +87,7 @@ import {
   listPositionReporting, addPositionReporting, updatePositionReporting, endPositionReporting, removePositionReporting,
   listPositionOccupants,
   listPositionOverrides, addPositionOverride, removePositionOverride,
-  positionOptions,
+  positionOptions, suggestNewShift,
 } from '../services/positionService.js';
 import { resolvePositionReporting } from '../services/reportingResolver.js';
 import {
@@ -100,6 +102,7 @@ const id = (req) => intParam(req.params.id);
 // Before /positions/:id, or Express would try to read "options" as an id.
 router.get('/positions/options', guard([PERM.positions.view, PERM.hiring.view, PERM.employees.view]), handle((req) => positionOptions(pool, ctx(req).companyId)));
 
+router.get('/positions/new-shift', guard(PERM.positions.view), handle((req) => suggestNewShift(pool, ctx(req).companyId, req.query)));
 router.get('/positions', guard(PERM.positions.view), listed('positions'), handle((req) => listPositions(pool, ctx(req).companyId, req.query)));
 router.post('/positions', guard(PERM.positions.edit), newPositionBody, handle((req) => tx(req, (db, c) => createPosition(db, c, req.body ?? {}))));
 router.get('/positions/:id', guard(PERM.positions.view), handle((req) => getPosition(pool, ctx(req).companyId, id(req), req.query)));

@@ -236,7 +236,7 @@ await rolledBack(async (db) => {
   'a policy from "Shop floor" creates the leave types the company did not have — and only those');
   ok(made.status === 'DRAFT' && made.rules.length === 6 && made.headline === 'Earned · Casual 7 · Sick 7 · Compensatory off · Bereavement · Leave without pay' && made.yearStartsMonth === 1 && made.code === null
     && JSON.stringify(made.leaveTypes[1]) === JSON.stringify({ code: 'CL', name: typesAfter.find((x) => x.code === 'CL').name, days: 7, basis: 'PER_YEAR' })
-    && JSON.stringify(made.usedBy) === JSON.stringify({ company: false, locations: 0, roles: 0, positions: 0 }) && made.rules.every((r) => r.id > 0 && r.leaveTypeId > 0 && r.summary),
+    && JSON.stringify(made.usedBy) === JSON.stringify({ company: false, locations: 0, roles: 0, labels: 0, positions: 0 }) && made.rules.every((r) => r.id > 0 && r.leaveTypeId > 0 && r.summary),
   'it starts as a DRAFT with the template’s six rules, a headline, and nobody using it', made.headline);
   const office = (await LEAVE.createPolicy(db, c, { name: `${TAG} Office`, fromTemplate: 'office_staff', yearStartsMonth: 4, status: 'ACTIVE', code: `${TAG}OF` })).policy;
   const typesThen = (await LEAVE.listLeaveTypes(db, COMPANY)).types;
@@ -340,7 +340,8 @@ await rolledBack(async (db) => {
     'a ROLE’s policy beats the location’s: "<policy> — from the role"; the other role at the same location still gets the location’s');
   ok(JSON.stringify(afterRole.roles.filter((r) => [roleA, roleB].includes(r.roleId))) === JSON.stringify([{ roleId: roleA, title: `${TAG} Role A`, positionCount: 1, policy: ref(forRole) }]),
     'the roles list holds only roles WITH a policy of their own, each with its position count', JSON.stringify(afterRole.roles.slice(0, 2)));
-  ok(JSON.stringify(Object.keys(afterRole)) === JSON.stringify(['company', 'locations', 'roles', 'unassignedPositions']), 'the answer is { company, locations, roles, unassignedPositions }');
+  // labels joined on 2026-10-15 (spec §17: By label; usedBy.labels too).
+  ok(JSON.stringify(Object.keys(afterRole)) === JSON.stringify(['company', 'locations', 'labels', 'roles', 'unassignedPositions']), 'the answer is { company, locations, labels, roles, unassignedPositions }');
   ok(JSON.stringify((await LEAVE.policyFor(db, COMPANY, { roleId: roleA, locationId: location.id })).effective) === JSON.stringify(line3)
     && JSON.stringify((await LEAVE.policyFor(db, COMPANY, { roleId: roleB, locationId: location.id })).effective) === JSON.stringify(line2)
     && JSON.stringify((await LEAVE.policyFor(db, COMPANY, { roleId: roleB })).effective) === JSON.stringify(line1)
@@ -357,8 +358,8 @@ await rolledBack(async (db) => {
   // ── usedBy ──
   const listed = (await LEAVE.listPolicies(db, COMPANY)).policies;
   const used = (p) => listed.find((x) => x.id === p.id).usedBy;
-  ok(JSON.stringify(used(forRole)) === JSON.stringify({ company: false, locations: 0, roles: 1, positions: 1 })
-    && JSON.stringify(used(forLocation)) === JSON.stringify({ company: false, locations: 1, roles: 0, positions: 1 })
+  ok(JSON.stringify(used(forRole)) === JSON.stringify({ company: false, locations: 0, roles: 1, labels: 0, positions: 1 })
+    && JSON.stringify(used(forLocation)) === JSON.stringify({ company: false, locations: 1, roles: 0, labels: 0, positions: 1 })
     && used(forCompany).company === true && used(forCompany).locations === 0 && used(forCompany).roles === 0
     && listed.reduce((t, x) => t + x.usedBy.positions, 0) === total,
   `usedBy: the role’s policy 1 role / 1 position, the location’s 1 location / 1 position, the default the rest — and the positions of all policies add up to the company’s ${total}`,

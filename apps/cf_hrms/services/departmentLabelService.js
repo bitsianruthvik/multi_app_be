@@ -24,7 +24,25 @@ import { ensureKind, readModel, readName, DEFAULT_LABELS } from './labelGroupSer
 
 export { DEFAULT_LABELS };
 
-const shape = (r) => ({ id: r.id, name: r.name, sortOrder: Number(r.sort_order), departmentCount: Number(r.department_count ?? 0), groupId: r.group_id });
+const shape = (r) => ({
+  id: r.id, name: r.name, sortOrder: Number(r.sort_order), departmentCount: Number(r.department_count ?? 0), groupId: r.group_id,
+  defaultShiftId: r.default_shift_id ?? null,
+});
+
+/**
+ * 'New positions start on' (spec §17.2): a label's default shift — a live shift
+ * of this company, or null for none. Existing positions never change with it;
+ * only a position created without a shift reads it (positionService).
+ */
+async function readDefaultShift(db, companyId, value) {
+  if (value === null || value === '' || value === undefined) return null;
+  const id = Number(value);
+  const [[row]] = Number.isInteger(id) && id > 0
+    ? await db.query('SELECT id FROM hrms_shifts WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id])
+    : [[null]];
+  if (!row) throw invalid('INVALID', 'Choose one of this company’s shifts, or no default.', { problems: ['The shift new positions start on must be one of this company’s shifts.'] });
+  return id;
+}
 
 /** The group a call means: the one named, or Kind. */
 function groupOf(model, groupId) {
@@ -117,18 +135,19 @@ async function audit(db, c, id, action, before, after) {
 
 const one = async (db, companyId, id) => shape((await readModel(db, companyId)).labelById.get(id));
 
-/** POST /organisation/department-labels { name, groupId? } — without groupId, a Kind label. */
+/** POST /organisation/department-labels { name, groupId?, defaultShiftId? } — without groupId, a Kind label. */
 export async function createLabel(db, c, body = {}) {
   const model = await ensureKind(db, c.companyId, c.userId);
   const group = groupOf(model, body.groupId);
   const name = readName(body.name);
   await assertNameFree(db, c.companyId, group.id, name);
+  const defaultShiftId = await readDefaultShift(db, c.companyId, body.defaultShiftId);
   const [[last]] = await db.query('SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_department_labels WHERE company_id = ? AND group_id = ? AND deleted_at IS NULL', [c.companyId, group.id]);
   const [res] = await db.query(
-    'INSERT INTO hrms_department_labels (company_id, group_id, name, sort_order, created_by) VALUES (?, ?, ?, ?, ?)',
-    [c.companyId, group.id, name, Number(last.n) + 1, c.userId ?? null],
+    'INSERT INTO hrms_department_labels (company_id, group_id, name, sort_order, default_shift_id, created_by) VALUES (?, ?, ?, ?, ?, ?)',
+    [c.companyId, group.id, name, Number(last.n) + 1, defaultShiftId, c.userId ?? null],
   );
-  await audit(db, c, res.insertId, 'CREATE', null, { name, groupId: group.id });
+  await audit(db, c, res.insertId, 'CREATE', null, { name, groupId: group.id, defaultShiftId });
   const label = await one(db, c.companyId, res.insertId);
   return { ...label, label };
 }
@@ -167,7 +186,14 @@ export async function updateLabel(db, c, id, body = {}) {
     await db.query('UPDATE hrms_department_labels SET sort_order = ? WHERE company_id = ? AND id = ?', [n, c.companyId, id]);
     after.sortOrder = n;
   }
-  if (Object.keys(after).length) await audit(db, c, id, 'UPDATE', { name: before.name, sortOrder: before.sort_order }, { ...after, departmentsRenamed: renamed });
+  if (body.defaultShiftId !== undefined) {
+    const shiftId = await readDefaultShift(db, c.companyId, body.defaultShiftId);
+    if (shiftId !== (before.default_shift_id ?? null)) {
+      await db.query('UPDATE hrms_department_labels SET default_shift_id = ? WHERE company_id = ? AND id = ?', [shiftId, c.companyId, id]);
+      after.defaultShiftId = shiftId;
+    }
+  }
+  if (Object.keys(after).length) await audit(db, c, id, 'UPDATE', { name: before.name, sortOrder: before.sort_order, defaultShiftId: before.default_shift_id ?? null }, { ...after, departmentsRenamed: renamed });
   const label = await one(db, c.companyId, id);
   return { ...label, label, departmentsRenamed: renamed };
 }

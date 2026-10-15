@@ -98,7 +98,7 @@ export async function readModel(db, companyId) {
       `SELECT id, name, sort_order, is_required, is_kind FROM hrms_label_groups
         WHERE company_id = ? AND deleted_at IS NULL ORDER BY sort_order, id`, [companyId]),
     db.query(
-      `SELECT l.id, l.group_id, l.name, l.sort_order,
+      `SELECT l.id, l.group_id, l.name, l.sort_order, IF(s.id IS NULL, NULL, l.default_shift_id) AS default_shift_id,
               IF(g.is_kind = 1,
                  (SELECT COUNT(*) FROM hrms_departments d
                    WHERE d.company_id = l.company_id AND d.deleted_at IS NULL AND LOWER(d.department_type) = LOWER(l.name)),
@@ -107,6 +107,7 @@ export async function readModel(db, companyId) {
                    WHERE k.company_id = l.company_id AND k.label_id = l.id AND k.deleted_at IS NULL)) AS department_count
          FROM hrms_department_labels l
          LEFT JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id
+         LEFT JOIN hrms_shifts s ON s.company_id = l.company_id AND s.id = l.default_shift_id AND s.deleted_at IS NULL
         WHERE l.company_id = ? AND l.deleted_at IS NULL
         ORDER BY l.sort_order, l.id`, [companyId]),
     db.query('SELECT COUNT(*) AS n FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
@@ -122,9 +123,11 @@ export async function readModel(db, companyId) {
  */
 export async function readLists(db, companyId) {
   const [rows] = await db.query(
-    `SELECT g.id AS gid, g.name AS gname, g.sort_order AS gsort, g.is_required, g.is_kind, l.id, l.name, l.sort_order
+    `SELECT g.id AS gid, g.name AS gname, g.sort_order AS gsort, g.is_required, g.is_kind, l.id, l.name, l.sort_order,
+            IF(s.id IS NULL, NULL, l.default_shift_id) AS default_shift_id
        FROM hrms_label_groups g
        LEFT JOIN hrms_department_labels l ON l.company_id = g.company_id AND l.group_id = g.id AND l.deleted_at IS NULL
+       LEFT JOIN hrms_shifts s ON s.company_id = l.company_id AND s.id = l.default_shift_id AND s.deleted_at IS NULL
       WHERE g.company_id = ? AND g.deleted_at IS NULL
       ORDER BY g.sort_order, g.id, l.sort_order, l.id`, [companyId]);
   if (!rows.some((r) => Number(r.is_kind) === 1 && r.id != null)) return ensureKind(db, companyId);
@@ -135,7 +138,7 @@ export async function readLists(db, companyId) {
       groups.push({ id: r.gid, name: r.gname, sort_order: r.gsort, is_required: r.is_required, is_kind: r.is_kind });
       KNOWN_GROUP_IDS.add(r.gid);
     }
-    if (r.id != null) labels.push({ id: r.id, group_id: r.gid, name: r.name, sort_order: r.sort_order });
+    if (r.id != null) labels.push({ id: r.id, group_id: r.gid, name: r.name, sort_order: r.sort_order, default_shift_id: r.default_shift_id ?? null });
   }
   return modelOf(groups, labels, null);
 }
@@ -207,7 +210,11 @@ export async function ensureKind(db, companyId, userId = null) {
 
 /* ── groups: reading ───────────────────────────────────────────────────── */
 
-const shapeLabel = (l) => ({ id: l.id, name: l.name, sortOrder: Number(l.sort_order), departmentCount: Number(l.department_count ?? 0), groupId: l.group_id });
+const shapeLabel = (l) => ({
+  id: l.id, name: l.name, sortOrder: Number(l.sort_order), departmentCount: Number(l.department_count ?? 0), groupId: l.group_id,
+  // 'New positions start on' (spec §17.2): the shift a new position in a department carrying this label gets.
+  defaultShiftId: l.default_shift_id ?? null,
+});
 
 export function shapeGroup(model, g) {
   const labels = model.labelsOf(g.id).map(shapeLabel);
@@ -227,8 +234,12 @@ export function shapeGroup(model, g) {
 
 /** GET /organisation/label-groups */
 export async function listGroups(db, companyId) {
-  const model = await ensureKind(db, companyId);
-  return { groups: model.groups.map((g) => shapeGroup(model, g)), departmentCount: model.departmentCount };
+  const [model, [shifts]] = await Promise.all([
+    ensureKind(db, companyId),
+    // The choices of 'New positions start on' (spec §17.2), so the Labels sheet needs no other right to offer them.
+    db.query("SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL AND status = 'ACTIVE' ORDER BY id", [companyId]),
+  ]);
+  return { groups: model.groups.map((g) => shapeGroup(model, g)), departmentCount: model.departmentCount, shifts: shifts.map((x) => ({ id: x.id, code: x.code, name: x.name })) };
 }
 
 /* ── groups: writing ───────────────────────────────────────────────────── */

@@ -112,9 +112,10 @@ router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmen
 // every department that uses it; a delete in use is 409 IN_USE with
 // detail.departmentCount unless ?moveTo=<labelId> says where its departments go.
 //   GET    /organisation/department-labels            { labels: [{ id, name, sortOrder, departmentCount }] }
-//   POST   /organisation/department-labels            { name }               -> the label (also under `label`)
+//   POST   /organisation/department-labels            { name, groupId?, defaultShiftId? }            -> the label (also under `label`)
 //   PUT    /organisation/department-labels/order      { ids: number[] }      -> { labels }
-//   PUT    /organisation/department-labels/:id        { name?, sortOrder? }  -> the label (also under `label`)
+//   PUT    /organisation/department-labels/:id        { name?, sortOrder?, defaultShiftId? }       -> the label (also under `label`)
+//          defaultShiftId = "New positions start on" (spec §17.2): a shift id, or null for none
 //   DELETE /organisation/department-labels/:id        ?moveTo=<labelId>      -> { ok, id, departmentsMoved }
 router.get('/organisation/department-labels', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLabels(pool, ctx(req).companyId, { groupId: req.query.groupId ?? null })));
 router.post('/organisation/department-labels', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLabel(db, c, req.body ?? {}))));

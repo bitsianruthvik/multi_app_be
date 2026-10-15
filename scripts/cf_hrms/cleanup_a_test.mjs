@@ -127,8 +127,9 @@ await rolledBack(async (db) => {
   // ── a company that has never had a list ──
   const first = await LABELS.listLabels(db, OTHER);
   ok(JSON.stringify(names(first)) === JSON.stringify(['Department', 'Section', 'Machine']) && first.labels.every((l, i) => l.sortOrder === i + 1 && l.departmentCount === 0 && l.id > 0)
-    // groupId joined on 2026-10-15: every label belongs to a group, and these are the Kind group's (CF_HRMS_HIRING_SPEC §15.2).
-    && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount', 'groupId']) && first.labels.every((l) => l.groupId === first.labels[0].groupId),
+    // groupId joined on 2026-10-15: every label belongs to a group, and these are the Kind group's (CF_HRMS_HIRING_SPEC §15.2);
+    // defaultShiftId the same day (§17.2, 'New positions start on' — none to begin with).
+    && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount', 'groupId', 'defaultShiftId']) && first.labels.every((l) => l.defaultShiftId === null) && first.labels.every((l) => l.groupId === first.labels[0].groupId),
   'a company with no list gets Department, Section, Machine the first time it is read: { labels: [{ id, name, sortOrder, departmentCount, groupId }] }', JSON.stringify(first.labels));
   ok(JSON.stringify((await LABELS.listLabels(db, OTHER)).labels.map((l) => l.id)) === JSON.stringify(first.labels.map((l) => l.id)), 'a second read writes nothing more');
   await db.query('DELETE FROM hrms_department_labels WHERE company_id = ?', [OTHER]);

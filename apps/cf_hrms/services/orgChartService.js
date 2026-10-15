@@ -842,8 +842,8 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
 
   // The resolved formal set and the role's content, both through their one owner.
   const [leavePolicy, reporting, roleContent, overrides] = await Promise.all([
-    // Which leave policy applies here: role, else location, else company (the one resolution).
-    effectiveFor(db, companyId, { roleId: head.role_id, locationId: head.location_id }),
+    // Which leave policy applies here: role, else label, else location, else company (the one resolution).
+    effectiveFor(db, companyId, { roleId: head.role_id, locationId: head.location_id, departmentId: head.department_id }),
     resolvePositionReporting(db, companyId, positionId, { on: asOf }),
     position.role_id ? getRoleContent(db, companyId, position.role_id, { on: asOf }) : null,
     listPositionOverrides(db, companyId, positionId),

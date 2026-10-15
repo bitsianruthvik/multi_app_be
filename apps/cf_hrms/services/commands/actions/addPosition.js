@@ -1,7 +1,8 @@
 /**
  * add_position — a vacant position (spec §14.2). positionService.createPosition
- * (the code is issued by the code generator; no shift named = the company's
- * General shift), then, when a manager is named, addPositionReporting with the
+ * (the code is issued by the code generator; no shift named = its department's
+ * label default, else the company's General shift — spec §17.2,
+ * services/newPositionShift.js; the preview says which and why), then, when a manager is named, addPositionReporting with the
  * company's PRIMARY_MANAGER type — the same two calls the position screen makes.
  *
  * Created ACTIVE: a position written in words is a real chair, ready to be
@@ -13,6 +14,19 @@ import {
   PERM, fieldOf, resolve, needRight, pathOf, shownName, OUTSIDE,
 } from './common.js';
 import { said } from './contentLine.js';
+import { chooseNewShift, shiftWords } from '../../newPositionShift.js';
+
+/**
+ * The shift the step will use and why: the one named, else the rule of
+ * newPositionShift.js over the department's labels (a department made earlier
+ * in the same plan brings the labels it is given there).
+ */
+export function shiftChoiceOf(ctx, shift, department) {
+  if (shift) return { shift: { id: shift.id, name: shift.name }, from: 'NAMED', label: null, line: `Starts on ${shiftWords(shift.name)} (as asked)` };
+  const own = !department ? [] : department.step ? (department.labelRefs ?? []) : (department.record?.labels ?? []);
+  const labels = own.map((l) => ({ ...l, defaultShiftId: ctx.recs.labelShift?.get(l.labelId) ?? null })).filter((l) => l.defaultShiftId != null);
+  return chooseNewShift({ labels, shifts: ctx.recs.shifts });
+}
 
 export default {
   key: 'add_position',
@@ -48,7 +62,7 @@ export default {
     if (department && !department.inside) problems.push(OUTSIDE(department.name));
     const shift = said(step, 'shift') ? resolve(ctx, step, 'shift', 'shift', problems) : null;
     const reportsTo = said(step, 'reportsTo') ? resolve(ctx, step, 'reportsTo', 'position', problems, { words: 'the position it reports to' }) : null;
-    const general = ctx.recs.shifts.find((s) => String(s.code ?? '').toUpperCase().startsWith('G')) ?? ctx.recs.shifts[0];
+    const choice = shiftChoiceOf(ctx, shift, department);
     ctx.preview.positions.push({
       key: step.id,
       title: shownName(role),
@@ -58,7 +72,10 @@ export default {
       departmentKey: department?.step ?? null,
       departmentName: department?.name ?? null,
       path: department && !department.step ? pathOf(ctx.recs, department.id) : [],
-      shiftName: (shift ?? general)?.name ?? null,
+      shiftName: choice.shift?.name ?? null,
+      // 'Starts on Day shift (from the label Machine)' — the shift it will use, and why.
+      shiftFrom: choice.from,
+      shiftLine: choice.line,
       reportsToId: reportsTo?.step ? null : reportsTo?.id ?? null,
       reportsToKey: reportsTo?.step ?? null,
       reportsToName: reportsTo ? `${reportsTo.name}${reportsTo.code ? ` (${reportsTo.code})` : ''}` : null,

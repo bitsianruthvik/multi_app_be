@@ -6,6 +6,7 @@ import { openHiringsByPosition, COMING_OR_LIVE_SQL, splitComing, dayText } from 
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
+import { newPositionShift } from './newPositionShift.js';
 import { issuePositionCode, acceptImportedCode } from './codeService.js';
 import { POSITION_ENTITY, cardCodeOf } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
@@ -22,7 +23,8 @@ import { randomUUID } from 'crypto';
  * ONE POSITION IS ONE CHAIR (2026-10-10; services/seatCount.js has the rule).
  * A position is for one person on one shift. `sanctioned_headcount` is always
  * written as 1 whatever a caller sends; `default_shift_id` is the position's
- * shift, set on create (the company's General shift when none is given) and
+ * shift, set on create (when none is given: its department's label default,
+ * else the company's General shift — services/newPositionShift.js) and
  * never cleared. Twelve helpers are twelve positions — "one more like this" is
  * addSiblingPosition, and the chart draws the twelve as one CARD
  * (services/positionCards.js). Reporting lines run chair to chair, but a team
@@ -433,15 +435,34 @@ export async function getPosition(db, companyId, id, query = {}) {
   if (!row) throw notFound('Position');
   // The leave policy this position falls under: its role's, else its location's, else the company's
   // (leavePolicyRead.resolveEffective — the one resolution). One read; the list does not carry it.
-  const leavePolicy = await effectiveFor(db, companyId, { roleId: row.role_id, locationId: row.location_id });
+  const leavePolicy = await effectiveFor(db, companyId, { roleId: row.role_id, locationId: row.location_id, departmentId: row.department_id });
   return { asOf: on, position: { ...shapePosition(row, people.live.get(row.id), hirings.get(row.id), people.joining.get(row.id), on), leavePolicy } };
 }
 
-/** The shift a new position gets when none is named: General (a code starting 'G'), else the company's first. */
-async function generalShiftId(db, companyId) {
-  const [shifts] = await db.query('SELECT id, code FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [companyId]);
-  const general = shifts.find((s) => String(s.code ?? '').trim().toUpperCase().startsWith('G'));
-  return (general ?? shifts[0])?.id ?? null;
+/**
+ * GET /positions/new-shift?departmentId=&likePositionId= — the shift a new
+ * position would start on, and why (spec §17.2): what the position form and
+ * "Add a position like this" show before saving. Reads only.
+ */
+export async function suggestNewShift(db, companyId, query = {}) {
+  const idOf = (v, label) => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) throw invalid('INVALID', `${label} must be a positive whole number.`);
+    return n;
+  };
+  let departmentId = idOf(query.departmentId, 'departmentId');
+  const likePositionId = idOf(query.likePositionId, 'likePositionId');
+  let likeShiftId = null;
+  if (likePositionId !== null) {
+    const like = await requirePosition(db, companyId, likePositionId);
+    likeShiftId = like.default_shift_id;
+    if (departmentId === null) departmentId = like.department_id;
+  }
+  const problems = [];
+  if (departmentId !== null) await exists(db, companyId, 'hrms_departments', departmentId, 'department', problems);
+  if (problems.length) throw notFound('That department');
+  return { suggestion: await newPositionShift(db, companyId, { departmentId, likeShiftId }) };
 }
 
 async function readPositionBody(db, companyId, body, { partial = false, current = null } = {}) {
@@ -474,7 +495,9 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
   // The position's shift. A new position with none named gets the company's
   // General shift; an existing one cannot be left without one — a chair is on a
   // shift, and "no shift" is how the old day/night box used to be written.
-  if (!partial && out.default_shift_id == null) out.default_shift_id = await generalShiftId(db, companyId);
+  // (spec §17.2) None named: the first label of its department, in group order, with a default shift;
+  // else General. A shift named always wins; an existing position never gets here.
+  if (!partial && out.default_shift_id == null) out.default_shift_id = (await newPositionShift(db, companyId, { departmentId: out.department_id })).shift?.id ?? null;
   if (partial && has('defaultShiftId') && out.default_shift_id == null && !problems.some((p) => /shift/i.test(p))) {
     if (current?.default_shift_id != null) problems.push('A position is on one shift. Choose the shift this position works.');
     else delete out.default_shift_id;
@@ -566,7 +589,8 @@ export async function updatePosition(db, { companyId, userId = null }, id, body)
  * VACANT chair in the same card.
  *
  *   - same role, title, department, location, status and dates as the source;
- *   - shift = `shiftId` when given, else the source's;
+ *   - shift = `shiftId` when given, else its department's label default
+ *     (spec §17.2), else the source's;
  *   - the source's reporting lines (every type, not yet ended), each pointed at
  *     the manager card's chair on the NEW position's shift when that card has
  *     one, else exactly where the source points — the rule the migration used
@@ -595,7 +619,10 @@ export async function addSiblingPosition(db, c, id, body = {}) {
   const givenShiftId = readInt(body.shiftId, 'Shift', problems);
   if (givenShiftId != null) await exists(db, companyId, 'hrms_shifts', givenShiftId, 'shift', problems);
   assertNoProblems(problems);
-  const shiftId = givenShiftId ?? source.default_shift_id ?? await generalShiftId(db, companyId);
+  // A shift named wins; else its department's label default; else the source's shift; else General (spec §17.2).
+  const shiftId = givenShiftId
+    ?? (await newPositionShift(db, companyId, { departmentId: source.department_id, likeShiftId: source.default_shift_id })).shift?.id
+    ?? null;
 
   // The code, through the generator. The card is read once, here, and used again for the reporting lines below.
   const on = today();

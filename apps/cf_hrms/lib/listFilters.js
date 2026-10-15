@@ -161,7 +161,7 @@ export const LIST_SPECS = {
     filters: {
       q: matchesText(['name', 'code']),
       status: oneOfWords((r) => r.status),
-      used: flag((r) => Boolean(r.usedBy?.company) || (r.usedBy?.locations ?? 0) > 0 || (r.usedBy?.roles ?? 0) > 0),
+      used: flag((r) => Boolean(r.usedBy?.company) || (r.usedBy?.locations ?? 0) > 0 || (r.usedBy?.roles ?? 0) > 0 || (r.usedBy?.labels ?? 0) > 0),
     },
   },
   libraries: {
