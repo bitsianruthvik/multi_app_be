@@ -68,7 +68,7 @@
  */
 import { notFound } from '../lib/errors.js';
 import {
-  getRoleContent, effectiveWhere, CONTENT as ROLE_CONTENT, isoDate,
+  getRoleContent, roleJobLayers, effectiveWhere, CONTENT as ROLE_CONTENT, isoDate,
 } from './roleContentService.js';
 import { dayBefore } from './datedChange.js';
 import {
@@ -566,29 +566,9 @@ export async function resolveContent(db, companyId, opts = {}) {
   // ── layer 1: the role. Read once, not re-derived. ────────────────────────
   const roleLayer = await getRoleContent(db, companyId, roleId, { on, scope: 'effective' });
 
-  // Flat lists with a parent pointer, not a nested structure. Grouping is
-  // rebuilt at the very end — which is what makes a suppressed KRA's children
-  // fall into `additional` instead of disappearing with their heading.
-  const kras = [];
-  const responsibilities = [];
-  const kpis = [];
-  for (const kra of roleLayer.kras) {
-    kras.push(itemFromRoleRow('kras', kra, null));
-    for (const r of kra.responsibilities) responsibilities.push(itemFromRoleRow('responsibilities', r, kra.definitionId));
-    for (const k of kra.kpis) kpis.push(itemFromRoleRow('kpis', k, kra.definitionId));
-  }
-  for (const r of roleLayer.additional.responsibilities) responsibilities.push(itemFromRoleRow('responsibilities', r, null));
-  for (const k of roleLayer.additional.kpis) kpis.push(itemFromRoleRow('kpis', k, null));
-
-  const bucket = { KRA: kras, RESPONSIBILITY: responsibilities, KPI: kpis };
-  const find = (kind, definitionId, lineKey = null) => findIn(bucket[kind], definitionId, lineKey);
-
   // ── layers 2 and 3: the overlays ─────────────────────────────────────────
   const layers = ['ROLE'];
-  const suppressed = [];
-  const ignored = [];
   const overlayRows = { position: [], assignment: [] };
-  let addedCount = 0;
 
   const overlaySets = [];
   if (positionId) {
@@ -607,6 +587,152 @@ export async function resolveContent(db, companyId, opts = {}) {
   // Every definition an ADD names, fetched once per master rather than once per
   // row. A per-row lookup is free locally and ruinous over the prod link.
   const definitions = await loadDefinitions(db, companyId, overlaySets);
+
+  const { kras, responsibilities, kpis, suppressed, ignored, addedCount } = layerItems(roleLayer, overlaySets, definitions);
+
+  // ── what each line replaced (spec §16.3 changedFrom) ──────────────────────
+  // An overlay's own line that rewords one above it, or that follows an earlier
+  // version of itself at the same layer; and a role line's earlier version.
+  const allOverlay = { POSITION: overlayRows.position, ASSIGNMENT: overlayRows.assignment };
+  for (const item of [...kras, ...responsibilities, ...kpis]) {
+    if (item.origin === 'ROLE') continue;
+    const rows = allOverlay[item.origin] ?? [];
+    const own = rows.find((r) => Number(r.id) === Number(item.sourceRowId));
+    const replaces = own?.overrideJson?.replacesDefinitionId ?? null;
+    const gone = replaces != null
+      ? suppressed.find((x) => x.byLayer === item.origin && x.kind === item.kind
+        && (Number(x.definitionId) === Number(replaces) || (item.lineKey && x.lineKey === item.lineKey)))
+      : null;
+    if (gone) {
+      item.changedFrom = { wording: wholeWording(gone.item?.name ?? gone.name, gone.item?.description), target: gone.item?.targetText ?? null, weightPercent: null, layer: wireLayer(item.origin) };
+      continue;
+    }
+    if (!own?.effectiveFrom || !own.lineKey) continue;
+    const prev = rows.find((r) => r.action === 'ADD' && r.lineKey === own.lineKey && r.effectiveTo === dayBefore(own.effectiveFrom));
+    if (!prev) continue;
+    const prevTarget = item.kind === 'KPI'
+      ? targetText(prev.overrideJson?.targetOperator ?? null, prev.overrideJson?.targetValue ?? null, item.measurementType, item.unit)
+      : null;
+    const wording = Number(prev[DEF_FIELD[item.kind]]) !== Number(item.definitionId) ? (wholeWording(prev.definitionName, prev.definitionDescription) || null) : null;
+    const target = item.kind === 'KPI' && prevTarget !== item.targetText ? prevTarget : null;
+    if (wording || target) item.changedFrom = { wording, target, weightPercent: null, layer: wireLayer(item.origin) };
+  }
+  await roleChangedFrom(db, companyId, roleId, [...kras, ...responsibilities, ...kpis].filter((i) => i.origin === 'ROLE' && !i.changedFrom));
+
+  renderItems(kras, responsibilities, kpis);
+
+  // An overlay line filed under a KRA the role has since renamed on a date (a new
+  // definition, the same KRA line, spec §16.1) stays under that KRA.
+  const kraLines = await kraLineIndex(db, companyId, roleId, [...responsibilities, ...kpis], new Map(kras.map((k) => [Number(k.definitionId), k])));
+  const { nodes, additional } = groupItems(kras, responsibilities, kpis, suppressed, kraLines);
+
+  // ── the six kinds with no overlay ────────────────────────────────────────
+  const skills = plainRows('skills', roleLayer.skills);
+  const qualifications = plainRows('qualifications', roleLayer.qualifications);
+  const experience = plainRows('experience', roleLayer.experience);
+  const authorities = plainRows('authorities', roleLayer.authorities);
+  const relationships = plainRows('relationships', roleLayer.relationships);
+  const conditions = plainRows('conditions', roleLayer.conditions);
+
+  const weight = (rows) => rows.reduce((t, r) => t + (Number(r.weightPercent) || 0), 0);
+
+  return {
+    asOf: on,
+    layers,
+
+    /** What was resolved, resolved — so a snapshot read years later is self-describing. */
+    target: {
+      roleId,
+      roleCode: roleLayer.role.roleCode ?? null,
+      roleTitle: roleLayer.role.title ?? null,
+      positionId: positionId ?? null,
+      workAssignmentId: workAssignmentId ?? null,
+      employeeId: assignment?.employee_id ?? null,
+      employeeCode: assignment?.employee_code ?? null,
+      employeeName: assignment?.full_name ?? null,
+    },
+    role: roleLayer.role,
+
+    kras: nodes,
+    additional,
+    suppressed: suppressed.map(({ item, ...rest }) => ({ ...rest, targetText: item?.targetText ?? null })),
+
+    skills,
+    qualifications,
+    experience,
+    authorities,
+    relationships,
+    conditions,
+
+    /**
+     * The overlay rows themselves, live and not, so a JD can print "this seat's
+     * exceptions" as a section and an HR reader can see a future-dated one
+     * coming. `ignored` is every override that changed nothing, with the reason
+     * — an exception that silently does nothing is the worst kind.
+     */
+    overlay: {
+      position: overlayRows.position,
+      assignment: overlayRows.assignment,
+      appliedLayers: layers.filter((l) => l !== 'ROLE'),
+      added: addedCount,
+      suppressedCount: suppressed.length,
+      overriddenCount: [...kras, ...responsibilities, ...kpis].filter((i) => i.overridden).length,
+      ignored,
+    },
+
+    counts: {
+      kras: nodes.length,
+      responsibilities: responsibilities.length,
+      kpis: kpis.length,
+      groupedResponsibilities: responsibilities.length - additional.responsibilities.length,
+      ungroupedResponsibilities: additional.responsibilities.length,
+      ungroupedKpis: additional.kpis.length,
+      skills: skills.length,
+      qualifications: qualifications.length,
+      experience: experience.length,
+      authorities: authorities.length,
+      relationships: relationships.length,
+      conditions: conditions.length,
+      suppressed: suppressed.length,
+    },
+
+    weights: {
+      kraTotal: Math.round(weight(kras) * 100) / 100,
+      kpiTotal: Math.round(weight(kpis) * 100) / 100,
+      kraWeighted: kras.filter((k) => k.weightPercent != null).length,
+      kpiWeighted: kpis.filter((k) => k.weightPercent != null).length,
+    },
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * The rule itself, without the reading — shared by resolveContent (one job)
+ * and resolveJobsForAssignments (many jobs, read in bulk). Same code, so the
+ * two cannot disagree.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** Role rows to items, then each overlay layer applied SUPPRESS, then OVERRIDE, then ADD. */
+function layerItems(roleLayer, overlaySets, definitions) {
+  // Flat lists with a parent pointer, not a nested structure. Grouping is
+  // rebuilt at the very end — which is what makes a suppressed KRA's children
+  // fall into `additional` instead of disappearing with their heading.
+  const kras = [];
+  const responsibilities = [];
+  const kpis = [];
+  for (const kra of roleLayer.kras) {
+    kras.push(itemFromRoleRow('kras', kra, null));
+    for (const r of kra.responsibilities) responsibilities.push(itemFromRoleRow('responsibilities', r, kra.definitionId));
+    for (const k of kra.kpis) kpis.push(itemFromRoleRow('kpis', k, kra.definitionId));
+  }
+  for (const r of roleLayer.additional.responsibilities) responsibilities.push(itemFromRoleRow('responsibilities', r, null));
+  for (const k of roleLayer.additional.kpis) kpis.push(itemFromRoleRow('kpis', k, null));
+
+  const bucket = { KRA: kras, RESPONSIBILITY: responsibilities, KPI: kpis };
+  const find = (kind, definitionId, lineKey = null) => findIn(bucket[kind], definitionId, lineKey);
+
+  const suppressed = [];
+  const ignored = [];
+  let addedCount = 0;
 
   for (const { layer, rows } of overlaySets) {
     // THE ORDER. Not row-id order — see rule 1 in the header.
@@ -696,47 +822,24 @@ export async function resolveContent(db, companyId, opts = {}) {
       }
     }
   }
+  return { kras, responsibilities, kpis, suppressed, ignored, addedCount };
+}
 
-  // ── what each line replaced (spec §16.3 changedFrom) ──────────────────────
-  // An overlay's own line that rewords one above it, or that follows an earlier
-  // version of itself at the same layer; and a role line's earlier version.
-  const allOverlay = { POSITION: overlayRows.position, ASSIGNMENT: overlayRows.assignment };
-  for (const item of [...kras, ...responsibilities, ...kpis]) {
-    if (item.origin === 'ROLE') continue;
-    const rows = allOverlay[item.origin] ?? [];
-    const own = rows.find((r) => Number(r.id) === Number(item.sourceRowId));
-    const replaces = own?.overrideJson?.replacesDefinitionId ?? null;
-    const gone = replaces != null
-      ? suppressed.find((x) => x.byLayer === item.origin && x.kind === item.kind
-        && (Number(x.definitionId) === Number(replaces) || (item.lineKey && x.lineKey === item.lineKey)))
-      : null;
-    if (gone) {
-      item.changedFrom = { wording: wholeWording(gone.item?.name ?? gone.name, gone.item?.description), target: gone.item?.targetText ?? null, weightPercent: null, layer: wireLayer(item.origin) };
-      continue;
-    }
-    if (!own?.effectiveFrom || !own.lineKey) continue;
-    const prev = rows.find((r) => r.action === 'ADD' && r.lineKey === own.lineKey && r.effectiveTo === dayBefore(own.effectiveFrom));
-    if (!prev) continue;
-    const prevTarget = item.kind === 'KPI'
-      ? targetText(prev.overrideJson?.targetOperator ?? null, prev.overrideJson?.targetValue ?? null, item.measurementType, item.unit)
-      : null;
-    const wording = Number(prev[DEF_FIELD[item.kind]]) !== Number(item.definitionId) ? (wholeWording(prev.definitionName, prev.definitionDescription) || null) : null;
-    const target = item.kind === 'KPI' && prevTarget !== item.targetText ? prevTarget : null;
-    if (wording || target) item.changedFrom = { wording, target, weightPercent: null, layer: wireLayer(item.origin) };
-  }
-  await roleChangedFrom(db, companyId, roleId, [...kras, ...responsibilities, ...kpis].filter((i) => i.origin === 'ROLE' && !i.changedFrom));
-
+/** The one-line rendering of every item, then the order. */
+function renderItems(kras, responsibilities, kpis) {
   // ── the one-line rendering, after every layer has had its say ────────────
   // Last, not per-layer: a sentence built before an OVERRIDE lands would state
   // the role's weight on a row the position had already changed.
   for (const item of [...kras, ...responsibilities, ...kpis]) item.text = itemText(item);
 
-  // ── grouping, last ───────────────────────────────────────────────────────
   const order = (a, b) => (a.sequence - b.sequence) || (Number(a.sourceRowId) - Number(b.sourceRowId));
   kras.sort(order);
   responsibilities.sort(order);
   kpis.sort(order);
+}
 
+/** Grouping, last: KRA nodes with their responsibilities and KPIs; the rest under additional (rule 2). */
+function groupItems(kras, responsibilities, kpis, suppressed, kraLines) {
   const suppressedKra = new Map(suppressed.filter((s) => s.kind === 'KRA').map((s) => [Number(s.definitionId), s]));
 
   const nodes = kras.map((k) => ({ ...k, responsibilities: [], kpis: [] }));
@@ -744,7 +847,6 @@ export async function resolveContent(db, companyId, opts = {}) {
   const additional = { responsibilities: [], kpis: [] };
   // An overlay line filed under a KRA the role has since renamed on a date (a new
   // definition, the same KRA line, spec §16.1) stays under that KRA.
-  const kraLines = await kraLineIndex(db, companyId, roleId, [...responsibilities, ...kpis], nodeOf);
   const nodeByLine = new Map(nodes.filter((n) => n.lineKey).map((n) => [n.lineKey, n]));
 
   const place = (item, into) => {
@@ -766,84 +868,7 @@ export async function resolveContent(db, companyId, opts = {}) {
   };
   for (const r of responsibilities) place(r, 'responsibilities');
   for (const k of kpis) place(k, 'kpis');
-
-  // ── the six kinds with no overlay ────────────────────────────────────────
-  const skills = plainRows('skills', roleLayer.skills);
-  const qualifications = plainRows('qualifications', roleLayer.qualifications);
-  const experience = plainRows('experience', roleLayer.experience);
-  const authorities = plainRows('authorities', roleLayer.authorities);
-  const relationships = plainRows('relationships', roleLayer.relationships);
-  const conditions = plainRows('conditions', roleLayer.conditions);
-
-  const weight = (rows) => rows.reduce((t, r) => t + (Number(r.weightPercent) || 0), 0);
-
-  return {
-    asOf: on,
-    layers,
-
-    /** What was resolved, resolved — so a snapshot read years later is self-describing. */
-    target: {
-      roleId,
-      roleCode: roleLayer.role.roleCode ?? null,
-      roleTitle: roleLayer.role.title ?? null,
-      positionId: positionId ?? null,
-      workAssignmentId: workAssignmentId ?? null,
-      employeeId: assignment?.employee_id ?? null,
-      employeeCode: assignment?.employee_code ?? null,
-      employeeName: assignment?.full_name ?? null,
-    },
-    role: roleLayer.role,
-
-    kras: nodes,
-    additional,
-    suppressed: suppressed.map(({ item, ...rest }) => ({ ...rest, targetText: item?.targetText ?? null })),
-
-    skills,
-    qualifications,
-    experience,
-    authorities,
-    relationships,
-    conditions,
-
-    /**
-     * The overlay rows themselves, live and not, so a JD can print "this seat's
-     * exceptions" as a section and an HR reader can see a future-dated one
-     * coming. `ignored` is every override that changed nothing, with the reason
-     * — an exception that silently does nothing is the worst kind.
-     */
-    overlay: {
-      position: overlayRows.position,
-      assignment: overlayRows.assignment,
-      appliedLayers: layers.filter((l) => l !== 'ROLE'),
-      added: addedCount,
-      suppressedCount: suppressed.length,
-      overriddenCount: [...kras, ...responsibilities, ...kpis].filter((i) => i.overridden).length,
-      ignored,
-    },
-
-    counts: {
-      kras: nodes.length,
-      responsibilities: responsibilities.length,
-      kpis: kpis.length,
-      groupedResponsibilities: responsibilities.length - additional.responsibilities.length,
-      ungroupedResponsibilities: additional.responsibilities.length,
-      ungroupedKpis: additional.kpis.length,
-      skills: skills.length,
-      qualifications: qualifications.length,
-      experience: experience.length,
-      authorities: authorities.length,
-      relationships: relationships.length,
-      conditions: conditions.length,
-      suppressed: suppressed.length,
-    },
-
-    weights: {
-      kraTotal: Math.round(weight(kras) * 100) / 100,
-      kpiTotal: Math.round(weight(kpis) * 100) / 100,
-      kraWeighted: kras.filter((k) => k.weightPercent != null).length,
-      kpiWeighted: kpis.filter((k) => k.weightPercent != null).length,
-    },
-  };
+  return { nodes, additional };
 }
 
 /**
@@ -1043,4 +1068,87 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
   return out;
 }
 
-export default { resolveContent, targetText, LAYERS, ACTION_ORDER };
+/* ══════════════════════════════════════════════════════════════════════════
+ * resolveJobsForAssignments — the JOB (KRAs and KPIs) of many people at once
+ * ══════════════════════════════════════════════════════════════════════════
+ * Performance plans (spec §18) copy each person's KRAs and KPIs as their job
+ * stood on one day — role, then position, then the person — for a whole period
+ * at a time: 72 people at Karni. resolveContent per person would be ~15 queries
+ * each, ~1,000 round trips at ~49 ms on production. This reads everything in a
+ * FIXED number of queries (role rows of every role: 4; position overlays: 1;
+ * person overlays: 1; definitions an ADD names: up to 2) and then runs THE
+ * SAME CODE as resolveContent — layerItems, renderItems, groupItems — per
+ * person, in memory. `performance_test.mjs` checks it against resolveContent
+ * for every Karni assignment, so the two cannot drift silently.
+ *
+ * Only KRAs and KPIs: responsibilities are the JD, not the scorecard, so their
+ * overlay rows are not read (and a position's SUPPRESS of a responsibility has
+ * nothing to act on here). What it does not compute: `changedFrom` (history,
+ * which a plan does not need) — everything else on an item is as resolveContent
+ * returns it.
+ *
+ * @param assignments  [{ workAssignmentId, positionId, roleId }] — the role the
+ *                     assignment names, as resolveContent takes it
+ * @returns Map(workAssignmentId -> { roleId, positionId, kras: [KRA node with kpis], additional: { kpis }, suppressed, ignored })
+ */
+export async function resolveJobsForAssignments(db, companyId, assignments, { on } = {}) {
+  const date = dateText(on) || today();
+  const out = new Map();
+  const list = (assignments ?? []).filter((a) => a && a.workAssignmentId && a.roleId);
+  if (!list.length) return out;
+  const roleIds = [...new Set(list.map((a) => Number(a.roleId)))];
+  const positionIds = [...new Set(list.map((a) => Number(a.positionId)).filter(Boolean))];
+  const waIds = [...new Set(list.map((a) => Number(a.workAssignmentId)))];
+  const KINDS = ['KRA', 'KPI'];
+  const overlaySql = (table, fk) => `
+    SELECT o.*, COALESCE(k.name, kp.name) AS definition_name, COALESCE(k.description, kp.description) AS definition_description, pk.name AS parent_kra_name
+      FROM ${table} o
+      LEFT JOIN hrms_kra_definitions k  ON k.company_id  = o.company_id AND k.id  = o.kra_definition_id
+      LEFT JOIN hrms_kpi_definitions kp ON kp.company_id = o.company_id AND kp.id = o.kpi_definition_id
+      LEFT JOIN hrms_kra_definitions pk ON pk.company_id = o.company_id AND pk.id = o.parent_kra_definition_id
+     WHERE o.company_id = ? AND o.${fk} IN (?) AND o.deleted_at IS NULL AND o.content_type IN (?)
+     ORDER BY o.content_type, o.action, o.id`;
+  const [roleLayers, positionRows, assignmentRows] = await Promise.all([
+    roleJobLayers(db, companyId, roleIds, { on: date, kinds: ['kras', 'kpis'] }),
+    positionIds.length
+      ? db.query(overlaySql('hrms_position_content_overrides', 'position_id'), [companyId, positionIds, KINDS]).then(([rows]) => rows)
+      : [],
+    db.query(overlaySql('hrms_work_assignment_content_overrides', 'work_assignment_id'), [companyId, waIds, KINDS]).then(([rows]) => rows),
+  ]);
+  const group = (rows, fk) => {
+    const m = new Map();
+    for (const r of rows) {
+      const key = Number(r[fk]);
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(shapeOverride(r));
+    }
+    return m;
+  };
+  const byPosition = group(positionRows, 'position_id');
+  const byAssignment = group(assignmentRows, 'work_assignment_id');
+
+  const setsOf = new Map();
+  for (const a of list) {
+    const sets = [];
+    if (a.positionId) sets.push({ layer: 'POSITION', rows: (byPosition.get(Number(a.positionId)) ?? []).filter((o) => liveOn(o, date)) });
+    sets.push({ layer: 'ASSIGNMENT', rows: (byAssignment.get(Number(a.workAssignmentId)) ?? []).filter((o) => liveOn(o, date)) });
+    setsOf.set(Number(a.workAssignmentId), sets);
+  }
+  // Every definition any ADD names, for everybody, in one query per master.
+  const definitions = await loadDefinitions(db, companyId, [...setsOf.values()].flat());
+
+  for (const a of list) {
+    const roleLayer = roleLayers.get(Number(a.roleId));
+    if (!roleLayer) continue;
+    const { kras, responsibilities, kpis, suppressed, ignored } = layerItems(roleLayer, setsOf.get(Number(a.workAssignmentId)), definitions);
+    renderItems(kras, responsibilities, kpis);
+    const { nodes, additional } = groupItems(kras, responsibilities, kpis, suppressed, roleLayer.kraLines);
+    out.set(Number(a.workAssignmentId), {
+      roleId: Number(a.roleId), positionId: a.positionId ? Number(a.positionId) : null, asOf: date,
+      kras: nodes, additional, suppressed: suppressed.map(({ item, ...rest }) => ({ ...rest, targetText: item?.targetText ?? null })), ignored,
+    });
+  }
+  return out;
+}
+
+export default { resolveContent, resolveJobsForAssignments, targetText, LAYERS, ACTION_ORDER };

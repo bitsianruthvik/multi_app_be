@@ -40,6 +40,9 @@ import {
 import { audit } from './peopleService.js';
 import { loadMySlice } from './selfOrgChartService.js';
 import { summaryFromRow } from './shiftRead.js';
+import {
+  listPlans, readPlan, planEmployeeId, setKraWeight, addKpi, changeKpi, removeKpi,
+} from './performance/planService.js';
 
 const notYours = (message, detail = undefined) => new HrmsError(403, 'NOT_YOUR_TEAM', message, detail ? { detail } : {});
 
@@ -171,7 +174,46 @@ export async function teamChangeShift(db, c, positionId, body = {}) {
   return result;
 }
 
+/* ── performance plans (spec §18.2): a manager login views and edits the DRAFT plans of people below them ── */
+
+/** The people below me today — the occupants of the positions I may change. */
+async function myTeamEmployeeIds(db, c) {
+  const slice = await mySlice(db, c);
+  const ids = new Set();
+  for (const n of slice.graph.nodes) {
+    if (!slice.canChange(n.id)) continue;
+    for (const o of n.occupants ?? []) if (o.employeeId != null) ids.add(Number(o.employeeId));
+  }
+  ids.delete(Number(slice.employee.id));
+  return [...ids];
+}
+
+/** GET /user/me/team/plans — the plans of the people below me (not cancelled). */
+export async function teamPlans(db, c) {
+  const ids = await myTeamEmployeeIds(db, c);
+  const { items } = await listPlans(db, c.companyId, { employeeIds: ids });
+  return { items: items.filter((p) => p.status !== 'CANCELLED'), people: ids.length };
+}
+
+/** A plan of a person below me, or 403 / 404 — the same rule as their job (assertPersonInMyTeam). */
+export async function assertPlanInMyTeam(db, c, planId) {
+  const employeeId = await planEmployeeId(db, c.companyId, planId);
+  if (employeeId == null) throw notFound('Plan');
+  await assertPersonInMyTeam(db, c, employeeId);
+}
+
+/** GET /user/me/team/plans/:id — editable while it is a draft; never activated or cancelled from here. */
+export async function teamPlan(db, c, planId) {
+  await assertPlanInMyTeam(db, c, planId);
+  return readPlan(db, c.companyId, planId, { edit: true, activate: false, cancel: false });
+}
+export async function teamSetKraWeight(db, c, planId, kraId, body) { await assertPlanInMyTeam(db, c, planId); return setKraWeight(db, c, planId, kraId, body); }
+export async function teamAddKpi(db, c, planId, body) { await assertPlanInMyTeam(db, c, planId); return addKpi(db, c, planId, body); }
+export async function teamChangeKpi(db, c, planId, kpiId, body) { await assertPlanInMyTeam(db, c, planId); return changeKpi(db, c, planId, kpiId, body); }
+export async function teamRemoveKpi(db, c, planId, kpiId) { await assertPlanInMyTeam(db, c, planId); return removeKpi(db, c, planId, kpiId); }
+
 export default {
   assertInMyTeam, teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
+  teamPlans, teamPlan, assertPlanInMyTeam, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
   assertPersonInMyTeam, teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
 };

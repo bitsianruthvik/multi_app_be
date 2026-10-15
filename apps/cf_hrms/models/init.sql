@@ -3690,3 +3690,241 @@ SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_department_labels' AND CONSTRAINT_NAME = 'fk_hdlb_default_shift');
 SET @sql = IF(@c = 0, 'ALTER TABLE hrms_department_labels ADD CONSTRAINT fk_hdlb_default_shift FOREIGN KEY (company_id, default_shift_id) REFERENCES hrms_shifts(company_id, id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 20. PERFORMANCE PLANS (CF_HRMS_HIRING_SPEC.md §18)                       ##
+-- ############################################################################
+-- Added 2026-10-15. KRAs and KPIs stay on the job (role -> position -> person,
+-- §16). Each period a PLAN is created for each employee by copying the KRA
+-- headings and KPIs from their job AS IT STOOD ON THE PERIOD'S START (through
+-- services/contentResolver.js, the one resolver); the manager changes only what
+-- differs. Responsibilities are not copied: they are the JD, not the scorecard.
+--
+--   hrms_performance_settings        one row per company: the performance year's
+--                                    first month, the frequency of a role that has
+--                                    none, the rating scale (used from step 6).
+--   hrms_roles.performance_frequency MONTHLY | QUARTERLY | HALF_YEARLY | YEARLY,
+--                                    NULL = the company default.
+--   hrms_performance_periods         made on demand from a frequency and the year
+--                                    start ("Q3 2026-27", "Oct 2026"); one per
+--                                    (company, frequency, start) and never
+--                                    overlapping for one frequency (service rule).
+--   hrms_performance_plans           one live plan per (employee, period) — a
+--                                    CANCELLED plan is kept and frees the slot.
+--                                    The position held on the day the job was
+--                                    read is a snapshot (position, role,
+--                                    department, the manager's position).
+--   hrms_performance_plan_kras       the KRA headings, copied; weight per plan.
+--   hrms_performance_plan_kpis       the KPIs, copied; `job_*` is what the job
+--                                    said, kept beside what the plan says, so
+--                                    "changed for this period" can show both.
+--                                    Actuals (step 5) and reviews (step 6) attach
+--                                    to a plan KPI's id: nothing here changes then.
+--   hrms_performance_target_changes  a target changed AFTER activation: dated,
+--                                    with a reason, never overwritten.
+--
+-- Status and kind columns are VARCHAR, not ENUM; the services hold the lists.
+-- New tables: CREATE TABLE IF NOT EXISTS reaches old and new databases alike.
+-- The one change to an existing table is a guarded ALTER.
+-- apps/cf_hrms/scripts/apply-performance-schema.mjs makes exactly these changes.
+
+-- ----- 20a. hrms_roles.performance_frequency --------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_roles' AND COLUMN_NAME = 'performance_frequency');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_roles ADD COLUMN performance_frequency VARCHAR(20) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 20b. Settings ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_settings (
+  id                 INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT          NOT NULL,
+  year_start_month   TINYINT      NOT NULL DEFAULT 4,              -- 1..12; India: April
+  default_frequency  VARCHAR(20)  NOT NULL DEFAULT 'QUARTERLY',
+  rating_scale       JSON         NULL,                            -- [{ value, label }] low to high
+
+  deleted_at         DATETIME     DEFAULT NULL,                    -- never written; every hrms_ table has it
+  created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT          NULL,
+  updated_by         INT          NULL,
+
+  UNIQUE KEY uq_hpfs_company (company_id),
+  CONSTRAINT fk_hpfs_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfs_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfs_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 20c. Periods ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_periods (
+  id          INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT          NOT NULL,
+  frequency   VARCHAR(20)  NOT NULL,                               -- MONTHLY | QUARTERLY | HALF_YEARLY | YEARLY
+  name        VARCHAR(40)  NOT NULL,                               -- "Q3 2026-27", "Oct 2026", "H2 2026-27", "2026-27"
+  start_date  DATE         NOT NULL,
+  end_date    DATE         NOT NULL,
+  status      VARCHAR(10)  NOT NULL DEFAULT 'OPEN',                -- OPEN | CLOSED
+  closed_at   DATETIME     NULL,
+  closed_by   INT          NULL,
+
+  deleted_at  DATETIME     DEFAULT NULL,                           -- never written: a period is closed, not removed
+  created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by  INT          NULL,
+
+  UNIQUE KEY uq_hpfp_tenant (company_id, id),
+  UNIQUE KEY uq_hpfp_start  (company_id, frequency, start_date),
+  KEY idx_hpfp_dates (company_id, frequency, start_date, end_date),
+
+  CONSTRAINT fk_hpfp_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfp_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfp_closer  FOREIGN KEY (closed_by)  REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 20d. Plans -----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_plans (
+  id                   INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id           INT          NOT NULL,
+  period_id            INT          NOT NULL,
+  employee_id          INT          NOT NULL,
+  -- The day the job was read: the period start, or the first day in the
+  -- position for a person who joined during the period. A snapshot.
+  copied_on            DATE         NOT NULL,
+  work_assignment_id   INT          NULL,
+  position_id          INT          NULL,
+  role_id              INT          NULL,
+  department_id        INT          NULL,
+  manager_position_id  INT          NULL,
+  position_code        VARCHAR(60)  NULL,
+  position_title       VARCHAR(250) NULL,
+  role_title           VARCHAR(200) NULL,
+  department_name      VARCHAR(200) NULL,
+  status               VARCHAR(12)  NOT NULL DEFAULT 'DRAFT',      -- DRAFT | ACTIVE | CLOSED | CANCELLED
+  no_kpis              TINYINT(1)   NOT NULL DEFAULT 0,            -- the job had no KPIs on that day
+  activated_at         DATETIME     NULL,
+  activated_by         INT          NULL,
+  closed_at            DATETIME     NULL,
+  cancelled_at         DATETIME     NULL,
+  cancelled_by         INT          NULL,
+  cancel_reason        VARCHAR(500) NULL,
+
+  deleted_at           DATETIME     DEFAULT NULL,                -- never written: a plan is CANCELLED, not deleted
+  created_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at           TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by           INT          NULL,
+
+  -- One live plan per person per period; a cancelled one is kept and frees the slot.
+  live_employee        INT          GENERATED ALWAYS AS (IF(status <> 'CANCELLED', employee_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpfl_tenant (company_id, id),
+  UNIQUE KEY uq_hpfl_one    (company_id, period_id, live_employee),
+  KEY idx_hpfl_period   (company_id, period_id, status),
+  KEY idx_hpfl_employee (company_id, employee_id),
+  KEY idx_hpfl_position (company_id, position_id),
+
+  CONSTRAINT fk_hpfl_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfl_period     FOREIGN KEY (company_id, period_id)          REFERENCES hrms_performance_periods(company_id, id),
+  CONSTRAINT fk_hpfl_employee   FOREIGN KEY (company_id, employee_id)        REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hpfl_assignment FOREIGN KEY (company_id, work_assignment_id) REFERENCES hrms_work_assignments(company_id, id),
+  CONSTRAINT fk_hpfl_position   FOREIGN KEY (company_id, position_id)        REFERENCES hrms_positions(company_id, id),
+  CONSTRAINT fk_hpfl_role       FOREIGN KEY (company_id, role_id)            REFERENCES hrms_roles(company_id, id),
+  CONSTRAINT fk_hpfl_creator    FOREIGN KEY (created_by)   REFERENCES users(id),
+  CONSTRAINT fk_hpfl_activator  FOREIGN KEY (activated_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfl_canceller  FOREIGN KEY (cancelled_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 20e. Plan KRAs ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_plan_kras (
+  id                 INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT          NOT NULL,
+  plan_id            INT          NOT NULL,
+  name               VARCHAR(250) NOT NULL,
+  kra_definition_id  INT          NULL,
+  line_key           VARCHAR(40)  NULL,                            -- the job line it came from; NULL = added on the plan
+  weight_percent     DECIMAL(5,2) NULL,
+  job_weight_percent DECIMAL(5,2) NULL,                            -- what the job said
+  added_on_plan      TINYINT(1)   NOT NULL DEFAULT 0,
+  sort_order         INT          NOT NULL DEFAULT 0,
+
+  deleted_at         DATETIME     DEFAULT NULL,
+  created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT          NULL,
+
+  UNIQUE KEY uq_hpfk_tenant (company_id, id),
+  KEY idx_hpfk_plan (company_id, plan_id, sort_order),
+
+  CONSTRAINT fk_hpfk_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfk_plan    FOREIGN KEY (company_id, plan_id) REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpfk_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 20f. Plan KPIs ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_plan_kpis (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  plan_id            INT           NOT NULL,
+  plan_kra_id        INT           NULL,                           -- NULL = not under a KRA
+  name               VARCHAR(250)  NOT NULL,
+  kpi_definition_id  INT           NULL,
+  line_key           VARCHAR(40)   NULL,                           -- the job line it came from; NULL = added on the plan
+  unit               VARCHAR(30)   NULL,                           -- "%", "hours", "count", "₹"
+  direction          VARCHAR(16)   NOT NULL DEFAULT 'TEXT',        -- HIGHER_BETTER | LOWER_BETTER | EXACT | TEXT
+  target_number      DECIMAL(18,4) NULL,
+  target_text        VARCHAR(500)  NULL,
+  entry_frequency    VARCHAR(20)   NULL,                           -- how often actuals are entered; NULL = the plan's
+  weight_percent     DECIMAL(5,2)  NULL,                           -- within its KRA
+  sort_order         INT           NOT NULL DEFAULT 0,
+  added_on_plan      TINYINT(1)    NOT NULL DEFAULT 0,
+  changed_on_plan    TINYINT(1)    NOT NULL DEFAULT 0,
+  -- What the job said on the day it was copied (NULL for one added on the plan).
+  job_unit           VARCHAR(30)   NULL,
+  job_direction      VARCHAR(16)   NULL,
+  job_target_number  DECIMAL(18,4) NULL,
+  job_target_text    VARCHAR(500)  NULL,                           -- the job's target as written ("95%", "Max 30 minutes")
+  job_weight_percent DECIMAL(5,2)  NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,                   -- removed from a DRAFT plan; kept
+  deleted_by         INT           NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT           NULL,
+
+  UNIQUE KEY uq_hpfi_tenant (company_id, id),
+  KEY idx_hpfi_plan (company_id, plan_id, sort_order),
+  KEY idx_hpfi_kra  (company_id, plan_kra_id),
+
+  CONSTRAINT fk_hpfi_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfi_plan    FOREIGN KEY (company_id, plan_id)     REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpfi_kra     FOREIGN KEY (company_id, plan_kra_id) REFERENCES hrms_performance_plan_kras(company_id, id),
+  CONSTRAINT fk_hpfi_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 20g. Target changes after activation -------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_target_changes (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  plan_id         INT           NOT NULL,
+  plan_kpi_id     INT           NOT NULL,
+  effective_from  DATE          NOT NULL,
+  from_number     DECIMAL(18,4) NULL,
+  from_text       VARCHAR(500)  NULL,
+  from_direction  VARCHAR(16)   NULL,
+  to_number       DECIMAL(18,4) NULL,
+  to_text         VARCHAR(500)  NULL,
+  to_direction    VARCHAR(16)   NULL,
+  reason          VARCHAR(500)  NOT NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,                    -- never written: a change is never undone, only followed
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT           NULL,
+
+  UNIQUE KEY uq_hpft_tenant (company_id, id),
+  KEY idx_hpft_kpi  (company_id, plan_kpi_id, effective_from),
+  KEY idx_hpft_plan (company_id, plan_id),
+
+  CONSTRAINT fk_hpft_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpft_plan    FOREIGN KEY (company_id, plan_id)     REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpft_kpi     FOREIGN KEY (company_id, plan_kpi_id) REFERENCES hrms_performance_plan_kpis(company_id, id),
+  CONSTRAINT fk_hpft_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

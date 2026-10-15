@@ -19,6 +19,7 @@ import accessRoutes from './access.js';
 import codegenGateRoutes from './codegen.js';
 import excelRoutes from './excel.js';
 import commandRoutes from './commands.js';
+import performanceRoutes from './performance.js';
 
 const router = Router();
 
@@ -131,5 +132,7 @@ router.use(codegenGateRoutes);
 router.use(excelRoutes);
 // "Do it in words" (spec §14): read a request, check the plan, apply it.
 router.use(commandRoutes);
+// Performance plans (spec §18): settings, periods, plans (routes/performance.js).
+router.use(performanceRoutes);
 
 export default router;

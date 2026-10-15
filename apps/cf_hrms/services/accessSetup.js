@@ -26,7 +26,7 @@
  * takes a right away: a ready-made role somebody has since edited keeps what it
  * has, and only the Owner is brought back to "everything".
  */
-import { ALL_TAGS, TEMPLATES, mapOldTags, orderTags } from '../lib/access.js';
+import { ALL_TAGS, TEMPLATES, LATE_AREAS, lateAreaTags, mapOldTags, orderTags } from '../lib/access.js';
 import { hrmsAppOf, ensureCatalog, tagsOfRoles, newTagsOf, oldTagsOf, setRoleTags } from './accessGrants.js';
 
 const lower = (s) => String(s ?? '').trim().toLowerCase();
@@ -60,6 +60,11 @@ export async function setupAccess(conn, companyId, { apply = false, userId = nul
   const [userRows] = await conn.query('SELECT role_id, COUNT(*) AS n FROM users WHERE company_id = ? AND deleted_at IS NULL GROUP BY role_id', [companyId]);
   const usersOf = new Map(userRows.map((r) => [r.role_id, Number(r.n)]));
 
+  // Areas added after this company was set up (lib/access.js LATE_AREAS): which ready-made role has had which already.
+  const [marks] = await conn.query(
+    "SELECT entity_id, request_id FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_access_roles' AND request_id LIKE 'late-area:%'", [companyId]);
+  const marked = new Set(marks.map((m) => `${m.entity_id}|${m.request_id}`));
+
   const problems = [];
   const plan = [];
   const claimed = new Set();
@@ -87,8 +92,19 @@ export async function setupAccess(conn, companyId, { apply = false, userId = nul
     // A ready-made role is given its template when it is first set up; later runs add nothing
     // to one somebody may have edited. The Owner is always everything.
     const firstTime = !existed || !accessOfRole.has(role.id);
-    const after = t.key === 'OWNER' ? [...ALL_TAGS] : orderTags(firstTime ? [...before, ...t.tags] : before);
-    plan.push({ template: t, role, existed, oldTags, before, after, wildcard: [...have.wildcard], label: t.label, scope: t.scope, locked: t.locked });
+    // A ready-made role set up BEFORE an area existed gets that area's rights its template holds — exactly those, once.
+    const late = [];
+    if (t.key !== 'OWNER') {
+      for (const area of LATE_AREAS) {
+        if (role && marked.has(`${role.id}|late-area:${area}`)) continue;
+        // First time: the template already holds the area; the mark alone is written, so a later run leaves the role alone.
+        const tags = firstTime ? [] : lateAreaTags(area).filter((tag) => t.tags.includes(tag) && !before.includes(tag));
+        late.push({ area, tags });
+      }
+    }
+    const lateTags = late.flatMap((l) => l.tags);
+    const after = t.key === 'OWNER' ? [...ALL_TAGS] : orderTags(firstTime ? [...before, ...t.tags] : [...before, ...lateTags]);
+    plan.push({ late, lateTags, template: t, role, existed, oldTags, before, after, wildcard: [...have.wildcard], label: t.label, scope: t.scope, locked: t.locked });
   }
 
   // ── 3. every other role that holds old tags (or new ones somebody granted by hand) ──
@@ -108,8 +124,10 @@ export async function setupAccess(conn, companyId, { apply = false, userId = nul
     const gained = p.after.filter((t) => !beforeSet.has(t));
     const lost = p.before.filter((t) => !afterSet.has(t));
     // A role that existed may gain only what its ready-made role is defined to hold.
-    const byDesign = p.template ? gained.filter((t) => p.template.tags.includes(t)) : [];
-    const unexpected = p.existed ? gained.filter((t) => !byDesign.includes(t)) : [];
+    const late = new Set(p.lateTags ?? []);
+    const byDesign = p.template ? gained.filter((t) => p.template.tags.includes(t) && !late.has(t)) : [];
+    const lateGained = gained.filter((t) => late.has(t));
+    const unexpected = p.existed ? gained.filter((t) => !byDesign.includes(t) && !late.has(t)) : [];
     if (unexpected.length) problems.push(`${p.role.name} would gain ${unexpected.join(', ')}.`);
     // A role that already has logins is not handed its ready-made rights without somebody saying so.
     const loginCount = p.role ? (loginsOf.get(p.role.id) ?? 0) + (usersOf.get(p.role.id) ?? 0) : 0;
@@ -132,6 +150,9 @@ export async function setupAccess(conn, companyId, { apply = false, userId = nul
       gained,
       lost,
       byDesign,
+      // A new area's rights for a role set up before it existed: [{ area, tags }] (tags may be empty — still marked once).
+      lateAreas: (p.late ?? []).map((l) => ({ area: l.area, tags: l.tags })),
+      lateGained,
       same: gained.length === 0 && lost.length === 0,
       wildcard: p.wildcard,
       accessRow: p.role && accessOfRole.has(p.role.id) ? 'exists' : 'created',
@@ -168,6 +189,13 @@ export async function setupAccess(conn, companyId, { apply = false, userId = nul
     }
     // addOnly: this never takes a right away. `after` is a superset of what the role holds.
     await setRoleTags(conn, { companyId, appId: app.id, roleId, tags: p.after, catalog, addOnly: true });
+    for (const l of p.late ?? []) {
+      await conn.query(
+        `INSERT INTO hrms_audit_log (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, request_id, created_by)
+         VALUES (?, ?, 'hrms_access_roles', ?, 'UPDATE', NULL, ?, ?, ?)`,
+        [companyId, userId, roleId, JSON.stringify({ lateArea: l.area, granted: l.tags }), `late-area:${l.area}`, userId],
+      );
+    }
   }
   return report;
 }

@@ -29,6 +29,9 @@ export const AREAS = [
   { key: 'time', label: 'Time', screens: ['Shifts', 'Holidays'], rights: ['view', 'edit', 'remove', 'upload'] },
   { key: 'leave', label: 'Leave', screens: ['Leave policies'], rights: ['view', 'edit', 'remove'] },
   { key: 'setup', label: 'Setup', screens: ['Code formats', 'Letters', 'Reporting types'], rights: ['view', 'edit', 'remove'] },
+  // Spec §18 (2026-10-15). Added after companies were set up: scripts/setup-access.mjs grants it to
+  // the ready-made roles of an existing company once (LATE_AREAS below), and nothing else.
+  { key: 'performance', label: 'Performance', screens: ['Plans', 'A person’s plan', 'Periods'], rights: ['view', 'edit', 'remove', 'upload'] },
 ];
 
 export const areaTag = (area, right) => `cf_hrms_${area}_${right}`;
@@ -84,12 +87,12 @@ export const TEMPLATES = [
   {
     key: 'HR_EXECUTIVE', label: 'HR executive', platformName: 'HR executive', scope: 'COMPANY', locked: false,
     description: 'Sees everything; changes employees, hiring, positions and documents; creates employees. Cannot remove, upload, change the setup or close an employee.',
-    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
+    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
   },
   {
     key: 'DEPARTMENT_HEAD', label: 'Department head', platformName: 'Department head', scope: 'DEPARTMENT', locked: false,
     description: 'Sees the organisation and the people of their own department and below; changes the positions there.',
-    tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave']), areaTag('positions', 'edit'), named('contactView'), named('selfView')],
+    tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave', 'performance']), ...edits(['positions', 'performance']), named('contactView'), named('selfView')],
   },
   {
     key: 'EMPLOYEE', label: 'Employee', platformName: 'Employee', scope: 'DEPARTMENT', locked: true,
@@ -97,6 +100,20 @@ export const TEMPLATES = [
     tags: [named('selfView')],
   },
 ];
+/**
+ * Areas added AFTER companies were set up on the rights model. setup-access
+ * gives a ready-made role its template only the first time (a role somebody
+ * edited is left alone), so a company set up before an area existed would
+ * never get it. `services/accessSetup.js` grants each ready-made role exactly
+ * the tags of these areas its template holds — once per role and area, marked
+ * in the audit log, so a right somebody later takes away is not handed back.
+ */
+export const LATE_AREAS = ['performance'];
+export const lateAreaTags = (area) => {
+  const a = AREAS.find((x) => x.key === area);
+  return a ? a.rights.map((r) => areaTag(a.key, r)) : [];
+};
+
 export const templateOf = (key) => TEMPLATES.find((t) => t.key === String(key ?? '').toUpperCase()) ?? null;
 
 export const SCOPES = ['COMPANY', 'DEPARTMENT'];
@@ -204,4 +221,4 @@ export function catalog() {
   };
 }
 
-export default { RIGHTS, AREAS, NAMED, ALL_TAGS, TEMPLATES, SCOPES, OLD_TAG_MAP, OLD_TAGS, areaTag, isKnownTag, tagName, templateOf, mapOldTags, tagSetProblems, orderTags, summaryOf, catalog };
+export default { RIGHTS, AREAS, NAMED, ALL_TAGS, TEMPLATES, LATE_AREAS, lateAreaTags, SCOPES, OLD_TAG_MAP, OLD_TAGS, areaTag, isKnownTag, tagName, templateOf, mapOldTags, tagSetProblems, orderTags, summaryOf, catalog };

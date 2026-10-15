@@ -169,6 +169,20 @@ export const LIST_SPECS = {
     filters: { q: matchesText(['name', 'code', 'description']), status: oneOfWords((r) => r.status), used: flag((r) => (r.usageCount ?? 0) > 0) },
   },
   reportingTypes: { key: ['rows'], filters: { q: matchesText(['name', 'code']), status: oneOfWords((r) => r.status) } },
+  // Performance plans (spec §18.3). Cancelled plans are hidden unless status asks for them (the route does that).
+  plans: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['employeeName', 'employeeCode', 'positionCode', 'positionTitle', 'roleTitle']),
+      status: oneOfWords((r) => r.status),
+      department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
+      frequency: oneOfWords((r) => r.frequency),
+      weightsOk: flag((r) => r.weightsOk),
+    },
+    needsTree: ['department'],
+    needsLabels: ['label'],
+  },
   // The service narrows these itself (q, roleId, state); here only the two numbers are added.
   logins: { key: ['logins'], filters: {} },
 };

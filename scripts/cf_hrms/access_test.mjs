@@ -48,7 +48,7 @@ import hrmsApp, { DESCRIBED_RESOURCES } from '../../apps/cf_hrms/app.js';
 import hrmsRouter from '../../apps/cf_hrms/routes/index.js';
 import codegenModule from '../../apps/cf_erp/modules/codegen/index.js';
 import { PERM } from '../../apps/cf_hrms/lib/http.js';
-import { ALL_TAGS, AREAS, NAMED, TEMPLATES, OLD_TAG_MAP, areaTag, mapOldTags, tagSetProblems, summaryOf, catalog } from '../../apps/cf_hrms/lib/access.js';
+import { ALL_TAGS, AREAS, NAMED, TEMPLATES, OLD_TAG_MAP, areaTag, lateAreaTags, mapOldTags, tagSetProblems, summaryOf, catalog } from '../../apps/cf_hrms/lib/access.js';
 import { forgetAccess } from '../../apps/cf_hrms/lib/accessContext.js';
 import { routeTable, routeTableProblems, renderAccessDoc, PUBLIC_ROUTES } from '../../apps/cf_hrms/lib/routeTable.js';
 import { hrmsAppOf, ensureCatalog, tagsOfRoles, setRoleTags, newTagsOf } from '../../apps/cf_hrms/services/accessGrants.js';
@@ -133,11 +133,11 @@ try {
   /* ══ 1. the catalogue and the table of routes ═════════════════════════════ */
   section('[1] The catalogue of rights, and the table of routes');
   {
-    ok(ALL_TAGS.length === 37 && new Set(ALL_TAGS).size === 37 && ALL_TAGS.every((t) => /^cf_hrms_[a-z_]+$/.test(t)), 'thirty-seven rights: nine areas × their rights, and seven named', `${ALL_TAGS.length}`);
+    ok(ALL_TAGS.length === 41 && new Set(ALL_TAGS).size === 41 && ALL_TAGS.every((t) => /^cf_hrms_[a-z_]+$/.test(t)), 'forty-one rights: ten areas × their rights (performance since §18), and seven named', `${ALL_TAGS.length}`);
     const grid = Object.fromEntries(AREAS.map((a) => [a.key, a.rights.join(' ')]));
     ok(JSON.stringify(grid) === JSON.stringify({
       org: 'view edit remove upload', roles: 'view edit remove upload', positions: 'view edit remove upload', employees: 'view edit upload', hiring: 'view edit',
-      documents: 'view edit remove', time: 'view edit remove upload', leave: 'view edit remove', setup: 'view edit remove',
+      documents: 'view edit remove', time: 'view edit remove upload', leave: 'view edit remove', setup: 'view edit remove', performance: 'view edit remove upload',
     }), 'the areas hold exactly the rights of the table (a dash is a right that does not exist)', JSON.stringify(grid));
     ok(JSON.stringify(NAMED.map((n) => n.tag)) === JSON.stringify(['cf_hrms_employee_create', 'cf_hrms_employee_close', 'cf_hrms_employee_bulk_add', 'cf_hrms_contact_view', 'cf_hrms_pay_view', 'cf_hrms_access_manage', 'cf_hrms_self_view'])
       && PERM.positions.edit === 'cf_hrms_positions_edit' && PERM.payView === 'cf_hrms_pay_view' && PERM.hiring.remove === undefined && PERM.employees.remove === undefined,
@@ -145,19 +145,19 @@ try {
     const tpl = Object.fromEntries(TEMPLATES.map((t) => [t.key, t]));
     const view = (k) => areaTag(k, 'view');
     ok(same(tpl.OWNER.tags, ALL_TAGS) && same(tpl.HR_MANAGER.tags, ALL_TAGS.filter((t) => t !== PERM.accessManage))
-      && same(tpl.HR_EXECUTIVE.tags, [...AREAS.map((a) => view(a.key)), PERM.employees.edit, PERM.hiring.edit, PERM.positions.edit, PERM.documents.edit, PERM.employeeCreate, PERM.contactView, PERM.payView, PERM.selfView])
-      && same(tpl.DEPARTMENT_HEAD.tags, [view('org'), view('roles'), view('positions'), view('employees'), view('time'), view('leave'), PERM.positions.edit, PERM.contactView, PERM.selfView])
+      && same(tpl.HR_EXECUTIVE.tags, [...AREAS.map((a) => view(a.key)), PERM.employees.edit, PERM.hiring.edit, PERM.positions.edit, PERM.documents.edit, PERM.performance.edit, PERM.employeeCreate, PERM.contactView, PERM.payView, PERM.selfView])
+      && same(tpl.DEPARTMENT_HEAD.tags, [view('org'), view('roles'), view('positions'), view('employees'), view('time'), view('leave'), view('performance'), PERM.positions.edit, PERM.performance.edit, PERM.contactView, PERM.selfView])
       && same(tpl.EMPLOYEE.tags, [PERM.selfView]) && tpl.DEPARTMENT_HEAD.scope === 'DEPARTMENT' && tpl.HR_MANAGER.scope === 'COMPANY' && tpl.OWNER.platformName === 'admin',
     'the five ready-made roles hold exactly what the spec gives them');
     ok(TEMPLATES.every((t) => tagSetProblems(t.tags).length === 0), 'every ready-made set is one a role may be saved with');
     ok(tagSetProblems([PERM.positions.edit]).length === 1 && /Positions/.test(tagSetProblems([PERM.positions.edit])[0]) && /view/.test(tagSetProblems([PERM.positions.edit])[0])
       && tagSetProblems(['cf_hrms_org_manage']).length === 1 && tagSetProblems('x').length === 1 && tagSetProblems([PERM.positions.view, PERM.positions.remove, PERM.payView]).length === 0,
     'edit, remove or upload without view is refused in words; so is a tag that is not a right (an old tag included)');
-    ok(summaryOf(tpl.HR_EXECUTIVE.tags) === 'Sees everything · changes positions, employees, hiring and documents · cannot remove · creates employees and sees pay'
+    ok(summaryOf(tpl.HR_EXECUTIVE.tags) === 'Sees everything · changes positions, employees, hiring, documents and performance · cannot remove · creates employees and sees pay'
       && summaryOf(tpl.EMPLOYEE.tags) === 'Sees their own place only' && summaryOf(tpl.OWNER.tags) === 'Sees everything · changes everything · can remove · creates employees, closes employees, sees pay and manages logins and access'
       && summaryOf([]) === 'Sees nothing', 'the sentence on a role’s card is written by the server', summaryOf(tpl.HR_EXECUTIVE.tags));
     const cat = catalog();
-    ok(JSON.stringify(Object.keys(cat)) === JSON.stringify(['areas', 'named', 'templates']) && cat.areas.length === 9 && cat.areas[3].rights.map((r) => r.right).join(' ') === 'view edit upload'
+    ok(JSON.stringify(Object.keys(cat)) === JSON.stringify(['areas', 'named', 'templates']) && cat.areas.length === 10 && cat.areas[3].rights.map((r) => r.right).join(' ') === 'view edit upload'
       && cat.areas.every((a) => a.label && a.screens.length && a.rights.every((r) => r.tag && r.label)) && cat.named.every((n) => n.label && n.hint && n.sensitive === (n.tag !== PERM.selfView)) && JSON.stringify(cat.templates.map((x) => x.key)) === JSON.stringify(['HR_MANAGER', 'HR_EXECUTIVE', 'DEPARTMENT_HEAD']),
     'GET /access/catalog -> { areas, named: [{ tag, label, hint, sensitive }], templates }: every named right but the self view is sensitive; the roles to start from are the three that can be copied — not the Owner, not Employee');
 
@@ -185,8 +185,9 @@ try {
     const used = new Set(rows.flatMap((r) => (r.guard ? [...r.guard.anyOf, ...r.guard.also] : [])));
     const unused = ALL_TAGS.filter((t) => !used.has(t));
     // The five upload rights guard the Excel uploads since round C (routes/excel.js).
-    ok(same(unused, [PERM.documents.remove]),
-      'every right opens a route, except removing a generated document (no such route yet)', unused.join(', '));
+    // Performance upload is the Excel of plans — step 5 (spec §18.3).
+    ok(same(unused, [PERM.documents.remove, PERM.performance.upload]),
+      'every right opens a route, except removing a generated document and uploading plans (no such routes yet)', unused.join(', '));
     ok(rows.filter((r) => r.guard?.anyOf.includes(PERM.selfView)).every((r) => r.path.startsWith('/user/me')) && rows.filter((r) => r.path.startsWith('/user/me')).every((r) => r.guard.anyOf.join() === PERM.selfView),
       'cf_hrms_self_view guards the /user/me routes and nothing else, and they ask for nothing else');
   }
@@ -195,6 +196,16 @@ try {
   section('[2] The migration: before and after, for every role');
   const roleIdOf = {};
   {
+    // An area added after the company was set up (performance, spec §18): the first run grants each
+    // ready-made role exactly that area's rights its template holds, and nothing else.
+    const late = await setupAccess(db, COMPANY, { apply: false });
+    const lateTags = new Set(lateAreaTags('performance'));
+    const lateOk = late.problems.length === 0 && late.roles.every((r) => r.lost.length === 0 && r.gained.every((t) => lateTags.has(t))
+      && (!r.templateKey || r.templateKey === 'OWNER' || same(r.gained, r.lateGained)))
+      && late.catalog.features.every((t) => lateTags.has(t));
+    ok(lateOk, 'a new area: the ready-made roles gain only its rights (HR manager all four; HR executive and Department head view + edit), nothing is lost',
+      JSON.stringify(late.roles.filter((r) => !r.same).map((r) => [r.platformName, r.gained, r.lost])));
+    if (late.roles.some((r) => !r.same) || late.catalog.features.length) await setupAccess(db, COMPANY, { apply: true });
     const dry = await setupAccess(db, COMPANY, { apply: false });
     const byKey = Object.fromEntries(dry.roles.filter((r) => r.templateKey).map((r) => [r.templateKey, r]));
     for (const k of Object.keys(byKey)) roleIdOf[k] = byKey[k].roleId;
@@ -214,7 +225,7 @@ try {
     ok(mine.every((r) => Number(r.n) === 1) && mine.every((r) => r.company_id === COMPANY && r.app_id === app.id), 'every grant of this company is for this company and its own cf_hrms app — none with no app, none twice', JSON.stringify(mine.filter((r) => Number(r.n) > 1 || r.app_id !== app.id).slice(0, 3)));
     const caps = await q("SELECT fc.name, fc.features_json, f.id FROM features_capability fc JOIN features f ON f.feature_tag = fc.name WHERE fc.name IN (?) AND fc.deleted_at IS NULL", [ALL_TAGS]);
     const idsOf = (v) => (Array.isArray(v) ? v : JSON.parse(v));
-    ok(caps.length === 37 && caps.every((c) => idsOf(c.features_json).length === 1 && Number(idsOf(c.features_json)[0]) === c.id), 'one capability per right, named after it, holding exactly that one feature');
+    ok(caps.length === ALL_TAGS.length && caps.every((c) => idsOf(c.features_json).length === 1 && Number(idsOf(c.features_json)[0]) === c.id), 'one capability per right, named after it, holding exactly that one feature');
   }
 
   // A company that has NOT been migrated, with roles on the old tags — built here, on another tenant.
@@ -711,7 +722,7 @@ try {
     ok(list.status === 200 && JSON.stringify(five.map((r) => r.templateKey)) === JSON.stringify(['OWNER', 'HR_MANAGER', 'HR_EXECUTIVE', 'DEPARTMENT_HEAD', 'EMPLOYEE'])
       && JSON.stringify(Object.keys(five[0])) === JSON.stringify(['roleId', 'label', 'platformName', 'description', 'scope', 'templateKey', 'locked', 'tags', 'loginCount', 'summary'])
       && five[0].label === 'Owner' && five[0].platformName === 'admin' && five[0].locked === true && five[4].locked === true && five[1].locked === false && five[3].scope === 'DEPARTMENT'
-      && five[2].summary === 'Sees everything · changes positions, employees, hiring and documents · cannot remove · creates employees and sees pay' && five.every((r) => typeof r.loginCount === 'number'),
+      && five[2].summary === 'Sees everything · changes positions, employees, hiring, documents and performance · cannot remove · creates employees and sees pay' && five.every((r) => typeof r.loginCount === 'number'),
     'GET /access/roles: the five ready-made roles first, each { roleId, label, platformName, description, scope, templateKey, locked, tags, loginCount, summary }', JSON.stringify(five.map((r) => r.templateKey)));
 
     const made = await call(U.OWNER, 'POST', '/access/roles', { label: `  ${TAG}  Payroll clerk `, description: 'Reads people and pay.', scope: 'COMPANY', copyFrom: 'HR_EXECUTIVE' });

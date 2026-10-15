@@ -44,7 +44,9 @@ import { myOrgChart } from '../services/selfOrgChartService.js';
 import {
   teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
   teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
+  teamPlans, teamPlan, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
 } from '../services/teamScopeService.js';
+import { myPlans } from '../services/performance/planService.js';
 
 const router = Router();
 
@@ -110,5 +112,19 @@ router.post('/user/me/team/employees/:id/job-content/change', guard(PERM.selfVie
 router.post('/user/me/team/employees/:id/job-content/switch-off', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonSwitchOffLine(db, c, intParam(req.params.id), req.body ?? {}))));
 router.post('/user/me/team/employees/:id/job-content/undo', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonUndoLine(db, c, intParam(req.params.id), req.body ?? {}))));
 router.put('/user/me/team/positions/:id/shift', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeShift(db, c, positionId(req), req.body ?? {}))));
+
+/**
+ * PERFORMANCE PLANS (spec §18). My own plan, read-only: GET /user/me/plan (no id —
+ * the plan is found from my login). A manager login may view and edit the DRAFT
+ * plans of the people below them — the same rule as their jobs (assertPersonInMyTeam):
+ * never their own plan, a card-mate's or a manager's. They do not activate or cancel.
+ */
+router.get('/user/me/plan', guard(PERM.selfView), handle((req) => myPlans(pool, ctx(req))));
+router.get('/user/me/team/plans', guard(PERM.selfView), handle((req) => teamPlans(pool, ctx(req))));
+router.get('/user/me/team/plans/:id', guard(PERM.selfView), handle((req) => teamPlan(pool, ctx(req), intParam(req.params.id))));
+router.put('/user/me/team/plans/:id/kras/:kraId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamSetKraWeight(db, c, intParam(req.params.id), intParam(req.params.kraId, 'kraId'), req.body ?? {}))));
+router.post('/user/me/team/plans/:id/kpis', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamAddKpi(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/user/me/team/plans/:id/kpis/:kpiId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeKpi(db, c, intParam(req.params.id), intParam(req.params.kpiId, 'kpiId'), req.body ?? {}))));
+router.delete('/user/me/team/plans/:id/kpis/:kpiId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamRemoveKpi(db, c, intParam(req.params.id), intParam(req.params.kpiId, 'kpiId')))));
 
 export default router;

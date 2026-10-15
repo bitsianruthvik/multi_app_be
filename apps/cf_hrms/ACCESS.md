@@ -17,6 +17,7 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 | Time | Shifts, Holidays | `cf_hrms_time_view` | `cf_hrms_time_edit` | `cf_hrms_time_remove` | `cf_hrms_time_upload` |
 | Leave | Leave policies | `cf_hrms_leave_view` | `cf_hrms_leave_edit` | `cf_hrms_leave_remove` | – |
 | Setup | Code formats, Letters, Reporting types | `cf_hrms_setup_view` | `cf_hrms_setup_edit` | `cf_hrms_setup_remove` | – |
+| Performance | Plans, A person’s plan, Periods | `cf_hrms_performance_view` | `cf_hrms_performance_edit` | `cf_hrms_performance_remove` | `cf_hrms_performance_upload` |
 
 | Named right | What it is |
 |---|---|
@@ -72,12 +73,19 @@ How to read the tables below:
 | `POST /user/me/team/employees/:id/job-content/switch-off` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/employees/:id/job-content/undo` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/positions/:id/shift` | `cf_hrms_self_view` |  |
+| `GET /user/me/plan` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/plans` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/plans/:id` | `cf_hrms_self_view` |  |
+| `PUT /user/me/team/plans/:id/kras/:kraId` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/plans/:id/kpis` | `cf_hrms_self_view` |  |
+| `PUT /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
+| `DELETE /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
 
 | Route | Right | Also |
 |---|---|---|
-| `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` |  |
+| `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` or `cf_hrms_performance_view` |  |
 | `GET /organisation/departments` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, label, shared, status, parent |
 | `GET /organisation/departments/staffing` | `cf_hrms_org_view` |  |
 | `POST /organisation/departments` | `cf_hrms_org_edit` | scope: the department |
@@ -400,5 +408,24 @@ How to read the tables below:
 | `POST /commands/read` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 | `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 | `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `GET /performance/settings` | `cf_hrms_performance_view` or `cf_hrms_setup_view` |  |
+| `PUT /performance/settings` | `cf_hrms_setup_edit` |  |
+| `PUT /performance/role-frequencies` | `cf_hrms_setup_edit` |  |
+| `GET /performance/periods` | `cf_hrms_performance_view` | narrowed to the login’s department |
+| `POST /performance/periods/:id/close` | `cf_hrms_performance_edit` | whole-company logins only |
+| `POST /performance/plans/preview` | `cf_hrms_performance_edit` | narrowed to the login’s department |
+| `POST /performance/plans/create` | `cf_hrms_performance_edit` | narrowed to the login’s department |
+| `GET /performance/plans` | `cf_hrms_performance_view` | filters: q, status, department, label, frequency, weightsOk; narrowed to the login’s department |
+| `POST /performance/plans/activate` | `cf_hrms_performance_edit` | scope: each plan’s person |
+| `POST /performance/plans/cancel` | `cf_hrms_performance_remove` | scope: each plan’s person |
+| `GET /performance/plans/:id` | `cf_hrms_performance_view` | scope: the person the plan is for |
+| `POST /performance/plans/:id/activate` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `POST /performance/plans/:id/cancel` | `cf_hrms_performance_remove` | scope: the person the plan is for |
+| `PUT /performance/plans/:id/kras/:kraId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `POST /performance/plans/:id/kpis` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `PUT /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `DELETE /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `POST /performance/plans/:id/kpis/:kpiId/target` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-299 routes.
+325 routes.

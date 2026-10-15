@@ -1074,6 +1074,81 @@ async function listContentRows(db, companyId, roleId, kind, opts) {
 }
 
 /**
+ * Grouping of a role's job rows, for getRoleContent and roleJobLayers alike:
+ * each KRA carries the responsibilities and KPIs filed under it (through the
+ * KRA's LINE, so a KRA renamed on a date keeps its lines), the rest go under
+ * `additional`. `allKraRows` = every KRA row of the role, any date.
+ */
+function groupJobRows(kras, responsibilities, kpis, allKraRows) {
+  const lineOfAssignment = new Map(allKraRows.map((r) => [Number(r.id), kraLineOf(r.line_key, r.kra_definition_id)]));
+
+  const byKra = new Map(kras.map((k) => [k.id, { ...k, responsibilities: [], kpis: [] }]));
+  const kraIdByLine = new Map(kras.map((k) => [kraLineOf(k.lineKey, k.definitionId), k.id]));
+  const parentOf = (row) => {
+    if (!row.roleKraAssignmentId) return null;
+    const line = lineOfAssignment.get(Number(row.roleKraAssignmentId));
+    const kraId = line === undefined ? row.roleKraAssignmentId : kraIdByLine.get(line);
+    return kraId === undefined ? null : byKra.get(kraId) ?? null;
+  };
+
+  const additional = { responsibilities: [], kpis: [] };
+  for (const r of responsibilities) {
+    const parent = parentOf(r);
+    (parent ? parent.responsibilities : additional.responsibilities).push(r);
+  }
+  for (const k of kpis) {
+    const parent = parentOf(k);
+    (parent ? parent.kpis : additional.kpis).push(k);
+  }
+
+  return { kras: [...byKra.values()], additional };
+}
+
+/**
+ * The JOB layer (KRAs and KPIs, optionally responsibilities) of MANY roles on
+ * one date, in a fixed handful of queries whatever the number of roles — for
+ * contentResolver.resolveJobsForAssignments (performance plans, spec §18). The
+ * same rows, the same "in force on a date" rule and the same grouping
+ * (groupJobRows) as getRoleContent; nothing else of the role is read.
+ *
+ * @returns Map(roleId -> { role: { id, roleCode, title }, kras, additional, kraLines })
+ */
+export async function roleJobLayers(db, companyId, roleIds, { on = today(), kinds = ['kras', 'kpis'] } = {}) {
+  const ids = [...new Set((roleIds ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const where = effectiveWhere('a', { on, scope: 'effective' });
+  const rowsOf = async (kind) => {
+    if (!kinds.includes(kind)) return [];
+    const k = contentOf(kind);
+    const [rows] = await db.query(
+      `SELECT a.*, ${k.defSelect}
+         FROM ${k.table} a LEFT JOIN ${k.def.table} d ON d.company_id = a.company_id AND d.id = a.${k.def.column}
+        WHERE a.company_id = ? AND a.role_id IN (?) AND ${where.sql}
+        ORDER BY a.sequence, a.id`,
+      [companyId, ids, ...where.params],
+    );
+    return rows.map((r) => shapeContentRow(kind, k, r));
+  };
+  const [[roles], kras, responsibilities, kpis, [allKraRows]] = await Promise.all([
+    db.query('SELECT id, role_code, title FROM hrms_roles WHERE company_id = ? AND id IN (?)', [companyId, ids]),
+    rowsOf('kras'),
+    rowsOf('responsibilities'),
+    rowsOf('kpis'),
+    db.query('SELECT id, role_id, kra_definition_id, line_key FROM hrms_role_kra_assignments WHERE company_id = ? AND role_id IN (?)', [companyId, ids]),
+  ]);
+  const byRole = (rows, roleId) => rows.filter((r) => Number(r.roleId ?? r.role_id) === roleId);
+  for (const r of roles) {
+    const id = Number(r.id);
+    const grouped = groupJobRows(byRole(kras, id), byRole(responsibilities, id), byRole(kpis, id), byRole(allKraRows, id));
+    // KRA definition -> its line, for a line filed under a KRA renamed on a date (contentResolver's kraLineIndex).
+    const kraLines = new Map(byRole(allKraRows, id).filter((k) => k.line_key != null).map((k) => [Number(k.kra_definition_id), k.line_key]));
+    out.set(id, { role: { id, roleCode: r.role_code ?? null, title: r.title }, ...grouped, kraLines });
+  }
+  return out;
+}
+
+/**
  * THE role content read (plan §7). Returns the role layer, grouped the way the
  * model means it: each KRA carries the responsibilities and KPIs assigned under
  * it, and everything ungrouped is collected under "Additional" — visible, not
@@ -1114,26 +1189,7 @@ export async function getRoleContent(db, companyId, roleId, { on = today(), scop
     'SELECT id, kra_definition_id, line_key FROM hrms_role_kra_assignments WHERE company_id = ? AND role_id = ?',
     [companyId, roleId],
   );
-  const lineOfAssignment = new Map(allKraRows.map((r) => [Number(r.id), kraLineOf(r.line_key, r.kra_definition_id)]));
-
-  const byKra = new Map(kras.map((k) => [k.id, { ...k, responsibilities: [], kpis: [] }]));
-  const kraIdByLine = new Map(kras.map((k) => [kraLineOf(k.lineKey, k.definitionId), k.id]));
-  const parentOf = (row) => {
-    if (!row.roleKraAssignmentId) return null;
-    const line = lineOfAssignment.get(Number(row.roleKraAssignmentId));
-    const kraId = line === undefined ? row.roleKraAssignmentId : kraIdByLine.get(line);
-    return kraId === undefined ? null : byKra.get(kraId) ?? null;
-  };
-
-  const additional = { responsibilities: [], kpis: [] };
-  for (const r of responsibilities) {
-    const parent = parentOf(r);
-    (parent ? parent.responsibilities : additional.responsibilities).push(r);
-  }
-  for (const k of kpis) {
-    const parent = parentOf(k);
-    (parent ? parent.kpis : additional.kpis).push(k);
-  }
+  const { kras: groupedKras, additional } = groupJobRows(kras, responsibilities, kpis, allKraRows);
 
   const sum = (rows) => rows.reduce((t, r) => t + (Number(r.weightPercent) || 0), 0);
   const kraWeight = sum(kras);
@@ -1144,7 +1200,7 @@ export async function getRoleContent(db, companyId, roleId, { on = today(), scop
     on,
     scope,
     layer: 'ROLE',
-    kras: [...byKra.values()],
+    kras: groupedKras,
     additional,
     skills,
     qualifications,

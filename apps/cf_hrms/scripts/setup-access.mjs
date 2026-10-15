@@ -15,7 +15,14 @@
  *      each with its row in hrms_access_roles and its grants, for THIS company
  *      and its own cf_hrms app only;
  *   3. every other role of the company that holds old cf_hrms tags gets the new
- *      rights those map to, and an access role named after it.
+ *      rights those map to, and an access role named after it;
+ *   4. AN AREA ADDED LATER (lib/access.js LATE_AREAS — 'performance', spec §18):
+ *      each ready-made role that was set up before it existed gets exactly the
+ *      tags of that area its template holds (HR manager all four, HR executive
+ *      and Department head view + edit; Owner holds everything anyway; Employee
+ *      none) — once: an audit row (request_id 'late-area:<area>') marks the role,
+ *      so a later run never hands back a right somebody took away. Nothing else
+ *      about any role changes; roles that are not ready-made get nothing.
  *
  * It prints, per role: the logins holding it and its rights before -> after.
  * "Before" is what the role could do under the old backend, said in the new
@@ -84,6 +91,9 @@ async function main() {
         console.log(`      before   ${r.templateKey === 'OWNER' ? 'everything (the platform lets "admin" through every check)' : inWords(r.before)}${r.oldTags.length ? `   [old tags: ${r.oldTags.map((t) => t.replace('cf_hrms_', '')).join(', ')}]` : ''}`);
       }
       console.log(`      after    ${inWords(r.after)}`);
+      for (const l of r.lateAreas ?? []) {
+        console.log(`      NEW AREA ${l.area}: ${l.tags.length ? `+ ${l.tags.map((t) => t.replace('cf_hrms_', '')).join(', ')}` : 'nothing to add (marked as done)'}${willWrite ? '' : ' (to write)'}`);
+      }
       if (r.existed) console.log(`      ${r.same ? 'SAME — nothing gained, nothing lost' : `CHANGED — gained: ${r.gained.join(', ') || 'none'}; lost: ${r.lost.join(', ') || 'none'}`}`);
       if (r.wildcard.length) console.log(`      WARNING  holds ${r.wildcard.join(', ')} through a grant with NO app (it applies in every app); this script does not write or remove those.`);
       console.log('');
