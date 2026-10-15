@@ -200,6 +200,39 @@ export const LIST_SPECS = {
     needsTree: ['department'],
     needsLabels: ['label'],
   },
+  // Performance › Reviews (spec §20.3): check-ins and final reviews.
+  reviews: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['employeeName', 'employeeCode', 'positionCode', 'positionTitle', 'roleTitle', 'managerName']),
+      period: oneOfIds((r) => r.periodId),
+      kind: oneOfWords((r) => r.kind),
+      status: oneOfWords((r) => r.status),
+      // DUE, OVERDUE, DONE, CANCELLED (comma-separated = any of)
+      state: oneOfWords((r) => r.state),
+      department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
+      manager: oneOfIds((r) => r.managerPositionId),
+    },
+    needsTree: ['department'],
+    needsLabels: ['label'],
+  },
+  // Performance › Actions (spec §20.3). Open ones unless `status` asks otherwise (the route does that).
+  actions: {
+    key: ['items'],
+    filters: {
+      q: matchesText(['text', 'ownerName', 'employeeName', 'employeeCode', 'positionCode']),
+      status: (row, value) => lower(value) === 'all' || csv(value).map(lower).includes(lower(row.status)),
+      overdue: flag((r) => r.overdue),
+      owner: oneOfIds((r) => r.ownerEmployeeId),
+      period: oneOfIds((r) => r.periodId),
+      department: inDepartment((r) => r.departmentId),
+      label: byLabel((r) => r.departmentId),
+      manager: oneOfIds((r) => r.managerPositionId),
+    },
+    needsTree: ['department'],
+    needsLabels: ['label'],
+  },
   // The service narrows these itself (q, roleId, state); here only the two numbers are added.
   logins: { key: ['logins'], filters: {} },
 };

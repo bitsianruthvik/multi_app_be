@@ -7,6 +7,7 @@
  *   rating scale       an ordered list of labels, low to high (used in step 6, stored now)
  *   bands              the achievement a plan or KPI needs to be "on track" (90) and
  *                      "at risk" (70); below that it is "behind" (spec §19.1)
+ *   review grace days  a FINAL review is due this many days after its period ends (7; spec §20.1)
  *   role frequency     hrms_roles.performance_frequency, NULL = the default
  *
  * A company with no row reads the defaults; the first save writes the row.
@@ -25,7 +26,8 @@ export const DEFAULT_SCALE = [
   { value: 4, label: 'Exceeds expectations' },
   { value: 5, label: 'Outstanding' },
 ];
-export const DEFAULTS = Object.freeze({ yearStartMonth: 4, defaultFrequency: 'QUARTERLY', ratingScale: DEFAULT_SCALE, bands: DEFAULT_BANDS });
+export const DEFAULT_GRACE_DAYS = 7;
+export const DEFAULTS = Object.freeze({ yearStartMonth: 4, defaultFrequency: 'QUARTERLY', ratingScale: DEFAULT_SCALE, bands: DEFAULT_BANDS, reviewGraceDays: DEFAULT_GRACE_DAYS });
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 const readJson = (v) => { if (v == null || typeof v === 'object') return v ?? null; try { return JSON.parse(v); } catch { return null; } };
@@ -44,6 +46,8 @@ export async function readSettings(db, companyId) {
       onTrack: row?.band_on_track != null ? Number(row.band_on_track) : DEFAULT_BANDS.onTrack,
       atRisk: row?.band_at_risk != null ? Number(row.band_at_risk) : DEFAULT_BANDS.atRisk,
     },
+    // A database before apply-reviews-schema.mjs has no such column: the default.
+    reviewGraceDays: row?.review_grace_days != null ? Number(row.review_grace_days) : DEFAULT_GRACE_DAYS,
   };
 }
 
@@ -59,7 +63,7 @@ function readScale(input, problems) {
   return labels.map((label, i) => ({ value: i + 1, label }));
 }
 
-/** PUT /performance/settings { yearStartMonth?, defaultFrequency?, ratingScale?, bands?: { onTrack, atRisk } } */
+/** PUT /performance/settings { yearStartMonth?, defaultFrequency?, ratingScale?, bands?: { onTrack, atRisk }, reviewGraceDays? } */
 export async function saveSettings(db, c, input = {}) {
   const before = await readSettings(db, c.companyId);
   const problems = [];
@@ -83,6 +87,11 @@ export async function saveSettings(db, c, input = {}) {
     else if (!(atRisk < onTrack)) problems.push(`"${BAND_WORDS.AT_RISK}" must start below "${BAND_WORDS.ON_TRACK}".`);
     else next.bands = { onTrack: Math.round(onTrack * 100) / 100, atRisk: Math.round(atRisk * 100) / 100 };
   }
+  if (input.reviewGraceDays !== undefined) {
+    const g = Number(input.reviewGraceDays);
+    if (!Number.isInteger(g) || g < 0 || g > 90) problems.push('A final review is due 0 to 90 days after its period ends: give a whole number of days.');
+    else next.reviewGraceDays = g;
+  }
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
 
   if (next.yearStartMonth !== before.yearStartMonth) {
@@ -102,9 +111,14 @@ export async function saveSettings(db, c, input = {}) {
   if (next.bands.onTrack !== before.bands.onTrack || next.bands.atRisk !== before.bands.atRisk) {
     await db.query('UPDATE hrms_performance_settings SET band_on_track = ?, band_at_risk = ? WHERE company_id = ?', [next.bands.onTrack, next.bands.atRisk, c.companyId]);
   }
+  // The grace days only when they change: a database before apply-reviews-schema.mjs has no such column.
+  // (FINAL reviews already made keep the due date they were given.)
+  if (next.reviewGraceDays !== before.reviewGraceDays) {
+    await db.query('UPDATE hrms_performance_settings SET review_grace_days = ? WHERE company_id = ?', [next.reviewGraceDays, c.companyId]);
+  }
   const { saved, ...was } = before;
   await audit(db, c, 'hrms_performance_settings', c.companyId, before.saved ? 'UPDATE' : 'CREATE', was, {
-    yearStartMonth: next.yearStartMonth, defaultFrequency: next.defaultFrequency, ratingScale: next.ratingScale, bands: next.bands,
+    yearStartMonth: next.yearStartMonth, defaultFrequency: next.defaultFrequency, ratingScale: next.ratingScale, bands: next.bands, reviewGraceDays: next.reviewGraceDays,
   });
   return getSettingsPage(db, c.companyId);
 }
@@ -132,6 +146,7 @@ export async function getSettingsPage(db, companyId) {
     ratingScale: settings.ratingScale,
     bands: settings.bands,
     bandWords: BAND_WORDS,
+    reviewGraceDays: settings.reviewGraceDays,
     saved: settings.saved,
     frequencies: FREQUENCIES.map((f) => ({ value: f, label: FREQUENCY_LABEL[f] })),
     roles: roles.map((r) => ({

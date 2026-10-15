@@ -33,6 +33,7 @@ import {
 import { DIRECTIONS, planTargetOf, planTargetText } from './targets.js';
 import { COMBINE_RULES, COMBINE_WORDS, defaultCombine } from './scoring.js';
 import { loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, periodOfRow, actualHistory } from './actualsService.js';
+import { cancelPlanReviews } from './reviewService.js';
 
 export const PLAN_STATUSES = ['DRAFT', 'ACTIVE', 'CLOSED', 'CANCELLED'];
 export const ENTRY_FREQUENCIES = ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'HALF_YEARLY', 'YEARLY'];
@@ -759,7 +760,9 @@ export async function cancelPlan(db, c, planId, body = {}) {
   const reason = clip(body.reason, 500);
   await db.query("UPDATE hrms_performance_plans SET status = 'CANCELLED', cancelled_at = NOW(), cancelled_by = ?, cancel_reason = ? WHERE company_id = ? AND id = ?", [c.userId, reason, c.companyId, planId]);
   await audit(db, c, 'hrms_performance_plans', Number(planId), 'UPDATE', { status: r.status }, { status: 'CANCELLED', reason });
-  return { ok: true };
+  // Its reviews that are not done go with it (spec §20.1); a draft has none.
+  const reviewsCancelled = r.status === 'ACTIVE' ? await cancelPlanReviews(db, c, Number(planId)) : 0;
+  return { ok: true, reviewsCancelled };
 }
 
 /** Bulk activate / cancel — each plan on its own terms; what could not be done is listed, the rest is done. */

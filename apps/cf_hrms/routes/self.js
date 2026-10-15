@@ -46,8 +46,10 @@ import {
   teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
   teamPlans, teamPlan, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
   teamActuals, teamEnterActual, teamActualHistory,
+  teamReviews, teamReview, teamWriteReview, teamCloseReview, teamCancelReview, teamOpenCheckIn, teamPlanReviews, teamAddAction, teamChangeAction, teamCloseAction,
 } from '../services/teamScopeService.js';
 import { myPlans, myActualHistory } from '../services/performance/planService.js';
+import { myReviews, myReview, writeMyPart, finishMyPart, markMyActionDone } from '../services/performance/reviewService.js';
 
 const router = Router();
 
@@ -136,5 +138,36 @@ router.get('/user/me/team/actuals', guard(PERM.selfView), handle((req) => teamAc
 router.put('/user/me/team/actuals', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamEnterActual(db, c, req.body ?? {}))));
 router.get('/user/me/team/plans/:id/kpis/:kpiId/actuals', guard(PERM.selfView), handle((req) => teamActualHistory(pool, ctx(req), intParam(req.params.id), intParam(req.params.kpiId, 'kpiId'))));
 router.delete('/user/me/team/plans/:id/kpis/:kpiId', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamRemoveKpi(db, c, intParam(req.params.id), intParam(req.params.kpiId, 'kpiId')))));
+
+/**
+ * REVIEWS AND ACTIONS (spec §20.2).
+ *
+ * THE PERSON — the first place an employee login WRITES anything, and exactly this:
+ * their own comment and blockers on their own OPEN review, "my part is done", and
+ * "done" on an action they own. The review / action is found from the login
+ * (another person's reads as not found); every other field is refused by name
+ * (reviewService onlyFields) — checked on the server, field by field.
+ *
+ * A MANAGER LOGIN — for the people below them (the same rule as their plans):
+ * open a check-in, write the manager's part, rate, close, cancel a check-in; add,
+ * change, mark done and drop actions. Never on their own review.
+ */
+router.get('/user/me/reviews', guard(PERM.selfView), handle((req) => myReviews(pool, ctx(req))));
+router.get('/user/me/reviews/:id', guard(PERM.selfView), handle((req) => myReview(pool, ctx(req), intParam(req.params.id))));
+router.put('/user/me/reviews/:id', guard(PERM.selfView), handle((req) => tx(req, (db, c) => writeMyPart(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/reviews/:id/done', guard(PERM.selfView), handle((req) => tx(req, (db, c) => finishMyPart(db, c, intParam(req.params.id)))));
+router.post('/user/me/actions/:id/done', guard(PERM.selfView), handle((req) => tx(req, (db, c) => markMyActionDone(db, c, intParam(req.params.id), req.body ?? {}))));
+
+router.get('/user/me/team/reviews', guard(PERM.selfView), handle((req) => teamReviews(pool, ctx(req))));
+router.get('/user/me/team/reviews/:id', guard(PERM.selfView), handle((req) => teamReview(pool, ctx(req), intParam(req.params.id))));
+router.put('/user/me/team/reviews/:id', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamWriteReview(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/reviews/:id/close', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCloseReview(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/reviews/:id/cancel', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCancelReview(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/plans/:id/check-ins', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamOpenCheckIn(db, c, intParam(req.params.id), req.body ?? {}))));
+router.get('/user/me/team/plans/:id/reviews', guard(PERM.selfView), handle((req) => teamPlanReviews(pool, ctx(req), intParam(req.params.id))));
+router.post('/user/me/team/plans/:id/actions', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamAddAction(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/user/me/team/actions/:id', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeAction(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/actions/:id/done', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCloseAction(db, c, intParam(req.params.id), 'DONE', req.body ?? {}))));
+router.post('/user/me/team/actions/:id/drop', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCloseAction(db, c, intParam(req.params.id), 'DROPPED', req.body ?? {}))));
 
 export default router;

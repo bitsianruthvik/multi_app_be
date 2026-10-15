@@ -44,6 +44,10 @@ import {
   listPlans, readPlan, planEmployeeId, setKraWeight, addKpi, changeKpi, removeKpi,
 } from './performance/planService.js';
 import { actualsGrid, narrowGrid, enterOne, actualHistory } from './performance/actualsService.js';
+import {
+  listReviews, readReview, reviewEmployeeId, planReviews, openCheckIn, writeManagerPart, closeReview, cancelReview,
+  addAction, changeAction, closeAction, actionPlanId,
+} from './performance/reviewService.js';
 
 const notYours = (message, detail = undefined) => new HrmsError(403, 'NOT_YOUR_TEAM', message, detail ? { detail } : {});
 
@@ -228,7 +232,39 @@ export async function teamEnterActual(db, c, body = {}) {
 }
 export async function teamActualHistory(db, c, planId, kpiId) { await assertPlanInMyTeam(db, c, planId); return actualHistory(db, c.companyId, planId, kpiId); }
 
+/* ── reviews and actions (spec §20.2): a manager login, for the people below them ── */
+
+/** A review of a person below me, or 403 / 404 — the same rule as their plan. */
+async function assertReviewInMyTeam(db, c, reviewId) {
+  const employeeId = await reviewEmployeeId(db, c.companyId, reviewId);
+  if (employeeId == null) throw notFound('Review');
+  await assertPersonInMyTeam(db, c, employeeId);
+}
+async function assertActionInMyTeam(db, c, actionId) {
+  const planId = await actionPlanId(db, c.companyId, actionId);
+  if (planId == null) throw notFound('Action');
+  await assertPlanInMyTeam(db, c, planId);
+}
+// What a manager login may do on a review: the manager's part, and cancel a check-in. Never an Owner's amendment.
+const MANAGER = { owner: false, edit: true, cancel: true };
+
+/** GET /user/me/team/reviews — the reviews of the people below me (FINALs made when due). */
+export async function teamReviews(db, c) {
+  const ids = await myTeamEmployeeIds(db, c);
+  return { ...(await listReviews(db, c, { employeeIds: ids })), people: ids.length };
+}
+export async function teamReview(db, c, reviewId) { await assertReviewInMyTeam(db, c, reviewId); return readReview(db, c.companyId, reviewId, 'MANAGE', MANAGER); }
+export async function teamWriteReview(db, c, reviewId, body) { await assertReviewInMyTeam(db, c, reviewId); return writeManagerPart(db, { ...c, owner: false }, reviewId, body); }
+export async function teamCloseReview(db, c, reviewId, body) { await assertReviewInMyTeam(db, c, reviewId); return closeReview(db, c, reviewId, body); }
+export async function teamCancelReview(db, c, reviewId, body) { await assertReviewInMyTeam(db, c, reviewId); return cancelReview(db, c, reviewId, body); }
+export async function teamOpenCheckIn(db, c, planId, body) { await assertPlanInMyTeam(db, c, planId); return openCheckIn(db, c, planId, body); }
+export async function teamPlanReviews(db, c, planId) { await assertPlanInMyTeam(db, c, planId); return planReviews(db, c, planId, 'MANAGE', MANAGER); }
+export async function teamAddAction(db, c, planId, body) { await assertPlanInMyTeam(db, c, planId); return addAction(db, c, planId, body); }
+export async function teamChangeAction(db, c, actionId, body) { await assertActionInMyTeam(db, c, actionId); return changeAction(db, c, actionId, body); }
+export async function teamCloseAction(db, c, actionId, status, body) { await assertActionInMyTeam(db, c, actionId); return closeAction(db, c, actionId, status, body); }
+
 export default {
+  teamReviews, teamReview, teamWriteReview, teamCloseReview, teamCancelReview, teamOpenCheckIn, teamPlanReviews, teamAddAction, teamChangeAction, teamCloseAction,
   teamActuals, teamEnterActual, teamActualHistory,
   assertInMyTeam, teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
   teamPlans, teamPlan, assertPlanInMyTeam, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,

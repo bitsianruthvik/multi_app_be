@@ -12,6 +12,7 @@
  *   scorePlans(…) / planScoreParts(…)
  *                                  every read that shows a score gets it here, from
  *                                  scoring.js — computed on read, never stored
+ *   reviewKpiTable(…)              the KPI table a review shows (spec §20.1) — the same scoring
  *   actualHistory(…)               a KPI's actuals, corrections included
  *   chartBands(…)                  the org chart's "Colour by performance"
  *
@@ -46,12 +47,12 @@ const sameNum = (a, b) => (a == null && b == null) || (a != null && b != null &&
 export const periodOfRow = (r) => ({ id: r.period_id, name: r.period_name, frequency: r.frequency, start: iso(r.start_date), end: iso(r.end_date), status: r.period_status ?? 'OPEN' });
 
 /** A plan KPI row as scoring.js reads it. */
-const scoringKpi = (k, period) => ({
+export const scoringKpi = (k, period) => ({
   id: Number(k.id), planKraId: k.plan_kra_id == null ? null : Number(k.plan_kra_id), weightPercent: num(k.weight_percent),
   direction: k.direction, targetNumber: num(k.target_number), unit: k.unit ?? null,
   combine: k.combine_rule ?? defaultCombine(k.unit, k.direction), slotCount: slotsOf(period, k.entry_frequency).length,
 });
-const scoringActual = (a) => ({ slotStart: iso(a.slot_start), valueNumber: num(a.value_number), met: a.met ?? null });
+export const scoringActual = (a) => ({ slotStart: iso(a.slot_start), valueNumber: num(a.value_number), met: a.met ?? null });
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Loading and scoring — the one place
@@ -130,6 +131,56 @@ export function kpiActualsView(kpiRow, score, actualsByKpi) {
     combined: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null,
     achievement: r?.achievement ?? null, band: r?.band ?? 'NO_DATA', bandLabel: BAND_WORDS[r?.band ?? 'NO_DATA'],
     counted: r?.counted ?? 0, slotCount: r?.slotCount ?? 1,
+  };
+}
+
+/**
+ * The KPI table a review shows (spec §20.1), from loaded parts. Pure.
+ *
+ *   slot null (a FINAL)     each KPI's whole-period result: exactly planScoreParts'
+ *                           — the plan page's numbers;
+ *   slot { start, end }     (a CHECK_IN) each KPI's result from the actuals of ITS slots
+ *                           that lie inside the check-in's slot — the same kpiResult(),
+ *                           with the KPI's own slot count, so a SUM target is taken pro
+ *                           rata to those slots. A KPI with no slot inside (one entered
+ *                           once for the whole period) shows its whole-period result,
+ *                           marked scope 'PERIOD'.
+ * The plan score is always the whole period's, as it stands.
+ * @returns { rows: [...], score: scoreSummary, kras: [{ id, name, weightPercent, score, band }] }
+ */
+export function reviewKpiTable(period, kraRows, kpiRows, actualsByKpi, bands, slot = null) {
+  const score = planScoreParts(period, kraRows, kpiRows, actualsByKpi, bands);
+  const kraOf = new Map(kraRows.map((k, i) => [Number(k.id), { name: k.name, order: i }]));
+  const rows = kpiRows.map((k) => {
+    const id = Number(k.id);
+    let r = score.kpis.get(id);
+    let scope = 'PERIOD';
+    if (slot) {
+      const inside = slotsOf(period, k.entry_frequency).filter((s) => s.start >= slot.start && s.end <= slot.end);
+      if (inside.length && !(inside.length === 1 && inside[0].whole)) {
+        const starts = new Set(inside.map((s) => s.start));
+        const res = kpiResult(scoringKpi(k, period), (actualsByKpi.get(id) ?? []).filter((a) => starts.has(iso(a.slot_start))).map(scoringActual));
+        r = { ...res, band: bandOf(res.achievement, bands) };
+        scope = 'SLOT';
+      } else if (inside.length) scope = 'SLOT';
+    }
+    const kra = k.plan_kra_id != null ? kraOf.get(Number(k.plan_kra_id)) : null;
+    const rule = k.combine_rule ?? defaultCombine(k.unit, k.direction);
+    return {
+      kpiId: id, kraId: kra ? Number(k.plan_kra_id) : null, kraName: kra?.name ?? null, kraOrder: kra ? kra.order : kraRows.length,
+      name: k.name, unit: k.unit ?? null, direction: k.direction,
+      targetNumber: num(k.target_number), targetText: k.target_text ?? null,
+      target: planTargetText({ direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit }),
+      combine: rule, combineLabel: COMBINE_WORDS[rule],
+      actual: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null,
+      achievement: r?.achievement ?? null, band: r?.band ?? 'NO_DATA', bandLabel: BAND_WORDS[r?.band ?? 'NO_DATA'],
+      counted: r?.counted ?? 0, slotCount: r?.slotCount ?? 1, scope,
+    };
+  }).sort((a, b) => a.kraOrder - b.kraOrder);
+  return {
+    rows: rows.map(({ kraOrder, ...x }) => x),
+    score: scoreSummary(score),
+    kras: kraRows.map((k) => ({ id: Number(k.id), name: k.name, weightPercent: num(k.weight_percent), score: score.kras.get(Number(k.id))?.score ?? null, band: score.kras.get(Number(k.id))?.band ?? 'NO_DATA' })),
   };
 }
 
@@ -586,5 +637,5 @@ export async function planIdsOfPeople(db, companyId, employeeIds, planIds) {
 
 export { COMBINE_RULES, COMBINE_WORDS, BAND_WORDS };
 export default {
-  SOURCES, loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, enterActuals, enterOne, actualHistory, actualsGrid, narrowGrid, chartBands, periodOfRow, planIdsOfPeople,
+  SOURCES, loadPlanParts, planScoreParts, reviewKpiTable, scoringKpi, scoringActual, scorePlans, scoreSummary, kpiActualsView, enterActuals, enterOne, actualHistory, actualsGrid, narrowGrid, chartBands, periodOfRow, planIdsOfPeople,
 };

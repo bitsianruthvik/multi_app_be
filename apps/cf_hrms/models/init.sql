@@ -4020,3 +4020,127 @@ CREATE TABLE IF NOT EXISTS hrms_performance_actuals (
   CONSTRAINT fk_hpfa_enterer  FOREIGN KEY (entered_by) REFERENCES users(id),
   CONSTRAINT fk_hpfa_closer   FOREIGN KEY (closed_by)  REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ############################################################################
+-- ## 22. CHECK-INS, REVIEWS AND ACTION ITEMS (CF_HRMS_HIRING_SPEC.md §20)     ##
+-- ############################################################################
+-- Added 2026-10-15. A REVIEW is a conversation about one plan:
+--
+--   hrms_performance_reviews   kind CHECK_IN (for one slot of the plan, opened by
+--                              HR or the manager) | FINAL (one per plan, made by
+--                              the app the day the period's last slot opens —
+--                              lazily, on read; idempotent). status OPEN ->
+--                              EMPLOYEE_DONE (the person wrote their part) ->
+--                              DONE (the manager closed it) — or CANCELLED.
+--                              A FINAL is due on the period's end + the company's
+--                              grace days; a CHECK_IN on its slot's end.
+--                              The person writes employee_comment and blockers;
+--                              the manager writes manager_comment and, on a
+--                              FINAL, the rating — a value of the company's
+--                              rating scale, its label kept beside it. A DONE
+--                              review is read-only except by the Owner, with a
+--                              reason (amended_*). One live review per (plan,
+--                              kind, slot): `live_slot` is the slot's first and
+--                              last day (1000-01-01 for a FINAL) while the review
+--                              is not cancelled, NULL once it is — and is unique.
+--   hrms_performance_actions   an action item: raised on a review or on the plan
+--                              directly; owner = an employee (usually the
+--                              person, sometimes the manager); due date; status
+--                              OPEN | DONE | DROPPED; done_on; a note. Overdue =
+--                              OPEN and the due date passed (computed on read).
+--   hrms_performance_settings.review_grace_days
+--                              days after the period's end a FINAL review is due (7).
+--
+-- The KPIs, actuals, achievement and plan score a review shows are READ, never
+-- stored: services/performance/scoring.js through actualsService.js, as on the
+-- plan page. apps/cf_hrms/scripts/apply-reviews-schema.mjs makes exactly these
+-- changes.
+
+-- ----- 22a. the grace days --------------------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_settings' AND COLUMN_NAME = 'review_grace_days');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_settings ADD COLUMN review_grace_days SMALLINT NOT NULL DEFAULT 7', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 22b. Reviews ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_reviews (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  plan_id            INT           NOT NULL,
+  kind               VARCHAR(10)   NOT NULL,                       -- CHECK_IN | FINAL
+  slot_start         DATE          NULL,                           -- CHECK_IN: its slot; FINAL: NULL (the whole period)
+  slot_end           DATE          NULL,
+  slot_name          VARCHAR(60)   NULL,
+  status             VARCHAR(16)   NOT NULL DEFAULT 'OPEN',        -- OPEN | EMPLOYEE_DONE | DONE | CANCELLED
+  due_date           DATE          NOT NULL,
+  employee_comment   VARCHAR(4000) NULL,                           -- written by the person
+  blockers           VARCHAR(4000) NULL,                           -- blockers / support needed, by the person
+  manager_comment    VARCHAR(4000) NULL,
+  rating_value       SMALLINT      NULL,                           -- FINAL only: a value of the rating scale
+  rating_label       VARCHAR(60)   NULL,                           -- its label, as it was when rated
+  opened_by          INT           NULL,                           -- NULL: made by the app (a FINAL)
+  employee_done_at   DATETIME      NULL,
+  employee_done_by   INT           NULL,
+  closed_at          DATETIME      NULL,
+  closed_by          INT           NULL,
+  cancelled_at       DATETIME      NULL,
+  cancelled_by       INT           NULL,
+  cancel_reason      VARCHAR(500)  NULL,
+  amended_at         DATETIME      NULL,                           -- changed after DONE (the Owner, with a reason)
+  amended_by         INT           NULL,
+  amend_reason       VARCHAR(500)  NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,                   -- never written: a review is cancelled, not deleted
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  -- One live review per (plan, kind, slot — its first and last day); a cancelled one is kept and frees the slot.
+  live_slot          VARCHAR(24)   GENERATED ALWAYS AS (IF(status <> 'CANCELLED', CONCAT(COALESCE(slot_start, '1000-01-01'), '/', COALESCE(slot_end, '1000-01-01')), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpfr_tenant (company_id, id),
+  UNIQUE KEY uq_hpfr_live   (company_id, plan_id, kind, live_slot),
+  KEY idx_hpfr_status (company_id, status, due_date),
+
+  CONSTRAINT fk_hpfr_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfr_plan      FOREIGN KEY (company_id, plan_id) REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpfr_opener    FOREIGN KEY (opened_by)        REFERENCES users(id),
+  CONSTRAINT fk_hpfr_empdone   FOREIGN KEY (employee_done_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfr_closer    FOREIGN KEY (closed_by)        REFERENCES users(id),
+  CONSTRAINT fk_hpfr_canceller FOREIGN KEY (cancelled_by)     REFERENCES users(id),
+  CONSTRAINT fk_hpfr_amender   FOREIGN KEY (amended_by)       REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 22c. Action items ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hrms_performance_actions (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  plan_id            INT           NOT NULL,
+  review_id          INT           NULL,                           -- NULL: raised on the plan directly
+  owner_employee_id  INT           NOT NULL,                       -- who does it
+  action_text        VARCHAR(1000) NOT NULL,
+  due_date           DATE          NOT NULL,
+  status             VARCHAR(10)   NOT NULL DEFAULT 'OPEN',        -- OPEN | DONE | DROPPED
+  done_on            DATE          NULL,
+  note               VARCHAR(1000) NULL,
+  closed_at          DATETIME      NULL,                           -- when it was done or dropped
+  closed_by          INT           NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,                   -- never written: an action is dropped, not deleted
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT           NULL,
+  updated_by         INT           NULL,
+
+  UNIQUE KEY uq_hpfx_tenant (company_id, id),
+  KEY idx_hpfx_plan   (company_id, plan_id),
+  KEY idx_hpfx_owner  (company_id, owner_employee_id, status),
+  KEY idx_hpfx_status (company_id, status, due_date),
+
+  CONSTRAINT fk_hpfx_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfx_plan    FOREIGN KEY (company_id, plan_id)           REFERENCES hrms_performance_plans(company_id, id),
+  CONSTRAINT fk_hpfx_review  FOREIGN KEY (company_id, review_id)         REFERENCES hrms_performance_reviews(company_id, id),
+  CONSTRAINT fk_hpfx_owner   FOREIGN KEY (company_id, owner_employee_id) REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hpfx_closer  FOREIGN KEY (closed_by)  REFERENCES users(id),
+  CONSTRAINT fk_hpfx_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_hpfx_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

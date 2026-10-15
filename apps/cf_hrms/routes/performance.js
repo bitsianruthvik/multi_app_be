@@ -30,6 +30,23 @@
  *   GET  /performance/bands?periodId=                  the org chart's "Colour by performance"     performance view
  *   (Excel: GET/POST /excel/actuals/… — routes/excel.js; the upload needs performance upload.)
  *
+ * REVIEWS AND ACTIONS (spec §20):
+ *   GET  /performance/reviews?period=&kind=&status=&state=&department=&label=&manager=&q=
+ *                                                      check-ins and final reviews (FINALs made when due)  performance view
+ *   GET  /performance/reviews/:id                      one review: KPI table, plan score, both parts       performance view
+ *   PUT  /performance/reviews/:id                      { managerComment?, rating?, reason? }  — a DONE one: the Owner, with a reason   performance edit
+ *   POST /performance/reviews/:id/close                { managerComment?, rating? }  DONE (a FINAL needs its rating)              performance edit
+ *   POST /performance/reviews/:id/cancel               { reason? }  a check-in                                                      performance remove
+ *   POST /performance/plans/:id/check-ins              { slotStart }                                                                performance edit
+ *   GET  /performance/plans/:id/reviews                the plan page's reviews and actions                                          performance view
+ *   GET  /performance/actions?status=&overdue=&owner=&period=&department=&label=&manager=&q=
+ *                                                      open actions (status=all for every one), overdue first                       performance view
+ *   POST /performance/plans/:id/actions                { text, ownerEmployeeId, dueDate, reviewId?, note? }                         performance edit
+ *   PUT  /performance/actions/:id                      { text?, ownerEmployeeId?, dueDate?, note? }                                 performance edit
+ *   POST /performance/actions/:id/done · /drop         { note? } · { note }                                                         performance edit
+ *   GET  /performance/employees/:id/review-summary     the org chart panel: latest rating, open actions                             performance view
+ *   (The person's part: /user/me/reviews…; a manager login's: /user/me/team/reviews… — routes/self.js.)
+ *
  * Removing a KPI from a DRAFT is part of shaping the draft (edit); removing a
  * PLAN is cancelling it (remove). The department scope (§12.3) applies to every
  * plan: lists are narrowed to it, a plan outside it answers 403 OUT_OF_SCOPE.
@@ -48,6 +65,10 @@ import {
   setKraWeight, addKpi, changeKpi, removeKpi, activatePlan, cancelPlan, forEachPlan, changeTarget,
 } from '../services/performance/planService.js';
 import { actualsGrid, narrowGrid, enterOne, actualHistory, chartBands } from '../services/performance/actualsService.js';
+import {
+  listReviews, readReview, reviewEmployeeId, planReviews, openCheckIn, writeManagerPart, closeReview, cancelReview,
+  listActions, addAction, changeAction, closeAction, actionEmployeeId, reviewSummary,
+} from '../services/performance/reviewService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -134,6 +155,40 @@ router.get('/performance/plans/:id/kpis/:kpiId/actuals', guard(PERM.performance.
 router.get('/performance/bands', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
   chartBands(pool, ctx(req).companyId, { periodId: req.query.periodId ? intParam(req.query.periodId, 'periodId') : null }, await peopleFilter(req))
 )));
+
+/* ── reviews and actions (spec §20) ───────────────────────────────────── */
+
+/** The review / action in the address must be of a person inside the login's department. */
+const inReview = Object.assign(step(async (req) => {
+  const employeeId = await reviewEmployeeId(pool, ctx(req).companyId, intParam(req.params.id));
+  if (employeeId != null) await assertEmployeeInScope(req, employeeId);
+}), { hrmsStep: 'scope: the person the review is about' });
+const inAction = Object.assign(step(async (req) => {
+  const employeeId = await actionEmployeeId(pool, ctx(req).companyId, intParam(req.params.id));
+  if (employeeId != null) await assertEmployeeInScope(req, employeeId);
+}), { hrmsStep: 'scope: the person whose plan the action is on' });
+const reviewCanFor = (req) => ({ owner: ctx(req).owner, edit: can(req, PERM.performance.edit), cancel: can(req, PERM.performance.remove) });
+
+router.get('/performance/reviews', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), listed('reviews'), handle(async (req) => (
+  listReviews(pool, ctx(req), { scopeDeptIds: await peopleFilter(req) })
+)));
+router.get('/performance/reviews/:id', guard(PERM.performance.view), inReview, handle((req) => readReview(pool, ctx(req).companyId, id(req), 'MANAGE', reviewCanFor(req))));
+router.put('/performance/reviews/:id', guard(PERM.performance.edit), inReview, handle((req) => tx(req, (db, c) => writeManagerPart(db, c, id(req), req.body ?? {}))));
+router.post('/performance/reviews/:id/close', guard(PERM.performance.edit), inReview, handle((req) => tx(req, (db, c) => closeReview(db, c, id(req), req.body ?? {}))));
+router.post('/performance/reviews/:id/cancel', guard(PERM.performance.remove), inReview, handle((req) => tx(req, (db, c) => cancelReview(db, c, id(req), req.body ?? {}))));
+router.post('/performance/plans/:id/check-ins', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => openCheckIn(db, c, id(req), req.body ?? {}))));
+router.get('/performance/plans/:id/reviews', guard(PERM.performance.view), inPlan, handle((req) => planReviews(pool, ctx(req), id(req), 'MANAGE', reviewCanFor(req))));
+
+router.get('/performance/actions', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), listed('actions'), handle(async (req) => {
+  const out = await listActions(pool, ctx(req), { scopeDeptIds: await peopleFilter(req) }, { edit: can(req, PERM.performance.edit) });
+  // Open ones unless the address asks for a status (status=all: every one).
+  return String(req.query.status ?? '').trim() ? out : { ...out, items: out.items.filter((a) => a.status === 'OPEN') };
+}));
+router.post('/performance/plans/:id/actions', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => addAction(db, c, id(req), req.body ?? {}))));
+router.put('/performance/actions/:id', guard(PERM.performance.edit), inAction, handle((req) => tx(req, (db, c) => changeAction(db, c, id(req), req.body ?? {}))));
+router.post('/performance/actions/:id/done', guard(PERM.performance.edit), inAction, handle((req) => tx(req, (db, c) => closeAction(db, c, id(req), 'DONE', req.body ?? {}))));
+router.post('/performance/actions/:id/drop', guard(PERM.performance.edit), inAction, handle((req) => tx(req, (db, c) => closeAction(db, c, id(req), 'DROPPED', req.body ?? {}))));
+router.get('/performance/employees/:id/review-summary', guard(PERM.performance.view), inEmployee(), handle((req) => reviewSummary(pool, ctx(req).companyId, id(req))));
 
 /* ── a person's plans ─────────────────────────────────────────────────── */
 

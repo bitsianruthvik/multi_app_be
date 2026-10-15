@@ -84,6 +84,22 @@ How to read the tables below:
 | `PUT /user/me/team/actuals` | `cf_hrms_self_view` |  |
 | `GET /user/me/team/plans/:id/kpis/:kpiId/actuals` | `cf_hrms_self_view` |  |
 | `DELETE /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
+| `GET /user/me/reviews` | `cf_hrms_self_view` |  |
+| `GET /user/me/reviews/:id` | `cf_hrms_self_view` |  |
+| `PUT /user/me/reviews/:id` | `cf_hrms_self_view` |  |
+| `POST /user/me/reviews/:id/done` | `cf_hrms_self_view` |  |
+| `POST /user/me/actions/:id/done` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/reviews` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/reviews/:id` | `cf_hrms_self_view` |  |
+| `PUT /user/me/team/reviews/:id` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/reviews/:id/close` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/reviews/:id/cancel` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/plans/:id/check-ins` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/plans/:id/reviews` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/plans/:id/actions` | `cf_hrms_self_view` |  |
+| `PUT /user/me/team/actions/:id` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/actions/:id/done` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/actions/:id/drop` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
 
@@ -438,6 +454,19 @@ How to read the tables below:
 | `PUT /performance/actuals` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `GET /performance/plans/:id/kpis/:kpiId/actuals` | `cf_hrms_performance_view` | scope: the person the plan is for |
 | `GET /performance/bands` | `cf_hrms_performance_view` | narrowed to the login’s department |
+| `GET /performance/reviews` | `cf_hrms_performance_view` | filters: q, period, kind, status, state, department, label, manager; narrowed to the login’s department |
+| `GET /performance/reviews/:id` | `cf_hrms_performance_view` | scope: the person the review is about |
+| `PUT /performance/reviews/:id` | `cf_hrms_performance_edit` | scope: the person the review is about |
+| `POST /performance/reviews/:id/close` | `cf_hrms_performance_edit` | scope: the person the review is about |
+| `POST /performance/reviews/:id/cancel` | `cf_hrms_performance_remove` | scope: the person the review is about |
+| `POST /performance/plans/:id/check-ins` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `GET /performance/plans/:id/reviews` | `cf_hrms_performance_view` | scope: the person the plan is for |
+| `GET /performance/actions` | `cf_hrms_performance_view` | filters: q, status, overdue, owner, period, department, label, manager; narrowed to the login’s department |
+| `POST /performance/plans/:id/actions` | `cf_hrms_performance_edit` | scope: the person the plan is for |
+| `PUT /performance/actions/:id` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
+| `POST /performance/actions/:id/done` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
+| `POST /performance/actions/:id/drop` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
+| `GET /performance/employees/:id/review-summary` | `cf_hrms_performance_view` | scope: the person |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-337 routes.
+366 routes.
