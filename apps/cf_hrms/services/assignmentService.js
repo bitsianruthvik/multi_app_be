@@ -46,11 +46,13 @@
  *   - ending an assignment ENDS its reporting rows and context links rather
  *     than deleting them.
  */
-import { notFound, conflict, assertNoProblems } from '../lib/errors.js';
+import { notFound, conflict, invalid, assertNoProblems } from '../lib/errors.js';
+import { randomUUID } from 'crypto';
 import {
   dateText, today, blank, bool, readDate, readText, readEnum, readInt,
   previousDay, LIVE_ON, SCOPE_TYPES,
   readContentOverride, shapeOverride,
+  today as todayIso, previousDay as previousDayIso,
 } from './positionService.js';
 import { assignmentRelationships, resolveReporting } from './reportingResolver.js';
 import { HOLDS_SEAT_SQL } from './seatCount.js';
@@ -107,7 +109,8 @@ const ASSIGNMENT_SELECT = `
          (SELECT COUNT(*) FROM hrms_work_assignment_contexts wc
            WHERE wc.company_id = wa.company_id AND wc.work_assignment_id = wa.id AND wc.deleted_at IS NULL) AS context_count,
          (SELECT COUNT(*) FROM hrms_work_assignment_content_overrides o
-           WHERE o.company_id = wa.company_id AND o.work_assignment_id = wa.id AND o.deleted_at IS NULL) AS override_count
+           WHERE o.company_id = wa.company_id AND o.work_assignment_id = wa.id AND o.deleted_at IS NULL
+             AND (o.effective_to IS NULL OR o.effective_to >= CURDATE())) AS override_count
     FROM hrms_work_assignments wa
     JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
     LEFT JOIN hrms_roles r ON r.company_id = wa.company_id AND r.id = wa.role_id
@@ -870,7 +873,8 @@ export async function removeAssignmentReporting(db, { companyId }, id) {
 export async function listAssignmentOverrides(db, companyId, assignmentId) {
   await requireAssignment(db, companyId, assignmentId);
   const [rows] = await db.query(
-    `SELECT o.*, COALESCE(k.name, rs.name, kp.name) AS definition_name, pk.name AS parent_kra_name
+    `SELECT o.*, COALESCE(k.name, rs.name, kp.name) AS definition_name,
+            COALESCE(k.description, rs.description, kp.description) AS definition_description, pk.name AS parent_kra_name
        FROM hrms_work_assignment_content_overrides o
        LEFT JOIN hrms_kra_definitions            k  ON k.company_id  = o.company_id AND k.id  = o.kra_definition_id
        LEFT JOIN hrms_responsibility_definitions rs ON rs.company_id = o.company_id AND rs.id = o.responsibility_definition_id
@@ -883,24 +887,40 @@ export async function listAssignmentOverrides(db, companyId, assignmentId) {
   return { items: rows.map(shapeOverride), total: rows.length };
 }
 
-export async function addAssignmentOverride(db, { companyId, userId }, assignmentId, body) {
+export async function addAssignmentOverride(db, { companyId, userId, owner = false }, assignmentId, body) {
   await requireAssignment(db, companyId, assignmentId);
   const o = await readContentOverride(db, companyId, body);
+  // Spec §16.1: dated from today unless a day is given; a past day is the Owner's alone.
+  const from = o.effectiveFrom ?? todayIso();
+  if (from < todayIso() && !owner) {
+    throw invalid('PAST_DATE', 'A change cannot take effect on a day that has passed: what was expected then is not rewritten. Choose today or a later day.');
+  }
   const [res] = await db.query(
     `INSERT INTO hrms_work_assignment_content_overrides
        (company_id, work_assignment_id, content_type, kra_definition_id, responsibility_definition_id, kpi_definition_id,
-        action, parent_kra_definition_id, override_json, effective_from, effective_to, reason, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        action, parent_kra_definition_id, override_json, effective_from, effective_to, reason, line_key, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [companyId, assignmentId, o.contentType, o.kraDefinitionId, o.responsibilityDefinitionId, o.kpiDefinitionId,
-      o.action, o.parentKraDefinitionId, o.overrideJson, o.effectiveFrom, o.effectiveTo, o.reason, userId],
+      o.action, o.parentKraDefinitionId, o.overrideJson, from, o.effectiveTo, o.reason,
+      body.lineKey ? String(body.lineKey).slice(0, 40) : randomUUID(), userId],
   );
   return { ok: true, id: res.insertId };
 }
 
-export async function removeAssignmentOverride(db, { companyId }, id) {
-  const [res] = await db.query('UPDATE hrms_work_assignment_content_overrides SET deleted_at = NOW() WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
+/**
+ * Spec §16.1: nothing job-related is deleted. Removing a change ENDS it — it was
+ * in force until yesterday and reads so for any earlier day; one that had not
+ * begun yet is cancelled (its window becomes empty).
+ */
+export async function removeAssignmentOverride(db, { companyId, userId = null }, id) {
+  const yesterday = previousDayIso(todayIso());
+  const [res] = await db.query(
+    `UPDATE hrms_work_assignment_content_overrides SET effective_to = ?, ended_by = ?
+      WHERE company_id = ? AND id = ? AND deleted_at IS NULL AND (effective_to IS NULL OR effective_to > ?)`,
+    [yesterday, userId, companyId, id, yesterday],
+  );
   if (!res.affectedRows) throw notFound('Content override');
-  return { ok: true, id };
+  return { ok: true, id, endedOn: yesterday };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

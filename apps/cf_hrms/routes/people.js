@@ -58,6 +58,10 @@ import {
 } from '../services/peopleService.js';
 import { peopleFilter } from '../services/accessScope.js';
 import { positionsHeld, moveEmployee } from '../services/employeePositionsService.js';
+import {
+  employeeJobContent, personAddLine, personChangeLine, personSwitchOffLine, personUndoLine,
+} from '../services/jobContentService.js';
+import { employeeJobHistory } from '../services/jobHistoryService.js';
 
 const router = Router();
 
@@ -144,6 +148,19 @@ router.post('/people/employees/:id/move', guard(PERM.positions.edit), inEmployee
  * The values never travel in the URL, only in the response body — a query string
  * ends up in access logs, browser history and proxy traces.
  */
+// ── a person's job (spec §16.2) ─────────────────────────────────────────────
+// Their position's job content and their own changes on top: the same four verbs
+// as a position's, one layer down, stored against the assignment through which
+// they hold the position on the day the change takes effect. KRAs stay at the role.
+router.get('/people/employees/:id/job-content', guard(PERM.employees.view), inEmployee(), handle((req) => (
+  employeeJobContent(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) }))));
+router.get('/people/employees/:id/job-content/history', guard(PERM.employees.view), inEmployee(), handle((req) => (
+  employeeJobHistory(pool, ctx(req).companyId, id(req)))));
+router.post('/people/employees/:id/job-content/add', guard(PERM.employees.edit), inEmployee(), handle((req) => tx(req, (db, c) => personAddLine(db, c, id(req), req.body ?? {}))));
+router.post('/people/employees/:id/job-content/change', guard(PERM.employees.edit), inEmployee(), handle((req) => tx(req, (db, c) => personChangeLine(db, c, id(req), req.body ?? {}))));
+router.post('/people/employees/:id/job-content/switch-off', guard(PERM.employees.edit), inEmployee(), handle((req) => tx(req, (db, c) => personSwitchOffLine(db, c, id(req), req.body ?? {}))));
+router.post('/people/employees/:id/job-content/undo', guard(PERM.employees.edit), inEmployee(), handle((req) => tx(req, (db, c) => personUndoLine(db, c, id(req), req.body ?? {}))));
+
 router.get('/people/employees/:id/identifiers', guard(PERM.employees.view), inEmployee(), handle((req) => (
   listIdentifiers(pool, ctx(req), id(req), {
     reveal: req.query.reveal === '1' || req.query.reveal === 'true',

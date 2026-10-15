@@ -3448,3 +3448,161 @@ CREATE TABLE IF NOT EXISTS hrms_department_label_links (
   CONSTRAINT fk_hdll_label      FOREIGN KEY (company_id, label_id)      REFERENCES hrms_department_labels(company_id, id),
   CONSTRAINT fk_hdll_creator    FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 18. DATED HISTORY OF JOB CONTENT (CF_HRMS_HIRING_SPEC.md §16, 2026-10-15)
+-- ############################################################################
+-- "Never overwrite old expectations." Every change to a KRA, responsibility or
+-- KPI line - on a role, on a position, or for one person - closes the old row
+-- (effective_to = the day before) and opens a new one (effective_from = the
+-- day it takes effect). Nothing job-related is deleted.
+--
+--   line_key       a line's identity across its versions: a reworded line is
+--                  "this line, reworded", not a new one. Role rows carry their
+--                  own; a position's or a person's change of a role line carries
+--                  the role line's key, so history can tell one line's story
+--                  through all three layers. Backfilled by
+--                  apps/cf_hrms/scripts/apply-history-schema.mjs.
+--   ended_by       who closed the row (the opener is created_by).
+--   change_reason  role rows only: why a change was dated in the past (the
+--                  Owner's reason). Overlay rows already have their reason.
+--
+-- One change per ALTER (TiDB, see §10c). Guarded: safe on an old database and
+-- a no-op the second time.
+
+-- ----- 18. hrms_role_kra_assignments -----------------------------------------
+SET @needs_hrka_line_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kra_assignments' AND COLUMN_NAME = 'line_key');
+SET @sql = IF(@needs_hrka_line_key = 1,
+  'ALTER TABLE hrms_role_kra_assignments ADD COLUMN line_key VARCHAR(40) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrka_ended_by = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kra_assignments' AND COLUMN_NAME = 'ended_by');
+SET @sql = IF(@needs_hrka_ended_by = 1,
+  'ALTER TABLE hrms_role_kra_assignments ADD COLUMN ended_by INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrka_change_reason = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kra_assignments' AND COLUMN_NAME = 'change_reason');
+SET @sql = IF(@needs_hrka_change_reason = 1,
+  'ALTER TABLE hrms_role_kra_assignments ADD COLUMN change_reason VARCHAR(500) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrka_line_idx = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kra_assignments' AND INDEX_NAME = 'idx_hrka_line');
+SET @sql = IF(@needs_hrka_line_idx = 1,
+  'ALTER TABLE hrms_role_kra_assignments ADD KEY idx_hrka_line (company_id, line_key)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 18. hrms_role_responsibility_assignments ------------------------------
+SET @needs_hrra_line_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_responsibility_assignments' AND COLUMN_NAME = 'line_key');
+SET @sql = IF(@needs_hrra_line_key = 1,
+  'ALTER TABLE hrms_role_responsibility_assignments ADD COLUMN line_key VARCHAR(40) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrra_ended_by = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_responsibility_assignments' AND COLUMN_NAME = 'ended_by');
+SET @sql = IF(@needs_hrra_ended_by = 1,
+  'ALTER TABLE hrms_role_responsibility_assignments ADD COLUMN ended_by INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrra_change_reason = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_responsibility_assignments' AND COLUMN_NAME = 'change_reason');
+SET @sql = IF(@needs_hrra_change_reason = 1,
+  'ALTER TABLE hrms_role_responsibility_assignments ADD COLUMN change_reason VARCHAR(500) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrra_line_idx = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_responsibility_assignments' AND INDEX_NAME = 'idx_hrra_line');
+SET @sql = IF(@needs_hrra_line_idx = 1,
+  'ALTER TABLE hrms_role_responsibility_assignments ADD KEY idx_hrra_line (company_id, line_key)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 18. hrms_role_kpi_assignments -----------------------------------------
+SET @needs_hrkp_line_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kpi_assignments' AND COLUMN_NAME = 'line_key');
+SET @sql = IF(@needs_hrkp_line_key = 1,
+  'ALTER TABLE hrms_role_kpi_assignments ADD COLUMN line_key VARCHAR(40) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrkp_ended_by = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kpi_assignments' AND COLUMN_NAME = 'ended_by');
+SET @sql = IF(@needs_hrkp_ended_by = 1,
+  'ALTER TABLE hrms_role_kpi_assignments ADD COLUMN ended_by INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrkp_change_reason = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kpi_assignments' AND COLUMN_NAME = 'change_reason');
+SET @sql = IF(@needs_hrkp_change_reason = 1,
+  'ALTER TABLE hrms_role_kpi_assignments ADD COLUMN change_reason VARCHAR(500) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hrkp_line_idx = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kpi_assignments' AND INDEX_NAME = 'idx_hrkp_line');
+SET @sql = IF(@needs_hrkp_line_idx = 1,
+  'ALTER TABLE hrms_role_kpi_assignments ADD KEY idx_hrkp_line (company_id, line_key)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 18. hrms_position_content_overrides -----------------------------------
+SET @needs_hpco_line_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_position_content_overrides' AND COLUMN_NAME = 'line_key');
+SET @sql = IF(@needs_hpco_line_key = 1,
+  'ALTER TABLE hrms_position_content_overrides ADD COLUMN line_key VARCHAR(40) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hpco_ended_by = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_position_content_overrides' AND COLUMN_NAME = 'ended_by');
+SET @sql = IF(@needs_hpco_ended_by = 1,
+  'ALTER TABLE hrms_position_content_overrides ADD COLUMN ended_by INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hpco_line_idx = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_position_content_overrides' AND INDEX_NAME = 'idx_hpco_line');
+SET @sql = IF(@needs_hpco_line_idx = 1,
+  'ALTER TABLE hrms_position_content_overrides ADD KEY idx_hpco_line (company_id, line_key)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 18. hrms_work_assignment_content_overrides ----------------------------
+SET @needs_hwco_line_key = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_work_assignment_content_overrides' AND COLUMN_NAME = 'line_key');
+SET @sql = IF(@needs_hwco_line_key = 1,
+  'ALTER TABLE hrms_work_assignment_content_overrides ADD COLUMN line_key VARCHAR(40) NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hwco_ended_by = (
+  SELECT COUNT(*) = 0 FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_work_assignment_content_overrides' AND COLUMN_NAME = 'ended_by');
+SET @sql = IF(@needs_hwco_ended_by = 1,
+  'ALTER TABLE hrms_work_assignment_content_overrides ADD COLUMN ended_by INT NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @needs_hwco_line_idx = (
+  SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_work_assignment_content_overrides' AND INDEX_NAME = 'idx_hwco_line');
+SET @sql = IF(@needs_hwco_line_idx = 1,
+  'ALTER TABLE hrms_work_assignment_content_overrides ADD KEY idx_hwco_line (company_id, line_key)',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

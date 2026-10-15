@@ -40,7 +40,9 @@ export function ctx(req) {
   const companyId = Number(req.user?.companyId ?? req.user?.company_id);
   if (!companyId) throw new HrmsError(401, 'NO_COMPANY', 'This session has no company.');
   const userId = Number(req.user?.id) || null;
-  return { companyId, userId };
+  // `owner`: may date a job-content change in the past, with a reason (spec §16.1).
+  // Only meaningful after guard(...) has run; false everywhere else.
+  return { companyId, userId, owner: Boolean(req.hrmsAccess?.owner) };
 }
 
 /**

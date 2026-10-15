@@ -9,6 +9,7 @@ import { effectiveFor } from './leavePolicyRead.js';
 import { issuePositionCode, acceptImportedCode } from './codeService.js';
 import { POSITION_ENTITY, cardCodeOf } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
+import { randomUUID } from 'crypto';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
  * structure between them, and position content overlays. (Plan §5.4, §7.)
@@ -243,6 +244,7 @@ export function shapeOverride(r) {
     responsibilityDefinitionId: r.responsibility_definition_id,
     kpiDefinitionId: r.kpi_definition_id,
     definitionName: r.definition_name ?? null,
+    definitionDescription: r.definition_description ?? null,
     parentKraDefinitionId: r.parent_kra_definition_id,
     parentKraName: r.parent_kra_name ?? null,
     overrideJson: r.override_json == null ? null : (typeof r.override_json === 'string' ? JSON.parse(r.override_json) : r.override_json),
@@ -250,12 +252,17 @@ export function shapeOverride(r) {
     effectiveTo: dateText(r.effective_to),
     reason: r.reason ?? null,
     createdAt: r.created_at,
+    // Spec §16: the line it belongs to, and who opened and closed it.
+    lineKey: r.line_key ?? null,
+    createdBy: r.created_by ?? null,
+    endedBy: r.ended_by ?? null,
   };
 }
 
 const OVERRIDE_SELECT = (table, fk) => `
   SELECT o.*,
          COALESCE(k.name, rs.name, kp.name) AS definition_name,
+         COALESCE(k.description, rs.description, kp.description) AS definition_description,
          pk.name AS parent_kra_name
     FROM ${table} o
     LEFT JOIN hrms_kra_definitions            k  ON k.company_id  = o.company_id AND k.id  = o.kra_definition_id
@@ -337,7 +344,8 @@ const POSITION_SELECT = `
          (SELECT COUNT(*) FROM hrms_position_reporting_relationships rr
            WHERE rr.company_id = p.company_id AND rr.from_position_id = p.id AND rr.deleted_at IS NULL) AS reporting_count,
          (SELECT COUNT(*) FROM hrms_position_content_overrides o
-           WHERE o.company_id = p.company_id AND o.position_id = p.id AND o.deleted_at IS NULL) AS override_count
+           WHERE o.company_id = p.company_id AND o.position_id = p.id AND o.deleted_at IS NULL
+             AND (o.effective_to IS NULL OR o.effective_to >= CURDATE())) AS override_count
     FROM hrms_positions p
     LEFT JOIN hrms_roles       r ON r.company_id = p.company_id AND r.id = p.role_id
     LEFT JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
@@ -514,7 +522,10 @@ export async function createPosition(db, { companyId, userId }, body, options = 
  * `default_shift_id` follows in the same transaction (a planned successor's
  * too); ended assignments keep the shift they were worked on.
  */
-export async function updatePosition(db, { companyId }, id, body) {
+/** The fields of a position its history shows (spec §16.3), as the audit row names them. */
+const HISTORY_FIELDS = { role_id: 'roleId', department_id: 'departmentId', default_shift_id: 'defaultShiftId', location_id: 'locationId', position_title: 'positionTitle' };
+
+export async function updatePosition(db, { companyId, userId = null }, id, body) {
   const current = await requirePosition(db, companyId, id, { lock: true });
   const data = await readPositionBody(db, companyId, body, { partial: true, current });
   const keys = Object.keys(data);
@@ -523,6 +534,18 @@ export async function updatePosition(db, { companyId }, id, body) {
       `UPDATE hrms_positions SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...keys.map((k) => data[k]), companyId, id],
     );
+    // What the position's history lists: a change of role, department, shift, place or title.
+    const changed = keys.filter((k) => HISTORY_FIELDS[k] && String(current[k] ?? '') !== String(data[k] ?? ''));
+    if (changed.length && !inBatch(db)) {
+      await db.query(
+        `INSERT INTO hrms_audit_log (company_id, actor_user_id, entity_type, entity_id, action, before_json, after_json, created_by)
+         VALUES (?, ?, 'hrms_positions', ?, 'UPDATE', ?, ?, ?)`,
+        [companyId, userId, id,
+          JSON.stringify(Object.fromEntries(changed.map((k) => [HISTORY_FIELDS[k], current[k] ?? null]))),
+          JSON.stringify({ ...Object.fromEntries(changed.map((k) => [HISTORY_FIELDS[k], data[k] ?? null])), on: today() }),
+          userId],
+      );
+    }
   }
   let occupantsMoved = 0;
   if (data.default_shift_id != null && data.default_shift_id !== current.default_shift_id) {
@@ -1693,30 +1716,49 @@ export async function listPositionOccupants(db, companyId, positionId, query = {
 /* ══════════════════════════════════════════════════════════════════════════
  * Position content overrides
  * ══════════════════════════════════════════════════════════════════════════ */
+const todayIso = () => today();
+const previousDayIso = (iso) => previousDay(iso);
+
 export async function listPositionOverrides(db, companyId, positionId) {
   await requirePosition(db, companyId, positionId);
   const [rows] = await db.query(OVERRIDE_SELECT('hrms_position_content_overrides', 'position_id'), [companyId, positionId]);
   return { items: rows.map(shapeOverride), total: rows.length };
 }
 
-export async function addPositionOverride(db, { companyId, userId }, positionId, body) {
+export async function addPositionOverride(db, { companyId, userId, owner = false }, positionId, body) {
   await requirePosition(db, companyId, positionId);
   const o = await readContentOverride(db, companyId, body);
+  // Spec §16.1: dated from today unless a day is given; a past day is the Owner's alone.
+  const from = o.effectiveFrom ?? todayIso();
+  if (from < todayIso() && !owner) {
+    throw invalid('PAST_DATE', 'A change cannot take effect on a day that has passed: what was expected then is not rewritten. Choose today or a later day.');
+  }
   const [res] = await db.query(
     `INSERT INTO hrms_position_content_overrides
        (company_id, position_id, content_type, kra_definition_id, responsibility_definition_id, kpi_definition_id,
-        action, parent_kra_definition_id, override_json, effective_from, effective_to, reason, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        action, parent_kra_definition_id, override_json, effective_from, effective_to, reason, line_key, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [companyId, positionId, o.contentType, o.kraDefinitionId, o.responsibilityDefinitionId, o.kpiDefinitionId,
-      o.action, o.parentKraDefinitionId, o.overrideJson, o.effectiveFrom, o.effectiveTo, o.reason, userId],
+      o.action, o.parentKraDefinitionId, o.overrideJson, from, o.effectiveTo, o.reason,
+      body.lineKey ? String(body.lineKey).slice(0, 40) : randomUUID(), userId],
   );
   return { ok: true, id: res.insertId };
 }
 
-export async function removePositionOverride(db, { companyId }, id) {
-  const [res] = await db.query('UPDATE hrms_position_content_overrides SET deleted_at = NOW() WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, id]);
+/**
+ * Spec §16.1: nothing job-related is deleted. Removing a change ENDS it — it was
+ * in force until yesterday and reads so for any earlier day; one that had not
+ * begun yet is cancelled (its window becomes empty).
+ */
+export async function removePositionOverride(db, { companyId, userId = null }, id) {
+  const yesterday = previousDayIso(todayIso());
+  const [res] = await db.query(
+    `UPDATE hrms_position_content_overrides SET effective_to = ?, ended_by = ?
+      WHERE company_id = ? AND id = ? AND deleted_at IS NULL AND (effective_to IS NULL OR effective_to > ?)`,
+    [yesterday, userId, companyId, id, yesterday],
+  );
   if (!res.affectedRows) throw notFound('Content override');
-  return { ok: true, id };
+  return { ok: true, id, endedOn: yesterday };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

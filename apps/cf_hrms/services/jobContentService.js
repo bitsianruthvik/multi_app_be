@@ -1,58 +1,70 @@
 /**
  * jobContentService.js — a job's KRAs, with the responsibilities and KPIs under
- * each, as ONE shape four screens draw (the org chart panel, a role, a position,
- * the Departments screen), plus the plain-language edits of that content.
+ * each, as ONE shape the screens draw (the org chart panel, a role, a position,
+ * a person, the Departments screen), plus the plain-language edits of that
+ * content at each of its three layers.
  *
  * WHAT THIS FILE IS NOT. It is not a resolver. `contentResolver.resolveContent`
- * is the one implementation of Role -> Position overlay -> Assignment overlay
- * (plan §2 rule 6) and everything here reads its output. This file only
+ * is the one implementation of Role -> Position -> Person (plan §2 rule 6) and
+ * everything here reads its output. This file only
  *   - flattens that output into the lines a screen prints, each carrying a MARK
- *     that says whether the seat added it, changed it or switched it off, and
- *   - turns "add / change / switch off / undo for this seat" into the override
- *     rows `positionService` already knows how to write.
+ *     that says whether the position (or the person) added it, changed it or
+ *     switched it off, and
+ *   - turns "add / change / switch off / undo for this position — or for this
+ *     person" into the override rows `positionService` / `assignmentService`
+ *     already know how to write.
  * A generated JD reads the same resolver, so the screen and the document cannot
  * disagree.
  *
- * THE RULE THE CLIENT SET (2026-10-10). KRAs are fixed at the ROLE. A seat may
- * expand, change or contract the RESPONSIBILITIES, the KPIs and a KPI's TARGET —
- * never the KRAs. So the seat actions below refuse a KRA, and the role actions
- * are the only way a KRA is created, renamed or removed.
+ * THE RULE THE CLIENT SET (2026-10-10). KRAs are fixed at the ROLE. A position
+ * (and a person, spec §16.2) may expand, change or contract the RESPONSIBILITIES,
+ * the KPIs and a KPI's TARGET — never the KRAs.
  *
- * HOW "CHANGE THE WORDING FOR THIS SEAT" IS STORED. The resolver deliberately
- * cannot rename a definition from an overlay ("define once, assign to a
- * context"), and a JD prints the definition's name. So a wording change is the
- * pattern the resolver's own header describes — "not the role's X, mine":
- *     SUPPRESS the role's line  +  ADD a new line, written for this seat
- * The ADD's `override_json` carries `replacesDefinitionId` so the two rows read
- * as ONE change on screen ("Changed for this position — the role says: …") and are
- * undone together. The resolver ignores json keys it does not know on an ADD, so
- * the JD shows the new line as specific to the position and lists the role's
- * line among the seat's exceptions. A change to a KPI TARGET alone is a plain
- * OVERRIDE of `targetOperator` / `targetValue`, which the resolver records as a
- * change with its before and after.
+ * EVERY CHANGE IS DATED (spec §16.1). A change takes effect today, or on a later
+ * day ("from 1 Nov"); a past day only for the Owner, with a reason. Nothing is
+ * deleted: a change CLOSES the rows it replaces (effective_to = the day before)
+ * and opens new ones (effective_from = that day), so the job as it stood on any
+ * date is still there to read. A change of the same line on the same day
+ * replaces the one made earlier that day (the old row's window becomes empty).
  *
- * `seatAuthored` in the same json marks a definition that was written for the
- * seat, so undoing the change can retire it instead of leaving the master lists
- * full of one-seat sentences. A definition picked from a master is never retired.
+ * HOW "CHANGE THE WORDING FOR THIS POSITION" IS STORED. The resolver cannot
+ * rename a definition from an overlay ("define once, assign to a context"), and
+ * a JD prints the definition's name. So a wording change is
+ *     SUPPRESS the inherited line  +  ADD a new line, written for this position
+ * The ADD's `override_json` carries `replacesDefinitionId` (and the SAME line
+ * key as the line it replaces) so the two rows read as ONE change on screen and
+ * in history ("this line, reworded") and are undone together. A change to a KPI
+ * TARGET alone is a plain OVERRIDE of `targetOperator` / `targetValue`.
+ *
+ * THE PERSON LAYER (spec §16.2) is the same four verbs one layer down, stored
+ * against the person's work assignment in the position they hold on that day —
+ * so when they move, their own changes stay with the old position's assignment
+ * (they end with it, history keeps them) and do not follow them.
  */
 import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js';
-import { resolveContent, targetText } from './contentResolver.js';
+import { resolveContent, targetText, wireLayer } from './contentResolver.js';
+import { requirePosition, addPositionOverride, dateText, today } from './positionService.js';
+import { addAssignmentOverride } from './assignmentService.js';
 import {
-  requirePosition, addPositionOverride, dateText, today,
-} from './positionService.js';
-import {
-  requireRole, audit, createMasterItem, addContent, removeContent, validateTarget, CONTENT,
+  requireRole, audit, createMasterItem, addContent, validateTarget, CONTENT,
+  changeRoleLine, removeRoleLine, isoDate,
 } from './roleContentService.js';
+import { readTakesEffect, dayBefore, newLineKey, longDay, isVoid } from './datedChange.js';
 import { buildOrgChart } from './orgChartService.js';
-import { SEATS_PER_POSITION } from './seatCount.js';
+import { SEATS_PER_POSITION, HOLDS_SEAT_SQL } from './seatCount.js';
 
 const KINDS = ['RESPONSIBILITY', 'KPI'];
 const DEF_COLUMN = { RESPONSIBILITY: 'responsibility_definition_id', KPI: 'kpi_definition_id' };
 const DEF_FIELD = { RESPONSIBILITY: 'responsibilityDefinitionId', KPI: 'kpiDefinitionId' };
-const DEF_TABLE = { RESPONSIBILITY: 'hrms_responsibility_definitions', KPI: 'hrms_kpi_definitions' };
 const MASTER_KIND = { RESPONSIBILITY: 'responsibilities', KPI: 'kpis' };
-const ROLE_TABLE = { RESPONSIBILITY: 'hrms_role_responsibility_assignments', KPI: 'hrms_role_kpi_assignments' };
+const ROLE_KIND = { RESPONSIBILITY: 'responsibilities', KPI: 'kpis' };
 const NOUN = { RESPONSIBILITY: 'responsibility', KPI: 'KPI' };
+
+/** The two overlay layers, by the name the resolver gives them. */
+const LAYER = {
+  POSITION: { table: 'hrms_position_content_overrides', owner: 'position_id', word: 'position', add: addPositionOverride },
+  ASSIGNMENT: { table: 'hrms_work_assignment_content_overrides', owner: 'work_assignment_id', word: 'person', add: addAssignmentOverride },
+};
 
 const titleCase = (s) => (s ? String(s).replace(/_/g, ' ').toLowerCase().replace(/^./, (ch) => ch.toUpperCase()) : null);
 const same = (a, b) => String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
@@ -60,52 +72,59 @@ const same = (a, b) => String(a ?? '').trim().toLowerCase() === String(b ?? '').
 /**
  * A definition's name is 250 characters; a long duty is stored with its name cut
  * short and ending "..." and the whole sentence in the description (the importer
- * does this, and so does a seat line written here). On screen that is ONE
- * sentence — the whole one — not a cut-off line with its own text repeated under it.
+ * does this, and so does a line written here). On screen that is ONE sentence —
+ * the whole one — not a cut-off line with its own text repeated under it.
  */
 const NAME_MAX = 250;
 const cutShort = (name, description) => {
   const n = String(name ?? '').trim();
   const d = String(description ?? '').trim();
-  if (!d || !/(\.\.\.|\u2026)$/.test(n)) return false;
-  const stem = n.replace(/(\.\.\.|\u2026)$/, '').trim().toLowerCase();
+  if (!d || !/(\.\.\.|…)$/.test(n)) return false;
+  const stem = n.replace(/(\.\.\.|…)$/, '').trim().toLowerCase();
   return stem.length > 0 && d.toLowerCase().startsWith(stem);
 };
 const wordingOf = (name, description) => (cutShort(name, description) ? String(description).trim() : name);
 const nameFor = (text) => (text.length > NAME_MAX ? `${text.slice(0, NAME_MAX - 3).trimEnd()}...` : text);
 
 /* ══════════════════════════════════════════════════════════════════════════
- * The read — one shape for a role and for a seat
+ * The read — one shape for a role, a position and a person
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * One printed line. `mark` is the whole provenance story in one word:
- *   null      the role says it, and this seat does it as written
- *   ADDED     specific to this seat
- *   CHANGED   the role says something else (`was` holds what)
- *   OFF       the role says it and this seat does not do it
- * `overrideIds` are the seat's own rows behind the mark — what Undo removes.
+ * One printed line. `mark` is the provenance story in one word, at the layer
+ * `markLayer` says ('POSITION' | 'PERSON'):
+ *   null      as the layer above says it
+ *   ADDED     specific to this position / this person
+ *   CHANGED   the layer above says something else (`was` holds what)
+ *   OFF       the layer above says it and this position / person does not do it
+ * `layer` / `since` / `changedFrom` (spec §16.3): which layer last shaped the
+ * line, from which day, and the wording or target it replaced.
  */
-function lineOf(item, overrideById) {
+function lineOf(item, ctx) {
   const line = {
     key: item.key,
     kind: item.kind,
     definitionId: item.definitionId,
+    lineKey: item.lineKey ?? null,
     name: wordingOf(item.name, item.description),
     description: item.description && !same(item.description, item.name) && !cutShort(item.name, item.description)
       ? item.description
       : null,
     detail: null,
     mark: null,
+    markLayer: null,
     was: null,
     reason: item.reason ?? null,
     overrideIds: [],
     replacesDefinitionId: null,
     // The role's own assignment row, when the role introduced the line — what the
-    // role editor edits, moves and removes. Null for a line the seat added.
+    // role editor edits, moves and removes. Null for a line a position or person added.
     roleRowId: item.origin === 'ROLE' ? item.sourceRowId : null,
     parentKraDefinitionId: item.parentKraDefinitionId ?? null,
     note: item.orphanNote ?? null,
+    layer: item.layer ?? 'ROLE',
+    since: item.since ?? null,
+    changedFrom: item.changedFrom ?? null,
   };
 
   if (item.kind === 'KPI') {
@@ -120,30 +139,40 @@ function lineOf(item, overrideById) {
     line.detail = titleCase(item.responsibilityClass);
   }
 
-  if (item.origin !== 'ROLE') {
-    const row = overrideById.get(Number(item.sourceRowId));
+  if (item.origin !== 'ROLE' && ctx.layers.includes(item.origin)) {
+    const row = ctx.rowOf(item.origin, item.sourceRowId);
     const replaces = row?.overrideJson?.replacesDefinitionId ?? null;
     line.mark = replaces ? 'CHANGED' : 'ADDED';
+    line.markLayer = wireLayer(item.origin);
     line.replacesDefinitionId = replaces ? Number(replaces) : null;
     line.overrideIds = [Number(item.sourceRowId)];
     line.seatAuthored = row?.overrideJson?.seatAuthored === true;
-  } else if (item.overridden) {
-    line.mark = 'CHANGED';
-    line.overrideIds = [...new Set((item.changes ?? []).map((c) => Number(c.byOverrideId)))];
-    line.was = wasText(item);
+    line.origin = wireLayer(item.origin);
+  } else {
+    line.origin = item.origin === 'ROLE' ? 'ROLE' : wireLayer(item.origin);
+    const changes = (item.changes ?? []).filter((c) => ctx.layers.includes(c.byLayer));
+    if (item.overridden && changes.length) {
+      const last = changes[changes.length - 1].byLayer;
+      line.mark = 'CHANGED';
+      line.markLayer = wireLayer(last);
+      line.overrideIds = [...new Set(changes.filter((c) => c.byLayer === last).map((c) => Number(c.byOverrideId)))];
+      line.was = wasText(item, last);
+    }
   }
   return line;
 }
 
-/** "Role target: 95%" — what the role said before the seat changed it. */
-function wasText(item) {
-  const changes = item.changes ?? [];
+/** "Role target: 95%" — what the layer above said before this layer changed it. */
+function wasText(item, layer) {
+  const all = item.changes ?? [];
+  const changes = all.filter((c) => c.byLayer === layer);
   const firstOf = (field) => changes.find((c) => c.field === field);
+  const above = layer === 'ASSIGNMENT' && all.some((c) => c.byLayer === 'POSITION') ? 'Position' : 'Role';
   const bits = [];
   if (item.kind === 'KPI' && (firstOf('targetValue') || firstOf('targetOperator'))) {
     const operator = firstOf('targetOperator') ? firstOf('targetOperator').from : item.targetOperator;
     const value = firstOf('targetValue') ? firstOf('targetValue').from : item.targetValue;
-    bits.push(`Role target: ${targetText(operator, value, item.measurementType, item.unit)}`);
+    bits.push(`${above} target: ${targetText(operator, value, item.measurementType, item.unit)}`);
   }
   const LABEL = {
     weightPercent: 'weight', frequency: 'frequency', isMandatory: 'mandatory',
@@ -151,63 +180,52 @@ function wasText(item) {
   };
   const other = [...new Set(changes.map((c) => c.field))].filter((f) => LABEL[f]).map((f) => LABEL[f]);
   if (other.length) bits.push(`Also changed here: ${other.join(', ')}`);
-  return bits.join('. ') || 'Changed for this position';
+  return bits.join('. ') || (layer === 'ASSIGNMENT' ? 'Changed for this person' : 'Changed for this position');
 }
 
-/** A line the seat switched off, rebuilt from the resolver's `suppressed` entry. */
+/** A line switched off at a layer, rebuilt from the resolver's `suppressed` entry. */
 function offLine(s) {
   return {
     key: `${s.kind}:${s.definitionId}`,
     kind: s.kind,
     definitionId: s.definitionId,
+    lineKey: s.lineKey ?? null,
     name: s.name,
     description: null,
-    detail: null,
+    detail: s.kind === 'KPI' ? s.targetText ?? null : null,
     mark: 'OFF',
+    markLayer: wireLayer(s.byLayer),
     was: null,
     reason: s.reason ?? null,
     overrideIds: [Number(s.byOverrideId)],
     replacesDefinitionId: null,
     roleRowId: null,
-    parentKraDefinitionId: null,
+    parentKraDefinitionId: s.parentKraDefinitionId ?? null,
     note: null,
+    layer: wireLayer(s.byLayer),
+    since: s.since ?? null,
+    changedFrom: null,
+    origin: s.origin === 'ROLE' ? 'ROLE' : wireLayer(s.origin),
   };
 }
 
-/**
- * Where the role files each switched-off line. The resolver reports that a line
- * was suppressed but not which KRA it sat under — and a switched-off line shown
- * out of its group reads as "ungrouped", which is a different statement. One
- * query, only when something is switched off.
- */
-async function parentsOfSuppressed(db, companyId, roleId, suppressed) {
-  const out = new Map();
-  for (const kind of KINDS) {
-    const ids = suppressed.filter((s) => s.kind === kind).map((s) => Number(s.definitionId));
-    if (!ids.length) continue;
-    const [rows] = await db.query(
-      `SELECT a.${DEF_COLUMN[kind]} AS definition_id, k.kra_definition_id
-         FROM ${ROLE_TABLE[kind]} a
-         JOIN hrms_role_kra_assignments k ON k.company_id = a.company_id AND k.id = a.role_kra_assignment_id
-        WHERE a.company_id = ? AND a.role_id = ? AND a.deleted_at IS NULL
-          AND a.${DEF_COLUMN[kind]} IN (${ids.map(() => '?').join(',')})`,
-      [companyId, roleId, ...ids],
-    );
-    for (const r of rows) out.set(`${kind}:${r.definition_id}`, Number(r.kra_definition_id));
-  }
-  return out;
-}
+const SUBJECT_LAYERS = { ROLE: [], SEAT: ['POSITION'], PERSON: ['POSITION', 'ASSIGNMENT'] };
 
-async function shape(db, companyId, resolved, subject, extra = {}) {
-  const overrideById = new Map((resolved.overlay?.position ?? []).map((o) => [Number(o.id), o]));
-  const suppressed = (resolved.suppressed ?? []).filter((s) => KINDS.includes(s.kind) && s.byLayer === 'POSITION');
-  const parents = suppressed.length
-    ? await parentsOfSuppressed(db, companyId, resolved.target.roleId, suppressed)
-    : new Map();
+function shape(resolved, subject, extra = {}) {
+  const layers = SUBJECT_LAYERS[subject];
+  const rows = new Map();
+  for (const o of resolved.overlay?.position ?? []) rows.set(`POSITION:${o.id}`, o);
+  for (const o of resolved.overlay?.assignment ?? []) rows.set(`ASSIGNMENT:${o.id}`, o);
+  const ctx = { layers, rowOf: (layer, id) => rows.get(`${layer}:${Number(id)}`) ?? null };
+  const on = resolved.asOf;
+  const live = (o) => (!o.effectiveFrom || o.effectiveFrom <= on) && (!o.effectiveTo || o.effectiveTo >= on);
+
+  const suppressed = (resolved.suppressed ?? []).filter((s) => KINDS.includes(s.kind) && layers.includes(s.byLayer));
 
   const kras = resolved.kras.map((k) => ({
     key: k.key,
     definitionId: k.definitionId,
+    lineKey: k.lineKey ?? null,
     // The role's own KRA row — what rename, delete and "move a line here" address.
     roleRowId: k.origin === 'ROLE' ? k.sourceRowId : null,
     name: k.name,
@@ -215,53 +233,61 @@ async function shape(db, companyId, resolved, subject, extra = {}) {
     weightPercent: k.weightPercent ?? null,
     mark: k.origin !== 'ROLE' ? 'ADDED' : (k.overridden ? 'CHANGED' : null),
     overrideIds: k.origin !== 'ROLE' ? [Number(k.sourceRowId)] : [],
-    responsibilities: k.responsibilities.map((i) => lineOf(i, overrideById)),
-    kpis: k.kpis.map((i) => lineOf(i, overrideById)),
+    layer: k.layer ?? 'ROLE',
+    since: k.since ?? null,
+    changedFrom: k.changedFrom ?? null,
+    responsibilities: k.responsibilities.map((i) => lineOf(i, ctx)),
+    kpis: k.kpis.map((i) => lineOf(i, ctx)),
   }));
   const ungrouped = {
-    responsibilities: resolved.additional.responsibilities.map((i) => lineOf(i, overrideById)),
-    kpis: resolved.additional.kpis.map((i) => lineOf(i, overrideById)),
+    responsibilities: resolved.additional.responsibilities.map((i) => lineOf(i, ctx)),
+    kpis: resolved.additional.kpis.map((i) => lineOf(i, ctx)),
   };
   const kraByDefinition = new Map(kras.map((k) => [Number(k.definitionId), k]));
 
-  // A wording change is two rows that are one change: fold the switched-off role
-  // line into the seat's replacement, so it is shown once.
+  // A wording change is two rows that are one change: fold the switched-off line
+  // into its replacement at the same layer, so it is shown once.
   const everyLine = [
     ...kras.flatMap((k) => [...k.responsibilities, ...k.kpis]),
     ...ungrouped.responsibilities, ...ungrouped.kpis,
   ];
-  const replacementOf = new Map(
-    everyLine.filter((l) => l.replacesDefinitionId).map((l) => [`${l.kind}:${l.replacesDefinitionId}`, l]),
-  );
+  const replacements = everyLine.filter((l) => l.replacesDefinitionId);
   for (const s of suppressed) {
-    const key = `${s.kind}:${s.definitionId}`;
-    const replacement = replacementOf.get(key);
+    const replacement = replacements.find((l) => l.kind === s.kind && l.markLayer === wireLayer(s.byLayer)
+      && (Number(l.replacesDefinitionId) === Number(s.definitionId) || (l.lineKey && l.lineKey === s.lineKey)));
     if (replacement) {
-      replacement.was = `The role says: ${s.name}`;
+      const above = s.origin === 'POSITION' ? 'The position says' : 'The role says';
+      replacement.was = `${above}: ${s.name}`;
       replacement.roleWording = s.name;
       replacement.overrideIds.push(Number(s.byOverrideId));
+      replacement.folded = true;
       continue;
     }
     const line = offLine(s);
-    const parent = kraByDefinition.get(parents.get(key));
+    const parent = kraByDefinition.get(Number(s.parentKraDefinitionId));
     line.parentKraDefinitionId = parent ? parent.definitionId : null;
     const into = s.kind === 'KPI' ? 'kpis' : 'responsibilities';
     (parent ?? ungrouped)[into].push(line);
   }
-  // A replacement whose role line is no longer suppressed is simply the seat's own line.
+  // A replacement whose replaced line is no longer switched off is simply the layer's own line.
   for (const l of everyLine) {
-    if (l.replacesDefinitionId && !l.was) { l.mark = 'ADDED'; l.replacesDefinitionId = null; }
+    if (l.replacesDefinitionId && !l.folded) { l.mark = 'ADDED'; l.replacesDefinitionId = null; }
+    delete l.folded;
   }
 
   const all = [
     ...kras.flatMap((k) => [...k.responsibilities, ...k.kpis]),
     ...ungrouped.responsibilities, ...ungrouped.kpis,
   ];
-  const live = all.filter((l) => l.mark !== 'OFF');
+  const shown = all.filter((l) => l.mark !== 'OFF');
+  const overlayRows = [
+    ...(layers.includes('POSITION') ? (resolved.overlay?.position ?? []).map((o) => ['POSITION', o]) : []),
+    ...(layers.includes('ASSIGNMENT') ? (resolved.overlay?.assignment ?? []).map((o) => ['ASSIGNMENT', o]) : []),
+  ];
 
   return {
     asOf: resolved.asOf,
-    subject,                                  // 'ROLE' | 'SEAT'
+    subject,                                  // 'ROLE' | 'SEAT' | 'PERSON'
     roleId: resolved.target.roleId,
     roleTitle: resolved.target.roleTitle,
     positionId: resolved.target.positionId,
@@ -270,58 +296,117 @@ async function shape(db, companyId, resolved, subject, extra = {}) {
     ungrouped,
     counts: {
       kras: kras.length,
-      responsibilities: live.filter((l) => l.kind === 'RESPONSIBILITY').length,
-      kpis: live.filter((l) => l.kind === 'KPI').length,
+      responsibilities: shown.filter((l) => l.kind === 'RESPONSIBILITY').length,
+      kpis: shown.filter((l) => l.kind === 'KPI').length,
       ungrouped: ungrouped.responsibilities.length + ungrouped.kpis.length,
       added: all.filter((l) => l.mark === 'ADDED').length,
       changed: all.filter((l) => l.mark === 'CHANGED').length,
       off: all.filter((l) => l.mark === 'OFF').length,
     },
     /**
-     * Seat rows that touch a KRA. The rule is that KRAs are fixed at the role, so
-     * the screens offer no way to write one — but a row written before the rule
-     * (or through the raw override endpoint) still resolves, and hiding it would
-     * make the seat's KRAs differ from its role's for no visible reason.
+     * Rows that touch a KRA. The rule is that KRAs are fixed at the role, so the
+     * screens offer no way to write one — but a row written before the rule (or
+     * through the raw override endpoint) still resolves, and hiding it would
+     * make the KRAs differ from the role's for no visible reason.
      */
-    kraExceptions: (resolved.overlay?.position ?? [])
-      .filter((o) => o.contentType === 'KRA')
-      .map((o) => ({ overrideId: o.id, action: o.action, name: o.definitionName ?? null, reason: o.reason ?? null })),
-    /** Seat rows that changed nothing, each with the reason — never silent. */
+    kraExceptions: overlayRows
+      .filter(([, o]) => o.contentType === 'KRA' && live(o))
+      .map(([layer, o]) => ({ overrideId: o.id, layer: wireLayer(layer), action: o.action, name: o.definitionName ?? null, reason: o.reason ?? null })),
+    /** Rows that changed nothing, each with the reason — never silent. */
     ignored: (resolved.overlay?.ignored ?? [])
-      .filter((i) => i.layer === 'POSITION')
-      .map((i) => ({ overrideId: i.overrideId, name: i.name ?? null, why: i.why })),
+      .filter((i) => layers.includes(i.layer))
+      .map((i) => ({ overrideId: i.overrideId, layer: wireLayer(i.layer), name: i.name ?? null, why: i.why })),
   };
 }
 
-/** A ROLE's job content: what every seat holding it starts from. */
+/** A ROLE's job content: what every position holding it starts from. */
 export async function roleJobContent(db, companyId, roleId, { on } = {}) {
   const resolved = await resolveContent(db, companyId, { roleId, on });
-  return shape(db, companyId, resolved, 'ROLE');
+  return shape(resolved, 'ROLE');
 }
 
-/** A SEAT's job content: its role's, with this seat's own changes applied and marked. */
+/** A POSITION's job content: its role's, with this position's own changes applied and marked. */
 export async function positionJobContent(db, companyId, positionId, { on } = {}) {
   const position = await requirePosition(db, companyId, positionId);
   const resolved = await resolveContent(db, companyId, { roleId: position.role_id, positionId, on });
-  // How many OTHER seats hold the same role — so "for this seat only" has a number beside it.
+  // How many OTHER positions hold the same role — so "for this position only" has a number beside it.
   const [[others]] = await db.query(
     `SELECT COUNT(*) AS n FROM hrms_positions
       WHERE company_id = ? AND role_id = ? AND id <> ? AND deleted_at IS NULL AND status <> 'CLOSED'`,
     [companyId, position.role_id, positionId],
   );
-  return shape(db, companyId, resolved, 'SEAT', {
+  return shape(resolved, 'SEAT', {
     positionTitle: position.position_title ?? resolved.target.roleTitle ?? null,
     positionCode: position.position_code ?? null,
     otherSeatsOnRole: Number(others.n ?? 0),
   });
 }
 
+/* ── the person ─────────────────────────────────────────────────────────── */
+
+async function requireEmployee(db, companyId, employeeId) {
+  const [[e]] = await db.query(
+    'SELECT id, employee_code, full_name, employment_status FROM hrms_employees WHERE company_id = ? AND id = ? AND deleted_at IS NULL',
+    [companyId, employeeId],
+  );
+  if (!e) throw notFound('Employee');
+  return e;
+}
+
+/** The assignment through which a person holds a position on a day (primary first), or null. */
+export async function seatHeldOn(db, companyId, employeeId, on) {
+  const [[a]] = await db.query(
+    `SELECT wa.id, wa.position_id, wa.role_id, wa.effective_from, wa.effective_to,
+            p.position_code, COALESCE(p.position_title, r.title) AS position_title, p.role_id AS position_role_id
+       FROM hrms_work_assignments wa
+       JOIN hrms_positions p ON p.company_id = wa.company_id AND p.id = wa.position_id
+       LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+      WHERE wa.company_id = ? AND wa.employee_id = ? AND ${HOLDS_SEAT_SQL('wa')}
+        AND (wa.effective_from IS NULL OR wa.effective_from <= ?) AND (wa.effective_to IS NULL OR wa.effective_to >= ?)
+      ORDER BY wa.is_primary DESC, wa.effective_from DESC, wa.id DESC
+      LIMIT 1`,
+    [companyId, employeeId, on, on],
+  );
+  return a ?? null;
+}
+
+/**
+ * A PERSON's job content (spec §16.2): their position's — role, then the
+ * position's changes — and then their own, each marked with its layer. A person
+ * in no position on that day has no job content; the answer says so.
+ */
+export async function employeeJobContent(db, companyId, employeeId, { on } = {}) {
+  const date = dateText(on) || today();
+  const e = await requireEmployee(db, companyId, employeeId);
+  const person = { employeeId: e.id, employeeName: e.full_name, employeeCode: e.employee_code ?? null };
+  const a = await seatHeldOn(db, companyId, employeeId, date);
+  if (!a) {
+    return {
+      asOf: date, subject: 'PERSON', roleId: null, roleTitle: null, positionId: null, ...person,
+      workAssignmentId: null, positionTitle: null, positionCode: null, notInPosition: true,
+      kras: [], ungrouped: { responsibilities: [], kpis: [] },
+      counts: { kras: 0, responsibilities: 0, kpis: 0, ungrouped: 0, added: 0, changed: 0, off: 0 },
+      kraExceptions: [], ignored: [],
+    };
+  }
+  const resolved = await resolveContent(db, companyId, { workAssignmentId: a.id, on: date });
+  return shape(resolved, 'PERSON', {
+    ...person,
+    workAssignmentId: a.id,
+    positionTitle: a.position_title ?? null,
+    positionCode: a.position_code ?? null,
+    notInPosition: false,
+  });
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
- * Seat edits — Add, Change, Switch off, Undo
+ * Edits at a layer — Add, Change, Switch off, Undo
  * ══════════════════════════════════════════════════════════════════════════
- * Each one is a handful of override rows written in the caller's transaction,
- * and each answers with the seat's job content AFTER the edit, so the screen
- * needs no second request to show what it did.
+ * One implementation for both layers; `t` says which:
+ *   { layer: 'POSITION', ownerId: positionId, positionId }
+ *   { layer: 'ASSIGNMENT', ownerId: workAssignmentId, positionId, workAssignmentId, employeeId }
+ * Each writes in the caller's transaction and answers with the job content AFTER
+ * the edit (as on today), so the screen needs no second request.
  */
 
 function readKind(value) {
@@ -352,58 +437,17 @@ function readTarget(target, measurementType, problems) {
   return { targetOperator: operator ?? 'INFO', targetValue: stored == null ? null : JSON.parse(stored) };
 }
 
-async function liveOverrides(db, companyId, positionId) {
-  const [rows] = await db.query(
-    `SELECT id, content_type, action, responsibility_definition_id, kpi_definition_id, parent_kra_definition_id, override_json, reason
-       FROM hrms_position_content_overrides
-      WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL`,
-    [companyId, positionId],
-  );
-  return rows.map((r) => ({
-    ...r,
-    json: r.override_json == null ? null : (typeof r.override_json === 'string' ? JSON.parse(r.override_json) : r.override_json),
-  }));
-}
+const resolveFor = (db, companyId, t, on) => (t.layer === 'ASSIGNMENT'
+  ? resolveContent(db, companyId, { workAssignmentId: t.workAssignmentId, on })
+  : resolveContent(db, companyId, { roleId: t.roleId, positionId: t.positionId, on }));
 
-async function dropOverrides(db, c, rows) {
-  if (!rows.length) return;
-  await db.query(
-    `UPDATE hrms_position_content_overrides SET deleted_at = NOW()
-      WHERE company_id = ? AND id IN (${rows.map(() => '?').join(',')}) AND deleted_at IS NULL`,
-    [c.companyId, ...rows.map((r) => r.id)],
-  );
-  for (const r of rows) {
-    await audit(db, c, 'hrms_position_content_overrides', r.id, 'DELETE',
-      { action: r.action, contentType: r.content_type, definitionId: r.responsibility_definition_id ?? r.kpi_definition_id }, null);
-  }
-}
+const readAfter = (db, companyId, t) => (t.layer === 'ASSIGNMENT'
+  ? employeeJobContent(db, companyId, t.employeeId)
+  : positionJobContent(db, companyId, t.positionId));
 
-async function writeOverride(db, c, positionId, body) {
-  const { id } = await addPositionOverride(db, c, positionId, body);
-  await audit(db, c, 'hrms_position_content_overrides', id, 'CREATE', null, { positionId, ...body });
-  return id;
-}
-
-/**
- * Retires a definition that was written for one seat and is now used by nothing.
- * Never touches a definition any role assigns or any other overlay names.
- */
-async function retireIfUnused(db, c, kind, definitionId) {
-  const col = DEF_COLUMN[kind];
-  const [[use]] = await db.query(
-    `SELECT (SELECT COUNT(*) FROM ${ROLE_TABLE[kind]} a WHERE a.company_id = ? AND a.${col} = ? AND a.deleted_at IS NULL)
-          + (SELECT COUNT(*) FROM hrms_position_content_overrides o WHERE o.company_id = ? AND o.${col} = ? AND o.deleted_at IS NULL)
-          + (SELECT COUNT(*) FROM hrms_work_assignment_content_overrides o WHERE o.company_id = ? AND o.${col} = ? AND o.deleted_at IS NULL) AS n`,
-    [c.companyId, definitionId, c.companyId, definitionId, c.companyId, definitionId],
-  );
-  if (Number(use.n) > 0) return;
-  await db.query(`UPDATE ${DEF_TABLE[kind]} SET deleted_at = NOW() WHERE company_id = ? AND id = ? AND deleted_at IS NULL`, [c.companyId, definitionId]);
-  await audit(db, c, DEF_TABLE[kind], definitionId, 'DELETE', { retired: 'written for one seat, no longer used' }, null);
-}
-
-/** Every line the seat currently resolves to, flat, with the role's KRAs. */
-async function currentLines(db, companyId, position) {
-  const resolved = await resolveContent(db, companyId, { roleId: position.role_id, positionId: position.id });
+/** Every line the job resolves to on `on`, flat, with the role's KRAs. */
+async function currentLines(db, companyId, t, on) {
+  const resolved = await resolveFor(db, companyId, t, on);
   const lines = [
     ...resolved.kras.flatMap((k) => [...k.responsibilities, ...k.kpis]),
     ...resolved.additional.responsibilities, ...resolved.additional.kpis,
@@ -411,7 +455,67 @@ async function currentLines(db, companyId, position) {
   return { resolved, lines };
 }
 
-async function writeSeatDefinition(db, c, kind, text, like = null) {
+/** This layer's rows that have not ended before `on` (a row dated ahead included). */
+async function openRows(db, companyId, t, on) {
+  const L = LAYER[t.layer];
+  const [rows] = await db.query(
+    `SELECT id, content_type, action, responsibility_definition_id, kpi_definition_id, parent_kra_definition_id,
+            override_json, reason, effective_from, effective_to, line_key
+       FROM ${L.table}
+      WHERE company_id = ? AND ${L.owner} = ? AND deleted_at IS NULL AND (effective_to IS NULL OR effective_to >= ?)`,
+    [companyId, t.ownerId, on],
+  );
+  return rows
+    .map((r) => ({
+      ...r,
+      from: dateText(r.effective_from),
+      json: r.override_json == null ? null : (typeof r.override_json === 'string' ? JSON.parse(r.override_json) : r.override_json),
+    }))
+    .filter((r) => !isVoid(r));
+}
+
+/**
+ * This layer's rows on one line: by definition — and, for a line this layer did
+ * not write, by the line's identity too (an OVERRIDE or SUPPRESS written before
+ * the role reworded the line still belongs to it).
+ */
+const rowsOfLine = (rows, line, layer) => rows.filter((o) => o.content_type === line.kind && (
+  Number(o[DEF_COLUMN[line.kind]]) === Number(line.definitionId)
+  || (line.origin !== layer && o.action !== 'ADD' && line.lineKey && o.line_key === line.lineKey)));
+
+/** A row of this line that began after `on` and has ALREADY begun is history: refused. */
+function refuseRewrite(rows, on) {
+  const now = today();
+  const begun = rows.find((r) => r.from && r.from > on && r.from <= now);
+  if (begun) {
+    throw conflict('LATER_CHANGE', `This line changed again on ${longDay(begun.from)}. A change dated before that would rewrite what came after it — date it ${longDay(begun.from)} or later.`);
+  }
+}
+
+/** Ends rows the day before `on` (a row dated on or after `on` is cancelled: its window empties). */
+async function closeRows(db, c, t, rows, on) {
+  if (!rows.length) return;
+  const L = LAYER[t.layer];
+  const end = dayBefore(on);
+  await db.query(
+    `UPDATE ${L.table} SET effective_to = ?, ended_by = ? WHERE company_id = ? AND id IN (${rows.map(() => '?').join(',')})`,
+    [end, c.userId, c.companyId, ...rows.map((r) => r.id)],
+  );
+  for (const r of rows) {
+    await audit(db, c, L.table, r.id, 'UPDATE',
+      { action: r.action, contentType: r.content_type, definitionId: r.responsibility_definition_id ?? r.kpi_definition_id, effectiveFrom: r.from },
+      { endedOn: end, cancelled: Boolean(r.from && r.from >= on) });
+  }
+}
+
+async function writeOverride(db, c, t, body, on) {
+  const L = LAYER[t.layer];
+  const { id } = await L.add(db, c, t.ownerId, { ...body, effectiveFrom: on });
+  await audit(db, c, L.table, id, 'CREATE', null, { [L.owner]: t.ownerId, ...body, takesEffect: on });
+  return id;
+}
+
+async function writeOwnDefinition(db, c, kind, text, like = null) {
   const body = kind === 'KPI'
     ? {
       name: nameFor(text),
@@ -426,51 +530,48 @@ async function writeSeatDefinition(db, c, kind, text, like = null) {
   return createMasterItem(db, c, MASTER_KIND[kind], body);
 }
 
-/**
- * ADD — a responsibility or a KPI for this seat only, under one of the role's
- * KRAs (or under none).
- */
-export async function seatAddLine(db, c, positionId, body = {}) {
-  const position = await requirePosition(db, c.companyId, positionId);
+const ownWord = (t) => (t.layer === 'ASSIGNMENT' ? 'This person' : 'This position');
+
+/** ADD — a responsibility or a KPI for this position (or person) only, under one of the role's KRAs or none. */
+async function layerAddLine(db, c, t, body = {}) {
   const kind = readKind(body.kind);
+  const when = readTakesEffect(body, c);
   const problems = [];
   const text = readText(body.text, kind === 'KPI' ? 'The KPI' : 'The responsibility', problems);
   const reason = readText(body.reason, 'Reason', problems, { required: false, max: 2000 });
   const target = kind === 'KPI' ? readTarget(body.target, 'TEXT', problems) : null;
   assertNoProblems(problems);
 
-  const { resolved, lines } = await currentLines(db, c.companyId, position);
+  const { resolved, lines } = await currentLines(db, c.companyId, t, when.on);
   if (lines.some((l) => l.kind === kind && same(wordingOf(l.name, l.description), text))) {
-    throw conflict('ALREADY_THERE', `This seat already has that ${NOUN[kind]}.`);
+    throw conflict('ALREADY_THERE', `${ownWord(t)} already has that ${NOUN[kind]}.`);
   }
   const parent = body.parentKraDefinitionId == null || body.parentKraDefinitionId === '' ? null : Number(body.parentKraDefinitionId);
   if (parent != null && !resolved.kras.some((k) => Number(k.definitionId) === parent)) {
-    throw invalid('BAD_REFERENCE', 'Pick one of the KRAs of this seat\'s role. A seat cannot have a KRA its role does not have.');
+    throw invalid('BAD_REFERENCE', 'Pick one of the KRAs of the role. A position or a person cannot have a KRA its role does not have.');
   }
 
-  const definition = await writeSeatDefinition(db, c, kind, text);
-  await writeOverride(db, c, positionId, {
+  const definition = await writeOwnDefinition(db, c, kind, text);
+  await writeOverride(db, c, t, {
     contentType: kind,
     action: 'ADD',
     [DEF_FIELD[kind]]: definition.id,
     parentKraDefinitionId: parent,
     overrideJson: { seatAuthored: true, ...(target ?? {}) },
     reason,
-  });
-  return positionJobContent(db, c.companyId, positionId);
+    lineKey: newLineKey(),
+  }, when.on);
+  return readAfter(db, c.companyId, t);
 }
 
-/**
- * CHANGE — the wording of a line, or a KPI's target, for this seat only.
- * See the header for why a wording change is a SUPPRESS plus an ADD.
- */
-export async function seatChangeLine(db, c, positionId, body = {}) {
-  const position = await requirePosition(db, c.companyId, positionId);
+/** CHANGE — the wording of a line, or a KPI's target, for this position (or person) only. */
+async function layerChangeLine(db, c, t, body = {}) {
   const kind = readKind(body.kind);
   const definitionId = Number(body.definitionId);
-  const { resolved, lines } = await currentLines(db, c.companyId, position);
+  const when = readTakesEffect(body, c);
+  const { resolved, lines } = await currentLines(db, c.companyId, t, when.on);
   const line = lines.find((l) => l.kind === kind && Number(l.definitionId) === definitionId);
-  if (!line) throw notFound(`That ${NOUN[kind]} on this seat`);
+  if (!line) throw notFound(`That ${NOUN[kind]} on ${longDay(when.on)}`);
 
   const problems = [];
   const text = body.text === undefined ? null : readText(body.text, 'The wording', problems);
@@ -481,130 +582,174 @@ export async function seatChangeLine(db, c, positionId, body = {}) {
   const rewording = text != null && !same(text, wordingOf(line.name, line.description));
   if (!rewording && !target) throw invalid('NOTHING_TO_CHANGE', 'Nothing was changed.');
   if (rewording && lines.some((l) => l !== line && l.kind === kind && same(wordingOf(l.name, l.description), text))) {
-    throw conflict('ALREADY_THERE', `This seat already has a ${NOUN[kind]} with that wording.`);
+    throw conflict('ALREADY_THERE', `${ownWord(t)} already has a ${NOUN[kind]} with that wording.`);
   }
 
-  const col = DEF_COLUMN[kind];
-  const overrides = await liveOverrides(db, c.companyId, positionId);
-  const mine = overrides.filter((o) => o.content_type === kind && Number(o[col]) === definitionId);
-  const seatOwned = line.origin !== 'ROLE';
+  const rows = await openRows(db, c.companyId, t, when.on);
+  const mine = rowsOfLine(rows, line, t.layer);
+  refuseRewrite(mine, when.on);
+  const owned = line.origin === t.layer;
+  const lineKey = line.lineKey ?? null;
 
   if (!rewording) {
-    // Target only. One row says it: replace whichever row said it before.
-    if (seatOwned) {
+    // Target only. One row says it from that day: the row(s) that said it before end the day before.
+    if (owned) {
       const add = mine.find((o) => o.action === 'ADD');
-      await dropOverrides(db, c, mine.filter((o) => o.action === 'ADD'));
-      await writeOverride(db, c, positionId, {
+      await closeRows(db, c, t, mine.filter((o) => o.action === 'ADD'), when.on);
+      await writeOverride(db, c, t, {
         contentType: kind, action: 'ADD', [DEF_FIELD[kind]]: definitionId,
         parentKraDefinitionId: add?.parent_kra_definition_id ?? line.parentKraDefinitionId ?? null,
         overrideJson: { ...(add?.json ?? {}), ...target },
         reason: reason ?? add?.reason ?? null,
-      });
+        lineKey: add?.line_key ?? lineKey ?? newLineKey(),
+      }, when.on);
     } else {
       const earlier = mine.filter((o) => o.action === 'OVERRIDE');
       // Keep anything else an earlier override said (a weight, a frequency).
       const carried = Object.assign({}, ...earlier.map((o) => o.json ?? {}));
-      await dropOverrides(db, c, earlier);
-      await writeOverride(db, c, positionId, {
+      await closeRows(db, c, t, earlier, when.on);
+      await writeOverride(db, c, t, {
         contentType: kind, action: 'OVERRIDE', [DEF_FIELD[kind]]: definitionId,
         overrideJson: { ...carried, ...target },
         reason,
-      });
+        lineKey: lineKey ?? newLineKey(),
+      }, when.on);
     }
-    return positionJobContent(db, c.companyId, positionId);
+    return readAfter(db, c.companyId, t);
   }
 
-  // Wording. The seat gets a line of its own; the role's line is switched off.
-  const definition = await writeSeatDefinition(db, c, kind, text, line);
+  // Wording. This layer gets a line of its own; the inherited line is switched off — the same line, reworded.
+  const definition = await writeOwnDefinition(db, c, kind, text, line);
   const carriedTarget = kind === 'KPI'
     ? (target ?? { targetOperator: line.targetOperator ?? 'INFO', targetValue: line.targetValue ?? null })
     : {};
-  if (seatOwned) {
+  if (owned) {
     const add = mine.find((o) => o.action === 'ADD');
-    await dropOverrides(db, c, mine);
-    await writeOverride(db, c, positionId, {
+    await closeRows(db, c, t, mine, when.on);
+    await writeOverride(db, c, t, {
       contentType: kind, action: 'ADD', [DEF_FIELD[kind]]: definition.id,
       parentKraDefinitionId: add?.parent_kra_definition_id ?? line.parentKraDefinitionId ?? null,
       overrideJson: { ...(add?.json ?? {}), seatAuthored: true, ...carriedTarget },
       reason: reason ?? add?.reason ?? null,
-    });
-    if (add?.json?.seatAuthored) await retireIfUnused(db, c, kind, definitionId);
+      lineKey: add?.line_key ?? lineKey ?? newLineKey(),
+    }, when.on);
   } else {
-    await dropOverrides(db, c, mine);
-    await writeOverride(db, c, positionId, { contentType: kind, action: 'SUPPRESS', [DEF_FIELD[kind]]: definitionId, reason });
+    await closeRows(db, c, t, mine, when.on);
+    await writeOverride(db, c, t, { contentType: kind, action: 'SUPPRESS', [DEF_FIELD[kind]]: definitionId, reason, lineKey }, when.on);
     const parentStillThere = line.parentKraDefinitionId != null
       && resolved.kras.some((k) => Number(k.definitionId) === Number(line.parentKraDefinitionId));
-    await writeOverride(db, c, positionId, {
+    await writeOverride(db, c, t, {
       contentType: kind, action: 'ADD', [DEF_FIELD[kind]]: definition.id,
       parentKraDefinitionId: parentStillThere ? line.parentKraDefinitionId : null,
       overrideJson: { seatAuthored: true, replacesDefinitionId: definitionId, sequence: line.sequence, ...carriedTarget },
       reason,
-    });
+      lineKey: lineKey ?? newLineKey(),
+    }, when.on);
   }
-  return positionJobContent(db, c.companyId, positionId);
+  return readAfter(db, c.companyId, t);
 }
 
-/** SWITCH OFF — a line of the role that does not apply to this seat. */
-export async function seatSwitchOffLine(db, c, positionId, body = {}) {
-  const position = await requirePosition(db, c.companyId, positionId);
+/** SWITCH OFF — a line that does not apply to this position (or person) from that day. */
+async function layerSwitchOffLine(db, c, t, body = {}) {
   const kind = readKind(body.kind);
   const definitionId = Number(body.definitionId);
+  const when = readTakesEffect(body, c);
   const problems = [];
   const reason = readText(body.reason, 'Reason', problems, { required: false, max: 2000 });
   assertNoProblems(problems);
 
-  const { lines } = await currentLines(db, c.companyId, position);
+  const { lines } = await currentLines(db, c.companyId, t, when.on);
   const line = lines.find((l) => l.kind === kind && Number(l.definitionId) === definitionId);
-  if (!line) throw notFound(`That ${NOUN[kind]} on this seat`);
+  if (!line) throw notFound(`That ${NOUN[kind]} on ${longDay(when.on)}`);
 
-  const col = DEF_COLUMN[kind];
-  const overrides = await liveOverrides(db, c.companyId, positionId);
-  const mine = overrides.filter((o) => o.content_type === kind && Number(o[col]) === definitionId);
+  const rows = await openRows(db, c.companyId, t, when.on);
+  const mine = rowsOfLine(rows, line, t.layer);
+  refuseRewrite(mine, when.on);
 
-  if (line.origin !== 'ROLE') {
-    // The seat's own line. Switching it off is removing it; if it replaced a role
-    // line, that role line stays switched off — which is what was asked for.
-    const add = mine.find((o) => o.action === 'ADD');
-    await dropOverrides(db, c, mine);
-    if (add?.json?.seatAuthored) await retireIfUnused(db, c, kind, definitionId);
+  if (line.origin === t.layer) {
+    // This layer's own line. Switching it off is ending it; if it replaced an
+    // inherited line, that line stays switched off — which is what was asked for.
+    await closeRows(db, c, t, mine, when.on);
   } else {
-    await dropOverrides(db, c, mine);
-    await writeOverride(db, c, positionId, { contentType: kind, action: 'SUPPRESS', [DEF_FIELD[kind]]: definitionId, reason });
+    await closeRows(db, c, t, mine, when.on);
+    await writeOverride(db, c, t, {
+      contentType: kind, action: 'SUPPRESS', [DEF_FIELD[kind]]: definitionId, reason, lineKey: line.lineKey ?? null,
+    }, when.on);
   }
-  return positionJobContent(db, c.companyId, positionId);
+  return readAfter(db, c.companyId, t);
 }
 
 /**
- * UNDO — put one line back to what the role says. Removes every row this seat
- * holds on it; for a wording change that is the seat's line AND the switch-off
- * of the role's line, together.
+ * UNDO — put one line back to what the layer above says, from that day. Ends
+ * every row this layer holds on it; for a wording change that is the layer's
+ * line AND the switch-off of the line it replaced, together.
  */
-export async function seatUndoLine(db, c, positionId, body = {}) {
-  await requirePosition(db, c.companyId, positionId);
+async function layerUndoLine(db, c, t, body = {}) {
   const kind = readKind(body.kind);
   const definitionId = Number(body.definitionId);
-  const col = DEF_COLUMN[kind];
+  const when = readTakesEffect(body, c);
+  const { resolved, lines } = await currentLines(db, c.companyId, t, when.on);
+  const shown = lines.find((l) => l.kind === kind && Number(l.definitionId) === definitionId);
+  const off = (resolved.suppressed ?? []).find((s) => s.kind === kind && Number(s.definitionId) === definitionId && s.byLayer === t.layer);
+  const line = shown ?? (off ? { kind, definitionId, lineKey: off.lineKey ?? null, origin: off.origin } : { kind, definitionId, lineKey: null, origin: 'ROLE' });
 
-  const overrides = await liveOverrides(db, c.companyId, positionId);
-  const mine = overrides.filter((o) => o.content_type === kind && Number(o[col]) === definitionId);
-  if (!mine.length) throw invalid('NOTHING_TO_UNDO', 'This seat has not changed that line — it already reads as the role says.');
+  const rows = await openRows(db, c.companyId, t, when.on);
+  const mine = rowsOfLine(rows, line, t.layer);
+  const nothing = t.layer === 'ASSIGNMENT'
+    ? 'This person has not changed that line — it already reads as their position says.'
+    : 'This position has not changed that line — it already reads as the role says.';
+  if (!mine.length) throw invalid('NOTHING_TO_UNDO', nothing);
 
-  const replaced = mine.filter((o) => o.action === 'ADD' && o.json?.replacesDefinitionId).map((o) => Number(o.json.replacesDefinitionId));
-  const paired = overrides.filter((o) => o.content_type === kind && o.action === 'SUPPRESS' && replaced.includes(Number(o[col])));
-  await dropOverrides(db, c, [...mine, ...paired]);
-  if (mine.some((o) => o.action === 'ADD' && o.json?.seatAuthored)) await retireIfUnused(db, c, kind, definitionId);
-  return positionJobContent(db, c.companyId, positionId);
+  const replaced = mine.filter((o) => o.action === 'ADD' && o.json?.replacesDefinitionId);
+  const paired = rows.filter((o) => o.content_type === kind && o.action === 'SUPPRESS' && !mine.includes(o)
+    && replaced.some((a) => Number(o[DEF_COLUMN[kind]]) === Number(a.json.replacesDefinitionId) || (a.line_key && o.line_key === a.line_key)));
+  refuseRewrite([...mine, ...paired], when.on);
+  await closeRows(db, c, t, [...mine, ...paired], when.on);
+  return readAfter(db, c.companyId, t);
 }
 
+/* ── the position's door ── */
+
+async function positionTarget(db, companyId, positionId) {
+  const position = await requirePosition(db, companyId, positionId);
+  return { layer: 'POSITION', ownerId: Number(positionId), positionId: Number(positionId), roleId: position.role_id };
+}
+export async function seatAddLine(db, c, positionId, body = {}) { return layerAddLine(db, c, await positionTarget(db, c.companyId, positionId), body); }
+export async function seatChangeLine(db, c, positionId, body = {}) { return layerChangeLine(db, c, await positionTarget(db, c.companyId, positionId), body); }
+export async function seatSwitchOffLine(db, c, positionId, body = {}) { return layerSwitchOffLine(db, c, await positionTarget(db, c.companyId, positionId), body); }
+export async function seatUndoLine(db, c, positionId, body = {}) { return layerUndoLine(db, c, await positionTarget(db, c.companyId, positionId), body); }
+
+/* ── the person's door ── */
+
+/**
+ * The person's changes are written against the assignment through which they
+ * hold a position ON THE DAY THE CHANGE TAKES EFFECT. A person in no position
+ * then has nothing to change (409 NO_POSITION).
+ */
+export async function personTarget(db, c, employeeId, body = {}) {
+  await requireEmployee(db, c.companyId, employeeId);
+  const when = readTakesEffect(body, c);
+  const a = await seatHeldOn(db, c.companyId, employeeId, when.on);
+  if (!a) throw conflict('NO_POSITION', `This person is not in a position on ${longDay(when.on)}, so there is no job of theirs to change.`);
+  return {
+    layer: 'ASSIGNMENT', ownerId: a.id, workAssignmentId: a.id, positionId: a.position_id, roleId: a.role_id, employeeId: Number(employeeId),
+  };
+}
+export async function personAddLine(db, c, employeeId, body = {}) { return layerAddLine(db, c, await personTarget(db, c, employeeId, body), body); }
+export async function personChangeLine(db, c, employeeId, body = {}) { return layerChangeLine(db, c, await personTarget(db, c, employeeId, body), body); }
+export async function personSwitchOffLine(db, c, employeeId, body = {}) { return layerSwitchOffLine(db, c, await personTarget(db, c, employeeId, body), body); }
+export async function personUndoLine(db, c, employeeId, body = {}) { return layerUndoLine(db, c, await personTarget(db, c, employeeId, body), body); }
+
 /* ══════════════════════════════════════════════════════════════════════════
- * Role edits — the KRAs themselves
+ * Role edits — the KRAs themselves, and a role line's wording
  * ══════════════════════════════════════════════════════════════════════════
  * A KRA is written freely per role, but `hrms_kra_definitions.name` is unique
  * per company (the master is a shared vocabulary). So:
  *   create  reuses the definition of that name when one exists, else writes one;
- *   rename  edits the definition in place when only this role uses it, and gives
- *           this role its OWN definition when another role shares it — a rename
- *           on one role must never rename another role's KRA.
+ *   rename  points THIS role's KRA line at the definition of the new name (one
+ *           that exists, or a new one) FROM A DATE: the old version is closed,
+ *           the new one opens — the old name is still what the role said before
+ *           that day, and no other role's KRA is touched (spec §16.1).
  */
 
 async function requireRoleKra(db, companyId, id) {
@@ -612,8 +757,8 @@ async function requireRoleKra(db, companyId, id) {
     `SELECT a.id, a.role_id, a.kra_definition_id, d.name, d.description
        FROM hrms_role_kra_assignments a
        JOIN hrms_kra_definitions d ON d.company_id = a.company_id AND d.id = a.kra_definition_id
-      WHERE a.company_id = ? AND a.id = ? AND a.deleted_at IS NULL`,
-    [companyId, id],
+      WHERE a.company_id = ? AND a.id = ? AND (a.deleted_at IS NULL OR (a.effective_to IS NOT NULL AND a.effective_to >= ?))`,
+    [companyId, id, today()],
   );
   if (!row) throw notFound('KRA');
   return row;
@@ -636,7 +781,7 @@ async function roleHasKra(db, companyId, roleId, definitionId, exceptId = null) 
   return !!row;
 }
 
-/** Create a KRA on a role by writing it: `{ name, description? }`. */
+/** Create a KRA on a role by writing it: `{ name, description?, takesEffect?, reason? }`. */
 export async function createRoleKra(db, c, roleId, body = {}) {
   await requireRole(db, c.companyId, roleId);
   const problems = [];
@@ -653,10 +798,10 @@ export async function createRoleKra(db, c, roleId, body = {}) {
   } else if (definition.status === 'INACTIVE') {
     throw conflict('INACTIVE', `A KRA named "${definition.name}" exists but is inactive. Reactivate it in the KRA list, or use another name.`);
   }
-  return addContent(db, c, roleId, 'kras', { kraDefinitionId: definition.id });
+  return addContent(db, c, roleId, 'kras', { kraDefinitionId: definition.id, takesEffect: body.takesEffect, reason: body.reason });
 }
 
-/** How many OTHER roles (and seats outside this role) lean on a KRA definition. */
+/** How many OTHER roles lean on a KRA definition. */
 async function kraSharedBy(db, companyId, definitionId, roleId) {
   const [[row]] = await db.query(
     `SELECT (SELECT COUNT(*) FROM hrms_role_kra_assignments a
@@ -666,7 +811,12 @@ async function kraSharedBy(db, companyId, definitionId, roleId) {
   return Number(row.roles ?? 0);
 }
 
-/** Rename a role's KRA, and/or rewrite its description. */
+/**
+ * Rename a role's KRA from a day (`takesEffect`, default today), and/or rewrite
+ * its description. The description belongs to the KRA list (the shared
+ * vocabulary) and is edited there in place; the NAME is what the role carries,
+ * and a new name is a new version of the role's KRA line.
+ */
 export async function renameRoleKra(db, c, id, body = {}) {
   const kra = await requireRoleKra(db, c.companyId, id);
   const problems = [];
@@ -675,84 +825,43 @@ export async function renameRoleKra(db, c, id, body = {}) {
     ? kra.description
     : readText(body.description, 'Description', problems, { required: false, max: 4000 });
   assertNoProblems(problems);
+  const when = readTakesEffect(body, c);
 
   const shared = await kraSharedBy(db, c.companyId, kra.kra_definition_id, kra.role_id);
   const renamed = !same(name, kra.name);
-  const existing = renamed ? await kraDefinitionNamed(db, c.companyId, name) : null;
+  if (!renamed) {
+    if (!same(description, kra.description)) {
+      await db.query('UPDATE hrms_kra_definitions SET description = ? WHERE company_id = ? AND id = ?', [description, c.companyId, kra.kra_definition_id]);
+      await audit(db, c, 'hrms_kra_definitions', kra.kra_definition_id, 'UPDATE', { description: kra.description }, { description });
+    }
+    return { ok: true, id, definitionId: kra.kra_definition_id, forked: false, sharedWithRoles: shared };
+  }
+
+  const existing = await kraDefinitionNamed(db, c.companyId, name);
   if (existing && Number(existing.id) !== Number(kra.kra_definition_id)
       && await roleHasKra(db, c.companyId, kra.role_id, existing.id, id)) {
     throw conflict('ALREADY_THERE', `This role already has a KRA named "${existing.name}". Move the lines there instead.`);
   }
-
-  if (!renamed || (!shared && !existing)) {
-    // Only this role uses it (or only the description changed): edit it where it is.
-    await db.query('UPDATE hrms_kra_definitions SET name = ?, description = ? WHERE company_id = ? AND id = ?',
-      [name, description, c.companyId, kra.kra_definition_id]);
-    await audit(db, c, 'hrms_kra_definitions', kra.kra_definition_id, 'UPDATE',
-      { name: kra.name, description: kra.description }, { name, description });
-    return { ok: true, id, definitionId: kra.kra_definition_id, forked: false, sharedWithRoles: shared };
-  }
-
-  // Another role shares the definition, or the new name already exists: this
-  // role's row moves to the right definition and takes its seats' rows with it.
   const target = existing ?? await createMasterItem(db, c, 'kras', { name, description, status: 'ACTIVE' });
-  await db.query('UPDATE hrms_role_kra_assignments SET kra_definition_id = ? WHERE company_id = ? AND id = ?',
-    [target.id, c.companyId, id]);
-  for (const [table, owner, ownerTable] of [
-    ['hrms_position_content_overrides', 'position_id', 'hrms_positions'],
-    ['hrms_work_assignment_content_overrides', 'work_assignment_id', 'hrms_work_assignments'],
-  ]) {
-    for (const column of ['parent_kra_definition_id', 'kra_definition_id']) {
-      await db.query(
-        `UPDATE ${table} o JOIN ${ownerTable} t ON t.company_id = o.company_id AND t.id = o.${owner}
-            SET o.${column} = ?
-          WHERE o.company_id = ? AND t.role_id = ? AND o.${column} = ? AND o.deleted_at IS NULL`,
-        [target.id, c.companyId, kra.role_id, kra.kra_definition_id],
-      );
-    }
-  }
-  await audit(db, c, 'hrms_role_kra_assignments', id, 'UPDATE',
-    { kraDefinitionId: kra.kra_definition_id, name: kra.name }, { kraDefinitionId: target.id, name });
-  if (!shared) {
-    // Nothing else pointed at the old definition; do not leave it behind.
-    const [[left]] = await db.query(
-      `SELECT (SELECT COUNT(*) FROM hrms_role_kra_assignments a WHERE a.company_id = ? AND a.kra_definition_id = ? AND a.deleted_at IS NULL)
-            + (SELECT COUNT(*) FROM hrms_position_content_overrides o WHERE o.company_id = ? AND (o.kra_definition_id = ? OR o.parent_kra_definition_id = ?) AND o.deleted_at IS NULL)
-            + (SELECT COUNT(*) FROM hrms_work_assignment_content_overrides o WHERE o.company_id = ? AND (o.kra_definition_id = ? OR o.parent_kra_definition_id = ?) AND o.deleted_at IS NULL) AS n`,
-      [c.companyId, kra.kra_definition_id, c.companyId, kra.kra_definition_id, kra.kra_definition_id, c.companyId, kra.kra_definition_id, kra.kra_definition_id],
-    );
-    if (!Number(left.n)) {
-      await db.query('UPDATE hrms_kra_definitions SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, kra.kra_definition_id]);
-    }
-  }
-  return { ok: true, id, definitionId: target.id, forked: true, sharedWithRoles: shared };
+  const next = await changeRoleLine(db, c, 'kras', id, { kra_definition_id: target.id }, when);
+  return { ok: true, id: next.id, previousId: id, definitionId: target.id, forked: true, sharedWithRoles: shared, takesEffect: when.on };
 }
 
 /**
- * Delete a KRA from a role. ITS LINES ARE NOT DELETED: they are un-filed first
- * and stay on the role, ungrouped. They are un-filed explicitly rather than left
- * pointing at the ended row, so writing the same KRA again later starts empty
- * instead of silently swallowing them back.
+ * Delete a KRA from a role, from a day. ITS LINES ARE NOT DELETED: from that day
+ * they stay on the role, ungrouped (a new version of each), so writing the same
+ * KRA again later starts empty instead of silently swallowing them back.
  */
-export async function deleteRoleKra(db, c, id) {
+export async function deleteRoleKra(db, c, id, body = {}) {
   const kra = await requireRoleKra(db, c.companyId, id);
-  let ungrouped = 0;
-  for (const kind of ['responsibilities', 'kpis']) {
-    const [res] = await db.query(
-      `UPDATE ${CONTENT[kind].table} SET role_kra_assignment_id = NULL
-        WHERE company_id = ? AND role_id = ? AND role_kra_assignment_id = ? AND deleted_at IS NULL`,
-      [c.companyId, kra.role_id, id],
-    );
-    ungrouped += Number(res.affectedRows ?? 0);
-  }
-  await removeContent(db, c, 'kras', id);
-  return { ok: true, id, name: kra.name, ungrouped };
+  const when = readTakesEffect(body, c);
+  const out = await removeRoleLine(db, c, 'kras', id, when);
+  return { ok: true, id, name: kra.name, ungrouped: out.ungrouped ?? 0, endedOn: out.endedOn };
 }
 
 /**
- * Move several lines under one KRA (or out of every KRA) in one write.
- * `{ roleKraAssignmentId | null, responsibilities: [rowId], kpis: [rowId] }`.
- * One request for a selection of thirty, not thirty requests.
+ * Move several lines under one KRA (or out of every KRA) in one write, from a
+ * day. `{ roleKraAssignmentId | null, responsibilities: [rowId], kpis: [rowId], takesEffect? }`.
  */
 export async function moveRoleLines(db, c, roleId, body = {}) {
   await requireRole(db, c.companyId, roleId);
@@ -763,27 +872,67 @@ export async function moveRoleLines(db, c, roleId, body = {}) {
       throw invalid('BAD_REFERENCE', 'A responsibility or KPI can only be grouped under a KRA that belongs to the same role.');
     }
   }
+  const when = readTakesEffect(body, c);
   let moved = 0;
   for (const kind of ['responsibilities', 'kpis']) {
     const ids = [...new Set((Array.isArray(body[kind]) ? body[kind] : []).map(Number))].filter((n) => Number.isInteger(n) && n > 0);
     if (!ids.length) continue;
     const marks = ids.map(() => '?').join(',');
     const [found] = await db.query(
-      `SELECT id FROM ${CONTENT[kind].table} WHERE company_id = ? AND role_id = ? AND deleted_at IS NULL AND id IN (${marks})`,
-      [c.companyId, roleId, ...ids],
+      `SELECT id, role_kra_assignment_id FROM ${CONTENT[kind].table}
+        WHERE company_id = ? AND role_id = ? AND id IN (${marks})
+          AND (deleted_at IS NULL OR (effective_to IS NOT NULL AND effective_to >= ?))`,
+      [c.companyId, roleId, ...ids, today()],
     );
     if (found.length !== ids.length) {
       throw invalid('INVALID', 'That selection lists a line that is not part of this role — reload the screen and try again.');
     }
-    await db.query(
-      `UPDATE ${CONTENT[kind].table} SET role_kra_assignment_id = ? WHERE company_id = ? AND role_id = ? AND id IN (${marks})`,
-      [target, c.companyId, roleId, ...ids],
-    );
-    await audit(db, c, CONTENT[kind].table, roleId, 'UPDATE', null, { movedToRoleKraAssignmentId: target, ids });
-    moved += ids.length;
+    for (const row of found) {
+      if ((row.role_kra_assignment_id ?? null) === target) continue;
+      await changeRoleLine(db, c, kind, row.id, { role_kra_assignment_id: target }, when);
+      moved += 1;
+    }
   }
-  if (!moved) throw invalid('INVALID', 'Pick at least one line to move.');
+  if (!moved && !['responsibilities', 'kpis'].some((k) => Array.isArray(body[k]) && body[k].length)) {
+    throw invalid('INVALID', 'Pick at least one line to move.');
+  }
   return { ok: true, roleId, roleKraAssignmentId: target, moved };
+}
+
+/**
+ * CHANGE THE WORDING of a role's responsibility or KPI, from a day (spec §16.1).
+ * The wording belongs to a definition other roles may share, so the role's line
+ * moves to a NEW definition with the new words (a KPI keeps its measurement) —
+ * the same line, reworded: the old words are what the role said before that day.
+ * `{ text, target?, takesEffect?, reason? }` on the role's row id.
+ */
+export async function rewordRoleLine(db, c, kind, roleRowId, body = {}) {
+  const k = readKind(kind);
+  const contentKind = ROLE_KIND[k];
+  const table = CONTENT[contentKind].table;
+  const [[row]] = await db.query(
+    `SELECT a.*, d.name AS def_name, d.description AS def_description
+       FROM ${table} a JOIN ${CONTENT[contentKind].def.table} d ON d.company_id = a.company_id AND d.id = a.${DEF_COLUMN[k]}
+      WHERE a.company_id = ? AND a.id = ? AND (a.deleted_at IS NULL OR (a.effective_to IS NOT NULL AND a.effective_to >= ?))`,
+    [c.companyId, roleRowId, today()],
+  );
+  if (!row) throw notFound(NOUN[k] === 'KPI' ? 'KPI' : 'Responsibility');
+  const when = readTakesEffect(body, c);
+  const problems = [];
+  const text = readText(body.text, 'The wording', problems);
+  assertNoProblems(problems);
+  if (same(text, wordingOf(row.def_name, row.def_description))) throw invalid('NOTHING_TO_CHANGE', 'Nothing was changed.');
+
+  let like = null;
+  if (k === 'KPI') {
+    const [[d]] = await db.query('SELECT measurement_type, unit, direction, default_frequency FROM hrms_kpi_definitions WHERE company_id = ? AND id = ?', [c.companyId, row.kpi_definition_id]);
+    like = { measurementType: d?.measurement_type, unit: d?.unit, direction: d?.direction, frequency: d?.default_frequency };
+  } else {
+    const [[d]] = await db.query('SELECT responsibility_class FROM hrms_responsibility_definitions WHERE company_id = ? AND id = ?', [c.companyId, row.responsibility_definition_id]);
+    like = { responsibilityClass: d?.responsibility_class ?? null };
+  }
+  const definition = await writeOwnDefinition(db, c, k, text, like);
+  return changeRoleLine(db, c, contentKind, roleRowId, { [DEF_COLUMN[k]]: definition.id }, when);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -852,7 +1001,7 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
     });
   }
 
-  // Which seats carry changes of their own — one grouped query for the company.
+  // Which seats carry changes of their own on the date — one grouped query for the company.
   const [changed] = await db.query(
     `SELECT o.position_id, COUNT(*) AS n FROM hrms_position_content_overrides o
       WHERE o.company_id = ? AND o.deleted_at IS NULL
@@ -895,9 +1044,13 @@ export async function departmentStaffing(db, companyId, { on } = {}) {
   };
 }
 
+// isoDate is re-exported for the history service, which reads the same rows.
+export { isoDate };
+
 export default {
-  roleJobContent, positionJobContent,
+  roleJobContent, positionJobContent, employeeJobContent,
   seatAddLine, seatChangeLine, seatSwitchOffLine, seatUndoLine,
-  createRoleKra, renameRoleKra, deleteRoleKra, moveRoleLines,
+  personAddLine, personChangeLine, personSwitchOffLine, personUndoLine,
+  createRoleKra, renameRoleKra, deleteRoleKra, moveRoleLines, rewordRoleLine,
   departmentStaffing,
 };

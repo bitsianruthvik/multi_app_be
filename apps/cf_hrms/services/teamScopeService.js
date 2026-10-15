@@ -33,7 +33,10 @@
  */
 import { HrmsError, invalid, notFound } from '../lib/errors.js';
 import { requirePosition, updatePosition, today } from './positionService.js';
-import { positionJobContent, seatAddLine, seatChangeLine, seatSwitchOffLine, seatUndoLine } from './jobContentService.js';
+import {
+  positionJobContent, seatAddLine, seatChangeLine, seatSwitchOffLine, seatUndoLine,
+  employeeJobContent, personAddLine, personChangeLine, personSwitchOffLine, personUndoLine, seatHeldOn,
+} from './jobContentService.js';
 import { audit } from './peopleService.js';
 import { loadMySlice } from './selfOrgChartService.js';
 import { summaryFromRow } from './shiftRead.js';
@@ -89,6 +92,53 @@ export async function teamUndoLine(db, c, positionId, body = {}) {
   return seatUndoLine(db, c, positionId, body);
 }
 
+/* ── a PERSON's own job content (spec §16.2): the same rule, by the position they hold today ── */
+
+/**
+ * A person below me: they hold, today, a position I may change. My own job,
+ * a card-mate's, my manager's: 403 with a sentence. A person in no position
+ * today has no team place at all (403); one who does not exist here, 404.
+ */
+export async function assertPersonInMyTeam(db, c, employeeId) {
+  const slice = await mySlice(db, c);
+  const [[e]] = await db.query('SELECT id FROM hrms_employees WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, employeeId]);
+  if (!e) throw notFound('Employee');
+  const seat = await seatHeldOn(db, c.companyId, Number(employeeId), today());
+  if (seat && slice.canChange(seat.position_id)) return slice;
+  if (Number(employeeId) === Number(slice.employee?.id)) {
+    throw notYours('This is your own job. You can change the jobs of the people who report to you, not your own.', { employeeId: Number(employeeId) });
+  }
+  const relation = seat ? slice.relationOf(Number(seat.position_id)) : null;
+  const sentence = {
+    SELF: 'This person shares your position. You can change the jobs of the people who report to you.',
+    SAME_CARD: 'This person works beside you, not below you. You can change the jobs of the people who report to you.',
+    MANAGER: 'This person is above you. You can change the jobs of the people who report to you.',
+    DOTTED_MANAGER: 'This person is above you. You can change the jobs of the people who report to you.',
+  }[relation] ?? 'This person is not in your team. You can change the jobs of the people who report to you.';
+  throw notYours(sentence, { employeeId: Number(employeeId) });
+}
+
+export async function teamPersonJobContent(db, c, employeeId, { on } = {}) {
+  await assertPersonInMyTeam(db, c, employeeId);
+  return employeeJobContent(db, c.companyId, employeeId, { on });
+}
+export async function teamPersonAddLine(db, c, employeeId, body = {}) {
+  await assertPersonInMyTeam(db, c, employeeId);
+  return personAddLine(db, c, employeeId, body);
+}
+export async function teamPersonChangeLine(db, c, employeeId, body = {}) {
+  await assertPersonInMyTeam(db, c, employeeId);
+  return personChangeLine(db, c, employeeId, body);
+}
+export async function teamPersonSwitchOffLine(db, c, employeeId, body = {}) {
+  await assertPersonInMyTeam(db, c, employeeId);
+  return personSwitchOffLine(db, c, employeeId, body);
+}
+export async function teamPersonUndoLine(db, c, employeeId, body = {}) {
+  await assertPersonInMyTeam(db, c, employeeId);
+  return personUndoLine(db, c, employeeId, body);
+}
+
 /* ── the shift ─────────────────────────────────────────────────────────────── */
 
 /** GET /user/me/team/shifts — the shifts a team's position can be put on. Only for somebody who has a team. */
@@ -123,4 +173,5 @@ export async function teamChangeShift(db, c, positionId, body = {}) {
 
 export default {
   assertInMyTeam, teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
+  assertPersonInMyTeam, teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
 };

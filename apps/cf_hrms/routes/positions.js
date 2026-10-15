@@ -61,6 +61,9 @@
  *   POST   /positions/:id/job-content/change      { kind, definitionId, text?, target?: { operator?, value }, reason? }
  *   POST   /positions/:id/job-content/switch-off  { kind, definitionId, reason? }
  *   POST   /positions/:id/job-content/undo        { kind, definitionId }   back to what the role says
+ *                                         All four take `takesEffect` (default today; a past day only for the
+ *                                         Owner, with `reason`) — spec §16.1: nothing is overwritten
+ *   GET    /positions/:id/job-content/history     the dated list of changes (spec §16.3)
  *                                         The four writes are override rows underneath (services/jobContentService.js)
  *                                         and each answers with the job content after the edit. A KRA is refused:
  *                                         KRAs are fixed at the role.
@@ -88,6 +91,7 @@ import { resolvePositionReporting } from '../services/reportingResolver.js';
 import {
   positionJobContent, seatAddLine, seatChangeLine, seatSwitchOffLine, seatUndoLine,
 } from '../services/jobContentService.js';
+import { positionJobHistory } from '../services/jobHistoryService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -140,6 +144,8 @@ router.delete('/position-content-overrides/:id', guard(PERM.positions.edit), inP
 // org_manage — the tag the override endpoints above already ask for, because
 // that is what they write. cf_hrms_self_view reaches none of the five.
 router.get('/positions/:id/job-content', guard(PERM.positions.view), handle((req) => positionJobContent(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) })));
+// Spec §16.3: the dated list of changes — the role's, this position's own, and the position's role / department / shift / reporting line.
+router.get('/positions/:id/job-content/history', guard(PERM.positions.view), handle((req) => positionJobHistory(pool, ctx(req).companyId, id(req))));
 router.post('/positions/:id/job-content/add', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatAddLine(db, c, id(req), req.body ?? {}))));
 router.post('/positions/:id/job-content/change', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatChangeLine(db, c, id(req), req.body ?? {}))));
 router.post('/positions/:id/job-content/switch-off', guard(PERM.positions.edit), inPosition(), handle((req) => tx(req, (db, c) => seatSwitchOffLine(db, c, id(req), req.body ?? {}))));

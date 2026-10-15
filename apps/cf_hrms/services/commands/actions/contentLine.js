@@ -7,9 +7,11 @@
  *                  role screen does (a definition in the library, then assigned);
  *   on a position  jobContentService.seatAddLine — the position-level "Add"
  *                  (§5): the line is the position's own, the role is untouched.
+ *   for a person   jobContentService.personAddLine — the person-level "Add"
+ *                  (§16.2): their own line, on top of their position's.
  */
 import { createMasterItem, addContent } from '../../roleContentService.js';
-import { seatAddLine } from '../../jobContentService.js';
+import { seatAddLine, personAddLine } from '../../jobContentService.js';
 import {
   PERM, textOf, fieldOf, resolve, needRight, companyWideOnly, shownName, nameFor, OUTSIDE,
 } from './common.js';
@@ -22,6 +24,8 @@ export const said = (step, name) => {
 
 /** A line goes on a position when the step names a position and no role. */
 export const onPosition = (step) => said(step, 'position') && !said(step, 'role');
+/** …and on one person when it names a person and neither a role nor a position. */
+export const onPerson = (step) => said(step, 'person') && !said(step, 'role') && !said(step, 'position');
 
 export function contentLine(kind) {
   const isKpi = kind === 'KPI';
@@ -33,9 +37,16 @@ export function contentLine(kind) {
     if (!text) problems.push(`Write the ${noun}.`);
     else if (text.length > 2000) problems.push(`A ${noun} is up to 2000 characters.`);
     const toPosition = onPosition(step);
+    const toPerson = onPerson(step);
     let role = null;
     let position = null;
-    if (toPosition) {
+    let person = null;
+    if (toPerson) {
+      needRight(ctx, PERM.employees.edit, `change a person's ${isKpi ? 'KPIs' : 'responsibilities'}`, problems);
+      person = resolve(ctx, step, 'person', 'employee', problems);
+      if (person && !person.inside) problems.push(OUTSIDE(person.name));
+      if (person && !person.record?.positionId) problems.push(`${person.name} is not in a position, so there is no job of theirs to add to.`);
+    } else if (toPosition) {
       needRight(ctx, PERM.positions.edit, `change a position's ${isKpi ? 'KPIs' : 'responsibilities'}`, problems);
       position = resolve(ctx, step, 'position', 'position', problems);
       if (position && !position.inside) problems.push(OUTSIDE(position.name));
@@ -48,7 +59,8 @@ export function contentLine(kind) {
     let kra = null;
     if (said(step, 'kra')) {
       const f = fieldOf(step, 'kra');
-      const roleId = role?.id ?? position?.record?.roleId ?? position?.roleId ?? null;
+      const personPosition = person?.record?.positionId ? ctx.recs.positionById.get(person.record.positionId) : null;
+      const roleId = role?.id ?? position?.record?.roleId ?? position?.roleId ?? personPosition?.roleId ?? null;
       if (f.ref?.kind === 'step') {
         const made = ctx.made.get(f.ref.id);
         if (!made || made.kind !== 'kra') problems.push('Choose the KRA it is filed under again.');
@@ -66,9 +78,9 @@ export function contentLine(kind) {
     }
     const target = isKpi ? textOf(step, 'target') : '';
     if (target.length > 200) problems.push('A target is up to 200 characters.');
-    const on = toPosition ? position : role;
+    const on = toPerson ? person : toPosition ? position : role;
     ctx.preview.lines.push({
-      key: step.id, kind, text, target: target || null, on: toPosition ? 'position' : 'role',
+      key: step.id, kind, text, target: target || null, on: toPerson ? 'person' : toPosition ? 'position' : 'role',
       targetName: shownName(on), targetId: on?.step ? null : on?.id ?? null, targetKey: on?.step ?? null, kraName: kra?.name ?? null,
     });
     return { problems, made: { kind: isKpi ? 'kpi' : 'responsibility', name: text, inside: true } };
@@ -80,6 +92,19 @@ export function contentLine(kind) {
     const kraField = fieldOf(step, 'kra');
     const kraMade = kraField?.ref?.kind === 'step' ? ctx.made.get(kraField.ref.id) : null;
     const kraGiven = kraField && (kraField.ref?.id != null || (kraField.value != null && kraField.value !== ''));
+    if (onPerson(step)) {
+      const employeeId = ctx.refId(step, 'person');
+      let parentKraDefinitionId = null;
+      if (kraGiven) {
+        const all = [...ctx.recs.roleKras.values()].flat();
+        parentKraDefinitionId = all.find((k) => Number(k.id) === Number(kraField.ref?.id ?? kraField.value))?.definitionId ?? null;
+      }
+      await personAddLine(conn, ctx.c, employeeId, {
+        kind, text, parentKraDefinitionId,
+        ...(isKpi && target ? { target: { operator: 'EQ', value: target } } : {}),
+      });
+      return { kind: isKpi ? 'kpi' : 'responsibility', name: text, link: `employees/${employeeId}` };
+    }
     if (onPosition(step)) {
       const positionId = ctx.refId(step, 'position');
       let parentKraDefinitionId = null;

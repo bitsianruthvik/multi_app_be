@@ -67,7 +67,10 @@
  * from the role layer, every row tagged `origin: 'ROLE'`, and they say so.
  */
 import { notFound } from '../lib/errors.js';
-import { getRoleContent, effectiveWhere, CONTENT as ROLE_CONTENT } from './roleContentService.js';
+import {
+  getRoleContent, effectiveWhere, CONTENT as ROLE_CONTENT, isoDate,
+} from './roleContentService.js';
+import { dayBefore } from './datedChange.js';
 import {
   dateText, today, blank, CONTENT_TYPES,
   listPositionOverrides, shapeOverride,
@@ -131,6 +134,24 @@ const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v)
 const liveOn = (row, on) =>
   (!row.effectiveFrom || row.effectiveFrom <= on) && (!row.effectiveTo || row.effectiveTo >= on);
 
+/**
+ * The layer as the wire says it (spec §16.3): 'ROLE' | 'POSITION' | 'PERSON'.
+ * Inside this file the third layer keeps its table's name, ASSIGNMENT.
+ */
+export const wireLayer = (layer) => (layer === 'ASSIGNMENT' ? 'PERSON' : layer);
+
+/**
+ * Which item an overlay row names: by definition, as always — or, when the
+ * role line was reworded on a date (a new definition, the same line), by the
+ * line's identity (spec §16.1), so a position's switch-off or a person's target
+ * follows the line through its rewording instead of silently letting go.
+ */
+const findIn = (list, definitionId, lineKey) => {
+  const at = list.findIndex((i) => Number(i.definitionId) === Number(definitionId));
+  if (at >= 0 || !lineKey) return at;
+  return list.findIndex((i) => i.lineKey && i.lineKey === lineKey);
+};
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Display text. The resolver owns MEANING, the renderers own LAYOUT.
  * ══════════════════════════════════════════════════════════════════════════
@@ -185,7 +206,7 @@ function limitText(limit) {
 const ORIGIN_WORD = {
   ROLE: null,                                 // the default; saying it on every line is noise
   POSITION: 'specific to this position',
-  ASSIGNMENT: 'specific to this assignment',
+  ASSIGNMENT: 'specific to this person',
 };
 
 /**
@@ -273,6 +294,12 @@ function itemFromRoleRow(kindKey, row, parentKraDefinitionId) {
     // For an auditor reading the snapshot in two years: which row said this.
     sourceTable: `hrms_role_${kindKey === 'kras' ? 'kra' : kindKey === 'kpis' ? 'kpi' : 'responsibility'}_assignments`,
     sourceRowId: row.id,
+
+    // Spec §16.3: the line's identity, the layer that last shaped it, since when, and what it replaced.
+    lineKey: row.lineKey ?? null,
+    layer: 'ROLE',
+    since: row.effectiveFrom ?? null,
+    changedFrom: null,
   };
 
   if (kind === 'KRA' || kind === 'KPI') item.weightPercent = num(row.weightPercent);
@@ -317,6 +344,11 @@ function itemFromAdd(kind, override, definition, layer, fallbackSequence) {
 
     sourceTable: layer === 'POSITION' ? 'hrms_position_content_overrides' : 'hrms_work_assignment_content_overrides',
     sourceRowId: override.id,
+
+    lineKey: override.lineKey ?? null,
+    layer: wireLayer(layer),
+    since: override.effectiveFrom ?? null,
+    changedFrom: null,
   };
 
   if (kind === 'KRA' || kind === 'KPI') item.weightPercent = null;
@@ -356,6 +388,7 @@ function applyOverrideJson(item, override, layer, { record = true } = {}) {
   if (!json || typeof json !== 'object') return { ignoredKeys };
 
   const allowed = OVERRIDABLE[item.kind] ?? [];
+  const targetBefore = item.kind === 'KPI' ? item.targetText ?? null : null;
   for (const [field, value] of Object.entries(json)) {
     if (!allowed.includes(field)) { ignoredKeys.push(field); continue; }
     const from = item[field] ?? null;
@@ -370,6 +403,14 @@ function applyOverrideJson(item, override, layer, { record = true } = {}) {
   if (record && override.reason && !item.reason) item.reason = override.reason;
   if (item.kind === 'KPI') {
     item.targetText = targetText(item.targetOperator, item.targetValue, item.measurementType, item.unit);
+  }
+  if (record && item.overridden) {
+    // This layer is now the one that last shaped the line, from this row's day.
+    item.layer = wireLayer(layer);
+    item.since = override.effectiveFrom ?? item.since ?? null;
+    if (item.kind === 'KPI' && targetBefore !== item.targetText) {
+      item.changedFrom = { wording: null, target: targetBefore, weightPercent: null, layer: wireLayer(layer) };
+    }
   }
   return { ignoredKeys };
 }
@@ -540,8 +581,7 @@ export async function resolveContent(db, companyId, opts = {}) {
   for (const k of roleLayer.additional.kpis) kpis.push(itemFromRoleRow('kpis', k, null));
 
   const bucket = { KRA: kras, RESPONSIBILITY: responsibilities, KPI: kpis };
-  const find = (kind, definitionId) =>
-    bucket[kind].findIndex((i) => Number(i.definitionId) === Number(definitionId));
+  const find = (kind, definitionId, lineKey = null) => findIn(bucket[kind], definitionId, lineKey);
 
   // ── layers 2 and 3: the overlays ─────────────────────────────────────────
   const layers = ['ROLE'];
@@ -584,7 +624,8 @@ export async function resolveContent(db, companyId, opts = {}) {
           continue;
         }
         const definitionId = o[DEF_FIELD[kind]];
-        const at = find(kind, definitionId);
+        // An ADD is matched by definition only: a reworded line shares the line of what it replaces.
+        const at = action === 'ADD' ? find(kind, definitionId) : find(kind, definitionId, o.lineKey);
 
         if (action === 'SUPPRESS') {
           if (at < 0) {
@@ -598,13 +639,18 @@ export async function resolveContent(db, companyId, opts = {}) {
           const [gone] = bucket[kind].splice(at, 1);
           suppressed.push({
             kind,
-            definitionId,
+            definitionId: gone.definitionId,
             name: gone.name,
             code: gone.code,
             byLayer: layer,
             byOverrideId: o.id,
             reason: o.reason ?? null,
             origin: gone.origin,
+            lineKey: gone.lineKey ?? o.lineKey ?? null,
+            layer: wireLayer(layer),
+            since: o.effectiveFrom ?? null,
+            parentKraDefinitionId: gone.parentKraDefinitionId ?? null,
+            item: gone,
             // Set below, once we know what was orphaned.
             movedChildren: 0,
           });
@@ -651,6 +697,35 @@ export async function resolveContent(db, companyId, opts = {}) {
     }
   }
 
+  // ── what each line replaced (spec §16.3 changedFrom) ──────────────────────
+  // An overlay's own line that rewords one above it, or that follows an earlier
+  // version of itself at the same layer; and a role line's earlier version.
+  const allOverlay = { POSITION: overlayRows.position, ASSIGNMENT: overlayRows.assignment };
+  for (const item of [...kras, ...responsibilities, ...kpis]) {
+    if (item.origin === 'ROLE') continue;
+    const rows = allOverlay[item.origin] ?? [];
+    const own = rows.find((r) => Number(r.id) === Number(item.sourceRowId));
+    const replaces = own?.overrideJson?.replacesDefinitionId ?? null;
+    const gone = replaces != null
+      ? suppressed.find((x) => x.byLayer === item.origin && x.kind === item.kind
+        && (Number(x.definitionId) === Number(replaces) || (item.lineKey && x.lineKey === item.lineKey)))
+      : null;
+    if (gone) {
+      item.changedFrom = { wording: wholeWording(gone.item?.name ?? gone.name, gone.item?.description), target: gone.item?.targetText ?? null, weightPercent: null, layer: wireLayer(item.origin) };
+      continue;
+    }
+    if (!own?.effectiveFrom || !own.lineKey) continue;
+    const prev = rows.find((r) => r.action === 'ADD' && r.lineKey === own.lineKey && r.effectiveTo === dayBefore(own.effectiveFrom));
+    if (!prev) continue;
+    const prevTarget = item.kind === 'KPI'
+      ? targetText(prev.overrideJson?.targetOperator ?? null, prev.overrideJson?.targetValue ?? null, item.measurementType, item.unit)
+      : null;
+    const wording = Number(prev[DEF_FIELD[item.kind]]) !== Number(item.definitionId) ? (wholeWording(prev.definitionName, prev.definitionDescription) || null) : null;
+    const target = item.kind === 'KPI' && prevTarget !== item.targetText ? prevTarget : null;
+    if (wording || target) item.changedFrom = { wording, target, weightPercent: null, layer: wireLayer(item.origin) };
+  }
+  await roleChangedFrom(db, companyId, roleId, [...kras, ...responsibilities, ...kpis].filter((i) => i.origin === 'ROLE' && !i.changedFrom));
+
   // ── the one-line rendering, after every layer has had its say ────────────
   // Last, not per-layer: a sentence built before an OVERRIDE lands would state
   // the role's weight on a row the position had already changed.
@@ -667,9 +742,14 @@ export async function resolveContent(db, companyId, opts = {}) {
   const nodes = kras.map((k) => ({ ...k, responsibilities: [], kpis: [] }));
   const nodeOf = new Map(nodes.map((n) => [Number(n.definitionId), n]));
   const additional = { responsibilities: [], kpis: [] };
+  // An overlay line filed under a KRA the role has since renamed on a date (a new
+  // definition, the same KRA line, spec §16.1) stays under that KRA.
+  const kraLines = await kraLineIndex(db, companyId, roleId, [...responsibilities, ...kpis], nodeOf);
+  const nodeByLine = new Map(nodes.filter((n) => n.lineKey).map((n) => [n.lineKey, n]));
 
   const place = (item, into) => {
-    const parent = item.parentKraDefinitionId == null ? null : nodeOf.get(Number(item.parentKraDefinitionId));
+    const parent = item.parentKraDefinitionId == null ? null
+      : nodeOf.get(Number(item.parentKraDefinitionId)) ?? nodeByLine.get(kraLines.get(Number(item.parentKraDefinitionId))) ?? null;
     if (parent) { parent[into].push(item); return; }
     // Ungrouped, or grouped under a KRA that is not here on this date. Either
     // way it is visible. Rule 2.
@@ -716,7 +796,7 @@ export async function resolveContent(db, companyId, opts = {}) {
 
     kras: nodes,
     additional,
-    suppressed,
+    suppressed: suppressed.map(({ item, ...rest }) => ({ ...rest, targetText: item?.targetText ?? null })),
 
     skills,
     qualifications,
@@ -764,6 +844,76 @@ export async function resolveContent(db, companyId, opts = {}) {
       kpiWeighted: kpis.filter((k) => k.weightPercent != null).length,
     },
   };
+}
+
+/**
+ * A role line's earlier version — the one that ended the day before this one
+ * began (same line, spec §16.1) — gives `changedFrom`: the wording, target or
+ * weight it had. One query per kind, only for lines that have a start date.
+ */
+const ROLE_VERSION_SQL = {
+  KRA: `SELECT a.line_key, a.effective_to, a.kra_definition_id AS definition_id, d.name, d.description,
+               NULL AS target_operator, NULL AS target_value, a.weight_percent
+          FROM hrms_role_kra_assignments a JOIN hrms_kra_definitions d ON d.company_id = a.company_id AND d.id = a.kra_definition_id`,
+  RESPONSIBILITY: `SELECT a.line_key, a.effective_to, a.responsibility_definition_id AS definition_id, d.name, d.description,
+               NULL AS target_operator, NULL AS target_value, NULL AS weight_percent
+          FROM hrms_role_responsibility_assignments a JOIN hrms_responsibility_definitions d ON d.company_id = a.company_id AND d.id = a.responsibility_definition_id`,
+  KPI: `SELECT a.line_key, a.effective_to, a.kpi_definition_id AS definition_id, d.name, d.description,
+               a.target_operator, CAST(a.target_value AS CHAR) AS target_value, a.weight_percent
+          FROM hrms_role_kpi_assignments a JOIN hrms_kpi_definitions d ON d.company_id = a.company_id AND d.id = a.kpi_definition_id`,
+};
+
+const readJsonText = (v) => {
+  if (v == null || typeof v === 'object') return v ?? null;
+  try { return JSON.parse(v); } catch { return v; }
+};
+/** A definition's whole sentence: a long one is stored cut short in `name`, whole in `description`. */
+export const wholeWording = (name, description) => {
+  const n = String(name ?? '').trim();
+  const d = String(description ?? '').trim();
+  if (d && /(\.\.\.|\u2026)$/.test(n) && d.toLowerCase().startsWith(n.replace(/(\.\.\.|\u2026)$/, '').trim().toLowerCase())) return d;
+  return n;
+};
+
+/** KRA definition -> its line, for the role's KRA rows of any date. Read only when a line's KRA is not found by definition. */
+async function kraLineIndex(db, companyId, roleId, items, nodeOf) {
+  const lost = items.some((i) => i.parentKraDefinitionId != null && !nodeOf.has(Number(i.parentKraDefinitionId)));
+  if (!lost) return new Map();
+  const [rows] = await db.query(
+    'SELECT kra_definition_id, line_key FROM hrms_role_kra_assignments WHERE company_id = ? AND role_id = ? AND line_key IS NOT NULL',
+    [companyId, roleId],
+  );
+  return new Map(rows.map((r) => [Number(r.kra_definition_id), r.line_key]));
+}
+
+async function roleChangedFrom(db, companyId, roleId, items) {
+  const wanted = items.filter((i) => i.lineKey && i.since);
+  if (!wanted.length) return;
+  const kinds = [...new Set(wanted.map((i) => i.kind))];
+  const found = new Map();
+  await Promise.all(kinds.map(async (kind) => {
+    const keys = [...new Set(wanted.filter((i) => i.kind === kind).map((i) => i.lineKey))];
+    const [rows] = await db.query(
+      `${ROLE_VERSION_SQL[kind]}
+        WHERE a.company_id = ? AND a.role_id = ? AND a.effective_to IS NOT NULL
+          AND (a.effective_from IS NULL OR a.effective_to >= a.effective_from)
+          AND a.line_key IN (${keys.map(() => '?').join(',')})`,
+      [companyId, roleId, ...keys],
+    );
+    for (const r of rows) found.set(`${kind}|${r.line_key}|${isoDate(r.effective_to)}`, r);
+  }));
+  for (const item of wanted) {
+    const prev = found.get(`${item.kind}|${item.lineKey}|${dayBefore(item.since)}`);
+    if (!prev) continue;
+    const wording = Number(prev.definition_id) !== Number(item.definitionId) ? wholeWording(prev.name, prev.description) : null;
+    const prevTarget = item.kind === 'KPI'
+      ? targetText(prev.target_operator, readJsonText(prev.target_value), item.measurementType, item.unit)
+      : null;
+    const target = item.kind === 'KPI' && prevTarget !== item.targetText ? prevTarget : null;
+    const weight = prev.weight_percent == null ? null : Number(prev.weight_percent);
+    const weightPercent = item.kind !== 'RESPONSIBILITY' && weight !== (item.weightPercent ?? null) ? weight : null;
+    if (wording || target || weightPercent != null) item.changedFrom = { wording, target, weightPercent, layer: 'ROLE' };
+  }
 }
 
 /**
@@ -832,7 +982,7 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
     Promise.all(wanted.map(async (kind) => {
       const k = ROLE_CONTENT[ROLE_CONTENT_KEY[kind]];
       const [rows] = await db.query(
-        `SELECT a.role_id, a.${k.def.column} AS definition_id
+        `SELECT a.role_id, a.${k.def.column} AS definition_id, ${kind === 'QUALIFICATION' ? 'NULL' : 'a.line_key'} AS line_key
            FROM ${k.table} a
           WHERE a.company_id = ? AND ${where.sql}
           ORDER BY a.sequence, a.id`,
@@ -857,7 +1007,7 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
     for (const r of rows) {
       const key = `${kind}:${r.role_id}`;
       if (!roleLines.has(key)) roleLines.set(key, []);
-      roleLines.get(key).push(Number(r.definition_id));
+      roleLines.get(key).push({ definitionId: Number(r.definition_id), lineKey: r.line_key ?? null });
     }
   }
   const overlayOf = new Map();   // positionId -> rows
@@ -871,7 +1021,7 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
     const bucket = {};
     for (const kind of wanted) {
       bucket[kind] = (roleLines.get(`${kind}:${p.roleId}`) ?? [])
-        .map((definitionId) => ({ kind, definitionId, origin: 'ROLE', overridden: false, changes: [] }));
+        .map(({ definitionId, lineKey }) => ({ kind, definitionId, lineKey, origin: 'ROLE', overridden: false, changes: [] }));
     }
     const rows = overlayOf.get(Number(p.id)) ?? [];
     for (const action of ACTION_ORDER) {
@@ -879,11 +1029,11 @@ export async function effectiveLinesForPositions(db, companyId, positions, { on,
         const kind = o.contentType;
         if (!overlayKinds.includes(kind) || o[DEF_FIELD[kind]] == null) continue;
         const definitionId = Number(o[DEF_FIELD[kind]]);
-        const at = bucket[kind].findIndex((i) => Number(i.definitionId) === definitionId);
+        const at = action === 'ADD' ? findIn(bucket[kind], definitionId) : findIn(bucket[kind], definitionId, o.lineKey);
         if (action === 'SUPPRESS') { if (at >= 0) bucket[kind].splice(at, 1); continue; }
         if (action === 'OVERRIDE') { if (at >= 0) applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
         if (at >= 0) { applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
-        bucket[kind].push({ kind, definitionId, origin: 'POSITION', overridden: false, changes: [] });
+        bucket[kind].push({ kind, definitionId, lineKey: o.lineKey ?? null, origin: 'POSITION', overridden: false, changes: [] });
       }
     }
     out.set(Number(p.id), wanted.flatMap((kind) => bucket[kind].map((l) => ({

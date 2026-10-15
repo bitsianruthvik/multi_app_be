@@ -65,7 +65,7 @@ import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
-import { getRoleContent } from './roleContentService.js';
+import { getRoleContent, ROW_IN_FORCE } from './roleContentService.js';
 import { effectiveLinesForPositions } from './contentResolver.js';
 import { embed, dot, ModelUnavailable } from './semantic/embedder.js';
 import {
@@ -235,22 +235,22 @@ const OCCUPANTS_SQL = `
 const CONTENT_COUNTS_SQL = `
     SELECT 'kras' AS kind, a.role_id, COUNT(*) AS n
       FROM hrms_role_kra_assignments a
-     WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${LIVE_ON('a')}
+     WHERE a.company_id = ? AND ${ROW_IN_FORCE('a')}
      GROUP BY a.role_id
   UNION ALL
     SELECT 'responsibilities', a.role_id, COUNT(*)
       FROM hrms_role_responsibility_assignments a
-     WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${LIVE_ON('a')}
+     WHERE a.company_id = ? AND ${ROW_IN_FORCE('a')}
      GROUP BY a.role_id
   UNION ALL
     SELECT 'kpis', a.role_id, COUNT(*)
       FROM hrms_role_kpi_assignments a
-     WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${LIVE_ON('a')}
+     WHERE a.company_id = ? AND ${ROW_IN_FORCE('a')}
      GROUP BY a.role_id
   UNION ALL
     SELECT 'qualifications', a.role_id, COUNT(*)
       FROM hrms_role_qualification_requirements a
-     WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${LIVE_ON('a')}
+     WHERE a.company_id = ? AND ${ROW_IN_FORCE('a')}
      GROUP BY a.role_id`;
 
 /**

@@ -66,6 +66,11 @@ How to read the tables below:
 | `POST /user/me/team/positions/:id/job-content/change` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/positions/:id/job-content/switch-off` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/positions/:id/job-content/undo` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/employees/:id/job-content` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/employees/:id/job-content/add` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/employees/:id/job-content/change` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/employees/:id/job-content/switch-off` | `cf_hrms_self_view` |  |
+| `POST /user/me/team/employees/:id/job-content/undo` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/positions/:id/shift` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
@@ -147,6 +152,8 @@ How to read the tables below:
 | `PUT /roles/:id/content-group` | `cf_hrms_roles_edit` | whole-company logins only |
 | `PUT /role-kras/:id` | `cf_hrms_roles_edit` | whole-company logins only |
 | `DELETE /role-kras/:id` | `cf_hrms_roles_edit` | whole-company logins only |
+| `GET /roles/:id/job-content/history` | `cf_hrms_roles_view` |  |
+| `POST /role-content/:kind/:id/reword` | `cf_hrms_roles_edit` | whole-company logins only |
 | `POST /roles/:id/content/:kind` | `cf_hrms_roles_edit` | whole-company logins only |
 | `PUT /roles/:id/content/:kind/order` | `cf_hrms_roles_edit` | whole-company logins only |
 | `PUT /role-content/:kind/:id/group` | `cf_hrms_roles_edit` | whole-company logins only |
@@ -182,6 +189,7 @@ How to read the tables below:
 | `POST /positions/:id/overrides` | `cf_hrms_positions_edit` | scope: the position |
 | `DELETE /position-content-overrides/:id` | `cf_hrms_positions_edit` | scope: the position |
 | `GET /positions/:id/job-content` | `cf_hrms_positions_view` |  |
+| `GET /positions/:id/job-content/history` | `cf_hrms_positions_view` |  |
 | `POST /positions/:id/job-content/add` | `cf_hrms_positions_edit` | scope: the position |
 | `POST /positions/:id/job-content/change` | `cf_hrms_positions_edit` | scope: the position |
 | `POST /positions/:id/job-content/switch-off` | `cf_hrms_positions_edit` | scope: the position |
@@ -233,6 +241,12 @@ How to read the tables below:
 | `GET /people/employees/:id/assignments` | `cf_hrms_employees_view` | scope: the person |
 | `GET /people/employees/:id/positions` | `cf_hrms_employees_view` | scope: the person |
 | `POST /people/employees/:id/move` | `cf_hrms_positions_edit` | scope: the person; scope: the position |
+| `GET /people/employees/:id/job-content` | `cf_hrms_employees_view` | scope: the person |
+| `GET /people/employees/:id/job-content/history` | `cf_hrms_employees_view` | scope: the person |
+| `POST /people/employees/:id/job-content/add` | `cf_hrms_employees_edit` | scope: the person |
+| `POST /people/employees/:id/job-content/change` | `cf_hrms_employees_edit` | scope: the person |
+| `POST /people/employees/:id/job-content/switch-off` | `cf_hrms_employees_edit` | scope: the person |
+| `POST /people/employees/:id/job-content/undo` | `cf_hrms_employees_edit` | scope: the person |
 | `GET /people/employees/:id/identifiers` | `cf_hrms_employees_view` | scope: the person |
 | `POST /people/employees/:id/identifiers` | `cf_hrms_employees_edit` **and** `cf_hrms_contact_view` | scope: the person |
 | `PUT /people/identifiers/:id` | `cf_hrms_employees_edit` **and** `cf_hrms_contact_view` | scope: the person |
@@ -386,4 +400,4 @@ How to read the tables below:
 | `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 | `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 
-284 routes.
+298 routes.

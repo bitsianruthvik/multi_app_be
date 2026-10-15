@@ -294,8 +294,12 @@ function tailTarget(text, cues, kinds, R, { minScore = 0.74 } = {}) {
   return null;
 }
 
-/** Role or position named by `text` — the role unless the words say position (a code, "position"). */
-function roleOrPosition(text, R, { allowPosition = true } = {}) {
+/**
+ * Role or position named by `text` — the role unless the words say position (a
+ * code, "position"); a PERSON (spec §16.2) when it names neither a role nor a
+ * position but one of the company's people.
+ */
+function roleOrPosition(text, R, { allowPosition = true, allowPerson = false } = {}) {
   const t = unmask(text, R.quotes);
   const saysPosition = POSITION_CODE.test(t) || /\b(position|seat|post|chair)\b/i.test(t);
   const role = entity('role', text, R);
@@ -303,6 +307,10 @@ function roleOrPosition(text, R, { allowPosition = true } = {}) {
   if (saysPosition && allowPosition && (position.ref || position.candidates?.length)) return { position };
   if (role.ref || role.candidates?.length) return { role };
   if (allowPosition && (position.ref || position.candidates?.length)) return { position };
+  if (allowPerson) {
+    const person = entity('employee', text, R, { allowSteps: false });
+    if (person.ref || person.candidates?.length) return { person };
+  }
   return { role };
 }
 
@@ -422,13 +430,13 @@ function readContent(cl, R, kind) {
     if (colon > 0) {
       const left = body.slice(0, colon);
       text = body.slice(colon + 1);
-      const t = tailTarget(left, ['to', 'for', 'on', 'of'], ['role', 'position'], R);
+      const t = tailTarget(left, ['to', 'for', 'on', 'of'], kind === 'KRA' ? ['role', 'position'] : ['role', 'position', 'employee'], R);
       if (t && !target) target = { field: t.field, kind: t.kind };
     } else {
       const m = new RegExp(`\\b${nounRe}\\b\\s*(?:called\\s+|named\\s+|of\\s+|that\\s+)?`, 'i').exec(body);
       let region = m ? body.slice(m.index + m[0].length) : stripLead(body);
       if (!target) {
-        const t = tailTarget(region, ['to', 'for', 'on', 'in', 'of', 'at'], kind === 'KRA' ? ['role'] : ['role', 'position'], R);
+        const t = tailTarget(region, ['to', 'for', 'on', 'in', 'of', 'at'], kind === 'KRA' ? ['role'] : ['role', 'position', 'employee'], R);
         if (t) { target = { field: t.field, kind: t.kind }; region = t.head; }
       }
       text = region.replace(/^(?:for|of|about|to)\s+/i, '');
@@ -438,16 +446,17 @@ function readContent(cl, R, kind) {
   out.text = q.length ? { value: q[0], fromText: q[0], confidence: 1 } : newText(String(text ?? '').replace(/^[\s:,-]+/, '').replace(/^(?:the\s+)?(?:duty|task|responsibility)\s+(?:of\s+)?/i, ''), quotes);
   if (target && typeof target === 'string') {
     const t = clean(unmask(target, quotes), 'role').replace(/^(?:position|role)\s+/i, '');
-    const rp = roleOrPosition(t, R, { allowPosition: kind !== 'KRA' });
+    const rp = roleOrPosition(t, R, { allowPosition: kind !== 'KRA', allowPerson: kind !== 'KRA' });
     Object.assign(out, rp);
   } else if (target) {
-    out[target.kind] = target.field;
+    out[target.kind === 'employee' ? 'person' : target.kind] = target.field;
   } else {
     out.role = { value: null, fromText: null, confidence: 0 };
   }
   // the KRA it is filed under, among that role's KRAs (or one an earlier step adds)
   if (out.kraText) {
-    const roleId = out.role?.ref?.kind === 'role' ? out.role.ref.id : out.position?.ref ? R.recs.positionById.get(out.position.ref.id)?.roleId : null;
+    const personRole = out.person?.ref ? R.recs.positionById.get(R.recs.employees.find((e) => e.id === out.person.ref.id)?.positionId)?.roleId ?? null : null;
+    const roleId = out.role?.ref?.kind === 'role' ? out.role.ref.id : out.position?.ref ? R.recs.positionById.get(out.position.ref.id)?.roleId : personRole;
     const roleStep = out.role?.ref?.kind === 'step' ? out.role.ref.id : null;
     const made = [...R.made].reverse().find((m) => m.kind === 'kra' && (roleStep ? m.roleStep === roleStep : true) && nameScore(out.kraText, m.name) >= 0.85);
     if (made) out.kra = { value: null, ref: { kind: 'step', id: made.stepId, label: `${made.name} (new)` }, fromText: out.kraText, confidence: 0.95 };

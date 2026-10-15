@@ -235,7 +235,8 @@ export async function buildRoleJd(db, { companyId, userId }, { roleId, positionI
         relationships: reporting.relationships,
         summary: reporting.summary,
       },
-      overrides: content.overlay.position,
+      // The exceptions in force on the date, and any dated after it (a reader can see one coming) — not the ones that ended before it (spec §16).
+      overrides: content.overlay.position.filter((o) => !(o.effectiveTo && (o.effectiveTo < content.asOf || (o.effectiveFrom && o.effectiveTo < o.effectiveFrom)))),
     };
   }
 

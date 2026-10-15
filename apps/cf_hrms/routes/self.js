@@ -43,6 +43,7 @@ import { myPlace } from '../services/selfService.js';
 import { myOrgChart } from '../services/selfOrgChartService.js';
 import {
   teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
+  teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
 } from '../services/teamScopeService.js';
 
 const router = Router();
@@ -101,6 +102,13 @@ router.post('/user/me/team/positions/:id/job-content/add', guard(PERM.selfView),
 router.post('/user/me/team/positions/:id/job-content/change', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeLine(db, c, positionId(req), req.body ?? {}))));
 router.post('/user/me/team/positions/:id/job-content/switch-off', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamSwitchOffLine(db, c, positionId(req), req.body ?? {}))));
 router.post('/user/me/team/positions/:id/job-content/undo', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamUndoLine(db, c, positionId(req), req.body ?? {}))));
+// Spec §16.2: a manager login changes the job of a PERSON below them, like a position below them.
+router.get('/user/me/team/employees/:id/job-content', guard(PERM.selfView), handle((req) => (
+  teamPersonJobContent(pool, ctx(req), intParam(req.params.id), { on: dateParam(req.query.on) }))));
+router.post('/user/me/team/employees/:id/job-content/add', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonAddLine(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/employees/:id/job-content/change', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonChangeLine(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/employees/:id/job-content/switch-off', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonSwitchOffLine(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/user/me/team/employees/:id/job-content/undo', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamPersonUndoLine(db, c, intParam(req.params.id), req.body ?? {}))));
 router.put('/user/me/team/positions/:id/shift', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeShift(db, c, positionId(req), req.body ?? {}))));
 
 export default router;

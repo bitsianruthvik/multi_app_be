@@ -60,6 +60,7 @@
  */
 import { dateText, today, LIVE_ON } from './positionService.js';
 import { resolveContent, targetText } from './contentResolver.js';
+import { ROW_IN_FORCE } from './roleContentService.js';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * The reads — each runs ONCE for the whole company
@@ -95,24 +96,11 @@ const PRIMARY_EDGES_SQL = `
    ORDER BY rr.is_primary DESC, t.sort_order, rr.id`;
 
 /**
- * Which rows of a role layer are in force on a date. THE TWIN of
- * `effectiveWhere(alias, { scope: 'effective' })` in roleContentService.js —
- * that is the authority, and this must say exactly what it says: a live row
- * inside its window, or a retired row whose window closed before today (so a
- * past date still reads the old row). The definition join is a LEFT JOIN with
- * no status filter, for the same reason it is there: a retired definition is
- * still what the role said on that date.
- *
- * It is a copy only because roleContentService does not export it. If that
- * function changes, this one changes with it — or better, export it and import
- * it here.
- *
- * Consumes 2 `?` (on, on).
+ * Which rows of a role layer are in force on a date: roleContentService's own
+ * ROW_IN_FORCE (spec §16.1 — a closed row counts for its window), imported, so
+ * the two cannot drift. Consumes 2 `?` (on, on).
  */
-const ROLE_LAYER_WINDOW = (a) => `
-  (${a}.deleted_at IS NULL OR (${a}.effective_to IS NOT NULL AND ${a}.effective_to < CURDATE()))
-  AND (${a}.effective_from IS NULL OR ${a}.effective_from <= ?)
-  AND (${a}.effective_to   IS NULL OR ${a}.effective_to   >= ?)`;
+const ROLE_LAYER_WINDOW = (a) => ROW_IN_FORCE(a);
 
 /**
  * Every role's content in the four kinds this view shows, in ONE round trip.

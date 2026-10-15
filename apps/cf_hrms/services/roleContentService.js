@@ -40,6 +40,9 @@ import { loadAssignmentIndex } from './leavePolicyRead.js';
 import { issueRoleCode, acceptImportedCode } from './codeService.js';
 import { ROLE_ENTITY } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
+import {
+  readTakesEffect, dayBefore, inWindow, isVoid, newLineKey, longDay,
+} from './datedChange.js';
 
 // ---------------------------------------------------------------------------
 // Vocabularies. These mirror models/init.sql; routes/index.js /meta serves the
@@ -65,7 +68,11 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // Small shared helpers
 // ---------------------------------------------------------------------------
 
-const today = () => new Date().toISOString().slice(0, 10);
+/** Today as the server's own calendar has it — the same day positionService.today() says. */
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 
 /** A DATE column as YYYY-MM-DD, whatever the driver handed back. */
 export function isoDate(value) {
@@ -75,13 +82,6 @@ export function isoDate(value) {
     return z.toISOString().slice(0, 10);
   }
   return String(value).slice(0, 10);
-}
-
-/** The day before an ISO date — where a superseded row's window closes. */
-function dayBefore(iso) {
-  const d = new Date(`${iso}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - 1);
-  return d.toISOString().slice(0, 10);
 }
 
 /**
@@ -972,19 +972,34 @@ async function resolveGroup(db, companyId, roleId, value, problems) {
     problems.push('The KRA to group under must be one of this role\'s KRAs.');
     return null;
   }
+  // A KRA whose change is dated ahead is retired but still in force until then: still a KRA to file under.
+  // An EARLIER version of a KRA (renamed or reweighted since, spec §16.1) means the same KRA line:
+  // the version in force today is what the line is filed under.
   const [[row]] = await db.query(
-    'SELECT id, role_id FROM hrms_role_kra_assignments WHERE company_id = ? AND id = ? AND deleted_at IS NULL',
-    [companyId, id],
+    `SELECT id, role_id, line_key,
+            (deleted_at IS NULL OR (effective_to IS NOT NULL AND effective_to >= ?)) AS current
+       FROM hrms_role_kra_assignments WHERE company_id = ? AND id = ?`,
+    [today(), companyId, id],
   );
-  if (!row) {
+  let found = row && Number(row.current) ? row : null;
+  if (row && !found && row.line_key) {
+    const [[now]] = await db.query(
+      `SELECT id, role_id FROM hrms_role_kra_assignments
+        WHERE company_id = ? AND role_id = ? AND line_key = ? AND ${ROW_IN_FORCE('hrms_role_kra_assignments')}
+        ORDER BY id DESC LIMIT 1`,
+      [companyId, row.role_id, row.line_key, today(), today()],
+    );
+    found = now ?? null;
+  }
+  if (!found) {
     problems.push('That KRA assignment no longer exists.');
     return null;
   }
-  if (Number(row.role_id) !== Number(roleId)) {
+  if (Number(found.role_id) !== Number(roleId)) {
     problems.push('A responsibility or KPI can only be grouped under a KRA that belongs to the same role.');
     return null;
   }
-  return id;
+  return Number(found.id);
 }
 
 function shapeContentRow(kind, kindDef, r) {
@@ -1007,28 +1022,40 @@ function shapeContentRow(kind, kindDef, r) {
     effectiveTo: isoDate(r.effective_to),
     notes: kindDef.noNotes ? null : (r.notes ?? null),
     retired: !!r.deleted_at,
+    // Spec §16: the line's identity across its versions, and why a change was dated in the past.
+    lineKey: r.line_key ?? null,
+    changeReason: r.change_reason ?? null,
     ...kindDef.shape(r),
   };
 }
 
+/** A KRA line's identity, or — for a row written before line keys — its definition's. */
+export const kraLineOf = (lineKey, definitionId) => lineKey ?? `def:${definitionId}`;
+
 /**
  * Which rows count as being in force on a date.
  *
- * A live row is in force when the date sits inside its window. A RETIRED row is
- * in force for a past date when it was closed before today — that is what makes
+ * A live row is in force when the date sits inside its window. A CLOSED row
+ * (retired with an end date) is in force for its window too — that is what makes
  * "ended, not overwritten" visible: a weight that changed on 1 June still reads
- * as the old weight when you ask for 1 May. Retiring never edits the past, and
- * it never keeps a row in the present.
+ * as the old weight when you ask for 1 May, and a change dated 1 Nov leaves the
+ * current row in force until 31 Oct (spec §16.1).
  */
 export function effectiveWhere(alias, { on, scope }) {
   if (scope === 'all') return { sql: `${alias}.deleted_at IS NULL`, params: [] };
-  return {
-    sql: `(${alias}.deleted_at IS NULL OR (${alias}.effective_to IS NOT NULL AND ${alias}.effective_to < CURDATE()))
-          AND (${alias}.effective_from IS NULL OR ${alias}.effective_from <= ?)
-          AND (${alias}.effective_to   IS NULL OR ${alias}.effective_to   >= ?)`,
-    params: [on, on],
-  };
+  return { sql: ROW_IN_FORCE(alias), params: [on, on] };
 }
+
+/**
+ * THE role-row predicate for "in force on a date" (two `?`: the date, twice).
+ * A CLOSED row (deleted_at set AND effective_to set) is history and counts for
+ * its window. A row deleted with no end date (its role removed outright) never
+ * counts. An empty window (to < from: a change cancelled before its day)
+ * contains no date. departmentRollupService and orgChartService count with it.
+ */
+export const ROW_IN_FORCE = (a) => `(${a}.deleted_at IS NULL OR ${a}.effective_to IS NOT NULL)
+          AND (${a}.effective_from IS NULL OR ${a}.effective_from <= ?)
+          AND (${a}.effective_to   IS NULL OR ${a}.effective_to   >= ?)`;
 
 async function listContentRows(db, companyId, roleId, kind, opts) {
   const k = contentOf(kind);
@@ -1081,18 +1108,20 @@ export async function getRoleContent(db, companyId, roleId, { on = today(), scop
    * date returns the older row — so a child that points at either row must land
    * under whichever row is in force on the date being asked about.
    */
+  // …and through the KRA LINE (spec §16.1), so a KRA renamed on a date — a new
+  // version with a new definition — still holds its lines on both sides of the date.
   const [allKraRows] = await db.query(
-    'SELECT id, kra_definition_id FROM hrms_role_kra_assignments WHERE company_id = ? AND role_id = ?',
+    'SELECT id, kra_definition_id, line_key FROM hrms_role_kra_assignments WHERE company_id = ? AND role_id = ?',
     [companyId, roleId],
   );
-  const definitionOfAssignment = new Map(allKraRows.map((r) => [Number(r.id), Number(r.kra_definition_id)]));
+  const lineOfAssignment = new Map(allKraRows.map((r) => [Number(r.id), kraLineOf(r.line_key, r.kra_definition_id)]));
 
   const byKra = new Map(kras.map((k) => [k.id, { ...k, responsibilities: [], kpis: [] }]));
-  const kraIdByDefinition = new Map(kras.map((k) => [Number(k.definitionId), k.id]));
+  const kraIdByLine = new Map(kras.map((k) => [kraLineOf(k.lineKey, k.definitionId), k.id]));
   const parentOf = (row) => {
     if (!row.roleKraAssignmentId) return null;
-    const defId = definitionOfAssignment.get(Number(row.roleKraAssignmentId));
-    const kraId = defId === undefined ? row.roleKraAssignmentId : kraIdByDefinition.get(defId);
+    const line = lineOfAssignment.get(Number(row.roleKraAssignmentId));
+    const kraId = line === undefined ? row.roleKraAssignmentId : kraIdByLine.get(line);
     return kraId === undefined ? null : byKra.get(kraId) ?? null;
   };
 
@@ -1181,9 +1210,176 @@ async function nextSequence(db, companyId, table, roleId) {
   return Number(row.next ?? 1);
 }
 
+/* ===========================================================================
+ * JOB CONTENT IS DATED (spec §16.1)
+ * ===========================================================================
+ * KRAs, responsibilities and KPIs on a role are never changed in place. A
+ * change closes the version in force (effective_to = the day before it takes
+ * effect, retired) and opens the next one (effective_from = that day), carrying
+ * the same `line_key` — so a reworded line is "this line, reworded", and a JD
+ * asked for any date reads exactly what was expected that day. Removing a line
+ * closes it. The other six kinds keep the older rule (edit, or supersede when
+ * effectiveFrom moves), and the ORDER of lines is still edited in place: it is
+ * how a list is laid out, not what is expected of anyone.
+ */
+
+/** The three kinds that are job content. */
+export const JOB_KINDS = new Set(['kras', 'responsibilities', 'kpis']);
+const KEY_PREFIX = { kras: 'K', responsibilities: 'R', kpis: 'P' };
+
+/** A row written before line keys gets the key the apply script gives it (scripts/apply-history-schema.mjs). */
+async function ensureLineKey(db, companyId, kind, row) {
+  if (row.line_key) return row.line_key;
+  const key = `${KEY_PREFIX[kind]}-${row.id}`;
+  await db.query(`UPDATE ${CONTENT[kind].table} SET line_key = ? WHERE company_id = ? AND id = ? AND line_key IS NULL`, [key, companyId, row.id]);
+  row.line_key = key;
+  return key;
+}
+
+/** Every version of one line, oldest first — not the ones cancelled before their day. */
+export async function lineVersions(db, companyId, kind, row) {
+  const k = contentOf(kind);
+  const key = await ensureLineKey(db, companyId, kind, row);
+  const [rows] = await db.query(
+    `SELECT a.* FROM ${k.table} a
+      WHERE a.company_id = ? AND a.role_id = ? AND a.line_key = ?
+        AND (a.deleted_at IS NULL OR a.effective_to IS NOT NULL)
+      ORDER BY COALESCE(a.effective_from, '1000-01-01'), a.id`,
+    [companyId, row.role_id, key],
+  );
+  return rows.filter((r) => !isVoid(r));
+}
+
+const CLOSE_SQL = (table) => `UPDATE ${table} SET effective_to = ?, deleted_at = COALESCE(deleted_at, NOW()), ended_by = ? WHERE company_id = ? AND id = ?`;
+
+/**
+ * Versions dated AFTER `on`. One that has already begun is history: refused.
+ * One still to come (a change set for a later day) is replaced by this one —
+ * cancelled, and the version before it reopened to where it ended.
+ */
+async function settleLater(db, c, kind, versions, on) {
+  const k = contentOf(kind);
+  const now = today();
+  const later = versions.filter((v) => isoDate(v.effective_from) && isoDate(v.effective_from) > on);
+  const begun = later.find((v) => isoDate(v.effective_from) <= now);
+  if (begun) {
+    const day = longDay(isoDate(begun.effective_from));
+    throw conflict('LATER_CHANGE', `This line changed again on ${day}. A change dated before that would rewrite what came after it — date it ${day} or later.`);
+  }
+  for (const v of [...later].reverse()) {
+    const from = isoDate(v.effective_from);
+    await db.query(CLOSE_SQL(k.table), [dayBefore(from), c.userId, c.companyId, v.id]);
+    const prev = versions.find((p) => p !== v && isoDate(p.effective_to) === dayBefore(from));
+    if (prev) {
+      const to = isoDate(v.effective_to);
+      await db.query(`UPDATE ${k.table} SET effective_to = ?, deleted_at = ${to ? 'COALESCE(deleted_at, NOW())' : 'NULL'}, ended_by = ? WHERE company_id = ? AND id = ?`,
+        [to, to ? c.userId : null, c.companyId, prev.id]);
+    }
+    await audit(db, c, k.table, v.id, 'DELETE', { effectiveFrom: from }, { cancelled: true, replacedByChangeOn: on });
+  }
+  return later.length;
+}
+
+/** The value a column holds, comparable whatever the driver handed back. */
+function comparable(col, value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (col === 'weight_percent') return Number(value);
+  if (col === 'target_value' || col === 'limit_json') return JSON.stringify(readJson(value));
+  if (col === 'is_mandatory') return Number(value) ? 1 : 0;
+  return String(value);
+}
+
+/**
+ * THE dated change of one role line. `changes` are columns (a new definition
+ * for a rewording, a target, a weight, the KRA it is filed under …).
+ * -> the new version, shaped, with `supersededId` / `supersededOn`.
+ */
+export async function changeRoleLine(db, c, kind, id, changes, { on, reason = null } = {}) {
+  const k = contentOf(kind);
+  const row = await getContentRow(db, c.companyId, kind, id, { includeRetired: true });
+  let versions = await lineVersions(db, c.companyId, kind, row);
+  if (await settleLater(db, c, kind, versions, on)) versions = await lineVersions(db, c.companyId, kind, row);
+  const current = versions.find((v) => inWindow(v, on));
+  if (!current) throw conflict('NOT_IN_FORCE', `That ${k.label.toLowerCase()} is not part of the role on ${longDay(on)}.`);
+
+  await db.query(CLOSE_SQL(k.table), [dayBefore(on), c.userId, c.companyId, current.id]);
+
+  const definition = k.def ? { measurement_type: null } : null;
+  const carried = {
+    role_id: current.role_id,
+    line_key: row.line_key,
+    sequence: current.sequence,
+    effective_from: on,
+    effective_to: isoDate(current.effective_to),
+    change_reason: reason,
+  };
+  if (k.def) carried[k.def.column] = current[k.def.column];
+  if (k.grouped) carried.role_kra_assignment_id = current.role_kra_assignment_id;
+  if (!k.noNotes) carried.notes = current.notes;
+  for (const col of Object.keys(k.fields({}, [], { creating: true, definition }))) carried[col] = current[col];
+  for (const [col, value] of Object.entries(changes)) carried[col] = value;
+  for (const col of ['target_value', 'limit_json']) {
+    if (carried[col] && typeof carried[col] === 'object') carried[col] = JSON.stringify(carried[col]);
+  }
+  const names = Object.keys(carried);
+  const [r] = await db.query(
+    `INSERT INTO ${k.table} (company_id, ${names.join(', ')}, created_by) VALUES (?, ${names.map(() => '?').join(', ')}, ?)`,
+    [c.companyId, ...names.map((n) => carried[n]), c.userId],
+  );
+  // A KRA's lines follow it to its new version (grouping reads through the line, so the past is untouched).
+  if (kind === 'kras') {
+    for (const child of ['responsibilities', 'kpis']) {
+      await db.query(
+        `UPDATE ${CONTENT[child].table} SET role_kra_assignment_id = ? WHERE company_id = ? AND role_kra_assignment_id = ? AND deleted_at IS NULL`,
+        [r.insertId, c.companyId, current.id],
+      );
+    }
+  }
+  await audit(db, c, k.table, current.id, 'UPDATE', shapeContentRow(kind, k, current),
+    { supersededBy: r.insertId, takesEffect: on, closedOn: dayBefore(on), changes, reason });
+  const next = shapeContentRow(kind, k, await getContentRow(db, c.companyId, kind, r.insertId));
+  return { ...next, supersededId: current.id, supersededOn: dayBefore(on) };
+}
+
+/** THE dated removal of one role line: closed the day before `on`. A KRA's lines stay on the role, ungrouped from that day. */
+export async function removeRoleLine(db, c, kind, id, { on, reason = null } = {}) {
+  const k = contentOf(kind);
+  const row = await getContentRow(db, c.companyId, kind, id, { includeRetired: true });
+  let versions = await lineVersions(db, c.companyId, kind, row);
+  const cancelled = await settleLater(db, c, kind, versions, on);
+  if (cancelled) versions = await lineVersions(db, c.companyId, kind, row);
+  const current = versions.find((v) => inWindow(v, on));
+  if (!current) {
+    if (cancelled) return { ok: true, id, kind, endedOn: dayBefore(on), cancelled };
+    throw conflict('NOT_IN_FORCE', `That ${k.label.toLowerCase()} is not part of the role on ${longDay(on)}.`);
+  }
+  let ungrouped = 0;
+  if (kind === 'kras') {
+    const ids = versions.map((v) => Number(v.id));
+    for (const child of ['responsibilities', 'kpis']) {
+      const where = ROW_IN_FORCE('a');
+      const [kids] = await db.query(
+        `SELECT a.id FROM ${CONTENT[child].table} a
+          WHERE a.company_id = ? AND a.role_id = ? AND a.role_kra_assignment_id IN (${ids.map(() => '?').join(',')}) AND ${where}`,
+        [c.companyId, current.role_id, ...ids, on, on],
+      );
+      for (const kid of kids) {
+        await changeRoleLine(db, c, child, kid.id, { role_kra_assignment_id: null }, { on, reason });
+        ungrouped += 1;
+      }
+    }
+  }
+  await db.query(CLOSE_SQL(k.table), [dayBefore(on), c.userId, c.companyId, current.id]);
+  await audit(db, c, k.table, current.id, 'DELETE', shapeContentRow(kind, k, current), { takesEffect: on, endedOn: dayBefore(on), reason });
+  return { ok: true, id, kind, endedOn: dayBefore(on), ungrouped };
+}
+
 export async function addContent(db, c, roleId, kind, input = {}) {
   const k = contentOf(kind);
   await requireRole(db, c.companyId, roleId);
+  const dated = JOB_KINDS.has(kind);
+  // The day it takes effect: before anything is read, so a past day is refused first.
+  const when = dated ? readTakesEffect({ takesEffect: input.takesEffect ?? input.effectiveFrom ?? null, reason: input.reason }, c) : null;
 
   const problems = [];
   let definition = null;
@@ -1202,10 +1398,30 @@ export async function addContent(db, c, roleId, kind, input = {}) {
 
   Object.assign(cols, k.fields(input, problems, { creating: true, definition }));
   Object.assign(cols, commonFields(k, input, problems, { creating: true }));
+  if (dated) {
+    cols.effective_from = when.on;
+    cols.line_key = newLineKey();
+    if (when.past) cols.change_reason = when.reason;
+  }
   if (cols.effective_from && cols.effective_to && cols.effective_to < cols.effective_from) {
     problems.push('Effective to cannot be before effective from.');
   }
   assertNoProblems(problems);
+
+  if (dated && k.def) {
+    // The same line still in force on or after that day — e.g. a change dated ahead
+    // keeps the old version until then. Two of one line would print twice.
+    const [[clash]] = await db.query(
+      `SELECT a.id FROM ${k.table} a
+        WHERE a.company_id = ? AND a.role_id = ? AND a.${k.def.column} = ?
+          AND (a.deleted_at IS NULL OR a.effective_to IS NOT NULL)
+          AND (a.effective_to IS NULL OR a.effective_to >= ?)
+          AND NOT (a.effective_from IS NOT NULL AND a.effective_to IS NOT NULL AND a.effective_to < a.effective_from)
+        LIMIT 1`,
+      [c.companyId, roleId, definition.id, when.on],
+    );
+    if (clash) throw conflict('ALREADY_THERE', `This role already carries "${definition.name}" on ${longDay(when.on)} or after.`);
+  }
 
   if (!cols.sequence) cols.sequence = await nextSequence(db, c.companyId, k.table, roleId);
 
@@ -1219,24 +1435,82 @@ export async function addContent(db, c, roleId, kind, input = {}) {
 }
 
 /**
+ * A job line's edit (spec §16.1). The screen sends the whole form; only what
+ * actually differs from the version in force is a change. The order alone is
+ * edited in place; anything else is a new version from `takesEffect` (today by
+ * default). An end date given is a removal from the day after it.
+ */
+async function updateJobLine(db, c, kind, id, input) {
+  const k = contentOf(kind);
+  const before = await getContentRow(db, c.companyId, kind, id, { includeRetired: true });
+  const problems = [];
+  const definition = k.def ? await requireDefinition(db, c.companyId, k, before[k.def.column]) : null;
+
+  const changes = {};
+  if (k.grouped && input.roleKraAssignmentId !== undefined) {
+    changes.role_kra_assignment_id = await resolveGroup(db, c.companyId, before.role_id, input.roleKraAssignmentId, problems);
+  }
+  Object.assign(changes, k.fields(input, problems, { creating: false, definition }));
+  const common = commonFields(k, input, problems, { creating: false });
+  if (common.sequence !== undefined) changes.sequence = common.sequence;
+  if (common.notes !== undefined) changes.notes = common.notes;
+  assertNoProblems(problems);
+
+  const fromGiven = common.effective_from;
+  const takes = input.takesEffect
+    ?? (fromGiven && fromGiven !== isoDate(before.effective_from) ? fromGiven : null);
+  const when = readTakesEffect({ takesEffect: takes, reason: input.reason }, c);
+
+  const diff = {};
+  for (const [col, value] of Object.entries(changes)) {
+    if (comparable(col, value) !== comparable(col, before[col])) diff[col] = value;
+  }
+  let result = null;
+  if (Object.keys(diff).length === 1 && diff.sequence !== undefined) {
+    await db.query(`UPDATE ${k.table} SET sequence = ? WHERE company_id = ? AND id = ?`, [diff.sequence, c.companyId, id]);
+    await audit(db, c, k.table, id, 'UPDATE', { sequence: before.sequence }, { sequence: diff.sequence });
+  } else if (Object.keys(diff).length) {
+    result = await changeRoleLine(db, c, kind, id, diff, when);
+  }
+
+  if (common.effective_to !== undefined && common.effective_to !== isoDate(before.effective_to)) {
+    const target = result?.id ?? id;
+    if (common.effective_to) {
+      const end = readTakesEffect({ takesEffect: dayAfterIso(common.effective_to), reason: input.reason }, c);
+      await removeRoleLine(db, c, kind, target, end);
+    } else {
+      // An end that was planned and is now not: the version reopens (only one still to end).
+      const row = await getContentRow(db, c.companyId, kind, target, { includeRetired: true });
+      const to = isoDate(row.effective_to);
+      if (to && to >= dayBefore(today())) {
+        await db.query(`UPDATE ${k.table} SET effective_to = NULL, deleted_at = NULL, ended_by = NULL WHERE company_id = ? AND id = ?`, [c.companyId, target]);
+        await audit(db, c, k.table, target, 'UPDATE', { effectiveTo: to }, { effectiveTo: null });
+      }
+    }
+  }
+  const after = await getContentRow(db, c.companyId, kind, result?.id ?? id, { includeRetired: true });
+  return { ...shapeContentRow(kind, k, after), ...(result ? { supersededId: result.supersededId, supersededOn: result.supersededOn } : {}) };
+}
+
+const dayAfterIso = (iso) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+};
+
+/**
  * Rule 2 — effective-dated rows are ENDED, not overwritten (plan §2 rule 8).
  *
- * A plain correction (a typo in the notes, an order change, a weight that was
- * always meant to be 40) edits the row. A DATED change — the caller passes an
- * `effectiveFrom` later than the row's own start — is a different fact about a
- * different period, so the current row is CLOSED the day before and a successor
- * opens on the new date.
+ * KRAs, responsibilities and KPIs: every change is dated (updateJobLine above).
  *
- * The schema allows only one live row per (role, definition): `uq_hrka_pair` and
- * its siblings are built on a virtual column that is the definition id while
- * `deleted_at IS NULL`. So the closed predecessor is retired from the live set
- * as it is closed. It keeps its dates and its values, `GET /content?on=<past>`
- * still returns it for the period it applied to, and the full before/after is in
- * hrms_audit_log. That is the honest reading of "ended, not overwritten" against
- * this schema — the alternative would be to overwrite the row and lose the fact
- * that it ever said something else.
+ * The other six kinds: a plain correction (a typo in the notes, a weight that
+ * was always meant to be 40) edits the row. A DATED change — the caller passes
+ * an `effectiveFrom` later than the row's own start — is a different fact about
+ * a different period, so the current row is CLOSED the day before and a
+ * successor opens on the new date.
  */
 export async function updateContent(db, c, kind, id, input = {}) {
+  if (JOB_KINDS.has(kind)) return updateJobLine(db, c, kind, id, input ?? {});
   const k = contentOf(kind);
   const before = await getContentRow(db, c.companyId, kind, id);
   const roleId = before.role_id;
@@ -1247,9 +1521,6 @@ export async function updateContent(db, c, kind, id, input = {}) {
     : null;
 
   const changes = {};
-  if (k.grouped && input.roleKraAssignmentId !== undefined) {
-    changes.role_kra_assignment_id = await resolveGroup(db, c.companyId, roleId, input.roleKraAssignmentId, problems);
-  }
   Object.assign(changes, k.fields(input, problems, { creating: false, definition }));
   Object.assign(changes, commonFields(k, input, problems, { creating: false }));
 
@@ -1292,11 +1563,9 @@ export async function updateContent(db, c, kind, id, input = {}) {
     effective_to: changes.effective_to !== undefined ? changes.effective_to : isoDate(before.effective_to),
   };
   if (k.def) carried[k.def.column] = before[k.def.column];
-  if (k.grouped) carried.role_kra_assignment_id = before.role_kra_assignment_id;
   if (!k.noNotes) carried.notes = before.notes;
   for (const col of Object.keys(k.fields({}, [], { creating: true, definition }))) carried[col] = before[col];
   for (const [col, value] of Object.entries(changes)) carried[col] = value;
-  // JSON columns come back from the driver as objects; they go in as text.
   for (const col of ['target_value', 'limit_json']) {
     if (carried[col] && typeof carried[col] === 'object') carried[col] = JSON.stringify(carried[col]);
   }
@@ -1306,22 +1575,6 @@ export async function updateContent(db, c, kind, id, input = {}) {
     `INSERT INTO ${k.table} (company_id, ${names.join(', ')}, created_by) VALUES (?, ${names.map(() => '?').join(', ')}, ?)`,
     [c.companyId, ...names.map((n) => carried[n]), c.userId],
   );
-  /**
-   * A superseded KRA takes its children with it. Without this, changing a KRA's
-   * weight on a date would silently drop every responsibility and KPI grouped
-   * under it into "Additional" — the structure the whole screen exists to show,
-   * undone by a weight edit.
-   */
-  if (kind === 'kras') {
-    for (const child of ['responsibilities', 'kpis']) {
-      await db.query(
-        `UPDATE ${CONTENT[child].table} SET role_kra_assignment_id = ?
-          WHERE company_id = ? AND role_kra_assignment_id = ? AND deleted_at IS NULL`,
-        [r.insertId, c.companyId, id],
-      );
-    }
-  }
-
   await audit(db, c, k.table, id, 'UPDATE', shapeContentRow(kind, k, before), { supersededBy: r.insertId, closedOn: closeOn, ...carried });
 
   const next = shapeContentRow(kind, k, await getContentRow(db, c.companyId, kind, r.insertId));
@@ -1329,12 +1582,18 @@ export async function updateContent(db, c, kind, id, input = {}) {
 }
 
 /**
- * Unassigning. The row is CLOSED on the end date and retired — it is not
- * silently erased, because a role that carried a KRA until March genuinely
- * carried it until March, and the JD generated in February must still be
- * explicable.
+ * Unassigning. The row is CLOSED and retired — never erased, because a role
+ * that carried a KRA until March genuinely carried it until March, and the JD
+ * generated in February must still be explicable.
+ *   job content   `takesEffect` (default today) is the first day without it;
+ *                 `endOn`, the older way of saying it, is the last day with it.
+ *   other kinds   closed on `endOn` (default today).
  */
-export async function removeContent(db, c, kind, id, { endOn } = {}) {
+export async function removeContent(db, c, kind, id, { endOn, takesEffect, reason } = {}) {
+  if (JOB_KINDS.has(kind)) {
+    const when = readTakesEffect({ takesEffect: takesEffect ?? (endOn ? dayAfterIso(String(endOn).slice(0, 10)) : null), reason }, c);
+    return removeRoleLine(db, c, kind, id, when);
+  }
   const k = contentOf(kind);
   const before = await getContentRow(db, c.companyId, kind, id);
   const problems = [];
@@ -1356,7 +1615,7 @@ export async function removeContent(db, c, kind, id, { endOn } = {}) {
  * Reorder in one write. `sequence` is what the JD prints in, so dragging a
  * responsibility above another has to be one atomic renumber — a half-applied
  * reorder leaves two rows claiming position 3 and the JD order becomes the
- * insertion order again.
+ * insertion order again. In place, also for job content: order is layout.
  */
 export async function reorderContent(db, c, roleId, kind, ids) {
   const k = contentOf(kind);
@@ -1383,19 +1642,13 @@ export async function reorderContent(db, c, roleId, kind, ids) {
 /**
  * Regrouping a responsibility or a KPI under a different KRA (or out to
  * Additional). Its own endpoint because it is the one edit that has to re-check
- * rule 1, and because the screen does it by drag, not by form.
+ * rule 1, and because the screen does it by drag, not by form. Dated, like every
+ * other change to job content: from today, or `takesEffect`.
  */
-export async function regroupContent(db, c, kind, id, roleKraAssignmentId) {
+export async function regroupContent(db, c, kind, id, roleKraAssignmentId, { takesEffect, reason } = {}) {
   const k = contentOf(kind);
   if (!k.grouped) throw invalid('INVALID', `${k.label} is not grouped under a KRA.`);
-  const before = await getContentRow(db, c.companyId, kind, id);
-  const problems = [];
-  const group = await resolveGroup(db, c.companyId, before.role_id, roleKraAssignmentId, problems);
-  assertNoProblems(problems);
-
-  await db.query(`UPDATE ${k.table} SET role_kra_assignment_id = ? WHERE company_id = ? AND id = ?`, [group, c.companyId, id]);
-  await audit(db, c, k.table, id, 'UPDATE', { roleKraAssignmentId: before.role_kra_assignment_id }, { roleKraAssignmentId: group });
-  return shapeContentRow(kind, k, await getContentRow(db, c.companyId, kind, id));
+  return updateJobLine(db, c, kind, id, { roleKraAssignmentId, takesEffect, reason });
 }
 
 /**

@@ -41,7 +41,13 @@
  *                                              definition of that name, or creates it, and assigns it
  *   PUT    /role-kras/:id                      { name?, description? } rename; a KRA another role shares is
  *                                              given its own definition here rather than renamed for both
- *   DELETE /role-kras/:id                      the KRA goes; ITS LINES STAY on the role, ungrouped
+ *   DELETE /role-kras/:id?takesEffect=&reason= the KRA goes from that day; ITS LINES STAY on the role, ungrouped
+ *   GET    /roles/:id/job-content/history      the dated list of changes (spec §16.3)
+ *   POST   /role-content/:kind/:id/reword      { text, takesEffect?, reason? } a responsibility's or KPI's wording, from a day
+ *
+ * EVERY CHANGE TO A KRA, RESPONSIBILITY OR KPI IS DATED (spec §16.1): `takesEffect`
+ * (default today; a past day only for the Owner, with `reason`) on add, edit,
+ * rewording, regrouping, KRA rename and removal.
  *   PUT    /roles/:id/content-group            { roleKraAssignmentId|null, responsibilities: [id], kpis: [id] }
  *                                              move several lines under one KRA in one write
  *
@@ -79,8 +85,9 @@ import {
   describeCopySource, previewCopy, executeCopy, permissionsForCopyMode,
 } from '../services/contentCopyService.js';
 import {
-  roleJobContent, createRoleKra, renameRoleKra, deleteRoleKra, moveRoleLines,
+  roleJobContent, createRoleKra, renameRoleKra, deleteRoleKra, moveRoleLines, rewordRoleLine,
 } from '../services/jobContentService.js';
+import { roleJobHistory } from '../services/jobHistoryService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -174,13 +181,17 @@ router.get('/roles/:id/job-content', guard(PERM.roles.view), handle((req) => rol
 router.post('/roles/:id/kras', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
 router.put('/roles/:id/content-group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => moveRoleLines(db, c, intParam(req.params.id), req.body ?? {}))));
 router.put('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => renameRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
-router.delete('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteRoleKra(db, c, intParam(req.params.id)))));
+router.delete('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteRoleKra(db, c, intParam(req.params.id), { takesEffect: req.query.takesEffect, reason: req.query.reason }))));
+// Spec §16: the dated list of changes to the role's job content.
+router.get('/roles/:id/job-content/history', guard(PERM.roles.view), handle((req) => roleJobHistory(pool, ctx(req).companyId, intParam(req.params.id))));
+// Spec §16.1: a role line's wording, changed from a day — a new version of the same line, never an edit of the shared library text.
+router.post('/role-content/:kind/:id/reword', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => rewordRoleLine(db, c, req.params.kind === 'kpis' ? 'KPI' : req.params.kind === 'responsibilities' ? 'RESPONSIBILITY' : req.params.kind, intParam(req.params.id), req.body ?? {}))));
 
 // ----- role content --------------------------------------------------------
 router.post('/roles/:id/content/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => addContent(db, c, intParam(req.params.id), req.params.kind, req.body))));
 router.put('/roles/:id/content/:kind/order', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => reorderContent(db, c, intParam(req.params.id), req.params.kind, req.body?.ids))));
-router.put('/role-content/:kind/:id/group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => regroupContent(db, c, req.params.kind, intParam(req.params.id), req.body?.roleKraAssignmentId ?? null))));
+router.put('/role-content/:kind/:id/group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => regroupContent(db, c, req.params.kind, intParam(req.params.id), req.body?.roleKraAssignmentId ?? null, { takesEffect: req.body?.takesEffect, reason: req.body?.reason }))));
 router.put('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateContent(db, c, req.params.kind, intParam(req.params.id), req.body))));
-router.delete('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => removeContent(db, c, req.params.kind, intParam(req.params.id), { endOn: req.query.endOn }))));
+router.delete('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => removeContent(db, c, req.params.kind, intParam(req.params.id), { endOn: req.query.endOn, takesEffect: req.query.takesEffect, reason: req.query.reason }))));
 
 export default router;
