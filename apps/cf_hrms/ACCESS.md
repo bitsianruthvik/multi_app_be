@@ -375,5 +375,10 @@ How to read the tables below:
 | `GET /imports/status` | `cf_hrms_employee_bulk_add` |  |
 | `GET /overview/nav-counts` | any login with access to the app |  |
 | `GET /overview/home` | any login with access to the app |  |
+| `GET /commands/actions` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `GET /commands/options` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `POST /commands/read` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
 
-274 routes.
+279 routes.

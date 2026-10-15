@@ -67,10 +67,10 @@
  * from the role layer, every row tagged `origin: 'ROLE'`, and they say so.
  */
 import { notFound } from '../lib/errors.js';
-import { getRoleContent } from './roleContentService.js';
+import { getRoleContent, effectiveWhere, CONTENT as ROLE_CONTENT } from './roleContentService.js';
 import {
   dateText, today, blank, CONTENT_TYPES,
-  listPositionOverrides,
+  listPositionOverrides, shapeOverride,
 } from './positionService.js';
 import { listAssignmentOverrides } from './assignmentService.js';
 
@@ -792,6 +792,104 @@ async function loadDefinitions(db, companyId, overlaySets) {
     );
     for (const r of rows) out.set(`${kind}:${r.id}`, r);
   }));
+  return out;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * effectiveLinesForPositions — the same resolution, for MANY positions at once
+ * ══════════════════════════════════════════════════════════════════════════
+ * The org chart search asks "which seats carry this line" across all ~220
+ * positions; calling resolveContent per position would be ~1,000 queries. This
+ * is the SAME rule — role rows in force on the date (roleContentService's own
+ * `effectiveWhere`), then the position overlay's live rows applied SUPPRESS,
+ * then OVERRIDE, then ADD, an ADD of a line already present applied as an
+ * override, a SUPPRESS of a line not present ignored — with the role rows and
+ * the overlay rows read once for the whole company (one query per kind, plus
+ * one for the overlays). It returns only what a search needs: which lines, and
+ * where each came from. `semantic_search_test.mjs` checks it against
+ * resolveContent for every Karni position, so the two cannot drift silently.
+ *
+ * The assignment layer is not applied: a search answers with POSITIONS, and
+ * a person's own exceptions are not the seat's.
+ *
+ * QUALIFICATION has no overlay (see the header) and comes from the role, as in
+ * resolveContent.
+ *
+ * @param positions  [{ id, roleId }]
+ * @returns Map(positionId -> [{ kind, definitionId, origin: 'ROLE'|'POSITION', overridden }])
+ */
+const ROLE_CONTENT_KEY = { KRA: 'kras', RESPONSIBILITY: 'responsibilities', KPI: 'kpis', QUALIFICATION: 'qualifications' };
+
+export async function effectiveLinesForPositions(db, companyId, positions, { on, kinds = [...CONTENT_TYPES, 'QUALIFICATION'] } = {}) {
+  const date = dateText(on) || today();
+  const wanted = kinds.filter((k) => ROLE_CONTENT_KEY[k]);
+  const out = new Map(positions.map((p) => [Number(p.id), []]));
+  if (!positions.length || !wanted.length) return out;
+
+  const overlayKinds = wanted.filter((k) => CONTENT_TYPES.includes(k));
+  const where = effectiveWhere('a', { on: date, scope: 'effective' });
+  const [roleRowsByKind, overlayRows] = await Promise.all([
+    Promise.all(wanted.map(async (kind) => {
+      const k = ROLE_CONTENT[ROLE_CONTENT_KEY[kind]];
+      const [rows] = await db.query(
+        `SELECT a.role_id, a.${k.def.column} AS definition_id
+           FROM ${k.table} a
+          WHERE a.company_id = ? AND ${where.sql}
+          ORDER BY a.sequence, a.id`,
+        [companyId, ...where.params],
+      );
+      return [kind, rows];
+    })),
+    overlayKinds.length
+      ? db.query(
+        `SELECT o.* FROM hrms_position_content_overrides o
+          WHERE o.company_id = ? AND o.deleted_at IS NULL
+          ORDER BY o.content_type, o.action, o.id`,
+        [companyId],
+      ).then(([rows]) => rows
+        .map((r) => ({ ...shapeOverride(r), positionId: Number(r.position_id) }))
+        .filter((o) => liveOn(o, date)))
+      : [],
+  ]);
+
+  const roleLines = new Map();   // `${kind}:${roleId}` -> [definitionId] in role order
+  for (const [kind, rows] of roleRowsByKind) {
+    for (const r of rows) {
+      const key = `${kind}:${r.role_id}`;
+      if (!roleLines.has(key)) roleLines.set(key, []);
+      roleLines.get(key).push(Number(r.definition_id));
+    }
+  }
+  const overlayOf = new Map();   // positionId -> rows
+  for (const o of overlayRows) {
+    const pid = o.positionId;
+    if (!overlayOf.has(pid)) overlayOf.set(pid, []);
+    overlayOf.get(pid).push(o);
+  }
+
+  for (const p of positions) {
+    const bucket = {};
+    for (const kind of wanted) {
+      bucket[kind] = (roleLines.get(`${kind}:${p.roleId}`) ?? [])
+        .map((definitionId) => ({ kind, definitionId, origin: 'ROLE', overridden: false, changes: [] }));
+    }
+    const rows = overlayOf.get(Number(p.id)) ?? [];
+    for (const action of ACTION_ORDER) {
+      for (const o of rows.filter((r) => r.action === action)) {
+        const kind = o.contentType;
+        if (!overlayKinds.includes(kind) || o[DEF_FIELD[kind]] == null) continue;
+        const definitionId = Number(o[DEF_FIELD[kind]]);
+        const at = bucket[kind].findIndex((i) => Number(i.definitionId) === definitionId);
+        if (action === 'SUPPRESS') { if (at >= 0) bucket[kind].splice(at, 1); continue; }
+        if (action === 'OVERRIDE') { if (at >= 0) applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
+        if (at >= 0) { applyOverrideJson(bucket[kind][at], o, 'POSITION'); continue; }
+        bucket[kind].push({ kind, definitionId, origin: 'POSITION', overridden: false, changes: [] });
+      }
+    }
+    out.set(Number(p.id), wanted.flatMap((kind) => bucket[kind].map((l) => ({
+      kind: l.kind, definitionId: l.definitionId, origin: l.origin, overridden: l.overridden,
+    }))));
+  }
   return out;
 }
 

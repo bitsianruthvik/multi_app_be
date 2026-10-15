@@ -65,6 +65,11 @@ import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
 import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
 import { getRoleContent } from './roleContentService.js';
+import { effectiveLinesForPositions } from './contentResolver.js';
+import { embed, dot, ModelUnavailable } from './semantic/embedder.js';
+import {
+  DEFINITION_SOURCES, definitionText, loadDefinitions, vectorsFor,
+} from './semantic/searchIndex.js';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Shift vocabulary
@@ -1042,80 +1047,246 @@ export async function getPositionCard(db, companyId, positionId, { on, scope } =
 /* ══════════════════════════════════════════════════════════════════════════
  * Search
  * ══════════════════════════════════════════════════════════════════════════
- * Free text across the four content kinds, answering with POSITIONS — because
- * "who is responsible for the ink store" is a question about seats, not about
- * definitions. Multi-word AND: every word must appear somewhere in the row's
- * name or description, not necessarily in the same field.
+ * Free text across the job content, answering with POSITIONS — because "who is
+ * responsible for the ink store" is a question about seats, not about
+ * definitions.
+ *
+ * TWO WAYS TO MATCH A LINE (`mode`):
+ *   exact    every word must appear somewhere in the line's name or description
+ *            (SQL LIKE, multi-word AND) — the original behaviour.
+ *   meaning  (default) the built-in sentence model (semantic/embedder.js) scores
+ *            every line against the question, so "machine stops" finds "Record
+ *            machine stoppages" and "hiring people" finds "Recruitment: source
+ *            candidates". Lines are matched when
+ *                cosine >= MEANING_FLOOR   or   every word appears (an exact hit
+ *                                                is never lost to the model)
+ *            and scored
+ *                score = (cosine + 0.3 * keyword) / 1.3          (0..1)
+ *                keyword = 1    the whole question appears as a phrase
+ *                          0.6  every word appears, not as one phrase
+ *                          0.3 x (share of the question's words that appear)
+ *            so an exact phrase hit ranks above a loose match by meaning. A line
+ *            whose vector is not built yet (more stale ones than the inline cap,
+ *            semantic/searchIndex.js) can only match by keyword this time, and
+ *            counts its cosine as MEANING_FLOOR.
+ *            If the model cannot load, the search runs as `exact` and says so:
+ *            `mode: 'keyword'` with a one-line `notice`.
+ *
+ * WHICH LINES A POSITION HAS. Its EFFECTIVE lines — the role's, minus the ones
+ * this position switched off, plus the ones it added (a wording change is one of
+ * each) — from contentResolver.effectiveLinesForPositions, the batch twin of
+ * resolveContent. A handful of company-wide queries; nothing per position.
+ * `origin` on a match says whether the line is the role's or the position's own.
+ *
+ * Rights: `cf_hrms_positions_view`, like the chart. The chart is company-wide for
+ * a department-scoped login (accessScope.js: "WHAT IS NOT: the structure"), so
+ * the search is too.
  */
-const SEARCH_KINDS = [
-  { kind: 'RESPONSIBILITY', table: 'hrms_role_responsibility_assignments', def: 'hrms_responsibility_definitions', fk: 'responsibility_definition_id' },
-  { kind: 'KRA', table: 'hrms_role_kra_assignments', def: 'hrms_kra_definitions', fk: 'kra_definition_id' },
-  { kind: 'KPI', table: 'hrms_role_kpi_assignments', def: 'hrms_kpi_definitions', fk: 'kpi_definition_id' },
-  { kind: 'QUALIFICATION', table: 'hrms_role_qualification_requirements', def: 'hrms_qualification_definitions', fk: 'qualification_definition_id' },
-];
+export const SEARCH_KIND_NAMES = ['KRA', 'RESPONSIBILITY', 'KPI', 'QUALIFICATION'];
+export const DEFAULT_SEARCH_KINDS = ['KRA', 'RESPONSIBILITY', 'KPI'];
+export const SEARCH_MODES = ['meaning', 'exact'];
+export const MEANING_FLOOR = 0.45;
+const KEYWORD_WEIGHT = 0.3;
+const MATCHES_SHOWN = 6;
+const KIND_ALIAS = {
+  KRA: 'KRA', KRAS: 'KRA',
+  RESPONSIBILITY: 'RESPONSIBILITY', RESPONSIBILITIES: 'RESPONSIBILITY',
+  KPI: 'KPI', KPIS: 'KPI',
+  QUALIFICATION: 'QUALIFICATION', QUALIFICATIONS: 'QUALIFICATION',
+};
+const MEMORY_NOTICE = 'The server is short of memory right now, so search by meaning is paused and these are the lines that contain every word you typed.';
+const MODEL_NOTICE = 'Search by meaning is not available right now, so these are the lines that contain every word you typed.';
 
 /** `%` and `_` are wildcards in LIKE, so a user typing them means them literally. */
 const likeTerm = (word) => `%${String(word).replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
 
-export async function searchOrgChart(db, companyId, { q, on, limit = 200 } = {}) {
+/** "KRA,responsibilities" -> ['KRA','RESPONSIBILITY']. Absent -> the default. Unknown -> 400. */
+export function readSearchKinds(value, fallback = DEFAULT_SEARCH_KINDS) {
+  if (value == null || value === '') return [...fallback];
+  const parts = (Array.isArray(value) ? value : String(value).split(','))
+    .map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+  const unknown = parts.filter((p) => !KIND_ALIAS[p]);
+  if (unknown.length) {
+    throw invalid('INVALID', `Unknown content kind: ${unknown.join(', ')}. Use KRA, RESPONSIBILITY or KPI.`);
+  }
+  const kinds = [...new Set(parts.map((p) => KIND_ALIAS[p]))];
+  if (!kinds.length) throw invalid('INVALID', 'Choose at least one of KRAs, responsibilities or KPIs.');
+  return kinds;
+}
+
+function readSearchMode(value, fallback) {
+  if (value == null || value === '') return fallback;
+  const m = String(value).trim().toLowerCase();
+  if (!SEARCH_MODES.includes(m)) throw invalid('INVALID', 'mode is "meaning" or "exact".');
+  return m;
+}
+
+/** How much of the question appears word for word in a line (lower-cased, LIKE-style substrings). */
+export function keywordSignal(q, words, text) {
+  const t = String(text ?? '').toLowerCase().replace(/\s+/g, ' ');
+  const phraseText = String(q ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const lw = words.map((w) => w.toLowerCase());
+  const present = lw.filter((w) => t.includes(w)).length;
+  const all = lw.length > 0 && present === lw.length;
+  const phrase = all && phraseText.length > 0 && t.includes(phraseText);
+  const keyword = phrase ? 1 : all ? 0.6 : 0.3 * (lw.length ? present / lw.length : 0);
+  return { all, phrase, keyword };
+}
+
+const blend = (cosine, keyword) => Math.max(0, Math.min(1, (cosine + KEYWORD_WEIGHT * keyword) / (1 + KEYWORD_WEIGHT)));
+const round3 = (n) => Math.round(n * 1000) / 1000;
+
+/** EXACT: definitions with every word, one LIKE query per kind. -> Map(key -> match). */
+async function exactMatches(db, companyId, kinds, words) {
+  const wordSql = words.map(() => `CONCAT_WS(' ', d.name, d.description) LIKE ? ESCAPE '\\\\'`).join(' AND ');
+  const lists = await Promise.all(kinds.map(async (kind) => {
+    const [rows] = await db.query(
+      `SELECT d.id, d.name, d.description FROM ${DEFINITION_SOURCES[kind]} d
+        WHERE d.company_id = ? AND d.deleted_at IS NULL AND ${wordSql}`,
+      [companyId, ...words.map(likeTerm)],
+    );
+    return rows.map((r) => [`${kind}:${r.id}`, {
+      kind, definitionId: Number(r.id), text: definitionText(r.name, r.description), score: 1,
+    }]);
+  }));
+  return new Map(lists.flat());
+}
+
+/** MEANING: every definition of the kinds, scored. -> { matches: Map, pending } */
+async function meaningMatches(db, companyId, kinds, q, words) {
+  const defs = await loadDefinitions(db, companyId, kinds);
+  const [queryVec] = await embed([q]);
+  const { vectors, pending } = await vectorsFor(db, companyId, defs);
+  const matches = new Map();
+  for (const d of defs) {
+    const key = `${d.kind}:${d.id}`;
+    const kw = keywordSignal(q, words, d.text);
+    const vec = vectors.get(key);
+    const cosine = vec ? dot(queryVec, vec) : null;
+    if (!(kw.all || (cosine != null && cosine >= MEANING_FLOOR))) continue;
+    matches.set(key, {
+      kind: d.kind,
+      definitionId: d.id,
+      text: d.text,
+      score: round3(blend(cosine ?? MEANING_FLOOR, kw.keyword)),
+      similarity: cosine == null ? null : round3(cosine),
+    });
+  }
+  return { matches, pending: pending.length };
+}
+
+/**
+ * The search, with its envelope: { mode, notice, kinds, pending, items }.
+ *   mode     'meaning' | 'exact' | 'keyword' (meaning was asked for, the model was not there)
+ *   pending  lines matched by keyword only this time because their vector is not built yet
+ *   items    position hits, best first
+ */
+export async function searchJobContent(db, companyId, {
+  q, on, limit = 200, kinds, mode,
+} = {}) {
   const asOf = dateText(on) || today();
   const words = String(q ?? '').trim().split(/\s+/).filter(Boolean).slice(0, 8);
   if (!words.length) throw invalid('INVALID', 'Type something to search for.');
-
+  const question = words.join(' ');
+  const chosen = readSearchKinds(kinds);
+  let usedMode = readSearchMode(mode, 'meaning');
   const cap = Math.min(Math.max(Number(limit) || 200, 1), 1000);
-  // Hits are positions, and seven chairs of one card all match the same role
-  // line — so each hit says which card it is drawn in and the client can show
-  // one box, not seven. Read beside the searches, not after them.
-  const cardsPromise = loadCards(db, companyId, asOf);
-  const perKind = await Promise.all(SEARCH_KINDS.map(async ({ kind, table, def, fk }) => {
-    const wordSql = words.map(() => `CONCAT_WS(' ', d.name, d.description) LIKE ? ESCAPE '\\\\'`).join(' AND ');
-    const [rows] = await db.query(
-      `SELECT p.id AS position_id, p.position_code,
-              COALESCE(p.position_title, r.title) AS title,
-              d.id AS definition_id, d.name, d.description
-         FROM ${table} a
-         JOIN ${def} d ON d.company_id = a.company_id AND d.id = a.${fk} AND d.deleted_at IS NULL
-         JOIN hrms_positions p ON p.company_id = a.company_id AND p.role_id = a.role_id
-              AND p.deleted_at IS NULL AND p.status <> 'CLOSED' AND ${LIVE_ON('p')}
-         LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
-        WHERE a.company_id = ? AND a.deleted_at IS NULL AND ${LIVE_ON('a')}
-          AND ${wordSql}
-        ORDER BY p.position_code, d.id
-        LIMIT 5000`,
-      [asOf, asOf, companyId, asOf, asOf, ...words.map(likeTerm)],
-    );
-    return rows.map((r) => ({ ...r, kind }));
-  }));
 
+  // Hits are positions, and the chairs of one card match the same role line —
+  // so each hit says which card it is drawn in. Read beside the matching.
+  const cardsPromise = loadCards(db, companyId, asOf);
+  const positionsPromise = db.query(
+    `SELECT p.id, p.role_id, p.position_code, COALESCE(p.position_title, r.title) AS title
+       FROM hrms_positions p
+       LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+      WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED' AND ${LIVE_ON('p')}
+        AND p.role_id IS NOT NULL
+      ORDER BY p.position_code, p.id`,
+    [companyId, asOf, asOf],
+  ).then(([rows]) => rows);
+
+  let notice = null;
+  let pending = 0;
+  let matches;
+  if (usedMode === 'meaning') {
+    try {
+      ({ matches, pending } = await meaningMatches(db, companyId, chosen, question, words));
+      if (pending) notice = `${pending} recently changed line${pending === 1 ? ' was' : 's were'} matched by exact words only this time.`;
+    } catch (err) {
+      if (!(err instanceof ModelUnavailable)) throw err;
+      usedMode = 'keyword';
+      notice = err.reason === 'memory' ? MEMORY_NOTICE : MODEL_NOTICE;
+    }
+  }
+  if (usedMode !== 'meaning') matches = await exactMatches(db, companyId, chosen, words);
+
+  const positions = await positionsPromise;
+  const linesOf = matches.size
+    ? await effectiveLinesForPositions(
+      db, companyId,
+      positions.map((p) => ({ id: p.id, roleId: p.role_id })),
+      { on: asOf, kinds: chosen },
+    )
+    : new Map();
   const { cardOf } = await cardsPromise;
-  const byPosition = new Map();
-  for (const r of perKind.flat()) {
-    const entry = byPosition.get(r.position_id) ?? {
-      positionId: r.position_id,
-      cardId: cardOf.get(r.position_id) ?? r.position_id,
-      positionCode: r.position_code ?? null,
-      title: r.title,
-      matches: [],
-      matchCount: 0,
-    };
-    entry.matchCount += 1;
-    // The card is one click away and carries the full lists, so a handful of
-    // matching lines is enough to tell the user why this box came back.
-    if (entry.matches.length < 6) {
-      entry.matches.push({
-        kind: r.kind,
-        definitionId: r.definition_id,
-        text: (r.name && String(r.name).trim()) || (r.description ? String(r.description).slice(0, 250) : ''),
+
+  const items = [];
+  for (const p of positions) {
+    const seen = new Set();
+    const hit = [];
+    for (const line of linesOf.get(Number(p.id)) ?? []) {
+      const key = `${line.kind}:${line.definitionId}`;
+      const m = matches.get(key);
+      if (!m || seen.has(key)) continue;
+      seen.add(key);
+      hit.push({
+        kind: m.kind,
+        definitionId: m.definitionId,
+        text: m.text.length > 300 ? `${m.text.slice(0, 297).trimEnd()}...` : m.text,
+        score: m.score,
+        origin: line.origin,
       });
     }
-    byPosition.set(r.position_id, entry);
+    if (!hit.length) continue;
+    hit.sort((a, b) => b.score - a.score || a.kind.localeCompare(b.kind) || a.definitionId - b.definitionId);
+    items.push({
+      positionId: p.id,
+      cardId: cardOf.get(p.id) ?? p.id,
+      positionCode: p.position_code ?? null,
+      title: p.title,
+      score: hit[0].score,
+      // The card is one click away and carries the full lists, so a handful of
+      // matching lines is enough to tell the user why this box came back.
+      matches: hit.slice(0, MATCHES_SHOWN),
+      matchCount: hit.length,
+    });
   }
-
-  const items = [...byPosition.values()].sort((a, b) => b.matchCount - a.matchCount
+  items.sort((a, b) => b.score - a.score || b.matchCount - a.matchCount
     || String(a.positionCode ?? '').localeCompare(String(b.positionCode ?? '')));
 
-  // Spec §9 fixes this as a bare array of hits — the route returns it as it is.
-  return items.slice(0, cap);
+  return {
+    mode: usedMode,
+    notice,
+    kinds: chosen,
+    pending,
+    total: items.length,
+    items: items.slice(0, cap),
+  };
+}
+
+/**
+ * The original call shape: a BARE ARRAY of hits (spec §9). Defaults to the
+ * original behaviour — every word must appear, across all four kinds — so a
+ * caller that never heard of `mode` or `kinds` gets what it always got (now with
+ * `score` and `origin` added, and position-level changes taken into account).
+ */
+export async function searchOrgChart(db, companyId, opts = {}) {
+  const { items } = await searchJobContent(db, companyId, {
+    ...opts,
+    mode: opts.mode ?? 'exact',
+    kinds: opts.kinds ?? SEARCH_KIND_NAMES,
+  });
+  return items;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

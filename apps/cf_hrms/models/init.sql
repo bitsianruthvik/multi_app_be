@@ -3299,3 +3299,38 @@ CREATE TABLE IF NOT EXISTS hrms_access_roles (
   CONSTRAINT fk_hacr_role    FOREIGN KEY (role_id)    REFERENCES roles(id),
   CONSTRAINT fk_hacr_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 16. SEARCH BY MEANING (org chart "Search job content", 2026-10-15)       ##
+-- ############################################################################
+-- One sentence vector per KRA / responsibility / KPI / qualification definition,
+-- made by the built-in model (services/semantic/embedder.js — nothing leaves the
+-- server). `text_hash` is the SHA-256 of the exact text embedded (name + ' ' +
+-- description); a definition whose text changed no longer matches its hash and
+-- is re-embedded (services/semantic/searchIndex.js). `model` keys the row, so a
+-- different model builds its own rows and never mixes with these.
+--
+-- `vector` is `dims` Float32 values, little-endian (384 x 4 = 1,536 bytes).
+-- `kind` is a VARCHAR, not an ENUM: RESPONSIBILITY | KRA | KPI | QUALIFICATION.
+-- deleted_at is there because every hrms_ table has one (the test suites and the
+-- tenant tools count live rows by it); the code never soft-deletes a vector — a
+-- row is derived data, rebuilt at will, and a deleted definition simply stops
+-- being looked up. A row with deleted_at set is ignored and revived by an upsert.
+CREATE TABLE IF NOT EXISTS hrms_search_vectors (
+  id             BIGINT        AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  kind           VARCHAR(20)   NOT NULL,
+  definition_id  INT           NOT NULL,
+  text_hash      CHAR(64)      NOT NULL,
+  model          VARCHAR(80)   NOT NULL,
+  dims           SMALLINT      NOT NULL,
+  vector         BLOB          NOT NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hsv_def (company_id, kind, definition_id, model),
+  KEY idx_hsv_model (company_id, model),
+
+  CONSTRAINT fk_hsv_company FOREIGN KEY (company_id) REFERENCES companies(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

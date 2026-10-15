@@ -1020,7 +1020,7 @@ function shapeContentRow(kind, kindDef, r) {
  * as the old weight when you ask for 1 May. Retiring never edits the past, and
  * it never keeps a row in the present.
  */
-function effectiveWhere(alias, { on, scope }) {
+export function effectiveWhere(alias, { on, scope }) {
   if (scope === 'all') return { sql: `${alias}.deleted_at IS NULL`, params: [] };
   return {
     sql: `(${alias}.deleted_at IS NULL OR (${alias}.effective_to IS NOT NULL AND ${alias}.effective_to < CURDATE()))

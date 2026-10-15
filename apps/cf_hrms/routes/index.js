@@ -18,6 +18,7 @@ import exitRoutes from './exits.js';
 import accessRoutes from './access.js';
 import codegenGateRoutes from './codegen.js';
 import excelRoutes from './excel.js';
+import commandRoutes from './commands.js';
 
 const router = Router();
 
@@ -128,5 +129,7 @@ router.use(accessRoutes);
 router.use(codegenGateRoutes);
 // Download and upload by Excel, one engine for every entity (routes/excel.js).
 router.use(excelRoutes);
+// "Do it in words" (spec §14): read a request, check the plan, apply it.
+router.use(commandRoutes);
 
 export default router;

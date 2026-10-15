@@ -1,0 +1,35 @@
+/** add_responsibility — a responsibility on a role or on one position (spec §14.2). */
+import { PERM } from './common.js';
+import { contentLine, onPosition } from './contentLine.js';
+
+const line = contentLine('RESPONSIBILITY');
+
+export default {
+  key: 'add_responsibility',
+  label: 'Add a responsibility',
+  template: 'Add the responsibility {text} to {role}{position} under the KRA {kra}',
+  fields: [
+    { name: 'text', kind: 'newText', required: true, label: 'Responsibility' },
+    { name: 'role', kind: 'role', required: false, label: 'Role' },
+    { name: 'position', kind: 'position', required: false, label: 'Position' },
+    { name: 'kra', kind: 'kra', required: false, label: 'Under the KRA' },
+  ],
+  oneOf: ['role', 'position'],
+  examples: [
+    'add a responsibility check the boiler pressure every shift to the Boiler Operator role',
+    'add responsibility "Prepare the daily production report" to Production Manager',
+    'the Store Keeper should also count the stock every Friday',
+    'give the Printing operator the duty of cleaning the ink trays',
+    'add the task record machine stoppages to Operator Printing',
+    'add a duty to P159-1: inspect the rolls before dispatch',
+    'Quality Officer is responsible for calibrating the instruments',
+    'new responsibility for the Security guard: check visitor passes',
+    'add responsibility train new helpers under the KRA Manpower & training for Production Manager',
+    'make the HR Executive responsible for joining formalities',
+    'add a job duty maintain the attendance register to the Time Office role',
+    'only for position P124-1 add the responsibility look after the rewinder',
+  ],
+  rightOf: (step) => (onPosition(step) ? PERM.positions.edit : PERM.roles.edit),
+  validate: line.validate,
+  apply: line.apply,
+};

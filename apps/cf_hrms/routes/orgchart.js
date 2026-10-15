@@ -5,14 +5,17 @@
  *   GET /orgchart                          ?on=&root=   the WHOLE graph in one payload
  *   GET /orgchart/positions/:id/card       ?on=&scope=  everything the card modal shows about ONE position;
  *                                                       scope=card widens directReports to the whole card
- *   GET /orgchart/search                   ?q=&on=      KRA / responsibility / KPI / qualification text
+ *   GET /orgchart/search                   ?q=&on=&kinds=&mode=&limit=   job content, by meaning or exact words
  *   GET /orgchart/departments              ?on=         what each unit is accountable for (spec §13)
  *   GET /orgchart/open-points              ?status=&entityType=&entityId=   grouped by entity
  *   PUT /orgchart/open-points/:id          { status, resolution|answer }    resolve / dismiss / reopen
  *
- * `/orgchart/search` answers with a BARE ARRAY of hits, exactly as spec §9
- * writes it, and `/orgchart/open-points` with a bare array of entity groups —
- * neither needs an envelope over a list the screen renders straight through.
+ * `/orgchart/search` answers `{ mode, notice, kinds, pending, total, items }`
+ * since search by meaning (2026-10-15): the screen has to be told when the model
+ * was not available and the answer is by exact words instead. `items` is the
+ * array of position hits spec §9 describes, with `score` and per-match
+ * `origin` added. `/orgchart/open-points` answers with a bare array of entity
+ * groups.
  *
  * ONE PAYLOAD, DELIBERATELY. Karni is 114 positions and 8 levels deep. Paging a
  * graph that size would cost more in round trips and client state than it could
@@ -33,7 +36,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
 import { companyWide } from '../lib/gates.js';
 import {
-  buildOrgChart, getPositionCard, searchOrgChart, listOpenPoints, updateOpenPoint,
+  buildOrgChart, getPositionCard, searchJobContent, listOpenPoints, updateOpenPoint,
 } from '../services/orgChartService.js';
 import { buildDepartmentRollup } from '../services/departmentRollupService.js';
 
@@ -75,11 +78,21 @@ router.get('/orgchart/positions/:id/card', guard(PERM.positions.view), handle((r
   { on: dateParam(req.query.on), scope: req.query.scope },
 )));
 
-/** Multi-word AND across the four content kinds, answering with positions. */
-router.get('/orgchart/search', guard(PERM.positions.view), handle((req) => searchOrgChart(
+/**
+ * Search job content, answering with positions (orgChartService "Search").
+ *   kinds  comma list of KRA, RESPONSIBILITY, KPI (QUALIFICATION also accepted); default the first three
+ *   mode   meaning (default) | exact — every word must appear
+ */
+router.get('/orgchart/search', guard(PERM.positions.view), handle((req) => searchJobContent(
   pool,
   ctx(req).companyId,
-  { q: req.query.q, on: dateParam(req.query.on), limit: req.query.limit },
+  {
+    q: req.query.q,
+    on: dateParam(req.query.on),
+    limit: req.query.limit,
+    kinds: req.query.kinds,
+    mode: req.query.mode,
+  },
 )));
 
 /**
