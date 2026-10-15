@@ -1,4 +1,5 @@
 import { protect } from '../../../core/middleware/authmiddleware.js';
+import { signToken } from '../../../core/utils/jwt.js';
 import { q, parseJson } from './db.js';
 import { roleDef, eff } from './roles.js';
 
@@ -83,6 +84,8 @@ function shape(customer, row, cfg) {
     perms: parseJson(row.perms, {}),
     lastSeen: row.last_seen,
     createdAt: row.created_at,
+    totpEnabled: !!row.totp_enabled,
+    mustChangePassword: !!row.must_change_password,
   };
   m.roleDef = roleDef(m.role, Array.isArray(cfg.roles) ? cfg.roles : []);
   m.can = eff(m);
@@ -94,7 +97,7 @@ export function publicMember(m) {
   if (!m) return null;
   return {
     id: String(m.id), email: m.email, name: m.name, role: m.role, owner: m.owner, active: m.active,
-    totpEnabled: false, lastLogin: m.lastSeen || null, createdAt: m.createdAt || null,
+    totpEnabled: !!m.totpEnabled, mustChangePassword: !!m.mustChangePassword, lastLogin: m.lastSeen || null, createdAt: m.createdAt || null,
     businesses: m.businesses || [], perms: m.perms || {}, companyId: m.companyId,
   };
 }
@@ -103,7 +106,7 @@ export function publicMember(m) {
  * protect, then the customer and member. Puts req.crm = { customer, me, cfg }.
  * opts.settings: owners only (role permission `settings`).
  */
-export function crm({ settings = false } = {}) {
+export function crm({ settings = false, pending = false } = {}) {
   const resolve = async (req, res, next) => {
     try {
       if (!req.user || req.user.is_service) return res.status(403).json({ error: 'Sign in to use this app.' });
@@ -116,6 +119,24 @@ export function crm({ settings = false } = {}) {
       if (!row) return res.status(403).json({ error: 'You do not have access to this app.' });
       if (!row.active) return res.status(403).json({ error: 'Your access to this app has been turned off. Ask an owner.' });
       const me = shape(customer, row, cfg);
+
+      // A password change, a reset by an owner or "sign out everywhere" ends
+      // every sign-in made before it (the platform's token cannot be revoked,
+      // so this app refuses it instead).
+      // tokens this app issues carry the millisecond (crmIssued); the platform's only the second (iat)
+      const validAfter = row.sessions_valid_after ? new Date(row.sessions_valid_after).getTime() : 0;
+      const issued = Number(req.user.crmIssued) || Number(req.user.iat) * 1000;
+      if (validAfter && !(issued >= validAfter)) {
+        return res.status(401).json({ error: 'Your session has ended. Please sign in again.', code: 'SESSION_ENDED' });
+      }
+      // Two-step sign-in: this sign-in must have passed it (a claim only this
+      // app puts in the token, for this login).
+      me.twoStepPassed = !me.totpEnabled || Number(req.user.crm2fa) === me.id;
+      // Until both gates are passed only the routes marked `pending` answer:
+      // who am I, the code check, and the password change.
+      if (!pending && !me.twoStepPassed) return res.status(403).json({ error: 'Enter the code from your authenticator app.', code: 'TWO_STEP' });
+      if (!pending && me.mustChangePassword) return res.status(403).json({ error: 'Choose a new password first.', code: 'PASSWORD_CHANGE' });
+
       if (settings && !me.can.settings) return res.status(403).json({ error: 'Only owners can do this.' });
       req.crm = { customer, me, cfg };
       // last seen, at most once a minute
@@ -128,6 +149,16 @@ export function crm({ settings = false } = {}) {
     }
   };
   return [protect, resolve];
+}
+
+/**
+ * A fresh platform token for this login, same claims plus `extra`. Used after
+ * a password change (so this sign-in survives while the others end) and after
+ * a passed two-step code. Signed with the platform's own secret and expiry.
+ */
+export function mintToken(req, extra = {}) {
+  const { iat, exp, nbf, ...claims } = req.user || {};
+  return signToken({ ...claims, ...extra, crmIssued: Date.now() });
 }
 
 /** Wraps an async handler: { error } on failure, the same shape the app reads. */

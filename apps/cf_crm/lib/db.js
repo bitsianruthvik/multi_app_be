@@ -1,5 +1,7 @@
 import { pool } from '../../../db.js';
 
+import { sendPush } from './push.js';
+
 export { pool };
 
 /** One query on the shared pool. Returns rows. */
@@ -12,10 +14,15 @@ export async function q(sql, params = []) {
 export async function tx(fn) {
   const conn = await pool.getConnection();
   conn.q = async (sql, params = []) => (await conn.query(sql, params))[0];
+  // work that must wait until the data is really saved (push alerts)
+  conn.afterCommit = [];
   try {
     await conn.beginTransaction();
     const out = await fn(conn);
     await conn.commit();
+    const later = conn.afterCommit;
+    conn.afterCommit = [];
+    later.forEach((f) => Promise.resolve().then(f).catch(() => {}));
     return out;
   } catch (err) {
     try { await conn.rollback(); } catch { /* the original error is the one that matters */ }
@@ -59,6 +66,8 @@ export async function notify(conn, me, { owners = [], userIds = [], except, kind
   });
   if (!to.length) return;
   const t = String(text || '').slice(0, 300);
+  const send = () => sendPush(me.customerId, to.map((r) => r.user_id), { text: t, link });
+  if (conn && conn.afterCommit) conn.afterCommit.push(send); else send();
   await run(conn)(
     `INSERT INTO cf_crm_notifications (customer_id, user_id, kind, text, link, at) VALUES ${to.map(() => '(?,?,?,?,?,UTC_TIMESTAMP(3))').join(',')}`,
     to.flatMap((r) => [me.customerId, r.user_id, kind || null, t, String(link || '').slice(0, 200)]),

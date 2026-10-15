@@ -20,6 +20,7 @@
  *     use): admin@northeast-chit.test, admin@northeast-realestate.test. An email
  *     belongs to one company only; `none` makes no login for that company (its
  *     staff are added later in Setup → Owners & team).
+ *   - a login made here must choose a new password at its first sign-in
  *   - the network's starting setup: the two businesses and their lead stages
  *     come from the app's defaults
  * Uses the DB_* settings of multi_app_be/.env (or the environment).
@@ -110,7 +111,7 @@ async function main() {
       let user = await one(conn, 'SELECT id, company_id FROM users WHERE email = ?', [co.admin.email]);
       if (!user) {
         const [ins] = await conn.query('INSERT INTO users (name, email, password, role_id, company_id) VALUES (?,?,?,?,?)', [co.admin.name, co.admin.email, hash, role.id, company.id]);
-        user = { id: ins.insertId, company_id: company.id };
+        user = { id: ins.insertId, company_id: company.id, made: true };
         console.log('admin login made:', co.admin.email);
       } else if (Number(user.company_id) !== Number(company.id)) {
         throw new Error(`${co.admin.email} belongs to another company.`);
@@ -119,8 +120,8 @@ async function main() {
         `INSERT INTO app_user_access (user_id, app_id, role_id, company_id) VALUES (?,?,?,?)
          ON DUPLICATE KEY UPDATE deleted_at = NULL`, [user.id, app.id, role.id, company.id]);
       await conn.query(
-        `INSERT INTO cf_crm_members (customer_id, user_id, role, owner, businesses, perms, active)
-         VALUES (?, ?, 'admin', '', '[]', '{}', 1) ON DUPLICATE KEY UPDATE role = 'admin', active = 1`, [customer.id, user.id]);
+        `INSERT INTO cf_crm_members (customer_id, user_id, role, owner, businesses, perms, active, must_change_password)
+         VALUES (?, ?, 'admin', '', '[]', '{}', 1, ?) ON DUPLICATE KEY UPDATE role = 'admin', active = 1`, [customer.id, user.id, user.made ? 1 : 0]);
     }
 
     const cfg = await one(conn, "SELECT 1 AS x FROM cf_crm_settings WHERE customer_id = ? AND k = 'config'", [customer.id]);

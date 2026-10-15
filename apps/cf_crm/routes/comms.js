@@ -3,6 +3,8 @@ import express, { Router } from 'express';
 import { q, tx, audit, notify, whoOf, parseJson } from '../lib/db.js';
 import { crm, handle } from '../lib/context.js';
 import { canBiz } from '../lib/roles.js';
+import { upsertRecords } from './data.js';
+import { vapidKeys, saveSubscription, dropSubscription, sendPush } from '../lib/push.js';
 
 /** Documents, team chat and notifications. Ports of api/files.js, chat.js, notify.js. */
 const router = Router({ mergeParams: true });
@@ -62,9 +64,7 @@ router.post('/files', ...crm(), express.raw({ type: () => true, limit: MAX + 102
   };
   await tx(async (c) => {
     await c.q('INSERT INTO cf_crm_files (customer_id, id, data, mime, size, created_by) VALUES (?,?,?,?,?,?)', [customer.id, id, buf, mime, buf.length, me.id]);
-    await c.q(
-      `INSERT INTO cf_crm_records (customer_id, type, id, data, deleted, person_id, updated_at, updated_by)
-       VALUES (?, 'docs', ?, ?, 0, ?, UTC_TIMESTAMP(6), ?)`, [customer.id, id, JSON.stringify(doc), doc.personId || null, me.id]);
+    await upsertRecords(c, customer.id, me.id, [{ t: 'docs', i: id, d: doc }]);
     await audit(me, 'upload', p.entity, p.entityId, `${doc.docType}: ${doc.name}`, c);
   });
   res.json({ doc });
@@ -77,7 +77,7 @@ router.delete('/files', ...crm(), handle(async (req, res, { customer, me }) => {
   if (!d) return res.status(404).json({ error: 'Document not found.' });
   if (!me.can.delete && String(d.byId) !== String(me.id)) return res.status(403).json({ error: 'Only owners or the person who uploaded it can delete a document.' });
   await tx(async (c) => {
-    await c.q("UPDATE cf_crm_records SET deleted = 1, data = NULL, updated_at = UTC_TIMESTAMP(6), updated_by = ? WHERE customer_id = ? AND type = 'docs' AND id = ?", [me.id, customer.id, id]);
+    await upsertRecords(c, customer.id, me.id, [{ t: 'docs', i: id, x: 1 }]);
     await c.q('DELETE FROM cf_crm_files WHERE customer_id = ? AND id = ?', [customer.id, id]);
     await audit(me, 'delete document', d.entity, d.entityId, `${d.docType}: ${d.name}`, c);
   });
@@ -242,6 +242,28 @@ router.post('/notify', ...crm(), handle(async (req, res, { customer, me }) => {
     if (ids.length) await q(`UPDATE cf_crm_notifications SET read_at = UTC_TIMESTAMP(3) WHERE customer_id = ? AND user_id = ? AND id IN (${ids.map(() => '?').join(',')})`, [customer.id, me.id, ...ids]);
   }
   res.json({ ok: true });
+}));
+
+/* ------------------------------------------------------- push alerts */
+// GET /push/key — the server's public key, for the browser to subscribe with
+router.get('/push/key', ...crm(), handle(async (req, res) => {
+  res.json({ key: (await vapidKeys()).publicKey });
+}));
+// POST /push/subscribe { subscription } — this device gets this login's alerts
+router.post('/push/subscribe', ...crm(), handle(async (req, res, { customer, me }) => {
+  const ok = await saveSubscription(customer.id, me.id, req.body && req.body.subscription);
+  if (!ok) return res.status(400).json({ error: 'That is not a valid alert subscription.' });
+  res.json({ ok: true });
+}));
+// POST /push/unsubscribe { endpoint } — on sign-out
+router.post('/push/unsubscribe', ...crm({ pending: true }), handle(async (req, res, { customer, me }) => {
+  if (req.body && req.body.endpoint) await dropSubscription(customer.id, me.id, req.body.endpoint);
+  res.json({ ok: true });
+}));
+// POST /push/test — "send me a test alert"
+router.post('/push/test', ...crm(), handle(async (req, res, { customer, me }) => {
+  const sent = await sendPush(customer.id, [me.id], { text: 'Alerts are working on this device.', link: 'home', tag: 'test' });
+  res.json({ sent });
 }));
 
 export default router;

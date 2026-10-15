@@ -1,9 +1,12 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { q, tx, audit, parseJson, CrmError } from '../lib/db.js';
-import { crm, handle, publicMember, forgetConfig, customerOfCompany } from '../lib/context.js';
+import QRCode from 'qrcode';
+import { crm, handle, publicMember, forgetConfig, customerOfCompany, mintToken } from '../lib/context.js';
+import { passwordProblem, newSecret, verifyCode, otpauthUri } from '../lib/security.js';
 import { roleExists } from '../lib/roles.js';
 import { sanitizeBrand } from '../lib/brand.js';
+import { upsertRecords } from './data.js';
 
 /**
  * Setup: the shared config (owners only), branding (owners only), the team
@@ -12,33 +15,36 @@ import { sanitizeBrand } from '../lib/brand.js';
 const router = Router({ mergeParams: true });
 
 /* ---------------------------------------------------------------- config */
-async function renameOwner(c, customerId, from, to) {
+// The renamed records go through upsertRecords like any save, so each gets a
+// new revision and version: an edit someone began before the rename merges
+// with it instead of putting the old owner name back.
+const RENAME_KEYS = { leads: ['owner'], people: ['ownerInCharge', 'sourceOwner'], comments: ['by'], interactions: ['by'], campaigns: ['owner'] };
+async function renameOwner(c, me, from, to) {
+  const customerId = me.customerId;
   const n = { users: 0, records: 0 };
   n.users += (await c.q('UPDATE cf_crm_members SET owner = ? WHERE customer_id = ? AND owner = ?', [to, customerId, from])).affectedRows;
-  const one = async (type, key) => {
-    const path = '$.' + key;
-    const r = await c.q(
-      `UPDATE cf_crm_records SET data = JSON_SET(data, '${path}', ?), updated_at = UTC_TIMESTAMP(6)
-         ${type === 'people' && key === 'ownerInCharge' ? ', owner_in_charge = ?' : ''}
-       WHERE customer_id = ? AND type = ? AND deleted = 0 AND JSON_UNQUOTE(JSON_EXTRACT(data, '${path}')) = ?`,
-      type === 'people' && key === 'ownerInCharge' ? [to, to, customerId, type, from] : [to, customerId, type, from]);
-    n.records += r.affectedRows;
-  };
-  await one('leads', 'owner');
-  await one('people', 'ownerInCharge');
-  await one('people', 'sourceOwner');
-  await one('comments', 'by');
-  await one('interactions', 'by');
-  await one('campaigns', 'owner');
+  const ops = [];
+  for (const [type, keys] of Object.entries(RENAME_KEYS)) {
+    const rows = await c.q(
+      `SELECT id, data FROM cf_crm_records WHERE customer_id = ? AND type = ? AND deleted = 0
+          AND (${keys.map((k) => `JSON_UNQUOTE(JSON_EXTRACT(data, '$.${k}')) = ?`).join(' OR ')})`,
+      [customerId, type, ...keys.map(() => from)]);
+    for (const row of rows) {
+      const d = parseJson(row.data, {});
+      keys.forEach((k) => { if (d[k] === from) d[k] = to; });
+      ops.push({ t: type, i: row.id, d });
+    }
+  }
   const cos = await c.q(
     `SELECT id, data FROM cf_crm_records WHERE customer_id = ? AND type = 'companies' AND deleted = 0
         AND JSON_CONTAINS(JSON_EXTRACT(data, '$.owners'), JSON_QUOTE(?))`, [customerId, from]);
   for (const row of cos) {
     const d = parseJson(row.data, {});
     d.owners = [...new Set((d.owners || []).map((x) => (x === from ? to : x)))];
-    await c.q("UPDATE cf_crm_records SET data = ?, updated_at = UTC_TIMESTAMP(6) WHERE customer_id = ? AND type = 'companies' AND id = ?", [JSON.stringify(d), customerId, row.id]);
-    n.records += 1;
+    ops.push({ t: 'companies', i: row.id, d });
   }
+  await upsertRecords(c, customerId, me.id, ops);
+  n.records += ops.length;
   return n;
 }
 
@@ -60,7 +66,7 @@ router.put('/config', ...crm({ settings: true }), handle(async (req, res, { cust
     }
     const out = [];
     for (const [from, to] of renames) {
-      const n = await renameOwner(c, customer.id, from, to);
+      const n = await renameOwner(c, me, from, to);
       out.push({ from, to, ...n });
       await audit(me, 'update', 'owners', '', `renamed owner ${from} to ${to}: ${n.records} records, ${n.users} team accounts`, c);
     }
@@ -85,10 +91,48 @@ router.get('/public-brand', handle(async (req, res) => {
   const c = await customerOfCompany(Number(req.company.id));
   const b = (c && c.brand) || {};
   res.setHeader('cache-control', 'public, max-age=300');
-  res.json({ brand: { appName: b.appName || '', logo: b.logo || '', colors: { accent: b.colors?.accent || '', accent2: b.colors?.accent2 || '', bg: b.colors?.bg || '' } } });
+  res.json({
+    brand: { appName: b.appName || '', logo: b.logo || '', colors: { accent: b.colors?.accent || '', accent2: b.colors?.accent2 || '', bg: b.colors?.bg || '' } },
+    // picks the home-screen manifest (public/cf_crm/m/<customer>.webmanifest)
+    customer: c ? c.slug : '',
+  });
 }));
 
-router.put('/brand',...crm({ settings: true }), handle(async (req, res, { customer, me }) => {
+// POST /network-sign-in { email, password } — no sign-in needed.
+// A customer's staff sign in at whichever of its companies' addresses they
+// have: when the platform says "User not in this company" (the password was
+// right, the company was not), the sign-in page asks here which company of
+// the SAME customer the login belongs to, and signs in there. Answers only
+// with the right password, only within the customer, only for a login with
+// this app; anything else is the same "not right" as a wrong password.
+// At most 10 tries a minute per address and email.
+const nsTries = new Map();
+router.post('/network-sign-in', handle(async (req, res) => {
+  const b = req.body || {};
+  const email = String(b.email || '').trim().toLowerCase();
+  const key = (req.ip || '') + '|' + email;
+  const now = Date.now();
+  const t = nsTries.get(key);
+  if (t && now - t.at < 60000 && t.n >= 10) return res.status(429).json({ error: 'Too many tries. Wait a minute.' });
+  nsTries.set(key, t && now - t.at < 60000 ? { at: t.at, n: t.n + 1 } : { at: now, n: 1 });
+  if (nsTries.size > 5000) nsTries.clear();
+  const no = () => res.status(401).json({ error: 'Email or password is not right.' });
+  if (!req.company || !req.appCtx || !email || !b.password) return no();
+  const here = await customerOfCompany(Number(req.company.id));
+  const u = (await q('SELECT id, password, company_id FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1', [email]))[0];
+  if (!here || !u || !(await bcrypt.compare(String(b.password), u.password || ''))) return no();
+  const theirs = await customerOfCompany(Number(u.company_id));
+  if (!theirs || theirs.id !== here.id) return no();
+  const co = (await q(
+    `SELECT co.slug, co.name FROM companies co
+       JOIN apps a ON a.company_id = co.id AND a.slug = 'cf_crm' AND a.deleted_at IS NULL
+       JOIN app_user_access aua ON aua.app_id = a.id AND aua.user_id = ? AND aua.deleted_at IS NULL
+      WHERE co.id = ? AND co.deleted_at IS NULL LIMIT 1`, [u.id, u.company_id]))[0];
+  if (!co) return no();
+  res.json({ company: co.slug, name: co.name });
+}));
+
+router.put('/brand', ...crm({ settings: true }), handle(async (req, res, { customer, me }) => {
   const brand = sanitizeBrand(req.body && req.body.brand);
   await q('UPDATE cf_crm_customers SET brand = ? WHERE id = ?', [JSON.stringify(brand), customer.id]);
   await audit(me, 'update', 'branding', '', 'colours / logo / name');
@@ -96,7 +140,6 @@ router.put('/brand',...crm({ settings: true }), handle(async (req, res, { custom
 }));
 
 /* ------------------------------------------------------------------ team */
-const PW_MIN = 8;
 
 async function customerCompanies(customerId) {
   return q(
@@ -115,6 +158,7 @@ async function listMembers(customerId) {
   return rows.map((r) => publicMember({
     id: Number(r.user_id), email: r.email, name: r.user_name, role: r.role, owner: r.owner, active: !!r.active,
     businesses: parseJson(r.businesses, []), perms: parseJson(r.perms, {}), lastSeen: r.last_seen, createdAt: r.created_at, companyId: Number(r.company_id),
+    totpEnabled: !!r.totp_enabled, mustChangePassword: !!r.must_change_password,
   }));
 }
 
@@ -165,7 +209,8 @@ router.post('/users', ...crm({ settings: true }), handle(async (req, res, { cust
            ON DUPLICATE KEY UPDATE role_id = VALUES(role_id), deleted_at = NULL`, [userId, appId, roleId, Number(ex.company_id)]);
       }
     } else {
-      if (!b.password || String(b.password).length < PW_MIN) throw new CrmError(400, `Set a temporary password of at least ${PW_MIN} characters.`);
+      const problem = passwordProblem(b.password, { email, name });
+      if (problem) throw new CrmError(400, 'Temporary password: ' + problem);
       const roleId = await staffRole(c, company.id);
       const hash = await bcrypt.hash(String(b.password), 10);
       const ins = await c.q('INSERT INTO users (name, email, password, role_id, company_id) VALUES (?,?,?,?,?)', [name, email, hash, roleId, company.id]);
@@ -173,8 +218,8 @@ router.post('/users', ...crm({ settings: true }), handle(async (req, res, { cust
       await c.q('INSERT INTO app_user_access (user_id, app_id, role_id, company_id) VALUES (?,?,?,?)', [userId, company.app_id, roleId, company.id]);
     }
     await c.q(
-      `INSERT INTO cf_crm_members (customer_id, user_id, role, owner, businesses, perms, active) VALUES (?,?,?,?,?, '{}', 1)`,
-      [customer.id, userId, b.role, owner, JSON.stringify(biz)]);
+      `INSERT INTO cf_crm_members (customer_id, user_id, role, owner, businesses, perms, active, must_change_password) VALUES (?,?,?,?,?, '{}', 1, ?)`,
+      [customer.id, userId, b.role, owner, JSON.stringify(biz), ex ? 0 : 1]);
     await audit(me, 'add user', 'team', String(userId), `${email} as ${b.role} (${company.name})`, c);
     return { userId, existing: !!ex };
   });
@@ -210,18 +255,24 @@ router.patch('/users', ...crm({ settings: true }), handle(async (req, res, { cus
   }
   let hash = null;
   if (b.password) {
-    if (String(b.password).length < PW_MIN) return res.status(400).json({ error: `Use at least ${PW_MIN} characters.` });
+    const problem = passwordProblem(b.password, { email: next.email, name: next.name });
+    if (problem) return res.status(400).json({ error: 'Temporary password: ' + problem });
     hash = await bcrypt.hash(String(b.password), 10);
   }
   await tx(async (c) => {
     await c.q('UPDATE cf_crm_members SET role = ?, owner = ?, active = ?, businesses = ?, perms = ? WHERE customer_id = ? AND user_id = ?',
       [next.role, next.owner, next.active ? 1 : 0, JSON.stringify(next.businesses), JSON.stringify(next.perms), customer.id, id]);
+    // a reset password is temporary and ends their sign-ins; so does switching them off
+    if (hash) await c.q('UPDATE cf_crm_members SET must_change_password = 1 WHERE customer_id = ? AND user_id = ?', [customer.id, id]);
+    if (hash || (cur.active && !next.active)) await c.q('UPDATE cf_crm_members SET sessions_valid_after = ? WHERE customer_id = ? AND user_id = ?', [new Date(), customer.id, id]);
+    if (b.resetTotp) await c.q('UPDATE cf_crm_members SET totp_enabled = 0, totp_secret = NULL, totp_pending = NULL, totp_last_step = NULL, totp_failed = 0, totp_locked_until = NULL WHERE customer_id = ? AND user_id = ?', [customer.id, id]);
     if (next.name !== cur.user_name || next.email !== cur.email || hash) {
       await c.q(`UPDATE users SET name = ?, email = ?${hash ? ', password = ?' : ''} WHERE id = ?`, hash ? [next.name, next.email, hash, id] : [next.name, next.email, id]);
     }
     const before = { role: cur.role, owner: cur.owner, active: !!cur.active, name: cur.user_name, email: cur.email };
     const changes = Object.keys(before).filter((k) => b[k] !== undefined && next[k] !== before[k]).map((k) => `${k}: ${next[k]}`);
-    if (b.password) changes.push('password reset');
+    if (b.password) changes.push('password reset, their sessions ended');
+    if (b.resetTotp) changes.push('two-step sign-in reset');
     if (b.businesses !== undefined) changes.push('business access: ' + (next.businesses.join(', ') || 'all'));
     if (b.perms !== undefined) changes.push('permissions: ' + JSON.stringify(next.perms));
     await audit(me, 'update user', 'team', String(id), `${cur.email} ${changes.join(', ')}`, c);
@@ -231,18 +282,104 @@ router.patch('/users', ...crm({ settings: true }), handle(async (req, res, { cus
 }));
 
 /* --------------------------------------------------------------- account */
-router.get('/me', ...crm(), handle(async (req, res, { customer, me }) => {
-  res.json({ user: publicMember(me), brand: customer.brand || {}, customer: { slug: customer.slug, name: customer.name } });
+// "Now" for sessions_valid_after, to the millisecond, from THIS server's clock —
+// the same clock that stamps the replacement token (crmIssued), so the token
+// made right after is never older than the cut-off.
+const cutoffNow = () => new Date();
+// the fresh token keeps a passed two-step sign-in
+const freshToken = (req, me) => mintToken(req, me.totpEnabled && me.twoStepPassed ? { crm2fa: me.id } : {});
+
+// Answers before the two gates: the app asks for the code / a new password.
+router.get('/me', ...crm({ pending: true }), handle(async (req, res, { customer, me }) => {
+  res.json({
+    user: publicMember(me), brand: customer.brand || {}, customer: { slug: customer.slug, name: customer.name },
+    needCode: !me.twoStepPassed, mustChangePassword: me.mustChangePassword,
+  });
 }));
 
-// POST /password { current, next } — the login's own platform password
-router.post('/password', ...crm(), handle(async (req, res, { me }) => {
+// POST /password { current, next } — the login's own platform password.
+// Ends every other sign-in; this one gets a fresh token.
+router.post('/password', ...crm({ pending: true }), handle(async (req, res, { customer, me }) => {
+  if (!me.twoStepPassed) return res.status(403).json({ error: 'Enter the code from your authenticator app.', code: 'TWO_STEP' });
   const b = req.body || {};
   const row = (await q('SELECT password FROM users WHERE id = ?', [me.id]))[0];
   if (!row || !(await bcrypt.compare(String(b.current || ''), row.password || ''))) return res.status(400).json({ error: 'Your current password is not right.' });
-  if (typeof b.next !== 'string' || b.next.length < PW_MIN) return res.status(400).json({ error: `Use a new password of at least ${PW_MIN} characters.` });
-  await q('UPDATE users SET password = ? WHERE id = ?', [await bcrypt.hash(b.next, 10), me.id]);
-  await audit(me, 'change password', 'team', String(me.id), '');
+  const problem = passwordProblem(b.next, { email: me.email, name: me.name });
+  if (problem) return res.status(400).json({ error: problem });
+  if (await bcrypt.compare(String(b.next), row.password || '')) return res.status(400).json({ error: 'Choose a password different from the current one.' });
+  await tx(async (c) => {
+    await c.q('UPDATE users SET password = ? WHERE id = ?', [await bcrypt.hash(String(b.next), 10), me.id]);
+    await c.q('UPDATE cf_crm_members SET must_change_password = 0, sessions_valid_after = ? WHERE customer_id = ? AND user_id = ?', [cutoffNow(), customer.id, me.id]);
+    await audit(me, 'change password', 'team', String(me.id), 'other sessions ended', c);
+  });
+  res.json({ ok: true, token: freshToken(req, me) });
+}));
+
+// POST /sessions/end — sign out every other device and browser
+router.post('/sessions/end', ...crm(), handle(async (req, res, { customer, me }) => {
+  await q('UPDATE cf_crm_members SET sessions_valid_after = ? WHERE customer_id = ? AND user_id = ?', [cutoffNow(), customer.id, me.id]);
+  await audit(me, 'sign out everywhere', 'team', String(me.id), '');
+  res.json({ ok: true, token: freshToken(req, me) });
+}));
+
+/* ------------------------------------------------- two-step sign-in */
+const TWO_STEP_TRIES = 5;
+async function memberRow(customerId, userId) {
+  return (await q('SELECT * FROM cf_crm_members WHERE customer_id = ? AND user_id = ?', [customerId, userId]))[0];
+}
+/** Check a code against `secret`; counts failures and locks for 15 minutes after 5. */
+async function checkCode(customerId, me, secret, code) {
+  const row = await memberRow(customerId, me.id);
+  if (row.totp_locked_until && new Date(row.totp_locked_until) > new Date()) throw new CrmError(429, 'Too many wrong codes. Try again in 15 minutes.');
+  const step = verifyCode(secret, code, row.totp_last_step);
+  if (step == null) {
+    const failed = Number(row.totp_failed || 0) + 1;
+    await q(`UPDATE cf_crm_members SET totp_failed = ?, totp_locked_until = ${failed >= TWO_STEP_TRIES ? 'UTC_TIMESTAMP() + INTERVAL 15 MINUTE' : 'NULL'} WHERE customer_id = ? AND user_id = ?`,
+      [failed >= TWO_STEP_TRIES ? 0 : failed, customerId, me.id]);
+    if (failed >= TWO_STEP_TRIES) await audit(me, 'two-step locked', 'team', String(me.id), `${TWO_STEP_TRIES} wrong codes`);
+    throw new CrmError(400, 'That code did not match. Use the newest 6-digit code from your authenticator app.');
+  }
+  await q('UPDATE cf_crm_members SET totp_last_step = ?, totp_failed = 0, totp_locked_until = NULL WHERE customer_id = ? AND user_id = ?', [step, customerId, me.id]);
+  return step;
+}
+
+// POST /two-step/verify { code } — the second step of signing in
+router.post('/two-step/verify', ...crm({ pending: true }), handle(async (req, res, { customer, me }) => {
+  if (!me.totpEnabled) return res.json({ ok: true, token: null });
+  const row = await memberRow(customer.id, me.id);
+  await checkCode(customer.id, me, row.totp_secret, req.body && req.body.code);
+  await audit(me, 'sign in', 'team', String(me.id), 'two-step code accepted');
+  res.json({ ok: true, token: mintToken(req, { crm2fa: me.id }) });
+}));
+
+// POST /two-step/start — a new secret to scan (not active until /enable)
+router.post('/two-step/start', ...crm(), handle(async (req, res, { customer, me }) => {
+  if (me.totpEnabled) return res.status(400).json({ error: 'Two-step sign-in is already on.' });
+  const secret = newSecret();
+  await q('UPDATE cf_crm_members SET totp_pending = ? WHERE customer_id = ? AND user_id = ?', [secret, customer.id, me.id]);
+  const issuer = (customer.brand && customer.brand.appName) || customer.name || 'CRM';
+  const uri = otpauthUri(secret, me.email, issuer);
+  res.json({ secret: secret.replace(/(.{4})/g, '$1 ').trim(), uri, qr: await QRCode.toDataURL(uri, { margin: 1, width: 220 }) });
+}));
+
+// POST /two-step/enable { code } — turn it on; this sign-in counts as passed
+router.post('/two-step/enable', ...crm(), handle(async (req, res, { customer, me }) => {
+  const row = await memberRow(customer.id, me.id);
+  if (!row.totp_pending) return res.status(400).json({ error: 'Start again: scan the new code first.' });
+  const step = verifyCode(row.totp_pending, req.body && req.body.code, null);
+  if (step == null) return res.status(400).json({ error: 'That code did not match. Try the newest code.' });
+  await q('UPDATE cf_crm_members SET totp_secret = totp_pending, totp_pending = NULL, totp_enabled = 1, totp_last_step = ?, totp_failed = 0 WHERE customer_id = ? AND user_id = ?', [step, customer.id, me.id]);
+  await audit(me, 'enable two-step sign-in', 'team', String(me.id), '');
+  res.json({ ok: true, token: mintToken(req, { crm2fa: me.id }) });
+}));
+
+// POST /two-step/disable { code } — needs a current code
+router.post('/two-step/disable', ...crm(), handle(async (req, res, { customer, me }) => {
+  if (!me.totpEnabled) return res.json({ ok: true });
+  const row = await memberRow(customer.id, me.id);
+  await checkCode(customer.id, me, row.totp_secret, req.body && req.body.code);
+  await q('UPDATE cf_crm_members SET totp_enabled = 0, totp_secret = NULL, totp_pending = NULL, totp_last_step = NULL WHERE customer_id = ? AND user_id = ?', [customer.id, me.id]);
+  await audit(me, 'disable two-step sign-in', 'team', String(me.id), '');
   res.json({ ok: true });
 }));
 

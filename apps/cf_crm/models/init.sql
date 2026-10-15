@@ -1,6 +1,6 @@
 -- ============================================================================
 -- cf_crm — customer, referral and marketing network (ported from NorthEast
--- Network, a Vercel + Postgres app). 12 tables. MySQL 8 and TiDB.
+-- Network, a Vercel + Postgres app). 14 tables. MySQL 8 and TiDB.
 -- ============================================================================
 -- THE MODEL IN ONE PARAGRAPH
 --   A CUSTOMER (cf_crm_customers) is the tenant of this app: it owns the
@@ -183,6 +183,75 @@ CREATE TABLE IF NOT EXISTS cf_crm_files (
   PRIMARY KEY (customer_id, id)
 );
 
+-- ----------------------------------------------------------------------------
+-- §2 (2026-10-15) REVISIONS, VERSIONS, SESSIONS, TWO-STEP SIGN-IN
+--   cf_crm_records.rev counts the writes to a record. A save names the rev it
+--   was based on; if someone saved in between, the server merges field by
+--   field against the version it was based on (kept in
+--   cf_crm_record_versions) instead of overwriting. Every write keeps its
+--   version, so an overwritten value can always be found again.
+--   cf_crm_members gains: sessions_valid_after (sign-ins older than this are
+--   ended), the two-step sign-in secret, and must_change_password.
+--   Guarded ALTERs (information_schema), so the file stays safe to re-run.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cf_crm_record_versions (
+  customer_id  INT NOT NULL,
+  type         VARCHAR(20) NOT NULL,
+  id           VARCHAR(64) NOT NULL,
+  rev          INT NOT NULL,
+  data         JSON NULL,
+  deleted      TINYINT(1) NOT NULL DEFAULT 0,
+  updated_by   INT NULL,
+  at           DATETIME(6) NOT NULL,
+  PRIMARY KEY (customer_id, type, id, rev)
+);
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_crm_records' AND COLUMN_NAME = 'rev');
+SET @sql = IF(@c = 0, 'ALTER TABLE cf_crm_records ADD COLUMN rev INT NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+
+-- records written before revisions: their current data is version 1
+INSERT IGNORE INTO cf_crm_record_versions (customer_id, type, id, rev, data, deleted, updated_by, at)
+  SELECT customer_id, type, id, 1, data, deleted, updated_by, updated_at FROM cf_crm_records WHERE rev = 0;
+UPDATE cf_crm_records SET rev = 1 WHERE rev = 0;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_crm_members' AND COLUMN_NAME = 'sessions_valid_after');
+SET @sql = IF(@c = 0, 'ALTER TABLE cf_crm_members ADD COLUMN sessions_valid_after DATETIME(3) NULL, ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0, ADD COLUMN totp_secret VARCHAR(64) NULL, ADD COLUMN totp_pending VARCHAR(64) NULL, ADD COLUMN totp_enabled TINYINT(1) NOT NULL DEFAULT 0, ADD COLUMN totp_last_step BIGINT NULL, ADD COLUMN totp_failed INT NOT NULL DEFAULT 0, ADD COLUMN totp_locked_until DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+
+-- ----------------------------------------------------------------------------
+-- §3 (2026-10-15) PUSH ALERTS
+--   One row per device a login turned alerts on for (Web Push). id is a hash
+--   of the endpoint, so the same device signed in as someone else moves to
+--   them. The server's own push keys (VAPID) are kept in cf_crm_settings
+--   under customer_id 0, k 'vapid', made on first use.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cf_crm_push_subs (
+  id           CHAR(40) NOT NULL,
+  customer_id  INT NOT NULL,
+  user_id      INT NOT NULL,
+  endpoint     TEXT NOT NULL,
+  p256dh       VARCHAR(200) NOT NULL,
+  auth         VARCHAR(100) NOT NULL,
+  created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_ok      DATETIME NULL,
+  PRIMARY KEY (id),
+  KEY ix_cf_crm_push_user (customer_id, user_id)
+);
+
+-- the session cut-off is to the millisecond (a sign-in in the same second as a reset must end too)
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_crm_members' AND COLUMN_NAME = 'sessions_valid_after' AND DATETIME_PRECISION = 0);
+SET @sql = IF(@c = 1, 'ALTER TABLE cf_crm_members MODIFY COLUMN sessions_valid_after DATETIME(3) NULL', 'SELECT 1');
+PREPARE s FROM @sql;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+
 SELECT IF((SELECT COUNT(*) FROM information_schema.tables
-            WHERE table_schema = DATABASE() AND table_name LIKE 'cf\_crm\_%') >= 12,
+            WHERE table_schema = DATABASE() AND table_name LIKE 'cf\_crm\_%') >= 14
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_crm_records' AND COLUMN_NAME = 'rev') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_crm_members' AND COLUMN_NAME = 'totp_enabled') = 1,
           'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

@@ -48,7 +48,7 @@ async function cleanup() {
   const c = await pool.getConnection();
   try {
     if (made.customer) {
-      for (const t of ['records', 'phones', 'settings', 'audit', 'chat_threads', 'chat_messages', 'chat_reads', 'notifications', 'files', 'members']) {
+      for (const t of ['records', 'phones', 'settings', 'audit', 'chat_threads', 'chat_messages', 'chat_reads', 'notifications', 'files', 'members', 'record_versions', 'push_subs']) {
         await c.query(`DELETE FROM cf_crm_${t} WHERE customer_id = ?`, [made.customer]);
       }
       await c.query('DELETE FROM cf_crm_customer_companies WHERE customer_id = ?', [made.customer]);
@@ -143,6 +143,9 @@ async function main() {
   r = await call(adminA, 'PATCH', '/users', { id: mannyId, businesses: ['re'] });
   ok(r.status === 200 && r.data.user.businesses.join() === 're', 'owner limits the manager to real estate', r.data);
   const manny = await login(B.slug, 'manny@zz-crm-b.test');
+  r = await call(manny, 'POST', '/password', { current: PW, next: 'Lotus-' + Math.random().toString(36).slice(2, 12) });
+  ok(r.status === 200 && r.data.token, 'the new manager chooses their own password first', r.data);
+  manny.token = r.data.token;
 
   s = await syncAll(manny);
   ok(!s.map.has('people/p1'), 'a manager does not see people of another owner');
@@ -243,6 +246,171 @@ async function main() {
   ok(r.status === 200 && r.data.brand.colors.accent === '#ABCDEF' && !r.data.brand.colors.bg && !r.data.brand.logo && !/[<>]/.test(r.data.brand.appName), 'branding keeps only valid colours, logo and text', r.data.brand);
   r = await call(adminB, 'GET', '/brand');
   ok(r.data.brand.colors.accent === '#ABCDEF', 'both companies see the new branding');
+
+  console.log('revisions: no silent overwrites');
+  const recOf = async (who, t, i) => (await syncAll(who)).map.get(t + '/' + i);
+  const revOf = async (who, t, i) => {
+    const qs = new URLSearchParams({ full: '1' });
+    const all = await call(who, 'GET', '/sync?' + qs);
+    const row = all.data.rows.find((x) => x.t === t && x.i === i);
+    return row ? row.r : null;
+  };
+  await call(adminA, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Merge Me', city: 'Hyd', notes: 'n0' }, b: 0 }] });
+  const r1 = await revOf(adminA, 'people', 'm1');
+  ok(r1 === 1, 'a new record starts at revision 1', r1);
+  r = await call(adminB, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Merge Me', city: 'Vizag', notes: 'n0' }, b: r1 }] });
+  ok(r.data.saved === 1 && !(r.data.merged || []).length && r.data.revs[0].r === 2, 'a save on the latest revision is not a merge', r.data);
+  r = await call(adminA, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Merge Me', city: 'Hyd', notes: 'n1' }, b: r1 }] });
+  let m = (r.data.merged || [])[0];
+  ok(m && m.d.city === 'Vizag' && m.d.notes === 'n1' && m.clash.length === 0, "a stale save keeps the other person's change and adds its own", m);
+  ok(m && m.r === 3, 'the merged save is revision 3', m && m.r);
+  r = await call(adminB, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Name by B', city: 'Vizag', notes: 'n1' }, b: 3 }] });
+  r = await call(adminA, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Name by A', city: 'Vizag', notes: 'n1' }, b: 3 }] });
+  m = (r.data.merged || [])[0];
+  ok(m && m.clash.join() === 'name' && m.d.name === 'Name by A', 'the same field changed by both is reported as a clash', m);
+  const vers = await pool.query("SELECT rev, JSON_UNQUOTE(JSON_EXTRACT(data, '$.name')) AS name FROM cf_crm_record_versions WHERE customer_id = ? AND type = 'people' AND id = 'm1' ORDER BY rev", [made.customer]);
+  ok(vers[0].length === 5 && vers[0][3].name === 'Name by B', "every version is kept, including the value that lost the clash", vers[0]);
+  r = await call(adminB, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', x: 1, b: 3 }] });
+  ok(r.data.rejected[0] && r.data.rejected[0].why === 'conflict', 'deleting a record changed since is refused', r.data);
+  await call(adminA, 'POST', '/records', { ops: [{ t: 'people', i: 'm2', d: { id: 'm2', name: 'Gone soon' }, b: 0 }] });
+  await call(adminA, 'POST', '/records', { ops: [{ t: 'people', i: 'm2', x: 1, b: 1 }] });
+  r = await call(adminB, 'POST', '/records', { ops: [{ t: 'people', i: 'm2', d: { id: 'm2', name: 'Edited after delete' }, b: 1 }] });
+  ok(r.data.rejected[0] && r.data.rejected[0].why === 'gone', 'editing a record someone deleted is refused, not brought back', r.data);
+  r = await call(adminB, 'POST', '/records', { ops: [{ t: 'people', i: 'm1', d: { id: 'm1', name: 'Legacy' } }] });
+  ok(r.data.saved === 1 && !(r.data.merged || []).length, 'a save without a revision (an old app) still saves', r.data);
+  const before = await revOf(adminA, 'leads', 'l1');
+  await call(adminA, 'PUT', '/config', { config: { businesses: [{ id: 'chit', name: 'Chit' }, { id: 're', name: 'RE' }], owners: ['Owner Uno', 'Owner 2', 'Owner 3'] }, renameOwners: [['Owner One', 'Owner Uno']] });
+  ok((await revOf(adminA, 'leads', 'l1')) === before, 'a rename leaves records of other owners alone');
+  const p1rev = await revOf(adminA, 'people', 'p1');
+  ok(p1rev > 1 && (await recOf(adminA, 'people', 'p1')).ownerInCharge === 'Owner Uno', 'a renamed record gets a new revision', p1rev);
+
+  console.log('passwords and sessions');
+  r = await call(adminA, 'POST', '/password', { current: PW, next: '12345678' });
+  ok(r.status === 400, 'all-digit passwords are refused', r.data);
+  r = await call(adminA, 'POST', '/password', { current: PW, next: 'Password123' });
+  ok(r.status === 400 && /common/.test(r.data.error), 'common passwords are refused', r.data);
+  const PW2 = 'Fresh-' + Math.random().toString(36).slice(2, 12);
+  r = await call(adminA, 'POST', '/password', { current: PW, next: PW2 });
+  ok(r.status === 200 && r.data.token, 'a good password is accepted with a fresh token', r.data);
+  const oldA = adminA;
+  const newA = { company: A.slug, token: r.data.token };
+  r = await call(oldA, 'GET', '/sync');
+  ok(r.status === 401 && r.data.code === 'SESSION_ENDED', 'the old sign-in is ended by the password change', r.data);
+  r = await call(newA, 'GET', '/me');
+  ok(r.status === 200, 'this sign-in carries on with its fresh token');
+  r = await call(newA, 'POST', '/sessions/end', {});
+  const newerA = { company: A.slug, token: r.data.token };
+  ok(r.status === 200 && (await call(newerA, 'GET', '/me')).status === 200, 'sign out everywhere keeps the current sign-in');
+
+  console.log('must change a password set by someone else');
+  const tmp = 'Temp-' + Math.random().toString(36).slice(2, 12);
+  r = await call(newerA, 'POST', '/users', { name: 'Tara New', email: 'tara@zz-crm-a.test', role: 'entry', password: '12345678', companyId: A.id });
+  ok(r.status === 400, 'a weak temporary password is refused', r.data);
+  r = await call(newerA, 'POST', '/users', { name: 'Tara New', email: 'tara@zz-crm-a.test', role: 'entry', password: tmp, companyId: A.id });
+  ok(r.status === 200 && r.data.user.mustChangePassword, 'a new team member must change the password', r.data);
+  if (r.data.user) made.users.push(Number(r.data.user.id));
+  const tara = await login(A.slug, 'tara@zz-crm-a.test', tmp);
+  r = await call(tara, 'GET', '/me');
+  ok(r.status === 200 && r.data.mustChangePassword === true, '/me says a new password is due', r.data);
+  r = await call(tara, 'GET', '/sync');
+  ok(r.status === 403 && r.data.code === 'PASSWORD_CHANGE', 'nothing else answers until it is changed', r.data);
+  r = await call(tara, 'POST', '/password', { current: tmp, next: tmp });
+  ok(r.status === 400, 'the new password must differ from the temporary one', r.data);
+  const taraPw = 'Mine-' + Math.random().toString(36).slice(2, 12);
+  r = await call(tara, 'POST', '/password', { current: tmp, next: taraPw });
+  const tara2 = { company: A.slug, token: r.data.token };
+  ok(r.status === 200 && (await call(tara2, 'GET', '/sync')).status === 200, 'after the change the app opens');
+  r = await call(newerA, 'PATCH', '/users', { id: String(made.users[made.users.length - 1]), password: 'Reset-' + Math.random().toString(36).slice(2, 12) });
+  ok(r.status === 200, 'an owner resets a password');
+  r = await call(tara2, 'GET', '/sync');
+  ok(r.status === 401, "the reset ends that person's sign-ins", r.status);
+
+  console.log('two-step sign-in');
+  const { codeAt } = await import('../lib/security.js');
+  r = await call(newerA, 'POST', '/two-step/start', {});
+  ok(r.status === 200 && /^data:image\/png/.test(r.data.qr) && /^otpauth:\/\/totp\//.test(r.data.uri), 'starting gives a QR code and a key', Object.keys(r.data));
+  const secret = r.data.secret.replace(/\s/g, '');
+  const step = Math.floor(Date.now() / 30000);
+  r = await call(newerA, 'POST', '/two-step/enable', { code: '000000' === codeAt(secret, step) ? '111111' : '000000' });
+  ok(r.status === 400, 'a wrong code does not turn it on');
+  r = await call(newerA, 'POST', '/two-step/enable', { code: codeAt(secret, step) });
+  ok(r.status === 200 && r.data.token, 'the right code turns it on', r.data);
+  const tfaA = { company: A.slug, token: r.data.token };
+  ok((await call(tfaA, 'GET', '/sync')).status === 200, 'this sign-in has passed two-step');
+  r = await call(newerA, 'GET', '/sync');
+  ok(r.status === 403 && r.data.code === 'TWO_STEP', 'a sign-in without the code gets nothing', r.data);
+  r = await call(newerA, 'GET', '/me');
+  ok(r.status === 200 && r.data.needCode === true, '/me asks for the code');
+  r = await call(newerA, 'POST', '/two-step/verify', { code: codeAt(secret, step) });
+  ok(r.status === 400, 'a code cannot be used twice');
+  r = await call(newerA, 'POST', '/two-step/verify', { code: codeAt(secret, step + 1) });
+  ok(r.status === 200 && (await call({ company: A.slug, token: r.data.token }, 'GET', '/sync')).status === 200, 'the next code signs in');
+  for (let k = 0; k < 5; k++) r = await call(newerA, 'POST', '/two-step/verify', { code: '999999' === codeAt(secret, step + 2) ? '888888' : '999999' });
+  r = await call(newerA, 'POST', '/two-step/verify', { code: codeAt(secret, step + 2) });
+  ok(r.status === 429, 'five wrong codes lock it for 15 minutes', r.status);
+  r = await call(adminB, 'PATCH', '/users', { id: String(made.users[0]), resetTotp: true });
+  ok(r.status === 200 && r.data.user.totpEnabled === false, 'another owner can reset two-step sign-in', r.data);
+  await pool.query('UPDATE cf_crm_members SET totp_locked_until = NULL WHERE customer_id = ?', [made.customer]);
+
+  console.log('app page headers');
+  const page = await fetch('http://localhost:5173/cf_crm/app.html').then((x) => x.text()).catch(() => '');
+  if (page) {
+    ok(/Content-Security-Policy/.test(page) && /script-src 'self' https:\/\/cdnjs\.cloudflare\.com;/.test(page) && !/unsafe-eval/.test(page), 'the app page forbids injected scripts');
+    ok(/integrity="sha512-/.test(page), 'the Excel library is pinned by its fingerprint');
+  }
+  adminA.token = tfaA.token;
+
+  console.log('one sign-in for every company of the network');
+  const wrong = await fetch(`${HOST}/api/${A.slug}/cf_crm/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: B.email, password: PW }) });
+  const wrongJ = await wrong.json().catch(() => ({}));
+  ok(wrong.status === 403 && /not in this company/i.test(wrongJ.message || ''), "the platform refuses a login at the other company's address", wrongJ);
+  const ns = async (company, email, password) => {
+    const x = await fetch(`${HOST}/api/${company}/cf_crm/network-sign-in`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password }) });
+    return { status: x.status, data: await x.json().catch(() => ({})) };
+  };
+  r = await ns(A.slug, B.email, PW);
+  ok(r.status === 200 && r.data.company === B.slug, 'the network says which company of the same customer the login belongs to', r.data);
+  r = await ns(A.slug, B.email, 'not-the-password');
+  ok(r.status === 401 && !r.data.company, 'with a wrong password it says nothing', r.data);
+  r = await ns(A.slug, 'nobody@zz-crm-a.test', PW);
+  ok(r.status === 401 && !r.data.company, 'an unknown email gets the same answer as a wrong password', r.data);
+  r = await ns('placebo', B.email, PW);
+  ok(r.status !== 200 && !r.data.company, "another customer's address does not lead into this network", r.status);
+
+  console.log('alerts on devices');
+  r = await call(adminB, 'GET', '/push/key');
+  ok(r.status === 200 && typeof r.data.key === 'string' && r.data.key.length > 60, 'the server has a public push key', r.data);
+  r = await call(adminB, 'POST', '/push/subscribe', { subscription: { endpoint: 'http://not-https.example/x', keys: { p256dh: 'a', auth: 'b' } } });
+  ok(r.status === 400, 'a subscription that is not https is refused', r.status);
+  const crypto = await import('node:crypto');
+  const ecdh = crypto.createECDH('prime256v1'); ecdh.generateKeys();
+  const fakeSub = { endpoint: 'https://127.0.0.1:9/push/zz-test', keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') } };
+  r = await call(adminB, 'POST', '/push/subscribe', { subscription: fakeSub });
+  ok(r.status === 200, 'a device subscribes', r.data);
+  r = await call(adminB, 'POST', '/push/test', {});
+  ok(r.status === 200 && r.data.sent === 0, 'an alert that cannot be delivered fails quietly', r.data);
+  const [subsLeft] = await pool.query('SELECT COUNT(*) AS n FROM cf_crm_push_subs WHERE customer_id = ?', [made.customer]);
+  ok(Number(subsLeft[0].n) === 1, 'a temporary delivery failure keeps the subscription');
+  r = await call(adminB, 'POST', '/push/unsubscribe', { endpoint: fakeSub.endpoint });
+  const [subsGone] = await pool.query('SELECT COUNT(*) AS n FROM cf_crm_push_subs WHERE customer_id = ?', [made.customer]);
+  ok(r.status === 200 && Number(subsGone[0].n) === 0, 'signing out removes the subscription');
+
+  console.log('the morning follow-up reminder');
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+  const yesterday = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(Date.now() - 864e5));
+  r = await call(tfaA, 'POST', '/records', { ops: [
+    { t: 'leads', i: 'd1', d: { id: 'd1', business: 'chit', stage: 'new', owner: 'Owner Uno', nextDate: yesterday }, b: 0 },
+    { t: 'leads', i: 'd2', d: { id: 'd2', business: 'chit', stage: 'enrolled', owner: 'Owner Uno', nextDate: today }, b: 0 },
+    { t: 'leads', i: 'd3', d: { id: 'd3', business: 'chit', stage: 'new', owner: 'Owner Uno', nextDate: '2099-01-01' }, b: 0 },
+  ] });
+  ok(r.data.saved === 3, 'three leads for the reminder', r.data);
+  const { runDigest } = await import('../lib/digest.js');
+  const dg = await runDigest({ id: made.customer }, { force: true });
+  ok(dg.told >= 1, 'the reminder runs', dg);
+  const [dueRows] = await pool.query("SELECT text, link FROM cf_crm_notifications WHERE customer_id = ? AND user_id = ? AND kind = 'due' ORDER BY id DESC LIMIT 1", [made.customer, made.users[0]]);
+  ok(dueRows[0] && /^1 follow-up due today \(1 overdue\)/.test(dueRows[0].text) && dueRows[0].link === 'followups', 'only open, due leads count; won and future ones do not', dueRows[0]);
+  const again = await runDigest({ id: made.customer });
+  ok(again.skipped === 'done' || again.skipped === 'early', 'it runs once a day', again);
 
   console.log('at least one owner');
   r = await call(adminA, 'PATCH', '/users', { id: String(made.users[0]), role: 'manager' });

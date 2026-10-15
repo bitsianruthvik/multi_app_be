@@ -4,6 +4,7 @@ import { Router } from 'express';
 import dataRoutes from './routes/data.js';
 import setupRoutes from './routes/setup.js';
 import commsRoutes from './routes/comms.js';
+import { startDigest } from './lib/digest.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +43,8 @@ export default {
   resourceDefs: {},
   register(server) {
     server.use('/api/:companySlug/cf_crm', router);
+    // the morning follow-up reminder (every 15 minutes it checks whose morning it is)
+    startDigest();
   },
   migrations: path.join(__dirname, 'models', 'init.sql'),
 };

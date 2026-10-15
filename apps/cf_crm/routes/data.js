@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { q, tx, audit, notify, whoOf, parseJson } from '../lib/db.js';
 import { crm, handle, publicMember } from '../lib/context.js';
 import { canBiz } from '../lib/roles.js';
+import { merge3 } from '../lib/merge.js';
 
 /**
  * THE NETWORK'S DATA: the browser keeps a full local copy and this router is
@@ -87,7 +88,7 @@ router.get('/sync', ...crm(), handle(async (req, res, { customer, me, cfg }) => 
        WHERE customer_id = ? AND type = 'leads' AND deleted = 0 AND ${leadBizClause}
     )
     SELECT x.* FROM (
-      SELECT r.type, r.id, ${TS.replace('%s', 'r.updated_at')} AS u, r.deleted, r.data,
+      SELECT r.type, r.id, ${TS.replace('%s', 'r.updated_at')} AS u, r.deleted, r.data, r.rev,
         ((r.type = 'people' AND r.id IN (SELECT id FROM hidden))
          OR (r.person_id IS NOT NULL AND r.person_id IN (SELECT id FROM hidden))
          OR (r.type = 'leads' AND r.id IN (SELECT id FROM hidden_leads))
@@ -102,7 +103,7 @@ router.get('/sync', ...crm(), handle(async (req, res, { customer, me, cfg }) => 
   const rows = await q(sql, [...args, ...hideTypes, customer.id, ...whereArgs]);
 
   const out = {
-    rows: rows.map((x) => (x.deleted || x.hid ? { t: x.type, i: x.id, x: 1 } : { t: x.type, i: x.id, d: parseJson(x.data, {}) })),
+    rows: rows.map((x) => (x.deleted || x.hid ? { t: x.type, i: x.id, x: 1 } : { t: x.type, i: x.id, d: parseJson(x.data, {}), r: Number(x.rev) || 0 })),
     more: rows.length === PAGE,
   };
   const last = rows[rows.length - 1];
@@ -136,22 +137,41 @@ function label(t, d) {
   return '';
 }
 
-/** Insert or replace a batch of records (and keep cf_crm_phones in step). */
+/**
+ * Insert or replace a batch of records: each gets its next revision, each
+ * write is kept in cf_crm_record_versions, and cf_crm_phones follows the
+ * people. Must run inside a transaction. Returns Map('type/id' -> rev).
+ */
 export async function upsertRecords(c, customerId, userId, ops) {
-  if (!ops.length) return;
+  const revs = new Map();
+  if (!ops.length) return revs;
   for (let k = 0; k < ops.length; k += 300) {
     const part = ops.slice(k, k + 300);
-    const vals = [];
+    const cur = await c.q(
+      `SELECT type, id, rev FROM cf_crm_records WHERE customer_id = ? AND (type, id) IN (${part.map(() => '(?,?)').join(',')}) FOR UPDATE`,
+      [customerId, ...part.flatMap((o) => [o.t, o.i])]);
+    const was = new Map(cur.map((r) => [r.type + '/' + r.id, Number(r.rev) || 0]));
+    const vals = [], vers = [];
     part.forEach((o) => {
+      const key = o.t + '/' + o.i;
+      const rev = (was.get(key) || 0) + 1;
+      revs.set(key, rev);
+      if (o.d) delete o.d._rev;
       const s = sideColumns(o.t, o.x ? null : o.d);
-      vals.push(customerId, o.t, o.i, o.x ? null : JSON.stringify(o.d), o.x ? 1 : 0, s.person_id, s.lead_id, s.owner_in_charge, s.is_private, s.business, userId);
+      const json = o.x ? null : JSON.stringify(o.d);
+      vals.push(customerId, o.t, o.i, json, o.x ? 1 : 0, s.person_id, s.lead_id, s.owner_in_charge, s.is_private, s.business, userId, rev);
+      vers.push(customerId, o.t, o.i, rev, json, o.x ? 1 : 0, userId);
     });
     await c.q(
-      `INSERT INTO cf_crm_records (customer_id, type, id, data, deleted, person_id, lead_id, owner_in_charge, is_private, business, updated_at, updated_by)
-       VALUES ${part.map(() => '(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6),?)').join(',')}
+      `INSERT INTO cf_crm_records (customer_id, type, id, data, deleted, person_id, lead_id, owner_in_charge, is_private, business, updated_at, updated_by, rev)
+       VALUES ${part.map(() => '(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6),?,?)').join(',')}
        ON DUPLICATE KEY UPDATE data = VALUES(data), deleted = VALUES(deleted), person_id = VALUES(person_id), lead_id = VALUES(lead_id),
          owner_in_charge = VALUES(owner_in_charge), is_private = VALUES(is_private), business = VALUES(business),
-         updated_at = VALUES(updated_at), updated_by = VALUES(updated_by)`, vals);
+         updated_at = VALUES(updated_at), updated_by = VALUES(updated_by), rev = VALUES(rev)`, vals);
+    await c.q(
+      `INSERT INTO cf_crm_record_versions (customer_id, type, id, rev, data, deleted, updated_by, at)
+       VALUES ${part.map(() => '(?,?,?,?,?,?,?,UTC_TIMESTAMP(6))').join(',')}
+       ON DUPLICATE KEY UPDATE data = VALUES(data), deleted = VALUES(deleted), updated_by = VALUES(updated_by), at = VALUES(at)`, vers);
   }
   const people = ops.filter((o) => o.t === 'people');
   if (people.length) {
@@ -167,12 +187,21 @@ export async function upsertRecords(c, customerId, userId, ops) {
       await c.q(`INSERT IGNORE INTO cf_crm_phones (customer_id, person_id, phone) VALUES ${part.map(() => '(?,?,?)').join(',')}`, part.flat());
     }
   }
+  return revs;
 }
 
-// POST /records { ops: [{ t, i, d } | { t, i, x: 1 }], note, quiet }
+// POST /records { ops: [{ t, i, d, b } | { t, i, x: 1, b }], note, quiet }
 // Saves a batch, checks the login's role for each record, writes the audit
 // log and the notifications. Records that are not allowed come back in
 // `rejected` and the app undoes them on screen.
+//
+// `b` is the revision the edit was based on (0 for a new record). When
+// someone else saved in between, the edit is MERGED field by field against
+// that version instead of overwriting their changes; fields both changed come
+// back in `merged[].clash` so the person is told. Deleting a record someone
+// changed since, or editing one someone deleted, is refused (`conflict`,
+// `gone`). Without `b` (an app from before revisions) the save overwrites,
+// as it always did.
 router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
   const role = me.can;
   if (!role.write) return res.status(403).json({ error: 'Your account is read-only.' });
@@ -193,10 +222,32 @@ router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
 
   const result = await tx(async (c) => {
     const cur = await c.q(
-      `SELECT type, id, data, deleted FROM cf_crm_records WHERE customer_id = ? AND (type, id) IN (${ops.map(() => '(?,?)').join(',')}) FOR UPDATE`,
+      `SELECT type, id, data, deleted, rev FROM cf_crm_records WHERE customer_id = ? AND (type, id) IN (${ops.map(() => '(?,?)').join(',')}) FOR UPDATE`,
       [customer.id, ...ops.flatMap((o) => [o.t, o.i])]);
-    const existing = new Map(cur.map((r) => [r.type + '/' + r.id, { ...r, data: parseJson(r.data, null) }]));
+    const existing = new Map(cur.map((r) => [r.type + '/' + r.id, { ...r, rev: Number(r.rev) || 0, data: parseJson(r.data, null) }]));
     const exOf = (o) => existing.get(o.t + '/' + o.i);
+
+    // someone saved since this edit began: merge, or refuse a delete / an edit of a deleted record
+    ops.forEach((o) => { if (o.d) delete o.d._rev; });
+    const stale = ops.filter((o) => Number.isInteger(o.b) && o.b >= 0 && exOf(o) && exOf(o).rev !== o.b);
+    const conflictWhy = new Map();
+    const clashes = new Map();
+    if (stale.length) {
+      const withBase = stale.filter((o) => o.b > 0);
+      const bases = withBase.length ? await c.q(
+        `SELECT type, id, rev, data, deleted FROM cf_crm_record_versions WHERE customer_id = ? AND (type, id, rev) IN (${withBase.map(() => '(?,?,?)').join(',')})`,
+        [customer.id, ...withBase.flatMap((o) => [o.t, o.i, o.b])]) : [];
+      const baseOf = new Map(bases.map((r) => [r.type + '/' + r.id, r]));
+      for (const o of stale) {
+        const ex = exOf(o);
+        if (o.x) { if (!ex.deleted) conflictWhy.set(o, 'conflict'); continue; }
+        if (ex.deleted) { conflictWhy.set(o, 'gone'); continue; }
+        const base = baseOf.get(o.t + '/' + o.i);
+        const m = merge3(base && !base.deleted ? parseJson(base.data, {}) : {}, ex.data || {}, o.d);
+        o.d = m.data;
+        clashes.set(o, m.clash);
+      }
+    }
 
     // managers may only touch people assigned to them (and those people's records)
     let personOwner = new Map();
@@ -215,8 +266,9 @@ router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
     for (const o of ops) {
       const ex = exOf(o);
       const exData = ex && !ex.deleted ? ex.data : null;
-      let why = '';
-      if (o.t === 'campaigns' && !role.campaigns) why = 'campaigns';
+      let why = conflictWhy.get(o) || '';
+      if (why) { /* refused above */ }
+      else if (o.t === 'campaigns' && !role.campaigns) why = 'campaigns';
       else if (o.x && ADMIN_DELETE.has(o.t) && !role.delete) why = 'delete';
       else if (o.t === 'comments' && exData && String(exData.byId || '') !== myId && !role.settings) why = 'comment';
       else if (o.t === 'campaigns' && o.d && o.d.status === 'Sent' && !(exData && exData.status === 'Sent') && !role.send) why = 'send';
@@ -259,6 +311,7 @@ router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
 
     const rejected = [];
     const ok = [];
+    let revs = new Map();
     for (const o of ops) {
       const why = whyOf.get(o);
       if (why) rejected.push({ t: o.t, i: o.i, why });
@@ -273,7 +326,7 @@ router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
       }
     });
     if (ok.length) {
-      await upsertRecords(c, customer.id, me.id, ok);
+      revs = await upsertRecords(c, customer.id, me.id, ok);
       const note = String(b.note || '').slice(0, 200);
       if (ok.length <= 15 && !b.quiet) {
         for (const o of ok) {
@@ -318,7 +371,12 @@ router.post('/records', ...crm(), handle(async (req, res, { customer, me }) => {
         }
       }
     }
-    return { saved: ok.length, rejected };
+    return {
+      saved: ok.length,
+      rejected,
+      revs: ok.map((o) => ({ t: o.t, i: o.i, r: revs.get(o.t + '/' + o.i) })),
+      merged: ok.filter((o) => clashes.has(o)).map((o) => ({ t: o.t, i: o.i, r: revs.get(o.t + '/' + o.i), d: o.d, clash: clashes.get(o) })),
+    };
   });
   res.json(result);
 }));
