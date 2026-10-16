@@ -34,6 +34,9 @@ const REQUEST_ID = 'setup-karni-exec-leave';
 
 /** Roles that are workers, not executives: they get no policy from this script. */
 export const WORKER_TITLE = /operator|helper|worker|driver|loader|cleaner|peon|guard|security|fitter|electrician|technician|attendant|boy/i;
+/** Also workers, by the user (2026-10-16), though their titles do not say so. Matched on the start of the title. */
+export const WORKER_ROLES = ['Asst Op 1 & Asst Op 2 & Asst Op 3', 'Housekeeping Staff', 'Welder/Fabricator', 'Cow Maintenance'];
+const isWorker = (title) => WORKER_TITLE.test(title ?? '') || WORKER_ROLES.some((w) => String(title ?? '').toLowerCase().startsWith(w.toLowerCase()));
 
 export const POLICY = {
   code: 'KPPL/HR/POL/004',
@@ -89,7 +92,7 @@ const sameRule = (a, b) => COMPARE.every((k) => JSON.stringify(a?.[k] ?? null) =
 /** What a run would do, and (with apply, in the caller's transaction) does it. Returns the report. */
 export async function setupExecLeave(conn, companyId, { userId = null } = {}) {
   const c = { companyId, userId };
-  const report = { types: [], policy: null, policyAction: null, assigned: [], alreadyAssigned: [], workers: [], elsewhere: [] };
+  const report = { types: [], policy: null, policyAction: null, assigned: [], alreadyAssigned: [], workers: [], elsewhere: [], unassigned: [] };
 
   // ── 1. leave types ──
   const { types } = await listLeaveTypes(conn, companyId);
@@ -147,8 +150,13 @@ export async function setupExecLeave(conn, companyId, { userId = null } = {}) {
   const [roles] = await conn.query('SELECT id, title FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY title, id', [companyId]);
   const index = await loadAssignmentIndex(conn, companyId, { labels: false });
   for (const r of roles) {
-    if (WORKER_TITLE.test(r.title ?? '')) { report.workers.push(r); continue; }
     const own = index.byRole.get(r.id) ?? null;
+    if (isWorker(r.title)) {
+      // A worker role that carries THIS policy (assigned before it was named a worker) loses it.
+      if (own && own.id === policy.id) { await putAssignment(conn, c, { scope: 'ROLE', roleId: r.id, policyId: null }, REQUEST_ID); report.unassigned.push(r); }
+      report.workers.push(r);
+      continue;
+    }
     if (own && own.id === policy.id) { report.alreadyAssigned.push(r); continue; }
     if (own) { report.elsewhere.push({ ...r, policy: own.name }); continue; }
     await putAssignment(conn, c, { scope: 'ROLE', roleId: r.id, policyId: policy.id }, REQUEST_ID);
@@ -195,6 +203,7 @@ async function main() {
     };
     list(APPLY ? 'ASSIGNED NOW' : 'WOULD BE ASSIGNED', report.assigned);
     list('ALREADY ASSIGNED THIS POLICY', report.alreadyAssigned);
+    list(APPLY ? 'TAKEN OFF NOW (worker roles that had this policy)' : 'WOULD BE TAKEN OFF (worker roles that have this policy)', report.unassigned);
     list('SKIPPED — WORKER ROLES', report.workers);
     list('SKIPPED — ALREADY HAVE ANOTHER POLICY (not touched; decide by hand)', report.elsewhere, (r) => `  (${r.policy})`);
     console.log(APPLY ? '\n  APPLIED.\n' : '\n  nothing written. Run again with --apply.\n');
