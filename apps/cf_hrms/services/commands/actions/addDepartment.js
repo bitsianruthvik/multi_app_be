@@ -3,11 +3,9 @@
  * Calls organisationService.createDepartment: the label is checked against the
  * company's list there, and the code is issued by the code generator.
  *
- * LABELS IN GROUPS (spec §15.3): `label` is the Kind label (Department,
- * Section, Machine …); `labels` carries the labels of the company's OTHER
- * groups, as label ids separated by commas ("add a Machine department Printing 3
- * under Production in Unit 2" -> the Unit group's label Unit 2). One label per
- * group; a required group must have one.
+ * `label` is the department's ONE label (Department, Section, Machine … —
+ * the company's list); a position added to it later in the same plan starts
+ * on that label's default shift (addPosition.shiftChoiceOf).
  */
 import { createDepartment } from '../../organisationService.js';
 import {
@@ -17,12 +15,11 @@ import {
 export default {
   key: 'add_department',
   label: 'Add a department or section',
-  template: 'Add the {label} {name} under {under} {labels}',
+  template: 'Add the {label} {name} under {under}',
   fields: [
     { name: 'name', kind: 'newText', required: true, label: 'Name' },
-    { name: 'label', kind: 'label', required: true, label: 'Kind' },
+    { name: 'label', kind: 'label', required: true, label: 'Label' },
     { name: 'under', kind: 'department', required: false, label: 'Under' },
-    { name: 'labels', kind: 'labels', required: false, label: 'Other labels' },
   ],
   examples: [
     'add a department called Quality Assurance',
@@ -37,7 +34,7 @@ export default {
     'we need a Safety department under Operations',
     'add department "Customer Service"',
     'open a new section called Ink Kitchen under Printing',
-    'add a Machine department Printing 3 under Production in Unit 2',
+    'add a Machine department Printing 3 under Production',
   ],
   rightOf: () => PERM.org.edit,
 
@@ -59,15 +56,10 @@ export default {
     if (name && ctx.recs.departments.some((d) => d.name.toLowerCase() === name.toLowerCase() && (d.parentId ?? null) === (under?.step ? -1 : under?.id ?? null))) {
       problems.push(`There is already a department called ${name} there.`);
     }
-    const others = otherLabelsOf(step, ctx, problems);
-    // Its labels in group order (Kind by name, then the others) — what a position added to it later in the plan starts its shift from.
-    const labelRefs = (ctx.recs.labelGroups ?? []).flatMap((g) => {
-      const l = g.isKind ? g.labels.find((x) => x.name.toLowerCase() === String(label).toLowerCase()) : g.labels.find((x) => others.some((o) => o.id === x.id));
-      return l ? [{ groupId: g.id, groupName: g.name, labelId: l.id, name: l.name }] : [];
-    });
-    const made = { kind: 'department', name, label, labelRefs, inside: under ? under.inside : !scoped, parentStep: under?.step ?? null };
+    // Its label — what a position added to it later in the plan starts its shift from.
+    const made = { kind: 'department', name, label, inside: under ? under.inside : !scoped, parentStep: under?.step ?? null };
     ctx.preview.departments.push({
-      key: step.id, name, label, labels: others.map((l) => ({ groupId: l.groupId, groupName: l.groupName, labelId: l.id, name: l.name })),
+      key: step.id, name, label,
       parentId: under?.step ? null : under?.id ?? null,
       parentKey: under?.step ?? null,
       parentName: under?.name ?? null,
@@ -79,25 +71,8 @@ export default {
   async apply(step, conn, ctx) {
     const label = textOf(step, 'label') || ctx.recs.labels[0];
     const under = ctx.refId(step, 'under');
-    const labels = Object.fromEntries(otherLabelsOf(step, ctx, []).map((l) => [l.groupId, l.id]));
-    const d = await createDepartment(conn, ctx.c, { name: textOf(step, 'name'), type: label, parentId: under ?? null, labels });
+    const d = await createDepartment(conn, ctx.c, { name: textOf(step, 'name'), type: label, parentId: under ?? null });
     return { kind: 'department', id: d.id, code: d.code ?? null, name: d.name ?? textOf(step, 'name'), departmentId: d.id, link: 'departments' };
   },
 };
 
-/** The step's labels of the other groups, checked: one per group, required groups given. */
-function otherLabelsOf(step, ctx, problems) {
-  const ids = textOf(step, 'labels').split(',').map((v) => Number(v.trim())).filter((n) => Number.isInteger(n) && n > 0);
-  const all = ctx.recs.otherLabels ?? [];
-  const chosen = [];
-  for (const id of ids) {
-    const l = all.find((x) => x.id === id);
-    if (!l) { problems.push('Choose the labels again — one of them is not a label of this company any more.'); continue; }
-    if (chosen.some((c) => c.groupId === l.groupId)) { problems.push(`Choose one ${l.groupName} label — a department has one label in each group.`); continue; }
-    chosen.push(l);
-  }
-  for (const g of ctx.recs.labelGroups ?? []) {
-    if (!g.isKind && g.isRequired && !chosen.some((c) => c.groupId === g.id)) problems.push(`Choose its ${g.name} label — every department has one.`);
-  }
-  return chosen;
-}

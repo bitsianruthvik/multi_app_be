@@ -305,13 +305,11 @@ export async function previewRuleSummary(db, companyId, body = {}) {
  * Policies
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** Live positions of the company with what the resolution needs of each (and what a warning names): one query. */
+/** Live positions of the company with what the resolution needs of each: one query. */
 async function livePositions(db, companyId) {
   const [rows] = await db.query(
-    `SELECT p.id, p.role_id, p.location_id, p.department_id, p.position_code, COALESCE(p.position_title, r.title) AS title, d.name AS department_name
+    `SELECT p.id, p.role_id, p.location_id, p.department_id
        FROM hrms_positions p
-       LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
-       LEFT JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
       WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED'`, [companyId]);
   return rows;
 }
@@ -559,11 +557,9 @@ export function listTemplates() {
 /**
  * GET /leave/assignments — five reads sent together, whatever the size of the company.
  *
- * `labels` (spec §17): every label of every group, group order, each with its
- * own policy (or null), `positionCount` = the positions whose policy comes from
- * this label (a role's own policy beats it; a department's OWN labels only),
- * and `conflicts` = those positions whose labels point to different policies —
- * where this label is the one that won or one that lost.
+ * `labels` (spec §17): every label of the company, in its order, each with its
+ * own policy (or null) and `positionCount` = the positions whose policy comes
+ * from this label (a role's own policy beats it; a department's OWN label only).
  */
 export async function getAssignments(db, companyId) {
   const [index, positions, [locations], [roles], [labels]] = await Promise.all([
@@ -572,23 +568,18 @@ export async function getAssignments(db, companyId) {
     db.query('SELECT id, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name, id', [companyId]),
     db.query('SELECT id, title FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query(
-      `SELECT l.id, l.name, g.id AS group_id, g.name AS group_name
+      `SELECT l.id, l.name
          FROM hrms_department_labels l
-         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.is_kind = 1 AND g.deleted_at IS NULL
         WHERE l.company_id = ? AND l.deleted_at IS NULL
-        ORDER BY g.sort_order, g.id, l.sort_order, l.id`, [companyId]),
+        ORDER BY l.sort_order, l.id`, [companyId]),
   ]);
   const positionsOfRole = new Map();
   for (const p of positions) positionsOfRole.set(p.role_id, (positionsOfRole.get(p.role_id) ?? 0) + 1);
   const reached = new Map();
-  const conflictsOf = new Map();
   for (const p of positions) {
     const e = resolveEffective(index, targetOf(p));
-    if (e.from !== 'LABEL') continue;
-    reached.set(e.label.id, (reached.get(e.label.id) ?? 0) + 1);
-    if (!e.conflict) continue;
-    const item = { positionId: p.id, positionCode: p.position_code ?? null, title: p.title ?? null, departmentName: p.department_name ?? null, line: e.line };
-    for (const id of [e.label.id, ...e.conflict.map((x) => x.label.id)]) conflictsOf.set(id, [...(conflictsOf.get(id) ?? []), item]);
+    if (e.from === 'LABEL') reached.set(e.label.id, (reached.get(e.label.id) ?? 0) + 1);
   }
   return {
     company: { policy: index.company },
@@ -600,13 +591,10 @@ export async function getAssignments(db, companyId) {
       effective: resolveEffective(index, { locationId: l.id }),
     })),
     labels: labels.map((l) => ({
-      groupId: l.group_id,
-      groupName: l.group_name,
       labelId: l.id,
       name: l.name,
       policy: index.byLabel.get(l.id)?.policy ?? null,
       positionCount: reached.get(l.id) ?? 0,
-      conflicts: (conflictsOf.get(l.id) ?? []).sort((a, b) => String(a.positionCode ?? '').localeCompare(String(b.positionCode ?? ''))),
     })),
     // Only the roles that have a policy of their own.
     roles: roles.filter((r) => index.byRole.has(r.id)).map((r) => ({
@@ -646,10 +634,10 @@ export async function putAssignment(conn, c, body = {}, requestId = null) {
     if (!row) throw notFound('That role');
   }
   if (scope === 'LABEL') {
-    // A live label of a live group of THIS company.
+    // A live label of THIS company's list.
     const [[row]] = await conn.query(
       `SELECT l.id FROM hrms_department_labels l
-         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.is_kind = 1 AND g.deleted_at IS NULL
         WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`, [c.companyId, labelId]);
     if (!row) throw notFound('That label');
   }

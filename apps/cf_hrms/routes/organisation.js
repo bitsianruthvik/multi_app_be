@@ -4,8 +4,8 @@
  *   GET    /organisation/lookups                    locations + departments + shifts for pickers
  *
  *   GET    /organisation/departments                pre-ordered tree, depth + child counts; + type, isShared, serves[], and `types` in use
- *   POST   /organisation/departments                { name, parentId?, type? (a Kind label's name), labels?: { [groupId]: labelId | null },
- *                                                     isShared?, serves?: [departmentId], status? } — rows carry labels: [{ groupId, groupName, labelId, name }]
+ *   POST   /organisation/departments                { name, parentId?, labelId? | type? (the label's name), isShared?,
+ *                                                     serves?: [departmentId], status? } — rows carry type (label name) + labelId
  *   PUT    /organisation/departments/:id            same fields; parentId moves the branch; serves replaces the list
  *   DELETE /organisation/departments/:id
  *   GET    /organisation/departments/staffing  ?on=  every department's roles and positions (seats, filled, vacant,
@@ -82,7 +82,6 @@ import {
 } from '../services/organisationService.js';
 import { departmentStaffing } from '../services/jobContentService.js';
 import { listLabels, createLabel, updateLabel, reorderLabels, deleteLabel } from '../services/departmentLabelService.js';
-import { listGroups, createGroup, updateGroup, reorderGroups, deleteGroup } from '../services/labelGroupService.js';
 
 const router = Router();
 
@@ -107,43 +106,23 @@ router.put('/organisation/departments/:id', guard(PERM.org.edit), departmentWrit
 router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmentWrite(), handle((req) => tx(req, (db, c) => deleteDepartment(db, c, intParam(req.params.id)))));
 
 // ----- department labels (spec §9) -------------------------------------------
-// The company's own short list: Department, Section, Machine to begin with. A
-// department's label (`type`) must be one of these. A rename also renames it on
+// The company's own short list: Department, Section, Machine to begin with.
+// Every department has exactly ONE label (`type` / `labelId`), one of these. A rename also renames it on
 // every department that uses it; a delete in use is 409 IN_USE with
 // detail.departmentCount unless ?moveTo=<labelId> says where its departments go.
-//   GET    /organisation/department-labels            { labels: [{ id, name, sortOrder, departmentCount }] }
-//   POST   /organisation/department-labels            { name, groupId?, defaultShiftId? }            -> the label (also under `label`)
-//   PUT    /organisation/department-labels/order      { ids: number[] }      -> { labels }
+//   GET    /organisation/department-labels            { labels: [{ id, name, sortOrder, departmentCount, defaultShiftId }],
+//                                                      shifts: [{ id, code, name }] } (the choices of "New positions start on")
+//   POST   /organisation/department-labels            { name, defaultShiftId? }              -> the label (also under `label`)
+//   PUT    /organisation/department-labels/order      { ids: number[] }      -> { labels, shifts }
 //   PUT    /organisation/department-labels/:id        { name?, sortOrder?, defaultShiftId? }       -> the label (also under `label`)
 //          defaultShiftId = "New positions start on" (spec §17.2): a shift id, or null for none
 //   DELETE /organisation/department-labels/:id        ?moveTo=<labelId>      -> { ok, id, departmentsMoved }
-router.get('/organisation/department-labels', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLabels(pool, ctx(req).companyId, { groupId: req.query.groupId ?? null })));
+router.get('/organisation/department-labels', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLabels(pool, ctx(req).companyId)));
 router.post('/organisation/department-labels', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLabel(db, c, req.body ?? {}))));
 // Before /:id, or "order" would be read as an id.
 router.put('/organisation/department-labels/order', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => reorderLabels(db, c, req.body ?? {}))));
 router.put('/organisation/department-labels/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLabel(db, c, intParam(req.params.id), req.body ?? {}))));
 router.delete('/organisation/department-labels/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLabel(db, c, intParam(req.params.id), { moveTo: req.query.moveTo ?? null }))));
-
-// ----- label groups (spec §15) -----------------------------------------------
-// A department's labels belong to named groups, one label per group. Kind is
-// every company's (required, LOCKED: never removed). The label routes above
-// take `groupId` (no groupId = Kind, as before groups).
-//   GET    /organisation/label-groups              { groups: [{ id, name, sortOrder, isRequired, isKind, locked, departmentsWithout,
-//                                                    labels: [{ id, name, sortOrder, departmentCount, groupId }] }], departmentCount }
-//   POST   /organisation/label-groups              { name, isRequired? }               -> the group (also under `group`)
-//   PUT    /organisation/label-groups/order        { ids: number[] }                    -> { groups }
-//   PUT    /organisation/label-groups/:id          { name?, isRequired?, sortOrder? }   -> the group; Kind stays required (409 LOCKED)
-//   DELETE /organisation/label-groups/:id          ?force=1                             -> { ok, id, departmentsUnlabelled, labelsRemoved };
-//                                                  409 IN_USE (detail.departmentCount) without force; 409 LOCKED for Kind
-const WHOLE = 'This belongs to the whole company. Your access covers your own department only.';
-router.get('/organisation/label-groups', guard([PERM.org.view, PERM.positions.view]), handle((req) => listGroups(pool, ctx(req).companyId)));
-router.post('/organisation/label-groups', guard(PERM.org.edit), companyWide(WHOLE), handle((req) => tx(req, (db, c) => createGroup(db, c, req.body ?? {}))));
-// Before /:id, or "order" would be read as an id.
-router.put('/organisation/label-groups/order', guard(PERM.org.edit), companyWide(WHOLE), handle((req) => tx(req, (db, c) => reorderGroups(db, c, req.body ?? {}))));
-router.put('/organisation/label-groups/:id', guard(PERM.org.edit), companyWide(WHOLE), handle((req) => tx(req, (db, c) => updateGroup(db, c, intParam(req.params.id), req.body ?? {}))));
-router.delete('/organisation/label-groups/:id', guard(PERM.org.remove), companyWide(WHOLE), handle((req) => tx(req, (db, c) => deleteGroup(db, c, intParam(req.params.id), {
-  force: ['1', 'true', 'yes'].includes(String(req.query.force ?? '').toLowerCase()),
-}))));
 
 // ----- locations ------------------------------------------------------------
 router.get('/organisation/locations', guard([PERM.org.view, PERM.positions.view]), listed('locations'), handle((req) => listLocations(pool, ctx(req).companyId)));

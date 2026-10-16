@@ -53,7 +53,7 @@ const UNIQUE_MESSAGES = {
   uq_hatd_name: 'That authority is already in the catalogue.',
 
   uq_hdlb_name: 'A label with that name already exists.',
-  uq_hdlb_group_name: 'That group already has a label with that name.',
+  uq_hdlb_group_name: 'A label with that name already exists.',
   uq_hlgr_name: 'A label group with that name already exists.',
   uq_hlgr_kind: 'The company already has its Kind group.',
   uq_hdll_one: 'A department has one label in each group.',

@@ -495,7 +495,7 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
   // The position's shift. A new position with none named gets the company's
   // General shift; an existing one cannot be left without one — a chair is on a
   // shift, and "no shift" is how the old day/night box used to be written.
-  // (spec §17.2) None named: the first label of its department, in group order, with a default shift;
+  // (spec §17.2) None named: its department's label's default shift, when it has one;
   // else General. A shift named always wins; an existing position never gets here.
   if (!partial && out.default_shift_id == null) out.default_shift_id = (await newPositionShift(db, companyId, { departmentId: out.department_id })).shift?.id ?? null;
   if (partial && has('defaultShiftId') && out.default_shift_id == null && !problems.some((p) => /shift/i.test(p))) {

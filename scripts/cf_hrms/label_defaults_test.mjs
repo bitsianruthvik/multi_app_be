@@ -6,24 +6,23 @@
  *      a second run plans nothing; `scope` is a VARCHAR;
  *   1. leave — the resolution order: role beats label beats location beats
  *      company; removing a label's (and a role's) assignment falls back;
- *   2. leave — two labels of two groups pointing to different policies: the
- *      group that comes first wins, the conflict is listed (and flips with the
- *      group order); the same policy twice is no conflict;
- *   3. leave — a label's policy reaches exactly the positions of departments
- *      carrying it (not their children), Kind labels included; GET
+ *      (a department has ONE label since 2026-10-16, so there is never a
+ *      conflict between two labels to resolve);
+ *   2. leave — a label's policy reaches exactly the positions of departments
+ *      carrying it (not their children), the built-in labels included; GET
  *      /leave/assignments `labels`; every read (position, card, policy-for,
  *      My place's helper, role page) answers through the one resolution;
  *      usedBy.labels, IN_USE, refusals;
- *   4. shift — a label's "New positions start on": set / clear / refused;
+ *   3. shift — a label's "New positions start on": set / clear / refused;
  *      the suggestion route; the default in EVERY creation path (POST
  *      /positions, add-sibling, Excel positions upload, command bar
  *      add_position incl. a department made earlier in the same plan); an
  *      explicit shift always wins; existing positions never change;
- *   5. rights; 6. tenant isolation; and nothing is left behind.
+ *   4. rights; 5. tenant isolation; and nothing is left behind.
  *
  *   node scripts/cf_hrms/label_defaults_test.mjs [--company=karni] [--verbose]
  *
- * NOTHING IS LEFT BEHIND: like label_groups_test, the whole run is ONE
+ * NOTHING IS LEFT BEHIND: like label_test, the whole run is ONE
  * connection inside ONE transaction (pool.query / getConnection point at it; a
  * route's own transaction is a savepoint), rolled back at the end. Local only.
  */
@@ -206,19 +205,16 @@ try {
     ok(String(scope?.t).toLowerCase() === 'varchar' && /label_id/.test(key?.e ?? ''), 'scope is a VARCHAR (LABEL needs no change to it); target_key has label_id in it');
   }
 
-  /* ══ fixtures: two groups, labels, departments, a location, roles, positions ══ */
-  const groups0 = (await must(O, 'GET', '/organisation/label-groups')).groups;
-  const KIND = groups0.find((g) => g.isKind);
-  const MACHINE = KIND.labels.find((l) => l.name === 'Machine');
-  const AREA = await must(O, 'POST', '/organisation/label-groups', { name: `${TAG} Area` });
-  const UNIT = await must(O, 'POST', '/organisation/label-groups', { name: `${TAG} Unit` });
-  const PLANT = await must(O, 'POST', '/organisation/department-labels', { groupId: AREA.id, name: 'Plant' });
-  const U2 = await must(O, 'POST', '/organisation/department-labels', { groupId: UNIT.id, name: 'Unit 2' });
-  const dept = async (name, labels, extra = {}) => must(O, 'POST', '/organisation/departments', { name: `${TAG} ${name}`, labels, ...extra });
-  const D1 = await dept('Both', { [AREA.id]: PLANT.id, [UNIT.id]: U2.id });      // Plant + Unit 2
-  const D2 = await dept('Unit only', { [UNIT.id]: U2.id });                       // Unit 2
-  const D3 = await dept('Under both', {}, { parentId: D1.id });                    // a child of D1, no labels of its own
-  const D4 = await dept('Plain', {});                                              // nothing but its Kind label
+  /* ══ fixtures: two labels, departments, a location, roles, positions ══ */
+  const labels0 = (await must(O, 'GET', '/organisation/department-labels')).labels;
+  const MACHINE = labels0.find((l) => l.name === 'Machine');
+  const PLANT = await must(O, 'POST', '/organisation/department-labels', { name: 'Plant' });
+  const U2 = await must(O, 'POST', '/organisation/department-labels', { name: 'Unit 2' });
+  const dept = async (name, labelId, extra = {}) => must(O, 'POST', '/organisation/departments', { name: `${TAG} ${name}`, ...(labelId ? { labelId } : {}), ...extra });
+  const D1 = await dept('Plant', PLANT.id);                                        // Plant
+  const D2 = await dept('Unit', U2.id);                                            // Unit 2
+  const D3 = await dept('Under plant', null, { parentId: D1.id });                 // a child of D1, the first label (not Plant)
+  const D4 = await dept('Plain', null);                                            // the first label, which has no policy or shift
   const location = await ORG.createLocation(db, c, { code: `${TAG}L`, name: `${TAG} Unit`, locationType: 'UNIT' });
   const roleA = await ins("INSERT INTO hrms_roles (company_id, role_code, title, status, created_by) VALUES (?, ?, ?, 'ACTIVE', ?)", [COMPANY, `${TAG}RA`, `${TAG} Role A`, c.userId]);
   const roleB = await ins("INSERT INTO hrms_roles (company_id, role_code, title, status, created_by) VALUES (?, ?, ?, 'ACTIVE', ?)", [COMPANY, `${TAG}RB`, `${TAG} Role B`, c.userId]);
@@ -229,11 +225,11 @@ try {
   const NIGHT = byCode('N') ?? shifts[2];
   if (!G || !DAY || !NIGHT) throw new Error('This test needs three shifts (G, D, N).');
   const pos = async (roleId, departmentId, extra = {}) => (await POS.createPosition(db, c, { roleId, departmentId, locationId: location.id, defaultShiftId: G.id, status: 'ACTIVE', ...extra })).position;
-  const pA = await pos(roleA, D1.id);      // role A, Plant + Unit 2
-  const pB = await pos(roleB, D1.id);      // role B, Plant + Unit 2
+  const pA = await pos(roleA, D1.id);      // role A, Plant
+  const pB = await pos(roleB, D1.id);      // role B, Plant
   const pC = await pos(roleB, D2.id);      // role B, Unit 2
-  const pChild = await pos(roleB, D3.id);  // role B, under D1 — no labels of its own
-  const pPlain = await pos(roleB, D4.id);  // role B, no labels
+  const pChild = await pos(roleB, D3.id);  // role B, under D1 — not labelled Plant
+  const pPlain = await pos(roleB, D4.id);  // role B, a label with nothing on it
   const eff = async (p) => (await LEAVE.policyFor(db, COMPANY, { positionId: p.id })).effective;
   const mk = async (name) => (await LEAVE.createPolicy(db, c, { name: `${TAG} ${name}`, fromTemplate: 'TRAINEE', status: 'ACTIVE' })).policy;
   const P = { company: await mk('Company'), location: await mk('Location'), plant: await mk('Plant'), unit: await mk('Unit'), role: await mk('Role') };
@@ -248,84 +244,58 @@ try {
     ok((await put({ scope: 'LOCATION', locationId: location.id, policyId: P.location.id })).status === 200, 'the location gets its own');
     const viaLocation = await eff(pC);
     ok(viaLocation.from === 'LOCATION' && viaLocation.policy.id === P.location.id && !('label' in viaLocation) && !('conflict' in viaLocation),
-      'a location’s policy beats the company’s; an answer not from a label keeps its old shape (no label / conflict keys)', JSON.stringify(viaLocation));
+      'a location’s policy beats the company’s; an answer not from a label carries no label key', JSON.stringify(viaLocation));
     const put1 = await put({ scope: 'LABEL', labelId: U2.id, policyId: P.unit.id });
     const row = put1.json?.assignments?.labels?.find((l) => l.labelId === U2.id);
-    ok(put1.status === 200 && row && row.policy?.id === P.unit.id && row.groupId === UNIT.id && row.groupName === `${TAG} Unit` && row.name === 'Unit 2',
-      'PUT /leave/assignments { scope: LABEL, labelId } -> the label row carries its policy', JSON.stringify(row));
+    ok(put1.status === 200 && row && row.policy?.id === P.unit.id && row.name === 'Unit 2' && !('groupId' in row) && !('conflicts' in row),
+      'PUT /leave/assignments { scope: LABEL, labelId } -> the label row carries its policy (no group, no conflicts)', JSON.stringify(row));
     const viaLabel = await eff(pC);
-    ok(viaLabel.from === 'LABEL' && viaLabel.policy.id === P.unit.id && viaLabel.label?.id === U2.id && viaLabel.label.groupName === `${TAG} Unit` && viaLabel.conflict === null
+    ok(viaLabel.from === 'LABEL' && viaLabel.policy.id === P.unit.id && viaLabel.label?.id === U2.id && viaLabel.label.name === 'Unit 2' && !('groupName' in viaLabel.label) && !('conflict' in viaLabel)
       && viaLabel.line === `${P.unit.name} — from the label Unit 2`, 'a label’s policy beats the location’s: "<policy> — from the label Unit 2"', JSON.stringify(viaLabel));
-    ok((await eff(pChild)).from === 'LOCATION', 'a department under one that carries the label does not get it (its own labels only)');
+    ok((await put({ scope: 'LABEL', labelId: PLANT.id, policyId: P.plant.id })).status === 200 && (await eff(pA)).from === 'LABEL' && (await eff(pA)).policy.id === P.plant.id,
+      'Plant gets its own policy: its department\'s positions take it');
+    ok((await eff(pChild)).from === 'LOCATION', 'a department under one that carries the label does not get it (its own label only)');
     ok((await put({ scope: 'ROLE', roleId: roleA, policyId: P.role.id })).status === 200 && (await eff(pA)).from === 'ROLE' && (await eff(pA)).line === `${P.role.name} — from the role`
       && (await eff(pB)).from === 'LABEL', 'a role’s policy beats the label’s; the other role in the same department still gets the label’s');
     // falling back
     ok((await put({ scope: 'ROLE', roleId: roleA, policyId: null })).status === 200 && (await eff(pA)).from === 'LABEL', 'remove the role’s: back to the label’s');
-    ok((await put({ scope: 'LABEL', labelId: U2.id, policyId: null })).status === 200 && (await eff(pC)).from === 'LOCATION' && (await eff(pA)).from === 'LOCATION',
-      'remove the label’s: back to the location’s');
+    ok((await put({ scope: 'LABEL', labelId: U2.id, policyId: null })).status === 200 && (await put({ scope: 'LABEL', labelId: PLANT.id, policyId: null })).status === 200
+      && (await eff(pC)).from === 'LOCATION' && (await eff(pA)).from === 'LOCATION', 'remove the labels’: back to the location’s');
     const st = await LEAVE.getAssignments(db, COMPANY);
     ok(st.labels.find((l) => l.labelId === U2.id)?.policy === null, 'the label row reads "no policy of its own" again');
     // the pure function, on its own
     const index = { company: null, byLocation: new Map([[5, ref(P.location)]]), locationName: new Map([[5, 'Unit 2']]), byRole: new Map([[9, ref(P.role)]]),
-      byLabel: new Map([[70, { policy: ref(P.plant), label: { id: 70, name: 'Plant', groupId: 1, groupName: 'Area' }, groupSort: 1, groupId: 1 }]]), labelsOfDepartment: new Map([[3, [70]]]) };
+      byLabel: new Map([[70, { policy: ref(P.plant), label: { id: 70, name: 'Plant' } }]]), labelOfDepartment: new Map([[3, 70]]) };
     ok(resolveEffective(index, { roleId: 9, locationId: 5, departmentId: 3 }).from === 'ROLE' && resolveEffective(index, { roleId: 8, locationId: 5, departmentId: 3 }).from === 'LABEL'
       && resolveEffective(index, { roleId: 8, locationId: 5, departmentId: 4 }).from === 'LOCATION' && resolveEffective({ ...index, byLocation: new Map() }, { departmentId: 4 }).line === 'No leave policy',
     'resolveEffective on its own: ROLE, LABEL, LOCATION, none');
   }
 
-  /* ══ 2. two labels, two groups, two policies ═══════════════════════════ */
-  section('[2] Leave: a label conflict — the first group wins, and says so');
+  /* ══ 2. reach, reads, refusals ═════════════════════════════════════════ */
+  section('[2] Leave: what a label reaches, and every read');
   {
     await put({ scope: 'LABEL', labelId: PLANT.id, policyId: P.plant.id });
     await put({ scope: 'LABEL', labelId: U2.id, policyId: P.unit.id });
-    const e = await eff(pB);
-    const line = `${P.plant.name} — from the label Plant (Unit 2 points to ${P.unit.name}; Plant comes first)`;
-    ok(e.from === 'LABEL' && e.policy.id === P.plant.id && e.label.name === 'Plant' && e.conflict?.length === 1 && e.conflict[0].label.id === U2.id
-      && e.conflict[0].policy.id === P.unit.id && e.line === line, `Area comes before Unit: "${line}"`, JSON.stringify(e));
-    ok((await eff(pC)).conflict === null && (await eff(pC)).policy.id === P.unit.id, 'a department carrying only one of them: no conflict');
-    const a = await LEAVE.getAssignments(db, COMPANY);
-    const plantRow = a.labels.find((l) => l.labelId === PLANT.id);
-    const unitRow = a.labels.find((l) => l.labelId === U2.id);
-    ok(plantRow.conflicts.some((x) => x.positionId === pB.id && x.line === line) && unitRow.conflicts.some((x) => x.positionId === pB.id)
-      && !unitRow.conflicts.some((x) => x.positionId === pC.id), 'GET /leave/assignments: the conflicting position is listed under both labels, with the line; a clean one is not');
-    // the group order decides
-    const order = (await must(O, 'GET', '/organisation/label-groups')).groups.map((g) => g.id);
-    const flipped = order.filter((id) => id !== UNIT.id);
-    flipped.splice(flipped.indexOf(AREA.id), 0, UNIT.id);
-    ok((await call(O, 'PUT', '/organisation/label-groups/order', { ids: flipped })).status === 200, 'Unit moved before Area');
-    const e2 = await eff(pB);
-    ok(e2.policy.id === P.unit.id && e2.label.name === 'Unit 2' && e2.conflict?.[0]?.label.name === 'Plant'
-      && e2.line === `${P.unit.name} — from the label Unit 2 (Plant points to ${P.plant.name}; Unit 2 comes first)`, 'and now Unit 2 wins: the order is the rule', e2.line);
-    await call(O, 'PUT', '/organisation/label-groups/order', { ids: order });
-    await put({ scope: 'LABEL', labelId: U2.id, policyId: P.plant.id });
-    ok((await eff(pB)).conflict === null, 'the same policy on both labels is no conflict');
-    await put({ scope: 'LABEL', labelId: U2.id, policyId: P.unit.id });
-  }
-
-  /* ══ 3. reach, reads, refusals ═════════════════════════════════════════ */
-  section('[3] Leave: what a label reaches, and every read');
-  {
     const a = await LEAVE.getAssignments(db, COMPANY);
     ok(JSON.stringify(Object.keys(a)) === JSON.stringify(['company', 'locations', 'labels', 'roles', 'unassignedPositions'])
-      && a.labels.every((l) => ['groupId', 'groupName', 'labelId', 'name', 'policy', 'positionCount', 'conflicts'].every((k) => k in l)),
-    'GET /leave/assignments: { company, locations, labels: [{ groupId, groupName, labelId, name, policy, positionCount, conflicts }], roles, unassignedPositions }');
-    const kindFirst = a.labels.findIndex((l) => l.groupId === KIND.id) < a.labels.findIndex((l) => l.groupId === AREA.id)
-      && a.labels.findIndex((l) => l.groupId === AREA.id) < a.labels.findIndex((l) => l.groupId === UNIT.id);
-    ok(kindFirst, 'labels in group order: Kind, then Area, then Unit');
+      && a.labels.every((l) => JSON.stringify(Object.keys(l)) === JSON.stringify(['labelId', 'name', 'policy', 'positionCount'])),
+    'GET /leave/assignments: { company, locations, labels: [{ labelId, name, policy, positionCount }], roles, unassignedPositions }', JSON.stringify(a.labels[0]));
+    const listOrder = (await must(O, 'GET', '/organisation/department-labels')).labels.map((l) => l.id);
+    ok(JSON.stringify(a.labels.map((l) => l.labelId)) === JSON.stringify(listOrder), 'labels in the list\'s order, every one of them');
     // Plant reaches exactly the positions of D1 (its role-less ones); not D3 (a child), not D2.
     const all = await q("SELECT id, role_id, location_id, department_id FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND status <> 'CLOSED'", [COMPANY]);
     const index = await (await import('../../apps/cf_hrms/services/leavePolicyRead.js')).loadAssignmentIndex(db, COMPANY);
     const fromPlant = all.filter((p) => resolveEffective(index, { roleId: p.role_id, locationId: p.location_id, departmentId: p.department_id }).label?.id === PLANT.id).map((p) => p.id);
     ok(same(fromPlant, [pA.id, pB.id]) && a.labels.find((l) => l.labelId === PLANT.id).positionCount === 2,
       'Plant reaches exactly the two positions of the department carrying it — not its child department, not the other', JSON.stringify(fromPlant));
-    // A Kind label: every Machine department of the company.
+    // A built-in label: every Machine department of the company.
     await put({ scope: 'LABEL', labelId: MACHINE.id, policyId: P.plant.id });
     const [[machine]] = await db.query(
       `SELECT COUNT(*) AS n FROM hrms_positions p JOIN hrms_departments d ON d.company_id = p.company_id AND d.id = p.department_id
         WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED' AND LOWER(d.department_type) = 'machine' AND d.deleted_at IS NULL`, [COMPANY]);
     const a2 = await LEAVE.getAssignments(db, COMPANY);
     ok(Number(machine.n) > 0 && a2.labels.find((l) => l.labelId === MACHINE.id).positionCount === Number(machine.n),
-      `a Kind label (Machine) reaches every position of the departments it labels: ${machine.n}`, String(a2.labels.find((l) => l.labelId === MACHINE.id).positionCount));
+      `a built-in label (Machine) reaches every position of the departments it labels: ${machine.n}`, String(a2.labels.find((l) => l.labelId === MACHINE.id).positionCount));
     await put({ scope: 'LABEL', labelId: MACHINE.id, policyId: null });
     // every read answers through the one resolution
     const byPos = await eff(pB);
@@ -352,18 +322,18 @@ try {
     ok(Number(twice[0].n) === 1, 'one live assignment per label (target_key LABEL:<id>)');
   }
 
-  /* ══ 4. the default shift ══════════════════════════════════════════════ */
-  section('[4] Shift: "New positions start on", in every creation path');
+  /* ══ 3. the default shift ══════════════════════════════════════════════ */
+  section('[3] Shift: "New positions start on", in every creation path');
   {
     const existing = await q('SELECT id, default_shift_id FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [COMPANY]);
     const setNight = await call(O, 'PUT', `/organisation/department-labels/${PLANT.id}`, { defaultShiftId: NIGHT.id });
     const setDay = await call(O, 'PUT', `/organisation/department-labels/${U2.id}`, { defaultShiftId: DAY.id });
     ok(setNight.status === 200 && setNight.json.defaultShiftId === NIGHT.id && setDay.json.defaultShiftId === DAY.id, 'PUT a label { defaultShiftId } -> returned');
-    const lg = await must(O, 'GET', '/organisation/label-groups');
-    ok(lg.groups.find((g) => g.id === AREA.id).labels.find((l) => l.id === PLANT.id).defaultShiftId === NIGHT.id && Array.isArray(lg.shifts) && lg.shifts.some((s) => s.id === DAY.id),
-      'GET /organisation/label-groups: each label with defaultShiftId, and the shifts to choose from');
+    const lg = await must(O, 'GET', '/organisation/department-labels');
+    ok(lg.labels.find((l) => l.id === PLANT.id).defaultShiftId === NIGHT.id && Array.isArray(lg.shifts) && lg.shifts.some((s) => s.id === DAY.id),
+      'GET /organisation/department-labels: each label with defaultShiftId, and the shifts to choose from');
     const bad = await call(O, 'PUT', `/organisation/department-labels/${PLANT.id}`, { defaultShiftId: 99999999 });
-    const made = await call(O, 'POST', '/organisation/department-labels', { groupId: AREA.id, name: 'Yard', defaultShiftId: DAY.id });
+    const made = await call(O, 'POST', '/organisation/department-labels', { name: 'Yard', defaultShiftId: DAY.id });
     ok(bad.status === 422 && made.status === 200 && made.json.defaultShiftId === DAY.id, 'a shift not of this company: 422; a new label may start with one');
     ok((await call(O, 'PUT', `/organisation/department-labels/${made.json.id}`, { defaultShiftId: null })).json.defaultShiftId === null, 'null clears it ("No default")');
 
@@ -373,11 +343,11 @@ try {
     const s3 = await suggest(`departmentId=${D3.id}`);
     const s4 = await suggest(`departmentId=${D4.id}`);
     ok(s1.shift.id === NIGHT.id && s1.from === 'LABEL' && s1.label.name === 'Plant' && s1.line === `Starts on ${NIGHT.name}${/shift$/i.test(NIGHT.name) ? '' : ' shift'} (from the label Plant)`,
-      'GET /positions/new-shift: Plant + Unit 2 -> Plant’s shift (its group comes first), "Starts on Night shift (from the label Plant)"', s1.line);
-    ok(s2.shift.id === DAY.id && s2.label.name === 'Unit 2' && s3.from === 'GENERAL' && s3.shift.id === G.id && s4.from === 'GENERAL',
-      'Unit 2 only -> Day; a child department and a plain one -> General (labels are not inherited)', `${s2.line} / ${s3.line} / ${s4.line}`);
+      'GET /positions/new-shift: Plant -> its shift, "Starts on Night shift (from the label Plant)"', s1.line);
+    ok(s2.shift.id === DAY.id && s2.label.name === 'Unit 2' && !('groupName' in s2.label) && s3.from === 'GENERAL' && s3.shift.id === G.id && s4.from === 'GENERAL',
+      'Unit 2 -> Day; a child department and a plain one -> General (labels are not inherited)', `${s2.line} / ${s3.line} / ${s4.line}`);
     ok((await call(O, 'GET', '/positions/new-shift?departmentId=99999999')).status === 404, 'a department that is not this company’s: 404');
-    ok(chooseNewShift({ labels: [{ labelId: 1, name: 'X', defaultShiftId: 424242 }], shifts }).from === 'GENERAL', 'a default pointing at a shift that is gone is passed over');
+    ok(chooseNewShift({ label: { id: 1, name: 'X', defaultShiftId: 424242 }, shifts }).from === 'GENERAL', 'a default pointing at a shift that is gone is passed over');
 
     // a. the position form / POST /positions
     const viaRoute = (await must(O, 'POST', '/positions', { roleId: roleB, departmentId: D2.id, status: 'ACTIVE' })).position;
@@ -427,12 +397,12 @@ try {
     ok(checked.clean && cp1.shiftName === DAY.name && cp1.shiftFrom === 'LABEL' && /from the label Unit 2/.test(cp1.shiftLine) && cp2.shiftFrom === 'NAMED' && cp2.shiftName === G.name,
       'command bar check: the preview says the shift it will use and why — the label’s, or the one asked for', JSON.stringify([cp1.shiftLine, cp2.shiftLine, checked.steps.map((s) => s.problems)]));
     const withDept = [
-      { id: 'd1', action: 'add_department', confidence: 1, sourceText: 'test', fields: { name: { value: `${TAG} New bay`, fromText: 'x', confidence: 1 }, labels: { value: String(U2.id), fromText: 'Unit 2', confidence: 1 } } },
+      { id: 'd1', action: 'add_department', confidence: 1, sourceText: 'test', fields: { name: { value: `${TAG} New bay`, fromText: 'x', confidence: 1 }, label: { value: 'Unit 2', fromText: 'Unit 2', confidence: 1 } } },
       stepPos('p1', { value: null, ref: { kind: 'step', id: 'd1', label: 'new' }, fromText: 'in it', confidence: 1 }),
     ];
     const checked2 = await checkPlan(pool, OWNER, withDept);
     ok(checked2.clean && checked2.preview.positions[0].shiftFrom === 'LABEL' && checked2.preview.positions[0].shiftName === DAY.name,
-      'a department made earlier in the same plan brings its labels: its new position starts on Day', JSON.stringify([checked2.preview.positions[0], checked2.steps.map((s) => s.problems)]));
+      'a department made earlier in the same plan brings its label: its new position starts on Day', JSON.stringify([checked2.preview.positions[0], checked2.steps.map((s) => s.problems)]));
     const done = await applyPlan(pool, OWNER, [stepPos('s1', field('department', D2.id, D2.name)), ...withDept]);
     const madeIds = done.created.filter((x) => x.kind === 'position').map((x) => x.id);
     const madeRows = await q('SELECT id, default_shift_id FROM hrms_positions WHERE company_id = ? AND id IN (?)', [COMPANY, madeIds]);
@@ -443,8 +413,8 @@ try {
     ok(moved.length === 0, `existing positions untouched: all ${existing.length} keep their shift`, JSON.stringify(moved.slice(0, 5)));
   }
 
-  /* ══ 5. rights ═════════════════════════════════════════════════════════ */
-  section('[5] Rights');
+  /* ══ 4. rights ═════════════════════════════════════════════════════════ */
+  section('[4] Rights');
   {
     if (!U.EMPLOYEE) skip('Employee rights', 'no Employee access role');
     else {
@@ -465,16 +435,16 @@ try {
     }
   }
 
-  /* ══ 6. tenant isolation ═══════════════════════════════════════════════ */
-  section('[6] Tenant isolation');
+  /* ══ 5. tenant isolation ═══════════════════════════════════════════════ */
+  section('[5] Tenant isolation');
   if (!THEM) skip('tenant isolation', 'no second company with an admin login');
   else {
     const t1 = await call(THEM, 'PUT', '/leave/assignments', { scope: 'LABEL', labelId: PLANT.id, policyId: null }, { as: other.slug });
     const t2 = await call(THEM, 'GET', `/positions/new-shift?departmentId=${D1.id}`, undefined, { as: other.slug });
     const t3 = await call(THEM, 'PUT', `/organisation/department-labels/${PLANT.id}`, { defaultShiftId: null }, { as: other.slug });
     const theirs = (await call(THEM, 'GET', '/leave/assignments', undefined, { as: other.slug })).json;
-    const theirGroups = (await call(THEM, 'GET', '/organisation/label-groups', undefined, { as: other.slug })).json;
-    const theirLabel = theirGroups?.groups?.[0]?.labels?.[0];
+    const theirGroups = (await call(THEM, 'GET', '/organisation/department-labels', undefined, { as: other.slug })).json;
+    const theirLabel = theirGroups?.labels?.[0];
     const t4 = theirLabel ? await call(THEM, 'PUT', `/organisation/department-labels/${theirLabel.id}`, { defaultShiftId: DAY.id }, { as: other.slug }) : { status: 422 };
     ok(t1.status === 404 && t2.status === 404 && t3.status === 404 && t4.status === 422 && !(theirs?.labels ?? []).some((l) => l.labelId === PLANT.id)
       && !(theirGroups?.shifts ?? []).some((s) => s.id === DAY.id),

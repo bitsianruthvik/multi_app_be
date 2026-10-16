@@ -99,7 +99,6 @@ pool.getConnection = async () => inside;
 const TAG = `ZZXL${Date.now().toString(36).toUpperCase().slice(-5)}`;
 const q = async (sql, params) => (await db.query(sql, params))[0];
 const one = async (sql, params) => (await q(sql, params))[0] ?? null;
-let groupHeads = [];
 const ins = async (sql, params) => (await db.query(sql, params))[0].insertId;
 const pad2 = (n) => String(n).padStart(2, '0');
 const dayText = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -264,15 +263,13 @@ try {
   {
     const file = await download(O, 'positions', `?department=${D.root}`);
     const book = await open(file.contentBase64);
-    // Since 2026-10-15 positions and employees end with one info column per label group (CF_HRMS_HIRING_SPEC §15.3).
-    groupHeads = (await q('SELECT name FROM hrms_label_groups WHERE company_id = ? AND deleted_at IS NULL ORDER BY sort_order, id', [COMPANY])).map((r) => r.name);
     const { wb, ws } = book;
     ok(/^[A-Za-z0-9]+-Positions-\d{4}-\d{2}-\d{2}\.xlsx$/.test(file.fileName) && file.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' && file.rows === 6,
       'the answer is { fileName, mimeType, contentBase64, rows } and the file is named Company-Positions-date.xlsx', file.fileName);
     ok(JSON.stringify(wb.worksheets.map((s) => s.name)) === JSON.stringify(['How to use', 'Data', 'Lists', '_meta']) && wb.getWorksheet('_meta').state === 'veryHidden',
       'four sheets: How to use first, Data, Lists, and a hidden _meta');
     ok(String(ws.getCell(1, 1).value) === '_id' && String(ws.getCell(1, 2).value) === '_seen' && ws.getColumn(1).hidden === true && ws.getColumn(2).hidden === true
-      && JSON.stringify([...book.head.keys()].slice(2)) === JSON.stringify(['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person', ...groupHeads]) && String(ws.getCell(1, 4).value) === 'Role ★',
+      && JSON.stringify([...book.head.keys()].slice(2)) === JSON.stringify(['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person', 'Label']) && String(ws.getCell(1, 4).value) === 'Role ★',
     'the Data sheet: hidden _id and _seen, then the columns of the spec — the required ones starred', [...book.head.keys()].join(', '));
     ok(ws.views?.[0]?.state === 'frozen' && ws.views[0].ySplit === 1 && ws.getCell(1, 3).font?.bold === true && Boolean(ws.sheetProtection?.sheet), 'the header row is frozen and bold, and the sheet is protected');
     const row = book.find('Code', `${TAG}-IN`);
@@ -319,7 +316,7 @@ try {
   section('[3] Every entity: unchanged = SAME; a changed cell = CHANGE; a new row = ADD');
   const deptCode = async (id) => (await one('SELECT code FROM hrms_departments WHERE id = ?', [id])).code;
   const CASES = {
-    departments: { query: `?q=${TAG}`, at: ['Name', `${TAG} SUB`], change: ['Name', `${TAG} SUB renamed`], add: async () => ({ Name: `${TAG} Added department`, Kind: 'Section', Under: await deptCode(D.root), Shared: 'No' }), issued: true, read: 'Name' },
+    departments: { query: `?q=${TAG}`, at: ['Name', `${TAG} SUB`], change: ['Name', `${TAG} SUB renamed`], add: async () => ({ Name: `${TAG} Added department`, Label: 'Section', Under: await deptCode(D.root), Shared: 'No' }), issued: true, read: 'Name' },
     locations: { query: `?q=${TAG}`, at: ['Name', `${TAG} Unit`], change: ['City', 'Nagpur'], add: () => ({ Name: `${TAG} Added location`, City: 'Indore', Pincode: '452001' }), issued: true, read: 'City' },
     roles: { query: `?q=${TAG}`, at: ['Title', `${TAG} Operator`], change: ['Purpose', 'Runs the machine and keeps it clean.'], add: () => ({ Title: `${TAG} Added role`, Purpose: 'A new job.', Status: 'ACTIVE' }), issued: true, read: 'Purpose' },
     positions: { query: `?department=${D.root}`, at: ['Code', `${TAG}-VAC2`], change: ['Shift', `${S2.code} — ${S2.name}`], add: () => ({ Role: `${TAG}R`, Department: `${TAG}SUB`, Shift: S1.code, 'Reports to': `${TAG}-HEAD`, Status: 'ACTIVE' }), issued: true, read: 'Shift' },
@@ -472,15 +469,15 @@ try {
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'ROOT'), 'Under', `${TAG}SUB`)), /inside itself/), 'a department put under its own sub-department: "would put the department inside itself"');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'ROOT'), 'Under', `${TAG}OTHER`); b.set(dAt(b, 'OTHER'), 'Under', `${TAG}ROOT`); }), /inside itself/, { rows: 2 }), 'a cycle made by two rows of the file');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Under', `${TAG}OTHER`)), /cannot be under itself/), 'a department under itself');
-    ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Kind', 'Machine / area')), /Kind: “Machine \/ area” is not in the “Labels” list/), 'a label that is not in the company’s list');
+    ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Label', 'Machine / area')), /Label: “Machine \/ area” is not in the “Labels” list/), 'a label that is not in the company’s list');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Serves', `${TAG}ROOT`)), /only a shared department serves others/), 'Serves on a department that is not shared');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Shared', 'Yes'); b.set(dAt(b, 'OTHER'), 'Serves', `${TAG}ROOT, NOPE-1`); }), /“NOPE-1” is not the code of a department/), 'Serves naming a code that is no department');
-    const twoNew = await edited(deptFile.contentBase64, (b) => { b.append({ Name: `${TAG} Parent new`, Kind: 'Section' }); b.append({ Name: `${TAG} Child new`, Kind: 'Section', Under: `${TAG} Parent new` }); });
+    const twoNew = await edited(deptFile.contentBase64, (b) => { b.append({ Name: `${TAG} Parent new`, Label: 'Section' }); b.append({ Name: `${TAG} Child new`, Label: 'Section', Under: `${TAG} Parent new` }); });
     const pTwo = await preview(O, 'departments', twoNew);
     ok(pTwo.json.summary.add === 1 && pTwo.json.summary.problems === 1 && /Under: “.*Parent new” is not in the “Departments” list/.test(problemsOf(pTwo)),
       'a new department under another NEW department of the same file: refused plainly (a new row has no code to be pointed at) — the first is an ADD, the second a problem', problemsOf(pTwo));
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Name', 'x'.repeat(201))), /Name is 201 characters long; it can be up to 200/), 'text longer than the column holds: said, with both numbers');
-    const spaces = await preview(O, 'departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Name', `  ${TAG} OTHER   `); b.set(dAt(b, 'OTHER'), 'Kind', ' department '); b.set(dAt(b, 'OTHER'), 'Shared', 'no'); }));
+    const spaces = await preview(O, 'departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Name', `  ${TAG} OTHER   `); b.set(dAt(b, 'OTHER'), 'Label', ' department '); b.set(dAt(b, 'OTHER'), 'Shared', 'no'); }));
     ok(spaces.json.summary.same === deptFile.rows && spaces.json.summary.problems === 0, 'trailing spaces, and a list value in other capitals, are the same value: SAME', JSON.stringify(spaces.json.summary));
 
     const empFile = await download(O, 'employees', `?department=${D.root}`);
@@ -583,7 +580,7 @@ try {
 
     const hidden = await download(noContact, 'employees', `?department=${D.root}`);
     const hb = await open(hidden.contentBase64);
-    ok(JSON.stringify([...hb.head.keys()].slice(2)) === JSON.stringify(['Code', 'Salutation', 'Name', 'Gender', 'Date of joining', 'Employment type', 'Status', 'Position', ...groupHeads]) && !Buffer.from(hidden.contentBase64, 'base64').includes(Buffer.from('9100000001')),
+    ok(JSON.stringify([...hb.head.keys()].slice(2)) === JSON.stringify(['Code', 'Salutation', 'Name', 'Gender', 'Date of joining', 'Employment type', 'Status', 'Position', 'Label']) && !Buffer.from(hidden.contentBase64, 'base64').includes(Buffer.from('9100000001')),
       'without contact access the file has NO date of birth, phone, email or address columns — and no phone number anywhere in it', [...hb.head.keys()].join(', '));
     const renamed = await edited(hidden.contentBase64, (b) => { b.set(b.find('Code', `${TAG}HEAD`), 'Name', `${TAG} Person HEAD renamed`); b.append({ Name: `${TAG} Added without contact`, 'Date of joining': '2026-10-02' }); });
     const hiddenApply = await apply(noContact, 'employees', renamed, { add: 1, change: 1 });
@@ -677,8 +674,8 @@ try {
       'a row outside it is a problem: moving a position out, changing a position that is outside (somebody else’s file), adding one outside', `${problemsOf(moveOut)} | ${problemsOf(newOutside)}`.slice(0, 300));
     const deptMine = await download(scoped, 'departments');
     const dTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.set(b.find('Code', `${TAG}ROOT`), 'Name', `${TAG} ROOT x`)));
-    const dNewTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} At the top`, Kind: 'Section' })));
-    const dNewIn = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} Inside`, Kind: 'Section', Under: `${TAG}SUB` })));
+    const dNewTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} At the top`, Label: 'Section' })));
+    const dNewIn = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} Inside`, Label: 'Section', Under: `${TAG}SUB` })));
     ok(/This is your own department/.test(problemsOf(dTop)) && /choose a department inside your own/.test(problemsOf(dNewTop)) && dNewIn.json.summary.add === 1 && dNewIn.json.summary.problems === 0 && deptMine.rows === 3,
       'departments: its own top department cannot be changed, nothing can be added at the top, a department inside can', `${problemsOf(dTop)} | ${problemsOf(dNewTop)}`.slice(0, 300));
     const wholeDownload = await call(scoped, 'GET', '/excel/shifts/workbook');

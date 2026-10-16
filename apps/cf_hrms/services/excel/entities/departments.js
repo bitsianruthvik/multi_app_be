@@ -1,18 +1,12 @@
 /**
- * Departments in Excel. Code (issued) · Name★ · Kind★ · <one column per label group> · Under · Shared · Serves · Status.
- * The Kind column is headed with the Kind group's own name (a file with the older header "Label" still reads); every
- * other group has a column of its own, a drop-down of that group's labels (spec §15.3).
+ * Departments in Excel. Code (issued) · Name★ · Label★ · Under · Shared · Serves · Status.
+ * Label: the department's ONE label, a drop-down of the company's labels. A file downloaded while labels had
+ * groups (header "Kind") still reads — the column's `aliases`.
  * Writes go through organisationService (the label rules, the cycle rule, the serves rule, the code).
  */
 import { PERM, words, coded, textOf, STATUS, yes, flag, changedKeys, inScope, loops } from './_shared.js';
 import * as ORG from '../../organisationService.js';
-import { labelState, groupLists, groupColumns, groupCells, otherGroups, groupKey } from './_labels.js';
-
-/** The Kind column is headed with the group's own name, unless that name is another column's header. */
-const kindHeader = (model) => {
-  const name = String(model.kind?.name ?? '').trim();
-  return name && !['code', 'name', 'under', 'shared', 'serves', 'status'].includes(name.toLowerCase()) ? name : 'Label';
-};
+import { labelState } from './_labels.js';
 
 const codesOf = (text) => String(text ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -37,7 +31,7 @@ export default {
       db.query('SELECT department_id, serves_department_id FROM hrms_department_serves WHERE company_id = ? AND deleted_at IS NULL', [c.companyId]),
       labelState(db, c.companyId),
     ]);
-    const labels = groups.model.kindLabels;
+    const labels = groups.model.labels;
     const departments = coded('Departments', rows);
     const codeOf = new Map(departments.entries.map((e) => [e.id, e.key]));
     const servedBy = new Map();
@@ -48,20 +42,18 @@ export default {
       cells: {
         code: r.code, name: r.name, label: r.department_type, under: textOf(departments, r.parent_department_id),
         shared: flag(r.is_shared), serves: (servedBy.get(r.id) ?? []).sort().join(', ') || null, status: r.status,
-        ...groupCells(groups.model, groups.ofDepartment, r.id),
       },
     }]));
     return {
-      lists: { labels: words('Labels', labels.map((l) => l.name)), ...groupLists(groups.model), departments, status: words('Status', STATUS) },
-      current, model: groups.model,
+      lists: { labels: words('Labels', labels.map((l) => l.name)), departments, status: words('Status', STATUS) },
+      current,
     };
   },
 
-  columns: (state) => [
+  columns: () => [
     { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The department’s code.', example: 'D012' },
     { key: 'name', header: 'Name', kind: 'text', required: true, max: 200, width: 34, meaning: 'What the department is called.', example: 'Quality Control' },
-    { key: 'label', header: kindHeader(state.model), aliases: ['Label'], kind: 'list', list: 'labels', required: true, width: 18, meaning: `What kind of department it is (its ${state.model.kind?.name ?? 'Kind'} label).`, example: 'Section' },
-    ...groupColumns(state.model, ['Code', 'Name', kindHeader(state.model), 'Label', 'Under', 'Shared', 'Serves', 'Status']),
+    { key: 'label', header: 'Label', aliases: ['Kind'], kind: 'list', list: 'labels', required: true, width: 18, meaning: 'The department’s label: what kind of department it is.', example: 'Section' },
     { key: 'under', header: 'Under', kind: 'list', list: 'departments', width: 36, meaning: 'The department it sits in. Blank = at the top.', example: 'D004 — Production' },
     { key: 'shared', header: 'Shared', kind: 'yesno', meaning: 'Yes when it works for several departments.', example: 'No' },
     { key: 'serves', header: 'Serves', kind: 'text', max: 500, width: 26, meaning: 'For a shared department: the codes of the departments it works for, separated by commas.', example: 'D004, D007' },
@@ -101,21 +93,18 @@ export default {
     for (const r of loops(rows, now, (row) => row.parentId)) r.problems.push('Under: this would put the department inside itself (the department you chose is below this one).');
   },
 
-  async add(db, c, row, state) {
-    const labels = Object.fromEntries(otherGroups(state.model).map((g) => [g.id, row.entries[groupKey(g)]?.id ?? null]));
+  async add(db, c, row) {
     const made = await ORG.createDepartment(db, c, {
-      name: row.values.name, type: row.values.label, labels, parentId: row.parentId, isShared: yes(row.values.shared), serves: row.servesIds, status: row.values.status,
+      name: row.values.name, type: row.values.label, parentId: row.parentId, isShared: yes(row.values.shared), serves: row.servesIds, status: row.values.status,
     });
     return { id: made.id, code: made.code };
   },
 
-  async change(db, c, row, state) {
+  async change(db, c, row) {
     const keys = changedKeys(row);
     const body = {};
     if (keys.has('name')) body.name = row.values.name;
     if (keys.has('label')) body.type = row.values.label;
-    const labels = Object.fromEntries(otherGroups(state.model).filter((g) => keys.has(groupKey(g))).map((g) => [g.id, row.entries[groupKey(g)]?.id ?? null]));
-    if (Object.keys(labels).length) body.labels = labels;
     if (keys.has('under')) body.parentId = row.parentId;
     if (keys.has('shared')) body.isShared = yes(row.values.shared);
     if (keys.has('serves') || (keys.has('shared') && yes(row.values.shared))) body.serves = row.servesIds;

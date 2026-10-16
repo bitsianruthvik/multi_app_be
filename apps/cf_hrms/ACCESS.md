@@ -124,11 +124,6 @@ How to read the tables below:
 | `PUT /organisation/department-labels/order` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/department-labels/:id` | `cf_hrms_org_edit` | whole-company logins only |
 | `DELETE /organisation/department-labels/:id` | `cf_hrms_org_remove` | whole-company logins only |
-| `GET /organisation/label-groups` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
-| `POST /organisation/label-groups` | `cf_hrms_org_edit` | whole-company logins only |
-| `PUT /organisation/label-groups/order` | `cf_hrms_org_edit` | whole-company logins only |
-| `PUT /organisation/label-groups/:id` | `cf_hrms_org_edit` | whole-company logins only |
-| `DELETE /organisation/label-groups/:id` | `cf_hrms_org_remove` | whole-company logins only |
 | `GET /organisation/locations` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, status |
 | `POST /organisation/locations` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/locations/:id` | `cf_hrms_org_edit` | whole-company logins only |
@@ -377,13 +372,13 @@ How to read the tables below:
 
 | Route | Right | Also |
 |---|---|---|
-| `GET /codegen/entities` | `cf_hrms_setup_view` | adds the company’s label groups to what a department rule can test |
+| `GET /codegen/entities` | `cf_hrms_setup_view` |  |
 | `GET /codegen/schemes` | `cf_hrms_setup_view` |  |
 | `GET /codegen/schemes/:id` | `cf_hrms_setup_view` |  |
-| `POST /codegen/preview` | `cf_hrms_setup_view` | reads the company’s label groups first |
-| `POST /codegen/explain` | `cf_hrms_setup_view` | reads the company’s label groups first |
-| `POST /codegen/schemes` | `cf_hrms_setup_edit` | whole-company logins only; reads the company’s label groups first |
-| `PUT /codegen/schemes/:id` | `cf_hrms_setup_edit` | whole-company logins only; reads the company’s label groups first |
+| `POST /codegen/preview` | `cf_hrms_setup_view` |  |
+| `POST /codegen/explain` | `cf_hrms_setup_view` |  |
+| `POST /codegen/schemes` | `cf_hrms_setup_edit` | whole-company logins only |
+| `PUT /codegen/schemes/:id` | `cf_hrms_setup_edit` | whole-company logins only |
 | `DELETE /codegen/schemes/:id` | `cf_hrms_setup_remove` **and** `cf_hrms_setup_edit` | whole-company logins only |
 
 ## Excel
@@ -489,4 +484,4 @@ How to read the tables below:
 | `GET /performance/employees/:id/review-summary` | `cf_hrms_performance_view` | scope: the person |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-386 routes.
+381 routes.

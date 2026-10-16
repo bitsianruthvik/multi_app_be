@@ -53,7 +53,7 @@
  * requirement.
  */
 import { notFound, invalid } from '../lib/errors.js';
-import { DEPARTMENT_LABELS_SQL, parseLabelList } from './labelGroupService.js';
+import { DEPARTMENT_LABEL_ID_SQL } from './labelGroupService.js';
 import { dateText, today, LIVE_ON, requirePosition, listPositionOverrides } from './positionService.js';
 import {
   SEATS_PER_POSITION, HOLDS_SEAT_SQL, OCCUPANT_COUNT_SQL,
@@ -123,7 +123,7 @@ const POSITIONS_SQL = `
  */
 const DEPARTMENTS_SQL = `
   SELECT d.id, d.code, d.name, d.parent_department_id, d.department_type, d.is_shared,
-         ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+         ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
     FROM hrms_departments d
    WHERE d.company_id = ? AND d.deleted_at IS NULL`;
 
@@ -156,8 +156,8 @@ export function shapeDepartments(departmentRows, serveRows, rank) {
       name: r.name,
       parentId: r.parent_department_id != null && live.has(r.parent_department_id) ? r.parent_department_id : null,
       type: r.department_type ?? null,
-      // Its label in each group, Kind first (spec §15.4) — read in the same query, so the chart costs no more.
-      labels: parseLabelList(r.label_list),
+      // Its ONE label's id (`type` is its name) — read in the same query, so the chart costs no more.
+      labelId: r.label_id == null ? null : Number(r.label_id),
       isShared: Boolean(r.is_shared),
       serves: servesBy.get(r.id) ?? [],
       rank: rank.get(r.id) ?? null,

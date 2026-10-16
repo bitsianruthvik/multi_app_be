@@ -12,7 +12,7 @@
  *
  * IT COSTS NO QUERY of its own, with two exceptions, each read only when its
  * filter is used: "department and below" needs the department tree (one read),
- * and `label` needs every department's labels (two reads, spec §15.3). The rows
+ * and `label` needs every department's label (two reads). The rows
  * are already in memory — every one of these lists is read whole — so narrowing
  * them here is exact and cannot disagree with what a row shows.
  *
@@ -44,10 +44,9 @@ const oneOfIds = (pick) => (row, value) => { const ids = idSet(value); return !i
 const oneOfWords = (pick) => (row, value) => { const words = csv(value).map(lower); return !words.length || words.includes(lower(pick(row))); };
 const flag = (pick) => (row, value) => { const want = yesNo(value); return want === null || Boolean(pick(row)) === want; };
 /**
- * `label=<labelId>[,<labelId>…]` (spec §15.3): the department `pick(row)` gives
- * carries the labels asked for — labels of one group are "any of", groups
- * combine as "and". A department's OWN labels only, never its parents'. A
- * Kind label's name is still taken (§13.6 had `label=Section`).
+ * `label=<labelId>[,<labelId>…]`: the department `pick(row)` gives carries
+ * one of the labels asked for ("any of"). A department's OWN label only, never
+ * its parents'. A label's name is still taken (§13.6 had `label=Section`).
  */
 const byLabel = (pick) => (row, value, aux) => aux.labelTest(value)(pick(row));
 /** "This department and everything below it." `tree.below(id)` is that set of ids. */

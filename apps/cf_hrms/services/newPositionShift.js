@@ -1,14 +1,14 @@
 /**
  * newPositionShift.js — the shift a NEW position starts on when none is named
- * (TM/CF_HRMS_HIRING_SPEC.md §17.2).
+ * (TM/CF_HRMS_HIRING_SPEC.md §17.2; one label per department since 2026-10-16).
  *
  * THE RULE, and its one implementation (`chooseNewShift`, pure):
  *   1. a shift named by whoever creates the position always wins — callers only
  *      ask this when none was named;
- *   2. else the first label of the position's department, in group order, that
- *      carries a default shift ("New positions start on: Day") — the
- *      department's OWN labels, never a parent's (§15.3); a default that points
- *      at an inactive or removed shift is passed over;
+ *   2. else the department's label, when it carries a default shift ("New
+ *      positions start on: Day") — the department's OWN label, never a
+ *      parent's; a default that points at an inactive or removed shift is
+ *      passed over;
  *   3. else, for "Add a position like this" only, the shift of the position it
  *      is added beside (what that path did before labels had defaults);
  *   4. else the company's General shift (a code starting with G), else its first.
@@ -36,23 +36,21 @@ export function generalShiftOf(shifts) {
 const refOf = (s) => ({ id: s.id, code: s.code ?? null, name: s.name });
 
 /**
- * @param labels  the department's own labels, IN GROUP ORDER: [{ labelId|id, name, groupName, defaultShiftId }]
+ * @param label   the department's label: { id, name, defaultShiftId } | null
  * @param shifts  the company's live shifts: [{ id, code, name, status? }]
  * @param likeShiftId  add-sibling only: the shift of the position it is added beside
  * @returns { shift: { id, code, name } | null, from: 'LABEL' | 'LIKE' | 'GENERAL' | null,
- *            label: { id, name, groupName } | null,
+ *            label: { id, name } | null,
  *            line: "Starts on Day shift (from the label Machine)" }
  */
-export function chooseNewShift({ labels = [], shifts = [], likeShiftId = null } = {}) {
+export function chooseNewShift({ label = null, shifts = [], likeShiftId = null } = {}) {
   const byId = new Map(shifts.map((s) => [Number(s.id), s]));
-  for (const l of labels) {
-    const s = l.defaultShiftId != null ? byId.get(Number(l.defaultShiftId)) : null;
-    if (LIVE(s)) {
-      return {
-        shift: refOf(s), from: 'LABEL', label: { id: l.labelId ?? l.id, name: l.name, groupName: l.groupName ?? null },
-        line: `Starts on ${shiftWords(s.name)} (from the label ${l.name})`,
-      };
-    }
+  const own = label?.defaultShiftId != null ? byId.get(Number(label.defaultShiftId)) : null;
+  if (LIVE(own)) {
+    return {
+      shift: refOf(own), from: 'LABEL', label: { id: label.id, name: label.name },
+      line: `Starts on ${shiftWords(own.name)} (from the label ${label.name})`,
+    };
   }
   const like = likeShiftId != null ? byId.get(Number(likeShiftId)) : null;
   if (like) return { shift: refOf(like), from: 'LIKE', label: null, line: `Starts on ${shiftWords(like.name)} (like the position it is added beside)` };
@@ -61,37 +59,29 @@ export function chooseNewShift({ labels = [], shifts = [], likeShiftId = null } 
   return { shift: null, from: null, label: null, line: 'This company has no shift yet.' };
 }
 
-/**
- * The labels with a default shift that a department carries, in group order:
- * one query. Kind by department_type (without case), the others by link — the
- * rule of labelGroupService.DEPARTMENT_LABELS_SQL.
- */
-export async function departmentShiftLabels(db, companyId, departmentId) {
-  if (departmentId == null) return [];
-  const [rows] = await db.query(
-    `SELECT l.id, l.name, g.name AS group_name, l.default_shift_id
-       FROM hrms_department_labels l
-       JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
-       JOIN hrms_departments d ON d.company_id = l.company_id AND d.id = ?
-      WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.default_shift_id IS NOT NULL
-        AND IF(g.is_kind = 1,
-               LOWER(l.name) = LOWER(d.department_type),
-               EXISTS (SELECT 1 FROM hrms_department_label_links k
-                        WHERE k.company_id = l.company_id AND k.department_id = d.id AND k.group_id = g.id
-                          AND k.label_id = l.id AND k.deleted_at IS NULL))
-      ORDER BY g.sort_order, g.id`,
-    [Number(departmentId), companyId],
+/** The department's label (by department_type, without case) with its default shift, or null: one query. */
+export async function departmentShiftLabel(db, companyId, departmentId) {
+  if (departmentId == null) return null;
+  const [[row]] = await db.query(
+    `SELECT l.id, l.name, l.default_shift_id
+       FROM hrms_departments d
+       JOIN hrms_label_groups g ON g.company_id = d.company_id AND g.is_kind = 1 AND g.deleted_at IS NULL
+       JOIN hrms_department_labels l ON l.company_id = d.company_id AND l.group_id = g.id AND l.deleted_at IS NULL
+                                    AND LOWER(l.name) = LOWER(d.department_type)
+      WHERE d.company_id = ? AND d.id = ?
+      ORDER BY l.id LIMIT 1`,
+    [companyId, Number(departmentId)],
   );
-  return rows.map((r) => ({ labelId: r.id, name: r.name, groupName: r.group_name, defaultShiftId: r.default_shift_id }));
+  return row ? { id: row.id, name: row.name, defaultShiftId: row.default_shift_id ?? null } : null;
 }
 
 /** The choice for one new position, from the database: two queries, sent together. */
 export async function newPositionShift(db, companyId, { departmentId = null, likeShiftId = null } = {}) {
-  const [labels, [shifts]] = await Promise.all([
-    departmentShiftLabels(db, companyId, departmentId),
+  const [label, [shifts]] = await Promise.all([
+    departmentShiftLabel(db, companyId, departmentId),
     db.query('SELECT id, code, name, status FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id', [companyId]),
   ]);
-  return chooseNewShift({ labels, shifts, likeShiftId });
+  return chooseNewShift({ label, shifts, likeShiftId });
 }
 
-export default { shiftWords, generalShiftOf, chooseNewShift, departmentShiftLabels, newPositionShift };
+export default { shiftWords, generalShiftOf, chooseNewShift, departmentShiftLabel, newPositionShift };

@@ -42,7 +42,7 @@ import { dateText, today, LIVE_ON } from '../positionService.js';
 import { HOLDS_SEAT_SQL } from '../seatCount.js';
 import { loadCards } from '../positionCards.js';
 import { effectiveLinesForPositions, effectiveLinesForAssignments } from '../contentResolver.js';
-import { DEPARTMENT_LABELS_SQL, parseLabelList, labelIndex, labelMatcher } from '../labelGroupService.js';
+import { labelIndex, labelMatcher } from '../labelGroupService.js';
 import { embed, dot, ModelUnavailable } from './embedder.js';
 import { loadDefinitions, loadEntities, vectorsFor } from './searchIndex.js';
 
@@ -291,7 +291,7 @@ const rankOf = (best, count) => best + 0.01 * Math.min(Math.max(count - 1, 0), 5
  * @param opts.mode       meaning (default) | exact
  * @param opts.on         date (default today)
  * @param opts.department department id — that department and every one below it
- * @param opts.label      label ids (or names), comma list — labelGroupService rule (any of within a group, all groups)
+ * @param opts.label      label ids (or names), comma list — any of (labelGroupService.labelMatcher)
  * @param opts.location   location id
  * @param opts.limit      people / positions returned (default 30, max 200)
  * @param opts.scope      accessScope answer ({ all: true } or { departmentIds })
@@ -315,23 +315,22 @@ export async function askWhoOwns(db, companyId, opts = {}) {
   const labelValue = opts.label == null ? '' : String(opts.label).trim();
   const explicitKinds = readAskKinds(opts.kinds);
 
-  // The structure, read once: departments (with labels), locations, labels by name.
+  // The structure, read once: departments, locations, the labels (by name and id, each department's one).
   const [[departments], [locations], labels, cardsAll] = await Promise.all([
-    db.query(`SELECT d.id, d.name, d.parent_department_id, ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+    db.query(`SELECT d.id, d.name, d.parent_department_id
                 FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL`, [companyId]),
     db.query('SELECT id, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     labelIndex(db, companyId),
     loadCards(db, companyId, asOf),
   ]);
-  const deptById = new Map(departments.map((d) => [Number(d.id), { ...d, labels: parseLabelList(d.label_list) }]));
+  const deptById = new Map(departments.map((d) => [Number(d.id), d]));
   const locById = new Map(locations.map((l) => [Number(l.id), l]));
-  const labelById = new Map();
-  for (const d of deptById.values()) for (const l of d.labels) labelById.set(l.labelId, l);
+  const labelById = new Map([...labels.names].map(([id, name]) => [id, { labelId: id, name }]));
 
   // Places a trailing "in …" may name: a location, else a label, else a department (exact name, any case).
   const places = new Map();
   for (const d of deptById.values()) places.set(d.name.trim().toLowerCase(), { kind: 'DEPARTMENT', id: Number(d.id), name: d.name });
-  for (const l of labelById.values()) places.set(l.name.trim().toLowerCase(), { kind: 'LABEL', id: l.labelId, name: l.name, groupName: l.groupName });
+  for (const l of labelById.values()) places.set(l.name.trim().toLowerCase(), { kind: 'LABEL', id: l.labelId, name: l.name });
   for (const l of locById.values()) places.set(l.name.trim().toLowerCase(), { kind: 'LOCATION', id: Number(l.id), name: l.name });
   const reading = readQuestion(raw, places);
   if (!reading.searchedFor) throw invalid('INVALID', 'Say what the work is — for example "Who owns vendor onboarding?"');

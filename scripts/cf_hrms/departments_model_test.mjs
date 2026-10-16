@@ -52,8 +52,8 @@ const companyId = company.id;
 /* ── 1. the chart payload ─────────────────────────────────────────────────── */
 const counted = counting(pool);
 const chart = await buildOrgChart(counted, companyId, {});
-// labels joined on 2026-10-15 (labels in groups, CF_HRMS_HIRING_SPEC §15.4) — read in the same query, so the count below is unchanged.
-const DEPT_KEYS = 'code,id,isShared,labels,name,parentId,rank,serves,type';
+// labelId joined on 2026-10-16 (one label per department; it was `labels` while labels had groups) — read in the same query, so the count below is unchanged.
+const DEPT_KEYS = 'code,id,isShared,labelId,name,parentId,rank,serves,type';
 ok(Array.isArray(chart.departments) && chart.departments.length > 0, 'orgchart carries departments');
 ok(chart.departments.every((d) => keysOf(d) === DEPT_KEYS), 'every department has exactly the contract\'s fields',
   chart.departments.find((d) => keysOf(d) !== DEPT_KEYS) ? keysOf(chart.departments.find((d) => keysOf(d) !== DEPT_KEYS)) : '');

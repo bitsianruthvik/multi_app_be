@@ -157,19 +157,12 @@ async function loadAll(db, companyId) {
     'SELECT id, code, name, address_json, status FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
   const [departments] = await db.query(
     'SELECT id, code, name, department_type, parent_department_id, status FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
-  const [links] = await db.query(
-    'SELECT department_id, group_id, label_id FROM hrms_department_label_links WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
   const [roles] = await db.query(
     'SELECT id, role_code AS code, title, default_department_id, status FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
   const [positions] = await db.query(
     `SELECT id, position_code AS code, role_id, department_id, location_id, default_shift_id, position_title, status
        FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL`, [companyId]);
-  const labelsOf = new Map();
-  for (const l of links) {
-    if (!labelsOf.has(l.department_id)) labelsOf.set(l.department_id, {});
-    labelsOf.get(l.department_id)[l.group_id] = l.label_id;
-  }
-  return { locations, departments, labelsOf, roles, positions };
+  return { locations, departments, roles, positions };
 }
 
 /** Departments in pre-order: parents first, siblings by current code. A parent that is not live counts as none. */
@@ -271,7 +264,7 @@ async function main() {
           const code = hasShape(rules.get(DEPARTMENT_ENTITY), d.code, { 'parent.code': parentCode })
             ? d.code
             : await renumber('department', d, issueDepartmentCode, {
-              name: d.name, type: d.department_type, parentId: d.parent_department_id, labels: data.labelsOf.get(d.id) ?? {},
+              name: d.name, type: d.department_type, parentId: d.parent_department_id,
             });
           deptCode.set(d.id, code);
         }

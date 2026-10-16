@@ -22,7 +22,7 @@
 import { PERM, words, coded, changedKeys, inScope, todayText, day } from './_shared.js';
 import * as PEOPLE from '../../peopleService.js';
 import { createAssignment } from '../../assignmentService.js';
-import { labelState, groupColumns, groupCells } from './_labels.js';
+import { labelState, labelInfoColumn, labelInfoCell } from './_labels.js';
 
 const TYPES = ['EMPLOYEE', 'CONTRACT', 'TRAINEE', 'CONSULTANT', 'OTHER'];
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -87,7 +87,7 @@ export default {
         cells: {
           code: e.employee_code, salutation: e.salutation || null, name: e.full_name, gender: e.gender || null,
           joined: day(e.date_of_joining), type: e.employment_type, status: e.employment_status, position: m?.position_code ?? null,
-          ...groupCells(groups.model, groups.ofDepartment, m?.department_id ?? null, { kind: true }),
+          ...labelInfoCell(groups.ofDepartment, m?.department_id ?? null),
           ...(contact ? { born: day(e.date_of_birth), phone: e.phone || null, email: e.email || null, address: address.line1 ? String(address.line1) : null } : {}),
         },
       }];
@@ -123,8 +123,8 @@ export default {
         key: 'position', header: 'Position', kind: 'list', list: 'vacant', lenient: true, newOnly: true, width: 34,
         meaning: 'NEW rows only: a vacant position to put the person in from the date of joining. On an existing row it shows their position and is ignored.', example: 'P021-2 — Operator',
       },
-      // The labels of the department of their position, for reading and sorting (spec §15.3). Ignored on upload.
-      ...groupColumns(state.model, ['Code', 'Salutation', 'Name', 'Gender', 'Date of birth', 'Date of joining', 'Phone', 'Email', 'Address', 'Employment type', 'Status', 'Position'], { info: true, kind: true }),
+      // The label of the department of their position, for reading and sorting. Ignored on upload.
+      labelInfoColumn(state.model),
     ];
   },
 

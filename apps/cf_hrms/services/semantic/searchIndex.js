@@ -27,7 +27,6 @@
  */
 import crypto from 'node:crypto';
 import { embed, MODEL_ID, toBlob, fromBlob } from './embedder.js';
-import { DEPARTMENT_LABELS_SQL, parseLabelList } from '../labelGroupService.js';
 
 /** The four masters a search ranks. QUALIFICATION has no position overlay (contentResolver.js). */
 export const DEFINITION_SOURCES = {
@@ -110,8 +109,8 @@ export const entityText = {
 
 /**
  * Every live record of the given structure kinds: { kind, id, text, hash, ... }.
- * One query per kind, in parallel. A department's labels come in its own row
- * (labelGroupService.DEPARTMENT_LABELS_SQL), so this is still one query.
+ * One query per kind, in parallel. A department's label is its own column
+ * (department_type, the label's name), so this is still one query.
  */
 export async function loadEntities(db, companyId, kinds = ENTITY_KINDS) {
   const read = {
@@ -131,10 +130,10 @@ export async function loadEntities(db, companyId, kinds = ENTITY_KINDS) {
     },
     DEPARTMENT: async () => {
       const [rows] = await db.query(
-        `SELECT d.id, d.name, ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+        `SELECT d.id, d.name, d.department_type
            FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL`, [companyId]);
       return rows.map((r) => {
-        const labels = parseLabelList(r.label_list).map((l) => l.name);
+        const labels = r.department_type ? [r.department_type] : [];
         return entityRow('DEPARTMENT', r.id, entityText.DEPARTMENT(r.name, labels), { name: r.name, labels });
       });
     },

@@ -209,9 +209,6 @@ export const refOf = (p) => (p ? { id: p.id, name: p.name, status: p.status } : 
  * Which policy applies where
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** Two labels in the company's group order. */
-const byGroupOrder = (a, b) => (a.groupSort - b.groupSort) || (a.groupId - b.groupId);
-
 /**
  * Every live assignment of a company as an index the resolution reads: the
  * company default, and the policy of each location, role and LABEL that has its
@@ -220,101 +217,69 @@ const byGroupOrder = (a, b) => (a.groupSort - b.groupSort) || (a.groupId - b.gro
  * company. With `labels: false` (the role page, which shows only the role's own
  * policy) the second is not sent.
  *
- * A department's labels are its OWN (spec §15.3): its Kind label is the one its
- * department_type names, the others are its links — the rule of
- * labelGroupService.DEPARTMENT_LABELS_SQL. Never a parent department's.
+ * A department has ONE label, its OWN (the one its department_type names,
+ * without case) — never a parent department's.
  */
 export async function loadAssignmentIndex(db, companyId, { labels = true } = {}) {
   const [[rows], [carried]] = await Promise.all([
     db.query(
-      `SELECT a.scope, a.location_id, a.role_id, a.label_id, p.id, p.name, p.status, l.name AS location_name,
-              dl.name AS label_name, g.id AS group_id, g.name AS group_name, g.sort_order AS group_sort
+      `SELECT a.scope, a.location_id, a.role_id, a.label_id, p.id, p.name, p.status, l.name AS location_name, dl.name AS label_name
          FROM hrms_leave_policy_assignments a
          JOIN hrms_leave_policies p ON p.company_id = a.company_id AND p.id = a.policy_id AND p.deleted_at IS NULL
          LEFT JOIN hrms_locations l ON l.company_id = a.company_id AND l.id = a.location_id
-         LEFT JOIN hrms_department_labels dl ON dl.company_id = a.company_id AND dl.id = a.label_id AND dl.deleted_at IS NULL
-         LEFT JOIN hrms_label_groups g ON g.company_id = dl.company_id AND g.id = dl.group_id AND g.deleted_at IS NULL
+         LEFT JOIN hrms_label_groups g ON g.company_id = a.company_id AND g.is_kind = 1 AND g.deleted_at IS NULL
+         LEFT JOIN hrms_department_labels dl ON dl.company_id = a.company_id AND dl.id = a.label_id AND dl.group_id = g.id AND dl.deleted_at IS NULL
         WHERE a.company_id = ? AND a.deleted_at IS NULL`,
       [companyId],
     ),
     labels
       ? db.query(
-        `SELECT k.department_id, k.label_id
-           FROM hrms_department_label_links k
-           JOIN hrms_leave_policy_assignments a ON a.company_id = k.company_id AND a.label_id = k.label_id AND a.scope = 'LABEL' AND a.deleted_at IS NULL
-           JOIN hrms_department_labels l ON l.company_id = k.company_id AND l.id = k.label_id AND l.group_id = k.group_id AND l.deleted_at IS NULL
-           JOIN hrms_label_groups g ON g.company_id = k.company_id AND g.id = k.group_id AND g.is_kind = 0 AND g.deleted_at IS NULL
-           JOIN hrms_departments d ON d.company_id = k.company_id AND d.id = k.department_id AND d.deleted_at IS NULL
-          WHERE k.company_id = ? AND k.deleted_at IS NULL
-         UNION
-         SELECT d.id AS department_id, l.id AS label_id
+        `SELECT d.id AS department_id, l.id AS label_id
            FROM hrms_departments d
            JOIN hrms_department_labels l ON l.company_id = d.company_id AND l.deleted_at IS NULL AND LOWER(l.name) = LOWER(d.department_type)
            JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.is_kind = 1 AND g.deleted_at IS NULL
            JOIN hrms_leave_policy_assignments a ON a.company_id = l.company_id AND a.label_id = l.id AND a.scope = 'LABEL' AND a.deleted_at IS NULL
           WHERE d.company_id = ? AND d.deleted_at IS NULL`,
-        [companyId, companyId],
+        [companyId],
       )
       : [[]],
   ]);
   const index = {
-    company: null, byLocation: new Map(), byRole: new Map(), byLabel: new Map(), locationName: new Map(), labelsOfDepartment: new Map(),
+    company: null, byLocation: new Map(), byRole: new Map(), byLabel: new Map(), locationName: new Map(), labelOfDepartment: new Map(),
   };
   for (const r of rows) {
     const ref = refOf(r);
     if (r.scope === 'COMPANY') index.company = ref;
     else if (r.scope === 'LOCATION' && r.location_id != null) { index.byLocation.set(r.location_id, ref); index.locationName.set(r.location_id, r.location_name ?? null); }
     else if (r.scope === 'ROLE' && r.role_id != null) index.byRole.set(r.role_id, ref);
-    // A label that is gone (or whose group is gone) applies nowhere.
-    else if (r.scope === 'LABEL' && r.label_id != null && r.label_name != null && r.group_id != null) {
-      index.byLabel.set(r.label_id, {
-        policy: ref,
-        label: { id: r.label_id, name: r.label_name, groupId: r.group_id, groupName: r.group_name },
-        groupSort: Number(r.group_sort) || 0,
-        groupId: r.group_id,
-      });
+    // A label that is gone applies nowhere.
+    else if (r.scope === 'LABEL' && r.label_id != null && r.label_name != null) {
+      index.byLabel.set(r.label_id, { policy: ref, label: { id: r.label_id, name: r.label_name } });
     }
   }
-  for (const k of carried) {
-    if (!index.byLabel.has(k.label_id)) continue;
-    const list = index.labelsOfDepartment.get(k.department_id) ?? [];
-    if (!list.includes(k.label_id)) list.push(k.label_id);
-    index.labelsOfDepartment.set(k.department_id, list);
-  }
-  for (const list of index.labelsOfDepartment.values()) list.sort((a, b) => byGroupOrder(index.byLabel.get(a), index.byLabel.get(b)));
+  for (const k of carried) if (index.byLabel.has(k.label_id)) index.labelOfDepartment.set(k.department_id, k.label_id);
   return index;
 }
-
-const labelRef = (l) => ({ id: l.id, name: l.name, groupName: l.groupName });
 
 /**
  * THE RESOLUTION (spec §8, §17): ROLE, else LABEL, else LOCATION, else the
  * COMPANY default, else none. The only implementation — every read that shows a
- * leave policy asks it.
- *
- * A position's labels are its department's own (`departmentId`). When they point
- * to DIFFERENT policies, the label whose group comes first in the group order
- * wins, and the answer says so: `conflict` lists the other labels and their
- * policies, and the line names them.
+ * leave policy asks it. A position's label is its department's own
+ * (`departmentId`); a department has one label, so there is never a choice.
  *
  * @returns the spec's `Effective`:
  *   { policy: Ref | null, from: 'ROLE' | 'LABEL' | 'LOCATION' | 'COMPANY' | null, line }
- *   and, only when from is LABEL: label: { id, name, groupName }, conflict: [{ label, policy }] | null
- *   (the shape every other answer had before labels is left exactly as it was)
- *   line: "Office staff — from the role" · "Shop floor — from the label Plant" ·
- *         "Shop floor — from the label Plant (Unit 2 points to Office staff; Plant comes first)" ·
+ *   and, only when from is LABEL: label: { id, name }
+ *   line: "Office staff — from the role" · "Shop floor — from the label Machine" ·
  *         "Shop floor — from Unit 2" (a location) · "Office staff — the company default" · "No leave policy"
  */
 export function resolveEffective(index, { roleId = null, locationId = null, departmentId = null } = {}) {
   const role = roleId != null ? index.byRole.get(Number(roleId)) : null;
   if (role) return { policy: role, from: 'ROLE', line: `${role.name} — from the role` };
-  const carried = departmentId != null ? (index.labelsOfDepartment?.get(Number(departmentId)) ?? []) : [];
-  if (carried.length) {
-    const [first, ...rest] = carried.map((id) => index.byLabel.get(id));
-    const others = rest.filter((o) => o.policy.id !== first.policy.id);
-    const conflict = others.length ? others.map((o) => ({ label: labelRef(o.label), policy: o.policy })) : null;
-    const why = conflict ? ` (${conflict.map((x) => `${x.label.name} points to ${x.policy.name}`).join('; ')}; ${first.label.name} comes first)` : '';
-    return { policy: first.policy, from: 'LABEL', label: labelRef(first.label), conflict, line: `${first.policy.name} — from the label ${first.label.name}${why}` };
+  const labelId = departmentId != null ? index.labelOfDepartment?.get(Number(departmentId)) : null;
+  const byLabel = labelId != null ? index.byLabel.get(labelId) : null;
+  if (byLabel) {
+    return { policy: byLabel.policy, from: 'LABEL', label: { ...byLabel.label }, line: `${byLabel.policy.name} — from the label ${byLabel.label.name}` };
   }
   const location = locationId != null ? index.byLocation.get(Number(locationId)) : null;
   if (location) return { policy: location, from: 'LOCATION', line: `${location.name} — from ${index.locationName.get(Number(locationId)) ?? 'the location'}` };

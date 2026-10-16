@@ -34,9 +34,7 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { ensureLabels, resolveKindLabel } from './departmentLabelService.js';
-import {
-  DEPARTMENT_LABELS_SQL, parseLabelList, readModel, readLabelsInput, writeDepartmentLabels, retireDepartmentLabels,
-} from './labelGroupService.js';
+import { DEPARTMENT_LABEL_ID_SQL, readModel, linkDepartmentLabel, retireDepartmentLabels } from './labelGroupService.js';
 import { issueDepartmentCode, issueLocationCode, acceptImportedCode } from './codeService.js';
 import { DEPARTMENT_ENTITY, LOCATION_ENTITY } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
@@ -404,8 +402,8 @@ const mapDepartment = (r, serves = []) => ({
   serves,
   status: r.status,
   createdAt: r.created_at,
-  // Its label in each group, group order (spec §15.2). Kind's is `type` too.
-  labels: parseLabelList(r.label_list),
+  // Its ONE label: `type` is the label's name, `labelId` its id (null only for a name the list no longer has).
+  labelId: r.label_id == null ? null : Number(r.label_id),
 });
 
 /** departmentId -> [served department ids], live rows only. One query for the company (or one department). */
@@ -427,17 +425,17 @@ async function servesByDepartment(db, companyId, departmentId = null) {
 }
 
 export async function listDepartments(db, companyId) {
-  // The labels first: ensureLabels makes the Kind group and its list when a company has none.
+  // The labels first: ensureLabels makes the company's list when it has none.
   const types = (await ensureLabels(db, companyId)).map((l) => l.name);
   const [rows] = await db.query(
     `SELECT d.id, d.code, d.name, d.parent_department_id, d.department_type, d.is_shared, d.status, d.created_at,
-            ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+            ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
        FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL
       ORDER BY d.name`,
     [companyId],
   );
   const serves = await servesByDepartment(db, companyId);
-  // `types`: the company's Kind labels, in its order — what the old form offered.
+  // `types`: the company's labels' names, in its order.
   return { rows: toPreOrder(rows, 'parent_department_id', (r) => mapDepartment(r, serves.get(r.id) ?? [])), types };
 }
 
@@ -524,26 +522,28 @@ function servesInput(input, problems) {
  * `options.addMissingLabel` — theirs too: a label the list lacks is added to it.
  */
 /**
- * A department's labels from a create / update body (spec §15.2):
- *   labels: { [groupId]: labelId | null }   any group, Kind included
- *   type / departmentType                   the Kind label by NAME, for older callers
- * `labels` wins for Kind when it names it. -> { kind (row) | undefined, set, model }
+ * A department's ONE label from a create / update body:
+ *   labelId                       the label's id
+ *   type / departmentType         the label by NAME (older callers, Excel, the command bar)
+ * `labelId` wins when both are given. A create naming none takes the first label.
+ * -> the label row, or undefined when an update does not touch it.
  */
-async function departmentLabelsOf(db, c, input, { creating, options }) {
-  const kindText = input.type !== undefined ? input.type : input.departmentType;
-  const touchesKind = kindText !== undefined;
-  // The Kind name first: the retired import may add a label to the list here, before the model is read.
-  let kind = touchesKind || creating
-    ? await resolveKindLabel(db, c.companyId, kindText, {
-      fallbackToFirst: creating || options.addMissingLabel === true, addIfMissing: options.addMissingLabel === true, userId: c.userId,
-    })
-    : undefined;
-  if (input.labels === undefined && !creating) return { kind, set: new Map(), model: null };
-  const model = await readModel(db, c.companyId);
-  const read = readLabelsInput(model, input.labels, { creating });
-  assertNoProblems(read.problems);
-  if (read.kind) kind = read.kind;
-  return { kind, set: read.set, model };
+async function departmentLabelOf(db, c, input, { creating, options }) {
+  if (input.labelId !== undefined && input.labelId !== null && input.labelId !== '') {
+    const model = await readModel(db, c.companyId);
+    const hit = model.labelById.get(Number(input.labelId));
+    if (!hit) {
+      const choices = model.labels.map((l) => l.name).join(', ');
+      throw invalid('INVALID', 'Choose one of this company’s labels.', { problems: [`That is not one of this company’s labels. Choose one of ${choices}.`] });
+    }
+    return hit;
+  }
+  const text = input.type !== undefined ? input.type : input.departmentType;
+  if (text === undefined && !creating) return undefined;
+  // The retired import may add a label to the list here.
+  return resolveKindLabel(db, c.companyId, text, {
+    fallbackToFirst: creating || options.addMissingLabel === true, addIfMissing: options.addMissingLabel === true, userId: c.userId,
+  });
 }
 
 export async function createDepartment(db, c, input = {}, options = {}) {
@@ -552,22 +552,20 @@ export async function createDepartment(db, c, input = {}, options = {}) {
   const parentId = idOrNull(input.parentId, 'Parent department', problems);
   const serves = servesInput(input, problems);
   assertNoProblems(problems);
-  // The Kind label must be one of the company's list; a department created with none takes the first.
-  // Every other required group must be given a label.
-  const labels = await departmentLabelsOf(db, c, input, { creating: true, options });
-  fields.department_type = labels.kind.name;
+  // The label must be one of the company's list; a department created with none takes the first.
+  const label = await departmentLabelOf(db, c, input, { creating: true, options });
+  fields.department_type = label.name;
   await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Department');
-  const labelIds = Object.fromEntries([[labels.model.kind.id, labels.kind.id], ...[...labels.set].filter(([, v]) => v)]);
   fields.code = (await acceptImportedCode(db, c.companyId, DEPARTMENT_ENTITY, options.importedCode))
-    ?? await issueDepartmentCode(db, c.companyId, { name: fields.name, type: fields.department_type, parentId, labels: labelIds, userId: c.userId });
+    ?? await issueDepartmentCode(db, c.companyId, { name: fields.name, type: fields.department_type, parentId, userId: c.userId });
   const id = await insertRow(db, 'hrms_departments', c.companyId, c.userId, {
     ...fields,
     parent_department_id: parentId,
     status: fields.status ?? 'ACTIVE',
   });
-  await writeDepartmentLabels(db, c, id, { set: labels.set, kindGroupId: labels.model.kind.id, kindLabelId: labels.kind.id });
+  await linkDepartmentLabel(db, c, id, { groupId: label.group_id, labelId: label.id });
   const served = serves ? await writeServes(db, c, id, fields.is_shared === 1, serves) : null;
-  await audit(db, c, 'hrms_departments', id, 'CREATE', null, { ...fields, parent_department_id: parentId, labels: labelIds, ...(served ? { serves: served.after } : {}) });
+  await audit(db, c, 'hrms_departments', id, 'CREATE', null, { ...fields, parent_department_id: parentId, labelId: label.id, ...(served ? { serves: served.after } : {}) });
   // A bulk run (lib/batch.js) throws the read-back away: every rule above has run as on a screen.
   if (inBatch(db)) return { id, code: fields.code };
   return getDepartment(db, c.companyId, id);
@@ -578,12 +576,10 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
   const problems = [];
   const fields = departmentFields(input, problems, { partial: true });
   assertNoProblems(problems);
-  const labels = await departmentLabelsOf(db, c, input, { creating: false, options });
-  if (labels.kind) fields.department_type = labels.kind.name;
-  let labelChange = { before: {}, after: {} };
-  if (labels.kind || labels.set.size) {
-    const model = labels.model ?? await readModel(db, c.companyId);
-    labelChange = await writeDepartmentLabels(db, c, id, { set: labels.set, kindGroupId: model.kind?.id ?? null, kindLabelId: labels.kind?.id ?? null });
+  const label = await departmentLabelOf(db, c, input, { creating: false, options });
+  if (label) {
+    fields.department_type = label.name;
+    await linkDepartmentLabel(db, c, id, { groupId: label.group_id, labelId: label.id });
   }
   if (input.parentId !== undefined) {
     const parentId = idOrNull(input.parentId, 'Parent department', problems);
@@ -601,8 +597,7 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
     ? await writeServes(db, c, id, sharedAfter, serves)
     : (!sharedAfter && before.is_shared ? await writeServes(db, c, id, false, []) : null);
   const beforeServes = served ? served.before : [];
-  const labelsChanged = Object.keys(labelChange.after).length ? { labels: labelChange } : {};
-  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...labelsChanged, ...(served ? { serves: served.after } : {}) });
+  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...(label ? { labelId: label.id } : {}), ...(served ? { serves: served.after } : {}) });
   if (inBatch(db)) return { id };
   return getDepartment(db, c.companyId, id);
 }
@@ -627,7 +622,7 @@ export async function deleteDepartment(db, c, id) {
 
 async function getDepartment(db, companyId, id) {
   const [[row]] = await db.query(
-    `SELECT d.*, ${DEPARTMENT_LABELS_SQL('d')} AS label_list FROM hrms_departments d WHERE d.company_id = ? AND d.id = ? AND d.deleted_at IS NULL`,
+    `SELECT d.*, ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id FROM hrms_departments d WHERE d.company_id = ? AND d.id = ? AND d.deleted_at IS NULL`,
     [companyId, id],
   );
   if (!row) throw notFound('Department');

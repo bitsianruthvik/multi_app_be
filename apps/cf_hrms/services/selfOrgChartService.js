@@ -147,7 +147,7 @@ export function sliceDepartments(departments, seatDepartmentIds) {
       name: d.name,
       parentId: d.parentId != null && keep.has(d.parentId) ? d.parentId : null,
       type: d.type ?? null,
-      labels: d.labels ?? [],
+      labelId: d.labelId ?? null,
       isShared: Boolean(d.isShared),
       // Only a department that is itself in the slice BECAUSE it is shared lists
       // what it serves; all of those were added above, so none dangles.

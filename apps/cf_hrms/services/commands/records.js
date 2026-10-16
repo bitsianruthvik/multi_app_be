@@ -15,7 +15,7 @@
 import { LIVE_ON, today } from '../positionService.js';
 import { HOLDS_SEAT_SQL } from '../seatCount.js';
 import { norm, nameScore } from './text.js';
-import { DEPARTMENT_LABELS_SQL, parseLabelList } from '../labelGroupService.js';
+import { DEPARTMENT_LABEL_ID_SQL } from '../labelGroupService.js';
 
 const SURE = 0.9;      // at or above: taken as found
 const FLOOR = 0.62;    // below: not a match at all
@@ -25,15 +25,15 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
   const asOf = on || today();
   const q = (sql, params = [companyId]) => db.query(sql, params).then(([rows]) => rows);
   const [departments, labels, roles, kras, positions, held, employees, shifts] = await Promise.all([
-    // With each department's own labels in group order (spec §17.2: the shift a new position starts on).
-    q(`SELECT d.id, d.code, d.name, d.department_type, d.parent_department_id, ${DEPARTMENT_LABELS_SQL('d')} AS label_list
+    // With each department's label id (spec §17.2: the shift a new position starts on).
+    q(`SELECT d.id, d.code, d.name, d.department_type, d.parent_department_id, ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
          FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL ORDER BY d.id`),
-    // Every group's labels, group order (spec §15). Kind's are `labels`; the others `otherLabels`.
-    q(`SELECT l.id, l.name, l.group_id, g.name AS group_name, g.is_kind, g.is_required, l.default_shift_id
+    // The company's labels, in its order: one label per department.
+    q(`SELECT l.id, l.name, l.default_shift_id
          FROM hrms_department_labels l
-         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.deleted_at IS NULL
+         JOIN hrms_label_groups g ON g.company_id = l.company_id AND g.id = l.group_id AND g.is_kind = 1 AND g.deleted_at IS NULL
         WHERE l.company_id = ? AND l.deleted_at IS NULL
-        ORDER BY g.sort_order, g.id, l.sort_order, l.id`),
+        ORDER BY l.sort_order, l.id`),
     q("SELECT id, role_code, title, status FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL AND status <> 'RETIRED' ORDER BY id"),
     q(`SELECT a.id, a.role_id, a.kra_definition_id, d.name
          FROM hrms_role_kra_assignments a
@@ -75,13 +75,13 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
     companyId,
     on: asOf,
     departments: departments.map((d) => ({
-      id: d.id, code: d.code ?? null, name: d.name, label: d.department_type, parentId: d.parent_department_id, labels: parseLabelList(d.label_list),
+      id: d.id, code: d.code ?? null, name: d.name, label: d.department_type, parentId: d.parent_department_id,
+      labelId: d.label_id == null ? null : Number(d.label_id),
     })),
-    // label id -> its 'New positions start on' shift (spec §17.2), for labels that have one.
-    labelShift: new Map(labels.filter((l) => l.default_shift_id != null).map((l) => [l.id, l.default_shift_id])),
-    labels: labels.filter((l) => Number(l.is_kind) === 1).map((l) => l.name),
-    labelGroups: labelGroupsOf(labels),
-    otherLabels: labels.filter((l) => Number(l.is_kind) !== 1).map((l) => ({ id: l.id, name: l.name, groupId: l.group_id, groupName: l.group_name })),
+    // The labels' names, in the company's order (what add_department offers).
+    labels: labels.map((l) => l.name),
+    // [{ id, name, defaultShiftId }]: the 'New positions start on' shift of each label (spec §17.2).
+    labelRows: labels.map((l) => ({ id: l.id, name: l.name, defaultShiftId: l.default_shift_id ?? null })),
     roles: roles.map((r) => ({ id: r.id, code: r.role_code ?? null, name: r.title })),
     roleKras: kras.reduce((m, k) => m.set(k.role_id, [...(m.get(k.role_id) ?? []), { id: k.id, definitionId: k.kra_definition_id, name: k.name }]), new Map()),
     positions: P,
@@ -92,17 +92,6 @@ export async function loadRecords(db, companyId, { scope = { all: true }, on } =
     shifts: shifts.map((s) => ({ id: s.id, code: s.code ?? null, name: s.name, status: s.status ?? 'ACTIVE' })),
     deptById,
   };
-}
-
-/** [{ id, name, isKind, isRequired, labels: [{ id, name }] }] in group order. */
-function labelGroupsOf(rows) {
-  const out = [];
-  for (const l of rows) {
-    let g = out.find((x) => x.id === l.group_id);
-    if (!g) { g = { id: l.group_id, name: l.group_name, isKind: Number(l.is_kind) === 1, isRequired: Number(l.is_required) === 1, labels: [] }; out.push(g); }
-    g.labels.push({ id: l.id, name: l.name, defaultShiftId: l.default_shift_id ?? null });
-  }
-  return out;
 }
 
 /** The records of one kind of field. */

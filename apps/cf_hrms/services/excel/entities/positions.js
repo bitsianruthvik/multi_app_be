@@ -9,7 +9,7 @@
  */
 import { PERM, words, coded, textOf, changedKeys, inScope, loops, todayText } from './_shared.js';
 import * as POS from '../../positionService.js';
-import { labelState, groupColumns, groupCells } from './_labels.js';
+import { labelState, labelInfoColumn, labelInfoCell } from './_labels.js';
 import { chooseNewShift } from '../../newPositionShift.js';
 
 const STATUSES = ['DRAFT', 'ACTIVE', 'FROZEN'];
@@ -72,20 +72,11 @@ export default {
       cells: {
         code: p.position_code, role: textOf(lists.roles, p.role_id), department: textOf(lists.departments, p.department_id), shift: textOf(lists.shifts, p.default_shift_id),
         location: textOf(lists.locations, p.location_id), reportsTo: textOf(lists.positions, manager.get(p.id)?.toId ?? null), status: p.status, person: person.get(p.id) ?? null,
-        ...groupCells(groups.model, groups.ofDepartment, p.department_id, { kind: true }),
+        ...labelInfoCell(groups.ofDepartment, p.department_id),
       },
     }]));
-    // Each department's labels that carry a default shift, in group order: what a new row with no shift starts on.
-    const shiftLabels = new Map();
-    for (const [departmentId, names] of groups.ofDepartment) {
-      const list = [];
-      for (const g of groups.model.groups) {
-        const l = names.has(g.id) ? groups.model.labelsOf(g.id).find((x) => x.name === names.get(g.id)) : null;
-        if (l?.default_shift_id != null) list.push({ labelId: l.id, name: l.name, groupName: g.name, defaultShiftId: l.default_shift_id });
-      }
-      if (list.length) shiftLabels.set(departmentId, list);
-    }
-    return { lists, current, primaryTypeId: type?.id ?? null, model: groups.model, shiftLabels, shiftRows: shifts };
+    // Each department's label: its default shift is what a new row with no shift starts on.
+    return { lists, current, primaryTypeId: type?.id ?? null, model: groups.model, labelOf: groups.ofDepartment, shiftRows: shifts };
   },
 
   columns: (state) => [
@@ -97,8 +88,8 @@ export default {
     { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = the top of the chart.', example: 'P004 — Plant Head' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 12, meaning: 'DRAFT, ACTIVE or FROZEN (kept, not to be filled).', example: 'ACTIVE' },
     { key: 'person', header: 'Person', kind: 'info', width: 30, meaning: 'Who is in the position today.', example: 'Asha Verma (KP0031)' },
-    // Its department's label in each group, for reading and sorting (spec §15.3). Ignored on upload.
-    ...groupColumns(state.model, ['Code', 'Role', 'Department', 'Shift', 'Location', 'Reports to', 'Status', 'Person'], { info: true, kind: true }),
+    // Its department's label, for reading and sorting. Ignored on upload.
+    labelInfoColumn(state.model),
   ],
   labelOf: (row) => `New position — ${row.values.role ?? ''}`.trim(),
 
@@ -108,7 +99,8 @@ export default {
     }
     if (row.isNew && !row.entries.shift) {
       // spec §17.2: none named -> the department's label default, else General. Said in the preview.
-      const choice = chooseNewShift({ labels: state.shiftLabels.get(row.entries.department?.id ?? null) ?? [], shifts: state.shiftRows });
+      const l = state.labelOf.get(row.entries.department?.id ?? null) ?? null;
+      const choice = chooseNewShift({ label: l && { id: l.id, name: l.name, defaultShiftId: l.default_shift_id }, shifts: state.shiftRows });
       if (!choice.shift) row.problems.push('Shift: this company has no shift yet. Add one under Shifts first.');
       else {
         row.entries.shift = { id: choice.shift.id };

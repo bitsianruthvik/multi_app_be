@@ -18,14 +18,16 @@ import { chooseNewShift, shiftWords } from '../../newPositionShift.js';
 
 /**
  * The shift the step will use and why: the one named, else the rule of
- * newPositionShift.js over the department's labels (a department made earlier
- * in the same plan brings the labels it is given there).
+ * newPositionShift.js over the department's label (a department made earlier
+ * in the same plan brings the label it is given there).
  */
 export function shiftChoiceOf(ctx, shift, department) {
   if (shift) return { shift: { id: shift.id, name: shift.name }, from: 'NAMED', label: null, line: `Starts on ${shiftWords(shift.name)} (as asked)` };
-  const own = !department ? [] : department.step ? (department.labelRefs ?? []) : (department.record?.labels ?? []);
-  const labels = own.map((l) => ({ ...l, defaultShiftId: ctx.recs.labelShift?.get(l.labelId) ?? null })).filter((l) => l.defaultShiftId != null);
-  return chooseNewShift({ labels, shifts: ctx.recs.shifts });
+  const rows = ctx.recs.labelRows ?? [];
+  const label = !department ? null
+    : department.step ? rows.find((l) => l.name.toLowerCase() === String(department.label ?? '').toLowerCase()) ?? null
+      : rows.find((l) => l.id === department.record?.labelId) ?? null;
+  return chooseNewShift({ label, shifts: ctx.recs.shifts });
 }
 
 export default {

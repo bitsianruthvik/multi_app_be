@@ -3354,6 +3354,13 @@ CREATE TABLE IF NOT EXISTS hrms_search_vectors (
 -- ############################################################################
 -- ## 17. LABELS IN GROUPS (CF_HRMS_HIRING_SPEC.md §15, 2026-10-15)           ##
 -- ############################################################################
+-- 2026-10-16: GROUPS WERE REMOVED — a department has exactly ONE label, always.
+-- The tables below stay as they are (no schema churn): every company keeps one
+-- hrms_label_groups row, its is_kind group, and every label lives in it. The
+-- code reads and writes only that group (services/labelGroupService.js); the
+-- department's label is department_type (its name), with a link row beside it.
+-- What follows describes the model as it was built on 2026-10-15.
+--
 -- A department's labels belong to named GROUPS, one label per group per
 -- department. Every company has the group "Kind" (required); its labels are the
 -- Department / Section / Machine list of §14. Other groups are the company's
@@ -3637,9 +3644,9 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 --                                  VARCHAR(20): LABEL needs no change to it.
 --   hrms_department_labels         default_shift_id ("New positions start on"):
 --                                  the shift a NEW position gets when none is
---                                  named — the first label of its department, in
---                                  group order, that has one; else the General
---                                  shift. Existing positions never change.
+--                                  named — its department's label's, when it has
+--                                  one; else the General shift. Existing
+--                                  positions never change.
 --
 -- One change per ALTER (TiDB, see §10c). Every step is guarded: a no-op on a
 -- database that has it, including one built from this file a moment ago.

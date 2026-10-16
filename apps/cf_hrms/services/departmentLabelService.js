@@ -1,23 +1,17 @@
 /**
- * departmentLabelService.js — the labels of a group: a company's own short
- * lists. (TM/CF_HRMS_HIRING_SPEC.md §9, in groups since §15.)
+ * departmentLabelService.js — the company's department labels: ONE short list,
+ * ONE label per department (TM/CF_HRMS_HIRING_SPEC.md §9; the groups of §15
+ * were removed on 2026-10-16). The list is read through labelGroupService.js's
+ * model; a department's label is kept, by name, in
+ * hrms_departments.department_type.
  *
- * Every label belongs to ONE group (labelGroupService.js). The group Kind holds
- * the list §9 began with — Department, Section, Machine — and a department's
- * Kind label is also kept, by name, in hrms_departments.department_type.
+ * THE LIST IS NEVER EMPTY. A company with none gets the defaults the first time
+ * the list is read (ensureLabels), together with any label its departments
+ * already use, and the last label cannot be deleted.
  *
- * WITHOUT A groupId every function here means the Kind group, as it did before
- * groups existed: the old screens and callers keep working unchanged.
- *
- * THE KIND LIST IS NEVER EMPTY. A company with none gets the defaults the first
- * time the list is read (ensureLabels), together with any label its
- * departments already use, and the last Kind label cannot be deleted (nor the
- * last label of any required group). An optional group may be empty.
- *
- * Renaming a Kind label renames it on every department that uses it, in the
- * same transaction. Deleting a label in use is refused unless the caller says
- * where its departments go (moveTo — another label of the SAME group; for an
- * optional group, `none` takes the label off them).
+ * Renaming a label renames it on every department that uses it, in the same
+ * transaction. Deleting a label in use is refused unless the caller says where
+ * its departments go (moveTo — another label of the list).
  */
 import { invalid, notFound, conflict } from '../lib/errors.js';
 import { ensureKind, readModel, readName, DEFAULT_LABELS } from './labelGroupService.js';
@@ -25,7 +19,8 @@ import { ensureKind, readModel, readName, DEFAULT_LABELS } from './labelGroupSer
 export { DEFAULT_LABELS };
 
 const shape = (r) => ({
-  id: r.id, name: r.name, sortOrder: Number(r.sort_order), departmentCount: Number(r.department_count ?? 0), groupId: r.group_id,
+  id: r.id, name: r.name, sortOrder: Number(r.sort_order), departmentCount: Number(r.department_count ?? 0),
+  // 'New positions start on' (spec §17.2): the shift a new position in a department carrying this label gets.
   defaultShiftId: r.default_shift_id ?? null,
 });
 
@@ -44,45 +39,42 @@ async function readDefaultShift(db, companyId, value) {
   return id;
 }
 
-/** The group a call means: the one named, or Kind. */
-function groupOf(model, groupId) {
-  if (groupId == null || groupId === '') return model.kind;
-  const g = model.groupById.get(Number(groupId));
-  if (!g) throw invalid('INVALID', 'Choose one of this company’s label groups.', { problems: ['That label group is not one of this company’s.'] });
-  return g;
-}
-
-/**
- * The company's KIND labels, rows as the database has them (+ department_count),
- * creating the Kind group and its defaults when it has none.
- */
+/** The company's labels, rows as the database has them (+ department_count), made when it has none. */
 export async function ensureLabels(db, companyId, userId = null) {
-  return (await ensureKind(db, companyId, userId)).kindLabels;
-}
-
-/** GET /organisation/department-labels[?groupId=] -> { labels: [{ id, name, sortOrder, departmentCount, groupId }] } */
-export async function listLabels(db, companyId, { groupId = null } = {}) {
-  const model = await ensureKind(db, companyId);
-  return { labels: model.labelsOf(groupOf(model, groupId).id).map(shape) };
+  return (await ensureKind(db, companyId, userId)).labels;
 }
 
 /**
- * The Kind label a department is being given, as the list spells it -> the row.
- *   blank, with `fallbackToFirst` (a create that names none) -> the first Kind label;
+ * GET /organisation/department-labels
+ *   -> { labels: [{ id, name, sortOrder, departmentCount, defaultShiftId }], shifts: [{ id, code, name }] }
+ * `shifts`: the company's active shifts, the choices of 'New positions start on' (spec §17.2), so the
+ * Labels sheet needs no other right to offer them.
+ */
+export async function listLabels(db, companyId) {
+  const [model, [shifts]] = await Promise.all([
+    ensureKind(db, companyId),
+    db.query("SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL AND status = 'ACTIVE' ORDER BY id", [companyId]),
+  ]);
+  return { labels: model.labels.map(shape), shifts: shifts.map((x) => ({ id: x.id, code: x.code ?? null, name: x.name })) };
+}
+
+/**
+ * The label a department is being given, as the list spells it -> the row.
+ *   blank, with `fallbackToFirst` (a create that names none) -> the first label;
  *   blank otherwise, or a name that is not in the list       -> 422.
  *
  * `addIfMissing` is for the retired workbook import alone (never a route): a
- * label typed in the workbook that the list lacks is ADDED to Kind, so the
+ * label typed in the workbook that the list lacks is ADDED to the list, so the
  * rule "a department's label is in the list" still holds afterwards.
  */
 export async function resolveKindLabel(db, companyId, given, { fallbackToFirst = false, addIfMissing = false, userId = null } = {}) {
   const model = await ensureKind(db, companyId);
-  const labels = model.kindLabels;
+  const labels = model.labels;
   const text = given == null ? '' : String(given).trim();
   const choices = labels.map((l) => l.name).join(', ');
   if (!text) {
     if (fallbackToFirst) return labels[0];
-    throw invalid('INVALID', `Choose a ${model.kind.name} label for the department.`, { problems: [`Choose a ${model.kind.name} label: ${choices}.`] });
+    throw invalid('INVALID', 'Choose a label for the department.', { problems: [`Choose a label: ${choices}.`] });
   }
   const hit = labels.find((l) => l.name.toLowerCase() === text.toLowerCase());
   if (!hit && addIfMissing) {
@@ -102,13 +94,17 @@ export async function resolveKindLabel(db, companyId, given, { fallbackToFirst =
   return hit;
 }
 
-/** The Kind label's NAME (what department_type holds). Kept for older callers. */
+/** The label's NAME (what department_type holds). Kept for older callers. */
 export async function resolveLabel(db, companyId, given, options = {}) {
   return (await resolveKindLabel(db, companyId, given, options)).name;
 }
 
-async function requireLabel(db, companyId, id) {
-  const [[row]] = await db.query('SELECT * FROM hrms_department_labels WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [companyId, id]);
+/** A label of the list, locked for the write. */
+async function requireLabel(db, companyId, id, model) {
+  const [[row]] = await db.query(
+    'SELECT * FROM hrms_department_labels WHERE company_id = ? AND id = ? AND group_id = ? AND deleted_at IS NULL FOR UPDATE',
+    [companyId, id, model.kind.id],
+  );
   if (!row) throw notFound('Label');
   return row;
 }
@@ -135,46 +131,40 @@ async function audit(db, c, id, action, before, after) {
 
 const one = async (db, companyId, id) => shape((await readModel(db, companyId)).labelById.get(id));
 
-/** POST /organisation/department-labels { name, groupId?, defaultShiftId? } — without groupId, a Kind label. */
+/** POST /organisation/department-labels { name, defaultShiftId? } */
 export async function createLabel(db, c, body = {}) {
   const model = await ensureKind(db, c.companyId, c.userId);
-  const group = groupOf(model, body.groupId);
+  const groupId = model.kind.id;
   const name = readName(body.name);
-  await assertNameFree(db, c.companyId, group.id, name);
+  await assertNameFree(db, c.companyId, groupId, name);
   const defaultShiftId = await readDefaultShift(db, c.companyId, body.defaultShiftId);
-  const [[last]] = await db.query('SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_department_labels WHERE company_id = ? AND group_id = ? AND deleted_at IS NULL', [c.companyId, group.id]);
+  const [[last]] = await db.query('SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_department_labels WHERE company_id = ? AND group_id = ? AND deleted_at IS NULL', [c.companyId, groupId]);
   const [res] = await db.query(
     'INSERT INTO hrms_department_labels (company_id, group_id, name, sort_order, default_shift_id, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-    [c.companyId, group.id, name, Number(last.n) + 1, defaultShiftId, c.userId ?? null],
+    [c.companyId, groupId, name, Number(last.n) + 1, defaultShiftId, c.userId ?? null],
   );
-  await audit(db, c, res.insertId, 'CREATE', null, { name, groupId: group.id, defaultShiftId });
+  await audit(db, c, res.insertId, 'CREATE', null, { name, defaultShiftId });
   const label = await one(db, c.companyId, res.insertId);
   return { ...label, label };
 }
 
-/** A rename of a Kind label also renames it on every department that uses it — one transaction. */
+/** PUT /organisation/department-labels/:id — a rename also renames the label on every department that uses it, one transaction. */
 export async function updateLabel(db, c, id, body = {}) {
-  const before = await requireLabel(db, c.companyId, id);
   const model = await ensureKind(db, c.companyId, c.userId);
-  const isKind = before.group_id === model.kind.id || before.group_id == null;
+  const before = await requireLabel(db, c.companyId, id, model);
   const after = {};
   let renamed = 0;
   if (body.name !== undefined) {
     const name = readName(body.name);
     if (name !== before.name) {
-      await assertNameFree(db, c.companyId, before.group_id ?? model.kind.id, name, id);
+      await assertNameFree(db, c.companyId, model.kind.id, name, id);
       await db.query('UPDATE hrms_department_labels SET name = ? WHERE company_id = ? AND id = ?', [name, c.companyId, id]);
-      if (isKind) {
-        // Every department, deleted ones too: a restored department must not come back with a label nobody has.
-        const [res] = await db.query(
-          'UPDATE hrms_departments SET department_type = ? WHERE company_id = ? AND LOWER(department_type) = LOWER(?)',
-          [name, c.companyId, before.name],
-        );
-        renamed = res.affectedRows;
-      } else {
-        const [[n]] = await db.query('SELECT COUNT(*) AS n FROM hrms_department_label_links WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-        renamed = Number(n.n);
-      }
+      // Every department, deleted ones too: a restored department must not come back with a label nobody has.
+      const [res] = await db.query(
+        'UPDATE hrms_departments SET department_type = ? WHERE company_id = ? AND LOWER(department_type) = LOWER(?)',
+        [name, c.companyId, before.name],
+      );
+      renamed = res.affectedRows;
       after.name = name;
     }
   }
@@ -198,17 +188,11 @@ export async function updateLabel(db, c, id, body = {}) {
   return { ...label, label, departmentsRenamed: renamed };
 }
 
-/**
- * PUT /organisation/department-labels/order { ids, groupId? } — every label of
- * ONE group, in the order wanted. The group is the one named, else the group of
- * the labels sent, else Kind.
- */
+/** PUT /organisation/department-labels/order { ids } — every label once, in the order wanted. -> { labels, shifts } */
 export async function reorderLabels(db, c, body = {}) {
   const model = await ensureKind(db, c.companyId, c.userId);
   const ids = Array.isArray(body.ids) ? body.ids.map(Number) : null;
-  const sentGroup = body.groupId != null ? body.groupId : (ids?.length ? model.labelById.get(ids[0])?.group_id ?? null : null);
-  const group = groupOf(model, sentGroup);
-  const labels = model.labelsOf(group.id);
+  const labels = model.labels;
   const have = new Set(labels.map((l) => l.id));
   if (!ids || ids.length !== labels.length || new Set(ids).size !== ids.length || ids.some((v) => !have.has(v))) {
     throw invalid('INVALID', 'Send every label once, in the order wanted.', {
@@ -219,62 +203,49 @@ export async function reorderLabels(db, c, body = {}) {
     `UPDATE hrms_department_labels SET sort_order = CASE id ${ids.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
     [...ids.flatMap((v, i) => [v, i + 1]), c.companyId, ids],
   );
-  return listLabels(db, c.companyId, { groupId: group.id });
+  return listLabels(db, c.companyId);
 }
 
 /**
  * DELETE. In use and no `moveTo`: 409 IN_USE with detail.departmentCount.
- * With `moveTo` (another label of the same group) its departments take that
- * label first; `moveTo=none` (optional groups only) takes the label off them.
+ * With `moveTo` (another label of the list) its departments take that label
+ * first. The last label is never removed (409 LAST_LABEL).
  */
 export async function deleteLabel(db, c, id, { moveTo = null } = {}) {
-  const before = await requireLabel(db, c.companyId, id);
   const model = await ensureKind(db, c.companyId, c.userId);
-  const group = model.groupById.get(before.group_id) ?? model.kind;
-  const isKind = group.id === model.kind.id;
-  const required = Number(group.is_required) === 1;
-  const labels = model.labelsOf(group.id);
-  if (required && labels.length <= 1) {
-    throw conflict('LAST_LABEL', `This is the only ${group.name} label left. Every department needs one, so add another before removing this one.`);
+  const before = await requireLabel(db, c.companyId, id, model);
+  const labels = model.labels;
+  if (labels.length <= 1) {
+    throw conflict('LAST_LABEL', 'This is the only label left. Every department needs one, so add another before removing this one.');
   }
   const departmentCount = Number(labels.find((l) => l.id === id)?.department_count ?? 0);
   let moved = 0;
-  const clear = !required && String(moveTo ?? '').toLowerCase() === 'none';
+  let target = null;
   if (departmentCount > 0) {
     const many = departmentCount !== 1;
-    if ((moveTo == null || moveTo === '') && !clear) {
+    if (moveTo == null || moveTo === '') {
       throw conflict('IN_USE', `${departmentCount} ${many ? 'departments use' : 'department uses'} the label "${before.name}". Choose the label ${many ? 'they move' : 'it moves'} to.`, {
         problems: [`${departmentCount} ${many ? 'departments are' : 'department is'} labelled "${before.name}". Choose another label for ${many ? 'them' : 'it'}, then remove this one.`],
         detail: { departmentCount },
       });
     }
-    if (clear) {
-      const [res] = await db.query('UPDATE hrms_department_label_links SET deleted_at = NOW() WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [c.companyId, id]);
-      moved = res.affectedRows;
-    } else {
-      const target = labels.find((l) => l.id === Number(moveTo));
-      if (!target || target.id === id) {
-        throw invalid('INVALID', 'Choose another label of the same list to move the departments to.', {
-          problems: [`The label to move the departments to must be another label of "${group.name}".`], detail: { departmentCount },
-        });
-      }
-      if (isKind) {
-        const [res] = await db.query(
-          'UPDATE hrms_departments SET department_type = ? WHERE company_id = ? AND LOWER(department_type) = LOWER(?)',
-          [target.name, c.companyId, before.name],
-        );
-        moved = res.affectedRows;
-      }
-      // One live link per (department, group): the link changes its label in place.
-      const [res] = await db.query('UPDATE hrms_department_label_links SET label_id = ? WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [target.id, c.companyId, id]);
-      if (!isKind) moved = res.affectedRows;
+    target = labels.find((l) => l.id === Number(moveTo));
+    if (!target || target.id === id) {
+      throw invalid('INVALID', 'Choose another label of the list to move the departments to.', {
+        problems: ['The label to move the departments to must be another label of the list.'], detail: { departmentCount },
+      });
     }
-  } else if (!isKind) {
-    // Links of departments that are gone.
-    await db.query('UPDATE hrms_department_label_links SET deleted_at = NOW() WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+    const [res] = await db.query(
+      'UPDATE hrms_departments SET department_type = ? WHERE company_id = ? AND LOWER(department_type) = LOWER(?)',
+      [target.name, c.companyId, before.name],
+    );
+    moved = res.affectedRows;
   }
+  // The link rows follow the name: one live link per department, its label changed in place.
+  if (target) await db.query('UPDATE hrms_department_label_links SET label_id = ? WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [target.id, c.companyId, id]);
+  else await db.query('UPDATE hrms_department_label_links SET deleted_at = NOW() WHERE company_id = ? AND label_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE hrms_department_labels SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
-  await audit(db, c, id, 'DELETE', { name: before.name, groupId: group.id, departmentCount }, moved ? (clear ? { cleared: moved } : { movedTo: Number(moveTo), departmentsMoved: moved }) : null);
+  await audit(db, c, id, 'DELETE', { name: before.name, departmentCount }, moved ? { movedTo: target.id, departmentsMoved: moved } : null);
   return { ok: true, id, departmentsMoved: moved };
 }
 
