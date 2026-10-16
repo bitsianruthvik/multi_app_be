@@ -158,17 +158,21 @@ if (slug === 'karni') {
     && new Set(storesHelpers.map((n) => primary.get(n.id))).size === 3,
   '"Helper 1" in Stores: three positions under three managers are THREE cards',
   storesHelpers.map((n) => `${n.positionCode}→${nodeById.get(primary.get(n.id))?.positionCode}:${n.cardId}`).join(' '));
-  const p124 = chart.nodes.filter((n) => /^P124-\d+$/.test(n.positionCode ?? ''));
+  // Found by role and department, not by code: codes are issued and Karni's were renumbered (recode-company.mjs, 2026-10-16). Was P124-1 … P124-7 under P024-1 / P024-2.
+  const p124 = chart.nodes.filter((n) => n.roleTitle === 'Operator - Production (Lamination · Raulimex)' && n.departmentName === 'Raulimex');
   const p124Managers = [...new Set(p124.map((n) => primary.get(n.id)))].map((id) => nodeById.get(id));
-  ok(p124.length === 7 && new Set(p124.map((n) => n.cardId)).size === 1, 'P124-1 … P124-7 are ONE card', `${p124.length} positions, cards ${[...new Set(p124.map((n) => n.cardId))].join(',')}`);
-  ok(p124Managers.length === 2 && p124Managers.every((m) => /^P024-[12]$/.test(m.positionCode)) && new Set(p124Managers.map((m) => m.cardId)).size === 1,
-    '…because their two managers (P024-1, P024-2) are one card', p124Managers.map((m) => `${m.positionCode}:${m.cardId}`).join(' '));
+  const p124Role = p124[0]?.positionCode?.replace(/-\d+$/, '') ?? '?';
+  ok(p124.length === 7 && new Set(p124.map((n) => n.cardId)).size === 1 && p124.every((n) => new RegExp(`^${p124Role}-[1-7]$`).test(n.positionCode)),
+    `the seven Raulimex lamination operators (${p124Role}-1 … ${p124Role}-7) are ONE card`, `${p124.length} positions, cards ${[...new Set(p124.map((n) => n.cardId))].join(',')}`);
+  ok(p124Managers.length === 2 && p124Managers.every((m) => m?.roleTitle === 'Incharge - Production (Lamination)' && /-[12]$/.test(m.positionCode))
+    && new Set(p124Managers.map((m) => m.cardId)).size === 1,
+    '…because their two managers (the two Incharge - Production (Lamination) chairs) are one card', p124Managers.map((m) => `${m?.positionCode}:${m?.cardId}`).join(' '));
   const one = p124[0];
   const card = await getPositionCard(pool, COMPANY, one.id, {});
   const wide = await getPositionCard(pool, COMPANY, p124Managers[0].id, { scope: 'card' });
   const narrow = await getPositionCard(pool, COMPANY, p124Managers[0].id, {});
   ok(card.cardId === one.cardId && card.shift?.id === one.defaultShift.id && card.shift.code && card.shift.name, 'position card: cardId and shift { id, code, name }');
-  ok(card.siblings.length === 6 && card.siblings.every((s) => s.positionId !== one.id && /^P124-/.test(s.positionCode) && s.shift?.code
+  ok(card.siblings.length === 6 && card.siblings.every((s) => s.positionId !== one.id && p124.some((n) => n.id === s.positionId) && s.shift?.code
     && (s.occupant === null || (typeof s.occupant.employeeId === 'number' && s.occupant.name))),
   'position card: siblings are the other six positions of the card, each with its shift and occupant|null');
   ok(card.siblings.filter((s) => s.occupant).length === p124.filter((n) => n.id !== one.id && n.occupants.length).length, 'siblings\' occupants match the chart');
@@ -179,7 +183,7 @@ if (slug === 'karni') {
   ok(wide.directReports.length === expectWide && wide.directReports.length > narrow.directReports.length && wide.directReportsScope === 'card'
     && wide.directReports.every((r) => cardIds.has(r.toPositionId)), 'directReports with scope=card = lines to ANY position of the card',
   `${wide.directReports.length} (expected ${expectWide}; this position alone ${narrow.directReports.length})`);
-} else skip('the Stores "Helper 1" and P124 cases', `they are local Karni's data and this is ${slug}`);
+} else skip('the Stores "Helper 1" and Raulimex operator cases', `they are local Karni's data and this is ${slug}`);
 
 // The rule itself, on a made-up graph: two tops of one role, a loop that no root reaches.
 {

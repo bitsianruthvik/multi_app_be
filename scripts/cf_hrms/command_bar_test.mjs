@@ -70,9 +70,31 @@ const before = await counts();
 
 /* ── the people and places the cases use, chosen at run time ───────────── */
 const recs = await loadRecords(pool, COMPANY, {});
-const code = (c) => recs.positions.find((p) => p.code === c);
-const vacant = code('P211-1');
-const vacant2 = code('P098');
+/**
+ * A position found by its ROLE's title (and department), the n-th by code — never by a code written
+ * here: codes are issued by the generator and Karni's were renumbered (recode-company.mjs, 2026-10-16).
+ */
+const byRole = (roleTitle, n = 1, departmentName = null) => {
+  const role = recs.roles.find((r) => r.name === roleTitle);
+  const dept = departmentName ? recs.departments.find((d) => d.name === departmentName) : null;
+  const list = recs.positions
+    .filter((p) => role && p.roleId === role.id && (!departmentName || (dept && p.departmentId === dept.id)))
+    .sort((a, b) => String(a.code).localeCompare(String(b.code), 'en', { numeric: true }));
+  if (!list[n - 1]) throw new Error(`No position #${n} of role "${roleTitle}"${departmentName ? ` in ${departmentName}` : ''} — the cases need local Karni's data.`);
+  return list[n - 1];
+};
+const vacant = byRole('Helper 1', 1, 'Shared · IBC 1 + IBC 2 + IBC 3');   // was P211-1
+/** The positions the cases name by code: placeholder -> position. */
+const POS = {
+  '{LAM1}': byRole('Operator - Production (Lamination · Raulimex)', 1),   // was P124-1
+  '{LAM2}': byRole('Operator - Production (Lamination · Raulimex)', 2),   // was P124-2
+  '{BFL1}': byRole('Operator - Production (BFL)', 1),                      // was P159-1
+  '{BFL2}': byRole('Operator - Production (BFL)', 2),                      // was P159-2
+  '{MAINT}': byRole('Manager - Maintenance', 1),                           // was P040
+  '{PRODMGR}': byRole('Production Manager', 1),                            // was P020
+  '{QCINCH}': byRole('Incharge - Quality (Quality · P208)', 1),            // was P208
+  '{PLAN}': byRole('Deputy Manager - Planning', 1),                        // was P098
+};
 const placed = recs.employees.filter((e) => e.positionId && e.name.split(' ').length >= 2 && Math.max(...e.name.split(' ').map((w) => w.length)) >= 6);
 const [E1, E2, E3] = placed;
 const typo = (name) => {
@@ -87,7 +109,8 @@ const hide = (s) => [[E1, "{E1}"], [E2, "{E2}"], [E3, "{E3}"]].reduce((t, [e, k]
 const fill = (s) => s
   .replaceAll('{E1}', E1.name).replaceAll('{E2}', E2.name).replaceAll('{E3}', E3.name)
   .replaceAll('{E1typo}', typo(E1.name)).replaceAll('{E1code}', E1.code ?? E1.name)
-  .replaceAll('{VAC}', vacant.code).replaceAll('{TAG}', TAG);
+  .replaceAll('{VAC}', vacant.code).replaceAll('{TAG}', TAG)
+  .replace(/\{[A-Z0-9]+\}/g, (k) => POS[k]?.code ?? k);
 
 /* ── [1] the reader ────────────────────────────────────────────────────── */
 // Expectations per step: action, then fields — 'text' compares new text (any case),
@@ -112,32 +135,32 @@ const CASES = [
   ['add a responsibility check ink viscosity every hour to Operator - Production (Printing)', [['add_responsibility', { text: 'Check ink viscosity every hour', role: 'Operator - Production (Printing)' }]]],
   ['the Production Manager should also review the daily wastage report', [['add_responsibility', { text: 'Review the daily wastage report', role: 'Production Manager' }]]],
   ['make the Manager - HR responsible for joining formalities', [['add_responsibility', { text: 'Joining formalities', role: 'Manager - HR' }]]],
-  ['only for position P124-1 add the responsibility look after the rewinder', [['add_responsibility', { text: 'Look after the rewinder', position: 'code:P124-1', role: '-' }]]],
-  ['add a duty to P159-1: inspect the rolls before dispatch', [['add_responsibility', { text: 'Inspect the rolls before dispatch', position: 'code:P159-1' }]]],
+  ['only for position {LAM1} add the responsibility look after the rewinder', [['add_responsibility', { text: 'Look after the rewinder', position: 'code:{LAM1}', role: '-' }]]],
+  ['add a duty to {BFL1}: inspect the rolls before dispatch', [['add_responsibility', { text: 'Inspect the rolls before dispatch', position: 'code:{BFL1}' }]]],
   ['add responsibility train new helpers under the KRA Manpower & team for Production Manager', [['add_responsibility', { text: 'Train new helpers', role: 'Production Manager', kra: 'Manpower & team' }]]],
   ['add a responsiblity to the Forklift Driver: check tyre pressure daily', [['add_responsibility', { text: 'Check tyre pressure daily', role: 'Forklift Driver' }]]],
   ['add KPI "On-time dispatch %" target 98% for Manager - PPC', [['add_kpi', { text: 'On-time dispatch %', target: '98%', role: 'Manager - PPC' }]]],
   ['add a KPI machine downtime hours with a target of 2 to Manager - Maintenance', [['add_kpi', { text: 'Machine downtime hours', target: '2', role: 'Manager - Maintenance' }]]],
   ['measure the Forklift Driver on fuel used per month', [['add_kpi', { text: 'Fuel used per month', role: 'Forklift Driver' }]]],
-  ['add a KPI for P159-1: rolls produced per shift, target 40', [['add_kpi', { text: 'Rolls produced per shift', target: '40', position: 'code:P159-1' }]]],
+  ['add a KPI for {BFL1}: rolls produced per shift, target 40', [['add_kpi', { text: 'Rolls produced per shift', target: '40', position: 'code:{BFL1}' }]]],
   ['add a position Officer - Quality in Quality', [['add_position', { role: 'Officer - Quality', department: 'Quality', shift: '-' }]]],
   ['add another Helper position in Slitting on the night shift', [['add_position', { role: 'Helper', department: 'Slitting', shift: 'Night' }]]],
-  ['open a vacancy for an Electrician in Maintenance reporting to P040', [['add_position', { role: 'Electrician', department: 'Maintenance', reportsTo: 'code:P040' }]]],
+  ['open a vacancy for an Electrician in Maintenance reporting to {MAINT}', [['add_position', { role: 'Electrician', department: 'Maintenance', reportsTo: 'code:{MAINT}' }]]],
   ['add a new post of Security in Security, night shift', [['add_position', { role: 'Security', department: 'Security', shift: 'Night' }]]],
-  ['move P159-2 to the day shift', [['change_shift', { position: 'code:P159-2', shift: 'Day' }]]],
-  ['change the shift of P124-2 to Night', [['change_shift', { position: 'code:P124-2', shift: 'Night' }]]],
+  ['move {BFL2} to the day shift', [['change_shift', { position: 'code:{BFL2}', shift: 'Day' }]]],
+  ['change the shift of {LAM2} to Night', [['change_shift', { position: 'code:{LAM2}', shift: 'Night' }]]],
   ['put the Forklift Driver position on the general shift', [['change_shift', { position: 'Forklift Driver', shift: 'General' }]]],
   ['put {E1} in {VAC}', [['place_person', { employee: '{E1}', position: `code:${'{VAC}'}` }]]],
   ['move {E1} to position {VAC} from 1 December 2026', [['place_person', { employee: '{E1}', position: 'code:{VAC}', from: '2026-12-01' }]]],
   ['assign {E1code} to {VAC} with effect from 2026-12-01', [['place_person', { employee: '{E1}', position: 'code:{VAC}', from: '2026-12-01' }]]],
   ['put {E1typo} in {VAC}', [['place_person', { employee: '{E1}', position: 'code:{VAC}' }]]],
-  ['place {E2} as Deputy Manager - Planning in PPC', [['place_person', { employee: '{E2}', position: 'code:P098' }]]],
+  ['place {E2} as Deputy Manager - Planning in PPC', [['place_person', { employee: '{E2}', position: 'code:{PLAN}' }]]],
   ['add a Quality Control section under Production and add a position Officer - Quality in it', [
     ['add_department', { name: 'Quality Control', label: 'Section', under: 'Production' }],
     ['add_position', { role: 'Officer - Quality', department: 'step:s1' }]]],
-  ['create a new role called Line Leader, then add a position for Line Leader in Printing reporting to P020', [
+  ['create a new role called Line Leader, then add a position for Line Leader in Printing reporting to {PRODMGR}', [
     ['add_role', { title: 'Line Leader' }],
-    ['add_position', { role: 'step:s1', department: 'Printing', reportsTo: 'code:P020' }]]],
+    ['add_position', { role: 'step:s1', department: 'Printing', reportsTo: 'code:{PRODMGR}' }]]],
   ['add a section Dispatch Desk under Logistics; add a role Dispatch Clerk; add a position Dispatch Clerk in Dispatch Desk; put {E1} in it', [
     ['add_department', { name: 'Dispatch Desk', label: 'Section', under: 'Logistics' }],
     ['add_role', { title: 'Dispatch Clerk' }],
@@ -166,7 +189,7 @@ const CASES = [
   ['add kpi Scrap sold per month to Store Supervisor - Scrap with target 10 tonnes', [['add_kpi', { text: 'Scrap sold per month', role: 'Store Supervisor - Scrap', target: '10 tonnes' }]], 'fresh'],
   ['add one more Electrician position in Maintenance', [['add_position', { role: 'Electrician', department: 'Maintenance' }]], 'fresh'],
   ['Open a new position for Executive - IT in MIS on general shift', [['add_position', { role: 'Executive - IT', department: 'MIS', shift: 'General' }]], 'fresh'],
-  ['switch P208 to night shift', [['change_shift', { position: 'code:P208', shift: 'Night' }]], 'fresh'],
+  ['switch {QCINCH} to night shift', [['change_shift', { position: 'code:{QCINCH}', shift: 'Night' }]], 'fresh'],
   ['transfer {E2} into {VAC}', [['place_person', { employee: '{E2}', position: 'code:{VAC}' }]], 'fresh'],
   ['add a section Quality Lab under Quality, add a role Lab Chemist and add a position Lab Chemist in Quality Lab', [
     ['add_department', { name: 'Quality Lab', label: 'Section', under: 'Quality' }],
@@ -175,7 +198,7 @@ const CASES = [
   ['add a KRA Housekeeping to the Housekeeping Staff role and a KPI cleanliness score to it', [
     ['add_kra', { text: 'Housekeeping', role: 'Housekeeping Staff' }],
     ['add_kpi', { text: 'Cleanliness score', role: 'Housekeeping Staff' }]], 'fresh'],
-  ['make {E3} the Deputy Manager - Planning', [['place_person', { employee: '{E3}', position: 'code:P098' }]], 'fresh'],
+  ['make {E3} the Deputy Manager - Planning', [['place_person', { employee: '{E3}', position: 'code:{PLAN}' }]], 'fresh'],
   ['please sort out the canteen menu for next week', [[null, {}]]],
   ['add a KRA Customer complaints to the Production Manager role and asdf qwerty zxcv', [
     ['add_kra', { text: 'Customer complaints', role: 'Production Manager' }], [null, {}]]],

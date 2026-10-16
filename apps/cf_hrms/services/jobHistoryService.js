@@ -229,6 +229,7 @@ const FIELD_WHAT = {
   defaultShiftId: ['SHIFT_CHANGED', 'hrms_shifts', 'name'],
   locationId: ['PLACE_CHANGED', 'hrms_locations', 'name'],
   positionTitle: ['TITLE_CHANGED', null, null],
+  code: ['CODE_CHANGED', null, null],
 };
 
 async function positionFacts(db, companyId, position) {
