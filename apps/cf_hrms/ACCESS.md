@@ -15,7 +15,7 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 | Hiring | Hiring, every step except the final create | `cf_hrms_hiring_view` | `cf_hrms_hiring_edit` | – | – |
 | Documents | Job descriptions, Responsibility profiles | `cf_hrms_documents_view` | `cf_hrms_documents_edit` | `cf_hrms_documents_remove` | – |
 | Time | Shifts, Holidays | `cf_hrms_time_view` | `cf_hrms_time_edit` | `cf_hrms_time_remove` | `cf_hrms_time_upload` |
-| Leave | Leave policies | `cf_hrms_leave_view` | `cf_hrms_leave_edit` | `cf_hrms_leave_remove` | – |
+| Leave | Leave policies, Leave requests, Leave balances | `cf_hrms_leave_view` | `cf_hrms_leave_edit` | `cf_hrms_leave_remove` | – |
 | Setup | Code formats, Letters, Reporting types, Performance settings | `cf_hrms_setup_view` | `cf_hrms_setup_edit` | `cf_hrms_setup_remove` | – |
 | Performance | Plans, A person’s plan, Periods, Actuals, Reviews and check-ins, Actions | `cf_hrms_performance_view` | `cf_hrms_performance_edit` | `cf_hrms_performance_remove` | `cf_hrms_performance_upload` |
 
@@ -100,6 +100,14 @@ How to read the tables below:
 | `PUT /user/me/team/actions/:id` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/actions/:id/done` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/actions/:id/drop` | `cf_hrms_self_view` |  |
+| `GET /user/me/leave` | `cf_hrms_self_view` |  |
+| `POST /user/me/leave/preview` | `cf_hrms_self_view` |  |
+| `POST /user/me/leave` | `cf_hrms_self_view` |  |
+| `POST /user/me/leave/:id/cancel` | `cf_hrms_self_view` |  |
+| `GET /user/me/approvals` | `cf_hrms_self_view` |  |
+| `GET /user/me/approvals/leave/:id` | `cf_hrms_self_view` |  |
+| `POST /user/me/approvals/leave/:id/approve` | `cf_hrms_self_view` |  |
+| `POST /user/me/approvals/leave/:id/reject` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
 
@@ -355,6 +363,15 @@ How to read the tables below:
 | `GET /leave/assignments` | `cf_hrms_leave_view` |  |
 | `PUT /leave/assignments` | `cf_hrms_leave_edit` | whole-company logins only; clearing one (policyId: null) also needs cf_hrms_leave_remove |
 | `GET /leave/policy-for` | `cf_hrms_leave_view` |  |
+| `GET /leave/requests` | `cf_hrms_leave_view` | narrowed to the login’s department |
+| `POST /leave/requests/preview` | `cf_hrms_leave_edit` | scope: the person |
+| `POST /leave/requests` | `cf_hrms_leave_edit` | scope: the person |
+| `GET /leave/requests/:id` | `cf_hrms_leave_view` | scope: the person |
+| `POST /leave/requests/:id/approve` | `cf_hrms_leave_edit` | scope: the person |
+| `POST /leave/requests/:id/reject` | `cf_hrms_leave_edit` | scope: the person |
+| `POST /leave/requests/:id/cancel` | `cf_hrms_leave_edit` | scope: the person |
+| `GET /leave/balances` | `cf_hrms_leave_view` | narrowed to the login’s department |
+| `PUT /leave/balances` | `cf_hrms_leave_edit` | scope: the person; clearing one (opening: null) also needs cf_hrms_leave_remove |
 
 ## Code formats
 
@@ -416,6 +433,9 @@ How to read the tables below:
 | `GET /excel/actuals/workbook` | `cf_hrms_performance_view` |  |
 | `POST /excel/actuals/preview` | `cf_hrms_performance_upload` **and** `cf_hrms_performance_view` |  |
 | `POST /excel/actuals/apply` | `cf_hrms_performance_upload` **and** `cf_hrms_performance_view` |  |
+| `GET /excel/leave-balances/workbook` | `cf_hrms_leave_view` |  |
+| `POST /excel/leave-balances/preview` | `cf_hrms_leave_edit` **and** `cf_hrms_leave_view` |  |
+| `POST /excel/leave-balances/apply` | `cf_hrms_leave_edit` **and** `cf_hrms_leave_view` |  |
 
 ## Everything else
 
@@ -469,4 +489,4 @@ How to read the tables below:
 | `GET /performance/employees/:id/review-summary` | `cf_hrms_performance_view` | scope: the person |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
 
-366 routes.
+386 routes.

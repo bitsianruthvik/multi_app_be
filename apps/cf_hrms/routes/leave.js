@@ -1,8 +1,12 @@
 import { Router } from 'express';
 import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, need } from '../lib/http.js';
-import { companyWide } from '../lib/gates.js';
+import { PERM, guard, handle, ctx, intParam, need, can } from '../lib/http.js';
+import { companyWide, inEmployee } from '../lib/gates.js';
+import { peopleFilter } from '../services/accessScope.js';
+import {
+  listRequests, readRequest, previewForPerson, submitForPerson, decide, cancelByHr, balancesGrid, setOpening, employeeIdOfLogin,
+} from '../services/leave/requestService.js';
 import {
   listLeaveTypes, createLeaveType, updateLeaveType, deleteLeaveType,
   listPolicies, getPolicy, createPolicy, updatePolicy, deletePolicy, listTemplates, previewRuleSummary,
@@ -33,14 +37,30 @@ const router = Router();
  *   PUT    /leave/assignments                   { scope, locationId?, roleId?, labelId?, policyId | null }  -> { assignments }
  *   GET    /leave/policy-for                    ?positionId=  |  ?roleId=&locationId=&departmentId=  -> { effective }
  *
+ * REQUESTS AND BALANCES (spec §22.5; services/leave/). Department scope as elsewhere:
+ * lists are narrowed to the login's departments, one request or person outside them
+ * answers 403 OUT_OF_SCOPE.
+ *
+ *   GET    /leave/requests                      ?status=&leaveTypeId=&departmentId=&from=&to=&q=   -> { items: Request[], total }
+ *   GET    /leave/requests/:id                  { request, context }
+ *   POST   /leave/requests/preview              { employeeId, leaveTypeId, from, to, halfDay? }      -> Preview
+ *   POST   /leave/requests                      the same + reason, on the person's behalf (raised by HR) -> { request }
+ *   POST   /leave/requests/:id/approve          { note? }   -> { request }
+ *   POST   /leave/requests/:id/reject           { note }    -> { request }
+ *   POST   /leave/requests/:id/cancel           { note }    -> { request }   any time, with a note
+ *   GET    /leave/balances                      ?year=&departmentId=&q=  -> { year, leaveTypes, rows: [{ person, policy, year, balances }] }
+ *   PUT    /leave/balances                      { employeeId, leaveTypeId, yearKey, opening, note }  -> { balance, yearKey }
+ *                                               opening: null clears HR's number (also needs leave remove)
+ *   (Excel: GET/POST /excel/leave-balances/… — routes/excel.js; the upload needs leave edit.)
+ *   (A person's own leave and the approvals screen: /user/me/leave…, /user/me/approvals… — routes/self.js.)
+ *
  * Reads: `cf_hrms_leave_view`. Writes: `cf_hrms_leave_edit`; deletes: `cf_hrms_leave_remove`. An employee
  * login holds neither; a person reads their OWN policy on `/user/me/place`.
  *
- * STILL TO COME: balances, accrual runs, applying for leave and approvals.
- * Approving a request will write the attendance rows for the affected dates and
- * move the balance, in one transaction — that side effect is why leave is not a
- * standalone list. `/leave/status` below is the stub those screens were wired
- * to, and it still answers "nothing yet" for them.
+ * No attendance rows are written on approval: attendance is not built. A balance is
+ * computed on every read (services/leave/balance.js), so approving or cancelling moves
+ * it without writing it. `/leave/status` below is the old stub; it stays for a screen
+ * that still asks it.
  */
 router.get('/leave/status', guard(PERM.leave.view), handle(async () => ({
   section: 'leave',
@@ -90,5 +110,41 @@ router.put('/leave/assignments', guard(PERM.leave.edit, { note: 'clearing one (p
   return tx(req, (db, c) => putAssignment(db, c, req.body ?? {}, reqId(req)));
 }));
 router.get('/leave/policy-for', guard(PERM.leave.view), handle((req) => policyFor(pool, ctx(req).companyId, req.query)));
+
+// ── requests (spec §22.5) ───────────────────────────────────────────────────
+/** Who is acting: their own employee (nobody decides their own leave) and whether they hold leave edit. */
+const viewerOf = async (req) => ({ userId: ctx(req).userId, employeeId: await employeeIdOfLogin(pool, ctx(req)), hr: can(req, PERM.leave.edit) ? { all: true } : null });
+const inRequest = inEmployee('leaveRequest');
+const inBodyPerson = inEmployee('employee', (req) => req.body?.employeeId);
+
+router.get('/leave/requests', guard(PERM.leave.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+  listRequests(pool, ctx(req), req.query ?? {}, await peopleFilter(req), await viewerOf(req)))));
+// Before /leave/requests/:id, or "preview" would be read as an id.
+router.post('/leave/requests/preview', guard(PERM.leave.edit), inBodyPerson, handle((req) => previewForPerson(pool, ctx(req), req.body ?? {})));
+router.post('/leave/requests', guard(PERM.leave.edit), inBodyPerson, handle(async (req) => {
+  const viewer = await viewerOf(req);
+  return tx(req, (db, c) => submitForPerson(db, c, req.body ?? {}, viewer, reqId(req)));
+}));
+router.get('/leave/requests/:id', guard(PERM.leave.view), inRequest, handle(async (req) => readRequest(pool, ctx(req), await viewerOf(req), id(req))));
+router.post('/leave/requests/:id/approve', guard(PERM.leave.edit), inRequest, handle(async (req) => {
+  const viewer = await viewerOf(req);
+  return tx(req, (db, c) => decide(db, c, viewer, id(req), 'APPROVE', req.body ?? {}, reqId(req)));
+}));
+router.post('/leave/requests/:id/reject', guard(PERM.leave.edit), inRequest, handle(async (req) => {
+  const viewer = await viewerOf(req);
+  return tx(req, (db, c) => decide(db, c, viewer, id(req), 'REJECT', req.body ?? {}, reqId(req)));
+}));
+router.post('/leave/requests/:id/cancel', guard(PERM.leave.edit), inRequest, handle(async (req) => {
+  const viewer = await viewerOf(req);
+  return tx(req, (db, c) => cancelByHr(db, c, id(req), req.body ?? {}, viewer, reqId(req)));
+}));
+
+// ── balances: the person × type grid, and HR's opening balance ──────────────
+router.get('/leave/balances', guard(PERM.leave.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+  balancesGrid(pool, ctx(req), req.query ?? {}, await peopleFilter(req)))));
+router.put('/leave/balances', guard(PERM.leave.edit, { note: 'clearing one (opening: null) also needs cf_hrms_leave_remove' }), inBodyPerson, handle((req) => {
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'opening') && (req.body.opening === null || req.body.opening === '')) need(req, PERM.leave.remove);
+  return tx(req, (db, c) => setOpening(db, c, req.body ?? {}, reqId(req)));
+}));
 
 export default router;

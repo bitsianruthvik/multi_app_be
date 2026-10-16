@@ -11,7 +11,8 @@ import holidays from './holidays.js';
 import shifts from './shifts.js';
 import libraries from './libraries.js';
 import actuals from './actuals.js';
+import leaveBalances from './leaveBalances.js';
 
-export const ENTITIES = [departments, locations, roles, positions, employees, holidays, shifts, ...libraries, actuals];
+export const ENTITIES = [departments, locations, roles, positions, employees, holidays, shifts, ...libraries, actuals, leaveBalances];
 
 export default ENTITIES;

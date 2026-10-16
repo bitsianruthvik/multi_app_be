@@ -38,7 +38,11 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, dateParam, canSeePii, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, dateParam, canSeePii, intParam, can } from '../lib/http.js';
+import { scopeOf } from '../services/accessScope.js';
+import {
+  myLeave, previewMine, submitMine, cancelMine, myApprovals, approvalDetail, decide, employeeIdOfLogin,
+} from '../services/leave/requestService.js';
 import { myPlace } from '../services/selfService.js';
 import { myOrgChart } from '../services/selfOrgChartService.js';
 import {
@@ -169,5 +173,71 @@ router.post('/user/me/team/plans/:id/actions', guard(PERM.selfView), handle((req
 router.put('/user/me/team/actions/:id', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamChangeAction(db, c, intParam(req.params.id), req.body ?? {}))));
 router.post('/user/me/team/actions/:id/done', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCloseAction(db, c, intParam(req.params.id), 'DONE', req.body ?? {}))));
 router.post('/user/me/team/actions/:id/drop', guard(PERM.selfView), handle((req) => tx(req, (db, c) => teamCloseAction(db, c, intParam(req.params.id), 'DROPPED', req.body ?? {}))));
+
+/**
+ * LEAVE (spec §22.5). My own leave — the employee is the login's, never an id from the
+ * client; a request id in the address is only what is asked about, and another person's
+ * reads as not found.
+ *
+ *   GET  /user/me/leave?year=                 { year, policy, balances, requests, approver, calendarNote }
+ *   POST /user/me/leave/preview               { leaveTypeId, from, to, halfDay? }  -> Preview (writes nothing)
+ *   POST /user/me/leave                       the same + reason  -> { request } · 422 INVALID with problems
+ *   POST /user/me/leave/:id/cancel            { note? }  -> { request }
+ */
+const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
+router.get('/user/me/leave', guard(PERM.selfView), handle((req) => myLeave(pool, ctx(req), { year: req.query.year })));
+router.post('/user/me/leave/preview', guard(PERM.selfView), handle((req) => previewMine(pool, ctx(req), req.body ?? {})));
+router.post('/user/me/leave', guard(PERM.selfView), handle((req) => tx(req, (db, c) => submitMine(db, c, req.body ?? {}, reqId(req)))));
+router.post('/user/me/leave/:id/cancel', guard(PERM.selfView), handle((req) => tx(req, (db, c) => cancelMine(db, c, intParam(req.params.id), req.body ?? {}, reqId(req)))));
+
+/**
+ * APPROVALS — everything waiting for this login to decide, of every kind.
+ *
+ *   GET  /user/me/approvals?status=PENDING|DECIDED     { items: ApprovalItem[], counts: { pending } }
+ *   GET  /user/me/approvals/<kind>/:id                 { request, context }
+ *   POST /user/me/approvals/<kind>/:id/approve         { note? }  -> { request }
+ *   POST /user/me/approvals/<kind>/:id/reject          { note }   -> { request }
+ *
+ * Who may decide is the service's rule (the approver, anybody above them in the chain,
+ * or a login with leave edit inside its department scope; never their own). Leave edit
+ * here changes WHAT is waiting for the login, not whether the route opens: the route
+ * asks for the self view only, like every /user/me route.
+ *
+ * ONE ENTRY PER KIND. Today only `leave`. Another kind of approval adds an entry —
+ * its feed, its read and its decide — and the list, the counts and the routes follow.
+ */
+async function viewerOf(req) {
+  const c = ctx(req);
+  let hr = null;
+  if (can(req, PERM.leave.edit)) {
+    const scope = await scopeOf(req);
+    hr = scope.all ? { all: true } : { departmentIds: scope.departmentIds };
+  }
+  return { userId: c.userId, employeeId: await employeeIdOfLogin(pool, c), hr };
+}
+const APPROVAL_KINDS = {
+  leave: {
+    feed: (c, viewer, status) => myApprovals(pool, c, viewer, { status }),
+    read: (c, viewer, itemId) => approvalDetail(pool, c, viewer, itemId),
+    decide: (db, c, viewer, itemId, verdict, body, requestId) => decide(db, c, viewer, itemId, verdict, body, requestId),
+  },
+};
+router.get('/user/me/approvals', guard(PERM.selfView), handle(async (req) => {
+  const c = ctx(req);
+  const viewer = await viewerOf(req);
+  const status = String(req.query.status ?? 'PENDING').toUpperCase() === 'DECIDED' ? 'DECIDED' : 'PENDING';
+  const feeds = await Promise.all(Object.values(APPROVAL_KINDS).map((k) => k.feed(c, viewer, status)));
+  const items = feeds.flatMap((f) => f.items).sort((a, b) => (status === 'PENDING' ? String(a.submittedAt).localeCompare(String(b.submittedAt)) : 0));
+  return { items, counts: { pending: feeds.reduce((s, f) => s + f.counts.pending, 0) } };
+}));
+for (const [kind, k] of Object.entries(APPROVAL_KINDS)) {
+  router.get(`/user/me/approvals/${kind}/:id`, guard(PERM.selfView), handle(async (req) => k.read(ctx(req), await viewerOf(req), intParam(req.params.id))));
+  for (const [path, verdict] of [['approve', 'APPROVE'], ['reject', 'REJECT']]) {
+    router.post(`/user/me/approvals/${kind}/:id/${path}`, guard(PERM.selfView), handle(async (req) => {
+      const viewer = await viewerOf(req);
+      return tx(req, (db, c) => k.decide(db, c, viewer, intParam(req.params.id), verdict, req.body ?? {}, reqId(req)));
+    }));
+  }
+}
 
 export default router;

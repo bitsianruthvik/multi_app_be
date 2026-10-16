@@ -2269,6 +2269,7 @@ CREATE TABLE IF NOT EXISTS hrms_leave_balances (
   used            DECIMAL(8,2)  NOT NULL DEFAULT 0,
   adjusted        DECIMAL(8,2)  NOT NULL DEFAULT 0,
   closing_balance DECIMAL(8,2)  NOT NULL DEFAULT 0,
+  note            VARCHAR(500)  NULL,         -- why HR entered this opening (spec §22; also §23)
 
   deleted_at      DATETIME      DEFAULT NULL,
   created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
@@ -2310,6 +2311,14 @@ CREATE TABLE IF NOT EXISTS hrms_leave_requests (
   status               ENUM('DRAFT','PENDING','APPROVED','REJECTED','CANCELLED') NOT NULL DEFAULT 'DRAFT',
   approver_employee_id INT           NULL,
   approved_at          TIMESTAMP     NULL,
+  -- spec §22 (2026-10-16; also §23, for the databases that already exist):
+  half_day             ENUM('FIRST','SECOND') NULL,   -- one date only, first or second half
+  days_json            JSON          NULL,                 -- the counted days, as decided at submit
+  decision_note        TEXT          NULL,
+  decided_by           INT           NULL,                 -- the login that approved or rejected
+  decided_at           DATETIME      NULL,
+  cancel_note          TEXT          NULL,
+  raised_by_hr         TINYINT(1)    NOT NULL DEFAULT 0,
 
   deleted_at           DATETIME      DEFAULT NULL,
   created_at           TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
@@ -2326,7 +2335,8 @@ CREATE TABLE IF NOT EXISTS hrms_leave_requests (
   CONSTRAINT fk_hlvr_employee FOREIGN KEY (company_id, employee_id)          REFERENCES hrms_employees(company_id, id),
   CONSTRAINT fk_hlvr_type     FOREIGN KEY (company_id, leave_type_id)        REFERENCES hrms_leave_types(company_id, id),
   CONSTRAINT fk_hlvr_approver FOREIGN KEY (company_id, approver_employee_id) REFERENCES hrms_employees(company_id, id),
-  CONSTRAINT fk_hlvr_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+  CONSTRAINT fk_hlvr_creator  FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_hlvr_decider  FOREIGN KEY (decided_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
@@ -4144,3 +4154,79 @@ CREATE TABLE IF NOT EXISTS hrms_performance_actions (
   CONSTRAINT fk_hpfx_creator FOREIGN KEY (created_by) REFERENCES users(id),
   CONSTRAINT fk_hpfx_updater FOREIGN KEY (updated_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 23. LEAVE REQUESTS AND APPROVALS (CF_HRMS_HIRING_SPEC.md §22)          ##
+-- ############################################################################
+-- Added 2026-10-16. The two leave tables of §8b/§8c are used for the first time:
+--
+--   hrms_leave_requests   submit = PENDING (no DRAFT is used) -> APPROVED | REJECTED
+--                         | CANCELLED (APPROVED -> CANCELLED). Never deleted; every
+--                         change writes hrms_audit_log. approver_employee_id is the
+--                         person in the chair the main position reports to (vacant:
+--                         the next one up; nobody: NULL, and HR decides).
+--                         half_day       FIRST | SECOND, one date only
+--                         days_json      the counted days as decided at submit
+--                         decision_note  the approver's note (needed to reject)
+--                         decided_by/at  the login that approved or rejected, and when
+--                         cancel_note    why it was cancelled
+--                         raised_by_hr   1 when HR asked on the person's behalf
+--                         No attendance rows are written: attendance is not built.
+--   hrms_leave_balances   ONE ROW = HR's opening balance for a person, a leave type
+--                         and a leave year (period_key = the year's key, '2026' or
+--                         '2026-27'), with a note. Only opening_balance and note are
+--                         read; earned, taken, held and available are computed on read
+--                         by services/leave/balance.js and are never stored.
+--
+-- Declared in the CREATEs of §8b/§8c too (a new database); these guarded ALTERs
+-- reach the databases that already exist. One change per ALTER (TiDB, §10c).
+-- apps/cf_hrms/scripts/apply-leave-requests-schema.mjs makes exactly these changes.
+
+-- ----- 23a. hrms_leave_requests ----------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'half_day');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN half_day ENUM(''FIRST'',''SECOND'') NULL AFTER approved_at', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'days_json');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN days_json JSON NULL AFTER half_day', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'decision_note');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN decision_note TEXT NULL AFTER days_json', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'decided_by');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN decided_by INT NULL AFTER decision_note', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'decided_at');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN decided_at DATETIME NULL AFTER decided_by', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'cancel_note');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN cancel_note TEXT NULL AFTER decided_at', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND COLUMN_NAME = 'raised_by_hr');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD COLUMN raised_by_hr TINYINT(1) NOT NULL DEFAULT 0 AFTER cancel_note', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_requests' AND CONSTRAINT_NAME = 'fk_hlvr_decider');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_requests ADD CONSTRAINT fk_hlvr_decider FOREIGN KEY (decided_by) REFERENCES users(id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 23b. hrms_leave_balances.note -----------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_balances' AND COLUMN_NAME = 'note');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_balances ADD COLUMN note VARCHAR(500) NULL AFTER closing_balance', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+

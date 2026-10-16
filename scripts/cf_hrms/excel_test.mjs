@@ -311,8 +311,8 @@ try {
       && (emps.ws.dataValidations.model[`${emps.ws.getColumn(emps.col('Date of joining')).letter}2:${emps.ws.getColumn(emps.col('Date of joining')).letter}${3 + 1 + EXTRA_ROWS}`] ?? emps.ws.dataValidations.model[`${emps.ws.getColumn(emps.col('Date of joining')).letter}2`])?.type === 'date',
     'a date column holds real dates, shown as year-month-day, and its cells accept only dates');
     const list = await call(O, 'GET', '/excel/entities');
-    ok(list.status === 200 && JSON.stringify(list.json.map((e) => e.entity)) === JSON.stringify(['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts', 'library-kras', 'library-responsibilities', 'library-kpis', 'library-skills', 'library-qualifications', 'library-authorities', 'actuals'])
-      && list.json.every((e) => e.label && e.area && e.canDownload === true && e.canUpload === true), 'GET /excel/entities -> the fourteen files, [{ entity, label, area, canDownload, canUpload }]');
+    ok(list.status === 200 && JSON.stringify(list.json.map((e) => e.entity)) === JSON.stringify(['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts', 'library-kras', 'library-responsibilities', 'library-kpis', 'library-skills', 'library-qualifications', 'library-authorities', 'actuals', 'leave-balances'])
+      && list.json.every((e) => e.label && e.area && e.canDownload === true && e.canUpload === true), 'GET /excel/entities -> the fifteen files, [{ entity, label, area, canDownload, canUpload }]');
   }
 
   /* ══ 3. every entity ══════════════════════════════════════════════════════ */
@@ -334,8 +334,9 @@ try {
     'library-authorities': { query: `?q=${TAG}`, at: ['Name', `${TAG} Authority`], change: ['What the holder may do', 'May stop the line and call maintenance.'], add: () => ({ Name: `${TAG} Added authority`, 'Authority type': 'APPROVE', 'What the holder may do': 'May approve overtime.' }), read: 'What the holder may do' },
   };
   // Actuals (spec §19.3) are rows of person × KPI × slot, never added by a file: their round trip is in actuals_test.mjs.
-  const ROUND_TRIP = ENTITIES.filter((e) => e.entity !== 'actuals');
-  ok(same(Object.keys(CASES), ROUND_TRIP.map((e) => e.entity)), 'every entity the engine knows is tested here (actuals: in actuals_test.mjs)', ROUND_TRIP.map((e) => e.entity).filter((e) => !CASES[e]).join(', '));
+  // Leave balances (spec §22.5) are rows of person × leave year, never added by a file: theirs is in leave_request_test.mjs.
+  const ROUND_TRIP = ENTITIES.filter((e) => e.entity !== 'actuals' && e.entity !== 'leave-balances');
+  ok(same(Object.keys(CASES), ROUND_TRIP.map((e) => e.entity)), 'every entity the engine knows is tested here (actuals: in actuals_test.mjs; leave balances: in leave_request_test.mjs)', ROUND_TRIP.map((e) => e.entity).filter((e) => !CASES[e]).join(', '));
   const issuedOf = {};
   for (const def of ROUND_TRIP) {
     const k = CASES[def.entity];
@@ -643,12 +644,12 @@ try {
     for (const def of ENTITIES) {
       for (const [method, url] of [['GET', `/excel/${def.entity}/workbook`], ['POST', `/excel/${def.entity}/preview`], ['POST', `/excel/${def.entity}/apply`]]) {
         const employee = await call(U.DEPARTMENT_HEAD, method, url, method === 'POST' ? { fileName: 'x.xlsx', contentBase64: '' } : undefined);
-        // A Department head views org, roles, positions, employees, time: downloads those; uploads nothing.
-        const expectDownload = ['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts'].includes(def.entity) || def.entity.startsWith('library-');
+        // A Department head views org, roles, positions, employees, time, leave: downloads those; uploads nothing.
+        const expectDownload = ['departments', 'locations', 'roles', 'positions', 'employees', 'holidays', 'shifts', 'leave-balances'].includes(def.entity) || def.entity.startsWith('library-');
         if (method === 'GET' ? (employee.status === 200) !== expectDownload : employee.status !== 403) wrong.push(`${method} ${url} ${employee.status}`);
       }
     }
-    ok(wrong.length === 0, 'each of the 39 Excel routes asks for its own area: a Department head downloads what it may view, and uploads nothing (403)', wrong.join('; '));
+    ok(wrong.length === 0, 'each of the 42 Excel routes asks for its own area: a Department head downloads what it may view, and uploads nothing (403)', wrong.join('; '));
     ok((await call(null, 'GET', '/excel/positions/workbook')).status === 401 && (await call(null, 'POST', '/excel/positions/apply', {})).status === 401, 'no token: 401');
     const manager = await preview(U.HR_MANAGER, 'positions', file.json.contentBase64);
     ok(manager.status === 200 && manager.json.summary.problems === 0, 'an HR manager (upload on every area) previews the file');

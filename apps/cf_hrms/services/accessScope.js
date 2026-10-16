@@ -186,6 +186,7 @@ const EMPLOYEE_ROW = {
   identifier: 'hrms_employee_identifiers',
   employeeDocument: 'hrms_employee_documents',
   assignment: 'hrms_work_assignments',
+  leaveRequest: 'hrms_leave_requests',
 };
 const ASSIGNMENT_ROW = {
   assignmentContext: 'hrms_work_assignment_contexts',
