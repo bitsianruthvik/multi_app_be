@@ -33,6 +33,13 @@
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
  *
+ *   GET    /orders/:orderId/lines/:lineId/nesting/plate-changes  the line's plate-change gate and requests (routes/plateChanges.js)
+ *
+ * PLATE CHANGES AFTER A PO (init.sql §62, 2026-10-16). Every write here that changes a line's plates — accept,
+ * compare/accept (auto), the files / sheet save, a lot delete, the choices, the plate setting, the untracked marks
+ * when they change the plates needed — goes through plateChangeGate (`gated` below): once a purchase order covers
+ * the line it becomes a request the MD approves (`reason` required), and a request waiting on the line holds it.
+ *
  * A LOOK IS A LOOK. The GET reads what was accepted and does not re-pack:
  * re-solving on every open cost the other system a 36-second spinner, and a
  * saved plan IS the plan. /plan is the button that re-packs, and it is a POST
@@ -76,6 +83,8 @@ import { getUntracked, markUntracked, unmarkUntracked } from '../services/nestUn
 import { getCompare, startCompare, acceptCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
+// Plate changes after a purchase order (init.sql §62): every plate write below goes through the gate.
+import { plateChangeGate } from '../services/plateChangeService.js';
 // Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
 import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, startDrawing } from '../services/partDrawingService.js';
 
@@ -99,6 +108,18 @@ const write = (req, fn) => withTransaction(async (db) => {
   return fn(db, c, id);
 });
 
+/**
+ * A PLATE WRITE (init.sql §62): the same transaction as `write`, through plateChangeGate. No purchase order
+ * covers the line → the action runs exactly as before (`impact: true` adds the before / after). A PO covers it →
+ * a change request (`reason` required) and nothing is saved. A request waiting on the line → refused, in words.
+ * A preview (dryRun) is never held and never a request.
+ */
+const gated = (req, kind, body, fn) => withTransaction(async (db) => {
+  const c = { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null };
+  const id = await assertLineOnOrder(db, c.companyId, orderId(req), lineId(req));
+  return plateChangeGate(db, c, id, kind, body, (b) => fn(db, c, id, b));
+});
+
 router.get('/orders/:orderId/lines/:lineId/nesting', view,
   handle((req) => read(req, (db, companyId, id) => getNesting(db, companyId, id))));
 
@@ -115,9 +136,10 @@ router.post('/orders/:orderId/lines/:lineId/nesting/plan', view,
 
 router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
   handle(async (req) => {
-    const out = await write(req, (db, c, id) => acceptNesting(db, c, id, req.body ?? {}));
-    // The proposal is now the saved plan: the finished run has done its job.
-    await dismissRun(ctx(req).companyId, lineId(req), { accepted: true });
+    const out = await gated(req, 'accept', req.body ?? {}, (db, c, id, b) => acceptNesting(db, c, id, b));
+    // The proposal is now the saved plan: the finished run has done its job. (Not when it only became a
+    // request: the run stays until the change is decided.)
+    if (!out?.requested) await dismissRun(ctx(req).companyId, lineId(req), { accepted: true });
     return out;
   }));
 
@@ -140,10 +162,10 @@ router.get('/orders/:orderId/lines/:lineId/nesting/choices', view,
   handle((req) => read(req, (db, companyId, id) => nestingChoices(db, companyId, id))));
 
 router.put('/orders/:orderId/lines/:lineId/nesting/choices', manage,
-  handle((req) => write(req, (db, c, id) => saveNestingChoices(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'choices', req.body ?? {}, (db, c, id, b) => saveNestingChoices(db, c, id, b))));
 
 router.put('/orders/:orderId/lines/:lineId/nesting/plates', manage,
-  handle((req) => write(req, (db, c, id) => setNestPlates(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'nest_plates', req.body ?? {}, (db, c, id, b) => setNestPlates(db, c, id, b))));
 
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id));
@@ -163,7 +185,7 @@ router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (r
 // writes nothing; saving replaces every lot on the line, and a nest that does
 // not fit our rules (or a cut plate over-covered) needs `force: true`.
 router.post('/orders/:orderId/lines/:lineId/nesting/sheet', manage,
-  handle((req) => write(req, (db, c, id) => importSheet(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'sheet', req.body ?? {}, (db, c, id, b) => importSheet(db, c, id, b))));
 
 // DRAWINGS — DXF or PDF per row of the line, matched by drawing mark (a plate part's DXF is its
 // shape). A dry run reads and matches and writes nothing; saving also refreshes the line's cut
@@ -194,7 +216,7 @@ router.delete('/orders/:orderId/lines/:lineId/drawings/:drawingId', manage,
 router.get('/orders/:orderId/lines/:lineId/nesting/files', view,
   handle((req) => read(req, (db, companyId, id) => getNestFiles(db, companyId, id))));
 router.post('/orders/:orderId/lines/:lineId/nesting/files', manage,
-  handle((req) => write(req, (db, c, id) => uploadNestFiles(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'upload', req.body ?? {}, (db, c, id, b) => uploadNestFiles(db, c, id, b))));
 router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => nestFileOf(db, companyId, id, intParam(req.params.lotId, 'lotId')));
   res.setHeader('Content-Type', out.contentType);
@@ -203,7 +225,7 @@ router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(a
   res.send(out.buffer);
 }));
 router.delete('/orders/:orderId/lines/:lineId/nesting/lots/:lotId', manage,
-  handle((req) => write(req, (db, c, id) => deleteNestLot(db, c, id, intParam(req.params.lotId, 'lotId')))));
+  handle((req) => gated(req, 'delete_lot', { ...(req.body ?? {}), lotId: intParam(req.params.lotId, 'lotId') }, (db, c, id, b) => deleteNestLot(db, c, id, b.lotId))));
 
 // PLATES THE FILES USE THAT THE CATALOG DOES NOT HAVE (2026-10-14): the preview lists them
 // (`missingPlates`), this adds them — custom sizes unless told otherwise. It is asked from an order's
@@ -216,9 +238,9 @@ router.post('/orders/:orderId/lines/:lineId/nesting/plates', manage,
 router.get('/orders/:orderId/lines/:lineId/nesting/untracked', view,
   handle((req) => read(req, (db, companyId, id) => getUntracked(db, companyId, id))));
 router.post('/orders/:orderId/lines/:lineId/nesting/untracked', manage,
-  handle((req) => write(req, (db, c, id) => markUntracked(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'untracked', req.body ?? {}, (db, c, id, b) => markUntracked(db, c, id, b))));
 router.delete('/orders/:orderId/lines/:lineId/nesting/untracked', manage,
-  handle((req) => write(req, (db, c, id) => unmarkUntracked(db, c, id, { ...(req.query ?? {}), ...(req.body ?? {}) }))));
+  handle((req) => gated(req, 'untracked_undo', { ...(req.query ?? {}), ...(req.body ?? {}) }, (db, c, id, b) => unmarkUntracked(db, c, id, b))));
 
 // COMPARE the uploaded nesting with our automatic one, side by side. The GET never packs: it pulls
 // up the automatic run that already answers this demand, or says there is none (or that it is
@@ -232,7 +254,7 @@ router.post('/orders/:orderId/lines/:lineId/nesting/compare/stop', view,
 router.delete('/orders/:orderId/lines/:lineId/nesting/compare', view,
   handle((req) => read(req, (db, companyId, id) => cancelRun(companyId, id, { purpose: 'compare' }))));
 router.post('/orders/:orderId/lines/:lineId/nesting/compare/accept', manage,
-  handle((req) => write(req, (db, c, id) => acceptCompare(db, c, id, req.body ?? {}))));
+  handle((req) => gated(req, 'compare', req.body ?? {}, (db, c, id, b) => acceptCompare(db, c, id, b))));
 
 /** A file out: the buffer, its type, and a download name. */
 const sendFile = (res, out, type) => {

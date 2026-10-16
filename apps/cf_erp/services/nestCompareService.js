@@ -578,4 +578,24 @@ export async function metricsOfPlan(db, companyId, lineId, plan) {
   return nestingMetrics(nests, { facts: st.facts, sizeOf: new Map(st.ctx.cutPlates.map((cp) => [cp.id, cp.steel ?? {}])), costs });
 }
 
+/**
+ * WHAT IS SAVED ON A LINE, MEASURED by the comparison's own rule (nestingMetrics: steel, parts, waste by
+ * cause with the offcuts in it, offcuts, cut length) — for the plate-change impact sheet (§62,
+ * plateChangeService). Never packs, never resumes a run: only the saved plates are read.
+ *   costsOf(plates) → Map plateItemId → { unit, basis } | { unit: null } — the caller's price rule
+ *                     (the impact sheet prices by valuationService.plateRatesPerKg, as the order's costs do).
+ * Returns { ctx, saved, metrics, perPlate }.
+ */
+export async function measureSavedLine(db, companyId, lineId, { costsOf }) {
+  const ctx = await importContext(db, companyId, lineId);
+  const [saved, facts] = await Promise.all([savedLotsOf(db, companyId, lineId), drawingFactsOfLine(db, companyId, lineId)]);
+  const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
+  const shapes = new Map();
+  const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
+  const nests = saved.length ? await fromSavedLots(saved.map((l) => [l, l.pieces]), { cpById, shapeOf, settingRows: ctx.settingRows, plates: ctx.plates }) : [];
+  const costs = await costsOf(nests);
+  const m = await nestingMetrics(nests, { facts, sizeOf: new Map(ctx.cutPlates.map((cp) => [cp.id, cp.steel ?? {}])), costs });
+  return { ctx, saved, ...m };
+}
+
 export const _test = { plateCosts, compareState };

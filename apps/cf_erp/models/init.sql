@@ -5437,3 +5437,139 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_nest_untracked'
              AND INDEX_NAME IN ('uq_cnu_tenant', 'uq_cnu_piece')) = 2,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §62  PLATE CHANGES AFTER A PURCHASE ORDER, approved by the MD (2026-10-16) — the same text as TM/s62.sql
+-- Additive and guarded: safe to re-run. Service: services/plateChangeService.js; routes: routes/plateChanges.js
+-- and the gate in routes/nesting.js. Contract: TM/CF_ERP_NESTING_V2.md ("Plate changes after a PO").
+--
+-- User, 2026-10-16: once a purchase order covers a line (any cf_purchase_line_orders row for one of the line's
+-- requisition lines, on a PO that is not cancelled), a change to the line's plates is a CHANGE REQUEST, not a
+-- save: re-nest accept, an upload save, deleting a plate, the nesting choices, the plate setting, and marking
+-- pieces as cut from untracked offcuts when that changes what plates the line needs. The MD approves it (the
+-- permission cf_erp_plate_change_approve, below). Approval saves the change exactly as the original action would
+-- have, brings the line's requisition up to date, and hands the buyer a CHECKLIST of purchase-order changes to
+-- make by hand (no PO is edited automatically).
+--
+-- cf_plate_change_requests
+--   code            PC-000123, set from the id after the insert.
+--   kind            accept | compare | upload | sheet | delete_lot | choices | nest_plates | untracked | untracked_undo
+--                   — which nesting action it replays.
+--   status          pending  -> approved (saved; buyer checklist open) -> applied (every checklist action done)
+--                   pending  -> rejected (decision_note says why) | withdrawn (by the requester)
+--                   pending  -> stale (the line's plates or its buying changed under it — found when someone tries to
+--                               approve it; it can only be withdrawn and asked again)
+--                   A request with nothing for the buyer to do goes straight to applied when approved.
+--   base_hash       SHA-256 of the line's saved plates (lots and their pieces), its nesting choices, plate setting and
+--                   untracked marks, and its buying (PO shares and holds of its requisition lines) when it was asked.
+--                   Approval refuses when the line's hash is not this any more.
+--   proposal_json   what replays the action: { kind, body } — the request body as it was sent, less the files.
+--   impact_json     the impact sheet: before / after plates, tonnes, waste (offcuts included), cost, and what is
+--                   ordered / received / held for the line, as worked out when it was asked.
+--   checklist_json  written on approval: per material, what is on PO, the new need, and actions the buyer ticks.
+--   pending_line    the line while the request holds it (pending or stale): one such request per line at a time.
+-- cf_plate_change_files   the files an upload (or a sheet) request replays, one row a file (≤ 4 MB each, so a row
+--                         stays under TiDB's 6 MB entry limit). Raw bytes, not base64.
+-- cf_plate_change_events  requested / approved / rejected / withdrawn / stale / ticked / unticked / applied.
+CREATE TABLE IF NOT EXISTS cf_plate_change_requests (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  code            VARCHAR(40)   NULL,
+  order_id        INT           NOT NULL,
+  order_line_id   INT           NOT NULL,
+  kind            VARCHAR(20)   NOT NULL,
+  reason          VARCHAR(1000) NOT NULL,
+  status          VARCHAR(12)   NOT NULL DEFAULT 'pending',
+  base_hash       CHAR(64)      NOT NULL,
+  proposal_json   LONGTEXT      NULL,
+  impact_json     LONGTEXT      NULL,
+  checklist_json  LONGTEXT      NULL,
+  requested_by    INT           NULL,
+  requested_at    DATETIME      DEFAULT CURRENT_TIMESTAMP,
+  decided_by      INT           NULL,
+  decided_at      DATETIME      NULL,
+  decision_note   VARCHAR(1000) NULL,
+  applied_at      DATETIME      NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT           NULL,
+  updated_by      INT           NULL,
+  pending_line    INT GENERATED ALWAYS AS (IF(deleted_at IS NULL AND status IN ('pending', 'stale'), order_line_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cpcr_tenant  (company_id, id),
+  UNIQUE KEY uq_cpcr_pending (company_id, pending_line),
+  KEY idx_cpcr_line   (company_id, order_line_id, id),
+  KEY idx_cpcr_status (company_id, status, id),
+
+  CONSTRAINT fk_cpcr_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpcr_order     FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cpcr_line      FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cpcr_requester FOREIGN KEY (requested_by) REFERENCES users(id),
+  CONSTRAINT fk_cpcr_decider   FOREIGN KEY (decided_by) REFERENCES users(id),
+  CONSTRAINT fk_cpcr_creator   FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_cpcr_updater   FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS cf_plate_change_files (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  request_id      INT           NOT NULL,
+  file_no         INT           NOT NULL,
+  filename        VARCHAR(255)  NULL,
+  bytes           INT           NOT NULL DEFAULT 0,
+  content         MEDIUMBLOB    NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT           NULL,
+
+  UNIQUE KEY uq_cpcf_tenant (company_id, id),
+  UNIQUE KEY uq_cpcf_file   (company_id, request_id, file_no),
+
+  CONSTRAINT fk_cpcf_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpcf_request FOREIGN KEY (company_id, request_id) REFERENCES cf_plate_change_requests(company_id, id),
+  CONSTRAINT fk_cpcf_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS cf_plate_change_events (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  request_id      INT           NOT NULL,
+  action          VARCHAR(20)   NOT NULL,
+  note            VARCHAR(1000) NULL,
+  user_id         INT           NULL,
+  created_at      DATETIME      DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cpce_tenant (company_id, id),
+  KEY idx_cpce_request (company_id, request_id, id),
+
+  CONSTRAINT fk_cpce_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpce_request FOREIGN KEY (company_id, request_id) REFERENCES cf_plate_change_requests(company_id, id),
+  CONSTRAINT fk_cpce_user    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+-- The approve permission: a feature and its capability. Granted to every company's ADMIN role for cf_erp only —
+-- nobody else gets it by default (the user gives it to the MD's role). models/seed.sql lists it too.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve plate changes', 'cf_erp_plate_change_approve', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_plate_change_approve' AND f.deleted_at IS NULL);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_plate_change_approve' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_plate_change_approve' AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND LOWER(r.name) = 'admin' AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_plate_change_approve' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_change_requests'
+             AND COLUMN_NAME IN ('company_id', 'order_line_id', 'kind', 'reason', 'status', 'base_hash', 'proposal_json', 'impact_json', 'checklist_json', 'pending_line')) = 10
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_change_requests'
+             AND INDEX_NAME IN ('uq_cpcr_tenant', 'uq_cpcr_pending')) = 2
+      AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_plate_change_files', 'cf_plate_change_events')) = 2
+      AND (SELECT COUNT(*) FROM features_capability WHERE name = 'cf_erp_plate_change_approve' AND deleted_at IS NULL) >= 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

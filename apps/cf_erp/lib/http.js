@@ -20,6 +20,7 @@ export const PERM = {
   inventoryView: 'cf_erp_inventory_view',   // see stocking areas, stock, batches and movements
   inventory: 'cf_erp_inventory_manage',     // stocking areas, receipts, issues, transfers, counts, scrap, batches
   purchaseApprove: 'cf_erp_purchase_approve', // approve / reject purchase requests (init.sql §39); raising and RFQs use inventory manage
+  plateChangeApprove: 'cf_erp_plate_change_approve', // approve / reject plate changes on a line a PO covers (init.sql §62); admin only by default
   floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
 };
 

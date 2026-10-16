@@ -32,6 +32,8 @@ import dashboardRoutes from './dashboard.js';
 // Cut from (§48): Setup › Cutting + the section stock picker, and 1-D section nesting.
 import cuttingRoutes from './cutting.js';
 import sectionNestingRoutes from './sectionNesting.js';
+// Plate changes after a purchase order, approved by the MD (init.sql §62).
+import plateChangeRoutes from './plateChanges.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -123,5 +125,6 @@ router.use(gstRoutes);
 router.use(dashboardRoutes);
 router.use(cuttingRoutes);
 router.use(sectionNestingRoutes);
+router.use(plateChangeRoutes);
 
 export default router;
