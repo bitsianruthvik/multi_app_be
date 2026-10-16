@@ -6,6 +6,20 @@
  */
 import { PERM, words, changedKeys } from './_shared.js';
 import * as RC from '../../roleContentService.js';
+import { MEASURES, MEASURE_WORDS, BETTER, BETTER_WORDS } from '../../kpiTarget.js';
+
+/** A list whose cells show words and whose rows store a code: "Percentage" <-> PERCENTAGE. */
+const coded = (label, codes, wordOf) => ({ label, entries: codes.map((k) => ({ text: wordOf[k], key: k })) });
+/** Measured in and Which way is better (spec §24 step 2), as a person reads them. Not set = blank. */
+const WHICH_WAY_WORDS = { HIGHER_BETTER: 'Higher', LOWER_BETTER: 'Lower', EXACT: 'Exactly', TARGET_RANGE: 'Within a range' };
+const fromWords = (wordOf) => (text) => (text == null ? null : Object.keys(wordOf).find((k) => wordOf[k] === text) ?? text);
+/** Cells hold the words; the service is given the codes. */
+const CELL = {
+  kpis: {
+    measurementType: { show: (v) => MEASURE_WORDS[v] ?? null, read: fromWords(MEASURE_WORDS) },
+    direction: { show: (v) => WHICH_WAY_WORDS[v] ?? null, read: fromWords(WHICH_WAY_WORDS) },
+  },
+};
 
 const STATUS = ['ACTIVE', 'INACTIVE'];
 const text = (key, header, max, meaning, example, extra = {}) => ({ key, header, kind: 'text', max, width: max > 300 ? 60 : 28, meaning, example, ...extra });
@@ -33,13 +47,15 @@ const LIBRARIES = {
     label: 'KPIs', one: 'KPI',
     columns: [
       code, text('name', 'Name', 250, 'What is measured.', 'On-time dispatch', { required: true }), text('description', 'Description', 4000, 'What it means.', ''),
-      pick('measurementType', 'Measurement type', 'measurementType', 'What kind of number it is.', 'PERCENTAGE'), text('unit', 'Unit', 50, 'The unit it is counted in.', '%', { width: 12 }),
-      pick('direction', 'Direction', 'direction', 'Which way is better.', 'HIGHER_BETTER'), text('formulaText', 'Formula', 4000, 'How it is worked out, in words.', 'Orders dispatched on time ÷ orders due'),
+      pick('measurementType', 'Measured in', 'measurementType', 'Percentage, Number, Rupees, Time, Weight, Length, Done or not, or Date / milestone. Blank: not set (targets are read from their words).', 'Percentage', { aliases: ['Measurement type'] }),
+      text('unit', 'Unit', 50, 'Time: minutes, hours or days. Weight: kg or MT. Number: a label of your own ("cylinders"). The rest set their own.', 'minutes', { width: 12 }),
+      pick('direction', 'Which way is better', 'direction', 'Higher, Lower, Exactly, or Within a range. Blank: not set. Not used for Done or not, or a Date.', 'Higher', { aliases: ['Direction'] }),
+      text('formulaText', 'Formula', 4000, 'How it is worked out, in words.', 'Orders dispatched on time ÷ orders due'),
       text('dataSource', 'Data source', 250, 'Where the number comes from.', 'Dispatch register'), pick('defaultFrequency', 'Frequency', 'frequency', 'How often it is looked at.', 'MONTHLY'), status,
     ],
     lists: {
-      measurementType: words('Measurement type', ['NUMBER', 'PERCENTAGE', 'CURRENCY', 'DURATION', 'BOOLEAN', 'RATING', 'TEXT']),
-      direction: words('Direction', ['HIGHER_BETTER', 'LOWER_BETTER', 'TARGET_RANGE', 'NEUTRAL']),
+      measurementType: coded('Measured in', MEASURES, MEASURE_WORDS),
+      direction: coded('Which way is better', BETTER, WHICH_WAY_WORDS),
       frequency: words('Frequency', ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY', 'ON_EVENT']),
     },
     db: { code: 'code', name: 'name', description: 'description', measurementType: 'measurement_type', unit: 'unit', direction: 'direction', formulaText: 'formula_text', dataSource: 'data_source', defaultFrequency: 'default_frequency', status: 'status' },
@@ -87,7 +103,7 @@ export default Object.entries(LIBRARIES).map(([kind, lib]) => {
       const [rows] = await db.query(`SELECT * FROM ${table} WHERE company_id = ? AND deleted_at IS NULL ORDER BY name, id`, [c.companyId]);
       const current = new Map(rows.map((r) => [r.id, {
         id: r.id, seen: r.updated_at, label: `${r.code ? `${r.code} ` : ''}${r.name}`,
-        cells: Object.fromEntries(Object.entries(lib.db).map(([key, column]) => [key, clean(r[column])])),
+        cells: Object.fromEntries(Object.entries(lib.db).map(([key, column]) => [key, CELL[kind]?.[key] ? CELL[kind][key].show(clean(r[column])) : clean(r[column])])),
       }]));
       return { lists: { ...(lib.lists ?? {}), status: words('Status', STATUS) }, current };
     },
@@ -99,14 +115,14 @@ export default Object.entries(LIBRARIES).map(([kind, lib]) => {
     },
 
     async add(db, c, row) {
-      const input = Object.fromEntries(Object.keys(lib.db).filter((k) => row.values[k] != null).map((k) => [k, row.values[k]]));
+      const input = Object.fromEntries(Object.keys(lib.db).filter((k) => row.values[k] != null).map((k) => [k, CELL[kind]?.[k] ? CELL[kind][k].read(row.values[k]) : row.values[k]]));
       const made = await RC.createMasterItem(db, c, kind, input);
       return { id: made.id, code: made.code ?? null };
     },
 
     async change(db, c, row) {
       const keys = changedKeys(row);
-      const input = Object.fromEntries(Object.keys(lib.db).filter((k) => keys.has(k)).map((k) => [k, row.values[k]]));
+      const input = Object.fromEntries(Object.keys(lib.db).filter((k) => keys.has(k)).map((k) => [k, CELL[kind]?.[k] ? CELL[kind][k].read(row.values[k] ?? null) : row.values[k]]));
       await RC.updateMasterItem(db, c, kind, row.id, input);
     },
   };

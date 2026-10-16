@@ -662,9 +662,10 @@ CREATE TABLE IF NOT EXISTS hrms_kpi_definitions (
   code              VARCHAR(50)  NULL,
   name              VARCHAR(250) NOT NULL,
   description       TEXT         NULL,
-  measurement_type  ENUM('NUMBER','PERCENTAGE','CURRENCY','DURATION','BOOLEAN','RATING','TEXT') NOT NULL DEFAULT 'NUMBER',
+  measurement_type  ENUM('NUMBER','PERCENTAGE','CURRENCY','DURATION','BOOLEAN','RATING','TEXT','WEIGHT','LENGTH','DATE') NOT NULL DEFAULT 'NUMBER',
+                                                   -- "measured in" (§25); TEXT / RATING = not set
   unit              VARCHAR(50)  NULL,             -- %, minutes, kg
-  direction         ENUM('HIGHER_BETTER','LOWER_BETTER','TARGET_RANGE','NEUTRAL') NULL,
+  direction         ENUM('HIGHER_BETTER','LOWER_BETTER','TARGET_RANGE','NEUTRAL','EXACT') NULL,   -- "which way is better"; NEUTRAL / NULL = not set
   formula_text      TEXT         NULL,             -- human-readable, not evaluated
   data_source       VARCHAR(250) NULL,             -- ERP / manual / attendance
   default_frequency ENUM('DAILY','WEEKLY','MONTHLY','QUARTERLY','YEARLY','ON_EVENT') NULL,
@@ -966,6 +967,7 @@ CREATE TABLE IF NOT EXISTS hrms_role_kpi_assignments (
   role_kra_assignment_id INT           NULL,   -- grouping; same role
   target_operator        ENUM('GTE','LTE','EQ','BETWEEN','INFO') NULL,
   target_value           JSON          NULL,   -- scalar or range; see above
+  target_json            JSON          NULL,   -- the structured target (§25): { measure, unit, direction, value | min+max | date }
   weight_percent         DECIMAL(5,2)  NULL,
   frequency_override     ENUM('DAILY','WEEKLY','MONTHLY','QUARTERLY','YEARLY','ON_EVENT') NULL,
   is_mandatory           TINYINT(1)    NOT NULL DEFAULT 1,
@@ -3893,7 +3895,9 @@ CREATE TABLE IF NOT EXISTS hrms_performance_plan_kpis (
   line_key           VARCHAR(40)   NULL,                           -- the job line it came from; NULL = added on the plan
   unit               VARCHAR(30)   NULL,                           -- "%", "hours", "count", "₹"
   direction          VARCHAR(16)   NOT NULL DEFAULT 'TEXT',        -- HIGHER_BETTER | LOWER_BETTER | EXACT | TEXT
-  target_number      DECIMAL(18,4) NULL,
+  target_number      DECIMAL(18,4) NULL,                           -- a range: its lowest (§25)
+  target_max         DECIMAL(18,4) NULL,                           -- a range: its highest (§25)
+  target_date        DATE          NULL,                           -- direction DATE: done on or before (§25)
   target_text        VARCHAR(500)  NULL,
   entry_frequency    VARCHAR(20)   NULL,                           -- how often actuals are entered; NULL = the plan's
   weight_percent     DECIMAL(5,2)  NULL,                           -- within its KRA
@@ -3904,6 +3908,8 @@ CREATE TABLE IF NOT EXISTS hrms_performance_plan_kpis (
   job_unit           VARCHAR(30)   NULL,
   job_direction      VARCHAR(16)   NULL,
   job_target_number  DECIMAL(18,4) NULL,
+  job_target_max     DECIMAL(18,4) NULL,
+  job_target_date    DATE          NULL,
   job_target_text    VARCHAR(500)  NULL,                           -- the job's target as written ("95%", "Max 30 minutes")
   job_weight_percent DECIMAL(5,2)  NULL,
 
@@ -3931,9 +3937,13 @@ CREATE TABLE IF NOT EXISTS hrms_performance_target_changes (
   plan_kpi_id     INT           NOT NULL,
   effective_from  DATE          NOT NULL,
   from_number     DECIMAL(18,4) NULL,
+  from_max        DECIMAL(18,4) NULL,
+  from_date       DATE          NULL,
   from_text       VARCHAR(500)  NULL,
   from_direction  VARCHAR(16)   NULL,
   to_number       DECIMAL(18,4) NULL,
+  to_max          DECIMAL(18,4) NULL,
+  to_date         DATE          NULL,
   to_text         VARCHAR(500)  NULL,
   to_direction    VARCHAR(16)   NULL,
   reason          VARCHAR(500)  NOT NULL,
@@ -4296,3 +4306,85 @@ SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
 SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN not_with_json JSON NULL AFTER notice_tiers_json', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+
+-- ############################################################################
+-- ## 25. STRUCTURED KPI TARGETS (CF_HRMS_HIRING_SPEC.md §24 step 2)           ##
+-- ############################################################################
+-- Added 2026-10-16. All optional; a KPI without them behaves exactly as before.
+--
+--   hrms_kpi_definitions.measurement_type   "Measured in" gains WEIGHT, LENGTH and DATE (Percentage ·
+--                                           Number · Rupees = CURRENCY · Time = DURATION · Weight · Length
+--                                           · Done or not = BOOLEAN · Date / milestone). TEXT = not set.
+--   hrms_kpi_definitions.direction          "Which way is better" gains EXACT (HIGHER_BETTER · LOWER_BETTER
+--                                           · EXACT · TARGET_RANGE). NEUTRAL / NULL = not set.
+--   hrms_role_kpi_assignments.target_json   the structured target of a role line:
+--                                           { measure, unit, direction, value | min + max | date }.
+--                                           target_value keeps the TEXT (operator EQ): the display and the
+--                                           fallback every older reader uses. A position / person line keeps
+--                                           its structure in override_json.targetSpec (no column).
+--   hrms_performance_plan_kpis              target_max (a range's highest; target_number = its lowest),
+--                                           target_date (direction DATE), and the job_ twins.
+--   hrms_performance_target_changes         from_max / from_date / to_max / to_date.
+--
+-- Declared in the CREATEs above too (a new database); these guarded ALTERs reach the databases that
+-- already exist. One change per ALTER (TiDB). Appending ENUM values keeps every stored value.
+-- apps/cf_hrms/scripts/apply-kpi-targets-schema.mjs makes exactly these changes.
+
+-- ----- 25a. hrms_kpi_definitions: measured in, which way ------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_kpi_definitions' AND COLUMN_NAME = 'measurement_type' AND COLUMN_TYPE LIKE '%''DATE''%');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_kpi_definitions MODIFY COLUMN measurement_type ENUM(''NUMBER'',''PERCENTAGE'',''CURRENCY'',''DURATION'',''BOOLEAN'',''RATING'',''TEXT'',''WEIGHT'',''LENGTH'',''DATE'') NOT NULL DEFAULT ''NUMBER''', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_kpi_definitions' AND COLUMN_NAME = 'direction' AND COLUMN_TYPE LIKE '%''EXACT''%');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_kpi_definitions MODIFY COLUMN direction ENUM(''HIGHER_BETTER'',''LOWER_BETTER'',''TARGET_RANGE'',''NEUTRAL'',''EXACT'') NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 25b. hrms_role_kpi_assignments.target_json ----------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_role_kpi_assignments' AND COLUMN_NAME = 'target_json');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_role_kpi_assignments ADD COLUMN target_json JSON NULL AFTER target_value', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 25c. hrms_performance_plan_kpis -------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_plan_kpis' AND COLUMN_NAME = 'target_max');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_plan_kpis ADD COLUMN target_max DECIMAL(18,4) NULL AFTER target_number', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_plan_kpis' AND COLUMN_NAME = 'target_date');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_plan_kpis ADD COLUMN target_date DATE NULL AFTER target_max', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_plan_kpis' AND COLUMN_NAME = 'job_target_max');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_plan_kpis ADD COLUMN job_target_max DECIMAL(18,4) NULL AFTER job_target_number', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_plan_kpis' AND COLUMN_NAME = 'job_target_date');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_plan_kpis ADD COLUMN job_target_date DATE NULL AFTER job_target_max', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 25d. hrms_performance_target_changes --------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_target_changes' AND COLUMN_NAME = 'from_max');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_target_changes ADD COLUMN from_max DECIMAL(18,4) NULL AFTER from_number', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_target_changes' AND COLUMN_NAME = 'from_date');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_target_changes ADD COLUMN from_date DATE NULL AFTER from_max', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_target_changes' AND COLUMN_NAME = 'to_max');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_target_changes ADD COLUMN to_max DECIMAL(18,4) NULL AFTER to_number', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_performance_target_changes' AND COLUMN_NAME = 'to_date');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_performance_target_changes ADD COLUMN to_date DATE NULL AFTER to_max', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

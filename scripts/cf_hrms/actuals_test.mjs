@@ -451,7 +451,7 @@ try {
     const toFill = all.rows.filter((r) => !r.actual && r.canEnter);
     const eb = counting();
     const t1 = Date.now();
-    const many = await ACT.enterActuals(eb.db, hr, toFill.map((r) => (r.direction === 'TEXT' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, met: 'YES' }
+    const many = await ACT.enterActuals(eb.db, hr, toFill.map((r) => (r.direction === 'DATE' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, value: r.slotStart } : r.direction === 'TEXT' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, met: 'YES' }
       : { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, value: r.targetNumber ?? 1 })), { source: 'EXCEL' });
     note(`${many.entered} actuals written in one call: ${eb.n} queries, ${Date.now() - t1} ms locally`);
     ok(many.entered === toFill.length && eb.n === 6, `${many.entered} cells are the same ${eb.n} queries as one`);
@@ -466,7 +466,7 @@ try {
     await db.query("UPDATE hrms_performance_plans SET status = 'ACTIVE', activated_at = NOW() WHERE company_id = ? AND period_id = ? AND status = 'DRAFT'", [COMPANY, mon.period.id]);
     const mAll = await ACT.actualsGrid(db, COMPANY, { periodId: mon.period.id }, { canEnter: true });
     const mb = counting();
-    const mFill = await ACT.enterActuals(mb.db, hr, mAll.rows.filter((r) => r.canEnter).map((r) => (r.direction === 'TEXT' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, met: 'NO' }
+    const mFill = await ACT.enterActuals(mb.db, hr, mAll.rows.filter((r) => r.canEnter).map((r) => (r.direction === 'DATE' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, value: r.slotStart } : r.direction === 'TEXT' ? { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, met: 'NO' }
       : { planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart, value: r.targetNumber ?? 1 })), { source: 'EXCEL' });
     const mg = counting();
     const t2 = Date.now();

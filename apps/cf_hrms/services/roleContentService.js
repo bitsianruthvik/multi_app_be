@@ -43,6 +43,7 @@ import { inBatch } from '../lib/batch.js';
 import {
   readTakesEffect, dayBefore, inWindow, isVoid, newLineKey, longDay,
 } from './datedChange.js';
+import { readTargetInput, readTargetText, normaliseSpec, MEASURE_UNITS, MEASURE_WORDS } from './kpiTarget.js';
 
 // ---------------------------------------------------------------------------
 // Vocabularies. These mirror models/init.sql; routes/index.js /meta serves the
@@ -51,8 +52,10 @@ import {
 const STATUSES = ['ACTIVE', 'INACTIVE'];
 const ROLE_STATUSES = ['DRAFT', 'ACTIVE', 'RETIRED'];
 const RESPONSIBILITY_CLASSES = ['OWNER', 'JOINT_OWNER', 'SUPPORT', 'BACKUP', 'APPROVER', 'REVIEWER', 'GENERIC'];
-const MEASUREMENT_TYPES = ['NUMBER', 'PERCENTAGE', 'CURRENCY', 'DURATION', 'BOOLEAN', 'RATING', 'TEXT'];
-const KPI_DIRECTIONS = ['HIGHER_BETTER', 'LOWER_BETTER', 'TARGET_RANGE', 'NEUTRAL'];
+// Measured in (spec §24 step 2): TEXT = not set (the target is words); RATING is an older value.
+const MEASUREMENT_TYPES = ['NUMBER', 'PERCENTAGE', 'CURRENCY', 'DURATION', 'BOOLEAN', 'RATING', 'TEXT', 'WEIGHT', 'LENGTH', 'DATE'];
+// Which way is better: NEUTRAL / null = not set.
+const KPI_DIRECTIONS = ['HIGHER_BETTER', 'LOWER_BETTER', 'TARGET_RANGE', 'NEUTRAL', 'EXACT'];
 const FREQUENCIES = ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY', 'ON_EVENT'];
 const TARGET_OPERATORS = ['GTE', 'LTE', 'EQ', 'BETWEEN', 'INFO'];
 const SKILL_TYPES = ['TECHNICAL', 'BEHAVIOURAL', 'SYSTEM', 'MACHINE', 'OTHER'];
@@ -105,6 +108,9 @@ function readJson(value) {
     return value;
   }
 }
+
+/** A KPI definition row (or its shape) as kpiTarget.js reads it: measured in, unit, which way. */
+export const defForTarget = (d) => (d ? { measurementType: d.measurement_type ?? d.measurementType ?? null, unit: d.unit ?? null, direction: d.direction ?? null, name: d.name ?? '' } : null);
 
 function str(value, max, problems, label, { required = false } = {}) {
   const s = value === null || value === undefined ? '' : String(value).trim();
@@ -247,11 +253,27 @@ export const MASTERS = {
       if (creating || input.code !== undefined) out.code = str(input.code, 50, problems, 'Code');
       if (creating || input.name !== undefined) out.name = str(input.name, 250, problems, 'Name', { required: true });
       if (creating || input.description !== undefined) out.description = str(input.description, 4000, problems, 'Description');
+      // Measured in and which way are both optional (spec §24 step 2): not set = TEXT / null,
+      // and the KPI behaves as before — its targets are read from their words.
       if (creating || input.measurementType !== undefined) {
-        out.measurement_type = enumValue(input.measurementType ?? 'NUMBER', MEASUREMENT_TYPES, problems, 'Measurement type', { required: true });
+        out.measurement_type = input.measurementType == null || input.measurementType === ''
+          ? 'TEXT'
+          : enumValue(input.measurementType, MEASUREMENT_TYPES, problems, 'Measured in', { required: true });
       }
       if (creating || input.unit !== undefined) out.unit = str(input.unit, 50, problems, 'Unit');
-      if (creating || input.direction !== undefined) out.direction = enumValue(input.direction, KPI_DIRECTIONS, problems, 'Direction');
+      if (out.measurement_type && (creating || input.measurementType !== undefined)) {
+        // The unit follows the measure: "%" for a percentage, "₹" for rupees, one of its own for a time or a weight.
+        const units = MEASURE_UNITS[out.measurement_type];
+        if (['BOOLEAN', 'DATE'].includes(out.measurement_type)) out.unit = null;
+        else if (units && units.length === 1) out.unit = units[0];
+        else if (units && units.length > 1) {
+          const given = out.unit ?? (input.unit === undefined ? null : input.unit);
+          const hit = given ? units.find((u) => u.toLowerCase() === String(given).trim().toLowerCase()) : units[0];
+          if (!hit) problems.push(`${MEASURE_WORDS[out.measurement_type]} is counted in ${units.join(' or ')}.`);
+          out.unit = hit ?? null;
+        }
+      }
+      if (creating || input.direction !== undefined) out.direction = enumValue(input.direction, KPI_DIRECTIONS, problems, 'Which way is better');
       if (creating || input.formulaText !== undefined) out.formula_text = str(input.formulaText, 4000, problems, 'Formula');
       if (creating || input.dataSource !== undefined) out.data_source = str(input.dataSource, 250, problems, 'Data source');
       if (creating || input.defaultFrequency !== undefined) {
@@ -725,15 +747,28 @@ export const CONTENT = {
     }),
     fields: (input, problems, { creating, definition }) => {
       const out = {};
-      const wantsTarget = creating || input.targetOperator !== undefined || input.targetValue !== undefined;
-      if (creating || input.targetOperator !== undefined) out.target_operator = enumValue(input.targetOperator, TARGET_OPERATORS, problems, 'Target operator');
-      if (wantsTarget) {
-        out.target_value = validateTarget(
-          out.target_operator ?? null,
-          input.targetValue,
-          definition?.measurement_type ?? 'NUMBER',
-          problems,
-        );
+      if (input.target !== undefined) {
+        // The target as the screens send it (spec §24 step 2): { text } free text, kept as typed;
+        // or { value } / { min, max } / { date } / { done } — the text is written from the structure.
+        const t = readTargetInput(input.target, definition ? defForTarget(definition) : null, problems, { name: definition?.name ?? '' });
+        out.target_operator = t.empty ? null : t.operator;
+        out.target_value = t.text == null ? null : JSON.stringify(t.text);
+        out.target_json = t.spec ? JSON.stringify(t.spec) : null;
+      } else {
+        const wantsTarget = creating || input.targetOperator !== undefined || input.targetValue !== undefined;
+        if (creating || input.targetOperator !== undefined) out.target_operator = enumValue(input.targetOperator, TARGET_OPERATORS, problems, 'Target operator');
+        if (wantsTarget) {
+          out.target_value = validateTarget(
+            out.target_operator ?? null,
+            input.targetValue,
+            definition?.measurement_type ?? 'NUMBER',
+            problems,
+          );
+          // Words given the older way: their structure, when they read cleanly.
+          const words = out.target_operator === 'EQ' && typeof input.targetValue === 'string' ? input.targetValue : null;
+          const spec = words && definition ? normaliseSpec(readTargetText(words, { def: defForTarget(definition), name: definition.name ?? '' })) : null;
+          out.target_json = spec ? JSON.stringify(spec) : null;
+        }
       }
       if (creating || input.weightPercent !== undefined) out.weight_percent = decimal(input.weightPercent, problems, 'Weight');
       if (creating || input.frequencyOverride !== undefined) out.frequency_override = enumValue(input.frequencyOverride, FREQUENCIES, problems, 'Frequency');
@@ -743,6 +778,7 @@ export const CONTENT = {
     shape: (r) => ({
       targetOperator: r.target_operator,
       targetValue: readJson(r.target_value),
+      targetSpec: readJson(r.target_json) ?? null,
       weightPercent: r.weight_percent === null ? null : Number(r.weight_percent),
       frequencyOverride: r.frequency_override,
       frequency: r.frequency_override ?? r.def_default_frequency ?? null,
@@ -915,6 +951,11 @@ export function validateTarget(operator, value, measurementType, problems) {
   }
   if (measurementType === 'TEXT') {
     return JSON.stringify(String(value));
+  }
+  // Words are a target for any KPI (spec §24 step 2): kept as written, read into a structure when they can be.
+  if (operator === 'EQ' && typeof value === 'string' && !/^-?\d+(\.\d+)?$/.test(value.trim())) {
+    if (value.trim().length > 500) problems.push('A target is up to 500 characters.');
+    return JSON.stringify(value.trim());
   }
   const n = Number(typeof value === 'object' ? NaN : value);
   if (!Number.isFinite(n)) {
@@ -1340,7 +1381,7 @@ async function settleLater(db, c, kind, versions, on) {
 function comparable(col, value) {
   if (value === null || value === undefined || value === '') return null;
   if (col === 'weight_percent') return Number(value);
-  if (col === 'target_value' || col === 'limit_json') return JSON.stringify(readJson(value));
+  if (col === 'target_value' || col === 'limit_json' || col === 'target_json') return JSON.stringify(readJson(value));
   if (col === 'is_mandatory') return Number(value) ? 1 : 0;
   return String(value);
 }
@@ -1374,7 +1415,7 @@ export async function changeRoleLine(db, c, kind, id, changes, { on, reason = nu
   if (!k.noNotes) carried.notes = current.notes;
   for (const col of Object.keys(k.fields({}, [], { creating: true, definition }))) carried[col] = current[col];
   for (const [col, value] of Object.entries(changes)) carried[col] = value;
-  for (const col of ['target_value', 'limit_json']) {
+  for (const col of ['target_value', 'limit_json', 'target_json']) {
     if (carried[col] && typeof carried[col] === 'object') carried[col] = JSON.stringify(carried[col]);
   }
   const names = Object.keys(carried);

@@ -3,7 +3,8 @@
  * of the chosen period — the slots that have begun.
  *
  *   info      Person · Position · Department · KRA · KPI · Unit · Target · Which way · Slot · Achievement · State
- *   editable  Value (a number) · Met (Met / Not met, for a target written as words) · Note
+ *   editable  Value (a number) · Met (Met / Not met, for a target written as words) · Done on (a KPI
+ *             due by a date: the day it was done) · Note
  *             · Reason for a correction (needed when a value already entered changes)
  *
  * A row is a KPI's slot, not a record of one table: its hidden id is
@@ -79,8 +80,9 @@ export default {
         slot: r.slotName,
         achievement: r.achievement == null ? null : `${r.achievement}% · ${r.bandLabel}`,
         state: r.locked ?? (r.actual ? (r.actual.corrected ? 'Entered (corrected)' : 'Entered') : 'To enter'),
-        value: r.direction === 'TEXT' ? null : r.actual?.value ?? null,
+        value: r.direction === 'TEXT' || r.direction === 'DATE' ? null : r.actual?.value ?? null,
         met: r.direction === 'TEXT' ? MET_WORDS[r.actual?.met] ?? null : null,
+        doneOn: r.direction === 'DATE' ? r.actual?.valueText ?? null : null,
         note: r.actual?.note ?? null,
         reason: null,
       },
@@ -102,6 +104,7 @@ export default {
     { key: 'state', header: 'State', kind: 'info', width: 22, meaning: 'To enter, entered, or why the row is read only.' },
     { key: 'value', header: 'Value', kind: 'number', whole: false, min: -1000000000000, max: 1000000000000, width: 14, meaning: 'The actual, as a number in the KPI’s unit. Leave blank for a target written as words.', example: '96.5' },
     { key: 'met', header: 'Met', kind: 'list', list: 'met', width: 12, meaning: 'For a target written as words only: Met or Not met.', example: 'Met' },
+    { key: 'doneOn', header: 'Done on', kind: 'date', width: 14, meaning: 'For a KPI due by a date only: the day it was done (met when on or before the date).', example: '2026-11-28' },
     { key: 'note', header: 'Note', kind: 'text', max: 1000, width: 32, meaning: 'Anything worth knowing about this actual. Optional.', example: 'Machine down two days' },
     { key: 'reason', header: 'Reason for a correction', kind: 'text', max: 500, width: 30, newOnly: true, meaning: 'Needed when you change a value or answer that was already entered: why it is corrected.', example: 'Count re-checked at the store' },
   ],
@@ -116,20 +119,26 @@ export default {
     const r = row.current.row;
     const cells = row.current.cells;
     const isText = r.direction === 'TEXT';
+    const isDate = r.direction === 'DATE';
     const valueNow = row.values.value ?? null;
     const metNow = row.values.met ?? null;
-    if (isText && valueNow != null) row.problems.push(`Value: ${r.kpiName} has a target written as words. Choose Met or Not met instead of a number.`);
-    if (!isText && metNow != null) row.problems.push(`Met: ${r.kpiName} has a number target. Type the number in Value instead.`);
+    const doneNow = row.values.doneOn ?? null;
+    if ((isText || isDate) && valueNow != null) row.problems.push(`Value: ${r.kpiName} ${isDate ? 'is due by a date. Type the day it was done in “Done on”' : 'has a target written as words. Choose Met or Not met'} instead of a number.`);
+    if (!isText && metNow != null) row.problems.push(`Met: ${r.kpiName} ${isDate ? 'is due by a date. Type the day it was done in “Done on”' : 'has a number target. Type the number in Value'} instead.`);
+    if (!isDate && doneNow != null) row.problems.push(`Done on: ${r.kpiName} is not due by a date. ${isText ? 'Choose Met or Not met.' : 'Type the number in Value.'}`);
     if (row.problems.length) return;
-    const valueChanged = isText ? show(metNow) !== show(cells.met) : show(valueNow) !== show(cells.value);
+    const col = isText ? 'met' : isDate ? 'doneOn' : 'value';
+    const header = isText ? 'Met' : isDate ? 'Done on' : 'Value';
+    const now = row.values[col] ?? null;
+    const valueChanged = show(now) !== show(cells[col]);
     const noteChanged = show(row.values.note) !== show(cells.note);
     if (!valueChanged && !noteChanged) return;
     if (r.locked) { row.problems.push(`${r.locked} Leave this row as it was.`); return; }
-    const had = isText ? cells.met != null : cells.value != null;
-    const has = isText ? metNow != null : valueNow != null;
-    if (had && !has) { row.problems.push(`${isText ? 'Met' : 'Value'}: a value once entered is corrected, not removed. Type the right one, and say why in “Reason for a correction”.`); return; }
-    if (!had && !has) { row.problems.push(`${isText ? 'Met' : 'Value'}: a note needs the actual beside it. ${isText ? 'Choose Met or Not met.' : 'Type the value.'}`); return; }
-    if (had && valueChanged && !row.values.reason) row.problems.push(`Reason for a correction: ${r.kpiName} for ${r.slotName} already has ${isText ? `“${cells.met}”` : `the value ${cells.value}`}. Say why it is corrected.`);
+    const had = cells[col] != null;
+    const has = now != null;
+    if (had && !has) { row.problems.push(`${header}: a value once entered is corrected, not removed. Type the right one, and say why in “Reason for a correction”.`); return; }
+    if (!had && !has) { row.problems.push(`${header}: a note needs the actual beside it. ${isText ? 'Choose Met or Not met.' : isDate ? 'Type the day it was done.' : 'Type the value.'}`); return; }
+    if (had && valueChanged && !row.values.reason) row.problems.push(`Reason for a correction: ${r.kpiName} for ${r.slotName} already has ${isText ? `“${cells.met}”` : isDate ? `the day ${cells.doneOn}` : `the value ${cells.value}`}. Say why it is corrected.`);
   },
 
   // Each row is written in afterApply, all in one call to the one writer.
@@ -142,7 +151,7 @@ export default {
       const isText = r.direction === 'TEXT';
       return {
         row: row.row, planId: r.planId, kpiId: r.kpiId, slotStart: r.slotStart,
-        ...(isText ? { met: metOf(row.values.met) } : { value: row.values.value }),
+        ...(isText ? { met: metOf(row.values.met) } : r.direction === 'DATE' ? { value: row.values.doneOn } : { value: row.values.value }),
         note: row.values.note ?? '',
         reason: row.values.reason ?? null,
       };

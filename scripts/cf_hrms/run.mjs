@@ -67,8 +67,8 @@ const AREAS = {
       `${H}/scripts/verify-against-source.mjs`, `${H}/scripts/lib/orgWorkbookReader.mjs`, `${H}/scripts/lib/orgTemplateSheets.mjs`, `${H}/routes/imports.js`],
   },
   roles: {
-    suites: ['content_copy_test', 'job_history_test'],
-    paths: [`${H}/services/roleContentService.js`, `${H}/services/contentCopyService.js`, `${H}/services/jobContentService.js`,
+    suites: ['content_copy_test', 'job_history_test', 'kpi_targets_test'],
+    paths: [`${H}/services/roleContentService.js`, `${H}/services/kpiTarget.js`, `${H}/scripts/apply-kpi-targets-schema.mjs`, `${H}/scripts/structure-kpi-targets.mjs`, `${H}/services/contentCopyService.js`, `${H}/services/jobContentService.js`,
       `${H}/services/jobHistoryService.js`, `${H}/services/datedChange.js`, `${H}/routes/roles.js`, `${H}/scripts/apply-history-schema.mjs`, `${H}/scripts/kra-review.mjs`],
   },
   documents: {
@@ -104,7 +104,7 @@ const AREAS = {
       `${H}/scripts/setup-karni-exec-leave.mjs`, `${H}/services/excel/entities/leaveBalances.js`, `${H}/services/reportingResolver.js`],
   },
   performance: {
-    suites: ['performance_test', 'actuals_test', 'reviews_test'],
+    suites: ['performance_test', 'actuals_test', 'reviews_test', 'kpi_targets_test'],
     paths: [`${H}/services/performance/**`, `${H}/routes/performance.js`, `${H}/scripts/apply-performance-schema.mjs`, `${H}/scripts/apply-actuals-schema.mjs`,
       `${H}/scripts/apply-reviews-schema.mjs`, `${H}/scripts/setup-performance.mjs`, `${H}/services/excel/entities/actuals.js`],
   },

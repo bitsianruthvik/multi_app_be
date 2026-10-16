@@ -101,7 +101,7 @@ const CONTENT_TYPE = { kras: 'KRA', responsibilities: 'RESPONSIBILITY', kpis: 'K
 const COLS = {
   kras: ['weight_percent', 'is_mandatory', 'notes'],
   responsibilities: ['responsibility_class_override', 'is_mandatory', 'notes'],
-  kpis: ['target_operator', 'target_value', 'weight_percent', 'frequency_override', 'is_mandatory', 'notes'],
+  kpis: ['target_operator', 'target_value', 'target_json', 'weight_percent', 'frequency_override', 'is_mandatory', 'notes'],
   skills: ['requirement_level', 'proficiency_level', 'notes'],
   qualifications: ['requirement_level', 'notes'],
   authorities: ['limit_json', 'notes'],
@@ -436,6 +436,7 @@ function makeLine(kind, it, parentKraDefinitionId, def) {
       line.cols = {
         target_operator: it.targetOperator ?? null,
         target_value: it.targetValue === null || it.targetValue === undefined ? null : jsonText(it.targetValue),
+        target_json: it.targetSpec ? jsonText(it.targetSpec) : null,
         weight_percent: it.weightPercent ?? null,
         frequency_override: override,
         is_mandatory: mandatory(it.isMandatory),
@@ -444,6 +445,7 @@ function makeLine(kind, it, parentKraDefinitionId, def) {
       if (it.targetOperator) {
         line.overlay.targetOperator = it.targetOperator;
         if (it.targetValue !== null && it.targetValue !== undefined) line.overlay.targetValue = it.targetValue;
+        if (it.targetSpec) line.overlay.targetSpec = it.targetSpec;
       }
       if (it.weightPercent != null) line.overlay.weightPercent = it.weightPercent;
       if (override) line.overlay.frequency = override;

@@ -50,6 +50,7 @@ import {
   changeRoleLine, removeRoleLine, isoDate,
 } from './roleContentService.js';
 import { readTakesEffect, dayBefore, newLineKey, longDay, isVoid } from './datedChange.js';
+import { readTargetInput, readTargetText, normaliseSpec } from './kpiTarget.js';
 import { buildOrgChart } from './orgChartService.js';
 import { SEATS_PER_POSITION, HOLDS_SEAT_SQL } from './seatCount.js';
 
@@ -133,6 +134,11 @@ function lineOf(item, ctx) {
     line.targetValue = item.targetValue ?? null;
     line.measurementType = item.measurementType ?? null;
     line.unit = item.unit ?? null;
+    line.direction = item.direction ?? null;
+    // Spec §24 step 2: what this line stores, and the target as it applies (the library KPI's
+    // measured-in and which-way over the line's number) — null when it is words.
+    line.targetSpec = item.targetSpec ?? null;
+    line.structured = item.structured ?? null;
     line.frequency = item.frequency ?? null;
     line.detail = [item.targetText, titleCase(item.frequency)].filter(Boolean).join(' · ') || null;
   } else if (item.responsibilityClass && item.responsibilityClass !== 'GENERIC') {
@@ -425,16 +431,33 @@ function readText(value, label, problems, { required = true, max = 2000 } = {}) 
   return s;
 }
 
-/** `{ operator, value }` as the screen sends it -> the two json fields an override carries. */
-function readTarget(target, measurementType, problems) {
+/**
+ * A target as the screen sends it -> the three json fields an override carries.
+ *   { text } | { value } | { min, max } | { date } | { done: true }   (spec §24 step 2, kpiTarget.readTargetInput)
+ *   { operator, value }                                               the older form, still read
+ * `line` is the line as it reads on that day: its KPI's measured-in, unit and which way. A structured
+ * target writes its text from the structure; free text is kept as typed, its structure filled when
+ * it reads cleanly. An empty box is "no target", not a target that failed validation.
+ */
+function readTarget(target, line, problems) {
   if (target == null) return null;
-  // An empty box is "no target", not a target that failed validation.
+  const def = { measurementType: line?.measurementType ?? null, unit: line?.unit ?? null, direction: line?.direction ?? null };
+  const name = line?.name ?? '';
+  if (target.operator === undefined) {
+    const before = problems.length;
+    const t = readTargetInput(target, def, problems, { name });
+    if (problems.length > before || t.empty) return null;
+    return { targetOperator: 'EQ', targetValue: t.text, targetSpec: t.spec };
+  }
   if (!target.operator && (target.value == null || String(target.value).trim() === '')) return null;
+  const measurementType = line?.measurementType ?? null;
   const operator = String(target.operator ?? (measurementType === 'TEXT' ? 'EQ' : '')).trim().toUpperCase() || null;
   const before = problems.length;
   const stored = validateTarget(operator, target.value, measurementType ?? 'NUMBER', problems);
   if (problems.length > before) return null;
-  return { targetOperator: operator ?? 'INFO', targetValue: stored == null ? null : JSON.parse(stored) };
+  const value = stored == null ? null : JSON.parse(stored);
+  const spec = operator === 'EQ' && typeof value === 'string' ? normaliseSpec(readTargetText(value, { def, name })) : null;
+  return { targetOperator: operator ?? 'INFO', targetValue: value, targetSpec: spec };
 }
 
 const resolveFor = (db, companyId, t, on) => (t.layer === 'ASSIGNMENT'
@@ -539,7 +562,7 @@ async function layerAddLine(db, c, t, body = {}) {
   const problems = [];
   const text = readText(body.text, kind === 'KPI' ? 'The KPI' : 'The responsibility', problems);
   const reason = readText(body.reason, 'Reason', problems, { required: false, max: 2000 });
-  const target = kind === 'KPI' ? readTarget(body.target, 'TEXT', problems) : null;
+  const target = kind === 'KPI' ? readTarget(body.target, { measurementType: 'TEXT', name: text ?? '' }, problems) : null;
   assertNoProblems(problems);
 
   const { resolved, lines } = await currentLines(db, c.companyId, t, when.on);
@@ -576,7 +599,7 @@ async function layerChangeLine(db, c, t, body = {}) {
   const problems = [];
   const text = body.text === undefined ? null : readText(body.text, 'The wording', problems);
   const reason = readText(body.reason, 'Reason', problems, { required: false, max: 2000 });
-  const target = kind === 'KPI' && body.target !== undefined ? readTarget(body.target, line.measurementType, problems) : null;
+  const target = kind === 'KPI' && body.target !== undefined ? readTarget(body.target, line, problems) : null;
   assertNoProblems(problems);
 
   const rewording = text != null && !same(text, wordingOf(line.name, line.description));
@@ -621,7 +644,7 @@ async function layerChangeLine(db, c, t, body = {}) {
   // Wording. This layer gets a line of its own; the inherited line is switched off — the same line, reworded.
   const definition = await writeOwnDefinition(db, c, kind, text, line);
   const carriedTarget = kind === 'KPI'
-    ? (target ?? { targetOperator: line.targetOperator ?? 'INFO', targetValue: line.targetValue ?? null })
+    ? (target ?? { targetOperator: line.targetOperator ?? 'INFO', targetValue: line.targetValue ?? null, targetSpec: line.targetSpec ?? null })
     : {};
   if (owned) {
     const add = mine.find((o) => o.action === 'ADD');

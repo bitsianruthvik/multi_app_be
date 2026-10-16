@@ -10,6 +10,14 @@
  *   HIGHER_BETTER   actual ÷ target              (a target of 0 or less: met when actual ≥ target)
  *   LOWER_BETTER    target ÷ actual              (an actual of 0 counts as 100% when the target is ≥ 0)
  *   EXACT           100 when equal, else 0
+ *   TARGET_RANGE    inside the range (lowest ≤ actual ≤ highest) → 100. Outside, by distance,
+ *                   the same two rules as above against the nearer end:
+ *                     below the lowest   actual ÷ lowest      (as HIGHER_BETTER against the lowest)
+ *                     above the highest  highest ÷ actual     (as LOWER_BETTER against the highest)
+ *                   so 9% for a 10–12% range is 90%, and 15% is 80%. Never above 100.
+ *                   (rangeAchievement below is the one place this rule is written.)
+ *   DATE            done on or before the date → 100; done after it → 0. Not done yet →
+ *                   not counted. The actual is the day it was done (value_text, YYYY-MM-DD).
  *   TEXT            met → 100, not met → 0, no answer → not counted
  *
  * SEVERAL SLOTS make one actual, as the KPI's combine rule says:
@@ -64,6 +72,7 @@ const AVERAGE_UNIT = /%|percent|minute|min\b|mins|hour|hrs?\b|day|rate|ratio|sco
 /** The combine rule a KPI starts with, from its unit and direction. */
 export function defaultCombine(unit, direction) {
   if (String(direction ?? '').toUpperCase() === 'TEXT') return 'AVERAGE';
+  if (String(direction ?? '').toUpperCase() === 'DATE') return 'LAST';
   return unit && AVERAGE_UNIT.test(String(unit)) ? 'AVERAGE' : 'SUM';
 }
 
@@ -91,8 +100,15 @@ const SLOT_NOUN = { DAILY: 'day', WEEKLY: 'week', MONTHLY: 'month', QUARTERLY: '
  * The gap of a combined actual against the target it is held to, in words.
  * @returns { gap: number|null (positive = better than the target), gapText }
  */
-export function gapOf(direction, combined, target, unit) {
-  if (direction === 'TEXT' || combined == null || target == null || !Number.isFinite(Number(combined))) return { gap: null, gapText: null };
+export function gapOf(direction, combined, target, unit, targetMax = null) {
+  if (direction === 'TEXT' || direction === 'DATE' || combined == null || target == null || !Number.isFinite(Number(combined))) return { gap: null, gapText: null };
+  if (direction === 'TARGET_RANGE') {
+    if (targetMax == null) return { gap: null, gapText: null };
+    const c = Number(combined);
+    if (c < Number(target)) { const d = Math.round((Number(target) - c) * 100) / 100; return { gap: -d, gapText: `${diffText(d, unit)} below the range` }; }
+    if (c > Number(targetMax)) { const d = Math.round((c - Number(targetMax)) * 100) / 100; return { gap: -d, gapText: `${diffText(d, unit)} above the range` }; }
+    return { gap: 0, gapText: 'within the range' };
+  }
   const d = Math.round((Number(combined) - Number(target)) * 100) / 100;
   if (Math.abs(d) < 0.005) return { gap: 0, gapText: 'on target' };
   if (direction === 'LOWER_BETTER') return { gap: -d, gapText: `${diffText(Math.abs(d), unit)} ${d > 0 ? 'over' : 'under'}` };
@@ -114,10 +130,11 @@ const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
 const cap = (n) => Math.max(0, Math.min(CAP, n));
 const same = (a, b) => Math.abs(Number(a) - Number(b)) < 0.00005;
 
-/** Achievement of one number against one target, uncapped then capped. null when there is no target. */
-export function achievementOf(direction, actual, target) {
+/** Achievement of one number against one target (a range: `target` its lowest, `targetMax` its highest), capped. null when there is no target. */
+export function achievementOf(direction, actual, target, targetMax = null) {
   if (actual == null || !Number.isFinite(Number(actual))) return null;
   const a = Number(actual);
+  if (direction === 'TARGET_RANGE') return rangeAchievement(a, target, targetMax);
   if (direction === 'EXACT') return target == null ? null : (same(a, target) ? 100 : 0);
   if (target == null || !Number.isFinite(Number(target))) return null;
   const t = Number(target);
@@ -128,6 +145,26 @@ export function achievementOf(direction, actual, target) {
   }
   return null;
 }
+
+/**
+ * THE range rule (one place): inside → 100; below the lowest → actual ÷ lowest; above the
+ * highest → highest ÷ actual. 0 when the end it is held to is 0 or less (nothing to divide by).
+ */
+export function rangeAchievement(actual, min, max) {
+  if (actual == null || min == null || max == null) return null;
+  const a = Number(actual);
+  const lo = Number(min);
+  const hi = Number(max);
+  if (a >= lo && a <= hi) return 100;
+  if (a < lo) return lo > 0 ? Math.max(0, Math.min(100, (a / lo) * 100)) : 0;
+  return a > 0 ? Math.max(0, Math.min(100, (hi / a) * 100)) : 0;
+}
+
+const DAY_MS = 86400000;
+const isoDay = (v) => (v && /^\d{4}-\d{2}-\d{2}/.test(String(v)) ? String(v).slice(0, 10) : null);
+/** Days from a to b (b later = positive). */
+const daysBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / DAY_MS);
+const DAY_WORDS = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
 
 /** A met / not met answer as an achievement. */
 const metAchievement = (met) => (met === 'YES' ? 100 : met === 'NO' ? 0 : null);
@@ -142,6 +179,20 @@ export function kpiResult(kpi, actuals = []) {
   const rule = COMBINE_RULES.includes(kpi.combine) ? kpi.combine : defaultCombine(kpi.unit, kpi.direction);
   const slotCount = Math.max(1, Number(kpi.slotCount ?? 1));
   const sorted = [...actuals].sort((x, y) => (x.slotStart < y.slotStart ? -1 : x.slotStart > y.slotStart ? 1 : 0));
+  if (kpi.direction === 'DATE') {
+    // The latest slot that says when it was done; met when on or before the target date.
+    const done = sorted.filter((a) => isoDay(a.valueText));
+    const target = isoDay(kpi.targetDate);
+    if (!done.length || !target) return { achievement: null, combined: null, combinedTarget: target, counted: 0, slotCount, rule: 'LAST', gap: null, gapText: null, pace: null, paceNote: null };
+    const day = isoDay(done[done.length - 1].valueText);
+    const early = daysBetween(day, target);
+    const days = (n) => `${n} day${n === 1 ? '' : 's'}`;
+    return {
+      achievement: early >= 0 ? 100 : 0, combined: day, combinedTarget: target, counted: done.length, slotCount, rule: 'LAST',
+      gap: early, gapText: early === 0 ? 'done on the day' : early > 0 ? `done ${days(early)} early` : `done ${days(-early)} late`,
+      pace: null, paceNote: null, doneOn: DAY_WORDS(day),
+    };
+  }
   if (kpi.direction === 'TEXT') {
     const answered = sorted.filter((a) => a.met === 'YES' || a.met === 'NO');
     if (!answered.length) return { achievement: null, combined: null, combinedTarget: null, counted: 0, slotCount, rule, gap: null, gapText: null, pace: null, paceNote: null };
@@ -158,22 +209,25 @@ export function kpiResult(kpi, actuals = []) {
   const nums = values.map((a) => Number(a.valueNumber));
   let combined;
   let target = kpi.targetNumber == null ? null : Number(kpi.targetNumber);
+  let targetMax = kpi.direction === 'TARGET_RANGE' && kpi.targetMax != null ? Number(kpi.targetMax) : null;
   if (rule === 'SUM') {
     combined = nums.reduce((t, n) => t + n, 0);
     if (target != null && slotCount > 1) target = (target * values.length) / slotCount;
+    if (targetMax != null && slotCount > 1) targetMax = (targetMax * values.length) / slotCount;
   } else if (rule === 'LAST') combined = nums[nums.length - 1];
   else combined = nums.reduce((t, n) => t + n, 0) / nums.length;
-  const achievement = achievementOf(kpi.direction, combined, target);
-  const { gap, gapText } = gapOf(kpi.direction, combined, target, kpi.unit ?? null);
+  const achievement = achievementOf(kpi.direction, combined, target, targetMax);
+  const { gap, gapText } = gapOf(kpi.direction, combined, target, kpi.unit ?? null, targetMax);
   // Part-way through: a SUM target taken pro rata — the gap is against that, and says so.
   const partWay = rule === 'SUM' && slotCount > 1 && values.length < slotCount && target != null;
   const noun = SLOT_NOUN[String(kpi.entryFrequency ?? '').toUpperCase()] ?? 'slot';
   return {
     achievement: round1(achievement), combined: Math.round(combined * 10000) / 10000,
-    combinedTarget: target == null ? null : Math.round(target * 10000) / 10000, counted: values.length, slotCount, rule,
+    combinedTarget: target == null ? null : Math.round(target * 10000) / 10000,
+    combinedTargetMax: targetMax == null ? null : Math.round(targetMax * 10000) / 10000, counted: values.length, slotCount, rule,
     gap, gapText: partWay && gapText ? `${gap >= 0 ? 'on pace' : 'behind pace'} · ${gapText}` : gapText,
     pace: partWay ? (gap >= 0 ? 'ON_PACE' : 'BEHIND_PACE') : null,
-    paceNote: partWay ? `Target pro-rated to ${values.length} of ${slotCount} ${noun}${slotCount === 1 ? '' : 's'}: ${amountText(target, kpi.unit ?? null)}` : null,
+    paceNote: partWay ? `Target pro-rated to ${values.length} of ${slotCount} ${noun}${slotCount === 1 ? '' : 's'}: ${amountText(target, kpi.unit ?? null)}${targetMax != null ? ` – ${amountText(targetMax, kpi.unit ?? null)}` : ''}` : null,
   };
 }
 
@@ -233,4 +287,4 @@ export function scorePlan(plan, actualsByKpi, bands = DEFAULT_BANDS) {
   };
 }
 
-export default { COMBINE_RULES, COMBINE_WORDS, BANDS, BAND_WORDS, DEFAULT_BANDS, CAP, defaultCombine, achievementOf, kpiResult, bandOf, scorePlan, gapOf, amountText, resultTone, RESULT_TONES, RESULT_WORDS };
+export default { COMBINE_RULES, COMBINE_WORDS, BANDS, BAND_WORDS, DEFAULT_BANDS, CAP, defaultCombine, achievementOf, rangeAchievement, kpiResult, bandOf, scorePlan, gapOf, amountText, resultTone, RESULT_TONES, RESULT_WORDS };

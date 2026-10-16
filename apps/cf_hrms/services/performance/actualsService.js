@@ -33,7 +33,7 @@ import { dateText, today } from '../positionService.js';
 import { readSettings } from './settingsService.js';
 import { slotsOf } from './slots.js';
 import { scorePlan, kpiResult, bandOf, BAND_WORDS, COMBINE_RULES, COMBINE_WORDS, defaultCombine } from './scoring.js';
-import { planTargetText } from './targets.js';
+import { planTargetText, planTargetShort, targetOfRow } from './targets.js';
 import { filterRows, LIST_SPECS } from '../../lib/listFilters.js';
 
 export const SOURCES = ['MANUAL', 'EXCEL', 'SYSTEM', 'FORMULA'];
@@ -41,6 +41,13 @@ const iso = (v) => dateText(v);
 const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
 const clip = (s, n) => (s == null ? null : String(s).replace(/\s+/g, ' ').trim().slice(0, n) || null);
 const longDay = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+/** A YYYY-MM-DD that is a real day, or null. */
+const strictDay = (v) => {
+  const d = v instanceof Date ? dateText(v) : String(v ?? '').trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  const t = new Date(`${d}T00:00:00Z`);
+  return Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== d ? null : d;
+};
 const sameNum = (a, b) => (a == null && b == null) || (a != null && b != null && Math.abs(Number(a) - Number(b)) < 0.00005);
 
 /** The period a plan row carries (PLAN_LIST_SQL's columns, or this file's). */
@@ -49,11 +56,11 @@ export const periodOfRow = (r) => ({ id: r.period_id, name: r.period_name, frequ
 /** A plan KPI row as scoring.js reads it. */
 export const scoringKpi = (k, period) => ({
   id: Number(k.id), planKraId: k.plan_kra_id == null ? null : Number(k.plan_kra_id), weightPercent: num(k.weight_percent),
-  direction: k.direction, targetNumber: num(k.target_number), unit: k.unit ?? null,
+  direction: k.direction, targetNumber: num(k.target_number), targetMax: num(k.target_max), targetDate: iso(k.target_date) ?? null, unit: k.unit ?? null,
   combine: k.combine_rule ?? defaultCombine(k.unit, k.direction), slotCount: slotsOf(period, k.entry_frequency).length,
   entryFrequency: k.entry_frequency || period.frequency || null,
 });
-export const scoringActual = (a) => ({ slotStart: iso(a.slot_start), valueNumber: num(a.value_number), met: a.met ?? null });
+export const scoringActual = (a) => ({ slotStart: iso(a.slot_start), valueNumber: num(a.value_number), valueText: a.value_text ?? null, met: a.met ?? null });
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Loading and scoring — the one place
@@ -129,9 +136,9 @@ export function kpiActualsView(kpiRow, score, actualsByKpi) {
   return {
     combine: rule, combineLabel: COMBINE_WORDS[rule],
     slots: (score.slots.get(id) ?? []).map((s) => ({ start: s.start, end: s.end, name: s.name, open: s.open, actual: shapeActual(bySlot.get(s.start)) })),
-    combined: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null,
+    combined: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null, combinedTargetMax: r?.combinedTargetMax ?? null,
     achievement: r?.achievement ?? null, band: r?.band ?? 'NO_DATA', bandLabel: BAND_WORDS[r?.band ?? 'NO_DATA'],
-    counted: r?.counted ?? 0, slotCount: r?.slotCount ?? 1,
+    counted: r?.counted ?? 0, slotCount: r?.slotCount ?? 1, gapText: r?.gapText ?? null,
   };
 }
 
@@ -170,8 +177,8 @@ export function reviewKpiTable(period, kraRows, kpiRows, actualsByKpi, bands, sl
     return {
       kpiId: id, kraId: kra ? Number(k.plan_kra_id) : null, kraName: kra?.name ?? null, kraOrder: kra ? kra.order : kraRows.length,
       name: k.name, unit: k.unit ?? null, direction: k.direction,
-      targetNumber: num(k.target_number), targetText: k.target_text ?? null,
-      target: planTargetText({ direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit }),
+      targetNumber: num(k.target_number), targetMax: num(k.target_max), targetDate: iso(k.target_date) ?? null, targetText: k.target_text ?? null,
+      target: planTargetText(targetOfRow(k)),
       combine: rule, combineLabel: COMBINE_WORDS[rule],
       actual: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null,
       achievement: r?.achievement ?? null, band: r?.band ?? 'NO_DATA', bandLabel: BAND_WORDS[r?.band ?? 'NO_DATA'],
@@ -262,6 +269,31 @@ export async function enterActuals(db, c, entries, opts = {}) {
 
     const was = liveOf.get(key) ?? null;
     const isText = kpi.direction === 'TEXT';
+    // A KPI due by a date (spec §24 step 2): its actual is the day it was done, kept in value_text.
+    const isDate = kpi.direction === 'DATE';
+    if (isDate) {
+      if (e.met !== undefined && e.met !== null && e.met !== '') throw why('INVALID', `${where(e)}${kpi.name} is due by a date: give the day it was done, not "Met" or "Not met".`);
+      const given = e.value !== undefined ? e.value : e.valueText;
+      let day = was?.value_text ?? null;
+      if (given !== undefined) {
+        if (given === null || given === '') {
+          if (was) throw why('NO_REMOVE', `${where(e)}A day once entered is corrected, not removed: give the right day and a reason.`);
+          day = null;
+        } else {
+          day = strictDay(given);
+          if (!day) throw why('INVALID', `${where(e)}The actual for ${kpi.name} is the day it was done (YYYY-MM-DD); “${String(given).slice(0, 30)}” is not one.`);
+          if (day > on) throw why('INVALID', `${where(e)}${kpi.name} cannot have been done on ${longDay(day)}: that day has not come.`);
+        }
+      }
+      const dateNote = e.note !== undefined ? clip(e.note, 1000) : (was?.note ?? null);
+      if (!day) throw why('INVALID', `${where(e)}Give the day ${kpi.name} was done.`);
+      const sameDay = day === (was?.value_text ?? null);
+      if (was && sameDay && (dateNote ?? null) === (was.note ?? null)) { results.push({ planId: Number(plan.id), kpiId: Number(kpi.id), slotStart: slot.start, action: 'UNCHANGED', id: was.id }); continue; }
+      const dateReason = clip(e.reason, 500);
+      if (was && !sameDay && !dateReason) throw why('REASON_REQUIRED', `${where(e)}${kpi.name} for ${slot.name} already says it was done on ${longDay(was.value_text)}. Say why it is corrected.`);
+      writes.push({ plan, kpi, slot, was, value: null, met: null, valueText: day, note: dateNote, reason: was ? dateReason : null, action: was ? (sameDay ? 'NOTE' : 'CORRECTED') : 'ENTERED' });
+      continue;
+    }
     let value = was ? num(was.value_number) : null;
     let met = was?.met ?? null;
     let valueText = was?.value_text ?? null;
@@ -466,8 +498,8 @@ function buildRows(plans, parts, pick, settings, canEnter, on = today()) {
           managerPositionId: p.manager_position_id ?? null,
           kraName: k.plan_kra_id ? kraName.get(Number(k.plan_kra_id)) ?? null : null,
           kpiName: k.name, unit: k.unit ?? null, direction: k.direction,
-          targetNumber: num(k.target_number), targetText: k.target_text ?? null,
-          target: planTargetText({ direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit }),
+          targetNumber: num(k.target_number), targetMax: num(k.target_max), targetDate: iso(k.target_date) ?? null, targetText: k.target_text ?? null,
+          target: planTargetText(targetOfRow(k)), targetShort: planTargetShort(targetOfRow(k)),
           actual: shapeActual(a),
           ...slotAchievement(k, pPeriod, a, settings.bands),
           canEnter: Boolean(canEnter) && !locked,

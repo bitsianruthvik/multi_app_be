@@ -30,7 +30,7 @@ import { readSettings } from './settingsService.js';
 import {
   FREQUENCIES, FREQUENCY_LABEL, isFrequency, periodStartingOn, periodsOfYear, yearOf, yearLabel,
 } from './periods.js';
-import { DIRECTIONS, planTargetOf, planTargetText, planTargetShort, valueText } from './targets.js';
+import { DIRECTIONS, DIRECTION_WORDS, planTargetOf, planTargetText, planTargetShort, targetOfRow, valueText } from './targets.js';
 import { COMBINE_RULES, COMBINE_WORDS, defaultCombine, resultTone, RESULT_WORDS } from './scoring.js';
 import {
   loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, periodOfRow, actualHistory, reviewKpiTable,
@@ -328,8 +328,8 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
       if (t.jobTargetText != null) { if (t.parsed) parsed += 1; else asWords += 1; }
       kpiRows.push([c.companyId, planId, kraSort == null ? null : kraIdOf.get(`${planId}|${kraSort}`) ?? null,
         clip(wholeWording(item.name, item.description), 250) ?? 'KPI', item.definitionId ?? null, item.lineKey ?? null,
-        clip(t.unit, 30), t.direction, t.targetNumber, clip(t.targetText, 500), num(item.weightPercent), sort,
-        clip(t.unit, 30), t.direction, t.targetNumber, clip(t.jobTargetText, 500), num(item.weightPercent), defaultCombine(t.unit, t.direction), c.userId]);
+        clip(t.unit, 30), t.direction, t.targetNumber, t.targetMax ?? null, t.targetDate ?? null, clip(t.targetText, 500), num(item.weightPercent), sort,
+        clip(t.unit, 30), t.direction, t.targetNumber, t.targetMax ?? null, t.targetDate ?? null, clip(t.jobTargetText, 500), num(item.weightPercent), defaultCombine(t.unit, t.direction), c.userId]);
       sort += 1;
     };
     p.job.kras.forEach((k, i) => k.kpis.forEach((item) => add(item, i)));
@@ -338,9 +338,9 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
   if (kpiRows.length) {
     await db.query(
       `INSERT INTO hrms_performance_plan_kpis
-         (company_id, plan_id, plan_kra_id, name, kpi_definition_id, line_key, unit, direction, target_number, target_text, weight_percent, sort_order,
-          job_unit, job_direction, job_target_number, job_target_text, job_weight_percent, combine_rule, created_by)
-       VALUES ${kpiRows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+         (company_id, plan_id, plan_kra_id, name, kpi_definition_id, line_key, unit, direction, target_number, target_max, target_date, target_text, weight_percent, sort_order,
+          job_unit, job_direction, job_target_number, job_target_max, job_target_date, job_target_text, job_weight_percent, combine_rule, created_by)
+       VALUES ${kpiRows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
       kpiRows.flat(),
     );
   }
@@ -450,10 +450,11 @@ const MARK = { FROM_JOB: 'From the job', CHANGED: 'Changed for this period', ADD
 
 function shapeKpi(r, changes) {
   const mark = r.added_on_plan ? 'ADDED' : (r.changed_on_plan ? 'CHANGED' : 'FROM_JOB');
-  const target = { direction: r.direction, targetNumber: num(r.target_number), targetText: r.target_text ?? null, unit: r.unit ?? null };
+  const target = targetOfRow(r);
+  const jobT = targetOfRow(r, 'job_');
   const job = r.added_on_plan ? null : {
-    direction: r.job_direction, targetNumber: num(r.job_target_number), targetText: r.job_direction === 'TEXT' ? r.job_target_text : null,
-    unit: r.job_unit ?? null, weightPercent: num(r.job_weight_percent), written: r.job_target_text ?? null,
+    ...jobT, targetText: r.job_direction === 'TEXT' ? r.job_target_text : null,
+    weightPercent: num(r.job_weight_percent), written: r.job_target_text ?? null,
   };
   return {
     id: r.id,
@@ -463,8 +464,11 @@ function shapeKpi(r, changes) {
     unit: target.unit,
     direction: target.direction,
     targetNumber: target.targetNumber,
+    targetMax: target.targetMax,
+    targetDate: target.targetDate,
     targetText: target.targetText,
     target: planTargetText(target),
+    targetShort: planTargetShort(target),
     frequency: r.entry_frequency ?? null,
     weightPercent: num(r.weight_percent),
     combine: r.combine_rule ?? defaultCombine(r.unit, r.direction),
@@ -513,8 +517,8 @@ export async function readPlan(db, companyId, planId, can = {}) {
     const list = changesOf.get(Number(ch.plan_kpi_id)) ?? [];
     list.push({
       id: ch.id, effectiveFrom: iso(ch.effective_from), reason: ch.reason, by: ch.by_name ?? null, at: ch.created_at,
-      from: planTargetText({ direction: ch.from_direction, targetNumber: num(ch.from_number), targetText: ch.from_text, unit }),
-      to: planTargetText({ direction: ch.to_direction, targetNumber: num(ch.to_number), targetText: ch.to_text, unit }),
+      from: planTargetText({ direction: ch.from_direction, targetNumber: num(ch.from_number), targetMax: num(ch.from_max), targetDate: iso(ch.from_date), targetText: ch.from_text, unit }),
+      to: planTargetText({ direction: ch.to_direction, targetNumber: num(ch.to_number), targetMax: num(ch.to_max), targetDate: iso(ch.to_date), targetText: ch.to_text, unit }),
     });
     changesOf.set(Number(ch.plan_kpi_id), list);
   }
@@ -551,7 +555,7 @@ export async function readPlan(db, companyId, planId, can = {}) {
     bands: settings.bands,
     combineRules: COMBINE_RULES.map((v) => ({ value: v, label: COMBINE_WORDS[v] })),
     marks: MARK,
-    directions: DIRECTIONS.map((d) => ({ value: d, label: { HIGHER_BETTER: 'Higher is better', LOWER_BETTER: 'Lower is better', EXACT: 'Exactly', TEXT: 'Written as words' }[d] })),
+    directions: DIRECTIONS.map((d) => ({ value: d, label: DIRECTION_WORDS[d] })),
     entryFrequencies: ENTRY_FREQUENCIES,
   };
 }
@@ -669,7 +673,7 @@ export async function scorecardOf(db, companyId, employeeId, { on } = {}) {
       kpis: table.rows.map((row) => ({
         key: `kpi-${row.kpiId}`, kpiId: row.kpiId, kraKey: row.kraId ? `kra-${row.kraId}` : null,
         name: row.name, unit: row.unit, direction: row.direction,
-        target: row.target, targetShort: planTargetShort(row),
+        target: row.target, targetShort: planTargetShort(row), targetMax: row.targetMax ?? null, targetDate: row.targetDate ?? null,
         actual: row.actual, current: currentLine(row, entryOf.get(row.kpiId)),
         combine: row.combine, combineLabel: row.combineLabel, counted: row.counted, slotCount: row.slotCount,
         achievement: row.achievement, band: row.band, bandLabel: row.bandLabel,
@@ -699,8 +703,10 @@ export async function scorecardOf(db, companyId, employeeId, { on } = {}) {
     outKpis.push({
       key: `job-${item.lineKey ?? `${kraKey}-${i}`}`, kpiId: null, kraKey,
       name: wholeWording(item.name, item.description), unit: t.unit ?? null, direction: t.direction,
-      // The job's own words ("100% adoption by end of Nov'26"): what a plan would copy, as written.
-      target: t.jobTargetText ?? planTargetText(t), targetShort: t.jobTargetText ?? planTargetShort(t),
+      // The job's own words ("100% adoption by end of Nov'26"): what a plan would copy, as written;
+      // a structured target shows its value ("95%") and the reader draws the mark from the direction.
+      target: t.jobTargetText ?? planTargetText(t), targetShort: t.parsed ? planTargetShort(t) : (t.jobTargetText ?? planTargetShort(t)),
+      targetMax: t.targetMax ?? null, targetDate: t.targetDate ?? null,
       actual: null, current: null, combine: null, combineLabel: null, counted: 0, slotCount: 0, achievement: null, band: 'NO_DATA', bandLabel: 'No data',
       gap: null, gapText: null, pace: null, paceNote: null, tone: 'NO_DATA', toneLabel: RESULT_WORDS.NO_DATA,
     });
@@ -748,23 +754,43 @@ const readWeight = (v, problems, what) => {
   return Math.round(n * 100) / 100;
 };
 
-/** Target fields from a body, checked together: { direction, targetNumber, targetText, unit }. */
+/**
+ * Target fields from a body, checked together: { direction, targetNumber, targetMax, targetDate, targetText, unit }.
+ *   TARGET_RANGE  targetNumber (or targetMin) = the lowest, targetMax = the highest
+ *   DATE          targetDate (YYYY-MM-DD): met when done on or before it
+ *   TEXT          targetText
+ */
 function readTarget(body, current, problems) {
   const direction = body.direction !== undefined ? String(body.direction ?? '').toUpperCase() : current.direction;
-  if (!DIRECTIONS.includes(direction)) problems.push('Choose which way is better: higher, lower, exactly, or written as words.');
-  let targetNumber = body.targetNumber !== undefined ? body.targetNumber : current.targetNumber;
+  if (!DIRECTIONS.includes(direction)) problems.push('Choose which way is better: higher, lower, exactly, within a range, done by a date, or written as words.');
+  let targetNumber = body.targetMin !== undefined ? body.targetMin : body.targetNumber !== undefined ? body.targetNumber : current.targetNumber;
+  let targetMax = body.targetMax !== undefined ? body.targetMax : (current.targetMax ?? null);
+  let targetDate = body.targetDate !== undefined ? body.targetDate : (current.targetDate ?? null);
   let targetText = body.targetText !== undefined ? clip(body.targetText, 500) : current.targetText;
-  const unit = body.unit !== undefined ? clip(body.unit, 30) : current.unit;
+  let unit = body.unit !== undefined ? clip(body.unit, 30) : current.unit;
+  const number = (v) => (v === '' || v === null || v === undefined ? NaN : Number(v));
   if (direction === 'TEXT') {
     if (!targetText) problems.push('Write the target in words.');
-    targetNumber = null;
+    targetNumber = null; targetMax = null; targetDate = null;
+  } else if (direction === 'DATE') {
+    const d = targetDate instanceof Date ? dateText(targetDate) : String(targetDate ?? '').trim().slice(0, 10);
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? new Date(`${d}T00:00:00Z`) : null;
+    const real = Boolean(t) && !Number.isNaN(t.getTime()) && t.toISOString().slice(0, 10) === d;
+    if (!real) problems.push('Give the date it is due (YYYY-MM-DD).');
+    targetDate = real ? d : null; targetNumber = null; targetMax = null; targetText = null; unit = null;
+  } else if (direction === 'TARGET_RANGE') {
+    const lo = number(targetNumber);
+    const hi = number(targetMax);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) problems.push('A range needs its lowest and its highest value, as numbers.');
+    else if (!(hi > lo)) problems.push('The highest value of the range must be above the lowest.');
+    targetNumber = Number.isFinite(lo) ? lo : null; targetMax = Number.isFinite(hi) ? hi : null; targetDate = null; targetText = null;
   } else {
-    const n = targetNumber === '' || targetNumber === null || targetNumber === undefined ? NaN : Number(targetNumber);
+    const n = number(targetNumber);
     if (!Number.isFinite(n)) problems.push('The target is a number (or choose "written as words").');
     targetNumber = Number.isFinite(n) ? n : null;
-    targetText = null;
+    targetMax = null; targetDate = null; targetText = null;
   }
-  return { direction, targetNumber, targetText, unit };
+  return { direction, targetNumber, targetMax, targetDate, targetText, unit };
 }
 
 /** PUT …/plans/:id/kras/:kraId { weightPercent } — draft only. */
@@ -800,7 +826,7 @@ export async function addKpi(db, c, planId, body = {}) {
     if (!k) problems.push('That KRA is not on this plan.');
     else planKraId = k.id;
   }
-  const t = readTarget(body, { direction: 'HIGHER_BETTER', targetNumber: null, targetText: null, unit: null }, problems);
+  const t = readTarget(body, { direction: 'HIGHER_BETTER', targetNumber: null, targetMax: null, targetDate: null, targetText: null, unit: null }, problems);
   const frequency = body.frequency ? String(body.frequency).toUpperCase() : null;
   if (frequency && !ENTRY_FREQUENCIES.includes(frequency)) problems.push('Choose how often it is measured.');
   const weight = readWeight(body.weightPercent, problems, 'A weight');
@@ -809,9 +835,9 @@ export async function addKpi(db, c, planId, body = {}) {
   const [[s]] = await db.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM hrms_performance_plan_kpis WHERE company_id = ? AND plan_id = ?', [c.companyId, planId]);
   const [res] = await db.query(
     `INSERT INTO hrms_performance_plan_kpis
-       (company_id, plan_id, plan_kra_id, name, unit, direction, target_number, target_text, entry_frequency, weight_percent, combine_rule, sort_order, added_on_plan, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-    [c.companyId, planId, planKraId, name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, combine, Number(s.next), c.userId],
+       (company_id, plan_id, plan_kra_id, name, unit, direction, target_number, target_max, target_date, target_text, entry_frequency, weight_percent, combine_rule, sort_order, added_on_plan, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+    [c.companyId, planId, planKraId, name, t.unit, t.direction, t.targetNumber, t.targetMax, t.targetDate, t.targetText, frequency, weight, combine, Number(s.next), c.userId],
   );
   await db.query('UPDATE hrms_performance_plans SET no_kpis = 0 WHERE company_id = ? AND id = ?', [c.companyId, planId]);
   await audit(db, c, 'hrms_performance_plan_kpis', res.insertId, 'CREATE', null, { planId: Number(planId), name, ...t, frequency, weightPercent: weight, combine });
@@ -825,6 +851,7 @@ async function kpiOf(db, companyId, planId, kpiId) {
 }
 const differsFromJob = (k) => !k.added_on_plan && (
   (k.unit ?? null) !== (k.job_unit ?? null) || k.direction !== k.job_direction || !sameNum(k.target_number, k.job_target_number)
+  || !sameNum(k.target_max, k.job_target_max) || (iso(k.target_date) ?? null) !== (iso(k.job_target_date) ?? null)
   || (k.direction === 'TEXT' && (k.target_text ?? null) !== (k.job_target_text ?? null)) || !sameNum(k.weight_percent, k.job_weight_percent)
   || k.entry_frequency != null);
 
@@ -833,7 +860,7 @@ export async function changeKpi(db, c, planId, kpiId, body = {}) {
   await draftPlan(db, c.companyId, planId);
   const k = await kpiOf(db, c.companyId, planId, kpiId);
   const problems = [];
-  const t = readTarget(body, { direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit }, problems);
+  const t = readTarget(body, targetOfRow(k), problems);
   let name = k.name;
   if (body.name !== undefined && clip(body.name, 250) !== k.name) {
     if (!k.added_on_plan) problems.push('A KPI from the job keeps its wording. Add a KPI for this period instead.');
@@ -847,12 +874,12 @@ export async function changeKpi(db, c, planId, kpiId, body = {}) {
   const wasDefault = (k.combine_rule ?? defaultCombine(k.unit, k.direction)) === defaultCombine(k.unit, k.direction);
   const combine = readCombine(body, problems) ?? (wasDefault ? defaultCombine(t.unit, t.direction) : k.combine_rule);
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
-  const next = { ...k, name, unit: t.unit, direction: t.direction, target_number: t.targetNumber, target_text: t.targetText, entry_frequency: frequency, weight_percent: weight };
+  const next = { ...k, name, unit: t.unit, direction: t.direction, target_number: t.targetNumber, target_max: t.targetMax, target_date: t.targetDate, target_text: t.targetText, entry_frequency: frequency, weight_percent: weight };
   const changed = differsFromJob(next) ? 1 : 0;
   await db.query(
-    `UPDATE hrms_performance_plan_kpis SET name = ?, unit = ?, direction = ?, target_number = ?, target_text = ?, entry_frequency = ?, weight_percent = ?, combine_rule = ?, changed_on_plan = ?
+    `UPDATE hrms_performance_plan_kpis SET name = ?, unit = ?, direction = ?, target_number = ?, target_max = ?, target_date = ?, target_text = ?, entry_frequency = ?, weight_percent = ?, combine_rule = ?, changed_on_plan = ?
       WHERE company_id = ? AND id = ?`,
-    [name, t.unit, t.direction, t.targetNumber, t.targetText, frequency, weight, combine, changed, c.companyId, kpiId],
+    [name, t.unit, t.direction, t.targetNumber, t.targetMax, t.targetDate, t.targetText, frequency, weight, combine, changed, c.companyId, kpiId],
   );
   await audit(db, c, 'hrms_performance_plan_kpis', Number(kpiId), 'UPDATE',
     { name: k.name, unit: k.unit, direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, frequency: k.entry_frequency, weightPercent: num(k.weight_percent), combine: k.combine_rule },
@@ -936,7 +963,7 @@ export async function changeTarget(db, c, planId, kpiId, body = {}) {
   const problems = [];
   const reason = clip(body.reason, 500);
   if (!reason) problems.push('Say why the target changes.');
-  const t = readTarget(body, { direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit }, problems);
+  const t = readTarget(body, targetOfRow(k), problems);
   const on = body.effectiveFrom ? dateText(body.effectiveFrom) : today();
   const start = iso(r.start_date);
   const end = iso(r.end_date);
@@ -947,23 +974,25 @@ export async function changeTarget(db, c, planId, kpiId, body = {}) {
     const [[last]] = await db.query('SELECT MAX(effective_from) AS d FROM hrms_performance_target_changes WHERE company_id = ? AND plan_kpi_id = ?', [c.companyId, kpiId]);
     if (last?.d && on < iso(last.d)) problems.push(`The target was last changed from ${longDay(iso(last.d))}; a new change takes effect on that day or later.`);
   }
-  if (!problems.length && t.direction === k.direction && sameNum(t.targetNumber, k.target_number) && (t.targetText ?? null) === (k.target_text ?? null) && (t.unit ?? null) === (k.unit ?? null)) {
+  if (!problems.length && t.direction === k.direction && sameNum(t.targetNumber, k.target_number) && sameNum(t.targetMax, k.target_max)
+    && (t.targetDate ?? null) === (iso(k.target_date) ?? null) && (t.targetText ?? null) === (k.target_text ?? null) && (t.unit ?? null) === (k.unit ?? null)) {
     problems.push('That is the target it already has.');
   }
   if (problems.length) throw invalid('INVALID', problems[0], { problems });
   await db.query(
     `INSERT INTO hrms_performance_target_changes
-       (company_id, plan_id, plan_kpi_id, effective_from, from_number, from_text, from_direction, to_number, to_text, to_direction, reason, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, planId, kpiId, on, k.target_number, k.target_text, k.direction, t.targetNumber, t.targetText, t.direction, reason, c.userId],
+       (company_id, plan_id, plan_kpi_id, effective_from, from_number, from_max, from_date, from_text, from_direction, to_number, to_max, to_date, to_text, to_direction, reason, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, planId, kpiId, on, k.target_number, k.target_max ?? null, iso(k.target_date) ?? null, k.target_text, k.direction,
+      t.targetNumber, t.targetMax, t.targetDate, t.targetText, t.direction, reason, c.userId],
   );
-  const next = { ...k, unit: t.unit, direction: t.direction, target_number: t.targetNumber, target_text: t.targetText };
+  const next = { ...k, unit: t.unit, direction: t.direction, target_number: t.targetNumber, target_max: t.targetMax, target_date: t.targetDate, target_text: t.targetText };
   await db.query(
-    'UPDATE hrms_performance_plan_kpis SET unit = ?, direction = ?, target_number = ?, target_text = ?, changed_on_plan = ? WHERE company_id = ? AND id = ?',
-    [t.unit, t.direction, t.targetNumber, t.targetText, differsFromJob(next) ? 1 : 0, c.companyId, kpiId],
+    'UPDATE hrms_performance_plan_kpis SET unit = ?, direction = ?, target_number = ?, target_max = ?, target_date = ?, target_text = ?, changed_on_plan = ? WHERE company_id = ? AND id = ?',
+    [t.unit, t.direction, t.targetNumber, t.targetMax, t.targetDate, t.targetText, differsFromJob(next) ? 1 : 0, c.companyId, kpiId],
   );
   await audit(db, c, 'hrms_performance_plan_kpis', Number(kpiId), 'UPDATE',
-    { direction: k.direction, targetNumber: num(k.target_number), targetText: k.target_text, unit: k.unit },
+    targetOfRow(k),
     { ...t, effectiveFrom: on, reason, planId: Number(planId) });
   return { ok: true, effectiveFrom: on };
 }

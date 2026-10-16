@@ -71,6 +71,7 @@ import {
   getRoleContent, roleJobLayers, effectiveWhere, CONTENT as ROLE_CONTENT, isoDate,
 } from './roleContentService.js';
 import { dayBefore } from './datedChange.js';
+import { effectiveTarget } from './kpiTarget.js';
 import {
   dateText, today, blank, CONTENT_TYPES,
   listPositionOverrides, shapeOverride,
@@ -118,7 +119,7 @@ const DEF_TABLE = {
 const OVERRIDABLE = {
   KRA: ['weightPercent', 'isMandatory', 'sequence', 'notes', 'description'],
   RESPONSIBILITY: ['responsibilityClass', 'isMandatory', 'sequence', 'notes', 'description'],
-  KPI: ['targetOperator', 'targetValue', 'weightPercent', 'frequency', 'isMandatory', 'sequence', 'notes', 'description'],
+  KPI: ['targetOperator', 'targetValue', 'targetSpec', 'weightPercent', 'frequency', 'isMandatory', 'sequence', 'notes', 'description'],
 };
 
 /**
@@ -169,6 +170,9 @@ const numText = (n) => (Number.isFinite(Number(n)) ? NUMBER_FORMAT.format(Number
 export function targetText(operator, value, measurementType, unit) {
   const suffix = unit ? ` ${unit}` : (measurementType === 'PERCENTAGE' ? '%' : '');
   if (!operator || operator === 'INFO') return 'Tracked, no target set';
+  // A target written as words is its own text, whatever the KPI is measured in (spec §24 step 2):
+  // a structured line stores the text written from its structure, so this is still THE sentence.
+  if (operator === 'EQ' && typeof value === 'string' && value.trim() && !/^-?\d+(\.\d+)?$/.test(value.trim())) return value.trim();
   if (operator === 'BETWEEN') {
     const min = value?.min ?? value?.[0];
     const max = value?.max ?? value?.[1];
@@ -190,6 +194,20 @@ function limitText(limit) {
   if (limit.scope) parts.push(`for ${limit.scope}`);
   if (limit.condition) parts.push(limit.condition);
   return parts.length ? parts.join(', ') : null;
+}
+
+/**
+ * A KPI item's target: THE text (above) and `structured` — the target as kpiTarget.js reads it, the
+ * library KPI's measured-in / unit / which-way over the line's own number (spec §24 step 2). null
+ * when it is words. `targetSpec` is what the line itself stores (role row target_json, or an
+ * override's targetSpec); a line without one is read from its operator or its text.
+ */
+function setKpiTarget(item) {
+  item.targetText = targetText(item.targetOperator, item.targetValue, item.measurementType, item.unit);
+  item.structured = effectiveTarget(
+    { measurementType: item.measurementType, unit: item.unit, direction: item.direction },
+    { spec: item.targetSpec ?? null, operator: item.targetOperator, value: item.targetValue, name: item.name ?? '' },
+  );
 }
 
 /* ── the one-line rendering of a row ───────────────────────────────────────
@@ -308,6 +326,7 @@ function itemFromRoleRow(kindKey, row, parentKraDefinitionId) {
     Object.assign(item, {
       targetOperator: row.targetOperator ?? null,
       targetValue: row.targetValue ?? null,
+      targetSpec: row.targetSpec ?? null,
       frequency: row.frequency ?? null,
       measurementType: def.measurementType ?? null,
       unit: def.unit ?? null,
@@ -315,7 +334,7 @@ function itemFromRoleRow(kindKey, row, parentKraDefinitionId) {
       formulaText: def.formulaText ?? null,
       dataSource: def.dataSource ?? null,
     });
-    item.targetText = targetText(item.targetOperator, item.targetValue, item.measurementType, item.unit);
+    setKpiTarget(item);
   }
   return item;
 }
@@ -357,6 +376,7 @@ function itemFromAdd(kind, override, definition, layer, fallbackSequence) {
     Object.assign(item, {
       targetOperator: null,
       targetValue: null,
+      targetSpec: null,
       frequency: definition?.default_frequency ?? null,
       measurementType: definition?.measurement_type ?? null,
       unit: definition?.unit ?? null,
@@ -369,9 +389,7 @@ function itemFromAdd(kind, override, definition, layer, fallbackSequence) {
   // An ADD carries its own context in the same json an OVERRIDE uses, so the
   // two paths cannot disagree about what a weight or a target means.
   applyOverrideJson(item, override, layer, { record: false });
-  if (kind === 'KPI') {
-    item.targetText = targetText(item.targetOperator, item.targetValue, item.measurementType, item.unit);
-  }
+  if (kind === 'KPI') setKpiTarget(item);
   return item;
 }
 
@@ -389,6 +407,8 @@ function applyOverrideJson(item, override, layer, { record = true } = {}) {
 
   const allowed = OVERRIDABLE[item.kind] ?? [];
   const targetBefore = item.kind === 'KPI' ? item.targetText ?? null : null;
+  // A target changed the older way (operator / value, no spec) is read from what it says, not from the spec above it.
+  if (item.kind === 'KPI' && ('targetOperator' in json || 'targetValue' in json) && !('targetSpec' in json)) item.targetSpec = null;
   for (const [field, value] of Object.entries(json)) {
     if (!allowed.includes(field)) { ignoredKeys.push(field); continue; }
     const from = item[field] ?? null;
@@ -401,9 +421,7 @@ function applyOverrideJson(item, override, layer, { record = true } = {}) {
     }
   }
   if (record && override.reason && !item.reason) item.reason = override.reason;
-  if (item.kind === 'KPI') {
-    item.targetText = targetText(item.targetOperator, item.targetValue, item.measurementType, item.unit);
-  }
+  if (item.kind === 'KPI') setKpiTarget(item);
   if (record && item.overridden) {
     // This layer is now the one that last shaped the line, from this row's day.
     item.layer = wireLayer(layer);

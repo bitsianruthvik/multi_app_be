@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { PERM, guard, handle } from '../lib/http.js';
+import { targetVocabulary } from '../services/kpiTarget.js';
 
 import organisationRoutes from './organisation.js';
 import roleRoutes from './roles.js';
@@ -62,8 +63,10 @@ router.get('/meta', guard(PERM.signedIn), handle(async () => ({
   activeStatuses: ['ACTIVE', 'INACTIVE'],
 
   responsibilityClasses: ['OWNER', 'JOINT_OWNER', 'SUPPORT', 'BACKUP', 'APPROVER', 'REVIEWER', 'GENERIC'],
-  measurementTypes: ['NUMBER', 'PERCENTAGE', 'CURRENCY', 'DURATION', 'BOOLEAN', 'RATING', 'TEXT'],
-  kpiDirections: ['HIGHER_BETTER', 'LOWER_BETTER', 'TARGET_RANGE', 'NEUTRAL'],
+  measurementTypes: ['NUMBER', 'PERCENTAGE', 'CURRENCY', 'DURATION', 'BOOLEAN', 'RATING', 'TEXT', 'WEIGHT', 'LENGTH', 'DATE'],
+  kpiDirections: ['HIGHER_BETTER', 'LOWER_BETTER', 'TARGET_RANGE', 'NEUTRAL', 'EXACT'],
+  // A KPI's measured in and which way is better, in words (spec §24 step 2; services/kpiTarget.js).
+  kpiTargets: targetVocabulary(),
   frequencies: ['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY', 'ON_EVENT'],
   targetOperators: ['GTE', 'LTE', 'EQ', 'BETWEEN', 'INFO'],
   skillTypes: ['TECHNICAL', 'BEHAVIOURAL', 'SYSTEM', 'MACHINE', 'OTHER'],
