@@ -5775,3 +5775,219 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
                OR (TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'supply')
                OR (TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'supplied_by_customer'))) = 4,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §67  INVENTORY v2 (2026-10-16): scrap and kerf, owner on the ledger, one record per piece — the same text as TM/s67.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_WIP_LEDGER_PLAN.md "2026-10-16 — Inventory v2".
+--
+-- The user's rules, 2026-10-16:
+--   * Tracking follows each item's own setting: quantity = a running total; batch = lots; individual = a record
+--     PER PIECE (cf_stock_units). Never add tracking an item does not ask for.
+--   * KERF is burnt — a loss on the cut, never scrap stock (cf_stock_losses kind 'kerf').
+--     OFFCUT = a reusable leftover meeting the shop minimum (the existing offcut rule).
+--     SCRAP  = physical, non-reusable leftover: plate skeleton, strips, small bits, rejected parts — real stock,
+--              weighable and sellable, held as the quantity item "Steel scrap (kg)" in a SCRAP area.
+--     Plate weight = parts + offcuts + kerf + scrap.
+--   * A customer's material: its offcuts AND scrap stay theirs (owner on the lot) and go back to them.
+--   * Our scrap's value is not decided: cf_company_settings.scrap_rate_per_kg; NULL = scrap valued at 0.
+--
+-- cf_stocking_areas.purpose     + 'scrap': where scrap stock lies. Made on first need (code SCRAP), like PROD-WIP.
+--                               Never usable material: every reader of usable stock asks for storage / wip.
+-- cf_company_settings.scrap_rate_per_kg   ₹ per kg our scrap is worth. NULL = not set (scrap valued at 0).
+-- cf_stock_ledger.owner_party_id          the lot's owner, copied onto every row (NULL = ours) so "stock by
+--                               customer" and ledger reports never join the batches. Filled by every writer;
+--                               rows written before §67 are backfilled below from their batch.
+-- cf_production_steps.ledger_scrap   scrapped pieces of the step the ledger has taken out of WIP into scrap.
+-- cf_production_steps.ledger_remade  scrapped pieces made again that the ledger has put back into WIP.
+-- cf_plate_lots.cut_movement_id      the transform that cut this plate (NULL = not cut, or the cut undone).
+-- cf_stock_losses      value that leaves stock without becoming stock: kerf (burnt), the write-down of scrap
+--                      to its scrap rate, and (negative) pieces made again whose material is not recorded.
+--                      For every production movement: SUM(ledger value) + SUM(loss value) = 0.
+-- cf_stock_units       one row per physical piece of an item tracked 'individual' (a lot of a tracker node holds
+--                      `quantity` pieces): its lot, its piece code from the lock, where it is and its status
+--                      (in_process / finished / joined (inside parent_unit_id) / split / dispatched / scrapped /
+--                      returned). Live units of a lot in an area = that lot's balance there (GET /stock/check).
+-- cf_stock_unit_events one row per change of a unit, naming the movement — the piece's history.
+-- ============================================================================
+
+-- 1. A SCRAP area purpose.
+SET @t = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'purpose');
+SET @sql = IF(@t IS NOT NULL AND @t NOT LIKE '%''scrap''%',
+  "ALTER TABLE cf_stocking_areas MODIFY COLUMN purpose ENUM('storage','wip','quarantine','dispatch','scrap') NOT NULL DEFAULT 'storage'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 2. The scrap rate.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'scrap_rate_per_kg');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN scrap_rate_per_kg DECIMAL(12,2) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 3. The owner on every ledger row (column, then its index, then the backfill — three statements).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'owner_party_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_ledger ADD COLUMN owner_party_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND INDEX_NAME = 'idx_csl_owner');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_ledger ADD INDEX idx_csl_owner (company_id, owner_party_id, item_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Backfill: one set-based statement; only rows still empty whose lot has an owner (re-running changes nothing).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'owner_party_id');
+SET @sql = IF(@col = 1,
+  'UPDATE cf_stock_ledger l JOIN cf_stock_batches b ON b.company_id = l.company_id AND b.id = l.batch_id
+      SET l.owner_party_id = b.owner_party_id
+    WHERE l.batch_id IS NOT NULL AND l.owner_party_id IS NULL AND b.owner_party_id IS NOT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 4. What a step's scrap has done in the ledger.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'ledger_scrap');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN ledger_scrap DECIMAL(18,6) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'ledger_remade');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN ledger_remade DECIMAL(18,6) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 5. Which plates are cut.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'cut_movement_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_plate_lots ADD COLUMN cut_movement_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- 6. Losses: value out of stock that does not become stock.
+CREATE TABLE IF NOT EXISTS cf_stock_losses (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  movement_id     INT           NOT NULL,
+  kind            VARCHAR(20)   NOT NULL,          -- kerf | scrap_writedown | remake
+  item_id         INT           NOT NULL,          -- what it was lost from (the plate, the part)
+  batch_id        INT           NULL,
+  owner_party_id  INT           NULL,              -- NULL = ours
+  order_id        INT           NULL,
+  order_line_id   INT           NULL,
+  plate_lot_id    INT           NULL,
+  kg              DECIMAL(14,3) NULL,
+  value           DECIMAL(18,2) NULL,              -- NULL = not costed (signed like the loss: + = lost)
+  currency        CHAR(3)       NOT NULL DEFAULT 'INR',
+  notes           VARCHAR(255)  NULL,
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT           NULL,
+  UNIQUE KEY uq_cslo_tenant (company_id, id),
+  KEY idx_cslo_movement (company_id, movement_id),
+  KEY idx_cslo_order (company_id, order_id),
+  KEY idx_cslo_owner (company_id, owner_party_id),
+  KEY idx_cslo_lot (company_id, plate_lot_id),
+  CONSTRAINT fk_cslo_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cslo_movement FOREIGN KEY (company_id, movement_id) REFERENCES cf_stock_movements(company_id, id),
+  CONSTRAINT fk_cslo_item     FOREIGN KEY (company_id, item_id) REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_cslo_batch    FOREIGN KEY (company_id, batch_id) REFERENCES cf_stock_batches(company_id, id),
+  CONSTRAINT fk_cslo_owner    FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cslo_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- 7. One record per piece of an item tracked 'individual'.
+CREATE TABLE IF NOT EXISTS cf_stock_units (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  item_id            INT           NOT NULL,
+  batch_id           INT           NOT NULL,       -- the lot it belongs to (a tracker node's lot)
+  production_item_id INT           NULL,
+  order_piece_id     INT           NULL,
+  piece_code         VARCHAR(150)  NULL,           -- the code the lock gave the piece (the node's)
+  serial             INT           NOT NULL,       -- 1.. within its lot
+  unit_code          VARCHAR(170)  NULL,           -- piece_code, or piece_code#n for a piece of a group
+  stocking_area_id   INT           NULL,           -- where it lies; NULL once inside a parent or gone
+  status             VARCHAR(16)   NOT NULL DEFAULT 'in_process',
+  owner_party_id     INT           NULL,
+  parent_unit_id     INT           NULL,           -- the piece it is inside (status 'joined')
+  replaces_unit_id   INT           NULL,           -- made again in place of a scrapped piece
+  last_movement_id   INT           NULL,
+  deleted_at         DATETIME      DEFAULT NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT           NULL,
+  UNIQUE KEY uq_csu_tenant (company_id, id),
+  UNIQUE KEY uq_csu_serial (company_id, batch_id, serial),
+  KEY idx_csu_item (company_id, item_id, status),
+  KEY idx_csu_area (company_id, stocking_area_id, status),
+  KEY idx_csu_parent (company_id, parent_unit_id),
+  KEY idx_csu_node (company_id, production_item_id),
+  CONSTRAINT fk_csu_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_csu_item    FOREIGN KEY (company_id, item_id) REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_csu_batch   FOREIGN KEY (company_id, batch_id) REFERENCES cf_stock_batches(company_id, id),
+  CONSTRAINT fk_csu_area    FOREIGN KEY (company_id, stocking_area_id) REFERENCES cf_stocking_areas(company_id, id),
+  CONSTRAINT fk_csu_owner   FOREIGN KEY (company_id, owner_party_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_csu_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_stock_unit_events (
+  id              INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT          NOT NULL,
+  unit_id         INT          NOT NULL,
+  movement_id     INT          NULL,
+  event           VARCHAR(16)  NOT NULL,           -- made | moved | joined | split | finished | dispatched | scrapped | returned | back
+  from_area_id    INT          NULL,
+  to_area_id      INT          NULL,
+  parent_unit_id  INT          NULL,
+  note            VARCHAR(255) NULL,
+  created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT          NULL,
+  UNIQUE KEY uq_csue_tenant (company_id, id),
+  KEY idx_csue_unit (company_id, unit_id, id),
+  KEY idx_csue_movement (company_id, movement_id),
+  CONSTRAINT fk_csue_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_csue_unit    FOREIGN KEY (company_id, unit_id) REFERENCES cf_stock_units(company_id, id),
+  CONSTRAINT fk_csue_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- 8. Units for the pieces already standing in stock (lots of 'individual' items made by production that have
+--    no unit yet): one row per whole piece, numbered within the lot. Set-based; a lot that has units is left alone.
+INSERT INTO cf_stock_units (company_id, item_id, batch_id, production_item_id, order_piece_id, piece_code, serial, unit_code,
+                            stocking_area_id, status, owner_party_id)
+SELECT x.company_id, x.item_id, x.batch_id, x.production_item_id, x.order_piece_id, x.piece_code, x.serial,
+       IF(x.node_qty > 1, CONCAT(COALESCE(x.piece_code, x.batch_code), '#', x.serial), COALESCE(x.piece_code, x.batch_code)),
+       x.stocking_area_id,
+       CASE x.purpose WHEN 'wip' THEN 'in_process' WHEN 'scrap' THEN 'scrapped' ELSE 'finished' END,
+       x.owner_party_id
+  FROM (SELECT k.company_id, k.item_id, k.batch_id, b.production_item_id, pi.order_piece_id, pi.code AS piece_code, b.code AS batch_code,
+               pi.quantity AS node_qty, k.stocking_area_id, a.purpose, b.owner_party_id,
+               ROW_NUMBER() OVER (PARTITION BY k.batch_id ORDER BY k.stocking_area_id, n.n) AS serial
+          FROM cf_stock_balances k
+          JOIN cf_stock_batches b ON b.company_id = k.company_id AND b.id = k.batch_id AND b.production_item_id IS NOT NULL AND b.deleted_at IS NULL
+          JOIN cf_item_details i ON i.company_id = k.company_id AND i.master_id = k.item_id AND i.tracked_by = 'individual'
+          JOIN cf_stocking_areas a ON a.id = k.stocking_area_id
+          LEFT JOIN cf_production_items pi ON pi.id = b.production_item_id
+          JOIN (SELECT d1.d + 10 * d2.d + 100 * d3.d + 1000 * d4.d + 1 AS n
+                  FROM (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d1
+                  CROSS JOIN (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d2
+                  CROSS JOIN (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d3
+                  CROSS JOIN (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d4) n
+            ON n.n <= FLOOR(k.quantity + 0.000001)
+         WHERE k.quantity >= 1
+           AND NOT EXISTS (SELECT 1 FROM cf_stock_units u WHERE u.company_id = k.company_id AND u.batch_id = k.batch_id)) x;
+
+INSERT INTO cf_stock_unit_events (company_id, unit_id, event, to_area_id, note)
+SELECT u.company_id, u.id, 'made', u.stocking_area_id, 'Recorded when per-piece tracking began (§67)'
+  FROM cf_stock_units u
+ WHERE NOT EXISTS (SELECT 1 FROM cf_stock_unit_events e WHERE e.company_id = u.company_id AND e.unit_id = u.id);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'scrap_rate_per_kg')
+               OR (TABLE_NAME = 'cf_stock_ledger' AND COLUMN_NAME = 'owner_party_id')
+               OR (TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME IN ('ledger_scrap', 'ledger_remade'))
+               OR (TABLE_NAME = 'cf_plate_lots' AND COLUMN_NAME = 'cut_movement_id')
+               OR (TABLE_NAME = 'cf_stock_losses' AND COLUMN_NAME IN ('movement_id', 'kind', 'kg', 'value'))
+               OR (TABLE_NAME = 'cf_stock_units' AND COLUMN_NAME IN ('batch_id', 'serial', 'status', 'parent_unit_id'))
+               OR (TABLE_NAME = 'cf_stock_unit_events' AND COLUMN_NAME IN ('unit_id', 'event')))) = 15
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'purpose' AND COLUMN_TYPE LIKE '%''scrap''%') = 1
+      AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_stock_ledger' AND INDEX_NAME = 'idx_csl_owner') > 0,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

@@ -7,7 +7,14 @@
  *   PUT    /stocking-areas/:id
  *   DELETE /stocking-areas/:id              only if it never held stock
  *   GET    /stock?areaId=&itemId=&batchId=&purpose=&search=&includeZero=1
- *   GET    /stock/check                     balances against the ledger
+ *   GET    /stock/check                     balances against the ledger (and pieces against their lots, §67)
+ *   GET    /stock/view                      the Stock screen: groups by tracking mode, chips, totals by owner (§67)
+ *   GET    /stock/view/lots                 the lots of one Stock row
+ *   GET    /stock/units                     pieces of individual items (paged=1)
+ *   GET    /stock/units/:id                 one piece and its history
+ *   GET    /stock/losses?orderId=&owner=    kerf, scrap write-downs, pieces made again
+ *   GET    /stock/scrap-rate                { ratePerKg | null, note }
+ *   PUT    /stock/scrap-rate                { ratePerKg } (blank = not set)
  *   GET    /items/:id/stock                 one item: totals, areas, batches, latest movements
  *   GET    /items/:id/batch-template        what a new batch of it must record
  *   GET    /batches?itemId=&status=&search=&inStock=1
@@ -27,6 +34,10 @@ import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { listAreas, createArea, updateArea, deleteArea } from '../services/stockingAreaService.js';
 // The production ledger (§45): work in progress by level, and offcut pieces with their outlines.
 import { wipStock, listOffcuts } from '../services/wipStockService.js';
+// Inventory v2 (§67): the Stock screen, pieces, losses and the scrap rate.
+import { stockView, stockViewLots } from '../services/stockViewService.js';
+import { listUnits, unitHistory } from '../services/unitService.js';
+import { scrapRate, setScrapRate, listLosses } from '../services/scrapService.js';
 import {
   listBatches, getBatch, updateBatch, setBatchStatus, setBatchValues, getBatchHistory, batchTemplate,
 } from '../services/batchService.js';
@@ -50,6 +61,13 @@ router.delete('/stocking-areas/:id', manage, handle((req) => tx(req, (db, c) => 
 router.get('/stock', view, handle((req) => listStock(pool, company(req), req.query)));
 router.get('/stock/check', view, handle((req) => checkLedger(pool, company(req))));
 router.get('/stock/wip', view, handle((req) => wipStock(pool, company(req), req.query)));
+router.get('/stock/view', view, handle((req) => stockView(pool, company(req), req.query)));
+router.get('/stock/view/lots', view, handle((req) => stockViewLots(pool, company(req), req.query)));
+router.get('/stock/units', view, handle((req) => listUnits(pool, company(req), req.query)));
+router.get('/stock/units/:id', view, handle((req) => unitHistory(pool, company(req), id(req))));
+router.get('/stock/losses', view, handle((req) => listLosses(pool, company(req), req.query)));
+router.get('/stock/scrap-rate', view, handle((req) => scrapRate(pool, company(req))));
+router.put('/stock/scrap-rate', manage, handle((req) => tx(req, (db, c) => setScrapRate(db, c, req.body ?? {}))));
 router.get('/offcuts', view, handle((req) => listOffcuts(pool, company(req), req.query)));
 router.get('/items/:id/stock', view, handle((req) => itemStock(pool, company(req), id(req))));
 router.get('/items/:id/batch-template', view, handle((req) => batchTemplate(pool, company(req), id(req))));

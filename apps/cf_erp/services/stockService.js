@@ -17,6 +17,13 @@ import { requireBatch, checkBatchValues, createBatch, ownerOf } from './batchSer
 import { generate } from '../modules/codegen/index.js';
 import { wantsPage, pageArgs, orderBy, pageOf, countsBy } from '../lib/listing.js';
 import { unreceive } from './purchaseLinkService.js';
+// Inventory v2 (§67): scrap stock and losses, offcut status, per-piece units.
+import {
+  scrapArea, scrapItem, scrapRate, scrapPerKg, customerScrapLots, writeLosses, reverseLosses, syncOffcutStatus, SCRAP_ITEM_CODE,
+} from './scrapService.js';
+import { syncUnits, checkUnits } from './unitService.js';
+import { unitKgOf } from './valuationService.js';
+import { hasV67, missingV67 } from '../lib/schemaV67.js';
 
 export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
 const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
@@ -71,7 +78,7 @@ const like = (s) => `%${String(s).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%
 export function categoryOf(purpose, batchStatus) {
   if (batchStatus === 'rejected') return 'rejected';
   if (batchStatus === 'on_hold' || purpose === 'quarantine') return 'held';
-  return { storage: 'available', wip: 'in_process', dispatch: 'dispatch' }[purpose] ?? 'available';
+  return { storage: 'available', wip: 'in_process', dispatch: 'dispatch', scrap: 'scrap' }[purpose] ?? 'available';
 }
 
 const label = (item, batch) => `${item.code ?? item.name}${batch ? ` batch ${batch.code}` : ''}`;
@@ -579,7 +586,86 @@ export async function postMovement(db, c, input = {}, opts = {}) {
     }
   }
   await savePools(db, c.companyId, pools, movementId);
+  await afterMovement(db, c, movementId, type, moving, order);
   return getMovement(db, c.companyId, movementId);
+}
+
+/**
+ * Inventory v2 (§67), after a movement's own lines are written:
+ *   scrap    what was scrapped goes INTO scrap stock by weight ("Steel scrap
+ *            (kg)" in the SCRAP area — a customer's into their scrap lot) at the
+ *            scrap rate; the rest of its value is a write-down (a loss row)
+ *   scrap / return   an offcut piece that left stock is 'scrapped' / 'returned'
+ *   any      the per-piece records of individual items follow (syncUnits)
+ * Fixed queries; nothing at all for a movement of loose stock of a plain item.
+ */
+async function afterMovement(db, c, movementId, type, moving, order) {
+  if (!hasV67()) return;
+  try {
+    if (type === 'scrap') await scrapIntoStock(db, c, movementId, moving, order);
+    const lotIds = moving.map((p) => p.batch?.id).filter(Boolean);
+    if ((type === 'scrap' || type === 'return') && lotIds.length) await syncOffcutStatus(db, c, lotIds, type, movementId);
+    const unitLots = moving.filter((p) => p.item.tracked_by === 'individual' && p.batch?.id).map((p) => p.batch.id);
+    if (unitLots.length) await syncUnits(db, c, { movementId, movementType: type, batchIds: unitLots });
+  } catch (e) {
+    if (!missingV67(e)) throw e;
+  }
+}
+
+/** A manual scrap: the pieces' weight into scrap stock, the rest of their value written down. */
+async function scrapIntoStock(db, c, movementId, moving, order) {
+  const cand = moving.filter((p) => p.legs.some((l) => l.sign < 0) && p.legs[0].area.purpose !== 'scrap' && p.item.code !== SCRAP_ITEM_CODE);
+  if (!cand.length) return;
+  const kgOf = await unitKgOf(db, c.companyId, cand.map((p) => p.item.id));
+  // An offcut piece weighs what its cf_offcuts row says (its item has no weight of its own).
+  const lotIds = cand.map((p) => p.batch?.id).filter(Boolean);
+  const [offRows] = lotIds.length ? await db.query('SELECT batch_id, weight_kg FROM cf_offcuts WHERE company_id = ? AND batch_id IN (?) AND deleted_at IS NULL', [c.companyId, lotIds]) : [[]];
+  const offKg = new Map(offRows.filter((o) => Number(o.weight_kg) > 0).map((o) => [o.batch_id, Number(o.weight_kg)]));
+  const perOf = (p) => (p.batch?.id && offKg.has(p.batch.id) ? offKg.get(p.batch.id) : kgOf.get(p.item.id));
+  const withKg = cand.filter((p) => perOf(p) > 0);
+  if (!withKg.length) return;
+  const itemId = await scrapItem(db, c);
+  if (!itemId) return;
+  const [area, item, { ratePerKg }] = await Promise.all([scrapArea(db, c), loadMaster(db, c.companyId, itemId), scrapRate(db, c.companyId)]);
+  const theirs = withKg.filter((p) => p.batch?.owner_party_id);
+  const lots = await customerScrapLots(db, c, itemId, theirs.map((p) => ({ partyId: p.batch.owner_party_id, orderId: p.batch.owner_order_id ?? null, orderCode: p.batch.owner_order_code ?? null })));
+  const pools = await loadPools(db, c.companyId, [itemId]);
+  let lineNo = Math.max(0, ...moving.map((p) => p.lineNo)) + 1;
+  const losses = [];
+  for (const p of withKg) {
+    const per = perOf(p);
+    const kg = round6(Math.abs(p.quantity) * per);
+    const out = p.legs[0];
+    const outValue = out.value == null ? null : Math.abs(out.value);
+    const perKg = scrapPerKg(ratePerKg, out.unitCost == null ? null : out.unitCost / per);
+    const value = round2(kg * perKg);
+    const owner = p.batch?.owner_party_id ?? null;
+    const batch = owner ? { id: lots.get(`${owner}:${p.batch.owner_order_id ?? 0}`), owner_party_id: owner } : null;
+    await writeLeg(db, c, { movementId, lineNo: lineNo++, area, item, batch, delta: kg, notes: `Scrap of ${p.item.code ?? p.item.name} (${fmt(kg)} kg)`, unitCost: perKg, value });
+    if (!owner) poolIn(pools.get(itemId), kg, value);
+    if (outValue != null) {
+      losses.push({ kind: 'scrap_writedown', itemId: p.item.id, batchId: p.batch?.id ?? null, ownerPartyId: owner, orderId: order?.id ?? null, value: round2(outValue - value), notes: 'Scrapped stock written down to the scrap rate', keep: true });
+    }
+  }
+  await savePools(db, c.companyId, pools, movementId);
+  await writeLosses(db, c, movementId, losses);
+}
+
+/**
+ * Loose legs of a production movement (no lot) carry their value into and out
+ * of the item's average, as a posted movement's do. legs: [{ itemId, delta, value }].
+ * Two statements, none when no leg is costed.
+ */
+export async function poolLegs(db, companyId, legs, movementId) {
+  const costed = (legs ?? []).filter((l) => !l.batchId && l.value != null && Math.abs(Number(l.delta)) > EPS);
+  if (!costed.length) return;
+  const pools = await loadPools(db, companyId, costed.map((l) => l.itemId));
+  for (const l of costed) {
+    const d = Number(l.delta);
+    if (d > 0) poolIn(pools.get(l.itemId), d, round2(Number(l.value)));
+    else poolOut(pools.get(l.itemId), -d, round2(Number(l.value)));
+  }
+  await savePools(db, companyId, pools, movementId);
 }
 
 /* ---- cost ------------------------------------------------------------------------- */
@@ -673,11 +759,28 @@ async function savePools(db, companyId, pools, movementId) {
 }
 
 async function writeLeg(db, c, { movementId, lineNo, area, item, batch, delta, notes, unitCost = null, value = null }) {
-  await db.query(
-    `INSERT INTO cf_stock_ledger (company_id, movement_id, line_no, stocking_area_id, item_id, batch_id, quantity, unit_cost, value, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, movementId, lineNo, area.id, item.id, batch?.id ?? null, delta, unitCost, value, notes ?? null, c.userId],
-  );
+  const row = [c.companyId, movementId, lineNo, area.id, item.id, batch?.id ?? null, delta, unitCost, value, notes ?? null, c.userId];
+  let written = false;
+  if (hasV67()) {
+    // §67: the lot's owner on the ledger row itself (NULL = ours; loose stock is always ours).
+    try {
+      await db.query(
+        `INSERT INTO cf_stock_ledger (company_id, movement_id, line_no, stocking_area_id, item_id, batch_id, quantity, unit_cost, value, notes, created_by, owner_party_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [...row, batch?.owner_party_id ?? null],
+      );
+      written = true;
+    } catch (e) {
+      if (!missingV67(e)) throw e;
+    }
+  }
+  if (!written) {
+    await db.query(
+      `INSERT INTO cf_stock_ledger (company_id, movement_id, line_no, stocking_area_id, item_id, batch_id, quantity, unit_cost, value, notes, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      row,
+    );
+  }
   await applyDelta(db, c, { area, item, batch, delta, movementId });
 }
 
@@ -754,6 +857,19 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
   }
   await savePools(db, c.companyId, pools, revId);
   await db.query('UPDATE cf_stock_movements SET reversed_by_id = ? WHERE company_id = ? AND id = ?', [revId, c.companyId, m.id]);
+  // §67: its losses undone; offcuts back on a shelf are available again; pieces follow their lots.
+  if (hasV67()) {
+    try {
+      await reverseLosses(db, c, m.id, revId);
+      const lotIds = [...new Set(legs.filter((l) => l.batch).map((l) => l.batch.id))];
+      if (lotIds.length) await syncOffcutStatus(db, c, lotIds, 'reversal', revId);
+      const unitLots = [...new Set(legs.filter((l) => l.batch && l.item.tracked_by === 'individual').map((l) => l.batch.id))];
+      const restore = { issue: 'dispatched', scrap: 'scrapped', return: 'returned', adjustment: 'scrapped' }[m.movement_type] ?? null;
+      if (unitLots.length) await syncUnits(db, c, { movementId: revId, movementType: m.movement_type, batchIds: unitLots, reason: 'undone', restore });
+    } catch (e) {
+      if (!missingV67(e)) throw e;
+    }
+  }
   const out = await getMovement(db, c.companyId, revId);
   if (!unreceived) return out;
   // What the reversal did to buying and to the plan (TM/CF_ERP_BUYING_V2.md §3): holds let go, and the planned cards now late / waiting.
@@ -819,6 +935,15 @@ function movementWhere(companyId, q, skip = []) {
   if (!blank(q.from)) { where.push('m.movement_date >= ?'); params.push(q.from); }
   if (!blank(q.to)) { where.push('m.movement_date <= ?'); params.push(q.to); }
   if (!blank(q.orderId)) { where.push('m.order_id = ?'); params.push(Number(q.orderId)); }
+  // §67: whose stock it moved, from the owner on the ledger rows (ours | customer | a party id).
+  if (!blank(q.owner) && hasV67()) {
+    if (q.owner === 'ours') where.push('EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id AND l.owner_party_id IS NULL)');
+    else if (q.owner === 'customer') where.push('EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id AND l.owner_party_id IS NOT NULL)');
+    else if (Number.isInteger(Number(q.owner))) {
+      where.push('EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id AND l.owner_party_id = ?)');
+      params.push(Number(q.owner));
+    }
+  }
   for (const [key, col] of [['areaId', 'stocking_area_id'], ['itemId', 'item_id'], ['batchId', 'batch_id']]) {
     if (!blank(q[key])) {
       where.push(`EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.movement_id = m.id AND l.${col} = ?)`);
@@ -977,7 +1102,7 @@ export async function valueRows(db, companyId, rows) {
 /** What sits where. q: { areaId?, itemId?, batchId?, purpose?, owner? (ours | customer | party id), search?, includeZero? } */
 /** What a balance row counts as, in SQL — the same rule as categoryOf. */
 const CATEGORY_SQL = `(CASE WHEN b.status = 'rejected' THEN 'rejected' WHEN b.status = 'on_hold' OR a.purpose = 'quarantine' THEN 'held'
-  WHEN a.purpose = 'wip' THEN 'in_process' WHEN a.purpose = 'dispatch' THEN 'dispatch' ELSE 'available' END)`;
+  WHEN a.purpose = 'wip' THEN 'in_process' WHEN a.purpose = 'dispatch' THEN 'dispatch' WHEN a.purpose = 'scrap' THEN 'scrap' ELSE 'available' END)`;
 const STOCK_SORT = { item: 'r.code', area: 'a.code', batch: 'b.code', owner: 'op.name', qty: 'k.quantity', category: CATEGORY_SQL, updated: 'k.updated_at' };
 
 /** Stock filters; `skip` leaves facets out ('category', 'owner') so a chip counts the others. */
@@ -1052,7 +1177,7 @@ export async function listStock(db, companyId, q = {}, { limit = 2000 } = {}) {
   return pageOf(rows.map(shapeStock), stat.n_lines, page, { counts });
 }
 
-const CATEGORIES = ['available', 'in_process', 'held', 'rejected', 'dispatch'];
+const CATEGORIES = ['available', 'in_process', 'held', 'rejected', 'dispatch', 'scrap'];   // scrap: a SCRAP area (§67)
 const summarise = (rows) => {
   const totals = Object.fromEntries(CATEGORIES.map((k) => [k, 0]));
   for (const r of rows) totals[r.category] = round6(totals[r.category] + r.quantity);
@@ -1141,10 +1266,13 @@ export async function checkLedger(db, companyId) {
     [companyId, companyId],
   );
   const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_stock_balances WHERE company_id = ?', [companyId]);
+  // §67: the pieces of individual items agree with their lots' balances.
+  const units = await checkUnits(db, companyId);
   return {
-    ok: rows.length === 0,
+    ok: rows.length === 0 && units.ok,
     checked: Number(n),
     differences: rows.map((r) => ({ areaId: r.stocking_area_id, itemId: r.item_id, batchId: r.batch_key || null, ledger: Number(r.ledger), balance: Number(r.balance) })),
+    units,
   };
 }
 

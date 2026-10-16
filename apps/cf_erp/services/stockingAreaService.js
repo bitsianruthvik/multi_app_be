@@ -7,7 +7,7 @@
 import { conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMachine } from './records.js';
 
-export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch'];
+export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch', 'scrap'];   // scrap: §67
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const blank = (v) => v == null || String(v).trim() === '';
 
@@ -62,7 +62,7 @@ async function readArea(db, companyId, input, problems, partial) {
   }
   if (input.purpose !== undefined || !partial) {
     const purpose = input.purpose ?? 'storage';
-    if (!PURPOSES.includes(purpose)) problems.push('Purpose is storage, wip, quarantine or dispatch.');
+    if (!PURPOSES.includes(purpose)) problems.push('Purpose is storage, wip, quarantine, dispatch or scrap.');
     out.purpose = purpose;
   }
   if (input.machineId !== undefined) {

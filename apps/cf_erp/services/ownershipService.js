@@ -24,6 +24,7 @@
 import { invalid, assertNoProblems } from '../lib/errors.js';
 import { postMovement, getMovement } from './stockService.js';
 import { orderFamily, unitKgOf, lotShares, lotPlateKg, CURRENCY } from './valuationService.js';
+import { scrapItemId } from './scrapService.js';
 
 const round3 = (n) => Number(Number(n).toFixed(3));
 const round6 = (n) => Number(Number(n).toFixed(6));
@@ -60,8 +61,12 @@ export async function receiveCustomerMaterial(db, c, input = {}) {
   });
 }
 
-/** The customer's lots that belong to this order (see the header). */
-const LOT_SCOPE = `b.company_id = ? AND b.owner_party_id = ? AND b.deleted_at IS NULL
+/**
+ * The customer's lots that belong to this order (see the header). A lot
+ * production made (a WIP piece, the finished piece — theirs since §67 when cut
+ * from their plate) is the job itself, not material to account for: left out.
+ */
+const LOT_SCOPE = `b.company_id = ? AND b.owner_party_id = ? AND b.deleted_at IS NULL AND b.production_item_id IS NULL
   AND (b.owner_order_id IN (?)
        OR (b.owner_order_id IS NULL AND EXISTS (
              SELECT 1 FROM cf_stock_ledger l2 JOIN cf_stock_movements m2 ON m2.id = l2.movement_id
@@ -76,8 +81,10 @@ const LOT_SCOPE = `b.company_id = ? AND b.owner_party_id = ? AND b.deleted_at IS
  *          − returned + adjusted (the ledger), balanceOnHand = their lots on our shelves (the balances);
  *          balances = the two agree,
  *   offcuts: { total, returned, used, scrapped, withUs } each { count, kg }, list: [...not returned],
- *   scrap:   { fromNestsKg (kerf, gaps, rim, wastage of their plates' nests), scrappedStockKg,
- *              returnedKg, withUsKg },
+ *   scrap:   { fromNestsKg (what their nests not yet cut will leave: gaps, rim, wastage — never the
+ *              kerf, which is burnt), scrapLotsKg (their scrap lots on our shelves: what cuts and
+ *              scrapped pieces left, §67), scrappedStockKg, returnedKg, withUsKg },
+ *   items also say made (into their offcut / scrap lots) and usedInProduction (their plates cut).
  *   totals:  { receivedKg, issuedKg, scrappedKg, returnedKg, withUsKg, owedBackKg }
  * }
  * owedBackKg = offcuts still with us + scrap still with us — what goes back to them.
@@ -86,12 +93,12 @@ export async function materialReconciliation(db, companyId, orderId) {
   const { order, ids } = await customerOrder(db, companyId, orderId);
   const cust = order.customer_id;
   const [moves] = await db.query(
-    `SELECT l.item_id, m.movement_type, SUM(l.quantity) AS qty
+    `SELECT l.item_id, m.movement_type, (l.quantity > 0) AS incoming, SUM(l.quantity) AS qty
        FROM cf_stock_ledger l
        JOIN cf_stock_movements m ON m.id = l.movement_id
        JOIN cf_stock_batches b ON b.id = l.batch_id
       WHERE ${LOT_SCOPE}
-      GROUP BY l.item_id, m.movement_type`,
+      GROUP BY l.item_id, m.movement_type, (l.quantity > 0)`,
     [companyId, cust, ids, ids],
   );
   const [bals] = await db.query(
@@ -111,17 +118,22 @@ export async function materialReconciliation(db, companyId, orderId) {
   const pair = (qty, per) => ({ qty: round6(qty), kg: per == null ? null : round3(qty * per) });
   const out = items.map((it) => {
     const per = kgOf.get(it.id);
-    const sum = (type) => moves.filter((m) => m.item_id === it.id && m.movement_type === type).reduce((t, m) => t + Number(m.qty), 0);
+    const sum = (type, dir = null) => moves.filter((m) => m.item_id === it.id && m.movement_type === type && (dir == null || Number(m.incoming) === dir))
+      .reduce((t, m) => t + Number(m.qty), 0);
     const received = sum('receipt');
     const issued = -sum('issue');
-    const scrapped = -sum('scrap');
+    const scrapped = -sum('scrap', 0);
     const returned = -sum('return');
     const adjusted = sum('adjustment');
-    const withUs = round6(received - issued - scrapped - returned + adjusted);
+    // §67: production cuts their plates (out) into their offcuts and scrap (in); a scrap movement puts the kg into their scrap lot.
+    const made = sum('transform', 1) + sum('scrap', 1);
+    const used = -sum('transform', 0);
+    const withUs = round6(received + made - issued - used - scrapped - returned + adjusted);
     const onHand = Number(bals.find((b) => b.item_id === it.id)?.qty ?? 0);
     return {
       item: { id: it.id, code: it.code, name: it.name }, uom: it.uom, kgPerUnit: per,
       received: pair(received, per), issued: pair(issued, per), scrapped: pair(scrapped, per),
+      made: pair(made, per), usedInProduction: pair(used, per),
       returned: pair(returned, per), adjusted: pair(adjusted, per), withUs: pair(withUs, per),
       balanceOnHand: pair(onHand, per), balances: Math.abs(onHand - withUs) <= 1e-6,
     };
@@ -137,13 +149,23 @@ export async function materialReconciliation(db, companyId, orderId) {
   );
   const tally = (list) => ({ count: list.length, kg: round3(list.reduce((t, o) => t + Number(o.weight_kg ?? 0), 0)) });
   const withUsOffcuts = offcuts.filter((o) => !['returned', 'used', 'scrapped'].includes(o.status));
+  // pl.* — cut_movement_id (§67) is read when the database has it.
   const [lots] = await db.query(
-    `SELECT pl.id, pl.length_mm, pl.width_mm, pl.thickness_mm, pl.density, pl.waste_json
+    `SELECT pl.*
        FROM cf_plate_lots pl JOIN cf_sales_order_lines ol ON ol.id = pl.order_line_id
       WHERE pl.company_id = ? AND pl.owner_party_id = ? AND ol.order_id IN (?) AND pl.deleted_at IS NULL`,
     [companyId, cust, ids],
   );
-  const fromNestsKg = round3(lots.reduce((t, l) => { const s = lotShares(l); return t + (s ? lotPlateKg(l) * s.scrap : 0); }, 0));
+  // §67: a plate already CUT left real scrap — their scrap lot, counted below as stock. A plate not cut yet:
+  // the scrap its nest will leave, without the kerf (burnt, never given back).
+  const fromNestsKg = round3(lots.filter((l) => !l.cut_movement_id).reduce((t, l) => {
+    const sh = lotShares(l);
+    if (!sh) return t;
+    let w = l.waste_json;
+    if (typeof w === 'string') { try { w = JSON.parse(w); } catch { w = null; } }
+    const kerf = Number(w?.plateArea) > 0 ? Number(w?.kerf ?? 0) / Number(w.plateArea) : 0;
+    return t + lotPlateKg(l) * Math.max(0, sh.scrap - kerf);
+  }, 0));
   const [[{ kg: returnedKg }]] = await db.query(
     `SELECT COALESCE(SUM(return_kg), 0) AS kg FROM cf_stock_movements
       WHERE company_id = ? AND movement_type = 'return' AND order_id IN (?) AND party_id = ? AND reversal_of_id IS NULL AND reversed_by_id IS NULL`,
@@ -151,7 +173,12 @@ export async function materialReconciliation(db, companyId, orderId) {
   );
   const kgSum = (key) => round3(out.reduce((t, r) => t + (r[key].kg ?? 0), 0));
   const scrappedStockKg = kgSum('scrapped');
-  const scrapWithUs = round3(fromNestsKg + scrappedStockKg - Number(returnedKg));
+  // Their scrap lots ("Steel scrap (kg)") on our shelves — real scrap from cuts and scrapped pieces.
+  const scrapId = await scrapItemId(db, companyId);
+  const scrapRow = scrapId ? out.find((r) => r.item.id === scrapId) : null;
+  const scrapLotsKg = round3(scrapRow?.balanceOnHand.qty ?? 0);
+  // Owed back: what their uncut nests will leave + their scrap lots − scrap already handed back by weight alone.
+  const scrapWithUs = round3(Math.max(0, fromNestsKg - Number(returnedKg)) + scrapLotsKg);
   const offcutsWithUs = tally(withUsOffcuts);
   return {
     order: { id: order.id, code: order.code, revision: order.revision },
@@ -170,7 +197,10 @@ export async function materialReconciliation(db, companyId, orderId) {
         thicknessMm: o.thickness_mm == null ? null : Number(o.thickness_mm), grade: o.grade,
       })),
     },
-    scrap: { fromNestsKg, scrappedStockKg, returnedKg: round3(Number(returnedKg)), withUsKg: scrapWithUs },
+    scrap: {
+      fromNestsKg, scrappedStockKg, scrapLotsKg,
+      returnedKg: round3(Number(returnedKg) + (scrapRow?.returned.qty ?? 0)), withUsKg: scrapWithUs,
+    },
     totals: {
       receivedKg: kgSum('received'), issuedKg: kgSum('issued'), scrappedKg: scrappedStockKg,
       returnedKg: round3(kgSum('returned') + offcuts.filter((o) => o.status === 'returned').reduce((t, o) => t + Number(o.weight_kg ?? 0), 0) + Number(returnedKg)),
@@ -190,6 +220,11 @@ export async function materialReconciliation(db, companyId, orderId) {
  * }
  * One 'return' movement: the lots leave our shelves through the ledger, the
  * offcuts are marked returned against it, the scrap weight sits on it.
+ *
+ * §67: an offcut that is a stock piece (cut) leaves its shelf as a line of the
+ * return; scrap by weight comes out of the customer's scrap lots of this order
+ * first ("Steel scrap (kg)", oldest first) — only what those do not hold is
+ * written on the movement as a bare weight (return_kg).
  */
 export async function returnToCustomer(db, c, input = {}) {
   const { order, ids } = await customerOrder(db, c.companyId, input.orderId);
@@ -202,7 +237,7 @@ export async function returnToCustomer(db, c, input = {}) {
   let offcuts = [];
   if (offcutIds.length) {
     const [rows] = await db.query(
-      `SELECT o.id, o.offcut_no, o.status, o.owner_party_id, ol.order_id
+      `SELECT o.id, o.offcut_no, o.status, o.owner_party_id, o.batch_id, ol.order_id
          FROM cf_offcuts o JOIN cf_sales_order_lines ol ON ol.id = o.order_line_id
         WHERE o.company_id = ? AND o.id IN (?) AND o.deleted_at IS NULL FOR UPDATE`,
       [c.companyId, offcutIds],
@@ -218,6 +253,35 @@ export async function returnToCustomer(db, c, input = {}) {
     offcuts = rows;
   }
   assertNoProblems(problems, 'Nothing can go back yet.');
+  // Offcut stock pieces leave their shelves; scrap comes out of their scrap lots first. Two reads.
+  const extra = [];
+  const pieceIds = offcuts.map((o) => o.batch_id).filter(Boolean);
+  if (pieceIds.length) {
+    const [onShelf] = await db.query(
+      'SELECT k.batch_id, k.item_id, k.stocking_area_id, k.quantity FROM cf_stock_balances k WHERE k.company_id = ? AND k.batch_id IN (?) AND k.quantity > 0 ORDER BY k.batch_id, k.id',
+      [c.companyId, pieceIds],
+    );
+    for (const k of onShelf) extra.push({ itemId: k.item_id, batchId: k.batch_id, quantity: Number(k.quantity), fromAreaId: k.stocking_area_id, notes: 'Offcut returned' });
+  }
+  let scrapFromLots = 0;
+  const scrapId = scrapKg != null ? await scrapItemId(db, c.companyId) : null;
+  if (scrapId) {
+    const [held] = await db.query(
+      `SELECT k.batch_id, k.stocking_area_id, k.quantity FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id
+        WHERE k.company_id = ? AND k.item_id = ? AND b.owner_party_id = ? AND (b.owner_order_id IN (?) OR b.owner_order_id IS NULL) AND k.quantity > 0
+        ORDER BY b.id, k.id`,
+      [c.companyId, scrapId, order.customer_id, ids],
+    );
+    let left = scrapKg;
+    for (const k of held) {
+      if (left <= 1e-6) break;
+      const t = round6(Math.min(left, Number(k.quantity)));
+      extra.push({ itemId: scrapId, batchId: k.batch_id, quantity: t, fromAreaId: k.stocking_area_id, notes: 'Scrap returned' });
+      left = round6(left - t);
+      scrapFromLots = round6(scrapFromLots + t);
+    }
+  }
+  const bareKg = scrapKg == null ? null : round3(scrapKg - scrapFromLots);
   const what = [
     lines.length ? `${lines.length} lot line${lines.length === 1 ? '' : 's'}` : null,
     offcuts.length ? `${offcuts.length} offcut${offcuts.length === 1 ? '' : 's'}` : null,
@@ -232,8 +296,8 @@ export async function returnToCustomer(db, c, input = {}) {
     reference: input.reference,
     reason: blank(input.reason) ? `Returned to ${order.customer_name ?? 'the customer'}: ${what}` : input.reason,
     notes: input.notes,
-    returnKg: scrapKg ?? undefined,
-    lines: lines.map((l) => ({ itemId: l.itemId, batchId: l.batchId, quantity: l.quantity, fromAreaId: l.fromAreaId, notes: l.notes })),
+    returnKg: bareKg != null && bareKg > 0.0005 ? bareKg : undefined,
+    lines: [...lines.map((l) => ({ itemId: l.itemId, batchId: l.batchId, quantity: l.quantity, fromAreaId: l.fromAreaId, notes: l.notes })), ...extra],
   }, { allowEmpty: true });
   if (offcuts.length) {
     await db.query(
@@ -245,6 +309,7 @@ export async function returnToCustomer(db, c, input = {}) {
     movement: offcuts.length ? await getMovement(db, c.companyId, movement.id) : movement,
     offcutsReturned: offcuts.map((o) => ({ id: o.id, offcutNo: o.offcut_no })),
     scrapKg: scrapKg == null ? null : round3(scrapKg),
+    scrapFromLotsKg: round3(scrapFromLots),
     reconciliation: await materialReconciliation(db, c.companyId, order.id),
   };
 }
