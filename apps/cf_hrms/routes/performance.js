@@ -20,6 +20,8 @@
  *   DELETE /performance/plans/:id/kpis/:kpiId          removed from the draft (kept)          performance edit
  *   POST /performance/plans/:id/kpis/:kpiId/target     { …target, effectiveFrom?, reason }   active   performance edit
  *   GET  /performance/employees/:id/plans              a person's plans (employee page)       performance view
+ *   GET  /performance/employees/:id/scorecard?on=      the org chart panel's KPIs: the plan holding the day
+ *                                                      (target, current, achievement, band), else the job's KPIs   performance view
  *
  * ACTUALS (spec §19):
  *   GET  /performance/actuals?periodId=&slot=&department=&label=&role=&manager=&band=&q=&missing=
@@ -54,14 +56,14 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, can, step } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, can, step, dateParam } from '../lib/http.js';
 import { listed } from '../lib/listFilters.js';
 import { notFound } from '../lib/errors.js';
 import { inEmployee, companyWide } from '../lib/gates.js';
 import { peopleFilter, assertEmployeeInScope } from '../services/accessScope.js';
 import { getSettingsPage, saveSettings, setRoleFrequencies } from '../services/performance/settingsService.js';
 import {
-  listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee,
+  listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee, scorecardOf,
   setKraWeight, addKpi, changeKpi, removeKpi, activatePlan, cancelPlan, forEachPlan, changeTarget,
 } from '../services/performance/planService.js';
 import { actualsGrid, narrowGrid, enterOne, actualHistory, chartBands } from '../services/performance/actualsService.js';
@@ -193,5 +195,7 @@ router.get('/performance/employees/:id/review-summary', guard(PERM.performance.v
 /* ── a person's plans ─────────────────────────────────────────────────── */
 
 router.get('/performance/employees/:id/plans', guard(PERM.performance.view), inEmployee(), handle((req) => plansOfEmployee(pool, ctx(req).companyId, id(req))));
+router.get('/performance/employees/:id/scorecard', guard(PERM.performance.view), inEmployee(),
+  handle((req) => scorecardOf(pool, ctx(req).companyId, id(req), { on: dateParam(req.query.on) })));
 
 export default router;

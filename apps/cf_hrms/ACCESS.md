@@ -74,8 +74,10 @@ How to read the tables below:
 | `POST /user/me/team/employees/:id/job-content/undo` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/positions/:id/shift` | `cf_hrms_self_view` |  |
 | `GET /user/me/plan` | `cf_hrms_self_view` |  |
+| `GET /user/me/scorecard` | `cf_hrms_self_view` |  |
 | `GET /user/me/team/plans` | `cf_hrms_self_view` |  |
 | `GET /user/me/team/plans/:id` | `cf_hrms_self_view` |  |
+| `GET /user/me/team/positions/:id/scorecard` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/plans/:id/kras/:kraId` | `cf_hrms_self_view` |  |
 | `POST /user/me/team/plans/:id/kpis` | `cf_hrms_self_view` |  |
 | `PUT /user/me/team/plans/:id/kpis/:kpiId` | `cf_hrms_self_view` |  |
@@ -483,5 +485,6 @@ How to read the tables below:
 | `POST /performance/actions/:id/drop` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
 | `GET /performance/employees/:id/review-summary` | `cf_hrms_performance_view` | scope: the person |
 | `GET /performance/employees/:id/plans` | `cf_hrms_performance_view` | scope: the person |
+| `GET /performance/employees/:id/scorecard` | `cf_hrms_performance_view` | scope: the person |
 
-381 routes.
+384 routes.

@@ -27,6 +27,7 @@
  *
  * Pure: no database.
  */
+import { amountText } from './scoring.js';
 
 export const DIRECTIONS = ['HIGHER_BETTER', 'LOWER_BETTER', 'EXACT', 'TEXT'];
 export const DIRECTION_WORDS = { HIGHER_BETTER: 'Higher is better', LOWER_BETTER: 'Lower is better', EXACT: 'Exactly', TEXT: 'Written as words' };
@@ -161,4 +162,12 @@ export function planTargetText({ direction, targetNumber, targetText, unit }) {
   return `${{ HIGHER_BETTER: 'at least', LOWER_BETTER: 'at most', EXACT: 'exactly' }[direction] ?? ''} ${value}`.trim();
 }
 
-export default { DIRECTIONS, DIRECTION_WORDS, parseTargetText, planTargetOf, planTargetText };
+/** A number with its unit (scoring.js's amountText): "92%", "8 working hours", "₹12 L", "₹1.5 Cr". */
+export const valueText = amountText;
+/** The target's value, short — "95%", "6 working hours", "₹12 L" — or the words. The reader adds the direction mark (▲ ▼ =). */
+export function planTargetShort({ direction, targetNumber, targetText, unit }) {
+  if (direction === 'TEXT' || targetNumber == null) return targetText ?? 'No target set';
+  return valueText(targetNumber, unit);
+}
+
+export default { DIRECTIONS, DIRECTION_WORDS, parseTargetText, planTargetOf, planTargetText, planTargetShort, valueText };

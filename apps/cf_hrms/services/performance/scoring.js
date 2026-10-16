@@ -32,6 +32,23 @@
  *
  * BANDS (thresholds from Performance settings): on track ≥ 90 · at risk ≥ 70 ·
  * behind below · no data.
+ *
+ * THE GAP, in words, next to the achievement (kpiResult's `gapText`): the combined
+ * actual against the target it is held to, direction- and unit-aware —
+ * "3 pts short" / "2 pts ahead" (%), "₹2.1 L ahead" / "₹50,000 short" (money,
+ * Indian grouping), "12 min over" / "4 hours under" (lower is better), "on target",
+ * "met" / "not met" (words). PACE: a SUM KPI part-way through the period (fewer
+ * slots in than it has) is held to the target pro rata (above), so its gap is
+ * against that, and `pace` says ON_PACE / BEHIND_PACE with `paceNote`
+ * "Target pro-rated to 1 of 3 months: …".
+ *
+ * THE RESULT TONE (resultTone) — what a scorecard row is coloured by: MET or not.
+ * Not the band (a KPI at 97% is "on track" but not met):
+ *   MET      achievement ≥ 100 (beaten counts; a words target met; a SUM on pace)
+ *   CLOSE    not met, but at or above the company's at-risk threshold
+ *   BELOW    below the at-risk threshold
+ *   NO_DATA  no actual yet
+ * The bands and the plan score are unchanged; a plan's score takes the same tone.
  */
 
 export const COMBINE_RULES = ['SUM', 'AVERAGE', 'LAST'];
@@ -48,6 +65,49 @@ const AVERAGE_UNIT = /%|percent|minute|min\b|mins|hour|hrs?\b|day|rate|ratio|sco
 export function defaultCombine(unit, direction) {
   if (String(direction ?? '').toUpperCase() === 'TEXT') return 'AVERAGE';
   return unit && AVERAGE_UNIT.test(String(unit)) ? 'AVERAGE' : 'SUM';
+}
+
+const AMOUNT = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 });
+/** A number with its unit, as a person reads it: "92%", "8 hours", "₹12 L", "₹1.5 Cr", "₹50,000". */
+export function amountText(value, unit) {
+  if (value == null || !Number.isFinite(Number(value))) return null;
+  const v = Number(value);
+  if (unit === '₹') {
+    const sign = v < 0 ? '-' : '';
+    const a = Math.abs(v);
+    if (a >= 1e7) return `${sign}₹${AMOUNT.format(a / 1e7)} Cr`;
+    if (a >= 1e5) return `${sign}₹${AMOUNT.format(a / 1e5)} L`;
+    return `${sign}₹${AMOUNT.format(a)}`;
+  }
+  const n = AMOUNT.format(v);
+  if (!unit) return n;
+  return unit === '%' ? `${n}%` : `${n} ${unit}`;
+}
+/** A difference with its unit: percentage POINTS for %, else the amount. */
+const diffText = (d, unit) => (unit === '%' ? `${AMOUNT.format(d)} pt${Math.abs(d) === 1 ? '' : 's'}` : amountText(d, unit));
+const SLOT_NOUN = { DAILY: 'day', WEEKLY: 'week', MONTHLY: 'month', QUARTERLY: 'quarter', HALF_YEARLY: 'half', YEARLY: 'year' };
+
+/**
+ * The gap of a combined actual against the target it is held to, in words.
+ * @returns { gap: number|null (positive = better than the target), gapText }
+ */
+export function gapOf(direction, combined, target, unit) {
+  if (direction === 'TEXT' || combined == null || target == null || !Number.isFinite(Number(combined))) return { gap: null, gapText: null };
+  const d = Math.round((Number(combined) - Number(target)) * 100) / 100;
+  if (Math.abs(d) < 0.005) return { gap: 0, gapText: 'on target' };
+  if (direction === 'LOWER_BETTER') return { gap: -d, gapText: `${diffText(Math.abs(d), unit)} ${d > 0 ? 'over' : 'under'}` };
+  if (direction === 'EXACT') return { gap: -Math.abs(d), gapText: `${diffText(Math.abs(d), unit)} ${d > 0 ? 'over' : 'under'}` };
+  return { gap: d, gapText: `${diffText(Math.abs(d), unit)} ${d > 0 ? 'ahead' : 'short'}` };
+}
+
+export const RESULT_TONES = ['MET', 'CLOSE', 'BELOW', 'NO_DATA'];
+export const RESULT_WORDS = { MET: 'Met', CLOSE: 'Not met — close', BELOW: 'Not met — below', NO_DATA: 'No actual yet' };
+/** The tone of a result: met or beaten / close / below / no data (thresholds from Performance settings). */
+export function resultTone(achievement, bands = DEFAULT_BANDS) {
+  if (achievement == null || !Number.isFinite(Number(achievement))) return 'NO_DATA';
+  const a = Number(achievement);
+  if (a >= 100) return 'MET';
+  return a >= Number(bands.atRisk) ? 'CLOSE' : 'BELOW';
 }
 
 const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
@@ -84,16 +144,17 @@ export function kpiResult(kpi, actuals = []) {
   const sorted = [...actuals].sort((x, y) => (x.slotStart < y.slotStart ? -1 : x.slotStart > y.slotStart ? 1 : 0));
   if (kpi.direction === 'TEXT') {
     const answered = sorted.filter((a) => a.met === 'YES' || a.met === 'NO');
-    if (!answered.length) return { achievement: null, combined: null, combinedTarget: null, counted: 0, slotCount, rule };
+    if (!answered.length) return { achievement: null, combined: null, combinedTarget: null, counted: 0, slotCount, rule, gap: null, gapText: null, pace: null, paceNote: null };
     const met = answered.filter((a) => a.met === 'YES').length;
     const achievement = rule === 'LAST' ? metAchievement(answered[answered.length - 1].met) : (met / answered.length) * 100;
     return {
       achievement: round1(achievement), combined: rule === 'LAST' ? answered[answered.length - 1].met : `${met} of ${answered.length} met`,
       combinedTarget: null, counted: answered.length, slotCount, rule,
+      gap: null, gapText: achievement === 100 ? 'met' : achievement === 0 ? 'not met' : `${met} of ${answered.length} met`, pace: null, paceNote: null,
     };
   }
   const values = sorted.filter((a) => a.valueNumber != null && Number.isFinite(Number(a.valueNumber)));
-  if (!values.length) return { achievement: null, combined: null, combinedTarget: null, counted: 0, slotCount, rule };
+  if (!values.length) return { achievement: null, combined: null, combinedTarget: null, counted: 0, slotCount, rule, gap: null, gapText: null, pace: null, paceNote: null };
   const nums = values.map((a) => Number(a.valueNumber));
   let combined;
   let target = kpi.targetNumber == null ? null : Number(kpi.targetNumber);
@@ -103,9 +164,16 @@ export function kpiResult(kpi, actuals = []) {
   } else if (rule === 'LAST') combined = nums[nums.length - 1];
   else combined = nums.reduce((t, n) => t + n, 0) / nums.length;
   const achievement = achievementOf(kpi.direction, combined, target);
+  const { gap, gapText } = gapOf(kpi.direction, combined, target, kpi.unit ?? null);
+  // Part-way through: a SUM target taken pro rata — the gap is against that, and says so.
+  const partWay = rule === 'SUM' && slotCount > 1 && values.length < slotCount && target != null;
+  const noun = SLOT_NOUN[String(kpi.entryFrequency ?? '').toUpperCase()] ?? 'slot';
   return {
     achievement: round1(achievement), combined: Math.round(combined * 10000) / 10000,
     combinedTarget: target == null ? null : Math.round(target * 10000) / 10000, counted: values.length, slotCount, rule,
+    gap, gapText: partWay && gapText ? `${gap >= 0 ? 'on pace' : 'behind pace'} · ${gapText}` : gapText,
+    pace: partWay ? (gap >= 0 ? 'ON_PACE' : 'BEHIND_PACE') : null,
+    paceNote: partWay ? `Target pro-rated to ${values.length} of ${slotCount} ${noun}${slotCount === 1 ? '' : 's'}: ${amountText(target, kpi.unit ?? null)}` : null,
   };
 }
 
@@ -165,4 +233,4 @@ export function scorePlan(plan, actualsByKpi, bands = DEFAULT_BANDS) {
   };
 }
 
-export default { COMBINE_RULES, COMBINE_WORDS, BANDS, BAND_WORDS, DEFAULT_BANDS, CAP, defaultCombine, achievementOf, kpiResult, bandOf, scorePlan };
+export default { COMBINE_RULES, COMBINE_WORDS, BANDS, BAND_WORDS, DEFAULT_BANDS, CAP, defaultCombine, achievementOf, kpiResult, bandOf, scorePlan, gapOf, amountText, resultTone, RESULT_TONES, RESULT_WORDS };

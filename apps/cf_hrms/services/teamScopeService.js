@@ -41,7 +41,7 @@ import { audit } from './peopleService.js';
 import { loadMySlice } from './selfOrgChartService.js';
 import { summaryFromRow } from './shiftRead.js';
 import {
-  listPlans, readPlan, planEmployeeId, setKraWeight, addKpi, changeKpi, removeKpi,
+  listPlans, readPlan, planEmployeeId, setKraWeight, addKpi, changeKpi, removeKpi, scorecardOf,
 } from './performance/planService.js';
 import { actualsGrid, narrowGrid, enterOne, actualHistory } from './performance/actualsService.js';
 import {
@@ -212,6 +212,18 @@ export async function teamPlan(db, c, planId) {
   await assertPlanInMyTeam(db, c, planId);
   return readPlan(db, c.companyId, planId, { edit: true, activate: false, cancel: false });
 }
+/**
+ * GET /user/me/team/positions/:id/scorecard — the KPIs of whoever sits, today, in a position
+ * below me (the same read as HR's /performance/employees/:id/scorecard). By POSITION, as the
+ * employee chart knows positions and never employee ids.
+ */
+export async function teamScorecard(db, c, positionId, { on } = {}) {
+  const slice = await assertInMyTeam(db, c, positionId);
+  const node = slice.graph.nodes.find((n) => Number(n.id) === Number(positionId));
+  const employeeId = node?.occupants?.find((o) => o.employeeId != null)?.employeeId ?? null;
+  if (employeeId == null) return { employeeId: null, on: on || today(), source: 'NONE', plan: null, kras: [], kpis: [], line: 'This position is vacant today.' };
+  return scorecardOf(db, c.companyId, employeeId, { on });
+}
 export async function teamSetKraWeight(db, c, planId, kraId, body) { await assertPlanInMyTeam(db, c, planId); return setKraWeight(db, c, planId, kraId, body); }
 export async function teamAddKpi(db, c, planId, body) { await assertPlanInMyTeam(db, c, planId); return addKpi(db, c, planId, body); }
 export async function teamChangeKpi(db, c, planId, kpiId, body) { await assertPlanInMyTeam(db, c, planId); return changeKpi(db, c, planId, kpiId, body); }
@@ -267,6 +279,6 @@ export default {
   teamReviews, teamReview, teamWriteReview, teamCloseReview, teamCancelReview, teamOpenCheckIn, teamPlanReviews, teamAddAction, teamChangeAction, teamCloseAction,
   teamActuals, teamEnterActual, teamActualHistory,
   assertInMyTeam, teamJobContent, teamAddLine, teamChangeLine, teamSwitchOffLine, teamUndoLine, teamShifts, teamChangeShift,
-  teamPlans, teamPlan, assertPlanInMyTeam, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
+  teamPlans, teamPlan, teamScorecard, assertPlanInMyTeam, teamSetKraWeight, teamAddKpi, teamChangeKpi, teamRemoveKpi,
   assertPersonInMyTeam, teamPersonJobContent, teamPersonAddLine, teamPersonChangeLine, teamPersonSwitchOffLine, teamPersonUndoLine,
 };

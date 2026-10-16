@@ -30,9 +30,11 @@ import { readSettings } from './settingsService.js';
 import {
   FREQUENCIES, FREQUENCY_LABEL, isFrequency, periodStartingOn, periodsOfYear, yearOf, yearLabel,
 } from './periods.js';
-import { DIRECTIONS, planTargetOf, planTargetText } from './targets.js';
-import { COMBINE_RULES, COMBINE_WORDS, defaultCombine } from './scoring.js';
-import { loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, periodOfRow, actualHistory } from './actualsService.js';
+import { DIRECTIONS, planTargetOf, planTargetText, planTargetShort, valueText } from './targets.js';
+import { COMBINE_RULES, COMBINE_WORDS, defaultCombine, resultTone, RESULT_WORDS } from './scoring.js';
+import {
+  loadPlanParts, planScoreParts, scorePlans, scoreSummary, kpiActualsView, periodOfRow, actualHistory, reviewKpiTable,
+} from './actualsService.js';
 import { cancelPlanReviews } from './reviewService.js';
 
 export const PLAN_STATUSES = ['DRAFT', 'ACTIVE', 'CLOSED', 'CANCELLED'];
@@ -593,6 +595,139 @@ export async function myActualHistory(db, c, planId, kpiId) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * The scorecard — the org chart panel's KPIs for one person (draft v1)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const SLOT_NOUN = { DAILY: 'day', WEEKLY: 'week', MONTHLY: 'month', QUARTERLY: 'quarter', HALF_YEARLY: 'half', YEARLY: 'year' };
+const SCORECARD_RANK = { ACTIVE: 0, CLOSED: 1, DRAFT: 2 };
+const plural = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
+/** A KRA's name cut to a chip: "Artwork approval & version control" -> "Artwork approval". */
+export function shortKraName(name) {
+  const whole = String(name ?? '').replace(/\s+/g, ' ').trim();
+  const first = whole.split(/\s*(?:&|,|;|:|\(|—|–| - | and )\s*/i)[0] || whole;
+  if (first.length <= 24) return first;
+  const cut = first.slice(0, 23);
+  return `${cut.slice(0, cut.lastIndexOf(' ') > 10 ? cut.lastIndexOf(' ') : 23)}…`;
+}
+
+/** "92% · average of 2 of 3 months" — the current value and how it is combined. null when nothing is in. */
+function currentLine(row, entryFrequency) {
+  if (!row.counted || row.actual == null) return null;
+  const noun = SLOT_NOUN[entryFrequency] ?? 'slot';
+  if (row.direction === 'TEXT') {
+    const word = row.actual === 'YES' ? 'Met' : row.actual === 'NO' ? 'Not met' : String(row.actual);
+    if (row.slotCount <= 1) return row.achievement === 100 ? 'Met' : row.achievement === 0 ? 'Not met' : word;
+    return row.combine === 'LAST' ? `${word} · latest of ${row.counted} of ${plural(row.slotCount, noun)}` : `${word} · ${row.counted} of ${plural(row.slotCount, noun)} answered`;
+  }
+  const value = valueText(row.actual, row.unit);
+  if (row.slotCount <= 1) return value;
+  const how = { SUM: 'added up over', AVERAGE: 'average of', LAST: 'latest of' }[row.combine] ?? 'from';
+  return `${value} · ${how} ${row.counted} of ${plural(row.slotCount, noun)}`;
+}
+
+/**
+ * GET /performance/employees/:id/scorecard?on= — the person's KPIs on one day, for the org chart panel.
+ *
+ *   source PLAN   their plan whose period holds the day (ACTIVE first, then CLOSED, then DRAFT): each KPI
+ *                 with its KRA, target, the current value and how it is combined, achievement and band —
+ *                 reviewKpiTable(), i.e. scoring.js; the plan's score. Rows in KRA order.
+ *   source JOB    no plan: the KPIs of the job they hold that day (contentResolver), with targets; no values.
+ *   source NONE   no plan and no position.
+ * Each KPI row and the plan carry `tone` (scoring.resultTone: MET / CLOSE / BELOW / NO_DATA) — what they are coloured by.
+ * A fixed handful of queries.
+ */
+export async function scorecardOf(db, companyId, employeeId, { on } = {}) {
+  const day = dateText(on) || today();
+  const [[who]] = await db.query('SELECT id FROM hrms_employees WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(employeeId)]);
+  if (!who) throw notFound('Employee');
+  const [plans] = await db.query(
+    `${PLAN_LIST_SQL} WHERE pl.company_id = ? AND pl.employee_id = ? AND pl.status <> 'CANCELLED' AND pp.start_date <= ? AND pp.end_date >= ?`,
+    [companyId, companyId, companyId, Number(employeeId), day, day],
+  );
+  plans.sort((a, b) => (SCORECARD_RANK[a.status] ?? 9) - (SCORECARD_RANK[b.status] ?? 9) || (iso(b.start_date) > iso(a.start_date) ? 1 : -1));
+  const settings = await readSettings(db, companyId);
+  const base = { employeeId: Number(employeeId), on: day, bands: settings.bands };
+
+  const r = plans[0];
+  if (r) {
+    const parts = await loadPlanParts(db, companyId, [r.id]);
+    const kras = parts.kras.get(Number(r.id)) ?? [];
+    const kpis = parts.kpis.get(Number(r.id)) ?? [];
+    const period = periodOfRow(r);
+    const table = reviewKpiTable(period, kras, kpis, parts.actuals, settings.bands);
+    const entryOf = new Map(kpis.map((k) => [Number(k.id), String(k.entry_frequency || period.frequency || '').toUpperCase()]));
+    return {
+      ...base,
+      source: 'PLAN',
+      plan: {
+        id: Number(r.id), status: r.status, period, ...table.score, kpiCount: kpis.length,
+        tone: resultTone(table.score.score, settings.bands),
+        /** Another plan of theirs also holds the day (e.g. a monthly and a quarterly one). */ otherPlans: plans.length - 1,
+      },
+      kras: table.kras.map((k) => ({ key: `kra-${k.id}`, name: k.name, short: shortKraName(k.name), weightPercent: k.weightPercent, score: k.score, band: k.band })),
+      kpis: table.rows.map((row) => ({
+        key: `kpi-${row.kpiId}`, kpiId: row.kpiId, kraKey: row.kraId ? `kra-${row.kraId}` : null,
+        name: row.name, unit: row.unit, direction: row.direction,
+        target: row.target, targetShort: planTargetShort(row),
+        actual: row.actual, current: currentLine(row, entryOf.get(row.kpiId)),
+        combine: row.combine, combineLabel: row.combineLabel, counted: row.counted, slotCount: row.slotCount,
+        achievement: row.achievement, band: row.band, bandLabel: row.bandLabel,
+        gap: row.gap, gapText: row.gapText, pace: row.pace, paceNote: row.paceNote,
+        tone: resultTone(row.achievement, settings.bands), toneLabel: RESULT_WORDS[resultTone(row.achievement, settings.bands)],
+      })),
+      line: null, // the plan's own score line says it ("No actuals yet.", "This plan has no KPIs.")
+    };
+  }
+
+  // No plan for the day: the job's KPIs, as it stands that day.
+  const [[seat]] = await db.query(
+    `SELECT wa.id, wa.position_id, COALESCE(wa.role_id, p.role_id) AS role_id
+       FROM hrms_work_assignments wa JOIN hrms_positions p ON p.company_id = wa.company_id AND p.id = wa.position_id
+      WHERE wa.company_id = ? AND wa.employee_id = ? AND ${HOLDS_SEAT_SQL('wa')}
+        AND (wa.effective_from IS NULL OR wa.effective_from <= ?) AND (wa.effective_to IS NULL OR wa.effective_to >= ?)
+      ORDER BY wa.is_primary DESC, wa.effective_from DESC, wa.id DESC LIMIT 1`,
+    [companyId, Number(employeeId), day, day],
+  );
+  if (!seat) return { ...base, source: 'NONE', plan: null, kras: [], kpis: [], line: 'They hold no position on this day, so there are no KPIs to show.' };
+  const jobs = await resolveJobsForAssignments(db, companyId, [{ workAssignmentId: seat.id, positionId: seat.position_id, roleId: seat.role_id }], { on: day });
+  const job = jobs.get(Number(seat.id)) ?? { kras: [], additional: { kpis: [] } };
+  const outKras = [];
+  const outKpis = [];
+  const addKpi = (item, kraKey, i) => {
+    const t = planTargetOf(item);
+    outKpis.push({
+      key: `job-${item.lineKey ?? `${kraKey}-${i}`}`, kpiId: null, kraKey,
+      name: wholeWording(item.name, item.description), unit: t.unit ?? null, direction: t.direction,
+      // The job's own words ("100% adoption by end of Nov'26"): what a plan would copy, as written.
+      target: t.jobTargetText ?? planTargetText(t), targetShort: t.jobTargetText ?? planTargetShort(t),
+      actual: null, current: null, combine: null, combineLabel: null, counted: 0, slotCount: 0, achievement: null, band: 'NO_DATA', bandLabel: 'No data',
+      gap: null, gapText: null, pace: null, paceNote: null, tone: 'NO_DATA', toneLabel: RESULT_WORDS.NO_DATA,
+    });
+  };
+  job.kras.forEach((k, i) => {
+    const key = `job-kra-${k.lineKey ?? i}`;
+    const name = wholeWording(k.name, k.description);
+    outKras.push({ key, name, short: shortKraName(name), weightPercent: num(k.weightPercent), score: null, band: 'NO_DATA' });
+    k.kpis.forEach((item, j) => addKpi(item, key, j));
+  });
+  job.additional.kpis.forEach((item, j) => addKpi(item, null, j));
+  return {
+    ...base, source: 'JOB', plan: null, kras: outKras, kpis: outKpis,
+    line: 'No plan for this period yet — current values come once a plan is active.',
+  };
+}
+
+/** GET /user/me/scorecard?on= — my own KPIs (the same read as HR's), for My place; read-only. */
+export async function myScorecard(db, c, { on } = {}) {
+  const [[e]] = await db.query('SELECT id FROM hrms_employees WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1', [c.companyId, c.userId]);
+  if (!e) {
+    return { linked: false, employeeId: null, on: dateText(on) || today(), source: 'NONE', plan: null, kras: [], kpis: [], line: 'This login is not linked to an employee record, so there are no KPIs to show.' };
+  }
+  return { linked: true, ...(await scorecardOf(db, c.companyId, e.id, { on })) };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Changing a plan
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -834,6 +969,6 @@ export async function changeTarget(db, c, planId, kpiId, body = {}) {
 }
 
 export default {
-  PLAN_STATUSES, periodOf, listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee, myPlans, myActualHistory,
+  PLAN_STATUSES, periodOf, listPeriods, closePeriod, previewPlans, createPlans, listPlans, readPlan, planEmployeeId, plansOfEmployee, myPlans, myActualHistory, scorecardOf, myScorecard, shortKraName,
   setKraWeight, addKpi, changeKpi, removeKpi, activatePlan, cancelPlan, forEachPlan, changeTarget,
 };

@@ -51,6 +51,7 @@ export const scoringKpi = (k, period) => ({
   id: Number(k.id), planKraId: k.plan_kra_id == null ? null : Number(k.plan_kra_id), weightPercent: num(k.weight_percent),
   direction: k.direction, targetNumber: num(k.target_number), unit: k.unit ?? null,
   combine: k.combine_rule ?? defaultCombine(k.unit, k.direction), slotCount: slotsOf(period, k.entry_frequency).length,
+  entryFrequency: k.entry_frequency || period.frequency || null,
 });
 export const scoringActual = (a) => ({ slotStart: iso(a.slot_start), valueNumber: num(a.value_number), met: a.met ?? null });
 
@@ -175,6 +176,7 @@ export function reviewKpiTable(period, kraRows, kpiRows, actualsByKpi, bands, sl
       actual: r?.combined ?? null, combinedTarget: r?.combinedTarget ?? null,
       achievement: r?.achievement ?? null, band: r?.band ?? 'NO_DATA', bandLabel: BAND_WORDS[r?.band ?? 'NO_DATA'],
       counted: r?.counted ?? 0, slotCount: r?.slotCount ?? 1, scope,
+      gap: r?.gap ?? null, gapText: r?.gapText ?? null, pace: r?.pace ?? null, paceNote: r?.paceNote ?? null,
     };
   }).sort((a, b) => a.kraOrder - b.kraOrder);
   return {
