@@ -151,6 +151,9 @@ try {
   ok(`…its ${sets.B.length} files are kept a row each, raw bytes; the stored body names them`, filesB.length === sets.B.length && filesB.every((f) => f.bytes > 0)
     && JSON.parse(rowB.proposal_json).body.files.every((f, i) => f.fileRef === i && f.file === undefined), J(filesB));
   ok('…the reason, the kind, who asked and the hash are stored', rowB.reason === REASON && rowB.kind === 'upload' && Number(rowB.requested_by) === asker.userId && rowB.base_hash === st.hash);
+  // §68: callers outside the nesting routes (a customer's substitute receipt) see the request holding the line.
+  const holding = await PC.holdingRequestOf(conn, COMPANY, fx.lineId);
+  ok('holdingRequestOf names the request holding the line; "substitute" is a kind with its own words', holding?.id === reqB.id && PC.KINDS.substitute?.label === 'The customer sent a different plate', J([holding?.code, PC.KINDS.substitute]));
 
   /* ───────────── 3. the impact sheet ───────────── */
   section('3. The impact sheet');

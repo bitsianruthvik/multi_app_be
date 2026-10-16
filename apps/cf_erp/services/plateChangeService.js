@@ -15,6 +15,11 @@
  *   nest_plates    PUT …/nesting/plates               standard plates only / any
  *   untracked      POST …/nesting/untracked           marking pieces as cut from untracked offcuts — a request
  *   untracked_undo DELETE …/nesting/untracked         ONLY when it changes what plates the line needs (it seldom does)
+ *   substitute     POST /purchase-lines/:id/receive    a CUSTOMER's PO received with a different item (§68): the lot is
+ *                                                     already in, on hold; the request is the MD's yes / no to it
+ *                                                     (customerMaterialService). Approving records it and frees the
+ *                                                     lot; nothing is re-nested. Rejecting / withdrawing flags the lot
+ *                                                     "return to customer". Its line's hash is not checked.
  *
  * HOW A REQUEST IS MADE. The action is run for real inside a SAVEPOINT, the line is measured before and after,
  * and the savepoint is rolled back: the impact sheet is exactly what the save would do, worked out by the code
@@ -73,6 +78,7 @@ export const KINDS = Object.freeze({
   nest_plates: { label: 'Change which plates nesting may use' },
   untracked: { label: 'Mark pieces as cut from offcuts' },
   untracked_undo: { label: 'Undo pieces cut from offcuts' },
+  substitute: { label: 'The customer sent a different plate' },
 });
 
 export const STATUS_LABEL = Object.freeze({
@@ -150,6 +156,7 @@ export async function lineStates(db, companyId, lineIds) {
          FROM cf_stock_reservations v
          JOIN cf_requisition_lines pl ON pl.company_id = v.company_id AND pl.id = v.pr_line_id AND pl.deleted_at IS NULL
         WHERE v.company_id = ? AND pl.order_line_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
+          AND v.item_id = pl.item_id
         ORDER BY v.id`,
       [companyId, ids],
     ),
@@ -475,6 +482,60 @@ async function holdingRequest(db, companyId, lineId, { lock = false } = {}) {
   return r ?? null;
 }
 
+/** The request holding a line (pending or out of date), or null — for callers outside the nesting routes. */
+export const holdingRequestOf = (db, companyId, lineId) => holdingRequest(db, companyId, lineId);
+
+/**
+ * A SUBSTITUTE on a customer's purchase order (§68) as a request for the MD. The receipt is already booked and
+ * its lot on hold (customerMaterialService.recordSubstitute). The impact sheet compares what was ordered with
+ * what came, beside the line's nesting as it stands. → { id, code }.
+ */
+export async function requestSubstitute(db, c, { lineId, reason, substitute }) {
+  const companyId = c.companyId;
+  const line = await requireLine(db, companyId, lineId);
+  const state = (await lineStates(db, companyId, [line.id])).get(Number(line.id));
+  const { ordered, received, quantity } = substitute;
+  const plate = (f, count) => ({ plateItemId: f.id, code: f.code ?? f.name, name: f.name ?? null, thickness: f.thickness, length: f.length, width: f.width, count, kg: f.kgEach == null ? null : r3(f.kgEach * count) });
+  const metrics = (f) => ({
+    plates: quantity, pieces: 0, tonnesBought: f.kgEach == null ? null : r3((f.kgEach * quantity) / 1000), partsTonnes: null,
+    wasteKg: 0, wastePct: null, offcutKg: 0, offcuts: 0,
+    cost: { value: 0, basis: 'the customer’s own material — it costs us nothing', reason: null },
+  });
+  const before = metrics(ordered); const after = metrics(received);
+  const counts = new Map(); for (const l of state.lots) counts.set(l.plateItemId, (counts.get(l.plateItemId) ?? 0) + 1);
+  const names = await codesOf(db, companyId, [...counts.keys()]);
+  const nesting = [...counts].map(([id, count]) => ({ plateItemId: id, code: names.get(id) ?? `#${id}`, count }));
+  const words = (f) => `${f.code ?? f.name}${f.thickness ? ` (${fmt(f.thickness)} mm${f.length && f.width ? ` × ${fmt(f.length)} × ${fmt(f.width)}` : ''})` : ''}`;
+  const impact = {
+    kind: 'substitute', kindLabel: KINDS.substitute.label, direct: false, reason, requestedBy: { id: c.userId ?? null, name: c.userName ?? null },
+    line: lineHead(line),
+    substitute: {
+      id: substitute.id, purchaseOrder: substitute.purchaseOrder, mr: substitute.mr ?? null, quantity,
+      ordered: plate(ordered, quantity), received: plate(received, quantity), batchId: substitute.batchId ?? null,
+    },
+    nesting: { plates: nesting, text: nesting.length ? `The line's nesting uses ${nesting.map((p) => `${p.count} × ${p.code}`).join(', ')}. It stays as it is — re-nesting is its own request.` : 'The line has no nesting saved.' },
+    plates: {
+      before: [plate(ordered, quantity)], after: [plate(received, quantity)],
+      added: [{ ...plate(received, quantity), from: 0, to: quantity }], removed: [{ ...plate(ordered, quantity), from: quantity, to: 0 }], changed: [], same: false,
+      words: [`+${fmt(quantity)} × ${words(received)}`, `−${fmt(quantity)} × ${words(ordered)}`],
+    },
+    before, after, delta: deltaOf(before, after), choice: null,
+    buying: {
+      purchaseOrders: [substitute.purchaseOrder], items: [], plates: { ordered: quantity, received: quantity, held: 0 },
+      text: `Received on ${substitute.purchaseOrder.code}${substitute.mr ? ` for ${substitute.mr}` : ''}: ${fmt(quantity)} × ${words(received)} in place of ${words(ordered)}. The lot is on hold — production cannot use it until this is approved.`,
+    },
+    sentence: `The customer sent ${fmt(quantity)} × ${words(received)} instead of ${words(ordered)}. Approve to use it; reject to send it back.`,
+  };
+  const [ins] = await db.query(
+    `INSERT INTO cf_plate_change_requests (company_id, order_id, order_line_id, kind, reason, status, base_hash, proposal_json, impact_json, requested_by, created_by)
+     VALUES (?, ?, ?, 'substitute', ?, 'pending', ?, ?, ?, ?, ?)`,
+    [companyId, line.order_id, line.id, String(reason).slice(0, MAX_REASON), state.hash, JSON.stringify({ kind: 'substitute', body: { substitutionId: substitute.id } }), JSON.stringify(impact), c.userId ?? null, c.userId ?? null],
+  );
+  await db.query("UPDATE cf_plate_change_requests SET code = CONCAT('PC-', LPAD(id, 6, '0')) WHERE company_id = ? AND id = ?", [companyId, ins.insertId]);
+  await event(db, c, ins.insertId, 'requested', reason);
+  return { id: ins.insertId, code: `PC-${String(ins.insertId).padStart(6, '0')}` };
+}
+
 const heldSentence = (r, line) => `Plate change ${r.code} is waiting for approval on line ${line.line_no} of ${line.order_code}${r.requested_by_name ? ` (asked by ${r.requested_by_name}: "${String(r.reason).slice(0, 120)}")` : ''}. Nesting is held until it is approved, rejected or withdrawn.`;
 const coveredSentence = (pos) => `A purchase order covers this line (${pos.map((p) => p.code).join(', ')}). A change to its plates goes to the MD for approval.`;
 
@@ -655,7 +716,8 @@ async function readRows(db, companyId, { id = null, ids = null, lineId = null, s
  */
 export function shapeRequest(r, { viewer = {}, live = null } = {}) {
   if (!r) return null;
-  const stale = r.status === 'stale' || (r.status === 'pending' && live != null && live !== r.base_hash);
+  // A substitute (§68) is the MD's yes / no to a lot already in: the line moving under it does not make it out of date.
+  const stale = r.kind !== 'substitute' && (r.status === 'stale' || (r.status === 'pending' && live != null && live !== r.base_hash));
   const status = stale && r.status === 'pending' ? 'pending' : r.status;
   const own = r.requested_by != null && Number(r.requested_by) === Number(viewer.userId);
   const holding = HOLDING.includes(r.status);
@@ -765,6 +827,17 @@ export async function approveChange(db, c, id, input = {}) {
   if (r.requested_by != null && Number(r.requested_by) === Number(c.userId) && !c.isAdmin) throw forbidden(`You asked for ${r.code} — somebody else has to approve it.`);
   const note = blank(input.note) ? null : String(input.note).trim().slice(0, MAX_REASON);
   const line = await requireLine(db, companyId, r.order_line_id, { lock: true });
+  if (r.kind === 'substitute') {
+    // §68: the MD's yes to what the customer sent. Recorded, the lot freed — nothing re-nested, no PO edited.
+    const { decideSubstitute } = await import('./customerMaterialService.js');
+    await decideSubstitute(db, c, r.id, 'approved', r.code);
+    await db.query(
+      `UPDATE cf_plate_change_requests SET status = 'applied', decided_by = ?, decided_at = NOW(), decision_note = ?, applied_at = NOW(), updated_by = ? WHERE company_id = ? AND id = ?`,
+      [c.userId ?? null, note, c.userId ?? null, companyId, r.id]);
+    await event(db, c, r.id, 'approved', note);
+    await event(db, c, r.id, 'applied', 'The substitute is recorded and the lot can be used. Re-nesting the line is its own request.');
+    return { request: await getChange(db, viewerOf(c), r.id), kind: r.kind, lineId: line.id, result: null };
+  }
   const state = (await lineStates(db, companyId, [line.id])).get(Number(line.id));
   if (state.hash !== r.base_hash) {
     await db.query("UPDATE cf_plate_change_requests SET status = 'stale', updated_by = ? WHERE company_id = ? AND id = ?", [c.userId ?? null, companyId, r.id]);
@@ -807,6 +880,7 @@ export async function rejectChange(db, c, id, input = {}) {
   if (!HOLDING.includes(r.status)) throw invalid('NOT_PENDING', `${r.code} is ${STATUS_LABEL[r.status]?.toLowerCase() ?? r.status} — only a change waiting for approval can be rejected.`);
   const note = blank(input.note) ? null : String(input.note).trim().slice(0, MAX_REASON);
   if (!note) throw invalid('NOTE_REQUIRED', 'Say why it is rejected — the person who asked sees the note.');
+  if (r.kind === 'substitute') await (await import('./customerMaterialService.js')).decideSubstitute(db, c, r.id, 'rejected', r.code);
   await db.query("UPDATE cf_plate_change_requests SET status = 'rejected', decided_by = ?, decided_at = NOW(), decision_note = ?, updated_by = ? WHERE company_id = ? AND id = ?",
     [c.userId ?? null, note, c.userId ?? null, c.companyId, r.id]);
   await event(db, c, r.id, 'rejected', note);
@@ -820,6 +894,8 @@ export async function withdrawChange(db, c, id, input = {}) {
   const own = r.requested_by != null && Number(r.requested_by) === Number(c.userId);
   if (!own && !c.isAdmin && !c.canApprove) throw forbidden(`Only the person who asked for ${r.code} can withdraw it.`);
   const note = blank(input.note) ? null : String(input.note).trim().slice(0, MAX_REASON);
+  // A substitute withdrawn is a substitute not taken: the lot goes back to the customer (§68).
+  if (r.kind === 'substitute') await (await import('./customerMaterialService.js')).decideSubstitute(db, c, r.id, 'rejected', r.code);
   await db.query("UPDATE cf_plate_change_requests SET status = 'withdrawn', updated_by = ? WHERE company_id = ? AND id = ?", [c.userId ?? null, c.companyId, r.id]);
   await event(db, c, r.id, 'withdrawn', note);
   return getChange(db, viewerOf(c), r.id);

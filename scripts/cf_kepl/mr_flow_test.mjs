@@ -95,16 +95,17 @@ try {
   const CUS_X = await party('CX', 'Customer X (sends its own steel)', 'is_customer');
   const CUS_Y = await party('CY', 'Customer Y', 'is_customer');
   const ITEM = { [G.A]: 'A', [G.B]: 'B', [G.C]: 'C' };
+  const TRACK = [G.A, G.B, G.C];
   const names = new Map([[S1, 'Supplier one'], [S2, 'Supplier two'], [CUS_X, 'Customer X'], [CUS_Y, 'Customer Y'], [G.CUS, 'Girder customer']]);
 
   /** An order of `lines` girders each, captured with its material supply, locked, confirmed. */
-  const makeOrder = async (key, girders, { customer = G.CUS, materialSupply = 'we_buy' } = {}) => {
-    const so = await SO.createOrder(db, c, { orderType: 'customer', customerId: customer, code: `${tag}-${key}`, committedDate: '2099-12-31', materialSupply });
+  const makeOrder = async (key, girders, { customer = G.CUS, materialSupply = 'we_buy', committed = '2099-12-31', confirm = true } = {}) => {
+    const so = await SO.createOrder(db, c, { orderType: 'customer', customerId: customer, code: `${tag}-${key}`, committedDate: committed, materialSupply });
     let o = so;
     for (const q of girders) o = await SO.addOrderLine(db, c, so.id, { recordId: G.GR.id, quantity: q });
     await db.query('UPDATE cf_sales_orders SET process_id = ? WHERE id = ?', [G.prc.id, so.id]);
     for (const l of o.lines) await LOCK.lockLine(db, c, l.id);
-    await SO.setOrderStatus(db, c, so.id, 'confirmed');
+    if (confirm) await SO.setOrderStatus(db, c, so.id, 'confirmed');
     return { id: so.id, code: `${tag}-${key}`, lines: o.lines.map((l) => ({ id: l.id, lineNo: l.lineNo })), supply: so.materialSupply };
   };
   const mrsOf = async (orderId) => (await RQ.orderRequisitions(db, COMPANY, orderId)).requisitions;
@@ -130,7 +131,7 @@ try {
            FROM cf_stock_reservations v LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
           WHERE v.company_id = ? AND v.item_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL) x
        GROUP BY x.item_id, x.owner_party_id ORDER BY x.item_id, x.owner_party_id`,
-      [COMPANY, [G.A, G.B, G.C], COMPANY, [G.A, G.B, G.C]],
+      [COMPANY, TRACK, COMPANY, TRACK],
     );
     md.push(`**${label}**\n`);
     table(['Material', 'Owner', 'On hand', 'Earmarked to an MR', 'Reserved for production', 'Free'],
@@ -333,7 +334,8 @@ try {
   let sx = await stateOf(X.id);
   ok('our own free A is untouched by the customer MR', (await availability(db, COMPANY, [G.A])).get(G.A).free === oursFreeA);
   const ex = (await MRS.lineReadiness(db, COMPANY, { full: true })).byLine.get(X.lines[0].id);
-  ok("the engine WAITS — it does not lean on our free stock for the customer's material", ex.state === 'waiting' && !ex.reasons.some((r) => r.cover.some((x) => x.kind === 'free' && x.owner !== 'customer')), j(ex.reasons.map((r) => [r.item.code, r.cover])));
+  ok('the customer PO carries a promised date: the line has none, so the committed date of the order (2099-12-31)', cpo.lines.every((l) => l.expectedDate === '2099-12-31') && cpo.expectedDate === '2099-12-31', j(cpo.lines.map((l) => l.expectedDate)));
+  ok("the engine waits for that date — it does not lean on our free stock for the customer's material", ex.state === 'dated' && ex.readyDate === '2099-12-31' && !ex.reasons.some((r) => r.cover.some((x) => x.kind === 'free' && x.owner !== 'customer')), j([ex.state, ex.readyDate, ex.reasons.map((r) => [r.item.code, r.cover])]));
   say(`Customer PO ${cpo.code} to ${names.get(CUS_X)}: ${cpo.lines.map((l) => `${l.item.code.replace(`${tag}-`, '')} ${n(l.quantity)}`).join(', ')} at ₹0.`);
 
   step('C2. Who supplies it is fixed once the MR is raised');
@@ -421,6 +423,126 @@ try {
   ok("valuation: customer X's B is under customers, not in our value", vx && vx.ours.quantity === 0 && vx.customers.quantity > 0, j(val.groups));
   table(['Owner', 'Stock lines', 'Held for them (per unit)'], [['Ours', String(list.counts.owners.ours), '—'],
     ...list.counts.owners.parties.map((p) => [p.name.replace(`${tag} `, ''), String(p.n), list.counts.held.filter((h) => Number(h.partyId) === Number(p.id)).map((h) => `${n(h.quantity)} ${h.uom}`).join(', ')])]);
+
+  /* ══════════════════ D. PROMISED DATES, PLATE CHANGES, SUBSTITUTES, MATERIAL TO RETURN (§68) ══════════════════ */
+  step('D1. The customer\'s promised date', 'An inquiry with no committed date anywhere, material from the customer. Raising its MR needs the date the customer promised.');
+  const ND = await makeOrder('NODATE', [1], { customer: CUS_X, materialSupply: 'customer', committed: null, confirm: false });
+  let e2 = await refusal(() => RQ.raiseRequisitions(db, c, ND.id, {}));
+  ok('with no committed date on the line or the order, the raise asks for the promised date (422 CUSTOMER_DATE)', e2?.code === 'CUSTOMER_DATE', j([e2?.code, e2?.message]));
+  say(`Refused: ${e2?.message}`);
+  const nd = await RQ.raiseRequisitions(db, c, ND.id, { customerDate: D(12) });
+  ok(`with the date typed (${D(12)}), the customer PO carries it on every line`, nd.customerPurchaseOrders.length === 1 && nd.customerPurchaseOrders[0].lines.every((l) => l.expectedDate === D(12)), j(nd.customerPurchaseOrders[0]?.lines.map((l) => l.expectedDate)));
+  // An older customer PO with no date (made before §68): the date is given on the PO; the MR line follows.
+  const ndPo = nd.customerPurchaseOrders[0];
+  await db.query('UPDATE cf_purchase_orders SET expected_date = NULL WHERE id = ?', [ndPo.id]);
+  await db.query('UPDATE cf_purchase_order_lines SET expected_date = NULL WHERE purchase_order_id = ?', [ndPo.id]);
+  let ndMr = (await mrsOf(ND.id))[0];
+  ok('an undated customer PO: the MR line says "no date yet"', ndMr.lines.every((l) => l.status === 'ordered_undated') && ndMr.lines.every((l) => l.purchase.every((p) => p.purchaseOrder.suppliedByCustomer)), j(ndMr.lines.map((l) => l.status)));
+  await PS.updatePurchaseOrder(db, c, ndPo.id, { expectedDate: D(14) });
+  ndMr = (await mrsOf(ND.id))[0];
+  ok("giving the customer's promised date on the PO dates the MR lines", ndMr.lines.every((l) => l.status === 'covered' && l.cover.lastDate === D(14)), j(ndMr.lines.map((l) => [l.status, l.cover.lastDate])));
+  await stateOf(ND.id, `After the promised date ${D(14)} is given:`);
+
+  step('D2. A plate change on a line covered by a CUSTOMER PO needs the MD, like any PO');
+  const PC = await imp('apps/cf_erp/services/plateChangeService.js');
+  const SB = await makeOrder('SUB', [1], { customer: CUS_X, materialSupply: 'customer' });
+  const rsb = await RQ.raiseRequisitions(db, c, SB.id, {});
+  const sbPo = rsb.customerPurchaseOrders[0];
+  const gst = (await PC.lineStates(db, COMPANY, [SB.lines[0].id])).get(SB.lines[0].id);
+  ok('the gate counts the customer PO as cover', gst.covering.some((s) => s.po.id === sbPo.id), j(gst.covering.map((s) => s.po.code)));
+  e2 = await refusal(() => PC.plateChangeGate(db, c, SB.lines[0].id, 'nest_plates', { plates: 'standard' }));
+  ok('a plate change without a reason is refused, naming the customer PO — it goes to the MD', e2?.code === 'PLATE_CHANGE_REASON' && e2.message.includes(sbPo.code), j([e2?.code, e2?.message]));
+  say(`Refused: ${e2?.message}`);
+
+  step('D3. The customer sends a DIFFERENT plate — taken, held, and sent to the MD',
+    'On the SUB order the customer sends 5 kg of "C 12 mm" instead of C. Then 6 kg of "B 12 mm" instead of B.');
+  const [[cls]] = await db.query('SELECT classification_id FROM cf_master_records WHERE id = ?', [G.C]);
+  const specId = async (code) => (await db.query('SELECT id FROM cf_specifications WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [COMPANY, code]))[0][0]?.id;
+  const sized = async (key, t) => {
+    const it = (await imp('apps/cf_erp/services/masterRecordService.js'));
+    const id = (await it.createItem(db, c, { itemType: 'catalog', classificationId: cls.classification_id, code: `${tag}-${key}`, name: `${tag} ${key}`, uom: 'kg', status: 'active' })).id;
+    for (const [code, v] of [['THICKNESS', t], ['LENGTH', 3000], ['WIDTH', 1500]]) {
+      const sid = await specId(code);
+      if (sid) await db.query("INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, value_number, source) VALUES (?, ?, 'master', ?, ?, 'entered')", [COMPANY, sid, id, v]);
+    }
+    return id;
+  };
+  const C12 = await sized('C12', 12);
+  const B12 = await sized('B12', 12);
+  ITEM[C12] = 'C 12 mm'; ITEM[B12] = 'B 12 mm'; TRACK.push(C12, B12);
+  const poO2 = (await RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S1, place: true, expectedDate: D(9), lines: [{ prLineId: mrLine(r2o.requisitions[0], G.B).id, quantity: 1 }] }] })).purchaseOrders[0];
+  e2 = await refusal(() => PS.receiveLine(db, c, poLineOf(poO2, G.B).id, { quantity: 1, stockingAreaId: G.store, substituteItemId: C12, substituteReason: 'x' }));
+  ok("a SUPPLIER's PO still refuses a different item", !!e2 && /only the item ordered/.test(j(e2.problems ?? e2.message)), j(e2?.problems ?? e2?.message));
+  e2 = await refusal(() => PS.receiveLine(db, c, poLineOf(sbPo, G.C).id, { stockingAreaId: G.store, substituteItemId: C12 }));
+  ok('a substitute needs a reason', !!e2 && /Say why a different item came/.test(j(e2.problems)), j(e2?.problems));
+  const sc = await PS.receiveLine(db, c, poLineOf(sbPo, G.C).id, { stockingAreaId: G.store, substituteItemId: C12, substituteReason: 'customer sent 12 mm instead of 11 mm' });
+  say(sc.substitute.message);
+  const lotC12 = (await db.query('SELECT b.id, b.status, b.status_note, b.owner_party_id, b.owner_order_id FROM cf_stock_batches b WHERE b.item_id = ? ORDER BY b.id DESC LIMIT 1', [C12]))[0][0];
+  ok("the lot is the customer's, for SUB, and ON HOLD", Number(lotC12.owner_party_id) === CUS_X && Number(lotC12.owner_order_id) === SB.id && lotC12.status === 'on_hold', j(lotC12));
+  ok('…and earmarked to the MR line (a hold of the item received)', sc.held.length === 1 && sc.held[0].quantity === 5, j(sc.held));
+  const req1 = await PC.getChange(db, { companyId: COMPANY, userId: user.id, canApprove: true, isAdmin: true }, sc.substitute.plateChange.id);
+  ok(`a plate-change request ${req1.code} (kind substitute) waits for the MD, with the reason and the before / after`, req1.kind === 'substitute' && req1.status === 'pending' && !req1.stale && req1.canApprove && req1.reason.includes('12 mm') && req1.impact.plates.words.length === 2 && /instead of/.test(req1.impact.sentence), j([req1.kind, req1.status, req1.impact?.plates?.words]));
+  table(['Request', 'Kind', 'Status', 'Impact'], [[req1.code, req1.kindLabel, req1.statusLabel, `${req1.impact.sentence} ${req1.impact.plates.words.join(' · ')}`]]);
+  let sbMr = (await mrsOf(SB.id))[0];
+  ok('the MR line for C still shows C open — what came is not C until the MD says so', mrLine(sbMr, G.C).cover.open === 5 && mrLine(sbMr, G.C).cover.received === 5 && mrLine(sbMr, G.C).cover.earmarked === 0, j(mrLine(sbMr, G.C).cover));
+  e2 = await refusal(() => PC.plateChangeGate(db, c, SB.lines[0].id, 'nest_plates', { plates: 'standard', reason: 'r' }));
+  ok('while it waits, the line is held for any other plate change', e2?.code === 'PLATE_CHANGE_PENDING', j([e2?.code, e2?.message]));
+  await stockByOwner('Stock by owner (the substitute lot is held: earmarked, not free)');
+
+  const mdUser = { ...c, canApprove: true, isAdmin: true };
+  const ap = await PC.approveChange(db, mdUser, req1.id, { note: 'Use 12 mm.' });
+  const lotC12b = (await db.query('SELECT status FROM cf_stock_batches WHERE id = ?', [lotC12.id]))[0][0];
+  ok('approved: done, the substitution recorded, the lot usable', ap.request.status === 'applied' && lotC12b.status === 'available', j([ap.request.status, lotC12b.status]));
+  const [[subRow]] = await db.query('SELECT status FROM cf_po_substitutions WHERE request_id = ?', [req1.id]);
+  ok('…the substitution row says approved; nothing re-nested (the MR still asks for C)', subRow.status === 'approved' && mrLine((await mrsOf(SB.id))[0], G.C).cover.open === 5);
+
+  const sb2 = await PS.receiveLine(db, c, poLineOf(sbPo, G.B).id, { stockingAreaId: G.store, substituteItemId: B12, substituteReason: 'customer sent 12 mm B' });
+  const rj = await PC.rejectChange(db, mdUser, sb2.substitute.plateChange.id, { note: 'We cannot use 12 mm here.' });
+  const lotB12 = (await db.query('SELECT id, status, status_note FROM cf_stock_batches WHERE item_id = ? ORDER BY id DESC LIMIT 1', [B12]))[0][0];
+  const [[b12holds]] = await db.query("SELECT COUNT(*) AS n FROM cf_stock_reservations WHERE batch_id = ? AND status = 'active'", [lotB12.id]);
+  ok('rejected: the lot stays the customer\'s, on hold, flagged "return to customer", its earmark let go', rj.status === 'rejected' && lotB12.status === 'on_hold' && /Return to customer/.test(lotB12.status_note) && Number(b12holds.n) === 0, j([rj.status, lotB12, b12holds]));
+
+  step('D4. EXTRA customer material — stays theirs, not earmarked, listed to go back');
+  const CM = await imp('apps/cf_erp/services/customerMaterialService.js');
+  const gA = await PS.receiveLine(db, c, poLineOf(sbPo, G.A).id, { quantity: 6, stockingAreaId: G.store });
+  ok('the customer sent A 6 where the MR asked 4: received, 4 earmarked, 2 extra', gA.held.reduce((t, h) => t + h.quantity, 0) === 4 && gA.extra?.quantity === 2, j([gA.held, gA.extra]));
+  say(gA.extra.text);
+  let ret = await CM.customerReturns(db, COMPANY, {});
+  const mine = (rows) => rows.filter((r) => String(r.order?.code ?? '').startsWith(tag));
+  const want = mine(ret.toReturn);
+  table(['Customer', 'Order', 'Material', 'Lot', 'Quantity', 'Why'], want.map((r) => [r.party.name.replace(`${tag} `, ''), r.order.code, ITEM[r.item.id] ?? r.item.code, r.batch.code, n(r.quantity), r.text]));
+  ok('to return: SUB · A 2 (extra on the customer PO)', want.some((r) => r.order.id === SB.id && r.item.id === G.A && r.quantity === 2 && r.why === 'extra'), j(want));
+  ok('to return: CUST · B 3 (sent outside a PO, more than the MR needs)', want.some((r) => r.order.id === X.id && r.item.id === G.B && r.quantity === 3 && r.why === 'extra'), j(want));
+  ok('to return: SUB · the B 12 mm lot not accepted', want.some((r) => r.batch.id === lotB12.id && r.why === 'substitute_rejected'), j(want));
+  ok('not on it: what an MR still needs, or a substitute approved', !want.some((r) => r.batch.id === lotC12.id) && !want.some((r) => r.order.id === ND.id), j(want));
+  ok('the substitutes are listed with their state', mine(ret.substitutes.map((s) => ({ ...s, order: s.order }))).length >= 2 && ret.substitutes.some((s) => s.status === 'approved') && ret.substitutes.some((s) => s.status === 'rejected'));
+  const extraA = want.find((r) => r.order.id === SB.id && r.item.id === G.A);
+  const [[areaOfA]] = await db.query('SELECT stocking_area_id FROM cf_stock_balances WHERE batch_id = ? AND quantity > 0 LIMIT 1', [extraA.batch.id]);
+  await OWN.returnToCustomer(db, c, { orderId: SB.id, lines: [{ itemId: G.A, batchId: extraA.batch.id, quantity: 2, fromAreaId: areaOfA.stocking_area_id }] });
+  ret = await CM.customerReturns(db, COMPANY, { orderId: SB.id });
+  ok('returning it (the existing "return to customer" movement) clears it from the list', !ret.toReturn.some((r) => r.item.id === G.A && r.why === 'extra'), j(ret.toReturn));
+  sbMr = (await mrsOf(SB.id))[0];
+  ok('…and the MR still has its 4 of A earmarked', mrLine(sbMr, G.A).cover.earmarked === 4);
+  // The substitute that was not accepted is ON HOLD — and still goes back through the same return movement.
+  const [[areaOfB12]] = await db.query('SELECT stocking_area_id, quantity FROM cf_stock_balances WHERE batch_id = ? AND quantity > 0 LIMIT 1', [lotB12.id]);
+  const back12 = await OWN.returnToCustomer(db, c, { orderId: SB.id, lines: [{ itemId: B12, batchId: lotB12.id, quantity: Number(areaOfB12.quantity), fromAreaId: areaOfB12.stocking_area_id }] });
+  ok('the rejected substitute lot (on hold) is returned to the customer by the return movement', !!back12?.id || !!back12?.movement?.id || !!back12?.code, j(Object.keys(back12 ?? {})));
+  ret = await CM.customerReturns(db, COMPANY, { orderId: SB.id });
+  const [[b12left]] = await db.query("SELECT COALESCE(SUM(quantity), 0) AS q FROM cf_stock_balances WHERE batch_id = ?", [lotB12.id]);
+  const [[b12claims]] = await db.query("SELECT COUNT(*) AS n FROM cf_stock_reservations WHERE batch_id = ? AND status = 'active' AND deleted_at IS NULL", [lotB12.id]);
+  ok('…it leaves the "to return" list, nothing of it is on hand, and nothing is earmarked on it', !ret.toReturn.some((r) => r.batch.id === lotB12.id) && Number(b12left.q) === 0 && Number(b12claims.n) === 0, j([ret.toReturn, b12left, b12claims]));
+  say(`The B 12 mm lot not accepted went back to the customer (${n(areaOfB12.quantity)} kg) — off the list, nothing earmarked.`);
+  // …while a lot of OURS on hold still cannot go to production.
+  const MRec = await imp('apps/cf_erp/services/masterRecordService.js');
+  const ourB = (await MRec.createItem(db, c, { itemType: 'catalog', classificationId: cls.classification_id, code: `${tag}-OURLOT`, name: `${tag} our lot plate`, uom: 'nos', trackedBy: 'batch', status: 'active' })).id;
+  const inOurs = await ST.postMovement(db, c, { movementType: 'receipt', toAreaId: G.store, lines: [{ itemId: ourB, quantity: 2, unitCost: 100, batch: { code: `${tag}-OL1` } }] });
+  const ourLot = inOurs.lines.find((x) => x.item?.id === ourB)?.batch?.id;
+  await db.query("UPDATE cf_stock_batches SET status = 'on_hold', status_note = 'test hold' WHERE id = ?", [ourLot]);
+  const e3 = await refusal(() => ST.postMovement(db, c, { movementType: 'issue', fromAreaId: G.store, lines: [{ itemId: ourB, batchId: ourLot, quantity: 1 }] }));
+  ok('an on-hold lot of OURS is still refused for issue', !!e3 && /on hold/.test(j([e3.message, e3.problems])), j([e3?.message, e3?.problems]));
+  ok('…and it is not free for production (availability counts none of it)', (await availability(db, COMPANY, [ourB])).get(ourB).free === 0);
+  await stateOf(SB.id, 'The SUB order after all this:');
+  await stockByOwner();
 
   // ── the end ─────────────────────────────────────────────────────────────────────────────────
   await db.rollback();

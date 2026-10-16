@@ -1463,7 +1463,9 @@ export async function takeMrEarmarks(db, c, releaseId) {
        JOIN cf_requisitions rq ON rq.id = prl.requisition_id AND rq.deleted_at IS NULL
        JOIN cf_master_records m ON m.id = v.item_id
        LEFT JOIN cf_item_details i ON i.master_id = v.item_id AND i.deleted_at IS NULL
+       LEFT JOIN cf_stock_batches sb ON sb.id = v.batch_id
       WHERE v.company_id = ? AND prl.order_line_id = ? AND v.held_for_order_id IS NOT NULL AND v.status = 'active' AND v.deleted_at IS NULL
+        AND (v.batch_id IS NULL OR sb.status = 'available')
       ORDER BY v.id FOR UPDATE`,
     [c.companyId, rel.order_line_id],
   );

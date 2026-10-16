@@ -103,7 +103,7 @@ function shapeLine(pl, { n, reason, holds, allocs, todayText, customer = false }
     const dated = DATED_PO_STATUSES.includes(a.po_status);
     return {
       allocationId: a.id,
-      purchaseOrder: { id: a.po_id, code: a.po_code, status: a.po_status },
+      purchaseOrder: { id: a.po_id, code: a.po_code, status: a.po_status, suppliedByCustomer: !!Number(a.supplied_by_customer ?? 0) },
       purchaseLineId: a.po_line_id,
       supplier: a.supplier_id ? { id: a.supplier_id, name: a.supplier_name } : null,
       quantity: Number(a.quantity), received: Number(a.qty_received), outstanding,
@@ -256,13 +256,13 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
          LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
          LEFT JOIN cf_purchase_order_lines l2 ON l2.id = v.purchase_line_id
          LEFT JOIN cf_purchase_orders p ON p.id = l2.purchase_order_id
-        WHERE v.company_id = ? AND pl.requisition_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL
+        WHERE v.company_id = ? AND pl.requisition_id IN (?) AND v.status = 'active' AND v.deleted_at IS NULL AND v.item_id = pl.item_id
         ORDER BY v.id`,
       [companyId, ids],
     ),
     db.query(
       `SELECT a.id, a.pr_line_id, a.quantity, a.qty_received, l2.id AS po_line_id, COALESCE(l2.expected_date, p.expected_date) AS due,
-              p.id AS po_id, p.code AS po_code, p.status AS po_status, s.id AS supplier_id, s.name AS supplier_name
+              p.id AS po_id, p.code AS po_code, p.status AS po_status, p.supplied_by_customer, s.id AS supplier_id, s.name AS supplier_name
          FROM cf_purchase_line_orders a
          JOIN cf_requisition_lines pl ON pl.id = a.pr_line_id
          JOIN cf_purchase_order_lines l2 ON l2.id = a.purchase_line_id AND l2.deleted_at IS NULL
@@ -352,6 +352,8 @@ export async function orderRequisitions(db, companyId, orderId, { R: given = nul
     return {
       line: { id: Number(l.id), lineNo: l.line_no, name: l.item_name ?? l.description ?? `Line ${l.line_no}`, quantity: Number(l.quantity), frozen: !!l.locked_at, released: !!l.release_id },
       supply: sup.supply, supplyLabel: SUPPLY_LABEL[sup.supply], ownSupply: sup.own,
+      // §68: the customer's promised date the raise proposes for this line (its committed date, else the order's).
+      customerDateDefault: dateOnly(l.committed_date) ?? dateOnly(l.order_committed) ?? null,
       canRaise: !!n?.known && materials.length > 0,
       reason: !n?.known ? n?.why ?? null : materials.length ? (n.ready ? null : n.why) : 'Everything under this line is made — it buys nothing.',
       materials,
@@ -498,7 +500,7 @@ export async function raiseRequisitions(db, c, orderId, input = {}) {
   const ours = input.earmark === true || input.earmark === 'true';
   const theirs = prs.filter((p) => supplyOf(p.supply) === 'customer').map((p) => p.id);
   const earmarked = ours || theirs.length ? await earmarkOnRaise(db, c, o, ours ? prs.map((p) => p.id) : theirs, { ours }) : [];
-  const customerPurchaseOrders = theirs.length ? await askCustomer(db, c, o, theirs) : [];
+  const customerPurchaseOrders = theirs.length ? await askCustomer(db, c, o, theirs, { date: input.customerDate, lines: can }) : [];
   return { raised: fresh.length, refreshed: had.length, notRaised, earmarked, customerPurchaseOrders, ...(await orderRequisitions(db, c.companyId, o.id)) };
 }
 
@@ -551,15 +553,27 @@ async function earmarkOnRaise(db, c, o, prIds, { ours = false } = {}) {
  * ₹0. Its receipt is the customer's own lot, earmarked to the MR line (purchaseService.receiveLine).
  * Nothing open → nothing made. Returns the purchase orders made (purchaseOrdersBrief).
  */
-async function askCustomer(db, c, o, prIds) {
+async function askCustomer(db, c, o, prIds, { date = null, lines = [] } = {}) {
   if (!o.customer_id) return [];
   const views = await readRequisitions(db, c.companyId, { ids: prIds });
   const asked = views.map((v) => ({ v, lines: v.lines.filter((l) => l.status !== 'not_needed' && l.cover.open > EPS && l.item.trackedBy !== 'individual') }))
     .filter((x) => x.lines.length);
   if (!asked.length) return [];
+  /*
+   * THE PROMISED DATE (§68): the date the customer is to send it by — typed on the raise (`customerDate`), else
+   * the earliest committed date of the lines asked about, else the order's. With none, the raise is refused so
+   * the screen can ask for it.
+   */
+  let promised = blank(date) ? null : String(date);
+  if (promised && !DATE_RE.test(promised)) throw invalid('INVALID', "The customer's promised date needs YYYY-MM-DD.");
+  if (!promised) {
+    const asking = new Set(asked.map((x) => Number(x.v.line.id)));
+    promised = lines.filter((l) => asking.has(Number(l.id))).map((l) => dateOnly(l.committed_date) ?? dateOnly(l.order_committed)).filter(Boolean).sort()[0] ?? null;
+  }
+  if (!promised) throw invalid('CUSTOMER_DATE', `Give the date ${o.code}'s customer promised to send the material — the line and the order have no committed date to take it from.`);
   const made = await makePurchaseOrders(db, c, {
     orders: [{
-      supplierId: o.customer_id, place: true,
+      supplierId: o.customer_id, place: true, expectedDate: promised,
       notes: `Material the customer supplies for ${o.code} (${asked.map((x) => x.v.code).join(', ')}).`,
       lines: asked.flatMap((x) => x.lines.map((l) => ({ prLineId: l.id, quantity: l.cover.open }))),
     }],

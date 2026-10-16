@@ -51,6 +51,7 @@ import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/l
 import { generate } from '../modules/codegen/index.js';
 import { availability, plannedLines, plannedMaterialOfLines } from './releaseService.js';
 import { postMovement } from './stockService.js';
+import { checkSubstitute, recordSubstitute } from './customerMaterialService.js';
 import {
   CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
 } from './priceService.js';
@@ -945,10 +946,14 @@ export async function receiveLine(db, c, lineId, input = {}) {
   const problems = [];
   const left = outstandingOf(l);
   const quantity = readQty(input.quantity ?? left, 'Quantity', problems);
-  if (quantity != null && quantity > left + EPS) problems.push(`Only ${fmt(left)} ${l.uom} of this line is still outstanding.`);
-  if (blank(input.stockingAreaId)) problems.push('Say which stocking area it went into.');
   const theirs = !!Number(l.supplied_by_customer ?? 0);
+  // §68: the customer may send MORE than asked — it is theirs, not earmarked, and flagged to go back. A supplier may not.
+  if (quantity != null && quantity > left + EPS && !theirs) problems.push(`Only ${fmt(left)} ${l.uom} of this line is still outstanding.`);
+  if (blank(input.stockingAreaId)) problems.push('Say which stocking area it went into.');
+  // §68: a DIFFERENT item than the line — only on a customer's PO, with a reason, as a plate change for the MD.
+  const substitute = blank(input.substituteItemId) ? null : await checkSubstitute(db, c.companyId, l, input, problems);
   const receipt = receiptLineFor(l, { ...input, quantity }, problems);
+  if (substitute) { receipt.itemId = substitute.received.id; delete receipt.batchId; delete receipt.batch; }
   if (theirs) {
     /*
      * CUSTOMER-SUPPLIED (§66): what arrives is the CUSTOMER's lot (owner = the customer, for the order the
@@ -971,10 +976,19 @@ export async function receiveLine(db, c, lineId, input = {}) {
   });
   await db.query('UPDATE cf_stock_movements SET purchase_line_id = ? WHERE company_id = ? AND id = ?', [l.id, c.companyId, movement.id]);
   await db.query('UPDATE cf_purchase_order_lines SET qty_received = qty_received + ? WHERE company_id = ? AND id = ?', [quantity, c.companyId, l.id]);
-  // What was bought for a sales order is held for it as it arrives (init.sql §43).
-  const held = await holdOnReceipt(db, c, l, quantity, movement.lines?.find((x) => x.item?.id === l.item_id)?.batch?.id ?? null);
+  // What was bought for a sales order is held for it as it arrives (init.sql §43) — a substitute too, as the item it is.
+  const itemIn = substitute ? substitute.received.id : l.item_id;
+  const batchIn = movement.lines?.find((x) => x.item?.id === itemIn)?.batch?.id ?? null;
+  const held = await holdOnReceipt(db, c, substitute ? { ...l, item_id: itemIn } : l, quantity, batchIn);
+  const sub = substitute ? await recordSubstitute(db, c, { l, check: substitute, quantity, movementId: movement.id, batchId: batchIn }) : null;
   await restate(db, c.companyId, l.purchase_order_id);
-  return { movement, held, order: await getPurchaseOrder(db, c.companyId, l.purchase_order_id) };
+  const extra = round6(quantity - held.reduce((t, h) => t + h.quantity, 0));
+  return {
+    movement, held, order: await getPurchaseOrder(db, c.companyId, l.purchase_order_id),
+    ...(sub ? { substitute: sub } : {}),
+    // §68: more than the MR asked for stays the customer's, not earmarked — it is on the "to return" list.
+    ...(theirs && extra > EPS ? { extra: { quantity: extra, text: `${fmt(extra)} ${l.uom} more than asked — it stays the customer's, not earmarked, and is listed to go back to them.` } } : {}),
+  };
 }
 
 /**

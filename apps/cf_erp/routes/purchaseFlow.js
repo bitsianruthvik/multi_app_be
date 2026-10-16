@@ -26,6 +26,8 @@
  *   POST /requisition-lines/:id/release-excess      { apply? } — more is held / coming than the line needs: let it go
  *   GET  /buying/board?orderId=&search=             requisitions by status, and lines that have none yet
  *   PUT  /order-lines/:id/material-supply           { supply: 'we_buy' | 'customer' | null } — who supplies the line's material (§66)
+ *   GET  /customer-material/returns?orderId=&partyId= customer material to go back, and substitutes (§68)
+ * Raise takes `customerDate` (§68): the customer PO's promised date; else the lines' committed date, else 422 CUSTOMER_DATE.
  * MATERIAL REQUEST (§66): the requisition is the MR. POST /orders/:id/requisitions { earmark: true } earmarks free
  * stock as it raises; a customer-supplied MR earmarks the customer's own lots and asks the rest of the customer on
  * a PO to them as vendor (answer: earmarked, customerPurchaseOrders).
@@ -45,6 +47,7 @@ import {
 } from '../services/requisitionService.js';
 import { lineMaterialReady } from '../services/materialReadyService.js';
 import { setLineSupply } from '../services/salesOrderService.js';
+import { customerReturns } from '../services/customerMaterialService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -90,5 +93,7 @@ router.post('/requisition-lines/:id/release-excess', view, handle((req) => {
 }));
 router.get('/buying/board', view, handle((req) => buyingBoard(pool, ctx(req).companyId, req.query)));
 router.put('/order-lines/:id/material-supply', manage, handle((req) => tx(req, (db, c) => setLineSupply(db, c, id(req), body(req)))));
+// §68: customer material to go back (extra, a substitute not accepted) and the substitutes, by order or customer.
+router.get('/customer-material/returns', view, handle((req) => customerReturns(pool, ctx(req).companyId, req.query)));
 
 export default router;

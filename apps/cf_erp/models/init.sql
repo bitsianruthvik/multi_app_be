@@ -5991,3 +5991,58 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME = 'cf_stock_ledger' AND INDEX_NAME = 'idx_csl_owner') > 0,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §68  CUSTOMER MATERIAL: a SUBSTITUTE on the customer's PO, approved by the MD (2026-10-16) — the same text as TM/s68.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_BUYING_V2.md "2026-10-16 (2) — substitutes, promised
+-- dates, material to return".
+--
+-- User, 2026-10-16: a receipt on a customer-supplied PO may be a DIFFERENT plate than the PO line ("customer sent
+-- 12 mm instead of 11 mm"), with a reason. The lot is the customer's and earmarked to the MR as usual; the
+-- substitution makes a plate-change request (kind 'substitute') for the MD. Until it is approved the lot is ON HOLD
+-- (production cannot use it). Approved: the substitution is recorded and the lot is usable (re-nesting is its own
+-- request). Rejected (or withdrawn): the lot stays the customer's, flagged "return to customer".
+--
+-- cf_po_substitutions   one row per substitute receipt: the PO line, the MR line it served, the item ordered and
+--                       the item received, the lot and quantity, the reason, the request, and its status
+--                       ('pending' | 'approved' | 'rejected').
+-- "Extra" customer material (more than the MR needs) is worked out on every read — nothing is stored for it.
+CREATE TABLE IF NOT EXISTS cf_po_substitutions (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  purchase_order_id  INT            NOT NULL,
+  purchase_line_id   INT            NOT NULL,
+  order_id           INT            NULL,
+  order_line_id      INT            NULL,
+  pr_line_id         INT            NULL,
+  ordered_item_id    INT            NOT NULL,
+  received_item_id   INT            NOT NULL,
+  batch_id           INT            NULL,
+  movement_id        INT            NULL,
+  quantity           DECIMAL(18,6)  NOT NULL,
+  reason             VARCHAR(1000)  NOT NULL,
+  request_id         INT            NULL,
+  status             VARCHAR(12)    NOT NULL DEFAULT 'pending',
+  decided_by         INT            NULL,
+  decided_at         DATETIME       NULL,
+
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT            NULL,
+
+  UNIQUE KEY uq_cpos_tenant (company_id, id),
+  KEY idx_cpos_order   (company_id, order_id),
+  KEY idx_cpos_line    (company_id, order_line_id),
+  KEY idx_cpos_batch   (company_id, batch_id),
+  KEY idx_cpos_request (company_id, request_id),
+
+  CONSTRAINT fk_cpos_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_po_substitutions'
+             AND COLUMN_NAME IN ('company_id', 'purchase_order_id', 'purchase_line_id', 'order_id', 'order_line_id', 'pr_line_id', 'ordered_item_id',
+                                 'received_item_id', 'batch_id', 'movement_id', 'quantity', 'reason', 'request_id', 'status')) = 14
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_po_substitutions'
+             AND INDEX_NAME IN ('uq_cpos_tenant', 'idx_cpos_order', 'idx_cpos_batch')) = 3,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
