@@ -32,7 +32,7 @@
 import { HrmsError, invalid, notFound, conflict } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { today as todayText, dateText, LIVE_ON } from '../positionService.js';
-import { loadAssignmentIndex, resolveEffective, rulesOfPolicies, applicability } from '../leavePolicyRead.js';
+import { loadAssignmentIndex, resolveEffective, rulesOfPolicies, applicability, noticeForQuantity } from '../leavePolicyRead.js';
 import { resolveReporting, resolvePositionReporting } from '../reportingResolver.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL } from '../accessScope.js';
 import {
@@ -105,7 +105,7 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
          FROM hrms_employees WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL`, [companyId, ids]),
     db.query(SEATS_SQL, [companyId, ids, on, on]),
     loadAssignmentIndex(db, companyId),
-    db.query('SELECT id, year_starts_month FROM hrms_leave_policies WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
+    db.query('SELECT id, year_starts_month, effective_from FROM hrms_leave_policies WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query(
       `SELECT id, employee_id, leave_type_id, period_key, opening_balance, note, updated_at
          FROM hrms_leave_balances WHERE company_id = ? AND employee_id IN (?) AND deleted_at IS NULL`, [companyId, ids]),
@@ -119,6 +119,7 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
   const seatOf = new Map();
   for (const s of seats) if (!seatOf.has(s.employee_id)) seatOf.set(s.employee_id, s);
   const startsOf = new Map(policies.map((p) => [p.id, Number(p.year_starts_month) || 1]));
+  const effectiveFromOf = new Map(policies.map((p) => [p.id, dateText(p.effective_from)]));
 
   const effectiveOf = new Map();
   for (const e of emps) {
@@ -181,6 +182,8 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
       effective,
       rules,
       startsMonth: effective.policy ? (startsOf.get(effective.policy.id) ?? 1) : 1,
+      // §23.1: nothing is earned before the policy takes effect.
+      effectiveFrom: effective.policy ? (effectiveFromOf.get(effective.policy.id) ?? null) : null,
       calendar,
       openings,
       requests: (requestsBy.get(e.id) ?? []).map((r) => ({
@@ -199,7 +202,7 @@ async function worldOf(db, companyId, employeeId) {
 }
 
 /** The policy as the screens show it: Effective, its year start and its rules. */
-const policyOf = (w) => ({ ...w.effective, yearStartsMonth: w.effective.policy ? w.startsMonth : null, rules: w.rules });
+const policyOf = (w) => ({ ...w.effective, yearStartsMonth: w.effective.policy ? w.startsMonth : null, effectiveFrom: w.effectiveFrom ?? null, rules: w.rules });
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Balances
@@ -226,7 +229,7 @@ function balanceFor(w, rule, { year, asOf, excludeRequestId = null }) {
     rule, year, startsMonth: w.startsMonth, joinDate: w.employee.joinDate, asOf,
     openings: w.openings.get(rule.leaveTypeId) ?? new Map(),
     requests: w.requests.filter((r) => r.leaveTypeId === rule.leaveTypeId),
-    calendar: w.calendar, excludeRequestId,
+    calendar: w.calendar, excludeRequestId, effectiveFrom: w.effectiveFrom ?? null,
   });
   let cannotWhy = null;
   const g = genderOf(w.employee.gender);
@@ -259,6 +262,53 @@ function yearFor(w, key) {
 const isSick = (rule) => /^SL$/i.test(rule?.leaveTypeCode ?? '') || /sick|medical/i.test(rule?.leaveTypeName ?? '');
 const block = (code, text) => ({ level: 'BLOCK', code, text });
 const noteOf = (code, text) => ({ level: 'NOTE', code, text });
+
+/**
+ * The sentences of a rule's note that turn on attendance (EL's "20 present days", ML's
+ * "80 days worked"), or null. Attendance is not recorded, so such a condition can only be
+ * assumed and checked by HR — the request says so (§23.1: a note, not a field).
+ */
+const ATTENDANCE_RE = /\b(attendance|attended|present|presence|worked)\b/i;
+export function attendanceSentences(notes) {
+  if (!notes) return null;
+  const hit = String(notes).split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter((x) => x && ATTENDANCE_RE.test(x));
+  return hit.length ? hit.join(' ') : null;
+}
+
+/** The longest run of days off that still joins two leaves ("next to" across a long holiday break). */
+const MAX_OFF_RUN = 40;
+
+/** Are `a` and `b` (a < b) next to each other: nothing but days off strictly between them? */
+function onlyDaysOffBetween(calendar, a, b) {
+  let n = 0;
+  for (let d = addDays(a, 1); d < b; d = addDays(d, 1)) {
+    if (calendar.isWorking(d) || (n += 1) > MAX_OFF_RUN) return false;
+  }
+  return true;
+}
+
+/**
+ * A PENDING / APPROVED request of a leave type this one may not touch (§23.1): the asked
+ * rule's own `notWithLeaveTypeIds`, or another rule naming the asked type in its own — the
+ * policy forbids the pair either way round. Touching = overlapping, or next to it with only
+ * days off between. @returns { request, overlaps } | null
+ */
+function notWithClash(w, rule, ask, excludeRequestId) {
+  const forbidden = new Set((rule.notWithLeaveTypeIds ?? []).map(Number));
+  for (const other of w.rules) {
+    if ((other.notWithLeaveTypeIds ?? []).map(Number).includes(Number(rule.leaveTypeId))) forbidden.add(Number(other.leaveTypeId));
+  }
+  forbidden.delete(Number(rule.leaveTypeId));
+  if (!forbidden.size) return null;
+  for (const r of w.requests) {
+    if (r.id === excludeRequestId || !forbidden.has(Number(r.leaveTypeId)) || (r.status !== 'PENDING' && r.status !== 'APPROVED')) continue;
+    const overlaps = r.from <= ask.to && r.to >= ask.from;
+    const before = r.to < ask.from && onlyDaysOffBetween(w.calendar, r.to, ask.from);
+    const after = r.from > ask.to && onlyDaysOffBetween(w.calendar, ask.to, r.from);
+    if (overlaps || before || after) return { request: r, overlaps };
+  }
+  return null;
+}
 
 /** A request body, read: 422 only for what cannot be read at all. */
 export function readAsk(body = {}, { needEmployee = false } = {}) {
@@ -343,7 +393,7 @@ export function checkAsk(w, type, ask, { mode = 'preview', excludeRequestId = nu
     }
     out.after = info.perOccasion === null || out.before === null ? null : Math.max(0, out.before - counted.quantity);
   } else if (balance.limited && counted.quantity > 0 && out.after < info.floor) {
-    checks.push(block('NOT_ENOUGH', `${balance.available <= 0 ? 'Nothing is' : `Only ${daysWords(balance.available)} ${balance.available === 1 ? 'is' : 'are'}`} available in ${year.key}. This asks for ${daysWords(counted.quantity)}.`));
+    checks.push(block('NOT_ENOUGH', `${balance.available <= 0 ? 'Nothing is' : `Only ${daysWords(balance.available)} ${balance.available <= 1 ? 'is' : 'are'}`} available in ${year.key}. This asks for ${daysWords(counted.quantity)}.`));
   }
 
   // ── another request on these days ──
@@ -352,11 +402,23 @@ export function checkAsk(w, type, ask, { mode = 'preview', excludeRequestId = nu
     && !(r.halfDay && ask.halfDay && r.from === r.to && ask.from === ask.to && r.halfDay !== ask.halfDay));
   if (clash) checks.push(block('OVERLAP', `There is already leave on these days: ${clash.leaveTypeName}, ${spanText(clash.from, clash.to)}, ${STATUS_WORDS[clash.status]}.`));
 
+  // ── a leave type it may not touch (§23.1), either rule saying so ──
+  const near = notWithClash(w, rule, ask, excludeRequestId);
+  if (near) {
+    checks.push(block('NOT_WITH', `${rule.leaveTypeName} cannot be taken next to ${near.request.leaveTypeName}. There is ${near.request.leaveTypeName}, ${spanText(near.request.from, near.request.to)}, ${STATUS_WORDS[near.request.status]}, ${near.overlaps ? 'on these days' : 'next to these dates with only days off between'}.`));
+  }
+
   // ── for the manager to weigh ──
-  const notice = Number(rule.minNoticeDays) || 0;
+  // The notice by length (§23.1) replaces the one notice when it is set.
+  const tiered = Array.isArray(rule.noticeTiers) && rule.noticeTiers.length;
+  const notice = tiered ? (noticeForQuantity(rule.noticeTiers, counted.quantity) ?? 0) : (Number(rule.minNoticeDays) || 0);
   const ahead = daysBetween(askedOn, ask.from);
   if (ask.from < askedOn) checks.push(noteOf('IN_PAST', 'These dates are in the past. This records leave already taken.'));
-  else if (notice > 0 && ahead < notice) checks.push(noteOf('SHORT_NOTICE', `Asked ${ahead === 0 ? 'on the day' : `${daysWords(ahead)} ahead`}. The policy asks for ${daysWords(notice)} ahead.`));
+  else if (notice > 0 && ahead < notice) {
+    checks.push(noteOf('SHORT_NOTICE', `Asked ${ahead === 0 ? 'on the day' : `${daysWords(ahead)} ahead`}. ${tiered ? `For ${daysWords(counted.quantity)} the policy asks for ${daysWords(notice)} ahead.` : `The policy asks for ${daysWords(notice)} ahead.`}`));
+  }
+  const attendance = attendanceSentences(rule.notes);
+  if (attendance) checks.push(noteOf('ATTENDANCE', `Attendance is not recorded yet, so this is assumed and must be checked by HR: ${attendance}`));
   if (!rule.allowedInProbation) checks.push(noteOf('PROBATION', `${rule.leaveTypeName} is not meant for probation. Probation is not recorded here, so check it.`));
   const proof = rule.proofAfterDays === null || rule.proofAfterDays === undefined ? null : Number(rule.proofAfterDays);
   if (proof !== null && counted.quantity > proof) {

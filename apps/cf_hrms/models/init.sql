@@ -3108,6 +3108,7 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policies (
   name              VARCHAR(150)  NOT NULL,
   description       VARCHAR(1000) NULL,
   year_starts_month TINYINT       NOT NULL DEFAULT 1,
+  effective_from    DATE          NULL,                 -- §24: nothing is earned before it
   status            VARCHAR(20)   NOT NULL DEFAULT 'DRAFT',
 
   deleted_at        DATETIME      DEFAULT NULL,
@@ -3142,6 +3143,7 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policies (
 --             PER_DAYS_WORKED   one day for every `days_worked_per_leave_day` days worked
 --             ON_REQUEST        granted when it happens
 --             EARNED_BY_WORK    credited when a holiday or weekly off is worked (compensatory off)
+--             HALF_YEARLY       days / 2 on the first day of the year and of its 7th month (§24)
 --   carry_forward  NONE | CAPPED (`carry_forward_cap_days`) | ALL
 --   applies_to     ANYONE | WOMEN | MEN
 -- A column that does not apply to the rule's basis and accrual is stored NULL
@@ -3159,6 +3161,8 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policy_rules (
   accrual                   VARCHAR(20)   NOT NULL DEFAULT 'UPFRONT',
   days_worked_per_leave_day INT           NULL,
   prorate_on_joining        TINYINT(1)    NOT NULL DEFAULT 0,
+  joining_cutoff_day        TINYINT       NULL,                 -- §24
+  credit_in_arrears         TINYINT(1)    NOT NULL DEFAULT 0,   -- §24
   allowed_in_probation      TINYINT(1)    NOT NULL DEFAULT 1,
   wait_days_after_joining   INT           NOT NULL DEFAULT 0,
   carry_forward             VARCHAR(20)   NOT NULL DEFAULT 'NONE',
@@ -3167,6 +3171,8 @@ CREATE TABLE IF NOT EXISTS hrms_leave_policy_rules (
   encash_cap_days           DECIMAL(6,2)  NULL,
   max_days_at_once          DECIMAL(6,2)  NULL,
   min_notice_days           INT           NOT NULL DEFAULT 0,
+  notice_tiers_json         JSON          NULL,                 -- §24
+  not_with_json             JSON          NULL,                 -- §24
   half_day_allowed          TINYINT(1)    NOT NULL DEFAULT 0,
   count_days_off_between    TINYINT(1)    NOT NULL DEFAULT 0,
   proof_after_days          DECIMAL(6,2)  NULL,                 -- NULL = never
@@ -4235,5 +4241,58 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_balances' AND COLUMN_NAME = 'note');
 SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_balances ADD COLUMN note VARCHAR(500) NULL AFTER closing_balance', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 24. LEAVE RULE ADDITIONS — KARNI'S EXECUTIVE POLICY (CF_HRMS_HIRING_SPEC.md §23)
+-- ############################################################################
+-- Added 2026-10-16. All optional; an old policy reads and behaves exactly as before.
+--
+--   hrms_leave_policies.effective_from      DATE NULL — nothing is earned before it. Earned
+--                                           counts from the latest of the leave-year start,
+--                                           joining and this date. A HALF_YEARLY rule gives
+--                                           the half that is running on this date in full.
+--   hrms_leave_policy_rules.accrual         gains HALF_YEARLY (no column change: VARCHAR).
+--   hrms_leave_policy_rules.joining_cutoff_day   someone who joins AFTER this day of a month
+--                                           earns nothing for that month (prorating on
+--                                           joining; MONTHLY skips the joining month).
+--   hrms_leave_policy_rules.credit_in_arrears    MONTHLY: a month's credit is given on the
+--                                           first day of the NEXT month.
+--   hrms_leave_policy_rules.notice_tiers_json    [{ "upToDays": 3, "days": 7 }, ..., { "days": 45 }]:
+--                                           the notice depends on the quantity; replaces
+--                                           min_notice_days when set. Still only a NOTE.
+--   hrms_leave_policy_rules.not_with_json   [leave type ids]: may not touch this leave
+--                                           (overlap, or next to it with only days off between).
+--
+-- Declared in the CREATEs of §13 too (a new database); these guarded ALTERs reach the
+-- databases that already exist. One change per ALTER (TiDB, §10c).
+-- apps/cf_hrms/scripts/apply-leave-rules-schema.mjs makes exactly these changes.
+
+-- ----- 24a. hrms_leave_policies -----------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policies' AND COLUMN_NAME = 'effective_from');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policies ADD COLUMN effective_from DATE NULL AFTER year_starts_month', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 24b. hrms_leave_policy_rules -------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_rules' AND COLUMN_NAME = 'joining_cutoff_day');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN joining_cutoff_day TINYINT NULL AFTER prorate_on_joining', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_rules' AND COLUMN_NAME = 'credit_in_arrears');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN credit_in_arrears TINYINT(1) NOT NULL DEFAULT 0 AFTER joining_cutoff_day', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_rules' AND COLUMN_NAME = 'notice_tiers_json');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN notice_tiers_json JSON NULL AFTER min_notice_days', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_rules' AND COLUMN_NAME = 'not_with_json');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN not_with_json JSON NULL AFTER notice_tiers_json', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 

@@ -28,7 +28,7 @@ const router = Router();
  *   GET    /leave/policies                      { policies: PolicySummary[] }
  *   GET    /leave/policies/:id                  { policy: Policy }
  *   POST   /leave/policies                      { name, code?, description?, yearStartsMonth?, status?, fromTemplate?, copyOf? }  -> { policy }
- *   PUT    /leave/policies/:id                  { name?, description?, yearStartsMonth?, status?, rules? } — `rules` REPLACES the set  -> { policy }
+ *   PUT    /leave/policies/:id                  { name?, description?, yearStartsMonth?, effectiveFrom?, status?, rules? } — `rules` REPLACES the set  -> { policy }
  *   DELETE /leave/policies/:id                  409 IN_USE listing where it is assigned
  *   POST   /leave/policies/preview-summary      { rule }  -> { summary, problems } — the sentence as it is typed; writes nothing
  *   GET    /leave/policy-templates              { note, templates }

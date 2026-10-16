@@ -31,14 +31,22 @@ import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js'
 import { audit } from './peopleService.js';
 import {
   BASES, ACCRUALS, CARRY_FORWARDS, APPLIES_TO, POLICY_STATUSES, SCOPES, RULE_DEFAULTS,
-  applicability, summaryOf, shapeRule, headlineOf, refOf, loadAssignmentIndex, resolveEffective, rulesOfPolicies,
+  applicability, summaryOf, shapeRule, headlineOf, refOf, loadAssignmentIndex, resolveEffective, rulesOfPolicies, leaveTypeNames,
 } from './leavePolicyRead.js';
 import { TEMPLATE_NOTE, LEAVE_TYPES_OFFERED, TEMPLATES } from './leavePolicyTemplates.js';
+import { isDate } from './leave/days.js';
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o ?? {}, k);
 const clean = (v) => (v === null || v === undefined ? null : (String(v).trim() || null));
 const flag = (v) => v === true || v === 1 || v === '1' || v === 'true';
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+/** A policy code may also carry slashes, as a numbered document does: KPPL/HR/POL/004. */
+const POLICY_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
+const pad2 = (n) => String(n).padStart(2, '0');
+/** A DATE as text, whether the driver hands back a string or a local-midnight Date. */
+const dateOnly = (d) => (d == null || d === '' ? null : d instanceof Date ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` : String(d).slice(0, 10));
+/** The most steps a "notice by length" may have. */
+const MAX_NOTICE_TIERS = 10;
 const UNITS = ['DAY', 'HALF_DAY', 'HOUR'];
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -169,8 +177,10 @@ function number(raw, label, problems, { min = 0, max = 100000, whole = false, ex
  *
  * @param input a RuleInput (camelCase)
  * @param typeName the leave type's name, for the problems
+ * @param leaveTypeId the rule's own leave type, when known — it cannot be "not with" itself
+ * @param typeNames Map<id, name> of the company's leave types, when known — "not with" must name them
  */
-export function readRule(input, typeName, problems) {
+export function readRule(input, typeName, problems, { leaveTypeId = null, typeNames = null } = {}) {
   const mine = [];
   const say = (text) => mine.push(`${typeName}: ${text}`);
   const pick = (key) => (has(input, key) ? input[key] : RULE_DEFAULTS[key]);
@@ -201,6 +211,50 @@ export function readRule(input, typeName, problems) {
   r.proofAfterDays = n('proofAfterDays', 'the days after which proof is needed', { min: 0, max: 366 });
   r.maxTimesInService = n('maxTimesInService', 'the number of times in service', { min: 1, max: 100, whole: true });
   r.expiresAfterDays = n('expiresAfterDays', 'the days it must be used within', { min: 1, max: 3650, whole: true });
+  r.joiningCutoffDay = n('joiningCutoffDay', 'the day of the month after which a joining month does not count', { min: 1, max: 30, whole: true });
+
+  // ── the notice by length (§23.1): steps from the shortest leave to the longest, the last open ──
+  const rawTiers = pick('noticeTiers');
+  r.noticeTiers = null;
+  if (rawTiers !== null && rawTiers !== undefined && !(Array.isArray(rawTiers) && rawTiers.length === 0)) {
+    if (!Array.isArray(rawTiers)) local.push('the notice by length is a list of steps.');
+    else if (rawTiers.length > MAX_NOTICE_TIERS) local.push(`the notice by length has at most ${MAX_NOTICE_TIERS} steps.`);
+    else {
+      const steps = rawTiers.map((t, i) => {
+        const at = `step ${i + 1} of the notice by length`;
+        const last = i === rawTiers.length - 1;
+        const upToDays = number(t?.upToDays, `the "up to" days of ${at}`, local, { min: 0, max: 366, exclusiveMin: true });
+        const ahead = number(t?.days, `the days ahead of ${at}`, local, { min: 0, max: 365, whole: true });
+        if (ahead === null && (t?.days === null || t?.days === undefined || t?.days === '')) local.push(`${at} needs the days ahead.`);
+        if (!last && upToDays === null && (t?.upToDays === null || t?.upToDays === undefined || t?.upToDays === '')) local.push(`${at} needs the length it is for ("up to" days). Only the last step is for anything longer.`);
+        return { upToDays: last && (t?.upToDays === null || t?.upToDays === undefined || t?.upToDays === '') ? null : upToDays, days: ahead ?? 0 };
+      });
+      const last = steps[steps.length - 1];
+      if (last.upToDays !== null) local.push('the last step of the notice by length is for anything longer — leave its "up to" empty.');
+      for (let i = 1; i < steps.length; i += 1) {
+        const a = steps[i - 1].upToDays;
+        const b = steps[i].upToDays;
+        if (a !== null && b !== null && b <= a) { local.push('the steps of the notice by length go from the shortest leave to the longest.'); break; }
+      }
+      r.noticeTiers = steps;
+    }
+  }
+
+  // ── leave types it cannot be next to (§23.1) ──
+  const rawNotWith = pick('notWithLeaveTypeIds');
+  r.notWithLeaveTypeIds = [];
+  if (rawNotWith !== null && rawNotWith !== undefined) {
+    if (!Array.isArray(rawNotWith)) local.push('the leave types it cannot be next to come as a list.');
+    else {
+      const ids = [...new Set(rawNotWith.map(Number))];
+      if (ids.some((x) => !Number.isInteger(x) || x <= 0)) local.push('a leave type it cannot be next to is not a leave type.');
+      else {
+        if (leaveTypeId !== null && ids.includes(Number(leaveTypeId))) local.push('it cannot be "not next to" itself.');
+        if (typeNames && ids.some((x) => !typeNames.has(x))) local.push('a leave type it cannot be next to is not one of this company’s leave types.');
+        r.notWithLeaveTypeIds = ids.filter((x) => x !== Number(leaveTypeId) && (!typeNames || typeNames.has(x))).sort((a, b) => a - b);
+      }
+    }
+  }
   for (const p of local) say(p);
 
   r.prorateOnJoining = flag(pick('prorateOnJoining'));
@@ -209,13 +263,14 @@ export function readRule(input, typeName, problems) {
   r.halfDayAllowed = flag(pick('halfDayAllowed'));
   r.countDaysOffBetween = flag(pick('countDaysOffBetween'));
   r.negativeBalanceAllowed = flag(pick('negativeBalanceAllowed'));
+  r.creditInArrears = flag(pick('creditInArrears'));
   r.notes = clean(pick('notes'));
   if (r.notes && r.notes.length > 500) say('the note is up to 500 characters.');
 
   // ── what the combination needs ──
   if (r.basis === 'PER_EVENT' && r.days === null && !local.length) say('say how many days it is each time.');
   if (r.basis === 'PER_YEAR') {
-    if (['UPFRONT', 'MONTHLY', 'ON_REQUEST'].includes(r.accrual) && r.days === null && !local.length) say('say how many days a year.');
+    if (['UPFRONT', 'MONTHLY', 'ON_REQUEST', 'HALF_YEARLY'].includes(r.accrual) && r.days === null && !local.length) say('say how many days a year.');
     if (r.accrual === 'PER_DAYS_WORKED' && r.daysWorkedPerLeaveDay === null && !local.length) say('say how many days worked earn one day of leave.');
   }
 
@@ -232,6 +287,11 @@ export function readRule(input, typeName, problems) {
   if (!a.maxTimesInService) r.maxTimesInService = null;
   if (!a.negativeBalanceAllowed) r.negativeBalanceAllowed = false;
   if (!a.halfDayAllowed) r.halfDayAllowed = false;
+  // The joining cut-off means something to a MONTHLY rule, or to one that prorates on joining.
+  if (!a.joiningCutoffDay || (r.accrual !== 'MONTHLY' && !r.prorateOnJoining)) r.joiningCutoffDay = null;
+  if (!a.creditInArrears) r.creditInArrears = false;
+  // The notice by length replaces the one notice.
+  if (r.noticeTiers) r.minNoticeDays = 0;
 
   // ── what remains must hang together ──
   if (r.carryForward === 'CAPPED' && r.carryForwardCapDays === null && !local.length) say('say how many unused days carry forward, or choose that they lapse.');
@@ -249,6 +309,15 @@ const RULE_COLUMNS = {
   maxDaysAtOnce: 'max_days_at_once', minNoticeDays: 'min_notice_days', halfDayAllowed: 'half_day_allowed',
   countDaysOffBetween: 'count_days_off_between', proofAfterDays: 'proof_after_days', appliesTo: 'applies_to',
   maxTimesInService: 'max_times_in_service', expiresAfterDays: 'expires_after_days', negativeBalanceAllowed: 'negative_balance_allowed', notes: 'notes',
+  joiningCutoffDay: 'joining_cutoff_day', creditInArrears: 'credit_in_arrears', noticeTiers: 'notice_tiers_json', notWithLeaveTypeIds: 'not_with_json',
+};
+
+/** A rule value as its column stores it: a flag as 1/0, a list as JSON (an empty list as NULL). */
+const columnValue = (v) => {
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  if (Array.isArray(v)) return v.length ? JSON.stringify(v) : null;
+  if (v !== null && typeof v === 'object') return JSON.stringify(v);
+  return v ?? null;
 };
 
 /**
@@ -260,6 +329,7 @@ async function readRuleSet(conn, companyId, rules) {
   if (!Array.isArray(rules)) throw invalid('INVALID', 'The leave types of a policy come as a list.', { problems: ['The leave types of a policy come as a list.'] });
   const [types] = await conn.query('SELECT id, code, name FROM hrms_leave_types WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
   const typeOf = new Map(types.map((t) => [t.id, t]));
+  const typeNames = new Map(types.map((t) => [t.id, t.name]));
   const seen = new Set();
   const out = [];
   rules.forEach((input, i) => {
@@ -267,7 +337,7 @@ async function readRuleSet(conn, companyId, rules) {
     if (!type) { problems.push(`Leave type ${i + 1} of the list is not one of this company’s leave types.`); return; }
     if (seen.has(type.id)) { problems.push(`${type.name} is in the policy twice. A policy has one set of rules for each leave type.`); return; }
     seen.add(type.id);
-    const rule = readRule(input ?? {}, type.name, problems);
+    const rule = readRule(input ?? {}, type.name, problems, { leaveTypeId: type.id, typeNames });
     const order = Number(input.sortOrder);
     out.push({ ...rule, leaveTypeId: type.id, sortOrder: Number.isInteger(order) ? order : i + 1 });
   });
@@ -283,7 +353,7 @@ async function writeRuleSet(conn, c, policyId, rules) {
     await conn.query(
       `INSERT INTO hrms_leave_policy_rules (company_id, policy_id, leave_type_id, sort_order, ${keys.map((k) => RULE_COLUMNS[k]).join(', ')}, created_by)
        VALUES (?, ?, ?, ?, ${keys.map(() => '?').join(', ')}, ?)`,
-      [c.companyId, policyId, r.leaveTypeId, r.sortOrder, ...keys.map((k) => (typeof r[k] === 'boolean' ? (r[k] ? 1 : 0) : r[k])), c.userId],
+      [c.companyId, policyId, r.leaveTypeId, r.sortOrder, ...keys.map((k) => columnValue(r[k])), c.userId],
     );
   }
 }
@@ -292,13 +362,16 @@ async function writeRuleSet(conn, c, policyId, rules) {
 export async function previewRuleSummary(db, companyId, body = {}) {
   const input = body.rule ?? {};
   let type = { code: clean(input.leaveTypeCode) ?? '', name: clean(input.leaveTypeName) ?? 'This leave type' };
-  if (input.leaveTypeId != null) {
-    const [[row]] = await db.query('SELECT code, name FROM hrms_leave_types WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(input.leaveTypeId)]);
-    if (row) type = row;
-  }
+  const [names, [[row]]] = await Promise.all([
+    leaveTypeNames(db, companyId),
+    input.leaveTypeId != null
+      ? db.query('SELECT code, name FROM hrms_leave_types WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(input.leaveTypeId)])
+      : [[null]],
+  ]);
+  if (row) type = row;
   const problems = [];
-  const rule = readRule(input, type.name, problems);
-  return { summary: summaryOf(rule, type), problems };
+  const rule = readRule(input, type.name, problems, { leaveTypeId: input.leaveTypeId != null ? Number(input.leaveTypeId) : null, typeNames: names });
+  return { summary: summaryOf(rule, type, { typeNames: names }), problems };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -342,6 +415,8 @@ function shapeSummary(p, rules, usedBy) {
     description: p.description ?? null,
     status: p.status,
     yearStartsMonth: Number(p.year_starts_month),
+    /** §23.1: nothing is earned before this date; null = from the start. */
+    effectiveFrom: dateOnly(p.effective_from),
     leaveTypes: rules.map((r) => ({ code: r.leaveTypeCode, name: r.leaveTypeName, days: r.days, basis: r.basis })),
     headline: headlineOf(rules),
     usedBy,
@@ -383,8 +458,14 @@ function policyFields(body, problems, { partial = false } = {}) {
   }
   if (has(body, 'code')) {
     const code = clean(body.code);
-    if (code && (!CODE_RE.test(code) || code.length > 50)) problems.push('A policy code is letters and digits, no spaces.');
+    if (code && (!POLICY_CODE_RE.test(code) || code.length > 50)) problems.push('A policy code is letters and digits (and - _ . /), no spaces.');
     out.code = code;
+  }
+  if (has(body, 'effectiveFrom')) {
+    const raw = body.effectiveFrom === null || body.effectiveFrom === undefined ? '' : String(body.effectiveFrom).trim();
+    if (raw === '') out.effective_from = null;
+    else if (!isDate(raw) || raw < '2000-01-01' || raw > '2100-12-31') problems.push('The date the policy takes effect must be a date, like 2026-10-01.');
+    else out.effective_from = raw;
   }
   if (has(body, 'description')) {
     const description = clean(body.description);
@@ -486,12 +567,12 @@ export async function createPolicy(conn, c, body = {}, requestId = null) {
   }
 
   const [ins] = await conn.query(
-    'INSERT INTO hrms_leave_policies (company_id, code, name, description, year_starts_month, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [c.companyId, f.code ?? null, f.name, f.description ?? (template && template.key !== 'BLANK' ? template.description : null), yearStartsMonth, f.status ?? 'DRAFT', c.userId],
+    'INSERT INTO hrms_leave_policies (company_id, code, name, description, year_starts_month, effective_from, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [c.companyId, f.code ?? null, f.name, f.description ?? (template && template.key !== 'BLANK' ? template.description : null), yearStartsMonth, f.effective_from ?? null, f.status ?? 'DRAFT', c.userId],
   );
   await writeRuleSet(conn, c, ins.insertId, rules);
   await audit(conn, c, 'hrms_leave_policies', ins.insertId, 'CREATE', null,
-    { name: f.name, status: f.status ?? 'DRAFT', fromTemplate: template?.key ?? null, copyOf, leaveTypes: rules.length }, requestId);
+    { name: f.name, code: f.code ?? null, status: f.status ?? 'DRAFT', effectiveFrom: f.effective_from ?? null, fromTemplate: template?.key ?? null, copyOf, leaveTypes: rules.length }, requestId);
   return getPolicy(conn, c.companyId, ins.insertId);
 }
 
@@ -517,7 +598,8 @@ export async function updatePolicy(conn, c, id, body = {}, requestId = null) {
   const cols = Object.keys(f);
   if (cols.length) await conn.query(`UPDATE hrms_leave_policies SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`, [...cols.map((k) => f[k]), c.companyId, id]);
   if (rules) await writeRuleSet(conn, c, id, rules);
-  await audit(conn, c, 'hrms_leave_policies', id, 'UPDATE', { name: before.name, status: before.status }, { ...f, ...(rules ? { leaveTypes: rules.length } : {}) }, requestId);
+  await audit(conn, c, 'hrms_leave_policies', id, 'UPDATE', { name: before.name, status: before.status, effectiveFrom: dateOnly(before.effective_from) },
+    { ...f, ...(rules ? { leaveTypes: rules.length } : {}) }, requestId);
   return getPolicy(conn, c.companyId, id);
 }
 

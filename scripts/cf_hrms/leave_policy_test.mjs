@@ -378,7 +378,9 @@ await rolledBack(async (db) => {
       WHERE e.company_id = ? AND e.deleted_at IS NULL AND e.user_id IS NOT NULL ORDER BY e.id LIMIT 1`, [COMPANY]);
   if (person) {
     const mine = await myPlace(db, { companyId: COMPANY, userId: person.user_id }, {});
-    ok(mine.leavePolicy.policy !== null && typeof mine.leavePolicy.line === 'string' && Array.isArray(mine.leavePolicy.rules) && mine.leavePolicy.rules.length === 3
+    // The rules of whichever policy reaches them (the test's company default, or a role's own policy already on this database).
+    const theirs = mine.leavePolicy.policy ? (await LEAVE.getPolicy(db, COMPANY, mine.leavePolicy.policy.id)).policy.rules.length : -1;
+    ok(mine.leavePolicy.policy !== null && typeof mine.leavePolicy.line === 'string' && Array.isArray(mine.leavePolicy.rules) && mine.leavePolicy.rules.length === theirs && theirs > 0
       && mine.leavePolicy.rules.every((r) => r.summary && r.leaveTypeName) && ['ROLE', 'LOCATION', 'COMPANY'].includes(mine.leavePolicy.from),
     '/user/me/place carries the person’s own leave policy WITH its rules and their sentences', JSON.stringify({ line: mine.leavePolicy.line, rules: mine.leavePolicy.rules?.length }));
     await db.query('UPDATE hrms_work_assignments SET role_id = ?, position_id = ? WHERE id = ?', [roleA, p1.id, person.assignment_id]);
@@ -392,7 +394,8 @@ await rolledBack(async (db) => {
   await put({ scope: 'LOCATION', locationId: location.id, policyId: null });
   ok(JSON.stringify(await eff(p1)) === JSON.stringify(line1) && JSON.stringify(await eff(p2)) === JSON.stringify(line1), 'remove the location’s: back to the company default');
   const afterNone = (await put({ scope: 'COMPANY', policyId: null })).assignments;
-  if (!already.company) ok(JSON.stringify(await eff(p1)) === JSON.stringify(none) && afterNone.company.policy === null && afterNone.unassignedPositions === total, `remove the default: "No leave policy", and all ${total} positions are counted as having none`);
+  if (!already.company) ok(JSON.stringify(await eff(p1)) === JSON.stringify(none) && afterNone.company.policy === null && afterNone.unassignedPositions === already.unassigned,
+    `remove the default: "No leave policy", and the ${already.unassigned} of ${total} positions no role, label or location covers are counted as having none again`);
   ok(JSON.stringify((await put({ scope: 'COMPANY', policyId: null })).assignments.company) === JSON.stringify(afterNone.company), 'removing what is not there is not an error');
   // The same target again replaces, it does not add.
   await put({ scope: 'ROLE', roleId: roleA, policyId: forRole.id });

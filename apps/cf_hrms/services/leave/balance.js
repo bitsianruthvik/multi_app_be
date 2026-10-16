@@ -33,7 +33,7 @@
  * `info.floor` is how far a request may take it.
  */
 import { applicability } from '../leavePolicyRead.js';
-import { MONTH_NAMES, addDays, workingDaysBetween } from './days.js';
+import { MONTH_NAMES, addDays, dayText, workingDaysBetween } from './days.js';
 
 const r2 = (n) => Math.round(Number(n) * 100) / 100;
 const floorHalf = (n) => Math.floor(Number(n) * 2) / 2;
@@ -78,44 +78,119 @@ export const previousYear = (year, startsMonth) => yearFromStart(Number(year.fro
 /** Months from a's month to b's month, both counted. */
 const monthsInclusive = (a, b) => (Number(b.slice(0, 4)) * 12 + Number(b.slice(5, 7))) - (Number(a.slice(0, 4)) * 12 + Number(a.slice(5, 7))) + 1;
 
+/** A month as one number (year × 12 + month − 1), so months can be counted and compared. */
+const monthIndex = (d) => Number(d.slice(0, 4)) * 12 + Number(d.slice(5, 7)) - 1;
+const monthStart = (i) => `${Math.floor(i / 12)}-${pad((i % 12) + 1)}-01`;
+const dayOfMonth = (d) => Number(d.slice(8, 10));
+const s = (n) => (n === 1 ? '' : 's');
+
 /* ══ earned ════════════════════════════════════════════════════════════════ */
 
 /**
  * What the policy gives in a year, up to `asOf` (the day the leave starts; null = the
  * whole year, for a past year's closing).
+ *
+ * Counting starts at the LATEST of the leave-year start, the joining date and the
+ * policy's `effectiveFrom` (§23.1) — nothing is earned before the policy takes effect.
+ *   - joiningCutoffDay: someone who joins AFTER this day of a month earns nothing for
+ *     that month (when the rule prorates on joining; MONTHLY always).
+ *   - MONTHLY + creditInArrears: a month's credit is given on the first day of the NEXT
+ *     month, and counts in the leave year that day falls in (December's comes on 1 January).
+ *   - HALF_YEARLY: days/2 on the first day of the year and of its 7th month. The joining
+ *     half is prorated days/12 per counted month left in it (prorateOnJoining); the half
+ *     running on `effectiveFrom` is given in full — as it would have been given had the
+ *     policy been in force from that half's start (a joiner of that half still gets their share).
+ * With none of these set, every accrual counts exactly as before.
  * @returns { amount, limited, text, estimated }
  */
-export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = null }) {
+export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = null, effectiveFrom = null }) {
   const days = rule.days === null || rule.days === undefined ? null : Number(rule.days);
   if (rule.basis === 'UNLIMITED_UNPAID') return { amount: 0, limited: false, text: 'Unpaid, with no fixed limit' };
   if (rule.basis === 'PER_EVENT') return { amount: days ?? 0, limited: days !== null, text: days === null ? 'Given each time it is needed' : `${plain(days)} each time` };
   if (rule.accrual === 'EARNED_BY_WORK') return { amount: 0, limited: true, text: 'Earned by working on a holiday or a weekly off, as HR enters it' };
   if (days === null) return { amount: 0, limited: false, text: 'No fixed number of days' };
   if (joinDate && joinDate > year.to) return { amount: 0, limited: true, text: 'Joins after this year' };
+  const eff = effectiveFrom || null;
+  if (eff && eff > year.to) return { amount: 0, limited: true, text: `Nothing before the policy takes effect on ${dayText(eff, true)}` };
   const joinedInside = Boolean(joinDate) && joinDate > year.from;
   const startMonth = MONTH_NAMES[Number(year.from.slice(5, 7)) - 1];
+  // Where counting starts: the joining date, else the policy's date, else the year's start.
+  const startIsJoin = joinedInside && (!eff || joinDate >= eff);
+  const startIsEff = !startIsJoin && Boolean(eff) && eff > year.from;
+  const effWords = startIsEff ? ` from ${dayText(eff, true)}, when the policy takes effect` : '';
+  const cutoff = Number(rule.joiningCutoffDay) || null;
+  const lateJoin = (d) => Boolean(cutoff && d && dayOfMonth(d) > cutoff);
+  const until = asOf === null || asOf > year.to ? year.to : asOf;
 
   if (rule.accrual === 'UPFRONT' || rule.accrual === 'ON_REQUEST') {
     const upTo = rule.accrual === 'ON_REQUEST' ? 'up to ' : '';
-    if (rule.prorateOnJoining && joinedInside) {
-      const left = monthsInclusive(joinDate, year.to);
+    if (rule.prorateOnJoining && startIsJoin) {
+      const left = monthsInclusive(joinDate, year.to) - (lateJoin(joinDate) ? 1 : 0);
       const amount = floorHalf((days * left) / 12);
-      return { amount, limited: true, text: `${upTo}${plain(amount)} for the ${left} month${left === 1 ? '' : 's'} left after joining (${plain(days)} a year)` };
+      return { amount, limited: true, text: `${upTo}${plain(amount)} for the ${left} month${s(left)} left after joining (${plain(days)} a year)` };
+    }
+    if (startIsEff) {
+      const left = monthsInclusive(eff, year.to);
+      const amount = floorHalf((days * left) / 12);
+      return { amount, limited: true, text: `${upTo}${plain(amount)} for the ${left} month${s(left)}${effWords} (${plain(days)} a year)` };
     }
     return { amount: days, limited: true, text: rule.accrual === 'ON_REQUEST' ? `Up to ${plain(days)} a year` : `${plain(days)} a year, given in ${startMonth}` };
   }
 
   if (rule.accrual === 'MONTHLY') {
-    const start = joinedInside ? joinDate : year.from;
-    const until = asOf === null || asOf > year.to ? year.to : asOf;
-    const months = until < start ? 0 : monthsInclusive(start, until);
-    const amount = Math.min(days, r2((days / 12) * months));
-    return { amount, limited: true, text: `${plain(days / 12)} a month, ${plain(amount)} so far` };
+    const per = days / 12;
+    // The first month that earns: the year's, the joining month (or the next, after the cut-off), the policy's.
+    let first = monthIndex(year.from);
+    if (joinDate) first = Math.max(first, monthIndex(joinDate) + (lateJoin(joinDate) ? 1 : 0));
+    if (eff) first = Math.max(first, monthIndex(eff));
+    if (rule.creditInArrears) {
+      // Month M is credited on the 1st of M+1, inside this year: the year's first credit is for the month before it.
+      let from = monthIndex(year.from) - 1;
+      if (joinDate) from = Math.max(from, monthIndex(joinDate) + (lateJoin(joinDate) ? 1 : 0));
+      if (eff) from = Math.max(from, monthIndex(eff));
+      const to = monthIndex(until) - 1;
+      const months = joinDate && until < joinDate ? 0 : Math.max(0, to - from + 1);
+      const amount = Math.min(days, r2(per * months));
+      return { amount, limited: true, text: `${plain(per)} a month, credited at the start of the next month${effWords}, ${plain(amount)} so far` };
+    }
+    const startDate = startIsJoin ? joinDate : (startIsEff ? eff : year.from);
+    const months = until < startDate ? 0 : Math.max(0, monthIndex(until) - first + 1);
+    const amount = Math.min(days, r2(per * months));
+    return { amount, limited: true, text: `${plain(per)} a month${effWords}, ${plain(amount)} so far` };
+  }
+
+  if (rule.accrual === 'HALF_YEARLY') {
+    const half = days / 2;
+    const second = monthStart(monthIndex(year.from) + 6);
+    const halves = [{ from: year.from, to: addDays(second, -1) }, { from: second, to: year.to }];
+    const startDate = startIsJoin ? joinDate : (startIsEff ? eff : year.from);
+    let amount = 0;
+    let note = null;
+    for (const h of halves) {
+      if (h.to < startDate) continue;
+      let give = half;
+      let on = h.from;
+      if (startDate > h.from) {
+        on = startDate;
+        const joinedInHalf = Boolean(joinDate) && joinDate > h.from && joinDate <= h.to;
+        if (joinedInHalf && rule.prorateOnJoining) {
+          const counted = Math.max(0, monthsInclusive(joinDate, h.to) - (lateJoin(joinDate) ? 1 : 0));
+          give = Math.min(half, r2((days / 12) * counted));
+          note = `${plain(give)} for the ${counted} month${s(counted)} left in the half-year after joining`;
+        } else if (startIsEff) {
+          note = `${plain(give)} for the half-year running on ${dayText(eff, true)}, when the policy takes effect`;
+        }
+      }
+      if (on <= until) amount = r2(amount + give);
+    }
+    const second7 = MONTH_NAMES[(Number(year.from.slice(5, 7)) + 5) % 12];
+    const plan = `${plain(days)} a year, half on 1 ${startMonth} and half on 1 ${second7}`;
+    return { amount, limited: true, text: `${note ? `${note} (${plan})` : plan}, ${plain(amount)} so far` };
   }
 
   if (rule.accrual === 'PER_DAYS_WORKED') {
     const per = Number(rule.daysWorkedPerLeaveDay) || 0;
-    const start = joinedInside ? joinDate : year.from;
+    const start = startIsJoin ? joinDate : (startIsEff ? eff : year.from);
     const dayBefore = asOf === null ? year.to : addDays(asOf, -1);
     const end = dayBefore > year.to ? year.to : dayBefore;
     const worked = calendar ? workingDaysBetween(calendar, start, end) : 0;
@@ -144,9 +219,10 @@ const sum = (rows) => r2(rows.reduce((s, r) => s + Number(r.quantity || 0), 0));
  * @param requests    this person's requests of this type: [{ id, status, quantity, from }]
  * @param calendar    from days.makeCalendar
  * @param excludeRequestId leave this request out (its own hold, on approve)
+ * @param effectiveFrom the policy's `effective_from` ('YYYY-MM-DD' | null): nothing is earned before it
  * @returns { balance: Balance (without canAsk), info: { floor, fullDays, perOccasion, timesUsed, timesHeld, maxTimes } }
  */
-export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf = null, openings = new Map(), requests = [], calendar = null, excludeRequestId = null }) {
+export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf = null, openings = new Map(), requests = [], calendar = null, excludeRequestId = null, effectiveFrom = null }) {
   const reqs = requests.filter((r) => r.id !== excludeRequestId);
   const inYear = (y) => reqs.filter((r) => yearOfRequest(r, startsMonth) === y.key);
   const taken = (y) => sum(inYear(y).filter((r) => r.status === 'APPROVED'));
@@ -192,14 +268,15 @@ export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf =
     if (carries === 'NONE' || depth >= 10) return { value: 0, text: null };
     const prev = previousYear(y, startsMonth);
     if (joinDate && prev.to < joinDate) return { value: 0, text: null };
+    if (effectiveFrom && prev.to < effectiveFrom) return { value: 0, text: null };
     const active = openings.has(prev.key) || reqs.some((r) => yearOfRequest(r, startsMonth) === prev.key);
     if (!active) return { value: 0, text: null };
-    const closing = r2(openingOf(prev, depth + 1).value + earnedOf(rule, { year: prev, joinDate, asOf: null, calendar }).amount - taken(prev) - held(prev));
+    const closing = r2(openingOf(prev, depth + 1).value + earnedOf(rule, { year: prev, joinDate, asOf: null, calendar, effectiveFrom }).amount - taken(prev) - held(prev));
     const carried = carries === 'ALL' ? closing : Math.min(closing, cap);
     return { value: r2(carried), text: carried ? `${plain(carried)} carried from ${prev.key}` : null };
   };
   const opening = openingOf(year, 0);
-  const earned = earnedOf(rule, { year, joinDate, asOf, calendar });
+  const earned = earnedOf(rule, { year, joinDate, asOf, calendar, effectiveFrom });
   if (!earned.limited) {
     return {
       balance: { ...base, limited: false, opening: opening.value, earned: 0, taken: tk, held: hd, available: null, why: words([earned.text, opening.text, ...tail]) },

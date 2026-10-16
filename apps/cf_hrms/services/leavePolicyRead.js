@@ -22,7 +22,7 @@
  */
 
 export const BASES = ['PER_YEAR', 'PER_EVENT', 'UNLIMITED_UNPAID'];
-export const ACCRUALS = ['UPFRONT', 'MONTHLY', 'PER_DAYS_WORKED', 'ON_REQUEST', 'EARNED_BY_WORK'];
+export const ACCRUALS = ['UPFRONT', 'MONTHLY', 'PER_DAYS_WORKED', 'ON_REQUEST', 'EARNED_BY_WORK', 'HALF_YEARLY'];
 export const CARRY_FORWARDS = ['NONE', 'CAPPED', 'ALL'];
 export const APPLIES_TO = ['ANYONE', 'WOMEN', 'MEN'];
 export const POLICY_STATUSES = ['DRAFT', 'ACTIVE', 'ARCHIVED'];
@@ -36,6 +36,8 @@ export const RULE_DEFAULTS = {
   maxDaysAtOnce: null, minNoticeDays: 0, halfDayAllowed: false, countDaysOffBetween: false,
   proofAfterDays: null, appliesTo: 'ANYONE', maxTimesInService: null,
   expiresAfterDays: null, negativeBalanceAllowed: false, notes: null,
+  // §23.1 — all off by default, so a rule without them reads and behaves as before.
+  joiningCutoffDay: null, creditInArrears: false, noticeTiers: null, notWithLeaveTypeIds: [],
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -61,7 +63,10 @@ export function applicability(rule) {
   return {
     days: basis !== 'UNLIMITED_UNPAID',
     daysWorkedPerLeaveDay: yearly && accrual === 'PER_DAYS_WORKED',
-    prorateOnJoining: yearly && (accrual === 'UPFRONT' || accrual === 'ON_REQUEST'),
+    prorateOnJoining: yearly && (accrual === 'UPFRONT' || accrual === 'ON_REQUEST' || accrual === 'HALF_YEARLY'),
+    // §23.1: a MONTHLY rule always skips a late joining month; the others only when they prorate.
+    joiningCutoffDay: yearly && ['UPFRONT', 'ON_REQUEST', 'HALF_YEARLY', 'MONTHLY'].includes(accrual),
+    creditInArrears: yearly && accrual === 'MONTHLY',
     carryForward: banked && !earnedByWork,
     encashable: banked,
     expiresAfterDays: earnedByWork,
@@ -85,11 +90,12 @@ const isSickLeave = (type) => /^SL$/i.test(type?.code ?? '') || /sick|medical/i.
  * Order: how much and how it is earned · who it is for · when it starts ·
  * what happens to what is left · the rules when taking it.
  */
-export function summaryOf(rule, type = null) {
+export function summaryOf(rule, type = null, { typeNames = null } = {}) {
   const r = { ...RULE_DEFAULTS, ...rule };
   const a = applicability(r);
   const d = num(r.days);
   const out = [];
+  const arrears = a.creditInArrears && Boolean(r.creditInArrears);
 
   // ── how much, and how it is earned ──
   if (r.basis === 'UNLIMITED_UNPAID') {
@@ -101,8 +107,12 @@ export function summaryOf(rule, type = null) {
     else if (n) out.push(`${cap(days(d))} each time, up to ${times(n)} in a person’s service.`);
     else out.push(`${cap(days(d))} each time it is needed.`);
   } else if (r.accrual === 'MONTHLY') {
-    if (d === null) out.push('Earned month by month.');
-    else out.push(`${cap(days(d))} a year, earned ${d === 12 ? 'a day' : days(d / 12)} each month.`);
+    const then = arrears ? ' and credited at the start of the next month' : '';
+    if (d === null) out.push(`Earned month by month${then}.`);
+    else out.push(`${cap(days(d))} a year, earned ${d === 12 ? 'a day' : days(d / 12)} each month${then}.`);
+  } else if (r.accrual === 'HALF_YEARLY') {
+    if (d === null) out.push('Given in two parts: at the start of the year and at the start of its 7th month.');
+    else out.push(`${cap(days(d))} a year, given in two parts: ${days(d / 2)} at the start of the year and ${days(d / 2)} at the start of its 7th month.`);
   } else if (r.accrual === 'PER_DAYS_WORKED') {
     const per = num(r.daysWorkedPerLeaveDay);
     out.push(`One day for every ${per ?? '…'} days worked${d !== null ? `, up to ${days(d)} a year` : ''}.`);
@@ -119,7 +129,14 @@ export function summaryOf(rule, type = null) {
   if (r.appliesTo === 'MEN') out.push('For men.');
 
   // ── when it starts ──
-  if (a.prorateOnJoining && r.prorateOnJoining) out.push('Someone who joins part-way through the year gets a share for the months left.');
+  const prorates = a.prorateOnJoining && r.prorateOnJoining;
+  if (prorates) {
+    out.push(r.accrual === 'HALF_YEARLY'
+      ? 'Someone who joins part-way through a half-year gets a share for the months left in it.'
+      : 'Someone who joins part-way through the year gets a share for the months left.');
+  }
+  const cutoff = num(r.joiningCutoffDay);
+  if (a.joiningCutoffDay && cutoff && (prorates || r.accrual === 'MONTHLY')) out.push(`Someone who joins after the ${ordinal(cutoff)} of a month gets nothing for that month.`);
   const wait = num(r.waitDaysAfterJoining) ?? 0;
   if (wait > 0 && !r.allowedInProbation) out.push(`Not during probation, and not in the first ${days(wait)} in the job.`);
   else if (wait > 0) out.push(`Can be taken after ${days(wait)} in the job.`);
@@ -141,8 +158,20 @@ export function summaryOf(rule, type = null) {
   // ── the rules when taking it ──
   const most = num(r.maxDaysAtOnce);
   if (most) out.push(`No more than ${days(most)} at a stretch.`);
-  const notice = num(r.minNoticeDays) ?? 0;
-  if (notice > 0) out.push(`Ask ${days(notice)} ahead.`);
+  const tiers = Array.isArray(r.noticeTiers) && r.noticeTiers.length ? r.noticeTiers : null;
+  if (tiers) out.push(noticeSentence(tiers));
+  else {
+    const notice = num(r.minNoticeDays) ?? 0;
+    if (notice > 0) out.push(`Ask ${days(notice)} ahead.`);
+  }
+  const notWith = Array.isArray(r.notWithLeaveTypeIds) ? r.notWithLeaveTypeIds : [];
+  if (notWith.length) {
+    const nameOf = (id) => (typeNames instanceof Map ? typeNames.get(Number(id)) : typeNames?.[id]) ?? null;
+    const names = notWith.map(nameOf).filter(Boolean);
+    out.push(names.length
+      ? `Cannot be taken next to ${orList(names)}, even with only days off between.`
+      : 'Cannot be taken next to some other leave types, even with only days off between.');
+  }
   if (a.halfDayAllowed && r.halfDayAllowed) out.push('Half days can be taken.');
   if (r.countDaysOffBetween) out.push('A weekly off or holiday between two leave days counts as leave.');
   const proof = num(r.proofAfterDays);
@@ -157,12 +186,67 @@ export function summaryOf(rule, type = null) {
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
+/** 1 -> "1st", 15 -> "15th", 22 -> "22nd". */
+export function ordinal(n) {
+  const v = Number(n);
+  const t = v % 100;
+  if (t >= 11 && t <= 13) return `${v}th`;
+  return `${v}${({ 1: 'st', 2: 'nd', 3: 'rd' })[v % 10] ?? 'th'}`;
+}
+
+/** "Sick leave" · "Sick leave or Earned leave" · "A, B or C". */
+const orList = (names) => (names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`);
+
+/**
+ * The notice a request of `quantity` days needs under some tiers — the first tier whose
+ * `upToDays` covers it, else the open one at the end. null when no tier covers it.
+ * The only place a tier is picked: the sentence, the check and the editor's sentence agree.
+ */
+export function noticeForQuantity(tiers, quantity) {
+  if (!Array.isArray(tiers) || !tiers.length) return null;
+  const q = Number(quantity) || 0;
+  for (const t of tiers) if (t.upToDays === null || t.upToDays === undefined || q <= Number(t.upToDays)) return Number(t.days) || 0;
+  return null;
+}
+
+/** "Ask 7 days ahead for up to 3 days, 30 days ahead for up to 7 days, and 45 days ahead for anything longer." */
+function noticeSentence(tiers) {
+  const ahead = (n) => (Number(n) === 0 ? 'no notice' : `${days(n)} ahead`);
+  if (tiers.length === 1 && (tiers[0].upToDays === null || tiers[0].upToDays === undefined)) {
+    return Number(tiers[0].days) ? `Ask ${days(tiers[0].days)} ahead.` : 'No notice is needed.';
+  }
+  const parts = tiers.map((t) => (t.upToDays === null || t.upToDays === undefined
+    ? `${ahead(t.days)} for anything longer`
+    : `${ahead(t.days)} for up to ${days(t.upToDays)}`));
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}`;
+  return `Ask ${list}.`;
+}
+
+/** A JSON column, as mysql2 hands it back (parsed already) or as text. */
+const json = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v !== 'string') return v;
+  try { return JSON.parse(v); } catch { return null; }
+};
+
 /* ══════════════════════════════════════════════════════════════════════════
  * A rule and a policy on the wire
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** A rule row (joined to its leave type as lt_code, lt_name, lt_is_paid) -> the spec's `Rule`. */
-export function shapeRule(r) {
+/** notice_tiers_json, read: [{ upToDays: number | null, days: number }] or null. */
+const tiersOf = (v) => {
+  const t = json(v);
+  if (!Array.isArray(t) || !t.length) return null;
+  return t.map((x) => ({ upToDays: num(x?.upToDays), days: num(x?.days) ?? 0 }));
+};
+/** not_with_json, read: leave type ids. */
+const idsOf = (v) => { const t = json(v); return Array.isArray(t) ? t.map(Number).filter((n) => Number.isInteger(n) && n > 0) : []; };
+
+/**
+ * A rule row (joined to its leave type as lt_code, lt_name, lt_is_paid) -> the spec's `Rule`.
+ * @param typeNames Map<leaveTypeId, name> — for the "cannot be next to" sentence.
+ */
+export function shapeRule(r, typeNames = null) {
   const rule = {
     id: r.id,
     leaveTypeId: r.leave_type_id,
@@ -191,8 +275,12 @@ export function shapeRule(r) {
     expiresAfterDays: num(r.expires_after_days),
     negativeBalanceAllowed: Boolean(r.negative_balance_allowed),
     notes: r.notes ?? null,
+    joiningCutoffDay: num(r.joining_cutoff_day),
+    creditInArrears: Boolean(r.credit_in_arrears),
+    noticeTiers: tiersOf(r.notice_tiers_json),
+    notWithLeaveTypeIds: idsOf(r.not_with_json),
   };
-  return { ...rule, summary: summaryOf(rule, { code: r.lt_code, name: r.lt_name }) };
+  return { ...rule, summary: summaryOf(rule, { code: r.lt_code, name: r.lt_name }, { typeNames }) };
 }
 
 /** "Casual leave" -> "Casual"; "Leave without pay" and "Compensatory off" stay as they are. */
@@ -297,19 +385,29 @@ const RULE_SELECT = `
     FROM hrms_leave_policy_rules r
     JOIN hrms_leave_types lt ON lt.company_id = r.company_id AND lt.id = r.leave_type_id`;
 
-/** The rules of some policies, shaped, by policy id: one query. */
+/** The company's leave type names by id — for the sentences that name another leave type. One query. */
+export async function leaveTypeNames(db, companyId) {
+  const [rows] = await db.query('SELECT id, name FROM hrms_leave_types WHERE company_id = ?', [companyId]);
+  return new Map(rows.map((t) => [t.id, t.name]));
+}
+
+/** The rules of some policies, shaped, by policy id: two queries, sent together. */
 export async function rulesOfPolicies(db, companyId, policyIds) {
   const by = new Map(policyIds.map((id) => [id, []]));
   if (!policyIds.length) return by;
-  const [rows] = await db.query(
-    `${RULE_SELECT} WHERE r.company_id = ? AND r.policy_id IN (?) AND r.deleted_at IS NULL ORDER BY r.policy_id, r.sort_order, r.id`,
-    [companyId, policyIds],
-  );
-  for (const r of rows) by.get(r.policy_id)?.push(shapeRule(r));
+  const [[rows], names] = await Promise.all([
+    db.query(
+      `${RULE_SELECT} WHERE r.company_id = ? AND r.policy_id IN (?) AND r.deleted_at IS NULL ORDER BY r.policy_id, r.sort_order, r.id`,
+      [companyId, policyIds],
+    ),
+    leaveTypeNames(db, companyId),
+  ]);
+  for (const r of rows) by.get(r.policy_id)?.push(shapeRule(r, names));
   return by;
 }
 
 export default {
   BASES, ACCRUALS, CARRY_FORWARDS, APPLIES_TO, POLICY_STATUSES, SCOPES, RULE_DEFAULTS,
   applicability, summaryOf, shapeRule, headlineOf, refOf, loadAssignmentIndex, resolveEffective, effectiveFor, rulesOfPolicies,
+  leaveTypeNames, noticeForQuantity, ordinal,
 };
